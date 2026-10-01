@@ -54,6 +54,26 @@ pub enum CrtcConfigApply {
     Pending(CrtcConfigToken),
 }
 
+/// Initial disposition of RANDR's forced connector reprobe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForcedReprobeApply {
+    /// The backend completed synchronously; the caller can reply from state.
+    Applied,
+    /// Work continues off the core thread. The core parks the reply and holds
+    /// its RANDR gate turn until `finish_forced_reprobe` resolves this token.
+    Pending(CrtcConfigToken),
+}
+
+/// Terminal disposition of a pending forced reprobe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForcedReprobeResult {
+    /// The probe was applied to the published RANDR state.
+    Applied,
+    /// The deadline or a VT release invalidated the probe; reply from the
+    /// state that was already published when this token resolved.
+    Expired,
+}
+
 /// What happens to a pending CRTC operation when its requesting client leaves.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum RequesterAbandon {
@@ -845,6 +865,39 @@ pub trait Backend {
     fn reprobe_connectors(&mut self, _state: &mut ServerState) -> io::Result<()> {
         Ok(())
     }
+
+    /// Begin RANDR's forced connector reprobe. The default preserves the
+    /// established synchronous path for every backend that does not need an
+    /// off-thread probe. Owner backends may return `Pending`; they must wake
+    /// the core with `CrtcConfigReady` when the token can be finished.
+    fn begin_forced_reprobe(&mut self, state: &mut ServerState) -> io::Result<ForcedReprobeApply> {
+        self.reprobe_connectors(state)
+            .map(|()| ForcedReprobeApply::Applied)
+    }
+
+    /// Whether `begin_forced_reprobe` may park work. The core uses this to
+    /// preserve the legacy admission rule for synchronous backends while
+    /// reserving a RANDR turn before dispatch for backends that can return a
+    /// pending token.
+    fn forced_reprobe_may_be_pending(&self) -> bool {
+        false
+    }
+
+    /// Finish a ready forced reprobe on the core thread. A backend applies
+    /// its connector registry change and notifications here, while the
+    /// request still owns the gate turn. Errors retain the existing BadAlloc
+    /// protocol mapping.
+    fn finish_forced_reprobe(
+        &mut self,
+        _token: CrtcConfigToken,
+        _state: &mut ServerState,
+    ) -> io::Result<ForcedReprobeResult> {
+        Err(io::Error::other("unknown forced reprobe token"))
+    }
+
+    /// Discard a forced reprobe at a generation boundary. A backend may leave
+    /// an in-kernel worker running, but its answer must no longer publish.
+    fn cancel_forced_reprobe(&mut self, _token: CrtcConfigToken) {}
 
     /// Attach or detach a RANDR output-sink provider to the selected
     /// output-source provider. `source_provider = None` detaches the sink.

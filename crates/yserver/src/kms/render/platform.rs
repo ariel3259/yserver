@@ -2648,6 +2648,10 @@ enum ScriptedProbeAnswer {
         barrier: ProbeBarrier,
     },
     Connectors(Result<Vec<crate::platform::drm::ConnectorProbe>, i32>),
+    BlockConnectors {
+        result: Result<Vec<crate::platform::drm::ConnectorProbe>, i32>,
+        barrier: ProbeBarrier,
+    },
     Unscripted,
 }
 
@@ -2731,6 +2735,66 @@ impl ScriptedConnectorProber {
         self.answers.lock().expect("scripted prober lock").insert(
             key,
             std::collections::VecDeque::from([ScriptedProbeAnswer::Snapshot(answer)]),
+        );
+    }
+
+    pub(crate) fn push_connectors(
+        &self,
+        key: crate::platform::drm::DrmDeviceKey,
+        result: io::Result<Vec<crate::platform::drm::ConnectorProbe>>,
+    ) {
+        let answer = result.map_err(|error| error.raw_os_error().unwrap_or(libc::EIO));
+        self.answers
+            .lock()
+            .expect("scripted prober lock")
+            .entry(key)
+            .or_default()
+            .push_back(ScriptedProbeAnswer::Connectors(answer));
+    }
+
+    pub(crate) fn set_connectors(
+        &self,
+        key: crate::platform::drm::DrmDeviceKey,
+        result: io::Result<Vec<crate::platform::drm::ConnectorProbe>>,
+    ) {
+        let answer = result.map_err(|error| error.raw_os_error().unwrap_or(libc::EIO));
+        self.answers.lock().expect("scripted prober lock").insert(
+            key,
+            std::collections::VecDeque::from([ScriptedProbeAnswer::Connectors(answer)]),
+        );
+    }
+
+    pub(crate) fn push_blocked_connectors(
+        &self,
+        key: crate::platform::drm::DrmDeviceKey,
+        result: io::Result<Vec<crate::platform::drm::ConnectorProbe>>,
+        barrier: ProbeBarrier,
+    ) {
+        let answer = result.map_err(|error| error.raw_os_error().unwrap_or(libc::EIO));
+        self.answers
+            .lock()
+            .expect("scripted prober lock")
+            .entry(key)
+            .or_default()
+            .push_back(ScriptedProbeAnswer::BlockConnectors {
+                result: answer,
+                barrier,
+            });
+    }
+
+    pub(crate) fn set_blocked_connectors(
+        &self,
+        key: crate::platform::drm::DrmDeviceKey,
+        result: io::Result<Vec<crate::platform::drm::ConnectorProbe>>,
+        barrier: ProbeBarrier,
+    ) {
+        let answer = result.map_err(|error| error.raw_os_error().unwrap_or(libc::EIO));
+        self.answers.lock().expect("scripted prober lock").insert(
+            key,
+            std::collections::VecDeque::from([ScriptedProbeAnswer::BlockConnectors {
+                result: answer,
+                barrier,
+            }]),
         );
     }
 
@@ -2819,7 +2883,9 @@ impl ConnectorProber for ScriptedConnectorProber {
             ScriptedProbeAnswer::Unscripted => Err(io::Error::other(format!(
                 "unscripted connector snapshot probe for {key}"
             ))),
-            ScriptedProbeAnswer::Connectors(_) => Err(io::Error::from_raw_os_error(libc::EINVAL)),
+            ScriptedProbeAnswer::Connectors(_) | ScriptedProbeAnswer::BlockConnectors { .. } => {
+                Err(io::Error::from_raw_os_error(libc::EINVAL))
+            }
         };
         drop(fd);
         fd_closed.store(true, std::sync::atomic::Ordering::Release);
@@ -2834,6 +2900,10 @@ impl ConnectorProber for ScriptedConnectorProber {
         let fd_closed = self.observe(key, fd.as_raw_fd());
         let result = match self.next_answer(key) {
             ScriptedProbeAnswer::Connectors(result) => scripted_probe_result(result),
+            ScriptedProbeAnswer::BlockConnectors { result, barrier } => {
+                barrier.block_worker();
+                scripted_probe_result(result)
+            }
             ScriptedProbeAnswer::Unscripted => Err(io::Error::other(format!(
                 "unscripted connector probe for {key}"
             ))),
@@ -5454,6 +5524,56 @@ impl PlatformBackend {
             .as_ref()
             .expect("install the scripted connector prober before scripting probe answers")
             .set_snapshot(key, result);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn script_connector_probes_for_tests(
+        &self,
+        key: crate::platform::drm::DrmDeviceKey,
+        result: io::Result<Vec<crate::platform::drm::ConnectorProbe>>,
+    ) {
+        self.scripted_connector_prober
+            .as_ref()
+            .expect("install the scripted connector prober before scripting probe answers")
+            .set_connectors(key, result);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queue_connector_probes_for_tests(
+        &self,
+        key: crate::platform::drm::DrmDeviceKey,
+        result: io::Result<Vec<crate::platform::drm::ConnectorProbe>>,
+    ) {
+        self.scripted_connector_prober
+            .as_ref()
+            .expect("install the scripted connector prober before scripting probe answers")
+            .push_connectors(key, result);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn script_blocked_connector_probes_for_tests(
+        &self,
+        key: crate::platform::drm::DrmDeviceKey,
+        result: io::Result<Vec<crate::platform::drm::ConnectorProbe>>,
+        barrier: ProbeBarrier,
+    ) {
+        self.scripted_connector_prober
+            .as_ref()
+            .expect("install the scripted connector prober before scripting probe answers")
+            .set_blocked_connectors(key, result, barrier);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queue_blocked_connector_probes_for_tests(
+        &self,
+        key: crate::platform::drm::DrmDeviceKey,
+        result: io::Result<Vec<crate::platform::drm::ConnectorProbe>>,
+        barrier: ProbeBarrier,
+    ) {
+        self.scripted_connector_prober
+            .as_ref()
+            .expect("install the scripted connector prober before scripting probe answers")
+            .push_blocked_connectors(key, result, barrier);
     }
 
     #[cfg(test)]

@@ -24,10 +24,11 @@ pub use params::{
 pub use trait_def::{
     ActiveCursorImage, Backend, BackendFdKind, CompletedPresentEvent, CrtcConfigApply,
     CrtcConfigToken, DisplayedCursor, Dri3Caps, Dri3ImportModifier, Dri3PixmapExport,
-    HostSocketStatus, KeyboardMappingChange, KeymapLoad, ModeSpec, PresentCaps, PresentClockSample,
-    PresentClockSource, PresentScanoutCandidate, PresentSequenceTarget, PresentSourceWait,
-    PresentWake, RequesterAbandon, RequesterlessPublication, SyncobjHandle, TopologyEpisodeEvent,
-    XkbIndicatorMapsChange, XkbNewKeyboardInfo, XkbSetEvent, XkbSetOutcome, XshmfenceHandle,
+    ForcedReprobeApply, ForcedReprobeResult, HostSocketStatus, KeyboardMappingChange, KeymapLoad,
+    ModeSpec, PresentCaps, PresentClockSample, PresentClockSource, PresentScanoutCandidate,
+    PresentSequenceTarget, PresentSourceWait, PresentWake, RequesterAbandon,
+    RequesterlessPublication, SyncobjHandle, TopologyEpisodeEvent, XkbIndicatorMapsChange,
+    XkbNewKeyboardInfo, XkbSetEvent, XkbSetOutcome, XshmfenceHandle,
 };
 
 use yserver_protocol::x11::ClientId;

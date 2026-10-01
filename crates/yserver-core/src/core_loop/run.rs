@@ -29,7 +29,8 @@ use super::{
         token_to_backend_index, token_to_client, token_to_listener_index,
     },
     process_request::{
-        CrtcConfigPublication, CrtcConfigReply, RequestOutcome, complete_crtc_config_reply,
+        CrtcConfigPublication, CrtcConfigReply, PendingForcedReprobe, RequestOutcome,
+        complete_crtc_config_reply, complete_forced_reprobe_reply,
         fire_present_configure_notify_for_window, process_request, publish_crtc_config,
     },
     reset::{GenerationLocals, ResetAction, ResetPolicy, ResetTrigger, reset_generation},
@@ -585,26 +586,41 @@ struct ParkedCrtcConfig {
     request_wire_bytes: usize,
 }
 
+#[derive(Clone, Copy)]
+struct ParkedForcedReprobe {
+    client_id: Option<yserver_protocol::x11::ClientId>,
+    sequence: yserver_protocol::x11::SequenceNumber,
+    byte_order: yserver_protocol::x11::ClientByteOrder,
+    request_wire_bytes: usize,
+}
+
 /// Backend waits indexed both by opaque token (completion) and by client
 /// (strict same-client FIFO blocking/cancellation).
 #[derive(Default)]
 pub(crate) struct PendingBackendRequests {
     crtc_by_token: HashMap<CrtcConfigToken, ParkedCrtcConfig>,
     crtc_by_client: HashMap<yserver_protocol::x11::ClientId, CrtcConfigToken>,
+    forced_reprobe_by_token: HashMap<CrtcConfigToken, ParkedForcedReprobe>,
+    forced_reprobe_by_client: HashMap<yserver_protocol::x11::ClientId, CrtcConfigToken>,
 }
 
 impl PendingBackendRequests {
     fn client_is_blocked(&self, client: yserver_protocol::x11::ClientId) -> bool {
         self.crtc_by_client.contains_key(&client)
+            || self.forced_reprobe_by_client.contains_key(&client)
     }
 
     fn park_crtc(&mut self, parked: ParkedCrtcConfig) -> Result<(), &'static str> {
         let client = parked.client_id;
         let token = parked.token;
-        if self.crtc_by_client.contains_key(&client) {
+        if self.crtc_by_client.contains_key(&client)
+            || self.forced_reprobe_by_client.contains_key(&client)
+        {
             return Err("client already has a pending backend request");
         }
-        if self.crtc_by_token.contains_key(&token) {
+        if self.crtc_by_token.contains_key(&token)
+            || self.forced_reprobe_by_token.contains_key(&token)
+        {
             return Err("backend reused a live CRTC configuration token");
         }
         self.crtc_by_client.insert(client, token);
@@ -620,6 +636,56 @@ impl PendingBackendRequests {
 
     fn take_crtc_reply(&mut self, token: CrtcConfigToken) -> Option<ParkedCrtcConfig> {
         self.take_crtc(token)
+    }
+
+    fn park_forced_reprobe(
+        &mut self,
+        pending: PendingForcedReprobe,
+        client_id: yserver_protocol::x11::ClientId,
+        sequence: yserver_protocol::x11::SequenceNumber,
+        request_wire_bytes: usize,
+    ) -> Result<(), &'static str> {
+        let token = pending.token;
+        if self.crtc_by_client.contains_key(&client_id)
+            || self.forced_reprobe_by_client.contains_key(&client_id)
+        {
+            return Err("client already has a pending backend request");
+        }
+        if self.crtc_by_token.contains_key(&token)
+            || self.forced_reprobe_by_token.contains_key(&token)
+        {
+            return Err("backend reused a live asynchronous token");
+        }
+        self.forced_reprobe_by_client.insert(client_id, token);
+        self.forced_reprobe_by_token.insert(
+            token,
+            ParkedForcedReprobe {
+                client_id: Some(client_id),
+                sequence,
+                byte_order: pending.byte_order,
+                request_wire_bytes,
+            },
+        );
+        Ok(())
+    }
+
+    fn take_forced_reprobe_reply(&mut self, token: CrtcConfigToken) -> Option<ParkedForcedReprobe> {
+        let parked = self.forced_reprobe_by_token.remove(&token)?;
+        if let Some(client_id) = parked.client_id {
+            self.forced_reprobe_by_client.remove(&client_id);
+        }
+        Some(parked)
+    }
+
+    /// Detach a departed requester's reply while retaining the token and its
+    /// gate turn until the backend work reaches a terminal result.
+    fn detach_forced_reprobe_requester(&mut self, client_id: yserver_protocol::x11::ClientId) {
+        let Some(token) = self.forced_reprobe_by_client.remove(&client_id) else {
+            return;
+        };
+        if let Some(parked) = self.forced_reprobe_by_token.get_mut(&token) {
+            parked.client_id = None;
+        }
     }
 
     fn take_client_crtc(
@@ -653,12 +719,20 @@ impl PendingBackendRequests {
 
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
-        self.crtc_by_token.is_empty() && self.crtc_by_client.is_empty()
+        self.crtc_by_token.is_empty()
+            && self.crtc_by_client.is_empty()
+            && self.forced_reprobe_by_token.is_empty()
+            && self.forced_reprobe_by_client.is_empty()
     }
 
     pub(crate) fn take_all_crtc_tokens(&mut self) -> Vec<CrtcConfigToken> {
         self.crtc_by_client.clear();
-        self.crtc_by_token.drain().map(|(token, _)| token).collect()
+        self.forced_reprobe_by_client.clear();
+        self.crtc_by_token
+            .drain()
+            .map(|(token, _)| token)
+            .chain(self.forced_reprobe_by_token.drain().map(|(token, _)| token))
+            .collect()
     }
 }
 
@@ -705,8 +779,15 @@ struct RandrGateWaiter {
 
 #[derive(Debug, Clone)]
 struct RandrGateFlight {
+    kind: RandrGateFlightKind,
     token: Option<CrtcConfigToken>,
     publication: Option<CrtcConfigPublication>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum RandrGateFlightKind {
+    Mutation,
+    ForcedReprobe,
 }
 
 /// Server-wide serial admission for configuration-changing RANDR requests.
@@ -723,6 +804,18 @@ pub(crate) struct RandrMutationGate {
 }
 
 impl RandrMutationGate {
+    fn hold_forced_reprobe_turn_for_tests(&mut self, token: CrtcConfigToken) {
+        assert!(
+            self.in_flight.is_none(),
+            "test forced turn starts on an idle gate"
+        );
+        self.in_flight = Some(RandrGateFlight {
+            kind: RandrGateFlightKind::ForcedReprobe,
+            token: Some(token),
+            publication: None,
+        });
+    }
+
     fn active_install_capable(&self, backend: &dyn Backend) -> bool {
         self.in_flight
             .as_ref()
@@ -733,6 +826,10 @@ impl RandrMutationGate {
     fn holds_requesterless_turn(&self, backend: &dyn Backend) -> bool {
         self.topology_episode.is_some()
             || !self.requested_topology_episodes.is_empty()
+            || self
+                .in_flight
+                .as_ref()
+                .is_some_and(|flight| flight.kind == RandrGateFlightKind::ForcedReprobe)
             || self.active_install_capable(backend)
     }
 
@@ -815,10 +912,12 @@ impl RandrMutationGate {
         if class == RandrRequestClass::NonGate {
             return;
         }
-        if class == RandrRequestClass::ForcedReprobe && !self.holds_requesterless_turn(backend) {
+        if class == RandrRequestClass::ForcedReprobe
+            && !self.holds_requesterless_turn(backend)
+            && !backend.forced_reprobe_may_be_pending()
+        {
             return;
         }
-
         let ticket = self.next_ticket;
         self.next_ticket = self.next_ticket.wrapping_add(1);
         req.randr_gate_ticket = Some(ticket);
@@ -891,25 +990,24 @@ impl RandrMutationGate {
                         .front()
                         .is_some_and(|head| head.ticket == ticket)
             }
-            RandrRequestClass::ForcedReprobe => match self.in_flight.as_ref() {
-                _ if self.topology_episode.is_some() => false,
-                Some(_) if self.active_install_capable(backend) => false,
-                Some(_) => true,
-                None => self
-                    .waiting
-                    .front()
-                    .is_some_and(|head| head.ticket == ticket),
-            },
+            RandrRequestClass::ForcedReprobe => {
+                self.in_flight.is_none()
+                    && self.topology_episode.is_none()
+                    && self.requested_topology_episodes.is_empty()
+                    && self
+                        .waiting
+                        .front()
+                        .is_some_and(|head| head.ticket == ticket)
+            }
             RandrRequestClass::NonGate => true,
         }
     }
 
     /// Consume a gate request immediately before it is dispatched. `true`
     /// means this request owns the gate through its synchronous completion or
-    /// pending CRTC publication. A forced reprobe only waits behind an
-    /// install-capable mutation; the reprobe itself is synchronous core-thread
-    /// work and does not occupy the gate.
-    fn admit(&mut self, req: &DeferredRequest, backend: &dyn Backend) -> bool {
+    /// pending backend result. A forced reprobe owns the same turn while its
+    /// worker runs, so a topology episode cannot publish ahead of its reply.
+    fn admit(&mut self, req: &DeferredRequest, _backend: &dyn Backend) -> bool {
         let Some(ticket) = req.randr_gate_ticket else {
             return false;
         };
@@ -938,25 +1036,31 @@ impl RandrMutationGate {
                 }
                 self.waiting.pop_front();
                 self.in_flight = Some(RandrGateFlight {
+                    kind: RandrGateFlightKind::Mutation,
                     token: None,
                     publication: None,
                 });
                 true
             }
             RandrRequestClass::ForcedReprobe => {
-                if self.holds_requesterless_turn(backend) {
-                    return false;
-                }
                 if self.in_flight.is_none()
+                    && self.topology_episode.is_none()
+                    && self.requested_topology_episodes.is_empty()
                     && self
                         .waiting
                         .front()
-                        .is_none_or(|head| head.ticket != ticket)
+                        .is_some_and(|head| head.ticket == ticket)
                 {
-                    return false;
+                    self.waiting.pop_front();
+                    self.in_flight = Some(RandrGateFlight {
+                        kind: RandrGateFlightKind::ForcedReprobe,
+                        token: None,
+                        publication: None,
+                    });
+                    true
+                } else {
+                    false
                 }
-                self.waiting.remove(index);
-                false
             }
             RandrRequestClass::NonGate => false,
         }
@@ -971,10 +1075,27 @@ impl RandrMutationGate {
         flight.publication = Some(publication);
     }
 
+    fn mark_forced_reprobe_pending(&mut self, token: CrtcConfigToken) {
+        let Some(flight) = self.in_flight.as_mut() else {
+            debug_assert!(false, "pending forced reprobe without a gate owner");
+            return;
+        };
+        debug_assert_eq!(flight.kind, RandrGateFlightKind::ForcedReprobe);
+        flight.token = Some(token);
+    }
+
+    fn owns_pending_token(&self, token: CrtcConfigToken) -> bool {
+        self.in_flight
+            .as_ref()
+            .is_some_and(|flight| flight.token == Some(token))
+    }
+
     fn take_publication(&mut self, token: CrtcConfigToken) -> Option<CrtcConfigPublication> {
         self.in_flight
             .as_mut()
-            .filter(|flight| flight.token == Some(token))
+            .filter(|flight| {
+                flight.kind == RandrGateFlightKind::Mutation && flight.token == Some(token)
+            })
             .and_then(|flight| flight.publication.take())
     }
 
@@ -1375,6 +1496,7 @@ fn abandon_client_randr_requests(
     {
         gate.finish_pending(token);
     }
+    pending.detach_forced_reprobe_requester(client);
 }
 
 pub(crate) fn cancel_all_pending_backend_requests(
@@ -1383,6 +1505,7 @@ pub(crate) fn cancel_all_pending_backend_requests(
 ) {
     for token in pending.take_all_crtc_tokens() {
         backend.cancel_crtc_config(token);
+        backend.cancel_forced_reprobe(token);
     }
 }
 
@@ -1511,6 +1634,49 @@ fn process_one_request(
                 pending_gate_mutation = true;
             }
         }
+        RequestOutcome::PendingForcedReprobe(continuation) => {
+            let token = continuation.token;
+            if let Err(reason) =
+                pending.park_forced_reprobe(continuation, req_client, req.sequence, req_wire_bytes)
+            {
+                log::error!(
+                    "cannot park asynchronous RRGetScreenResources for client {} token {}: {reason}",
+                    req_client.0,
+                    token.0,
+                );
+                if !pending.forced_reprobe_by_token.contains_key(&token)
+                    && !pending.crtc_by_token.contains_key(&token)
+                {
+                    backend.cancel_forced_reprobe(token);
+                }
+                disconnect_with_pending_cleanup(
+                    state,
+                    backend,
+                    pending,
+                    gate,
+                    reset_trigger,
+                    req_client,
+                );
+            } else if gate_mutation {
+                gate.mark_forced_reprobe_pending(token);
+                pending_gate_mutation = true;
+            } else {
+                log::error!(
+                    "backend returned pending forced reprobe token {} without a gate turn",
+                    token.0,
+                );
+                let _ = pending.take_forced_reprobe_reply(token);
+                backend.cancel_forced_reprobe(token);
+                disconnect_with_pending_cleanup(
+                    state,
+                    backend,
+                    pending,
+                    gate,
+                    reset_trigger,
+                    req_client,
+                );
+            }
+        }
     }
     if gate_mutation && !pending_gate_mutation {
         gate.finish_synchronous();
@@ -1567,9 +1733,10 @@ fn drain_pending_requests(
             gate_mutation,
             req,
         );
-        // A Legacy mutation and GetScreenResources' forced reprobe run on
-        // this thread, so the loop cannot service deadlines during them.
-        // Expire every waiter before another request can be admitted.
+        // A Legacy mutation and Legacy's forced reprobe run on this thread,
+        // so the loop cannot service deadlines during them. Owner forced
+        // reprobes return Pending and let the loop continue through the
+        // worker's two-second probe deadline.
         if gate_mutation || is_forced_reprobe {
             drain_expired_randr_gate_waiters(
                 state,
@@ -1699,7 +1866,10 @@ fn process_request_inline(
     };
     // Pending work has not committed any visible result yet. Its completion
     // path performs this bookkeeping exactly once when the result is applied.
-    if !matches!(&outcome, RequestOutcome::PendingCrtcConfig(_)) {
+    if !matches!(
+        &outcome,
+        RequestOutcome::PendingCrtcConfig(_) | RequestOutcome::PendingForcedReprobe(_)
+    ) {
         if std::mem::take(&mut state.damage_notify_flush_pending) {
             backend.flush_before_damage_notify();
         }
@@ -1752,6 +1922,74 @@ fn drain_ready_crtc_configs_with_gate_policy(
 ) {
     drain_requesterless_publications(state, backend, gate, publish_old_generation, None);
     for token in backend.drain_ready_crtc_configs() {
+        if let Some(parked) = pending.take_forced_reprobe_reply(token) {
+            if !gate.owns_pending_token(token) {
+                backend.cancel_forced_reprobe(token);
+                gate.finish_pending(token);
+                drain_requesterless_publications(
+                    state,
+                    backend,
+                    gate,
+                    publish_old_generation,
+                    None,
+                );
+                continue;
+            }
+            let result = if publish_old_generation {
+                backend.finish_forced_reprobe(token, state)
+            } else {
+                backend.cancel_forced_reprobe(token);
+                Ok(crate::backend::ForcedReprobeResult::Expired)
+            };
+            if publish_old_generation {
+                if std::mem::take(&mut state.damage_notify_flush_pending) {
+                    backend.flush_before_damage_notify();
+                }
+                backend.mark_dirty();
+            }
+            let outcome = parked
+                .client_id
+                .map_or(Ok(RequestOutcome::Handled), |client_id| {
+                    complete_forced_reprobe_reply(
+                        state,
+                        client_id,
+                        parked.sequence,
+                        parked.byte_order,
+                        result,
+                    )
+                });
+            gate.finish_pending(token);
+            // A topology episode requested by a worker while this forced
+            // reprobe owned the turn is granted only after its reply.
+            drain_requesterless_publications(state, backend, gate, publish_old_generation, None);
+            match outcome {
+                Ok(RequestOutcome::Disconnect(client)) => {
+                    disconnect_with_pending_cleanup(
+                        state,
+                        backend,
+                        pending,
+                        gate,
+                        reset_trigger,
+                        client,
+                    );
+                }
+                Ok(RequestOutcome::Handled) => {
+                    if let Some(client_id) = parked.client_id {
+                        grant_request_credit(state, client_id, parked.request_wire_bytes);
+                    }
+                }
+                Ok(
+                    RequestOutcome::PendingCrtcConfig(_) | RequestOutcome::PendingForcedReprobe(_),
+                ) => {
+                    unreachable!("forced reprobe completion cannot park a second backend request")
+                }
+                Err(error) => log::warn!(
+                    "RRGetScreenResources completion reply failed (token {}): {error}",
+                    token.0
+                ),
+            }
+            continue;
+        }
         let parked = pending.take_crtc_reply(token);
         let Some(publication) = gate.take_publication(token) else {
             // Cancellation may race a worker completion. A token without a
@@ -1839,7 +2077,7 @@ fn drain_ready_crtc_configs_with_gate_policy(
                     grant_request_credit(state, reply.client_id, reply.request_wire_bytes);
                 }
             }
-            RequestOutcome::PendingCrtcConfig(_) => {
+            RequestOutcome::PendingCrtcConfig(_) | RequestOutcome::PendingForcedReprobe(_) => {
                 unreachable!("CRTC completion cannot start a second asynchronous request")
             }
         }
@@ -2900,6 +3138,21 @@ pub fn run_iteration_tail_for_tests(
             Some(delivery_trace),
         );
     });
+}
+
+/// Hold the existing core-entry test gate for a forced reprobe while a KMS
+/// fixture drives backend entries. This lets the shared driver verify that
+/// topology events remain queued behind the request's gate turn.
+#[doc(hidden)]
+pub fn hold_forced_reprobe_turn_for_tests(token: CrtcConfigToken) {
+    TEST_CORE_RANDR_GATE.with(|gate| gate.borrow_mut().hold_forced_reprobe_turn_for_tests(token));
+}
+
+/// Complete the test-only forced turn after the backend's ready token has
+/// been consumed, then let the next core-entry iteration deliver queued events.
+#[doc(hidden)]
+pub fn release_forced_reprobe_turn_for_tests(token: CrtcConfigToken) {
+    TEST_CORE_RANDR_GATE.with(|gate| gate.borrow_mut().finish_pending(token));
 }
 
 thread_local! {
@@ -5511,6 +5764,373 @@ mod tests {
     }
 
     #[test]
+    fn c0_3cii_core_forced_reprobe_parks_the_reply() {
+        use crate::backend::{CrtcConfigToken, ForcedReprobeResult, recording::RecordingBackend};
+        use yserver_protocol::x11::randr as rr;
+
+        let mut state = make_c0_randr_state();
+        let mut reprobe_peer = install_c0_client(&mut state, 1);
+        let mut mutation_peer = install_c0_client(&mut state, 2);
+        state.randr_select_masks.insert(
+            (1, crate::resources::ROOT_WINDOW),
+            rr::NOTIFY_MASK_OUTPUT_CHANGE,
+        );
+        let token = CrtcConfigToken(0xc050);
+        let mut backend = RecordingBackend::new();
+        backend.pending_forced_reprobe = Some(token);
+        backend
+            .forced_reprobe_results
+            .insert(token, Ok(ForcedReprobeResult::Applied));
+        backend.reprobe_connectors_changes_state = true;
+        let mut pending = PendingBackendRequests::default();
+        let mut gate = RandrMutationGate::default();
+        let mut queue = FairRequestQueue::default();
+        let mut resources_body = Vec::new();
+        resources_body.extend_from_slice(&crate::resources::ROOT_WINDOW.0.to_le_bytes());
+        accept_c0_request(
+            &backend,
+            &mut gate,
+            &mut queue,
+            c0_randr_request(1, 1, rr::RR_GET_SCREEN_RESOURCES, resources_body, 2),
+        );
+        drain_c0_requests(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut queue,
+        );
+        assert!(gate.is_busy(), "the forced reprobe owns its gate turn");
+        assert!(read_c0_available(&mut reprobe_peer).is_empty());
+
+        accept_c0_request(
+            &backend,
+            &mut gate,
+            &mut queue,
+            c0_randr_request(2, 1, rr::RR_SET_CRTC_CONFIG, set_crtc_body(4), 7),
+        );
+        drain_c0_requests(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut queue,
+        );
+        assert!(read_c0_available(&mut mutation_peer).is_empty());
+
+        backend.ready_crtc_configs.push(token);
+        let mut reset = ResetTrigger::new(ResetPolicy::NoReset);
+        drain_ready_crtc_configs_with_gate(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut reset,
+        );
+        let reply_and_events = read_c0_available(&mut reprobe_peer);
+        assert!(reply_and_events.len() > 32);
+        assert_eq!(
+            reply_and_events[0] & 0x7f,
+            90,
+            "publication event precedes reply"
+        );
+        assert_eq!(reply_and_events[32], 1, "reply follows publication");
+        assert!(!gate.is_busy(), "the request turn ends after its reply");
+        assert!(read_c0_available(&mut mutation_peer).is_empty());
+
+        drain_c0_requests(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut queue,
+        );
+        assert_eq!(read_c0_available(&mut mutation_peer).len(), 32);
+        assert!(
+            state
+                .randr
+                .outputs
+                .iter()
+                .any(|output| output.output_id == 1),
+            "the expected live RANDR output remains present"
+        );
+    }
+
+    #[test]
+    fn c0_3cii_core_forced_reprobe_requester_gone() {
+        use crate::backend::{CrtcConfigToken, ForcedReprobeResult, recording::RecordingBackend};
+        use yserver_protocol::x11::randr as rr;
+
+        let mut state = make_c0_randr_state();
+        let mut departed_peer = install_c0_client(&mut state, 1);
+        let mut survivor_peer = install_c0_client(&mut state, 2);
+        let token = CrtcConfigToken(0xc051);
+        let mut backend = RecordingBackend::new();
+        backend.pending_forced_reprobe = Some(token);
+        backend
+            .forced_reprobe_results
+            .insert(token, Ok(ForcedReprobeResult::Expired));
+        let mut pending = PendingBackendRequests::default();
+        let mut gate = RandrMutationGate::default();
+        let mut queue = FairRequestQueue::default();
+        let mut resources_body = Vec::new();
+        resources_body.extend_from_slice(&crate::resources::ROOT_WINDOW.0.to_le_bytes());
+        accept_c0_request(
+            &backend,
+            &mut gate,
+            &mut queue,
+            c0_randr_request(1, 1, rr::RR_GET_SCREEN_RESOURCES, resources_body, 2),
+        );
+        drain_c0_requests(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut queue,
+        );
+        assert!(gate.is_busy());
+
+        accept_c0_request(
+            &backend,
+            &mut gate,
+            &mut queue,
+            c0_randr_request(2, 1, rr::RR_SET_CRTC_CONFIG, set_crtc_body(4), 7),
+        );
+        drain_c0_requests(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut queue,
+        );
+        disconnect_with_pending_cleanup(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut ResetTrigger::new(ResetPolicy::NoReset),
+            yserver_protocol::x11::ClientId(1),
+        );
+        assert!(pending.forced_reprobe_by_token.contains_key(&token));
+        assert!(gate.is_busy(), "disconnect detaches only the reply owner");
+        assert!(!state.clients.contains_key(&1));
+
+        backend.ready_crtc_configs.push(token);
+        drain_ready_crtc_configs_with_gate(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut ResetTrigger::new(ResetPolicy::NoReset),
+        );
+        assert!(
+            !gate.is_busy(),
+            "the token's terminal result releases the turn"
+        );
+        assert!(backend.finished_forced_reprobes.contains(&token));
+
+        drain_c0_requests(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut queue,
+        );
+        assert_eq!(read_c0_available(&mut survivor_peer).len(), 32);
+        assert!(read_c0_available(&mut departed_peer).is_empty());
+        assert!(
+            state
+                .randr
+                .outputs
+                .iter()
+                .any(|output| output.output_id == 1)
+        );
+    }
+
+    #[test]
+    fn c0_3cii_core_forced_reprobe_failure_is_badalloc() {
+        use crate::backend::{CrtcConfigToken, recording::RecordingBackend};
+        use yserver_protocol::x11::randr as rr;
+
+        let mut state = make_c0_randr_state();
+        let mut peer = install_c0_client(&mut state, 1);
+        let token = CrtcConfigToken(0xc052);
+        let mut backend = RecordingBackend::new();
+        backend.pending_forced_reprobe = Some(token);
+        backend
+            .forced_reprobe_results
+            .insert(token, Err(std::io::ErrorKind::Other));
+        let mut pending = PendingBackendRequests::default();
+        let mut gate = RandrMutationGate::default();
+        let mut queue = FairRequestQueue::default();
+        let mut body = Vec::new();
+        body.extend_from_slice(&crate::resources::ROOT_WINDOW.0.to_le_bytes());
+        accept_c0_request(
+            &backend,
+            &mut gate,
+            &mut queue,
+            c0_randr_request(1, 1, rr::RR_GET_SCREEN_RESOURCES, body, 2),
+        );
+        drain_c0_requests(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut queue,
+        );
+        assert!(
+            read_c0_available(&mut peer).is_empty(),
+            "failure remains parked until ready"
+        );
+        backend.ready_crtc_configs.push(token);
+        drain_ready_crtc_configs_with_gate(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut ResetTrigger::new(ResetPolicy::NoReset),
+        );
+        let error = read_c0_available(&mut peer);
+        assert_eq!(error.len(), 32);
+        assert_eq!(error[0], 0, "X11 error packet");
+        assert_eq!(error[1], yserver_protocol::x11::error::BAD_ALLOC);
+        assert_eq!(error[2], 1, "original request sequence");
+        assert!(!gate.is_busy(), "failed token releases the forced turn");
+        assert!(backend.finished_forced_reprobes.contains(&token));
+        assert!(
+            state
+                .randr
+                .outputs
+                .iter()
+                .any(|output| output.output_id == 1)
+        );
+    }
+
+    #[test]
+    fn c0_3cii_core_expired_forced_reprobe_releases_next_mutation() {
+        use crate::backend::{CrtcConfigToken, ForcedReprobeResult, recording::RecordingBackend};
+        use yserver_protocol::x11::randr as rr;
+
+        let mut state = make_c0_randr_state();
+        let mut query_peer = install_c0_client(&mut state, 1);
+        let mut mutation_peer = install_c0_client(&mut state, 2);
+        let token = CrtcConfigToken(0xc053);
+        let mut backend = RecordingBackend::new();
+        backend.pending_forced_reprobe = Some(token);
+        backend
+            .forced_reprobe_results
+            .insert(token, Ok(ForcedReprobeResult::Expired));
+        backend.apply_crtc_configs = true;
+        let mut pending = PendingBackendRequests::default();
+        let mut gate = RandrMutationGate::default();
+        let mut queue = FairRequestQueue::default();
+        let mut resources_body = Vec::new();
+        resources_body.extend_from_slice(&crate::resources::ROOT_WINDOW.0.to_le_bytes());
+        accept_c0_request(
+            &backend,
+            &mut gate,
+            &mut queue,
+            c0_randr_request(1, 1, rr::RR_GET_SCREEN_RESOURCES, resources_body, 2),
+        );
+        drain_c0_requests(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut queue,
+        );
+        accept_c0_request(
+            &backend,
+            &mut gate,
+            &mut queue,
+            c0_randr_request(2, 1, rr::RR_SET_CRTC_CONFIG, set_crtc_body(4), 7),
+        );
+        drain_c0_requests(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut queue,
+        );
+        assert!(read_c0_available(&mut query_peer).is_empty());
+        assert!(read_c0_available(&mut mutation_peer).is_empty());
+
+        backend.ready_crtc_configs.push(token);
+        drain_ready_crtc_configs_with_gate(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut ResetTrigger::new(ResetPolicy::NoReset),
+        );
+        let expired_reply = read_c0_available(&mut query_peer);
+        assert!(expired_reply.len() >= 32);
+        assert_eq!(
+            expired_reply[0], 1,
+            "Expired replies from the published state"
+        );
+        assert!(!gate.is_busy());
+        drain_c0_requests(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut queue,
+        );
+        assert_eq!(read_c0_available(&mut mutation_peer).len(), 32);
+        assert!(backend.calls().iter().any(|call| matches!(
+            call,
+            crate::backend::recording::RecordedCall::ApplyCrtcConfig { .. }
+        )));
+        assert!(
+            state
+                .randr
+                .outputs
+                .iter()
+                .any(|output| output.output_id == 1)
+        );
+    }
+
+    #[test]
+    fn c0_3cii_legacy_only_reprobe_unchanged() {
+        use crate::backend::recording::RecordingBackend;
+        use yserver_protocol::x11::randr as rr;
+
+        let mut state = make_c0_randr_state();
+        let mut peer = install_c0_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        backend.reprobe_connectors_changes_state = true;
+        let mut pending = PendingBackendRequests::default();
+        let mut gate = RandrMutationGate::default();
+        let mut queue = FairRequestQueue::default();
+        let mut resources_body = Vec::new();
+        resources_body.extend_from_slice(&crate::resources::ROOT_WINDOW.0.to_le_bytes());
+        accept_c0_request(
+            &backend,
+            &mut gate,
+            &mut queue,
+            c0_randr_request(1, 1, rr::RR_GET_SCREEN_RESOURCES, resources_body, 2),
+        );
+        drain_c0_requests(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut queue,
+        );
+        let reply = read_c0_available(&mut peer);
+        assert!(reply.len() >= 32, "synchronous reprobe replies immediately");
+        assert_eq!(reply[0], 1, "GetScreenResources reply");
+        assert_eq!(backend.reprobe_connectors_calls, 1);
+        assert!(pending.is_empty());
+        assert!(!gate.is_busy());
+        assert!(
+            !state.randr.outputs[0].connected,
+            "the synchronous reprobe publishes through the established call"
+        );
+    }
+
+    #[test]
     fn c0_3bii_mate_reassert_behind_a_change() {
         use crate::backend::{CrtcConfigToken, recording::RecordingBackend};
 
@@ -6024,6 +6644,7 @@ mod tests {
         backend.crtc_config_is_install_capable = true;
         let mut gate = RandrMutationGate {
             in_flight: Some(RandrGateFlight {
+                kind: RandrGateFlightKind::Mutation,
                 token: Some(token),
                 publication: Some(c0_test_publication()),
             }),
@@ -8816,6 +9437,7 @@ mod tests {
             .unwrap();
         let mut gate = RandrMutationGate {
             in_flight: Some(RandrGateFlight {
+                kind: RandrGateFlightKind::Mutation,
                 token: Some(token),
                 publication: Some(publication),
             }),

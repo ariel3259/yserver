@@ -32,7 +32,8 @@ use yserver_protocol::x11::{self, AtomId, ClientId, RequestHeader, ResourceId, S
 use crate::core_loop::pointer_fanout::pointer_event_fanout_to_state;
 use crate::{
     backend::{
-        Backend, CrtcConfigApply, CrtcConfigToken, ModeSpec, OriginContext, params::FillState,
+        Backend, CrtcConfigApply, CrtcConfigToken, ForcedReprobeApply, ForcedReprobeResult,
+        ModeSpec, OriginContext, params::FillState,
     },
     core_loop::{
         client_io::{self, WriteOutcome},
@@ -125,6 +126,16 @@ pub enum RequestOutcome {
     /// request's flow-control credit and park later requests from the same
     /// client until the token becomes ready.
     PendingCrtcConfig(PendingCrtcConfig),
+    /// RANDR's `GetScreenResources` probe is continuing in the backend. The
+    /// core parks this reply and holds the request's gate turn until ready.
+    PendingForcedReprobe(PendingForcedReprobe),
+}
+
+/// Continuation data for an asynchronous `RRGetScreenResources` reply.
+#[derive(Debug, Clone, Copy)]
+pub struct PendingForcedReprobe {
+    pub token: CrtcConfigToken,
+    pub byte_order: yserver_protocol::x11::ClientByteOrder,
 }
 
 /// Continuation data needed to finish an asynchronous `RRSetCrtcConfig`
@@ -3186,27 +3197,29 @@ fn handle_randr_request(
             // RRGetInfo force_query=TRUE). A probe failure surfaces as
             // BadAlloc, matching Xorg. GetScreenResourcesCurrent below
             // skips this and serves the cached view.
-            if let Err(e) = backend.reprobe_connectors(state) {
-                log::warn!("RRGetScreenResources reprobe failed: {e}");
-                return emit_x11_error_with_minor(
-                    state,
-                    client_id,
-                    sequence,
-                    x11::error::BAD_ALLOC,
-                    0,
-                    u16::from(header.data),
-                    RANDR_MAJOR_OPCODE,
-                );
+            match backend.begin_forced_reprobe(state) {
+                Err(error) => {
+                    log::warn!("RRGetScreenResources reprobe failed: {error}");
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_ALLOC,
+                        0,
+                        u16::from(header.data),
+                        RANDR_MAJOR_OPCODE,
+                    );
+                }
+                Ok(ForcedReprobeApply::Applied) => {
+                    return reply_get_screen_resources(state, client_id, sequence, byte_order);
+                }
+                Ok(ForcedReprobeApply::Pending(token)) => {
+                    return Ok(RequestOutcome::PendingForcedReprobe(PendingForcedReprobe {
+                        token,
+                        byte_order,
+                    }));
+                }
             }
-            let resources = state.randr.screen_resources_current();
-            let buf = x11randr::encode_get_screen_resources_current_reply(
-                byte_order, sequence, &resources,
-            );
-            let Some(client) = state.clients.get_mut(&client_id.0) else {
-                return Ok(RequestOutcome::Handled);
-            };
-            let _byte_order = client.byte_order;
-            return Ok(write_to_client(client, client_id, &buf));
         }
         x11randr::RR_GET_SCREEN_RESOURCES_CURRENT => {
             let window = request_xid(body);
@@ -25051,6 +25064,52 @@ pub(crate) fn emit_x11_error_with_minor(
         major_opcode,
     )?;
     Ok(write_to_client(client, client_id, &buf))
+}
+
+fn reply_get_screen_resources(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    byte_order: yserver_protocol::x11::ClientByteOrder,
+) -> io::Result<RequestOutcome> {
+    use yserver_protocol::x11::randr as x11randr;
+
+    let resources = state.randr.screen_resources_current();
+    let buf = x11randr::encode_get_screen_resources_current_reply(byte_order, sequence, &resources);
+    let Some(client) = state.clients.get_mut(&client_id.0) else {
+        return Ok(RequestOutcome::Handled);
+    };
+    Ok(write_to_client(client, client_id, &buf))
+}
+
+/// Complete the protocol tail for a ready forced reprobe. The backend has
+/// already applied a successful result while the core still owns the request's
+/// gate turn. Both success and expiry answer from the current published state;
+/// a probe error retains RANDR's BadAlloc mapping.
+pub(crate) fn complete_forced_reprobe_reply(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    byte_order: yserver_protocol::x11::ClientByteOrder,
+    result: io::Result<ForcedReprobeResult>,
+) -> io::Result<RequestOutcome> {
+    match result {
+        Ok(ForcedReprobeResult::Applied | ForcedReprobeResult::Expired) => {
+            reply_get_screen_resources(state, client_id, sequence, byte_order)
+        }
+        Err(error) => {
+            log::warn!("RRGetScreenResources reprobe failed: {error}");
+            emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_ALLOC,
+                0,
+                u16::from(yserver_protocol::x11::randr::RR_GET_SCREEN_RESOURCES),
+                RANDR_MAJOR_OPCODE,
+            )
+        }
+    }
 }
 
 fn log_void(

@@ -13,6 +13,10 @@ rerun. The gate's own behaviour stays covered by the `yserver-core`
 `c0_3bii_` wire tests (transport-independent). No harness is built for them
 now.
 
+**Accounting update (3c-ii Task 5):** Owner forced reprobe now runs on the
+probe worker with its own 2 s deadline, so `L_reprobe` is excluded from the
+synchronous `L` term below. Legacy mutations in a mixed server remain in `L`.
+
 **Revision 8 (2026-09-24, coordinator)** — codex round 7 (0 blocking, 1 major,
 1 minor, `../findings/2026-09-24-stage-3b-ii-plan-review-round7.md`): the XDMCP
 termination branch waits for the terminal result too (M-1, Task 2); the goal's
@@ -65,9 +69,9 @@ wire-level scripts (M-1).
 **Goal:** the six RANDR obligations of the umbrella (§3b) hold for Owner and
 Legacy alike: one named component orders every RANDR mutation, `Success`
 means installed, an installed change is published even if its requester left,
-every parked request is answered within `Q + E + L`, `L` being the synchronous
-core-thread work ahead of it (Legacy mutations in a mixed server, and the
-forced connector reprobe until 3c — design revision 12), and
+every parked synchronous request is answered within `Q + E + L`, `L` being the
+synchronous core-thread work ahead of it (including Legacy mutations in a
+mixed server; Owner forced reprobe has its separate 3c-ii 2 s worker deadline), and
 changes no request caused have an ordered publication path.
 
 **Prerequisite:** plans 3b-i-1 and 3b-i-2 accepted. Tasks 1–4 are core-side

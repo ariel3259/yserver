@@ -407,6 +407,14 @@ pub struct RecordingBackend {
     /// Test controls and observations for asynchronous CRTC configuration.
     /// `None` preserves the synchronous `apply_crtc_config` path.
     pub pending_crtc_config: Option<CrtcConfigToken>,
+    /// Token returned by a scripted asynchronous forced reprobe.
+    pub pending_forced_reprobe: Option<CrtcConfigToken>,
+    pub forced_reprobe_results: std::collections::HashMap<
+        CrtcConfigToken,
+        Result<crate::backend::ForcedReprobeResult, io::ErrorKind>,
+    >,
+    pub finished_forced_reprobes: Vec<CrtcConfigToken>,
+    pub cancelled_forced_reprobes: Vec<CrtcConfigToken>,
     /// When set, a synchronous `apply_crtc_config` reports a change and the
     /// following `refresh_randr_state_set_time` installs it into
     /// `state.randr`, carrying client-owned state as the KMS rebuild does.
@@ -679,6 +687,10 @@ impl RecordingBackend {
             provider_output_source_changed: true,
             provider_output_source_error: None,
             pending_crtc_config: None,
+            pending_forced_reprobe: None,
+            forced_reprobe_results: std::collections::HashMap::new(),
+            finished_forced_reprobes: Vec::new(),
+            cancelled_forced_reprobes: Vec::new(),
             apply_crtc_configs: false,
             applied_crtc_config: None,
             ready_crtc_configs: Vec::new(),
@@ -999,6 +1011,43 @@ impl Backend for RecordingBackend {
             }
         }
         Ok(())
+    }
+
+    fn begin_forced_reprobe(
+        &mut self,
+        state: &mut crate::server::ServerState,
+    ) -> io::Result<crate::backend::ForcedReprobeApply> {
+        if let Some(token) = self.pending_forced_reprobe.take() {
+            return Ok(crate::backend::ForcedReprobeApply::Pending(token));
+        }
+        self.reprobe_connectors(state)
+            .map(|()| crate::backend::ForcedReprobeApply::Applied)
+    }
+
+    fn forced_reprobe_may_be_pending(&self) -> bool {
+        self.pending_forced_reprobe.is_some()
+    }
+
+    fn finish_forced_reprobe(
+        &mut self,
+        token: CrtcConfigToken,
+        state: &mut crate::server::ServerState,
+    ) -> io::Result<crate::backend::ForcedReprobeResult> {
+        self.finished_forced_reprobes.push(token);
+        let result = self
+            .forced_reprobe_results
+            .remove(&token)
+            .unwrap_or(Err(io::ErrorKind::NotFound))
+            .map_err(io::Error::from)?;
+        if result == crate::backend::ForcedReprobeResult::Applied {
+            self.reprobe_connectors(state)?;
+        }
+        Ok(result)
+    }
+
+    fn cancel_forced_reprobe(&mut self, token: CrtcConfigToken) {
+        self.cancelled_forced_reprobes.push(token);
+        self.forced_reprobe_results.remove(&token);
     }
 
     fn set_logical_screen_size(&mut self, width: u16, height: u16) -> io::Result<()> {

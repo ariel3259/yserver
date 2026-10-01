@@ -1818,6 +1818,11 @@ pub struct KmsBackend {
     pub(crate) core_driver_finished_crtc_configs_for_tests:
         VecDeque<(CrtcConfigToken, std::io::Result<bool>)>,
     #[cfg(test)]
+    pub(crate) core_driver_finished_forced_reprobes_for_tests: VecDeque<(
+        CrtcConfigToken,
+        Result<yserver_core::backend::ForcedReprobeResult, String>,
+    )>,
+    #[cfg(test)]
     pub(crate) core_driver_announced_crtc_configs_for_tests: HashSet<CrtcConfigToken>,
     #[cfg(test)]
     pub(crate) core_driver_readiness_script_for_tests:
@@ -2277,6 +2282,12 @@ pub struct KmsBackend {
     probe_result_receiver: std::sync::mpsc::Receiver<ProbeWorkerResult>,
     next_probe_epoch: u64,
     probe_episode: Option<ProbeEpisode>,
+    waiting_forced_reprobe: Option<WaitingForcedReprobe>,
+    ready_forced_reprobe_results: HashMap<CrtcConfigToken, io::Result<ReadyForcedReprobe>>,
+    /// Latest changed Owner connector registry accepted as an administrative
+    /// (RANDR forced) reprobe. This records the classification without
+    /// projecting a lifecycle transition or issuing KMS work.
+    administrative_reprobe_records: HashMap<DrmDeviceKey, u64>,
     /// Session-persistent PRIME Output Source policy, keyed by the KMS sink.
     ///
     /// Values use the provider's tagged endpoint identity rather than a DRM
@@ -2416,6 +2427,7 @@ const PROBE_EPISODE_DEADLINE: std::time::Duration = std::time::Duration::from_se
 enum ProbeEpisodeCause {
     Acquire,
     Hotplug,
+    ForcedReprobe,
 }
 
 struct ProbeEpisode {
@@ -2427,13 +2439,35 @@ struct ProbeEpisode {
     owner_devices: HashSet<DrmDeviceKey>,
     legacy_devices: HashSet<DrmDeviceKey>,
     results: std::collections::BTreeMap<DrmDeviceKey, io::Result<Vec<ConnectorSnapshot>>>,
+    connector_results: std::collections::BTreeMap<
+        DrmDeviceKey,
+        io::Result<Vec<crate::platform::drm::ConnectorProbe>>,
+    >,
+    forced_reprobe_token: Option<CrtcConfigToken>,
+}
+
+struct WaitingForcedReprobe {
+    token: CrtcConfigToken,
+    deadline: std::time::Instant,
+}
+
+type ConnectorRegistryFingerprint = Vec<(String, bool, Vec<(u16, u16, u32, bool)>)>;
+
+enum ReadyForcedReprobe {
+    Probes(Vec<(DrmDeviceKey, Vec<crate::platform::drm::ConnectorProbe>)>),
+    Expired,
+}
+
+enum ProbeWorkerAnswer {
+    Snapshot(Vec<ConnectorSnapshot>),
+    Connectors(Vec<crate::platform::drm::ConnectorProbe>),
 }
 
 struct ProbeWorkerResult {
     device: DrmDeviceKey,
     incarnation: Option<IncarnationId>,
     epoch: u64,
-    result: io::Result<Vec<ConnectorSnapshot>>,
+    result: io::Result<ProbeWorkerAnswer>,
 }
 
 struct ProbeWorker {
@@ -5159,7 +5193,16 @@ impl KmsBackend {
             self.next_crtc_config_token = token.0.wrapping_add(1).max(1);
             if !self.pending_crtc_config_probes.contains_key(&token)
                 && !self.ready_crtc_config_results.contains_key(&token)
+                && !self.ready_forced_reprobe_results.contains_key(&token)
                 && !self.ready_client_modeset_results.contains_key(&token)
+                && self
+                    .waiting_forced_reprobe
+                    .as_ref()
+                    .is_none_or(|waiting| waiting.token != token)
+                && self
+                    .probe_episode
+                    .as_ref()
+                    .is_none_or(|episode| episode.forced_reprobe_token != Some(token))
                 && !self.detached_client_modeset_tokens.contains(&token)
                 && !self.lifecycle_drivers.values().any(|driver| {
                     driver
@@ -7634,6 +7677,8 @@ impl KmsBackend {
             #[cfg(test)]
             core_driver_finished_crtc_configs_for_tests: VecDeque::new(),
             #[cfg(test)]
+            core_driver_finished_forced_reprobes_for_tests: VecDeque::new(),
+            #[cfg(test)]
             core_driver_announced_crtc_configs_for_tests: HashSet::new(),
             #[cfg(test)]
             core_driver_readiness_script_for_tests: VecDeque::new(),
@@ -7770,6 +7815,9 @@ impl KmsBackend {
             probe_result_receiver,
             next_probe_epoch: 1,
             probe_episode: None,
+            waiting_forced_reprobe: None,
+            ready_forced_reprobe_results: HashMap::new(),
+            administrative_reprobe_records: HashMap::new(),
             provider_output_sources: HashMap::new(),
             output_identity_by_id: std::collections::HashMap::new(),
             output_key_by_id: std::collections::HashMap::new(),
@@ -9144,6 +9192,8 @@ impl KmsBackend {
             #[cfg(test)]
             core_driver_finished_crtc_configs_for_tests: VecDeque::new(),
             #[cfg(test)]
+            core_driver_finished_forced_reprobes_for_tests: VecDeque::new(),
+            #[cfg(test)]
             core_driver_announced_crtc_configs_for_tests: HashSet::new(),
             #[cfg(test)]
             core_driver_readiness_script_for_tests: VecDeque::new(),
@@ -9279,6 +9329,9 @@ impl KmsBackend {
             probe_result_receiver,
             next_probe_epoch: 1,
             probe_episode: None,
+            waiting_forced_reprobe: None,
+            ready_forced_reprobe_results: HashMap::new(),
+            administrative_reprobe_records: HashMap::new(),
             provider_output_sources: HashMap::new(),
             output_identity_by_id: std::collections::HashMap::new(),
             output_key_by_id: std::collections::HashMap::new(),
@@ -11552,6 +11605,27 @@ impl KmsBackend {
             );
         }
         changed
+    }
+
+    fn connector_registry_fingerprint(&self, device: DrmDeviceKey) -> ConnectorRegistryFingerprint {
+        let mut connectors = self
+            .randr_id_alloc
+            .entries()
+            .filter(|(key, _)| key.device_key == device)
+            .map(|(key, entry)| {
+                (
+                    key.connector_name.clone(),
+                    entry.connected,
+                    entry
+                        .modes
+                        .iter()
+                        .map(|mode| (mode.width, mode.height, mode.vrefresh, mode.preferred))
+                        .collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+        connectors.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        connectors
     }
 
     /// RandR output list — mirrors `KmsBackend::randr_outputs`.
@@ -25650,6 +25724,7 @@ impl KmsBackend {
             {
                 episode.remaining.remove(&device);
                 episode.results.remove(&device);
+                episode.connector_results.remove(&device);
                 Some(episode.epoch)
             } else {
                 None
@@ -25797,6 +25872,7 @@ impl KmsBackend {
             owner_devices,
             legacy_devices,
             ProbeEpisodeCause::Hotplug,
+            None,
         );
     }
 
@@ -25824,6 +25900,124 @@ impl KmsBackend {
             return;
         }
         self.begin_hotplug_topology_episode(participants);
+    }
+
+    fn resolve_forced_reprobe_probe_episode(&mut self, episode: ProbeEpisode) {
+        let token = episode
+            .forced_reprobe_token
+            .expect("forced reprobe probe episode carries its request token");
+        if let Some(error) = episode
+            .connector_results
+            .values()
+            .find_map(|result| result.as_ref().err())
+        {
+            let error = io::Error::new(error.kind(), error.to_string());
+            self.queue_ready_forced_reprobe(token, Err(error));
+            return;
+        }
+        let probes = episode
+            .connector_results
+            .into_iter()
+            .filter_map(|(device, result)| result.ok().map(|probes| (device, probes)))
+            .collect();
+        self.queue_ready_forced_reprobe(token, Ok(ReadyForcedReprobe::Probes(probes)));
+    }
+
+    fn queue_ready_forced_reprobe(
+        &mut self,
+        token: CrtcConfigToken,
+        result: io::Result<ReadyForcedReprobe>,
+    ) {
+        if self.ready_forced_reprobe_results.contains_key(&token) {
+            log::error!("kms: forced reprobe token {token:?} became ready twice");
+            return;
+        }
+        self.ready_forced_reprobe_results.insert(token, result);
+        self.ready_crtc_config_announcements.push_back(token);
+        self.wake_crtc_config_ready();
+    }
+
+    fn advance_waiting_forced_reprobe(&mut self, state: &mut ServerState) -> bool {
+        let Some(waiting) = self.waiting_forced_reprobe.as_ref() else {
+            return false;
+        };
+        if std::time::Instant::now() >= waiting.deadline {
+            let waiting = self
+                .waiting_forced_reprobe
+                .take()
+                .expect("waiting forced reprobe was checked above");
+            self.queue_ready_forced_reprobe(waiting.token, Ok(ReadyForcedReprobe::Expired));
+            self.arm_forced_reprobe_background_rescan();
+            return true;
+        }
+        if self.probe_episode.is_some() {
+            return false;
+        }
+        let waiting = self
+            .waiting_forced_reprobe
+            .take()
+            .expect("waiting forced reprobe was checked above");
+        let owner_incarnations = self
+            .lifecycle_owner_incarnation_devices()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let owner_devices = owner_incarnations
+            .iter()
+            .copied()
+            .filter(|device| {
+                !self
+                    .lifecycle_coordinator
+                    .device(device)
+                    .is_some_and(|arbiter| {
+                        arbiter.state()
+                            == crate::kms::owner::lifecycle::DeviceLifecycleState::Removed
+                            || arbiter.desired().device_presence() == Some(false)
+                    })
+            })
+            .collect::<HashSet<_>>();
+        let all_devices = self
+            .platform
+            .devices
+            .iter()
+            .map(|entry| entry.key)
+            .collect::<HashSet<_>>();
+        let legacy_devices = all_devices
+            .difference(&owner_incarnations)
+            .copied()
+            .collect::<HashSet<_>>();
+        self.start_probe_episode(
+            state,
+            owner_devices,
+            legacy_devices,
+            ProbeEpisodeCause::ForcedReprobe,
+            Some(waiting),
+        );
+        true
+    }
+
+    fn arm_forced_reprobe_background_rescan(&mut self) {
+        if self.vt_state != crate::vt::state::VtState::Active {
+            return;
+        }
+        self.hotplug_rescan_deadline =
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(150));
+    }
+
+    fn invalidate_ungranted_hotplug_after_forced_reprobe(&mut self) {
+        let Some(episode) = self.acquire_episode.as_ref() else {
+            return;
+        };
+        if episode.cause != TopologyEpisodeCause::Hotplug || episode.granted {
+            return;
+        }
+        let episode = self
+            .acquire_episode
+            .take()
+            .expect("ungranted hotplug episode was checked above");
+        self.hotplug_episode = None;
+        self.topology_episode_events
+            .push_back(TopologyEpisodeEvent::EpisodeEnd(episode.id, None));
+        self.arm_forced_reprobe_background_rescan();
     }
 
     fn apply_hotplug_logical_device(
@@ -26360,6 +26554,7 @@ impl KmsBackend {
             owner_devices,
             legacy_devices,
             ProbeEpisodeCause::Acquire,
+            None,
         );
     }
 
@@ -26369,6 +26564,7 @@ impl KmsBackend {
         owner_devices: HashSet<DrmDeviceKey>,
         legacy_devices: HashSet<DrmDeviceKey>,
         cause: ProbeEpisodeCause,
+        forced_reprobe: Option<WaitingForcedReprobe>,
     ) {
         self.probe_workers.reap_finished();
         let mut participants = owner_devices
@@ -26390,7 +26586,10 @@ impl KmsBackend {
             .next_probe_epoch
             .checked_add(1)
             .expect("probe epoch exhausted");
-        let deadline = std::time::Instant::now() + PROBE_EPISODE_DEADLINE;
+        let deadline = forced_reprobe.as_ref().map_or_else(
+            || std::time::Instant::now() + PROBE_EPISODE_DEADLINE,
+            |forced| forced.deadline,
+        );
         self.probe_episode = Some(ProbeEpisode {
             cause,
             epoch,
@@ -26400,6 +26599,8 @@ impl KmsBackend {
             owner_devices,
             legacy_devices,
             results: std::collections::BTreeMap::new(),
+            connector_results: std::collections::BTreeMap::new(),
+            forced_reprobe_token: forced_reprobe.map(|forced| forced.token),
         });
 
         let prober = std::sync::Arc::clone(&self.platform.connector_prober);
@@ -26455,7 +26656,15 @@ impl KmsBackend {
                 .name(format!("yserver-probe-{}-{}", device.major, device.minor))
                 .spawn(move || {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        worker_prober.probe_snapshot(device, fd)
+                        if cause == ProbeEpisodeCause::ForcedReprobe {
+                            worker_prober
+                                .probe_connectors(device, fd)
+                                .map(ProbeWorkerAnswer::Connectors)
+                        } else {
+                            worker_prober
+                                .probe_snapshot(device, fd)
+                                .map(ProbeWorkerAnswer::Snapshot)
+                        }
                     }))
                     .unwrap_or_else(|_| Err(io::Error::from_raw_os_error(libc::EIO)));
                     if sender
@@ -26505,12 +26714,26 @@ impl KmsBackend {
     }
 
     fn invalidate_probe_episode_for_release(&mut self) {
-        let Some(episode) = self.probe_episode.take() else {
+        if self.probe_episode.is_none() && self.waiting_forced_reprobe.is_none() {
             return;
-        };
-        let hotplug = episode.cause == ProbeEpisodeCause::Hotplug;
-        for device in episode.remaining {
-            self.probe_workers.mark_stuck(device, episode.epoch);
+        }
+        let episode = self.probe_episode.take();
+        let hotplug = episode
+            .as_ref()
+            .is_some_and(|episode| episode.cause == ProbeEpisodeCause::Hotplug);
+        if let Some(mut episode) = episode {
+            for device in std::mem::take(&mut episode.remaining) {
+                self.probe_workers.mark_stuck(device, episode.epoch);
+            }
+            if episode.cause == ProbeEpisodeCause::ForcedReprobe {
+                let token = episode
+                    .forced_reprobe_token
+                    .expect("forced reprobe probe episode carries its request token");
+                self.queue_ready_forced_reprobe(token, Ok(ReadyForcedReprobe::Expired));
+            }
+        }
+        if let Some(waiting) = self.waiting_forced_reprobe.take() {
+            self.queue_ready_forced_reprobe(waiting.token, Ok(ReadyForcedReprobe::Expired));
         }
         self.end_acquire_episode_without_publication();
         self.hotplug_rescan_deadline = None;
@@ -26551,6 +26774,9 @@ impl KmsBackend {
             .is_some_and(|episode| episode.remaining.is_empty())
         {
             self.resolve_probe_episode(state);
+            consumed = true;
+        }
+        if self.advance_waiting_forced_reprobe(state) {
             consumed = true;
         }
         if reaped_stuck
@@ -26595,12 +26821,33 @@ impl KmsBackend {
         {
             return false;
         }
-        let cause = episode.cause;
         match result.result {
-            Ok(snapshot) => {
+            Ok(answer) => {
                 if let Some(episode) = self.probe_episode.as_mut() {
                     episode.remaining.remove(&result.device);
-                    episode.results.insert(result.device, Ok(snapshot));
+                    match (episode.cause, answer) {
+                        (
+                            ProbeEpisodeCause::ForcedReprobe,
+                            ProbeWorkerAnswer::Connectors(probes),
+                        ) => {
+                            episode.connector_results.insert(result.device, Ok(probes));
+                        }
+                        (ProbeEpisodeCause::ForcedReprobe, ProbeWorkerAnswer::Snapshot(_)) => {
+                            episode.connector_results.insert(
+                                result.device,
+                                Err(io::Error::from_raw_os_error(libc::EINVAL)),
+                            );
+                        }
+                        (_, ProbeWorkerAnswer::Snapshot(snapshot)) => {
+                            episode.results.insert(result.device, Ok(snapshot));
+                        }
+                        (_, ProbeWorkerAnswer::Connectors(_)) => {
+                            episode.results.insert(
+                                result.device,
+                                Err(io::Error::from_raw_os_error(libc::EINVAL)),
+                            );
+                        }
+                    }
                 }
                 false
             }
@@ -26614,7 +26861,12 @@ impl KmsBackend {
                 self.remove_owner_device(device, incarnation);
                 true
             }
-            Err(error) if cause == ProbeEpisodeCause::Hotplug => {
+            Err(error)
+                if self
+                    .probe_episode
+                    .as_ref()
+                    .is_some_and(|episode| episode.cause == ProbeEpisodeCause::Hotplug) =>
+            {
                 if error.raw_os_error() == Some(libc::EBUSY)
                     && self
                         .probe_workers
@@ -26634,6 +26886,32 @@ impl KmsBackend {
                 }
                 true
             }
+            Err(error)
+                if self
+                    .probe_episode
+                    .as_ref()
+                    .is_some_and(|episode| episode.cause == ProbeEpisodeCause::ForcedReprobe) =>
+            {
+                if error.raw_os_error() == Some(libc::EBUSY)
+                    && self
+                        .probe_workers
+                        .workers
+                        .get(&result.device)
+                        .is_some_and(|worker| worker.stuck)
+                    && self.vt_state == crate::vt::state::VtState::Active
+                {
+                    self.hotplug_retry_pending = true;
+                }
+                log::error!(
+                    "kms: forced connector probe failed on {}: {error}",
+                    result.device
+                );
+                if let Some(episode) = self.probe_episode.as_mut() {
+                    episode.remaining.remove(&result.device);
+                    episode.connector_results.insert(result.device, Err(error));
+                }
+                true
+            }
             Err(error) if is_owner => {
                 log::error!(
                     "kms: Owner acquire connector probe failed on {}: {error}; closing incarnation",
@@ -26647,7 +26925,13 @@ impl KmsBackend {
                 self.acquire_episode_participant_terminal(result.device);
                 true
             }
-            Err(error) if is_legacy => {
+            Err(error)
+                if is_legacy
+                    && self
+                        .probe_episode
+                        .as_ref()
+                        .is_some_and(|episode| episode.cause == ProbeEpisodeCause::Acquire) =>
+            {
                 log::error!(
                     "kms: mixed resume connector probe failed on Legacy device {}: {error}; exiting",
                     result.device
@@ -26689,6 +26973,24 @@ impl KmsBackend {
             );
             return;
         }
+        if episode.cause == ProbeEpisodeCause::ForcedReprobe {
+            for device in std::mem::take(&mut episode.remaining) {
+                self.probe_workers.mark_stuck(device, episode.epoch);
+            }
+            if self.vt_state == crate::vt::state::VtState::Active {
+                self.hotplug_retry_pending = true;
+            }
+            let token = episode
+                .forced_reprobe_token
+                .expect("forced reprobe probe episode carries its request token");
+            log::warn!(
+                "kms: forced connector probe episode {} expired",
+                episode.epoch
+            );
+            self.queue_ready_forced_reprobe(token, Ok(ReadyForcedReprobe::Expired));
+            self.arm_forced_reprobe_background_rescan();
+            return;
+        }
         let timed_out = std::mem::take(&mut episode.remaining);
         let mut legacy_timeout = None;
         for device in timed_out {
@@ -26721,9 +27023,16 @@ impl KmsBackend {
     }
 
     fn resolve_probe_episode_with(&mut self, state: &mut ServerState, episode: ProbeEpisode) {
-        if episode.cause == ProbeEpisodeCause::Hotplug {
-            self.resolve_hotplug_probe_episode(episode);
-            return;
+        match episode.cause {
+            ProbeEpisodeCause::Hotplug => {
+                self.resolve_hotplug_probe_episode(episode);
+                return;
+            }
+            ProbeEpisodeCause::ForcedReprobe => {
+                self.resolve_forced_reprobe_probe_episode(episode);
+                return;
+            }
+            ProbeEpisodeCause::Acquire => {}
         }
         let ProbeEpisode {
             cause: _,
@@ -26734,6 +27043,8 @@ impl KmsBackend {
             owner_devices,
             legacy_devices,
             results: probes,
+            connector_results: _,
+            forced_reprobe_token: _,
         } = episode;
         self.continue_owner_acquire_after_probe(state, probes, owner_devices, legacy_devices);
     }
@@ -28036,6 +28347,11 @@ impl Backend for KmsBackend {
             .chain(self.platform.owner_completion_deadline())
             .chain(self.probe_episode.as_ref().map(|episode| episode.deadline))
             .chain(
+                self.waiting_forced_reprobe
+                    .as_ref()
+                    .map(|waiting| waiting.deadline),
+            )
+            .chain(
                 self.owner_vt_release
                     .as_ref()
                     .map(|release| release.deadline),
@@ -29127,6 +29443,101 @@ impl Backend for KmsBackend {
         let probes = self.platform.probe_all_connectors()?;
         let _ = self.publish_connector_probes(state, &probes);
         Ok(())
+    }
+
+    fn begin_forced_reprobe(
+        &mut self,
+        state: &mut ServerState,
+    ) -> io::Result<yserver_core::backend::ForcedReprobeApply> {
+        if self.lifecycle_owner_incarnation_devices().is_empty() {
+            Backend::reprobe_connectors(self, state)?;
+            return Ok(yserver_core::backend::ForcedReprobeApply::Applied);
+        }
+        if self.waiting_forced_reprobe.is_some()
+            || self
+                .probe_episode
+                .as_ref()
+                .is_some_and(|episode| episode.cause == ProbeEpisodeCause::ForcedReprobe)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "a forced reprobe is already pending",
+            ));
+        }
+
+        let waiting = WaitingForcedReprobe {
+            token: self.next_crtc_config_token(),
+            deadline: std::time::Instant::now() + PROBE_EPISODE_DEADLINE,
+        };
+        let token = waiting.token;
+        self.waiting_forced_reprobe = Some(waiting);
+        let _ = self.advance_waiting_forced_reprobe(state);
+        Ok(yserver_core::backend::ForcedReprobeApply::Pending(token))
+    }
+
+    fn forced_reprobe_may_be_pending(&self) -> bool {
+        !self.lifecycle_owner_incarnation_devices().is_empty()
+    }
+
+    fn finish_forced_reprobe(
+        &mut self,
+        token: CrtcConfigToken,
+        state: &mut ServerState,
+    ) -> io::Result<yserver_core::backend::ForcedReprobeResult> {
+        let Some(result) = self.ready_forced_reprobe_results.remove(&token) else {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!("forced reprobe {token:?} is not ready"),
+            ));
+        };
+        self.remove_crtc_config_ready_announcement(token);
+        match result? {
+            ReadyForcedReprobe::Expired => Ok(yserver_core::backend::ForcedReprobeResult::Expired),
+            ReadyForcedReprobe::Probes(probes) => {
+                self.invalidate_ungranted_hotplug_after_forced_reprobe();
+                let owner_devices = self
+                    .lifecycle_owner_incarnation_devices()
+                    .into_iter()
+                    .collect::<HashSet<_>>();
+                let before = probes
+                    .iter()
+                    .filter(|(device, _)| owner_devices.contains(device))
+                    .map(|(device, _)| (*device, self.connector_registry_fingerprint(*device)))
+                    .collect::<HashMap<_, _>>();
+                let _changed = self.publish_connector_probes(state, &probes);
+                for (device, old) in before {
+                    if self.connector_registry_fingerprint(device) != old {
+                        self.administrative_reprobe_records.insert(device, token.0);
+                        log::debug!(
+                            "kms: AdministrativeReprobe recorded for changed Owner device {device} (token {})",
+                            token.0
+                        );
+                    }
+                }
+                Ok(yserver_core::backend::ForcedReprobeResult::Applied)
+            }
+        }
+    }
+
+    fn cancel_forced_reprobe(&mut self, token: CrtcConfigToken) {
+        if self
+            .waiting_forced_reprobe
+            .as_ref()
+            .is_some_and(|waiting| waiting.token == token)
+        {
+            self.waiting_forced_reprobe = None;
+        }
+        if self.probe_episode.as_ref().is_some_and(|episode| {
+            episode.cause == ProbeEpisodeCause::ForcedReprobe
+                && episode.forced_reprobe_token == Some(token)
+        }) && let Some(mut episode) = self.probe_episode.take()
+        {
+            for device in std::mem::take(&mut episode.remaining) {
+                self.probe_workers.mark_stuck(device, episode.epoch);
+            }
+        }
+        self.ready_forced_reprobe_results.remove(&token);
+        self.remove_crtc_config_ready_announcement(token);
     }
 
     fn set_provider_output_source(
@@ -70629,7 +71040,10 @@ mod tests {
         }
     }
 
-    fn c0_3bi_finish_announced_crtc_configs(backend: &mut super::KmsBackend) -> Result<(), String> {
+    fn c0_3bi_finish_announced_crtc_configs(
+        backend: &mut super::KmsBackend,
+        state: &mut ServerState,
+    ) -> Result<(), String> {
         for token in Backend::drain_ready_crtc_configs(backend) {
             if !backend
                 .core_driver_announced_crtc_configs_for_tests
@@ -70638,6 +71052,14 @@ mod tests {
                 return Err(format!(
                     "core-entry driver observed CRTC token {token:?} more than once"
                 ));
+            }
+            if backend.ready_forced_reprobe_results.contains_key(&token) {
+                let result = Backend::finish_forced_reprobe(backend, token, state)
+                    .map_err(|error| error.to_string());
+                backend
+                    .core_driver_finished_forced_reprobes_for_tests
+                    .push_back((token, result));
+                continue;
             }
             let result = Backend::finish_crtc_config(backend, token);
             backend
@@ -70904,7 +71326,7 @@ mod tests {
             // core_loop::run::drain_ready_crtc_configs.
             if !backend.ready_crtc_config_announcements.is_empty() {
                 let _bounded_wait = Backend::next_wakeup(backend);
-                c0_3bi_finish_announced_crtc_configs(backend)?;
+                c0_3bi_finish_announced_crtc_configs(backend, state)?;
                 c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete);
                 if done(backend)
                     && (stop_immediately_when_done
@@ -70922,7 +71344,7 @@ mod tests {
             if backend.core_driver_script_notification_count_for_tests > 0 {
                 backend.core_driver_script_notification_count_for_tests -= 1;
                 let _bounded_wait = Backend::next_wakeup(backend);
-                c0_3bi_finish_announced_crtc_configs(backend)?;
+                c0_3bi_finish_announced_crtc_configs(backend, state)?;
                 c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete);
                 if done(backend)
                     && (stop_immediately_when_done
@@ -100247,6 +100669,89 @@ mod tests {
         (resources, output_info, crtc_info)
     }
 
+    fn c0_3cii_client_output_modes(
+        backend: &mut super::KmsBackend,
+        state: &mut ServerState,
+        peer: &mut std::os::unix::net::UnixStream,
+        client: u32,
+        output_id: u32,
+        sequence: u16,
+        label: &str,
+    ) -> Vec<(u16, u16, u32)> {
+        use yserver_protocol::x11::randr as rr;
+
+        let resources = c0_3cii_randr_request_bytes(
+            backend,
+            state,
+            peer,
+            client,
+            sequence,
+            rr::RR_GET_SCREEN_RESOURCES_CURRENT,
+            &yserver_core::resources::ROOT_WINDOW.0.to_le_bytes(),
+            &format!("{label}: GetScreenResourcesCurrent"),
+        );
+        assert_eq!(resources[0], 1, "{label}: resources reply");
+        let resources_crtcs = usize::from(u16::from_le_bytes([resources[16], resources[17]]));
+        let resources_outputs = usize::from(u16::from_le_bytes([resources[18], resources[19]]));
+        let resources_modes = usize::from(u16::from_le_bytes([resources[20], resources[21]]));
+        let resources_mode_start = 32 + (resources_crtcs + resources_outputs) * 4;
+        let resources_mode_ids = (0..resources_modes)
+            .map(|index| {
+                let offset = resources_mode_start + index * 32;
+                u32::from_le_bytes(
+                    resources[offset..offset + 4]
+                        .try_into()
+                        .expect("four-byte mode XID"),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut output_body = Vec::with_capacity(8);
+        output_body.extend_from_slice(&output_id.to_le_bytes());
+        output_body.extend_from_slice(&state.randr.config_timestamp.to_le_bytes());
+        let output_info = c0_3cii_randr_request_bytes(
+            backend,
+            state,
+            peer,
+            client,
+            sequence.wrapping_add(1),
+            rr::RR_GET_OUTPUT_INFO,
+            &output_body,
+            &format!("{label}: GetOutputInfo"),
+        );
+        assert_eq!(output_info[0], 1, "{label}: output info reply");
+        let output_crtcs = usize::from(u16::from_le_bytes([output_info[26], output_info[27]]));
+        let output_modes = usize::from(u16::from_le_bytes([output_info[28], output_info[29]]));
+        let output_mode_start = 36 + output_crtcs * 4;
+        let output_mode_ids = (0..output_modes)
+            .map(|index| {
+                let offset = output_mode_start + index * 4;
+                u32::from_le_bytes(
+                    output_info[offset..offset + 4]
+                        .try_into()
+                        .expect("four-byte output mode XID"),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        output_mode_ids
+            .iter()
+            .map(|mode_id| {
+                assert!(
+                    resources_mode_ids.contains(mode_id),
+                    "{label}: GetOutputInfo mode {mode_id} appears in GetScreenResourcesCurrent"
+                );
+                let mode = state
+                    .randr
+                    .mode_table
+                    .iter()
+                    .find(|mode| mode.mode_id == *mode_id)
+                    .unwrap_or_else(|| panic!("{label}: published mode table contains {mode_id}"));
+                (mode.width, mode.height, mode.vrefresh)
+            })
+            .collect()
+    }
+
     fn c0_3cii_assert_matching_randr_replies(
         owner: &(Vec<u8>, Vec<u8>, Vec<u8>),
         legacy: &(Vec<u8>, Vec<u8>, Vec<u8>),
@@ -105129,6 +105634,8 @@ mod tests {
             owner_devices: HashSet::from([device]),
             legacy_devices: HashSet::new(),
             results: Default::default(),
+            connector_results: Default::default(),
+            forced_reprobe_token: None,
         });
 
         // Hold the worker just after its answer is visible. This makes the
@@ -105146,7 +105653,7 @@ mod tests {
                         device,
                         incarnation: Some(incarnation),
                         epoch,
-                        result: Ok(Vec::new()),
+                        result: Ok(super::ProbeWorkerAnswer::Snapshot(Vec::new())),
                     })
                     .expect("fixture result receiver remains open");
                 result_sent_tx.send(()).expect("signal sent result");
@@ -106148,7 +106655,7 @@ mod tests {
                 device: device_a,
                 incarnation: Some(stale_incarnation),
                 epoch: second_epoch,
-                result: Ok(snapshot_a),
+                result: Ok(super::ProbeWorkerAnswer::Snapshot(snapshot_a)),
             })
             .expect("enqueue stale-incarnation probe answer");
         backend.wake_crtc_config_ready();
@@ -117479,6 +117986,1670 @@ mod tests {
         assert_eq!((got[0], got[1], got[8]), (1, 27, 1), "MappingBusy");
         let (_, after) = get_modifier_mapping_reply(&mut state, &mut backend, &mut peer);
         assert_eq!(after, map);
+    }
+
+    fn c0_3cii_ready_owner_for_forced_reprobe()
+    -> (OwnerLiveFixture, DrmDeviceKey, Vec<OutputKey>, ServerState) {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let (mut fixture, device, outputs, _) =
+            c0_3ci_live_release_fixture(StubBehaviour::AcceptKernelCalls(1_000), false);
+        let backend = &mut fixture.backend;
+        // The fixture's /dev/null KMS fd is a deterministic stand-in. Remove
+        // host udev input so only the scripted probe path can change topology.
+        backend.platform.hotplug_monitor = None;
+        let mut state = c0_3ci_core_state(backend);
+        c0_3cii_settle_owner_fixture(backend, &mut state, device, "forced-reprobe fixture");
+        (fixture, device, outputs, state)
+    }
+
+    fn c0_3cii_connector_probe_for_output(
+        backend: &super::KmsBackend,
+        key: &OutputKey,
+        connected: bool,
+    ) -> crate::platform::drm::ConnectorProbe {
+        let layout = backend
+            .platform
+            .outputs
+            .iter()
+            .find(|layout| &layout.key == key)
+            .expect("forced-reprobe output layout");
+        crate::platform::drm::ConnectorProbe {
+            connector_name: key.connector_name.clone(),
+            connected,
+            modes: if connected {
+                layout.output.modes.clone()
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    fn c0_3cii_begin_forced_reprobe(
+        backend: &mut super::KmsBackend,
+        state: &mut ServerState,
+        device: DrmDeviceKey,
+        answer: io::Result<Vec<crate::platform::drm::ConnectorProbe>>,
+    ) -> CrtcConfigToken {
+        use yserver_core::backend::ForcedReprobeApply;
+
+        backend
+            .platform
+            .install_scripted_connector_prober_for_tests();
+        backend
+            .platform
+            .script_connector_probes_for_tests(device, answer);
+        match Backend::begin_forced_reprobe(backend, state).expect("Owner forced reprobe begins") {
+            ForcedReprobeApply::Pending(token) => token,
+            ForcedReprobeApply::Applied => {
+                panic!("an Owner forced reprobe must run on the probe worker")
+            }
+        }
+    }
+
+    #[test]
+    fn c0_3cii_forced_reprobe_matches_legacy_modes_in_client_replies() {
+        use yserver_core::backend::Backend;
+
+        let probed_modes = vec![
+            test_advertised_mode(800, 600, 60, true),
+            test_advertised_mode(1280, 720, 60, false),
+            test_advertised_mode(1920, 1080, 75, false),
+        ];
+        let make_fixture = || {
+            let mut backend = super::KmsBackend::for_tests();
+            let device = backend
+                .platform
+                .primary_device()
+                .expect("headless fixture device")
+                .key;
+            let output_key = backend.platform.outputs[0].key.clone();
+            backend.randr_id_alloc.entry_mut(&output_key).modes =
+                vec![test_advertised_mode(800, 600, 60, true)];
+            let state = c0_3ci_core_state(&mut backend);
+            (backend, device, output_key, state)
+        };
+        let expected_modes = probed_modes
+            .iter()
+            .map(|mode| (mode.width, mode.height, mode.vrefresh))
+            .collect::<Vec<_>>();
+
+        // Legacy's synchronous `reprobe_connectors` applies its connector
+        // probe with this same publication helper. Invoke the scripted prober
+        // synchronously here so the test needs no DRM device, then compare the
+        // client-facing replies produced by that publication.
+        let (mut legacy, legacy_device, legacy_key, mut legacy_state) = make_fixture();
+        legacy
+            .platform
+            .install_scripted_connector_prober_for_tests();
+        legacy.platform.script_connector_probes_for_tests(
+            legacy_device,
+            Ok(vec![crate::platform::drm::ConnectorProbe {
+                connector_name: legacy_key.connector_name.clone(),
+                connected: true,
+                modes: probed_modes.clone(),
+            }]),
+        );
+        let legacy_fd = crate::kms::render::platform::duplicate_connector_probe_fd(
+            legacy
+                .platform
+                .device_for_key(legacy_device)
+                .expect("Legacy fixture device")
+                .device
+                .as_ref(),
+        )
+        .expect("duplicate synthetic Legacy probe fd");
+        let legacy_probes = crate::kms::render::platform::ConnectorProber::probe_connectors(
+            legacy.platform.connector_prober.as_ref(),
+            legacy_device,
+            legacy_fd,
+        )
+        .expect("scripted synchronous Legacy connector probe");
+        assert_eq!(legacy_probes[0].modes, probed_modes);
+        legacy.publish_connector_probes(&mut legacy_state, &[(legacy_device, legacy_probes)]);
+        let legacy_output_id = legacy.randr_id_alloc.ids_for(&legacy_key).output_id;
+        let mut legacy_peer = c0_3aii_install_dpms_core_client(&mut legacy_state, 81);
+        let legacy_modes = c0_3cii_client_output_modes(
+            &mut legacy,
+            &mut legacy_state,
+            &mut legacy_peer,
+            81,
+            legacy_output_id,
+            1,
+            "Legacy synchronous reprobe",
+        );
+
+        // Start Owner's registry with just its active mode, as the failing
+        // hardware fixture did. The worker answer must reach GetOutputInfo;
+        // `RandrState::modes` contains only active CRTC modes, while
+        // `mode_table` backs GetScreenResources and output mode XIDs.
+        let (mut backend, device, output_key, mut state) = make_fixture();
+
+        install_admission_owner_gate(&mut backend, device);
+        backend
+            .lifecycle_register_owner_device(device)
+            .expect("register synthetic Owner device");
+        backend
+            .platform
+            .install_scripted_connector_prober_for_tests();
+        backend.platform.script_connector_probes_for_tests(
+            device,
+            Ok(vec![crate::platform::drm::ConnectorProbe {
+                connector_name: output_key.connector_name.clone(),
+                connected: true,
+                modes: probed_modes.clone(),
+            }]),
+        );
+
+        let token = match Backend::begin_forced_reprobe(&mut backend, &mut state)
+            .expect("Owner forced reprobe begins")
+        {
+            yserver_core::backend::ForcedReprobeApply::Pending(token) => token,
+            yserver_core::backend::ForcedReprobeApply::Applied => {
+                panic!("Owner forced reprobe must use the worker")
+            }
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !backend.ready_forced_reprobe_results.contains_key(&token) {
+            backend.poll_probe_episode(&mut state);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "scripted Owner probe answer becomes ready"
+            );
+            std::thread::yield_now();
+        }
+        match backend
+            .ready_forced_reprobe_results
+            .get(&token)
+            .expect("ready forced-reprobe answer")
+        {
+            Ok(super::ReadyForcedReprobe::Probes(probes)) => assert_eq!(
+                probes
+                    .iter()
+                    .find(|(found_device, _)| *found_device == device)
+                    .and_then(|(_, probes)| probes.first())
+                    .map(|probe| &probe.modes),
+                Some(&probed_modes),
+                "scripted worker answer contains all probed modes"
+            ),
+            Ok(super::ReadyForcedReprobe::Expired) => {
+                panic!("scripted forced reprobe expired before collecting its answer")
+            }
+            Err(error) => panic!("scripted forced reprobe failed: {error}"),
+        }
+        assert!(matches!(
+            Backend::finish_forced_reprobe(&mut backend, token, &mut state),
+            Ok(yserver_core::backend::ForcedReprobeResult::Applied)
+        ));
+        assert_eq!(
+            backend
+                .randr_id_alloc
+                .entry(&output_key)
+                .expect("registry output")
+                .modes,
+            probed_modes,
+            "Owner finish applies the complete worker answer to the registry"
+        );
+
+        let owner_output_id = backend.randr_id_alloc.ids_for(&output_key).output_id;
+        let mut owner_peer = c0_3aii_install_dpms_core_client(&mut state, 82);
+        let owner_modes = c0_3cii_client_output_modes(
+            &mut backend,
+            &mut state,
+            &mut owner_peer,
+            82,
+            owner_output_id,
+            1,
+            "Owner forced reprobe",
+        );
+        assert_eq!(
+            legacy_modes, expected_modes,
+            "Legacy synchronous publication reaches the GetOutputInfo mode list"
+        );
+        assert_eq!(
+            owner_modes, expected_modes,
+            "Owner forced-reprobe publication reaches the GetOutputInfo mode list"
+        );
+        assert_eq!(
+            owner_modes, legacy_modes,
+            "Owner forced reprobe matches Legacy in GetScreenResources/GetOutputInfo"
+        );
+    }
+
+    fn c0_3cii_finish_forced_reprobe(
+        backend: &mut super::KmsBackend,
+        state: &mut ServerState,
+        token: CrtcConfigToken,
+        label: &str,
+    ) -> Result<yserver_core::backend::ForcedReprobeResult, String> {
+        let result_ready = |backend: &super::KmsBackend| {
+            backend
+                .core_driver_finished_forced_reprobes_for_tests
+                .iter()
+                .any(|(ready, _)| *ready == token)
+        };
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            state,
+            label,
+            std::time::Duration::from_secs(5),
+            &result_ready,
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{label}: {error}"));
+        let index = backend
+            .core_driver_finished_forced_reprobes_for_tests
+            .iter()
+            .position(|(ready, _)| *ready == token)
+            .expect("core-entry driver retained the forced-reprobe result");
+        let (ready, result) = backend
+            .core_driver_finished_forced_reprobes_for_tests
+            .remove(index)
+            .expect("located forced-reprobe result");
+        assert_eq!(ready, token);
+        result
+    }
+
+    fn c0_3cii_expire_forced_probe_for_tests(backend: &mut super::KmsBackend) {
+        let episode = backend
+            .probe_episode
+            .as_mut()
+            .expect("forced probe episode is outstanding");
+        assert_eq!(episode.cause, super::ProbeEpisodeCause::ForcedReprobe);
+        episode.deadline = std::time::Instant::now() - std::time::Duration::from_millis(1);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3cii_forced_reprobe_owns_one_turn_vulkan() {
+        use yserver_core::core_loop::run::CoreEntryDelivery;
+
+        let (mut fixture, device, outputs, mut state) = c0_3cii_ready_owner_for_forced_reprobe();
+        let backend = &mut fixture.backend;
+        let before_client_modesets = backend.lifecycle_drivers[&device].client_modeset_test_stats();
+        let before_topology_sends = backend.lifecycle_drivers[&device].topology_test_stats();
+        let mut probe = c0_3cii_connector_probe_for_output(backend, &outputs[0], false);
+        probe.connected = true;
+        probe.modes = vec![test_advertised_mode(1200, 800, 60, true)];
+        let token = c0_3cii_begin_forced_reprobe(backend, &mut state, device, Ok(vec![probe]));
+        assert_eq!(
+            backend.probe_episode.as_ref().unwrap().cause,
+            super::ProbeEpisodeCause::ForcedReprobe
+        );
+        assert!(
+            backend.topology_episode_events.is_empty(),
+            "forced reprobe emits no EpisodeBegin"
+        );
+        assert_eq!(
+            c0_3cii_finish_forced_reprobe(backend, &mut state, token, "finish forced reprobe"),
+            Ok(yserver_core::backend::ForcedReprobeResult::Applied)
+        );
+        assert!(
+            backend
+                .core_entry_deliveries_for_tests
+                .iter()
+                .all(|delivery| {
+                    !matches!(delivery, CoreEntryDelivery::TopologyEpisodeBegin(_))
+                })
+        );
+        assert_eq!(
+            backend.administrative_reprobe_records.get(&device),
+            Some(&token.0)
+        );
+        assert!(
+            backend
+                .lifecycle_coordinator
+                .device(&device)
+                .unwrap()
+                .transition()
+                .is_none()
+        );
+        assert_eq!(
+            backend.lifecycle_drivers[&device].client_modeset_test_stats(),
+            before_client_modesets,
+            "administrative reprobe sends no client KMS modeset"
+        );
+        assert_eq!(
+            backend.lifecycle_drivers[&device].topology_test_stats(),
+            before_topology_sends,
+            "administrative reprobe sends no topology KMS transaction"
+        );
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3cii_forced_reprobe_owns_one_turn_vulkan",
+            &c0_3bi_expected_end_state(outputs),
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3cii_forced_reprobe_parks_and_expires_vulkan() {
+        use crate::kms::render::platform::ProbeBarrier;
+
+        let (mut fixture, device, outputs, mut state) = c0_3cii_ready_owner_for_forced_reprobe();
+        let backend = &mut fixture.backend;
+        backend
+            .platform
+            .install_scripted_connector_prober_for_tests();
+        let barrier = ProbeBarrier::new();
+        let late = c0_3cii_connector_probe_for_output(backend, &outputs[0], false);
+        backend.platform.script_blocked_connector_probes_for_tests(
+            device,
+            Ok(vec![late]),
+            barrier.clone(),
+        );
+        let token = match Backend::begin_forced_reprobe(backend, &mut state)
+            .expect("blocked Owner forced reprobe begins")
+        {
+            yserver_core::backend::ForcedReprobeApply::Pending(token) => token,
+            yserver_core::backend::ForcedReprobeApply::Applied => panic!("Owner must park"),
+        };
+        assert!(barrier.wait_started(std::time::Duration::from_secs(1)));
+        c0_3cii_expire_forced_probe_for_tests(backend);
+        assert_eq!(
+            c0_3cii_finish_forced_reprobe(backend, &mut state, token, "expire forced reprobe"),
+            Ok(yserver_core::backend::ForcedReprobeResult::Expired)
+        );
+        assert!(
+            backend.hotplug_rescan_deadline.is_some(),
+            "timeout arms the background rescan"
+        );
+        assert!(
+            backend.hotplug_retry_pending,
+            "the stuck worker has one pending retry"
+        );
+        assert!(
+            state
+                .randr
+                .outputs
+                .iter()
+                .find(|output| output.name == outputs[0].connector_name)
+                .is_some_and(|output| output.connected),
+            "Expired replies from the published state"
+        );
+        barrier.release();
+        c0_3cii_finish_probe_workers(backend, &mut state, "join expired forced-probe worker");
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3cii_forced_reprobe_parks_and_expires_vulkan",
+            &c0_3bi_expected_end_state(outputs),
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3cii_forced_reprobe_timeout_discards_late_result_vulkan() {
+        use crate::kms::render::platform::ProbeBarrier;
+
+        let (mut fixture, device, outputs, mut state) = c0_3cii_ready_owner_for_forced_reprobe();
+        let backend = &mut fixture.backend;
+        backend
+            .platform
+            .install_scripted_connector_prober_for_tests();
+        let forced_barrier = ProbeBarrier::new();
+        let retry_barrier = ProbeBarrier::new();
+        let late = c0_3cii_connector_probe_for_output(backend, &outputs[0], false);
+        backend.platform.queue_blocked_connector_probes_for_tests(
+            device,
+            Ok(vec![late]),
+            forced_barrier.clone(),
+        );
+        let new_key = OutputKey::new(device, "DP-NEW");
+        let mode = test_advertised_mode(1280, 720, 60, true);
+        let retry = ConnectorSnapshot {
+            key: new_key.clone(),
+            modes: vec![mode],
+            mm_width: 300,
+            mm_height: 190,
+            edid: vec![0x33],
+            connector_type: "DisplayPort".into(),
+        };
+        let current = c0_3cii_snapshot_from_layout(backend, &outputs[0]);
+        backend.platform.queue_blocked_connector_probe_for_tests(
+            device,
+            Ok(vec![current, retry]),
+            retry_barrier.clone(),
+        );
+        let token = match Backend::begin_forced_reprobe(backend, &mut state)
+            .expect("blocked Owner forced reprobe begins")
+        {
+            yserver_core::backend::ForcedReprobeApply::Pending(token) => token,
+            yserver_core::backend::ForcedReprobeApply::Applied => panic!("Owner must park"),
+        };
+        assert!(forced_barrier.wait_started(std::time::Duration::from_secs(1)));
+        c0_3cii_expire_forced_probe_for_tests(backend);
+        assert_eq!(
+            c0_3cii_finish_forced_reprobe(backend, &mut state, token, "expire late-answer probe"),
+            Ok(yserver_core::backend::ForcedReprobeResult::Expired)
+        );
+        let old_config = backend.randr_id_alloc.entry(&outputs[0]).unwrap().config;
+        assert!(backend.randr_id_alloc.entry(&outputs[0]).unwrap().connected);
+
+        backend.hotplug_rescan_deadline =
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
+        forced_barrier.release();
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "join late forced worker and start background rescan",
+            std::time::Duration::from_secs(5),
+            &|backend| {
+                backend
+                    .probe_episode
+                    .as_ref()
+                    .is_some_and(|episode| episode.cause == super::ProbeEpisodeCause::Hotplug)
+                    && retry_barrier.wait_started(std::time::Duration::ZERO)
+            },
+            None,
+        )
+        .expect("joining the expired worker starts the background hotplug retry");
+        assert!(retry_barrier.wait_started(std::time::Duration::from_secs(1)));
+        assert!(
+            backend.randr_id_alloc.entry(&outputs[0]).unwrap().connected,
+            "the expired forced answer did not change published connection state"
+        );
+        assert_eq!(
+            backend.randr_id_alloc.entry(&outputs[0]).unwrap().config,
+            old_config
+        );
+        retry_barrier.release();
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "publish background rescan result",
+            std::time::Duration::from_secs(5),
+            &|backend| {
+                backend.acquire_episode.is_none()
+                    && backend
+                        .randr_id_alloc
+                        .entry(&new_key)
+                        .is_some_and(|entry| entry.connected)
+            },
+            None,
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "the retry publishes its current connector answer requester-less: {error}; \
+                 probe={:?}; waiting={:?}; acquire={:?}; hotplug={:?}; retry_pending={}; \
+                 rescan_deadline={:?}; workers={:?}; new_registry={:?}",
+                backend.probe_episode.as_ref().map(|episode| (
+                    episode.cause,
+                    episode.epoch,
+                    &episode.remaining
+                )),
+                backend
+                    .waiting_forced_reprobe
+                    .as_ref()
+                    .map(|waiting| waiting.token),
+                backend.acquire_episode.as_ref().map(|episode| (
+                    episode.id,
+                    episode.cause,
+                    episode.granted,
+                    &episode.remaining
+                )),
+                backend.hotplug_episode.as_ref().map(|episode| episode.id),
+                backend.hotplug_retry_pending,
+                backend.hotplug_rescan_deadline,
+                backend
+                    .probe_workers
+                    .workers
+                    .iter()
+                    .map(|(device, worker)| (*device, worker.epoch, worker.stuck))
+                    .collect::<Vec<_>>(),
+                backend
+                    .randr_id_alloc
+                    .entry(&new_key)
+                    .map(|entry| (entry.connected, entry.modes.len())),
+            );
+        });
+        assert!(backend.randr_id_alloc.entry(&outputs[0]).unwrap().connected);
+        let expected = c0_3bi_expected_end_state(outputs.clone());
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3cii_forced_reprobe_timeout_discards_late_result_vulkan",
+            &expected,
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3cii_forced_reprobe_never_commits_vulkan() {
+        let (mut fixture, device, outputs, mut state) = c0_3cii_ready_owner_for_forced_reprobe();
+        let backend = &mut fixture.backend;
+        let before_client_modesets = backend.lifecycle_drivers[&device].client_modeset_test_stats();
+        let before_topology_sends = backend.lifecycle_drivers[&device].topology_test_stats();
+        let answer = c0_3cii_connector_probe_for_output(backend, &outputs[0], false);
+        let token = c0_3cii_begin_forced_reprobe(backend, &mut state, device, Ok(vec![answer]));
+        assert_eq!(
+            c0_3cii_finish_forced_reprobe(
+                backend,
+                &mut state,
+                token,
+                "publish disconnected registry"
+            ),
+            Ok(yserver_core::backend::ForcedReprobeResult::Applied)
+        );
+        assert!(!backend.randr_id_alloc.entry(&outputs[0]).unwrap().connected);
+        assert_eq!(
+            backend.platform.outputs.len(),
+            1,
+            "forced reprobe leaves the active output installed"
+        );
+        assert_eq!(
+            backend.lifecycle_drivers[&device].client_modeset_test_stats(),
+            before_client_modesets,
+            "forced reprobe does not dispatch a lifecycle transaction"
+        );
+        assert_eq!(
+            backend.lifecycle_drivers[&device].topology_test_stats(),
+            before_topology_sends,
+            "forced reprobe submits no topology transaction"
+        );
+        assert!(
+            backend
+                .lifecycle_coordinator
+                .device(&device)
+                .unwrap()
+                .transition()
+                .is_none()
+        );
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3cii_forced_reprobe_never_commits_vulkan",
+            &c0_3bi_expected_end_state(outputs),
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3cii_forced_reprobe_failure_is_badalloc_vulkan() {
+        let (mut fixture, device, outputs, mut state) = c0_3cii_ready_owner_for_forced_reprobe();
+        let backend = &mut fixture.backend;
+        let before = state.randr.config_timestamp;
+        backend
+            .platform
+            .install_scripted_connector_prober_for_tests();
+        backend.platform.script_connector_probes_for_tests(
+            device,
+            Err(io::Error::from_raw_os_error(libc::EIO)),
+        );
+        let token = match Backend::begin_forced_reprobe(backend, &mut state)
+            .expect("failed probe still parks the request")
+        {
+            yserver_core::backend::ForcedReprobeApply::Pending(token) => token,
+            yserver_core::backend::ForcedReprobeApply::Applied => panic!("Owner must park"),
+        };
+        let result = c0_3cii_finish_forced_reprobe(backend, &mut state, token, "fail forced probe");
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|error| error.contains("Input/output error")),
+            "EIO reaches the core as Failed(io): {result:?}"
+        );
+        assert_eq!(
+            state.randr.config_timestamp, before,
+            "failed probe publishes nothing"
+        );
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3cii_forced_reprobe_failure_is_badalloc_vulkan",
+            &c0_3bi_expected_end_state(outputs),
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3cii_release_resolves_parked_forced_reprobe_vulkan() {
+        use crate::kms::render::platform::ProbeBarrier;
+
+        let (mut fixture, device, outputs, mut state) = c0_3cii_ready_owner_for_forced_reprobe();
+        let backend = &mut fixture.backend;
+        backend
+            .platform
+            .install_scripted_connector_prober_for_tests();
+        let barrier = ProbeBarrier::new();
+        backend.platform.script_blocked_connector_probes_for_tests(
+            device,
+            Ok(vec![c0_3cii_connector_probe_for_output(
+                backend,
+                &outputs[0],
+                false,
+            )]),
+            barrier.clone(),
+        );
+        let token = match Backend::begin_forced_reprobe(backend, &mut state)
+            .expect("blocked Owner forced reprobe begins")
+        {
+            yserver_core::backend::ForcedReprobeApply::Pending(token) => token,
+            yserver_core::backend::ForcedReprobeApply::Applied => panic!("Owner must park"),
+        };
+        assert!(barrier.wait_started(std::time::Duration::from_secs(1)));
+        c0_3ci_release_owner_to_suspended(
+            backend,
+            &mut state,
+            device,
+            "release parked forced reprobe",
+        );
+        assert_eq!(
+            c0_3cii_finish_forced_reprobe(
+                backend,
+                &mut state,
+                token,
+                "resolve forced reprobe on release"
+            ),
+            Ok(yserver_core::backend::ForcedReprobeResult::Expired)
+        );
+        assert!(backend.hotplug_rescan_deadline.is_none());
+        assert!(!backend.hotplug_retry_pending);
+        barrier.release();
+        c0_3cii_finish_probe_workers(backend, &mut state, "discard late answer after release");
+        assert!(backend.hotplug_rescan_deadline.is_none());
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3cii_release_resolves_parked_forced_reprobe_vulkan",
+            &c0_3bi_expected_end_state(outputs),
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3cii_forced_reprobe_while_released_matches_legacy_vulkan() {
+        use crate::vt::state::VtState;
+        use yserver_protocol::x11::randr as rr;
+
+        let (mut fixture, device, outputs, mut state) = c0_3cii_ready_owner_for_forced_reprobe();
+        let backend = &mut fixture.backend;
+        let initial_snapshot = c0_3cii_snapshot_from_layout(backend, &outputs[0]);
+        let (initial_mode, initial_position) = backend
+            .platform
+            .outputs
+            .iter()
+            .find(|layout| layout.key == outputs[0])
+            .map(|layout| (layout.output.picked.clone(), (layout.x, layout.y)))
+            .expect("Owner output layout");
+        let (mut legacy, legacy_device, legacy_key, mut legacy_state) =
+            c0_3cii_legacy_fixture_from_owner_snapshot(
+                &backend.randr_id_alloc,
+                &initial_snapshot,
+                &initial_mode,
+                initial_position,
+            );
+        let mut owner_listener = c0_3aii_install_dpms_core_client(&mut state, 80);
+        let mut legacy_listener = c0_3aii_install_dpms_core_client(&mut legacy_state, 80);
+        state.randr_select_masks.insert(
+            (80, yserver_core::resources::ROOT_WINDOW),
+            rr::NOTIFY_MASK_OUTPUT_CHANGE,
+        );
+        legacy_state.randr_select_masks.insert(
+            (80, yserver_core::resources::ROOT_WINDOW),
+            rr::NOTIFY_MASK_OUTPUT_CHANGE,
+        );
+        c0_3ci_release_owner_to_suspended(
+            backend,
+            &mut state,
+            device,
+            "prepare released-seat probe",
+        );
+        assert_eq!(backend.vt_state, VtState::Suspended);
+        backend
+            .platform
+            .install_scripted_connector_prober_for_tests();
+        let mut legacy_probes = legacy
+            .randr_id_alloc
+            .entries()
+            .filter(|(key, _)| key.device_key == legacy_device && **key != legacy_key)
+            .map(|(key, entry)| crate::platform::drm::ConnectorProbe {
+                connector_name: key.connector_name.clone(),
+                connected: entry.connected,
+                modes: entry.modes.clone(),
+            })
+            .collect::<Vec<_>>();
+        let observations_before = backend
+            .platform
+            .connector_probe_observations_for_tests()
+            .len();
+        let mut answer = c0_3cii_connector_probe_for_output(backend, &outputs[0], true);
+        answer
+            .modes
+            .push(test_advertised_mode(1280, 720, 60, false));
+        let mut legacy_answer = crate::platform::drm::ConnectorProbe {
+            connector_name: answer.connector_name.clone(),
+            connected: answer.connected,
+            modes: answer.modes.clone(),
+        };
+        let publication_start = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(5))
+            .expect("shared publication timestamp is representable");
+        state.start_instant = publication_start;
+        legacy_state.start_instant = publication_start;
+        let token = c0_3cii_begin_forced_reprobe(backend, &mut state, device, Ok(vec![answer]));
+        assert_eq!(
+            c0_3cii_finish_forced_reprobe(
+                backend,
+                &mut state,
+                token,
+                "forced probe while released"
+            ),
+            Ok(yserver_core::backend::ForcedReprobeResult::Applied)
+        );
+        legacy_answer
+            .connector_name
+            .clone_from(&legacy_key.connector_name);
+        legacy_probes.push(legacy_answer);
+        legacy.publish_connector_probes(&mut legacy_state, &[(legacy_device, legacy_probes)]);
+        let observations = backend.platform.connector_probe_observations_for_tests();
+        assert_eq!(
+            observations.len(),
+            observations_before + 1,
+            "released-seat reprobe still uses the worker"
+        );
+        assert_ne!(
+            observations.last().unwrap().thread,
+            std::thread::current().id()
+        );
+        assert_eq!(backend.vt_state, VtState::Suspended);
+        assert!(backend.hotplug_rescan_deadline.is_none());
+        assert!(!backend.hotplug_retry_pending);
+        let owner_event_bytes = kbd_map_drain(&mut owner_listener);
+        let legacy_event_bytes = kbd_map_drain(&mut legacy_listener);
+        let owner_events = c0_3cii_normalize_event_config_timestamps(&owner_event_bytes);
+        let legacy_events = c0_3cii_normalize_event_config_timestamps(&legacy_event_bytes);
+        assert_eq!(
+            owner_events, legacy_events,
+            "released-seat RANDR events match Legacy"
+        );
+        let owner_replies = c0_3cii_published_randr_replies(
+            backend,
+            &mut state,
+            &mut owner_listener,
+            80,
+            "released-seat Owner replies",
+        );
+        let legacy_replies = c0_3cii_published_randr_replies(
+            &mut legacy,
+            &mut legacy_state,
+            &mut legacy_listener,
+            80,
+            "released-seat Legacy replies",
+        );
+        c0_3cii_assert_matching_randr_replies(
+            &owner_replies,
+            &legacy_replies,
+            "released-seat forced reprobe",
+        );
+        assert_eq!(
+            state.randr.config_timestamp, legacy_state.randr.config_timestamp,
+            "released-seat publication preserves Legacy lastConfigTime"
+        );
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3cii_forced_reprobe_while_released_matches_legacy_vulkan",
+            &c0_3bi_expected_end_state(outputs),
+        );
+        c0_3bi_assert_end_state(
+            &legacy,
+            "c0_3cii_forced_reprobe_while_released_matches_legacy_vulkan:Legacy",
+            &c0_3bi_expected_end_state([legacy_key]),
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3cii_forced_reprobe_waits_for_open_hotplug_probe_vulkan() {
+        use crate::kms::render::platform::ProbeBarrier;
+
+        let (mut fixture, device, outputs, mut state) = c0_3cii_ready_owner_for_forced_reprobe();
+        let backend = &mut fixture.backend;
+        backend
+            .platform
+            .install_scripted_connector_prober_for_tests();
+        let hotplug_barrier = ProbeBarrier::new();
+        let forced_barrier = ProbeBarrier::new();
+        let snapshot = c0_3cii_snapshot_from_layout(backend, &outputs[0]);
+        backend.platform.script_blocked_connector_probe_for_tests(
+            device,
+            Ok(vec![snapshot]),
+            hotplug_barrier.clone(),
+        );
+        super::KmsBackend::record_display_hotplug_edge(backend);
+        backend.hotplug_rescan_deadline =
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "start hotplug probe before forced request",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend
+                    .probe_episode
+                    .as_ref()
+                    .is_some_and(|episode| episode.cause == super::ProbeEpisodeCause::Hotplug)
+                    && hotplug_barrier.wait_started(std::time::Duration::ZERO)
+            },
+            None,
+        )
+        .expect("hotplug probe is open");
+        assert!(hotplug_barrier.wait_started(std::time::Duration::from_secs(1)));
+        backend.platform.queue_blocked_connector_probes_for_tests(
+            device,
+            Ok(vec![c0_3cii_connector_probe_for_output(
+                backend,
+                &outputs[0],
+                true,
+            )]),
+            forced_barrier.clone(),
+        );
+        let token = match Backend::begin_forced_reprobe(backend, &mut state)
+            .expect("forced reprobe waits behind the open hotplug probe")
+        {
+            yserver_core::backend::ForcedReprobeApply::Pending(token) => token,
+            yserver_core::backend::ForcedReprobeApply::Applied => panic!("Owner must park"),
+        };
+        assert!(backend.waiting_forced_reprobe.is_some());
+        let first_epoch = backend.probe_episode.as_ref().unwrap().epoch;
+        assert_eq!(
+            backend.next_probe_epoch,
+            first_epoch + 1,
+            "no concurrent forced worker starts"
+        );
+        hotplug_barrier.release();
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "resolve hotplug then start forced probe",
+            std::time::Duration::from_secs(5),
+            &|backend| {
+                backend
+                    .probe_episode
+                    .as_ref()
+                    .is_some_and(|episode| episode.cause == super::ProbeEpisodeCause::ForcedReprobe)
+                    && forced_barrier.wait_started(std::time::Duration::ZERO)
+            },
+            None,
+        )
+        .expect("the forced probe starts after hotplug collection resolves");
+        assert!(forced_barrier.wait_started(std::time::Duration::from_secs(1)));
+        assert!(backend.waiting_forced_reprobe.is_none());
+        assert_eq!(
+            backend.probe_episode.as_ref().unwrap().forced_reprobe_token,
+            Some(token)
+        );
+        forced_barrier.release();
+        assert_eq!(
+            c0_3cii_finish_forced_reprobe(backend, &mut state, token, "finish queued forced probe"),
+            Ok(yserver_core::backend::ForcedReprobeResult::Applied)
+        );
+        c0_3cii_finish_hotplug_episode(
+            backend,
+            &mut state,
+            device,
+            "finish hotplug after forced probe",
+        );
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3cii_forced_reprobe_waits_for_open_hotplug_probe_vulkan",
+            &c0_3bi_expected_end_state(outputs),
+        );
+
+        let (mut fixture, device, outputs, mut state) = c0_3cii_ready_owner_for_forced_reprobe();
+        let backend = &mut fixture.backend;
+        backend
+            .platform
+            .install_scripted_connector_prober_for_tests();
+        let hotplug_barrier = ProbeBarrier::new();
+        let snapshot = c0_3cii_snapshot_from_layout(backend, &outputs[0]);
+        backend.platform.script_blocked_connector_probe_for_tests(
+            device,
+            Ok(vec![snapshot]),
+            hotplug_barrier.clone(),
+        );
+        super::KmsBackend::record_display_hotplug_edge(backend);
+        backend.hotplug_rescan_deadline =
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "start hotplug probe for request-deadline case",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend
+                    .probe_episode
+                    .as_ref()
+                    .is_some_and(|episode| episode.cause == super::ProbeEpisodeCause::Hotplug)
+                    && hotplug_barrier.wait_started(std::time::Duration::ZERO)
+            },
+            None,
+        )
+        .expect("request-deadline case has an open hotplug probe");
+        assert!(hotplug_barrier.wait_started(std::time::Duration::from_secs(1)));
+        let token = match Backend::begin_forced_reprobe(backend, &mut state)
+            .expect("forced request waits behind the open hotplug probe")
+        {
+            yserver_core::backend::ForcedReprobeApply::Pending(token) => token,
+            yserver_core::backend::ForcedReprobeApply::Applied => panic!("Owner must park"),
+        };
+        yserver_core::core_loop::run::hold_forced_reprobe_turn_for_tests(token);
+        let hotplug_epoch = backend.probe_episode.as_ref().unwrap().epoch;
+        let waiting = backend
+            .waiting_forced_reprobe
+            .as_mut()
+            .expect("forced request is waiting behind hotplug collection");
+        waiting.deadline = std::time::Instant::now() - std::time::Duration::from_millis(1);
+        assert_eq!(
+            c0_3cii_finish_forced_reprobe(
+                backend,
+                &mut state,
+                token,
+                "expire while waiting for hotplug probe"
+            ),
+            Ok(yserver_core::backend::ForcedReprobeResult::Expired)
+        );
+        assert!(backend.waiting_forced_reprobe.is_none());
+        assert_eq!(
+            backend
+                .probe_episode
+                .as_ref()
+                .map(|episode| (episode.epoch, episode.cause)),
+            Some((hotplug_epoch, super::ProbeEpisodeCause::Hotplug)),
+            "the blocked hotplug probe remains the only episode"
+        );
+        assert!(backend.hotplug_rescan_deadline.is_some());
+        assert!(
+            state
+                .randr
+                .outputs
+                .iter()
+                .find(|output| output.name == outputs[0].connector_name)
+                .is_some_and(|output| output.connected),
+            "Expired replies from the currently published state"
+        );
+        yserver_core::core_loop::run::release_forced_reprobe_turn_for_tests(token);
+        // The armed deadline was observed above; keep this focused scenario
+        // from starting an additional retry while the deliberately blocked
+        // hotplug worker is being joined.
+        backend.hotplug_rescan_deadline = None;
+        hotplug_barrier.release();
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "resolve hotplug after request deadline",
+            std::time::Duration::from_secs(5),
+            &|backend| backend.probe_episode.is_none(),
+            None,
+        )
+        .expect("the original hotplug probe resolves after the forced request expires");
+        c0_3cii_finish_hotplug_episode(
+            backend,
+            &mut state,
+            device,
+            "finish hotplug after request deadline",
+        );
+        c0_3cii_finish_probe_workers(backend, &mut state, "join request-deadline hotplug worker");
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3cii_forced_reprobe_waits_for_open_hotplug_probe_vulkan:deadline",
+            &c0_3bi_expected_end_state(outputs),
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3cii_forced_reprobe_then_edge_still_detaches_and_relights_vulkan() {
+        for (case, probe_connected, probe_modes, edge_present, edge_modes) in [
+            ("unplug", false, true, false, true),
+            ("replug", true, true, true, true),
+            ("zero modes", true, false, true, false),
+        ] {
+            let (mut fixture, device, outputs, mut state) =
+                c0_3cii_ready_owner_for_forced_reprobe();
+            let backend = &mut fixture.backend;
+            let initial_snapshot = c0_3cii_snapshot_from_layout(backend, &outputs[0]);
+            let initial_probe = c0_3cii_connector_probe_for_output(backend, &outputs[0], true);
+            let original_instance = backend
+                .platform
+                .outputs
+                .iter()
+                .position(|output| output.key == outputs[0])
+                .and_then(|index| backend.platform.output_instance_ids.get(index).copied())
+                .expect("the initial route owns a pool instance");
+            let remembered = backend.randr_id_alloc.entry(&outputs[0]).unwrap().config;
+            backend.randr_id_alloc.entry_mut(&outputs[0]).last_enabled = Some(remembered);
+            if case == "replug" {
+                c0_3cii_run_owner_hotplug(
+                    backend,
+                    &mut state,
+                    device,
+                    Vec::new(),
+                    "prepare the replug case with a detached route",
+                );
+                assert!(
+                    backend.platform.outputs.is_empty(),
+                    "the replug case starts with the remembered route detached"
+                );
+            }
+            let mut answer = initial_probe;
+            answer.connected = probe_connected;
+            if !probe_modes {
+                answer.modes.clear();
+            }
+            let modes_before_forced =
+                backend.lifecycle_drivers[&device].client_modeset_test_stats();
+            let topology_before_forced = backend.lifecycle_drivers[&device].topology_test_stats();
+            let token = c0_3cii_begin_forced_reprobe(backend, &mut state, device, Ok(vec![answer]));
+            assert_eq!(
+                c0_3cii_finish_forced_reprobe(
+                    backend,
+                    &mut state,
+                    token,
+                    "publish forced-reprobe registry"
+                ),
+                Ok(yserver_core::backend::ForcedReprobeResult::Applied)
+            );
+            assert_eq!(
+                backend.lifecycle_drivers[&device].client_modeset_test_stats(),
+                modes_before_forced,
+                "forced reprobe itself submits no KMS transaction"
+            );
+            assert_eq!(
+                backend.lifecycle_drivers[&device].topology_test_stats(),
+                topology_before_forced,
+                "forced reprobe itself submits no topology transaction"
+            );
+            let mut edge = initial_snapshot;
+            if !edge_modes {
+                edge.modes.clear();
+            }
+            let edge_snapshots = if edge_present {
+                vec![edge.clone()]
+            } else {
+                Vec::new()
+            };
+            let class = backend.classify_hotplug_for_device(device, &edge_snapshots);
+            assert!(
+                class.kms_work,
+                "installed route still requires edge KMS work after forced registry change: {class:?}"
+            );
+            if case != "replug" {
+                assert_eq!(
+                    backend.platform.outputs.len(),
+                    1,
+                    "forced reprobe leaves the active route installed until the hotplug episode"
+                );
+            }
+            c0_3cii_run_owner_hotplug(
+                backend,
+                &mut state,
+                device,
+                if edge_present { vec![edge] } else { Vec::new() },
+                &format!("apply the {case} edge after forced reprobe"),
+            );
+            let expected_live = if case == "replug" {
+                outputs.clone()
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                backend
+                    .platform
+                    .outputs
+                    .iter()
+                    .map(|output| output.key.clone())
+                    .collect::<Vec<_>>(),
+                expected_live,
+                "the edge episode performs the KMS route change for {case}"
+            );
+            assert_eq!(
+                backend.lifecycle_drivers[&device]
+                    .topology_test_stats()
+                    .1
+                    .len(),
+                topology_before_forced.1.len() + 1,
+                "the {case} edge reaches one topology commit"
+            );
+            if expected_live.is_empty() {
+                c0_3bi_core_driver_until_with_state(
+                    backend,
+                    &mut state,
+                    &format!("{case}: drain the retired scanout pool"),
+                    std::time::Duration::from_secs(3),
+                    &|backend| {
+                        backend
+                            .scene
+                            .retired_output_end_states_for_tests()
+                            .iter()
+                            .all(|bundle| bundle.instance != original_instance)
+                    },
+                    None,
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "{error}; retired={:?}",
+                        backend.scene.retired_output_end_states_for_tests()
+                    )
+                });
+                assert!(
+                    backend
+                        .scene
+                        .retired_output_end_states_for_tests()
+                        .iter()
+                        .all(|bundle| bundle.instance != original_instance),
+                    "the {case} edge retires the former scanout pool"
+                );
+            }
+            let registry = backend
+                .randr_id_alloc
+                .entry(&outputs[0])
+                .expect("the connector remains in the RandR registry");
+            assert_eq!(registry.connected, edge_present);
+            assert_eq!(registry.modes.is_empty(), !edge_modes);
+            c0_3bi_assert_end_state(
+                backend,
+                &format!(
+                    "c0_3cii_forced_reprobe_then_edge_still_detaches_and_relights_vulkan:{case}"
+                ),
+                &c0_3bi_expected_end_state(expected_live),
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3cii_forced_reprobe_invalidates_older_hotplug_answer_vulkan() {
+        use crate::kms::render::platform::ProbeBarrier;
+
+        let (mut fixture, device, outputs, mut state) = c0_3cii_ready_owner_for_forced_reprobe();
+        let backend = &mut fixture.backend;
+        backend
+            .platform
+            .install_scripted_connector_prober_for_tests();
+        let hotplug_barrier = ProbeBarrier::new();
+        backend.platform.script_blocked_connector_probe_for_tests(
+            device,
+            Ok(Vec::new()),
+            hotplug_barrier.clone(),
+        );
+        super::KmsBackend::record_display_hotplug_edge(backend);
+        backend.hotplug_rescan_deadline =
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "start older unplug probe",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend
+                    .probe_episode
+                    .as_ref()
+                    .is_some_and(|episode| episode.cause == super::ProbeEpisodeCause::Hotplug)
+                    && hotplug_barrier.wait_started(std::time::Duration::ZERO)
+            },
+            None,
+        )
+        .expect("older hotplug probe is outstanding");
+        assert!(hotplug_barrier.wait_started(std::time::Duration::from_secs(1)));
+        let mut current = c0_3cii_connector_probe_for_output(backend, &outputs[0], true);
+        current
+            .modes
+            .push(test_advertised_mode(1280, 720, 60, false));
+        backend
+            .platform
+            .install_scripted_connector_prober_for_tests();
+        let forced_barrier = ProbeBarrier::new();
+        backend.platform.queue_blocked_connector_probes_for_tests(
+            device,
+            Ok(vec![current]),
+            forced_barrier.clone(),
+        );
+        let token = match Backend::begin_forced_reprobe(backend, &mut state)
+            .expect("forced request waits for older hotplug probe")
+        {
+            yserver_core::backend::ForcedReprobeApply::Pending(token) => token,
+            yserver_core::backend::ForcedReprobeApply::Applied => panic!("Owner must park"),
+        };
+        yserver_core::core_loop::run::hold_forced_reprobe_turn_for_tests(token);
+        assert!(backend.waiting_forced_reprobe.is_some());
+        let delivery_start = backend.core_entry_deliveries_for_tests.len();
+        hotplug_barrier.release();
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "consume old answer and block the later forced probe",
+            std::time::Duration::from_secs(5),
+            &|backend| {
+                backend
+                    .acquire_episode
+                    .as_ref()
+                    .is_some_and(|episode| episode.cause == super::TopologyEpisodeCause::Hotplug)
+                    && backend.probe_episode.as_ref().is_some_and(|episode| {
+                        episode.cause == super::ProbeEpisodeCause::ForcedReprobe
+                    })
+                    && forced_barrier.wait_started(std::time::Duration::ZERO)
+            },
+            None,
+        )
+        .expect("the old hotplug answer queues behind the blocked forced probe");
+        let stale_episode_id = backend
+            .acquire_episode
+            .as_ref()
+            .expect("the older hotplug episode is queued behind the forced turn")
+            .id;
+        assert!(forced_barrier.wait_started(std::time::Duration::from_secs(1)));
+        forced_barrier.release();
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "finish the forced probe after the older answer is queued",
+            std::time::Duration::from_secs(5),
+            &|backend| {
+                backend
+                    .core_driver_finished_forced_reprobes_for_tests
+                    .iter()
+                    .any(|(ready, _)| *ready == token)
+            },
+            None,
+        )
+        .expect("forced request resolves after the older probe answer");
+        let idx = backend
+            .core_driver_finished_forced_reprobes_for_tests
+            .iter()
+            .position(|(ready, _)| *ready == token)
+            .unwrap();
+        let (_, result) = backend
+            .core_driver_finished_forced_reprobes_for_tests
+            .remove(idx)
+            .unwrap();
+        assert_eq!(
+            result,
+            Ok(yserver_core::backend::ForcedReprobeResult::Applied)
+        );
+        assert!(
+            backend.randr_id_alloc.entry(&outputs[0]).unwrap().connected,
+            "the older unplug answer cannot move the registry behind the forced result"
+        );
+        assert!(
+            backend.hotplug_rescan_deadline.is_some(),
+            "discarding the stale hotplug publication arms a fresh rescan"
+        );
+        yserver_core::core_loop::run::release_forced_reprobe_turn_for_tests(token);
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "release forced turn and deliver invalidated topology events",
+            std::time::Duration::from_secs(2),
+            &|backend| backend.acquire_episode.is_none(),
+            None,
+        )
+        .expect("queued older EpisodeBegin is withdrawn before grant");
+        let deliveries = &backend.core_entry_deliveries_for_tests[delivery_start..];
+        let begin = deliveries
+            .iter()
+            .position(|delivery| {
+                matches!(
+                    delivery,
+                    yserver_core::core_loop::run::CoreEntryDelivery::TopologyEpisodeBegin(id)
+                        if *id == stale_episode_id
+                )
+            })
+            .expect("the existing core-entry driver delivers the queued EpisodeBegin");
+        let end = deliveries
+            .iter()
+            .position(|delivery| {
+                matches!(
+                    delivery,
+                    yserver_core::core_loop::run::CoreEntryDelivery::TopologyEpisodeEnd {
+                        episode_id,
+                        published: false,
+                    } if *episode_id == stale_episode_id
+                )
+            })
+            .expect("the forced publication withdraws the queued episode through the core");
+        assert!(
+            begin < end,
+            "the queued topology episode ends after its begin"
+        );
+        c0_3cii_finish_probe_workers(backend, &mut state, "join invalidated older hotplug worker");
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3cii_forced_reprobe_invalidates_older_hotplug_answer_vulkan",
+            &c0_3bi_expected_end_state(outputs),
+        );
+    }
+
+    #[test]
+    #[ignore = "needs card1; never run by the implementer"]
+    fn c0_hw_3cii_forced_reprobe_on_card1_drm() {
+        use std::{
+            os::fd::{AsFd, AsRawFd},
+            path::PathBuf,
+            rc::Rc,
+            sync::{Arc, Mutex},
+            time::{Duration, Instant},
+        };
+
+        use crate::kms::render::resources::{DrmCleanupRegistry, ResourceService};
+        use yserver_core::backend::Backend;
+
+        struct TimedProductionConnectorProber {
+            durations: Arc<Mutex<Vec<Duration>>>,
+        }
+
+        impl crate::kms::render::platform::ConnectorProber for TimedProductionConnectorProber {
+            fn probe_snapshot(
+                &self,
+                device: DrmDeviceKey,
+                fd: std::os::fd::OwnedFd,
+            ) -> io::Result<Vec<ConnectorSnapshot>> {
+                crate::kms::render::platform::DrmConnectorProber.probe_snapshot(device, fd)
+            }
+
+            fn probe_connectors(
+                &self,
+                device: DrmDeviceKey,
+                fd: std::os::fd::OwnedFd,
+            ) -> io::Result<Vec<crate::platform::drm::ConnectorProbe>> {
+                let started = Instant::now();
+                let result =
+                    crate::kms::render::platform::DrmConnectorProber.probe_connectors(device, fd);
+                self.durations
+                    .lock()
+                    .expect("record forced-reprobe connector probe duration")
+                    .push(started.elapsed());
+                result
+            }
+        }
+
+        let card1 = PathBuf::from("/dev/dri/card1");
+        if let Err(error) = std::fs::metadata(&card1) {
+            eprintln!("environmental skip: /dev/dri/card1 is unavailable: {error}");
+            return;
+        }
+
+        let preflight = KmsBackend::for_tests_with_vk_live_scene_real_drm()
+            .unwrap_or_else(|error| panic!("card1 forced-reprobe preflight failed: {error}"));
+        let primary = preflight
+            .platform
+            .vk
+            .as_ref()
+            .and_then(|vk| vk.selected_drm_identity)
+            .and_then(|identity| identity.primary)
+            .expect("Vulkan reports the primary DRM identity");
+        let primary_path = super::card_path_for_key(primary)
+            .unwrap_or_else(|error| panic!("cannot map primary DRM identity: {error}"));
+        assert_eq!(
+            primary_path, card1,
+            "the forced-reprobe hardware test must select card1 before opening an Owner"
+        );
+        drop(preflight);
+
+        let mut base = KmsBackend::for_tests_with_vk_live_scene_real_drm()
+            .unwrap_or_else(|error| panic!("card1 forced-reprobe Vulkan fixture: {error}"));
+        base.core.bg_pixel = Some(0x0010_50E0);
+        let mut fixture = KmsBackend::for_tests_with_live_kms_from_backend(base, Some("HDMI-2"))
+            .unwrap_or_else(|error| panic!("card1 HDMI-2 live fixture: {error}"));
+        let backend = &mut fixture.backend;
+        backend.resource_cleanup_on_drop_for_tests = true;
+        let device = backend
+            .platform
+            .primary_device()
+            .expect("live KMS fixture has card1")
+            .key;
+        let device_rc = Rc::clone(
+            &backend
+                .platform
+                .device_for_key(device)
+                .expect("card1 device is retained")
+                .device,
+        );
+        assert_eq!(
+            super::card_path_for_key(device).expect("map card1 device identity"),
+            card1
+        );
+        let executor = crate::kms::executor::KmsIoExecutor::spawn(
+            device_rc.as_fd(),
+            crate::kms::owner::identity::IncarnationId::first(),
+        )
+        .unwrap_or_else(|error| panic!("spawn card1 Owner executor: {error}"));
+        let (incarnation, lifecycle) = executor.owner_identity();
+        backend.platform.devices[0].executor = Some(executor);
+        backend.platform.devices[0].owner = Some(
+            crate::kms::owner::device::DeviceCommitOwner::new(incarnation, lifecycle, 1),
+        );
+        let mut registry = DrmCleanupRegistry::new(Rc::clone(&device_rc), device, incarnation);
+        let mut service = ResourceService::new(device, incarnation);
+        for output_idx in 0..backend.platform.scanout_pools.len() {
+            let bo_count = backend.platform.scanout_pools[output_idx]
+                .as_ref()
+                .map_or(0, |scanout| scanout.display_pool().bos.len());
+            for bo_idx in 0..bo_count {
+                backend
+                    .platform
+                    .register_managed_scanout_bo(&mut service, &mut registry, output_idx, bo_idx)
+                    .unwrap_or_else(|error| {
+                        panic!("adopt card1 output {output_idx} BO {bo_idx}: {error:?}")
+                    });
+            }
+        }
+        backend.install_resource_service_with_registry(service, registry);
+        install_admission_owner_gate(backend, device);
+        backend.install_admission_conductor_with_backend_composed_for_tests(
+            device,
+            AdmissionSourceFixture::new_source().0,
+        );
+        backend
+            .lifecycle_register_owner_device(device)
+            .expect("register card1 Owner lifecycle driver and coordinator");
+
+        let output_idx = backend
+            .platform
+            .outputs
+            .iter()
+            .position(|output| output.key.device_key == device)
+            .expect("live card1 HDMI-2 output");
+        let output_key = backend.platform.outputs[output_idx].key.clone();
+        assert_eq!(output_key.connector_name, "HDMI-2");
+        let output_id = backend.randr_id_alloc.ids_for(&output_key).output_id;
+        backend
+            .output_key_by_id
+            .insert(output_id, output_key.clone());
+        let config = {
+            let output = &backend.platform.outputs[output_idx];
+            super::ConnectorConfig::Enabled {
+                mode_w: output.width,
+                mode_h: output.height,
+                vrefresh: output.output.picked.vrefresh,
+                x: output.x,
+                y: output.y,
+            }
+        };
+        {
+            let output = &backend.platform.outputs[output_idx];
+            let entry = backend.randr_id_alloc.entry_mut(&output_key);
+            entry.connected = true;
+            entry.config = config;
+            entry.modes = output.output.modes.clone();
+            entry.edid = output.output.edid.clone();
+            entry.mm_width = output.output.mm_width;
+            entry.mm_height = output.output.mm_height;
+            entry.connector_type = output.output.connector_type.clone();
+        }
+
+        backend
+            .platform
+            .use_production_connector_prober_for_live_drm_fixture();
+        assert!(
+            !backend.platform.connector_prober_is_scripted_for_tests(),
+            "the forced-reprobe hardware path uses DrmConnectorProber"
+        );
+        let probe_durations = Arc::new(Mutex::new(Vec::new()));
+        backend.platform.connector_prober = Arc::new(TimedProductionConnectorProber {
+            durations: Arc::clone(&probe_durations),
+        });
+
+        let drm_fd = backend
+            .platform
+            .device_for_key(device)
+            .expect("card1 Owner device")
+            .device
+            .as_fd()
+            .as_raw_fd();
+        let hardware_complete = Rc::new(std::cell::RefCell::new(std::collections::HashSet::new()));
+        let hardware_crtc =
+            u32::from(CrtcKey::for_output(&backend.platform.outputs[output_idx]).crtc);
+        let clock_key = backend
+            .platform
+            .owner_ref(device)
+            .and_then(|owner| owner.clock_key_for_hardware_crtc(hardware_crtc))
+            .expect("HDMI-2 CRTC has a production clock record");
+        c0_hw_3b_drive_until(
+            backend,
+            device,
+            drm_fd,
+            "initial HDMI-2 clock probe",
+            Duration::from_secs(20),
+            &|backend| {
+                backend
+                    .platform
+                    .owner_ref(device)
+                    .and_then(|owner| owner.clock(clock_key))
+                    .is_some_and(|clock| {
+                        clock.probe == crate::kms::owner::clock::ProbeState::Succeeded
+                    })
+            },
+            &hardware_complete,
+        )
+        .unwrap_or_else(|error| panic!("initial HDMI-2 clock probe failed: {error}"));
+        c0_3cii_hotplug_initial_composed_commit(
+            backend,
+            device,
+            drm_fd,
+            &output_key,
+            "compose the initial HDMI-2 frame before forced reprobe",
+            &hardware_complete,
+        )
+        .unwrap_or_else(|error| panic!("initial HDMI-2 composition failed: {error}"));
+        {
+            let entry = backend.randr_id_alloc.entry_mut(&output_key);
+            entry.last_enabled = Some(config);
+            entry.crtc_associated = true;
+        }
+
+        let mut state = c0_3ci_core_state(backend);
+        let synchronous = crate::kms::render::platform::ConnectorProber::probe_connectors(
+            &crate::kms::render::platform::DrmConnectorProber,
+            device,
+            crate::kms::render::platform::duplicate_connector_probe_fd(
+                backend
+                    .platform
+                    .device_for_key(device)
+                    .unwrap()
+                    .device
+                    .as_ref(),
+            )
+            .expect("duplicate card1 master fd"),
+        )
+        .expect("synchronous connector probe");
+        // A forced reprobe must make no KMS change: no lifecycle topology
+        // commit (TEST_ONLY or live) and no client modeset reaches the
+        // device. Ordinary composed frames may be dispatched in parallel by
+        // unrelated composition (and use the executor), so they are not
+        // counted.
+        let sends_now = |backend: &super::KmsBackend| {
+            let (validation, live, ..) = backend.lifecycle_drivers[&device].topology_test_stats();
+            (
+                validation.len(),
+                live.len(),
+                backend.dispatched_client_modeset_tokens.len(),
+            )
+        };
+        let before_sends = sends_now(backend);
+        let started = Instant::now();
+        let token = match Backend::begin_forced_reprobe(backend, &mut state)
+            .expect("card1 forced reprobe begins")
+        {
+            yserver_core::backend::ForcedReprobeApply::Pending(token) => token,
+            yserver_core::backend::ForcedReprobeApply::Applied => {
+                panic!("Owner card1 must use worker")
+            }
+        };
+        assert_eq!(
+            c0_3cii_finish_forced_reprobe(backend, &mut state, token, "complete card1 reprobe"),
+            Ok(yserver_core::backend::ForcedReprobeResult::Applied)
+        );
+        let elapsed = started.elapsed();
+        eprintln!("c0_hw_3cii_forced_reprobe_on_card1_drm probe duration: {elapsed:?}");
+        assert!(elapsed < super::PROBE_EPISODE_DEADLINE);
+        let worker_durations = probe_durations
+            .lock()
+            .expect("read forced-reprobe worker duration");
+        assert_eq!(
+            worker_durations.len(),
+            1,
+            "the forced request records exactly one production connector probe"
+        );
+        let worker_duration = worker_durations[0];
+        eprintln!(
+            "c0_hw_3cii_forced_reprobe_on_card1_drm DrmConnectorProber duration: {worker_duration:?}"
+        );
+        assert!(worker_duration < super::PROBE_EPISODE_DEADLINE);
+        let expected = synchronous
+            .iter()
+            .find(|probe| probe.connector_name == "HDMI-2")
+            .expect("card1 synchronous probe finds HDMI-2");
+        let mut reply_peer = c0_3aii_install_dpms_core_client(&mut state, 83);
+        let actual_modes = c0_3cii_client_output_modes(
+            backend,
+            &mut state,
+            &mut reply_peer,
+            83,
+            output_id,
+            80,
+            "card1 forced-reprobe client publication",
+        );
+        let expected_modes = expected
+            .modes
+            .iter()
+            .map(|mode| (mode.width, mode.height, mode.vrefresh))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual_modes, expected_modes,
+            "client GetScreenResources/GetOutputInfo mode list matches synchronous probe_connectors"
+        );
+        Backend::reprobe_connectors(backend, &mut state)
+            .expect("Legacy synchronous reprobe publishes on the card1 fixture");
+        let mut legacy_reply_peer = c0_3aii_install_dpms_core_client(&mut state, 84);
+        let legacy_published_modes = c0_3cii_client_output_modes(
+            backend,
+            &mut state,
+            &mut legacy_reply_peer,
+            84,
+            output_id,
+            90,
+            "card1 Legacy synchronous publication",
+        );
+        assert_eq!(
+            legacy_published_modes, expected_modes,
+            "Legacy reprobe_connectors publishes the full synchronous probe mode list"
+        );
+        assert_eq!(
+            actual_modes, legacy_published_modes,
+            "Owner and Legacy published HDMI-2 mode lists match on the card1 fixture"
+        );
+        assert_eq!(
+            sends_now(backend),
+            before_sends,
+            "forced reprobe dispatches no lifecycle topology commit and no client modeset"
+        );
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_hw_3cii_forced_reprobe_on_card1_drm",
+            &c0_3bi_expected_end_state(
+                backend
+                    .platform
+                    .outputs
+                    .iter()
+                    .map(|output| output.key.clone()),
+            ),
+        );
     }
 }
 
