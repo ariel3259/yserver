@@ -80,7 +80,8 @@ if [[ ! -d "$CONFIGFS_ROOT" ]]; then
         printf 'vkms %s is already absent (vkms configfs is unavailable)\n' "$DEVICE_NAME"
         exit 0
     fi
-    modprobe vkms
+    # Only the configfs device this script creates; no default vkms card.
+    modprobe vkms create_default_dev=0
 fi
 
 if [[ ! -d "$CONFIGFS_ROOT" ]]; then
