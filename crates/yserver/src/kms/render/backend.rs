@@ -437,6 +437,79 @@ fn scanout_direct_eligible(
     // source crop proven valid.
 }
 
+/// Whether no Bounding or Clip shape on `leaf_xid` or any ancestor up to the
+/// root (the COW included) removes part of the `root` rect.
+///
+/// Xorg flips a Present only when the window's `clipList` equals the root's
+/// `winSize` (`present/present_scmd.c:102`), and every shape in the chain
+/// narrows that clip list (`SetWinSize`, `dix/window.c:1713`, propagated to
+/// descendants by `miComputeClips`). Muffin's lock screen is the load-bearing
+/// case: it shapes the COW to an EMPTY region and unredirects the locker, so
+/// its stage's Presents are clipped to nothing and the locker below shows.
+/// Shape rects are relative to each window's content origin.
+fn direct_shape_chain_covers_root(
+    windows: &WindowsMap,
+    root_window_id: u32,
+    shape_bounding: &HashMap<u32, Vec<xfixes::RegionRect>>,
+    shape_clip: &HashMap<u32, Vec<xfixes::RegionRect>>,
+    leaf_xid: u32,
+    root: (u32, u32),
+) -> bool {
+    use crate::kms::render::region::Region;
+
+    let mut chain = Vec::new();
+    let mut xid = leaf_xid;
+    // Resource validation prevents cycles in production; stay bounded anyway.
+    for _ in 0..=windows.len() {
+        let Some(geometry) = windows.get(&xid) else {
+            return false;
+        };
+        let bw = i32::from(geometry.border_width);
+        chain.push((xid, i32::from(geometry.x) + bw, i32::from(geometry.y) + bw));
+        match geometry.parent {
+            None => break,
+            Some(parent) if parent == root_window_id => break,
+            Some(parent) => xid = parent,
+        }
+    }
+    let root_rect = vk::Rect2D {
+        offset: vk::Offset2D::default(),
+        extent: vk::Extent2D {
+            width: root.0,
+            height: root.1,
+        },
+    };
+    let (mut abs_x, mut abs_y) = (0, 0);
+    for &(xid, x, y) in chain.iter().rev() {
+        abs_x += x;
+        abs_y += y;
+        for shapes in [shape_bounding, shape_clip] {
+            let Some(rects) = shapes.get(&xid) else {
+                continue;
+            };
+            // Subtract rect by rect: a capped remainder only grows, so the
+            // answer can err towards "not covered", never towards a flip.
+            let mut uncovered = Region::from_rect(root_rect);
+            for rect in rects {
+                uncovered.subtract(&Region::from_rect(vk::Rect2D {
+                    offset: vk::Offset2D {
+                        x: abs_x + i32::from(rect.x),
+                        y: abs_y + i32::from(rect.y),
+                    },
+                    extent: vk::Extent2D {
+                        width: u32::from(rect.width),
+                        height: u32::from(rect.height),
+                    },
+                }));
+            }
+            if !uncovered.is_empty() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Which retained direct frame a single CRTC is scanning out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DirectFrameSlot {
@@ -4687,8 +4760,9 @@ impl KmsBackend {
         // (mapped, covering the root, nothing raised above it). Evaluated
         // here so both routes -- the legacy producer and the admission
         // source -- apply it.
-        let scene_eligible = !matches!(target, ScanoutM0Target::Unredirected)
-            || self.unredirected_direct_scene_eligible(candidate.paint_dst_host_xid, root);
+        let scene_eligible = (!matches!(target, ScanoutM0Target::Unredirected)
+            || self.unredirected_direct_scene_eligible(candidate.paint_dst_host_xid, root))
+            && self.direct_shape_chain_covers_root(candidate.paint_dst_host_xid, root);
         // #133 step 3 (3.5): reject any candidate whose resolved paint
         // chain carries a border clip. A bordered storage starts at its
         // outer origin, not at content (0, 0).
@@ -5610,6 +5684,34 @@ impl KmsBackend {
         } else {
             ScanoutM0Target::Other
         }
+    }
+
+    fn direct_shape_chain_covers_root(&self, leaf_xid: u32, root: (u32, u32)) -> bool {
+        direct_shape_chain_covers_root(
+            &self.windows,
+            self.core.window_id,
+            &self.core.shape_bounding,
+            &self.core.shape_clip,
+            leaf_xid,
+            root,
+        )
+    }
+
+    /// Whether a retained direct frame now presents through a Bounding or
+    /// Clip shape that no longer covers the root. A compositor may shape the
+    /// COW without presenting again, so the shape change itself must unflip.
+    fn direct_frames_shaped_off_root(&self) -> bool {
+        let root = (u32::from(self.platform.fb_w), u32::from(self.platform.fb_h));
+        let shaped_off = |frame: &DirectPresentFrame| {
+            !self.direct_shape_chain_covers_root(frame.candidate.paint_dst_host_xid, root)
+        };
+        self.scanout_m2.pending.as_ref().is_some_and(shaped_off)
+            || self
+                .scanout_m2
+                .queued_successor
+                .as_ref()
+                .is_some_and(shaped_off)
+            || self.scanout_m2.current.as_ref().is_some_and(shaped_off)
     }
 
     /// Whether an unredirected Present target is still the window which the
@@ -10393,14 +10495,151 @@ impl KmsBackend {
         }
     }
 
+    /// Tile `host_pixmap_xid` across the whole root extent from (0, 0): the
+    /// root's background pixmap, painted by `set_container_background_pixmap`
+    /// and again whenever the root storage is reallocated for a new screen
+    /// size (Xorg `SetRootClip` exposes the whole resized root and
+    /// `miPaintWindow` tiles its background there).
+    fn tile_root_background_pixmap(&mut self, host_pixmap_xid: u32) {
+        use crate::kms::{
+            render::engine::{ResolvedSource, SourceDrawable},
+            vk::ops::render::CompositeRect,
+        };
+        // Stage 4a — root paint resolves through redirect routing.
+        let Some(dst_target) = self.resolve_paint_target(self.core.window_id) else {
+            return;
+        };
+        let dst = dst_target.backing_id();
+        let Some(src) = self.store.lookup(host_pixmap_xid) else {
+            log::debug!(
+                "render set_container_background_pixmap: pixmap 0x{host_pixmap_xid:x} not in store"
+            );
+            return;
+        };
+        // Stage 3f.14: X11 bg_pixmap tiles across the drawable
+        // extent. Pre-3f.14 v2 did a single copy_area at (0, 0)
+        // and left the rest of root unchanged — fvwm3 wallpaper
+        // covered only the top-left of the screen on bee. Route
+        // through `engine.render_composite` with OP_SRC + Repeat::
+        // Normal so the source pixmap tiles across the whole root
+        // extent in a single submit. Same shape as `try_tiled_fill`
+        // (3f.3) but unconditioned by GC clip.
+        if src == dst {
+            // Defensive: a pixmap aliased as bg of its own drawable
+            // is not a meaningful X11 op. v1's path treats it the
+            // same (copy_area with src == dst is logged + skipped).
+            log::debug!("render set_container_background_pixmap: src == root, skipping");
+            return;
+        }
+        let src_format = self.store.get(src).map(|d| d.storage.format);
+        if src_format != Some(ash::vk::Format::B8G8R8A8_UNORM) {
+            // Tile path requires BGRA8 src (matches `try_tiled_fill`
+            // gate). Other formats fall through with no paint —
+            // v1-parity-ish; rare in practice for root bg.
+            log::debug!(
+                "render set_container_background_pixmap: pixmap 0x{host_pixmap_xid:x} format \
+                 {src_format:?} not BGRA8, skipping tile"
+            );
+            return;
+        }
+        let dst_extent = ash::vk::Extent2D {
+            width: u32::from(self.platform.fb_w.max(1)),
+            height: u32::from(self.platform.fb_h.max(1)),
+        };
+        let rects = [CompositeRect {
+            src_x: 0,
+            src_y: 0,
+            mask_x: 0,
+            mask_y: 0,
+            dst_x: dst_target.offset().0,
+            dst_y: dst_target.offset().1,
+            width: dst_extent.width,
+            height: dst_extent.height,
+        }];
+        const OP_SRC: u8 = 1;
+        let composite_result = self.engine.render_composite(
+            &mut self.store,
+            &mut self.platform,
+            OP_SRC,
+            ResolvedSource::Drawable(SourceDrawable::whole(src)),
+            ResolvedSource::None,
+            dst_target.dst(),
+            &rects,
+            None,
+            Repeat::Normal,
+            Repeat::None,
+            None,
+            None,
+            false,
+            // Audit #4: synthesized backing-seed copy, no Picture
+            // context. Engine falls back to depth heuristic.
+            0,
+            0,
+            0,
+        );
+        self.sync_descriptor_pool_telemetry();
+        match composite_result {
+            Ok(s) if s.recorded_draws > 0 && !s.deferred_to_batch => {
+                self.telemetry.record_paint_submit();
+                self.trace_render(
+                    SubmitKind::RenderComposite,
+                    dst,
+                    s.recorded_draws,
+                    1, // OP_SRC
+                    SrcClass::Direct,
+                    None,
+                    SubmitFlags {
+                        readback: s.used_dst_readback,
+                        alias: s.used_src_alias_scratch,
+                        zero_draws: false,
+                        upload: false,
+                    },
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                log::warn!(
+                    "render set_container_background_pixmap: render_composite tile failed: {e:?}"
+                );
+            }
+        }
+    }
+
     fn read_root_scanout_assembled(&mut self, region: vk::Rect2D) -> Option<Vec<u8>> {
         self.prime_transformed_root_reads();
         // Root space: a transformed output covers its footprint (spec D6).
         let outputs = self.crtc_root_rects();
-        if outputs.is_empty() {
-            return None;
-        }
-        Some(assemble_root_scanout(region, &outputs, |rect| {
+        let root_target = self.resolve_paint_target(self.core.window_id)?;
+        let root_id = root_target.backing_id();
+        Some(assemble_root_scanout(region, &outputs, |rect, source| {
+            if source == RootReadSource::Background {
+                // No CRTC shows this area, so no scanout holds it. The root
+                // storage does: its background, which is what Xorg's screen
+                // pixmap holds there too (windows over it are not composed
+                // outside the CRTCs, so they are missing from this piece).
+                let (offset_x, offset_y) = root_target.offset();
+                let root_local_rect = vk::Rect2D {
+                    offset: vk::Offset2D {
+                        x: rect.offset.x.saturating_add(offset_x),
+                        y: rect.offset.y.saturating_add(offset_y),
+                    },
+                    extent: rect.extent,
+                };
+                return self
+                    .engine
+                    .get_image(
+                        &mut self.store,
+                        &mut self.platform,
+                        crate::kms::render::target::Src::server_internal(root_id),
+                        root_local_rect,
+                        32,
+                    )
+                    .map_err(|e| log::debug!("render root background readback {rect:?}: {e:?}"))
+                    .ok()
+                    .filter(|bytes| {
+                        bytes.len() == rect.extent.width as usize * rect.extent.height as usize * 4
+                    });
+            }
             // `assemble_root_scanout` zero-fills a piece it cannot read. That
             // degradation is unchanged, but a failure here now also covers an
             // unresolvable direct-scanout source, which previously answered
@@ -16248,6 +16487,14 @@ impl KmsBackend {
             }
         }
 
+        // The fill above is the pixel background; tile the pixmap after the
+        // root and COW have both reached their new extent. Root paints resolve
+        // through C.0's redirect routing, so doing this before the COW resize
+        // would paint the storage that is about to be retired.
+        if let Some(bg_pixmap) = self.core.bg_pixmap {
+            self.tile_root_background_pixmap(bg_pixmap.as_raw());
+        }
+
         // ── 4. Mark scene dirty — no drain/rebuild needed ─────────────────
         // A logical resize (RRSetScreenSize) does NOT change per-output
         // scanout pool geometry or output positions; only the root/COW
@@ -20796,6 +21043,15 @@ fn split_root_scanout_reads(
     reads
 }
 
+/// Where `assemble_root_scanout` wants a piece read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootReadSource {
+    /// Inside one output: what that CRTC scans out.
+    Scanout,
+    /// Covered by no output: the root window's own storage.
+    Background,
+}
+
 /// Assemble a root-region `GetImage` ZPixmap buffer from per-output scanout
 /// reads.
 ///
@@ -20806,19 +21062,22 @@ fn split_root_scanout_reads(
 /// came back all-black (ImageMagick `import` screenshots over a dual-head root:
 /// `import` grabs the entire root, then crops client-side). Split the region
 /// per output, read each piece, and blit it into one row-major 4-bytes-per-pixel
-/// buffer. Region area not covered by any output stays zero-filled (X11 leaves
-/// off-screen root pixels undefined).
+/// buffer. Region area not covered by any output is read as
+/// `RootReadSource::Background`: Xorg's root is the whole screen pixmap, so
+/// e.g. the corner a 1280x800 + 1024x768 layout leaves uncovered answers the
+/// root background, not black.
 ///
-/// `read(rect)` returns tightly-packed 4-bpp rows for `rect` (guaranteed by the
-/// splitter to sit fully within one output) or `None` if that read failed — a
-/// failed piece is left zero-filled rather than aborting the whole capture.
+/// `read(rect, source)` returns tightly-packed 4-bpp rows for `rect` (for
+/// `Scanout`, guaranteed by the splitter to sit fully within one output) or
+/// `None` if that read failed — a failed piece is left zero-filled rather than
+/// aborting the whole capture.
 fn assemble_root_scanout<F>(
     region: vk::Rect2D,
     outputs: &[(i32, i32, u32, u32)],
     mut read: F,
 ) -> Vec<u8>
 where
-    F: FnMut(vk::Rect2D) -> Option<Vec<u8>>,
+    F: FnMut(vk::Rect2D, RootReadSource) -> Option<Vec<u8>>,
 {
     let w = region.extent.width as usize;
     let h = region.extent.height as usize;
@@ -20832,8 +21091,30 @@ where
         offset: vk::Offset2D::default(),
         extent: region.extent,
     };
-    for piece in split_root_scanout_reads(sub, src_x, src_y, 0, 0, outputs) {
-        let Some(bytes) = read(piece.read) else {
+    let output_rects: Vec<vk::Rect2D> = outputs
+        .iter()
+        .map(|&(x, y, width, height)| vk::Rect2D {
+            offset: vk::Offset2D { x, y },
+            extent: vk::Extent2D { width, height },
+        })
+        .collect();
+    let scanout = split_root_scanout_reads(sub, src_x, src_y, 0, 0, outputs)
+        .into_iter()
+        .map(|piece| (piece, RootReadSource::Scanout));
+    let background = compute_copy_area_dst_rects(region, &output_rects)
+        .into_iter()
+        .map(|rect| {
+            let piece = RootScanoutRead {
+                read: rect,
+                dst_local: vk::Offset2D {
+                    x: rect.offset.x - region.offset.x,
+                    y: rect.offset.y - region.offset.y,
+                },
+            };
+            (piece, RootReadSource::Background)
+        });
+    for (piece, source) in scanout.chain(background) {
+        let Some(bytes) = read(piece.read, source) else {
             continue;
         };
         let pw = piece.read.extent.width as usize;
@@ -36130,6 +36411,9 @@ impl Backend for KmsBackend {
         // fix cut 2b — the compose scheduler otherwise excludes it).
         // Input shape (2) only affects hit-testing — no redraw needed.
         if kind == 0 || kind == 1 {
+            if self.direct_frames_shaped_off_root() {
+                self.request_direct_unflip("shape_clips_direct_frame");
+            }
             self.scene.wake_for_damage();
         }
         Ok(())
@@ -53600,7 +53884,7 @@ mod tests {
         // the old single-`read_scanout_region` path returned all-black for
         // (rect spanning two outputs → no matching BO → empty reply).
         let outputs = [(0i32, 0i32, 2u32, 2u32), (2, 0, 2, 2)];
-        let got = super::assemble_root_scanout(r(0, 0, 4, 2), &outputs, |rect| {
+        let got = super::assemble_root_scanout(r(0, 0, 4, 2), &outputs, |rect, _| {
             let px = (rect.extent.width * rect.extent.height) as usize;
             let byte = if rect.offset.x == 0 { 0x11u8 } else { 0x22u8 };
             Some(vec![byte; px * 4])
@@ -53618,7 +53902,7 @@ mod tests {
         // A piece whose read fails stays zero (black) instead of aborting the
         // whole capture; the covered output still lands.
         let outputs = [(0i32, 0i32, 2u32, 2u32), (2, 0, 2, 2)];
-        let got = super::assemble_root_scanout(r(0, 0, 4, 1), &outputs, |rect| {
+        let got = super::assemble_root_scanout(r(0, 0, 4, 1), &outputs, |rect, _| {
             if rect.offset.x == 0 {
                 Some(vec![
                     0x11u8;
@@ -53630,6 +53914,33 @@ mod tests {
         });
         assert_eq!(&got[0..8], &[0x11u8; 8], "covered output landed");
         assert_eq!(&got[8..16], &[0x00u8; 8], "failed-read output stays black");
+    }
+
+    #[test]
+    fn assemble_root_scanout_reads_uncovered_area_from_the_root_background() {
+        // A 4x2 output over a 6x3 root region: the column right of it and the
+        // row below it are covered by no CRTC and read from root storage, as
+        // Xorg does for the root background there.
+        let outputs = [(0i32, 0i32, 4u32, 2u32)];
+        let mut background_px = 0;
+        let got = super::assemble_root_scanout(r(0, 0, 6, 3), &outputs, |rect, source| {
+            let px = (rect.extent.width * rect.extent.height) as usize;
+            match source {
+                super::RootReadSource::Scanout => {
+                    assert_eq!(rect, r(0, 0, 4, 2), "scanout read stays on the output");
+                    Some(vec![0x11u8; px * 4])
+                }
+                super::RootReadSource::Background => {
+                    background_px += px;
+                    Some(vec![0x22u8; px * 4])
+                }
+            }
+        });
+        assert_eq!(background_px, 6 * 3 - 4 * 2, "every uncovered pixel, once");
+        let stride = 6 * 4;
+        assert_eq!(&got[0..16], &[0x11u8; 16], "row0 under the output");
+        assert_eq!(&got[16..24], &[0x22u8; 8], "row0 right of the output");
+        assert_eq!(&got[2 * stride..3 * stride], &[0x22u8; 24], "row2 below it");
     }
 
     #[test]
@@ -103683,6 +103994,70 @@ mod tests {
         );
     }
 
+    /// A root background PIXMAP survives the reallocation: the newly covered
+    /// region is tiled from the root origin, not left in the pixel fill
+    /// (Xorg `SetRootClip` exposes the whole resized root, `miPaintWindow`
+    /// tiles it). Measured in the vng scenario `root-bg-resize`.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn a_resized_root_keeps_its_background_pixmap() {
+        use yserver_core::backend::Backend;
+
+        let mut b = match KmsBackend::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+        // A 4x4 tile: green, with a blue top-left pixel marking the phase.
+        let tile = b.create_pixmap(None, 32, 4, 4).expect("tile pixmap");
+        b.fill_rectangle(None, tile.as_raw(), 0xFF00_FF00, 0, 0, 4, 4)
+            .expect("tile fill green");
+        b.fill_rectangle(None, tile.as_raw(), 0xFF00_00FF, 0, 0, 1, 1)
+            .expect("tile phase pixel blue");
+        b.set_container_background_pixmap(None, tile.as_raw())
+            .expect("set root bg pixmap");
+
+        let old_w = b.platform.fb_w;
+        let new_w = old_w.saturating_add(1280);
+        b.apply_virtual_screen_extent(new_w, b.platform.fb_h)
+            .expect("growing the virtual extent must not fail");
+        b.engine_close_open_frame_for_timeout_for_tests()
+            .expect("close open frame");
+        b.engine_drain_all_for_tests();
+
+        let root_id = b
+            .store
+            .lookup(b.core.window_id)
+            .expect("root must be live after the grow");
+        // A tile-aligned 2x1 read in the newly covered region: the phase
+        // pixel, then plain tile.
+        let x = (i32::from(old_w) + 4) & !3;
+        let bytes = b
+            .engine
+            .get_image(
+                &mut b.store,
+                &mut b.platform,
+                crate::kms::render::target::Src::server_internal(root_id),
+                ash::vk::Rect2D {
+                    offset: ash::vk::Offset2D { x, y: 4 },
+                    extent: ash::vk::Extent2D {
+                        width: 2,
+                        height: 1,
+                    },
+                },
+                32,
+            )
+            .expect("readback of the newly covered region");
+        assert_eq!(
+            (&bytes[0..3], &bytes[4..7]),
+            (&[0xff, 0x00, 0x00][..], &[0x00, 0xff, 0x00][..]),
+            "the resized root must be tiled with its background pixmap from \
+             the root origin (B8G8R8A8)",
+        );
+    }
+
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     #[cfg(target_os = "linux")]
@@ -111205,6 +111580,112 @@ mod tests {
         );
     }
 
+    /// A root-sized stage under the COW, as muffin lays it out.
+    fn seed_cow_stage(b: &mut super::KmsBackend, stage: u32) -> (u32, u32) {
+        let cow = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+        let (w, h) = (b.platform.fb_w, b.platform.fb_h);
+        let root_window = b.core.window_id;
+        seed_window(b, cow, Some(root_window), 0, 0);
+        seed_window(b, stage, Some(cow), 0, 0);
+        for xid in [cow, stage] {
+            let geometry = b.windows.get_mut(&xid).unwrap();
+            geometry.width = w;
+            geometry.height = h;
+        }
+        (u32::from(w), u32::from(h))
+    }
+
+    /// Xorg flips a Present only when the window's clip list is the root's
+    /// `winSize` (`present/present_scmd.c:102`), and a Bounding or Clip shape
+    /// on the window or any ancestor narrows that clip list (`SetWinSize`,
+    /// `dix/window.c:1713`; `miComputeClips`). Muffin's lock screen shapes
+    /// the COW to an EMPTY region while its stage keeps presenting.
+    #[test]
+    fn direct_shape_chain_requires_every_shape_to_cover_the_root() {
+        use yserver_protocol::x11::xfixes::RegionRect;
+
+        let cow = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+        let stage = 0x0040_0003;
+        let mut b = super::KmsBackend::for_tests();
+        let root = seed_cow_stage(&mut b, stage);
+        let (w, h) = (
+            u16::try_from(root.0).unwrap(),
+            u16::try_from(root.1).unwrap(),
+        );
+        let rect = |x: i16, width: u16| RegionRect {
+            x,
+            y: 0,
+            width,
+            height: h,
+        };
+        let half = i16::try_from(w / 2).unwrap();
+        let covers = |b: &super::KmsBackend| b.direct_shape_chain_covers_root(stage, root);
+
+        assert!(covers(&b), "unshaped chain");
+        b.core.shape_bounding.insert(cow, Vec::new());
+        assert!(!covers(&b), "empty COW Bounding shape clips the stage away");
+        b.core.shape_bounding.insert(cow, vec![rect(0, w)]);
+        assert!(covers(&b), "a root-sized COW shape");
+        b.core
+            .shape_bounding
+            .insert(cow, vec![rect(0, w / 2), rect(half, w - w / 2)]);
+        assert!(covers(&b), "two rects that tile the root");
+        b.core.shape_bounding.insert(cow, vec![rect(0, w / 2)]);
+        assert!(!covers(&b), "a hole punched in the COW");
+        b.core.shape_bounding.remove(&cow);
+        b.core.shape_clip.insert(stage, Vec::new());
+        assert!(!covers(&b), "an empty Clip shape on the presented window");
+        b.core.shape_clip.insert(stage, vec![rect(0, w)]);
+        assert!(covers(&b));
+        // Shape rects are window-relative: a stage shifted right by `half`
+        // with a shape starting at `-half` still covers the root.
+        b.windows.get_mut(&stage).unwrap().x = half;
+        b.core.shape_clip.insert(stage, vec![rect(-half, w)]);
+        assert!(covers(&b), "window-relative shape on an offset window");
+        b.core.shape_clip.insert(stage, vec![rect(0, w)]);
+        assert!(!covers(&b), "the same rect, not translated back");
+    }
+
+    /// The shape change itself must hand a direct frame back to the composed
+    /// scene: muffin shapes the COW and need not Present again before the
+    /// locker is expected on screen.
+    #[test]
+    fn an_empty_cow_bounding_shape_unflips_the_direct_stage_frame() {
+        use yserver_core::backend::Backend;
+        use yserver_protocol::x11::xfixes::RegionRect;
+
+        let cow = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+        let (stage, source) = (0x0040_0003, 0x0040_0007);
+        let mut b = super::KmsBackend::for_tests();
+        let (w, h) = seed_cow_stage(&mut b, stage);
+        seed_window(&mut b, source, None, 0, 0);
+        let (w, h) = (u16::try_from(w).unwrap(), u16::try_from(h).unwrap());
+        retain_direct_frame_from_source_test(&mut b, source, stage, w, h);
+        assert!(b.scanout_m2.active());
+
+        b.set_shape_rectangles(None, cow, 2, Some(&[])).unwrap();
+        b.set_shape_rectangles(
+            None,
+            cow,
+            0,
+            Some(&[RegionRect {
+                x: 0,
+                y: 0,
+                width: w,
+                height: h,
+            }]),
+        )
+        .unwrap();
+        assert!(
+            !b.scanout_m2.unflip_requested,
+            "an input shape or a root-covering bounding shape keeps the flip"
+        );
+
+        b.set_shape_rectangles(None, cow, 0, Some(&[])).unwrap();
+        assert!(b.scanout_m2.unflip_requested);
+        assert_eq!(b.scanout_m2.unflip_reason, Some("shape_clips_direct_frame"));
+    }
+
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_3ci_release_supersedes_undispatched_acquire_vulkan() {
@@ -112335,6 +112816,7 @@ mod tests {
     fn kbd_map_backend(layout: &str, options: Option<&str>) -> KmsBackend {
         let mut backend = KmsBackend::for_tests();
         backend.core.install_keymap(
+            &crate::kms::xkb::golden_context(),
             crate::kms::xkb::golden_keymap(layout, options),
             &crate::kms::core::XkbRmlvo {
                 rules: "evdev".into(),
