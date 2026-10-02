@@ -32,7 +32,7 @@
 - XI1 `XListInputDevices` and XI2 `XIQueryDevice` expose the same live IDs and names.
 - Slave delivery follows the current attachment: a temporarily floating grabbed slave gets its own XI delivery and cannot feed the master/core stream until reattached.
 - Recognized libinput property writes apply to the target live handle before the XI value commits.
-- `YSERVER_MOUSE_ACCEL_PROFILE` accepts `default|flat|adaptive`; unset means `default`; touchpads are excluded.
+- No server-wide acceleration default and no new environment variables (Task 17 dropped 2026-10-02).
 - This plan changes the direct KMS/libinput path. Nested host input retains master/core delivery without being mislabeled as XTEST; XTEST input retains its explicitly requested XI device identity.
 - Before each implementation commit: `cargo +nightly fmt` and `cargo clippy --all-targets -- -D warnings`, as required by `AGENTS.md`.
 
@@ -259,7 +259,9 @@ DeviceSuspended retains XI IDs/properties, inventory facts and selections; relea
 - [ ] **Step 3:** Match Xorg `Xi/selectev.c`, `Xi/extinit.c`, `dix/devices.c`, and `XIproto.h` selection, sequencing, and wire layout; retain existing XI1 property-change fanout.
 - [ ] **Step 4:** Run focused checks, format, CI clippy; commit `feat(xinput): notify XI1 clients of physical hotplug`.
 
-### Task 17: Apply the global mouse acceleration default
+### Task 17: Apply the global mouse acceleration default — DROPPED
+
+**Dropped 2026-10-02 by user decision:** the upstream maintainer rejects gating environment variables (PR 129). Per-device XI properties plus MATE presence reapplication (Task 16) or a startup `xinput` loop replace it; see the spec section "Mouse acceleration configuration". Task 18 skips the global-default checks. The original text below is kept for history only and must not be implemented.
 
 **Files:** Modify `crates/yserver/src/lib.rs:272,1016`, `crates/yserver/src/kms/render/backend.rs:5193`, `crates/yserver/src/kms/render/platform.rs:2612`, `crates/yserver/src/kms/backend.rs:1062`, `crates/yserver/src/input/libinput_config.rs`, `crates/yserver/src/input/context.rs:166,211`, `README.md`.
 

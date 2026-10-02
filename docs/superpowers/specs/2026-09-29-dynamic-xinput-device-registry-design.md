@@ -18,8 +18,9 @@ wrong libinput source. `xinput list` exposes only one physical pointer facade.
 The objective is for every usable libinput keyboard, pointer, and touch
 function to have its own XInput identity and for all clients to see and
 configure the same live devices. No exact device selector or heuristic for a
-"primary mouse" is part of the design. A global default can set `flat` for
-every eligible mouse function, including newly connected devices.
+"primary mouse" is part of the design. Acceleration is configured per
+device through its own XI properties; there is no server-wide default
+(see "Mouse acceleration configuration").
 
 ## Grounding and compatibility
 
@@ -269,28 +270,31 @@ survey of third-party X11 clients. A physical event must never be stamped
 as source 4 solely because 4 is the only current slave. Preserve core
 event behavior via masters 2/3.
 
-## Global mouse acceleration default
+## Mouse acceleration configuration
 
-The KMS backend accepts `YSERVER_MOUSE_ACCEL_PROFILE=default|flat|adaptive`
-at startup; unset means `default`. `flat` and `adaptive` apply at each
-libinput `DeviceAdded` to every non-touchpad source with pointer capability
-and a supported acceleration profile. This deliberately includes the
-HyperX Mouse event node; no attempt is made to guess whether it is a
-"real" mouse. Sources without acceleration support are skipped. Touchpad
-settings remain independent. If a requested profile is unavailable on a
-source, retain its libinput default and log the skipped source. Invalid
-values are startup errors with the allowed values in the diagnostic.
+**Revised 2026-10-02 (user decision):** the earlier `YSERVER_MOUSE_ACCEL_PROFILE`
+startup default is dropped. The upstream maintainer asked on PR 129 not to
+add gating environment variables, since they become a permanent
+maintenance burden. No server-wide acceleration default is added.
 
-The global setting is an initial default. Later XI property writes from a
-client such as MATE override that source until physical removal. A proven
-VT continuation restores those settings without reapplying the initial
-default. On physical reconnection, the global default is applied to the
-new source before its properties are published. This is the yserver
-counterpart of Xorg's `InputClass` plus `AccelProfile` setting; it does not require an i3 script or an exact device
-selector. The existing i3 `set-prop 4` line should be removed from the
-user's configuration when this behavior is deployed; changing yserver
-cannot make that line configure a physical mouse while preserving 4 as a
-virtual device.
+Each acceleration-capable pointer facet exposes its own libinput
+properties, so clients configure physical devices directly. MATE's mouse
+manager reapplies its settings to each device on XI1 `DevicePresenceNotify`
+after hotplug. Without a settings daemon, a startup script can configure
+every device that exposes the property, which is the same pattern the
+project's vng pointer scenarios use:
+
+```sh
+for id in $(xinput list --id-only); do
+    xinput set-prop "$id" 'libinput Accel Profile Enabled' 0 1 0 2>/dev/null || true
+done
+```
+
+Sources without acceleration support do not expose the property, so the loop skips
+them. The existing i3 `set-prop 4` line must be replaced, because 4 is now
+the virtual XTEST pointer and never configures a physical mouse. A device
+plugged in after startup keeps libinput's default until a client
+configures it.
 
 ## Touch protocol details clarified by the adversarial review
 
@@ -375,10 +379,9 @@ tracked in `docs/status.md`.
   handle. The same write to the HyperX pointer changes only HyperX. A
   write to one mixed source's keyboard facet cannot alter its pointer
   facet; writes to 4/5 cannot alter physical devices.
-- With `YSERVER_MOUSE_ACCEL_PROFILE=flat`, both acceleration-capable
-  non-touchpad pointers report flat immediately after add and after
-  reconnection, regardless of add order. Without the setting, libinput's
-  default remains in force until a client changes it.
+- Without client configuration, libinput's default acceleration remains
+  in force on each source; a client write to one source's acceleration
+  property changes only that source (no server-wide default exists).
 - Pointer and keyboard events carry their actual source IDs; master/core
   behavior, focus, grabs, scroll, XTEST, and existing touchpad properties
   continue to work. Touch contacts from a touch-capable source generate
