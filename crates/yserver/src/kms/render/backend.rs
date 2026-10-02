@@ -1621,6 +1621,7 @@ pub struct KmsBackend {
     invalidated_crtc_config_probes: HashSet<CrtcConfigToken>,
     ready_crtc_config_announcements: VecDeque<CrtcConfigToken>,
     next_crtc_config_token: u64,
+    next_device_config_token: u64,
     /// Invalidates results across any topology quiesce or VT event, including
     /// an ABA transition which happens to restore the same final layout.
     crtc_config_topology_epoch: u64,
@@ -5309,6 +5310,7 @@ impl KmsBackend {
             invalidated_crtc_config_probes: HashSet::new(),
             ready_crtc_config_announcements: VecDeque::new(),
             next_crtc_config_token: 1,
+            next_device_config_token: 1,
             crtc_config_topology_epoch: 0,
             #[cfg(test)]
             crtc_config_discovery_override: None,
@@ -6322,6 +6324,7 @@ impl KmsBackend {
             invalidated_crtc_config_probes: HashSet::new(),
             ready_crtc_config_announcements: VecDeque::new(),
             next_crtc_config_token: 1,
+            next_device_config_token: 1,
             crtc_config_topology_epoch: 0,
             #[cfg(test)]
             crtc_config_discovery_override: None,
@@ -21525,11 +21528,14 @@ impl Backend for KmsBackend {
         }
     }
 
-    fn apply_device_config(
+    fn start_device_config(
         &mut self,
-        device_node: &str,
+        source: yserver_core::xinput::InputSourceId,
         change: yserver_core::xinput::libinput_props::DeviceConfigChange,
-    ) -> Result<(), yserver_core::xinput::libinput_props::DeviceConfigError> {
+    ) -> Result<
+        yserver_core::xinput::libinput_props::DeviceConfigStart,
+        yserver_core::xinput::libinput_props::DeviceConfigError,
+    > {
         // libinput lives on the separate
         // input thread, so forward the write over the control channel —
         // the thread applies it to its own device map on the next wakeup.
@@ -21538,10 +21544,15 @@ impl Backend for KmsBackend {
         // rejection. Without this the write would be silently dropped and
         // every client device-config knob (natural scroll, tap, accel…)
         // would be a no-op under lightdm.
-        if let Some(control) = self.input_thread_control.as_ref() {
-            control.push_config(device_node.to_owned(), change);
-        }
-        Ok(())
+        let Some(control) = self.input_thread_control.as_ref() else {
+            return Err(yserver_core::xinput::libinput_props::DeviceConfigError::SourceGone);
+        };
+        let token = yserver_core::xinput::libinput_props::DeviceConfigToken(
+            self.next_device_config_token.max(1),
+        );
+        self.next_device_config_token = token.0.wrapping_add(1).max(1);
+        control.push_config(token, source, change);
+        Ok(yserver_core::xinput::libinput_props::DeviceConfigStart::Pending(token))
     }
 
     fn probe_input_devices(&mut self, _state: &mut ServerState) -> usize {

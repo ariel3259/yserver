@@ -17,7 +17,7 @@
 //! `nested::handle_request`'s ChangeWindowAttributes path on
 //! ROOT_WINDOW pokes the container).
 
-use std::{io, sync::Mutex};
+use std::{collections::VecDeque, io, sync::Mutex};
 
 use yserver_protocol::x11::{ClipRectangles, FontMetrics, ResourceId, glx, xfixes};
 
@@ -523,11 +523,19 @@ pub struct RecordingBackend {
     /// one per pending Present scrapped by same-target supersession.
     /// Lets a test assert exactly one call per victim.
     pub present_skip_count: u32,
-    /// `(device_node, change)` pairs passed to `apply_device_config`, in
-    /// call order, so xinput property-write tests can assert exactly what
-    /// reached the backend (the trait's default impl is a no-op and
-    /// doesn't record anything).
-    pub applied_device_configs: Vec<(String, crate::xinput::libinput_props::DeviceConfigChange)>,
+    /// Source/change pairs passed to `start_device_config`, in call order.
+    pub started_device_configs: Vec<(
+        crate::xinput::InputSourceId,
+        crate::xinput::libinput_props::DeviceConfigChange,
+    )>,
+    /// Results returned by successive `start_device_config` calls. Empty
+    /// means each setting is confirmed synchronously.
+    pub device_config_start_results: VecDeque<
+        Result<
+            crate::xinput::libinput_props::DeviceConfigStart,
+            crate::xinput::libinput_props::DeviceConfigError,
+        >,
+    >,
 }
 
 impl Default for RecordingBackend {
@@ -627,7 +635,8 @@ impl RecordingBackend {
             enqueued_present_completions: Vec::new(),
             arm_present_syncobj_wait_result: None,
             present_skip_count: 0,
-            applied_device_configs: Vec::new(),
+            started_device_configs: Vec::new(),
+            device_config_start_results: VecDeque::new(),
         }
     }
 
@@ -901,14 +910,18 @@ impl Backend for RecordingBackend {
             .is_some_and(|(owner, _)| *owner == client_id)
     }
 
-    fn apply_device_config(
+    fn start_device_config(
         &mut self,
-        device_node: &str,
+        source: crate::xinput::InputSourceId,
         change: crate::xinput::libinput_props::DeviceConfigChange,
-    ) -> Result<(), crate::xinput::libinput_props::DeviceConfigError> {
-        self.applied_device_configs
-            .push((device_node.to_owned(), change));
-        Ok(())
+    ) -> Result<
+        crate::xinput::libinput_props::DeviceConfigStart,
+        crate::xinput::libinput_props::DeviceConfigError,
+    > {
+        self.started_device_configs.push((source, change));
+        self.device_config_start_results.pop_front().unwrap_or(Ok(
+            crate::xinput::libinput_props::DeviceConfigStart::Applied,
+        ))
     }
 
     fn signal_present_wake(&mut self, present_id: u64) {

@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 
 use super::message::DeviceInfo;
-use crate::xinput::InputSourceId;
+use crate::xinput::{InputSourceId, libinput_props::DeviceConfigChange};
 
 /// Process-lifetime input device inventory, owned beside the core loop
 /// (a local binding in `run_core`, never a field of `ServerState`).
@@ -50,6 +50,17 @@ impl InputInventory {
     pub fn resume(&mut self, mut info: DeviceInfo) {
         info.enabled = true;
         self.add(info);
+    }
+
+    /// Record a configuration value only after the source's live libinput
+    /// handle confirms it. Returns false when that source has already been
+    /// removed from the process-lifetime inventory.
+    pub fn update_config(&mut self, source: InputSourceId, change: DeviceConfigChange) -> bool {
+        let Some(info) = self.devices.get_mut(&source) else {
+            return false;
+        };
+        info.config.apply_confirmed(change);
+        true
     }
 
     /// Drop one source. No-op if it is already absent.

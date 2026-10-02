@@ -142,6 +142,33 @@ pub struct LibinputConfigSnapshot {
     pub send_events: BitFlags2,
 }
 
+impl LibinputConfigSnapshot {
+    /// Reflect a configuration change that the live libinput handle has
+    /// confirmed. Availability and default values come from the device
+    /// snapshot and are deliberately left untouched.
+    pub fn apply_confirmed(&mut self, change: crate::xinput::libinput_props::DeviceConfigChange) {
+        use crate::xinput::libinput_props::DeviceConfigChange as C;
+
+        match change {
+            C::Tap(value) => self.tap.current = value,
+            C::TapDrag(value) => self.tap_drag.current = value,
+            C::TapDragLock(value) => self.tap_drag_lock.current = value,
+            C::TapButtonMap(value) => self.tap_button_map.current = Some(value),
+            C::NaturalScroll(value) => self.natural_scroll.current = value,
+            C::Dwt(value) => self.dwt.current = value,
+            C::LeftHanded(value) => self.left_handed.current = value,
+            C::MiddleEmulation(value) => self.middle_emulation.current = value,
+            C::ScrollMethod(value) => self.scroll_method.current = value,
+            C::ClickMethod(value) => self.click_method.current = value,
+            C::SendEvents(value) => self.send_events.current_mask = value,
+            C::AccelSpeed(value) => self.accel.current = value,
+            C::AccelProfile(value) => self.accel_profile.current = value.filter(|slot| *slot < 2),
+            C::ScrollButton(value) => self.scroll_button.current = value,
+            C::ScrollButtonLock(value) => self.scroll_button_lock.current = value,
+        }
+    }
+}
+
 /// An owned recognized XI property write, suitable for validation after it
 /// crosses from request parsing into the core configuration lane.
 #[derive(Debug, Clone)]
@@ -230,6 +257,14 @@ pub enum Message {
     /// the core drains opaque tokens through `Backend` and finishes them on
     /// its own thread.
     CrtcConfigReady,
+    /// The input thread finished applying one source-targeted libinput
+    /// configuration request. Process-lifetime so reset cannot strand the
+    /// runner's submitted configuration lane.
+    DeviceConfigResult {
+        token: crate::xinput::libinput_props::DeviceConfigToken,
+        source: crate::xinput::InputSourceId,
+        result: Result<(), crate::xinput::libinput_props::DeviceConfigError>,
+    },
     /// signalfd readable.
     Shutdown,
     /// SIGHUP under a policy other than `-noreset` → cross the

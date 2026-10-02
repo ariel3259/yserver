@@ -124,6 +124,9 @@ pub enum RequestOutcome {
     /// request's flow-control credit and park later requests from the same
     /// client until the token becomes ready.
     PendingCrtcConfig(PendingCrtcConfig),
+    /// A recognized physical libinput property write. The core runner owns
+    /// validation, source-targeted application, and commit ordering.
+    PendingXiConfig(crate::core_loop::message::XiConfigRequest),
 }
 
 /// Continuation data needed to finish an asynchronous `RRSetCrtcConfig`
@@ -17766,12 +17769,14 @@ fn handle_xi2_request(
             // both write arms (XI2 minor 57 + XI1 minor 37) share the same
             // pipeline so T5/T6 only has to wire event emission in one place.
             match dispatch_change_property(
-                state, backend, client_id, sequence, 57, deviceid, mode, format, property,
-                type_atom, &data,
+                state, client_id, sequence, 57, deviceid, mode, format, property, type_atom, &data,
             ) {
-                Ok(what) => {
+                Ok(PropertyChangeOutcome::Changed(what)) => {
                     let _ = emit_property_change(state, deviceid, property, what);
                     return Ok(RequestOutcome::Handled);
+                }
+                Ok(PropertyChangeOutcome::Pending(request)) => {
+                    return Ok(RequestOutcome::PendingXiConfig(request));
                 }
                 Err(err) => {
                     return emit_property_dispatch_error(state, client_id, sequence, err, 57);
@@ -19165,12 +19170,14 @@ fn handle_xi2_request(
             // `XI_PropertyEvent` here too — xserver's
             // `send_property_event` fires from both XI1 and XI2 paths.
             match dispatch_change_property(
-                state, backend, client_id, sequence, 37, deviceid, mode, format, property,
-                type_atom, &data,
+                state, client_id, sequence, 37, deviceid, mode, format, property, type_atom, &data,
             ) {
-                Ok(what) => {
+                Ok(PropertyChangeOutcome::Changed(what)) => {
                     let _ = emit_property_change(state, deviceid, property, what);
                     return Ok(RequestOutcome::Handled);
+                }
+                Ok(PropertyChangeOutcome::Pending(request)) => {
+                    return Ok(RequestOutcome::PendingXiConfig(request));
                 }
                 Err(err) => {
                     return emit_property_dispatch_error(state, client_id, sequence, err, 37);
@@ -24456,8 +24463,9 @@ pub(super) fn validate_xi_change(
     };
 
     // Match xf86-input-libinput's setter shape checks before disabled-device
-    // and availability checks. Format/type mismatches were rejected above;
-    // a bad element count is also a BadMatch at the Xorg setter boundary.
+    // and availability checks. Format/type mismatches were rejected above.
+    // Accel Profile Enabled reports an oversized merged value as BadValue;
+    // the other exact-width descriptors retain their Xorg BadMatch result.
     let shape_matches = match descriptor.kind {
         crate::xinput::libinput_props::ValueKind::Scalar => {
             merged_data.len() == usize::from(descriptor.format / 8)
@@ -24471,7 +24479,13 @@ pub(super) fn validate_xi_change(
         }
     };
     if !shape_matches {
-        return Err(PropertyDispatchError::BadMatch);
+        return if descriptor.binding == Some(crate::xinput::libinput_props::Binding::AccelProfile) {
+            Err(PropertyDispatchError::BadValue {
+                error_value: u32::from(request.format),
+            })
+        } else {
+            Err(PropertyDispatchError::BadMatch)
+        };
     }
 
     if crate::xinput::libinput_props::validate_value(descriptor.kind, request.format, &merged_data)
@@ -24605,6 +24619,61 @@ pub(super) fn commit_validated_xi_change(
     Ok(what)
 }
 
+/// Commit a confirmed source change against the current XI registry. When a
+/// protocol continuation survived in the current generation, preserve its
+/// already validated/merged bytes. After disconnect or reset, derive the
+/// current atom and property bytes from the submitted setting instead of
+/// using retired request metadata.
+pub(super) fn commit_confirmed_xi_change(
+    state: &mut ServerState,
+    source_id: crate::xinput::InputSourceId,
+    change: crate::xinput::libinput_props::DeviceConfigChange,
+    validated: Option<&ValidatedXiChange>,
+) -> Result<(u16, AtomId, crate::xinput::PropWhat), PropertyDispatchError> {
+    if let Some(validated) = validated {
+        let what = commit_validated_xi_change(state, validated)?;
+        return Ok((validated.facet_id, validated.request.property, what));
+    }
+
+    if state.xi_devices.source(source_id).is_none() {
+        return Err(PropertyDispatchError::BadDevice { deviceid: 0 });
+    }
+    let facet_id = state
+        .xi_devices
+        .facet(source_id, crate::xinput::XiFacetKind::PointerTouch)
+        .ok_or(PropertyDispatchError::BadDevice { deviceid: 0 })?;
+    let descriptor = crate::xinput::libinput_props::descriptor_for_change(change);
+    let property = state.atoms.intern(descriptor.name, false);
+    let type_atom = crate::xinput::type_atom_for(descriptor.val, state.float_atom);
+    let device = state
+        .xi_devices
+        .device_mut(facet_id)
+        .filter(|device| {
+            device.source_id == Some(source_id)
+                && device.facet == Some(crate::xinput::XiFacetKind::PointerTouch)
+        })
+        .ok_or(PropertyDispatchError::BadDevice { deviceid: facet_id })?;
+    let (what, read_only, deletable) = match device.properties.get(&property) {
+        Some(existing) => (
+            crate::xinput::PropWhat::Modified,
+            existing.read_only,
+            existing.deletable,
+        ),
+        None => (crate::xinput::PropWhat::Created, false, true),
+    };
+    device.properties.insert(
+        property,
+        crate::xinput::XiProperty {
+            type_atom,
+            format: descriptor.format,
+            data: crate::xinput::libinput_props::encode_change_value(change),
+            read_only,
+            deletable,
+        },
+    );
+    Ok((facet_id, property, what))
+}
+
 /// Apply a parsed XI property request. Recognized writes on physical sources
 /// use the facet-aware validator; unknown properties and virtual/master
 /// properties retain ordinary XI storage behavior.
@@ -24615,9 +24684,13 @@ fn is_xtest_marker_property(state: &ServerState, deviceid: u16, property: AtomId
     ) && property == state.xtest_device_atom
 }
 
+pub(super) enum PropertyChangeOutcome {
+    Changed(crate::xinput::PropWhat),
+    Pending(crate::core_loop::message::XiConfigRequest),
+}
+
 fn dispatch_change_property(
     state: &mut ServerState,
-    backend: &mut dyn Backend,
     client: ClientId,
     sequence: SequenceNumber,
     minor_opcode: u16,
@@ -24627,7 +24700,7 @@ fn dispatch_change_property(
     property: AtomId,
     type_atom: AtomId,
     data: &[u8],
-) -> Result<crate::xinput::PropWhat, PropertyDispatchError> {
+) -> Result<PropertyChangeOutcome, PropertyDispatchError> {
     // 1. BadAtom.
     if !state.atoms.exists(property) {
         return Err(PropertyDispatchError::BadAtom { atom: property.0 });
@@ -24659,20 +24732,7 @@ fn dispatch_change_property(
             mode,
             data: data.to_vec(),
         };
-        let validated = validate_xi_change(state, &request)?;
-        let node = source_info.device_node.clone();
-        match backend.apply_device_config(&node, validated.change) {
-            Ok(()) => {}
-            Err(crate::xinput::libinput_props::DeviceConfigError::Unsupported) => {
-                return Err(PropertyDispatchError::BadMatch);
-            }
-            Err(crate::xinput::libinput_props::DeviceConfigError::Invalid) => {
-                return Err(PropertyDispatchError::BadValue {
-                    error_value: u32::from(format),
-                });
-            }
-        }
-        return commit_validated_xi_change(state, &validated);
+        return Ok(PropertyChangeOutcome::Pending(request));
     }
 
     if source_info.is_some()
@@ -24693,7 +24753,7 @@ fn dispatch_change_property(
     let device = crate::xinput::find_device_mut(&mut state.xi_devices, deviceid)
         .expect("caller verified device exists");
     match crate::xinput::apply_change_property(device, mode, format, property, type_atom, data) {
-        Ok(what) => Ok(what),
+        Ok(what) => Ok(PropertyChangeOutcome::Changed(what)),
         Err(crate::xinput::XiPropError::BadValue) => Err(PropertyDispatchError::BadValue {
             error_value: u32::from(format),
         }),
@@ -24709,7 +24769,7 @@ fn dispatch_change_property(
 
 /// Map a [`PropertyDispatchError`] onto the XI minor-opcode error-emit
 /// path. Pure plumbing — the variant carries the error code + value.
-fn emit_property_dispatch_error(
+pub(super) fn emit_property_dispatch_error(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
@@ -24764,7 +24824,7 @@ fn emit_property_dispatch_error(
 /// `deviceid=0`) silently receives nothing. The XI2 and XI1 emits are
 /// independent: a client may have selected via either (or both) paths
 /// and receives one copy per path.
-fn emit_property_change(
+pub(super) fn emit_property_change(
     state: &mut ServerState,
     deviceid: u16,
     property: AtomId,
@@ -34318,12 +34378,15 @@ mod tests {
         assert_eq!(glx_fbconfig_visual(0xDEAD), 0);
     }
 
-    fn install_client(state: &mut ServerState, id: u32) -> UnixStream {
-        let (a, b) = UnixStream::pair().unwrap();
+    fn install_client_with_transport(
+        state: &mut ServerState,
+        id: u32,
+        transport: crate::transport::Transport,
+    ) {
         state.clients.insert(
             id,
             ClientState {
-                writer: Arc::new(Mutex::new(crate::transport::Transport::Unix(a))),
+                writer: Arc::new(Mutex::new(transport)),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
                 // Permissive resource-id range so tests driving
@@ -34349,7 +34412,34 @@ mod tests {
                 fd_passing: true,
             },
         );
-        b
+    }
+
+    fn install_client(state: &mut ServerState, id: u32) -> UnixStream {
+        let (writer, peer) = UnixStream::pair().unwrap();
+        install_client_with_transport(state, id, crate::transport::Transport::Unix(writer));
+        peer
+    }
+
+    fn install_capture_client(state: &mut ServerState, id: u32) -> crate::transport::CapturedPeer {
+        let (transport, peer) = crate::transport::Transport::capture_pair();
+        install_client_with_transport(state, id, transport);
+        peer
+    }
+
+    trait TestPeer: Read {
+        fn set_nonblocking(&mut self, nonblocking: bool) -> io::Result<()>;
+    }
+
+    impl TestPeer for UnixStream {
+        fn set_nonblocking(&mut self, nonblocking: bool) -> io::Result<()> {
+            UnixStream::set_nonblocking(self, nonblocking)
+        }
+    }
+
+    impl TestPeer for crate::transport::CapturedPeer {
+        fn set_nonblocking(&mut self, nonblocking: bool) -> io::Result<()> {
+            crate::transport::CapturedPeer::set_nonblocking(self, nonblocking)
+        }
     }
 
     #[test]
@@ -34559,7 +34649,7 @@ mod tests {
         });
     }
 
-    fn read_all_available(peer: &mut UnixStream) -> Vec<u8> {
+    fn read_all_available(peer: &mut impl TestPeer) -> Vec<u8> {
         peer.set_nonblocking(true).expect("set_nonblocking");
         let mut out = Vec::new();
         let mut buf = [0u8; 512];
@@ -42790,8 +42880,9 @@ mod tests {
     // Tier 2 Task 4: device naming from the registry + XI1/XI2 sync
     // -----------------------------------------------------------------
 
-    /// Drive XIQueryDevice (opcode 48) and parse out `(id, name)` for
-    /// each device in the reply (little-endian fixture clients).
+    /// Drive XIQueryDevice (opcode 48) for XIAllDevices and parse out
+    /// `(id, name)` for each device in the little-endian reply. Validate
+    /// the reply length and every variable-sized device/class record.
     fn query_device_ids_and_names(
         state: &mut ServerState,
         peer: &mut UnixStream,
@@ -42804,18 +42895,33 @@ mod tests {
             ClientId(1),
             SequenceNumber(1),
             xi2_header(48),
-            &[],
+            &[0, 0, 0, 0], // deviceid=XIAllDevices, pad
         )
         .expect("XIQueryDevice");
         let wire = read_all_available(peer);
+        assert_eq!(wire[0], 1, "XIQueryDevice reply, not an X error: {wire:?}");
+        let reply_length = u32::from_le_bytes(wire[4..8].try_into().unwrap()) as usize;
+        assert_eq!(
+            wire.len(),
+            32 + reply_length * 4,
+            "reply length covers all records"
+        );
         let num_devices = u16::from_le_bytes([wire[8], wire[9]]) as usize;
         let mut off = 32;
         let mut out = Vec::new();
         for _ in 0..num_devices {
+            assert!(
+                off + 12 <= wire.len(),
+                "device-info header is in reply bounds"
+            );
             let id = u16::from_le_bytes([wire[off], wire[off + 1]]);
             let num_classes = u16::from_le_bytes([wire[off + 6], wire[off + 7]]) as usize;
             let name_len = u16::from_le_bytes([wire[off + 8], wire[off + 9]]) as usize;
             let name_start = off + 12;
+            assert!(
+                name_start + name_len <= wire.len(),
+                "device name is in reply bounds"
+            );
             let name = String::from_utf8(wire[name_start..name_start + name_len].to_vec()).unwrap();
             // Advance: 12-byte info header + name (padded to 4) + classes.
             let mut pos = name_start + name_len;
@@ -42825,13 +42931,44 @@ mod tests {
             // Walk class blocks by their 4-byte-unit length field (u16 at
             // offset +2 of each class header).
             for _ in 0..num_classes {
+                assert!(pos + 4 <= wire.len(), "class header is in reply bounds");
                 let units = u16::from_le_bytes([wire[pos + 2], wire[pos + 3]]) as usize;
+                assert!(units > 0, "XI2 class record has a nonzero length");
                 pos += units * 4;
+                assert!(
+                    pos <= wire.len(),
+                    "class record length stays in reply bounds"
+                );
             }
             out.push((id, name));
             off = pos;
         }
+        assert_eq!(off, wire.len(), "all reply bytes belong to device records");
         out
+    }
+
+    #[test]
+    fn xiquerydevice_short_body_returns_well_formed_badlength_error() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(48),
+            &[],
+        )
+        .expect("malformed XIQueryDevice is handled as an X error");
+
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 32);
+        assert_eq!(&wire[0..4], &[0, x11::error::BAD_LENGTH, 1, 0]);
+        assert_eq!(&wire[4..8], &[0, 0, 0, 0]);
+        assert_eq!(&wire[8..11], &[48, 0, 137]);
+        assert_eq!(&wire[11..], &[0; 21]);
     }
 
     /// Drive XListInputDevices (XI 1.x, major 131 minor 2) and parse out
@@ -42893,19 +43030,27 @@ mod tests {
     fn xiquerydevice_reports_slave_pointer_registry_name_after_rename() {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
-        // Rename device 4 in the registry (simulating a seeded touchpad).
+        seed_pointer_for_t3(&mut state);
+        // Physical facets start at 6; 4 stays the virtual XTEST pointer.
         state
             .xi_devices
             .iter_mut()
-            .find(|d| d.id == 4)
+            .find(|d| d.id == TEST_PHYSICAL_POINTER_ID)
             .unwrap()
             .name = "SynPS/2 Synaptics TouchPad".to_owned();
 
         let devs = query_device_ids_and_names(&mut state, &mut peer);
-        let slave = devs.iter().find(|(id, _)| *id == 4).expect("device 4");
+        let slave = devs
+            .iter()
+            .find(|(id, _)| *id == TEST_PHYSICAL_POINTER_ID)
+            .expect("physical touchpad facet");
         assert_eq!(
             slave.1, "SynPS/2 Synaptics TouchPad",
-            "XIQueryDevice must report device 4's registry name"
+            "XIQueryDevice must report the physical facet's registry name"
+        );
+        assert_eq!(
+            devs.iter().find(|(id, _)| *id == 4).unwrap().1,
+            crate::xinput::registry::NAME_XTEST_POINTER
         );
     }
 
@@ -42918,13 +43063,13 @@ mod tests {
         let xi1 = list_input_devices_ids_and_names(&mut state, &mut peer);
         assert_eq!(xi2, xi1, "XI1 and XI2 must agree on (id, name) by default");
 
-        // After a touchpad rename, both must STILL agree — this is the
-        // ListInputDevices fatal-CHECK guard: Chromium/Electron compare
-        // the two enumerations and crash on any divergence.
+        // A physical touchpad gets its own ID; both enumerations must
+        // still agree after that physical facet is renamed.
+        seed_pointer_for_t3(&mut state);
         state
             .xi_devices
             .iter_mut()
-            .find(|d| d.id == 4)
+            .find(|d| d.id == TEST_PHYSICAL_POINTER_ID)
             .unwrap()
             .name = "ETPS/2 Elantech Touchpad".to_owned();
         let xi2 = query_device_ids_and_names(&mut state, &mut peer);
@@ -42934,17 +43079,27 @@ mod tests {
             "XI1 and XI2 must agree on (id, name) after a touchpad rename"
         );
         assert_eq!(
-            xi2.iter().find(|(id, _)| *id == 4).unwrap().1,
+            xi2.iter()
+                .find(|(id, _)| *id == TEST_PHYSICAL_POINTER_ID)
+                .unwrap()
+                .1,
             "ETPS/2 Elantech Touchpad",
-            "both enumerations carry the renamed slave pointer"
+            "both enumerations carry the renamed physical touchpad facet"
+        );
+        assert_eq!(
+            xi2.iter().find(|(id, _)| *id == 4).unwrap().1,
+            crate::xinput::registry::NAME_XTEST_POINTER
         );
     }
 
     /// Drive `XListInputDevices` (XI 1.x, major 131 minor 2) and return
-    /// the type-atom `u32` for each device in order `[2, 3, 4, 5]`.
+    /// `(device id, type atom)` pairs for the current registry snapshot.
     /// The atom sits at bytes 0-3 of each 8-byte device-info descriptor
     /// immediately after the 32-byte reply header.
-    fn list_input_devices_type_atoms(state: &mut ServerState, peer: &mut UnixStream) -> [u32; 4] {
+    fn list_input_devices_type_atoms(
+        state: &mut ServerState,
+        peer: &mut UnixStream,
+    ) -> Vec<(u16, u32)> {
         let mut backend = RecordingBackend::new();
         let header = RequestHeader {
             opcode: 131,
@@ -42966,11 +43121,18 @@ mod tests {
         .expect("XListInputDevices");
         let wire = read_all_available(peer);
         let ndevices = wire[8] as usize;
-        assert_eq!(ndevices, 4, "expected 4 devices");
-        let mut result = [0u32; 4];
+        let reply_length = u32::from_le_bytes(wire[4..8].try_into().unwrap()) as usize;
+        assert_eq!(
+            wire.len(),
+            32 + reply_length * 4,
+            "reply length covers all records"
+        );
+        let mut result = Vec::with_capacity(ndevices);
         let mut off = 32;
-        for r in result.iter_mut().take(ndevices) {
-            *r = u32::from_le_bytes([wire[off], wire[off + 1], wire[off + 2], wire[off + 3]]);
+        for _ in 0..ndevices {
+            let type_atom =
+                u32::from_le_bytes([wire[off], wire[off + 1], wire[off + 2], wire[off + 3]]);
+            result.push((u16::from(wire[off + 4]), type_atom));
             off += 8;
         }
         result
@@ -42991,15 +43153,18 @@ mod tests {
         assert_ne!(kbd_atom, 0, "KEYBOARD pre-interned");
         assert_ne!(touchpad_atom, 0, "TOUCHPAD pre-interned");
 
-        // Before seeding: device 4 should be MOUSE.
+        // Masters and XTEST are the four stable entries before any
+        // physical source is registered.
         let types = list_input_devices_type_atoms(&mut state, &mut peer);
-        assert_eq!(types[0], mouse_atom, "device 2 = MOUSE");
-        assert_eq!(types[1], kbd_atom, "device 3 = KEYBOARD");
         assert_eq!(
-            types[2], mouse_atom,
-            "device 4 = MOUSE before touchpad seed"
+            types,
+            [
+                (2, mouse_atom),
+                (3, kbd_atom),
+                (4, mouse_atom),
+                (5, kbd_atom)
+            ]
         );
-        assert_eq!(types[3], kbd_atom, "device 5 = KEYBOARD");
 
         // A legacy touchpad add must not repurpose virtual device 4.
         let touchpad_info = crate::core_loop::DeviceInfo {
@@ -43037,9 +43202,32 @@ mod tests {
             },
         };
         let touchpad_source = touchpad_info.source_id;
-        state.xi_register_source(&touchpad_info);
+        let physical_ids = state.xi_register_source(&touchpad_info);
+        let physical_pointer = physical_ids
+            .iter()
+            .copied()
+            .find(|id| {
+                state.xi_devices.device(*id).is_some_and(|device| {
+                    device.facet == Some(crate::xinput::XiFacetKind::PointerTouch)
+                })
+            })
+            .expect("registered touchpad pointer facet");
+        assert!(physical_pointer >= 6, "physical facet IDs start at 6");
         let types = list_input_devices_type_atoms(&mut state, &mut peer);
-        assert_eq!(types[2], mouse_atom, "device 4 remains the XTEST pointer");
+        assert_eq!(
+            types.len(),
+            5,
+            "the physical pointer is a fifth registry entry"
+        );
+        assert_eq!(types.iter().find(|(id, _)| *id == 4).unwrap().1, mouse_atom);
+        assert_eq!(
+            types
+                .iter()
+                .find(|(id, _)| *id == physical_pointer)
+                .unwrap()
+                .1,
+            touchpad_atom
+        );
         assert_eq!(
             state
                 .xi_devices
@@ -43056,22 +43244,51 @@ mod tests {
                 .properties
                 .contains_key(&state.xtest_device_atom)
         );
+        let tap_atom = state
+            .atoms
+            .id_for(crate::xinput::PROP_TAPPING_ENABLED)
+            .unwrap();
+        assert!(
+            state
+                .xi_devices
+                .device(physical_pointer)
+                .unwrap()
+                .properties
+                .contains_key(&tap_atom)
+        );
+        assert!(
+            !state
+                .xi_devices
+                .device(crate::xinput::DEVICEID_SLAVE_POINTER)
+                .unwrap()
+                .properties
+                .contains_key(&tap_atom)
+        );
 
         // Removal still leaves the virtual device intact.
         state.xi_unregister_source(touchpad_source);
         let types = list_input_devices_type_atoms(&mut state, &mut peer);
-        assert_eq!(types[2], mouse_atom, "device 4 remains MOUSE after clear");
+        assert_eq!(
+            types,
+            [
+                (2, mouse_atom),
+                (3, kbd_atom),
+                (4, mouse_atom),
+                (5, kbd_atom)
+            ]
+        );
         assert_ne!(touchpad_atom, mouse_atom);
     }
 
     /// Drive XIQueryDevice (opcode 48) and return the RAW class-block
-    /// bytes (and `num_classes`) for device 4 only — the slave pointer.
+    /// bytes (and `num_classes`) for one selected device.
     /// Walks the device-info array exactly like
-    /// `query_device_ids_and_names` but, for the device whose id is 4,
-    /// slices out the trailing class bytes rather than just the name.
-    fn query_device_4_class_block(
+    /// `query_device_ids_and_names` but slices out the target's trailing
+    /// class bytes rather than just its name.
+    fn query_device_class_block(
         state: &mut ServerState,
         peer: &mut UnixStream,
+        target_id: u16,
     ) -> (Vec<u8>, u16) {
         let mut backend = RecordingBackend::new();
         handle_xi2_request(
@@ -43081,10 +43298,17 @@ mod tests {
             ClientId(1),
             SequenceNumber(1),
             xi2_header(48),
-            &[],
+            &[0, 0, 0, 0], // deviceid=XIAllDevices, pad
         )
         .expect("XIQueryDevice");
         let wire = read_all_available(peer);
+        assert_eq!(wire[0], 1, "XIQueryDevice reply");
+        let reply_length = u32::from_le_bytes(wire[4..8].try_into().unwrap()) as usize;
+        assert_eq!(
+            wire.len(),
+            32 + reply_length * 4,
+            "reply length covers all records"
+        );
         let num_devices = u16::from_le_bytes([wire[8], wire[9]]) as usize;
         let mut off = 32;
         for _ in 0..num_devices {
@@ -43100,7 +43324,7 @@ mod tests {
                 let units = u16::from_le_bytes([wire[pos + 2], wire[pos + 3]]) as usize;
                 pos += units * 4;
             }
-            if id == 4 {
+            if id == target_id {
                 return (wire[classes_start..pos].to_vec(), num_classes);
             }
             off = pos;
@@ -43108,19 +43332,15 @@ mod tests {
         panic!("device 4 not present in XIQueryDevice reply");
     }
 
-    /// Regression guard: the device-4 class block XIQueryDevice (opcode
-    /// 48) emits MUST be byte-identical to the block carried by the
-    /// touchpad-add/remove `XI_DeviceChanged` fanout. Both callers now go
-    /// through `fanout::build_slave_pointer_class_block`, so they cannot
-    /// drift; this test parses the real XIQueryDevice wire bytes and
-    /// compares them against the shared builder's output (the path the
-    /// fanout uses) to keep that guarantee under test.
+    /// Regression guard: XIQueryDevice's virtual XTEST pointer class
+    /// block matches its DeviceChanged block. A physical touchpad has a
+    /// separate facet beginning at 6, with its own source ID in classes.
     #[test]
     fn query_device_4_matches_device_changed_block() {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
 
-        let (wire_classes, wire_num) = query_device_4_class_block(&mut state, &mut peer);
+        let (wire_classes, wire_num) = query_device_class_block(&mut state, &mut peer, 4);
         let (builder_classes, builder_num) =
             crate::core_loop::fanout::build_slave_pointer_class_block(&mut state);
 
@@ -43134,20 +43354,32 @@ mod tests {
              XI_DeviceChanged fanout block (both call build_slave_pointer_class_block)"
         );
 
-        // Also hold under a seeded-touchpad rename: the class shape is
-        // name-independent, so the two must STILL match byte-for-byte.
+        // A renamed touchpad gets its own physical facet; it does not
+        // replace or alter the XTEST pointer's class block.
+        let physical_pointer = seed_pointer_for_t3(&mut state);
         state
             .xi_devices
             .iter_mut()
-            .find(|d| d.id == 4)
+            .find(|d| d.id == physical_pointer)
             .unwrap()
             .name = "SynPS/2 Synaptics TouchPad".to_owned();
-        let (wire_classes, _) = query_device_4_class_block(&mut state, &mut peer);
+        let (wire_classes, _) = query_device_class_block(&mut state, &mut peer, 4);
         let (builder_classes, _) =
             crate::core_loop::fanout::build_slave_pointer_class_block(&mut state);
         assert_eq!(
             wire_classes, builder_classes,
             "device-4 class blocks must stay byte-identical after a touchpad rename"
+        );
+        let (physical_classes, _) =
+            query_device_class_block(&mut state, &mut peer, physical_pointer);
+        assert_eq!(
+            u16::from_le_bytes([physical_classes[4], physical_classes[5]]),
+            physical_pointer,
+            "physical class records identify their registry facet"
+        );
+        assert_eq!(
+            state.xi_devices.device(4).unwrap().name,
+            crate::xinput::registry::NAME_XTEST_POINTER
         );
     }
 
@@ -43412,16 +43644,26 @@ mod tests {
         )
         .unwrap();
         let wire = read_all_available(&mut peer);
-        assert_eq!(wire.len(), 32 + 8, "32 header + 2 atoms");
+        assert_eq!(
+            wire.len(),
+            32 + 12,
+            "32 header + XTEST marker + 2 client atoms"
+        );
         assert_eq!(wire[0], 1, "X_Reply");
         assert_eq!(
             u32::from_le_bytes(wire[4..8].try_into().unwrap()),
-            2,
+            3,
             "length"
         );
-        assert_eq!(u16::from_le_bytes([wire[8], wire[9]]), 2, "num_properties");
-        assert_eq!(u32::from_le_bytes(wire[32..36].try_into().unwrap()), 100);
-        assert_eq!(u32::from_le_bytes(wire[36..40].try_into().unwrap()), 200);
+        assert_eq!(u16::from_le_bytes([wire[8], wire[9]]), 3, "num_properties");
+        let mut atoms = wire[32..]
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let mut expected = vec![state.xtest_device_atom.0, 100, 200];
+        atoms.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(atoms, expected, "the virtual XTEST Device marker is listed");
     }
 
     #[test]
@@ -43916,17 +44158,27 @@ mod tests {
         )
         .unwrap();
         let wire = read_all_available(&mut peer);
-        assert_eq!(wire.len(), 32 + 8, "32 header + 2 atoms");
+        assert_eq!(
+            wire.len(),
+            32 + 12,
+            "32 header + XTEST marker + 2 client atoms"
+        );
         assert_eq!(wire[0], 1, "X_Reply");
         assert_eq!(
             u32::from_le_bytes(wire[4..8].try_into().unwrap()),
-            2,
-            "length = nAtoms"
+            3,
+            "length = nAtoms including the XTEST marker"
         );
-        assert_eq!(u16::from_le_bytes([wire[8], wire[9]]), 2, "nAtoms");
+        assert_eq!(u16::from_le_bytes([wire[8], wire[9]]), 3, "nAtoms");
         assert!(wire[10..32].iter().all(|&b| b == 0), "pad zero");
-        assert_eq!(u32::from_le_bytes(wire[32..36].try_into().unwrap()), 100);
-        assert_eq!(u32::from_le_bytes(wire[36..40].try_into().unwrap()), 200);
+        let mut atoms = wire[32..]
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let mut expected = vec![state.xtest_device_atom.0, 100, 200];
+        atoms.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(atoms, expected, "the virtual XTEST Device marker is listed");
     }
 
     #[test]
@@ -44184,12 +44436,449 @@ mod tests {
         seed_physical_pointer_fixture(state, &info)
     }
 
-    #[test]
-    fn t3_xi2_change_property_writable_descriptor_commits_to_registry() {
+    fn inventory_for_t3_source(
+        state: &ServerState,
+    ) -> (
+        crate::core_loop::input_inventory::InputInventory,
+        crate::xinput::InputSourceId,
+    ) {
+        let source = state
+            .xi_devices
+            .device(TEST_PHYSICAL_POINTER_ID)
+            .and_then(|device| device.source_id)
+            .expect("physical pointer source");
+        let mut inventory = crate::core_loop::input_inventory::InputInventory::new();
+        inventory.add(
+            state
+                .xi_devices
+                .source(source)
+                .expect("source facts")
+                .clone(),
+        );
+        (inventory, source)
+    }
+
+    fn route_t3_config_request(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        inventory: &mut crate::core_loop::input_inventory::InputInventory,
+        pending: &mut crate::core_loop::run::PendingBackendRequests,
+        lane: &mut crate::core_loop::run::XiConfigLane,
+        request: crate::core_loop::message::XiConfigRequest,
+    ) {
+        crate::core_loop::run::route_pending_xi_config(
+            state,
+            backend,
+            inventory,
+            pending,
+            lane,
+            &mut crate::core_loop::reset::ResetTrigger::new(
+                crate::core_loop::reset::ResetPolicy::NoReset,
+            ),
+            request,
+            32,
+            crate::core_loop::generation::Generation::default(),
+        );
+    }
+
+    fn xi_property_snapshot(
+        state: &ServerState,
+    ) -> Vec<(
+        u16,
+        std::collections::BTreeMap<AtomId, crate::xinput::XiProperty>,
+    )> {
+        state
+            .xi_devices
+            .devices()
+            .iter()
+            .map(|device| (device.id, device.properties.clone()))
+            .collect()
+    }
+
+    /// Parse a recognized XI1/XI2 write, prove parsing has no side effects,
+    /// and then drive the production core lane. This is the shared route for
+    /// the migrated property-dispatch tests.
+    fn drive_t3_config_wire_request(
+        state: &mut ServerState,
+        peer: &mut impl TestPeer,
+        backend: &mut RecordingBackend,
+        inventory: &mut crate::core_loop::input_inventory::InputInventory,
+        pending: &mut crate::core_loop::run::PendingBackendRequests,
+        lane: &mut crate::core_loop::run::XiConfigLane,
+        client: u32,
+        sequence: u16,
+        header: RequestHeader,
+        body: &[u8],
+    ) -> crate::core_loop::message::XiConfigRequest {
+        let properties_before = xi_property_snapshot(state);
+        let calls_before = backend.started_device_configs.len();
+        let outcome = handle_xi2_request(
+            state,
+            backend,
+            None,
+            ClientId(client),
+            SequenceNumber(sequence),
+            header,
+            body,
+        )
+        .expect("parse XI property request");
+        let RequestOutcome::PendingXiConfig(request) = outcome else {
+            panic!("recognized physical write must return PendingXiConfig, got {outcome:?}");
+        };
+        assert_eq!(
+            xi_property_snapshot(state),
+            properties_before,
+            "parsing does not mutate XI properties"
+        );
+        assert_eq!(
+            backend.started_device_configs.len(),
+            calls_before,
+            "parsing does not call the backend"
+        );
+        assert!(
+            read_all_available(peer).is_empty(),
+            "parsing produces no reply, error, or property notification"
+        );
+        let captured = request.clone();
+        route_t3_config_request(state, backend, inventory, pending, lane, request);
+        captured
+    }
+
+    fn assert_xi_config_error(wire: &[u8], code: u8, sequence: u16, minor_opcode: u16) {
+        assert_eq!(wire.len(), 32, "one X error packet");
+        assert_eq!(wire[0], 0, "X_Error");
+        assert_eq!(wire[1], code, "error code");
+        assert_eq!(
+            u16::from_le_bytes([wire[2], wire[3]]),
+            sequence,
+            "original request sequence"
+        );
+        assert_eq!(
+            u16::from_le_bytes([wire[8], wire[9]]),
+            minor_opcode,
+            "original XI minor opcode"
+        );
+        assert_eq!(wire[10], 137, "XInput extension major opcode");
+    }
+
+    fn assert_confirmed_tap_write(
+        state: &ServerState,
+        inventory: &crate::core_loop::input_inventory::InputInventory,
+        source: crate::xinput::InputSourceId,
+        property: AtomId,
+    ) {
+        assert_eq!(
+            state
+                .xi_devices
+                .device(TEST_PHYSICAL_POINTER_ID)
+                .unwrap()
+                .properties[&property]
+                .data,
+            [0],
+            "confirmed tap write commits the requested XI bytes"
+        );
+        assert!(!inventory.get(source).unwrap().config.tap.current);
+    }
+
+    fn parse_t3_xi2_config_request(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        client: u32,
+        sequence: u16,
+        deviceid: u16,
+        property_name: &str,
+        mode: u8,
+        format: u8,
+        data: &[u8],
+    ) -> crate::core_loop::message::XiConfigRequest {
+        let property = state.atoms.intern(property_name, false).0;
+        let type_atom = if property_name == "libinput Accel Speed" {
+            state.float_atom.0
+        } else {
+            crate::xinput::XA_INTEGER.0
+        };
+        let body = xi2_change_property_body(deviceid, mode, format, property, type_atom, data);
+        match handle_xi2_request(
+            state,
+            backend,
+            None,
+            ClientId(client),
+            SequenceNumber(sequence),
+            xi2_header(57),
+            &body,
+        )
+        .expect("parse XI2 property request")
+        {
+            RequestOutcome::PendingXiConfig(request) => request,
+            outcome => panic!("recognized physical write must be pending, got {outcome:?}"),
+        }
+    }
+
+    fn parse_t3_xi1_config_request(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        client: u32,
+        sequence: u16,
+        deviceid: u16,
+        data: &[u8],
+    ) -> crate::core_loop::message::XiConfigRequest {
+        let property = state.atoms.intern("libinput Accel Speed", false).0;
+        let body = xi1_change_property_body(
+            property,
+            state.float_atom.0,
+            u8::try_from(deviceid).expect("physical XI1 id fits CARD8"),
+            32,
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            data,
+        );
+        match handle_xi2_request(
+            state,
+            backend,
+            None,
+            ClientId(client),
+            SequenceNumber(sequence),
+            xi2_header(37),
+            &body,
+        )
+        .expect("parse XI1 property request")
+        {
+            RequestOutcome::PendingXiConfig(request) => request,
+            outcome => panic!("recognized physical XI1 write must be pending, got {outcome:?}"),
+        }
+    }
+
+    /// Run the real HostInput lifecycle dispatcher while one write occupies
+    /// the lane and another targets the source being removed or suspended.
+    /// RecordingBackend does not own XI topology, so prepare the state change
+    /// performed by the production KMS `on_host_input` before dispatching.
+    fn assert_t3_host_lifecycle_cancels_queued_write(removed: bool, xi1_request: bool) {
+        use crate::xinput::libinput_props::{
+            DeviceConfigChange, DeviceConfigStart, DeviceConfigToken,
+        };
+
         let mut state = ServerState::new();
-        let mut peer = install_client(&mut state, 1);
+        let mut peer_a = install_capture_client(&mut state, 1);
+        let mut peer_b = install_capture_client(&mut state, 2);
         let mut backend = RecordingBackend::new();
         seed_pointer_for_t3(&mut state);
+        let source = state
+            .xi_devices
+            .device(TEST_PHYSICAL_POINTER_ID)
+            .unwrap()
+            .source_id
+            .unwrap();
+        let source_info = state.xi_devices.source(source).unwrap().clone();
+        let accel_atom = state.atoms.id_for("libinput Accel Speed").unwrap();
+        let source_property_before = state
+            .xi_devices
+            .device(TEST_PHYSICAL_POINTER_ID)
+            .unwrap()
+            .properties[&accel_atom]
+            .data
+            .clone();
+
+        let mut live_info = source_info.clone();
+        live_info.source_id = crate::xinput::InputSourceId(source.0 + 1);
+        live_info.device_node = "/dev/input/event78".into();
+        live_info.sysname = "event78".into();
+        let live_ids = state.xi_register_source(&live_info);
+        let live_device = *live_ids
+            .iter()
+            .find(|id| *id != &TEST_PHYSICAL_POINTER_ID)
+            .expect("second pointer facet");
+        let live_source = live_info.source_id;
+        let mut inventory = crate::core_loop::input_inventory::InputInventory::new();
+        inventory.add(source_info);
+        inventory.add(live_info);
+        let mut pending = crate::core_loop::run::PendingBackendRequests::default();
+        let mut lane = crate::core_loop::run::XiConfigLane::default();
+        backend
+            .device_config_start_results
+            .push_back(Ok(DeviceConfigStart::Pending(DeviceConfigToken(207))));
+
+        // B submits a write on the other, still-enabled source.
+        let request_b = parse_t3_xi2_config_request(
+            &mut state,
+            &mut backend,
+            2,
+            4,
+            live_device,
+            "libinput Accel Speed",
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            32,
+            &0.75_f32.to_le_bytes(),
+        );
+        route_t3_config_request(
+            &mut state,
+            &mut backend,
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            request_b,
+        );
+        assert_eq!(backend.started_device_configs.len(), 1);
+        assert!(!lane.is_empty(), "B's backend operation remains in flight");
+        assert!(pending.xi_config_client_is_blocked_for_test(yserver_protocol::x11::ClientId(2)));
+
+        // A's source-specific request queues behind B and retains its XI
+        // minor opcode and sequence for an immediate lifecycle error.
+        let request_a = if xi1_request {
+            parse_t3_xi1_config_request(
+                &mut state,
+                &mut backend,
+                1,
+                9,
+                TEST_PHYSICAL_POINTER_ID,
+                &0.25_f32.to_le_bytes(),
+            )
+        } else {
+            parse_t3_xi2_config_request(
+                &mut state,
+                &mut backend,
+                1,
+                9,
+                TEST_PHYSICAL_POINTER_ID,
+                "libinput Accel Speed",
+                crate::xinput::XI_PROP_MODE_REPLACE,
+                32,
+                &0.25_f32.to_le_bytes(),
+            )
+        };
+        route_t3_config_request(
+            &mut state,
+            &mut backend,
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            request_a,
+        );
+        assert!(pending.xi_config_client_is_blocked_for_test(yserver_protocol::x11::ClientId(1)));
+        assert!(read_all_available(&mut peer_a).is_empty());
+        assert!(read_all_available(&mut peer_b).is_empty());
+
+        // This mirrors the registry transition made by the production KMS
+        // backend in handle_host_input; the shared run_core dispatcher below
+        // performs inventory maintenance, calls handle_host_input, and
+        // cancels the queued XI write.
+        let lifecycle_event = if removed {
+            state.xi_unregister_source(source);
+            crate::core_loop::HostInputEvent::DeviceRemoved { source_id: source }
+        } else {
+            let mut disabled = state.xi_devices.source(source).unwrap().clone();
+            disabled.enabled = false;
+            state.xi_devices.register(&disabled);
+            crate::core_loop::HostInputEvent::DeviceSuspended { source_id: source }
+        };
+        crate::core_loop::run::dispatch_host_input(
+            &mut state,
+            &mut backend,
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            &mut crate::core_loop::reset::ResetTrigger::new(
+                crate::core_loop::reset::ResetPolicy::NoReset,
+            ),
+            lifecycle_event,
+            crate::core_loop::generation::Generation::default(),
+        );
+
+        let expected_error = if removed {
+            XI2_FIRST_ERROR
+        } else {
+            x11::error::BAD_MATCH
+        };
+        let minor_opcode = if xi1_request { 37 } else { 57 };
+        let cancelled = read_all_available(&mut peer_a);
+        assert_xi_config_error(&cancelled, expected_error, 9, minor_opcode);
+        assert!(
+            !pending.xi_config_client_is_blocked_for_test(yserver_protocol::x11::ClientId(1)),
+            "lifecycle cancellation unblocks A immediately"
+        );
+        assert!(pending.xi_config_client_is_blocked_for_test(yserver_protocol::x11::ClientId(2)));
+        assert!(!lane.is_empty(), "B remains in flight after A is cancelled");
+        assert_eq!(backend.started_device_configs.len(), 1, "A never starts");
+        assert!(read_all_available(&mut peer_b).is_empty());
+
+        if removed {
+            assert!(state.xi_devices.source(source).is_none());
+            assert!(inventory.get(source).is_none());
+            assert!(state.xi_devices.device(TEST_PHYSICAL_POINTER_ID).is_none());
+        } else {
+            assert!(!state.xi_devices.source(source).unwrap().enabled);
+            assert!(!inventory.get(source).unwrap().enabled);
+            assert_eq!(
+                state
+                    .xi_devices
+                    .device(TEST_PHYSICAL_POINTER_ID)
+                    .unwrap()
+                    .properties[&accel_atom]
+                    .data,
+                source_property_before,
+                "suspension leaves source S's property unchanged"
+            );
+        }
+
+        crate::core_loop::run::dispatch_device_config_result(
+            &mut state,
+            &mut backend,
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            &mut crate::core_loop::reset::ResetTrigger::new(
+                crate::core_loop::reset::ResetPolicy::NoReset,
+            ),
+            crate::core_loop::message::Message::DeviceConfigResult {
+                token: DeviceConfigToken(207),
+                source: live_source,
+                result: Ok(()),
+            },
+            crate::core_loop::generation::Generation::default(),
+        );
+
+        assert_eq!(
+            backend.started_device_configs,
+            [(live_source, DeviceConfigChange::AccelSpeed(0.75))],
+            "only B's enabled-source write reaches the backend"
+        );
+        assert_eq!(
+            state.xi_devices.device(live_device).unwrap().properties[&accel_atom].data,
+            0.75_f32.to_le_bytes(),
+            "B's completion commits normally"
+        );
+        assert_eq!(
+            inventory.get(live_source).unwrap().config.accel.current,
+            0.75
+        );
+        if removed {
+            assert!(state.xi_devices.source(source).is_none());
+            assert!(inventory.get(source).is_none());
+        } else {
+            assert_eq!(
+                state
+                    .xi_devices
+                    .device(TEST_PHYSICAL_POINTER_ID)
+                    .unwrap()
+                    .properties[&accel_atom]
+                    .data,
+                source_property_before,
+                "S's property remains unchanged after B completes"
+            );
+        }
+        assert!(lane.is_empty());
+        assert!(pending.is_empty());
+        assert!(read_all_available(&mut peer_a).is_empty());
+        assert!(read_all_available(&mut peer_b).is_empty());
+    }
+
+    #[test]
+    fn xi_config_completion_writable_descriptor_commits_to_registry() {
+        let mut state = ServerState::new();
+        let mut peer = install_capture_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_pointer_for_t3(&mut state);
+        let (mut inventory, source) = inventory_for_t3_source(&state);
+        let mut pending = crate::core_loop::run::PendingBackendRequests::default();
+        let mut lane = crate::core_loop::run::XiConfigLane::default();
         let tap_atom = state
             .atoms
             .intern(crate::xinput::PROP_TAPPING_ENABLED, false)
@@ -44205,16 +44894,18 @@ mod tests {
             integer_atom,
             &[0],
         );
-        handle_xi2_request(
+        drive_t3_config_wire_request(
             &mut state,
+            &mut peer,
             &mut backend,
-            None,
-            ClientId(1),
-            SequenceNumber(1),
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            1,
+            1,
             xi2_header(57),
             &body,
-        )
-        .unwrap();
+        );
         assert!(
             read_all_available(&mut peer).is_empty(),
             "successful XIChangeProperty has no reply"
@@ -44228,6 +44919,11 @@ mod tests {
         let prop = dev.properties.get(&AtomId(tap_atom)).expect("tap stored");
         assert_eq!(prop.format, 8);
         assert_eq!(prop.data, vec![0], "tap toggled off");
+        assert_confirmed_tap_write(&state, &inventory, source, AtomId(tap_atom));
+        assert!(!inventory.get(source).unwrap().config.tap.current);
+        assert_eq!(backend.started_device_configs.len(), 1);
+        assert!(lane.is_empty());
+        assert!(pending.is_empty());
     }
 
     // -----------------------------------------------------------------
@@ -44275,16 +44971,20 @@ mod tests {
     }
 
     #[test]
-    fn b1_xi2_change_property_format8_scalar_float_mismatch_is_badmatch_no_panic() {
+    fn xi_config_completion_b1_xi2_format8_scalar_float_mismatch_is_badmatch_no_panic() {
         // `libinput Accel Speed` is Scalar/Float, descriptor format 32.
         // A `format=8, num_items=1` write used to pass `validate_value`
         // (which computed its expected length from the request's
         // format) and then panic in `decode_change`'s `float32(&[7])`
         // (`b[1]` out of bounds).
         let mut state = ServerState::new();
-        let mut peer = install_client(&mut state, 1);
+        let mut peer = install_capture_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
         seed_pointer_for_t3(&mut state);
+        let (mut inventory, _) = inventory_for_t3_source(&state);
+        let mut pending = crate::core_loop::run::PendingBackendRequests::default();
+        let mut lane = crate::core_loop::run::XiConfigLane::default();
+        let properties_before = xi_property_snapshot(&state);
         let accel_speed_atom = state.atoms.intern("libinput Accel Speed", false).0;
 
         let body = xi2_change_property_body(
@@ -44295,29 +44995,37 @@ mod tests {
             crate::xinput::XA_INTEGER.0,
             &[7],
         );
-        handle_xi2_request(
+        drive_t3_config_wire_request(
             &mut state,
+            &mut peer,
             &mut backend,
-            None,
-            ClientId(1),
-            SequenceNumber(1),
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            1,
+            1,
             xi2_header(57),
             &body,
-        )
-        .unwrap();
+        );
         let wire = read_all_available(&mut peer);
-        assert_eq!(wire.len(), 32, "error packet");
-        assert_eq!(wire[0], 0, "error packet");
-        assert_eq!(wire[1], x11::error::BAD_MATCH, "BadMatch, not a panic");
+        assert_xi_config_error(&wire, x11::error::BAD_MATCH, 1, 57);
+        assert_eq!(xi_property_snapshot(&state), properties_before);
+        assert!(backend.started_device_configs.is_empty());
+        assert!(lane.is_empty());
+        assert!(pending.is_empty());
     }
 
     #[test]
-    fn b1_xi2_change_property_format16_scalar_float_mismatch_is_badmatch() {
+    fn xi_config_completion_b1_xi2_format16_scalar_float_mismatch_is_badmatch() {
         // Same target, format=16 (still not the descriptor's 32).
         let mut state = ServerState::new();
-        let mut peer = install_client(&mut state, 1);
+        let mut peer = install_capture_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
         seed_pointer_for_t3(&mut state);
+        let (mut inventory, _) = inventory_for_t3_source(&state);
+        let mut pending = crate::core_loop::run::PendingBackendRequests::default();
+        let mut lane = crate::core_loop::run::XiConfigLane::default();
+        let properties_before = xi_property_snapshot(&state);
         let accel_speed_atom = state.atoms.intern("libinput Accel Speed", false).0;
 
         let body = xi2_change_property_body(
@@ -44328,30 +45036,38 @@ mod tests {
             crate::xinput::XA_INTEGER.0,
             &[7, 0],
         );
-        handle_xi2_request(
+        drive_t3_config_wire_request(
             &mut state,
+            &mut peer,
             &mut backend,
-            None,
-            ClientId(1),
-            SequenceNumber(1),
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            1,
+            1,
             xi2_header(57),
             &body,
-        )
-        .unwrap();
+        );
         let wire = read_all_available(&mut peer);
-        assert_eq!(wire.len(), 32, "error packet");
-        assert_eq!(wire[0], 0, "error packet");
-        assert_eq!(wire[1], x11::error::BAD_MATCH, "BadMatch");
+        assert_xi_config_error(&wire, x11::error::BAD_MATCH, 1, 57);
+        assert_eq!(xi_property_snapshot(&state), properties_before);
+        assert!(backend.started_device_configs.is_empty());
+        assert!(lane.is_empty());
+        assert!(pending.is_empty());
     }
 
     #[test]
-    fn b1_xi2_change_property_format8_card32_mismatch_is_badmatch_no_panic() {
+    fn xi_config_completion_b1_xi2_format8_card32_mismatch_is_badmatch_no_panic() {
         // `libinput Button Scrolling Button` is Scalar/Card32,
         // descriptor format 32. Same crash shape via `card32(&[7])`.
         let mut state = ServerState::new();
-        let mut peer = install_client(&mut state, 1);
+        let mut peer = install_capture_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
         seed_pointer_for_t3(&mut state);
+        let (mut inventory, _) = inventory_for_t3_source(&state);
+        let mut pending = crate::core_loop::run::PendingBackendRequests::default();
+        let mut lane = crate::core_loop::run::XiConfigLane::default();
+        let properties_before = xi_property_snapshot(&state);
         let scroll_button_atom = state
             .atoms
             .intern("libinput Button Scrolling Button", false)
@@ -44365,20 +45081,24 @@ mod tests {
             crate::xinput::XA_INTEGER.0,
             &[7],
         );
-        handle_xi2_request(
+        drive_t3_config_wire_request(
             &mut state,
+            &mut peer,
             &mut backend,
-            None,
-            ClientId(1),
-            SequenceNumber(1),
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            1,
+            1,
             xi2_header(57),
             &body,
-        )
-        .unwrap();
+        );
         let wire = read_all_available(&mut peer);
-        assert_eq!(wire.len(), 32, "error packet");
-        assert_eq!(wire[0], 0, "error packet");
-        assert_eq!(wire[1], x11::error::BAD_MATCH, "BadMatch, not a panic");
+        assert_xi_config_error(&wire, x11::error::BAD_MATCH, 1, 57);
+        assert_eq!(xi_property_snapshot(&state), properties_before);
+        assert!(backend.started_device_configs.is_empty());
+        assert!(lane.is_empty());
+        assert!(pending.is_empty());
     }
 
     /// The short-write relaxation is per-descriptor, not blanket.
@@ -44394,11 +45114,14 @@ mod tests {
     /// would silently commit "two-finger on, edge off, button off" — a
     /// configuration the client never expressed, and BadMatch on Xorg.
     #[test]
-    fn short_write_accepted_only_for_the_ranged_accel_profile_descriptor() {
+    fn xi_config_completion_short_write_only_for_ranged_accel_profile_descriptor() {
         let mut state = ServerState::new();
-        let mut peer = install_client(&mut state, 1);
+        let mut peer = install_capture_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
         seed_pointer_for_t3(&mut state);
+        let (mut inventory, source) = inventory_for_t3_source(&state);
+        let mut pending = crate::core_loop::run::PendingBackendRequests::default();
+        let mut lane = crate::core_loop::run::XiConfigLane::default();
         let scroll_atom = state
             .atoms
             .intern("libinput Scroll Method Enabled", false)
@@ -44413,24 +45136,23 @@ mod tests {
             crate::xinput::XA_INTEGER.0,
             &[0, 1],
         );
-        handle_xi2_request(
+        drive_t3_config_wire_request(
             &mut state,
+            &mut peer,
             &mut backend,
-            None,
-            ClientId(1),
-            SequenceNumber(1),
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            1,
+            1,
             xi2_header(57),
             &body,
-        )
-        .unwrap();
-        let wire = read_all_available(&mut peer);
-        assert_eq!(wire.len(), 32, "error packet");
-        assert_eq!(wire[0], 0, "error packet");
-        assert_eq!(
-            wire[1],
-            x11::error::BAD_MATCH,
-            "short Scroll Method write must not be zero-padded into a real config",
         );
+        let wire = read_all_available(&mut peer);
+        assert_xi_config_error(&wire, x11::error::BAD_MATCH, 1, 57);
+        assert!(backend.started_device_configs.is_empty());
+        assert!(lane.is_empty());
+        assert!(pending.is_empty());
 
         // The same two-byte shape against Accel Profile Enabled is the
         // write mate-settings-daemon emits, and must be accepted.
@@ -44446,30 +45168,52 @@ mod tests {
             crate::xinput::XA_INTEGER.0,
             &[0, 1],
         );
-        handle_xi2_request(
+        drive_t3_config_wire_request(
             &mut state,
+            &mut peer,
             &mut backend,
-            None,
-            ClientId(1),
-            SequenceNumber(2),
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            1,
+            2,
             xi2_header(57),
             &body,
-        )
-        .unwrap();
+        );
         assert!(
             read_all_available(&mut peer).is_empty(),
             "two-item accel-profile write must succeed (no error packet)",
         );
+        assert_eq!(backend.started_device_configs.len(), 1);
+        assert_eq!(
+            inventory.get(source).unwrap().config.accel_profile.current,
+            Some(1)
+        );
+        assert_eq!(
+            state
+                .xi_devices
+                .device(TEST_PHYSICAL_POINTER_ID)
+                .unwrap()
+                .properties[&AtomId(accel_atom)]
+                .data,
+            [0, 1, 0]
+        );
+        assert!(lane.is_empty());
+        assert!(pending.is_empty());
     }
 
     #[test]
-    fn b1_xi1_change_device_property_format_mismatch_is_badmatch_no_panic() {
+    fn xi_config_completion_b1_xi1_format_mismatch_is_badmatch_no_panic() {
         // Same crash shape, XI1 wire arm (minor 37) — the path MATE's
         // settings daemon actually uses.
         let mut state = ServerState::new();
-        let mut peer = install_client(&mut state, 1);
+        let mut peer = install_capture_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
         seed_pointer_for_t3(&mut state);
+        let (mut inventory, _) = inventory_for_t3_source(&state);
+        let mut pending = crate::core_loop::run::PendingBackendRequests::default();
+        let mut lane = crate::core_loop::run::XiConfigLane::default();
+        let properties_before = xi_property_snapshot(&state);
         let accel_speed_atom = state.atoms.intern("libinput Accel Speed", false).0;
 
         let body = xi1_change_property_body(
@@ -44480,20 +45224,24 @@ mod tests {
             crate::xinput::XI_PROP_MODE_REPLACE,
             &[7],
         );
-        handle_xi2_request(
+        drive_t3_config_wire_request(
             &mut state,
+            &mut peer,
             &mut backend,
-            None,
-            ClientId(1),
-            SequenceNumber(1),
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            1,
+            1,
             xi2_header(37),
             &body,
-        )
-        .unwrap();
+        );
         let wire = read_all_available(&mut peer);
-        assert_eq!(wire.len(), 32, "error packet");
-        assert_eq!(wire[0], 0, "error packet");
-        assert_eq!(wire[1], x11::error::BAD_MATCH, "BadMatch, not a panic");
+        assert_xi_config_error(&wire, x11::error::BAD_MATCH, 1, 37);
+        assert_eq!(xi_property_snapshot(&state), properties_before);
+        assert!(backend.started_device_configs.is_empty());
+        assert!(lane.is_empty());
+        assert!(pending.is_empty());
     }
 
     // -----------------------------------------------------------------
@@ -44508,16 +45256,19 @@ mod tests {
     // -----------------------------------------------------------------
 
     #[test]
-    fn t3_b2_xi2_two_item_accel_profile_write_commits_normalized_three_bytes() {
+    fn xi_config_completion_t3_b2_xi2_two_item_accel_profile_commits_normalized_bytes() {
         // The headline vector: msd writes exactly 2 bytes; the merged
         // (here: unmerged, since Replace) value must validate, decode
         // to AccelProfile(Some(1)) — flat — and the STORED property
         // must be normalised to the full 3-byte descriptor width, not
         // the 2 raw bytes the client sent.
         let mut state = ServerState::new();
-        let mut peer = install_client(&mut state, 1);
+        let mut peer = install_capture_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
         seed_pointer_for_t3(&mut state);
+        let (mut inventory, source) = inventory_for_t3_source(&state);
+        let mut pending = crate::core_loop::run::PendingBackendRequests::default();
+        let mut lane = crate::core_loop::run::XiConfigLane::default();
         let atom = state
             .atoms
             .intern("libinput Accel Profile Enabled", false)
@@ -44532,7 +45283,7 @@ mod tests {
             integer_atom,
             &[0, 1],
         );
-        handle_xi2_request(
+        let outcome = handle_xi2_request(
             &mut state,
             &mut backend,
             None,
@@ -44542,17 +45293,50 @@ mod tests {
             &body,
         )
         .unwrap();
+        let crate::core_loop::process_request::RequestOutcome::PendingXiConfig(request) = outcome
+        else {
+            panic!("recognized XI2 write must enter the core config lane")
+        };
         assert!(
             read_all_available(&mut peer).is_empty(),
             "no X error for a short write"
         );
+        assert!(
+            backend.started_device_configs.is_empty(),
+            "request parsing does not start the backend"
+        );
+        let dev = state.xi_devices.device(TEST_PHYSICAL_POINTER_ID).unwrap();
         assert_eq!(
-            backend.applied_device_configs,
+            dev.properties.get(&AtomId(atom)).unwrap().data,
+            vec![1, 0, 0],
+            "request parsing leaves the seeded property unchanged"
+        );
+
+        route_t3_config_request(
+            &mut state,
+            &mut backend,
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            request,
+        );
+        assert_eq!(
+            backend.started_device_configs,
             vec![(
-                "/dev/input/event4".to_string(),
+                source,
                 crate::xinput::libinput_props::DeviceConfigChange::AccelProfile(Some(1)),
             )],
             "reaches the backend as AccelProfile(Some(1)) — flat"
+        );
+        assert!(lane.is_empty(), "synchronous confirmation drains the lane");
+        assert!(
+            pending.is_empty(),
+            "synchronous confirmation unblocks the client"
+        );
+        assert_eq!(
+            inventory.get(source).unwrap().config.accel_profile.current,
+            Some(1),
+            "confirmed value is retained in the process-lifetime inventory"
         );
 
         let dev = state
@@ -44572,10 +45356,10 @@ mod tests {
     }
 
     #[test]
-    fn t3_b2_xi1_two_item_accel_profile_write_commits_normalized_three_bytes() {
+    fn xi_config_completion_t3_b2_xi1_two_item_accel_profile_commits_normalized_bytes() {
         // Same assertions, XI1 wire arm (minor 37).
         let mut state = ServerState::new();
-        let mut peer = install_client(&mut state, 1);
+        let mut peer = install_capture_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
         seed_pointer_for_t3(&mut state);
         let atom = state
@@ -44592,7 +45376,10 @@ mod tests {
             crate::xinput::XI_PROP_MODE_REPLACE,
             &[0, 1],
         );
-        handle_xi2_request(
+        let (mut inventory, source) = inventory_for_t3_source(&state);
+        let mut pending = crate::core_loop::run::PendingBackendRequests::default();
+        let mut lane = crate::core_loop::run::XiConfigLane::default();
+        let outcome = handle_xi2_request(
             &mut state,
             &mut backend,
             None,
@@ -44602,17 +45389,49 @@ mod tests {
             &body,
         )
         .unwrap();
+        let crate::core_loop::process_request::RequestOutcome::PendingXiConfig(request) = outcome
+        else {
+            panic!("recognized XI1 write must enter the core config lane")
+        };
         assert!(
             read_all_available(&mut peer).is_empty(),
             "no X error for a short write"
         );
+        assert!(
+            backend.started_device_configs.is_empty(),
+            "request parsing does not start the backend"
+        );
+        let dev = state.xi_devices.device(TEST_PHYSICAL_POINTER_ID).unwrap();
         assert_eq!(
-            backend.applied_device_configs,
+            dev.properties.get(&AtomId(atom)).unwrap().data,
+            vec![1, 0, 0],
+            "request parsing leaves the seeded property unchanged"
+        );
+        route_t3_config_request(
+            &mut state,
+            &mut backend,
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            request,
+        );
+        assert_eq!(
+            backend.started_device_configs,
             vec![(
-                "/dev/input/event4".to_string(),
+                source,
                 crate::xinput::libinput_props::DeviceConfigChange::AccelProfile(Some(1)),
             )],
             "reaches the backend as AccelProfile(Some(1)) — flat"
+        );
+        assert!(lane.is_empty(), "synchronous confirmation drains the lane");
+        assert!(
+            pending.is_empty(),
+            "synchronous confirmation unblocks the client"
+        );
+        assert_eq!(
+            inventory.get(source).unwrap().config.accel_profile.current,
+            Some(1),
+            "confirmed value is retained in the process-lifetime inventory"
         );
 
         let dev = state
@@ -44632,16 +45451,19 @@ mod tests {
     }
 
     #[test]
-    fn t3_b2_append_onto_full_width_accel_profile_is_badvalue_and_untouched() {
+    fn xi_config_completion_t3_b2_full_width_accel_profile_append_is_badvalue_and_untouched() {
         // Append [1] onto an already-full-width (3-byte) stored value:
         // the merged length is 4 > n=3, so this must be BadValue with
         // BOTH the stored property and the libinput config untouched —
         // in particular, `apply_device_config` must NOT be called a
         // second time with the wrong fragment-decoded value.
         let mut state = ServerState::new();
-        let mut peer = install_client(&mut state, 1);
+        let mut peer = install_capture_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
         seed_pointer_for_t3(&mut state);
+        let (mut inventory, source) = inventory_for_t3_source(&state);
+        let mut pending = crate::core_loop::run::PendingBackendRequests::default();
+        let mut lane = crate::core_loop::run::XiConfigLane::default();
         let atom = state
             .atoms
             .intern("libinput Accel Profile Enabled", false)
@@ -44657,7 +45479,7 @@ mod tests {
             integer_atom,
             &[1, 0, 0],
         );
-        handle_xi2_request(
+        let outcome = handle_xi2_request(
             &mut state,
             &mut backend,
             None,
@@ -44667,7 +45489,38 @@ mod tests {
             &seed_body,
         )
         .unwrap();
+        let crate::core_loop::process_request::RequestOutcome::PendingXiConfig(seed_request) =
+            outcome
+        else {
+            panic!("setup write must enter the core config lane")
+        };
+        assert!(backend.started_device_configs.is_empty());
+        assert_eq!(
+            state
+                .xi_devices
+                .device(TEST_PHYSICAL_POINTER_ID)
+                .unwrap()
+                .properties
+                .get(&AtomId(atom))
+                .unwrap()
+                .data,
+            vec![1, 0, 0],
+            "the setup request has not committed before lane processing"
+        );
+        route_t3_config_request(
+            &mut state,
+            &mut backend,
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            seed_request,
+        );
         assert!(read_all_available(&mut peer).is_empty());
+        assert_eq!(backend.started_device_configs.len(), 1);
+        assert_eq!(
+            inventory.get(source).unwrap().config.accel_profile.current,
+            Some(0)
+        );
 
         // Append [1] → merged length 4 > n=3 → BadValue, untouched.
         let append_body = xi2_change_property_body(
@@ -44678,7 +45531,7 @@ mod tests {
             integer_atom,
             &[1],
         );
-        handle_xi2_request(
+        let outcome = handle_xi2_request(
             &mut state,
             &mut backend,
             None,
@@ -44688,14 +45541,42 @@ mod tests {
             &append_body,
         )
         .unwrap();
-        let wire = read_all_available(&mut peer);
-        assert_eq!(wire.len(), 32, "error packet");
-        assert_eq!(wire[0], 0, "error packet");
+        let crate::core_loop::process_request::RequestOutcome::PendingXiConfig(append_request) =
+            outcome
+        else {
+            panic!("recognized append must enter the core config lane")
+        };
         assert_eq!(
-            wire[1],
-            x11::error::BAD_VALUE,
-            "BadValue: merged length 4 > n"
+            backend.started_device_configs.len(),
+            1,
+            "append has not started"
         );
+        assert_eq!(
+            state
+                .xi_devices
+                .device(TEST_PHYSICAL_POINTER_ID)
+                .unwrap()
+                .properties
+                .get(&AtomId(atom))
+                .unwrap()
+                .data,
+            vec![1, 0, 0],
+            "request parsing leaves the confirmed full-width value untouched"
+        );
+        assert!(
+            read_all_available(&mut peer).is_empty(),
+            "no reply or event before validation"
+        );
+        route_t3_config_request(
+            &mut state,
+            &mut backend,
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            append_request,
+        );
+        let wire = read_all_available(&mut peer);
+        assert_xi_config_error(&wire, x11::error::BAD_VALUE, 2, 57);
 
         let dev = state
             .xi_devices
@@ -44709,30 +45590,1101 @@ mod tests {
             "stored property untouched by the rejected append"
         );
         assert_eq!(
-            backend.applied_device_configs.len(),
+            backend.started_device_configs.len(),
             1,
-            "only the seeding Replace reached apply_device_config, not the rejected Append"
+            "only the seeding Replace reached start_device_config, not the rejected Append"
         );
     }
 
     #[test]
-    fn t3_b2_append_onto_absent_accel_profile_behaves_like_replace() {
+    fn xi_config_completion_immediate_success_updates_registry_and_inventory() {
+        use crate::xinput::libinput_props::DeviceConfigChange;
+
+        let mut state = ServerState::new();
+        let mut peer = install_capture_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_pointer_for_t3(&mut state);
+        let (mut inventory, source) = inventory_for_t3_source(&state);
+        let mut pending = crate::core_loop::run::PendingBackendRequests::default();
+        let mut lane = crate::core_loop::run::XiConfigLane::default();
+        let request = parse_t3_xi2_config_request(
+            &mut state,
+            &mut backend,
+            1,
+            1,
+            TEST_PHYSICAL_POINTER_ID,
+            "libinput Accel Speed",
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            32,
+            &0.5_f32.to_le_bytes(),
+        );
+        let atom = request.property;
+
+        assert!(backend.started_device_configs.is_empty());
+        assert_eq!(
+            state
+                .xi_devices
+                .device(TEST_PHYSICAL_POINTER_ID)
+                .unwrap()
+                .properties[&atom]
+                .data,
+            0.0_f32.to_le_bytes(),
+            "request parsing has not changed the XI property"
+        );
+        route_t3_config_request(
+            &mut state,
+            &mut backend,
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            request,
+        );
+
+        assert_eq!(
+            backend.started_device_configs,
+            [(source, DeviceConfigChange::AccelSpeed(0.5))]
+        );
+        assert_eq!(
+            state
+                .xi_devices
+                .device(TEST_PHYSICAL_POINTER_ID)
+                .unwrap()
+                .properties[&atom]
+                .data,
+            0.5_f32.to_le_bytes()
+        );
+        assert_eq!(inventory.get(source).unwrap().config.accel.current, 0.5);
+        assert!(lane.is_empty());
+        assert!(pending.is_empty());
+        assert!(read_all_available(&mut peer).is_empty());
+    }
+
+    #[test]
+    fn xi_config_completion_pending_success_commits_only_after_message() {
+        use crate::xinput::libinput_props::{
+            DeviceConfigChange, DeviceConfigStart, DeviceConfigToken,
+        };
+
+        let mut state = ServerState::new();
+        let mut peer = install_capture_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_pointer_for_t3(&mut state);
+        let (mut inventory, source) = inventory_for_t3_source(&state);
+        let mut pending = crate::core_loop::run::PendingBackendRequests::default();
+        let mut lane = crate::core_loop::run::XiConfigLane::default();
+        select_xi2_property_event_on_root(&mut state, 1, TEST_PHYSICAL_POINTER_ID);
+        let original = 0.0_f32.to_le_bytes();
+        backend
+            .device_config_start_results
+            .push_back(Ok(DeviceConfigStart::Pending(DeviceConfigToken(201))));
+        let request = parse_t3_xi2_config_request(
+            &mut state,
+            &mut backend,
+            1,
+            1,
+            TEST_PHYSICAL_POINTER_ID,
+            "libinput Accel Speed",
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            32,
+            &0.5_f32.to_le_bytes(),
+        );
+        let atom = request.property;
+        route_t3_config_request(
+            &mut state,
+            &mut backend,
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            request,
+        );
+
+        assert_eq!(
+            backend.started_device_configs,
+            [(source, DeviceConfigChange::AccelSpeed(0.5))]
+        );
+        assert!(
+            !lane.is_empty(),
+            "submitted write holds the lane until acknowledgment"
+        );
+        assert!(!pending.is_empty(), "originating client remains blocked");
+        assert_eq!(
+            state
+                .xi_devices
+                .device(TEST_PHYSICAL_POINTER_ID)
+                .unwrap()
+                .properties[&atom]
+                .data,
+            original,
+            "XI value remains old until the input thread confirms success"
+        );
+        assert_eq!(inventory.get(source).unwrap().config.accel.current, 0.0);
+        assert!(
+            read_all_available(&mut peer).is_empty(),
+            "no notification before success"
+        );
+
+        crate::core_loop::run::dispatch_device_config_result(
+            &mut state,
+            &mut backend,
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            &mut crate::core_loop::reset::ResetTrigger::new(
+                crate::core_loop::reset::ResetPolicy::NoReset,
+            ),
+            crate::core_loop::message::Message::DeviceConfigResult {
+                token: DeviceConfigToken(201),
+                source,
+                result: Ok(()),
+            },
+            crate::core_loop::generation::Generation::default(),
+        );
+
+        let wire = read_all_available(&mut peer);
+        let event = find_xi2_property_event(&wire).expect("success emits XI_PropertyEvent");
+        assert_eq!(event[20], crate::xinput::PropWhat::Modified as u8);
+        assert_eq!(
+            state
+                .xi_devices
+                .device(TEST_PHYSICAL_POINTER_ID)
+                .unwrap()
+                .properties[&atom]
+                .data,
+            0.5_f32.to_le_bytes()
+        );
+        assert_eq!(inventory.get(source).unwrap().config.accel.current, 0.5);
+        assert!(lane.is_empty());
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn xi_config_completion_start_and_async_errors_leave_values_untouched() {
+        use crate::xinput::libinput_props::{
+            DeviceConfigError as ConfigError, DeviceConfigStart, DeviceConfigToken,
+        };
+
+        for (start_result, async_error, expected_error) in [
+            (Err(ConfigError::Unsupported), None, x11::error::BAD_MATCH),
+            (Err(ConfigError::Invalid), None, x11::error::BAD_VALUE),
+            (Err(ConfigError::SourceGone), None, XI2_FIRST_ERROR),
+            (
+                Ok(DeviceConfigStart::Pending(DeviceConfigToken(203))),
+                Some(ConfigError::Invalid),
+                x11::error::BAD_VALUE,
+            ),
+            (
+                Ok(DeviceConfigStart::Pending(DeviceConfigToken(203))),
+                Some(ConfigError::Unsupported),
+                x11::error::BAD_MATCH,
+            ),
+            (
+                Ok(DeviceConfigStart::Pending(DeviceConfigToken(203))),
+                Some(ConfigError::SourceGone),
+                XI2_FIRST_ERROR,
+            ),
+        ] {
+            let mut state = ServerState::new();
+            let mut peer = install_capture_client(&mut state, 1);
+            let mut backend = RecordingBackend::new();
+            seed_pointer_for_t3(&mut state);
+            let (mut inventory, source) = inventory_for_t3_source(&state);
+            let mut pending = crate::core_loop::run::PendingBackendRequests::default();
+            let mut lane = crate::core_loop::run::XiConfigLane::default();
+            let request = parse_t3_xi2_config_request(
+                &mut state,
+                &mut backend,
+                1,
+                3,
+                TEST_PHYSICAL_POINTER_ID,
+                "libinput Accel Speed",
+                crate::xinput::XI_PROP_MODE_REPLACE,
+                32,
+                &0.5_f32.to_le_bytes(),
+            );
+            let atom = request.property;
+            let old_property = state
+                .xi_devices
+                .device(TEST_PHYSICAL_POINTER_ID)
+                .unwrap()
+                .properties[&atom]
+                .clone();
+            backend.device_config_start_results.push_back(start_result);
+
+            route_t3_config_request(
+                &mut state,
+                &mut backend,
+                &mut inventory,
+                &mut pending,
+                &mut lane,
+                request,
+            );
+            assert_eq!(backend.started_device_configs.len(), 1);
+            if let Some(error) = async_error {
+                assert!(!lane.is_empty());
+                crate::core_loop::run::dispatch_device_config_result(
+                    &mut state,
+                    &mut backend,
+                    &mut inventory,
+                    &mut pending,
+                    &mut lane,
+                    &mut crate::core_loop::reset::ResetTrigger::new(
+                        crate::core_loop::reset::ResetPolicy::NoReset,
+                    ),
+                    crate::core_loop::message::Message::DeviceConfigResult {
+                        token: DeviceConfigToken(203),
+                        source,
+                        result: Err(error),
+                    },
+                    crate::core_loop::generation::Generation::default(),
+                );
+            }
+
+            let wire = read_all_available(&mut peer);
+            assert_xi_config_error(&wire, expected_error, 3, 57);
+            assert_eq!(
+                state
+                    .xi_devices
+                    .device(TEST_PHYSICAL_POINTER_ID)
+                    .unwrap()
+                    .properties[&atom],
+                old_property
+            );
+            assert_eq!(inventory.get(source).unwrap().config.accel.current, 0.0);
+            assert!(lane.is_empty());
+            assert!(pending.is_empty());
+        }
+    }
+
+    #[test]
+    fn xi_config_completion_merges_ordered_writes_at_dequeue_time() {
+        use crate::xinput::libinput_props::{
+            DeviceConfigChange, DeviceConfigStart, DeviceConfigToken,
+        };
+
+        let mut state = ServerState::new();
+        let mut peer_a = install_capture_client(&mut state, 1);
+        let mut peer_b = install_capture_client(&mut state, 2);
+        let mut backend = RecordingBackend::new();
+        seed_pointer_for_t3(&mut state);
+        let (mut inventory, source) = inventory_for_t3_source(&state);
+        let mut pending = crate::core_loop::run::PendingBackendRequests::default();
+        let mut lane = crate::core_loop::run::XiConfigLane::default();
+        select_xi2_property_event_on_root(&mut state, 1, TEST_PHYSICAL_POINTER_ID);
+        select_xi2_property_event_on_root(&mut state, 2, TEST_PHYSICAL_POINTER_ID);
+        backend
+            .device_config_start_results
+            .push_back(Ok(DeviceConfigStart::Pending(DeviceConfigToken(204))));
+
+        let request_a = parse_t3_xi2_config_request(
+            &mut state,
+            &mut backend,
+            1,
+            1,
+            TEST_PHYSICAL_POINTER_ID,
+            "libinput Accel Speed",
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            32,
+            &0.5_f32.to_le_bytes(),
+        );
+        let atom = request_a.property;
+        route_t3_config_request(
+            &mut state,
+            &mut backend,
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            request_a,
+        );
+        let request_b = parse_t3_xi2_config_request(
+            &mut state,
+            &mut backend,
+            2,
+            1,
+            TEST_PHYSICAL_POINTER_ID,
+            "libinput Accel Speed",
+            crate::xinput::XI_PROP_MODE_APPEND,
+            32,
+            &[],
+        );
+        route_t3_config_request(
+            &mut state,
+            &mut backend,
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            request_b,
+        );
+
+        assert_eq!(
+            backend.started_device_configs,
+            [(source, DeviceConfigChange::AccelSpeed(0.5))],
+            "B remains queued behind A"
+        );
+        assert_eq!(
+            state
+                .xi_devices
+                .device(TEST_PHYSICAL_POINTER_ID)
+                .unwrap()
+                .properties[&atom]
+                .data,
+            0.0_f32.to_le_bytes()
+        );
+        assert!(read_all_available(&mut peer_a).is_empty());
+        assert!(read_all_available(&mut peer_b).is_empty());
+
+        crate::core_loop::run::dispatch_device_config_result(
+            &mut state,
+            &mut backend,
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            &mut crate::core_loop::reset::ResetTrigger::new(
+                crate::core_loop::reset::ResetPolicy::NoReset,
+            ),
+            crate::core_loop::message::Message::DeviceConfigResult {
+                token: DeviceConfigToken(204),
+                source,
+                result: Ok(()),
+            },
+            crate::core_loop::generation::Generation::default(),
+        );
+
+        assert_eq!(
+            backend.started_device_configs,
+            [
+                (source, DeviceConfigChange::AccelSpeed(0.5)),
+                (source, DeviceConfigChange::AccelSpeed(0.5)),
+            ],
+            "B's empty Append merges with A's confirmed 0.5 at dequeue"
+        );
+        assert_eq!(
+            state
+                .xi_devices
+                .device(TEST_PHYSICAL_POINTER_ID)
+                .unwrap()
+                .properties[&atom]
+                .data,
+            0.5_f32.to_le_bytes()
+        );
+        assert_eq!(inventory.get(source).unwrap().config.accel.current, 0.5);
+        for peer in [&mut peer_a, &mut peer_b] {
+            let wire = read_all_available(peer);
+            let event = find_xi2_property_event(&wire).expect("confirmed write notification");
+            assert_eq!(event[20], crate::xinput::PropWhat::Modified as u8);
+        }
+        assert!(lane.is_empty());
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn xi_config_completion_removal_cancels_queued_write_before_id_reuse() {
+        use crate::xinput::libinput_props::{
+            DeviceConfigChange, DeviceConfigStart, DeviceConfigToken,
+        };
+
+        let mut state = ServerState::new();
+        let mut peer_a = install_capture_client(&mut state, 1);
+        let mut peer_b = install_capture_client(&mut state, 2);
+        let mut backend = RecordingBackend::new();
+        seed_pointer_for_t3(&mut state);
+        let (mut inventory, source) = inventory_for_t3_source(&state);
+        let original_info = state.xi_devices.source(source).unwrap().clone();
+        let mut pending = crate::core_loop::run::PendingBackendRequests::default();
+        let mut lane = crate::core_loop::run::XiConfigLane::default();
+        backend
+            .device_config_start_results
+            .push_back(Ok(DeviceConfigStart::Pending(DeviceConfigToken(205))));
+
+        let request_a = parse_t3_xi2_config_request(
+            &mut state,
+            &mut backend,
+            1,
+            1,
+            TEST_PHYSICAL_POINTER_ID,
+            "libinput Accel Speed",
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            32,
+            &0.25_f32.to_le_bytes(),
+        );
+        route_t3_config_request(
+            &mut state,
+            &mut backend,
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            request_a,
+        );
+        let request_b = parse_t3_xi2_config_request(
+            &mut state,
+            &mut backend,
+            2,
+            2,
+            TEST_PHYSICAL_POINTER_ID,
+            "libinput Accel Speed",
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            32,
+            &0.75_f32.to_le_bytes(),
+        );
+        route_t3_config_request(
+            &mut state,
+            &mut backend,
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            request_b,
+        );
+        assert_eq!(backend.started_device_configs.len(), 1);
+
+        state.xi_unregister_source(source);
+        inventory.remove(source);
+        crate::core_loop::run::cancel_queued_xi_configs_for_source(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut lane,
+            &mut crate::core_loop::reset::ResetTrigger::new(
+                crate::core_loop::reset::ResetPolicy::NoReset,
+            ),
+            source,
+            crate::core_loop::generation::Generation::default(),
+        );
+        let mut replacement = original_info;
+        replacement.source_id = crate::xinput::InputSourceId(source.0 + 1);
+        replacement.device_node = "/dev/input/event88".into();
+        replacement.sysname = "event88".into();
+        let replacement_ids = state.xi_register_source(&replacement);
+        inventory.add(replacement.clone());
+        assert!(replacement_ids.contains(&TEST_PHYSICAL_POINTER_ID));
+
+        let error_b = read_all_available(&mut peer_b);
+        assert_xi_config_error(&error_b, XI2_FIRST_ERROR, 2, 57);
+        assert_eq!(
+            backend.started_device_configs.len(),
+            1,
+            "B never reached the backend"
+        );
+
+        crate::core_loop::run::dispatch_device_config_result(
+            &mut state,
+            &mut backend,
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            &mut crate::core_loop::reset::ResetTrigger::new(
+                crate::core_loop::reset::ResetPolicy::NoReset,
+            ),
+            crate::core_loop::message::Message::DeviceConfigResult {
+                token: DeviceConfigToken(205),
+                source,
+                result: Err(crate::xinput::libinput_props::DeviceConfigError::SourceGone),
+            },
+            crate::core_loop::generation::Generation::default(),
+        );
+        let error_a = read_all_available(&mut peer_a);
+        assert_xi_config_error(&error_a, XI2_FIRST_ERROR, 1, 57);
+
+        let replacement_device = state
+            .xi_devices
+            .device(TEST_PHYSICAL_POINTER_ID)
+            .expect("replacement reused the physical XI id");
+        let replacement_atom = state.atoms.id_for("libinput Accel Speed").unwrap();
+        assert_eq!(replacement_device.source_id, Some(replacement.source_id));
+        assert_eq!(
+            replacement_device.properties[&replacement_atom].data,
+            replacement.config.accel.current.to_le_bytes()
+        );
+        assert_eq!(
+            inventory
+                .get(replacement.source_id)
+                .unwrap()
+                .config
+                .accel
+                .current,
+            0.0
+        );
+        assert!(lane.is_empty());
+        assert!(pending.is_empty());
+        assert_eq!(
+            backend.started_device_configs,
+            [(source, DeviceConfigChange::AccelSpeed(0.25))]
+        );
+    }
+
+    #[test]
+    fn xi_config_completion_disconnect_discards_replies_but_keeps_submitted_change() {
+        use crate::xinput::libinput_props::{
+            DeviceConfigChange, DeviceConfigStart, DeviceConfigToken,
+        };
+
+        let mut state = ServerState::new();
+        let mut peer_a = install_capture_client(&mut state, 1);
+        let mut peer_b = install_capture_client(&mut state, 2);
+        let mut backend = RecordingBackend::new();
+        seed_pointer_for_t3(&mut state);
+        let (mut inventory, source) = inventory_for_t3_source(&state);
+        let mut pending = crate::core_loop::run::PendingBackendRequests::default();
+        let mut lane = crate::core_loop::run::XiConfigLane::default();
+        backend
+            .device_config_start_results
+            .push_back(Ok(DeviceConfigStart::Pending(DeviceConfigToken(206))));
+
+        let request_a = parse_t3_xi2_config_request(
+            &mut state,
+            &mut backend,
+            1,
+            1,
+            TEST_PHYSICAL_POINTER_ID,
+            "libinput Accel Speed",
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            32,
+            &0.5_f32.to_le_bytes(),
+        );
+        route_t3_config_request(
+            &mut state,
+            &mut backend,
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            request_a,
+        );
+        let request_b = parse_t3_xi2_config_request(
+            &mut state,
+            &mut backend,
+            2,
+            2,
+            TEST_PHYSICAL_POINTER_ID,
+            "libinput Accel Speed",
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            32,
+            &0.75_f32.to_le_bytes(),
+        );
+        route_t3_config_request(
+            &mut state,
+            &mut backend,
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            request_b,
+        );
+
+        let mut reset_trigger = crate::core_loop::reset::ResetTrigger::new(
+            crate::core_loop::reset::ResetPolicy::NoReset,
+        );
+        crate::core_loop::run::disconnect_with_pending_cleanup(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut lane,
+            &mut reset_trigger,
+            ClientId(2),
+        );
+        assert!(read_all_available(&mut peer_b).is_empty());
+        assert_eq!(backend.started_device_configs.len(), 1);
+        crate::core_loop::run::disconnect_with_pending_cleanup(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut lane,
+            &mut reset_trigger,
+            ClientId(1),
+        );
+        assert!(read_all_available(&mut peer_a).is_empty());
+        assert!(pending.is_empty());
+        assert!(
+            !lane.is_empty(),
+            "submitted backend work survives disconnect"
+        );
+
+        crate::core_loop::run::dispatch_device_config_result(
+            &mut state,
+            &mut backend,
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            &mut reset_trigger,
+            crate::core_loop::message::Message::DeviceConfigResult {
+                token: DeviceConfigToken(206),
+                source,
+                result: Ok(()),
+            },
+            crate::core_loop::generation::Generation::default(),
+        );
+
+        let atom = state.atoms.id_for("libinput Accel Speed").unwrap();
+        assert_eq!(
+            state
+                .xi_devices
+                .device(TEST_PHYSICAL_POINTER_ID)
+                .unwrap()
+                .properties[&atom]
+                .data,
+            0.5_f32.to_le_bytes()
+        );
+        assert_eq!(inventory.get(source).unwrap().config.accel.current, 0.5);
+        assert_eq!(
+            backend.started_device_configs,
+            [(source, DeviceConfigChange::AccelSpeed(0.5))]
+        );
+        assert!(lane.is_empty());
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn xi_config_completion_reset_keeps_submitted_change_and_uses_current_atoms() {
+        use crate::xinput::libinput_props::{
+            DeviceConfigChange, DeviceConfigStart, DeviceConfigToken,
+        };
+
+        let mut state = ServerState::new();
+        let mut peer_a = install_capture_client(&mut state, 1);
+        let mut peer_b = install_capture_client(&mut state, 2);
+        let mut backend = RecordingBackend::new();
+        seed_pointer_for_t3(&mut state);
+        let (mut inventory, source) = inventory_for_t3_source(&state);
+        let info = inventory.get(source).unwrap().clone();
+        let old_atom = state.atoms.id_for("libinput Accel Speed").unwrap();
+        let mut pending = crate::core_loop::run::PendingBackendRequests::default();
+        let mut lane = crate::core_loop::run::XiConfigLane::default();
+        backend
+            .device_config_start_results
+            .push_back(Ok(DeviceConfigStart::Pending(DeviceConfigToken(207))));
+
+        let request = parse_t3_xi2_config_request(
+            &mut state,
+            &mut backend,
+            1,
+            1,
+            TEST_PHYSICAL_POINTER_ID,
+            "libinput Accel Speed",
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            32,
+            &0.5_f32.to_le_bytes(),
+        );
+        route_t3_config_request(
+            &mut state,
+            &mut backend,
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            request,
+        );
+        let queued = parse_t3_xi2_config_request(
+            &mut state,
+            &mut backend,
+            2,
+            1,
+            TEST_PHYSICAL_POINTER_ID,
+            "libinput Accel Speed",
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            32,
+            &0.75_f32.to_le_bytes(),
+        );
+        route_t3_config_request(
+            &mut state,
+            &mut backend,
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            queued,
+        );
+        assert_eq!(backend.started_device_configs.len(), 1);
+        crate::core_loop::run::cancel_unsubmitted_xi_configs(&mut lane, &mut pending);
+        assert!(!lane.is_empty(), "reset retains the submitted operation");
+        assert!(
+            pending.is_empty(),
+            "reset releases old client blocking state"
+        );
+        assert!(read_all_available(&mut peer_a).is_empty());
+        assert!(read_all_available(&mut peer_b).is_empty());
+
+        let mut reset_state = ServerState::new();
+        let _ = reset_state.atoms.intern("reset atom allocation", false);
+        reset_state.xi_register_source(&info);
+        let current_atom = reset_state.atoms.id_for("libinput Accel Speed").unwrap();
+        assert_ne!(
+            current_atom, old_atom,
+            "reset replay gives the descriptor a fresh atom id"
+        );
+        let generation = crate::core_loop::generation::GenerationCounter::new();
+        let current_generation = generation.bump();
+        crate::core_loop::run::dispatch_device_config_result(
+            &mut reset_state,
+            &mut backend,
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            &mut crate::core_loop::reset::ResetTrigger::new(
+                crate::core_loop::reset::ResetPolicy::NoReset,
+            ),
+            crate::core_loop::message::Message::DeviceConfigResult {
+                token: DeviceConfigToken(207),
+                source,
+                result: Ok(()),
+            },
+            current_generation,
+        );
+
+        let device = reset_state
+            .xi_devices
+            .device(TEST_PHYSICAL_POINTER_ID)
+            .expect("replayed source has its pointer facet");
+        assert_eq!(device.properties[&current_atom].data, 0.5_f32.to_le_bytes());
+        assert_eq!(device.source_id, Some(source));
+        assert_eq!(
+            reset_state
+                .xi_devices
+                .source(source)
+                .unwrap()
+                .config
+                .accel
+                .current,
+            0.5
+        );
+        assert_eq!(inventory.get(source).unwrap().config.accel.current, 0.5);
+        assert_eq!(
+            backend.started_device_configs,
+            [(source, DeviceConfigChange::AccelSpeed(0.5))]
+        );
+        assert!(lane.is_empty());
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn xi_config_completion_recreates_get_deleted_property_after_success() {
+        use crate::xinput::libinput_props::{DeviceConfigStart, DeviceConfigToken};
+
+        let mut state = ServerState::new();
+        let mut peer = install_capture_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_pointer_for_t3(&mut state);
+        let (mut inventory, source) = inventory_for_t3_source(&state);
+        let mut pending = crate::core_loop::run::PendingBackendRequests::default();
+        let mut lane = crate::core_loop::run::XiConfigLane::default();
+        let property = state.atoms.intern("libinput Accel Profile Enabled", false);
+        select_xi2_property_event_on_root(&mut state, 1, TEST_PHYSICAL_POINTER_ID);
+
+        let mut delete_body = TEST_PHYSICAL_POINTER_ID.to_le_bytes().to_vec();
+        delete_body.extend_from_slice(&[1, 0]);
+        delete_body.extend_from_slice(&property.0.to_le_bytes());
+        delete_body.extend_from_slice(&0u32.to_le_bytes()); // type = AnyPropertyType
+        delete_body.extend_from_slice(&0u32.to_le_bytes()); // offset
+        delete_body.extend_from_slice(&3u32.to_le_bytes()); // full three-byte read
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(59),
+            &delete_body,
+        )
+        .expect("GetProperty(delete)");
+        let deletion_wire = read_all_available(&mut peer);
+        assert!(find_xi2_property_event(&deletion_wire).is_some());
+        assert!(
+            !state
+                .xi_devices
+                .device(TEST_PHYSICAL_POINTER_ID)
+                .unwrap()
+                .properties
+                .contains_key(&property),
+            "GetProperty(delete) removes the seeded property"
+        );
+
+        backend
+            .device_config_start_results
+            .push_back(Ok(DeviceConfigStart::Pending(DeviceConfigToken(208))));
+        let request = parse_t3_xi2_config_request(
+            &mut state,
+            &mut backend,
+            1,
+            2,
+            TEST_PHYSICAL_POINTER_ID,
+            "libinput Accel Profile Enabled",
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            8,
+            &[0, 1],
+        );
+        assert!(backend.started_device_configs.is_empty());
+        route_t3_config_request(
+            &mut state,
+            &mut backend,
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            request,
+        );
+        assert!(
+            !state
+                .xi_devices
+                .device(TEST_PHYSICAL_POINTER_ID)
+                .unwrap()
+                .properties
+                .contains_key(&property),
+            "a submitted write does not recreate the property before success"
+        );
+        assert!(
+            read_all_available(&mut peer).is_empty(),
+            "no Created event before success"
+        );
+
+        crate::core_loop::run::dispatch_device_config_result(
+            &mut state,
+            &mut backend,
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            &mut crate::core_loop::reset::ResetTrigger::new(
+                crate::core_loop::reset::ResetPolicy::NoReset,
+            ),
+            crate::core_loop::message::Message::DeviceConfigResult {
+                token: DeviceConfigToken(208),
+                source,
+                result: Ok(()),
+            },
+            crate::core_loop::generation::Generation::default(),
+        );
+        let wire = read_all_available(&mut peer);
+        assert_eq!(
+            find_xi2_property_event(&wire).unwrap()[20],
+            crate::xinput::PropWhat::Created as u8
+        );
+        let recreated = &state
+            .xi_devices
+            .device(TEST_PHYSICAL_POINTER_ID)
+            .unwrap()
+            .properties[&property];
+        assert_eq!(recreated.data, [0, 1, 0]);
+        assert!(
+            recreated.deletable,
+            "recreated Xorg property uses default deletable flag"
+        );
+        assert_eq!(
+            inventory.get(source).unwrap().config.accel_profile.current,
+            Some(1)
+        );
+        assert!(lane.is_empty());
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn xi_config_completion_suspended_source_rejects_without_blocking_other_source() {
+        use crate::xinput::libinput_props::{
+            DeviceConfigChange, DeviceConfigStart, DeviceConfigToken,
+        };
+
+        let mut state = ServerState::new();
+        let mut peer_suspended = install_capture_client(&mut state, 1);
+        let mut peer_live = install_capture_client(&mut state, 2);
+        let mut backend = RecordingBackend::new();
+        seed_pointer_for_t3(&mut state);
+        let source_suspended = state
+            .xi_devices
+            .device(TEST_PHYSICAL_POINTER_ID)
+            .unwrap()
+            .source_id
+            .unwrap();
+        let mut suspended_info = state.xi_devices.source(source_suspended).unwrap().clone();
+        suspended_info.enabled = false;
+        state.xi_devices.register(&suspended_info);
+        let mut live_info = suspended_info.clone();
+        live_info.source_id = crate::xinput::InputSourceId(source_suspended.0 + 1);
+        live_info.enabled = true;
+        live_info.device_node = "/dev/input/event77".into();
+        live_info.sysname = "event77".into();
+        let live_ids = state.xi_register_source(&live_info);
+        let live_device = *live_ids
+            .iter()
+            .find(|id| *id != &TEST_PHYSICAL_POINTER_ID)
+            .expect("second pointer facet");
+        let source_live = live_info.source_id;
+        let mut inventory = crate::core_loop::input_inventory::InputInventory::new();
+        inventory.add(suspended_info);
+        inventory.add(live_info);
+        inventory.suspend(source_suspended);
+        let mut pending = crate::core_loop::run::PendingBackendRequests::default();
+        let mut lane = crate::core_loop::run::XiConfigLane::default();
+        backend
+            .device_config_start_results
+            .push_back(Ok(DeviceConfigStart::Pending(DeviceConfigToken(206))));
+
+        // Client B's enabled-source write occupies the global lane while its
+        // backend completion remains pending.
+        let request_live = parse_t3_xi2_config_request(
+            &mut state,
+            &mut backend,
+            2,
+            1,
+            live_device,
+            "libinput Accel Speed",
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            32,
+            &0.75_f32.to_le_bytes(),
+        );
+        route_t3_config_request(
+            &mut state,
+            &mut backend,
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            request_live,
+        );
+        assert_eq!(backend.started_device_configs.len(), 1);
+        assert!(!lane.is_empty(), "client B's write is still in flight");
+        assert!(pending.xi_config_client_is_blocked_for_test(yserver_protocol::x11::ClientId(2)));
+
+        // Client A's write targets the suspended source and must fail before
+        // it can wait behind B's in-flight write.
+        let request_suspended = parse_t3_xi2_config_request(
+            &mut state,
+            &mut backend,
+            1,
+            2,
+            TEST_PHYSICAL_POINTER_ID,
+            "libinput Accel Speed",
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            32,
+            &0.25_f32.to_le_bytes(),
+        );
+        route_t3_config_request(
+            &mut state,
+            &mut backend,
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            request_suspended,
+        );
+
+        let rejected = read_all_available(&mut peer_suspended);
+        assert_xi_config_error(&rejected, x11::error::BAD_MATCH, 2, 57);
+        assert!(
+            !pending.xi_config_client_is_blocked_for_test(yserver_protocol::x11::ClientId(1)),
+            "client A is rejected without joining the pending lane"
+        );
+        assert!(pending.xi_config_client_is_blocked_for_test(yserver_protocol::x11::ClientId(2)));
+        assert!(!lane.is_empty(), "client B remains in flight");
+        assert_eq!(backend.started_device_configs.len(), 1);
+        assert!(read_all_available(&mut peer_live).is_empty());
+
+        let accel_atom = state.atoms.id_for("libinput Accel Speed").unwrap();
+        assert_eq!(
+            state
+                .xi_devices
+                .device(TEST_PHYSICAL_POINTER_ID)
+                .unwrap()
+                .properties[&accel_atom]
+                .data,
+            0.0_f32.to_le_bytes(),
+            "the rejected suspended-source write leaves its property unchanged"
+        );
+        assert_eq!(
+            inventory
+                .get(source_suspended)
+                .unwrap()
+                .config
+                .accel
+                .current,
+            0.0
+        );
+
+        crate::core_loop::run::dispatch_device_config_result(
+            &mut state,
+            &mut backend,
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            &mut crate::core_loop::reset::ResetTrigger::new(
+                crate::core_loop::reset::ResetPolicy::NoReset,
+            ),
+            crate::core_loop::message::Message::DeviceConfigResult {
+                token: DeviceConfigToken(206),
+                source: source_live,
+                result: Ok(()),
+            },
+            crate::core_loop::generation::Generation::default(),
+        );
+
+        let live_atom = state.atoms.id_for("libinput Accel Speed").unwrap();
+        assert_eq!(
+            backend.started_device_configs,
+            [(source_live, DeviceConfigChange::AccelSpeed(0.75))]
+        );
+        assert_eq!(
+            state.xi_devices.device(live_device).unwrap().properties[&live_atom].data,
+            0.75_f32.to_le_bytes()
+        );
+        assert_eq!(
+            inventory.get(source_live).unwrap().config.accel.current,
+            0.75
+        );
+        assert!(lane.is_empty());
+        assert!(pending.is_empty());
+        assert!(read_all_available(&mut peer_live).is_empty());
+        assert!(read_all_available(&mut peer_suspended).is_empty());
+    }
+
+    #[test]
+    fn xi_config_completion_removal_cancels_queued_write_on_host_input_for_xi1_and_xi2() {
+        for xi1_request in [true, false] {
+            assert_t3_host_lifecycle_cancels_queued_write(true, xi1_request);
+        }
+    }
+
+    #[test]
+    fn xi_config_completion_suspension_cancels_queued_write_on_host_input_for_xi1_and_xi2() {
+        for xi1_request in [true, false] {
+            assert_t3_host_lifecycle_cancels_queued_write(false, xi1_request);
+        }
+    }
+
+    #[test]
+    fn xi_config_completion_t3_b2_append_onto_absent_profile_behaves_like_replace() {
         // Model a client-deleted supported property. Append [0, 1, 0]
         // then behaves exactly like Replace and stores three bytes.
         let mut state = ServerState::new();
-        let mut peer = install_client(&mut state, 1);
+        let mut peer = install_capture_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
         seed_pointer_for_t3(&mut state);
+        let (mut inventory, source) = inventory_for_t3_source(&state);
+        let mut pending = crate::core_loop::run::PendingBackendRequests::default();
+        let mut lane = crate::core_loop::run::XiConfigLane::default();
         let atom = state
             .atoms
             .intern("libinput Accel Profile Enabled", false)
             .0;
-        state
-            .xi_devices
-            .device_mut(TEST_PHYSICAL_POINTER_ID)
-            .unwrap()
-            .properties
-            .remove(&AtomId(atom));
+
+        // Delete through the same XIGetProperty(delete) path a client uses.
+        let mut delete_body = TEST_PHYSICAL_POINTER_ID.to_le_bytes().to_vec();
+        delete_body.extend_from_slice(&[1, 0]);
+        delete_body.extend_from_slice(&atom.to_le_bytes());
+        delete_body.extend_from_slice(&0u32.to_le_bytes());
+        delete_body.extend_from_slice(&0u32.to_le_bytes());
+        delete_body.extend_from_slice(&3u32.to_le_bytes());
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(59),
+            &delete_body,
+        )
+        .unwrap();
+        let deleted_reply = read_all_available(&mut peer);
+        assert_eq!(
+            deleted_reply.len(),
+            36,
+            "GetProperty reply includes the full value"
+        );
+        assert_eq!(deleted_reply[0], 1, "GetProperty returns a reply");
+        assert!(
+            !state
+                .xi_devices
+                .device(TEST_PHYSICAL_POINTER_ID)
+                .unwrap()
+                .properties
+                .contains_key(&AtomId(atom))
+        );
         let integer_atom = crate::xinput::XA_INTEGER.0;
 
         let body = xi2_change_property_body(
@@ -44743,7 +46695,7 @@ mod tests {
             integer_atom,
             &[0, 1, 0],
         );
-        handle_xi2_request(
+        let outcome = handle_xi2_request(
             &mut state,
             &mut backend,
             None,
@@ -44753,6 +46705,28 @@ mod tests {
             &body,
         )
         .unwrap();
+        let crate::core_loop::process_request::RequestOutcome::PendingXiConfig(request) = outcome
+        else {
+            panic!("recognized Append must enter the core config lane")
+        };
+        assert!(backend.started_device_configs.is_empty());
+        assert!(
+            !state
+                .xi_devices
+                .device(TEST_PHYSICAL_POINTER_ID)
+                .unwrap()
+                .properties
+                .contains_key(&AtomId(atom)),
+            "request parsing leaves the deleted property absent"
+        );
+        route_t3_config_request(
+            &mut state,
+            &mut backend,
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            request,
+        );
         assert!(
             read_all_available(&mut peer).is_empty(),
             "no error: absent property + Append behaves like Replace"
@@ -44765,6 +46739,23 @@ mod tests {
             .unwrap();
         let prop = dev.properties.get(&AtomId(atom)).unwrap();
         assert_eq!(prop.data, vec![0, 1, 0]);
+        assert!(
+            prop.deletable,
+            "recreated property uses Xorg's default flag"
+        );
+        assert_eq!(
+            backend.started_device_configs,
+            [(
+                source,
+                crate::xinput::libinput_props::DeviceConfigChange::AccelProfile(Some(1))
+            )]
+        );
+        assert_eq!(
+            inventory.get(source).unwrap().config.accel_profile.current,
+            Some(1)
+        );
+        assert!(lane.is_empty());
+        assert!(pending.is_empty());
     }
 
     // -----------------------------------------------------------------
@@ -44803,15 +46794,18 @@ mod tests {
     }
 
     #[test]
-    fn t5_xi2_change_property_emits_property_event_modified_to_selecting_client() {
+    fn xi_config_completion_t5_xi2_modified_property_event_to_selecting_client() {
         // Selecting client receives an XI2 XI_PropertyEvent with
         // what=Modified after a successful XIChangeProperty against an
         // already-seeded libinput property ("libinput Tapping Enabled"
         // is set by `seed_pointer_properties`, so the write is a Modify).
         let mut state = ServerState::new();
-        let mut peer = install_client(&mut state, 1);
+        let mut peer = install_capture_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
         seed_pointer_for_t3(&mut state);
+        let (mut inventory, source) = inventory_for_t3_source(&state);
+        let mut pending = crate::core_loop::run::PendingBackendRequests::default();
+        let mut lane = crate::core_loop::run::XiConfigLane::default();
         select_xi2_property_event_on_root(&mut state, 1, TEST_PHYSICAL_POINTER_ID);
         let tap_atom = state
             .atoms
@@ -44827,16 +46821,18 @@ mod tests {
             integer_atom,
             &[0],
         );
-        handle_xi2_request(
+        drive_t3_config_wire_request(
             &mut state,
+            &mut peer,
             &mut backend,
-            None,
-            ClientId(1),
-            SequenceNumber(1),
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            1,
+            1,
             xi2_header(57),
             &body,
-        )
-        .unwrap();
+        );
         let wire = read_all_available(&mut peer);
         // No reply for XIChangeProperty; the only bytes on the wire
         // must be the 32-byte XI_PropertyEvent.
@@ -44856,6 +46852,10 @@ mod tests {
             "property atom"
         );
         assert_eq!(ev[20], 2, "what = Modified (property already seeded)");
+        assert_confirmed_tap_write(&state, &inventory, source, AtomId(tap_atom));
+        assert_eq!(backend.started_device_configs.len(), 1);
+        assert!(lane.is_empty());
+        assert!(pending.is_empty());
     }
 
     #[test]
@@ -45055,14 +47055,17 @@ mod tests {
     }
 
     #[test]
-    fn t5_xi2_change_property_not_selected_client_gets_nothing() {
+    fn xi_config_completion_t5_xi2_not_selected_client_gets_nothing() {
         // A client that did NOT select `XI_PropertyEventMask` for
         // this physical device must not receive the event, even if it has other
         // XI2 selections on the same window.
         let mut state = ServerState::new();
-        let mut peer = install_client(&mut state, 1);
+        let mut peer = install_capture_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
         seed_pointer_for_t3(&mut state);
+        let (mut inventory, source) = inventory_for_t3_source(&state);
+        let mut pending = crate::core_loop::run::PendingBackendRequests::default();
+        let mut lane = crate::core_loop::run::XiConfigLane::default();
         // Selecting `XI_DeviceChanged` only — the
         // `XI2_PROPERTY_EVENT_MASK` bit is NOT set, so this client
         // must be skipped.
@@ -45084,33 +47087,42 @@ mod tests {
             integer_atom,
             &[0],
         );
-        handle_xi2_request(
+        drive_t3_config_wire_request(
             &mut state,
+            &mut peer,
             &mut backend,
-            None,
-            ClientId(1),
-            SequenceNumber(1),
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            1,
+            1,
             xi2_header(57),
             &body,
-        )
-        .unwrap();
+        );
         assert!(
             read_all_available(&mut peer).is_empty(),
             "client without the property-event bit gets nothing"
         );
+        assert_confirmed_tap_write(&state, &inventory, source, AtomId(tap_atom));
+        assert_eq!(backend.started_device_configs.len(), 1);
+        assert!(lane.is_empty());
+        assert!(pending.is_empty());
     }
 
     #[test]
-    fn t5_xi2_change_property_other_device_does_not_match() {
+    fn xi_config_completion_t5_xi2_other_device_does_not_match() {
         // Selecting `XI_PropertyEvent` for device 3 (master keyboard)
         // must NOT route a physical pointer property change to that client.
         // The wildcards `XIAllDevices(0)` / `XIAllMasterDevices(1)` are
         // followed by `xi2mask_isset` (xserver dix/inpututils.c:1153),
         // but device 3 is neither, so this client stays unselected.
         let mut state = ServerState::new();
-        let mut peer = install_client(&mut state, 1);
+        let mut peer = install_capture_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
         seed_pointer_for_t3(&mut state);
+        let (mut inventory, source) = inventory_for_t3_source(&state);
+        let mut pending = crate::core_loop::run::PendingBackendRequests::default();
+        let mut lane = crate::core_loop::run::XiConfigLane::default();
         // Client subscribes to property events on device 3, not the physical pointer.
         state
             .clients
@@ -45132,24 +47144,30 @@ mod tests {
             integer_atom,
             &[0],
         );
-        handle_xi2_request(
+        drive_t3_config_wire_request(
             &mut state,
+            &mut peer,
             &mut backend,
-            None,
-            ClientId(1),
-            SequenceNumber(1),
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            1,
+            1,
             xi2_header(57),
             &body,
-        )
-        .unwrap();
+        );
         assert!(
             read_all_available(&mut peer).is_empty(),
             "device-3 selection must not see physical pointer events"
         );
+        assert_confirmed_tap_write(&state, &inventory, source, AtomId(tap_atom));
+        assert_eq!(backend.started_device_configs.len(), 1);
+        assert!(lane.is_empty());
+        assert!(pending.is_empty());
     }
 
     #[test]
-    fn t5_xi2_change_property_xi_all_devices_wildcard_matches() {
+    fn xi_config_completion_t5_xi2_all_devices_wildcard_matches() {
         // Regression for the bug `xinput watch-props 4` exposed on
         // M1/Asahi: every realworld client (xinput, MATE, etc.) calls
         // XISelectEvents with `deviceid = XIAllDevices = 0`, not the
@@ -45158,9 +47176,12 @@ mod tests {
         // specific mask; without that OR the client silently received
         // nothing.
         let mut state = ServerState::new();
-        let mut peer = install_client(&mut state, 1);
+        let mut peer = install_capture_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
         seed_pointer_for_t3(&mut state);
+        let (mut inventory, source) = inventory_for_t3_source(&state);
+        let mut pending = crate::core_loop::run::PendingBackendRequests::default();
+        let mut lane = crate::core_loop::run::XiConfigLane::default();
         // Select on the wildcard, NOT on the physical pointer directly.
         state
             .clients
@@ -45181,33 +47202,42 @@ mod tests {
             integer_atom,
             &[0],
         );
-        handle_xi2_request(
+        drive_t3_config_wire_request(
             &mut state,
+            &mut peer,
             &mut backend,
-            None,
-            ClientId(1),
-            SequenceNumber(1),
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            1,
+            1,
             xi2_header(57),
             &body,
-        )
-        .unwrap();
+        );
         let wire = read_all_available(&mut peer);
         let ev = find_xi2_property_event(&wire)
             .expect("XIAllDevices selection must receive the property event");
         assert_eq!(ev[20], 2, "what byte = Modified");
+        assert_confirmed_tap_write(&state, &inventory, source, AtomId(tap_atom));
+        assert_eq!(backend.started_device_configs.len(), 1);
+        assert!(lane.is_empty());
+        assert!(pending.is_empty());
     }
 
     #[test]
-    fn t5_xi1_change_device_property_also_emits_xi2_property_event() {
+    fn xi_config_completion_t5_xi1_write_also_emits_xi2_property_event() {
         // The XI1 write path (minor 37) must trigger the same XI2
         // fan-out — xserver's `send_property_event` fires from both
         // protocol paths so an XI2-listening client sees its tap
         // toggle even when an XI1 caller (e.g. an older xset variant)
         // wrote the property.
         let mut state = ServerState::new();
-        let mut peer = install_client(&mut state, 1);
+        let mut peer = install_capture_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
         seed_pointer_for_t3(&mut state);
+        let (mut inventory, source) = inventory_for_t3_source(&state);
+        let mut pending = crate::core_loop::run::PendingBackendRequests::default();
+        let mut lane = crate::core_loop::run::XiConfigLane::default();
         select_xi2_property_event_on_root(&mut state, 1, TEST_PHYSICAL_POINTER_ID);
         let tap_atom = state
             .atoms
@@ -45227,33 +47257,42 @@ mod tests {
         body.push(0); // pad
         body.extend_from_slice(&1u32.to_le_bytes()); // num_items = 1
         body.extend_from_slice(&[0u8, 0, 0, 0]); // value=[0] + 3 pad
-        handle_xi2_request(
+        drive_t3_config_wire_request(
             &mut state,
+            &mut peer,
             &mut backend,
-            None,
-            ClientId(1),
-            SequenceNumber(1),
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            1,
+            1,
             xi2_header(37),
             &body,
-        )
-        .unwrap();
+        );
         let wire = read_all_available(&mut peer);
         let ev =
             find_xi2_property_event(&wire).expect("XI1 write must also fan-out XI_PropertyEvent");
         assert_eq!(ev[20], 2, "what = Modified");
+        assert_confirmed_tap_write(&state, &inventory, source, AtomId(tap_atom));
+        assert_eq!(backend.started_device_configs.len(), 1);
+        assert!(lane.is_empty());
+        assert!(pending.is_empty());
     }
 
     #[test]
-    fn t5_property_event_selected_on_any_window_still_delivers() {
+    fn xi_config_completion_t5_property_event_selected_on_any_window_still_delivers() {
         // SendEventToAllWindows: a client that selected
         // `XI_PropertyEvent` for the device on ANY window (here a
         // synthetic non-root xid) must still receive the event. The
         // event has no event-window field, so per-window distinctions
         // only affect delivery.
         let mut state = ServerState::new();
-        let mut peer = install_client(&mut state, 1);
+        let mut peer = install_capture_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
         seed_pointer_for_t3(&mut state);
+        let (mut inventory, source) = inventory_for_t3_source(&state);
+        let mut pending = crate::core_loop::run::PendingBackendRequests::default();
+        let mut lane = crate::core_loop::run::XiConfigLane::default();
         // Subscribe via a non-root window — anything keyed by the
         // device id wins.
         state.clients.get_mut(&1).unwrap().xi2_masks.insert(
@@ -45274,21 +47313,27 @@ mod tests {
             integer_atom,
             &[0],
         );
-        handle_xi2_request(
+        drive_t3_config_wire_request(
             &mut state,
+            &mut peer,
             &mut backend,
-            None,
-            ClientId(1),
-            SequenceNumber(1),
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            1,
+            1,
             xi2_header(57),
             &body,
-        )
-        .unwrap();
+        );
         let wire = read_all_available(&mut peer);
         assert!(
             find_xi2_property_event(&wire).is_some(),
             "non-root selection must still deliver"
         );
+        assert_confirmed_tap_write(&state, &inventory, source, AtomId(tap_atom));
+        assert_eq!(backend.started_device_configs.len(), 1);
+        assert!(lane.is_empty());
+        assert!(pending.is_empty());
     }
 
     // -----------------------------------------------------------------
@@ -45579,16 +47624,19 @@ mod tests {
     }
 
     #[test]
-    fn t6_xi1_change_property_delivers_device_property_notify() {
+    fn xi_config_completion_t6_xi1_change_delivers_device_property_notify() {
         // End-to-end: a client SelectExtensionEvent(DevicePropertyNotify
         // for dev4), then someone (here, the same client via XI2
         // XIChangeProperty minor 57) writes a property. The 32-byte
         // XI1 event must land on the selecting client with the right
         // type byte, atom, and deviceid.
         let mut state = ServerState::new();
-        let mut peer = install_client(&mut state, 1);
+        let mut peer = install_capture_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
         seed_pointer_for_t3(&mut state);
+        let (mut inventory, source) = inventory_for_t3_source(&state);
+        let mut pending = crate::core_loop::run::PendingBackendRequests::default();
+        let mut lane = crate::core_loop::run::XiConfigLane::default();
         let physical_class = (u32::from(TEST_PHYSICAL_POINTER_ID) << 8) | 82;
         // Subscribe via SelectExtensionEvent only (no XI2 mask), so the
         // ONLY event on the wire is the XI1 one.
@@ -45623,16 +47671,18 @@ mod tests {
             integer_atom,
             &[0],
         );
-        handle_xi2_request(
+        drive_t3_config_wire_request(
             &mut state,
+            &mut peer,
             &mut backend,
-            None,
-            ClientId(1),
-            SequenceNumber(2),
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            1,
+            2,
             xi2_header(57),
             &body,
-        )
-        .unwrap();
+        );
         let wire = read_all_available(&mut peer);
         assert_eq!(wire.len(), 32, "exactly one 32-byte XI1 event");
         let ev = find_xi1_device_property_notify(&wire).expect("XI1 event present");
@@ -45648,6 +47698,10 @@ mod tests {
             u8::try_from(TEST_PHYSICAL_POINTER_ID).unwrap(),
             "deviceid (last byte)"
         );
+        assert_confirmed_tap_write(&state, &inventory, source, AtomId(tap_atom));
+        assert_eq!(backend.started_device_configs.len(), 1);
+        assert!(lane.is_empty());
+        assert!(pending.is_empty());
     }
 
     #[test]
@@ -45699,14 +47753,17 @@ mod tests {
     }
 
     #[test]
-    fn t6_xi1_unselected_client_gets_nothing() {
+    fn xi_config_completion_t6_xi1_unselected_client_gets_nothing() {
         // A client that did NOT call SelectExtensionEvent must not
         // receive an XI1 DevicePropertyNotify — even if the property
         // change happens on the device it cares about.
         let mut state = ServerState::new();
-        let mut peer = install_client(&mut state, 1);
+        let mut peer = install_capture_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
         seed_pointer_for_t3(&mut state);
+        let (mut inventory, source) = inventory_for_t3_source(&state);
+        let mut pending = crate::core_loop::run::PendingBackendRequests::default();
+        let mut lane = crate::core_loop::run::XiConfigLane::default();
         // No SelectExtensionEvent, no XI2 mask.
         let tap_atom = state
             .atoms
@@ -45721,31 +47778,40 @@ mod tests {
             integer_atom,
             &[0],
         );
-        handle_xi2_request(
+        drive_t3_config_wire_request(
             &mut state,
+            &mut peer,
             &mut backend,
-            None,
-            ClientId(1),
-            SequenceNumber(1),
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            1,
+            1,
             xi2_header(57),
             &body,
-        )
-        .unwrap();
+        );
         assert!(
             read_all_available(&mut peer).is_empty(),
             "unselected client receives nothing"
         );
+        assert_confirmed_tap_write(&state, &inventory, source, AtomId(tap_atom));
+        assert_eq!(backend.started_device_configs.len(), 1);
+        assert!(lane.is_empty());
+        assert!(pending.is_empty());
     }
 
     #[test]
-    fn t6_xi1_wrong_device_class_does_not_match() {
-        // Selecting DevicePropertyNotify for device 5 must NOT route a
-        // device-4 property change to that client (parallel to the
+    fn xi_config_completion_t6_xi1_wrong_device_class_does_not_match() {
+        // Selecting DevicePropertyNotify for XTEST device 5 must NOT route a
+        // physical pointer property change to that client (parallel to the
         // XI2 same-property-different-device test in T5).
         let mut state = ServerState::new();
-        let mut peer = install_client(&mut state, 1);
+        let mut peer = install_capture_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
         seed_pointer_for_t3(&mut state);
+        let (mut inventory, source) = inventory_for_t3_source(&state);
+        let mut pending = crate::core_loop::run::PendingBackendRequests::default();
+        let mut lane = crate::core_loop::run::XiConfigLane::default();
         let class_dev5: u32 = (5 << 8) | 82;
         let select_body = xi1_select_extension_event_body(ROOT_WINDOW.0, &[class_dev5]);
         handle_xi2_request(
@@ -45773,20 +47839,26 @@ mod tests {
             integer_atom,
             &[0],
         );
-        handle_xi2_request(
+        drive_t3_config_wire_request(
             &mut state,
+            &mut peer,
             &mut backend,
-            None,
-            ClientId(1),
-            SequenceNumber(2),
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            1,
+            2,
             xi2_header(57),
             &body,
-        )
-        .unwrap();
+        );
         assert!(
             read_all_available(&mut peer).is_empty(),
-            "device-5 selection must not see device-4 events"
+            "device-5 selection must not see physical pointer events"
         );
+        assert_confirmed_tap_write(&state, &inventory, source, AtomId(tap_atom));
+        assert_eq!(backend.started_device_configs.len(), 1);
+        assert!(lane.is_empty());
+        assert!(pending.is_empty());
     }
 
     #[test]
@@ -45841,7 +47913,7 @@ mod tests {
     }
 
     #[test]
-    fn t6_xi1_and_xi2_dual_selection_delivers_one_event_per_path() {
+    fn xi_config_completion_t6_dual_selection_delivers_each_event_path() {
         // A client that selected `XI_PropertyEvent` via XI2's
         // `xi2_masks` AND a `DevicePropertyNotify` class via XI1's
         // `SelectExtensionEvent` receives TWO independent events from
@@ -45851,9 +47923,12 @@ mod tests {
         // uses XI2 directly plus a legacy libXi consumer in the same
         // process). Pins the no-cross-path-dedup invariant.
         let mut state = ServerState::new();
-        let mut peer = install_client(&mut state, 1);
+        let mut peer = install_capture_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
         seed_pointer_for_t3(&mut state);
+        let (mut inventory, source) = inventory_for_t3_source(&state);
+        let mut pending = crate::core_loop::run::PendingBackendRequests::default();
+        let mut lane = crate::core_loop::run::XiConfigLane::default();
         let physical_class = (u32::from(TEST_PHYSICAL_POINTER_ID) << 8) | 82;
         // XI2 selection.
         select_xi2_property_event_on_root(&mut state, 1, TEST_PHYSICAL_POINTER_ID);
@@ -45887,16 +47962,18 @@ mod tests {
             integer_atom,
             &[0],
         );
-        handle_xi2_request(
+        drive_t3_config_wire_request(
             &mut state,
+            &mut peer,
             &mut backend,
-            None,
-            ClientId(1),
-            SequenceNumber(2),
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            1,
+            2,
             xi2_header(57),
             &body,
-        )
-        .unwrap();
+        );
         let wire = read_all_available(&mut peer);
         assert_eq!(wire.len(), 64, "two 32-byte events (XI2 + XI1)");
         // Both events must be present — anchor by type byte.
@@ -45915,14 +47992,22 @@ mod tests {
             u8::try_from(TEST_PHYSICAL_POINTER_ID).unwrap(),
             "XI1 deviceid (last byte)"
         );
+        assert_confirmed_tap_write(&state, &inventory, source, AtomId(tap_atom));
+        assert_eq!(backend.started_device_configs.len(), 1);
+        assert!(lane.is_empty());
+        assert!(pending.is_empty());
     }
 
     #[test]
-    fn t3_xi2_change_property_readonly_descriptor_yields_bad_access() {
+    fn xi_config_completion_readonly_descriptor_yields_bad_access() {
         let mut state = ServerState::new();
-        let mut peer = install_client(&mut state, 1);
+        let mut peer = install_capture_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
         seed_pointer_for_t3(&mut state);
+        let (mut inventory, _) = inventory_for_t3_source(&state);
+        let mut pending = crate::core_loop::run::PendingBackendRequests::default();
+        let mut lane = crate::core_loop::run::XiConfigLane::default();
+        let properties_before = xi_property_snapshot(&state);
         // `…Enabled Default` is the ReadOnly companion (Access::ReadOnly).
         let default_atom = state
             .atoms
@@ -45950,20 +48035,20 @@ mod tests {
             integer_atom,
             &[0],
         );
-        handle_xi2_request(
+        drive_t3_config_wire_request(
             &mut state,
+            &mut peer,
             &mut backend,
-            None,
-            ClientId(1),
-            SequenceNumber(2),
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            1,
+            2,
             xi2_header(57),
             &body,
-        )
-        .unwrap();
+        );
         let wire = read_all_available(&mut peer);
-        assert_eq!(wire.len(), 32, "error packet");
-        assert_eq!(wire[0], 0, "X_Error");
-        assert_eq!(wire[1], 10, "BadAccess");
+        assert_xi_config_error(&wire, 10, 2, 57);
 
         let after = state
             .xi_devices
@@ -45975,6 +48060,10 @@ mod tests {
             .cloned()
             .expect("default still present");
         assert_eq!(before.data, after.data, "read-only value unchanged");
+        assert_eq!(xi_property_snapshot(&state), properties_before);
+        assert!(backend.started_device_configs.is_empty());
+        assert!(lane.is_empty());
+        assert!(pending.is_empty());
     }
 
     // -----------------------------------------------------------------
@@ -46313,11 +48402,14 @@ mod tests {
     }
 
     #[test]
-    fn t3_xi2_change_property_invalid_value_yields_bad_value_without_mutation() {
+    fn xi_config_completion_invalid_value_yields_bad_value_without_mutation() {
         let mut state = ServerState::new();
-        let mut peer = install_client(&mut state, 1);
+        let mut peer = install_capture_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
         seed_pointer_for_t3(&mut state);
+        let (mut inventory, _) = inventory_for_t3_source(&state);
+        let mut pending = crate::core_loop::run::PendingBackendRequests::default();
+        let mut lane = crate::core_loop::run::XiConfigLane::default();
         // Scroll Method Enabled is `OneHotOrNone { n: 3 }` — two bits set is illegal.
         let scroll_atom = state
             .atoms
@@ -46333,6 +48425,7 @@ mod tests {
             .get(&AtomId(scroll_atom))
             .cloned()
             .expect("scroll method seeded");
+        let properties_before = xi_property_snapshot(&state);
 
         let body = xi2_change_property_body(
             TEST_PHYSICAL_POINTER_ID,
@@ -46342,20 +48435,20 @@ mod tests {
             integer_atom,
             &[1, 1, 0],
         );
-        handle_xi2_request(
+        drive_t3_config_wire_request(
             &mut state,
+            &mut peer,
             &mut backend,
-            None,
-            ClientId(1),
-            SequenceNumber(4),
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            1,
+            4,
             xi2_header(57),
             &body,
-        )
-        .unwrap();
+        );
         let wire = read_all_available(&mut peer);
-        assert_eq!(wire.len(), 32, "error packet");
-        assert_eq!(wire[0], 0, "X_Error");
-        assert_eq!(wire[1], 2, "BadValue");
+        assert_xi_config_error(&wire, 2, 4, 57);
 
         let after = state
             .xi_devices
@@ -46370,6 +48463,10 @@ mod tests {
             before.data, after.data,
             "registry untouched when validation rejects the value"
         );
+        assert_eq!(xi_property_snapshot(&state), properties_before);
+        assert!(backend.started_device_configs.is_empty());
+        assert!(lane.is_empty());
+        assert!(pending.is_empty());
     }
 
     #[test]
