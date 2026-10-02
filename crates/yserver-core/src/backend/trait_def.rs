@@ -896,10 +896,9 @@ pub trait Backend {
         0
     }
 
-    /// Apply a decoded touchpad config change to the live input device
-    /// identified by `device_node`. `Ok` = applied (or nothing to apply
-    /// on this backend). `Err(Unsupported)` → BadMatch, `Err(Invalid)`
-    /// → BadValue.
+    /// Start applying a decoded libinput config change to the live input
+    /// source. `Applied` confirms synchronous application; `Pending(token)`
+    /// means the backend will report the actual setter result later.
     ///
     /// Default: no-op success — only backends that own a live libinput
     /// context write through to a device.
@@ -909,12 +908,15 @@ pub trait Backend {
     /// Returns `DeviceConfigError::Unsupported` when the setting isn't
     /// available on the addressed device, or `Invalid` when the value
     /// is out of range / not a legal one-hot.
-    fn apply_device_config(
+    fn start_device_config(
         &mut self,
-        _device_node: &str,
+        _source: crate::xinput::InputSourceId,
         _change: crate::xinput::libinput_props::DeviceConfigChange,
-    ) -> Result<(), crate::xinput::libinput_props::DeviceConfigError> {
-        Ok(())
+    ) -> Result<
+        crate::xinput::libinput_props::DeviceConfigStart,
+        crate::xinput::libinput_props::DeviceConfigError,
+    > {
+        Ok(crate::xinput::libinput_props::DeviceConfigStart::Applied)
     }
 
     /// Hand the backend a core-channel sender so backend-originated shutdowns

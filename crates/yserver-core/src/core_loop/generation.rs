@@ -70,6 +70,7 @@ pub(crate) fn is_session_scoped(message: &Message) -> bool {
 
         Message::HostInput(_)
         | Message::CrtcConfigReady
+        | Message::DeviceConfigResult { .. }
         | Message::Shutdown
         | Message::ResetRequested
         | Message::VtRelease

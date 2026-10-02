@@ -1051,9 +1051,8 @@ mod tests {
         );
     }
 
-    /// A process-lifetime source must not be restored by overwriting the
-    /// virtual XTEST pointer. Physical registry/property restoration is a
-    /// later migration stage.
+    /// Reset replays the live physical touchpad onto its registry-allocated
+    /// facet while leaving virtual XTEST pointer 4 independent.
     #[test]
     fn reset_generation_keeps_virtual_xtest_pointer_intact() {
         let mut state = ServerState::new();
@@ -1096,10 +1095,23 @@ mod tests {
         assert!(!slave.is_touchpad);
         assert!(slave.properties.contains_key(&state.xtest_device_atom));
         let tap = state.atoms.intern("libinput Tapping Enabled", true);
+        let holders = state
+            .xi_devices
+            .iter()
+            .filter(|device| device.properties.contains_key(&tap))
+            .map(|device| device.id)
+            .collect::<Vec<_>>();
+        println!(
+            "AtomId({}) is {} and is held by XI device maps {:?}",
+            tap.0,
+            state.atoms.name(tap).unwrap_or("<unknown>"),
+            holders
+        );
+        assert_eq!(state.atoms.name(tap), Some("libinput Tapping Enabled"));
         assert_eq!(
-            tap,
-            yserver_protocol::x11::AtomId(0),
-            "physical touchpad properties are not seeded on XTEST"
+            holders,
+            [6],
+            "the physical touchpad pointer facet owns the property"
         );
         assert!(!slave.properties.contains_key(&tap));
     }
@@ -1203,10 +1215,12 @@ mod tests {
 
         // A worker completion racing the reset arrives now.
         backend.ready_crtc_configs = vec![token];
+        let mut xi_config_lane = crate::core_loop::run::XiConfigLane::default();
         drain_ready_crtc_configs(
             &mut state,
             &mut backend,
             &mut locals.pending_backend_requests,
+            &mut xi_config_lane,
             &mut ResetTrigger::new(ResetPolicy::NoReset),
         );
         assert!(

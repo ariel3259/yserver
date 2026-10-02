@@ -334,10 +334,16 @@ impl SendContext {
     /// from the inner [`Context::apply_device_config`].
     pub fn apply_device_config(
         &mut self,
-        device_node: &str,
+        source: InputSourceId,
         change: DeviceConfigChange,
     ) -> Result<(), DeviceConfigError> {
-        self.0.apply_device_config(device_node, change)
+        self.0.apply_device_config(source, change)
+    }
+
+    /// Whether a submitted command may wait for this source's proven
+    /// continuation during VT recovery.
+    pub(crate) fn can_wait_for_device_config(&self, source: InputSourceId) -> bool {
+        self.0.can_wait_for_device_config(source)
     }
 }
 
@@ -634,21 +640,26 @@ impl Context {
     /// [`DeviceConfigError::Invalid`] when the value is out of range.
     pub fn apply_device_config(
         &mut self,
-        device_node: &str,
+        source: InputSourceId,
         change: DeviceConfigChange,
     ) -> Result<(), DeviceConfigError> {
-        for (handle, (node, dev)) in &mut self.pointer_devices {
-            if node == device_node {
+        for (handle, (_, dev)) in &mut self.pointer_devices {
+            if self.sources.get(handle) == Some(source) {
                 libinput_config::apply(dev, change)?;
-                if let Some(source_id) = self.sources.get(handle)
-                    && let Some(info) = self.source_facts.get_mut(&source_id)
-                {
+                if let Some(info) = self.source_facts.get_mut(&source) {
                     info.config = libinput_config::gather(dev);
                 }
                 return Ok(());
             }
         }
-        Ok(())
+        Err(DeviceConfigError::SourceGone)
+    }
+
+    fn can_wait_for_device_config(&self, source: InputSourceId) -> bool {
+        self.resume_tracker
+            .paused
+            .get(&source)
+            .is_some_and(|info| info.resume_key.is_some())
     }
 }
 
