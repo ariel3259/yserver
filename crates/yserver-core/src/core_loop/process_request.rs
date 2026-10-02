@@ -1951,6 +1951,89 @@ fn expose_own_region(
     }
 }
 
+/// Xorg's `miWindowExposures` (`mi/miexpose.c:375-410`) for `region` of
+/// `window` (its content space): its background over the region when
+/// `paint` (unless None), and Expose events to the clients that selected
+/// them, one per rect with the count still to follow, or the extents
+/// alone past `RECTLIMIT` rects.
+fn send_window_exposures(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    window: ResourceId,
+    region: &[x11::xfixes::RegionRect],
+    paint: bool,
+) {
+    if region.is_empty() {
+        return;
+    }
+    if paint
+        && let Some(bg) = state.resources.window_resolved_background(window)
+        && let Some(target) = state.resources.host_drawable_target(window)
+    {
+        for r in region {
+            let _ = backend.clear_area(
+                origin,
+                target.host_xid(),
+                bg.background_pixel,
+                bg.background_pixmap_host_xid.map(|h| h.as_raw()),
+                r.x,
+                r.y,
+                r.width,
+                r.height,
+                bg.tile_origin_offset,
+            );
+            let _dropped = accumulate_damage_to_state(state, window, r.x, r.y, r.width, r.height);
+        }
+    }
+    if subscribers_by_id(state, window, 0x0000_8000).is_empty() {
+        return;
+    }
+    let extents;
+    let events = if region.len() > crate::core_loop::clip_list::RECTLIMIT {
+        extents = [crate::nested::region_extents(region)];
+        &extents[..]
+    } else {
+        region
+    };
+    let last = events.len() - 1;
+    for (i, r) in events.iter().enumerate() {
+        let count = u16::try_from(last - i).unwrap_or(u16::MAX);
+        let r = *r;
+        let _dropped = emit_window_event_to_state(state, window, 0x0000_8000, |buf, seq, order| {
+            x11::encode_expose_event(
+                buf,
+                seq,
+                order,
+                window,
+                u16::try_from(r.x).unwrap_or(0),
+                u16::try_from(r.y).unwrap_or(0),
+                r.width,
+                r.height,
+                count,
+            );
+        });
+    }
+}
+
+/// The Expose events of windows becoming viewable: each of `tops`, then
+/// its inferiors, a window before its children and children top-most
+/// first, each for its whole clip list (`miHandleValidateExposures`,
+/// `mi/miwindow.c`, after `miComputeClips` gives a newly viewable window
+/// its clip list as exposed). Their backgrounds are painted on realize.
+fn send_map_exposures(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    tops: &[ResourceId],
+) {
+    for top in tops {
+        for (w, region) in crate::core_loop::clip_list::subtree_clip_lists(state, *top) {
+            send_window_exposures(state, backend, origin, w, &region, false);
+        }
+    }
+}
+
 /// `window`'s content rect in its own content space, intersected with
 /// each ancestor's up to the nearest redirected one: what of it can be
 /// in a clip list at all, since a child's never leaves its parent's
@@ -27465,12 +27548,11 @@ fn handle_map_window(
         // Emit VisibilityNotify(Unobscured) then Expose on the window
         // itself when it becomes viewable. Subscribed clients want the
         // newly-viewable window to redraw.
-        let extents = state
+        let viewable = state
             .resources
             .window(window)
-            .filter(|w| w.map_state == crate::resources::MapState::Viewable)
-            .map(|w| (w.width, w.height));
-        if let Some((w, h)) = extents {
+            .is_some_and(|w| w.map_state == crate::resources::MapState::Viewable);
+        if viewable {
             // VisibilityNotify(Unobscured) for clients selecting
             // VisibilityChangeMask (0x10000). Under yserver's compositor
             // model every viewable top-level is effectively unobscured.
@@ -27498,11 +27580,7 @@ fn handle_map_window(
             // FF bug on bee. Order with the Expose subtree walk below
             // doesn't matter; both are subtree-wide and idempotent.
             let _dropped = emit_visibility_unobscured_subtree_to_state(state, window);
-            let _dropped =
-                emit_window_event_to_state(state, window, 0x0000_8000, |buf, seq, order| {
-                    x11::encode_expose_event(buf, seq, order, window, 0, 0, w, h, 0);
-                });
-            let _dropped = emit_expose_subtree_to_state(state, window);
+            send_map_exposures(state, backend, origin, &[window]);
         }
     }
     // Audit #11: Xorg's `miPaintWindow` fires damage on the window's
@@ -27600,11 +27678,11 @@ fn map_subwindows_with_delta(
         .map(|outcome| (outcome, delta));
     }
     let children: Vec<ResourceId> = state.resources.children(parent).to_vec();
+    let mut newly_viewable = Vec::new();
     for child in children {
         let transition = state.resources.map_window(child);
         let was_unmapped = transition.mapping_changed;
         let host_xid = state.resources.window(child).and_then(|w| w.host_xid);
-        let extents = state.resources.window(child).map(|w| (w.width, w.height));
         let override_redirect = state
             .resources
             .window(child)
@@ -27634,32 +27712,20 @@ fn map_subwindows_with_delta(
                     x11::encode_map_notify_event(buf, seq, order, parent, child, override_redirect);
                 });
         }
-        // Only emit Expose if the child is now Viewable (parent must
-        // also be mapped). When the parent is unmapped, mapping the
-        // child changes its `map_state` to `Mapped` but not `Viewable`,
-        // and the spec only fires Expose for newly-viewable areas.
+        // Only a child now Viewable (its parent mapped too) is exposed,
+        // with the descendants that mapping it promoted to Viewable.
         let viewable = state
             .resources
             .window(child)
             .is_some_and(|w| w.map_state == MapState::Viewable);
-        if was_unmapped
-            && viewable
-            && let Some((width, height)) = extents
-        {
-            let _dropped =
-                emit_window_event_to_state(state, child, 0x0000_8000, |buf, seq, order| {
-                    x11::encode_expose_event(buf, seq, order, child, 0, 0, width, height, 0);
-                });
-            // Mapping this child transitioned it Unmapped->Viewable, which
-            // also promotes any of its descendants that were sitting
-            // Unviewable (mapped while this ancestor was unmapped) to
-            // Viewable via the map_window cascade. Xorg fires Expose on
-            // every newly-viewable window; without this walk the promoted
-            // grandchildren never get their first Expose and never paint.
-            // Mirrors handle_map_window's emit_expose_subtree_to_state.
-            let _dropped = emit_expose_subtree_to_state(state, child);
+        if was_unmapped && viewable {
+            newly_viewable.push(child);
         }
     }
+    // Xorg maps them all, then validates and exposes once: top-most first,
+    // each clipped by the siblings mapped with it (`dix/window.c:2760-2775`).
+    newly_viewable.reverse();
+    send_map_exposures(state, backend, origin, &newly_viewable);
     // Xorg MapSubwindows: one WindowsRestructured after the batch
     // (`dix/window.c:2775`).
     backend.windows_restructured(state);
@@ -27695,6 +27761,15 @@ fn handle_unmap_window(
             );
         }
         let host_xid = state.resources.window(window).and_then(|w| w.host_xid);
+        let viewable_before = state
+            .resources
+            .window(window)
+            .is_some_and(|w| w.map_state == MapState::Viewable);
+        let clips_before = if viewable_before {
+            crate::core_loop::clip_list::clip_lists_under(state, window)
+        } else {
+            Vec::new()
+        };
         let transition = state.resources.unmap_window(window);
         let was_mapped = transition.mapping_changed;
         let parent = if was_mapped {
@@ -27741,6 +27816,16 @@ fn handle_unmap_window(
                 emit_window_event_to_state(state, parent, 0x0008_0000, |buf, seq, order| {
                     x11::encode_unmap_notify_event(buf, seq, order, parent, window, false);
                 });
+            // What it covered is exposed: its parent's and lower
+            // siblings' backgrounds painted there, and Expose sent
+            // (`UnmapWindow`, `dix/window.c:2856-2866`).
+            if viewable_before {
+                let after = crate::core_loop::clip_list::clip_lists_under(state, window);
+                for (w, region) in crate::core_loop::clip_list::newly_exposed(&clips_before, after)
+                {
+                    send_window_exposures(state, backend, origin, w, &region, true);
+                }
+            }
             // XI1: a device focus on a window that just became
             // unviewable reverts per its revert_to, emitting
             // DeviceFocusIn/Out (Xi/exevents.c
@@ -27807,6 +27892,7 @@ fn unmap_subwindows_with_delta(
     if parent == ROOT_WINDOW {
         children.retain(|child| *child != COMPOSITE_OVERLAY_WINDOW);
     }
+    let clip_before = crate::core_loop::clip_list::clip_list(state, parent);
     // Snapshot mapping order + collect host xids; unmap each in the
     // resource table.
     let mut pending: Vec<PendingUnmap> = Vec::new();
@@ -27833,6 +27919,12 @@ fn unmap_subwindows_with_delta(
     // Xorg frees each redirect pixmap at unrealize (`compwindow.c:291`).
     apply_viewability_delta_to_redirects(state, backend, origin, &delta);
     release_storage_for_delta(state, backend, origin, &delta);
+    // The parent is exposed where its children were (`dix/window.c:2925-2933`).
+    let gained = crate::core_loop::clip_list::subtract(
+        &crate::core_loop::clip_list::clip_list(state, parent),
+        &clip_before,
+    );
+    send_window_exposures(state, backend, origin, parent, &gained, true);
     crate::core_loop::xi1_focus::revert_unviewable_focus(state);
     revert_core_focus_if_unviewable(state);
     release_core_grabs_for_unviewable(state, backend);

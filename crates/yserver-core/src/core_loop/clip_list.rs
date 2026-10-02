@@ -234,6 +234,90 @@ fn clip_list_from(
     region
 }
 
+/// The clip lists of `w` and every viewable window inside it, in the order
+/// Xorg delivers exposures (`miHandleValidateExposures`, `mi/miwindow.c`):
+/// a window before its children, children top-most first.
+pub(crate) fn subtree_clip_lists(
+    state: &ServerState,
+    w: ResourceId,
+) -> Vec<(ResourceId, Vec<RegionRect>)> {
+    let mut out = Vec::new();
+    let universe = not_clipped_by_children(state, w);
+    walk(state, w, universe, &mut out);
+    out
+}
+
+fn walk(
+    state: &ServerState,
+    w: ResourceId,
+    universe: Vec<RegionRect>,
+    out: &mut Vec<(ResourceId, Vec<RegionRect>)>,
+) {
+    if !viewable(state, w) {
+        return;
+    }
+    let children: Vec<ResourceId> = state.resources.children(w).iter().rev().copied().collect();
+    let child_universes: Vec<(ResourceId, Vec<RegionRect>)> = children
+        .iter()
+        .map(|c| (*c, child_universe(state, &universe, w, *c)))
+        .collect();
+    out.push((w, clip_list_from(state, w, universe)));
+    for (c, u) in child_universes {
+        walk(state, c, u, out);
+    }
+}
+
+/// The clip lists unmapping `w` can grow, before or after it: its
+/// parent's and those of the siblings stacked under it that it overlaps,
+/// with their subtrees, in exposure order (`UnmapWindow` validates and
+/// exposes from the parent, `dix/window.c:2856-2866`).
+pub(crate) fn clip_lists_under(
+    state: &ServerState,
+    w: ResourceId,
+) -> Vec<(ResourceId, Vec<RegionRect>)> {
+    let mut out = Vec::new();
+    let Some(parent) = state.resources.window(w).map(|win| win.parent) else {
+        return out;
+    };
+    let universe = not_clipped_by_children(state, parent);
+    out.push((parent, clip_list_from(state, parent, universe.clone())));
+    let footprint = border_size_in_parent(state, w);
+    let siblings = state.resources.children(parent);
+    let Some(at) = siblings.iter().position(|s| *s == w) else {
+        return out;
+    };
+    for s in siblings[..at].iter().rev() {
+        if intersect(&border_size_in_parent(state, *s), &footprint).is_empty() {
+            continue;
+        }
+        let u = child_universe(state, &universe, parent, *s);
+        walk(state, *s, u, &mut out);
+    }
+    out
+}
+
+/// Per window, what `after` shows that `before` did not: the exposures a
+/// change between the two makes, in `after`'s order.
+pub(crate) fn newly_exposed(
+    before: &[(ResourceId, Vec<RegionRect>)],
+    after: Vec<(ResourceId, Vec<RegionRect>)>,
+) -> Vec<(ResourceId, Vec<RegionRect>)> {
+    after
+        .into_iter()
+        .filter_map(|(w, region)| {
+            let old = before
+                .iter()
+                .find(|(b, _)| *b == w)
+                .map(|(_, r)| r.as_slice());
+            let gained = match old {
+                Some(old) => subtract(&region, old),
+                None => region,
+            };
+            (!gained.is_empty()).then_some((w, gained))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,5 +349,76 @@ mod tests {
             canonical(vec![r(40, 10, 70, 50), r(40, 40, 40, 60)]),
             vec![r(40, 10, 70, 50), r(40, 60, 40, 40)]
         );
+    }
+
+    fn window(
+        state: &mut ServerState,
+        id: u32,
+        parent: ResourceId,
+        geom: (i16, i16, u16, u16),
+        class: u16,
+    ) {
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(1),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(id),
+                parent,
+                x: geom.0,
+                y: geom.1,
+                width: geom.2,
+                height: geom.3,
+                border_width: 0,
+                class,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state
+            .resources
+            .window_mut(ResourceId(id))
+            .unwrap()
+            .map_state = MapState::Viewable;
+    }
+
+    /// MapWindow of tools/vng-scenarios/expose-probe.c's P, measured on
+    /// Xorg without a compositor: P at (-40,200) 300x200, children P1
+    /// (10,10 100x50), P2 (50,40 100x80) above it, an InputOnly P3 over
+    /// all of P and P4 (200,150 150x100). P's exposure is its part on the
+    /// screen less P1, P2 and P4 in pixman's seven rects, P1's what P2
+    /// leaves of it, and P3 none; children come top-most first.
+    #[test]
+    fn map_exposures_are_the_clip_lists_in_xorgs_order() {
+        let mut state = ServerState::with_geometry(1024, 768);
+        let (p, p1, p2, p3, p4) = (
+            0x0020_0100,
+            0x0020_0101,
+            0x0020_0102,
+            0x0020_0103,
+            0x0020_0104,
+        );
+        window(&mut state, p, ROOT_WINDOW, (-40, 200, 300, 200), 1);
+        window(&mut state, p1, ResourceId(p), (10, 10, 100, 50), 1);
+        window(&mut state, p2, ResourceId(p), (50, 40, 100, 80), 1);
+        window(&mut state, p3, ResourceId(p), (0, 0, 300, 200), 2);
+        window(&mut state, p4, ResourceId(p), (200, 150, 150, 100), 1);
+        let got = subtree_clip_lists(&state, ResourceId(p));
+        let ids: Vec<u32> = got.iter().map(|(w, _)| w.0).collect();
+        assert_eq!(ids, vec![p, p4, p2, p1], "P3 is InputOnly");
+        assert_eq!(
+            got[0].1,
+            vec![
+                r(40, 0, 260, 10),
+                r(110, 10, 190, 30),
+                r(150, 40, 150, 20),
+                r(40, 60, 10, 60),
+                r(150, 60, 150, 60),
+                r(40, 120, 260, 30),
+                r(40, 150, 160, 50),
+            ]
+        );
+        assert_eq!(got[1].1, vec![r(0, 0, 100, 50)]);
+        assert_eq!(got[2].1, vec![r(0, 0, 100, 80)]);
+        assert_eq!(got[3].1, vec![r(30, 0, 70, 30), r(30, 30, 10, 20)]);
     }
 }
