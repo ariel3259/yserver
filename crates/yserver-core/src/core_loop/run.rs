@@ -1920,7 +1920,11 @@ pub fn run_core(
             // commit retry). `Duration::ZERO` keeps mio returning
             // immediately when a deadline is already due.
             let now = Instant::now();
-            let repeat_deadline = state.repeat_state.as_ref().map(|r| r.next_fire);
+            let repeat_deadline = state
+                .key_repeats
+                .values()
+                .map(|repeat| repeat.next_fire)
+                .min();
             let backend_deadline = backend.next_wakeup();
             let dpms_deadline = state.dpms_transition_deadline();
             let ss_idle_deadline = state.screensaver_idle_deadline();
@@ -2381,7 +2385,7 @@ pub fn run_core(
         // elapsed (either because the poll woke on the timeout, or
         // because an unrelated event arrived after the deadline),
         // fan out a synthetic KeyRelease+KeyPress pair.
-        if state.repeat_state.is_some() {
+        if !state.key_repeats.is_empty() {
             // Only poke the compositor when a repeat actually fired.
             // `fire_pending_repeats` returns false when the armed key
             // is merely not-yet-due (the common case every iteration
@@ -3765,51 +3769,53 @@ pub fn handle_host_input(state: &mut ServerState, backend: &mut dyn Backend, ev:
     backend.on_host_input(state, ev);
 }
 
-/// Arm / refresh / clear `state.repeat_state` from an incoming host
-/// input event. X11 spec: only the most recently pressed key
-/// repeats — pressing a different key replaces the armed key;
-/// releasing the armed key clears it; releases of other keys are
-/// ignored. Non-key events don't affect repeat state.
+/// Arm / refresh / clear repeat state for the origin of an incoming host
+/// input event. Each keyboard view has one current repeat key, matching
+/// Xorg's per-device XKB repeat state: a key press from another keyboard
+/// cannot replace it. A matching release clears that origin's timer.
 fn update_repeat_state(state: &mut ServerState, ev: &HostInputEvent) {
-    use crate::core_loop::message::HostInputEvent::Key;
+    use crate::core_loop::{
+        InputOrigin,
+        message::HostInputEvent::{DeviceRemoved, DeviceSuspended, Key},
+    };
     let Key(key) = ev else {
+        let source_id = match ev {
+            DeviceRemoved { source_id } | DeviceSuspended { source_id } => *source_id,
+            _ => return,
+        };
+        state.key_repeats.remove(&InputOrigin::Physical(source_id));
         return;
     };
-    if crate::core_loop::key_fanout::keyboard_origin_is_floating(state, key.origin) {
-        if state.repeat_state.is_some_and(|repeat| {
-            repeat.event.origin == key.origin && repeat.event.keycode == key.keycode
-        }) {
-            state.repeat_state = None;
-        }
+    if !crate::core_loop::key_fanout::keyboard_origin_is_live(state, key.origin) {
+        state.key_repeats.remove(&key.origin);
         return;
     }
     if key.pressed {
-        let synthetic = state
-            .repeat_state
-            .as_ref()
-            .is_some_and(|r| r.event.keycode == key.keycode && r.event.pressed);
-        if synthetic {
-            // This is a repeat we just fired; don't reset the timer.
+        if crate::core_loop::key_fanout::keyboard_key_is_down(state, key.origin, key.keycode) {
+            // A duplicate press is not a new XKB press and does not restart
+            // this origin's repeat delay.
             return;
         }
-        // ChangeKeyboardControl gate: global auto-repeat off disables
-        // all repeat; otherwise the per-key bitmap decides. A
-        // non-repeating press still replaces (disarms) the armed key —
-        // only the most recently pressed key may repeat.
+        // ChangeKeyboardControl gate: global auto-repeat off disables all
+        // repeat; otherwise the per-key bitmap decides. A non-repeating key
+        // replaces the current repeat key for this origin only.
         if !state.keyboard_control.key_auto_repeats(key.keycode) {
-            state.repeat_state = None;
+            state.key_repeats.remove(&key.origin);
             return;
         }
-        state.repeat_state = Some(KeyRepeatState {
-            event: *key,
-            next_fire: Instant::now() + REPEAT_INITIAL_DELAY,
-        });
+        state.key_repeats.insert(
+            key.origin,
+            KeyRepeatState {
+                event: *key,
+                next_fire: Instant::now() + REPEAT_INITIAL_DELAY,
+            },
+        );
     } else if state
-        .repeat_state
-        .as_ref()
-        .is_some_and(|r| r.event.keycode == key.keycode)
+        .key_repeats
+        .get(&key.origin)
+        .is_some_and(|repeat| repeat.event.keycode == key.keycode)
     {
-        state.repeat_state = None;
+        state.key_repeats.remove(&key.origin);
     }
 }
 
@@ -3828,39 +3834,70 @@ fn update_repeat_state(state: &mut ServerState, ev: &HostInputEvent) {
 /// key is held (or while a phantom key is stuck armed) busy-spins the
 /// compositor at the iteration rate instead of the repeat rate
 /// (idle free-run, [[project_idle_compositor_redraw_loop]] cut 2a).
-fn fire_pending_repeats(state: &mut ServerState, backend: &mut dyn Backend) -> bool {
-    let Some(armed) = state.repeat_state else {
-        return false;
-    };
-    if crate::core_loop::key_fanout::keyboard_origin_is_floating(state, armed.event.origin) {
-        state.repeat_state = None;
-        return false;
+pub fn fire_pending_repeats(state: &mut ServerState, backend: &mut dyn Backend) -> bool {
+    let mut origins: Vec<_> = state.key_repeats.keys().copied().collect();
+    origins.sort_by_key(|origin| match origin {
+        crate::core_loop::InputOrigin::Physical(source) => (0, source.0),
+        crate::core_loop::InputOrigin::XTest(device_id) => (1, u64::from(*device_id)),
+        crate::core_loop::InputOrigin::NestedHost => (2, 0),
+    });
+
+    // A drained source may lose its held key before its timer fires. Do not
+    // synthesize a new press for that key; the origin's held set is the
+    // authority for whether repeat remains active.
+    let stale_origins: Vec<_> = origins
+        .iter()
+        .copied()
+        .filter(|origin| {
+            let Some(armed) = state.key_repeats.get(origin) else {
+                return true;
+            };
+            !crate::core_loop::key_fanout::keyboard_origin_is_live(state, *origin)
+                || !crate::core_loop::key_fanout::keyboard_key_is_down(
+                    state,
+                    *origin,
+                    armed.event.keycode,
+                )
+                || !state.keyboard_control.key_auto_repeats(armed.event.keycode)
+        })
+        .collect();
+    for origin in stale_origins {
+        state.key_repeats.remove(&origin);
     }
-    // Repeat may have been disabled (ChangeKeyboardControl) after the
-    // key was armed — disarm instead of firing.
-    if !state.keyboard_control.key_auto_repeats(armed.event.keycode) {
-        state.repeat_state = None;
-        return false;
-    }
+
     let now = Instant::now();
-    if now < armed.next_fire {
+    let due: Vec<_> = origins
+        .into_iter()
+        .filter_map(|origin| {
+            state
+                .key_repeats
+                .get(&origin)
+                .filter(|armed| armed.next_fire <= now)
+                .copied()
+                .map(|armed| (origin, armed))
+        })
+        .collect();
+    if due.is_empty() {
         return false;
     }
-    let mut next_fire = armed.next_fire;
-    while now >= next_fire {
-        next_fire += REPEAT_PERIOD;
+
+    for (origin, armed) in due {
+        let mut next_fire = armed.next_fire;
+        while now >= next_fire {
+            next_fire += REPEAT_PERIOD;
+        }
+        // Update the timer first so any reentrant arming during fan-out
+        // doesn't double-fire.
+        if let Some(repeat) = state.key_repeats.get_mut(&origin) {
+            repeat.next_fire = next_fire;
+        }
+        let mut release = armed.event;
+        release.pressed = false;
+        let mut press = armed.event;
+        press.pressed = true;
+        backend.on_host_input(state, HostInputEvent::KeyRepeat(release));
+        backend.on_host_input(state, HostInputEvent::KeyRepeat(press));
     }
-    // Update the timer first so any reentrant arming during fan-out
-    // doesn't double-fire.
-    if let Some(s) = state.repeat_state.as_mut() {
-        s.next_fire = next_fire;
-    }
-    let mut release = armed.event;
-    release.pressed = false;
-    let mut press = armed.event;
-    press.pressed = true;
-    backend.on_host_input(state, HostInputEvent::KeyRepeat(release));
-    backend.on_host_input(state, HostInputEvent::KeyRepeat(press));
     true
 }
 
@@ -5982,26 +6019,34 @@ mod tests {
 
         // Press A → armed on A.
         handle_host_input(&mut state, &mut backend, key(38, true));
-        let armed = state.repeat_state.expect("press should arm repeat_state");
+        let armed = state
+            .key_repeats
+            .get(&crate::core_loop::InputOrigin::NestedHost)
+            .expect("press should arm repeat state for NestedHost");
         assert_eq!(armed.event.keycode, 38);
         assert!(armed.event.pressed);
 
         // Press B (different keycode) → replaces armed key.
         handle_host_input(&mut state, &mut backend, key(39, true));
-        let armed = state.repeat_state.expect("second press should re-arm");
+        let armed = state
+            .key_repeats
+            .get(&crate::core_loop::InputOrigin::NestedHost)
+            .expect("second press should replace the same origin's repeat");
         assert_eq!(armed.event.keycode, 39);
 
         // Release A while B is armed → ignored (only the armed key's
         // release clears).
         handle_host_input(&mut state, &mut backend, key(38, false));
         assert!(
-            state.repeat_state.is_some(),
+            state
+                .key_repeats
+                .contains_key(&crate::core_loop::InputOrigin::NestedHost),
             "release of non-armed key must not clear",
         );
 
         // Release B → clears.
         handle_host_input(&mut state, &mut backend, key(39, false));
-        assert!(state.repeat_state.is_none());
+        assert!(state.key_repeats.is_empty());
     }
 
     /// Regression guard for the idle free-run fix (cut 2a): the caller
@@ -6039,7 +6084,25 @@ mod tests {
                 state: 0,
             }),
         );
-        assert!(state.repeat_state.is_some());
+        assert!(
+            state
+                .key_repeats
+                .contains_key(&crate::core_loop::InputOrigin::NestedHost)
+        );
+        let transition = crate::core_loop::key_fanout::key_transition_status(
+            &state,
+            crate::core_loop::InputOrigin::NestedHost,
+            38,
+            true,
+        )
+        .expect("NestedHost has a master keyboard");
+        crate::core_loop::key_fanout::commit_key_transition(
+            &mut state,
+            crate::core_loop::InputOrigin::NestedHost,
+            38,
+            true,
+            transition,
+        );
 
         // Freshly armed → `next_fire` is INITIAL_DELAY in the future →
         // NOT due → must return false (the idle busy-spin case).
@@ -6049,7 +6112,10 @@ mod tests {
         );
 
         // Force the deadline into the past → must fire.
-        if let Some(s) = state.repeat_state.as_mut() {
+        if let Some(s) = state
+            .key_repeats
+            .get_mut(&crate::core_loop::InputOrigin::NestedHost)
+        {
             s.next_fire = Instant::now() - Duration::from_millis(1);
         }
         assert!(
@@ -6087,7 +6153,24 @@ mod tests {
                 state: 0,
             }),
         );
-        if let Some(s) = state.repeat_state.as_mut() {
+        let transition = crate::core_loop::key_fanout::key_transition_status(
+            &state,
+            crate::core_loop::InputOrigin::NestedHost,
+            38,
+            true,
+        )
+        .expect("NestedHost has a master keyboard");
+        crate::core_loop::key_fanout::commit_key_transition(
+            &mut state,
+            crate::core_loop::InputOrigin::NestedHost,
+            38,
+            true,
+            transition,
+        );
+        if let Some(s) = state
+            .key_repeats
+            .get_mut(&crate::core_loop::InputOrigin::NestedHost)
+        {
             s.next_fire = Instant::now() - Duration::from_millis(1);
         }
         assert!(fire_pending_repeats(&mut state, &mut backend));
@@ -6116,6 +6199,20 @@ mod tests {
                     repeat: true,
                 },
             ]
+        );
+        let transition = crate::core_loop::key_fanout::key_transition_status(
+            &state,
+            crate::core_loop::InputOrigin::NestedHost,
+            38,
+            true,
+        )
+        .expect("NestedHost has a master keyboard");
+        crate::core_loop::key_fanout::commit_key_transition(
+            &mut state,
+            crate::core_loop::InputOrigin::NestedHost,
+            38,
+            true,
+            transition,
         );
     }
 

@@ -633,6 +633,10 @@ pub fn process_batch(
     Ok(())
 }
 
+fn reset_hotkeys_after_vt_pause(state: &mut LibinputThreadState) {
+    state.hotkey.reset();
+}
+
 /// Long-running libinput thread body. Owns `input_ctx`, drives an
 /// `epoll` set on its fd, dispatches batches through [`process_batch`],
 /// and flushes any leftover pending motion at the end of each batch so
@@ -897,7 +901,7 @@ pub(crate) fn run(
                         resume_retry_window = None;
                         hotplug_retry_until = None;
                         pending_motion = None;
-                        state.hotkey.reset();
+                        reset_hotkeys_after_vt_pause(&mut state);
                         true
                     }
                     InputThreadCommand::Resume if paused => match input_ctx.resume() {
@@ -1802,6 +1806,54 @@ mod tests {
             collected.iter().any(|m| matches!(m, Message::Shutdown)),
             "right Ctrl + right Alt + Backspace must zap, got {collected:?}",
         );
+        drop(poll);
+    }
+
+    #[test]
+    fn vt_pause_clears_hotkeys_without_forwarding_key_releases() {
+        let (poll, sender, rx) = channel().expect("channel");
+        let mut state = LibinputThreadState::new(800, 600);
+        let mut pending: Option<HostInputEvent> = None;
+        let other_source = InputSourceId(2);
+        state.hotkey.check(&InputEvent::KeyPress {
+            source_id: other_source,
+            keycode: LINUX_KEY_LEFTCTRL,
+        });
+        state.hotkey.check(&InputEvent::KeyPress {
+            source_id: other_source,
+            keycode: LINUX_KEY_LEFTALT,
+        });
+
+        process_batch(
+            &mut state,
+            &sender,
+            &mut pending,
+            [InputEvent::DeviceSuspended {
+                source_id: TEST_SOURCE_ID,
+            }],
+            0,
+        )
+        .unwrap();
+        // This is the reset performed by the production Pause command after
+        // forwarding the suspend lifecycle batch.
+        reset_hotkeys_after_vt_pause(&mut state);
+
+        assert_eq!(
+            state.hotkey.check(&InputEvent::KeyPress {
+                source_id: other_source,
+                keycode: 60,
+            }),
+            None,
+            "a bare F2 after VT pause must not inherit Ctrl+Alt",
+        );
+        let messages: Vec<_> = rx.try_recv_all().collect();
+        assert_eq!(messages.len(), 1, "pause only forwards suspend lifecycle");
+        assert!(matches!(
+            messages.as_slice(),
+            [Message::HostInput(HostInputEvent::DeviceSuspended { source_id })]
+                if *source_id == TEST_SOURCE_ID
+        ));
+        assert!(state.scroll_accum_by_source.is_empty());
         drop(poll);
     }
 

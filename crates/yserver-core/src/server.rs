@@ -1316,13 +1316,11 @@ pub struct ServerState {
     /// from the backend at startup. Space-separated, libglvnd priority
     /// order.
     pub glx_vendor_names: String,
-    /// Server-side key auto-repeat state. Set to `Some` while a key
-    /// is held; cleared on the matching release or replaced when a
-    /// different key is pressed (X11 spec: only the most recently
-    /// pressed key repeats). The core loop's poll uses
-    /// `repeat_state.next_fire` to compute its wake-up timeout so an
-    /// idle server still costs zero CPU.
-    pub repeat_state: Option<KeyRepeatState>,
+    /// Server-side key auto-repeat state, keyed by the originating XI
+    /// keyboard view. A key press on another keyboard cannot replace this
+    /// device's repeat. The core loop's poll uses the earliest `next_fire`
+    /// to compute its wake-up timeout so an idle server still costs zero CPU.
+    pub key_repeats: HashMap<crate::core_loop::InputOrigin, KeyRepeatState>,
     /// Global DPMS extension state (power management).
     pub dpms: DpmsState,
     /// MIT-SCREEN-SAVER extension state.
@@ -1439,12 +1437,11 @@ pub struct ServerState {
     pub float_atom: AtomId,
 }
 
-/// Server-side key auto-repeat. Carries the original `HostKeyEvent`
-/// so synthetic repeat events can re-use its time/state/coord
-/// fields when fan-out runs, plus the `Instant` at which the next
-/// repeat should fire. Per-key delay/rate overrides aren't tracked
-/// today — `core_loop::run` uses the X11 defaults (660 ms initial,
-/// 40 ms period ≈ 25 Hz).
+/// Server-side key auto-repeat for one input origin. Carries the original
+/// `HostKeyEvent` so synthetic repeat events retain source, state, and
+/// coordinates, plus the `Instant` at which the next repeat should fire.
+/// Per-key delay/rate overrides aren't tracked today — `core_loop::run` uses
+/// the X11 defaults (660 ms initial, 40 ms period ≈ 25 Hz).
 #[derive(Clone, Copy, Debug)]
 pub struct KeyRepeatState {
     pub event: crate::host_x11::HostKeyEvent,
@@ -1755,7 +1752,7 @@ impl ServerState {
             sync_awaits: HashMap::new(),
             record: crate::core_loop::record::RecordState::default(),
             sync_servertime_last: None,
-            repeat_state: None,
+            key_repeats: HashMap::new(),
             dpms: DpmsState::new(false),
             screensaver: ScreenSaverState::new(),
             keyboard_control: KeyboardControlState::new(),

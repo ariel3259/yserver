@@ -20315,6 +20315,7 @@ impl Backend for KmsBackend {
             }
             HostInputEvent::DeviceSuspended { source_id } => {
                 log::info!("xi-device: suspended source={}", source_id.0);
+                state.key_repeats.remove(&InputOrigin::Physical(source_id));
                 if let Some(mut info) = state.xi_devices.source(source_id).cloned() {
                     info.enabled = false;
                     let _ = state.xi_devices.register(&info);
@@ -20323,6 +20324,7 @@ impl Backend for KmsBackend {
             }
             HostInputEvent::DeviceRemoved { source_id } => {
                 log::info!("xi-device: removed source={}", source_id.0);
+                state.key_repeats.remove(&InputOrigin::Physical(source_id));
                 yserver_core::core_loop::pointer_fanout::xi_cleanup_source(state, self, source_id);
                 self.synchronize_floating_keyboard_states(state);
                 return;
@@ -38492,7 +38494,7 @@ mod tests {
         }
         assert!(backend.core.down_keys.is_empty());
         assert!(state.keys_down.iter().all(|byte| *byte == 0));
-        assert!(state.repeat_state.is_none());
+        assert!(state.key_repeats.is_empty());
         assert!(state.sync_pending.is_empty());
         assert!(state.xi_devices.source(RETIRED).is_none());
         assert!(state.xi_devices.source(RAZER).is_some());
@@ -40988,6 +40990,373 @@ mod tests {
     }
 
     #[test]
+    fn key_source_selection_repeat_after_another_keyboard_becomes_active() {
+        use yserver_core::{
+            core_loop::{DeviceInfo, HostInputEvent, InputOrigin, message::LibinputConfigSnapshot},
+            host_x11::HostKeyEvent,
+            server::ServerState,
+            xinput::{InputCapabilities, InputSourceId, XiFacetKind},
+        };
+
+        const A: InputSourceId = InputSourceId(0xA31);
+        const B: InputSourceId = InputSourceId(0xA32);
+
+        let mut backend = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        for (source_id, name) in [(A, "Keyboard A"), (B, "Keyboard B")] {
+            backend.on_host_input(
+                &mut state,
+                HostInputEvent::DeviceAdded(DeviceInfo {
+                    source_id,
+                    enabled: true,
+                    resume_key: None,
+                    capabilities: InputCapabilities {
+                        keyboard: true,
+                        pointer: false,
+                        touch: false,
+                    },
+                    name: name.to_owned(),
+                    device_node: format!("/dev/input/{name}"),
+                    sysname: name.to_owned(),
+                    vendor_id: 0,
+                    product_id: 0,
+                    is_touchpad: false,
+                    config: LibinputConfigSnapshot::default(),
+                }),
+            );
+        }
+        let a_id = state
+            .xi_devices
+            .facet(A, XiFacetKind::Keyboard)
+            .expect("Keyboard A facet");
+        let b_id = state
+            .xi_devices
+            .facet(B, XiFacetKind::Keyboard)
+            .expect("Keyboard B facet");
+        let key = |source_id, keycode, pressed| {
+            HostInputEvent::Key(HostKeyEvent {
+                origin: InputOrigin::Physical(source_id),
+                pressed,
+                keycode,
+                time: 0,
+                root_x: 0,
+                root_y: 0,
+                event_x: 0,
+                event_y: 0,
+                state: 0,
+            })
+        };
+
+        yserver_core::core_loop::run::handle_host_input(&mut state, &mut backend, key(A, 38, true));
+        yserver_core::core_loop::run::handle_host_input(&mut state, &mut backend, key(B, 39, true));
+
+        assert_eq!(
+            state
+                .key_repeats
+                .get(&InputOrigin::Physical(A))
+                .map(|repeat| repeat.event.origin),
+            Some(InputOrigin::Physical(A)),
+            "Keyboard B's activity must not steal Keyboard A's repeat attribution",
+        );
+        assert!(state.key_down_by_device[&a_id].contains_key(&38));
+        assert!(state.key_down_by_device[&b_id].contains_key(&39));
+        let forced_deadline = std::time::Instant::now() - std::time::Duration::from_millis(1);
+        state
+            .key_repeats
+            .get_mut(&InputOrigin::Physical(A))
+            .expect("Keyboard A repeat remains armed")
+            .next_fire = forced_deadline;
+        assert!(yserver_core::core_loop::run::fire_pending_repeats(
+            &mut state,
+            &mut backend,
+        ));
+        assert_eq!(
+            state.key_repeats[&InputOrigin::Physical(A)].event.origin,
+            InputOrigin::Physical(A),
+            "the repeat remains attributed to A after B becomes active",
+        );
+        assert!(state.key_repeats[&InputOrigin::Physical(A)].next_fire > forced_deadline);
+        assert_eq!(
+            state.key_repeats[&InputOrigin::Physical(B)].event.origin,
+            InputOrigin::Physical(B),
+            "B's independent repeat remains attributed to B",
+        );
+        assert!(
+            state.key_repeats.contains_key(&InputOrigin::Physical(B)),
+            "B's held key retains its own timer after A repeats",
+        );
+        assert_eq!(state.key_repeats.len(), 2);
+        assert_eq!(state.key_down_by_device.len(), 2);
+        assert_eq!(
+            state.key_down_by_device[&a_id]
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            [38],
+        );
+        assert_eq!(
+            state.key_down_by_device[&b_id]
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            [39],
+        );
+        assert_eq!(
+            backend.core.down_keys,
+            std::collections::HashSet::from([38, 39])
+        );
+        assert!(state.unpublished_keyboard_keys_down.is_empty());
+    }
+
+    #[test]
+    fn key_source_selection_repeat_stops_after_source_key_is_drained() {
+        use yserver_core::{
+            core_loop::{DeviceInfo, HostInputEvent, InputOrigin, message::LibinputConfigSnapshot},
+            host_x11::HostKeyEvent,
+            server::ServerState,
+            xinput::{InputCapabilities, InputSourceId, XiFacetKind},
+        };
+
+        const A: InputSourceId = InputSourceId(0xA34);
+        const B: InputSourceId = InputSourceId(0xA35);
+
+        let mut backend = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        for (source_id, name) in [(A, "Drain A"), (B, "Drain B")] {
+            backend.on_host_input(
+                &mut state,
+                HostInputEvent::DeviceAdded(DeviceInfo {
+                    source_id,
+                    enabled: true,
+                    resume_key: None,
+                    capabilities: InputCapabilities {
+                        keyboard: true,
+                        pointer: false,
+                        touch: false,
+                    },
+                    name: name.to_owned(),
+                    device_node: format!("/dev/input/{name}"),
+                    sysname: name.to_owned(),
+                    vendor_id: 0,
+                    product_id: 0,
+                    is_touchpad: false,
+                    config: LibinputConfigSnapshot::default(),
+                }),
+            );
+        }
+        let a_id = state
+            .xi_devices
+            .facet(A, XiFacetKind::Keyboard)
+            .expect("A keyboard facet");
+        let b_id = state
+            .xi_devices
+            .facet(B, XiFacetKind::Keyboard)
+            .expect("B keyboard facet");
+        let key = |source_id, keycode, pressed| {
+            HostInputEvent::Key(HostKeyEvent {
+                origin: InputOrigin::Physical(source_id),
+                pressed,
+                keycode,
+                time: 0,
+                root_x: 0,
+                root_y: 0,
+                event_x: 0,
+                event_y: 0,
+                state: 0,
+            })
+        };
+        yserver_core::core_loop::run::handle_host_input(&mut state, &mut backend, key(A, 38, true));
+        yserver_core::core_loop::run::handle_host_input(&mut state, &mut backend, key(B, 39, true));
+        backend.release_keyboard_source_keys(&mut state, A);
+        state
+            .key_repeats
+            .get_mut(&InputOrigin::Physical(A))
+            .expect("A repeat remains pending until the next timer check")
+            .next_fire = std::time::Instant::now() - std::time::Duration::from_millis(1);
+
+        assert!(!yserver_core::core_loop::run::fire_pending_repeats(
+            &mut state,
+            &mut backend,
+        ));
+        assert!(
+            !state.key_repeats.contains_key(&InputOrigin::Physical(A)),
+            "draining A's held key retires A's repeat",
+        );
+        assert!(state.key_repeats.contains_key(&InputOrigin::Physical(B)));
+        assert_eq!(state.key_repeats.len(), 1);
+        assert!(!state.key_down_by_device.contains_key(&a_id));
+        assert_eq!(state.key_down_by_device.len(), 1);
+        assert_eq!(
+            state
+                .key_down_by_device
+                .get(&b_id)
+                .map(|keys| keys.keys().copied().collect::<Vec<_>>()),
+            Some(vec![39]),
+            "B's held key remains untouched",
+        );
+        assert!(state.unpublished_keyboard_keys_down.is_empty());
+        assert!(!backend.core.down_keys.contains(&38));
+        assert!(backend.core.down_keys.contains(&39));
+    }
+
+    #[test]
+    fn key_source_selection_repeat_floating_keyboard_arms_slave_repeat() {
+        use yserver_core::{
+            core_loop::{DeviceInfo, HostInputEvent, InputOrigin, message::LibinputConfigSnapshot},
+            host_x11::HostKeyEvent,
+            resources::ROOT_WINDOW,
+            server::ServerState,
+            xinput::{InputCapabilities, InputSourceId, XiFacetKind},
+        };
+        use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
+
+        const SOURCE: InputSourceId = InputSourceId(0xA33);
+        const CLIENT: u32 = 8;
+
+        let mut backend = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        state.core_focus.raw = ROOT_WINDOW.0;
+        let mut peer = kbd_map_client_id(&mut state, CLIENT);
+        backend.on_host_input(
+            &mut state,
+            HostInputEvent::DeviceAdded(DeviceInfo {
+                source_id: SOURCE,
+                enabled: true,
+                resume_key: None,
+                capabilities: InputCapabilities {
+                    keyboard: true,
+                    pointer: false,
+                    touch: false,
+                },
+                name: "Floating keyboard".into(),
+                device_node: "/dev/input/floating".into(),
+                sysname: "floating".into(),
+                vendor_id: 0,
+                product_id: 0,
+                is_touchpad: false,
+                config: LibinputConfigSnapshot::default(),
+            }),
+        );
+        let device_id = state
+            .xi_devices
+            .facet(SOURCE, XiFacetKind::Keyboard)
+            .expect("keyboard facet");
+        state
+            .clients
+            .get_mut(&CLIENT)
+            .unwrap()
+            .xi2_masks
+            .insert((ROOT_WINDOW, device_id), (1 << 2) | (1 << 3));
+        state
+            .clients
+            .get_mut(&CLIENT)
+            .unwrap()
+            .xi2_masks
+            .insert((ROOT_WINDOW, 0), (1 << 2) | (1 << 3));
+        let mut grab = Vec::with_capacity(24);
+        grab.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        grab.extend_from_slice(&0u32.to_le_bytes());
+        grab.extend_from_slice(&0u32.to_le_bytes());
+        grab.extend_from_slice(&device_id.to_le_bytes());
+        grab.extend_from_slice(&[1, 1, 0, 0]);
+        grab.extend_from_slice(&1u16.to_le_bytes());
+        grab.extend_from_slice(&((1u32 << 2) | (1u32 << 3)).to_le_bytes());
+        yserver_core::core_loop::process_request::process_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 137,
+                data: 51,
+                length_units: 7,
+            },
+            &grab,
+            None,
+        )
+        .expect("exact keyboard grab floats this slave");
+        let _ = kbd_map_drain(&mut peer);
+        assert_eq!(
+            state.xi_devices.device(device_id).unwrap().attached_master,
+            None
+        );
+
+        yserver_core::core_loop::run::handle_host_input(
+            &mut state,
+            &mut backend,
+            HostInputEvent::Key(HostKeyEvent {
+                origin: InputOrigin::Physical(SOURCE),
+                pressed: true,
+                keycode: 38,
+                time: 0,
+                root_x: 0,
+                root_y: 0,
+                event_x: 0,
+                event_y: 0,
+                state: 0,
+            }),
+        );
+
+        assert_eq!(
+            state
+                .key_repeats
+                .get(&InputOrigin::Physical(SOURCE))
+                .map(|repeat| repeat.event.origin),
+            Some(InputOrigin::Physical(SOURCE)),
+            "a floating held key repeats in its slave view",
+        );
+        assert!(
+            backend.floating_keyboard_states[&device_id]
+                .down_keys
+                .contains(&38)
+        );
+        assert!(!backend.core.down_keys.contains(&38));
+        assert!(state.keys_down.iter().all(|byte| *byte == 0));
+        let master_modifiers = backend.serialize_modifiers();
+        let forced_deadline = std::time::Instant::now() - std::time::Duration::from_millis(1);
+        state
+            .key_repeats
+            .get_mut(&InputOrigin::Physical(SOURCE))
+            .expect("floating key has a source-local timer")
+            .next_fire = forced_deadline;
+        assert!(yserver_core::core_loop::run::fire_pending_repeats(
+            &mut state,
+            &mut backend,
+        ));
+        assert_eq!(
+            state.key_repeats[&InputOrigin::Physical(SOURCE)]
+                .event
+                .origin,
+            InputOrigin::Physical(SOURCE),
+            "a floating repeat stays attributed to its slave source",
+        );
+        assert!(state.key_repeats[&InputOrigin::Physical(SOURCE)].next_fire > forced_deadline);
+        assert!(
+            backend.floating_keyboard_states[&device_id]
+                .down_keys
+                .contains(&38)
+        );
+        assert!(!backend.core.down_keys.contains(&38));
+        assert!(state.keys_down.iter().all(|byte| *byte == 0));
+        assert_eq!(state.key_down_by_device.len(), 1);
+        assert_eq!(
+            state.key_down_by_device[&device_id]
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            [38]
+        );
+        assert_eq!(state.key_repeats.len(), 1);
+        assert!(state.unpublished_keyboard_keys_down.is_empty());
+        assert_eq!(backend.serialize_modifiers(), master_modifiers);
+        assert!(
+            state
+                .key_repeats
+                .contains_key(&InputOrigin::Physical(SOURCE))
+        );
+    }
+
+    #[test]
     fn xi_dynamic_grabs_floating_keyboard() {
         use yserver_core::{
             backend::Backend,
@@ -41179,8 +41548,10 @@ mod tests {
         send_key(&mut backend, &mut state, RAZER, A_KEY, true);
         razer_bytes.extend(kbd_map_drain(&mut grab_peer));
         assert!(
-            state.repeat_state.is_none(),
-            "a floating key cannot arm the master repeat timer",
+            state
+                .key_repeats
+                .contains_key(&yserver_core::core_loop::InputOrigin::Physical(RAZER)),
+            "a floating held key arms repeat for its slave view",
         );
         assert_eq!(backend.serialize_modifiers(), master_mods_before);
         assert_eq!(backend.current_led_bits(), master_leds_before);
@@ -41263,8 +41634,10 @@ mod tests {
             }
             send_key(&mut backend, &mut state, RAZER, A_KEY, true);
             assert!(
-                state.repeat_state.is_none(),
-                "a floating held key cannot arm the master repeat timer",
+                state
+                    .key_repeats
+                    .contains_key(&yserver_core::core_loop::InputOrigin::Physical(RAZER)),
+                "a floating held key arms repeat for its slave view",
             );
             send_key(&mut backend, &mut state, RAZER, A_KEY, false);
             assert_eq!(backend.serialize_modifiers(), master_mods_before);
@@ -41520,7 +41893,7 @@ mod tests {
         assert!(backend.core.down_keys.is_empty());
         assert!(state.keys_down.iter().all(|&byte| byte == 0));
         assert!(state.sync_pending.is_empty());
-        assert!(state.repeat_state.is_none());
+        assert!(state.key_repeats.is_empty());
         assert!(backend.floating_keyboard_states.is_empty());
         assert_eq!(backend.serialize_modifiers(), master_mods_before);
         assert_eq!(backend.current_led_bits(), master_leds_before);
