@@ -110,6 +110,164 @@ pub fn keyboard_origin_is_live(state: &ServerState, origin: crate::core_loop::In
     resolve_key_xi_source(state, origin).is_some()
 }
 
+/// The independently guarded state transition represented by one host key.
+/// A slave may accept its transition while the attached master suppresses a
+/// duplicate press or release.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyTransition {
+    pub device_accepted: bool,
+    pub master_accepted: bool,
+}
+
+/// Whether this origin currently holds `keycode` in its own XI keyboard view.
+/// For unpublished physical sources the equivalent internal source map is
+/// used; master-only origins use the core/master QueryKeymap bitmap.
+pub fn keyboard_key_is_down(
+    state: &ServerState,
+    origin: crate::core_loop::InputOrigin,
+    keycode: u8,
+) -> bool {
+    use crate::core_loop::InputOrigin;
+    let Some(source) = resolve_key_xi_source(state, origin) else {
+        return false;
+    };
+    match origin {
+        InputOrigin::Physical(source_id) if source.slave_deviceid.is_none() => state
+            .unpublished_keyboard_keys_down
+            .get(&source_id)
+            .is_some_and(|keys| keys.contains_key(&keycode)),
+        InputOrigin::Physical(_) | InputOrigin::XTest(_) if source.slave_deviceid.is_some() => {
+            state
+                .key_down_by_device
+                .get(&source.slave_deviceid.unwrap_or_default())
+                .is_some_and(|keys| keys.contains_key(&keycode))
+        }
+        InputOrigin::XTest(_) | InputOrigin::NestedHost => master_key_is_down(state, keycode),
+        InputOrigin::Physical(_) => false,
+    }
+}
+
+/// Check the generating keyboard guard independently from the attached
+/// master's down guard. The master release deliberately accepts the first
+/// valid release from any attached slave (Xi/exevents.c:922-943).
+pub fn key_transition_status(
+    state: &ServerState,
+    origin: crate::core_loop::InputOrigin,
+    keycode: u8,
+    pressed: bool,
+) -> Option<KeyTransition> {
+    use crate::core_loop::InputOrigin;
+    let source = resolve_key_xi_source(state, origin)?;
+    let device_was_down = match origin {
+        InputOrigin::Physical(source_id) if source.slave_deviceid.is_none() => state
+            .unpublished_keyboard_keys_down
+            .get(&source_id)
+            .is_some_and(|keys| keys.contains_key(&keycode)),
+        InputOrigin::Physical(_) | InputOrigin::XTest(_) if source.slave_deviceid.is_some() => {
+            state
+                .key_down_by_device
+                .get(&source.slave_deviceid.unwrap_or_default())
+                .is_some_and(|keys| keys.contains_key(&keycode))
+        }
+        InputOrigin::XTest(_) | InputOrigin::NestedHost => master_key_is_down(state, keycode),
+        InputOrigin::Physical(_) => false,
+    };
+    let device_accepted = pressed != device_was_down;
+    let master_accepted = match origin {
+        InputOrigin::Physical(_) if source.attached_master.is_some() => {
+            if pressed {
+                !master_key_is_down(state, keycode)
+            } else {
+                master_key_is_down(state, keycode)
+            }
+        }
+        InputOrigin::XTest(_) if source.slave_deviceid.is_some() => {
+            if pressed {
+                !master_key_is_down(state, keycode)
+            } else {
+                master_key_is_down(state, keycode)
+            }
+        }
+        InputOrigin::XTest(_) | InputOrigin::NestedHost if source.attached_master.is_some() => {
+            // Master-targeted XTEST and nested input have a single guard.
+            device_accepted
+        }
+        _ => false,
+    };
+    Some(KeyTransition {
+        device_accepted,
+        master_accepted,
+    })
+}
+
+/// Commit one accepted generating-device transition and, independently, an
+/// accepted master transition. Call only after `key_transition_status` has
+/// accepted the slave/device edge.
+pub fn commit_key_transition(
+    state: &mut ServerState,
+    origin: crate::core_loop::InputOrigin,
+    keycode: u8,
+    pressed: bool,
+    transition: KeyTransition,
+) {
+    use crate::core_loop::InputOrigin;
+    if !transition.device_accepted {
+        return;
+    }
+    let Some(source) = resolve_key_xi_source(state, origin) else {
+        return;
+    };
+    match origin {
+        InputOrigin::Physical(source_id) if source.slave_deviceid.is_none() => {
+            let keys = state
+                .unpublished_keyboard_keys_down
+                .entry(source_id)
+                .or_default();
+            if pressed {
+                keys.insert(keycode, origin);
+            } else {
+                keys.remove(&keycode);
+                if keys.is_empty() {
+                    state.unpublished_keyboard_keys_down.remove(&source_id);
+                }
+            }
+        }
+        InputOrigin::Physical(_) | InputOrigin::XTest(_) if source.slave_deviceid.is_some() => {
+            let device_id = source.slave_deviceid.unwrap_or_default();
+            let keys = state.key_down_by_device.entry(device_id).or_default();
+            if pressed {
+                keys.insert(keycode, origin);
+            } else {
+                keys.remove(&keycode);
+                if keys.is_empty() {
+                    state.key_down_by_device.remove(&device_id);
+                }
+            }
+        }
+        InputOrigin::XTest(_) | InputOrigin::NestedHost | InputOrigin::Physical(_) => {}
+    }
+
+    if transition.master_accepted {
+        set_master_key_down(state, keycode, pressed);
+    }
+}
+
+fn master_key_is_down(state: &ServerState, keycode: u8) -> bool {
+    let byte = usize::from(keycode / 8);
+    let bit = 1u8 << (keycode % 8);
+    state.keys_down[byte] & bit != 0
+}
+
+fn set_master_key_down(state: &mut ServerState, keycode: u8, pressed: bool) {
+    let byte = usize::from(keycode / 8);
+    let bit = 1u8 << (keycode % 8);
+    if pressed {
+        state.keys_down[byte] |= bit;
+    } else {
+        state.keys_down[byte] &= !bit;
+    }
+}
+
 /// Resolve the device-indexed grab/freeze key for an input origin.
 fn key_origin_device(
     state: &ServerState,
@@ -165,33 +323,37 @@ pub fn key_event_fanout_to_state(
     backend: &mut dyn crate::backend::Backend,
     event: HostKeyEvent,
 ) -> Vec<ClientId> {
+    let Some(transition) = key_transition_status(state, event.origin, event.keycode, event.pressed)
+    else {
+        return Vec::new();
+    };
+    if !transition.device_accepted {
+        return Vec::new();
+    }
+    commit_key_transition(
+        state,
+        event.origin,
+        event.keycode,
+        event.pressed,
+        transition,
+    );
+    key_event_fanout_after_transition(state, backend, event, transition.master_accepted)
+}
+
+/// Fan an already guarded host key transition out to clients. KMS calls this
+/// after it has updated its XKB state only when the master transition was
+/// accepted; queued replay paths retain the original transition decision.
+pub fn key_event_fanout_after_transition(
+    state: &mut ServerState,
+    backend: &mut dyn crate::backend::Backend,
+    event: HostKeyEvent,
+    master_transition_accepted: bool,
+) -> Vec<ClientId> {
     let Some(xi_source) = resolve_key_xi_source(state, event.origin) else {
         return Vec::new();
     };
     let device_id = xi_source.slave_deviceid.unwrap_or(xi_source.sourceid);
     let master_id = xi_source.attached_master;
-    // QueryKeymap bitmap — device key state tracks the physical
-    // event regardless of where (or whether) it gets delivered.
-    //
-    // NOTE: we deliberately do NOT reconstruct modifier state here and
-    // stamp it onto the event. The backend already cooks the
-    // authoritative xkb modifier state into `event.state`
-    // (`cook_host_key` → `serialize_modifiers`, and XTest fakes are
-    // cooked the same way via `on_host_input`). A second server-side
-    // tracker (keys_down × modifier-map) is a redundant source of
-    // truth that drifts from xkb — `synthesize_held_releases` on a
-    // VT-switch clears keys_down without touching xkb — and any
-    // `state == 0` override then clobbers every unmodified keypress
-    // with the stale modifier ("stuck Ctrl, can't type in wezterm").
-    if master_id.is_some() {
-        let byte = usize::from(event.keycode / 8);
-        let bit = 1u8 << (event.keycode % 8);
-        if event.pressed {
-            state.keys_down[byte] |= bit;
-        } else {
-            state.keys_down[byte] &= !bit;
-        }
-    }
     // DPMS: any key resets the idle timer; from any non-On level
     // we wake the screen *before* fanning out, so the first event
     // of the resumed session lands on a visible scanout.
@@ -273,12 +435,15 @@ pub fn key_event_fanout_to_state(
             .sync_pending
             .push_back(crate::server::PendingSyncEvent {
                 device: frozen_device,
-                event: crate::server::QueuedInputEvent::HostKey(event),
+                event: crate::server::QueuedInputEvent::HostKeyTransition(
+                    event,
+                    master_transition_accepted,
+                ),
             });
         return Vec::new();
     }
 
-    let dropped = deliver_routed_key(state, event);
+    let dropped = deliver_routed_key_with_master_status(state, event, master_transition_accepted);
 
     // XkbStateNotify (GH #59): libxkbcommon-x11 clients (kitty/GLFW, all
     // of Wayland's X11 path) keep their xkb_state synchronized ONLY from
@@ -331,10 +496,55 @@ pub fn key_event_fanout_to_state(
 /// callable without a backend so `xi1_compute_freezes` can replay
 /// withheld core keys on thaw.
 pub(crate) fn deliver_routed_key(state: &mut ServerState, event: HostKeyEvent) -> Vec<ClientId> {
+    deliver_routed_key_with_master_status(state, event, true)
+}
+
+pub(crate) fn deliver_routed_key_after_transition(
+    state: &mut ServerState,
+    event: HostKeyEvent,
+    master_transition_accepted: bool,
+) -> Vec<ClientId> {
+    deliver_routed_key_with_master_status(state, event, master_transition_accepted)
+}
+
+fn deliver_routed_key_with_master_status(
+    state: &mut ServerState,
+    event: HostKeyEvent,
+    master_transition_accepted: bool,
+) -> Vec<ClientId> {
     if !keyboard_origin_is_live(state, event.origin) {
         return Vec::new();
     }
-    let (device_id, _master_id) = key_origin_device(state, event.origin);
+    let (device_id, master_id) = key_origin_device(state, event.origin);
+    if !master_transition_accepted
+        && master_id == Some(XI2_MASTER_KEYBOARD_DEVICE_ID)
+        && device_id != XI2_MASTER_KEYBOARD_DEVICE_ID
+    {
+        // The slave pass remains independently deliverable even when the
+        // master guard rejected its copy. An exact slave grab owns this form;
+        // otherwise route the slave selection on the natural focus path.
+        if let Some(grab) = state.xi2_keyboard_grabs.get(&device_id).copied() {
+            let mut dropped = deliver_key_to_grab_owner(
+                state,
+                &event,
+                grab.owner,
+                grab.grab_window,
+                grab.via_xi2,
+                device_id,
+            );
+            merge_dropped(&mut dropped, deliver_xi1_focused_key(state, &event));
+            return dropped;
+        }
+        let focus = current_focus(state);
+        let mut dropped = if focus == ResourceId(0) {
+            Vec::new()
+        } else {
+            let target = focused_walk_target(state, focus, &event);
+            deliver_key_to_window(state, &event, target, false, false)
+        };
+        merge_dropped(&mut dropped, deliver_xi1_focused_key(state, &event));
+        return dropped;
+    }
     match key_route(state, &event) {
         // Core delivery has nowhere to go (focus on root, no grab) —
         // but the XI1 fanout routes by the extension keyboard's own
@@ -356,7 +566,10 @@ pub(crate) fn deliver_routed_key(state: &mut ServerState, event: HostKeyEvent) -
             // sync passive-button-grab freeze in `pointer_fanout`.
             if freeze && event.pressed {
                 state.xi1_frozen.entry(device_id).or_default().stored =
-                    Some(crate::server::QueuedInputEvent::HostKey(event));
+                    Some(crate::server::QueuedInputEvent::HostKeyTransition(
+                        event,
+                        master_transition_accepted,
+                    ));
             }
             // Xorg DeliverGrabbedEvent: with owner_events, key events
             // that would naturally land on one of the grab client's
@@ -393,7 +606,13 @@ pub(crate) fn deliver_routed_key(state: &mut ServerState, event: HostKeyEvent) -
             // focus) where a client selected the event — Xorg
             // DeliverFocusedEvent's pointer-walk leg.
             let target = focused_walk_target(state, window, &event);
-            let mut dropped = deliver_key_to_window(state, &event, target);
+            let mut dropped = deliver_key_to_window(
+                state,
+                &event,
+                target,
+                master_transition_accepted,
+                master_transition_accepted,
+            );
             merge_dropped(&mut dropped, deliver_xi1_focused_key(state, &event));
             dropped
         }
@@ -406,11 +625,28 @@ pub(crate) fn deliver_routed_key(state: &mut ServerState, event: HostKeyEvent) -
 /// after the grab owner declines the key. Mirrors Xorg
 /// `ComputeFreezes` → `DeliverFocusedEvent` (dix/events.c:1360).
 pub fn replay_frozen_key_to_focus(state: &mut ServerState, event: HostKeyEvent) -> Vec<ClientId> {
+    replay_frozen_key_to_focus_after_transition(state, event, true)
+}
+
+pub(crate) fn replay_frozen_key_to_focus_after_transition(
+    state: &mut ServerState,
+    event: HostKeyEvent,
+    master_transition_accepted: bool,
+) -> Vec<ClientId> {
+    if !keyboard_origin_is_live(state, event.origin) {
+        return Vec::new();
+    }
     let focus = current_focus(state);
     if focus == ResourceId(0) {
         return Vec::new();
     }
-    let mut dropped = deliver_key_to_window(state, &event, focus);
+    let mut dropped = deliver_key_to_window(
+        state,
+        &event,
+        focus,
+        master_transition_accepted,
+        master_transition_accepted,
+    );
     merge_dropped(&mut dropped, deliver_xi1_focused_key(state, &event));
     dropped
 }
@@ -423,6 +659,8 @@ fn deliver_key_to_window(
     state: &mut ServerState,
     event: &HostKeyEvent,
     target_window: ResourceId,
+    include_master_form: bool,
+    include_core_form: bool,
 ) -> Vec<ClientId> {
     let mask_bit = if event.pressed {
         KEY_PRESS_MASK
@@ -437,7 +675,10 @@ fn deliver_key_to_window(
     // core (XSelectInput KeyPressMask) and XI2 (XISelectEvents) — e.g.
     // Chromium's Ozone X11 layer — gets every keystroke twice.
     let xi2_evtype = xi2_evtype_for(event);
-    let forms = key_xi2_forms(state, event.origin);
+    let forms = key_xi2_forms(state, event.origin)
+        .into_iter()
+        .filter(|(device_id, _)| include_master_form || *device_id != XI2_MASTER_KEYBOARD_DEVICE_ID)
+        .collect::<Vec<_>>();
     let mut xi2_targets = Vec::new();
     for (device_id, _) in &forms {
         for (id, client) in &state.clients {
@@ -451,10 +692,14 @@ fn deliver_key_to_window(
 
     // Core KeyPress/KeyRelease to KeyPressMask/KeyReleaseMask subscribers,
     // excluding any client already getting the XI2 form above.
-    let core_targets: Vec<ClientId> = subscribers_by_id(state, target_window, mask_bit)
-        .into_iter()
-        .filter(|c| !xi2_targets.contains(c))
-        .collect();
+    let core_targets: Vec<ClientId> = if include_core_form {
+        subscribers_by_id(state, target_window, mask_bit)
+            .into_iter()
+            .filter(|c| !xi2_targets.contains(c))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut dropped = if core_targets.is_empty() {
         Vec::new()
     } else {
@@ -1055,20 +1300,24 @@ pub(crate) fn current_focus(state: &ServerState) -> ResourceId {
 /// `DeliverFocusedEvent`); grab/freeze handling inside
 /// `xi1_route_device_event` is unaffected by the focus.
 fn deliver_xi1_focused_key(state: &mut ServerState, event: &HostKeyEvent) -> Vec<ClientId> {
+    let Some(device_id) =
+        resolve_key_xi_source(state, event.origin).and_then(|source| source.slave_deviceid)
+    else {
+        // Nested and unpublished origins have no XI1 slave form; in
+        // particular they must not be relabeled as virtual XTEST keyboard 5.
+        return Vec::new();
+    };
     let xi1_offset = if event.pressed {
         crate::xinput::XI_DEVICE_KEY_PRESS_OFFSET
     } else {
         crate::xinput::XI_DEVICE_KEY_RELEASE_OFFSET
     };
     let evcode = crate::server::XI_FIRST_EVENT + xi1_offset;
-    let (natural, focus_route) = crate::core_loop::xi1_focus::key_delivery_route(
-        state,
-        crate::xinput::DEVICEID_SLAVE_KEYBOARD,
-    );
+    let (natural, focus_route) = crate::core_loop::xi1_focus::key_delivery_route(state, device_id);
     crate::core_loop::pointer_fanout::xi1_route_device_event(
         state,
         crate::server::Xi1QueuedEvent {
-            deviceid: crate::xinput::DEVICEID_SLAVE_KEYBOARD,
+            deviceid: device_id,
             evcode,
             detail: event.keycode,
             time: event.time,

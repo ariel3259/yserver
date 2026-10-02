@@ -20997,6 +20997,16 @@ fn handle_xi2_request(
                                 crate::server::QueuedInputEvent::HostKey(event) => {
                                     let _ = replay_frozen_key_to_focus(state, event);
                                 }
+                                crate::server::QueuedInputEvent::HostKeyTransition(
+                                    event,
+                                    master_transition_accepted,
+                                ) => {
+                                    let _ = crate::core_loop::key_fanout::replay_frozen_key_to_focus_after_transition(
+                                        state,
+                                        event,
+                                        master_transition_accepted,
+                                    );
+                                }
                                 // Only a device event activates a grab, so
                                 // the stored slot never holds a raw event;
                                 // processing one is plain master delivery.
@@ -28708,6 +28718,25 @@ fn apply_xi2_allow_events_for_slave(
                         state, backend, &xid_map, event,
                     );
             }
+        } else if let Some(crate::server::QueuedInputEvent::HostKeyTransition(
+            event,
+            master_transition_accepted,
+        )) = stored
+        {
+            if state
+                .xi2_keyboard_grabs
+                .get(&device_id)
+                .is_some_and(|grab| grab.owner == client_id)
+            {
+                state.xi2_keyboard_grabs.remove(&device_id);
+                state.reattach_xi2_slave(device_id);
+            }
+            let _dropped =
+                crate::core_loop::key_fanout::replay_frozen_key_to_focus_after_transition(
+                    state,
+                    event,
+                    master_transition_accepted,
+                );
         } else if let Some(crate::server::QueuedInputEvent::HostKey(event)) = stored {
             if state
                 .xi2_keyboard_grabs
@@ -28936,7 +28965,10 @@ fn apply_allow_events(
     // must not replay it and consume the allowance intended for the next
     // physical key event.
     if mode == 4
-        && let Some(crate::server::QueuedInputEvent::HostKey(event)) = frozen_keyboard.as_ref()
+        && let Some(
+            crate::server::QueuedInputEvent::HostKey(event)
+            | crate::server::QueuedInputEvent::HostKeyTransition(event, _),
+        ) = frozen_keyboard.as_ref()
     {
         let press_evcode =
             crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_KEY_PRESS_OFFSET;
@@ -29005,6 +29037,17 @@ fn apply_allow_events(
         let _dropped = replay_frozen_pointer_event_to_state(state, backend, &xid_map, event);
     }
     if keyboard_replay
+        && let Some(crate::server::QueuedInputEvent::HostKeyTransition(
+            event,
+            master_transition_accepted,
+        )) = frozen_keyboard
+    {
+        let _dropped = crate::core_loop::key_fanout::replay_frozen_key_to_focus_after_transition(
+            state,
+            event,
+            master_transition_accepted,
+        );
+    } else if keyboard_replay
         && let Some(crate::server::QueuedInputEvent::HostKey(event)) = frozen_keyboard
     {
         let _dropped = replay_frozen_key_to_focus(state, event);
@@ -62494,7 +62537,10 @@ mod tests {
                 .xi1_frozen
                 .get(&keyboard_id)
                 .and_then(|freeze| freeze.stored.as_ref()),
-            Some(crate::server::QueuedInputEvent::HostKey(_))
+            Some(
+                crate::server::QueuedInputEvent::HostKey(_)
+                    | crate::server::QueuedInputEvent::HostKeyTransition(_, _)
+            )
         ));
         assert!(
             read_all_available(&mut target_peer).is_empty(),
