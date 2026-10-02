@@ -8010,6 +8010,51 @@ impl KmsBackend {
         Some(scratch)
     }
 
+    /// The image a root read of `local` on output `output_idx` copies from,
+    /// composed from the scene as every earlier request left it
+    /// ([`SceneCompositor::root_readback`]); `None` without a live scene,
+    /// leaving the read on the scanout.
+    fn fresh_root_readback(&mut self, output_idx: usize, local: vk::Rect2D) -> Option<vk::Image> {
+        if !self.scene.is_live() {
+            return None;
+        }
+        if !self
+            .scene
+            .root_readback_is_current(&self.store, &self.platform, output_idx, local)
+        {
+            if let Err(e) = self.engine.close_open_frame(
+                &mut self.store,
+                &mut self.platform,
+                crate::kms::render::frame_builder::CloseReason::LegacyScCompose,
+            ) {
+                log::warn!("render root read: close_open_frame failed: {e:?}");
+            }
+            if let Err(e) = self.engine.flush_submit_group(
+                &mut self.store,
+                &mut self.platform,
+                crate::kms::render::submit_group::FlushReason::SceneCompose,
+            ) {
+                log::warn!("render root read: flush_submit_group failed: {e:?}");
+            }
+        }
+        let cow_host_xid = self.cow_host_xid();
+        match self.scene.root_readback(
+            &self.core,
+            &mut self.store,
+            &self.windows,
+            &self.platform,
+            cow_host_xid,
+            output_idx,
+            local,
+        ) {
+            Ok(image) => image,
+            Err(e) => {
+                log::warn!("render root read: output {output_idx} readback compose failed: {e}");
+                None
+            }
+        }
+    }
+
     /// Before a root read: compose any transformed output that has not
     /// composed since its transform became current, so the read returns root
     /// content rather than a zero-filled piece.
@@ -18105,6 +18150,10 @@ enum ScanoutReadOrigin {
     TransformIntermediate {
         output_idx: usize,
     },
+    /// The scene composed afresh for a root read (`fresh_root_readback`).
+    RootReadback {
+        output_idx: usize,
+    },
     DirectSource {
         source_xid: u32,
     },
@@ -18121,6 +18170,7 @@ impl ScanoutReadOrigin {
             Self::TransformIntermediate { output_idx } => {
                 format!("transform-intermediate-out{output_idx}")
             }
+            Self::RootReadback { output_idx } => format!("root-readback-out{output_idx}"),
             Self::DirectSource { source_xid } => format!("direct-src-0x{source_xid:x}"),
         }
     }
@@ -18450,7 +18500,7 @@ fn read_scanout_region_named(
         return Ok((Vec::new(), ScanoutReadOrigin::Empty));
     }
 
-    let (source, local_rect) = match select_scanout_read_route(backend, rect, selection)? {
+    let (mut source, local_rect) = match select_scanout_read_route(backend, rect, selection)? {
         ScanoutReadRoute::Pool {
             pool_idx,
             bo_idx,
@@ -18503,6 +18553,22 @@ fn read_scanout_region_named(
             return Ok((bytes, ScanoutReadOrigin::DirectSource { source_xid }));
         }
     };
+
+    // A root read sees every earlier request, not the last composed frame.
+    let mut fresh = None;
+    if selection == ScanoutReadSelection::OnScreenOnly {
+        let output_idx = match source {
+            ScanoutReadOrigin::ComposedPool { pool_idx, .. } => Some(pool_idx),
+            ScanoutReadOrigin::TransformIntermediate { output_idx } => Some(output_idx),
+            _ => None,
+        };
+        if let Some(output_idx) = output_idx
+            && let Some(image) = backend.fresh_root_readback(output_idx, local_rect)
+        {
+            source = ScanoutReadOrigin::RootReadback { output_idx };
+            fresh = Some(image);
+        }
+    }
 
     let Some(vk) = backend.platform.vk.as_ref().cloned() else {
         return Err(io::Error::other("no vulkan context"));
@@ -18566,6 +18632,8 @@ fn read_scanout_region_named(
                 })?;
             (image, false)
         }
+        // Composed for this read and left `GENERAL`, like the intermediate.
+        ScanoutReadOrigin::RootReadback { .. } => (fresh.expect("set with the origin"), false),
         ScanoutReadOrigin::Empty | ScanoutReadOrigin::DirectSource { .. } => {
             unreachable!("returned above")
         }
