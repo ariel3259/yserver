@@ -14219,6 +14219,44 @@ impl KmsBackend {
         self.emit_pointer(ev);
     }
 
+    fn emit_floating_pointer_event_at(
+        &mut self,
+        server_state: &ServerState,
+        origin: yserver_core::core_loop::InputOrigin,
+        kind: PointerEventKind,
+        detail: u8,
+        root_x: i16,
+        root_y: i16,
+        state_mask: u16,
+        raw_dx: i32,
+        raw_dy: i32,
+    ) {
+        let previous = (self.core.cursor_x, self.core.cursor_y);
+        self.core.cursor_x = f32::from(root_x);
+        self.core.cursor_y = f32::from(root_y);
+        let host_xid = self.resource_pointer_host_xid(server_state);
+        let (event_x, event_y) = self.event_relative_coords(host_xid);
+        self.emit_pointer(HostPointerEvent {
+            origin,
+            kind,
+            host_xid,
+            detail,
+            time: crate::clock::server_time_ms(),
+            root_x,
+            root_y,
+            event_x,
+            event_y,
+            state: state_mask,
+            crossing_mode: 0,
+            child: 0,
+            raw_dx,
+            raw_dy,
+            tree_change: false,
+        });
+        self.core.cursor_x = previous.0;
+        self.core.cursor_y = previous.1;
+    }
+
     /// Spec-correct Normal-mode crossing chain for a top-level
     /// transition. Direct v1 port (kms/backend.rs:6630-6695) —
     /// the body only touches KmsCore + nested-resource look-ups.
@@ -19737,8 +19775,34 @@ impl Backend for KmsBackend {
                     );
                     return;
                 }
-                self.core.button_mask = (state.buttons_down & 0x001f) << 8;
-                self.process_pointer_absolute(state, x as f32, y as f32, relative, dx, dy, origin);
+                if let Some(device_id) =
+                    yserver_core::core_loop::pointer_fanout::floating_pointer_device_id(
+                        state, origin,
+                    )
+                {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let (root_x, root_y) = (x as i16, y as i16);
+                    let buttons = state
+                        .xi_devices
+                        .device(device_id)
+                        .map_or(0, |device| (device.buttons_down & 0x001f) << 8);
+                    self.emit_floating_pointer_event_at(
+                        state,
+                        origin,
+                        PointerEventKind::MotionNotify,
+                        0,
+                        root_x,
+                        root_y,
+                        self.serialize_modifiers() | buttons,
+                        dx,
+                        dy,
+                    );
+                } else {
+                    self.core.button_mask = (state.buttons_down & 0x001f) << 8;
+                    self.process_pointer_absolute(
+                        state, x as f32, y as f32, relative, dx, dy, origin,
+                    );
+                }
             }
             HostInputEvent::PointerButton {
                 origin,
@@ -19752,14 +19816,97 @@ impl Backend for KmsBackend {
                     );
                     return;
                 }
-                self.core.button_mask = (state.buttons_down & 0x001f) << 8;
-                self.process_pointer_button(u32::from(button), pressed, state, origin);
+                if let Some(device_id) =
+                    yserver_core::core_loop::pointer_fanout::floating_pointer_device_id(
+                        state, origin,
+                    )
+                {
+                    let detail = match button {
+                        0x110 => 1,
+                        0x111 => 3,
+                        0x112 => 2,
+                        0x113 => 8,
+                        0x114 => 9,
+                        0x180 => 4,
+                        0x181 => 5,
+                        0x182 => 6,
+                        0x183 => 7,
+                        _ => return,
+                    };
+                    let held = state
+                        .xi_devices
+                        .device(device_id)
+                        .map_or(0, |device| device.buttons_down);
+                    let button_bit = if (1..=5).contains(&detail) {
+                        1u16 << (detail - 1)
+                    } else {
+                        0
+                    };
+                    let (root_x, root_y) = state
+                        .floating_pointer_positions
+                        .get(&device_id)
+                        .copied()
+                        .unwrap_or(state.pointer_root);
+                    let state_mask = (self.serialize_modifiers() | ((held & 0x001f) << 8))
+                        | if pressed { 0 } else { button_bit << 8 };
+                    self.emit_floating_pointer_event_at(
+                        state,
+                        origin,
+                        if pressed {
+                            PointerEventKind::ButtonPress
+                        } else {
+                            PointerEventKind::ButtonRelease
+                        },
+                        detail,
+                        root_x,
+                        root_y,
+                        state_mask,
+                        0,
+                        0,
+                    );
+                } else {
+                    self.core.button_mask = (state.buttons_down & 0x001f) << 8;
+                    self.process_pointer_button(u32::from(button), pressed, state, origin);
+                }
             }
             HostInputEvent::PointerScrollStop { origin, .. } => {
                 if !yserver_core::core_loop::pointer_fanout::pointer_origin_is_live(state, origin) {
                     log::trace!(
                         "dropping pointer scroll stop from unknown, disabled, or invalid origin {origin:?}"
                     );
+                    return;
+                }
+                if let Some(device_id) =
+                    yserver_core::core_loop::pointer_fanout::floating_pointer_device_id(
+                        state, origin,
+                    )
+                {
+                    let (root_x, root_y) = state
+                        .floating_pointer_positions
+                        .get(&device_id)
+                        .copied()
+                        .unwrap_or(state.pointer_root);
+                    let buttons = state
+                        .xi_devices
+                        .device(device_id)
+                        .map_or(0, |device| (device.buttons_down & 0x001f) << 8);
+                    let previous = (self.core.cursor_x, self.core.cursor_y);
+                    self.core.cursor_x = f32::from(root_x);
+                    self.core.cursor_y = f32::from(root_y);
+                    let host_xid = self.resource_pointer_host_xid(state);
+                    let xid_map = self.core.xid_map.clone();
+                    yserver_core::core_loop::pointer_fanout::emit_scroll_stop_to_state(
+                        state,
+                        &xid_map,
+                        origin,
+                        host_xid,
+                        root_x,
+                        root_y,
+                        self.serialize_modifiers() | buttons,
+                        crate::clock::server_time_ms(),
+                    );
+                    self.core.cursor_x = previous.0;
+                    self.core.cursor_y = previous.1;
                     return;
                 }
                 // Fingers lifted from a two-finger scroll. Emit a delta-0 XI2
@@ -19786,12 +19933,16 @@ impl Backend for KmsBackend {
                 // One timestamp for the raw event and the device event
                 // (Xorg GetKeyboardEvents stamps both with the same ms).
                 let time = crate::clock::server_time_ms();
+                let floating_keyboard =
+                    yserver_core::core_loop::key_fanout::keyboard_origin_is_floating(
+                        state, raw.origin,
+                    );
                 // Device input (not a software repeat) generates the XI2 raw
                 // key event first — ahead of the duplicate guard below, as
                 // Xorg builds it in GetKeyboardEvents before exevents drops
                 // a duplicate. `raw_key_event_to_state` applies Xorg's own
                 // press-while-down rule.
-                if matches!(ev, HostInputEvent::Key(_)) {
+                if matches!(ev, HostInputEvent::Key(_)) && !floating_keyboard {
                     let _dropped = yserver_core::core_loop::key_fanout::raw_key_event_to_state(
                         state,
                         yserver_core::core_loop::key_fanout::RawKeyEvent {
@@ -19802,6 +19953,37 @@ impl Backend for KmsBackend {
                         self.core.down_keys.contains(&raw.keycode),
                         self.core.xkb_desc.modmap[usize::from(raw.keycode)] != 0,
                     );
+                }
+                if floating_keyboard {
+                    // TODO(11c): give floating keyboards their own XKB state.
+                    // Until then, grabbed key events use the master keymap's
+                    // current modifiers without changing the master state.
+                    let cooked = HostKeyEvent {
+                        state: self.serialize_modifiers(),
+                        root_x: self.core.cursor_x as i16,
+                        root_y: self.core.cursor_y as i16,
+                        event_x: self.core.cursor_x as i16,
+                        event_y: self.core.cursor_y as i16,
+                        time,
+                        ..raw
+                    };
+                    let repeat = matches!(ev, HostInputEvent::KeyRepeat(_));
+                    if !(repeat && !cooked.pressed) {
+                        yserver_core::core_loop::record::record_device_event(
+                            state,
+                            yserver_core::core_loop::record::RecordedDeviceEvent {
+                                event_type: if cooked.pressed { 2 } else { 3 },
+                                detail: cooked.keycode,
+                                repeat,
+                                time: cooked.time,
+                                root_x: cooked.root_x,
+                                root_y: cooked.root_y,
+                                state: cooked.state,
+                            },
+                        );
+                    }
+                    let _dropped = key_event_fanout_to_state(state, self, cooked);
+                    return;
                 }
                 // Xorg `Xi/exevents.c` UpdateDeviceState: "don't allow
                 // ddx to generate multiple downs" and "guard against
@@ -19885,7 +20067,7 @@ impl Backend for KmsBackend {
             }
             HostInputEvent::DeviceRemoved { source_id } => {
                 log::info!("xi-device: removed source={}", source_id.0);
-                state.xi_unregister_source(source_id);
+                yserver_core::core_loop::pointer_fanout::xi_cleanup_source(state, self, source_id);
                 return;
             }
         }
@@ -37729,6 +37911,7 @@ mod tests {
         let mut b = KmsBackend::for_tests();
         let mut state = ServerState::new();
         state.key_grabs.push(KeyGrab {
+            device_id: 0,
             owner: WM,
             grab_window: ROOT_WINDOW,
             keycode: RETURN,
@@ -39281,6 +39464,116 @@ mod tests {
         );
         assert_eq!(b.core.cursor_x, 10.0);
         assert_eq!(b.core.cursor_y, 20.0);
+    }
+
+    #[test]
+    fn xi_dynamic_grabs_kms_floating_source_cleanup() {
+        use yserver_core::{
+            backend::Backend,
+            core_loop::{DeviceInfo, HostInputEvent, message::LibinputConfigSnapshot},
+            host_x11::HostKeyEvent,
+            server::ServerState,
+            xinput::{InputCapabilities, InputSourceId, XiFacetKind},
+        };
+
+        const CLIENT: u32 = 7;
+        let mut backend = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        let _peer = kbd_map_client_id(&mut state, CLIENT);
+        let source_id = InputSourceId(0xA11);
+        backend.on_host_input(
+            &mut state,
+            HostInputEvent::DeviceAdded(DeviceInfo {
+                source_id,
+                enabled: true,
+                resume_key: None,
+                capabilities: InputCapabilities {
+                    keyboard: false,
+                    pointer: true,
+                    touch: false,
+                },
+                name: "floating pointer".to_owned(),
+                device_node: "/dev/input/test-floating-pointer".to_owned(),
+                sysname: "test-floating-pointer".to_owned(),
+                vendor_id: 0,
+                product_id: 0,
+                is_touchpad: false,
+                config: LibinputConfigSnapshot::default(),
+            }),
+        );
+        let device_id = state
+            .xi_devices
+            .facet(source_id, XiFacetKind::PointerTouch)
+            .expect("DeviceAdded publishes the pointer facet");
+
+        let mut grab_body = Vec::with_capacity(24);
+        grab_body.extend_from_slice(&yserver_core::resources::ROOT_WINDOW.0.to_le_bytes());
+        grab_body.extend_from_slice(&0u32.to_le_bytes());
+        grab_body.extend_from_slice(&0u32.to_le_bytes());
+        grab_body.extend_from_slice(&device_id.to_le_bytes());
+        grab_body.extend_from_slice(&[1, 0, 0, 0]); // async, paired sync, owner_events=false
+        grab_body.extend_from_slice(&0u16.to_le_bytes());
+        grab_body.extend_from_slice(&[0u8; 2]);
+        yserver_core::core_loop::process_request::process_request(
+            &mut state,
+            &mut backend,
+            yserver_protocol::x11::ClientId(CLIENT),
+            yserver_protocol::x11::SequenceNumber(1),
+            yserver_protocol::x11::RequestHeader {
+                opcode: 137,
+                data: 51,
+                length_units: 7,
+            },
+            &grab_body,
+            None,
+        )
+        .expect("XIGrabDevice on the source's pointer facet");
+        assert!(state.xi2_pointer_grabs.contains_key(&device_id));
+        assert_eq!(
+            state.xi_devices.device(device_id).unwrap().attached_master,
+            None
+        );
+
+        assert!(state.floating_pointer_positions.contains_key(&device_id));
+        assert_eq!(
+            state.xi1_frozen[&yserver_core::xinput::DEVICEID_MASTER_KEYBOARD].other,
+            Some(yserver_protocol::x11::ClientId(CLIENT)),
+            "paired sync mode holds the attached master keyboard",
+        );
+        backend.on_host_input(
+            &mut state,
+            HostInputEvent::Key(HostKeyEvent {
+                origin: yserver_core::core_loop::InputOrigin::NestedHost,
+                pressed: true,
+                keycode: 30,
+                time: 0x1234,
+                root_x: 10,
+                root_y: 20,
+                event_x: 10,
+                event_y: 20,
+                state: 0,
+            }),
+        );
+        assert!(
+            !state.sync_pending.is_empty(),
+            "key input is queued while the paired master keyboard is held",
+        );
+
+        backend.on_host_input(&mut state, HostInputEvent::DeviceRemoved { source_id });
+        assert!(state.xi_devices.source(source_id).is_none());
+        assert!(state.xi_devices.device(device_id).is_none());
+        assert!(!state.xi2_pointer_grabs.contains_key(&device_id));
+        assert!(!state.xi2_detached_masters.contains_key(&device_id));
+        assert!(!state.floating_pointer_positions.contains_key(&device_id));
+        assert!(!state.xi1_frozen.contains_key(&device_id));
+        assert!(state.sync_pending.is_empty());
+        assert!(
+            !state
+                .xi1_frozen
+                .get(&yserver_core::xinput::DEVICEID_MASTER_KEYBOARD)
+                .is_some_and(yserver_core::server::Xi1Freeze::frozen),
+            "source removal releases its paired master freeze",
+        );
     }
 
     /// Stage 3f.6 — `create_subwindow` records the parent xid + the

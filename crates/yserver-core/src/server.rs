@@ -238,6 +238,9 @@ impl AtomTable {
 #[derive(Debug, Clone)]
 pub struct PassiveButtonGrab {
     pub owner: ClientId,
+    /// 0 for a core GrabButton (master semantics), otherwise the exact XI2
+    /// device requested by XIPassiveGrabDevice.
+    pub device_id: u16,
     pub grab_window: ResourceId,
     /// 0 = AnyButton
     pub button: u8,
@@ -270,6 +273,9 @@ pub struct PassiveButtonGrab {
 #[derive(Debug, Clone)]
 pub struct KeyGrab {
     pub owner: ClientId,
+    /// 0 for a core GrabKey (master semantics), otherwise the exact XI2
+    /// device requested by XIPassiveGrabDevice.
+    pub device_id: u16,
     pub grab_window: ResourceId,
     /// 0 == AnyKey
     pub keycode: u8,
@@ -1048,6 +1054,17 @@ pub struct ServerState {
     pub pointer_root: (i16, i16),
     /// Active pointer grab record (full state including event_mask/cursor/time).
     pub active_pointer_grab: Option<ActivePointerGrab>,
+    /// XI2 pointer grabs on exact slave devices. Master and core pointer
+    /// grabs continue to use `active_pointer_grab`.
+    pub xi2_pointer_grabs: HashMap<u16, ActivePointerGrab>,
+    /// XI2 keyboard grabs on exact slave devices. Master and core keyboard
+    /// grabs continue to use `active_keyboard_grab`.
+    pub xi2_keyboard_grabs: HashMap<u16, ActiveKeyboardGrab>,
+    /// Original master for a slave temporarily detached by an explicit
+    /// XI2 grab (`dix/events.c::DetachFromMaster`).
+    pub xi2_detached_masters: HashMap<u16, u16>,
+    /// Per-slave sprite position retained during a floating pointer grab.
+    pub floating_pointer_positions: HashMap<u16, (i16, i16)>,
     /// Registered passive button grabs.
     pub button_grabs: Vec<PassiveButtonGrab>,
     /// Global withheld-event queue, in arrival order across devices.
@@ -1541,6 +1558,44 @@ impl ServerState {
         self.active_pointer_grab = None;
     }
 
+    /// Temporarily float a physical slave for an explicit XI2 grab, saving
+    /// the attachment so deactivation and disconnect can restore it.
+    pub fn detach_xi2_slave(&mut self, device_id: u16) -> bool {
+        let Some(device) = self.xi_devices.device(device_id) else {
+            return false;
+        };
+        if device.facet.is_none() {
+            return false;
+        }
+        let Some(master) = device.attached_master else {
+            return false;
+        };
+        let facet = device.facet;
+        self.xi2_detached_masters.insert(device_id, master);
+        if facet == Some(crate::xinput::XiFacetKind::PointerTouch) {
+            self.floating_pointer_positions
+                .insert(device_id, self.pointer_root);
+        }
+        if let Some(device) = self.xi_devices.device_mut(device_id) {
+            device.attached_master = None;
+        }
+        true
+    }
+
+    /// Restore the attachment saved by [`Self::detach_xi2_slave`].
+    pub fn reattach_xi2_slave(&mut self, device_id: u16) -> bool {
+        let Some(master) = self.xi2_detached_masters.remove(&device_id) else {
+            return false;
+        };
+        if let Some(device) = self.xi_devices.device_mut(device_id) {
+            device.attached_master = Some(master);
+        } else {
+            return false;
+        }
+        self.floating_pointer_positions.remove(&device_id);
+        true
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self::with_geometry(800, 600)
@@ -1609,6 +1664,10 @@ impl ServerState {
             selections: HashMap::new(),
             pointer_root: (0, 0),
             active_pointer_grab: None,
+            xi2_pointer_grabs: HashMap::new(),
+            xi2_keyboard_grabs: HashMap::new(),
+            xi2_detached_masters: HashMap::new(),
+            floating_pointer_positions: HashMap::new(),
             button_grabs: Vec::new(),
             sync_pending: std::collections::VecDeque::new(),
             playing_sync_events: false,
@@ -1804,6 +1863,60 @@ impl ServerState {
 
     /// Remove one physical source and every facet it currently owns.
     pub fn xi_unregister_source(&mut self, source: crate::xinput::InputSourceId) -> Vec<u16> {
+        let ids: Vec<u16> = [
+            self.xi_devices
+                .facet(source, crate::xinput::XiFacetKind::Keyboard),
+            self.xi_devices
+                .facet(source, crate::xinput::XiFacetKind::PointerTouch),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let removed_grabs: Vec<(u16, ClientId)> = ids
+            .iter()
+            .filter_map(|id| {
+                self.xi2_pointer_grabs
+                    .get(id)
+                    .map(|grab| (*id, grab.owner))
+                    .or_else(|| {
+                        self.xi2_keyboard_grabs
+                            .get(id)
+                            .map(|grab| (*id, grab.owner))
+                    })
+            })
+            .collect();
+        for (id, owner) in removed_grabs {
+            let paired = self.xi_devices.paired_master(id).or_else(|| {
+                self.xi2_detached_masters
+                    .get(&id)
+                    .and_then(|master| self.xi_devices.paired_master(*master))
+            });
+            if let Some(freeze) = paired.and_then(|paired| self.xi1_frozen.get_mut(&paired))
+                && freeze.other == Some(owner)
+            {
+                freeze.other = None;
+            }
+        }
+        for id in &ids {
+            self.xi2_pointer_grabs.remove(id);
+            self.xi2_keyboard_grabs.remove(id);
+            self.xi2_detached_masters.remove(id);
+            self.floating_pointer_positions.remove(id);
+            self.xi1_frozen.remove(id);
+            self.xi1_device_focus.remove(id);
+            self.xi1_device_input_state.remove(id);
+            self.xi1_button_map.remove(id);
+            self.xi1_modifier_map.remove(id);
+            self.xi1_resolution.remove(id);
+            self.xi1_active_grabs.remove(id);
+        }
+        self.button_grabs
+            .retain(|grab| !ids.contains(&grab.device_id));
+        self.key_grabs.retain(|grab| !ids.contains(&grab.device_id));
+        self.xi1_passive_grabs
+            .retain(|grab| !ids.contains(&grab.deviceid));
+        self.sync_pending
+            .retain(|pending| !ids.contains(&pending.device));
         self.xi_devices.remove(source)
     }
 
@@ -3064,6 +3177,8 @@ impl ServerState {
         window: ResourceId,
         button: u8,
         state_mask: u16,
+        device_id: u16,
+        master_device_id: Option<u16>,
     ) -> Option<PassiveButtonGrab> {
         // X11 GrabButton: the grab activates only when "no other
         // buttons ... are logically down" (XGrabButton-1).
@@ -3087,12 +3202,17 @@ impl ServerState {
             current = w.parent;
         }
         for current in chain.into_iter().rev() {
-            for grab in &self.button_grabs {
+            let attached_master =
+                master_device_id.or_else(|| self.xi_devices.attachment(device_id));
+            let matching = self.button_grabs.iter().filter_map(|grab| {
                 if grab.grab_window != current {
-                    continue;
+                    return None;
                 }
                 let button_match = grab.button == 0 || grab.button == button;
                 let mod_match = grab.modifiers == 0x8000 || grab.modifiers == (state_mask & 0x00ff);
+                let device_match = (grab.device_id == 0 && attached_master.is_some())
+                    || grab.device_id == device_id
+                    || Some(grab.device_id) == attached_master;
                 // Xorg ActivatePointerGrab fails when confine_to is
                 // not viewable — the grab does not activate
                 // (XGrabButton-3).
@@ -3101,9 +3221,19 @@ impl ServerState {
                         .resources
                         .window(grab.confine_to)
                         .is_some_and(|w| w.map_state == crate::resources::MapState::Viewable);
-                if button_match && mod_match && confine_ok {
-                    return Some(grab.clone());
-                }
+                (button_match && mod_match && device_match && confine_ok).then(|| {
+                    let specificity = if grab.device_id == device_id && grab.device_id != 0 {
+                        3
+                    } else if grab.device_id != 0 {
+                        2
+                    } else {
+                        1
+                    };
+                    (specificity, grab)
+                })
+            });
+            if let Some((_, grab)) = matching.max_by_key(|(specificity, _)| *specificity) {
+                return Some(grab.clone());
             }
         }
         None
@@ -3120,6 +3250,8 @@ impl ServerState {
         window: ResourceId,
         keycode: u8,
         state_mask: u16,
+        device_id: u16,
+        master_device_id: Option<u16>,
     ) -> Option<&KeyGrab> {
         // Top-down walk (root first) — Xorg CheckDeviceGrabs checks
         // the focus trace from the root down, so an ancestor's grab
@@ -3140,15 +3272,30 @@ impl ServerState {
             chain.push(crate::resources::ROOT_WINDOW);
         }
         for current in chain.into_iter().rev() {
-            for grab in &self.key_grabs {
+            let attached_master =
+                master_device_id.or_else(|| self.xi_devices.attachment(device_id));
+            let matching = self.key_grabs.iter().filter_map(|grab| {
                 if grab.grab_window != current {
-                    continue;
+                    return None;
                 }
                 let key_match = grab.keycode == 0 || grab.keycode == keycode;
                 let mod_match = grab.modifiers == 0x8000 || grab.modifiers == (state_mask & 0x00ff);
-                if key_match && mod_match {
-                    return Some(grab);
-                }
+                let device_match = (grab.device_id == 0 && attached_master.is_some())
+                    || grab.device_id == device_id
+                    || Some(grab.device_id) == attached_master;
+                (key_match && mod_match && device_match).then(|| {
+                    let specificity = if grab.device_id == device_id && grab.device_id != 0 {
+                        3
+                    } else if grab.device_id != 0 {
+                        2
+                    } else {
+                        1
+                    };
+                    (specificity, grab)
+                })
+            });
+            if let Some((_, grab)) = matching.max_by_key(|(specificity, _)| *specificity) {
+                return Some(grab);
             }
         }
         None
@@ -3430,8 +3577,14 @@ fn pointer_event_fanout_inner(
                 .root_pointer_target_at(event.root_x, event.root_y)
                 .or_else(|| s.pointer_target_at(top, event.event_x, event.event_y))
                 .unwrap_or((top, event.event_x, event.event_y));
-            s.find_passive_grab(hit_window, event.detail, event.state)
-                .map(|grab| (grab, hit_window))
+            s.find_passive_grab(
+                hit_window,
+                event.detail,
+                event.state,
+                crate::xinput::DEVICEID_SLAVE_POINTER,
+                None,
+            )
+            .map(|grab| (grab, hit_window))
         });
         if let Some(grab) = matched {
             let (grab, hit_window) = grab;
@@ -4732,6 +4885,7 @@ mod tests {
                 xi2_mask: u64::MAX,
             });
             s.button_grabs.push(PassiveButtonGrab {
+                device_id: 0,
                 owner: ClientId(1),
                 grab_window,
                 button: 1,
@@ -4898,6 +5052,7 @@ mod tests {
                 xi2_mask: u64::MAX,
             });
             s.button_grabs.push(PassiveButtonGrab {
+                device_id: 0,
                 owner: ClientId(1),
                 grab_window,
                 button: 1,
@@ -5297,6 +5452,7 @@ mod tests {
         let win = ResourceId(0x42);
         let owner = ClientId(1);
         s.key_grabs.push(KeyGrab {
+            device_id: 0,
             owner,
             grab_window: win,
             keycode: 24,
@@ -5307,7 +5463,13 @@ mod tests {
             via_xi2: false,
             xi2_mask: 0,
         });
-        let hit = s.find_key_grab(win, 24, 0x0040);
+        let hit = s.find_key_grab(
+            win,
+            24,
+            0x0040,
+            crate::xinput::DEVICEID_SLAVE_KEYBOARD,
+            None,
+        );
         assert!(hit.is_some());
         assert_eq!(hit.unwrap().owner, owner);
     }
@@ -5317,6 +5479,7 @@ mod tests {
         let mut s = ServerState::new();
         let win = ResourceId(0x42);
         s.key_grabs.push(KeyGrab {
+            device_id: 0,
             owner: ClientId(1),
             grab_window: win,
             keycode: 24,
@@ -5327,9 +5490,36 @@ mod tests {
             via_xi2: false,
             xi2_mask: 0,
         });
-        assert!(s.find_key_grab(win, 24, 0x0040).is_some());
-        assert!(s.find_key_grab(win, 24, 0x0000).is_some());
-        assert!(s.find_key_grab(win, 25, 0x0040).is_none());
+        assert!(
+            s.find_key_grab(
+                win,
+                24,
+                0x0040,
+                crate::xinput::DEVICEID_SLAVE_KEYBOARD,
+                None
+            )
+            .is_some()
+        );
+        assert!(
+            s.find_key_grab(
+                win,
+                24,
+                0x0000,
+                crate::xinput::DEVICEID_SLAVE_KEYBOARD,
+                None
+            )
+            .is_some()
+        );
+        assert!(
+            s.find_key_grab(
+                win,
+                25,
+                0x0040,
+                crate::xinput::DEVICEID_SLAVE_KEYBOARD,
+                None
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -5337,6 +5527,7 @@ mod tests {
         let mut s = ServerState::new();
         let win = ResourceId(0x42);
         s.key_grabs.push(KeyGrab {
+            device_id: 0,
             owner: ClientId(1),
             grab_window: win,
             keycode: 0,
@@ -5347,9 +5538,36 @@ mod tests {
             via_xi2: false,
             xi2_mask: 0,
         });
-        assert!(s.find_key_grab(win, 24, 0x0040).is_some());
-        assert!(s.find_key_grab(win, 99, 0x0040).is_some());
-        assert!(s.find_key_grab(win, 24, 0x0000).is_none());
+        assert!(
+            s.find_key_grab(
+                win,
+                24,
+                0x0040,
+                crate::xinput::DEVICEID_SLAVE_KEYBOARD,
+                None
+            )
+            .is_some()
+        );
+        assert!(
+            s.find_key_grab(
+                win,
+                99,
+                0x0040,
+                crate::xinput::DEVICEID_SLAVE_KEYBOARD,
+                None
+            )
+            .is_some()
+        );
+        assert!(
+            s.find_key_grab(
+                win,
+                24,
+                0x0000,
+                crate::xinput::DEVICEID_SLAVE_KEYBOARD,
+                None
+            )
+            .is_none()
+        );
     }
 
     #[test]

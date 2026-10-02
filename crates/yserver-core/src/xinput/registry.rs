@@ -41,6 +41,16 @@ pub enum XiFacetKind {
     PointerTouch,
 }
 
+/// Protocol role of a registered XI device. Slave roles remain the same while
+/// detached; attachment is reported separately by [`XiRegistry::attachment`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XiDeviceRole {
+    MasterPointer,
+    MasterKeyboard,
+    SlavePointer,
+    SlaveKeyboard,
+}
+
 #[derive(Debug)]
 struct SourceRecord {
     info: DeviceInfo,
@@ -197,6 +207,48 @@ impl XiRegistry {
         self.sources
             .get_mut(&source_id)
             .map(|record| &mut record.info)
+    }
+
+    #[must_use]
+    pub fn role(&self, device_id: u16) -> Option<XiDeviceRole> {
+        let device = self.device(device_id)?;
+        Some(match device_id {
+            DEVICEID_MASTER_POINTER => XiDeviceRole::MasterPointer,
+            DEVICEID_MASTER_KEYBOARD => XiDeviceRole::MasterKeyboard,
+            DEVICEID_SLAVE_POINTER => XiDeviceRole::SlavePointer,
+            DEVICEID_SLAVE_KEYBOARD => XiDeviceRole::SlaveKeyboard,
+            _ => match device.facet? {
+                XiFacetKind::PointerTouch => XiDeviceRole::SlavePointer,
+                XiFacetKind::Keyboard => XiDeviceRole::SlaveKeyboard,
+            },
+        })
+    }
+
+    /// Current attachment of a slave, or its own master ID for a master.
+    #[must_use]
+    pub fn attachment(&self, device_id: u16) -> Option<u16> {
+        let device = self.device(device_id)?;
+        match self.role(device_id)? {
+            XiDeviceRole::MasterPointer | XiDeviceRole::MasterKeyboard => Some(device_id),
+            XiDeviceRole::SlavePointer | XiDeviceRole::SlaveKeyboard => device.attached_master,
+        }
+    }
+
+    /// Xorg `GetPairedDevice`: the paired master for a master or attached
+    /// slave. A floating slave has no current paired master.
+    #[must_use]
+    pub fn paired_master(&self, device_id: u16) -> Option<u16> {
+        use XiDeviceRole::{MasterKeyboard, MasterPointer, SlaveKeyboard, SlavePointer};
+        let master = match self.role(device_id)? {
+            MasterPointer => DEVICEID_MASTER_POINTER,
+            MasterKeyboard => DEVICEID_MASTER_KEYBOARD,
+            SlavePointer | SlaveKeyboard => self.attachment(device_id)?,
+        };
+        match master {
+            DEVICEID_MASTER_POINTER => Some(DEVICEID_MASTER_KEYBOARD),
+            DEVICEID_MASTER_KEYBOARD => Some(DEVICEID_MASTER_POINTER),
+            _ => None,
+        }
     }
 
     #[must_use]
