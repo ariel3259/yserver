@@ -17737,6 +17737,35 @@ fn handle_xi2_request(
                             header.opcode,
                         );
                     }
+                    let hierarchy_event = crate::xinput::XI2_HIERARCHY_CHANGED_EVENT_TYPE;
+                    let selects_hierarchy = mask_bytes
+                        .get((hierarchy_event / 8) as usize)
+                        .is_some_and(|byte| byte & (1 << (hierarchy_event % 8)) != 0);
+                    if deviceid != 0 && selects_hierarchy {
+                        // Xorg Xi/xiselectev.c:186-193 permits this mask only
+                        // on XIAllDevices. Preserve its lookup-before-mask
+                        // validation order for concrete device ids.
+                        if deviceid != 1 && state.xi_devices.device(deviceid).is_none() {
+                            return emit_x11_error_with_minor(
+                                state,
+                                client_id,
+                                sequence,
+                                XI2_FIRST_ERROR, // XI_BadDevice
+                                u32::from(deviceid),
+                                46,
+                                header.opcode,
+                            );
+                        }
+                        return emit_x11_error_with_minor(
+                            state,
+                            client_id,
+                            sequence,
+                            x11::error::BAD_VALUE,
+                            hierarchy_event,
+                            46,
+                            header.opcode,
+                        );
+                    }
                     // The mask is a bit array (bit n in byte n/8), so the
                     // bytes are little-endian whatever the client order.
                     let mut word = [0u8; 8];
@@ -43955,6 +43984,77 @@ mod tests {
         assert_eq!(wire[event_offset + 10], 2, "deviceid low byte");
         assert_eq!(wire[event_offset + 16], 7, "num_classes low byte");
         assert_eq!(wire[event_offset + 18], 4, "sourceid low byte");
+    }
+
+    #[test]
+    fn xi_select_events_rejects_hierarchy_changed_outside_all_devices() {
+        let mut state = ServerState::new();
+        let mut peer = install_capture_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        for (sequence, device_id) in [1_u16, 2, 4].into_iter().enumerate() {
+            let mut body = Vec::new();
+            body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+            body.extend_from_slice(&1_u16.to_le_bytes());
+            body.extend_from_slice(&0_u16.to_le_bytes());
+            body.extend_from_slice(&device_id.to_le_bytes());
+            body.extend_from_slice(&1_u16.to_le_bytes());
+            body.extend_from_slice(&(1_u32 << 11).to_le_bytes()); // XI_HierarchyChanged
+            handle_xi2_request(
+                &mut state,
+                &mut backend,
+                None,
+                ClientId(1),
+                SequenceNumber(u16::try_from(sequence + 1).unwrap()),
+                xi2_header(46),
+                &body,
+            )
+            .expect("XISelectEvents dispatch");
+
+            let error = read_all_available(&mut peer);
+            assert_eq!(
+                error.len(),
+                32,
+                "BadValue error for deviceid {device_id}; client={:?}; outbound={}",
+                state.clients[&1].xi2_masks,
+                state.clients[&1].outbound.len(),
+            );
+            assert_eq!(error[0], 0, "an X11 error, not a reply");
+            assert_eq!(error[1], yserver_protocol::x11::error::BAD_VALUE);
+            assert_eq!(
+                u32::from_le_bytes(error[4..8].try_into().unwrap()),
+                11,
+                "errorValue is XI_HierarchyChanged"
+            );
+            assert!(
+                !state.clients[&1]
+                    .xi2_masks
+                    .contains_key(&(ROOT_WINDOW, device_id)),
+                "the rejected selection leaves client masks unchanged"
+            );
+        }
+
+        let mut all_devices = Vec::new();
+        all_devices.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        all_devices.extend_from_slice(&1_u16.to_le_bytes());
+        all_devices.extend_from_slice(&0_u16.to_le_bytes());
+        all_devices.extend_from_slice(&0_u16.to_le_bytes()); // XIAllDevices
+        all_devices.extend_from_slice(&1_u16.to_le_bytes());
+        all_devices.extend_from_slice(&(1_u32 << 11).to_le_bytes());
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(8),
+            xi2_header(46),
+            &all_devices,
+        )
+        .expect("XIAllDevices may select hierarchy changes");
+        assert_eq!(
+            state.clients[&1].xi2_masks.get(&(ROOT_WINDOW, 0)),
+            Some(&(1_u64 << 11))
+        );
+        assert!(read_all_available(&mut peer).is_empty());
     }
 
     // -----------------------------------------------------------------

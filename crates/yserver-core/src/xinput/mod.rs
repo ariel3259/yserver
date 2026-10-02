@@ -11,6 +11,7 @@ use yserver_protocol::x11::{AtomId, ClientByteOrder, SequenceNumber};
 
 use crate::core_loop::DeviceInfo;
 
+pub mod hotplug;
 pub mod libinput_props;
 pub mod query;
 pub mod registry;
@@ -50,6 +51,12 @@ pub const NAME_SLAVE_KEYBOARD: &str = "Virtual core slave keyboard";
 /// XISelectEvents bootstrap and the touchpad-add/remove fanout so both
 /// match the same selection bit.
 pub const XI2_DEVICE_CHANGED_MASK: u32 = 1 << 1;
+
+/// XI2 `XI_HierarchyChanged` event number (XI2.h:99).
+pub const XI2_HIERARCHY_CHANGED_EVENT_TYPE: u32 = 11;
+
+/// XI2 `XI_HierarchyChanged` selection bit (`1 << 11`, XI2.h:101).
+pub const XI2_HIERARCHY_CHANGED_MASK: u32 = 1 << XI2_HIERARCHY_CHANGED_EVENT_TYPE;
 
 /// XI2 `XI_PropertyEvent` event-mask bit (`1 << XI_PropertyEvent`,
 /// XI2.h:243). Single source of truth shared by `emit_property_change`

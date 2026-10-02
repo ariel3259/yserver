@@ -19809,12 +19809,33 @@ impl KmsBackend {
         yserver_core::core_loop::pointer_fanout::xi_cleanup_source(state, self, source_id);
         self.synchronize_floating_keyboard_states(state);
 
+        let was_enabled = state
+            .xi_devices
+            .source(source_id)
+            .is_some_and(|info| info.enabled);
+        let changed_ids: Vec<u16> = [
+            state
+                .xi_devices
+                .facet(source_id, yserver_core::xinput::XiFacetKind::Keyboard),
+            state
+                .xi_devices
+                .facet(source_id, yserver_core::xinput::XiFacetKind::PointerTouch),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         if let Some(mut info) = state.xi_devices.source(source_id).cloned() {
             info.enabled = false;
             state.xi_register_source(&info);
         }
-        // Task 15 adds the master's last-slave source reference; clear that
-        // reference here on disable/removal when it becomes part of state.
+        if was_enabled {
+            let _dropped = yserver_core::xinput::hotplug::emit_xi_hierarchy_changed(
+                state,
+                yserver_core::xinput::hotplug::XiHierarchyStep::DeviceDisabled,
+                &changed_ids,
+                &[],
+            );
+        }
     }
 }
 
@@ -20295,7 +20316,25 @@ impl Backend for KmsBackend {
                     info.device_node,
                     info.is_touchpad,
                 );
-                state.xi_register_source(&info);
+                let continuing = state.xi_devices.source(info.source_id).is_some();
+                if !continuing {
+                    let mut disabled_info = info.clone();
+                    disabled_info.enabled = false;
+                    let added_ids = state.xi_register_source(&disabled_info);
+                    let _dropped = yserver_core::xinput::hotplug::emit_xi_hierarchy_changed(
+                        state,
+                        yserver_core::xinput::hotplug::XiHierarchyStep::SlaveAdded,
+                        &added_ids,
+                        &[],
+                    );
+                }
+                let enabled_ids = state.xi_register_source(&info);
+                let _dropped = yserver_core::xinput::hotplug::emit_xi_hierarchy_changed(
+                    state,
+                    yserver_core::xinput::hotplug::XiHierarchyStep::DeviceEnabled,
+                    &enabled_ids,
+                    &[],
+                );
                 return;
             }
             HostInputEvent::DeviceResumed(info) => {
@@ -20306,9 +20345,13 @@ impl Backend for KmsBackend {
                     info.device_node,
                     info.is_touchpad,
                 );
-                state.xi_register_source(&info);
-                // Task 15/16 insert the per-facet Enabled notification at
-                // this single continuation transition point.
+                let enabled_ids = state.xi_register_source(&info);
+                let _dropped = yserver_core::xinput::hotplug::emit_xi_hierarchy_changed(
+                    state,
+                    yserver_core::xinput::hotplug::XiHierarchyStep::DeviceEnabled,
+                    &enabled_ids,
+                    &[],
+                );
                 return;
             }
             HostInputEvent::DeviceSuspended { source_id } => {
@@ -20320,8 +20363,7 @@ impl Backend for KmsBackend {
                 {
                     self.release_device_state(state, source_id);
                 }
-                // Task 15/16 insert the per-facet Disabled notification at
-                // the synchronous state transition in release_device_state;
+                // release_device_state publishes Disabled synchronously;
                 // a delayed duplicate suspend has no transition to publish.
                 return;
             }
@@ -20330,8 +20372,38 @@ impl Backend for KmsBackend {
                 if state.xi_devices.source(source_id).is_none() {
                     return;
                 }
+                let was_enabled = state
+                    .xi_devices
+                    .source(source_id)
+                    .is_some_and(|info| info.enabled);
                 self.release_device_state(state, source_id);
-                state.xi_unregister_source(source_id);
+                if !was_enabled {
+                    let disabled_ids: Vec<u16> = [
+                        state
+                            .xi_devices
+                            .facet(source_id, yserver_core::xinput::XiFacetKind::Keyboard),
+                        state
+                            .xi_devices
+                            .facet(source_id, yserver_core::xinput::XiFacetKind::PointerTouch),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                    let _dropped = yserver_core::xinput::hotplug::emit_xi_hierarchy_changed(
+                        state,
+                        yserver_core::xinput::hotplug::XiHierarchyStep::DeviceDisabled,
+                        &disabled_ids,
+                        &[],
+                    );
+                }
+                let removed_ids = state.xi_unregister_source(source_id);
+                let removed = state.take_xi_removed_device_descriptors();
+                let _dropped = yserver_core::xinput::hotplug::emit_xi_hierarchy_changed(
+                    state,
+                    yserver_core::xinput::hotplug::XiHierarchyStep::SlaveRemoved,
+                    &removed_ids,
+                    &removed,
+                );
                 self.synchronize_floating_keyboard_states(state);
                 return;
             }
@@ -29675,6 +29747,353 @@ mod tests {
         }
         assert_eq!(w.check(t0 + WarnThrottle::PERIOD), Some(5));
         assert_eq!(w.check(t0 + WarnThrottle::PERIOD), None);
+    }
+
+    #[test]
+    fn xi2_dynamic_hotplug_publishes_atomic_hierarchy_steps() {
+        use std::{
+            collections::{HashMap, HashSet, VecDeque},
+            io::{ErrorKind, Read},
+            os::unix::net::UnixStream,
+            sync::{Arc, Mutex, atomic::AtomicU16},
+        };
+        use yserver_core::{
+            backend::Backend,
+            core_loop::{DeviceInfo, HostInputEvent, process_request},
+            server::{ClientState, ServerState},
+            xinput::{InputCapabilities, InputSourceId},
+        };
+        use yserver_protocol::x11::{ClientByteOrder, ClientId, RequestHeader, SequenceNumber};
+
+        fn install(state: &mut ServerState, id: u32, hierarchy: bool) -> UnixStream {
+            let (peer, writer) = UnixStream::pair().expect("client socket pair");
+            writer.set_nonblocking(true).expect("nonblocking writer");
+            peer.set_nonblocking(true).expect("nonblocking peer");
+            let mut xi2_masks = HashMap::new();
+            if hierarchy {
+                xi2_masks.insert(
+                    (yserver_core::resources::ROOT_WINDOW, 0),
+                    1_u64 << 11, // XI_HierarchyChanged
+                );
+            }
+            state.clients.insert(
+                id,
+                ClientState {
+                    writer: Arc::new(Mutex::new(yserver_core::transport::Transport::Unix(writer))),
+                    is_local: true,
+                    fd_passing: true,
+                    byte_order: ClientByteOrder::LittleEndian,
+                    last_sequence: Arc::new(AtomicU16::new(0)),
+                    resource_id_base: 0,
+                    resource_id_mask: u32::MAX,
+                    event_masks: HashMap::new(),
+                    save_set: HashSet::new(),
+                    big_requests_enabled: false,
+                    xi2_masks,
+                    xi1_event_classes: HashSet::new(),
+                    xi1_window_event_classes: HashMap::new(),
+                    outbound: VecDeque::new(),
+                    watching_writable: false,
+                    focused_window: yserver_core::resources::ROOT_WINDOW,
+                    reader_control: None,
+                },
+            );
+            peer
+        }
+
+        fn read_events(peer: &mut UnixStream) -> Vec<Vec<u8>> {
+            let mut wire = vec![0; 4096];
+            let mut used = 0;
+            loop {
+                match peer.read(&mut wire[used..]) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        used += n;
+                        if used == wire.len() {
+                            break;
+                        }
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                    Err(error) => panic!("read event stream: {error}"),
+                }
+            }
+            wire.truncate(used);
+            let mut events = Vec::new();
+            let mut offset = 0;
+            while offset < wire.len() {
+                assert!(offset + 32 <= wire.len(), "complete generic event header");
+                let words =
+                    u32::from_le_bytes(wire[offset + 4..offset + 8].try_into().unwrap()) as usize;
+                let event_len = 32 + words * 4;
+                assert!(offset + event_len <= wire.len(), "complete hierarchy event");
+                events.push(wire[offset..offset + event_len].to_vec());
+                offset += event_len;
+            }
+            events
+        }
+
+        fn event_info(event: &[u8], device_id: u16) -> (u16, u8, u8, u32) {
+            assert_eq!(event[0], 35, "GenericEvent");
+            assert_eq!(event[1], 137, "XI extension opcode");
+            assert_eq!(u16::from_le_bytes([event[8], event[9]]), 11);
+            assert_eq!(
+                u16::from_le_bytes([event[10], event[11]]),
+                0,
+                "XIAllDevices"
+            );
+            let count = u16::from_le_bytes([event[20], event[21]]) as usize;
+            let length = u32::from_le_bytes(event[4..8].try_into().unwrap()) as usize;
+            assert_eq!(length * 4, count * 12, "full xXIHierarchyInfo list");
+            let aggregate = event[32..32 + count * 12]
+                .chunks_exact(12)
+                .fold(0, |flags, info| {
+                    flags | u32::from_le_bytes(info[8..12].try_into().unwrap())
+                });
+            assert_eq!(
+                u32::from_le_bytes(event[16..20].try_into().unwrap()),
+                aggregate,
+                "event flags OR all info flags"
+            );
+            for info in event[32..32 + count * 12].chunks_exact(12) {
+                if u16::from_le_bytes([info[0], info[1]]) == device_id {
+                    return (
+                        u16::from_le_bytes([info[2], info[3]]),
+                        info[4],
+                        info[5],
+                        u32::from_le_bytes(info[8..12].try_into().unwrap()),
+                    );
+                }
+            }
+            panic!("hierarchy event omitted device {device_id}");
+        }
+
+        fn event_device_ids(event: &[u8]) -> Vec<u16> {
+            let count = u16::from_le_bytes([event[20], event[21]]) as usize;
+            event[32..32 + count * 12]
+                .chunks_exact(12)
+                .map(|info| u16::from_le_bytes([info[0], info[1]]))
+                .collect()
+        }
+
+        fn source_info(source_id: InputSourceId) -> DeviceInfo {
+            DeviceInfo {
+                source_id,
+                enabled: true,
+                resume_key: None,
+                capabilities: InputCapabilities {
+                    keyboard: true,
+                    pointer: true,
+                    touch: false,
+                },
+                name: "mixed hotplug test device".to_owned(),
+                device_node: "/dev/input/event-test".to_owned(),
+                sysname: "event-test".to_owned(),
+                vendor_id: 0x1234,
+                product_id: 0x5678,
+                is_touchpad: false,
+                config: Default::default(),
+            }
+        }
+
+        let source = InputSourceId(0x15_aa);
+        let info = source_info(source);
+        let mut state = ServerState::new();
+        let mut backend = KmsBackend::for_tests();
+        let mut selected = install(&mut state, 1, true);
+        let mut unrelated = install(&mut state, 2, false);
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceAdded(info.clone()),
+        );
+        for (sequence, device_id) in [6_u16, 7].into_iter().enumerate() {
+            let device_id_bytes = device_id.to_le_bytes();
+            process_request::process_request(
+                &mut state,
+                &mut backend,
+                ClientId(2),
+                SequenceNumber(u16::try_from(sequence + 1).unwrap()),
+                RequestHeader {
+                    opcode: 137,
+                    data: 48, // XIQueryDevice
+                    length_units: 2,
+                },
+                &[device_id_bytes[0], device_id_bytes[1], 0, 0],
+                None,
+            )
+            .expect("XIQueryDevice sees a newly registered facet before its event is read");
+            let replies = read_events(&mut unrelated);
+            assert_eq!(replies.len(), 1);
+            assert_eq!(replies[0][0], 1, "XIQueryDevice reply");
+            assert_eq!(u16::from_le_bytes([replies[0][8], replies[0][9]]), 1);
+            assert_eq!(
+                u16::from_le_bytes([replies[0][32], replies[0][33]]),
+                device_id
+            );
+            assert_eq!(replies[0][42], 1, "XIQueryDevice reports enabled facets");
+        }
+        let added_and_enabled = read_events(&mut selected);
+        assert_eq!(
+            added_and_enabled.len(),
+            2,
+            "Added then Enabled are separate events; client={:?}; outbound={}",
+            state.clients[&1].xi2_masks,
+            state.clients[&1].outbound.len(),
+        );
+        for event in &added_and_enabled {
+            assert_eq!(event_device_ids(event), vec![2, 3, 4, 5, 6, 7]);
+        }
+        assert_eq!(event_info(&added_and_enabled[0], 6), (3, 4, 0, 1 << 2));
+        assert_eq!(event_info(&added_and_enabled[0], 7), (2, 3, 0, 1 << 2));
+        assert_eq!(event_info(&added_and_enabled[1], 6), (3, 4, 1, 1 << 6));
+        assert_eq!(event_info(&added_and_enabled[1], 7), (2, 3, 1, 1 << 6));
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceSuspended { source_id: source },
+        );
+        let disabled = read_events(&mut selected);
+        assert_eq!(disabled.len(), 1, "VT suspension publishes Disabled only");
+        assert_eq!(event_device_ids(&disabled[0]), vec![2, 3, 4, 5, 6, 7]);
+        assert_eq!(event_info(&disabled[0], 6), (3, 4, 0, 1 << 7));
+        assert_eq!(event_info(&disabled[0], 7), (2, 3, 0, 1 << 7));
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceResumed(info.clone()),
+        );
+        let enabled = read_events(&mut selected);
+        assert_eq!(enabled.len(), 1, "VT continuation publishes Enabled only");
+        assert_eq!(event_device_ids(&enabled[0]), vec![2, 3, 4, 5, 6, 7]);
+        assert_eq!(event_info(&enabled[0], 6), (3, 4, 1, 1 << 6));
+        assert_eq!(event_info(&enabled[0], 7), (2, 3, 1, 1 << 6));
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceRemoved { source_id: source },
+        );
+        let disabled_and_removed = read_events(&mut selected);
+        assert_eq!(
+            disabled_and_removed.len(),
+            2,
+            "Disabled then Removed are separate events"
+        );
+        assert_eq!(
+            event_device_ids(&disabled_and_removed[0]),
+            vec![2, 3, 4, 5, 6, 7]
+        );
+        assert_eq!(
+            event_device_ids(&disabled_and_removed[1]),
+            vec![2, 3, 4, 5, 6, 7]
+        );
+        assert_eq!(event_info(&disabled_and_removed[0], 6), (3, 4, 0, 1 << 7));
+        assert_eq!(event_info(&disabled_and_removed[0], 7), (2, 3, 0, 1 << 7));
+        assert_eq!(event_info(&disabled_and_removed[1], 6), (0, 0, 0, 1 << 3));
+        assert_eq!(event_info(&disabled_and_removed[1], 7), (0, 0, 0, 1 << 3));
+
+        assert!(state.xi_devices.source(source).is_none());
+        assert!(state.xi_devices.device(6).is_none());
+        assert!(state.xi_devices.device(7).is_none());
+        assert!(state.take_xi_removed_device_descriptors().is_empty());
+        assert_eq!(
+            state.xi_devices.len(),
+            4,
+            "only masters and virtual devices remain"
+        );
+
+        let unmatched_source = InputSourceId(source.0 + 1);
+        let unmatched_info = source_info(unmatched_source);
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceAdded(unmatched_info.clone()),
+        );
+        let fresh_add = read_events(&mut selected);
+        assert_eq!(
+            fresh_add.len(),
+            2,
+            "unmatched endpoint starts with Added/Enabled"
+        );
+        assert_eq!(event_info(&fresh_add[0], 6), (3, 4, 0, 1 << 2));
+        assert_eq!(event_info(&fresh_add[1], 6), (3, 4, 1, 1 << 6));
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceSuspended {
+                source_id: unmatched_source,
+            },
+        );
+        let unmatched_disabled = read_events(&mut selected);
+        assert_eq!(unmatched_disabled.len(), 1);
+        assert_eq!(event_info(&unmatched_disabled[0], 6), (3, 4, 0, 1 << 7));
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceRemoved {
+                source_id: unmatched_source,
+            },
+        );
+        let unmatched_removed = read_events(&mut selected);
+        assert_eq!(
+            unmatched_removed.len(),
+            2,
+            "ordinary removal is Disabled/Removed"
+        );
+        assert_eq!(event_info(&unmatched_removed[0], 6), (3, 4, 0, 1 << 7));
+        assert_eq!(event_info(&unmatched_removed[1], 6), (0, 0, 0, 1 << 3));
+        assert!(state.xi_devices.source(unmatched_source).is_none());
+
+        let fresh_source = InputSourceId(source.0 + 2);
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceAdded(source_info(fresh_source)),
+        );
+        let readd = read_events(&mut selected);
+        assert_eq!(
+            readd.len(),
+            2,
+            "a fresh source gets Added/Enabled after Removed"
+        );
+        assert_eq!(event_info(&readd[0], 6), (3, 4, 0, 1 << 2));
+        assert_eq!(event_info(&readd[1], 6), (3, 4, 1, 1 << 6));
+        assert!(state.xi_devices.source(fresh_source).is_some());
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceRemoved {
+                source_id: fresh_source,
+            },
+        );
+        let final_remove = read_events(&mut selected);
+        assert_eq!(final_remove.len(), 2);
+        assert_eq!(event_info(&final_remove[0], 6), (3, 4, 0, 1 << 7));
+        assert_eq!(event_info(&final_remove[1], 6), (0, 0, 0, 1 << 3));
+
+        assert!(state.xi_devices.source(fresh_source).is_none());
+        assert!(state.xi_devices.device(6).is_none());
+        assert!(state.xi_devices.device(7).is_none());
+        assert!(state.take_xi_removed_device_descriptors().is_empty());
+        assert_eq!(
+            state.xi_devices.len(),
+            4,
+            "only masters and virtual devices remain"
+        );
+        assert!(state.xi_devices.source_ids().is_empty());
+        assert!(state.key_down_by_device.is_empty());
+        assert!(state.unpublished_keyboard_keys_down.is_empty());
+        assert!(state.unpublished_pointer_buttons_down.is_empty());
+        assert_eq!(state.buttons_down, 0);
+        assert!(backend.core.down_keys.is_empty());
+        assert_eq!(backend.core.button_mask, 0);
+        assert!(backend.core.pending_pointer_events.is_empty());
+        assert_eq!(state.xi_devices.device(4).unwrap().buttons_down, 0);
+        assert_eq!(state.xi_devices.device(5).unwrap().buttons_down, 0);
+        assert!(read_events(&mut unrelated).is_empty());
     }
 
     use super::{
@@ -39463,9 +39882,27 @@ mod tests {
             "the removed facet holds its physical and explicit-XTEST buttons",
         );
 
+        assert_eq!(
+            state
+                .xi_devices
+                .device(removed_keyboard)
+                .unwrap()
+                .properties,
+            removed_keyboard_properties,
+            "keyboard facet properties are intact immediately before removal",
+        );
+        assert_eq!(
+            state.xi_devices.device(removed_pointer).unwrap().properties,
+            removed_pointer_properties,
+            "pointer facet properties are intact immediately before removal",
+        );
         backend.on_host_input(
             &mut state,
             HostInputEvent::DeviceRemoved { source_id: REMOVED },
+        );
+        assert!(
+            state.pending_xi_device_removals.is_empty(),
+            "the production removal dispatch consumes descriptor snapshots for XI2 Removed",
         );
         let removal_bytes = drain_peer(&mut state, &mut peer);
         let removal_events = xi2_events(&removal_bytes);
@@ -39619,38 +40056,8 @@ mod tests {
             HostInputEvent::DeviceRemoved { source_id: REMOVED },
         );
         assert!(drain_peer(&mut state, &mut peer).is_empty());
-        assert_eq!(state.pending_xi_device_removals.len(), 2);
-        let removed_descriptors = state.take_xi_removed_device_descriptors();
-        assert_eq!(
-            removed_descriptors
-                .iter()
-                .map(|device| device.id)
-                .collect::<Vec<_>>(),
-            vec![removed_keyboard, removed_pointer],
-            "both facet snapshots are returned together for later removal notifications",
-        );
-        assert!(removed_descriptors.iter().all(|device| !device.enabled));
-        assert!(
-            removed_descriptors
-                .iter()
-                .all(|device| device.buttons_down == 0)
-        );
-        assert_eq!(
-            removed_descriptors
-                .iter()
-                .find(|device| device.id == removed_keyboard)
-                .unwrap()
-                .properties,
-            removed_keyboard_properties,
-        );
-        assert_eq!(
-            removed_descriptors
-                .iter()
-                .find(|device| device.id == removed_pointer)
-                .unwrap()
-                .properties,
-            removed_pointer_properties,
-        );
+        assert!(state.pending_xi_device_removals.is_empty());
+        assert!(state.take_xi_removed_device_descriptors().is_empty());
         assert!(backend.core.down_keys.contains(&HYPERX_KEY));
         assert!(backend.core.down_keys.contains(&SHIFT_L));
         assert!(!backend.core.down_keys.contains(&CTRL_L));
