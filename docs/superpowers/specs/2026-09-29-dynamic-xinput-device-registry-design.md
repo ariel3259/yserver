@@ -15,12 +15,25 @@ device 4 even while motion comes from the Razer. The i3 command
 `xinput set-prop 4 "libinput Accel Profile Enabled" 0 1 0` then configures the
 wrong libinput source. `xinput list` exposes only one physical pointer facade.
 
-The objective is for every usable libinput keyboard, pointer, and touch
-function to have its own XInput identity and for all clients to see and
-configure the same live devices. No exact device selector or heuristic for a
+The objective is for every usable libinput keyboard and pointer function,
+including laptop touchpads, to have its own XInput identity and for all
+clients to see and configure the same live devices. No exact device selector or heuristic for a
 "primary mouse" is part of the design. Acceleration is configured per
 device through its own XI properties; there is no server-wide default
 (see "Mouse acceleration configuration").
+
+## Scope revision: direct touch is out of scope
+
+**Revised 2026-10-02 (user decision):** the intended scope is mice,
+keyboards and laptop touchpads. Direct-touch devices (touchscreens, touch
+tablets) were never a goal and are excluded; the companion touch plan is
+dropped. A touchpad remains a pointer facet classified `TOUCHPAD` with its
+own libinput properties, and touchpad gestures never imply an XI2
+TouchClass. A touch-only libinput source gets no XI facet, and libinput
+touch events are not translated, exactly as before this design. Wherever
+this document still mentions `Touch` facets, XI2 TouchClass, touch
+contacts, `TOUCHSCREEN` or touch delivery, that text is historical and not
+a requirement.
 
 ## Grounding and compatibility
 
@@ -296,63 +309,12 @@ the virtual XTEST pointer and never configures a physical mouse. A device
 plugged in after startup keeps libinput's default until a client
 configures it.
 
-## Touch protocol details clarified by the adversarial review
+## Touch protocol details (dropped)
 
-These details refine the approved topology using Xorg and the official
-[xf86-input-libinput 1.5.0 source](https://www.x.org/releases/individual/driver/xf86-input-libinput-1.5.0.tar.xz).
-A touch-capable pointer/touch facet uses axes 0/1 labeled `Abs MT Position X/Y`,
-Absolute, range 0..65535, resolution 0. A touch-only facet has seven buttons,
-four valuators (0/1 absolute MT, 2/3 relative scroll labels), no ScrollClass,
-and TouchClass. A combined pointer/touch source uses that same X/Y axis
-model with both pointer-initialized ScrollClasses on 2/3, matching the
-driver's unconditional horizontal/vertical setup; pointer-only sources retain
-their existing axis model. Relative motion on a combined absolute-axis
-source follows Xorg's integration in native device units and scaling,
-rather than pointer-only pixel speed. Master copies keep the slave's
-native valuator values/classes; only root/event coordinates use root pixels.
-All fixed-point values preserve fractional precision.
-
-Ordinary End retains the last contact position. RawTouchEnd includes axes
-0/1 with that last processed native position and raw values zero, matching
-GetTouchEvents' backfill after an empty raw driver mask. Forced physical
-End on disable/removal also emits RawTouchEnd; ownership-only artificial
-End does not. The driver uses 15 contacts when libinput reports an unknown
-count; clamp the advertised count to 255 for the protocol's one-byte field.
-
-Touch maps native values (`norm × 65535`) to the entire client root using
-`native × state.randr.screen_width/height ÷ 65536`, matching Xorg's
-inclusive declared axis range, and uses the common root hit-test path. Default
-input mapping adds no per-output rotation, mode or scanout transform
-without a Coordinate Transformation Matrix. Only the pointer-emulating
-contact uses pointer root/confinement processing; report its normal touch
-coordinates after confinement while raw processed coordinates retain their
-pre-confinement native values. Other contacts retain their own unconstrained
-positions, including intentional gaps between outputs. Restricted pointer
-emulation delivery restricts only Motion/Button through the ordinary KMS
-queue to the retained pointer listener, without an unrestricted duplicate.
-Enter/Leave crossings, cursor updates and XFIXES cursor notifications retain
-ordinary delivery to their selecting clients. A regular touch owner gets
-sprite/crossing movement without an additional pointer stream; the
-no-listener Motion fallback follows Xorg DeliverEmulatedMotionEvent.
-Touch-emulated cookies do not add raw pointer events to the raw touch stream.
-
-Emulated button state is separate TouchClass accounting per device/master,
-combined with physical state only in reported core/button masks. Emulated
-Press/Release reach their chosen listener regardless of another physical or
-touch hold of the same button. Physical-button aggregation never suppresses
-an emulated terminal Release; replay and pending ownership do not count a
-hold or terminal transition twice.
-
-Regular touch delivery follows Xorg's ordered listener chain and chooses
-at most one regular listener per device-form sequence. It retains its target
-from Begin. Raw subscribers are independent. XISelectEvents requires the
-Begin/Update/End triplet when any regular touch or ownership bit is selected
-and enforces Xorg's per-window selector conflicts. TouchBegin passive grabs,
-accept/reject, early acceptance, ownership transfer and pending-End replay
-must be implemented before claiming touch support. Pointer emulation follows
-the chosen pointer listener; it is not a separate broadcast to every client
-without a touch mask. Only the first concurrently active direct-touch contact
-on each source emulates the pointer; later contacts are not promoted.
+The touch protocol details recorded by the 2026-09-30 adversarial review
+(TouchClass axes, contact delivery, touch grabs, pointer emulation) belonged
+to the dropped direct-touch scope; see "Scope revision" above and the
+findings documents for the historical text.
 
 ## Review correction record
 
@@ -384,8 +346,7 @@ tracked in `docs/status.md`.
   property changes only that source (no server-wide default exists).
 - Pointer and keyboard events carry their actual source IDs; master/core
   behavior, focus, grabs, scroll, XTEST, and existing touchpad properties
-  continue to work. Touch contacts from a touch-capable source generate
-  begin/update/end with a stable contact ID and are removed cleanly.
+  continue to work. (Direct-touch contacts are out of scope.)
 - VT switching releases held keys/buttons/contacts exactly once, preserves
   IDs, selection masks and confirmed settings for proven continuations,
   and exposes Disabled/Enabled without false Removed/Added transitions.

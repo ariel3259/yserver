@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust workspace (`yserver`, `yserver-core`, `yserver-protocol`), libinput via the `input` crate, XI1/XI2, Xorg source in `../xserver`.
 
-**Spec:** `docs/superpowers/specs/2026-09-29-dynamic-xinput-device-registry-design.md`. This plan implements keyboard/pointer registration and routing. The companion plan `2026-09-29-dynamic-xinput-touch.md` completes its touch requirements after this plan.
+**Spec:** `docs/superpowers/specs/2026-09-29-dynamic-xinput-device-registry-design.md`. This plan implements keyboard/pointer registration and routing, touchpads included. The companion touch plan was DROPPED on 2026-10-02 (direct touch is out of scope); this plan alone completes the feature.
 
 **Executor:** One implementation subagent per numbered task, using `gpt-6-luna` with reasoning effort `xhigh`. The parent supplies this plan, the approved spec, the task number, and the latest completed-task summary. Do not send a subagent the whole conversation as its only instructions. A task ends with a commit and a concise handoff naming changed interfaces, verification output, and any unresolved issue. A fresh task reviewer checks spec compliance and code quality before the parent dispatches the dependent task; a separate whole-branch review follows the final task.
 
@@ -287,4 +287,4 @@ Add `Backend::reset_input_session(&mut self, old_state: &mut ServerState)` with 
 
 ## Completion boundary
 
-This plan delivers the bug fix for Razer/HyperX and independently usable keyboard/pointer XI registration. The touch companion plan adds XI2 TouchClass and contact delivery. Both plans together satisfy the approved spec.
+This plan delivers the bug fix for Razer/HyperX and independently usable keyboard/pointer XI registration, touchpads included. Direct touch is out of scope (2026-10-02); this plan alone satisfies the revised spec.
