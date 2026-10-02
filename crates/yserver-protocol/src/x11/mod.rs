@@ -2523,6 +2523,63 @@ pub fn encode_xi2_device_changed_event(
     debug_assert_eq!(out.len(), 32 + classes.len());
 }
 
+/// One live or just-removed device entry in an XI2 hierarchy notification.
+/// `use_` is one of `XIMasterPointer`, `XIMasterKeyboard`, `XISlavePointer`,
+/// `XISlaveKeyboard`, or zero for a removed descriptor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct XiHierarchyInfo {
+    pub device_id: u16,
+    pub attachment: u16,
+    pub use_: u8,
+    pub enabled: bool,
+    pub flags: u32,
+}
+
+/// Encode XI2 `XI_HierarchyChanged` (XI2proto.h's `xXIHierarchyEvent` plus
+/// its trailing `xXIHierarchyInfo[]`). Each info record is 12 bytes; the
+/// GenericEvent length counts only the trailing records in 4-byte units.
+pub fn encode_xi2_hierarchy_changed_event(
+    out: &mut Vec<u8>,
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    major_opcode: u8,
+    time: u32,
+    infos: &[XiHierarchyInfo],
+) {
+    const XI_HIERARCHY_CHANGED: u16 = 11;
+
+    let event_flags = infos.iter().fold(0, |flags, info| flags | info.flags);
+    out.push(35); // GenericEvent
+    out.push(major_opcode);
+    write_u16(byte_order, out, sequence.0);
+    write_u32(
+        byte_order,
+        out,
+        u32::try_from(infos.len().saturating_mul(12) / 4).unwrap_or(u32::MAX),
+    );
+    write_u16(byte_order, out, XI_HIERARCHY_CHANGED);
+    write_u16(byte_order, out, 0); // XIAllDevices
+    write_u32(byte_order, out, time);
+    write_u32(byte_order, out, event_flags);
+    write_u16(
+        byte_order,
+        out,
+        u16::try_from(infos.len()).unwrap_or(u16::MAX),
+    );
+    write_u16(byte_order, out, 0); // pad0
+    write_u32(byte_order, out, 0); // pad1
+    write_u32(byte_order, out, 0); // pad2
+    for info in infos {
+        write_u16(byte_order, out, info.device_id);
+        write_u16(byte_order, out, info.attachment);
+        out.push(info.use_);
+        out.push(u8::from(info.enabled));
+        write_u16(byte_order, out, 0); // pad
+        write_u32(byte_order, out, info.flags);
+    }
+    debug_assert_eq!(out.len(), 32 + infos.len() * 12);
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn encode_xi2_crossing_event(
     out: &mut Vec<u8>,
