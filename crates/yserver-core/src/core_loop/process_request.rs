@@ -10867,6 +10867,225 @@ pub(crate) fn emit_dpms_notify(state: &mut ServerState) {
     }
 }
 
+/// A window or pixmap of that id.
+fn drawable_exists(state: &ServerState, id: ResourceId) -> bool {
+    state.resources.window(id).is_some() || state.resources.pixmap(id).is_some()
+}
+
+/// `ScreenSaverSetAttributes` (`Xext/saver.c:734-1073`): CreateWindow's
+/// checks against the root, then BadAccess when another client holds
+/// the attributes; else they are this client's, replacing its own.
+fn screen_saver_set_attributes(
+    state: &mut ServerState,
+    client_id: ClientId,
+    body: &[u8],
+) -> Result<(), (u8, u32)> {
+    use crate::server::SaverAttributes;
+    if body.len() < 24 {
+        return Err((x11::error::BAD_LENGTH, 0));
+    }
+    let u16_at = |i: usize| u16::from_le_bytes([body[i], body[i + 1]]);
+    let u32_at = |i: usize| u32::from_le_bytes([body[i], body[i + 1], body[i + 2], body[i + 3]]);
+    let drawable = u32_at(0);
+    let (x, y) = (u16_at(4) as i16, u16_at(6) as i16);
+    let (width, height, border_width) = (u16_at(8), u16_at(10), u16_at(12));
+    let (class, depth, visual, value_mask) = (body[14], body[15], u32_at(16), u32_at(20));
+    if !drawable_exists(state, ResourceId(drawable)) {
+        return Err((x11::error::BAD_DRAWABLE, drawable));
+    }
+    let values: Vec<u32> = body[24..].chunks_exact(4).map(u32_at_slice).collect();
+    if usize::try_from(value_mask.count_ones()).ok() != Some(values.len()) {
+        return Err((x11::error::BAD_LENGTH, 0));
+    }
+    if width == 0 || height == 0 {
+        return Err((x11::error::BAD_VALUE, 0));
+    }
+    // The root is InputOutput, of the root depth and visual.
+    let effective_class = match class {
+        0 | 1 => 1,
+        2 => 2,
+        other => return Err((x11::error::BAD_VALUE, u32::from(other))),
+    };
+    if effective_class == 2 && (border_width != 0 || depth != 0) {
+        return Err((x11::error::BAD_MATCH, 0));
+    }
+    let depth = if effective_class == 1 && depth == 0 {
+        crate::resources::ROOT_DEPTH
+    } else {
+        depth
+    };
+    let visual = if visual == 0 {
+        crate::resources::ROOT_VISUAL.0
+    } else {
+        visual
+    };
+    if (visual != crate::resources::ROOT_VISUAL.0 || depth != crate::resources::ROOT_DEPTH)
+        && !state.resources.is_known_visual(ResourceId(visual))
+    {
+        return Err((x11::error::BAD_MATCH, 0));
+    }
+    const CW_BORDER: u32 = 0x0004 | 0x0008;
+    const CW_COLORMAP: u32 = 0x2000;
+    if value_mask & CW_BORDER == 0 && effective_class != 2 && depth != crate::resources::ROOT_DEPTH
+    {
+        return Err((x11::error::BAD_MATCH, 0));
+    }
+    if value_mask & CW_COLORMAP == 0
+        && effective_class != 2
+        && visual != crate::resources::ROOT_VISUAL.0
+    {
+        return Err((x11::error::BAD_MATCH, 0));
+    }
+    if state
+        .screensaver
+        .attributes
+        .as_ref()
+        .is_some_and(|a| a.client != client_id)
+    {
+        return Err((x11::error::BAD_ACCESS, 0));
+    }
+    state.screensaver.attributes = Some(SaverAttributes {
+        client: client_id,
+        x,
+        y,
+        width,
+        height,
+        border_width,
+        class,
+        depth,
+        visual,
+        value_mask,
+        values,
+    });
+    Ok(())
+}
+
+fn u32_at_slice(c: &[u8]) -> u32 {
+    u32::from_le_bytes([c[0], c[1], c[2], c[3]])
+}
+
+/// `ScreenSaverUnsetAttributes` (`Xext/saver.c:1075-1096`), and a client
+/// going away (`ScreenSaverFreeAttr`): its attributes are dropped, and
+/// the saver window with them.
+pub(crate) fn unset_screen_saver_attributes(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    client_id: ClientId,
+) {
+    if state
+        .screensaver
+        .attributes
+        .as_ref()
+        .is_some_and(|a| a.client == client_id)
+    {
+        state.screensaver.attributes = None;
+        // `ScreenSaverFreeAttr` (`Xext/saver.c:333-355`): a shown window
+        // goes by resetting the saver and starting it again.
+        if state.screensaver.window_shown {
+            apply_screen_saver_transition(state, backend, ScreenSaverActive::Off, true);
+            apply_screen_saver_transition(state, backend, ScreenSaverActive::On, true);
+        }
+    }
+}
+
+/// `CreateSaverWindow` (`Xext/saver.c:466-564`): the attributes as a
+/// server-owned, override-redirect child of the root, mapped.
+fn create_screen_saver_window(state: &mut ServerState, backend: &mut dyn Backend) {
+    destroy_screen_saver_window(state, backend);
+    let Some(attrs) = state.screensaver.attributes.clone() else {
+        return;
+    };
+    const CW_OVERRIDE_REDIRECT: u32 = 0x0200;
+    let mask = attrs.value_mask | CW_OVERRIDE_REDIRECT;
+    let mut values = Vec::with_capacity(attrs.values.len() + 1);
+    let mut given = attrs.values.iter();
+    for bit in 0..15u32 {
+        let b = 1 << bit;
+        if mask & b == 0 {
+            continue;
+        }
+        if b == CW_OVERRIDE_REDIRECT {
+            if attrs.value_mask & b != 0 {
+                given.next();
+            }
+            values.push(1);
+        } else if let Some(v) = given.next() {
+            values.push(*v);
+        }
+    }
+    // Xorg keeps the values as `unsigned long` and hands them to
+    // CreateWindow as an `XID *` (`Xext/saver.c:494`): on a 64-bit server
+    // every other XID it reads is the high half of the one before, 0.
+    // dtsession's mask-0 window (override-redirect alone) is unaffected;
+    // a mask with background pixel loses its override-redirect.
+    let values: Vec<u32> = values
+        .iter()
+        .flat_map(|v| [*v, 0])
+        .take(values.len())
+        .collect();
+    let window = crate::resources::SCREEN_SAVER_WINDOW;
+    let mut body = Vec::with_capacity(28 + 4 * values.len());
+    body.extend_from_slice(&window.0.to_le_bytes());
+    body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+    for v in [
+        attrs.x as u16,
+        attrs.y as u16,
+        attrs.width,
+        attrs.height,
+        attrs.border_width,
+    ] {
+        body.extend_from_slice(&v.to_le_bytes());
+    }
+    body.extend_from_slice(&u16::from(attrs.class).to_le_bytes());
+    body.extend_from_slice(&attrs.visual.to_le_bytes());
+    body.extend_from_slice(&mask.to_le_bytes());
+    for v in &values {
+        body.extend_from_slice(&v.to_le_bytes());
+    }
+    let header = RequestHeader {
+        opcode: 1,
+        data: attrs.depth,
+        length_units: u32::try_from(1 + body.len() / 4).unwrap_or(u32::MAX),
+    };
+    let server = crate::resources::SERVER_OWNER;
+    let _ = handle_create_window(
+        state,
+        backend,
+        None,
+        server,
+        SequenceNumber(0),
+        header,
+        &body,
+    );
+    if state.resources.window(window).is_none() {
+        return;
+    }
+    let _ = handle_map_window(
+        state,
+        backend,
+        None,
+        server,
+        SequenceNumber(0),
+        &window.0.to_le_bytes(),
+    );
+    state.screensaver.window_shown = true;
+}
+
+/// `DestroySaverWindow` (`Xext/saver.c:566-584`).
+fn destroy_screen_saver_window(state: &mut ServerState, backend: &mut dyn Backend) {
+    if !state.screensaver.window_shown {
+        return;
+    }
+    state.screensaver.window_shown = false;
+    if state
+        .resources
+        .window(crate::resources::SCREEN_SAVER_WINDOW)
+        .is_some()
+    {
+        destroy_window_subtree(state, backend, None, crate::resources::SCREEN_SAVER_WINDOW);
+    }
+}
+
 /// Transition the screensaver to `new` (must be `Off` or `On`).
 /// `Cycle` is an event-only value — it never appears in
 /// `screensaver.active`. Passing it here is a programmer error; the
@@ -10879,7 +11098,7 @@ pub(crate) fn emit_dpms_notify(state: &mut ServerState) {
 /// and is currently unused (SS is purely server-side bookkeeping).
 pub(crate) fn apply_screen_saver_transition(
     state: &mut ServerState,
-    _backend: &mut dyn Backend, // reserved for future coupling (parity with apply_dpms_transition)
+    backend: &mut dyn Backend,
     new: ScreenSaverActive,
     forced: bool,
 ) {
@@ -10903,7 +11122,26 @@ pub(crate) fn apply_screen_saver_transition(
         ),
         _ => None,
     };
+    // `ScreenSaverHandle` (`Xext/saver.c:586-614`): the window first,
+    // then the notify that names it.
+    match new {
+        ScreenSaverActive::On => create_screen_saver_window(state, backend),
+        _ => destroy_screen_saver_window(state, backend),
+    }
     emit_screen_saver_notify(state, new, forced);
+}
+
+/// `kind` of QueryInfo and ScreenSaverNotify: External while a client's
+/// attributes are set (`Xext/saver.c:411-416`).
+fn screen_saver_kind(state: &ServerState) -> u8 {
+    use yserver_protocol::x11::screensaver as x11ss;
+    if state.screensaver.attributes.is_some() {
+        x11ss::SCREEN_SAVER_EXTERNAL
+    } else if state.screensaver.prefer_blanking {
+        x11ss::SCREEN_SAVER_BLANKED
+    } else {
+        x11ss::SCREEN_SAVER_INTERNAL
+    }
 }
 
 /// Fan a `ScreenSaverNotify` event out to subscribers. `notify_state`
@@ -10935,11 +11173,7 @@ pub(crate) fn emit_screen_saver_notify(
     }
     let ts = state.timestamp_now();
     let root = crate::resources::ROOT_WINDOW.0;
-    let kind = if state.screensaver.prefer_blanking {
-        x11ss::SCREEN_SAVER_BLANKED
-    } else {
-        x11ss::SCREEN_SAVER_INTERNAL
-    };
+    let kind = screen_saver_kind(state);
     let dropped =
         crate::core_loop::fanout::fanout_event_to_clients(state, &subs, |buf, seq, order| {
             x11ss::encode_screen_saver_notify_event(
@@ -10950,7 +11184,7 @@ pub(crate) fn emit_screen_saver_notify(
                 active_state,
                 ts,
                 root,
-                0, // window — always 0 (no SetAttributes path)
+                crate::resources::SCREEN_SAVER_WINDOW.0,
                 kind,
                 forced,
             );
@@ -11330,16 +11564,12 @@ fn handle_screen_saver_request(
                 .get(&client_id)
                 .copied()
                 .unwrap_or(0);
-            let kind = if state.screensaver.prefer_blanking {
-                x11ss::SCREEN_SAVER_BLANKED
-            } else {
-                x11ss::SCREEN_SAVER_INTERNAL
-            };
+            let kind = screen_saver_kind(state);
             let reply = x11ss::encode_query_info_reply(
                 byte_order,
                 sequence,
                 reply_state,
-                0, /*window*/
+                crate::resources::SCREEN_SAVER_WINDOW.0,
                 til_or_since,
                 last_input,
                 event_mask,
@@ -11369,18 +11599,21 @@ fn handle_screen_saver_request(
             }
         }
         x11ss::SET_ATTRIBUTES => {
-            return emit_x11_error_with_minor(
-                state,
-                client_id,
-                sequence,
-                x11::error::BAD_ACCESS,
-                0,
-                minor_u16,
-                MIT_SCREEN_SAVER_MAJOR_OPCODE,
-            );
+            return match screen_saver_set_attributes(state, client_id, body) {
+                Ok(()) => Ok(RequestOutcome::Handled),
+                Err((code, value)) => emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    code,
+                    value,
+                    minor_u16,
+                    MIT_SCREEN_SAVER_MAJOR_OPCODE,
+                ),
+            };
         }
         x11ss::UNSET_ATTRIBUTES => {
-            if x11ss::parse_unset_attributes_request(body).is_none() {
+            let Some(drawable) = x11ss::parse_unset_attributes_request(body) else {
                 return emit_x11_error_with_minor(
                     state,
                     client_id,
@@ -11390,7 +11623,19 @@ fn handle_screen_saver_request(
                     minor_u16,
                     MIT_SCREEN_SAVER_MAJOR_OPCODE,
                 );
+            };
+            if !drawable_exists(state, ResourceId(drawable)) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_DRAWABLE,
+                    drawable,
+                    minor_u16,
+                    MIT_SCREEN_SAVER_MAJOR_OPCODE,
+                );
             }
+            unset_screen_saver_attributes(state, _backend, client_id);
         }
         x11ss::SUSPEND => {
             let Some(suspend) = x11ss::parse_suspend_request(body) else {
@@ -23406,8 +23651,9 @@ fn handle_create_window(
             return emit_x11_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, 1);
         }
     }
-    // BadIdChoice / BadMatch validation.
-    let validation_failed = {
+    // BadIdChoice / BadMatch validation. The server creates its own
+    // windows (the screensaver's) under `SERVER_OWNER`, with no client.
+    let validation_failed = client_id != crate::resources::SERVER_OWNER && {
         let handle = state.clients.get(&client_id.0).expect("client registered");
         let owned = crate::server::IdAllocator::validate_owned(
             new_id,
@@ -23525,13 +23771,10 @@ fn handle_create_window(
         }
     }
     state.resources.create_window(client_id, request);
-    if mask != 0 {
-        state
-            .clients
-            .get_mut(&client_id.0)
-            .expect("client registered")
-            .event_masks
-            .insert(window_id, mask);
+    if mask != 0
+        && let Some(client) = state.clients.get_mut(&client_id.0)
+    {
+        client.event_masks.insert(window_id, mask);
     }
     let needs_host_xid = state
         .resources
@@ -73734,8 +73977,8 @@ mod tests {
         assert_eq!(bytes[1], x11screensaver::SCREEN_SAVER_DISABLED);
         assert_eq!(
             u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
-            0,
-            "window field is always 0 (no SetAttributes path)"
+            crate::resources::SCREEN_SAVER_WINDOW.0,
+            "the screen's saver window id, set or not (`Xext/saver.c:665`)"
         );
         assert_eq!(
             u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]),
@@ -73899,28 +74142,92 @@ mod tests {
         );
     }
 
+    /// `ScreenSaverSetAttributes` (`Xext/saver.c:840-845`): the first
+    /// client gets the attributes, another BadAccess until the first
+    /// unsets them; activation then creates and maps the server's saver
+    /// window, override-redirect, and deactivation destroys it
+    /// (`CreateSaverWindow` / `DestroySaverWindow`). dtsession sets
+    /// 1x1 InputOutput, mask 0, and exits on BadAccess.
     #[test]
-    fn screen_saver_set_attributes_returns_bad_access() {
+    fn screen_saver_set_attributes_belongs_to_one_client_and_shows_a_window() {
         let mut state = ServerState::new();
-        let mut peer = install_client(&mut state, 1);
+        let mut peer1 = install_client(&mut state, 1);
+        let mut peer2 = install_client(&mut state, 2);
         let mut backend = RecordingBackend::new();
-        let header = RequestHeader {
-            opcode: 150,
-            data: x11screensaver::SET_ATTRIBUTES,
-            length_units: 4,
+        let mut body = ROOT_WINDOW.0.to_le_bytes().to_vec();
+        for v in [0u16, 0, 1, 1, 0] {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+        body.extend_from_slice(&[0, 0]); // CopyFromParent class and depth
+        body.extend_from_slice(&0u32.to_le_bytes()); // visual
+        body.extend_from_slice(&0u32.to_le_bytes()); // mask
+        let request = |state: &mut ServerState,
+                       backend: &mut RecordingBackend,
+                       client,
+                       minor,
+                       body: &[u8]| {
+            let header = RequestHeader {
+                opcode: 150,
+                data: minor,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            };
+            let _ = handle_screen_saver_request(
+                state,
+                backend,
+                ClientId(client),
+                SequenceNumber(1),
+                header,
+                body,
+            );
         };
-        let _ = handle_screen_saver_request(
+        request(
             &mut state,
             &mut backend,
-            ClientId(1),
-            SequenceNumber(1),
-            header,
-            &[0u8; 12],
+            1,
+            x11screensaver::SET_ATTRIBUTES,
+            &body,
         );
+        assert!(
+            read_all_available(&mut peer1).is_empty(),
+            "client 1: no error"
+        );
+        request(
+            &mut state,
+            &mut backend,
+            2,
+            x11screensaver::SET_ATTRIBUTES,
+            &body,
+        );
+        let bytes = read_all_available(&mut peer2);
+        assert_eq!((bytes[0], bytes[1]), (0, x11::error::BAD_ACCESS));
 
-        let bytes = read_all_available(&mut peer);
-        assert_eq!(bytes[0], 0, "error reply");
-        assert_eq!(bytes[1], x11::error::BAD_ACCESS);
+        let saver = crate::resources::SCREEN_SAVER_WINDOW;
+        apply_screen_saver_transition(&mut state, &mut backend, ScreenSaverActive::On, true);
+        let w = state.resources.window(saver).expect("saver window");
+        assert_eq!((w.width, w.height, w.parent), (1, 1, ROOT_WINDOW));
+        assert!(w.override_redirect);
+        assert_eq!(w.map_state, MapState::Viewable);
+        apply_screen_saver_transition(&mut state, &mut backend, ScreenSaverActive::Off, true);
+        assert!(state.resources.window(saver).is_none());
+
+        request(
+            &mut state,
+            &mut backend,
+            1,
+            x11screensaver::UNSET_ATTRIBUTES,
+            &ROOT_WINDOW.0.to_le_bytes(),
+        );
+        request(
+            &mut state,
+            &mut backend,
+            2,
+            x11screensaver::SET_ATTRIBUTES,
+            &body,
+        );
+        assert!(
+            read_all_available(&mut peer2).is_empty(),
+            "client 2 after the unset"
+        );
     }
 
     #[test]

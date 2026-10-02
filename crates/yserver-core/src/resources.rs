@@ -45,6 +45,12 @@ pub const ARGB_COLORMAP: ResourceId = ResourceId(0x104);
 /// Opaque depth-24 visual dedicated to the stencil-free GLX FBConfig used by
 /// glmark2. It must not share ROOT_VISUAL with the stencil-8 configuration.
 pub const GLMARK_VISUAL: ResourceId = ResourceId(0x105);
+/// The MIT-SCREEN-SAVER window, server-owned: Xorg allocates
+/// `pScreen->screensaver.wid` once per screen and reports it in
+/// `QueryInfo` and `ScreenSaverNotify` whether or not it exists
+/// (`Xext/saver.c:665`, `:424`); it does while a client's
+/// `SetAttributes` are shown.
+pub const SCREEN_SAVER_WINDOW: ResourceId = ResourceId(0x106);
 
 /// The X11 depth of the root window, as advertised in the setup reply.
 ///
