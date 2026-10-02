@@ -564,6 +564,10 @@ fn encode_key_xi2_for_device(
 /// valuators, so the keycode, direction and timestamp are all of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RawKeyEvent {
+    /// Keep the producer identity with a raw event while it is queued behind
+    /// a device freeze, even when the backend's current delivery pass is
+    /// master-only.
+    pub origin: crate::core_loop::InputOrigin,
     pub keycode: u8,
     pub pressed: bool,
     /// Shared with the device event generated from the same input
@@ -1813,6 +1817,7 @@ mod tests {
 
         fn raw(keycode: u8, pressed: bool, time: u32) -> RawKeyEvent {
             RawKeyEvent {
+                origin: crate::core_loop::InputOrigin::NestedHost,
                 keycode,
                 pressed,
                 time,

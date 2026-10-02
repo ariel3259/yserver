@@ -63704,7 +63704,7 @@ mod tests {
         );
         assert_eq!(
             state.floating_pointer_positions.get(&razer_id),
-            Some(&(30, 40))
+            Some(&(30.0, 40.0))
         );
 
         let _ = pointer_event_fanout_to_state(

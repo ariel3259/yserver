@@ -876,9 +876,10 @@ fn pointer_event_fanout_to_state_inner(
         .slave_deviceid
         .filter(|_| xi_source.attached_master.is_none());
     if let Some(device_id) = floating_device {
-        state
-            .floating_pointer_positions
-            .insert(device_id, (event.root_x, event.root_y));
+        state.floating_pointer_positions.insert(
+            device_id,
+            (f32::from(event.root_x), f32::from(event.root_y)),
+        );
     } else {
         state.pointer_root = (event.root_x, event.root_y);
     }

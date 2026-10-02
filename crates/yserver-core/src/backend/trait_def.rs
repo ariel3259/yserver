@@ -2855,12 +2855,11 @@ pub trait Backend {
     fn windows_restructured(&mut self, _state: &mut ServerState) {}
 
     /// After the server moved the pointer on its own (XTEST fake motion),
-    /// hand the new position to whatever tracks physical pointer input, so
-    /// the next real motion continues from there instead of jumping back.
-    /// The KMS backend's direct-mode input thread accumulates relative
-    /// deltas from its own copy of the position ([`Self::warp_pointer_root`]
-    /// resyncs it the same way). Default no-op: host-forwarding backends get
-    /// their position from the host.
+    /// hand the new position to backends that keep a producer-side pointer
+    /// position, so the next real motion continues from there. KMS integrates
+    /// physical relative deltas from its current cursor and needs no resync.
+    /// Default no-op: host-forwarding backends get their position from the
+    /// host.
     fn resync_input_position(&mut self) {}
 
     fn query_pointer(&mut self, origin: Option<OriginContext>) -> io::Result<PointerPosition>;

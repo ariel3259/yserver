@@ -5,13 +5,13 @@
 //! to `HostInputEvent`s and pushed onto the core's message channel.
 //! Consecutive `PointerMotion` events from the same origin and motion mode
 //! are coalesced — at most one compatible motion stays in flight to the core
-//! at any given moment, and the latest position wins. Buttons and keys are
-//! never coalesced and flush any pending motion immediately.
+//! at any given moment. Deltas sum, while the latest absolute position wins.
+//! Buttons and keys are never coalesced and flush any pending motion
+//! immediately.
 //!
-//! Cursor accumulation lives on this thread (relative deltas + clamped
-//! absolute mappings). The backend keeps its own cursor mirror updated
-//! when it receives `HostInputEvent::PointerMotion`. A brief skew is
-//! tolerable.
+//! Absolute-device mapping and the current virtual framebuffer extent live
+//! on this thread. Physical relative motion carries its fractional delta to
+//! KMS, which integrates it against the authoritative cursor position.
 //!
 //! Spec: `docs/superpowers/specs/2026-05-05-single-threaded-core-design.md`
 //! Plan: `docs/superpowers/plans/2026-05-06-single-threaded-core.md` §E2.
@@ -46,8 +46,8 @@ use crate::input::{
     hotkey::{Hotkey, HotkeyDetector},
 };
 
-/// Cursor accumulator + framebuffer dimensions held on the libinput
-/// thread.
+/// Absolute pointer mapping position + framebuffer dimensions held on the
+/// libinput thread.
 #[derive(Debug, Clone)]
 pub struct LibinputThreadState {
     cursor_x: f64,
@@ -90,26 +90,11 @@ impl LibinputThreadState {
     /// Update the virtual framebuffer extent used for pointer clamping.
     ///
     /// Called whenever the logical screen size changes (hotplug or
-    /// `RRSetScreenSize`).  The cursor position is NOT re-clamped here;
-    /// it will be clamped to the new extent on the next motion event.
+    /// `RRSetScreenSize`). The last mapped position is not reclamped here;
+    /// absolute input is mapped against the new extent on the next event.
     pub fn set_extent(&mut self, fb_w: u32, fb_h: u32) {
         self.fb_w = fb_w;
         self.fb_h = fb_h;
-    }
-
-    /// Overwrite the cursor accumulator with an absolute position the core
-    /// thread has authoritatively decided (a `WarpPointer`, a confine
-    /// reclamp, or a pointer-barrier clamp). Clamped to the current extent.
-    ///
-    /// Without this, the input thread keeps accumulating relative deltas
-    /// from its own stale position, so a barrier/confine correction in the
-    /// core would not physically hold — the next delta would march the
-    /// cursor straight back past the wall. The caller MUST also drop any
-    /// coalesced `pending_motion` (see the control-wakeup handler) so a
-    /// stale pre-correction delta isn't replayed after the resync.
-    pub fn set_position(&mut self, x: i32, y: i32) {
-        self.cursor_x = f64::from(x).clamp(0.0, f64::from(self.fb_w).max(1.0) - 1.0);
-        self.cursor_y = f64::from(y).clamp(0.0, f64::from(self.fb_h).max(1.0) - 1.0);
     }
 
     /// Translate one libinput event into a `HostInputEvent`.
@@ -141,10 +126,6 @@ impl LibinputThreadState {
                 state: 0,
             }),
             InputEvent::PointerMotion { source_id, dx, dy } => {
-                self.cursor_x =
-                    (self.cursor_x + dx).clamp(0.0, f64::from(self.fb_w).max(1.0) - 1.0);
-                self.cursor_y =
-                    (self.cursor_y + dy).clamp(0.0, f64::from(self.fb_h).max(1.0) - 1.0);
                 HostInputEvent::PointerMotion {
                     origin: InputOrigin::Physical(source_id),
                     x: self.cursor_x as i32,
@@ -274,7 +255,7 @@ pub(crate) enum InputThreadCommand {
 /// client `xinput set-prop` device-config writes that must be applied on the
 /// thread that owns the libinput handles, and a
 /// latched `pending_resize` — the latest virtual framebuffer extent to
-/// apply to the cursor accumulator (only the newest value matters, so
+/// apply to the absolute-device mapping extent (only the newest value matters, so
 /// this uses a pair of atomics rather than a queue).
 #[derive(Debug)]
 pub(crate) struct InputThreadControl {
@@ -290,13 +271,6 @@ pub(crate) struct InputThreadControl {
     /// against a wrong extent. The resize path is rare (resize/hotplug),
     /// so the lock cost is irrelevant.
     pending_resize: Mutex<Option<(u32, u32)>>,
-    /// Latched pending absolute cursor position. Written by the core
-    /// thread via `push_position` after a `WarpPointer` / confine reclamp /
-    /// pointer-barrier clamp; read+cleared by the input thread via
-    /// `take_position`, which overwrites its cursor accumulator and drops
-    /// the coalesced motion. `Mutex<Option<(i32,i32)>>` mirrors
-    /// `pending_resize`: only the newest position matters.
-    pending_position: Mutex<Option<(i32, i32)>>,
 }
 
 impl InputThreadControl {
@@ -308,7 +282,6 @@ impl InputThreadControl {
             configs: Mutex::new(VecDeque::new()),
             efd,
             pending_resize: Mutex::new(None),
-            pending_position: Mutex::new(None),
         })
     }
 
@@ -379,7 +352,7 @@ impl InputThreadControl {
     }
 
     /// Push a new virtual framebuffer extent to the input thread so its
-    /// cursor accumulator clamps to the correct range after a resize or
+    /// absolute-device mapping uses the correct range after a resize or
     /// hotplug.  Only the latest value matters; subsequent calls before
     /// the thread drains the event overwrite the previous value.
     ///
@@ -401,25 +374,6 @@ impl InputThreadControl {
     /// handler.
     pub(crate) fn take_resize(&self) -> Option<(u32, u32)> {
         self.pending_resize
-            .lock()
-            .ok()
-            .and_then(|mut slot| slot.take())
-    }
-
-    /// Push an absolute cursor position to the input thread so its
-    /// accumulator resyncs after a core-side `WarpPointer` / confine
-    /// reclamp / pointer-barrier clamp. Only the latest value matters.
-    pub(crate) fn push_position(&self, x: i32, y: i32) {
-        if let Ok(mut slot) = self.pending_position.lock() {
-            *slot = Some((x, y));
-        }
-        self.wake();
-    }
-
-    /// Read and clear any pending position pushed by [`push_position`].
-    /// Called on the input thread inside the control-wakeup handler.
-    pub(crate) fn take_position(&self) -> Option<(i32, i32)> {
-        self.pending_position
             .lock()
             .ok()
             .and_then(|mut slot| slot.take())
@@ -923,15 +877,6 @@ pub(crate) fn run(
                 log::debug!("input thread: updating cursor extent to {fw}×{fh}");
                 state.set_extent(fw, fh);
             }
-            if let Some((px, py)) = control.take_position() {
-                // Core-authoritative resync (warp / confine / barrier clamp).
-                // Overwrite the accumulator AND drop any coalesced motion —
-                // otherwise a stale pre-clamp delta replays after the
-                // correction and drives the cursor back across the barrier.
-                log::debug!("input thread: resync cursor to ({px}, {py})");
-                state.set_position(px, py);
-                pending_motion = None;
-            }
             for command in commands {
                 paused = match command {
                     InputThreadCommand::Pause if !paused => {
@@ -1204,7 +1149,7 @@ mod tests {
     const TEST_SOURCE_ID: InputSourceId = InputSourceId(1);
 
     #[test]
-    fn maps_relative_motion_to_clamped_absolute() {
+    fn maps_relative_motion_without_cursor_accumulation() {
         let mut s = LibinputThreadState::new(800, 600);
         // Center: (400, 300)
         assert_eq!(s.cursor(), (400.0, 300.0));
@@ -1218,10 +1163,19 @@ mod tests {
         );
         assert!(matches!(
             ev,
-            HostInputEvent::PointerMotion { x: 450, y: 200, .. }
+            HostInputEvent::PointerMotion {
+                x: 400,
+                y: 300,
+                relative: true,
+                dx: 50,
+                dy: -100,
+                motion_delta: Some([50.0, -100.0]),
+                ..
+            }
         ));
-        // Walk past the right edge — clamps to fb_w-1.
-        let _ = s.map(
+        // A large relative move is passed through without making the input
+        // thread a second cursor authority or clamping the physical delta.
+        let large = s.map(
             InputEvent::PointerMotion {
                 source_id: TEST_SOURCE_ID,
                 dx: 1000.0,
@@ -1229,25 +1183,34 @@ mod tests {
             },
             0,
         );
-        let (cx, _) = s.cursor();
-        assert!((cx - 799.0).abs() < 0.5, "cursor_x = {cx}");
+        assert!(matches!(
+            large,
+            HostInputEvent::PointerMotion {
+                x: 400,
+                y: 300,
+                dx: 1000,
+                motion_delta: Some([1000.0, 0.0]),
+                ..
+            }
+        ));
+        assert_eq!(s.cursor(), (400.0, 300.0));
     }
 
-    /// After `set_extent` is called with the new virtual screen size, the
-    /// cursor accumulator must allow motion past the *old* right edge.
+    /// After `set_extent` is called with the new virtual screen size, absolute
+    /// device mapping must cover the *new* virtual extent.
     /// Regression guard for the 2-monitor hotplug bug: boot on a single
     /// 2560-wide screen, plug in a second screen → virtual width becomes
     /// 5120; cursor was stuck at x=2559 until the server restarted.
     #[test]
-    fn set_extent_allows_motion_past_old_right_edge() {
+    fn set_extent_updates_absolute_mapping_past_old_right_edge() {
         // Boot on a single 2560×1440 display.
         let mut s = LibinputThreadState::new(2560, 1440);
-        // Walk cursor to the right edge of the single-monitor boot extent.
+        // An absolute event reaches the right edge of the single-monitor extent.
         let _ = s.map(
-            InputEvent::PointerMotion {
+            InputEvent::PointerMotionAbsolute {
                 source_id: TEST_SOURCE_ID,
-                dx: 10000.0,
-                dy: 0.0,
+                x_norm: 1.0,
+                y_norm: 0.5,
             },
             0,
         );
@@ -1262,10 +1225,10 @@ mod tests {
 
         // Move right: must now cross 2560 and reach the new far edge.
         let ev = s.map(
-            InputEvent::PointerMotion {
+            InputEvent::PointerMotionAbsolute {
                 source_id: TEST_SOURCE_ID,
-                dx: 1000.0,
-                dy: 0.0,
+                x_norm: 0.8,
+                y_norm: 0.5,
             },
             0,
         );
@@ -1283,12 +1246,12 @@ mod tests {
             other => panic!("expected PointerMotion, got {other:?}"),
         }
 
-        // Walk all the way to the new right edge.
+        // Absolute devices map to the full new extent.
         let _ = s.map(
-            InputEvent::PointerMotion {
+            InputEvent::PointerMotionAbsolute {
                 source_id: TEST_SOURCE_ID,
-                dx: 10000.0,
-                dy: 0.0,
+                x_norm: 1.0,
+                y_norm: 0.5,
             },
             0,
         );
@@ -1320,35 +1283,64 @@ mod tests {
         );
     }
 
-    /// `push_position` / `take_position` round-trip (T12 barrier/confine
-    /// resync): deliver the latest position, consume it, latest wins.
     #[test]
-    fn push_position_take_position_round_trip() {
+    fn resize_control_preserves_queued_relative_motion() {
         let ctrl = InputThreadControl::new().expect("control");
-        assert_eq!(ctrl.take_position(), None, "no pending position initially");
-        ctrl.push_position(100, 50);
-        ctrl.push_position(99, 50); // a later clamp overwrites
+        let mut state = LibinputThreadState::new(800, 600);
+        let (poll, sender, rx) = channel().expect("channel");
+        let mut pending = None;
+        process_batch(
+            &mut state,
+            &sender,
+            &mut pending,
+            [InputEvent::PointerMotion {
+                source_id: TEST_SOURCE_ID,
+                dx: 0.4,
+                dy: 0.0,
+            }],
+            0,
+        )
+        .unwrap();
+        ctrl.push_resize(5120, 1440);
         assert_eq!(
-            ctrl.take_position(),
-            Some((99, 50)),
-            "take_position returns the latest pushed position"
+            ctrl.take_resize(),
+            Some((5120, 1440)),
+            "resize control remains available"
         );
-        assert_eq!(ctrl.take_position(), None, "position consumed after take");
+        let Some(HostInputEvent::PointerMotion {
+            x,
+            y,
+            motion_delta: Some([dx, dy]),
+            ..
+        }) = pending
+        else {
+            panic!("relative motion remains pending across resize control");
+        };
+        assert_eq!((x, y), (400, 300));
+        assert!((dx - 0.4).abs() < f64::EPSILON);
+        assert_eq!(dy, 0.0);
+        assert!(rx.try_recv_all().next().is_none());
+        drop(poll);
     }
 
-    /// `set_position` overwrites the accumulator and clamps to the extent,
-    /// so a subsequent relative delta integrates from the corrected base
-    /// (this is what makes a barrier/confine clamp physically hold).
+    /// An absolute/touch event updates the mapped position, while later
+    /// relative input leaves that position alone for KMS to integrate.
     #[test]
-    fn set_position_overwrites_and_clamps_accumulator() {
+    fn absolute_then_relative_mapping_keeps_relative_position_kms_owned() {
         let mut s = LibinputThreadState::new(800, 600);
-        s.set_position(99, 50);
-        assert_eq!(s.cursor(), (99.0, 50.0), "accumulator overwritten");
-        // Out-of-range request clamps to the extent (799×599).
-        s.set_position(10_000, 10_000);
-        assert_eq!(s.cursor(), (799.0, 599.0), "clamped to extent");
-        // A relative delta now integrates from the corrected base, not a
-        // stale position.
+        let absolute = s.map(
+            InputEvent::PointerMotionAbsolute {
+                source_id: TEST_SOURCE_ID,
+                x_norm: 99.0 / 799.0,
+                y_norm: 50.0 / 599.0,
+            },
+            0,
+        );
+        assert!(matches!(
+            absolute,
+            HostInputEvent::PointerMotion { x: 99, y: 50, .. }
+        ));
+        let absolute_position = s.cursor();
         let ev = s.map(
             InputEvent::PointerMotion {
                 source_id: TEST_SOURCE_ID,
@@ -1358,9 +1350,10 @@ mod tests {
             0,
         );
         match ev {
-            HostInputEvent::PointerMotion { x, .. } => assert_eq!(x, 699),
+            HostInputEvent::PointerMotion { x, y, .. } => assert_eq!((x, y), (99, 50)),
             other => panic!("expected PointerMotion, got {other:?}"),
         }
+        assert_eq!(s.cursor(), absolute_position);
     }
 
     /// Only the latest push_resize survives — older values are overwritten.
@@ -1512,13 +1505,15 @@ mod tests {
         );
         // Coalesced raw deltas must SUM (5 motions of dx=dy=1 → 5,5), not
         // collapse to the last one — else XI2 RawMotion loses distance and
-        // SDL2 relative-mouse apps under-track. (#96 follow-up: chromium-bsu)
+        // SDL2 relative-mouse apps under-track. The producer position stays
+        // fixed because KMS integrates physical relative deltas. (#96 follow-up)
         match &collected[0] {
             Message::HostInput(HostInputEvent::PointerMotion {
-                x: 405,
-                y: 305,
+                x: 400,
+                y: 300,
                 dx: 5,
                 dy: 5,
+                motion_delta: Some([5.0, 5.0]),
                 ..
             }) => {}
             other => panic!("first message: {other:?}"),
@@ -1533,16 +1528,67 @@ mod tests {
         }
         match &collected[2] {
             Message::HostInput(HostInputEvent::PointerMotion {
-                x: 408,
-                y: 308,
+                x: 400,
+                y: 300,
                 dx: 3,
                 dy: 3,
+                motion_delta: Some([3.0, 3.0]),
                 ..
             }) => {}
             other => panic!("third message: {other:?}"),
         }
         // Silence unused warning on `poll` — we just need its waker
         // alive for the channel to function.
+        drop(poll);
+    }
+
+    #[test]
+    fn kms_pointer_authority_input_thread_preserves_fractional_relative_motion() {
+        let (poll, sender, rx) = channel().expect("channel");
+        let mut state = LibinputThreadState::new(800, 600);
+        let mut pending: Option<HostInputEvent> = None;
+        process_batch(
+            &mut state,
+            &sender,
+            &mut pending,
+            [0.4, 0.4, 0.4].map(|dx| InputEvent::PointerMotion {
+                source_id: TEST_SOURCE_ID,
+                dx,
+                dy: 0.0,
+            }),
+            100,
+        )
+        .unwrap();
+        if let Some(motion) = pending.take() {
+            sender.send(Message::HostInput(motion)).unwrap();
+        }
+
+        assert_eq!(state.cursor(), (400.0, 300.0));
+        let messages: Vec<Message> = rx.try_recv_all().collect();
+        assert_eq!(messages.len(), 1);
+        match &messages[0] {
+            Message::HostInput(HostInputEvent::PointerMotion {
+                origin,
+                x,
+                y,
+                dx,
+                dy,
+                motion_delta,
+                relative,
+                ..
+            }) => {
+                assert_eq!(*origin, InputOrigin::Physical(TEST_SOURCE_ID));
+                assert_eq!((*x, *y), (400, 300));
+                assert_eq!((*dx, *dy), (0, 0));
+                let Some([motion_dx, motion_dy]) = motion_delta else {
+                    panic!("relative motion must retain the fractional delta");
+                };
+                assert!((*motion_dx - 1.2).abs() < 1e-12);
+                assert_eq!(*motion_dy, 0.0);
+                assert!(*relative);
+            }
+            other => panic!("expected a relative pointer motion, got {other:?}"),
+        }
         drop(poll);
     }
 
@@ -1569,7 +1615,7 @@ mod tests {
         assert!(immediate.is_empty(), "no flush yet, got {immediate:?}");
 
         // Batch B: motion then button — only the latest combined
-        // motion + button get sent.
+        // motion + button get sent, while deltas stay separate from x/y.
         process_batch(
             &mut state,
             &sender,
@@ -1592,7 +1638,13 @@ mod tests {
         let collected: Vec<Message> = rx.try_recv_all().collect();
         assert_eq!(collected.len(), 2);
         match &collected[0] {
-            Message::HostInput(HostInputEvent::PointerMotion { x: 415, y: 300, .. }) => {}
+            Message::HostInput(HostInputEvent::PointerMotion {
+                x: 400,
+                y: 300,
+                dx: 15,
+                motion_delta: Some([15.0, 0.0]),
+                ..
+            }) => {}
             other => panic!("first message: {other:?}"),
         }
         match &collected[1] {
