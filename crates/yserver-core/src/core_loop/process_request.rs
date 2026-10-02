@@ -18084,6 +18084,22 @@ fn handle_xi2_request(
             header.opcode,
         );
     }
+    // Xorg's XI swap/dispatch path checks these content-derived tails before
+    // handling any selection or grab records. The request swapper has already
+    // converted the dynamic length fields to LE, while mask bytes remain
+    // opaque. Keep this check ahead of all state changes so a truncated later
+    // record cannot leave earlier selections or grabs installed.
+    if !xi2_request_has_complete_dynamic_tail(minor, body) {
+        return emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_LENGTH,
+            0,
+            u16::from(minor),
+            header.opcode,
+        );
+    }
     let mut buf: Vec<u8> = Vec::with_capacity(64);
     match minor {
         1 => {
@@ -28674,6 +28690,77 @@ fn handle_big_requests_request(
     Ok(outcome)
 }
 
+/// Check the variable arrays that Xorg validates with `REQUEST_FIXED_SIZE`
+/// or by walking XISelectEvents records. All typed count fields have been
+/// swapped to little-endian by the reader before this production entry point.
+fn xi2_request_has_complete_dynamic_tail(minor: u8, body: &[u8]) -> bool {
+    fn u16_at(body: &[u8], offset: usize) -> Option<usize> {
+        let bytes = body.get(offset..offset.checked_add(2)?)?;
+        Some(usize::from(u16::from_le_bytes([bytes[0], bytes[1]])))
+    }
+
+    fn words_fit(body: &[u8], start: usize, words: usize) -> Option<usize> {
+        let bytes = words.checked_mul(4)?;
+        let end = start.checked_add(bytes)?;
+        (end <= body.len()).then_some(end)
+    }
+
+    match minor {
+        // SProcXISelectEvents checks each xXIEventMask header and mask_len
+        // region, returning BadLength before ProcXISelectEvents mutates masks.
+        46 => {
+            let Some(num_masks) = u16_at(body, 4) else {
+                return false;
+            };
+            let mut pos = 8usize;
+            for _ in 0..num_masks {
+                let Some(device_and_len_end) = pos.checked_add(4) else {
+                    return false;
+                };
+                if device_and_len_end > body.len() {
+                    return false;
+                }
+                let Some(mask_words) = u16_at(body, pos + 2) else {
+                    return false;
+                };
+                let Some(mask_end) = words_fit(body, device_and_len_end, mask_words) else {
+                    return false;
+                };
+                pos = mask_end;
+            }
+            true
+        }
+        // ProcXIGrabDevice checks mask_len words after its 20-byte body
+        // prefix. Those words are byte masks and remain unswapped.
+        51 => {
+            let Some(mask_len) = u16_at(body, 18) else {
+                return false;
+            };
+            words_fit(body, 20, mask_len).is_some()
+        }
+        // SProcXIPassiveGrabDevice checks the mask and modifier spans together
+        // before its modifier CARD32 swap loop.
+        54 => {
+            let (Some(num_modifiers), Some(mask_len)) = (u16_at(body, 18), u16_at(body, 20)) else {
+                return false;
+            };
+            let Some(mask_end) = words_fit(body, 28, mask_len) else {
+                return false;
+            };
+            words_fit(body, mask_end, num_modifiers).is_some()
+        }
+        // SProcXIPassiveUngrabDevice checks num_modifiers CARD32s after its
+        // 16-byte fixed body.
+        55 => {
+            let Some(num_modifiers) = u16_at(body, 10) else {
+                return false;
+            };
+            words_fit(body, 16, num_modifiers).is_some()
+        }
+        _ => true,
+    }
+}
+
 fn handle_get_window_attributes(
     state: &mut ServerState,
     client_id: ClientId,
@@ -38655,6 +38742,341 @@ mod tests {
             }
         }
         b
+    }
+
+    /// Send a client-order XI request through the request-body swap used by
+    /// `client_reader`, then dispatch it through the production
+    /// `process_request` entry point.
+    fn send_xi_wire_request(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        peer: &mut impl TestPeer,
+        client_id: u32,
+        sequence: u16,
+        minor: u8,
+        byte_order: ClientByteOrder,
+        mut body: Vec<u8>,
+    ) -> Vec<u8> {
+        yserver_protocol::x11::request_swap::swap_request_body(137, minor, byte_order, &mut body);
+        process_request(
+            state,
+            backend,
+            ClientId(client_id),
+            SequenceNumber(sequence),
+            RequestHeader {
+                opcode: 137,
+                data: minor,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            &body,
+            None,
+        )
+        .expect("XI request dispatch");
+        let mut reply = read_all_available(peer);
+        reply.extend(
+            state
+                .clients
+                .get_mut(&client_id)
+                .expect("test client")
+                .outbound
+                .drain(..),
+        );
+        reply
+    }
+
+    fn xi_dynamic_select_wire_body(
+        byte_order: ClientByteOrder,
+        window: u32,
+        masks: &[(u16, [u8; 4])],
+    ) -> Vec<u8> {
+        let mut body = WireBody(byte_order, Vec::new())
+            .u32(window)
+            .u16(u16::try_from(masks.len()).unwrap())
+            .bytes(&[0, 0]);
+        for (device_id, mask) in masks {
+            body = body.u16(*device_id).u16(1).bytes(mask);
+        }
+        body.1
+    }
+
+    fn xi_dynamic_passive_grab_wire_body(
+        byte_order: ClientByteOrder,
+        window: u32,
+        detail: u32,
+        device_id: u16,
+        event_mask: &[u8],
+        modifiers: &[u32],
+    ) -> Vec<u8> {
+        assert!(event_mask.len().is_multiple_of(4));
+        let mut body = WireBody(byte_order, Vec::new())
+            .u32(0)
+            .u32(window)
+            .u32(0)
+            .u32(detail)
+            .u16(device_id)
+            .u16(u16::try_from(modifiers.len()).unwrap())
+            .u16(u16::try_from(event_mask.len() / 4).unwrap())
+            .bytes(&[1, 1, 1, 0, 0, 0])
+            .bytes(event_mask);
+        for modifier in modifiers {
+            body = body.u32(*modifier);
+        }
+        body.1
+    }
+
+    fn xi_dynamic_passive_ungrab_wire_body(
+        byte_order: ClientByteOrder,
+        window: u32,
+        detail: u32,
+        device_id: u16,
+        modifiers: &[u32],
+    ) -> Vec<u8> {
+        let mut body = WireBody(byte_order, Vec::new())
+            .u32(window)
+            .u32(detail)
+            .u16(device_id)
+            .u16(u16::try_from(modifiers.len()).unwrap())
+            .bytes(&[1, 0, 0, 0]);
+        for modifier in modifiers {
+            body = body.u32(*modifier);
+        }
+        body.1
+    }
+
+    #[test]
+    fn xi_dynamic_request_swap_select_events_big_endian_matches_little_endian() {
+        const CLIENT_ID: u32 = 1;
+        let mut states = Vec::new();
+        for byte_order in [ClientByteOrder::LittleEndian, ClientByteOrder::BigEndian] {
+            let mut state = ServerState::new();
+            let mut peer = install_capture_client(&mut state, CLIENT_ID);
+            state.clients.get_mut(&CLIENT_ID).unwrap().byte_order = byte_order;
+            let mut backend = RecordingBackend::new();
+            let _ = xi_dynamic_grab_source(&mut state, 91, false, true, "select-a");
+            let _ = xi_dynamic_grab_source(&mut state, 92, false, true, "select-b");
+            let body = xi_dynamic_select_wire_body(
+                byte_order,
+                ROOT_WINDOW.0,
+                &[
+                    (6, [0x04, 0, 0, 0]),
+                    (7, [0x08, 0, 0, 0]),
+                    (1, [0x10, 0, 0, 0]),
+                ],
+            );
+            let reply = send_xi_wire_request(
+                &mut state,
+                &mut backend,
+                &mut peer,
+                CLIENT_ID,
+                1,
+                46,
+                byte_order,
+                body,
+            );
+            assert!(reply.is_empty(), "selection should not reply: {reply:02x?}");
+            states.push(state.clients[&CLIENT_ID].xi2_masks.clone());
+        }
+        assert_eq!(
+            states[0], states[1],
+            "BE selections must match LE selections"
+        );
+        assert_eq!(states[1].get(&(ROOT_WINDOW, 6)), Some(&0x04));
+        assert_eq!(states[1].get(&(ROOT_WINDOW, 7)), Some(&0x08));
+        assert_eq!(states[1].get(&(ROOT_WINDOW, 1)), Some(&0x10));
+    }
+
+    #[test]
+    fn xi_dynamic_request_swap_passive_grab_big_endian_matches_little_endian() {
+        const CLIENT_ID: u32 = 1;
+        const WINDOW: u32 = 0x0010_0061;
+        let mut grab_records = Vec::new();
+        for byte_order in [ClientByteOrder::LittleEndian, ClientByteOrder::BigEndian] {
+            let mut state = ServerState::new();
+            let mut peer = install_capture_client(&mut state, CLIENT_ID);
+            state.clients.get_mut(&CLIENT_ID).unwrap().byte_order = byte_order;
+            let mut backend = RecordingBackend::new();
+            let (_, keyboard_id) =
+                xi_dynamic_grab_source(&mut state, 93, true, false, "grab-keyboard");
+            let body = xi_dynamic_passive_grab_wire_body(
+                byte_order,
+                WINDOW,
+                67,
+                keyboard_id,
+                &[0x02, 0, 0, 0],
+                &[4, 1],
+            );
+            let reply = send_xi_wire_request(
+                &mut state,
+                &mut backend,
+                &mut peer,
+                CLIENT_ID,
+                1,
+                54,
+                byte_order,
+                body,
+            );
+            assert_eq!(reply.len(), 32, "passive grab reply: {reply:02x?}");
+            let records: Vec<_> = state
+                .key_grabs
+                .iter()
+                .map(|grab| (grab.device_id, grab.keycode, grab.modifiers, grab.xi2_mask))
+                .collect();
+            grab_records.push(records);
+        }
+        assert_eq!(grab_records[0], grab_records[1]);
+        assert_eq!(
+            grab_records[1],
+            vec![(6, 67, 4, 2), (6, 67, 1, 2)],
+            "both declared modifiers and byte mask must retain their LE values"
+        );
+    }
+
+    #[test]
+    fn xi_dynamic_request_swap_passive_ungrab_big_endian_matches_little_endian() {
+        const CLIENT_ID: u32 = 1;
+        const WINDOW: u32 = 0x0010_0062;
+        let mut remaining_grabs = Vec::new();
+        for byte_order in [ClientByteOrder::LittleEndian, ClientByteOrder::BigEndian] {
+            let mut state = ServerState::new();
+            let mut peer = install_capture_client(&mut state, CLIENT_ID);
+            state.clients.get_mut(&CLIENT_ID).unwrap().byte_order = byte_order;
+            let mut backend = RecordingBackend::new();
+            let (_, keyboard_id) =
+                xi_dynamic_grab_source(&mut state, 94, true, false, "ungrab-keyboard");
+            let (_, other_keyboard_id) =
+                xi_dynamic_grab_source(&mut state, 95, true, false, "other-keyboard");
+            for device_id in [keyboard_id, other_keyboard_id] {
+                let body = xi_dynamic_passive_grab_wire_body(
+                    byte_order,
+                    WINDOW,
+                    67,
+                    device_id,
+                    &[0x02, 0, 0, 0],
+                    &[4, 1],
+                );
+                let _ = send_xi_wire_request(
+                    &mut state,
+                    &mut backend,
+                    &mut peer,
+                    CLIENT_ID,
+                    1,
+                    54,
+                    byte_order,
+                    body,
+                );
+            }
+            let body =
+                xi_dynamic_passive_ungrab_wire_body(byte_order, WINDOW, 67, keyboard_id, &[4, 1]);
+            let reply = send_xi_wire_request(
+                &mut state,
+                &mut backend,
+                &mut peer,
+                CLIENT_ID,
+                2,
+                55,
+                byte_order,
+                body,
+            );
+            assert!(reply.is_empty(), "passive ungrab is void: {reply:02x?}");
+            remaining_grabs.push(
+                state
+                    .key_grabs
+                    .iter()
+                    .map(|grab| (grab.device_id, grab.keycode, grab.modifiers))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert_eq!(remaining_grabs[0], remaining_grabs[1]);
+        assert_eq!(remaining_grabs[1], vec![(7, 67, 4), (7, 67, 1)]);
+    }
+
+    #[test]
+    fn xi_dynamic_request_swap_rejects_select_record_overrun_without_mutation() {
+        const CLIENT_ID: u32 = 1;
+        let mut state = ServerState::new();
+        let mut peer = install_capture_client(&mut state, CLIENT_ID);
+        state.clients.get_mut(&CLIENT_ID).unwrap().byte_order = ClientByteOrder::BigEndian;
+        let mut backend = RecordingBackend::new();
+        let _ = xi_dynamic_grab_source(&mut state, 96, false, true, "malformed-select");
+
+        let valid = xi_dynamic_select_wire_body(
+            ClientByteOrder::BigEndian,
+            ROOT_WINDOW.0,
+            &[(7, [0x08, 0, 0, 0])],
+        );
+        let _ = send_xi_wire_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            CLIENT_ID,
+            1,
+            46,
+            ClientByteOrder::BigEndian,
+            valid,
+        );
+        let before = state.clients[&CLIENT_ID].xi2_masks.clone();
+
+        // mask_len=2 words, but only one word remains in the request body.
+        let malformed = WireBody(ClientByteOrder::BigEndian, Vec::new())
+            .u32(ROOT_WINDOW.0)
+            .u16(1)
+            .bytes(&[0, 0])
+            .u16(6)
+            .u16(2)
+            .bytes(&[0x04, 0, 0, 0])
+            .1;
+        let reply = send_xi_wire_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            CLIENT_ID,
+            2,
+            46,
+            ClientByteOrder::BigEndian,
+            malformed,
+        );
+        assert_eq!(reply.get(1), Some(&x11::error::BAD_LENGTH), "{reply:02x?}");
+        assert_eq!(state.clients[&CLIENT_ID].xi2_masks, before);
+    }
+
+    #[test]
+    fn xi_dynamic_request_swap_rejects_modifier_overrun_without_grab() {
+        const CLIENT_ID: u32 = 1;
+        const WINDOW: u32 = 0x0010_0063;
+        let mut state = ServerState::new();
+        let mut peer = install_capture_client(&mut state, CLIENT_ID);
+        state.clients.get_mut(&CLIENT_ID).unwrap().byte_order = ClientByteOrder::BigEndian;
+        let mut backend = RecordingBackend::new();
+        let (_, keyboard_id) =
+            xi_dynamic_grab_source(&mut state, 97, true, false, "malformed-grab");
+
+        let mut malformed = WireBody(ClientByteOrder::BigEndian, Vec::new())
+            .u32(0)
+            .u32(WINDOW)
+            .u32(0)
+            .u32(67)
+            .u16(keyboard_id)
+            .u16(2)
+            .u16(0)
+            .bytes(&[1, 1, 1, 0, 0, 0])
+            .u32(4)
+            .1;
+        assert_eq!(malformed.len(), 32);
+        let reply = send_xi_wire_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            CLIENT_ID,
+            1,
+            54,
+            ClientByteOrder::BigEndian,
+            std::mem::take(&mut malformed),
+        );
+        assert_eq!(reply.get(1), Some(&x11::error::BAD_LENGTH), "{reply:02x?}");
+        assert!(
+            state.key_grabs.is_empty(),
+            "malformed modifiers install no grab"
+        );
     }
 
     #[test]
