@@ -34,6 +34,89 @@ const XI2_RAW_KEY_RELEASE_EVTYPE: u16 = 14;
 const XI2_ALL_DEVICES: u16 = 0;
 const XI2_ALL_MASTER_DEVICES: u16 = 1;
 
+/// Resolve the keyboard device form represented by an input origin. A known
+/// unpublished physical source remains master-only; XTEST and nested input
+/// keep their explicit virtual/master identities.
+fn key_origin_device(
+    state: &ServerState,
+    origin: crate::core_loop::InputOrigin,
+) -> (u16, Option<u16>) {
+    use crate::{core_loop::InputOrigin, xinput::XiFacetKind};
+    match origin {
+        InputOrigin::Physical(source) => {
+            let Some(info) = state.xi_devices.source(source).filter(|info| info.enabled) else {
+                return (XI2_MASTER_KEYBOARD_DEVICE_ID, None);
+            };
+            if let Some(device_id) = state.xi_devices.facet(source, XiFacetKind::Keyboard)
+                && let Some(device) = state.xi_devices.device(device_id)
+                && device.enabled
+            {
+                return (device_id, device.attached_master);
+            }
+            let _ = info;
+            (
+                XI2_MASTER_KEYBOARD_DEVICE_ID,
+                Some(XI2_MASTER_KEYBOARD_DEVICE_ID),
+            )
+        }
+        InputOrigin::XTest(device_id) => {
+            if matches!(
+                state.xi_devices.role(device_id),
+                Some(
+                    crate::xinput::XiDeviceRole::MasterKeyboard
+                        | crate::xinput::XiDeviceRole::SlaveKeyboard
+                )
+            ) {
+                (
+                    device_id,
+                    state
+                        .xi_devices
+                        .device(device_id)
+                        .and_then(|device| device.attached_master),
+                )
+            } else {
+                (XI2_MASTER_KEYBOARD_DEVICE_ID, None)
+            }
+        }
+        InputOrigin::NestedHost => (
+            XI2_MASTER_KEYBOARD_DEVICE_ID,
+            Some(XI2_MASTER_KEYBOARD_DEVICE_ID),
+        ),
+    }
+}
+
+/// Whether `origin` names a keyboard facet that is currently floating under
+/// an explicit XI2 grab. KMS uses this before touching master XKB state.
+pub fn keyboard_origin_is_floating(
+    state: &ServerState,
+    origin: crate::core_loop::InputOrigin,
+) -> bool {
+    let (device_id, master_id) = key_origin_device(state, origin);
+    matches!(
+        state.xi_devices.role(device_id),
+        Some(crate::xinput::XiDeviceRole::SlaveKeyboard)
+    ) && master_id.is_none()
+}
+
+fn active_keyboard_grab_for_origin(
+    state: &ServerState,
+    device_id: u16,
+    master_id: Option<u16>,
+) -> Option<(ActiveKeyboardGrab, bool)> {
+    state
+        .xi2_keyboard_grabs
+        .get(&device_id)
+        .copied()
+        .map(|grab| (grab, false))
+        .or_else(|| {
+            (device_id == XI2_MASTER_KEYBOARD_DEVICE_ID
+                || master_id == Some(XI2_MASTER_KEYBOARD_DEVICE_ID))
+            .then_some(state.active_keyboard_grab)
+            .flatten()
+            .map(|grab| (grab, true))
+        })
+}
+
 /// Fan a host key event out to nested clients.
 ///
 /// Returns the deduped list of clients whose outbound buffer overflowed
@@ -44,6 +127,7 @@ pub fn key_event_fanout_to_state(
     backend: &mut dyn crate::backend::Backend,
     event: HostKeyEvent,
 ) -> Vec<ClientId> {
+    let (device_id, master_id) = key_origin_device(state, event.origin);
     // QueryKeymap bitmap — device key state tracks the physical
     // event regardless of where (or whether) it gets delivered.
     //
@@ -57,7 +141,7 @@ pub fn key_event_fanout_to_state(
     // VT-switch clears keys_down without touching xkb — and any
     // `state == 0` override then clobbers every unmodified keypress
     // with the stale modifier ("stuck Ctrl, can't type in wezterm").
-    {
+    if master_id.is_some() {
         let byte = usize::from(event.keycode / 8);
         let bit = 1u8 << (event.keycode % 8);
         if event.pressed {
@@ -133,15 +217,20 @@ pub fn key_event_fanout_to_state(
     // regenerates both the core and the XI1 form — queueing the XI1
     // form separately here would double-deliver it on thaw (XTS
     // XUngrabDevice-1: "expecting two events, got 4").
-    if state
-        .xi1_frozen
-        .get(&crate::xinput::DEVICEID_SLAVE_KEYBOARD)
-        .is_some_and(crate::server::Xi1Freeze::frozen)
-    {
+    let frozen_device = [Some(device_id), master_id]
+        .into_iter()
+        .flatten()
+        .find(|id| {
+            state
+                .xi1_frozen
+                .get(id)
+                .is_some_and(crate::server::Xi1Freeze::frozen)
+        });
+    if let Some(frozen_device) = frozen_device {
         state
             .sync_pending
             .push_back(crate::server::PendingSyncEvent {
-                device: crate::xinput::DEVICEID_SLAVE_KEYBOARD,
+                device: frozen_device,
                 event: crate::server::QueuedInputEvent::HostKey(event),
             });
         return Vec::new();
@@ -199,6 +288,7 @@ pub fn key_event_fanout_to_state(
 /// callable without a backend so `xi1_compute_freezes` can replay
 /// withheld core keys on thaw.
 pub(crate) fn deliver_routed_key(state: &mut ServerState, event: HostKeyEvent) -> Vec<ClientId> {
+    let (device_id, _master_id) = key_origin_device(state, event.origin);
     match key_route(state, &event) {
         // Core delivery has nowhere to go (focus on root, no grab) —
         // but the XI1 fanout routes by the extension keyboard's own
@@ -212,17 +302,15 @@ pub(crate) fn deliver_routed_key(state: &mut ServerState, event: HostKeyEvent) -
             freeze,
             owner_events,
             via_xi2,
+            device_id: grab_device_id,
         } => {
             // Synchronous passive key grab: hold the activating press
             // so AllowEvents(ReplayKeyboard) can replay it to the
             // focus window if the grab owner declines it. Mirrors the
             // sync passive-button-grab freeze in `pointer_fanout`.
             if freeze && event.pressed {
-                state
-                    .xi1_frozen
-                    .entry(crate::xinput::DEVICEID_SLAVE_KEYBOARD)
-                    .or_default()
-                    .stored = Some(crate::server::QueuedInputEvent::HostKey(event));
+                state.xi1_frozen.entry(device_id).or_default().stored =
+                    Some(crate::server::QueuedInputEvent::HostKey(event));
             }
             // Xorg DeliverGrabbedEvent: with owner_events, key events
             // that would naturally land on one of the grab client's
@@ -233,9 +321,16 @@ pub(crate) fn deliver_routed_key(state: &mut ServerState, event: HostKeyEvent) -
                 None
             };
             let mut dropped = if let Some(target) = natural {
-                deliver_key_to_grab_owner(state, &event, owner, target, via_xi2)
+                deliver_key_to_grab_owner(state, &event, owner, target, via_xi2, grab_device_id)
             } else {
-                deliver_key_to_grab_owner(state, &event, owner, grab_window, via_xi2)
+                deliver_key_to_grab_owner(
+                    state,
+                    &event,
+                    owner,
+                    grab_window,
+                    via_xi2,
+                    grab_device_id,
+                )
             };
             // XI1 leg runs under grabs too — the router handles its
             // own grab/freeze semantics, including the armed
@@ -371,10 +466,11 @@ fn deliver_key_to_grab_owner(
     owner: ClientId,
     grab_window: ResourceId,
     via_xi2: bool,
+    device_id: u16,
 ) -> Vec<ClientId> {
     if via_xi2 {
         fanout_event_to_clients(state, &[owner], |buf, seq, order| {
-            encode_key_xi2(buf, order, seq, event, grab_window);
+            encode_key_xi2_for_device(buf, order, seq, event, grab_window, device_id);
         })
     } else {
         fanout_event_to_clients(state, &[owner], |buf, seq, order| {
@@ -418,13 +514,36 @@ fn encode_key_xi2(
     event: &HostKeyEvent,
     target_window: ResourceId,
 ) {
+    encode_key_xi2_for_device(
+        buf,
+        order,
+        seq,
+        event,
+        target_window,
+        XI2_MASTER_KEYBOARD_DEVICE_ID,
+    );
+}
+
+fn encode_key_xi2_for_device(
+    buf: &mut Vec<u8>,
+    order: x11::ClientByteOrder,
+    seq: x11::SequenceNumber,
+    event: &HostKeyEvent,
+    target_window: ResourceId,
+    device_id: u16,
+) {
+    let source_id = if device_id == XI2_MASTER_KEYBOARD_DEVICE_ID {
+        XI2_SLAVE_KEYBOARD_DEVICE_ID
+    } else {
+        device_id
+    };
     x11::encode_xi2_device_event(
         buf,
         order,
         seq,
         XI2_MAJOR_OPCODE,
         xi2_evtype_for(event),
-        XI2_MASTER_KEYBOARD_DEVICE_ID,
+        device_id,
         event.time,
         ROOT_WINDOW,
         target_window,
@@ -435,7 +554,7 @@ fn encode_key_xi2(
         event.event_y,
         event.state,
         u32::from(event.keycode),
-        XI2_SLAVE_KEYBOARD_DEVICE_ID,
+        source_id,
         0, // flags: no XIPointerEmulated on key events
     );
 }
@@ -661,6 +780,7 @@ enum KeyRoute {
         /// the grab owner first (Xorg DeliverGrabbedEvent).
         owner_events: bool,
         via_xi2: bool,
+        device_id: u16,
     },
     /// Normal delivery to a window's subscribers (focus window, or an
     /// explicit-grab window).
@@ -670,8 +790,10 @@ enum KeyRoute {
 /// Apply X11 keyboard routing rules. May activate a passive grab or
 /// auto-release one on the matching key release.
 fn key_route(state: &mut ServerState, event: &HostKeyEvent) -> KeyRoute {
+    let (device_id, master_id) = key_origin_device(state, event.origin);
     // Active grab in effect.
-    if let Some(g) = state.active_keyboard_grab {
+    if let Some((g, is_master_grab)) = active_keyboard_grab_for_origin(state, device_id, master_id)
+    {
         let passive = matches!(g.source, ActiveKeyboardGrabSource::PassiveKey { .. });
         // Auto-release a passive-key grab on the matching key-release
         // (the release still goes to the grab owner below).
@@ -679,18 +801,18 @@ fn key_route(state: &mut ServerState, event: &HostKeyEvent) -> KeyRoute {
             && let ActiveKeyboardGrabSource::PassiveKey { keycode: kc } = g.source
             && kc == event.keycode
         {
-            state.active_keyboard_grab = None;
-            if let Some(freeze) = state
-                .xi1_frozen
-                .get_mut(&crate::xinput::DEVICEID_SLAVE_KEYBOARD)
-            {
+            if is_master_grab {
+                state.active_keyboard_grab = None;
+            } else {
+                state.xi2_keyboard_grabs.remove(&device_id);
+                state.reattach_xi2_slave(device_id);
+            }
+            if let Some(freeze) = state.xi1_frozen.get_mut(&device_id) {
                 freeze.stored = None;
             }
             // Release the XI1-side holds the activation placed.
             crate::core_loop::pointer_fanout::xi1_core_grab_bridge_release(
-                state,
-                crate::xinput::DEVICEID_SLAVE_KEYBOARD,
-                g.owner,
+                state, device_id, g.owner,
             );
             // Xorg DeactivateKeyboardGrab: DoFocusEvents(grab_window
             // → focus, NotifyUngrab).
@@ -708,6 +830,11 @@ fn key_route(state: &mut ServerState, event: &HostKeyEvent) -> KeyRoute {
                 freeze: false,
                 owner_events: g.owner_events,
                 via_xi2: g.via_xi2,
+                device_id: if is_master_grab {
+                    XI2_MASTER_KEYBOARD_DEVICE_ID
+                } else {
+                    device_id
+                },
             };
         }
         // Explicit grab (GrabKeyboard): key events go to the grabbing
@@ -723,6 +850,11 @@ fn key_route(state: &mut ServerState, event: &HostKeyEvent) -> KeyRoute {
             freeze: false,
             owner_events: g.owner_events,
             via_xi2: g.via_xi2,
+            device_id: if is_master_grab {
+                XI2_MASTER_KEYBOARD_DEVICE_ID
+            } else {
+                device_id
+            },
         };
     }
 
@@ -738,7 +870,13 @@ fn key_route(state: &mut ServerState, event: &HostKeyEvent) -> KeyRoute {
     };
     if event.pressed
         && let Some(grab) = state
-            .find_key_grab(grab_walk_start, event.keycode, event.state)
+            .find_key_grab(
+                grab_walk_start,
+                event.keycode,
+                event.state,
+                device_id,
+                master_id,
+            )
             .cloned()
     {
         let crate::server::KeyGrab {
@@ -749,9 +887,10 @@ fn key_route(state: &mut ServerState, event: &HostKeyEvent) -> KeyRoute {
             owner_events,
             via_xi2,
             xi2_mask,
+            device_id: grabbed_device_id,
             ..
         } = grab;
-        state.active_keyboard_grab = Some(ActiveKeyboardGrab {
+        let active = ActiveKeyboardGrab {
             owner,
             grab_window,
             source: ActiveKeyboardGrabSource::PassiveKey {
@@ -760,7 +899,15 @@ fn key_route(state: &mut ServerState, event: &HostKeyEvent) -> KeyRoute {
             owner_events,
             via_xi2,
             xi2_mask,
-        });
+        };
+        let device_grab =
+            grabbed_device_id != 0 && grabbed_device_id != XI2_MASTER_KEYBOARD_DEVICE_ID;
+        if device_grab {
+            state.xi2_keyboard_grabs.insert(grabbed_device_id, active);
+            let _ = state.detach_xi2_slave(grabbed_device_id);
+        } else {
+            state.active_keyboard_grab = Some(active);
+        }
         // Xorg ActivateKeyboardGrab: DoFocusEvents(focus →
         // grab_window, NotifyGrab).
         crate::core_loop::process_request::emit_core_focus_transition(
@@ -777,7 +924,11 @@ fn key_route(state: &mut ServerState, event: &HostKeyEvent) -> KeyRoute {
         // this way).
         crate::core_loop::pointer_fanout::xi1_check_grab_for_syncs(
             state,
-            crate::xinput::DEVICEID_SLAVE_KEYBOARD,
+            if device_grab {
+                grabbed_device_id
+            } else {
+                crate::xinput::DEVICEID_MASTER_KEYBOARD
+            },
             owner,
             keyboard_mode == 0,
             pointer_mode == 0,
@@ -789,6 +940,11 @@ fn key_route(state: &mut ServerState, event: &HostKeyEvent) -> KeyRoute {
             freeze: keyboard_mode == 0,
             owner_events,
             via_xi2,
+            device_id: if device_grab {
+                grabbed_device_id
+            } else {
+                XI2_MASTER_KEYBOARD_DEVICE_ID
+            },
         };
     }
 
@@ -1124,6 +1280,7 @@ mod tests {
         let mut owner = install_kf(&mut state, 7, ROOT_WINDOW, 0, 0);
         let mut backend = crate::backend::recording::RecordingBackend::default();
         state.key_grabs.push(KeyGrab {
+            device_id: 0,
             owner: ClientId(7),
             grab_window: ROOT_WINDOW,
             keycode: 33,
@@ -1151,7 +1308,7 @@ mod tests {
         assert!(
             state
                 .xi1_frozen
-                .get(&crate::xinput::DEVICEID_SLAVE_KEYBOARD)
+                .get(&crate::xinput::DEVICEID_MASTER_KEYBOARD)
                 .and_then(|f| f.stored.as_ref())
                 .is_some(),
             "synchronous grab must freeze the press for replay"
@@ -1190,6 +1347,7 @@ mod tests {
         let _owner = install_kf(&mut state, 7, ROOT_WINDOW, 0, 0);
         let mut backend = crate::backend::recording::RecordingBackend::default();
         state.key_grabs.push(KeyGrab {
+            device_id: 0,
             owner: ClientId(7),
             grab_window: ROOT_WINDOW,
             keycode: 33,
@@ -1272,6 +1430,7 @@ mod tests {
         let grab_owner = ClientId(7);
         let mut backend = crate::backend::recording::RecordingBackend::default();
         state.key_grabs.push(KeyGrab {
+            device_id: 0,
             owner: grab_owner,
             grab_window: ROOT_WINDOW,
             keycode: 38,

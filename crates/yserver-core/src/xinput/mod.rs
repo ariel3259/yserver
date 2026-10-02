@@ -16,7 +16,7 @@ pub mod query;
 pub mod registry;
 
 pub use query::XiQueryError;
-pub use registry::{InputCapabilities, InputSourceId, XiFacetKind, XiRegistry};
+pub use registry::{InputCapabilities, InputSourceId, XiDeviceRole, XiFacetKind, XiRegistry};
 
 // ---------------------------------------------------------------------------
 // X11 predefined atom ids for property type annotation
