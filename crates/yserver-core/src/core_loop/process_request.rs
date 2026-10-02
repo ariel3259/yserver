@@ -2006,6 +2006,19 @@ fn content_within_ancestors(state: &ServerState, window: ResourceId) -> x11::xfi
     })
 }
 
+/// The nearest window at or above `window`, short of the root, that is
+/// redirected: whose backing `window` draws into.
+fn redirected_ancestor_or_self(state: &ServerState, window: ResourceId) -> Option<ResourceId> {
+    let mut cur = window;
+    while cur != crate::resources::ROOT_WINDOW {
+        if state.composite_redirects.window_mode(cur).is_some() {
+            return Some(cur);
+        }
+        cur = state.resources.window(cur)?.parent;
+    }
+    None
+}
+
 /// Whether any proper ancestor of `window` is redirected, i.e. the
 /// window (when not redirected itself) draws into that ancestor's
 /// backing rather than onto the screen.
@@ -28945,8 +28958,29 @@ fn handle_get_image(
             .map_or((i32::MAX, i32::MAX), |r| {
                 (i32::from(r.width), i32::from(r.height))
             });
-        let on_screen =
-            abs_x + rx0 >= 0 && abs_y + ry0 >= 0 && abs_x + rx1 <= root_w && abs_y + ry1 <= root_h;
+        // The bound is the pixmap the window draws into: the screen, or
+        // the backing of the nearest redirected window at or above it,
+        // which a window partly off the screen still has whole
+        // (`DoGetImage`, `dix/dispatch.c:2176-2210`).
+        let (bx, by, bwidth, bheight) = match redirected_ancestor_or_self(state, req.drawable)
+            .and_then(|r| state.resources.window(r).map(|w| (r, w)))
+        {
+            Some((r, rw)) => {
+                let (rx, ry) = state.resources.window_absolute_position(r);
+                let rbw = i32::from(rw.border_width);
+                (
+                    rx - rbw,
+                    ry - rbw,
+                    i32::from(rw.width) + 2 * rbw,
+                    i32::from(rw.height) + 2 * rbw,
+                )
+            }
+            None => (0, 0, root_w, root_h),
+        };
+        let on_screen = abs_x + rx0 >= bx
+            && abs_y + ry0 >= by
+            && abs_x + rx1 <= bx + bwidth
+            && abs_y + ry1 <= by + bheight;
         if !viewable || !in_window || !on_screen {
             return emit_x11_error(
                 state,
@@ -42649,6 +42683,77 @@ mod tests {
                 .any(|call| matches!(call, RecordedCall::FreePixmap(0xbeef))),
             "host pixmap must stay alive while retained by GC tile"
         );
+    }
+
+    /// GetImage of a window partly off the screen: BadMatch unless the
+    /// window is redirected, when its bound is its backing (`DoGetImage`,
+    /// `dix/dispatch.c:2176-2210`; measured by
+    /// tools/vng-scenarios/draw-clip-probe.c, `F at x=-50`).
+    #[test]
+    fn get_image_of_a_redirected_window_off_the_screen_reads_its_backing() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let window = ResourceId(0x1100);
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window,
+                parent: ROOT_WINDOW,
+                x: -50,
+                y: 0,
+                width: 200,
+                height: 150,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state.resources.window_mut(window).unwrap().map_state = MapState::Viewable;
+        let mut body = window.0.to_le_bytes().to_vec();
+        for v in [0i16, 0] {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [200u16, 150] {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+        body.extend_from_slice(&u32::MAX.to_le_bytes());
+        let mut get_image = |state: &mut ServerState| {
+            process_request(
+                state,
+                &mut backend,
+                ClientId(1),
+                SequenceNumber(1),
+                RequestHeader {
+                    opcode: 73,
+                    data: 2,
+                    length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+                },
+                &body,
+                None,
+            )
+            .expect("process_request");
+            read_all_available(&mut peer)
+        };
+        let unredirected = get_image(&mut state);
+        assert_eq!(
+            (unredirected[0], unredirected[1]),
+            (0, x11::error::BAD_MATCH)
+        );
+        state
+            .composite_redirects
+            .redirect_window(
+                window,
+                crate::server::RedirectRecord {
+                    mode: crate::server::CompositeRedirectMode::Manual,
+                    owner: ClientId(1),
+                },
+            )
+            .unwrap();
+        let redirected = get_image(&mut state);
+        assert_eq!(redirected.first(), Some(&1), "a reply, not an error");
     }
 
     #[test]

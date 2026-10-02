@@ -15530,6 +15530,127 @@ impl KmsBackend {
         }
     }
 
+    /// GetImage of a window returns its inferiors too: Xorg reads the
+    /// pixmap the window draws into (`DoGetImage`, `dix/dispatch.c:2176-
+    /// 2189`), the screen's or a redirected ancestor's, where its
+    /// children have drawn over it. Here a window keeps its own storage
+    /// unless it shares a redirected ancestor's, so paste over `buf`
+    /// (`area` of `parent`, in `host`'s content space, 4-byte pixels)
+    /// every viewable child, bottom to top, that does not draw into
+    /// `parent_backing` already, through its bounding shape and its
+    /// ancestors' rects (`clip`); and recurse. A Manual-redirected child
+    /// is not drawn into its parent (`TreatAsTransparent`,
+    /// `mi/mivaltree.c:171`).
+    #[allow(clippy::too_many_arguments)]
+    fn paste_inferiors(
+        &mut self,
+        parent: u32,
+        parent_origin: (i32, i32),
+        clip: Vec<ash::vk::Rect2D>,
+        parent_backing: DrawableId,
+        area: ash::vk::Rect2D,
+        depth: u8,
+        buf: &mut [u8],
+    ) {
+        let mut children: Vec<(u32, WindowGeometry)> = self
+            .windows
+            .iter()
+            .filter(|(_, g)| g.parent == Some(parent) && g.mapped && g.viewable)
+            .map(|(xid, g)| (*xid, *g))
+            .collect();
+        if children.is_empty() {
+            return;
+        }
+        children.sort_by_key(|(_, g)| g.stack_rank);
+        for (child, g) in children {
+            let participating = self
+                .store
+                .lookup(child)
+                .and_then(|id| self.store.get(id))
+                .is_some_and(|d| d.scene_participating);
+            if !participating {
+                continue;
+            }
+            let Some(target) = self.resolve_paint_target(child) else {
+                continue;
+            };
+            let bw = i32::from(g.border_width);
+            let outer = ash::vk::Rect2D {
+                offset: ash::vk::Offset2D {
+                    x: i32::from(g.x),
+                    y: i32::from(g.y),
+                },
+                extent: ash::vk::Extent2D {
+                    width: u32::from(g.width) + 2 * u32::from(g.border_width),
+                    height: u32::from(g.height) + 2 * u32::from(g.border_width),
+                },
+            };
+            let visible: Vec<ash::vk::Rect2D> = self
+                .child_clip_region(child, &g, outer)
+                .into_iter()
+                .map(|r| ash::vk::Rect2D {
+                    offset: ash::vk::Offset2D {
+                        x: r.offset.x + parent_origin.0,
+                        y: r.offset.y + parent_origin.1,
+                    },
+                    extent: r.extent,
+                })
+                .flat_map(|r| intersect_rect_with_clip(r, &clip))
+                .collect();
+            if visible.is_empty() {
+                continue;
+            }
+            let origin = (
+                parent_origin.0 + i32::from(g.x) + bw,
+                parent_origin.1 + i32::from(g.y) + bw,
+            );
+            if target.backing_id() != parent_backing
+                && let Some(bbox) = vk_rects_bbox(&visible)
+            {
+                let storage = ash::vk::Rect2D {
+                    offset: ash::vk::Offset2D {
+                        x: bbox.offset.x - origin.0 + target.offset().0,
+                        y: bbox.offset.y - origin.1 + target.offset().1,
+                    },
+                    extent: bbox.extent,
+                };
+                match self.engine.get_image(
+                    &mut self.store,
+                    &mut self.platform,
+                    target.src_including_border(),
+                    storage,
+                    depth,
+                ) {
+                    Ok(bytes) => {
+                        for piece in &visible {
+                            blit_rows_4bpp(&bytes, bbox, buf, area, *piece);
+                        }
+                    }
+                    Err(e) => {
+                        log::debug!("render get_image: inferior {child:#x} readback: {e:?}");
+                    }
+                }
+            }
+            let content = ash::vk::Rect2D {
+                offset: ash::vk::Offset2D {
+                    x: origin.0,
+                    y: origin.1,
+                },
+                extent: ash::vk::Extent2D {
+                    width: u32::from(g.width),
+                    height: u32::from(g.height),
+                },
+            };
+            let inner: Vec<ash::vk::Rect2D> = visible
+                .into_iter()
+                .flat_map(|r| intersect_rect_with_clip(r, &[content]))
+                .collect();
+            if !inner.is_empty() {
+                self.paste_inferiors(child, origin, inner, target.backing_id(), area, depth, buf);
+            }
+        }
+    }
+
     fn collect_fill_rects_for_inferiors(
         &self,
         host_xid: u32,
@@ -17255,6 +17376,64 @@ impl KmsBackend {
         let result = self.render_text_chars(origin, host_xid, foreground, x, y, chars);
         self.core.current_function = saved_function;
         result
+    }
+}
+
+/// The bounding box of the non-empty `rects`, or `None` when there are none.
+fn vk_rects_bbox(rects: &[ash::vk::Rect2D]) -> Option<ash::vk::Rect2D> {
+    let mut it = rects
+        .iter()
+        .filter(|r| r.extent.width > 0 && r.extent.height > 0);
+    let first = it.next()?;
+    let (mut x0, mut y0) = (first.offset.x, first.offset.y);
+    let (mut x1, mut y1) = (
+        x0 + first.extent.width as i32,
+        y0 + first.extent.height as i32,
+    );
+    for r in it {
+        x0 = x0.min(r.offset.x);
+        y0 = y0.min(r.offset.y);
+        x1 = x1.max(r.offset.x + r.extent.width as i32);
+        y1 = y1.max(r.offset.y + r.extent.height as i32);
+    }
+    Some(ash::vk::Rect2D {
+        offset: ash::vk::Offset2D { x: x0, y: y0 },
+        extent: ash::vk::Extent2D {
+            width: (x1 - x0) as u32,
+            height: (y1 - y0) as u32,
+        },
+    })
+}
+
+/// Copy `piece` (same space as both images) from `src`, a tightly packed
+/// 4-byte-per-pixel image of `src_rect`, into `dst`, one of `dst_rect`.
+fn blit_rows_4bpp(
+    src: &[u8],
+    src_rect: ash::vk::Rect2D,
+    dst: &mut [u8],
+    dst_rect: ash::vk::Rect2D,
+    piece: ash::vk::Rect2D,
+) {
+    let clip = |a: ash::vk::Rect2D, b: ash::vk::Rect2D| {
+        intersect_rect_with_clip(a, &[b]).into_iter().next()
+    };
+    let Some(piece) = clip(piece, src_rect).and_then(|p| clip(p, dst_rect)) else {
+        return;
+    };
+    let row = piece.extent.width as usize * 4;
+    let (src_stride, dst_stride) = (
+        src_rect.extent.width as usize * 4,
+        dst_rect.extent.width as usize * 4,
+    );
+    for line in 0..piece.extent.height as i32 {
+        let y = piece.offset.y + line;
+        let s = (y - src_rect.offset.y) as usize * src_stride
+            + (piece.offset.x - src_rect.offset.x) as usize * 4;
+        let d = (y - dst_rect.offset.y) as usize * dst_stride
+            + (piece.offset.x - dst_rect.offset.x) as usize * 4;
+        if let (Some(from), Some(to)) = (src.get(s..s + row), dst.get_mut(d..d + row)) {
+            to.copy_from_slice(from);
+        }
     }
 }
 
@@ -25263,6 +25442,27 @@ impl Backend for KmsBackend {
                         pixel_bytes.len(),
                     );
                     pixel_bytes.resize(expected, 0);
+                }
+                if matches!(depth, 24 | 32) && self.windows.contains_key(&host_xid) {
+                    let area = ash::vk::Rect2D {
+                        offset: ash::vk::Offset2D {
+                            x: i32::from(x),
+                            y: i32::from(y),
+                        },
+                        extent: ash::vk::Extent2D {
+                            width: u32::from(width),
+                            height: u32::from(height),
+                        },
+                    };
+                    self.paste_inferiors(
+                        host_xid,
+                        (0, 0),
+                        vec![area],
+                        target.backing_id(),
+                        area,
+                        depth,
+                        &mut pixel_bytes,
+                    );
                 }
                 if format == GET_IMAGE_FORMAT_XY_PIXMAP {
                     pixel_bytes = z_to_xy_planes(

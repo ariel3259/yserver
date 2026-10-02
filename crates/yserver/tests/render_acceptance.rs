@@ -10875,6 +10875,53 @@ fn redirected_frame_child_strokes_stay_in_its_clip() {
     }
 }
 
+/// GetImage of a window without a compositor reads what it shows,
+/// its children included: Xorg reads the screen pixmap under it
+/// (`DoGetImage`, `dix/dispatch.c:2176-2189`). Measured by
+/// tools/vng-scenarios/draw-clip-probe.c (`GetImage C`, direct): F
+/// (200x150) with C (5,20 190x100), C's child V (100,10 80x120) and
+/// V's child G (10,10 20x20), all of the root's depth.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn get_image_of_an_unredirected_window_includes_its_inferiors() {
+    const FRAME: u32 = 0x0020_2020;
+    const GRAY: u32 = 0x003B_3B3E;
+    const BLUE: u32 = 0x0000_00FF;
+    const GREEN: u32 = 0x0000_FF00;
+    const F: u32 = 0x14b0;
+    const C: u32 = 0x14b1;
+    const V: u32 = 0x14b2;
+    const G: u32 = 0x14b3;
+    let mut f = ProtoFixture::new().expect("live Vulkan");
+    let root = yserver_core::resources::ROOT_WINDOW.0;
+    let visual = yserver_core::resources::ROOT_VISUAL.0;
+    let window = |f: &mut ProtoFixture, wid, parent, x, y, w, h, bg| {
+        or_create_window(f, wid, parent, 24, x, y, w, h, 0, visual, 2, &[bg]);
+        wz_map(f, wid);
+    };
+    window(&mut f, F, root, 0, 0, 200, 150, FRAME);
+    window(&mut f, C, F, 5, 20, 190, 100, GRAY);
+    window(&mut f, V, C, 100, 10, 80, 120, BLUE);
+    window(&mut f, G, V, 10, 10, 20, 20, GREEN);
+    let host = f.host_xid(F);
+    let reply = f
+        .backend
+        .get_image(None, host, 2, 0, 0, 200, 150, !0)
+        .expect("get_image")
+        .expect("a reply");
+    let pixels = &reply[32..];
+    for (x, y, pixel, what) in [
+        (2, 2, FRAME, "F"),
+        (50, 60, GRAY, "C"),
+        (150, 60, BLUE, "V"),
+        (120, 45, GREEN, "G"),
+        (150, 125, FRAME, "F under V's rows past C's bottom"),
+    ] {
+        let at = ((y * 200 + x) * 4) as usize;
+        assert_eq!(&pixels[at..at + 3], &or_bgr(pixel), "{what} at ({x},{y})");
+    }
+}
+
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn redirected_menu_border_change_resizes_backing() {
