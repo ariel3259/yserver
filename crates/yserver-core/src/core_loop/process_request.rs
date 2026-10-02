@@ -293,7 +293,7 @@ pub fn process_request(
             header.opcode,
         );
     }
-    match header.opcode {
+    let outcome = match header.opcode {
         // ── server scheduling grab ──
         36 => handle_grab_server(state, client_id, sequence),
         37 => handle_ungrab_server(state, client_id, sequence),
@@ -529,7 +529,9 @@ pub fn process_request(
                 opcode,
             )
         }
-    }
+    };
+    backend.sync_floating_keyboard_states(state);
+    outcome
 }
 
 /// Apply Xorg's per-client locality policy before an extension handler sees a

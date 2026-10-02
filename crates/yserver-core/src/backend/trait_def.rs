@@ -666,6 +666,12 @@ pub trait Backend {
     /// (KMS) and F2 (host-X11); inert until then.
     fn on_host_input(&mut self, state: &mut ServerState, ev: HostInputEvent);
 
+    /// Reconcile backend-owned per-device state after XI slave attachment
+    /// changes. XKB implementations use this to create a floating slave's
+    /// independent state or retire it when the slave is attached again.
+    /// Backends without per-device keyboard state need no work.
+    fn sync_floating_keyboard_states(&mut self, _state: &ServerState) {}
+
     /// `drm_fd` is readable. The backend should drain completion events from
     /// that exact DRM device and submit the next composite/flip. The fd is one
     /// returned by [`Backend::poll_fds`] with [`BackendFdKind::Drm`].

@@ -700,6 +700,7 @@ pub fn process_disconnect_reporting(
     // clears the scene's `root_overlay` contribution: a different concept
     // with a confusingly similar name.
     crate::core_loop::composite_overlay::release_client_overlay_claims(state, backend, client_id);
+    backend.sync_floating_keyboard_states(state);
     // Drop any per-client transient backend state (e.g. the root-overlay
     // contribution) so a crashed/killed client can't strand it.
     backend.client_disconnected(client_id);
