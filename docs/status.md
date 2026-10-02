@@ -28,6 +28,22 @@ Earlier program docs are archived:
 Cross-cutting bugs and followups that don't fit a stage live in
 [`known-issues.md`](known-issues.md).
 
+- **2026-10-02 Phase C.0 stage 3c-ii (hotplug and device removal on the Owner)
+  ACCEPTED** at `b2682dcf`. Connector probes leave the core thread: one probe
+  episode per hotplug edge, forced reprobe or acquire covers every open device,
+  each probe on its own worker and fd, and the episode applies and publishes
+  nothing if any probe fails or misses its 2 s deadline. The Owner hotplug
+  route publishes with Legacy parity, timestamps included. A udev `remove` of
+  an open card is `DeviceRemoved` (no KMS call, executor reaped, outputs
+  withdrawn logically at once, the server continues); an `add` is logged and
+  left unopened. Hardware: the vkms device hotplug acceptance gate (a real
+  kernel/udev remove and add of a second live Owner) passes 6/6, 3/3 and 2/2
+  across the last three tips; the user's HDMI unplug/replug and VT runs pass
+  3/3 each. A new test criterion runs the suites under CPU load: it found the
+  3c-ii suite flaking 4/8 and a production defect (a failed acquire kept the
+  shared scene dirty); `c0_3cii_` is now 30/30 under load. The other `c0_`
+  suites still flake under load and are fixed before stage 4. Finding:
+  `docs/superpowers/findings/2026-10-02-stage-3c-ii-accepted.md`.
 - **2026-09-27 Phase C.0 stage 3c-i (VT switching on the Owner) ACCEPTED**
   at `a461096b`. On an Owner device a VT switch is a lifecycle transition: the
   release runs its prompt obligations at once, commits `ACTIVE=0` and hands the
