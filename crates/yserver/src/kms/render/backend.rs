@@ -15312,6 +15312,29 @@ impl KmsBackend {
         if cut.is_empty() && keep.is_none() {
             return rects.to_vec();
         }
+        // Text and lines come as many small spans: when the clip leaves
+        // their bounding box whole, take them as they are.
+        if let Some(bbox) = rects16_bbox(rects) {
+            let (bx1, by1) = (
+                bbox.offset.x + bbox.extent.width as i32,
+                bbox.offset.y + bbox.extent.height as i32,
+            );
+            let misses = |c: &ash::vk::Rect2D| {
+                c.offset.x >= bx1
+                    || c.offset.y >= by1
+                    || c.offset.x + c.extent.width as i32 <= bbox.offset.x
+                    || c.offset.y + c.extent.height as i32 <= bbox.offset.y
+            };
+            let covers = |k: &ash::vk::Rect2D| {
+                k.offset.x <= bbox.offset.x
+                    && k.offset.y <= bbox.offset.y
+                    && k.offset.x + k.extent.width as i32 >= bx1
+                    && k.offset.y + k.extent.height as i32 >= by1
+            };
+            if cut.iter().all(misses) && keep.as_ref().is_none_or(|k| k.iter().any(covers)) {
+                return rects.to_vec();
+            }
+        }
         let mut out = Vec::new();
         for r in rects {
             if r.width == 0 || r.height == 0 {
@@ -15828,12 +15851,16 @@ impl KmsBackend {
             Vec::new()
         };
 
-        // Host's own backing.
-        if !fg_clipped.is_empty() {
-            self.fill_solid_rects(target, foreground, &fg_clipped);
+        // Host's own backing, through its clip list: its children out
+        // under ClipByChildren, and what of a backing it shares with its
+        // ancestors it may not paint — the same clip every fill takes.
+        let fg_own = self.clip_fill_rects_by_subwindow_mode(host_xid, &fg_clipped);
+        let bg_own = self.clip_fill_rects_by_subwindow_mode(host_xid, &bg_clipped);
+        if !fg_own.is_empty() {
+            self.fill_solid_rects(target, foreground, &fg_own);
         }
-        if !bg_clipped.is_empty() {
-            self.fill_solid_rects(target, background, &bg_clipped);
+        if !bg_own.is_empty() {
+            self.fill_solid_rects(target, background, &bg_own);
         }
 
         // Each distinct inferior backing, exactly once (XOR-safe).
@@ -16899,6 +16926,7 @@ impl KmsBackend {
     /// translation point (no per-glyph pre-shift here).
     fn render_text_chars(
         &mut self,
+        origin: Option<OriginContext>,
         host_xid: u32,
         foreground: u32,
         x: i32,
@@ -16950,9 +16978,35 @@ impl KmsBackend {
         if spans.is_empty() {
             return Ok(());
         }
-        let clipped = self.intersect_with_current_clip_live(&spans);
-        self.fill_solid_rects(target, foreground, &clipped);
+        self.paint_solid_spans(origin, host_xid, target, foreground, spans);
         Ok(())
+    }
+
+    /// Solid spans in `host_xid`'s coordinates, clipped as a stroke is:
+    /// the GC clip, the subwindow mode (inferiors included or cut out)
+    /// and the window's clip in a backing it shares. Core text and
+    /// points: Xorg draws them through the GC's composite clip like
+    /// every other op (`fb/fbglyph.c`, `fb/fbpoint.c`).
+    fn paint_solid_spans(
+        &mut self,
+        origin: Option<OriginContext>,
+        host_xid: u32,
+        target: PaintTarget,
+        color: u32,
+        spans: Vec<Rectangle16>,
+    ) {
+        let background = self.core.current_background;
+        self.emit_stroke_output(
+            origin,
+            host_xid,
+            target,
+            color,
+            background,
+            crate::kms::render::stroke::StrokeOutput {
+                fg_rects: spans,
+                bg_rects: Vec::new(),
+            },
+        );
     }
 
     /// Legacy GPU-atlas text path — unreachable from the core
@@ -17169,6 +17223,7 @@ impl KmsBackend {
     /// temporarily forced to Copy.
     fn image_text_common(
         &mut self,
+        origin: Option<OriginContext>,
         host_xid: u32,
         foreground: u32,
         background: u32,
@@ -17193,15 +17248,35 @@ impl KmsBackend {
                     height: u16::try_from(bg_h).unwrap_or(u16::MAX),
                 };
                 if let Some(target) = self.resolve_paint_target(host_xid) {
-                    let clipped = self.intersect_with_current_clip_live(&[bg]);
-                    self.fill_solid_rects(target, background, &clipped);
+                    self.paint_solid_spans(origin, host_xid, target, background, vec![bg]);
                 }
             }
         }
-        let result = self.render_text_chars(host_xid, foreground, x, y, chars);
+        let result = self.render_text_chars(origin, host_xid, foreground, x, y, chars);
         self.core.current_function = saved_function;
         result
     }
+}
+
+/// The bounding box of the non-empty `rects`, or `None` when there are none.
+fn rects16_bbox(rects: &[Rectangle16]) -> Option<ash::vk::Rect2D> {
+    let mut it = rects.iter().filter(|r| r.width > 0 && r.height > 0);
+    let first = it.next()?;
+    let (mut x0, mut y0) = (i32::from(first.x), i32::from(first.y));
+    let (mut x1, mut y1) = (x0 + i32::from(first.width), y0 + i32::from(first.height));
+    for r in it {
+        x0 = x0.min(i32::from(r.x));
+        y0 = y0.min(i32::from(r.y));
+        x1 = x1.max(i32::from(r.x) + i32::from(r.width));
+        y1 = y1.max(i32::from(r.y) + i32::from(r.height));
+    }
+    Some(ash::vk::Rect2D {
+        offset: ash::vk::Offset2D { x: x0, y: y0 },
+        extent: ash::vk::Extent2D {
+            width: (x1 - x0) as u32,
+            height: (y1 - y0) as u32,
+        },
+    })
 }
 
 /// Sum of character advances for a run, with the X11 nonexistent-
@@ -25550,7 +25625,7 @@ impl Backend for KmsBackend {
 
     fn poly_point(
         &mut self,
-        _origin: Option<OriginContext>,
+        origin: Option<OriginContext>,
         host_xid: u32,
         foreground: u32,
         coordinate_mode: u8,
@@ -25580,8 +25655,18 @@ impl Backend for KmsBackend {
                 height: 1,
             });
         }
-        let rects = self.intersect_with_current_clip_live(&rects);
-        self.fill_solid_rects(target, foreground, &rects);
+        let background = self.core.current_background;
+        self.emit_stroke_output(
+            origin,
+            host_xid,
+            target,
+            foreground,
+            background,
+            crate::kms::render::stroke::StrokeOutput {
+                fg_rects: rects,
+                bg_rects: Vec::new(),
+            },
+        );
         Ok(())
     }
 
@@ -25723,7 +25808,7 @@ impl Backend for KmsBackend {
 
     fn poly_text8(
         &mut self,
-        _origin: Option<OriginContext>,
+        origin: Option<OriginContext>,
         host_xid: u32,
         foreground: u32,
         body: &[u8],
@@ -25759,7 +25844,7 @@ impl Backend for KmsBackend {
             cursor_x = cursor_x.saturating_add(i32::from(delta));
             if !text.is_empty() {
                 let chars: Vec<char> = text.iter().map(|&b| b as char).collect();
-                self.render_text_chars(host_xid, foreground, cursor_x, y, &chars)?;
+                self.render_text_chars(origin, host_xid, foreground, cursor_x, y, &chars)?;
                 if let Some(font_state) =
                     self.core.current_font.and_then(|f| self.core.fonts.get(&f))
                 {
@@ -25773,7 +25858,7 @@ impl Backend for KmsBackend {
 
     fn poly_text16(
         &mut self,
-        _origin: Option<OriginContext>,
+        origin: Option<OriginContext>,
         host_xid: u32,
         foreground: u32,
         body: &[u8],
@@ -25813,7 +25898,7 @@ impl Backend for KmsBackend {
                 chars.push(char::from_u32(codepoint).unwrap_or('\u{fffd}'));
             }
             if !chars.is_empty() {
-                self.render_text_chars(host_xid, foreground, cursor_x, y, &chars)?;
+                self.render_text_chars(origin, host_xid, foreground, cursor_x, y, &chars)?;
                 if let Some(font_state) =
                     self.core.current_font.and_then(|f| self.core.fonts.get(&f))
                 {
@@ -25827,7 +25912,7 @@ impl Backend for KmsBackend {
 
     fn image_text8(
         &mut self,
-        _origin: Option<OriginContext>,
+        origin: Option<OriginContext>,
         host_xid: u32,
         foreground: u32,
         background: u32,
@@ -25842,12 +25927,12 @@ impl Backend for KmsBackend {
         let y = i16::from_le_bytes([body[10], body[11]]) as i32;
         let end = (12usize + text_len as usize).min(body.len());
         let chars: Vec<char> = body[12..end].iter().map(|&b| b as char).collect();
-        self.image_text_common(host_xid, foreground, background, x, y, &chars)
+        self.image_text_common(origin, host_xid, foreground, background, x, y, &chars)
     }
 
     fn image_text16(
         &mut self,
-        _origin: Option<OriginContext>,
+        origin: Option<OriginContext>,
         host_xid: u32,
         foreground: u32,
         background: u32,
@@ -25869,7 +25954,7 @@ impl Backend for KmsBackend {
             pos += 2;
             chars.push(char::from_u32(codepoint).unwrap_or('\u{fffd}'));
         }
-        self.image_text_common(host_xid, foreground, background, x, y, &chars)
+        self.image_text_common(origin, host_xid, foreground, background, x, y, &chars)
     }
 
     // ── RENDER ──────────────────────────────────────────────────

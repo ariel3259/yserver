@@ -10781,6 +10781,100 @@ fn redirected_frame_child_paints_stay_inside_the_child() {
     );
 }
 
+/// Lines and points into a client window C inside its redirected frame
+/// F take the clip fills take: not under H, a sibling stacked above C
+/// that shares F's backing, and not over C's child V under
+/// ClipByChildren — Xorg strokes through the GC's composite clip,
+/// C's clipList (`mi/mivaltree.c:390-437`). Measured by
+/// tools/vng-scenarios/draw-clip-probe.c.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn redirected_frame_child_strokes_stay_in_its_clip() {
+    const FRAME: u32 = 0xFF20_2020;
+    const GRAY: u32 = 0xFF3B_3B3E;
+    const BLUE: u32 = 0xFF00_00FF;
+    const CYAN: u32 = 0xFF00_FFFF;
+    const ORANGE: u32 = 0xFFFF_8000;
+    const F: u32 = 0x14a0;
+    const C: u32 = 0x14a1;
+    const H: u32 = 0x14a2;
+    const V: u32 = 0x14a3;
+    const GC: u32 = 0x14a4;
+    let mut f = ProtoFixture::new().expect("live Vulkan");
+    let root = yserver_core::resources::ROOT_WINDOW.0;
+    let window = |f: &mut ProtoFixture, wid, parent, x, y, w, h, bg| {
+        or_create_window(
+            f,
+            wid,
+            parent,
+            32,
+            x,
+            y,
+            w,
+            h,
+            0,
+            yserver_core::resources::ARGB_VISUAL.0,
+            2 | 8 | 0x2000,
+            &[bg, 0, yserver_core::resources::ARGB_COLORMAP.0],
+        );
+        wz_map(f, wid);
+    };
+    window(&mut f, F, root, 20, 30, 200, 150, FRAME);
+    let mut body = root.to_le_bytes().to_vec();
+    body.extend_from_slice(&[1, 0, 0, 0]);
+    f.req(144, 2, &body);
+    window(&mut f, C, F, 5, 20, 190, 100, GRAY);
+    window(&mut f, H, F, 130, 15, 30, 20, CYAN);
+    window(&mut f, V, C, 100, 10, 80, 120, BLUE);
+    or_create_gc(&mut f, GC, C, ORANGE);
+    // PolySegment: C's rows 2 (through H) and 40 (through V), and a
+    // column at C's x=140 from above C to below it.
+    let mut body = C.to_le_bytes().to_vec();
+    body.extend_from_slice(&GC.to_le_bytes());
+    for (x1, y1, x2, y2) in [
+        (-50i16, 2i16, 300i16, 2i16),
+        (-50, 40, 300, 40),
+        (140, -50, 140, 200),
+    ] {
+        for v in [x1, y1, x2, y2] {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    f.req(66, 0, &body);
+    // PolyPoint: a row of points through H and V.
+    let mut body = C.to_le_bytes().to_vec();
+    body.extend_from_slice(&GC.to_le_bytes());
+    for x in (-40i16..300).step_by(2) {
+        for y in [4i16, 50] {
+            body.extend_from_slice(&x.to_le_bytes());
+            body.extend_from_slice(&y.to_le_bytes());
+        }
+    }
+    f.req(64, 0, &body);
+    let (sw, _, pixels) = f.backing(F);
+    // F coordinates: C's (x, y) is F's (x + 5, y + 20).
+    for (x, y, pixel, what) in [
+        (50, 22, ORANGE, "C's row 2"),
+        (140, 22, CYAN, "H over C's row 2"),
+        (50, 60, ORANGE, "C's row 40"),
+        (150, 60, BLUE, "V under C's row 40"),
+        (145, 25, CYAN, "H over C's column 140"),
+        (145, 45, BLUE, "V under C's column 140"),
+        (145, 10, FRAME, "F above C's column 140"),
+        (61, 24, ORANGE, "a point in C's row 4"),
+        (141, 24, CYAN, "H over a point in C's row 4"),
+        (151, 70, BLUE, "V under a point in C's row 50"),
+        (90, 61, GRAY, "C between the lines"),
+    ] {
+        let at = ((y * sw + x) * 4) as usize;
+        assert_eq!(
+            &pixels[at..at + 4],
+            &brd_bgra(pixel),
+            "{what}: F's backing at ({x},{y})"
+        );
+    }
+}
+
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn redirected_menu_border_change_resizes_backing() {
