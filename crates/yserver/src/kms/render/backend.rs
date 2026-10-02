@@ -24070,7 +24070,7 @@ impl Backend for KmsBackend {
     ) -> io::Result<()> {
         self.core.current_clip = match clip {
             Some(rects) => ClipState::Rectangles {
-                origin: (0, 0),
+                origin: (rects.x_origin, rects.y_origin),
                 rects,
             },
             None => ClipState::None,

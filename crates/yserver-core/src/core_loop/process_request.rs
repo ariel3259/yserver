@@ -8456,6 +8456,9 @@ fn handle_xfixes_request(
                 let gc_id = ResourceId(req.gc);
                 if req.region == 0 {
                     state.resources.clear_gc_clip(gc_id);
+                    state
+                        .resources
+                        .set_gc_clip_origin(gc_id, req.x_origin, req.y_origin);
                 } else {
                     let rects = state
                         .xfixes_regions
