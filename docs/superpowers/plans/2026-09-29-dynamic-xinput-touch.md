@@ -1,3 +1,5 @@
+> **DROPPED 2026-10-02 (user decision):** direct-touch devices (touchscreens, touch tablets) are out of scope; the intended scope is mice, keyboards and laptop touchpads, all covered by the keyboard/pointer plan. Kept for history only; do not implement.
+
 # Dynamic XInput Touch Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
