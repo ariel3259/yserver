@@ -132,6 +132,42 @@ pub(crate) struct WindowGeometry {
 
 pub(crate) type WindowsMap = HashMap<u32, WindowGeometry>;
 
+/// [`WindowsMap`] counting its mutable borrows, so a clip computed from
+/// it can tell it is still current ([`KmsBackend::subwindow_mode_clip`]).
+#[derive(Debug, Default)]
+pub(crate) struct TrackedWindows {
+    map: WindowsMap,
+    generation: u64,
+}
+
+impl TrackedWindows {
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+impl std::ops::Deref for TrackedWindows {
+    type Target = WindowsMap;
+    fn deref(&self) -> &WindowsMap {
+        &self.map
+    }
+}
+
+impl<'a> IntoIterator for &'a TrackedWindows {
+    type Item = (&'a u32, &'a WindowGeometry);
+    type IntoIter = std::collections::hash_map::Iter<'a, u32, WindowGeometry>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.map.iter()
+    }
+}
+
+impl std::ops::DerefMut for TrackedWindows {
+    fn deref_mut(&mut self) -> &mut WindowsMap {
+        self.generation = self.generation.wrapping_add(1);
+        &mut self.map
+    }
+}
+
 /// Test-only (#133): one scene participant's placement — its host xid and
 /// its output-local rects as `(x, y, w, h)`. Named so
 /// `KmsBackend::scene_participant_places_for_tests` has a simple signature.
@@ -1367,7 +1403,7 @@ pub struct KmsBackend {
     /// `create_subwindow` / `configure_subwindow` /
     /// `map_subwindow` / `unmap_subwindow` /
     /// `destroy_subwindow`.
-    pub(crate) windows: WindowsMap,
+    pub(crate) windows: TrackedWindows,
     /// Monotonic allocator for per-parent sibling ordering. V2 scene
     /// assembly still stores windows in a flat map, so child z-order
     /// needs an explicit stable rank instead of relying on HashMap
@@ -1523,6 +1559,13 @@ pub struct KmsBackend {
 
     /// Paces the root-readback warning, which a client reading the root while no output is lit repeats thousands of times a second.
     root_readback_warn: WarnThrottle,
+
+    /// The last [`KmsBackend::subwindow_mode_clip`]: for which window and
+    /// mode, at which generations of the window tree, of the store's
+    /// redirect routing and of the shapes, and what it was.
+    subwindow_clip_cache: std::cell::RefCell<Option<SubwindowClipCacheEntry>>,
+    /// Counts SHAPE changes, for that cache.
+    shape_generation: u64,
 
     /// Set while a RENDER op repeats itself on a destination's inferiors
     /// ([`KmsBackend::include_inferiors_dst_fanout`]), so the repeats do
@@ -5363,7 +5406,9 @@ impl KmsBackend {
             store: DrawableStore::new(),
             engine,
             scene,
-            windows: WindowsMap::new(),
+            windows: TrackedWindows::default(),
+            subwindow_clip_cache: std::cell::RefCell::new(None),
+            shape_generation: 0,
             next_window_stack_rank: 1,
             telemetry: Telemetry::new(),
             last_observed_pool_creates: 0,
@@ -6378,7 +6423,9 @@ impl KmsBackend {
             store: DrawableStore::new(),
             engine: RenderEngine::stub(),
             scene: SceneCompositor::stub(),
-            windows: WindowsMap::new(),
+            windows: TrackedWindows::default(),
+            subwindow_clip_cache: std::cell::RefCell::new(None),
+            shape_generation: 0,
             next_window_stack_rank: 1,
             telemetry: Telemetry::new(),
             last_observed_pool_creates: 0,
@@ -15383,8 +15430,43 @@ impl KmsBackend {
         host_xid: u32,
         rects: &[Rectangle16],
     ) -> Vec<Rectangle16> {
-        if rects.is_empty() || !self.windows.contains_key(&host_xid) {
-            return rects.to_vec();
+        if rects.is_empty() {
+            return Vec::new();
+        }
+        match self.subwindow_mode_clip(host_xid) {
+            Some(clip) => apply_subwindow_mode_clip(&clip, rects),
+            None => rects.to_vec(),
+        }
+    }
+
+    /// What [`Self::clip_fill_rects_by_subwindow_mode`] cuts `host_xid`'s
+    /// rects with, computed once for a request whatever its rect count:
+    /// the children it takes out, and where it may draw in a shared
+    /// backing. `None` when nothing does.
+    fn subwindow_mode_clip(&self, host_xid: u32) -> Option<SubwindowModeClip> {
+        let key = (
+            host_xid,
+            self.core.current_subwindow_mode,
+            self.windows.generation(),
+            self.store.topology_generation(),
+            self.shape_generation,
+        );
+        if let Some(entry) = self.subwindow_clip_cache.borrow().as_ref()
+            && entry.key == key
+        {
+            return entry.clip.clone();
+        }
+        let clip = self.compute_subwindow_mode_clip(host_xid);
+        *self.subwindow_clip_cache.borrow_mut() = Some(SubwindowClipCacheEntry {
+            key,
+            clip: clip.clone(),
+        });
+        clip
+    }
+
+    fn compute_subwindow_mode_clip(&self, host_xid: u32) -> Option<SubwindowModeClip> {
+        if !self.windows.contains_key(&host_xid) {
+            return None;
         }
         let mut cut: Vec<ash::vk::Rect2D> = Vec::new();
         if matches!(
@@ -15438,65 +15520,9 @@ impl KmsBackend {
             .resolve_paint_target(host_xid)
             .and_then(|t| self.shared_backing_draw_clip(host_xid, &t));
         if cut.is_empty() && keep.is_none() {
-            return rects.to_vec();
+            return None;
         }
-        // Text and lines come as many small spans: when the clip leaves
-        // their bounding box whole, take them as they are.
-        if let Some(bbox) = rects16_bbox(rects) {
-            let (bx1, by1) = (
-                bbox.offset.x + bbox.extent.width as i32,
-                bbox.offset.y + bbox.extent.height as i32,
-            );
-            let misses = |c: &ash::vk::Rect2D| {
-                c.offset.x >= bx1
-                    || c.offset.y >= by1
-                    || c.offset.x + c.extent.width as i32 <= bbox.offset.x
-                    || c.offset.y + c.extent.height as i32 <= bbox.offset.y
-            };
-            let covers = |k: &ash::vk::Rect2D| {
-                k.offset.x <= bbox.offset.x
-                    && k.offset.y <= bbox.offset.y
-                    && k.offset.x + k.extent.width as i32 >= bx1
-                    && k.offset.y + k.extent.height as i32 >= by1
-            };
-            if cut.iter().all(misses) && keep.as_ref().is_none_or(|k| k.iter().any(covers)) {
-                return rects.to_vec();
-            }
-        }
-        let mut out = Vec::new();
-        for r in rects {
-            if r.width == 0 || r.height == 0 {
-                continue;
-            }
-            let rect = ash::vk::Rect2D {
-                offset: ash::vk::Offset2D {
-                    x: i32::from(r.x),
-                    y: i32::from(r.y),
-                },
-                extent: ash::vk::Extent2D {
-                    width: u32::from(r.width),
-                    height: u32::from(r.height),
-                },
-            };
-            let pieces = match &keep {
-                Some(keep) => intersect_rect_with_clip(rect, keep),
-                None => vec![rect],
-            };
-            out.extend(
-                pieces
-                    .into_iter()
-                    .flat_map(|piece| compute_copy_area_dst_rects(piece, &cut))
-                    .filter_map(|piece| {
-                        Some(Rectangle16 {
-                            x: i16::try_from(piece.offset.x).ok()?,
-                            y: i16::try_from(piece.offset.y).ok()?,
-                            width: u16::try_from(piece.extent.width).ok()?,
-                            height: u16::try_from(piece.extent.height).ok()?,
-                        })
-                    }),
-            );
-        }
-        out
+        Some(SubwindowModeClip { cut, keep })
     }
 
     /// Compute the destination window's RENDER clipList for one paint op
@@ -16233,8 +16259,16 @@ impl KmsBackend {
         // Host's own backing, through its clip list: its children out
         // under ClipByChildren, and what of a backing it shares with its
         // ancestors it may not paint — the same clip every fill takes.
-        let fg_own = self.clip_fill_rects_by_subwindow_mode(host_xid, &fg_clipped);
-        let bg_own = self.clip_fill_rects_by_subwindow_mode(host_xid, &bg_clipped);
+        let clip = if fg_clipped.is_empty() && bg_clipped.is_empty() {
+            None
+        } else {
+            self.subwindow_mode_clip(host_xid)
+        };
+        let own = |rects: &[Rectangle16]| match &clip {
+            Some(clip) if !rects.is_empty() => apply_subwindow_mode_clip(clip, rects),
+            _ => rects.to_vec(),
+        };
+        let (fg_own, bg_own) = (own(&fg_clipped), own(&bg_clipped));
         if !fg_own.is_empty() {
             self.fill_solid_rects(target, foreground, &fg_own);
         }
@@ -17640,6 +17674,100 @@ impl KmsBackend {
 /// `v + by`, saturated to the wire's `INT16`.
 fn shift_i16(v: i16, by: i32) -> i16 {
     (i32::from(v) + by).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
+}
+
+/// The cut of [`KmsBackend::subwindow_mode_clip`].
+#[derive(Clone)]
+struct SubwindowModeClip {
+    cut: Vec<ash::vk::Rect2D>,
+    keep: Option<Vec<ash::vk::Rect2D>>,
+}
+
+struct SubwindowClipCacheEntry {
+    key: (u32, yserver_core::backend::SubwindowMode, u64, u64, u64),
+    clip: Option<SubwindowModeClip>,
+}
+
+/// `rects` through `clip`.
+fn apply_subwindow_mode_clip(clip: &SubwindowModeClip, rects: &[Rectangle16]) -> Vec<Rectangle16> {
+    let (cut, keep) = (&clip.cut, &clip.keep);
+    // Text and lines come as many small spans: when the clip leaves
+    // their bounding box whole, take them as they are.
+    if let Some(bbox) = rects16_bbox(rects) {
+        let (bx1, by1) = (
+            bbox.offset.x + bbox.extent.width as i32,
+            bbox.offset.y + bbox.extent.height as i32,
+        );
+        let misses = |c: &ash::vk::Rect2D| {
+            c.offset.x >= bx1
+                || c.offset.y >= by1
+                || c.offset.x + c.extent.width as i32 <= bbox.offset.x
+                || c.offset.y + c.extent.height as i32 <= bbox.offset.y
+        };
+        let covers = |k: &ash::vk::Rect2D| {
+            k.offset.x <= bbox.offset.x
+                && k.offset.y <= bbox.offset.y
+                && k.offset.x + k.extent.width as i32 >= bx1
+                && k.offset.y + k.extent.height as i32 >= by1
+        };
+        if cut.iter().all(misses) && keep.as_ref().is_none_or(|k| k.iter().any(covers)) {
+            return rects.to_vec();
+        }
+    }
+    let mut out = Vec::with_capacity(rects.len());
+    for r in rects {
+        if r.width == 0 || r.height == 0 {
+            continue;
+        }
+        // The same test per rect: most spans need no cutting.
+        let (rx0, ry0) = (i32::from(r.x), i32::from(r.y));
+        let (rx1, ry1) = (rx0 + i32::from(r.width), ry0 + i32::from(r.height));
+        let clear = cut.iter().all(|c| {
+            c.offset.x >= rx1
+                || c.offset.y >= ry1
+                || c.offset.x + c.extent.width as i32 <= rx0
+                || c.offset.y + c.extent.height as i32 <= ry0
+        }) && keep.as_ref().is_none_or(|k| {
+            k.iter().any(|k| {
+                k.offset.x <= rx0
+                    && k.offset.y <= ry0
+                    && k.offset.x + k.extent.width as i32 >= rx1
+                    && k.offset.y + k.extent.height as i32 >= ry1
+            })
+        });
+        if clear {
+            out.push(*r);
+            continue;
+        }
+        let rect = ash::vk::Rect2D {
+            offset: ash::vk::Offset2D {
+                x: i32::from(r.x),
+                y: i32::from(r.y),
+            },
+            extent: ash::vk::Extent2D {
+                width: u32::from(r.width),
+                height: u32::from(r.height),
+            },
+        };
+        let pieces = match &keep {
+            Some(keep) => intersect_rect_with_clip(rect, keep),
+            None => vec![rect],
+        };
+        out.extend(
+            pieces
+                .into_iter()
+                .flat_map(|piece| compute_copy_area_dst_rects(piece, cut))
+                .filter_map(|piece| {
+                    Some(Rectangle16 {
+                        x: i16::try_from(piece.offset.x).ok()?,
+                        y: i16::try_from(piece.offset.y).ok()?,
+                        width: u16::try_from(piece.extent.width).ok()?,
+                        height: u16::try_from(piece.extent.height).ok()?,
+                    })
+                }),
+        );
+    }
+    out
 }
 
 /// One inferior of a window that draws into storage of its own: see
@@ -29146,6 +29274,7 @@ impl Backend for KmsBackend {
         // empty → click-through for input, drawn-as-nothing for bounding).
         // `cursor_inside_shape` and the scene's bounding clip already read
         // `Some([])` correctly; the old API deleted on empty and lost it.
+        self.shape_generation = self.shape_generation.wrapping_add(1);
         let dst = match kind {
             0 => &mut self.core.shape_bounding,
             1 => &mut self.core.shape_clip,
@@ -41201,6 +41330,31 @@ mod tests {
             (25, 20, 15, 10),
         ]);
         assert_eq!(got, want);
+    }
+
+    /// The per-request clip is cached; any change to the window tree
+    /// (a child moved, here) computes it again.
+    #[test]
+    fn clip_fill_rects_by_subwindow_mode_follows_a_moved_child() {
+        let mut b = KmsBackend::for_tests();
+        let _parent = seed_window(&mut b, 0x100, None, 0, 0);
+        let _child = seed_window(&mut b, 0x200, Some(0x100), 10, 20);
+        b.core.current_subwindow_mode = yserver_core::backend::SubwindowMode::ClipByChildren;
+        let span = [Rectangle16 {
+            x: 0,
+            y: 25,
+            width: 40,
+            height: 1,
+        }];
+        let child = b.windows.get_mut(&0x200).expect("child geom");
+        (child.width, child.height) = (15, 10);
+        let before = b.clip_fill_rects_by_subwindow_mode(0x100, &span);
+        assert_eq!(before.len(), 2, "split around the child: {before:?}");
+        b.windows.get_mut(&0x200).expect("child geom").y = 100;
+        assert_eq!(
+            b.clip_fill_rects_by_subwindow_mode(0x100, &span),
+            span.to_vec()
+        );
     }
 
     #[test]

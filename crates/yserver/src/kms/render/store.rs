@@ -853,6 +853,9 @@ pub(crate) struct DrawableStore {
     /// scene-participation changes: whether a composed root readback is
     /// still current (`SceneCompositor::root_readback`).
     scene_damage_generation: u64,
+    /// Counts redirect-routing and scene-participation changes: what a
+    /// window's clip in a shared backing depends on beyond the tree.
+    topology_generation: u64,
 }
 
 impl DrawableStore {
@@ -866,7 +869,13 @@ impl DrawableStore {
             exported_writes: Vec::new(),
             prewaited_exported_writes: std::collections::HashSet::new(),
             scene_damage_generation: 0,
+            topology_generation: 0,
         }
+    }
+
+    /// See the field.
+    pub(crate) fn topology_generation(&self) -> u64 {
+        self.topology_generation
     }
 
     /// See the field: bumped by every paint the scene would show.
@@ -976,6 +985,7 @@ impl DrawableStore {
         };
         self.entries.insert(id, drawable);
         self.by_xid.insert(xid, id);
+        self.topology_generation = self.topology_generation.wrapping_add(1);
         Ok(id)
     }
 
@@ -1069,6 +1079,7 @@ impl DrawableStore {
     /// Idempotent: missing mappings are silently ignored.
     pub(crate) fn detach_xid(&mut self, xid: u32) {
         self.by_xid.remove(&xid);
+        self.topology_generation = self.topology_generation.wrapping_add(1);
     }
 
     /// Drop one reference. If refcount hits zero, decide
@@ -1140,6 +1151,7 @@ impl DrawableStore {
             let xid = drawable.xid;
             if self.by_xid.get(&xid).copied() == Some(id) {
                 self.by_xid.remove(&xid);
+                self.topology_generation = self.topology_generation.wrapping_add(1);
             }
             self.pending_retire.push(id);
             RetireDecision::PendingFence
@@ -1163,6 +1175,7 @@ impl DrawableStore {
         };
         if self.by_xid.get(&drawable.xid).copied() == Some(id) {
             self.by_xid.remove(&drawable.xid);
+            self.topology_generation = self.topology_generation.wrapping_add(1);
         }
         drawable.storage.destroy(platform);
         // last_render_ticket drops here; its Rc inner refcount
@@ -1185,6 +1198,7 @@ impl DrawableStore {
         d.scene_participating = v;
         if was != v {
             self.scene_damage_generation = self.scene_damage_generation.wrapping_add(1);
+            self.topology_generation = self.topology_generation.wrapping_add(1);
         }
         if was && !v {
             d.presentation_damage.clear();
@@ -1367,6 +1381,7 @@ impl DrawableStore {
         window_id: DrawableId,
         backing_id: Option<DrawableId>,
     ) {
+        self.topology_generation = self.topology_generation.wrapping_add(1);
         // Diagnostic trace (TEMP — Stage 4d "opaque black backing"
         // investigation). Every redirect-route mutation matters
         // because clearing the route makes future paints land on
