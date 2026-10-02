@@ -55,7 +55,7 @@ pub(crate) fn encode_reply(
                     }
                 },
             ),
-            DeviceClass::Keyboard => write_key_class(byte_order, device.id),
+            DeviceClass::Keyboard => build_key_classes(byte_order, device.id),
         };
         write_device_info(
             byte_order,
@@ -281,7 +281,7 @@ fn write_scroll_class(
     x11::write_u32(byte_order, out, 0);
 }
 
-fn write_key_class(byte_order: ClientByteOrder, source_id: u16) -> (Vec<u8>, u16) {
+pub(crate) fn build_key_classes(byte_order: ClientByteOrder, source_id: u16) -> (Vec<u8>, u16) {
     const NUM_KEYCODES: u16 = 248;
     let mut classes = Vec::with_capacity(8 + 4 * usize::from(NUM_KEYCODES));
     x11::write_u16(byte_order, &mut classes, 0); // KeyClass

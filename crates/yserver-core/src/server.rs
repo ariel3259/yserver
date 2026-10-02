@@ -1451,6 +1451,11 @@ pub struct ServerState {
     /// physical facets, and source metadata. Existing property/query helpers
     /// temporarily use its slice compatibility while consumers migrate.
     pub xi_devices: crate::xinput::XiRegistry,
+    /// Xorg `last.slave` for the paired master pointer and keyboard.
+    /// Floating, disabled, and removed slaves are cleared before they can be
+    /// advertised as the current source again.
+    xi_last_pointer_slave: Option<u16>,
+    xi_last_keyboard_slave: Option<u16>,
     /// Removed XI facet snapshots waiting for the lifecycle notification
     /// stage. KMS fills this before unregistering the source so the later
     /// notification path retains the exact descriptors that disappeared.
@@ -1609,6 +1614,7 @@ impl ServerState {
             return false;
         };
         let facet = device.facet;
+        self.xi_clear_last_slave(device_id);
         self.xi2_detached_masters.insert(device_id, master);
         if facet == Some(crate::xinput::XiFacetKind::PointerTouch) {
             self.floating_pointer_positions.insert(
@@ -1796,6 +1802,8 @@ impl ServerState {
             unpublished_keyboard_keys_down: HashMap::new(),
             installed_colormaps: vec![crate::resources::ROOT_COLORMAP],
             xi_devices,
+            xi_last_pointer_slave: None,
+            xi_last_keyboard_slave: None,
             pending_xi_device_removals: Vec::new(),
             xtest_device_atom,
             float_atom,
@@ -1874,6 +1882,11 @@ impl ServerState {
     pub fn xi_register_source(&mut self, info: &crate::core_loop::DeviceInfo) -> Vec<u16> {
         let continuation = self.xi_devices.source(info.source_id).is_some();
         let ids = self.xi_devices.register(info);
+        if !info.enabled {
+            for id in &ids {
+                self.xi_clear_last_slave(*id);
+            }
+        }
         for &id in &ids {
             if continuation {
                 let Some(mut seeded) = self.xi_devices.device(id).cloned() else {
@@ -1918,6 +1931,9 @@ impl ServerState {
         .into_iter()
         .flatten()
         .collect();
+        for id in &ids {
+            self.xi_clear_last_slave(*id);
+        }
         let removed_descriptors: Vec<crate::xinput::XiDevice> = ids
             .iter()
             .filter_map(|id| self.xi_devices.device(*id).cloned())
@@ -1975,6 +1991,57 @@ impl ServerState {
     /// the physical-device notification publisher.
     pub fn take_xi_removed_device_descriptors(&mut self) -> Vec<crate::xinput::XiDevice> {
         std::mem::take(&mut self.pending_xi_device_removals)
+    }
+
+    /// Current last attached slave for master pointer 2 or keyboard 3.
+    #[must_use]
+    pub fn xi_last_slave(&self, master_id: u16) -> Option<u16> {
+        match master_id {
+            crate::xinput::DEVICEID_MASTER_POINTER => self.xi_last_pointer_slave,
+            crate::xinput::DEVICEID_MASTER_KEYBOARD => self.xi_last_keyboard_slave,
+            _ => None,
+        }
+    }
+
+    /// Update Xorg-style `lastSlave` after an input edge. Returns true only
+    /// when the attached source actually changed; disabled and floating
+    /// devices cannot become a master's current source.
+    pub fn xi_record_last_slave(&mut self, master_id: u16, slave_id: u16) -> bool {
+        let Some(device) = self.xi_devices.device(slave_id) else {
+            return false;
+        };
+        if !device.enabled || device.attached_master != Some(master_id) {
+            return false;
+        }
+        let expected_role = match master_id {
+            crate::xinput::DEVICEID_MASTER_POINTER => crate::xinput::XiDeviceRole::SlavePointer,
+            crate::xinput::DEVICEID_MASTER_KEYBOARD => crate::xinput::XiDeviceRole::SlaveKeyboard,
+            _ => return false,
+        };
+        if self.xi_devices.role(slave_id) != Some(expected_role) {
+            return false;
+        }
+        let last_slave = match master_id {
+            crate::xinput::DEVICEID_MASTER_POINTER => &mut self.xi_last_pointer_slave,
+            crate::xinput::DEVICEID_MASTER_KEYBOARD => &mut self.xi_last_keyboard_slave,
+            _ => return false,
+        };
+        if *last_slave == Some(slave_id) {
+            return false;
+        }
+        *last_slave = Some(slave_id);
+        true
+    }
+
+    /// Clear a source reference before its slave is disabled, detached, or
+    /// removed. It is harmless when the device was not current.
+    pub fn xi_clear_last_slave(&mut self, slave_id: u16) {
+        if self.xi_last_pointer_slave == Some(slave_id) {
+            self.xi_last_pointer_slave = None;
+        }
+        if self.xi_last_keyboard_slave == Some(slave_id) {
+            self.xi_last_keyboard_slave = None;
+        }
     }
 
     #[must_use]

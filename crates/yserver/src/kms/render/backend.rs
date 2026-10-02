@@ -20791,6 +20791,10 @@ impl KmsBackend {
             return;
         };
         let time = crate::clock::server_time_ms();
+        if transition.device_accepted {
+            let _dropped =
+                yserver_core::core_loop::key_fanout::announce_key_source_switch(state, raw.origin);
+        }
         if generate_raw {
             let key_was_down = yserver_core::core_loop::key_fanout::keyboard_key_is_down(
                 state,
@@ -31450,6 +31454,370 @@ mod tests {
         assert_eq!(state.xi_devices.device(4).unwrap().buttons_down, 0);
         assert_eq!(state.xi_devices.device(5).unwrap().buttons_down, 0);
         assert!(read_events(&mut unrelated).is_empty());
+    }
+
+    #[test]
+    fn xi_slave_switch_kms_suspend_and_removal_clear_last_source() {
+        use yserver_core::{
+            backend::Backend,
+            core_loop::{DeviceInfo, HostInputEvent, InputOrigin},
+            resources::ROOT_WINDOW,
+            server::ServerState,
+            xinput::{InputCapabilities, InputSourceId, XiFacetKind},
+        };
+        use yserver_protocol::x11::ClientId;
+
+        const CLIENT: u32 = 0xA73;
+        const CHANGE_AND_MOTION: u64 = (1 << 1) | (1 << 6);
+        let info = |source_id, name: &str| DeviceInfo {
+            source_id: InputSourceId(source_id),
+            enabled: true,
+            resume_key: None,
+            capabilities: InputCapabilities {
+                keyboard: false,
+                pointer: true,
+                touch: false,
+            },
+            name: name.to_owned(),
+            device_node: format!("/dev/input/event-{name}"),
+            sysname: format!("event-{name}"),
+            vendor_id: 1,
+            product_id: source_id as u32,
+            is_touchpad: false,
+            config: Default::default(),
+        };
+        let motion = |source_id, x, y, time| HostInputEvent::PointerMotion {
+            origin: InputOrigin::Physical(InputSourceId(source_id)),
+            x,
+            y,
+            time,
+            relative: false,
+            dx: 0,
+            dy: 0,
+            motion_delta: None,
+        };
+        let events = |bytes: &[u8]| {
+            let mut result = Vec::new();
+            let mut offset = 0;
+            while offset + 32 <= bytes.len() {
+                if bytes[offset] & 0x7f == 35 {
+                    let event_type = u16::from_le_bytes([bytes[offset + 8], bytes[offset + 9]]);
+                    let device_id = u16::from_le_bytes([bytes[offset + 10], bytes[offset + 11]]);
+                    let source_offset = if event_type == 1 { 18 } else { 52 };
+                    let source_id = u16::from_le_bytes([
+                        bytes[offset + source_offset],
+                        bytes[offset + source_offset + 1],
+                    ]);
+                    let reason = if event_type == 1 {
+                        bytes[offset + 20]
+                    } else {
+                        0
+                    };
+                    result.push((event_type, device_id, source_id, reason));
+                    let units =
+                        u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap());
+                    offset += 32 + units as usize * 4;
+                } else {
+                    offset += 32;
+                }
+            }
+            assert_eq!(offset, bytes.len(), "complete KMS XI2 event stream");
+            result
+        };
+
+        let mut backend = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        backend
+            .core
+            .xid_map
+            .insert(backend.core.window_id, ROOT_WINDOW);
+        let mut peer = kbd_map_client_id(&mut state, CLIENT);
+        state
+            .clients
+            .get_mut(&CLIENT)
+            .unwrap()
+            .xi2_masks
+            .insert((ROOT_WINDOW, 2), CHANGE_AND_MOTION);
+        state.xi2_client_versions.insert(ClientId(CLIENT), (2, 2));
+
+        let razer = info(0xA731, "Razer");
+        let hyperx = info(0xA732, "HyperX");
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceAdded(razer.clone()),
+        );
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceAdded(hyperx.clone()),
+        );
+        let razer_id = state
+            .xi_devices
+            .facet(razer.source_id, XiFacetKind::PointerTouch)
+            .unwrap();
+        let hyperx_id = state
+            .xi_devices
+            .facet(hyperx.source_id, XiFacetKind::PointerTouch)
+            .unwrap();
+        assert_eq!((razer_id, hyperx_id), (6, 7));
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            motion(razer.source_id.0, 20, 30, 1),
+        );
+        let first = events(&kbd_map_drain(&mut peer));
+        assert_eq!(first[0], (1, 2, razer_id, 1));
+        assert_eq!(state.xi_last_slave(2), Some(razer_id));
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceSuspended {
+                source_id: razer.source_id,
+            },
+        );
+        assert_eq!(state.xi_last_slave(2), None, "suspend clears lastSlave");
+        assert!(!state.xi_devices.source(razer.source_id).unwrap().enabled);
+        assert!(state.xi_devices.device(razer_id).is_some());
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceResumed(razer.clone()),
+        );
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            motion(razer.source_id.0, 40, 50, 2),
+        );
+        let resumed = events(&kbd_map_drain(&mut peer));
+        assert_eq!(resumed[0], (1, 2, razer_id, 1));
+        assert_eq!(state.xi_last_slave(2), Some(razer_id));
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceRemoved {
+                source_id: razer.source_id,
+            },
+        );
+        assert_eq!(state.xi_last_slave(2), None, "removal clears lastSlave");
+        assert!(state.xi_devices.source(razer.source_id).is_none());
+        assert!(state.xi_devices.device(razer_id).is_none());
+
+        let replacement = info(0xA733, "replacement");
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceAdded(replacement.clone()),
+        );
+        let replacement_id = state
+            .xi_devices
+            .facet(replacement.source_id, XiFacetKind::PointerTouch)
+            .unwrap();
+        assert_eq!(replacement_id, razer_id, "the released XI ID is reused");
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            motion(replacement.source_id.0, 60, 70, 3),
+        );
+        let replacement_events = events(&kbd_map_drain(&mut peer));
+        assert_eq!(replacement_events[0], (1, 2, replacement_id, 1));
+        assert_eq!(state.xi_last_slave(2), Some(replacement_id));
+        assert!(state.xi_devices.source(hyperx.source_id).is_some());
+        assert!(state.xi_devices.device(hyperx_id).unwrap().enabled);
+        assert_eq!(
+            state
+                .xi_devices
+                .device(hyperx_id)
+                .unwrap()
+                .scroll_axis_values,
+            [0, 0]
+        );
+        assert_eq!(state.xi_devices.devices().len(), 6);
+        assert!(state.pending_xi_device_removals.is_empty());
+        assert_eq!(state.buttons_down, 0);
+        assert!(state.sync_pending.is_empty());
+        assert!(state.unpublished_pointer_buttons_down.is_empty());
+        assert!(state.unpublished_keyboard_keys_down.is_empty());
+        assert!(backend.core.pending_pointer_events.is_empty());
+    }
+
+    #[test]
+    fn xi_slave_switch_kms_keyboard_precedes_raw_and_key_events() {
+        use yserver_core::{
+            backend::Backend,
+            core_loop::{DeviceInfo, HostInputEvent, InputOrigin},
+            host_x11::HostKeyEvent,
+            resources::ROOT_WINDOW,
+            server::ServerState,
+            xinput::{InputCapabilities, InputSourceId, XiFacetKind},
+        };
+        use yserver_protocol::x11::ClientId;
+
+        const CLIENT: u32 = 0xA74;
+        const KEY_MASK: u64 = (1 << 1) | (1 << 2) | (1 << 13);
+        let info = |source_id| DeviceInfo {
+            source_id: InputSourceId(source_id),
+            enabled: true,
+            resume_key: None,
+            capabilities: InputCapabilities {
+                keyboard: true,
+                pointer: false,
+                touch: false,
+            },
+            name: format!("keyboard-{source_id}"),
+            device_node: format!("/dev/input/event-{source_id}"),
+            sysname: format!("event-{source_id}"),
+            vendor_id: 1,
+            product_id: source_id as u32,
+            is_touchpad: false,
+            config: Default::default(),
+        };
+        let key = |source_id, keycode, pressed, time| {
+            HostInputEvent::Key(HostKeyEvent {
+                origin: InputOrigin::Physical(InputSourceId(source_id)),
+                pressed,
+                keycode,
+                time,
+                root_x: 10,
+                root_y: 20,
+                event_x: 10,
+                event_y: 20,
+                state: 0,
+            })
+        };
+        let parse = |bytes: &[u8]| {
+            let mut events = Vec::new();
+            let mut offset = 0;
+            while offset + 32 <= bytes.len() {
+                assert_eq!(bytes[offset] & 0x7f, 35, "XI2 GenericEvent");
+                let event_type = u16::from_le_bytes([bytes[offset + 8], bytes[offset + 9]]);
+                let device_id = u16::from_le_bytes([bytes[offset + 10], bytes[offset + 11]]);
+                let source_offset = if event_type == 1 {
+                    18
+                } else if (13..=17).contains(&event_type) {
+                    20
+                } else {
+                    52
+                };
+                let source_id = u16::from_le_bytes([
+                    bytes[offset + source_offset],
+                    bytes[offset + source_offset + 1],
+                ]);
+                let reason = if event_type == 1 {
+                    bytes[offset + 20]
+                } else {
+                    0
+                };
+                if event_type == 1 {
+                    assert_eq!(
+                        u16::from_le_bytes([bytes[offset + 32], bytes[offset + 33]]),
+                        0,
+                        "DeviceChanged carries KeyClass"
+                    );
+                    assert_eq!(
+                        u16::from_le_bytes([bytes[offset + 36], bytes[offset + 37]]),
+                        source_id,
+                        "KeyClass source id"
+                    );
+                }
+                events.push((event_type, device_id, source_id, reason));
+                let units = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap());
+                offset += 32 + units as usize * 4;
+            }
+            assert_eq!(offset, bytes.len(), "complete KMS keyboard event stream");
+            events
+        };
+
+        let mut backend = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        state.core_focus.raw = ROOT_WINDOW.0;
+        let mut peer = kbd_map_client_id(&mut state, CLIENT);
+        state
+            .clients
+            .get_mut(&CLIENT)
+            .unwrap()
+            .xi2_masks
+            .insert((ROOT_WINDOW, 3), KEY_MASK);
+        state.xi2_client_versions.insert(ClientId(CLIENT), (2, 2));
+
+        let razer = info(0xA741);
+        let hyperx = info(0xA742);
+        for device in [razer.clone(), hyperx.clone()] {
+            Backend::on_host_input(
+                &mut backend,
+                &mut state,
+                HostInputEvent::DeviceAdded(device),
+            );
+        }
+        let razer_id = state
+            .xi_devices
+            .facet(razer.source_id, XiFacetKind::Keyboard)
+            .unwrap();
+        let hyperx_id = state
+            .xi_devices
+            .facet(hyperx.source_id, XiFacetKind::Keyboard)
+            .unwrap();
+        assert_eq!((razer_id, hyperx_id), (6, 7));
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            key(razer.source_id.0, 38, true, 1),
+        );
+        let first = parse(&kbd_map_drain(&mut peer));
+        assert_eq!(
+            first,
+            vec![
+                (1, 3, razer_id, 1),
+                (13, 3, razer_id, 0),
+                (2, 3, razer_id, 0)
+            ],
+            "UpdateFromMaster DeviceChanged precedes raw and normal key delivery"
+        );
+        assert_eq!(state.xi_last_slave(3), Some(razer_id));
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            key(razer.source_id.0, 39, true, 2),
+        );
+        let same = parse(&kbd_map_drain(&mut peer));
+        assert_eq!(same, vec![(13, 3, razer_id, 0), (2, 3, razer_id, 0)]);
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            key(hyperx.source_id.0, 40, true, 3),
+        );
+        let switched = parse(&kbd_map_drain(&mut peer));
+        assert_eq!(
+            switched,
+            vec![
+                (1, 3, hyperx_id, 1),
+                (13, 3, hyperx_id, 0),
+                (2, 3, hyperx_id, 0)
+            ]
+        );
+        for (source, keycode, time) in [
+            (razer.source_id.0, 38, 4),
+            (razer.source_id.0, 39, 5),
+            (hyperx.source_id.0, 40, 6),
+        ] {
+            Backend::on_host_input(&mut backend, &mut state, key(source, keycode, false, time));
+            let _ = kbd_map_drain(&mut peer);
+        }
+        assert_eq!(state.xi_last_slave(3), Some(hyperx_id));
+        assert!(state.keys_down.iter().all(|byte| *byte == 0));
+        assert!(state.key_down_by_device.is_empty());
+        assert!(state.sync_pending.is_empty());
+        assert_eq!(state.xi_devices.devices().len(), 6);
+        assert!(state.xi_devices.source(razer.source_id).is_some());
+        assert!(state.xi_devices.source(hyperx.source_id).is_some());
+        assert!(backend.core.down_keys.is_empty());
     }
 
     use super::{
