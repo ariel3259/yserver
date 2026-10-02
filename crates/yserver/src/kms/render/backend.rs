@@ -21066,6 +21066,16 @@ impl Backend for KmsBackend {
             pointer_fanout::pointer_event_fanout_to_state,
         };
 
+        if let HostInputEvent::Key(raw) | HostInputEvent::KeyRepeat(raw) = &ev
+            && !yserver_core::core_loop::key_fanout::keyboard_origin_is_live(state, raw.origin)
+        {
+            log::trace!(
+                "dropping key input from unknown, disabled, or invalid origin {:?}",
+                raw.origin
+            );
+            return;
+        }
+
         self.synchronize_floating_keyboard_states(state);
 
         let pointer_button_origin = match &ev {
@@ -21308,7 +21318,7 @@ impl Backend for KmsBackend {
                 // Xorg builds it in GetKeyboardEvents before exevents drops
                 // a duplicate. `raw_key_event_to_state` applies Xorg's own
                 // press-while-down rule.
-                if matches!(ev, HostInputEvent::Key(_)) && !floating_keyboard {
+                if matches!(ev, HostInputEvent::Key(_)) {
                     let _dropped = yserver_core::core_loop::key_fanout::raw_key_event_to_state(
                         state,
                         yserver_core::core_loop::key_fanout::RawKeyEvent {
@@ -39901,12 +39911,10 @@ mod tests {
         out
     }
 
-    /// Issue #173: a key from the device path produces XI2 raw key events
-    /// for a root XIAllMasterDevices selector — deviceid 3 (master), sourceid
-    /// 5, detail = keycode — delivered BEFORE the key's XI2 device event and
-    /// with the same timestamp (Xorg GetKeyboardEvents: one `ms`, raw first;
-    /// the reporter's Xlibre `xinput test-xi2 --root` log and the Xvfb
-    /// capture in key_fanout's raw_keys tests show both).
+    /// Nested host keys produce master-only XI2 raw/device events. Their
+    /// sourceid is the master keyboard itself (3), never the virtual XTEST
+    /// keyboard (5). Raw remains before the device event with the same
+    /// timestamp, matching Xorg's GetKeyboardEvents ordering.
     #[test]
     fn device_key_emits_raw_key_events_before_the_device_event() {
         use yserver_core::{
@@ -39944,8 +39952,8 @@ mod tests {
         let kinds: Vec<_> = events.iter().map(|e| (e.0, e.1, e.2, e.3)).collect();
         assert_eq!(
             kinds,
-            vec![(13, 3, 5, 71), (2, 3, 5, 71), (14, 3, 5, 71), (3, 3, 5, 71)],
-            "RawKeyPress, KeyPress, RawKeyRelease, KeyRelease"
+            vec![(13, 3, 3, 71), (2, 3, 3, 71), (14, 3, 3, 71), (3, 3, 3, 71)],
+            "nested RawKeyPress, KeyPress, RawKeyRelease, KeyRelease"
         );
         assert_eq!(
             events[0].4, events[1].4,
@@ -39955,6 +39963,148 @@ mod tests {
             events[2].4, events[3].4,
             "raw release and KeyRelease share one time"
         );
+    }
+
+    #[test]
+    fn key_source_routing_kms_preserves_facets_and_drops_unknown_before_xkb() {
+        use yserver_core::{
+            backend::Backend,
+            core_loop::{DeviceInfo, HostInputEvent, InputOrigin, message::LibinputConfigSnapshot},
+            host_x11::HostKeyEvent,
+            resources::ROOT_WINDOW,
+            server::ServerState,
+            xinput::{InputCapabilities, InputSourceId, XiFacetKind},
+        };
+
+        const RAZER: InputSourceId = InputSourceId(0xA11);
+        const HYPERX: InputSourceId = InputSourceId(0xA12);
+        const RETIRED: InputSourceId = InputSourceId(0xA13);
+
+        let mut backend = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        state.core_focus.raw = ROOT_WINDOW.0;
+
+        let key = |origin, keycode, pressed| {
+            HostInputEvent::Key(HostKeyEvent {
+                origin,
+                keycode,
+                pressed,
+                time: 0,
+                root_x: 10,
+                root_y: 20,
+                event_x: 10,
+                event_y: 20,
+                state: 0,
+            })
+        };
+        let device_info = |source_id, name: &str| DeviceInfo {
+            source_id,
+            enabled: true,
+            resume_key: None,
+            capabilities: InputCapabilities {
+                keyboard: true,
+                pointer: false,
+                touch: false,
+            },
+            name: name.to_owned(),
+            device_node: format!("/dev/input/{name}"),
+            sysname: name.to_owned(),
+            vendor_id: 0,
+            product_id: 0,
+            is_touchpad: false,
+            config: LibinputConfigSnapshot::default(),
+        };
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceAdded(device_info(RETIRED, "Retired keyboard")),
+        );
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceRemoved { source_id: RETIRED },
+        );
+
+        // An unknown source must not reach raw fanout or advance KMS/XKB.
+        let initial_modifiers = backend.serialize_modifiers();
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            key(InputOrigin::Physical(RETIRED), 50, true),
+        );
+        assert!(backend.core.down_keys.is_empty());
+        assert!(state.keys_down.iter().all(|byte| *byte == 0));
+        assert_eq!(backend.serialize_modifiers(), initial_modifiers);
+
+        for (source_id, name) in [(RAZER, "Razer"), (HYPERX, "HyperX")] {
+            Backend::on_host_input(
+                &mut backend,
+                &mut state,
+                HostInputEvent::DeviceAdded(device_info(source_id, name)),
+            );
+        }
+        let razer_id = state
+            .xi_devices
+            .facet(RAZER, XiFacetKind::Keyboard)
+            .expect("Razer keyboard facet");
+        let hyperx_id = state
+            .xi_devices
+            .facet(HYPERX, XiFacetKind::Keyboard)
+            .expect("HyperX keyboard facet");
+        assert_ne!(razer_id, hyperx_id);
+
+        let suspended_info = device_info(HYPERX, "HyperX");
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceSuspended { source_id: HYPERX },
+        );
+        let suspended_modifiers = backend.serialize_modifiers();
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            key(InputOrigin::Physical(HYPERX), 50, true),
+        );
+        assert!(backend.core.down_keys.is_empty());
+        assert!(state.keys_down.iter().all(|byte| *byte == 0));
+        assert_eq!(backend.serialize_modifiers(), suspended_modifiers);
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceResumed(suspended_info),
+        );
+        assert!(state.xi_devices.source(HYPERX).unwrap().enabled);
+        assert_eq!(
+            state.xi_devices.facet(HYPERX, XiFacetKind::Keyboard),
+            Some(hyperx_id),
+            "resume preserves the same facet ID"
+        );
+
+        for source_id in [RAZER, HYPERX] {
+            Backend::on_host_input(
+                &mut backend,
+                &mut state,
+                key(InputOrigin::Physical(source_id), 38, true),
+            );
+            Backend::on_host_input(
+                &mut backend,
+                &mut state,
+                key(InputOrigin::Physical(source_id), 38, false),
+            );
+        }
+
+        for origin in [InputOrigin::XTest(5), InputOrigin::NestedHost] {
+            Backend::on_host_input(&mut backend, &mut state, key(origin, 38, true));
+            Backend::on_host_input(&mut backend, &mut state, key(origin, 38, false));
+        }
+        assert!(backend.core.down_keys.is_empty());
+        assert!(state.keys_down.iter().all(|byte| *byte == 0));
+        assert!(state.repeat_state.is_none());
+        assert!(state.sync_pending.is_empty());
+        assert!(state.xi_devices.source(RETIRED).is_none());
+        assert!(state.xi_devices.source(RAZER).is_some());
+        assert!(state.xi_devices.source(HYPERX).is_some());
     }
 
     /// The duplicate guard (#168) drops a press of a key already down and
@@ -42105,7 +42255,7 @@ mod tests {
 
         let mut backend = KmsBackend::for_tests();
         let mut state = ServerState::new();
-        let _peer = kbd_map_client_id(&mut state, CLIENT);
+        let mut grab_peer = kbd_map_client_id(&mut state, CLIENT);
         for (source_id, name) in [(RAZER, "Razer"), (HYPERX, "HyperX")] {
             backend.on_host_input(
                 &mut state,
@@ -42136,6 +42286,13 @@ mod tests {
             .xi_devices
             .facet(RAZER, XiFacetKind::Keyboard)
             .expect("Razer keyboard facet");
+        state
+            .clients
+            .get_mut(&CLIENT)
+            .unwrap()
+            .xi2_masks
+            .insert((ROOT_WINDOW, razer_keyboard_id), (1 << 13) | (1 << 14));
+        state.xi2_client_versions.insert(ClientId(CLIENT), (2, 2));
         assert!(
             state
                 .xi_devices
@@ -42330,15 +42487,14 @@ mod tests {
             "KMS confines the integrated cursor before emitting motion"
         );
 
-        // Freeze the virtual XTEST keyboard through XIGrabDevice, then send
-        // a physical Razer keyboard press/release through KMS. The deferred
-        // raw records must keep their generating source while core key state
-        // is still fully released.
+        // Float and synchronously grab Razer's keyboard facet, then send its
+        // press/release through KMS. Raw slave records arrive immediately;
+        // the device events remain queued with their generating source.
         let mut key_grab_body = Vec::with_capacity(24);
         key_grab_body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
         key_grab_body.extend_from_slice(&0u32.to_le_bytes());
         key_grab_body.extend_from_slice(&0u32.to_le_bytes());
-        key_grab_body.extend_from_slice(&5u16.to_le_bytes());
+        key_grab_body.extend_from_slice(&razer_keyboard_id.to_le_bytes());
         key_grab_body.extend_from_slice(&[0, 1, 0, 0]); // sync this, async paired
         key_grab_body.extend_from_slice(&0u16.to_le_bytes());
         key_grab_body.extend_from_slice(&[0u8; 2]);
@@ -42355,11 +42511,11 @@ mod tests {
             &key_grab_body,
             None,
         )
-        .expect("XIGrabDevice on XTEST keyboard");
+        .expect("XIGrabDevice on Razer keyboard");
         assert!(
             state
                 .xi1_frozen
-                .get(&5)
+                .get(&razer_keyboard_id)
                 .is_some_and(yserver_core::server::Xi1Freeze::frozen)
         );
         for (pressed, time) in [(true, 3), (false, 4)] {
@@ -42379,30 +42535,34 @@ mod tests {
             );
         }
         assert!(backend.core.down_keys.is_empty());
-        let deferred_raw: Vec<_> = state
-            .sync_pending
-            .iter()
-            .filter_map(|pending| match &pending.event {
-                yserver_core::server::QueuedInputEvent::RawKey(event) => Some(*event),
-                yserver_core::server::QueuedInputEvent::Xi1Routed(_) => None,
-                other => panic!("unexpected deferred input, got {other:?}"),
-            })
-            .collect();
-        assert_eq!(state.sync_pending.len(), 4);
+        let (deferred_raw, deferred_keys): (Vec<_>, Vec<_>) = state.sync_pending.iter().fold(
+            (Vec::new(), Vec::new()),
+            |(mut raw, mut keys), pending| {
+                match &pending.event {
+                    yserver_core::server::QueuedInputEvent::RawKey(event) => raw.push(*event),
+                    yserver_core::server::QueuedInputEvent::HostKey(event) => keys.push(*event),
+                    yserver_core::server::QueuedInputEvent::Xi1Routed(_) => {}
+                    other => panic!("unexpected deferred input, got {other:?}"),
+                }
+                (raw, keys)
+            },
+        );
+        assert_eq!(state.sync_pending.len(), 2);
         assert_eq!(
             state
                 .sync_pending
                 .iter()
                 .filter(|pending| matches!(
                     pending.event,
-                    yserver_core::server::QueuedInputEvent::Xi1Routed(_)
+                    yserver_core::server::QueuedInputEvent::HostKey(_)
                 ))
                 .count(),
             2
         );
-        assert_eq!(deferred_raw.len(), 2);
+        assert!(deferred_raw.is_empty());
+        assert_eq!(deferred_keys.len(), 2);
         assert_eq!(
-            deferred_raw
+            deferred_keys
                 .iter()
                 .map(|event| (event.origin, event.keycode, event.pressed))
                 .collect::<Vec<_>>(),
@@ -42419,7 +42579,18 @@ mod tests {
                 ),
             ]
         );
-
+        assert_eq!(
+            xi2_events(&kbd_map_drain(&mut grab_peer))
+                .into_iter()
+                .filter(|event| matches!(event.0, 13 | 14))
+                .map(|event| (event.0, event.1, event.2, event.3))
+                .collect::<Vec<_>>(),
+            vec![
+                (13, razer_keyboard_id, razer_keyboard_id, 38),
+                (14, razer_keyboard_id, razer_keyboard_id, 38),
+            ],
+            "a floating keyboard emits only its source slave raw form"
+        );
         assert_eq!(state.xi_devices.source(RAZER).unwrap().name, "Razer");
         assert_eq!(state.xi_devices.source(HYPERX).unwrap().name, "HyperX");
         assert_eq!(
@@ -42461,7 +42632,7 @@ mod tests {
         );
         assert_eq!(
             state.xi2_keyboard_grabs.keys().copied().collect::<Vec<_>>(),
-            vec![5]
+            vec![razer_keyboard_id]
         );
         assert_eq!(
             state
@@ -42469,7 +42640,7 @@ mod tests {
                 .device(razer_keyboard_id)
                 .unwrap()
                 .attached_master,
-            Some(yserver_core::xinput::DEVICEID_MASTER_KEYBOARD)
+            None
         );
         assert_eq!(
             state
@@ -42483,7 +42654,7 @@ mod tests {
         assert!((floating_position.0 - 601.2).abs() < 0.001);
         assert_eq!(floating_position.1, 300.0);
         assert!(backend.core.pending_pointer_events.is_empty());
-        assert_eq!(state.sync_pending.len(), 4);
+        assert_eq!(state.sync_pending.len(), 2);
     }
 
     /// Stage 3f.6 — `create_subwindow` records the parent xid + the
