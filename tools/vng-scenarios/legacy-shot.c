@@ -4,7 +4,8 @@
  *
  *   ./legacy-shot WINDOW-ID NAME [frame]   # writes NAME.ppm
  *
- * With `frame`, the top-level the window manager put the window in.
+ * With `frame`, the top-level the window manager put the window in. A
+ * window reaching past the screen is read up to its edge.
  *
  *   cc -O1 -o legacy-shot legacy-shot.c -lxcb
  */
@@ -36,10 +37,22 @@ int main(int argc, char **argv)
         printf("%s: no such window\n", argv[2]);
         return 1;
     }
+    /* A window larger than the screen (dtpad without a window manager)
+     * is read as far as the screen reaches. */
+    xcb_screen_t *s = xcb_setup_roots_iterator(xcb_get_setup(c)).data;
+    xcb_translate_coordinates_reply_t *at =
+        xcb_translate_coordinates_reply(c, xcb_translate_coordinates(c, w, s->root, 0, 0), NULL);
+    if (at) {
+        if (at->dst_x >= 0 && at->dst_x + g->width > s->width_in_pixels)
+            g->width = s->width_in_pixels - at->dst_x;
+        if (at->dst_y >= 0 && at->dst_y + g->height > s->height_in_pixels)
+            g->height = s->height_in_pixels - at->dst_y;
+        free(at);
+    }
     xcb_get_image_reply_t *r = xcb_get_image_reply(
         c, xcb_get_image(c, XCB_IMAGE_FORMAT_Z_PIXMAP, w, 0, 0, g->width, g->height, ~0u), NULL);
     if (!r) {
-        printf("%s: GetImage failed\n", argv[2]);
+        printf("%s: GetImage failed (%ux%u+%d+%d)\n", argv[2], g->width, g->height, g->x, g->y);
         return 1;
     }
     const uint32_t *px = (const uint32_t *)xcb_get_image_data(r);
