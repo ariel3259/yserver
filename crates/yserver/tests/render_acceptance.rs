@@ -10922,6 +10922,99 @@ fn get_image_of_an_unredirected_window_includes_its_inferiors() {
     }
 }
 
+/// RENDER through a Picture on a window without a compositor: as a
+/// source it reads the window's children too, whatever its subwindow
+/// mode (`miClipPictureSrc`, `render/mipict.c:265-284`); as an
+/// IncludeInferiors destination it paints over them
+/// (`render/mipict.c:114-118`). Measured by
+/// tools/vng-scenarios/draw-clip-probe.c (direct): C (190x100) with
+/// its child V (100,10 80x120).
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn render_through_an_unredirected_window_reaches_its_inferiors() {
+    use yserver_core::backend::{AnyHandle, PixmapHandle, WindowHandle};
+    const GRAY: u32 = 0x003B_3B3E;
+    const BLUE: u32 = 0x0000_00FF;
+    const C: u32 = 0x14c0;
+    const V: u32 = 0x14c1;
+    let mut f = ProtoFixture::new().expect("live Vulkan");
+    let root = yserver_core::resources::ROOT_WINDOW.0;
+    let visual = yserver_core::resources::ROOT_VISUAL.0;
+    or_create_window(&mut f, C, root, 24, 0, 0, 190, 100, 0, visual, 2, &[GRAY]);
+    wz_map(&mut f, C);
+    or_create_window(&mut f, V, C, 24, 100, 10, 80, 120, 0, visual, 2, &[BLUE]);
+    wz_map(&mut f, V);
+    let (c, v) = (f.host_xid(C), f.host_xid(V));
+    let window_pic = |f: &mut ProtoFixture, mode: u32| {
+        f.backend
+            .render_create_picture(
+                None,
+                AnyHandle::Window(WindowHandle::from_raw(c).unwrap()),
+                0,
+                0x0100, // CPSubwindowMode
+                &mode.to_le_bytes(),
+            )
+            .unwrap()
+            .unwrap()
+            .as_raw()
+    };
+    for mode in [0, 1] {
+        let pm = f.backend.create_pixmap(None, 24, 190, 100).unwrap();
+        let pm_xid = pm.as_raw();
+        let dst = f
+            .backend
+            .render_create_picture(
+                None,
+                AnyHandle::Pixmap(PixmapHandle::from_raw(pm_xid).unwrap()),
+                0,
+                0,
+                &[],
+            )
+            .unwrap()
+            .unwrap()
+            .as_raw();
+        let src = window_pic(&mut f, mode);
+        f.backend
+            .render_composite(None, 1, src, 0, dst, 0, 0, 0, 0, 0, 0, 190, 100)
+            .unwrap();
+        let got = f
+            .backend
+            .get_image_pixels_for_tests(pm_xid, 2, 0, 0, 190, 100, !0)
+            .unwrap()
+            .unwrap();
+        for (x, y, pixel) in [(50, 50, GRAY), (150, 50, BLUE)] {
+            let at = ((y * 190 + x) * 4) as usize;
+            assert_eq!(
+                &got[at..at + 3],
+                &or_bgr(pixel),
+                "source mode {mode} at ({x},{y})"
+            );
+        }
+    }
+    let dst = window_pic(&mut f, 1);
+    let orange = [0xff, 0xff, 0x80, 0x80, 0, 0, 0xff, 0xff];
+    let mut rect = Vec::new();
+    for v in [-50i16, -50] {
+        rect.extend_from_slice(&v.to_le_bytes());
+    }
+    for v in [400u16, 400] {
+        rect.extend_from_slice(&v.to_le_bytes());
+    }
+    f.backend
+        .render_fill_rectangles(None, dst, 1, orange, &rect, 0, 0)
+        .unwrap();
+    let got = f
+        .backend
+        .get_image_pixels_for_tests(v, 2, 0, 0, 80, 120, !0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        &got[(20 * 80 + 20) * 4..(20 * 80 + 20) * 4 + 3],
+        &or_bgr(0x00FF_8000),
+        "V under an IncludeInferiors fill of C"
+    );
+}
+
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn redirected_menu_border_change_resizes_backing() {

@@ -2933,10 +2933,14 @@ fn handle_render_request(
                 // window-minus-children; if the result is empty the whole
                 // op is skipped. Pixmaps / childless windows pass through
                 // unchanged.
+                // IncludeInferiors keeps the children in the clip.
                 let dst_drawable = state.resources.picture(req.dst).and_then(|p| p.drawable);
+                let include_inferiors = backend.picture_includes_inferiors(host_dst);
                 let painted_rects = match dst_drawable {
-                    Some(d) => clip_fill_rects_by_children(state, d, &req.rects),
-                    None => req.rects.clone(),
+                    Some(d) if !include_inferiors => {
+                        clip_fill_rects_by_children(state, d, &req.rects)
+                    }
+                    _ => req.rects.clone(),
                 };
                 if !painted_rects.is_empty() {
                     let _ = backend.render_fill_rectangles(
@@ -2949,7 +2953,11 @@ fn handle_render_request(
                         0,
                     );
                     if let Some(d) = dst_drawable {
-                        let _dropped = accumulate_damage_clip_by_children_to_state(state, d);
+                        let _dropped = if include_inferiors {
+                            accumulate_damage_full_to_state(state, d)
+                        } else {
+                            accumulate_damage_clip_by_children_to_state(state, d)
+                        };
                     }
                 }
             }
