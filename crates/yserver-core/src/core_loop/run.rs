@@ -3775,6 +3775,14 @@ fn update_repeat_state(state: &mut ServerState, ev: &HostInputEvent) {
     let Key(key) = ev else {
         return;
     };
+    if crate::core_loop::key_fanout::keyboard_origin_is_floating(state, key.origin) {
+        if state.repeat_state.is_some_and(|repeat| {
+            repeat.event.origin == key.origin && repeat.event.keycode == key.keycode
+        }) {
+            state.repeat_state = None;
+        }
+        return;
+    }
     if key.pressed {
         let synthetic = state
             .repeat_state
@@ -3824,6 +3832,10 @@ fn fire_pending_repeats(state: &mut ServerState, backend: &mut dyn Backend) -> b
     let Some(armed) = state.repeat_state else {
         return false;
     };
+    if crate::core_loop::key_fanout::keyboard_origin_is_floating(state, armed.event.origin) {
+        state.repeat_state = None;
+        return false;
+    }
     // Repeat may have been disabled (ChangeKeyboardControl) after the
     // key was armed — disarm instead of firing.
     if !state.keyboard_control.key_auto_repeats(armed.event.keycode) {

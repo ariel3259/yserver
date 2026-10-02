@@ -280,6 +280,7 @@ pub fn key_event_fanout_to_state(
         state.last_xkb_group = g;
         state.last_xkb_mods = eff_mods;
     }
+    backend.sync_floating_keyboard_states(state);
 
     dropped
 }

@@ -219,6 +219,14 @@ struct SharedBackingMoveSource {
     occluders: Vec<ash::vk::Rect2D>,
 }
 
+/// Cooking state owned by one temporarily floating keyboard slave. Its XKB
+/// state and duplicate guard must not share the master keyboard's state.
+struct FloatingKeyboardState {
+    xkb_state: crate::kms::core::XkbState,
+    down_keys: HashSet<u8>,
+    locked_group: u8,
+}
+
 /// #133 step 6 (P8) — what [`KmsBackend::sync_window_leaf_storage`]
 /// does with the pixels a window's leaf storage already holds when it
 /// has to reallocate.
@@ -1694,6 +1702,9 @@ pub struct KmsBackend {
     /// Last `input::Led` bits pushed — dedup so only lock-state
     /// TRANSITIONS reach the hardware, not every key event.
     leds_sent: u32,
+    /// Independent XKB cooking states for keyboard slaves detached by an
+    /// explicit XI2 grab. The XI device ID is stable for the grab lifetime.
+    floating_keyboard_states: HashMap<u16, FloatingKeyboardState>,
     /// Core-channel sender for backend-originated shutdowns. Handed in via
     /// `set_input_sender` after the channel is created in `lib.rs`.
     input_sender: Option<yserver_core::core_loop::CoreSender>,
@@ -5415,6 +5426,7 @@ impl KmsBackend {
             vt_switching_armed: false,
             led_relay: None,
             leds_sent: 0,
+            floating_keyboard_states: HashMap::new(),
             input_sender: None,
             crtc_config_probe_executor,
             pending_crtc_config_probes: HashMap::new(),
@@ -6429,6 +6441,7 @@ impl KmsBackend {
             vt_switching_armed: false,
             led_relay: None,
             leds_sent: 0,
+            floating_keyboard_states: HashMap::new(),
             input_sender: None,
             crtc_config_probe_executor: None,
             pending_crtc_config_probes: HashMap::new(),
@@ -11867,7 +11880,18 @@ impl KmsBackend {
     /// Bits 13..=14 carry the active keyboard group (XkbGroupForCoreState),
     /// sourced from the authoritative `core.locked_group`.
     fn serialize_modifiers(&self) -> u16 {
-        let state = &self.core.xkb_state.0;
+        Self::serialize_xkb_modifiers(
+            &self.core.xkb_state.0,
+            self.effective_locked_group(),
+            self.keymap_group_count(),
+        )
+    }
+
+    fn serialize_xkb_modifiers(
+        state: &xkbcommon::xkb::State,
+        locked_group: u8,
+        group_count: u8,
+    ) -> u16 {
         let flags = xkbcommon::xkb::STATE_MODS_EFFECTIVE;
         let mut mask: u16 = 0;
         if state.mod_name_is_active("Shift", flags) {
@@ -11894,11 +11918,126 @@ impl KmsBackend {
         if state.mod_name_is_active("Mod5", flags) {
             mask |= 0x80;
         }
-        // XkbGroupForCoreState: active group in bits 13-14. Sourced from the
-        // authoritative locked_group (NOT xkb_state) — see plan, the group lock
-        // is tracked server-side, not pushed into the master xkb_state.
-        mask |= (u16::from(self.effective_locked_group()) & 0x3) << 13;
+        // XkbGroupForCoreState: active group in bits 13-14. Each keyboard
+        // keeps its group lock alongside its own XKB state.
+        let group = locked_group.min(group_count.saturating_sub(1));
+        mask |= (u16::from(group) & 0x3) << 13;
         mask
+    }
+
+    fn synchronize_floating_keyboard_states(&mut self, state: &ServerState) {
+        let floating_ids: HashSet<u16> = state
+            .xi2_detached_masters
+            .keys()
+            .copied()
+            .filter(|device_id| {
+                state.xi_devices.role(*device_id)
+                    == Some(yserver_core::xinput::XiDeviceRole::SlaveKeyboard)
+            })
+            .collect();
+        self.floating_keyboard_states
+            .retain(|device_id, _| floating_ids.contains(device_id));
+
+        let new_ids: Vec<u16> = floating_ids
+            .into_iter()
+            .filter(|device_id| !self.floating_keyboard_states.contains_key(device_id))
+            .collect();
+        for device_id in new_ids {
+            let mut xkb_state = xkbcommon::xkb::State::new(&self.core.xkb_keymap.0);
+            let master_state = &self.core.xkb_state.0;
+            let latched_mods = master_state.serialize_mods(xkbcommon::xkb::STATE_MODS_LATCHED);
+            let locked_mods = master_state.serialize_mods(xkbcommon::xkb::STATE_MODS_LOCKED);
+            let latched_group = master_state.serialize_layout(xkbcommon::xkb::STATE_LAYOUT_LATCHED);
+            let locked_group = self.effective_locked_group();
+            // Xorg AttachDevice pushes the master keyboard's locked and
+            // latched modifiers/group to attached slaves. A slave that
+            // starts a floating interval therefore inherits those masks,
+            // while depressed key state remains device-local.
+            xkb_state.update_mask(
+                0,
+                latched_mods,
+                locked_mods,
+                0,
+                latched_group,
+                u32::from(locked_group),
+            );
+            self.floating_keyboard_states.insert(
+                device_id,
+                FloatingKeyboardState {
+                    xkb_state: crate::kms::core::XkbState(xkb_state),
+                    down_keys: HashSet::new(),
+                    locked_group,
+                },
+            );
+        }
+    }
+
+    fn cook_floating_host_key(
+        &mut self,
+        device_id: u16,
+        raw: HostKeyEvent,
+    ) -> Option<HostKeyEvent> {
+        let key_is_down = self
+            .floating_keyboard_states
+            .get(&device_id)?
+            .down_keys
+            .contains(&raw.keycode);
+        if raw.pressed == key_is_down {
+            log::debug!(
+                "floating host key device={device_id} key={} {}: duplicate transition dropped",
+                raw.keycode,
+                if raw.pressed { "press" } else { "release" },
+            );
+            return None;
+        }
+
+        let group_count = self.keymap_group_count();
+        let floating = self.floating_keyboard_states.get_mut(&device_id)?;
+        let pre_state = Self::serialize_xkb_modifiers(
+            &floating.xkb_state.0,
+            floating.locked_group,
+            group_count,
+        );
+        let group_before = floating
+            .xkb_state
+            .0
+            .serialize_layout(xkbcommon::xkb::STATE_LAYOUT_EFFECTIVE);
+        floating.xkb_state.0.update_key(
+            xkbcommon::xkb::Keycode::new(u32::from(raw.keycode)),
+            if raw.pressed {
+                xkbcommon::xkb::KeyDirection::Down
+            } else {
+                xkbcommon::xkb::KeyDirection::Up
+            },
+        );
+        let group_after = floating
+            .xkb_state
+            .0
+            .serialize_layout(xkbcommon::xkb::STATE_LAYOUT_EFFECTIVE);
+        if group_after != group_before {
+            floating.locked_group = u8::try_from(group_after)
+                .unwrap_or(0)
+                .min(group_count.saturating_sub(1));
+        }
+        if raw.pressed {
+            floating.down_keys.insert(raw.keycode);
+        } else {
+            floating.down_keys.remove(&raw.keycode);
+        }
+        let post_state = Self::serialize_xkb_modifiers(
+            &floating.xkb_state.0,
+            floating.locked_group,
+            group_count,
+        );
+        let state = (pre_state & 0x00ff) | (post_state & 0x6000);
+        Some(HostKeyEvent {
+            state,
+            root_x: self.core.cursor_x as i16,
+            root_y: self.core.cursor_y as i16,
+            event_x: self.core.cursor_x as i16,
+            event_y: self.core.cursor_y as i16,
+            ..raw
+        })
     }
 
     fn keymap_group_count(&self) -> u8 {
@@ -19732,6 +19871,10 @@ impl Backend for KmsBackend {
         self.scene.wake_for_damage();
     }
 
+    fn sync_floating_keyboard_states(&mut self, state: &ServerState) {
+        self.synchronize_floating_keyboard_states(state);
+    }
+
     fn on_host_input(&mut self, state: &mut ServerState, ev: HostInputEvent) {
         // Stage 3f.7 port of v1's on_host_input. Key events go
         // through the cook → key fanout path; pointer events flow
@@ -19742,6 +19885,8 @@ impl Backend for KmsBackend {
             HostInputEvent, InputOrigin, key_fanout::key_event_fanout_to_state,
             pointer_fanout::pointer_event_fanout_to_state,
         };
+
+        self.synchronize_floating_keyboard_states(state);
 
         let pointer_button_origin = match &ev {
             HostInputEvent::PointerButton { origin, .. } => Some(*origin),
@@ -19997,17 +20142,20 @@ impl Backend for KmsBackend {
                     );
                 }
                 if floating_keyboard {
-                    // TODO(11c): give floating keyboards their own XKB state.
-                    // Until then, grabbed key events use the master keymap's
-                    // current modifiers without changing the master state.
-                    let cooked = HostKeyEvent {
-                        state: self.serialize_modifiers(),
-                        root_x: self.core.cursor_x as i16,
-                        root_y: self.core.cursor_y as i16,
-                        event_x: self.core.cursor_x as i16,
-                        event_y: self.core.cursor_y as i16,
-                        time,
-                        ..raw
+                    let device_id = match raw.origin {
+                        InputOrigin::Physical(source_id) => state
+                            .xi_devices
+                            .facet(source_id, yserver_core::xinput::XiFacetKind::Keyboard),
+                        InputOrigin::XTest(device_id) => Some(device_id),
+                        InputOrigin::NestedHost => None,
+                    };
+                    let Some(device_id) = device_id else {
+                        return;
+                    };
+                    let Some(cooked) =
+                        self.cook_floating_host_key(device_id, HostKeyEvent { time, ..raw })
+                    else {
+                        return;
                     };
                     let repeat = matches!(ev, HostInputEvent::KeyRepeat(_));
                     if !(repeat && !cooked.pressed) {
@@ -20025,6 +20173,7 @@ impl Backend for KmsBackend {
                         );
                     }
                     let _dropped = key_event_fanout_to_state(state, self, cooked);
+                    self.synchronize_floating_keyboard_states(state);
                     return;
                 }
                 // Xorg `Xi/exevents.c` UpdateDeviceState: "don't allow
@@ -20075,6 +20224,7 @@ impl Backend for KmsBackend {
                     );
                 }
                 let _dropped = key_event_fanout_to_state(state, self, cooked);
+                self.synchronize_floating_keyboard_states(state);
                 return;
             }
             HostInputEvent::DeviceAdded(info) => {
@@ -20110,6 +20260,7 @@ impl Backend for KmsBackend {
             HostInputEvent::DeviceRemoved { source_id } => {
                 log::info!("xi-device: removed source={}", source_id.0);
                 yserver_core::core_loop::pointer_fanout::xi_cleanup_source(state, self, source_id);
+                self.synchronize_floating_keyboard_states(state);
                 return;
             }
         }
@@ -39733,6 +39884,546 @@ mod tests {
                 .is_some_and(yserver_core::server::Xi1Freeze::frozen),
             "source removal releases its paired master freeze",
         );
+    }
+
+    #[test]
+    fn xi_dynamic_grabs_floating_keyboard() {
+        use yserver_core::{
+            backend::Backend,
+            core_loop::{DeviceInfo, HostInputEvent, message::LibinputConfigSnapshot},
+            host_x11::HostKeyEvent,
+            resources::ROOT_WINDOW,
+            server::ServerState,
+            xinput::{InputCapabilities, InputSourceId, XiFacetKind},
+        };
+        use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
+
+        const GRAB_CLIENT: u32 = 7;
+        const XI_MASTER_CLIENT: u32 = 8;
+        const CORE_CLIENT: u32 = 9;
+        const RAZER: InputSourceId = InputSourceId(0xA11);
+        const HYPERX: InputSourceId = InputSourceId(0xA12);
+        const SHIFT_L: u8 = 50;
+        const A_KEY: u8 = 38;
+        const CAPS_LOCK: u8 = 66;
+        const SHIFT_MASK: u16 = 0x01;
+        const LOCK_MASK: u16 = 0x02;
+
+        let mut backend = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        let mut grab_peer = kbd_map_client_id(&mut state, GRAB_CLIENT);
+        let mut xi_master_peer = kbd_map_client_id(&mut state, XI_MASTER_CLIENT);
+        let mut core_peer = kbd_map_client_id(&mut state, CORE_CLIENT);
+        state.core_focus.raw = ROOT_WINDOW.0;
+
+        for (source_id, name) in [(RAZER, "Razer"), (HYPERX, "HyperX")] {
+            backend.on_host_input(
+                &mut state,
+                HostInputEvent::DeviceAdded(DeviceInfo {
+                    source_id,
+                    enabled: true,
+                    resume_key: None,
+                    capabilities: InputCapabilities {
+                        keyboard: true,
+                        pointer: false,
+                        touch: false,
+                    },
+                    name: name.to_owned(),
+                    device_node: format!("/dev/input/{name}"),
+                    sysname: name.to_owned(),
+                    vendor_id: 0,
+                    product_id: 0,
+                    is_touchpad: false,
+                    config: LibinputConfigSnapshot::default(),
+                }),
+            );
+        }
+        let razer_id = state
+            .xi_devices
+            .facet(RAZER, XiFacetKind::Keyboard)
+            .expect("Razer keyboard facet");
+        let hyperx_id = state
+            .xi_devices
+            .facet(HYPERX, XiFacetKind::Keyboard)
+            .expect("HyperX keyboard facet");
+
+        // Select the attached master forms independently: XI2 on one
+        // connection, core key events on another.
+        state
+            .clients
+            .get_mut(&XI_MASTER_CLIENT)
+            .unwrap()
+            .xi2_masks
+            .insert(
+                (ROOT_WINDOW, yserver_core::xinput::DEVICEID_MASTER_KEYBOARD),
+                (1 << 2) | (1 << 3),
+            );
+        state
+            .clients
+            .get_mut(&CORE_CLIENT)
+            .unwrap()
+            .event_masks
+            .insert(ROOT_WINDOW, 0x0000_0001 | 0x0000_0002);
+
+        let key = |source_id, keycode, pressed| {
+            HostInputEvent::Key(HostKeyEvent {
+                origin: yserver_core::core_loop::InputOrigin::Physical(source_id),
+                pressed,
+                keycode,
+                time: 0x1234,
+                root_x: 0,
+                root_y: 0,
+                event_x: 0,
+                event_y: 0,
+                state: 0,
+            })
+        };
+        let send_key =
+            |backend: &mut KmsBackend, state: &mut ServerState, source_id, keycode, pressed| {
+                yserver_core::core_loop::run::handle_host_input(
+                    state,
+                    backend,
+                    key(source_id, keycode, pressed),
+                );
+            };
+
+        // A slave attached before it floats already has the master's locked
+        // state, as Xorg's XkbPushLockedStateToSlaves keeps it synchronized.
+        for pressed in [true, false] {
+            send_key(&mut backend, &mut state, HYPERX, CAPS_LOCK, pressed);
+        }
+        let _ = kbd_map_drain(&mut xi_master_peer);
+        let _ = kbd_map_drain(&mut core_peer);
+        assert_ne!(backend.current_led_bits(), 0);
+
+        let xi_grab = |device_id: u16| {
+            let mut body = Vec::with_capacity(24);
+            body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+            body.extend_from_slice(&0u32.to_le_bytes());
+            body.extend_from_slice(&0u32.to_le_bytes());
+            body.extend_from_slice(&device_id.to_le_bytes());
+            body.extend_from_slice(&[1, 1, 0, 0]); // async grab and paired device, no owner events
+            body.extend_from_slice(&1u16.to_le_bytes());
+            body.extend_from_slice(&((1u32 << 2) | (1u32 << 3)).to_le_bytes());
+            body
+        };
+        let request = |minor_opcode, length_units| RequestHeader {
+            opcode: 137,
+            data: minor_opcode,
+            length_units,
+        };
+        yserver_core::core_loop::process_request::process_request(
+            &mut state,
+            &mut backend,
+            ClientId(GRAB_CLIENT),
+            SequenceNumber(1),
+            request(51, 7),
+            &xi_grab(razer_id),
+            None,
+        )
+        .expect("XIGrabDevice on Razer's keyboard facet");
+        let _ = kbd_map_drain(&mut grab_peer);
+        assert_eq!(
+            state.xi_devices.device(razer_id).unwrap().attached_master,
+            None,
+            "the explicit slave grab floats only Razer",
+        );
+        assert!(
+            backend.floating_keyboard_states.contains_key(&razer_id),
+            "detaching Razer allocates its independent XKB state",
+        );
+        assert_ne!(
+            backend.serialize_modifiers() & LOCK_MASK,
+            0,
+            "HyperX's Caps Lock establishes a master locked modifier before Razer floats",
+        );
+        assert_eq!(
+            KmsBackend::serialize_xkb_modifiers(
+                &backend.floating_keyboard_states[&razer_id].xkb_state.0,
+                backend.floating_keyboard_states[&razer_id].locked_group,
+                backend.keymap_group_count(),
+            ) & LOCK_MASK,
+            backend.serialize_modifiers() & LOCK_MASK,
+            "Razer inherits the master's locked modifier when its floating state is created",
+        );
+        assert_eq!(
+            state.xi_devices.device(hyperx_id).unwrap().attached_master,
+            Some(yserver_core::xinput::DEVICEID_MASTER_KEYBOARD),
+            "HyperX remains attached to the master keyboard",
+        );
+
+        let master_mods_before = backend.serialize_modifiers();
+        let master_leds_before = backend.current_led_bits();
+        let mut razer_bytes = Vec::new();
+        send_key(&mut backend, &mut state, RAZER, SHIFT_L, true);
+        razer_bytes.extend(kbd_map_drain(&mut grab_peer));
+        assert!(
+            backend.floating_keyboard_states[&razer_id]
+                .down_keys
+                .contains(&SHIFT_L),
+            "the first floating Shift press reaches the local XKB state; facet={:?}, attached={:?}, active={:?}, master_active={:?}, bytes={}, outbound={}",
+            state
+                .xi_devices
+                .facet(RAZER, yserver_core::xinput::XiFacetKind::Keyboard),
+            state.xi_devices.device(razer_id).unwrap().attached_master,
+            state.xi2_keyboard_grabs.get(&razer_id),
+            state.active_keyboard_grab,
+            razer_bytes.len(),
+            state.clients[&GRAB_CLIENT].outbound.len(),
+        );
+        assert_eq!(backend.serialize_modifiers(), master_mods_before);
+        assert_eq!(backend.current_led_bits(), master_leds_before);
+        send_key(&mut backend, &mut state, RAZER, SHIFT_L, true);
+        razer_bytes.extend(kbd_map_drain(&mut grab_peer));
+        send_key(&mut backend, &mut state, RAZER, A_KEY, true);
+        razer_bytes.extend(kbd_map_drain(&mut grab_peer));
+        assert!(
+            state.repeat_state.is_none(),
+            "a floating key cannot arm the master repeat timer",
+        );
+        assert_eq!(backend.serialize_modifiers(), master_mods_before);
+        assert_eq!(backend.current_led_bits(), master_leds_before);
+        send_key(&mut backend, &mut state, RAZER, A_KEY, false);
+        razer_bytes.extend(kbd_map_drain(&mut grab_peer));
+        assert_eq!(backend.serialize_modifiers(), master_mods_before);
+        assert_eq!(backend.current_led_bits(), master_leds_before);
+        send_key(&mut backend, &mut state, RAZER, SHIFT_L, false);
+        razer_bytes.extend(kbd_map_drain(&mut grab_peer));
+        assert_eq!(backend.serialize_modifiers(), master_mods_before);
+        assert_eq!(backend.current_led_bits(), master_leds_before);
+        assert!(
+            backend.floating_keyboard_states[&razer_id]
+                .down_keys
+                .is_empty()
+        );
+        let razer_events = xi2_events(&razer_bytes);
+        assert_eq!(
+            razer_events
+                .iter()
+                .filter(|(kind, device, _, detail, _)| {
+                    *kind == 2 && *device == razer_id && *detail == u32::from(SHIFT_L)
+                })
+                .count(),
+            1,
+            "the floating keyboard's duplicate guard emits one Shift press: events={razer_events:?}, pending={}, xi1_frozen={:?}, active={:?}, outbound={}",
+            state.sync_pending.len(),
+            state.xi1_frozen.get(&razer_id),
+            state.xi2_keyboard_grabs.get(&razer_id),
+            state.clients[&GRAB_CLIENT].outbound.len(),
+        );
+        assert!(
+            razer_events.iter().any(|(kind, device, _, detail, _)| {
+                *kind == 2 && *device == razer_id && *detail == u32::from(A_KEY)
+            }),
+            "floating key events are delivered through Razer's XI2 slave grab: {razer_events:?}",
+        );
+        let razer_shifted_a = {
+            let bytes = &razer_bytes;
+            let mut offset = 0usize;
+            let mut shifted = false;
+            while offset + 32 <= bytes.len() {
+                if bytes[offset] == 35 {
+                    let length =
+                        u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap())
+                            as usize;
+                    let event_len = 32 + length * 4;
+                    if offset + event_len > bytes.len() {
+                        break;
+                    }
+                    let kind = u16::from_le_bytes([bytes[offset + 8], bytes[offset + 9]]);
+                    let device = u16::from_le_bytes([bytes[offset + 10], bytes[offset + 11]]);
+                    let detail =
+                        u32::from_le_bytes(bytes[offset + 16..offset + 20].try_into().unwrap());
+                    let effective_mods =
+                        u32::from_le_bytes(bytes[offset + 72..offset + 76].try_into().unwrap())
+                            as u16;
+                    shifted |= kind == 2
+                        && device == razer_id
+                        && detail == u32::from(A_KEY)
+                        && effective_mods & SHIFT_MASK != 0;
+                    offset += event_len;
+                } else {
+                    offset += 32;
+                }
+            }
+            shifted
+        };
+        assert!(
+            razer_shifted_a,
+            "Razer's own XI2 key event must report its floating Shift modifier",
+        );
+
+        // Caps Lock on floating Razer updates only its slave view; it does
+        // not change the attached master's modifier state or LED snapshot.
+        let mut razer_caps_bytes = Vec::new();
+        for _ in 0..2 {
+            for pressed in [true, false] {
+                send_key(&mut backend, &mut state, RAZER, CAPS_LOCK, pressed);
+            }
+            send_key(&mut backend, &mut state, RAZER, A_KEY, true);
+            assert!(
+                state.repeat_state.is_none(),
+                "a floating held key cannot arm the master repeat timer",
+            );
+            send_key(&mut backend, &mut state, RAZER, A_KEY, false);
+            assert_eq!(backend.serialize_modifiers(), master_mods_before);
+            assert_eq!(backend.current_led_bits(), master_leds_before);
+            razer_caps_bytes.extend(kbd_map_drain(&mut grab_peer));
+        }
+        let razer_caps_events = xi2_events(&razer_caps_bytes);
+        let caps_lock_states = {
+            let mut offset = 0usize;
+            let mut states = Vec::new();
+            while offset + 32 <= razer_caps_bytes.len() {
+                if razer_caps_bytes[offset] == 35 {
+                    let length = u32::from_le_bytes(
+                        razer_caps_bytes[offset + 4..offset + 8].try_into().unwrap(),
+                    ) as usize;
+                    let event_len = 32 + length * 4;
+                    if offset + event_len > razer_caps_bytes.len() {
+                        break;
+                    }
+                    let kind = u16::from_le_bytes([
+                        razer_caps_bytes[offset + 8],
+                        razer_caps_bytes[offset + 9],
+                    ]);
+                    let device = u16::from_le_bytes([
+                        razer_caps_bytes[offset + 10],
+                        razer_caps_bytes[offset + 11],
+                    ]);
+                    let detail = u32::from_le_bytes(
+                        razer_caps_bytes[offset + 16..offset + 20]
+                            .try_into()
+                            .unwrap(),
+                    );
+                    let effective_mods = u32::from_le_bytes(
+                        razer_caps_bytes[offset + 72..offset + 76]
+                            .try_into()
+                            .unwrap(),
+                    ) as u16;
+                    if kind == 2 && device == razer_id && detail == u32::from(A_KEY) {
+                        states.push(effective_mods & LOCK_MASK);
+                    }
+                    offset += event_len;
+                } else {
+                    offset += 32;
+                }
+            }
+            states
+        };
+        assert!(
+            razer_caps_events
+                .iter()
+                .any(|(kind, device, _, detail, _)| {
+                    *kind == 2 && *device == razer_id && *detail == u32::from(A_KEY)
+                }),
+            "floating Razer key events continue to target its own slave grab",
+        );
+        assert_eq!(
+            caps_lock_states,
+            vec![0, LOCK_MASK],
+            "Razer's own XI2 events report its independent Caps transitions",
+        );
+        assert!(
+            kbd_map_drain(&mut xi_master_peer).is_empty(),
+            "floating Razer key events have no master XI2 delivery",
+        );
+        assert!(
+            kbd_map_drain(&mut core_peer).is_empty(),
+            "floating Razer key events have no core delivery",
+        );
+
+        // The independently attached HyperX keyboard still delivers plain,
+        // unshifted input to both the master XI2 and core views.
+        send_key(&mut backend, &mut state, HYPERX, A_KEY, true);
+        send_key(&mut backend, &mut state, HYPERX, A_KEY, false);
+        let xi_master_bytes = kbd_map_drain(&mut xi_master_peer);
+        let xi_master_events = xi2_events(&xi_master_bytes);
+        assert!(
+            xi_master_events.iter().any(|(kind, device, _, detail, _)| {
+                *kind == 2
+                    && *device == yserver_core::xinput::DEVICEID_MASTER_KEYBOARD
+                    && *detail == u32::from(A_KEY)
+            }),
+            "attached HyperX input reaches the master XI2 selector: {xi_master_events:?}",
+        );
+        let master_a = xi_master_events.iter().any(|(kind, device, _, detail, _)| {
+            *kind == 2
+                && *device == yserver_core::xinput::DEVICEID_MASTER_KEYBOARD
+                && *detail == u32::from(A_KEY)
+        });
+        assert!(master_a, "master XI2 includes HyperX's A key");
+        let master_xi2_a_state = {
+            let mut offset = 0usize;
+            let mut key_state = None;
+            while offset + 32 <= xi_master_bytes.len() {
+                if xi_master_bytes[offset] == 35 {
+                    let length = u32::from_le_bytes(
+                        xi_master_bytes[offset + 4..offset + 8].try_into().unwrap(),
+                    ) as usize;
+                    let event_len = 32 + length * 4;
+                    if offset + event_len > xi_master_bytes.len() {
+                        break;
+                    }
+                    let kind = u16::from_le_bytes([
+                        xi_master_bytes[offset + 8],
+                        xi_master_bytes[offset + 9],
+                    ]);
+                    let device = u16::from_le_bytes([
+                        xi_master_bytes[offset + 10],
+                        xi_master_bytes[offset + 11],
+                    ]);
+                    let detail = u32::from_le_bytes(
+                        xi_master_bytes[offset + 16..offset + 20]
+                            .try_into()
+                            .unwrap(),
+                    );
+                    if kind == 2
+                        && device == yserver_core::xinput::DEVICEID_MASTER_KEYBOARD
+                        && detail == u32::from(A_KEY)
+                    {
+                        key_state = Some(u32::from_le_bytes(
+                            xi_master_bytes[offset + 72..offset + 76]
+                                .try_into()
+                                .unwrap(),
+                        ) as u16);
+                    }
+                    offset += event_len;
+                } else {
+                    offset += 32;
+                }
+            }
+            key_state
+        };
+        assert_eq!(
+            master_xi2_a_state.map(|mask| mask & (SHIFT_MASK | LOCK_MASK)),
+            Some(master_mods_before & (SHIFT_MASK | LOCK_MASK)),
+            "master XI2 A event from HyperX is unshifted and keeps the master Caps lock",
+        );
+        assert_eq!(
+            backend.serialize_modifiers() & (SHIFT_MASK | LOCK_MASK),
+            master_mods_before & (SHIFT_MASK | LOCK_MASK),
+            "floating Razer modifiers must not change the master modifier state",
+        );
+        let core_events = kbd_map_drain(&mut core_peer);
+        assert!(
+            core_events
+                .chunks_exact(32)
+                .any(|event| event[0] == 2 && event[1] == A_KEY),
+            "attached HyperX input reaches the core key selector",
+        );
+        let core_a_state = core_events
+            .chunks_exact(32)
+            .find(|event| event[0] == 2 && event[1] == A_KEY)
+            .map(|event| u16::from_le_bytes([event[28], event[29]]));
+        assert_eq!(
+            core_a_state.map(|mask| mask & (SHIFT_MASK | LOCK_MASK)),
+            Some(master_mods_before & (SHIFT_MASK | LOCK_MASK)),
+            "core A event from HyperX is unshifted and keeps the master Caps lock",
+        );
+
+        // Explicit grab reattachment follows Xorg's ReattachToOldMaster →
+        // AttachDevice path: it does not call ReleaseButtonsAndKeys. A key
+        // still physically held at ungrab is not synthesized as a release.
+        send_key(&mut backend, &mut state, RAZER, SHIFT_L, true);
+        let _ = kbd_map_drain(&mut grab_peer);
+        // XIUngrabDevice restores Razer's original master; its floating
+        // XKB state is retired and does not become master state.
+        let mut ungrab_body = Vec::with_capacity(8);
+        ungrab_body.extend_from_slice(&0u32.to_le_bytes());
+        ungrab_body.extend_from_slice(&razer_id.to_le_bytes());
+        ungrab_body.extend_from_slice(&[0u8; 2]);
+        yserver_core::core_loop::process_request::process_request(
+            &mut state,
+            &mut backend,
+            ClientId(GRAB_CLIENT),
+            SequenceNumber(2),
+            request(52, 3),
+            &ungrab_body,
+            None,
+        )
+        .expect("XIUngrabDevice reattaches Razer");
+        let _ = kbd_map_drain(&mut grab_peer);
+        assert_eq!(
+            state.xi_devices.device(razer_id).unwrap().attached_master,
+            Some(yserver_core::xinput::DEVICEID_MASTER_KEYBOARD),
+        );
+        assert!(
+            !backend.floating_keyboard_states.contains_key(&razer_id),
+            "reattachment retires Razer's floating XKB state",
+        );
+        assert!(!state.xi2_keyboard_grabs.contains_key(&razer_id));
+        assert!(!state.xi2_detached_masters.contains_key(&razer_id));
+        assert_eq!(backend.serialize_modifiers(), master_mods_before);
+        assert_eq!(backend.current_led_bits(), master_leds_before);
+        send_key(&mut backend, &mut state, RAZER, SHIFT_L, false);
+        assert_eq!(backend.serialize_modifiers(), master_mods_before);
+        assert!(
+            kbd_map_drain(&mut core_peer).is_empty(),
+            "Xorg's explicit-grab reattachment does not synthesize a core key release",
+        );
+        assert!(
+            kbd_map_drain(&mut xi_master_peer).is_empty(),
+            "Xorg's explicit-grab reattachment does not synthesize a master XI2 release",
+        );
+        assert!(backend.core.down_keys.is_empty());
+        assert!(state.keys_down.iter().all(|&byte| byte == 0));
+        assert!(state.sync_pending.is_empty());
+        assert!(
+            !state
+                .xi1_frozen
+                .get(&razer_id)
+                .is_some_and(yserver_core::server::Xi1Freeze::frozen)
+        );
+
+        // Float it again and remove it while a local key is held. The state
+        // is retired with the source and the unrelated HyperX facet survives.
+        yserver_core::core_loop::process_request::process_request(
+            &mut state,
+            &mut backend,
+            ClientId(GRAB_CLIENT),
+            SequenceNumber(3),
+            request(51, 7),
+            &xi_grab(razer_id),
+            None,
+        )
+        .expect("second XIGrabDevice on Razer");
+        let _ = kbd_map_drain(&mut grab_peer);
+        assert_eq!(
+            KmsBackend::serialize_xkb_modifiers(
+                &backend.floating_keyboard_states[&razer_id].xkb_state.0,
+                backend.floating_keyboard_states[&razer_id].locked_group,
+                backend.keymap_group_count(),
+            ) & LOCK_MASK,
+            master_mods_before & LOCK_MASK,
+            "a new floating interval starts from the master's locked Caps state",
+        );
+        send_key(&mut backend, &mut state, RAZER, CAPS_LOCK, true);
+        send_key(&mut backend, &mut state, RAZER, CAPS_LOCK, false);
+        send_key(&mut backend, &mut state, RAZER, SHIFT_L, true);
+        assert_eq!(backend.serialize_modifiers(), master_mods_before);
+        backend.on_host_input(
+            &mut state,
+            HostInputEvent::DeviceRemoved { source_id: RAZER },
+        );
+        assert!(state.xi_devices.source(RAZER).is_none());
+        assert!(state.xi_devices.device(razer_id).is_none());
+        assert!(state.xi_devices.source(HYPERX).is_some());
+        assert_eq!(
+            state.xi_devices.device(hyperx_id).unwrap().attached_master,
+            Some(yserver_core::xinput::DEVICEID_MASTER_KEYBOARD),
+        );
+        assert!(!state.xi2_keyboard_grabs.contains_key(&razer_id));
+        assert!(!state.xi2_detached_masters.contains_key(&razer_id));
+        assert!(!state.xi1_frozen.contains_key(&razer_id));
+        assert!(backend.core.down_keys.is_empty());
+        assert!(state.keys_down.iter().all(|&byte| byte == 0));
+        assert!(state.sync_pending.is_empty());
+        assert!(state.repeat_state.is_none());
+        assert!(backend.floating_keyboard_states.is_empty());
+        assert_eq!(backend.serialize_modifiers(), master_mods_before);
+        assert_eq!(backend.current_led_bits(), master_leds_before);
+        assert!(backend.floating_keyboard_states.is_empty());
     }
 
     #[test]
