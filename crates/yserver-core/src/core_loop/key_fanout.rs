@@ -27,62 +27,100 @@ const XI2_MAJOR_OPCODE: u8 = 137;
 const XI2_KEYPRESS_EVTYPE: u16 = 2;
 const XI2_KEYRELEASE_EVTYPE: u16 = 3;
 const XI2_MASTER_KEYBOARD_DEVICE_ID: u16 = 3;
-const XI2_SLAVE_KEYBOARD_DEVICE_ID: u16 = 5;
 const XI2_RAW_KEY_PRESS_EVTYPE: u16 = 13;
 const XI2_RAW_KEY_RELEASE_EVTYPE: u16 = 14;
 /// XISelectEvents wildcard deviceids.
 const XI2_ALL_DEVICES: u16 = 0;
 const XI2_ALL_MASTER_DEVICES: u16 = 1;
 
-/// Resolve the keyboard device form represented by an input origin. A known
-/// unpublished physical source remains master-only; XTEST and nested input
-/// keep their explicit virtual/master identities.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KeyXiSource {
+    slave_deviceid: Option<u16>,
+    sourceid: u16,
+    attached_master: Option<u16>,
+}
+
+/// Resolve the keyboard XI forms represented by an input origin. Unknown,
+/// removed, suspended, disabled, and non-keyboard XTEST targets have no
+/// source. A known physical source without an allocated keyboard facet and
+/// nested host input use master identity 3 for both deviceid and sourceid.
+fn resolve_key_xi_source(
+    state: &ServerState,
+    origin: crate::core_loop::InputOrigin,
+) -> Option<KeyXiSource> {
+    use crate::{core_loop::InputOrigin, xinput::XiFacetKind};
+    match origin {
+        InputOrigin::Physical(source) => {
+            state
+                .xi_devices
+                .source(source)
+                .filter(|info| info.enabled)?;
+            if let Some(device_id) = state.xi_devices.facet(source, XiFacetKind::Keyboard) {
+                let device = state.xi_devices.device(device_id)?;
+                if !device.enabled
+                    || device
+                        .attached_master
+                        .is_some_and(|master| master != XI2_MASTER_KEYBOARD_DEVICE_ID)
+                {
+                    return None;
+                }
+                return Some(KeyXiSource {
+                    slave_deviceid: Some(device_id),
+                    sourceid: device_id,
+                    attached_master: device.attached_master,
+                });
+            }
+            Some(KeyXiSource {
+                slave_deviceid: None,
+                sourceid: XI2_MASTER_KEYBOARD_DEVICE_ID,
+                attached_master: Some(XI2_MASTER_KEYBOARD_DEVICE_ID),
+            })
+        }
+        InputOrigin::XTest(device_id) => {
+            let device = state.xi_devices.device(device_id)?;
+            if !device.enabled {
+                return None;
+            }
+            match state.xi_devices.role(device_id)? {
+                crate::xinput::XiDeviceRole::MasterKeyboard => Some(KeyXiSource {
+                    slave_deviceid: None,
+                    sourceid: device_id,
+                    attached_master: Some(device_id),
+                }),
+                crate::xinput::XiDeviceRole::SlaveKeyboard => Some(KeyXiSource {
+                    slave_deviceid: Some(device_id),
+                    sourceid: device_id,
+                    attached_master: device.attached_master,
+                }),
+                crate::xinput::XiDeviceRole::MasterPointer
+                | crate::xinput::XiDeviceRole::SlavePointer => None,
+            }
+        }
+        InputOrigin::NestedHost => Some(KeyXiSource {
+            slave_deviceid: None,
+            sourceid: XI2_MASTER_KEYBOARD_DEVICE_ID,
+            attached_master: Some(XI2_MASTER_KEYBOARD_DEVICE_ID),
+        }),
+    }
+}
+
+/// KMS checks physical identity before cooking keys or mutating backend
+/// XKB/held state. The fanout repeats this validation for queued input.
+pub fn keyboard_origin_is_live(state: &ServerState, origin: crate::core_loop::InputOrigin) -> bool {
+    resolve_key_xi_source(state, origin).is_some()
+}
+
+/// Resolve the device-indexed grab/freeze key for an input origin.
 fn key_origin_device(
     state: &ServerState,
     origin: crate::core_loop::InputOrigin,
 ) -> (u16, Option<u16>) {
-    use crate::{core_loop::InputOrigin, xinput::XiFacetKind};
-    match origin {
-        InputOrigin::Physical(source) => {
-            let Some(info) = state.xi_devices.source(source).filter(|info| info.enabled) else {
-                return (XI2_MASTER_KEYBOARD_DEVICE_ID, None);
-            };
-            if let Some(device_id) = state.xi_devices.facet(source, XiFacetKind::Keyboard)
-                && let Some(device) = state.xi_devices.device(device_id)
-                && device.enabled
-            {
-                return (device_id, device.attached_master);
-            }
-            let _ = info;
-            (
-                XI2_MASTER_KEYBOARD_DEVICE_ID,
-                Some(XI2_MASTER_KEYBOARD_DEVICE_ID),
-            )
-        }
-        InputOrigin::XTest(device_id) => {
-            if matches!(
-                state.xi_devices.role(device_id),
-                Some(
-                    crate::xinput::XiDeviceRole::MasterKeyboard
-                        | crate::xinput::XiDeviceRole::SlaveKeyboard
-                )
-            ) {
-                (
-                    device_id,
-                    state
-                        .xi_devices
-                        .device(device_id)
-                        .and_then(|device| device.attached_master),
-                )
-            } else {
-                (XI2_MASTER_KEYBOARD_DEVICE_ID, None)
-            }
-        }
-        InputOrigin::NestedHost => (
-            XI2_MASTER_KEYBOARD_DEVICE_ID,
-            Some(XI2_MASTER_KEYBOARD_DEVICE_ID),
-        ),
-    }
+    resolve_key_xi_source(state, origin).map_or((XI2_MASTER_KEYBOARD_DEVICE_ID, None), |source| {
+        (
+            source.slave_deviceid.unwrap_or(source.sourceid),
+            source.attached_master,
+        )
+    })
 }
 
 /// Whether `origin` names a keyboard facet that is currently floating under
@@ -127,7 +165,11 @@ pub fn key_event_fanout_to_state(
     backend: &mut dyn crate::backend::Backend,
     event: HostKeyEvent,
 ) -> Vec<ClientId> {
-    let (device_id, master_id) = key_origin_device(state, event.origin);
+    let Some(xi_source) = resolve_key_xi_source(state, event.origin) else {
+        return Vec::new();
+    };
+    let device_id = xi_source.slave_deviceid.unwrap_or(xi_source.sourceid);
+    let master_id = xi_source.attached_master;
     // QueryKeymap bitmap — device key state tracks the physical
     // event regardless of where (or whether) it gets delivered.
     //
@@ -289,6 +331,9 @@ pub fn key_event_fanout_to_state(
 /// callable without a backend so `xi1_compute_freezes` can replay
 /// withheld core keys on thaw.
 pub(crate) fn deliver_routed_key(state: &mut ServerState, event: HostKeyEvent) -> Vec<ClientId> {
+    if !keyboard_origin_is_live(state, event.origin) {
+        return Vec::new();
+    }
     let (device_id, _master_id) = key_origin_device(state, event.origin);
     match key_route(state, &event) {
         // Core delivery has nowhere to go (focus on root, no grab) —
@@ -392,28 +437,17 @@ fn deliver_key_to_window(
     // core (XSelectInput KeyPressMask) and XI2 (XISelectEvents) — e.g.
     // Chromium's Ozone X11 layer — gets every keystroke twice.
     let xi2_evtype = xi2_evtype_for(event);
-    let xi2_targets: Vec<ClientId> = state
-        .clients
-        .iter()
-        .filter_map(|(id, client)| {
-            let mask = xi2_mask_for_client(
-                client,
-                target_window,
-                target_window,
-                &[
-                    XI2_SLAVE_KEYBOARD_DEVICE_ID,
-                    XI2_MASTER_KEYBOARD_DEVICE_ID,
-                    1,
-                    0,
-                ],
-            );
-            if mask & (1 << xi2_evtype) != 0 {
-                Some(ClientId(*id))
-            } else {
-                None
+    let forms = key_xi2_forms(state, event.origin);
+    let mut xi2_targets = Vec::new();
+    for (device_id, _) in &forms {
+        for (id, client) in &state.clients {
+            if key_xi2_form_selected(client, target_window, *device_id, xi2_evtype)
+                && !xi2_targets.contains(&ClientId(*id))
+            {
+                xi2_targets.push(ClientId(*id));
             }
-        })
-        .collect();
+        }
+    }
 
     // Core KeyPress/KeyRelease to KeyPressMask/KeyReleaseMask subscribers,
     // excluding any client already getting the XI2 form above.
@@ -429,9 +463,20 @@ fn deliver_key_to_window(
         })
     };
 
-    if !xi2_targets.is_empty() {
-        let xi2_dropped = fanout_event_to_clients(state, &xi2_targets, |buf, seq, order| {
-            encode_key_xi2(buf, order, seq, event, target_window);
+    for (device_id, source_id) in forms {
+        let targets: Vec<ClientId> = state
+            .clients
+            .iter()
+            .filter_map(|(id, client)| {
+                key_xi2_form_selected(client, target_window, device_id, xi2_evtype)
+                    .then_some(ClientId(*id))
+            })
+            .collect();
+        if targets.is_empty() {
+            continue;
+        }
+        let xi2_dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
+            encode_key_xi2_for_device(buf, order, seq, event, target_window, device_id, source_id);
         });
         merge_dropped(&mut dropped, xi2_dropped);
     }
@@ -470,8 +515,10 @@ fn deliver_key_to_grab_owner(
     device_id: u16,
 ) -> Vec<ClientId> {
     if via_xi2 {
+        let source_id =
+            resolve_key_xi_source(state, event.origin).map_or(device_id, |source| source.sourceid);
         fanout_event_to_clients(state, &[owner], |buf, seq, order| {
-            encode_key_xi2_for_device(buf, order, seq, event, grab_window, device_id);
+            encode_key_xi2_for_device(buf, order, seq, event, grab_window, device_id, source_id);
         })
     } else {
         fanout_event_to_clients(state, &[owner], |buf, seq, order| {
@@ -486,6 +533,41 @@ fn xi2_evtype_for(event: &HostKeyEvent) -> u16 {
     } else {
         XI2_KEYRELEASE_EVTYPE
     }
+}
+
+/// Device event copies follow Xorg's slave-first mieq pass. A detached
+/// keyboard has only its slave form; attached sources also get a master copy.
+fn key_xi2_forms(state: &ServerState, origin: crate::core_loop::InputOrigin) -> Vec<(u16, u16)> {
+    let Some(source) = resolve_key_xi_source(state, origin) else {
+        return Vec::new();
+    };
+    let mut forms = Vec::with_capacity(2);
+    if let Some(slave_id) = source.slave_deviceid {
+        forms.push((slave_id, slave_id));
+    }
+    if let Some(master_id) = source.attached_master {
+        forms.push((master_id, source.sourceid));
+    }
+    forms
+}
+
+fn key_xi2_form_selected(
+    client: &crate::server::ClientState,
+    window: ResourceId,
+    device_id: u16,
+    evtype: u16,
+) -> bool {
+    let devices = if device_id == XI2_MASTER_KEYBOARD_DEVICE_ID {
+        [device_id, XI2_ALL_MASTER_DEVICES, XI2_ALL_DEVICES]
+    } else {
+        [device_id, XI2_ALL_DEVICES, u16::MAX]
+    };
+    let device_count = if device_id == XI2_MASTER_KEYBOARD_DEVICE_ID {
+        3
+    } else {
+        2
+    };
+    xi2_mask_for_client(client, window, window, &devices[..device_count]) & (1 << evtype) != 0
 }
 
 fn key_event_wire(
@@ -508,23 +590,6 @@ fn key_event_wire(
     }
 }
 
-fn encode_key_xi2(
-    buf: &mut Vec<u8>,
-    order: x11::ClientByteOrder,
-    seq: x11::SequenceNumber,
-    event: &HostKeyEvent,
-    target_window: ResourceId,
-) {
-    encode_key_xi2_for_device(
-        buf,
-        order,
-        seq,
-        event,
-        target_window,
-        XI2_MASTER_KEYBOARD_DEVICE_ID,
-    );
-}
-
 fn encode_key_xi2_for_device(
     buf: &mut Vec<u8>,
     order: x11::ClientByteOrder,
@@ -532,12 +597,8 @@ fn encode_key_xi2_for_device(
     event: &HostKeyEvent,
     target_window: ResourceId,
     device_id: u16,
+    source_id: u16,
 ) {
-    let source_id = if device_id == XI2_MASTER_KEYBOARD_DEVICE_ID {
-        XI2_SLAVE_KEYBOARD_DEVICE_ID
-    } else {
-        device_id
-    };
     x11::encode_xi2_device_event(
         buf,
         order,
@@ -601,21 +662,21 @@ impl RawKeyEvent {
 /// auto-repeat is off globally or for the key, or the key is a modifier.
 ///
 /// Delivery mirrors Xorg's two passes through `DeliverRawEvent`
-/// (dix/events.c), slave first then master (mi/mieq.c): the slave form
-/// (deviceid = sourceid = slave keyboard) goes to root selectors of the
-/// slave keyboard / `XIAllDevices`; the master form (deviceid = master
-/// keyboard) to root selectors of the master keyboard / `XIAllMasterDevices`
-/// / `XIAllDevices`, subject to the keyboard grab. The master form is queued
-/// behind a frozen keyboard like any other master event (Xorg
-/// `EnqueueEvent`) and delivered on thaw; the slave is never frozen.
-/// Keys arrive only on the master keyboard's attached slave, so an
-/// `XIAllDevices` selector receives both forms.
+/// (dix/events.c), slave first then master (mi/mieq.c). A slave form uses
+/// that keyboard's ID for both deviceid and sourceid; its master copy uses
+/// deviceid 3 and retains the generating sourceid. Master copies go to root
+/// selectors of the master / `XIAllMasterDevices` / `XIAllDevices`, subject
+/// to the keyboard grab. The master form queues behind a frozen keyboard and
+/// revalidates the origin on thaw; floating keyboards produce no master form.
 pub fn raw_key_event_to_state(
     state: &mut ServerState,
     event: RawKeyEvent,
     key_was_down: bool,
     is_modifier: bool,
 ) -> Vec<ClientId> {
+    let Some(source) = resolve_key_xi_source(state, event.origin) else {
+        return Vec::new();
+    };
     if event.pressed
         && key_was_down
         && (is_modifier || !state.keyboard_control.key_auto_repeats(event.keycode))
@@ -627,21 +688,30 @@ pub fn raw_key_event_to_state(
         return Vec::new();
     }
     let evtype = event.evtype();
-    let slave_targets = raw_key_root_selectors(
-        state,
-        &[XI2_SLAVE_KEYBOARD_DEVICE_ID, XI2_ALL_DEVICES],
-        evtype,
-    );
-    let mut dropped = send_raw_key(state, &slave_targets, event, XI2_SLAVE_KEYBOARD_DEVICE_ID);
-    if state
-        .xi1_frozen
-        .get(&crate::xinput::DEVICEID_SLAVE_KEYBOARD)
-        .is_some_and(crate::server::Xi1Freeze::frozen)
-    {
+    let mut dropped = Vec::new();
+    if let Some(slave_id) = source.slave_deviceid {
+        let slave_targets = raw_key_root_selectors(state, &[slave_id, XI2_ALL_DEVICES], evtype);
+        dropped = send_raw_key(state, &slave_targets, event, slave_id, slave_id);
+    }
+
+    let Some(master_id) = source.attached_master else {
+        return dropped;
+    };
+    let freeze_device = source.slave_deviceid.unwrap_or(master_id);
+    let frozen_device = [Some(freeze_device), Some(master_id)]
+        .into_iter()
+        .flatten()
+        .find(|device_id| {
+            state
+                .xi1_frozen
+                .get(device_id)
+                .is_some_and(crate::server::Xi1Freeze::frozen)
+        });
+    if let Some(device) = frozen_device {
         state
             .sync_pending
             .push_back(crate::server::PendingSyncEvent {
-                device: crate::xinput::DEVICEID_SLAVE_KEYBOARD,
+                device,
                 event: crate::server::QueuedInputEvent::RawKey(event),
             });
     } else {
@@ -657,13 +727,15 @@ pub fn raw_key_event_to_state(
 /// behind a frozen keyboard — the grab consulted is the one in effect when
 /// the event is finally processed, as on Xorg.
 pub(crate) fn deliver_raw_key_master(state: &mut ServerState, event: RawKeyEvent) -> Vec<ClientId> {
+    let Some(source) = resolve_key_xi_source(state, event.origin) else {
+        return Vec::new();
+    };
+    let Some(master_id) = source.attached_master else {
+        return Vec::new();
+    };
     let evtype = event.evtype();
     let bit = 1u64 << evtype;
-    let master_devices = [
-        XI2_MASTER_KEYBOARD_DEVICE_ID,
-        XI2_ALL_MASTER_DEVICES,
-        XI2_ALL_DEVICES,
-    ];
+    let master_devices = [master_id, XI2_ALL_MASTER_DEVICES, XI2_ALL_DEVICES];
     let grab = state.active_keyboard_grab;
     let mut dropped = Vec::new();
 
@@ -689,7 +761,7 @@ pub(crate) fn deliver_raw_key_master(state: &mut ServerState, event: RawKeyEvent
         if natural || u64::from(g.xi2_mask) & bit != 0 {
             merge_dropped(
                 &mut dropped,
-                send_raw_key(state, &[g.owner], event, XI2_MASTER_KEYBOARD_DEVICE_ID),
+                send_raw_key(state, &[g.owner], event, master_id, source.sourceid),
             );
         }
     }
@@ -712,7 +784,7 @@ pub(crate) fn deliver_raw_key_master(state: &mut ServerState, event: RawKeyEvent
         .collect();
     merge_dropped(
         &mut dropped,
-        send_raw_key(state, &targets, event, XI2_MASTER_KEYBOARD_DEVICE_ID),
+        send_raw_key(state, &targets, event, master_id, source.sourceid),
     );
     dropped
 }
@@ -730,14 +802,15 @@ fn raw_key_root_selectors(state: &ServerState, devices: &[u16], evtype: u16) -> 
         .collect()
 }
 
-/// Write one raw key event with the given `deviceid` to each target. The
-/// source is always the slave keyboard, and keys carry no valuators — the
-/// valuator mask is two zero words (Xorg `eventToRawEvent`).
+/// Write one raw key event with the given `deviceid` and `sourceid` to each
+/// target. Keys carry no valuators; the valuator mask is two zero words
+/// (Xorg `eventToRawEvent`).
 fn send_raw_key(
     state: &mut ServerState,
     targets: &[ClientId],
     event: RawKeyEvent,
     deviceid: u16,
+    sourceid: u16,
 ) -> Vec<ClientId> {
     if targets.is_empty() {
         return Vec::new();
@@ -752,7 +825,7 @@ fn send_raw_key(
             deviceid,
             event.time,
             u32::from(event.keycode),
-            XI2_SLAVE_KEYBOARD_DEVICE_ID,
+            sourceid,
             0,
             0,
         );
@@ -1192,6 +1265,339 @@ mod tests {
             event_x: 10,
             event_y: 20,
             state: 0,
+        }
+    }
+
+    mod key_source_routing {
+        use super::*;
+        use crate::{
+            core_loop::{DeviceInfo, InputOrigin, message::LibinputConfigSnapshot},
+            xinput::{InputCapabilities, InputSourceId, XiFacetKind},
+        };
+
+        const KEY_PRESS: u32 = 1 << 2;
+        const KEY_RELEASE: u32 = 1 << 3;
+        const RAW_KEY_PRESS: u32 = 1 << 13;
+        const RAW_KEY_RELEASE: u32 = 1 << 14;
+        const ROUTED_MASK: u32 = KEY_PRESS | KEY_RELEASE | RAW_KEY_PRESS | RAW_KEY_RELEASE;
+
+        fn keyboard_info(source_id: InputSourceId) -> DeviceInfo {
+            DeviceInfo {
+                source_id,
+                enabled: true,
+                resume_key: None,
+                capabilities: InputCapabilities {
+                    keyboard: true,
+                    pointer: false,
+                    touch: false,
+                },
+                name: format!("keyboard {}", source_id.0),
+                device_node: format!("/dev/input/event{}", source_id.0),
+                sysname: format!("event{}", source_id.0),
+                vendor_id: 0,
+                product_id: 0,
+                is_touchpad: false,
+                config: LibinputConfigSnapshot::default(),
+            }
+        }
+
+        fn capture_client(state: &mut ServerState, id: u32) -> crate::transport::CapturedPeer {
+            let (writer, peer) = crate::transport::Transport::capture_pair();
+            state.clients.insert(
+                id,
+                ClientState {
+                    writer: Arc::new(Mutex::new(writer)),
+                    byte_order: ClientByteOrder::LittleEndian,
+                    last_sequence: Arc::new(AtomicU16::new(0)),
+                    resource_id_base: 0,
+                    resource_id_mask: u32::MAX,
+                    event_masks: HashMap::new(),
+                    save_set: HashSet::new(),
+                    big_requests_enabled: false,
+                    xi2_masks: HashMap::new(),
+                    xi1_event_classes: HashSet::new(),
+                    xi1_window_event_classes: HashMap::new(),
+                    outbound: VecDeque::new(),
+                    watching_writable: false,
+                    focused_window: ROOT_WINDOW,
+                    reader_control: None,
+                    is_local: true,
+                    fd_passing: true,
+                },
+            );
+            peer
+        }
+
+        fn root_selector(
+            state: &mut ServerState,
+            id: u32,
+            device: u16,
+        ) -> crate::transport::CapturedPeer {
+            let peer = capture_client(state, id);
+            let client = state.clients.get_mut(&id).unwrap();
+            client
+                .xi2_masks
+                .insert((ROOT_WINDOW, device), u64::from(ROUTED_MASK));
+            state.xi2_client_versions.insert(ClientId(id), (2, 2));
+            peer
+        }
+
+        fn capture_read_all(peer: &mut crate::transport::CapturedPeer) -> Vec<u8> {
+            use std::io::Read;
+            let mut out = Vec::new();
+            let mut buf = [0u8; 512];
+            while let Ok(n) = peer.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                out.extend_from_slice(&buf[..n]);
+            }
+            out
+        }
+
+        fn xge_events(peer: &mut crate::transport::CapturedPeer) -> Vec<(u16, u16, u16, u32)> {
+            let bytes = capture_read_all(peer);
+            let read_u16 = |at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+            let read_u32 = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+            let mut events = Vec::new();
+            let mut at = 0;
+            while at + 32 <= bytes.len() {
+                if bytes[at] & 0x7f != 35 {
+                    at += 32;
+                    continue;
+                }
+                let evtype = read_u16(at + 8);
+                let source_offset = if (13..=17).contains(&evtype) { 20 } else { 52 };
+                events.push((
+                    evtype,
+                    read_u16(at + 10),
+                    read_u16(at + source_offset),
+                    read_u32(at + 16),
+                ));
+                at += 32 + 4 * read_u32(at + 4) as usize;
+            }
+            events
+        }
+
+        fn raw_event(origin: InputOrigin, pressed: bool) -> RawKeyEvent {
+            RawKeyEvent {
+                origin,
+                keycode: 38,
+                pressed,
+                time: if pressed { 17 } else { 18 },
+            }
+        }
+
+        fn key_event_from(origin: InputOrigin, pressed: bool) -> HostKeyEvent {
+            HostKeyEvent {
+                origin,
+                pressed,
+                keycode: 38,
+                time: if pressed { 17 } else { 18 },
+                root_x: 10,
+                root_y: 20,
+                event_x: 10,
+                event_y: 20,
+                state: 0,
+            }
+        }
+
+        #[test]
+        fn physical_keyboard_facets_keep_raw_and_device_source_ids() {
+            let mut state = ServerState::new();
+            let source_a = InputSourceId(0xA11);
+            let source_b = InputSourceId(0xA12);
+            let a_id = state.xi_register_source(&keyboard_info(source_a))[0];
+            let b_id = state.xi_register_source(&keyboard_info(source_b))[0];
+            assert_eq!((a_id, b_id), (6, 7));
+
+            let mut a_peer = root_selector(&mut state, 1, a_id);
+            let mut b_peer = root_selector(&mut state, 2, b_id);
+            let mut master_peer = root_selector(&mut state, 3, 3);
+            let mut all_peer = root_selector(&mut state, 4, 0);
+            state.core_focus.raw = ROOT_WINDOW.0;
+
+            let origin = InputOrigin::Physical(source_a);
+            let _ = raw_key_event_to_state(&mut state, raw_event(origin, true), false, false);
+            let mut backend = crate::backend::recording::RecordingBackend::default();
+            let _ =
+                key_event_fanout_to_state(&mut state, &mut backend, key_event_from(origin, true));
+
+            assert_eq!(
+                xge_events(&mut a_peer),
+                vec![(13, a_id, a_id, 38), (2, a_id, a_id, 38)],
+                "the source facet receives its slave raw and device forms"
+            );
+            assert!(
+                xge_events(&mut b_peer).is_empty(),
+                "another keyboard is untouched"
+            );
+            assert_eq!(
+                xge_events(&mut master_peer),
+                vec![(13, 3, a_id, 38), (2, 3, a_id, 38)],
+                "master copies name the generating keyboard facet"
+            );
+            assert_eq!(
+                xge_events(&mut all_peer),
+                vec![
+                    (13, a_id, a_id, 38),
+                    (13, 3, a_id, 38),
+                    (2, a_id, a_id, 38),
+                    (2, 3, a_id, 38),
+                ],
+                "XIAllDevices sees slave form before the master copy"
+            );
+
+            let _ = raw_key_event_to_state(&mut state, raw_event(origin, false), true, false);
+            let _ =
+                key_event_fanout_to_state(&mut state, &mut backend, key_event_from(origin, false));
+            assert_eq!(
+                xge_events(&mut a_peer),
+                vec![(14, a_id, a_id, 38), (3, a_id, a_id, 38)]
+            );
+            assert_eq!(
+                xge_events(&mut b_peer),
+                Vec::<(u16, u16, u16, u32)>::new(),
+                "unrelated keyboard remains untouched"
+            );
+            assert_eq!(
+                xge_events(&mut master_peer),
+                vec![(14, 3, a_id, 38), (3, 3, a_id, 38)]
+            );
+            assert_eq!(
+                xge_events(&mut all_peer),
+                vec![
+                    (14, a_id, a_id, 38),
+                    (14, 3, a_id, 38),
+                    (3, a_id, a_id, 38),
+                    (3, 3, a_id, 38),
+                ]
+            );
+            assert!(state.keys_down.iter().all(|byte| *byte == 0));
+            assert!(state.sync_pending.is_empty());
+            assert_eq!(
+                state.xi_devices.facet(source_a, XiFacetKind::Keyboard),
+                Some(a_id)
+            );
+            assert_eq!(
+                state.xi_devices.facet(source_b, XiFacetKind::Keyboard),
+                Some(b_id)
+            );
+        }
+
+        #[test]
+        fn virtual_nested_unpublished_and_removed_keyboard_sources_route_separately() {
+            let mut state = ServerState::new();
+            // Exhaust physical XI IDs while retaining one known source with
+            // no published keyboard facet for master-only delivery.
+            for n in 1..=122 {
+                let _ = state.xi_register_source(&keyboard_info(InputSourceId(n)));
+            }
+            let unpublished = InputSourceId(123);
+            assert!(
+                state
+                    .xi_register_source(&keyboard_info(unpublished))
+                    .is_empty()
+            );
+            let removed_source = InputSourceId(124);
+            assert!(
+                state
+                    .xi_register_source(&keyboard_info(removed_source))
+                    .is_empty()
+            );
+            assert!(state.xi_unregister_source(removed_source).is_empty());
+
+            let mut all_peer = root_selector(&mut state, 1, 0);
+            state.core_focus.raw = ROOT_WINDOW.0;
+            let mut backend = crate::backend::recording::RecordingBackend::default();
+
+            let xtest = InputOrigin::XTest(5);
+            let _ = raw_key_event_to_state(&mut state, raw_event(xtest, true), false, false);
+            let _ =
+                key_event_fanout_to_state(&mut state, &mut backend, key_event_from(xtest, true));
+            assert_eq!(
+                xge_events(&mut all_peer),
+                vec![(13, 5, 5, 38), (13, 3, 5, 38), (2, 5, 5, 38), (2, 3, 5, 38),],
+                "XTEST keeps its explicit virtual keyboard identity"
+            );
+            let _ = raw_key_event_to_state(&mut state, raw_event(xtest, false), true, false);
+            let _ =
+                key_event_fanout_to_state(&mut state, &mut backend, key_event_from(xtest, false));
+            assert_eq!(
+                xge_events(&mut all_peer),
+                vec![(14, 5, 5, 38), (14, 3, 5, 38), (3, 5, 5, 38), (3, 3, 5, 38)]
+            );
+
+            let nested = InputOrigin::NestedHost;
+            let _ = raw_key_event_to_state(&mut state, raw_event(nested, true), false, false);
+            let _ =
+                key_event_fanout_to_state(&mut state, &mut backend, key_event_from(nested, true));
+            assert_eq!(
+                xge_events(&mut all_peer),
+                vec![(13, 3, 3, 38), (2, 3, 3, 38)],
+                "nested input is master-only and is not attributed to XTEST"
+            );
+            let _ = raw_key_event_to_state(&mut state, raw_event(nested, false), true, false);
+            let _ =
+                key_event_fanout_to_state(&mut state, &mut backend, key_event_from(nested, false));
+            assert_eq!(
+                xge_events(&mut all_peer),
+                vec![(14, 3, 3, 38), (3, 3, 3, 38)]
+            );
+
+            let unpublished_origin = InputOrigin::Physical(unpublished);
+            let _ = raw_key_event_to_state(
+                &mut state,
+                raw_event(unpublished_origin, true),
+                false,
+                false,
+            );
+            let _ = key_event_fanout_to_state(
+                &mut state,
+                &mut backend,
+                key_event_from(unpublished_origin, true),
+            );
+            assert_eq!(
+                xge_events(&mut all_peer),
+                vec![(13, 3, 3, 38), (2, 3, 3, 38)],
+                "unpublished known sources retain only master forms"
+            );
+            let _ = raw_key_event_to_state(
+                &mut state,
+                raw_event(unpublished_origin, false),
+                true,
+                false,
+            );
+            let _ = key_event_fanout_to_state(
+                &mut state,
+                &mut backend,
+                key_event_from(unpublished_origin, false),
+            );
+            assert_eq!(
+                xge_events(&mut all_peer),
+                vec![(14, 3, 3, 38), (3, 3, 3, 38)]
+            );
+            assert!(state.xi_unregister_source(unpublished).is_empty());
+
+            let removed = InputOrigin::Physical(removed_source);
+            let _ = raw_key_event_to_state(&mut state, raw_event(removed, true), false, false);
+            let _ =
+                key_event_fanout_to_state(&mut state, &mut backend, key_event_from(removed, true));
+            assert!(
+                xge_events(&mut all_peer).is_empty(),
+                "removed source events are dropped rather than relabeled"
+            );
+            assert!(state.keys_down.iter().all(|byte| *byte == 0));
+            assert!(state.sync_pending.is_empty());
+            assert!(state.xi_devices.source(unpublished).is_none());
+            assert!(
+                state
+                    .xi_devices
+                    .facet(unpublished, XiFacetKind::Keyboard)
+                    .is_none()
+            );
+            assert!(state.xi_devices.source(removed_source).is_none());
+            assert_eq!(state.xi_devices.devices().len(), 126);
         }
     }
 
@@ -1818,7 +2224,9 @@ mod tests {
 
         fn raw(keycode: u8, pressed: bool, time: u32) -> RawKeyEvent {
             RawKeyEvent {
-                origin: crate::core_loop::InputOrigin::NestedHost,
+                // These Xvfb captures are driven through XTEST; keep the
+                // virtual keyboard's explicit source identity in the fixture.
+                origin: crate::core_loop::InputOrigin::XTest(5),
                 keycode,
                 pressed,
                 time,
