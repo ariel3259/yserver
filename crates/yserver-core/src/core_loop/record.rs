@@ -2190,6 +2190,7 @@ mod tests {
         ctx_request(&mut state, REC, 3, x11rec::ENABLE_CONTEXT, ctx);
         let _start = read_all(&mut rec);
         let ev = |kind, detail, state| HostPointerEvent {
+            origin: crate::core_loop::message::InputOrigin::XTest(4),
             kind,
             host_xid: 0,
             detail,

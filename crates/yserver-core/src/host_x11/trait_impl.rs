@@ -105,6 +105,7 @@ impl Backend for HostX11Backend {
             }
             HostInputEvent::PointerMotion { x, y, time, .. } => {
                 self.push_pending_host_event(HostEvent::Pointer(HostPointerEvent {
+                    origin: crate::core_loop::message::InputOrigin::NestedHost,
                     kind: PointerEventKind::MotionNotify,
                     host_xid: container,
                     detail: 0,
@@ -161,6 +162,7 @@ impl Backend for HostX11Backend {
                     PointerEventKind::ButtonRelease
                 };
                 self.push_pending_host_event(HostEvent::Pointer(HostPointerEvent {
+                    origin: crate::core_loop::message::InputOrigin::NestedHost,
                     kind,
                     host_xid: container,
                     detail,

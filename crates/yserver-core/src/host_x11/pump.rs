@@ -143,6 +143,7 @@ pub(super) fn decode_host_event(event: &[u8; 32]) -> Option<HostEvent> {
                 _ => PointerEventKind::MotionNotify,
             };
             Some(HostEvent::Pointer(HostPointerEvent {
+                origin: crate::core_loop::message::InputOrigin::NestedHost,
                 kind,
                 host_xid: read_u32(&event[12..16]), // event window
                 detail: event[1],
@@ -173,6 +174,7 @@ pub(super) fn decode_host_event(event: &[u8; 32]) -> Option<HostEvent> {
             // Crossing wire layout: detail at byte 1, child at 16..20,
             // mode at byte 30.
             Some(HostEvent::Pointer(HostPointerEvent {
+                origin: crate::core_loop::message::InputOrigin::NestedHost,
                 kind,
                 host_xid: read_u32(&event[12..16]),
                 detail: event[1],
@@ -259,6 +261,8 @@ pub enum PointerEventKind {
 
 #[derive(Clone, Copy, Debug)]
 pub struct HostPointerEvent {
+    /// Producer identity for source-aware XI2 fanout.
+    pub origin: crate::core_loop::message::InputOrigin,
     pub kind: PointerEventKind,
     pub host_xid: u32,
     pub detail: u8,

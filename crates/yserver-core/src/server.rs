@@ -3283,6 +3283,7 @@ fn pointer_event_fanout_inner(
         });
         if let Some((rx, ry)) = translated {
             crate::host_x11::HostPointerEvent {
+                origin: event.origin,
                 root_x: rx,
                 root_y: ry,
                 ..event
@@ -4582,6 +4583,7 @@ mod tests {
             &state,
             &xid_map,
             HostPointerEvent {
+                origin: crate::core_loop::message::InputOrigin::XTest(4),
                 kind: PointerEventKind::ButtonPress,
                 host_xid: 0xCAFE,
                 detail: 1,
@@ -4746,6 +4748,7 @@ mod tests {
             &state,
             &xid_map,
             HostPointerEvent {
+                origin: crate::core_loop::message::InputOrigin::XTest(4),
                 kind: PointerEventKind::ButtonPress,
                 host_xid: 0xCAFE,
                 detail: 1,
@@ -4911,6 +4914,7 @@ mod tests {
             &state,
             &xid_map,
             HostPointerEvent {
+                origin: crate::core_loop::message::InputOrigin::XTest(4),
                 kind: PointerEventKind::ButtonPress,
                 host_xid: 0xCAFE,
                 detail: 1,
@@ -5033,6 +5037,7 @@ mod tests {
             &state,
             &xid_map,
             HostPointerEvent {
+                origin: crate::core_loop::message::InputOrigin::XTest(4),
                 kind: PointerEventKind::ButtonPress,
                 host_xid: 0xCAFE,
                 detail: 1,
@@ -5158,6 +5163,7 @@ mod tests {
             &state,
             &xid_map,
             HostPointerEvent {
+                origin: crate::core_loop::message::InputOrigin::XTest(4),
                 kind: PointerEventKind::MotionNotify,
                 host_xid: 0xCAFE,
                 detail: 0,
@@ -5194,6 +5200,7 @@ mod tests {
             &state,
             &xid_map,
             HostPointerEvent {
+                origin: crate::core_loop::message::InputOrigin::XTest(4),
                 kind: PointerEventKind::MotionNotify,
                 host_xid: 0xCAFE,
                 detail: 0,
@@ -5258,6 +5265,7 @@ mod tests {
             &state,
             &xid_map,
             HostPointerEvent {
+                origin: crate::core_loop::message::InputOrigin::XTest(4),
                 kind: PointerEventKind::ButtonPress,
                 host_xid: 0xCAFE, // not in map
                 detail: 1,
