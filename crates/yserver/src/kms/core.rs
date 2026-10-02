@@ -375,13 +375,27 @@ pub(crate) struct FontDir {
 }
 
 impl FontDir {
-    /// Parse `<dir>/fonts.dir` (required) and `<dir>/fonts.alias`
-    /// (optional). fonts.dir: first line = entry count, then
+    /// Parse `<dir>/fonts.dir` and `<dir>/fonts.alias`, either of which
+    /// may be missing but not both: libXfont's `FontFileReadDirectory`
+    /// takes a directory of aliases alone, as CDE's
+    /// `/usr/dt/etc/cde/fontaliases` is. fonts.dir: first line = entry count, then
     /// `<file> <name>` per line (name may contain spaces — split at
     /// the FIRST space). fonts.alias: `<alias> <name>` with optional
     /// double quotes around either; `!` starts a comment line.
     pub(crate) fn load(dir: &std::path::Path) -> io::Result<Self> {
-        let dir_listing = std::fs::read_to_string(dir.join("fonts.dir"))?;
+        let dir_listing = match std::fs::read_to_string(dir.join("fonts.dir")) {
+            Ok(text) => Some(text),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        let alias_text = std::fs::read_to_string(dir.join("fonts.alias")).ok();
+        if dir_listing.is_none() && alias_text.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "neither fonts.dir nor fonts.alias",
+            ));
+        }
+        let dir_listing = dir_listing.unwrap_or_default();
         let mut entries = Vec::new();
         for line in dir_listing.lines().skip(1) {
             let line = line.trim_end();
@@ -393,7 +407,7 @@ impl FontDir {
             }
         }
         let mut aliases = Vec::new();
-        if let Ok(alias_text) = std::fs::read_to_string(dir.join("fonts.alias")) {
+        if let Some(alias_text) = alias_text {
             for line in alias_text.lines() {
                 let line = line.trim();
                 if line.is_empty() || line.starts_with('!') {
@@ -577,7 +591,7 @@ impl FontLoader {
     }
 
     /// Validate and install a new font path. Every element must be
-    /// "built-ins" or a directory with a readable fonts.dir; on any
+    /// "built-ins" or a directory with a readable fonts.dir or fonts.alias; on any
     /// invalid element the old path is kept and Err carries the bad
     /// element (handler → BadValue). Empty list resets to default
     /// (Xorg SetFontPath semantics).
@@ -661,6 +675,22 @@ impl FontLoader {
                 .map(|(n, p)| (n.clone(), p.clone()))
             {
                 return Some(FontResolution::File { path, entry_name });
+            }
+            // A pattern matches aliases too: libXfont looks a name up in
+            // one table of a directory's fonts and aliases
+            // (`FontFileFindNameInDir`), so CDE's `-dt-interface …-m*-…`
+            // opens through `/usr/dt/etc/cde/fontaliases`, a directory of
+            // aliases alone.
+            // An alias whose target is not on this system (CDE's
+            // fonts.alias names fonts for every charset) gives way to the
+            // next one that matches.
+            if let Some(found) = dir
+                .aliases
+                .iter()
+                .filter(|(a, _)| font_pattern_matches(name, a))
+                .find_map(|(_, target)| self.resolve_inner(target, hops - 1))
+            {
+                return Some(found);
             }
         }
         None
@@ -3088,6 +3118,51 @@ mod font_tests {
         // unknown bare name → None → BadName at the request layer
         assert!(loader.resolve("definitely-not-a-font").is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CDE's Xsession adds `/usr/dt/etc/cde/fontaliases`, a directory
+    /// with a fonts.alias and no fonts.dir, which Xorg takes
+    /// (`FontFileReadDirectory`); its patterns then open through the
+    /// aliases (`FontFileFindNameInDir`), past one whose target is not
+    /// installed. Measured with CDE's
+    /// `-dt-interface system-medium-r-normal-s*-…-ISO8859-1` in vng.
+    #[test]
+    fn an_alias_only_directory_joins_the_path_and_opens_by_pattern() {
+        let fonts = write_test_font_dir("alias-target");
+        let aliases = std::env::temp_dir().join(format!(
+            "yserver-font-test-alias-only-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&aliases);
+        std::fs::write(
+            aliases.join("fonts.alias"),
+            "\"-dt-interface system-medium-r-normal-s gone-13-130-75-75-m-70-iso8859-1\" no-such-font\n\
+             \"-dt-interface system-medium-r-normal-s serif-13-130-75-75-m-70-iso8859-1\" testfont0\n",
+        )
+        .unwrap();
+        let mut loader = FontLoader::new().unwrap();
+        loader
+            .set_font_path(&[
+                fonts.to_string_lossy().into_owned(),
+                aliases.to_string_lossy().into_owned(),
+            ])
+            .expect("an alias-only directory is a valid path element");
+        assert!(matches!(
+            loader.resolve("-dt-interface system-medium-r-normal-s*-*-*-*-*-*-*-ISO8859-1"),
+            Some(FontResolution::File { .. })
+        ));
+        let empty =
+            std::env::temp_dir().join(format!("yserver-font-test-empty-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&empty);
+        assert!(
+            loader
+                .set_font_path(&[empty.to_string_lossy().into_owned()])
+                .is_err(),
+            "neither fonts.dir nor fonts.alias"
+        );
+        for d in [fonts, aliases, empty] {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 
     #[test]
