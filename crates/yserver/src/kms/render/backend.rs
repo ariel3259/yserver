@@ -21019,6 +21019,13 @@ impl KmsBackend {
                 &changed_ids,
                 &[],
             );
+            for id in changed_ids {
+                let _dropped = yserver_core::xinput::hotplug::emit_xi1_device_presence(
+                    state,
+                    id,
+                    yserver_core::xinput::hotplug::DevicePresenceChange::Disabled,
+                );
+            }
         }
     }
 }
@@ -21511,6 +21518,13 @@ impl Backend for KmsBackend {
                         &added_ids,
                         &[],
                     );
+                    for id in &added_ids {
+                        let _dropped = yserver_core::xinput::hotplug::emit_xi1_device_presence(
+                            state,
+                            *id,
+                            yserver_core::xinput::hotplug::DevicePresenceChange::Added,
+                        );
+                    }
                 }
                 let enabled_ids = state.xi_register_source(&info);
                 let _dropped = yserver_core::xinput::hotplug::emit_xi_hierarchy_changed(
@@ -21519,6 +21533,13 @@ impl Backend for KmsBackend {
                     &enabled_ids,
                     &[],
                 );
+                for id in &enabled_ids {
+                    let _dropped = yserver_core::xinput::hotplug::emit_xi1_device_presence(
+                        state,
+                        *id,
+                        yserver_core::xinput::hotplug::DevicePresenceChange::Enabled,
+                    );
+                }
                 return;
             }
             HostInputEvent::DeviceResumed(info) => {
@@ -21536,6 +21557,13 @@ impl Backend for KmsBackend {
                     &enabled_ids,
                     &[],
                 );
+                for id in &enabled_ids {
+                    let _dropped = yserver_core::xinput::hotplug::emit_xi1_device_presence(
+                        state,
+                        *id,
+                        yserver_core::xinput::hotplug::DevicePresenceChange::Enabled,
+                    );
+                }
                 return;
             }
             HostInputEvent::DeviceSuspended { source_id } => {
@@ -21579,6 +21607,13 @@ impl Backend for KmsBackend {
                         &disabled_ids,
                         &[],
                     );
+                    for id in disabled_ids {
+                        let _dropped = yserver_core::xinput::hotplug::emit_xi1_device_presence(
+                            state,
+                            id,
+                            yserver_core::xinput::hotplug::DevicePresenceChange::Disabled,
+                        );
+                    }
                 }
                 let removed_ids = state.xi_unregister_source(source_id);
                 let removed = state.take_xi_removed_device_descriptors();
@@ -21588,6 +21623,13 @@ impl Backend for KmsBackend {
                     &removed_ids,
                     &removed,
                 );
+                for id in removed_ids {
+                    let _dropped = yserver_core::xinput::hotplug::emit_xi1_device_presence(
+                        state,
+                        id,
+                        yserver_core::xinput::hotplug::DevicePresenceChange::Removed,
+                    );
+                }
                 self.synchronize_floating_keyboard_states(state);
                 return;
             }
@@ -31454,6 +31496,222 @@ mod tests {
         assert_eq!(state.xi_devices.device(4).unwrap().buttons_down, 0);
         assert_eq!(state.xi_devices.device(5).unwrap().buttons_down, 0);
         assert!(read_events(&mut unrelated).is_empty());
+    }
+
+    #[test]
+    fn xi1_dynamic_hotplug_notifies_selected_client_at_each_facet_transition() {
+        use std::{
+            collections::{HashMap, HashSet, VecDeque},
+            io::{ErrorKind, Read},
+            os::unix::net::UnixStream,
+            sync::{Arc, Mutex, atomic::AtomicU16},
+            time::{Duration, Instant},
+        };
+        use yserver_core::{
+            backend::Backend,
+            core_loop::{DeviceInfo, HostInputEvent, process_request},
+            server::{ClientState, ServerState},
+            xinput::{InputCapabilities, InputSourceId},
+        };
+        use yserver_protocol::x11::{ClientByteOrder, ClientId, RequestHeader, SequenceNumber};
+
+        const PRESENCE_CLASS: u32 = 256 << 8;
+        const PRESENCE_EVENT: u8 = 81; // XI_FIRST_EVENT (66) + DevicePresenceNotify (15)
+        const SEQUENCE: u16 = 73;
+
+        fn install(state: &mut ServerState, id: u32) -> UnixStream {
+            let (peer, writer) = UnixStream::pair().expect("client socket pair");
+            writer.set_nonblocking(true).expect("nonblocking writer");
+            peer.set_nonblocking(true).expect("nonblocking peer");
+            state.clients.insert(
+                id,
+                ClientState {
+                    writer: Arc::new(Mutex::new(yserver_core::transport::Transport::Unix(writer))),
+                    is_local: true,
+                    fd_passing: true,
+                    byte_order: ClientByteOrder::LittleEndian,
+                    last_sequence: Arc::new(AtomicU16::new(0)),
+                    resource_id_base: 0,
+                    resource_id_mask: u32::MAX,
+                    event_masks: HashMap::new(),
+                    save_set: HashSet::new(),
+                    big_requests_enabled: false,
+                    xi2_masks: HashMap::new(),
+                    xi1_event_classes: HashSet::new(),
+                    xi1_window_event_classes: HashMap::new(),
+                    outbound: VecDeque::new(),
+                    watching_writable: false,
+                    focused_window: yserver_core::resources::ROOT_WINDOW,
+                    reader_control: None,
+                },
+            );
+            peer
+        }
+
+        fn read_events(
+            state: &mut ServerState,
+            client_id: u32,
+            peer: &mut UnixStream,
+        ) -> Vec<[u8; 32]> {
+            let mut wire = Vec::new();
+            let mut bytes = [0u8; 256];
+            loop {
+                match peer.read(&mut bytes) {
+                    Ok(0) => break,
+                    Ok(count) => wire.extend_from_slice(&bytes[..count]),
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                    Err(error) => panic!("read event stream: {error}"),
+                }
+            }
+            wire.extend(
+                state
+                    .clients
+                    .get_mut(&client_id)
+                    .expect("event client")
+                    .outbound
+                    .drain(..),
+            );
+            assert_eq!(wire.len() % 32, 0, "XI1 events have 32-byte wire size");
+            wire.chunks_exact(32)
+                .map(|event| event.try_into().expect("32-byte XI1 event"))
+                .collect()
+        }
+
+        fn read_expected_events(
+            state: &mut ServerState,
+            client_id: u32,
+            peer: &mut UnixStream,
+            expected: usize,
+        ) -> Vec<[u8; 32]> {
+            let mut events = read_events(state, client_id, peer);
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while events.len() < expected && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+                events.extend(read_events(state, client_id, peer));
+            }
+            events
+        }
+
+        fn assert_presence_event(event: &[u8; 32], change: u8, id: u8) {
+            assert_eq!(event[0], PRESENCE_EVENT, "XI_FIRST_EVENT + 15");
+            assert_eq!(u16::from_le_bytes([event[2], event[3]]), SEQUENCE);
+            assert_eq!(event[8], change, "Xorg DevicePresenceNotify change");
+            assert_eq!(event[9], id, "physical facet id");
+            assert_eq!(u16::from_le_bytes([event[10], event[11]]), 0, "control");
+            assert!(event[12..].iter().all(|byte| *byte == 0), "wire padding");
+        }
+
+        let mut state = ServerState::new();
+        let mut selected = install(&mut state, 1);
+        let mut unselected = install(&mut state, 2);
+        let mut backend = KmsBackend::for_tests();
+        let mut selection = Vec::with_capacity(12);
+        selection.extend_from_slice(&yserver_core::resources::ROOT_WINDOW.0.to_le_bytes());
+        selection.extend_from_slice(&1u16.to_le_bytes());
+        selection.extend_from_slice(&0u16.to_le_bytes());
+        selection.extend_from_slice(&PRESENCE_CLASS.to_le_bytes());
+        process_request::process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(SEQUENCE),
+            RequestHeader {
+                opcode: 137,
+                data: 6,
+                length_units: 4,
+            },
+            &selection,
+            None,
+        )
+        .expect("MATE-style SelectExtensionEvent request");
+        assert!(
+            read_events(&mut state, 1, &mut selected).is_empty(),
+            "selection has no reply"
+        );
+        assert_eq!(
+            state.clients[&1].xi1_event_classes,
+            HashSet::from([PRESENCE_CLASS]),
+            "process_request stored device-256 presence selection"
+        );
+
+        let source = InputSourceId(0x16_01);
+        let info = DeviceInfo {
+            source_id: source,
+            enabled: true,
+            resume_key: None,
+            capabilities: InputCapabilities {
+                keyboard: false,
+                pointer: true,
+                touch: false,
+            },
+            name: "XI1 hotplug test mouse".to_owned(),
+            device_node: "/dev/input/event-xi1-test".to_owned(),
+            sysname: "event-xi1-test".to_owned(),
+            vendor_id: 0x1234,
+            product_id: 0x5678,
+            is_touchpad: false,
+            config: Default::default(),
+        };
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceAdded(info.clone()),
+        );
+        let added_enabled = read_expected_events(&mut state, 1, &mut selected, 2);
+        assert_eq!(
+            added_enabled.len(),
+            2,
+            "Added then Enabled; selection={:?}; source={:?}; devices={:?}",
+            state.clients[&1].xi1_event_classes,
+            state.xi_devices.source(source),
+            state.xi_devices.devices(),
+        );
+        assert_presence_event(&added_enabled[0], 0, 6);
+        assert_presence_event(&added_enabled[1], 2, 6);
+        assert!(
+            read_events(&mut state, 2, &mut unselected).is_empty(),
+            "unselected client"
+        );
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceSuspended { source_id: source },
+        );
+        let disabled = read_expected_events(&mut state, 1, &mut selected, 1);
+        assert_presence_event(&disabled[0], 3, 6);
+        assert!(read_events(&mut state, 2, &mut unselected).is_empty());
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceResumed(info),
+        );
+        let enabled = read_expected_events(&mut state, 1, &mut selected, 1);
+        assert_presence_event(&enabled[0], 2, 6);
+        assert!(read_events(&mut state, 2, &mut unselected).is_empty());
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceRemoved { source_id: source },
+        );
+        let disabled_removed = read_expected_events(&mut state, 1, &mut selected, 2);
+        assert_eq!(disabled_removed.len(), 2, "Disabled then Removed");
+        assert_presence_event(&disabled_removed[0], 3, 6);
+        assert_presence_event(&disabled_removed[1], 1, 6);
+        assert!(
+            read_events(&mut state, 2, &mut unselected).is_empty(),
+            "unselected client"
+        );
+
+        assert!(state.xi_devices.source(source).is_none());
+        assert!(state.xi_devices.device(6).is_none());
+        assert!(state.xi_devices.source_ids().is_empty());
+        assert_eq!(state.xi_devices.len(), 4, "masters and XTEST only");
+        assert!(state.key_down_by_device.is_empty());
+        assert!(state.unpublished_pointer_buttons_down.is_empty());
+        assert_eq!(state.buttons_down, 0);
     }
 
     #[test]
