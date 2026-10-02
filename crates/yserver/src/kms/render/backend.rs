@@ -19766,12 +19766,10 @@ impl KmsBackend {
         self.synchronize_floating_keyboard_states(state);
     }
 
-    /// Release all held keys attributed to one physical keyboard source.
+    /// Release all held keys attributed to one physical keyboard facet.
     /// Each release re-enters the normal per-device and master guards; an
     /// earlier physical release therefore cannot be emitted twice. This is
-    /// intentionally only the drain helper: removal/VT orchestration is
-    /// wired by the following lifecycle task.
-    #[allow(dead_code)] // Task 14 is the sole removal/suspend caller.
+    /// also how explicit XTEST holds targeting the physical facet are drained.
     pub(crate) fn release_keyboard_source_keys(
         &mut self,
         state: &mut ServerState,
@@ -19815,6 +19813,89 @@ impl KmsBackend {
                 false,
             );
         }
+    }
+
+    fn release_pointer_source_buttons(
+        &mut self,
+        state: &mut ServerState,
+        source_id: yserver_core::xinput::InputSourceId,
+    ) {
+        use yserver_core::{
+            core_loop::{HostInputEvent, InputOrigin},
+            xinput::XiFacetKind,
+        };
+
+        let held = state
+            .xi_devices
+            .facet(source_id, XiFacetKind::PointerTouch)
+            .and_then(|device_id| state.xi_devices.device(device_id))
+            .map(|device| device.buttons_down)
+            .or_else(|| {
+                state
+                    .unpublished_pointer_buttons_down
+                    .get(&source_id)
+                    .copied()
+            })
+            .unwrap_or(0);
+
+        // Xorg dix/devices.c::ReleaseButtonsAndKeys releases pointer buttons
+        // in ascending button order before it starts the key loop.
+        for detail in 1..=9 {
+            let bit = 1u16 << (detail - 1);
+            if held & bit == 0 {
+                continue;
+            }
+            let code = match detail {
+                1 => 0x110,
+                2 => 0x112,
+                3 => 0x111,
+                4 => 0x180,
+                5 => 0x181,
+                6 => 0x182,
+                7 => 0x183,
+                8 => 0x113,
+                9 => 0x114,
+                _ => unreachable!("button release loop is bounded to 1..=9"),
+            };
+            Backend::on_host_input(
+                self,
+                state,
+                HostInputEvent::PointerButton {
+                    origin: InputOrigin::Physical(source_id),
+                    button: code,
+                    pressed: false,
+                    time: crate::clock::server_time_ms(),
+                },
+            );
+        }
+    }
+
+    /// Own physical-device held-state cleanup for removal and VT suspension.
+    /// Releases pass through the ordinary KMS input and XI fanout paths while
+    /// the source is still live; grab teardown and facet disable follow.
+    pub(crate) fn release_device_state(
+        &mut self,
+        state: &mut ServerState,
+        source_id: yserver_core::xinput::InputSourceId,
+    ) {
+        if state.xi_devices.source(source_id).is_none() {
+            return;
+        }
+
+        state
+            .key_repeats
+            .remove(&yserver_core::core_loop::InputOrigin::Physical(source_id));
+        self.release_pointer_source_buttons(state, source_id);
+        self.release_keyboard_source_keys(state, source_id);
+        yserver_core::core_loop::pointer_fanout::xi_cleanup_source(state, self, source_id);
+        self.synchronize_floating_keyboard_states(state);
+
+        if let Some(mut info) = state.xi_devices.source(source_id).cloned() {
+            info.enabled = false;
+            state.xi_register_source(&info);
+        }
+        // Task 15 adds the master's last-slave source reference; clear that
+        // reference here on disable/removal when it becomes part of state.
     }
 }
 
@@ -20044,13 +20125,27 @@ impl Backend for KmsBackend {
             HostInputEvent, InputOrigin, pointer_fanout::pointer_event_fanout_to_state,
         };
 
-        if let HostInputEvent::Key(raw) | HostInputEvent::KeyRepeat(raw) = &ev
-            && !yserver_core::core_loop::key_fanout::keyboard_origin_is_live(state, raw.origin)
-        {
-            log::trace!(
-                "dropping key input from unknown, disabled, or invalid origin {:?}",
-                raw.origin
-            );
+        let rejected_origin = match &ev {
+            HostInputEvent::Key(raw) | HostInputEvent::KeyRepeat(raw)
+                if !yserver_core::core_loop::key_fanout::keyboard_origin_is_live(
+                    state, raw.origin,
+                ) =>
+            {
+                Some(raw.origin)
+            }
+            HostInputEvent::PointerMotion { origin, .. }
+            | HostInputEvent::PointerButton { origin, .. }
+            | HostInputEvent::PointerScrollStop { origin, .. }
+                if !yserver_core::core_loop::pointer_fanout::pointer_origin_is_live(
+                    state, *origin,
+                ) =>
+            {
+                Some(*origin)
+            }
+            _ => None,
+        };
+        if let Some(origin) = rejected_origin {
+            log::trace!("dropping input from unknown, disabled, or invalid origin {origin:?}");
             return;
         }
 
@@ -20072,12 +20167,6 @@ impl Backend for KmsBackend {
                 motion_delta,
                 ..
             } => {
-                if !yserver_core::core_loop::pointer_fanout::pointer_origin_is_live(state, origin) {
-                    log::trace!(
-                        "dropping pointer motion from unknown, disabled, or invalid origin {origin:?}"
-                    );
-                    return;
-                }
                 if let Some(device_id) =
                     yserver_core::core_loop::pointer_fanout::floating_pointer_device_id(
                         state, origin,
@@ -20150,12 +20239,6 @@ impl Backend for KmsBackend {
                 pressed,
                 ..
             } => {
-                if !yserver_core::core_loop::pointer_fanout::pointer_origin_is_live(state, origin) {
-                    log::trace!(
-                        "dropping pointer button from unknown, disabled, or invalid origin {origin:?}"
-                    );
-                    return;
-                }
                 if let Some(device_id) =
                     yserver_core::core_loop::pointer_fanout::floating_pointer_device_id(
                         state, origin,
@@ -20217,12 +20300,6 @@ impl Backend for KmsBackend {
                 }
             }
             HostInputEvent::PointerScrollStop { origin, .. } => {
-                if !yserver_core::core_loop::pointer_fanout::pointer_origin_is_live(state, origin) {
-                    log::trace!(
-                        "dropping pointer scroll stop from unknown, disabled, or invalid origin {origin:?}"
-                    );
-                    return;
-                }
                 if let Some(device_id) =
                     yserver_core::core_loop::pointer_fanout::floating_pointer_device_id(
                         state, origin,
@@ -20324,8 +20401,11 @@ impl Backend for KmsBackend {
             }
             HostInputEvent::DeviceRemoved { source_id } => {
                 log::info!("xi-device: removed source={}", source_id.0);
-                state.key_repeats.remove(&InputOrigin::Physical(source_id));
-                yserver_core::core_loop::pointer_fanout::xi_cleanup_source(state, self, source_id);
+                if state.xi_devices.source(source_id).is_none() {
+                    return;
+                }
+                self.release_device_state(state, source_id);
+                state.xi_unregister_source(source_id);
                 self.synchronize_floating_keyboard_states(state);
                 return;
             }
@@ -39247,6 +39327,533 @@ mod tests {
         );
         assert!(state.unpublished_keyboard_keys_down.is_empty());
         assert_eq!(state.xi_devices.devices().len(), 6);
+    }
+
+    #[test]
+    fn xi_source_removal_releases_source_holds_before_unregister_and_drops_stale_reuse_input() {
+        use yserver_core::{
+            backend::Backend,
+            core_loop::{DeviceInfo, HostInputEvent, InputOrigin, message::LibinputConfigSnapshot},
+            host_x11::HostKeyEvent,
+            resources::ROOT_WINDOW,
+            server::ServerState,
+            xinput::{InputCapabilities, InputSourceId, XiFacetKind},
+        };
+
+        const REMOVED: InputSourceId = InputSourceId(0xD140);
+        const HYPERX: InputSourceId = InputSourceId(0xD141);
+        const REPLACEMENT: InputSourceId = InputSourceId(0xD142);
+        const CLIENT: u32 = 0xD14;
+        const CTRL_L: u8 = 37;
+        const ALT_L: u8 = 64;
+        const SHIFT_L: u8 = 50;
+        const SUPER_L: u8 = 133;
+        const HYPERX_KEY: u8 = 30;
+        const KEY_MASK: u64 = (1 << 2) | (1 << 3);
+        const BUTTON_MASK: u64 = (1 << 4) | (1 << 5);
+
+        let mut backend = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        backend
+            .core
+            .xid_map
+            .insert(backend.core.window_id, ROOT_WINDOW);
+        state.core_focus.raw = ROOT_WINDOW.0;
+        let mut peer = kbd_map_client_id(&mut state, CLIENT);
+        let make_info = |source_id: InputSourceId, name: &str| DeviceInfo {
+            source_id,
+            enabled: true,
+            resume_key: None,
+            capabilities: InputCapabilities {
+                keyboard: true,
+                pointer: true,
+                touch: false,
+            },
+            name: name.to_owned(),
+            device_node: format!("/dev/input/{}", source_id.0),
+            sysname: format!("event{}", source_id.0),
+            vendor_id: 0,
+            product_id: source_id.0 as u32,
+            is_touchpad: false,
+            config: LibinputConfigSnapshot::default(),
+        };
+        for (source, name) in [(REMOVED, "Razer"), (HYPERX, "HyperX")] {
+            backend.on_host_input(
+                &mut state,
+                HostInputEvent::DeviceAdded(make_info(source, name)),
+            );
+        }
+        let removed_keyboard = state
+            .xi_devices
+            .facet(REMOVED, XiFacetKind::Keyboard)
+            .unwrap();
+        let removed_pointer = state
+            .xi_devices
+            .facet(REMOVED, XiFacetKind::PointerTouch)
+            .unwrap();
+        let hyperx_keyboard = state
+            .xi_devices
+            .facet(HYPERX, XiFacetKind::Keyboard)
+            .unwrap();
+        let hyperx_pointer = state
+            .xi_devices
+            .facet(HYPERX, XiFacetKind::PointerTouch)
+            .unwrap();
+        let removed_keyboard_properties = state
+            .xi_devices
+            .device(removed_keyboard)
+            .unwrap()
+            .properties
+            .clone();
+        let removed_pointer_properties = state
+            .xi_devices
+            .device(removed_pointer)
+            .unwrap()
+            .properties
+            .clone();
+        let hyperx_pointer_properties = state
+            .xi_devices
+            .device(hyperx_pointer)
+            .unwrap()
+            .properties
+            .clone();
+        for (device_id, mask) in [
+            (removed_keyboard, KEY_MASK),
+            (hyperx_keyboard, KEY_MASK),
+            (removed_pointer, BUTTON_MASK),
+            (hyperx_pointer, BUTTON_MASK),
+            (2, BUTTON_MASK),
+            (3, KEY_MASK),
+            (4, BUTTON_MASK),
+            (5, KEY_MASK),
+        ] {
+            state
+                .clients
+                .get_mut(&CLIENT)
+                .unwrap()
+                .xi2_masks
+                .insert((ROOT_WINDOW, device_id), mask);
+        }
+        state
+            .clients
+            .get_mut(&CLIENT)
+            .unwrap()
+            .xi2_masks
+            .insert((ROOT_WINDOW, 0), KEY_MASK | BUTTON_MASK);
+
+        let key = |origin, keycode, pressed| {
+            HostInputEvent::Key(HostKeyEvent {
+                origin,
+                pressed,
+                keycode,
+                time: 1,
+                root_x: 0,
+                root_y: 0,
+                event_x: 0,
+                event_y: 0,
+                state: 0,
+            })
+        };
+        let button = |origin, button, pressed| HostInputEvent::PointerButton {
+            origin,
+            button,
+            pressed,
+            time: 2,
+        };
+        let drain_peer = |state: &mut ServerState, peer: &mut std::os::unix::net::UnixStream| {
+            let mut bytes = Vec::new();
+            for _ in 0..64 {
+                bytes.extend(kbd_map_drain(peer));
+                let Some(client) = state.clients.get_mut(&CLIENT) else {
+                    break;
+                };
+                if client.outbound.is_empty() {
+                    break;
+                }
+                let outcome = yserver_core::core_loop::client_io::drain_outbound(client)
+                    .expect("flush buffered test events");
+                assert_ne!(
+                    outcome,
+                    yserver_core::core_loop::client_io::WriteOutcome::Disconnect,
+                    "the event-capture peer remains connected",
+                );
+            }
+            bytes.extend(kbd_map_drain(peer));
+            bytes
+        };
+
+        // The source is a mixed keyboard/pointer facet. Explicit XTEST holds
+        // aimed at its physical XI facets belong to those facets and drain
+        // with them; virtual XTEST 4/5 holds remain independent.
+        backend.on_host_input(
+            &mut state,
+            key(InputOrigin::Physical(REMOVED), CTRL_L, true),
+        );
+        backend.on_host_input(&mut state, key(InputOrigin::Physical(REMOVED), ALT_L, true));
+        backend.on_host_input(
+            &mut state,
+            key(InputOrigin::XTest(removed_keyboard), SUPER_L, true),
+        );
+        backend.on_host_input(
+            &mut state,
+            key(InputOrigin::Physical(HYPERX), HYPERX_KEY, true),
+        );
+        backend.on_host_input(&mut state, key(InputOrigin::XTest(5), SHIFT_L, true));
+        backend.on_host_input(
+            &mut state,
+            button(InputOrigin::Physical(REMOVED), 0x110, true),
+        );
+        backend.on_host_input(
+            &mut state,
+            button(InputOrigin::XTest(removed_pointer), 0x112, true),
+        );
+        backend.on_host_input(
+            &mut state,
+            button(InputOrigin::Physical(HYPERX), 0x110, true),
+        );
+        backend.on_host_input(&mut state, button(InputOrigin::XTest(4), 0x112, true));
+        let press_bytes = drain_peer(&mut state, &mut peer);
+        let press_events = xi2_events(&press_bytes);
+        assert!(
+            press_events.iter().any(|event| {
+                event.0 == 4 && event.1 == removed_pointer && event.2 == removed_pointer
+            }),
+            "production pointer press reaches the selected source facet: events={press_events:?}; bytes={}; buffered={}; held={}",
+            press_bytes.len(),
+            state.clients[&CLIENT].outbound.len(),
+            state
+                .xi_devices
+                .device(removed_pointer)
+                .unwrap()
+                .buttons_down,
+        );
+        assert_eq!(
+            state
+                .xi_devices
+                .device(removed_pointer)
+                .unwrap()
+                .buttons_down,
+            3,
+            "the removed facet holds its physical and explicit-XTEST buttons",
+        );
+
+        backend.on_host_input(
+            &mut state,
+            HostInputEvent::DeviceRemoved { source_id: REMOVED },
+        );
+        let removal_bytes = drain_peer(&mut state, &mut peer);
+        let removal_events = xi2_events(&removal_bytes);
+        let releases: Vec<_> = removal_events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| matches!(event.0, 3 | 5))
+            .collect();
+
+        // Xorg dix/devices.c::ReleaseButtonsAndKeys runs its
+        // `/* Release all buttons */` loop before `/* Release all keys */`.
+        let last_button_release = releases
+            .iter()
+            .filter(|(_, event)| event.0 == 5)
+            .map(|(index, _)| *index)
+            .max()
+            .unwrap_or_else(|| {
+                panic!(
+                    "removed source emits button releases; decoded={removal_events:?}; bytes={}; buffered={}",
+                    removal_bytes.len(),
+                    state.clients[&CLIENT].outbound.len(),
+                )
+            });
+        let first_key_release = releases
+            .iter()
+            .filter(|(_, event)| event.0 == 3)
+            .map(|(index, _)| *index)
+            .min()
+            .expect("removed source emits key releases");
+        assert!(last_button_release < first_key_release);
+
+        for detail in [1, 2] {
+            assert_eq!(
+                removal_events
+                    .iter()
+                    .filter(|event| {
+                        event.0 == 5
+                            && event.1 == removed_pointer
+                            && event.2 == removed_pointer
+                            && event.3 == detail
+                    })
+                    .count(),
+                1,
+                "each removed-facet ButtonRelease must be delivered once",
+            );
+        }
+        assert_eq!(
+            removal_events
+                .iter()
+                .filter(|event| event.0 == 5 && event.1 == 2 && event.3 == 1)
+                .count(),
+            0,
+            "HyperX still holds button 1, so its master release is suppressed",
+        );
+        assert_eq!(
+            removal_events
+                .iter()
+                .filter(|event| event.0 == 5 && event.1 == 2 && event.3 == 2)
+                .count(),
+            0,
+            "virtual XTEST still holds button 2, so its master release is suppressed",
+        );
+        assert!(
+            removal_events
+                .iter()
+                .all(|event| { !(matches!(event.0, 3 | 5) && matches!(event.1, 4 | 5)) }),
+            "virtual XTEST facets do not receive removal releases"
+        );
+        for (keycode, expected_slave_events) in [(CTRL_L, 1), (ALT_L, 1), (SUPER_L, 1)] {
+            let slave_release = removal_events
+                .iter()
+                .position(|event| {
+                    event.0 == 3
+                        && event.1 == removed_keyboard
+                        && event.2 == removed_keyboard
+                        && event.3 == u32::from(keycode)
+                })
+                .expect("removed keyboard facet gets its release");
+            assert_eq!(
+                removal_events
+                    .iter()
+                    .filter(|event| {
+                        event.0 == 3
+                            && event.1 == removed_keyboard
+                            && event.2 == removed_keyboard
+                            && event.3 == u32::from(keycode)
+                    })
+                    .count(),
+                expected_slave_events,
+            );
+            let master_release = removal_events
+                .iter()
+                .position(|event| {
+                    event.0 == 3
+                        && event.1 == 3
+                        && event.2 == removed_keyboard
+                        && event.3 == u32::from(keycode)
+                })
+                .expect("accepted slave release reaches the keyboard master");
+            assert!(
+                slave_release < master_release,
+                "slave form precedes master form"
+            );
+            assert_eq!(
+                removal_events
+                    .iter()
+                    .filter(|event| {
+                        event.0 == 3
+                            && event.1 == 3
+                            && event.2 == removed_keyboard
+                            && event.3 == u32::from(keycode)
+                    })
+                    .count(),
+                1,
+                "each removed-source master KeyRelease is emitted once",
+            );
+        }
+
+        assert!(state.xi_devices.source(REMOVED).is_none());
+        assert!(
+            state
+                .xi_devices
+                .devices()
+                .iter()
+                .all(|device| device.source_id != Some(REMOVED))
+        );
+        assert!(state.xi_devices.device(removed_keyboard).is_none());
+        assert!(state.xi_devices.device(removed_pointer).is_none());
+        assert!(!state.key_down_by_device.contains_key(&removed_keyboard));
+        assert!(
+            !state
+                .key_repeats
+                .contains_key(&InputOrigin::Physical(REMOVED))
+        );
+        assert!(!state.unpublished_keyboard_keys_down.contains_key(&REMOVED));
+        assert!(
+            !state
+                .unpublished_pointer_buttons_down
+                .contains_key(&REMOVED)
+        );
+        assert!(state.sync_pending.is_empty());
+        assert!(backend.core.pending_pointer_events.is_empty());
+        assert!(!state.xi1_frozen.contains_key(&removed_keyboard));
+        assert!(!state.xi1_frozen.contains_key(&removed_pointer));
+        assert!(!state.xi2_keyboard_grabs.contains_key(&removed_keyboard));
+        assert!(!state.xi2_pointer_grabs.contains_key(&removed_pointer));
+        assert!(!state.xi2_detached_masters.contains_key(&removed_keyboard));
+        assert!(!state.xi2_detached_masters.contains_key(&removed_pointer));
+        backend.on_host_input(
+            &mut state,
+            HostInputEvent::DeviceRemoved { source_id: REMOVED },
+        );
+        assert!(drain_peer(&mut state, &mut peer).is_empty());
+        assert_eq!(state.pending_xi_device_removals.len(), 2);
+        let removed_descriptors = state.take_xi_removed_device_descriptors();
+        assert_eq!(
+            removed_descriptors
+                .iter()
+                .map(|device| device.id)
+                .collect::<Vec<_>>(),
+            vec![removed_keyboard, removed_pointer],
+            "both facet snapshots are returned together for later removal notifications",
+        );
+        assert!(removed_descriptors.iter().all(|device| !device.enabled));
+        assert!(
+            removed_descriptors
+                .iter()
+                .all(|device| device.buttons_down == 0)
+        );
+        assert_eq!(
+            removed_descriptors
+                .iter()
+                .find(|device| device.id == removed_keyboard)
+                .unwrap()
+                .properties,
+            removed_keyboard_properties,
+        );
+        assert_eq!(
+            removed_descriptors
+                .iter()
+                .find(|device| device.id == removed_pointer)
+                .unwrap()
+                .properties,
+            removed_pointer_properties,
+        );
+        assert!(backend.core.down_keys.contains(&HYPERX_KEY));
+        assert!(backend.core.down_keys.contains(&SHIFT_L));
+        assert!(!backend.core.down_keys.contains(&CTRL_L));
+        assert!(!backend.core.down_keys.contains(&ALT_L));
+        assert!(!backend.core.down_keys.contains(&SUPER_L));
+        assert_eq!(
+            state.key_down_by_device.get(&hyperx_keyboard),
+            Some(&std::collections::HashMap::from([(
+                HYPERX_KEY,
+                InputOrigin::Physical(HYPERX),
+            )])),
+        );
+        assert_eq!(
+            state.key_down_by_device.get(&5),
+            Some(&std::collections::HashMap::from([(
+                SHIFT_L,
+                InputOrigin::XTest(5),
+            )])),
+            "virtual XTEST keyboard 5 keeps its independent Shift hold",
+        );
+        assert_eq!(
+            state
+                .xi_devices
+                .device(hyperx_pointer)
+                .unwrap()
+                .buttons_down,
+            1,
+            "HyperX keeps its button held",
+        );
+        assert_eq!(
+            state.xi_devices.device(hyperx_pointer).unwrap().properties,
+            hyperx_pointer_properties,
+            "HyperX's independent property state remains intact",
+        );
+        assert_eq!(state.xi_devices.device(4).unwrap().buttons_down, 2);
+        assert_eq!(
+            state.xi_devices.device(5).unwrap().source_id,
+            None,
+            "virtual XTEST keyboard identity remains present",
+        );
+        assert_eq!(state.buttons_down, 3);
+        assert_eq!(backend.core.button_mask, 0x0300);
+        let mut expected_keys = [0u8; 32];
+        for keycode in [HYPERX_KEY, SHIFT_L] {
+            expected_keys[usize::from(keycode / 8)] |= 1 << (keycode % 8);
+        }
+        assert_eq!(state.keys_down, expected_keys);
+        assert_eq!(
+            state
+                .xi_devices
+                .device(hyperx_pointer)
+                .unwrap()
+                .scroll_axis_values,
+            [0, 0],
+            "unrelated pointer valuators remain unchanged",
+        );
+
+        // A newly added source can reuse the XI IDs, but events remain bound
+        // to their old runtime SourceId and cannot mutate/fan out into it.
+        backend.on_host_input(
+            &mut state,
+            HostInputEvent::DeviceAdded(make_info(REPLACEMENT, "replacement")),
+        );
+        assert_eq!(
+            state.xi_devices.facet(REPLACEMENT, XiFacetKind::Keyboard),
+            Some(removed_keyboard),
+        );
+        assert_eq!(
+            state
+                .xi_devices
+                .facet(REPLACEMENT, XiFacetKind::PointerTouch),
+            Some(removed_pointer),
+        );
+        let before = (
+            backend.core.cursor_x,
+            backend.core.cursor_y,
+            backend.core.button_mask,
+            backend.serialize_modifiers(),
+            state.pointer_root,
+            state.buttons_down,
+            state.keys_down,
+            state
+                .xi_devices
+                .device(removed_pointer)
+                .unwrap()
+                .buttons_down,
+        );
+        backend.on_host_input(
+            &mut state,
+            key(InputOrigin::Physical(REMOVED), CTRL_L, true),
+        );
+        backend.on_host_input(
+            &mut state,
+            HostInputEvent::PointerMotion {
+                origin: InputOrigin::Physical(REMOVED),
+                x: 500,
+                y: 400,
+                time: 3,
+                relative: false,
+                dx: 0,
+                dy: 0,
+                motion_delta: None,
+            },
+        );
+        backend.on_host_input(
+            &mut state,
+            button(InputOrigin::Physical(REMOVED), 0x111, true),
+        );
+        assert_eq!(
+            (
+                backend.core.cursor_x,
+                backend.core.cursor_y,
+                backend.core.button_mask,
+                backend.serialize_modifiers(),
+                state.pointer_root,
+                state.buttons_down,
+                state.keys_down,
+                state
+                    .xi_devices
+                    .device(removed_pointer)
+                    .unwrap()
+                    .buttons_down,
+            ),
+            before,
+            "old-source input cannot change KMS, master, or reused-facet state",
+        );
+        assert!(drain_peer(&mut state, &mut peer).is_empty());
+        assert!(state.xi_devices.source(HYPERX).unwrap().enabled);
+        assert!(state.xi_devices.source(REPLACEMENT).unwrap().enabled);
     }
 
     #[test]
