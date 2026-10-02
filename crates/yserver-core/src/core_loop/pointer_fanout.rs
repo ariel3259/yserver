@@ -35,6 +35,12 @@ struct PointerXiSource {
     sourceid: u16,
 }
 
+#[derive(Clone, Copy)]
+struct PointerButtonTransition {
+    source_accepted: bool,
+    master_accepted: bool,
+}
+
 /// Whether a pointer origin can still produce input. KMS calls this before
 /// integrating relative motion into its cursor; fanout repeats the check so
 /// queued and replayed events cannot outlive their source.
@@ -116,6 +122,137 @@ fn resolve_pointer_xi_source(
     })
 }
 
+fn pointer_button_transition(
+    state: &mut ServerState,
+    origin: crate::core_loop::InputOrigin,
+    xi_source: PointerXiSource,
+    button: u8,
+    pressed: bool,
+) -> PointerButtonTransition {
+    if !(1..=16).contains(&button) {
+        return PointerButtonTransition {
+            source_accepted: true,
+            master_accepted: true,
+        };
+    }
+
+    let bit = 1u16 << (button - 1);
+    let unpublished_source = match (origin, xi_source.slave_deviceid) {
+        (crate::core_loop::InputOrigin::Physical(source_id), None) => Some(source_id),
+        _ => None,
+    };
+    let had_source_state = if let Some(device_id) = xi_source.slave_deviceid {
+        state
+            .xi_devices
+            .device(device_id)
+            .is_some_and(|device| device.buttons_down & bit != 0)
+    } else if let Some(source_id) = unpublished_source {
+        state
+            .unpublished_pointer_buttons_down
+            .get(&source_id)
+            .is_some_and(|buttons| buttons & bit != 0)
+    } else {
+        state.buttons_down & bit != 0
+    };
+
+    if pressed == had_source_state {
+        return PointerButtonTransition {
+            source_accepted: false,
+            master_accepted: false,
+        };
+    }
+
+    if let Some(device_id) = xi_source.slave_deviceid {
+        if let Some(device) = state.xi_devices.device_mut(device_id) {
+            if pressed {
+                device.buttons_down |= bit;
+            } else {
+                device.buttons_down &= !bit;
+            }
+        }
+    } else if let Some(source_id) = unpublished_source {
+        let buttons = state
+            .unpublished_pointer_buttons_down
+            .entry(source_id)
+            .or_default();
+        if pressed {
+            *buttons |= bit;
+        } else {
+            *buttons &= !bit;
+            if *buttons == 0 {
+                state.unpublished_pointer_buttons_down.remove(&source_id);
+            }
+        }
+    }
+
+    let attached_to_master = xi_source.slave_deviceid.is_none_or(|device_id| {
+        state
+            .xi_devices
+            .device(device_id)
+            .is_some_and(|device| device.attached_master == Some(XI2_MASTER_POINTER_DEVICE_ID))
+    });
+    if !attached_to_master {
+        return PointerButtonTransition {
+            source_accepted: true,
+            master_accepted: false,
+        };
+    }
+
+    if pressed {
+        if state.buttons_down & bit != 0 {
+            return PointerButtonTransition {
+                source_accepted: true,
+                master_accepted: false,
+            };
+        }
+        state.buttons_down |= bit;
+        return PointerButtonTransition {
+            source_accepted: true,
+            master_accepted: true,
+        };
+    }
+
+    // Xorg's master button release is aggregated: a slave release reaches
+    // that slave, but cannot release the master while any attached slave
+    // still holds the mapped button.
+    if attached_pointer_holds_button(state, bit) {
+        PointerButtonTransition {
+            source_accepted: true,
+            master_accepted: false,
+        }
+    } else if state.buttons_down & bit != 0 {
+        state.buttons_down &= !bit;
+        PointerButtonTransition {
+            source_accepted: true,
+            master_accepted: true,
+        }
+    } else {
+        PointerButtonTransition {
+            source_accepted: true,
+            master_accepted: false,
+        }
+    }
+}
+
+fn attached_pointer_holds_button(state: &ServerState, bit: u16) -> bool {
+    state.xi_devices.devices().iter().any(|device| {
+        device.enabled
+            && device.attached_master == Some(XI2_MASTER_POINTER_DEVICE_ID)
+            && (device.id == XI2_SLAVE_POINTER_DEVICE_ID
+                || device.facet == Some(crate::xinput::XiFacetKind::PointerTouch))
+            && device.buttons_down & bit != 0
+    }) || state
+        .unpublished_pointer_buttons_down
+        .iter()
+        .any(|(source_id, buttons)| {
+            buttons & bit != 0
+                && state
+                    .xi_devices
+                    .source(*source_id)
+                    .is_some_and(|info| info.enabled && info.capabilities.pointer)
+        })
+}
+
 /// Fan a host pointer event out to nested clients.
 ///
 /// `handle_grabs` toggles passive-grab matching and active-grab
@@ -148,7 +285,7 @@ pub fn pointer_event_fanout_to_state(
         &mut info,
     );
     implicit_pointer_grab_lifecycle(state, &event, &info);
-    if !info.queued {
+    if !info.queued && info.master_button_transition {
         release_passive_grab_on_button_release(state, event.kind);
     }
     dropped
@@ -171,7 +308,7 @@ pub fn replay_frozen_pointer_event_to_state(
         state, backend, xid_map, event, false, false, true, &mut info,
     );
     implicit_pointer_grab_lifecycle(state, &event, &info);
-    if !info.queued {
+    if !info.queued && info.master_button_transition {
         release_passive_grab_on_button_release(state, event.kind);
     }
     dropped
@@ -204,6 +341,7 @@ struct ImplicitGrabFanoutInfo {
     /// must not drive grab lifecycle. The lifecycle for this event runs
     /// when `xi1_compute_freezes` replays it.
     queued: bool,
+    master_button_transition: bool,
     core_press: Option<DeliveredPress>,
     xi2_press: Option<DeliveredPress>,
 }
@@ -322,18 +460,38 @@ fn pointer_event_fanout_to_state_inner(
     // onto delivered events: the backend cooks the authoritative
     // modifier/button state into `event.state` (see the modifier
     // source-of-truth note in `key_fanout`).
-    if matches!(
+    let button_transition = if matches!(
         event.kind,
         PointerEventKind::ButtonPress | PointerEventKind::ButtonRelease
-    ) && (1..=16).contains(&event.detail)
-    {
-        let bit = 1u16 << (event.detail - 1);
-        if event.kind == PointerEventKind::ButtonPress {
-            state.buttons_down |= bit;
+    ) {
+        let replaying = state.playing_sync_events || is_replay || suppress_raw;
+        let transition = pointer_button_transition(
+            state,
+            event.origin,
+            xi_source,
+            event.detail,
+            event.kind == PointerEventKind::ButtonPress,
+        );
+        if replaying {
+            // A frozen input may have updated its held state before it was
+            // queued, or it may first become owned when the activating press
+            // is replayed. The transition helper is idempotent in both cases;
+            // preserve delivery of the queued/replayed event even when that
+            // state transition was already applied.
+            PointerButtonTransition {
+                source_accepted: true,
+                master_accepted: true,
+            }
         } else {
-            state.buttons_down &= !bit;
+            transition
         }
-    }
+    } else {
+        PointerButtonTransition {
+            source_accepted: true,
+            master_accepted: true,
+        }
+    };
+    info.master_button_transition = button_transition.master_accepted;
     // Pointer confinement (Xorg CheckPhysLimits): while a confined
     // grab is active, motion outside the confine rectangle is
     // replaced by a warp to the nearest inside point; press/release
@@ -833,7 +991,13 @@ fn pointer_event_fanout_to_state_inner(
         .map(|(_, _, _, c, _)| c)
         .unwrap_or_default();
         let xi2_evt = xi2_evtype(event.kind);
-        let xi2_clients = compute_xi2_targets(state, target, top_level_id, xi2_evt);
+        let xi2_clients = compute_xi2_targets_for_source(
+            state,
+            target,
+            top_level_id,
+            xi2_evt,
+            xi_source.slave_deviceid,
+        );
         let label_clients = |cs: &[ClientId]| -> String {
             if cs.is_empty() {
                 "<none>".to_string()
@@ -869,8 +1033,9 @@ fn pointer_event_fanout_to_state_inner(
     // QUEUE stay handle_grabs-gated (those are the re-entry hazards).
     // With no grab in effect, active_grab_target is None and this is the
     // exact pre-fix behavior for the replayed press.
-    if let Some((grab_window, grab_client, gx, gy, owner_events, via_xi2, grab_event_mask)) =
-        active_grab_target(state)
+    if button_transition.master_accepted
+        && let Some((grab_window, grab_client, gx, gy, owner_events, via_xi2, grab_event_mask)) =
+            active_grab_target(state)
     {
         // Xorg DeliverGrabbedEvent's owner_events=true rule is NOT
         // "the immediate hit window is owned by the grab client".
@@ -1039,6 +1204,7 @@ fn pointer_event_fanout_to_state_inner(
         && !active_grab_present
         && handle_grabs
         && event.kind == PointerEventKind::ButtonPress
+        && button_transition.master_accepted
         && let Some((grab, _hit_window)) = try_match_passive_grab(state, xid_map, event)
     {
         log::debug!(
@@ -1198,7 +1364,10 @@ fn pointer_event_fanout_to_state_inner(
         event.kind,
         PointerEventKind::EnterNotify | PointerEventKind::LeaveNotify
     );
-    if !handled_core_via_grab && (top_level_id_opt.is_some() || is_crossing) {
+    if !handled_core_via_grab
+        && button_transition.master_accepted
+        && (top_level_id_opt.is_some() || is_crossing)
+    {
         let mask_bit = pointer_mask_bit(event.kind, event.state);
         // Crossings carry a *per-window* endpoint (the producer stamps each
         // Leave/Enter chain event with that window's host_xid). The live
@@ -1274,7 +1443,13 @@ fn pointer_event_fanout_to_state_inner(
                 } else {
                     (target, top_level_id)
                 };
-                let xi2_dedup = compute_xi2_targets(state, dedup_target, dedup_top_level, xi2_evt);
+                let xi2_dedup = compute_xi2_targets_for_source(
+                    state,
+                    dedup_target,
+                    dedup_top_level,
+                    xi2_evt,
+                    xi_source.slave_deviceid,
+                );
                 // Only the MASTER-pointer XI2 form duplicates the core
                 // event, so shadow core only for those clients (Chromium's
                 // Ozone X11 selects core + XI2 on the master → it must NOT
@@ -1288,8 +1463,16 @@ fn pointer_event_fanout_to_state_inner(
                 // registered on the e desktop.
                 core_targets.retain(|c| {
                     !xi2_dedup.contains(c)
-                        || xi2_stamp_deviceid(state, *c, dedup_target, dedup_top_level, xi2_evt)
-                            == XI2_SLAVE_POINTER_DEVICE_ID
+                        || xi_source.slave_deviceid.is_some_and(|slave_deviceid| {
+                            xi2_stamp_deviceid_for_source(
+                                state,
+                                *c,
+                                dedup_target,
+                                dedup_top_level,
+                                xi2_evt,
+                                Some(slave_deviceid),
+                            ) == slave_deviceid
+                        })
                 });
             }
         }
@@ -1380,8 +1563,8 @@ fn pointer_event_fanout_to_state_inner(
     // DeviceMotionNotify) for clients that selected the matching
     // `XEventClass` via SelectExtensionEvent. XI1 events propagate up
     // the ancestor chain like core events (Xorg dix
-    // DeliverDeviceEvents) and report the slave/extension pointer (4),
-    // matching the device XTS opens (masters are not XI1-openable).
+    // DeliverDeviceEvents) and report the resolved source facet (masters
+    // are not XI1-openable).
     //
     // Deliberately BEFORE the `top_level_id_opt` gate below: XI1
     // routing resolves its own target from `natural_target` and its
@@ -1396,7 +1579,10 @@ fn pointer_event_fanout_to_state_inner(
         PointerEventKind::MotionNotify => Some(crate::xinput::XI_DEVICE_MOTION_NOTIFY_OFFSET),
         _ => None,
     };
-    if let Some(offset) = xi1_offset {
+    if let Some(offset) = xi1_offset
+        && button_transition.source_accepted
+        && let Some(deviceid) = xi_source.slave_deviceid
+    {
         let evcode = crate::server::XI_FIRST_EVENT + offset;
         let detail = if event.kind == PointerEventKind::MotionNotify {
             0
@@ -1406,7 +1592,7 @@ fn pointer_event_fanout_to_state_inner(
         let extras = xi1_route_device_event(
             state,
             crate::server::Xi1QueuedEvent {
-                deviceid: crate::xinput::DEVICEID_SLAVE_POINTER,
+                deviceid,
                 evcode,
                 detail,
                 time: event.time,
@@ -1473,9 +1659,15 @@ fn pointer_event_fanout_to_state_inner(
         let (ox, oy) = state.resources.window_absolute_position(crossing_win);
         event_x = clamp_grab_coord(event.root_x, ox);
         event_y = clamp_grab_coord(event.root_y, oy);
-        xi2_crossing_targets(state, crossing_win, xi2_evtype)
+        xi2_crossing_targets_for_source(state, crossing_win, xi2_evtype, xi_source.slave_deviceid)
     } else {
-        compute_xi2_targets(state, target, top_level_id, xi2_evtype)
+        compute_xi2_targets_for_source(
+            state,
+            target,
+            top_level_id,
+            xi2_evtype,
+            xi_source.slave_deviceid,
+        )
     };
     let (xi2_raw_slave_targets, xi2_raw_master_targets) = xi2_raw_evtype
         .map(|raw_evtype| compute_xi2_raw_targets(state, raw_evtype, xi_source))
@@ -1690,7 +1882,8 @@ fn pointer_event_fanout_to_state_inner(
     // cumulative-vs-delta bug.
     //
     // ButtonRelease doesn't carry an axis update; only ButtonPress does.
-    let scroll_axis_info: Option<(u8, i32)> = if event.kind == PointerEventKind::ButtonPress
+    let scroll_axis_info: Option<(u8, usize)> = if event.kind == PointerEventKind::ButtonPress
+        && button_transition.source_accepted
         && (event.detail >= 4 && event.detail <= 7)
     {
         let (axis_idx, delta): (usize, i32) = match event.detail {
@@ -1700,9 +1893,15 @@ fn pointer_event_fanout_to_state_inner(
             7 => (1, 1),
             _ => unreachable!(),
         };
+        if let Some(device_id) = xi_source.slave_deviceid
+            && let Some(device) = state.xi_devices.device_mut(device_id)
+        {
+            device.scroll_axis_values[axis_idx] =
+                device.scroll_axis_values[axis_idx].wrapping_add(delta);
+        }
         state.scroll_axis_value[axis_idx] = state.scroll_axis_value[axis_idx].wrapping_add(delta);
         let scroll_axis_num: u8 = if axis_idx == 0 { 2 } else { 3 };
-        Some((scroll_axis_num, state.scroll_axis_value[axis_idx]))
+        Some((scroll_axis_num, axis_idx))
     } else {
         None
     };
@@ -1761,8 +1960,14 @@ fn pointer_event_fanout_to_state_inner(
         PointerEventKind::EnterNotify | PointerEventKind::LeaveNotify
     );
     for cid in &xi2_targets {
-        let (wants_master, wants_slave) =
-            xi2_pointer_forms(state, *cid, target, top_level_id, xi2_evtype);
+        let (wants_master, wants_slave) = xi2_pointer_forms_for_source(
+            state,
+            *cid,
+            target,
+            top_level_id,
+            xi2_evtype,
+            xi_source.slave_deviceid,
+        );
         // Crossings and grab-redirected delivery have one fixed event
         // window. Normal slave/master forms route independently and may
         // stop on different selected ancestors.
@@ -1779,7 +1984,11 @@ fn pointer_event_fanout_to_state_inner(
         };
         let mut forms = Vec::with_capacity(2);
         if let Some(slave_deviceid) = xi_source.slave_deviceid {
-            forms.push((slave_deviceid, wants_slave, Xi2PointerForm::Slave));
+            forms.push((
+                slave_deviceid,
+                wants_slave && button_transition.source_accepted,
+                Xi2PointerForm::Slave,
+            ));
         }
         // Master form for master / `XIAllMasterDevices` / `XIAllDevices`
         // selectors, AND as the default when the client has no matching
@@ -1788,7 +1997,7 @@ fn pointer_event_fanout_to_state_inner(
         // no published slave can only deliver its master form.
         forms.push((
             XI2_MASTER_POINTER_DEVICE_ID,
-            wants_master || !wants_slave,
+            (wants_master || !wants_slave) && button_transition.master_accepted,
             Xi2PointerForm::Master,
         ));
         for (deviceid, want, form) in forms {
@@ -1796,7 +2005,14 @@ fn pointer_event_fanout_to_state_inner(
                 continue;
             }
             let (ev_win, ev_child, ev_x, ev_y) = fixed_geometry.unwrap_or_else(|| {
-                let win = xi2_route_window(state, target, form, xi2_evtype).unwrap_or(target);
+                let win = xi2_route_window_for_source(
+                    state,
+                    target,
+                    form,
+                    xi2_evtype,
+                    xi_source.slave_deviceid,
+                )
+                .unwrap_or(target);
                 if win == nested_id {
                     (nested_id, ResourceId(0), event_x, event_y)
                 } else {
@@ -1811,6 +2027,18 @@ fn pointer_event_fanout_to_state_inner(
                 }
             });
             let focus = state.crossing_has_focus(ev_win);
+            let scroll_value = scroll_axis_info.map(|(_, axis_idx)| {
+                if deviceid == XI2_MASTER_POINTER_DEVICE_ID {
+                    state.scroll_axis_value[axis_idx]
+                } else {
+                    state
+                        .xi_devices
+                        .device(deviceid)
+                        .map_or(state.scroll_axis_value[axis_idx], |device| {
+                            device.scroll_axis_values[axis_idx]
+                        })
+                }
+            });
             let extras =
                 fanout_event_to_clients(state, std::slice::from_ref(cid), |buf, seq, order| {
                     if is_crossing_evt {
@@ -1835,7 +2063,8 @@ fn pointer_event_fanout_to_state_inner(
                             focus,
                         );
                     } else {
-                        if let Some((axis, value)) = scroll_axis_info {
+                        if let Some((axis, _)) = scroll_axis_info {
+                            let value = scroll_value.unwrap_or_default();
                             x11::encode_xi2_motion_with_scroll(
                                 buf,
                                 order,
@@ -1906,7 +2135,7 @@ fn pointer_event_fanout_to_state_inner(
                         [
                             xi_source
                                 .slave_deviceid
-                                .unwrap_or(XI2_SLAVE_POINTER_DEVICE_ID),
+                                .unwrap_or(XI2_MASTER_POINTER_DEVICE_ID),
                             XI2_MASTER_POINTER_DEVICE_ID,
                             1,
                             0,
@@ -1944,7 +2173,12 @@ fn implicit_pointer_grab_lifecycle(
     event: &HostPointerEvent,
     info: &ImplicitGrabFanoutInfo,
 ) {
-    if info.queued {
+    if info.queued
+        || (matches!(
+            event.kind,
+            PointerEventKind::ButtonPress | PointerEventKind::ButtonRelease
+        ) && !info.master_button_transition)
+    {
         return;
     }
     match event.kind {
@@ -2011,6 +2245,7 @@ fn implicit_pointer_grab_lifecycle(
 pub fn emit_scroll_stop_to_state(
     state: &mut ServerState,
     xid_map: &HostXidMap,
+    origin: crate::core_loop::InputOrigin,
     pointer_host_xid: u32,
     root_x: i16,
     root_y: i16,
@@ -2018,8 +2253,11 @@ pub fn emit_scroll_stop_to_state(
     time: u32,
 ) {
     const XI_MOTION: u16 = 6;
+    let Some(xi_source) = resolve_pointer_xi_source(state, origin, false) else {
+        return;
+    };
     let probe = HostPointerEvent {
-        origin: crate::core_loop::message::InputOrigin::XTest(4),
+        origin,
         kind: PointerEventKind::MotionNotify,
         host_xid: pointer_host_xid,
         detail: 0,
@@ -2042,59 +2280,70 @@ pub fn emit_scroll_stop_to_state(
         .unwrap_or(ROOT_WINDOW);
     let (target, event_x, event_y) = root_hit.unwrap_or((top_level_id, root_x, root_y));
 
-    let xi2_targets = compute_xi2_targets(state, target, top_level_id, XI_MOTION);
+    let xi2_targets = compute_xi2_targets_for_source(
+        state,
+        target,
+        top_level_id,
+        XI_MOTION,
+        xi_source.slave_deviceid,
+    );
     if xi2_targets.is_empty() {
         return;
     }
-    let mut master_dev_targets: Vec<ClientId> = Vec::new();
-    let mut slave_dev_targets: Vec<ClientId> = Vec::new();
     for cid in &xi2_targets {
-        let (wants_master, wants_slave) =
-            xi2_pointer_forms(state, *cid, target, top_level_id, XI_MOTION);
-        if wants_slave {
-            slave_dev_targets.push(*cid);
+        let (wants_master, wants_slave) = xi2_pointer_forms_for_source(
+            state,
+            *cid,
+            target,
+            top_level_id,
+            XI_MOTION,
+            xi_source.slave_deviceid,
+        );
+        let mut forms = Vec::with_capacity(2);
+        if let Some(device_id) = xi_source.slave_deviceid
+            && wants_slave
+        {
+            forms.push((device_id, true));
         }
         if wants_master || !wants_slave {
-            master_dev_targets.push(*cid);
+            forms.push((XI2_MASTER_POINTER_DEVICE_ID, false));
         }
-    }
-    // Current cumulative valuator per axis (unchanged → delta 0 → is_stop).
-    // Index 0 = vertical (scroll axis 2), 1 = horizontal (axis 3); mirrors the
-    // click path's `scroll_axis_num` mapping.
-    let axes: [(u8, i32); 2] = [
-        (2, state.scroll_axis_value[0]),
-        (3, state.scroll_axis_value[1]),
-    ];
-    // Slave form before master (see the ordering note in the main fanout).
-    for (deviceid, group) in [
-        (XI2_SLAVE_POINTER_DEVICE_ID, &slave_dev_targets),
-        (XI2_MASTER_POINTER_DEVICE_ID, &master_dev_targets),
-    ] {
-        if group.is_empty() {
-            continue;
+        for (deviceid, is_slave) in forms {
+            let scroll = if is_slave {
+                state
+                    .xi_devices
+                    .device(deviceid)
+                    .map_or(state.scroll_axis_value, |device| device.scroll_axis_values)
+            } else {
+                state.scroll_axis_value
+            };
+            let _ = fanout_event_to_clients(state, std::slice::from_ref(cid), |buf, seq, order| {
+                // Current cumulative valuator per axis (unchanged → delta
+                // 0 → is_stop). Index 0 is vertical axis 2; index 1 is
+                // horizontal axis 3.
+                let axes = [(2, scroll[0]), (3, scroll[1])];
+                for (axis, value) in axes {
+                    x11::encode_xi2_motion_with_scroll(
+                        buf,
+                        order,
+                        seq,
+                        XI2_MAJOR_OPCODE,
+                        deviceid,
+                        time,
+                        ROOT_WINDOW,
+                        target,
+                        root_x,
+                        root_y,
+                        event_x,
+                        event_y,
+                        state_mask,
+                        xi_source.sourceid,
+                        axis,
+                        value,
+                    );
+                }
+            });
         }
-        let _ = fanout_event_to_clients(state, group, |buf, seq, order| {
-            for (axis, value) in axes {
-                x11::encode_xi2_motion_with_scroll(
-                    buf,
-                    order,
-                    seq,
-                    XI2_MAJOR_OPCODE,
-                    deviceid,
-                    time,
-                    ROOT_WINDOW,
-                    target,
-                    root_x,
-                    root_y,
-                    event_x,
-                    event_y,
-                    state_mask,
-                    XI2_SLAVE_POINTER_DEVICE_ID,
-                    axis,
-                    value,
-                );
-            }
-        });
     }
 }
 
@@ -3105,42 +3354,44 @@ enum Xi2PointerForm {
     Master,
 }
 
-fn xi2_form_selected_on(
+fn xi2_form_selected_on_for_source(
     client: &crate::server::ClientState,
     window: ResourceId,
     form: Xi2PointerForm,
     evtype: u16,
+    slave_deviceid: Option<u16>,
 ) -> bool {
-    let devices: &[u16] = match form {
-        Xi2PointerForm::Slave => &[XI2_SLAVE_POINTER_DEVICE_ID, 0],
-        Xi2PointerForm::Master => &[XI2_MASTER_POINTER_DEVICE_ID, 1, 0],
-    };
     let bit = 1u64 << evtype;
-    devices.iter().any(|device| {
+    let selected = |device: u16| {
         client
             .xi2_masks
-            .get(&(window, *device))
+            .get(&(window, device))
             .is_some_and(|mask| mask & bit != 0)
-    })
+    };
+    match form {
+        Xi2PointerForm::Slave => slave_deviceid.is_some_and(selected) || selected(0),
+        Xi2PointerForm::Master => {
+            selected(XI2_MASTER_POINTER_DEVICE_ID) || selected(1) || selected(0)
+        }
+    }
 }
 
 /// Route one XI2 device form using Xorg's `DeliverDeviceEvents` rule: walk
 /// leaf-to-root and stop at the first window with a matching selection.
 /// Every selector on that window receives the form; selectors on higher
 /// ancestors do not receive duplicate copies.
-fn xi2_route_window(
+fn xi2_route_window_for_source(
     state: &ServerState,
     target: ResourceId,
     form: Xi2PointerForm,
     evtype: u16,
+    slave_deviceid: Option<u16>,
 ) -> Option<ResourceId> {
     let mut window = target;
     for _ in 0..256 {
-        if state
-            .clients
-            .values()
-            .any(|client| xi2_form_selected_on(client, window, form, evtype))
-        {
+        if state.clients.values().any(|client| {
+            xi2_form_selected_on_for_source(client, window, form, evtype, slave_deviceid)
+        }) {
             return Some(window);
         }
         if window == ROOT_WINDOW {
@@ -3151,17 +3402,19 @@ fn xi2_route_window(
     None
 }
 
-fn xi2_form_targets(
+fn xi2_form_targets_for_source(
     state: &ServerState,
     window: ResourceId,
     form: Xi2PointerForm,
     evtype: u16,
+    slave_deviceid: Option<u16>,
 ) -> Vec<ClientId> {
     state
         .clients
         .iter()
         .filter_map(|(id, client)| {
-            xi2_form_selected_on(client, window, form, evtype).then_some(ClientId(*id))
+            xi2_form_selected_on_for_source(client, window, form, evtype, slave_deviceid)
+                .then_some(ClientId(*id))
         })
         .collect()
 }
@@ -3170,13 +3423,18 @@ fn xi2_form_targets(
 /// `DeviceEnterLeaveEvent` (`dix/events.c:4866`): under an XI2 grab only the
 /// grab client, through the grab's mask; otherwise the selections on
 /// `window`, never propagated.
-fn xi2_crossing_targets(state: &ServerState, window: ResourceId, evtype: u16) -> Vec<ClientId> {
+fn xi2_crossing_targets_for_source(
+    state: &ServerState,
+    window: ResourceId,
+    evtype: u16,
+    slave_deviceid: Option<u16>,
+) -> Vec<ClientId> {
     match state.active_pointer_grab {
         Some(grab) if grab.via_xi2 => client_target_id(state, grab.owner)
             .filter(|_| grab.xi2_mask & (1 << evtype) != 0)
             .into_iter()
             .collect(),
-        _ => compute_xi2_exact_targets(state, window, evtype),
+        _ => compute_xi2_exact_targets_for_source(state, window, evtype, slave_deviceid),
     }
 }
 
@@ -3186,17 +3444,23 @@ pub(crate) fn xi2_master_selectors(
     window: ResourceId,
     evtype: u16,
 ) -> Vec<ClientId> {
-    xi2_form_targets(state, window, Xi2PointerForm::Master, evtype)
+    xi2_form_targets_for_source(state, window, Xi2PointerForm::Master, evtype, None)
 }
 
-fn compute_xi2_exact_targets(
+fn compute_xi2_exact_targets_for_source(
     state: &ServerState,
     window: ResourceId,
     evtype: u16,
+    slave_deviceid: Option<u16>,
 ) -> Vec<ClientId> {
     let mut targets = Vec::new();
-    for form in [Xi2PointerForm::Slave, Xi2PointerForm::Master] {
-        for cid in xi2_form_targets(state, window, form, evtype) {
+    let forms = if slave_deviceid.is_some() {
+        [Some(Xi2PointerForm::Slave), Some(Xi2PointerForm::Master)]
+    } else {
+        [None, Some(Xi2PointerForm::Master)]
+    };
+    for form in forms.into_iter().flatten() {
+        for cid in xi2_form_targets_for_source(state, window, form, evtype, slave_deviceid) {
             if !targets.contains(&cid) {
                 targets.push(cid);
             }
@@ -3205,19 +3469,28 @@ fn compute_xi2_exact_targets(
     targets
 }
 
-fn compute_xi2_targets(
+fn compute_xi2_targets_for_source(
     state: &ServerState,
     target: yserver_protocol::x11::ResourceId,
     _top_level_id: yserver_protocol::x11::ResourceId,
     xi2_evtype: u16,
+    slave_deviceid: Option<u16>,
 ) -> Vec<ClientId> {
     let mut xi2_targets: Vec<ClientId> = Vec::new();
     if xi2_evtype == 0 {
         return xi2_targets;
     }
-    for form in [Xi2PointerForm::Slave, Xi2PointerForm::Master] {
-        if let Some(window) = xi2_route_window(state, target, form, xi2_evtype) {
-            for cid in xi2_form_targets(state, window, form, xi2_evtype) {
+    let forms = if slave_deviceid.is_some() {
+        [Some(Xi2PointerForm::Slave), Some(Xi2PointerForm::Master)]
+    } else {
+        [None, Some(Xi2PointerForm::Master)]
+    };
+    for form in forms.into_iter().flatten() {
+        if let Some(window) =
+            xi2_route_window_for_source(state, target, form, xi2_evtype, slave_deviceid)
+        {
+            for cid in xi2_form_targets_for_source(state, window, form, xi2_evtype, slave_deviceid)
+            {
                 if !xi2_targets.contains(&cid) {
                     xi2_targets.push(cid);
                 }
@@ -3264,25 +3537,54 @@ fn compute_xi2_raw_targets(
 /// Two uses: it picks the deviceid stamped on the delivered XI2 event,
 /// and it decides whether that XI2 event *duplicates* the core event
 /// (only the master form does) and must therefore shadow core delivery.
-fn xi2_stamp_deviceid(
+fn xi2_stamp_deviceid_for_source(
     state: &ServerState,
     cid: ClientId,
     target: ResourceId,
     _top_level: ResourceId,
     evtype: u16,
+    slave_deviceid: Option<u16>,
 ) -> u16 {
     let Some(client) = state.clients.get(&cid.0) else {
         return XI2_MASTER_POINTER_DEVICE_ID;
     };
-    if xi2_route_window(state, target, Xi2PointerForm::Master, evtype)
-        .is_some_and(|window| xi2_form_selected_on(client, window, Xi2PointerForm::Master, evtype))
-    {
+    if xi2_route_window_for_source(
+        state,
+        target,
+        Xi2PointerForm::Master,
+        evtype,
+        slave_deviceid,
+    )
+    .is_some_and(|window| {
+        xi2_form_selected_on_for_source(
+            client,
+            window,
+            Xi2PointerForm::Master,
+            evtype,
+            slave_deviceid,
+        )
+    }) {
         return XI2_MASTER_POINTER_DEVICE_ID;
     }
-    if xi2_route_window(state, target, Xi2PointerForm::Slave, evtype)
-        .is_some_and(|window| xi2_form_selected_on(client, window, Xi2PointerForm::Slave, evtype))
+    if let Some(slave_deviceid) = slave_deviceid
+        && xi2_route_window_for_source(
+            state,
+            target,
+            Xi2PointerForm::Slave,
+            evtype,
+            Some(slave_deviceid),
+        )
+        .is_some_and(|window| {
+            xi2_form_selected_on_for_source(
+                client,
+                window,
+                Xi2PointerForm::Slave,
+                evtype,
+                Some(slave_deviceid),
+            )
+        })
     {
-        return XI2_SLAVE_POINTER_DEVICE_ID;
+        return slave_deviceid;
     }
     XI2_MASTER_POINTER_DEVICE_ID
 }
@@ -3298,20 +3600,51 @@ fn xi2_stamp_deviceid(
 /// handler gates on `deviceid == sourceid`), so a master-only delivery
 /// leaves it unable to scroll (issue #72), while pointer position + the
 /// GDK-style clients read the master form.
-fn xi2_pointer_forms(
+fn xi2_pointer_forms_for_source(
     state: &ServerState,
     cid: ClientId,
     target: ResourceId,
     _top_level: ResourceId,
     evtype: u16,
+    slave_deviceid: Option<u16>,
 ) -> (bool, bool) {
     let Some(client) = state.clients.get(&cid.0) else {
         return (false, false);
     };
-    let master = xi2_route_window(state, target, Xi2PointerForm::Master, evtype)
-        .is_some_and(|window| xi2_form_selected_on(client, window, Xi2PointerForm::Master, evtype));
-    let slave = xi2_route_window(state, target, Xi2PointerForm::Slave, evtype)
-        .is_some_and(|window| xi2_form_selected_on(client, window, Xi2PointerForm::Slave, evtype));
+    let master = xi2_route_window_for_source(
+        state,
+        target,
+        Xi2PointerForm::Master,
+        evtype,
+        slave_deviceid,
+    )
+    .is_some_and(|window| {
+        xi2_form_selected_on_for_source(
+            client,
+            window,
+            Xi2PointerForm::Master,
+            evtype,
+            slave_deviceid,
+        )
+    });
+    let slave = slave_deviceid.is_some_and(|device_id| {
+        xi2_route_window_for_source(
+            state,
+            target,
+            Xi2PointerForm::Slave,
+            evtype,
+            Some(device_id),
+        )
+        .is_some_and(|window| {
+            xi2_form_selected_on_for_source(
+                client,
+                window,
+                Xi2PointerForm::Slave,
+                evtype,
+                Some(device_id),
+            )
+        })
+    });
     (master, slave)
 }
 
@@ -3697,6 +4030,21 @@ mod tests {
         }
     }
 
+    fn source_button_event(
+        kind: PointerEventKind,
+        origin: crate::core_loop::InputOrigin,
+        detail: u8,
+        time: u32,
+    ) -> HostPointerEvent {
+        HostPointerEvent {
+            kind,
+            detail,
+            time,
+            origin,
+            ..motion_event()
+        }
+    }
+
     fn pointer_source(state: &mut ServerState, source: u64, pointer: bool) -> u16 {
         let info = crate::core_loop::DeviceInfo {
             source_id: crate::xinput::InputSourceId(source),
@@ -3742,6 +4090,556 @@ mod tests {
         }
         assert_eq!(offset, bytes.len(), "event stream fully consumed");
         result
+    }
+
+    fn xi2_scroll_values(bytes: &[u8]) -> Vec<(u16, u16, i32)> {
+        let mut result = Vec::new();
+        let mut offset = 0;
+        while offset + 32 <= bytes.len() {
+            assert_eq!(bytes[offset], 35, "expected GenericEvent");
+            let units = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap());
+            let evtype = u16::from_le_bytes(bytes[offset + 8..offset + 10].try_into().unwrap());
+            let deviceid = u16::from_le_bytes(bytes[offset + 10..offset + 12].try_into().unwrap());
+            if evtype == 6 && units == 28 {
+                let sourceid =
+                    u16::from_le_bytes(bytes[offset + 52..offset + 54].try_into().unwrap());
+                let value =
+                    i32::from_le_bytes(bytes[offset + 136..offset + 140].try_into().unwrap());
+                result.push((deviceid, sourceid, value));
+            }
+            offset += 32 + units as usize * 4;
+        }
+        assert_eq!(offset, bytes.len(), "event stream fully consumed");
+        result
+    }
+
+    fn xi1_device_event_ids(bytes: &[u8]) -> Vec<(u8, u8)> {
+        let mut result = Vec::new();
+        let mut offset = 0;
+        while offset + 32 <= bytes.len() {
+            if bytes[offset] == 35 {
+                let units = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap());
+                offset += 32 + units as usize * 4;
+            } else {
+                let event_type = bytes[offset];
+                if (crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_BUTTON_PRESS_OFFSET
+                    ..=crate::server::XI_FIRST_EVENT
+                        + crate::xinput::XI_DEVICE_BUTTON_RELEASE_OFFSET)
+                    .contains(&event_type)
+                {
+                    result.push((event_type, bytes[offset + 31] & 0x7f));
+                }
+                offset += 32;
+            }
+        }
+        assert_eq!(offset, bytes.len(), "event stream fully consumed");
+        result
+    }
+
+    fn select_xi2(state: &mut ServerState, client: u32, device: u16, mask: u64) {
+        state
+            .clients
+            .get_mut(&client)
+            .unwrap()
+            .xi2_masks
+            .insert((ROOT_WINDOW, device), mask);
+    }
+
+    fn select_xi1_button(state: &mut ServerState, client: u32, device: u16, offset: u8) {
+        state
+            .clients
+            .get_mut(&client)
+            .unwrap()
+            .xi1_window_event_classes
+            .entry(ROOT_WINDOW)
+            .or_default()
+            .insert((u32::from(device) << 8) | u32::from(crate::server::XI_FIRST_EVENT + offset));
+    }
+
+    #[test]
+    fn pointer_source_selection_uses_resolved_xi1_and_xi2_facets() {
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        let mut xi2_peer = install_capture_client(&mut state, 1);
+        let mut xi1_peer = install_capture_client(&mut state, 2);
+        let razer = pointer_source(&mut state, 301, true);
+        let hyperx = pointer_source(&mut state, 302, true);
+        assert_eq!((razer, hyperx), (6, 7));
+        select_xi2(&mut state, 1, razer, 1 << 4);
+        select_xi1_button(
+            &mut state,
+            2,
+            hyperx,
+            crate::xinput::XI_DEVICE_BUTTON_PRESS_OFFSET,
+        );
+
+        let dropped = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &HostXidMap::new(),
+            source_button_event(
+                PointerEventKind::ButtonPress,
+                crate::core_loop::InputOrigin::Physical(crate::xinput::InputSourceId(301)),
+                1,
+                1,
+            ),
+            true,
+            false,
+        );
+        assert!(dropped.is_empty());
+        assert_eq!(
+            xi2_event_ids(&read_all_capture_available(&mut xi2_peer)),
+            vec![(4, razer, razer)]
+        );
+        assert!(read_all_capture_available(&mut xi1_peer).is_empty());
+
+        let dropped = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &HostXidMap::new(),
+            source_button_event(
+                PointerEventKind::ButtonPress,
+                crate::core_loop::InputOrigin::Physical(crate::xinput::InputSourceId(302)),
+                1,
+                2,
+            ),
+            true,
+            false,
+        );
+        assert!(dropped.is_empty());
+        assert!(read_all_capture_available(&mut xi2_peer).is_empty());
+        assert_eq!(
+            xi1_device_event_ids(&read_all_capture_available(&mut xi1_peer)),
+            vec![(
+                crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_BUTTON_PRESS_OFFSET,
+                hyperx as u8,
+            )]
+        );
+
+        assert_eq!(state.buttons_down, 1);
+        assert_eq!(state.xi_devices.device(razer).unwrap().buttons_down, 1);
+        assert_eq!(state.xi_devices.device(hyperx).unwrap().buttons_down, 1);
+        assert_eq!(state.sync_pending.len(), 0);
+        assert_eq!(state.xi_devices.devices().len(), 6);
+        assert_eq!(state.unpublished_pointer_buttons_down.len(), 0);
+        assert_eq!(state.scroll_axis_value, [0, 0]);
+        assert_eq!(
+            state
+                .xi_devices
+                .devices()
+                .iter()
+                .map(|device| (device.id, device.buttons_down, device.scroll_axis_values))
+                .collect::<Vec<_>>(),
+            vec![
+                (2, 0, [0, 0]),
+                (3, 0, [0, 0]),
+                (4, 0, [0, 0]),
+                (5, 0, [0, 0]),
+                (razer, 1, [0, 0]),
+                (hyperx, 1, [0, 0]),
+            ],
+            "unrelated devices and facets keep their own state"
+        );
+    }
+
+    #[test]
+    fn pointer_source_selection_aggregates_holds_and_preserves_slave_release_cookies() {
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        let mut peer = install_capture_client(&mut state, 1);
+        let razer = pointer_source(&mut state, 311, true);
+        let hyperx = pointer_source(&mut state, 312, true);
+        let device_mask = (1 << 4) | (1 << 5);
+        for device in [2, 4, razer, hyperx] {
+            select_xi2(&mut state, 1, device, device_mask);
+        }
+
+        macro_rules! send {
+            ($event:expr) => {{
+                let dropped = pointer_event_fanout_to_state(
+                    &mut state,
+                    &mut backend,
+                    &HostXidMap::new(),
+                    $event,
+                    true,
+                    false,
+                );
+                assert!(dropped.is_empty());
+                xi2_event_ids(&read_all_capture_available(&mut peer))
+            }};
+        }
+
+        assert_eq!(
+            send!(source_button_event(
+                PointerEventKind::ButtonPress,
+                crate::core_loop::InputOrigin::Physical(crate::xinput::InputSourceId(311)),
+                1,
+                1,
+            )),
+            vec![(4, razer, razer), (4, 2, razer)]
+        );
+        assert!(
+            send!(source_button_event(
+                PointerEventKind::ButtonPress,
+                crate::core_loop::InputOrigin::Physical(crate::xinput::InputSourceId(311)),
+                1,
+                11,
+            ))
+            .is_empty(),
+            "a duplicate press from one slave is ignored"
+        );
+        assert_eq!(
+            send!(source_button_event(
+                PointerEventKind::ButtonPress,
+                crate::core_loop::InputOrigin::Physical(crate::xinput::InputSourceId(312)),
+                1,
+                2,
+            )),
+            vec![(4, hyperx, hyperx)],
+            "a second attached slave keeps its event, but the master press is duplicate"
+        );
+        assert_eq!(state.buttons_down, 1);
+        assert_eq!(state.xi_devices.device(razer).unwrap().buttons_down, 1);
+        assert_eq!(state.xi_devices.device(hyperx).unwrap().buttons_down, 1);
+
+        // A virtual XTEST click takes its own slave hold during the physical
+        // drag. It cannot create another master press, and it keeps the
+        // master down when the first physical source releases.
+        assert_eq!(
+            send!(source_button_event(
+                PointerEventKind::ButtonPress,
+                crate::core_loop::InputOrigin::XTest(4),
+                1,
+                3,
+            )),
+            vec![(4, 4, 4)]
+        );
+        assert_eq!(
+            send!(source_button_event(
+                PointerEventKind::ButtonRelease,
+                crate::core_loop::InputOrigin::Physical(crate::xinput::InputSourceId(311)),
+                1,
+                4,
+            )),
+            vec![(5, razer, razer)],
+            "the per-slave release cookie survives while master release is suppressed"
+        );
+        assert!(
+            send!(source_button_event(
+                PointerEventKind::ButtonRelease,
+                crate::core_loop::InputOrigin::Physical(crate::xinput::InputSourceId(311)),
+                1,
+                41,
+            ))
+            .is_empty(),
+            "a duplicate release from one slave is ignored"
+        );
+        assert_eq!(state.buttons_down, 1);
+        assert_eq!(state.xi_devices.device(razer).unwrap().buttons_down, 0);
+        assert_eq!(state.xi_devices.device(hyperx).unwrap().buttons_down, 1);
+        assert_eq!(state.xi_devices.device(4).unwrap().buttons_down, 1);
+
+        // Removing Razer drops only its source state; HyperX and XTEST remain
+        // attached holders, so unplugging one mouse cannot release the drag.
+        assert_eq!(
+            state.xi_unregister_source(crate::xinput::InputSourceId(311)),
+            vec![razer]
+        );
+        assert!(state.xi_devices.device(razer).is_none());
+        assert_eq!(state.xi_devices.device(hyperx).unwrap().buttons_down, 1);
+        assert_eq!(state.xi_devices.device(4).unwrap().buttons_down, 1);
+        assert_eq!(state.buttons_down, 1);
+
+        assert_eq!(
+            send!(source_button_event(
+                PointerEventKind::ButtonRelease,
+                crate::core_loop::InputOrigin::Physical(crate::xinput::InputSourceId(312)),
+                1,
+                5,
+            )),
+            vec![(5, hyperx, hyperx)]
+        );
+        assert_eq!(state.buttons_down, 1);
+        assert_eq!(
+            send!(source_button_event(
+                PointerEventKind::ButtonRelease,
+                crate::core_loop::InputOrigin::XTest(4),
+                1,
+                6,
+            )),
+            vec![(5, 4, 4), (5, 2, 4)],
+            "the final attached holder releases the master button"
+        );
+        assert_eq!(state.buttons_down, 0);
+        assert_eq!(state.xi_devices.device(hyperx).unwrap().buttons_down, 0);
+        assert_eq!(state.xi_devices.device(4).unwrap().buttons_down, 0);
+        assert_eq!(state.sync_pending.len(), 0);
+        assert_eq!(state.xi_devices.devices().len(), 5);
+        assert!(
+            state
+                .xi_devices
+                .source(crate::xinput::InputSourceId(311))
+                .is_none()
+        );
+        assert!(
+            state
+                .xi_devices
+                .facet(
+                    crate::xinput::InputSourceId(311),
+                    crate::xinput::XiFacetKind::PointerTouch
+                )
+                .is_none()
+        );
+        assert!(
+            state
+                .xi_devices
+                .source(crate::xinput::InputSourceId(312))
+                .is_some()
+        );
+        assert!(state.unpublished_pointer_buttons_down.is_empty());
+        assert_eq!(state.scroll_axis_value, [0, 0]);
+        assert_eq!(
+            state
+                .xi_devices
+                .devices()
+                .iter()
+                .map(|device| (device.id, device.buttons_down, device.scroll_axis_values))
+                .collect::<Vec<_>>(),
+            vec![
+                (2, 0, [0, 0]),
+                (3, 0, [0, 0]),
+                (4, 0, [0, 0]),
+                (5, 0, [0, 0]),
+                (hyperx, 0, [0, 0]),
+            ],
+            "the removed source leaves no state and unrelated devices stay clear"
+        );
+    }
+
+    #[test]
+    fn pointer_source_selection_keeps_scroll_values_and_stops_per_source() {
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        let mut peer = install_capture_client(&mut state, 1);
+        let razer = pointer_source(&mut state, 321, true);
+        let hyperx = pointer_source(&mut state, 322, true);
+        select_xi2(&mut state, 1, razer, 1 << 6);
+        select_xi2(&mut state, 1, hyperx, 1 << 6);
+
+        for (source, count) in [(321, 2), (322, 1)] {
+            for n in 0..count {
+                let dropped = pointer_event_fanout_to_state(
+                    &mut state,
+                    &mut backend,
+                    &HostXidMap::new(),
+                    source_button_event(
+                        PointerEventKind::ButtonPress,
+                        crate::core_loop::InputOrigin::Physical(crate::xinput::InputSourceId(
+                            source,
+                        )),
+                        5,
+                        source as u32 + n as u32,
+                    ),
+                    true,
+                    false,
+                );
+                assert!(dropped.is_empty());
+                let _ = read_all_capture_available(&mut peer);
+                let dropped = pointer_event_fanout_to_state(
+                    &mut state,
+                    &mut backend,
+                    &HostXidMap::new(),
+                    source_button_event(
+                        PointerEventKind::ButtonRelease,
+                        crate::core_loop::InputOrigin::Physical(crate::xinput::InputSourceId(
+                            source,
+                        )),
+                        5,
+                        source as u32 + n as u32,
+                    ),
+                    true,
+                    false,
+                );
+                assert!(dropped.is_empty());
+                let _ = read_all_capture_available(&mut peer);
+            }
+        }
+        assert_eq!(
+            state.xi_devices.device(razer).unwrap().scroll_axis_values,
+            [2, 0]
+        );
+        assert_eq!(
+            state.xi_devices.device(hyperx).unwrap().scroll_axis_values,
+            [1, 0]
+        );
+        assert_eq!(state.scroll_axis_value, [3, 0]);
+
+        for (source, device, expected) in [(321, razer, 2), (322, hyperx, 1)] {
+            crate::core_loop::pointer_fanout::emit_scroll_stop_to_state(
+                &mut state,
+                &HostXidMap::new(),
+                crate::core_loop::InputOrigin::Physical(crate::xinput::InputSourceId(source)),
+                0,
+                10,
+                20,
+                0,
+                source as u32,
+            );
+            assert_eq!(
+                xi2_scroll_values(&read_all_capture_available(&mut peer)),
+                vec![(device, device, expected), (device, device, 0)],
+                "scroll stop uses the selected source's cumulative valuator"
+            );
+            assert_eq!(
+                state.xi_devices.device(device).unwrap().scroll_axis_values[0],
+                expected
+            );
+        }
+        assert_eq!(state.xi_devices.device(razer).unwrap().buttons_down, 0);
+        assert_eq!(state.xi_devices.device(hyperx).unwrap().buttons_down, 0);
+        assert_eq!(state.buttons_down, 0);
+        assert_eq!(state.sync_pending.len(), 0);
+        assert_eq!(state.xi_devices.devices().len(), 6);
+        assert_eq!(state.scroll_axis_value, [3, 0]);
+        assert!(state.unpublished_pointer_buttons_down.is_empty());
+        assert_eq!(
+            state
+                .xi_devices
+                .devices()
+                .iter()
+                .map(|device| (device.id, device.buttons_down, device.scroll_axis_values))
+                .collect::<Vec<_>>(),
+            vec![
+                (2, 0, [0, 0]),
+                (3, 0, [0, 0]),
+                (4, 0, [0, 0]),
+                (5, 0, [0, 0]),
+                (razer, 0, [2, 0]),
+                (hyperx, 0, [1, 0]),
+            ],
+            "each source retains its own valuator state"
+        );
+    }
+
+    #[test]
+    fn pointer_source_selection_unpublished_source_tracks_its_own_hold() {
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        let mut peer = install_capture_client(&mut state, 1);
+        for source in 2000..2122 {
+            assert_ne!(pointer_source(&mut state, source, true), 0);
+        }
+        let unpublished = crate::xinput::InputSourceId(330);
+        assert_eq!(pointer_source(&mut state, unpublished.0, true), 0);
+        select_xi2(&mut state, 1, 2, 1 << 4 | 1 << 5);
+        select_xi2(&mut state, 1, 4, 1 << 4 | 1 << 5);
+
+        for (kind, origin, expected) in [
+            (
+                PointerEventKind::ButtonPress,
+                crate::core_loop::InputOrigin::Physical(unpublished),
+                vec![(4, 2, 2)],
+            ),
+            (
+                PointerEventKind::ButtonPress,
+                crate::core_loop::InputOrigin::XTest(4),
+                vec![(4, 4, 4)],
+            ),
+            (
+                PointerEventKind::ButtonRelease,
+                crate::core_loop::InputOrigin::Physical(unpublished),
+                Vec::new(),
+            ),
+            (
+                PointerEventKind::ButtonRelease,
+                crate::core_loop::InputOrigin::XTest(4),
+                vec![(5, 4, 4), (5, 2, 4)],
+            ),
+        ] {
+            let dropped = pointer_event_fanout_to_state(
+                &mut state,
+                &mut backend,
+                &HostXidMap::new(),
+                source_button_event(kind, origin, 1, 1),
+                true,
+                false,
+            );
+            assert!(dropped.is_empty());
+            assert_eq!(
+                xi2_event_ids(&read_all_capture_available(&mut peer)),
+                expected
+            );
+        }
+        assert_eq!(
+            state.unpublished_pointer_buttons_down.get(&unpublished),
+            None
+        );
+        assert_eq!(state.buttons_down, 0);
+        assert_eq!(state.xi_devices.devices().len(), 126);
+        assert_eq!(state.xi_devices.device(4).unwrap().buttons_down, 0);
+        assert_eq!(state.sync_pending.len(), 0);
+        assert!(state.xi_devices.source(unpublished).is_some());
+        assert!(
+            state
+                .xi_devices
+                .facet(unpublished, crate::xinput::XiFacetKind::PointerTouch)
+                .is_none()
+        );
+        assert_eq!(state.buttons_down, 0);
+        assert!(
+            state
+                .xi_devices
+                .devices()
+                .iter()
+                .all(|device| device.buttons_down == 0)
+        );
+        assert!(
+            state
+                .xi_devices
+                .devices()
+                .iter()
+                .all(|device| device.scroll_axis_values == [0, 0])
+        );
+    }
+
+    #[test]
+    fn replayed_pointer_press_records_held_state_until_release() {
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::default();
+        let origin = crate::core_loop::InputOrigin::XTest(4);
+        let press = source_button_event(PointerEventKind::ButtonPress, origin, 1, 1);
+
+        let _ = replay_frozen_pointer_event_to_state(
+            &mut state,
+            &mut backend,
+            &HostXidMap::new(),
+            press,
+        );
+        assert_eq!(
+            state.buttons_down, 1,
+            "replayed press marks the master button down"
+        );
+        assert_eq!(
+            state.xi_devices.device(4).unwrap().buttons_down,
+            1,
+            "replayed press marks its generating XI device down"
+        );
+
+        let release = source_button_event(PointerEventKind::ButtonRelease, origin, 1, 2);
+        let _ = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &HostXidMap::new(),
+            release,
+            true,
+            false,
+        );
+        assert_eq!(state.buttons_down, 0, "release leaves the master button up");
+        assert_eq!(
+            state.xi_devices.device(4).unwrap().buttons_down,
+            0,
+            "release leaves its generating XI device up"
+        );
     }
 
     #[test]
@@ -4100,6 +4998,13 @@ mod tests {
         rel.event_x = 20;
         rel.event_y = 20;
 
+        let mut press = rel;
+        press.kind = PointerEventKind::ButtonPress;
+        press.state = 0;
+        let _ =
+            pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
+        let _ = read_all_available(&mut gc_peer);
+
         let _ = pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, rel, true, false);
 
         let bytes = read_all_available(&mut gc_peer);
@@ -4192,6 +5097,13 @@ mod tests {
         release.root_y = 20;
         release.event_x = 10;
         release.event_y = 10;
+
+        let mut press = release;
+        press.kind = PointerEventKind::ButtonPress;
+        press.state = 0;
+        let _ =
+            pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
+        let _ = read_all_available(&mut owner_peer);
 
         let _ =
             pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, release, true, false);
@@ -6450,22 +7362,22 @@ mod tests {
         // client 4: no XI2 selection at all.
 
         assert_eq!(
-            xi2_stamp_deviceid(&state, ClientId(1), win, win, 4),
+            xi2_stamp_deviceid_for_source(&state, ClientId(1), win, win, 4, Some(4)),
             XI2_SLAVE_POINTER_DEVICE_ID,
             "slave-device selector must stay slave (keeps core delivery)"
         );
         assert_eq!(
-            xi2_stamp_deviceid(&state, ClientId(2), win, win, 4),
+            xi2_stamp_deviceid_for_source(&state, ClientId(2), win, win, 4, Some(4)),
             XI2_MASTER_POINTER_DEVICE_ID,
             "master-device selector must be master (stays deduped)"
         );
         assert_eq!(
-            xi2_stamp_deviceid(&state, ClientId(3), win, win, 4),
+            xi2_stamp_deviceid_for_source(&state, ClientId(3), win, win, 4, Some(4)),
             XI2_MASTER_POINTER_DEVICE_ID,
             "XIAllMasterDevices selector classifies as master"
         );
         assert_eq!(
-            xi2_stamp_deviceid(&state, ClientId(4), win, win, 4),
+            xi2_stamp_deviceid_for_source(&state, ClientId(4), win, win, 4, Some(4)),
             XI2_MASTER_POINTER_DEVICE_ID,
             "no XI2 selection defaults to master"
         );
@@ -6505,7 +7417,7 @@ mod tests {
         // XI_ButtonPress (4) is selected ONLY under XIAllDevices(0). Under
         // the old first-match semantics device 1 matched first and had no
         // button bit -> empty targets -> the click reached no client.
-        let press_targets = compute_xi2_targets(&state, window, window, 4);
+        let press_targets = compute_xi2_targets_for_source(&state, window, window, 4, Some(4));
         assert!(
             press_targets.contains(&ClientId(11)),
             "issue #72: XI_ButtonPress selected under XIAllDevices(0) must be \
@@ -6513,7 +7425,7 @@ mod tests {
         );
 
         // XI_ButtonRelease (5) is likewise only under XIAllDevices(0).
-        let release_targets = compute_xi2_targets(&state, window, window, 5);
+        let release_targets = compute_xi2_targets_for_source(&state, window, window, 5, Some(4));
         assert!(
             release_targets.contains(&ClientId(11)),
             "issue #72: XI_ButtonRelease under XIAllDevices(0) must be delivered"
@@ -6521,7 +7433,7 @@ mod tests {
 
         // Sanity: XI_Motion (6) — selected under BOTH wildcards — still
         // reaches the client (this arm passed even under first-match).
-        let motion_targets = compute_xi2_targets(&state, window, window, 6);
+        let motion_targets = compute_xi2_targets_for_source(&state, window, window, 6, Some(4));
         assert!(
             motion_targets.contains(&ClientId(11)),
             "XI_Motion must continue to be delivered"
@@ -6560,13 +7472,13 @@ mod tests {
         // core issue-#72 fix: it was false under master-only bucketing.
         set_masks(&mut state, &[(1u16, 0x381c_00c0u32), (0u16, 0x19f2u32)]);
         assert_eq!(
-            xi2_pointer_forms(&state, ClientId(11), win, win, MOTION),
+            xi2_pointer_forms_for_source(&state, ClientId(11), win, win, MOTION, Some(4)),
             (true, true),
             "issue #72: an XIAllDevices(0) selector must get BOTH forms for \
              Motion so SDL3 can parse smooth scroll off the slave-stamped motion"
         );
         assert_eq!(
-            xi2_pointer_forms(&state, ClientId(11), win, win, BUTTON_PRESS),
+            xi2_pointer_forms_for_source(&state, ClientId(11), win, win, BUTTON_PRESS, Some(4)),
             (true, true),
             "ButtonPress selected under XIAllDevices(0) must also yield BOTH forms"
         );
@@ -6575,7 +7487,7 @@ mod tests {
         // covers master devices only, so master form yes, slave form no.
         set_masks(&mut state, &[(1u16, 0x0000_0040u32)]);
         assert_eq!(
-            xi2_pointer_forms(&state, ClientId(11), win, win, MOTION),
+            xi2_pointer_forms_for_source(&state, ClientId(11), win, win, MOTION, Some(4)),
             (true, false),
             "XIAllMasterDevices(1) covers master devices only: master form, NO slave form"
         );
@@ -6584,7 +7496,7 @@ mod tests {
         // slave form yes, master form no; preserves core delivery.
         set_masks(&mut state, &[(XI2_SLAVE_POINTER_DEVICE_ID, 0x0000_0040u32)]);
         assert_eq!(
-            xi2_pointer_forms(&state, ClientId(11), win, win, MOTION),
+            xi2_pointer_forms_for_source(&state, ClientId(11), win, win, MOTION, Some(4)),
             (false, true),
             "a concrete slave-pointer selector gets the slave form only"
         );
@@ -6593,7 +7505,7 @@ mod tests {
         // slave, so both forms.
         set_masks(&mut state, &[(0u16, 0x0000_0040u32)]);
         assert_eq!(
-            xi2_pointer_forms(&state, ClientId(11), win, win, MOTION),
+            xi2_pointer_forms_for_source(&state, ClientId(11), win, win, MOTION, Some(4)),
             (true, true),
             "XIAllDevices(0) matches both master and slave: BOTH forms"
         );

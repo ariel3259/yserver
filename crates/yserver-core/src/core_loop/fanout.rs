@@ -466,6 +466,13 @@ pub fn emit_xi2_device_changed_slave_pointer(
 /// both XIQueryDevice and DeviceChanged use it so their class blocks remain
 /// byte-identical for little-endian clients.
 pub(crate) fn build_slave_pointer_class_block(state: &mut ServerState) -> (Vec<u8>, u16) {
+    build_pointer_class_block_for_device(state, crate::xinput::DEVICEID_SLAVE_POINTER)
+}
+
+pub(crate) fn build_pointer_class_block_for_device(
+    state: &mut ServerState,
+    device_id: u16,
+) -> (Vec<u8>, u16) {
     let class_data = crate::xinput::query::XiQueryClassData {
         button_labels: [
             state.atoms.intern("Button Left", false),
@@ -486,11 +493,18 @@ pub(crate) fn build_slave_pointer_class_block(state: &mut ServerState) -> (Vec<u
             i32::from(state.randr.screen_width) / 2,
             i32::from(state.randr.screen_height) / 2,
         ),
-        scroll: state.scroll_axis_value,
+        scroll: if device_id == crate::xinput::DEVICEID_MASTER_POINTER {
+            state.scroll_axis_value
+        } else {
+            state
+                .xi_devices
+                .device(device_id)
+                .map_or(state.scroll_axis_value, |device| device.scroll_axis_values)
+        },
     };
     crate::xinput::query::build_pointer_classes(
         ClientByteOrder::LittleEndian,
-        crate::xinput::DEVICEID_SLAVE_POINTER,
+        device_id,
         class_data,
     )
 }

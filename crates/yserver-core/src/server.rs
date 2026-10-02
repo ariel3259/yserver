@@ -1408,6 +1408,10 @@ pub struct ServerState {
     /// reads the cumulative value off each XI_Motion-with-scroll-
     /// axis event and computes deltas from the previous sample.
     pub scroll_axis_value: [i32; 2],
+    /// Buttons held by physical pointer sources whose facets could not be
+    /// published because XI device IDs were exhausted. These sources still
+    /// participate in the attached master pointer's button aggregation.
+    pub unpublished_pointer_buttons_down: HashMap<crate::xinput::InputSourceId, u16>,
     /// Installed colormaps in install order (oldest first). Capacity
     /// is the server's max installed minimum; we only have a single
     /// hardware colormap (TrueColor) so the list mostly mirrors the
@@ -1710,6 +1714,7 @@ impl ServerState {
             cow_claims: Vec::new(),
             cow_teardown_failed: false,
             scroll_axis_value: [0; 2],
+            unpublished_pointer_buttons_down: HashMap::new(),
             installed_colormaps: vec![crate::resources::ROOT_COLORMAP],
             xi_devices,
             xtest_device_atom,

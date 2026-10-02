@@ -43,7 +43,18 @@ pub(crate) fn encode_reply(
     for device in devices {
         let (use_type, attachment, class) = device_descriptor(device)?;
         let (classes, num_classes) = match class {
-            DeviceClass::Pointer => build_pointer_classes(byte_order, device.id, class_data),
+            DeviceClass::Pointer => build_pointer_classes(
+                byte_order,
+                device.id,
+                if device.id == super::DEVICEID_MASTER_POINTER {
+                    class_data
+                } else {
+                    XiQueryClassData {
+                        scroll: device.scroll_axis_values,
+                        ..class_data
+                    }
+                },
+            ),
             DeviceClass::Keyboard => write_key_class(byte_order, device.id),
         };
         write_device_info(

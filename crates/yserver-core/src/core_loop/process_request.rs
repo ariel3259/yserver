@@ -63608,6 +63608,15 @@ mod tests {
                 .any(|p| p.device == crate::xinput::DEVICEID_SLAVE_POINTER)
         );
         assert!(state.active_pointer_grab.is_none());
+        assert_eq!(
+            state.buttons_down, 0,
+            "replayed press and queued release leave the master clear"
+        );
+        assert_eq!(
+            state.xi_devices.device(4).unwrap().buttons_down,
+            0,
+            "replayed press and queued release leave XTEST 4 clear"
+        );
 
         // Grab owner must not receive the replayed events (they go to
         // the natural target).
@@ -65184,6 +65193,22 @@ mod tests {
             tree_change: false,
         };
         let xid_map = backend.xid_map().clone();
+        let press = HostPointerEvent {
+            kind: PointerEventKind::ButtonPress,
+            state: 0,
+            ..release
+        };
+        let _dropped =
+            pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
+        let _ = read_all_available(&mut grab_peer);
+        let _ = read_all_available(&mut other_peer);
+        grab_peer
+            .set_nonblocking(true)
+            .expect("restore grab peer mode");
+        other_peer
+            .set_nonblocking(true)
+            .expect("restore other peer mode");
+
         let _dropped =
             pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, release, true, false);
 
@@ -83076,6 +83101,15 @@ mod tests {
         assert!(
             state.active_pointer_grab.is_none(),
             "release completes the click — implicit grab torn down"
+        );
+        assert_eq!(
+            state.buttons_down, 0,
+            "the queued release leaves the master clear"
+        );
+        assert_eq!(
+            state.xi_devices.device(4).unwrap().buttons_down,
+            0,
+            "the queued release leaves XTEST 4 clear"
         );
     }
 
