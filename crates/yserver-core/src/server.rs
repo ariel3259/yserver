@@ -634,11 +634,7 @@ pub struct ActivePointerGrab {
     pub xi2_mask: u64,
 }
 
-/// XComposite redirect mode. Both wire constants are accepted —
-/// `Automatic` (update=0) and `Manual` (update=1) — but the
-/// redirected-backing pixmap path is unimplemented, so no code
-/// currently branches on the variant. The record's presence is what
-/// `NameWindowPixmap` and the disconnect-cleanup paths consult.
+/// XComposite redirect mode: `Automatic` (update=0) or `Manual` (update=1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompositeRedirectMode {
     Manual,
@@ -889,13 +885,11 @@ impl Default for PointerControlState {
     }
 }
 
-/// Per-window XComposite redirect record stored in
-/// [`ServerState::composite_redirects`]. The `owner` is the client
-/// that issued the `RedirectWindow` / `RedirectSubwindows` — used
-/// by the dispatch layer for `BadAccess` conflict detection and by
-/// `process_disconnect` to tear down redirects belonging to a
-/// departing client (L2 task B.1b).
-#[derive(Debug, Clone, Copy)]
+/// One client's XComposite redirect (Xorg `CompClientWindowRec`), kept in
+/// [`ServerState::composite_redirects`]. The `owner` is the client that
+/// issued the `RedirectWindow` / `RedirectSubwindows`; its records go with
+/// it at disconnect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RedirectRecord {
     pub mode: CompositeRedirectMode,
     pub owner: ClientId,
@@ -1228,7 +1222,7 @@ pub struct ServerState {
     /// output is allowed to drain, the core asks the backend to submit that
     /// drawing so an external compositor cannot sample ahead of it.
     pub damage_notify_flush_pending: bool,
-    pub composite_redirects: HashMap<(ResourceId, bool), RedirectRecord>,
+    pub composite_redirects: crate::composite_redirects::CompositeRedirects,
     pub present_event_selections: HashMap<u32, PresentEventSelection>,
     /// `PresentNotifyMSC` requests parked for a future MSC, fired when a
     /// pageflip advances past their target (`drain_present_completions`).
@@ -1658,7 +1652,7 @@ impl ServerState {
             sync_fences: HashMap::new(),
             damage_objects: HashMap::new(),
             damage_notify_flush_pending: false,
-            composite_redirects: HashMap::new(),
+            composite_redirects: crate::composite_redirects::CompositeRedirects::default(),
             present_event_selections: HashMap::new(),
             present_pending_msc: Vec::new(),
             present_next_id: 1,
@@ -2554,23 +2548,9 @@ pub struct EventTarget {
 }
 
 impl ServerState {
-    /// Stage 4e — set the COW's input shape to empty (click-through) at
-    /// materialization. Mirrors Xorg's compositor convention where the
-    /// COW's default input region passes pointer events through to
-    /// underlying root children, with descendants like the compositor's
-    /// stage receiving input directly.
-    ///
-    /// Pairs with `ResourceTable::materialize_cow_resource` — both run
-    /// from the `GetOverlayWindow` handler on the 0→1 transition.
-    pub fn materialize_cow_input_shape(&mut self) {
-        self.shape_windows
-            .entry(COMPOSITE_OVERLAY_WINDOW)
-            .or_default()
-            .input = Some(Vec::<xfixes::RegionRect>::new());
-    }
-
-    /// Symmetric teardown for [`Self::materialize_cow_input_shape`]. Called
-    /// from the `ReleaseOverlayWindow` handler on the 1→0 transition.
+    /// Drop the COW's shapes with the overlay: Xorg frees them in
+    /// DeleteWindow, so the next overlay starts unshaped. Called from the
+    /// `ReleaseOverlayWindow` handler on the 1→0 transition.
     pub fn destroy_cow_input_shape(&mut self) {
         self.shape_windows.remove(&COMPOSITE_OVERLAY_WINDOW);
     }
@@ -2608,6 +2588,111 @@ impl ServerState {
     pub fn direct_child_at(&self, parent: ResourceId, x: i16, y: i16) -> Option<ResourceId> {
         self.hit_test_children(parent, x, y)
             .map(|(child, _, _)| child)
+    }
+
+    /// The child CirculateWindow restacks — Xorg `CirculateWindow`
+    /// (`dix/window.c:2443`): RaiseLowest (0) takes the lowest mapped child a
+    /// mapped sibling above overlaps, LowerHighest (1) the highest mapped
+    /// child that overlaps a mapped sibling below. The overlay window stays
+    /// out of it, capped on top.
+    #[must_use]
+    pub fn circulate_candidate(&self, parent: ResourceId, direction: u8) -> Option<ResourceId> {
+        let kids: Vec<ResourceId> = self
+            .resources
+            .children(parent)
+            .iter()
+            .copied()
+            .filter(|w| *w != crate::resources::COMPOSITE_OVERLAY_WINDOW)
+            .collect();
+        let mapped = |w: ResourceId| {
+            self.resources
+                .window(w)
+                .is_some_and(|w| w.map_state != crate::resources::MapState::Unmapped)
+        };
+        let overlaps_any = |w: ResourceId, others: &[ResourceId]| {
+            others
+                .iter()
+                .any(|s| mapped(*s) && self.siblings_overlap(w, *s))
+        };
+        if direction == 0 {
+            (0..kids.len())
+                .find(|&i| mapped(kids[i]) && overlaps_any(kids[i], &kids[i + 1..]))
+                .map(|i| kids[i])
+        } else {
+            (0..kids.len())
+                .rev()
+                .find(|&i| mapped(kids[i]) && overlaps_any(kids[i], &kids[..i]))
+                .map(|i| kids[i])
+        }
+    }
+
+    /// Xorg `BOXES_OVERLAP` of two siblings' border-inclusive extents, cut by
+    /// their bounding shapes (`ShapeOverlap`, `dix/window.c:1975`).
+    fn siblings_overlap(&self, a: ResourceId, b: ResourceId) -> bool {
+        let (ra, rb) = (self.sibling_region(a), self.sibling_region(b));
+        ra.iter().any(|p| {
+            rb.iter()
+                .any(|q| p.0 < q.2 && q.0 < p.2 && p.1 < q.3 && q.1 < p.3)
+        })
+    }
+
+    /// A window's bounding region in its parent's coordinates, as
+    /// `(x1, y1, x2, y2)` boxes.
+    fn sibling_region(&self, window: ResourceId) -> Vec<(i32, i32, i32, i32)> {
+        let Some(w) = self.resources.window(window) else {
+            return Vec::new();
+        };
+        let bw = i32::from(w.border_width);
+        let (x1, y1) = (i32::from(w.x), i32::from(w.y));
+        let (x2, y2) = (
+            x1 + i32::from(w.width) + 2 * bw,
+            y1 + i32::from(w.height) + 2 * bw,
+        );
+        let Some(shape) = self
+            .shape_windows
+            .get(&window)
+            .and_then(|s| s.bounding.as_ref())
+        else {
+            return vec![(x1, y1, x2, y2)];
+        };
+        let (ox, oy) = (x1 + bw, y1 + bw);
+        shape
+            .iter()
+            .map(|r| {
+                let (rx, ry) = (ox + i32::from(r.x), oy + i32::from(r.y));
+                (
+                    rx.max(x1),
+                    ry.max(y1),
+                    (rx + i32::from(r.width)).min(x2),
+                    (ry + i32::from(r.height)).min(y2),
+                )
+            })
+            .filter(|b| b.0 < b.2 && b.1 < b.3)
+            .collect()
+    }
+
+    /// The `focus` flag of a crossing on `window` (core and XI2): the core
+    /// focus is PointerRoot, or `window` or one of its ancestors (Xorg
+    /// `CoreEnterLeaveEvent` / `DeviceEnterLeaveEvent`, `dix/events.c:4772`).
+    #[must_use]
+    pub fn crossing_has_focus(&self, window: ResourceId) -> bool {
+        match self.core_focus.raw {
+            0 => false,
+            1 => true,
+            focus => {
+                let mut current = window;
+                for _ in 0..256 {
+                    if current.0 == focus {
+                        return true;
+                    }
+                    match self.resources.window(current) {
+                        Some(w) if w.parent != current => current = w.parent,
+                        _ => return false,
+                    }
+                }
+                false
+            }
+        }
     }
 
     #[must_use]
@@ -2650,13 +2735,9 @@ impl ServerState {
     ) -> Option<(ResourceId, i16, i16)> {
         // Strict-Xorg miSpriteTrace: iterate children top-to-bottom and
         // let hit_test_child's window_input_contains gate decide each one.
-        // The COW is no longer special once it's a real root child
-        // (Phase 2 materialization). With its default empty input shape,
-        // hit_test_child(COW) returns None and the trace continues to
-        // the next sibling — exactly matching Xorg's mi/misprite.c.
-        // When a compositor populates the COW input region via XFIXES,
-        // the gate descends naturally via pointer_target_at_inner's
-        // recursive walk.
+        // The COW is no special case: like Xorg's it is created unshaped,
+        // so it takes the pointer until the compositor empties its input
+        // region, and the trace then continues to the next sibling.
         let parent_window = self.resources.window(parent)?;
         for child_id in parent_window.children.iter().rev() {
             if let Some(hit) = self.hit_test_child(*child_id, x, y) {
@@ -2709,23 +2790,26 @@ impl ServerState {
         Some((child_id, child_x, child_y))
     }
 
+    /// Xorg `miSpriteTrace` (`mi/miwindow.c:767`): a set bounding shape
+    /// (`PointInBorderSize`) and a set input shape must both hold the point.
     fn window_input_contains(&self, window: ResourceId, x: i16, y: i16) -> bool {
-        let Some(rects) = self
-            .shape_windows
-            .get(&window)
-            .and_then(|state| state.input.as_ref())
-        else {
+        let Some(shape) = self.shape_windows.get(&window) else {
             return true;
         };
-        rects.iter().any(|rect| {
-            let rx = i32::from(rect.x);
-            let ry = i32::from(rect.y);
-            let rr = rx + i32::from(rect.width);
-            let rb = ry + i32::from(rect.height);
-            let px = i32::from(x);
-            let py = i32::from(y);
-            px >= rx && py >= ry && px < rr && py < rb
-        })
+        let holds = |rects: &Option<Vec<xfixes::RegionRect>>| {
+            rects.as_ref().is_none_or(|rects| {
+                rects.iter().any(|rect| {
+                    let rx = i32::from(rect.x);
+                    let ry = i32::from(rect.y);
+                    let rr = rx + i32::from(rect.width);
+                    let rb = ry + i32::from(rect.height);
+                    let px = i32::from(x);
+                    let py = i32::from(y);
+                    px >= rx && py >= ry && px < rr && py < rb
+                })
+            })
+        };
+        holds(&shape.bounding) && holds(&shape.input)
     }
 
     /// Diagnostic label for a window: `0x<id>[<WM_CLASS>]`. WM_CLASS is
@@ -3535,6 +3619,7 @@ fn pointer_event_fanout_inner(
         }
         Err(_) => return,
     };
+    let focus = state.lock().is_ok_and(|g| g.crossing_has_focus(nested_id));
 
     for target in core_targets {
         let seq = SequenceNumber(target.last_sequence.load(Ordering::Relaxed));
@@ -3607,6 +3692,7 @@ fn pointer_event_fanout_inner(
                     state: event.state,
                     detail: event.detail,
                     mode: event.crossing_mode,
+                    focus,
                 },
             ),
             PointerEventKind::LeaveNotify => x11::encode_leave_notify_event(
@@ -3625,6 +3711,7 @@ fn pointer_event_fanout_inner(
                     state: event.state,
                     detail: event.detail,
                     mode: event.crossing_mode,
+                    focus,
                 },
             ),
         }
@@ -3683,6 +3770,7 @@ fn pointer_event_fanout_inner(
                 0,
                 0,
                 2,
+                focus,
             );
         } else {
             // Pre-D3 legacy emitter (state.fanout_pointer). Mirror the
@@ -4507,6 +4595,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             },
         );
 
@@ -4670,6 +4759,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             },
         );
 
@@ -4834,6 +4924,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             },
         );
 
@@ -4955,6 +5046,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             },
         );
 
@@ -5079,6 +5171,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             },
         );
 
@@ -5114,6 +5207,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             },
         );
         let a_read2 = a_reader_remote.read(&mut buf);
@@ -5177,6 +5271,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             },
         );
 
@@ -5492,10 +5587,15 @@ mod tests {
         );
         let _ = state.resources.map_window(sib);
 
-        // Materialize COW (full-screen, empty input shape per Task 2.8).
+        // Materialize the full-screen COW; the compositor empties its
+        // input region.
         let host_xid = crate::backend::WindowHandle::from_raw_panicking(0x4000_0103);
         state.resources.materialize_cow_resource(host_xid);
-        state.materialize_cow_input_shape();
+        state
+            .shape_windows
+            .entry(crate::resources::COMPOSITE_OVERLAY_WINDOW)
+            .or_default()
+            .input = Some(Vec::new());
 
         // Click at (50, 50): inside both sibling and COW geometry. COW's
         // empty input shape → hit_test_child(COW) = None → iteration
@@ -5796,30 +5896,6 @@ mod tests {
         assert_eq!(
             target, stage,
             "non-empty COW input shape lets the trace descend to stage"
-        );
-    }
-
-    #[test]
-    fn cow_default_input_shape_is_empty() {
-        use crate::resources::COMPOSITE_OVERLAY_WINDOW;
-
-        let mut state = ServerState::new();
-        let host_xid = crate::backend::WindowHandle::from_raw_panicking(0x4000_0103);
-        state.resources.materialize_cow_resource(host_xid);
-        state.materialize_cow_input_shape();
-
-        let shape = state
-            .shape_windows
-            .get(&COMPOSITE_OVERLAY_WINDOW)
-            .expect("COW must have a shape_windows entry after materialization");
-        assert!(
-            shape.input.is_some(),
-            "COW must have a non-default input shape (set, but empty)"
-        );
-        assert_eq!(
-            shape.input.as_ref().unwrap().len(),
-            0,
-            "COW's default input shape rects are empty (click-through)"
         );
     }
 

@@ -208,6 +208,17 @@ fn migrated_content_copy(
     ))
 }
 
+/// A moving window's place in an ancestor's shared redirect backing,
+/// taken before the configure: see
+/// [`KmsBackend::shared_backing_move_source`].
+struct SharedBackingMoveSource {
+    /// Where the window drew before the move.
+    target: PaintTarget,
+    /// Higher siblings over the window at its OLD position, in its
+    /// local content space: those pixels are theirs, not the window's.
+    occluders: Vec<ash::vk::Rect2D>,
+}
+
 /// #133 step 6 (P8) — what [`KmsBackend::sync_window_leaf_storage`]
 /// does with the pixels a window's leaf storage already holds when it
 /// has to reallocate.
@@ -353,6 +364,79 @@ fn scanout_direct_eligible(
     // on real desktops (every WM in the current smoke set uses
     // `border_width = 0`). Lifting it later needs the bordered storage +
     // source crop proven valid.
+}
+
+/// Whether no Bounding or Clip shape on `leaf_xid` or any ancestor up to the
+/// root (the COW included) removes part of the `root` rect.
+///
+/// Xorg flips a Present only when the window's `clipList` equals the root's
+/// `winSize` (`present/present_scmd.c:102`), and every shape in the chain
+/// narrows that clip list (`SetWinSize`, `dix/window.c:1713`, propagated to
+/// descendants by `miComputeClips`). Muffin's lock screen is the load-bearing
+/// case: it shapes the COW to an EMPTY region and unredirects the locker, so
+/// its stage's Presents are clipped to nothing and the locker below shows.
+/// Shape rects are relative to each window's content origin.
+fn direct_shape_chain_covers_root(
+    windows: &WindowsMap,
+    root_window_id: u32,
+    shape_bounding: &HashMap<u32, Vec<xfixes::RegionRect>>,
+    shape_clip: &HashMap<u32, Vec<xfixes::RegionRect>>,
+    leaf_xid: u32,
+    root: (u32, u32),
+) -> bool {
+    use crate::kms::render::region::Region;
+
+    let mut chain = Vec::new();
+    let mut xid = leaf_xid;
+    // Resource validation prevents cycles in production; stay bounded anyway.
+    for _ in 0..=windows.len() {
+        let Some(geometry) = windows.get(&xid) else {
+            return false;
+        };
+        let bw = i32::from(geometry.border_width);
+        chain.push((xid, i32::from(geometry.x) + bw, i32::from(geometry.y) + bw));
+        match geometry.parent {
+            None => break,
+            Some(parent) if parent == root_window_id => break,
+            Some(parent) => xid = parent,
+        }
+    }
+    let root_rect = vk::Rect2D {
+        offset: vk::Offset2D::default(),
+        extent: vk::Extent2D {
+            width: root.0,
+            height: root.1,
+        },
+    };
+    let (mut abs_x, mut abs_y) = (0, 0);
+    for &(xid, x, y) in chain.iter().rev() {
+        abs_x += x;
+        abs_y += y;
+        for shapes in [shape_bounding, shape_clip] {
+            let Some(rects) = shapes.get(&xid) else {
+                continue;
+            };
+            // Subtract rect by rect: a capped remainder only grows, so the
+            // answer can err towards "not covered", never towards a flip.
+            let mut uncovered = Region::from_rect(root_rect);
+            for rect in rects {
+                uncovered.subtract(&Region::from_rect(vk::Rect2D {
+                    offset: vk::Offset2D {
+                        x: abs_x + i32::from(rect.x),
+                        y: abs_y + i32::from(rect.y),
+                    },
+                    extent: vk::Extent2D {
+                        width: u32::from(rect.width),
+                        height: u32::from(rect.height),
+                    },
+                }));
+            }
+            if !uncovered.is_empty() {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Which retained direct frame a single CRTC is scanning out.
@@ -3347,6 +3431,34 @@ impl KmsBackend {
         } else {
             ScanoutM0Target::Other
         }
+    }
+
+    fn direct_shape_chain_covers_root(&self, leaf_xid: u32, root: (u32, u32)) -> bool {
+        direct_shape_chain_covers_root(
+            &self.windows,
+            self.core.window_id,
+            &self.core.shape_bounding,
+            &self.core.shape_clip,
+            leaf_xid,
+            root,
+        )
+    }
+
+    /// Whether a retained direct frame now presents through a Bounding or
+    /// Clip shape that no longer covers the root. A compositor may shape the
+    /// COW without presenting again, so the shape change itself must unflip.
+    fn direct_frames_shaped_off_root(&self) -> bool {
+        let root = (u32::from(self.platform.fb_w), u32::from(self.platform.fb_h));
+        let shaped_off = |frame: &DirectPresentFrame| {
+            !self.direct_shape_chain_covers_root(frame.candidate.paint_dst_host_xid, root)
+        };
+        self.scanout_m2.pending.as_ref().is_some_and(shaped_off)
+            || self
+                .scanout_m2
+                .queued_successor
+                .as_ref()
+                .is_some_and(shaped_off)
+            || self.scanout_m2.current.as_ref().is_some_and(shaped_off)
     }
 
     /// Whether an unredirected Present target is still the window which the
@@ -7042,6 +7154,133 @@ impl KmsBackend {
         self.finish_content_clip(clip, id)
     }
 
+    /// What a pure move of `host_xid` has to carry along, captured
+    /// BEFORE the configure mutates its geometry: `None` unless the
+    /// window draws into an ANCESTOR's redirect backing.
+    ///
+    /// A window under a redirected ancestor has no pixels of its own on
+    /// screen: it (and every non-redirected inferior) paints straight
+    /// into the shared backing at its offset, so moving it leaves those
+    /// pixels behind. Xorg moves them inside that one pixmap:
+    /// `miMoveWindow` calls `CopyWindow` (`mi/miwindow.c:293`), and
+    /// `compCopyWindow` falls through for a window that is not itself
+    /// redirected (`composite/compwindow.c:548-552`) to `fbCopyWindow`,
+    /// which copies the old `borderClip` to the new origin. The client
+    /// is not asked to repaint the part that copy covers, so a client
+    /// that drew once — the MATE notification area composites each
+    /// tray icon into its window and then waits for Damage — shows
+    /// whatever the backing held at the new position. A window that
+    /// paints into its own leaf (no redirected ancestor), or owns its
+    /// own backing, moves with its storage and needs nothing.
+    ///
+    /// Only a pure move qualifies: a resize or border-width change
+    /// reallocates or re-tiles the window and goes through the paths
+    /// below it instead.
+    fn shared_backing_move_source(
+        &self,
+        host_xid: u32,
+        config: &HostSubwindowConfig,
+    ) -> Option<SharedBackingMoveSource> {
+        let geom = self.windows.get(&host_xid)?;
+        let moved = config.x.is_some_and(|x| x != geom.x) || config.y.is_some_and(|y| y != geom.y);
+        let resized = config.width.is_some_and(|w| w != geom.width)
+            || config.height.is_some_and(|h| h != geom.height)
+            || config
+                .border_width
+                .is_some_and(|bw| bw != geom.border_width);
+        if !moved || resized {
+            return None;
+        }
+        let leaf = self.store.lookup(host_xid);
+        if leaf
+            .and_then(|id| self.store.redirected_target(id))
+            .is_some()
+        {
+            return None;
+        }
+        let target = self.resolve_paint_target(host_xid)?;
+        if Some(target.backing_id()) == leaf {
+            return None;
+        }
+        Some(SharedBackingMoveSource {
+            occluders: self.copy_area_shared_backing_occluders(host_xid, &target),
+            target,
+        })
+    }
+
+    /// Copy what [`Self::shared_backing_move_source`] captured to the
+    /// window's new position in the same backing: the window's whole
+    /// outer extent, inferiors included, minus higher siblings at the
+    /// old position (not the window's pixels) and at the new one (not
+    /// the window's to overwrite) — `fbCopyWindow`'s old `borderClip`
+    /// intersected with the new one. Whatever the copy cannot cover is
+    /// exposed by the core configure path, as in Xorg.
+    fn carry_shared_backing_pixels_on_move(
+        &mut self,
+        host_xid: u32,
+        source: SharedBackingMoveSource,
+    ) {
+        let Some(geom) = self.windows.get(&host_xid).copied() else {
+            return;
+        };
+        let Some(target) = self.resolve_paint_target(host_xid) else {
+            return;
+        };
+        let backing = target.backing_id();
+        if backing != source.target.backing_id() {
+            return;
+        }
+        let old_origin = source.target.offset();
+        let new_origin = target.offset();
+        if old_origin == new_origin {
+            return;
+        }
+        // Window-local CONTENT space, the occluders' frame: the outer
+        // extent starts a border width up and left of the content.
+        let bw = i32::from(geom.border_width);
+        let outer = ash::vk::Rect2D {
+            offset: ash::vk::Offset2D { x: -bw, y: -bw },
+            extent: ash::vk::Extent2D {
+                width: u32::from(geom.width) + 2 * u32::from(geom.border_width),
+                height: u32::from(geom.height) + 2 * u32::from(geom.border_width),
+            },
+        };
+        let new_occluders = self.copy_area_shared_backing_occluders(host_xid, &target);
+        let still_visible = compute_copy_area_dst_rects(outer, &new_occluders);
+        let pieces: Vec<ash::vk::Rect2D> = compute_copy_area_dst_rects(outer, &source.occluders)
+            .into_iter()
+            .flat_map(|r| intersect_rect_with_clip(r, &still_visible))
+            .collect();
+        let delta = (new_origin.0 - old_origin.0, new_origin.1 - old_origin.1);
+        for piece in order_pieces_for_in_place_move(pieces, delta) {
+            let src_rect = ash::vk::Rect2D {
+                offset: ash::vk::Offset2D {
+                    x: old_origin.0 + piece.offset.x,
+                    y: old_origin.1 + piece.offset.y,
+                },
+                extent: piece.extent,
+            };
+            let dst_pos = ash::vk::Offset2D {
+                x: new_origin.0 + piece.offset.x,
+                y: new_origin.1 + piece.offset.y,
+            };
+            if let Err(e) = self.engine.copy_area(
+                &mut self.store,
+                &mut self.platform,
+                Src::server_internal(backing),
+                Dst::server_internal(backing),
+                src_rect,
+                dst_pos,
+            ) {
+                log::warn!(
+                    "render configure_subwindow: carrying moved window 0x{host_xid:x} \
+                     inside its shared backing failed: {e:?}"
+                );
+                return;
+            }
+        }
+    }
+
     /// When window branches share one redirected backing, painting a lower
     /// branch must not overwrite higher siblings' visible pixels in that
     /// backing. Walk from the destination through every ancestor: a higher
@@ -7554,14 +7793,142 @@ impl KmsBackend {
         }
     }
 
+    /// Tile `host_pixmap_xid` across the whole root extent from (0, 0): the
+    /// root's background pixmap, painted by `set_container_background_pixmap`
+    /// and again whenever the root storage is reallocated for a new screen
+    /// size (Xorg `SetRootClip` exposes the whole resized root and
+    /// `miPaintWindow` tiles its background there).
+    fn tile_root_background_pixmap(&mut self, host_pixmap_xid: u32) {
+        use crate::kms::{
+            render::engine::{ResolvedSource, SourceDrawable},
+            vk::ops::render::CompositeRect,
+        };
+        // Stage 4a — root paint resolves through redirect routing.
+        let Some(dst_target) = self.resolve_paint_target(self.core.window_id) else {
+            return;
+        };
+        let dst = dst_target.backing_id();
+        let Some(src) = self.store.lookup(host_pixmap_xid) else {
+            log::debug!(
+                "render set_container_background_pixmap: pixmap 0x{host_pixmap_xid:x} not in store"
+            );
+            return;
+        };
+        // Stage 3f.14: X11 bg_pixmap tiles across the drawable
+        // extent. Pre-3f.14 v2 did a single copy_area at (0, 0)
+        // and left the rest of root unchanged — fvwm3 wallpaper
+        // covered only the top-left of the screen on bee. Route
+        // through `engine.render_composite` with OP_SRC + Repeat::
+        // Normal so the source pixmap tiles across the whole root
+        // extent in a single submit. Same shape as `try_tiled_fill`
+        // (3f.3) but unconditioned by GC clip.
+        if src == dst {
+            // Defensive: a pixmap aliased as bg of its own drawable
+            // is not a meaningful X11 op. v1's path treats it the
+            // same (copy_area with src == dst is logged + skipped).
+            log::debug!("render set_container_background_pixmap: src == root, skipping");
+            return;
+        }
+        let src_format = self.store.get(src).map(|d| d.storage.format);
+        if src_format != Some(ash::vk::Format::B8G8R8A8_UNORM) {
+            // Tile path requires BGRA8 src (matches `try_tiled_fill`
+            // gate). Other formats fall through with no paint —
+            // v1-parity-ish; rare in practice for root bg.
+            log::debug!(
+                "render set_container_background_pixmap: pixmap 0x{host_pixmap_xid:x} format \
+                 {src_format:?} not BGRA8, skipping tile"
+            );
+            return;
+        }
+        let dst_extent = ash::vk::Extent2D {
+            width: u32::from(self.platform.fb_w.max(1)),
+            height: u32::from(self.platform.fb_h.max(1)),
+        };
+        let rects = [CompositeRect {
+            src_x: 0,
+            src_y: 0,
+            mask_x: 0,
+            mask_y: 0,
+            dst_x: dst_target.offset().0,
+            dst_y: dst_target.offset().1,
+            width: dst_extent.width,
+            height: dst_extent.height,
+        }];
+        const OP_SRC: u8 = 1;
+        let composite_result = self.engine.render_composite(
+            &mut self.store,
+            &mut self.platform,
+            OP_SRC,
+            ResolvedSource::Drawable(SourceDrawable::whole(src)),
+            ResolvedSource::None,
+            dst_target.dst(),
+            &rects,
+            None,
+            Repeat::Normal,
+            Repeat::None,
+            None,
+            None,
+            false,
+            // Audit #4: synthesized backing-seed copy, no Picture
+            // context. Engine falls back to depth heuristic.
+            0,
+            0,
+            0,
+        );
+        self.sync_descriptor_pool_telemetry();
+        match composite_result {
+            Ok(s) if s.recorded_draws > 0 && !s.deferred_to_batch => {
+                self.telemetry.record_paint_submit();
+                self.trace_render(
+                    SubmitKind::RenderComposite,
+                    dst,
+                    s.recorded_draws,
+                    1, // OP_SRC
+                    SrcClass::Direct,
+                    None,
+                    SubmitFlags {
+                        readback: s.used_dst_readback,
+                        alias: s.used_src_alias_scratch,
+                        zero_draws: false,
+                        upload: false,
+                    },
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                log::warn!(
+                    "render set_container_background_pixmap: render_composite tile failed: {e:?}"
+                );
+            }
+        }
+    }
+
     fn read_root_scanout_assembled(&mut self, region: vk::Rect2D) -> Option<Vec<u8>> {
         self.prime_transformed_root_reads();
         // Root space: a transformed output covers its footprint (spec D6).
         let outputs = self.crtc_root_rects();
-        if outputs.is_empty() {
-            return None;
-        }
-        Some(assemble_root_scanout(region, &outputs, |rect| {
+        let root_id = self.store.lookup(self.core.window_id)?;
+        Some(assemble_root_scanout(region, &outputs, |rect, source| {
+            if source == RootReadSource::Background {
+                // No CRTC shows this area, so no scanout holds it. The root
+                // storage does: its background, which is what Xorg's screen
+                // pixmap holds there too (windows over it are not composed
+                // outside the CRTCs, so they are missing from this piece).
+                return self
+                    .engine
+                    .get_image(
+                        &mut self.store,
+                        &mut self.platform,
+                        crate::kms::render::target::Src::server_internal(root_id),
+                        rect,
+                        32,
+                    )
+                    .map_err(|e| log::debug!("render root background readback {rect:?}: {e:?}"))
+                    .ok()
+                    .filter(|bytes| {
+                        bytes.len() == rect.extent.width as usize * rect.extent.height as usize * 4
+                    });
+            }
             // `assemble_root_scanout` zero-fills a piece it cannot read. That
             // degradation is unchanged, but a failure here now also covers an
             // unresolvable direct-scanout source, which previously answered
@@ -13061,6 +13428,12 @@ impl KmsBackend {
             }
         }
 
+        // The fill above is the pixel background; a background pixmap tiles
+        // over it, as Xorg repaints the whole resized root with its tile.
+        if let Some(bg_pixmap) = self.core.bg_pixmap {
+            self.tile_root_background_pixmap(bg_pixmap.as_raw());
+        }
+
         // ── 3. Resize COW backing storage (if materialised) ──────────────
         // The COW is lazily allocated on the first CompositeGetOverlayWindow
         // call. If it hasn't been created yet, fb_w/fb_h are already updated
@@ -13805,6 +14178,7 @@ impl KmsBackend {
             child,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         self.emit_pointer(ev);
     }
@@ -13825,6 +14199,7 @@ impl KmsBackend {
             child: 0,
             raw_dx,
             raw_dy,
+            tree_change: false,
         };
         self.emit_pointer(ev);
     }
@@ -14182,6 +14557,7 @@ impl KmsBackend {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         self.emit_pointer(ptr_event);
         // Implicit-grab crossings (G3). Direct v1 port.
@@ -17257,6 +17633,15 @@ fn split_root_scanout_reads(
     reads
 }
 
+/// Where `assemble_root_scanout` wants a piece read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootReadSource {
+    /// Inside one output: what that CRTC scans out.
+    Scanout,
+    /// Covered by no output: the root window's own storage.
+    Background,
+}
+
 /// Assemble a root-region `GetImage` ZPixmap buffer from per-output scanout
 /// reads.
 ///
@@ -17267,19 +17652,22 @@ fn split_root_scanout_reads(
 /// came back all-black (ImageMagick `import` screenshots over a dual-head root:
 /// `import` grabs the entire root, then crops client-side). Split the region
 /// per output, read each piece, and blit it into one row-major 4-bytes-per-pixel
-/// buffer. Region area not covered by any output stays zero-filled (X11 leaves
-/// off-screen root pixels undefined).
+/// buffer. Region area not covered by any output is read as
+/// `RootReadSource::Background`: Xorg's root is the whole screen pixmap, so
+/// e.g. the corner a 1280x800 + 1024x768 layout leaves uncovered answers the
+/// root background, not black.
 ///
-/// `read(rect)` returns tightly-packed 4-bpp rows for `rect` (guaranteed by the
-/// splitter to sit fully within one output) or `None` if that read failed — a
-/// failed piece is left zero-filled rather than aborting the whole capture.
+/// `read(rect, source)` returns tightly-packed 4-bpp rows for `rect` (for
+/// `Scanout`, guaranteed by the splitter to sit fully within one output) or
+/// `None` if that read failed — a failed piece is left zero-filled rather than
+/// aborting the whole capture.
 fn assemble_root_scanout<F>(
     region: vk::Rect2D,
     outputs: &[(i32, i32, u32, u32)],
     mut read: F,
 ) -> Vec<u8>
 where
-    F: FnMut(vk::Rect2D) -> Option<Vec<u8>>,
+    F: FnMut(vk::Rect2D, RootReadSource) -> Option<Vec<u8>>,
 {
     let w = region.extent.width as usize;
     let h = region.extent.height as usize;
@@ -17293,8 +17681,30 @@ where
         offset: vk::Offset2D::default(),
         extent: region.extent,
     };
-    for piece in split_root_scanout_reads(sub, src_x, src_y, 0, 0, outputs) {
-        let Some(bytes) = read(piece.read) else {
+    let output_rects: Vec<vk::Rect2D> = outputs
+        .iter()
+        .map(|&(x, y, width, height)| vk::Rect2D {
+            offset: vk::Offset2D { x, y },
+            extent: vk::Extent2D { width, height },
+        })
+        .collect();
+    let scanout = split_root_scanout_reads(sub, src_x, src_y, 0, 0, outputs)
+        .into_iter()
+        .map(|piece| (piece, RootReadSource::Scanout));
+    let background = compute_copy_area_dst_rects(region, &output_rects)
+        .into_iter()
+        .map(|rect| {
+            let piece = RootScanoutRead {
+                read: rect,
+                dst_local: vk::Offset2D {
+                    x: rect.offset.x - region.offset.x,
+                    y: rect.offset.y - region.offset.y,
+                },
+            };
+            (piece, RootReadSource::Background)
+        });
+    for (piece, source) in scanout.chain(background) {
+        let Some(bytes) = read(piece.read, source) else {
             continue;
         };
         let pw = piece.read.extent.width as usize;
@@ -19951,8 +20361,9 @@ impl Backend for KmsBackend {
                     ) == root
             });
         let authoritative_root = scanout_m2_is_authoritative_root(target, root_coverage);
-        let scene_eligible = !matches!(target, ScanoutM0Target::Unredirected)
-            || self.unredirected_direct_scene_eligible(candidate.paint_dst_host_xid, root);
+        let scene_eligible = (!matches!(target, ScanoutM0Target::Unredirected)
+            || self.unredirected_direct_scene_eligible(candidate.paint_dst_host_xid, root))
+            && self.direct_shape_chain_covers_root(candidate.paint_dst_host_xid, root);
         // #133 step 3 (3.5): reject any candidate whose resolved paint
         // chain carries a border clip. `has_border_clip()` is true iff
         // some window between the presented drawable and its backing has
@@ -21748,6 +22159,7 @@ impl Backend for KmsBackend {
         if self.direct_frame_references_host_drawable(host_xid) {
             self.request_direct_unflip("configure_direct_frame_drawable");
         }
+        let move_source = self.shared_backing_move_source(host_xid, &config);
         let Some(geom) = self.windows.get_mut(&host_xid) else {
             // Window not tracked — log + skip (e.g., configure
             // before register). v1 tolerates this.
@@ -21858,6 +22270,12 @@ impl Backend for KmsBackend {
             if is_subwindow {
                 self.restack_subwindow(host_xid, stack_mode, config.sibling);
             }
+        }
+        // After the restack, so the destination clip sees the new
+        // stacking, as Xorg's `CopyWindow` runs against the validated
+        // tree.
+        if let Some(source) = move_source {
+            self.carry_shared_backing_pixels_on_move(host_xid, source);
         }
         self.scene.wake_for_damage();
         Ok(())
@@ -22690,6 +23108,12 @@ impl Backend for KmsBackend {
             cursor: None,
         };
         self.windows.insert(cow_host_xid, geom);
+        // The COW takes the pointer until its input region is emptied, so
+        // crossings resolve it like any window (Nonlinear to a sibling).
+        self.core.xid_map.insert(
+            cow_host_xid,
+            yserver_core::resources::COMPOSITE_OVERLAY_WINDOW,
+        );
         self.deferred_cow_release = false;
         // Step 2 (DRIFT 2): the COW's place in top_level_order is no longer
         // set here — the GetOverlayWindow core handler reprojects from core
@@ -23309,114 +23733,9 @@ impl Backend for KmsBackend {
         _origin: Option<OriginContext>,
         host_pixmap_xid: u32,
     ) -> io::Result<()> {
-        use crate::kms::{
-            render::engine::{ResolvedSource, SourceDrawable},
-            vk::ops::render::CompositeRect,
-        };
         self.core.bg_pixmap = PixmapHandle::from_raw(host_pixmap_xid);
         self.core.bg_pixel = None;
-        // Stage 4a — root paint resolves through redirect routing.
-        let Some(dst_target) = self.resolve_paint_target(self.core.window_id) else {
-            self.scene.wake_for_damage();
-            return Ok(());
-        };
-        let dst = dst_target.backing_id();
-        let Some(src) = self.store.lookup(host_pixmap_xid) else {
-            log::debug!(
-                "render set_container_background_pixmap: pixmap 0x{host_pixmap_xid:x} not in store"
-            );
-            self.scene.wake_for_damage();
-            return Ok(());
-        };
-        // Stage 3f.14: X11 bg_pixmap tiles across the drawable
-        // extent. Pre-3f.14 v2 did a single copy_area at (0, 0)
-        // and left the rest of root unchanged — fvwm3 wallpaper
-        // covered only the top-left of the screen on bee. Route
-        // through `engine.render_composite` with OP_SRC + Repeat::
-        // Normal so the source pixmap tiles across the whole root
-        // extent in a single submit. Same shape as `try_tiled_fill`
-        // (3f.3) but unconditioned by GC clip.
-        if src == dst {
-            // Defensive: a pixmap aliased as bg of its own drawable
-            // is not a meaningful X11 op. v1's path treats it the
-            // same (copy_area with src == dst is logged + skipped).
-            log::debug!("render set_container_background_pixmap: src == root, skipping");
-            self.scene.wake_for_damage();
-            return Ok(());
-        }
-        let src_format = self.store.get(src).map(|d| d.storage.format);
-        if src_format != Some(ash::vk::Format::B8G8R8A8_UNORM) {
-            // Tile path requires BGRA8 src (matches `try_tiled_fill`
-            // gate). Other formats fall through with no paint —
-            // v1-parity-ish; rare in practice for root bg.
-            log::debug!(
-                "render set_container_background_pixmap: pixmap 0x{host_pixmap_xid:x} format \
-                 {src_format:?} not BGRA8, skipping tile"
-            );
-            self.scene.wake_for_damage();
-            return Ok(());
-        }
-        let dst_extent = ash::vk::Extent2D {
-            width: u32::from(self.platform.fb_w.max(1)),
-            height: u32::from(self.platform.fb_h.max(1)),
-        };
-        let rects = [CompositeRect {
-            src_x: 0,
-            src_y: 0,
-            mask_x: 0,
-            mask_y: 0,
-            dst_x: dst_target.offset().0,
-            dst_y: dst_target.offset().1,
-            width: dst_extent.width,
-            height: dst_extent.height,
-        }];
-        const OP_SRC: u8 = 1;
-        let composite_result = self.engine.render_composite(
-            &mut self.store,
-            &mut self.platform,
-            OP_SRC,
-            ResolvedSource::Drawable(SourceDrawable::whole(src)),
-            ResolvedSource::None,
-            dst_target.dst(),
-            &rects,
-            None,
-            Repeat::Normal,
-            Repeat::None,
-            None,
-            None,
-            false,
-            // Audit #4: synthesized backing-seed copy, no Picture
-            // context. Engine falls back to depth heuristic.
-            0,
-            0,
-            0,
-        );
-        self.sync_descriptor_pool_telemetry();
-        match composite_result {
-            Ok(s) if s.recorded_draws > 0 && !s.deferred_to_batch => {
-                self.telemetry.record_paint_submit();
-                self.trace_render(
-                    SubmitKind::RenderComposite,
-                    dst,
-                    s.recorded_draws,
-                    1, // OP_SRC
-                    SrcClass::Direct,
-                    None,
-                    SubmitFlags {
-                        readback: s.used_dst_readback,
-                        alias: s.used_src_alias_scratch,
-                        zero_draws: false,
-                        upload: false,
-                    },
-                );
-            }
-            Ok(_) => {}
-            Err(e) => {
-                log::warn!(
-                    "render set_container_background_pixmap: render_composite tile failed: {e:?}"
-                );
-            }
-        }
+        self.tile_root_background_pixmap(host_pixmap_xid);
         self.scene.wake_for_damage();
         Ok(())
     }
@@ -27933,6 +28252,9 @@ impl Backend for KmsBackend {
         // fix cut 2b — the compose scheduler otherwise excludes it).
         // Input shape (2) only affects hit-testing — no redraw needed.
         if kind == 0 || kind == 1 {
+            if self.direct_frames_shaped_off_root() {
+                self.request_direct_unflip("shape_clips_direct_frame");
+            }
             self.scene.wake_for_damage();
         }
         Ok(())
@@ -27979,6 +28301,29 @@ impl Backend for KmsBackend {
         // closes the pre-existing confine-drift gap. No-op in test fixtures
         // where `input_thread_control` is None.
         self.resync_input_position();
+    }
+
+    fn windows_restructured(&mut self, state: &mut ServerState) {
+        // Xorg `CheckMotion(NULL)`: the sprite starts on the root, and only a
+        // changed pointer window generates crossings — one hit-test otherwise.
+        let host_xid = self.resource_pointer_host_xid(state);
+        let prev = *self
+            .core
+            .prev_pointer_window
+            .get_or_insert(self.core.window_id);
+        if prev == host_xid {
+            return;
+        }
+        let mask = self.serialize_modifiers() | self.core.button_mask;
+        self.update_pointer_window(state, host_xid, mask);
+        let pending = std::mem::take(&mut self.core.pending_pointer_events);
+        let xid_map = self.core.xid_map.clone();
+        for mut ev in pending {
+            ev.tree_change = true;
+            let _dropped = yserver_core::core_loop::pointer_fanout::pointer_event_fanout_to_state(
+                state, self, &xid_map, ev, true, false,
+            );
+        }
     }
 
     fn resync_input_position(&mut self) {
@@ -28635,6 +28980,60 @@ fn compute_render_composite_clip(
     fold(src_in_dst);
     fold(mask_in_dst);
     acc
+}
+
+/// Order the disjoint pieces of an in-place move by `delta` so that no
+/// piece is read after another piece has written over it. Each copy is
+/// individually overlap-safe (`RenderEngine::copy_area` stages a
+/// same-image copy through a scratch image), but the pieces are separate
+/// copies: piece `j` must go before piece `i` whenever `i`'s destination
+/// covers `j`'s source. Xorg's `miCopyRegion` gets the same guarantee by
+/// walking its YX-banded boxes against the direction of the move
+/// (`mi/micopy.c:54-140`); these pieces are not banded, so the order is
+/// derived from the overlaps directly. Should the remaining pieces ever
+/// form a cycle, they are appended as they are; the common case — no
+/// higher sibling over the window — is a single piece.
+fn order_pieces_for_in_place_move(
+    pieces: Vec<ash::vk::Rect2D>,
+    delta: (i32, i32),
+) -> Vec<ash::vk::Rect2D> {
+    fn overlaps(a: ash::vk::Rect2D, b: ash::vk::Rect2D) -> bool {
+        let right = |r: ash::vk::Rect2D| r.offset.x + i32::try_from(r.extent.width).unwrap_or(0);
+        let bottom = |r: ash::vk::Rect2D| r.offset.y + i32::try_from(r.extent.height).unwrap_or(0);
+        a.offset.x < right(b)
+            && b.offset.x < right(a)
+            && a.offset.y < bottom(b)
+            && b.offset.y < bottom(a)
+    }
+    if pieces.len() < 2 {
+        return pieces;
+    }
+    let moved = |r: ash::vk::Rect2D| ash::vk::Rect2D {
+        offset: ash::vk::Offset2D {
+            x: r.offset.x + delta.0,
+            y: r.offset.y + delta.1,
+        },
+        extent: r.extent,
+    };
+    let mut left: Vec<ash::vk::Rect2D> = pieces;
+    let mut ordered = Vec::with_capacity(left.len());
+    while !left.is_empty() {
+        // A piece is safe to copy now when its destination covers no
+        // other remaining piece's source.
+        let ready = (0..left.len()).find(|&i| {
+            let dst = moved(left[i]);
+            left.iter()
+                .enumerate()
+                .all(|(j, src)| j == i || !overlaps(dst, *src))
+        });
+        match ready {
+            Some(i) => ordered.push(left.swap_remove(i)),
+            None => {
+                ordered.append(&mut left);
+            }
+        }
+    }
+    ordered
 }
 
 fn compute_copy_area_dst_rects(
@@ -44310,7 +44709,7 @@ mod tests {
                 .is_none()
         );
         assert!(
-            state.composite_redirects.contains_key(&(window, false)),
+            state.composite_redirects.window_mode(window).is_some(),
             "redirect stays"
         );
         assert_eq!(backend.test_host_window_to_backing(host.as_raw()), None);
@@ -44580,7 +44979,7 @@ mod tests {
         // the old single-`read_scanout_region` path returned all-black for
         // (rect spanning two outputs → no matching BO → empty reply).
         let outputs = [(0i32, 0i32, 2u32, 2u32), (2, 0, 2, 2)];
-        let got = super::assemble_root_scanout(r(0, 0, 4, 2), &outputs, |rect| {
+        let got = super::assemble_root_scanout(r(0, 0, 4, 2), &outputs, |rect, _| {
             let px = (rect.extent.width * rect.extent.height) as usize;
             let byte = if rect.offset.x == 0 { 0x11u8 } else { 0x22u8 };
             Some(vec![byte; px * 4])
@@ -44594,11 +44993,38 @@ mod tests {
     }
 
     #[test]
+    fn assemble_root_scanout_reads_uncovered_area_from_the_root_background() {
+        // A 4x2 output over a 6x3 root region: the column right of it and the
+        // row below it are covered by no CRTC and read from the root storage
+        // (Xorg answers the root background there), never from a scanout.
+        let outputs = [(0i32, 0i32, 4u32, 2u32)];
+        let mut background_px = 0;
+        let got = super::assemble_root_scanout(r(0, 0, 6, 3), &outputs, |rect, source| {
+            let px = (rect.extent.width * rect.extent.height) as usize;
+            match source {
+                super::RootReadSource::Scanout => {
+                    assert_eq!(rect, r(0, 0, 4, 2), "scanout read stays on the output");
+                    Some(vec![0x11u8; px * 4])
+                }
+                super::RootReadSource::Background => {
+                    background_px += px;
+                    Some(vec![0x22u8; px * 4])
+                }
+            }
+        });
+        assert_eq!(background_px, 6 * 3 - 4 * 2, "every uncovered pixel, once");
+        let stride = 6 * 4;
+        assert_eq!(&got[0..16], &[0x11u8; 16], "row0 under the output");
+        assert_eq!(&got[16..24], &[0x22u8; 8], "row0 right of the output");
+        assert_eq!(&got[2 * stride..3 * stride], &[0x22u8; 24], "row2 below it");
+    }
+
+    #[test]
     fn assemble_root_scanout_failed_read_is_zero_filled() {
         // A piece whose read fails stays zero (black) instead of aborting the
         // whole capture; the covered output still lands.
         let outputs = [(0i32, 0i32, 2u32, 2u32), (2, 0, 2, 2)];
-        let got = super::assemble_root_scanout(r(0, 0, 4, 1), &outputs, |rect| {
+        let got = super::assemble_root_scanout(r(0, 0, 4, 1), &outputs, |rect, _| {
             if rect.offset.x == 0 {
                 Some(vec![
                     0x11u8;
@@ -44950,13 +45376,17 @@ mod tests {
         // is a redirected direct child. socket is a child of mate-
         // panel (not directly redirected). nm-applet is currently
         // a direct child of root (and therefore inherits redirect).
-        state.composite_redirects.insert(
-            (root_xid, true),
-            RedirectRecord {
-                mode: CompositeRedirectMode::Manual,
-                owner: ClientId(14),
-            },
-        );
+        state
+            .composite_redirects
+            .redirect_subwindows(
+                root_xid,
+                &[],
+                RedirectRecord {
+                    mode: CompositeRedirectMode::Manual,
+                    owner: ClientId(14),
+                },
+            )
+            .unwrap();
 
         seed_state_window(
             &mut state,
@@ -44968,6 +45398,10 @@ mod tests {
             2560,
             28,
         );
+        // As CreateWindow does for a child of a subwindows-redirected parent.
+        state
+            .composite_redirects
+            .redirect_new_subwindow(root_xid, mate_panel_xid);
         seed_redirected_backing(&mut state, &mut backend, mate_panel_xid);
         let mate_panel_backing_id =
             backing_drawable_id(&backend, mate_panel_xid).expect("mate-panel backing drawable id");
@@ -44991,6 +45425,9 @@ mod tests {
             26,
             27,
         );
+        state
+            .composite_redirects
+            .redirect_new_subwindow(root_xid, nm_applet_xid);
         seed_redirected_backing(&mut state, &mut backend, nm_applet_xid);
 
         dispatch_reparent_window(
@@ -45595,6 +46032,60 @@ mod tests {
             b.cow_host_xid().is_none(),
             "cow_host_xid getter returns None after final release"
         );
+        assert!(
+            b.core.xid_map.contains_key(&cow_host_xid),
+            "COW stays in the pointer xid map until core unregisters it"
+        );
+    }
+
+    /// An unshaped COW takes the pointer (Xorg `compCreateOverlayWindow`), so
+    /// moving between it and a root sibling crosses Nonlinear both ways, as
+    /// measured on Xvfb 21.1 (tools/vng-scenarios/cow-input-shape).
+    #[test]
+    fn pointer_crossing_between_cow_and_a_sibling_is_nonlinear() {
+        use yserver_core::{backend::Backend, host_x11::PointerEventKind, server::ServerState};
+        let cow = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW;
+        let mut b = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        let app = create_live_window(
+            &mut state,
+            &mut b,
+            yserver_protocol::x11::ResourceId(0x0020_0001),
+            yserver_core::resources::ROOT_WINDOW,
+            100,
+            100,
+            200,
+            200,
+        )
+        .as_raw();
+        b.get_overlay_window(None).expect("get");
+        state.resources.materialize_cow_resource(
+            yserver_core::backend::WindowHandle::from_raw_panicking(cow.0),
+        );
+
+        let crossings = |b: &mut KmsBackend| -> Vec<(PointerEventKind, u32, u8)> {
+            std::mem::take(&mut b.core.pending_pointer_events)
+                .into_iter()
+                .map(|e| (e.kind, e.host_xid, e.detail))
+                .collect()
+        };
+        b.core.prev_pointer_window = Some(app);
+        b.update_pointer_window(&state, cow.0, 0);
+        assert_eq!(
+            crossings(&mut b),
+            vec![
+                (PointerEventKind::LeaveNotify, app, 3),
+                (PointerEventKind::EnterNotify, cow.0, 3),
+            ],
+        );
+        b.update_pointer_window(&state, app, 0);
+        assert_eq!(
+            crossings(&mut b),
+            vec![
+                (PointerEventKind::LeaveNotify, cow.0, 3),
+                (PointerEventKind::EnterNotify, app, 3),
+            ],
+        );
     }
 
     /// A hotplug that GREW the virtual extent must grow root backing
@@ -45768,6 +46259,70 @@ mod tests {
             (0x00, 0x00, 0xff, 0xff),
             "the newly covered region must hold the opaque root background \
              (B8G8R8A8), not recycled content",
+        );
+    }
+
+    /// A root background PIXMAP survives the reallocation: the newly covered
+    /// region is tiled from the root origin, not left in the pixel fill
+    /// (Xorg `SetRootClip` exposes the whole resized root, `miPaintWindow`
+    /// tiles it). Measured in the vng scenario `root-bg-resize`.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn a_resized_root_keeps_its_background_pixmap() {
+        use yserver_core::backend::Backend;
+
+        let mut b = match KmsBackend::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+        // A 4x4 tile: green, with a blue top-left pixel marking the phase.
+        let tile = b.create_pixmap(None, 32, 4, 4).expect("tile pixmap");
+        b.fill_rectangle(None, tile.as_raw(), 0xFF00_FF00, 0, 0, 4, 4)
+            .expect("tile fill green");
+        b.fill_rectangle(None, tile.as_raw(), 0xFF00_00FF, 0, 0, 1, 1)
+            .expect("tile phase pixel blue");
+        b.set_container_background_pixmap(None, tile.as_raw())
+            .expect("set root bg pixmap");
+
+        let old_w = b.platform.fb_w;
+        let new_w = old_w.saturating_add(1280);
+        b.apply_virtual_screen_extent(new_w, b.platform.fb_h)
+            .expect("growing the virtual extent must not fail");
+        b.engine_close_open_frame_for_timeout_for_tests()
+            .expect("close open frame");
+        b.engine_drain_all_for_tests();
+
+        let root_id = b
+            .store
+            .lookup(b.core.window_id)
+            .expect("root must be live after the grow");
+        // A tile-aligned 2x1 read in the newly covered region: the phase
+        // pixel, then plain tile.
+        let x = (i32::from(old_w) + 4) & !3;
+        let bytes = b
+            .engine
+            .get_image(
+                &mut b.store,
+                &mut b.platform,
+                crate::kms::render::target::Src::server_internal(root_id),
+                ash::vk::Rect2D {
+                    offset: ash::vk::Offset2D { x, y: 4 },
+                    extent: ash::vk::Extent2D {
+                        width: 2,
+                        height: 1,
+                    },
+                },
+                32,
+            )
+            .expect("readback of the newly covered region");
+        assert_eq!(
+            (&bytes[0..3], &bytes[4..7]),
+            (&[0xff, 0x00, 0x00][..], &[0x00, 0xff, 0x00][..]),
+            "the resized root must be tiled with its background pixmap from \
+             the root origin (B8G8R8A8)",
         );
     }
 
@@ -48422,6 +48977,112 @@ mod tests {
         ));
     }
 
+    /// A root-sized stage under the COW, as muffin lays it out.
+    fn seed_cow_stage(b: &mut super::KmsBackend, stage: u32) -> (u32, u32) {
+        let cow = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+        let (w, h) = (b.platform.fb_w, b.platform.fb_h);
+        let root_window = b.core.window_id;
+        seed_window(b, cow, Some(root_window), 0, 0);
+        seed_window(b, stage, Some(cow), 0, 0);
+        for xid in [cow, stage] {
+            let geometry = b.windows.get_mut(&xid).unwrap();
+            geometry.width = w;
+            geometry.height = h;
+        }
+        (u32::from(w), u32::from(h))
+    }
+
+    /// Xorg flips a Present only when the window's clip list is the root's
+    /// `winSize` (`present/present_scmd.c:102`), and a Bounding or Clip shape
+    /// on the window or any ancestor narrows that clip list (`SetWinSize`,
+    /// `dix/window.c:1713`; `miComputeClips`). Muffin's lock screen shapes
+    /// the COW to an EMPTY region while its stage keeps presenting.
+    #[test]
+    fn direct_shape_chain_requires_every_shape_to_cover_the_root() {
+        use yserver_protocol::x11::xfixes::RegionRect;
+
+        let cow = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+        let stage = 0x0040_0003;
+        let mut b = super::KmsBackend::for_tests();
+        let root = seed_cow_stage(&mut b, stage);
+        let (w, h) = (
+            u16::try_from(root.0).unwrap(),
+            u16::try_from(root.1).unwrap(),
+        );
+        let rect = |x: i16, width: u16| RegionRect {
+            x,
+            y: 0,
+            width,
+            height: h,
+        };
+        let half = i16::try_from(w / 2).unwrap();
+        let covers = |b: &super::KmsBackend| b.direct_shape_chain_covers_root(stage, root);
+
+        assert!(covers(&b), "unshaped chain");
+        b.core.shape_bounding.insert(cow, Vec::new());
+        assert!(!covers(&b), "empty COW Bounding shape clips the stage away");
+        b.core.shape_bounding.insert(cow, vec![rect(0, w)]);
+        assert!(covers(&b), "a root-sized COW shape");
+        b.core
+            .shape_bounding
+            .insert(cow, vec![rect(0, w / 2), rect(half, w - w / 2)]);
+        assert!(covers(&b), "two rects that tile the root");
+        b.core.shape_bounding.insert(cow, vec![rect(0, w / 2)]);
+        assert!(!covers(&b), "a hole punched in the COW");
+        b.core.shape_bounding.remove(&cow);
+        b.core.shape_clip.insert(stage, Vec::new());
+        assert!(!covers(&b), "an empty Clip shape on the presented window");
+        b.core.shape_clip.insert(stage, vec![rect(0, w)]);
+        assert!(covers(&b));
+        // Shape rects are window-relative: a stage shifted right by `half`
+        // with a shape starting at `-half` still covers the root.
+        b.windows.get_mut(&stage).unwrap().x = half;
+        b.core.shape_clip.insert(stage, vec![rect(-half, w)]);
+        assert!(covers(&b), "window-relative shape on an offset window");
+        b.core.shape_clip.insert(stage, vec![rect(0, w)]);
+        assert!(!covers(&b), "the same rect, not translated back");
+    }
+
+    /// The shape change itself must hand a direct frame back to the composed
+    /// scene: muffin shapes the COW and need not Present again before the
+    /// locker is expected on screen.
+    #[test]
+    fn an_empty_cow_bounding_shape_unflips_the_direct_stage_frame() {
+        use yserver_core::backend::Backend;
+        use yserver_protocol::x11::xfixes::RegionRect;
+
+        let cow = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+        let (stage, source) = (0x0040_0003, 0x0040_0007);
+        let mut b = super::KmsBackend::for_tests();
+        let (w, h) = seed_cow_stage(&mut b, stage);
+        seed_window(&mut b, source, None, 0, 0);
+        let (w, h) = (u16::try_from(w).unwrap(), u16::try_from(h).unwrap());
+        retain_direct_frame_from_source_test(&mut b, source, stage, w, h);
+        assert!(b.scanout_m2.active());
+
+        b.set_shape_rectangles(None, cow, 2, Some(&[])).unwrap();
+        b.set_shape_rectangles(
+            None,
+            cow,
+            0,
+            Some(&[RegionRect {
+                x: 0,
+                y: 0,
+                width: w,
+                height: h,
+            }]),
+        )
+        .unwrap();
+        assert!(
+            !b.scanout_m2.unflip_requested,
+            "an input shape or a root-covering bounding shape keeps the flip"
+        );
+
+        b.set_shape_rectangles(None, cow, 0, Some(&[])).unwrap();
+        assert!(b.scanout_m2.unflip_requested);
+        assert_eq!(b.scanout_m2.unflip_reason, Some("shape_clips_direct_frame"));
+    }
+
     /// #133 step 3 (3.5) — a bordered paint chain is rejected outright,
     /// however perfect the rest of the candidate is: the flip path
     /// assumes content at storage (0, 0) and bordered storage starts at
@@ -48878,6 +49539,7 @@ mod tests {
     fn kbd_map_backend(layout: &str, options: Option<&str>) -> KmsBackend {
         let mut backend = KmsBackend::for_tests();
         backend.core.install_keymap(
+            &crate::kms::xkb::golden_context(),
             crate::kms::xkb::golden_keymap(layout, options),
             &crate::kms::core::XkbRmlvo {
                 rules: "evdev".into(),
@@ -51207,6 +51869,502 @@ mod tests {
         assert_eq!((got[0], got[1], got[8]), (1, 27, 1), "MappingBusy");
         let (_, after) = get_modifier_mapping_reply(&mut state, &mut backend, &mut peer);
         assert_eq!(after, map);
+    }
+
+    /// Windows for the tree-change crossing tests: `A` (0,0 200x200) with
+    /// child `C` (50,50 100x100), and a top-level `B` (50,50 100x100) above
+    /// `A`, all unmapped; the pointer rests at (100,100) on the root. Client
+    /// 14 selects crossings and StructureNotify on each and on the root.
+    fn tree_crossing_fixture() -> (
+        yserver_core::server::ServerState,
+        KmsBackend,
+        std::os::unix::net::UnixStream,
+    ) {
+        use yserver_core::{resources::ROOT_WINDOW, server::ServerState};
+        let mut state = ServerState::new();
+        let mut b = KmsBackend::for_tests();
+        let peer = kbd_map_client_id(&mut state, 14);
+        seed_state_window(&mut state, &mut b, TREE_A, ROOT_WINDOW, 0, 0, 200, 200);
+        seed_state_window(&mut state, &mut b, TREE_C, TREE_A, 50, 50, 100, 100);
+        seed_state_window(&mut state, &mut b, TREE_B, ROOT_WINDOW, 50, 50, 100, 100);
+        let masks = &mut state.clients.get_mut(&14).unwrap().event_masks;
+        masks.insert(ROOT_WINDOW, 0x30);
+        for w in [TREE_A, TREE_B, TREE_C] {
+            masks.insert(w, 0x0002_0030);
+            b.core.xid_map.insert(synth_host_xid(w), w);
+        }
+        b.core.xid_map.insert(b.core.window_id, ROOT_WINDOW);
+        b.core.cursor_x = 100.0;
+        b.core.cursor_y = 100.0;
+        b.core.prev_pointer_window = Some(b.core.window_id);
+        (state, b, peer)
+    }
+
+    const TREE_A: yserver_protocol::x11::ResourceId =
+        yserver_protocol::x11::ResourceId(0x0010_0a01);
+    const TREE_B: yserver_protocol::x11::ResourceId =
+        yserver_protocol::x11::ResourceId(0x0010_0a02);
+    const TREE_C: yserver_protocol::x11::ResourceId =
+        yserver_protocol::x11::ResourceId(0x0010_0a03);
+
+    /// The events client 14 got, one line each: Map/Unmap/Configure/Destroy
+    /// by window, crossings as `Enter|Leave <event> <detail> child=<child>`.
+    fn tree_events(peer: &mut std::os::unix::net::UnixStream) -> Vec<String> {
+        let name = |xid: u32| match xid {
+            0 => "None".to_string(),
+            x if x == TREE_A.0 => "A".to_string(),
+            x if x == TREE_B.0 => "B".to_string(),
+            x if x == TREE_C.0 => "C".to_string(),
+            x if x == yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0 => "COW".to_string(),
+            x if x == yserver_core::resources::ROOT_WINDOW.0 => "root".to_string(),
+            x => format!("{x:#x}"),
+        };
+        let word = |e: &[u8], at: usize| u32::from_le_bytes(e[at..at + 4].try_into().unwrap());
+        let details = [
+            "Ancestor",
+            "Virtual",
+            "Inferior",
+            "Nonlinear",
+            "NonlinearVirtual",
+        ];
+        kbd_map_drain(peer)
+            .chunks(32)
+            .filter_map(|e| match e[0] & 0x7f {
+                7 | 8 => Some(format!(
+                    "{} {} {} child={} mode={}",
+                    if e[0] & 0x7f == 7 { "Enter" } else { "Leave" },
+                    name(word(e, 12)),
+                    details[usize::from(e[1])],
+                    name(word(e, 16)),
+                    e[30],
+                )),
+                17 => Some(format!("Destroy {}", name(word(e, 8)))),
+                18 => Some(format!("Unmap {}", name(word(e, 8)))),
+                19 => Some(format!("Map {}", name(word(e, 8)))),
+                21 => Some(format!(
+                    "Reparent {} to {}",
+                    name(word(e, 8)),
+                    name(word(e, 12))
+                )),
+                22 => Some(format!("Configure {}", name(word(e, 8)))),
+                26 => Some(format!("Circulate {} place={}", name(word(e, 8)), e[16])),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn tree_request(
+        state: &mut yserver_core::server::ServerState,
+        b: &mut KmsBackend,
+        opcode: u8,
+        window: yserver_protocol::x11::ResourceId,
+    ) {
+        dispatch_raw(state, b, opcode, 0, &window.0.to_le_bytes());
+    }
+
+    /// Xvfb, pointer still at the centre: MapWindow of a window under it
+    /// sends MapNotify, then Leave(root, Inferior) / Enter(A, Ancestor), in
+    /// the same request (Xorg MapWindow → WindowsRestructured).
+    #[test]
+    fn map_under_a_still_pointer_crosses_within_the_request() {
+        let (mut state, mut b, mut peer) = tree_crossing_fixture();
+        tree_request(&mut state, &mut b, 8, TREE_A);
+        assert_eq!(
+            tree_events(&mut peer),
+            [
+                "Map A",
+                "Leave root Inferior child=None mode=0",
+                "Enter A Ancestor child=None mode=0",
+            ],
+        );
+        assert_eq!(b.core.prev_pointer_window, Some(synth_host_xid(TREE_A)));
+    }
+
+    /// Xvfb: unmapping the window under the pointer hands it to the window
+    /// it revealed — UnmapNotify, then Leave(B) / Enter(A), both Nonlinear.
+    #[test]
+    fn unmap_under_a_still_pointer_enters_the_revealed_window() {
+        let (mut state, mut b, mut peer) = tree_crossing_fixture();
+        tree_request(&mut state, &mut b, 8, TREE_A);
+        tree_request(&mut state, &mut b, 8, TREE_B);
+        let _ = tree_events(&mut peer);
+        tree_request(&mut state, &mut b, 10, TREE_B);
+        assert_eq!(
+            tree_events(&mut peer),
+            [
+                "Unmap B",
+                "Leave B Nonlinear child=None mode=0",
+                "Enter A Nonlinear child=None mode=0",
+            ],
+        );
+    }
+
+    /// Xvfb: moving a window out from under the pointer leaves its child
+    /// (Ancestor), the window itself (Virtual, child = C) and enters the
+    /// root (Inferior), after the ConfigureNotify; moving it to where it
+    /// already is sends no crossing.
+    #[test]
+    fn configure_under_a_still_pointer_crosses_after_configure_notify() {
+        let (mut state, mut b, mut peer) = tree_crossing_fixture();
+        tree_request(&mut state, &mut b, 8, TREE_A);
+        dispatch_raw(&mut state, &mut b, 9, 0, &TREE_A.0.to_le_bytes());
+        let _ = tree_events(&mut peer);
+        dispatch_configure_window(&mut state, &mut b, TREE_A, Some(0), Some(0), None);
+        assert_eq!(tree_events(&mut peer), Vec::<String>::new());
+        dispatch_configure_window(&mut state, &mut b, TREE_A, Some(300), Some(300), None);
+        assert_eq!(
+            tree_events(&mut peer),
+            [
+                "Configure A",
+                "Leave C Ancestor child=None mode=0",
+                "Leave A Virtual child=C mode=0",
+                "Enter root Inferior child=None mode=0",
+            ],
+        );
+    }
+
+    /// Xvfb: the last ReleaseOverlayWindow with the pointer on the COW
+    /// unmaps it, leaves it for the root while it still exists, and only
+    /// then destroys it (Xorg compDestroyOverlayWindow → DeleteWindow).
+    #[test]
+    fn release_overlay_under_a_still_pointer_leaves_before_destroy_notify() {
+        use yserver_core::resources::{COMPOSITE_OVERLAY_WINDOW, ROOT_WINDOW};
+        let (mut state, mut b, mut peer) = tree_crossing_fixture();
+        let masks = &mut state.clients.get_mut(&14).unwrap().event_masks;
+        masks.insert(ROOT_WINDOW, 0x0008_0030);
+        masks.insert(COMPOSITE_OVERLAY_WINDOW, 0x0002_0030);
+        dispatch_raw(&mut state, &mut b, 144, 7, &ROOT_WINDOW.0.to_le_bytes());
+        assert_eq!(b.core.prev_pointer_window, Some(COMPOSITE_OVERLAY_WINDOW.0));
+        let _ = tree_events(&mut peer);
+        dispatch_raw(&mut state, &mut b, 144, 8, &ROOT_WINDOW.0.to_le_bytes());
+        assert_eq!(
+            tree_events(&mut peer),
+            [
+                "Unmap COW",
+                "Unmap COW",
+                "Leave COW Ancestor child=None mode=0",
+                "Enter root Inferior child=None mode=0",
+                "Destroy COW",
+                "Destroy COW",
+            ],
+        );
+        assert_eq!(b.core.prev_pointer_window, Some(b.core.window_id));
+    }
+
+    /// Xvfb: destroying a window whose child holds the pointer unmaps it
+    /// first — UnmapNotify(A), the crossings out of C and A while both still
+    /// exist, and only then the DestroyNotifys. The pointer never refers to
+    /// a destroyed window afterwards.
+    #[test]
+    fn destroy_under_a_still_pointer_leaves_before_destroy_notify() {
+        let (mut state, mut b, mut peer) = tree_crossing_fixture();
+        tree_request(&mut state, &mut b, 8, TREE_A);
+        dispatch_raw(&mut state, &mut b, 9, 0, &TREE_A.0.to_le_bytes());
+        let _ = tree_events(&mut peer);
+        tree_request(&mut state, &mut b, 4, TREE_A);
+        assert_eq!(
+            tree_events(&mut peer),
+            [
+                "Unmap A",
+                "Leave C Ancestor child=None mode=0",
+                "Leave A Virtual child=C mode=0",
+                "Enter root Inferior child=None mode=0",
+                "Destroy C",
+                "Destroy A",
+            ],
+        );
+        assert_eq!(b.core.prev_pointer_window, Some(b.core.window_id));
+    }
+
+    /// Xvfb: a bounding shape that misses the pointer takes the window out
+    /// from under it as an input shape would (`miSpriteTrace` checks
+    /// `PointInBorderSize`), and resetting it brings the pointer back.
+    #[test]
+    fn bounding_shape_off_the_pointer_leaves_the_window() {
+        let (mut state, mut b, mut peer) = tree_crossing_fixture();
+        tree_request(&mut state, &mut b, 8, TREE_A);
+        tree_request(&mut state, &mut b, 8, TREE_B);
+        let _ = tree_events(&mut peer);
+        // SHAPE Rectangles(Set, Bounding, B, 0,0, [0,0 10x10]).
+        let mut body = vec![0u8, 0, 0, 0];
+        body.extend_from_slice(&TREE_B.0.to_le_bytes());
+        body.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 10, 0, 10, 0]);
+        dispatch_raw(&mut state, &mut b, 141, 1, &body);
+        assert_eq!(
+            tree_events(&mut peer),
+            [
+                "Leave B Nonlinear child=None mode=0",
+                "Enter A Nonlinear child=None mode=0",
+            ],
+        );
+        // SHAPE Mask(Set, Bounding, B, None) resets it.
+        let mut body = vec![0u8, 0, 0, 0];
+        body.extend_from_slice(&TREE_B.0.to_le_bytes());
+        body.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+        dispatch_raw(&mut state, &mut b, 141, 2, &body);
+        assert_eq!(
+            tree_events(&mut peer),
+            [
+                "Leave A Nonlinear child=None mode=0",
+                "Enter B Nonlinear child=None mode=0",
+            ],
+        );
+    }
+
+    /// Xvfb: ReparentWindow of a mapped window is an UnmapWindow, the
+    /// reparent and a MapWindow — the pointer leaves the window at its old
+    /// place before ReparentNotify, and enters it at its new one after
+    /// MapNotify.
+    #[test]
+    fn reparent_of_a_mapped_window_unmaps_and_maps_it_around_the_pointer() {
+        let (mut state, mut b, mut peer) = tree_crossing_fixture();
+        tree_request(&mut state, &mut b, 8, TREE_A);
+        tree_request(&mut state, &mut b, 8, TREE_B);
+        let _ = tree_events(&mut peer);
+        dispatch_reparent_window(&mut state, &mut b, TREE_B, TREE_A, 150, 150);
+        assert_eq!(
+            tree_events(&mut peer),
+            [
+                "Unmap B",
+                "Leave B Nonlinear child=None mode=0",
+                "Enter A Nonlinear child=None mode=0",
+                "Reparent B to A",
+                "Map B",
+            ],
+        );
+        let root = yserver_core::resources::ROOT_WINDOW;
+        dispatch_reparent_window(&mut state, &mut b, TREE_B, root, 50, 50);
+        assert_eq!(
+            tree_events(&mut peer),
+            [
+                "Unmap B",
+                "Reparent B to root",
+                "Map B",
+                "Leave A Nonlinear child=None mode=0",
+                "Enter B Nonlinear child=None mode=0",
+            ],
+        );
+    }
+
+    /// Xorg `CoreEnterLeaveEvent`: a crossing goes to the selections on
+    /// its own window and never propagates — a parent that selected
+    /// crossings gets its Leave(Inferior), not its child's Enter as well.
+    #[test]
+    fn core_crossings_do_not_propagate_to_the_parent() {
+        let (mut state, mut b, mut peer) = tree_crossing_fixture();
+        state
+            .clients
+            .get_mut(&14)
+            .unwrap()
+            .event_masks
+            .remove(&TREE_C);
+        tree_request(&mut state, &mut b, 8, TREE_A);
+        let _ = tree_events(&mut peer);
+        dispatch_raw(&mut state, &mut b, 9, 0, &TREE_A.0.to_le_bytes());
+        assert_eq!(
+            tree_events(&mut peer),
+            ["Leave A Inferior child=None mode=0"],
+        );
+    }
+
+    /// Xvfb, GrabPointer(E, owner_events=false, Enter|Leave): a window
+    /// mapped over E sends the grab client its Leave on E only — the
+    /// Enter on the new window is not the grab window's, so nobody gets it.
+    #[test]
+    fn crossings_under_a_grab_reach_only_the_grab_window() {
+        let (mut state, mut b, mut peer) = tree_crossing_fixture();
+        tree_request(&mut state, &mut b, 8, TREE_A);
+        let _ = tree_events(&mut peer);
+        let mut body = TREE_A.0.to_le_bytes().to_vec();
+        body.extend_from_slice(&0x30u16.to_le_bytes());
+        body.extend_from_slice(&[1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        dispatch_raw(&mut state, &mut b, 26, 0, &body);
+        let _ = tree_events(&mut peer);
+        tree_request(&mut state, &mut b, 8, TREE_B);
+        assert_eq!(
+            tree_events(&mut peer),
+            ["Map B", "Leave A Nonlinear child=None mode=0"],
+        );
+    }
+
+    /// XI2 crossings of client 15, which selected XI_Enter|XI_Leave on the
+    /// master pointers of `windows`: (evtype, deviceid, sourceid, mode,
+    /// detail, event window).
+    fn tree_xi2_crossings(
+        state: &mut yserver_core::server::ServerState,
+        windows: &[yserver_protocol::x11::ResourceId],
+    ) -> std::os::unix::net::UnixStream {
+        let peer = kbd_map_client_id(state, 15);
+        let masks = &mut state.clients.get_mut(&15).unwrap().xi2_masks;
+        for w in windows {
+            masks.insert((*w, 1), (1 << 7) | (1 << 8));
+        }
+        peer
+    }
+
+    fn drain_xi2_crossings(
+        peer: &mut std::os::unix::net::UnixStream,
+    ) -> Vec<(u16, u16, u16, u8, u8, u32)> {
+        let bytes = kbd_map_drain(peer);
+        let half = |at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+        let mut out = Vec::new();
+        let mut at = 0;
+        while at + 32 <= bytes.len() {
+            let len =
+                32 + 4 * u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+            if bytes[at] == 35 {
+                out.push((
+                    half(at + 8),
+                    half(at + 10),
+                    half(at + 16),
+                    bytes[at + 18],
+                    bytes[at + 19],
+                    u32::from_le_bytes(bytes[at + 24..at + 28].try_into().unwrap()),
+                ));
+            }
+            at += if bytes[at] == 35 { len } else { 32 };
+        }
+        out
+    }
+
+    /// Xvfb: GrabPointer's Grab-mode crossings and a tree change's Normal
+    /// ones reach XI2 selectors too, from the master pointer (sourceid 2:
+    /// Xorg passes the master's id when no device event caused them).
+    #[test]
+    fn grab_and_tree_change_crossings_have_an_xi2_form_from_the_master() {
+        let (mut state, mut b, _peer) = tree_crossing_fixture();
+        let mut xi2 = tree_xi2_crossings(&mut state, &[TREE_A, TREE_B]);
+        let (a, bb) = (TREE_A.0, TREE_B.0);
+        tree_request(&mut state, &mut b, 8, TREE_A);
+        assert_eq!(drain_xi2_crossings(&mut xi2), [(7, 2, 2, 0, 0, a)]);
+        tree_request(&mut state, &mut b, 8, TREE_B);
+        assert_eq!(
+            drain_xi2_crossings(&mut xi2),
+            [(8, 2, 2, 0, 3, a), (7, 2, 2, 0, 3, bb)],
+            "map B over A: Leave(A) Enter(B), Nonlinear",
+        );
+        // GrabPointer(A) by client 14: the Grab-mode chain B -> A.
+        let mut body = TREE_A.0.to_le_bytes().to_vec();
+        body.extend_from_slice(&0x30u16.to_le_bytes());
+        body.extend_from_slice(&[1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        dispatch_raw(&mut state, &mut b, 26, 0, &body);
+        assert_eq!(
+            drain_xi2_crossings(&mut xi2),
+            [(8, 2, 2, 1, 3, bb), (7, 2, 2, 1, 3, a)],
+        );
+    }
+
+    /// Xvfb: CirculateWindow(LowerHighest) lowers the highest MAPPED child
+    /// that overlaps a sibling below it (an unmapped one above is skipped),
+    /// RaiseLowest raises the lowest one a sibling above overlaps; each sends
+    /// CirculateNotify, then the crossings of the restack.
+    #[test]
+    fn circulate_picks_the_overlapping_mapped_child() {
+        let (mut state, mut b, mut peer) = tree_crossing_fixture();
+        let unmapped = yserver_protocol::x11::ResourceId(0x0010_0a05);
+        let root = yserver_core::resources::ROOT_WINDOW;
+        seed_state_window(&mut state, &mut b, unmapped, root, 0, 0, 300, 300);
+        tree_request(&mut state, &mut b, 8, TREE_A);
+        tree_request(&mut state, &mut b, 8, TREE_B);
+        let _ = tree_events(&mut peer);
+        dispatch_raw(&mut state, &mut b, 13, 1, &root.0.to_le_bytes());
+        assert_eq!(
+            tree_events(&mut peer),
+            [
+                "Circulate B place=1",
+                "Leave B Nonlinear child=None mode=0",
+                "Enter A Nonlinear child=None mode=0",
+            ],
+        );
+        dispatch_raw(&mut state, &mut b, 13, 0, &root.0.to_le_bytes());
+        assert_eq!(
+            tree_events(&mut peer),
+            [
+                "Circulate B place=0",
+                "Leave A Nonlinear child=None mode=0",
+                "Enter B Nonlinear child=None mode=0",
+            ],
+        );
+    }
+
+    /// Xorg `CoreEnterLeaveEvent`: the `focus` flag is set only on the
+    /// focus window and its inferiors (or everywhere under PointerRoot).
+    #[test]
+    fn crossing_focus_flag_follows_the_focus_window() {
+        let (mut state, mut b, mut peer) = tree_crossing_fixture();
+        state.core_focus.raw = TREE_A.0;
+        tree_request(&mut state, &mut b, 8, TREE_A);
+        dispatch_raw(&mut state, &mut b, 9, 0, &TREE_A.0.to_le_bytes());
+        let flags = |peer: &mut std::os::unix::net::UnixStream| -> Vec<(u8, u32, u8)> {
+            kbd_map_drain(peer)
+                .chunks(32)
+                .filter(|e| matches!(e[0] & 0x7f, 7 | 8))
+                .map(|e| {
+                    (
+                        e[0],
+                        u32::from_le_bytes(e[12..16].try_into().unwrap()),
+                        e[31],
+                    )
+                })
+                .collect()
+        };
+        let root = yserver_core::resources::ROOT_WINDOW.0;
+        assert_eq!(
+            flags(&mut peer),
+            [
+                (8, root, 2),
+                (7, TREE_A.0, 3),
+                (8, TREE_A.0, 3),
+                (7, TREE_C.0, 3)
+            ],
+        );
+        // Xvfb: a window over the focus window, not inside it, has no focus.
+        tree_request(&mut state, &mut b, 8, TREE_B);
+        assert_eq!(
+            flags(&mut peer),
+            [(8, TREE_C.0, 3), (8, TREE_A.0, 3), (7, TREE_B.0, 2)],
+        );
+    }
+
+    /// Xvfb: DestroyWindow sends UnmapNotify for the destroyed window only,
+    /// and DestroyNotify for its inferiors topmost first (Xorg CrushTree).
+    #[test]
+    fn destroy_notifies_inferiors_topmost_first_without_unmap_notify() {
+        use yserver_protocol::x11::ResourceId;
+        let (mut state, mut b, mut peer) = tree_crossing_fixture();
+        let top = ResourceId(0x0010_0a04);
+        seed_state_window(&mut state, &mut b, top, TREE_A, 0, 0, 10, 10);
+        state
+            .clients
+            .get_mut(&14)
+            .unwrap()
+            .event_masks
+            .insert(top, 0x0002_0000);
+        tree_request(&mut state, &mut b, 8, TREE_A);
+        dispatch_raw(&mut state, &mut b, 9, 0, &TREE_A.0.to_le_bytes());
+        let _ = tree_events(&mut peer);
+        tree_request(&mut state, &mut b, 4, TREE_A);
+        let events = tree_events(&mut peer);
+        let structure: Vec<&String> = events
+            .iter()
+            .filter(|e| !e.starts_with("Enter") && !e.starts_with("Leave"))
+            .collect();
+        assert_eq!(
+            structure,
+            ["Unmap A", "Destroy 0x100a04", "Destroy C", "Destroy A"],
+        );
+    }
+
+    /// A tree change is not user input: its crossings leave the idle clock
+    /// (and with it DPMS and the screen saver) alone.
+    #[test]
+    fn tree_change_crossings_do_not_count_as_activity() {
+        let (mut state, mut b, mut peer) = tree_crossing_fixture();
+        let idle_since = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        state.dpms.last_activity = idle_since;
+        tree_request(&mut state, &mut b, 8, TREE_A);
+        assert_eq!(tree_events(&mut peer).len(), 3);
+        assert_eq!(state.dpms.last_activity, idle_since);
     }
 }
 
