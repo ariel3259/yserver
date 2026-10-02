@@ -473,7 +473,19 @@ pub(crate) fn build_pointer_class_block_for_device(
     state: &mut ServerState,
     device_id: u16,
 ) -> (Vec<u8>, u16) {
-    let class_data = crate::xinput::query::XiQueryClassData {
+    let class_data = pointer_class_data_for_device(state, device_id);
+    crate::xinput::query::build_pointer_classes(
+        ClientByteOrder::LittleEndian,
+        device_id,
+        class_data,
+    )
+}
+
+pub(crate) fn pointer_class_data_for_device(
+    state: &mut ServerState,
+    device_id: u16,
+) -> crate::xinput::query::XiQueryClassData {
+    crate::xinput::query::XiQueryClassData {
         button_labels: [
             state.atoms.intern("Button Left", false),
             state.atoms.intern("Button Middle", false),
@@ -501,12 +513,7 @@ pub(crate) fn build_pointer_class_block_for_device(
                 .device(device_id)
                 .map_or(state.scroll_axis_value, |device| device.scroll_axis_values)
         },
-    };
-    crate::xinput::query::build_pointer_classes(
-        ClientByteOrder::LittleEndian,
-        device_id,
-        class_data,
-    )
+    }
 }
 
 /// State-borrowing replacement for `nested::expose_event_fanout`.

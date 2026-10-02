@@ -354,6 +354,11 @@ pub fn key_event_fanout_after_transition(
     };
     let device_id = xi_source.slave_deviceid.unwrap_or(xi_source.sourceid);
     let master_id = xi_source.attached_master;
+    let mut switch_dropped = Vec::new();
+    if let (Some(sourceid), Some(master_id)) = (xi_source.slave_deviceid, master_id) {
+        switch_dropped =
+            crate::xinput::hotplug::announce_xi2_slave_switch(state, master_id, sourceid);
+    }
     // DPMS: any key resets the idle timer; from any non-On level
     // we wake the screen *before* fanning out, so the first event
     // of the resumed session lands on a visible scanout.
@@ -443,7 +448,11 @@ pub fn key_event_fanout_after_transition(
         return Vec::new();
     }
 
-    let dropped = deliver_routed_key_with_master_status(state, event, master_transition_accepted);
+    let mut dropped = switch_dropped;
+    merge_dropped(
+        &mut dropped,
+        deliver_routed_key_with_master_status(state, event, master_transition_accepted),
+    );
 
     // XkbStateNotify (GH #59): libxkbcommon-x11 clients (kitty/GLFW, all
     // of Wayland's X11 path) keep their xkb_state synchronized ONLY from
@@ -490,6 +499,21 @@ pub fn key_event_fanout_after_transition(
     backend.sync_floating_keyboard_states(state);
 
     dropped
+}
+
+/// Publish a master source switch before KMS emits the raw-key form. Xorg
+/// queues `UpdateFromMaster`'s DeviceChanged before the raw and device events.
+pub fn announce_key_source_switch(
+    state: &mut ServerState,
+    origin: crate::core_loop::InputOrigin,
+) -> Vec<ClientId> {
+    let Some(source) = resolve_key_xi_source(state, origin) else {
+        return Vec::new();
+    };
+    let (Some(sourceid), Some(master_id)) = (source.slave_deviceid, source.attached_master) else {
+        return Vec::new();
+    };
+    crate::xinput::hotplug::announce_xi2_slave_switch(state, master_id, sourceid)
 }
 
 /// The routing+delivery tail of [`key_event_fanout_to_state`] —
@@ -1847,6 +1871,123 @@ mod tests {
             );
             assert!(state.xi_devices.source(removed_source).is_none());
             assert_eq!(state.xi_devices.devices().len(), 126);
+        }
+
+        #[test]
+        fn xi_slave_switch_keyboards_alternate_before_master_key_and_keep_same_source_quiet() {
+            const DEVICE_CHANGED: u64 = 1 << 1;
+            let mut state = ServerState::new();
+            let razer = InputSourceId(0xA61);
+            let hyperx = InputSourceId(0xA62);
+            let razer_id = state.xi_register_source(&keyboard_info(razer))[0];
+            let hyperx_id = state.xi_register_source(&keyboard_info(hyperx))[0];
+            state.xi_devices.device_mut(razer_id).unwrap().name = "Razer keyboard".to_owned();
+            state.xi_devices.device_mut(hyperx_id).unwrap().name = "HyperX keyboard".to_owned();
+            assert_eq!((razer_id, hyperx_id), (6, 7));
+
+            let mut peer = root_selector(&mut state, 61, 3);
+            state
+                .clients
+                .get_mut(&61)
+                .unwrap()
+                .xi2_masks
+                .insert((ROOT_WINDOW, 3), u64::from(ROUTED_MASK) | DEVICE_CHANGED);
+            let mut backend = crate::backend::recording::RecordingBackend::new();
+
+            let parse = |bytes: &[u8]| {
+                let mut events = Vec::new();
+                let mut offset = 0;
+                while offset + 32 <= bytes.len() {
+                    let event_type = u16::from_le_bytes([bytes[offset + 8], bytes[offset + 9]]);
+                    let device_id = u16::from_le_bytes([bytes[offset + 10], bytes[offset + 11]]);
+                    let source_offset = if event_type == 1 { 18 } else { 52 };
+                    let source_id = u16::from_le_bytes([
+                        bytes[offset + source_offset],
+                        bytes[offset + source_offset + 1],
+                    ]);
+                    if event_type == 1 {
+                        let num_classes =
+                            u16::from_le_bytes([bytes[offset + 16], bytes[offset + 17]]);
+                        assert_eq!(num_classes, 1, "keyboard switch carries KeyClass");
+                        assert_eq!(
+                            u16::from_le_bytes([bytes[offset + 32], bytes[offset + 33]]),
+                            0,
+                            "class is KeyClass"
+                        );
+                        assert_eq!(
+                            u16::from_le_bytes([bytes[offset + 36], bytes[offset + 37]]),
+                            source_id,
+                            "KeyClass belongs to the new keyboard source"
+                        );
+                        assert_eq!(bytes[offset + 20], 1, "XI2.h XISlaveSwitch");
+                    }
+                    events.push((event_type, device_id, source_id));
+                    let units =
+                        u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap());
+                    offset += 32 + units as usize * 4;
+                }
+                assert_eq!(offset, bytes.len(), "complete XI2 event stream");
+                events
+            };
+
+            let input = |source, keycode, pressed| {
+                let mut event = key_event_from(InputOrigin::Physical(source), pressed);
+                event.keycode = keycode;
+                event
+            };
+            let send = |state: &mut ServerState,
+                        backend: &mut crate::backend::recording::RecordingBackend,
+                        peer: &mut crate::transport::CapturedPeer,
+                        source,
+                        keycode,
+                        pressed| {
+                let _dropped =
+                    key_event_fanout_to_state(state, backend, input(source, keycode, pressed));
+                parse(&capture_read_all(peer))
+            };
+
+            assert_eq!(
+                send(&mut state, &mut backend, &mut peer, razer, 38, true),
+                vec![(1, 3, razer_id), (2, 3, razer_id)]
+            );
+            assert_eq!(
+                send(&mut state, &mut backend, &mut peer, razer, 39, true),
+                vec![(2, 3, razer_id)],
+                "continuing on the same keyboard emits no switch"
+            );
+            assert_eq!(
+                send(&mut state, &mut backend, &mut peer, hyperx, 40, true),
+                vec![(1, 3, hyperx_id), (2, 3, hyperx_id)]
+            );
+            assert_eq!(
+                send(&mut state, &mut backend, &mut peer, hyperx, 41, true),
+                vec![(2, 3, hyperx_id)],
+                "continuing on HyperX emits no switch"
+            );
+
+            for (source, keycode) in [(razer, 38), (razer, 39), (hyperx, 40), (hyperx, 41)] {
+                let _ = send(&mut state, &mut backend, &mut peer, source, keycode, false);
+            }
+            assert_eq!(state.xi_last_slave(3), Some(hyperx_id));
+            assert!(state.keys_down.iter().all(|byte| *byte == 0));
+            assert!(
+                state
+                    .key_down_by_device
+                    .values()
+                    .all(std::collections::HashMap::is_empty)
+            );
+            assert!(state.sync_pending.is_empty());
+            assert_eq!(state.xi_devices.devices().len(), 6);
+            assert!(state.xi_devices.device(razer_id).unwrap().enabled);
+            assert!(state.xi_devices.device(hyperx_id).unwrap().enabled);
+            assert_eq!(
+                state.xi_devices.source(razer).unwrap().name,
+                "keyboard 2657"
+            );
+            assert_eq!(
+                state.xi_devices.source(hyperx).unwrap().name,
+                "keyboard 2658"
+            );
         }
     }
 

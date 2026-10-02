@@ -829,6 +829,21 @@ fn pointer_event_fanout_to_state_inner(
     // Step 1 — translate host-screen coords to ynest-root coords.
     let event = translate_host_event(state, xid_map, event);
 
+    // Xorg `GetPointerEvents` inserts UpdateFromMaster's DeviceChanged
+    // before the raw and device forms. A replay has already passed that
+    // generation point and must not switch the master a second time.
+    if !is_replay
+        && !suppress_raw
+        && button_transition.source_accepted
+        && let (Some(sourceid), Some(master_id)) =
+            (xi_source.slave_deviceid, xi_source.attached_master)
+    {
+        merge_dropped(
+            &mut dropped,
+            crate::xinput::hotplug::announce_xi2_slave_switch(state, master_id, sourceid),
+        );
+    }
+
     // RECORD sees each physical pointer event once, before grabs and
     // delivery, and not again when a frozen queue replays it (Xorg
     // `ProcessDeviceEvent` skips the callback while playingEvents).
@@ -4802,6 +4817,194 @@ mod tests {
             ],
             "each source retains its own valuator state"
         );
+    }
+
+    #[test]
+    fn xi_slave_switch_pointer_alternates_before_master_motion_and_uses_facet_scroll() {
+        use crate::core_loop::InputOrigin;
+
+        const RAZER: u64 = 0xA51;
+        const HYPERX: u64 = 0xA52;
+        const XI_MOTION: u64 = 1 << 6;
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        let mut peer = install_capture_client(&mut state, 91);
+        let razer = pointer_source(&mut state, RAZER, true);
+        let hyperx = pointer_source(&mut state, HYPERX, true);
+        state.xi_devices.device_mut(razer).unwrap().name = "Razer".to_owned();
+        state.xi_devices.device_mut(hyperx).unwrap().name = "HyperX".to_owned();
+        assert_eq!((razer, hyperx), (6, 7));
+        select_xi2(
+            &mut state,
+            91,
+            2,
+            u64::from(crate::xinput::XI2_DEVICE_CHANGED_MASK),
+        );
+
+        // Generate independent scroll state through the ordinary pointer
+        // event path before checking the classes carried by later switches.
+        for (source, device) in [(RAZER, razer), (HYPERX, hyperx)] {
+            for (kind, time) in [
+                (PointerEventKind::ButtonPress, 1),
+                (PointerEventKind::ButtonRelease, 2),
+            ] {
+                let _dropped = pointer_event_fanout_to_state(
+                    &mut state,
+                    &mut backend,
+                    &HostXidMap::new(),
+                    source_button_event(
+                        kind,
+                        InputOrigin::Physical(crate::xinput::InputSourceId(source)),
+                        5,
+                        time,
+                    ),
+                    true,
+                    false,
+                );
+            }
+            assert_eq!(
+                state.xi_devices.device(device).unwrap().scroll_axis_values,
+                [1, 0]
+            );
+            let _ = read_all_capture_available(&mut peer);
+        }
+
+        select_xi2(
+            &mut state,
+            91,
+            2,
+            u64::from(crate::xinput::XI2_DEVICE_CHANGED_MASK) | XI_MOTION,
+        );
+        let mut headers = Vec::new();
+        for (source, device) in [(RAZER, razer), (HYPERX, hyperx), (HYPERX, hyperx)] {
+            let event = HostPointerEvent {
+                origin: InputOrigin::Physical(crate::xinput::InputSourceId(source)),
+                ..motion_event()
+            };
+            let _dropped = pointer_event_fanout_to_state(
+                &mut state,
+                &mut backend,
+                &HostXidMap::new(),
+                event,
+                true,
+                false,
+            );
+            let bytes = read_all_capture_available(&mut peer);
+            let mut offset = 0;
+            while offset + 32 <= bytes.len() {
+                let event_type = u16::from_le_bytes([bytes[offset + 8], bytes[offset + 9]]);
+                let event_device = u16::from_le_bytes([bytes[offset + 10], bytes[offset + 11]]);
+                let source_offset = if event_type == 1 { 18 } else { 52 };
+                let event_source = u16::from_le_bytes([
+                    bytes[offset + source_offset],
+                    bytes[offset + source_offset + 1],
+                ]);
+                if event_type == 1 {
+                    let reason = bytes[offset + 20];
+                    let num_classes =
+                        u16::from_le_bytes([bytes[offset + 16], bytes[offset + 17]]) as usize;
+                    let mut class_offset = offset + 32;
+                    let mut valuators = Vec::new();
+                    for _ in 0..num_classes {
+                        let class_type =
+                            u16::from_le_bytes([bytes[class_offset], bytes[class_offset + 1]]);
+                        let units =
+                            u16::from_le_bytes([bytes[class_offset + 2], bytes[class_offset + 3]])
+                                as usize;
+                        let class_source =
+                            u16::from_le_bytes([bytes[class_offset + 4], bytes[class_offset + 5]]);
+                        if class_type == 2 {
+                            let number = u16::from_le_bytes([
+                                bytes[class_offset + 6],
+                                bytes[class_offset + 7],
+                            ]);
+                            let value = i32::from_le_bytes(
+                                bytes[class_offset + 28..class_offset + 32]
+                                    .try_into()
+                                    .unwrap(),
+                            );
+                            valuators.push((class_source, number, value));
+                        }
+                        class_offset += units * 4;
+                    }
+                    assert_eq!(
+                        class_offset,
+                        offset
+                            + 32
+                            + u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap(),)
+                                as usize
+                                * 4
+                    );
+                    assert_eq!(event_device, 2, "DeviceChanged is on the master pointer");
+                    assert_eq!(event_source, device, "sourceid is the newly active slave");
+                    assert_eq!(reason, 1, "XI2.h XISlaveSwitch");
+                    assert_eq!(
+                        valuators,
+                        vec![
+                            (device, 0, 400),
+                            (device, 1, 300),
+                            (device, 2, 1),
+                            (device, 3, 0),
+                        ],
+                        "class valuators use the switching facet's scroll snapshot"
+                    );
+                }
+                headers.push((event_type, event_device, event_source));
+                let units =
+                    u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
+                offset += 32 + units * 4;
+            }
+            assert_eq!(offset, bytes.len(), "complete XI2 event stream");
+        }
+        assert_eq!(
+            headers,
+            vec![
+                (1, 2, razer),
+                (6, 2, razer),
+                (1, 2, hyperx),
+                (6, 2, hyperx),
+                (6, 2, hyperx),
+            ],
+            "a source switch precedes that source's first master event; same-source motion has none"
+        );
+
+        // A floating slave still delivers its own form, but cannot replace
+        // the attached master's last source.
+        assert!(state.detach_xi2_slave(razer));
+        let floating = HostPointerEvent {
+            origin: InputOrigin::XTest(razer),
+            ..motion_event()
+        };
+        let _dropped = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &HostXidMap::new(),
+            floating,
+            true,
+            false,
+        );
+        let floating_events = read_all_capture_available(&mut peer);
+        assert!(
+            !floating_events
+                .chunks_exact(32)
+                .any(|event| event[0] == 35 && u16::from_le_bytes([event[8], event[9]]) == 1),
+            "floating input does not emit a master DeviceChanged"
+        );
+        assert_eq!(state.xi_last_slave(2), Some(hyperx));
+        assert_eq!(state.buttons_down, 0);
+        assert!(state.sync_pending.is_empty());
+        assert!(state.unpublished_pointer_buttons_down.is_empty());
+        assert_eq!(state.xi_devices.devices().len(), 6);
+        assert_eq!(
+            state.xi_devices.device(razer).unwrap().scroll_axis_values,
+            [1, 0]
+        );
+        assert_eq!(
+            state.xi_devices.device(hyperx).unwrap().scroll_axis_values,
+            [1, 0]
+        );
+        assert!(state.xi_devices.device(razer).unwrap().enabled);
+        assert!(state.xi_devices.device(hyperx).unwrap().enabled);
     }
 
     #[test]

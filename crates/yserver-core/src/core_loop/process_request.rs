@@ -17785,7 +17785,7 @@ fn handle_xi2_request(
                         } else {
                             client.xi2_masks.insert((window, deviceid), mask);
                             if window == ROOT_WINDOW
-                                && matches!(deviceid, 0..=2)
+                                && matches!(deviceid, 0..=3)
                                 && (mask & u64::from(XI2_DEVICE_CHANGED_MASK)) != 0
                             {
                                 send_device_changed_bootstrap = true;
@@ -34530,124 +34530,63 @@ fn emit_xi2_device_changed_bootstrap(
     sequence: SequenceNumber,
     major_opcode: u8,
 ) -> io::Result<()> {
-    fn write_button_class(buf: &mut Vec<u8>, sourceid: u16, label_atoms: &[AtomId]) {
-        let le = x11::ClientByteOrder::LittleEndian;
-        let num_buttons = u16::try_from(label_atoms.len()).unwrap_or(u16::MAX);
-        let state_words = num_buttons.div_ceil(32) as usize;
-        let byte_len = 8 + 4 * state_words + 4 * num_buttons as usize;
-        x11::write_u16(le, buf, 1);
-        x11::write_u16(le, buf, (byte_len / 4) as u16);
-        x11::write_u16(le, buf, sourceid);
-        x11::write_u16(le, buf, num_buttons);
-        buf.extend(std::iter::repeat_n(0u8, 4 * state_words));
-        for atom in label_atoms {
-            x11::write_u32(le, buf, atom.0);
-        }
-    }
-
-    fn write_valuator_class(
-        buf: &mut Vec<u8>,
-        sourceid: u16,
-        number: u16,
-        label_atom: AtomId,
-        value: i32,
-    ) {
-        let le = x11::ClientByteOrder::LittleEndian;
-        x11::write_u16(le, buf, 2);
-        x11::write_u16(le, buf, 11);
-        x11::write_u16(le, buf, sourceid);
-        x11::write_u16(le, buf, number);
-        x11::write_u32(le, buf, label_atom.0);
-        x11::write_u32(le, buf, u32::MAX);
-        x11::write_u32(le, buf, 0);
-        x11::write_u32(le, buf, u32::MAX);
-        x11::write_u32(le, buf, 0);
-        x11::write_u32(le, buf, value as u32);
-        x11::write_u32(le, buf, 0);
-        x11::write_u32(le, buf, 0);
-        buf.push(0);
-        buf.extend_from_slice(&[0u8; 3]);
-    }
-
-    fn write_scroll_class(buf: &mut Vec<u8>, sourceid: u16, number: u16, scroll_type: u16) {
-        let le = x11::ClientByteOrder::LittleEndian;
-        x11::write_u16(le, buf, 3);
-        x11::write_u16(le, buf, 6);
-        x11::write_u16(le, buf, sourceid);
-        x11::write_u16(le, buf, number);
-        x11::write_u16(le, buf, scroll_type);
-        x11::write_u16(le, buf, 0);
-        // Flags = 0 to match the XIQueryDevice encoder's `write_scroll_class`
-        // (the canonical comment lives there). XIScrollFlagNoEmulation would
-        // be a contract violation while we still emit emulated XI_ButtonPress
-        // 4..7 — release Chrome crashes on it (2026-05-29). xserver's
-        // XIQueryDevice and DeviceChanged paths populate this field from a
-        // single `axis->scroll.flags` source
-        // (`Xi/xiquerydevice.c:ListScrollInfo` and
-        // `dix/eventconvert.c:appendScrollInfo`), so the two encoders here
-        // must agree.
-        x11::write_u32(le, buf, 0);
-        x11::write_u32(le, buf, 1);
-        x11::write_u32(le, buf, 0);
-    }
-
-    let pointer = (
-        i32::from(state.randr.screen_width) / 2,
-        i32::from(state.randr.screen_height) / 2,
-    );
-    let button_labels = [
-        state.atoms.intern("Button Left", false),
-        state.atoms.intern("Button Middle", false),
-        state.atoms.intern("Button Right", false),
-        state.atoms.intern("Button Wheel Up", false),
-        state.atoms.intern("Button Wheel Down", false),
-        state.atoms.intern("Button Horiz Wheel Left", false),
-        state.atoms.intern("Button Horiz Wheel Right", false),
-    ];
-    let axis_labels = [
-        state.atoms.intern("Rel X", false),
-        state.atoms.intern("Rel Y", false),
-        state.atoms.intern("Rel Vert Scroll", false),
-        state.atoms.intern("Rel Horiz Scroll", false),
-    ];
-    let mut classes = Vec::new();
-    write_button_class(&mut classes, 4, &button_labels);
-    write_valuator_class(&mut classes, 4, 0, axis_labels[0], pointer.0);
-    write_valuator_class(&mut classes, 4, 1, axis_labels[1], pointer.1);
-    write_valuator_class(
-        &mut classes,
-        4,
-        2,
-        axis_labels[2],
-        state.scroll_axis_value[0],
-    );
-    write_valuator_class(
-        &mut classes,
-        4,
-        3,
-        axis_labels[3],
-        state.scroll_axis_value[1],
-    );
-    write_scroll_class(&mut classes, 4, 2, 1);
-    write_scroll_class(&mut classes, 4, 3, 2);
     let time = state.timestamp_now();
-
-    let Some(client) = state.clients.get_mut(&client_id.0) else {
+    let Some((byte_order, selected_masters)) = state.clients.get(&client_id.0).map(|client| {
+        (
+            client.byte_order,
+            [
+                crate::xinput::DEVICEID_MASTER_POINTER,
+                crate::xinput::DEVICEID_MASTER_KEYBOARD,
+            ]
+            .into_iter()
+            .filter(|master_id| {
+                client
+                    .xi2_masks
+                    .iter()
+                    .any(|(&(window, device_id), &mask)| {
+                        window == ROOT_WINDOW
+                            && (matches!(device_id, 0 | 1) || device_id == *master_id)
+                            && (mask & u64::from(XI2_DEVICE_CHANGED_MASK)) != 0
+                    })
+            })
+            .collect::<Vec<_>>(),
+        )
+    }) else {
         return Ok(());
     };
     let mut buf = Vec::new();
-    x11::encode_xi2_device_changed_event(
-        &mut buf,
-        client.byte_order,
-        sequence,
-        major_opcode,
-        2,
-        time,
-        7,
-        4,
-        1,
-        &classes,
-    );
+    for master_id in selected_masters {
+        let sourceid = state
+            .xi_last_slave(master_id)
+            .filter(|sourceid| {
+                state.xi_devices.device(*sourceid).is_some_and(|device| {
+                    device.enabled && device.attached_master == Some(master_id)
+                })
+            })
+            .unwrap_or(master_id);
+        let Some((classes, num_classes)) =
+            crate::xinput::hotplug::device_changed_class_block(state, sourceid, byte_order)
+        else {
+            continue;
+        };
+        let mut event_buf = Vec::new();
+        x11::encode_xi2_device_changed_event(
+            &mut event_buf,
+            byte_order,
+            sequence,
+            major_opcode,
+            master_id,
+            time,
+            num_classes,
+            sourceid,
+            crate::xinput::hotplug::XiDeviceChangeReason::SlaveSwitch as u8,
+            &classes,
+        );
+        buf.extend_from_slice(&event_buf);
+    }
+    let Some(client) = state.clients.get_mut(&client_id.0) else {
+        return Ok(());
+    };
     let _outcome = write_to_client(client, client_id, &buf);
     Ok(())
 }
@@ -43983,7 +43922,290 @@ mod tests {
             .expect("bootstrap XI_DeviceChanged event");
         assert_eq!(wire[event_offset + 10], 2, "deviceid low byte");
         assert_eq!(wire[event_offset + 16], 7, "num_classes low byte");
-        assert_eq!(wire[event_offset + 18], 4, "sourceid low byte");
+        assert_eq!(
+            wire[event_offset + 18],
+            2,
+            "sourceid falls back to master pointer"
+        );
+    }
+
+    #[test]
+    fn xi_slave_switch_bootstrap_uses_last_pointer_slave_or_master_classes() {
+        use crate::{
+            backend::recording::RecordingBackend,
+            core_loop::{DeviceInfo, InputOrigin, pointer_fanout::pointer_event_fanout_to_state},
+            host_x11::{HostPointerEvent, HostXidMap, PointerEventKind},
+            xinput::{InputCapabilities, InputSourceId, XiFacetKind},
+        };
+
+        fn select_master_pointer(
+            state: &mut ServerState,
+            backend: &mut RecordingBackend,
+            client: u32,
+            sequence: u16,
+        ) {
+            let mut body = Vec::new();
+            body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+            body.extend_from_slice(&1u16.to_le_bytes());
+            body.extend_from_slice(&0u16.to_le_bytes());
+            body.extend_from_slice(&2u16.to_le_bytes());
+            body.extend_from_slice(&1u16.to_le_bytes());
+            body.extend_from_slice(&XI2_DEVICE_CHANGED_MASK.to_le_bytes());
+            handle_xi2_request(
+                state,
+                backend,
+                None,
+                ClientId(client),
+                SequenceNumber(sequence),
+                RequestHeader {
+                    opcode: 131,
+                    data: 46,
+                    length_units: 5,
+                },
+                &body,
+            )
+            .expect("XISelectEvents on master pointer");
+        }
+
+        fn device_changed(bytes: &[u8]) -> (u16, u16, u8, u16, i32) {
+            let offset = (0..bytes.len().saturating_sub(32))
+                .find(|&offset| {
+                    bytes[offset] == 35
+                        && u16::from_le_bytes([bytes[offset + 8], bytes[offset + 9]]) == 1
+                })
+                .unwrap_or_else(|| panic!("bootstrap XI_DeviceChanged event missing: {bytes:?}"));
+            let deviceid = u16::from_le_bytes([bytes[offset + 10], bytes[offset + 11]]);
+            let num_classes = u16::from_le_bytes([bytes[offset + 16], bytes[offset + 17]]);
+            let sourceid = u16::from_le_bytes([bytes[offset + 18], bytes[offset + 19]]);
+            let reason = bytes[offset + 20];
+            let mut class_offset = offset + 32;
+            let mut valuator_two = None;
+            for _ in 0..num_classes {
+                let class_type = u16::from_le_bytes([bytes[class_offset], bytes[class_offset + 1]]);
+                let units =
+                    u16::from_le_bytes([bytes[class_offset + 2], bytes[class_offset + 3]]) as usize;
+                let class_source =
+                    u16::from_le_bytes([bytes[class_offset + 4], bytes[class_offset + 5]]);
+                if class_type == 2
+                    && u16::from_le_bytes([bytes[class_offset + 6], bytes[class_offset + 7]]) == 2
+                {
+                    valuator_two = Some((
+                        class_source,
+                        i32::from_le_bytes(
+                            bytes[class_offset + 28..class_offset + 32]
+                                .try_into()
+                                .unwrap(),
+                        ),
+                    ));
+                }
+                class_offset += units * 4;
+            }
+            let (class_source, scroll_value) = valuator_two.expect("vertical scroll valuator");
+            assert_eq!(class_source, sourceid, "classes use the reported source");
+            (deviceid, sourceid, reason, num_classes, scroll_value)
+        }
+
+        let mut state = ServerState::new();
+        let mut bootstrap_peer = install_capture_client(&mut state, 101);
+        let mut backend = RecordingBackend::new();
+
+        // With no observed physical source, XISelectEvents reports the
+        // current master pointer classes and keeps sourceid at master 2.
+        select_master_pointer(&mut state, &mut backend, 101, 1);
+        assert_eq!(
+            state
+                .clients
+                .get(&101)
+                .unwrap()
+                .xi2_masks
+                .get(&(ROOT_WINDOW, 2)),
+            Some(&u64::from(XI2_DEVICE_CHANGED_MASK)),
+            "master pointer DeviceChanged selection was installed"
+        );
+        let fallback = read_all_available(&mut bootstrap_peer);
+        assert_eq!(
+            device_changed(&fallback),
+            (2, 2, 1, 7, 0),
+            "bootstrap does not invent XTEST pointer 4 as a physical source"
+        );
+
+        let source = InputSourceId(0xA71);
+        let info = DeviceInfo {
+            source_id: source,
+            enabled: true,
+            resume_key: None,
+            capabilities: InputCapabilities {
+                keyboard: false,
+                pointer: true,
+                touch: false,
+            },
+            name: "Razer mouse".to_owned(),
+            device_node: "/dev/input/event-razer".to_owned(),
+            sysname: "event-razer".to_owned(),
+            vendor_id: 1,
+            product_id: 2,
+            is_touchpad: false,
+            config: Default::default(),
+        };
+        let source_id = state.xi_register_source(&info)[0];
+        let wheel = HostPointerEvent {
+            origin: InputOrigin::Physical(source),
+            kind: PointerEventKind::ButtonPress,
+            detail: 5,
+            host_xid: 0,
+            time: 2,
+            root_x: 10,
+            root_y: 20,
+            event_x: 10,
+            event_y: 20,
+            state: 0,
+            crossing_mode: 0,
+            child: 0,
+            raw_dx: 0,
+            raw_dy: 0,
+            tree_change: false,
+        };
+        let _dropped = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &HostXidMap::new(),
+            wheel,
+            true,
+            false,
+        );
+        let release = HostPointerEvent {
+            kind: PointerEventKind::ButtonRelease,
+            time: 3,
+            ..wheel
+        };
+        let _dropped = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &HostXidMap::new(),
+            release,
+            true,
+            false,
+        );
+        let _ = read_all_available(&mut bootstrap_peer);
+
+        let mut late_peer = install_capture_client(&mut state, 102);
+        select_master_pointer(&mut state, &mut backend, 102, 2);
+        assert_eq!(
+            device_changed(&read_all_available(&mut late_peer)),
+            (2, source_id, 1, 7, 1),
+            "a late selector bootstraps from the current last slave and its scroll state"
+        );
+        assert_eq!(state.xi_last_slave(2), Some(source_id));
+        assert_eq!(
+            state
+                .xi_devices
+                .device(source_id)
+                .unwrap()
+                .scroll_axis_values,
+            [1, 0]
+        );
+        assert_eq!(state.xi_devices.devices().len(), 5);
+        assert!(state.xi_devices.source(source).is_some());
+        assert_eq!(
+            state.xi_devices.facet(source, XiFacetKind::PointerTouch),
+            Some(source_id)
+        );
+        assert_eq!(state.buttons_down, 0);
+        assert!(state.sync_pending.is_empty());
+        assert!(state.unpublished_pointer_buttons_down.is_empty());
+    }
+
+    #[test]
+    fn xi_device_changed_device_change_reason_uses_existing_facet_classes() {
+        use crate::{
+            core_loop::DeviceInfo,
+            xinput::{InputCapabilities, InputSourceId, XiFacetKind},
+        };
+
+        let mut state = ServerState::new();
+        let mut selected = install_client(&mut state, 111);
+        let mut unrelated = install_client(&mut state, 112);
+        let source = InputSourceId(0xA72);
+        let info = DeviceInfo {
+            source_id: source,
+            enabled: true,
+            resume_key: None,
+            capabilities: InputCapabilities {
+                keyboard: false,
+                pointer: true,
+                touch: false,
+            },
+            name: "HyperX mouse".to_owned(),
+            device_node: "/dev/input/event-hyperx".to_owned(),
+            sysname: "event-hyperx".to_owned(),
+            vendor_id: 3,
+            product_id: 4,
+            is_touchpad: false,
+            config: Default::default(),
+        };
+        let device_id = state.xi_register_source(&info)[0];
+        state
+            .clients
+            .get_mut(&111)
+            .unwrap()
+            .xi2_masks
+            .insert((ROOT_WINDOW, device_id), u64::from(XI2_DEVICE_CHANGED_MASK));
+
+        let dropped = crate::xinput::hotplug::emit_xi2_device_changed(
+            &mut state,
+            device_id,
+            crate::xinput::hotplug::XiDeviceChangeReason::DeviceChange,
+            device_id,
+        );
+        assert!(dropped.is_empty());
+        let wire = read_all_available(&mut selected);
+        let offset = (0..wire.len().saturating_sub(32))
+            .find(|&offset| {
+                wire[offset] == 35 && u16::from_le_bytes([wire[offset + 8], wire[offset + 9]]) == 1
+            })
+            .expect("XI_DeviceChanged class update");
+        assert_eq!(
+            u16::from_le_bytes([wire[offset + 10], wire[offset + 11]]),
+            device_id
+        );
+        assert_eq!(
+            u16::from_le_bytes([wire[offset + 18], wire[offset + 19]]),
+            device_id
+        );
+        assert_eq!(wire[offset + 20], 2, "XI2.h XIDeviceChange");
+        let num_classes = u16::from_le_bytes([wire[offset + 16], wire[offset + 17]]) as usize;
+        assert_eq!(num_classes, 7);
+        let mut class_offset = offset + 32;
+        for _ in 0..num_classes {
+            assert_eq!(
+                u16::from_le_bytes([wire[class_offset + 4], wire[class_offset + 5]]),
+                device_id,
+                "class block identifies the changed facet"
+            );
+            let units =
+                u16::from_le_bytes([wire[class_offset + 2], wire[class_offset + 3]]) as usize;
+            class_offset += units * 4;
+        }
+        assert_eq!(
+            class_offset,
+            offset
+                + 32
+                + u32::from_le_bytes(wire[offset + 4..offset + 8].try_into().unwrap()) as usize * 4
+        );
+        assert!(read_all_available(&mut unrelated).is_empty());
+        assert_eq!(
+            state.xi_last_slave(2),
+            None,
+            "class-change emission is not a source switch"
+        );
+        assert_eq!(state.xi_devices.devices().len(), 5);
+        assert!(state.xi_devices.source(source).is_some());
+        assert_eq!(
+            state.xi_devices.facet(source, XiFacetKind::PointerTouch),
+            Some(device_id)
+        );
+        assert!(state.sync_pending.is_empty());
+        assert!(state.unpublished_pointer_buttons_down.is_empty());
     }
 
     #[test]
@@ -44579,6 +44801,12 @@ mod tests {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
+        state
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .xi2_masks
+            .insert((ROOT_WINDOW, 0), u64::from(XI2_DEVICE_CHANGED_MASK));
 
         emit_xi2_device_changed_bootstrap(
             &mut state,
