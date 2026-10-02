@@ -142,6 +142,12 @@ pub struct XiDevice {
     /// `AtomId` derives `Ord` (an arbitrary-but-stable ordering over the
     /// inner `u32`), so it is used directly as the key.
     pub properties: BTreeMap<AtomId, XiProperty>,
+    /// Logical buttons currently held by this pointer facet. Button `n` is
+    /// represented by bit `n - 1`; each slave/XTEST device owns its own set.
+    pub buttons_down: u16,
+    /// Cumulative vertical and horizontal smooth-scroll valuators for this
+    /// pointer source, independent of other attached mice.
+    pub scroll_axis_values: [i32; 2],
 }
 
 impl XiDevice {
@@ -160,6 +166,8 @@ impl XiDevice {
             is_touchpad: false,
             device_node: None,
             properties: BTreeMap::new(),
+            buttons_down: 0,
+            scroll_axis_values: [0; 2],
         }
     }
 
@@ -178,6 +186,8 @@ impl XiDevice {
             is_touchpad: facet == XiFacetKind::PointerTouch && info.is_touchpad,
             device_node: Some(info.device_node.clone()),
             properties: BTreeMap::new(),
+            buttons_down: 0,
+            scroll_axis_values: [0; 2],
         }
     }
 }

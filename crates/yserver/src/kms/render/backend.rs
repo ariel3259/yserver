@@ -14542,10 +14542,11 @@ impl KmsBackend {
         // X11 spec: `state` is the logical button state IMMEDIATELY
         // BEFORE the event takes effect. Press: button bit not yet
         // set. Release: button bit still set.
+        let master_button_mask = (server_state.buttons_down & 0x001f) << 8;
         let state = if pressed {
-            modifier_mask | self.core.button_mask
+            modifier_mask | master_button_mask
         } else {
-            modifier_mask | self.core.button_mask | button_bit
+            modifier_mask | master_button_mask | button_bit
         };
         // Stuck-button / lost-release diagnostic (2026-07-11 drag-select bug).
         // Button state must stay balanced: a press for a bit already set — or a
@@ -19716,6 +19717,10 @@ impl Backend for KmsBackend {
             pointer_fanout::pointer_event_fanout_to_state,
         };
 
+        let pointer_button_origin = match &ev {
+            HostInputEvent::PointerButton { origin, .. } => Some(*origin),
+            _ => None,
+        };
         match ev {
             HostInputEvent::PointerMotion {
                 origin,
@@ -19732,6 +19737,7 @@ impl Backend for KmsBackend {
                     );
                     return;
                 }
+                self.core.button_mask = (state.buttons_down & 0x001f) << 8;
                 self.process_pointer_absolute(state, x as f32, y as f32, relative, dx, dy, origin);
             }
             HostInputEvent::PointerButton {
@@ -19746,9 +19752,16 @@ impl Backend for KmsBackend {
                     );
                     return;
                 }
+                self.core.button_mask = (state.buttons_down & 0x001f) << 8;
                 self.process_pointer_button(u32::from(button), pressed, state, origin);
             }
-            HostInputEvent::PointerScrollStop { .. } => {
+            HostInputEvent::PointerScrollStop { origin, .. } => {
+                if !yserver_core::core_loop::pointer_fanout::pointer_origin_is_live(state, origin) {
+                    log::trace!(
+                        "dropping pointer scroll stop from unknown, disabled, or invalid origin {origin:?}"
+                    );
+                    return;
+                }
                 // Fingers lifted from a two-finger scroll. Emit a delta-0 XI2
                 // scroll motion (→ GDK `scroll.is_stop`) so Firefox's
                 // SwipeTracker commits a horizontal history-swipe (bug
@@ -19760,6 +19773,7 @@ impl Backend for KmsBackend {
                 yserver_core::core_loop::pointer_fanout::emit_scroll_stop_to_state(
                     state,
                     &xid_map,
+                    origin,
                     host_xid,
                     self.core.cursor_x as i16,
                     self.core.cursor_y as i16,
@@ -19881,6 +19895,14 @@ impl Backend for KmsBackend {
         let xid_map = self.core.xid_map.clone();
         for ev in pending {
             let _dropped = pointer_event_fanout_to_state(state, self, &xid_map, ev, true, false);
+        }
+        if pointer_button_origin.is_some_and(|origin| {
+            yserver_core::core_loop::pointer_fanout::pointer_origin_is_live(state, origin)
+        }) {
+            // The fanout applies per-slave duplicate and master aggregation
+            // guards. Mirror its resulting master state back to KMS so later
+            // motion and button event masks stay authoritative.
+            self.core.button_mask = (state.buttons_down & 0x001f) << 8;
         }
     }
 
@@ -38626,6 +38648,156 @@ mod tests {
         assert!(backend.core.pending_pointer_events.is_empty());
         assert!(!state.xi_devices.device(6).unwrap().enabled);
         assert_eq!(state.xi_devices.devices().len(), 5);
+    }
+
+    #[test]
+    fn pointer_source_selection_kms_rejects_unknown_removed_and_suspended_button_sources() {
+        use yserver_core::{
+            backend::Backend,
+            core_loop::{DeviceInfo, HostInputEvent, InputOrigin, message::LibinputConfigSnapshot},
+            server::{ActivePointerGrab, ServerState},
+            xinput::{InputCapabilities, InputSourceId},
+        };
+
+        let mut backend = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        backend
+            .core
+            .xid_map
+            .insert(backend.core.window_id, yserver_core::resources::ROOT_WINDOW);
+        let active_grab = ActivePointerGrab {
+            owner: yserver_protocol::x11::ClientId(1),
+            grab_window: yserver_core::resources::ROOT_WINDOW,
+            event_mask: 0,
+            cursor: yserver_protocol::x11::ResourceId(0),
+            time: 7,
+            owner_events: false,
+            via_xi2: false,
+            implicit: false,
+            passive: false,
+            xi2_mask: 0,
+        };
+        state.set_pointer_grab(active_grab);
+
+        let make_info = |source_id: InputSourceId| DeviceInfo {
+            source_id,
+            enabled: true,
+            resume_key: None,
+            capabilities: InputCapabilities {
+                keyboard: false,
+                pointer: true,
+                touch: false,
+            },
+            name: format!("button source {}", source_id.0),
+            device_node: format!("/dev/input/event{}", source_id.0),
+            sysname: format!("event{}", source_id.0),
+            vendor_id: 1,
+            product_id: source_id.0 as u32,
+            is_touchpad: false,
+            config: LibinputConfigSnapshot::default(),
+        };
+        let removed = InputSourceId(401);
+        let suspended = InputSourceId(402);
+        state.xi_register_source(&make_info(removed));
+        state.xi_register_source(&make_info(suspended));
+        assert_eq!(state.xi_unregister_source(removed), vec![6]);
+        let mut suspended_info = state.xi_devices.source(suspended).unwrap().clone();
+        suspended_info.enabled = false;
+        state.xi_register_source(&suspended_info);
+
+        let initial_cursor = (backend.core.cursor_x, backend.core.cursor_y);
+        let initial_devices = state.xi_devices.devices().to_vec();
+        let initial_device_input_state = initial_devices
+            .iter()
+            .map(|device| {
+                (
+                    device.id,
+                    device.enabled,
+                    device.source_id,
+                    device.facet,
+                    device.attached_master,
+                    device.buttons_down,
+                    device.scroll_axis_values,
+                )
+            })
+            .collect::<Vec<_>>();
+        let grab_state = |grab: ActivePointerGrab| {
+            (
+                grab.owner,
+                grab.grab_window,
+                grab.event_mask,
+                grab.cursor,
+                grab.time,
+                grab.owner_events,
+                grab.via_xi2,
+                grab.implicit,
+                grab.passive,
+                grab.xi2_mask,
+            )
+        };
+        let initial_grab = state.active_pointer_grab.map(grab_state);
+        for origin in [
+            InputOrigin::Physical(InputSourceId(999)),
+            InputOrigin::Physical(removed),
+            InputOrigin::Physical(suspended),
+        ] {
+            Backend::on_host_input(
+                &mut backend,
+                &mut state,
+                HostInputEvent::PointerButton {
+                    origin,
+                    button: 0x110,
+                    pressed: true,
+                    time: 10,
+                },
+            );
+            assert_eq!(
+                backend.core.button_mask, 0,
+                "rejected input changes no KMS hold"
+            );
+            assert_eq!(
+                (backend.core.cursor_x, backend.core.cursor_y),
+                initial_cursor
+            );
+            assert!(backend.core.pending_pointer_events.is_empty());
+            assert_eq!(
+                state.buttons_down, 0,
+                "rejected input changes no master hold"
+            );
+            assert_eq!(state.pointer_root, (0, 0));
+            assert!(state.pointer_motion_history.is_empty());
+            assert!(state.sync_pending.is_empty());
+            assert!(state.xi1_device_input_state.is_empty());
+            assert_eq!(state.active_pointer_grab.map(grab_state), initial_grab);
+            assert_eq!(state.xi_devices.devices().len(), initial_devices.len());
+            assert_eq!(
+                state
+                    .xi_devices
+                    .devices()
+                    .iter()
+                    .map(|device| {
+                        (
+                            device.id,
+                            device.enabled,
+                            device.source_id,
+                            device.facet,
+                            device.attached_master,
+                            device.buttons_down,
+                            device.scroll_axis_values,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                initial_device_input_state,
+            );
+            assert!(!state.xi_devices.source(suspended).unwrap().enabled);
+        }
+        assert!(state.xi_devices.source(removed).is_none());
+        assert!(state.xi_devices.device(6).is_none());
+        assert_eq!(state.xi_devices.device(7).unwrap().buttons_down, 0);
+        assert_eq!(
+            state.xi_devices.device(7).unwrap().scroll_axis_values,
+            [0, 0]
+        );
     }
 
     /// `warp_pointer_root` (the WarpPointer path on KMS) must move
