@@ -413,6 +413,10 @@ pub struct Xi1Freeze {
 pub enum QueuedInputEvent {
     HostPointer(crate::host_x11::HostPointerEvent),
     HostKey(crate::host_x11::HostKeyEvent),
+    /// A key already processed through the per-device/master guards. Keep the
+    /// accepted master edge with frozen delivery so thaw cannot infer a new
+    /// transition from later held state.
+    HostKeyTransition(crate::host_x11::HostKeyEvent, bool),
     Xi1Routed(Xi1QueuedEvent),
     /// The master-keyboard form of an XI2 raw key event, queued behind a
     /// frozen keyboard in input order (Xorg enqueues the master's
@@ -1429,6 +1433,14 @@ pub struct ServerState {
     /// published because XI device IDs were exhausted. These sources still
     /// participate in the attached master pointer's button aggregation.
     pub unpublished_pointer_buttons_down: HashMap<crate::xinput::InputSourceId, u16>,
+    /// Key holds owned by each published XI keyboard, including virtual
+    /// XTEST and explicit XTEST targets. The saved origin lets source cleanup
+    /// submit the matching release through the normal guarded key path.
+    pub key_down_by_device: HashMap<u16, HashMap<u8, crate::core_loop::InputOrigin>>,
+    /// Key holds for enabled physical keyboard sources whose facet could not
+    /// be published because XI IDs were exhausted.
+    pub unpublished_keyboard_keys_down:
+        HashMap<crate::xinput::InputSourceId, HashMap<u8, crate::core_loop::InputOrigin>>,
     /// Installed colormaps in install order (oldest first). Capacity
     /// is the server's max installed minimum; we only have a single
     /// hardware colormap (TrueColor) so the list mostly mirrors the
@@ -1779,6 +1791,8 @@ impl ServerState {
             cow_teardown_failed: false,
             scroll_axis_value: [0; 2],
             unpublished_pointer_buttons_down: HashMap::new(),
+            key_down_by_device: HashMap::new(),
+            unpublished_keyboard_keys_down: HashMap::new(),
             installed_colormaps: vec![crate::resources::ROOT_COLORMAP],
             xi_devices,
             xtest_device_atom,
