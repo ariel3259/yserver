@@ -64,6 +64,14 @@ pub const XI2_HIERARCHY_CHANGED_MASK: u32 = 1 << XI2_HIERARCHY_CHANGED_EVENT_TYP
 /// device-property change/delete fan-out.
 pub const XI2_PROPERTY_EVENT_MASK: u32 = 1 << 12;
 
+/// XI 1.x `DevicePresenceNotify` event offset within the XInput event block.
+pub const XI_DEVICE_PRESENCE_NOTIFY_OFFSET: u8 = 15;
+
+/// Special XI1 `XEventClass` used to select device-presence notifications.
+/// Xorg reserves device id 256 for classes which are not bound to a device;
+/// `_devicePresence` is class offset zero.
+pub const XI1_DEVICE_PRESENCE_CLASS: u32 = 256 << 8;
+
 /// XI 1.x `DevicePropertyNotify` event code (XIproto.h:139, the 17th
 /// XInput event type). The wire type byte for a delivered event is
 /// `first_event + XI_DEVICE_PROPERTY_NOTIFY_OFFSET` (= 82 with

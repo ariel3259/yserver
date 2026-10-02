@@ -19368,17 +19368,45 @@ fn handle_xi2_request(
                     XI2_MAJOR_OPCODE,
                 );
             }
+            // Xorg's HandleDevicePresenceMask runs before ordinary XI1
+            // class validation and removes every class whose device field
+            // is 256. Only its `_devicePresence` class selects a mask.
+            // Preserve that class separately: truncating the device field
+            // to eight bits would turn it into XIAllDevices (id 0).
+            let mut ordinary_classes = Vec::with_capacity(count);
+            let mut presence_selected = false;
             for i in 0..count {
                 let off = 8 + i * 4;
                 let class =
                     u32::from_le_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
-                if !xi1_device_valid(&state.xi_devices, xi1_event_class_device(class)) {
+                if class >> 8 == 256 {
+                    if class & 0xff == 0 {
+                        presence_selected = true;
+                    }
+                    continue;
+                }
+                ordinary_classes.push(class);
+            }
+            if presence_selected && let Some(client) = state.clients.get_mut(&client_id.0) {
+                // Xorg installs DevicePresenceNotifyMask in
+                // HandleDevicePresenceMask before ordinary classes are
+                // validated. Preserve that ordering if a later class in
+                // this request reports BadClass.
+                client
+                    .xi1_window_event_classes
+                    .entry(ResourceId(sel_window))
+                    .or_default()
+                    .insert(crate::xinput::XI1_DEVICE_PRESENCE_CLASS);
+                client.rebuild_xi1_global_event_classes();
+            }
+            for class in &ordinary_classes {
+                if !xi1_device_valid(&state.xi_devices, xi1_event_class_device(*class)) {
                     return emit_x11_error_with_minor(
                         state,
                         client_id,
                         sequence,
                         XI1_ERROR_BAD_CLASS,
-                        class,
+                        *class,
                         u16::from(minor),
                         XI2_MAJOR_OPCODE,
                     );
@@ -19388,12 +19416,9 @@ fn handle_xi2_request(
             // deviceids that appear (so we can drop the client's stale
             // entries for *those* devices — Xorg's "replace per device"
             // semantics, see Xi/selectev.c::ProcXSelectExtensionEvent).
-            let mut accepted_classes: Vec<u32> = Vec::with_capacity(count);
+            let mut accepted_classes: Vec<u32> = Vec::with_capacity(ordinary_classes.len());
             let mut touched_devices: HashSet<u8> = HashSet::new();
-            for i in 0..count {
-                let off = 8 + i * 4;
-                let class =
-                    u32::from_le_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
+            for class in ordinary_classes {
                 #[allow(clippy::cast_possible_truncation)]
                 let class_low = class as u8; // event code in the XInput block
                 #[allow(clippy::cast_possible_truncation)]
@@ -19448,6 +19473,9 @@ fn handle_xi2_request(
                         .get_mut(&ResourceId(sel_window))
                 {
                     set.retain(|c| {
+                        if *c == crate::xinput::XI1_DEVICE_PRESENCE_CLASS {
+                            return true;
+                        }
                         #[allow(clippy::cast_possible_truncation)]
                         let dev_byte = (c >> 8) as u8;
                         !touched_devices.contains(&dev_byte)
@@ -48768,6 +48796,92 @@ mod tests {
             body.extend_from_slice(&c.to_le_bytes());
         }
         body
+    }
+
+    #[test]
+    fn xi1_dynamic_hotplug_selects_the_device_256_presence_class() {
+        const DEVICE_PRESENCE_CLASS: u32 = 256 << 8;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let body = xi1_select_extension_event_body(ROOT_WINDOW.0, &[DEVICE_PRESENCE_CLASS]);
+
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(19),
+            xi2_header_for_body(6, &body),
+            &body,
+        )
+        .expect("device 256 is valid for XI1 presence selection");
+
+        let wire = read_all_available(&mut peer);
+        assert!(
+            wire.is_empty(),
+            "SelectExtensionEvent has no reply or error"
+        );
+        let client = state.clients.get(&1).expect("selected client");
+        assert!(
+            client
+                .xi1_window_event_classes
+                .get(&ROOT_WINDOW)
+                .is_some_and(|classes| classes.contains(&DEVICE_PRESENCE_CLASS)),
+            "preserve the special presence class on its selected window"
+        );
+        assert!(
+            client.xi1_event_classes.contains(&DEVICE_PRESENCE_CLASS),
+            "presence class participates in server-wide event delivery"
+        );
+    }
+
+    #[test]
+    fn xi1_dynamic_hotplug_does_not_treat_an_ordinary_class_as_presence() {
+        const DEVICE_PRESENCE_CLASS: u32 = 256 << 8;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // Device 256's low byte is `_devicePresence` (0). Other classes
+        // with that special device id are stripped by Xorg but do not
+        // select presence; a real device's event class is not a substitute.
+        let other_device_256_class: u32 = (256 << 8) | 15;
+        let ordinary_device_class: u32 = (4 << 8) | 81;
+        let body = xi1_select_extension_event_body(
+            ROOT_WINDOW.0,
+            &[other_device_256_class, ordinary_device_class],
+        );
+
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(20),
+            xi2_header_for_body(6, &body),
+            &body,
+        )
+        .expect("unsupported ordinary classes remain ignored");
+
+        let wire = read_all_available(&mut peer);
+        assert!(
+            wire.is_empty(),
+            "SelectExtensionEvent has no reply or error"
+        );
+        let client = state.clients.get(&1).expect("selected client");
+        assert!(
+            !client.xi1_event_classes.contains(&DEVICE_PRESENCE_CLASS),
+            "ordinary XI1 classes must not subscribe to presence"
+        );
+        assert!(
+            client.xi1_window_event_classes.values().all(|classes| {
+                !classes.contains(&DEVICE_PRESENCE_CLASS)
+                    && !classes.contains(&other_device_256_class)
+                    && !classes.contains(&ordinary_device_class)
+            }),
+            "only the recognized device 256 class is stored"
+        );
     }
 
     /// Scan a wire buffer for the first XI1 `DevicePropertyNotify`

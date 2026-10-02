@@ -3295,6 +3295,28 @@ pub fn encode_property_notify_event(
     out.extend_from_slice(&[0; 15]);
 }
 
+/// Encode the XI1 `DevicePresenceNotify` event (`XIproto.h`, event 15).
+/// Device presence uses the core event's 32-byte wire size and carries the
+/// device transition code and the affected eight-bit XI device id.
+pub fn encode_xi1_device_presence_notify_event(
+    out: &mut Vec<u8>,
+    order: ClientByteOrder,
+    sequence: SequenceNumber,
+    event_type: u8,
+    time: u32,
+    change: u8,
+    device_id: u8,
+) {
+    out.push(event_type);
+    out.push(0); // detail
+    write_u16(order, out, sequence.0);
+    write_u32(order, out, time);
+    out.push(change);
+    out.push(device_id);
+    write_u16(order, out, 0); // control
+    out.extend_from_slice(&[0; 20]);
+}
+
 pub fn write_property_notify_event(
     writer: &mut impl Write,
     byte_order: ClientByteOrder,

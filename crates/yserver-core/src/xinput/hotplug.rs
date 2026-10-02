@@ -13,6 +13,59 @@ const XI_HIERARCHY_CHANGED_MASK_WIDE: u64 = XI2_HIERARCHY_CHANGED_MASK as u64;
 const XI_DEVICE_CHANGED_MASK_WIDE: u64 = XI2_DEVICE_CHANGED_MASK as u64;
 const XI_SLAVE_SWITCH: u8 = 1;
 const XI_DEVICE_CHANGE: u8 = 2;
+const XI1_DEVICE_PRESENCE_EVENT_TYPE: u8 =
+    crate::server::XI_FIRST_EVENT + super::XI_DEVICE_PRESENCE_NOTIFY_OFFSET;
+
+/// One XI1 device-list transition, matching Xorg's `DevicePresenceNotify`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DevicePresenceChange {
+    Added = 0,
+    Removed = 1,
+    Enabled = 2,
+    Disabled = 3,
+}
+
+/// Emit an XI1 `DevicePresenceNotify` for one physical facet. Device 256's
+/// `_devicePresence` class is a global selection, retained canonically per
+/// window and aggregated on `xi1_event_classes` like other server-wide XI1
+/// notifications.
+pub fn emit_xi1_device_presence(
+    state: &mut ServerState,
+    id: u16,
+    change: DevicePresenceChange,
+) -> Vec<ClientId> {
+    if !(6..=127).contains(&id) {
+        return Vec::new();
+    }
+    let targets: Vec<ClientId> = state
+        .clients
+        .iter()
+        .filter_map(|(client_id, client)| {
+            client
+                .xi1_event_classes
+                .contains(&super::XI1_DEVICE_PRESENCE_CLASS)
+                .then_some(ClientId(*client_id))
+        })
+        .collect();
+    if targets.is_empty() {
+        return Vec::new();
+    }
+
+    let time = state.timestamp_now();
+    let device_id = u8::try_from(id).expect("physical XI device ids fit in one byte");
+    crate::core_loop::fanout::fanout_event_to_clients(state, &targets, |buf, sequence, order| {
+        x11::encode_xi1_device_presence_notify_event(
+            buf,
+            order,
+            sequence,
+            XI1_DEVICE_PRESENCE_EVENT_TYPE,
+            time,
+            change as u8,
+            device_id,
+        );
+    })
+}
 
 const XI_SLAVE_ADDED: u32 = 1 << 2;
 const XI_SLAVE_REMOVED: u32 = 1 << 3;

@@ -2721,7 +2721,8 @@ pub struct ClientState {
 pub(crate) fn xi1_class_is_global_notification(class: u32) -> bool {
     #[allow(clippy::cast_possible_truncation)]
     let event_code = class as u8;
-    event_code == XI_FIRST_EVENT + crate::xinput::XI_DEVICE_PROPERTY_NOTIFY_OFFSET
+    class == crate::xinput::XI1_DEVICE_PRESENCE_CLASS
+        || event_code == XI_FIRST_EVENT + crate::xinput::XI_DEVICE_PROPERTY_NOTIFY_OFFSET
         || event_code == XI_FIRST_EVENT + crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET
         || event_code == XI_FIRST_EVENT + crate::xinput::XI_CHANGE_DEVICE_NOTIFY_OFFSET
 }
