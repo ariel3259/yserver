@@ -154,6 +154,7 @@ pub enum RecordedCall {
         new_host_xid: u32,
     },
     SetCursorHidden(bool),
+    FreeCursor(u32),
     DefineCursor {
         host_window_xid: u32,
         cursor_host_xid: u32,
@@ -1674,6 +1675,11 @@ impl Backend for RecordingBackend {
             fore,
             back,
         });
+        Ok(())
+    }
+
+    fn free_cursor(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
+        self.record(RecordedCall::FreeCursor(host_xid));
         Ok(())
     }
 

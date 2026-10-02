@@ -1727,10 +1727,15 @@ pub struct KmsBackend {
 
     /// Animated-cursor frame lists, keyed by the anim cursor's host
     /// handle. Same key-space discipline as `cursor_records` /
-    /// `cursor_pixmaps` (see comment at `cursor_records`); entries
-    /// are never removed (status-quo no-op `free_cursor` — spec
-    /// "Frame lifetime").
+    /// `cursor_pixmaps` (see comment at `cursor_records`). A live entry
+    /// holds a reference on each frame's cursor (Xorg `animcur.c:360`).
     pub(crate) anim_cursor_records: HashMap<u32, crate::kms::render::cursor::AnimCursorRecord>,
+    /// Cursors the core has freed (no XID names them) that are still
+    /// referenced here — a window's cursor, the grab override, the sticky
+    /// root default, the displayed sprite or a live animated cursor's
+    /// frame. Destroyed by `collect_released_cursors` once the last of
+    /// those goes, as Xorg's `FreeCursor` does on `refcnt == 0`.
+    pub(crate) released_cursors: HashSet<u32>,
     /// The one running animation (the effective cursor is animated),
     /// or `None`.
     pub(crate) active_cursor_anim: Option<crate::kms::render::cursor::ActiveCursorAnim>,
@@ -5478,6 +5483,7 @@ impl KmsBackend {
             cursor_hidden: false,
             displayed_cursor_pending: None,
             anim_cursor_records: HashMap::new(),
+            released_cursors: HashSet::new(),
             active_cursor_anim: None,
             last_drained_fb_opens: 0,
             // Direct mode: no on-core libinput; the core sender is installed
@@ -5938,10 +5944,55 @@ impl KmsBackend {
                     u32::try_from(record.version).unwrap_or(u32::MAX)
                 }),
         });
+        // The sprite's reference moved: the cursor it showed may be gone.
+        self.collect_released_cursors();
         let Some(xid) = new_xid else {
             return;
         };
         self.display_cursor_by_handle(xid);
+    }
+
+    /// Whether anything besides a cursor XID still references host cursor
+    /// `xid` — the references Xorg counts in `pCurs->refcnt`: window cursor
+    /// attributes (`dix/window.c:1536`), the grab (`dix/grabs.c:243`), the
+    /// sprite's current cursor (`dix/events.c:954`), an animated cursor's
+    /// frames (`render/animcur.c:360`); plus our sticky root default. An
+    /// InputOnly window has no backend window: the core holds its cursor.
+    fn cursor_referenced(&self, xid: u32) -> bool {
+        self.effective_cursor_xid == Some(xid)
+            || self.default_cursor_xid == Some(xid)
+            || self.core.active_cursor == Some(xid)
+            || self.grab_cursor_override == Some(xid)
+            || self.windows.values().any(|geom| geom.cursor == Some(xid))
+            || self
+                .anim_cursor_records
+                .values()
+                .any(|anim| anim.frames.iter().any(|frame| frame.source == xid))
+    }
+
+    /// Destroy every released cursor nothing references any more, and its
+    /// sprite pixmap. An animated cursor's canonical sprite aliases a frame's
+    /// pixmap, so only a static cursor frees one; dropping an animated cursor
+    /// can release its frames, hence the loop.
+    fn collect_released_cursors(&mut self) {
+        loop {
+            let Some(xid) = self
+                .released_cursors
+                .iter()
+                .copied()
+                .find(|&xid| !self.cursor_referenced(xid))
+            else {
+                return;
+            };
+            self.released_cursors.remove(&xid);
+            self.cursor_records.remove(&xid);
+            let sprite = self.cursor_pixmaps.remove(&xid);
+            if self.anim_cursor_records.remove(&xid).is_none()
+                && let Some(id) = sprite
+            {
+                self.store_decref_with_invalidate(id);
+            }
+        }
     }
 
     /// XFIXES `HideCursor` / `ShowCursor` edge. Hiding drops the scene's
@@ -6526,6 +6577,7 @@ impl KmsBackend {
             cursor_hidden: false,
             displayed_cursor_pending: None,
             anim_cursor_records: HashMap::new(),
+            released_cursors: HashSet::new(),
             active_cursor_anim: None,
             last_drained_fb_opens: 0,
             // Test fixtures always run in Direct mode.
@@ -14464,10 +14516,10 @@ impl KmsBackend {
                 parent_host = h.as_raw();
                 break;
             }
-            if cursor.is_none()
-                && let Some(c) = cw.cursor.filter(|c| c.0 != 0)
-            {
-                cursor = server_state.resources.cursor_host_xid(c);
+            // The window's own hold on its cursor, which outlives the
+            // cursor's XID (Xorg refcnt).
+            if cursor.is_none() {
+                cursor = cw.cursor_host.map(CursorHandle::as_raw);
             }
             cur = cw.parent;
         }
@@ -23118,7 +23170,15 @@ impl Backend for KmsBackend {
         if let Some(id) = self.store.lookup(host_xid) {
             self.store_decref_with_invalidate(id);
         }
-        self.windows.remove(&host_xid);
+        if self
+            .windows
+            .remove(&host_xid)
+            .is_some_and(|geom| geom.cursor.is_some())
+        {
+            // Xorg `DeleteWindow` drops the window's cursor ref (`dix/window.c:968`).
+            self.refresh_effective_cursor();
+            self.collect_released_cursors();
+        }
         // Step 2 (DRIFT 2): top_level_order is no longer mutated here — it
         // is a projection of core children, reprojected by the destroy
         // core handler via `sync_top_level_order` after the resource child
@@ -24691,6 +24751,7 @@ impl Backend for KmsBackend {
             // poll loop (explicit Xorg deviation, see spec).
             let ms = if *delay_ms == 0 { 16 } else { *delay_ms };
             snap.push(crate::kms::render::cursor::AnimFrame {
+                source: raw,
                 record: std::sync::Arc::clone(record),
                 pixmap: self.cursor_pixmaps.get(&raw).copied(),
                 delay: std::time::Duration::from_millis(u64::from(ms)),
@@ -24711,6 +24772,16 @@ impl Backend for KmsBackend {
             crate::kms::render::cursor::AnimCursorRecord { frames: snap },
         );
         Ok(Some(handle))
+    }
+
+    fn free_cursor(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
+        // The core calls this when the last XID naming the cursor goes;
+        // other references may still hold it (see `cursor_referenced`).
+        if self.cursor_records.contains_key(&host_xid) {
+            self.released_cursors.insert(host_xid);
+            self.collect_released_cursors();
+        }
+        Ok(())
     }
 
     fn define_cursor(
@@ -24741,6 +24812,7 @@ impl Backend for KmsBackend {
             self.core.active_cursor = Some(cursor_host_xid);
         }
         self.refresh_effective_cursor();
+        self.collect_released_cursors();
         Ok(())
     }
 
@@ -24756,6 +24828,7 @@ impl Backend for KmsBackend {
         // scene `CursorEntry` when the displayed cursor changed.
         self.grab_cursor_override = cursor_host_xid;
         self.refresh_effective_cursor();
+        self.collect_released_cursors();
         Ok(())
     }
 
@@ -29389,6 +29462,7 @@ impl Backend for KmsBackend {
             self.grab_cursor_override = Some(new_host_xid);
         }
         self.refresh_effective_cursor();
+        self.collect_released_cursors();
         Ok(())
     }
 
@@ -37279,6 +37353,182 @@ mod tests {
         // `define_cursor(_, 0)` (X11 None) clears the per-window slot.
         b.define_cursor(None, w, 0).expect("define_cursor clear");
         assert_eq!(b.windows.get(&w).and_then(|g| g.cursor), None);
+    }
+
+    fn insert_test_window(b: &mut KmsBackend, w: u32) {
+        let rank = b.alloc_window_stack_rank();
+        b.windows.insert(
+            w,
+            super::WindowGeometry {
+                border_width: 0,
+                border_pixel: None,
+                border_pixmap: None,
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 8,
+                depth: 24,
+                mapped: true,
+                viewable: true,
+                parent: None,
+                stack_rank: rank,
+                bg_pixel: None,
+                bg_pixmap: None,
+                cursor: None,
+            },
+        );
+    }
+
+    fn test_cursor(b: &mut KmsBackend) -> u32 {
+        use yserver_core::backend::{Backend, PixmapHandle};
+        let pix = PixmapHandle::from_raw(0x1234_0040).unwrap();
+        b.create_cursor(None, pix, None, (0xFFFF, 0, 0), (0, 0, 0), 0, 0)
+            .expect("create_cursor")
+            .as_raw()
+    }
+
+    /// #196: FreeCursor drops only the XID's reference (Xorg `FreeCursor`
+    /// decrements `refcnt`): a window still using the cursor keeps it, and
+    /// it goes when the window's cursor changes (`dix/window.c:1559`).
+    /// `free_cursor` used to be a no-op, so every cursor ever created —
+    /// and its sprite pixmap — lived for the session.
+    #[test]
+    fn freed_cursor_lives_until_its_window_stops_using_it() {
+        use yserver_core::backend::Backend;
+        let mut b = KmsBackend::for_tests();
+        let c = test_cursor(&mut b);
+        let w = 0xABCD_0101;
+        insert_test_window(&mut b, w);
+        b.define_cursor(None, w, c).expect("define");
+        b.free_cursor(None, c).expect("free");
+        assert!(
+            b.cursor_records.contains_key(&c),
+            "the window still holds it"
+        );
+        b.define_cursor(None, w, 0).expect("undefine");
+        assert!(!b.cursor_records.contains_key(&c));
+        assert!(b.released_cursors.is_empty());
+    }
+
+    #[test]
+    fn freed_cursor_goes_with_the_window_that_used_it() {
+        use yserver_core::backend::Backend;
+        let mut b = KmsBackend::for_tests();
+        let c = test_cursor(&mut b);
+        let w = 0xABCD_0102;
+        insert_test_window(&mut b, w);
+        b.define_cursor(None, w, c).expect("define");
+        b.free_cursor(None, c).expect("free");
+        b.destroy_subwindow(None, w).expect("destroy");
+        assert!(!b.cursor_records.contains_key(&c), "dix/window.c:968");
+    }
+
+    #[test]
+    fn unreferenced_cursor_is_destroyed_at_free_cursor() {
+        use yserver_core::backend::Backend;
+        let mut b = KmsBackend::for_tests();
+        let c = test_cursor(&mut b);
+        b.free_cursor(None, c).expect("free");
+        assert!(!b.cursor_records.contains_key(&c));
+    }
+
+    /// The grab holds a ref for its duration (`dix/grabs.c:243`/`:261`).
+    #[test]
+    fn freed_grab_cursor_lives_until_the_grab_ends() {
+        use yserver_core::backend::Backend;
+        let mut b = KmsBackend::for_tests();
+        let c = test_cursor(&mut b);
+        b.set_grab_cursor(None, Some(c)).expect("grab");
+        b.free_cursor(None, c).expect("free");
+        assert!(b.cursor_records.contains_key(&c));
+        assert_eq!(b.effective_cursor_xid, Some(c), "still displayed");
+        b.set_grab_cursor(None, None).expect("ungrab");
+        assert!(!b.cursor_records.contains_key(&c));
+    }
+
+    /// The root's cursor (our sticky default) holds it until replaced.
+    #[test]
+    fn freed_root_cursor_lives_until_the_root_cursor_changes() {
+        use yserver_core::backend::Backend;
+        let mut b = KmsBackend::for_tests();
+        let (c, c2) = (test_cursor(&mut b), test_cursor(&mut b));
+        let root = b.core.window_id;
+        b.define_cursor(None, root, c).expect("define root");
+        b.free_cursor(None, c).expect("free");
+        assert!(b.cursor_records.contains_key(&c));
+        b.define_cursor(None, root, c2).expect("redefine root");
+        assert!(!b.cursor_records.contains_key(&c));
+        assert!(b.cursor_records.contains_key(&c2));
+    }
+
+    /// An animated cursor refs its frames (`render/animcur.c:360`), so a
+    /// client may free them right after CreateAnimCursor (libXcursor does);
+    /// they go with the animated cursor (`animcur.c:247`).
+    #[test]
+    fn animated_cursor_keeps_its_freed_frames_alive() {
+        use yserver_core::backend::{Backend, CursorHandle};
+        let mut b = KmsBackend::for_tests();
+        let (c1, c2) = (test_cursor(&mut b), test_cursor(&mut b));
+        let anim = b
+            .create_anim_cursor(
+                None,
+                &[
+                    (CursorHandle::from_raw(c1).unwrap(), 50),
+                    (CursorHandle::from_raw(c2).unwrap(), 50),
+                ],
+            )
+            .expect("anim")
+            .expect("KMS animates")
+            .as_raw();
+        b.free_cursor(None, c1).expect("free c1");
+        b.free_cursor(None, c2).expect("free c2");
+        assert!(b.cursor_records.contains_key(&c1) && b.cursor_records.contains_key(&c2));
+        b.free_cursor(None, anim).expect("free anim");
+        for xid in [c1, c2, anim] {
+            assert!(!b.cursor_records.contains_key(&xid), "{xid:#x}");
+        }
+        assert!(b.anim_cursor_records.is_empty());
+    }
+
+    /// #196 with real Vk: destroying a cursor releases its sprite pixmap.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn freed_cursor_releases_its_sprite_pixmap() {
+        use yserver_core::backend::Backend;
+        let mut b = match KmsBackend::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+        let c = test_cursor(&mut b);
+        let sprite = *b.cursor_pixmaps.get(&c).expect("sprite allocated");
+        let w = 0xABCD_0103;
+        insert_test_window(&mut b, w);
+        b.define_cursor(None, w, c).expect("define");
+        b.free_cursor(None, c).expect("free");
+        assert!(b.store.get(sprite).is_some(), "in use: sprite kept");
+        b.define_cursor(None, w, 0).expect("undefine");
+        assert!(!b.cursor_records.contains_key(&c), "cursor destroyed");
+        // The sprite upload is still in the open frame: submit it, then retire.
+        b.engine
+            .close_open_frame(
+                &mut b.store,
+                &mut b.platform,
+                crate::kms::render::frame_builder::CloseReason::SyncWait,
+            )
+            .expect("close frame");
+        b.engine
+            .flush_submit_group(
+                &mut b.store,
+                &mut b.platform,
+                crate::kms::render::submit_group::FlushReason::SyncBoundary,
+            )
+            .expect("flush");
+        b.platform.wait_idle_bounded();
+        b.poll_pending_retire_with_invalidate();
+        assert!(b.store.get(sprite).is_none(), "sprite pixmap released");
     }
 
     /// A GrabPointer cursor is the top-priority sprite: it overrides the
@@ -53542,6 +53792,89 @@ mod tests {
             ],
         );
         assert_eq!(b.effective_cursor_xid, root_cursor);
+    }
+
+    /// #196: an InputOnly window has no backend window, yet holds its
+    /// cursor like any window (Xorg `dix/window.c:1536`): after FreeCursor
+    /// the pointer entering it still shows that cursor, which is destroyed
+    /// only once the window changes cursor (`:1559`) or dies (`:968`).
+    #[test]
+    fn input_only_window_keeps_its_freed_cursor_until_it_drops_it() {
+        use yserver_core::{backend::Backend, core_loop::message::HostInputEvent};
+        use yserver_protocol::x11::{ClientId, CreateWindowRequest, ResourceId};
+        const ONLY: ResourceId = ResourceId(0x0010_0a07);
+        const OTHER: ResourceId = ResourceId(0x0010_0a09);
+        const CURSOR: ResourceId = ResourceId(0x0010_0a08);
+        const CURSOR2: ResourceId = ResourceId(0x0010_0a0a);
+        let (mut state, mut b, mut peer) = tree_crossing_fixture();
+        tree_request(&mut state, &mut b, 8, TREE_A);
+        let (c, c2) = (test_cursor(&mut b), test_cursor(&mut b));
+        for (id, host) in [(CURSOR, c), (CURSOR2, c2)] {
+            state.resources.create_glyph_cursor(ClientId(14), id);
+            state.resources.set_cursor_host_xid(
+                id,
+                yserver_core::backend::CursorHandle::from_raw(host).unwrap(),
+            );
+        }
+        for (window, x, cursor) in [(ONLY, 100, CURSOR), (OTHER, 10, CURSOR2)] {
+            state.resources.create_window(
+                ClientId(14),
+                CreateWindowRequest {
+                    window,
+                    parent: TREE_A,
+                    x,
+                    y: 20,
+                    width: 40,
+                    height: 40,
+                    class: 2,
+                    cursor: Some(cursor),
+                    ..Default::default()
+                },
+            );
+            let _ = state.resources.map_window(window);
+        }
+        b.core.cursor_x = 180.0;
+        b.core.cursor_y = 150.0;
+        b.windows_restructured(&mut state);
+        let motion = |x: i32, y: i32| HostInputEvent::PointerMotion {
+            x,
+            y,
+            time: 0,
+            relative: false,
+            dx: 0,
+            dy: 0,
+        };
+        b.on_host_input(&mut state, motion(120, 40));
+        assert_eq!(b.effective_cursor_xid, Some(c));
+        b.on_host_input(&mut state, motion(20, 40));
+        assert_eq!(b.effective_cursor_xid, Some(c2));
+        b.on_host_input(&mut state, motion(180, 150));
+        let root_cursor = b.effective_cursor_xid;
+
+        dispatch_raw(&mut state, &mut b, 95, 0, &CURSOR.0.to_le_bytes());
+        dispatch_raw(&mut state, &mut b, 95, 0, &CURSOR2.0.to_le_bytes());
+        assert!(b.cursor_records.contains_key(&c) && b.cursor_records.contains_key(&c2));
+        b.on_host_input(&mut state, motion(120, 40));
+        assert_eq!(b.effective_cursor_xid, Some(c), "the window still shows it");
+
+        // ChangeWindowAttributes(cursor = None) under the pointer.
+        let mut body = ONLY.0.to_le_bytes().to_vec();
+        body.extend(0x4000u32.to_le_bytes());
+        body.extend(0u32.to_le_bytes());
+        dispatch_raw(&mut state, &mut b, 2, 0, &body);
+        assert_eq!(b.effective_cursor_xid, root_cursor, "inherits A's again");
+        assert!(!b.cursor_records.contains_key(&c), "dropped: destroyed");
+        assert!(b.cursor_records.contains_key(&c2), "OTHER still holds it");
+
+        tree_request(&mut state, &mut b, 4, OTHER);
+        assert!(!b.cursor_records.contains_key(&c2), "destroyed with OTHER");
+        assert!(b.released_cursors.is_empty());
+        assert!(
+            b.default_cursor_xid
+                .is_some_and(|d| b.cursor_records.contains_key(&d)),
+            "the root X_cursor is never released"
+        );
+        let _ = tree_events(&mut peer);
     }
 
     /// Xvfb, pointer still at the centre: MapWindow of a window under it

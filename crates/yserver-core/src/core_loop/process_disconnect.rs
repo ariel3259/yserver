@@ -635,6 +635,7 @@ pub fn process_disconnect_reporting(
     for cursor_xid in removed.freed_cursors {
         let _ = backend.free_cursor(None, cursor_xid);
     }
+    crate::core_loop::process_request::release_dropped_cursors(state, backend, None);
     for syncobj_xid in removed.freed_dri3_syncobjs {
         if let Err(e) = backend.dri3_free_syncobj(client_id, syncobj_xid) {
             log::warn!(
@@ -885,6 +886,7 @@ pub fn destroy_zombie_resources_reporting(
     for cursor_xid in removed.freed_cursors {
         let _ = backend.free_cursor(None, cursor_xid);
     }
+    crate::core_loop::process_request::release_dropped_cursors(state, backend, None);
     for syncobj_xid in removed.freed_dri3_syncobjs {
         if let Err(e) = backend.dri3_free_syncobj(zombie, syncobj_xid) {
             log::warn!(

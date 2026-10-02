@@ -2437,6 +2437,21 @@ fn destroy_window_subtree(
     // DeleteWindowFromAnyEvents) — the destroyed windows are gone from
     // the resource table now, so the viewability probe sees them off.
     release_core_grabs_for_unviewable(state, backend);
+    release_dropped_cursors(state, backend, origin);
+}
+
+/// Free on the backend each host cursor a window let go of that nothing
+/// references any more — a cursor freed while a window still used it goes
+/// when that window changes cursor or dies (Xorg `FreeCursor` on
+/// `refcnt == 0`, `dix/window.c:968`/`:1559`).
+pub(crate) fn release_dropped_cursors(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+) {
+    for host in state.resources.take_unreferenced_cursor_hosts() {
+        let _ = backend.free_cursor(origin, host);
+    }
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -7699,6 +7714,7 @@ fn xfixes_replace_cursor(
     state.resources.retarget_cursor_host(old_host, source);
     let _ = backend.replace_cursor(origin, old_host, new_host);
     if !state.resources.cursor_host_referenced(old_host) {
+        state.resources.cursor_host_released(old_host);
         let _ = backend.free_cursor(origin, old_host);
     }
 }
@@ -24266,6 +24282,7 @@ fn handle_change_window_attributes(
             // pointer.
             backend.windows_restructured(state);
         }
+        release_dropped_cursors(state, backend, origin);
     }
     debug!(
         "client {} #{} ChangeWindowAttributes",
@@ -75759,6 +75776,89 @@ mod tests {
             &read_all_available(&mut peer),
             x11::error::BAD_CURSOR,
             "unknown cursor",
+        );
+    }
+
+    /// #196: a window holds its cursor (Xorg `pCurs->refcnt`,
+    /// `dix/window.c:1536`), so FreeCursor of a cursor set by CreateWindow
+    /// keeps it — for an InputOutput and an InputOnly window alike, the
+    /// latter having no backend window to hold it — until the window
+    /// changes cursor (`:1559`) or is destroyed (`:968`); then it is freed
+    /// once.
+    #[test]
+    fn create_window_cursor_outlives_free_cursor_until_the_window_drops_it() {
+        let host_frees = |calls: &[RecordedCall]| -> Vec<u32> {
+            calls
+                .iter()
+                .filter_map(|c| match c {
+                    RecordedCall::FreeCursor(h) => Some(*h),
+                    _ => None,
+                })
+                .collect()
+        };
+        for (class, drop_by_destroy) in [(1u16, false), (1, true), (2, false), (2, true)] {
+            let mut state = ServerState::new();
+            let mut peer = install_client(&mut state, 1);
+            let cursor = ResourceId(0x0080_0010);
+            let window = 0x0080_0001;
+            state.resources.create_glyph_cursor(ClientId(1), cursor);
+            state.resources.set_cursor_host_xid(
+                cursor,
+                crate::backend::CursorHandle::from_raw(0x00ab_0001).unwrap(),
+            );
+            let mut body = border_create_body(window, ROOT_WINDOW.0, 0x4000, &[cursor.0]);
+            body[18..20].copy_from_slice(&class.to_le_bytes());
+            run_border_request(&mut state, 1, 0, &body);
+            assert_no_error(&read_all_available(&mut peer), "CreateWindow");
+
+            let calls = run_border_request_recording(&mut state, 95, 0, &cursor.0.to_le_bytes());
+            assert_eq!(host_frees(&calls), Vec::<u32>::new(), "class {class}: held");
+
+            let calls = if drop_by_destroy {
+                run_border_request_recording(&mut state, 4, 0, &window.to_le_bytes())
+            } else {
+                run_border_request_recording(
+                    &mut state,
+                    2,
+                    0,
+                    &border_cwa_body(window, 0x4000, &[0]),
+                )
+            };
+            assert_eq!(host_frees(&calls), vec![0x00ab_0001], "class {class}");
+            assert_no_error(&read_all_available(&mut peer), "no error");
+        }
+    }
+
+    /// The positive control: a cursor two windows hold goes with the last.
+    #[test]
+    fn freed_cursor_goes_with_the_last_window_holding_it() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let cursor = ResourceId(0x0080_0010);
+        state.resources.create_glyph_cursor(ClientId(1), cursor);
+        state.resources.set_cursor_host_xid(
+            cursor,
+            crate::backend::CursorHandle::from_raw(0x00ab_0001).unwrap(),
+        );
+        for w in [0x0080_0001u32, 0x0080_0002] {
+            let body = border_create_body(w, ROOT_WINDOW.0, 0x4000, &[cursor.0]);
+            run_border_request(&mut state, 1, 0, &body);
+        }
+        let mut calls = run_border_request_recording(&mut state, 95, 0, &cursor.0.to_le_bytes());
+        calls.extend(run_border_request_recording(
+            &mut state,
+            4,
+            0,
+            &0x0080_0001u32.to_le_bytes(),
+        ));
+        assert!(!calls.contains(&RecordedCall::FreeCursor(0x00ab_0001)));
+        let calls = run_border_request_recording(&mut state, 4, 0, &0x0080_0002u32.to_le_bytes());
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| **c == RecordedCall::FreeCursor(0x00ab_0001))
+                .count(),
+            1
         );
     }
 

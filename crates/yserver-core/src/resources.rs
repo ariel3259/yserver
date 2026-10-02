@@ -265,6 +265,9 @@ pub struct ResourceTable {
     dri3_syncobjs: HashMap<u32, ClientId>,
     /// Backings whose last freed name's alias ref waits for a background/border/GC release site.
     deferred_name_refs: HashSet<u32>,
+    /// Host cursors a window let go of (cursor change, destroy); drained by
+    /// [`Self::take_unreferenced_cursor_hosts`].
+    dropped_cursor_hosts: Vec<u32>,
 }
 
 impl Default for ResourceTable {
@@ -301,6 +304,7 @@ impl Default for ResourceTable {
                 do_not_propagate_mask: 0,
                 colormap: ROOT_COLORMAP,
                 cursor: None,
+                cursor_host: None,
                 owner: SERVER_OWNER,
                 properties: HashMap::new(),
                 host_xid: None,
@@ -399,6 +403,7 @@ impl Default for ResourceTable {
             colormaps,
             dri3_syncobjs: HashMap::new(),
             deferred_name_refs: HashSet::new(),
+            dropped_cursor_hosts: Vec::new(),
         }
     }
 }
@@ -685,6 +690,10 @@ impl ResourceTable {
                 Some(None) | None => parent.map_or(ROOT_COLORMAP, |p| p.colormap),
             },
             cursor: request.cursor,
+            cursor_host: request
+                .cursor
+                .filter(|c| c.0 != 0)
+                .and_then(|c| self.cursors.get(&c.0).and_then(|c| c.host_xid)),
             owner,
             properties: HashMap::new(),
             host_xid: None,
@@ -853,6 +862,9 @@ impl ResourceTable {
         if let Some(parent) = self.windows.get_mut(&window.parent.0) {
             parent.children.retain(|child| *child != id);
         }
+        if let Some(host) = window.cursor_host {
+            self.dropped_cursor_hosts.push(host.as_raw());
+        }
         destroyed.push(id);
         for child in window.children {
             self.destroy_window_inner(child, destroyed);
@@ -989,6 +1001,13 @@ impl ResourceTable {
             }
             if let Some(cursor) = request.cursor {
                 window.cursor = Some(cursor);
+                let host = (cursor.0 != 0)
+                    .then(|| self.cursors.get(&cursor.0).and_then(|c| c.host_xid))
+                    .flatten();
+                if let Some(old) = window.cursor_host.filter(|old| Some(*old) != host) {
+                    self.dropped_cursor_hosts.push(old.as_raw());
+                }
+                window.cursor_host = host;
             }
         }
 
@@ -2955,15 +2974,35 @@ impl ResourceTable {
             }
         }
         self.cursor_host_names.remove(&old_host);
+        for w in self.windows.values_mut() {
+            if w.cursor_host.map(|h| h.as_raw()) == Some(old_host) {
+                w.cursor_host = src.host_xid;
+            }
+        }
         changed
     }
 
-    /// True iff some cursor XID still refers to host cursor `host`.
+    /// True iff some cursor XID or some window's cursor attribute still
+    /// refers to host cursor `host` (Xorg `pCurs->refcnt`).
     #[must_use]
     pub fn cursor_host_referenced(&self, host: u32) -> bool {
         self.cursors
             .values()
             .any(|c| c.host_xid.map(|h| h.as_raw()) == Some(host))
+            || self
+                .windows
+                .values()
+                .any(|w| w.cursor_host.map(|h| h.as_raw()) == Some(host))
+    }
+
+    /// Host cursors a window dropped since the last call that nothing
+    /// references any more: the caller frees each on the backend, once.
+    pub fn take_unreferenced_cursor_hosts(&mut self) -> Vec<u32> {
+        let mut hosts = std::mem::take(&mut self.dropped_cursor_hosts);
+        hosts.sort_unstable();
+        hosts.dedup();
+        hosts.retain(|&host| !self.cursor_host_referenced(host));
+        hosts
     }
 
     /// Remove a cursor from the table and return its host XID when this
@@ -2976,9 +3015,19 @@ impl ResourceTable {
     pub fn free_cursor(&mut self, id: ResourceId) -> Option<u32> {
         let host_xid = self.cursors.get(&id.0).and_then(|c| c.host_xid);
         self.cursors.remove(&id.0);
-        host_xid
+        let freed = host_xid
             .map(|h| h.as_raw())
-            .filter(|host| !self.cursor_host_referenced(*host))
+            .filter(|host| !self.cursor_host_referenced(*host));
+        if let Some(host) = freed {
+            self.cursor_host_released(host);
+        }
+        freed
+    }
+
+    /// The caller frees host cursor `host` itself: no pending window drop
+    /// may free it again.
+    pub fn cursor_host_released(&mut self, host: u32) {
+        self.dropped_cursor_hosts.retain(|&h| h != host);
     }
 
     /// Mark a cursor as animated (RENDER CreateAnimCursor product).
@@ -3090,6 +3139,8 @@ impl ResourceTable {
         freed_cursors.sort_unstable();
         freed_cursors.dedup();
         freed_cursors.retain(|host| !self.cursor_host_referenced(*host));
+        self.dropped_cursor_hosts
+            .retain(|host| !freed_cursors.contains(host));
         let mut closed_fonts = Vec::new();
         self.fonts.retain(|_, f| {
             if f.owner == client {
@@ -3390,6 +3441,10 @@ pub struct Window {
     pub do_not_propagate_mask: u16,
     pub colormap: ResourceId,
     pub cursor: Option<ResourceId>,
+    /// Host cursor `cursor` named when it was set. The window holds it
+    /// (Xorg `pCurs->refcnt`, `dix/window.c:1536`) after its XID is freed,
+    /// so a freed cursor stays this window's until the window drops it.
+    pub cursor_host: Option<crate::backend::CursorHandle>,
     pub owner: ClientId,
     pub properties: HashMap<AtomId, PropertyValue>,
     pub host_xid: Option<crate::backend::WindowHandle>,
@@ -3553,6 +3608,7 @@ impl Window {
             do_not_propagate_mask: 0,
             colormap: ROOT_COLORMAP,
             cursor: None,
+            cursor_host: None,
             owner: SERVER_OWNER,
             properties: HashMap::new(),
             host_xid: None,
