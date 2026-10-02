@@ -29786,6 +29786,164 @@ fn copy_area_source_split(
     (Some(avail), missing)
 }
 
+/// The region a CopyArea / CopyPlane exposes on its destination, in its
+/// coordinates: Xorg's `miHandleExposures` (`mi/miexpose.c:120-305`),
+/// step for step. The part of the source rect outside what the source
+/// shows — its clip list under ClipByChildren, `NotClippedByChildren`
+/// under IncludeInferiors, its extent for a pixmap — moved over the
+/// destination and cut to what of it shows likewise, and to the GC's
+/// client clip (which Xorg applies without the clip origin). Past
+/// `RECTLIMIT` rects onto a window it is sent as its extents, unless the
+/// source's shape does not hold the source rect. `None` when nothing is
+/// exposed or there is nothing to do: Xorg's NULL return, NoExpose.
+/// The flag says whether the region was reduced to its extents.
+#[allow(clippy::too_many_arguments)]
+fn copy_exposed_region(
+    state: &ServerState,
+    src: ResourceId,
+    dst: ResourceId,
+    draw_state: &crate::backend::DrawState,
+    graphics_exposures: bool,
+    (src_x, src_y): (i16, i16),
+    (width, height): (u16, u16),
+    (dst_x, dst_y): (i16, i16),
+) -> Option<(Vec<x11::xfixes::RegionRect>, bool)> {
+    use crate::core_loop::clip_list;
+    let dst_is_window = state.resources.window(dst).is_some();
+    if !graphics_exposures && !dst_is_window {
+        return None;
+    }
+    let include_inferiors = matches!(
+        draw_state.subwindow_mode,
+        crate::backend::SubwindowMode::IncludeInferiors
+    );
+    let src_box = x11::xfixes::RegionRect {
+        x: src_x,
+        y: src_y,
+        width,
+        height,
+    };
+    let window_clip = |w: ResourceId| {
+        if include_inferiors {
+            clip_list::not_clipped_by_children(state, w)
+        } else {
+            clip_list::clip_list(state, w)
+        }
+    };
+    let src_clip = if state.resources.window(src).is_some() {
+        let clip = window_clip(src);
+        if clip_list::contains(&clip, src_box) {
+            return None;
+        }
+        clip
+    } else {
+        let (w, h) = drawable_size(state, src)?;
+        let whole = x11::xfixes::RegionRect {
+            x: 0,
+            y: 0,
+            width: w,
+            height: h,
+        };
+        if clip_list::contains(&[whole], src_box) {
+            return None;
+        }
+        vec![whole]
+    };
+    let dst_clip = if dst == src {
+        src_clip.clone()
+    } else if dst_is_window {
+        window_clip(dst)
+    } else {
+        let (w, h) = drawable_size(state, dst)?;
+        vec![x11::xfixes::RegionRect {
+            x: 0,
+            y: 0,
+            width: w,
+            height: h,
+        }]
+    };
+    let hidden = clip_list::subtract(&[src_box], &src_clip);
+    let moved = clip_list::translate(
+        hidden,
+        i32::from(dst_x) - i32::from(src_x),
+        i32::from(dst_y) - i32::from(src_y),
+    );
+    let mut exposed = clip_list::intersect(&moved, &dst_clip);
+    if let crate::backend::ClipState::Rectangles { rects, .. } = &draw_state.clip {
+        let client: Vec<x11::xfixes::RegionRect> = rects
+            .rectangles
+            .chunks_exact(8)
+            .map(|c| x11::xfixes::RegionRect {
+                x: i16::from_le_bytes([c[0], c[1]]),
+                y: i16::from_le_bytes([c[2], c[3]]),
+                width: u16::from_le_bytes([c[4], c[5]]),
+                height: u16::from_le_bytes([c[6], c[7]]),
+            })
+            .collect();
+        exposed = clip_list::intersect(&exposed, &client);
+    }
+    let mut extents = graphics_exposures && exposed.len() > clip_list::RECTLIMIT && dst_is_window;
+    if extents
+        && let Some(shape) = state
+            .shape_windows
+            .get(&src)
+            .and_then(|s| s.clip.as_ref().or(s.bounding.as_ref()))
+        && !clip_list::contains(shape, src_box)
+    {
+        extents = false;
+    }
+    if exposed.is_empty() {
+        return None;
+    }
+    if extents {
+        exposed = vec![crate::nested::region_extents(&exposed)];
+    }
+    Some((exposed, extents))
+}
+
+/// [`copy_exposed_region`]'s side effects: the destination window's
+/// background over the region unless it is None (`miHandleExposures`
+/// paints it, cut to the clip list when reduced to extents), and the
+/// GraphicsExpose events, or one NoExpose, when the GC asks for them.
+#[allow(clippy::too_many_arguments)]
+fn finish_copy_exposures(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    client_id: ClientId,
+    dst: ResourceId,
+    dst_host: u32,
+    exposed: Option<(Vec<x11::xfixes::RegionRect>, bool)>,
+    graphics_exposures: bool,
+    major_opcode: u8,
+) -> io::Result<()> {
+    let rects = exposed.as_ref().map_or(&[][..], |(r, _)| r.as_slice());
+    if let Some(window) = state.resources.window(dst)
+        && !window.background_none
+        && !rects.is_empty()
+    {
+        let paint = match &exposed {
+            Some((r, true)) => crate::core_loop::clip_list::intersect(
+                r,
+                &crate::core_loop::clip_list::clip_list(state, dst),
+            ),
+            _ => rects.to_vec(),
+        };
+        for r in &paint {
+            backend.paint_window_background_rect(origin, dst_host, r.x, r.y, r.width, r.height)?;
+            let _dropped = accumulate_damage_to_state(state, dst, r.x, r.y, r.width, r.height);
+        }
+    }
+    if graphics_exposures {
+        let events: Vec<(i16, i16, u16, u16)> = rects
+            .iter()
+            .map(|r| (r.x, r.y, r.width, r.height))
+            .collect();
+        emit_copy_exposures(state, client_id, dst, &events, major_opcode);
+    }
+    Ok(())
+}
+
 /// Emit the CopyArea/CopyPlane graphics-exposures contract events to
 /// the requesting client: one GraphicsExpose per missing dst-coord
 /// sub-rect (count = number still to follow), or one NoExposure when
@@ -29906,19 +30064,36 @@ fn handle_copy_area(
         // Clamp the copy to the AVAILABLE part of the source drawable
         // (X11 §CopyArea): out-of-bounds source regions are never
         // copied; they become the GraphicsExpose region below.
-        let (avail, missing) = if window_unviewable(state, request.dst) {
+        let (avail, exposed) = if window_unviewable(state, request.dst) {
             // Xorg miDoCopy returns before copying or exposing: NoExpose (micopy.c:157).
-            (None, Vec::new())
+            (None, None)
         } else {
-            copy_area_source_split(
-                state,
-                request.src,
-                request.src_x,
-                request.src_y,
-                request.dst_x,
-                request.dst_y,
-                request.width,
-                request.height,
+            let graphics_exposures = state
+                .resources
+                .gc(request.gc)
+                .is_some_and(|g| g.graphics_exposures);
+            (
+                copy_area_source_split(
+                    state,
+                    request.src,
+                    request.src_x,
+                    request.src_y,
+                    request.dst_x,
+                    request.dst_y,
+                    request.width,
+                    request.height,
+                )
+                .0,
+                copy_exposed_region(
+                    state,
+                    request.src,
+                    request.dst,
+                    &st,
+                    graphics_exposures,
+                    (request.src_x, request.src_y),
+                    (request.width, request.height),
+                    (request.dst_x, request.dst_y),
+                ),
             )
         };
         let request = match avail {
@@ -29981,28 +30156,26 @@ fn handle_copy_area(
             let _dropped =
                 accumulate_damage_to_state(state, dst_id, sub.x, sub.y, sub.width, sub.height);
         }
-        // X11 §CopyArea: destination regions corresponding to
-        // unavailable source are TILED WITH THE DST WINDOW'S
-        // BACKGROUND (bg != None), with GXcopy + all-ones plane-mask
-        // — independent of the graphics-exposures setting.
-        if !missing.is_empty() && state.resources.window(request.dst).is_some() {
-            for (mx, my, mw, mh) in &missing {
-                backend.paint_window_background_rect(origin, dst_host, *mx, *my, *mw, *mh)?;
-                let _dropped = accumulate_damage_to_state(state, request.dst, *mx, *my, *mw, *mh);
-            }
-        }
         // Graphics-exposures contract (still fires when the copy was
-        // fully clipped — codex 2026-05-18 follow-up): GraphicsExpose
-        // per missing source sub-rect (out-of-bounds source region),
-        // NoExposure when the source was fully available. Events go
-        // to the requestor unconditionally (not mask-gated).
+        // fully clipped — codex 2026-05-18 follow-up): the exposed
+        // destination gets its background, and GraphicsExpose per rect
+        // or one NoExposure go to the requestor unconditionally (not
+        // mask-gated).
         let graphics_exposures = state
             .resources
             .gc(request.gc)
             .is_some_and(|g| g.graphics_exposures);
-        if graphics_exposures {
-            emit_copy_exposures(state, client_id, request.dst, &missing, 62);
-        }
+        finish_copy_exposures(
+            state,
+            backend,
+            origin,
+            client_id,
+            request.dst,
+            dst_host,
+            exposed,
+            graphics_exposures,
+            62,
+        )?;
     }
     Ok(RequestOutcome::Handled)
 }
@@ -30305,11 +30478,24 @@ fn handle_copy_plane(
         backend.apply_draw_state(origin, &st)?;
         // Clamp to the available source region (same contract as
         // CopyArea — out-of-bounds source becomes GraphicsExpose).
-        let (avail, missing) = if window_unviewable(state, dst) {
+        let graphics_exposures = state.resources.gc(gc).is_some_and(|g| g.graphics_exposures);
+        let (avail, exposed) = if window_unviewable(state, dst) {
             // Xorg miDoCopy returns before copying or exposing: NoExpose (micopy.c:157).
-            (None, Vec::new())
+            (None, None)
         } else {
-            copy_area_source_split(state, src, sx, sy, dx, dy, w, h)
+            (
+                copy_area_source_split(state, src, sx, sy, dx, dy, w, h).0,
+                copy_exposed_region(
+                    state,
+                    src,
+                    dst,
+                    &st,
+                    graphics_exposures,
+                    (sx, sy),
+                    (w, h),
+                    (dx, dy),
+                ),
+            )
         };
         if let Some((asx, asy, adx, ady, aw, ah)) = avail {
             backend.copy_plane(
@@ -30326,27 +30512,19 @@ fn handle_copy_plane(
             )?;
             let _dropped = accumulate_damage_to_state(state, dst, adx, ady, aw, ah);
         }
-        // Missing-source dst regions get the dst window's background
-        // (same contract as CopyArea).
-        if !missing.is_empty() && state.resources.window(dst).is_some() {
-            for (mx, my, mw, mh) in &missing {
-                backend.paint_window_background_rect(
-                    origin,
-                    dstt.host_xid(),
-                    *mx,
-                    *my,
-                    *mw,
-                    *mh,
-                )?;
-                let _dropped = accumulate_damage_to_state(state, dst, *mx, *my, *mw, *mh);
-            }
-        }
-        // GraphicsExpose / NoExposure to the requestor when
-        // graphics-exposures is True.
-        let graphics_exposures = state.resources.gc(gc).is_some_and(|g| g.graphics_exposures);
-        if graphics_exposures {
-            emit_copy_exposures(state, client_id, dst, &missing, 63);
-        }
+        // The same exposure contract as CopyArea (`miCopyPlane` hands its
+        // region to `miHandleExposures` too).
+        finish_copy_exposures(
+            state,
+            backend,
+            origin,
+            client_id,
+            dst,
+            dstt.host_xid(),
+            exposed,
+            graphics_exposures,
+            63,
+        )?;
     }
     debug!(
         "client {} #{} CopyPlane src=0x{:x} dst=0x{:x} src=({},{}) dst=({},{}) {}x{} plane=0x{:x}",
@@ -70233,6 +70411,50 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    /// `miHandleExposures` (`mi/miexpose.c:120-305`) as measured by
+    /// tools/vng-scenarios/expose-probe.c: a client window C (190x100)
+    /// with a child V (100,10 80x120). A scroll whose source runs past
+    /// C's bottom lands its missing rows outside C: NoExpose. A source
+    /// under V is hidden under ClipByChildren, not under IncludeInferiors.
+    #[test]
+    fn copy_area_exposes_what_the_source_hides_inside_the_destination_clip() {
+        use crate::resources::MapState;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let (c, v) = (0x0010_0130u32, 0x0010_0131u32);
+        uv_window(&mut state, c, ROOT_WINDOW, MapState::Viewable);
+        uv_window(&mut state, v, ResourceId(c), MapState::Viewable);
+        for (id, x, y, w, h) in [(c, 5, 20, 190, 100), (v, 100, 10, 80, 120)] {
+            let win = state.resources.window_mut(ResourceId(id)).unwrap();
+            (win.x, win.y, win.width, win.height) = (x, y, w, h);
+        }
+        state
+            .resources
+            .create_gc(ClientId(1), uv_gc_request(UV_GC, true));
+        let mut inferiors = uv_gc_request(UV_GC_NOEXP, true);
+        inferiors.subwindow_mode = Some(1);
+        state.resources.create_gc(ClientId(1), inferiors);
+        let mut copy = |state: &mut ServerState, gc, src: (i16, i16), dst: (i16, i16), size| {
+            uv_copy(state, &mut backend, 62, c, c, gc, src, dst, size);
+            uv_events(&read_all_available(&mut peer))
+        };
+        assert_eq!(
+            copy(&mut state, UV_GC, (0, 0), (0, 40), (100, 200)),
+            vec![(14, c, 0, 0, 0, 0, 0, 62)],
+            "NoExpose"
+        );
+        assert_eq!(
+            copy(&mut state, UV_GC, (90, 20), (10, 20), (40, 40)),
+            vec![(13, c, 20, 20, 30, 40, 0, 62)]
+        );
+        assert_eq!(
+            copy(&mut state, UV_GC_NOEXP, (90, 20), (10, 20), (40, 40)),
+            vec![(14, c, 0, 0, 0, 0, 0, 62)],
+            "IncludeInferiors: V's pixels are the source's"
+        );
     }
 
     /// Xorg: an unrealized source window has an empty clipList

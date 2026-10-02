@@ -7910,7 +7910,7 @@ impl KmsBackend {
         };
         let host_xid = *host_xid;
         if host_xid != self.core.window_id {
-            return self.window_inferiors_snapshot(host_xid);
+            return self.window_inferiors_snapshot(host_xid, None);
         }
         let root_xid = self.core.window_id;
         let root_id = self.store.lookup(root_xid)?;
@@ -7952,17 +7952,28 @@ impl KmsBackend {
         Some(scratch_xid)
     }
 
-    /// [`Self::source_inferiors_snapshot`] for a window other than the root.
-    fn window_inferiors_snapshot(&mut self, host_xid: u32) -> Option<u32> {
+    /// [`Self::source_inferiors_snapshot`] for a window other than the
+    /// root: `area` of it (its content space; `None` for all of it) as a
+    /// scratch pixmap whose `(0, 0)` is `area`'s origin. `None` when its
+    /// storage holds all it shows there already.
+    fn window_inferiors_snapshot(
+        &mut self,
+        host_xid: u32,
+        area: Option<vk::Rect2D>,
+    ) -> Option<u32> {
         let geom = *self.windows.get(&host_xid)?;
         let target = self.resolve_paint_target(host_xid)?;
-        let content = vk::Rect2D {
+        let whole = vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent: vk::Extent2D {
                 width: u32::from(geom.width),
                 height: u32::from(geom.height),
             },
         };
+        let area = area.unwrap_or(whole);
+        let content = intersect_rect_with_clip(area, &[whole])
+            .into_iter()
+            .next()?;
         let mut pieces = Vec::new();
         self.inferior_pieces(
             host_xid,
@@ -7971,11 +7982,16 @@ impl KmsBackend {
             target.backing_id(),
             &mut pieces,
         );
-        if pieces.is_empty() || geom.width == 0 || geom.height == 0 {
+        if pieces.is_empty() {
             return None;
         }
         let scratch = self
-            .create_pixmap(None, geom.depth, geom.width, geom.height)
+            .create_pixmap(
+                None,
+                geom.depth,
+                u16::try_from(area.extent.width).ok()?,
+                u16::try_from(area.extent.height).ok()?,
+            )
             .ok()?
             .as_raw();
         let Some(dst) = self.resolve_paint_target(scratch) else {
@@ -7990,13 +8006,17 @@ impl KmsBackend {
                 },
                 extent: r.extent,
             };
+            let at = vk::Offset2D {
+                x: r.offset.x - area.offset.x,
+                y: r.offset.y - area.offset.y,
+            };
             if let Err(e) = b.engine.copy_area(
                 &mut b.store,
                 &mut b.platform,
                 src.src_including_border(),
                 dst.server_backing_dst(),
                 src_rect,
-                r.offset,
+                at,
             ) {
                 log::debug!("render source snapshot of {host_xid:#x}: copy {r:?}: {e:?}");
             }
@@ -24732,6 +24752,43 @@ impl Backend for KmsBackend {
         height: u16,
     ) -> io::Result<()> {
         self.telemetry.record_copy_area_call();
+        // IncludeInferiors copies what the source shows, its inferiors'
+        // pixels too (`miHandleExposures` exposes only what falls outside
+        // `NotClippedByChildren`); a window keeping its own storage holds
+        // only its own.
+        if src_host_xid != self.core.window_id
+            && matches!(
+                self.core.current_subwindow_mode,
+                yserver_core::backend::SubwindowMode::IncludeInferiors
+            )
+            && self.windows.contains_key(&src_host_xid)
+        {
+            let area = vk::Rect2D {
+                offset: vk::Offset2D {
+                    x: i32::from(src_x),
+                    y: i32::from(src_y),
+                },
+                extent: vk::Extent2D {
+                    width: u32::from(width),
+                    height: u32::from(height),
+                },
+            };
+            if let Some(scratch) = self.window_inferiors_snapshot(src_host_xid, Some(area)) {
+                let result = self.copy_area(
+                    _origin,
+                    scratch,
+                    dst_host_xid,
+                    0,
+                    0,
+                    dst_x,
+                    dst_y,
+                    width,
+                    height,
+                );
+                let _ = self.free_pixmap(None, scratch);
+                return result;
+            }
+        }
         // Resolve the SOURCE the same way as the destination. A window
         // that is Composite-redirected (or whose ancestor is) has its
         // pixels in the redirect *backing*; its own leaf storage is
