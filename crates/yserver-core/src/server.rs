@@ -1064,7 +1064,7 @@ pub struct ServerState {
     /// XI2 grab (`dix/events.c::DetachFromMaster`).
     pub xi2_detached_masters: HashMap<u16, u16>,
     /// Per-slave sprite position retained during a floating pointer grab.
-    pub floating_pointer_positions: HashMap<u16, (i16, i16)>,
+    pub floating_pointer_positions: HashMap<u16, (f32, f32)>,
     /// Registered passive button grabs.
     pub button_grabs: Vec<PassiveButtonGrab>,
     /// Global withheld-event queue, in arrival order across devices.
@@ -1573,8 +1573,13 @@ impl ServerState {
         let facet = device.facet;
         self.xi2_detached_masters.insert(device_id, master);
         if facet == Some(crate::xinput::XiFacetKind::PointerTouch) {
-            self.floating_pointer_positions
-                .insert(device_id, self.pointer_root);
+            self.floating_pointer_positions.insert(
+                device_id,
+                (
+                    f32::from(self.pointer_root.0),
+                    f32::from(self.pointer_root.1),
+                ),
+            );
         }
         if let Some(device) = self.xi_devices.device_mut(device_id) {
             device.attached_master = None;

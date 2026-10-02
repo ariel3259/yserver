@@ -11694,9 +11694,8 @@ impl KmsBackend {
         }
     }
 
-    /// Notify both input paths of a new virtual framebuffer extent so the
-    /// cursor accumulator clamps to the correct range after a resize or
-    /// hotplug.
+    /// Notify absolute input mapping of a new virtual framebuffer extent so
+    /// coordinates use the correct range after a resize or hotplug.
     ///
     /// The input-event accumulator lives on the dedicated input thread; send
     /// the new extent via `InputThreadControl::push_resize`.
@@ -13235,9 +13234,8 @@ impl KmsBackend {
         self.rebuild_randr_state(state, None, config_changed);
 
         // Propagate the new virtual extent (set while applying the connector
-        // snapshot) to the cursor accumulator on both input paths.
-        // This allows the pointer to reach the full multi-monitor span after a
-        // hotplug.
+        // snapshot) to absolute input mapping. This allows absolute devices to
+        // reach the full multi-monitor span after a hotplug.
         let (new_fb_w, new_fb_h) = (self.platform.fb_w, self.platform.fb_h);
         self.update_input_extent(new_fb_w, new_fb_h);
 
@@ -13355,8 +13353,8 @@ impl KmsBackend {
         self.platform.fb_w = w;
         self.platform.fb_h = h;
 
-        // Propagate the new extent to the input thread's cursor accumulator so
-        // the pointer can reach the full virtual screen after a resize.
+        // Propagate the new extent to the input thread's absolute mapper so
+        // absolute devices can reach the full virtual screen after a resize.
         self.update_input_extent(w, h);
 
         // ── 2. Resize root backing storage ────────────────────────────────
@@ -14410,7 +14408,6 @@ impl KmsBackend {
         // coordinate.  Focus-follows-mouse WMs such as dwm react to that
         // EnterNotify by focusing the window below; SDL then drops and
         // reacquires its grab continuously (#99).
-        let mut confined = false;
         let confine_to = server_state.pointer_confine_to;
         if confine_to.0 != 0
             && let Some(window) = server_state.resources.window(confine_to)
@@ -14421,7 +14418,6 @@ impl KmsBackend {
             let y1 = y0 + i32::from(window.height);
             let confined_x = x.clamp(x0 as f32, (x1 - 1).max(x0) as f32);
             let confined_y = y.clamp(y0 as f32, (y1 - 1).max(y0) as f32);
-            confined = confined_x != x || confined_y != y;
             x = confined_x;
             y = confined_y;
         }
@@ -14430,8 +14426,7 @@ impl KmsBackend {
         // not the first output's box. `core_platform_init`
         // (`kms/backend.rs:1063-1072`) computes this as
         // `max(x + width)` across every output, which is also the
-        // extent the input thread targets when it accumulates
-        // libinput deltas (`input_thread.rs:180-189`). Pre-fix
+        // extent the input thread uses when mapping absolute events. Pre-fix
         // this consulted `outputs.first().width/height`, so the
         // pointer could never cross from output 0 onto a side-
         // adjacent output 1 — pinned by
@@ -14446,7 +14441,6 @@ impl KmsBackend {
             (self.core.cursor_x, self.core.cursor_y),
             (root_x, root_y),
         );
-        confined |= (new_x, new_y) != (root_x, root_y);
         if new_x != self.core.cursor_x || new_y != self.core.cursor_y {
             self.core.cursor_x = new_x;
             self.core.cursor_y = new_y;
@@ -14533,15 +14527,9 @@ impl KmsBackend {
         }
         let prev = server_state.barrier_bypass;
         server_state.barrier_bypass = prev || !relative;
+        self.core.pending_motion_barrier_bypass = !relative;
         self.dispatch_motion_event(server_state, raw_dx, raw_dy, origin);
         server_state.barrier_bypass = prev;
-        if confined && let Some(ctrl) = &self.input_thread_control {
-            // The libinput thread accumulates relative deltas independently.
-            // Pull its authoritative position back to the confined edge too,
-            // otherwise its next sample starts outside and repeatedly tries
-            // to cross the boundary.
-            ctrl.push_position(self.core.cursor_x as i32, self.core.cursor_y as i32);
-        }
     }
 
     fn process_pointer_button(
@@ -19751,7 +19739,7 @@ impl Backend for KmsBackend {
         // pointer fanout after each call so the buffer stays empty
         // between events (matches v1's contract).
         use yserver_core::core_loop::{
-            HostInputEvent, key_fanout::key_event_fanout_to_state,
+            HostInputEvent, InputOrigin, key_fanout::key_event_fanout_to_state,
             pointer_fanout::pointer_event_fanout_to_state,
         };
 
@@ -19759,6 +19747,7 @@ impl Backend for KmsBackend {
             HostInputEvent::PointerButton { origin, .. } => Some(*origin),
             _ => None,
         };
+        let mut floating_position_update = None;
         match ev {
             HostInputEvent::PointerMotion {
                 origin,
@@ -19767,6 +19756,7 @@ impl Backend for KmsBackend {
                 relative,
                 dx,
                 dy,
+                motion_delta,
                 ..
             } => {
                 if !yserver_core::core_loop::pointer_fanout::pointer_origin_is_live(state, origin) {
@@ -19780,8 +19770,32 @@ impl Backend for KmsBackend {
                         state, origin,
                     )
                 {
+                    let position = if relative && matches!(origin, InputOrigin::Physical(_)) {
+                        let current = state
+                            .floating_pointer_positions
+                            .get(&device_id)
+                            .copied()
+                            .unwrap_or_else(|| {
+                                (
+                                    f32::from(state.pointer_root.0),
+                                    f32::from(state.pointer_root.1),
+                                )
+                            });
+                        let delta = motion_delta.unwrap_or([f64::from(dx), f64::from(dy)]);
+                        (
+                            (current.0 + delta[0] as f32)
+                                .clamp(0.0, self.platform.fb_w.saturating_sub(1) as f32),
+                            (current.1 + delta[1] as f32)
+                                .clamp(0.0, self.platform.fb_h.saturating_sub(1) as f32),
+                        )
+                    } else {
+                        (x as f32, y as f32)
+                    };
+                    if relative && matches!(origin, InputOrigin::Physical(_)) {
+                        floating_position_update = Some((device_id, position));
+                    }
                     #[allow(clippy::cast_possible_truncation)]
-                    let (root_x, root_y) = (x as i16, y as i16);
+                    let (root_x, root_y) = (position.0 as i16, position.1 as i16);
                     let buttons = state
                         .xi_devices
                         .device(device_id)
@@ -19799,9 +19813,22 @@ impl Backend for KmsBackend {
                     );
                 } else {
                     self.core.button_mask = (state.buttons_down & 0x001f) << 8;
-                    self.process_pointer_absolute(
-                        state, x as f32, y as f32, relative, dx, dy, origin,
-                    );
+                    if relative && matches!(origin, InputOrigin::Physical(_)) {
+                        let delta = motion_delta.unwrap_or([f64::from(dx), f64::from(dy)]);
+                        self.process_pointer_absolute(
+                            state,
+                            self.core.cursor_x + delta[0] as f32,
+                            self.core.cursor_y + delta[1] as f32,
+                            true,
+                            dx,
+                            dy,
+                            origin,
+                        );
+                    } else {
+                        self.process_pointer_absolute(
+                            state, x as f32, y as f32, relative, dx, dy, origin,
+                        );
+                    }
                 }
             }
             HostInputEvent::PointerButton {
@@ -19846,7 +19873,14 @@ impl Backend for KmsBackend {
                         .floating_pointer_positions
                         .get(&device_id)
                         .copied()
-                        .unwrap_or(state.pointer_root);
+                        .unwrap_or_else(|| {
+                            (
+                                f32::from(state.pointer_root.0),
+                                f32::from(state.pointer_root.1),
+                            )
+                        });
+                    #[allow(clippy::cast_possible_truncation)]
+                    let (root_x, root_y) = (root_x as i16, root_y as i16);
                     let state_mask = (self.serialize_modifiers() | ((held & 0x001f) << 8))
                         | if pressed { 0 } else { button_bit << 8 };
                     self.emit_floating_pointer_event_at(
@@ -19885,7 +19919,14 @@ impl Backend for KmsBackend {
                         .floating_pointer_positions
                         .get(&device_id)
                         .copied()
-                        .unwrap_or(state.pointer_root);
+                        .unwrap_or_else(|| {
+                            (
+                                f32::from(state.pointer_root.0),
+                                f32::from(state.pointer_root.1),
+                            )
+                        });
+                    #[allow(clippy::cast_possible_truncation)]
+                    let (root_x, root_y) = (root_x as i16, root_y as i16);
                     let buttons = state
                         .xi_devices
                         .device(device_id)
@@ -19946,6 +19987,7 @@ impl Backend for KmsBackend {
                     let _dropped = yserver_core::core_loop::key_fanout::raw_key_event_to_state(
                         state,
                         yserver_core::core_loop::key_fanout::RawKeyEvent {
+                            origin: raw.origin,
                             keycode: raw.keycode,
                             pressed: raw.pressed,
                             time,
@@ -20073,10 +20115,26 @@ impl Backend for KmsBackend {
         }
 
         // Drain pointer events queued by the process_pointer_* call.
+        // `process_pointer_absolute` builds the queued events before this
+        // fanout runs, so keep its absolute-motion barrier policy active
+        // until those events have actually reached the pointer fanout.
+        let previous_barrier_bypass = state.barrier_bypass;
+        let pending_motion_barrier_bypass =
+            std::mem::take(&mut self.core.pending_motion_barrier_bypass);
+        state.barrier_bypass = previous_barrier_bypass || pending_motion_barrier_bypass;
         let pending = std::mem::take(&mut self.core.pending_pointer_events);
         let xid_map = self.core.xid_map.clone();
         for ev in pending {
             let _dropped = pointer_event_fanout_to_state(state, self, &xid_map, ev, true, false);
+        }
+        state.barrier_bypass = previous_barrier_bypass;
+        if let Some((device_id, position)) = floating_position_update
+            && state.floating_pointer_positions.contains_key(&device_id)
+        {
+            // The fanout caches the integer event coordinates. Restore the
+            // KMS-integrated position so successive subpixel motions retain
+            // their fractional remainder while the slave is detached.
+            state.floating_pointer_positions.insert(device_id, position);
         }
         if pointer_button_origin.is_some_and(|origin| {
             yserver_core::core_loop::pointer_fanout::pointer_origin_is_live(state, origin)
@@ -28557,14 +28615,6 @@ impl Backend for KmsBackend {
                 motion_delta: None,
             },
         );
-        // Resync the direct-mode input thread's cursor accumulator to the
-        // warped position (and drop any coalesced delta). Without this the
-        // libinput thread keeps integrating from its stale position, so a
-        // pointer-barrier / confine clamp would not physically hold — the
-        // next relative delta marches the cursor back past the wall. Also
-        // closes the pre-existing confine-drift gap. No-op in test fixtures
-        // where `input_thread_control` is None.
-        self.resync_input_position();
     }
 
     fn windows_restructured(&mut self, state: &mut ServerState) {
@@ -28592,12 +28642,6 @@ impl Backend for KmsBackend {
             let _dropped = yserver_core::core_loop::pointer_fanout::pointer_event_fanout_to_state(
                 state, self, &xid_map, ev, true, false,
             );
-        }
-    }
-
-    fn resync_input_position(&mut self) {
-        if let Some(ctrl) = &self.input_thread_control {
-            ctrl.push_position(self.core.cursor_x as i32, self.core.cursor_y as i32);
         }
     }
 
@@ -39238,6 +39282,121 @@ mod tests {
         assert_eq!(state.pointer_root, (110, 50));
     }
 
+    #[test]
+    fn kms_pointer_authority_integrates_relative_motion_against_pointer_barriers() {
+        use yserver_core::{
+            backend::Backend,
+            core_loop::{DeviceInfo, HostInputEvent, InputOrigin, message::LibinputConfigSnapshot},
+            server::{PointerBarrier, ServerState},
+            xinput::{InputCapabilities, InputSourceId},
+        };
+        use yserver_protocol::x11::{ClientId, ResourceId};
+
+        const SOURCE: InputSourceId = InputSourceId(0xB11);
+        const BARRIER: ResourceId = ResourceId(0x0050_0001);
+
+        let mut backend = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        backend.on_host_input(
+            &mut state,
+            HostInputEvent::DeviceAdded(DeviceInfo {
+                source_id: SOURCE,
+                enabled: true,
+                resume_key: None,
+                capabilities: InputCapabilities {
+                    keyboard: false,
+                    pointer: true,
+                    touch: false,
+                },
+                name: "barrier test pointer".to_owned(),
+                device_node: "/dev/input/barrier-test".to_owned(),
+                sysname: "barrier-test".to_owned(),
+                vendor_id: 0,
+                product_id: 0,
+                is_touchpad: false,
+                config: LibinputConfigSnapshot::default(),
+            }),
+        );
+        state.pointer_barriers.insert(
+            BARRIER.0,
+            PointerBarrier {
+                owner: ClientId(1),
+                window: yserver_core::resources::ROOT_WINDOW,
+                x1: 100,
+                y1: 0,
+                x2: 100,
+                y2: 200,
+                directions: 0,
+                devices: Vec::new(),
+                hit: false,
+                seen: false,
+                event_id: 1,
+                release_event_id: 0,
+                last_timestamp: 0,
+            },
+        );
+
+        // Use the same solid barrier setup as the existing absolute-motion
+        // test: release_event_id != event_id keeps it solid.
+        Backend::warp_pointer_root(&mut backend, &mut state, 90, 50);
+        let physical_motion = |time, x, dx, relative, motion_delta| HostInputEvent::PointerMotion {
+            origin: InputOrigin::Physical(SOURCE),
+            x,
+            y: 50,
+            time,
+            relative,
+            dx,
+            dy: 0,
+            motion_delta,
+        };
+
+        // Physical absolute input represents touch/tablet motion and bypasses
+        // this barrier, as in the existing absolute-motion regression.
+        backend.on_host_input(&mut state, physical_motion(1, 110, 11, false, None));
+        assert_eq!(
+            (backend.core.cursor_x, backend.core.cursor_y),
+            (110.0, 50.0)
+        );
+        assert_eq!(state.pointer_root, (110, 50));
+        Backend::warp_pointer_root(&mut backend, &mut state, 90, 50);
+
+        // Consecutive physical relative events approach and cross x=100.
+        // KMS must integrate each from its current (barrier-clamped) cursor.
+        backend.on_host_input(
+            &mut state,
+            physical_motion(2, 700, 8, true, Some([8.0, 0.0])),
+        );
+        assert_eq!((backend.core.cursor_x, backend.core.cursor_y), (98.0, 50.0));
+        assert_eq!(state.pointer_root, (98, 50));
+
+        backend.on_host_input(
+            &mut state,
+            physical_motion(3, 700, 10, true, Some([10.0, 0.0])),
+        );
+        assert_eq!(
+            (backend.core.cursor_x, backend.core.cursor_y),
+            (99.0, 50.0),
+            "relative motion must stop immediately before the solid barrier",
+        );
+        assert_eq!(state.pointer_root, (99, 50));
+
+        backend.on_host_input(
+            &mut state,
+            physical_motion(4, 700, -5, true, Some([-5.0, 0.0])),
+        );
+        assert_eq!(
+            (backend.core.cursor_x, backend.core.cursor_y),
+            (94.0, 50.0),
+            "the next relative delta away from the wall starts at the clamped cursor",
+        );
+        assert_eq!(state.pointer_root, (94, 50));
+
+        assert_eq!(backend.core.cursor_x, state.pointer_root.0 as f32);
+        assert_eq!(backend.core.cursor_y, state.pointer_root.1 as f32);
+        assert!(backend.core.pending_pointer_events.is_empty());
+        assert!(state.sync_pending.is_empty());
+    }
+
     /// `window_under_cursor` returns the topmost mapped top-level
     /// containing the cursor. Walks `core.top_level_order` back-to-
     /// front so the most-recently-stacked window wins. Unmapped
@@ -39574,6 +39733,404 @@ mod tests {
                 .is_some_and(yserver_core::server::Xi1Freeze::frozen),
             "source removal releases its paired master freeze",
         );
+    }
+
+    #[test]
+    fn kms_pointer_authority_integrates_physical_relative_motion_in_kms() {
+        use yserver_core::{
+            backend::Backend,
+            core_loop::{DeviceInfo, HostInputEvent, message::LibinputConfigSnapshot},
+            resources::{ROOT_VISUAL, ROOT_WINDOW},
+            server::ServerState,
+            xinput::{InputCapabilities, InputSourceId, XiFacetKind},
+        };
+        use yserver_protocol::x11::{ClientId, CreateWindowRequest, ResourceId};
+
+        const CLIENT: u32 = 7;
+        const RAZER: InputSourceId = InputSourceId(0xA11);
+        const HYPERX: InputSourceId = InputSourceId(0xA12);
+
+        let mut backend = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        let _peer = kbd_map_client_id(&mut state, CLIENT);
+        for (source_id, name) in [(RAZER, "Razer"), (HYPERX, "HyperX")] {
+            backend.on_host_input(
+                &mut state,
+                HostInputEvent::DeviceAdded(DeviceInfo {
+                    source_id,
+                    enabled: true,
+                    resume_key: None,
+                    capabilities: InputCapabilities {
+                        keyboard: source_id == RAZER,
+                        pointer: true,
+                        touch: false,
+                    },
+                    name: name.to_owned(),
+                    device_node: format!("/dev/input/{name}"),
+                    sysname: name.to_owned(),
+                    vendor_id: 0,
+                    product_id: 0,
+                    is_touchpad: false,
+                    config: LibinputConfigSnapshot::default(),
+                }),
+            );
+        }
+        let razer_id = state
+            .xi_devices
+            .facet(RAZER, XiFacetKind::PointerTouch)
+            .expect("Razer pointer facet");
+        let razer_keyboard_id = state
+            .xi_devices
+            .facet(RAZER, XiFacetKind::Keyboard)
+            .expect("Razer keyboard facet");
+        assert!(
+            state
+                .xi_devices
+                .facet(HYPERX, XiFacetKind::PointerTouch)
+                .is_some()
+        );
+
+        // Establish the master cursor through the regular warp path.
+        Backend::warp_pointer_root(&mut backend, &mut state, 100, 300);
+        assert_eq!(
+            (backend.core.cursor_x, backend.core.cursor_y),
+            (100.0, 300.0)
+        );
+
+        // An explicit slave grab floats Razer while HyperX remains attached.
+        let mut grab_body = Vec::with_capacity(24);
+        grab_body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        grab_body.extend_from_slice(&0u32.to_le_bytes());
+        grab_body.extend_from_slice(&0u32.to_le_bytes());
+        grab_body.extend_from_slice(&razer_id.to_le_bytes());
+        grab_body.extend_from_slice(&[1, 1, 0, 0]);
+        grab_body.extend_from_slice(&0u16.to_le_bytes());
+        grab_body.extend_from_slice(&[0u8; 2]);
+        yserver_core::core_loop::process_request::process_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT),
+            yserver_protocol::x11::SequenceNumber(1),
+            yserver_protocol::x11::RequestHeader {
+                opcode: 137,
+                data: 51,
+                length_units: 7,
+            },
+            &grab_body,
+            None,
+        )
+        .expect("XIGrabDevice on Razer pointer");
+        assert_eq!(
+            state.xi_devices.device(razer_id).unwrap().attached_master,
+            None
+        );
+
+        let physical_motion =
+            |source_id, x, y, dx, dy, motion_delta, relative| HostInputEvent::PointerMotion {
+                origin: yserver_core::core_loop::InputOrigin::Physical(source_id),
+                x,
+                y,
+                time: 1,
+                relative,
+                dx,
+                dy,
+                motion_delta,
+            };
+
+        // The input thread's x=650 is stale for the master and differs from
+        // the floating slave's authoritative 100 + 500 position.
+        backend.on_host_input(
+            &mut state,
+            physical_motion(RAZER, 650, 300, 500, 0, Some([500.0, 0.0]), true),
+        );
+        assert_eq!(
+            (backend.core.cursor_x, backend.core.cursor_y),
+            (100.0, 300.0)
+        );
+        let floating_position = state.floating_pointer_positions[&razer_id];
+        assert_eq!(floating_position.0, 600.0);
+        assert_eq!(floating_position.1, 300.0);
+        assert_eq!(state.pointer_root, (100, 300));
+        for _ in 0..3 {
+            backend.on_host_input(
+                &mut state,
+                physical_motion(RAZER, 650, 300, 0, 0, Some([0.4, 0.0]), true),
+            );
+        }
+        let floating_position = state.floating_pointer_positions[&razer_id];
+        assert!((floating_position.0 - 601.2).abs() < 0.001);
+        assert_eq!(state.pointer_root, (100, 300));
+
+        // HyperX is still attached: its +1 delta advances the master by
+        // exactly one pixel, regardless of the stale input-thread x value.
+        backend.on_host_input(
+            &mut state,
+            physical_motion(HYPERX, 650, 300, 1, 0, Some([1.0, 0.0]), true),
+        );
+        assert_eq!(
+            (backend.core.cursor_x, backend.core.cursor_y),
+            (101.0, 300.0)
+        );
+        assert_eq!(state.pointer_root, (101, 300));
+
+        // Fractional motion is retained across separate events; it is not
+        // rounded to zero per event or treated as three integer pixels.
+        backend.on_host_input(
+            &mut state,
+            physical_motion(HYPERX, 650, 300, 0, 0, Some([1.2, 0.0]), true),
+        );
+        assert!((backend.core.cursor_x - 102.2).abs() < 0.001);
+
+        // Warps reset the KMS position directly. Relative motion starts at
+        // that warped point even though the host absolute coordinate lags.
+        Backend::warp_pointer_root(&mut backend, &mut state, 250, 80);
+        backend.on_host_input(
+            &mut state,
+            physical_motion(HYPERX, 102, 300, 2, 0, Some([2.0, 0.0]), true),
+        );
+        assert_eq!(
+            (backend.core.cursor_x, backend.core.cursor_y),
+            (252.0, 80.0)
+        );
+
+        // Absolute tablet/touch-style input remains authoritative. A later
+        // relative event continues from that point, not the input thread's
+        // last relative accumulator.
+        backend.on_host_input(
+            &mut state,
+            physical_motion(HYPERX, 305, 100, 205, 20, None, false),
+        );
+        backend.on_host_input(
+            &mut state,
+            physical_motion(HYPERX, 252, 80, 5, 0, Some([5.0, 0.0]), true),
+        );
+        assert_eq!(
+            (backend.core.cursor_x, backend.core.cursor_y),
+            (310.0, 100.0)
+        );
+
+        // Motion confinement clamps the KMS-integrated result. The stale
+        // host coordinate remains inside the window, while the relative
+        // delta attempts to move beyond its right and bottom edges.
+        const CONFINED: ResourceId = ResourceId(0x0050_0001);
+        const CONFINED_HOST: u32 = 0x8000_0001;
+        state.resources.create_window(
+            ClientId(CLIENT),
+            CreateWindowRequest {
+                depth: 24,
+                window: CONFINED,
+                parent: ROOT_WINDOW,
+                x: 300,
+                y: 90,
+                width: 10,
+                height: 20,
+                border_width: 0,
+                class: 1,
+                visual: ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state.resources.window_mut(CONFINED).unwrap().host_xid =
+            yserver_core::backend::WindowHandle::from_raw(CONFINED_HOST);
+        assert!(state.resources.map_window(CONFINED).mapping_changed);
+        backend.windows.insert(
+            CONFINED_HOST,
+            super::WindowGeometry {
+                border_width: 0,
+                border_pixel: None,
+                border_pixmap: None,
+                x: 300,
+                y: 90,
+                width: 10,
+                height: 20,
+                depth: 24,
+                mapped: true,
+                viewable: true,
+                parent: None,
+                stack_rank: 0,
+                bg_pixel: None,
+                bg_pixmap: None,
+                cursor: None,
+            },
+        );
+        backend.core.xid_map.insert(CONFINED_HOST, CONFINED);
+        backend.core.top_level_order.push(CONFINED_HOST);
+        state.pointer_confine_to = CONFINED;
+        let history_len = state.pointer_motion_history.len();
+        backend.on_host_input(
+            &mut state,
+            physical_motion(HYPERX, 310, 100, 100, 100, Some([100.0, 100.0]), true),
+        );
+        assert_eq!(
+            (backend.core.cursor_x, backend.core.cursor_y),
+            (309.0, 109.0)
+        );
+        assert_eq!(state.pointer_root, (309, 109));
+        assert_eq!(
+            state
+                .pointer_motion_history
+                .iter()
+                .skip(history_len)
+                .map(|motion| (motion.root_x, motion.root_y))
+                .collect::<Vec<_>>(),
+            vec![(309, 109)],
+            "KMS confines the integrated cursor before emitting motion"
+        );
+
+        // Freeze the virtual XTEST keyboard through XIGrabDevice, then send
+        // a physical Razer keyboard press/release through KMS. The deferred
+        // raw records must keep their generating source while core key state
+        // is still fully released.
+        let mut key_grab_body = Vec::with_capacity(24);
+        key_grab_body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        key_grab_body.extend_from_slice(&0u32.to_le_bytes());
+        key_grab_body.extend_from_slice(&0u32.to_le_bytes());
+        key_grab_body.extend_from_slice(&5u16.to_le_bytes());
+        key_grab_body.extend_from_slice(&[0, 1, 0, 0]); // sync this, async paired
+        key_grab_body.extend_from_slice(&0u16.to_le_bytes());
+        key_grab_body.extend_from_slice(&[0u8; 2]);
+        yserver_core::core_loop::process_request::process_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT),
+            yserver_protocol::x11::SequenceNumber(2),
+            yserver_protocol::x11::RequestHeader {
+                opcode: 137,
+                data: 51,
+                length_units: 7,
+            },
+            &key_grab_body,
+            None,
+        )
+        .expect("XIGrabDevice on XTEST keyboard");
+        assert!(
+            state
+                .xi1_frozen
+                .get(&5)
+                .is_some_and(yserver_core::server::Xi1Freeze::frozen)
+        );
+        for (pressed, time) in [(true, 3), (false, 4)] {
+            backend.on_host_input(
+                &mut state,
+                HostInputEvent::Key(yserver_core::host_x11::HostKeyEvent {
+                    origin: yserver_core::core_loop::InputOrigin::Physical(RAZER),
+                    pressed,
+                    keycode: 38,
+                    time,
+                    root_x: -1,
+                    root_y: -1,
+                    event_x: -1,
+                    event_y: -1,
+                    state: 0,
+                }),
+            );
+        }
+        assert!(backend.core.down_keys.is_empty());
+        let deferred_raw: Vec<_> = state
+            .sync_pending
+            .iter()
+            .filter_map(|pending| match &pending.event {
+                yserver_core::server::QueuedInputEvent::RawKey(event) => Some(*event),
+                yserver_core::server::QueuedInputEvent::Xi1Routed(_) => None,
+                other => panic!("unexpected deferred input, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(state.sync_pending.len(), 4);
+        assert_eq!(
+            state
+                .sync_pending
+                .iter()
+                .filter(|pending| matches!(
+                    pending.event,
+                    yserver_core::server::QueuedInputEvent::Xi1Routed(_)
+                ))
+                .count(),
+            2
+        );
+        assert_eq!(deferred_raw.len(), 2);
+        assert_eq!(
+            deferred_raw
+                .iter()
+                .map(|event| (event.origin, event.keycode, event.pressed))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    yserver_core::core_loop::InputOrigin::Physical(RAZER),
+                    38,
+                    true
+                ),
+                (
+                    yserver_core::core_loop::InputOrigin::Physical(RAZER),
+                    38,
+                    false
+                ),
+            ]
+        );
+
+        assert_eq!(state.xi_devices.source(RAZER).unwrap().name, "Razer");
+        assert_eq!(state.xi_devices.source(HYPERX).unwrap().name, "HyperX");
+        assert_eq!(
+            state.xi_devices.device(razer_id).unwrap().attached_master,
+            None
+        );
+        assert_eq!(
+            state
+                .xi_devices
+                .facet(HYPERX, XiFacetKind::PointerTouch)
+                .and_then(|id| state.xi_devices.device(id))
+                .unwrap()
+                .attached_master,
+            Some(yserver_core::xinput::DEVICEID_MASTER_POINTER)
+        );
+        assert_eq!(
+            state
+                .xi_devices
+                .devices()
+                .iter()
+                .map(|device| device.id)
+                .collect::<Vec<_>>(),
+            vec![
+                2,
+                3,
+                4,
+                5,
+                razer_keyboard_id,
+                razer_id,
+                state
+                    .xi_devices
+                    .facet(HYPERX, XiFacetKind::PointerTouch)
+                    .unwrap()
+            ]
+        );
+        assert_eq!(
+            state.xi2_pointer_grabs.keys().copied().collect::<Vec<_>>(),
+            vec![razer_id]
+        );
+        assert_eq!(
+            state.xi2_keyboard_grabs.keys().copied().collect::<Vec<_>>(),
+            vec![5]
+        );
+        assert_eq!(
+            state
+                .xi_devices
+                .device(razer_keyboard_id)
+                .unwrap()
+                .attached_master,
+            Some(yserver_core::xinput::DEVICEID_MASTER_KEYBOARD)
+        );
+        assert_eq!(
+            state
+                .floating_pointer_positions
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![razer_id]
+        );
+        let floating_position = state.floating_pointer_positions[&razer_id];
+        assert!((floating_position.0 - 601.2).abs() < 0.001);
+        assert_eq!(floating_position.1, 300.0);
+        assert!(backend.core.pending_pointer_events.is_empty());
+        assert_eq!(state.sync_pending.len(), 4);
     }
 
     /// Stage 3f.6 — `create_subwindow` records the parent xid + the
@@ -52438,11 +52995,6 @@ mod tests {
             body
         };
         let mut backend = KmsBackend::for_tests();
-        // The direct-mode input thread accumulates physical deltas from its
-        // own position; every fake move must hand it the new one, as
-        // WarpPointer does, or the next real mouse motion jumps back.
-        let ctrl = std::sync::Arc::new(crate::input_thread::InputThreadControl::new().unwrap());
-        backend.input_thread_control = Some(ctrl.clone());
         let mut state = yserver_core::server::ServerState::new();
         let _peer = kbd_map_client(&mut state);
         kbd_map_request(
@@ -52453,11 +53005,6 @@ mod tests {
             &fake_motion(0, 200, 200),
         );
         assert_eq!(state.pointer_root, (200, 200), "absolute fake motion");
-        assert_eq!(
-            ctrl.take_position(),
-            Some((200, 200)),
-            "input thread resynced (absolute)"
-        );
         kbd_map_request(
             &mut state,
             &mut backend,
@@ -52466,11 +53013,6 @@ mod tests {
             &fake_motion(1, 10, -5),
         );
         assert_eq!(state.pointer_root, (210, 195), "relative +10,-5");
-        assert_eq!(
-            ctrl.take_position(),
-            Some((210, 195)),
-            "input thread resynced (relative)"
-        );
         kbd_map_request(
             &mut state,
             &mut backend,
@@ -52482,11 +53024,6 @@ mod tests {
             state.pointer_root,
             (0, 0),
             "relative move clipped to the screen"
-        );
-        assert_eq!(
-            ctrl.take_position(),
-            Some((0, 0)),
-            "input thread gets the clipped position"
         );
     }
 
