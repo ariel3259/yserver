@@ -2053,6 +2053,13 @@ pub(crate) struct KmsCore {
     /// keymap, the one it was edited from. Read by GetNames (`symbolsName`)
     /// and `_XKB_RULES_NAMES`.
     pub(crate) xkb_rmlvo: XkbRmlvo,
+    /// Immutable process-start keyboard description. A server-generation
+    /// reset starts a new XKB session on this map even though the KMS backend
+    /// itself survives the reset boundary.
+    startup_xkb_desc: XkbDesc,
+    startup_xkb_text: String,
+    startup_xkb_keymap: XkbKeymap,
+    startup_xkb_rmlvo: XkbRmlvo,
     /// Whether the active keymap is `xkb_rmlvo`'s or an edited copy.
     pub(crate) keymap_source: KeymapSource,
     /// Authoritative active keyboard group (0..=3). Tracked server-side
@@ -2190,6 +2197,10 @@ impl KmsCore {
         };
         let (xkb_desc, xkb_text, keymap) = cooking_keymap_for(&xkb_context.0, keymap, &rmlvo);
         let xkb_state = XkbState(fresh_state(&keymap));
+        let startup_xkb_desc = xkb_desc.clone();
+        let startup_xkb_text = xkb_text.clone();
+        let startup_xkb_keymap = XkbKeymap(keymap.clone());
+        let startup_xkb_rmlvo = rmlvo.clone();
         let xkb_keymap = XkbKeymap(keymap);
 
         let mut xid_map: HostXidMap = HashMap::new();
@@ -2207,6 +2218,10 @@ impl KmsCore {
             xkb_text,
             xkb_state,
             xkb_rmlvo: rmlvo,
+            startup_xkb_desc,
+            startup_xkb_text,
+            startup_xkb_keymap,
+            startup_xkb_rmlvo,
             keymap_source: KeymapSource::Rmlvo,
             locked_group: 0,
             down_keys: HashSet::new(),
@@ -2280,6 +2295,10 @@ impl KmsCore {
         let (xkb_desc, xkb_text, keymap) =
             cooking_keymap_for(&xkb_context.0, keymap, &XkbRmlvo::default());
         let xkb_state = XkbState(fresh_state(&keymap));
+        let startup_xkb_desc = xkb_desc.clone();
+        let startup_xkb_text = xkb_text.clone();
+        let startup_xkb_keymap = XkbKeymap(keymap.clone());
+        let startup_xkb_rmlvo = XkbRmlvo::default();
         let xkb_keymap = XkbKeymap(keymap);
 
         Self {
@@ -2294,6 +2313,10 @@ impl KmsCore {
             xkb_text,
             xkb_state,
             xkb_rmlvo: XkbRmlvo::default(),
+            startup_xkb_desc,
+            startup_xkb_text,
+            startup_xkb_keymap,
+            startup_xkb_rmlvo,
             keymap_source: KeymapSource::Rmlvo,
             locked_group: 0,
             down_keys: HashSet::new(),
@@ -2488,6 +2511,20 @@ impl KmsCore {
         }
         self.xkb_state = XkbState(new_state);
         self.xkb_keymap = XkbKeymap(keymap);
+    }
+
+    /// Begin a fresh server-generation keyboard session from the immutable
+    /// startup map. Unlike a VT resume, reset inherits no pressed keys,
+    /// locked modifiers, or locked group from the previous session.
+    pub(crate) fn reset_keyboard_session(&mut self) {
+        self.down_keys.clear();
+        self.xkb_desc = self.startup_xkb_desc.clone();
+        self.xkb_text.clone_from(&self.startup_xkb_text);
+        self.xkb_keymap = XkbKeymap(self.startup_xkb_keymap.0.clone());
+        self.xkb_rmlvo = self.startup_xkb_rmlvo.clone();
+        self.keymap_source = KeymapSource::Rmlvo;
+        self.locked_group = 0;
+        self.xkb_state = XkbState(fresh_state(&self.xkb_keymap.0));
     }
 }
 

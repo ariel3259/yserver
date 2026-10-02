@@ -19793,16 +19793,18 @@ impl KmsBackend {
         }
     }
 
-    /// Own physical-device held-state cleanup for removal and VT suspension.
-    /// Releases pass through the ordinary KMS input and XI fanout paths while
-    /// the source is still live; grab teardown and facet disable follow.
-    pub(crate) fn release_device_state(
+    /// Drain one physical source's holds through the same duplicate guards
+    /// and fanout used by ordinary input, without changing the source's
+    /// enabled state. Server reset uses this while the old XI topology is
+    /// still present; VT/removal cleanup additionally disables or unregisters
+    /// the source afterwards.
+    fn release_device_holds(
         &mut self,
         state: &mut ServerState,
         source_id: yserver_core::xinput::InputSourceId,
-    ) {
+    ) -> bool {
         if state.xi_devices.source(source_id).is_none() {
-            return;
+            return false;
         }
 
         state
@@ -19812,6 +19814,20 @@ impl KmsBackend {
         self.release_keyboard_source_keys(state, source_id);
         yserver_core::core_loop::pointer_fanout::xi_cleanup_source(state, self, source_id);
         self.synchronize_floating_keyboard_states(state);
+        true
+    }
+
+    /// Own physical-device held-state cleanup for removal and VT suspension.
+    /// Releases pass through the ordinary KMS input and XI fanout paths while
+    /// the source is still live; grab teardown and facet disable follow.
+    pub(crate) fn release_device_state(
+        &mut self,
+        state: &mut ServerState,
+        source_id: yserver_core::xinput::InputSourceId,
+    ) {
+        if !self.release_device_holds(state, source_id) {
+            return;
+        }
 
         let was_enabled = state
             .xi_devices
@@ -23204,6 +23220,145 @@ impl Backend for KmsBackend {
 
     fn client_disconnected(&mut self, client_id: yserver_protocol::x11::ClientId) {
         self.scene.root_overlay_on_disconnect(client_id);
+    }
+
+    fn reset_input_session(&mut self, old_state: &mut ServerState) {
+        use yserver_core::core_loop::{HostInputEvent, InputOrigin};
+
+        // Physical cleanup owns published and unpublished source state,
+        // including XTEST holds explicitly aimed at one of those facets.
+        // Unlike VT/removal cleanup, this leaves every source's enabled bit
+        // untouched so inventory replay can reproduce its current status.
+        let sources = old_state.xi_devices.source_ids();
+        for source_id in sources {
+            let _retained = self.release_device_holds(old_state, source_id);
+        }
+
+        // Release any remaining virtual/master keyboard holds through the
+        // ordinary guarded transition path. Physical holds above have
+        // already disappeared, so duplicate map entries become no-ops.
+        let mut held_keys: Vec<(u16, u8, InputOrigin)> = old_state
+            .key_down_by_device
+            .iter()
+            .flat_map(|(&device_id, keys)| {
+                keys.iter()
+                    .map(move |(&keycode, &origin)| (device_id, keycode, origin))
+            })
+            .collect();
+        held_keys.sort_by_key(|(device_id, keycode, _)| (*device_id, *keycode));
+        let mut released_keys = HashSet::new();
+        for (_, keycode, origin) in held_keys {
+            if !released_keys.insert((origin, keycode)) {
+                continue;
+            }
+            self.handle_host_key(
+                old_state,
+                HostKeyEvent {
+                    origin,
+                    pressed: false,
+                    keycode,
+                    time: crate::clock::server_time_ms(),
+                    root_x: self.core.cursor_x as i16,
+                    root_y: self.core.cursor_y as i16,
+                    event_x: self.core.cursor_x as i16,
+                    event_y: self.core.cursor_y as i16,
+                    state: 0,
+                },
+                false,
+                false,
+            );
+        }
+
+        // Then drain any pointer device holds still present. In normal input
+        // this is principally virtual XTEST 4/5; physical holds were retired
+        // above while their source/facet identity was still available.
+        let mut held_pointers: Vec<(u16, InputOrigin, u16)> = old_state
+            .xi_devices
+            .iter()
+            .filter(|device| device.buttons_down != 0)
+            .map(|device| {
+                let origin = device
+                    .source_id
+                    .map(InputOrigin::Physical)
+                    .unwrap_or(InputOrigin::XTest(device.id));
+                (device.id, origin, device.buttons_down)
+            })
+            .collect();
+        held_pointers.sort_by_key(|(device_id, _, _)| *device_id);
+        for (_, origin, buttons) in held_pointers {
+            for detail in 1u16..=9 {
+                if buttons & (1 << (detail - 1)) == 0 {
+                    continue;
+                }
+                let button = match detail {
+                    1 => 0x110,
+                    2 => 0x112,
+                    3 => 0x111,
+                    4 => 0x180,
+                    5 => 0x181,
+                    6 => 0x182,
+                    7 => 0x183,
+                    8 => 0x113,
+                    9 => 0x114,
+                    _ => unreachable!("button release loop is bounded to 1..=9"),
+                };
+                Backend::on_host_input(
+                    self,
+                    old_state,
+                    HostInputEvent::PointerButton {
+                        origin,
+                        button,
+                        pressed: false,
+                        time: crate::clock::server_time_ms(),
+                    },
+                );
+            }
+        }
+
+        // A generation boundary owns no old-session replay, XI grabs, or
+        // KMS-queued pointer events. Do this only after guarded releases have
+        // had the old registry and client windows available for fanout.
+        old_state.key_repeats.clear();
+        old_state.sync_pending.clear();
+        old_state.playing_sync_events = false;
+        old_state.xi1_frozen.clear();
+        old_state.xi1_active_grabs.clear();
+        old_state.xi1_passive_grabs.clear();
+        old_state.xi1_device_focus.clear();
+        old_state.xi1_device_input_state.clear();
+        old_state.xi2_pointer_grabs.clear();
+        old_state.xi2_keyboard_grabs.clear();
+        old_state.xi2_detached_masters.clear();
+        old_state.floating_pointer_positions.clear();
+        old_state.key_grabs.clear();
+        old_state.button_grabs.clear();
+        old_state.active_pointer_grab = None;
+        old_state.active_keyboard_grab = None;
+        old_state.key_down_by_device.clear();
+        old_state.unpublished_keyboard_keys_down.clear();
+        old_state.unpublished_pointer_buttons_down.clear();
+        old_state.keys_down.fill(0);
+        old_state.buttons_down = 0;
+        let old_device_ids: Vec<u16> = old_state
+            .xi_devices
+            .iter()
+            .map(|device| device.id)
+            .collect();
+        for device in old_state.xi_devices.iter_mut() {
+            device.buttons_down = 0;
+        }
+        for device_id in old_device_ids {
+            old_state.xi_clear_last_slave(device_id);
+        }
+
+        self.core.pending_pointer_events.clear();
+        self.core.pending_motion_barrier_bypass = false;
+        self.core.button_mask = 0;
+        self.core.down_keys.clear();
+        self.floating_keyboard_states.clear();
+        self.core.reset_keyboard_session();
+        let _cursor_result = Backend::set_grab_cursor(self, None, None);
+        self.sync_keyboard_leds();
     }
 
     fn promote_pixmap_exportable(&mut self, host_xid: u32) -> bool {
@@ -50780,6 +50935,560 @@ mod tests {
                 .is_none_or(std::collections::HashMap::is_empty)
         );
         assert!(b.core.pending_pointer_events.is_empty());
+    }
+
+    #[test]
+    fn xi_dynamic_reset_retires_kms_input_and_replays_inventory_on_the_runner_boundary() {
+        use std::{
+            collections::{HashMap, HashSet},
+            thread,
+            time::{Duration, Instant},
+        };
+        use yserver_core::{
+            core_loop::{
+                CoreSender, DeviceInfo, Generation, HostInputEvent, InputOrigin, Message,
+                ResetPolicy,
+                auth::AuthState,
+                channel,
+                message::{BoolSetting, FloatSetting, LibinputConfigSnapshot, OneHot2, U32Setting},
+                poll_tokens::ClientIdAllocator,
+                process_request::process_request,
+                run::handle_host_input,
+                run_core,
+            },
+            host_x11::HostKeyEvent,
+            resources::ROOT_WINDOW,
+            server::ServerState,
+            xinput::{InputCapabilities, InputSourceId, XiFacetKind},
+        };
+        use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
+
+        fn info(source: InputSourceId, name: &str, keyboard: bool, pointer: bool) -> DeviceInfo {
+            DeviceInfo {
+                source_id: source,
+                enabled: true,
+                resume_key: None,
+                capabilities: InputCapabilities {
+                    keyboard,
+                    pointer,
+                    touch: false,
+                },
+                name: name.into(),
+                device_node: format!("/dev/input/event{}", source.0),
+                sysname: format!("event{}", source.0),
+                vendor_id: 0x1234,
+                product_id: u32::try_from(source.0).unwrap_or_default(),
+                is_touchpad: false,
+                config: LibinputConfigSnapshot {
+                    accel: FloatSetting {
+                        available: pointer,
+                        current: 0.0,
+                        default: 0.0,
+                    },
+                    accel_profile: OneHot2 {
+                        available: pointer,
+                        current: Some(0),
+                        default: Some(0),
+                    },
+                    accel_profile_available_mask: if pointer { 0b011 } else { 0 },
+                    tap: BoolSetting::default(),
+                    scroll_button: U32Setting::default(),
+                    ..Default::default()
+                },
+            }
+        }
+
+        fn post_input(sender: &CoreSender, event: HostInputEvent) {
+            sender
+                .send(Message::HostInput(event))
+                .expect("post process-lifetime input event");
+        }
+
+        fn wait_generation(counter: &yserver_core::core_loop::GenerationCounter, old: Generation) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while counter.current() == old && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert_ne!(counter.current(), old, "runner must cross reset boundary");
+        }
+
+        const MOUSE_20: InputSourceId = InputSourceId(20);
+        const MOUSE_10: InputSourceId = InputSourceId(10);
+        const MIXED: InputSourceId = InputSourceId(30);
+        const REMOVED: InputSourceId = InputSourceId(40);
+        const SHIFT_L: u8 = 50;
+        const KEY_A: u8 = 38;
+        const KEY_B: u8 = 56;
+        const CAPS_LOCK: u8 = 66;
+
+        let mut backend = KmsBackend::for_tests();
+        let led_relay = std::sync::Arc::new(
+            crate::input::LedRelay::new().expect("test keyboard LED relay eventfd"),
+        );
+        backend.set_led_relay(led_relay.clone());
+        make_vt_fixture_headless(&mut backend);
+        backend
+            .core
+            .xid_map
+            .insert(backend.core.window_id, ROOT_WINDOW);
+        let mut state = ServerState::new();
+        for i in 0..32 {
+            state.atoms.intern(&format!("_KMS_OLD_SESSION_{i}"), false);
+        }
+        let source_20 = info(MOUSE_20, "Mouse twenty", false, true);
+        let source_30 = info(MIXED, "Mixed keyboard pointer", true, true);
+        let source_10 = info(MOUSE_10, "Mouse ten", false, true);
+        let removed = info(REMOVED, "Removed mouse", false, true);
+        // Seed an old-generation property atom. DeviceAdded is dispatched
+        // through run_core below and reuses it in this generation. Reset
+        // replaces the table before the inventory recreates the atom.
+        let old_profile_atom = state.atoms.intern("libinput Accel Profile Enabled", false);
+        for device in [&source_20, &source_30, &source_10, &removed] {
+            handle_host_input(
+                &mut state,
+                &mut backend,
+                HostInputEvent::DeviceAdded(device.clone()),
+            );
+        }
+        let changed_map = backend.core.recompile_keymap(&crate::kms::core::XkbRmlvo {
+            rules: "evdev".into(),
+            model: "pc105".into(),
+            layout: "us,be".into(),
+            variant: String::new(),
+            options: None,
+        });
+        assert!(changed_map.is_some(), "alternate pre-reset keymap compiles");
+        assert_eq!(backend.core.xkb_rmlvo.layout, "us,be");
+        for pressed in [true, false] {
+            handle_host_input(
+                &mut state,
+                &mut backend,
+                HostInputEvent::Key(HostKeyEvent {
+                    origin: InputOrigin::Physical(MIXED),
+                    keycode: CAPS_LOCK,
+                    pressed,
+                    time: 1,
+                    root_x: 0,
+                    root_y: 0,
+                    event_x: 0,
+                    event_y: 0,
+                    state: 0,
+                }),
+            );
+        }
+        backend.sync_keyboard_leds();
+        assert_eq!(
+            led_relay.drain(),
+            input::Led::CAPSLOCK.bits(),
+            "pre-reset Caps Lock mask reaches the input relay",
+        );
+        let old_id_6_source = state.xi_devices.device(6).unwrap().source_id;
+        assert_eq!(old_id_6_source, Some(MOUSE_20));
+
+        let _peer = kbd_map_client_id(&mut state, 7);
+
+        // Set up real device grabs through process_request before run_core.
+        // This lets the KMS-specific test cover floating input without a
+        // request/reply socket reader; the reset itself still runs through
+        // run_core below.
+        for (device_id, sequence, event_mask) in [
+            (8u16, 1u16, (1u32 << 4) | (1 << 5)),
+            (7u16, 2u16, (1u32 << 2) | (1 << 3)),
+        ] {
+            let mut grab = Vec::with_capacity(24);
+            grab.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+            grab.extend_from_slice(&0u32.to_le_bytes());
+            grab.extend_from_slice(&0u32.to_le_bytes());
+            grab.extend_from_slice(&device_id.to_le_bytes());
+            grab.extend_from_slice(&[1, 1, 0, 0]);
+            grab.extend_from_slice(&1u16.to_le_bytes());
+            grab.extend_from_slice(&event_mask.to_le_bytes());
+            process_request(
+                &mut state,
+                &mut backend,
+                ClientId(7),
+                SequenceNumber(sequence),
+                RequestHeader {
+                    opcode: 137,
+                    data: 51,
+                    length_units: 7,
+                },
+                &grab,
+                None,
+            )
+            .expect("real XIGrabDevice request succeeds");
+        }
+        let mixed_keyboard_before = state
+            .xi_devices
+            .facet(MIXED, XiFacetKind::Keyboard)
+            .unwrap();
+        let mixed_pointer_before = state
+            .xi_devices
+            .facet(MIXED, XiFacetKind::PointerTouch)
+            .unwrap();
+        assert_eq!(mixed_keyboard_before, 7);
+        assert_eq!(mixed_pointer_before, 8);
+        assert_eq!(
+            state
+                .xi_devices
+                .device(mixed_keyboard_before)
+                .unwrap()
+                .attached_master,
+            None,
+        );
+        assert_eq!(
+            state
+                .xi_devices
+                .device(mixed_pointer_before)
+                .unwrap()
+                .attached_master,
+            None,
+        );
+        assert!(state.xi2_pointer_grabs.contains_key(&mixed_pointer_before));
+        assert!(
+            state
+                .xi2_keyboard_grabs
+                .contains_key(&mixed_keyboard_before)
+        );
+
+        // Exercise old-session master lock state and simultaneous physical,
+        // XTEST, and floating key/button holds through the production KMS
+        // input handler.
+        for (origin, keycode) in [
+            (InputOrigin::Physical(MIXED), SHIFT_L),
+            (InputOrigin::Physical(MIXED), KEY_A),
+            (InputOrigin::XTest(5), KEY_B),
+        ] {
+            handle_host_input(
+                &mut state,
+                &mut backend,
+                HostInputEvent::Key(HostKeyEvent {
+                    origin,
+                    keycode,
+                    pressed: true,
+                    time: 2,
+                    root_x: 0,
+                    root_y: 0,
+                    event_x: 0,
+                    event_y: 0,
+                    state: 0,
+                }),
+            );
+        }
+        handle_host_input(
+            &mut state,
+            &mut backend,
+            HostInputEvent::PointerMotion {
+                origin: InputOrigin::Physical(MIXED),
+                x: 12,
+                y: 20,
+                time: 3,
+                relative: false,
+                dx: 0,
+                dy: 0,
+                motion_delta: None,
+            },
+        );
+        for (origin, button) in [
+            (InputOrigin::Physical(MOUSE_20), 0x110),
+            (InputOrigin::Physical(MIXED), 0x112),
+            (InputOrigin::XTest(4), 0x111),
+        ] {
+            handle_host_input(
+                &mut state,
+                &mut backend,
+                HostInputEvent::PointerButton {
+                    origin,
+                    button,
+                    pressed: true,
+                    time: 3,
+                },
+            );
+        }
+        assert_eq!(
+            backend.current_led_bits(),
+            input::Led::CAPSLOCK.bits(),
+            "pre-reset master lock state lights Caps Lock",
+        );
+        assert_eq!(backend.core.down_keys, HashSet::from([KEY_B]));
+        assert!(
+            backend
+                .floating_keyboard_states
+                .contains_key(&mixed_keyboard_before)
+        );
+        assert_eq!(
+            state.key_down_by_device.get(&mixed_keyboard_before),
+            Some(&HashMap::from([
+                (SHIFT_L, InputOrigin::Physical(MIXED)),
+                (KEY_A, InputOrigin::Physical(MIXED)),
+            ])),
+        );
+        assert!(
+            state
+                .floating_pointer_positions
+                .contains_key(&mixed_pointer_before)
+        );
+        assert_eq!(
+            state
+                .xi_devices
+                .device(mixed_pointer_before)
+                .unwrap()
+                .buttons_down,
+            0b010,
+        );
+        assert_eq!(state.buttons_down & 0b101, 0b101);
+        assert_eq!(state.buttons_down & 0b010, 0);
+        assert_eq!(
+            state.key_repeats[&InputOrigin::Physical(MIXED)]
+                .event
+                .keycode,
+            KEY_A,
+            "pre-reset physical key has an armed repeat",
+        );
+        assert_eq!(
+            state.key_repeats[&InputOrigin::XTest(5)].event.keycode,
+            KEY_B,
+            "pre-reset XTEST key has an independent armed repeat",
+        );
+        let (poll, sender, receiver) = channel().expect("core channel");
+        let generation_counter = receiver.generation_counter();
+        let generation_zero = generation_counter.current();
+        let input_sender = sender.clone_handle();
+        let driver = thread::spawn(move || {
+            // The runner inventory receives these same lifecycle messages;
+            // a suspended source remains in it while a removed source does
+            // not. Facet IDs before reset are 6, 7/8, 9, then 10.
+            for device in [&source_20, &source_30, &source_10, &removed] {
+                post_input(&input_sender, HostInputEvent::DeviceAdded(device.clone()));
+            }
+
+            // Repeating a live identity keeps the inventory's current
+            // source configuration before the reset boundary. The runner
+            // also records the remove and suspend facts before rebuilding.
+            post_input(
+                &input_sender,
+                HostInputEvent::DeviceRemoved { source_id: REMOVED },
+            );
+            post_input(
+                &input_sender,
+                HostInputEvent::DeviceSuspended {
+                    source_id: MOUSE_10,
+                },
+            );
+
+            input_sender
+                .send(Message::ResetRequested)
+                .expect("request first reset");
+            wait_generation(&generation_counter, generation_zero);
+
+            // Give the old repeat deadline a chance to fire. The cleanup hook
+            // removes its source repeat and the fresh generation has none.
+            thread::sleep(Duration::from_millis(700));
+            for (origin, keycode) in [
+                (InputOrigin::Physical(MIXED), SHIFT_L),
+                (InputOrigin::Physical(MIXED), KEY_A),
+                (InputOrigin::XTest(5), KEY_B),
+            ] {
+                post_input(
+                    &input_sender,
+                    HostInputEvent::Key(HostKeyEvent {
+                        origin,
+                        keycode,
+                        pressed: false,
+                        time: 4,
+                        root_x: 0,
+                        root_y: 0,
+                        event_x: 0,
+                        event_y: 0,
+                        state: 0,
+                    }),
+                );
+            }
+            for (origin, button) in [
+                (InputOrigin::Physical(MOUSE_20), 0x110),
+                (InputOrigin::Physical(MIXED), 0x112),
+                (InputOrigin::XTest(4), 0x111),
+            ] {
+                post_input(
+                    &input_sender,
+                    HostInputEvent::PointerButton {
+                        origin,
+                        button,
+                        pressed: false,
+                        time: 5,
+                    },
+                );
+            }
+
+            // Late old-source releases must not disturb the reset session.
+            // Then send fresh pointer input, whose final state is inspected
+            // after run_core returns.
+            post_input(
+                &input_sender,
+                HostInputEvent::PointerMotion {
+                    origin: InputOrigin::Physical(MOUSE_20),
+                    x: 0,
+                    y: 0,
+                    time: 6,
+                    relative: true,
+                    dx: 5,
+                    dy: 0,
+                    motion_delta: Some([5.0, 0.0]),
+                },
+            );
+            input_sender
+                .send(Message::Shutdown)
+                .expect("stop runner after fresh post-reset input");
+        });
+
+        run_core(
+            poll,
+            receiver,
+            sender,
+            &mut state,
+            &mut backend,
+            Vec::new(),
+            &ClientIdAllocator::new(),
+            AuthState::new(None),
+            ResetPolicy::Reset,
+            None,
+        )
+        .expect("core loop crosses both reset boundaries and shuts down cleanly");
+        driver.join().expect("input driver thread");
+
+        let pointer_10 = state
+            .xi_devices
+            .facet(MOUSE_10, XiFacetKind::PointerTouch)
+            .expect("suspended mouse ten survives reset");
+        let pointer_20 = state
+            .xi_devices
+            .facet(MOUSE_20, XiFacetKind::PointerTouch)
+            .expect("mouse twenty survives reset");
+        let mixed_keyboard = state
+            .xi_devices
+            .facet(MIXED, XiFacetKind::Keyboard)
+            .expect("mixed keyboard facet survives reset");
+        let mixed_pointer = state
+            .xi_devices
+            .facet(MIXED, XiFacetKind::PointerTouch)
+            .expect("mixed pointer facet survives reset");
+        assert_eq!(
+            (pointer_10, pointer_20, mixed_keyboard, mixed_pointer),
+            (6, 7, 8, 9)
+        );
+        assert_eq!(
+            state.xi_devices.device(6).unwrap().source_id,
+            Some(MOUSE_10)
+        );
+        assert_ne!(
+            old_id_6_source,
+            state.xi_devices.device(6).unwrap().source_id
+        );
+        assert!(state.xi_devices.source(REMOVED).is_none());
+        assert!(!state.xi_devices.source(MOUSE_10).unwrap().enabled);
+        assert!(state.xi_devices.source(MOUSE_20).unwrap().enabled);
+        assert!(state.xi_devices.source(MIXED).unwrap().enabled);
+        assert_eq!(
+            state
+                .xi_devices
+                .device(mixed_keyboard)
+                .unwrap()
+                .attached_master,
+            Some(yserver_core::xinput::DEVICEID_MASTER_KEYBOARD)
+        );
+        assert_eq!(
+            state
+                .xi_devices
+                .device(mixed_pointer)
+                .unwrap()
+                .attached_master,
+            Some(yserver_core::xinput::DEVICEID_MASTER_POINTER)
+        );
+
+        let current_profile_atom = state
+            .atoms
+            .id_for("libinput Accel Profile Enabled")
+            .expect("new generation recreates property atom");
+        assert_ne!(old_profile_atom, current_profile_atom);
+        assert_eq!(
+            state.atoms.name(current_profile_atom),
+            Some("libinput Accel Profile Enabled")
+        );
+        assert!(
+            state
+                .xi_devices
+                .device(pointer_20)
+                .unwrap()
+                .properties
+                .contains_key(&current_profile_atom)
+        );
+
+        assert!(
+            state.clients.is_empty(),
+            "old-generation client was destroyed"
+        );
+        assert_eq!(
+            state
+                .keys_down
+                .iter()
+                .map(|byte| byte.count_ones())
+                .sum::<u32>(),
+            0,
+            "the reset session has no stale keys held",
+        );
+        assert_eq!(state.buttons_down, 0);
+        assert!(state.key_down_by_device.is_empty());
+        assert!(state.unpublished_keyboard_keys_down.is_empty());
+        assert!(state.unpublished_pointer_buttons_down.is_empty());
+        assert!(
+            state.key_repeats.is_empty(),
+            "reset drops old repeat timers"
+        );
+        assert!(state.sync_pending.is_empty());
+        assert!(state.xi1_frozen.is_empty());
+        assert!(state.xi2_pointer_grabs.is_empty());
+        assert!(state.xi2_keyboard_grabs.is_empty());
+        assert!(state.xi2_detached_masters.is_empty());
+        assert!(state.floating_pointer_positions.is_empty());
+        assert_eq!(
+            backend
+                .core
+                .xkb_state
+                .0
+                .serialize_mods(xkbcommon::xkb::STATE_MODS_DEPRESSED),
+            0
+        );
+        assert_eq!(
+            backend
+                .core
+                .xkb_state
+                .0
+                .serialize_mods(xkbcommon::xkb::STATE_MODS_LATCHED),
+            0
+        );
+        assert_eq!(
+            backend
+                .core
+                .xkb_state
+                .0
+                .serialize_mods(xkbcommon::xkb::STATE_MODS_LOCKED),
+            0
+        );
+        assert_eq!(backend.current_led_bits(), 0);
+        assert_eq!(backend.leds_sent, 0);
+        assert_eq!(led_relay.drain(), 0, "reset relays the fresh LED mask");
+        assert_eq!(backend.core.xkb_rmlvo.layout, "us");
+        assert!(backend.core.down_keys.is_empty());
+        assert_eq!(state.pointer_motion_history.len(), 1);
+        assert!(state.pointer_motion_history[0].time > 0);
+        assert!(backend.core.pending_pointer_events.is_empty());
+        assert!(backend.floating_keyboard_states.is_empty());
+        assert_eq!(state.xi_devices.device(pointer_10).unwrap().buttons_down, 0);
+        assert_eq!(state.xi_devices.device(pointer_20).unwrap().buttons_down, 0);
+        assert_eq!(
+            state.xi_devices.device(mixed_pointer).unwrap().buttons_down,
+            0
+        );
     }
 
     // ── Task 13: stub-backed VT-switch suspend/resume integration tests ──

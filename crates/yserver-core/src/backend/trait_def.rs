@@ -2677,6 +2677,13 @@ pub trait Backend {
     /// contribution here. Default no-op.
     fn client_disconnected(&mut self, _client_id: yserver_protocol::x11::ClientId) {}
 
+    /// Retire state held by the old input session immediately before a
+    /// server-generation reset destroys its clients and replaces its XI
+    /// registry. Backends whose input state lives entirely in `ServerState`
+    /// need no extra work; stateful backends can route releases while the old
+    /// facets and resources are still present. Default no-op.
+    fn reset_input_session(&mut self, _old_state: &mut ServerState) {}
+
     /// GLX-TFP Task 3.5: promote the backing for `host_xid` to
     /// dma-buf-exportable storage (idempotent) WITHOUT touching the
     /// lifetime refcount (`glx_refs`) or allocating/exporting a dmabuf fd.

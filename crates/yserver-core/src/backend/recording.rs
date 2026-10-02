@@ -34,6 +34,8 @@ use crate::{
 /// assert against `Vec<RecordedCall>` snapshots.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordedCall {
+    /// The backend input-session cleanup hook ran at a generation boundary.
+    ResetInputSession,
     /// A key event handed to `on_host_input`; `repeat` distinguishes
     /// `HostInputEvent::KeyRepeat` from device `HostInputEvent::Key`.
     HostKey {
@@ -1129,6 +1131,10 @@ impl Backend for RecordingBackend {
     fn ping(&mut self, _origin: Option<OriginContext>) -> io::Result<()> {
         self.record(RecordedCall::Ping);
         Ok(())
+    }
+
+    fn reset_input_session(&mut self, _old_state: &mut crate::server::ServerState) {
+        self.record(RecordedCall::ResetInputSession);
     }
 
     fn on_host_input(

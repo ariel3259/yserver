@@ -1045,7 +1045,12 @@ fn translate(event: &Event, source_id: InputSourceId) -> Option<InputEvent> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_touchpad;
+    use super::{MonotonicClock, ResumeTracker, is_touchpad};
+    use std::{
+        sync::{Arc, Mutex},
+        thread,
+        time::{Duration, Instant},
+    };
 
     /// Touchpad classification keys off libinput's tap finger count:
     /// mice / trackpoints / keyboards report 0; clickpads/touchpads
@@ -1056,5 +1061,113 @@ mod tests {
         assert!(!is_touchpad(0), "0 fingers = not a touchpad");
         assert!(is_touchpad(1), "1 finger = touchpad");
         assert!(is_touchpad(3), "3 fingers = touchpad");
+    }
+
+    struct TestClock(Mutex<Instant>);
+
+    impl MonotonicClock for TestClock {
+        fn now(&self) -> Instant {
+            *self.0.lock().unwrap()
+        }
+    }
+
+    #[test]
+    fn xi_dynamic_reset_keeps_active_vt_recovery_window() {
+        use yserver_core::{
+            core_loop::{
+                DeviceInfo, EndpointInstanceKey, HostInputEvent, Message, ResetPolicy, channel,
+                message::LibinputConfigSnapshot, run_core,
+            },
+            xinput::{InputCapabilities, InputSourceId},
+        };
+
+        let now = Instant::now();
+        let clock = Arc::new(TestClock(Mutex::new(now)));
+        let mut recovery = ResumeTracker::new(clock);
+        let source_id = InputSourceId(91);
+        let paused_info = DeviceInfo {
+            source_id,
+            enabled: false,
+            resume_key: Some(EndpointInstanceKey("input-91".into())),
+            capabilities: InputCapabilities {
+                keyboard: true,
+                pointer: true,
+                touch: false,
+            },
+            name: "Paused mixed source".into(),
+            device_node: "/dev/input/event91".into(),
+            sysname: "event91".into(),
+            vendor_id: 1,
+            product_id: 91,
+            is_touchpad: false,
+            config: LibinputConfigSnapshot::default(),
+        };
+        recovery.paused.insert(source_id, paused_info.clone());
+        recovery
+            .begin()
+            .expect("start the active VT recovery window");
+        let active_window = recovery.window().expect("active resume deadline");
+
+        let (poll, sender, receiver) = channel().expect("core channel");
+        let generations = receiver.generation_counter();
+        let before = generations.current();
+        let input_sender = sender.clone_handle();
+        let driver = thread::spawn(move || {
+            input_sender
+                .send(Message::HostInput(HostInputEvent::DeviceAdded(paused_info)))
+                .expect("publish suspended source to the process-lifetime inventory");
+            input_sender
+                .send(Message::ResetRequested)
+                .expect("request reset while VT recovery is active");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while generations.current() == before && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert_ne!(
+                generations.current(),
+                before,
+                "runner crossed the reset boundary"
+            );
+            input_sender
+                .send(Message::Shutdown)
+                .expect("stop the runner after reset");
+        });
+
+        let mut state = yserver_core::server::ServerState::new();
+        let mut backend = crate::kms::render::KmsBackend::for_tests();
+        backend.platform.devices.clear();
+        run_core(
+            poll,
+            receiver,
+            sender,
+            &mut state,
+            &mut backend,
+            Vec::new(),
+            &yserver_core::core_loop::poll_tokens::ClientIdAllocator::new(),
+            yserver_core::core_loop::auth::AuthState::new(None),
+            ResetPolicy::Reset,
+            None,
+        )
+        .expect("runner reset succeeds during the active recovery window");
+        driver.join().expect("reset driver thread");
+
+        assert_eq!(recovery.window(), Some(active_window));
+        assert_eq!(
+            recovery.paused.get(&source_id).map(|info| info.enabled),
+            Some(false)
+        );
+        assert!(!state.xi_devices.source(source_id).unwrap().enabled);
+        assert!(
+            state
+                .xi_devices
+                .facet(source_id, yserver_core::xinput::XiFacetKind::Keyboard)
+                .is_some()
+        );
+        assert!(
+            state
+                .xi_devices
+                .facet(source_id, yserver_core::xinput::XiFacetKind::PointerTouch)
+                .is_some()
+        );
     }
 }
