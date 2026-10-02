@@ -63212,6 +63212,7 @@ mod tests {
             f.state = crate::server::Xi1SyncState::FrozenWithEvent;
             f.stored = Some(crate::server::QueuedInputEvent::HostPointer(
                 HostPointerEvent {
+                    origin: crate::core_loop::message::InputOrigin::XTest(4),
                     kind: PointerEventKind::ButtonPress,
                     host_xid: HOST_XID,
                     detail: 1,
@@ -63391,6 +63392,7 @@ mod tests {
         // host_xid = SIBLING's host xid so the v2-style hit-test lands
         // on the sibling window naturally.
         let motion = HostPointerEvent {
+            origin: crate::core_loop::message::InputOrigin::XTest(4),
             kind: PointerEventKind::MotionNotify,
             host_xid: HOST_SIBLING_XID,
             detail: 0,
@@ -63529,6 +63531,7 @@ mod tests {
 
         set_test_pointer_grab(&mut state, GRAB_CLIENT_ID, GRAB_WIN, true, false);
         let press = HostPointerEvent {
+            origin: crate::core_loop::message::InputOrigin::XTest(4),
             kind: PointerEventKind::ButtonPress,
             host_xid: HOST_XID,
             detail: 1,
@@ -63554,6 +63557,7 @@ mod tests {
         }
         // Queue a release that arrived while frozen.
         let release = HostPointerEvent {
+            origin: crate::core_loop::message::InputOrigin::XTest(4),
             kind: PointerEventKind::ButtonRelease,
             time: 0x1c89,
             ..press
@@ -63756,6 +63760,7 @@ mod tests {
             },
         );
         let press = HostPointerEvent {
+            origin: crate::core_loop::message::InputOrigin::XTest(4),
             kind: PointerEventKind::ButtonPress,
             host_xid: HOST_XID,
             detail: 1,
@@ -63784,6 +63789,7 @@ mod tests {
             .push_back(crate::server::PendingSyncEvent {
                 device: crate::xinput::DEVICEID_SLAVE_POINTER,
                 event: crate::server::QueuedInputEvent::HostPointer(HostPointerEvent {
+                    origin: crate::core_loop::message::InputOrigin::XTest(4),
                     kind: PointerEventKind::ButtonRelease,
                     time: 0x2a50,
                     ..press
@@ -64038,6 +64044,7 @@ mod tests {
         state.sync_pending.push_back(PendingSyncEvent {
             device: crate::xinput::DEVICEID_SLAVE_POINTER,
             event: QueuedInputEvent::HostPointer(HostPointerEvent {
+                origin: crate::core_loop::message::InputOrigin::XTest(4),
                 kind: PointerEventKind::ButtonRelease,
                 host_xid: HOST_XID,
                 detail: 1,
@@ -64158,6 +64165,7 @@ mod tests {
         state.sync_pending.push_back(PendingSyncEvent {
             device: crate::xinput::DEVICEID_SLAVE_POINTER,
             event: QueuedInputEvent::HostPointer(HostPointerEvent {
+                origin: crate::core_loop::message::InputOrigin::XTest(4),
                 kind: PointerEventKind::ButtonRelease,
                 host_xid: HOST_XID,
                 detail: 1,
@@ -64280,6 +64288,7 @@ mod tests {
         // Drive a PHYSICAL button-1 release through the real fanout: the gate
         // withholds it into sync_pending with the physical detail preserved.
         let release = HostPointerEvent {
+            origin: crate::core_loop::message::InputOrigin::XTest(4),
             kind: PointerEventKind::ButtonRelease,
             host_xid: HOST_XID,
             detail: 1,
@@ -64423,6 +64432,7 @@ mod tests {
             },
         );
         let press = HostPointerEvent {
+            origin: crate::core_loop::message::InputOrigin::XTest(4),
             kind: PointerEventKind::ButtonPress,
             host_xid: HOST_XID,
             detail: 1,
@@ -64451,6 +64461,7 @@ mod tests {
             .push_back(crate::server::PendingSyncEvent {
                 device: crate::xinput::DEVICEID_SLAVE_POINTER,
                 event: crate::server::QueuedInputEvent::HostPointer(HostPointerEvent {
+                    origin: crate::core_loop::message::InputOrigin::XTest(4),
                     kind: PointerEventKind::ButtonRelease,
                     time: 0x20,
                     ..press
@@ -64577,6 +64588,7 @@ mod tests {
             f.state = crate::server::Xi1SyncState::FrozenWithEvent;
             f.stored = Some(crate::server::QueuedInputEvent::HostPointer(
                 HostPointerEvent {
+                    origin: crate::core_loop::message::InputOrigin::XTest(4),
                     kind: PointerEventKind::ButtonPress,
                     host_xid: HOST_XID,
                     detail: 1,
@@ -64693,6 +64705,7 @@ mod tests {
             .expect("register host xid");
 
         let event = HostPointerEvent {
+            origin: crate::core_loop::message::InputOrigin::XTest(4),
             kind: PointerEventKind::ButtonPress,
             host_xid: HOST_XID,
             detail: 1,
@@ -64821,6 +64834,7 @@ mod tests {
             .expect("register host xid");
 
         let press = HostPointerEvent {
+            origin: crate::core_loop::message::InputOrigin::XTest(4),
             kind: PointerEventKind::ButtonPress,
             host_xid: HOST_XID,
             detail: 1,
@@ -64866,6 +64880,7 @@ mod tests {
 
         // Release arrives BEFORE AllowEvents (the load-bearing case).
         let release = HostPointerEvent {
+            origin: crate::core_loop::message::InputOrigin::XTest(4),
             kind: PointerEventKind::ButtonRelease,
             time: 0x1280,
             ..press
@@ -64998,6 +65013,7 @@ mod tests {
             .expect("register host xid");
 
         let press = HostPointerEvent {
+            origin: crate::core_loop::message::InputOrigin::XTest(4),
             kind: PointerEventKind::ButtonPress,
             host_xid: HOST_XID,
             detail: 1,
@@ -65151,6 +65167,7 @@ mod tests {
         // Pointer has dragged onto nemo-desktop (200,200..600,600); button 1
         // still held. event_x/y are relative to OTHER_WIN's origin.
         let release = HostPointerEvent {
+            origin: crate::core_loop::message::InputOrigin::XTest(4),
             kind: PointerEventKind::ButtonRelease,
             host_xid: OTHER_HOST_XID,
             detail: 1,
@@ -65270,6 +65287,7 @@ mod tests {
             .expect("register host xid");
 
         let press = HostPointerEvent {
+            origin: crate::core_loop::message::InputOrigin::XTest(4),
             kind: PointerEventKind::ButtonPress,
             host_xid: HOST_XID,
             detail: 1,
@@ -82970,6 +82988,7 @@ mod tests {
         // queue gate decremented buttons_down and withheld it).
         set_test_pointer_grab(&mut state, WM, GRAB_WIN, true, false);
         let press = HostPointerEvent {
+            origin: crate::core_loop::message::InputOrigin::XTest(4),
             kind: PointerEventKind::ButtonPress,
             host_xid: HOST_XID,
             detail: 1,
@@ -82994,6 +83013,7 @@ mod tests {
             f.stored = Some(crate::server::QueuedInputEvent::HostPointer(press));
         }
         let release = HostPointerEvent {
+            origin: crate::core_loop::message::InputOrigin::XTest(4),
             kind: PointerEventKind::ButtonRelease,
             time: 1010,
             state: 0x100,
@@ -83277,6 +83297,7 @@ mod tests {
         // Frozen sync passive grab held by the WM, press stored.
         set_test_pointer_grab(&mut state, WM, GRAB_WIN, true, false);
         let press = HostPointerEvent {
+            origin: crate::core_loop::message::InputOrigin::XTest(4),
             kind: PointerEventKind::ButtonPress,
             host_xid: HOST_APP,
             detail: 1,
@@ -83367,6 +83388,7 @@ mod tests {
         // Natural release now resolves over the WM's covering window.
         let xid_map = backend.xid_map().clone();
         let release = HostPointerEvent {
+            origin: crate::core_loop::message::InputOrigin::XTest(4),
             kind: PointerEventKind::ButtonRelease,
             host_xid: HOST_COVER,
             time: 1200,
@@ -83470,6 +83492,7 @@ mod tests {
 
         // 1. ButtonPress @ W (Xorg: delivered to the selector on its window).
         let press = HostPointerEvent {
+            origin: crate::core_loop::message::InputOrigin::XTest(4),
             kind: PointerEventKind::ButtonPress,
             host_xid: HOST_APP,
             detail: 1,
@@ -83524,6 +83547,7 @@ mod tests {
         // 3. ButtonRelease @ W, still over W (Xorg: delivered to the client on W,
         //    even though the client established its own grab mid-click).
         let release = HostPointerEvent {
+            origin: crate::core_loop::message::InputOrigin::XTest(4),
             kind: PointerEventKind::ButtonRelease,
             time: 1100,
             state: 0x100,
@@ -83664,6 +83688,7 @@ mod tests {
             let seq = i * 4;
             let base_time = 1000 + i * 100;
             let press = HostPointerEvent {
+                origin: crate::core_loop::message::InputOrigin::XTest(4),
                 kind: PointerEventKind::ButtonPress,
                 host_xid: HOST_APP,
                 detail: 1,
@@ -83704,6 +83729,7 @@ mod tests {
             .expect("XIGrabDevice");
 
             let release = HostPointerEvent {
+                origin: crate::core_loop::message::InputOrigin::XTest(4),
                 kind: PointerEventKind::ButtonRelease,
                 time: base_time + 50,
                 state: 0x100,
@@ -83887,6 +83913,7 @@ mod tests {
         // Press @ STEAM_WIN (post-ReplayDevice replay to Steam): Steam gets it,
         // installs the implicit grab.
         let press = HostPointerEvent {
+            origin: crate::core_loop::message::InputOrigin::XTest(4),
             kind: PointerEventKind::ButtonPress,
             host_xid: HOST_STEAM,
             detail: 1,
@@ -83942,6 +83969,7 @@ mod tests {
         // Release over Steam's window — must reach the grab holder (Steam),
         // not muffin.
         let release = HostPointerEvent {
+            origin: crate::core_loop::message::InputOrigin::XTest(4),
             kind: PointerEventKind::ButtonRelease,
             time: 0xa0e3,
             state: 0x100,
@@ -84023,6 +84051,7 @@ mod tests {
             .expect("register");
         let xid_map = backend.xid_map().clone();
         let press = HostPointerEvent {
+            origin: crate::core_loop::message::InputOrigin::XTest(4),
             kind: PointerEventKind::ButtonPress,
             host_xid: HOST_XID,
             detail: 1,
@@ -84282,6 +84311,7 @@ mod tests {
 
         // Real click over the app's leaf.
         let press = HostPointerEvent {
+            origin: crate::core_loop::message::InputOrigin::XTest(4),
             kind: PointerEventKind::ButtonPress,
             host_xid: HOST_LEAF,
             detail: 1,

@@ -12966,7 +12966,12 @@ impl KmsBackend {
         let xid_map = self.core.xid_map.clone();
         for (n, &code) in BUTTON_CODES.iter().enumerate() {
             if held & (1 << n) != 0 {
-                self.process_pointer_button(code, false, state);
+                self.process_pointer_button(
+                    code,
+                    false,
+                    state,
+                    yserver_core::core_loop::InputOrigin::XTest(4),
+                );
                 // Drain pointer events into fanout after each button
                 // (matches on_host_input's drain-per-event contract).
                 let pending = std::mem::take(&mut self.core.pending_pointer_events);
@@ -14760,6 +14765,7 @@ impl KmsBackend {
 
     fn emit_crossing(
         &mut self,
+        origin: yserver_core::core_loop::InputOrigin,
         host_xid: u32,
         kind: PointerEventKind,
         detail: u8,
@@ -14769,6 +14775,7 @@ impl KmsBackend {
     ) {
         let (event_x, event_y) = self.event_relative_coords(host_xid);
         let ev = HostPointerEvent {
+            origin,
             kind,
             host_xid,
             detail,
@@ -14787,9 +14794,17 @@ impl KmsBackend {
         self.emit_pointer(ev);
     }
 
-    fn emit_motion_only(&mut self, host_xid: u32, mask: u16, raw_dx: i32, raw_dy: i32) {
+    fn emit_motion_only(
+        &mut self,
+        origin: yserver_core::core_loop::InputOrigin,
+        host_xid: u32,
+        mask: u16,
+        raw_dx: i32,
+        raw_dy: i32,
+    ) {
         let (event_x, event_y) = self.event_relative_coords(host_xid);
         let ev = HostPointerEvent {
+            origin,
             kind: PointerEventKind::MotionNotify,
             host_xid,
             detail: 0,
@@ -14811,7 +14826,13 @@ impl KmsBackend {
     /// Spec-correct Normal-mode crossing chain for a top-level
     /// transition. Direct v1 port (kms/backend.rs:6630-6695) —
     /// the body only touches KmsCore + nested-resource look-ups.
-    fn update_pointer_window(&mut self, server_state: &ServerState, new_xid: u32, mask: u16) {
+    fn update_pointer_window(
+        &mut self,
+        server_state: &ServerState,
+        new_xid: u32,
+        mask: u16,
+        origin: yserver_core::core_loop::InputOrigin,
+    ) {
         if self.core.prev_pointer_window == Some(new_xid) {
             log::trace!(
                 target: "yserver::kms::render::pointer",
@@ -14857,7 +14878,7 @@ impl KmsBackend {
                     "upw: emit_crossing host=0x{win_host_xid:x} kind={:?} detail={} child={:#x}",
                     kind, ev.detail, ev.child.0
                 );
-                self.emit_crossing(win_host_xid, kind, ev.detail, 0, ev.child.0, mask);
+                self.emit_crossing(origin, win_host_xid, kind, ev.detail, 0, ev.child.0, mask);
             }
         } else {
             log::trace!(
@@ -14868,9 +14889,17 @@ impl KmsBackend {
             // First-motion bootstrap or unmapped host_xid —
             // fall back to a single Leave/Enter with detail=0.
             if let Some(prev) = prev_host {
-                self.emit_crossing(prev, PointerEventKind::LeaveNotify, 0, 0, 0, mask);
+                self.emit_crossing(origin, prev, PointerEventKind::LeaveNotify, 0, 0, 0, mask);
             }
-            self.emit_crossing(new_xid, PointerEventKind::EnterNotify, 0, 0, 0, mask);
+            self.emit_crossing(
+                origin,
+                new_xid,
+                PointerEventKind::EnterNotify,
+                0,
+                0,
+                0,
+                mask,
+            );
         }
         self.core.prev_pointer_window = Some(new_xid);
         // Stage 5 Phase A: cross-in may change the effective cursor
@@ -14878,7 +14907,13 @@ impl KmsBackend {
         self.refresh_effective_cursor();
     }
 
-    fn dispatch_motion_event(&mut self, server_state: &ServerState, raw_dx: i32, raw_dy: i32) {
+    fn dispatch_motion_event(
+        &mut self,
+        server_state: &ServerState,
+        raw_dx: i32,
+        raw_dy: i32,
+        origin: yserver_core::core_loop::InputOrigin,
+    ) {
         // Fall back to the root container so root-window subscribers
         // (e16's right-click-desktop menu, fvwm3's root bindings) can
         // see motion when the cursor is over the wallpaper.
@@ -14889,8 +14924,8 @@ impl KmsBackend {
             "dispatch_motion: cursor=({},{}) → host_xid=0x{host_xid:x}",
             self.core.cursor_x, self.core.cursor_y
         );
-        self.update_pointer_window(server_state, host_xid, mask);
-        self.emit_motion_only(host_xid, mask, raw_dx, raw_dy);
+        self.update_pointer_window(server_state, host_xid, mask, origin);
+        self.emit_motion_only(origin, host_xid, mask, raw_dx, raw_dy);
     }
 
     /// Every live CRTC's root rectangle (its footprint at its origin).
@@ -14923,6 +14958,7 @@ impl KmsBackend {
         relative: bool,
         raw_dx: i32,
         raw_dy: i32,
+        origin: yserver_core::core_loop::InputOrigin,
     ) {
         // Apply active-grab confinement before hit-testing and crossing
         // generation.  The core fanout also clamps as a backend-independent
@@ -15055,7 +15091,7 @@ impl KmsBackend {
         }
         let prev = server_state.barrier_bypass;
         server_state.barrier_bypass = prev || !relative;
-        self.dispatch_motion_event(server_state, raw_dx, raw_dy);
+        self.dispatch_motion_event(server_state, raw_dx, raw_dy, origin);
         server_state.barrier_bypass = prev;
         if confined && let Some(ctrl) = &self.input_thread_control {
             // The libinput thread accumulates relative deltas independently.
@@ -15066,7 +15102,13 @@ impl KmsBackend {
         }
     }
 
-    fn process_pointer_button(&mut self, code: u32, pressed: bool, server_state: &ServerState) {
+    fn process_pointer_button(
+        &mut self,
+        code: u32,
+        pressed: bool,
+        server_state: &ServerState,
+        origin: yserver_core::core_loop::InputOrigin,
+    ) {
         let detail = match code {
             0x110 => 1, // BTN_LEFT
             0x111 => 3, // BTN_RIGHT
@@ -15140,6 +15182,7 @@ impl KmsBackend {
             PointerEventKind::ButtonRelease
         };
         let ptr_event = HostPointerEvent {
+            origin,
             kind,
             host_xid,
             detail,
@@ -15182,6 +15225,7 @@ impl KmsBackend {
                     yserver_core::crossings::CrossingKind::Leave => PointerEventKind::LeaveNotify,
                 };
                 self.emit_crossing(
+                    origin,
                     win_host_xid,
                     kind,
                     ev.detail,
@@ -20854,6 +20898,7 @@ impl Backend for KmsBackend {
 
         match ev {
             HostInputEvent::PointerMotion {
+                origin,
                 x,
                 y,
                 relative,
@@ -20861,12 +20906,27 @@ impl Backend for KmsBackend {
                 dy,
                 ..
             } => {
-                self.process_pointer_absolute(state, x as f32, y as f32, relative, dx, dy);
+                if !yserver_core::core_loop::pointer_fanout::pointer_origin_is_live(state, origin) {
+                    log::trace!(
+                        "dropping pointer motion from unknown, disabled, or invalid origin {origin:?}"
+                    );
+                    return;
+                }
+                self.process_pointer_absolute(state, x as f32, y as f32, relative, dx, dy, origin);
             }
             HostInputEvent::PointerButton {
-                button, pressed, ..
+                origin,
+                button,
+                pressed,
+                ..
             } => {
-                self.process_pointer_button(u32::from(button), pressed, state);
+                if !yserver_core::core_loop::pointer_fanout::pointer_origin_is_live(state, origin) {
+                    log::trace!(
+                        "dropping pointer button from unknown, disabled, or invalid origin {origin:?}"
+                    );
+                    return;
+                }
+                self.process_pointer_button(u32::from(button), pressed, state, origin);
             }
             HostInputEvent::PointerScrollStop { .. } => {
                 // Fingers lifted from a two-finger scroll. Emit a delta-0 XI2
@@ -29660,7 +29720,12 @@ impl Backend for KmsBackend {
             return;
         }
         let mask = self.serialize_modifiers() | self.core.button_mask;
-        self.update_pointer_window(state, host_xid, mask);
+        self.update_pointer_window(
+            state,
+            host_xid,
+            mask,
+            yserver_core::core_loop::InputOrigin::NestedHost,
+        );
         let pending = std::mem::take(&mut self.core.pending_pointer_events);
         let xid_map = self.core.xid_map.clone();
         for mut ev in pending {
@@ -40045,7 +40110,12 @@ mod tests {
         let mut b = KmsBackend::for_tests();
         let state = ServerState::new();
         // BTN_LEFT press → detail=1, button bit = 0x0100.
-        b.process_pointer_button(0x110, true, &state);
+        b.process_pointer_button(
+            0x110,
+            true,
+            &state,
+            yserver_core::core_loop::InputOrigin::XTest(4),
+        );
         let press = b
             .core
             .pending_pointer_events
@@ -40065,7 +40135,12 @@ mod tests {
         );
 
         b.core.pending_pointer_events.clear();
-        b.process_pointer_button(0x110, false, &state);
+        b.process_pointer_button(
+            0x110,
+            false,
+            &state,
+            yserver_core::core_loop::InputOrigin::XTest(4),
+        );
         let release = b
             .core
             .pending_pointer_events
@@ -40082,6 +40157,137 @@ mod tests {
             0,
             "button_mask cleared post-release"
         );
+    }
+
+    #[test]
+    fn pointer_source_routing_kms_preserves_origin_and_drops_unknown_before_cursor_motion() {
+        use yserver_core::{
+            backend::Backend,
+            core_loop::{DeviceInfo, HostInputEvent, InputOrigin, message::LibinputConfigSnapshot},
+            server::ServerState,
+            xinput::{InputCapabilities, InputSourceId},
+        };
+
+        let mut backend = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        backend
+            .core
+            .xid_map
+            .insert(backend.core.window_id, yserver_core::resources::ROOT_WINDOW);
+        let initial_cursor = (backend.core.cursor_x, backend.core.cursor_y);
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::PointerMotion {
+                origin: InputOrigin::Physical(InputSourceId(999)),
+                x: 123,
+                y: 45,
+                time: 1,
+                relative: false,
+                dx: 0,
+                dy: 0,
+                motion_delta: None,
+            },
+        );
+        assert_eq!(
+            (backend.core.cursor_x, backend.core.cursor_y),
+            initial_cursor
+        );
+        assert_eq!(state.pointer_root, (0, 0));
+        assert_eq!(backend.core.pending_pointer_events.len(), 0);
+        assert_eq!(state.xi_devices.devices().len(), 4);
+
+        let source = InputSourceId(201);
+        state.xi_register_source(&DeviceInfo {
+            source_id: source,
+            enabled: true,
+            resume_key: None,
+            capabilities: InputCapabilities {
+                keyboard: false,
+                pointer: true,
+                touch: false,
+            },
+            name: "test mouse".into(),
+            device_node: "/dev/input/event201".into(),
+            sysname: "event201".into(),
+            vendor_id: 1,
+            product_id: 2,
+            is_touchpad: false,
+            config: LibinputConfigSnapshot::default(),
+        });
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::PointerMotion {
+                origin: InputOrigin::Physical(source),
+                x: 20,
+                y: 30,
+                time: 2,
+                relative: false,
+                dx: 0,
+                dy: 0,
+                motion_delta: None,
+            },
+        );
+        assert_eq!((backend.core.cursor_x, backend.core.cursor_y), (20.0, 30.0));
+        assert_eq!(state.pointer_root, (20, 30));
+        assert_eq!(backend.core.pending_pointer_events.len(), 0);
+        assert_eq!(state.xi_devices.devices().len(), 5);
+        assert_eq!(
+            state
+                .xi_devices
+                .facet(source, yserver_core::xinput::XiFacetKind::PointerTouch),
+            Some(6)
+        );
+        assert_eq!(state.buttons_down, 0);
+
+        // Exercise the KMS event builder directly as well: on_host_input
+        // drains this production queue immediately into core fanout, while
+        // process_pointer_absolute exposes the HostPointerEvents it builds.
+        backend.process_pointer_absolute(
+            &mut state,
+            21.0,
+            31.0,
+            false,
+            0,
+            0,
+            InputOrigin::Physical(source),
+        );
+        assert_eq!((backend.core.cursor_x, backend.core.cursor_y), (21.0, 31.0));
+        let emitted = std::mem::take(&mut backend.core.pending_pointer_events);
+        assert_eq!(
+            emitted.iter().map(|event| event.kind).collect::<Vec<_>>(),
+            vec![yserver_core::host_x11::PointerEventKind::MotionNotify],
+        );
+        assert!(
+            emitted
+                .iter()
+                .all(|event| event.origin == InputOrigin::Physical(source))
+        );
+        assert!(backend.core.pending_pointer_events.is_empty());
+
+        let mut disabled = state.xi_devices.source(source).unwrap().clone();
+        disabled.enabled = false;
+        state.xi_register_source(&disabled);
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::PointerMotion {
+                origin: InputOrigin::Physical(source),
+                x: 500,
+                y: 400,
+                time: 3,
+                relative: false,
+                dx: 0,
+                dy: 0,
+                motion_delta: None,
+            },
+        );
+        assert_eq!((backend.core.cursor_x, backend.core.cursor_y), (21.0, 31.0));
+        assert_eq!(state.pointer_root, (20, 30));
+        assert!(backend.core.pending_pointer_events.is_empty());
+        assert!(!state.xi_devices.device(6).unwrap().enabled);
+        assert_eq!(state.xi_devices.devices().len(), 5);
     }
 
     /// `warp_pointer_root` (the WarpPointer path on KMS) must move
@@ -40115,11 +40321,27 @@ mod tests {
         let mut b = KmsBackend::for_tests();
         let mut state = ServerState::new();
         // Inside extent.
-        b.process_pointer_absolute(&mut state, 100.0, 200.0, true, 0, 0);
+        b.process_pointer_absolute(
+            &mut state,
+            100.0,
+            200.0,
+            true,
+            0,
+            0,
+            yserver_core::core_loop::InputOrigin::XTest(4),
+        );
         assert_eq!(b.core.cursor_x, 100.0);
         assert_eq!(b.core.cursor_y, 200.0);
         // Past extent → clamped to (extent - 1).
-        b.process_pointer_absolute(&mut state, 5000.0, 5000.0, true, 0, 0);
+        b.process_pointer_absolute(
+            &mut state,
+            5000.0,
+            5000.0,
+            true,
+            0,
+            0,
+            yserver_core::core_loop::InputOrigin::XTest(4),
+        );
         assert_eq!(b.core.cursor_x, 799.0);
         assert_eq!(b.core.cursor_y, 599.0);
     }
@@ -40197,7 +40419,15 @@ mod tests {
         b.core.cursor_y = 150.0;
         b.core.prev_pointer_window = Some(GAME_HOST);
 
-        b.process_pointer_absolute(&mut state, 220.0, 150.0, true, 21, 0);
+        b.process_pointer_absolute(
+            &mut state,
+            220.0,
+            150.0,
+            true,
+            21,
+            0,
+            yserver_core::core_loop::InputOrigin::XTest(4),
+        );
 
         assert_eq!((b.core.cursor_x, b.core.cursor_y), (199.0, 150.0));
         assert_eq!(state.pointer_root, (199, 150));
@@ -40232,7 +40462,15 @@ mod tests {
         let mut state = ServerState::new();
         // Point on monitor 1 (x=4000 is past output[0]'s 800-wide
         // fixture extent but well within the 5120 union extent).
-        b.process_pointer_absolute(&mut state, 4000.0, 1000.0, true, 0, 0);
+        b.process_pointer_absolute(
+            &mut state,
+            4000.0,
+            1000.0,
+            true,
+            0,
+            0,
+            yserver_core::core_loop::InputOrigin::XTest(4),
+        );
         assert_eq!(
             b.core.cursor_x, 4000.0,
             "pointer must be able to cross past the first output's \
@@ -40241,7 +40479,15 @@ mod tests {
         );
         assert_eq!(b.core.cursor_y, 1000.0);
         // Past the union extent → clamped to (union - 1).
-        b.process_pointer_absolute(&mut state, 9999.0, 9999.0, true, 0, 0);
+        b.process_pointer_absolute(
+            &mut state,
+            9999.0,
+            9999.0,
+            true,
+            0,
+            0,
+            yserver_core::core_loop::InputOrigin::XTest(4),
+        );
         assert_eq!(b.core.cursor_x, 5119.0);
         assert_eq!(b.core.cursor_y, 1439.0);
     }
@@ -47975,7 +48221,12 @@ mod tests {
                 .collect()
         };
         b.core.prev_pointer_window = Some(app);
-        b.update_pointer_window(&state, cow.0, 0);
+        b.update_pointer_window(
+            &state,
+            cow.0,
+            0,
+            yserver_core::core_loop::InputOrigin::NestedHost,
+        );
         assert_eq!(
             crossings(&mut b),
             vec![
@@ -47983,7 +48234,12 @@ mod tests {
                 (PointerEventKind::EnterNotify, cow.0, 3),
             ],
         );
-        b.update_pointer_window(&state, app, 0);
+        b.update_pointer_window(
+            &state,
+            app,
+            0,
+            yserver_core::core_loop::InputOrigin::NestedHost,
+        );
         assert_eq!(
             crossings(&mut b),
             vec![
