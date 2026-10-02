@@ -26,8 +26,9 @@ device through its own XI properties; there is no server-wide default
 
 **Revised 2026-10-02 (user decision):** the intended scope is mice,
 keyboards and laptop touchpads. Direct-touch devices (touchscreens, touch
-tablets) were never a goal and are excluded; the companion touch plan is
-dropped. A touchpad remains a pointer facet classified `TOUCHPAD` with its
+tablets) are an explicit **non-goal**; their support entered this design
+and its adversarial review without being requested, and the companion
+touch plan is dropped. A touchpad remains a pointer facet classified `TOUCHPAD` with its
 own libinput properties, and touchpad gestures never imply an XI2
 TouchClass. A touch-only libinput source gets no XI facet, and libinput
 touch events are not translated, exactly as before this design. Wherever
