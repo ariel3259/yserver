@@ -2831,17 +2831,55 @@ pub(crate) fn xi1_compute_freezes(
     }
 }
 
-/// Remove a physical source and replay input released by its dynamic
-/// XI2 grab's paired-device hold.
+/// End active grabs on a physical source, restore its saved attachments,
+/// and replay input released by a dynamic XI2 grab's paired-device hold.
+/// The caller keeps the source registered until held-state releases have
+/// passed through the normal fanout path, then disables and unregisters it.
 pub fn xi_cleanup_source(
     state: &mut ServerState,
     backend: &mut dyn crate::backend::Backend,
     source: crate::xinput::InputSourceId,
-) -> Vec<u16> {
-    let removed = state.xi_unregister_source(source);
+) {
+    let device_ids: Vec<u16> = [
+        state
+            .xi_devices
+            .facet(source, crate::xinput::XiFacetKind::Keyboard),
+        state
+            .xi_devices
+            .facet(source, crate::xinput::XiFacetKind::PointerTouch),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    for device_id in device_ids {
+        xi1_deactivate_device_grab(state, device_id);
+
+        let pointer_owner = state
+            .xi2_pointer_grabs
+            .remove(&device_id)
+            .map(|grab| grab.owner);
+        let keyboard_owner = state
+            .xi2_keyboard_grabs
+            .remove(&device_id)
+            .map(|grab| grab.owner);
+        for owner in [pointer_owner, keyboard_owner].into_iter().flatten() {
+            if let Some(freeze) = state.xi1_frozen.get_mut(&device_id) {
+                freeze.state = crate::server::Xi1SyncState::Thawed;
+                freeze.stored = None;
+            }
+            xi1_core_grab_bridge_release(state, device_id, owner);
+        }
+        if pointer_owner.is_some()
+            || keyboard_owner.is_some()
+            || state.xi2_detached_masters.contains_key(&device_id)
+        {
+            state.reattach_xi2_slave(device_id);
+        }
+    }
+
     let xid_map = backend.xid_map().clone();
     xi1_compute_freezes(state, backend, &xid_map);
-    removed
 }
 
 /// Port of Xorg `CheckGrabForSyncs` (dix/events.c:1424-1450): set the
@@ -4106,6 +4144,56 @@ mod tests {
         assert!(!state.xi1_frozen[&PTR].frozen());
         assert_eq!(state.xi1_frozen[&KBD].other, None);
         assert!(!state.xi1_frozen[&KBD].frozen());
+    }
+
+    #[test]
+    fn xi_source_removal_grab_cleanup_keeps_registry_for_atomic_unregister() {
+        use crate::{
+            backend::recording::RecordingBackend,
+            core_loop::{DeviceInfo, message::LibinputConfigSnapshot},
+            xinput::{InputCapabilities, InputSourceId, XiFacetKind},
+        };
+
+        let source = InputSourceId(0xD14);
+        let info = DeviceInfo {
+            source_id: source,
+            enabled: true,
+            resume_key: None,
+            capabilities: InputCapabilities {
+                keyboard: true,
+                pointer: true,
+                touch: false,
+            },
+            name: "removal cleanup source".to_owned(),
+            device_node: "/dev/input/removal-cleanup".to_owned(),
+            sysname: "removal-cleanup".to_owned(),
+            vendor_id: 0,
+            product_id: 0,
+            is_touchpad: false,
+            config: LibinputConfigSnapshot::default(),
+        };
+        let mut state = ServerState::new();
+        let ids = state.xi_register_source(&info);
+        let mut backend = RecordingBackend::new();
+
+        xi_cleanup_source(&mut state, &mut backend, source);
+
+        assert_eq!(
+            state
+                .xi_devices
+                .source(source)
+                .map(|current| current.name.as_str()),
+            Some("removal cleanup source"),
+            "grab cleanup must leave the source registered until KMS drains state and unregisters both facets together",
+        );
+        assert_eq!(
+            state.xi_devices.facet(source, XiFacetKind::Keyboard),
+            Some(ids[0]),
+        );
+        assert_eq!(
+            state.xi_devices.facet(source, XiFacetKind::PointerTouch),
+            Some(ids[1]),
+        );
     }
 
     use crate::server::ClientState;

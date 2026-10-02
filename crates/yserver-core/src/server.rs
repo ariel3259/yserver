@@ -1451,6 +1451,10 @@ pub struct ServerState {
     /// physical facets, and source metadata. Existing property/query helpers
     /// temporarily use its slice compatibility while consumers migrate.
     pub xi_devices: crate::xinput::XiRegistry,
+    /// Removed XI facet snapshots waiting for the lifecycle notification
+    /// stage. KMS fills this before unregistering the source so the later
+    /// notification path retains the exact descriptors that disappeared.
+    pub pending_xi_device_removals: Vec<crate::xinput::XiDevice>,
     /// Atom identity for the read-only XTEST marker on virtual devices 4/5.
     pub xtest_device_atom: AtomId,
     /// Pre-interned atom for the property-type literal `"FLOAT"`.
@@ -1792,6 +1796,7 @@ impl ServerState {
             unpublished_keyboard_keys_down: HashMap::new(),
             installed_colormaps: vec![crate::resources::ROOT_COLORMAP],
             xi_devices,
+            pending_xi_device_removals: Vec::new(),
             xtest_device_atom,
             float_atom,
         }
@@ -1913,6 +1918,10 @@ impl ServerState {
         .into_iter()
         .flatten()
         .collect();
+        let removed_descriptors: Vec<crate::xinput::XiDevice> = ids
+            .iter()
+            .filter_map(|id| self.xi_devices.device(*id).cloned())
+            .collect();
         let removed_grabs: Vec<(u16, ClientId)> = ids
             .iter()
             .filter_map(|id| {
@@ -1958,7 +1967,14 @@ impl ServerState {
             .retain(|grab| !ids.contains(&grab.deviceid));
         self.sync_pending
             .retain(|pending| !ids.contains(&pending.device));
+        self.pending_xi_device_removals.extend(removed_descriptors);
         self.xi_devices.remove(source)
+    }
+
+    /// Return facet snapshots queued by [`Self::xi_unregister_source`] for
+    /// the physical-device notification publisher.
+    pub fn take_xi_removed_device_descriptors(&mut self) -> Vec<crate::xinput::XiDevice> {
+        std::mem::take(&mut self.pending_xi_device_removals)
     }
 
     #[must_use]
