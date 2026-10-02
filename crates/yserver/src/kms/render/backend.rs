@@ -2483,6 +2483,10 @@ struct ProbeWorker {
 #[derive(Default)]
 struct ProbeWorkerLedger {
     workers: std::collections::BTreeMap<DrmDeviceKey, ProbeWorker>,
+    /// Episode deadline in place of `PROBE_EPISODE_DEADLINE`; tests that
+    /// block a worker on purpose set it so a loaded machine cannot expire
+    /// the episode before they observe it.
+    episode_deadline_override: Option<std::time::Duration>,
 }
 
 impl ProbeWorkerLedger {
@@ -25658,6 +25662,11 @@ impl KmsBackend {
             executor.request_termination();
             let _ = executor.try_reap();
         }
+        // This incarnation cannot accept Owner frames after the failed
+        // acquire. Keep its scene and pool allocations attached for later
+        // retirement, but stop its parked repaint from holding the shared
+        // scene structure dirty while other Owner devices continue.
+        self.scene.withdraw_device_outputs(device);
         self.withdraw_outputs_for_device(device);
         self.update_resource_service_activity();
     }
@@ -26590,7 +26599,13 @@ impl KmsBackend {
             .checked_add(1)
             .expect("probe epoch exhausted");
         let deadline = forced_reprobe.as_ref().map_or_else(
-            || std::time::Instant::now() + PROBE_EPISODE_DEADLINE,
+            || {
+                std::time::Instant::now()
+                    + self
+                        .probe_workers
+                        .episode_deadline_override
+                        .unwrap_or(PROBE_EPISODE_DEADLINE)
+            },
             |forced| forced.deadline,
         );
         self.probe_episode = Some(ProbeEpisode {
@@ -99641,6 +99656,118 @@ mod tests {
         .unwrap_or_else(|error| panic!("{label}: {error}"));
     }
 
+    fn c0_3cii_owner_frame_work_quiescent(
+        backend: &super::KmsBackend,
+        devices: &[DrmDeviceKey],
+    ) -> bool {
+        let live_or_queued_owner_work = devices.iter().any(|device| {
+            backend
+                .platform
+                .owner_ref(*device)
+                .and_then(|owner| owner.live_record())
+                .is_some()
+                || backend
+                    .admission_conductors
+                    .get(device)
+                    .is_some_and(|conductor| !conductor.composed.is_empty())
+        });
+        let owner_render_is_running = backend
+            .platform
+            .outputs
+            .iter()
+            .enumerate()
+            .filter(|(_, output)| devices.contains(&output.key.device_key))
+            .any(|(output_idx, _)| {
+                backend
+                    .scene
+                    .owner_prepared_for_tests(output_idx)
+                    .is_some_and(|(_, _, rendering)| rendering)
+            });
+        !backend.scene_wants_compose()
+            && !live_or_queued_owner_work
+            && !owner_render_is_running
+            && backend
+                .platform
+                .ready_scanout_render_completions_for_tests
+                .is_empty()
+            && backend.ready_crtc_config_announcements.is_empty()
+            && backend.core_driver_script_notification_count_for_tests == 0
+            && backend.core_driver_owner_events_for_tests.is_empty()
+            && backend.core_driver_drm_events_for_tests.is_empty()
+            && backend.core_driver_readiness_script_for_tests.is_empty()
+    }
+
+    fn c0_3cii_drive_owner_work_until(
+        backend: &mut super::KmsBackend,
+        state: &mut ServerState,
+        devices: &[DrmDeviceKey],
+        label: &str,
+        timeout: std::time::Duration,
+        done: &dyn Fn(&super::KmsBackend) -> bool,
+    ) -> Result<(), String> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if done(backend) {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            let live = devices.iter().find_map(|device| {
+                backend
+                    .platform
+                    .owner_ref(*device)
+                    .and_then(|owner| owner.live_record())
+                    .map(|record| (*device, record.commit_id()))
+            });
+            if let Some((device, commit)) = live {
+                c0_3bi_complete_owner_commit_through_core_driver_with_state(
+                    backend,
+                    state,
+                    device,
+                    commit,
+                    &format!("{label}: complete composed Owner work"),
+                );
+                continue;
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            c0_3bi_core_driver_until_with_state(
+                backend,
+                state,
+                label,
+                remaining,
+                &|backend| {
+                    devices.iter().any(|device| {
+                        backend
+                            .platform
+                            .owner_ref(*device)
+                            .and_then(|owner| owner.live_record())
+                            .is_some()
+                    }) || done(backend)
+                },
+                None,
+            )?;
+        }
+        Err(format!(
+            "{label}: Owner frame work did not settle before {timeout:?}"
+        ))
+    }
+
+    fn c0_3cii_settle_owner_work_through_core_driver(
+        backend: &mut super::KmsBackend,
+        state: &mut ServerState,
+        devices: &[DrmDeviceKey],
+        label: &str,
+        timeout: std::time::Duration,
+    ) -> Result<(), String> {
+        c0_3cii_drive_owner_work_until(backend, state, devices, label, timeout, &|backend| {
+            c0_3cii_owner_frame_work_quiescent(backend, devices)
+        })
+    }
+
     fn c0_3cii_settle_owner_fixture(
         backend: &mut super::KmsBackend,
         state: &mut ServerState,
@@ -99648,58 +99775,29 @@ mod tests {
         label: &str,
     ) {
         backend.scene.scene_structure_dirty = false;
-        for frame in 0..8 {
-            if let Some(commit) = backend
-                .platform
-                .owner_ref(device)
-                .and_then(|owner| owner.live_record())
-                .map(|record| record.commit_id())
-            {
-                c0_3bi_complete_owner_commit_through_core_driver_with_state(
-                    backend,
-                    state,
-                    device,
-                    commit,
-                    &format!("{label}: settle composed frame"),
-                );
-                continue;
-            }
-            if !backend.scene_wants_compose() {
-                break;
-            }
-            c0_3bi_core_driver_until_with_state(
-                backend,
-                state,
-                label,
-                std::time::Duration::from_secs(3),
-                &|backend| {
-                    backend
-                        .platform
-                        .owner_ref(device)
-                        .and_then(|owner| owner.live_record())
-                        .is_some()
-                },
-                None,
+        c0_3cii_settle_owner_work_through_core_driver(
+            backend,
+            state,
+            &[device],
+            label,
+            std::time::Duration::from_secs(3),
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "{error}; diagnostics: {}",
+                c0_3cii_owner_route_diagnostics_for_tests(backend, device)
             )
-            .unwrap_or_else(|error| {
-                panic!(
-                    "{label}, frame {frame}: {error}; diagnostics: {}",
-                    c0_3cii_owner_route_diagnostics_for_tests(backend, device)
-                )
-            });
-        }
+        });
         assert!(
             backend
                 .platform
                 .owner_ref(device)
                 .and_then(|owner| owner.live_record())
                 .is_none(),
-            "{label}: no unrelated Owner commit remains live"
+            "{label}: no unrelated Owner commit remains live; diagnostics: {}",
+            c0_3cii_owner_route_diagnostics_for_tests(backend, device)
         );
-        assert!(
-            !backend.scene_wants_compose(),
-            "{label}: initial composed frame is complete"
-        );
+        assert!(c0_3cii_owner_frame_work_quiescent(backend, &[device]));
         backend.lifecycle_observe_seat_target(crate::kms::owner::lifecycle::SeatTarget::Owned);
         assert_eq!(
             backend
@@ -99784,7 +99882,8 @@ mod tests {
              admission_trace={:?}; live_record={live_record:?}; composed_offers={offers:?}; \
              output_damage={outputs:?}; executor_(key,(sent,validation,live,replies),terminated)={executors:?}; \
              admission_gate={:?}; lifecycle={:?}; conductor={conductor:?}; \
-             pending_ready_render_completions={:?}; queued_core=(crtc_announcements={}, script_notifications={}, owner_events={}, drm_events={}, readiness_script={})",
+             pending_ready_render_completions={:?}; \
+             queued_core=(crtc_announcements={}, script_notifications={}, owner_events={}, drm_events={}, readiness_script={})",
             backend.scene_wants_compose(),
             backend.scene.scene_structure_dirty,
             backend.scene.owes_repaint(),
@@ -99819,45 +99918,22 @@ mod tests {
         label: &str,
     ) {
         backend.scene.scene_structure_dirty = false;
-        for frame in 0..8 {
-            let live = devices.iter().find_map(|device| {
-                backend
-                    .platform
-                    .owner_ref(*device)
-                    .and_then(|owner| owner.live_record())
-                    .map(|record| (*device, record.commit_id()))
-            });
-            if let Some((device, commit)) = live {
-                c0_3bi_complete_owner_commit_through_core_driver_with_state(
-                    backend,
-                    state,
-                    device,
-                    commit,
-                    &format!("{label}: settle composed frame"),
-                );
-                continue;
-            }
-            if !backend.scene_wants_compose() {
-                break;
-            }
-            c0_3bi_core_driver_until_with_state(
-                backend,
-                state,
-                label,
-                std::time::Duration::from_secs(3),
-                &|backend| {
-                    devices.iter().any(|device| {
-                        backend
-                            .platform
-                            .owner_ref(*device)
-                            .and_then(|owner| owner.live_record())
-                            .is_some()
-                    })
-                },
-                None,
+        c0_3cii_settle_owner_work_through_core_driver(
+            backend,
+            state,
+            devices,
+            label,
+            std::time::Duration::from_secs(3),
+        )
+        .unwrap_or_else(|error| {
+            let device = *devices
+                .first()
+                .expect("multi-Owner fixture includes at least one device");
+            panic!(
+                "{error}; diagnostics: {}",
+                c0_3cii_owner_route_diagnostics_for_tests(backend, device)
             )
-            .unwrap_or_else(|error| panic!("{label}, frame {frame}: {error}"));
-        }
+        });
         for device in devices {
             assert!(
                 backend
@@ -99877,10 +99953,7 @@ mod tests {
                 "{label}: Owner lifecycle is ready for {device}"
             );
         }
-        assert!(
-            !backend.scene_wants_compose(),
-            "{label}: all initial composed frames are complete"
-        );
+        assert!(c0_3cii_owner_frame_work_quiescent(backend, devices));
     }
 
     #[test]
@@ -100060,6 +100133,7 @@ mod tests {
                 clock.queue_failed,
             ) = clock_state;
         }
+        let dispatch_trace_start = backend.admission_trace_for_tests(device).len();
         let outcome = backend.admission_wake(device, false);
         let composed_generation = backend
             .admission_conductors
@@ -100073,11 +100147,75 @@ mod tests {
                 .admission_snapshot(device, false)
                 .and_then(|snapshot| snapshot.readiness(IntentKey::Composed { crtc, generation }))
         });
+        if !matches!(
+            &outcome,
+            crate::kms::render::admission::AdmissionOutcome::Dispatched(_)
+        ) {
+            c0_3bi_core_driver_until_with_state(
+                backend,
+                &mut state,
+                "observe render readiness and dispatch the retained composed generation",
+                std::time::Duration::from_secs(5),
+                &|backend| {
+                    backend
+                        .admission_trace_for_tests(device)
+                        .iter()
+                        .skip(dispatch_trace_start)
+                        .any(|step| {
+                            matches!(
+                                step,
+                                crate::kms::render::admission::AdmissionTraceStep::Dispatched(_)
+                            )
+                        })
+                        && backend
+                            .platform
+                            .owner_ref(device)
+                            .and_then(|owner| owner.live_record())
+                            .is_some()
+                },
+                None,
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{error}; initial_outcome={outcome:?}; clock={:?}; scene_ready={scene_ready}; \
+                     readiness_after_retry={readiness_after_retry:?}; conductor={:?}; live={:?}; \
+                     core_entries={:?}",
+                    backend
+                        .platform
+                        .owner_ref(device)
+                        .and_then(|owner| owner.clock(clock_key))
+                        .map(|clock| (
+                            clock.source,
+                            clock.probe,
+                            clock.reference,
+                            clock.queue_failed
+                        )),
+                    backend.admission_conductors.get(&device).map(|conductor| (
+                        conductor.composed.clone(),
+                        conductor.last_readiness_for_tests.clone(),
+                        conductor.last_decision_for_tests.clone(),
+                    )),
+                    backend
+                        .platform
+                        .owner_ref(device)
+                        .and_then(|owner| owner.live_record())
+                        .map(|record| (record.commit_id(), record.state(), record.milestones())),
+                    backend.core_entry_trace_for_tests.borrow(),
+                )
+            });
+        }
+        let dispatched_after_probe = backend
+            .admission_trace_for_tests(device)
+            .iter()
+            .skip(dispatch_trace_start)
+            .any(|step| {
+                matches!(
+                    step,
+                    crate::kms::render::admission::AdmissionTraceStep::Dispatched(_)
+                )
+            });
         assert!(
-            matches!(
-                &outcome,
-                crate::kms::render::admission::AdmissionOutcome::Dispatched(_)
-            ),
+            dispatched_after_probe,
             "a successful Owner clock probe dispatches the retained generation; \
              outcome={outcome:?}; clock={:?}; scene_ready={scene_ready}; \
              scene_ready_before_probe_failure={scene_ready_before_probe_failure}; \
@@ -102001,6 +102139,12 @@ mod tests {
                 "settle initial Owner repaint follow-ups",
             );
         }
+        c0_3cii_settle_owner_fixtures(
+            &mut fixture.backend,
+            &mut state,
+            &[device_a, device_b],
+            "settle the initial two-Owner fixture frames",
+        );
         assert!(fixture.backend.acquire_episode.is_none());
         for device in [device_a, device_b] {
             assert_eq!(
@@ -102714,16 +102858,64 @@ mod tests {
             .map(|output| (output.output_id, output.connected, output.mode_id))
             .collect::<Vec<_>>();
 
-        c0_3cii_arm_multi_hotplug_probe(
+        backend
+            .platform
+            .install_scripted_connector_prober_for_tests();
+        let pending_a = ProbeBarrier::new();
+        backend.platform.queue_blocked_connector_probe_for_tests(
+            device_a,
+            Ok(Vec::new()),
+            pending_a.clone(),
+        );
+        backend.platform.queue_connector_probe_for_tests(
+            device_b,
+            Err(io::Error::from_raw_os_error(libc::EIO)),
+        );
+        super::KmsBackend::record_display_hotplug_edge(backend);
+        backend.hotplug_rescan_deadline =
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
+        c0_3bi_core_driver_until_with_state(
             backend,
             &mut state,
-            vec![
-                (device_a, Ok(Vec::new())),
-                (device_b, Err(io::Error::from_raw_os_error(libc::EIO))),
-            ],
-            "fail the combined two-Owner probe",
+            "observe B's failure while A's probe remains outstanding",
+            std::time::Duration::from_secs(2),
+            &|backend| {
+                pending_a.wait_started(std::time::Duration::ZERO)
+                    && backend.probe_episode.as_ref().is_some_and(|episode| {
+                        episode.cause == super::ProbeEpisodeCause::Hotplug
+                            && episode.results.get(&device_b).is_some_and(Result::is_err)
+                    })
+            },
+            None,
+        )
+        .expect("B's error is recorded without closing the combined episode");
+        let episode = backend
+            .probe_episode
+            .as_ref()
+            .expect("the combined episode stays open while A is pending");
+        assert!(episode.remaining.contains(&device_a));
+        assert!(!episode.results.contains_key(&device_a));
+        assert_eq!(backend.platform.outputs.len(), 2);
+        assert_eq!(
+            state
+                .randr
+                .outputs
+                .iter()
+                .map(|output| (output.output_id, output.connected, output.mode_id))
+                .collect::<Vec<_>>(),
+            output_ids_before,
+            "the failure is not published while A is still pending"
         );
-        c0_3cii_finish_probe_workers(backend, &mut state, "join failed-probe workers");
+        pending_a.release();
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "close the failed episode after A answers",
+            std::time::Duration::from_secs(3),
+            &|backend| backend.probe_episode.is_none() && backend.probe_workers.workers.is_empty(),
+            None,
+        )
+        .expect("all failed-probe workers are joined through core-loop entries");
         assert!(backend.probe_episode.is_none());
         assert!(backend.acquire_episode.is_none());
         assert!(backend.hotplug_episode.is_none());
@@ -102842,12 +103034,20 @@ mod tests {
         late_backend
             .platform
             .queue_blocked_connector_probe_for_tests(late_b, Ok(Vec::new()), barrier.clone());
+        let late_a_barrier = ProbeBarrier::new();
+        late_backend
+            .platform
+            .queue_blocked_connector_probe_for_tests(
+                late_a,
+                Ok(Vec::new()),
+                late_a_barrier.clone(),
+            );
         late_backend
             .platform
             .queue_connector_probe_for_tests(late_a, Ok(Vec::new()));
         late_backend
             .platform
-            .queue_connector_probe_for_tests(late_a, Ok(Vec::new()));
+            .queue_connector_probe_for_tests(late_b, Ok(Vec::new()));
         late_backend
             .platform
             .queue_connector_probe_for_tests(late_b, Ok(Vec::new()));
@@ -102866,6 +103066,21 @@ mod tests {
         )
         .expect("the second case starts its bounded probe episode");
         assert!(barrier.wait_started(std::time::Duration::from_secs(1)));
+        c0_3bi_core_driver_until_with_state(
+            late_backend,
+            &mut late_state,
+            "consume A's successful probe before expiring B",
+            std::time::Duration::from_secs(2),
+            &|backend| {
+                backend.probe_episode.as_ref().is_some_and(|episode| {
+                    episode.cause == super::ProbeEpisodeCause::Hotplug
+                        && episode.results.get(&late_a).is_some_and(Result::is_ok)
+                        && !episode.remaining.contains(&late_a)
+                })
+            },
+            None,
+        )
+        .expect("A's successful answer is consumed while B remains blocked");
         late_backend.probe_episode.as_mut().unwrap().deadline =
             std::time::Instant::now() - std::time::Duration::from_millis(1);
         c0_3bi_core_driver_until_with_state(
@@ -102891,28 +103106,101 @@ mod tests {
         );
 
         let failed_edge_epoch = late_backend.next_probe_epoch;
+        let stuck_b_epoch = late_backend.probe_workers.workers[&late_b].epoch;
+        // A stays blocked on purpose below; the real deadline must not mark
+        // it stuck before the test observes the pending episode.
+        late_backend.probe_workers.episode_deadline_override =
+            Some(std::time::Duration::from_secs(60));
         super::KmsBackend::record_display_hotplug_edge(late_backend);
         late_backend.hotplug_rescan_deadline =
             Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
         c0_3bi_core_driver_until_with_state(
             late_backend,
             &mut late_state,
-            "fast-fail the next edge against late B",
+            "observe late B's failure while A remains pending",
+            std::time::Duration::from_secs(2),
+            &|backend| {
+                backend.next_probe_epoch == failed_edge_epoch + 1
+                    && backend.probe_episode.as_ref().is_some_and(|episode| {
+                        episode.epoch == failed_edge_epoch
+                            && episode.cause == super::ProbeEpisodeCause::Hotplug
+                            && episode.remaining.contains(&late_a)
+                            && episode.results.get(&late_b).is_some_and(Result::is_err)
+                            && late_a_barrier.wait_started(std::time::Duration::ZERO)
+                    })
+            },
+            None,
+        )
+        .expect("the next combined episode starts while late B is still owned");
+        assert!(late_backend.hotplug_retry_pending);
+        assert!(late_backend.probe_workers.workers.contains_key(&late_b));
+        assert!(late_backend.probe_workers.workers.contains_key(&late_a));
+        assert!(!late_backend.probe_workers.workers[&late_a].stuck);
+        assert_eq!(
+            late_backend.probe_workers.workers[&late_b].epoch,
+            stuck_b_epoch
+        );
+        assert!(
+            late_backend
+                .probe_episode
+                .as_ref()
+                .unwrap()
+                .results
+                .get(&late_b)
+                .is_none_or(Result::is_err),
+            "a consumed late-B failure leaves A pending in the combined episode"
+        );
+        late_backend.probe_episode.as_mut().unwrap().deadline =
+            std::time::Instant::now() - std::time::Duration::from_millis(1);
+        c0_3bi_core_driver_until_with_state(
+            late_backend,
+            &mut late_state,
+            "close the failed edge at its deadline with A still blocked",
             std::time::Duration::from_secs(2),
             &|backend| {
                 backend.probe_episode.is_none()
                     && backend.hotplug_retry_pending
-                    && backend.next_probe_epoch == failed_edge_epoch + 1
+                    && backend
+                        .probe_workers
+                        .workers
+                        .get(&late_a)
+                        .is_some_and(|worker| worker.stuck)
             },
             None,
         )
-        .expect("next edge starts immediately and fails on stuck B");
-        assert!(late_backend.probe_workers.workers.contains_key(&late_b));
+        .expect("the deadline closes the edge while A's worker is still running");
+        assert_eq!(late_backend.next_probe_epoch, failed_edge_epoch + 1);
         barrier.release();
         c0_3bi_core_driver_until_with_state(
             late_backend,
             &mut late_state,
-            "join late B and let its single retry collect both devices",
+            "join late B and wait for the pending-A retry to finish",
+            std::time::Duration::from_secs(5),
+            &|backend| {
+                backend.next_probe_epoch == failed_edge_epoch + 2
+                    && backend.probe_episode.is_none()
+                    && backend.hotplug_retry_pending
+                    && backend
+                        .probe_workers
+                        .workers
+                        .get(&late_a)
+                        .is_some_and(|worker| worker.epoch == failed_edge_epoch && worker.stuck)
+            },
+            None,
+        )
+        .expect("joining stuck B starts one bounded retry while A remains stuck");
+        assert!(
+            !late_backend
+                .probe_workers
+                .workers
+                .get(&late_b)
+                .is_some_and(|worker| worker.epoch == stuck_b_epoch)
+        );
+        late_a_barrier.release();
+        c0_3bi_core_driver_until_with_state(
+            late_backend,
+            &mut late_state,
+            "join late A and let the fresh combined retry collect both devices",
             std::time::Duration::from_secs(5),
             &|backend| {
                 backend.probe_episode.is_none()
@@ -102922,7 +103210,7 @@ mod tests {
             },
             None,
         )
-        .expect("worker reaping starts one fresh combined probe episode");
+        .expect("joining stuck A starts a successful combined retry");
         let late_sends = [late_a, late_b]
             .into_iter()
             .map(|device| {
@@ -104355,44 +104643,10 @@ mod tests {
         assert_eq!(outputs.len(), 2, "the fixture starts with two lit outputs");
         let backend = &mut fixture.backend;
         let mut state = c0_3ci_core_state(backend);
-        // This fixture starts with a complete installed route but leaves the
-        // first ordinary repaint dirty; keep it out of the hotplug window so
-        // an unrelated composed FastUpdate cannot occupy the Owner slot.
-        backend.scene.scene_structure_dirty = false;
-        for frame in 0..8 {
-            if let Some(commit) = backend
-                .platform
-                .owner_ref(device)
-                .and_then(|owner| owner.live_record())
-                .map(|record| record.commit_id())
-            {
-                c0_3bi_complete_owner_commit_through_core_driver(
-                    backend,
-                    device,
-                    commit,
-                    "settle an initial composed frame before unplug",
-                );
-                continue;
-            }
-            if !backend.scene_wants_compose() {
-                break;
-            }
-            c0_3bi_core_driver_until_with_state(
-                backend,
-                &mut state,
-                "compose the live fixture before unplug",
-                std::time::Duration::from_secs(3),
-                &|backend| {
-                    backend
-                        .platform
-                        .owner_ref(device)
-                        .and_then(|owner| owner.live_record())
-                        .is_some()
-                },
-                None,
-            )
-            .unwrap_or_else(|error| panic!("initial fixture frame {frame}: {error}"));
-        }
+        // The fixture leaves its first ordinary repaint dirty. Drain the
+        // composed Owner work and any render preparation already in flight
+        // before opening the topology episode.
+        c0_3cii_settle_owner_fixture(backend, &mut state, device, "live fixture before unplug");
         assert!(
             backend
                 .platform
@@ -104910,7 +105164,27 @@ mod tests {
             None,
         )
         .expect("the kept output receives an ordinary composed repaint");
+        c0_3cii_settle_owner_fixture(
+            backend,
+            &mut state,
+            device,
+            "settle the kept output repaint",
+        );
         let expected = c0_3bi_expected_end_state([outputs[1].clone()]);
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "discharge the unplugged output's pool proofs",
+            std::time::Duration::from_secs(5),
+            &|backend| c0_3bi_end_state_errors(backend, &expected).is_empty(),
+            None,
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "{error}; end-state errors: {:?}",
+                c0_3bi_end_state_errors(backend, &expected)
+            )
+        });
         c0_3bi_assert_end_state(
             backend,
             "c0_3cii_kept_output_is_not_a_lifecycle_object_vulkan",
@@ -105228,21 +105502,19 @@ mod tests {
             device,
             "settle kept output before DPMS off",
         );
-        Backend::set_dpms_power(&mut *backend, 3).expect("protocol DPMS enters standby");
+        c0_3bi_apply_dpms_transition_through_core_driver(backend, device, 3);
         assert_eq!(backend.lifecycle_coordinator.protocol_dpms_level(), 3);
-        if let Some(commit) = backend
-            .platform
-            .owner_ref(device)
-            .and_then(|owner| owner.live_record())
-            .map(|record| record.commit_id())
-        {
-            c0_3bi_complete_owner_commit_through_core_driver(
-                backend,
-                device,
-                commit,
-                "apply DPMS-off setup through core entries",
-            );
-        }
+        assert_eq!(
+            backend.owner_dpms_installed_active.get(&device),
+            Some(&false),
+            "the DPMS-off transaction is installed before relight starts"
+        );
+        assert!(
+            backend
+                .lifecycle_coordinator
+                .device(&device)
+                .is_none_or(|arbiter| arbiter.transition().is_none())
+        );
         let sent_before = backend.lifecycle_drivers[&device]
             .topology_test_stats()
             .1
@@ -106417,6 +106689,19 @@ mod tests {
             .iter()
             .position(|output| output.key.device_key == device_a)
             .expect("Owner A installed output");
+        let output_b_index = backend
+            .platform
+            .outputs
+            .iter()
+            .position(|output| output.key.device_key == device_b)
+            .expect("Owner B installed output");
+        assert_eq!(
+            backend
+                .scene
+                .output_is_excluded_from_composition_for_tests(output_b_index),
+            Some(false),
+            "B's live scene output starts eligible for composition"
+        );
         let probes = c0_3ci_test_probe_results(backend);
         let snapshot_a = probes[&device_a]
             .as_ref()
@@ -106472,6 +106757,13 @@ mod tests {
                 .transport_gate(&device_b)
                 .map(|gate| gate.state()),
             Some(crate::kms::render::resources::TransportState::Closed)
+        );
+        assert_eq!(
+            backend
+                .scene
+                .output_is_excluded_from_composition_for_tests(output_b_index),
+            Some(true),
+            "failed acquire closes B's transport and excludes its retained output from composition"
         );
 
         let reinstall_a = c0_3ci_wait_owner_acquire_accepted(
@@ -106583,72 +106875,22 @@ mod tests {
                 .retired_output_has_instance_for_tests(instance_after_first_acquire)
                 && c0_3bi_end_state_errors(backend, &expected).is_empty()
         };
-        let retirement_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        for frame in 0..8 {
-            if retirement_drained(backend) {
-                break;
-            }
-            if let Some(commit) = backend
-                .platform
-                .owner_ref(device_a)
-                .and_then(|owner| owner.live_record())
-                .map(|record| record.commit_id())
-            {
-                // Acquisition can compose a follow-up A frame while the old
-                // pool is retiring. The executor stub does not emit its DRM
-                // completion, so supply the same core-entry completion used
-                // for the two reinstall commits above.
-                c0_3bi_complete_owner_commit_through_core_driver_with_state(
-                    backend,
-                    &mut state,
-                    device_a,
-                    commit,
-                    "complete A's follow-up while draining acquire retirement",
-                );
-                continue;
-            }
-            let remaining =
-                retirement_deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                panic!(
-                    "A's displaced scene instance did not drain within the existing 5-second bound; diagnostics: {}; end_state_errors={:?}; retired={:?}",
-                    c0_3cii_owner_route_diagnostics_for_tests(backend, device_a),
-                    c0_3bi_end_state_errors(backend, &expected),
-                    backend.scene.retired_output_end_states_for_tests(),
-                );
-            }
-            c0_3bi_core_driver_until_with_state(
-                backend,
-                &mut state,
-                "retire A's displaced scene instance after the second acquire",
-                remaining,
-                &|backend| {
-                    retirement_drained(backend)
-                        || backend
-                            .platform
-                            .owner_ref(device_a)
-                            .and_then(|owner| owner.live_record())
-                            .is_some()
-                },
-                None,
+        c0_3cii_drive_owner_work_until(
+            backend,
+            &mut state,
+            &[device_a, device_b],
+            "retire A's displaced scene instance after the second acquire",
+            std::time::Duration::from_secs(5),
+            &retirement_drained,
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "{error}; A diagnostics: {}; end_state_errors={:?}; retired={:?}",
+                c0_3cii_owner_route_diagnostics_for_tests(backend, device_a),
+                c0_3bi_end_state_errors(backend, &expected),
+                backend.scene.retired_output_end_states_for_tests(),
             )
-            .unwrap_or_else(|error| {
-                panic!(
-                    "{error}; A diagnostics: {}; end_state_errors={:?}; retired={:?}",
-                    c0_3cii_owner_route_diagnostics_for_tests(backend, device_a),
-                    c0_3bi_end_state_errors(backend, &expected),
-                    backend.scene.retired_output_end_states_for_tests(),
-                )
-            });
-            if frame == 7 && !retirement_drained(backend) {
-                panic!(
-                    "A's acquire retirement did not settle after 8 accepted frames; diagnostics: {}; end_state_errors={:?}; retired={:?}",
-                    c0_3cii_owner_route_diagnostics_for_tests(backend, device_a),
-                    c0_3bi_end_state_errors(backend, &expected),
-                    backend.scene.retired_output_end_states_for_tests(),
-                );
-            }
-        }
+        });
         c0_3bi_assert_end_state(
             backend,
             "c0_3cii_stuck_acquire_worker_closes_and_is_reaped_vulkan",
@@ -106674,10 +106916,13 @@ mod tests {
             .as_ref()
             .expect("first B snapshot")
             .clone();
+        let first_a_barrier = crate::kms::render::platform::ProbeBarrier::new();
         let old_worker_barrier = crate::kms::render::platform::ProbeBarrier::new();
-        backend
-            .platform
-            .script_connector_probe_for_tests(device_a, Ok(snapshot_a.clone()));
+        backend.platform.script_blocked_connector_probe_for_tests(
+            device_a,
+            Ok(snapshot_a.clone()),
+            first_a_barrier.clone(),
+        );
         backend.platform.script_blocked_connector_probe_for_tests(
             device_b,
             Ok(snapshot_b),
@@ -106695,6 +106940,41 @@ mod tests {
             .as_ref()
             .expect("first probe episode")
             .epoch;
+        // Keep the first episode open on B, but make A's successful answer
+        // deterministic before release. Otherwise load can leave A's quick
+        // worker in the ledger when the next acquire begins, so its stale
+        // EIO masks the second episode's intended blocked A probe.
+        first_a_barrier.release();
+        let first_probe_deadline = backend
+            .probe_episode
+            .as_ref()
+            .expect("first probe episode remains open for B")
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "consume the first-epoch A answer while B remains blocked",
+            first_probe_deadline,
+            &|backend| {
+                backend.probe_episode.as_ref().is_some_and(|episode| {
+                    episode.epoch == old_epoch
+                        && episode.results.get(&device_a).is_some_and(Result::is_ok)
+                        && !backend.probe_workers.workers.contains_key(&device_a)
+                })
+            },
+            None,
+        )
+        .expect("A's first-epoch answer is joined before the next acquire");
+        assert!(backend.probe_workers.workers.contains_key(&device_b));
+        assert!(
+            backend
+                .probe_episode
+                .as_ref()
+                .unwrap()
+                .remaining
+                .contains(&device_b)
+        );
 
         backend.core_driver_vt_releases_for_tests += 1;
         c0_3bi_core_driver_until_with_state(
@@ -107896,25 +108176,41 @@ mod tests {
         label: &str,
     ) {
         backend.core_driver_vt_acquires_for_tests += 1;
-        c0_3bi_core_driver_until_with_state(
+        let acquire_worker_started = |backend: &super::KmsBackend| {
+            backend.vt_state == crate::vt::state::VtState::Resuming
+                && backend.probe_workers.workers.contains_key(&device)
+                && backend
+                    .core_entry_trace_for_tests
+                    .borrow()
+                    .contains(&"vt_acquire")
+        };
+        let driven = c0_3bi_core_driver_until_mode(
             backend,
             state,
             label,
             std::time::Duration::from_secs(1),
-            &|backend| {
-                backend.vt_state == crate::vt::state::VtState::Resuming
-                    && backend
-                        .platform
-                        .connector_probe_observations_for_tests()
-                        .iter()
-                        .any(|observation| observation.key == device)
-            },
+            &acquire_worker_started,
             None,
-        )
-        .unwrap_or_else(|error| panic!("{label}: {error}"));
+            false,
+            true,
+        );
+        if let Err(error) = driven {
+            // The VT callback can run as the final Backend entry before the
+            // bounded driver notices its deadline. Accept that timeout only
+            // when the exact acquire entry and blocked worker are observable.
+            assert!(acquire_worker_started(backend), "{label}: {error}");
+        }
         assert!(
             barrier.wait_started(std::time::Duration::from_secs(1)),
             "{label}: the scripted prober owns a real worker thread blocked on its barrier"
+        );
+        assert!(
+            backend
+                .platform
+                .connector_probe_observations_for_tests()
+                .iter()
+                .any(|observation| observation.key == device),
+            "{label}: the worker entered the scripted prober before the barrier"
         );
         assert!(
             backend
@@ -107949,29 +108245,11 @@ mod tests {
         Vec<OutputKey>,
         ServerState,
     ) {
-        use crate::kms::executor::test_support::StubBehaviour;
-
-        let (mut fixture, device_a, device_b, _, _) =
-            c0_3bi_live_two_owner_position_backend(StubBehaviour::AcceptKernelCalls(1_000))
-                .expect("environmental skip: live two-Owner probe fixture");
+        let (mut fixture, device_a, device_b, outputs_a, outputs_b, mut state) =
+            c0_3cii_live_two_owner_fixture();
         let backend = &mut fixture.backend;
         backend.vt_skip_master_ioctls_for_tests = true;
         backend.platform.owner_completion_detached = true;
-        let outputs_a = backend
-            .platform
-            .outputs
-            .iter()
-            .filter(|output| output.key.device_key == device_a)
-            .map(|output| output.key.clone())
-            .collect::<Vec<_>>();
-        let outputs_b = backend
-            .platform
-            .outputs
-            .iter()
-            .filter(|output| output.key.device_key == device_b)
-            .map(|output| output.key.clone())
-            .collect::<Vec<_>>();
-        let mut state = c0_3ci_core_state(backend);
         // AcceptKernelCalls models the executor protocol only; it does not
         // submit kernel atomic commits, page flips, VT ioctls, or DRM master.
         c0_3ci_release_owners_to_suspended(
@@ -118122,6 +118400,42 @@ mod tests {
         // host udev input so only the scripted probe path can change topology.
         backend.platform.hotplug_monitor = None;
         let mut state = c0_3ci_core_state(backend);
+        let crtc = backend
+            .platform
+            .outputs
+            .iter()
+            .find(|output| output.key.device_key == device)
+            .map(|output| u32::from(output.output.crtc))
+            .expect("forced-reprobe Owner output");
+        let clock_key = backend
+            .platform
+            .owner_ref(device)
+            .and_then(|owner| owner.clock_key_for_hardware_crtc(crtc))
+            .expect("forced-reprobe Owner clock");
+        backend.scene.scene_structure_dirty = false;
+        c0_3cii_drive_owner_work_until(
+            backend,
+            &mut state,
+            &[device],
+            "forced-reprobe fixture clock and frame readiness",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend
+                    .platform
+                    .owner_ref(device)
+                    .and_then(|owner| owner.clock(clock_key))
+                    .is_some_and(|clock| {
+                        matches!(clock.probe, crate::kms::owner::clock::ProbeState::Succeeded)
+                    })
+                    && c0_3cii_owner_frame_work_quiescent(backend, &[device])
+            },
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "{error}; diagnostics: {}",
+                c0_3cii_owner_route_diagnostics_for_tests(backend, device)
+            )
+        });
         c0_3cii_settle_owner_fixture(backend, &mut state, device, "forced-reprobe fixture");
         (fixture, device, outputs, state)
     }
@@ -119267,11 +119581,24 @@ mod tests {
             connected: answer.connected,
             modes: answer.modes.clone(),
         };
-        let publication_start = std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_secs(5))
-            .expect("shared publication timestamp is representable");
-        state.start_instant = publication_start;
-        legacy_state.start_instant = publication_start;
+        let config_timestamp_before = 500;
+        state.randr.config_timestamp = config_timestamp_before;
+        legacy_state.randr.config_timestamp = config_timestamp_before;
+        // `ServerState::start_instant` is the timestamp source seam. Put both
+        // states on the same future epoch so timestamp_now() stays at the
+        // same deterministic value while the Owner worker and Legacy's
+        // synchronous probe publish at different wall-clock instants.
+        let frozen_publication_epoch = std::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(3_600))
+            .expect("frozen publication epoch is representable");
+        state.start_instant = frozen_publication_epoch;
+        legacy_state.start_instant = frozen_publication_epoch;
+        assert_eq!(state.timestamp_now(), 0, "Owner clock is frozen for parity");
+        assert_eq!(
+            legacy_state.timestamp_now(),
+            0,
+            "Legacy clock is frozen for parity"
+        );
         let token = c0_3cii_begin_forced_reprobe(backend, &mut state, device, Ok(vec![answer]));
         assert_eq!(
             c0_3cii_finish_forced_reprobe(
@@ -119330,6 +119657,24 @@ mod tests {
         assert_eq!(
             state.randr.config_timestamp, legacy_state.randr.config_timestamp,
             "released-seat publication preserves Legacy lastConfigTime"
+        );
+        assert_ne!(
+            state.randr.config_timestamp, config_timestamp_before,
+            "the changed Owner mode list advances lastConfigTime"
+        );
+        assert_ne!(
+            legacy_state.randr.config_timestamp, config_timestamp_before,
+            "the changed Legacy mode list advances lastConfigTime"
+        );
+        assert_eq!(
+            state.randr.config_timestamp,
+            state.timestamp_now(),
+            "Owner lastConfigTime uses the frozen publication timestamp"
+        );
+        assert_eq!(
+            legacy_state.randr.config_timestamp,
+            legacy_state.timestamp_now(),
+            "Legacy lastConfigTime uses the frozen publication timestamp"
         );
         c0_3bi_assert_end_state(
             backend,

@@ -2512,9 +2512,9 @@ impl SceneCompositor {
             .unwrap_or_default()
     }
 
-    /// Keep terminally removed devices' scene and pool state attached so
-    /// their allocations remain quarantinable, while excluding their outputs
-    /// from future composition and scene-wide repaint scheduling.
+    /// Keep outputs with closed or terminally removed devices' scene and pool
+    /// state attached so their allocations remain retireable, while excluding
+    /// those outputs from composition and scene-wide repaint scheduling.
     pub(crate) fn withdraw_device_outputs(&mut self, device: crate::platform::drm::DrmDeviceKey) {
         let Some(inner) = self.inner.as_mut() else {
             return;
@@ -3703,6 +3703,18 @@ impl SceneCompositor {
             prepared.identity().generation,
             prepared.state() == OwnerBufferState::Rendering,
         ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn output_is_excluded_from_composition_for_tests(
+        &self,
+        output_idx: usize,
+    ) -> Option<bool> {
+        self.inner
+            .as_ref()?
+            .outputs
+            .get(output_idx)
+            .map(|state| state.withdrawn)
     }
 
     #[cfg(test)]
