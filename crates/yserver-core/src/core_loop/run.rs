@@ -1245,6 +1245,27 @@ pub(super) fn cancel_queued_xi_configs_for_source(
     lane.queued = retained;
 }
 
+/// Dispatch the production `Message::VtRelease` lifecycle callback. Keep the
+/// process-lifetime source inventory and backend device facets in the same
+/// unavailable boundary before the backend releases DRM master.
+pub fn dispatch_vt_release(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    input_inventory: &mut InputInventory,
+) {
+    if backend.vt_switching_armed() {
+        input_inventory.suspend_all();
+        backend.on_vt_release(state);
+    }
+}
+
+/// Dispatch the production `Message::VtAcquire` lifecycle callback.
+pub fn dispatch_vt_acquire(state: &mut ServerState, backend: &mut dyn Backend) {
+    if backend.vt_switching_armed() {
+        backend.on_vt_acquire(state);
+    }
+}
+
 /// Dispatch one host input event through the same lifecycle and XI-config
 /// cancellation path used by `run_core`.
 pub(super) fn dispatch_host_input(
@@ -2282,14 +2303,10 @@ pub fn run_core(
                                 // diagnostic dumps go through DumpScanout /
                                 // DumpDrawables via the Ctrl-Alt-Enter /
                                 // Ctrl-Alt-F12 hotkeys, not this path.)
-                                if backend.vt_switching_armed() {
-                                    backend.on_vt_release(state);
-                                }
+                                dispatch_vt_release(state, backend, &mut input_inventory);
                             }
                             Message::VtAcquire => {
-                                if backend.vt_switching_armed() {
-                                    backend.on_vt_acquire(state);
-                                }
+                                dispatch_vt_acquire(state, backend);
                             }
                             Message::SwitchVt(vt) => {
                                 if backend.vt_switching_armed() {

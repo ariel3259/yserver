@@ -46,6 +46,15 @@ impl InputInventory {
         }
     }
 
+    /// Mark every known source unavailable in the same core-loop dispatch as
+    /// VT release. The backend performs synchronous held-state cleanup before
+    /// the VT handoff; later per-device suspend messages remain idempotent.
+    pub fn suspend_all(&mut self) {
+        for info in self.devices.values_mut() {
+            info.enabled = false;
+        }
+    }
+
     /// Refresh a continued source after libinput has restored its settings.
     pub fn resume(&mut self, mut info: DeviceInfo) {
         info.enabled = true;
@@ -148,6 +157,24 @@ mod tests {
         inventory.add(device(3, "/dev/input/event3", "Mouse"));
         inventory.remove(InputSourceId(9));
         assert_eq!(inventory.len(), 1);
+    }
+
+    #[test]
+    fn suspend_all_marks_every_inventory_source_unavailable() {
+        let mut inventory = InputInventory::new();
+        inventory.add(device(3, "/dev/input/event3", "Mouse"));
+        inventory.add(device(4, "/dev/input/event4", "Keyboard"));
+
+        inventory.suspend_all();
+
+        assert_eq!(inventory.len(), 2);
+        assert_eq!(inventory.devices_by_source().len(), 2);
+        assert!(
+            inventory
+                .devices_by_source()
+                .iter()
+                .all(|info| !info.enabled)
+        );
     }
 
     #[test]

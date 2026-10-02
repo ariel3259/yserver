@@ -209,6 +209,15 @@ impl XiRegistry {
             .map(|record| &mut record.info)
     }
 
+    /// Every retained physical source, including sources without an
+    /// allocated XI facet, ordered by runtime identity.
+    #[must_use]
+    pub fn source_ids(&self) -> Vec<InputSourceId> {
+        let mut source_ids: Vec<_> = self.sources.keys().copied().collect();
+        source_ids.sort_unstable_by_key(|source_id| source_id.0);
+        source_ids
+    }
+
     #[must_use]
     pub fn role(&self, device_id: u16) -> Option<XiDeviceRole> {
         let device = self.device(device_id)?;
