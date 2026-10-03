@@ -119,8 +119,7 @@ nonexistent slave.
 
 At `DeviceAdded`, the libinput backend captures all three capability bits,
 the source ID, input metadata, and the full supported configuration
-snapshot. It applies the configured global acceleration default before
-capturing that snapshot. It stores a libinput handle by `SourceId` for
+snapshot, without applying any server-wide acceleration default. It stores a libinput handle by `SourceId` for
 writable properties, including sources with several facets. Registration
 creates all facets for one source before publishing a hierarchy change.
 
@@ -355,7 +354,7 @@ tracked in `docs/status.md`.
   and rapid unplug/replug do not rebind an old XI facet to another source.
 
 The implementation plan should split registry/lifecycle, XI1 and XI2
-enumeration, source-aware event routing, touch delivery, hotplug notices,
-and global acceleration into reviewable stages. Each stage must preserve
+enumeration, source-aware event routing, and hotplug notices into
+reviewable stages. Each stage must preserve
 the invariants above; the feature is complete only when all stages are
 integrated. No implementation or tests are run by this design document.

@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Expose each KMS libinput keyboard and pointer facet as a distinct, configurable XInput device, with Xorg-style virtual IDs 4/5 and a global mouse acceleration default.
+**Goal:** Expose each KMS libinput keyboard and pointer facet as a distinct, configurable XInput device, with Xorg-style virtual IDs 4/5 and per-device acceleration configured through each facet's own XI properties.
 
-**Architecture:** A process-local `InputSourceId` follows each libinput attachment from discovery through events and removal. `XiRegistry` owns the physical facet IDs and their properties; XI1 and XI2 query that same registry, while core input still flows through masters 2/3. The libinput backend retains a handle per source for property writes and applies the optional global profile before publishing device metadata.
+**Architecture:** A process-local `InputSourceId` follows each libinput attachment from discovery through events and removal. `XiRegistry` owns the physical facet IDs and their properties; XI1 and XI2 query that same registry, while core input still flows through masters 2/3. The libinput backend retains a handle per source for property writes; it applies no server-wide acceleration default.
 
 **Tech Stack:** Rust workspace (`yserver`, `yserver-core`, `yserver-protocol`), libinput via the `input` crate, XI1/XI2, Xorg source in `../xserver`.
 
@@ -55,9 +55,9 @@
 | XI1/XI2 device query | `crates/yserver-core/src/core_loop/process_request.rs`, `crates/yserver-protocol/src/x11/mod.rs` |
 | Per-facet property writes | `crates/yserver-core/src/backend/trait_def.rs`, `crates/yserver-core/src/backend/recording.rs`, `crates/yserver/src/kms/render/backend.rs`, `crates/yserver/src/input/context.rs` |
 | Source-aware input and notifications | `crates/yserver-core/src/core_loop/key_fanout.rs`, `crates/yserver-core/src/core_loop/pointer_fanout.rs`, `crates/yserver-core/src/core_loop/fanout.rs`, `crates/yserver/src/kms/render/backend.rs`, new `crates/yserver-core/src/xinput/hotplug.rs` |
-| Global default and current status | `crates/yserver/src/input/libinput_config.rs`, `crates/yserver/src/input/context.rs`, `README.md`, `docs/status.md` |
+| Current status | `docs/status.md` |
 
-Tasks 1–3 establish identity and lifecycle; Tasks 4–5 enumerate facets; Tasks 6–8 configure them; Tasks 9–13 attribute input and scope grabs; Tasks 14–16 handle removal and notifications; Tasks 17–18 handle defaults, reset, and integration. Each task has its own reviewable result.
+Tasks 1–3 establish identity and lifecycle; Tasks 4–5 enumerate facets; Tasks 6–8 configure them; Tasks 9–13 attribute input and scope grabs; Tasks 14–16 handle removal and notifications; Task 17 is dropped; Task 18 handles reset and integration. Each task has its own reviewable result.
 
 ### Task 1: Central registry and virtual 4/5
 
@@ -261,16 +261,7 @@ DeviceSuspended retains XI IDs/properties, inventory facts and selections; relea
 
 ### Task 17: Apply the global mouse acceleration default — DROPPED
 
-**Dropped 2026-10-02 by user decision:** the upstream maintainer rejects gating environment variables (PR 129). Per-device XI properties plus MATE presence reapplication (Task 16) or a startup `xinput` loop replace it; see the spec section "Mouse acceleration configuration". Task 18 skips the global-default checks. The original text below is kept for history only and must not be implemented.
-
-**Files:** Modify `crates/yserver/src/lib.rs:272,1016`, `crates/yserver/src/kms/render/backend.rs:5193`, `crates/yserver/src/kms/render/platform.rs:2612`, `crates/yserver/src/kms/backend.rs:1062`, `crates/yserver/src/input/libinput_config.rs`, `crates/yserver/src/input/context.rs:166,211`, `README.md`.
-
-**Interfaces:** `MouseAccelProfile::parse(value: Option<&str>) -> io::Result<Self>` accepts `default|flat|adaptive`, with unset=`default`. Parse it in launcher startup before KMS backend/input-thread initialization and pass the typed profile through `build_kms_backend`, `KmsBackend::open`, `KmsBackend::open_with_commit`, `PlatformBackend::open_with_commit`, `platform_init`, and `SendContext::new(profile)` to `Context::new(profile)`. Add a `MouseAccelProfile` parameter to each constructor in this chain and update all test/nested constructors with `default`: an invalid value exits with the allowed values in its own diagnostic, never through the current `Context::new()` warning plus misleading "no input devices" abort. `apply_mouse_accel_default(&mut Device, MouseAccelProfile, is_touchpad: bool) -> Result<(), DeviceConfigError>` runs before `gather(&dev)` at a genuinely new DeviceAdded. A proven VT DeviceResumed restores the saved client configuration and does not reapply this initial global default. Only pointer-capable non-touchpads with supported acceleration are eligible; unsupported requested profiles retain the libinput default and log once for that source.
-
-- [ ] **Step 1:** Add focused parser/eligibility checks for unset/default, flat, adaptive, invalid startup value with an explicit diagnostic and no "no input" fallback, touchpad, keyboard-only, unsupported profile, and a fresh attachment after removal. Verify a later XI write may override the initial default.
-- [ ] **Step 2:** Run `cargo test -p yserver input::libinput_config::tests --lib`; confirm new checks fail.
-- [ ] **Step 3:** Apply the policy to every eligible source independently, including HyperX `event9`; capture the post-policy snapshot. Compare acceleration-property behavior with `xf86-input-libinput` from an actual available source checkout or official upstream source; the driver is not present at `../xf86-input-libinput` in this workspace. Document `YSERVER_MOUSE_ACCEL_PROFILE=flat` in README and explain why the old i3 `set-prop 4` line must be removed when deployed.
-- [ ] **Step 4:** Run focused checks, format, CI clippy; commit `feat(input): apply mouse acceleration profile on device add`.
+**Dropped 2026-10-02 by user decision:** the upstream maintainer rejects gating environment variables (PR 129). Per-device XI properties plus MATE presence reapplication (Task 16) or a startup `xinput` loop replace it; see the spec section "Mouse acceleration configuration". Task 18 skips the global-default checks. Nothing in this task is implemented.
 
 ### Task 18: Replay the registry on reset and audit integration
 
