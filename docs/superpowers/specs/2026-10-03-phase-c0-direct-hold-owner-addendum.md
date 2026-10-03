@@ -2,7 +2,9 @@
 
 **Status:** revision 3 (review round 1: M-1 protected set, M-2 lifecycle
 handoffs, M-3 test preconditions; round 2: M-1 the invariant's two ownership
-states, M-2 per-variant mutation reachability). Direction approved by the user 2026-10-03:
+states, M-2 per-variant mutation reachability; round 3: M-1 the invariant
+restated negatively so it covers initial entry, M-2 the client modeset keeps
+its prerequisite unflip). Direction approved by the user 2026-10-03:
 Legacy parity, not a symptom fix. A production defect of the Owner composed admission (stage 3b)
 against the direct scanout state (stage 2c Ciii, M2), found by the load
 criterion through `c0_merge_unmap_direct_window_unflips_vulkan`.
@@ -71,35 +73,48 @@ accumulates; it never causes an unflip by itself.
    primary plane keep progressing. Damage keeps accumulating in the scene.
 2. **Replacement paths.** On a live, healthy incarnation the ordinary
    replacement of a direct frame by composed content is the Ciii unflip only,
-   and M2 is cleared when it retires (unchanged). The owner-ordered lifecycle
-   and topology paths keep their existing handoffs and are not routed through
-   Ciii: VT release (`ACTIVE=0`), VT acquire reinstall (which already calls
-   `stop_direct_after_scanout_replaced`), DPMS transitions, a client modeset,
-   and device removal / quarantine. This addendum changes none of them and
-   adds no early release: every one still releases the direct frame only on
-   its existing proof (retirement, reinstall, or quarantine), and a logical
-   withdrawal is not proof that scanout stopped.
+   and M2 is cleared when it retires (unchanged). Two kinds of existing paths
+   are distinguished, and this addendum changes neither:
+   - **Paths that already go through Ciii first:** a client modeset on a
+     device that owns the direct frame parks, requests the direct unflip
+     (`client_modeset_direct_ineligible`) and resumes only after that unflip
+     commit retires. This prerequisite is preserved: rule 1 does not let the
+     modeset or any composed content bypass it.
+   - **Owner-ordered lifecycle paths that do not use Ciii:** VT release
+     (`ACTIVE=0`), VT acquire reinstall (which calls
+     `stop_direct_after_scanout_replaced` after its reinstall is promoted),
+     DPMS transitions (which keep the primary-plane bindings) and device
+     removal / quarantine. They keep their existing handoffs.
+   Rule 1 only blocks *ordinary composed primaries*; it never blocks a Ciii
+   unflip, a parked modeset's resumption after its unflip, or a lifecycle
+   commit. No path gets an early release: each releases the direct frame
+   only on its existing proof (retirement, reinstall promotion, or
+   quarantine / teardown), and a logical withdrawal is not proof that
+   scanout stopped.
 3. **No new unflip triggers.** This addendum adds none; the existing reasons
    (`request_direct_unflip` callers) stay the only ones. Scene damage behind a
    held direct frame must not request an unflip.
 4. **Invariant.** On a live, healthy incarnation with no lifecycle
-   transition, no owner-ordered modeset and no Ciii unflip in flight on the
-   device, at every core-loop iteration boundary, M2's direct ownership is in
-   exactly one of two states, and the commit ledger matches it:
-   - **Stable:** M2 holds a current frame D0 and no direct successor commit
-     is in flight. `current_resources` holds D0's `DirectRole::Current`
-     resources for the whole protected set.
-   - **Direct replacement in flight:** M2 holds D0 current and a pending
-     successor D1 whose commit is dispatched. D0's resources are that
-     commit's retained old-state dependencies (taken out of
-     `current_resources` by the direct dispatch) and D1's resources are its
-     new state, for the same protected set; when D1 retires, D1 becomes
-     Stable. The identities are exact (D0's and D1's commit and source
-     generations), so an ordinary composed commit in flight on the protected
-     set can never satisfy this state: that is the defect this addendum
-     forbids.
-   During the excluded transitions the invariant is suspended, and each
-   transition's own existing proof decides when the direct frame is released.
+   transition, no client modeset and no Ciii unflip in flight on the device,
+   at every core-loop iteration boundary, whenever M2 owns any direct frame
+   on the device (queued, pending or current):
+   - **(a) no ordinary composed primary** is in flight or current on any
+     CRTC of the protected set — no in-flight commit's new state and no
+     `current_resources` entry carries composed primary content for those
+     CRTCs; and
+   - **(b) every M2 direct frame that has a commit is correlated** with its
+     exact ledger resources: a current frame with no direct successor in
+     flight holds its `DirectRole::Current` entry in `current_resources`; a
+     pending frame is its dispatched commit's new state, whose retained
+     old state is whatever the protected set showed before it (the previous
+     direct frame, or the composed content it replaces on first entry).
+   (a) is the property this addendum restores; (b) is the bookkeeping that
+   makes (a) checkable. The states are not enumerated beyond this: first
+   entry, a queued-only frame (no commit yet, so only (a) applies), a direct
+   successor in flight and the stable state all satisfy (a) and (b) as
+   written. During the excluded transitions the invariant is suspended, and
+   each transition's own existing proof decides when the direct frame is
+   released.
 
 The rejected alternative (making the Ciii unflip accept composed resources as
 the direct retirement, or routing every composed replacement through Ciii) is
@@ -155,6 +170,17 @@ meaningful, and the mutation (gate removed) must cross the dispatch boundary
 - **Rule 4 at every iteration:** checked through the driver's per-iteration
   observation in each test above (not only at the end), then the end-state
   check.
+
+- **First direct entry:** composed content is current; the first direct
+  frame is queued, dispatched and retired through production entries; rule 4
+  (a) and (b) hold at every iteration, including the interval where M2 has a
+  pending frame and no current one. Mutation: let a composed primary be
+  admitted in that interval — (a) fails.
+- **Client modeset over a held direct frame:** grouped direct ownership; a
+  client modeset parks and requests the unflip; the unflip's shadow first
+  fails, then the production retry dispatches it; the modeset dispatches only
+  after the unflip commit retires. Mutation: let rule 1's exemption skip the
+  prerequisite — the modeset dispatches before the unflip retires.
 
 Hardware (C, coordinator): `c0_hw_3b_modeset_owner_on_card1_drm` and the
 direct-scanout hardware tests that exist on card1, before the commit.
