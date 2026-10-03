@@ -211,3 +211,38 @@ I ran existing binaries containing the R4 tests: **13 passed; 8 were environment
 Headless wheel conversion, remapped-button unplug cleanup, VT held-state cleanup, hotkey reset, exact-slave delivery, and nested XTEST identity checks passed. I found no further confirmed VT/unplug regression in the traced cleanup paths.
 
 **Verdict: not ready for hardware verification and PR.**
+## Final verification of R5 (2026-10-03)
+
+Reviewer: codex gpt-6.1-sol xhigh, read-only, on `5a67379c`. No blocking or major findings; the two minor findings below are left as follow-ups for the user to decide (not fixed in this branch yet).
+
+**Not ready for hardware verification and PR.** V1–V5 are fixed in their reported scenarios, but R5 introduces two minor correctness regressions. I confirmed no new blocking or major defect.
+
+Reviewed only `931ae07b..5a67379c`, using surrounding code and `../xserver` for context.
+
+| Finding | Verification against production code and Xorg | Does the regression test reject the old behavior? |
+|---|---|---|
+| **V1 — Fixed** | [Scroll stop:2546](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver-core/src/core_loop/pointer_fanout.rs:2546) now announces the source switch and copies its counters before emitting stop Motion. This matches [UpdateFromMaster:697](/home/ariel_santangelo/Projects/xserver/dix/getevents.c:697); [XIQueryDevice:369](/home/ariel_santangelo/Projects/xserver/Xi/xiquerydevice.c:369) reads the resulting valuator baseline. | **Yes.** [Test:5212](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver-core/src/core_loop/pointer_fanout.rs:5212) exercises scrolling → XTEST motion → stop → query. Without the stop announcement, its SlaveSwitch and last-source assertions fail. |
+| **V2 — Fixed** | [Separate scroll Motion:2060](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver-core/src/core_loop/pointer_fanout.rs:2060) uses source acceptance independently of master button aggregation. Xorg generates smooth Motion before wheel-button emulation at [getevents.c:1753](/home/ariel_santangelo/Projects/xserver/dix/getevents.c:1753). | **Yes.** [Test:5406](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver-core/src/core_loop/pointer_fanout.rs:5406) holds XTEST button 5 and requires physical master scroll Motion. Old code yields no matching Motion. |
+| **V3 — Fixed for ordinary Caps Lock** | [Press bookkeeping:19755](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver/src/kms/render/backend.rs:19755) saves pre-press locked bits; [floating release:12109](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver/src/kms/render/backend.rs:12109) clears them. This matches the default LockMods filter at [xkbActions.c:372](/home/ariel_santangelo/Projects/xserver/xkb/xkbActions.c:372). | **Yes.** [Test:31645](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver/src/kms/render/backend.rs:31645) starts with Caps on, holds another press through the slave grab, then requires unlocked state. R4 retains Lock. |
+| **V4 — Fixed** | [RECORD admission:910](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver-core/src/core_loop/pointer_fanout.rs:910) requires an attached master. Xorg omits floating master copies at [mieq.c:397](/home/ariel_santangelo/Projects/xserver/mi/mieq.c:397), and records core conversion only for masters at [record.c:784](/home/ariel_santangelo/Projects/xserver/record/record.c:784). | **Yes.** [Test:5550](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver-core/src/core_loop/pointer_fanout.rs:5550) dispatches RECORD setup and a synchronous physical-pointer grab. Removing the attachment gate records its queued ButtonPress and fails the assertion. |
+| **V5 — Fixed for the reported geometry regression** | [Fallback:1914](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver-core/src/core_loop/pointer_fanout.rs:1914) no longer sets the global geometry override; [delivery:2276](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver-core/src/core_loop/pointer_fanout.rs:2276) redirects only the owner. Xorg fixes natural delivery against its selected window at [events.c:2823](/home/ariel_santangelo/Projects/xserver/dix/events.c:2823), and fallback against the grab window at [4333](/home/ariel_santangelo/Projects/xserver/dix/events.c:4333). | **Yes.** [Test:5703](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver-core/src/core_loop/pointer_fanout.rs:5703) checks both recipients. R4 gives B the child window and child-local coordinates instead of root geometry. |
+
+The “without the fix” conclusions above come from tracing the old code and test assertions; I did not perform reversions. V5’s inherited delivery to nonowners remains different from [Xorg’s filtering:2069](/home/ariel_santangelo/Projects/xserver/dix/events.c:2069); R5 fixes the reported coordinate regression.
+
+Two new defects are reachable:
+
+1. **Minor — Owner-events grabs can lose wheel Motion when natural ButtonPress and Motion selections differ.**  
+   Client A selects master `XI_ButtonPress` on a mapped child, then grabs master 2 on root with `owner_events=true` and Motion in the grab mask. Scroll one mouse over that child.
+
+   ButtonPress naturally reaches A, so [1897](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver-core/src/core_loop/pointer_fanout.rs:1897) creates no fallback marker. Motion has no natural recipient, but the new path adds the owner only when that **ButtonPress-derived marker** exists at [2077](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver-core/src/core_loop/pointer_fanout.rs:2077). Consequently, the counter advances and the emulated button arrives, but smooth Motion disappears. R4 emitted Motion through the ButtonPress recipient. Xorg independently falls back for Motion at [events.c:4400](/home/ariel_santangelo/Projects/xserver/dix/events.c:4400).
+
+   This is reachable through accepted requests with one mouse. I found no common-toolkit reproduction, so I classify the differing-selection case as minor. The new ungrabbed V2 test misses it.
+
+2. **Minor — A lock-only XKB action incorrectly unlocks after a held-key slave grab.**  
+   Configure Caps with `LockMods(modifiers=Lock, affect=lock)`, turn Lock on, press Caps again, grab that physical keyboard while held, then release and type another key.
+
+   The supported [action writer:437](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver/src/kms/xkb_desc/action.rs:437) preserves `affect=lock`, but R5 saves only modifier bits and unconditionally clears them at [12112](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver/src/kms/render/backend.rs:12112). Xorg explicitly honors `LockNoUnlock` at [xkbActions.c:382](/home/ariel_santangelo/Projects/xserver/xkb/xkbActions.c:382).
+
+   A memory-only libxkbcommon probe confirmed: normal release and R4’s copied floating release retain mask **2**; R5’s saved-mask operation produces **0**. This requires a custom action and a slave grab, so it is minor. The default-Caps test misses the flag.
+
+All **five new R5 tests passed** in the existing binaries built after the changed sources. The pointer suite had **37 passes and 24 socket-limited failures**; the backend subset had **3 passes and 6 socket-limited failures**. A socketpair probe confirmed `send` returns `EPERM`. No fresh build, hardware test, ignored test, environment-variable change, file edit, or git write occurred.
