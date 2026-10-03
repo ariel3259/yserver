@@ -4,7 +4,10 @@
 handoffs, M-3 test preconditions; round 2: M-1 the invariant's two ownership
 states, M-2 per-variant mutation reachability; round 3: M-1 the invariant
 restated negatively so it covers initial entry, M-2 the client modeset keeps
-its prerequisite unflip). Direction approved by the user 2026-10-03:
+its prerequisite unflip; round 4, classified as edge cases and folded in
+without another round: the pre-entry composed state is allowed, and the
+first-entry pending case is a characterization). Design converged: ready
+for implementation. Direction approved by the user 2026-10-03:
 Legacy parity, not a symptom fix. A production defect of the Owner composed admission (stage 3b)
 against the direct scanout state (stage 2c Ciii, M2), found by the load
 criterion through `c0_merge_unmap_direct_window_unflips_vulkan`.
@@ -98,10 +101,14 @@ accumulates; it never causes an unflip by itself.
    transition, no client modeset and no Ciii unflip in flight on the device,
    at every core-loop iteration boundary, whenever M2 owns any direct frame
    on the device (queued, pending or current):
-   - **(a) no ordinary composed primary** is in flight or current on any
-     CRTC of the protected set — no in-flight commit's new state and no
-     `current_resources` entry carries composed primary content for those
-     CRTCs; and
+   - **(a) no ordinary composed primary is admitted onto the protected set
+     after the hold began.** A composed state that was already current or
+     in flight on those CRTCs when M2 began owning the direct frame (the
+     pre-entry predecessor, e.g. composed content still current while the
+     first direct frame is only queued or waits for the slot) is allowed; it
+     is replaced by the direct frame's own dispatch through its existing
+     proof. What is forbidden is any ordinary composed primary dispatched
+     after that point while no unflip is requested; and
    - **(b) every M2 direct frame that has a commit is correlated** with its
      exact ledger resources: a current frame with no direct successor in
      flight holds its `DirectRole::Current` entry in `current_resources`; a
@@ -171,11 +178,19 @@ meaningful, and the mutation (gate removed) must cross the dispatch boundary
   observation in each test above (not only at the end), then the end-state
   check.
 
-- **First direct entry:** composed content is current; the first direct
-  frame is queued, dispatched and retired through production entries; rule 4
-  (a) and (b) hold at every iteration, including the interval where M2 has a
-  pending frame and no current one. Mutation: let a composed primary be
-  admitted in that interval — (a) fails.
+- **First direct entry, queued:** composed content C0 is current; the first
+  direct frame is queued and genuinely waits across at least one iteration
+  boundary (its source not ready); C0 stays current (allowed pre-entry
+  state) and no new composed primary is dispatched for the protected set even
+  though a ready composed offer exists. Mutation: drop rule 1 — the ready
+  composed offer is dispatched.
+- **First direct entry, pending — characterization:** after dispatch the
+  slot is occupied (`SlotBusy` before readiness), so the test checks rule 4
+  (b) (the pending frame is its commit's new state, C0 the retained old
+  state) at every iteration until retirement. Its mutation is a bookkeeping
+  one (break the commit/resource correlation — (b) fails); the composed
+  admission mutation is the queued and post-retirement cases, never a
+  bypassed slot.
 - **Client modeset over a held direct frame:** grouped direct ownership; a
   client modeset parks and requests the unflip; the unflip's shadow first
   fails, then the production retry dispatches it; the modeset dispatches only
