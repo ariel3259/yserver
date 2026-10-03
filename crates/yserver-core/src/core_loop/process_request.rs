@@ -33531,12 +33531,22 @@ fn handle_ungrab_pointer(
 /// the replayed event). Shared by `apply_allow_events` and the XI1
 /// ReplayThisDevice path.
 fn deactivate_passive_pointer_grab_crossings(state: &mut ServerState) {
-    let prev_grab_window = state
-        .active_pointer_grab
-        .filter(|grab| grab.passive)
-        .map(|grab| grab.grab_window);
+    let prev_grab = state.active_pointer_grab.filter(|grab| grab.passive);
+    let prev_grab_window = prev_grab.map(|grab| grab.grab_window);
     state.clear_pointer_grab();
     state.pointer_confine_to = ResourceId(0);
+    // Xorg DeactivatePointerGrab clears every `sync.other` held on the
+    // dying grab's behalf: a keyboard frozen by the button grab's sync
+    // keyboard mode thaws with it, or it stays frozen with no grab left
+    // to AllowEvents it.
+    if let Some(grab) = prev_grab
+        && let Some(kbd) = state
+            .xi1_frozen
+            .get_mut(&crate::xinput::DEVICEID_SLAVE_KEYBOARD)
+        && kbd.other == Some(grab.owner)
+    {
+        kbd.other = None;
+    }
     if let Some(prev) = prev_grab_window {
         let to_win = crate::core_loop::key_fanout::deepest_window_at_pointer(state);
         emit_core_pointer_grab_chain(state, prev, to_win, 2); // NotifyUngrab
@@ -63088,6 +63098,71 @@ mod tests {
             "FocusIn must carry the current pointer X (631), not 0; Xorg \
              populates focus-event coords from the pointer position",
         );
+    }
+
+    /// A sync passive button grab that also froze the keyboard (dtwm's
+    /// front panel: GrabModeSync for both) and is let go by
+    /// `AllowEvents(ReplayPointer)`: Xorg DeactivatePointerGrab clears the
+    /// keyboard's hold with the grab, so typing works again (measured:
+    /// tools/vng-scenarios/goldens/passive-grab.txt, last line).
+    #[test]
+    fn replay_pointer_of_passive_grab_thaws_keyboard_it_froze() {
+        const GRAB_CLIENT_ID: u32 = 1;
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        let _grab_peer = install_client(&mut state, GRAB_CLIENT_ID);
+        state.set_pointer_grab(crate::server::ActivePointerGrab {
+            owner: ClientId(GRAB_CLIENT_ID),
+            grab_window: ROOT_WINDOW,
+            event_mask: 0x0008,
+            cursor: ResourceId(0),
+            time: 0,
+            owner_events: false,
+            via_xi2: false,
+            implicit: false,
+            passive: true,
+            xi2_mask: 0,
+        });
+        crate::core_loop::pointer_fanout::xi1_check_grab_for_syncs(
+            &mut state,
+            crate::xinput::DEVICEID_SLAVE_POINTER,
+            ClientId(GRAB_CLIENT_ID),
+            true,
+            true,
+        );
+        state
+            .xi1_frozen
+            .entry(crate::xinput::DEVICEID_SLAVE_POINTER)
+            .or_default()
+            .state = crate::server::Xi1SyncState::FrozenWithEvent;
+        let kbd_frozen = |state: &ServerState| {
+            state
+                .xi1_frozen
+                .get(&crate::xinput::DEVICEID_SLAVE_KEYBOARD)
+                .is_some_and(crate::server::Xi1Freeze::frozen)
+        };
+        assert!(
+            kbd_frozen(&state),
+            "the grab's sync keyboard mode holds the keyboard"
+        );
+
+        let header = yserver_protocol::x11::RequestHeader {
+            opcode: 35,
+            data: 2, // ReplayPointer
+            length_units: 2,
+        };
+        handle_allow_events(
+            &mut state,
+            &mut backend,
+            ClientId(GRAB_CLIENT_ID),
+            SequenceNumber(1),
+            header,
+            &[0u8; 4],
+        )
+        .expect("allow events replay pointer");
+
+        assert!(state.active_pointer_grab.is_none());
+        assert!(!kbd_frozen(&state), "the keyboard thaws with the grab");
     }
 
     /// Core `AllowEvents(ReplayKeyboard)` (mode 5 — what muffin/mutter

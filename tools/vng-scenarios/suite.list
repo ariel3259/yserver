@@ -36,3 +36,4 @@ child-clip           guest=child-clip.sh             timeout=300
 draw-clip            guest=draw-clip.sh              timeout=300
 legacy-apps          guest=legacy-apps.sh            timeout=400 golden=live
 screensaver          guest=screensaver.sh            timeout=300
+passive-grab         guest=passive-grab.sh           timeout=300
