@@ -63366,8 +63366,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs live Vulkan ICD"]
-    fn c0_conv_ci_legacy_tick_flips_as_before_vulkan() {
+    #[ignore = "takes DRM master on the Vulkan primary card and page-flips it; coordinator hardware run only"]
+    fn c0_conv_ci_legacy_tick_flips_as_before_drm() {
         let mut fixture = super::KmsBackend::for_tests_with_live_kms()
             .expect("environmental skip: no live Vulkan ICD/DRM master available");
         let backend = &mut fixture.backend;
