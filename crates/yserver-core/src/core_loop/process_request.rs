@@ -18415,6 +18415,11 @@ fn handle_xi2_request(
                     i32::from(state.randr.screen_width) / 2,
                     i32::from(state.randr.screen_height) / 2,
                 ),
+                // Xorg ListValuatorInfo reports the master pointer's
+                // current axisVal (Xi/xiquerydevice.c:369). This state is
+                // synchronized from the latest attached source in pointer
+                // fanout, rather than globally accumulating independent
+                // physical-device scroll counters.
                 scroll: state.scroll_axis_value,
             };
             let reply =
@@ -64322,6 +64327,19 @@ mod tests {
             read_all_available(&mut peer).is_empty(),
             "a child selection does not receive the root-only bootstrap"
         );
+        process_xi_dynamic_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT),
+            SequenceNumber(2),
+            XI_SELECT_EVENTS,
+            &xi_dynamic_select_events_body(
+                ROOT_WINDOW.0,
+                crate::xinput::DEVICEID_MASTER_POINTER,
+                crate::xinput::XI2_DEVICE_CHANGED_MASK,
+            ),
+        );
+        let _root_bootstrap = read_all_available(&mut peer);
 
         let dropped = pointer_event_fanout_to_state(
             &mut state,
@@ -64338,28 +64356,45 @@ mod tests {
         );
         assert!(dropped.is_empty());
 
-        let event = read_all_available(&mut peer);
-        assert!(
-            !event.is_empty(),
-            "a child-window DeviceChanged selection receives the source switch"
-        );
-        assert_eq!(event[0], 35, "GenericEvent");
+        let events = read_all_available(&mut peer);
+        let mut delivered = Vec::new();
+        let mut offset = 0;
+        while offset < events.len() {
+            assert_eq!(events[offset], 35, "GenericEvent");
+            let units = usize::try_from(u32::from_le_bytes(
+                events[offset + 4..offset + 8].try_into().unwrap(),
+            ))
+            .unwrap();
+            let event_len = 32 + 4 * units;
+            assert!(
+                offset + event_len <= events.len(),
+                "complete DeviceChanged event"
+            );
+            assert_eq!(
+                u16::from_le_bytes([events[offset + 8], events[offset + 9]]),
+                1,
+                "XI_DeviceChanged SlaveSwitch"
+            );
+            assert_eq!(
+                u16::from_le_bytes([events[offset + 10], events[offset + 11]]),
+                crate::xinput::DEVICEID_MASTER_POINTER
+            );
+            assert_eq!(
+                u16::from_le_bytes([events[offset + 18], events[offset + 19]]),
+                pointer_id,
+                "sourceid is the newly active physical slave"
+            );
+            delivered.push((
+                u16::from_le_bytes([events[offset + 10], events[offset + 11]]),
+                u16::from_le_bytes([events[offset + 18], events[offset + 19]]),
+            ));
+            offset += event_len;
+        }
         assert_eq!(
-            u16::from_le_bytes([event[8], event[9]]),
-            1,
-            "XI_DeviceChanged SlaveSwitch"
+            delivered,
+            [(crate::xinput::DEVICEID_MASTER_POINTER, pointer_id); 2],
+            "Xorg emits one DeviceChanged for root and one for the selected child"
         );
-        assert_eq!(
-            u16::from_le_bytes([event[10], event[11]]),
-            crate::xinput::DEVICEID_MASTER_POINTER
-        );
-        assert_eq!(
-            u16::from_le_bytes([event[18], event[19]]),
-            pointer_id,
-            "sourceid is the newly active physical slave"
-        );
-        let units = usize::try_from(u32::from_le_bytes(event[4..8].try_into().unwrap())).unwrap();
-        assert_eq!(event.len(), 32 + 4 * units);
         assert_eq!(
             state.xi_devices.device(pointer_id).unwrap().attached_master,
             Some(crate::xinput::DEVICEID_MASTER_POINTER)

@@ -1426,6 +1426,8 @@ pub struct ServerState {
     /// on the XIScrollClass entries in the XIQueryDevice reply. GDK
     /// reads the cumulative value off each XI_Motion-with-scroll-
     /// axis event and computes deltas from the previous sample.
+    /// Current XI master-pointer valuator state. Attached-source events
+    /// copy their cumulative scroll values here, matching Xorg's UpdateFromMaster.
     pub scroll_axis_value: [i32; 2],
     /// Buttons held by physical pointer sources whose facets could not be
     /// published because XI device IDs were exhausted. These sources still
