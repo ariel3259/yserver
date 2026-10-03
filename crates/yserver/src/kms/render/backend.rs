@@ -75255,6 +75255,10 @@ mod tests {
         );
     }
 
+    #[allow(
+        dead_code,
+        reason = "the c0_3ci held-fence regression uses the controlled variant"
+    )]
     fn c0_3bi_prepare_unsubmitted_desired_frame(
         backend: &mut super::KmsBackend,
         device: DrmDeviceKey,
@@ -108462,9 +108466,98 @@ mod tests {
         let (mut fixture, device, outputs, _) =
             c0_3ci_live_release_fixture(StubBehaviour::AcceptKernelCalls(1_000), false);
         let backend = &mut fixture.backend;
+        let previous_completion_deadline = backend
+            .platform
+            .owner_ref(device)
+            .expect("Owner device")
+            .completion_deadline_override;
+        c0_3bi_set_owner_completion_deadline_for_tests(
+            backend,
+            device,
+            Some(std::time::Duration::from_secs(30)),
+        );
+        c0_3bi_settle_owner_frame_work_through_core_driver(
+            backend,
+            device,
+            "settle Owner fixture before preparing displaced acquire work",
+            std::time::Duration::from_secs(3),
+        )
+        .expect("initial Owner frame work settles before the acquire subject is prepared");
         let output_key = outputs[0].clone();
-        let (instance, crtc, bo_idx, generation) =
-            c0_3bi_prepare_unsubmitted_desired_frame(backend, device);
+        let instance = backend
+            .scene
+            .output_instance_id_for_tests(0)
+            .expect("the live Owner output instance");
+        let crtc = u32::from(backend.platform.outputs[0].output.crtc);
+        let previous_generation = backend
+            .scene
+            .owner_buffer_identities_for_tests(0)
+            .into_iter()
+            .filter(|identity| identity.output_key == output_key && identity.crtc == crtc)
+            .map(|identity| identity.generation)
+            .max()
+            .unwrap_or(0);
+        backend
+            .admission_conductors
+            .get_mut(&device)
+            .expect("active admission conductor")
+            .lifecycle_admission_closed = true;
+        backend
+            .platform
+            .hold_next_scanout_render_completion_for_tests(
+                instance,
+                ScanoutRenderCompletionStage::Render,
+            );
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        let (bo_idx, generation, waiting) = backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .expect("the dirty Owner scene starts an exact render generation");
+        assert!(waiting, "the exact render is still pending");
+        assert!(generation > previous_generation);
+        let (target_identity, target_state) = backend
+            .scene
+            .owner_buffer_for_generation_anywhere_for_tests(&output_key, bo_idx, generation)
+            .expect("the prepared Rendering generation has a complete identity");
+        assert_eq!(target_state, OwnerBufferState::Rendering);
+        let render_fence = backend
+            .scene
+            .hold_owner_render_fence_for_tests(0, generation)
+            .expect("hold the exact render ticket before the next core poll");
+        backend.platform.wait_idle_bounded();
+        let completion = backend
+            .platform
+            .held_scanout_render_completion_for_tests(
+                instance,
+                ScanoutRenderCompletionStage::Render,
+            )
+            .expect("the held exact render notification is ready");
+        backend
+            .platform
+            .release_scanout_render_completion_for_tests(completion)
+            .expect("make the held exact render notification visible to the core driver");
+        c0_3bi_core_driver_until_before_iteration_tail(
+            backend,
+            "observe the held Desired generation before a successor compose",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend
+                    .scene
+                    .owner_buffer_for_generation_anywhere_for_tests(&output_key, bo_idx, generation)
+                    .is_some_and(|(identity, state)| {
+                        identity == target_identity && state == OwnerBufferState::Desired
+                    })
+            },
+        )
+        .expect("the core entry observes render completion for the held generation");
+        assert_eq!(
+            backend
+                .scene
+                .owner_buffer_for_generation_anywhere_for_tests(&output_key, bo_idx, generation)
+                .map(|(_, state)| state),
+            Some(OwnerBufferState::Desired)
+        );
         let allocations =
             c0_3bi_scanout_allocation_keys(backend, device, &output_key.connector_name);
         assert_eq!(
@@ -108473,17 +108566,19 @@ mod tests {
                 .owner_state_for_generation_for_tests(0, generation),
             Some(OwnerBufferState::Desired)
         );
-        let render_fence = backend
-            .scene
-            .hold_owner_render_fence_for_tests(0, generation)
-            .expect("the queued generation retains its render fence");
-
         let mut state = c0_3ci_core_state(backend);
         c0_3ci_release_owner_to_suspended(
             backend,
             &mut state,
             device,
             "release with a displaced composed frame",
+        );
+        assert_eq!(
+            backend
+                .scene
+                .owner_state_for_generation_for_tests(0, generation),
+            Some(OwnerBufferState::Desired),
+            "VT release leaves the held unsubmitted generation queued until acquire retires its output"
         );
         c0_3ci_acquire_with_scripted_layout_through_core_driver(
             backend,
@@ -108503,8 +108598,10 @@ mod tests {
             "complete acquire with a displaced composed frame",
         );
 
-        c0_3bi_core_driver_until(
+        c0_3cii_drive_owner_work_until(
             backend,
+            &mut state,
+            &[device],
             "retain displaced frame while its render fence is withheld",
             std::time::Duration::from_secs(2),
             &|backend| {
@@ -108512,11 +108609,27 @@ mod tests {
                     .scene
                     .retired_output_end_states_for_tests()
                     .iter()
-                    .any(|bundle| bundle.instance == instance)
+                    .any(|bundle| {
+                        bundle.instance == instance
+                            && bundle.gpu_fence_proofs == 1
+                            && bundle
+                                .owner_buffers
+                                .contains(&(bo_idx, OwnerBufferState::Displaced))
+                            && backend
+                                .scene
+                                .owner_buffer_for_generation_anywhere_for_tests(
+                                    &output_key,
+                                    bo_idx,
+                                    generation,
+                                )
+                                .is_some_and(|(identity, state)| {
+                                    identity == target_identity
+                                        && state == OwnerBufferState::Displaced
+                                })
+                    })
             },
-            None,
         )
-        .expect("the withheld render fence keeps the retired bundle observable");
+        .expect("the held Desired generation remains in the retired bundle");
         let retired = backend
             .scene
             .retired_output_end_states_for_tests()
@@ -108537,7 +108650,10 @@ mod tests {
                 installed_outputs: outputs.clone(),
                 retained_bundles: vec![C0ExpectedRetiredBundle {
                     instance,
-                    proofs: vec![C0RetiredProofKind::GpuFence],
+                    proofs: vec![
+                        C0RetiredProofKind::GpuFence,
+                        C0RetiredProofKind::ResourceProof,
+                    ],
                 }],
                 ..C0EndStateExpectation::default()
             },
@@ -108561,10 +108677,22 @@ mod tests {
                 .resource_service()
                 .is_none_or(|service| !service.contains(key))
         }));
+        c0_3bi_settle_owner_frame_work_through_core_driver(
+            backend,
+            device,
+            "settle successor work after displaced composed work is released",
+            std::time::Duration::from_secs(3),
+        )
+        .expect("successor work settles through core entries after acquire");
         c0_3bi_assert_end_state(
             backend,
             "c0_3ci_acquire_releases_displaced_composed_work_vulkan after signal",
             &c0_3bi_expected_end_state(outputs),
+        );
+        c0_3bi_set_owner_completion_deadline_for_tests(
+            backend,
+            device,
+            previous_completion_deadline,
         );
 
         // A Rendering buffer can reach VT release before its render
@@ -108574,6 +108702,23 @@ mod tests {
         let (mut fixture, device, outputs, _) =
             c0_3ci_live_release_fixture(StubBehaviour::AcceptKernelCalls(1_000), false);
         let backend = &mut fixture.backend;
+        let previous_completion_deadline = backend
+            .platform
+            .owner_ref(device)
+            .expect("Owner device")
+            .completion_deadline_override;
+        c0_3bi_set_owner_completion_deadline_for_tests(
+            backend,
+            device,
+            Some(std::time::Duration::from_secs(30)),
+        );
+        c0_3bi_settle_owner_frame_work_through_core_driver(
+            backend,
+            device,
+            "settle Owner fixture before preparing Rendering retirement",
+            std::time::Duration::from_secs(3),
+        )
+        .expect("initial Owner frame work settles before the Rendering subject is prepared");
         let output_key = outputs[0].clone();
         let instance = backend
             .scene
@@ -108605,6 +108750,11 @@ mod tests {
         );
         let allocations =
             c0_3bi_scanout_allocation_keys(backend, device, &output_key.connector_name);
+        let (target_identity, target_state) = backend
+            .scene
+            .owner_buffer_for_generation_anywhere_for_tests(&output_key, bo_idx, generation)
+            .expect("the prepared Rendering generation has a complete identity");
+        assert_eq!(target_state, OwnerBufferState::Rendering);
         let render_fence = backend
             .scene
             .hold_owner_render_fence_for_tests(0, generation)
@@ -108656,8 +108806,10 @@ mod tests {
             "complete acquire after the render notification was dropped",
         );
 
-        c0_3bi_core_driver_until(
+        c0_3cii_drive_owner_work_until(
             backend,
+            &mut state,
+            &[device],
             "retain Rendering work as Displaced behind its render fence",
             std::time::Duration::from_secs(2),
             &|backend| {
@@ -108665,11 +108817,27 @@ mod tests {
                     .scene
                     .retired_output_end_states_for_tests()
                     .iter()
-                    .any(|bundle| bundle.instance == instance)
+                    .any(|bundle| {
+                        bundle.instance == instance
+                            && bundle.gpu_fence_proofs == 1
+                            && bundle
+                                .owner_buffers
+                                .contains(&(bo_idx, OwnerBufferState::Displaced))
+                            && backend
+                                .scene
+                                .owner_buffer_for_generation_anywhere_for_tests(
+                                    &output_key,
+                                    bo_idx,
+                                    generation,
+                                )
+                                .is_some_and(|(identity, state)| {
+                                    identity == target_identity
+                                        && state == OwnerBufferState::Displaced
+                                })
+                    })
             },
-            None,
         )
-        .expect("the second old instance has a retired bundle");
+        .expect("the held Rendering generation remains in the retired bundle");
         let retired = backend
             .scene
             .retired_output_end_states_for_tests()
@@ -108716,10 +108884,22 @@ mod tests {
                 .resource_service()
                 .is_none_or(|service| !service.contains(key))
         }));
+        c0_3bi_settle_owner_frame_work_through_core_driver(
+            backend,
+            device,
+            "settle successor work after Rendering retirement",
+            std::time::Duration::from_secs(3),
+        )
+        .expect("successor work settles through core entries after Rendering retirement");
         c0_3bi_assert_end_state(
             backend,
             "c0_3ci_acquire_releases_displaced_composed_work_vulkan Rendering after signal",
             &c0_3bi_expected_end_state(outputs),
+        );
+        c0_3bi_set_owner_completion_deadline_for_tests(
+            backend,
+            device,
+            previous_completion_deadline,
         );
     }
 
@@ -113271,6 +113451,46 @@ mod tests {
         let (mut fixture, device, outputs, target_mode) =
             c0_3ci_live_release_fixture(StubBehaviour::AcceptKernelCalls(1_000), false);
         let backend = &mut fixture.backend;
+        let previous_completion_deadline = backend
+            .platform
+            .owner_ref(device)
+            .expect("Owner device")
+            .completion_deadline_override;
+        c0_3bi_set_owner_completion_deadline_for_tests(
+            backend,
+            device,
+            Some(std::time::Duration::from_secs(30)),
+        );
+        c0_3bi_settle_owner_frame_work_through_core_driver(
+            backend,
+            device,
+            "settle Owner frame work before client modeset and VT release",
+            std::time::Duration::from_secs(3),
+        )
+        .expect("initial Owner frame work settles through core entries");
+        let initial_current_resources = backend
+            .commit_consumer
+            .current_resources
+            .iter()
+            .filter(|resources| {
+                resources
+                    .crtcs
+                    .iter()
+                    .any(|member| member.crtc.device_key == device)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            initial_current_resources.len(),
+            1,
+            "the settled Owner fixture has one current framebuffer lease"
+        );
+        assert_eq!(initial_current_resources[0].allocations.len(), 1);
+        let initial_current_commit = initial_current_resources[0].commit_id;
+        let initial_current_allocation = initial_current_resources[0].allocations[0].key();
+        let retired_instance = backend
+            .scene
+            .output_instance_id_for_tests(0)
+            .expect("initial output instance before client modeset");
         let mut state = c0_3ci_core_state(backend);
         let output_id = backend.randr_id_alloc.ids_for(&outputs[0]).output_id;
         backend
@@ -113360,10 +113580,83 @@ mod tests {
             &backend.vt_call_trace_for_tests[backend.vt_call_trace_for_tests.len() - 2..],
             ["drop_master", "vt_reldisp"]
         );
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "drain the retired output after client modeset and VT release",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                !backend
+                    .scene
+                    .retired_output_has_instance_for_tests(retired_instance)
+            },
+            None,
+        )
+        .expect("the initial output instance drains through core entries after release");
+        let current_release_resources = backend
+            .commit_consumer
+            .current_resources
+            .iter()
+            .filter(|resources| {
+                resources
+                    .crtcs
+                    .iter()
+                    .any(|member| member.crtc.device_key == device)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            current_release_resources.len(),
+            1,
+            "VT release retains the one current framebuffer lease from the settled Owner fixture"
+        );
+        assert_eq!(
+            current_release_resources[0].commit_id,
+            initial_current_commit
+        );
+        assert_eq!(current_release_resources[0].crtcs.len(), 1);
+        assert!(
+            current_release_resources[0]
+                .crtcs
+                .iter()
+                .all(|member| member.crtc.device_key == device)
+        );
+        assert_eq!(
+            current_release_resources[0].allocations.len(),
+            1,
+            "the retained current CRTC has one framebuffer allocation"
+        );
+        assert_eq!(
+            current_release_resources[0].allocations[0].key(),
+            initial_current_allocation,
+            "client modeset and VT release leave the exact fixture framebuffer current"
+        );
+        let mut expected = c0_3bi_expected_end_state(outputs.clone());
+        expected.other_live_allocations = vec![initial_current_allocation];
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "settle release and modeset resources through core entries",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend
+                    .platform
+                    .owner_ref(device)
+                    .and_then(|owner| owner.live_record())
+                    .is_none()
+                    && c0_3bi_end_state_errors(backend, &expected).is_empty()
+            },
+            None,
+        )
+        .expect("release and modeset resources settle through core entries");
         c0_3bi_assert_end_state(
             backend,
             "c0_3ci_release_commit_waits_behind_dispatched_modeset_vulkan",
-            &c0_3bi_expected_end_state(outputs),
+            &expected,
+        );
+        c0_3bi_set_owner_completion_deadline_for_tests(
+            backend,
+            device,
+            previous_completion_deadline,
         );
     }
 
@@ -114575,11 +114868,8 @@ mod tests {
         )
         .expect("DPMS-off output remains without an admitted Owner frame");
         assert!(!backend.owner_outputs_powered_on(device));
-        c0_3bi_assert_end_state(
-            backend,
-            "c0_3ci_acquire_honours_dpms_off_vulkan",
-            &c0_3bi_expected_end_state(outputs),
-        );
+        let expected = c0_3bi_expected_end_state(outputs);
+        c0_3bi_assert_end_state(backend, "c0_3ci_acquire_honours_dpms_off_vulkan", &expected);
     }
 
     #[test]
@@ -114724,6 +115014,25 @@ mod tests {
             backend.randr_id_alloc.entry(&output_a)
         );
 
+        let output_a_idx = backend
+            .platform
+            .outputs
+            .iter()
+            .position(|output| output.key == output_a)
+            .expect("reinstalled Owner A output");
+        let output_a_instance = backend
+            .scene
+            .output_instance_id_for_tests(output_a_idx)
+            .expect("reinstalled Owner A scene instance");
+        let output_a_crtc = u32::from(backend.platform.outputs[output_a_idx].output.crtc);
+        let expected = c0_3ci_expected_end_state_with_acquire_preparation(
+            backend,
+            backend
+                .platform
+                .outputs
+                .iter()
+                .map(|output| output.key.clone()),
+        );
         let offers_before = backend.core_driver_composed_offers_for_tests.len();
         backend.scene.mark_scene_structure_dirty();
         c0_3bi_core_driver_until_with_state(
@@ -114734,11 +115043,21 @@ mod tests {
             &|backend| {
                 backend.core_driver_composed_offers_for_tests[offers_before..]
                     .iter()
-                    .any(|(device, _, _, _)| *device == device_a)
+                    .any(|(offered_device, offered_crtc, _, offered_instance)| {
+                        *offered_device == device_a
+                            && *offered_crtc == output_a_crtc
+                            && *offered_instance == output_a_instance
+                    })
                     && backend
                         .platform
                         .owner_ref(device_a)
-                        .is_some_and(|owner| owner.live_record().is_some())
+                        .and_then(|owner| owner.live_record())
+                        .is_some_and(|record| record.milestones().dispatched)
+                    && backend
+                        .platform
+                        .owner_ref(device_b)
+                        .is_some_and(|owner| owner.live_record().is_none())
+                    && c0_3bi_end_state_errors(backend, &expected).is_empty()
             },
             None,
         )
@@ -114749,18 +115068,7 @@ mod tests {
                 .owner_ref(device_b)
                 .is_some_and(|owner| owner.live_record().is_none())
         );
-        c0_3bi_assert_end_state(
-            backend,
-            "c0_3ci_acquire_mixed_success_vulkan",
-            &c0_3ci_expected_end_state_with_acquire_preparation(
-                backend,
-                backend
-                    .platform
-                    .outputs
-                    .iter()
-                    .map(|output| output.key.clone()),
-            ),
-        );
+        c0_3bi_assert_end_state(backend, "c0_3ci_acquire_mixed_success_vulkan", &expected);
     }
 
     #[test]
@@ -115694,6 +116002,8 @@ mod tests {
         let backend = &mut fixture.backend;
         backend.vt_skip_master_ioctls_for_tests = true;
         backend.platform.owner_completion_detached = true;
+        let initial_scanout_allocations =
+            c0_3bi_scanout_allocation_keys(backend, device, &outputs[0].connector_name);
         let mut state = c0_3ci_core_state(backend);
         let mut listener = c0_3aii_install_dpms_core_client(&mut state, 87);
         state.randr_select_masks.insert(
@@ -116154,43 +116464,85 @@ mod tests {
         );
 
         backend.scene.mark_scene_structure_dirty();
+        let reinstalled_output_idx = backend
+            .platform
+            .outputs
+            .iter()
+            .position(|output| output.key.device_key == device)
+            .expect("reinstalled output remains installed");
+        let reinstalled_output_instance = backend
+            .scene
+            .output_instance_id_for_tests(reinstalled_output_idx)
+            .expect("reinstalled scene output instance");
+        let reinstalled_crtc =
+            u32::from(backend.platform.outputs[reinstalled_output_idx].output.crtc);
         c0_3bi_core_driver_until_with_state(
             backend,
             &mut state,
             "compose a frame after the post-supersession acquire",
             Duration::from_secs(5),
             &|backend| {
-                let output_idx = backend
-                    .platform
-                    .outputs
-                    .iter()
-                    .position(|output| output.key.device_key == device);
                 backend.core_driver_composed_offers_for_tests[offers_before_reacquire..]
                     .iter()
-                    .any(|(offered_device, _, _, _)| *offered_device == device)
-                    && output_idx.is_some()
+                    .any(|(offered_device, offered_crtc, _, offered_instance)| {
+                        *offered_device == device
+                            && *offered_crtc == reinstalled_crtc
+                            && *offered_instance == reinstalled_output_instance
+                    })
                     && backend
                         .platform
                         .owner_ref(device)
-                        .is_some_and(|owner| owner.live_record().is_some())
+                        .and_then(|owner| owner.live_record())
+                        .is_some_and(|record| record.milestones().dispatched)
             },
             None,
         )
         .expect("the reinstalled output composes and dispatches a new frame");
+        let output_idx = reinstalled_output_idx;
+        let composed_commit = backend
+            .platform
+            .owner_ref(device)
+            .and_then(|owner| owner.live_record())
+            .filter(|record| record.milestones().dispatched)
+            .expect("the composed frame remains dispatched")
+            .commit_id();
+        let replacement_scanout_allocations = c0_3bi_scanout_allocation_keys(
+            backend,
+            device,
+            &backend.platform.outputs[output_idx].key.connector_name,
+        );
+        let displaced_initial_allocations = initial_scanout_allocations
+            .iter()
+            .copied()
+            .filter(|key| !replacement_scanout_allocations.contains(key))
+            .collect::<Vec<_>>();
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "drain the displaced initial scanout pool while the composed commit remains live",
+            Duration::from_secs(5),
+            &|backend| {
+                backend
+                    .platform
+                    .owner_ref(device)
+                    .and_then(|owner| owner.live_record())
+                    .is_some_and(|record| {
+                        record.commit_id() == composed_commit
+                            && record.milestones().dispatched
+                            && !record.milestones().hardware_complete
+                    })
+                    && c0_3bi_managed_keys_are_absent(backend, &displaced_initial_allocations)
+                    && c0_3bi_end_state_errors(backend, &expected).is_empty()
+            },
+            None,
+        )
+        .expect("the displaced initial pool drains while this composed commit remains in flight");
+        c0_3bi_assert_managed_keys_absent(backend, &displaced_initial_allocations);
         c0_3bi_assert_end_state(
             backend,
             "c0_3ci_release_supersedes_undispatched_acquire_vulkan after composed frame",
             &expected,
         );
-        c0_3bi_core_driver_until_with_state(
-            backend,
-            &mut state,
-            "post-supersession acquire clean end state",
-            Duration::from_secs(5),
-            &|backend| c0_3bi_end_state_errors(backend, &expected).is_empty(),
-            None,
-        )
-        .expect("the later acquire retires all displaced resources cleanly");
         c0_3bi_assert_end_state(
             backend,
             "c0_3ci_release_supersedes_undispatched_acquire_vulkan after reacquire",
