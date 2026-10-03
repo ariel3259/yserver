@@ -638,9 +638,9 @@ pub struct ActivePointerGrab {
     /// this is the event window's MERGED xi2 selection captured at
     /// activation (Xorg ActivateImplicitGrab: xi2mask_merge(tempGrab->
     /// xi2mask, inputMasks->xi2mask), events.c:2183-2189). XIGrabDevice
-    /// sets `u64::MAX` — its wire mask is not parsed (pre-existing
-    /// permissive delivery); core GrabPointer sets 0 (never consulted:
-    /// the XI2 redirect delivers nothing for via_xi2=false grabs).
+    /// snapshots the request's XI2 event-type mask; core GrabPointer sets 0
+    /// (never consulted: the XI2 redirect delivers nothing for via_xi2=false
+    /// grabs).
     pub xi2_mask: u64,
 }
 
