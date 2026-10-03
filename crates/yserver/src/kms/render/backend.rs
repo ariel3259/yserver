@@ -89,6 +89,22 @@ use crate::{
 /// `change_subwindow_attributes`; the bg-pixel is painted into
 /// storage at allocate + configure resize so freshly-mapped windows
 /// have a defined initial colour.
+/// See `input_only_pointer_hosts`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct InputOnlyPointerHost {
+    window: ResourceId,
+    /// Host of the nearest ancestor with a backend window, where the
+    /// cursor walk carries on when no InputOnly window on the way up has
+    /// a cursor.
+    parent_host: u32,
+    /// The first cursor set on the InputOnly windows from `window` up to
+    /// that ancestor.
+    cursor: Option<u32>,
+    /// `window`'s parent-relative origin, which `event_relative_coords`
+    /// subtracts as it does a backend window's (the core adds it back).
+    origin: (i16, i16),
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct WindowGeometry {
     pub(crate) x: i16,
@@ -1682,6 +1698,12 @@ pub struct KmsBackend {
     /// `define_cursor(_, 0)` (X11 `None`) falls back to this; the
     /// scene's `register_cursor` swaps to the entry recorded here.
     pub(crate) default_cursor_xid: Option<u32>,
+    /// InputOnly windows the pointer has reached, by the synthetic host
+    /// xid that stands in for them (they have no backend window). Xorg's
+    /// sprite enters InputOnly windows like any other (`XYToWindow`) and
+    /// shows their cursor; the pointer model here is host-keyed, so each
+    /// gets a host xid mapped back to it in `core.xid_map`.
+    pub(crate) input_only_pointer_hosts: HashMap<u32, InputOnlyPointerHost>,
     /// Xid of the currently-effective cursor — the one whose sprite
     /// is shown on screen. Driven by `update_effective_cursor`;
     /// `define_cursor` + `update_pointer_window` re-evaluate it.
@@ -5450,6 +5472,7 @@ impl KmsBackend {
             cursor_pixmaps: HashMap::new(),
             next_cursor_version: 1,
             default_cursor_xid: None,
+            input_only_pointer_hosts: HashMap::new(),
             effective_cursor_xid: None,
             grab_cursor_override: None,
             cursor_hidden: false,
@@ -5844,6 +5867,13 @@ impl KmsBackend {
         // Bound the walk so a corrupted parent loop can't burn the
         // event loop. windows fits in u32 xids; 64 is generous.
         for _ in 0..64 {
+            if let Some(io) = self.input_only_pointer_hosts.get(&cur) {
+                if let Some(c) = io.cursor {
+                    return Some(c);
+                }
+                cur = io.parent_host;
+                continue;
+            }
             if let Some(geom) = self.windows.get(&cur) {
                 if let Some(c) = geom.cursor {
                     return Some(c);
@@ -6467,6 +6497,7 @@ impl KmsBackend {
             cursor_pixmaps: HashMap::new(),
             next_cursor_version: 1,
             default_cursor_xid: None,
+            input_only_pointer_hosts: HashMap::new(),
             effective_cursor_xid: None,
             grab_cursor_override: None,
             cursor_hidden: false,
@@ -14355,12 +14386,16 @@ impl KmsBackend {
     /// inputs. Falls back to the root container when the cursor resolves to
     /// the root window or the hit window has no host backing.
     #[allow(clippy::cast_possible_truncation)]
-    fn resource_pointer_host_xid(&self, server_state: &ServerState) -> u32 {
+    fn resource_pointer_host_xid(&mut self, server_state: &ServerState) -> u32 {
+        self.prune_input_only_pointer_hosts(server_state);
         let Some((mut resid, _, _)) = server_state
             .root_pointer_target_at(self.core.cursor_x as i16, self.core.cursor_y as i16)
         else {
             return self.core.window_id;
         };
+        if let Some(host) = self.input_only_pointer_host(server_state, resid) {
+            return host;
+        }
         // Walk up to the nearest host-backed window so a non-hosted
         // sub-window resolves to the deepest *hosted* ancestor — matching
         // the granularity of the host walk this replaces, rather than
@@ -14378,6 +14413,103 @@ impl KmsBackend {
             resid = w.parent;
         }
         self.core.window_id
+    }
+
+    /// The synthetic host standing in for `window` when it is an InputOnly
+    /// window with no backend window, allocated on first use. Refreshes the
+    /// entry's parent host and cursor from the core tree.
+    fn input_only_pointer_host(
+        &mut self,
+        server_state: &ServerState,
+        window: ResourceId,
+    ) -> Option<u32> {
+        let w = server_state.resources.window(window)?;
+        if w.class != yserver_core::resources::WindowClass::InputOnly || w.host_xid.is_some() {
+            return None;
+        }
+        let mut cursor = None;
+        let mut parent_host = self.core.window_id;
+        let mut cur = window;
+        for _ in 0..256 {
+            if cur == yserver_core::resources::ROOT_WINDOW {
+                break;
+            }
+            let Some(cw) = server_state.resources.window(cur) else {
+                break;
+            };
+            if let Some(h) = cw.host_xid {
+                parent_host = h.as_raw();
+                break;
+            }
+            if cursor.is_none()
+                && let Some(c) = cw.cursor.filter(|c| c.0 != 0)
+            {
+                cursor = server_state.resources.cursor_host_xid(c);
+            }
+            cur = cw.parent;
+        }
+        let host = self
+            .input_only_pointer_hosts
+            .iter()
+            .find_map(|(h, e)| (e.window == window).then_some(*h))
+            .unwrap_or_else(|| {
+                let h = self.core.next_host_xid();
+                self.core.xid_map.insert(h, window);
+                h
+            });
+        self.input_only_pointer_hosts.insert(
+            host,
+            InputOnlyPointerHost {
+                window,
+                parent_host,
+                cursor,
+                origin: (w.x, w.y),
+            },
+        );
+        Some(host)
+    }
+
+    /// Drop the stand-in hosts of InputOnly windows that are gone (or no
+    /// longer InputOnly without a backend window), as a destroyed window's
+    /// host leaves `xid_map`.
+    fn prune_input_only_pointer_hosts(&mut self, server_state: &ServerState) {
+        let stale: Vec<u32> = self
+            .input_only_pointer_hosts
+            .iter()
+            .filter(|(_, e)| {
+                !server_state.resources.window(e.window).is_some_and(|w| {
+                    w.class == yserver_core::resources::WindowClass::InputOnly
+                        && w.host_xid.is_none()
+                })
+            })
+            .map(|(h, _)| *h)
+            .collect();
+        for h in stale {
+            self.input_only_pointer_hosts.remove(&h);
+            self.core.xid_map.remove(&h);
+        }
+    }
+
+    /// The host a crossing event on `window` is stamped with: its backend
+    /// window, the stand-in of an InputOnly window, else `fallback`.
+    fn crossing_host_for(
+        &mut self,
+        server_state: &ServerState,
+        window: ResourceId,
+        fallback: u32,
+    ) -> u32 {
+        if window == yserver_core::resources::ROOT_WINDOW {
+            return self.core.window_id;
+        }
+        if let Some(h) = server_state
+            .resources
+            .window(window)
+            .and_then(|w| w.host_xid)
+        {
+            return h.as_raw();
+        }
+        self.input_only_pointer_host(server_state, window)
+            .unwrap_or(fallback)
     }
 
     #[allow(dead_code)] // retained for A/B comparison vs the resource-tree producer + unit tests
@@ -14500,9 +14632,14 @@ impl KmsBackend {
     /// coords when `host_xid` isn't tracked (the dispatcher
     /// re-derives target coords from its own tree walk anyway).
     fn event_relative_coords(&self, host_xid: u32) -> (i16, i16) {
-        if let Some(w) = self.windows.get(&host_xid) {
-            let ex = (self.core.cursor_x as i32) - i32::from(w.x);
-            let ey = (self.core.cursor_y as i32) - i32::from(w.y);
+        let origin = self.windows.get(&host_xid).map(|w| (w.x, w.y)).or_else(|| {
+            self.input_only_pointer_hosts
+                .get(&host_xid)
+                .map(|e| e.origin)
+        });
+        if let Some((x, y)) = origin {
+            let ex = (self.core.cursor_x as i32) - i32::from(x);
+            let ey = (self.core.cursor_y as i32) - i32::from(y);
             (
                 ex.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
                 ey.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
@@ -14605,15 +14742,7 @@ impl KmsBackend {
                 from.0, to.0, events.len()
             );
             for ev in events {
-                let win_host_xid = if ev.window == yserver_core::resources::ROOT_WINDOW {
-                    self.core.window_id
-                } else {
-                    server_state
-                        .resources
-                        .window(ev.window)
-                        .and_then(|w| w.host_xid.map(|h| h.as_raw()))
-                        .unwrap_or(new_xid)
-                };
+                let win_host_xid = self.crossing_host_for(server_state, ev.window, new_xid);
                 let kind = match ev.kind {
                     yserver_core::crossings::CrossingKind::Enter => PointerEventKind::EnterNotify,
                     yserver_core::crossings::CrossingKind::Leave => PointerEventKind::LeaveNotify,
@@ -14934,11 +15063,15 @@ impl KmsBackend {
             let events =
                 yserver_core::crossings::implicit_grab_crossings(server_state, focus, grab);
             for ev in events {
-                let win_host_xid = server_state
-                    .resources
-                    .window(ev.window)
-                    .and_then(|w| w.host_xid.map(|h| h.as_raw()))
-                    .unwrap_or(host_xid);
+                let win_host_xid = if ev.window == yserver_core::resources::ROOT_WINDOW {
+                    server_state
+                        .resources
+                        .window(ev.window)
+                        .and_then(|w| w.host_xid.map(|h| h.as_raw()))
+                        .unwrap_or(host_xid)
+                } else {
+                    self.crossing_host_for(server_state, ev.window, host_xid)
+                };
                 let kind = match ev.kind {
                     yserver_core::crossings::CrossingKind::Enter => PointerEventKind::EnterNotify,
                     yserver_core::crossings::CrossingKind::Leave => PointerEventKind::LeaveNotify,
@@ -29358,6 +29491,10 @@ impl Backend for KmsBackend {
             .prev_pointer_window
             .get_or_insert(self.core.window_id);
         if prev == host_xid {
+            // The window under the pointer is the same, but an InputOnly
+            // window's cursor (kept here, not by `define_cursor`) may
+            // have changed.
+            self.refresh_effective_cursor();
             return;
         }
         let mask = self.serialize_modifiers() | self.core.button_mask;
@@ -53132,6 +53269,115 @@ mod tests {
         window: yserver_protocol::x11::ResourceId,
     ) {
         dispatch_raw(state, b, opcode, 0, &window.0.to_le_bytes());
+    }
+
+    /// An InputOnly child (no backend window) of `A` at (100,20) 40x40
+    /// with a cursor: the pointer enters it, shows its cursor and clicks
+    /// on it, as on Xorg (tools/vng-scenarios/goldens/cursor.txt: dtwm's
+    /// frame resize handles are such windows).
+    #[test]
+    fn pointer_enters_input_only_window_and_shows_its_cursor() {
+        use yserver_core::{backend::Backend, core_loop::message::HostInputEvent};
+        use yserver_protocol::x11::{ClientId, CreateWindowRequest, ResourceId};
+        const ONLY: ResourceId = ResourceId(0x0010_0a07);
+        const CURSOR: ResourceId = ResourceId(0x0010_0a08);
+        const CURSOR_HOST: u32 = 0x00ab_0001;
+        let (mut state, mut b, mut peer) = tree_crossing_fixture();
+        tree_request(&mut state, &mut b, 8, TREE_A);
+        state.resources.create_glyph_cursor(ClientId(14), CURSOR);
+        state.resources.set_cursor_host_xid(
+            CURSOR,
+            yserver_core::backend::CursorHandle::from_raw(CURSOR_HOST).unwrap(),
+        );
+        state.resources.create_window(
+            ClientId(14),
+            CreateWindowRequest {
+                window: ONLY,
+                parent: TREE_A,
+                x: 100,
+                y: 20,
+                width: 40,
+                height: 40,
+                class: 2,
+                cursor: Some(CURSOR),
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(ONLY);
+        state
+            .clients
+            .get_mut(&14)
+            .unwrap()
+            .event_masks
+            .insert(ONLY, 0x0000_003c);
+        b.core.cursor_x = 180.0;
+        b.core.cursor_y = 150.0;
+        b.windows_restructured(&mut state);
+        let _ = tree_events(&mut peer);
+        let root_cursor = b.effective_cursor_xid;
+
+        let motion = |x: i32, y: i32| HostInputEvent::PointerMotion {
+            x,
+            y,
+            time: 0,
+            relative: false,
+            dx: 0,
+            dy: 0,
+        };
+        b.on_host_input(&mut state, motion(120, 40));
+        assert_eq!(
+            tree_events(&mut peer),
+            [
+                "Leave A Inferior child=None mode=0",
+                "Enter 0x100a07 Ancestor child=None mode=0",
+            ],
+        );
+        assert_eq!(b.effective_cursor_xid, Some(CURSOR_HOST));
+
+        b.on_host_input(
+            &mut state,
+            HostInputEvent::PointerButton {
+                button: 0x110,
+                pressed: true,
+                time: 0,
+            },
+        );
+        let press = kbd_map_drain(&mut peer);
+        let press = press
+            .chunks(32)
+            .find(|e| e[0] & 0x7f == 4)
+            .expect("ButtonPress");
+        assert_eq!(
+            &press[12..16],
+            &ONLY.0.to_le_bytes(),
+            "on the InputOnly window"
+        );
+        assert_eq!(
+            (
+                i16::from_le_bytes([press[24], press[25]]),
+                i16::from_le_bytes([press[26], press[27]])
+            ),
+            (20, 20),
+            "event coordinates relative to it"
+        );
+        b.on_host_input(
+            &mut state,
+            HostInputEvent::PointerButton {
+                button: 0x110,
+                pressed: false,
+                time: 0,
+            },
+        );
+
+        b.on_host_input(&mut state, motion(180, 150));
+        assert_eq!(
+            tree_events(&mut peer),
+            [
+                "Leave 0x100a07 Ancestor child=None mode=0",
+                "Enter A Inferior child=None mode=0"
+            ],
+        );
+        assert_eq!(b.effective_cursor_xid, root_cursor);
     }
 
     /// Xvfb, pointer still at the centre: MapWindow of a window under it

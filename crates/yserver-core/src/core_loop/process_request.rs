@@ -24256,6 +24256,11 @@ fn handle_change_window_attributes(
         };
         if let (Some(hw), Some(ch)) = (host_window_raw, cursor_host_xid) {
             let _ = backend.define_cursor(origin, hw, ch);
+        } else if host_window_raw.is_none() {
+            // No backend window (InputOnly): the backend reads the cursor
+            // from the tree when it re-resolves the window under the
+            // pointer.
+            backend.windows_restructured(state);
         }
     }
     debug!(
