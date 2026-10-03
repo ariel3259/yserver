@@ -135,9 +135,10 @@ pub(crate) fn device_changed_class_block(
 }
 
 /// Emit an XI2 `XI_DeviceChanged` event on `id`, using the classes and
-/// source identity of `sourceid`. Selection is on the root window for the
+/// source identity of `sourceid`. Selection may be on any window for the
 /// exact event device, XIAllDevices, or XIAllMasterDevices when `id` is a
-/// master. Returns clients whose output buffers overflowed.
+/// master, matching Xorg's `SendEventToAllWindows` (Xi/exevents.c:760).
+/// Returns clients whose output buffers overflowed.
 pub fn emit_xi2_device_changed(
     state: &mut ServerState,
     id: u16,
@@ -158,14 +159,10 @@ pub fn emit_xi2_device_changed(
         .clients
         .iter()
         .filter_map(|(client_id, client)| {
-            let selected = client
-                .xi2_masks
-                .iter()
-                .any(|(&(window, device_id), &mask)| {
-                    window == crate::resources::ROOT_WINDOW
-                        && (device_id == id || device_id == 0 || (is_master && device_id == 1))
-                        && (mask & XI_DEVICE_CHANGED_MASK_WIDE) != 0
-                });
+            let selected = client.xi2_masks.iter().any(|(&(_, device_id), &mask)| {
+                (device_id == id || device_id == 0 || (is_master && device_id == 1))
+                    && (mask & XI_DEVICE_CHANGED_MASK_WIDE) != 0
+            });
             selected.then_some(ClientId(*client_id))
         })
         .collect();
@@ -252,10 +249,11 @@ pub fn emit_xi_hierarchy_changed(
     );
 
     for device in state.xi_devices.devices() {
+        let (use_, attachment) = hierarchy_descriptor(state, device.id);
         infos.push(x11::XiHierarchyInfo {
             device_id: device.id,
-            attachment: state.xi_devices.attachment(device.id).unwrap_or(0),
-            use_: hierarchy_use(state.xi_devices.role(device.id)),
+            attachment,
+            use_,
             enabled: device.enabled,
             flags: if changed.contains(&device.id) {
                 step_flag
@@ -312,12 +310,26 @@ pub fn emit_xi_hierarchy_changed(
     })
 }
 
-fn hierarchy_use(role: Option<XiDeviceRole>) -> u8 {
-    match role {
-        Some(XiDeviceRole::MasterPointer) => 1,  // XIMasterPointer
-        Some(XiDeviceRole::MasterKeyboard) => 2, // XIMasterKeyboard
-        Some(XiDeviceRole::SlavePointer) => 3,   // XISlavePointer
-        Some(XiDeviceRole::SlaveKeyboard) => 4,  // XISlaveKeyboard
-        None => 0,
+/// Return the same use/attachment pair as Xorg's GetDeviceUse
+/// (Xi/xiquerydevice.c:518-529), shared by XIQueryDevice and hierarchy data.
+fn hierarchy_descriptor(state: &ServerState, device_id: u16) -> (u8, u16) {
+    match state.xi_devices.role(device_id) {
+        Some(XiDeviceRole::MasterPointer) => (
+            1, // XIMasterPointer
+            crate::xinput::DEVICEID_MASTER_KEYBOARD,
+        ),
+        Some(XiDeviceRole::MasterKeyboard) => (
+            2, // XIMasterKeyboard
+            crate::xinput::DEVICEID_MASTER_POINTER,
+        ),
+        Some(XiDeviceRole::SlavePointer) => state
+            .xi_devices
+            .attachment(device_id)
+            .map_or((5, 0), |master| (3, master)), // XISlavePointer / XIFloatingSlave
+        Some(XiDeviceRole::SlaveKeyboard) => state
+            .xi_devices
+            .attachment(device_id)
+            .map_or((5, 0), |master| (4, master)), // XISlaveKeyboard / XIFloatingSlave
+        None => (0, 0),
     }
 }

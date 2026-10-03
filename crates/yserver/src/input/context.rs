@@ -612,20 +612,17 @@ impl Context {
     }
 
     /// Route a decoded `xinput set-prop` / KCM `XIChangeProperty` write
-    /// through to the live libinput device it targets, keyed by the XI
-    /// device's `device_node`. Config is per-device (as on Xorg, where each
-    /// physical pointer is its own XI slave): a write to the mouse must not
-    /// touch a touchpad, so this applies ONLY to the matching device.
+    /// through to the live libinput device for its `InputSourceId`. The XI
+    /// pointer facet identifies that source; configuration stays per physical
+    /// source so a write to a mouse cannot touch a touchpad.
     ///
     /// Each physical pointer has its own registry-assigned XI facet and
-    /// configuration. The reserved XTEST pointer (id 4) is not the owner of
-    /// a libinput source; a write reaches only the source matching the
-    /// selected facet's device node.
+    /// configuration. The reserved XTEST pointer (id 4) has no libinput
+    /// source ID, so it cannot name a physical configuration target.
     ///
-    /// Returns `Ok(())` when no matching device is stashed for
-    /// `device_node` (an unplugged / non-real-pointer target is a no-op; the
-    /// property registry stays writable and the X11 reply path doesn't
-    /// surface a "device gone" error to clients).
+    /// Returns [`DeviceConfigError::SourceGone`] when the source ID no longer
+    /// has a live pointer handle. The input thread may retain a request across
+    /// a confirmed resume; a removed source completes with `SourceGone`.
     ///
     /// Errors map libinput's [`input::DeviceConfigError`] onto the
     /// X-layer's [`DeviceConfigError`]: `Unsupported` → BadMatch,
@@ -637,6 +634,8 @@ impl Context {
     /// Returns [`DeviceConfigError::Unsupported`] when libinput
     /// reports the setting isn't available on this device, or
     /// [`DeviceConfigError::Invalid`] when the value is out of range.
+    /// Returns [`DeviceConfigError::SourceGone`] when `source` has no live
+    /// pointer handle.
     pub fn apply_device_config(
         &mut self,
         source: InputSourceId,

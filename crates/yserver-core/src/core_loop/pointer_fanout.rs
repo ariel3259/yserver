@@ -2119,17 +2119,17 @@ fn pointer_event_fanout_to_state_inner(
                 }
             });
             let focus = state.crossing_has_focus(ev_win);
+            // Xorg snapshots the slave's `axisVal` into DeviceChanged
+            // (dix/getevents.c:265-286), then copies the slave event to its
+            // master (mi/mieq.c:422-425). Keep both XI forms on that same
+            // source counter so a source switch cannot create a false delta.
             let scroll_value = scroll_axis_info.map(|(_, axis_idx)| {
-                if deviceid == XI2_MASTER_POINTER_DEVICE_ID {
-                    state.scroll_axis_value[axis_idx]
-                } else {
-                    state
-                        .xi_devices
-                        .device(deviceid)
-                        .map_or(state.scroll_axis_value[axis_idx], |device| {
-                            device.scroll_axis_values[axis_idx]
-                        })
-                }
+                xi_source
+                    .slave_deviceid
+                    .and_then(|source_id| state.xi_devices.device(source_id))
+                    .map_or(state.scroll_axis_value[axis_idx], |device| {
+                        device.scroll_axis_values[axis_idx]
+                    })
             });
             let extras =
                 fanout_event_to_clients(state, std::slice::from_ref(cid), |buf, seq, order| {
@@ -4860,6 +4860,161 @@ mod tests {
             ],
             "each source retains its own valuator state"
         );
+    }
+
+    #[test]
+    fn xi_slave_switch_master_scroll_value_uses_the_current_source_baseline() {
+        use crate::core_loop::InputOrigin;
+
+        const RAZER: u64 = 0xA61;
+        const HYPERX: u64 = 0xA62;
+        const XI_BUTTON_PRESS: u32 = 1 << 4;
+        const XI_MOTION: u32 = 1 << 6;
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        let mut peer = install_capture_client(&mut state, 92);
+        let razer = pointer_source(&mut state, RAZER, true);
+        let hyperx = pointer_source(&mut state, HYPERX, true);
+        let mut selection = Vec::new();
+        selection.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        selection.extend_from_slice(&1u16.to_le_bytes());
+        selection.extend_from_slice(&[0; 2]);
+        selection.extend_from_slice(&2u16.to_le_bytes()); // master pointer
+        selection.extend_from_slice(&1u16.to_le_bytes()); // one mask word
+        selection.extend_from_slice(
+            &(crate::xinput::XI2_DEVICE_CHANGED_MASK | XI_BUTTON_PRESS | XI_MOTION).to_le_bytes(),
+        );
+        crate::core_loop::process_request::process_request(
+            &mut state,
+            &mut backend,
+            yserver_protocol::x11::ClientId(92),
+            yserver_protocol::x11::SequenceNumber(1),
+            yserver_protocol::x11::RequestHeader {
+                opcode: 137,
+                data: 46, // XISelectEvents
+                length_units: 5,
+            },
+            &selection,
+            None,
+        )
+        .expect("select master DeviceChanged, ButtonPress, and Motion events");
+
+        for time in 1..=10 {
+            for kind in [
+                PointerEventKind::ButtonPress,
+                PointerEventKind::ButtonRelease,
+            ] {
+                let dropped = pointer_event_fanout_to_state(
+                    &mut state,
+                    &mut backend,
+                    &HostXidMap::new(),
+                    source_button_event(
+                        kind,
+                        InputOrigin::Physical(crate::xinput::InputSourceId(RAZER)),
+                        5,
+                        time,
+                    ),
+                    true,
+                    false,
+                );
+                assert!(dropped.is_empty());
+            }
+            let _ = read_all_capture_available(&mut peer);
+        }
+
+        assert_eq!(state.scroll_axis_value, [10, 0]);
+        assert_eq!(
+            state.xi_devices.device(razer).unwrap().scroll_axis_values,
+            [10, 0]
+        );
+        assert_eq!(
+            state.xi_devices.device(hyperx).unwrap().scroll_axis_values,
+            [0, 0]
+        );
+
+        let dropped = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &HostXidMap::new(),
+            source_button_event(
+                PointerEventKind::ButtonPress,
+                InputOrigin::Physical(crate::xinput::InputSourceId(HYPERX)),
+                5,
+                11,
+            ),
+            true,
+            false,
+        );
+        assert!(dropped.is_empty());
+        let bytes = read_all_capture_available(&mut peer);
+
+        let mut switch_baseline = None;
+        let mut offset = 0;
+        while offset < bytes.len() {
+            assert_eq!(bytes[offset], 35, "XI2 GenericEvent");
+            let units =
+                u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
+            let evtype = u16::from_le_bytes([bytes[offset + 8], bytes[offset + 9]]);
+            if evtype == 1 {
+                let num_classes =
+                    u16::from_le_bytes([bytes[offset + 16], bytes[offset + 17]]) as usize;
+                let mut class_offset = offset + 32;
+                for _ in 0..num_classes {
+                    let class_type =
+                        u16::from_le_bytes([bytes[class_offset], bytes[class_offset + 1]]);
+                    let class_units =
+                        u16::from_le_bytes([bytes[class_offset + 2], bytes[class_offset + 3]])
+                            as usize;
+                    let source_id =
+                        u16::from_le_bytes([bytes[class_offset + 4], bytes[class_offset + 5]]);
+                    let axis =
+                        u16::from_le_bytes([bytes[class_offset + 6], bytes[class_offset + 7]]);
+                    if class_type == 2 && source_id == hyperx && axis == 2 {
+                        switch_baseline = Some(i32::from_le_bytes(
+                            bytes[class_offset + 28..class_offset + 32]
+                                .try_into()
+                                .unwrap(),
+                        ));
+                    }
+                    class_offset += class_units * 4;
+                }
+                assert_eq!(class_offset, offset + 32 + units * 4);
+            }
+            offset += 32 + units * 4;
+        }
+        assert_eq!(switch_baseline, Some(0));
+        assert_eq!(
+            xi2_scroll_values(&bytes),
+            vec![(2, hyperx, 1)],
+            "the master event advances from the switching slave's baseline"
+        );
+        let dropped = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &HostXidMap::new(),
+            source_button_event(
+                PointerEventKind::ButtonRelease,
+                InputOrigin::Physical(crate::xinput::InputSourceId(HYPERX)),
+                5,
+                12,
+            ),
+            true,
+            false,
+        );
+        assert!(dropped.is_empty());
+        let _ = read_all_capture_available(&mut peer);
+        assert_eq!(state.scroll_axis_value, [11, 0]);
+        assert_eq!(
+            state.xi_devices.device(razer).unwrap().scroll_axis_values,
+            [10, 0]
+        );
+        assert_eq!(
+            state.xi_devices.device(hyperx).unwrap().scroll_axis_values,
+            [1, 0]
+        );
+        assert_eq!(state.buttons_down, 0);
+        assert!(state.sync_pending.is_empty());
+        assert!(state.unpublished_pointer_buttons_down.is_empty());
     }
 
     #[test]
