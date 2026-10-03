@@ -11974,10 +11974,44 @@ impl KmsBackend {
                 .flat_map(|held| held.keys().copied())
                 .collect();
             for keycode in &down_keys {
-                xkb_state.update_key(
-                    xkbcommon::xkb::Keycode::new(u32::from(*keycode)),
-                    xkbcommon::xkb::KeyDirection::Down,
-                );
+                let xkb_keycode = xkbcommon::xkb::Keycode::new(u32::from(*keycode));
+                let keymap = &self.core.xkb_keymap.0;
+                let lock_action_key = (0..keymap.num_layouts_for_key(xkb_keycode)).any(|layout| {
+                    (0..keymap.num_levels_for_key(xkb_keycode, layout)).any(|level| {
+                        keymap
+                            .key_get_syms_by_level(xkb_keycode, layout, level)
+                            .iter()
+                            .any(|keysym| {
+                                matches!(
+                                    keysym.raw(),
+                                    xkbcommon::xkb::keysyms::KEY_Caps_Lock
+                                        | xkbcommon::xkb::keysyms::KEY_Shift_Lock
+                                        | xkbcommon::xkb::keysyms::KEY_Num_Lock
+                                        | xkbcommon::xkb::keysyms::KEY_Scroll_Lock
+                                        | xkbcommon::xkb::keysyms::KEY_ISO_Lock
+                                        | xkbcommon::xkb::keysyms::KEY_ISO_Level3_Lock
+                                        | xkbcommon::xkb::keysyms::KEY_ISO_Level5_Lock
+                                        | xkbcommon::xkb::keysyms::KEY_ISO_Group_Lock
+                                        | xkbcommon::xkb::keysyms::KEY_ISO_Next_Group_Lock
+                                        | xkbcommon::xkb::keysyms::KEY_ISO_Prev_Group_Lock
+                                        | xkbcommon::xkb::keysyms::KEY_ISO_First_Group_Lock
+                                        | xkbcommon::xkb::keysyms::KEY_ISO_Last_Group_Lock
+                                )
+                            })
+                    })
+                });
+                if lock_action_key {
+                    // The master's copied locked state already includes the
+                    // held lock key's action. Xorg retains that key's action
+                    // filter across DetachFromMaster (xkb/xkbActions.c:372;
+                    // dix/events.c:1463-1471); replaying a second lock press
+                    // here makes libxkbcommon clear the inherited lock when
+                    // the floating device later receives the release. Keep
+                    // it in `down_keys` for duplicate suppression and bitmap
+                    // handling, but do not replay its action into this state.
+                    continue;
+                }
+                xkb_state.update_key(xkb_keycode, xkbcommon::xkb::KeyDirection::Down);
             }
             self.floating_keyboard_states.insert(
                 device_id,
@@ -20463,37 +20497,7 @@ impl Backend for KmsBackend {
                 if state.xi_devices.source(source_id).is_none() {
                     return;
                 }
-                let was_enabled = state
-                    .xi_devices
-                    .source(source_id)
-                    .is_some_and(|info| info.enabled);
                 self.release_device_state(state, source_id);
-                if !was_enabled {
-                    let disabled_ids: Vec<u16> = [
-                        state
-                            .xi_devices
-                            .facet(source_id, yserver_core::xinput::XiFacetKind::Keyboard),
-                        state
-                            .xi_devices
-                            .facet(source_id, yserver_core::xinput::XiFacetKind::PointerTouch),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .collect();
-                    for id in &disabled_ids {
-                        let _dropped = yserver_core::xinput::hotplug::emit_xi1_device_presence(
-                            state,
-                            *id,
-                            yserver_core::xinput::hotplug::DevicePresenceChange::Disabled,
-                        );
-                    }
-                    let _dropped = yserver_core::xinput::hotplug::emit_xi_hierarchy_changed(
-                        state,
-                        yserver_core::xinput::hotplug::XiHierarchyStep::DeviceDisabled,
-                        &disabled_ids,
-                        &[],
-                    );
-                }
                 let removed_ids = state.xi_unregister_source(source_id);
                 let removed = state.take_xi_removed_device_descriptors();
                 for id in &removed_ids {
@@ -30319,11 +30323,10 @@ mod tests {
         let unmatched_removed = read_events(&mut selected);
         assert_eq!(
             unmatched_removed.len(),
-            2,
-            "ordinary removal is Disabled/Removed"
+            1,
+            "removing an already-suspended device emits Removed only"
         );
-        assert_eq!(event_info(&unmatched_removed[0], 6), (3, 4, 0, 1 << 7));
-        assert_eq!(event_info(&unmatched_removed[1], 6), (0, 0, 0, 1 << 3));
+        assert_eq!(event_info(&unmatched_removed[0], 6), (0, 0, 0, 1 << 3));
         assert!(state.xi_devices.source(unmatched_source).is_none());
 
         let fresh_source = InputSourceId(source.0 + 2);
@@ -30727,6 +30730,72 @@ mod tests {
         assert!(state.active_keyboard_grab.is_none());
         assert!(state.clients[&1].outbound.is_empty());
         assert!(drain(&mut peer).is_empty());
+
+        // A physical unplug can arrive after VT suspension already emitted
+        // Disabled. Removal then emits Removed only; Xorg DisableDevice
+        // returns without another transition for an already-disabled
+        // device (dix/devices.c:468-469).
+        let suspended_source = InputSourceId(0x1632);
+        let mut suspended_info = info.clone();
+        suspended_info.source_id = suspended_source;
+        suspended_info.name = "removed while suspended".to_owned();
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceAdded(suspended_info),
+        );
+        assert_eq!(
+            transitions(&drain(&mut peer)),
+            vec![(0, 0), (1, 1 << 2), (0, 2), (1, 1 << 6)],
+            "a replacement mouse starts with Added then Enabled",
+        );
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceSuspended {
+                source_id: suspended_source,
+            },
+        );
+        assert_eq!(
+            transitions(&drain(&mut peer)),
+            vec![(0, 3), (1, 1 << 7)],
+            "VT suspension reports Disabled once",
+        );
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceRemoved {
+                source_id: suspended_source,
+            },
+        );
+        assert_eq!(
+            transitions(&drain(&mut peer)),
+            vec![(0, 1), (1, 1 << 3)],
+            "removal of an already-suspended mouse reports Removed only",
+        );
+        assert!(state.xi_devices.source(suspended_source).is_none());
+        assert!(
+            state
+                .xi_devices
+                .facet(
+                    suspended_source,
+                    yserver_core::xinput::XiFacetKind::PointerTouch
+                )
+                .is_none()
+        );
+        assert!(state.xi2_pointer_grabs.is_empty());
+        assert!(state.xi2_keyboard_grabs.is_empty());
+        assert!(state.xi2_detached_masters.is_empty());
+        assert!(state.xi1_frozen.is_empty());
+        assert!(state.sync_pending.is_empty());
+        assert!(state.key_down_by_device.is_empty());
+        assert!(state.unpublished_keyboard_keys_down.is_empty());
+        assert!(state.unpublished_pointer_buttons_down.is_empty());
+        assert_eq!(state.buttons_down, 0);
+        assert!(backend.core.down_keys.is_empty());
+        assert_eq!(backend.core.button_mask, 0);
+        assert!(state.clients[&1].outbound.is_empty());
+        assert!(drain(&mut peer).is_empty());
     }
 
     #[test]
@@ -30943,6 +31012,1076 @@ mod tests {
         assert!(state.key_down_by_device.is_empty());
         assert!(state.unpublished_pointer_buttons_down.is_empty());
         assert_eq!(state.buttons_down, 0);
+    }
+
+    #[test]
+    fn xi_dynamic_master_motion_only_grab_gets_input_thread_wheel_motion() {
+        use yserver_core::{
+            backend::Backend,
+            core_loop::{DeviceInfo, HostInputEvent, process_request},
+            resources::ROOT_WINDOW,
+            server::ServerState,
+            xinput::{InputCapabilities, InputSourceId, XiFacetKind},
+        };
+        use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
+
+        const CLIENT: u32 = 0xA729;
+        const SOURCE: InputSourceId = InputSourceId(0xA7291);
+        const XI_MOTION: u32 = 1 << 6;
+
+        let mut backend = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        backend
+            .core
+            .xid_map
+            .insert(backend.core.window_id, ROOT_WINDOW);
+        let mut peer = kbd_map_client_id(&mut state, CLIENT);
+        let send_request =
+            |state: &mut ServerState, backend: &mut KmsBackend, sequence, minor, body: &[u8]| {
+                process_request::process_request(
+                    state,
+                    backend,
+                    ClientId(CLIENT),
+                    SequenceNumber(sequence),
+                    RequestHeader {
+                        opcode: 137,
+                        data: minor,
+                        length_units: u32::try_from((body.len() + 4) / 4).unwrap(),
+                    },
+                    body,
+                    None,
+                )
+                .expect("production XI2 request")
+            };
+
+        send_request(&mut state, &mut backend, 1, 47, &[2, 0, 3, 0]);
+        assert_eq!(kbd_map_drain(&mut peer)[0], 1, "XIQueryVersion reply");
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceAdded(DeviceInfo {
+                source_id: SOURCE,
+                enabled: true,
+                resume_key: None,
+                capabilities: InputCapabilities {
+                    keyboard: false,
+                    pointer: true,
+                    touch: false,
+                },
+                name: "one physical wheel mouse".to_owned(),
+                device_node: "/dev/input/event-one-mouse".to_owned(),
+                sysname: "event-one-mouse".to_owned(),
+                vendor_id: 1,
+                product_id: 1,
+                is_touchpad: false,
+                config: Default::default(),
+            }),
+        );
+        let pointer_id = state
+            .xi_devices
+            .facet(SOURCE, XiFacetKind::PointerTouch)
+            .expect("the sole physical mouse has one slave pointer");
+
+        let mut grab = Vec::with_capacity(20);
+        grab.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        grab.extend_from_slice(&0u32.to_le_bytes()); // current time
+        grab.extend_from_slice(&0u32.to_le_bytes()); // no cursor
+        grab.extend_from_slice(&2u16.to_le_bytes()); // master pointer
+        grab.extend_from_slice(&[1, 1, 0, 0]); // async modes, owner_events=false
+        grab.extend_from_slice(&1u16.to_le_bytes()); // one mask word
+        grab.extend_from_slice(&XI_MOTION.to_le_bytes());
+        send_request(&mut state, &mut backend, 2, 51, &grab);
+        assert_eq!(kbd_map_drain(&mut peer)[0], 1, "XIGrabDevice reply");
+        assert!(state.active_pointer_grab.is_some_and(|grab| {
+            grab.owner == ClientId(CLIENT) && grab.xi2_mask == u64::from(XI_MOTION)
+        }));
+        assert_eq!(
+            state.xi_devices.device(pointer_id).unwrap().attached_master,
+            Some(2)
+        );
+
+        let (_poll, sender, receiver) = yserver_core::core_loop::channel().expect("input channel");
+        let mut input_thread = crate::input_thread::LibinputThreadState::new(800, 600);
+        let mut pending_motion = None;
+        crate::input_thread::process_batch(
+            &mut input_thread,
+            &sender,
+            &mut pending_motion,
+            [
+                crate::input::InputEvent::PointerMotion {
+                    source_id: SOURCE,
+                    dx: 2.0,
+                    dy: 1.0,
+                },
+                crate::input::InputEvent::PointerScroll {
+                    source_id: SOURCE,
+                    dx_v120: 0,
+                    dy_v120: 120,
+                },
+            ],
+            7,
+        )
+        .expect("input-thread production scroll conversion");
+        let messages: Vec<_> = receiver.try_recv_all().collect();
+        assert_eq!(
+            messages.len(),
+            3,
+            "motion then a button-5 press/release pair"
+        );
+        let inputs: Vec<HostInputEvent> = messages
+            .into_iter()
+            .map(|message| match message {
+                yserver_core::core_loop::Message::HostInput(input) => input,
+                other => panic!("unexpected input-thread message: {other:?}"),
+            })
+            .collect();
+        assert!(matches!(
+            inputs.as_slice(),
+            [
+                HostInputEvent::PointerMotion { .. },
+                HostInputEvent::PointerButton {
+                    button: 0x181,
+                    pressed: true,
+                    ..
+                },
+                HostInputEvent::PointerButton {
+                    button: 0x181,
+                    pressed: false,
+                    ..
+                }
+            ]
+        ));
+
+        let mut output = Vec::new();
+        for input in inputs {
+            Backend::on_host_input(&mut backend, &mut state, input);
+            output.push(kbd_map_drain(&mut peer));
+        }
+        let ordinary_motion = xi2_events(&output[0]);
+        let wheel_motion = xi2_events(&output[1]);
+        let wheel_release = xi2_events(&output[2]);
+
+        assert_eq!(ordinary_motion.len(), 1);
+        assert_eq!(
+            ordinary_motion[0].0, 6,
+            "ordinary pointer motion is delivered"
+        );
+        assert_eq!(ordinary_motion[0].1, 2, "master grab keeps master identity");
+        // Xorg getevents.c:1747 changes the scroll event's type to MotionNotify
+        // before the active-grab event-mask filter runs.
+        assert_eq!(
+            wheel_motion.len(),
+            1,
+            "motion-only grab receives wheel Motion"
+        );
+        assert_eq!(wheel_motion[0].0, 6);
+        assert_eq!(wheel_motion[0].1, 2);
+        assert_eq!(wheel_motion[0].2, pointer_id);
+        assert!(
+            wheel_release.is_empty(),
+            "Motion-only grab has no ButtonRelease"
+        );
+        assert!(
+            state.active_pointer_grab.is_some(),
+            "master grab stays active"
+        );
+        assert_eq!(
+            state.xi_devices.device(pointer_id).unwrap().attached_master,
+            Some(2)
+        );
+        assert_eq!(state.xi_devices.device(pointer_id).unwrap().buttons_down, 0);
+        assert_eq!(state.buttons_down, 0);
+        assert!(state.sync_pending.is_empty());
+        assert!(!state.xi1_frozen[&2].frozen());
+    }
+
+    #[test]
+    fn xi_dynamic_owner_events_grab_fallback_preserves_slave_button_and_motion_identity() {
+        use yserver_core::{
+            backend::Backend,
+            core_loop::{DeviceInfo, HostInputEvent, InputOrigin, process_request},
+            resources::ROOT_WINDOW,
+            server::ServerState,
+            xinput::{InputCapabilities, InputSourceId, XiFacetKind},
+        };
+        use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
+
+        const CLIENT: u32 = 0xA731;
+        const SOURCE: InputSourceId = InputSourceId(0xA7311);
+        const XI_BUTTON_PRESS: u32 = 1 << 4;
+        const XI_BUTTON_RELEASE: u32 = 1 << 5;
+        const XI_MOTION: u32 = 1 << 6;
+
+        let mut backend = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        backend
+            .core
+            .xid_map
+            .insert(backend.core.window_id, ROOT_WINDOW);
+        let mut peer = kbd_map_client_id(&mut state, CLIENT);
+        let send_request =
+            |state: &mut ServerState, backend: &mut KmsBackend, sequence, minor, body: &[u8]| {
+                process_request::process_request(
+                    state,
+                    backend,
+                    ClientId(CLIENT),
+                    SequenceNumber(sequence),
+                    RequestHeader {
+                        opcode: 137,
+                        data: minor,
+                        length_units: u32::try_from((body.len() + 4) / 4).unwrap(),
+                    },
+                    body,
+                    None,
+                )
+                .expect("production XI2 request")
+            };
+
+        send_request(&mut state, &mut backend, 1, 47, &[2, 0, 3, 0]);
+        assert_eq!(kbd_map_drain(&mut peer)[0], 1, "XIQueryVersion reply");
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceAdded(DeviceInfo {
+                source_id: SOURCE,
+                enabled: true,
+                resume_key: None,
+                capabilities: InputCapabilities {
+                    keyboard: false,
+                    pointer: true,
+                    touch: false,
+                },
+                name: "owner-events fallback mouse".to_owned(),
+                device_node: "/dev/input/event-owner-events".to_owned(),
+                sysname: "event-owner-events".to_owned(),
+                vendor_id: 1,
+                product_id: 1,
+                is_touchpad: false,
+                config: Default::default(),
+            }),
+        );
+        let pointer_id = state
+            .xi_devices
+            .facet(SOURCE, XiFacetKind::PointerTouch)
+            .expect("physical mouse pointer facet");
+
+        let mut grab = Vec::with_capacity(20);
+        grab.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        grab.extend_from_slice(&0u32.to_le_bytes()); // current time
+        grab.extend_from_slice(&0u32.to_le_bytes()); // no cursor
+        grab.extend_from_slice(&pointer_id.to_le_bytes()); // exact physical slave
+        grab.extend_from_slice(&[1, 1, 1, 0]); // async modes, owner_events=true
+        grab.extend_from_slice(&1u16.to_le_bytes()); // one mask word
+        grab.extend_from_slice(&(XI_BUTTON_PRESS | XI_BUTTON_RELEASE | XI_MOTION).to_le_bytes());
+        send_request(&mut state, &mut backend, 2, 51, &grab);
+        let grab_reply = kbd_map_drain(&mut peer);
+        assert_eq!(grab_reply[0], 1, "XIGrabDevice reply");
+        assert_eq!(grab_reply[8], 0, "XIGrabDevice succeeds");
+        assert_eq!(
+            state.xi_devices.device(pointer_id).unwrap().attached_master,
+            None
+        );
+        assert!(state.xi2_pointer_grabs.contains_key(&pointer_id));
+
+        let physical = InputOrigin::Physical(SOURCE);
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::PointerButton {
+                origin: physical,
+                button: 0x110, // BTN_LEFT
+                pressed: true,
+                time: 10,
+            },
+        );
+        let press = xi2_events(&kbd_map_drain(&mut peer));
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::PointerMotion {
+                origin: physical,
+                x: 12,
+                y: 14,
+                time: 11,
+                relative: false,
+                dx: 0,
+                dy: 0,
+                motion_delta: None,
+            },
+        );
+        let motion = xi2_events(&kbd_map_drain(&mut peer));
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::PointerButton {
+                origin: physical,
+                button: 0x110,
+                pressed: false,
+                time: 12,
+            },
+        );
+        let release = xi2_events(&kbd_map_drain(&mut peer));
+
+        assert_eq!(press.len(), 1, "grab owner gets the fallback button press");
+        assert_eq!(
+            (press[0].0, press[0].1, press[0].2, press[0].3),
+            (4, pointer_id, pointer_id, 1)
+        );
+        assert_eq!(motion.len(), 1, "grab owner gets the fallback motion");
+        assert_eq!(
+            (motion[0].0, motion[0].1, motion[0].2),
+            (6, pointer_id, pointer_id)
+        );
+        assert_eq!(
+            release.len(),
+            1,
+            "grab owner gets the fallback button release"
+        );
+        assert_eq!(
+            (release[0].0, release[0].1, release[0].2, release[0].3),
+            (5, pointer_id, pointer_id, 1)
+        );
+        assert_eq!(
+            state.xi_devices.device(pointer_id).unwrap().attached_master,
+            None
+        );
+        assert!(state.xi2_pointer_grabs.contains_key(&pointer_id));
+        assert_eq!(state.xi_devices.device(pointer_id).unwrap().buttons_down, 0);
+        assert_eq!(state.buttons_down, 0);
+        assert!(state.sync_pending.is_empty());
+        assert!(!state.xi1_frozen[&pointer_id].frozen());
+    }
+
+    #[test]
+    fn xi_dynamic_caps_lock_release_after_keyboard_grab_preserves_locked_state() {
+        use yserver_core::{
+            backend::Backend,
+            core_loop::{DeviceInfo, HostInputEvent, InputOrigin, process_request},
+            host_x11::HostKeyEvent,
+            resources::ROOT_WINDOW,
+            server::ServerState,
+            xinput::{InputCapabilities, InputSourceId, XiFacetKind},
+        };
+        use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
+
+        const CLIENT: u32 = 0xA732;
+        const SOURCE: InputSourceId = InputSourceId(0xA7321);
+        const CAPS_LOCK: u8 = 66;
+        const LOCK_MASK: u32 = 1 << 1;
+        const XI_KEY_PRESS_RELEASE: u32 = (1 << 2) | (1 << 3);
+
+        let mut backend = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        backend
+            .core
+            .xid_map
+            .insert(backend.core.window_id, ROOT_WINDOW);
+        let mut peer = kbd_map_client_id(&mut state, CLIENT);
+        let send_request =
+            |state: &mut ServerState, backend: &mut KmsBackend, sequence, minor, body: &[u8]| {
+                process_request::process_request(
+                    state,
+                    backend,
+                    ClientId(CLIENT),
+                    SequenceNumber(sequence),
+                    RequestHeader {
+                        opcode: 137,
+                        data: minor,
+                        length_units: u32::try_from((body.len() + 4) / 4).unwrap(),
+                    },
+                    body,
+                    None,
+                )
+                .expect("production XI2 request")
+            };
+
+        send_request(&mut state, &mut backend, 1, 47, &[2, 0, 3, 0]);
+        assert_eq!(kbd_map_drain(&mut peer)[0], 1, "XIQueryVersion reply");
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceAdded(DeviceInfo {
+                source_id: SOURCE,
+                enabled: true,
+                resume_key: None,
+                capabilities: InputCapabilities {
+                    keyboard: true,
+                    pointer: false,
+                    touch: false,
+                },
+                name: "held Caps Lock keyboard".to_owned(),
+                device_node: "/dev/input/event-caps-lock".to_owned(),
+                sysname: "event-caps-lock".to_owned(),
+                vendor_id: 1,
+                product_id: 2,
+                is_touchpad: false,
+                config: Default::default(),
+            }),
+        );
+        let keyboard_id = state
+            .xi_devices
+            .facet(SOURCE, XiFacetKind::Keyboard)
+            .expect("physical keyboard facet");
+        let key = |pressed| {
+            HostInputEvent::Key(HostKeyEvent {
+                origin: InputOrigin::Physical(SOURCE),
+                pressed,
+                keycode: CAPS_LOCK,
+                time: 10,
+                root_x: 0,
+                root_y: 0,
+                event_x: 0,
+                event_y: 0,
+                state: 0,
+            })
+        };
+
+        Backend::on_host_input(&mut backend, &mut state, key(true));
+        let master_locked_before_grab = backend
+            .core
+            .xkb_state
+            .0
+            .serialize_mods(xkbcommon::xkb::STATE_MODS_LOCKED);
+        assert_ne!(
+            master_locked_before_grab & LOCK_MASK,
+            0,
+            "Caps Lock is held and locked"
+        );
+        assert!(state.key_down_by_device[&keyboard_id].contains_key(&CAPS_LOCK));
+        let master_caps_down_bit = 1u8 << (CAPS_LOCK % 8);
+        assert_ne!(
+            state.keys_down[usize::from(CAPS_LOCK / 8)] & master_caps_down_bit,
+            0,
+            "master QueryKeymap contains Caps before detachment",
+        );
+
+        let mut grab = Vec::with_capacity(20);
+        grab.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        grab.extend_from_slice(&0u32.to_le_bytes()); // current time
+        grab.extend_from_slice(&0u32.to_le_bytes()); // no cursor
+        grab.extend_from_slice(&keyboard_id.to_le_bytes());
+        grab.extend_from_slice(&[1, 1, 0, 0]); // async modes, owner_events=false
+        grab.extend_from_slice(&1u16.to_le_bytes()); // one mask word
+        grab.extend_from_slice(&XI_KEY_PRESS_RELEASE.to_le_bytes());
+        send_request(&mut state, &mut backend, 2, 51, &grab);
+        let grab_wire = kbd_map_drain_until(&mut peer, |bytes| {
+            let mut offset = 0;
+            while offset + 32 <= bytes.len() {
+                if bytes[offset] == 1 {
+                    return true;
+                }
+                let event_len = if bytes[offset] == 35 {
+                    32 + u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap())
+                        as usize
+                        * 4
+                } else {
+                    32
+                };
+                offset += event_len;
+            }
+            false
+        });
+        let mut offset = 0;
+        while offset + 32 <= grab_wire.len() && grab_wire[offset] != 1 {
+            let event_len = if grab_wire[offset] == 35 {
+                32 + u32::from_le_bytes(grab_wire[offset + 4..offset + 8].try_into().unwrap())
+                    as usize
+                    * 4
+            } else {
+                32
+            };
+            offset += event_len;
+        }
+        assert!(
+            offset + 32 <= grab_wire.len(),
+            "XIGrabDevice reply follows events"
+        );
+        assert_eq!(grab_wire[offset], 1, "XIGrabDevice reply");
+        assert_eq!(grab_wire[offset + 8], 0, "XIGrabDevice succeeds");
+        assert!(
+            backend.floating_keyboard_states[&keyboard_id]
+                .down_keys
+                .contains(&CAPS_LOCK)
+        );
+        assert_eq!(
+            state
+                .xi_devices
+                .device(keyboard_id)
+                .unwrap()
+                .attached_master,
+            None
+        );
+
+        Backend::on_host_input(&mut backend, &mut state, key(false));
+        let _ = kbd_map_drain(&mut peer);
+        let floating_locked_after_release = backend.floating_keyboard_states[&keyboard_id]
+            .xkb_state
+            .0
+            .serialize_mods(xkbcommon::xkb::STATE_MODS_LOCKED);
+
+        // Xorg's lock filter at xkb/xkbActions.c:372 stores the pre-press
+        // locked bits and clears only those bits on release. Detaching must
+        // not reconstruct a second lock action from the held key.
+        assert_eq!(
+            floating_locked_after_release & LOCK_MASK,
+            master_locked_before_grab & LOCK_MASK,
+            "releasing held Caps Lock preserves the inherited lock",
+        );
+        assert!(
+            !backend.floating_keyboard_states[&keyboard_id]
+                .down_keys
+                .contains(&CAPS_LOCK)
+        );
+        assert!(
+            state
+                .key_down_by_device
+                .get(&keyboard_id)
+                .is_none_or(std::collections::HashMap::is_empty)
+        );
+        assert_ne!(
+            state.keys_down[usize::from(CAPS_LOCK / 8)] & master_caps_down_bit,
+            0,
+            "Xorg DetachFromMaster (dix/events.c:1463-1471) leaves the master key bitmap alone",
+        );
+        assert_eq!(
+            state
+                .xi_devices
+                .device(keyboard_id)
+                .unwrap()
+                .attached_master,
+            None
+        );
+        assert!(state.xi2_keyboard_grabs.contains_key(&keyboard_id));
+        assert!(state.sync_pending.is_empty());
+        assert!(!state.xi1_frozen[&keyboard_id].frozen());
+    }
+
+    #[test]
+    fn record_keeps_pointer_events_enqueued_while_master_is_synchronously_frozen() {
+        use yserver_core::{
+            backend::Backend,
+            core_loop::{DeviceInfo, HostInputEvent, InputOrigin, process_request},
+            resources::ROOT_WINDOW,
+            server::{QueuedInputEvent, ServerState},
+            xinput::{InputCapabilities, InputSourceId, XiFacetKind},
+        };
+        use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
+
+        const RECORDER: u32 = 5;
+        const GRABBER: u32 = 0xA734;
+        const XTEST_CLIENT: u32 = 0xA735;
+        const SOURCE: InputSourceId = InputSourceId(0xA7331);
+        const XI_BUTTON_PRESS_RELEASE: u32 = (1 << 4) | (1 << 5);
+
+        let mut backend = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        backend
+            .core
+            .xid_map
+            .insert(backend.core.window_id, ROOT_WINDOW);
+        let mut recorder_peer = kbd_map_client_id(&mut state, RECORDER);
+        let _grab_peer = kbd_map_client_id(&mut state, GRABBER);
+        let _xtest_peer = kbd_map_client_id(&mut state, XTEST_CLIENT);
+
+        // RECORD CreateContext selects core ButtonPress..ButtonRelease,
+        // followed by EnableContext, through the production dispatcher.
+        let mut create = Vec::new();
+        for word in [1u32, 0, 1, 1, 2] {
+            create.extend_from_slice(&word.to_le_bytes());
+        }
+        create.extend_from_slice(&[0; 18]);
+        create.extend_from_slice(&[2, 5, 0, 0, 0, 0]);
+        kbd_map_request(&mut state, &mut backend, 154, 1, &create);
+        kbd_map_request(&mut state, &mut backend, 154, 5, &1u32.to_le_bytes());
+        let _ = kbd_map_drain(&mut recorder_peer);
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceAdded(DeviceInfo {
+                source_id: SOURCE,
+                enabled: true,
+                resume_key: None,
+                capabilities: InputCapabilities {
+                    keyboard: false,
+                    pointer: true,
+                    touch: false,
+                },
+                name: "RECORD synchronous-grab mouse".to_owned(),
+                device_node: "/dev/input/event-record-sync".to_owned(),
+                sysname: "event-record-sync".to_owned(),
+                vendor_id: 1,
+                product_id: 3,
+                is_touchpad: false,
+                config: Default::default(),
+            }),
+        );
+        let pointer_id = state
+            .xi_devices
+            .facet(SOURCE, XiFacetKind::PointerTouch)
+            .expect("physical mouse pointer facet");
+
+        let mut grab = Vec::with_capacity(24);
+        grab.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        grab.extend_from_slice(&0u32.to_le_bytes()); // current time
+        grab.extend_from_slice(&0u32.to_le_bytes()); // no cursor
+        grab.extend_from_slice(&2u16.to_le_bytes()); // master pointer
+        grab.extend_from_slice(&[0, 1, 0, 0]); // sync master, async paired, owner_events=false
+        grab.extend_from_slice(&1u16.to_le_bytes()); // one mask word
+        grab.extend_from_slice(&XI_BUTTON_PRESS_RELEASE.to_le_bytes());
+        process_request::process_request(
+            &mut state,
+            &mut backend,
+            ClientId(GRABBER),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 137,
+                data: 51,
+                length_units: 7,
+            },
+            &grab,
+            None,
+        )
+        .expect("production synchronous XIGrabDevice");
+        assert!(state.active_pointer_grab.is_some_and(|active| {
+            active.owner == ClientId(GRABBER)
+                && active.xi2_mask == u64::from(XI_BUTTON_PRESS_RELEASE)
+        }));
+        assert!(state.xi1_frozen[&2].frozen(), "sync grab freezes master 2");
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::PointerButton {
+                origin: InputOrigin::Physical(SOURCE),
+                button: 0x110, // BTN_LEFT -> core button 1
+                pressed: true,
+                time: 20,
+            },
+        );
+
+        let mut fake_button = |event_type: u8| {
+            let mut body = Vec::with_capacity(28);
+            body.extend_from_slice(&[event_type, 1, 0, 0]); // type, detail, pad
+            body.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+            body.extend_from_slice(&0u32.to_le_bytes()); // current root
+            body.extend_from_slice(&[0; 8]);
+            body.extend_from_slice(&0i16.to_le_bytes()); // root x
+            body.extend_from_slice(&0i16.to_le_bytes()); // root y
+            body.extend_from_slice(&0u32.to_le_bytes());
+            assert_eq!(body.len(), 28);
+            process_request::process_request(
+                &mut state,
+                &mut backend,
+                ClientId(XTEST_CLIENT),
+                SequenceNumber(u16::from(event_type)),
+                RequestHeader {
+                    opcode: 146,
+                    data: 2, // XTEST FakeInput
+                    length_units: 8,
+                },
+                &body,
+                None,
+            )
+            .expect("production XTEST FakeInput request")
+        };
+        fake_button(4); // XTestFakeButtonEvent press
+        fake_button(5); // XTestFakeButtonEvent release
+
+        let bytes = kbd_map_drain_until(&mut recorder_peer, |bytes| {
+            let mut at = 0usize;
+            let mut found = 0;
+            while at + 32 <= bytes.len() {
+                let words = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+                let len = 32 + words * 4;
+                if at + len > bytes.len() {
+                    break;
+                }
+                if bytes[at] == 1
+                    && bytes[at + 1] == 0
+                    && len >= 34
+                    && matches!(bytes[at + 32], 4 | 5)
+                {
+                    found += 1;
+                }
+                at += len;
+            }
+            found >= 3
+        });
+        let mut button_records = Vec::new();
+        let mut at = 0usize;
+        while at + 32 <= bytes.len() {
+            let words = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+            let len = 32 + words * 4;
+            assert!(at + len <= bytes.len(), "complete RECORD stream element");
+            if bytes[at] == 1 && bytes[at + 1] == 0 && len >= 34 {
+                let event = &bytes[at + 32..at + len];
+                if matches!(event[0], 4 | 5) {
+                    button_records.push((event[0], event[1]));
+                }
+            }
+            at += len;
+        }
+
+        assert_eq!(
+            state.sync_pending.len(),
+            3,
+            "physical and XTEST edges are frozen"
+        );
+        assert_eq!(
+            button_records,
+            [(4, 1), (4, 1), (5, 1)],
+            "RECORD gets physical press plus both XTEST edges while frozen",
+        );
+        assert_eq!(
+            state.sync_pending.len(),
+            3,
+            "all three input edges are queued"
+        );
+        let queued: Vec<_> = state
+            .sync_pending
+            .iter()
+            .map(|pending| {
+                assert_eq!(pending.device, 2, "master 2 controls the queue");
+                match &pending.event {
+                    QueuedInputEvent::HostPointer(event) => {
+                        (event.origin, event.kind, event.detail)
+                    }
+                    other => panic!("unexpected queued input: {other:?}"),
+                }
+            })
+            .collect();
+        assert_eq!(
+            queued,
+            [
+                (
+                    InputOrigin::Physical(SOURCE),
+                    yserver_core::host_x11::PointerEventKind::ButtonPress,
+                    1
+                ),
+                (
+                    InputOrigin::XTest(4),
+                    yserver_core::host_x11::PointerEventKind::ButtonPress,
+                    1
+                ),
+                (
+                    InputOrigin::XTest(4),
+                    yserver_core::host_x11::PointerEventKind::ButtonRelease,
+                    1
+                ),
+            ]
+        );
+        assert_eq!(state.buttons_down, 1, "physical Button1 stays held");
+        assert_eq!(state.xi_devices.device(pointer_id).unwrap().buttons_down, 1);
+        assert_eq!(
+            state
+                .xi_devices
+                .device(yserver_core::xinput::DEVICEID_XTEST_POINTER)
+                .unwrap()
+                .buttons_down,
+            0,
+            "the queued XTEST click releases its own source button",
+        );
+        assert!(state.xi1_frozen[&2].frozen());
+        assert!(
+            state
+                .active_pointer_grab
+                .is_some_and(|active| active.owner == ClientId(GRABBER))
+        );
+        assert_eq!(
+            state.xi_devices.device(pointer_id).unwrap().attached_master,
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn xi_slave_switch_scroll_stop_next_motion_and_query_share_current_source_value() {
+        use yserver_core::{
+            backend::Backend,
+            core_loop::{DeviceInfo, HostInputEvent, InputOrigin, process_request},
+            resources::ROOT_WINDOW,
+            server::ServerState,
+            xinput::{InputCapabilities, InputSourceId, XiFacetKind},
+        };
+        use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
+
+        const CLIENT: u32 = 0xA730;
+        const MOUSE_A: InputSourceId = InputSourceId(0xA7301);
+        const MOUSE_B: InputSourceId = InputSourceId(0xA7302);
+        const XI_DEVICE_CHANGED: u32 = 1 << 1;
+        const XI_BUTTON_PRESS: u32 = 1 << 4;
+        const XI_MOTION: u32 = 1 << 6;
+
+        fn xi_scroll_values(bytes: &[u8]) -> Vec<(u16, u16, i32)> {
+            let mut values = Vec::new();
+            let mut offset = 0;
+            while offset < bytes.len() {
+                assert_eq!(bytes[offset], 35, "GenericEvent stream");
+                let units = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap());
+                let evtype = u16::from_le_bytes([bytes[offset + 8], bytes[offset + 9]]);
+                let deviceid = u16::from_le_bytes([bytes[offset + 10], bytes[offset + 11]]);
+                if evtype == 6 && units == 28 {
+                    let sourceid =
+                        u16::from_le_bytes(bytes[offset + 52..offset + 54].try_into().unwrap());
+                    let value =
+                        i32::from_le_bytes(bytes[offset + 136..offset + 140].try_into().unwrap());
+                    values.push((deviceid, sourceid, value));
+                }
+                offset += 32 + units as usize * 4;
+            }
+            assert_eq!(offset, bytes.len(), "complete XI2 event stream");
+            values
+        }
+
+        fn master_scroll_value(bytes: &[u8]) -> i32 {
+            assert_eq!(bytes[0], 1, "XIQueryDevice reply");
+            let devices = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
+            let mut offset = 32;
+            for _ in 0..devices {
+                let device = u16::from_le_bytes([bytes[offset], bytes[offset + 1]]);
+                let classes = u16::from_le_bytes([bytes[offset + 6], bytes[offset + 7]]) as usize;
+                let name_len = u16::from_le_bytes([bytes[offset + 8], bytes[offset + 9]]) as usize;
+                let mut class_offset = offset + 12 + name_len;
+                while !class_offset.is_multiple_of(4) {
+                    class_offset += 1;
+                }
+                for _ in 0..classes {
+                    let class = u16::from_le_bytes([bytes[class_offset], bytes[class_offset + 1]]);
+                    let units =
+                        u16::from_le_bytes([bytes[class_offset + 2], bytes[class_offset + 3]])
+                            as usize;
+                    let axis =
+                        u16::from_le_bytes([bytes[class_offset + 6], bytes[class_offset + 7]]);
+                    if device == 2 && class == 2 && axis == 2 {
+                        return i32::from_le_bytes(
+                            bytes[class_offset + 28..class_offset + 32]
+                                .try_into()
+                                .unwrap(),
+                        );
+                    }
+                    class_offset += units * 4;
+                }
+                offset = class_offset;
+            }
+            panic!("master pointer vertical valuator missing from XIQueryDevice");
+        }
+
+        fn request(
+            state: &mut ServerState,
+            backend: &mut KmsBackend,
+            sequence: u16,
+            minor: u8,
+            body: &[u8],
+        ) {
+            process_request::process_request(
+                state,
+                backend,
+                ClientId(CLIENT),
+                SequenceNumber(sequence),
+                RequestHeader {
+                    opcode: 137,
+                    data: minor,
+                    length_units: u32::try_from((body.len() + 4) / 4).unwrap(),
+                },
+                body,
+                None,
+            )
+            .expect("production XI2 request");
+        }
+
+        let source_info = |source_id: InputSourceId, name: &str| DeviceInfo {
+            source_id,
+            enabled: true,
+            resume_key: None,
+            capabilities: InputCapabilities {
+                keyboard: false,
+                pointer: true,
+                touch: false,
+            },
+            name: name.to_owned(),
+            device_node: format!("/dev/input/{name}"),
+            sysname: name.to_owned(),
+            vendor_id: 1,
+            product_id: source_id.0 as u32,
+            is_touchpad: false,
+            config: Default::default(),
+        };
+        let motion = |source_id, x, y, time| HostInputEvent::PointerMotion {
+            origin: InputOrigin::Physical(source_id),
+            x,
+            y,
+            time,
+            relative: false,
+            dx: 0,
+            dy: 0,
+            motion_delta: None,
+        };
+        let mut backend = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        backend
+            .core
+            .xid_map
+            .insert(backend.core.window_id, ROOT_WINDOW);
+        let mut peer = kbd_map_client_id(&mut state, CLIENT);
+        request(&mut state, &mut backend, 1, 47, &[2, 0, 3, 0]);
+        let version_reply = kbd_map_drain(&mut peer);
+        assert_eq!(version_reply[0], 1, "XIQueryVersion reply");
+        let mut select = Vec::new();
+        select.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        select.extend_from_slice(&1u16.to_le_bytes());
+        select.extend_from_slice(&[0; 2]);
+        select.extend_from_slice(&2u16.to_le_bytes());
+        select.extend_from_slice(&1u16.to_le_bytes());
+        select.extend_from_slice(&(XI_DEVICE_CHANGED | XI_BUTTON_PRESS | XI_MOTION).to_le_bytes());
+        request(&mut state, &mut backend, 2, 46, &select);
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceAdded(source_info(MOUSE_A, "scroll-mouse-a")),
+        );
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceAdded(source_info(MOUSE_B, "scroll-mouse-b")),
+        );
+        let mouse_a = state
+            .xi_devices
+            .facet(MOUSE_A, XiFacetKind::PointerTouch)
+            .unwrap();
+        let mouse_b = state
+            .xi_devices
+            .facet(MOUSE_B, XiFacetKind::PointerTouch)
+            .unwrap();
+        let _ = kbd_map_drain(&mut peer);
+
+        Backend::on_host_input(&mut backend, &mut state, motion(MOUSE_A, 10, 20, 1));
+        let _ = kbd_map_drain(&mut peer);
+        for n in 0..10 {
+            for pressed in [true, false] {
+                Backend::on_host_input(
+                    &mut backend,
+                    &mut state,
+                    HostInputEvent::PointerButton {
+                        origin: InputOrigin::Physical(MOUSE_A),
+                        button: 0x181,
+                        pressed,
+                        time: 2 + n,
+                    },
+                );
+            }
+        }
+        let _ = kbd_map_drain(&mut peer);
+        assert_eq!(
+            state.xi_devices.device(mouse_a).unwrap().scroll_axis_values,
+            [10, 0]
+        );
+
+        Backend::on_host_input(&mut backend, &mut state, motion(MOUSE_B, 30, 40, 20));
+        let switched = kbd_map_drain(&mut peer);
+        assert_eq!(state.xi_last_slave(2), Some(mouse_b));
+        let query = |backend: &mut KmsBackend,
+                     state: &mut ServerState,
+                     peer: &mut std::os::unix::net::UnixStream,
+                     sequence| {
+            request(state, backend, sequence, 48, &[2, 0, 0, 0]);
+            master_scroll_value(&kbd_map_drain(peer))
+        };
+        let after_switch = query(&mut backend, &mut state, &mut peer, 2);
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::PointerButton {
+                origin: InputOrigin::Physical(MOUSE_B),
+                button: 0x181,
+                pressed: true,
+                time: 21,
+            },
+        );
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::PointerButton {
+                origin: InputOrigin::Physical(MOUSE_B),
+                button: 0x181,
+                pressed: false,
+                time: 22,
+            },
+        );
+        let first_b_scroll = xi_scroll_values(&kbd_map_drain(&mut peer));
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::PointerScrollStop {
+                origin: InputOrigin::Physical(MOUSE_B),
+                time: 23,
+            },
+        );
+        let stop = xi_scroll_values(&kbd_map_drain(&mut peer));
+        let after_stop = query(&mut backend, &mut state, &mut peer, 3);
+        for pressed in [true, false] {
+            Backend::on_host_input(
+                &mut backend,
+                &mut state,
+                HostInputEvent::PointerButton {
+                    origin: InputOrigin::Physical(MOUSE_B),
+                    button: 0x181,
+                    pressed,
+                    time: 24,
+                },
+            );
+        }
+        let next_b_scroll = xi_scroll_values(&kbd_map_drain(&mut peer));
+        let after_next_scroll = query(&mut backend, &mut state, &mut peer, 4);
+
+        let mut offset = 0;
+        let mut saw_switch = false;
+        while offset < switched.len() {
+            assert_eq!(switched[offset], 35, "XI2 GenericEvent");
+            let units =
+                u32::from_le_bytes(switched[offset + 4..offset + 8].try_into().unwrap()) as usize;
+            let evtype = u16::from_le_bytes([switched[offset + 8], switched[offset + 9]]);
+            let deviceid = u16::from_le_bytes([switched[offset + 10], switched[offset + 11]]);
+            if evtype == 1 {
+                saw_switch |= deviceid == 2
+                    && u16::from_le_bytes([switched[offset + 18], switched[offset + 19]])
+                        == mouse_b
+                    && switched[offset + 20] == 1;
+            }
+            offset += 32 + units * 4;
+        }
+        assert!(
+            saw_switch,
+            "KMS motion emits SlaveSwitch DeviceChanged for mouse B"
+        );
+        assert_eq!(after_switch, 0, "XIQueryDevice reports B's switch baseline");
+        assert_eq!(first_b_scroll, vec![(2, mouse_b, 1)]);
+        assert_eq!(
+            stop,
+            vec![(2, mouse_b, 1), (2, mouse_b, 0)],
+            "stop keeps both of B's master scroll-axis baselines"
+        );
+        assert_eq!(after_stop, 1, "query and PointerScrollStop agree");
+        assert_eq!(next_b_scroll, vec![(2, mouse_b, 2)]);
+        assert_eq!(
+            after_next_scroll, 2,
+            "XIQueryDevice follows the next B motion"
+        );
+        assert_eq!(
+            state.xi_devices.device(mouse_a).unwrap().scroll_axis_values,
+            [10, 0]
+        );
+        assert_eq!(
+            state.xi_devices.device(mouse_b).unwrap().scroll_axis_values,
+            [2, 0]
+        );
+        assert_eq!(state.scroll_axis_value, [2, 0]);
+        assert_eq!(state.buttons_down, 0);
+        assert!(state.sync_pending.is_empty());
+        assert!(state.unpublished_pointer_buttons_down.is_empty());
+        assert_eq!(state.xi_devices.device(mouse_a).unwrap().buttons_down, 0);
+        assert_eq!(state.xi_devices.device(mouse_b).unwrap().buttons_down, 0);
     }
 
     #[test]

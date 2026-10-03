@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use yserver_protocol::x11::{self, ClientByteOrder, ClientId};
+use yserver_protocol::x11::{self, ClientByteOrder, ClientId, ResourceId};
 
 use crate::{core_loop::fanout::fanout_event_to_clients, server::ServerState};
 
@@ -155,15 +155,26 @@ pub fn emit_xi2_device_changed(
         id_role,
         XiDeviceRole::MasterPointer | XiDeviceRole::MasterKeyboard
     );
-    let targets: Vec<ClientId> = state
+    // Xorg SendEventToAllWindows delivers at the root and recursively at
+    // each selected child (Xi/exevents.c:3283-3292). DeviceChanged has no
+    // window field, but each selected window still produces a delivery.
+    let targets: Vec<(ClientId, ResourceId)> = state
         .clients
         .iter()
-        .filter_map(|(client_id, client)| {
-            let selected = client.xi2_masks.iter().any(|(&(_, device_id), &mask)| {
-                (device_id == id || device_id == 0 || (is_master && device_id == 1))
-                    && (mask & XI_DEVICE_CHANGED_MASK_WIDE) != 0
-            });
-            selected.then_some(ClientId(*client_id))
+        .flat_map(|(client_id, client)| {
+            let selected_windows: HashSet<ResourceId> = client
+                .xi2_masks
+                .iter()
+                .filter_map(|(&(window, device_id), &mask)| {
+                    ((device_id == id || device_id == 0 || (is_master && device_id == 1))
+                        && mask & XI_DEVICE_CHANGED_MASK_WIDE != 0)
+                        .then_some(window)
+                })
+                .collect();
+            selected_windows
+                .into_iter()
+                .map(|window| (ClientId(*client_id), window))
+                .collect::<Vec<_>>()
         })
         .collect();
     if targets.is_empty() {
@@ -171,21 +182,37 @@ pub fn emit_xi2_device_changed(
     }
 
     let time = state.timestamp_now();
-    crate::core_loop::fanout::fanout_event_to_clients(state, &targets, |buf, sequence, order| {
-        let (classes, num_classes) = encode_device_classes(source_classes, sourceid, order);
-        x11::encode_xi2_device_changed_event(
-            buf,
-            order,
-            sequence,
-            XI2_MAJOR_OPCODE,
-            id,
-            time,
-            num_classes,
-            sourceid,
-            reason as u8,
-            &classes,
+    let mut disconnected = HashSet::new();
+    for (client_id, _selected_window) in targets {
+        if disconnected.contains(&client_id.0) {
+            continue;
+        }
+        disconnected.extend(
+            crate::core_loop::fanout::fanout_event_to_clients(
+                state,
+                std::slice::from_ref(&client_id),
+                |buf, sequence, order| {
+                    let (classes, num_classes) =
+                        encode_device_classes(source_classes, sourceid, order);
+                    x11::encode_xi2_device_changed_event(
+                        buf,
+                        order,
+                        sequence,
+                        XI2_MAJOR_OPCODE,
+                        id,
+                        time,
+                        num_classes,
+                        sourceid,
+                        reason as u8,
+                        &classes,
+                    );
+                },
+            )
+            .into_iter()
+            .map(|client| client.0),
         );
-    })
+    }
+    disconnected.into_iter().map(ClientId).collect()
 }
 
 /// Record and announce the first attached-slave event after the master
