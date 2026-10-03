@@ -29410,14 +29410,6 @@ impl Backend for KmsBackend {
         // catalog — ONE global max_names budget across the ordered
         // walk (Xorg traverses FPEs in path order with one count).
         let mut names: Vec<String> = self.core.font_loader.path_font_names(pattern);
-        names.extend(
-            self.core
-                .font_loader
-                .catalog
-                .iter()
-                .filter(|name| xlfd_pattern_matches(pattern, name))
-                .cloned(),
-        );
         names.truncate(cap);
 
         let mut name_data: Vec<u8> = Vec::new();
@@ -29449,14 +29441,6 @@ impl Backend for KmsBackend {
         // (mirrors list_fonts_proxy ordering so the two requests
         // agree on the visible font set).
         let mut matched: Vec<String> = self.core.font_loader.path_font_names(pattern);
-        matched.extend(
-            self.core
-                .font_loader
-                .catalog
-                .iter()
-                .filter(|name| xlfd_pattern_matches(pattern, name))
-                .cloned(),
-        );
         matched.truncate(cap);
 
         let mut entries: Vec<(String, FontMetrics)> = Vec::with_capacity(matched.len());
@@ -29759,38 +29743,6 @@ impl Backend for KmsBackend {
             Ok(())
         }
     }
-}
-
-/// XLFD glob match per X11 ListFonts semantics: `*` matches zero or more
-/// characters (including `-`), `?` matches exactly one. Comparison is
-/// ASCII case-insensitive because clients legitimately mix case.
-fn xlfd_pattern_matches(pattern: &str, name: &str) -> bool {
-    let pat = pattern.as_bytes();
-    let s = name.as_bytes();
-    let mut pi = 0usize;
-    let mut si = 0usize;
-    let mut star_pi: Option<usize> = None;
-    let mut star_si: usize = 0;
-    while si < s.len() {
-        if pi < pat.len() && (pat[pi] == b'?' || pat[pi].eq_ignore_ascii_case(&s[si])) {
-            pi += 1;
-            si += 1;
-        } else if pi < pat.len() && pat[pi] == b'*' {
-            star_pi = Some(pi);
-            star_si = si;
-            pi += 1;
-        } else if let Some(sp) = star_pi {
-            pi = sp + 1;
-            star_si += 1;
-            si = star_si;
-        } else {
-            return false;
-        }
-    }
-    while pi < pat.len() && pat[pi] == b'*' {
-        pi += 1;
-    }
-    pi == pat.len()
 }
 
 /// Stage 4d Manual-redirect fix: when a window has mapped child

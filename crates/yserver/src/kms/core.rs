@@ -515,6 +515,8 @@ pub(crate) enum FontResolution {
 pub(crate) struct EmbeddedFont {
     /// The bare font name clients ask for (`OpenFont` / `fonts.dir` key).
     pub(crate) name: &'static str,
+    /// Further names it answers to.
+    pub(crate) aliases: &'static [&'static str],
     /// PCF file contents.
     pub(crate) bytes: &'static [u8],
 }
@@ -534,23 +536,56 @@ pub(crate) struct EmbeddedFont {
 /// `fixed` is deliberately absent: it is ordinary text, so fontconfig's
 /// substitution is a reasonable (if not byte-faithful) stand-in, and clients
 /// already depend on that behaviour.
+///
+/// `fixed`: libXfont2's built-in FPE serves `fixed` and `6x13` as aliases of
+/// its embedded `6x13-ISO8859-1.pcf`, so Xorg answers them, and CDE's
+/// dthello and friends start, on a host with no core font packages. A
+/// fontconfig face has other metrics (10 wide, not 6).
 pub(crate) static EMBEDDED_FONTS: &[EmbeddedFont] = &[
     EmbeddedFont {
         name: "cursor",
+        aliases: &[],
         bytes: include_bytes!("../../fonts/cursor.pcf"),
     },
     EmbeddedFont {
         name: "nil2",
+        aliases: &[],
         bytes: include_bytes!("../../fonts/nil2.pcf"),
     },
+    EmbeddedFont {
+        name: XORG_BUILTIN_FIXED,
+        aliases: &[
+            "fixed",
+            "6x13",
+            "-misc-fixed-medium-r-semicondensed--13-100-100-100-c-60-iso8859-1",
+            "-misc-fixed-medium-r-semicondensed--0-0-75-75-c-0-iso8859-1",
+        ],
+        bytes: include_bytes!("../../fonts/6x13-ISO8859-1.pcf"),
+    },
+];
+
+/// The XLFD of libXfont2's built-in `fixed`.
+pub(crate) const XORG_BUILTIN_FIXED: &str =
+    "-misc-fixed-medium-r-semicondensed--13-120-75-75-c-60-iso8859-1";
+
+/// What `ListFonts` finds in Xorg's `built-ins` element, in its order
+/// (measured on Xorg 21.1 with the path set to `built-ins` alone; the
+/// 100-dpi and 0-0 names are its bitmap scaler's).
+pub(crate) const XORG_BUILTIN_NAMES: &[&str] = &[
+    "-misc-fixed-medium-r-semicondensed--13-100-100-100-c-60-iso8859-1",
+    XORG_BUILTIN_FIXED,
+    "6x13",
+    "cursor",
+    "fixed",
+    "-misc-fixed-medium-r-semicondensed--0-0-75-75-c-0-iso8859-1",
 ];
 
 /// The embedded font `name` refers to, if any (case-insensitive, as
 /// X font names are).
 pub(crate) fn embedded_font(name: &str) -> Option<&'static EmbeddedFont> {
-    EMBEDDED_FONTS
-        .iter()
-        .find(|f| f.name.eq_ignore_ascii_case(name))
+    EMBEDDED_FONTS.iter().find(|f| {
+        f.name.eq_ignore_ascii_case(name) || f.aliases.iter().any(|a| a.eq_ignore_ascii_case(name))
+    })
 }
 
 pub(crate) struct FontLoader {
@@ -667,7 +702,12 @@ impl FontLoader {
             let Some(dir) = dir else {
                 // "built-ins": embedded fonts first — a fontconfig
                 // substitute for `cursor`/`nil2` is always wrong (#79).
-                if let Some(f) = embedded_font(name) {
+                if let Some(f) = embedded_font(name).or_else(|| {
+                    XORG_BUILTIN_NAMES
+                        .iter()
+                        .find(|n| font_pattern_matches(name, n))
+                        .and_then(|n| embedded_font(n))
+                }) {
                     return Some(FontResolution::Embedded(f));
                 }
                 // then the alias set, then catalog XLFD match.
@@ -812,12 +852,29 @@ impl FontLoader {
         Self::alias_to_xlfd(alias, &metrics).eq_ignore_ascii_case(name)
     }
 
-    /// All fonts.dir/alias names on the current path matching
-    /// `pattern`, in path order — feed for ListFonts ahead of the
-    /// built-ins catalog. Aliases are reported by their alias name.
+    /// Every name on the current path matching `pattern`, element by
+    /// element as Xorg's ListFonts walks them: a directory's fonts.dir
+    /// and alias names; for `built-ins`, Xorg's own built-in names, then
+    /// the fontconfig catalog this server adds there. Nothing from
+    /// `built-ins` when the path does not hold it, as on Xorg.
     pub(crate) fn path_font_names(&self, pattern: &str) -> Vec<String> {
         let mut out = Vec::new();
-        for dir in self.path_dirs.iter().flatten() {
+        for dir in &self.path_dirs {
+            let Some(dir) = dir else {
+                out.extend(
+                    XORG_BUILTIN_NAMES
+                        .iter()
+                        .filter(|n| font_pattern_matches(pattern, n))
+                        .map(|n| (*n).to_string()),
+                );
+                out.extend(
+                    self.catalog
+                        .iter()
+                        .filter(|n| font_pattern_matches(pattern, n))
+                        .cloned(),
+                );
+                continue;
+            };
             for (name, _) in &dir.entries {
                 if font_pattern_matches(pattern, name) {
                     out.push(name.clone());
@@ -1667,8 +1724,9 @@ pub(crate) fn build_font_catalog(fc: &fontconfig::Fontconfig) -> Vec<String> {
     const PIXEL_SIZES: &[u32] = &[8, 10, 12, 14, 16, 18, 24];
     const CHARSETS: &[&str] = &["iso8859-1", "iso10646-1"];
 
-    // Aliases the loader handles directly without an XLFD parse pass.
-    let mut entries: Vec<String> = vec!["fixed".into(), "cursor".into(), "nil2".into()];
+    // `fixed`, `cursor` and the rest of Xorg's own built-ins are listed
+    // from `XORG_BUILTIN_NAMES`, ahead of these.
+    let mut entries: Vec<String> = Vec::new();
 
     // fontconfig 0.11 wraps construction/queries in `Result`; this fn
     // is infallible, so on any setup failure fall back to just the
@@ -3100,10 +3158,10 @@ mod font_tests {
             "nil2 must resolve to the embedded font — a visible substitute \
              inverts its whole purpose (invisible cursors)"
         );
-        // `fixed` is ordinary text; fontconfig substitution stays.
+        // `fixed` is libXfont2's built-in 6x13, as on Xorg.
         assert!(
-            matches!(loader.resolve("fixed"), Some(FontResolution::BuiltIn)),
-            "fixed keeps its fontconfig fallback"
+            matches!(loader.resolve("fixed"), Some(FontResolution::Embedded(f)) if f.name == XORG_BUILTIN_FIXED),
+            "fixed is the embedded 6x13"
         );
 
         // XC_left_ptr: the arrow the reporter saw as an `E`.
@@ -3145,7 +3203,7 @@ mod font_tests {
     fn builtin_alias_xlfd_identity_not_just_shape() {
         let mut loader = FontLoader::new().unwrap();
         loader.set_font_path(&["built-ins".into()]).unwrap();
-        let (_, metrics, _) = loader.open_font_builtin("fixed").unwrap();
+        let (_, metrics, _) = loader.open_builtin_or_embedded("fixed").unwrap();
         let real = FontLoader::alias_to_xlfd("fixed", &metrics);
         assert!(
             matches!(loader.resolve(&real), Some(FontResolution::BuiltIn)),
@@ -3206,11 +3264,54 @@ mod font_tests {
         // built-ins alias survives any path
         assert!(matches!(
             loader.resolve("fixed"),
-            Some(FontResolution::BuiltIn)
+            Some(FontResolution::Embedded(_))
         ));
         // unknown bare name → None → BadName at the request layer
         assert!(loader.resolve("definitely-not-a-font").is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Xorg's `built-ins` element alone (measured, Xorg 21.1): `fixed`,
+    /// `6x13` and the 6x13 XLFD open as one 6-wide font with ascent 11
+    /// and descent 2; `*` lists its six names first; and a path without
+    /// `built-ins` has none of them.
+    #[test]
+    fn built_ins_are_xorgs_fixed_and_cursor() {
+        let mut loader = FontLoader::new().unwrap();
+        loader.set_font_path(&["built-ins".into()]).unwrap();
+        for name in [
+            "fixed",
+            "FIXED",
+            "6x13",
+            XORG_BUILTIN_FIXED,
+            "-*-*-*-R-*-*-*-120-*-*-*-*",
+        ] {
+            let Some(FontResolution::Embedded(f)) = loader.resolve(name) else {
+                panic!("{name} must resolve to the built-in 6x13");
+            };
+            assert_eq!(f.name, XORG_BUILTIN_FIXED);
+        }
+        let (_, metrics, _) = loader.open_builtin_or_embedded("fixed").unwrap();
+        assert_eq!(
+            (
+                metrics.max_bounds.character_width,
+                metrics.font_ascent,
+                metrics.font_descent
+            ),
+            (6, 11, 2)
+        );
+        assert_eq!(&loader.path_font_names("*")[..6], XORG_BUILTIN_NAMES);
+        let aliases = std::env::temp_dir().join(format!(
+            "yserver-font-test-no-builtins-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&aliases);
+        std::fs::write(aliases.join("fonts.alias"), "other fixed\n").unwrap();
+        loader
+            .set_font_path(&[aliases.to_string_lossy().into_owned()])
+            .unwrap();
+        assert!(loader.path_font_names("fixed").is_empty());
+        let _ = std::fs::remove_dir_all(aliases);
     }
 
     /// CDE's Xsession adds `/usr/dt/etc/cde/fontaliases`, a directory
