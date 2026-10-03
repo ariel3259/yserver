@@ -1,4 +1,4 @@
-**Invocation verified:** Claude Code `claude-opus-5-5`, `--effort high`, read-only tools; successful completion, 20 turns, zero permission denials. **Code base:** `bac725e5`, incorporating `joske/master` at `736a8036`.
+**Invocation verified:** Claude Code `claude-opus-5-5`, `--effort high`, read-only tools; successful completion, 20 turns, zero permission denials. **Code base:** `dbeb5a49`, incorporating `joske/master` at `736a8036`.
 
 I've finished verifying the revised documents against the Xorg, driver and yserver sources; the full round-3 report follows.
 
@@ -10,7 +10,7 @@ I've finished verifying the revised documents against the Xorg, driver and yserv
 - **Touch and keyboard master aggregation:** R3-6 through R3-8.
 
 **Scope and method:**
-- I re-read the four live documents, `AGENTS.md`, and the yserver code at `bac725e5`.
+- I re-read the four live documents, `AGENTS.md`, and the yserver code at `dbeb5a49`.
 - I checked claims against `../xserver`, `../xorgproto`, `xf86libinput.c` 1.5.0, `input` 0.10.0 and `libinput.h`.
 - I used read-only tools only. **No implementation tests were run and no files were written.**
 

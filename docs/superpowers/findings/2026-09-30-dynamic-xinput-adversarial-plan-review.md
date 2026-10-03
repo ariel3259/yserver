@@ -2,7 +2,7 @@
 
 **Reviewer:** Claude Code, `claude-opus-5-5`, effort `high` (confirmed by CLI model usage). **Scope:** read-only plan and source review; no implementation tests run.
 
-I checked the plans against the yserver code at `87e63e1f`, the Xorg source in `../xserver`, `../xorgproto`, the `input` 0.10.0 crate source and `/usr/include/libinput.h`. I did not read xf86-input-libinput, GTK, MATE or KDE sources. Any claim that depends on them is marked **unverifiable**.
+I checked the plans against the yserver code at `9b93ff08`, the Xorg source in `../xserver`, `../xorgproto`, the `input` 0.10.0 crate source and `/usr/include/libinput.h`. I did not read xf86-input-libinput, GTK, MATE or KDE sources. Any claim that depends on them is marked **unverifiable**.
 
 Where this report cites plan lines, **KP** means `docs/superpowers/plans/2026-09-29-dynamic-xinput-keyboard-pointer.md` and **TP** means `docs/superpowers/plans/2026-09-29-dynamic-xinput-touch.md`.
 

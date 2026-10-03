@@ -1,4 +1,4 @@
-**Invocation verified:** Claude Code `claude-opus-5-5`, `--effort high`, read-only tools; successful completion, 139 turns, zero permission denials. **Code base:** `bac725e5`, incorporating `joske/master` at `736a8036`.
+**Invocation verified:** Claude Code `claude-opus-5-5`, `--effort high`, read-only tools; successful completion, 139 turns, zero permission denials. **Code base:** `dbeb5a49`, incorporating `joske/master` at `736a8036`.
 
 # Round 2 adversarial review: dynamic XInput registry spec and plans
 

@@ -24,7 +24,7 @@ findings report**, and the possible gaps have no final severity/disposition.
 
 ## Resume information
 
-- Code base: `bac725e5`, incorporating `joske/master` at `736a8036`.
+- Code base: `dbeb5a49`, incorporating `joske/master` at `736a8036`.
 - Claude session: `2f85efda-cd6c-42fd-bbd0-53de5252b4ee`.
 - Transient prompt/stream/snapshots: `/tmp/yserver-xi-convergence/round-4-*`.
 - Saved document revisions follow the fingerprints below; later live edits
