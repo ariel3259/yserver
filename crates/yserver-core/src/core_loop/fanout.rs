@@ -323,9 +323,9 @@ where
 /// State-borrowing replacement for `nested::emit_xi2_focus_event`.
 ///
 /// Emits an XI2 FocusIn / FocusOut on `window` to clients selecting
-/// the matching XI2 evtype on `(window, deviceid)` for any of the
-/// fallback device candidates `[5, 3, 1, 0]` (slave keyboard, then
-/// master keyboard, then AllMasterDevices, then AllDevices). The
+/// the matching XI2 evtype on the master keyboard or either wildcard
+/// selector. Focus transitions carry master keyboard deviceid 3, so
+/// the XTEST keyboard's exact-device selector is not eligible. The
 /// encoding is byte-order agnostic, matching the pre-lift helper.
 ///
 /// `xi2_major_opcode` is the XI extension's runtime-assigned major
@@ -344,14 +344,15 @@ pub fn emit_xi2_focus_event_to_state(
         .clients
         .iter()
         .filter_map(|(id, client)| {
-            let mask = client
-                .xi2_masks
-                .get(&(window, 5))
-                .or_else(|| client.xi2_masks.get(&(window, 3)))
-                .or_else(|| client.xi2_masks.get(&(window, 1)))
-                .or_else(|| client.xi2_masks.get(&(window, 0)))
-                .copied()
-                .unwrap_or(0);
+            let mask = [
+                crate::xinput::DEVICEID_MASTER_KEYBOARD,
+                1, // XIAllMasterDevices applies to this master device.
+                0, // XIAllDevices applies to every device.
+            ]
+            .into_iter()
+            .filter_map(|device_id| client.xi2_masks.get(&(window, device_id)))
+            .copied()
+            .fold(0, |combined, selected| combined | selected);
             if mask & (1 << evtype) != 0 {
                 Some(ClientId(*id))
             } else {
@@ -392,18 +393,14 @@ pub fn emit_xi2_focus_event_to_state(
 /// active slave swap).
 const XI_REASON_DEVICE_CHANGE: u8 = 2;
 
-/// Emit an XI2 `XI_DeviceChanged` for the slave pointer (device 4) to
-/// every client that selected `XI_DeviceChanged` on it.
+/// Emit an XI2 `XI_DeviceChanged` for the bootstrapped virtual XTEST
+/// pointer to clients that selected that device or `XIAllDevices`.
+/// Physical registry facets are never represented by device 4 here.
+/// The carried class set keeps the query-compatible button + 4 valuator
+/// + 2 scroll shape.
 ///
-/// This retained device-4 emitter is part of the legacy fixed-topology
-/// path. Physical source registration now leaves virtual XTEST device 4
-/// untouched; dynamic hierarchy and presence publication is handled by
-/// the later registry-lifecycle tasks. The carried class set keeps the
-/// query-compatible button + 4 valuator + 2 scroll shape.
-///
-/// Selection matches device 4 explicitly, plus the `XIAllDevices` (0)
-/// and `XIAllMasterDevices` (1) wildcards a client may have used. If no
-/// client selected, this is a no-op. Returns clients whose outbound
+/// `XIAllMasterDevices` does not select this slave event. If no client
+/// selected, this is a no-op. Returns clients whose outbound
 /// buffer overflowed (for `ClientDisconnected` reporting).
 ///
 /// `xi2_major_opcode` is the XI extension's runtime-assigned major
@@ -412,27 +409,23 @@ pub fn emit_xi2_device_changed_slave_pointer(
     state: &mut ServerState,
     xi2_major_opcode: u8,
 ) -> Vec<ClientId> {
-    const SLAVE_POINTER: u16 = 4;
+    const XTEST_POINTER: u16 = crate::xinput::DEVICEID_XTEST_POINTER;
 
     // Clients select on (window, deviceid). DeviceChanged is a
     // hierarchy-wide event clients select on the ROOT window (the same
     // window `process_request`'s XISelectEvents bootstrap requires before
     // it sends the initial DeviceChanged). Match the root window only —
     // matching any window would spuriously deliver to a client that
-    // selected DeviceChanged on some unrelated child. Device-id match
-    // covers device 4 plus the AllDevices(0)/AllMasterDevices(1)
-    // wildcards.
+    // selected DeviceChanged on some unrelated child. The XTEST device
+    // matches its exact selector and XIAllDevices(0); it is not a master,
+    // so XIAllMasterDevices(1) does not match.
     let targets: Vec<ClientId> = state
         .clients
         .iter()
         .filter_map(|(id, client)| {
             let selected = client.xi2_masks.iter().any(|(&(window, dev), &mask)| {
                 window == ROOT_WINDOW
-                    // NOTE: XIAllMasterDevices(1) technically covers
-                    // masters only; device 4 is a slave. Kept for
-                    // delivery breadth; real clients select via
-                    // XIAllDevices(0).
-                    && matches!(dev, SLAVE_POINTER | 0 | 1)
+                    && matches!(dev, XTEST_POINTER | 0)
                     && (mask & u64::from(XI2_DEVICE_CHANGED_MASK)) != 0
             });
             selected.then_some(ClientId(*id))
@@ -450,23 +443,23 @@ pub fn emit_xi2_device_changed_slave_pointer(
             order,
             seq,
             xi2_major_opcode,
-            SLAVE_POINTER,
+            XTEST_POINTER,
             time,
             num_classes,
-            SLAVE_POINTER, // sourceid = the device itself
+            XTEST_POINTER, // sourceid = the XTEST device itself
             XI_REASON_DEVICE_CHANGE,
             &classes,
         );
     })
 }
 
-/// Build the XI2 device-class block for virtual XTEST pointer 4.
+/// Build the XI2 device-class block for the virtual XTEST pointer.
 ///
 /// The query encoder owns the shared button/valuator/scroll class layout;
 /// both XIQueryDevice and DeviceChanged use it so their class blocks remain
 /// byte-identical for little-endian clients.
 pub(crate) fn build_slave_pointer_class_block(state: &mut ServerState) -> (Vec<u8>, u16) {
-    build_pointer_class_block_for_device(state, crate::xinput::DEVICEID_SLAVE_POINTER)
+    build_pointer_class_block_for_device(state, crate::xinput::DEVICEID_XTEST_POINTER)
 }
 
 pub(crate) fn build_pointer_class_block_for_device(
@@ -718,9 +711,12 @@ mod tests {
         server::{ClientState, ServerState},
     };
 
-    fn make_client(writer: UnixStream, mask_for_root: u32) -> ClientState {
+    fn make_client_with_transport(
+        writer: crate::transport::Transport,
+        mask_for_root: u32,
+    ) -> ClientState {
         ClientState {
-            writer: Arc::new(Mutex::new(crate::transport::Transport::Unix(writer))),
+            writer: Arc::new(Mutex::new(writer)),
             byte_order: ClientByteOrder::LittleEndian,
             last_sequence: Arc::new(AtomicU16::new(0)),
             resource_id_base: 0,
@@ -740,11 +736,38 @@ mod tests {
         }
     }
 
+    fn make_client(writer: UnixStream, mask_for_root: u32) -> ClientState {
+        make_client_with_transport(crate::transport::Transport::Unix(writer), mask_for_root)
+    }
+
     fn install(state: &mut ServerState, id: u32, mask: u32) -> UnixStream {
         let (a, b) = UnixStream::pair().unwrap();
         let client = make_client(a, mask);
         state.clients.insert(id, client);
         b
+    }
+
+    fn install_capture(state: &mut ServerState, id: u32) -> crate::transport::CapturedPeer {
+        let (writer, peer) = crate::transport::Transport::capture_pair();
+        state
+            .clients
+            .insert(id, make_client_with_transport(writer, 0));
+        peer
+    }
+
+    fn read_all_capture(peer: &mut crate::transport::CapturedPeer) -> Vec<u8> {
+        peer.set_nonblocking(true).expect("set capture nonblocking");
+        let mut bytes = Vec::new();
+        let mut buffer = [0u8; 128];
+        loop {
+            match peer.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => bytes.extend_from_slice(&buffer[..count]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("capture read failed: {error}"),
+            }
+        }
+        bytes
     }
 
     /// Issue #141 — a reparenting WM must not be handed a core press that
@@ -982,6 +1005,87 @@ mod tests {
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             other => panic!("client 2 unexpectedly received: {other:?}"),
         }
+    }
+
+    #[test]
+    fn xi2_focus_event_for_master_does_not_target_xtest_keyboard() {
+        let mut state = ServerState::new();
+        let window = ROOT_WINDOW;
+        let mut xtest_peer = install_capture(&mut state, 1);
+        let mut master_peer = install_capture(&mut state, 2);
+        let mut all_masters_peer = install_capture(&mut state, 3);
+        let mut all_devices_peer = install_capture(&mut state, 4);
+        for (client_id, device_id) in [
+            (1, crate::xinput::DEVICEID_XTEST_KEYBOARD),
+            (2, crate::xinput::DEVICEID_MASTER_KEYBOARD),
+            (3, 1),
+            (4, 0),
+        ] {
+            state
+                .clients
+                .get_mut(&client_id)
+                .expect("registered focus client")
+                .xi2_masks
+                .insert((window, device_id), 1 << 9);
+        }
+        state
+            .clients
+            .get_mut(&2)
+            .expect("registered master focus client")
+            .xi2_masks
+            .insert((window, crate::xinput::DEVICEID_MASTER_KEYBOARD), 1 << 2);
+        state
+            .clients
+            .get_mut(&2)
+            .expect("registered master focus client")
+            .xi2_masks
+            .insert((window, 1), 1 << 9);
+
+        assert!(emit_xi2_focus_event_to_state(&mut state, window, 9, 137, 0, 0, 0, 0).is_empty());
+
+        assert!(
+            read_all_capture(&mut xtest_peer).is_empty(),
+            "the focus transition is for master keyboard 3, not XTEST keyboard 5"
+        );
+        for (peer, label) in [
+            (&mut master_peer, "master keyboard"),
+            (&mut all_masters_peer, "XIAllMasterDevices"),
+            (&mut all_devices_peer, "XIAllDevices"),
+        ] {
+            let event = read_all_capture(peer);
+            assert_eq!(event.len(), 76, "{label} receives one focus event");
+            assert_eq!(u16::from_le_bytes(event[8..10].try_into().unwrap()), 9);
+            assert_eq!(
+                u16::from_le_bytes(event[10..12].try_into().unwrap()),
+                crate::xinput::DEVICEID_MASTER_KEYBOARD,
+                "focus event deviceid is the master keyboard"
+            );
+            assert_eq!(
+                u16::from_le_bytes(event[16..18].try_into().unwrap()),
+                crate::xinput::DEVICEID_MASTER_KEYBOARD,
+                "focus event sourceid is the master keyboard"
+            );
+        }
+        assert_eq!(state.clients.len(), 4);
+        assert_eq!(
+            state.clients[&1].xi2_masks,
+            HashMap::from([((window, crate::xinput::DEVICEID_XTEST_KEYBOARD), 1 << 9)])
+        );
+        assert_eq!(
+            state.clients[&2].xi2_masks,
+            HashMap::from([
+                ((window, crate::xinput::DEVICEID_MASTER_KEYBOARD), 1 << 2),
+                ((window, 1), 1 << 9),
+            ])
+        );
+        assert_eq!(
+            state.clients[&3].xi2_masks,
+            HashMap::from([((window, 1), 1 << 9)])
+        );
+        assert_eq!(
+            state.clients[&4].xi2_masks,
+            HashMap::from([((window, 0), 1 << 9)])
+        );
     }
 
     #[test]

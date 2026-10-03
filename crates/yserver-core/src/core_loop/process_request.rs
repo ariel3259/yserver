@@ -10584,7 +10584,7 @@ fn dispatch_fake_input_with_body(
                 backend.on_host_input(
                     state,
                     HostInputEvent::Key(HostKeyEvent {
-                        origin: fake_input_origin(body, crate::xinput::DEVICEID_SLAVE_KEYBOARD),
+                        origin: fake_input_origin(body, crate::xinput::DEVICEID_XTEST_KEYBOARD),
                         pressed,
                         keycode: fi.detail,
                         time: fi.time,
@@ -10673,7 +10673,7 @@ fn dispatch_fake_input_with_body(
                 let _ = crate::core_loop::pointer_fanout::xi1_route_device_event(
                     state,
                     crate::server::Xi1QueuedEvent {
-                        deviceid: fake_input_device_id(body, crate::xinput::DEVICEID_SLAVE_POINTER),
+                        deviceid: fake_input_device_id(body, crate::xinput::DEVICEID_XTEST_POINTER),
                         evcode: crate::server::XI_FIRST_EVENT
                             + crate::xinput::XI_DEVICE_MOTION_NOTIFY_OFFSET,
                         detail: 0,
@@ -10707,7 +10707,7 @@ fn dispatch_fake_input_with_body(
             backend.on_host_input(
                 state,
                 HostInputEvent::Key(HostKeyEvent {
-                    origin: fake_input_origin(body, crate::xinput::DEVICEID_SLAVE_KEYBOARD),
+                    origin: fake_input_origin(body, crate::xinput::DEVICEID_XTEST_KEYBOARD),
                     pressed,
                     keycode: fi.detail,
                     time: fi.time,
@@ -10744,7 +10744,7 @@ fn dispatch_fake_input_with_body(
             backend.on_host_input(
                 state,
                 HostInputEvent::PointerButton {
-                    origin: fake_input_origin(body, crate::xinput::DEVICEID_SLAVE_POINTER),
+                    origin: fake_input_origin(body, crate::xinput::DEVICEID_XTEST_POINTER),
                     button: linux_code,
                     pressed,
                     time: fi.time,
@@ -10760,7 +10760,7 @@ fn dispatch_fake_input_with_body(
             // raw relative motion, so XI2 RawMotion reports it.
             let motion = if fi.detail == 0 {
                 HostInputEvent::PointerMotion {
-                    origin: fake_input_origin(body, crate::xinput::DEVICEID_SLAVE_POINTER),
+                    origin: fake_input_origin(body, crate::xinput::DEVICEID_XTEST_POINTER),
                     x: i32::from(fi.root_x),
                     y: i32::from(fi.root_y),
                     time: fi.time,
@@ -10773,7 +10773,7 @@ fn dispatch_fake_input_with_body(
                 let (x, y) = state.pointer_root;
                 let (dx, dy) = (i32::from(fi.root_x), i32::from(fi.root_y));
                 HostInputEvent::PointerMotion {
-                    origin: fake_input_origin(body, crate::xinput::DEVICEID_SLAVE_POINTER),
+                    origin: fake_input_origin(body, crate::xinput::DEVICEID_XTEST_POINTER),
                     x: i32::from(x) + dx,
                     y: i32::from(y) + dy,
                     time: fi.time,
@@ -19766,7 +19766,7 @@ fn handle_xi2_request(
                         crate::xinput::DEVICEID_MASTER_KEYBOARD => {
                             (1, keyboard_atom, &keyboard_classes[..])
                         }
-                        crate::xinput::DEVICEID_SLAVE_POINTER => (
+                        crate::xinput::DEVICEID_XTEST_POINTER => (
                             4,
                             if device.is_touchpad {
                                 touchpad_atom
@@ -19775,7 +19775,7 @@ fn handle_xi2_request(
                             },
                             &pointer_classes[..],
                         ),
-                        crate::xinput::DEVICEID_SLAVE_KEYBOARD => {
+                        crate::xinput::DEVICEID_XTEST_KEYBOARD => {
                             (3, keyboard_atom, &keyboard_classes[..])
                         }
                         _ => match device
@@ -25724,7 +25724,7 @@ pub(super) fn commit_confirmed_xi_change(
 fn is_xtest_marker_property(state: &ServerState, deviceid: u16, property: AtomId) -> bool {
     matches!(
         deviceid,
-        crate::xinput::DEVICEID_SLAVE_POINTER | crate::xinput::DEVICEID_SLAVE_KEYBOARD
+        crate::xinput::DEVICEID_XTEST_POINTER | crate::xinput::DEVICEID_XTEST_KEYBOARD
     ) && property == state.xtest_device_atom
 }
 
@@ -25857,8 +25857,9 @@ pub(super) fn emit_property_dispatch_error(
 /// recipient. Deduplication by client id is handled inside
 /// `fanout_event_to_clients`.
 ///
-/// `deviceid` is the literal device id the change applied to (e.g. 4
-/// for the slave pointer). The XISelectEvents storage keys masks by
+/// `deviceid` is the literal device id the change applied to (the
+/// reserved XTEST ID for a virtual-device change, or a registry-assigned
+/// facet ID for a physical source). The XISelectEvents storage keys masks by
 /// the deviceid the client *requested*, which may be `XIAllDevices(0)`
 /// (a client that wants events from every device) or
 /// `XIAllMasterDevices(1)` (every master). xserver's delivery walks
@@ -25878,15 +25879,16 @@ pub(super) fn emit_property_change(
     // `xi2_masks[(window, deviceid)]` keyed by the deviceid they asked
     // for. A client targeting `XIAllDevices(0)` or — when the event
     // device is a master — `XIAllMasterDevices(1)` selects with that
-    // wildcard id, so a property event on slave id 4 reaches both
-    // `dev == 4` selectors AND `dev == 0` selectors. xinput's
+    // wildcard id, so a property event on a master reaches its exact
+    // selector AND `dev == 1` selectors. A slave property event reaches
+    // its exact selector AND `dev == 0` selectors. xinput's
     // `watch-props` uses `dev == 0`; without the wildcard match it
     // sees nothing.
     // XI device-id wildcards from `XI2.h`: XIAllDevices=0 selects any
-    // device; XIAllMasterDevices=1 selects any master. Property events
-    // are sourced from a slave (id 4 for the touchpad), so the slave
-    // never matches the master-only wildcard — but a future emit from
-    // a master device would. The OR keeps both well-defined.
+    // device; XIAllMasterDevices=1 selects any master. Physical touchpad
+    // facets use registry-assigned IDs; the reserved XTEST ID is only
+    // used for virtual-device properties. Slaves never match the
+    // master-only wildcard.
     const XI_ALL_DEVICES: u16 = 0;
     let xi2_targets: Vec<ClientId> = state
         .clients
@@ -34291,10 +34293,14 @@ fn deactivate_passive_pointer_grab_crossings(state: &mut ServerState) {
     // dying grab's behalf: a keyboard frozen by the button grab's sync
     // keyboard mode thaws with it, or it stays frozen with no grab left
     // to AllowEvents it.
+    // A core passive grab freezes the master pointer and holds its
+    // paired master keyboard (`xi1_check_grab_for_syncs`).
     if let Some(grab) = prev_grab
-        && let Some(kbd) = state
-            .xi1_frozen
-            .get_mut(&crate::xinput::DEVICEID_SLAVE_KEYBOARD)
+        && let Some(paired) = crate::core_loop::pointer_fanout::xi1_other_input_device(
+            state,
+            crate::xinput::DEVICEID_MASTER_POINTER,
+        )
+        && let Some(kbd) = state.xi1_frozen.get_mut(&paired)
         && kbd.other == Some(grab.owner)
     {
         kbd.other = None;
@@ -45758,10 +45764,10 @@ mod tests {
         result
     }
 
-    /// Device 4 remains the virtual XTEST pointer during the staged source
-    /// migration, so its XI1 type stays MOUSE after legacy add/remove hooks.
+    /// Device 4 remains the virtual XTEST pointer when a physical source is
+    /// registered, so its XI1 type stays MOUSE beside dynamic facets.
     #[test]
-    fn list_input_devices_device4_keeps_xtest_mouse_type() {
+    fn list_input_devices_xtest_pointer_keeps_mouse_type() {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
 
@@ -45786,7 +45792,8 @@ mod tests {
             ]
         );
 
-        // A legacy touchpad add must not repurpose virtual device 4.
+        // A physical touchpad gets a separate dynamic facet and must not
+        // repurpose virtual XTEST pointer 4.
         let touchpad_info = crate::core_loop::DeviceInfo {
             source_id: crate::xinput::InputSourceId(u64::from(line!())),
             enabled: true,
@@ -45839,7 +45846,14 @@ mod tests {
             5,
             "the physical pointer is a fifth registry entry"
         );
-        assert_eq!(types.iter().find(|(id, _)| *id == 4).unwrap().1, mouse_atom);
+        assert_eq!(
+            types
+                .iter()
+                .find(|(id, _)| *id == crate::xinput::DEVICEID_XTEST_POINTER)
+                .unwrap()
+                .1,
+            mouse_atom
+        );
         assert_eq!(
             types
                 .iter()
@@ -45851,7 +45865,7 @@ mod tests {
         assert_eq!(
             state
                 .xi_devices
-                .device(crate::xinput::DEVICEID_SLAVE_POINTER)
+                .device(crate::xinput::DEVICEID_XTEST_POINTER)
                 .unwrap()
                 .name,
             crate::xinput::registry::NAME_XTEST_POINTER
@@ -45859,7 +45873,7 @@ mod tests {
         assert!(
             state
                 .xi_devices
-                .device(crate::xinput::DEVICEID_SLAVE_POINTER)
+                .device(crate::xinput::DEVICEID_XTEST_POINTER)
                 .unwrap()
                 .properties
                 .contains_key(&state.xtest_device_atom)
@@ -45879,7 +45893,7 @@ mod tests {
         assert!(
             !state
                 .xi_devices
-                .device(crate::xinput::DEVICEID_SLAVE_POINTER)
+                .device(crate::xinput::DEVICEID_XTEST_POINTER)
                 .unwrap()
                 .properties
                 .contains_key(&tap_atom)
@@ -45949,28 +45963,29 @@ mod tests {
             }
             off = pos;
         }
-        panic!("device 4 not present in XIQueryDevice reply");
+        panic!("requested device not present in XIQueryDevice reply");
     }
 
     /// Regression guard: XIQueryDevice's virtual XTEST pointer class
     /// block matches its DeviceChanged block. A physical touchpad has a
     /// separate facet beginning at 6, with its own source ID in classes.
     #[test]
-    fn query_device_4_matches_device_changed_block() {
+    fn query_xtest_pointer_matches_device_changed_block() {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
 
-        let (wire_classes, wire_num) = query_device_class_block(&mut state, &mut peer, 4);
+        let (wire_classes, wire_num) =
+            query_device_class_block(&mut state, &mut peer, crate::xinput::DEVICEID_XTEST_POINTER);
         let (builder_classes, builder_num) =
             crate::core_loop::fanout::build_slave_pointer_class_block(&mut state);
 
         assert_eq!(
             wire_num, builder_num,
-            "XIQueryDevice device-4 num_classes must match the shared builder"
+            "XIQueryDevice XTEST pointer num_classes must match the shared builder"
         );
         assert_eq!(
             wire_classes, builder_classes,
-            "XIQueryDevice device-4 class bytes must be byte-identical to the \
+            "XIQueryDevice XTEST-pointer class bytes must be byte-identical to the \
              XI_DeviceChanged fanout block (both call build_slave_pointer_class_block)"
         );
 
@@ -45983,12 +45998,13 @@ mod tests {
             .find(|d| d.id == physical_pointer)
             .unwrap()
             .name = "SynPS/2 Synaptics TouchPad".to_owned();
-        let (wire_classes, _) = query_device_class_block(&mut state, &mut peer, 4);
+        let (wire_classes, _) =
+            query_device_class_block(&mut state, &mut peer, crate::xinput::DEVICEID_XTEST_POINTER);
         let (builder_classes, _) =
             crate::core_loop::fanout::build_slave_pointer_class_block(&mut state);
         assert_eq!(
             wire_classes, builder_classes,
-            "device-4 class blocks must stay byte-identical after a touchpad rename"
+            "XTEST-pointer class blocks must stay byte-identical after a touchpad rename"
         );
         let (physical_classes, _) =
             query_device_class_block(&mut state, &mut peer, physical_pointer);
@@ -45998,7 +46014,11 @@ mod tests {
             "physical class records identify their registry facet"
         );
         assert_eq!(
-            state.xi_devices.device(4).unwrap().name,
+            state
+                .xi_devices
+                .device(crate::xinput::DEVICEID_XTEST_POINTER)
+                .unwrap()
+                .name,
             crate::xinput::registry::NAME_XTEST_POINTER
         );
     }
@@ -46096,17 +46116,17 @@ mod tests {
     }
 
     #[test]
-    fn legacy_device_changed_fanout_emits_for_selected_slave_pointer() {
+    fn legacy_device_changed_fanout_emits_for_selected_xtest_pointer() {
         use crate::{
             core_loop::fanout::emit_xi2_device_changed_slave_pointer,
-            xinput::DEVICEID_SLAVE_POINTER,
+            xinput::DEVICEID_XTEST_POINTER,
         };
 
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let xtest_pointer = state
             .xi_devices
-            .device(DEVICEID_SLAVE_POINTER)
+            .device(DEVICEID_XTEST_POINTER)
             .expect("XTEST pointer");
         assert_eq!(
             xtest_pointer.name,
@@ -46117,22 +46137,22 @@ mod tests {
                 .properties
                 .contains_key(&state.xtest_device_atom)
         );
-        // Client selects XI_DeviceChanged on the slave pointer (device 4)
-        // at the root window — the way GDK/Chromium subscribe.
+        // Client selects XI_DeviceChanged on the virtual XTEST pointer
+        // (device 4) at the root window — the way GDK/Chromium subscribe.
         state.clients.get_mut(&1).unwrap().xi2_masks.insert(
-            (ROOT_WINDOW, DEVICEID_SLAVE_POINTER),
+            (ROOT_WINDOW, DEVICEID_XTEST_POINTER),
             u64::from(XI2_DEVICE_CHANGED_MASK),
         );
 
-        // This legacy helper still emits its fixed slave-pointer event during
-        // the staged migration; device 4 remains virtual XTEST.
+        // This helper emits only the bootstrapped XTEST pointer event; the
+        // physical source registry owns all dynamically allocated facets.
         let dropped = emit_xi2_device_changed_slave_pointer(&mut state, 137);
         assert!(dropped.is_empty());
         let wire = read_all_available(&mut peer);
         let off = (0..wire.len().saturating_sub(32))
             .find(|&i| wire[i] == 35 && u16::from_le_bytes([wire[i + 8], wire[i + 9]]) == 1)
             .expect("legacy XI_DeviceChanged fanout");
-        assert_eq!(wire[off + 10], 4, "deviceid = slave pointer");
+        assert_eq!(wire[off + 10], 4, "deviceid = XTEST pointer");
         assert_eq!(wire[off + 18], 4, "sourceid = the XTEST pointer itself");
         assert_eq!(wire[off + 20], 2, "reason = XIDeviceChange");
         assert_eq!(wire[off + 16], 7, "num_classes low byte");
@@ -46144,7 +46164,41 @@ mod tests {
         let off = (0..wire.len().saturating_sub(32))
             .find(|&i| wire[i] == 35 && u16::from_le_bytes([wire[i + 8], wire[i + 9]]) == 1)
             .expect("second legacy XI_DeviceChanged fanout");
-        assert_eq!(wire[off + 10], 4, "deviceid = slave pointer");
+        assert_eq!(wire[off + 10], 4, "deviceid = XTEST pointer");
+    }
+
+    #[test]
+    fn xtest_device_changed_is_not_selected_by_all_master_devices() {
+        use crate::core_loop::fanout::emit_xi2_device_changed_slave_pointer;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .xi2_masks
+            .insert((ROOT_WINDOW, 1), u64::from(XI2_DEVICE_CHANGED_MASK));
+
+        let dropped = emit_xi2_device_changed_slave_pointer(&mut state, 137);
+        assert!(dropped.is_empty());
+        assert!(
+            read_all_available(&mut peer).is_empty(),
+            "XIAllMasterDevices must not receive DeviceChanged for XTEST slave 4",
+        );
+        assert_eq!(
+            state
+                .xi_devices
+                .device(crate::xinput::DEVICEID_XTEST_POINTER)
+                .map(|d| d.id),
+            Some(crate::xinput::DEVICEID_XTEST_POINTER),
+            "only the static XTEST pointer is involved",
+        );
+        assert_eq!(
+            state.xi_devices.source_ids().len(),
+            0,
+            "the event must not pretend a physical source is device 4",
+        );
     }
 
     #[test]
@@ -46168,13 +46222,13 @@ mod tests {
         // — otherwise the fanout spuriously delivers to the wrong window.
         use crate::{
             core_loop::fanout::emit_xi2_device_changed_slave_pointer,
-            xinput::DEVICEID_SLAVE_POINTER,
+            xinput::DEVICEID_XTEST_POINTER,
         };
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let non_root = ResourceId(0x4000_0001);
         state.clients.get_mut(&1).unwrap().xi2_masks.insert(
-            (non_root, DEVICEID_SLAVE_POINTER),
+            (non_root, DEVICEID_XTEST_POINTER),
             u64::from(XI2_DEVICE_CHANGED_MASK),
         );
         let dropped = emit_xi2_device_changed_slave_pointer(&mut state, 137);
@@ -46222,7 +46276,7 @@ mod tests {
         }
     }
 
-    /// Seed the slave-pointer device (id 4) with one INTEGER/8 property
+    /// Seed the XTEST pointer (id 4) with one INTEGER/8 property
     /// keyed by a synthetic atom whose numeric id is supplied by the
     /// caller. The atom is registered into `state.atoms` so it passes
     /// the T3 BadAtom guard in the property dispatch arms — historical
@@ -46234,9 +46288,8 @@ mod tests {
             .register_for_test(AtomId(atom), &format!("test-prop-{atom}"));
         let dev = state
             .xi_devices
-            .iter_mut()
-            .find(|d| d.id == 4)
-            .expect("slave pointer");
+            .device_mut(crate::xinput::DEVICEID_XTEST_POINTER)
+            .expect("XTEST pointer");
         dev.properties.insert(
             AtomId(atom),
             crate::xinput::XiProperty {
@@ -46257,8 +46310,13 @@ mod tests {
         seed_one_prop(&mut state, 100, 8, vec![1]);
         seed_one_prop(&mut state, 200, 8, vec![2]);
 
-        // body: deviceid=4 (u16) + pad(u16).
-        let body = [4u8, 0, 0, 0];
+        // body: XTEST pointer deviceid + pad.
+        let body = [
+            u8::try_from(crate::xinput::DEVICEID_XTEST_POINTER).unwrap(),
+            0,
+            0,
+            0,
+        ];
         handle_xi2_request(
             &mut state,
             &mut backend,
@@ -46326,10 +46384,10 @@ mod tests {
         let mut backend = RecordingBackend::new();
         seed_one_prop(&mut state, 100, 8, vec![0xAB]);
 
-        // body: deviceid(2)=4, delete(1)=0, pad(1), property(4)=100,
+        // body: XTEST pointer deviceid, delete(1)=0, pad(1), property(4)=100,
         //       type(4)=0(Any), offset(4)=0, len(4)=100.
         let mut body = Vec::new();
-        body.extend_from_slice(&4u16.to_le_bytes());
+        body.extend_from_slice(&crate::xinput::DEVICEID_XTEST_POINTER.to_le_bytes());
         body.push(0); // delete
         body.push(0); // pad
         body.extend_from_slice(&100u32.to_le_bytes());
@@ -46372,12 +46430,12 @@ mod tests {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
-        // device 4 exists; delete = 2 (illegal) → BadValue.
+        // XTEST pointer 4 exists; delete = 2 (illegal) → BadValue.
         // Pre-register atom 100 so the BadAtom guard (T3) doesn't fire
         // before the bad-delete check we're actually exercising.
         state.atoms.register_for_test(AtomId(100), "test-prop-100");
         let mut body = Vec::new();
-        body.extend_from_slice(&4u16.to_le_bytes());
+        body.extend_from_slice(&crate::xinput::DEVICEID_XTEST_POINTER.to_le_bytes());
         body.push(2); // delete = 2 (illegal)
         body.push(0);
         body.extend_from_slice(&100u32.to_le_bytes());
@@ -46411,7 +46469,7 @@ mod tests {
         // XIChangeProperty: deviceid(2)=4, mode(1)=Replace, format(1)=8,
         // property(4)=100, type(4)=INTEGER(19), num_items(4)=3, data=[7,8,9]+pad.
         let mut body = Vec::new();
-        body.extend_from_slice(&4u16.to_le_bytes());
+        body.extend_from_slice(&crate::xinput::DEVICEID_XTEST_POINTER.to_le_bytes());
         body.push(0); // mode Replace
         body.push(8); // format
         body.extend_from_slice(&100u32.to_le_bytes());
@@ -46433,7 +46491,7 @@ mod tests {
 
         // GetProperty back.
         let mut gbody = Vec::new();
-        gbody.extend_from_slice(&4u16.to_le_bytes());
+        gbody.extend_from_slice(&crate::xinput::DEVICEID_XTEST_POINTER.to_le_bytes());
         gbody.push(0);
         gbody.push(0);
         gbody.extend_from_slice(&100u32.to_le_bytes());
@@ -46465,7 +46523,7 @@ mod tests {
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
         let mut body = Vec::new();
-        body.extend_from_slice(&4u16.to_le_bytes());
+        body.extend_from_slice(&crate::xinput::DEVICEID_XTEST_POINTER.to_le_bytes());
         body.push(0); // mode
         body.push(7); // format = 7 (illegal)
         body.extend_from_slice(&100u32.to_le_bytes());
@@ -46526,9 +46584,9 @@ mod tests {
         let mut backend = RecordingBackend::new();
         seed_one_prop(&mut state, 100, 8, vec![1]);
 
-        // body: deviceid(2)=4, pad(2), property(4)=100.
+        // body: XTEST pointer deviceid, pad(2), property(4)=100.
         let mut body = Vec::new();
-        body.extend_from_slice(&4u16.to_le_bytes());
+        body.extend_from_slice(&crate::xinput::DEVICEID_XTEST_POINTER.to_le_bytes());
         body.extend_from_slice(&0u16.to_le_bytes());
         body.extend_from_slice(&100u32.to_le_bytes());
         handle_xi2_request(
@@ -46543,7 +46601,10 @@ mod tests {
         .unwrap();
         // No reply for DeleteProperty.
         assert!(read_all_available(&mut peer).is_empty());
-        let dev = state.xi_devices.iter().find(|d| d.id == 4).unwrap();
+        let dev = state
+            .xi_devices
+            .device(crate::xinput::DEVICEID_XTEST_POINTER)
+            .unwrap();
         assert!(
             !dev.properties.contains_key(&AtomId(100)),
             "property removed"
@@ -46580,7 +46641,7 @@ mod tests {
 
     #[test]
     fn xi1_get_xtest_marker_property_wire() {
-        // Reads the XTEST Device INTEGER/8/[1] marker from virtual device 4.
+        // Reads the XTEST Device INTEGER/8/[1] marker from virtual XTEST pointer 4.
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
@@ -46638,7 +46699,7 @@ mod tests {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
-        // device 4 exists but has no property at atom 999. The atom
+        // XTEST pointer 4 exists but has no property at atom 999. The atom
         // ITSELF must be valid (T3 BadAtom guard); the test checks the
         // distinct case where the atom is interned but the device has
         // no value for it.
@@ -46938,7 +46999,10 @@ mod tests {
         )
         .unwrap();
         assert!(read_all_available(&mut peer).is_empty(), "no reply");
-        let dev = state.xi_devices.iter().find(|d| d.id == 4).unwrap();
+        let dev = state
+            .xi_devices
+            .device(crate::xinput::DEVICEID_XTEST_POINTER)
+            .unwrap();
         assert!(
             !dev.properties.contains_key(&AtomId(100)),
             "property removed"
@@ -49968,9 +50032,12 @@ mod tests {
 
     /// XI1 device-property event code is 16; with `XI_FIRST_EVENT = 66`
     /// the wire type byte is 82. The XEventClass packs
-    /// `(deviceid << 8) | event_code`, so for the slave pointer
+    /// `(deviceid << 8) | event_code`, so for the virtual XTEST pointer
     /// (deviceid 4) the class is `(4 << 8) | 82 = 0x0452`.
-    const XI1_DEV_PROP_CLASS_DEV4: u32 = (4 << 8) | 82;
+    const XI1_DEV_PROP_CLASS_XTEST_POINTER: u32 =
+        ((crate::xinput::DEVICEID_XTEST_POINTER as u32) << 8) | 82;
+    const XI1_DEV_PROP_CLASS_XTEST_KEYBOARD: u32 =
+        ((crate::xinput::DEVICEID_XTEST_KEYBOARD as u32) << 8) | 82;
 
     /// Build an `xSelectExtensionEventReq` body (the bytes after the
     /// 4-byte X request header) for a single XEventClass list.
@@ -50036,7 +50103,7 @@ mod tests {
         // with that special device id are stripped by Xorg but do not
         // select presence; a real device's event class is not a substitute.
         let other_device_256_class: u32 = (256 << 8) | 15;
-        let ordinary_device_class: u32 = (4 << 8) | 81;
+        let ordinary_device_class: u32 = ((crate::xinput::DEVICEID_XTEST_POINTER as u32) << 8) | 81;
         let body = xi1_select_extension_event_body(
             ROOT_WINDOW.0,
             &[other_device_256_class, ordinary_device_class],
@@ -50086,14 +50153,17 @@ mod tests {
 
     #[test]
     fn xi1_query_device_state_reports_real_classes() {
-        // QueryDeviceState (minor 30) on the slave pointer must report
+        // QueryDeviceState (minor 30) on the virtual XTEST pointer must report
         // ButtonState (7 buttons, down-bitmask) + ValuatorState (4
         // axes, sprite position) — not the old num_classes=0 stub.
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
         {
-            let entry = state.xi1_device_input_state.entry(4).or_default();
+            let entry = state
+                .xi1_device_input_state
+                .entry(crate::xinput::DEVICEID_XTEST_POINTER)
+                .or_default();
             entry.buttons_down[0] = 0b0000_0010; // button 1 down
             entry.valuators = [120, 45, 0, 0]; // axes as of last motion
         }
@@ -50105,7 +50175,12 @@ mod tests {
             ClientId(1),
             SequenceNumber(1),
             xi2_header(30),
-            &[4, 0, 0, 0], // deviceid + pad
+            &[
+                u8::try_from(crate::xinput::DEVICEID_XTEST_POINTER).unwrap(),
+                0,
+                0,
+                0,
+            ], // deviceid + pad
         )
         .unwrap();
         let wire = read_all_available(&mut peer);
@@ -50130,7 +50205,7 @@ mod tests {
 
     #[test]
     fn t6_xi1_select_extension_event_populates_client_class_set() {
-        // Selecting a DevicePropertyNotify class for device 4 stores
+        // Selecting a DevicePropertyNotify class for XTEST pointer 4 stores
         // the exact wire-form class in `xi1_event_classes`. Classes the
         // server does not yet implement (e.g. a hypothetical XI1
         // motion-event class 0x04XX with the wrong low byte) are
@@ -50138,13 +50213,13 @@ mod tests {
         let mut state = ServerState::new();
         let _peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
-        // Body: window=ROOT, count=2, [DevicePropertyNotify(dev4),
-        // motion-event(dev4)]. The motion-event class has low byte
+        // Body: window=ROOT, count=2, [DevicePropertyNotify(XTEST pointer),
+        // motion-event(XTEST pointer)]. The motion-event class has low byte
         // != 82 so must be dropped.
-        let unknown_class: u32 = (4 << 8) | 70; // bogus event code 4 → DeviceMotion
+        let unknown_class: u32 = ((crate::xinput::DEVICEID_XTEST_POINTER as u32) << 8) | 70; // bogus DeviceMotion class
         let body = xi1_select_extension_event_body(
             ROOT_WINDOW.0,
-            &[XI1_DEV_PROP_CLASS_DEV4, unknown_class],
+            &[XI1_DEV_PROP_CLASS_XTEST_POINTER, unknown_class],
         );
         handle_xi2_request(
             &mut state,
@@ -50158,7 +50233,9 @@ mod tests {
         .unwrap();
         let client = state.clients.get(&1).expect("client installed");
         assert!(
-            client.xi1_event_classes.contains(&XI1_DEV_PROP_CLASS_DEV4),
+            client
+                .xi1_event_classes
+                .contains(&XI1_DEV_PROP_CLASS_XTEST_POINTER),
             "DevicePropertyNotify class stored verbatim"
         );
         assert!(
@@ -50180,8 +50257,9 @@ mod tests {
         let mut state = ServerState::new();
         let _peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
-        // Step 1: select DevicePropertyNotify for device 4.
-        let body = xi1_select_extension_event_body(ROOT_WINDOW.0, &[XI1_DEV_PROP_CLASS_DEV4]);
+        // Step 1: select DevicePropertyNotify for XTEST pointer 4.
+        let body =
+            xi1_select_extension_event_body(ROOT_WINDOW.0, &[XI1_DEV_PROP_CLASS_XTEST_POINTER]);
         handle_xi2_request(
             &mut state,
             &mut backend,
@@ -50198,12 +50276,12 @@ mod tests {
                 .get(&1)
                 .unwrap()
                 .xi1_event_classes
-                .contains(&XI1_DEV_PROP_CLASS_DEV4)
+                .contains(&XI1_DEV_PROP_CLASS_XTEST_POINTER)
         );
-        // Step 2: re-select with a class list that names device 4 but
+        // Step 2: re-select with a class list that names XTEST pointer 4 but
         // requests a class we don't handle. The replacement must clear
         // the prior device-4 entry.
-        let unknown_class_dev4: u32 = (4 << 8) | 70;
+        let unknown_class_dev4: u32 = ((crate::xinput::DEVICEID_XTEST_POINTER as u32) << 8) | 70;
         let body = xi1_select_extension_event_body(ROOT_WINDOW.0, &[unknown_class_dev4]);
         handle_xi2_request(
             &mut state,
@@ -50218,22 +50296,25 @@ mod tests {
         let client = state.clients.get(&1).unwrap();
         assert!(
             client.xi1_event_classes.is_empty(),
-            "replacement with no supported classes clears device-4 selection"
+            "replacement with no supported classes clears XTEST pointer selection"
         );
     }
 
     #[test]
     fn t6_xi1_select_extension_event_other_device_preserved() {
         // Replacement is scoped to the deviceids mentioned in the new
-        // request. Pre-select dev4 + dev5; re-select only dev4. The
-        // dev5 entry must survive (Xorg's per-device replace).
+        // request. Pre-select XTEST pointer 4 + XTEST keyboard 5; re-select
+        // only XTEST pointer 4. The keyboard entry must survive (Xorg's
+        // per-device replace).
         let mut state = ServerState::new();
         let _peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
-        let class_dev5: u32 = (5 << 8) | 82;
+        let class_dev5 = XI1_DEV_PROP_CLASS_XTEST_KEYBOARD;
         // Seed via the dispatch — two classes, two devices.
-        let body =
-            xi1_select_extension_event_body(ROOT_WINDOW.0, &[XI1_DEV_PROP_CLASS_DEV4, class_dev5]);
+        let body = xi1_select_extension_event_body(
+            ROOT_WINDOW.0,
+            &[XI1_DEV_PROP_CLASS_XTEST_POINTER, class_dev5],
+        );
         handle_xi2_request(
             &mut state,
             &mut backend,
@@ -50244,9 +50325,10 @@ mod tests {
             &body,
         )
         .unwrap();
-        // Re-select only dev4 (with the supported class). The dev5
-        // entry must remain — its deviceid wasn't named in this call.
-        let body = xi1_select_extension_event_body(ROOT_WINDOW.0, &[XI1_DEV_PROP_CLASS_DEV4]);
+        // Re-select only XTEST pointer 4 (with the supported class). The
+        // keyboard entry must remain — its deviceid wasn't named here.
+        let body =
+            xi1_select_extension_event_body(ROOT_WINDOW.0, &[XI1_DEV_PROP_CLASS_XTEST_POINTER]);
         handle_xi2_request(
             &mut state,
             &mut backend,
@@ -50259,12 +50341,14 @@ mod tests {
         .unwrap();
         let client = state.clients.get(&1).unwrap();
         assert!(
-            client.xi1_event_classes.contains(&XI1_DEV_PROP_CLASS_DEV4),
-            "device-4 selection re-installed"
+            client
+                .xi1_event_classes
+                .contains(&XI1_DEV_PROP_CLASS_XTEST_POINTER),
+            "XTEST pointer selection re-installed"
         );
         assert!(
             client.xi1_event_classes.contains(&class_dev5),
-            "device-5 selection untouched"
+            "XTEST keyboard selection untouched"
         );
     }
 
@@ -50274,11 +50358,13 @@ mod tests {
         let mut peer1 = install_client(&mut state, 1);
         let _peer2 = install_client(&mut state, 2);
         let mut backend = RecordingBackend::new();
-        let motion_dev4: u32 = (4 << 8) | 70;
-        let property_dev5: u32 = (5 << 8) | 82;
+        let motion_dev4: u32 = ((crate::xinput::DEVICEID_XTEST_POINTER as u32) << 8) | 70;
+        let property_dev5 = XI1_DEV_PROP_CLASS_XTEST_KEYBOARD;
 
-        let body =
-            xi1_select_extension_event_body(ROOT_WINDOW.0, &[XI1_DEV_PROP_CLASS_DEV4, motion_dev4]);
+        let body = xi1_select_extension_event_body(
+            ROOT_WINDOW.0,
+            &[XI1_DEV_PROP_CLASS_XTEST_POINTER, motion_dev4],
+        );
         handle_xi2_request(
             &mut state,
             &mut backend,
@@ -50326,9 +50412,9 @@ mod tests {
             classes,
             vec![
                 motion_dev4,
-                XI1_DEV_PROP_CLASS_DEV4,
+                XI1_DEV_PROP_CLASS_XTEST_POINTER,
                 motion_dev4,
-                XI1_DEV_PROP_CLASS_DEV4,
+                XI1_DEV_PROP_CLASS_XTEST_POINTER,
                 property_dev5,
             ],
             "this-client list precedes the all-clients list"
@@ -50338,7 +50424,7 @@ mod tests {
     #[test]
     fn xi_config_completion_t6_xi1_change_delivers_device_property_notify() {
         // End-to-end: a client SelectExtensionEvent(DevicePropertyNotify
-        // for dev4), then someone (here, the same client via XI2
+        // for XTEST pointer 4), then someone (here, the same client via XI2
         // XIChangeProperty minor 57) writes a property. The 32-byte
         // XI1 event must land on the selecting client with the right
         // type byte, atom, and deviceid.
@@ -50425,7 +50511,7 @@ mod tests {
         let mut backend = RecordingBackend::new();
         seed_one_prop(&mut state, 100, 8, vec![1]);
         let select_body =
-            xi1_select_extension_event_body(ROOT_WINDOW.0, &[XI1_DEV_PROP_CLASS_DEV4]);
+            xi1_select_extension_event_body(ROOT_WINDOW.0, &[XI1_DEV_PROP_CLASS_XTEST_POINTER]);
         handle_xi2_request(
             &mut state,
             &mut backend,
@@ -50514,7 +50600,7 @@ mod tests {
 
     #[test]
     fn xi_config_completion_t6_xi1_wrong_device_class_does_not_match() {
-        // Selecting DevicePropertyNotify for XTEST device 5 must NOT route a
+        // Selecting DevicePropertyNotify for XTEST keyboard 5 must NOT route a
         // physical pointer property change to that client (parallel to the
         // XI2 same-property-different-device test in T5).
         let mut state = ServerState::new();
@@ -50524,7 +50610,7 @@ mod tests {
         let (mut inventory, source) = inventory_for_t3_source(&state);
         let mut pending = crate::core_loop::run::PendingBackendRequests::default();
         let mut lane = crate::core_loop::run::XiConfigLane::default();
-        let class_dev5: u32 = (5 << 8) | 82;
+        let class_dev5 = XI1_DEV_PROP_CLASS_XTEST_KEYBOARD;
         let select_body = xi1_select_extension_event_body(ROOT_WINDOW.0, &[class_dev5]);
         handle_xi2_request(
             &mut state,
@@ -50608,7 +50694,7 @@ mod tests {
         body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
         body.extend_from_slice(&2u16.to_le_bytes()); // count = 2
         body.extend_from_slice(&0u16.to_le_bytes()); // pad
-        body.extend_from_slice(&XI1_DEV_PROP_CLASS_DEV4.to_le_bytes()); // only one class
+        body.extend_from_slice(&XI1_DEV_PROP_CLASS_XTEST_POINTER.to_le_bytes()); // only one class
         handle_xi2_request(
             &mut state,
             &mut backend,
@@ -66362,7 +66448,7 @@ mod tests {
         set_test_pointer_grab(&mut state, GRAB_CLIENT_ID, GRAB_WIN, true, false);
         // Unified state THAWED — the sole admission authority says "not frozen".
         state.xi1_frozen.insert(
-            crate::xinput::DEVICEID_SLAVE_POINTER,
+            crate::xinput::DEVICEID_XTEST_POINTER,
             Xi1Freeze {
                 state: Xi1SyncState::Thawed,
                 ..Default::default()
@@ -66464,7 +66550,7 @@ mod tests {
             via_xi2: false,
         });
         state.xi1_frozen.insert(
-            crate::xinput::DEVICEID_SLAVE_POINTER,
+            crate::xinput::DEVICEID_XTEST_POINTER,
             Xi1Freeze {
                 state: Xi1SyncState::FrozenNoEvent,
                 ..Default::default()
@@ -66473,7 +66559,7 @@ mod tests {
         // A release withheld during the freeze, in the global queue (what the
         // production QUEUE-WHILE-FROZEN gate pushes).
         state.sync_pending.push_back(PendingSyncEvent {
-            device: crate::xinput::DEVICEID_SLAVE_POINTER,
+            device: crate::xinput::DEVICEID_XTEST_POINTER,
             event: QueuedInputEvent::HostPointer(HostPointerEvent {
                 origin: crate::core_loop::message::InputOrigin::XTest(4),
                 kind: PointerEventKind::ButtonRelease,
@@ -66499,7 +66585,7 @@ mod tests {
             &mut state,
             &mut backend,
             &xid_map,
-            crate::xinput::DEVICEID_SLAVE_POINTER,
+            crate::xinput::DEVICEID_XTEST_POINTER,
         );
 
         assert!(
@@ -66567,8 +66653,8 @@ mod tests {
         };
 
         for dev in [
-            crate::xinput::DEVICEID_SLAVE_KEYBOARD,
-            crate::xinput::DEVICEID_SLAVE_POINTER,
+            crate::xinput::DEVICEID_XTEST_KEYBOARD,
+            crate::xinput::DEVICEID_XTEST_POINTER,
         ] {
             state.xi1_frozen.insert(
                 dev,
@@ -66580,7 +66666,7 @@ mod tests {
         }
         // Enqueue KEY (release) THEN POINTER (release), in that global order.
         state.sync_pending.push_back(PendingSyncEvent {
-            device: crate::xinput::DEVICEID_SLAVE_KEYBOARD,
+            device: crate::xinput::DEVICEID_XTEST_KEYBOARD,
             event: QueuedInputEvent::HostKey(HostKeyEvent {
                 origin: crate::core_loop::InputOrigin::NestedHost,
                 pressed: false,
@@ -66594,7 +66680,7 @@ mod tests {
             }),
         });
         state.sync_pending.push_back(PendingSyncEvent {
-            device: crate::xinput::DEVICEID_SLAVE_POINTER,
+            device: crate::xinput::DEVICEID_XTEST_POINTER,
             event: QueuedInputEvent::HostPointer(HostPointerEvent {
                 origin: crate::core_loop::message::InputOrigin::XTest(4),
                 kind: PointerEventKind::ButtonRelease,
@@ -66616,8 +66702,8 @@ mod tests {
 
         // Thaw BOTH, then ONE replay pass.
         for dev in [
-            crate::xinput::DEVICEID_SLAVE_KEYBOARD,
-            crate::xinput::DEVICEID_SLAVE_POINTER,
+            crate::xinput::DEVICEID_XTEST_KEYBOARD,
+            crate::xinput::DEVICEID_XTEST_POINTER,
         ] {
             state.xi1_frozen.get_mut(&dev).unwrap().state = Xi1SyncState::Thawed;
         }
@@ -66708,7 +66794,7 @@ mod tests {
         state.pointer_mapping_override = Some(vec![3, 2, 1]);
         // Pointer frozen so the release is withheld at the gate.
         state.xi1_frozen.insert(
-            crate::xinput::DEVICEID_SLAVE_POINTER,
+            crate::xinput::DEVICEID_XTEST_POINTER,
             Xi1Freeze {
                 state: Xi1SyncState::FrozenNoEvent,
                 ..Default::default()
@@ -66754,7 +66840,7 @@ mod tests {
             &mut state,
             &mut backend,
             &xid_map,
-            crate::xinput::DEVICEID_SLAVE_POINTER,
+            crate::xinput::DEVICEID_XTEST_POINTER,
         );
 
         // The delivered ButtonRelease must carry LOGICAL button 3 (mapped once).
@@ -68276,20 +68362,20 @@ mod tests {
         });
         crate::core_loop::pointer_fanout::xi1_check_grab_for_syncs(
             &mut state,
-            crate::xinput::DEVICEID_SLAVE_POINTER,
+            crate::xinput::DEVICEID_MASTER_POINTER,
             ClientId(GRAB_CLIENT_ID),
             true,
             true,
         );
         state
             .xi1_frozen
-            .entry(crate::xinput::DEVICEID_SLAVE_POINTER)
+            .entry(crate::xinput::DEVICEID_MASTER_POINTER)
             .or_default()
             .state = crate::server::Xi1SyncState::FrozenWithEvent;
         let kbd_frozen = |state: &ServerState| {
             state
                 .xi1_frozen
-                .get(&crate::xinput::DEVICEID_SLAVE_KEYBOARD)
+                .get(&crate::xinput::DEVICEID_MASTER_KEYBOARD)
                 .is_some_and(crate::server::Xi1Freeze::frozen)
         };
         assert!(
@@ -68509,7 +68595,7 @@ mod tests {
         );
         let frozen = state
             .xi1_frozen
-            .get(&crate::xinput::DEVICEID_SLAVE_KEYBOARD)
+            .get(&crate::xinput::DEVICEID_XTEST_KEYBOARD)
             .map_or(Xi1SyncState::Thawed, |f| f.state);
         assert_eq!(
             frozen,

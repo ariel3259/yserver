@@ -617,11 +617,10 @@ impl Context {
     /// physical pointer is its own XI slave): a write to the mouse must not
     /// touch a touchpad, so this applies ONLY to the matching device.
     ///
-    /// LIMITATION: yserver currently exposes a single slave-pointer entry
-    /// (id 4) that whichever real pointer seeded last owns, so only that one
-    /// device is configurable per-session. The correct long-term fix is to
-    /// expose one XI slave per physical pointer like Xorg
-    /// (see `project_kcm_mouse_crash_libinput_accel`).
+    /// Each physical pointer has its own registry-assigned XI facet and
+    /// configuration. The reserved XTEST pointer (id 4) is not the owner of
+    /// a libinput source; a write reaches only the source matching the
+    /// selected facet's device node.
     ///
     /// Returns `Ok(())` when no matching device is stashed for
     /// `device_node` (an unplugged / non-real-pointer target is a no-op; the

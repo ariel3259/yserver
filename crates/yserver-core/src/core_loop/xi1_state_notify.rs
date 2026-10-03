@@ -199,8 +199,8 @@ mod tests {
     };
     use yserver_protocol::x11::{ClientByteOrder, CreateWindowRequest};
 
-    const POINTER: u16 = crate::xinput::DEVICEID_SLAVE_POINTER;
-    const KEYBOARD: u16 = crate::xinput::DEVICEID_SLAVE_KEYBOARD;
+    const POINTER: u16 = crate::xinput::DEVICEID_XTEST_POINTER;
+    const KEYBOARD: u16 = crate::xinput::DEVICEID_XTEST_KEYBOARD;
 
     // Duplicated from xi1_focus.rs::tests (shared test_fixtures module
     // is a tracked follow-up).

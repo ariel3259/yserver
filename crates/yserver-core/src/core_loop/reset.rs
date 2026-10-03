@@ -1127,8 +1127,8 @@ mod tests {
         let slave = state
             .xi_devices
             .iter()
-            .find(|d| d.id == crate::xinput::DEVICEID_SLAVE_POINTER)
-            .expect("slave pointer");
+            .find(|d| d.id == crate::xinput::DEVICEID_XTEST_POINTER)
+            .expect("XTEST pointer");
         assert_eq!(
             slave.name,
             crate::xinput::registry::NAME_XTEST_POINTER,

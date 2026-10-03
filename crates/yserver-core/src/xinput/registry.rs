@@ -12,8 +12,8 @@ use std::{
 use crate::core_loop::DeviceInfo;
 
 use super::{
-    DEVICEID_MASTER_KEYBOARD, DEVICEID_MASTER_POINTER, DEVICEID_SLAVE_KEYBOARD,
-    DEVICEID_SLAVE_POINTER, XiDevice, XiQueryError,
+    DEVICEID_MASTER_KEYBOARD, DEVICEID_MASTER_POINTER, DEVICEID_XTEST_KEYBOARD,
+    DEVICEID_XTEST_POINTER, XiDevice, XiQueryError,
 };
 
 const FIRST_PHYSICAL_DEVICE_ID: u16 = 6;
@@ -75,8 +75,8 @@ impl XiRegistry {
             devices: vec![
                 XiDevice::new(DEVICEID_MASTER_POINTER, super::NAME_MASTER_POINTER),
                 XiDevice::new(DEVICEID_MASTER_KEYBOARD, super::NAME_MASTER_KEYBOARD),
-                XiDevice::new(DEVICEID_SLAVE_POINTER, NAME_XTEST_POINTER),
-                XiDevice::new(DEVICEID_SLAVE_KEYBOARD, NAME_XTEST_KEYBOARD),
+                XiDevice::new(DEVICEID_XTEST_POINTER, NAME_XTEST_POINTER),
+                XiDevice::new(DEVICEID_XTEST_KEYBOARD, NAME_XTEST_KEYBOARD),
             ],
             sources: HashMap::new(),
         }
@@ -224,8 +224,8 @@ impl XiRegistry {
         Some(match device_id {
             DEVICEID_MASTER_POINTER => XiDeviceRole::MasterPointer,
             DEVICEID_MASTER_KEYBOARD => XiDeviceRole::MasterKeyboard,
-            DEVICEID_SLAVE_POINTER => XiDeviceRole::SlavePointer,
-            DEVICEID_SLAVE_KEYBOARD => XiDeviceRole::SlaveKeyboard,
+            DEVICEID_XTEST_POINTER => XiDeviceRole::SlavePointer,
+            DEVICEID_XTEST_KEYBOARD => XiDeviceRole::SlaveKeyboard,
             _ => match device.facet? {
                 XiFacetKind::PointerTouch => XiDeviceRole::SlavePointer,
                 XiFacetKind::Keyboard => XiDeviceRole::SlaveKeyboard,
@@ -293,7 +293,8 @@ fn facets_for(capabilities: InputCapabilities) -> Vec<XiFacetKind> {
     if capabilities.keyboard {
         facets.push(XiFacetKind::Keyboard);
     }
-    // Touch-only facet publication is added by the touch implementation.
+    // Touch-only sources deliberately receive no XI facet; direct touch is
+    // outside this registry's scope.
     if capabilities.pointer {
         facets.push(XiFacetKind::PointerTouch);
     }

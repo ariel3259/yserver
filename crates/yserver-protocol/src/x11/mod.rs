@@ -6887,7 +6887,7 @@ mod tests {
                     use_code: 4,
                     attachment: 2,
                     type_atom: AtomId(MOUSE),
-                    name: "Virtual core slave pointer",
+                    name: "Virtual core XTEST pointer",
                     classes: &pointer_classes,
                 },
                 Xi1DeviceDescriptor {
@@ -6895,7 +6895,7 @@ mod tests {
                     use_code: 3,
                     attachment: 3,
                     type_atom: AtomId(KEYBOARD),
-                    name: "Virtual core slave keyboard",
+                    name: "Virtual core XTEST keyboard",
                     classes: &keyboard_classes,
                 },
             ];
@@ -6982,8 +6982,8 @@ mod tests {
             let names = [
                 "Virtual core pointer",
                 "Virtual core keyboard",
-                "Virtual core slave pointer",
-                "Virtual core slave keyboard",
+                "Virtual core XTEST pointer",
+                "Virtual core XTEST keyboard",
             ];
             for name in names {
                 let n = buf[off] as usize;
@@ -7001,12 +7001,13 @@ mod tests {
             );
         }
 
-        /// A seeded touchpad renames the slave pointer (device 4); the
-        /// XI1 reply must carry that name in the STR list (and the
-        /// length byte must match), proving names thread through from
-        /// the registry rather than being hardcoded.
+        /// A seeded physical touchpad keeps its registry-assigned ID
+        /// after the two XTEST devices; the XI1 reply must carry its
+        /// name in the STR list (and matching length byte), proving
+        /// names thread through from the registry rather than being
+        /// hardcoded.
         #[test]
-        fn list_input_devices_reply_reflects_seeded_slave_pointer_name() {
+        fn list_input_devices_reply_reflects_seeded_pointer_facet_name() {
             let le = ClientByteOrder::LittleEndian;
             let touchpad = "SynPS/2 Synaptics TouchPad";
             let pointer_axes = [(-1, -1), (-1, -1), (-1, 0), (-1, 0)];
@@ -7043,8 +7044,8 @@ mod tests {
                     id: 4,
                     use_code: 4,
                     attachment: 2,
-                    type_atom: AtomId(71),
-                    name: touchpad,
+                    type_atom: AtomId(69),
+                    name: "Virtual core XTEST pointer",
                     classes: &pointer_classes,
                 },
                 Xi1DeviceDescriptor {
@@ -7052,29 +7053,38 @@ mod tests {
                     use_code: 3,
                     attachment: 3,
                     type_atom: AtomId(70),
-                    name: "Virtual core slave keyboard",
+                    name: "Virtual core XTEST keyboard",
                     classes: &keyboard_classes,
+                },
+                Xi1DeviceDescriptor {
+                    id: 6,
+                    use_code: 4,
+                    attachment: 2,
+                    type_atom: AtomId(71),
+                    name: touchpad,
+                    classes: &pointer_classes,
                 },
             ];
             let buf = encode_list_input_devices_reply(le, SequenceNumber(1), &devices);
             let ndevices = buf[8] as usize;
-            assert_eq!(ndevices, 4);
+            assert_eq!(ndevices, 5);
 
             // Skip the device-info array.
             let mut off = 32 + 8 * ndevices;
             // Skip the class-info blocks (walk by byte length).
-            for &num_classes in &[2u8, 1, 2, 1] {
+            for &num_classes in &[2u8, 1, 2, 1, 2] {
                 for _ in 0..num_classes {
                     let len = buf[off + 1] as usize;
                     off += len;
                 }
             }
-            // Name STR list, device order: the 3rd name is the touchpad.
+            // Name STR list, device order: the 5th name is the touchpad.
             let expected = [
                 "Virtual core pointer",
                 "Virtual core keyboard",
+                "Virtual core XTEST pointer",
+                "Virtual core XTEST keyboard",
                 touchpad,
-                "Virtual core slave keyboard",
             ];
             for name in expected {
                 let n = buf[off] as usize;

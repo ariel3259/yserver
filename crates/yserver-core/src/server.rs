@@ -1677,8 +1677,8 @@ impl ServerState {
         let float_atom = atoms.intern("FLOAT", false);
         let mut xi_devices = crate::xinput::XiRegistry::new();
         for device_id in [
-            crate::xinput::DEVICEID_SLAVE_POINTER,
-            crate::xinput::DEVICEID_SLAVE_KEYBOARD,
+            crate::xinput::DEVICEID_XTEST_POINTER,
+            crate::xinput::DEVICEID_XTEST_KEYBOARD,
         ] {
             xi_devices
                 .device_mut(device_id)
@@ -3531,6 +3531,32 @@ fn pointer_event_fanout_inner(
     handle_grabs: bool,
 ) {
     use crate::host_x11::PointerEventKind;
+    let xi_pointer_device_id = match state.lock() {
+        Ok(state) => match event.origin {
+            crate::core_loop::InputOrigin::Physical(source_id) => {
+                state.xi_devices.source(source_id).and_then(|info| {
+                    info.enabled.then(|| {
+                        state
+                            .xi_devices
+                            .facet(source_id, crate::xinput::XiFacetKind::PointerTouch)
+                            .unwrap_or(crate::xinput::DEVICEID_MASTER_POINTER)
+                    })
+                })
+            }
+            crate::core_loop::InputOrigin::XTest(device_id) => state
+                .xi_devices
+                .device(device_id)
+                .filter(|device| device.enabled)
+                .map(|_| device_id),
+            crate::core_loop::InputOrigin::NestedHost => {
+                Some(crate::xinput::DEVICEID_MASTER_POINTER)
+            }
+        },
+        Err(_) => return,
+    };
+    let Some(xi_pointer_device_id) = xi_pointer_device_id else {
+        return;
+    };
     trace!(
         "pointer_event_fanout: kind={:?} detail={} host_xid=0x{:x} root=({},{}) event=({},{}) state=0x{:x}",
         event.kind,
@@ -3686,7 +3712,7 @@ fn pointer_event_fanout_inner(
         && s.active_pointer_grab.is_some_and(|grab| grab.passive)
     {
         s.clear_pointer_grab();
-        if let Some(freeze) = s.xi1_frozen.get_mut(&crate::xinput::DEVICEID_SLAVE_POINTER) {
+        if let Some(freeze) = s.xi1_frozen.get_mut(&xi_pointer_device_id) {
             freeze.stored = None;
             freeze.state = Xi1SyncState::Thawed;
             freeze.other = None;
@@ -3706,7 +3732,7 @@ fn pointer_event_fanout_inner(
                 hit_window,
                 event.detail,
                 event.state,
-                crate::xinput::DEVICEID_SLAVE_POINTER,
+                xi_pointer_device_id,
                 None,
             )
             .map(|grab| (grab, hit_window))
@@ -3725,10 +3751,8 @@ fn pointer_event_fanout_inner(
                 Ok(mut s) => {
                     let target = s.client_target(grab.owner);
                     if grab.pointer_mode == 0 {
-                        s.xi1_frozen
-                            .entry(crate::xinput::DEVICEID_SLAVE_POINTER)
-                            .or_default()
-                            .stored = Some(QueuedInputEvent::HostPointer(event));
+                        s.xi1_frozen.entry(xi_pointer_device_id).or_default().stored =
+                            Some(QueuedInputEvent::HostPointer(event));
                     }
                     s.set_pointer_grab(ActivePointerGrab {
                         owner: grab.owner,
@@ -3844,7 +3868,17 @@ fn pointer_event_fanout_inner(
             let mut xi2_raw_targets = Vec::new();
             if xi2_evtype != 0 {
                 for (cid, c) in g.clients.iter() {
-                    let mask = xi2_mask_for_client(c, target, top_level_id, &[4, 2, 1, 0]);
+                    let mask = xi2_mask_for_client(
+                        c,
+                        target,
+                        top_level_id,
+                        &[
+                            xi_pointer_device_id,
+                            crate::xinput::DEVICEID_MASTER_POINTER,
+                            1,
+                            0,
+                        ],
+                    );
                     trace!(
                         "  xi2 lookup: client={} target=0x{:x} top_level=0x{:x} mask=0x{:x} want_bit={}",
                         cid,
@@ -3876,7 +3910,12 @@ fn pointer_event_fanout_inner(
                             c,
                             crate::resources::ROOT_WINDOW,
                             crate::resources::ROOT_WINDOW,
-                            &[1, 0, 4, 2],
+                            &[
+                                xi_pointer_device_id,
+                                crate::xinput::DEVICEID_MASTER_POINTER,
+                                1,
+                                0,
+                            ],
                         );
                         if root_mask & (1 << raw_evtype) != 0
                             // Avoid double-add if the per-target lookup
@@ -4016,10 +4055,10 @@ fn pointer_event_fanout_inner(
             seq,
             137, // XI2 major opcode
             raw_evtype,
-            4, // deviceid: source Slave Pointer
+            xi_pointer_device_id,
             event.time,
             u32::from(event.detail),
-            4, // sourceid: source Slave Pointer
+            xi_pointer_device_id, // sourceid follows the input origin
             // Relative device delta, not absolute position (see pointer_fanout).
             event.raw_dx,
             event.raw_dy,
@@ -4077,7 +4116,7 @@ fn pointer_event_fanout_inner(
                 seq,
                 137, // XI2 major opcode
                 xi2_evtype,
-                2, // deviceid: Master Pointer
+                xi_pointer_device_id,
                 event.time,
                 crate::resources::ROOT_WINDOW,
                 nested_id,
@@ -4088,7 +4127,7 @@ fn pointer_event_fanout_inner(
                 event_y,
                 event.state,
                 u32::from(event.detail),
-                2,
+                xi_pointer_device_id,
                 xi2_flags,
             );
         }
@@ -4119,7 +4158,7 @@ pub fn next_dpms_level(current: u8, idle_ms: u32, dpms: &DpmsState) -> u8 {
 mod tests {
     use super::*;
     use proptest::prelude::*;
-    use std::os::unix::net::UnixStream;
+    use std::{io::Read, os::unix::net::UnixStream};
 
     #[test]
     fn float_atom_is_pre_interned_at_server_init() {
@@ -4600,6 +4639,153 @@ mod tests {
     }
 
     #[test]
+    fn xi_dynamic_reset_nested_host_pointer_uses_master_xi_ids() {
+        let mut state = ServerState::new();
+        let (xtest_writer, mut xtest_peer) = Transport::capture_pair();
+        let (master_writer, mut master_peer) = Transport::capture_pair();
+        for (client_id, writer, selected_device) in [
+            (1, xtest_writer, crate::xinput::DEVICEID_XTEST_POINTER),
+            (2, master_writer, crate::xinput::DEVICEID_MASTER_POINTER),
+        ] {
+            state.clients.insert(
+                client_id,
+                ClientState {
+                    writer: Arc::new(Mutex::new(writer)),
+                    byte_order: ClientByteOrder::LittleEndian,
+                    last_sequence: Arc::new(AtomicU16::new(0)),
+                    resource_id_base: 0,
+                    resource_id_mask: u32::MAX,
+                    event_masks: HashMap::new(),
+                    save_set: HashSet::new(),
+                    big_requests_enabled: false,
+                    xi2_masks: HashMap::from([(
+                        (crate::resources::ROOT_WINDOW, selected_device),
+                        (1 << 6) | (1 << 17),
+                    )]),
+                    xi1_event_classes: HashSet::new(),
+                    xi1_window_event_classes: HashMap::new(),
+                    outbound: std::collections::VecDeque::new(),
+                    watching_writable: false,
+                    focused_window: crate::resources::ROOT_WINDOW,
+                    reader_control: None,
+                    is_local: true,
+                    fd_passing: true,
+                },
+            );
+        }
+
+        let state = Mutex::new(state);
+        pointer_event_fanout(
+            &state,
+            &HashMap::from([(0xCAFE, crate::resources::ROOT_WINDOW)]),
+            crate::host_x11::HostPointerEvent {
+                origin: crate::core_loop::InputOrigin::NestedHost,
+                kind: crate::host_x11::PointerEventKind::MotionNotify,
+                host_xid: 0xCAFE,
+                detail: 0,
+                time: 1,
+                root_x: 10,
+                root_y: 20,
+                event_x: 10,
+                event_y: 20,
+                state: 0,
+                crossing_mode: 0,
+                child: 0,
+                raw_dx: 1,
+                raw_dy: 2,
+                tree_change: false,
+            },
+        );
+
+        xtest_peer
+            .set_nonblocking(true)
+            .expect("nonblocking XTEST peer");
+        let mut xtest_events = Vec::new();
+        let mut buf = [0; 256];
+        loop {
+            match xtest_peer.read(&mut buf) {
+                Ok(0) => break,
+                Ok(count) => xtest_events.extend_from_slice(&buf[..count]),
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(err) => panic!("read XTEST events: {err}"),
+            }
+        }
+        assert!(
+            xtest_events.is_empty(),
+            "nested host input must not reach a client that selected only XTEST pointer 4"
+        );
+
+        master_peer
+            .set_nonblocking(true)
+            .expect("nonblocking master peer");
+        let mut master_events = Vec::new();
+        loop {
+            match master_peer.read(&mut buf) {
+                Ok(0) => break,
+                Ok(count) => master_events.extend_from_slice(&buf[..count]),
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(err) => panic!("read master events: {err}"),
+            }
+        }
+        let mut ids = Vec::new();
+        let mut offset = 0;
+        while offset + 32 <= master_events.len() {
+            assert_eq!(master_events[offset], 35, "GenericEvent");
+            let length = u32::from_le_bytes(
+                master_events[offset + 4..offset + 8]
+                    .try_into()
+                    .expect("event length"),
+            ) as usize;
+            let evtype = u16::from_le_bytes(
+                master_events[offset + 8..offset + 10]
+                    .try_into()
+                    .expect("event type"),
+            );
+            let device_id = u16::from_le_bytes(
+                master_events[offset + 10..offset + 12]
+                    .try_into()
+                    .expect("device id"),
+            );
+            let source_offset = if evtype == 17 { 20 } else { 52 };
+            let source_id = u16::from_le_bytes(
+                master_events[offset + source_offset..offset + source_offset + 2]
+                    .try_into()
+                    .expect("source id"),
+            );
+            ids.push((evtype, device_id, source_id));
+            offset += 32 + length * 4;
+        }
+        assert_eq!(offset, master_events.len(), "event stream fully consumed");
+        assert_eq!(
+            ids,
+            vec![
+                (
+                    17,
+                    crate::xinput::DEVICEID_MASTER_POINTER,
+                    crate::xinput::DEVICEID_MASTER_POINTER
+                ),
+                (
+                    6,
+                    crate::xinput::DEVICEID_MASTER_POINTER,
+                    crate::xinput::DEVICEID_MASTER_POINTER
+                ),
+            ],
+            "nested host raw and device pointer forms use master IDs",
+        );
+        let final_state = state.lock().expect("server state");
+        assert_eq!(final_state.buttons_down, 0);
+        assert_eq!(
+            final_state
+                .xi_devices
+                .device(crate::xinput::DEVICEID_XTEST_POINTER)
+                .map(|device| device.buttons_down),
+            Some(0),
+            "nested host input does not change XTEST held-button state",
+        );
+        assert!(final_state.xi_devices.source_ids().is_empty());
+    }
+
+    #[test]
     fn unmap_notify_fanout_reaches_only_subscribed_clients() {
         use yserver_protocol::x11::{SequenceNumber, encode_unmap_notify_event};
 
@@ -4677,10 +4863,10 @@ mod tests {
     #[test]
     fn drop_window_subscriptions_removes_entries_for_destroyed_windows() {
         let mut state = ServerState::new();
-        let xi1_class_dev4 =
-            (4 << 8) | u32::from(XI_FIRST_EVENT + crate::xinput::XI_DEVICE_PROPERTY_NOTIFY_OFFSET);
-        let xi1_class_dev5 =
-            (5 << 8) | u32::from(XI_FIRST_EVENT + crate::xinput::XI_DEVICE_PROPERTY_NOTIFY_OFFSET);
+        let xi1_class_xtest_pointer = (u32::from(crate::xinput::DEVICEID_XTEST_POINTER) << 8)
+            | u32::from(XI_FIRST_EVENT + crate::xinput::XI_DEVICE_PROPERTY_NOTIFY_OFFSET);
+        let xi1_class_xtest_keyboard = (u32::from(crate::xinput::DEVICEID_XTEST_KEYBOARD) << 8)
+            | u32::from(XI_FIRST_EVENT + crate::xinput::XI_DEVICE_PROPERTY_NOTIFY_OFFSET);
         state.clients.insert(
             1,
             ClientState {
@@ -4696,13 +4882,22 @@ mod tests {
                 save_set: HashSet::new(),
                 big_requests_enabled: false,
                 xi2_masks: HashMap::from([
-                    ((ResourceId(0x100), 4), 1),
-                    ((ResourceId(0x200), 5), 1),
+                    (
+                        (ResourceId(0x100), crate::xinput::DEVICEID_XTEST_POINTER),
+                        1,
+                    ),
+                    (
+                        (ResourceId(0x200), crate::xinput::DEVICEID_XTEST_KEYBOARD),
+                        1,
+                    ),
                 ]),
-                xi1_event_classes: HashSet::from([xi1_class_dev4, xi1_class_dev5]),
+                xi1_event_classes: HashSet::from([
+                    xi1_class_xtest_pointer,
+                    xi1_class_xtest_keyboard,
+                ]),
                 xi1_window_event_classes: HashMap::from([
-                    (ResourceId(0x100), HashSet::from([xi1_class_dev4])),
-                    (ResourceId(0x200), HashSet::from([xi1_class_dev5])),
+                    (ResourceId(0x100), HashSet::from([xi1_class_xtest_pointer])),
+                    (ResourceId(0x200), HashSet::from([xi1_class_xtest_keyboard])),
                 ]),
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
@@ -4718,8 +4913,16 @@ mod tests {
         // Surviving window's subscription stays.
         assert_eq!(state.subscribers(ResourceId(0x200), 0x0040_0000).len(), 1);
         let client = state.clients.get(&1).unwrap();
-        assert!(!client.xi2_masks.contains_key(&(ResourceId(0x100), 4)));
-        assert!(client.xi2_masks.contains_key(&(ResourceId(0x200), 5)));
+        assert!(
+            !client
+                .xi2_masks
+                .contains_key(&(ResourceId(0x100), crate::xinput::DEVICEID_XTEST_POINTER))
+        );
+        assert!(
+            client
+                .xi2_masks
+                .contains_key(&(ResourceId(0x200), crate::xinput::DEVICEID_XTEST_KEYBOARD))
+        );
         assert!(
             !client
                 .xi1_window_event_classes
@@ -4730,7 +4933,10 @@ mod tests {
                 .xi1_window_event_classes
                 .contains_key(&ResourceId(0x200))
         );
-        assert_eq!(client.xi1_event_classes, HashSet::from([xi1_class_dev5]));
+        assert_eq!(
+            client.xi1_event_classes,
+            HashSet::from([xi1_class_xtest_keyboard])
+        );
     }
 
     #[test]
@@ -5592,7 +5798,7 @@ mod tests {
             win,
             24,
             0x0040,
-            crate::xinput::DEVICEID_SLAVE_KEYBOARD,
+            crate::xinput::DEVICEID_XTEST_KEYBOARD,
             None,
         );
         assert!(hit.is_some());
@@ -5620,7 +5826,7 @@ mod tests {
                 win,
                 24,
                 0x0040,
-                crate::xinput::DEVICEID_SLAVE_KEYBOARD,
+                crate::xinput::DEVICEID_XTEST_KEYBOARD,
                 None
             )
             .is_some()
@@ -5630,7 +5836,7 @@ mod tests {
                 win,
                 24,
                 0x0000,
-                crate::xinput::DEVICEID_SLAVE_KEYBOARD,
+                crate::xinput::DEVICEID_XTEST_KEYBOARD,
                 None
             )
             .is_some()
@@ -5640,7 +5846,7 @@ mod tests {
                 win,
                 25,
                 0x0040,
-                crate::xinput::DEVICEID_SLAVE_KEYBOARD,
+                crate::xinput::DEVICEID_XTEST_KEYBOARD,
                 None
             )
             .is_none()
@@ -5668,7 +5874,7 @@ mod tests {
                 win,
                 24,
                 0x0040,
-                crate::xinput::DEVICEID_SLAVE_KEYBOARD,
+                crate::xinput::DEVICEID_XTEST_KEYBOARD,
                 None
             )
             .is_some()
@@ -5678,7 +5884,7 @@ mod tests {
                 win,
                 99,
                 0x0040,
-                crate::xinput::DEVICEID_SLAVE_KEYBOARD,
+                crate::xinput::DEVICEID_XTEST_KEYBOARD,
                 None
             )
             .is_some()
@@ -5688,7 +5894,7 @@ mod tests {
                 win,
                 24,
                 0x0000,
-                crate::xinput::DEVICEID_SLAVE_KEYBOARD,
+                crate::xinput::DEVICEID_XTEST_KEYBOARD,
                 None
             )
             .is_none()

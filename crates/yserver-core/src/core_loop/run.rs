@@ -1866,8 +1866,9 @@ pub fn run_core(
     // Probe input devices at startup, Xorg-style: drain libinput's
     // initial device enumeration and seed `state.xi_devices` BEFORE the
     // serve loop begins, so the first client to connect sees the real
-    // device model (e.g. device 4 = touchpad) immediately. Without this
-    // the registry carries only the static {2,3,4,5} model until
+    // device model (including a physical touchpad facet with its dynamic
+    // ID) immediately. Without this the registry carries only the static
+    // master and XTEST devices until
     // libinput's first `DeviceAdded` burst is dispatched from the loop,
     // which on real hardware can land seconds after the desktop's
     // clients have already enumerated devices and cached a plain
@@ -6275,12 +6276,12 @@ mod tests {
     }
 
     #[cfg(test)]
-    fn slave_pointer_name(state: &ServerState) -> String {
+    fn xtest_pointer_name(state: &ServerState) -> String {
         state
             .xi_devices
             .iter()
-            .find(|d| d.id == crate::xinput::DEVICEID_SLAVE_POINTER)
-            .expect("slave pointer (id 4) always present")
+            .find(|d| d.id == crate::xinput::DEVICEID_XTEST_POINTER)
+            .expect("XTEST pointer (id 4) always present")
             .name
             .clone()
     }
@@ -6294,13 +6295,13 @@ mod tests {
 
         let mut state = ServerState::new();
         let mut backend = RecordingBackend::new(); // no probe_rounds configured
-        let before = slave_pointer_name(&state);
+        let before = xtest_pointer_name(&state);
 
         let seeded = backend.probe_input_devices(&mut state);
 
         assert_eq!(seeded, 0, "no-op probe seeds nothing");
         assert_eq!(
-            slave_pointer_name(&state),
+            xtest_pointer_name(&state),
             before,
             "device 4 unchanged when nothing to probe",
         );
@@ -6318,16 +6319,16 @@ mod tests {
         backend.probe_rounds.push_back(vec![probe_touchpad_info()]);
 
         assert_ne!(
-            slave_pointer_name(&state),
+            xtest_pointer_name(&state),
             "SynPS/2 Synaptics TouchPad",
-            "precondition: device 4 starts as the generic slave pointer",
+            "precondition: device 4 starts as the virtual XTEST pointer",
         );
 
         let seeded = backend.probe_input_devices(&mut state);
 
         assert_eq!(seeded, 1, "exactly one device seeded");
         assert_eq!(
-            slave_pointer_name(&state),
+            xtest_pointer_name(&state),
             crate::xinput::registry::NAME_XTEST_POINTER,
             "device 4 remains the virtual XTEST pointer after startup probe",
         );
@@ -6348,7 +6349,7 @@ mod tests {
         assert!(
             !state
                 .xi_devices
-                .device(crate::xinput::DEVICEID_SLAVE_POINTER)
+                .device(crate::xinput::DEVICEID_XTEST_POINTER)
                 .unwrap()
                 .properties
                 .contains_key(&tap_atom)

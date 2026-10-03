@@ -82,12 +82,12 @@ fn device_descriptor(device: &XiDevice) -> io::Result<(u16, u16, DeviceClass)> {
     match device.id {
         DEVICEID_MASTER_POINTER => Ok((1, DEVICEID_MASTER_KEYBOARD, DeviceClass::Pointer)),
         DEVICEID_MASTER_KEYBOARD => Ok((2, DEVICEID_MASTER_POINTER, DeviceClass::Keyboard)),
-        super::DEVICEID_SLAVE_POINTER => Ok(slave_descriptor(
+        super::DEVICEID_XTEST_POINTER => Ok(slave_descriptor(
             device.attached_master,
             3,
             DeviceClass::Pointer,
         )),
-        super::DEVICEID_SLAVE_KEYBOARD => Ok(slave_descriptor(
+        super::DEVICEID_XTEST_KEYBOARD => Ok(slave_descriptor(
             device.attached_master,
             4,
             DeviceClass::Keyboard,

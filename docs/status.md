@@ -33,61 +33,15 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
-- **2026-09-30 dynamic XI device registry, Tasks 1–6 staged (branch
-  `feat/xi-dynamic-registry-implementation`):** `XiRegistry` now owns the
-  live XI device vector plus `InputSourceId` metadata and atomic lowest-free
-  keyboard/pointer facet allocation in IDs 6..=127. `DeviceInfo` carries
-  source identity and independent keyboard/pointer/touch capability bits.
-  The libinput producer now allocates attachment IDs against `input::Device`
-  handle identity and tags physical `InputEvent`s; unknown/removed handles
-  are dropped without matching by node. Task 3 now carries source IDs through
-  `HostInputEvent`, coalesces motion by origin/mode with fractional physical
-  deltas, keeps wheel fractions by source, and keys the process-lifetime
-  inventory by source. VT suspend/resume retains disabled facts and recognized
-  settings, proves continuation only by canonical sysfs endpoint-instance
-  paths within one token-checked 2500 ms window, and expires unmatched sources
-  before forwarding late dispatch input. Pause/resume commands use a FIFO
-  queue. Task 6 now publishes physical keyboard/pointer facets through
-  `InputSourceId`, seeds each facet's Device Node/Product ID and each pointer
-  facet's own available libinput descriptors, preserves independent property
-  maps, and keeps unpublished sources unpublished during VT continuation.
-  Suspend disables the source's existing facets; resume refreshes actual
-  metadata/config on those same IDs and only updates property entries that
-  remain present. Reset rebuilds enabled and suspended inventory records.
-  Direct deletion rejects non-deletable seeded driver properties; full
-  GetProperty(delete) still unlinks them, with XI1/XI2 Deleted notifications
-  following Xorg's separate rules. Descriptor/metadata write protection
-  survives inline deletion, while ordinary client properties remain
-  writable/deletable. Task 7 now validates recognized physical driver writes
-  against the live source/facet snapshot, captures the expected source
-  identity, and separates merge/validation from commit. The existing immediate
-  backend hook remains in place pending Task 8's source-targeted submission and
-  acknowledgment path; its three-slot Accel Profile availability mask comes
-  from libinput's existing raw getter while custom writes remain unsupported.
-  Task 8 acknowledgments, Task 11 coordinate authority,
-  Task 14 guarded per-source
-  held-state releases, and Tasks 15–16 hierarchy/presence notifications remain
-  later work. Server startup
-  seeds virtual devices 4/5 with the XTEST pointer/keyboard names and
-  `XTEST Device` INTEGER/8 value 1; writes and direct
-  deletes of that marker are guarded by atom identity even after a
-  GetProperty(delete) unlink. Task 4 makes XI2 `XIQueryDevice` select from
-  the registry for XIAllDevices, XIAllMasterDevices, and exact live IDs,
-  reporting BadDevice for unknown IDs and encoding descriptors/classes in
-  the requesting client's byte order. Device 4/5 remain named virtual XTEST
-  pointer/keyboard devices; the shared generic pointer class shape remains
-  for GDK compatibility without assigning physical ownership to 4. XI1
-  `XListInputDevices` now selects the same registry snapshot and order,
-  carrying each live ID, name, type, use, and class shape in XI1 wire format.
-  XI1 validation and class checks, including `XOpenDevice`, use registry
-  facets; Xorg-compatible `XOpenDevice` still rejects the master devices and
-  accepts live slaves. XI1's legacy attachment byte remains zero, matching
-  Xorg, while XI2 reports registry attachments. Production physical
-  KMS add/remove and VT lifecycle now register, disable, refresh, and unregister
-  source-owned physical facets; dynamic hierarchy/presence notifications are
-  still pending Tasks 15–16. Behavioral tests were not added or run under the
-  current authorization constraint; existing source-property and lifecycle
-  fixtures were adapted to the per-facet registry and property ownership API.
+- **2026-10-02 dynamic XI device registry implemented (branch
+  `feat/xi-dynamic-registry-implementation`):** KMS/libinput publishes
+  source-owned keyboard, pointer, and touchpad facets with independent
+  properties; recognized property writes commit only after libinput confirms
+  them. XI1 and XI2 expose hotplug through presence and hierarchy notifications.
+  VT continuation preserves proven source identities and settings, and server
+  reset replays the current enabled and suspended inventory into a fresh XI
+  registry. Direct touch and a server-wide acceleration default are not
+  provided. Hardware verification: see PR.
 
 - **2026-09-29 RANDR CRTC rotation and reflection (branch
   `feat/randr-rotation`):** SetCrtcConfig accepts modesetting's
