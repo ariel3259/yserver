@@ -44965,7 +44965,7 @@ mod tests {
     }
 
     #[test]
-    fn xi_dynamic_grabs_kms_floating_source_cleanup() {
+    fn xi_dynamic_grabs_kms_slave_cleanup_does_not_freeze_paired_master() {
         use yserver_core::{
             backend::Backend,
             core_loop::{DeviceInfo, HostInputEvent, message::LibinputConfigSnapshot},
@@ -45004,14 +45004,13 @@ mod tests {
             .facet(source_id, XiFacetKind::PointerTouch)
             .expect("DeviceAdded publishes the pointer facet");
 
-        let mut grab_body = Vec::with_capacity(24);
+        let mut grab_body = Vec::with_capacity(20);
         grab_body.extend_from_slice(&yserver_core::resources::ROOT_WINDOW.0.to_le_bytes());
         grab_body.extend_from_slice(&0u32.to_le_bytes());
         grab_body.extend_from_slice(&0u32.to_le_bytes());
         grab_body.extend_from_slice(&device_id.to_le_bytes());
-        grab_body.extend_from_slice(&[1, 0, 0, 0]); // async, paired sync, owner_events=false
+        grab_body.extend_from_slice(&[1, 0, 0, 0]); // async, requested paired sync, owner_events=false
         grab_body.extend_from_slice(&0u16.to_le_bytes());
-        grab_body.extend_from_slice(&[0u8; 2]);
         yserver_core::core_loop::process_request::process_request(
             &mut state,
             &mut backend,
@@ -45020,7 +45019,7 @@ mod tests {
             yserver_protocol::x11::RequestHeader {
                 opcode: 137,
                 data: 51,
-                length_units: 7,
+                length_units: 6,
             },
             &grab_body,
             None,
@@ -45034,9 +45033,12 @@ mod tests {
 
         assert!(state.floating_pointer_positions.contains_key(&device_id));
         assert_eq!(
-            state.xi1_frozen[&yserver_core::xinput::DEVICEID_MASTER_KEYBOARD].other,
-            Some(yserver_protocol::x11::ClientId(CLIENT)),
-            "paired sync mode holds the attached master keyboard",
+            state
+                .xi1_frozen
+                .get(&yserver_core::xinput::DEVICEID_MASTER_KEYBOARD)
+                .and_then(|freeze| freeze.other),
+            None,
+            "Xorg forces a slave grab's paired mode to Async",
         );
         backend.on_host_input(
             &mut state,
@@ -45053,8 +45055,8 @@ mod tests {
             }),
         );
         assert!(
-            !state.sync_pending.is_empty(),
-            "key input is queued while the paired master keyboard is held",
+            state.sync_pending.is_empty(),
+            "the paired master keyboard is not frozen"
         );
 
         backend.on_host_input(&mut state, HostInputEvent::DeviceRemoved { source_id });
@@ -45070,7 +45072,7 @@ mod tests {
                 .xi1_frozen
                 .get(&yserver_core::xinput::DEVICEID_MASTER_KEYBOARD)
                 .is_some_and(yserver_core::server::Xi1Freeze::frozen),
-            "source removal releases its paired master freeze",
+            "source removal leaves the paired master keyboard unfrozen",
         );
     }
 
@@ -54546,8 +54548,8 @@ mod tests {
         grab_body.extend_from_slice(&0u32.to_le_bytes());
         grab_body.extend_from_slice(&pointer.to_le_bytes());
         grab_body.extend_from_slice(&[1, 1, 0, 0]);
-        grab_body.extend_from_slice(&0u16.to_le_bytes());
-        grab_body.extend_from_slice(&(u32::MAX).to_le_bytes());
+        grab_body.extend_from_slice(&1u16.to_le_bytes());
+        grab_body.extend_from_slice(&((1u32 << 4) | (1u32 << 5)).to_le_bytes());
         yserver_core::core_loop::process_request::process_request(
             &mut state,
             &mut backend,
