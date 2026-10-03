@@ -3178,8 +3178,11 @@ pub struct PlatformBackend {
     #[cfg(test)]
     held_scanout_render_completions_for_tests: HashSet<u64>,
     #[cfg(test)]
-    hold_next_scanout_render_completions_for_tests:
-        std::collections::VecDeque<(OutputInstanceId, ScanoutRenderCompletionStage)>,
+    hold_next_scanout_render_completions_for_tests: std::collections::VecDeque<(
+        OutputInstanceId,
+        ScanoutRenderCompletionStage,
+        Option<usize>,
+    )>,
     #[cfg(test)]
     pub(crate) dpms_output_calls_for_tests: Option<Vec<(bool, Vec<OutputKey>)>>,
     #[cfg(test)]
@@ -6080,8 +6083,10 @@ impl PlatformBackend {
         let hold_request = self
             .hold_next_scanout_render_completions_for_tests
             .iter()
-            .position(|(held_instance, held_stage)| {
-                *held_instance == output_instance_id && *held_stage == stage
+            .position(|(held_instance, held_stage, held_bo_idx)| {
+                *held_instance == output_instance_id
+                    && *held_stage == stage
+                    && held_bo_idx.is_none_or(|held_bo_idx| held_bo_idx == bo_idx)
             });
         if let Some(fd) = fd.as_ref()
             && !{
@@ -6256,6 +6261,40 @@ impl PlatformBackend {
     }
 
     #[cfg(test)]
+    pub(crate) fn hold_scanout_render_completion_for_buffer_for_tests(
+        &mut self,
+        output_instance_id: OutputInstanceId,
+        stage: ScanoutRenderCompletionStage,
+        bo_idx: usize,
+    ) -> io::Result<Option<u64>> {
+        let Some(pending) = self
+            .pending_scanout_render_completions
+            .iter()
+            .find(|pending| {
+                pending.output_instance_id == output_instance_id
+                    && pending.stage == stage
+                    && pending.bo_idx == bo_idx
+                    && !self
+                        .held_scanout_render_completions_for_tests
+                        .contains(&pending.job_id)
+            })
+        else {
+            return Ok(None);
+        };
+        let job_id = pending.job_id;
+        self.held_scanout_render_completions_for_tests
+            .insert(job_id);
+        if let Some(fd) = pending.fd.as_ref()
+            && let Err(error) = self.scanout_render_completion_epfd.unregister(fd.as_fd())
+        {
+            self.held_scanout_render_completions_for_tests
+                .remove(&job_id);
+            return Err(error);
+        }
+        Ok(Some(job_id))
+    }
+
+    #[cfg(test)]
     pub(crate) fn hold_scanout_render_completions_for_output_stage_for_tests(
         &mut self,
         output_instance_id: OutputInstanceId,
@@ -6290,7 +6329,18 @@ impl PlatformBackend {
         stage: ScanoutRenderCompletionStage,
     ) {
         self.hold_next_scanout_render_completions_for_tests
-            .push_back((output_instance_id, stage));
+            .push_back((output_instance_id, stage, None));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_next_scanout_render_completion_for_buffer_for_tests(
+        &mut self,
+        output_instance_id: OutputInstanceId,
+        stage: ScanoutRenderCompletionStage,
+        bo_idx: usize,
+    ) {
+        self.hold_next_scanout_render_completions_for_tests
+            .push_back((output_instance_id, stage, Some(bo_idx)));
     }
 
     #[cfg(test)]

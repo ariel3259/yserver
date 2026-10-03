@@ -6,6 +6,7 @@ use std::{
         fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd},
         unix::net::UnixStream,
     },
+    sync::{Mutex, MutexGuard},
     time::{Duration, Instant},
 };
 
@@ -16,6 +17,16 @@ use super::{
     take_inherited_fd, transport,
 };
 use crate::kms::owner::identity::IncarnationId;
+
+static PROCESS_SPAWN_LOCK: Mutex<()> = Mutex::new(());
+
+/// Keep tests that assert last-close flock semantics out of the short
+/// fork-to-exec window of sibling helper-process tests.
+pub(crate) fn process_spawn_guard_for_tests() -> MutexGuard<'static, ()> {
+    PROCESS_SPAWN_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Scripted reply shapes for reply-validation integration tests.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -101,6 +112,7 @@ pub enum StubBehaviour {
     ReplyWithWrongFamily,
     AcceptDeclaringMissingFence,
     ReplyTwiceWith(i32),
+    ReplyTwiceThenExitWith(i32),
     WedgedHoldingLock,
     AcceptValidationThenNeverReply,
 }
@@ -181,6 +193,7 @@ impl StubBehaviour {
             Self::ReplyWithWrongFamily => "reply-wrong-family".to_string(),
             Self::AcceptDeclaringMissingFence => "accept-declaring-missing-fence".to_string(),
             Self::ReplyTwiceWith(errno) => format!("reply-twice:{errno}"),
+            Self::ReplyTwiceThenExitWith(errno) => format!("reply-twice-then-exit:{errno}"),
             Self::WedgedHoldingLock => "wedged-holding-lock".to_string(),
             Self::AcceptValidationThenNeverReply => {
                 "accept-validation-then-never-reply".to_string()
@@ -318,6 +331,11 @@ impl StubBehaviour {
             Some(Self::AcceptDeclaringMissingFence)
         } else if let Some(errno_str) = s.strip_prefix("reply-twice:") {
             errno_str.parse::<i32>().ok().map(Self::ReplyTwiceWith)
+        } else if let Some(errno_str) = s.strip_prefix("reply-twice-then-exit:") {
+            errno_str
+                .parse::<i32>()
+                .ok()
+                .map(Self::ReplyTwiceThenExitWith)
         } else if s == "wedged-holding-lock" {
             Some(Self::WedgedHoldingLock)
         } else if s == "accept-validation-then-never-reply" {
@@ -331,6 +349,7 @@ impl StubBehaviour {
 /// Spawn a process-isolated stub helper configured with `behaviour`.
 #[doc(hidden)]
 pub fn spawn_stub_helper(behaviour: StubBehaviour) -> io::Result<KmsIoExecutor> {
+    let _spawn_guard = process_spawn_guard_for_tests();
     let dummy_file = std::fs::File::open("/dev/null")?;
     let exe = executor_executable()?;
     spawn_internal(
@@ -347,6 +366,7 @@ pub fn spawn_stub_helper_with_event_fd(
     behaviour: StubBehaviour,
     event_fd: impl AsFd,
 ) -> io::Result<KmsIoExecutor> {
+    let _spawn_guard = process_spawn_guard_for_tests();
     let exe = executor_executable()?;
     let raw = event_fd.as_fd().as_raw_fd();
     let readable_alias = std::fs::OpenOptions::new()
@@ -1029,6 +1049,28 @@ fn run_stub_helper(behaviour: StubBehaviour) -> io::Result<()> {
             let _ = std::io::Read::read(&mut &control, &mut sink);
             Ok(())
         }
+        StubBehaviour::ReplyTwiceThenExitWith(errno) => {
+            let mut req_buf = vec![0u8; protocol::MAX_REQUEST_FRAME_LEN];
+            let received = transport::recv_frame(&control, &mut req_buf)?;
+            if received.len > 0 {
+                let req = protocol::decode_request(&req_buf[..received.len]).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("protocol error: {error:?}"),
+                    )
+                })?;
+                let reply = protocol::HostCallReply::Rejected {
+                    correlation: req.correlation(),
+                    errno,
+                    helper_duration_ns: 1_000_000,
+                    unexpected_fence_output: false,
+                };
+                let rep_frame = protocol::encode_reply(&reply);
+                transport::send_frame(&control, &rep_frame)?;
+                transport::send_frame(&control, &rep_frame)?;
+            }
+            Ok(())
+        }
         StubBehaviour::WedgedHoldingLock => {
             let _lock = if unsafe { libc::fcntl(super::LOCK_FD, libc::F_GETFD) } >= 0 {
                 let lock = take_inherited_fd(super::LOCK_FD, "executor device lock")?;
@@ -1561,6 +1603,7 @@ impl Drop for DrmMasterGuard {
 /// Spawn a real helper process connected to `device`.
 #[doc(hidden)]
 pub fn spawn_real_helper_for_tests(device: &TestDevice) -> KmsIoExecutor {
+    let _spawn_guard = process_spawn_guard_for_tests();
     let exe = executor_executable().expect("executor executable");
     spawn_internal(&exe, device.as_fd(), IncarnationId::first(), None).expect("spawn real helper")
 }
@@ -1610,6 +1653,7 @@ pub fn spawn_stub_helper_with_inherited_fd(
     behaviour: StubBehaviour,
     inherited_fd: impl AsFd,
 ) -> io::Result<KmsIoExecutor> {
+    let _spawn_guard = process_spawn_guard_for_tests();
     let exe = executor_executable()?;
     spawn_internal(
         &exe,

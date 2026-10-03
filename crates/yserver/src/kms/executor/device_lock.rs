@@ -223,7 +223,7 @@ impl DeviceLock {
     #[cfg(test)]
     pub fn duplicate_for_tests(&self) -> Self {
         use std::os::fd::FromRawFd;
-        let dup = unsafe { libc::dup(self.file.as_raw_fd()) };
+        let dup = unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
         if dup < 0 {
             panic!("dup failed: {}", io::Error::last_os_error());
         }
@@ -426,6 +426,7 @@ mod tests {
 
     #[test]
     fn a_lock_held_by_another_process_blocks_install() {
+        let _spawn_guard = crate::kms::executor::test_support::process_spawn_guard_for_tests();
         let device = DrmDeviceKey {
             major: 226,
             minor: 0,
@@ -444,6 +445,7 @@ mod tests {
 
     #[test]
     fn the_lock_is_released_when_the_holder_dies() {
+        let _spawn_guard = crate::kms::executor::test_support::process_spawn_guard_for_tests();
         let device = DrmDeviceKey {
             major: 226,
             minor: 1,
@@ -463,6 +465,7 @@ mod tests {
 
     #[test]
     fn a_sigkilled_holder_still_releases_the_lock() {
+        let _spawn_guard = crate::kms::executor::test_support::process_spawn_guard_for_tests();
         // This is the property COMMIT-7 rests on: the guarantee must survive a
         // service manager killing the parent, so it cannot depend on any
         // orderly release path running.
@@ -513,6 +516,7 @@ mod tests {
 
     #[test]
     fn dropping_a_device_lock_does_not_unlock_a_shared_description() {
+        let _spawn_guard = crate::kms::executor::test_support::process_spawn_guard_for_tests();
         let key = DrmDeviceKey {
             major: 226,
             minor: 250,
@@ -533,6 +537,7 @@ mod tests {
 
     #[test]
     fn an_explicit_release_is_still_available_before_handoff_and_is_global() {
+        let _spawn_guard = crate::kms::executor::test_support::process_spawn_guard_for_tests();
         let key = DrmDeviceKey {
             major: 226,
             minor: 251,
@@ -549,6 +554,7 @@ mod tests {
 
     #[test]
     fn an_inheritable_lock_still_holds_and_still_releases_on_last_close() {
+        let _spawn_guard = crate::kms::executor::test_support::process_spawn_guard_for_tests();
         let key = DrmDeviceKey {
             major: 226,
             minor: 252,

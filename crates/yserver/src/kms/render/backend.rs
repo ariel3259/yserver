@@ -59528,11 +59528,20 @@ mod tests {
     fn on_executor_readable_drains_more_than_one_queued_event() {
         let mut backend = backend_with_stub_executors_with_behaviour_for_tests(
             1,
-            crate::kms::executor::test_support::StubBehaviour::ReplyTwiceWith(libc::EINVAL),
+            crate::kms::executor::test_support::StubBehaviour::ReplyTwiceThenExitWith(libc::EINVAL),
         );
         let mut state = yserver_core::server::ServerState::new();
         send_rejected_host_call_for_tests(&mut backend);
-        // Terminalize via tick past deadline so both replies are accepted as LateReply
+        // Wait until the helper has queued both replies and exited before
+        // delivering the watchdog terminalization. Then one readable callback
+        // observes two already-queued LateReply events under any host load.
+        crate::kms::executor::test_support::wait_for_helper_exit(
+            backend.platform.devices[0]
+                .executor
+                .as_mut()
+                .expect("executor"),
+            std::time::Duration::from_secs(5),
+        );
         let _ = backend
             .platform
             .tick_executors(std::time::Instant::now() + std::time::Duration::from_secs(3));
@@ -61396,21 +61405,24 @@ mod tests {
             cleanup_io,
         } = copied_owner_live_fixture()
             .expect("environmental skip: no copied-route Vulkan fixture available");
+        let previous_generation = backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .map_or(0, |(_, generation, _)| generation);
         backend.scene.mark_scene_structure_dirty();
         c0_3bi_core_driver_until(
             &mut backend,
             "prepare copied A through the core iteration tail",
             std::time::Duration::from_secs(3),
             &|backend| {
-                backend
-                    .scene
-                    .owner_prepared_for_tests(0)
-                    .is_some_and(|(_, _, rendering)| rendering)
+                backend.scene.owner_prepared_for_tests(0).is_some_and(
+                    |(_, generation, rendering)| generation > previous_generation && rendering,
+                )
             },
             None,
         )
-        .expect("core iteration tail prepares copied A");
-        let (bo_idx, _, rendering) = backend
+        .expect("core iteration tail prepares the new copied A generation");
+        let (bo_idx, generation, rendering) = backend
             .scene
             .owner_prepared_for_tests(0)
             .expect("copied Owner tick must retain a prepared generation");
@@ -61418,6 +61430,7 @@ mod tests {
             rendering,
             "stage A must remain in Rendering before its wake"
         );
+        assert!(generation > previous_generation);
         let (source_key, destination_key) = match backend.platform.scanout_pools[0]
             .as_ref()
             .expect("copied pool")
@@ -61458,6 +61471,143 @@ mod tests {
                 .device_wait_idle()
                 .expect("copied sink device idle");
         }
+    }
+
+    fn c0_conv_prepare_copy_wake_with_read_obligation_held(
+        backend: &mut super::KmsBackend,
+        bo_idx: usize,
+        instance: crate::kms::backend::OutputInstanceId,
+        source_key: crate::kms::render::resources::AllocationKey,
+        destination_key: crate::kms::render::resources::AllocationKey,
+        label: &str,
+    ) -> (crate::kms::render::resources::ObligationId, u64) {
+        use crate::kms::render::platform::ScanoutRenderCompletionStage::{CopiedOwnerCopy, Render};
+
+        backend
+            .resource_service_mut()
+            .expect("copied resource service")
+            .hold_next_copied_batch_for_tests(source_key, destination_key);
+        let mut held_a_render = backend
+            .platform
+            .hold_scanout_render_completion_for_buffer_for_tests(instance, Render, bo_idx)
+            .expect("hold exact A render notification");
+        backend
+            .platform
+            .hold_next_scanout_render_completion_for_buffer_for_tests(
+                instance,
+                CopiedOwnerCopy,
+                bo_idx,
+            );
+        if held_a_render.is_none() {
+            backend
+                .platform
+                .hold_next_scanout_render_completion_for_buffer_for_tests(instance, Render, bo_idx);
+            c0_3bi_core_driver_until(
+                backend,
+                &format!("{label}: wait for exact A renderer completion"),
+                std::time::Duration::from_secs(3),
+                &|backend| {
+                    backend
+                        .platform
+                        .held_scanout_render_completions_for_tests(instance, Render)
+                        .iter()
+                        .any(|(_, held_bo_idx)| *held_bo_idx == bo_idx)
+                },
+                None,
+            )
+            .unwrap_or_else(|error| panic!("{error}"));
+            held_a_render = backend
+                .platform
+                .held_scanout_render_completions_for_tests(instance, Render)
+                .into_iter()
+                .find_map(|(job_id, held_bo_idx)| (held_bo_idx == bo_idx).then_some(job_id));
+        }
+        let held_a_render = held_a_render.expect("the exact A render notification is held");
+        backend.platform.wait_idle_bounded();
+        backend
+            .platform
+            .release_scanout_render_completion_for_tests(held_a_render)
+            .expect("release A's render notification");
+        let a_completion = c0_3bi_take_subject_scanout_completion(
+            backend,
+            held_a_render,
+            instance,
+            Render,
+            bo_idx,
+        );
+        c0_3bi_handle_retired_copied_completion(backend, a_completion);
+
+        c0_3bi_core_driver_until_before_iteration_tail(
+            backend,
+            &format!("{label}: wait for exact copied B receipt and wake"),
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend
+                    .scene
+                    .copied_receipt_for_tests(0, bo_idx)
+                    .is_some_and(|((destination, _), (source, obligation))| {
+                        destination == destination_key
+                            && source == source_key
+                            && backend.resource_service().is_some_and(|service| {
+                                service.has_pending_obligation(&source_key, obligation)
+                            })
+                            && backend
+                                .platform
+                                .held_scanout_render_completions_for_tests(
+                                    instance,
+                                    CopiedOwnerCopy,
+                                )
+                                .iter()
+                                .any(|(_, held_bo_idx)| *held_bo_idx == bo_idx)
+                    })
+            },
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+
+        let ((receipt_destination, _), (receipt_source, read_obligation)) = backend
+            .scene
+            .copied_receipt_for_tests(0, bo_idx)
+            .expect("A's render completion submits copied B");
+        assert_eq!(receipt_destination, destination_key);
+        assert_eq!(receipt_source, source_key);
+        assert!(
+            backend
+                .resource_service()
+                .expect("copied resource service")
+                .has_pending_obligation(&source_key, read_obligation),
+            "the held B batch retains its source read obligation"
+        );
+
+        wait_copied_sink_idle(backend);
+        let held_copy_completion = backend
+            .platform
+            .held_scanout_render_completions_for_tests(instance, CopiedOwnerCopy)
+            .into_iter()
+            .find_map(|(job_id, held_bo_idx)| (held_bo_idx == bo_idx).then_some(job_id))
+            .expect("the copied B notification remains held after its fence signals");
+        (read_obligation, held_copy_completion)
+    }
+
+    fn c0_conv_handle_held_copy_wake(
+        backend: &mut super::KmsBackend,
+        bo_idx: usize,
+        instance: crate::kms::backend::OutputInstanceId,
+        held_copy_completion: u64,
+    ) {
+        use crate::kms::render::platform::ScanoutRenderCompletionStage::CopiedOwnerCopy;
+
+        backend
+            .platform
+            .release_scanout_render_completion_for_tests(held_copy_completion)
+            .expect("release the copied B notification");
+        let completion = c0_3bi_take_subject_scanout_completion(
+            backend,
+            held_copy_completion,
+            instance,
+            CopiedOwnerCopy,
+            bo_idx,
+        );
+        c0_3bi_handle_retired_copied_completion(backend, completion);
     }
 
     fn copied_owner_commit_for_tests() -> (
@@ -61686,25 +61836,41 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_cp_readable_fence_with_pending_obligation_offers_nothing_vulkan() {
-        let (mut fixture, bo_idx, _, destination_key) = copied_owner_frame_after_a();
-        fixture.backend.platform.wait_idle_bounded();
-        fixture.backend.drain_scanout_render_completions_for_tests();
+        let (mut fixture, bo_idx, source_key, destination_key) = copied_owner_frame_after_a();
+        let instance = fixture
+            .backend
+            .scene
+            .output_instance_id_for_tests(0)
+            .expect("copied output instance");
+        let (source_obligation, copy_completion) =
+            c0_conv_prepare_copy_wake_with_read_obligation_held(
+                &mut fixture.backend,
+                bo_idx,
+                instance,
+                source_key,
+                destination_key,
+                "hold the copied B obligation while its wake is readable",
+            );
+        c0_conv_handle_held_copy_wake(&mut fixture.backend, bo_idx, instance, copy_completion);
+
         let (_, destination_obligation) = fixture
             .backend
             .scene
             .copied_receipt_for_tests(0, bo_idx)
             .expect("production B preparation must retain the receipt")
             .0;
-
-        // The first drain only consumed A's already-registered wake.  The
-        // second drain consumes B's real sync_file wake while the service
-        // still owns the correlated obligation.
-        fixture.backend.platform.wait_idle_bounded();
-        fixture.backend.drain_scanout_render_completions_for_tests();
         assert_eq!(
             fixture.backend.scene.owner_state_for_tests(0, bo_idx),
             Some(crate::kms::render::owner_buffer::OwnerBufferState::Rendering),
             "a readable copy fence is not itself permission to promote"
+        );
+        assert!(
+            fixture
+                .backend
+                .resource_service_mut()
+                .expect("resource service")
+                .has_pending_obligation(&source_key, source_obligation),
+            "the copied read obligation remains pending after its readable wake"
         );
         assert!(
             fixture
@@ -61773,6 +61939,8 @@ mod tests {
             .expect("resource service")
             .service_completions(std::time::Instant::now())
             .expect("the real B fence must retire");
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
         assert!(
             !fixture
                 .backend
@@ -61910,25 +62078,31 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_cp_source_released_by_the_read_obligation_vulkan() {
-        let (mut pending_fixture, pending_bo_idx, pending_source_key, _) =
+        let (mut pending_fixture, pending_bo_idx, pending_source_key, pending_destination_key) =
             copied_owner_frame_after_a();
-
-        // A's completion is only the handoff into B. The source read debt and
-        // B's temporary sink wait must both still be live after that wake.
-        pending_fixture.backend.platform.wait_idle_bounded();
-        pending_fixture
-            .backend
-            .drain_scanout_render_completions_for_tests();
-        let (_, pending_source_obligation) = pending_fixture
+        let pending_instance = pending_fixture
             .backend
             .scene
-            .copied_receipt_for_tests(0, pending_bo_idx)
-            .expect("production B preparation must retain the source receipt")
-            .1;
+            .output_instance_id_for_tests(0)
+            .expect("copied output instance");
+
+        // A's completion is only the handoff into B. The source read debt and
+        // B's temporary sink wait must both remain live after B's wake. Hold
+        // the exact resource ticket and renderer notification so CPU/GPU load
+        // cannot retire the read debt before the assertion observes it.
+        let (pending_source_obligation, pending_copy_completion) =
+            c0_conv_prepare_copy_wake_with_read_obligation_held(
+                &mut pending_fixture.backend,
+                pending_bo_idx,
+                pending_instance,
+                pending_source_key,
+                pending_destination_key,
+                "deliver copied B wake while its source read obligation is held",
+            );
         assert!(
             pending_fixture
                 .backend
-                .resource_service_mut()
+                .resource_service()
                 .expect("resource service")
                 .has_pending_obligation(&pending_source_key, pending_source_obligation),
             "B's read obligation must hold the source after A retires"
@@ -61943,18 +62117,16 @@ mod tests {
             pending_waits_before_b.0,
             "the sink wait remains live while B's read obligation is pending"
         );
-
-        // The copy wake can arrive before the resource-service ticket has
-        // retired. The release site is reached in that state, but CP-10 must
-        // leave the source synchronization payload untouched.
-        pending_fixture.backend.platform.wait_idle_bounded();
-        pending_fixture
-            .backend
-            .drain_scanout_render_completions_for_tests();
+        c0_conv_handle_held_copy_wake(
+            &mut pending_fixture.backend,
+            pending_bo_idx,
+            pending_instance,
+            pending_copy_completion,
+        );
         assert!(
             pending_fixture
                 .backend
-                .resource_service_mut()
+                .resource_service()
                 .expect("resource service")
                 .has_pending_obligation(&pending_source_key, pending_source_obligation),
             "B's source read obligation must still be pending when its wake is handled"
@@ -61972,20 +62144,26 @@ mod tests {
         drop(pending_fixture);
 
         // Repeat the production route so the original proof can deliver B's
-        // existing wake after its real resource-service retirement.
-        let (mut fixture, bo_idx, source_key, _) = copied_owner_frame_after_a();
-        fixture.backend.platform.wait_idle_bounded();
-        fixture.backend.drain_scanout_render_completions_for_tests();
-        let (_, source_obligation) = fixture
+        // held read debt and then retire that debt through the resource service.
+        let (mut fixture, bo_idx, source_key, destination_key) = copied_owner_frame_after_a();
+        let instance = fixture
             .backend
             .scene
-            .copied_receipt_for_tests(0, bo_idx)
-            .expect("production B preparation must retain the source receipt")
-            .1;
+            .output_instance_id_for_tests(0)
+            .expect("copied output instance");
+        let (source_obligation, copy_completion) =
+            c0_conv_prepare_copy_wake_with_read_obligation_held(
+                &mut fixture.backend,
+                bo_idx,
+                instance,
+                source_key,
+                destination_key,
+                "deliver the second copied B wake while its source read obligation is held",
+            );
         assert!(
             fixture
                 .backend
-                .resource_service_mut()
+                .resource_service()
                 .expect("resource service")
                 .has_pending_obligation(&source_key, source_obligation),
             "B's read obligation must hold the source after A retires"
@@ -62001,9 +62179,11 @@ mod tests {
             "the sink wait remains live while B's read obligation is pending"
         );
 
-        // Retire B through the resource service, then deliver its existing
-        // sync-file wake. No Owner commit or flip is involved in this proof.
-        wait_copied_sink_idle(&fixture.backend);
+        c0_3bi_release_copied_resource_completion_for_tests(
+            &mut fixture.backend,
+            source_key,
+            destination_key,
+        );
         fixture
             .backend
             .resource_service_mut()
@@ -62013,11 +62193,12 @@ mod tests {
         assert!(
             !fixture
                 .backend
-                .resource_service_mut()
+                .resource_service()
                 .expect("resource service")
                 .has_pending_obligation(&source_key, source_obligation),
-            "the source read obligation must retire with B's batch"
+            "the source read obligation retires with B's batch"
         );
+        c0_conv_handle_held_copy_wake(&mut fixture.backend, bo_idx, instance, copy_completion);
         fixture.backend.platform.wait_idle_bounded();
         fixture.backend.drain_scanout_render_completions_for_tests();
         let waits_after_b = fixture
@@ -62028,7 +62209,7 @@ mod tests {
             .expect("managed copied source");
         assert!(
             !waits_after_b.0 && !waits_after_b.1,
-            "B's retired read obligation, not an Owner ack or flip, releases source waits"
+            "B's retired read obligation, not an Owner ack or flip, releases source waits: {waits_after_b:?}"
         );
     }
 
@@ -66898,15 +67079,38 @@ mod tests {
             32,
         );
         backend.sync_top_level_order(&state);
+        let device = backend.platform.primary_device().expect("device").key;
+
+        // Mapping this window damages its visible left edge as well as the
+        // off-output area painted below. Retire that setup damage first so
+        // the target frame proves that only the later off-output paint is
+        // withheld from this output's acknowledgement.
+        c0_3bi_compose_and_drain(&mut backend);
+        let map_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("mapped window compose")
+            .commit_id();
+        assert!(c0_3bi_drive_owner_batch(
+            &mut backend,
+            device,
+            vec![
+                crate::kms::owner::device::OwnerEvent::Accepted { commit: map_commit },
+                crate::kms::owner::device::OwnerEvent::HardwareComplete { commit: map_commit },
+            ],
+            "retire visible map damage before off-output paint",
+        ));
+        assert!(
+            !backend.test_peek_presentation_damage_nonempty(window.as_raw()),
+            "the visible map damage is acknowledged before the off-output paint"
+        );
+
         backend
             .fill_rectangle(None, window.as_raw(), 0x0000_22ff, 20, 0, 12, 32)
             .expect("paint the off-output window");
         assert!(backend.test_peek_presentation_damage_nonempty(window.as_raw()));
 
-        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
-        backend.platform.wait_idle_bounded();
-        backend.drain_scanout_render_completions_for_tests();
-        let device = backend.platform.primary_device().expect("device").key;
+        c0_3bi_compose_and_drain(&mut backend);
         let commit = backend
             .device_owner_for_tests(0)
             .live_record()
@@ -66926,14 +67130,15 @@ mod tests {
                 )
         );
 
-        backend.route_owner_event_batch(
+        assert!(c0_3bi_drive_owner_batch(
+            &mut backend,
             device,
             vec![
                 crate::kms::owner::device::OwnerEvent::Accepted { commit },
                 crate::kms::owner::device::OwnerEvent::HardwareComplete { commit },
             ],
-            std::time::Instant::now(),
-        );
+            "acknowledge the off-output-only compose",
+        ));
         assert!(
             backend.test_peek_presentation_damage_nonempty(window.as_raw()),
             "OffOutput damage must remain pending after this output's ack"
@@ -71778,6 +71983,9 @@ mod tests {
                             .map(|(_, commit)| commit),
                     );
                 }
+                if stop_before_iteration_tail_when_done && done(backend) {
+                    return Ok(());
+                }
                 c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete);
                 if done(backend)
                     && (stop_immediately_when_done
@@ -72723,17 +72931,21 @@ mod tests {
         backend
             .platform
             .queue_ready_scanout_render_completion_for_tests(completion);
-        c0_3bi_core_driver_until(
+        backend.core_driver_readiness_script_for_tests.push_back((
+            yserver_core::backend::BackendFdKind::ScanoutRenderCompletion,
+            -1,
+        ));
+        c0_3bi_core_driver_until_before_iteration_tail(
             backend,
             "copied scanout render completion",
             std::time::Duration::from_secs(2),
             &|backend| {
-                backend
-                    .platform
-                    .ready_scanout_render_completions_for_tests
-                    .is_empty()
+                backend.core_driver_readiness_script_for_tests.is_empty()
+                    && backend
+                        .platform
+                        .ready_scanout_render_completions_for_tests
+                        .is_empty()
             },
-            None,
         )
         .unwrap_or_else(|error| panic!("{error}"));
     }

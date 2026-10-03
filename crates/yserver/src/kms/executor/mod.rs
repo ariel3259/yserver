@@ -1528,7 +1528,10 @@ pub(crate) fn spawn_internal_full(
             ..
         }) => ignore_termination,
         Some(test_support::StubBehaviour::WedgedHoldingLock) => true,
-        Some(test_support::StubBehaviour::ReplyTwiceWith(_)) => true,
+        Some(
+            test_support::StubBehaviour::ReplyTwiceWith(_)
+            | test_support::StubBehaviour::ReplyTwiceThenExitWith(_),
+        ) => true,
         _ => false,
     };
 
@@ -1710,19 +1713,23 @@ mod tests {
     fn early_take_reap_proof_returns_none_and_does_not_invalidate_future_proof() {
         let mut fds = IncarnationFdSet::default();
         let lease = fds.register_alias(std::fs::File::open("/dev/null").expect("open").into());
-        let mut executor = stub_executor(StubBehaviour::ExitBeforeReply, lease);
+        let mut executor = stub_executor(StubBehaviour::NeverReply, lease);
         // Process has not replied or exited yet before dispatch
         assert!(executor.take_reap_proof().is_none());
         assert_eq!(executor.state(), ExecutorState::Live);
 
-        let _ = executor.dispatch_for_tests(HostCallClass::SeatActiveNonblock);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let mut reap = executor.try_reap();
-        while std::time::Instant::now() < deadline && !matches!(reap, ReapState::Reaped(_)) {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-            reap = executor.try_reap();
-        }
-        assert!(matches!(reap, ReapState::Reaped(_)));
+        let request = test_support::small_atomic_request_for_tests();
+        executor
+            .send(
+                &request,
+                HostCallReservation::Submitting(SubmittingProof::for_tests()),
+            )
+            .expect("send while helper remains live");
+        assert!(executor.take_reap_proof().is_none());
+        assert_eq!(executor.state(), ExecutorState::Live);
+
+        executor.request_termination();
+        test_support::reap_within(&mut executor, Duration::from_secs(5));
         let proof = executor
             .take_reap_proof()
             .expect("reap proof must still be available");

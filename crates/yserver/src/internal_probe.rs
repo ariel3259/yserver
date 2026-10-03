@@ -1413,6 +1413,7 @@ mod tests {
             watchdog: Duration::from_secs(1),
         };
         let kms = File::open("/dev/null").expect("open inert KMS fixture");
+        let _spawn_guard = crate::kms::executor::test_support::process_spawn_guard_for_tests();
         let error = supervisor
             .run(kms.as_fd(), request(22, true))
             .expect_err("non-helper child must fail its protocol exchange");
@@ -1439,6 +1440,7 @@ mod tests {
         unsafe {
             command.pre_exec(|| arm_helper_parent_death_signal(-1));
         }
+        let _spawn_guard = crate::kms::executor::test_support::process_spawn_guard_for_tests();
         let error = command
             .spawn()
             .expect_err("stale captured parent must fail before exec");
@@ -1776,10 +1778,13 @@ mod tests {
                 .write_all(&copied_response(&decoded).encode())
                 .expect("write response");
         });
-        let child = Command::new("/bin/sleep")
-            .arg("10")
-            .spawn()
-            .expect("spawn sleeping child");
+        let child = {
+            let _spawn_guard = crate::kms::executor::test_support::process_spawn_guard_for_tests();
+            Command::new("/bin/sleep")
+                .arg("10")
+                .spawn()
+                .expect("spawn sleeping child")
+        };
 
         let started = Instant::now();
         let observed = supervise_exchange(child, parent, request, Duration::from_secs(1))
@@ -1796,10 +1801,13 @@ mod tests {
             "Duration::MAX must overflow this platform's Instant"
         );
         let (parent, _helper) = UnixStream::pair().expect("socketpair");
-        let child = Command::new("/bin/sleep")
-            .arg("10")
-            .spawn()
-            .expect("spawn sleeping child");
+        let child = {
+            let _spawn_guard = crate::kms::executor::test_support::process_spawn_guard_for_tests();
+            Command::new("/bin/sleep")
+                .arg("10")
+                .spawn()
+                .expect("spawn sleeping child")
+        };
         let child_pid = libc::pid_t::try_from(child.id()).expect("child pid fits pid_t");
 
         let error = supervise_exchange(child, parent, request(12, true), Duration::MAX)
@@ -1837,10 +1845,13 @@ mod tests {
                 .expect("write partial response");
             thread::sleep(Duration::from_millis(100));
         });
-        let child = Command::new("/bin/sleep")
-            .arg("10")
-            .spawn()
-            .expect("spawn sleeping child");
+        let child = {
+            let _spawn_guard = crate::kms::executor::test_support::process_spawn_guard_for_tests();
+            Command::new("/bin/sleep")
+                .arg("10")
+                .spawn()
+                .expect("spawn sleeping child")
+        };
 
         let started = Instant::now();
         let error = supervise_exchange(child, parent, request(13, true), Duration::from_millis(30))
