@@ -11961,11 +11961,29 @@ impl KmsBackend {
                 latched_group,
                 u32::from(locked_group),
             );
+            // Detaching a slave for an XI grab changes its attachment, not
+            // its key-down bitmap. Xorg's DetachFromMaster only calls
+            // AttachDevice(NULL, ...) (dix/events.c:1463-1471), and a later
+            // release clears that device bitmap in UpdateDeviceState
+            // (Xi/exevents.c:934-943). Seed both the duplicate guard and the
+            // local XKB state from the keys the attached facet already held.
+            let down_keys: HashSet<u8> = state
+                .key_down_by_device
+                .get(&device_id)
+                .into_iter()
+                .flat_map(|held| held.keys().copied())
+                .collect();
+            for keycode in &down_keys {
+                xkb_state.update_key(
+                    xkbcommon::xkb::Keycode::new(u32::from(*keycode)),
+                    xkbcommon::xkb::KeyDirection::Down,
+                );
+            }
             self.floating_keyboard_states.insert(
                 device_id,
                 FloatingKeyboardState {
                     xkb_state: crate::kms::core::XkbState(xkb_state),
-                    down_keys: HashSet::new(),
+                    down_keys,
                     locked_group,
                 },
             );
@@ -19670,7 +19688,11 @@ impl KmsBackend {
         };
 
         commit_key_transition(state, raw.origin, raw.keycode, raw.pressed, transition);
-        if !(repeat && !cooked.pressed) {
+        // RECORD's core conversion is attached to master-device callbacks
+        // only (record/record.c:784-794). A slave edge can update its own
+        // bitmap while the master rejects the duplicate or the slave is
+        // floating; those edges must not be recorded as core transitions.
+        if transition.master_accepted && !(repeat && !cooked.pressed) {
             yserver_core::core_loop::record::record_device_event(
                 state,
                 yserver_core::core_loop::record::RecordedDeviceEvent {
@@ -19761,14 +19783,31 @@ impl KmsBackend {
             })
             .unwrap_or(0);
 
-        // Xorg dix/devices.c::ReleaseButtonsAndKeys releases pointer buttons
-        // in ascending button order before it starts the key loop.
-        for detail in 1..=9 {
-            let bit = 1u16 << (detail - 1);
+        // `buttons_down` stores logical button details. Find the physical
+        // detail that produced each held logical button so re-entering the
+        // host-input path applies SetPointerMapping exactly once. Xorg keeps
+        // the physical down bit and maps it at delivery (Xi/exevents.c:1922-
+        // 1934); ReleaseButtonsAndKeys walks those physical bits in order
+        // (dix/devices.c:2636-2642).
+        let mapping = state.pointer_mapping_override.as_deref();
+        let mut releases = Vec::new();
+        for logical_detail in 1..=9 {
+            let bit = 1u16 << (logical_detail - 1);
             if held & bit == 0 {
                 continue;
             }
-            let code = match detail {
+            let physical_detail = mapping
+                .and_then(|map| {
+                    if usize::from(logical_detail) > map.len() {
+                        None
+                    } else {
+                        map.iter()
+                            .position(|mapped| *mapped == logical_detail)
+                            .and_then(|index| u8::try_from(index + 1).ok())
+                    }
+                })
+                .unwrap_or(logical_detail);
+            let code = match physical_detail {
                 1 => 0x110,
                 2 => 0x112,
                 3 => 0x111,
@@ -19780,6 +19819,10 @@ impl KmsBackend {
                 9 => 0x114,
                 _ => unreachable!("button release loop is bounded to 1..=9"),
             };
+            releases.push((physical_detail, code));
+        }
+        releases.sort_unstable_by_key(|(detail, _)| *detail);
+        for (_, code) in releases {
             Backend::on_host_input(
                 self,
                 state,
@@ -39498,6 +39541,10 @@ mod tests {
                 i += 32;
                 continue;
             }
+            let event_len = 32 + 4 * rd32(i + 4) as usize;
+            if i + event_len > bytes.len() {
+                break;
+            }
             let evtype = rd16(i + 8);
             // Raw events carry sourceid at byte 20, device events at 52.
             let sourceid = if (13..=17).contains(&evtype) {
@@ -39506,9 +39553,664 @@ mod tests {
                 rd16(i + 52)
             };
             out.push((evtype, rd16(i + 10), sourceid, rd32(i + 16), rd32(i + 12)));
-            i += 32 + 4 * rd32(i + 4) as usize;
+            i += event_len;
         }
         out
+    }
+
+    fn kbd_map_drain_until(
+        peer: &mut std::os::unix::net::UnixStream,
+        ready: impl Fn(&[u8]) -> bool,
+    ) -> Vec<u8> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut bytes = Vec::new();
+        loop {
+            bytes.extend(kbd_map_drain(peer));
+            if ready(&bytes) || std::time::Instant::now() >= deadline {
+                return bytes;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    fn dynamic_test_device(
+        source_id: yserver_core::xinput::InputSourceId,
+        keyboard: bool,
+        pointer: bool,
+    ) -> yserver_core::core_loop::DeviceInfo {
+        yserver_core::core_loop::DeviceInfo {
+            source_id,
+            enabled: true,
+            resume_key: None,
+            capabilities: yserver_core::xinput::InputCapabilities {
+                keyboard,
+                pointer,
+                touch: false,
+            },
+            name: format!("dynamic test device {}", source_id.0),
+            device_node: format!("/dev/input/event{}", source_id.0),
+            sysname: format!("event{}", source_id.0),
+            vendor_id: 0,
+            product_id: 0,
+            is_touchpad: false,
+            config: yserver_core::core_loop::message::LibinputConfigSnapshot::default(),
+        }
+    }
+
+    fn process_dynamic_test_keyboard_grab(
+        backend: &mut KmsBackend,
+        state: &mut yserver_core::server::ServerState,
+        client: u32,
+        device_id: u16,
+        sequence: u16,
+    ) {
+        use yserver_core::{backend::Backend, core_loop::process_request};
+        let mut body = Vec::with_capacity(24);
+        body.extend_from_slice(&yserver_core::resources::ROOT_WINDOW.0.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // cursor
+        body.extend_from_slice(&0u32.to_le_bytes()); // time
+        body.extend_from_slice(&device_id.to_le_bytes());
+        body.extend_from_slice(&[1, 1, 0, 0]); // async device and paired modes, owner_events=false
+        body.extend_from_slice(&1u16.to_le_bytes());
+        body.extend_from_slice(&((1u32 << 2) | (1u32 << 3)).to_le_bytes()); // KeyPress/Release
+        process_request::process_request(
+            state,
+            backend as &mut dyn Backend,
+            yserver_protocol::x11::ClientId(client),
+            yserver_protocol::x11::SequenceNumber(sequence),
+            yserver_protocol::x11::RequestHeader {
+                opcode: 137,
+                data: 51,
+                length_units: 7,
+            },
+            &body,
+            None,
+        )
+        .expect("XIGrabDevice on dynamic keyboard facet");
+    }
+
+    fn process_dynamic_test_keyboard_ungrab(
+        backend: &mut KmsBackend,
+        state: &mut yserver_core::server::ServerState,
+        client: u32,
+        device_id: u16,
+        sequence: u16,
+    ) {
+        use yserver_core::{backend::Backend, core_loop::process_request};
+        let mut body = Vec::with_capacity(8);
+        body.extend_from_slice(&0u32.to_le_bytes()); // time
+        body.extend_from_slice(&device_id.to_le_bytes());
+        body.extend_from_slice(&[0, 0]);
+        process_request::process_request(
+            state,
+            backend as &mut dyn Backend,
+            yserver_protocol::x11::ClientId(client),
+            yserver_protocol::x11::SequenceNumber(sequence),
+            yserver_protocol::x11::RequestHeader {
+                opcode: 137,
+                data: 52,
+                length_units: 3,
+            },
+            &body,
+            None,
+        )
+        .expect("XIUngrabDevice on dynamic keyboard facet");
+    }
+
+    #[test]
+    fn xi_dynamic_keyboard_release_after_grab_clears_the_slave_hold() {
+        use yserver_core::{
+            backend::Backend,
+            core_loop::{HostInputEvent, InputOrigin},
+            host_x11::HostKeyEvent,
+            server::ServerState,
+            xinput::{InputSourceId, XiFacetKind},
+        };
+
+        const SOURCE: InputSourceId = InputSourceId(0xA201);
+        const CLIENT: u32 = 71;
+        const KEYCODE: u8 = 50;
+        let mut backend = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        let mut peer = kbd_map_client_id(&mut state, CLIENT);
+        backend.on_host_input(
+            &mut state,
+            HostInputEvent::DeviceAdded(dynamic_test_device(SOURCE, true, false)),
+        );
+        let device_id = state
+            .xi_devices
+            .facet(SOURCE, XiFacetKind::Keyboard)
+            .expect("DeviceAdded publishes the keyboard facet");
+        let key = |pressed| {
+            HostInputEvent::Key(HostKeyEvent {
+                origin: InputOrigin::Physical(SOURCE),
+                pressed,
+                keycode: KEYCODE,
+                time: 0,
+                root_x: 0,
+                root_y: 0,
+                event_x: 0,
+                event_y: 0,
+                state: 0,
+            })
+        };
+
+        backend.on_host_input(&mut state, key(true));
+        assert!(state.key_down_by_device[&device_id].contains_key(&KEYCODE));
+        let master_key_bit = 1u8 << (KEYCODE % 8);
+        assert_ne!(
+            state.keys_down[usize::from(KEYCODE / 8)] & master_key_bit,
+            0
+        );
+
+        process_dynamic_test_keyboard_grab(&mut backend, &mut state, CLIENT, device_id, 1);
+        assert_eq!(
+            state.xi_devices.device(device_id).unwrap().attached_master,
+            None
+        );
+        assert!(state.xi2_keyboard_grabs.contains_key(&device_id));
+        let _ = kbd_map_drain(&mut peer);
+
+        backend.on_host_input(&mut state, key(false));
+
+        assert!(
+            !state
+                .key_down_by_device
+                .get(&device_id)
+                .is_some_and(|held| held.contains_key(&KEYCODE)),
+            "the physical slave's held key clears when its floating release is accepted",
+        );
+        assert!(
+            backend.floating_keyboard_states[&device_id]
+                .down_keys
+                .is_empty()
+        );
+        assert!(
+            state.xi2_keyboard_grabs.contains_key(&device_id),
+            "the release does not end an explicit active grab",
+        );
+        assert_eq!(
+            state.xi_devices.device(device_id).unwrap().attached_master,
+            None
+        );
+        assert!(state.sync_pending.is_empty());
+        assert_ne!(
+            state.keys_down[usize::from(KEYCODE / 8)] & master_key_bit,
+            0,
+            "Xorg's floating slave release clears its own key bitmap; the detached master bitmap remains as it was",
+        );
+        let release_wire = kbd_map_drain_until(&mut peer, |bytes| {
+            xi2_events(bytes)
+                .iter()
+                .any(|event| event.0 == 3 && event.1 == device_id && event.3 == u32::from(KEYCODE))
+        });
+        let release_events = xi2_events(&release_wire);
+        assert_eq!(
+            release_events
+                .iter()
+                .filter(|event| event.0 == 3
+                    && event.1 == device_id
+                    && event.3 == u32::from(KEYCODE))
+                .count(),
+            1,
+            "the active slave grab receives the floating KeyRelease: events={release_events:?}, bytes={}, buffered={}, freeze={:?}, grab={:?}",
+            release_wire.len(),
+            state.clients[&CLIENT].outbound.len(),
+            state.xi1_frozen.get(&device_id),
+            state.xi2_keyboard_grabs.get(&device_id),
+        );
+
+        process_dynamic_test_keyboard_ungrab(&mut backend, &mut state, CLIENT, device_id, 2);
+        assert!(!state.xi2_keyboard_grabs.contains_key(&device_id));
+        assert_eq!(
+            state.xi_devices.device(device_id).unwrap().attached_master,
+            Some(yserver_core::xinput::DEVICEID_MASTER_KEYBOARD),
+        );
+        assert!(!backend.floating_keyboard_states.contains_key(&device_id));
+        assert!(state.sync_pending.is_empty());
+        assert!(!state.key_down_by_device.contains_key(&device_id));
+    }
+
+    #[test]
+    fn xi_dynamic_keyboard_removal_releases_a_held_key_before_unregister() {
+        use yserver_core::{
+            backend::Backend,
+            core_loop::HostInputEvent,
+            host_x11::HostKeyEvent,
+            server::ServerState,
+            xinput::{InputSourceId, XiFacetKind},
+        };
+
+        const SOURCE: InputSourceId = InputSourceId(0xA202);
+        const CLIENT: u32 = 72;
+        const KEYCODE: u8 = 50;
+        let mut backend = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        let mut peer = kbd_map_client_id(&mut state, CLIENT);
+        backend.on_host_input(
+            &mut state,
+            HostInputEvent::DeviceAdded(dynamic_test_device(SOURCE, true, false)),
+        );
+        let device_id = state
+            .xi_devices
+            .facet(SOURCE, XiFacetKind::Keyboard)
+            .expect("DeviceAdded publishes the keyboard facet");
+        backend.on_host_input(
+            &mut state,
+            HostInputEvent::Key(HostKeyEvent {
+                origin: yserver_core::core_loop::InputOrigin::Physical(SOURCE),
+                pressed: true,
+                keycode: KEYCODE,
+                time: 0,
+                root_x: 0,
+                root_y: 0,
+                event_x: 0,
+                event_y: 0,
+                state: 0,
+            }),
+        );
+        process_dynamic_test_keyboard_grab(&mut backend, &mut state, CLIENT, device_id, 1);
+        let _ = kbd_map_drain(&mut peer);
+
+        backend.on_host_input(
+            &mut state,
+            HostInputEvent::DeviceRemoved { source_id: SOURCE },
+        );
+
+        let release_wire = kbd_map_drain_until(&mut peer, |bytes| {
+            xi2_events(bytes)
+                .iter()
+                .any(|event| event.0 == 3 && event.1 == device_id && event.3 == u32::from(KEYCODE))
+        });
+        let events = xi2_events(&release_wire);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.0 == 3
+                    && event.1 == device_id
+                    && event.3 == u32::from(KEYCODE))
+                .count(),
+            1,
+            "ReleaseButtonsAndKeys sends a release through the live slave grab before teardown",
+        );
+        assert!(state.xi_devices.source(SOURCE).is_none());
+        assert!(state.xi_devices.device(device_id).is_none());
+        assert!(!state.key_down_by_device.contains_key(&device_id));
+        assert!(!state.xi2_keyboard_grabs.contains_key(&device_id));
+        assert!(!state.xi2_detached_masters.contains_key(&device_id));
+        assert!(!state.xi1_frozen.contains_key(&device_id));
+        assert!(state.sync_pending.is_empty());
+        assert!(!backend.floating_keyboard_states.contains_key(&device_id));
+    }
+
+    #[test]
+    fn xi_registry_unregister_drops_a_real_facets_held_key_bitmap() {
+        use yserver_core::{
+            backend::Backend,
+            core_loop::HostInputEvent,
+            host_x11::HostKeyEvent,
+            server::ServerState,
+            xinput::{InputSourceId, XiFacetKind},
+        };
+
+        const SOURCE: InputSourceId = InputSourceId(0xA20A);
+        let mut backend = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        backend.on_host_input(
+            &mut state,
+            HostInputEvent::DeviceAdded(dynamic_test_device(SOURCE, true, false)),
+        );
+        let device_id = state
+            .xi_devices
+            .facet(SOURCE, XiFacetKind::Keyboard)
+            .expect("DeviceAdded publishes the keyboard facet");
+        backend.on_host_input(
+            &mut state,
+            HostInputEvent::Key(HostKeyEvent {
+                origin: yserver_core::core_loop::InputOrigin::Physical(SOURCE),
+                pressed: true,
+                keycode: 50,
+                time: 0,
+                root_x: 0,
+                root_y: 0,
+                event_x: 0,
+                event_y: 0,
+                state: 0,
+            }),
+        );
+        assert!(state.key_down_by_device[&device_id].contains_key(&50));
+
+        let removed_ids = state.xi_unregister_source(SOURCE);
+
+        assert!(removed_ids.contains(&device_id));
+        assert!(state.xi_devices.source(SOURCE).is_none());
+        assert!(!state.key_down_by_device.contains_key(&device_id));
+        assert!(!state.unpublished_keyboard_keys_down.contains_key(&SOURCE));
+    }
+
+    #[test]
+    fn xi_dynamic_pointer_mapping_cleanup_releases_the_held_logical_button() {
+        use yserver_core::{
+            backend::Backend,
+            core_loop::{HostInputEvent, InputOrigin},
+            server::ServerState,
+            xinput::{InputSourceId, XiFacetKind},
+        };
+        use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
+
+        const SOURCE: InputSourceId = InputSourceId(0xA203);
+        let mut backend = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        let _peer = kbd_map_client_id(&mut state, 73);
+        let mapping = [3u8, 2, 1, 4, 5, 6, 7];
+        yserver_core::core_loop::process_request::process_request(
+            &mut state,
+            &mut backend as &mut dyn Backend,
+            ClientId(73),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 116,
+                data: u8::try_from(mapping.len()).unwrap(),
+                length_units: 3,
+            },
+            &mapping,
+            None,
+        )
+        .expect("SetPointerMapping through process_request");
+        backend.on_host_input(
+            &mut state,
+            HostInputEvent::DeviceAdded(dynamic_test_device(SOURCE, false, true)),
+        );
+        let device_id = state
+            .xi_devices
+            .facet(SOURCE, XiFacetKind::PointerTouch)
+            .expect("DeviceAdded publishes the pointer facet");
+
+        backend.on_host_input(
+            &mut state,
+            HostInputEvent::PointerButton {
+                origin: InputOrigin::Physical(SOURCE),
+                button: 0x110, // physical Button1 maps to logical Button3
+                pressed: true,
+                time: 0,
+            },
+        );
+        assert_eq!(
+            state.xi_devices.device(device_id).unwrap().buttons_down,
+            1 << 2
+        );
+        assert_eq!(state.buttons_down, 1 << 2);
+
+        backend.on_host_input(
+            &mut state,
+            HostInputEvent::DeviceRemoved { source_id: SOURCE },
+        );
+
+        assert!(state.xi_devices.source(SOURCE).is_none());
+        assert!(state.xi_devices.device(device_id).is_none());
+        assert_eq!(
+            state.buttons_down, 0,
+            "the logical master Button3 hold is released"
+        );
+        assert!(state.sync_pending.is_empty());
+        assert!(!state.xi2_pointer_grabs.contains_key(&device_id));
+        assert!(!state.xi2_detached_masters.contains_key(&device_id));
+    }
+
+    #[test]
+    fn xtest_key_input_to_a_floating_keyboard_does_not_change_master_state() {
+        use yserver_core::{
+            backend::Backend,
+            core_loop::{HostInputEvent, InputOrigin},
+            host_x11::HostKeyEvent,
+            server::ServerState,
+            xinput::{InputSourceId, XiFacetKind},
+        };
+
+        const FLOATING: InputSourceId = InputSourceId(0xA204);
+        const ATTACHED: InputSourceId = InputSourceId(0xA205);
+        const CLIENT: u32 = 74;
+        const KEYCODE: u8 = 38;
+        let mut backend = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        let mut peer = kbd_map_client_id(&mut state, CLIENT);
+        for source in [FLOATING, ATTACHED] {
+            backend.on_host_input(
+                &mut state,
+                HostInputEvent::DeviceAdded(dynamic_test_device(source, true, false)),
+            );
+        }
+        let floating_id = state
+            .xi_devices
+            .facet(FLOATING, XiFacetKind::Keyboard)
+            .unwrap();
+        let attached_id = state
+            .xi_devices
+            .facet(ATTACHED, XiFacetKind::Keyboard)
+            .unwrap();
+        backend.on_host_input(
+            &mut state,
+            HostInputEvent::Key(HostKeyEvent {
+                origin: InputOrigin::Physical(FLOATING),
+                pressed: true,
+                keycode: 50,
+                time: 0,
+                root_x: 0,
+                root_y: 0,
+                event_x: 0,
+                event_y: 0,
+                state: 0,
+            }),
+        );
+        process_dynamic_test_keyboard_grab(&mut backend, &mut state, CLIENT, floating_id, 1);
+        let _ = kbd_map_drain(&mut peer);
+
+        let key = |origin, pressed| {
+            HostInputEvent::Key(HostKeyEvent {
+                origin,
+                pressed,
+                keycode: KEYCODE,
+                time: 0,
+                root_x: 0,
+                root_y: 0,
+                event_x: 0,
+                event_y: 0,
+                state: 0,
+            })
+        };
+        backend.on_host_input(&mut state, key(InputOrigin::XTest(floating_id), true));
+        let master_key_bit = 1u8 << (KEYCODE % 8);
+        assert_eq!(
+            state.keys_down[usize::from(KEYCODE / 8)] & master_key_bit,
+            0,
+            "XTEST's floating slave key is absent from QueryKeymap's master bitmap",
+        );
+        assert!(
+            backend.floating_keyboard_states[&floating_id]
+                .down_keys
+                .contains(&KEYCODE)
+        );
+        assert!(state.key_down_by_device[&floating_id].contains_key(&KEYCODE));
+
+        backend.on_host_input(&mut state, key(InputOrigin::Physical(ATTACHED), true));
+        assert!(
+            backend.core.down_keys.contains(&KEYCODE),
+            "the next attached keyboard press is accepted by the master XKB state",
+        );
+        assert!(state.key_down_by_device[&attached_id].contains_key(&KEYCODE));
+        assert!(state.xi2_keyboard_grabs.contains_key(&floating_id));
+        assert_eq!(
+            state
+                .xi_devices
+                .device(floating_id)
+                .unwrap()
+                .attached_master,
+            None
+        );
+        assert!(state.sync_pending.is_empty());
+
+        backend.on_host_input(&mut state, key(InputOrigin::Physical(ATTACHED), false));
+        backend.on_host_input(&mut state, key(InputOrigin::XTest(floating_id), false));
+        assert!(!state.key_down_by_device.contains_key(&attached_id));
+        assert!(
+            !state
+                .key_down_by_device
+                .get(&floating_id)
+                .is_some_and(|held| held.contains_key(&KEYCODE))
+        );
+    }
+
+    #[test]
+    fn record_contains_only_accepted_master_key_and_button_transitions() {
+        use yserver_core::{
+            backend::Backend,
+            core_loop::{HostInputEvent, InputOrigin},
+            host_x11::HostKeyEvent,
+            server::ServerState,
+            xinput::InputSourceId,
+        };
+
+        const A_KBD: InputSourceId = InputSourceId(0xA206);
+        const B_KBD: InputSourceId = InputSourceId(0xA207);
+        const A_PTR: InputSourceId = InputSourceId(0xA208);
+        const B_PTR: InputSourceId = InputSourceId(0xA209);
+        const FLOATING_KBD: InputSourceId = InputSourceId(0xA20B);
+        const GRAB_CLIENT: u32 = 76;
+        const KEYCODE: u8 = 38;
+        let mut backend = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        let mut peer = kbd_map_client_id(&mut state, 5);
+        let mut grab_peer = kbd_map_client_id(&mut state, GRAB_CLIENT);
+
+        // RECORD CreateContext(ctx=1, FutureClients, core KeyPress..ButtonRelease)
+        // followed by EnableContext, through the normal request dispatcher.
+        let mut create = Vec::new();
+        for word in [1u32, 0, 1, 1, 2] {
+            create.extend_from_slice(&word.to_le_bytes());
+        }
+        create.extend_from_slice(&[0; 18]);
+        create.extend_from_slice(&[2, 5, 0, 0, 0, 0]);
+        kbd_map_request(&mut state, &mut backend, 154, 1, &create);
+        kbd_map_request(&mut state, &mut backend, 154, 5, &1u32.to_le_bytes());
+        let _ = kbd_map_drain(&mut peer);
+
+        for (source, keyboard, pointer) in [
+            (A_KBD, true, false),
+            (B_KBD, true, false),
+            (A_PTR, false, true),
+            (B_PTR, false, true),
+            (FLOATING_KBD, true, false),
+        ] {
+            backend.on_host_input(
+                &mut state,
+                HostInputEvent::DeviceAdded(dynamic_test_device(source, keyboard, pointer)),
+            );
+        }
+        let key = |source, pressed| {
+            HostInputEvent::Key(HostKeyEvent {
+                origin: InputOrigin::Physical(source),
+                pressed,
+                keycode: KEYCODE,
+                time: 0,
+                root_x: 0,
+                root_y: 0,
+                event_x: 0,
+                event_y: 0,
+                state: 0,
+            })
+        };
+        backend.on_host_input(&mut state, key(A_KBD, true));
+        backend.on_host_input(&mut state, key(B_KBD, true));
+        backend.on_host_input(&mut state, key(A_KBD, false));
+        backend.on_host_input(&mut state, key(B_KBD, false));
+        let bytes = kbd_map_drain(&mut peer);
+        let mut key_records = Vec::new();
+        let mut at = 0usize;
+        while at + 32 <= bytes.len() {
+            let words = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+            let len = 32 + words * 4;
+            assert!(at + len <= bytes.len(), "complete RECORD stream element");
+            if bytes[at] == 1 && bytes[at + 1] == 0 {
+                let event = &bytes[at + 32..at + len];
+                if matches!(event[0], 2 | 3) {
+                    key_records.push((event[0], event[1]));
+                }
+            }
+            at += len;
+        }
+        assert_eq!(key_records, [(2, KEYCODE), (3, KEYCODE)]);
+
+        let floating_id = state
+            .xi_devices
+            .facet(FLOATING_KBD, yserver_core::xinput::XiFacetKind::Keyboard)
+            .unwrap();
+        process_dynamic_test_keyboard_grab(&mut backend, &mut state, GRAB_CLIENT, floating_id, 1);
+        let _ = kbd_map_drain(&mut grab_peer);
+        for pressed in [true, false] {
+            backend.on_host_input(
+                &mut state,
+                HostInputEvent::Key(HostKeyEvent {
+                    origin: InputOrigin::XTest(floating_id),
+                    pressed,
+                    keycode: KEYCODE,
+                    time: 0,
+                    root_x: 0,
+                    root_y: 0,
+                    event_x: 0,
+                    event_y: 0,
+                    state: 0,
+                }),
+            );
+        }
+        let bytes = kbd_map_drain(&mut peer);
+        let mut floating_key_records = Vec::new();
+        let mut at = 0usize;
+        while at + 32 <= bytes.len() {
+            let words = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+            let len = 32 + words * 4;
+            assert!(at + len <= bytes.len(), "complete RECORD stream element");
+            if bytes[at] == 1 && bytes[at + 1] == 0 {
+                let event = &bytes[at + 32..at + len];
+                if matches!(event[0], 2 | 3) {
+                    floating_key_records.push((event[0], event[1]));
+                }
+            }
+            at += len;
+        }
+        assert!(
+            floating_key_records.is_empty(),
+            "floating slave key edges have no core RECORD forms",
+        );
+
+        let button = |source, pressed| HostInputEvent::PointerButton {
+            origin: InputOrigin::Physical(source),
+            button: 0x110,
+            pressed,
+            time: 0,
+        };
+        backend.on_host_input(&mut state, button(A_PTR, true));
+        backend.on_host_input(&mut state, button(B_PTR, true));
+        backend.on_host_input(&mut state, button(A_PTR, false));
+        backend.on_host_input(&mut state, button(B_PTR, false));
+        let bytes = kbd_map_drain(&mut peer);
+        let mut button_records = Vec::new();
+        let mut at = 0usize;
+        while at + 32 <= bytes.len() {
+            let words = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+            let len = 32 + words * 4;
+            assert!(at + len <= bytes.len(), "complete RECORD stream element");
+            if bytes[at] == 1 && bytes[at + 1] == 0 {
+                let event = &bytes[at + 32..at + len];
+                if matches!(event[0], 4 | 5) {
+                    button_records.push((event[0], event[1]));
+                }
+            }
+            at += len;
+        }
+        assert_eq!(button_records, [(4, 1), (5, 1)]);
+        assert_eq!(state.buttons_down, 0);
+        assert!(state.key_down_by_device.is_empty());
+        assert!(state.sync_pending.is_empty());
     }
 
     /// Nested host keys produce master-only XI2 raw/device events. Their

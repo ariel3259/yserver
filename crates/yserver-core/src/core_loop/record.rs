@@ -2166,9 +2166,9 @@ mod tests {
         );
     }
 
-    /// The pointer fan-out records motion and buttons once, from the
-    /// physical event: not crossings, not an AllowEvents replay, not a
-    /// frozen-queue replay (Xorg skips the callback while playingEvents).
+    /// Pointer RECORD runs once for a frozen event: Xorg's EnqueueEvent
+    /// callback records it when queued, while ProcessDeviceEvent skips the
+    /// callback when PlayReleasedEvents replays it under playingEvents.
     #[test]
     fn pointer_fanout_records_physical_events_only() {
         use crate::{
@@ -2230,6 +2230,19 @@ mod tests {
             false,
             true,
         );
+        // Xorg's frozen path calls RECORD from EnqueueEvent when the release
+        // first arrives; UpdateDeviceState happens later when
+        // PlayReleasedEvents replays it under playingEvents. Model the
+        // enqueue-time RECORD observation first, then replay that same
+        // release with RECORD suppressed.
+        let _ = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &xid_map,
+            ev(PointerEventKind::ButtonRelease, 1, 0x100),
+            true,
+            false,
+        );
         state.playing_sync_events = true;
         let _ = pointer_event_fanout_to_state(
             &mut state,
@@ -2240,14 +2253,6 @@ mod tests {
             false,
         );
         state.playing_sync_events = false;
-        let _ = pointer_event_fanout_to_state(
-            &mut state,
-            &mut backend,
-            &xid_map,
-            ev(PointerEventKind::ButtonRelease, 1, 0x100),
-            true,
-            false,
-        );
         let got = packets(LittleEndian, &read_all(&mut rec));
         let elements: Vec<Vec<u8>> = got.iter().map(|p| p[32..].to_vec()).collect();
         // `record-probe basic l 0` (the event time is that run's):
