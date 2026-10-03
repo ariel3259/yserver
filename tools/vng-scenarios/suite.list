@@ -38,3 +38,4 @@ legacy-apps          guest=legacy-apps.sh            timeout=400 golden=live
 screensaver          guest=screensaver.sh            timeout=300
 cde-apps             guest=cde-apps.sh               timeout=700 golden=live root-hook=cde-apps-root.sh
 passive-grab         guest=passive-grab.sh           timeout=300
+cursor               guest=cursor.sh                 timeout=300

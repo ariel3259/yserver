@@ -5548,16 +5548,21 @@ impl KmsBackend {
         // scene registration happen via the shared
         // `insert_cursor_record` path so subsequent client cursors
         // and the default sit on the same plumbing.
-        let xid = self.core.next_host_xid();
-        let bytes = crate::kms::render::cursor::default_arrow_bgra();
-        self.insert_cursor_record(
-            xid,
-            crate::kms::render::cursor::DEFAULT_ARROW_W,
-            crate::kms::render::cursor::DEFAULT_ARROW_H,
-            crate::kms::render::cursor::DEFAULT_ARROW_HOT_X,
-            crate::kms::render::cursor::DEFAULT_ARROW_HOT_Y,
-            bytes,
-        );
+        let xid = if let Some(xid) = self.xorg_root_cursor() {
+            xid
+        } else {
+            let xid = self.core.next_host_xid();
+            let bytes = crate::kms::render::cursor::default_arrow_bgra();
+            self.insert_cursor_record(
+                xid,
+                crate::kms::render::cursor::DEFAULT_ARROW_W,
+                crate::kms::render::cursor::DEFAULT_ARROW_H,
+                crate::kms::render::cursor::DEFAULT_ARROW_HOT_X,
+                crate::kms::render::cursor::DEFAULT_ARROW_HOT_Y,
+                bytes,
+            );
+            xid
+        };
         self.default_cursor_xid = Some(xid);
         // Force the effective cursor to resolve against the new
         // default so the scene picks it up at boot (otherwise
@@ -5567,6 +5572,24 @@ impl KmsBackend {
         self.refresh_effective_cursor();
         log::info!("render: default cursor sprite registered (xid 0x{xid:x})");
         Ok(())
+    }
+
+    /// Xorg's root cursor (`CreateRootCursor`, dix/cursor.c): glyph 0
+    /// (`X_cursor`) of the "cursor" font over mask glyph 1, black on white.
+    /// It is what the screen shows wherever no window sets a cursor.
+    fn xorg_root_cursor(&mut self) -> Option<u32> {
+        let (font, _) = self.open_font(None, "cursor").ok()?;
+        let cursor = self.create_glyph_cursor(
+            None,
+            font,
+            Some(font),
+            0,
+            1,
+            (0, 0, 0),
+            (0xffff, 0xffff, 0xffff),
+        );
+        let _ = self.close_font(None, font.as_raw());
+        cursor.ok().map(CursorHandle::as_raw)
     }
 
     fn arm_direct_vt_switching(&mut self) {
@@ -37413,6 +37436,29 @@ mod tests {
             b.effective_cursor_walking_chain(0xFFFF_FFFF),
             Some(root_cur.as_raw())
         );
+    }
+
+    /// With no root cursor set the screen shows Xorg's: `X_cursor` from the
+    /// cursor font, black on white. Size, hotspot and the FNV-1a hash of
+    /// the ARGB pixels as XFixesGetCursorImage reports them on Xorg
+    /// (tools/vng-scenarios/goldens/cursor.txt, "bare root").
+    #[test]
+    fn default_cursor_is_xorg_root_cursor() {
+        let b = KmsBackend::for_tests();
+        let record = b
+            .cursor_records
+            .get(&b.default_cursor_xid.expect("default cursor"))
+            .expect("default record");
+        assert_eq!(
+            (record.width, record.height, record.hot_x, record.hot_y),
+            (16, 16, 7, 7)
+        );
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for px in record.bgra_bytes.chunks_exact(4) {
+            h ^= u64::from(u32::from_le_bytes([px[0], px[1], px[2], px[3]]));
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        assert_eq!(h, 0x1ae7_d436_690f_ff69);
     }
 
     /// CursorRecord versions are monotonically increasing — each
