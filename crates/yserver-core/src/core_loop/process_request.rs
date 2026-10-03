@@ -23713,6 +23713,19 @@ fn handle_create_window(
             1,
         );
     }
+    if let Some(cursor) = request.cursor
+        && cursor.0 != 0
+        && !state.resources.cursor_exists(cursor)
+    {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_CURSOR,
+            cursor.0,
+            1,
+        );
+    }
     // Border validation. The effective depth resolves CopyFromParent
     // (depth 0) against the parent, matching
     // `ResourceTable::create_window`.
@@ -23855,6 +23868,14 @@ fn handle_create_window(
             if let Some(border) = state.resources.window(window_id).map(|w| w.border) {
                 let (value_mask, values) = border_source_cwa_values(border);
                 let _ = backend.change_subwindow_attributes(origin, host_xid, value_mask, &values);
+            }
+            // CWCursor on CreateWindow, as ChangeWindowAttributes forwards it.
+            if let Some(cursor_host) = request
+                .cursor
+                .filter(|c| c.0 != 0)
+                .and_then(|c| state.resources.cursor_host_xid(c))
+            {
+                let _ = backend.define_cursor(origin, host_xid, cursor_host);
             }
             let result = if parent == ROOT_WINDOW {
                 backend.register_top_level(origin, window_id, host_xid)
@@ -75367,6 +75388,39 @@ mod tests {
             bytes.is_empty() || bytes[0] != 0,
             "{what}: expected no error, got {:02x?}",
             bytes
+        );
+    }
+
+    /// CWCursor on CreateWindow takes effect like ChangeWindowAttributes'
+    /// (Xorg `CreateWindow` → `ChangeWindowAttributes`): the window keeps
+    /// the cursor and the backend shows it; an unknown cursor is BadCursor.
+    #[test]
+    fn create_window_cursor_is_kept_and_forwarded() {
+        const CURSOR: ResourceId = ResourceId(0x0080_0010);
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.resources.create_glyph_cursor(ClientId(1), CURSOR);
+        state.resources.set_cursor_host_xid(
+            CURSOR,
+            crate::backend::CursorHandle::from_raw(0x00ab_0001).unwrap(),
+        );
+        let body = border_create_body(0x0080_0001, ROOT_WINDOW.0, 0x4000, &[CURSOR.0]);
+        let calls = run_border_request_recording(&mut state, 1, 0, &body);
+        assert_no_error(&read_all_available(&mut peer), "CreateWindow with a cursor");
+        let window = state.resources.window(ResourceId(0x0080_0001)).unwrap();
+        assert_eq!(window.cursor, Some(CURSOR));
+        let host = window.host_xid.unwrap().as_raw();
+        assert!(calls.contains(&RecordedCall::DefineCursor {
+            host_window_xid: host,
+            cursor_host_xid: 0x00ab_0001,
+        }));
+
+        let body = border_create_body(0x0080_0002, ROOT_WINDOW.0, 0x4000, &[0x0080_0011]);
+        run_border_request(&mut state, 1, 0, &body);
+        assert_error_code(
+            &read_all_available(&mut peer),
+            x11::error::BAD_CURSOR,
+            "unknown cursor",
         );
     }
 

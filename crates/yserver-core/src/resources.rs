@@ -682,7 +682,7 @@ impl ResourceTable {
                 Some(Some(id)) => id,
                 Some(None) | None => parent.map_or(ROOT_COLORMAP, |p| p.colormap),
             },
-            cursor: None,
+            cursor: request.cursor,
             owner,
             properties: HashMap::new(),
             host_xid: None,
