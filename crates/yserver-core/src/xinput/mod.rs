@@ -151,8 +151,10 @@ pub struct XiDevice {
     /// (`TOUCHPAD` vs `MOUSE`) in the `XListInputDevices` reply.
     pub is_touchpad: bool,
     /// Evdev device node (`/dev/input/eventN`) for the physical source bound
-    /// to this facet, or `None` for a master or virtual device. Used by T3 to
-    /// map a `Binding` write back to the libinput device handle.
+    /// to this facet, or `None` for a master or virtual device. Descriptive
+    /// metadata only (it backs the read-only `Device Node` property): writes
+    /// and events are routed by `source_id`, never by node, since a node can
+    /// be reused by a later attachment.
     pub device_node: Option<String>,
     /// Properties keyed by their name-atom (`AtomId`).  `BTreeMap` gives
     /// stable, sorted iteration order for XIListProperties (Task 3);
