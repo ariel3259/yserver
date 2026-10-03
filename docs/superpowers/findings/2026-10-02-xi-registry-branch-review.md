@@ -39,3 +39,119 @@ Additional observations:
 **Scope questions:** Explicit `XIChangeHierarchy` attach/detach still rejects all physical IDs ([process_request.rs:17492](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver-core/src/core_loop/process_request.rs:17492)). The plan chiefly promises grab-time detachment, so I have not counted manual hierarchy editing as a defect.
 
 **Verdict: not ready for PR.** Held-state leakage, broken grab delivery/isolation, incorrect scroll deltas, and nested XTEST regression need resolution despite the green per-task suites.
+## Verification review of R1-R3 (2026-10-03)
+
+Reviewer: codex gpt-6.1-sol xhigh, read-only, on `02e98009`. New findings D1-D6 are fixed in round R4.
+
+**Not ready for hardware verification and PR.** The fixes repair most reported scenarios, but introduce two major scroll regressions. Exact-slave grabs also remain broken with `owner_events=true`.
+
+I reviewed `35e54b5e..HEAD` and the relevant full-branch interactions against `joske/master`, at HEAD `02e9800954d9`. No files or git state changed. Existing test binaries produced **24 passes and 10 environment-limited failures**: this sandbox rejects Unix-socket `send` with `EPERM`, preventing those tests’ replies/events from reaching their peers. These were not fresh HEAD builds. Statements about tests failing without a fix are source counterfactuals; I did not revert fixes or perform mutation runs.
+
+The additional defects are:
+
+- **D1 — Major, new in R3: scroll motion, stop and query values disagree.** Normal master scroll motion now uses `device.scroll_axis_values` at [pointer_fanout.rs:2126](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver-core/src/core_loop/pointer_fanout.rs:2126). However, master scroll-stop still uses `state.scroll_axis_value` at [pointer_fanout.rs:2415](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver-core/src/core_loop/pointer_fanout.rs:2415), and XIQueryDevice supplies the global counter at [process_request.rs:17897](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver-core/src/core_loop/process_request.rs:17897).
+
+  Reachable scenario: mouse A scrolls +10; touchpad B scrolls +1. SlaveSwitch announces B’s baseline 0, then master motion correctly reports 1. Finger lift follows the real `PointerScrollStop` path through [backend.rs:20361](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver/src/kms/render/backend.rs:20361) and reports **11**, creating a false +10 delta. B’s next scroll reports 2, creating −9. XIQueryDevice can similarly seed the wrong baseline.
+
+  Xorg stores delivered valuators in `v->axisVal[i]` and queries that same state—`info->value = double_to_fp3232(v->axisVal[axisnumber])` at [xiquerydevice.c:369](/home/ariel_santangelo/Projects/xserver/Xi/xiquerydevice.c:369). Root bootstrap normally chooses the last attached source correctly; the query and stop paths are the inconsistency. The new test stops after the first B scroll and misses both paths.
+
+- **D2 — Major, new in R2: motion-only XI grabs lose wheel scrolling.** XIGrabDevice now stores the supplied mask at [process_request.rs:18556](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver-core/src/core_loop/process_request.rs:18556). Physical scrolling is translated into button 4–7 press/release pairs by the input thread. Recipient filtering then tests the press’s **ButtonPress bit** at [pointer_fanout.rs:1841](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver-core/src/core_loop/pointer_fanout.rs:1841); synthetic scroll Motion is generated later inside that recipient loop, at line 2158.
+
+  A valid `XIGrabDevice(master2, owner_events=false, mask=XI_Motion)` receives ordinary motion but no wheel Motion because bit 4 is absent. This works through the production path with **one mouse and one keyboard**, and also affects exact-slave grabs. Before R2—and on `joske/master`—the permissive pointer-grab mask admitted this path.
+
+  Xorg first converts scrolling to `type = MotionNotify` at [getevents.c:1747](/home/ariel_santangelo/Projects/xserver/dix/getevents.c:1747), then independently generates legacy button emulation. Its grab filter therefore tests Motion for scroll Motion. The new grab test selects all three button/motion bits and uses button 1, so it cannot detect this regression.
+
+- **D3 — Major, remaining finding 6: owner-events fallback still drops exact-slave buttons and misidentifies motion.** Grab a physical pointer on root with `owner_events=true`, a button/motion mask, and no XISelectEvents selection. The valid fallback at [pointer_fanout.rs:1848](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver-core/src/core_loop/pointer_fanout.rs:1848) adds the grab owner and sets `xi2_grab_window_target`, but does not set `xi2_grab_delivery`. The new exact-slave override requires that flag at line 2052.
+
+  Consequently neither selected slave form nor accepted master button form exists: press/release disappear. Motion falls through to device ID 2. Xorg’s owner-events path falls back to `DeliverOneGrabbedEvent` when natural delivery delivers nothing ([events.c:4400](/home/ariel_santangelo/Projects/xserver/dix/events.c:4400)), preserving the grabbed device and using its grab mask. The regression test covers only `owner_events=false`.
+
+- **D4 — Minor, new in R1: replaying held lock keys corrupts floating XKB state.** [backend.rs:11956](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver/src/kms/render/backend.rs:11956) first copies the master’s current locked modifiers, then replays held keys as `Down` at line 11976.
+
+  Starting with Caps Lock off: press Caps, grab that keyboard while Caps remains held, then release it. The copied state already has Caps locked; the reconstructed press therefore remembers an initially locked state, and release unlocks the floating keyboard. Subsequent floating letters disagree with the master’s locked state.
+
+  Xorg preserves the existing action filter across detachment. Its lock filter saves the pre-press state in `filter->priv` and clears only those bits on release ([xkbActions.c:372](/home/ariel_santangelo/Projects/xserver/xkb/xkbActions.c:372)). A read-only probe against installed libxkbcommon confirmed normal Caps press/release retains Lock, whereas copy-locked → seed-press → release clears it. The new tests hold Shift, not a lock key.
+
+- **D5 — Minor, new in R1: RECORD filtering loses events while the master is synchronously frozen.** The new `master_record_accepted` filter runs before the actual freeze queue ([pointer_fanout.rs:850](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver-core/src/core_loop/pointer_fanout.rs:850), queue at line 951).
+
+  Freeze master 2 with a synchronous grab; press physical button 1; inject an XTEST4 click while that physical button remains held. The XTEST edges are rejected by master aggregation and omitted from RECORD. Xorg’s frozen path instead calls `DeviceEventCallback` unconditionally while enqueueing ([events.c:1166](/home/ariel_santangelo/Projects/xserver/dix/events.c:1166)); duplicate suppression occurs during later processing, with replay callbacks disabled. The new asynchronous aggregation test misses this distinction.
+
+- **D6 — Minor, existing branch defect: removal of an already suspended source repeats Disabled notifications.** [backend.rs:20471](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver/src/kms/render/backend.rs:20471) explicitly emits another Disabled presence/hierarchy step when `!was_enabled`. Unplug during VT suspension, followed by removal or resume-window expiry, therefore produces Disabled twice before Removed.
+
+  This code predates the three fixes. Xorg’s `DisableDevice` returns immediately for an already disabled device ([devices.c:468](/home/ariel_santangelo/Projects/xserver/dix/devices.c:468)); removal subsequently emits Removed. The new ordering test resumes before removing, avoiding this case.
+
+For the original 13 findings:
+
+1. **Held keys and reused IDs — fixed for the reported bitmap failure.**  
+   [backend.rs:11970](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver/src/kms/render/backend.rs:11970) seeds floating `down_keys` from `key_down_by_device`. A held Shift release now passes `raw.pressed == key_is_down` rather than being rejected. Unregister additionally executes `self.key_down_by_device.remove(id)` at [server.rs:1967](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver-core/src/server.rs:1967). This matches Xorg detachment’s `AttachDevice(NULL, dev, NULL)` ([events.c:1470](/home/ariel_santangelo/Projects/xserver/dix/events.c:1470)) followed by release’s `set_key_up` ([exevents.c:942](/home/ariel_santangelo/Projects/xserver/Xi/exevents.c:942)).
+
+   **Tests:** [backend.rs:40050](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver/src/kms/render/backend.rs:40050) and its removal companion use real KMS input plus XIGrabDevice dispatch. Without seeding, their held-state assertions fail before wire assertions. The unregister test directly exercises the production teardown boundary and fails without bitmap removal. Actual ID reuse and disconnect are not directly tested. D4 remains a separate XKB regression.
+
+2. **Double button mapping during cleanup — fixed for the reported mapping.**  
+   [backend.rs:19799](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver/src/kms/render/backend.rs:19799) finds the physical detail with `.position(|mapped| *mapped == logical_detail)`, then re-enters ordinary input. Under `[3,2,1,4,5,6,7]`, held logical 3 becomes physical left release, which maps once back to 3. Xorg likewise releases physical bits with `GetPointerEvents(..., ButtonRelease, i, ...)` ([devices.c:2640](/home/ariel_santangelo/Projects/xserver/dix/devices.c:2640)).
+
+   **Test:** [backend.rs:40281](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver/src/kms/render/backend.rs:40281) dispatches SetPointerMapping, presses through KMS input, and removes the source. It passed and would leave master button 3 held without the fix. It checks state rather than release bytes; VT uses the same cleanup function but is not directly covered by this test.
+
+3. **XTEST ending another source’s passive grab — fixed.**  
+   Teardown now requires `state.buttons_down == 0` at [pointer_fanout.rs:3442](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver-core/src/core_loop/pointer_fanout.rs:3442). An XTEST click therefore cannot end the master grab while physical button 1 remains held. Xorg uses the grabbed device’s `!b->buttonsDown` ([exevents.c:1935](/home/ariel_santangelo/Projects/xserver/Xi/exevents.c:1935)), after checking attached-slave holds.
+
+   **Test:** [process_request.rs:62773](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver-core/src/core_loop/process_request.rs:62773) establishes a real core GrabButton, invokes production fanout for physical and XTEST events, and checks both grab lifetime and paired freeze. Passed; the old teardown clears both prematurely. It does not assert subsequent drag-motion bytes.
+
+4. **SlaveSwitch scroll baseline — partially fixed.**  
+   The first switched-source motion now uses `device.scroll_axis_values`, matching Xorg’s `dce->valuators[i].value = slave->valuator->axisVal[i]` ([getevents.c:286](/home/ariel_santangelo/Projects/xserver/dix/getevents.c:286)) and `memcpy(copy, original, len)` to the master ([mieq.c:423](/home/ariel_santangelo/Projects/xserver/mi/mieq.c:423)).
+
+   **Test:** [pointer_fanout.rs:4866](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver-core/src/core_loop/pointer_fanout.rs:4866) uses XISelectEvents dispatch and production fanout for A+10/B+1, then decodes baseline 0 and master value 1. Passed; old code reports 11. It genuinely catches the original scenario, but D1 leaves the complete scroll lifecycle incorrect.
+
+5. **Slave grabs freezing the paired master — fixed.**  
+   [pointer_fanout.rs:2950](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver-core/src/core_loop/pointer_fanout.rs:2950) limits paired synchronization to master roles. Xorg explicitly applies `if (!IsMaster(dev)) ... = GrabModeAsync` ([xigrabdev.c:89](/home/ariel_santangelo/Projects/xserver/Xi/xigrabdev.c:89)).
+
+   **Tests:** [process_request.rs:64119](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver-core/src/core_loop/process_request.rs:64119) exercises grab, paired AllowEvents and ungrab through dispatch; [backend.rs:43695](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver/src/kms/render/backend.rs:43695) exercises KMS keyboard delivery and source removal. Both passed and would observe the unwanted paired hold without the fix. Master synchronization coverage remains intact.
+
+6. **Exact pointer grabs without selections — partially fixed.**  
+   [pointer_fanout.rs:2052](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver-core/src/core_loop/pointer_fanout.rs:2052) now forces `wants_master = false; wants_slave = true` for exclusive exact-slave grab delivery. Xorg filters directly through `GetXI2MaskByte(grab->xi2mask, dev, evtype)` ([events.c:4308](/home/ariel_santangelo/Projects/xserver/dix/events.c:4308)).
+
+   **Test:** [process_request.rs:62898](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver-core/src/core_loop/process_request.rs:62898) dispatches XIGrabDevice without selections and decodes production press/motion/release identities. Passed; without the override, buttons disappear and motion reports master 2. However, it covers only owner-events false and a combined mask: D2 and D3 remain.
+
+7. **Floating pointer master raw copies — fixed.**  
+   [pointer_fanout.rs:3812](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver-core/src/core_loop/pointer_fanout.rs:3812) collects master raw recipients only when no slave exists or `attached_master.is_some()`. This matches Xorg’s `IsFloating(sdev)` exclusion ([mieq.c:397](/home/ariel_santangelo/Projects/xserver/mi/mieq.c:397)).
+
+   **Test:** [process_request.rs:63001](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver-core/src/core_loop/process_request.rs:63001) establishes separate exact-slave, master and AllMaster listeners, grabs the physical slave, and sends production motion. Passed; old code delivers unwanted master raw copies. Raw buttons share the fixed recipient filter, although only RawMotion is tested.
+
+8. **Floating-keyboard XTEST altering master holds — fixed.**  
+   [key_fanout.rs:187](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver-core/src/core_loop/key_fanout.rs:187) now requires both a slave ID and `attached_master.is_some()` before accepting its master transition. Again, Xorg’s floating-device exclusion prevents that copy.
+
+   **Test:** [backend.rs:40350](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver/src/kms/render/backend.rs:40350) grabs a physical keyboard through dispatch, injects an XTEST-origin key through KMS input, checks master QueryKeymap isolation, and verifies an attached keyboard’s same-key press. Passed; old code changes the master bitmap and suppresses the attached press. It bypasses the FakeInput decoder, but exercises the affected production transition/cooking path.
+
+9. **Nested XTEST pointer identity — fixed.**  
+   Motion and button queuing now preserve `origin` at [trait_impl.rs:114](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver-core/src/host_x11/trait_impl.rs:114) and line 172. Xorg routes ordinary injection through `GetXTestDevice(dev)` ([xtest.c:351](/home/ariel_santangelo/Projects/xserver/Xext/xtest.c:351)).
+
+   **Test:** [host_x11/mod.rs:1445](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver-core/src/host_x11/mod.rs:1445) dispatches actual FakeInput requests, drains the nested backend queue through production fanout, and checks source 4 alongside a master-only NestedHost control. Passed; replacing origin with NestedHost loses the asserted source-4 forms. The fixture requires no host display.
+
+10. **RECORD reporting suppressed master transitions — fixed asynchronously; partial overall.**  
+    KMS keys now require `transition.master_accepted` at [backend.rs:19695](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver/src/kms/render/backend.rs:19695); pointer recording applies the corresponding guard. Xorg returns on `DONT_PROCESS` before its normal callback ([exevents.c:1851](/home/ariel_santangelo/Projects/xserver/Xi/exevents.c:1851)), and RECORD converts to core only for `IsMaster` ([record.c:784](/home/ariel_santangelo/Projects/xserver/record/record.c:784)).
+
+    **Test:** [backend.rs:40453](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver/src/kms/render/backend.rs:40453) uses real RECORD requests and KMS input for duplicate attached holds and floating keys. Its wire run was environment-limited; without the fix its expected counts fail. The auxiliary replay test at [record.rs:2233](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver-core/src/core_loop/record.rs:2233) performs an ordinary release, then manually toggles `playing_sync_events`; it **does not exercise real freezing/enqueue/replay**. D5 remains.
+
+11. **Hierarchy descriptors contradicting queries — fixed.**  
+    [hotplug.rs:315](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver-core/src/xinput/hotplug.rs:315) reports paired masters and `.map_or((5, 0), ...)` for floating slaves. Xorg similarly uses `*attachment = (paired ? paired->id : 0)` and `XIFloatingSlave` ([xiquerydevice.c:518](/home/ariel_santangelo/Projects/xserver/Xi/xiquerydevice.c:518)).
+
+    **Test:** [backend.rs:29997](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver/src/kms/render/backend.rs:29997) exercises actual hotplug, queries, grab detachment, and an unrelated subsequent hotplug. Its master-pair and floating-use assertions would reject the old descriptors. Runtime verification was environment-limited.
+
+12. **Child-window DeviceChanged selections — fixed for the reported scenario.**  
+    [hotplug.rs:162](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver-core/src/xinput/hotplug.rs:162) now considers selections on any window. Xorg recursively calls `DeliverEventsToWindow` for children ([exevents.c:3290](/home/ariel_santangelo/Projects/xserver/Xi/exevents.c:3290)).
+
+    **Test:** [process_request.rs:63085](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver-core/src/core_loop/process_request.rs:63085) creates a child, dispatches XISelectEvents, and decodes SlaveSwitch after production motion. Passed; the old root restriction emits nothing.
+
+    **Observation:** yserver still deduplicates recipients per client, whereas Xorg delivers per selected window. One client selecting root and child receives one notification rather than two; the single-window test does not cover this remaining difference.
+
+13. **XI1/XI2 lifecycle ordering — fixed.**  
+    [backend.rs:20394](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver/src/kms/render/backend.rs:20394) emits XI1 presence before hierarchy; Enabled, Disabled and Removed follow the same ordering. Xorg calls `SendDevicePresenceEvent` before `XISendDeviceHierarchyEvent` ([devices.c:616](/home/ariel_santangelo/Projects/xserver/dix/devices.c:616)).
+
+    **Test:** [backend.rs:30498](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver/src/kms/render/backend.rs:30498) selects both protocols and checks ordered wire transitions for add, suspend, resume and removal through production lifecycle handlers. Old ordering fails its expected tuples. Runtime verification was environment-limited. D6 is a separate transition-count defect.
+
+The lifecycle cross-checks support the cleanup changes: VT suspension invokes the shared release path while facets remain registered; removal releases holds before teardown; reset drains the old input session before rebuilding inventory ([reset.rs:345](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver-core/src/core_loop/reset.rs:345)). I found no additional confirmed new defect in reset replay or the configuration lane. The configuration snapshot optimization preserves events for waiting writes and avoids cloning when none wait ([input_thread.rs:1135](/home/ariel_santangelo/Projects/yserver-xi-dynamic-registry/crates/yserver/src/input_thread.rs:1135)); its test exercises the production helper/service pair, not the complete input-thread loop. The inherited core/RECORD-before-raw ordering gap remains unchanged.
+
+For a user with one mouse and one keyboard, D2 is directly reachable. D1 also becomes reachable after replacing a scrolled mouse: the new source starts its counter at zero while the global query counter retains previous scrolling. D4 and D5 require grabs/XTEST, but require no additional physical devices.
+
+**Scope questions:** None raised.
+
+**Verdict: not ready for hardware verification and PR.** Resolve D1–D3 and add coverage for scroll stops/queries, motion-only masks, and owner-events fallback before proceeding.
