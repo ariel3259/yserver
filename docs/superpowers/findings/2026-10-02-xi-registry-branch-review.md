@@ -213,7 +213,7 @@ Headless wheel conversion, remapped-button unplug cleanup, VT held-state cleanup
 **Verdict: not ready for hardware verification and PR.**
 ## Final verification of R5 (2026-10-03)
 
-Reviewer: codex gpt-6.1-sol xhigh, read-only, on `5a67379c`. No blocking or major findings; the two minor findings below are left as follow-ups for the user to decide (not fixed in this branch yet).
+Reviewer: codex gpt-6.1-sol xhigh, read-only, on `5a67379c`. No blocking or major findings; the two minor findings below were accepted by the user on 2026-10-03 as documented known limitations (not fixed in this branch).
 
 **Not ready for hardware verification and PR.** V1–V5 are fixed in their reported scenarios, but R5 introduces two minor correctness regressions. I confirmed no new blocking or major defect.
 
