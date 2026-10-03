@@ -2008,6 +2008,12 @@ fn restore_primary_output_after_rebuild(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KmsButtonDiagnostic {
+    PressAlreadyHeld { mask: u16 },
+    ReleaseNotHeld { mask: u16 },
+}
+
 impl KmsBackend {
     fn handle_cursor_move_outcome(
         &mut self,
@@ -14886,6 +14892,56 @@ impl KmsBackend {
         server_state.barrier_bypass = prev;
     }
 
+    /// Diagnose an unbalanced button transition against the generating
+    /// device's held set. Core button state is aggregated across sources, so
+    /// it cannot distinguish a duplicate press on one source from a valid
+    /// press while another source holds the same button.
+    fn button_diagnostic(
+        state: &ServerState,
+        origin: yserver_core::core_loop::InputOrigin,
+        button_bit: u16,
+        pressed: bool,
+    ) -> Option<KmsButtonDiagnostic> {
+        if button_bit == 0 {
+            return None;
+        }
+
+        use yserver_core::{
+            core_loop::InputOrigin,
+            xinput::{DEVICEID_MASTER_POINTER, XiFacetKind},
+        };
+
+        let device_buttons_down = match origin {
+            InputOrigin::Physical(source_id) => state
+                .xi_devices
+                .facet(source_id, XiFacetKind::PointerTouch)
+                .and_then(|device_id| state.xi_devices.device(device_id))
+                .map(|device| device.buttons_down)
+                .or_else(|| {
+                    state
+                        .unpublished_pointer_buttons_down
+                        .get(&source_id)
+                        .copied()
+                })
+                .unwrap_or(0),
+            InputOrigin::XTest(DEVICEID_MASTER_POINTER) | InputOrigin::NestedHost => {
+                state.buttons_down
+            }
+            InputOrigin::XTest(device_id) => state
+                .xi_devices
+                .device(device_id)
+                .map_or(0, |device| device.buttons_down),
+        };
+        let held_mask = (device_buttons_down & 0x001f) << 8;
+        let already_held = held_mask & button_bit != 0;
+
+        match (pressed, already_held) {
+            (true, true) => Some(KmsButtonDiagnostic::PressAlreadyHeld { mask: held_mask }),
+            (false, false) => Some(KmsButtonDiagnostic::ReleaseNotHeld { mask: held_mask }),
+            _ => None,
+        }
+    }
+
     fn process_pointer_button(
         &mut self,
         code: u32,
@@ -14929,31 +14985,28 @@ impl KmsBackend {
             modifier_mask | master_button_mask | button_bit
         };
         // Stuck-button / lost-release diagnostic (2026-07-11 drag-select bug).
-        // Button state must stay balanced: a press for a bit already set — or a
-        // release for a bit already clear — means an event was lost or a
-        // grab/focus transition desynced us, and text-selection drags break
-        // until the mask is cleared (currently only a VT switch does that).
-        // Silent in normal use, so it rides at WARN on the default log level;
-        // the intermittent bug can't be reproduced on demand, but the NEXT
-        // click after it wedges trips the "already held" arm and captures the
-        // moment. `detail == 4/5` are wheel press+release pairs and balance
-        // normally; 6/7 aren't tracked in the mask (button_bit == 0).
-        if button_bit != 0 {
-            let already_held = self.core.button_mask & button_bit != 0;
-            if pressed && already_held {
+        // Button state must stay balanced for each generating device: a press
+        // for a bit already set — or a release for a bit already clear — means
+        // an event was lost or a grab/focus transition desynced us, and text-
+        // selection drags break until the mask is cleared. Keep WARN so the
+        // intermittent bug captures the event that trips the mismatch.
+        // `detail == 4/5` wheel press+release pairs balance normally; 6/7 are
+        // not tracked in the button mask.
+        match Self::button_diagnostic(server_state, origin, button_bit, pressed) {
+            Some(KmsButtonDiagnostic::PressAlreadyHeld { mask }) => {
                 log::warn!(
                     "render: ButtonPress detail={detail} but button already held \
-                     (mask=0x{:04x}) — a prior ButtonRelease was lost; drags/\
+                     (mask=0x{mask:04x}) — a prior ButtonRelease was lost; drags/\
                      selection will misbehave until the mask clears",
-                    self.core.button_mask,
-                );
-            } else if !pressed && !already_held {
-                log::warn!(
-                    "render: ButtonRelease detail={detail} but button not marked held \
-                     (mask=0x{:04x}) — a prior ButtonPress was lost or state desynced",
-                    self.core.button_mask,
                 );
             }
+            Some(KmsButtonDiagnostic::ReleaseNotHeld { mask }) => {
+                log::warn!(
+                    "render: ButtonRelease detail={detail} but button not marked held \
+                     (mask=0x{mask:04x}) — a prior ButtonPress was lost or state desynced",
+                );
+            }
+            None => {}
         }
         if pressed {
             self.core.button_mask |= button_bit;
@@ -30415,6 +30468,140 @@ mod tests {
         }
         assert_eq!(w.check(t0 + WarnThrottle::PERIOD), Some(5));
         assert_eq!(w.check(t0 + WarnThrottle::PERIOD), None);
+    }
+
+    #[test]
+    fn kms_button_diagnostic_ignores_xtest_hold_for_physical_wheel_pair() {
+        use super::KmsBackend;
+        use yserver_core::{
+            core_loop::{DeviceInfo, InputOrigin, message::LibinputConfigSnapshot},
+            server::ServerState,
+            xinput::{DEVICEID_XTEST_POINTER, InputCapabilities, InputSourceId, XiFacetKind},
+        };
+
+        let source = InputSourceId(0xD1A6);
+        let mut state = ServerState::new();
+        state.xi_register_source(&DeviceInfo {
+            source_id: source,
+            enabled: true,
+            resume_key: None,
+            capabilities: InputCapabilities {
+                keyboard: false,
+                pointer: true,
+                touch: false,
+            },
+            name: "diagnostic test mouse".into(),
+            device_node: "/dev/input/event-diagnostic".into(),
+            sysname: "event-diagnostic".into(),
+            vendor_id: 0,
+            product_id: 0,
+            is_touchpad: false,
+            config: LibinputConfigSnapshot::default(),
+        });
+        let physical_pointer = state
+            .xi_devices
+            .facet(source, XiFacetKind::PointerTouch)
+            .expect("physical pointer facet");
+
+        // XTEST holds logical button 5. The master aggregates that hold, but
+        // the physical source starts its wheel press with button 5 clear.
+        state
+            .xi_devices
+            .device_mut(DEVICEID_XTEST_POINTER)
+            .expect("XTEST pointer")
+            .buttons_down = 1 << 4;
+        state.buttons_down = 1 << 4;
+        let physical = InputOrigin::Physical(source);
+        assert_eq!(
+            KmsBackend::button_diagnostic(&state, physical, 0x1000, true),
+            None,
+            "another device's held button 5 must not flag the physical press",
+        );
+
+        // Fanout records the physical source's accepted press before it
+        // receives the matching release. XTEST still owns the master hold.
+        state
+            .xi_devices
+            .device_mut(physical_pointer)
+            .expect("physical pointer")
+            .buttons_down |= 1 << 4;
+        assert_eq!(
+            KmsBackend::button_diagnostic(&state, physical, 0x1000, false),
+            None,
+            "the physical release balances its own press",
+        );
+        state
+            .xi_devices
+            .device_mut(physical_pointer)
+            .expect("physical pointer")
+            .buttons_down &= !(1 << 4);
+        assert_eq!(
+            KmsBackend::button_diagnostic(&state, physical, 0x1000, true),
+            None,
+            "a repeated physical wheel pair can start while XTEST holds button 5",
+        );
+        state
+            .xi_devices
+            .device_mut(physical_pointer)
+            .expect("physical pointer")
+            .buttons_down |= 1 << 4;
+        assert_eq!(
+            KmsBackend::button_diagnostic(&state, physical, 0x1000, false),
+            None,
+            "the repeated physical release also balances",
+        );
+    }
+
+    #[test]
+    fn kms_button_diagnostic_warns_on_duplicate_physical_press() {
+        use super::{KmsBackend, KmsButtonDiagnostic};
+        use yserver_core::{
+            core_loop::{DeviceInfo, InputOrigin, message::LibinputConfigSnapshot},
+            server::ServerState,
+            xinput::{InputCapabilities, InputSourceId, XiFacetKind},
+        };
+
+        let source = InputSourceId(0xD1A7);
+        let mut state = ServerState::new();
+        state.xi_register_source(&DeviceInfo {
+            source_id: source,
+            enabled: true,
+            resume_key: None,
+            capabilities: InputCapabilities {
+                keyboard: false,
+                pointer: true,
+                touch: false,
+            },
+            name: "diagnostic test mouse".into(),
+            device_node: "/dev/input/event-diagnostic".into(),
+            sysname: "event-diagnostic".into(),
+            vendor_id: 0,
+            product_id: 0,
+            is_touchpad: false,
+            config: LibinputConfigSnapshot::default(),
+        });
+        let physical_pointer = state
+            .xi_devices
+            .facet(source, XiFacetKind::PointerTouch)
+            .expect("physical pointer facet");
+        let physical = InputOrigin::Physical(source);
+
+        assert_eq!(
+            KmsBackend::button_diagnostic(&state, physical, 0x0100, true),
+            None,
+            "the first physical Button1 press is balanced",
+        );
+        state
+            .xi_devices
+            .device_mut(physical_pointer)
+            .expect("physical pointer")
+            .buttons_down |= 1;
+        state.buttons_down |= 1;
+        assert_eq!(
+            KmsBackend::button_diagnostic(&state, physical, 0x0100, true),
+            Some(KmsButtonDiagnostic::PressAlreadyHeld { mask: 0x0100 }),
+            "a second physical Button1 press without release must warn",
+        );
     }
 
     #[test]
