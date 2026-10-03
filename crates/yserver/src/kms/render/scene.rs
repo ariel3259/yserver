@@ -1000,6 +1000,10 @@ struct RootReadback {
     valid: Vec<vk::Rect2D>,
     /// It has been composed into whole once, so a clipped compose may load it.
     whole: bool,
+    /// Reads at `generation`, and at the one before: a poller reading many
+    /// rects between two changes gets one whole compose per change.
+    reads: u32,
+    prev_reads: u32,
 }
 
 /// Stage 3f.8 cursor sprite registration. The sprite lives as a
@@ -8001,8 +8005,9 @@ impl SceneCompositor {
     /// Xorg's GetImage reads the screen pixmap, which every earlier
     /// request has painted (`DoGetImage`, `dix/dispatch.c:2176`), while a
     /// scanout BO holds the last composed frame. Composes the scene into
-    /// a private image — just `local` once it holds a whole frame — when
-    /// anything changed since, and waits. `local` and the image are in the
+    /// a private image — just `local` for a lone read after a change once
+    /// it holds a whole frame, else all of it — when anything changed
+    /// since, and waits. `local` and the image are in the
     /// space a root read of this output uses: the mode for an identity
     /// output, the root footprint for a transformed one (D6). No software
     /// cursor: Xorg lifts the sprite off a GetImage (`miSpriteGetImage`).
@@ -8043,6 +8048,8 @@ impl SceneCompositor {
                 generation,
                 valid: Vec::new(),
                 whole: false,
+                reads: 0,
+                prev_reads: 0,
             });
         }
         let rb = inner.root_readbacks[output_idx]
@@ -8051,7 +8058,10 @@ impl SceneCompositor {
         if rb.generation != generation {
             rb.generation = generation;
             rb.valid.clear();
+            rb.prev_reads = rb.reads;
+            rb.reads = 0;
         }
+        rb.reads = rb.reads.saturating_add(1);
         if root_readback_covers(&rb.valid, local) {
             return Ok(Some(rb.target.image));
         }
@@ -8069,7 +8079,8 @@ impl SceneCompositor {
         );
         // The overlay XOR is not idempotent: only a full compose applies it
         // exactly once (see `record_command_buffer`).
-        let (repaint, scissors) = if rb.whole && overlay_ops.is_empty() {
+        let one_read = rb.reads == 1 && rb.prev_reads <= 1;
+        let (repaint, scissors) = if rb.whole && overlay_ops.is_empty() && one_read {
             (Repaint::Clipped(local), vec![local])
         } else {
             (Repaint::Full(extent), Vec::new())
