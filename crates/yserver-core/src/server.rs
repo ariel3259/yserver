@@ -1983,6 +1983,16 @@ impl ServerState {
             .retain(|grab| !ids.contains(&grab.deviceid));
         self.sync_pending
             .retain(|pending| !ids.contains(&pending.device));
+        // These bitmaps are keyed outside the device table. Drop them at the
+        // unregister boundary so a reused XI id cannot inherit an old
+        // keyboard hold. The normal backend path has already sent guarded
+        // releases first (Xorg dix/devices.c:2626-2653); this also makes
+        // registry teardown remove the per-device held state itself.
+        for id in &ids {
+            self.key_down_by_device.remove(id);
+        }
+        self.unpublished_keyboard_keys_down.remove(&source);
+        self.unpublished_pointer_buttons_down.remove(&source);
         self.pending_xi_device_removals.extend(removed_descriptors);
         self.xi_devices.remove(source)
     }

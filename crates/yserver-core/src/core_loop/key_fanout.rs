@@ -181,7 +181,12 @@ pub fn key_transition_status(
                 master_key_is_down(state, keycode)
             }
         }
-        InputOrigin::XTest(_) if source.slave_deviceid.is_some() => {
+        // Xorg's master-copy path returns no master event for a floating
+        // slave (mi/mieq.c:385-398); XTEST addressed to an attached slave
+        // follows its paired master as usual.
+        InputOrigin::XTest(_)
+            if source.slave_deviceid.is_some() && source.attached_master.is_some() =>
+        {
             if pressed {
                 !master_key_is_down(state, keycode)
             } else {

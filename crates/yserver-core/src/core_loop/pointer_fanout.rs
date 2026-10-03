@@ -847,7 +847,17 @@ fn pointer_event_fanout_to_state_inner(
     // RECORD sees each physical pointer event once, before grabs and
     // delivery, and not again when a frozen queue replays it (Xorg
     // `ProcessDeviceEvent` skips the callback while playingEvents).
-    if !suppress_raw && !state.playing_sync_events {
+    let master_record_accepted = match event.kind {
+        PointerEventKind::ButtonPress | PointerEventKind::ButtonRelease => {
+            button_transition.master_accepted
+        }
+        // A floating slave has no master copy in Xorg's mieq path
+        // (mi/mieq.c:397-425), so it cannot produce a core MotionNotify for
+        // RECORD either.
+        PointerEventKind::MotionNotify => xi_source.attached_master.is_some(),
+        PointerEventKind::EnterNotify | PointerEventKind::LeaveNotify => false,
+    };
+    if !suppress_raw && !state.playing_sync_events && master_record_accepted {
         let event_type = match event.kind {
             PointerEventKind::ButtonPress => Some(4),
             PointerEventKind::ButtonRelease => Some(5),
