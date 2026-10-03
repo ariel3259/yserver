@@ -921,7 +921,10 @@ pub(crate) fn run(
                                 &mut waiting_device_configs,
                             )?;
                             state.hotkey.reset();
-                            let lifecycle_events = events.clone();
+                            let lifecycle_events = snapshot_lifecycle_events_for_waiters(
+                                &waiting_device_configs,
+                                &events,
+                            );
                             process_batch(
                                 &mut state,
                                 &sender,
@@ -929,12 +932,14 @@ pub(crate) fn run(
                                 events,
                                 current_time_ms(),
                             )?;
-                            service_waiting_device_configs(
-                                &sender,
-                                &mut waiting_device_configs,
-                                &lifecycle_events,
-                                |source, change| input_ctx.apply_device_config(source, change),
-                            )?;
+                            if let Some(lifecycle_events) = lifecycle_events {
+                                service_waiting_device_configs(
+                                    &sender,
+                                    &mut waiting_device_configs,
+                                    &lifecycle_events,
+                                    |source, change| input_ctx.apply_device_config(source, change),
+                                )?;
+                            }
                             if let Some(m) = pending_motion.take() {
                                 sender.send(Message::HostInput(m))?;
                             }
@@ -991,15 +996,18 @@ pub(crate) fn run(
                 InputEvent::DeviceAdded(_) | InputEvent::DeviceRemoved { .. }
             )
         });
-        let lifecycle_events = events.clone();
+        let lifecycle_events =
+            snapshot_lifecycle_events_for_waiters(&waiting_device_configs, &events);
         let time_ms = current_time_ms();
         process_batch(&mut state, &sender, &mut pending_motion, events, time_ms)?;
-        service_waiting_device_configs(
-            &sender,
-            &mut waiting_device_configs,
-            &lifecycle_events,
-            |source, change| input_ctx.apply_device_config(source, change),
-        )?;
+        if let Some(lifecycle_events) = lifecycle_events {
+            service_waiting_device_configs(
+                &sender,
+                &mut waiting_device_configs,
+                &lifecycle_events,
+                |source, change| input_ctx.apply_device_config(source, change),
+            )?;
+        }
         if device_change {
             hotplug_retry_until =
                 Some(std::time::Instant::now() + std::time::Duration::from_millis(2500));
@@ -1031,14 +1039,16 @@ fn finish_expired_resume_window(
     }
     let events = input_ctx.finish_resume_window(token, now);
     *window = None;
-    let lifecycle_events = events.clone();
+    let lifecycle_events = snapshot_lifecycle_events_for_waiters(waiting_device_configs, &events);
     process_batch(state, sender, pending_motion, events, current_time_ms())?;
-    service_waiting_device_configs(
-        sender,
-        waiting_device_configs,
-        &lifecycle_events,
-        |source, change| input_ctx.apply_device_config(source, change),
-    )?;
+    if let Some(lifecycle_events) = lifecycle_events {
+        service_waiting_device_configs(
+            sender,
+            waiting_device_configs,
+            &lifecycle_events,
+            |source, change| input_ctx.apply_device_config(source, change),
+        )?;
+    }
     if let Some(motion) = pending_motion.take() {
         sender.send(Message::HostInput(motion))?;
     }
@@ -1116,6 +1126,13 @@ fn service_waiting_device_configs(
     }
     *waiting = remaining;
     Ok(())
+}
+
+fn snapshot_lifecycle_events_for_waiters(
+    waiting: &VecDeque<(DeviceConfigToken, InputSourceId, DeviceConfigChange)>,
+    events: &[InputEvent],
+) -> Option<Vec<InputEvent>> {
+    (!waiting.is_empty()).then(|| events.to_vec())
 }
 
 fn current_time_ms() -> u32 {
@@ -2220,6 +2237,51 @@ mod tests {
             },
         )
         .expect("apply to the proven rebind and report it");
+
+        assert!(waiting.is_empty());
+        assert!(matches!(
+            receiver.try_recv_all().next(),
+            Some(Message::DeviceConfigResult {
+                token: actual_token,
+                source: actual_source,
+                result: Ok(()),
+            }) if actual_token == token && actual_source == source
+        ));
+    }
+
+    #[test]
+    fn waiting_config_snapshot_keeps_resume_events_after_batch_consumption() {
+        let (_poll, sender, receiver) = yserver_core::core_loop::channel().unwrap();
+        let source = InputSourceId(94);
+        let token = DeviceConfigToken(20);
+        let change = DeviceConfigChange::NaturalScroll(true);
+        let events = vec![InputEvent::DeviceResumed(resumed_info(source))];
+        let waiting = VecDeque::from([(token, source, change)]);
+
+        let snapshot = snapshot_lifecycle_events_for_waiters(&waiting, &events)
+            .expect("a pending config keeps the lifecycle events beside the consumed batch");
+        assert!(matches!(
+            snapshot.as_slice(),
+            [InputEvent::DeviceResumed(info)] if info.source_id == source
+        ));
+        assert!(
+            snapshot_lifecycle_events_for_waiters(&VecDeque::new(), &events).is_none(),
+            "the common path without a waiting config needs no batch clone"
+        );
+        drop(events); // process_batch consumes the original input vector.
+
+        let mut waiting = waiting;
+        service_waiting_device_configs(
+            &sender,
+            &mut waiting,
+            &snapshot,
+            |actual_source, actual_change| {
+                assert_eq!(actual_source, source);
+                assert_eq!(actual_change, change);
+                Ok(())
+            },
+        )
+        .expect("resume lifecycle event retries the waiting config");
 
         assert!(waiting.is_empty());
         assert!(matches!(

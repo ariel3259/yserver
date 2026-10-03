@@ -103,9 +103,15 @@ impl Backend for HostX11Backend {
                     state: raw.state,
                 }));
             }
-            HostInputEvent::PointerMotion { x, y, time, .. } => {
+            HostInputEvent::PointerMotion {
+                origin, x, y, time, ..
+            } => {
                 self.push_pending_host_event(HostEvent::Pointer(HostPointerEvent {
-                    origin: crate::core_loop::message::InputOrigin::NestedHost,
+                    // XTEST selects its virtual device with GetXTestDevice
+                    // (Xext/xtest.c:351); preserve that source ID through
+                    // nested host fanout. Physical nested input arrives as
+                    // NestedHost on the same path.
+                    origin,
                     kind: PointerEventKind::MotionNotify,
                     host_xid: container,
                     detail: 0,
@@ -131,6 +137,7 @@ impl Backend for HostX11Backend {
             // has no XI2 smooth-scroll valuators to signal one. No-op.
             HostInputEvent::PointerScrollStop { .. } => {}
             HostInputEvent::PointerButton {
+                origin,
                 button,
                 pressed,
                 time,
@@ -162,7 +169,7 @@ impl Backend for HostX11Backend {
                     PointerEventKind::ButtonRelease
                 };
                 self.push_pending_host_event(HostEvent::Pointer(HostPointerEvent {
-                    origin: crate::core_loop::message::InputOrigin::NestedHost,
+                    origin,
                     kind,
                     host_xid: container,
                     detail,

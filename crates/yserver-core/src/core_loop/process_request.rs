@@ -64274,6 +64274,109 @@ mod tests {
         assert!(state.sync_pending.is_empty());
     }
 
+    #[test]
+    fn xi_slave_switch_device_changed_selection_on_child_window_is_delivered() {
+        use crate::{
+            core_loop::pointer_fanout::pointer_event_fanout_to_state, host_x11::HostXidMap,
+        };
+
+        const CLIENT: u32 = 94;
+        const CHILD: u32 = 0x0010_0094;
+        const XI_SELECT_EVENTS: u8 = 46;
+        const SOURCE: u64 = 0xB14;
+
+        let mut state = ServerState::new();
+        let mut peer = install_capture_client(&mut state, CLIENT);
+        let mut backend = RecordingBackend::new();
+        state.resources.create_window(
+            ClientId(CLIENT),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(CHILD),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let (source_id, pointer_id) =
+            xi_dynamic_grab_source(&mut state, SOURCE, false, true, "child-switch-mouse");
+        process_xi_dynamic_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT),
+            SequenceNumber(1),
+            XI_SELECT_EVENTS,
+            &xi_dynamic_select_events_body(
+                CHILD,
+                crate::xinput::DEVICEID_MASTER_POINTER,
+                crate::xinput::XI2_DEVICE_CHANGED_MASK,
+            ),
+        );
+        assert!(
+            read_all_available(&mut peer).is_empty(),
+            "a child selection does not receive the root-only bootstrap"
+        );
+
+        let dropped = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &HostXidMap::new(),
+            xi_dynamic_pointer_event(
+                crate::core_loop::InputOrigin::Physical(source_id),
+                crate::host_x11::PointerEventKind::MotionNotify,
+                0,
+                1,
+            ),
+            true,
+            false,
+        );
+        assert!(dropped.is_empty());
+
+        let event = read_all_available(&mut peer);
+        assert!(
+            !event.is_empty(),
+            "a child-window DeviceChanged selection receives the source switch"
+        );
+        assert_eq!(event[0], 35, "GenericEvent");
+        assert_eq!(
+            u16::from_le_bytes([event[8], event[9]]),
+            1,
+            "XI_DeviceChanged SlaveSwitch"
+        );
+        assert_eq!(
+            u16::from_le_bytes([event[10], event[11]]),
+            crate::xinput::DEVICEID_MASTER_POINTER
+        );
+        assert_eq!(
+            u16::from_le_bytes([event[18], event[19]]),
+            pointer_id,
+            "sourceid is the newly active physical slave"
+        );
+        let units = usize::try_from(u32::from_le_bytes(event[4..8].try_into().unwrap())).unwrap();
+        assert_eq!(event.len(), 32 + 4 * units);
+        assert_eq!(
+            state.xi_devices.device(pointer_id).unwrap().attached_master,
+            Some(crate::xinput::DEVICEID_MASTER_POINTER)
+        );
+        assert!(state.xi2_pointer_grabs.is_empty());
+        assert!(state.active_pointer_grab.is_none());
+        assert_eq!(state.buttons_down, 0);
+        assert!(state.unpublished_pointer_buttons_down.is_empty());
+        assert!(state.sync_pending.is_empty());
+        assert!(state.xi1_frozen.values().all(|freeze| {
+            freeze.state == crate::server::Xi1SyncState::Thawed
+                && freeze.other.is_none()
+                && freeze.stored.is_none()
+        }));
+        assert!(state.clients[&CLIENT].outbound.is_empty());
+    }
+
     fn xi_dynamic_grab_body(window: u32, device_id: u16, mode: u8) -> Vec<u8> {
         let mut body = Vec::with_capacity(24);
         body.extend_from_slice(&window.to_le_bytes());

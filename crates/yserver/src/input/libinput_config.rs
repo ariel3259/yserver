@@ -14,9 +14,9 @@
 //! * [`apply`] — route a decoded [`DeviceConfigChange`] to the matching
 //!   `config_*_set_*` setter on the live device, then collapse
 //!   libinput's [`input::DeviceConfigError`] onto yserver's
-//!   [`DeviceConfigError`]. Caller is responsible for keying the live
-//!   handle by devnode and gating absent-device writes (a no-op
-//!   `Ok(())` is the standard contract — see [`super::Context::apply_device_config`]).
+//!   [`DeviceConfigError`]. Caller keys the live handle by source ID and
+//!   reports an absent source as `SourceGone` (see
+//!   [`super::Context::apply_device_config`]).
 //!
 //! The six bit-mapping helpers (`*_bit` / `send_events_*_mask`) are
 //! private to this module — they encode the snapshot's slot order,
