@@ -2164,7 +2164,7 @@ mod tests {
         assert!(
             state
                 .xi1_frozen
-                .get(&crate::xinput::DEVICEID_SLAVE_KEYBOARD)
+                .get(&crate::xinput::DEVICEID_XTEST_KEYBOARD)
                 .and_then(|f| f.stored.as_ref())
                 .is_none(),
             "async grab must not freeze"
@@ -2858,7 +2858,7 @@ mod tests {
             state.active_keyboard_grab = Some(keyboard_grab(1, ROOT_WINDOW, false, false, 0));
             state
                 .xi1_frozen
-                .entry(crate::xinput::DEVICEID_SLAVE_KEYBOARD)
+                .entry(crate::xinput::DEVICEID_XTEST_KEYBOARD)
                 .or_default()
                 .state = crate::server::Xi1SyncState::FrozenNoEvent;
 
@@ -2882,7 +2882,7 @@ mod tests {
                 &mut state,
                 &mut backend,
                 &HostXidMap::new(),
-                crate::xinput::DEVICEID_SLAVE_KEYBOARD,
+                crate::xinput::DEVICEID_XTEST_KEYBOARD,
             );
 
             let master = vec![
@@ -2912,7 +2912,7 @@ mod tests {
             });
             state
                 .xi1_frozen
-                .entry(crate::xinput::DEVICEID_SLAVE_KEYBOARD)
+                .entry(crate::xinput::DEVICEID_XTEST_KEYBOARD)
                 .or_default()
                 .state = crate::server::Xi1SyncState::FrozenWithEvent;
             let _ = raw_key_event_to_state(&mut state, raw(38, false, 101), true, false);
@@ -2923,7 +2923,7 @@ mod tests {
                 &mut state,
                 &mut backend,
                 &HostXidMap::new(),
-                crate::xinput::DEVICEID_SLAVE_KEYBOARD,
+                crate::xinput::DEVICEID_XTEST_KEYBOARD,
             );
 
             assert_eq!(

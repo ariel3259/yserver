@@ -27,7 +27,7 @@ use crate::{
 
 const XI2_MAJOR_OPCODE: u8 = 137;
 const XI2_MASTER_POINTER_DEVICE_ID: u16 = 2;
-const XI2_SLAVE_POINTER_DEVICE_ID: u16 = 4;
+const XI2_XTEST_POINTER_DEVICE_ID: u16 = crate::xinput::DEVICEID_XTEST_POINTER;
 
 #[derive(Clone, Copy)]
 struct PointerXiSource {
@@ -108,7 +108,7 @@ fn resolve_pointer_xi_source(
                     sourceid: XI2_MASTER_POINTER_DEVICE_ID,
                     attached_master: Some(XI2_MASTER_POINTER_DEVICE_ID),
                 }
-            } else if (device_id == XI2_SLAVE_POINTER_DEVICE_ID
+            } else if (device_id == XI2_XTEST_POINTER_DEVICE_ID
                 || device.facet == Some(XiFacetKind::PointerTouch))
                 && device
                     .attached_master
@@ -259,7 +259,7 @@ fn attached_pointer_holds_button(state: &ServerState, bit: u16) -> bool {
     state.xi_devices.devices().iter().any(|device| {
         device.enabled
             && device.attached_master == Some(XI2_MASTER_POINTER_DEVICE_ID)
-            && (device.id == XI2_SLAVE_POINTER_DEVICE_ID
+            && (device.id == XI2_XTEST_POINTER_DEVICE_ID
                 || device.facet == Some(crate::xinput::XiFacetKind::PointerTouch))
             && device.buttons_down & bit != 0
     }) || state
@@ -2263,7 +2263,7 @@ fn implicit_pointer_grab_lifecycle(
                 || source_has_xi2_grab
                 || state
                     .xi1_active_grabs
-                    .contains_key(&crate::xinput::DEVICEID_SLAVE_POINTER)
+                    .contains_key(&crate::xinput::DEVICEID_XTEST_POINTER)
             {
                 return;
             }
@@ -3912,12 +3912,7 @@ fn barrier_xi2_targets(state: &ServerState, window: ResourceId, evtype: u16) -> 
                 client,
                 window,
                 window,
-                &[
-                    XI2_SLAVE_POINTER_DEVICE_ID,
-                    XI2_MASTER_POINTER_DEVICE_ID,
-                    1,
-                    0,
-                ],
+                &[XI2_MASTER_POINTER_DEVICE_ID, 1, 0],
             );
             ((mask & (1 << evtype)) != 0).then_some(ClientId(*id))
         })
@@ -4100,7 +4095,7 @@ mod tests {
     fn xi1_sync_state_machine_pins() {
         use crate::{
             server::{Xi1ActiveGrab, Xi1SyncState},
-            xinput::{DEVICEID_MASTER_KEYBOARD as KBD, DEVICEID_SLAVE_POINTER as PTR},
+            xinput::{DEVICEID_MASTER_KEYBOARD as KBD, DEVICEID_XTEST_POINTER as PTR},
         };
         let mut state = ServerState::new();
         let owner = ClientId(7);
@@ -5624,7 +5619,7 @@ mod tests {
     /// state is thawed, events MUST flow, never enqueue.
     #[test]
     fn thawed_unified_state_does_not_queue_despite_lingering_passive_grab() {
-        use crate::xinput::DEVICEID_SLAVE_POINTER as PTR;
+        use crate::xinput::DEVICEID_XTEST_POINTER as PTR;
         const OWNER: u32 = 3;
         let grab_win = yserver_protocol::x11::ResourceId(0x0020_0001);
 
@@ -5667,14 +5662,14 @@ mod tests {
             !state
                 .sync_pending
                 .iter()
-                .any(|p| p.device == crate::xinput::DEVICEID_SLAVE_POINTER),
+                .any(|p| p.device == crate::xinput::DEVICEID_XTEST_POINTER),
             "a pointer event must NOT be swallowed into the freeze queue when the \
              unified device state is thawed (Xorg gates enqueue on sync.frozen only); \
              got {} queued — the Steam input-wedge",
             state
                 .sync_pending
                 .iter()
-                .filter(|p| p.device == crate::xinput::DEVICEID_SLAVE_POINTER)
+                .filter(|p| p.device == crate::xinput::DEVICEID_XTEST_POINTER)
                 .count(),
         );
     }
@@ -5854,7 +5849,7 @@ mod tests {
         assert_eq!(off, bytes.len(), "event stream fully consumed");
         assert_eq!(
             motion_deviceids,
-            vec![XI2_SLAVE_POINTER_DEVICE_ID, XI2_MASTER_POINTER_DEVICE_ID],
+            vec![XI2_XTEST_POINTER_DEVICE_ID, XI2_MASTER_POINTER_DEVICE_ID],
             "XIAllDevices(0) motion selector must receive the slave-stamped \
              form BEFORE the master-stamped form (Xorg mi/mieq.c order); \
              master-first silently breaks Qt smooth-scroll + hover"
@@ -6380,6 +6375,114 @@ mod tests {
             &(99i32 << 16).to_le_bytes(),
             "root_x FP1616"
         );
+    }
+
+    fn barrier_hit_bytes_for_selector(device_id: u16) -> Vec<u8> {
+        let mut state = ServerState::new();
+        let mut backend = crate::backend::recording::RecordingBackend::new();
+        let mut peer = install_capture_client(&mut state, 1);
+        let source_id = crate::xinput::InputSourceId(101);
+        let pointer_id = pointer_source(&mut state, source_id.0, true);
+        state
+            .clients
+            .get_mut(&1)
+            .expect("client")
+            .xi2_masks
+            .insert((ROOT_WINDOW, device_id), 1 << 25);
+        assert_eq!(
+            barrier_xi2_targets(&state, ROOT_WINDOW, 25),
+            if matches!(device_id, 0..=2) {
+                vec![ClientId(1)]
+            } else {
+                Vec::new()
+            },
+            "barrier selection candidates for device {device_id}",
+        );
+        let bid = 0x0050_0006;
+        state.pointer_barriers.insert(
+            bid,
+            crate::server::PointerBarrier {
+                owner: ClientId(1),
+                window: ROOT_WINDOW,
+                x1: 100,
+                y1: 0,
+                x2: 100,
+                y2: 200,
+                directions: 0,
+                devices: Vec::new(),
+                hit: false,
+                seen: false,
+                event_id: 1,
+                release_event_id: 0,
+                last_timestamp: 0,
+            },
+        );
+        state.pointer_root = (90, 50);
+        let mut event = motion_event();
+        event.origin = crate::core_loop::message::InputOrigin::Physical(source_id);
+        event.root_x = 110;
+        event.root_y = 50;
+
+        let dropped = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &HostXidMap::new(),
+            event,
+            true,
+            false,
+        );
+
+        assert!(dropped.is_empty());
+        assert_eq!(state.pointer_root, (99, 50));
+        assert!(state.pointer_barriers.get(&bid).expect("barrier").hit);
+        assert_eq!(
+            state
+                .xi_devices
+                .facet(source_id, crate::xinput::XiFacetKind::PointerTouch),
+            Some(pointer_id)
+        );
+        assert_eq!(
+            state.xi_devices.source(source_id).map(|info| info.enabled),
+            Some(true)
+        );
+        assert_eq!(
+            state
+                .xi_devices
+                .device(pointer_id)
+                .map(|device| device.buttons_down),
+            Some(0),
+            "barrier handling must not alter the source's held-button state",
+        );
+        read_all_capture_available(&mut peer)
+    }
+
+    #[test]
+    fn xi_dynamic_reset_barrier_targets_master_selectors_not_xtest_pointer() {
+        let xtest = barrier_hit_bytes_for_selector(crate::xinput::DEVICEID_XTEST_POINTER);
+        assert!(
+            xtest.is_empty(),
+            "a master pointer barrier event must not be selected through virtual XTEST pointer 4"
+        );
+
+        for selector in [
+            XI2_MASTER_POINTER_DEVICE_ID,
+            1, // XIAllMasterDevices
+            0, // XIAllDevices
+        ] {
+            let bytes = barrier_hit_bytes_for_selector(selector);
+            assert_eq!(bytes.len(), 68, "selector {selector} receives BarrierHit");
+            assert_eq!(&bytes[8..10], &25u16.to_le_bytes(), "BarrierHit");
+            assert_eq!(
+                &bytes[10..12],
+                &XI2_MASTER_POINTER_DEVICE_ID.to_le_bytes(),
+                "barrier deviceid remains the master pointer",
+            );
+            assert_eq!(
+                &bytes[40..42],
+                &XI2_MASTER_POINTER_DEVICE_ID.to_le_bytes(),
+                "barrier sourceid remains the master pointer",
+            );
+        }
     }
 
     /// Regression (HW-observed 2026-06-18): a client that selected
@@ -7753,7 +7856,7 @@ mod tests {
         const XI_BUTTON_PRESS_MASK: u32 = 1 << 4;
         // client 1: slave-pointer selection (Enlightenment's pattern).
         state.clients.get_mut(&1).unwrap().xi2_masks.insert(
-            (win, XI2_SLAVE_POINTER_DEVICE_ID),
+            (win, XI2_XTEST_POINTER_DEVICE_ID),
             u64::from(XI_BUTTON_PRESS_MASK),
         );
         // client 2: master-pointer selection (Chromium's pattern).
@@ -7772,7 +7875,7 @@ mod tests {
 
         assert_eq!(
             xi2_stamp_deviceid_for_source(&state, ClientId(1), win, win, 4, Some(4)),
-            XI2_SLAVE_POINTER_DEVICE_ID,
+            XI2_XTEST_POINTER_DEVICE_ID,
             "slave-device selector must stay slave (keeps core delivery)"
         );
         assert_eq!(
@@ -7903,7 +8006,7 @@ mod tests {
 
         // Case 3 — concrete slave pointer only (Enlightenment's pattern):
         // slave form yes, master form no; preserves core delivery.
-        set_masks(&mut state, &[(XI2_SLAVE_POINTER_DEVICE_ID, 0x0000_0040u32)]);
+        set_masks(&mut state, &[(XI2_XTEST_POINTER_DEVICE_ID, 0x0000_0040u32)]);
         assert_eq!(
             xi2_pointer_forms_for_source(&state, ClientId(11), win, win, MOTION, Some(4)),
             (false, true),
@@ -8420,7 +8523,7 @@ mod tests {
             .get_mut(&APP)
             .unwrap()
             .xi2_masks
-            .insert((canvas, XI2_SLAVE_POINTER_DEVICE_ID), (1 << 4) | (1 << 5));
+            .insert((canvas, XI2_XTEST_POINTER_DEVICE_ID), (1 << 4) | (1 << 5));
         let mut xid_map = HostXidMap::new();
         xid_map.insert(HOST_CANVAS, canvas);
 

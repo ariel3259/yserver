@@ -17,7 +17,10 @@ pub mod query;
 pub mod registry;
 
 pub use query::XiQueryError;
-pub use registry::{InputCapabilities, InputSourceId, XiDeviceRole, XiFacetKind, XiRegistry};
+pub use registry::{
+    InputCapabilities, InputSourceId, NAME_XTEST_KEYBOARD, NAME_XTEST_POINTER, XiDeviceRole,
+    XiFacetKind, XiRegistry,
+};
 
 // ---------------------------------------------------------------------------
 // X11 predefined atom ids for property type annotation
@@ -38,14 +41,13 @@ pub const XA_STRING: AtomId = AtomId(31);
 
 pub const DEVICEID_MASTER_POINTER: u16 = 2;
 pub const DEVICEID_MASTER_KEYBOARD: u16 = 3;
-pub const DEVICEID_SLAVE_POINTER: u16 = 4;
-pub const DEVICEID_SLAVE_KEYBOARD: u16 = 5;
+/// Reserved virtual XTEST pointer; physical pointer facets start at ID 6.
+pub const DEVICEID_XTEST_POINTER: u16 = 4;
+/// Reserved virtual XTEST keyboard; physical keyboard facets start at ID 6.
+pub const DEVICEID_XTEST_KEYBOARD: u16 = 5;
 
 pub const NAME_MASTER_POINTER: &str = "Virtual core pointer";
 pub const NAME_MASTER_KEYBOARD: &str = "Virtual core keyboard";
-pub const NAME_SLAVE_POINTER: &str = "Virtual core slave pointer";
-pub const NAME_SLAVE_KEYBOARD: &str = "Virtual core slave keyboard";
-
 /// XI2 `XI_DeviceChanged` event-mask bit (`1 << XI_DeviceChanged`,
 /// XI2.h:232). Single source of truth shared by `process_request`'s
 /// XISelectEvents bootstrap and the touchpad-add/remove fanout so both
@@ -174,8 +176,8 @@ impl XiDevice {
             source_id: None,
             facet: None,
             attached_master: match id {
-                DEVICEID_SLAVE_POINTER => Some(DEVICEID_MASTER_POINTER),
-                DEVICEID_SLAVE_KEYBOARD => Some(DEVICEID_MASTER_KEYBOARD),
+                DEVICEID_XTEST_POINTER => Some(DEVICEID_MASTER_POINTER),
+                DEVICEID_XTEST_KEYBOARD => Some(DEVICEID_MASTER_KEYBOARD),
                 _ => None,
             },
             is_touchpad: false,
@@ -217,8 +219,8 @@ pub fn initial_xi_devices() -> Vec<XiDevice> {
     vec![
         XiDevice::new(DEVICEID_MASTER_POINTER, NAME_MASTER_POINTER),
         XiDevice::new(DEVICEID_MASTER_KEYBOARD, NAME_MASTER_KEYBOARD),
-        XiDevice::new(DEVICEID_SLAVE_POINTER, NAME_SLAVE_POINTER),
-        XiDevice::new(DEVICEID_SLAVE_KEYBOARD, NAME_SLAVE_KEYBOARD),
+        XiDevice::new(DEVICEID_XTEST_POINTER, NAME_XTEST_POINTER),
+        XiDevice::new(DEVICEID_XTEST_KEYBOARD, NAME_XTEST_KEYBOARD),
     ]
 }
 
@@ -445,7 +447,7 @@ pub fn type_atom_for(val: libinput_props::XiValType, float_atom: AtomId) -> Atom
 /// Seed the source metadata and supported pointer properties on one physical facet.
 ///
 /// Every physical facet receives its own Device Node and Device Product ID.
-/// Only pointer/touch facets receive the available libinput descriptors from
+/// Only pointer facets receive the available libinput descriptors from
 /// their source's own configuration snapshot. `float_atom` is the server-wide
 /// FLOAT atom (`ServerState::float_atom`).
 pub fn seed_pointer_properties(
@@ -659,15 +661,15 @@ pub fn device_name(devices: &[XiDevice], deviceid: u16) -> &str {
     match deviceid {
         DEVICEID_MASTER_POINTER => NAME_MASTER_POINTER,
         DEVICEID_MASTER_KEYBOARD => NAME_MASTER_KEYBOARD,
-        DEVICEID_SLAVE_KEYBOARD => NAME_SLAVE_KEYBOARD,
-        DEVICEID_SLAVE_POINTER => NAME_SLAVE_POINTER,
+        DEVICEID_XTEST_KEYBOARD => NAME_XTEST_KEYBOARD,
+        DEVICEID_XTEST_POINTER => NAME_XTEST_POINTER,
         _ => {
             // An id we don't know about should never reach here: the
             // four bootstrap devices are 2/3/4/5. Be loud in debug so a
             // stray id surfaces in tests/dev, but stay harmless in
-            // release by falling back to the slave-pointer name.
+            // release by falling back to the XTEST-pointer name.
             debug_assert!(false, "device_name: unknown device id {deviceid}");
-            NAME_SLAVE_POINTER
+            NAME_XTEST_POINTER
         }
     }
 }
@@ -1623,8 +1625,8 @@ mod tests {
         assert_eq!(devs.len(), 4);
         assert!(devs.iter().any(|d| d.id == DEVICEID_MASTER_POINTER));
         assert!(devs.iter().any(|d| d.id == DEVICEID_MASTER_KEYBOARD));
-        assert!(devs.iter().any(|d| d.id == DEVICEID_SLAVE_POINTER));
-        assert!(devs.iter().any(|d| d.id == DEVICEID_SLAVE_KEYBOARD));
+        assert!(devs.iter().any(|d| d.id == DEVICEID_XTEST_POINTER));
+        assert!(devs.iter().any(|d| d.id == DEVICEID_XTEST_KEYBOARD));
     }
 
     #[test]
@@ -1633,8 +1635,8 @@ mod tests {
         let get = |id: u16| devs.iter().find(|d| d.id == id).unwrap().name.as_str();
         assert_eq!(get(DEVICEID_MASTER_POINTER), "Virtual core pointer");
         assert_eq!(get(DEVICEID_MASTER_KEYBOARD), "Virtual core keyboard");
-        assert_eq!(get(DEVICEID_SLAVE_POINTER), "Virtual core slave pointer");
-        assert_eq!(get(DEVICEID_SLAVE_KEYBOARD), "Virtual core slave keyboard");
+        assert_eq!(get(DEVICEID_XTEST_POINTER), "Virtual core XTEST pointer");
+        assert_eq!(get(DEVICEID_XTEST_KEYBOARD), "Virtual core XTEST keyboard");
     }
 
     #[test]
@@ -1728,11 +1730,11 @@ mod tests {
         for id in [
             DEVICEID_MASTER_POINTER,
             DEVICEID_MASTER_KEYBOARD,
-            DEVICEID_SLAVE_POINTER,
-            DEVICEID_SLAVE_KEYBOARD,
+            DEVICEID_XTEST_POINTER,
+            DEVICEID_XTEST_KEYBOARD,
         ] {
             let dev = state.xi_devices.device(id).unwrap();
-            if id == DEVICEID_SLAVE_POINTER || id == DEVICEID_SLAVE_KEYBOARD {
+            if id == DEVICEID_XTEST_POINTER || id == DEVICEID_XTEST_KEYBOARD {
                 assert_eq!(dev.properties.len(), 1, "XTEST marker remains on {id}");
                 assert!(dev.properties.contains_key(&state.xtest_device_atom));
             } else {
@@ -1755,7 +1757,7 @@ mod tests {
         assert_eq!(
             state
                 .xi_devices
-                .device(DEVICEID_SLAVE_POINTER)
+                .device(DEVICEID_XTEST_POINTER)
                 .unwrap()
                 .name,
             registry::NAME_XTEST_POINTER
@@ -1817,7 +1819,7 @@ mod tests {
         let ids = state.xi_register_source(&info);
         assert_eq!(ids.len(), 1, "pointer capability publishes a facet");
         assert!(state.xi_devices.device(ids[0]).is_some());
-        let slave = state.xi_devices.device(DEVICEID_SLAVE_POINTER).unwrap();
+        let slave = state.xi_devices.device(DEVICEID_XTEST_POINTER).unwrap();
         assert_eq!(slave.name, registry::NAME_XTEST_POINTER);
         let marker = state.xtest_device_atom;
         assert_eq!(
@@ -1892,7 +1894,7 @@ mod tests {
         let mut state = crate::server::ServerState::new();
         let ids = state.xi_register_source(&mouse_info_with_accel());
         assert_eq!(ids, vec![6]);
-        let slave = state.xi_devices.device(DEVICEID_SLAVE_POINTER).unwrap();
+        let slave = state.xi_devices.device(DEVICEID_XTEST_POINTER).unwrap();
         assert_eq!(slave.name, registry::NAME_XTEST_POINTER);
         assert!(
             !slave
@@ -1943,7 +1945,7 @@ mod tests {
             .atoms
             .intern("libinput Natural Scrolling Enabled", true);
         assert!(physical.properties.contains_key(&natural_scroll));
-        let slave = state.xi_devices.device(DEVICEID_SLAVE_POINTER).unwrap();
+        let slave = state.xi_devices.device(DEVICEID_XTEST_POINTER).unwrap();
         assert_eq!(
             slave.name,
             registry::NAME_XTEST_POINTER,
@@ -1998,8 +2000,8 @@ mod tests {
         let mut state = crate::server::ServerState::new();
         let info = touchpad_info(true);
         let id = state.xi_register_source(&info)[0];
-        assert_ne!(id, DEVICEID_SLAVE_POINTER);
-        let slave = state.xi_devices.device(DEVICEID_SLAVE_POINTER).unwrap();
+        assert_ne!(id, DEVICEID_XTEST_POINTER);
+        let slave = state.xi_devices.device(DEVICEID_XTEST_POINTER).unwrap();
         assert_eq!(slave.name, registry::NAME_XTEST_POINTER);
         assert_eq!(slave.properties.len(), 1);
         assert!(slave.properties.contains_key(&state.xtest_device_atom));
@@ -2237,7 +2239,7 @@ mod tests {
     ///   atom 200: STRING/8/"abcde" (5 bytes)
     /// plus a 32-bit one at atom 300: INTEGER/32/[0x11223344, 0x55667788].
     fn dev_with_props() -> XiDevice {
-        let mut dev = XiDevice::new(DEVICEID_SLAVE_POINTER, NAME_SLAVE_POINTER);
+        let mut dev = XiDevice::new(DEVICEID_XTEST_POINTER, NAME_XTEST_POINTER);
         dev.properties.insert(
             AtomId(100),
             XiProperty {
@@ -2443,7 +2445,7 @@ mod tests {
 
     #[test]
     fn change_property_replace_roundtrip() {
-        let mut dev = XiDevice::new(DEVICEID_SLAVE_POINTER, NAME_SLAVE_POINTER);
+        let mut dev = XiDevice::new(DEVICEID_XTEST_POINTER, NAME_XTEST_POINTER);
         let first = apply_change_property(
             &mut dev,
             XI_PROP_MODE_REPLACE,
@@ -2485,7 +2487,7 @@ mod tests {
 
     #[test]
     fn change_property_append_roundtrip() {
-        let mut dev = XiDevice::new(DEVICEID_SLAVE_POINTER, NAME_SLAVE_POINTER);
+        let mut dev = XiDevice::new(DEVICEID_XTEST_POINTER, NAME_XTEST_POINTER);
         apply_change_property(
             &mut dev,
             XI_PROP_MODE_REPLACE,
@@ -2514,7 +2516,7 @@ mod tests {
 
     #[test]
     fn change_property_prepend_roundtrip() {
-        let mut dev = XiDevice::new(DEVICEID_SLAVE_POINTER, NAME_SLAVE_POINTER);
+        let mut dev = XiDevice::new(DEVICEID_XTEST_POINTER, NAME_XTEST_POINTER);
         apply_change_property(
             &mut dev,
             XI_PROP_MODE_REPLACE,
@@ -2543,7 +2545,7 @@ mod tests {
 
     #[test]
     fn change_property_append_format_mismatch_is_badmatch() {
-        let mut dev = XiDevice::new(DEVICEID_SLAVE_POINTER, NAME_SLAVE_POINTER);
+        let mut dev = XiDevice::new(DEVICEID_XTEST_POINTER, NAME_XTEST_POINTER);
         apply_change_property(
             &mut dev,
             XI_PROP_MODE_REPLACE,
@@ -2568,7 +2570,7 @@ mod tests {
 
     #[test]
     fn change_property_append_type_mismatch_is_badmatch() {
-        let mut dev = XiDevice::new(DEVICEID_SLAVE_POINTER, NAME_SLAVE_POINTER);
+        let mut dev = XiDevice::new(DEVICEID_XTEST_POINTER, NAME_XTEST_POINTER);
         apply_change_property(
             &mut dev,
             XI_PROP_MODE_REPLACE,
@@ -2592,7 +2594,7 @@ mod tests {
 
     #[test]
     fn change_property_bad_format_is_badvalue() {
-        let mut dev = XiDevice::new(DEVICEID_SLAVE_POINTER, NAME_SLAVE_POINTER);
+        let mut dev = XiDevice::new(DEVICEID_XTEST_POINTER, NAME_XTEST_POINTER);
         let err = apply_change_property(
             &mut dev,
             XI_PROP_MODE_REPLACE,
@@ -2629,8 +2631,8 @@ mod tests {
         let ev = encode_xi2_property_event(
             ClientByteOrder::LittleEndian,
             SequenceNumber(7),
-            137, // xi_major — yserver's advertised XInputExtension major
-            4,   // deviceid = slave pointer
+            137,                    // xi_major — yserver's advertised XInputExtension major
+            DEVICEID_XTEST_POINTER, // virtual XTEST pointer deviceid
             1000,
             AtomId(0x123),
             PropWhat::Modified,
@@ -2649,7 +2651,11 @@ mod tests {
             12,
             "evtype = XI_PropertyEvent"
         );
-        assert_eq!(u16::from_le_bytes([ev[10], ev[11]]), 4, "deviceid");
+        assert_eq!(
+            u16::from_le_bytes([ev[10], ev[11]]),
+            DEVICEID_XTEST_POINTER,
+            "deviceid = XTEST pointer",
+        );
         assert_eq!(
             u32::from_le_bytes([ev[12], ev[13], ev[14], ev[15]]),
             1000,
@@ -2704,7 +2710,7 @@ mod tests {
             ClientByteOrder::LittleEndian,
             SequenceNumber(1),
             137,
-            4,
+            DEVICEID_XTEST_POINTER,
             0,
             AtomId(1),
             PropWhat::Deleted,
@@ -2727,7 +2733,7 @@ mod tests {
             ClientByteOrder::LittleEndian,
             SequenceNumber(3),
             /*first_event=*/ 66,
-            /*deviceid=*/ 4,
+            /*deviceid=*/ DEVICEID_XTEST_POINTER,
             /*time=*/ 50,
             AtomId(0x77),
             /*deleted=*/ false,
@@ -2748,7 +2754,7 @@ mod tests {
         );
         // Bytes 12-30 are pad0..pad5 + pad4. Pads must be zero.
         assert_eq!(&ev[12..31], &[0u8; 19], "padding bytes are zero");
-        assert_eq!(ev[31], 4, "deviceid (last byte)");
+        assert_eq!(ev[31], 4, "deviceid = XTEST pointer (last byte)");
     }
 
     #[test]
@@ -2759,7 +2765,7 @@ mod tests {
             ClientByteOrder::LittleEndian,
             SequenceNumber(1),
             66,
-            4,
+            DEVICEID_XTEST_POINTER,
             0,
             AtomId(1),
             /*deleted=*/ true,
@@ -2904,7 +2910,7 @@ mod tests {
             "master keyboard is never touchpad"
         );
         assert!(
-            !device_is_touchpad(&state.xi_devices, DEVICEID_SLAVE_KEYBOARD),
+            !device_is_touchpad(&state.xi_devices, DEVICEID_XTEST_KEYBOARD),
             "slave keyboard is never touchpad"
         );
     }

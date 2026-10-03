@@ -888,9 +888,9 @@ pub trait Backend {
     /// from the main loop. On real hardware the desktop's clients can
     /// enumerate devices (`XIQueryDevice` / `XListInputDevices`) seconds
     /// before that burst lands, so they cache a plain pointer and never
-    /// recognise the touchpad (observed on M2/Asahi MATE: all four
-    /// libinput devices first processed ~2s AFTER the clients queried
-    /// device 4).
+    /// recognise the physical touchpad facet (observed on M2/Asahi MATE:
+    /// all four libinput devices first processed ~2s after clients queried
+    /// the registry's initial devices).
     ///
     /// Implementations MUST be bounded and non-blocking: if libinput has
     /// nothing yet, return immediately rather than waiting. Backends without
