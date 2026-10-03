@@ -1,7 +1,8 @@
 # Phase C.0 addendum: the Owner route honours the direct hold
 
-**Status:** revision 2 (review round 1: M-1 protected set, M-2 lifecycle
-handoffs, M-3 test preconditions). Direction approved by the user 2026-10-03:
+**Status:** revision 3 (review round 1: M-1 protected set, M-2 lifecycle
+handoffs, M-3 test preconditions; round 2: M-1 the invariant's two ownership
+states, M-2 per-variant mutation reachability). Direction approved by the user 2026-10-03:
 Legacy parity, not a symptom fix. A production defect of the Owner composed admission (stage 3b)
 against the direct scanout state (stage 2c Ciii, M2), found by the load
 criterion through `c0_merge_unmap_direct_window_unflips_vulkan`.
@@ -81,13 +82,24 @@ accumulates; it never causes an unflip by itself.
 3. **No new unflip triggers.** This addendum adds none; the existing reasons
    (`request_direct_unflip` callers) stay the only ones. Scene damage behind a
    held direct frame must not request an unflip.
-4. **Invariant.** On a live, healthy incarnation with no lifecycle transition,
-   no owner-ordered modeset and no Ciii unflip in flight on the device, at
-   every core-loop iteration boundary: if M2 holds a current direct frame,
-   `current_resources` holds that frame's `DirectRole::Current` for the
-   protected set. During the excluded transitions the invariant is suspended,
-   and each transition's own existing proof decides when the direct frame is
-   released.
+4. **Invariant.** On a live, healthy incarnation with no lifecycle
+   transition, no owner-ordered modeset and no Ciii unflip in flight on the
+   device, at every core-loop iteration boundary, M2's direct ownership is in
+   exactly one of two states, and the commit ledger matches it:
+   - **Stable:** M2 holds a current frame D0 and no direct successor commit
+     is in flight. `current_resources` holds D0's `DirectRole::Current`
+     resources for the whole protected set.
+   - **Direct replacement in flight:** M2 holds D0 current and a pending
+     successor D1 whose commit is dispatched. D0's resources are that
+     commit's retained old-state dependencies (taken out of
+     `current_resources` by the direct dispatch) and D1's resources are its
+     new state, for the same protected set; when D1 retires, D1 becomes
+     Stable. The identities are exact (D0's and D1's commit and source
+     generations), so an ordinary composed commit in flight on the protected
+     set can never satisfy this state: that is the defect this addendum
+     forbids.
+   During the excluded transitions the invariant is suspended, and each
+   transition's own existing proof decides when the direct frame is released.
 
 The rejected alternative (making the Ciii unflip accept composed resources as
 the direct retirement, or routing every composed replacement through Ciii) is
@@ -116,8 +128,18 @@ meaningful, and the mutation (gate removed) must cross the dispatch boundary
   commit is dispatched, the direct frame stays M2-current with its
   `DirectRole::Current`, the composed damage is still pending. Mutation: drop
   rule 1 — a composed commit is dispatched.
-- The same with the direct frame **pending** (not yet presented) and with a
-  **queued successor**.
+- **Pending direct frame — ownership characterization, not a dispatch
+  mutation.** While a submitted direct frame is not yet presented the device
+  slot is occupied and `admission_wake` returns `SlotBusy` before readiness is
+  evaluated, so no composed commit can be dispatched in that interval with or
+  without rule 1. The test checks the protected set and the ownership state
+  (Direct replacement in flight, rule 4) across the interval; the dispatch
+  mutation evidence for this frame is the post-retirement case above. The
+  occupied slot is never bypassed to manufacture a witness.
+- **Queued successor:** the queued direct successor is held in a production
+  waiting state (its source not yet ready), so it cannot win the retirement
+  admission and mask the composed candidate; with the gate removed, the
+  ready composed offer is dispatched (mutation), with the gate it waits.
 - **The complete protected set:** a device with two outputs; the direct frame
   is paced on A; a ready composed offer on B is held too. Mutation: derive the
   set from the candidate's CRTC — B's composed commit is dispatched.
