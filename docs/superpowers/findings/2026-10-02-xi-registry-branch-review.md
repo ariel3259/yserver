@@ -1,6 +1,6 @@
 # Dynamic XI registry: whole-branch review (2026-10-02)
 
-Reviewer: codex gpt-6.1-sol xhigh, read-only, on `c91ca276` vs `joske/master`. Coordinator spot-checked the Xorg citations for findings 3, 5, 6, 7 and 13 (all match). Fixes are applied in three rounds: R1 = 1, 2, 8, 10; R2 = 3, 5, 6, 7; R3 = 4, 9, 11, 12, 13 + observations.
+Reviewer: codex gpt-6.1-sol xhigh, read-only, on `499e7129` vs `joske/master`. Coordinator spot-checked the Xorg citations for findings 3, 5, 6, 7 and 13 (all match). Fixes are applied in three rounds: R1 = 1, 2, 8, 10; R2 = 3, 5, 6, 7; R3 = 4, 9, 11, 12, 13 + observations.
 
 I found **nine major integration defects and four minor wire defects**. These are verified source traces against `joske/master` and `../xserver`; no files were changed and no tests were run.
 
@@ -41,11 +41,11 @@ Additional observations:
 **Verdict: not ready for PR.** Held-state leakage, broken grab delivery/isolation, incorrect scroll deltas, and nested XTEST regression need resolution despite the green per-task suites.
 ## Verification review of R1-R3 (2026-10-03)
 
-Reviewer: codex gpt-6.1-sol xhigh, read-only, on `02e98009`. New findings D1-D6 are fixed in round R4.
+Reviewer: codex gpt-6.1-sol xhigh, read-only, on `f42f6ab7`. New findings D1-D6 are fixed in round R4.
 
 **Not ready for hardware verification and PR.** The fixes repair most reported scenarios, but introduce two major scroll regressions. Exact-slave grabs also remain broken with `owner_events=true`.
 
-I reviewed `35e54b5e..HEAD` and the relevant full-branch interactions against `joske/master`, at HEAD `02e9800954d9`. No files or git state changed. Existing test binaries produced **24 passes and 10 environment-limited failures**: this sandbox rejects Unix-socket `send` with `EPERM`, preventing those tests’ replies/events from reaching their peers. These were not fresh HEAD builds. Statements about tests failing without a fix are source counterfactuals; I did not revert fixes or perform mutation runs.
+I reviewed `02e6f11d..HEAD` and the relevant full-branch interactions against `joske/master`, at HEAD `f42f6ab7b6d2`. No files or git state changed. Existing test binaries produced **24 passes and 10 environment-limited failures**: this sandbox rejects Unix-socket `send` with `EPERM`, preventing those tests’ replies/events from reaching their peers. These were not fresh HEAD builds. Statements about tests failing without a fix are source counterfactuals; I did not revert fixes or perform mutation runs.
 
 The additional defects are:
 
@@ -157,11 +157,11 @@ For a user with one mouse and one keyboard, D2 is directly reachable. D1 also be
 **Verdict: not ready for hardware verification and PR.** Resolve D1–D3 and add coverage for scroll stops/queries, motion-only masks, and owner-events fallback before proceeding.
 ## Second verification review of R4 (2026-10-03)
 
-Reviewer: codex gpt-6.1-sol xhigh, read-only, on `e7d7c02b`. Findings below (numbered V1-V5 for R5): 1->V1, 2->V2, 3->V3, 4->V4, 5->V5.
+Reviewer: codex gpt-6.1-sol xhigh, read-only, on `d08b6777`. Findings below (numbered V1-V5 for R5): 1->V1, 2->V2, 3->V3, 4->V4, 5->V5.
 
 **Not ready yet.** R4 repairs the reported D1–D3, D5–D6 scenarios and the per-window DeviceChanged observation. D4 is only partially fixed. I found three new R4 defects and two scrolling regressions against `joske/master`.
 
-Reviewed `f865ade4..e7d7c02b`, with full-branch context and `../xserver`. No files or git state changed; no hardware or ignored tests ran.
+Reviewed `40bd7851..d08b6777`, with full-branch context and `../xserver`. No files or git state changed; no hardware or ignored tests ran.
 
 For each requested fix:
 
@@ -213,11 +213,11 @@ Headless wheel conversion, remapped-button unplug cleanup, VT held-state cleanup
 **Verdict: not ready for hardware verification and PR.**
 ## Final verification of R5 (2026-10-03)
 
-Reviewer: codex gpt-6.1-sol xhigh, read-only, on `5a67379c`. No blocking or major findings; the two minor findings below were accepted by the user on 2026-10-03 as documented known limitations (not fixed in this branch).
+Reviewer: codex gpt-6.1-sol xhigh, read-only, on `5690cd59`. No blocking or major findings; the two minor findings below were accepted by the user on 2026-10-03 as documented known limitations (not fixed in this branch).
 
 **Not ready for hardware verification and PR.** V1–V5 are fixed in their reported scenarios, but R5 introduces two minor correctness regressions. I confirmed no new blocking or major defect.
 
-Reviewed only `931ae07b..5a67379c`, using surrounding code and `../xserver` for context.
+Reviewed only `71ece4a6..5690cd59`, using surrounding code and `../xserver` for context.
 
 | Finding | Verification against production code and Xorg | Does the regression test reject the old behavior? |
 |---|---|---|

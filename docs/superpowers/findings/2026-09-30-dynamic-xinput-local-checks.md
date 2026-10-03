@@ -1,7 +1,7 @@
 # Local verification of the two unfinished XI design questions
 
 **Scope:** source audit and reproducible acceptance scenarios, 2026-09-30,
-on yserver `bac725e5`. Further Opus review is canceled by user instruction.
+on yserver `dbeb5a49`. Further Opus review is canceled by user instruction.
 This document does not claim runtime reproduction or a passing implementation.
 No Rust changes, implementation tests or live VT/reset operations were performed.
 
