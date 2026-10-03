@@ -276,6 +276,7 @@ struct SharedBackingMoveSource {
 struct FloatingKeyboardState {
     xkb_state: crate::kms::core::XkbState,
     down_keys: HashSet<u8>,
+    lock_filter_priv_by_key: HashMap<u8, u32>,
     locked_group: u8,
 }
 
@@ -1780,6 +1781,9 @@ pub struct KmsBackend {
     /// Independent XKB cooking states for keyboard slaves detached by an
     /// explicit XI2 grab. The XI device ID is stable for the grab lifetime.
     floating_keyboard_states: HashMap<u16, FloatingKeyboardState>,
+    /// Xorg's XkbFilterLockState `filter->priv`: locked modifier bits that
+    /// were set before each held LockMods key press.
+    lock_filter_priv_by_device: HashMap<u16, HashMap<u8, u32>>,
     /// Core-channel sender for backend-originated shutdowns. Handed in via
     /// `set_input_sender` after the channel is created in `lib.rs`.
     input_sender: Option<yserver_core::core_loop::CoreSender>,
@@ -5533,6 +5537,7 @@ impl KmsBackend {
             led_relay: None,
             leds_sent: 0,
             floating_keyboard_states: HashMap::new(),
+            lock_filter_priv_by_device: HashMap::new(),
             input_sender: None,
             crtc_config_probe_executor,
             pending_crtc_config_probes: HashMap::new(),
@@ -6628,6 +6633,7 @@ impl KmsBackend {
             led_relay: None,
             leds_sent: 0,
             floating_keyboard_states: HashMap::new(),
+            lock_filter_priv_by_device: HashMap::new(),
             input_sender: None,
             crtc_config_probe_executor: None,
             pending_crtc_config_probes: HashMap::new(),
@@ -12423,6 +12429,18 @@ impl KmsBackend {
         mask
     }
 
+    fn lock_modifiers_action_mask(&self, keycode: u8) -> u32 {
+        self.core
+            .xkb_desc
+            .acts
+            .get(usize::from(keycode))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|action| action[0] == crate::kms::xkb_desc::SA_LOCK_MODS)
+            .fold(0, |mask, action| mask | u32::from(action[2]))
+    }
+
     fn synchronize_floating_keyboard_states(&mut self, state: &ServerState) {
         let floating_ids: HashSet<u16> = state
             .xi2_detached_masters
@@ -12435,6 +12453,8 @@ impl KmsBackend {
             .collect();
         self.floating_keyboard_states
             .retain(|device_id, _| floating_ids.contains(device_id));
+        self.lock_filter_priv_by_device
+            .retain(|device_id, _| state.xi_devices.device(*device_id).is_some());
 
         let new_ids: Vec<u16> = floating_ids
             .into_iter()
@@ -12471,6 +12491,7 @@ impl KmsBackend {
                 .into_iter()
                 .flat_map(|held| held.keys().copied())
                 .collect();
+            let mut lock_filter_priv_by_key = HashMap::new();
             for keycode in &down_keys {
                 let xkb_keycode = xkbcommon::xkb::Keycode::new(u32::from(*keycode));
                 let keymap = &self.core.xkb_keymap.0;
@@ -12500,13 +12521,18 @@ impl KmsBackend {
                 });
                 if lock_action_key {
                     // The master's copied locked state already includes the
-                    // held lock key's action. Xorg retains that key's action
-                    // filter across DetachFromMaster (xkb/xkbActions.c:372;
-                    // dix/events.c:1463-1471); replaying a second lock press
-                    // here makes libxkbcommon clear the inherited lock when
-                    // the floating device later receives the release. Keep
-                    // it in `down_keys` for duplicate suppression and bitmap
-                    // handling, but do not replay its action into this state.
+                    // held lock key's action. Xorg retains its filter across
+                    // DetachFromMaster and clears only filter->priv on keyup
+                    // (xkb/xkbActions.c:372-383). Preserve those pre-press
+                    // bits for the floating release instead of replaying a
+                    // second LockMods press.
+                    if let Some(priv_bits) = self
+                        .lock_filter_priv_by_device
+                        .get(&device_id)
+                        .and_then(|held| held.get(keycode))
+                    {
+                        lock_filter_priv_by_key.insert(*keycode, *priv_bits);
+                    }
                     continue;
                 }
                 xkb_state.update_key(xkb_keycode, xkbcommon::xkb::KeyDirection::Down);
@@ -12516,6 +12542,7 @@ impl KmsBackend {
                 FloatingKeyboardState {
                     xkb_state: crate::kms::core::XkbState(xkb_state),
                     down_keys,
+                    lock_filter_priv_by_key,
                     locked_group,
                 },
             );
@@ -12543,6 +12570,11 @@ impl KmsBackend {
 
         let group_count = self.keymap_group_count();
         let floating = self.floating_keyboard_states.get_mut(&device_id)?;
+        let lock_filter_priv = if raw.pressed {
+            None
+        } else {
+            floating.lock_filter_priv_by_key.remove(&raw.keycode)
+        };
         let pre_state = Self::serialize_xkb_modifiers(
             &floating.xkb_state.0,
             floating.locked_group,
@@ -12560,6 +12592,27 @@ impl KmsBackend {
                 xkbcommon::xkb::KeyDirection::Up
             },
         );
+        if let Some(priv_bits) = lock_filter_priv {
+            let xkb_state = &mut floating.xkb_state.0;
+            let locked_mods = xkb_state.serialize_mods(xkbcommon::xkb::STATE_MODS_LOCKED);
+            let depressed_mods = xkb_state.serialize_mods(xkbcommon::xkb::STATE_MODS_DEPRESSED);
+            let latched_mods = xkb_state.serialize_mods(xkbcommon::xkb::STATE_MODS_LATCHED);
+            let depressed_layout =
+                xkb_state.serialize_layout(xkbcommon::xkb::STATE_LAYOUT_DEPRESSED);
+            let latched_layout = xkb_state.serialize_layout(xkbcommon::xkb::STATE_LAYOUT_LATCHED);
+            let locked_layout = xkb_state.serialize_layout(xkbcommon::xkb::STATE_LAYOUT_LOCKED);
+            // XkbFilterLockState release: `locked_mods &= ~filter->priv`.
+            // xkb_state_update_mask preserves the other components while
+            // replacing only that saved lock subset.
+            xkb_state.update_mask(
+                depressed_mods,
+                latched_mods,
+                locked_mods & !priv_bits,
+                depressed_layout,
+                latched_layout,
+                locked_layout,
+            );
+        }
         let group_after = floating
             .xkb_state
             .0
@@ -20872,14 +20925,41 @@ impl KmsBackend {
         self.synchronize_floating_keyboard_states(state);
         let floating_keyboard =
             yserver_core::core_loop::key_fanout::keyboard_origin_is_floating(state, raw.origin);
+        let keyboard_device_id = match raw.origin {
+            yserver_core::core_loop::InputOrigin::Physical(source_id) => state
+                .xi_devices
+                .facet(source_id, yserver_core::xinput::XiFacetKind::Keyboard),
+            yserver_core::core_loop::InputOrigin::XTest(device_id) => Some(device_id),
+            yserver_core::core_loop::InputOrigin::NestedHost => None,
+        };
+        if !floating_keyboard && let Some(device_id) = keyboard_device_id {
+            if raw.pressed {
+                let action_mask = self.lock_modifiers_action_mask(raw.keycode);
+                if action_mask != 0 {
+                    let locked_mods = self
+                        .core
+                        .xkb_state
+                        .0
+                        .serialize_mods(xkbcommon::xkb::STATE_MODS_LOCKED);
+                    let priv_bits = if transition.master_accepted {
+                        locked_mods & action_mask
+                    } else {
+                        0
+                    };
+                    self.lock_filter_priv_by_device
+                        .entry(device_id)
+                        .or_default()
+                        .insert(raw.keycode, priv_bits);
+                }
+            } else if let Some(held) = self.lock_filter_priv_by_device.get_mut(&device_id) {
+                held.remove(&raw.keycode);
+                if held.is_empty() {
+                    self.lock_filter_priv_by_device.remove(&device_id);
+                }
+            }
+        }
         let cooked = if floating_keyboard {
-            let device_id = match raw.origin {
-                yserver_core::core_loop::InputOrigin::Physical(source_id) => state
-                    .xi_devices
-                    .facet(source_id, yserver_core::xinput::XiFacetKind::Keyboard),
-                yserver_core::core_loop::InputOrigin::XTest(device_id) => Some(device_id),
-                yserver_core::core_loop::InputOrigin::NestedHost => None,
-            };
+            let device_id = keyboard_device_id;
             let Some(device_id) = device_id else {
                 return;
             };
@@ -20887,6 +20967,14 @@ impl KmsBackend {
             else {
                 return;
             };
+            if !raw.pressed
+                && let Some(held) = self.lock_filter_priv_by_device.get_mut(&device_id)
+            {
+                held.remove(&raw.keycode);
+                if held.is_empty() {
+                    self.lock_filter_priv_by_device.remove(&device_id);
+                }
+            }
             cooked
         } else if transition.master_accepted {
             let mut cooked = self.cook_host_key(HostKeyEvent { time, ..raw });
@@ -32910,6 +32998,152 @@ mod tests {
         assert!(state.xi2_keyboard_grabs.contains_key(&keyboard_id));
         assert!(state.sync_pending.is_empty());
         assert!(!state.xi1_frozen[&keyboard_id].frozen());
+    }
+
+    #[test]
+    fn xi_dynamic_caps_lock_release_after_keyboard_grab_clears_saved_prepress_lock() {
+        use yserver_core::{
+            backend::Backend,
+            core_loop::{HostInputEvent, InputOrigin, process_request},
+            host_x11::HostKeyEvent,
+            resources::ROOT_WINDOW,
+            server::ServerState,
+            xinput::{InputSourceId, XiFacetKind},
+        };
+        use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
+
+        const CLIENT: u32 = 0xA742;
+        const SOURCE: InputSourceId = InputSourceId(0xA7421);
+        const CAPS_LOCK: u8 = 66;
+        const LOCK_MASK: u32 = 1 << 1;
+
+        let mut backend = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        backend
+            .core
+            .xid_map
+            .insert(backend.core.window_id, ROOT_WINDOW);
+        let _peer = kbd_map_client_id(&mut state, CLIENT);
+        process_request::process_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 137,
+                data: 47,
+                length_units: 2,
+            },
+            &[2, 0, 3, 0],
+            None,
+        )
+        .expect("production XIQueryVersion request");
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceAdded(dynamic_test_device(SOURCE, true, false)),
+        );
+        let keyboard_id = state
+            .xi_devices
+            .facet(SOURCE, XiFacetKind::Keyboard)
+            .expect("physical keyboard facet");
+        let key = |pressed| {
+            HostInputEvent::Key(HostKeyEvent {
+                origin: InputOrigin::Physical(SOURCE),
+                pressed,
+                keycode: CAPS_LOCK,
+                time: 10,
+                root_x: 0,
+                root_y: 0,
+                event_x: 0,
+                event_y: 0,
+                state: 0,
+            })
+        };
+
+        // First press/release turns Caps on. A second press starts while
+        // Lock is already set; Xorg saves that pre-press bit in the lock
+        // filter (xkb/xkbActions.c:368-383) and clears only it on release.
+        Backend::on_host_input(&mut backend, &mut state, key(true));
+        Backend::on_host_input(&mut backend, &mut state, key(false));
+        assert_eq!(
+            backend
+                .core
+                .xkb_state
+                .0
+                .serialize_mods(xkbcommon::xkb::STATE_MODS_LOCKED)
+                & LOCK_MASK,
+            LOCK_MASK,
+            "the first Caps cycle turns Lock on",
+        );
+        Backend::on_host_input(&mut backend, &mut state, key(true));
+        assert!(state.key_down_by_device[&keyboard_id].contains_key(&CAPS_LOCK));
+        assert_eq!(
+            backend.lock_filter_priv_by_device[&keyboard_id][&CAPS_LOCK], LOCK_MASK,
+            "the floating release carries Xorg's pre-press Lock bit",
+        );
+
+        process_dynamic_test_keyboard_grab(&mut backend, &mut state, CLIENT, keyboard_id, 2);
+        assert_eq!(
+            state
+                .xi_devices
+                .device(keyboard_id)
+                .unwrap()
+                .attached_master,
+            None
+        );
+        assert!(
+            backend.floating_keyboard_states[&keyboard_id]
+                .down_keys
+                .contains(&CAPS_LOCK)
+        );
+
+        Backend::on_host_input(&mut backend, &mut state, key(false));
+        let floating_locked_after_release = backend.floating_keyboard_states[&keyboard_id]
+            .xkb_state
+            .0
+            .serialize_mods(xkbcommon::xkb::STATE_MODS_LOCKED);
+        assert_eq!(
+            floating_locked_after_release & LOCK_MASK,
+            0,
+            "floating release clears the saved pre-press Caps bit",
+        );
+        assert!(
+            !backend.floating_keyboard_states[&keyboard_id]
+                .down_keys
+                .contains(&CAPS_LOCK)
+        );
+        assert!(
+            state
+                .key_down_by_device
+                .get(&keyboard_id)
+                .is_none_or(std::collections::HashMap::is_empty)
+        );
+        assert!(
+            !backend
+                .lock_filter_priv_by_device
+                .contains_key(&keyboard_id)
+        );
+        assert!(
+            backend.floating_keyboard_states[&keyboard_id]
+                .lock_filter_priv_by_key
+                .is_empty()
+        );
+        assert_eq!(
+            state
+                .xi_devices
+                .device(keyboard_id)
+                .unwrap()
+                .attached_master,
+            None
+        );
+        assert!(state.xi2_keyboard_grabs.contains_key(&keyboard_id));
+        assert!(state.sync_pending.is_empty());
+        assert_ne!(
+            state.keys_down[usize::from(CAPS_LOCK / 8)] & (1u8 << (CAPS_LOCK % 8)),
+            0,
+            "detached release leaves the master key bitmap unchanged",
+        );
     }
 
     #[test]
