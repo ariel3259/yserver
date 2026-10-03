@@ -32,7 +32,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fmt, io,
     os::fd::{AsFd, AsRawFd},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 pub use super::{clock::ProbeOutcome, completion::MechanismFailure, fences::FenceStatus};
@@ -224,6 +224,9 @@ pub struct DeviceCommitOwner<R> {
     pub(crate) inject_hardware_overflow: bool,
     #[doc(hidden)]
     pub(crate) inject_present_overflow_crtc: Option<u32>,
+    /// Optional hardware-completion timeout used by long-running core-loop
+    /// fixtures. `None` retains the production deadline calculation.
+    pub(crate) completion_deadline_override: Option<Duration>,
     #[cfg(test)]
     refuse_next_validated_begin_for_tests: bool,
 }
@@ -261,6 +264,7 @@ impl<R> DeviceCommitOwner<R> {
             },
             inject_hardware_overflow: false,
             inject_present_overflow_crtc: None,
+            completion_deadline_override: None,
             #[cfg(test)]
             refuse_next_validated_begin_for_tests: false,
         }
@@ -2606,18 +2610,23 @@ impl<R> DeviceCommitOwner<R> {
                     record.mark_accepted();
                     record.completion_state_mut().accepted_at = Some(now);
 
-                    let hw_duration = match record.completion_context().class {
-                        CompletionClass::FastUpdate => fast_hardware(
-                            record.completion_context().mode_periods.values().copied(),
-                        ),
-                        CompletionClass::LifecycleInstallRestore => {
-                            lifecycle_hardware(record.completion_context().lifecycle_observed_max)
-                        }
-                    };
-                    let hw_duration = match hw_duration {
-                        Ok(d) => d,
-                        Err(_) => {
-                            return self.poison_unconditionally(MechanismFailure::DeadlineOverflow);
+                    let hw_duration = if let Some(duration) = self.completion_deadline_override {
+                        duration
+                    } else {
+                        let calculated = match record.completion_context().class {
+                            CompletionClass::FastUpdate => fast_hardware(
+                                record.completion_context().mode_periods.values().copied(),
+                            ),
+                            CompletionClass::LifecycleInstallRestore => lifecycle_hardware(
+                                record.completion_context().lifecycle_observed_max,
+                            ),
+                        };
+                        match calculated {
+                            Ok(duration) => duration,
+                            Err(_) => {
+                                return self
+                                    .poison_unconditionally(MechanismFailure::DeadlineOverflow);
+                            }
                         }
                     };
                     let hw_deadline = if self.inject_hardware_overflow {

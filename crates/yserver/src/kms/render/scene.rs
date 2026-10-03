@@ -3730,12 +3730,12 @@ impl SceneCompositor {
     }
 
     #[cfg(test)]
-    pub(crate) fn output_scene_identity_for_tests(&self, output_idx: usize) -> Option<usize> {
+    pub(crate) fn output_scene_identity_for_tests(&self, output_idx: usize) -> Option<u64> {
         self.inner
             .as_ref()?
             .outputs
             .get(output_idx)
-            .map(|state| std::ptr::from_ref(state) as usize)
+            .map(|state| state.pool_ring.identity_for_tests())
     }
 
     #[cfg(test)]
@@ -4165,6 +4165,61 @@ impl SceneCompositor {
                     .find(|buffer| buffer.identity().generation == generation)
             })
             .map(OwnerBuffer::state)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn owner_buffer_for_generation_anywhere_for_tests(
+        &self,
+        output_key: &OutputKey,
+        bo_idx: usize,
+        generation: u64,
+    ) -> Option<(
+        crate::kms::render::owner_buffer::OwnerBufferIdentity,
+        OwnerBufferState,
+    )> {
+        let inner = self.inner.as_ref()?;
+        inner
+            .outputs
+            .iter()
+            .flat_map(|state| state.owner_buffers.iter())
+            .chain(
+                inner
+                    .retired_outputs
+                    .values()
+                    .flatten()
+                    .flat_map(|bundle| bundle.scene.owner_buffers.iter()),
+            )
+            .find(|buffer| {
+                buffer.identity().output_key == *output_key
+                    && buffer.identity().bo_idx == bo_idx
+                    && buffer.identity().generation == generation
+            })
+            .map(|buffer| (buffer.identity().clone(), buffer.state()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn owner_buffers_anywhere_for_tests(
+        &self,
+    ) -> Vec<(
+        crate::kms::render::owner_buffer::OwnerBufferIdentity,
+        OwnerBufferState,
+    )> {
+        let Some(inner) = self.inner.as_ref() else {
+            return Vec::new();
+        };
+        inner
+            .outputs
+            .iter()
+            .flat_map(|state| state.owner_buffers.iter())
+            .chain(
+                inner
+                    .retired_outputs
+                    .values()
+                    .flatten()
+                    .flat_map(|bundle| bundle.scene.owner_buffers.iter()),
+            )
+            .map(|buffer| (buffer.identity().clone(), buffer.state()))
+            .collect()
     }
 
     #[cfg(test)]

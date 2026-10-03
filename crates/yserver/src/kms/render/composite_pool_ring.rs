@@ -142,6 +142,13 @@ impl CompositePoolRing {
     pub(crate) fn occupancy_for_tests(&self) -> (usize, usize) {
         (self.tracker.slots_in_use(), self.pools.len())
     }
+
+    #[cfg(test)]
+    pub(crate) fn identity_for_tests(&self) -> u64 {
+        use ash::vk::Handle;
+
+        self.pools[0].as_raw()
+    }
 }
 
 impl Drop for CompositePoolRing {

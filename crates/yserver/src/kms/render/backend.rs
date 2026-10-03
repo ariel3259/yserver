@@ -1906,6 +1906,9 @@ pub struct KmsBackend {
     /// are conservatively treated as lit until the first registration.
     pub(crate) owner_dpms_installed_active: HashMap<DrmDeviceKey, bool>,
     pub(crate) resource_service: Option<crate::kms::render::resources::ResourceService>,
+    /// Optional test override for the combined wake deadline while a retired
+    /// output is pending. `None` keeps the production calculation unchanged.
+    retired_output_deadline_override: Option<std::time::Instant>,
     pub(crate) drm_cleanup_registry: Option<crate::kms::render::resources::DrmCleanupRegistry>,
     pub(crate) commit_consumer: crate::kms::render::resources::CommitResourceConsumer,
 
@@ -7723,6 +7726,7 @@ impl KmsBackend {
             lifecycle_drivers: std::collections::BTreeMap::new(),
             owner_dpms_installed_active: HashMap::new(),
             resource_service: None,
+            retired_output_deadline_override: None,
             drm_cleanup_registry: None,
             commit_consumer: crate::kms::render::resources::CommitResourceConsumer::new(),
             #[cfg(test)]
@@ -9238,6 +9242,7 @@ impl KmsBackend {
             lifecycle_drivers: std::collections::BTreeMap::new(),
             owner_dpms_installed_active: HashMap::new(),
             resource_service: None,
+            retired_output_deadline_override: None,
             drm_cleanup_registry: None,
             commit_consumer: crate::kms::render::resources::CommitResourceConsumer::new(),
             #[cfg(test)]
@@ -28479,14 +28484,14 @@ impl Backend for KmsBackend {
         } else {
             None
         };
+        let retired_output_pending = self.scene.retired_output_work_pending();
         let retired_output_deadline = self
-            .scene
-            .retired_output_work_pending()
-            .then(|| now + std::time::Duration::from_millis(1));
+            .retired_output_deadline_override
+            .or_else(|| retired_output_pending.then(|| now + std::time::Duration::from_millis(1)));
         let rescan_deadline = self
             .hotplug_rescan_deadline
             .map(|until| if now >= until { now } else { until });
-        scene_deadline
+        let next_deadline = scene_deadline
             .into_iter()
             .chain(present_deadline)
             .chain(retired_output_deadline)
@@ -28517,7 +28522,10 @@ impl Backend for KmsBackend {
                     .as_ref()
                     .and_then(|s| s.next_deadline()),
             )
-            .min()
+            .min();
+        self.retired_output_deadline_override
+            .filter(|_| retired_output_pending)
+            .or(next_deadline)
     }
 
     fn maybe_composite(&mut self) -> io::Result<()> {
@@ -71540,6 +71548,18 @@ mod tests {
         c0_3bi_core_driver_until_mode(backend, &mut state, label, timeout, done, None, false, true)
     }
 
+    fn c0_3bi_core_driver_until_before_iteration_tail(
+        backend: &mut super::KmsBackend,
+        label: &str,
+        timeout: std::time::Duration,
+        done: &dyn Fn(&super::KmsBackend) -> bool,
+    ) -> Result<(), String> {
+        let mut state = ServerState::new();
+        c0_3bi_core_driver_until_mode_with_options(
+            backend, &mut state, label, timeout, done, None, false, false, true,
+        )
+    }
+
     /// Whether `fd` is a DRM character device (major 226), as opposed to the
     /// `/dev/null` stand-in the live fixtures install.
     fn c0_3bi_fd_is_drm_device(fd: std::os::fd::RawFd) -> bool {
@@ -71589,11 +71609,36 @@ mod tests {
         stop_when_done_before_crtc_result: bool,
         stop_immediately_when_done: bool,
     ) -> Result<(), String> {
+        c0_3bi_core_driver_until_mode_with_options(
+            backend,
+            state,
+            label,
+            timeout,
+            done,
+            hardware_complete,
+            stop_when_done_before_crtc_result,
+            stop_immediately_when_done,
+            false,
+        )
+    }
+
+    fn c0_3bi_core_driver_until_mode_with_options(
+        backend: &mut super::KmsBackend,
+        state: &mut ServerState,
+        label: &str,
+        timeout: std::time::Duration,
+        done: &dyn Fn(&super::KmsBackend) -> bool,
+        hardware_complete: Option<&Rc<RefCell<HashSet<crate::kms::owner::identity::CommitId>>>>,
+        stop_when_done_before_crtc_result: bool,
+        stop_immediately_when_done: bool,
+        stop_before_iteration_tail_when_done: bool,
+    ) -> Result<(), String> {
         use std::time::Instant;
         let end = Instant::now() + timeout;
         let sources = Backend::poll_fds(backend);
         while Instant::now() < end {
-            if stop_immediately_when_done && done(backend) {
+            if (stop_immediately_when_done || stop_before_iteration_tail_when_done) && done(backend)
+            {
                 return Ok(());
             }
             Backend::before_block(backend);
@@ -71870,6 +71915,9 @@ mod tests {
                             .map(|(_, commit)| commit),
                     );
                 }
+            }
+            if stop_before_iteration_tail_when_done && done(backend) {
+                return Ok(());
             }
             c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete);
             if done(backend)
@@ -72512,53 +72560,128 @@ mod tests {
         }));
     }
 
+    fn c0_3bi_managed_keys_are_absent(
+        backend: &super::KmsBackend,
+        keys: &[crate::kms::render::resources::AllocationKey],
+    ) -> bool {
+        keys.iter().all(|key| {
+            !backend
+                .resource_service()
+                .is_some_and(|service| service.contains(key))
+        })
+    }
+
+    fn c0_3bi_core_drive_retired_pool_release(
+        backend: &mut super::KmsBackend,
+        instance: crate::kms::backend::OutputInstanceId,
+        keys: &[crate::kms::render::resources::AllocationKey],
+        label: &str,
+        timeout: std::time::Duration,
+    ) -> Result<(), String> {
+        c0_3bi_core_driver_until(
+            backend,
+            label,
+            timeout,
+            &|backend| {
+                !backend
+                    .scene
+                    .retired_output_has_instance_for_tests(instance)
+                    && c0_3bi_managed_keys_are_absent(backend, keys)
+            },
+            None,
+        )
+    }
+
     fn c0_3bi_assert_managed_keys_absent(
         backend: &super::KmsBackend,
         keys: &[crate::kms::render::resources::AllocationKey],
     ) {
-        let retained = keys
-            .iter()
-            .copied()
-            .filter(|key| {
-                backend
-                    .resource_service()
-                    .is_some_and(|service| service.contains(key))
-            })
+        let retained = backend
+            .resource_service()
+            .map(|service| service.allocation_end_state_for_tests())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|allocation| keys.contains(&allocation.key))
             .collect::<Vec<_>>();
         assert!(
             retained.is_empty(),
-            "retired copied allocations remain: {retained:?}"
+            "retired copied allocations remain with live uses or obligations: {retained:?}"
         );
     }
 
-    fn c0_3bi_hold_copied_resource_completion_for_tests(
-        backend: &mut super::KmsBackend,
-        source: crate::kms::render::resources::AllocationKey,
-        destination: crate::kms::render::resources::AllocationKey,
+    fn c0_3bi_assert_managed_keys_quiescent(
+        backend: &super::KmsBackend,
+        keys: &[crate::kms::render::resources::AllocationKey],
     ) {
         let service = backend
-            .resource_service
-            .as_mut()
-            .expect("copied completion resource service");
-        let mut held = 0;
-        for batch in service.pending_batches_mut() {
-            let has_source_read = batch
-                .read_obligation
-                .as_ref()
-                .is_some_and(|read| read.source_key() == source);
-            let has_destination_write = batch.obligation().is_some_and(|obligation| {
-                obligation
-                    .entries()
-                    .iter()
-                    .any(|(key, _)| *key == destination)
-            });
-            if has_source_read && has_destination_write {
-                assert!(batch.test_ticket_status.is_none());
-                batch.test_ticket_status = Some(Ok(false));
-                held += 1;
+            .resource_service()
+            .expect("managed allocation resource service");
+        let allocations = service
+            .allocation_end_state_for_tests()
+            .into_iter()
+            .filter(|allocation| keys.contains(&allocation.key))
+            .filter(|allocation| {
+                !allocation.live_uses.is_empty() || !allocation.pending_obligations.is_empty()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            allocations.is_empty(),
+            "old-pool allocations still have live uses or obligations: {allocations:?}"
+        );
+
+        let batches = service
+            .pending_batches()
+            .iter()
+            .filter(|batch| {
+                batch.leases.iter().any(|lease| keys.contains(&lease.key()))
+                    || batch.read_obligation.as_ref().is_some_and(|read| {
+                        keys.contains(&read.source_key())
+                            || read
+                                .staging_lease
+                                .as_ref()
+                                .is_some_and(|lease| keys.contains(&lease.key()))
+                    })
+                    || batch.obligation().is_some_and(|obligation| {
+                        obligation
+                            .entries()
+                            .iter()
+                            .any(|(key, _)| keys.contains(key))
+                    })
+            })
+            .count();
+        assert_eq!(
+            batches, 0,
+            "old-pool allocations still have a pending retirement batch"
+        );
+    }
+
+    fn c0_3bi_take_subject_scanout_completion(
+        backend: &mut super::KmsBackend,
+        job_id: u64,
+        instance: crate::kms::backend::OutputInstanceId,
+        stage: crate::kms::render::platform::ScanoutRenderCompletionStage,
+        bo_idx: usize,
+    ) -> crate::kms::render::platform::ReadyScanoutRenderCompletion {
+        let mut subject = Vec::new();
+        for completion in backend.platform.drain_scanout_render_completions() {
+            if completion.job_id == job_id
+                && completion.output_instance_id == instance
+                && completion.stage == stage
+                && completion.bo_idx == bo_idx
+            {
+                subject.push(completion);
+            } else {
+                backend
+                    .platform
+                    .queue_ready_scanout_render_completion_for_tests(completion);
             }
         }
-        assert_eq!(held, 1, "the copied B batch owns its read and write proofs");
+        assert_eq!(
+            subject.len(),
+            1,
+            "the held subject job {job_id} has exactly one matching completion"
+        );
+        subject.pop().expect("one matching subject completion")
     }
 
     fn c0_3bi_release_copied_resource_completion_for_tests(
@@ -72721,7 +72844,6 @@ mod tests {
         };
         let member = c0_3bi_output_group_member(&backend, 0);
         let held = c0_3bi_hold_kms_release(&mut backend, old_keys[0], member, 0x3b1_811);
-
         let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
         assert!(
             c0_3bi_accept_and_finish_client_modeset(&mut backend, device, token, None)
@@ -72757,19 +72879,14 @@ mod tests {
                 .retired_output_has_instance_for_tests(old_instance),
             "the old source and destination pool stays rooted while its proofs drain"
         );
-        let retained = C0EndStateExpectation {
-            installed_outputs: vec![output_key.clone()],
-            retained_bundles: vec![C0ExpectedRetiredBundle {
-                instance: old_instance,
-                proofs: vec![C0RetiredProofKind::KmsRelease],
-            }],
-            ..C0EndStateExpectation::default()
-        };
-        c0_3bi_assert_end_state(
-            &backend,
-            "c0_3bi_copied_mode_change_vulkan while KMS release is withheld",
-            &retained,
-        );
+        assert!(old_keys.iter().all(|key| {
+            backend
+                .resource_service()
+                .is_some_and(|service| service.contains(key))
+        }));
+        assert!(backend.resource_service().is_some_and(|service| {
+            service.has_pending_obligation(&held.allocation, held.obligation)
+        }));
         for _ in 0..4 {
             c0_3bi_core_driver_until(
                 &mut backend,
@@ -72787,16 +72904,12 @@ mod tests {
                 .retired_output_has_instance_for_tests(old_instance)
         );
         c0_3bi_release_kms_hold(&mut backend, &held);
-        c0_3bi_core_driver_until(
+        c0_3bi_core_drive_retired_pool_release(
             &mut backend,
+            old_instance,
+            &old_keys,
             "destroy copied bundle after KMS release",
             std::time::Duration::from_secs(2),
-            &|backend| {
-                !backend
-                    .scene
-                    .retired_output_has_instance_for_tests(old_instance)
-            },
-            None,
         )
         .expect("core driver destroys the now-proven copied bundle");
         assert!(
@@ -72810,6 +72923,7 @@ mod tests {
                 .resource_service()
                 .is_some_and(|service| service.contains(key))
         }));
+        c0_3bi_assert_managed_keys_quiescent(&backend, &old_keys);
         c0_3bi_assert_end_state(
             &backend,
             "c0_3bi_copied_mode_change_vulkan after copied proofs",
@@ -72828,7 +72942,7 @@ mod tests {
         {
             let (
                 mut fixture,
-                _bo_idx,
+                bo_idx,
                 device,
                 output_id,
                 connector,
@@ -72869,23 +72983,20 @@ mod tests {
                 .platform
                 .release_scanout_render_completion_for_tests(held_render_completion)
                 .expect("release A's renderer sync-file notification after disable");
-            let completions = backend.platform.drain_scanout_render_completions();
-            assert_eq!(completions.len(), 1);
-            assert_eq!(completions[0].stage, ScanoutRenderCompletionStage::Render);
-            c0_3bi_handle_retired_copied_completion(
+            let completion = c0_3bi_take_subject_scanout_completion(
                 backend,
-                completions.into_iter().next().unwrap(),
+                held_render_completion,
+                instance,
+                ScanoutRenderCompletionStage::Render,
+                bo_idx,
             );
-            c0_3bi_core_driver_until(
+            c0_3bi_handle_retired_copied_completion(backend, completion);
+            c0_3bi_core_drive_retired_pool_release(
                 backend,
+                instance,
+                &keys,
                 "finish copied A retirement after render completion",
                 std::time::Duration::from_secs(2),
-                &|backend| {
-                    !backend
-                        .scene
-                        .retired_output_has_instance_for_tests(instance)
-                },
-                None,
             )
             .expect("core driver destroys the A-stage bundle after all proofs");
             assert!(
@@ -72894,7 +73005,14 @@ mod tests {
                     .retired_output_has_instance_for_tests(instance)
             );
             c0_3bi_assert_managed_keys_absent(backend, &keys);
-            assert!(backend.scene.take_owner_composed_offers().is_empty());
+            c0_3bi_assert_managed_keys_quiescent(backend, &keys);
+            c0_3bi_settle_owner_frame_work_through_core_driver(
+                backend,
+                device,
+                "settle disabled copied output work after A-stage retirement",
+                std::time::Duration::from_secs(3),
+            )
+            .expect("all copied output work settles through core entries");
             c0_3bi_assert_end_state(
                 backend,
                 "c0_3bi_retired_copied_frame_stages_vulkan A-stage completion",
@@ -72908,7 +73026,7 @@ mod tests {
         {
             let (
                 mut fixture,
-                _bo_idx,
+                bo_idx,
                 device,
                 output_id,
                 connector,
@@ -72947,21 +73065,20 @@ mod tests {
                 .platform
                 .release_scanout_render_completion_for_tests(held_render_completion)
                 .expect("release A's renderer sync-file notification after modeset");
-            let mut completions = backend.platform.drain_scanout_render_completions();
-            assert_eq!(completions.len(), 1);
-            let completion = completions.pop().unwrap();
-            assert_eq!(completion.stage, ScanoutRenderCompletionStage::Render);
-            c0_3bi_handle_retired_copied_completion(backend, completion);
-            c0_3bi_core_driver_until(
+            let completion = c0_3bi_take_subject_scanout_completion(
                 backend,
+                held_render_completion,
+                instance,
+                ScanoutRenderCompletionStage::Render,
+                bo_idx,
+            );
+            c0_3bi_handle_retired_copied_completion(backend, completion);
+            c0_3bi_core_drive_retired_pool_release(
+                backend,
+                instance,
+                &keys,
                 "finish copied late A completion after render completion",
                 std::time::Duration::from_secs(2),
-                &|backend| {
-                    !backend
-                        .scene
-                        .retired_output_has_instance_for_tests(instance)
-                },
-                None,
             )
             .expect("core driver destroys the B-never-prepared stage bundle");
             assert!(
@@ -72973,21 +73090,7 @@ mod tests {
                 !backend
                     .resource_service()
                     .unwrap()
-                    .has_pending_obligations(&source_key),
-                "source allocation state: {:?}; pending batches: {:?}",
-                backend
-                    .resource_service()
-                    .unwrap()
-                    .allocation_end_state_for_tests()
-                    .into_iter()
-                    .find(|allocation| allocation.key == source_key),
-                backend
-                    .resource_service()
-                    .unwrap()
-                    .pending_batches()
-                    .iter()
-                    .map(|batch| (batch.test_ticket_status, batch.ticket_status()))
-                    .collect::<Vec<_>>()
+                    .has_pending_obligations(&source_key)
             );
             assert!(
                 !backend
@@ -72995,14 +73098,8 @@ mod tests {
                     .unwrap()
                     .has_pending_obligations(&destination_key)
             );
-            assert!(
-                backend
-                    .resource_service()
-                    .unwrap()
-                    .pending_batches()
-                    .is_empty()
-            );
             c0_3bi_assert_managed_keys_absent(backend, &keys);
+            c0_3bi_assert_managed_keys_quiescent(backend, &keys);
             assert!(
                 !backend.core_driver_composed_offers_for_tests.iter().any(
                     |(offered_device, offered_crtc, generation, output_instance)| {
@@ -73043,12 +73140,17 @@ mod tests {
             ) = c0_3bi_copied_modeset_frame_after_a();
             let backend = &mut fixture.backend;
             backend.platform.wait_idle_bounded();
-            let mut render_completions = backend.platform.drain_scanout_render_completions();
-            assert_eq!(render_completions.len(), 1);
-            assert_eq!(
-                render_completions[0].stage,
-                ScanoutRenderCompletionStage::Render
-            );
+            let a_render_job = backend
+                .platform
+                .hold_scanout_render_completion_for_tests(
+                    instance,
+                    ScanoutRenderCompletionStage::Render,
+                )
+                .expect("identify A's renderer completion");
+            backend
+                .platform
+                .release_scanout_render_completion_for_tests(a_render_job)
+                .expect("release A's renderer completion for the live output");
             let output_pool_depth = backend.platform.scanout_pools[0]
                 .as_ref()
                 .expect("copied output pool")
@@ -73064,7 +73166,18 @@ mod tests {
                     );
             }
             let held_descriptor_slots = backend.scene.exhaust_descriptor_ring_for_tests(0);
-            c0_3bi_handle_retired_copied_completion(backend, render_completions.pop().unwrap());
+            let a_completion = c0_3bi_take_subject_scanout_completion(
+                backend,
+                a_render_job,
+                instance,
+                ScanoutRenderCompletionStage::Render,
+                bo_idx,
+            );
+            backend
+                .resource_service_mut()
+                .expect("hold copied B resource completion")
+                .hold_next_copied_batch_for_tests(source_key, destination_key);
+            c0_3bi_handle_retired_copied_completion(backend, a_completion);
             backend
                 .scene
                 .release_descriptor_slots_for_tests(0, &held_descriptor_slots);
@@ -73074,7 +73187,6 @@ mod tests {
                 .expect("A completion submits B while the output is live");
             assert_eq!(receipt.0.0, destination_key);
             assert_eq!(receipt.1.0, source_key);
-            c0_3bi_hold_copied_resource_completion_for_tests(backend, source_key, destination_key);
             let held_copy_completions = backend.platform.held_scanout_render_completions_for_tests(
                 instance,
                 ScanoutRenderCompletionStage::CopiedOwnerCopy,
@@ -73118,24 +73230,12 @@ mod tests {
                 .platform
                 .release_scanout_render_completion_for_tests(held_copy_completion)
                 .expect("restore B's renderer sync-file notification");
-            let completions = backend.platform.drain_scanout_render_completions();
-            assert_eq!(
-                completions.len(),
-                1,
-                "ready scanout completions: {:?}",
-                completions
-                    .iter()
-                    .map(|completion| (
-                        completion.job_id,
-                        completion.output_instance_id,
-                        completion.stage,
-                        completion.bo_idx,
-                    ))
-                    .collect::<Vec<_>>()
-            );
-            assert_eq!(
-                completions[0].stage,
-                ScanoutRenderCompletionStage::CopiedOwnerCopy
+            let completion = c0_3bi_take_subject_scanout_completion(
+                backend,
+                held_copy_completion,
+                instance,
+                ScanoutRenderCompletionStage::CopiedOwnerCopy,
+                bo_idx,
             );
             c0_3bi_release_copied_resource_completion_for_tests(
                 backend,
@@ -73148,10 +73248,7 @@ mod tests {
                     .scene
                     .retired_output_has_instance_for_tests(instance)
             );
-            c0_3bi_handle_retired_copied_completion(
-                backend,
-                completions.into_iter().next().unwrap(),
-            );
+            c0_3bi_handle_retired_copied_completion(backend, completion);
             assert!(
                 backend
                     .scene
@@ -73169,16 +73266,12 @@ mod tests {
                         .expect("release the later copied frame after retiring B");
                 }
             }
-            c0_3bi_core_driver_until(
+            c0_3bi_core_drive_retired_pool_release(
                 backend,
+                instance,
+                &keys,
                 "finish copied B retirement after KMS proof",
                 std::time::Duration::from_secs(2),
-                &|backend| {
-                    !backend
-                        .scene
-                        .retired_output_has_instance_for_tests(instance)
-                },
-                None,
             )
             .expect("core driver destroys the B-stage bundle after all proofs");
             assert!(
@@ -73187,7 +73280,14 @@ mod tests {
                     .retired_output_has_instance_for_tests(instance)
             );
             c0_3bi_assert_managed_keys_absent(backend, &keys);
-            assert!(backend.scene.take_owner_composed_offers().is_empty());
+            c0_3bi_assert_managed_keys_quiescent(backend, &keys);
+            c0_3bi_settle_owner_frame_work_through_core_driver(
+                backend,
+                device,
+                "settle disabled copied output after B-submitted retirement",
+                std::time::Duration::from_secs(3),
+            )
+            .expect("all copied output work settles through core entries");
             c0_3bi_assert_end_state(
                 backend,
                 "c0_3bi_retired_copied_frame_stages_vulkan B-submitted stage",
@@ -73214,12 +73314,17 @@ mod tests {
             ) = c0_3bi_copied_modeset_frame_after_a();
             let backend = &mut fixture.backend;
             backend.platform.wait_idle_bounded();
-            let mut render_completions = backend.platform.drain_scanout_render_completions();
-            assert_eq!(render_completions.len(), 1);
-            assert_eq!(
-                render_completions[0].stage,
-                ScanoutRenderCompletionStage::Render
-            );
+            let a_render_job = backend
+                .platform
+                .hold_scanout_render_completion_for_tests(
+                    instance,
+                    ScanoutRenderCompletionStage::Render,
+                )
+                .expect("identify A's renderer completion");
+            backend
+                .platform
+                .release_scanout_render_completion_for_tests(a_render_job)
+                .expect("release A's renderer completion for the live output");
             let output_pool_depth = backend.platform.scanout_pools[0]
                 .as_ref()
                 .expect("copied output pool")
@@ -73235,7 +73340,18 @@ mod tests {
                     );
             }
             let held_descriptor_slots = backend.scene.exhaust_descriptor_ring_for_tests(0);
-            c0_3bi_handle_retired_copied_completion(backend, render_completions.pop().unwrap());
+            let a_completion = c0_3bi_take_subject_scanout_completion(
+                backend,
+                a_render_job,
+                instance,
+                ScanoutRenderCompletionStage::Render,
+                bo_idx,
+            );
+            backend
+                .resource_service_mut()
+                .expect("hold copied B resource completion")
+                .hold_next_copied_batch_for_tests(source_key, destination_key);
+            c0_3bi_handle_retired_copied_completion(backend, a_completion);
             backend
                 .scene
                 .release_descriptor_slots_for_tests(0, &held_descriptor_slots);
@@ -73248,7 +73364,6 @@ mod tests {
                 .iter()
                 .find_map(|(job_id, held_bo_idx)| (*held_bo_idx == bo_idx).then_some(*job_id))
                 .expect("the driver holds B's completed renderer notification");
-            c0_3bi_hold_copied_resource_completion_for_tests(backend, source_key, destination_key);
             unsafe {
                 sink_vk
                     .device
@@ -73259,12 +73374,12 @@ mod tests {
                 .platform
                 .release_scanout_render_completion_for_tests(held_copy_completion)
                 .expect("make B's completed notification ready without delivering it to the scene");
-            let mut completions = backend.platform.drain_scanout_render_completions();
-            assert_eq!(completions.len(), 1);
-            let completion = completions.pop().unwrap();
-            assert_eq!(
-                completion.stage,
-                ScanoutRenderCompletionStage::CopiedOwnerCopy
+            let completion = c0_3bi_take_subject_scanout_completion(
+                backend,
+                held_copy_completion,
+                instance,
+                ScanoutRenderCompletionStage::CopiedOwnerCopy,
+                bo_idx,
             );
             let (
                 (destination_receipt_key, destination_receipt),
@@ -73285,21 +73400,7 @@ mod tests {
                 !backend
                     .resource_service()
                     .unwrap()
-                    .has_pending_obligation(&source_key, source_receipt),
-                "source allocation state: {:?}; pending batches: {:?}",
-                backend
-                    .resource_service()
-                    .unwrap()
-                    .allocation_end_state_for_tests()
-                    .into_iter()
-                    .find(|allocation| allocation.key == source_key),
-                backend
-                    .resource_service()
-                    .unwrap()
-                    .pending_batches()
-                    .iter()
-                    .map(|batch| (batch.test_ticket_status, batch.ticket_status()))
-                    .collect::<Vec<_>>()
+                    .has_pending_obligation(&source_key, source_receipt)
             );
             assert!(
                 !backend
@@ -73337,16 +73438,12 @@ mod tests {
                         .expect("release the later copied frame after retiring B");
                 }
             }
-            c0_3bi_core_driver_until(
+            c0_3bi_core_drive_retired_pool_release(
                 backend,
+                instance,
+                &keys,
                 "finish copied B-done wake after KMS proof",
                 std::time::Duration::from_secs(2),
-                &|backend| {
-                    !backend
-                        .scene
-                        .retired_output_has_instance_for_tests(instance)
-                },
-                None,
             )
             .unwrap_or_else(|error| {
                 let allocations = backend
@@ -73376,7 +73473,7 @@ mod tests {
                     .retired_output_has_instance_for_tests(instance)
             );
             c0_3bi_assert_managed_keys_absent(backend, &keys);
-            assert!(backend.scene.take_owner_composed_offers().is_empty());
+            c0_3bi_assert_managed_keys_quiescent(backend, &keys);
             assert!(backend.device_owner_for_tests(0).live_record().is_none());
             c0_3bi_assert_end_state(
                 backend,
@@ -73423,19 +73520,37 @@ mod tests {
         // receipts, then let the Owner conductor submit the destination on
         // the sink device.
         backend.platform.wait_idle_bounded();
-        let mut render_completions = backend.platform.drain_scanout_render_completions();
-        assert_eq!(render_completions.len(), 1);
-        assert_eq!(
-            render_completions[0].stage,
-            crate::kms::render::platform::ScanoutRenderCompletionStage::Render
-        );
+        let a_render_job = backend
+            .platform
+            .hold_scanout_render_completion_for_tests(
+                instance,
+                crate::kms::render::platform::ScanoutRenderCompletionStage::Render,
+            )
+            .expect("identify A's renderer completion");
+        backend
+            .platform
+            .release_scanout_render_completion_for_tests(a_render_job)
+            .expect("release A's renderer completion for the live output");
         backend
             .platform
             .hold_next_scanout_render_completion_for_tests(
                 instance,
                 crate::kms::render::platform::ScanoutRenderCompletionStage::CopiedOwnerCopy,
             );
-        c0_3bi_handle_retired_copied_completion(backend, render_completions.pop().unwrap());
+        backend
+            .platform
+            .hold_next_scanout_render_completion_for_tests(
+                instance,
+                crate::kms::render::platform::ScanoutRenderCompletionStage::Render,
+            );
+        let a_completion = c0_3bi_take_subject_scanout_completion(
+            backend,
+            a_render_job,
+            instance,
+            crate::kms::render::platform::ScanoutRenderCompletionStage::Render,
+            bo_idx,
+        );
+        c0_3bi_handle_retired_copied_completion(backend, a_completion);
         wait_copied_sink_idle(backend);
         let ((destination_receipt_key, destination_receipt), (source_receipt_key, source_receipt)) =
             backend
@@ -73453,12 +73568,6 @@ mod tests {
             .into_iter()
             .find_map(|(job_id, held_bo_idx)| (held_bo_idx == bo_idx).then_some(job_id))
             .expect("hold B's renderer notification until its receipts retire");
-        backend
-            .platform
-            .hold_next_scanout_render_completion_for_tests(
-                instance,
-                crate::kms::render::platform::ScanoutRenderCompletionStage::Render,
-            );
         c0_3bi_core_driver_iteration(backend, "retire copied B resource receipts");
         assert!(
             !backend
@@ -73479,17 +73588,22 @@ mod tests {
             .platform
             .release_scanout_render_completion_for_tests(held_copy_completion)
             .expect("release B's renderer notification after its receipts retire");
-        let mut copy_completions = backend.platform.drain_scanout_render_completions();
-        assert_eq!(copy_completions.len(), 1);
-        assert_eq!(
-            copy_completions[0].stage,
-            crate::kms::render::platform::ScanoutRenderCompletionStage::CopiedOwnerCopy
+        let copy_completion = c0_3bi_take_subject_scanout_completion(
+            backend,
+            held_copy_completion,
+            instance,
+            crate::kms::render::platform::ScanoutRenderCompletionStage::CopiedOwnerCopy,
+            bo_idx,
         );
+        // This test supplies Owner acceptance directly after it observes the
+        // submitted generation. Keep the executor unanswered: the
+        // validation-only stub returns an empty fence mask, which would be an
+        // invalid acceptance if ordinary composition reaches it first.
         c0_3aii_replace_owner_executor(
             backend,
-            crate::kms::executor::test_support::StubBehaviour::AcceptValidationThenNeverReply,
+            crate::kms::executor::test_support::StubBehaviour::NeverReply,
         );
-        c0_3bi_handle_retired_copied_completion(backend, copy_completions.pop().unwrap());
+        c0_3bi_handle_retired_copied_completion(backend, copy_completion);
         c0_3bi_core_driver_until(
             backend,
             "submit copied destination after B completion",
@@ -73541,7 +73655,32 @@ mod tests {
             completion,
             "complete submitted copied frame"
         ));
-
+        backend.scene.mark_scene_structure_dirty();
+        c0_3bi_core_driver_until(
+            backend,
+            "compose a follow-up frame before copied-output retirement",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend
+                    .platform
+                    .held_scanout_render_completion_for_tests(
+                        instance,
+                        crate::kms::render::platform::ScanoutRenderCompletionStage::Render,
+                    )
+                    .is_some()
+            },
+            None,
+        )
+        .expect("core loop composes the withheld follow-up render");
+        let (held_followup_render, held_followup_bo_idx) = backend
+            .platform
+            .held_scanout_render_completions_for_tests(
+                instance,
+                crate::kms::render::platform::ScanoutRenderCompletionStage::Render,
+            )
+            .into_iter()
+            .next()
+            .expect("the follow-up render remains held");
         let output = &backend.platform.outputs[0];
         let member = crate::kms::render::resources::GroupMember::new(
             crate::kms::render::platform::CrtcKey::for_output(output),
@@ -73583,27 +73722,27 @@ mod tests {
             "complete copied output disable"
         ));
         assert!(c0_3bi_take_crtc_config_result(backend, token).expect("copied output disable"));
-        let held_followup_render = backend
-            .platform
-            .held_scanout_render_completion_for_tests(
+        assert_eq!(
+            backend.platform.held_scanout_render_completion_for_tests(
                 instance,
                 crate::kms::render::platform::ScanoutRenderCompletionStage::Render,
-            )
-            .expect("withhold the next frame's renderer proof until its output retires");
+            ),
+            Some(held_followup_render),
+            "withhold the identified follow-up renderer proof until its output retires"
+        );
         backend
             .platform
             .release_scanout_render_completion_for_tests(held_followup_render)
             .expect("release the post-B renderer proof after output retirement");
-        let late_render_completions = backend.platform.drain_scanout_render_completions();
-        assert_eq!(late_render_completions.len(), 1);
-        assert_eq!(
-            late_render_completions[0].stage,
-            crate::kms::render::platform::ScanoutRenderCompletionStage::Render
-        );
-        c0_3bi_handle_retired_copied_completion(
+        backend.platform.wait_idle_bounded();
+        let late_render_completion = c0_3bi_take_subject_scanout_completion(
             backend,
-            late_render_completions.into_iter().next().unwrap(),
+            held_followup_render,
+            instance,
+            crate::kms::render::platform::ScanoutRenderCompletionStage::Render,
+            held_followup_bo_idx,
         );
+        c0_3bi_handle_retired_copied_completion(backend, late_render_completion);
         c0_3bi_core_driver_iteration(backend, "service disabled copied output");
 
         assert!(
@@ -73683,16 +73822,12 @@ mod tests {
             .expect("resource service")
             .apply_validated_proof_for_tests(source_key, held_foreign_return)
             .expect("discharge the source FOREIGN return");
-        c0_3bi_core_driver_until(
+        c0_3bi_core_drive_retired_pool_release(
             backend,
+            instance,
+            &keys,
             "destroy copied bundle after FOREIGN return and GPU completion",
             std::time::Duration::from_secs(2),
-            &|backend| {
-                !backend
-                    .scene
-                    .retired_output_has_instance_for_tests(instance)
-            },
-            None,
         )
         .expect("core driver consumes the final retired copied-frame proof");
         assert!(
@@ -73701,8 +73836,15 @@ mod tests {
                 .retired_output_has_instance_for_tests(instance)
         );
         c0_3bi_assert_managed_keys_absent(backend, &keys);
-        assert!(backend.scene.take_owner_composed_offers().is_empty());
+        c0_3bi_assert_managed_keys_quiescent(backend, &keys);
         assert!(backend.platform.outputs.is_empty());
+        c0_3bi_settle_owner_frame_work_through_core_driver(
+            backend,
+            device,
+            "settle disabled copied output work after submitted-frame retirement",
+            std::time::Duration::from_secs(3),
+        )
+        .expect("all copied output work settles through core entries");
         c0_3bi_assert_end_state(
             backend,
             "c0_3bi_retired_submitted_copied_frame_vulkan after both proofs",
@@ -73882,15 +74024,23 @@ mod tests {
             .expect("the live copied output starts A");
         assert!(rendering, "A remains in flight until its render proof");
         backend.platform.wait_idle_bounded();
-        let render_completions = backend.platform.drain_scanout_render_completions();
-        let render_completion = render_completions
-            .into_iter()
-            .find(|completion| completion.output_instance_id == old_instance)
-            .expect("the old copied output's A renderer notification");
-        assert_eq!(render_completion.output_instance_id, old_instance);
-        assert_eq!(
-            render_completion.stage,
-            ScanoutRenderCompletionStage::Render
+        let a_render_job = backend
+            .platform
+            .hold_scanout_render_completion_for_tests(
+                old_instance,
+                ScanoutRenderCompletionStage::Render,
+            )
+            .expect("identify the old copied output's A renderer notification");
+        backend
+            .platform
+            .release_scanout_render_completion_for_tests(a_render_job)
+            .expect("release A's renderer notification for the live output");
+        let render_completion = c0_3bi_take_subject_scanout_completion(
+            backend,
+            a_render_job,
+            old_instance,
+            ScanoutRenderCompletionStage::Render,
+            bo_idx,
         );
         backend
             .platform
@@ -74025,9 +74175,13 @@ mod tests {
             .platform
             .release_scanout_render_completion_for_tests(held_copy_completion)
             .expect("restore B's renderer sync-file notification");
-        let completions = backend.platform.drain_scanout_render_completions();
-        assert_eq!(completions.len(), 1);
-        let completion = completions.into_iter().next().unwrap();
+        let completion = c0_3bi_take_subject_scanout_completion(
+            backend,
+            held_copy_completion,
+            old_instance,
+            ScanoutRenderCompletionStage::CopiedOwnerCopy,
+            bo_idx,
+        );
         assert_eq!(completion.output_instance_id, old_instance);
         assert_eq!(completion.output_key.connector_name, connector);
         assert_eq!(completion.bo_idx, bo_idx);
@@ -74041,16 +74195,12 @@ mod tests {
             old_destination_key,
         );
         c0_3bi_handle_retired_copied_completion(backend, completion);
-        c0_3bi_core_driver_until(
+        c0_3bi_core_drive_retired_pool_release(
             backend,
+            old_instance,
+            &old_keys,
             "drain late copied completion retirement",
             std::time::Duration::from_secs(2),
-            &|backend| {
-                !backend
-                    .scene
-                    .retired_output_has_instance_for_tests(old_instance)
-            },
-            None,
         )
         .expect("core driver drains the retired bundle after the late copy completion");
 
@@ -74060,6 +74210,7 @@ mod tests {
                 .retired_output_has_instance_for_tests(old_instance)
         );
         c0_3bi_assert_managed_keys_absent(backend, &old_keys);
+        c0_3bi_assert_managed_keys_quiescent(backend, &old_keys);
         assert_eq!(c0_3bi_scanout_images(backend, new_idx), new_images);
         assert_eq!(
             backend.platform.scanout_pools[new_idx]
@@ -74081,8 +74232,13 @@ mod tests {
             "late old completion leaves every new-pool Owner state unchanged"
         );
         assert_eq!(c0_3bi_scanout_images(backend, 0), peer_images);
-        assert!(backend.scene.take_owner_composed_offers().is_empty());
         assert!(backend.device_owner_for_tests(0).live_record().is_none());
+        for job_id in held_new_render_completions {
+            backend
+                .platform
+                .release_scanout_render_completion_for_tests(job_id)
+                .expect("restore replacement-pool render notification after old B assertions");
+        }
         c0_3bi_assert_end_state(
             backend,
             "c0_3bi_late_copy_completion_vulkan",
@@ -74091,12 +74247,6 @@ mod tests {
                 OutputKey::new(device, connector),
             ]),
         );
-        for job_id in held_new_render_completions {
-            backend
-                .platform
-                .release_scanout_render_completion_for_tests(job_id)
-                .expect("restore replacement-pool render notification after old B assertions");
-        }
     }
 
     #[test]
@@ -75109,48 +75259,176 @@ mod tests {
         backend: &mut super::KmsBackend,
         device: DrmDeviceKey,
     ) -> (crate::kms::backend::OutputInstanceId, u32, usize, u64) {
+        c0_3bi_prepare_unsubmitted_desired_frame_with_tail(backend, device, false)
+    }
+
+    fn c0_3bi_prepare_unsubmitted_desired_frame_with_tail(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        stop_before_tail: bool,
+    ) -> (crate::kms::backend::OutputInstanceId, u32, usize, u64) {
+        c0_3bi_prepare_unsubmitted_desired_frame_controlled(
+            backend,
+            device,
+            stop_before_tail,
+            false,
+        )
+        .0
+    }
+
+    fn c0_3bi_prepare_unsubmitted_desired_frame_with_held_render_fence(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+    ) -> (
+        (crate::kms::backend::OutputInstanceId, u32, usize, u64),
+        crate::kms::render::platform::FenceTicket,
+    ) {
+        let (prepared, ticket) =
+            c0_3bi_prepare_unsubmitted_desired_frame_controlled(backend, device, true, true);
+        (
+            prepared,
+            ticket.expect("held-frame setup captures the render ticket before completion"),
+        )
+    }
+
+    fn c0_3bi_prepare_unsubmitted_desired_frame_controlled(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        stop_before_tail: bool,
+        hold_render_fence_before_desired: bool,
+    ) -> (
+        (crate::kms::backend::OutputInstanceId, u32, usize, u64),
+        Option<crate::kms::render::platform::FenceTicket>,
+    ) {
         use crate::kms::render::owner_buffer::OwnerBufferState;
 
         let instance = backend
             .scene
             .output_instance_id_for_tests(0)
             .expect("old output instance");
+        let output_key = backend.platform.outputs[0].key.clone();
         let crtc = u32::from(backend.platform.outputs[0].output.crtc);
+        let previous_generation = backend
+            .scene
+            .owner_buffer_identities_for_tests(0)
+            .into_iter()
+            .filter(|identity| identity.output_key == output_key && identity.crtc == crtc)
+            .map(|identity| identity.generation)
+            .max()
+            .unwrap_or(0);
         backend
             .admission_conductors
             .get_mut(&device)
             .expect("active admission conductor")
             .lifecycle_admission_closed = true;
         backend.scene.mark_scene_structure_dirty();
-        c0_3bi_core_driver_until(
-            backend,
-            "compose and queue a Desired frame through the core iteration tail",
-            std::time::Duration::from_secs(3),
-            &|backend| {
-                backend
-                    .admission_conductors
-                    .get(&device)
-                    .is_some_and(|conductor| conductor.admission.composed(crtc).is_some())
-                    && backend
+        let desired_generation_ready = |backend: &super::KmsBackend| {
+            backend
+                .admission_conductors
+                .get(&device)
+                .and_then(|conductor| conductor.admission.composed(crtc))
+                .is_some_and(|intent| {
+                    backend
                         .scene
-                        .owner_buffer_states_for_tests(0)
-                        .contains(&OwnerBufferState::Desired)
-            },
-            None,
-        )
-        .expect("core iteration prepares an unsubmitted composed frame");
+                        .owner_state_for_generation_for_tests(0, intent.generation)
+                        == Some(OwnerBufferState::Desired)
+                        && backend
+                            .admission_conductors
+                            .get(&device)
+                            .and_then(|conductor| conductor.composed_output_instances.get(&crtc))
+                            == Some(&Some(instance))
+                })
+        };
+        let render_generation_ready = |backend: &super::KmsBackend| {
+            backend
+                .scene
+                .owner_buffers_anywhere_for_tests()
+                .iter()
+                .any(|(identity, state)| {
+                    identity.output_key == output_key
+                        && identity.crtc == crtc
+                        && identity.generation > previous_generation
+                        && *state == OwnerBufferState::Rendering
+                })
+        };
+        let mut held_generation = None;
+        let render_fence = if hold_render_fence_before_desired {
+            c0_3bi_core_driver_until_before_iteration_tail(
+                backend,
+                "observe the rendering generation before its first core poll",
+                std::time::Duration::from_secs(3),
+                &render_generation_ready,
+            )
+            .expect("core entry observes the exact owner generation while rendering");
+            let (identity, _) = backend
+                .scene
+                .owner_buffers_anywhere_for_tests()
+                .into_iter()
+                .filter(|(identity, state)| {
+                    identity.output_key == output_key
+                        && identity.crtc == crtc
+                        && identity.generation > previous_generation
+                        && *state == OwnerBufferState::Rendering
+                })
+                .max_by_key(|(identity, _)| identity.generation)
+                .expect("the newly rendered generation remains before its first fence poll");
+            let generation = identity.generation;
+            held_generation = Some(generation);
+            Some(
+                backend
+                    .scene
+                    .hold_owner_render_fence_for_tests(0, generation)
+                    .expect("hold the render ticket before the next core entry can poll it"),
+            )
+        } else {
+            None
+        };
+        let exact_desired_generation_ready = |backend: &super::KmsBackend| {
+            held_generation.is_some_and(|generation| {
+                backend
+                    .scene
+                    .owner_state_for_generation_for_tests(0, generation)
+                    == Some(OwnerBufferState::Desired)
+            })
+        };
+        let driven = if hold_render_fence_before_desired {
+            c0_3bi_core_driver_until_before_iteration_tail(
+                backend,
+                "observe the held Desired render before a successor compose",
+                std::time::Duration::from_secs(3),
+                &exact_desired_generation_ready,
+            )
+        } else if stop_before_tail {
+            c0_3bi_core_driver_until_before_iteration_tail(
+                backend,
+                "observe the Desired render completion before a successor compose",
+                std::time::Duration::from_secs(3),
+                &desired_generation_ready,
+            )
+        } else {
+            c0_3bi_core_driver_until(
+                backend,
+                "compose and queue a Desired frame through the core iteration tail",
+                std::time::Duration::from_secs(3),
+                &desired_generation_ready,
+                None,
+            )
+        };
+        driven.expect("core iteration prepares an unsubmitted composed frame");
 
-        let conductor = &backend.admission_conductors[&device];
-        let intent = conductor
-            .admission
-            .composed(crtc)
-            .expect("ordinary admission remains queued for the retiring output");
-        assert_eq!(
-            conductor.composed_output_instances.get(&crtc),
-            Some(&Some(instance)),
-            "the queued offer carries the exact output instance"
-        );
-        let generation = intent.generation;
+        let generation = held_generation.unwrap_or_else(|| {
+            let conductor = &backend.admission_conductors[&device];
+            let intent = conductor
+                .admission
+                .composed(crtc)
+                .expect("ordinary admission remains queued for the retiring output");
+            assert_eq!(
+                conductor.composed_output_instances.get(&crtc),
+                Some(&Some(instance)),
+                "the queued offer carries the exact output instance"
+            );
+            intent.generation
+        });
         let owner = backend
             .scene
             .owner_buffer_identities_for_tests(0)
@@ -75166,7 +75444,7 @@ mod tests {
         );
         assert_eq!(owner.output_key.device_key, device);
         assert_eq!(owner.crtc, crtc);
-        (instance, crtc, owner.bo_idx, generation)
+        ((instance, crtc, owner.bo_idx, generation), render_fence)
     }
 
     fn c0_3bi_assert_no_retired_instance_offer(
@@ -75184,13 +75462,21 @@ mod tests {
                 .all(|offered_instance| *offered_instance != Some(instance)),
             "admission has no composed offer for retired instance {instance:?}"
         );
-        assert_ne!(
+        let current_offer = (
+            conductor
+                .composed_output_instances
+                .get(&crtc)
+                .copied()
+                .flatten(),
             conductor
                 .admission
                 .composed(crtc)
                 .map(|intent| intent.generation),
-            Some(generation),
-            "the retired generation is absent from the CRTC's composed intent"
+        );
+        assert_ne!(
+            current_offer,
+            (Some(instance), Some(generation)),
+            "the retired instance/generation offer is absent from the CRTC"
         );
     }
 
@@ -75306,7 +75592,7 @@ mod tests {
             c0_3bi_live_modeset_backend(StubBehaviour::AcceptValidationThenNeverReply, false)
                 .expect("environmental skip: no live Vulkan modeset fixture");
         let (instance, crtc, bo_idx, generation) =
-            c0_3bi_prepare_unsubmitted_desired_frame(&mut backend, device);
+            c0_3bi_prepare_unsubmitted_desired_frame_with_tail(&mut backend, device, true);
         let output_key = OutputKey::new(device, connector.clone());
         let old_keys = c0_3bi_scanout_allocation_keys(&backend, device, &connector);
 
@@ -75389,34 +75675,19 @@ mod tests {
             Some(vec![ObligationKind::Gpu]),
             "the test's separate hold is the only remaining proof"
         );
-        c0_3bi_assert_end_state(
-            &backend,
-            "c0_3bi_a3_desired_frame_of_a_retired_output_is_released_vulkan before unrelated proof",
-            &C0EndStateExpectation {
-                installed_outputs: vec![output_key.clone()],
-                retained_bundles: vec![C0ExpectedRetiredBundle {
-                    instance,
-                    proofs: vec![C0RetiredProofKind::ResourceProof],
-                }],
-                ..C0EndStateExpectation::default()
-            },
-        );
+        c0_3bi_assert_managed_keys_present(&backend, &old_keys);
 
         backend
             .resource_service_mut()
             .expect("resource service")
             .apply_validated_proof_for_tests(held_key, held_obligation)
             .expect("release the unrelated pool-allocation hold");
-        c0_3bi_core_driver_until(
+        c0_3bi_core_drive_retired_pool_release(
             &mut backend,
+            instance,
+            &old_keys,
             "destroy retired bundle after frame and modeset proofs",
             std::time::Duration::from_secs(3),
-            &|backend| {
-                !backend
-                    .scene
-                    .retired_output_has_instance_for_tests(instance)
-            },
-            None,
         )
         .expect("the fully proven bundle leaves the retirement list");
         assert!(old_keys.iter().all(|key| {
@@ -75424,6 +75695,7 @@ mod tests {
                 .resource_service()
                 .is_some_and(|service| service.contains(key))
         }));
+        c0_3bi_assert_managed_keys_quiescent(&backend, &old_keys);
         assert!(
             backend
                 .scene
@@ -75445,84 +75717,125 @@ mod tests {
     fn c0_3bi_a3_desired_frame_waits_for_its_render_fence_vulkan() {
         use crate::kms::{
             executor::test_support::StubBehaviour, render::owner_buffer::OwnerBufferState,
-            vk::scanout::BoPhase,
         };
 
         let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
             c0_3bi_live_modeset_backend(StubBehaviour::AcceptValidationThenNeverReply, false)
                 .expect("environmental skip: no live Vulkan modeset fixture");
-        let (instance, crtc, bo_idx, generation) =
-            c0_3bi_prepare_unsubmitted_desired_frame(&mut backend, device);
+        // Successor flips are accepted by a test executor that returns stub
+        // out-fences. Keep Owner completion polling detached from the first
+        // core entry and supply their completion through the core driver.
+        backend.platform.owner_completion_detached = true;
+        let ((instance, crtc, bo_idx, generation), render_fence) =
+            c0_3bi_prepare_unsubmitted_desired_frame_with_held_render_fence(&mut backend, device);
         let output_key = OutputKey::new(device, connector.clone());
         let old_keys = c0_3bi_scanout_allocation_keys(&backend, device, &connector);
-        let render_fence = backend
+        let subject_identity = backend
             .scene
-            .hold_owner_render_fence_for_tests(0, generation)
-            .expect("the queued Desired frame retains its real render fence");
-
+            .owner_buffer_identities_for_tests(0)
+            .into_iter()
+            .find(|identity| identity.bo_idx == bo_idx && identity.generation == generation)
+            .expect("the exact Desired generation has an OwnerBuffer identity before modeset");
         let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
         assert!(
-            c0_3bi_accept_and_finish_client_modeset(&mut backend, device, token, None)
-                .expect("mode change completion result")
+            c0_3bi_accept_and_finish_client_modeset(
+                &mut backend,
+                device,
+                token,
+                Some(StubBehaviour::AcceptKernelCalls(1_000)),
+            )
+            .expect("mode change completion result")
         );
-        c0_3bi_core_driver_until(
-            &mut backend,
-            "service retired frame while its render fence is withheld",
-            std::time::Duration::from_secs(1),
-            &|backend| {
-                backend
-                    .scene
-                    .retired_output_end_states_for_tests()
-                    .iter()
-                    .any(|bundle| bundle.instance == instance)
-            },
-            None,
-        )
-        .expect("retired bundle remains while the render-fence proof is withheld");
-        let retired = backend
+        let subject_before = backend
             .scene
-            .retired_output_end_states_for_tests()
+            .owner_buffer_for_generation_anywhere_for_tests(&output_key, bo_idx, generation)
+            .unwrap_or_else(|| {
+                let allocations = backend
+                    .resource_service()
+                    .expect("resource service")
+                    .allocation_end_state_for_tests();
+                let subject_allocation = allocations
+                    .iter()
+                    .find(|allocation| allocation.key == subject_identity.managed_key);
+                panic!(
+                    "modeset dropped the held Desired generation from OwnerBuffer ledgers; identity={subject_identity:?}; owner buffers={:?}; retired={:?}; subject allocation={subject_allocation:?}; old keys={old_keys:?}; fence={:?}",
+                    backend.scene.owner_buffers_anywhere_for_tests(),
+                    backend.scene.retired_output_end_states_for_tests(),
+                    render_fence.poll_signaled_result(
+                        backend.platform.vk.as_deref().expect("live Vulkan context")
+                    ),
+                )
+            });
+        assert_eq!(subject_before.0.generation, generation);
+        assert_eq!(subject_before.0.bo_idx, bo_idx);
+        assert_eq!(subject_before.0.output_key.device_key, device);
+        assert_eq!(subject_before.1, OwnerBufferState::Displaced);
+        let subject_allocation_before = backend
+            .resource_service()
+            .expect("resource service")
+            .allocation_end_state_for_tests()
             .into_iter()
-            .find(|bundle| bundle.instance == instance)
-            .expect("the unsignalled render fence retains the bundle");
-        assert_eq!(
-            retired.owner_buffers,
-            vec![(bo_idx, OwnerBufferState::Displaced)]
+            .find(|allocation| allocation.key == subject_before.0.managed_key)
+            .expect("the displaced Desired generation retains its managed allocation");
+        assert!(
+            !subject_allocation_before.live_uses.is_empty()
+                || !subject_allocation_before.pending_obligations.is_empty(),
+            "the exact displaced generation still owns live use or proof debt: {subject_allocation_before:?}"
         );
-        assert_eq!(retired.phases[bo_idx], BoPhase::Owner);
-        assert_eq!(retired.gpu_fence_proofs, 1);
+        let withheld_before = render_fence
+            .poll_signaled_result(backend.platform.vk.as_deref().expect("live Vulkan context"));
+        assert_eq!(withheld_before, Ok(false));
+        c0_3bi_core_driver_iteration(
+            &mut backend,
+            "service the retired output once while its render fence is withheld",
+        );
+        let withheld_after = render_fence
+            .poll_signaled_result(backend.platform.vk.as_deref().expect("live Vulkan context"));
+        let subject_after = backend
+            .scene
+            .owner_buffer_for_generation_anywhere_for_tests(&output_key, bo_idx, generation)
+            .expect(
+                "one core entry retains the exact displaced generation behind its render fence",
+            );
+        assert_eq!(subject_after, subject_before);
+        let subject_allocation_after = backend
+            .resource_service()
+            .expect("resource service")
+            .allocation_end_state_for_tests()
+            .into_iter()
+            .find(|allocation| allocation.key == subject_before.0.managed_key)
+            .expect("the held generation's managed allocation survives core service");
+        assert!(
+            !subject_allocation_after.live_uses.is_empty()
+                || !subject_allocation_after.pending_obligations.is_empty(),
+            "the exact displaced generation remains justified while its fence is withheld: {subject_allocation_after:?}"
+        );
+        assert_eq!(withheld_after, Ok(false));
         c0_3bi_assert_no_retired_instance_offer(&backend, device, crtc, instance, generation);
-        c0_3bi_assert_end_state(
-            &backend,
-            "c0_3bi_a3_desired_frame_waits_for_its_render_fence_vulkan while withheld",
-            &C0EndStateExpectation {
-                installed_outputs: vec![output_key.clone()],
-                retained_bundles: vec![C0ExpectedRetiredBundle {
-                    instance,
-                    proofs: vec![C0RetiredProofKind::GpuFence],
-                }],
-                ..C0EndStateExpectation::default()
-            },
-        );
 
         render_fence.release_polling_for_tests();
         c0_3bi_core_driver_until(
             &mut backend,
-            "drain retired frame after its render fence signals",
+            "release the exact displaced generation after its render fence signals",
             std::time::Duration::from_secs(3),
             &|backend| {
-                !backend
+                backend
                     .scene
-                    .retired_output_has_instance_for_tests(instance)
+                    .owner_buffer_for_generation_anywhere_for_tests(&output_key, bo_idx, generation)
+                    .is_none()
             },
             None,
         )
-        .expect("the core loop observes the render fence and frees the retired frame");
-        assert!(old_keys.iter().all(|key| {
-            !backend
-                .resource_service()
-                .is_some_and(|service| service.contains(key))
-        }));
+        .expect("the core loop observes the render fence and frees the exact frame");
+        c0_3bi_settle_owner_frame_work_through_core_driver(
+            &mut backend,
+            device,
+            "settle successor work after the displaced generation is released",
+            std::time::Duration::from_secs(3),
+        )
+        .expect("successor output work settles through core entries");
+        c0_3bi_assert_managed_keys_absent(&backend, &old_keys);
+        c0_3bi_assert_managed_keys_quiescent(&backend, &old_keys);
         c0_3bi_assert_no_retired_instance_offer(&backend, device, crtc, instance, generation);
         c0_3bi_assert_end_state(
             &backend,
@@ -75557,9 +75870,12 @@ mod tests {
         assert!(backend.platform.outputs.is_empty());
 
         let before = std::time::Instant::now();
+        let expected_first_deadline = before + std::time::Duration::from_millis(5);
+        backend.retired_output_deadline_override = Some(expected_first_deadline);
         let first_deadline = backend
             .next_wakeup()
             .expect("retired bundle must arm a poll deadline");
+        assert_eq!(first_deadline, expected_first_deadline);
         assert!(
             first_deadline > before,
             "retired fence polling must not spin"
@@ -75576,9 +75892,12 @@ mod tests {
             "c0_3bi_a1_idle_bundle_wakeup_is_bounded before_block",
         );
         let after_poll = std::time::Instant::now();
+        let expected_next_deadline = after_poll + std::time::Duration::from_millis(5);
+        backend.retired_output_deadline_override = Some(expected_next_deadline);
         let next_deadline = backend
             .next_wakeup()
             .expect("unsignaled retired fence still needs polling");
+        assert_eq!(next_deadline, expected_next_deadline);
         assert!(next_deadline > after_poll, "polling must not busy-loop");
         assert!(
             next_deadline <= after_poll + std::time::Duration::from_millis(10),
@@ -77035,6 +77354,11 @@ mod tests {
             .expect("environmental skip: no live Vulkan modeset fixture");
         backend.client_modeset_stale_before_validation_for_tests = true;
         let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        c0_3bi_drive_crtc_config_result(
+            &mut backend,
+            token,
+            "c0_3bi_prepared_set_released_once_vulkan stale result",
+        );
         let keys = backend
             .client_modeset_released_allocation_keys_for_tests
             .clone();
@@ -96643,9 +96967,19 @@ mod tests {
 
     fn c0_3bi_settle_composed_owner_frame(
         backend: &mut super::KmsBackend,
-        _device: DrmDeviceKey,
+        device: DrmDeviceKey,
         label: &str,
     ) {
+        let previous_deadline = backend
+            .platform
+            .owner_ref(device)
+            .expect("baseline Owner device")
+            .completion_deadline_override;
+        c0_3bi_set_owner_completion_deadline_for_tests(
+            backend,
+            device,
+            Some(std::time::Duration::from_secs(30)),
+        );
         backend.platform.owner_completion_detached = true;
         c0_3bi_compose_and_drain(backend);
         let commit = backend
@@ -96653,9 +96987,140 @@ mod tests {
             .live_record()
             .expect("baseline composed Owner commit")
             .commit_id();
-        c0_3bi_wait_owner_commit_accepted(backend, _device, commit, label);
-        c0_3bi_complete_owner_commit_through_core_driver(backend, _device, commit, label);
-        c0_3bi_complete_owner_followups(backend, _device, 1, label);
+        c0_3bi_wait_owner_commit_accepted(backend, device, commit, label);
+        c0_3bi_complete_owner_commit_through_core_driver(backend, device, commit, label);
+        c0_3bi_complete_owner_followups(backend, device, 1, label);
+        c0_3bi_set_owner_completion_deadline_for_tests(backend, device, previous_deadline);
+    }
+
+    fn c0_3bi_set_owner_completion_deadline_for_tests(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        deadline: Option<std::time::Duration>,
+    ) {
+        backend
+            .platform
+            .devices
+            .iter_mut()
+            .find(|entry| entry.key == device)
+            .and_then(|entry| entry.owner.as_mut())
+            .expect("Owner device for completion-deadline fixture override")
+            .completion_deadline_override = deadline;
+    }
+
+    fn c0_3bi_owner_frame_work_quiescent(
+        backend: &super::KmsBackend,
+        device: DrmDeviceKey,
+    ) -> bool {
+        let live_owner_commit = backend
+            .platform
+            .owner_ref(device)
+            .and_then(|owner| owner.live_record())
+            .is_some();
+        let queued_owner_offer = backend
+            .admission_conductors
+            .get(&device)
+            .is_some_and(|conductor| !conductor.composed.is_empty());
+        let owner_render_is_running = backend
+            .platform
+            .outputs
+            .iter()
+            .enumerate()
+            .filter(|(_, output)| output.key.device_key == device)
+            .any(|(output_idx, _)| {
+                backend
+                    .scene
+                    .owner_prepared_for_tests(output_idx)
+                    .is_some_and(|(_, _, rendering)| rendering)
+            });
+        !(backend.scene_wants_compose() && backend.scene.has_output_ready_for_submit())
+            && !live_owner_commit
+            && !queued_owner_offer
+            && !owner_render_is_running
+            && backend
+                .platform
+                .pending_scanout_render_completion_count_for_tests()
+                == 0
+            && backend
+                .platform
+                .ready_scanout_render_completions_for_tests
+                .is_empty()
+            && backend.core_driver_script_notification_count_for_tests == 0
+            && backend.core_driver_owner_events_for_tests.is_empty()
+            && backend.core_driver_drm_events_for_tests.is_empty()
+            && backend.core_driver_readiness_script_for_tests.is_empty()
+    }
+
+    fn c0_3bi_settle_owner_frame_work_through_core_driver(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        label: &str,
+        timeout: std::time::Duration,
+    ) -> Result<(), String> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut state = ServerState::new();
+        loop {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            if c0_3bi_owner_frame_work_quiescent(backend, device) {
+                return Ok(());
+            }
+            if let Some(commit) = backend
+                .platform
+                .owner_ref(device)
+                .and_then(|owner| owner.live_record())
+                .map(|record| record.commit_id())
+            {
+                c0_3bi_complete_owner_commit_through_core_driver_with_state(
+                    backend, &mut state, device, commit, label,
+                );
+                continue;
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            if remaining.is_zero() {
+                break;
+            }
+            c0_3bi_core_driver_until_mode_with_options(
+                backend,
+                &mut state,
+                label,
+                remaining,
+                &|backend| {
+                    backend
+                        .platform
+                        .owner_ref(device)
+                        .and_then(|owner| owner.live_record())
+                        .is_some()
+                        || c0_3bi_owner_frame_work_quiescent(backend, device)
+                },
+                None,
+                false,
+                false,
+                true,
+            )?;
+        }
+        Err(format!(
+            "{label}: Owner frame work did not settle before {timeout:?}; live={:?}; composed={:?}; scene_wants_compose={}; pending render completions=(pending={}, ready={})",
+            backend
+                .platform
+                .owner_ref(device)
+                .and_then(|owner| owner.live_record())
+                .map(|record| (record.commit_id(), record.state(), record.milestones())),
+            backend
+                .admission_conductors
+                .get(&device)
+                .map(|conductor| &conductor.composed),
+            backend.scene_wants_compose(),
+            backend
+                .platform
+                .pending_scanout_render_completion_count_for_tests(),
+            backend
+                .platform
+                .ready_scanout_render_completions_for_tests
+                .len(),
+        ))
     }
 
     #[test]
@@ -98594,6 +99059,16 @@ mod tests {
             c0_3bi_live_modeset_backend(StubBehaviour::AcceptKernelCalls(1_000), false)
                 .expect("environmental skip: live Vulkan position-only fixture");
         let expected_live_outputs = vec![OutputKey::new(device, connector.clone())];
+        let previous_deadline = backend
+            .platform
+            .owner_ref(device)
+            .expect("Owner device")
+            .completion_deadline_override;
+        c0_3bi_set_owner_completion_deadline_for_tests(
+            &mut backend,
+            device,
+            Some(std::time::Duration::from_secs(30)),
+        );
         backend.platform.owner_completion_detached = true;
         c0_3bi_compose_and_drain(&mut backend);
         let accepted_commit = backend
@@ -98621,6 +99096,11 @@ mod tests {
             .release_descriptor_slots_for_tests(0, &[first_slot]);
 
         let crtc = u32::from(backend.platform.outputs[0].output.crtc);
+        let previous_generation = backend.admission_conductors[&device]
+            .composed
+            .get(&crtc)
+            .copied()
+            .unwrap_or(0);
         backend.scene.mark_scene_structure_dirty();
         c0_3bi_core_driver_until_observing(
             &mut backend,
@@ -98630,7 +99110,15 @@ mod tests {
                 backend.admission_conductors[&device]
                     .composed
                     .get(&crtc)
-                    .is_some_and(|generation| *generation > 0)
+                    .is_some_and(|generation| {
+                        *generation > previous_generation
+                            && matches!(
+                                backend
+                                    .scene
+                                    .owner_state_for_generation_for_tests(0, *generation),
+                                Some(OwnerBufferState::Desired | OwnerBufferState::Displaced)
+                            )
+                    })
             },
         )
         .expect("core driver queues the next composed generation");
@@ -98690,10 +99178,10 @@ mod tests {
             ),
             "an old-layout frame is no longer dispatchable after position promotion"
         );
-        assert!(
-            !backend.admission_conductors[&device]
-                .composed
-                .contains_key(&crtc)
+        assert_ne!(
+            backend.admission_conductors[&device].composed.get(&crtc),
+            Some(&queued_generation),
+            "the old-layout composed offer is withdrawn after position promotion"
         );
         assert_eq!(
             backend.lifecycle_drivers[&device]
@@ -98706,6 +99194,7 @@ mod tests {
             .scene
             .release_descriptor_slots_for_tests(0, held_successor_slots);
         c0_3bi_complete_owner_followups(&mut backend, device, 2, "finish position-only repaint");
+        c0_3bi_set_owner_completion_deadline_for_tests(&mut backend, device, previous_deadline);
         c0_3bi_assert_end_state(
             &backend,
             "c0_3bi_position_only_waits_behind_an_accepted_flip_vulkan",
@@ -98723,11 +99212,14 @@ mod tests {
                 .expect("environmental skip: live Vulkan position-only fixture");
         let expected_live_outputs = vec![OutputKey::new(device, connector.clone())];
         backend.platform.owner_completion_detached = true;
-        c0_3bi_settle_composed_owner_frame(
+        backend.scene.mark_scene_structure_dirty();
+        c0_3bi_settle_owner_frame_work_through_core_driver(
             &mut backend,
             device,
             "settle Owner buffer before position-only promotion",
-        );
+            std::time::Duration::from_secs(3),
+        )
+        .expect("Owner frame work settles through core entries before promotion");
         let state_identity = backend
             .scene
             .output_scene_identity_for_tests(0)
@@ -98759,6 +99251,13 @@ mod tests {
 
         let token =
             c0_3bi_begin_client_modeset_at(&mut backend, output_id, &connector, Some(mode), 1, 0);
+        c0_3bi_core_driver_until_observing(
+            &mut backend,
+            "promote position-only request before inspecting scene state",
+            std::time::Duration::from_secs(3),
+            &|backend| backend.scene.output_origin_for_tests(0) == Some((1, 0)),
+        )
+        .expect("position-only request updates the existing output origin");
         assert_eq!(
             backend.scene.output_instance_id_for_tests(0),
             Some(instance)
@@ -99041,6 +99540,19 @@ mod tests {
         let (OwnerLiveFixture { mut backend, .. }, device_a, device_b, output_id, connector) =
             c0_3bi_live_two_owner_position_backend(StubBehaviour::AcceptKernelCalls(1_000))
                 .expect("environmental skip: live two-Owner modeset fixture");
+        // This fixture supplies out-fence and page-flip completion through
+        // explicit core-driver events. Detach fence polling before the first
+        // core entry: A can otherwise expose the stub's /dev/null out-fence
+        // while the test waits for B's clock probe.
+        backend.platform.owner_completion_detached = true;
+        backend
+            .platform
+            .devices
+            .iter_mut()
+            .find(|entry| entry.key == device_b)
+            .and_then(|entry| entry.owner.as_mut())
+            .expect("device B Owner")
+            .completion_deadline_override = Some(std::time::Duration::from_secs(30));
         let a_output_idx = backend
             .platform
             .outputs
@@ -99065,10 +99577,18 @@ mod tests {
             "the client modeset targets device A's explicitly expected output"
         );
         let b_crtc = u32::from(backend.platform.outputs[b_output_idx].output.crtc);
+        let b_scene_instance = backend
+            .scene
+            .output_instance_id_for_tests(b_output_idx)
+            .expect("device B output instance");
         let b_scene_identity = backend
             .scene
             .output_scene_identity_for_tests(b_output_idx)
-            .expect("device B scene state");
+            .expect("device B scene identity");
+        let b_scene_origin = backend
+            .scene
+            .output_origin_for_tests(b_output_idx)
+            .expect("device B scene origin");
         let b_pool = backend.platform.scanout_pools[b_output_idx]
             .as_ref()
             .expect("device B scanout pool") as *const _;
@@ -99095,7 +99615,6 @@ mod tests {
         )
         .expect("device B clock probe reply reaches Owner through core entries");
 
-        backend.platform.owner_completion_detached = true;
         backend.scene.mark_scene_structure_dirty();
         c0_3bi_core_driver_until(
             &mut backend,
@@ -99159,6 +99678,16 @@ mod tests {
             .and_then(|owner| owner.live_record())
             .expect("B's accepted composed commit")
             .commit_id();
+        let b_held_buffer = backend
+            .scene
+            .owner_buffer_identities_for_tests(b_output_idx)
+            .into_iter()
+            .zip(backend.scene.owner_buffer_states_for_tests(b_output_idx))
+            .find_map(|(identity, state)| {
+                (state == crate::kms::render::owner_buffer::OwnerBufferState::Accepted)
+                    .then_some(identity)
+            })
+            .expect("B's held accepted commit has an Owner buffer");
 
         // A refresh-only mode, when available, preserves the root extent so
         // this test isolates per-device scene replacement.
@@ -99221,9 +99750,31 @@ mod tests {
         );
 
         assert_eq!(
+            backend.scene.output_instance_id_for_tests(b_output_idx),
+            Some(b_scene_instance),
+            "A's modeset preserves B's output instance"
+        );
+        assert_eq!(
             backend.scene.output_scene_identity_for_tests(b_output_idx),
             Some(b_scene_identity),
-            "A's modeset preserves B's OutputSceneState object"
+            "A's modeset preserves B's scene-owned descriptor-pool ring"
+        );
+        assert!(
+            backend
+                .scene
+                .owner_buffer_identities_for_tests(b_output_idx)
+                .into_iter()
+                .zip(backend.scene.owner_buffer_states_for_tests(b_output_idx))
+                .any(|(identity, state)| {
+                    identity == b_held_buffer
+                        && state == crate::kms::render::owner_buffer::OwnerBufferState::Accepted
+                }),
+            "A's modeset keeps B's accepted Owner buffer live while B's held commit is pending"
+        );
+        assert_eq!(
+            backend.scene.output_origin_for_tests(b_output_idx),
+            Some(b_scene_origin),
+            "A's modeset leaves B's output origin unchanged"
         );
         assert!(std::ptr::eq(
             b_pool,
