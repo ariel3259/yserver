@@ -4,7 +4,9 @@
 scoped, requests during recovery parked, late executor results; round 2: M-2
 the RANDR gate and administrative-reprobe contract of section 3.3; round 3:
 M-3 lease holders include in-process probe-worker threads, the parked
-mutation's `Q` deadline, device-scoped acquire reuse). Design
+mutation's `Q` deadline, device-scoped acquire reuse; round 4: M-4 the
+deadline bounds the whole teardown, unproven GPU/shared obligations are
+retained, no unbounded wait during shutdown). Design
 approved by the user section by section on 2026-10-04. One spec, two plans
 (3d-i, 3d-ii).
 
@@ -253,6 +255,18 @@ Following C.0 §10's Shutdown row:
    process exits; the kernel's process teardown is what finally releases them.
    An orphaned helper keeps the device lock; a blocked worker thread dies with
    the process.
+5. **The deadline bounds the whole teardown, not only lease holders.** After
+   the fd family closes, independent obligations remain (C.0 §10: a family
+   close is not a universal lifetime proof): pending GPU submissions, reads,
+   FOREIGN and shared (dma-buf, GBM, Vulkan) owners. Each is released only on
+   its own proof, checked with **bounded** queries (fence status polls within
+   the remaining deadline). **No unbounded wait runs during shutdown**: in
+   particular `VkContext` destruction must not call `device_wait_idle` unless
+   GPU idleness is already proven by the bounded checks. Any obligation still
+   unproven at the deadline is **retained, not destroyed** (its owner and
+   context are kept alive, recorded, and left to process exit), and the
+   process exits. This holds whether or not any lease holder survives; the
+   recorded state names every retained obligation.
 
 ## 5. Evidence
 
@@ -294,6 +308,11 @@ names the mutation that must fail. The umbrella §4 differential gate applies.
   deadline with the lease recorded; and a shutdown where every child is reaped
   but a connector-probe worker is still blocked: no premature family close or
   resource destruction, the worker recorded, a bounded exit at the deadline.
+- Shutdown with zero surviving fd-family holders and an unresolved GPU
+  obligation (a submission whose fence never signals): the family closes, the
+  GPU owner and its context are retained (no `device_wait_idle`, no
+  destruction), the retained obligation is recorded, and the process exits at
+  the deadline.
 - Recovery barrier with a stuck probe worker: no replacement fd while the
   worker holds its lease; the late join releases it and the same `RecoveryId`
   continues.
