@@ -981,6 +981,33 @@ yserver-openbox-picom-xrender-hw-telemetry log="info":
         wait $yserver_pid 2>/dev/null;\
         rm -rf "$xdg_rd" 2>/dev/null;'
 
+# =========================== CDE ===================================
+yserver-cde-hw log="info":
+    cargo build --release --bin yserver
+    bash -c '\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11;\
+        export XDG_SESSION_TYPE=x11;\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-cde.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        env PATH=$PATH:/usr/dt/bin DISPLAY=:7 /usr/dt/bin/Xsession > cde.log 2>&1 ;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;'
+
+yserver-cde-hw-trace log="info":
+    cargo build --release --bin yserver
+    bash -c '\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11;\
+        export XDG_SESSION_TYPE=x11;\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-cde.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        env PATH=$PATH:/usr/dt/bin DISPLAY=:7 x11trace -n -k -o cde.xtrace /usr/dt/bin/Xsession > cde.log 2>&1 ;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;'
+
 # ============================== awesome ==============================
 
 yserver-awesome-hw log="info":
