@@ -46,7 +46,8 @@ static int string_prop(const char *name)
     static const char *const names[] = {
         "FONT", "FOUNDRY", "FAMILY_NAME", "WEIGHT_NAME", "SLANT", "SETWIDTH_NAME",
         "ADD_STYLE_NAME", "SPACING", "CHARSET_REGISTRY", "CHARSET_ENCODING", "COPYRIGHT",
-        "NOTICE", "FONTNAME_REGISTRY", "FACE_NAME", "FONT_TYPE", "RASTERIZER_NAME", NULL,
+        "NOTICE", "FONTNAME_REGISTRY", "FACE_NAME", "FONT_TYPE", "RASTERIZER_NAME", "FULL_NAME",
+        "_DEC_DEVICE_FONTNAMES", "_GBDFED_INFO", "_XMBDFED_INFO", NULL,
     };
     for (int i = 0; names[i]; i++)
         if (!strcmp(names[i], name))
@@ -91,7 +92,8 @@ static void list_fonts(unsigned max, const char *pat)
     xcb_close_font(c, f);
 }
 
-static void list_fonts_with_info(unsigned max, const char *pat)
+/* names_only: the reply names, without metrics and properties. */
+static void list_fonts_with_info(unsigned max, const char *pat, int names_only)
 {
     xcb_list_fonts_with_info_cookie_t ck = xcb_list_fonts_with_info(c, max, strlen(pat), pat);
     printf("LFWI max=%u '%s'\n", max, pat);
@@ -107,8 +109,13 @@ static void list_fonts_with_info(unsigned max, const char *pat)
             free(r);
             return;
         }
-        printf("  %.*s\n   asc=%d desc=%d", xcb_list_fonts_with_info_name_length(r),
-               xcb_list_fonts_with_info_name(r), r->font_ascent, r->font_descent);
+        printf("  %.*s\n", xcb_list_fonts_with_info_name_length(r),
+               xcb_list_fonts_with_info_name(r));
+        if (names_only) {
+            free(r);
+            continue;
+        }
+        printf("   asc=%d desc=%d", r->font_ascent, r->font_descent);
         charinfo("min", &r->min_bounds);
         charinfo("max", &r->max_bounds);
         printf(" dc=%u cols=%u-%u rows=%u-%u all=%u dir=%u\n", r->default_char,
@@ -170,13 +177,14 @@ int main(int argc, char **argv)
             continue;
         *tab = 0;
         unsigned max = (unsigned)strtoul(line, NULL, 10);
-        /* A third field "lf": ListFonts only. */
+        /* A third field: "lf" for ListFonts only, "names" for ListFontsWithInfo
+         * names without metrics and properties. */
         char *only = strchr(tab + 1, '\t');
         if (only)
             *only++ = 0;
         list_fonts(max, tab + 1);
         if (!only || strcmp(only, "lf"))
-            list_fonts_with_info(max, tab + 1);
+            list_fonts_with_info(max, tab + 1, only && !strcmp(only, "names"));
     }
     fclose(in);
     /* Back to the default path so a later scenario starts clean. */

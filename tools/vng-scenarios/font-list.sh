@@ -6,10 +6,8 @@
 # shellcheck shell=sh
 # golden: probe.log
 # mask: /font-list(\.xorg)?/aliases => /<artifacts>/aliases -- each run writes its alias dir into its own artifact dir
-# mask: ^(   asc=-?\d+ desc=-?\d+) min=\S+ max=\S+ => \1 -- ListFontsWithInfo bounds: ours fold per-glyph metrics, Xorg sends the PCF accelerators' ink bounds and attributes; not about name lookup
-# mask: ( dc=)\d+ => \1<dc> -- default char: ours comes from PCF tables read only from uncompressed files, so a .pcf.gz font reports 0; not about name lookup
 # mask: ^  open: error 17$ =>   open: error 15 -- an alias loop: Xorg's OpenFont gives up with BadImplementation, ours with BadName
-# drop: ^   [A-Z_][A-Z0-9_]*= -- ListFontsWithInfo properties: FreeType exposes a subset of the PCF properties, in its own order, and FONT is the fonts.dir key; not about name lookup
+# drop: ^   FONT= -- ListFontsWithInfo FONT: ours is the fonts.dir key, which OpenFont reopens (Debian's 19px misc-fixed PCFs carry a different name); Xorg's is the PCF's own
 set -u
 set +e
 cc -O1 -o probe "${YSERVER_REPO:?}/tools/vng-scenarios/font-list-probe.c" -lxcb > cc.log 2>&1 || cat cc.log >&2
