@@ -29734,19 +29734,27 @@ impl Backend for KmsBackend {
         // Path fonts first, then built-ins — one global budget
         // (mirrors list_fonts_proxy ordering so the two requests
         // agree on the visible font set).
-        let matched: Vec<String> = self.core.font_loader.list_font_names(pattern, cap);
+        let listed = self.core.font_loader.list_fonts_with_info(pattern, cap);
 
-        let mut entries: Vec<(String, FontMetrics)> = Vec::with_capacity(matched.len());
-        for name in matched {
-            // Capture the fonts.dir KEY that resolve() matches for path
-            // fonts; it — not the bare matched alias, not the file-
-            // embedded FONT atom — is the round-trippable XA_FONT.
-            let path_entry_key = match self.core.font_loader.resolve(&name) {
-                Some(crate::kms::core::FontResolution::File { entry_name, .. }) => Some(entry_name),
+        let mut entries: Vec<(String, FontMetrics)> = Vec::with_capacity(listed.len());
+        for crate::kms::core::ListedFont {
+            reply_name: name,
+            open_name,
+            res,
+        } in listed
+        {
+            // The fonts.dir KEY a path font resolved to — not the bare
+            // matched alias, not the file-embedded FONT atom — is the
+            // round-trippable XA_FONT.
+            let path_entry_key = match &res {
+                crate::kms::core::FontResolution::File { entry_name, .. } => {
+                    Some(entry_name.clone())
+                }
                 _ => None,
             };
-            match self.core.font_loader.open_font(&name) {
-                Ok((_face, mut metrics, _cache)) => {
+            match self.core.font_loader.font_info(&res, &open_name) {
+                Ok(info) => {
+                    let mut metrics = info.metrics_without_chars();
                     // Reply NAME keeps Xorg FPE behavior: path / XLFD
                     // names go out verbatim; a bare built-in alias
                     // ("fixed"/"cursor"/"nil2") is rewritten to a full
@@ -29816,7 +29824,7 @@ impl Backend for KmsBackend {
                     entries.push((wire_name, metrics));
                 }
                 Err(err) => {
-                    log::debug!("render ListFontsWithInfo: skipping {name:?} — open_font: {err}");
+                    log::debug!("render ListFontsWithInfo: skipping {name:?} — {err}");
                 }
             }
         }

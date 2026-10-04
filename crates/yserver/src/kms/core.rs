@@ -511,6 +511,7 @@ fn split_alias_token(s: &str) -> Option<(&str, &str)> {
 }
 
 /// Resolution outcome for a font name against the font path.
+#[derive(Debug, Clone)]
 pub(crate) enum FontResolution {
     /// Matched a fonts.dir entry: open this file. `entry_name` is the
     /// matched fonts.dir name (used for XLFD-derived sizing of
@@ -531,6 +532,7 @@ pub(crate) enum FontResolution {
 
 /// A core font compiled into the server, serving the `built-ins`
 /// font-path element the way libXfont2's built-in FPE does.
+#[derive(Debug)]
 pub(crate) struct EmbeddedFont {
     /// The bare font name clients ask for (`OpenFont` / `fonts.dir` key).
     pub(crate) name: &'static str,
@@ -618,6 +620,68 @@ pub(crate) struct FontLoader {
     pub(crate) font_path: Vec<String>,
     /// Parsed dirs parallel to `font_path` (`None` = "built-ins").
     pub(crate) path_dirs: Vec<Option<FontDir>>,
+    /// What each name resolved to on the current path, by lowered name.
+    /// Cleared with the path.
+    resolutions: RefCell<HashMap<Box<[u8]>, Option<FontResolution>>>,
+    /// Metrics and per-char info of each font opened, so a font asked for
+    /// again (OpenFont, ListFontsWithInfo) skips FreeType's walk over every
+    /// glyph. Cleared with the path, so `xset fp rehash` rereads files.
+    infos: RefCell<HashMap<FontInfoKey, std::rc::Rc<FontInfo>>>,
+}
+
+/// One reply of ListFontsWithInfo.
+#[derive(Debug, Clone)]
+pub(crate) struct ListedFont {
+    /// The name the reply carries.
+    pub(crate) reply_name: String,
+    /// The name `res` was resolved from.
+    pub(crate) open_name: String,
+    pub(crate) res: FontResolution,
+}
+
+/// More entries than this in a [`FontLoader`] cache and it starts over:
+/// clients choose the names, so the caches must not grow without bound.
+const FONT_CACHE_CAP: usize = 4096;
+
+/// The font a [`FontInfo`] was computed from.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum FontInfoKey {
+    /// A fonts.dir file; the entry name sizes a scalable one.
+    File(std::path::PathBuf, String),
+    Embedded(&'static str),
+    /// A fontconfig face, by the lowered name it was asked by.
+    BuiltIn(Box<[u8]>),
+}
+
+/// A font's metrics, its properties among them, and per-char info.
+#[derive(Debug)]
+pub(crate) struct FontInfo {
+    pub(crate) metrics: FontMetrics,
+    pub(crate) chars: HashMap<char, ProtocolCharInfo>,
+}
+
+impl FontInfo {
+    /// The metrics without the per-char table, which ListFontsWithInfo
+    /// does not carry and a two-byte font makes large.
+    pub(crate) fn metrics_without_chars(&self) -> FontMetrics {
+        let m = &self.metrics;
+        FontMetrics {
+            min_bounds: m.min_bounds,
+            max_bounds: m.max_bounds,
+            min_char_or_byte2: m.min_char_or_byte2,
+            max_char_or_byte2: m.max_char_or_byte2,
+            default_char: m.default_char,
+            draw_direction: m.draw_direction,
+            min_byte1: m.min_byte1,
+            max_byte1: m.max_byte1,
+            all_chars_exist: m.all_chars_exist,
+            font_ascent: m.font_ascent,
+            font_descent: m.font_descent,
+            properties: m.properties.clone(),
+            named_properties: m.named_properties.clone(),
+            char_infos: Vec::new(),
+        }
+    }
 }
 
 /// Built-in alias names that always resolve via fontconfig — the
@@ -642,6 +706,8 @@ impl FontLoader {
                 .collect(),
             font_path: Vec::new(),
             path_dirs: Vec::new(),
+            resolutions: RefCell::new(HashMap::new()),
+            infos: RefCell::new(HashMap::new()),
         };
         let default = Self::default_font_path();
         // Default path elements are pre-vetted (fonts.dir checked) —
@@ -707,6 +773,8 @@ impl FontLoader {
         }
         self.font_path = effective;
         self.path_dirs = dirs;
+        self.resolutions.borrow_mut().clear();
+        self.infos.borrow_mut().clear();
         Ok(())
     }
 
@@ -716,7 +784,17 @@ impl FontLoader {
     /// wildcard match against fonts.dir names; "built-ins" matches
     /// the alias set or the fontconfig catalog. None = BadName.
     pub(crate) fn resolve(&self, name: &str) -> Option<FontResolution> {
-        self.resolve_inner(name, 20)
+        let key = LoweredName::new(name).bytes;
+        if let Some(hit) = self.resolutions.borrow().get(&key) {
+            return hit.clone();
+        }
+        let found = self.resolve_inner(name, 20);
+        let mut cache = self.resolutions.borrow_mut();
+        if cache.len() >= FONT_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(key, found.clone());
+        found
     }
 
     fn resolve_inner(&self, name: &str, hops: u8) -> Option<FontResolution> {
@@ -852,10 +930,14 @@ impl FontLoader {
         };
         // Neither `open_font_builtin` nor `open_font_embedded` consults
         // the font path, so this cannot recurse back into `resolve_inner`.
-        let Ok((_, metrics, _)) = self.open_builtin_or_embedded(alias) else {
+        let res = match embedded_font(alias) {
+            Some(f) => FontResolution::Embedded(f),
+            None => FontResolution::BuiltIn,
+        };
+        let Ok(info) = self.font_info(&res, alias) else {
             return false;
         };
-        Self::alias_to_xlfd(alias, &metrics).eq_ignore_ascii_case(name)
+        Self::alias_to_xlfd(alias, &info.metrics).eq_ignore_ascii_case(name)
     }
 
     /// The first `max` names on the current path matching `pattern`,
@@ -892,6 +974,23 @@ impl FontLoader {
             );
         }
         out
+    }
+
+    /// What ListFontsWithInfo reports for `pattern`: the first `max`
+    /// names, each with the font it resolves to; a name that resolves to
+    /// nothing is left out.
+    pub(crate) fn list_fonts_with_info(&self, pattern: &str, max: usize) -> Vec<ListedFont> {
+        self.list_font_names(pattern, max)
+            .into_iter()
+            .filter_map(|name| {
+                let res = self.resolve(&name)?;
+                Some(ListedFont {
+                    open_name: name.clone(),
+                    reply_name: name,
+                    res,
+                })
+            })
+            .collect()
     }
 
     pub(crate) fn is_xlfd_pattern(name: &str) -> bool {
@@ -967,16 +1066,75 @@ impl FontLoader {
         &self,
         name: &str,
     ) -> io::Result<(freetype::Face, FontMetrics, HashMap<char, ProtocolCharInfo>)> {
-        match self.resolve(name) {
-            Some(FontResolution::File { path, entry_name }) => {
-                self.open_font_file(&path, &entry_name)
-            }
-            Some(FontResolution::Embedded(f)) => self.open_font_embedded(f),
-            Some(FontResolution::BuiltIn) => self.open_font_builtin(name),
-            None => Err(io::Error::new(
+        let Some(res) = self.resolve(name) else {
+            return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("no font on path matches {name:?}"),
-            )),
+            ));
+        };
+        let face = self.open_face(&res, name)?;
+        let info = match self.cached_info(&res, name) {
+            Some(info) => info,
+            None => self.compute_info(&res, name, &face),
+        };
+        Ok((face, info.metrics.clone(), info.chars.clone()))
+    }
+
+    /// The metrics of the font `res` names, `name` being the name it was
+    /// resolved from: cached, else read from a freshly opened face.
+    pub(crate) fn font_info(
+        &self,
+        res: &FontResolution,
+        name: &str,
+    ) -> io::Result<std::rc::Rc<FontInfo>> {
+        if let Some(info) = self.cached_info(res, name) {
+            return Ok(info);
+        }
+        let face = self.open_face(res, name)?;
+        Ok(self.compute_info(res, name, &face))
+    }
+
+    fn info_key(res: &FontResolution, name: &str) -> FontInfoKey {
+        match res {
+            FontResolution::File { path, entry_name } => {
+                FontInfoKey::File(path.clone(), entry_name.clone())
+            }
+            FontResolution::Embedded(f) => FontInfoKey::Embedded(f.name),
+            FontResolution::BuiltIn => FontInfoKey::BuiltIn(LoweredName::new(name).bytes),
+        }
+    }
+
+    fn cached_info(&self, res: &FontResolution, name: &str) -> Option<std::rc::Rc<FontInfo>> {
+        self.infos.borrow().get(&Self::info_key(res, name)).cloned()
+    }
+
+    fn compute_info(
+        &self,
+        res: &FontResolution,
+        name: &str,
+        face: &freetype::Face,
+    ) -> std::rc::Rc<FontInfo> {
+        let (metrics, chars) = match res {
+            FontResolution::File { path, .. } => file_font_metrics(face, pcf_file_info(path)),
+            FontResolution::Embedded(f) => file_font_metrics(face, pcf_info_from_bytes(f.bytes)),
+            FontResolution::BuiltIn => compute_font_metrics(face, false),
+        };
+        let info = std::rc::Rc::new(FontInfo { metrics, chars });
+        let mut cache = self.infos.borrow_mut();
+        if cache.len() >= FONT_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(Self::info_key(res, name), info.clone());
+        info
+    }
+
+    /// A FreeType face for the font `res` names, sized and with its
+    /// charmap selected.
+    fn open_face(&self, res: &FontResolution, name: &str) -> io::Result<freetype::Face> {
+        match res {
+            FontResolution::File { path, entry_name } => self.open_face_file(path, entry_name),
+            FontResolution::Embedded(f) => self.open_face_embedded(f),
+            FontResolution::BuiltIn => self.open_face_builtin(name),
         }
     }
 
@@ -984,11 +1142,11 @@ impl FontLoader {
     /// FreeType auto-detects). Bitmap faces select their (single)
     /// strike; scalable files honour the matched entry name's XLFD
     /// pixel size.
-    fn open_font_file(
+    fn open_face_file(
         &self,
         path: &std::path::Path,
         entry_name: &str,
-    ) -> io::Result<(freetype::Face, FontMetrics, HashMap<char, ProtocolCharInfo>)> {
+    ) -> io::Result<freetype::Face> {
         let face = self
             .library
             .new_face(path, 0)
@@ -1018,48 +1176,16 @@ impl FontLoader {
             // X11 font dirs.
             let _ = face.select_size(0);
         }
-        let pcf = pcf_file_info(path);
-        // Ink metrics iff the PCF carries the table; BDF files always
-        // (Xorg's bdf reader computes ink unconditionally); scalable
-        // faces use cell metrics (old behavior).
-        let use_ink = match &pcf {
-            Some(info) => info.has_ink_metrics,
-            None => !face.is_scalable(),
-        };
-        let (mut metrics, char_cache) = compute_font_metrics(&face, use_ink);
-        // PCF authoritative overrides — Xorg's QueryFont serves
-        // these from the file's tables, not from re-derivation:
-        // default_char (encodings header), min/max_bounds + font
-        // ascent/descent (accelerators, ink variants when present).
-        if let Some(pcf) = pcf {
-            if let Some(default_char) = pcf.default_char {
-                metrics.default_char = default_char;
-            }
-            // min/max_bounds intentionally NOT taken from the accel
-            // table: R6+ servers fold them from per-char metrics,
-            // excluding all-zero entries (xtfont3/4's #if
-            // XT_X_RELEASE==6 expectations) — compute_font_metrics
-            // does exactly that.
-            if let Some(a) = pcf.font_ascent {
-                metrics.font_ascent = a;
-            }
-            if let Some(d) = pcf.font_descent {
-                metrics.font_descent = d;
-            }
-        }
-        Ok((face, metrics, char_cache))
+        Ok(face)
     }
 
     /// Open a font compiled into the binary. Same handling as a
-    /// fonts.dir-resolved PCF ([`Self::open_font_file`]) — explicit
+    /// fonts.dir-resolved PCF ([`Self::open_face_file`]) — explicit
     /// charmap selection, single bitmap strike, PCF-authoritative
     /// metric overrides — just sourced from `include_bytes!` instead
     /// of the filesystem, so it works on hosts with no X core font
     /// packages installed at all.
-    fn open_font_embedded(
-        &self,
-        font: &'static EmbeddedFont,
-    ) -> io::Result<(freetype::Face, FontMetrics, HashMap<char, ProtocolCharInfo>)> {
+    fn open_face_embedded(&self, font: &'static EmbeddedFont) -> io::Result<freetype::Face> {
         let face = self
             .library
             .new_memory_face(font.bytes.to_vec(), 0)
@@ -1071,31 +1197,14 @@ impl FontLoader {
             })?;
         // PCF exposes exactly one charmap and FreeType leaves none
         // active when the file carries no recognized registry — same
-        // reason as open_font_file.
+        // reason as open_face_file.
         if face.raw().charmap.is_null() && face.num_charmaps() > 0 {
             let cm = face.get_charmap(0);
             let _ = face.set_charmap(&cm);
         }
         // Bitmap strike: one size per X11 core font file.
         let _ = face.select_size(0);
-        let pcf = pcf_info_from_bytes(font.bytes);
-        let use_ink = match &pcf {
-            Some(info) => info.has_ink_metrics,
-            None => !face.is_scalable(),
-        };
-        let (mut metrics, char_cache) = compute_font_metrics(&face, use_ink);
-        if let Some(pcf) = pcf {
-            if let Some(default_char) = pcf.default_char {
-                metrics.default_char = default_char;
-            }
-            if let Some(a) = pcf.font_ascent {
-                metrics.font_ascent = a;
-            }
-            if let Some(d) = pcf.font_descent {
-                metrics.font_descent = d;
-            }
-        }
-        Ok((face, metrics, char_cache))
+        Ok(face)
     }
 
     /// Open a built-ins-element font with the same precedence
@@ -1106,20 +1215,21 @@ impl FontLoader {
     /// carried; that reply is built from `open_font`'s metrics, so an
     /// embedded font here and a fontconfig font there would make the
     /// server reject its own reply name (the #107 failure mode).
+    #[cfg(test)]
     fn open_builtin_or_embedded(
         &self,
         alias: &str,
     ) -> io::Result<(freetype::Face, FontMetrics, HashMap<char, ProtocolCharInfo>)> {
-        match embedded_font(alias) {
-            Some(f) => self.open_font_embedded(f),
-            None => self.open_font_builtin(alias),
-        }
+        let res = match embedded_font(alias) {
+            Some(f) => FontResolution::Embedded(f),
+            None => FontResolution::BuiltIn,
+        };
+        let face = self.open_face(&res, alias)?;
+        let info = self.font_info(&res, alias)?;
+        Ok((face, info.metrics.clone(), info.chars.clone()))
     }
 
-    fn open_font_builtin(
-        &self,
-        name: &str,
-    ) -> io::Result<(freetype::Face, FontMetrics, HashMap<char, ProtocolCharInfo>)> {
+    fn open_face_builtin(&self, name: &str) -> io::Result<freetype::Face> {
         // Resolve the X11 font name to a file path via fontconfig. We can't
         // rely on the high-level `Fontconfig::find`: when the requested family
         // doesn't exist, fontconfig falls back to the *system default* (often
@@ -1172,9 +1282,45 @@ impl FontLoader {
         } else {
             let _ = face.set_char_size(12 << 6, 12 << 6, 96, 96);
         }
-        let (metrics, char_cache) = compute_font_metrics(&face, false);
-        Ok((face, metrics, char_cache))
+        Ok(face)
     }
+}
+
+/// Metrics of a fonts.dir or embedded bitmap face, `pcf` its PCF tables
+/// when it is one.
+fn file_font_metrics(
+    face: &freetype::Face,
+    pcf: Option<PcfFileInfo>,
+) -> (FontMetrics, HashMap<char, ProtocolCharInfo>) {
+    // Ink metrics iff the PCF carries the table; BDF files always
+    // (Xorg's bdf reader computes ink unconditionally); scalable
+    // faces use cell metrics (old behavior).
+    let use_ink = match &pcf {
+        Some(info) => info.has_ink_metrics,
+        None => !face.is_scalable(),
+    };
+    let (mut metrics, char_cache) = compute_font_metrics(face, use_ink);
+    // PCF authoritative overrides — Xorg's QueryFont serves
+    // these from the file's tables, not from re-derivation:
+    // default_char (encodings header), min/max_bounds + font
+    // ascent/descent (accelerators, ink variants when present).
+    if let Some(pcf) = pcf {
+        if let Some(default_char) = pcf.default_char {
+            metrics.default_char = default_char;
+        }
+        // min/max_bounds intentionally NOT taken from the accel
+        // table: R6+ servers fold them from per-char metrics,
+        // excluding all-zero entries (xtfont3/4's #if
+        // XT_X_RELEASE==6 expectations) — compute_font_metrics
+        // does exactly that.
+        if let Some(a) = pcf.font_ascent {
+            metrics.font_ascent = a;
+        }
+        if let Some(d) = pcf.font_descent {
+            metrics.font_descent = d;
+        }
+    }
+    (metrics, char_cache)
 }
 
 /// Per-char QueryFont metrics. Mirrors Xorg's table choice:
