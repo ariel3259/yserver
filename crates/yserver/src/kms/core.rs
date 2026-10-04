@@ -629,6 +629,13 @@ pub(crate) struct FontLoader {
     infos: RefCell<HashMap<FontInfoKey, std::rc::Rc<FontInfo>>>,
 }
 
+/// What a name a path element lists stands for.
+enum ElementName {
+    Font(FontResolution),
+    /// An alias, with its (lowered) target.
+    Alias(String),
+}
+
 /// One reply of ListFontsWithInfo.
 #[derive(Debug, Clone)]
 pub(crate) struct ListedFont {
@@ -828,23 +835,82 @@ impl FontLoader {
             // fonts and aliases (`FontFileFindNameInDir`), so CDE's
             // `-dt-interface …-m*-…` opens through
             // `/usr/dt/etc/cde/fontaliases`, a directory of aliases alone.
-            // An alias whose target is not on this system (CDE's
-            // fonts.alias names fonts for every charset) gives way to the
-            // next one that matches.
-            for e in dir.matching(&pattern) {
-                match &e.value {
-                    DirEntry::File(path) => {
-                        return Some(FontResolution::File {
-                            path: path.clone(),
-                            entry_name: e.name.to_string(),
-                        });
+            // The first match decides: an alias starts over with its
+            // target from the first element, and if that is not on this
+            // system the name is BadName (`doOpenFont`), even where a
+            // later alias would have led somewhere.
+            if let Some(e) = dir.matching(&pattern).next() {
+                return match &e.value {
+                    DirEntry::File(path) => Some(FontResolution::File {
+                        path: path.clone(),
+                        entry_name: e.name.to_string(),
+                    }),
+                    DirEntry::Alias(target) => self.resolve_inner(target, hops - 1),
+                };
+            }
+        }
+        None
+    }
+
+    /// The first `max` names element `dir` lists for `pattern`, each with
+    /// the font it is or the alias target it stands for
+    /// (`_FontFileListFonts` with aliases marked).
+    fn element_names(
+        &self,
+        dir: Option<&FontDir>,
+        pattern: &FontPattern,
+        max: usize,
+    ) -> Vec<(String, ElementName)> {
+        let Some(dir) = dir else {
+            return XORG_BUILTIN_NAMES
+                .iter()
+                .zip(&self.builtin_keys)
+                .filter(|(_, k)| pattern.matches(k))
+                .map(|(n, _)| {
+                    let res =
+                        embedded_font(n).map_or(FontResolution::BuiltIn, FontResolution::Embedded);
+                    ((*n).to_string(), ElementName::Font(res))
+                })
+                .chain(self.catalog.matching(pattern).map(|e| {
+                    (
+                        e.name.to_string(),
+                        ElementName::Font(FontResolution::BuiltIn),
+                    )
+                }))
+                .take(max)
+                .collect();
+        };
+        dir.matching(pattern)
+            .take(max)
+            .map(|e| {
+                let kind = match &e.value {
+                    DirEntry::File(path) => ElementName::Font(FontResolution::File {
+                        path: path.clone(),
+                        entry_name: e.name.to_string(),
+                    }),
+                    DirEntry::Alias(target) => ElementName::Alias(target.clone()),
+                };
+                (e.name.to_string(), kind)
+            })
+            .collect()
+    }
+
+    /// The font an alias target names, as Xorg resolves an alias met while
+    /// listing (`doListFontsAndAliases`, `doListFontsWithInfo`): the first
+    /// element that lists anything for `target` decides, a further alias
+    /// starts over, at most 20 aliases deep. The name is the one the
+    /// font was found by.
+    fn resolve_alias_target(&self, target: &str, aliases: u8) -> Option<(String, FontResolution)> {
+        let pattern = FontPattern::new(target);
+        for dir in &self.path_dirs {
+            if let Some((name, kind)) = self.element_names(dir.as_ref(), &pattern, 1).pop() {
+                return match kind {
+                    ElementName::Font(res) => Some((name, res)),
+                    ElementName::Alias(next) if aliases > 1 => {
+                        self.resolve_alias_target(&next, aliases - 1)
                     }
-                    DirEntry::Alias(target) => {
-                        if let Some(found) = self.resolve_inner(target, hops - 1) {
-                            return Some(found);
-                        }
-                    }
-                }
+                    ElementName::Alias(_) => None,
+                };
             }
         }
         None
@@ -940,13 +1006,14 @@ impl FontLoader {
         Self::alias_to_xlfd(alias, &info.metrics).eq_ignore_ascii_case(name)
     }
 
-    /// The first `max` names on the current path matching `pattern`,
-    /// element by element as Xorg's ListFonts walks them, each element
-    /// asked only for what is left of `max`: a directory's names in
-    /// libXfont's order ([`FontDir::matching`]); for `built-ins`, Xorg's
-    /// own built-in names, then the fontconfig catalog this server adds
-    /// there. Nothing from `built-ins` when the path does not hold it, as
-    /// on Xorg.
+    /// The first `max` names on the current path matching `pattern`, as
+    /// Xorg's ListFonts finds them (`doListFontsAndAliases`): element by
+    /// element, each asked only for what is left of `max`, in libXfont's
+    /// order ([`FontDir::matching`]); for `built-ins`, Xorg's own built-in
+    /// names, then the fontconfig catalog this server adds there. An
+    /// alias is listed by its own name, and only when its target resolves
+    /// to a font. Nothing from `built-ins` when the path does not hold it,
+    /// as on Xorg.
     pub(crate) fn list_font_names(&self, pattern: &str, max: usize) -> Vec<String> {
         let pattern = FontPattern::new(pattern);
         let mut out = Vec::new();
@@ -955,42 +1022,53 @@ impl FontLoader {
             if left == 0 {
                 break;
             }
-            let Some(dir) = dir else {
-                out.extend(
-                    XORG_BUILTIN_NAMES
-                        .iter()
-                        .zip(&self.builtin_keys)
-                        .filter(|(_, k)| pattern.matches(k))
-                        .map(|(n, _)| (*n).to_string())
-                        .chain(self.catalog.matching(&pattern).map(|e| e.name.to_string()))
-                        .take(left),
-                );
-                continue;
-            };
-            out.extend(
-                dir.matching(&pattern)
-                    .take(left)
-                    .map(|e| e.name.to_string()),
-            );
+            for (name, kind) in self.element_names(dir.as_ref(), &pattern, left) {
+                match kind {
+                    ElementName::Font(_) => out.push(name),
+                    ElementName::Alias(target) => {
+                        if self.resolve_alias_target(&target, 20).is_some() {
+                            out.push(name);
+                        }
+                    }
+                }
+            }
         }
         out
     }
 
-    /// What ListFontsWithInfo reports for `pattern`: the first `max`
-    /// names, each with the font it resolves to; a name that resolves to
-    /// nothing is left out.
+    /// What ListFontsWithInfo reports for `pattern`, as Xorg's
+    /// `doListFontsWithInfo`: up to `max` fonts, element by element, each
+    /// element listing what is left of `max`. An alias is reported by its
+    /// target name — the font it resolves to, under the name the alias
+    /// gives — and left out when that resolves to nothing.
     pub(crate) fn list_fonts_with_info(&self, pattern: &str, max: usize) -> Vec<ListedFont> {
-        self.list_font_names(pattern, max)
-            .into_iter()
-            .filter_map(|name| {
-                let res = self.resolve(&name)?;
-                Some(ListedFont {
-                    open_name: name.clone(),
-                    reply_name: name,
-                    res,
-                })
-            })
-            .collect()
+        let pattern = FontPattern::new(pattern);
+        let mut out = Vec::new();
+        for dir in &self.path_dirs {
+            let left = max.saturating_sub(out.len());
+            if left == 0 {
+                break;
+            }
+            for (name, kind) in self.element_names(dir.as_ref(), &pattern, left) {
+                match kind {
+                    ElementName::Font(res) => out.push(ListedFont {
+                        open_name: name.clone(),
+                        reply_name: name,
+                        res,
+                    }),
+                    ElementName::Alias(target) => {
+                        if let Some((open_name, res)) = self.resolve_alias_target(&target, 20) {
+                            out.push(ListedFont {
+                                reply_name: target,
+                                open_name,
+                                res,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        out
     }
 
     pub(crate) fn is_xlfd_pattern(name: &str) -> bool {
@@ -3411,9 +3489,12 @@ mod font_tests {
     /// CDE's Xsession adds `/usr/dt/etc/cde/fontaliases`, a directory
     /// with a fonts.alias and no fonts.dir, which Xorg takes
     /// (`FontFileReadDirectory`); its patterns then open through the
-    /// aliases (`FontFileFindNameInDir`), past one whose target is not
-    /// installed. Measured with CDE's
-    /// `-dt-interface system-medium-r-normal-s*-…-ISO8859-1` in vng.
+    /// aliases (`FontFileFindNameInDir`). The first match in `strcmpn`
+    /// order decides: an alias whose target is not installed makes the
+    /// name BadName (`doOpenFont`), ListFonts leaves it out and
+    /// ListFontsWithInfo reports a resolved alias by its target name
+    /// (`doListFontsAndAliases`, `doListFontsWithInfo`; the font-list vng
+    /// scenario compares these with Xorg).
     #[test]
     fn an_alias_only_directory_joins_the_path_and_opens_by_pattern() {
         let fonts = write_test_font_dir("alias-target");
@@ -3424,8 +3505,8 @@ mod font_tests {
         let _ = std::fs::create_dir_all(&aliases);
         std::fs::write(
             aliases.join("fonts.alias"),
-            "\"-dt-interface system-medium-r-normal-s gone-13-130-75-75-m-70-iso8859-1\" no-such-font\n\
-             \"-dt-interface system-medium-r-normal-s serif-13-130-75-75-m-70-iso8859-1\" testfont0\n",
+            "\"-dt-interface system-medium-r-normal-s serif-13-130-75-75-m-70-iso8859-1\" testfont0\n\
+             \"-dt-interface system-medium-r-normal-s gone-13-130-75-75-m-70-iso8859-1\" no-such-font\n",
         )
         .unwrap();
         let mut loader = FontLoader::new().unwrap();
@@ -3436,9 +3517,29 @@ mod font_tests {
             ])
             .expect("an alias-only directory is a valid path element");
         assert!(matches!(
-            loader.resolve("-dt-interface system-medium-r-normal-s*-*-*-*-*-*-*-ISO8859-1"),
+            loader.resolve("-dt-interface system-medium-r-normal-s s*-*-*-*-*-*-*-ISO8859-1"),
             Some(FontResolution::File { .. })
         ));
+        // "s gone" sorts first and leads nowhere.
+        assert!(
+            loader
+                .resolve("-dt-interface system-medium-r-normal-s*-*-*-*-*-*-*-ISO8859-1")
+                .is_none()
+        );
+        assert_eq!(
+            loader.list_font_names("-dt-interface system-*", 10),
+            ["-dt-interface system-medium-r-normal-s serif-13-130-75-75-m-70-iso8859-1"]
+        );
+        // max-names is spent on the alias that leads nowhere.
+        assert!(
+            loader
+                .list_font_names("-dt-interface system-*", 1)
+                .is_empty()
+        );
+        let listed = loader.list_fonts_with_info("-dt-interface system-*", 10);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].reply_name, "testfont0");
+        assert!(matches!(listed[0].res, FontResolution::File { .. }));
         let empty =
             std::env::temp_dir().join(format!("yserver-font-test-empty-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&empty);
