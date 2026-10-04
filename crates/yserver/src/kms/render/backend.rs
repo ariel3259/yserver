@@ -23742,10 +23742,48 @@ impl KmsBackend {
         drm_fd: std::os::fd::RawFd,
     ) -> io::Result<crate::kms::render::platform::DrainedPageFlipEvents> {
         if self.core_driver_has_drm_event_for_fd_for_tests(drm_fd) {
+            let mut flipped = Vec::new();
+            for (device_key, event) in &self.core_driver_drm_events_for_tests {
+                let Some(device) = self.platform.device_for_key(*device_key) else {
+                    continue;
+                };
+                if std::os::fd::AsRawFd::as_raw_fd(&device.device.as_fd()) != drm_fd {
+                    continue;
+                }
+                let crate::drm::event_stream::DrmEventRecord::PageFlip {
+                    crtc_id,
+                    sequence,
+                    tv_sec,
+                    tv_usec,
+                    ..
+                } = event
+                else {
+                    continue;
+                };
+                let Some(output_idx) = self.platform.outputs.iter().position(|output| {
+                    output.key.device_key == *device_key
+                        && u32::from(output.output.crtc) == *crtc_id
+                }) else {
+                    continue;
+                };
+                let ust = u64::from(*tv_sec)
+                    .saturating_mul(1_000_000)
+                    .saturating_add(u64::from(*tv_usec));
+                flipped.push((
+                    output_idx,
+                    yserver_core::backend::PresentClockSample {
+                        msc: u64::from(*sequence),
+                        ust,
+                        source: yserver_core::backend::PresentClockSource::PageFlip,
+                    },
+                ));
+            }
+            let owner_event_batches =
+                self.drain_core_driver_drm_events_for_tests(drm_fd, std::time::Instant::now());
             return Ok(crate::kms::render::platform::DrainedPageFlipEvents {
-                flipped: Vec::new(),
+                flipped,
                 sequences: Vec::new(),
-                owner_event_batches: Vec::new(),
+                owner_event_batches,
             });
         }
         self.platform.drain_page_flip_events(drm_fd)
@@ -71767,6 +71805,50 @@ mod tests {
         )
     }
 
+    fn c0_3bi_core_driver_until_with_boundary_observer(
+        backend: &mut super::KmsBackend,
+        label: &str,
+        timeout: std::time::Duration,
+        done: &dyn Fn(&super::KmsBackend) -> bool,
+        observer: &dyn Fn(&super::KmsBackend),
+    ) -> Result<(), String> {
+        let mut state = ServerState::new();
+        c0_3bi_core_driver_until_mode_with_options_and_observer(
+            backend,
+            &mut state,
+            label,
+            timeout,
+            done,
+            None,
+            false,
+            false,
+            false,
+            Some(observer),
+        )
+    }
+
+    fn c0_3bi_core_driver_until_with_state_and_boundary_observer(
+        backend: &mut super::KmsBackend,
+        state: &mut ServerState,
+        label: &str,
+        timeout: std::time::Duration,
+        done: &dyn Fn(&super::KmsBackend) -> bool,
+        observer: &dyn Fn(&super::KmsBackend),
+    ) -> Result<(), String> {
+        c0_3bi_core_driver_until_mode_with_options_and_observer(
+            backend,
+            state,
+            label,
+            timeout,
+            done,
+            None,
+            false,
+            false,
+            false,
+            Some(observer),
+        )
+    }
+
     fn c0_3bi_core_driver_until_with_state(
         backend: &mut super::KmsBackend,
         state: &mut ServerState,
@@ -71851,11 +71933,15 @@ mod tests {
         backend: &mut super::KmsBackend,
         state: &mut ServerState,
         hardware_complete: Option<&Rc<RefCell<HashSet<crate::kms::owner::identity::CommitId>>>>,
+        observer: Option<&dyn Fn(&super::KmsBackend)>,
     ) {
         let mut deliveries = Vec::new();
         yserver_core::core_loop::run::run_iteration_tail_for_tests(state, backend, &mut deliveries);
         backend.core_entry_deliveries_for_tests.extend(deliveries);
         c0_3bi_collect_hardware_completes_for_tests(backend, hardware_complete);
+        if let Some(observer) = observer {
+            observer(backend);
+        }
     }
 
     fn c0_3bi_core_driver_until_mode(
@@ -71892,6 +71978,32 @@ mod tests {
         stop_immediately_when_done: bool,
         stop_before_iteration_tail_when_done: bool,
     ) -> Result<(), String> {
+        c0_3bi_core_driver_until_mode_with_options_and_observer(
+            backend,
+            state,
+            label,
+            timeout,
+            done,
+            hardware_complete,
+            stop_when_done_before_crtc_result,
+            stop_immediately_when_done,
+            stop_before_iteration_tail_when_done,
+            None,
+        )
+    }
+
+    fn c0_3bi_core_driver_until_mode_with_options_and_observer(
+        backend: &mut super::KmsBackend,
+        state: &mut ServerState,
+        label: &str,
+        timeout: std::time::Duration,
+        done: &dyn Fn(&super::KmsBackend) -> bool,
+        hardware_complete: Option<&Rc<RefCell<HashSet<crate::kms::owner::identity::CommitId>>>>,
+        stop_when_done_before_crtc_result: bool,
+        stop_immediately_when_done: bool,
+        stop_before_iteration_tail_when_done: bool,
+        observer: Option<&dyn Fn(&super::KmsBackend)>,
+    ) -> Result<(), String> {
         use std::time::Instant;
         let end = Instant::now() + timeout;
         let sources = Backend::poll_fds(backend);
@@ -71908,7 +72020,7 @@ mod tests {
                     .core_entry_trace_for_tests
                     .borrow_mut()
                     .push("vt_release");
-                c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete);
+                c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete, observer);
                 continue;
             }
             if backend.core_driver_vt_acquires_for_tests > 0 {
@@ -71918,7 +72030,7 @@ mod tests {
                     .core_entry_trace_for_tests
                     .borrow_mut()
                     .push("vt_acquire");
-                c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete);
+                c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete, observer);
                 continue;
             }
             if let Some(observed) = hardware_complete {
@@ -71933,7 +72045,7 @@ mod tests {
                 && done(backend)
             {
                 let _bounded_wait = Backend::next_wakeup(backend);
-                c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete);
+                c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete, observer);
                 return Ok(());
             }
             // A test backend has no CoreSender. Treat the queued notification
@@ -71942,7 +72054,7 @@ mod tests {
             if !backend.ready_crtc_config_announcements.is_empty() {
                 let _bounded_wait = Backend::next_wakeup(backend);
                 c0_3bi_finish_announced_crtc_configs(backend, state)?;
-                c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete);
+                c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete, observer);
                 if done(backend)
                     && (stop_immediately_when_done
                         || (backend.ready_crtc_config_announcements.is_empty()
@@ -71960,7 +72072,7 @@ mod tests {
                 backend.core_driver_script_notification_count_for_tests -= 1;
                 let _bounded_wait = Backend::next_wakeup(backend);
                 c0_3bi_finish_announced_crtc_configs(backend, state)?;
-                c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete);
+                c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete, observer);
                 if done(backend)
                     && (stop_immediately_when_done
                         || (backend.ready_crtc_config_announcements.is_empty()
@@ -71983,7 +72095,7 @@ mod tests {
                 };
                 let _bounded_wait = Backend::next_wakeup(backend);
                 Backend::on_page_flip_ready(backend, state, fd);
-                c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete);
+                c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete, observer);
                 if done(backend)
                     && (stop_immediately_when_done
                         || (backend.core_driver_drm_events_for_tests.is_empty()
@@ -71999,7 +72111,7 @@ mod tests {
                     return Ok(());
                 }
                 let _bounded_wait = Backend::next_wakeup(backend);
-                c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete);
+                c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete, observer);
                 return Ok(());
             }
 
@@ -72040,7 +72152,7 @@ mod tests {
                 if stop_before_iteration_tail_when_done && done(backend) {
                     return Ok(());
                 }
-                c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete);
+                c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete, observer);
                 if done(backend)
                     && (stop_immediately_when_done
                         || (backend.ready_crtc_config_announcements.is_empty()
@@ -72064,7 +72176,7 @@ mod tests {
                             .map(|(_, commit)| commit),
                     );
                 }
-                c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete);
+                c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete, observer);
                 if done(backend)
                     && (stop_immediately_when_done
                         || (backend.ready_crtc_config_announcements.is_empty()
@@ -72088,7 +72200,7 @@ mod tests {
                             .map(|(_, commit)| commit),
                     );
                 }
-                c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete);
+                c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete, observer);
                 if done(backend)
                     && (stop_immediately_when_done
                         || (backend.ready_crtc_config_announcements.is_empty()
@@ -72181,7 +72293,7 @@ mod tests {
             if stop_before_iteration_tail_when_done && done(backend) {
                 return Ok(());
             }
-            c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete);
+            c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete, observer);
             if done(backend)
                 && (stop_immediately_when_done
                     || (backend.ready_crtc_config_announcements.is_empty()
@@ -72314,10 +72426,43 @@ mod tests {
         commit: crate::kms::owner::identity::CommitId,
         label: &str,
     ) {
+        c0_3bi_complete_owner_commit_through_core_driver_with_state_and_observer(
+            backend, state, device, commit, label, None,
+        );
+    }
+
+    fn c0_3bi_complete_owner_commit_through_core_driver_with_state_and_observer(
+        backend: &mut super::KmsBackend,
+        state: &mut ServerState,
+        device: DrmDeviceKey,
+        commit: crate::kms::owner::identity::CommitId,
+        label: &str,
+        observer: Option<&dyn Fn(&super::KmsBackend)>,
+    ) {
         use crate::{drm::event_stream::DrmEventRecord, kms::owner::device::OwnerEvent};
 
         let target = commit;
-        c0_3bi_wait_owner_commit_accepted(backend, device, target, label);
+        if let Some(observer) = observer {
+            c0_3bi_core_driver_until_with_state_and_boundary_observer(
+                backend,
+                state,
+                &format!("{label}: wait for Owner acceptance"),
+                std::time::Duration::from_secs(3),
+                &|backend| {
+                    backend
+                        .platform
+                        .owner_ref(device)
+                        .and_then(|owner| owner.live_record())
+                        .is_some_and(|record| {
+                            record.commit_id() == target && record.milestones().accepted
+                        })
+                },
+                observer,
+            )
+            .unwrap_or_else(|error| panic!("{error}"));
+        } else {
+            c0_3bi_wait_owner_commit_accepted(backend, device, target, label);
+        }
         let (event_token, present_crtcs) = {
             let owner = backend.platform.owner_ref(device).expect("Owner device");
             let record = owner
@@ -72369,23 +72514,35 @@ mod tests {
                 },
             ));
         }
-        c0_3bi_core_driver_until_with_state(
-            backend,
-            state,
-            label,
-            std::time::Duration::from_secs(3),
-            &|backend| {
-                backend
-                    .platform
-                    .owner_ref(device)
-                    .and_then(|owner| owner.live_record())
-                    .is_none_or(|record| record.commit_id() != target)
-                    && backend.core_driver_owner_events_for_tests.is_empty()
-                    && backend.core_driver_drm_events_for_tests.is_empty()
-            },
-            None,
-        )
-        .unwrap_or_else(|error| {
+        let done = |backend: &super::KmsBackend| {
+            backend
+                .platform
+                .owner_ref(device)
+                .and_then(|owner| owner.live_record())
+                .is_none_or(|record| record.commit_id() != target)
+                && backend.core_driver_owner_events_for_tests.is_empty()
+                && backend.core_driver_drm_events_for_tests.is_empty()
+        };
+        let driven = if let Some(observer) = observer {
+            c0_3bi_core_driver_until_with_state_and_boundary_observer(
+                backend,
+                state,
+                label,
+                std::time::Duration::from_secs(3),
+                &done,
+                observer,
+            )
+        } else {
+            c0_3bi_core_driver_until_with_state(
+                backend,
+                state,
+                label,
+                std::time::Duration::from_secs(3),
+                &done,
+                None,
+            )
+        };
+        driven.unwrap_or_else(|error| {
             panic!(
                 "{error}; target={target:?}; live={:?}",
                 backend
@@ -82760,21 +82917,6 @@ mod tests {
         let mut backend = backend_with_current_and_successor_for_admission_seam();
         let device = backend.platform.primary_device().unwrap().key;
         install_admission_owner_gate(&mut backend, device);
-        let reservation = backend
-            .commit_consumer
-            .capacity
-            .reserve(DirectRole::OrdinaryRetirement)
-            .expect("ordinary retirement reservation");
-        let occupied = backend
-            .commit_consumer
-            .capacity
-            .attach(
-                reservation,
-                CommitResources::new(vec![], None, None, None, vec![], vec![]),
-            )
-            .expect("ordinary retirement attachment");
-        backend.commit_consumer.releasing_resources.push(occupied);
-
         let (source, readiness, _) = AdmissionSourceFixture::new();
         AdmissionSourceFixture::set_readiness(
             &readiness,
@@ -82790,6 +82932,31 @@ mod tests {
                 .admission_offer_direct(device, source_id, candidate, event)
                 .expect("direct offer")
         );
+        assert_eq!(
+            backend
+                .admission_snapshot(device, true)
+                .expect("direct successor snapshot")
+                .readiness(IntentKey::Direct {
+                    source_generation: 1,
+                }),
+            Some(Readiness::Ready),
+            "the direct successor is independently ready before the loop wake"
+        );
+
+        let reservation = backend
+            .commit_consumer
+            .capacity
+            .reserve(DirectRole::OrdinaryRetirement)
+            .expect("ordinary retirement reservation");
+        let occupied = backend
+            .commit_consumer
+            .capacity
+            .attach(
+                reservation,
+                CommitResources::new(vec![], None, None, None, vec![], vec![]),
+            )
+            .expect("ordinary retirement attachment");
+        backend.commit_consumer.releasing_resources.push(occupied);
 
         let snapshot = backend
             .admission_snapshot(device, false)
@@ -83572,7 +83739,19 @@ mod tests {
         composed_crtc: u32,
         generation: u64,
         current_composed_bos: Vec<(usize, usize)>,
+        pre_hold_commit_keys: std::collections::BTreeSet<crate::kms::render::resources::CommitKey>,
+        pre_hold_allocation_keys:
+            std::collections::BTreeSet<crate::kms::render::resources::AllocationKey>,
     }
+
+    type C0DirectHoldReadiness = std::rc::Rc<
+        std::cell::RefCell<
+            std::collections::BTreeMap<
+                crate::kms::owner::admission::IntentKey,
+                crate::kms::owner::admission::Readiness,
+            >,
+        >,
+    >;
 
     #[derive(Clone)]
     struct C0DirectHoldObservation {
@@ -83618,6 +83797,25 @@ mod tests {
                 (output_idx, identity.bo_idx)
             })
             .collect::<Vec<_>>();
+        let pre_hold_commit_keys = backend
+            .commit_consumer
+            .current_resources
+            .iter()
+            .filter(|resources| resources.direct_role.is_none())
+            .filter_map(|resources| resources.commit_id)
+            .collect();
+        let pre_hold_allocation_keys = backend
+            .commit_consumer
+            .current_resources
+            .iter()
+            .filter(|resources| resources.direct_role.is_none())
+            .flat_map(|resources| {
+                resources
+                    .allocations
+                    .iter()
+                    .map(|allocation| allocation.key())
+            })
+            .collect();
 
         let output = backend
             .platform
@@ -83667,16 +83865,20 @@ mod tests {
             composed_crtc,
             generation,
             current_composed_bos,
+            pre_hold_commit_keys,
+            pre_hold_allocation_keys,
         }
     }
 
     fn c0_direct_hold_replace_admission_source_with_waiting_direct(
         backend: &mut super::KmsBackend,
         device: DrmDeviceKey,
-    ) {
+    ) -> C0DirectHoldReadiness {
         use crate::kms::owner::admission::{IntentKey, Readiness, WaitReason};
 
-        let (source, readiness, _) = AdmissionSourceFixture::new();
+        let (source, readiness, _, describe_page_flip, _, _, _, _) =
+            AdmissionSourceFixture::new_with_controls();
+        describe_page_flip.set(true);
         AdmissionSourceFixture::set_readiness(
             &readiness,
             IntentKey::Direct {
@@ -83689,6 +83891,7 @@ mod tests {
             .get_mut(&device)
             .expect("Owner admission conductor")
             .source = source;
+        readiness
     }
 
     fn c0_direct_hold_observe(
@@ -83744,6 +83947,244 @@ mod tests {
         }
     }
 
+    /// Rule 4's boundary checker. The only composed state it exempts is the
+    /// resource state that was already current before M2 first owned a direct
+    /// frame. A direct pending commit must name the M2 frame and its exact new
+    /// ledger resource; its old ledger resource must retain the pre-entry
+    /// composition or the previous direct frame.
+    fn c0_direct_hold_assert_rule4_boundary(
+        backend: &super::KmsBackend,
+        device: DrmDeviceKey,
+        pre_hold_commit_keys: &std::collections::BTreeSet<crate::kms::render::resources::CommitKey>,
+        pre_hold_allocation_keys: &std::collections::BTreeSet<
+            crate::kms::render::resources::AllocationKey,
+        >,
+    ) {
+        use crate::kms::{owner::ledger::LedgerState, render::resources::DirectRole};
+
+        let protected = backend.direct_hold_crtcs_for_device(device);
+        if protected.is_empty() {
+            return;
+        }
+        let transition_active = backend
+            .lifecycle_coordinator
+            .device(&device)
+            .is_some_and(|arbiter| arbiter.transition_tag().is_some());
+        let modeset_active = backend
+            .lifecycle_drivers
+            .get(&device)
+            .is_some_and(|driver| driver.client_modeset.is_some());
+        let unflip_active = backend.scanout_m2.unflip_requested
+            || backend
+                .scanout_m2
+                .owner_unflip_return
+                .as_ref()
+                .is_some_and(|record| record.commit.device == device);
+        if transition_active || modeset_active || unflip_active {
+            return;
+        }
+
+        let allocation_matches =
+            |resources: &crate::kms::render::resources::CommitResources,
+             key: crate::kms::render::resources::AllocationKey| {
+                resources
+                    .allocations
+                    .iter()
+                    .any(|allocation| allocation.key() == key)
+            };
+        let members_match = |resources: &crate::kms::render::resources::CommitResources| {
+            resources
+                .crtcs
+                .iter()
+                .map(|member| u32::from(member.crtc.crtc))
+                .collect::<std::collections::BTreeSet<_>>()
+                == protected
+        };
+
+        // An ordinary primary resource created after the hold began cannot
+        // hide after its Owner record retires: it would become current here.
+        for resources in &backend.commit_consumer.current_resources {
+            let after_hold = resources
+                .commit_id
+                .is_some_and(|commit| !pre_hold_commit_keys.contains(&commit));
+            let is_primary = resources
+                .crtcs
+                .iter()
+                .any(|member| protected.contains(&u32::from(member.crtc.crtc)));
+            assert!(
+                !(after_hold && is_primary && resources.direct_role.is_none()),
+                "rule 4(a): ordinary composed primary {:?} became current after the direct hold began",
+                resources.commit_id
+            );
+        }
+
+        let live_record = backend
+            .platform
+            .owner_ref(device)
+            .and_then(|owner| owner.live_record());
+        let pending_frame = backend
+            .scanout_m2
+            .pending
+            .as_ref()
+            .filter(|frame| frame.commit_id.is_some());
+        if let Some(frame) = pending_frame {
+            let pending_commit = frame.commit_id.expect("filtered committed pending frame");
+            assert_eq!(
+                live_record.map(|record| record.commit_id()),
+                Some(pending_commit.commit),
+                "rule 4(b): a committed M2 pending frame has its exact live Owner record"
+            );
+        }
+        if let Some(record) = live_record {
+            let commit = crate::kms::render::resources::CommitKey::new(device, record.commit_id());
+            let (old_resources, new_resources): (&[_], &[_]) = match record.ledger() {
+                LedgerState::Submitted(submitted) => {
+                    (submitted.old_resources(), submitted.new_resources())
+                }
+                LedgerState::Accepted(accepted) => (accepted.old_resources(), accepted.new()),
+                _ => (&[], &[]),
+            };
+            let is_pending_direct =
+                pending_frame.is_some_and(|frame| frame.commit_id == Some(commit));
+
+            if is_pending_direct {
+                let frame = backend
+                    .scanout_m2
+                    .pending
+                    .as_ref()
+                    .expect("pending direct frame checked above");
+                let framebuffer = frame.framebuffer_lease.as_ref().map(|lease| lease.key());
+                assert_eq!(
+                    frame.commit_id,
+                    Some(commit),
+                    "rule 4(b): pending M2 frame names its dispatched Owner commit"
+                );
+                assert!(
+                    new_resources.iter().any(|resources| {
+                        resources.commit_id == Some(commit)
+                            && resources
+                                .direct_role
+                                .as_ref()
+                                .is_some_and(|role| role.role() == DirectRole::Submitted)
+                            && framebuffer.is_none_or(|key| allocation_matches(resources, key))
+                            && members_match(resources)
+                    }),
+                    "rule 4(b): pending M2 frame is absent from its exact Submitted new ledger state"
+                );
+                let previous_direct = backend.scanout_m2.current.as_ref();
+                let previous_direct_key = previous_direct
+                    .and_then(|current| current.framebuffer_lease.as_ref())
+                    .map(|lease| lease.key());
+                let old_state_retained = old_resources.iter().any(|resources| {
+                    if let Some(previous_direct) = previous_direct {
+                        previous_direct_key.is_some_and(|key| allocation_matches(resources, key))
+                            || previous_direct_key.is_none()
+                                && resources.commit_id == previous_direct.commit_id
+                    } else {
+                        resources
+                            .commit_id
+                            .is_some_and(|old| pre_hold_commit_keys.contains(&old))
+                            || resources.allocations.iter().any(|allocation| {
+                                pre_hold_allocation_keys.contains(&allocation.key())
+                            })
+                    }
+                });
+                assert!(
+                    old_state_retained,
+                    "rule 4(b): pending direct commit did not retain its previous direct or pre-entry composed state"
+                );
+            } else {
+                assert!(
+                    new_resources.iter().all(|resources| {
+                        !resources
+                            .crtcs
+                            .iter()
+                            .any(|member| protected.contains(&u32::from(member.crtc.crtc)))
+                            || resources
+                                .direct_role
+                                .as_ref()
+                                .is_some_and(|role| role.role() == DirectRole::Submitted)
+                    }),
+                    "rule 4(a): an ordinary primary resource crossed Owner dispatch onto the protected set"
+                );
+            }
+        }
+
+        if let Some(frame) = backend.scanout_m2.current.as_ref() {
+            let commit = frame.commit_id.expect("current M2 frame has a commit");
+            let key = frame.framebuffer_lease.as_ref().map(|lease| lease.key());
+            let successor_in_flight = backend.scanout_m2.pending.as_ref().is_some_and(|pending| {
+                pending.commit_id.is_some()
+                    && backend
+                        .device_owner_for_tests(0)
+                        .live_record()
+                        .is_some_and(|record| {
+                            Some(record.commit_id()) == pending.commit_id.map(|id| id.commit)
+                        })
+            });
+            if successor_in_flight {
+                let record = backend
+                    .device_owner_for_tests(0)
+                    .live_record()
+                    .expect("pending direct successor has a live record");
+                let old_resources = match record.ledger() {
+                    LedgerState::Submitted(submitted) => submitted.old_resources(),
+                    LedgerState::Accepted(accepted) => accepted.old_resources(),
+                    _ => &[],
+                };
+                assert!(
+                    old_resources.iter().any(|resources| {
+                        key.is_none_or(|key| allocation_matches(resources, key))
+                            && (key.is_some() || resources.commit_id == Some(commit))
+                    }),
+                    "rule 4(b): in-flight direct successor does not retain the current direct frame"
+                );
+            } else {
+                assert!(
+                    backend
+                        .commit_consumer
+                        .current_resources
+                        .iter()
+                        .any(|resources| {
+                            resources.commit_id == Some(commit)
+                                && resources
+                                    .direct_role
+                                    .as_ref()
+                                    .is_some_and(|role| role.role() == DirectRole::Current)
+                                && key.is_none_or(|key| allocation_matches(resources, key))
+                                && members_match(resources)
+                        }),
+                    "rule 4(b): current M2 direct frame is absent from its exact Current ledger resource"
+                );
+            }
+        }
+    }
+
+    fn c0_direct_hold_record_boundary(
+        backend: &super::KmsBackend,
+        device: DrmDeviceKey,
+        composed_offers: &[(u32, u64)],
+        current_composed_bos: &[(usize, usize)],
+        pre_hold_commit_keys: &std::collections::BTreeSet<crate::kms::render::resources::CommitKey>,
+        pre_hold_allocation_keys: &std::collections::BTreeSet<
+            crate::kms::render::resources::AllocationKey,
+        >,
+        observations: &std::rc::Rc<std::cell::RefCell<Vec<C0DirectHoldObservation>>>,
+    ) {
+        c0_direct_hold_assert_rule4_boundary(
+            backend,
+            device,
+            pre_hold_commit_keys,
+            pre_hold_allocation_keys,
+        );
+        observations.borrow_mut().push(c0_direct_hold_observe(
+            backend,
+            device,
+            composed_offers,
+            current_composed_bos,
+        ));
+    }
+
     fn c0_direct_hold_assert_observations(
         observations: &[C0DirectHoldObservation],
         protected_crtcs: &std::collections::BTreeSet<u32>,
@@ -83796,6 +84237,10 @@ mod tests {
         output_idx: usize,
         bo_idx: usize,
         current_composed_bos: &[(usize, usize)],
+        pre_hold_commit_keys: &std::collections::BTreeSet<crate::kms::render::resources::CommitKey>,
+        pre_hold_allocation_keys: &std::collections::BTreeSet<
+            crate::kms::render::resources::AllocationKey,
+        >,
     ) -> Vec<C0DirectHoldObservation> {
         let (composed_crtc, generation) = offer;
         backend.platform.wait_idle_bounded();
@@ -83820,22 +84265,37 @@ mod tests {
         ));
         let observations = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let observed = std::rc::Rc::clone(&observations);
-        let driven = c0_3bi_core_driver_until_before_iteration_tail(
+        let observer = |backend: &super::KmsBackend| {
+            c0_direct_hold_assert_rule4_boundary(
+                backend,
+                device,
+                pre_hold_commit_keys,
+                pre_hold_allocation_keys,
+            );
+            observed.borrow_mut().push(c0_direct_hold_observe(
+                backend,
+                device,
+                &[offer],
+                current_composed_bos,
+            ));
+        };
+        let mut state = ServerState::new();
+        let driven = c0_3bi_core_driver_until_mode_with_options_and_observer(
             backend,
+            &mut state,
             "complete held composed generation through the core loop",
             std::time::Duration::from_secs(3),
             &|backend| {
-                observed.borrow_mut().push(c0_direct_hold_observe(
-                    backend,
-                    device,
-                    &[offer],
-                    current_composed_bos,
-                ));
                 backend
                     .scene
                     .owner_state_for_generation_for_tests(output_idx, generation)
                     == Some(crate::kms::render::owner_buffer::OwnerBufferState::Desired)
             },
+            None,
+            false,
+            false,
+            false,
+            Some(&observer),
         );
         if let Err(error) = driven {
             panic!(
@@ -83876,6 +84336,10 @@ mod tests {
         device: DrmDeviceKey,
         offers: &[(u32, u64)],
         current_composed_bos: &[(usize, usize)],
+        pre_hold_commit_keys: &std::collections::BTreeSet<crate::kms::render::resources::CommitKey>,
+        pre_hold_allocation_keys: &std::collections::BTreeSet<
+            crate::kms::render::resources::AllocationKey,
+        >,
     ) -> Vec<C0DirectHoldObservation> {
         use crate::kms::{
             owner::{device::OwnerEvent, identity::CommitId, ledger::Submitted},
@@ -83892,20 +84356,32 @@ mod tests {
         ));
         let observations = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let observed = std::rc::Rc::clone(&observations);
-        c0_3bi_core_driver_until(
+        let observer = |backend: &super::KmsBackend| {
+            c0_direct_hold_assert_rule4_boundary(
+                backend,
+                device,
+                pre_hold_commit_keys,
+                pre_hold_allocation_keys,
+            );
+            observed.borrow_mut().push(c0_direct_hold_observe(
+                backend,
+                device,
+                offers,
+                current_composed_bos,
+            ));
+        };
+        let mut state = ServerState::new();
+        c0_3bi_core_driver_until_mode_with_options_and_observer(
             backend,
+            &mut state,
             "deliver Owner retirement wake through the core loop",
             std::time::Duration::from_secs(2),
-            &|backend| {
-                observed.borrow_mut().push(c0_direct_hold_observe(
-                    backend,
-                    device,
-                    offers,
-                    current_composed_bos,
-                ));
-                backend.core_driver_owner_events_for_tests.is_empty()
-            },
+            &|backend| backend.core_driver_owner_events_for_tests.is_empty(),
             None,
+            false,
+            false,
+            false,
+            Some(&observer),
         )
         .expect("core loop routes the retirement batch and wake");
         assert_eq!(
@@ -83963,12 +84439,205 @@ mod tests {
         c0_3bi_assert_end_state(backend, test_name, &expected);
     }
 
+    fn c0_direct_hold_complete_pending_commit(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        commit: crate::kms::owner::identity::CommitId,
+        observer: &dyn Fn(&super::KmsBackend),
+        label: &str,
+    ) {
+        use crate::drm::event_stream::DrmEventRecord;
+
+        c0_3bi_core_driver_until_with_boundary_observer(
+            backend,
+            &format!("{label}: accept direct submission"),
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend
+                    .platform
+                    .owner_ref(device)
+                    .and_then(|owner| owner.live_record())
+                    .is_some_and(|record| {
+                        record.commit_id() == commit && record.milestones().accepted
+                    })
+            },
+            observer,
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "{error}; live={:?}",
+                backend
+                    .platform
+                    .owner_ref(device)
+                    .and_then(|owner| owner.live_record())
+                    .map(|record| (record.commit_id(), record.state(), record.milestones()))
+            )
+        });
+
+        let (event_token, present_crtcs) = {
+            let record = backend
+                .platform
+                .owner_ref(device)
+                .and_then(|owner| owner.live_record())
+                .filter(|record| record.commit_id() == commit)
+                .expect("accepted direct record remains live");
+            (
+                record.event_token().as_user_data(),
+                record
+                    .closure()
+                    .present_event()
+                    .iter()
+                    .copied()
+                    .filter(|crtc| !record.completion_state().observed.contains(crtc))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        backend.platform.owner_completion_detached = true;
+        let device_index = backend
+            .platform
+            .devices
+            .iter()
+            .position(|entry| entry.key == device)
+            .expect("Owner device index");
+        for (index, crtc_id) in present_crtcs.into_iter().enumerate() {
+            let offset = u32::try_from(index).expect("page-flip index fits");
+            backend.core_driver_drm_events_for_tests.push_back((
+                device,
+                DrmEventRecord::PageFlip {
+                    crtc_id,
+                    sequence: 20_000u32.saturating_add(offset),
+                    tv_sec: 20_000u32.saturating_add(offset),
+                    tv_usec: 0,
+                    user_data: event_token,
+                },
+            ));
+        }
+        c0_3bi_core_driver_until_with_boundary_observer(
+            backend,
+            &format!("{label}: present direct submission"),
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend
+                    .platform
+                    .owner_ref(device)
+                    .and_then(|owner| owner.live_record())
+                    .is_some_and(|record| {
+                        record.commit_id() == commit && record.milestones().presented
+                    })
+            },
+            observer,
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "{error}; live={:?}",
+                backend
+                    .platform
+                    .owner_ref(device)
+                    .and_then(|owner| owner.live_record())
+                    .map(|record| (record.commit_id(), record.state(), record.milestones()))
+            )
+        });
+
+        let events = backend.complete_owner_for_tests(device_index);
+        backend
+            .core_driver_owner_events_for_tests
+            .push_back((device, events));
+        c0_3bi_core_driver_until_with_boundary_observer(
+            backend,
+            &format!("{label}: retire direct submission"),
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend
+                    .platform
+                    .owner_ref(device)
+                    .and_then(|owner| owner.live_record())
+                    .is_none_or(|record| record.commit_id() != commit)
+                    && backend.core_driver_owner_events_for_tests.is_empty()
+                    && backend.core_driver_drm_events_for_tests.is_empty()
+            },
+            observer,
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "{error}; live={:?}",
+                backend
+                    .platform
+                    .owner_ref(device)
+                    .and_then(|owner| owner.live_record())
+                    .map(|record| (record.commit_id(), record.state(), record.milestones()))
+            )
+        });
+    }
+
+    fn c0_direct_hold_complete_no_present_commit(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        commit: crate::kms::owner::identity::CommitId,
+        observer: &dyn Fn(&super::KmsBackend),
+        label: &str,
+    ) {
+        c0_3bi_core_driver_until_with_boundary_observer(
+            backend,
+            &format!("{label}: accept Owner commit"),
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend
+                    .platform
+                    .owner_ref(device)
+                    .and_then(|owner| owner.live_record())
+                    .is_some_and(|record| {
+                        record.commit_id() == commit && record.milestones().accepted
+                    })
+            },
+            observer,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        let record = backend
+            .platform
+            .owner_ref(device)
+            .and_then(|owner| owner.live_record())
+            .filter(|record| record.commit_id() == commit)
+            .expect("accepted no-Present Owner commit remains live");
+        assert!(
+            record.closure().present_event().is_empty(),
+            "{label}: this helper is for commits without a Present event"
+        );
+        backend.platform.owner_completion_detached = true;
+        let device_index = backend
+            .platform
+            .devices
+            .iter()
+            .position(|entry| entry.key == device)
+            .expect("Owner device index");
+        let mut events = vec![crate::kms::owner::device::OwnerEvent::HardwareComplete { commit }];
+        events.extend(backend.complete_owner_for_tests(device_index));
+        backend
+            .core_driver_owner_events_for_tests
+            .push_back((device, events));
+        c0_3bi_core_driver_until_with_boundary_observer(
+            backend,
+            &format!("{label}: retire Owner commit"),
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend
+                    .platform
+                    .owner_ref(device)
+                    .and_then(|owner| owner.live_record())
+                    .is_none_or(|record| record.commit_id() != commit)
+                    && backend.core_driver_owner_events_for_tests.is_empty()
+            },
+            observer,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+    }
+
     fn c0_direct_hold_queue_waiting_successor(
         backend: &mut super::KmsBackend,
         device: DrmDeviceKey,
         suffix: u32,
-    ) {
-        c0_direct_hold_replace_admission_source_with_waiting_direct(backend, device);
+    ) -> C0DirectHoldReadiness {
+        let readiness =
+            c0_direct_hold_replace_admission_source_with_waiting_direct(backend, device);
         let (source_id, candidate, event) = admission_direct_candidate(backend, suffix);
         assert!(
             backend
@@ -83978,6 +84647,7 @@ mod tests {
         );
         assert!(backend.scanout_m2.queued_successor.is_some());
         assert!(backend.scanout_m2.queued_successor_role.is_some());
+        readiness
     }
 
     fn c0_direct_hold_assert_offer_pending(
@@ -84071,10 +84741,19 @@ mod tests {
             held.output_idx,
             held.bo_idx,
             &[],
+            &held.pre_hold_commit_keys,
+            &held.pre_hold_allocation_keys,
         );
         c0_direct_hold_assert_no_commit(backend, "production composed offer");
         c0_direct_hold_assert_composed_ready(backend, device, held.composed_crtc, held.generation);
-        let retirement = c0_direct_hold_core_retirement_wake(backend, device, &[offer], &[]);
+        let retirement = c0_direct_hold_core_retirement_wake(
+            backend,
+            device,
+            &[offer],
+            &[],
+            &held.pre_hold_commit_keys,
+            &held.pre_hold_allocation_keys,
+        );
         c0_direct_hold_assert_no_commit(backend, "retirement wake");
         observations.extend(retirement);
         assert_eq!(
@@ -84150,10 +84829,19 @@ mod tests {
             held.output_idx,
             held.bo_idx,
             &[],
+            &held.pre_hold_commit_keys,
+            &held.pre_hold_allocation_keys,
         );
         c0_direct_hold_assert_no_commit(backend, "ready composed offer with queued successor");
         c0_direct_hold_assert_composed_ready(backend, device, held.composed_crtc, held.generation);
-        let retirement = c0_direct_hold_core_retirement_wake(backend, device, &[offer], &[]);
+        let retirement = c0_direct_hold_core_retirement_wake(
+            backend,
+            device,
+            &[offer],
+            &[],
+            &held.pre_hold_commit_keys,
+            &held.pre_hold_allocation_keys,
+        );
         c0_direct_hold_assert_no_commit(backend, "queued-successor retirement wake");
         observations.extend(retirement);
         let ready_snapshot =
@@ -84225,6 +84913,8 @@ mod tests {
             held.output_idx,
             held.bo_idx,
             &held.current_composed_bos,
+            &held.pre_hold_commit_keys,
+            &held.pre_hold_allocation_keys,
         );
         c0_direct_hold_assert_no_commit(backend, "output B composed offer");
         c0_direct_hold_assert_composed_ready(backend, device, held.composed_crtc, held.generation);
@@ -84233,6 +84923,8 @@ mod tests {
             device,
             &[offer],
             &held.current_composed_bos,
+            &held.pre_hold_commit_keys,
+            &held.pre_hold_allocation_keys,
         );
         c0_direct_hold_assert_no_commit(backend, "output B retirement wake");
         observations.extend(retirement);
@@ -84311,6 +85003,8 @@ mod tests {
             held.output_idx,
             held.bo_idx,
             &held.current_composed_bos,
+            &held.pre_hold_commit_keys,
+            &held.pre_hold_allocation_keys,
         );
         c0_direct_hold_assert_no_commit(backend, "first direct entry queued");
         c0_direct_hold_assert_composed_ready(backend, device, held.composed_crtc, held.generation);
@@ -84319,6 +85013,8 @@ mod tests {
             device,
             &[offer],
             &held.current_composed_bos,
+            &held.pre_hold_commit_keys,
+            &held.pre_hold_allocation_keys,
         );
         c0_direct_hold_assert_no_commit(backend, "first-entry retirement wake");
         observations.extend(retirement);
@@ -84359,6 +85055,890 @@ mod tests {
         c0_direct_hold_assert_end_state(
             backend,
             "c0_adm_direct_hold_first_entry_queued_keeps_composed_current_vulkan",
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_adm_direct_hold_pending_successor_correlates_ledger_vulkan() {
+        use crate::kms::owner::admission::{IntentKey, Readiness};
+
+        let mut held = c0_direct_hold_ready_offer_before_entry(1, 0);
+        let backend = &mut held.fixture.backend;
+        let device = held.device;
+        c0_conv_ciii_install_current_direct(backend);
+        c0_3bi_prepare_owner_unflip_reply(backend, device);
+        let predecessor_commit = backend
+            .scanout_m2
+            .current
+            .as_ref()
+            .and_then(|frame| frame.commit_id)
+            .expect("stable predecessor direct frame has a commit");
+        let readiness = c0_direct_hold_queue_waiting_successor(backend, device, 92);
+        AdmissionSourceFixture::set_readiness(
+            &readiness,
+            IntentKey::Direct {
+                source_generation: 1,
+            },
+            Readiness::Ready,
+        );
+        assert_eq!(
+            backend
+                .admission_snapshot(device, true)
+                .expect("direct successor readiness snapshot")
+                .readiness(IntentKey::Direct {
+                    source_generation: 1,
+                }),
+            Some(Readiness::Ready),
+            "the queued successor is independently ready before the loop wake"
+        );
+        let protected = backend.direct_hold_crtcs_for_device(device);
+        let offer = (held.composed_crtc, held.generation);
+        let mut observations = c0_direct_hold_core_render_completion(
+            backend,
+            device,
+            offer,
+            held.output_idx,
+            held.bo_idx,
+            &[],
+            &held.pre_hold_commit_keys,
+            &held.pre_hold_allocation_keys,
+        );
+        let wake = c0_direct_hold_core_retirement_wake(
+            backend,
+            device,
+            &[offer],
+            &[],
+            &held.pre_hold_commit_keys,
+            &held.pre_hold_allocation_keys,
+        );
+        observations.extend(wake);
+        let pending_observations = observations
+            .iter()
+            .filter(|observation| observation.has_pending)
+            .collect::<Vec<_>>();
+        assert!(!pending_observations.is_empty());
+        for observation in pending_observations {
+            assert_eq!(observation.protected, protected);
+            assert!(
+                observation.has_current,
+                "the predecessor remains M2 current"
+            );
+            assert!(observation.has_pending, "the successor is submitted");
+            assert!(!observation.has_queued);
+            assert!(
+                !observation.current_role,
+                "the predecessor is retained in pending.old"
+            );
+            assert_eq!(
+                observation.live_commit,
+                backend
+                    .scanout_m2
+                    .pending
+                    .as_ref()
+                    .and_then(|frame| frame.commit_id)
+                    .map(|key| key.commit)
+            );
+        }
+        let pending = backend
+            .scanout_m2
+            .pending
+            .as_ref()
+            .expect("direct successor remains pending");
+        let direct_commit = pending.commit_id.expect("pending successor commit");
+        assert_eq!(
+            backend
+                .admission_snapshot(device, true)
+                .expect("held direct snapshot")
+                .readiness(IntentKey::Composed {
+                    crtc: held.composed_crtc,
+                    generation: held.generation,
+                }),
+            Some(Readiness::Waiting(
+                crate::kms::owner::admission::WaitReason::DirectFrameHeld
+            ))
+        );
+        let record = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("direct successor's live record");
+        assert_eq!(record.commit_id(), direct_commit.commit);
+        let crate::kms::owner::ledger::LedgerState::Submitted(submitted) = record.ledger() else {
+            panic!("pending direct successor retains its Submitted ledger");
+        };
+        assert!(submitted.new_resources().iter().any(|resources| {
+            resources.commit_id == Some(direct_commit)
+                && resources.direct_role.as_ref().is_some_and(|role| {
+                    role.role() == crate::kms::render::resources::DirectRole::Submitted
+                })
+        }));
+        assert!(
+            submitted
+                .old_resources()
+                .iter()
+                .any(|resources| { resources.commit_id == Some(predecessor_commit) })
+        );
+        assert_eq!(
+            backend.admission_wake(device, true),
+            crate::kms::render::admission::AdmissionOutcome::SlotBusy,
+            "pending direct submission occupies the device slot before readiness is considered"
+        );
+
+        let observed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let observer = |backend: &super::KmsBackend| {
+            c0_direct_hold_record_boundary(
+                backend,
+                device,
+                &[offer],
+                &[],
+                &held.pre_hold_commit_keys,
+                &held.pre_hold_allocation_keys,
+                &observed,
+            );
+        };
+        c0_direct_hold_complete_pending_commit(
+            backend,
+            device,
+            direct_commit.commit,
+            &observer,
+            "retire held direct successor through core entries",
+        );
+        assert!(backend.scanout_m2.current.is_some());
+        assert!(backend.scanout_m2.pending.is_none());
+        assert!(observed.borrow().iter().any(|observation| {
+            observation.has_current && !observation.has_pending && observation.current_role
+        }));
+        assert_eq!(
+            backend
+                .scanout_m2
+                .current
+                .as_ref()
+                .and_then(|frame| frame.commit_id),
+            Some(direct_commit)
+        );
+        c0_direct_hold_assert_offer_pending(
+            backend,
+            device,
+            held.output_idx,
+            held.composed_crtc,
+            held.generation,
+        );
+        c0_direct_hold_assert_end_state(
+            backend,
+            "c0_adm_direct_hold_pending_successor_correlates_ledger_vulkan",
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_adm_direct_hold_first_entry_pending_correlates_composed_predecessor_vulkan() {
+        use crate::kms::owner::admission::{IntentKey, Readiness};
+
+        let mut held = c0_direct_hold_ready_offer_before_entry(1, 0);
+        let backend = &mut held.fixture.backend;
+        let device = held.device;
+        c0_3bi_prepare_owner_unflip_reply(backend, device);
+        let readiness = c0_direct_hold_queue_waiting_successor(backend, device, 93);
+        AdmissionSourceFixture::set_readiness(
+            &readiness,
+            IntentKey::Direct {
+                source_generation: 1,
+            },
+            Readiness::Ready,
+        );
+        assert!(backend.scanout_m2.current.is_none());
+        let protected = backend.direct_hold_crtcs_for_device(device);
+        let offer = (held.composed_crtc, held.generation);
+        let mut observations = c0_direct_hold_core_render_completion(
+            backend,
+            device,
+            offer,
+            held.output_idx,
+            held.bo_idx,
+            &held.current_composed_bos,
+            &held.pre_hold_commit_keys,
+            &held.pre_hold_allocation_keys,
+        );
+        let wake = c0_direct_hold_core_retirement_wake(
+            backend,
+            device,
+            &[offer],
+            &held.current_composed_bos,
+            &held.pre_hold_commit_keys,
+            &held.pre_hold_allocation_keys,
+        );
+        observations.extend(wake);
+        let pending_observations = observations
+            .iter()
+            .filter(|observation| observation.has_pending)
+            .collect::<Vec<_>>();
+        assert!(!pending_observations.is_empty());
+        for observation in pending_observations {
+            assert_eq!(observation.protected, protected);
+            assert!(!observation.has_current);
+            assert!(!observation.current_role);
+            assert_eq!(observation.pre_entry_current_bos, vec![true]);
+        }
+        let pending = backend
+            .scanout_m2
+            .pending
+            .as_ref()
+            .expect("first direct frame remains pending");
+        let direct_commit = pending.commit_id.expect("pending first-entry commit");
+        let record = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("first direct entry record");
+        assert!(
+            !record.closure().present_event().is_empty(),
+            "direct Owner description must request Present evidence: closure={:?}",
+            record.closure()
+        );
+        assert_eq!(record.commit_id(), direct_commit.commit);
+        let crate::kms::owner::ledger::LedgerState::Submitted(submitted) = record.ledger() else {
+            panic!("first direct entry retains its Submitted ledger");
+        };
+        assert!(submitted.new_resources().iter().any(|resources| {
+            resources.commit_id == Some(direct_commit)
+                && resources.direct_role.as_ref().is_some_and(|role| {
+                    role.role() == crate::kms::render::resources::DirectRole::Submitted
+                })
+        }));
+        assert!(
+            submitted.old_resources().iter().any(|resources| {
+                held.pre_hold_commit_keys
+                    .contains(&resources.commit_id.expect("pre-entry composed commit key"))
+                    || resources
+                        .allocations
+                        .iter()
+                        .any(|allocation| held.pre_hold_allocation_keys.contains(&allocation.key()))
+            }),
+            "the first direct dispatch retains C0 as its old ledger state"
+        );
+        assert_eq!(
+            backend.admission_wake(device, true),
+            crate::kms::render::admission::AdmissionOutcome::SlotBusy,
+            "a pending first entry cannot bypass the occupied device slot"
+        );
+
+        let observed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let observer = |backend: &super::KmsBackend| {
+            c0_direct_hold_record_boundary(
+                backend,
+                device,
+                &[offer],
+                &held.current_composed_bos,
+                &held.pre_hold_commit_keys,
+                &held.pre_hold_allocation_keys,
+                &observed,
+            );
+        };
+        c0_direct_hold_complete_pending_commit(
+            backend,
+            device,
+            direct_commit.commit,
+            &observer,
+            "retire first direct entry through core entries",
+        );
+        assert!(backend.scanout_m2.current.is_some());
+        assert!(backend.scanout_m2.pending.is_none());
+        assert!(observed.borrow().iter().any(|observation| {
+            observation.has_current && !observation.has_pending && observation.current_role
+        }));
+        assert_eq!(
+            backend
+                .scanout_m2
+                .current
+                .as_ref()
+                .and_then(|frame| frame.commit_id),
+            Some(direct_commit)
+        );
+        c0_direct_hold_assert_offer_pending(
+            backend,
+            device,
+            held.output_idx,
+            held.composed_crtc,
+            held.generation,
+        );
+        c0_direct_hold_assert_end_state(
+            backend,
+            "c0_adm_direct_hold_first_entry_pending_correlates_composed_predecessor_vulkan",
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_adm_direct_hold_unflip_retries_failed_shadow_vulkan() {
+        use crate::kms::owner::admission::{IntentKey, Readiness, WaitReason};
+
+        let mut held = c0_direct_hold_ready_offer_before_entry(1, 0);
+        let backend = &mut held.fixture.backend;
+        let device = held.device;
+        let offer = (held.composed_crtc, held.generation);
+        c0_conv_ciii_add_enter_direct_and_retire(backend, device, 930)
+            .expect("enter a real direct frame while the composed offer is rendering");
+        c0_direct_hold_core_render_completion(
+            backend,
+            device,
+            offer,
+            held.output_idx,
+            held.bo_idx,
+            &held.current_composed_bos,
+            &held.pre_hold_commit_keys,
+            &held.pre_hold_allocation_keys,
+        );
+        c0_direct_hold_assert_composed_ready(backend, device, held.composed_crtc, held.generation);
+
+        let protected = backend.direct_hold_crtcs_for_device(device);
+        let observer = |backend: &super::KmsBackend| {
+            c0_direct_hold_assert_rule4_boundary(
+                backend,
+                device,
+                &held.pre_hold_commit_keys,
+                &held.pre_hold_allocation_keys,
+            );
+        };
+        observer(backend);
+        assert_eq!(protected.len(), 1);
+        assert_eq!(
+            backend
+                .admission_snapshot(device, true)
+                .expect("direct-hold snapshot")
+                .readiness(IntentKey::Composed {
+                    crtc: held.composed_crtc,
+                    generation: held.generation,
+                }),
+            Some(Readiness::Waiting(WaitReason::DirectFrameHeld)),
+            "the ready pre-entry composed offer is held by the direct frame"
+        );
+
+        let (original_target, direct_frame_commit) = {
+            let frame = backend
+                .scanout_m2
+                .current
+                .as_mut()
+                .expect("installed direct frame");
+            let original_target = frame.fallback_target;
+            frame.fallback_target = crate::kms::render::target::PaintTarget::new(
+                crate::kms::render::store::DrawableId::for_tests(u64::MAX),
+                (0, 0),
+                None,
+                24,
+            );
+            (
+                original_target,
+                frame.commit_id.expect("current direct commit"),
+            )
+        };
+        c0_3bi_prepare_owner_unflip_reply(backend, device);
+        backend.request_direct_unflip("c0_direct_hold_unflip_retry");
+        assert!(backend.scanout_m2.unflip_requested);
+        assert!(!backend.direct_unflip_shadow_ready());
+        assert!(backend.scanout_m2.current.is_some());
+        assert_eq!(
+            backend
+                .admission_snapshot(device, false)
+                .expect("unflip waits for the failed shadow")
+                .readiness(IntentKey::Unflip),
+            Some(Readiness::Waiting(WaitReason::UnflipShadowNotMaterialized))
+        );
+        assert_eq!(
+            backend
+                .admission_snapshot(device, false)
+                .expect("composed candidate remains queued during unflip wait")
+                .readiness(IntentKey::Composed {
+                    crtc: held.composed_crtc,
+                    generation: held.generation,
+                }),
+            Some(Readiness::Ready),
+            "the ordinary composed offer stays genuinely ready while Ciii waits for its shadow"
+        );
+
+        c0_direct_hold_core_retirement_wake(
+            backend,
+            device,
+            &[offer],
+            &held.current_composed_bos,
+            &held.pre_hold_commit_keys,
+            &held.pre_hold_allocation_keys,
+        );
+        c0_direct_hold_assert_no_commit(backend, "while the Ciii shadow is unavailable");
+        assert!(backend.scanout_m2.current.is_some());
+        assert!(backend.scanout_m2.owner_unflip_return.is_none());
+
+        backend
+            .scanout_m2
+            .current
+            .as_mut()
+            .expect("unflip preparation preserves the M2 current frame")
+            .fallback_target = original_target;
+        assert!(!backend.direct_unflip_shadow_ready());
+
+        c0_3bi_core_driver_until_with_boundary_observer(
+            backend,
+            "retry direct shadow and dispatch Ciii unflip",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend.scanout_m2.owner_unflip_return.is_some()
+                    && backend
+                        .platform
+                        .owner_ref(device)
+                        .and_then(|owner| owner.live_record())
+                        .is_some()
+            },
+            &observer,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert!(backend.direct_unflip_shadow_ready());
+        let unflip = backend
+            .platform
+            .owner_ref(device)
+            .and_then(|owner| owner.live_record())
+            .expect("Ciii unflip dispatch")
+            .commit_id();
+        assert_eq!(
+            backend
+                .scanout_m2
+                .owner_unflip_return
+                .as_ref()
+                .map(|record| record.commit),
+            Some(crate::kms::render::resources::CommitKey::new(
+                device, unflip
+            ))
+        );
+        assert!(
+            backend.scanout_m2.current.is_some(),
+            "M2 retains the direct frame until the Ciii unflip retires"
+        );
+        assert_eq!(
+            backend
+                .scanout_m2
+                .current
+                .as_ref()
+                .and_then(|frame| frame.commit_id),
+            Some(direct_frame_commit),
+            "the direct M2 frame remains identified until unflip retirement"
+        );
+        let unflip_record = backend
+            .platform
+            .owner_ref(device)
+            .and_then(|owner| owner.live_record())
+            .filter(|record| record.commit_id() == unflip)
+            .expect("live Ciii unflip record");
+        let old_resources = match unflip_record.ledger() {
+            crate::kms::owner::ledger::LedgerState::Submitted(submitted) => {
+                submitted.old_resources()
+            }
+            crate::kms::owner::ledger::LedgerState::Accepted(accepted) => accepted.old_resources(),
+            _ => &[],
+        };
+        assert!(
+            old_resources.iter().any(|resources| {
+                resources.commit_id == Some(direct_frame_commit)
+                    && resources.direct_role.as_ref().is_some_and(|role| {
+                        role.role() == crate::kms::render::resources::DirectRole::ExitRetirement
+                    })
+            }),
+            "the unflip retains the direct allocation under its ExitRetirement proof"
+        );
+
+        c0_direct_hold_complete_no_present_commit(
+            backend,
+            device,
+            unflip,
+            &observer,
+            "retire retried Ciii unflip",
+        );
+        assert!(
+            backend.scanout_m2.current.is_none(),
+            "M2 clears only at unflip retirement"
+        );
+        assert!(!backend.scanout_m2.unflip_requested);
+        while let Some(record) = backend
+            .platform
+            .owner_ref(device)
+            .and_then(|owner| owner.live_record())
+        {
+            let commit = record.commit_id();
+            c0_direct_hold_complete_no_present_commit(
+                backend,
+                device,
+                commit,
+                &observer,
+                "retire post-unflip Owner work",
+            );
+        }
+        c0_direct_hold_assert_end_state(
+            backend,
+            "c0_adm_direct_hold_unflip_retries_failed_shadow_vulkan",
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_adm_direct_hold_allows_maintenance_and_vt_release_vulkan() {
+        use crate::kms::{
+            owner::admission::{IntentKey, MaintenanceClass, MaintenanceKey, Readiness},
+            render::admission::MaintenancePayload,
+        };
+        use std::sync::Arc;
+
+        let mut held = c0_direct_hold_ready_offer_before_entry(1, 0);
+        let backend = &mut held.fixture.backend;
+        let device = held.device;
+        c0_conv_ciii_install_current_direct(backend);
+        let offer = (held.composed_crtc, held.generation);
+        c0_direct_hold_core_render_completion(
+            backend,
+            device,
+            offer,
+            held.output_idx,
+            held.bo_idx,
+            &held.current_composed_bos,
+            &held.pre_hold_commit_keys,
+            &held.pre_hold_allocation_keys,
+        );
+        c0_direct_hold_assert_composed_ready(backend, device, held.composed_crtc, held.generation);
+        let protected = backend.direct_hold_crtcs_for_device(device);
+        assert_eq!(protected.len(), 1);
+
+        let (source, readiness, _, _, _) = AdmissionSourceFixture::new_with_snapshot_controls();
+        backend
+            .admission_conductors
+            .get_mut(&device)
+            .expect("Owner conductor")
+            .source = source;
+        c0_3bi_prepare_owner_unflip_reply(backend, device);
+        let generation = 701;
+        let maintenance = MaintenanceKey {
+            crtc: held.composed_crtc,
+            class: MaintenanceClass::Gamma,
+        };
+        AdmissionSourceFixture::set_readiness(
+            &readiness,
+            IntentKey::Maintenance {
+                key: maintenance,
+                generation,
+            },
+            Readiness::Ready,
+        );
+        backend
+            .admission_offer_maintenance(
+                device,
+                maintenance,
+                MaintenancePayload {
+                    generation,
+                    data: Arc::<[u8]>::from(vec![7]),
+                },
+            )
+            .expect("primary-free gamma maintenance offer");
+
+        let observations = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let observed = std::rc::Rc::clone(&observations);
+        let observer = |backend: &super::KmsBackend| {
+            c0_direct_hold_record_boundary(
+                backend,
+                device,
+                &[offer],
+                &held.current_composed_bos,
+                &held.pre_hold_commit_keys,
+                &held.pre_hold_allocation_keys,
+                &observed,
+            );
+        };
+        c0_direct_hold_core_retirement_wake(
+            backend,
+            device,
+            &[offer],
+            &held.current_composed_bos,
+            &held.pre_hold_commit_keys,
+            &held.pre_hold_allocation_keys,
+        );
+        let maintenance_commit = backend
+            .platform
+            .owner_ref(device)
+            .and_then(|owner| owner.live_record())
+            .expect("maintenance commits while ordinary composition is held")
+            .commit_id();
+        let record = backend
+            .platform
+            .owner_ref(device)
+            .and_then(|owner| owner.live_record())
+            .expect("maintenance Owner record");
+        let crate::kms::owner::ledger::LedgerState::Submitted(submitted) = record.ledger() else {
+            panic!("primary-free maintenance keeps its Submitted ledger");
+        };
+        assert!(submitted.new_resources().is_empty());
+        assert!(submitted.old_resources().is_empty());
+        assert!(backend.scanout_m2.current.is_some());
+
+        c0_direct_hold_complete_no_present_commit(
+            backend,
+            device,
+            maintenance_commit,
+            &observer,
+            "retire primary-free maintenance under direct hold",
+        );
+        assert!(observations.borrow().iter().any(|observation| {
+            observation.has_current && !observation.has_pending && observation.current_role
+        }));
+        assert!(backend.scanout_m2.current.is_some());
+        assert!(backend.scanout_m2.pending.is_none());
+        c0_direct_hold_assert_offer_pending(
+            backend,
+            device,
+            held.output_idx,
+            held.composed_crtc,
+            held.generation,
+        );
+
+        backend.vt_skip_master_ioctls_for_tests = true;
+        backend.platform.owner_completion_detached = true;
+        let mut state = ServerState::new();
+        c0_3ci_release_owner_to_suspended_with_boundary_observer(
+            backend,
+            &mut state,
+            device,
+            "release VT while direct hold blocks composition",
+            Some(&observer),
+        );
+        assert_eq!(backend.vt_state, crate::vt::state::VtState::Suspended);
+        assert!(
+            backend
+                .platform
+                .owner_ref(device)
+                .is_some_and(|owner| !owner.is_poisoned() && owner.live_record().is_none()),
+            "known VT release leaves the Owner incarnation healthy and quiescent"
+        );
+        c0_direct_hold_assert_end_state(
+            backend,
+            "c0_adm_direct_hold_allows_maintenance_and_vt_release_vulkan",
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_adm_direct_hold_client_modeset_waits_for_retried_unflip_vulkan() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let (mut fixture, device, output_id, connector, mode, _) =
+            c0_3bi_live_direct_modeset_fixture(StubBehaviour::NeverReply)
+                .expect("environmental skip: live Vulkan direct modeset fixture");
+        let backend = &mut fixture.backend;
+        c0_3bi_prepare_owner_unflip_reply(backend, device);
+        let old_instance = backend
+            .scene
+            .output_instance_id_for_tests(0)
+            .expect("pre-modeset output instance");
+        let baseline_validations = backend.lifecycle_drivers[&device]
+            .client_modeset_test_stats()
+            .0
+            .len();
+        let pre_hold_commit_keys = std::collections::BTreeSet::new();
+        let pre_hold_allocation_keys = std::collections::BTreeSet::new();
+        let boundary_count = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let observed_boundaries = std::rc::Rc::clone(&boundary_count);
+        let observer = |backend: &super::KmsBackend| {
+            c0_direct_hold_assert_rule4_boundary(
+                backend,
+                device,
+                &pre_hold_commit_keys,
+                &pre_hold_allocation_keys,
+            );
+            observed_boundaries.set(observed_boundaries.get().saturating_add(1));
+        };
+
+        let original_target = {
+            let frame = backend
+                .scanout_m2
+                .current
+                .as_mut()
+                .expect("stable direct frame before modeset");
+            let target = frame.fallback_target;
+            frame.fallback_target = crate::kms::render::target::PaintTarget::new(
+                crate::kms::render::store::DrawableId::for_tests(u64::MAX),
+                (0, 0),
+                None,
+                24,
+            );
+            target
+        };
+        let token = c0_3bi_begin_client_modeset(backend, output_id, &connector, Some(mode));
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset_test_stats()
+                .0
+                .len(),
+            baseline_validations,
+            "client TEST_ONLY stays parked while shadow materialization fails"
+        );
+        assert!(backend.scanout_m2.unflip_requested);
+        assert!(!backend.direct_unflip_shadow_ready());
+        assert!(backend.scanout_m2.current.is_some());
+        assert!(backend.scanout_m2.owner_unflip_return.is_none());
+        assert!(backend.device_owner_for_tests(0).live_record().is_none());
+        assert!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset
+                .as_ref()
+                .is_some_and(|slot| {
+                    slot.token == token
+                        && slot.phase == crate::kms::render::admission::ClientModesetPhase::Queued
+                })
+        );
+
+        c0_direct_hold_core_retirement_wake(
+            backend,
+            device,
+            &[],
+            &[],
+            &pre_hold_commit_keys,
+            &pre_hold_allocation_keys,
+        );
+        c0_direct_hold_assert_no_commit(backend, "client modeset waits on failed shadow");
+        assert!(backend.scanout_m2.current.is_some());
+        assert!(backend.scanout_m2.owner_unflip_return.is_none());
+
+        backend
+            .scanout_m2
+            .current
+            .as_mut()
+            .expect("M2 keeps direct current while the modeset waits")
+            .fallback_target = original_target;
+        c0_3bi_core_driver_until_with_boundary_observer(
+            backend,
+            "retry Ciii shadow for queued client modeset",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend.scanout_m2.owner_unflip_return.is_some()
+                    && backend
+                        .platform
+                        .owner_ref(device)
+                        .and_then(|owner| owner.live_record())
+                        .is_some()
+            },
+            &observer,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        let unflip = backend
+            .platform
+            .owner_ref(device)
+            .and_then(|owner| owner.live_record())
+            .expect("retried Ciii unflip")
+            .commit_id();
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset_test_stats()
+                .0
+                .len(),
+            baseline_validations,
+            "the modeset stays queued until its unflip retires"
+        );
+        assert!(backend.scanout_m2.current.is_some());
+        assert_eq!(
+            backend
+                .scanout_m2
+                .owner_unflip_return
+                .as_ref()
+                .map(|record| record.commit),
+            Some(crate::kms::render::resources::CommitKey::new(
+                device, unflip
+            ))
+        );
+
+        c0_direct_hold_complete_no_present_commit(
+            backend,
+            device,
+            unflip,
+            &observer,
+            "retire unflip before resuming client modeset",
+        );
+        assert!(backend.scanout_m2.current.is_none());
+        assert!(backend.scanout_m2.owner_unflip_return.is_none());
+        let (validation_sends, _) = backend.lifecycle_drivers[&device].client_modeset_test_stats();
+        assert_eq!(
+            validation_sends.len(),
+            baseline_validations + 1,
+            "client TEST_ONLY starts only after the Ciii unflip retires"
+        );
+        let tag = backend.lifecycle_drivers[&device]
+            .client_modeset
+            .as_ref()
+            .filter(|slot| slot.token == token)
+            .expect("client modeset resumes after unflip retirement")
+            .tag;
+        c0_3bi_core_driver_until_with_boundary_observer(
+            backend,
+            "dispatch client modeset after direct retirement",
+            std::time::Duration::from_secs(5),
+            &|backend| {
+                backend
+                    .lifecycle_drivers
+                    .get(&device)
+                    .and_then(|driver| driver.client_modeset_commit_for_tests(tag))
+                    .is_some_and(|commit| {
+                        backend
+                            .platform
+                            .owner_ref(device)
+                            .and_then(|owner| owner.live_record())
+                            .is_some_and(|record| record.commit_id() == commit)
+                    })
+            },
+            &observer,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset_test_stats()
+                .1,
+            vec![tag],
+            "the live client modeset dispatch occurs after the unflip retirement"
+        );
+        let modeset_commit = backend
+            .lifecycle_drivers
+            .get(&device)
+            .and_then(|driver| driver.client_modeset_commit_for_tests(tag))
+            .expect("dispatched client modeset commit");
+        assert!(backend.scanout_m2.current.is_none());
+        c0_direct_hold_complete_no_present_commit(
+            backend,
+            device,
+            modeset_commit,
+            &observer,
+            "complete dispatched client modeset",
+        );
+        assert!(
+            c0_3bi_take_crtc_config_result(backend, token)
+                .expect("client modeset result after live commit")
+        );
+        c0_3bi_core_driver_until_with_boundary_observer(
+            backend,
+            "settle retired output render completion",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend
+                    .scene
+                    .retired_output_end_states_for_tests()
+                    .into_iter()
+                    .find(|bundle| bundle.instance == old_instance)
+                    .is_none_or(|bundle| bundle.gpu_fence_proofs == 0)
+            },
+            &observer,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert!(boundary_count.get() > 0);
+        let mut end_state = c0_3bi_expected_end_state([OutputKey::new(device, connector.clone())]);
+        end_state.retained_bundles.push(C0ExpectedRetiredBundle {
+            instance: old_instance,
+            proofs: vec![
+                C0RetiredProofKind::KmsRelease,
+                C0RetiredProofKind::OwnerBuffer,
+            ],
+        });
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_adm_direct_hold_client_modeset_waits_for_retried_unflip_vulkan",
+            &end_state,
         );
     }
 
@@ -87579,8 +89159,9 @@ mod tests {
                 AdmissionTraceStep::Decided,
                 AdmissionTraceStep::Dispatched(
                     backend
-                        .device_owner_for_tests(0)
-                        .live_record()
+                        .platform
+                        .owner_ref(device)
+                        .and_then(|owner| owner.live_record())
                         .expect("successor dispatched")
                         .commit_id(),
                 ),
@@ -111912,7 +113493,25 @@ mod tests {
         device: DrmDeviceKey,
         label: &str,
     ) {
-        c0_3ci_release_owners_to_suspended(backend, state, &[device], label);
+        c0_3ci_release_owner_to_suspended_with_boundary_observer(
+            backend, state, device, label, None,
+        );
+    }
+
+    fn c0_3ci_release_owner_to_suspended_with_boundary_observer(
+        backend: &mut super::KmsBackend,
+        state: &mut ServerState,
+        device: DrmDeviceKey,
+        label: &str,
+        observer: Option<&dyn Fn(&super::KmsBackend)>,
+    ) {
+        c0_3ci_release_owners_to_suspended_with_boundary_observer(
+            backend,
+            state,
+            &[device],
+            label,
+            observer,
+        );
     }
 
     fn c0_3ci_release_owners_to_suspended(
@@ -111920,6 +113519,18 @@ mod tests {
         state: &mut ServerState,
         devices: &[DrmDeviceKey],
         label: &str,
+    ) {
+        c0_3ci_release_owners_to_suspended_with_boundary_observer(
+            backend, state, devices, label, None,
+        );
+    }
+
+    fn c0_3ci_release_owners_to_suspended_with_boundary_observer(
+        backend: &mut super::KmsBackend,
+        state: &mut ServerState,
+        devices: &[DrmDeviceKey],
+        label: &str,
+        observer: Option<&dyn Fn(&super::KmsBackend)>,
     ) {
         use std::time::{Duration, Instant};
 
@@ -111963,12 +113574,23 @@ mod tests {
                 };
                 let completion_label =
                     format!("{label}: synthetic kernel completion on {device} for {commit:?}");
-                c0_3bi_complete_owner_commit_through_core_driver(
-                    backend,
-                    device,
-                    commit,
-                    &completion_label,
-                );
+                if let Some(observer) = observer {
+                    c0_3bi_complete_owner_commit_through_core_driver_with_state_and_observer(
+                        backend,
+                        state,
+                        device,
+                        commit,
+                        &completion_label,
+                        Some(observer),
+                    );
+                } else {
+                    c0_3bi_complete_owner_commit_through_core_driver(
+                        backend,
+                        device,
+                        commit,
+                        &completion_label,
+                    );
+                }
                 completed_record = true;
             }
             if completed_record || is_settled(backend) {
@@ -112004,24 +113626,36 @@ mod tests {
                     })
                     .collect::<Vec<_>>()
             );
-            c0_3bi_core_driver_until_with_state(
-                backend,
-                state,
-                &format!("{label}: wait for the next release transaction"),
-                remaining,
-                &|backend| {
-                    is_settled(backend)
-                        || devices.iter().any(|device| {
-                            backend
-                                .platform
-                                .owner_ref(*device)
-                                .and_then(|owner| owner.live_record())
-                                .is_some()
-                        })
-                },
-                None,
-            )
-            .unwrap_or_else(|error| panic!("{label}: {error}"));
+            let done = |backend: &super::KmsBackend| {
+                is_settled(backend)
+                    || devices.iter().any(|device| {
+                        backend
+                            .platform
+                            .owner_ref(*device)
+                            .and_then(|owner| owner.live_record())
+                            .is_some()
+                    })
+            };
+            let driven = if let Some(observer) = observer {
+                c0_3bi_core_driver_until_with_state_and_boundary_observer(
+                    backend,
+                    state,
+                    &format!("{label}: wait for the next release transaction"),
+                    remaining,
+                    &done,
+                    observer,
+                )
+            } else {
+                c0_3bi_core_driver_until_with_state(
+                    backend,
+                    state,
+                    &format!("{label}: wait for the next release transaction"),
+                    remaining,
+                    &done,
+                    None,
+                )
+            };
+            driven.unwrap_or_else(|error| panic!("{label}: {error}"));
         }
         for device in devices {
             assert!(
