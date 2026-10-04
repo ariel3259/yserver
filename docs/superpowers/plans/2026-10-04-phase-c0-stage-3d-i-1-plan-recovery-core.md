@@ -8,6 +8,12 @@
 > prompt; the coordinator re-runs them before each commit. Every other `c0_hw_*`, `_drm` or
 > `render_acceptance` test stays forbidden. No git writes.
 
+**Revision 4 (2026-10-04, coordinator) — implementation stop on Task 1, confirmed:** the registry's
+family-closure mint does not hold the last reference to the DRM device — `DeviceCleanupIo` keeps an `Rc`
+clone (`drm_cleanup.rs` ~265), `KmsDevice.device` keeps one (`platform.rs` ~2544) and stays in `poll_fds` —
+so `try_mint_file_family_closed` can mint a closure proof while the fd is open (a 2c-i defect: "if it
+affects us, it is ours"). Task 1 now fixes the mint and detaches the device first (see Task 1, **IN-0**).
+
 **Revision 3 (2026-10-04, coordinator) — review loop closed after round 2** (0 blocking, 1 major,
 `../findings/2026-10-04-stage-3d-i-1-plan-review-round2.md`; all round-1 findings applied, M-2 partial):
 no design defect remains (user's convergence rule). Folded in without another round: Task 6 runs the
@@ -127,7 +133,15 @@ submitter is detached, and the cleanup registry minted the family closure. **Seq
 release every lease holder (reap children, join workers); (2) close the control alias and discharge every
 other accounted alias; (3) obtain the closure proof through `try_mint_file_family_closed`, which performs
 the final close. The control close is step 2, never before step 1, and is never itself taken as the
-family-closure proof. On the `Poisoned` entry the
+family-closure proof.
+
+**IN-0 (rev 4, implementation stop):** the mint must be a real last close. (a) Step 2 also detaches the
+device from the platform: the `KmsDevice` entry's `Rc<drm::Device>` is moved out of the entry (the entry
+itself moves to the transition's quarantine without a device handle) and the device's fd leaves
+`poll_fds`. (b) `try_mint_file_family_closed` drops `DeviceCleanupIo`'s clone and then requires
+`Rc::try_unwrap` on its own handle to succeed before dropping it and returning `FileFamilyClosed`; if any
+other strong reference remains, it returns an error naming the outstanding holder count and mints
+nothing. A closure proof therefore implies the open file description is closed. On the `Poisoned` entry the
 driver stops admission and alias creation, detaches submitters/event readers, requests executor and
 helper termination, and polls the barrier from `before_block`/`next_wakeup` (a wakeup armed while a
 lease is outstanding).
@@ -139,6 +153,7 @@ predicate; a driver hook `on_poisoned(device)` (name free) called from the exist
 | --- | --- | --- |
 | `c0_3di_poison_requests_termination_and_retires_the_family_vulkan` | completion loss → `Poisoned`; the helper is reaped and no worker is live: the barrier mints exactly once, then the old fd set is closed | close the control alias before the lease holders are released; or treat the control close alone as the closure proof |
 | `c0_3di_stuck_probe_worker_blocks_the_barrier_vulkan` | children reaped, one probe worker blocked: the barrier stays false; joining the worker makes it true | count only executor leases |
+| `c0_3di_mint_refuses_while_the_device_is_still_referenced` | an extra `Rc<drm::Device>` is held (as `KmsDevice` held it before IN-0): the mint returns an error and no proof; after the holder is dropped it mints, and the fd is closed (fstat on a dup taken earlier shows the description gone, or the device's fd number is reusable) | mint without `try_unwrap` (drop only the registry's own handle) |
 | `c0_3di_unreaped_helper_blocks_the_barrier_vulkan` | the helper gives no wait status: the barrier stays false and a wakeup stays armed | treat termination request as reap |
 
 **Hardware (M-2):** `c0_hw_3di_poison_retires_family_on_card1_drm` — on card1, a real composed commit's
