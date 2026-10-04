@@ -29,6 +29,7 @@ pub enum WaitReason {
     ExitRetirementOccupied,
     ComposedReturnNotEstablished,
     UnflipShadowNotMaterialized,
+    DirectFrameHeld,
     NotDirectEligible,
     OutputPoweredOff,
 }
@@ -45,6 +46,9 @@ pub struct ReadinessSnapshot {
     pub topology_generation: u64,
     pub retirement_wake: bool,
     pub homogeneous_group: BTreeSet<CrtcId>,
+    /// CRTCs where an ordinary composed primary would overwrite a direct
+    /// frame still owned by M2.
+    pub direct_hold_crtcs: BTreeSet<CrtcId>,
     reports: BTreeMap<IntentKey, Readiness>,
     compatible: BTreeSet<(IntentKey, IntentKey)>,
 }
@@ -56,6 +60,7 @@ impl ReadinessSnapshot {
             topology_generation,
             retirement_wake: false,
             homogeneous_group: BTreeSet::new(),
+            direct_hold_crtcs: BTreeSet::new(),
             reports: BTreeMap::new(),
             compatible: BTreeSet::new(),
         }
@@ -71,6 +76,10 @@ impl ReadinessSnapshot {
 
     pub fn is_ready(&self, key: IntentKey) -> bool {
         self.readiness(key) == Some(Readiness::Ready)
+    }
+
+    pub fn is_direct_hold_protected(&self, crtc: CrtcId) -> bool {
+        self.direct_hold_crtcs.contains(&crtc)
     }
 
     pub fn report_compatible(&mut self, maintenance: IntentKey, primary: IntentKey) {

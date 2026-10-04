@@ -3260,6 +3260,47 @@ impl KmsBackend {
         frame_device.or_else(|| self.platform.primary_device().map(|device| device.key))
     }
 
+    /// The complete CRTC set protected by M2's direct ownership on one device
+    /// (direct-hold addendum, rules 0-1): every output of the grouped direct
+    /// frame's device, not the Present pacing CRTC. Empty once an unflip is
+    /// requested: from then on the Ciii unflip (or its degraded per-output
+    /// composed flips) is what replaces the direct frame, as in Legacy.
+    pub(super) fn direct_hold_crtcs_for_device(
+        &self,
+        device: DrmDeviceKey,
+    ) -> std::collections::BTreeSet<u32> {
+        if self.scanout_m2.unflip_requested {
+            return std::collections::BTreeSet::new();
+        }
+        let frames = [
+            self.scanout_m2.current.as_ref(),
+            self.scanout_m2.pending.as_ref(),
+            self.scanout_m2.queued_successor.as_ref(),
+        ];
+        let owns_device = frames.into_iter().flatten().any(|frame| {
+            frame
+                .members
+                .first()
+                .map(|member| member.crtc.device_key)
+                .or_else(|| {
+                    self.platform
+                        .outputs
+                        .get(frame.completion_output_idx)
+                        .map(|output| output.key.device_key)
+                })
+                == Some(device)
+        });
+        if !owns_device {
+            return std::collections::BTreeSet::new();
+        }
+        self.platform
+            .outputs
+            .iter()
+            .filter(|output| output.key.device_key == device)
+            .map(|output| u32::from(output.output.crtc))
+            .collect()
+    }
+
     pub(crate) fn output_key_for_id(&self, output_id: u32) -> Option<&OutputKey> {
         self.output_key_by_id.get(&output_id)
     }
@@ -60131,6 +60172,34 @@ mod tests {
         backend
     }
 
+    fn backend_with_composed_current_for_admission_seam() -> super::KmsBackend {
+        use crate::kms::render::resources::{CommitResources, GroupMember, ResourceService};
+
+        let mut backend = super::KmsBackend::for_tests();
+        seed_direct_owner_description_properties_for_tests(&mut backend);
+        let device = backend.platform.primary_device().unwrap().key;
+        let crtc = test_crtc_key(device, 1);
+        backend
+            .commit_consumer
+            .current_resources
+            .push(CommitResources::new(
+                Vec::new(),
+                None,
+                None,
+                None,
+                vec![GroupMember::new(crtc, 1, 1)],
+                Vec::new(),
+            ));
+        backend.install_resource_service(ResourceService::new(
+            device,
+            crate::kms::owner::identity::IncarnationId::from_raw(1),
+        ));
+        assert!(backend.scanout_m2.current.is_none());
+        assert!(backend.scanout_m2.pending.is_none());
+        assert!(backend.scanout_m2.queued_successor.is_none());
+        backend
+    }
+
     fn seed_direct_owner_description_properties_for_tests(backend: &mut super::KmsBackend) {
         let test_crtcs = backend
             .platform
@@ -66031,21 +66100,6 @@ mod tests {
         backend.install_admission_conductor_with_backend_composed_for_tests(
             device,
             AdmissionSourceFixture::new_source().0,
-        );
-    }
-
-    fn replace_owner_executor_for_ciii_test(backend: &mut super::KmsBackend) {
-        crate::kms::executor::test_support::kill_and_reap(
-            backend.platform.devices[0]
-                .executor
-                .as_mut()
-                .expect("owner executor"),
-        );
-        backend.platform.devices[0].executor = Some(
-            crate::kms::executor::test_support::spawn_stub_helper(
-                crate::kms::executor::test_support::StubBehaviour::NeverReply,
-            )
-            .expect("replacement owner executor"),
         );
     }
 
@@ -74991,6 +75045,11 @@ mod tests {
                 false,
             )
             .expect("environmental skip: no live Vulkan modeset fixture");
+        // The old front's retirement carries its last render ticket. Drain
+        // that fixture work before the disable so the release assertion
+        // measures the disable's proofs, not concurrent Vulkan completion.
+        backend.platform.wait_idle_bounded();
+        Backend::before_block(&mut backend);
         let instance = backend
             .scene
             .output_instance_id_for_tests(0)
@@ -77402,262 +77461,281 @@ mod tests {
 
         // Discovery failure: a mapped but absent connector reaches preparation
         // and terminates before it can allocate a pool.
-        let (OwnerLiveFixture { mut backend, .. }, device, _, _, mode) =
-            c0_3bi_live_modeset_backend(StubBehaviour::NeverReply, false)
-                .expect("environmental skip: no live Vulkan modeset fixture");
-        let missing = OutputKey::new(device, "missing-c0-connector");
-        let missing_id = backend.randr_id_alloc.ids_for(&missing).output_id;
-        backend.output_key_by_id.insert(missing_id, missing.clone());
-        let token = c0_3bi_begin_client_modeset(
-            &mut backend,
-            missing_id,
-            &missing.connector_name,
-            Some(mode),
-        );
-        let error = c0_3bi_take_crtc_config_result(&mut backend, token)
-            .expect_err("absent connector fails preparation");
-        assert_eq!(
-            c0_3bi_client_modeset_failure(&error),
-            Some(ClientModesetFailure::Preparation(
-                PreparationStage::Discovery
-            ))
-        );
-        assert!(
-            backend
-                .client_modeset_released_allocation_keys_for_tests
-                .is_empty()
-        );
+        {
+            let (OwnerLiveFixture { mut backend, .. }, device, _, _, mode) =
+                c0_3bi_live_modeset_backend(StubBehaviour::NeverReply, false)
+                    .expect("environmental skip: no live Vulkan modeset fixture");
+            let missing = OutputKey::new(device, "missing-c0-connector");
+            let missing_id = backend.randr_id_alloc.ids_for(&missing).output_id;
+            backend.output_key_by_id.insert(missing_id, missing.clone());
+            let token = c0_3bi_begin_client_modeset(
+                &mut backend,
+                missing_id,
+                &missing.connector_name,
+                Some(mode),
+            );
+            let error = c0_3bi_take_crtc_config_result(&mut backend, token)
+                .expect_err("absent connector fails preparation");
+            assert_eq!(
+                c0_3bi_client_modeset_failure(&error),
+                Some(ClientModesetFailure::Preparation(
+                    PreparationStage::Discovery
+                ))
+            );
+            assert!(
+                backend
+                    .client_modeset_released_allocation_keys_for_tests
+                    .is_empty()
+            );
+        }
 
         // An unadvertised mode also fails before pool allocation.
-        let (OwnerLiveFixture { mut backend, .. }, _, output_id, connector, _) =
-            c0_3bi_live_modeset_backend(StubBehaviour::NeverReply, false)
-                .expect("environmental skip: no live Vulkan modeset fixture");
-        let token = c0_3bi_begin_client_modeset(
-            &mut backend,
-            output_id,
-            &connector,
-            Some(yserver_core::backend::ModeSpec {
-                width: 1,
-                height: 1,
-                vrefresh: 1,
-            }),
-        );
-        let error = c0_3bi_take_crtc_config_result(&mut backend, token)
-            .expect_err("unadvertised mode fails preparation");
-        assert_eq!(
-            c0_3bi_client_modeset_failure(&error),
-            Some(ClientModesetFailure::Preparation(PreparationStage::Mode))
-        );
-        assert!(
-            backend
-                .client_modeset_released_allocation_keys_for_tests
-                .is_empty()
-        );
+        {
+            let (OwnerLiveFixture { mut backend, .. }, _, output_id, connector, _) =
+                c0_3bi_live_modeset_backend(StubBehaviour::NeverReply, false)
+                    .expect("environmental skip: no live Vulkan modeset fixture");
+            let token = c0_3bi_begin_client_modeset(
+                &mut backend,
+                output_id,
+                &connector,
+                Some(yserver_core::backend::ModeSpec {
+                    width: 1,
+                    height: 1,
+                    vrefresh: 1,
+                }),
+            );
+            let error = c0_3bi_take_crtc_config_result(&mut backend, token)
+                .expect_err("unadvertised mode fails preparation");
+            assert_eq!(
+                c0_3bi_client_modeset_failure(&error),
+                Some(ClientModesetFailure::Preparation(PreparationStage::Mode))
+            );
+            assert!(
+                backend
+                    .client_modeset_released_allocation_keys_for_tests
+                    .is_empty()
+            );
+        }
 
         // Injected allocation failure drops the already-created mode blob and
         // leaves no ResourceService entry behind.
-        let (OwnerLiveFixture { mut backend, .. }, _, output_id, connector, mode) =
-            c0_3bi_live_modeset_backend(StubBehaviour::NeverReply, false)
-                .expect("environmental skip: no live Vulkan modeset fixture");
-        backend.client_modeset_force_allocation_failure_for_tests = true;
-        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
-        let error = c0_3bi_take_crtc_config_result(&mut backend, token)
-            .expect_err("injected pool allocation failure is terminal");
-        assert_eq!(
-            c0_3bi_client_modeset_failure(&error),
-            Some(ClientModesetFailure::Preparation(
-                PreparationStage::Allocation
-            ))
-        );
-        assert!(
-            backend
-                .client_modeset_released_allocation_keys_for_tests
-                .is_empty()
-        );
+        {
+            let (OwnerLiveFixture { mut backend, .. }, _, output_id, connector, mode) =
+                c0_3bi_live_modeset_backend(StubBehaviour::NeverReply, false)
+                    .expect("environmental skip: no live Vulkan modeset fixture");
+            backend.client_modeset_force_allocation_failure_for_tests = true;
+            let token =
+                c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+            let error = c0_3bi_take_crtc_config_result(&mut backend, token)
+                .expect_err("injected pool allocation failure is terminal");
+            assert_eq!(
+                c0_3bi_client_modeset_failure(&error),
+                Some(ClientModesetFailure::Preparation(
+                    PreparationStage::Allocation
+                ))
+            );
+            assert!(
+                backend
+                    .client_modeset_released_allocation_keys_for_tests
+                    .is_empty()
+            );
+        }
 
         // TEST_ONLY EINVAL releases every adopted BO and framebuffer.
-        let (
-            OwnerLiveFixture {
-                mut backend,
-                cleanup_calls,
-                ..
-            },
-            device,
-            output_id,
-            connector,
-            mode,
-        ) = c0_3bi_live_modeset_backend(StubBehaviour::RejectWith(libc::EINVAL), false)
-            .expect("environmental skip: no live Vulkan modeset fixture");
-        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
-        let (keys, framebuffers) = c0_3bi_pending_prepared_pool_allocations(&backend, device);
-        c0_3bi_drive_crtc_config_result(
-            &mut backend,
-            token,
-            "c0_3bi_prepared_set_released_once_vulkan rejection result",
-        );
-        let validation_error = c0_3bi_take_crtc_config_result(&mut backend, token)
-            .expect_err("TEST_ONLY returned EINVAL");
-        assert_eq!(
-            c0_3bi_client_modeset_failure(&validation_error),
-            Some(ClientModesetFailure::Preparation(
-                PreparationStage::TestOnly {
-                    errno: libc::EINVAL
-                }
-            ))
-        );
-        c0_3bi_assert_prepared_pool_released(
-            &backend,
-            device,
-            &keys,
-            &framebuffers,
-            &cleanup_calls,
-        );
+        {
+            let (
+                OwnerLiveFixture {
+                    mut backend,
+                    cleanup_calls,
+                    ..
+                },
+                device,
+                output_id,
+                connector,
+                mode,
+            ) = c0_3bi_live_modeset_backend(StubBehaviour::RejectWith(libc::EINVAL), false)
+                .expect("environmental skip: no live Vulkan modeset fixture");
+            let token =
+                c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+            let (keys, framebuffers) = c0_3bi_pending_prepared_pool_allocations(&backend, device);
+            c0_3bi_drive_crtc_config_result(
+                &mut backend,
+                token,
+                "c0_3bi_prepared_set_released_once_vulkan rejection result",
+            );
+            let validation_error = c0_3bi_take_crtc_config_result(&mut backend, token)
+                .expect_err("TEST_ONLY returned EINVAL");
+            assert_eq!(
+                c0_3bi_client_modeset_failure(&validation_error),
+                Some(ClientModesetFailure::Preparation(
+                    PreparationStage::TestOnly {
+                        errno: libc::EINVAL
+                    }
+                ))
+            );
+            c0_3bi_assert_prepared_pool_released(
+                &backend,
+                device,
+                &keys,
+                &framebuffers,
+                &cleanup_calls,
+            );
+        }
 
         // A DPMS event after staging supersedes the pending TEST_ONLY result.
-        let (
-            OwnerLiveFixture {
-                mut backend,
-                cleanup_calls,
-                ..
-            },
-            device,
-            output_id,
-            connector,
-            mode,
-        ) = c0_3bi_live_modeset_backend(StubBehaviour::NeverReply, false)
-            .expect("environmental skip: no live Vulkan modeset fixture");
-        let _off = c0_3bi_begin_dpms_transition(&mut backend, device, 3);
-        c0_3bi_complete_dpms_transition(&mut backend, device, StubBehaviour::NeverReply);
-        c0_3aii_replace_owner_executor(
-            &mut backend,
-            StubBehaviour::AcceptAfter(std::time::Duration::from_millis(100)),
-        );
-        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
-        let (keys, framebuffers) = c0_3bi_pending_prepared_pool_allocations(&backend, device);
-        Backend::set_dpms_power(&mut backend, 0).expect("DPMS-on supersedes staged request");
-        c0_3bi_drive_crtc_config_result(
-            &mut backend,
-            token,
-            "c0_3bi_prepared_set_released_once_vulkan superseded result",
-        );
-        assert!(
-            c0_3bi_take_crtc_config_result(&mut backend, token)
-                .expect_err("superseded prepared request")
-                .to_string()
-                .contains("Superseded(DPMS)")
-        );
-        c0_3bi_assert_prepared_pool_released(
-            &backend,
-            device,
-            &keys,
-            &framebuffers,
-            &cleanup_calls,
-        );
+        {
+            let (
+                OwnerLiveFixture {
+                    mut backend,
+                    cleanup_calls,
+                    ..
+                },
+                device,
+                output_id,
+                connector,
+                mode,
+            ) = c0_3bi_live_modeset_backend(StubBehaviour::NeverReply, false)
+                .expect("environmental skip: no live Vulkan modeset fixture");
+            let _off = c0_3bi_begin_dpms_transition(&mut backend, device, 3);
+            c0_3bi_complete_dpms_transition(&mut backend, device, StubBehaviour::NeverReply);
+            c0_3aii_replace_owner_executor(
+                &mut backend,
+                StubBehaviour::AcceptAfter(std::time::Duration::from_millis(100)),
+            );
+            let token =
+                c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+            let (keys, framebuffers) = c0_3bi_pending_prepared_pool_allocations(&backend, device);
+            Backend::set_dpms_power(&mut backend, 0).expect("DPMS-on supersedes staged request");
+            c0_3bi_drive_crtc_config_result(
+                &mut backend,
+                token,
+                "c0_3bi_prepared_set_released_once_vulkan superseded result",
+            );
+            assert!(
+                c0_3bi_take_crtc_config_result(&mut backend, token)
+                    .expect_err("superseded prepared request")
+                    .to_string()
+                    .contains("Superseded(DPMS)")
+            );
+            c0_3bi_assert_prepared_pool_released(
+                &backend,
+                device,
+                &keys,
+                &framebuffers,
+                &cleanup_calls,
+            );
+        }
 
         // A topology invalidation before validation supersedes the queued
         // request and releases the prepared set.
-        let (
-            OwnerLiveFixture {
-                mut backend,
-                cleanup_calls,
-                ..
-            },
-            device,
-            output_id,
-            connector,
-            mode,
-        ) = c0_3bi_live_modeset_backend(StubBehaviour::NeverReply, false)
-            .expect("environmental skip: no live Vulkan modeset fixture");
-        backend.client_modeset_stale_before_validation_for_tests = true;
-        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
-        c0_3bi_drive_crtc_config_result(
-            &mut backend,
-            token,
-            "c0_3bi_prepared_set_released_once_vulkan stale result",
-        );
-        let keys = backend
-            .client_modeset_released_allocation_keys_for_tests
-            .clone();
-        let framebuffers = backend
-            .client_modeset_released_framebuffers_for_tests
-            .clone();
-        assert!(!keys.is_empty(), "stale preparation had a managed pool");
-        assert!(
-            backend.lifecycle_drivers[&device]
-                .client_modeset_test_stats()
-                .0
-                .is_empty()
-        );
-        let stale_error = c0_3bi_take_crtc_config_result(&mut backend, token)
-            .expect_err("the topology invalidation supersedes the queued request");
-        assert_eq!(
-            c0_3bi_client_modeset_failure(&stale_error),
-            Some(ClientModesetFailure::Superseded(
-                crate::kms::owner::lifecycle::LifecycleKind::DPMS
-            ))
-        );
-        c0_3bi_assert_prepared_pool_released(
-            &backend,
-            device,
-            &keys,
-            &framebuffers,
-            &cleanup_calls,
-        );
+        {
+            let (
+                OwnerLiveFixture {
+                    mut backend,
+                    cleanup_calls,
+                    ..
+                },
+                device,
+                output_id,
+                connector,
+                mode,
+            ) = c0_3bi_live_modeset_backend(StubBehaviour::NeverReply, false)
+                .expect("environmental skip: no live Vulkan modeset fixture");
+            backend.client_modeset_stale_before_validation_for_tests = true;
+            let token =
+                c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+            c0_3bi_drive_crtc_config_result(
+                &mut backend,
+                token,
+                "c0_3bi_prepared_set_released_once_vulkan stale result",
+            );
+            let keys = backend
+                .client_modeset_released_allocation_keys_for_tests
+                .clone();
+            let framebuffers = backend
+                .client_modeset_released_framebuffers_for_tests
+                .clone();
+            assert!(!keys.is_empty(), "stale preparation had a managed pool");
+            assert!(
+                backend.lifecycle_drivers[&device]
+                    .client_modeset_test_stats()
+                    .0
+                    .is_empty()
+            );
+            let stale_error = c0_3bi_take_crtc_config_result(&mut backend, token)
+                .expect_err("the topology invalidation supersedes the queued request");
+            assert_eq!(
+                c0_3bi_client_modeset_failure(&stale_error),
+                Some(ClientModesetFailure::Superseded(
+                    crate::kms::owner::lifecycle::LifecycleKind::DPMS
+                ))
+            );
+            c0_3bi_assert_prepared_pool_released(
+                &backend,
+                device,
+                &keys,
+                &framebuffers,
+                &cleanup_calls,
+            );
+        }
 
         // Explicit rejection of the dispatched live request also releases the
         // same prepared set. The executor remains a stub throughout.
-        let (
-            OwnerLiveFixture {
-                mut backend,
-                cleanup_calls,
-                ..
-            },
-            device,
-            output_id,
-            connector,
-            mode,
-        ) = c0_3bi_live_modeset_backend(
-            StubBehaviour::AcceptValidationThenRejectWith {
-                sequence: 1_000,
-                errno: libc::EINVAL,
-            },
-            false,
-        )
-        .expect("environmental skip: no live Vulkan modeset fixture");
-        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
-        let (keys, framebuffers) = c0_3bi_pending_prepared_pool_allocations(&backend, device);
-        c0_3bi_core_driver_until(
-            &mut backend,
-            "c0_3bi_prepared_set_released_once_vulkan live rejection",
-            std::time::Duration::from_secs(3),
-            &|backend| c0_3bi_has_crtc_config_result(backend, token),
-            None,
-        )
-        .expect("core driver routes the executor rejection of the live modeset");
-        let error = c0_3bi_take_crtc_config_result(&mut backend, token)
-            .expect_err("live commit was explicitly rejected");
-        assert_eq!(
-            c0_3bi_client_modeset_failure(&error),
-            Some(
-                crate::kms::render::admission::ClientModesetFailure::KernelRejected {
+        {
+            let (
+                OwnerLiveFixture {
+                    mut backend,
+                    cleanup_calls,
+                    ..
+                },
+                device,
+                output_id,
+                connector,
+                mode,
+            ) = c0_3bi_live_modeset_backend(
+                StubBehaviour::AcceptValidationThenRejectWith {
+                    sequence: 1_000,
                     errno: libc::EINVAL,
-                }
-            ),
-            "{error:?}"
-        );
-        c0_3bi_assert_prepared_pool_released(
-            &backend,
-            device,
-            &keys,
-            &framebuffers,
-            &cleanup_calls,
-        );
+                },
+                false,
+            )
+            .expect("environmental skip: no live Vulkan modeset fixture");
+            let token =
+                c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+            let (keys, framebuffers) = c0_3bi_pending_prepared_pool_allocations(&backend, device);
+            c0_3bi_core_driver_until(
+                &mut backend,
+                "c0_3bi_prepared_set_released_once_vulkan live rejection",
+                std::time::Duration::from_secs(3),
+                &|backend| c0_3bi_has_crtc_config_result(backend, token),
+                None,
+            )
+            .expect("core driver routes the executor rejection of the live modeset");
+            let error = c0_3bi_take_crtc_config_result(&mut backend, token)
+                .expect_err("live commit was explicitly rejected");
+            assert_eq!(
+                c0_3bi_client_modeset_failure(&error),
+                Some(
+                    crate::kms::render::admission::ClientModesetFailure::KernelRejected {
+                        errno: libc::EINVAL,
+                    }
+                ),
+                "{error:?}"
+            );
+            c0_3bi_assert_prepared_pool_released(
+                &backend,
+                device,
+                &keys,
+                &framebuffers,
+                &cleanup_calls,
+            );
 
-        c0_3bi_assert_end_state(
-            &backend,
-            "c0_3bi_prepared_set_released_once_vulkan",
-            &c0_3bi_expected_end_state([OutputKey::new(device, connector.clone())]),
-        );
+            c0_3bi_assert_end_state(
+                &backend,
+                "c0_3bi_prepared_set_released_once_vulkan",
+                &c0_3bi_expected_end_state([OutputKey::new(device, connector.clone())]),
+            );
+        }
     }
 
     #[test]
@@ -83486,6 +83564,804 @@ mod tests {
         Ok(backend)
     }
 
+    struct C0DirectHoldReadyOffer {
+        fixture: OwnerLiveFixture,
+        device: DrmDeviceKey,
+        output_idx: usize,
+        bo_idx: usize,
+        composed_crtc: u32,
+        generation: u64,
+        current_composed_bos: Vec<(usize, usize)>,
+    }
+
+    #[derive(Clone)]
+    struct C0DirectHoldObservation {
+        protected: std::collections::BTreeSet<u32>,
+        has_current: bool,
+        has_pending: bool,
+        has_queued: bool,
+        current_role: bool,
+        current_role_crtcs: std::collections::BTreeSet<u32>,
+        composed_readiness: Vec<Option<crate::kms::owner::admission::Readiness>>,
+        pre_entry_current_bos: Vec<bool>,
+        live_commit: Option<crate::kms::owner::identity::CommitId>,
+    }
+
+    fn c0_direct_hold_ready_offer_before_entry(
+        output_count: usize,
+        composed_output_idx: usize,
+    ) -> C0DirectHoldReadyOffer {
+        let mut fixture = owner_live_fixture_with_output_count(output_count, false)
+            .expect("environmental skip: direct-hold fixture needs a live Vulkan ICD");
+        let backend = &mut fixture.backend;
+        let device = backend.platform.primary_device().expect("device").key;
+        c0_conv_ciii_establish_composed_return(backend, device);
+        reinstall_owner_executor_for_direct_test(backend);
+        backend
+            .scene
+            .test_set_cursor_mode(crate::kms::render::scene::CursorPlaneMode::Hw);
+
+        let current_composed_bos = (0..output_count)
+            .map(|output_idx| {
+                let identity = backend
+                    .scene
+                    .owner_buffer_identities_for_tests(output_idx)
+                    .into_iter()
+                    .zip(backend.scene.owner_buffer_states_for_tests(output_idx))
+                    .find_map(|(identity, state)| {
+                        (state == crate::kms::render::owner_buffer::OwnerBufferState::Current)
+                            .then_some(identity)
+                    })
+                    .unwrap_or_else(|| {
+                        panic!("output {output_idx} has no current composed predecessor")
+                    });
+                (output_idx, identity.bo_idx)
+            })
+            .collect::<Vec<_>>();
+
+        let output = backend
+            .platform
+            .outputs
+            .get(composed_output_idx)
+            .expect("composed output index");
+        assert_eq!(output.key.device_key, device);
+        let composed_crtc = u32::from(output.output.crtc);
+        let instance = backend.platform.output_instance_ids[composed_output_idx];
+        backend.scene.mark_scene_structure_damage_rect(
+            composed_output_idx,
+            ash::vk::Rect2D {
+                offset: ash::vk::Offset2D { x: 3, y: 5 },
+                extent: ash::vk::Extent2D {
+                    width: 19,
+                    height: 23,
+                },
+            },
+        );
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        let (bo_idx, generation, rendering) = backend
+            .scene
+            .owner_prepared_for_tests(composed_output_idx)
+            .expect("production scene tick prepares the composed offer");
+        assert!(rendering, "the composed generation is offered before ready");
+        backend
+            .admission_offer_composed_for_instance(
+                device,
+                composed_crtc,
+                generation,
+                Some(instance),
+            )
+            .expect("queue the production composed intent before direct entry");
+        assert_eq!(
+            backend.composed_producer_readiness_for_tests(device, composed_crtc, generation),
+            crate::kms::owner::admission::Readiness::Waiting(
+                crate::kms::owner::admission::WaitReason::SourceWaits
+            ),
+            "the pre-entry offer is not ready until its render completion"
+        );
+
+        C0DirectHoldReadyOffer {
+            fixture,
+            device,
+            output_idx: composed_output_idx,
+            bo_idx,
+            composed_crtc,
+            generation,
+            current_composed_bos,
+        }
+    }
+
+    fn c0_direct_hold_replace_admission_source_with_waiting_direct(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+    ) {
+        use crate::kms::owner::admission::{IntentKey, Readiness, WaitReason};
+
+        let (source, readiness, _) = AdmissionSourceFixture::new();
+        AdmissionSourceFixture::set_readiness(
+            &readiness,
+            IntentKey::Direct {
+                source_generation: 1,
+            },
+            Readiness::Waiting(WaitReason::SourceWaits),
+        );
+        backend
+            .admission_conductors
+            .get_mut(&device)
+            .expect("Owner admission conductor")
+            .source = source;
+    }
+
+    fn c0_direct_hold_observe(
+        backend: &super::KmsBackend,
+        device: DrmDeviceKey,
+        composed_offers: &[(u32, u64)],
+        current_composed_bos: &[(usize, usize)],
+    ) -> C0DirectHoldObservation {
+        let current_role = backend
+            .commit_consumer
+            .current_resources
+            .iter()
+            .find(|resources| {
+                resources.direct_role.as_ref().is_some_and(|role| {
+                    role.role() == crate::kms::render::resources::DirectRole::Current
+                })
+            });
+        let current_role_crtcs = current_role
+            .into_iter()
+            .flat_map(|resources| {
+                resources
+                    .crtcs
+                    .iter()
+                    .map(|member| u32::from(member.crtc.crtc))
+            })
+            .collect();
+        let composed_readiness = composed_offers
+            .iter()
+            .map(|&(crtc, generation)| {
+                backend.composed_readiness_for_tests(device, crtc, generation)
+            })
+            .collect();
+        let pre_entry_current_bos = current_composed_bos
+            .iter()
+            .map(|&(output_idx, bo_idx)| {
+                backend.scene.owner_state_for_tests(output_idx, bo_idx)
+                    == Some(crate::kms::render::owner_buffer::OwnerBufferState::Current)
+            })
+            .collect();
+        C0DirectHoldObservation {
+            protected: backend.direct_hold_crtcs_for_device(device),
+            has_current: backend.scanout_m2.current.is_some(),
+            has_pending: backend.scanout_m2.pending.is_some(),
+            has_queued: backend.scanout_m2.queued_successor.is_some(),
+            current_role: current_role.is_some(),
+            current_role_crtcs,
+            composed_readiness,
+            pre_entry_current_bos,
+            live_commit: backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .map(|record| record.commit_id()),
+        }
+    }
+
+    fn c0_direct_hold_assert_observations(
+        observations: &[C0DirectHoldObservation],
+        protected_crtcs: &std::collections::BTreeSet<u32>,
+        composed_offers: &[(u32, u64)],
+        current_composed_bos: &[(usize, usize)],
+        expect_current: bool,
+        expect_queued: bool,
+    ) {
+        use crate::kms::owner::admission::{Readiness, WaitReason};
+
+        assert!(
+            !observations.is_empty(),
+            "core driver recorded no iteration"
+        );
+        for observation in observations {
+            assert_eq!(
+                &observation.protected, protected_crtcs,
+                "every core-loop boundary observes the complete direct protected set"
+            );
+            assert_eq!(observation.has_current, expect_current);
+            assert!(!observation.has_pending);
+            assert_eq!(observation.has_queued, expect_queued);
+            assert_eq!(observation.current_role, expect_current);
+            if expect_current {
+                assert_eq!(
+                    &observation.current_role_crtcs, protected_crtcs,
+                    "the stable direct frame keeps its grouped DirectRole::Current ledger entry"
+                );
+            }
+            assert_eq!(
+                observation.composed_readiness,
+                vec![Some(Readiness::Waiting(WaitReason::DirectFrameHeld)); composed_offers.len()],
+                "ready composed offers remain Waiting with the direct-hold reason"
+            );
+            assert_eq!(
+                observation.pre_entry_current_bos,
+                vec![true; current_composed_bos.len()]
+            );
+            assert!(
+                observation.live_commit.is_none(),
+                "no ordinary composed commit crossed the Owner dispatch boundary"
+            );
+        }
+    }
+
+    fn c0_direct_hold_core_render_completion(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        offer: (u32, u64),
+        output_idx: usize,
+        bo_idx: usize,
+        current_composed_bos: &[(usize, usize)],
+    ) -> Vec<C0DirectHoldObservation> {
+        let (composed_crtc, generation) = offer;
+        backend.platform.wait_idle_bounded();
+        let render_completions = backend.platform.drain_scanout_render_completions();
+        assert!(
+            render_completions.iter().any(|completion| {
+                completion.output_instance_id == backend.platform.output_instance_ids[output_idx]
+                    && completion.bo_idx == bo_idx
+                    && completion.stage
+                        == crate::kms::render::platform::ScanoutRenderCompletionStage::Render
+            }),
+            "the prepared composed generation has a completed renderer fence"
+        );
+        for completion in render_completions {
+            backend
+                .platform
+                .queue_ready_scanout_render_completion_for_tests(completion);
+        }
+        backend.core_driver_readiness_script_for_tests.push_back((
+            yserver_core::backend::BackendFdKind::ScanoutRenderCompletion,
+            -1,
+        ));
+        let observations = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let observed = std::rc::Rc::clone(&observations);
+        let driven = c0_3bi_core_driver_until_before_iteration_tail(
+            backend,
+            "complete held composed generation through the core loop",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                observed.borrow_mut().push(c0_direct_hold_observe(
+                    backend,
+                    device,
+                    &[offer],
+                    current_composed_bos,
+                ));
+                backend
+                    .scene
+                    .owner_state_for_generation_for_tests(output_idx, generation)
+                    == Some(crate::kms::render::owner_buffer::OwnerBufferState::Desired)
+            },
+        );
+        if let Err(error) = driven {
+            panic!(
+                "{error}; output={output_idx}; generation={generation}; prepared={:?}; state={:?}; ready_completions={}; scripted={}; core_entries={:?}",
+                backend.scene.owner_prepared_for_tests(output_idx),
+                backend
+                    .scene
+                    .owner_state_for_generation_for_tests(output_idx, generation),
+                backend
+                    .platform
+                    .ready_scanout_render_completions_for_tests
+                    .len(),
+                backend.core_driver_readiness_script_for_tests.len(),
+                backend
+                    .core_entry_trace_for_tests
+                    .borrow()
+                    .iter()
+                    .rev()
+                    .take(8)
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert!(
+            backend.core_driver_composed_offers_for_tests.iter().any(
+                |&(offered_device, offered_crtc, offered_generation, _)| {
+                    offered_device == device
+                        && offered_crtc == composed_crtc
+                        && offered_generation == generation
+                }
+            ),
+            "the production render-completion entry offers the composed generation"
+        );
+        observations.borrow().clone()
+    }
+
+    fn c0_direct_hold_core_retirement_wake(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        offers: &[(u32, u64)],
+        current_composed_bos: &[(usize, usize)],
+    ) -> Vec<C0DirectHoldObservation> {
+        use crate::kms::{
+            owner::{device::OwnerEvent, identity::CommitId, ledger::Submitted},
+            render::resources::CommitResources,
+        };
+
+        let pulse = CommitId::for_tests(89_001);
+        backend.core_driver_owner_events_for_tests.push_back((
+            device,
+            vec![OwnerEvent::CompletionRetired {
+                commit: pulse,
+                resources: Submitted::new(Vec::<CommitResources>::new(), Vec::new()).accepted(),
+            }],
+        ));
+        let observations = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let observed = std::rc::Rc::clone(&observations);
+        c0_3bi_core_driver_until(
+            backend,
+            "deliver Owner retirement wake through the core loop",
+            std::time::Duration::from_secs(2),
+            &|backend| {
+                observed.borrow_mut().push(c0_direct_hold_observe(
+                    backend,
+                    device,
+                    offers,
+                    current_composed_bos,
+                ));
+                backend.core_driver_owner_events_for_tests.is_empty()
+            },
+            None,
+        )
+        .expect("core loop routes the retirement batch and wake");
+        assert_eq!(
+            backend.core_driver_owner_batch_results_for_tests.pop(),
+            Some(true),
+            "the synthetic empty retirement pulse is consumed by the production Owner entry"
+        );
+        observations.borrow().clone()
+    }
+
+    fn c0_direct_hold_assert_no_commit(backend: &super::KmsBackend, label: &str) {
+        let live = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .map(|record| (record.commit_id(), record.completion_context().class));
+        assert!(
+            live.is_none(),
+            "{label}: a held direct frame admitted an ordinary commit: {live:?}"
+        );
+    }
+
+    fn c0_direct_hold_assert_end_state(backend: &super::KmsBackend, test_name: &str) {
+        let outputs = backend
+            .platform
+            .outputs
+            .iter()
+            .map(|output| output.key.clone())
+            .collect::<Vec<_>>();
+        let mut expected = c0_3bi_expected_end_state(outputs);
+        let mut direct_allocations = std::collections::BTreeSet::new();
+        for resources in backend
+            .commit_consumer
+            .current_resources
+            .iter()
+            .chain(&backend.commit_consumer.releasing_resources)
+        {
+            direct_allocations.extend(
+                resources
+                    .allocations
+                    .iter()
+                    .map(|allocation| allocation.key()),
+            );
+        }
+        for frame in [
+            backend.scanout_m2.current.as_ref(),
+            backend.scanout_m2.pending.as_ref(),
+            backend.scanout_m2.queued_successor.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            direct_allocations.extend(frame.framebuffer_lease.iter().map(|lease| lease.key()));
+        }
+        expected.other_live_allocations = direct_allocations.into_iter().collect();
+        c0_3bi_assert_end_state(backend, test_name, &expected);
+    }
+
+    fn c0_direct_hold_queue_waiting_successor(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        suffix: u32,
+    ) {
+        c0_direct_hold_replace_admission_source_with_waiting_direct(backend, device);
+        let (source_id, candidate, event) = admission_direct_candidate(backend, suffix);
+        assert!(
+            backend
+                .admission_offer_direct(device, source_id, candidate, event)
+                .expect("queue direct successor through Owner admission"),
+            "the direct candidate is prepared and queued"
+        );
+        assert!(backend.scanout_m2.queued_successor.is_some());
+        assert!(backend.scanout_m2.queued_successor_role.is_some());
+    }
+
+    fn c0_direct_hold_assert_offer_pending(
+        backend: &super::KmsBackend,
+        device: DrmDeviceKey,
+        output_idx: usize,
+        crtc: u32,
+        generation: u64,
+    ) {
+        assert_eq!(
+            backend.admission_conductors[&device]
+                .admission
+                .composed(crtc)
+                .map(|offer| offer.generation),
+            Some(generation),
+            "the composed offer remains queued behind the direct hold"
+        );
+        assert_eq!(
+            backend
+                .scene
+                .owner_state_for_generation_for_tests(output_idx, generation),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Desired),
+            "the ready composed generation remains Desired, without an Owner commit"
+        );
+        assert_eq!(
+            backend.scene.pending_ack_count_for_tests(output_idx),
+            0,
+            "a held composed offer has not installed a primary-plane acknowledgement"
+        );
+    }
+
+    fn c0_direct_hold_ready_snapshot(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        crtc: u32,
+        generation: u64,
+    ) -> crate::kms::owner::admission::ReadinessSnapshot {
+        use crate::kms::owner::admission::{IntentKey, Readiness, WaitReason};
+
+        c0_direct_hold_assert_composed_ready(backend, device, crtc, generation);
+        let snapshot = backend
+            .admission_snapshot(device, true)
+            .expect("direct-hold retirement snapshot");
+        assert_eq!(
+            snapshot.readiness(IntentKey::Composed { crtc, generation }),
+            Some(Readiness::Waiting(WaitReason::DirectFrameHeld)),
+            "the ready composed intent is held by the direct-frame rule"
+        );
+        snapshot
+    }
+
+    fn c0_direct_hold_assert_composed_ready(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        crtc: u32,
+        generation: u64,
+    ) {
+        use crate::kms::owner::admission::Readiness;
+
+        assert_eq!(
+            backend.composed_producer_readiness_for_tests(device, crtc, generation),
+            Readiness::Ready,
+            "the real composed producer is ready independently of the hold gate"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_adm_direct_hold_ready_composed_waits_on_retirement_wake_vulkan() {
+        use crate::kms::owner::admission::{IntentKey, Readiness, WaitReason};
+
+        let mut held = c0_direct_hold_ready_offer_before_entry(1, 0);
+        let backend = &mut held.fixture.backend;
+        let device = held.device;
+        c0_conv_ciii_install_current_direct(backend);
+        let protected = backend
+            .platform
+            .outputs
+            .iter()
+            .map(|output| u32::from(output.output.crtc))
+            .collect::<std::collections::BTreeSet<_>>();
+        let offer = (held.composed_crtc, held.generation);
+        let before_render = backend
+            .admission_snapshot(device, true)
+            .expect("hold snapshot before render completion");
+
+        let mut observations = c0_direct_hold_core_render_completion(
+            backend,
+            device,
+            offer,
+            held.output_idx,
+            held.bo_idx,
+            &[],
+        );
+        c0_direct_hold_assert_no_commit(backend, "production composed offer");
+        c0_direct_hold_assert_composed_ready(backend, device, held.composed_crtc, held.generation);
+        let retirement = c0_direct_hold_core_retirement_wake(backend, device, &[offer], &[]);
+        c0_direct_hold_assert_no_commit(backend, "retirement wake");
+        observations.extend(retirement);
+        assert_eq!(
+            before_render.readiness(IntentKey::Composed {
+                crtc: held.composed_crtc,
+                generation: held.generation,
+            }),
+            Some(Readiness::Waiting(WaitReason::DirectFrameHeld))
+        );
+        let ready_snapshot =
+            c0_direct_hold_ready_snapshot(backend, device, held.composed_crtc, held.generation);
+        c0_direct_hold_assert_observations(&observations, &protected, &[offer], &[], true, false);
+        assert_eq!(
+            ready_snapshot.readiness(IntentKey::Composed {
+                crtc: held.composed_crtc,
+                generation: held.generation,
+            }),
+            Some(Readiness::Waiting(WaitReason::DirectFrameHeld))
+        );
+        assert_eq!(
+            backend.commit_consumer.current_resources[0]
+                .direct_role
+                .as_ref()
+                .expect("current direct role")
+                .role(),
+            crate::kms::render::resources::DirectRole::Current
+        );
+        c0_direct_hold_assert_offer_pending(
+            backend,
+            device,
+            held.output_idx,
+            held.composed_crtc,
+            held.generation,
+        );
+        c0_direct_hold_assert_end_state(
+            backend,
+            "c0_adm_direct_hold_ready_composed_waits_on_retirement_wake_vulkan",
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_adm_direct_hold_waiting_queued_successor_does_not_mask_composed_vulkan() {
+        use crate::kms::owner::admission::{IntentKey, Readiness, WaitReason};
+
+        let mut held = c0_direct_hold_ready_offer_before_entry(1, 0);
+        let backend = &mut held.fixture.backend;
+        let device = held.device;
+        c0_conv_ciii_install_current_direct(backend);
+        c0_direct_hold_queue_waiting_successor(backend, device, 89);
+        let protected = backend
+            .platform
+            .outputs
+            .iter()
+            .map(|output| u32::from(output.output.crtc))
+            .collect::<std::collections::BTreeSet<_>>();
+        let offer = (held.composed_crtc, held.generation);
+        let before_render = backend
+            .admission_snapshot(device, true)
+            .expect("queued-successor hold snapshot");
+        assert_eq!(
+            before_render.readiness(IntentKey::Direct {
+                source_generation: 1,
+            }),
+            Some(Readiness::Waiting(WaitReason::SourceWaits)),
+            "the queued successor stays in its production source-waiting state"
+        );
+
+        let mut observations = c0_direct_hold_core_render_completion(
+            backend,
+            device,
+            offer,
+            held.output_idx,
+            held.bo_idx,
+            &[],
+        );
+        c0_direct_hold_assert_no_commit(backend, "ready composed offer with queued successor");
+        c0_direct_hold_assert_composed_ready(backend, device, held.composed_crtc, held.generation);
+        let retirement = c0_direct_hold_core_retirement_wake(backend, device, &[offer], &[]);
+        c0_direct_hold_assert_no_commit(backend, "queued-successor retirement wake");
+        observations.extend(retirement);
+        let ready_snapshot =
+            c0_direct_hold_ready_snapshot(backend, device, held.composed_crtc, held.generation);
+        assert_eq!(
+            ready_snapshot.readiness(IntentKey::Direct {
+                source_generation: 1,
+            }),
+            Some(Readiness::Waiting(WaitReason::SourceWaits))
+        );
+        c0_direct_hold_assert_observations(&observations, &protected, &[offer], &[], true, true);
+        c0_direct_hold_assert_offer_pending(
+            backend,
+            device,
+            held.output_idx,
+            held.composed_crtc,
+            held.generation,
+        );
+        c0_direct_hold_assert_end_state(
+            backend,
+            "c0_adm_direct_hold_waiting_queued_successor_does_not_mask_composed_vulkan",
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_adm_direct_hold_protects_every_device_output_vulkan() {
+        use crate::kms::owner::admission::{IntentKey, Readiness, WaitReason};
+
+        let mut held = c0_direct_hold_ready_offer_before_entry(2, 1);
+        let backend = &mut held.fixture.backend;
+        let device = held.device;
+        let protected = backend
+            .platform
+            .outputs
+            .iter()
+            .map(|output| u32::from(output.output.crtc))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(protected.len(), 2, "fixture has two output CRTCs");
+        c0_direct_hold_queue_waiting_successor(backend, device, 91);
+        let pacing_crtc = backend
+            .scanout_m2
+            .queued_successor
+            .as_ref()
+            .expect("queued grouped direct successor")
+            .candidate
+            .crtc_id;
+        assert_eq!(
+            backend.present_crtc_output(pacing_crtc).map(|(idx, _)| idx),
+            Some(0),
+            "Present paces the grouped direct frame on output A"
+        );
+        let offer = (held.composed_crtc, held.generation);
+        let before_render = backend
+            .admission_snapshot(device, true)
+            .expect("complete-set hold snapshot");
+        assert_eq!(
+            before_render.readiness(IntentKey::Direct {
+                source_generation: 1,
+            }),
+            Some(Readiness::Waiting(WaitReason::SourceWaits)),
+            "the queued direct successor remains in its production waiting state"
+        );
+
+        let mut observations = c0_direct_hold_core_render_completion(
+            backend,
+            device,
+            offer,
+            held.output_idx,
+            held.bo_idx,
+            &held.current_composed_bos,
+        );
+        c0_direct_hold_assert_no_commit(backend, "output B composed offer");
+        c0_direct_hold_assert_composed_ready(backend, device, held.composed_crtc, held.generation);
+        let retirement = c0_direct_hold_core_retirement_wake(
+            backend,
+            device,
+            &[offer],
+            &held.current_composed_bos,
+        );
+        c0_direct_hold_assert_no_commit(backend, "output B retirement wake");
+        observations.extend(retirement);
+        assert_eq!(
+            before_render.readiness(IntentKey::Composed {
+                crtc: held.composed_crtc,
+                generation: held.generation,
+            }),
+            Some(Readiness::Waiting(WaitReason::DirectFrameHeld))
+        );
+        let ready_snapshot =
+            c0_direct_hold_ready_snapshot(backend, device, held.composed_crtc, held.generation);
+        c0_direct_hold_assert_observations(
+            &observations,
+            &protected,
+            &[offer],
+            &held.current_composed_bos,
+            false,
+            true,
+        );
+        assert_eq!(
+            ready_snapshot.direct_hold_crtcs, protected,
+            "the pacing CRTC does not narrow the protected set"
+        );
+        assert_eq!(
+            ready_snapshot.readiness(IntentKey::Composed {
+                crtc: held.composed_crtc,
+                generation: held.generation,
+            }),
+            Some(Readiness::Waiting(WaitReason::DirectFrameHeld))
+        );
+        c0_direct_hold_assert_offer_pending(
+            backend,
+            device,
+            held.output_idx,
+            held.composed_crtc,
+            held.generation,
+        );
+        c0_direct_hold_assert_end_state(
+            backend,
+            "c0_adm_direct_hold_protects_every_device_output_vulkan",
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_adm_direct_hold_first_entry_queued_keeps_composed_current_vulkan() {
+        use crate::kms::owner::admission::{IntentKey, Readiness, WaitReason};
+
+        let mut held = c0_direct_hold_ready_offer_before_entry(1, 0);
+        let backend = &mut held.fixture.backend;
+        let device = held.device;
+        let protected = backend
+            .platform
+            .outputs
+            .iter()
+            .map(|output| u32::from(output.output.crtc))
+            .collect::<std::collections::BTreeSet<_>>();
+        c0_direct_hold_queue_waiting_successor(backend, device, 90);
+        assert!(backend.scanout_m2.current.is_none());
+        let offer = (held.composed_crtc, held.generation);
+        let before_render = backend
+            .admission_snapshot(device, true)
+            .expect("first-entry queued hold snapshot");
+        assert_eq!(
+            before_render.readiness(IntentKey::Direct {
+                source_generation: 1,
+            }),
+            Some(Readiness::Waiting(WaitReason::SourceWaits))
+        );
+
+        let mut observations = c0_direct_hold_core_render_completion(
+            backend,
+            device,
+            offer,
+            held.output_idx,
+            held.bo_idx,
+            &held.current_composed_bos,
+        );
+        c0_direct_hold_assert_no_commit(backend, "first direct entry queued");
+        c0_direct_hold_assert_composed_ready(backend, device, held.composed_crtc, held.generation);
+        let retirement = c0_direct_hold_core_retirement_wake(
+            backend,
+            device,
+            &[offer],
+            &held.current_composed_bos,
+        );
+        c0_direct_hold_assert_no_commit(backend, "first-entry retirement wake");
+        observations.extend(retirement);
+        assert_eq!(
+            before_render.readiness(IntentKey::Composed {
+                crtc: held.composed_crtc,
+                generation: held.generation,
+            }),
+            Some(Readiness::Waiting(WaitReason::DirectFrameHeld))
+        );
+        let ready_snapshot =
+            c0_direct_hold_ready_snapshot(backend, device, held.composed_crtc, held.generation);
+        assert_eq!(
+            ready_snapshot.readiness(IntentKey::Direct {
+                source_generation: 1,
+            }),
+            Some(Readiness::Waiting(WaitReason::SourceWaits))
+        );
+        c0_direct_hold_assert_observations(
+            &observations,
+            &protected,
+            &[offer],
+            &held.current_composed_bos,
+            false,
+            true,
+        );
+        assert!(
+            backend.scanout_m2.current.is_none(),
+            "the first direct frame remains queued, not installed over C0"
+        );
+        c0_direct_hold_assert_offer_pending(
+            backend,
+            device,
+            held.output_idx,
+            held.composed_crtc,
+            held.generation,
+        );
+        c0_direct_hold_assert_end_state(
+            backend,
+            "c0_adm_direct_hold_first_entry_queued_keeps_composed_current_vulkan",
+        );
+    }
+
     fn c0_conv_ciii_compose_and_retire_output(
         backend: &mut super::KmsBackend,
         output_idx: usize,
@@ -84531,6 +85407,8 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_ciii_unflip_retirement_returns_to_composed_vulkan() {
+        use crate::kms::owner::admission::{IntentKey, Readiness, WaitReason};
+
         let mut backend = c0_conv_ciii_owner_dispatch_fixture(1)
             .expect("environmental skip: no live Vulkan ICD available");
         let device = backend.platform.primary_device().expect("device").key;
@@ -84545,52 +85423,46 @@ mod tests {
         backend
             .admission_offer_composed(device, crtc, 1)
             .expect("offer ordinary composed commit");
-        let ordinary_outcome = backend.admission_wake(device, false);
-        assert!(matches!(
-            ordinary_outcome,
-            crate::kms::render::admission::AdmissionOutcome::Dispatched(_)
-        ));
-        let ordinary_commit = backend
-            .device_owner_for_tests(0)
-            .live_record()
-            .expect("ordinary composed owner record")
-            .commit_id();
+        let held_snapshot = backend
+            .admission_snapshot(device, true)
+            .expect("retirement-wake admission snapshot");
+        assert_eq!(
+            held_snapshot.readiness(IntentKey::Composed {
+                crtc,
+                generation: 1,
+            }),
+            Some(Readiness::Waiting(WaitReason::DirectFrameHeld)),
+            "an ordinary composed offer waits while the current direct frame is held"
+        );
+        assert_eq!(
+            backend.admission_wake(device, true),
+            crate::kms::render::admission::AdmissionOutcome::NothingAdmissible,
+            "a retirement wake cannot dispatch an ordinary composed replacement"
+        );
+        assert!(backend.device_owner_for_tests(0).live_record().is_none());
+        assert!(backend.scanout_m2.current.is_some());
+        assert_eq!(
+            backend.commit_consumer.current_resources[0]
+                .direct_role
+                .as_ref()
+                .expect("current direct role")
+                .role(),
+            crate::kms::render::resources::DirectRole::Current
+        );
 
-        let crtcs = backend
-            .platform
-            .outputs
-            .iter()
-            .filter(|output| output.key.device_key == device)
-            .map(|output| u32::from(output.output.crtc))
-            .collect();
-        backend
-            .admission_request_unflip(device, crtcs)
-            .expect("request unflip behind ordinary composed commit");
+        // The seam installs a prepared composed shadow explicitly; the
+        // production request path still owns the request and admission state.
         backend.scanout_m2.unflip_shadow_ready = true;
-        backend.scanout_m2.unflip_requested = true;
-
-        c0_conv_cii_accept_direct_owner_commit(&mut backend, device, ordinary_commit);
-        // Complete the real composed owner record, but hold its completion
-        // events. The owner slot is free after complete_for_tests(), so the
-        // unflip can be dispatched while this composed retirement is still
-        // waiting at the backend entry point.
-        let ordinary_completion = backend.complete_owner_for_tests(0);
-        assert!(ordinary_completion.iter().any(|event| matches!(
-            event,
-            crate::kms::owner::device::OwnerEvent::CompletionRetired { commit, .. }
-                if *commit == ordinary_commit
-        )));
-        replace_owner_executor_for_ciii_test(&mut backend);
-
+        backend.request_direct_unflip("c0_direct_hold_unflip_retirement");
+        assert!(backend.scanout_m2.unflip_requested);
+        assert!(backend.scanout_m2.unflip_shadow_ready);
         let unflip_outcome = backend.admission_wake(device, false);
         assert!(
             matches!(
                 unflip_outcome,
                 crate::kms::render::admission::AdmissionOutcome::Dispatched(_)
             ),
-            "unflip outcome: {unflip_outcome:?}, snapshot={:?}, trace={:?}",
-            backend.admission_snapshot(device, false),
-            backend.admission_trace_for_tests(device)
+            "the production Ciii unflip dispatches after its request: {unflip_outcome:?}"
         );
         let unflip_commit = backend
             .device_owner_for_tests(0)
@@ -84599,53 +85471,44 @@ mod tests {
             .commit_id();
         assert!(
             backend.scanout_m2.owner_unflip_return.is_some(),
-            "the unflip dispatch must record its return before any retirement"
+            "the unflip dispatch records its return before retirement"
         );
-        let damage_before_ordinary_retirement = backend
+        let damage_before_retirement = backend
             .scene
             .scanout_damage_signature_for_tests(0)
-            .expect("live output damage signature before ordinary retirement");
-        let structure_before_ordinary_retirement = backend
+            .expect("live output damage signature before unflip retirement");
+        let structure_before_retirement = backend
             .scene
             .scene_structure_damage_for_tests(0)
-            .expect("live output structure damage before ordinary retirement");
+            .expect("live output structure damage before unflip retirement");
 
-        assert!(backend.route_owner_event_batch(
-            device,
-            ordinary_completion,
-            std::time::Instant::now(),
-        ));
-        assert!(
-            backend.scanout_m2.owner_unflip_return.is_some(),
-            "an ordinary composed retirement must not consume the unflip return record"
-        );
         assert!(
             backend.scanout_m2.current.is_some(),
-            "an ordinary composed retirement must not stop direct scanout"
+            "Ciii submission must not stop direct scanout before retirement"
         );
         assert!(
             !backend.scanout_m2.reentry_blocked_until_composed,
-            "an ordinary composed retirement must not arm the re-entry barrier"
+            "Ciii acceptance has not yet armed the return barrier"
         );
         assert!(
             backend.scanout_m2.owner_unflip_awaiting_outputs.is_empty(),
-            "an ordinary composed retirement must not install affected outputs"
+            "the return barrier is installed only at unflip retirement"
         );
         assert_eq!(
             backend
                 .scene
                 .scanout_damage_signature_for_tests(0)
-                .expect("live output damage signature after ordinary retirement"),
-            damage_before_ordinary_retirement,
-            "an ordinary composed retirement must not invalidate composed damage"
+                .expect("live output damage signature before unflip retirement"),
+            damage_before_retirement,
+            "unflip submission must not invalidate composed damage"
         );
         assert_eq!(
             backend
                 .scene
                 .scene_structure_damage_for_tests(0)
-                .expect("live output structure damage after ordinary retirement"),
-            structure_before_ordinary_retirement,
-            "an ordinary composed retirement must not add return structure damage"
+                .expect("live output structure damage before unflip retirement"),
+            structure_before_retirement,
+            "unflip submission must not add return structure damage"
         );
 
         c0_conv_cii_accept_direct_owner_commit(&mut backend, device, unflip_commit);
@@ -85915,7 +86778,11 @@ mod tests {
         );
         assert!(!direct.commit_consumer.capacity.is_admission_closed());
 
-        let mut composed = backend_with_current_and_successor_for_admission_seam();
+        // The direct branch keeps the direct-current predecessor because it
+        // is testing restoration of that ledger. The composed branch uses a
+        // plain composed predecessor with no M2 ownership, so its offer is
+        // legitimately admissible and send refusal remains the subject.
+        let mut composed = backend_with_composed_current_for_admission_seam();
         let device = composed.platform.primary_device().unwrap().key;
         admission_install_executor(
             &mut composed,
@@ -85932,13 +86799,16 @@ mod tests {
             crate::kms::render::admission::AdmissionOutcome::SendRefused(RefusalCause::Reaped)
         ));
         assert_eq!(composed.commit_consumer.current_resources.len(), 1);
-        assert_eq!(
+        assert!(
             composed.commit_consumer.current_resources[0]
                 .direct_role
-                .as_ref()
-                .expect("current role")
-                .role(),
-            DirectRole::Current
+                .is_none(),
+            "the restored current primary is composed and has no direct role"
+        );
+        assert_eq!(
+            composed.commit_consumer.current_resources[0].crtcs[0].crtc,
+            test_crtc_key(device, 1),
+            "send refusal preserves the prior composed primary"
         );
         assert!(!composed.commit_consumer.capacity.is_admission_closed());
     }
@@ -86445,7 +87315,9 @@ mod tests {
             render::resources::DirectRole,
         };
 
-        let mut backend = backend_with_current_and_successor_for_admission_seam();
+        // This is an ordinary composed commit, so a composed-only current
+        // predecessor lets the test reach the kernel-rejection path under rule 1.
+        let mut backend = backend_with_composed_current_for_admission_seam();
         let device = backend.platform.primary_device().unwrap().key;
         let executor = crate::kms::executor::test_support::spawn_stub_helper(
             StubBehaviour::AcceptProbesThenNeverReply(1000),
@@ -86493,13 +87365,16 @@ mod tests {
         )]);
 
         assert_eq!(backend.commit_consumer.current_resources.len(), 1);
-        assert_eq!(
+        assert!(
             backend.commit_consumer.current_resources[0]
                 .direct_role
-                .as_ref()
-                .expect("current role")
-                .role(),
-            DirectRole::Current
+                .is_none(),
+            "kernel rejection returns the prior composed primary to the ledger"
+        );
+        assert_eq!(
+            backend.commit_consumer.current_resources[0].crtcs[0].crtc,
+            test_crtc_key(device, 1),
+            "kernel rejection preserves the exact prior primary CRTC"
         );
         assert_eq!(backend.commit_consumer.rejected_resources.len(), 1);
         assert_eq!(
@@ -86803,7 +87678,10 @@ mod tests {
             }
         }
 
-        let mut backend = backend_with_current_and_successor_for_admission_seam();
+        // This test measures the DRM drain's single admission wake. Keep its
+        // ordinary composed successor admissible by using a composed current
+        // resource rather than the direct-owned M2 fixture.
+        let mut backend = backend_with_composed_current_for_admission_seam();
         let device = backend.platform.primary_device().unwrap().key;
         admission_install_executor(
             &mut backend,
@@ -86920,7 +87798,7 @@ mod tests {
                 crate::kms::render::admission::AdmissionTraceStep::Consumed(commit_a),
                 crate::kms::render::admission::AdmissionTraceStep::Enqueued {
                     completions: Vec::new(),
-                    skips: vec![1],
+                    skips: Vec::new(),
                 },
                 crate::kms::render::admission::AdmissionTraceStep::Decided,
                 crate::kms::render::admission::AdmissionTraceStep::Dispatched(next_commit),
@@ -86939,7 +87817,10 @@ mod tests {
         };
         use std::sync::Arc;
 
-        let mut backend = backend_with_current_and_successor_for_admission_seam();
+        // The live commit and transport close are the subject here. Give the
+        // composed offer a plain composed predecessor so direct M2 ownership
+        // does not make that offer inadmissible before the transport path.
+        let mut backend = backend_with_composed_current_for_admission_seam();
         let device = backend.platform.primary_device().unwrap().key;
         admission_install_executor(
             &mut backend,
@@ -97395,12 +98276,13 @@ mod tests {
             .iter()
             .filter(|output| output.key.device_key == device)
             .count();
-        c0_3bi_complete_owner_followups(
+        c0_3bi_settle_owner_frame_work_through_core_driver(
             backend,
             device,
-            output_count.saturating_add(6),
-            "complete baseline Owner frames before output removal",
-        );
+            "settle baseline Owner frames before output removal",
+            std::time::Duration::from_secs(3),
+        )
+        .expect("baseline Owner renders and followups settle through core entries");
         assert!(
             backend
                 .scene
@@ -98530,6 +99412,8 @@ mod tests {
             .image;
         assert_ne!(image, ash::vk::Image::null());
         let direct_allocation = c0_3aii_current_direct_allocation(backend);
+        backend.platform.wait_idle_bounded();
+        Backend::before_block(backend);
 
         backend
             .unmap_window_for_tests(window_xid)

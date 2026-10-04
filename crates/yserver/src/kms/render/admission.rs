@@ -7909,6 +7909,16 @@ impl KmsBackend {
             })
     }
 
+    #[cfg(test)]
+    pub(crate) fn composed_producer_readiness_for_tests(
+        &mut self,
+        device: DrmDeviceKey,
+        crtc: CrtcId,
+        generation: u64,
+    ) -> Readiness {
+        self.composed_readiness(device, crtc, generation)
+    }
+
     fn composed_description(
         &mut self,
         device: DrmDeviceKey,
@@ -8233,6 +8243,7 @@ impl KmsBackend {
             .platform
             .owner_ref(device)
             .map_or(0, |owner| owner.topology_generation());
+        let direct_hold_crtcs = self.direct_hold_crtcs_for_device(device);
         let current_direct = has_current_direct(self);
         let ordinary_retirement_vacant = self
             .commit_consumer
@@ -8295,6 +8306,7 @@ impl KmsBackend {
             let mut snapshot =
                 ReadinessSnapshot::new(conductor.layout_generation, topology_generation);
             snapshot.retirement_wake = retirement_wake;
+            snapshot.direct_hold_crtcs = direct_hold_crtcs;
 
             let primary_intents = conductor
                 .composed
@@ -8312,7 +8324,9 @@ impl KmsBackend {
 
             for (&crtc, &generation) in &conductor.composed {
                 let key = IntentKey::Composed { crtc, generation };
-                let readiness = if !outputs_powered_on {
+                let readiness = if snapshot.is_direct_hold_protected(crtc) {
+                    Readiness::Waiting(WaitReason::DirectFrameHeld)
+                } else if !outputs_powered_on {
                     Readiness::Waiting(WaitReason::OutputPoweredOff)
                 } else if backend_composed {
                     backend_composed_readiness

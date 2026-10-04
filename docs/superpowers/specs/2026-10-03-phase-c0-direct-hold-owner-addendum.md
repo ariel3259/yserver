@@ -1,6 +1,6 @@
 # Phase C.0 addendum: the Owner route honours the direct hold
 
-**Status:** revision 3 (review round 1: M-1 protected set, M-2 lifecycle
+**Status:** revision 5 (review round 1: M-1 protected set, M-2 lifecycle
 handoffs, M-3 test preconditions; round 2: M-1 the invariant's two ownership
 states, M-2 per-variant mutation reachability; round 3: M-1 the invariant
 restated negatively so it covers initial entry, M-2 the client modeset keeps

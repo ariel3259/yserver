@@ -71,6 +71,10 @@ impl<R> Submitted<R> {
         &self.new
     }
 
+    pub fn old_resources(&self) -> &[R] {
+        &self.old
+    }
+
     pub fn into_parts(self) -> (Vec<R>, Vec<R>) {
         (self.old, self.new)
     }
@@ -84,6 +88,10 @@ impl<R> Accepted<R> {
     }
 
     pub fn old(&self) -> &[R] {
+        &self.old
+    }
+
+    pub fn old_resources(&self) -> &[R] {
         &self.old
     }
 

@@ -166,6 +166,7 @@ impl Admission {
             .iter()
             .filter(|candidate| {
                 matches!(candidate.admitted, Admitted::Composed { .. })
+                    && !self.direct_hold_excludes_composed(candidate, snapshot)
                     && candidate
                         .crtcs
                         .iter()
@@ -197,6 +198,7 @@ impl Admission {
         };
         candidates.iter().any(|candidate| {
             candidate.crtcs.contains(&key.crtc)
+                && !self.direct_hold_excludes_composed(candidate, snapshot)
                 && round_robin_allows(candidate, &self.last_primary_crtcs, owed)
                 && snapshot.is_compatible(maintenance, candidate.intent)
         })
@@ -206,7 +208,7 @@ impl Admission {
         let mut candidates = Vec::new();
 
         for (crtc, composed) in self.composed_intents() {
-            if self.primary_is_blocked(crtc) {
+            if self.primary_is_blocked(crtc) || snapshot.is_direct_hold_protected(crtc) {
                 continue;
             }
 
@@ -260,6 +262,18 @@ impl Admission {
         self.unflip()
             .is_some_and(|barrier| barrier.crtcs.contains(&crtc))
             || self.cursor_recovery().contains(&crtc)
+    }
+
+    fn direct_hold_excludes_composed(
+        &self,
+        candidate: &Candidate,
+        snapshot: &ReadinessSnapshot,
+    ) -> bool {
+        matches!(candidate.admitted, Admitted::Composed { .. })
+            && candidate
+                .crtcs
+                .iter()
+                .any(|&crtc| snapshot.is_direct_hold_protected(crtc))
     }
 
     fn primary_decision(
@@ -327,6 +341,7 @@ impl Admission {
         let combined_primary = candidates
             .iter()
             .filter(|candidate| candidate.crtcs.contains(&key.crtc))
+            .filter(|candidate| !self.direct_hold_excludes_composed(candidate, snapshot))
             .filter(|candidate| round_robin_allows(candidate, &self.last_primary_crtcs, owed))
             .filter(|candidate| snapshot.is_compatible(maintenance_intent, candidate.intent))
             .min_by_key(|candidate| candidate.ordinal);
@@ -380,6 +395,7 @@ impl Admission {
                 };
                 (candidates.iter().any(|candidate| {
                     candidate.crtcs.contains(&key.crtc)
+                        && !self.direct_hold_excludes_composed(candidate, snapshot)
                         && snapshot.is_compatible(maintenance, candidate.intent)
                 }) && snapshot.is_ready(maintenance))
                 .then_some(CarriedMaintenance {
