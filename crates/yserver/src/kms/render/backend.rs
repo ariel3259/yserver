@@ -29704,8 +29704,7 @@ impl Backend for KmsBackend {
         // Font-path (fonts.dir/alias) names first, then the built-ins
         // catalog — ONE global max_names budget across the ordered
         // walk (Xorg traverses FPEs in path order with one count).
-        let mut names: Vec<String> = self.core.font_loader.path_font_names(pattern);
-        names.truncate(cap);
+        let names: Vec<String> = self.core.font_loader.list_font_names(pattern, cap);
 
         let mut name_data: Vec<u8> = Vec::new();
         for name in &names {
@@ -29735,8 +29734,7 @@ impl Backend for KmsBackend {
         // Path fonts first, then built-ins — one global budget
         // (mirrors list_fonts_proxy ordering so the two requests
         // agree on the visible font set).
-        let mut matched: Vec<String> = self.core.font_loader.path_font_names(pattern);
-        matched.truncate(cap);
+        let matched: Vec<String> = self.core.font_loader.list_font_names(pattern, cap);
 
         let mut entries: Vec<(String, FontMetrics)> = Vec::with_capacity(matched.len());
         for name in matched {

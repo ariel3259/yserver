@@ -38,7 +38,7 @@ use yserver_protocol::x11::{
 
 use crate::kms::{
     cpu_types::{PictTransform, Rectangle16, Repeat},
-    font_index::{FontPattern, LoweredName},
+    font_index::{FontPattern, FontTable, LoweredName, TableEntry},
     xkb_desc::XkbDesc,
 };
 
@@ -365,18 +365,50 @@ pub(crate) struct FontState {
 /// back through `open_font`, so the LFWI metrics path can return real
 /// FreeType metrics for any name we hand out.
 /// One font-path directory: parsed `fonts.dir` (+ optional
-/// `fonts.alias`). Names are kept verbatim (matching is
-/// case-insensitive per the X11 spec).
+/// `fonts.alias`), as libXfont's fontfile FPE keeps it: names lowered and
+/// sorted into two tables (`FontFileReadDirectory`).
 #[derive(Debug, Clone)]
 pub(crate) struct FontDir {
-    /// fonts.dir entries in file order: (font name, glyph file path).
-    pub(crate) entries: Vec<(String, std::path::PathBuf)>,
-    /// fonts.alias entries: (alias, target font name or pattern).
-    pub(crate) aliases: Vec<(String, String)>,
-    /// `entries` names, lowered for matching.
-    entry_keys: Vec<LoweredName>,
-    /// `aliases` names, lowered for matching.
-    alias_keys: Vec<LoweredName>,
+    /// libXfont's `nonScalable` table: the fonts.dir names that are not a
+    /// scalable XLFD, and the aliases.
+    pub(crate) non_scalable: FontTable<DirEntry>,
+    /// libXfont's `scalable` table: fonts.dir XLFDs without a pixel or
+    /// point size (`-0-0-`), as mkfontscale writes for outline fonts.
+    pub(crate) scalable: FontTable<DirEntry>,
+}
+
+/// What a [`FontDir`] name stands for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DirEntry {
+    /// A fonts.dir entry: its glyph file.
+    File(std::path::PathBuf),
+    /// A fonts.alias entry: the font name or pattern it stands for,
+    /// lowered as libXfont stores it.
+    Alias(String),
+}
+
+/// Whether a fonts.dir name goes to libXfont's `scalable` table: an XLFD
+/// (14 dashes) whose size fields parse (`FontParseXLFDName`'s `GetInt`:
+/// digits, empty or `*`) and whose pixel and point sizes are both unset.
+fn is_scalable_xlfd(name: &str) -> bool {
+    let f: Vec<&str> = name.split('-').collect();
+    if f.len() != 15 {
+        return false;
+    }
+    let int = |s: &str| -> Option<i64> {
+        match s {
+            "*" => Some(-1),
+            _ if s.bytes().all(|c| c.is_ascii_digit()) => Some(
+                s.bytes()
+                    .fold(0i64, |v, c| v.saturating_mul(10) + i64::from(c - b'0')),
+            ),
+            _ => None,
+        }
+    };
+    let (Some(px), Some(pt)) = (int(f[7]), int(f[8])) else {
+        return false;
+    };
+    [9, 10, 12].iter().all(|&i| int(f[i]).is_some()) && px <= 0 && pt <= 0
 }
 
 impl FontDir {
@@ -384,9 +416,10 @@ impl FontDir {
     /// may be missing but not both: libXfont's `FontFileReadDirectory`
     /// takes a directory of aliases alone, as CDE's
     /// `/usr/dt/etc/cde/fontaliases` is. fonts.dir: first line = entry count, then
-    /// `<file> <name>` per line (name may contain spaces — split at
-    /// the FIRST space). fonts.alias: `<alias> <name>` with optional
-    /// double quotes around either; `!` starts a comment line.
+    /// `<file> <name>` per line (the file name ends at the first blank,
+    /// the font name is the rest of the line). fonts.alias: `<alias> <name>` with optional
+    /// double quotes around either; `!` starts a comment line; an alias
+    /// naming itself is dropped (`FontFileAddFontAlias`).
     pub(crate) fn load(dir: &std::path::Path) -> io::Result<Self> {
         let dir_listing = match std::fs::read_to_string(dir.join("fonts.dir")) {
             Ok(text) => Some(text),
@@ -401,40 +434,60 @@ impl FontDir {
             ));
         }
         let dir_listing = dir_listing.unwrap_or_default();
-        let mut entries = Vec::new();
+        let mut non_scalable = Vec::new();
+        let mut scalable = Vec::new();
         for line in dir_listing.lines().skip(1) {
             let line = line.trim_end();
-            if let Some((file, name)) = line.split_once(' ') {
+            if let Some((file, name)) = line.split_once(char::is_whitespace) {
+                let name = name.trim_start();
                 if file.is_empty() || name.is_empty() {
                     continue;
                 }
-                entries.push((name.to_string(), dir.join(file)));
+                let entry = (name.to_string(), DirEntry::File(dir.join(file)));
+                if is_scalable_xlfd(name) {
+                    scalable.push(entry);
+                } else {
+                    non_scalable.push(entry);
+                }
             }
         }
-        let mut aliases = Vec::new();
         if let Some(alias_text) = alias_text {
             for line in alias_text.lines() {
                 let line = line.trim();
                 if line.is_empty() || line.starts_with('!') {
                     continue;
                 }
-                let (alias, rest) = match split_alias_token(line) {
-                    Some(pair) => pair,
-                    None => continue,
+                let Some((alias, rest)) = split_alias_token(line) else {
+                    continue;
                 };
                 if let Some((target, _)) = split_alias_token(rest) {
-                    aliases.push((alias.to_string(), target.to_string()));
+                    if alias == target {
+                        continue;
+                    }
+                    let target = LoweredName::new(target);
+                    non_scalable.push((
+                        alias.to_string(),
+                        DirEntry::Alias(String::from_utf8_lossy(&target.bytes).into_owned()),
+                    ));
                 }
             }
         }
-        let entry_keys = entries.iter().map(|(n, _)| LoweredName::new(n)).collect();
-        let alias_keys = aliases.iter().map(|(a, _)| LoweredName::new(a)).collect();
         Ok(Self {
-            entries,
-            aliases,
-            entry_keys,
-            alias_keys,
+            non_scalable: FontTable::new(non_scalable),
+            scalable: FontTable::new(scalable),
         })
+    }
+
+    /// The names `pattern` matches, in the order libXfont lists them
+    /// (`_FontFileListFonts`): the `nonScalable` table, then the
+    /// `scalable` one, each in `strcmpn` order.
+    pub(crate) fn matching<'a>(
+        &'a self,
+        pattern: &'a FontPattern,
+    ) -> impl Iterator<Item = &'a TableEntry<DirEntry>> + 'a {
+        self.non_scalable
+            .matching(pattern)
+            .chain(self.scalable.matching(pattern))
     }
 }
 
@@ -557,9 +610,7 @@ pub(crate) fn embedded_font(name: &str) -> Option<&'static EmbeddedFont> {
 pub(crate) struct FontLoader {
     pub(crate) library: freetype::Library,
     pub(crate) fc: fontconfig::Fontconfig,
-    pub(crate) catalog: Vec<String>,
-    /// `catalog`, lowered for matching.
-    catalog_keys: Vec<LoweredName>,
+    pub(crate) catalog: FontTable<()>,
     /// `XORG_BUILTIN_NAMES`, lowered for matching.
     builtin_keys: Vec<LoweredName>,
     /// Current font path, element order significant. Elements are
@@ -584,8 +635,7 @@ impl FontLoader {
             library: freetype::Library::init()
                 .map_err(|e| io::Error::other(format!("freetype init failed: {e:?}")))?,
             fc,
-            catalog_keys: catalog.iter().map(|n| LoweredName::new(n)).collect(),
-            catalog,
+            catalog: FontTable::new(catalog.into_iter().map(|n| (n, ()))),
             builtin_keys: XORG_BUILTIN_NAMES
                 .iter()
                 .map(|n| LoweredName::new(n))
@@ -674,7 +724,6 @@ impl FontLoader {
             return None;
         }
         let pattern = FontPattern::new(name);
-        let key = LoweredName::new(name);
         for dir in &self.path_dirs {
             let Some(dir) = dir else {
                 // "built-ins": embedded fonts first — a fontconfig
@@ -690,45 +739,34 @@ impl FontLoader {
                 }
                 // then the alias set, then catalog XLFD match.
                 if BUILTIN_ALIASES.iter().any(|a| a.eq_ignore_ascii_case(name))
-                    || self.catalog_keys.iter().any(|k| pattern.matches(k))
+                    || self.catalog.matching(&pattern).next().is_some()
                     || self.builtin_xlfd_is_current_alias_reply(name)
                 {
                     return Some(FontResolution::BuiltIn);
                 }
                 continue;
             };
-            let file = |i: usize| {
-                let (n, p) = &dir.entries[i];
-                FontResolution::File {
-                    path: p.clone(),
-                    entry_name: n.clone(),
-                }
-            };
-            if let Some(i) = dir.entry_keys.iter().position(|k| k.bytes == key.bytes) {
-                return Some(file(i));
-            }
-            if let Some(i) = dir.alias_keys.iter().position(|k| k.bytes == key.bytes) {
-                return self.resolve_inner(&dir.aliases[i].1, hops - 1);
-            }
-            if let Some(i) = dir.entry_keys.iter().position(|k| pattern.matches(k)) {
-                return Some(file(i));
-            }
-            // A pattern matches aliases too: libXfont looks a name up in
-            // one table of a directory's fonts and aliases
-            // (`FontFileFindNameInDir`), so CDE's `-dt-interface …-m*-…`
-            // opens through `/usr/dt/etc/cde/fontaliases`, a directory of
-            // aliases alone.
+            // libXfont looks a name up in one table of a directory's
+            // fonts and aliases (`FontFileFindNameInDir`), so CDE's
+            // `-dt-interface …-m*-…` opens through
+            // `/usr/dt/etc/cde/fontaliases`, a directory of aliases alone.
             // An alias whose target is not on this system (CDE's
             // fonts.alias names fonts for every charset) gives way to the
             // next one that matches.
-            if let Some(found) = dir
-                .alias_keys
-                .iter()
-                .zip(&dir.aliases)
-                .filter(|(k, _)| pattern.matches(k))
-                .find_map(|(_, (_, target))| self.resolve_inner(target, hops - 1))
-            {
-                return Some(found);
+            for e in dir.matching(&pattern) {
+                match &e.value {
+                    DirEntry::File(path) => {
+                        return Some(FontResolution::File {
+                            path: path.clone(),
+                            entry_name: e.name.to_string(),
+                        });
+                    }
+                    DirEntry::Alias(target) => {
+                        if let Some(found) = self.resolve_inner(target, hops - 1) {
+                            return Some(found);
+                        }
+                    }
+                }
             }
         }
         None
@@ -820,42 +858,38 @@ impl FontLoader {
         Self::alias_to_xlfd(alias, &metrics).eq_ignore_ascii_case(name)
     }
 
-    /// Every name on the current path matching `pattern`, element by
-    /// element as Xorg's ListFonts walks them: a directory's fonts.dir
-    /// and alias names; for `built-ins`, Xorg's own built-in names, then
-    /// the fontconfig catalog this server adds there. Nothing from
-    /// `built-ins` when the path does not hold it, as on Xorg.
-    pub(crate) fn path_font_names(&self, pattern: &str) -> Vec<String> {
+    /// The first `max` names on the current path matching `pattern`,
+    /// element by element as Xorg's ListFonts walks them, each element
+    /// asked only for what is left of `max`: a directory's names in
+    /// libXfont's order ([`FontDir::matching`]); for `built-ins`, Xorg's
+    /// own built-in names, then the fontconfig catalog this server adds
+    /// there. Nothing from `built-ins` when the path does not hold it, as
+    /// on Xorg.
+    pub(crate) fn list_font_names(&self, pattern: &str, max: usize) -> Vec<String> {
         let pattern = FontPattern::new(pattern);
         let mut out = Vec::new();
         for dir in &self.path_dirs {
+            let left = max.saturating_sub(out.len());
+            if left == 0 {
+                break;
+            }
             let Some(dir) = dir else {
                 out.extend(
                     XORG_BUILTIN_NAMES
                         .iter()
                         .zip(&self.builtin_keys)
                         .filter(|(_, k)| pattern.matches(k))
-                        .map(|(n, _)| (*n).to_string()),
-                );
-                out.extend(
-                    self.catalog
-                        .iter()
-                        .zip(&self.catalog_keys)
-                        .filter(|(_, k)| pattern.matches(k))
-                        .map(|(n, _)| n.clone()),
+                        .map(|(n, _)| (*n).to_string())
+                        .chain(self.catalog.matching(&pattern).map(|e| e.name.to_string()))
+                        .take(left),
                 );
                 continue;
             };
-            for ((name, _), k) in dir.entries.iter().zip(&dir.entry_keys) {
-                if pattern.matches(k) {
-                    out.push(name.clone());
-                }
-            }
-            for ((alias, _), k) in dir.aliases.iter().zip(&dir.alias_keys) {
-                if pattern.matches(k) {
-                    out.push(alias.clone());
-                }
-            }
+            out.extend(
+                dir.matching(&pattern)
+                    .take(left)
+                    .map(|e| e.name.to_string()),
+            );
         }
         out
     }
@@ -2892,11 +2926,29 @@ mod font_tests {
     fn fonts_dir_parse_and_alias() {
         let dir = write_test_font_dir("parse");
         let fd = FontDir::load(&dir).unwrap();
-        assert_eq!(fd.entries.len(), 2);
-        assert_eq!(fd.entries[0].0, "testfont0");
+        assert_eq!(fd.non_scalable.len(), 3);
+        assert_eq!(fd.scalable.len(), 0);
+        let all = FontPattern::new("*");
+        let names: Vec<(String, DirEntry)> = fd
+            .matching(&all)
+            .map(|e| (e.name.to_string(), e.value.clone()))
+            .collect();
         assert_eq!(
-            fd.aliases,
-            vec![("myalias".to_string(), "testfont0".to_string())]
+            names,
+            [
+                (
+                    "-vsw-testfont-bold-r-normal--13-130-75-75-m-70-iso8859-1".to_string(),
+                    DirEntry::File(dir.join("testfont0.bdf"))
+                ),
+                (
+                    "myalias".to_string(),
+                    DirEntry::Alias("testfont0".to_string())
+                ),
+                (
+                    "testfont0".to_string(),
+                    DirEntry::File(dir.join("testfont0.bdf"))
+                ),
+            ]
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3196,7 +3248,7 @@ mod font_tests {
             ),
             (6, 11, 2)
         );
-        assert_eq!(&loader.path_font_names("*")[..6], XORG_BUILTIN_NAMES);
+        assert_eq!(&loader.list_font_names("*", 6), XORG_BUILTIN_NAMES);
         let aliases = std::env::temp_dir().join(format!(
             "yserver-font-test-no-builtins-{}",
             std::process::id()
@@ -3206,7 +3258,7 @@ mod font_tests {
         loader
             .set_font_path(&[aliases.to_string_lossy().into_owned()])
             .unwrap();
-        assert!(loader.path_font_names("fixed").is_empty());
+        assert!(loader.list_font_names("fixed", 10).is_empty());
         let _ = std::fs::remove_dir_all(aliases);
     }
 
