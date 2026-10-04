@@ -23,6 +23,7 @@ ash.workspace = true
 crossbeam-channel.workspace = true
 drm.workspace = true
 env_logger.workspace = true
+flate2 = "1.1"
 fontconfig = "0.11"
 freetype-rs.workspace = true
 gbm.workspace = true

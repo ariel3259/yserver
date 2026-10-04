@@ -1492,6 +1492,7 @@ fn compute_char_info(face: &freetype::Face, ch: char, use_ink: bool) -> Protocol
 }
 
 /// PCF file facts FreeType doesn't expose.
+#[derive(Debug, PartialEq)]
 struct PcfFileInfo {
     /// BDF_ENCODINGS header default_char — bdftopcf moves
     /// DEFAULT_CHAR out of the property table.
@@ -1509,14 +1510,33 @@ struct PcfFileInfo {
 }
 
 /// Parse the PCF table directory for [`PcfFileInfo`]. Returns None
-/// for non-PCF/compressed/odd files.
+/// for non-PCF/odd files.
 fn pcf_file_info(path: &std::path::Path) -> Option<PcfFileInfo> {
     pcf_info_from_bytes(&std::fs::read(path).ok()?)
 }
 
-/// [`pcf_file_info`] over an in-memory PCF image — shared with the
-/// embedded built-in fonts, which have no path to read.
+/// A PCF image as libXfont reads it: gzip-compressed files (detected
+/// by magic, like its BufFilePushZIP) are inflated first.
+fn pcf_image(data: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
+    use std::io::Read;
+    // Bitmap fonts inflate to a few MiB at most; cap a bogus stream.
+    const MAX_PCF: u64 = 64 << 20;
+    if !data.starts_with(&[0x1f, 0x8b]) {
+        return Some(std::borrow::Cow::Borrowed(data));
+    }
+    let mut out = Vec::new();
+    flate2::read::MultiGzDecoder::new(data)
+        .take(MAX_PCF)
+        .read_to_end(&mut out)
+        .ok()?;
+    Some(std::borrow::Cow::Owned(out))
+}
+
+/// [`pcf_file_info`] over an in-memory PCF image, plain or gzipped —
+/// shared with the embedded built-in fonts, which have no path to read.
 fn pcf_info_from_bytes(data: &[u8]) -> Option<PcfFileInfo> {
+    let image = pcf_image(data)?;
+    let data: &[u8] = &image;
     const PCF_ACCELERATORS: u32 = 1 << 1;
     const PCF_INK_METRICS: u32 = 1 << 4;
     const PCF_BDF_ENCODINGS: u32 = 1 << 5;
@@ -3609,6 +3629,59 @@ mod font_tests {
 #[cfg(test)]
 mod pcf_tests {
     use super::*;
+
+    /// A gzipped PCF (how distros install bitmap fonts) reads the same
+    /// tables as the plain image it inflates to.
+    #[test]
+    fn gzipped_pcf_parses_like_its_plain_image() {
+        use std::io::Write;
+        let plain = include_bytes!("../../fonts/6x13-ISO8859-1.pcf");
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(plain).unwrap();
+        let gz = enc.finish().unwrap();
+        let from_plain = pcf_info_from_bytes(plain).expect("plain PCF parses");
+        assert_eq!(pcf_info_from_bytes(&gz), Some(from_plain));
+        assert_eq!(
+            pcf_info_from_bytes(&gz[..gz.len() / 2]),
+            None,
+            "truncated stream"
+        );
+    }
+
+    /// default_char of installed .pcf.gz fonts, as a live Xorg 21.1
+    /// ListFontsWithInfo reports it (vng font-list scenario): 32 for
+    /// sony 8x16, 0x2121 for jiskan16. Skips when the fonts are absent.
+    #[test]
+    fn system_pcf_gz_default_char_matches_xorg() {
+        let dir = std::path::Path::new("/usr/share/fonts/misc");
+        let cases = [
+            (
+                "8x16.pcf.gz",
+                "-sony-fixed-medium-r-normal--16-120-100-100-c-80-iso8859-1",
+                32,
+            ),
+            (
+                "jiskan16.pcf.gz",
+                "-jis-fixed-medium-r-normal--16-150-75-75-c-160-jisx0208.1983-0",
+                0x2121,
+            ),
+        ];
+        if !cases.iter().all(|(f, _, _)| dir.join(f).is_file()) || !dir.join("fonts.dir").is_file()
+        {
+            eprintln!("skipping: misc .pcf.gz fonts not present");
+            return;
+        }
+        let mut loader = FontLoader::new().unwrap();
+        loader
+            .set_font_path(&[dir.to_string_lossy().into_owned()])
+            .unwrap();
+        for (file, xlfd, dc) in cases {
+            let info = pcf_file_info(&dir.join(file)).expect("gzipped PCF parses");
+            assert_eq!(info.default_char, Some(dc), "{file}");
+            let (_face, metrics, _) = loader.open_font(xlfd).unwrap();
+            assert_eq!(metrics.default_char, dc, "{xlfd}");
+        }
+    }
 
     /// Real compiled PCF regression: FreeType's PCF driver leaves no
     /// charmap selected for registry-less fonts (the xts xtfonts), so
