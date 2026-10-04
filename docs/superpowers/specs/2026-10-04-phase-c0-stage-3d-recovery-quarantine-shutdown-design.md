@@ -1,7 +1,8 @@
 # Phase C.0 stage 3d — recovery, quarantine and shutdown
 
-**Status:** revision 2 (design review round 1: M-1 the invisibility contract
-scoped, requests during recovery parked, late executor results). Design
+**Status:** revision 3 (design review round 1: M-1 the invisibility contract
+scoped, requests during recovery parked, late executor results; round 2: M-2
+the RANDR gate and administrative-reprobe contract of section 3.3). Design
 approved by the user section by section on 2026-10-04. One spec, two plans
 (3d-i, 3d-ii).
 
@@ -137,6 +138,42 @@ A completion loss or mechanism breach already moves the device to `Poisoned`
   same quarantine. The executor lease keeps the old incarnation from retiring
   until return or reap.
 
+### 3.3. The RANDR gate during recovery (review round 2, M-2)
+
+The core's `RandrMutationGate` serializes RANDR mutations and forced reprobes,
+and an active or requested topology episode blocks both
+(`yserver-core/src/core_loop/run.rs`). Recovery must neither hide a
+higher-priority input behind the gate nor wait for a gate turn that waits for
+it:
+
+1. **Recovery takes no gate episode.** It runs as the device's lifecycle
+   transition inside the backend; it never requests a topology episode to
+   park mutations.
+2. **A RANDR mutation that arrives while a device is `Poisoned` or
+   `Recovering` holds its own ordinary gate turn** and is answered when the
+   recovery terminates (decision 2a): its begin returns pending, and the
+   recovery's terminal outcome (`Ready` or `RecoveryFailed`) wakes it, after
+   which it is validated and executed through the ordinary 3b path. The gate's
+   `Q` = 30 s bound answers it `Failed` if the recovery is still running then
+   (for example paused by DPMS-off or waiting for a reap).
+3. **Administrative-reprobe delivery is not gated.** A forced reprobe updates
+   the `REC-5` desired snapshot (`AdministrativeReprobe`) when the request is
+   received, before it waits for a gate turn, so the arbiter can supersede a
+   paused or stalled recovery immediately. Its protocol reply still follows
+   gate order.
+4. **No circular wait from `RecoveryFailed`.** A forced reprobe that is
+   authorized to create the fresh attempt (decision 3) is **answered first**,
+   from the current (withdrawn) state, and releases its gate turn; the fresh
+   attempt then runs as the device's lifecycle transition. A successful
+   attempt republishes the restored outputs as one requester-less publication
+   (the device was withdrawn, so its topology does change; decision 2 does not
+   apply to a return from `RecoveryFailed`). A failed attempt publishes nothing
+   new.
+5. **Wake on every terminal path.** Success, failure, executor stall,
+   supersession and shutdown each wake the parked mutation exactly once with
+   the state it must be validated against; supersession by `Shutdown` answers
+   it as shutdown does.
+
 ## 4. 3d-ii — quarantine, `Removed` teardown and shutdown
 
 ### 4.1. Inventory and transfer of retained owners
@@ -213,6 +250,13 @@ names the mutation that must fail. The umbrella §4 differential gate applies.
   in the gate and then executes (decision 2a), and an in-flight Present, which
   is terminalized. A second case ends in `RecoveryFailed`: the parked mutation
   is validated against the withdrawn state.
+- RANDR gate (section 3.3), through the core loop: a forced reprobe arriving
+  during a recovery paused by DPMS-off supersedes it promptly (its desired
+  update is not blocked behind the parked mutation); a forced reprobe on a
+  `RecoveryFailed` device is answered from the withdrawn state, then the fresh
+  attempt runs and republishes once on success; a parked mutation is woken
+  exactly once on success, failure, stall, supersession and shutdown, and at
+  `Q` if the recovery is still running.
 - Late executor results after supersession: an accepted-stale result's fds are
   adopted and closed exactly once and both resource sets reach the winning
   transition's quarantine; a rejection cleans up only never-submitted state.
