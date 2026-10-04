@@ -8,6 +8,13 @@
 > prompt; the coordinator re-runs them before each commit. Every other `c0_hw_*`, `_drm` or
 > `render_acceptance` test stays forbidden. No git writes.
 
+**Revision 3 (2026-10-04, coordinator) — review loop closed after round 2** (0 blocking, 1 major,
+`../findings/2026-10-04-stage-3d-i-1-plan-review-round2.md`; all round-1 findings applied, M-2 partial):
+no design defect remains (user's convergence rule). Folded in without another round: Task 6 runs the
+recovery hardware case for **4 cycles** (M-2); the round's open integration question becomes
+implementation note **IN-1** in Task 8 (the retained old executor keeps being polled and drained, with
+request/transition correlation, until reaped).
+
 **Revision 2 (2026-10-04, coordinator)** — codex round 1 (1 blocking, 2 major, 1 minor, all confirmed,
 `../findings/2026-10-04-stage-3d-i-1-plan-review-round1.md`): the acquire preparation's synchronous
 forced connector probe moves to a probe worker before recovery reuses it (B-1, new Task 5, which also
@@ -217,8 +224,9 @@ reopens; failure/unknown → `RecoveryFailed` (Task 2's path). Topology unchange
 | `c0_3di_reinstall_failure_is_recovery_failed_vulkan` | the reinstall is rejected: `RecoveryFailed`, withdrawn, no retry | retry the reinstall once |
 | `c0_3di_unknown_completion_during_attempt_vulkan` | *(M-1)* the reinstall commit on the fresh incarnation is accepted and its completion is lost (through the executor and the core driver, not the scripted seam): `RecoveryFailed` in one input, the **same** `RecoveryId`, one withdrawal, never `Poisoned`, no retry | route the loss through the generic `Poisoned` handling while `Recovering` |
 
-**Hardware:** `c0_hw_3di_completion_loss_recovers_on_card1_drm` (Task 9's test) is first run here, 1
-cycle, as this task's real-path evidence; Task 9 runs the 4-cycle acceptance.
+**Hardware:** `c0_hw_3di_completion_loss_recovers_on_card1_drm` is delivered and run here for **at least
+4 cycles** using only Tasks 1–6 (round 2, M-2); Task 9 re-runs it as the final acceptance and records the
+coverage.
 
 ## Task 7 — `ExecutorStalled` and resume of the same incident
 
@@ -243,6 +251,12 @@ winning quarantine; rejection cleans only never-submitted state).
 | `c0_3di_vt_release_supersedes_recovery_vulkan` | release during the barrier wait: the release wins, no reopen, the incident is invalidated per `REC-6`; the next acquire installs the fresh incarnation | reopen after the release |
 | `c0_3di_removal_supersedes_recovery_vulkan` | `DeviceRemoved` during `Recovering`: `Removed`, the quarantine transferred, no further attempt | keep the attempt running |
 | `c0_3di_dpms_on_resumes_paused_attempt_vulkan` | DPMS-off pauses the attempt, DPMS-on resumes it: one attempt total | start a new attempt on DPMS-on |
+**IN-1 (round 2 open question):** after the fresh incarnation replaces the old entry, the retained old
+`KmsIoExecutor` stays registered with the core loop (its control/reply fd in `poll_fds`, its watchdog
+ticked) until it is reaped, so a buffered reply is still drained and routed with its request and
+transition correlation to the winning transition's quarantine; it never reaches the new incarnation's
+owner. Test: the late-`Accepted` case below must arrive through that drained transport, not be injected.
+
 | `c0_3di_late_accepted_result_goes_to_quarantine_vulkan` | an old-incarnation `Accepted` arrives after `Ready`: its fds are adopted and closed once, both resource sets in the winning quarantine, nothing promoted | promote the late result |
 
 ## Task 9 — hardware: injected completion loss on card1, and the coverage evidence
