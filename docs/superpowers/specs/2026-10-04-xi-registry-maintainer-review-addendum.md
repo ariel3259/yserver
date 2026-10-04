@@ -75,9 +75,19 @@ not deletable (`devices.c:308-311`). The property handler
 - anything other than format 8 / `INTEGER` / size 1 is `BadValue`;
 - writing 0 to 2, 3, 4 or 5 is `BadAccess`, and writing 1 there succeeds
   without change;
-- on a physical facet, 0 runs A3 and 1 runs A4's enable, unless the facet
-  is session-disabled. In that case the write only records the client fact,
-  and the facet stays disabled until the session returns;
+- on a physical facet that is enabled, 0 runs A3 and sets the
+  client-disabled fact. On a client-disabled facet, nonzero clears the fact
+  and runs A4's enable;
+- a write that changes no state (1 on an enabled device, 0 on a disabled one,
+  either value on 2..5 except 0) runs no transition. In particular, 0 written
+  while the facet is only session-disabled records nothing: Xorg's handler
+  acts only when `dev->enabled` (`devices.c:162-165`), and VT enter re-enables
+  the device (`xf86Events.c:316-320`);
+- after the handler, every successful write stores the client's bytes as
+  written (a nonzero value other than 1 stays as written) and sends one more
+  property notification (`Xi/xiproperty.c:759-801`). A transition therefore
+  produces its full A3/A4 sequence, including its own property event, followed
+  by this final property event;
 - any nonzero value means enabled (`devices.c:162-165` tests the byte for
   zero);
 - `DeleteProperty` on it is `BadAccess` (`Xi/xiproperty.c:657`, not

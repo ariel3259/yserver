@@ -166,9 +166,13 @@ writes.
    button state clears. *Kills:* skipping the facet cleanup.
 3. 0 on 2, 3, 4, 5 → `BadAccess`, and nothing changes. A format-16 write →
    `BadValue`. Delete → `BadAccess`.
-4. Client-disable while session-disabled (suspended): no events. Resume: the
-   facet stays disabled and floating, with no `XIDeviceEnabled`. A later
-   write of 1 enables it.
+4. Write 0 while only session-disabled (suspended): exactly one property
+   event, no transition, and nothing recorded. Resume re-enables it normally
+   (Xorg `devices.c:162-165`, `xf86Events.c:316-320`).
+5. Notification order for a client disable: the A3 sequence (property 0,
+   presence, hierarchy), then one final property event. Writing 5 to a
+   disabled facet enables it and `XIGetProperty` returns 5. *Kills:*
+   normalizing the stored byte; omitting the outer event.
 
 ### Task 5 — libinput writes to disabled facets (A7)
 
