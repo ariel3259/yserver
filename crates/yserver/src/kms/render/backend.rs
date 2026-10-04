@@ -21214,6 +21214,37 @@ impl KmsBackend {
         true
     }
 
+    /// Drain just one physical XI facet while it is still enabled. Client
+    /// disable requests use this narrower cleanup so a mixed source keeps
+    /// delivering through its sibling facet.
+    fn release_device_facet_holds(&mut self, state: &mut ServerState, device_id: u16) -> bool {
+        let Some(device) = state
+            .xi_devices
+            .device(device_id)
+            .filter(|device| device.enabled)
+            .cloned()
+        else {
+            return false;
+        };
+        let Some(source_id) = device.source_id else {
+            return false;
+        };
+        match device.facet {
+            Some(yserver_core::xinput::XiFacetKind::Keyboard) => {
+                state
+                    .key_repeats
+                    .remove(&yserver_core::core_loop::InputOrigin::Physical(source_id));
+                self.release_keyboard_source_keys(state, source_id);
+            }
+            Some(yserver_core::xinput::XiFacetKind::PointerTouch) => {
+                self.release_pointer_source_buttons(state, source_id);
+            }
+            None => return false,
+        }
+        self.synchronize_floating_keyboard_states(state);
+        true
+    }
+
     /// Disable one physical facet in Xorg order. The hierarchy descriptor is
     /// captured while attached, then explicitly handed to the emitter before
     /// the live facet is floated.
@@ -21227,28 +21258,7 @@ impl KmsBackend {
         }
 
         state.xi_set_facet_session_enabled(device_id, false);
-        let Some(mut snapshot) =
-            yserver_core::xinput::hotplug::hierarchy_device_snapshot(state, device_id)
-        else {
-            return;
-        };
-        snapshot.enabled = false;
-        let _dropped = yserver_core::xinput::hotplug::emit_device_enabled_property_change(
-            state, device_id, false,
-        );
-        let _dropped = yserver_core::xinput::hotplug::emit_xi1_device_presence(
-            state,
-            device_id,
-            yserver_core::xinput::hotplug::DevicePresenceChange::Disabled,
-        );
-        let _dropped = yserver_core::xinput::hotplug::emit_xi_hierarchy_changed(
-            state,
-            yserver_core::xinput::hotplug::XiHierarchyStep::DeviceDisabled,
-            device_id,
-            None,
-            Some(snapshot),
-        );
-        state.xi_float_disabled_device(device_id);
+        yserver_core::xinput::hotplug::publish_facet_disabled(state, device_id);
     }
 
     /// Own physical-device held-state cleanup for removal and VT suspension.
@@ -21500,6 +21510,14 @@ impl Backend for KmsBackend {
     }
 
     fn sync_floating_keyboard_states(&mut self, state: &ServerState) {
+        self.synchronize_floating_keyboard_states(state);
+    }
+
+    fn disable_xi_facet(&mut self, state: &mut ServerState, device_id: u16) {
+        let _released = self.release_device_facet_holds(state, device_id);
+    }
+
+    fn enable_xi_facet(&mut self, state: &mut ServerState, _device_id: u16) {
         self.synchronize_floating_keyboard_states(state);
     }
 
@@ -21788,44 +21806,14 @@ impl Backend for KmsBackend {
                             None,
                         );
                         if info.enabled && state.xi_set_facet_session_enabled(id, true) {
-                            let _dropped =
-                                yserver_core::xinput::hotplug::emit_device_enabled_property_change(
-                                    state, id, true,
-                                );
-                            let _dropped = yserver_core::xinput::hotplug::emit_xi1_device_presence(
-                                state,
-                                id,
-                                yserver_core::xinput::hotplug::DevicePresenceChange::Enabled,
-                            );
-                            let _dropped = yserver_core::xinput::hotplug::emit_xi_hierarchy_changed(
-                                state,
-                                yserver_core::xinput::hotplug::XiHierarchyStep::DeviceEnabled,
-                                id,
-                                None,
-                                None,
-                            );
+                            yserver_core::xinput::hotplug::publish_facet_enabled(state, id);
                         }
                     }
                 } else {
                     let ids = state.xi_refresh_source(&info);
                     for id in ids {
                         if info.enabled && state.xi_set_facet_session_enabled(id, true) {
-                            let _dropped =
-                                yserver_core::xinput::hotplug::emit_device_enabled_property_change(
-                                    state, id, true,
-                                );
-                            let _dropped = yserver_core::xinput::hotplug::emit_xi1_device_presence(
-                                state,
-                                id,
-                                yserver_core::xinput::hotplug::DevicePresenceChange::Enabled,
-                            );
-                            let _dropped = yserver_core::xinput::hotplug::emit_xi_hierarchy_changed(
-                                state,
-                                yserver_core::xinput::hotplug::XiHierarchyStep::DeviceEnabled,
-                                id,
-                                None,
-                                None,
-                            );
+                            yserver_core::xinput::hotplug::publish_facet_enabled(state, id);
                         }
                     }
                 }
@@ -21842,22 +21830,7 @@ impl Backend for KmsBackend {
                 let enabled_ids = state.xi_refresh_source(&info);
                 for id in enabled_ids {
                     if info.enabled && state.xi_set_facet_session_enabled(id, true) {
-                        let _dropped =
-                            yserver_core::xinput::hotplug::emit_device_enabled_property_change(
-                                state, id, true,
-                            );
-                        let _dropped = yserver_core::xinput::hotplug::emit_xi1_device_presence(
-                            state,
-                            id,
-                            yserver_core::xinput::hotplug::DevicePresenceChange::Enabled,
-                        );
-                        let _dropped = yserver_core::xinput::hotplug::emit_xi_hierarchy_changed(
-                            state,
-                            yserver_core::xinput::hotplug::XiHierarchyStep::DeviceEnabled,
-                            id,
-                            None,
-                            None,
-                        );
+                        yserver_core::xinput::hotplug::publish_facet_enabled(state, id);
                     }
                 }
                 return;
@@ -44524,6 +44497,919 @@ mod tests {
         assert!(state.key_down_by_device.is_empty());
         assert!(state.xi2_detached_masters.is_empty());
         assert!(state.floating_pointer_positions.is_empty());
+    }
+
+    fn device_enabled_write_body_xi2(
+        device_id: u16,
+        property: u32,
+        format: u8,
+        type_atom: u32,
+        data: &[u8],
+    ) -> Vec<u8> {
+        let mut body = Vec::with_capacity(16 + data.len());
+        body.extend_from_slice(&device_id.to_le_bytes());
+        body.push(yserver_core::xinput::XI_PROP_MODE_REPLACE);
+        body.push(format);
+        body.extend_from_slice(&property.to_le_bytes());
+        body.extend_from_slice(&type_atom.to_le_bytes());
+        let item_size = usize::from(format / 8);
+        body.extend_from_slice(&u32::try_from(data.len() / item_size).unwrap().to_le_bytes());
+        body.extend_from_slice(data);
+        body
+    }
+
+    fn device_enabled_write_body_xi1(
+        device_id: u16,
+        format: u8,
+        mode: u8,
+        property: u32,
+        type_atom: u32,
+        data: &[u8],
+    ) -> Vec<u8> {
+        let mut body = Vec::with_capacity(16 + data.len());
+        body.extend_from_slice(&property.to_le_bytes());
+        body.extend_from_slice(&type_atom.to_le_bytes());
+        body.push(u8::try_from(device_id).unwrap());
+        body.push(format);
+        body.push(mode);
+        body.push(0);
+        let item_size = usize::from(format / 8);
+        body.extend_from_slice(&u32::try_from(data.len() / item_size).unwrap().to_le_bytes());
+        body.extend_from_slice(data);
+        body
+    }
+
+    fn select_device_enabled_transition_events(
+        state: &mut yserver_core::server::ServerState,
+        backend: &mut KmsBackend,
+        device_id: u16,
+        sequence: u16,
+    ) {
+        let mask = (1u32 << 2)
+            | (1u32 << 3)
+            | (1u32 << 4)
+            | (1u32 << 5)
+            | yserver_core::xinput::XI2_HIERARCHY_CHANGED_MASK
+            | yserver_core::xinput::XI2_PROPERTY_EVENT_MASK;
+        let mut xi2 = Vec::with_capacity(16);
+        xi2.extend_from_slice(&yserver_core::resources::ROOT_WINDOW.0.to_le_bytes());
+        xi2.extend_from_slice(&1u16.to_le_bytes());
+        xi2.extend_from_slice(&[0; 2]);
+        xi2.extend_from_slice(&0u16.to_le_bytes()); // XIAllDevices
+        xi2.extend_from_slice(&1u16.to_le_bytes());
+        xi2.extend_from_slice(&mask.to_le_bytes());
+        device_enabled_xi_request(state, backend, 46, sequence, &xi2);
+
+        let presence_class = yserver_core::xinput::XI1_DEVICE_PRESENCE_CLASS;
+        let mut presence = Vec::with_capacity(12);
+        presence.extend_from_slice(&yserver_core::resources::ROOT_WINDOW.0.to_le_bytes());
+        presence.extend_from_slice(&1u16.to_le_bytes());
+        presence.extend_from_slice(&[0; 2]);
+        presence.extend_from_slice(&presence_class.to_le_bytes());
+        device_enabled_xi_request(state, backend, 6, sequence + 1, &presence);
+
+        let property_class = (u32::from(device_id) << 8) | 82;
+        let mut property = Vec::with_capacity(12);
+        property.extend_from_slice(&yserver_core::resources::ROOT_WINDOW.0.to_le_bytes());
+        property.extend_from_slice(&1u16.to_le_bytes());
+        property.extend_from_slice(&[0; 2]);
+        property.extend_from_slice(&property_class.to_le_bytes());
+        device_enabled_xi_request(state, backend, 6, sequence + 2, &property);
+    }
+
+    fn assert_device_enabled_write_cleanup(
+        state: &mut yserver_core::server::ServerState,
+        backend: &mut KmsBackend,
+        source_id: yserver_core::xinput::InputSourceId,
+        original_core_properties: &[std::collections::BTreeMap<
+            yserver_protocol::x11::AtomId,
+            yserver_core::xinput::XiProperty,
+        >; 4],
+    ) {
+        use yserver_core::core_loop::{HostInputEvent, process_disconnect::process_disconnect};
+
+        Backend::on_host_input(backend, state, HostInputEvent::DeviceRemoved { source_id });
+        process_disconnect(state, backend, yserver_protocol::x11::ClientId(5));
+        assert!(state.clients.is_empty(), "XI1/XI2 selections are released");
+        assert!(state.xi_devices.source_ids().is_empty());
+        assert_eq!(
+            state
+                .xi_devices
+                .devices()
+                .iter()
+                .map(|device| device.id)
+                .collect::<Vec<_>>(),
+            [2, 3, 4, 5]
+        );
+        assert_eq!(
+            [2, 3, 4, 5].map(|id| state.xi_devices.device(id).unwrap().properties.clone()),
+            *original_core_properties,
+            "base-device property maps return to baseline"
+        );
+        assert!(state.keys_down.iter().all(|byte| *byte == 0));
+        assert_eq!(state.buttons_down, 0);
+        assert!(state.key_down_by_device.is_empty());
+        assert!(state.key_repeats.is_empty());
+        assert!(state.unpublished_keyboard_keys_down.is_empty());
+        assert!(state.unpublished_pointer_buttons_down.is_empty());
+        assert!(state.xi2_detached_masters.is_empty());
+        assert!(state.floating_pointer_positions.is_empty());
+        assert!(backend.floating_keyboard_states.is_empty());
+        assert!(backend.core.pending_pointer_events.is_empty());
+    }
+
+    #[test]
+    fn xi_device_enabled_write_disables_only_requested_facet_and_drops_its_input() {
+        use yserver_core::{
+            backend::Backend,
+            core_loop::{HostInputEvent, InputOrigin},
+            host_x11::HostKeyEvent,
+            server::ServerState,
+            xinput::{InputSourceId, XiFacetKind},
+        };
+
+        // Kills: changing the source-wide bit, treating only byte value 1 as enabled, or omitting the outer property notification.
+        const SOURCE: InputSourceId = InputSourceId(0xD4_01);
+        const KEYCODE: u8 = 38;
+        let mut state = ServerState::new();
+        let original_core_properties =
+            [2, 3, 4, 5].map(|id| state.xi_devices.device(id).unwrap().properties.clone());
+        let mut backend = KmsBackend::for_tests();
+        let mut peer = kbd_map_client_id(&mut state, 5);
+        let info = dynamic_test_device(SOURCE, true, true);
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceAdded(info.clone()),
+        );
+        let pointer_id = state
+            .xi_devices
+            .facet(SOURCE, XiFacetKind::PointerTouch)
+            .unwrap();
+        let keyboard_id = state
+            .xi_devices
+            .facet(SOURCE, XiFacetKind::Keyboard)
+            .unwrap();
+        select_device_enabled_transition_events(&mut state, &mut backend, pointer_id, 1);
+        let _ = kbd_map_drain(&mut peer);
+
+        let disable = device_enabled_write_body_xi2(
+            pointer_id,
+            state.xi_device_enabled_atom.0,
+            8,
+            yserver_core::xinput::XA_INTEGER.0,
+            &[0],
+        );
+        let disabled_events =
+            device_enabled_request_bytes(&mut state, &mut backend, &mut peer, 57, 4, &disable);
+        assert_eq!(
+            device_enabled_event_kinds(&disabled_events),
+            [
+                "xi2-property",
+                "xi1-property",
+                "presence",
+                "hierarchy",
+                "xi2-property",
+                "xi1-property"
+            ]
+        );
+        assert!(
+            !state.xi_devices.device(pointer_id).unwrap().enabled,
+            "requested pointer facet is disabled"
+        );
+        assert_eq!(
+            state.xi_devices.device(pointer_id).unwrap().attached_master,
+            None,
+            "disabled pointer facet floats"
+        );
+        assert!(state.xi_devices.device(keyboard_id).unwrap().enabled);
+        assert_eq!(
+            state
+                .xi_devices
+                .device(keyboard_id)
+                .unwrap()
+                .attached_master,
+            Some(3),
+            "sibling keyboard stays attached"
+        );
+
+        let old_cursor = (backend.core.cursor_x, backend.core.cursor_y);
+        let old_buttons = state.buttons_down;
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::PointerMotion {
+                origin: InputOrigin::Physical(SOURCE),
+                x: 55,
+                y: 61,
+                time: 5,
+                relative: false,
+                dx: 0,
+                dy: 0,
+                motion_delta: None,
+            },
+        );
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::PointerButton {
+                origin: InputOrigin::Physical(SOURCE),
+                button: 0x110,
+                pressed: true,
+                time: 6,
+            },
+        );
+        assert_eq!((backend.core.cursor_x, backend.core.cursor_y), old_cursor);
+        assert_eq!(state.buttons_down, old_buttons);
+        assert_eq!(state.xi_devices.device(pointer_id).unwrap().buttons_down, 0);
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::Key(HostKeyEvent {
+                origin: InputOrigin::Physical(SOURCE),
+                pressed: true,
+                keycode: KEYCODE,
+                time: 7,
+                root_x: 0,
+                root_y: 0,
+                event_x: 0,
+                event_y: 0,
+                state: 0,
+            }),
+        );
+        let keyboard_events = xi2_events(&kbd_map_drain(&mut peer));
+        assert!(keyboard_events.iter().any(|event| {
+            event.0 == 2
+                && event.1 == keyboard_id
+                && event.2 == keyboard_id
+                && event.3 == u32::from(KEYCODE)
+        }));
+        assert!(state.xi_devices.device(keyboard_id).unwrap().enabled);
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::Key(HostKeyEvent {
+                origin: InputOrigin::Physical(SOURCE),
+                pressed: false,
+                keycode: KEYCODE,
+                time: 8,
+                root_x: 0,
+                root_y: 0,
+                event_x: 0,
+                event_y: 0,
+                state: 0,
+            }),
+        );
+        let _ = kbd_map_drain(&mut peer);
+
+        let enable_nonzero = device_enabled_write_body_xi2(
+            pointer_id,
+            state.xi_device_enabled_atom.0,
+            8,
+            yserver_core::xinput::XA_INTEGER.0,
+            &[2],
+        );
+        let enabled_events = device_enabled_request_bytes(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            57,
+            9,
+            &enable_nonzero,
+        );
+        assert_eq!(
+            device_enabled_event_kinds(&enabled_events),
+            [
+                "xi2-property",
+                "xi1-property",
+                "presence",
+                "hierarchy",
+                "xi2-property",
+                "xi1-property"
+            ]
+        );
+        assert!(
+            state.xi_devices.device(pointer_id).unwrap().enabled,
+            "any nonzero byte re-enables the physical facet"
+        );
+        assert_eq!(
+            state.xi_devices.device(pointer_id).unwrap().attached_master,
+            Some(2)
+        );
+
+        assert_device_enabled_write_cleanup(
+            &mut state,
+            &mut backend,
+            SOURCE,
+            &original_core_properties,
+        );
+    }
+
+    #[test]
+    fn xi_device_enabled_write_drains_held_pointer_button_before_disable() {
+        use yserver_core::{
+            backend::Backend,
+            core_loop::{HostInputEvent, InputOrigin},
+            server::ServerState,
+            xinput::{InputSourceId, XiFacetKind},
+        };
+
+        // Kills: omitting the per-facet release_buttons path before the disabled fact is committed.
+        const SOURCE: InputSourceId = InputSourceId(0xD4_02);
+        let mut state = ServerState::new();
+        let original_core_properties =
+            [2, 3, 4, 5].map(|id| state.xi_devices.device(id).unwrap().properties.clone());
+        let mut backend = KmsBackend::for_tests();
+        let mut peer = kbd_map_client_id(&mut state, 5);
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceAdded(dynamic_test_device(SOURCE, false, true)),
+        );
+        let pointer_id = state
+            .xi_devices
+            .facet(SOURCE, XiFacetKind::PointerTouch)
+            .unwrap();
+        select_device_enabled_transition_events(&mut state, &mut backend, pointer_id, 1);
+        let _ = kbd_map_drain(&mut peer);
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::PointerButton {
+                origin: InputOrigin::Physical(SOURCE),
+                button: 0x110,
+                pressed: true,
+                time: 2,
+            },
+        );
+        let presses = xi2_events(&kbd_map_drain(&mut peer));
+        assert!(presses.iter().any(|event| {
+            event.0 == 4 && event.1 == pointer_id && event.2 == pointer_id && event.3 == 1
+        }));
+        assert_eq!(state.xi_devices.device(pointer_id).unwrap().buttons_down, 1);
+        assert_ne!(state.buttons_down & 1, 0);
+
+        let disable = device_enabled_write_body_xi1(
+            pointer_id,
+            8,
+            yserver_core::xinput::XI_PROP_MODE_REPLACE,
+            state.xi_device_enabled_atom.0,
+            yserver_core::xinput::XA_INTEGER.0,
+            &[0],
+        );
+        let releases =
+            device_enabled_request_bytes(&mut state, &mut backend, &mut peer, 37, 4, &disable);
+        let events = xi2_events(&releases);
+        assert!(events.iter().any(|event| {
+            event.0 == 5 && event.1 == pointer_id && event.2 == pointer_id && event.3 == 1
+        }));
+        assert!(events.iter().any(|event| {
+            event.0 == 5 && event.1 == 2 && event.2 == pointer_id && event.3 == 1
+        }));
+        assert_eq!(state.xi_devices.device(pointer_id).unwrap().buttons_down, 0);
+        assert_eq!(state.buttons_down & 1, 0);
+        assert!(!state.xi_devices.device(pointer_id).unwrap().enabled);
+        assert!(state.xi2_detached_masters.is_empty());
+        assert!(state.floating_pointer_positions.is_empty());
+
+        assert_device_enabled_write_cleanup(
+            &mut state,
+            &mut backend,
+            SOURCE,
+            &original_core_properties,
+        );
+    }
+
+    #[test]
+    fn xi_device_enabled_write_validates_virtual_devices_format_and_delete() {
+        use yserver_core::{
+            backend::Backend,
+            core_loop::HostInputEvent,
+            server::ServerState,
+            xinput::{InputSourceId, XiFacetKind},
+        };
+
+        // Kills: generic handling of Device Enabled writes, and forcing a recreated property to ignore Xorg's deletable default.
+        const SOURCE: InputSourceId = InputSourceId(0xD4_03);
+        let mut state = ServerState::new();
+        let original_core_properties =
+            [2, 3, 4, 5].map(|id| state.xi_devices.device(id).unwrap().properties.clone());
+        let mut backend = KmsBackend::for_tests();
+        let mut peer = kbd_map_client_id(&mut state, 5);
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceAdded(dynamic_test_device(SOURCE, false, true)),
+        );
+        let pointer_id = state
+            .xi_devices
+            .facet(SOURCE, XiFacetKind::PointerTouch)
+            .unwrap();
+        let enabled_atom = state.xi_device_enabled_atom.0;
+        let before = [2, 3, 4, 5, pointer_id]
+            .map(|id| state.xi_devices.device(id).unwrap().properties.clone());
+
+        for device_id in [2, 3, 4, 5] {
+            let body = device_enabled_write_body_xi2(
+                device_id,
+                enabled_atom,
+                8,
+                yserver_core::xinput::XA_INTEGER.0,
+                &[0],
+            );
+            let wire = device_enabled_request_bytes(
+                &mut state,
+                &mut backend,
+                &mut peer,
+                57,
+                10 + device_id,
+                &body,
+            );
+            assert_eq!(wire.len(), 32);
+            assert_eq!(
+                wire[1], 10,
+                "zero is BadAccess for virtual device {device_id}"
+            );
+        }
+        for device_id in [2u16, 3, 4, 5] {
+            let body = device_enabled_write_body_xi1(
+                device_id,
+                8,
+                yserver_core::xinput::XI_PROP_MODE_REPLACE,
+                enabled_atom,
+                yserver_core::xinput::XA_INTEGER.0,
+                &[1],
+            );
+            let wire = device_enabled_request_bytes(
+                &mut state,
+                &mut backend,
+                &mut peer,
+                37,
+                20 + device_id,
+                &body,
+            );
+            assert!(
+                wire.is_empty(),
+                "one succeeds on virtual device {device_id}"
+            );
+        }
+
+        let malformed = device_enabled_write_body_xi2(
+            pointer_id,
+            enabled_atom,
+            16,
+            yserver_core::xinput::XA_INTEGER.0,
+            &[1, 0],
+        );
+        let wire =
+            device_enabled_request_bytes(&mut state, &mut backend, &mut peer, 57, 30, &malformed);
+        assert_eq!(wire.len(), 32);
+        assert_eq!(wire[1], 2, "format 16 is BadValue");
+
+        let wrong_type_atom = state.atoms.intern("STRING", false);
+        let wrong_type = device_enabled_write_body_xi1(
+            pointer_id,
+            8,
+            yserver_core::xinput::XI_PROP_MODE_REPLACE,
+            enabled_atom,
+            wrong_type_atom.0,
+            &[1],
+        );
+        let wire =
+            device_enabled_request_bytes(&mut state, &mut backend, &mut peer, 37, 33, &wrong_type);
+        assert_eq!(wire.len(), 32);
+        assert_eq!(wire[1], 2, "non-INTEGER type is BadValue");
+
+        let wrong_size = device_enabled_write_body_xi2(
+            pointer_id,
+            enabled_atom,
+            8,
+            yserver_core::xinput::XA_INTEGER.0,
+            &[1, 0],
+        );
+        let wire =
+            device_enabled_request_bytes(&mut state, &mut backend, &mut peer, 57, 34, &wrong_size);
+        assert_eq!(wire.len(), 32);
+        assert_eq!(wire[1], 2, "two items are BadValue");
+
+        for (minor, body, sequence) in [
+            (
+                58,
+                {
+                    let mut body = Vec::with_capacity(8);
+                    body.extend_from_slice(&pointer_id.to_le_bytes());
+                    body.extend_from_slice(&0u16.to_le_bytes());
+                    body.extend_from_slice(&enabled_atom.to_le_bytes());
+                    body
+                },
+                31,
+            ),
+            (
+                38,
+                {
+                    let mut body = Vec::with_capacity(8);
+                    body.extend_from_slice(&enabled_atom.to_le_bytes());
+                    body.push(u8::try_from(pointer_id).unwrap());
+                    body.extend_from_slice(&[0; 3]);
+                    body
+                },
+                32,
+            ),
+        ] {
+            let wire = device_enabled_request_bytes(
+                &mut state,
+                &mut backend,
+                &mut peer,
+                minor,
+                sequence,
+                &body,
+            );
+            assert_eq!(wire.len(), 32);
+            assert_eq!(wire[1], 10, "delete via XI minor {minor} is BadAccess");
+        }
+        for device_id in [2u16, 3, 4, 5] {
+            let mut body = Vec::with_capacity(8);
+            body.extend_from_slice(&device_id.to_le_bytes());
+            body.extend_from_slice(&0u16.to_le_bytes());
+            body.extend_from_slice(&enabled_atom.to_le_bytes());
+            let wire = device_enabled_request_bytes(
+                &mut state,
+                &mut backend,
+                &mut peer,
+                58,
+                50 + device_id,
+                &body,
+            );
+            assert_eq!(wire.len(), 32);
+            assert_eq!(
+                wire[1], 10,
+                "Device Enabled on {device_id} is not deletable"
+            );
+        }
+
+        for (index, id) in [2, 3, 4, 5, pointer_id].into_iter().enumerate() {
+            assert_eq!(
+                state.xi_devices.device(id).unwrap().properties,
+                before[index],
+                "invalid request leaves device {id}'s property map unchanged"
+            );
+        }
+
+        let mut get_delete = Vec::with_capacity(20);
+        get_delete.extend_from_slice(&pointer_id.to_le_bytes());
+        get_delete.extend_from_slice(&[1, 0]); // delete after complete read
+        get_delete.extend_from_slice(&enabled_atom.to_le_bytes());
+        get_delete.extend_from_slice(&0u32.to_le_bytes()); // AnyPropertyType
+        get_delete.extend_from_slice(&0u32.to_le_bytes()); // offset
+        get_delete.extend_from_slice(&100u32.to_le_bytes()); // length
+        let reply =
+            device_enabled_request_bytes(&mut state, &mut backend, &mut peer, 59, 40, &get_delete);
+        assert_eq!(
+            reply.len(),
+            36,
+            "GetProperty(delete) still replies with its value"
+        );
+        assert!(
+            !state
+                .xi_devices
+                .device(pointer_id)
+                .unwrap()
+                .properties
+                .contains_key(&state.xi_device_enabled_atom),
+            "GetProperty(delete) unlinks Device Enabled"
+        );
+        let recreate = device_enabled_write_body_xi1(
+            pointer_id,
+            8,
+            yserver_core::xinput::XI_PROP_MODE_REPLACE,
+            enabled_atom,
+            yserver_core::xinput::XA_INTEGER.0,
+            &[1],
+        );
+        let no_reply =
+            device_enabled_request_bytes(&mut state, &mut backend, &mut peer, 37, 41, &recreate);
+        assert!(no_reply.is_empty());
+        let recreated = state
+            .xi_devices
+            .device(pointer_id)
+            .unwrap()
+            .properties
+            .get(&state.xi_device_enabled_atom)
+            .unwrap();
+        assert_eq!(recreated.data, [1]);
+        assert!(recreated.deletable);
+        // Xorg's XICreateDeviceProperty defaults new properties to deletable
+        // (xiproperty.c:575-592). This exposes the narrow addendum conflict:
+        // DeleteProperty is BadAccess on the seeded property, but succeeds
+        // after GetProperty(delete) removes it and a client recreates it.
+        let mut delete_recreated = Vec::with_capacity(8);
+        delete_recreated.extend_from_slice(&pointer_id.to_le_bytes());
+        delete_recreated.extend_from_slice(&0u16.to_le_bytes());
+        delete_recreated.extend_from_slice(&enabled_atom.to_le_bytes());
+        let wire = device_enabled_request_bytes(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            58,
+            42,
+            &delete_recreated,
+        );
+        assert!(
+            wire.is_empty(),
+            "recreated property follows Xorg deletability"
+        );
+        assert!(
+            !state
+                .xi_devices
+                .device(pointer_id)
+                .unwrap()
+                .properties
+                .contains_key(&state.xi_device_enabled_atom)
+        );
+        assert!(state.xi_devices.device(pointer_id).unwrap().enabled);
+        assert_eq!(
+            state.xi_devices.device(pointer_id).unwrap().attached_master,
+            Some(2)
+        );
+        assert!(state.xi2_detached_masters.is_empty());
+        assert!(state.floating_pointer_positions.is_empty());
+        assert_device_enabled_write_cleanup(
+            &mut state,
+            &mut backend,
+            SOURCE,
+            &original_core_properties,
+        );
+    }
+
+    #[test]
+    fn xi_device_enabled_write_while_session_disabled_stays_floating_until_enabled() {
+        use yserver_core::{
+            backend::Backend,
+            core_loop::HostInputEvent,
+            server::ServerState,
+            xinput::{InputSourceId, XiFacetKind},
+        };
+
+        // Kills: recording a client-disabled preference for zero written while only session-disabled.
+        const SOURCE: InputSourceId = InputSourceId(0xD4_04);
+        let mut state = ServerState::new();
+        let original_core_properties =
+            [2, 3, 4, 5].map(|id| state.xi_devices.device(id).unwrap().properties.clone());
+        let mut backend = KmsBackend::for_tests();
+        let mut peer = kbd_map_client_id(&mut state, 5);
+        let mut info = dynamic_test_device(SOURCE, false, true);
+        info.enabled = false;
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceAdded(info.clone()),
+        );
+        let pointer_id = state
+            .xi_devices
+            .facet(SOURCE, XiFacetKind::PointerTouch)
+            .unwrap();
+        select_device_enabled_transition_events(&mut state, &mut backend, pointer_id, 1);
+        let _ = kbd_map_drain(&mut peer);
+
+        let disable = device_enabled_write_body_xi2(
+            pointer_id,
+            state.xi_device_enabled_atom.0,
+            8,
+            yserver_core::xinput::XA_INTEGER.0,
+            &[0],
+        );
+        let write_events =
+            device_enabled_request_bytes(&mut state, &mut backend, &mut peer, 57, 4, &disable);
+        assert_eq!(
+            device_enabled_event_kinds(&write_events),
+            ["xi2-property", "xi1-property"],
+            "a no-transition write sends only the outer property notification"
+        );
+        assert!(!state.xi_devices.device(pointer_id).unwrap().client_disabled);
+        assert!(!state.xi_devices.device(pointer_id).unwrap().enabled);
+        assert_eq!(
+            state.xi_devices.device(pointer_id).unwrap().attached_master,
+            None
+        );
+        assert_eq!(
+            state.xi_devices.device(pointer_id).unwrap().properties[&state.xi_device_enabled_atom]
+                .data,
+            [0]
+        );
+
+        let mut resumed = info;
+        resumed.enabled = true;
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceResumed(resumed),
+        );
+        assert!(
+            state.xi_devices.device(pointer_id).unwrap().enabled,
+            "session resume enables a facet not client-disabled"
+        );
+        assert_eq!(
+            state.xi_devices.device(pointer_id).unwrap().attached_master,
+            Some(2)
+        );
+        assert!(!state.xi_devices.device(pointer_id).unwrap().client_disabled);
+        assert!(state.xi2_detached_masters.is_empty());
+        assert!(state.floating_pointer_positions.is_empty());
+        assert_eq!(
+            device_enabled_event_kinds(&kbd_map_drain(&mut peer)),
+            ["xi2-property", "xi1-property", "presence", "hierarchy"],
+            "resume emits its normal enable sequence"
+        );
+        assert_eq!(
+            state.xi_devices.device(pointer_id).unwrap().properties[&state.xi_device_enabled_atom]
+                .data,
+            [1]
+        );
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceSuspended { source_id: SOURCE },
+        );
+        let _ = kbd_map_drain(&mut peer);
+        assert_device_enabled_write_cleanup(
+            &mut state,
+            &mut backend,
+            SOURCE,
+            &original_core_properties,
+        );
+    }
+
+    #[test]
+    fn xi_device_enabled_write_preserves_transition_order_outer_notification_and_value() {
+        use yserver_core::{
+            backend::Backend,
+            core_loop::HostInputEvent,
+            server::ServerState,
+            xinput::{InputSourceId, XiFacetKind},
+        };
+
+        // Kills: normalizing nonzero bytes, omitting the outer notification, or transitioning on zero while disabled or one while enabled.
+        const SOURCE: InputSourceId = InputSourceId(0xD4_05);
+        let mut state = ServerState::new();
+        let original_core_properties =
+            [2, 3, 4, 5].map(|id| state.xi_devices.device(id).unwrap().properties.clone());
+        let mut backend = KmsBackend::for_tests();
+        let mut peer = kbd_map_client_id(&mut state, 5);
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceAdded(dynamic_test_device(SOURCE, false, true)),
+        );
+        let pointer_id = state
+            .xi_devices
+            .facet(SOURCE, XiFacetKind::PointerTouch)
+            .unwrap();
+        select_device_enabled_transition_events(&mut state, &mut backend, pointer_id, 1);
+        let _ = kbd_map_drain(&mut peer);
+
+        let disable = device_enabled_write_body_xi1(
+            pointer_id,
+            8,
+            yserver_core::xinput::XI_PROP_MODE_REPLACE,
+            state.xi_device_enabled_atom.0,
+            yserver_core::xinput::XA_INTEGER.0,
+            &[0],
+        );
+        let disabled =
+            device_enabled_request_bytes(&mut state, &mut backend, &mut peer, 37, 4, &disable);
+        assert_eq!(
+            device_enabled_event_kinds(&disabled),
+            [
+                "xi2-property",
+                "xi1-property",
+                "presence",
+                "hierarchy",
+                "xi2-property",
+                "xi1-property"
+            ],
+            "A3 property/presence/hierarchy sequence precedes the outer property event"
+        );
+        assert!(!state.xi_devices.device(pointer_id).unwrap().enabled);
+        assert_eq!(
+            state.xi_devices.device(pointer_id).unwrap().attached_master,
+            None
+        );
+        assert_eq!(
+            state.xi_devices.device(pointer_id).unwrap().properties[&state.xi_device_enabled_atom]
+                .data,
+            [0]
+        );
+        assert!(state.xi2_detached_masters.is_empty());
+        assert!(state.floating_pointer_positions.is_empty());
+
+        let disabled_again = device_enabled_write_body_xi2(
+            pointer_id,
+            state.xi_device_enabled_atom.0,
+            8,
+            yserver_core::xinput::XA_INTEGER.0,
+            &[0],
+        );
+        let unchanged_disabled = device_enabled_request_bytes(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            57,
+            5,
+            &disabled_again,
+        );
+        assert_eq!(
+            device_enabled_event_kinds(&unchanged_disabled),
+            ["xi2-property", "xi1-property"],
+            "zero on an already disabled facet emits one property notification and no transition"
+        );
+        assert!(state.xi_devices.device(pointer_id).unwrap().client_disabled);
+        assert!(!state.xi_devices.device(pointer_id).unwrap().enabled);
+        assert_eq!(
+            state.xi_devices.device(pointer_id).unwrap().attached_master,
+            None
+        );
+
+        let enable_five = device_enabled_write_body_xi2(
+            pointer_id,
+            state.xi_device_enabled_atom.0,
+            8,
+            yserver_core::xinput::XA_INTEGER.0,
+            &[5],
+        );
+        let enabled =
+            device_enabled_request_bytes(&mut state, &mut backend, &mut peer, 57, 6, &enable_five);
+        assert_eq!(
+            device_enabled_event_kinds(&enabled),
+            [
+                "xi2-property",
+                "xi1-property",
+                "presence",
+                "hierarchy",
+                "xi2-property",
+                "xi1-property"
+            ],
+            "A4 property/presence/hierarchy sequence precedes the outer property event"
+        );
+        assert!(state.xi_devices.device(pointer_id).unwrap().enabled);
+        assert_eq!(
+            state.xi_devices.device(pointer_id).unwrap().attached_master,
+            Some(2)
+        );
+        assert_eq!(
+            state.xi_devices.device(pointer_id).unwrap().properties[&state.xi_device_enabled_atom]
+                .data,
+            [5]
+        );
+        let enabled_atom = state.xi_device_enabled_atom.0;
+        assert_eq!(
+            device_enabled_get_enabled_xi2(
+                &mut state,
+                &mut backend,
+                &mut peer,
+                pointer_id,
+                enabled_atom,
+                7,
+            ),
+            5,
+            "XIGetProperty returns the byte that the client wrote"
+        );
+        assert!(state.xi2_detached_masters.is_empty());
+        assert!(state.floating_pointer_positions.is_empty());
+
+        let enable_one = device_enabled_write_body_xi1(
+            pointer_id,
+            8,
+            yserver_core::xinput::XI_PROP_MODE_REPLACE,
+            enabled_atom,
+            yserver_core::xinput::XA_INTEGER.0,
+            &[1],
+        );
+        let unchanged_enabled =
+            device_enabled_request_bytes(&mut state, &mut backend, &mut peer, 37, 8, &enable_one);
+        assert_eq!(
+            device_enabled_event_kinds(&unchanged_enabled),
+            ["xi2-property", "xi1-property"],
+            "one on an enabled facet emits one property notification and no transition"
+        );
+        assert!(state.xi_devices.device(pointer_id).unwrap().enabled);
+        assert_eq!(
+            state.xi_devices.device(pointer_id).unwrap().attached_master,
+            Some(2)
+        );
+        assert_eq!(
+            state.xi_devices.device(pointer_id).unwrap().properties[&state.xi_device_enabled_atom]
+                .data,
+            [1]
+        );
+
+        assert_device_enabled_write_cleanup(
+            &mut state,
+            &mut backend,
+            SOURCE,
+            &original_core_properties,
+        );
     }
 
     fn process_dynamic_test_keyboard_grab(

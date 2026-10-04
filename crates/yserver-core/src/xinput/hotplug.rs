@@ -380,6 +380,35 @@ pub fn hierarchy_device_snapshot(
     })
 }
 
+/// Publish the Xorg-ordered disabled transition for a physical facet whose
+/// enabled fact has already been committed. The still-attached descriptor is
+/// captured before the live facet is floated.
+pub fn publish_facet_disabled(state: &mut ServerState, device_id: u16) {
+    let Some(snapshot) = hierarchy_device_snapshot(state, device_id) else {
+        return;
+    };
+
+    let _dropped = emit_device_enabled_property_change(state, device_id, false);
+    let _dropped = emit_xi1_device_presence(state, device_id, DevicePresenceChange::Disabled);
+    let _dropped = emit_xi_hierarchy_changed(
+        state,
+        XiHierarchyStep::DeviceDisabled,
+        device_id,
+        None,
+        Some(snapshot),
+    );
+    state.xi_float_disabled_device(device_id);
+}
+
+/// Publish the Xorg-ordered enabled transition for a physical facet whose
+/// enabled fact has already been committed.
+pub fn publish_facet_enabled(state: &mut ServerState, device_id: u16) {
+    let _dropped = emit_device_enabled_property_change(state, device_id, true);
+    let _dropped = emit_xi1_device_presence(state, device_id, DevicePresenceChange::Enabled);
+    let _dropped =
+        emit_xi_hierarchy_changed(state, XiHierarchyStep::DeviceEnabled, device_id, None, None);
+}
+
 /// Return the same use/attachment pair as Xorg's GetDeviceUse
 /// (Xi/xiquerydevice.c:518-529), shared by XIQueryDevice and hierarchy data.
 fn hierarchy_descriptor(state: &ServerState, device_id: u16) -> (u8, u16) {

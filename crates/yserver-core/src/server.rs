@@ -2009,10 +2009,11 @@ impl ServerState {
     ) -> Option<crate::xinput::PropWhat> {
         let atom = self.xi_device_enabled_atom;
         let device = self.xi_devices.device_mut(device_id)?;
-        let what = if device.properties.contains_key(&atom) {
-            crate::xinput::PropWhat::Modified
-        } else {
-            crate::xinput::PropWhat::Created
+        let (what, deletable) = match device.properties.get(&atom) {
+            Some(existing) => (crate::xinput::PropWhat::Modified, existing.deletable),
+            // XI/xiproperty.c::XICreateDeviceProperty initializes a property
+            // recreated after GetProperty(delete) as deletable (lines 575-592).
+            None => (crate::xinput::PropWhat::Created, true),
         };
         device.properties.insert(
             atom,
@@ -2021,7 +2022,7 @@ impl ServerState {
                 format: 8,
                 data: vec![u8::from(enabled)],
                 read_only: false,
-                deletable: false,
+                deletable,
             },
         );
         Some(what)
@@ -2066,6 +2067,31 @@ impl ServerState {
             .xi_devices
             .set_facet_session_enabled(device_id, enabled);
         if enabled && changed {
+            self.xi2_detached_masters.remove(&device_id);
+            self.floating_pointer_positions.remove(&device_id);
+        }
+        changed
+    }
+
+    /// Change one physical facet's client Device Enabled preference. A
+    /// disable clears the master's last-slave reference but retains the
+    /// attachment for its Disabled hierarchy snapshot. A re-enable removes
+    /// any grab-floating bookkeeping only when session state also makes the
+    /// facet enabled.
+    pub fn xi_set_facet_client_disabled(&mut self, device_id: u16, disabled: bool) -> bool {
+        if disabled {
+            self.xi_clear_last_slave(device_id);
+        }
+        let changed = self
+            .xi_devices
+            .set_facet_client_disabled(device_id, disabled);
+        if !disabled
+            && changed
+            && self
+                .xi_devices
+                .device(device_id)
+                .is_some_and(|device| device.enabled)
+        {
             self.xi2_detached_masters.remove(&device_id);
             self.floating_pointer_positions.remove(&device_id);
         }

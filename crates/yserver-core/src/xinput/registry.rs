@@ -224,6 +224,32 @@ impl XiRegistry {
         !was_enabled && is_enabled
     }
 
+    /// Record one client's Device Enabled preference independently of the
+    /// current input session. Disabling retains the old attachment until
+    /// the caller has emitted the XIDeviceDisabled snapshot; enabling only
+    /// attaches on a real disabled-to-enabled transition, so a redundant
+    /// write cannot undo an XI grab's temporary floating state.
+    pub fn set_facet_client_disabled(&mut self, device_id: u16, disabled: bool) -> bool {
+        let Some(device) = self.device_mut(device_id) else {
+            return false;
+        };
+        if device.source_id.is_none() || device.client_disabled == disabled {
+            return false;
+        }
+
+        let was_enabled = device.enabled;
+        device.client_disabled = disabled;
+        device.enabled = device.session_enabled && !device.client_disabled;
+        if !was_enabled && device.enabled {
+            device.attached_master = Some(match device.facet {
+                Some(XiFacetKind::PointerTouch) => DEVICEID_MASTER_POINTER,
+                Some(XiFacetKind::Keyboard) => DEVICEID_MASTER_KEYBOARD,
+                None => return false,
+            });
+        }
+        true
+    }
+
     /// Remove one published facet while preserving its source's other facet.
     pub fn remove_facet(&mut self, device_id: u16) -> Option<XiDevice> {
         let removed = self.device(device_id)?.clone();

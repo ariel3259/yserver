@@ -672,6 +672,15 @@ pub trait Backend {
     /// Backends without per-device keyboard state need no work.
     fn sync_floating_keyboard_states(&mut self, _state: &ServerState) {}
 
+    /// Release holds owned by one still-enabled physical XI facet before a
+    /// client-driven Device Enabled disable is committed. Backends without
+    /// host-device state have no cleanup to perform.
+    fn disable_xi_facet(&mut self, _state: &mut ServerState, _device_id: u16) {}
+
+    /// Reconcile backend-owned state after a client-driven XI facet enable.
+    /// The core has already restored the facet's role-derived home master.
+    fn enable_xi_facet(&mut self, _state: &mut ServerState, _device_id: u16) {}
+
     /// `drm_fd` is readable. The backend should drain completion events from
     /// that exact DRM device and submit the next composite/flip. The fd is one
     /// returned by [`Backend::poll_fds`] with [`BackendFdKind::Drm`].

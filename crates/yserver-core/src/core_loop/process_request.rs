@@ -18532,7 +18532,8 @@ fn handle_xi2_request(
             // both write arms (XI2 minor 57 + XI1 minor 37) share the same
             // pipeline so T5/T6 only has to wire event emission in one place.
             match dispatch_change_property(
-                state, client_id, sequence, 57, deviceid, mode, format, property, type_atom, &data,
+                state, backend, client_id, sequence, 57, deviceid, mode, format, property,
+                type_atom, &data,
             ) {
                 Ok(PropertyChangeOutcome::Changed(what)) => {
                     let _ = emit_property_change(state, deviceid, property, what);
@@ -20140,7 +20141,8 @@ fn handle_xi2_request(
             // `XI_PropertyEvent` here too — xserver's
             // `send_property_event` fires from both XI1 and XI2 paths.
             match dispatch_change_property(
-                state, client_id, sequence, 37, deviceid, mode, format, property, type_atom, &data,
+                state, backend, client_id, sequence, 37, deviceid, mode, format, property,
+                type_atom, &data,
             ) {
                 Ok(PropertyChangeOutcome::Changed(what)) => {
                     let _ = emit_property_change(state, deviceid, property, what);
@@ -25750,6 +25752,7 @@ pub(super) enum PropertyChangeOutcome {
 
 fn dispatch_change_property(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
     client: ClientId,
     sequence: SequenceNumber,
     minor_opcode: u16,
@@ -25809,6 +25812,12 @@ fn dispatch_change_property(
         return Err(PropertyDispatchError::BadAccess { atom: property.0 });
     }
 
+    if property == state.xi_device_enabled_atom {
+        return dispatch_device_enabled_property_write(
+            state, backend, deviceid, mode, format, property, type_atom, data,
+        );
+    }
+
     let device = crate::xinput::find_device_mut(&mut state.xi_devices, deviceid)
         .expect("caller verified device exists");
     match crate::xinput::apply_change_property(device, mode, format, property, type_atom, data) {
@@ -25822,6 +25831,176 @@ fn dispatch_change_property(
         // arm is reachable here.
         Err(crate::xinput::XiPropError::BadDevice) => {
             unreachable!("apply_change_property never returns BadDevice; lookup handled above")
+        }
+    }
+}
+
+/// Apply one Device Enabled property write. The wire handlers have already
+/// validated the device, mode, format range, and request length. Physical
+/// facet transitions share the lifecycle emitters with VT changes, while
+/// the backend drains that facet's held input before a disable is committed.
+fn dispatch_device_enabled_property_write(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    deviceid: u16,
+    mode: u8,
+    format: u8,
+    property: AtomId,
+    type_atom: AtomId,
+    data: &[u8],
+) -> Result<PropertyChangeOutcome, PropertyDispatchError> {
+    if !state.atoms.exists(type_atom) {
+        return Err(PropertyDispatchError::BadAtom { atom: type_atom.0 });
+    }
+
+    let existing = crate::xinput::find_device(&state.xi_devices, deviceid)
+        .and_then(|device| device.properties.get(&property))
+        .cloned();
+    // Xorg treats a missing property's first write as Replace, regardless of
+    // the requested append/prepend mode (xiproperty.c:699-706). GetProperty
+    // with delete may have removed this normally non-deletable property.
+    let effective_mode = if existing.is_none() {
+        crate::xinput::XI_PROP_MODE_REPLACE
+    } else {
+        mode
+    };
+
+    // XIChangeDeviceProperty checks append/prepend type and format before it
+    // calls DeviceSetProperty (xiproperty.c:714-717).
+    if let Some(existing) = &existing
+        && effective_mode != crate::xinput::XI_PROP_MODE_REPLACE
+        && (existing.format != format || existing.type_atom != type_atom)
+    {
+        return Err(PropertyDispatchError::BadMatch);
+    }
+    let resulting_bytes = if effective_mode == crate::xinput::XI_PROP_MODE_REPLACE {
+        data.len()
+    } else {
+        existing.as_ref().map_or(data.len(), |existing| {
+            existing.data.len().saturating_add(data.len())
+        })
+    };
+    if format != 8 || type_atom != crate::xinput::XA_INTEGER || resulting_bytes != 1 {
+        return Err(PropertyDispatchError::BadValue {
+            error_value: property.0,
+        });
+    }
+
+    // XIChangeDeviceProperty does not call DeviceSetProperty for an empty
+    // append/prepend; it leaves the value alone and still sends the normal
+    // Modified notification (xiproperty.c:789-800).
+    if effective_mode != crate::xinput::XI_PROP_MODE_REPLACE && data.is_empty() {
+        return apply_enabled_property_value(
+            state,
+            deviceid,
+            effective_mode,
+            format,
+            property,
+            type_atom,
+            data,
+        );
+    }
+
+    // The base masters and XTEST slaves may be asserted enabled, but clients
+    // cannot disable them (dix/devices.c:153-158).
+    let value = if effective_mode == crate::xinput::XI_PROP_MODE_REPLACE {
+        data[0]
+    } else {
+        existing
+            .as_ref()
+            .expect("append/prepend has an existing property")
+            .data[0]
+    };
+    if matches!(
+        deviceid,
+        crate::xinput::DEVICEID_MASTER_POINTER
+            | crate::xinput::DEVICEID_MASTER_KEYBOARD
+            | crate::xinput::DEVICEID_XTEST_POINTER
+            | crate::xinput::DEVICEID_XTEST_KEYBOARD
+    ) {
+        if value == 0 {
+            return Err(PropertyDispatchError::BadAccess { atom: property.0 });
+        }
+        return apply_enabled_property_value(
+            state,
+            deviceid,
+            effective_mode,
+            format,
+            property,
+            type_atom,
+            data,
+        );
+    }
+
+    let Some(device) = crate::xinput::find_device(&state.xi_devices, deviceid) else {
+        unreachable!("caller resolved the XI device before property dispatch");
+    };
+    if device.source_id.is_none() || device.facet.is_none() {
+        return apply_enabled_property_value(
+            state,
+            deviceid,
+            effective_mode,
+            format,
+            property,
+            type_atom,
+            data,
+        );
+    }
+
+    let was_enabled = device.enabled;
+    if value == 0 {
+        if was_enabled {
+            backend.disable_xi_facet(state, deviceid);
+            // Xorg's DeviceSetProperty only calls DisableDevice for an
+            // enabled device (devices.c:160-165). A zero written while the
+            // session already has the facet off records no client preference.
+            state.xi_set_facet_client_disabled(deviceid, true);
+            crate::xinput::hotplug::publish_facet_disabled(state, deviceid);
+        }
+    } else {
+        state.xi_set_facet_client_disabled(deviceid, false);
+        let is_enabled = crate::xinput::find_device(&state.xi_devices, deviceid)
+            .is_some_and(|device| device.enabled);
+        if !was_enabled && is_enabled {
+            backend.enable_xi_facet(state, deviceid);
+            crate::xinput::hotplug::publish_facet_enabled(state, deviceid);
+        }
+    }
+
+    // XIChangeDeviceProperty stores the caller's complete value and sends its
+    // own notification after the handler returns (xiproperty.c:785-801).
+    // For a transition this follows the lifecycle sequence above and keeps
+    // nonzero values such as 5 intact.
+    apply_enabled_property_value(
+        state,
+        deviceid,
+        effective_mode,
+        format,
+        property,
+        type_atom,
+        data,
+    )
+}
+
+fn apply_enabled_property_value(
+    state: &mut ServerState,
+    deviceid: u16,
+    mode: u8,
+    format: u8,
+    property: AtomId,
+    type_atom: AtomId,
+    data: &[u8],
+) -> Result<PropertyChangeOutcome, PropertyDispatchError> {
+    let device = crate::xinput::find_device_mut(&mut state.xi_devices, deviceid)
+        .expect("caller resolved the XI device before property dispatch");
+    match crate::xinput::apply_change_property(device, mode, format, property, type_atom, data) {
+        Ok(what) => Ok(PropertyChangeOutcome::Changed(what)),
+        Err(crate::xinput::XiPropError::BadValue) => Err(PropertyDispatchError::BadValue {
+            error_value: u32::from(format),
+        }),
+        Err(crate::xinput::XiPropError::BadMatch) => Err(PropertyDispatchError::BadMatch),
+        Err(crate::xinput::XiPropError::BadDevice) => {
+            unreachable!("apply_change_property never returns BadDevice")
         }
     }
 }
