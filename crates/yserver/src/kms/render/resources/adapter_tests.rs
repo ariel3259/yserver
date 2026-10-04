@@ -849,6 +849,7 @@ fn c0_2ci_adapter_duplicate_stale_evidence_aliasing() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn c0_2ci_live_lifetime_adapters_vulkan() {
+    let _vk_test_guard = crate::kms::render::backend::acquire_test_vk_guard();
     // Reset validation layer error/warning counters before smoke test
     crate::kms::vk::device::reset_validation_counts();
 
@@ -1298,6 +1299,7 @@ fn c0_2ci_live_lifetime_adapters_vulkan() {
 fn c0_2ci_scanout_managed_conversion_and_bophase_ownership_vulkan() {
     use crate::kms::vk::scanout::{BoPhase, OutputScanout, ScanoutBo, ScanoutBoPool};
 
+    let _vk_test_guard = crate::kms::render::backend::acquire_test_vk_guard();
     let mut platform = match live_platform() {
         Some(p) => p,
         None => panic!("environmental skip: no live Vulkan ICD available; not claiming pass"),
@@ -1489,6 +1491,7 @@ fn c0_2ci_scanout_managed_conversion_and_bophase_ownership_vulkan() {
 fn c0_2ci_scanout_managed_pool_husk_blocks_family_barrier_until_detached_vulkan() {
     use crate::kms::vk::scanout::{OutputScanout, ScanoutBo, ScanoutBoPool};
 
+    let _vk_test_guard = crate::kms::render::backend::acquire_test_vk_guard();
     let mut platform = match live_platform() {
         Some(p) => p,
         None => panic!("environmental skip: no live Vulkan ICD available; not claiming pass"),

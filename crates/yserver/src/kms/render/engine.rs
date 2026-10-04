@@ -19091,6 +19091,7 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_2ci_engine_promote_drawable_exportable_managed_vulkan() {
+        let _vk_test_guard = crate::kms::render::backend::acquire_test_vk_guard();
         let mut platform = match live_platform() {
             Some(p) => p,
             None => panic!("environmental skip: no live Vulkan ICD; not claiming pass"),

@@ -2308,6 +2308,7 @@ fn c0_2ci_gpu_frozen_entry_refuses_subsequent_valid_batch() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn c0_2ci_gpu_dropped_frame_metadata_with_live_ticket_vulkan() {
+    let _vk_test_guard = crate::kms::render::backend::acquire_test_vk_guard();
     let vk = real_vk_context();
     let ops_pool = crate::kms::vk::ops::OpsCommandPool::new(Arc::clone(&vk)).expect("ops pool");
     let fence_pool = crate::kms::render::platform::FencePool::new(Arc::clone(&vk));
@@ -2387,6 +2388,7 @@ fn c0_2ci_descriptor_reset_exclusion_until_gpu_signaled() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn c0_2ci_descriptor_reset_exclusion_until_gpu_signaled_vulkan() {
+    let _vk_test_guard = crate::kms::render::backend::acquire_test_vk_guard();
     let vk = real_vk_context();
     let ops_pool = crate::kms::vk::ops::OpsCommandPool::new(Arc::clone(&vk)).expect("ops pool");
     let fence_pool = crate::kms::render::platform::FencePool::new(Arc::clone(&vk));

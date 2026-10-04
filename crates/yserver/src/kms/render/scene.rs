@@ -14722,6 +14722,7 @@ mod tests {
     fn c0_2ci_scene_drain_pending_pool_releases_gates_on_service_vulkan() {
         use crate::kms::render::resources::ObligationKind;
 
+        let _vk_test_guard = crate::kms::render::backend::acquire_test_vk_guard();
         let Some((mut platform, mut service, _registry, key)) = managed_pool_release_fixture()
         else {
             panic!("environmental skip: no live Vulkan ICD available; not claiming pass")
@@ -14772,6 +14773,7 @@ mod tests {
     fn c0_2ci_scene_retire_failed_submit_bos_gates_on_service_vulkan() {
         use crate::kms::render::resources::ObligationKind;
 
+        let _vk_test_guard = crate::kms::render::backend::acquire_test_vk_guard();
         let Some((mut platform, mut service, _registry, key)) = managed_pool_release_fixture()
         else {
             panic!("environmental skip: no live Vulkan ICD available; not claiming pass")
@@ -14824,6 +14826,7 @@ mod tests {
     fn c0_2ci_scene_drain_all_gates_pool_slot_release_on_service_vulkan() {
         use crate::kms::render::resources::ObligationKind;
 
+        let _vk_test_guard = crate::kms::render::backend::acquire_test_vk_guard();
         let Some((mut platform, mut service, _registry, key)) = managed_pool_release_fixture()
         else {
             panic!("environmental skip: no live Vulkan ICD available; not claiming pass")
@@ -14877,6 +14880,7 @@ mod tests {
     fn c0_2ci_scene_handle_page_flip_complete_registers_managed_batch_vulkan() {
         use crate::kms::render::resources::{GpuObligation, ObligationKind};
 
+        let _vk_test_guard = crate::kms::render::backend::acquire_test_vk_guard();
         let Some((mut platform, mut service, _registry, key)) = managed_pool_release_fixture()
         else {
             panic!("environmental skip: no live Vulkan ICD available; not claiming pass")

@@ -3310,6 +3310,7 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_2ci_storage_no_premature_pool_return_vulkan() {
+        let _vk_test_guard = crate::kms::render::backend::acquire_test_vk_guard();
         let vk = match crate::kms::vk::device::VkContext::new() {
             Ok(v) => v,
             Err(_) => {
@@ -3389,6 +3390,7 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_2ci_storage_into_managed_pins_real_context_for_cleanup_vulkan() {
+        let _vk_test_guard = crate::kms::render::backend::acquire_test_vk_guard();
         let vk = match crate::kms::vk::device::VkContext::new() {
             Ok(v) => v,
             Err(_) => {
@@ -3508,6 +3510,7 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_2ci_storage_record_layout_transition_managed_reserves_write_vulkan() {
+        let _vk_test_guard = crate::kms::render::backend::acquire_test_vk_guard();
         let vk = match crate::kms::vk::device::VkContext::new() {
             Ok(v) => v,
             Err(_) => {
@@ -4056,6 +4059,7 @@ mod tests {
             target::allocate_exportable,
         };
 
+        let _vk_test_guard = crate::kms::render::backend::acquire_test_vk_guard();
         let vk = match VkContext::new() {
             Ok(v) => v,
             Err(_) => {

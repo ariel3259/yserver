@@ -100,9 +100,9 @@ static REAL_DRM_TEST_SERIAL: RealDrmTestSerial = RealDrmTestSerial {
     wake: std::sync::Condvar::new(),
 };
 
-/// A re-entrant process-wide guard for the shared real-DRM Vulkan test
-/// context. Re-entrancy is needed because a few tests intentionally keep two
-/// live fixtures at once; ownership remains exclusive between test threads.
+/// A re-entrant process-wide guard for Vulkan test contexts. Re-entrancy is
+/// needed because a few tests intentionally keep two live fixtures at once;
+/// ownership remains exclusive between test threads.
 #[cfg(test)]
 struct RealDrmTestGuard;
 
@@ -156,6 +156,13 @@ impl Drop for RealDrmTestGuard {
             REAL_DRM_TEST_SERIAL.wake.notify_one();
         }
     }
+}
+
+/// Acquire the Vulkan test serialization guard for fixtures outside
+/// `KmsBackend` that construct their own `VkContext`.
+#[cfg(test)]
+pub(crate) fn acquire_test_vk_guard() -> impl Drop {
+    RealDrmTestSerial::acquire()
 }
 
 /// Per-window geometry tracked by v2's scene assembler. Stage 2 plan
@@ -2371,14 +2378,13 @@ pub struct KmsBackend {
     #[doc(hidden)]
     pub legacy_dispositions_for_tests: Vec<LegacyEventDisposition>,
 
-    /// Serializes all test use of the shared real-DRM Vulkan context. The
-    /// guard is held by the backend, not just by fixture construction, so
-    /// ignored tests remain safe even if the harness runs them in parallel.
-    #[cfg(test)]
-    real_drm_test_guard: Option<RealDrmTestGuard>,
-
     /// Last `export holders` report, for change detection.
     export_holders: crate::kms::render::export_holders::ExportHoldersReporter,
+
+    /// Serializes test Vulkan work for this backend. This is the final field
+    /// so every Vulkan-owning field is destroyed before the guard is released.
+    #[cfg(test)]
+    real_drm_test_guard: Option<RealDrmTestGuard>,
 }
 
 struct OwnerVtRelease {
@@ -7896,9 +7902,9 @@ impl KmsBackend {
             legacy_handover_failed: std::collections::BTreeSet::new(),
             force_dispose_failure_crtc_for_tests: None,
             legacy_dispositions_for_tests: Vec::new(),
+            export_holders: Default::default(),
             #[cfg(test)]
             real_drm_test_guard: None,
-            export_holders: Default::default(),
         };
         // Validate every route already committed during platform bring-up,
         // then apply Xorg's one-shot AutoBindGPU-shaped startup policy: every
@@ -8566,6 +8572,13 @@ impl KmsBackend {
     #[doc(hidden)]
     pub fn for_tests_with_vk() -> Result<Self, io::Error> {
         use std::sync::Arc;
+
+        // Keep device creation, use, and destruction serialized with the
+        // shared real-DRM Vulkan fixtures. Declare this before `base` so an
+        // error drops the backend and its context before releasing the guard.
+        #[cfg(test)]
+        let real_drm_test_guard = RealDrmTestSerial::acquire();
+
         // Build the test seed WITHOUT the root drawable. If
         // `for_tests()` were used, `init_root_storage` would have
         // run with no Vk attached and stamped a `for_tests_null`
@@ -8576,6 +8589,10 @@ impl KmsBackend {
         // `set_container_background_pixmap`) segfaults inside the
         // descriptor-set bind.
         let mut base = Self::for_tests_seed();
+        #[cfg(test)]
+        {
+            base.real_drm_test_guard = Some(real_drm_test_guard);
+        }
         let vk = crate::kms::vk::device::VkContext::new()
             .map_err(|e| io::Error::other(format!("render for_tests_with_vk: VkContext: {e:?}")))?;
         let ops_pool = crate::kms::vk::ops::OpsCommandPool::new(Arc::clone(&vk)).map_err(|e| {
@@ -8609,7 +8626,14 @@ impl KmsBackend {
     pub fn for_tests_with_vk_live_scene() -> Result<Self, io::Error> {
         use std::sync::Arc;
 
+        #[cfg(test)]
+        let real_drm_test_guard = RealDrmTestSerial::acquire();
+
         let mut base = Self::for_tests_seed();
+        #[cfg(test)]
+        {
+            base.real_drm_test_guard = Some(real_drm_test_guard);
+        }
         let vk = crate::kms::vk::device::VkContext::new().map_err(|e| {
             io::Error::other(format!(
                 "render for_tests_with_vk_live_scene: VkContext: {e:?}"
@@ -8679,6 +8703,12 @@ impl KmsBackend {
     pub fn for_tests_with_vk_live_scene_real_drm() -> Result<Self, io::Error> {
         #[cfg(test)]
         use std::sync::Arc;
+
+        // The shared context may need to be initialized on this call. Guard
+        // that initialization too, before any other fixture can destroy a
+        // different VkDevice concurrently.
+        #[cfg(test)]
+        let _real_drm_test_guard = RealDrmTestSerial::acquire();
 
         #[cfg(test)]
         let vk = {
@@ -9411,9 +9441,9 @@ impl KmsBackend {
             legacy_handover_failed: std::collections::BTreeSet::new(),
             force_dispose_failure_crtc_for_tests: None,
             legacy_dispositions_for_tests: Vec::new(),
+            export_holders: Default::default(),
             #[cfg(test)]
             real_drm_test_guard: None,
-            export_holders: Default::default(),
         };
         let live: Vec<_> = backend
             .platform
@@ -98757,6 +98787,10 @@ mod tests {
 
     fn copied_cross_device_live_fixture() -> Result<super::LiveKmsFixture, std::io::Error> {
         use std::{path::Path, rc::Rc, sync::Arc};
+
+        // These two contexts are initialized before the backend can own its
+        // guard, so protect their creation and any early-error destruction.
+        let _real_drm_test_guard = super::RealDrmTestSerial::acquire();
 
         let sink_primary = hardware_drm_key("/dev/dri/card1").map_err(|error| {
             std::io::Error::other(format!(
