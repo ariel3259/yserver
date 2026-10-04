@@ -11,6 +11,7 @@ pub(crate) type ConsoleGuardOpt = Option<console::ConsoleGuard>;
 #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
 pub(crate) type ConsoleGuardOpt = Option<()>;
 pub(crate) mod cursor_plane;
+pub(crate) mod font_index;
 pub(crate) mod hotplug;
 pub mod render;
 pub(crate) mod render_node;

@@ -38,6 +38,7 @@ use yserver_protocol::x11::{
 
 use crate::kms::{
     cpu_types::{PictTransform, Rectangle16, Repeat},
+    font_index::{FontPattern, LoweredName},
     xkb_desc::XkbDesc,
 };
 
@@ -372,6 +373,10 @@ pub(crate) struct FontDir {
     pub(crate) entries: Vec<(String, std::path::PathBuf)>,
     /// fonts.alias entries: (alias, target font name or pattern).
     pub(crate) aliases: Vec<(String, String)>,
+    /// `entries` names, lowered for matching.
+    entry_keys: Vec<LoweredName>,
+    /// `aliases` names, lowered for matching.
+    alias_keys: Vec<LoweredName>,
 }
 
 impl FontDir {
@@ -422,7 +427,14 @@ impl FontDir {
                 }
             }
         }
-        Ok(Self { entries, aliases })
+        let entry_keys = entries.iter().map(|(n, _)| LoweredName::new(n)).collect();
+        let alias_keys = aliases.iter().map(|(a, _)| LoweredName::new(a)).collect();
+        Ok(Self {
+            entries,
+            aliases,
+            entry_keys,
+            alias_keys,
+        })
     }
 }
 
@@ -443,52 +455,6 @@ fn split_alias_token(s: &str) -> Option<(&str, &str)> {
             None => Some((s, "")),
         }
     }
-}
-
-/// Case-insensitive `*`/`?` glob for X11 font name patterns.
-///
-/// Single-pass with one backtrack point (the last `*`), so cost is
-/// O(|pattern| x |name|). The obvious recursive form — `'*' =>
-/// (0..=n.len()).any(|k| rec(&p[1..], &n[k..]))` — is exponential in the
-/// number of STARS, not the length, so "font names are short" does not save
-/// it. Toolkits ask `-*-*-*-*-*-*-*-*-*-*-*-*-iso8859-1`; a name that fails
-/// on the charset forces every split of every star. That cost `ListFonts`
-/// 514ms per call in issue #155, because `path_font_names` runs this once
-/// per font-path entry. `font_pattern_glob_is_not_exponential` guards it.
-///
-/// `?` matches one char, not one byte, hence `Vec<char>` — the byte-based
-/// `xlfd_pattern_matches` is not a drop-in here.
-pub(crate) fn font_pattern_matches(pattern: &str, name: &str) -> bool {
-    let p: Vec<char> = pattern.to_ascii_lowercase().chars().collect();
-    let n: Vec<char> = name.to_ascii_lowercase().chars().collect();
-    let mut pi = 0usize;
-    let mut ni = 0usize;
-    // Position of the most recent `*` in the pattern, and the name offset
-    // it was first tried at. On a mismatch we return here and let that
-    // star swallow one more char — the only backtrack the grammar needs.
-    let mut star: Option<usize> = None;
-    let mut star_ni = 0usize;
-    while ni < n.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
-            pi += 1;
-            ni += 1;
-        } else if pi < p.len() && p[pi] == '*' {
-            star = Some(pi);
-            star_ni = ni;
-            pi += 1;
-        } else if let Some(sp) = star {
-            pi = sp + 1;
-            star_ni += 1;
-            ni = star_ni;
-        } else {
-            return false;
-        }
-    }
-    // Name exhausted: any trailing stars match empty, anything else fails.
-    while pi < p.len() && p[pi] == '*' {
-        pi += 1;
-    }
-    pi == p.len()
 }
 
 /// Resolution outcome for a font name against the font path.
@@ -592,6 +558,10 @@ pub(crate) struct FontLoader {
     pub(crate) library: freetype::Library,
     pub(crate) fc: fontconfig::Fontconfig,
     pub(crate) catalog: Vec<String>,
+    /// `catalog`, lowered for matching.
+    catalog_keys: Vec<LoweredName>,
+    /// `XORG_BUILTIN_NAMES`, lowered for matching.
+    builtin_keys: Vec<LoweredName>,
     /// Current font path, element order significant. Elements are
     /// directories (with fonts.dir) or the literal "built-ins".
     pub(crate) font_path: Vec<String>,
@@ -614,7 +584,12 @@ impl FontLoader {
             library: freetype::Library::init()
                 .map_err(|e| io::Error::other(format!("freetype init failed: {e:?}")))?,
             fc,
+            catalog_keys: catalog.iter().map(|n| LoweredName::new(n)).collect(),
             catalog,
+            builtin_keys: XORG_BUILTIN_NAMES
+                .iter()
+                .map(|n| LoweredName::new(n))
+                .collect(),
             font_path: Vec::new(),
             path_dirs: Vec::new(),
         };
@@ -698,53 +673,45 @@ impl FontLoader {
         if hops == 0 {
             return None;
         }
-        for (el, dir) in self.font_path.iter().zip(&self.path_dirs) {
+        let pattern = FontPattern::new(name);
+        let key = LoweredName::new(name);
+        for dir in &self.path_dirs {
             let Some(dir) = dir else {
                 // "built-ins": embedded fonts first — a fontconfig
                 // substitute for `cursor`/`nil2` is always wrong (#79).
                 if let Some(f) = embedded_font(name).or_else(|| {
                     XORG_BUILTIN_NAMES
                         .iter()
-                        .find(|n| font_pattern_matches(name, n))
-                        .and_then(|n| embedded_font(n))
+                        .zip(&self.builtin_keys)
+                        .find(|(_, k)| pattern.matches(k))
+                        .and_then(|(n, _)| embedded_font(n))
                 }) {
                     return Some(FontResolution::Embedded(f));
                 }
                 // then the alias set, then catalog XLFD match.
                 if BUILTIN_ALIASES.iter().any(|a| a.eq_ignore_ascii_case(name))
-                    || self
-                        .catalog
-                        .iter()
-                        .any(|entry| font_pattern_matches(name, entry))
+                    || self.catalog_keys.iter().any(|k| pattern.matches(k))
                     || self.builtin_xlfd_is_current_alias_reply(name)
                 {
                     return Some(FontResolution::BuiltIn);
                 }
-                let _ = el;
                 continue;
             };
-            if let Some((entry_name, path)) = dir
-                .entries
-                .iter()
-                .find(|(n, _)| n.eq_ignore_ascii_case(name))
-                .map(|(n, p)| (n.clone(), p.clone()))
-            {
-                return Some(FontResolution::File { path, entry_name });
+            let file = |i: usize| {
+                let (n, p) = &dir.entries[i];
+                FontResolution::File {
+                    path: p.clone(),
+                    entry_name: n.clone(),
+                }
+            };
+            if let Some(i) = dir.entry_keys.iter().position(|k| k.bytes == key.bytes) {
+                return Some(file(i));
             }
-            if let Some((_, target)) = dir
-                .aliases
-                .iter()
-                .find(|(a, _)| a.eq_ignore_ascii_case(name))
-            {
-                return self.resolve_inner(target, hops - 1);
+            if let Some(i) = dir.alias_keys.iter().position(|k| k.bytes == key.bytes) {
+                return self.resolve_inner(&dir.aliases[i].1, hops - 1);
             }
-            if let Some((entry_name, path)) = dir
-                .entries
-                .iter()
-                .find(|(n, _)| font_pattern_matches(name, n))
-                .map(|(n, p)| (n.clone(), p.clone()))
-            {
-                return Some(FontResolution::File { path, entry_name });
+            if let Some(i) = dir.entry_keys.iter().position(|k| pattern.matches(k)) {
+                return Some(file(i));
             }
             // A pattern matches aliases too: libXfont looks a name up in
             // one table of a directory's fonts and aliases
@@ -755,10 +722,11 @@ impl FontLoader {
             // fonts.alias names fonts for every charset) gives way to the
             // next one that matches.
             if let Some(found) = dir
-                .aliases
+                .alias_keys
                 .iter()
-                .filter(|(a, _)| font_pattern_matches(name, a))
-                .find_map(|(_, target)| self.resolve_inner(target, hops - 1))
+                .zip(&dir.aliases)
+                .filter(|(k, _)| pattern.matches(k))
+                .find_map(|(_, (_, target))| self.resolve_inner(target, hops - 1))
             {
                 return Some(found);
             }
@@ -858,30 +826,33 @@ impl FontLoader {
     /// the fontconfig catalog this server adds there. Nothing from
     /// `built-ins` when the path does not hold it, as on Xorg.
     pub(crate) fn path_font_names(&self, pattern: &str) -> Vec<String> {
+        let pattern = FontPattern::new(pattern);
         let mut out = Vec::new();
         for dir in &self.path_dirs {
             let Some(dir) = dir else {
                 out.extend(
                     XORG_BUILTIN_NAMES
                         .iter()
-                        .filter(|n| font_pattern_matches(pattern, n))
-                        .map(|n| (*n).to_string()),
+                        .zip(&self.builtin_keys)
+                        .filter(|(_, k)| pattern.matches(k))
+                        .map(|(n, _)| (*n).to_string()),
                 );
                 out.extend(
                     self.catalog
                         .iter()
-                        .filter(|n| font_pattern_matches(pattern, n))
-                        .cloned(),
+                        .zip(&self.catalog_keys)
+                        .filter(|(_, k)| pattern.matches(k))
+                        .map(|(n, _)| n.clone()),
                 );
                 continue;
             };
-            for (name, _) in &dir.entries {
-                if font_pattern_matches(pattern, name) {
+            for ((name, _), k) in dir.entries.iter().zip(&dir.entry_keys) {
+                if pattern.matches(k) {
                     out.push(name.clone());
                 }
             }
-            for (alias, _) in &dir.aliases {
-                if font_pattern_matches(pattern, alias) {
+            for ((alias, _), k) in dir.aliases.iter().zip(&dir.alias_keys) {
+                if pattern.matches(k) {
                     out.push(alias.clone());
                 }
             }
@@ -2928,81 +2899,6 @@ mod font_tests {
             vec![("myalias".to_string(), "testfont0".to_string())]
         );
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn font_pattern_glob() {
-        assert!(font_pattern_matches("xtfont*", "xtfont0"));
-        assert!(font_pattern_matches("XTFONT0", "xtfont0")); // case-insensitive
-        assert!(font_pattern_matches(
-            "-vsw-*-bold-r-*",
-            "-vsw-testfont-bold-r-normal--13-130-75-75-m-70-iso8859-1"
-        ));
-        assert!(!font_pattern_matches("xtfont?", "xtfont"));
-        assert!(!font_pattern_matches("nope", "xtfont0"));
-    }
-
-    /// Edge cases that distinguish a correct glob from a plausible one:
-    /// trailing stars, empty inputs, a star giving back chars so a later
-    /// literal can land, and `?` against a multibyte char (#155).
-    #[test]
-    fn font_pattern_glob_edge_cases() {
-        // Trailing stars match empty; a bare star matches empty.
-        assert!(font_pattern_matches("abc*", "abc"));
-        assert!(font_pattern_matches("abc***", "abc"));
-        assert!(font_pattern_matches("*", ""));
-        assert!(font_pattern_matches("***", ""));
-        assert!(font_pattern_matches("", ""));
-        // A non-star pattern cannot match an empty name, and vice versa.
-        assert!(!font_pattern_matches("", "a"));
-        assert!(!font_pattern_matches("?", ""));
-        // The whole name must be consumed.
-        assert!(!font_pattern_matches("abc", "abcd"));
-        // Backtracking: the star must give back chars so a later literal
-        // can land. A single-pass matcher without a backtrack point fails
-        // these.
-        assert!(font_pattern_matches("*b", "abab"));
-        assert!(font_pattern_matches("*ab", "aab"));
-        assert!(font_pattern_matches("a*b*c", "axxbyyc"));
-        assert!(!font_pattern_matches("*ab", "aba"));
-        // `?` matches exactly one CHAR, not one byte — a byte-based
-        // matcher (e.g. `xlfd_pattern_matches`) diverges here.
-        assert!(font_pattern_matches("?", "é"));
-        assert!(font_pattern_matches("*é*", "xéy"));
-        // The shape real toolkits send: all-wildcard XLFD with a literal
-        // charset tail. Matching and non-matching must both be right.
-        let name = "-misc-fixed-medium-r-normal--20-200-75-75-c-100-iso8859-1";
-        assert!(font_pattern_matches(
-            "-*-*-*-*-*-*-*-*-*-*-*-*-iso8859-1",
-            name
-        ));
-        assert!(!font_pattern_matches(
-            "-*-*-*-*-*-*-*-*-*-*-*-*-iso10646-1",
-            name
-        ));
-        assert!(font_pattern_matches("-*-*-*-*-*-*-*-*-*-*-*-*-*-*", name));
-    }
-
-    /// Complexity guard for #155: the matcher must not be exponential in
-    /// the star count. The worst case is a fully-wildcarded XLFD with a
-    /// literal charset tail against a name that does NOT match, so every
-    /// split of every star is explored before the answer is known. The
-    /// bound is loose enough that only a return to exponential can trip
-    /// it, so a wall-clock assertion is safe here.
-    #[test]
-    fn font_pattern_glob_is_not_exponential() {
-        let pattern = "-*-*-*-*-*-*-*-*-*-*-*-*-iso8859-1";
-        let name = "-misc-fixed-medium-r-normal--20-200-75-75-c-100-iso10646-1";
-        let start = std::time::Instant::now();
-        for _ in 0..5000 {
-            assert!(!font_pattern_matches(pattern, name));
-        }
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < std::time::Duration::from_secs(3),
-            "5000 worst-case font glob matches took {elapsed:?}; the matcher \
-             has regressed to exponential backtracking (see #155)"
-        );
     }
 
     /// The built-ins escape hatch for our own synthesized alias XLFD
