@@ -1397,6 +1397,11 @@ fn file_font_metrics(
         if let Some(d) = pcf.font_descent {
             metrics.font_descent = d;
         }
+        // libXfont serves the PROPERTIES table whole; FreeType exposes
+        // only the names asked for.
+        if let Some(props) = pcf.properties {
+            metrics.named_properties = props;
+        }
     }
     (metrics, char_cache)
 }
@@ -1507,6 +1512,9 @@ struct PcfFileInfo {
     max_bounds: Option<ProtocolCharInfo>,
     font_ascent: Option<i16>,
     font_descent: Option<i16>,
+    /// The PROPERTIES table, in file order — what libXfont's
+    /// pcfGetProperties hands QueryFont and ListFontsWithInfo.
+    properties: Option<Vec<(String, FontPropValue)>>,
 }
 
 /// Parse the PCF table directory for [`PcfFileInfo`]. Returns None
@@ -1537,6 +1545,7 @@ fn pcf_image(data: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
 fn pcf_info_from_bytes(data: &[u8]) -> Option<PcfFileInfo> {
     let image = pcf_image(data)?;
     let data: &[u8] = &image;
+    const PCF_PROPERTIES: u32 = 1 << 0;
     const PCF_ACCELERATORS: u32 = 1 << 1;
     const PCF_INK_METRICS: u32 = 1 << 4;
     const PCF_BDF_ENCODINGS: u32 = 1 << 5;
@@ -1553,6 +1562,7 @@ fn pcf_info_from_bytes(data: &[u8]) -> Option<PcfFileInfo> {
         max_bounds: None,
         font_ascent: None,
         font_descent: None,
+        properties: None,
     };
     let read_i16 = |off: usize, big: bool| -> Option<i16> {
         let raw: [u8; 2] = data.get(off..off + 2)?.try_into().ok()?;
@@ -1589,6 +1599,7 @@ fn pcf_info_from_bytes(data: &[u8]) -> Option<PcfFileInfo> {
         let ttype = u32::from_le_bytes(data.get(base..base + 4)?.try_into().ok()?);
         let off = u32::from_le_bytes(data.get(base + 12..base + 16)?.try_into().ok()?) as usize;
         match ttype {
+            PCF_PROPERTIES => info.properties = pcf_properties(data, off),
             PCF_INK_METRICS => info.has_ink_metrics = true,
             PCF_ACCELERATORS => accel_off = Some(off),
             PCF_BDF_ACCELERATORS => bdf_accel_off = Some(off),
@@ -1623,6 +1634,50 @@ fn pcf_info_from_bytes(data: &[u8]) -> Option<PcfFileInfo> {
         info.max_bounds = read_metrics(max_off, big);
     }
     Some(info)
+}
+
+/// The PCF PROPERTIES table at `off`, as libXfont's pcfGetProperties
+/// reads it: format word, count, (name offset, is-string, value)
+/// records padded to 4, then the string pool. None if malformed.
+fn pcf_properties(data: &[u8], off: usize) -> Option<Vec<(String, FontPropValue)>> {
+    let fmt = u32::from_le_bytes(data.get(off..off + 4)?.try_into().ok()?);
+    if fmt & 0xFFFF_FF00 != 0 {
+        return None; // not PCF_DEFAULT_FORMAT
+    }
+    let big = fmt & (1 << 2) != 0;
+    let read_i32 = |at: usize| -> Option<i32> {
+        let raw: [u8; 4] = data.get(at..at + 4)?.try_into().ok()?;
+        Some(if big {
+            i32::from_be_bytes(raw)
+        } else {
+            i32::from_le_bytes(raw)
+        })
+    };
+    let nprops = usize::try_from(read_i32(off + 4)?)
+        .ok()
+        .filter(|&n| n > 0)?;
+    let records = off + 8;
+    let pool_len_at = records + (nprops * 9).next_multiple_of(4);
+    let pool_len = usize::try_from(read_i32(pool_len_at)?).ok()?;
+    let pool = data.get(pool_len_at + 4..pool_len_at + 4 + pool_len)?;
+    let string_at = |at: i32| -> Option<String> {
+        let tail = pool.get(usize::try_from(at).ok()?..)?;
+        let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
+        Some(String::from_utf8_lossy(&tail[..end]).into_owned())
+    };
+    let mut props = Vec::with_capacity(nprops);
+    for i in 0..nprops {
+        let rec = records + 9 * i;
+        let name = string_at(read_i32(rec)?)?;
+        let value = read_i32(rec + 5)?;
+        let value = match data.get(rec + 4)? {
+            0 => FontPropValue::Int(value),
+            1 => FontPropValue::Str(string_at(value)?),
+            _ => return None,
+        };
+        props.push((name, value));
+    }
+    Some(props)
 }
 
 /// FFI for FreeType's BDF/PCF property accessor — freetype-sys
@@ -3646,6 +3701,48 @@ mod pcf_tests {
             None,
             "truncated stream"
         );
+    }
+
+    /// The PROPERTIES table whole and in file order, as a live Xorg
+    /// 21.1 ListFontsWithInfo reports sony 8x16 (vng font-list
+    /// scenario) — FreeType exposed only the names asked for.
+    #[test]
+    fn system_pcf_properties_match_xorg() {
+        let file = std::path::Path::new("/usr/share/fonts/misc/8x16.pcf.gz");
+        if !file.is_file() {
+            eprintln!("skipping: {} not present", file.display());
+            return;
+        }
+        let s = |v: &str| FontPropValue::Str(v.to_string());
+        let expected = [
+            ("FONTNAME_REGISTRY", s("")),
+            ("FOUNDRY", s("Sony")),
+            ("FAMILY_NAME", s("Fixed")),
+            ("WEIGHT_NAME", s("Medium")),
+            ("SLANT", s("R")),
+            ("SETWIDTH_NAME", s("Normal")),
+            ("ADD_STYLE_NAME", s("")),
+            ("PIXEL_SIZE", FontPropValue::Int(16)),
+            ("POINT_SIZE", FontPropValue::Int(120)),
+            ("RESOLUTION_X", FontPropValue::Int(100)),
+            ("RESOLUTION_Y", FontPropValue::Int(100)),
+            ("SPACING", s("C")),
+            ("AVERAGE_WIDTH", FontPropValue::Int(80)),
+            ("CHARSET_REGISTRY", s("ISO8859")),
+            ("CHARSET_ENCODING", s("1")),
+            ("COPYRIGHT", s("Copyright (c) 1987, 1988 Sony Corp.")),
+            (
+                "FONT",
+                s("-Sony-Fixed-Medium-R-Normal--16-120-100-100-C-80-ISO8859-1"),
+            ),
+            ("WEIGHT", FontPropValue::Int(10)),
+            ("RESOLUTION", FontPropValue::Int(138)),
+            ("X_HEIGHT", FontPropValue::Int(14)),
+            ("QUAD_WIDTH", FontPropValue::Int(8)),
+        ]
+        .map(|(n, v)| (n.to_string(), v));
+        let info = pcf_file_info(file).expect("gzipped PCF parses");
+        assert_eq!(info.properties.as_deref(), Some(&expected[..]));
     }
 
     /// default_char of installed .pcf.gz fonts, as a live Xorg 21.1

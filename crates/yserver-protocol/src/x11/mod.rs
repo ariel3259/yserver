@@ -438,7 +438,7 @@ pub struct CharInfo {
 /// A font property value as read from the font file (BDF/PCF
 /// properties). String values become atoms at the request layer
 /// (the server's atom table isn't visible to backends).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FontPropValue {
     Card(u32),
     Int(i32),
