@@ -2,7 +2,9 @@
 
 **Status:** revision 3 (design review round 1: M-1 the invisibility contract
 scoped, requests during recovery parked, late executor results; round 2: M-2
-the RANDR gate and administrative-reprobe contract of section 3.3). Design
+the RANDR gate and administrative-reprobe contract of section 3.3; round 3:
+M-3 lease holders include in-process probe-worker threads, the parked
+mutation's `Q` deadline, device-scoped acquire reuse). Design
 approved by the user section by section on 2026-10-04. One spec, two plans
 (3d-i, 3d-ii).
 
@@ -103,8 +105,9 @@ A completion loss or mechanism breach already moves the device to `Poisoned`
    `IncarnationId`), acquire DRM master, spawn a new executor, rebuild the
    device's scanout pools and their resource registrations on the new fd, and
    rediscover (connectors, properties, clock).
-5. **Reinstall and qualification.** Run the 3c-i acquire reinstall for that
-   device: probe, final `TEST_ONLY`, a from-scratch `ALLOW_MODESET`
+5. **Reinstall and qualification.** Reuse the 3c-i acquire's **device-scoped
+   preparation and installation** for that device (not the acquire episode,
+   which takes a gate episode; section 3.3 forbids one): probe, final `TEST_ONLY`, a from-scratch `ALLOW_MODESET`
    installation of the desired topology with the current DPMS projection. That
    real installation, completed with its required evidence, **is** the
    qualification. Publication happens only if the topology changed (decision 2).
@@ -155,7 +158,9 @@ it:
    recovery's terminal outcome (`Ready` or `RecoveryFailed`) wakes it, after
    which it is validated and executed through the ordinary 3b path. The gate's
    `Q` = 30 s bound answers it `Failed` if the recovery is still running then
-   (for example paused by DPMS-off or waiting for a reap).
+   (for example paused by DPMS-off or waiting for a reap). Today the gate
+   derives deadlines only from waiting entries; the parked mutation is the
+   active entry, so its `Q` deadline must be armed on the active entry as well.
 3. **Administrative-reprobe delivery is not gated.** A forced reprobe updates
    the `REC-5` desired snapshot (`AdministrativeReprobe`) when the request is
    received, before it waits for a gate turn, so the arbiter can supersede a
@@ -210,6 +215,23 @@ complete fd set, release the resources owned by that incarnation, in the
 device-loss safe order. A device that reappears is a new identity (out of scope:
 opening a hot-added card).
 
+### 4.2a. Lease holders
+
+An incarnation's fd family is held by two kinds of lease holder, and every
+barrier in this stage counts both:
+
+- **executor/helper children** (processes; released by an actual wait/reap
+  status);
+- **in-process connector-probe worker threads** (3c-ii): each owns a
+  duplicated fd of the incarnation while its probe runs and stays in the probe
+  ledger until it returns and is joined. A stuck worker keeps its fd.
+
+The probe-worker ledger and its fd accounting move with the incarnation (into
+the winning transition's quarantine, like the executor lease). A worker that
+returns late is joined asynchronously from the core loop and releases its
+lease then. "Every lease holder released" means every child reaped **and**
+every worker of that incarnation joined.
+
 ### 4.3. Orderly shutdown
 
 Following C.0 §10's Shutdown row:
@@ -218,13 +240,19 @@ Following C.0 §10's Shutdown row:
    recovery.
 2. Request termination of every executor and helper; terminalize protocol work;
    **release the seat** (drop master, restore the VT) before waiting.
-3. The **teardown supervisor** waits up to **3 s** for every child's wait/reap
-   status; then closes the complete DRM fd set, drops file-owned quarantine, and
+3. The **teardown supervisor** waits up to **3 s** until every lease holder
+   (section 4.2a: children reaped and probe workers joined) is released; then
+   closes the complete DRM fd set, drops file-owned quarantine, and
    tears down Vulkan, GBM and shared owners in their device-loss safe order.
    `shutdown_destroy_drawables` runs inside that order.
-4. A child still unreaped at the deadline puts the device in
-   `ShutdownExecutorStalled`: logical shutdown is complete, the unreaped lease is
-   recorded, and the process exits; the orphaned helper keeps the device lock.
+4. A lease holder still unreleased at the deadline (an unreaped child or an
+   unjoined probe worker) puts the device in `ShutdownExecutorStalled`: logical
+   shutdown is complete, the unreleased holder is recorded, the device's fd
+   family is **not** closed and its family-owned resources are **not**
+   destroyed by the supervisor (no unproven barrier is claimed), and the
+   process exits; the kernel's process teardown is what finally releases them.
+   An orphaned helper keeps the device lock; a blocked worker thread dies with
+   the process.
 
 ## 5. Evidence
 
@@ -263,7 +291,12 @@ names the mutation that must fail. The umbrella §4 differential gate applies.
 - Quarantine totality: every inventoried owner is held and released only at its
   barrier.
 - Shutdown: the complete barrier order; `ShutdownExecutorStalled` at the 3 s
-  deadline with the lease recorded.
+  deadline with the lease recorded; and a shutdown where every child is reaped
+  but a connector-probe worker is still blocked: no premature family close or
+  resource destruction, the worker recorded, a bounded exit at the deadline.
+- Recovery barrier with a stuck probe worker: no replacement fd while the
+  worker holds its lease; the late join releases it and the same `RecoveryId`
+  continues.
 
 ### 5.2. Hardware (card1, at least 4 cycles each)
 
