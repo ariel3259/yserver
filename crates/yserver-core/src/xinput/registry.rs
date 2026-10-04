@@ -94,7 +94,22 @@ impl XiRegistry {
             let ids = sorted_facet_ids(&record.facets);
             for id in &ids {
                 if let Some(device) = self.device_mut(*id) {
-                    device.enabled = info.enabled;
+                    let was_session_enabled = device.session_enabled;
+                    device.session_enabled = info.enabled;
+                    device.enabled = device.session_enabled && !device.client_disabled;
+                    if !device.enabled && !was_session_enabled {
+                        device.attached_master = None;
+                    } else if device.enabled && !was_session_enabled {
+                        // Enabling restores the role's home master. Do not
+                        // use the most recent attachment: grab detachment is
+                        // a temporary state, and XI masters never change a
+                        // slave's pointer/keyboard role (devices.c:388-394).
+                        device.attached_master = Some(match device.facet {
+                            Some(XiFacetKind::PointerTouch) => DEVICEID_MASTER_POINTER,
+                            Some(XiFacetKind::Keyboard) => DEVICEID_MASTER_KEYBOARD,
+                            None => continue,
+                        });
+                    }
                     device.name.clone_from(&info.name);
                     device.is_touchpad =
                         device.facet == Some(XiFacetKind::PointerTouch) && info.is_touchpad;
@@ -240,6 +255,17 @@ impl XiRegistry {
         match self.role(device_id)? {
             XiDeviceRole::MasterPointer | XiDeviceRole::MasterKeyboard => Some(device_id),
             XiDeviceRole::SlavePointer | XiDeviceRole::SlaveKeyboard => device.attached_master,
+        }
+    }
+
+    /// Home master implied by a slave's role. This remains stable while the
+    /// slave is temporarily detached for a grab or floated while disabled.
+    #[must_use]
+    pub fn home_master(&self, device_id: u16) -> Option<u16> {
+        match self.role(device_id)? {
+            XiDeviceRole::SlavePointer => Some(DEVICEID_MASTER_POINTER),
+            XiDeviceRole::SlaveKeyboard => Some(DEVICEID_MASTER_KEYBOARD),
+            XiDeviceRole::MasterPointer | XiDeviceRole::MasterKeyboard => None,
         }
     }
 

@@ -21210,14 +21210,14 @@ impl KmsBackend {
             .remove(&yserver_core::core_loop::InputOrigin::Physical(source_id));
         self.release_pointer_source_buttons(state, source_id);
         self.release_keyboard_source_keys(state, source_id);
-        yserver_core::core_loop::pointer_fanout::xi_cleanup_source(state, self, source_id);
         self.synchronize_floating_keyboard_states(state);
         true
     }
 
     /// Own physical-device held-state cleanup for removal and VT suspension.
     /// Releases pass through the ordinary KMS input and XI fanout paths while
-    /// the source is still live; grab teardown and facet disable follow.
+    /// the source is still live. XI grabs remain active across suspension, as
+    /// DisableDevice releases holds but does not deactivate device grabs.
     pub(crate) fn release_device_state(
         &mut self,
         state: &mut ServerState,
@@ -21260,6 +21260,9 @@ impl KmsBackend {
                 &changed_ids,
                 &[],
             );
+        }
+        for id in &changed_ids {
+            state.xi_float_disabled_device(*id);
         }
     }
 }
@@ -21819,6 +21822,7 @@ impl Backend for KmsBackend {
                     return;
                 }
                 self.release_device_state(state, source_id);
+                yserver_core::core_loop::pointer_fanout::xi_cleanup_source(state, self, source_id);
                 let removed_ids = state.xi_unregister_source(source_id);
                 let removed = state.take_xi_removed_device_descriptors();
                 for id in &removed_ids {
@@ -31858,8 +31862,11 @@ mod tests {
             (2, 2, 1, 0),
             "master keyboard is attached to its paired pointer"
         );
-        assert_eq!(event_info(&added_and_enabled[0], 6), (3, 4, 0, 1 << 2));
-        assert_eq!(event_info(&added_and_enabled[0], 7), (2, 3, 0, 1 << 2));
+        // Xorg creates an off device before ActivateDevice publishes
+        // XISlaveAdded (devices.c:307-311, 601-605); EnableDevice attaches it
+        // only afterwards (devices.c:388-394).
+        assert_eq!(event_info(&added_and_enabled[0], 6), (0, 5, 0, 1 << 2));
+        assert_eq!(event_info(&added_and_enabled[0], 7), (0, 5, 0, 1 << 2));
         assert_eq!(event_info(&added_and_enabled[1], 6), (3, 4, 1, 1 << 6));
         assert_eq!(event_info(&added_and_enabled[1], 7), (2, 3, 1, 1 << 6));
 
@@ -31932,7 +31939,7 @@ mod tests {
             2,
             "unmatched endpoint starts with Added/Enabled"
         );
-        assert_eq!(event_info(&fresh_add[0], 6), (3, 4, 0, 1 << 2));
+        assert_eq!(event_info(&fresh_add[0], 6), (0, 5, 0, 1 << 2));
         assert_eq!(event_info(&fresh_add[1], 6), (3, 4, 1, 1 << 6));
         Backend::on_host_input(
             &mut backend,
@@ -31972,7 +31979,7 @@ mod tests {
             2,
             "a fresh source gets Added/Enabled after Removed"
         );
-        assert_eq!(event_info(&readd[0], 6), (3, 4, 0, 1 << 2));
+        assert_eq!(event_info(&readd[0], 6), (0, 5, 0, 1 << 2));
         assert_eq!(event_info(&readd[1], 6), (3, 4, 1, 1 << 6));
         assert!(state.xi_devices.source(fresh_source).is_some());
         Backend::on_host_input(
@@ -32126,6 +32133,503 @@ mod tests {
         assert!(state.clients[&2].outbound.is_empty());
         assert!(read_events(&mut selected).is_empty());
         assert!(read_events(&mut unrelated).is_empty());
+    }
+
+    // Kills: retaining an attached_master for a physically suspended facet,
+    // which would make XIQueryDevice report it as an attached slave.
+    #[test]
+    fn xi_dynamic_session_disable_floats_query_and_resume_reattaches_home_master() {
+        use std::{
+            collections::{HashMap, HashSet, VecDeque},
+            io::{ErrorKind, Read},
+            os::unix::net::UnixStream,
+            sync::{Arc, Mutex, atomic::AtomicU16},
+        };
+        use yserver_core::{
+            backend::Backend,
+            core_loop::{DeviceInfo, HostInputEvent, process_request},
+            server::{ClientState, ServerState},
+            transport::Transport,
+            xinput::{DEVICEID_MASTER_POINTER, InputCapabilities, InputSourceId, XiFacetKind},
+        };
+        use yserver_protocol::x11::{ClientByteOrder, ClientId, RequestHeader, SequenceNumber};
+
+        fn install(state: &mut ServerState, id: u32) -> UnixStream {
+            let (peer, writer) = UnixStream::pair().expect("client socket pair");
+            peer.set_nonblocking(true).expect("nonblocking peer");
+            writer.set_nonblocking(true).expect("nonblocking writer");
+            state.clients.insert(
+                id,
+                ClientState {
+                    writer: Arc::new(Mutex::new(Transport::Unix(writer))),
+                    is_local: true,
+                    fd_passing: true,
+                    byte_order: ClientByteOrder::LittleEndian,
+                    last_sequence: Arc::new(AtomicU16::new(0)),
+                    resource_id_base: 0,
+                    resource_id_mask: u32::MAX,
+                    event_masks: HashMap::new(),
+                    save_set: HashSet::new(),
+                    big_requests_enabled: false,
+                    xi2_masks: HashMap::new(),
+                    xi1_event_classes: HashSet::new(),
+                    xi1_window_event_classes: HashMap::new(),
+                    outbound: VecDeque::new(),
+                    watching_writable: false,
+                    focused_window: yserver_core::resources::ROOT_WINDOW,
+                    reader_control: None,
+                },
+            );
+            peer
+        }
+
+        fn drain(peer: &mut UnixStream) -> Vec<u8> {
+            let mut wire = Vec::new();
+            let mut chunk = [0u8; 512];
+            loop {
+                match peer.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(count) => wire.extend_from_slice(&chunk[..count]),
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                    Err(error) => panic!("read client wire: {error}"),
+                }
+            }
+            wire
+        }
+
+        fn drain_query_reply(peer: &mut UnixStream) -> Vec<u8> {
+            use std::time::Duration;
+
+            let mut wire = Vec::new();
+            for _ in 0..100 {
+                wire.extend_from_slice(&drain(peer));
+                if wire.len() >= 8 {
+                    let extra_words = u32::from_le_bytes(wire[4..8].try_into().unwrap()) as usize;
+                    let expected_len = 32 + extra_words * 4;
+                    if wire.len() >= expected_len {
+                        wire.truncate(expected_len);
+                        return wire;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            wire
+        }
+
+        fn query_device(
+            state: &mut ServerState,
+            backend: &mut KmsBackend,
+            peer: &mut UnixStream,
+            sequence: u16,
+            device_id: u16,
+        ) -> Vec<u8> {
+            let [lo, hi] = device_id.to_le_bytes();
+            let outcome = process_request::process_request(
+                state,
+                backend,
+                ClientId(2),
+                SequenceNumber(sequence),
+                RequestHeader {
+                    opcode: 137,
+                    data: 48, // XIQueryDevice
+                    length_units: 2,
+                },
+                &[lo, hi, 0, 0],
+                None,
+            )
+            .expect("XIQueryDevice through process_request");
+            assert!(
+                matches!(outcome, process_request::RequestOutcome::Handled),
+                "XIQueryDevice outcome: {outcome:?}"
+            );
+            use yserver_core::core_loop::client_io::{self, WriteOutcome};
+            for _ in 0..100 {
+                let outcome =
+                    client_io::drain_outbound(state.clients.get_mut(&2).expect("query client"))
+                        .expect("flush queued XIQueryDevice reply");
+                if outcome == WriteOutcome::Done {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let reply = drain_query_reply(peer);
+            assert!(
+                !reply.is_empty(),
+                "XIQueryDevice reply missing; client outbound queue has {} bytes",
+                state.clients[&2].outbound.len()
+            );
+            reply
+        }
+
+        let source = InputSourceId(0x16_41);
+        let info = DeviceInfo {
+            source_id: source,
+            enabled: true,
+            resume_key: None,
+            capabilities: InputCapabilities {
+                keyboard: false,
+                pointer: true,
+                touch: false,
+            },
+            name: "session disable mouse".to_owned(),
+            device_node: "/dev/input/event-session-disable".to_owned(),
+            sysname: "event-session-disable".to_owned(),
+            vendor_id: 0x1234,
+            product_id: 0x5678,
+            is_touchpad: false,
+            config: Default::default(),
+        };
+
+        let mut state = ServerState::new();
+        let initial_ids: Vec<_> = state
+            .xi_devices
+            .devices()
+            .iter()
+            .map(|device| device.id)
+            .collect();
+        let initial_properties: HashMap<_, _> = state
+            .xi_devices
+            .devices()
+            .iter()
+            .map(|device| (device.id, device.properties.clone()))
+            .collect();
+        let mut query_peer = install(&mut state, 2);
+        let initial_selections = state.clients[&2].xi2_masks.clone();
+        let mut backend = KmsBackend::for_tests();
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceAdded(info.clone()),
+        );
+        let pointer = state
+            .xi_devices
+            .facet(source, XiFacetKind::PointerTouch)
+            .expect("added pointer facet");
+        let before = query_device(&mut state, &mut backend, &mut query_peer, 1, pointer);
+        assert_eq!(before[0], 1, "XIQueryDevice reply");
+        assert_eq!(u16::from_le_bytes(before[34..36].try_into().unwrap()), 3);
+        assert_eq!(
+            u16::from_le_bytes(before[36..38].try_into().unwrap()),
+            DEVICEID_MASTER_POINTER
+        );
+        assert_eq!(before[42], 1);
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceSuspended { source_id: source },
+        );
+        let disabled = query_device(&mut state, &mut backend, &mut query_peer, 2, pointer);
+        assert_eq!(disabled[0], 1, "XIQueryDevice reply");
+        assert_eq!(
+            u16::from_le_bytes(disabled[34..36].try_into().unwrap()),
+            5,
+            "a disabled pointer is XIFloatingSlave"
+        );
+        assert_eq!(
+            u16::from_le_bytes(disabled[36..38].try_into().unwrap()),
+            0,
+            "a disabled pointer has no attachment"
+        );
+        assert_eq!(disabled[42], 0, "XIQueryDevice reports disabled");
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceResumed(info.clone()),
+        );
+        let resumed = query_device(&mut state, &mut backend, &mut query_peer, 3, pointer);
+        assert_eq!(resumed[0], 1, "XIQueryDevice reply");
+        assert_eq!(u16::from_le_bytes(resumed[34..36].try_into().unwrap()), 3);
+        assert_eq!(
+            u16::from_le_bytes(resumed[36..38].try_into().unwrap()),
+            DEVICEID_MASTER_POINTER,
+            "resume attaches to the facet's home master"
+        );
+        assert_eq!(resumed[42], 1);
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceRemoved { source_id: source },
+        );
+        assert!(state.xi_devices.source(source).is_none());
+        assert_eq!(
+            state
+                .xi_devices
+                .devices()
+                .iter()
+                .map(|device| device.id)
+                .collect::<Vec<_>>(),
+            initial_ids,
+            "removal restores the original registry"
+        );
+        for device in state.xi_devices.devices() {
+            assert_eq!(device.properties, initial_properties[&device.id]);
+        }
+        assert_eq!(state.clients[&2].xi2_masks, initial_selections);
+        assert!(state.xi2_detached_masters.is_empty());
+        assert!(state.floating_pointer_positions.is_empty());
+        assert!(state.xi2_pointer_grabs.is_empty());
+        assert!(state.xi2_keyboard_grabs.is_empty());
+        assert!(state.key_down_by_device.is_empty());
+        assert!(state.unpublished_keyboard_keys_down.is_empty());
+        assert!(state.unpublished_pointer_buttons_down.is_empty());
+        assert_eq!(state.xi_last_slave(DEVICEID_MASTER_POINTER), None);
+        assert_eq!(
+            state.xi_last_slave(yserver_core::xinput::DEVICEID_MASTER_KEYBOARD),
+            None
+        );
+        assert!(state.keys_down.iter().all(|byte| *byte == 0));
+        assert_eq!(state.buttons_down, 0);
+        assert_eq!(state.xi_devices.device(4).unwrap().buttons_down, 0);
+        assert_eq!(state.xi_devices.device(5).unwrap().buttons_down, 0);
+        assert!(state.clients[&2].xi1_event_classes.is_empty());
+        assert!(state.clients[&2].xi1_window_event_classes.is_empty());
+        assert!(state.sync_pending.is_empty());
+        assert!(state.clients[&2].outbound.is_empty());
+        assert!(drain(&mut query_peer).is_empty());
+    }
+
+    // Kills: disable keeping the grab-detach entry (`xi2_detached_masters`),
+    // which lets XIUngrabDevice re-attach a disabled slave to its old master.
+    #[test]
+    fn xi_dynamic_session_disable_clears_grab_detach_before_ungrab() {
+        use std::{
+            collections::{HashMap, HashSet, VecDeque},
+            io::{ErrorKind, Read},
+            os::unix::net::UnixStream,
+            sync::{Arc, Mutex, atomic::AtomicU16},
+        };
+        use yserver_core::{
+            backend::Backend,
+            core_loop::{DeviceInfo, HostInputEvent, process_request},
+            server::{ClientState, ServerState},
+            transport::Transport,
+            xinput::{DEVICEID_MASTER_POINTER, InputCapabilities, InputSourceId, XiFacetKind},
+        };
+        use yserver_protocol::x11::{ClientByteOrder, ClientId, RequestHeader, SequenceNumber};
+
+        fn install(state: &mut ServerState, id: u32) -> UnixStream {
+            let (peer, writer) = UnixStream::pair().expect("client socket pair");
+            peer.set_nonblocking(true).expect("nonblocking peer");
+            writer.set_nonblocking(true).expect("nonblocking writer");
+            state.clients.insert(
+                id,
+                ClientState {
+                    writer: Arc::new(Mutex::new(Transport::Unix(writer))),
+                    is_local: true,
+                    fd_passing: true,
+                    byte_order: ClientByteOrder::LittleEndian,
+                    last_sequence: Arc::new(AtomicU16::new(0)),
+                    resource_id_base: 0,
+                    resource_id_mask: u32::MAX,
+                    event_masks: HashMap::new(),
+                    save_set: HashSet::new(),
+                    big_requests_enabled: false,
+                    xi2_masks: HashMap::new(),
+                    xi1_event_classes: HashSet::new(),
+                    xi1_window_event_classes: HashMap::new(),
+                    outbound: VecDeque::new(),
+                    watching_writable: false,
+                    focused_window: yserver_core::resources::ROOT_WINDOW,
+                    reader_control: None,
+                },
+            );
+            peer
+        }
+
+        fn drain(peer: &mut UnixStream) -> Vec<u8> {
+            let mut wire = Vec::new();
+            let mut chunk = [0u8; 512];
+            loop {
+                match peer.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(count) => wire.extend_from_slice(&chunk[..count]),
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                    Err(error) => panic!("read client wire: {error}"),
+                }
+            }
+            wire
+        }
+
+        fn request(
+            state: &mut ServerState,
+            backend: &mut KmsBackend,
+            peer: &mut UnixStream,
+            minor: u8,
+            sequence: u16,
+            body: &[u8],
+        ) -> Vec<u8> {
+            process_request::process_request(
+                state,
+                backend,
+                ClientId(1),
+                SequenceNumber(sequence),
+                RequestHeader {
+                    opcode: 137,
+                    data: minor,
+                    length_units: u32::try_from((body.len() + 4) / 4).unwrap(),
+                },
+                body,
+                None,
+            )
+            .expect("XI request through process_request");
+            drain(peer)
+        }
+
+        let source = InputSourceId(0x16_42);
+        let info = DeviceInfo {
+            source_id: source,
+            enabled: true,
+            resume_key: None,
+            capabilities: InputCapabilities {
+                keyboard: false,
+                pointer: true,
+                touch: false,
+            },
+            name: "grabbed session disable mouse".to_owned(),
+            device_node: "/dev/input/event-grab-disable".to_owned(),
+            sysname: "event-grab-disable".to_owned(),
+            vendor_id: 0x1234,
+            product_id: 0x5678,
+            is_touchpad: false,
+            config: Default::default(),
+        };
+
+        let mut state = ServerState::new();
+        let initial_ids: Vec<_> = state
+            .xi_devices
+            .devices()
+            .iter()
+            .map(|device| device.id)
+            .collect();
+        let initial_properties: HashMap<_, _> = state
+            .xi_devices
+            .devices()
+            .iter()
+            .map(|device| (device.id, device.properties.clone()))
+            .collect();
+        let mut owner_peer = install(&mut state, 1);
+        let mut backend = KmsBackend::for_tests();
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceAdded(info.clone()),
+        );
+        let pointer = state
+            .xi_devices
+            .facet(source, XiFacetKind::PointerTouch)
+            .expect("added pointer facet");
+        let mut grab = Vec::new();
+        grab.extend_from_slice(&yserver_core::resources::ROOT_WINDOW.0.to_le_bytes());
+        grab.extend_from_slice(&0u32.to_le_bytes());
+        grab.extend_from_slice(&0u32.to_le_bytes());
+        grab.extend_from_slice(&pointer.to_le_bytes());
+        grab.extend_from_slice(&[1, 1, 0, 0]); // async modes, no owner events
+        grab.extend_from_slice(&0u16.to_le_bytes()); // no XI event mask
+        let _ = request(&mut state, &mut backend, &mut owner_peer, 51, 1, &grab);
+        assert_eq!(
+            state.xi2_detached_masters.get(&pointer),
+            Some(&DEVICEID_MASTER_POINTER)
+        );
+        assert!(state.floating_pointer_positions.contains_key(&pointer));
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceSuspended { source_id: source },
+        );
+        assert!(!state.xi_devices.device(pointer).unwrap().enabled);
+        assert_eq!(
+            state.xi_devices.device(pointer).unwrap().attached_master,
+            None
+        );
+        assert!(
+            state.xi2_pointer_grabs.contains_key(&pointer),
+            "the explicit XI grab remains active across session disable"
+        );
+        assert!(
+            !state.xi2_detached_masters.contains_key(&pointer),
+            "disable discards the separate saved grab attachment"
+        );
+        assert!(!state.floating_pointer_positions.contains_key(&pointer));
+
+        let mut ungrab = Vec::new();
+        ungrab.extend_from_slice(&0u32.to_le_bytes());
+        ungrab.extend_from_slice(&pointer.to_le_bytes());
+        ungrab.extend_from_slice(&[0; 2]);
+        let _ = request(&mut state, &mut backend, &mut owner_peer, 52, 2, &ungrab);
+        assert!(state.xi2_pointer_grabs.is_empty());
+        assert!(!state.xi2_detached_masters.contains_key(&pointer));
+        assert!(!state.floating_pointer_positions.contains_key(&pointer));
+        assert_eq!(
+            state.xi_devices.device(pointer).unwrap().attached_master,
+            None,
+            "ungrab must leave a disabled facet floating"
+        );
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceResumed(info.clone()),
+        );
+        assert!(state.xi_devices.device(pointer).unwrap().enabled);
+        assert_eq!(
+            state.xi_devices.device(pointer).unwrap().attached_master,
+            Some(DEVICEID_MASTER_POINTER)
+        );
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceRemoved { source_id: source },
+        );
+
+        assert!(state.xi_devices.source(source).is_none());
+        assert_eq!(
+            state
+                .xi_devices
+                .devices()
+                .iter()
+                .map(|device| device.id)
+                .collect::<Vec<_>>(),
+            initial_ids
+        );
+        for device in state.xi_devices.devices() {
+            assert_eq!(device.properties, initial_properties[&device.id]);
+        }
+        assert!(state.clients[&1].xi2_masks.is_empty());
+        assert!(state.xi2_detached_masters.is_empty());
+        assert!(state.floating_pointer_positions.is_empty());
+        assert!(state.xi2_pointer_grabs.is_empty());
+        assert!(state.xi2_keyboard_grabs.is_empty());
+        assert_eq!(state.xi_last_slave(DEVICEID_MASTER_POINTER), None);
+        assert_eq!(
+            state.xi_last_slave(yserver_core::xinput::DEVICEID_MASTER_KEYBOARD),
+            None
+        );
+        assert!(
+            state
+                .xi1_frozen
+                .values()
+                .all(|freeze| freeze.other.is_none())
+        );
+        assert!(state.sync_pending.is_empty());
+        assert!(state.key_down_by_device.is_empty());
+        assert!(state.unpublished_keyboard_keys_down.is_empty());
+        assert!(state.unpublished_pointer_buttons_down.is_empty());
+        assert!(state.keys_down.iter().all(|byte| *byte == 0));
+        assert_eq!(state.buttons_down, 0);
+        assert_eq!(state.xi_devices.device(4).unwrap().buttons_down, 0);
+        assert_eq!(state.xi_devices.device(5).unwrap().buttons_down, 0);
+        assert!(state.clients[&1].xi1_event_classes.is_empty());
+        assert!(state.clients[&1].xi1_window_event_classes.is_empty());
+        assert!(backend.core.down_keys.is_empty());
+        assert_eq!(backend.core.button_mask, 0);
+        assert!(state.clients[&1].outbound.is_empty());
+        assert!(drain(&mut owner_peer).is_empty());
     }
 
     #[test]
@@ -56633,11 +57137,15 @@ mod tests {
         assert!(backend.core.down_keys.contains(&SHIFT_L));
         assert_eq!(state.xi_devices.device(4).unwrap().buttons_down, 2);
         assert_eq!(state.key_down_by_device.get(&5).unwrap().len(), 1);
+        // Xorg DisableDevice releases held input and clears the master's
+        // lastSlave, then reports DeviceDisabled before floating the device
+        // (devices.c:466-468, 488-492, 532-539). It does not deactivate the
+        // explicit XI grab; XIUngrabDevice does that (xigrabdev.c:166-172).
         assert_eq!(
             state.xi_devices.device(pointer).unwrap().attached_master,
-            Some(2)
+            None
         );
-        assert!(!state.xi2_pointer_grabs.contains_key(&pointer));
+        assert!(state.xi2_pointer_grabs.contains_key(&pointer));
         assert!(
             state.clients[&CLIENT]
                 .xi2_masks
@@ -56849,8 +57357,8 @@ mod tests {
             "virtual XTEST Shift remains down on the master",
         );
         assert!(
-            state.xi2_pointer_grabs.is_empty(),
-            "ended active grabs do not resume"
+            state.xi2_pointer_grabs.contains_key(&pointer),
+            "the active explicit grab remains until XIUngrabDevice"
         );
         assert!(state.xi_devices.source(SOURCE).is_some());
         assert_eq!(state.xi_devices.devices().len(), 6);

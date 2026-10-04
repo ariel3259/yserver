@@ -138,7 +138,14 @@ pub struct XiDevice {
     pub id: u16,
     pub name: String,
     /// Whether the device is currently enabled and can receive input.
+    /// Physical facets derive this from `session_enabled` and
+    /// `client_disabled`; masters and XTEST devices remain enabled.
     pub enabled: bool,
+    /// Whether the input session currently permits this physical facet to
+    /// receive input (for example, the VT is owned by this server).
+    pub session_enabled: bool,
+    /// Whether a client disabled this physical facet through Device Enabled.
+    pub client_disabled: bool,
     /// Physical source owning this facet; virtual and master devices have none.
     pub source_id: Option<InputSourceId>,
     /// Physical capability represented by this facet.
@@ -175,6 +182,8 @@ impl XiDevice {
             id,
             name: name.to_owned(),
             enabled: true,
+            session_enabled: true,
+            client_disabled: false,
             source_id: None,
             facet: None,
             attached_master: match id {
@@ -191,7 +200,7 @@ impl XiDevice {
     }
 
     pub(crate) fn physical(id: u16, info: &DeviceInfo, facet: XiFacetKind) -> Self {
-        let attached_master = match facet {
+        let home_master = match facet {
             XiFacetKind::Keyboard => DEVICEID_MASTER_KEYBOARD,
             XiFacetKind::PointerTouch => DEVICEID_MASTER_POINTER,
         };
@@ -199,9 +208,11 @@ impl XiDevice {
             id,
             name: info.name.clone(),
             enabled: info.enabled,
+            session_enabled: info.enabled,
+            client_disabled: false,
             source_id: Some(info.source_id),
             facet: Some(facet),
-            attached_master: Some(attached_master),
+            attached_master: info.enabled.then_some(home_master),
             is_touchpad: facet == XiFacetKind::PointerTouch && info.is_touchpad,
             device_node: Some(info.device_node.clone()),
             properties: BTreeMap::new(),

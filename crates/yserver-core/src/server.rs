@@ -1609,7 +1609,7 @@ impl ServerState {
         let Some(device) = self.xi_devices.device(device_id) else {
             return false;
         };
-        if device.facet.is_none() {
+        if device.facet.is_none() || !device.enabled {
             return false;
         }
         let Some(master) = device.attached_master else {
@@ -1635,13 +1635,17 @@ impl ServerState {
 
     /// Restore the attachment saved by [`Self::detach_xi2_slave`].
     pub fn reattach_xi2_slave(&mut self, device_id: u16) -> bool {
-        let Some(master) = self.xi2_detached_masters.remove(&device_id) else {
+        let Some(detached_master) = self.xi2_detached_masters.remove(&device_id) else {
             return false;
         };
-        if let Some(device) = self.xi_devices.device_mut(device_id) {
-            device.attached_master = Some(master);
-        } else {
+        let Some(device) = self.xi_devices.device_mut(device_id) else {
+            self.floating_pointer_positions.remove(&device_id);
             return false;
+        };
+        if device.enabled {
+            device.attached_master = Some(detached_master);
+        } else {
+            device.attached_master = None;
         }
         self.floating_pointer_positions.remove(&device_id);
         true
@@ -1883,10 +1887,42 @@ impl ServerState {
     /// property maps; continuation refreshes only values whose entries remain.
     pub fn xi_register_source(&mut self, info: &crate::core_loop::DeviceInfo) -> Vec<u16> {
         let continuation = self.xi_devices.source(info.source_id).is_some();
+        let previous_enabled: HashMap<u16, bool> = if continuation {
+            [
+                self.xi_devices
+                    .facet(info.source_id, crate::xinput::XiFacetKind::Keyboard),
+                self.xi_devices
+                    .facet(info.source_id, crate::xinput::XiFacetKind::PointerTouch),
+            ]
+            .into_iter()
+            .flatten()
+            .filter_map(|id| {
+                self.xi_devices
+                    .device(id)
+                    .map(|device| (id, device.enabled))
+            })
+            .collect()
+        } else {
+            HashMap::new()
+        };
         let ids = self.xi_devices.register(info);
-        if !info.enabled {
-            for id in &ids {
+        for id in &ids {
+            if !self
+                .xi_devices
+                .device(*id)
+                .is_some_and(|device| device.enabled)
+            {
+                // DisableDevice clears the master's lastSlave reference
+                // (devices.c:488-492). A grab's saved attachment is a
+                // separate temporary state; it must not survive disable.
                 self.xi_clear_last_slave(*id);
+                self.xi2_detached_masters.remove(id);
+                self.floating_pointer_positions.remove(id);
+            } else if previous_enabled.get(id) == Some(&false) {
+                // Re-enable from the facet's role-derived home master,
+                // discarding any stale grab-position state.
+                self.xi2_detached_masters.remove(id);
+                self.floating_pointer_positions.remove(id);
             }
         }
         for &id in &ids {
@@ -1920,6 +1956,23 @@ impl ServerState {
             }
         }
         ids
+    }
+
+    /// Finish a physical facet disable after its disabled notification has
+    /// been built from the still-attached snapshot (devices.c:532-539).
+    pub fn xi_float_disabled_device(&mut self, device_id: u16) {
+        let Some(device) = self.xi_devices.device(device_id) else {
+            return;
+        };
+        if device.enabled || device.facet.is_none() {
+            return;
+        }
+        self.xi_clear_last_slave(device_id);
+        self.xi2_detached_masters.remove(&device_id);
+        self.floating_pointer_positions.remove(&device_id);
+        if let Some(device) = self.xi_devices.device_mut(device_id) {
+            device.attached_master = None;
+        }
     }
 
     /// Remove one physical source and every facet it currently owns.
