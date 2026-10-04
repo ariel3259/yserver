@@ -247,6 +247,8 @@ pub fn initial_xi_devices() -> Vec<XiDevice> {
 /// XListInputDevices encoder share a single canonical spelling with the
 /// descriptor table.
 pub const PROP_TAPPING_ENABLED: &str = "libinput Tapping Enabled";
+/// XI's per-device enabled-state property (`XI_PROP_ENABLED`).
+pub const PROP_DEVICE_ENABLED: &str = "Device Enabled";
 /// XTEST's predefined virtual-device marker property.
 pub const PROP_XTEST_DEVICE: &str = "XTEST Device";
 const PROP_DEVICE_NODE: &str = "Device Node";
@@ -1738,8 +1740,8 @@ mod tests {
     fn other_devices_unaffected_by_source_registration() {
         let mut state = crate::server::ServerState::new();
         state.xi_register_source(&touchpad_info(true));
-        // Master pointer/keyboard, XTEST pointer/keyboard each keep their
-        // independent ordinary property maps.
+        // Device Enabled is seeded on every base device; source properties
+        // must remain isolated to the newly registered physical facet.
         for id in [
             DEVICEID_MASTER_POINTER,
             DEVICEID_MASTER_KEYBOARD,
@@ -1748,11 +1750,27 @@ mod tests {
         ] {
             let dev = state.xi_devices.device(id).unwrap();
             if id == DEVICEID_XTEST_POINTER || id == DEVICEID_XTEST_KEYBOARD {
-                assert_eq!(dev.properties.len(), 1, "XTEST marker remains on {id}");
+                assert_eq!(
+                    dev.properties.len(),
+                    2,
+                    "XTEST marker and Device Enabled remain on {id}"
+                );
                 assert!(dev.properties.contains_key(&state.xtest_device_atom));
             } else {
-                assert!(dev.properties.is_empty(), "device {id} got properties");
+                assert_eq!(
+                    dev.properties.len(),
+                    1,
+                    "only Device Enabled is seeded on {id}"
+                );
             }
+            let enabled = dev
+                .properties
+                .get(&state.xi_device_enabled_atom)
+                .expect("every base device has Device Enabled");
+            assert_eq!(enabled.type_atom, XA_INTEGER);
+            assert_eq!(enabled.format, 8);
+            assert_eq!(enabled.data, [1]);
+            assert!(!enabled.deletable);
         }
     }
 
@@ -2016,8 +2034,9 @@ mod tests {
         assert_ne!(id, DEVICEID_XTEST_POINTER);
         let slave = state.xi_devices.device(DEVICEID_XTEST_POINTER).unwrap();
         assert_eq!(slave.name, registry::NAME_XTEST_POINTER);
-        assert_eq!(slave.properties.len(), 1);
+        assert_eq!(slave.properties.len(), 2);
         assert!(slave.properties.contains_key(&state.xtest_device_atom));
+        assert!(slave.properties.contains_key(&state.xi_device_enabled_atom));
     }
 
     /// T2: seeding is driven entirely by the descriptor table. Available

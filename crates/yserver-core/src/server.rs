@@ -1464,6 +1464,8 @@ pub struct ServerState {
     pub pending_xi_device_removals: Vec<crate::xinput::XiDevice>,
     /// Atom identity for the read-only XTEST marker on virtual devices 4/5.
     pub xtest_device_atom: AtomId,
+    /// Atom identity for each device's `Device Enabled` property.
+    pub xi_device_enabled_atom: AtomId,
     /// Pre-interned atom for the property-type literal `"FLOAT"`.
     ///
     /// `FLOAT` is **not** a predefined X atom, so the libinput
@@ -1676,12 +1678,34 @@ impl ServerState {
         atoms.intern(crate::xinput::XI_ATOM_KEYBOARD, false);
         atoms.intern(crate::xinput::XI_ATOM_TOUCHPAD, false);
         let xtest_device_atom = atoms.intern(crate::xinput::PROP_XTEST_DEVICE, false);
+        let xi_device_enabled_atom = atoms.intern(crate::xinput::PROP_DEVICE_ENABLED, false);
         // FLOAT is not a predefined X atom; intern it now so the
         // libinput accel-speed property family can stamp
         // type=float_atom on its wire replies without a per-request
         // intern dance.
         let float_atom = atoms.intern("FLOAT", false);
         let mut xi_devices = crate::xinput::XiRegistry::new();
+        for device_id in [
+            crate::xinput::DEVICEID_MASTER_POINTER,
+            crate::xinput::DEVICEID_MASTER_KEYBOARD,
+            crate::xinput::DEVICEID_XTEST_POINTER,
+            crate::xinput::DEVICEID_XTEST_KEYBOARD,
+        ] {
+            xi_devices
+                .device_mut(device_id)
+                .expect("XiRegistry creates all four base devices")
+                .properties
+                .insert(
+                    xi_device_enabled_atom,
+                    crate::xinput::XiProperty {
+                        type_atom: crate::xinput::XA_INTEGER,
+                        format: 8,
+                        data: vec![1],
+                        read_only: false,
+                        deletable: false,
+                    },
+                );
+        }
         for device_id in [
             crate::xinput::DEVICEID_XTEST_POINTER,
             crate::xinput::DEVICEID_XTEST_KEYBOARD,
@@ -1812,6 +1836,7 @@ impl ServerState {
             xi_last_keyboard_slave: None,
             pending_xi_device_removals: Vec::new(),
             xtest_device_atom,
+            xi_device_enabled_atom,
             float_atom,
         }
     }
@@ -1906,6 +1931,22 @@ impl ServerState {
             HashMap::new()
         };
         let ids = self.xi_devices.register(info);
+        if !continuation {
+            for &id in &ids {
+                if let Some(device) = self.xi_devices.device_mut(id) {
+                    device.properties.insert(
+                        self.xi_device_enabled_atom,
+                        crate::xinput::XiProperty {
+                            type_atom: crate::xinput::XA_INTEGER,
+                            format: 8,
+                            data: vec![0],
+                            read_only: false,
+                            deletable: false,
+                        },
+                    );
+                }
+            }
+        }
         for id in &ids {
             if !self
                 .xi_devices
@@ -1956,6 +1997,34 @@ impl ServerState {
             }
         }
         ids
+    }
+
+    /// Replace a device's `Device Enabled` byte after an actual enabled-state
+    /// transition. Returns the property notification kind expected by the
+    /// shared XI1/XI2 property-event emitter.
+    pub(crate) fn xi_update_device_enabled_property(
+        &mut self,
+        device_id: u16,
+        enabled: bool,
+    ) -> Option<crate::xinput::PropWhat> {
+        let atom = self.xi_device_enabled_atom;
+        let device = self.xi_devices.device_mut(device_id)?;
+        let what = if device.properties.contains_key(&atom) {
+            crate::xinput::PropWhat::Modified
+        } else {
+            crate::xinput::PropWhat::Created
+        };
+        device.properties.insert(
+            atom,
+            crate::xinput::XiProperty {
+                type_atom: crate::xinput::XA_INTEGER,
+                format: 8,
+                data: vec![u8::from(enabled)],
+                read_only: false,
+                deletable: false,
+            },
+        );
+        Some(what)
     }
 
     /// Refresh metadata for a retained source while preserving the enabled

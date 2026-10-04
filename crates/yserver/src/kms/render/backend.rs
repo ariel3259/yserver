@@ -21233,6 +21233,9 @@ impl KmsBackend {
             return;
         };
         snapshot.enabled = false;
+        let _dropped = yserver_core::xinput::hotplug::emit_device_enabled_property_change(
+            state, device_id, false,
+        );
         let _dropped = yserver_core::xinput::hotplug::emit_xi1_device_presence(
             state,
             device_id,
@@ -21785,6 +21788,10 @@ impl Backend for KmsBackend {
                             None,
                         );
                         if info.enabled && state.xi_set_facet_session_enabled(id, true) {
+                            let _dropped =
+                                yserver_core::xinput::hotplug::emit_device_enabled_property_change(
+                                    state, id, true,
+                                );
                             let _dropped = yserver_core::xinput::hotplug::emit_xi1_device_presence(
                                 state,
                                 id,
@@ -21803,6 +21810,10 @@ impl Backend for KmsBackend {
                     let ids = state.xi_refresh_source(&info);
                     for id in ids {
                         if info.enabled && state.xi_set_facet_session_enabled(id, true) {
+                            let _dropped =
+                                yserver_core::xinput::hotplug::emit_device_enabled_property_change(
+                                    state, id, true,
+                                );
                             let _dropped = yserver_core::xinput::hotplug::emit_xi1_device_presence(
                                 state,
                                 id,
@@ -21831,6 +21842,10 @@ impl Backend for KmsBackend {
                 let enabled_ids = state.xi_refresh_source(&info);
                 for id in enabled_ids {
                     if info.enabled && state.xi_set_facet_session_enabled(id, true) {
+                        let _dropped =
+                            yserver_core::xinput::hotplug::emit_device_enabled_property_change(
+                                state, id, true,
+                            );
                         let _dropped = yserver_core::xinput::hotplug::emit_xi1_device_presence(
                             state,
                             id,
@@ -44017,6 +44032,498 @@ mod tests {
             is_touchpad: false,
             config: yserver_core::core_loop::message::LibinputConfigSnapshot::default(),
         }
+    }
+
+    fn device_enabled_xi_request(
+        state: &mut yserver_core::server::ServerState,
+        backend: &mut KmsBackend,
+        minor: u8,
+        sequence: u16,
+        body: &[u8],
+    ) {
+        use yserver_core::{backend::Backend, core_loop::process_request};
+
+        let outcome = process_request::process_request(
+            state,
+            backend as &mut dyn Backend,
+            yserver_protocol::x11::ClientId(5),
+            yserver_protocol::x11::SequenceNumber(sequence),
+            yserver_protocol::x11::RequestHeader {
+                opcode: 137,
+                data: minor,
+                length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+            },
+            body,
+            None,
+        )
+        .expect("process XI request through the core dispatcher");
+        assert!(
+            matches!(outcome, process_request::RequestOutcome::Handled),
+            "XI minor {minor} outcome: {outcome:?}"
+        );
+    }
+
+    fn device_enabled_request_bytes(
+        state: &mut yserver_core::server::ServerState,
+        backend: &mut KmsBackend,
+        peer: &mut std::os::unix::net::UnixStream,
+        minor: u8,
+        sequence: u16,
+        body: &[u8],
+    ) -> Vec<u8> {
+        device_enabled_xi_request(state, backend, minor, sequence, body);
+        kbd_map_drain(peer)
+    }
+
+    fn device_enabled_device_property_list_body(device_id: u16) -> [u8; 4] {
+        let mut body = [0; 4];
+        body[..2].copy_from_slice(&device_id.to_le_bytes());
+        body
+    }
+
+    fn device_enabled_get_enabled_xi2(
+        state: &mut yserver_core::server::ServerState,
+        backend: &mut KmsBackend,
+        peer: &mut std::os::unix::net::UnixStream,
+        device_id: u16,
+        property: u32,
+        sequence: u16,
+    ) -> u8 {
+        let mut body = Vec::with_capacity(20);
+        body.extend_from_slice(&device_id.to_le_bytes());
+        body.extend_from_slice(&[0, 0]); // delete=false, pad
+        body.extend_from_slice(&property.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // AnyPropertyType
+        body.extend_from_slice(&0u32.to_le_bytes()); // offset
+        body.extend_from_slice(&100u32.to_le_bytes()); // length
+        let reply = device_enabled_request_bytes(state, backend, peer, 59, sequence, &body);
+        assert_eq!(reply.len(), 36, "XIGetProperty reply with one byte");
+        assert_eq!(reply[0], 1, "reply packet");
+        assert_eq!(u32::from_le_bytes(reply[8..12].try_into().unwrap()), 19);
+        assert_eq!(u32::from_le_bytes(reply[16..20].try_into().unwrap()), 1);
+        assert_eq!(reply[20], 8);
+        reply[32]
+    }
+
+    fn device_enabled_get_enabled_xi1(
+        state: &mut yserver_core::server::ServerState,
+        backend: &mut KmsBackend,
+        peer: &mut std::os::unix::net::UnixStream,
+        device_id: u16,
+        property: u32,
+        sequence: u16,
+    ) -> u8 {
+        let mut body = Vec::with_capacity(20);
+        body.extend_from_slice(&property.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // AnyPropertyType
+        body.extend_from_slice(&0u32.to_le_bytes()); // offset
+        body.extend_from_slice(&100u32.to_le_bytes()); // length
+        body.push(u8::try_from(device_id).unwrap());
+        body.push(0); // delete=false
+        body.extend_from_slice(&[0; 2]);
+        let reply = device_enabled_request_bytes(state, backend, peer, 39, sequence, &body);
+        assert_eq!(reply.len(), 36, "XI1 GetDeviceProperty reply with one byte");
+        assert_eq!(reply[0], 1, "reply packet");
+        assert_eq!(u32::from_le_bytes(reply[8..12].try_into().unwrap()), 19);
+        assert_eq!(u32::from_le_bytes(reply[16..20].try_into().unwrap()), 1);
+        assert_eq!(reply[20], 8);
+        assert_eq!(reply[21], u8::try_from(device_id).unwrap());
+        reply[32]
+    }
+
+    fn device_enabled_event_kinds(bytes: &[u8]) -> Vec<&'static str> {
+        let mut kinds = Vec::new();
+        let mut offset = 0;
+        while offset + 32 <= bytes.len() {
+            let event_type = bytes[offset] & 0x7f;
+            if event_type == 35 {
+                let words =
+                    u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
+                let event_len = 32 + words * 4;
+                assert!(offset + event_len <= bytes.len(), "complete XI2 event");
+                let evtype = u16::from_le_bytes(bytes[offset + 8..offset + 10].try_into().unwrap());
+                kinds.push(match evtype {
+                    11 => "hierarchy",
+                    12 => "xi2-property",
+                    _ => "other-xi2",
+                });
+                offset += event_len;
+            } else {
+                kinds.push(match event_type {
+                    81 => "presence",
+                    82 => "xi1-property",
+                    _ => "other-xi1",
+                });
+                offset += 32;
+            }
+        }
+        assert_eq!(offset, bytes.len(), "complete event stream");
+        kinds
+    }
+
+    #[test]
+    fn xi_device_enabled_is_listed_and_read_through_xi1_xi2() {
+        use yserver_core::{
+            backend::Backend,
+            core_loop::{HostInputEvent, process_disconnect::process_disconnect},
+            server::ServerState,
+            xinput::{
+                DEVICEID_MASTER_KEYBOARD, DEVICEID_MASTER_POINTER, DEVICEID_XTEST_KEYBOARD,
+                DEVICEID_XTEST_POINTER, InputSourceId, XiFacetKind,
+            },
+        };
+
+        // Kills physical-only seeding and continuation refreshes that reset Device Enabled.
+        const SOURCE: InputSourceId = InputSourceId(0xD3_01);
+        let mut state = ServerState::new();
+        let original_core_properties =
+            [2, 3, 4, 5].map(|id| state.xi_devices.device(id).unwrap().properties.clone());
+        let enabled_atom = state.atoms.intern("Device Enabled", false);
+        let mut backend = KmsBackend::for_tests();
+        let mut peer = kbd_map_client_id(&mut state, 5);
+
+        let mut info = dynamic_test_device(SOURCE, true, false);
+        info.enabled = false;
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceAdded(info.clone()),
+        );
+        let device_id = state
+            .xi_devices
+            .facet(SOURCE, XiFacetKind::Keyboard)
+            .expect("DeviceAdded publishes a disabled keyboard facet");
+
+        let all_devices = [
+            DEVICEID_MASTER_POINTER,
+            DEVICEID_MASTER_KEYBOARD,
+            DEVICEID_XTEST_POINTER,
+            DEVICEID_XTEST_KEYBOARD,
+            device_id,
+        ];
+        let mut sequence = 1;
+        for id in all_devices {
+            let list = device_enabled_device_property_list_body(id);
+            let xi2 = device_enabled_request_bytes(
+                &mut state,
+                &mut backend,
+                &mut peer,
+                56,
+                sequence,
+                &list,
+            );
+            sequence += 1;
+            let xi2_count = usize::from(u16::from_le_bytes([xi2[8], xi2[9]]));
+            let xi2_atoms = xi2[32..32 + xi2_count * 4]
+                .chunks_exact(4)
+                .map(|atom| u32::from_le_bytes(atom.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            assert!(
+                xi2_atoms.contains(&enabled_atom.0),
+                "XIListProperties lists Device Enabled on {id}"
+            );
+
+            let xi1_list = [u8::try_from(id).unwrap(), 0, 0, 0];
+            let xi1 = device_enabled_request_bytes(
+                &mut state,
+                &mut backend,
+                &mut peer,
+                36,
+                sequence,
+                &xi1_list,
+            );
+            sequence += 1;
+            let xi1_count = usize::from(u16::from_le_bytes([xi1[8], xi1[9]]));
+            let xi1_atoms = xi1[32..32 + xi1_count * 4]
+                .chunks_exact(4)
+                .map(|atom| u32::from_le_bytes(atom.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            assert!(
+                xi1_atoms.contains(&enabled_atom.0),
+                "ListDeviceProperties lists Device Enabled on {id}"
+            );
+
+            let expected = u8::from(id != device_id);
+            assert_eq!(
+                device_enabled_get_enabled_xi2(
+                    &mut state,
+                    &mut backend,
+                    &mut peer,
+                    id,
+                    enabled_atom.0,
+                    sequence
+                ),
+                expected,
+                "XIGetProperty on {id}"
+            );
+            sequence += 1;
+            assert_eq!(
+                device_enabled_get_enabled_xi1(
+                    &mut state,
+                    &mut backend,
+                    &mut peer,
+                    id,
+                    enabled_atom.0,
+                    sequence
+                ),
+                expected,
+                "GetDeviceProperty on {id}"
+            );
+            sequence += 1;
+        }
+
+        let physical_properties = state
+            .xi_devices
+            .device(device_id)
+            .unwrap()
+            .properties
+            .clone();
+        // Repeated DeviceAdded for the retained source exercises the live
+        // continuation refresh; Device Enabled must remain present exactly
+        // once with its disabled byte.
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceAdded(info.clone()),
+        );
+        assert_eq!(
+            state.xi_devices.device(device_id).unwrap().properties,
+            physical_properties,
+            "continuation refresh preserves the property map"
+        );
+        assert_eq!(
+            device_enabled_get_enabled_xi2(
+                &mut state,
+                &mut backend,
+                &mut peer,
+                device_id,
+                enabled_atom.0,
+                sequence,
+            ),
+            0,
+            "continuation refresh preserves the disabled value"
+        );
+        sequence += 1;
+
+        let mut resumed = info.clone();
+        resumed.enabled = true;
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceResumed(resumed),
+        );
+        let enabled_properties = state
+            .xi_devices
+            .device(device_id)
+            .unwrap()
+            .properties
+            .clone();
+        let mut resumed_info = info.clone();
+        resumed_info.enabled = true;
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceAdded(resumed_info),
+        );
+        assert_eq!(
+            state.xi_devices.device(device_id).unwrap().properties,
+            enabled_properties,
+            "enabled continuation refresh preserves the property map"
+        );
+        assert_eq!(
+            device_enabled_get_enabled_xi2(
+                &mut state,
+                &mut backend,
+                &mut peer,
+                device_id,
+                enabled_atom.0,
+                sequence
+            ),
+            1
+        );
+        sequence += 1;
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceSuspended { source_id: SOURCE },
+        );
+        assert_eq!(
+            device_enabled_get_enabled_xi1(
+                &mut state,
+                &mut backend,
+                &mut peer,
+                device_id,
+                enabled_atom.0,
+                sequence
+            ),
+            0
+        );
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceRemoved { source_id: SOURCE },
+        );
+        process_disconnect(&mut state, &mut backend, yserver_protocol::x11::ClientId(5));
+        assert!(
+            state.clients.is_empty(),
+            "disconnect restores the client-selection baseline"
+        );
+        assert!(state.xi_devices.source_ids().is_empty());
+        assert_eq!(
+            state
+                .xi_devices
+                .devices()
+                .iter()
+                .map(|device| device.id)
+                .collect::<Vec<_>>(),
+            [2, 3, 4, 5]
+        );
+        assert_eq!(
+            [2, 3, 4, 5].map(|id| state.xi_devices.device(id).unwrap().properties.clone()),
+            original_core_properties
+        );
+        assert!(state.keys_down.iter().all(|byte| *byte == 0));
+        assert_eq!(state.buttons_down, 0);
+        assert!(state.key_down_by_device.is_empty());
+        assert!(state.xi2_detached_masters.is_empty());
+        assert!(state.floating_pointer_positions.is_empty());
+    }
+
+    #[test]
+    fn xi_device_enabled_transitions_notify_before_presence_and_hierarchy() {
+        use yserver_core::{
+            backend::Backend,
+            core_loop::{HostInputEvent, process_disconnect::process_disconnect},
+            resources::ROOT_WINDOW,
+            server::ServerState,
+            xinput::{
+                InputSourceId, XI1_DEVICE_PRESENCE_CLASS, XI2_HIERARCHY_CHANGED_MASK,
+                XI2_PROPERTY_EVENT_MASK, XiFacetKind,
+            },
+        };
+        use yserver_protocol::x11::ClientId;
+
+        // Kills either transition mutation that omits the Device Enabled property event.
+        const SOURCE: InputSourceId = InputSourceId(0xD3_02);
+        let mut state = ServerState::new();
+        let original_core_properties =
+            [2, 3, 4, 5].map(|id| state.xi_devices.device(id).unwrap().properties.clone());
+        let mut backend = KmsBackend::for_tests();
+        let mut peer = kbd_map_client_id(&mut state, 5);
+        let mut sequence = 1u16;
+        let select = |state: &mut ServerState,
+                      backend: &mut KmsBackend,
+                      sequence: u16,
+                      minor: u8,
+                      body: &[u8]| {
+            device_enabled_xi_request(state, backend, minor, sequence, body);
+        };
+
+        let mut xi2_select = Vec::new();
+        xi2_select.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        xi2_select.extend_from_slice(&1u16.to_le_bytes());
+        xi2_select.extend_from_slice(&[0; 2]);
+        xi2_select.extend_from_slice(&0u16.to_le_bytes()); // XIAllDevices
+        xi2_select.extend_from_slice(&1u16.to_le_bytes()); // one 32-bit mask word
+        xi2_select.extend_from_slice(
+            &(XI2_PROPERTY_EVENT_MASK | XI2_HIERARCHY_CHANGED_MASK).to_le_bytes(),
+        );
+        select(&mut state, &mut backend, sequence, 46, &xi2_select);
+        sequence += 1;
+
+        let mut xi1_presence = Vec::new();
+        xi1_presence.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        xi1_presence.extend_from_slice(&1u16.to_le_bytes());
+        xi1_presence.extend_from_slice(&[0; 2]);
+        xi1_presence.extend_from_slice(&XI1_DEVICE_PRESENCE_CLASS.to_le_bytes());
+        select(&mut state, &mut backend, sequence, 6, &xi1_presence);
+        sequence += 1;
+        assert!(
+            kbd_map_drain(&mut peer).is_empty(),
+            "selection requests emit no events"
+        );
+
+        let mut info = dynamic_test_device(SOURCE, true, false);
+        info.enabled = false;
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceAdded(info.clone()),
+        );
+        let device_id = state
+            .xi_devices
+            .facet(SOURCE, XiFacetKind::Keyboard)
+            .unwrap();
+        let added = device_enabled_event_kinds(&kbd_map_drain(&mut peer));
+        assert_eq!(
+            added,
+            ["presence", "hierarchy"],
+            "seeding is silent, add still publishes its two lifecycle events"
+        );
+
+        let class = (u32::from(device_id) << 8) | 82; // XI_FIRST_EVENT (66) + DevicePropertyNotify offset (16)
+        let mut xi1_property = Vec::new();
+        xi1_property.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        xi1_property.extend_from_slice(&1u16.to_le_bytes());
+        xi1_property.extend_from_slice(&[0; 2]);
+        xi1_property.extend_from_slice(&class.to_le_bytes());
+        select(&mut state, &mut backend, sequence, 6, &xi1_property);
+
+        let mut resumed = info.clone();
+        resumed.enabled = true;
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceResumed(resumed),
+        );
+        let enabled = device_enabled_event_kinds(&kbd_map_drain(&mut peer));
+        assert_eq!(
+            enabled,
+            ["xi2-property", "xi1-property", "presence", "hierarchy"]
+        );
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceSuspended { source_id: SOURCE },
+        );
+        let disabled = device_enabled_event_kinds(&kbd_map_drain(&mut peer));
+        assert_eq!(
+            disabled,
+            ["xi2-property", "xi1-property", "presence", "hierarchy"]
+        );
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceRemoved { source_id: SOURCE },
+        );
+        let _ = kbd_map_drain(&mut peer);
+        process_disconnect(&mut state, &mut backend, ClientId(5));
+        assert!(
+            state.clients.is_empty(),
+            "disconnect clears XI1 and XI2 selections"
+        );
+        assert!(state.xi_devices.source_ids().is_empty());
+        assert_eq!(
+            state
+                .xi_devices
+                .devices()
+                .iter()
+                .map(|device| device.id)
+                .collect::<Vec<_>>(),
+            [2, 3, 4, 5]
+        );
+        assert_eq!(
+            [2, 3, 4, 5].map(|id| state.xi_devices.device(id).unwrap().properties.clone()),
+            original_core_properties
+        );
+        assert!(state.keys_down.iter().all(|byte| *byte == 0));
+        assert_eq!(state.buttons_down, 0);
+        assert!(state.key_down_by_device.is_empty());
+        assert!(state.xi2_detached_masters.is_empty());
+        assert!(state.floating_pointer_positions.is_empty());
     }
 
     fn process_dynamic_test_keyboard_grab(

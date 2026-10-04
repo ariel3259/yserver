@@ -25884,7 +25884,7 @@ pub(super) fn emit_property_dispatch_error(
 /// `deviceid=0`) silently receives nothing. The XI2 and XI1 emits are
 /// independent: a client may have selected via either (or both) paths
 /// and receives one copy per path.
-pub(super) fn emit_property_change(
+pub(crate) fn emit_property_change(
     state: &mut ServerState,
     deviceid: u16,
     property: AtomId,
@@ -46345,21 +46345,26 @@ mod tests {
         let wire = read_all_available(&mut peer);
         assert_eq!(
             wire.len(),
-            32 + 12,
-            "32 header + XTEST marker + 2 client atoms"
+            32 + 16,
+            "32 header + XTEST marker + Device Enabled + 2 client atoms"
         );
         assert_eq!(wire[0], 1, "X_Reply");
         assert_eq!(
             u32::from_le_bytes(wire[4..8].try_into().unwrap()),
-            3,
+            4,
             "length"
         );
-        assert_eq!(u16::from_le_bytes([wire[8], wire[9]]), 3, "num_properties");
+        assert_eq!(u16::from_le_bytes([wire[8], wire[9]]), 4, "num_properties");
         let mut atoms = wire[32..]
             .chunks_exact(4)
             .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
             .collect::<Vec<_>>();
-        let mut expected = vec![state.xtest_device_atom.0, 100, 200];
+        let mut expected = vec![
+            state.xtest_device_atom.0,
+            state.xi_device_enabled_atom.0,
+            100,
+            200,
+        ];
         atoms.sort_unstable();
         expected.sort_unstable();
         assert_eq!(atoms, expected, "the virtual XTEST Device marker is listed");
@@ -46862,22 +46867,27 @@ mod tests {
         let wire = read_all_available(&mut peer);
         assert_eq!(
             wire.len(),
-            32 + 12,
-            "32 header + XTEST marker + 2 client atoms"
+            32 + 16,
+            "32 header + XTEST marker + Device Enabled + 2 client atoms"
         );
         assert_eq!(wire[0], 1, "X_Reply");
         assert_eq!(
             u32::from_le_bytes(wire[4..8].try_into().unwrap()),
-            3,
-            "length = nAtoms including the XTEST marker"
+            4,
+            "length = nAtoms including the XTEST marker and Device Enabled"
         );
-        assert_eq!(u16::from_le_bytes([wire[8], wire[9]]), 3, "nAtoms");
+        assert_eq!(u16::from_le_bytes([wire[8], wire[9]]), 4, "nAtoms");
         assert!(wire[10..32].iter().all(|&b| b == 0), "pad zero");
         let mut atoms = wire[32..]
             .chunks_exact(4)
             .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
             .collect::<Vec<_>>();
-        let mut expected = vec![state.xtest_device_atom.0, 100, 200];
+        let mut expected = vec![
+            state.xtest_device_atom.0,
+            state.xi_device_enabled_atom.0,
+            100,
+            200,
+        ];
         atoms.sort_unstable();
         expected.sort_unstable();
         assert_eq!(atoms, expected, "the virtual XTEST Device marker is listed");

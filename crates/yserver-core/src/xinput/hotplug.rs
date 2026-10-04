@@ -67,6 +67,21 @@ pub fn emit_xi1_device_presence(
     })
 }
 
+/// Store and publish one `Device Enabled` change through the same property
+/// emitter used by XI1/XI2 property requests. Callers invoke this after
+/// committing the registry's enabled fact and before the presence event.
+pub fn emit_device_enabled_property_change(
+    state: &mut ServerState,
+    id: u16,
+    enabled: bool,
+) -> Vec<ClientId> {
+    let Some(what) = state.xi_update_device_enabled_property(id, enabled) else {
+        return Vec::new();
+    };
+    let property = state.xi_device_enabled_atom;
+    crate::core_loop::process_request::emit_property_change(state, id, property, what)
+}
+
 const XI_SLAVE_ADDED: u32 = 1 << 2;
 const XI_SLAVE_REMOVED: u32 = 1 << 3;
 const XI_DEVICE_ENABLED: u32 = 1 << 6;

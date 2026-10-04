@@ -1129,6 +1129,29 @@ mod tests {
             .iter()
             .find(|d| d.id == crate::xinput::DEVICEID_XTEST_POINTER)
             .expect("XTEST pointer");
+        // Kills the mutation that omits Device Enabled seeding from a fresh server generation.
+        let enabled_atom = state
+            .atoms
+            .id_for("Device Enabled")
+            .expect("reset re-interns Device Enabled");
+        for device_id in [
+            crate::xinput::DEVICEID_MASTER_POINTER,
+            crate::xinput::DEVICEID_MASTER_KEYBOARD,
+            crate::xinput::DEVICEID_XTEST_POINTER,
+            crate::xinput::DEVICEID_XTEST_KEYBOARD,
+        ] {
+            let property = state
+                .xi_devices
+                .device(device_id)
+                .unwrap()
+                .properties
+                .get(&enabled_atom)
+                .expect("base XI devices retain Device Enabled after reset");
+            assert_eq!(property.type_atom, crate::xinput::XA_INTEGER);
+            assert_eq!(property.format, 8);
+            assert_eq!(property.data, [1]);
+            assert!(!property.deletable);
+        }
         assert_eq!(
             slave.name,
             crate::xinput::registry::NAME_XTEST_POINTER,
@@ -1156,6 +1179,16 @@ mod tests {
             "the physical touchpad pointer facet owns the property"
         );
         assert!(!slave.properties.contains_key(&tap));
+        assert_eq!(state.xi_devices.devices().len(), 5);
+        assert_eq!(state.xi_devices.source_ids().len(), 1);
+        assert!(state.clients.is_empty());
+        assert!(state.selections.is_empty());
+        assert!(state.keys_down.iter().all(|byte| *byte == 0));
+        assert_eq!(state.buttons_down, 0);
+        assert!(state.key_down_by_device.is_empty());
+        assert!(state.xi1_device_input_state.is_empty());
+        assert!(state.xi2_detached_masters.is_empty());
+        assert!(state.floating_pointer_positions.is_empty());
     }
 
     #[test]
