@@ -1,7 +1,9 @@
 # Phase C.0 stage 3d — recovery, quarantine and shutdown
 
-**Status:** design approved by the user section by section on 2026-10-04;
-pending codex design review. One spec, two plans (3d-i, 3d-ii).
+**Status:** revision 2 (design review round 1: M-1 the invisibility contract
+scoped, requests during recovery parked, late executor results). Design
+approved by the user section by section on 2026-10-04. One spec, two plans
+(3d-i, 3d-ii).
 
 **Related specifications:**
 
@@ -34,12 +36,24 @@ unsupervised shutdown (`lib.rs` → `shutdown_destroy_drawables`).
    `Recovering` → `Ready`/`RecoveryFailed`, `ExecutorStalled`) and **3d-ii**
    quarantine transfer, `Removed` teardown and orderly shutdown
    (`ShutdownExecutorStalled`).
-2. **A successful recovery is invisible to clients.** Outputs stay published
-   while a recovery runs; nothing is published unless the reinstalled topology
-   differs. Logical withdrawal happens only when the executor stalls
-   (`ExecutorStalled`) or the recovery fails (`RecoveryFailed`). The visible
-   effect of a successful recovery is a frozen screen until the reinstall
-   completes.
+2. **A successful recovery does not change what clients see of the
+   topology.** Outputs stay published while a recovery runs; no RANDR
+   notification is sent and read-only topology replies are unchanged unless the
+   reinstalled topology differs. Logical withdrawal happens only when the
+   executor stalls (`ExecutorStalled`) or the recovery fails
+   (`RecoveryFailed`). The visible effect of a successful recovery is a frozen
+   screen until the reinstall completes. Requests that arrive meanwhile follow
+   decision 2a; protocol work the completion loss affected is terminalized as
+   C.0 §10 requires.
+   - **2a (user, after review round 1):** an `RRSetCrtcConfig` (or other RANDR
+     mutation) arriving while the device is `Poisoned`/`Recovering` **waits in
+     the existing `RandrMutationGate`** until the recovery terminates: on
+     `Ready` it executes normally; on `RecoveryFailed` it is validated against
+     the withdrawn state. The gate's existing `Q` = 30 s bound still applies.
+     A Present affected by the completion loss is terminalized (as during a VT
+     release). These are the recovery's client-visible differences from a run
+     without the failure and are listed as a named exception of the umbrella §4
+     client contract: a delayed RANDR reply, and the terminalized Presents.
 3. **Amendment to C.0 §10 — bounded administrative reprobe.** RANDR's forced
    reprobe (`RRGetScreenResources`) is `AdministrativeReprobe` (3c). After a
    `RecoveryFailed`, it may create **at most one** fresh recovery attempt; if
@@ -113,6 +127,15 @@ A completion loss or mechanism breach already moves the device to `Poisoned`
   result for the old incarnation cannot promote state.
 - While a recovery runs the X11 core stays responsive and rendering continues
   off-screen.
+- **Late executor results** (`REC-4`): a result from the old incarnation that
+  arrives after the recovery (or its successor) moved on cannot promote state.
+  An explicit rejection permits generation-local never-submitted cleanup. An
+  explicit success is accepted-stale: the owner adopts and closes every
+  returned fd exactly once, terminalizes the protocol work once, and both
+  possible state/resource sets go into the **current winning transition's**
+  quarantine. An absent or invalid result stays acceptance-unknown with the
+  same quarantine. The executor lease keeps the old incarnation from retiring
+  until return or reap.
 
 ## 4. 3d-ii — quarantine, `Removed` teardown and shutdown
 
@@ -183,8 +206,16 @@ names the mutation that must fail. The umbrella §4 differential gate applies.
   `RecoveryId`; no replacement fd while a lease survives.
 - Supersession during recovery (shutdown, removal, VT release): the winner
   receives the quarantine; the incident follows `REC-6`.
-- Invisibility: the protocol bytes clients receive across a successful recovery
-  equal those of a run without the failure (decision 2).
+- Topology invisibility (decision 2): across a successful recovery with an
+  unchanged topology, the RANDR topology replies and notifications clients
+  receive equal those of a run without the failure; the scenario includes a
+  client RANDR mutation sent during the closed-admission interval, which waits
+  in the gate and then executes (decision 2a), and an in-flight Present, which
+  is terminalized. A second case ends in `RecoveryFailed`: the parked mutation
+  is validated against the withdrawn state.
+- Late executor results after supersession: an accepted-stale result's fds are
+  adopted and closed exactly once and both resource sets reach the winning
+  transition's quarantine; a rejection cleans up only never-submitted state.
 - Quarantine totality: every inventoried owner is held and released only at its
   barrier.
 - Shutdown: the complete barrier order; `ShutdownExecutorStalled` at the 3 s
