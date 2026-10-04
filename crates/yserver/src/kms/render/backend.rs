@@ -21214,6 +21214,40 @@ impl KmsBackend {
         true
     }
 
+    /// Disable one physical facet in Xorg order. The hierarchy descriptor is
+    /// captured while attached, then explicitly handed to the emitter before
+    /// the live facet is floated.
+    fn publish_disabled_xi_facet(state: &mut ServerState, device_id: u16) {
+        if !state
+            .xi_devices
+            .device(device_id)
+            .is_some_and(|device| device.enabled)
+        {
+            return;
+        }
+
+        state.xi_set_facet_session_enabled(device_id, false);
+        let Some(mut snapshot) =
+            yserver_core::xinput::hotplug::hierarchy_device_snapshot(state, device_id)
+        else {
+            return;
+        };
+        snapshot.enabled = false;
+        let _dropped = yserver_core::xinput::hotplug::emit_xi1_device_presence(
+            state,
+            device_id,
+            yserver_core::xinput::hotplug::DevicePresenceChange::Disabled,
+        );
+        let _dropped = yserver_core::xinput::hotplug::emit_xi_hierarchy_changed(
+            state,
+            yserver_core::xinput::hotplug::XiHierarchyStep::DeviceDisabled,
+            device_id,
+            None,
+            Some(snapshot),
+        );
+        state.xi_float_disabled_device(device_id);
+    }
+
     /// Own physical-device held-state cleanup for removal and VT suspension.
     /// Releases pass through the ordinary KMS input and XI fanout paths while
     /// the source is still live. XI grabs remain active across suspension, as
@@ -21227,11 +21261,7 @@ impl KmsBackend {
             return;
         }
 
-        let was_enabled = state
-            .xi_devices
-            .source(source_id)
-            .is_some_and(|info| info.enabled);
-        let changed_ids: Vec<u16> = [
+        let facet_ids: Vec<u16> = [
             state
                 .xi_devices
                 .facet(source_id, yserver_core::xinput::XiFacetKind::Keyboard),
@@ -21242,27 +21272,14 @@ impl KmsBackend {
         .into_iter()
         .flatten()
         .collect();
-        if let Some(mut info) = state.xi_devices.source(source_id).cloned() {
+        if facet_ids.is_empty()
+            && let Some(mut info) = state.xi_devices.source(source_id).cloned()
+        {
             info.enabled = false;
             state.xi_register_source(&info);
         }
-        if was_enabled {
-            for id in &changed_ids {
-                let _dropped = yserver_core::xinput::hotplug::emit_xi1_device_presence(
-                    state,
-                    *id,
-                    yserver_core::xinput::hotplug::DevicePresenceChange::Disabled,
-                );
-            }
-            let _dropped = yserver_core::xinput::hotplug::emit_xi_hierarchy_changed(
-                state,
-                yserver_core::xinput::hotplug::XiHierarchyStep::DeviceDisabled,
-                &changed_ids,
-                &[],
-            );
-        }
-        for id in &changed_ids {
-            state.xi_float_disabled_device(*id);
+        for id in facet_ids {
+            Self::publish_disabled_xi_facet(state, id);
         }
     }
 }
@@ -21749,34 +21766,58 @@ impl Backend for KmsBackend {
                     let mut disabled_info = info.clone();
                     disabled_info.enabled = false;
                     let added_ids = state.xi_register_source(&disabled_info);
-                    for id in &added_ids {
+                    if added_ids.is_empty() {
+                        // A retained source with no XI facet still participates
+                        // in guarded internal input delivery.
+                        state.xi_refresh_source(&info);
+                    }
+                    for id in added_ids {
                         let _dropped = yserver_core::xinput::hotplug::emit_xi1_device_presence(
                             state,
-                            *id,
+                            id,
                             yserver_core::xinput::hotplug::DevicePresenceChange::Added,
                         );
+                        let _dropped = yserver_core::xinput::hotplug::emit_xi_hierarchy_changed(
+                            state,
+                            yserver_core::xinput::hotplug::XiHierarchyStep::SlaveAdded,
+                            id,
+                            None,
+                            None,
+                        );
+                        if info.enabled && state.xi_set_facet_session_enabled(id, true) {
+                            let _dropped = yserver_core::xinput::hotplug::emit_xi1_device_presence(
+                                state,
+                                id,
+                                yserver_core::xinput::hotplug::DevicePresenceChange::Enabled,
+                            );
+                            let _dropped = yserver_core::xinput::hotplug::emit_xi_hierarchy_changed(
+                                state,
+                                yserver_core::xinput::hotplug::XiHierarchyStep::DeviceEnabled,
+                                id,
+                                None,
+                                None,
+                            );
+                        }
                     }
-                    let _dropped = yserver_core::xinput::hotplug::emit_xi_hierarchy_changed(
-                        state,
-                        yserver_core::xinput::hotplug::XiHierarchyStep::SlaveAdded,
-                        &added_ids,
-                        &[],
-                    );
+                } else {
+                    let ids = state.xi_refresh_source(&info);
+                    for id in ids {
+                        if info.enabled && state.xi_set_facet_session_enabled(id, true) {
+                            let _dropped = yserver_core::xinput::hotplug::emit_xi1_device_presence(
+                                state,
+                                id,
+                                yserver_core::xinput::hotplug::DevicePresenceChange::Enabled,
+                            );
+                            let _dropped = yserver_core::xinput::hotplug::emit_xi_hierarchy_changed(
+                                state,
+                                yserver_core::xinput::hotplug::XiHierarchyStep::DeviceEnabled,
+                                id,
+                                None,
+                                None,
+                            );
+                        }
+                    }
                 }
-                let enabled_ids = state.xi_register_source(&info);
-                for id in &enabled_ids {
-                    let _dropped = yserver_core::xinput::hotplug::emit_xi1_device_presence(
-                        state,
-                        *id,
-                        yserver_core::xinput::hotplug::DevicePresenceChange::Enabled,
-                    );
-                }
-                let _dropped = yserver_core::xinput::hotplug::emit_xi_hierarchy_changed(
-                    state,
-                    yserver_core::xinput::hotplug::XiHierarchyStep::DeviceEnabled,
-                    &enabled_ids,
-                    &[],
-                );
                 return;
             }
             HostInputEvent::DeviceResumed(info) => {
@@ -21787,20 +21828,23 @@ impl Backend for KmsBackend {
                     info.device_node,
                     info.is_touchpad,
                 );
-                let enabled_ids = state.xi_register_source(&info);
-                for id in &enabled_ids {
-                    let _dropped = yserver_core::xinput::hotplug::emit_xi1_device_presence(
-                        state,
-                        *id,
-                        yserver_core::xinput::hotplug::DevicePresenceChange::Enabled,
-                    );
+                let enabled_ids = state.xi_refresh_source(&info);
+                for id in enabled_ids {
+                    if info.enabled && state.xi_set_facet_session_enabled(id, true) {
+                        let _dropped = yserver_core::xinput::hotplug::emit_xi1_device_presence(
+                            state,
+                            id,
+                            yserver_core::xinput::hotplug::DevicePresenceChange::Enabled,
+                        );
+                        let _dropped = yserver_core::xinput::hotplug::emit_xi_hierarchy_changed(
+                            state,
+                            yserver_core::xinput::hotplug::XiHierarchyStep::DeviceEnabled,
+                            id,
+                            None,
+                            None,
+                        );
+                    }
                 }
-                let _dropped = yserver_core::xinput::hotplug::emit_xi_hierarchy_changed(
-                    state,
-                    yserver_core::xinput::hotplug::XiHierarchyStep::DeviceEnabled,
-                    &enabled_ids,
-                    &[],
-                );
                 return;
             }
             HostInputEvent::DeviceSuspended { source_id } => {
@@ -21818,26 +21862,45 @@ impl Backend for KmsBackend {
             }
             HostInputEvent::DeviceRemoved { source_id } => {
                 log::info!("xi-device: removed source={}", source_id.0);
+                if !self.release_device_holds(state, source_id) {
+                    return;
+                }
                 if state.xi_devices.source(source_id).is_none() {
                     return;
                 }
-                self.release_device_state(state, source_id);
                 yserver_core::core_loop::pointer_fanout::xi_cleanup_source(state, self, source_id);
-                let removed_ids = state.xi_unregister_source(source_id);
-                let removed = state.take_xi_removed_device_descriptors();
-                for id in &removed_ids {
+                let removed_ids: Vec<u16> = [
+                    state
+                        .xi_devices
+                        .facet(source_id, yserver_core::xinput::XiFacetKind::Keyboard),
+                    state
+                        .xi_devices
+                        .facet(source_id, yserver_core::xinput::XiFacetKind::PointerTouch),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                if removed_ids.is_empty() {
+                    state.xi_unregister_source(source_id);
+                }
+                for id in removed_ids {
+                    Self::publish_disabled_xi_facet(state, id);
+                    let Some(removed) = state.xi_unregister_facet(id) else {
+                        continue;
+                    };
                     let _dropped = yserver_core::xinput::hotplug::emit_xi1_device_presence(
                         state,
-                        *id,
+                        id,
                         yserver_core::xinput::hotplug::DevicePresenceChange::Removed,
                     );
+                    let _dropped = yserver_core::xinput::hotplug::emit_xi_hierarchy_changed(
+                        state,
+                        yserver_core::xinput::hotplug::XiHierarchyStep::SlaveRemoved,
+                        id,
+                        Some(&removed),
+                        None,
+                    );
                 }
-                let _dropped = yserver_core::xinput::hotplug::emit_xi_hierarchy_changed(
-                    state,
-                    yserver_core::xinput::hotplug::XiHierarchyStep::SlaveRemoved,
-                    &removed_ids,
-                    &removed,
-                );
                 self.synchronize_floating_keyboard_states(state);
                 return;
             }
@@ -31842,10 +31905,14 @@ mod tests {
             assert_eq!(replies[0][42], 1, "XIQueryDevice reports enabled facets");
         }
         let added_and_enabled = read_events(&mut selected);
+        // Corrected: the previous assertion expected one aggregate Added and
+        // one aggregate Enabled event. Xorg sets only flags[dev->id] in
+        // dix/devices.c:601-605 and :417-421; xichangehierarchy.c:85-99
+        // serializes each device's flags independently.
         assert_eq!(
             added_and_enabled.len(),
-            2,
-            "Added then Enabled are separate events; client={:?}; outbound={}",
+            4,
+            "each mixed-source facet gets Added then Enabled; client={:?}; outbound={}",
             state.clients[&1].xi2_masks,
             state.clients[&1].outbound.len(),
         );
@@ -31866,9 +31933,12 @@ mod tests {
         // XISlaveAdded (devices.c:307-311, 601-605); EnableDevice attaches it
         // only afterwards (devices.c:388-394).
         assert_eq!(event_info(&added_and_enabled[0], 6), (0, 5, 0, 1 << 2));
-        assert_eq!(event_info(&added_and_enabled[0], 7), (0, 5, 0, 1 << 2));
+        assert_eq!(event_info(&added_and_enabled[0], 7), (0, 5, 0, 0));
         assert_eq!(event_info(&added_and_enabled[1], 6), (3, 4, 1, 1 << 6));
-        assert_eq!(event_info(&added_and_enabled[1], 7), (2, 3, 1, 1 << 6));
+        assert_eq!(event_info(&added_and_enabled[1], 7), (0, 5, 0, 0));
+        assert_eq!(event_info(&added_and_enabled[2], 6), (3, 4, 1, 0));
+        assert_eq!(event_info(&added_and_enabled[2], 7), (0, 5, 0, 1 << 2));
+        assert_eq!(event_info(&added_and_enabled[3], 7), (2, 3, 1, 1 << 6));
 
         Backend::on_host_input(
             &mut backend,
@@ -31876,10 +31946,13 @@ mod tests {
             HostInputEvent::DeviceSuspended { source_id: source },
         );
         let disabled = read_events(&mut selected);
-        assert_eq!(disabled.len(), 1, "VT suspension publishes Disabled only");
+        assert_eq!(disabled.len(), 2, "VT suspension disables each facet");
         assert_eq!(event_device_ids(&disabled[0]), vec![2, 3, 4, 5, 6, 7]);
+        assert_eq!(event_device_ids(&disabled[1]), vec![2, 3, 4, 5, 6, 7]);
         assert_eq!(event_info(&disabled[0], 6), (3, 4, 0, 1 << 7));
-        assert_eq!(event_info(&disabled[0], 7), (2, 3, 0, 1 << 7));
+        assert_eq!(event_info(&disabled[0], 7), (2, 3, 1, 0));
+        assert_eq!(event_info(&disabled[1], 6), (0, 5, 0, 0));
+        assert_eq!(event_info(&disabled[1], 7), (2, 3, 0, 1 << 7));
 
         Backend::on_host_input(
             &mut backend,
@@ -31887,10 +31960,13 @@ mod tests {
             HostInputEvent::DeviceResumed(info.clone()),
         );
         let enabled = read_events(&mut selected);
-        assert_eq!(enabled.len(), 1, "VT continuation publishes Enabled only");
+        assert_eq!(enabled.len(), 2, "VT continuation enables each facet");
         assert_eq!(event_device_ids(&enabled[0]), vec![2, 3, 4, 5, 6, 7]);
+        assert_eq!(event_device_ids(&enabled[1]), vec![2, 3, 4, 5, 6, 7]);
         assert_eq!(event_info(&enabled[0], 6), (3, 4, 1, 1 << 6));
-        assert_eq!(event_info(&enabled[0], 7), (2, 3, 1, 1 << 6));
+        assert_eq!(event_info(&enabled[0], 7), (0, 5, 0, 0));
+        assert_eq!(event_info(&enabled[1], 6), (3, 4, 1, 0));
+        assert_eq!(event_info(&enabled[1], 7), (2, 3, 1, 1 << 6));
 
         Backend::on_host_input(
             &mut backend,
@@ -31900,8 +31976,8 @@ mod tests {
         let disabled_and_removed = read_events(&mut selected);
         assert_eq!(
             disabled_and_removed.len(),
-            2,
-            "Disabled then Removed are separate events"
+            4,
+            "each facet is Disabled then Removed before the next facet"
         );
         assert_eq!(
             event_device_ids(&disabled_and_removed[0]),
@@ -31909,12 +31985,21 @@ mod tests {
         );
         assert_eq!(
             event_device_ids(&disabled_and_removed[1]),
-            vec![2, 3, 4, 5, 6, 7]
+            vec![2, 3, 4, 5, 7, 6]
+        );
+        assert_eq!(
+            event_device_ids(&disabled_and_removed[2]),
+            vec![2, 3, 4, 5, 7]
+        );
+        assert_eq!(
+            event_device_ids(&disabled_and_removed[3]),
+            vec![2, 3, 4, 5, 7]
         );
         assert_eq!(event_info(&disabled_and_removed[0], 6), (3, 4, 0, 1 << 7));
-        assert_eq!(event_info(&disabled_and_removed[0], 7), (2, 3, 0, 1 << 7));
+        assert_eq!(event_info(&disabled_and_removed[0], 7), (2, 3, 1, 0));
         assert_eq!(event_info(&disabled_and_removed[1], 6), (0, 0, 0, 1 << 3));
-        assert_eq!(event_info(&disabled_and_removed[1], 7), (0, 0, 0, 1 << 3));
+        assert_eq!(event_info(&disabled_and_removed[2], 7), (2, 3, 0, 1 << 7));
+        assert_eq!(event_info(&disabled_and_removed[3], 7), (0, 0, 0, 1 << 3));
 
         assert!(state.xi_devices.source(source).is_none());
         assert!(state.xi_devices.device(6).is_none());
@@ -31936,8 +32021,8 @@ mod tests {
         let fresh_add = read_events(&mut selected);
         assert_eq!(
             fresh_add.len(),
-            2,
-            "unmatched endpoint starts with Added/Enabled"
+            4,
+            "unmatched mixed endpoint starts each facet with Added/Enabled"
         );
         assert_eq!(event_info(&fresh_add[0], 6), (0, 5, 0, 1 << 2));
         assert_eq!(event_info(&fresh_add[1], 6), (3, 4, 1, 1 << 6));
@@ -31949,7 +32034,7 @@ mod tests {
             },
         );
         let unmatched_disabled = read_events(&mut selected);
-        assert_eq!(unmatched_disabled.len(), 1);
+        assert_eq!(unmatched_disabled.len(), 2);
         assert_eq!(event_info(&unmatched_disabled[0], 6), (3, 4, 0, 1 << 7));
         Backend::on_host_input(
             &mut backend,
@@ -31961,10 +32046,11 @@ mod tests {
         let unmatched_removed = read_events(&mut selected);
         assert_eq!(
             unmatched_removed.len(),
-            1,
-            "removing an already-suspended device emits Removed only"
+            2,
+            "removing an already-suspended mixed source emits Removed per facet"
         );
         assert_eq!(event_info(&unmatched_removed[0], 6), (0, 0, 0, 1 << 3));
+        assert_eq!(event_info(&unmatched_removed[1], 7), (0, 0, 0, 1 << 3));
         assert!(state.xi_devices.source(unmatched_source).is_none());
 
         let fresh_source = InputSourceId(source.0 + 2);
@@ -31976,8 +32062,8 @@ mod tests {
         let readd = read_events(&mut selected);
         assert_eq!(
             readd.len(),
-            2,
-            "a fresh source gets Added/Enabled after Removed"
+            4,
+            "a fresh mixed source gets Added/Enabled for each facet after Removed"
         );
         assert_eq!(event_info(&readd[0], 6), (0, 5, 0, 1 << 2));
         assert_eq!(event_info(&readd[1], 6), (3, 4, 1, 1 << 6));
@@ -31990,9 +32076,11 @@ mod tests {
             },
         );
         let final_remove = read_events(&mut selected);
-        assert_eq!(final_remove.len(), 2);
+        assert_eq!(final_remove.len(), 4);
         assert_eq!(event_info(&final_remove[0], 6), (3, 4, 0, 1 << 7));
         assert_eq!(event_info(&final_remove[1], 6), (0, 0, 0, 1 << 3));
+        assert_eq!(event_info(&final_remove[2], 7), (2, 3, 0, 1 << 7));
+        assert_eq!(event_info(&final_remove[3], 7), (0, 0, 0, 1 << 3));
 
         assert!(state.xi_devices.source(fresh_source).is_none());
         assert!(state.xi_devices.device(6).is_none());
@@ -32632,6 +32720,8 @@ mod tests {
         assert!(drain(&mut owner_peer).is_empty());
     }
 
+    // Kills: batching hierarchy flags across facets, emitting a disabled
+    // descriptor after floating, and retaining lifecycle state after removal.
     #[test]
     fn xi1_xi2_dynamic_hotplug_presence_precedes_hierarchy_for_each_transition() {
         use std::{
@@ -32721,7 +32811,13 @@ mod tests {
             wire
         }
 
-        fn transitions(wire: &[u8]) -> Vec<(u8, u32)> {
+        #[derive(Debug, PartialEq, Eq)]
+        enum Transition {
+            Presence(u8, u8),
+            Hierarchy(u32, u16, u8, u16, u8),
+        }
+
+        fn transitions(wire: &[u8]) -> Vec<Transition> {
             let mut events = Vec::new();
             let mut offset = 0;
             while offset < wire.len() {
@@ -32735,13 +32831,30 @@ mod tests {
                         HIERARCHY_CHANGED,
                         "XI2 HierarchyChanged event"
                     );
-                    let flags =
+                    let event_flags =
                         u32::from_le_bytes(wire[offset + 16..offset + 20].try_into().unwrap());
-                    events.push((1, flags)); // 1 tags XI2 hierarchy
+                    let count = usize::from(u16::from_le_bytes(
+                        wire[offset + 20..offset + 22].try_into().unwrap(),
+                    ));
+                    let infos = wire[offset + 32..offset + 32 + count * 12]
+                        .chunks_exact(12)
+                        .filter(|info| u32::from_le_bytes(info[8..12].try_into().unwrap()) != 0)
+                        .collect::<Vec<_>>();
+                    assert_eq!(infos.len(), 1, "one changed device per hierarchy event");
+                    let info = infos[0];
+                    let device_flags = u32::from_le_bytes(info[8..12].try_into().unwrap());
+                    assert_eq!(event_flags, device_flags, "event flags name one facet");
+                    events.push(Transition::Hierarchy(
+                        device_flags,
+                        u16::from_le_bytes(info[0..2].try_into().unwrap()),
+                        info[4],
+                        u16::from_le_bytes(info[2..4].try_into().unwrap()),
+                        info[5],
+                    ));
                     offset += 32 + units * 4;
                 } else {
                     assert_eq!(wire[offset], PRESENCE_EVENT, "XI1 DevicePresenceNotify");
-                    events.push((0, u32::from(wire[offset + 8]))); // 0 tags XI1 presence
+                    events.push(Transition::Presence(wire[offset + 8], wire[offset + 9]));
                     offset += 32;
                 }
             }
@@ -32749,8 +32862,63 @@ mod tests {
             events
         }
 
+        fn presence(change: u8, device_id: u8) -> Transition {
+            Transition::Presence(change, device_id)
+        }
+
+        fn hierarchy(
+            flags: u32,
+            device_id: u16,
+            use_: u8,
+            attachment: u16,
+            enabled: u8,
+        ) -> Transition {
+            Transition::Hierarchy(flags, device_id, use_, attachment, enabled)
+        }
+
+        fn query_device(
+            state: &mut ServerState,
+            backend: &mut KmsBackend,
+            peer: &mut UnixStream,
+            sequence: u16,
+            device_id: u16,
+        ) -> Vec<u8> {
+            let [lo, hi] = device_id.to_le_bytes();
+            let outcome = process_request::process_request(
+                state,
+                backend,
+                ClientId(2),
+                SequenceNumber(sequence),
+                RequestHeader {
+                    opcode: 137,
+                    data: 48,
+                    length_units: 2,
+                },
+                &[lo, hi, 0, 0],
+                None,
+            )
+            .expect("dispatch XIQueryDevice request");
+            assert!(
+                matches!(outcome, process_request::RequestOutcome::Handled),
+                "XIQueryDevice outcome: {outcome:?}"
+            );
+            use yserver_core::core_loop::client_io::{self, WriteOutcome};
+            for _ in 0..100 {
+                if client_io::drain_outbound(state.clients.get_mut(&2).unwrap()).unwrap()
+                    == WriteOutcome::Done
+                {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let reply = drain(peer);
+            assert!(!reply.is_empty(), "XIQueryDevice reply was dispatched");
+            reply
+        }
+
         let mut state = ServerState::new();
         let mut peer = install(&mut state, 1);
+        let mut query_peer = install(&mut state, 2);
         let mut backend = KmsBackend::for_tests();
         let root = yserver_core::resources::ROOT_WINDOW.0;
 
@@ -32776,17 +32944,31 @@ mod tests {
         xi1_selection.extend_from_slice(&PRESENCE_CLASS.to_le_bytes());
         request(&mut state, &mut backend, 2, 6, &xi1_selection);
         assert!(drain(&mut peer).is_empty(), "both selections have no reply");
+        let selected_hierarchy = state.clients[&1].xi2_masks.clone();
+        let selected_presence = state.clients[&1].xi1_event_classes.clone();
+        let initial_devices: Vec<u16> = state
+            .xi_devices
+            .devices()
+            .iter()
+            .map(|device| device.id)
+            .collect();
+        let initial_properties: HashMap<_, _> = state
+            .xi_devices
+            .devices()
+            .iter()
+            .map(|device| (device.id, device.properties.clone()))
+            .collect();
 
         let info = DeviceInfo {
             source_id: InputSourceId(0x16_31),
             enabled: true,
             resume_key: None,
             capabilities: InputCapabilities {
-                keyboard: false,
+                keyboard: true,
                 pointer: true,
                 touch: false,
             },
-            name: "mixed-order mouse".to_owned(),
+            name: "mixed-order keyboard and mouse".to_owned(),
             device_node: "/dev/input/event-mixed-order".to_owned(),
             sysname: "event-mixed-order".to_owned(),
             vendor_id: 0x1234,
@@ -32802,8 +32984,17 @@ mod tests {
         );
         assert_eq!(
             transitions(&drain(&mut peer)),
-            vec![(0, 0), (1, 1 << 2), (0, 2), (1, 1 << 6)],
-            "Added and Enabled each publish XI1 presence before XI2 hierarchy"
+            vec![
+                presence(0, 6),
+                hierarchy(1 << 2, 6, 5, 0, 0),
+                presence(2, 6),
+                hierarchy(1 << 6, 6, 4, 3, 1),
+                presence(0, 7),
+                hierarchy(1 << 2, 7, 5, 0, 0),
+                presence(2, 7),
+                hierarchy(1 << 6, 7, 3, 2, 1),
+            ],
+            "each facet is Added then Enabled, with presence before hierarchy"
         );
 
         Backend::on_host_input(
@@ -32815,9 +33006,27 @@ mod tests {
         );
         assert_eq!(
             transitions(&drain(&mut peer)),
-            vec![(0, 3), (1, 1 << 7)],
-            "Disabled presence precedes its hierarchy notification"
+            vec![
+                presence(3, 6),
+                hierarchy(1 << 7, 6, 4, 3, 0),
+                presence(3, 7),
+                hierarchy(1 << 7, 7, 3, 2, 0),
+            ],
+            "disabled descriptors keep the pre-float attachment"
         );
+        let disabled_pointer = query_device(&mut state, &mut backend, &mut query_peer, 3, 7);
+        assert_eq!(disabled_pointer[0], 1, "XIQueryDevice reply");
+        assert_eq!(
+            u16::from_le_bytes(disabled_pointer[34..36].try_into().unwrap()),
+            5
+        );
+        assert_eq!(
+            u16::from_le_bytes(disabled_pointer[36..38].try_into().unwrap()),
+            0
+        );
+        assert_eq!(disabled_pointer[42], 0);
+        assert_eq!(state.xi_devices.device(6).unwrap().attached_master, None);
+        assert_eq!(state.xi_devices.device(7).unwrap().attached_master, None);
 
         Backend::on_host_input(
             &mut backend,
@@ -32826,9 +33035,46 @@ mod tests {
         );
         assert_eq!(
             transitions(&drain(&mut peer)),
-            vec![(0, 2), (1, 1 << 6)],
-            "Enabled presence precedes its hierarchy notification"
+            vec![
+                presence(2, 6),
+                hierarchy(1 << 6, 6, 4, 3, 1),
+                presence(2, 7),
+                hierarchy(1 << 6, 7, 3, 2, 1),
+            ],
+            "resume enables one facet at a time in creation order"
         );
+
+        for keycode in [38, 56] {
+            Backend::on_host_input(
+                &mut backend,
+                &mut state,
+                HostInputEvent::Key(yserver_core::host_x11::HostKeyEvent {
+                    origin: yserver_core::core_loop::InputOrigin::Physical(info.source_id),
+                    keycode,
+                    pressed: true,
+                    state: 0,
+                    root_x: 0,
+                    root_y: 0,
+                    event_x: 0,
+                    event_y: 0,
+                    time: 0,
+                }),
+            );
+        }
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::PointerButton {
+                origin: yserver_core::core_loop::InputOrigin::Physical(info.source_id),
+                button: 0x110,
+                pressed: true,
+                time: 0,
+            },
+        );
+        assert_eq!(backend.core.down_keys.len(), 2);
+        assert_ne!(backend.core.button_mask, 0);
+        assert!(!state.key_down_by_device.is_empty());
+        assert_ne!(state.buttons_down, 0);
 
         Backend::on_host_input(
             &mut backend,
@@ -32839,8 +33085,17 @@ mod tests {
         );
         assert_eq!(
             transitions(&drain(&mut peer)),
-            vec![(0, 3), (1, 1 << 7), (0, 1), (1, 1 << 3)],
-            "Disabled and Removed presence precede their hierarchy notifications"
+            vec![
+                presence(3, 6),
+                hierarchy(1 << 7, 6, 4, 3, 0),
+                presence(1, 6),
+                hierarchy(1 << 3, 6, 0, 0, 0),
+                presence(3, 7),
+                hierarchy(1 << 7, 7, 3, 2, 0),
+                presence(1, 7),
+                hierarchy(1 << 3, 7, 0, 0, 0),
+            ],
+            "disable then remove each facet before advancing"
         );
         assert!(state.xi_devices.source(info.source_id).is_none());
         assert!(
@@ -32855,12 +33110,30 @@ mod tests {
         assert!(state.xi2_pointer_grabs.is_empty());
         assert!(state.xi2_keyboard_grabs.is_empty());
         assert!(state.xi2_detached_masters.is_empty());
+        assert!(state.floating_pointer_positions.is_empty());
         assert!(state.xi1_frozen.is_empty());
         assert!(state.sync_pending.is_empty());
         assert!(state.key_down_by_device.is_empty());
         assert!(state.unpublished_keyboard_keys_down.is_empty());
         assert!(state.unpublished_pointer_buttons_down.is_empty());
         assert_eq!(state.buttons_down, 0);
+        assert!(state.keys_down.iter().all(|byte| *byte == 0));
+        assert!(backend.core.down_keys.is_empty());
+        assert_eq!(backend.core.button_mask, 0);
+        assert_eq!(
+            state
+                .xi_devices
+                .devices()
+                .iter()
+                .map(|device| device.id)
+                .collect::<Vec<_>>(),
+            initial_devices
+        );
+        for device in state.xi_devices.devices() {
+            assert_eq!(device.properties, initial_properties[&device.id]);
+        }
+        assert_eq!(state.clients[&1].xi2_masks, selected_hierarchy);
+        assert_eq!(state.clients[&1].xi1_event_classes, selected_presence);
         assert!(state.active_pointer_grab.is_none());
         assert!(state.active_keyboard_grab.is_none());
         assert!(state.clients[&1].outbound.is_empty());
@@ -32881,8 +33154,17 @@ mod tests {
         );
         assert_eq!(
             transitions(&drain(&mut peer)),
-            vec![(0, 0), (1, 1 << 2), (0, 2), (1, 1 << 6)],
-            "a replacement mouse starts with Added then Enabled",
+            vec![
+                presence(0, 6),
+                hierarchy(1 << 2, 6, 5, 0, 0),
+                presence(2, 6),
+                hierarchy(1 << 6, 6, 4, 3, 1),
+                presence(0, 7),
+                hierarchy(1 << 2, 7, 5, 0, 0),
+                presence(2, 7),
+                hierarchy(1 << 6, 7, 3, 2, 1),
+            ],
+            "a replacement mixed source starts each facet with Added then Enabled",
         );
         Backend::on_host_input(
             &mut backend,
@@ -32893,7 +33175,12 @@ mod tests {
         );
         assert_eq!(
             transitions(&drain(&mut peer)),
-            vec![(0, 3), (1, 1 << 7)],
+            vec![
+                presence(3, 6),
+                hierarchy(1 << 7, 6, 4, 3, 0),
+                presence(3, 7),
+                hierarchy(1 << 7, 7, 3, 2, 0),
+            ],
             "VT suspension reports Disabled once",
         );
         Backend::on_host_input(
@@ -32905,7 +33192,12 @@ mod tests {
         );
         assert_eq!(
             transitions(&drain(&mut peer)),
-            vec![(0, 1), (1, 1 << 3)],
+            vec![
+                presence(1, 6),
+                hierarchy(1 << 3, 6, 0, 0, 0),
+                presence(1, 7),
+                hierarchy(1 << 3, 7, 0, 0, 0),
+            ],
             "removal of an already-suspended mouse reports Removed only",
         );
         assert!(state.xi_devices.source(suspended_source).is_none());
@@ -32921,12 +33213,27 @@ mod tests {
         assert!(state.xi2_pointer_grabs.is_empty());
         assert!(state.xi2_keyboard_grabs.is_empty());
         assert!(state.xi2_detached_masters.is_empty());
+        assert!(state.floating_pointer_positions.is_empty());
         assert!(state.xi1_frozen.is_empty());
         assert!(state.sync_pending.is_empty());
         assert!(state.key_down_by_device.is_empty());
         assert!(state.unpublished_keyboard_keys_down.is_empty());
         assert!(state.unpublished_pointer_buttons_down.is_empty());
         assert_eq!(state.buttons_down, 0);
+        assert_eq!(
+            state
+                .xi_devices
+                .devices()
+                .iter()
+                .map(|device| device.id)
+                .collect::<Vec<_>>(),
+            initial_devices
+        );
+        for device in state.xi_devices.devices() {
+            assert_eq!(device.properties, initial_properties[&device.id]);
+        }
+        assert_eq!(state.clients[&1].xi2_masks, selected_hierarchy);
+        assert_eq!(state.clients[&1].xi1_event_classes, selected_presence);
         assert!(backend.core.down_keys.is_empty());
         assert_eq!(backend.core.button_mask, 0);
         assert!(state.clients[&1].outbound.is_empty());

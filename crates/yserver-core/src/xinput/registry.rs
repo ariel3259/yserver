@@ -155,6 +155,93 @@ impl XiRegistry {
         result
     }
 
+    /// Refresh retained source metadata without changing any facet's
+    /// session-enabled state. Lifecycle publishers use this before enabling
+    /// facets one at a time.
+    pub fn refresh_source(&mut self, info: &DeviceInfo) -> Vec<u16> {
+        let Some(ids) = self
+            .sources
+            .get(&info.source_id)
+            .map(|record| sorted_facet_ids(&record.facets))
+        else {
+            return Vec::new();
+        };
+        for id in &ids {
+            if let Some(device) = self.device_mut(*id) {
+                device.name.clone_from(&info.name);
+                device.is_touchpad =
+                    device.facet == Some(XiFacetKind::PointerTouch) && info.is_touchpad;
+                device.device_node = Some(info.device_node.clone());
+            }
+        }
+        let source_enabled = if ids.is_empty() {
+            info.enabled
+        } else {
+            ids.iter().any(|id| {
+                self.device(*id)
+                    .is_some_and(|device| device.session_enabled)
+            })
+        };
+        if let Some(record) = self.sources.get_mut(&info.source_id) {
+            record.info = info.clone();
+            record.info.enabled = source_enabled;
+        }
+        ids
+    }
+
+    /// Change one facet's session availability without floating it. A disable
+    /// caller emits the hierarchy snapshot first, then floats the facet;
+    /// enabling restores the role-derived home master immediately.
+    pub fn set_facet_session_enabled(&mut self, device_id: u16, enabled: bool) -> bool {
+        let Some(source_id) = self.device(device_id).and_then(|device| device.source_id) else {
+            return false;
+        };
+        let Some(device) = self.device_mut(device_id) else {
+            return false;
+        };
+        let was_enabled = device.enabled;
+        device.session_enabled = enabled;
+        device.enabled = device.session_enabled && !device.client_disabled;
+        if device.enabled {
+            device.attached_master = Some(match device.facet {
+                Some(XiFacetKind::PointerTouch) => DEVICEID_MASTER_POINTER,
+                Some(XiFacetKind::Keyboard) => DEVICEID_MASTER_KEYBOARD,
+                None => return false,
+            });
+        }
+        let is_enabled = device.enabled;
+
+        let any_session_enabled = self
+            .sources
+            .get(&source_id)
+            .into_iter()
+            .flat_map(|record| record.facets.values())
+            .any(|id| self.device(*id).is_some_and(|facet| facet.session_enabled));
+        if let Some(record) = self.sources.get_mut(&source_id) {
+            record.info.enabled = any_session_enabled;
+        }
+
+        !was_enabled && is_enabled
+    }
+
+    /// Remove one published facet while preserving its source's other facet.
+    pub fn remove_facet(&mut self, device_id: u16) -> Option<XiDevice> {
+        let removed = self.device(device_id)?.clone();
+        let source_id = removed.source_id?;
+        let facet = removed.facet?;
+        let record = self.sources.get_mut(&source_id)?;
+        if record.facets.get(&facet) != Some(&device_id) {
+            return None;
+        }
+        record.facets.remove(&facet);
+        let source_empty = record.facets.is_empty();
+        if source_empty {
+            self.sources.remove(&source_id);
+        }
+        self.devices.retain(|device| device.id != device_id);
+        Some(removed)
+    }
+
     /// Remove a source and all of its currently published facets.
     ///
     /// Returned IDs can be used by later lifecycle stages to publish removal

@@ -1958,6 +1958,95 @@ impl ServerState {
         ids
     }
 
+    /// Refresh metadata for a retained source while preserving the enabled
+    /// facts on its individual facets.
+    pub fn xi_refresh_source(&mut self, info: &crate::core_loop::DeviceInfo) -> Vec<u16> {
+        let ids = self.xi_devices.refresh_source(info);
+        for &id in &ids {
+            let Some(mut seeded) = self.xi_devices.device(id).cloned() else {
+                continue;
+            };
+            seeded.properties.clear();
+            crate::xinput::seed_pointer_properties(
+                &mut seeded,
+                &mut self.atoms,
+                self.float_atom,
+                info,
+            );
+            if let Some(device) = self.xi_devices.device_mut(id) {
+                for (atom, fresh) in seeded.properties {
+                    if let Some(existing) = device.properties.get_mut(&atom) {
+                        existing.type_atom = fresh.type_atom;
+                        existing.format = fresh.format;
+                        existing.data = fresh.data;
+                    }
+                }
+            }
+        }
+        ids
+    }
+
+    /// Change one facet's VT/session enabled state. A disable clears the
+    /// master last-slave reference but deliberately retains the attachment
+    /// until its Disabled hierarchy snapshot has been emitted.
+    pub fn xi_set_facet_session_enabled(&mut self, device_id: u16, enabled: bool) -> bool {
+        if !enabled {
+            self.xi_clear_last_slave(device_id);
+        }
+        let changed = self
+            .xi_devices
+            .set_facet_session_enabled(device_id, enabled);
+        if enabled && changed {
+            self.xi2_detached_masters.remove(&device_id);
+            self.floating_pointer_positions.remove(&device_id);
+        }
+        changed
+    }
+
+    /// Remove one facet after its Disabled/Removed notifications have been
+    /// sent. This keeps a mixed source's other facet live until its own turn.
+    pub fn xi_unregister_facet(&mut self, device_id: u16) -> Option<crate::xinput::XiDevice> {
+        let device = self.xi_devices.device(device_id)?.clone();
+        let source_id = device.source_id?;
+        self.xi_clear_last_slave(device_id);
+
+        if let Some(grab) = self.xi2_pointer_grabs.remove(&device_id)
+            && let Some(freeze) = self.xi1_frozen.get_mut(&device_id)
+            && freeze.other == Some(grab.owner)
+        {
+            freeze.other = None;
+        }
+        if let Some(grab) = self.xi2_keyboard_grabs.remove(&device_id)
+            && let Some(freeze) = self.xi1_frozen.get_mut(&device_id)
+            && freeze.other == Some(grab.owner)
+        {
+            freeze.other = None;
+        }
+        self.xi2_detached_masters.remove(&device_id);
+        self.floating_pointer_positions.remove(&device_id);
+        self.xi1_frozen.remove(&device_id);
+        self.xi1_device_focus.remove(&device_id);
+        self.xi1_device_input_state.remove(&device_id);
+        self.xi1_button_map.remove(&device_id);
+        self.xi1_modifier_map.remove(&device_id);
+        self.xi1_resolution.remove(&device_id);
+        self.xi1_active_grabs.remove(&device_id);
+        self.button_grabs.retain(|grab| grab.device_id != device_id);
+        self.key_grabs.retain(|grab| grab.device_id != device_id);
+        self.xi1_passive_grabs
+            .retain(|grab| grab.deviceid != device_id);
+        self.sync_pending
+            .retain(|pending| pending.device != device_id);
+        self.key_down_by_device.remove(&device_id);
+
+        let removed = self.xi_devices.remove_facet(device_id)?;
+        if self.xi_devices.source(source_id).is_none() {
+            self.unpublished_keyboard_keys_down.remove(&source_id);
+            self.unpublished_pointer_buttons_down.remove(&source_id);
+        }
+        Some(removed)
+    }
+
     /// Finish a physical facet disable after its disabled notification has
     /// been built from the still-attached snapshot (devices.c:532-539).
     pub fn xi_float_disabled_device(&mut self, device_id: u16) {

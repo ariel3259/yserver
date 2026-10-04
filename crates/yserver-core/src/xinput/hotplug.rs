@@ -257,54 +257,63 @@ impl XiHierarchyStep {
 pub fn emit_xi_hierarchy_changed(
     state: &mut ServerState,
     change: XiHierarchyStep,
-    changed_ids: &[u16],
-    removed: &[XiDevice],
+    changed_id: u16,
+    removed: Option<&XiDevice>,
+    descriptor_snapshot: Option<x11::XiHierarchyInfo>,
 ) -> Vec<ClientId> {
-    if changed_ids.is_empty() {
+    if state.xi_devices.device(changed_id).is_none()
+        && removed.is_none_or(|device| device.id != changed_id)
+    {
         return Vec::new();
     }
 
-    let changed: HashSet<u16> = changed_ids.iter().copied().collect();
     let step_flag = change.flag();
-    let mut infos = Vec::with_capacity(
-        state.xi_devices.devices().len()
-            + if change == XiHierarchyStep::SlaveRemoved {
-                removed.len()
-            } else {
-                0
-            },
-    );
+    let mut infos =
+        Vec::with_capacity(state.xi_devices.devices().len() + usize::from(removed.is_some()));
 
     for device in state.xi_devices.devices() {
-        let (use_, attachment) = hierarchy_descriptor(state, device.id);
+        if device.id == changed_id && change == XiHierarchyStep::SlaveRemoved {
+            continue;
+        }
+        let info = if device.id == changed_id {
+            descriptor_snapshot.unwrap_or_else(|| {
+                let (use_, attachment) = hierarchy_descriptor(state, device.id);
+                x11::XiHierarchyInfo {
+                    device_id: device.id,
+                    attachment,
+                    use_,
+                    enabled: device.enabled,
+                    flags: 0,
+                }
+            })
+        } else {
+            let (use_, attachment) = hierarchy_descriptor(state, device.id);
+            x11::XiHierarchyInfo {
+                device_id: device.id,
+                attachment,
+                use_,
+                enabled: device.enabled,
+                flags: 0,
+            }
+        };
         infos.push(x11::XiHierarchyInfo {
-            device_id: device.id,
-            attachment,
-            use_,
-            enabled: device.enabled,
-            flags: if changed.contains(&device.id) {
+            flags: if device.id == changed_id {
                 step_flag
             } else {
                 0
             },
+            ..info
         });
     }
 
-    if change == XiHierarchyStep::SlaveRemoved {
-        let mut removed_in_id_order: Vec<&XiDevice> = removed
-            .iter()
-            .filter(|device| changed.contains(&device.id))
-            .collect();
-        removed_in_id_order.sort_unstable_by_key(|device| device.id);
-        for device in removed_in_id_order {
-            infos.push(x11::XiHierarchyInfo {
-                device_id: device.id,
-                attachment: 0,
-                use_: 0,
-                enabled: false,
-                flags: step_flag,
-            });
-        }
+    if let Some(device) = removed {
+        infos.push(x11::XiHierarchyInfo {
+            device_id: device.id,
+            attachment: 0,
+            use_: 0,
+            enabled: false,
+            flags: step_flag,
+        });
     }
 
     let targets: Vec<ClientId> = state
@@ -334,6 +343,25 @@ pub fn emit_xi_hierarchy_changed(
             time,
             &infos,
         );
+    })
+}
+
+/// Capture one live hierarchy descriptor for the lifecycle publisher to pass
+/// back explicitly when emitting XIDeviceDisabled. The caller marks the
+/// snapshot disabled after committing that fact and before floating the live
+/// facet.
+pub fn hierarchy_device_snapshot(
+    state: &ServerState,
+    device_id: u16,
+) -> Option<x11::XiHierarchyInfo> {
+    let device = state.xi_devices.device(device_id)?;
+    let (use_, attachment) = hierarchy_descriptor(state, device_id);
+    Some(x11::XiHierarchyInfo {
+        device_id,
+        attachment,
+        use_,
+        enabled: device.enabled,
+        flags: 0,
     })
 }
 
