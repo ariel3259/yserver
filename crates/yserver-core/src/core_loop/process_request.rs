@@ -1750,6 +1750,39 @@ fn outer_rect(
     }
 }
 
+/// `window`'s bounding region in its parent's content space for the
+/// geometry given: its outer rect, cut to its bounding shape when it has
+/// one (the shape is relative to its content origin). Xorg's
+/// `borderSize` (`SetBorderSize`, `dix/window.c:1747-1770`).
+fn bounding_in_parent(
+    state: &ServerState,
+    window: ResourceId,
+    (x, y, width, height, border_width): (i16, i16, u16, u16, u16),
+) -> Vec<x11::xfixes::RegionRect> {
+    let outer = outer_rect(x, y, width, height, border_width);
+    let Some(shape) = state
+        .shape_windows
+        .get(&window)
+        .and_then(|s| s.bounding.as_ref())
+    else {
+        return vec![outer];
+    };
+    let bw = i16::try_from(border_width).unwrap_or(i16::MAX);
+    let shape =
+        crate::nested::offset_rects(shape.clone(), x.saturating_add(bw), y.saturating_add(bw));
+    crate::nested::intersect_regions(&[outer], &shape)
+}
+
+/// [`bounding_in_parent`] at the window's current geometry.
+fn current_bounding_in_parent(
+    state: &ServerState,
+    window: ResourceId,
+) -> Vec<x11::xfixes::RegionRect> {
+    state.resources.window(window).map_or_else(Vec::new, |w| {
+        bounding_in_parent(state, window, (w.x, w.y, w.width, w.height, w.border_width))
+    })
+}
+
 /// Expose what `moved` uncovered when it left `vacated` (in `parent`'s
 /// content space): Xorg's `miHandleValidateExposures` after a
 /// `ConfigureWindow`, for the case where nothing else restores those
@@ -1784,12 +1817,7 @@ fn expose_vacated_area(
     let Some(p) = state.resources.window(parent) else {
         return;
     };
-    let content = x11::xfixes::RegionRect {
-        x: 0,
-        y: 0,
-        width: p.width,
-        height: p.height,
-    };
+    let content = content_within_ancestors(state, parent);
     let mut region = crate::nested::intersect_regions(&vacated, &[content]);
     // Top-most first; `children` is bottom-to-top.
     let siblings: Vec<ResourceId> = p.children.iter().rev().copied().collect();
@@ -1830,7 +1858,7 @@ fn higher_sibling_rects(state: &ServerState, window: ResourceId) -> Vec<x11::xfi
                 && state.composite_redirects.window_mode(*s)
                     != Some(crate::server::CompositeRedirectMode::Manual)
         })
-        .map(|(_, w)| outer_rect(w.x, w.y, w.width, w.height, w.border_width))
+        .flat_map(|(s, _)| current_bounding_in_parent(state, s))
         .collect()
 }
 
@@ -1857,12 +1885,12 @@ fn expose_child_share(
     if mode == Some(crate::server::CompositeRedirectMode::Manual) {
         return region;
     }
-    let outer = outer_rect(c.x, c.y, c.width, c.height, c.border_width);
-    let share = crate::nested::intersect_regions(&region, &[outer]);
+    let outer = current_bounding_in_parent(state, child);
+    let share = crate::nested::intersect_regions(&region, &outer);
     if share.is_empty() {
         return region;
     }
-    let rest = crate::nested::subtract_regions(&region, &[outer]);
+    let rest = crate::nested::subtract_regions(&region, &outer);
     if expose && mode.is_none() {
         // Into the child's content space; the border ring is not
         // repainted here.
@@ -1940,6 +1968,157 @@ fn expose_own_region(
             );
         });
     }
+}
+
+/// Xorg's `miWindowExposures` (`mi/miexpose.c:375-410`) for `region` of
+/// `window` (its content space): its background over the region when
+/// `paint` (unless None), and Expose events to the clients that selected
+/// them, one per rect with the count still to follow, or the extents
+/// alone past `RECTLIMIT` rects.
+fn send_window_exposures(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    window: ResourceId,
+    region: &[x11::xfixes::RegionRect],
+    paint: bool,
+) {
+    if region.is_empty() {
+        return;
+    }
+    if paint
+        && let Some(bg) = state.resources.window_resolved_background(window)
+        && let Some(target) = state.resources.host_drawable_target(window)
+    {
+        for r in region {
+            let _ = backend.clear_area(
+                origin,
+                target.host_xid(),
+                bg.background_pixel,
+                bg.background_pixmap_host_xid.map(|h| h.as_raw()),
+                r.x,
+                r.y,
+                r.width,
+                r.height,
+                bg.tile_origin_offset,
+            );
+            let _dropped = accumulate_damage_to_state(state, window, r.x, r.y, r.width, r.height);
+        }
+    }
+    if subscribers_by_id(state, window, 0x0000_8000).is_empty() {
+        return;
+    }
+    let extents;
+    let events = if region.len() > crate::core_loop::clip_list::RECTLIMIT {
+        extents = [crate::nested::region_extents(region)];
+        &extents[..]
+    } else {
+        region
+    };
+    let last = events.len() - 1;
+    for (i, r) in events.iter().enumerate() {
+        let count = u16::try_from(last - i).unwrap_or(u16::MAX);
+        let r = *r;
+        let _dropped = emit_window_event_to_state(state, window, 0x0000_8000, |buf, seq, order| {
+            x11::encode_expose_event(
+                buf,
+                seq,
+                order,
+                window,
+                u16::try_from(r.x).unwrap_or(0),
+                u16::try_from(r.y).unwrap_or(0),
+                r.width,
+                r.height,
+                count,
+            );
+        });
+    }
+}
+
+/// The Expose events of windows becoming viewable: each of `tops`, then
+/// its inferiors, a window before its children and children top-most
+/// first, each for its whole clip list (`miHandleValidateExposures`,
+/// `mi/miwindow.c`, after `miComputeClips` gives a newly viewable window
+/// its clip list as exposed). Their backgrounds are painted on realize.
+fn send_map_exposures(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    tops: &[ResourceId],
+) {
+    for top in tops {
+        for (w, region) in crate::core_loop::clip_list::subtree_clip_lists(state, *top) {
+            send_window_exposures(state, backend, origin, w, &region, false);
+        }
+    }
+}
+
+/// `window`'s content rect in its own content space, intersected with
+/// each ancestor's up to the nearest redirected one: what of it can be
+/// in a clip list at all, since a child's never leaves its parent's
+/// (`mi/mivaltree.c:390`) and a redirected window's is not clipped by
+/// ITS parent (`mi/mivaltree.c:233-239`, `SetWinSize` `dix/window.c:1716`).
+fn content_within_ancestors(state: &ServerState, window: ResourceId) -> x11::xfixes::RegionRect {
+    let Some(w) = state.resources.window(window) else {
+        return x11::xfixes::RegionRect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        };
+    };
+    let mut clip = vec![x11::xfixes::RegionRect {
+        x: 0,
+        y: 0,
+        width: w.width,
+        height: w.height,
+    }];
+    // The current ancestor's content origin, in `window`'s content space.
+    let (mut ox, mut oy) = (0i32, 0i32);
+    let mut cur = window;
+    while state.composite_redirects.window_mode(cur).is_none() {
+        let Some(c) = state.resources.window(cur) else {
+            break;
+        };
+        let Some(p) = state.resources.window(c.parent).filter(|_| cur != c.parent) else {
+            break;
+        };
+        let bw = i32::from(c.border_width);
+        ox -= i32::from(c.x) + bw;
+        oy -= i32::from(c.y) + bw;
+        let (Ok(x), Ok(y)) = (i16::try_from(ox), i16::try_from(oy)) else {
+            break;
+        };
+        clip = crate::nested::intersect_regions(
+            &clip,
+            &[x11::xfixes::RegionRect {
+                x,
+                y,
+                width: p.width,
+                height: p.height,
+            }],
+        );
+        cur = c.parent;
+    }
+    clip.first().copied().unwrap_or(x11::xfixes::RegionRect {
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0,
+    })
+}
+
+/// The nearest window at or above `window`, short of the root, that is
+/// redirected: whose backing `window` draws into.
+fn redirected_ancestor_or_self(state: &ServerState, window: ResourceId) -> Option<ResourceId> {
+    let mut cur = window;
+    while cur != crate::resources::ROOT_WINDOW {
+        if state.composite_redirects.window_mode(cur).is_some() {
+            return Some(cur);
+        }
+        cur = state.resources.window(cur)?.parent;
+    }
+    None
 }
 
 /// Whether any proper ancestor of `window` is redirected, i.e. the
@@ -2862,10 +3041,14 @@ fn handle_render_request(
                 // window-minus-children; if the result is empty the whole
                 // op is skipped. Pixmaps / childless windows pass through
                 // unchanged.
+                // IncludeInferiors keeps the children in the clip.
                 let dst_drawable = state.resources.picture(req.dst).and_then(|p| p.drawable);
+                let include_inferiors = backend.picture_includes_inferiors(host_dst);
                 let painted_rects = match dst_drawable {
-                    Some(d) => clip_fill_rects_by_children(state, d, &req.rects),
-                    None => req.rects.clone(),
+                    Some(d) if !include_inferiors => {
+                        clip_fill_rects_by_children(state, d, &req.rects)
+                    }
+                    _ => req.rects.clone(),
                 };
                 if !painted_rects.is_empty() {
                     let _ = backend.render_fill_rectangles(
@@ -2878,7 +3061,11 @@ fn handle_render_request(
                         0,
                     );
                     if let Some(d) = dst_drawable {
-                        let _dropped = accumulate_damage_clip_by_children_to_state(state, d);
+                        let _dropped = if include_inferiors {
+                            accumulate_damage_full_to_state(state, d)
+                        } else {
+                            accumulate_damage_clip_by_children_to_state(state, d)
+                        };
                     }
                 }
             }
@@ -7329,7 +7516,68 @@ fn fmt_shape_rects(rects: &[yserver_protocol::x11::xfixes::RegionRect]) -> Strin
     s
 }
 
+/// SHAPE requests, and the exposures a viewable window's new bounding
+/// shape makes: Xorg's `miSetShape` (`mi/miwindow.c:637-677`) revalidates
+/// the tree, so what the window no longer covers is exposed beneath it
+/// and what it newly covers is exposed to it. GDK clips a native window
+/// inside a client-side one with its bounding shape and shifts that
+/// shape on every scroll; the dialog repaints its button bar below the
+/// viewport only on that Expose.
 fn handle_shape_request(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    use yserver_protocol::x11::shape as x11shape;
+    // Rectangles, Mask and Combine carry the destination kind at byte 1,
+    // Offset at byte 0; all four the destination window at bytes 4..8.
+    let kind_at = match header.data {
+        x11shape::RECTANGLES | x11shape::MASK | x11shape::COMBINE => Some(1),
+        x11shape::OFFSET => Some(0),
+        _ => None,
+    };
+    let reshaped = kind_at
+        .filter(|at| body.get(*at) == Some(&x11shape::KIND_BOUNDING))
+        .and_then(|_| body.get(4..8))
+        .map(|b| ResourceId(u32::from_le_bytes([b[0], b[1], b[2], b[3]])))
+        .filter(|w| {
+            state
+                .resources
+                .window(*w)
+                .is_some_and(|w| w.map_state == crate::resources::MapState::Viewable)
+        })
+        .and_then(|w| {
+            let parent = state.resources.window(w)?.parent;
+            // A top-level keeps its own storage, and the scene recomposites
+            // what its shape uncovers — as for a move.
+            (parent != crate::resources::ROOT_WINDOW || has_redirected_ancestor(state, w))
+                .then(|| (w, parent, current_bounding_in_parent(state, w)))
+        });
+    let outcome =
+        handle_shape_request_ops(state, backend, origin, client_id, sequence, header, body)?;
+    if let Some((window, parent, before)) = reshaped {
+        let inside = content_within_ancestors(state, parent);
+        let before = crate::nested::intersect_regions(&before, &[inside]);
+        let after =
+            crate::nested::intersect_regions(&current_bounding_in_parent(state, window), &[inside]);
+        let vacated = crate::nested::subtract_regions(&before, &after);
+        if !vacated.is_empty() {
+            expose_vacated_area(state, backend, origin, parent, window, vacated);
+        }
+        let gained = crate::nested::subtract_regions(&after, &before);
+        let gained = crate::nested::subtract_regions(&gained, &higher_sibling_rects(state, window));
+        if !gained.is_empty() {
+            let _rest = expose_child_share(state, backend, origin, window, gained, true);
+        }
+    }
+    Ok(outcome)
+}
+
+fn handle_shape_request_ops(
     state: &mut ServerState,
     backend: &mut dyn Backend,
     origin: Option<OriginContext>,
@@ -8552,6 +8800,9 @@ fn handle_xfixes_request(
                 let gc_id = ResourceId(req.gc);
                 if req.region == 0 {
                     state.resources.clear_gc_clip(gc_id);
+                    state
+                        .resources
+                        .set_gc_clip_origin(gc_id, req.x_origin, req.y_origin);
                 } else {
                     let rects = state
                         .xfixes_regions
@@ -10856,6 +11107,225 @@ pub(crate) fn emit_dpms_notify(state: &mut ServerState) {
     }
 }
 
+/// A window or pixmap of that id.
+fn drawable_exists(state: &ServerState, id: ResourceId) -> bool {
+    state.resources.window(id).is_some() || state.resources.pixmap(id).is_some()
+}
+
+/// `ScreenSaverSetAttributes` (`Xext/saver.c:734-1073`): CreateWindow's
+/// checks against the root, then BadAccess when another client holds
+/// the attributes; else they are this client's, replacing its own.
+fn screen_saver_set_attributes(
+    state: &mut ServerState,
+    client_id: ClientId,
+    body: &[u8],
+) -> Result<(), (u8, u32)> {
+    use crate::server::SaverAttributes;
+    if body.len() < 24 {
+        return Err((x11::error::BAD_LENGTH, 0));
+    }
+    let u16_at = |i: usize| u16::from_le_bytes([body[i], body[i + 1]]);
+    let u32_at = |i: usize| u32::from_le_bytes([body[i], body[i + 1], body[i + 2], body[i + 3]]);
+    let drawable = u32_at(0);
+    let (x, y) = (u16_at(4) as i16, u16_at(6) as i16);
+    let (width, height, border_width) = (u16_at(8), u16_at(10), u16_at(12));
+    let (class, depth, visual, value_mask) = (body[14], body[15], u32_at(16), u32_at(20));
+    if !drawable_exists(state, ResourceId(drawable)) {
+        return Err((x11::error::BAD_DRAWABLE, drawable));
+    }
+    let values: Vec<u32> = body[24..].chunks_exact(4).map(u32_at_slice).collect();
+    if usize::try_from(value_mask.count_ones()).ok() != Some(values.len()) {
+        return Err((x11::error::BAD_LENGTH, 0));
+    }
+    if width == 0 || height == 0 {
+        return Err((x11::error::BAD_VALUE, 0));
+    }
+    // The root is InputOutput, of the root depth and visual.
+    let effective_class = match class {
+        0 | 1 => 1,
+        2 => 2,
+        other => return Err((x11::error::BAD_VALUE, u32::from(other))),
+    };
+    if effective_class == 2 && (border_width != 0 || depth != 0) {
+        return Err((x11::error::BAD_MATCH, 0));
+    }
+    let depth = if effective_class == 1 && depth == 0 {
+        crate::resources::ROOT_DEPTH
+    } else {
+        depth
+    };
+    let visual = if visual == 0 {
+        crate::resources::ROOT_VISUAL.0
+    } else {
+        visual
+    };
+    if (visual != crate::resources::ROOT_VISUAL.0 || depth != crate::resources::ROOT_DEPTH)
+        && !state.resources.is_known_visual(ResourceId(visual))
+    {
+        return Err((x11::error::BAD_MATCH, 0));
+    }
+    const CW_BORDER: u32 = 0x0004 | 0x0008;
+    const CW_COLORMAP: u32 = 0x2000;
+    if value_mask & CW_BORDER == 0 && effective_class != 2 && depth != crate::resources::ROOT_DEPTH
+    {
+        return Err((x11::error::BAD_MATCH, 0));
+    }
+    if value_mask & CW_COLORMAP == 0
+        && effective_class != 2
+        && visual != crate::resources::ROOT_VISUAL.0
+    {
+        return Err((x11::error::BAD_MATCH, 0));
+    }
+    if state
+        .screensaver
+        .attributes
+        .as_ref()
+        .is_some_and(|a| a.client != client_id)
+    {
+        return Err((x11::error::BAD_ACCESS, 0));
+    }
+    state.screensaver.attributes = Some(SaverAttributes {
+        client: client_id,
+        x,
+        y,
+        width,
+        height,
+        border_width,
+        class,
+        depth,
+        visual,
+        value_mask,
+        values,
+    });
+    Ok(())
+}
+
+fn u32_at_slice(c: &[u8]) -> u32 {
+    u32::from_le_bytes([c[0], c[1], c[2], c[3]])
+}
+
+/// `ScreenSaverUnsetAttributes` (`Xext/saver.c:1075-1096`), and a client
+/// going away (`ScreenSaverFreeAttr`): its attributes are dropped, and
+/// the saver window with them.
+pub(crate) fn unset_screen_saver_attributes(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    client_id: ClientId,
+) {
+    if state
+        .screensaver
+        .attributes
+        .as_ref()
+        .is_some_and(|a| a.client == client_id)
+    {
+        state.screensaver.attributes = None;
+        // `ScreenSaverFreeAttr` (`Xext/saver.c:333-355`): a shown window
+        // goes by resetting the saver and starting it again.
+        if state.screensaver.window_shown {
+            apply_screen_saver_transition(state, backend, ScreenSaverActive::Off, true);
+            apply_screen_saver_transition(state, backend, ScreenSaverActive::On, true);
+        }
+    }
+}
+
+/// `CreateSaverWindow` (`Xext/saver.c:466-564`): the attributes as a
+/// server-owned, override-redirect child of the root, mapped.
+fn create_screen_saver_window(state: &mut ServerState, backend: &mut dyn Backend) {
+    destroy_screen_saver_window(state, backend);
+    let Some(attrs) = state.screensaver.attributes.clone() else {
+        return;
+    };
+    const CW_OVERRIDE_REDIRECT: u32 = 0x0200;
+    let mask = attrs.value_mask | CW_OVERRIDE_REDIRECT;
+    let mut values = Vec::with_capacity(attrs.values.len() + 1);
+    let mut given = attrs.values.iter();
+    for bit in 0..15u32 {
+        let b = 1 << bit;
+        if mask & b == 0 {
+            continue;
+        }
+        if b == CW_OVERRIDE_REDIRECT {
+            if attrs.value_mask & b != 0 {
+                given.next();
+            }
+            values.push(1);
+        } else if let Some(v) = given.next() {
+            values.push(*v);
+        }
+    }
+    // Xorg keeps the values as `unsigned long` and hands them to
+    // CreateWindow as an `XID *` (`Xext/saver.c:494`): on a 64-bit server
+    // every other XID it reads is the high half of the one before, 0.
+    // dtsession's mask-0 window (override-redirect alone) is unaffected;
+    // a mask with background pixel loses its override-redirect.
+    let values: Vec<u32> = values
+        .iter()
+        .flat_map(|v| [*v, 0])
+        .take(values.len())
+        .collect();
+    let window = crate::resources::SCREEN_SAVER_WINDOW;
+    let mut body = Vec::with_capacity(28 + 4 * values.len());
+    body.extend_from_slice(&window.0.to_le_bytes());
+    body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+    for v in [
+        attrs.x as u16,
+        attrs.y as u16,
+        attrs.width,
+        attrs.height,
+        attrs.border_width,
+    ] {
+        body.extend_from_slice(&v.to_le_bytes());
+    }
+    body.extend_from_slice(&u16::from(attrs.class).to_le_bytes());
+    body.extend_from_slice(&attrs.visual.to_le_bytes());
+    body.extend_from_slice(&mask.to_le_bytes());
+    for v in &values {
+        body.extend_from_slice(&v.to_le_bytes());
+    }
+    let header = RequestHeader {
+        opcode: 1,
+        data: attrs.depth,
+        length_units: u32::try_from(1 + body.len() / 4).unwrap_or(u32::MAX),
+    };
+    let server = crate::resources::SERVER_OWNER;
+    let _ = handle_create_window(
+        state,
+        backend,
+        None,
+        server,
+        SequenceNumber(0),
+        header,
+        &body,
+    );
+    if state.resources.window(window).is_none() {
+        return;
+    }
+    let _ = handle_map_window(
+        state,
+        backend,
+        None,
+        server,
+        SequenceNumber(0),
+        &window.0.to_le_bytes(),
+    );
+    state.screensaver.window_shown = true;
+}
+
+/// `DestroySaverWindow` (`Xext/saver.c:566-584`).
+fn destroy_screen_saver_window(state: &mut ServerState, backend: &mut dyn Backend) {
+    if !state.screensaver.window_shown {
+        return;
+    }
+    state.screensaver.window_shown = false;
+    if state
+        .resources
+        .window(crate::resources::SCREEN_SAVER_WINDOW)
+        .is_some()
+    {
+        destroy_window_subtree(state, backend, None, crate::resources::SCREEN_SAVER_WINDOW);
+    }
+}
+
 /// Transition the screensaver to `new` (must be `Off` or `On`).
 /// `Cycle` is an event-only value — it never appears in
 /// `screensaver.active`. Passing it here is a programmer error; the
@@ -10868,7 +11338,7 @@ pub(crate) fn emit_dpms_notify(state: &mut ServerState) {
 /// and is currently unused (SS is purely server-side bookkeeping).
 pub(crate) fn apply_screen_saver_transition(
     state: &mut ServerState,
-    _backend: &mut dyn Backend, // reserved for future coupling (parity with apply_dpms_transition)
+    backend: &mut dyn Backend,
     new: ScreenSaverActive,
     forced: bool,
 ) {
@@ -10892,7 +11362,26 @@ pub(crate) fn apply_screen_saver_transition(
         ),
         _ => None,
     };
+    // `ScreenSaverHandle` (`Xext/saver.c:586-614`): the window first,
+    // then the notify that names it.
+    match new {
+        ScreenSaverActive::On => create_screen_saver_window(state, backend),
+        _ => destroy_screen_saver_window(state, backend),
+    }
     emit_screen_saver_notify(state, new, forced);
+}
+
+/// `kind` of QueryInfo and ScreenSaverNotify: External while a client's
+/// attributes are set (`Xext/saver.c:411-416`).
+fn screen_saver_kind(state: &ServerState) -> u8 {
+    use yserver_protocol::x11::screensaver as x11ss;
+    if state.screensaver.attributes.is_some() {
+        x11ss::SCREEN_SAVER_EXTERNAL
+    } else if state.screensaver.prefer_blanking {
+        x11ss::SCREEN_SAVER_BLANKED
+    } else {
+        x11ss::SCREEN_SAVER_INTERNAL
+    }
 }
 
 /// Fan a `ScreenSaverNotify` event out to subscribers. `notify_state`
@@ -10924,11 +11413,7 @@ pub(crate) fn emit_screen_saver_notify(
     }
     let ts = state.timestamp_now();
     let root = crate::resources::ROOT_WINDOW.0;
-    let kind = if state.screensaver.prefer_blanking {
-        x11ss::SCREEN_SAVER_BLANKED
-    } else {
-        x11ss::SCREEN_SAVER_INTERNAL
-    };
+    let kind = screen_saver_kind(state);
     let dropped =
         crate::core_loop::fanout::fanout_event_to_clients(state, &subs, |buf, seq, order| {
             x11ss::encode_screen_saver_notify_event(
@@ -10939,7 +11424,7 @@ pub(crate) fn emit_screen_saver_notify(
                 active_state,
                 ts,
                 root,
-                0, // window — always 0 (no SetAttributes path)
+                crate::resources::SCREEN_SAVER_WINDOW.0,
                 kind,
                 forced,
             );
@@ -11319,16 +11804,12 @@ fn handle_screen_saver_request(
                 .get(&client_id)
                 .copied()
                 .unwrap_or(0);
-            let kind = if state.screensaver.prefer_blanking {
-                x11ss::SCREEN_SAVER_BLANKED
-            } else {
-                x11ss::SCREEN_SAVER_INTERNAL
-            };
+            let kind = screen_saver_kind(state);
             let reply = x11ss::encode_query_info_reply(
                 byte_order,
                 sequence,
                 reply_state,
-                0, /*window*/
+                crate::resources::SCREEN_SAVER_WINDOW.0,
                 til_or_since,
                 last_input,
                 event_mask,
@@ -11358,18 +11839,21 @@ fn handle_screen_saver_request(
             }
         }
         x11ss::SET_ATTRIBUTES => {
-            return emit_x11_error_with_minor(
-                state,
-                client_id,
-                sequence,
-                x11::error::BAD_ACCESS,
-                0,
-                minor_u16,
-                MIT_SCREEN_SAVER_MAJOR_OPCODE,
-            );
+            return match screen_saver_set_attributes(state, client_id, body) {
+                Ok(()) => Ok(RequestOutcome::Handled),
+                Err((code, value)) => emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    code,
+                    value,
+                    minor_u16,
+                    MIT_SCREEN_SAVER_MAJOR_OPCODE,
+                ),
+            };
         }
         x11ss::UNSET_ATTRIBUTES => {
-            if x11ss::parse_unset_attributes_request(body).is_none() {
+            let Some(drawable) = x11ss::parse_unset_attributes_request(body) else {
                 return emit_x11_error_with_minor(
                     state,
                     client_id,
@@ -11379,7 +11863,19 @@ fn handle_screen_saver_request(
                     minor_u16,
                     MIT_SCREEN_SAVER_MAJOR_OPCODE,
                 );
+            };
+            if !drawable_exists(state, ResourceId(drawable)) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_DRAWABLE,
+                    drawable,
+                    minor_u16,
+                    MIT_SCREEN_SAVER_MAJOR_OPCODE,
+                );
             }
+            unset_screen_saver_attributes(state, _backend, client_id);
         }
         x11ss::SUSPEND => {
             let Some(suspend) = x11ss::parse_suspend_request(body) else {
@@ -23442,8 +23938,9 @@ fn handle_create_window(
             return emit_x11_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, 1);
         }
     }
-    // BadIdChoice / BadMatch validation.
-    let validation_failed = {
+    // BadIdChoice / BadMatch validation. The server creates its own
+    // windows (the screensaver's) under `SERVER_OWNER`, with no client.
+    let validation_failed = client_id != crate::resources::SERVER_OWNER && {
         let handle = state.clients.get(&client_id.0).expect("client registered");
         let owned = crate::server::IdAllocator::validate_owned(
             new_id,
@@ -23500,6 +23997,19 @@ fn handle_create_window(
             sequence,
             x11::error::BAD_COLORMAP,
             colormap.0,
+            1,
+        );
+    }
+    if let Some(cursor) = request.cursor
+        && cursor.0 != 0
+        && !state.resources.cursor_exists(cursor)
+    {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_CURSOR,
+            cursor.0,
             1,
         );
     }
@@ -23561,13 +24071,10 @@ fn handle_create_window(
         }
     }
     state.resources.create_window(client_id, request);
-    if mask != 0 {
-        state
-            .clients
-            .get_mut(&client_id.0)
-            .expect("client registered")
-            .event_masks
-            .insert(window_id, mask);
+    if mask != 0
+        && let Some(client) = state.clients.get_mut(&client_id.0)
+    {
+        client.event_masks.insert(window_id, mask);
     }
     let needs_host_xid = state
         .resources
@@ -23648,6 +24155,14 @@ fn handle_create_window(
             if let Some(border) = state.resources.window(window_id).map(|w| w.border) {
                 let (value_mask, values) = border_source_cwa_values(border);
                 let _ = backend.change_subwindow_attributes(origin, host_xid, value_mask, &values);
+            }
+            // CWCursor on CreateWindow, as ChangeWindowAttributes forwards it.
+            if let Some(cursor_host) = request
+                .cursor
+                .filter(|c| c.0 != 0)
+                .and_then(|c| state.resources.cursor_host_xid(c))
+            {
+                let _ = backend.define_cursor(origin, host_xid, cursor_host);
             }
             let result = if parent == ROOT_WINDOW {
                 backend.register_top_level(origin, window_id, host_xid)
@@ -24028,6 +24543,11 @@ fn handle_change_window_attributes(
         };
         if let (Some(hw), Some(ch)) = (host_window_raw, cursor_host_xid) {
             let _ = backend.define_cursor(origin, hw, ch);
+        } else if host_window_raw.is_none() {
+            // No backend window (InputOnly): the backend reads the cursor
+            // from the tree when it re-resolves the window under the
+            // pointer.
+            backend.windows_restructured(state);
         }
     }
     debug!(
@@ -24490,12 +25010,13 @@ fn handle_configure_window(
             && !resized
             && let Some((old_x, old_y, _, _, _)) = before_geom
             && (old_x, old_y) != (geometry.x, geometry.y)
-            && has_redirected_ancestor(state, window_id)
+            && (has_redirected_ancestor(state, window_id)
+                || parent.is_some_and(|p| p != crate::resources::ROOT_WINDOW))
         {
-            // A pure move of an UNREDIRECTED window inside a redirected
-            // ancestor: the backend carries its pixels to the new
-            // position in the ancestor's backing (Xorg `fbCopyWindow`),
-            // and Xorg reports that copy through `damageCopyWindow`
+            // A pure move of an UNREDIRECTED subwindow (inside a
+            // redirected ancestor, the backend also carries its pixels to the new
+            // position in the ancestor's backing, Xorg `fbCopyWindow`):
+            // Xorg reports that copy through `damageCopyWindow`
             // (`miext/damage/damage.c`); a damage object on any ancestor
             // sees it, since window damage includes inferiors. (The
             // vacated area is reported by its exposure paint below.)
@@ -24528,21 +25049,28 @@ fn handle_configure_window(
                 request.value_mask,
             );
         }
-        // What the window left behind inside a shared redirect backing.
+        // What the window left behind, exposed beneath it as Xorg's
+        // `miMoveWindow` does — inside a shared redirect backing, and for
+        // a subwindow anywhere (a top-level keeps its own storage and the
+        // scene recomposites what it uncovers).
+        let shared = has_redirected_ancestor(state, window_id);
         if viewable
             && let Some((old_x, old_y, old_w, old_h, old_bw)) = before_geom
             && let Some(parent) = parent
-            && has_redirected_ancestor(state, window_id)
+            && (shared || parent != crate::resources::ROOT_WINDOW)
         {
-            let old_outer = outer_rect(old_x, old_y, old_w, old_h, old_bw);
-            let new_outer = outer_rect(
-                geometry.x,
-                geometry.y,
-                geometry.width,
-                geometry.height,
-                geometry.border_width,
+            // Both ends as far as the parent's clip reaches: the part of
+            // the window outside it was never drawn, nor carried.
+            let inside = content_within_ancestors(state, parent);
+            let old_outer = crate::nested::intersect_regions(
+                &bounding_in_parent(state, window_id, (old_x, old_y, old_w, old_h, old_bw)),
+                &[inside],
             );
-            let vacated = crate::nested::subtract_regions(&[old_outer], &[new_outer]);
+            let new_outer = crate::nested::intersect_regions(
+                &current_bounding_in_parent(state, window_id),
+                &[inside],
+            );
+            let vacated = crate::nested::subtract_regions(&old_outer, &new_outer);
             if !vacated.is_empty() {
                 expose_vacated_area(state, backend, origin, parent, window_id, vacated);
             }
@@ -24561,10 +25089,10 @@ fn handle_configure_window(
                     geometry.x.saturating_sub(old_x),
                     geometry.y.saturating_sub(old_y),
                 );
-                let mut carried = crate::nested::subtract_regions(&[old_outer], &higher_before);
+                let mut carried = crate::nested::subtract_regions(&old_outer, &higher_before);
                 crate::nested::translate_region(&mut carried, dx, dy);
                 let higher_now = higher_sibling_rects(state, window_id);
-                let visible_now = crate::nested::subtract_regions(&[new_outer], &higher_now);
+                let visible_now = crate::nested::subtract_regions(&new_outer, &higher_now);
                 let holes = crate::nested::subtract_regions(&visible_now, &carried);
                 if !holes.is_empty() {
                     let _rest = expose_child_share(state, backend, origin, window_id, holes, true);
@@ -27622,12 +28150,11 @@ fn handle_map_window(
         // Emit VisibilityNotify(Unobscured) then Expose on the window
         // itself when it becomes viewable. Subscribed clients want the
         // newly-viewable window to redraw.
-        let extents = state
+        let viewable = state
             .resources
             .window(window)
-            .filter(|w| w.map_state == crate::resources::MapState::Viewable)
-            .map(|w| (w.width, w.height));
-        if let Some((w, h)) = extents {
+            .is_some_and(|w| w.map_state == crate::resources::MapState::Viewable);
+        if viewable {
             // VisibilityNotify(Unobscured) for clients selecting
             // VisibilityChangeMask (0x10000). Under yserver's compositor
             // model every viewable top-level is effectively unobscured.
@@ -27655,11 +28182,7 @@ fn handle_map_window(
             // FF bug on bee. Order with the Expose subtree walk below
             // doesn't matter; both are subtree-wide and idempotent.
             let _dropped = emit_visibility_unobscured_subtree_to_state(state, window);
-            let _dropped =
-                emit_window_event_to_state(state, window, 0x0000_8000, |buf, seq, order| {
-                    x11::encode_expose_event(buf, seq, order, window, 0, 0, w, h, 0);
-                });
-            let _dropped = emit_expose_subtree_to_state(state, window);
+            send_map_exposures(state, backend, origin, &[window]);
         }
     }
     // Audit #11: Xorg's `miPaintWindow` fires damage on the window's
@@ -27757,11 +28280,11 @@ fn map_subwindows_with_delta(
         .map(|outcome| (outcome, delta));
     }
     let children: Vec<ResourceId> = state.resources.children(parent).to_vec();
+    let mut newly_viewable = Vec::new();
     for child in children {
         let transition = state.resources.map_window(child);
         let was_unmapped = transition.mapping_changed;
         let host_xid = state.resources.window(child).and_then(|w| w.host_xid);
-        let extents = state.resources.window(child).map(|w| (w.width, w.height));
         let override_redirect = state
             .resources
             .window(child)
@@ -27791,32 +28314,20 @@ fn map_subwindows_with_delta(
                     x11::encode_map_notify_event(buf, seq, order, parent, child, override_redirect);
                 });
         }
-        // Only emit Expose if the child is now Viewable (parent must
-        // also be mapped). When the parent is unmapped, mapping the
-        // child changes its `map_state` to `Mapped` but not `Viewable`,
-        // and the spec only fires Expose for newly-viewable areas.
+        // Only a child now Viewable (its parent mapped too) is exposed,
+        // with the descendants that mapping it promoted to Viewable.
         let viewable = state
             .resources
             .window(child)
             .is_some_and(|w| w.map_state == MapState::Viewable);
-        if was_unmapped
-            && viewable
-            && let Some((width, height)) = extents
-        {
-            let _dropped =
-                emit_window_event_to_state(state, child, 0x0000_8000, |buf, seq, order| {
-                    x11::encode_expose_event(buf, seq, order, child, 0, 0, width, height, 0);
-                });
-            // Mapping this child transitioned it Unmapped->Viewable, which
-            // also promotes any of its descendants that were sitting
-            // Unviewable (mapped while this ancestor was unmapped) to
-            // Viewable via the map_window cascade. Xorg fires Expose on
-            // every newly-viewable window; without this walk the promoted
-            // grandchildren never get their first Expose and never paint.
-            // Mirrors handle_map_window's emit_expose_subtree_to_state.
-            let _dropped = emit_expose_subtree_to_state(state, child);
+        if was_unmapped && viewable {
+            newly_viewable.push(child);
         }
     }
+    // Xorg maps them all, then validates and exposes once: top-most first,
+    // each clipped by the siblings mapped with it (`dix/window.c:2760-2775`).
+    newly_viewable.reverse();
+    send_map_exposures(state, backend, origin, &newly_viewable);
     // Xorg MapSubwindows: one WindowsRestructured after the batch
     // (`dix/window.c:2775`).
     backend.windows_restructured(state);
@@ -27852,6 +28363,15 @@ fn handle_unmap_window(
             );
         }
         let host_xid = state.resources.window(window).and_then(|w| w.host_xid);
+        let viewable_before = state
+            .resources
+            .window(window)
+            .is_some_and(|w| w.map_state == MapState::Viewable);
+        let clips_before = if viewable_before {
+            crate::core_loop::clip_list::clip_lists_under(state, window)
+        } else {
+            Vec::new()
+        };
         let transition = state.resources.unmap_window(window);
         let was_mapped = transition.mapping_changed;
         let parent = if was_mapped {
@@ -27898,6 +28418,16 @@ fn handle_unmap_window(
                 emit_window_event_to_state(state, parent, 0x0008_0000, |buf, seq, order| {
                     x11::encode_unmap_notify_event(buf, seq, order, parent, window, false);
                 });
+            // What it covered is exposed: its parent's and lower
+            // siblings' backgrounds painted there, and Expose sent
+            // (`UnmapWindow`, `dix/window.c:2856-2866`).
+            if viewable_before {
+                let after = crate::core_loop::clip_list::clip_lists_under(state, window);
+                for (w, region) in crate::core_loop::clip_list::newly_exposed(&clips_before, after)
+                {
+                    send_window_exposures(state, backend, origin, w, &region, true);
+                }
+            }
             // XI1: a device focus on a window that just became
             // unviewable reverts per its revert_to, emitting
             // DeviceFocusIn/Out (Xi/exevents.c
@@ -27964,6 +28494,7 @@ fn unmap_subwindows_with_delta(
     if parent == ROOT_WINDOW {
         children.retain(|child| *child != COMPOSITE_OVERLAY_WINDOW);
     }
+    let clip_before = crate::core_loop::clip_list::clip_list(state, parent);
     // Snapshot mapping order + collect host xids; unmap each in the
     // resource table.
     let mut pending: Vec<PendingUnmap> = Vec::new();
@@ -27990,6 +28521,12 @@ fn unmap_subwindows_with_delta(
     // Xorg frees each redirect pixmap at unrealize (`compwindow.c:291`).
     apply_viewability_delta_to_redirects(state, backend, origin, &delta);
     release_storage_for_delta(state, backend, origin, &delta);
+    // The parent is exposed where its children were (`dix/window.c:2925-2933`).
+    let gained = crate::core_loop::clip_list::subtract(
+        &crate::core_loop::clip_list::clip_list(state, parent),
+        &clip_before,
+    );
+    send_window_exposures(state, backend, origin, parent, &gained, true);
     crate::core_loop::xi1_focus::revert_unviewable_focus(state);
     revert_core_focus_if_unviewable(state);
     release_core_grabs_for_unviewable(state, backend);
@@ -29123,8 +29660,29 @@ fn handle_get_image(
             .map_or((i32::MAX, i32::MAX), |r| {
                 (i32::from(r.width), i32::from(r.height))
             });
-        let on_screen =
-            abs_x + rx0 >= 0 && abs_y + ry0 >= 0 && abs_x + rx1 <= root_w && abs_y + ry1 <= root_h;
+        // The bound is the pixmap the window draws into: the screen, or
+        // the backing of the nearest redirected window at or above it,
+        // which a window partly off the screen still has whole
+        // (`DoGetImage`, `dix/dispatch.c:2176-2210`).
+        let (bx, by, bwidth, bheight) = match redirected_ancestor_or_self(state, req.drawable)
+            .and_then(|r| state.resources.window(r).map(|w| (r, w)))
+        {
+            Some((r, rw)) => {
+                let (rx, ry) = state.resources.window_absolute_position(r);
+                let rbw = i32::from(rw.border_width);
+                (
+                    rx - rbw,
+                    ry - rbw,
+                    i32::from(rw.width) + 2 * rbw,
+                    i32::from(rw.height) + 2 * rbw,
+                )
+            }
+            None => (0, 0, root_w, root_h),
+        };
+        let on_screen = abs_x + rx0 >= bx
+            && abs_y + ry0 >= by
+            && abs_x + rx1 <= bx + bwidth
+            && abs_y + ry1 <= by + bheight;
         if !viewable || !in_window || !on_screen {
             return emit_x11_error(
                 state,
@@ -29922,6 +30480,164 @@ fn copy_area_source_split(
     (Some(avail), missing)
 }
 
+/// The region a CopyArea / CopyPlane exposes on its destination, in its
+/// coordinates: Xorg's `miHandleExposures` (`mi/miexpose.c:120-305`),
+/// step for step. The part of the source rect outside what the source
+/// shows — its clip list under ClipByChildren, `NotClippedByChildren`
+/// under IncludeInferiors, its extent for a pixmap — moved over the
+/// destination and cut to what of it shows likewise, and to the GC's
+/// client clip (which Xorg applies without the clip origin). Past
+/// `RECTLIMIT` rects onto a window it is sent as its extents, unless the
+/// source's shape does not hold the source rect. `None` when nothing is
+/// exposed or there is nothing to do: Xorg's NULL return, NoExpose.
+/// The flag says whether the region was reduced to its extents.
+#[allow(clippy::too_many_arguments)]
+fn copy_exposed_region(
+    state: &ServerState,
+    src: ResourceId,
+    dst: ResourceId,
+    draw_state: &crate::backend::DrawState,
+    graphics_exposures: bool,
+    (src_x, src_y): (i16, i16),
+    (width, height): (u16, u16),
+    (dst_x, dst_y): (i16, i16),
+) -> Option<(Vec<x11::xfixes::RegionRect>, bool)> {
+    use crate::core_loop::clip_list;
+    let dst_is_window = state.resources.window(dst).is_some();
+    if !graphics_exposures && !dst_is_window {
+        return None;
+    }
+    let include_inferiors = matches!(
+        draw_state.subwindow_mode,
+        crate::backend::SubwindowMode::IncludeInferiors
+    );
+    let src_box = x11::xfixes::RegionRect {
+        x: src_x,
+        y: src_y,
+        width,
+        height,
+    };
+    let window_clip = |w: ResourceId| {
+        if include_inferiors {
+            clip_list::not_clipped_by_children(state, w)
+        } else {
+            clip_list::clip_list(state, w)
+        }
+    };
+    let src_clip = if state.resources.window(src).is_some() {
+        let clip = window_clip(src);
+        if clip_list::contains(&clip, src_box) {
+            return None;
+        }
+        clip
+    } else {
+        let (w, h) = drawable_size(state, src)?;
+        let whole = x11::xfixes::RegionRect {
+            x: 0,
+            y: 0,
+            width: w,
+            height: h,
+        };
+        if clip_list::contains(&[whole], src_box) {
+            return None;
+        }
+        vec![whole]
+    };
+    let dst_clip = if dst == src {
+        src_clip.clone()
+    } else if dst_is_window {
+        window_clip(dst)
+    } else {
+        let (w, h) = drawable_size(state, dst)?;
+        vec![x11::xfixes::RegionRect {
+            x: 0,
+            y: 0,
+            width: w,
+            height: h,
+        }]
+    };
+    let hidden = clip_list::subtract(&[src_box], &src_clip);
+    let moved = clip_list::translate(
+        hidden,
+        i32::from(dst_x) - i32::from(src_x),
+        i32::from(dst_y) - i32::from(src_y),
+    );
+    let mut exposed = clip_list::intersect(&moved, &dst_clip);
+    if let crate::backend::ClipState::Rectangles { rects, .. } = &draw_state.clip {
+        let client: Vec<x11::xfixes::RegionRect> = rects
+            .rectangles
+            .chunks_exact(8)
+            .map(|c| x11::xfixes::RegionRect {
+                x: i16::from_le_bytes([c[0], c[1]]),
+                y: i16::from_le_bytes([c[2], c[3]]),
+                width: u16::from_le_bytes([c[4], c[5]]),
+                height: u16::from_le_bytes([c[6], c[7]]),
+            })
+            .collect();
+        exposed = clip_list::intersect(&exposed, &client);
+    }
+    let mut extents = graphics_exposures && exposed.len() > clip_list::RECTLIMIT && dst_is_window;
+    if extents
+        && let Some(shape) = state
+            .shape_windows
+            .get(&src)
+            .and_then(|s| s.clip.as_ref().or(s.bounding.as_ref()))
+        && !clip_list::contains(shape, src_box)
+    {
+        extents = false;
+    }
+    if exposed.is_empty() {
+        return None;
+    }
+    if extents {
+        exposed = vec![crate::nested::region_extents(&exposed)];
+    }
+    Some((exposed, extents))
+}
+
+/// [`copy_exposed_region`]'s side effects: the destination window's
+/// background over the region unless it is None (`miHandleExposures`
+/// paints it, cut to the clip list when reduced to extents), and the
+/// GraphicsExpose events, or one NoExpose, when the GC asks for them.
+#[allow(clippy::too_many_arguments)]
+fn finish_copy_exposures(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    client_id: ClientId,
+    dst: ResourceId,
+    dst_host: u32,
+    exposed: Option<(Vec<x11::xfixes::RegionRect>, bool)>,
+    graphics_exposures: bool,
+    major_opcode: u8,
+) -> io::Result<()> {
+    let rects = exposed.as_ref().map_or(&[][..], |(r, _)| r.as_slice());
+    if let Some(window) = state.resources.window(dst)
+        && !window.background_none
+        && !rects.is_empty()
+    {
+        let paint = match &exposed {
+            Some((r, true)) => crate::core_loop::clip_list::intersect(
+                r,
+                &crate::core_loop::clip_list::clip_list(state, dst),
+            ),
+            _ => rects.to_vec(),
+        };
+        for r in &paint {
+            backend.paint_window_background_rect(origin, dst_host, r.x, r.y, r.width, r.height)?;
+            let _dropped = accumulate_damage_to_state(state, dst, r.x, r.y, r.width, r.height);
+        }
+    }
+    if graphics_exposures {
+        let events: Vec<(i16, i16, u16, u16)> = rects
+            .iter()
+            .map(|r| (r.x, r.y, r.width, r.height))
+            .collect();
+        emit_copy_exposures(state, client_id, dst, &events, major_opcode);
+    }
+    Ok(())
+}
+
 /// Emit the CopyArea/CopyPlane graphics-exposures contract events to
 /// the requesting client: one GraphicsExpose per missing dst-coord
 /// sub-rect (count = number still to follow), or one NoExposure when
@@ -30042,19 +30758,36 @@ fn handle_copy_area(
         // Clamp the copy to the AVAILABLE part of the source drawable
         // (X11 §CopyArea): out-of-bounds source regions are never
         // copied; they become the GraphicsExpose region below.
-        let (avail, missing) = if window_unviewable(state, request.dst) {
+        let (avail, exposed) = if window_unviewable(state, request.dst) {
             // Xorg miDoCopy returns before copying or exposing: NoExpose (micopy.c:157).
-            (None, Vec::new())
+            (None, None)
         } else {
-            copy_area_source_split(
-                state,
-                request.src,
-                request.src_x,
-                request.src_y,
-                request.dst_x,
-                request.dst_y,
-                request.width,
-                request.height,
+            let graphics_exposures = state
+                .resources
+                .gc(request.gc)
+                .is_some_and(|g| g.graphics_exposures);
+            (
+                copy_area_source_split(
+                    state,
+                    request.src,
+                    request.src_x,
+                    request.src_y,
+                    request.dst_x,
+                    request.dst_y,
+                    request.width,
+                    request.height,
+                )
+                .0,
+                copy_exposed_region(
+                    state,
+                    request.src,
+                    request.dst,
+                    &st,
+                    graphics_exposures,
+                    (request.src_x, request.src_y),
+                    (request.width, request.height),
+                    (request.dst_x, request.dst_y),
+                ),
             )
         };
         let request = match avail {
@@ -30117,28 +30850,26 @@ fn handle_copy_area(
             let _dropped =
                 accumulate_damage_to_state(state, dst_id, sub.x, sub.y, sub.width, sub.height);
         }
-        // X11 §CopyArea: destination regions corresponding to
-        // unavailable source are TILED WITH THE DST WINDOW'S
-        // BACKGROUND (bg != None), with GXcopy + all-ones plane-mask
-        // — independent of the graphics-exposures setting.
-        if !missing.is_empty() && state.resources.window(request.dst).is_some() {
-            for (mx, my, mw, mh) in &missing {
-                backend.paint_window_background_rect(origin, dst_host, *mx, *my, *mw, *mh)?;
-                let _dropped = accumulate_damage_to_state(state, request.dst, *mx, *my, *mw, *mh);
-            }
-        }
         // Graphics-exposures contract (still fires when the copy was
-        // fully clipped — codex 2026-05-18 follow-up): GraphicsExpose
-        // per missing source sub-rect (out-of-bounds source region),
-        // NoExposure when the source was fully available. Events go
-        // to the requestor unconditionally (not mask-gated).
+        // fully clipped — codex 2026-05-18 follow-up): the exposed
+        // destination gets its background, and GraphicsExpose per rect
+        // or one NoExposure go to the requestor unconditionally (not
+        // mask-gated).
         let graphics_exposures = state
             .resources
             .gc(request.gc)
             .is_some_and(|g| g.graphics_exposures);
-        if graphics_exposures {
-            emit_copy_exposures(state, client_id, request.dst, &missing, 62);
-        }
+        finish_copy_exposures(
+            state,
+            backend,
+            origin,
+            client_id,
+            request.dst,
+            dst_host,
+            exposed,
+            graphics_exposures,
+            62,
+        )?;
     }
     Ok(RequestOutcome::Handled)
 }
@@ -30268,12 +30999,29 @@ fn copy_area_effective_dst_rects(
                 && c.width > 0
                 && c.height > 0
                 && !is_manual)
-                .then_some(CopyAreaSubRect {
-                    x: c.x,
-                    y: c.y,
-                    width: c.width,
-                    height: c.height,
+                .then(|| {
+                    let rect = x11::xfixes::RegionRect {
+                        x: c.x,
+                        y: c.y,
+                        width: c.width,
+                        height: c.height,
+                    };
+                    // A shaped child takes only its bounding shape out
+                    // (Xorg subtracts its `borderSize`): GDK clips a
+                    // native window inside a client-side one with it, and
+                    // the parent's button bar outside it stays drawable.
+                    crate::nested::intersect_regions(
+                        &[rect],
+                        &current_bounding_in_parent(state, *cid),
+                    )
                 })
+        })
+        .flatten()
+        .map(|r| CopyAreaSubRect {
+            x: r.x,
+            y: r.y,
+            width: r.width,
+            height: r.height,
         })
         .collect();
     if child_rects.is_empty() {
@@ -30424,11 +31172,24 @@ fn handle_copy_plane(
         backend.apply_draw_state(origin, &st)?;
         // Clamp to the available source region (same contract as
         // CopyArea — out-of-bounds source becomes GraphicsExpose).
-        let (avail, missing) = if window_unviewable(state, dst) {
+        let graphics_exposures = state.resources.gc(gc).is_some_and(|g| g.graphics_exposures);
+        let (avail, exposed) = if window_unviewable(state, dst) {
             // Xorg miDoCopy returns before copying or exposing: NoExpose (micopy.c:157).
-            (None, Vec::new())
+            (None, None)
         } else {
-            copy_area_source_split(state, src, sx, sy, dx, dy, w, h)
+            (
+                copy_area_source_split(state, src, sx, sy, dx, dy, w, h).0,
+                copy_exposed_region(
+                    state,
+                    src,
+                    dst,
+                    &st,
+                    graphics_exposures,
+                    (sx, sy),
+                    (w, h),
+                    (dx, dy),
+                ),
+            )
         };
         if let Some((asx, asy, adx, ady, aw, ah)) = avail {
             backend.copy_plane(
@@ -30445,27 +31206,19 @@ fn handle_copy_plane(
             )?;
             let _dropped = accumulate_damage_to_state(state, dst, adx, ady, aw, ah);
         }
-        // Missing-source dst regions get the dst window's background
-        // (same contract as CopyArea).
-        if !missing.is_empty() && state.resources.window(dst).is_some() {
-            for (mx, my, mw, mh) in &missing {
-                backend.paint_window_background_rect(
-                    origin,
-                    dstt.host_xid(),
-                    *mx,
-                    *my,
-                    *mw,
-                    *mh,
-                )?;
-                let _dropped = accumulate_damage_to_state(state, dst, *mx, *my, *mw, *mh);
-            }
-        }
-        // GraphicsExpose / NoExposure to the requestor when
-        // graphics-exposures is True.
-        let graphics_exposures = state.resources.gc(gc).is_some_and(|g| g.graphics_exposures);
-        if graphics_exposures {
-            emit_copy_exposures(state, client_id, dst, &missing, 63);
-        }
+        // The same exposure contract as CopyArea (`miCopyPlane` hands its
+        // region to `miHandleExposures` too).
+        finish_copy_exposures(
+            state,
+            backend,
+            origin,
+            client_id,
+            dst,
+            dstt.host_xid(),
+            exposed,
+            graphics_exposures,
+            63,
+        )?;
     }
     debug!(
         "client {} #{} CopyPlane src=0x{:x} dst=0x{:x} src=({},{}) dst=({},{}) {}x{} plane=0x{:x}",
@@ -33137,12 +33890,22 @@ fn handle_ungrab_pointer(
 /// the replayed event). Shared by `apply_allow_events` and the XI1
 /// ReplayThisDevice path.
 fn deactivate_passive_pointer_grab_crossings(state: &mut ServerState) {
-    let prev_grab_window = state
-        .active_pointer_grab
-        .filter(|grab| grab.passive)
-        .map(|grab| grab.grab_window);
+    let prev_grab = state.active_pointer_grab.filter(|grab| grab.passive);
+    let prev_grab_window = prev_grab.map(|grab| grab.grab_window);
     state.clear_pointer_grab();
     state.pointer_confine_to = ResourceId(0);
+    // Xorg DeactivatePointerGrab clears every `sync.other` held on the
+    // dying grab's behalf: a keyboard frozen by the button grab's sync
+    // keyboard mode thaws with it, or it stays frozen with no grab left
+    // to AllowEvents it.
+    if let Some(grab) = prev_grab
+        && let Some(kbd) = state
+            .xi1_frozen
+            .get_mut(&crate::xinput::DEVICEID_SLAVE_KEYBOARD)
+        && kbd.other == Some(grab.owner)
+    {
+        kbd.other = None;
+    }
     if let Some(prev) = prev_grab_window {
         let to_win = crate::core_loop::key_fanout::deepest_window_at_pointer(state);
         emit_core_pointer_grab_chain(state, prev, to_win, 2); // NotifyUngrab
@@ -42811,6 +43574,77 @@ mod tests {
                 .any(|call| matches!(call, RecordedCall::FreePixmap(0xbeef))),
             "host pixmap must stay alive while retained by GC tile"
         );
+    }
+
+    /// GetImage of a window partly off the screen: BadMatch unless the
+    /// window is redirected, when its bound is its backing (`DoGetImage`,
+    /// `dix/dispatch.c:2176-2210`; measured by
+    /// tools/vng-scenarios/draw-clip-probe.c, `F at x=-50`).
+    #[test]
+    fn get_image_of_a_redirected_window_off_the_screen_reads_its_backing() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let window = ResourceId(0x1100);
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window,
+                parent: ROOT_WINDOW,
+                x: -50,
+                y: 0,
+                width: 200,
+                height: 150,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state.resources.window_mut(window).unwrap().map_state = MapState::Viewable;
+        let mut body = window.0.to_le_bytes().to_vec();
+        for v in [0i16, 0] {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [200u16, 150] {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+        body.extend_from_slice(&u32::MAX.to_le_bytes());
+        let mut get_image = |state: &mut ServerState| {
+            process_request(
+                state,
+                &mut backend,
+                ClientId(1),
+                SequenceNumber(1),
+                RequestHeader {
+                    opcode: 73,
+                    data: 2,
+                    length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+                },
+                &body,
+                None,
+            )
+            .expect("process_request");
+            read_all_available(&mut peer)
+        };
+        let unredirected = get_image(&mut state);
+        assert_eq!(
+            (unredirected[0], unredirected[1]),
+            (0, x11::error::BAD_MATCH)
+        );
+        state
+            .composite_redirects
+            .redirect_window(
+                window,
+                crate::server::RedirectRecord {
+                    mode: crate::server::CompositeRedirectMode::Manual,
+                    owner: ClientId(1),
+                },
+            )
+            .unwrap();
+        let redirected = get_image(&mut state);
+        assert_eq!(redirected.first(), Some(&1), "a reply, not an error");
     }
 
     #[test]
@@ -63343,6 +64177,71 @@ mod tests {
         );
     }
 
+    /// A sync passive button grab that also froze the keyboard (dtwm's
+    /// front panel: GrabModeSync for both) and is let go by
+    /// `AllowEvents(ReplayPointer)`: Xorg DeactivatePointerGrab clears the
+    /// keyboard's hold with the grab, so typing works again (measured:
+    /// tools/vng-scenarios/goldens/passive-grab.txt, last line).
+    #[test]
+    fn replay_pointer_of_passive_grab_thaws_keyboard_it_froze() {
+        const GRAB_CLIENT_ID: u32 = 1;
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        let _grab_peer = install_client(&mut state, GRAB_CLIENT_ID);
+        state.set_pointer_grab(crate::server::ActivePointerGrab {
+            owner: ClientId(GRAB_CLIENT_ID),
+            grab_window: ROOT_WINDOW,
+            event_mask: 0x0008,
+            cursor: ResourceId(0),
+            time: 0,
+            owner_events: false,
+            via_xi2: false,
+            implicit: false,
+            passive: true,
+            xi2_mask: 0,
+        });
+        crate::core_loop::pointer_fanout::xi1_check_grab_for_syncs(
+            &mut state,
+            crate::xinput::DEVICEID_SLAVE_POINTER,
+            ClientId(GRAB_CLIENT_ID),
+            true,
+            true,
+        );
+        state
+            .xi1_frozen
+            .entry(crate::xinput::DEVICEID_SLAVE_POINTER)
+            .or_default()
+            .state = crate::server::Xi1SyncState::FrozenWithEvent;
+        let kbd_frozen = |state: &ServerState| {
+            state
+                .xi1_frozen
+                .get(&crate::xinput::DEVICEID_SLAVE_KEYBOARD)
+                .is_some_and(crate::server::Xi1Freeze::frozen)
+        };
+        assert!(
+            kbd_frozen(&state),
+            "the grab's sync keyboard mode holds the keyboard"
+        );
+
+        let header = yserver_protocol::x11::RequestHeader {
+            opcode: 35,
+            data: 2, // ReplayPointer
+            length_units: 2,
+        };
+        handle_allow_events(
+            &mut state,
+            &mut backend,
+            ClientId(GRAB_CLIENT_ID),
+            SequenceNumber(1),
+            header,
+            &[0u8; 4],
+        )
+        .expect("allow events replay pointer");
+
+        assert!(state.active_pointer_grab.is_none());
+        assert!(!kbd_frozen(&state), "the keyboard thaws with the grab");
+    }
+
     /// Core `AllowEvents(ReplayKeyboard)` (mode 5 — what muffin/mutter
     /// calls for a declined key) releases the passive keyboard grab and
     /// replays the frozen key to the focused window. This is the
@@ -71002,6 +71901,50 @@ mod tests {
             .collect()
     }
 
+    /// `miHandleExposures` (`mi/miexpose.c:120-305`) as measured by
+    /// tools/vng-scenarios/expose-probe.c: a client window C (190x100)
+    /// with a child V (100,10 80x120). A scroll whose source runs past
+    /// C's bottom lands its missing rows outside C: NoExpose. A source
+    /// under V is hidden under ClipByChildren, not under IncludeInferiors.
+    #[test]
+    fn copy_area_exposes_what_the_source_hides_inside_the_destination_clip() {
+        use crate::resources::MapState;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let (c, v) = (0x0010_0130u32, 0x0010_0131u32);
+        uv_window(&mut state, c, ROOT_WINDOW, MapState::Viewable);
+        uv_window(&mut state, v, ResourceId(c), MapState::Viewable);
+        for (id, x, y, w, h) in [(c, 5, 20, 190, 100), (v, 100, 10, 80, 120)] {
+            let win = state.resources.window_mut(ResourceId(id)).unwrap();
+            (win.x, win.y, win.width, win.height) = (x, y, w, h);
+        }
+        state
+            .resources
+            .create_gc(ClientId(1), uv_gc_request(UV_GC, true));
+        let mut inferiors = uv_gc_request(UV_GC_NOEXP, true);
+        inferiors.subwindow_mode = Some(1);
+        state.resources.create_gc(ClientId(1), inferiors);
+        let mut copy = |state: &mut ServerState, gc, src: (i16, i16), dst: (i16, i16), size| {
+            uv_copy(state, &mut backend, 62, c, c, gc, src, dst, size);
+            uv_events(&read_all_available(&mut peer))
+        };
+        assert_eq!(
+            copy(&mut state, UV_GC, (0, 0), (0, 40), (100, 200)),
+            vec![(14, c, 0, 0, 0, 0, 0, 62)],
+            "NoExpose"
+        );
+        assert_eq!(
+            copy(&mut state, UV_GC, (90, 20), (10, 20), (40, 40)),
+            vec![(13, c, 20, 20, 30, 40, 0, 62)]
+        );
+        assert_eq!(
+            copy(&mut state, UV_GC_NOEXP, (90, 20), (10, 20), (40, 40)),
+            vec![(14, c, 0, 0, 0, 0, 0, 62)],
+            "IncludeInferiors: V's pixels are the source's"
+        );
+    }
+
     /// Xorg: an unrealized source window has an empty clipList
     /// (mivaltree.c:691-696, miwindow.c:741-744, window.c:892), so miDoCopy
     /// copies nothing and miHandleExposures exposes the whole rect.
@@ -71480,6 +72423,75 @@ mod tests {
         assert_eq!(got[0].y, 0);
         assert_eq!(got[0].width, 100);
         assert_eq!(got[0].height, 80);
+    }
+
+    /// A bounding-shaped child takes only its shape out of its parent
+    /// under ClipByChildren (Xorg subtracts its `borderSize`,
+    /// `dix/window.c:1747-1770`). xfce4-settings-manager's socket S at
+    /// (8,8) 730x531 is shaped to the 450 rows of its viewport, and the
+    /// manager repaints its button bar under S's rect but outside its
+    /// shape with `CopyArea(8,464 730x36)`; measured on Xorg 21.1 by
+    /// tools/vng-scenarios/xembed-scroll-probe.c, the bar is drawn.
+    #[test]
+    fn copy_area_clip_by_children_takes_out_only_a_shaped_childs_shape() {
+        use crate::resources::MapState;
+        use yserver_protocol::x11::{CreateWindowRequest, ResourceId, shape as x11shape};
+
+        let mut state = ServerState::new();
+        let (c, s) = (ResourceId(0x0020_0101), ResourceId(0x0020_0102));
+        for (window, parent, x, y, width, height) in
+            [(c, ROOT_WINDOW, 0, 0, 746, 500), (s, c, 8, 8, 730, 531)]
+        {
+            state.resources.create_window(
+                yserver_protocol::x11::ClientId(1),
+                CreateWindowRequest {
+                    depth: 24,
+                    window,
+                    parent,
+                    x,
+                    y,
+                    width,
+                    height,
+                    border_width: 0,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+        }
+        state.resources.window_mut(s).expect("socket").map_state = MapState::Viewable;
+        crate::nested::set_shape_rects(
+            &mut state,
+            s,
+            x11shape::KIND_BOUNDING,
+            vec![yserver_protocol::x11::xfixes::RegionRect {
+                x: 0,
+                y: 0,
+                width: 730,
+                height: 450,
+            }],
+        );
+        let request = yserver_protocol::x11::CopyAreaRequest {
+            src: ResourceId(0x1),
+            dst: c,
+            gc: ResourceId(0x1),
+            src_x: 0,
+            src_y: 0,
+            dst_x: 8,
+            dst_y: 464,
+            width: 730,
+            height: 36,
+        };
+        let draw_state = crate::backend::DrawState {
+            subwindow_mode: crate::backend::SubwindowMode::ClipByChildren,
+            ..Default::default()
+        };
+        let got = copy_area_effective_dst_rects(&state, c, &draw_state, &request);
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            (got[0].x, got[0].y, got[0].width, got[0].height),
+            (8, 464, 730, 36)
+        );
     }
 
     /// MANUALLY-redirected children must not be subtracted by
@@ -74118,8 +75130,8 @@ mod tests {
         assert_eq!(bytes[1], x11screensaver::SCREEN_SAVER_DISABLED);
         assert_eq!(
             u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
-            0,
-            "window field is always 0 (no SetAttributes path)"
+            crate::resources::SCREEN_SAVER_WINDOW.0,
+            "the screen's saver window id, set or not (`Xext/saver.c:665`)"
         );
         assert_eq!(
             u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]),
@@ -74283,28 +75295,92 @@ mod tests {
         );
     }
 
+    /// `ScreenSaverSetAttributes` (`Xext/saver.c:840-845`): the first
+    /// client gets the attributes, another BadAccess until the first
+    /// unsets them; activation then creates and maps the server's saver
+    /// window, override-redirect, and deactivation destroys it
+    /// (`CreateSaverWindow` / `DestroySaverWindow`). dtsession sets
+    /// 1x1 InputOutput, mask 0, and exits on BadAccess.
     #[test]
-    fn screen_saver_set_attributes_returns_bad_access() {
+    fn screen_saver_set_attributes_belongs_to_one_client_and_shows_a_window() {
         let mut state = ServerState::new();
-        let mut peer = install_client(&mut state, 1);
+        let mut peer1 = install_client(&mut state, 1);
+        let mut peer2 = install_client(&mut state, 2);
         let mut backend = RecordingBackend::new();
-        let header = RequestHeader {
-            opcode: 150,
-            data: x11screensaver::SET_ATTRIBUTES,
-            length_units: 4,
+        let mut body = ROOT_WINDOW.0.to_le_bytes().to_vec();
+        for v in [0u16, 0, 1, 1, 0] {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+        body.extend_from_slice(&[0, 0]); // CopyFromParent class and depth
+        body.extend_from_slice(&0u32.to_le_bytes()); // visual
+        body.extend_from_slice(&0u32.to_le_bytes()); // mask
+        let request = |state: &mut ServerState,
+                       backend: &mut RecordingBackend,
+                       client,
+                       minor,
+                       body: &[u8]| {
+            let header = RequestHeader {
+                opcode: 150,
+                data: minor,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            };
+            let _ = handle_screen_saver_request(
+                state,
+                backend,
+                ClientId(client),
+                SequenceNumber(1),
+                header,
+                body,
+            );
         };
-        let _ = handle_screen_saver_request(
+        request(
             &mut state,
             &mut backend,
-            ClientId(1),
-            SequenceNumber(1),
-            header,
-            &[0u8; 12],
+            1,
+            x11screensaver::SET_ATTRIBUTES,
+            &body,
         );
+        assert!(
+            read_all_available(&mut peer1).is_empty(),
+            "client 1: no error"
+        );
+        request(
+            &mut state,
+            &mut backend,
+            2,
+            x11screensaver::SET_ATTRIBUTES,
+            &body,
+        );
+        let bytes = read_all_available(&mut peer2);
+        assert_eq!((bytes[0], bytes[1]), (0, x11::error::BAD_ACCESS));
 
-        let bytes = read_all_available(&mut peer);
-        assert_eq!(bytes[0], 0, "error reply");
-        assert_eq!(bytes[1], x11::error::BAD_ACCESS);
+        let saver = crate::resources::SCREEN_SAVER_WINDOW;
+        apply_screen_saver_transition(&mut state, &mut backend, ScreenSaverActive::On, true);
+        let w = state.resources.window(saver).expect("saver window");
+        assert_eq!((w.width, w.height, w.parent), (1, 1, ROOT_WINDOW));
+        assert!(w.override_redirect);
+        assert_eq!(w.map_state, MapState::Viewable);
+        apply_screen_saver_transition(&mut state, &mut backend, ScreenSaverActive::Off, true);
+        assert!(state.resources.window(saver).is_none());
+
+        request(
+            &mut state,
+            &mut backend,
+            1,
+            x11screensaver::UNSET_ATTRIBUTES,
+            &ROOT_WINDOW.0.to_le_bytes(),
+        );
+        request(
+            &mut state,
+            &mut backend,
+            2,
+            x11screensaver::SET_ATTRIBUTES,
+            &body,
+        );
+        assert!(
+            read_all_available(&mut peer2).is_empty(),
+            "client 2 after the unset"
+        );
     }
 
     #[test]
@@ -75369,6 +76445,39 @@ mod tests {
             bytes.is_empty() || bytes[0] != 0,
             "{what}: expected no error, got {:02x?}",
             bytes
+        );
+    }
+
+    /// CWCursor on CreateWindow takes effect like ChangeWindowAttributes'
+    /// (Xorg `CreateWindow` → `ChangeWindowAttributes`): the window keeps
+    /// the cursor and the backend shows it; an unknown cursor is BadCursor.
+    #[test]
+    fn create_window_cursor_is_kept_and_forwarded() {
+        const CURSOR: ResourceId = ResourceId(0x0080_0010);
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.resources.create_glyph_cursor(ClientId(1), CURSOR);
+        state.resources.set_cursor_host_xid(
+            CURSOR,
+            crate::backend::CursorHandle::from_raw(0x00ab_0001).unwrap(),
+        );
+        let body = border_create_body(0x0080_0001, ROOT_WINDOW.0, 0x4000, &[CURSOR.0]);
+        let calls = run_border_request_recording(&mut state, 1, 0, &body);
+        assert_no_error(&read_all_available(&mut peer), "CreateWindow with a cursor");
+        let window = state.resources.window(ResourceId(0x0080_0001)).unwrap();
+        assert_eq!(window.cursor, Some(CURSOR));
+        let host = window.host_xid.unwrap().as_raw();
+        assert!(calls.contains(&RecordedCall::DefineCursor {
+            host_window_xid: host,
+            cursor_host_xid: 0x00ab_0001,
+        }));
+
+        let body = border_create_body(0x0080_0002, ROOT_WINDOW.0, 0x4000, &[0x0080_0011]);
+        run_border_request(&mut state, 1, 0, &body);
+        assert_error_code(
+            &read_all_available(&mut peer),
+            x11::error::BAD_CURSOR,
+            "unknown cursor",
         );
     }
 
@@ -82337,5 +83446,130 @@ mod tests {
             vec![(x11::error::BAD_DRAWABLE, 0x00DE_AD00)],
         );
         assert!(state.resources.picture(ResourceId(PIC)).is_none());
+    }
+
+    /// A GTK bin window taller than its viewport, inside an xfwm4 frame
+    /// under the compositor: frame F (756x534, Manual-redirected through
+    /// root), client C at (5,29) 746x500, bin window V at (8,8) 730x531.
+    /// Xorg clips a child's clip list to its parent's
+    /// (`mi/mivaltree.c:390`), so V can hold only its rows above C's
+    /// bottom edge, 500 - 8 = 492 of them; a redirected window stops the
+    /// walk, being clipped to itself only.
+    #[test]
+    fn content_within_ancestors_stops_at_the_parents_edge() {
+        use crate::server::{CompositeRedirectMode, RedirectRecord};
+        let mut state = make_test_state();
+        state
+            .composite_redirects
+            .redirect_subwindows(
+                ROOT_WINDOW,
+                &[],
+                RedirectRecord {
+                    mode: CompositeRedirectMode::Manual,
+                    owner: ClientId(1),
+                },
+            )
+            .unwrap();
+        let (f, c, v) = (
+            ResourceId(0x0040_0001),
+            ResourceId(0x0040_0002),
+            ResourceId(0x0040_0003),
+        );
+        seed_window(&mut state, f, ROOT_WINDOW, 756, 534);
+        seed_window(&mut state, c, f, 746, 500);
+        seed_window(&mut state, v, c, 730, 531);
+        for (w, x, y) in [(f, 900, 400), (c, 5, 29), (v, 8, 8)] {
+            let w = state.resources.window_mut(w).unwrap();
+            (w.x, w.y) = (x, y);
+        }
+        let rect = |width, height| x11::xfixes::RegionRect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        assert_eq!(content_within_ancestors(&state, v), rect(730, 492));
+        assert_eq!(content_within_ancestors(&state, c), rect(746, 500));
+        // F's own redirect ends the walk before the root's edge.
+        state.resources.window_mut(f).unwrap().x = 32000;
+        assert_eq!(content_within_ancestors(&state, f), rect(756, 534));
+        assert_eq!(content_within_ancestors(&state, v), rect(730, 492));
+    }
+
+    /// GDK clips a native child of a client-side window with its bounding
+    /// shape and shifts the shape when it scrolls. Xorg's `miSetShape`
+    /// (`mi/miwindow.c:637-677`) then exposes what the window no longer
+    /// covers to its parent and what it newly covers to itself — the
+    /// parent's button bar is repainted only on that Expose. Measured on
+    /// Xorg 21.1 by tools/vng-scenarios/child-clip-probe.c: the shape
+    /// (0,0 170x60) of V at (10,10) becoming (0,30 170x60) exposes
+    /// P 10,10 170x30 and V 0,60 170x30.
+    #[test]
+    fn bounding_shape_change_exposes_what_it_uncovers_and_covers() {
+        use yserver_protocol::x11::{shape as x11shape, xfixes::RegionRect};
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let (p, v) = (ResourceId(0x1c0_0001), ResourceId(0x1c0_0002));
+        seed_window(&mut state, p, ROOT_WINDOW, 190, 100);
+        seed_window(&mut state, v, p, 170, 120);
+        for w in [p, v] {
+            state.resources.window_mut(w).unwrap().map_state = crate::resources::MapState::Viewable;
+        }
+        let vw = state.resources.window_mut(v).unwrap();
+        (vw.x, vw.y) = (10, 10);
+        crate::nested::set_shape_rects(
+            &mut state,
+            v,
+            x11shape::KIND_BOUNDING,
+            vec![RegionRect {
+                x: 0,
+                y: 0,
+                width: 170,
+                height: 60,
+            }],
+        );
+        let client = state.clients.get_mut(&1).unwrap();
+        client.event_masks.insert(p, 0x0000_8000);
+        client.event_masks.insert(v, 0x0000_8000);
+
+        // RECTANGLES body: op kind ordering pad dest(4) x_off(2) y_off(2) rects.
+        let mut body = vec![x11shape::OP_SET, x11shape::KIND_BOUNDING, 0, 0];
+        body.extend_from_slice(&v.0.to_le_bytes());
+        body.extend_from_slice(&[0; 4]);
+        for field in [0u16, 30, 170, 60] {
+            body.extend_from_slice(&field.to_le_bytes());
+        }
+        let header = yserver_protocol::x11::RequestHeader {
+            opcode: 129,
+            data: x11shape::RECTANGLES,
+            length_units: 6,
+        };
+        handle_shape_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &body,
+        )
+        .expect("ShapeRectangles");
+
+        let exposes: Vec<(u32, [u16; 4])> = read_all_available(&mut peer)
+            .chunks_exact(32)
+            .filter(|e| e[0] & 0x7f == 12)
+            .map(|e| {
+                let at = |i: usize| u16::from_le_bytes([e[i], e[i + 1]]);
+                (
+                    u32::from_le_bytes([e[4], e[5], e[6], e[7]]),
+                    [at(8), at(10), at(12), at(14)],
+                )
+            })
+            .collect();
+        assert_eq!(
+            exposes,
+            vec![(p.0, [10, 10, 170, 30]), (v.0, [0, 60, 170, 30])]
+        );
     }
 }
