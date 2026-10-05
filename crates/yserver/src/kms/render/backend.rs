@@ -276,9 +276,21 @@ struct SharedBackingMoveSource {
 struct FloatingKeyboardState {
     xkb_state: crate::kms::core::XkbState,
     down_keys: HashSet<u8>,
-    lock_filter_priv_by_key: HashMap<u8, u32>,
+    lock_filter_priv_by_key: HashMap<u8, LockFilterPriv>,
     locked_group: u8,
 }
+
+/// The XkbFilterLockState data captured for a held LockMods key. Xorg stores
+/// both the pre-press locked bits and the up action; `LockNoUnlock` suppresses
+/// clearing those bits when the detached key is released.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LockFilterPriv {
+    pre_press_locked_mods: u32,
+    no_unlock: bool,
+}
+
+/// XkbSA_LockNoUnlock (`LockMods(..., affect=lock)`).
+const XKB_SA_LOCK_NO_UNLOCK: u8 = 0x02;
 
 /// #133 step 6 (P8) — what [`KmsBackend::sync_window_leaf_storage`]
 /// does with the pixels a window's leaf storage already holds when it
@@ -1781,9 +1793,9 @@ pub struct KmsBackend {
     /// Independent XKB cooking states for keyboard slaves detached by an
     /// explicit XI2 grab. The XI device ID is stable for the grab lifetime.
     floating_keyboard_states: HashMap<u16, FloatingKeyboardState>,
-    /// Xorg's XkbFilterLockState `filter->priv`: locked modifier bits that
-    /// were set before each held LockMods key press.
-    lock_filter_priv_by_device: HashMap<u16, HashMap<u8, u32>>,
+    /// Xorg's XkbFilterLockState `filter->priv` and `filter->upAction` for
+    /// each held LockMods key.
+    lock_filter_priv_by_device: HashMap<u16, HashMap<u8, LockFilterPriv>>,
     /// Core-channel sender for backend-originated shutdowns. Handed in via
     /// `set_input_sender` after the channel is created in `lib.rs`.
     input_sender: Option<yserver_core::core_loop::CoreSender>,
@@ -12435,16 +12447,20 @@ impl KmsBackend {
         mask
     }
 
-    fn lock_modifiers_action_mask(&self, keycode: u8) -> u32 {
-        self.core
-            .xkb_desc
-            .acts
-            .get(usize::from(keycode))
-            .into_iter()
-            .flatten()
-            .flatten()
+    fn current_key_action(&self, keycode: u8) -> Option<crate::kms::xkb_desc::Action> {
+        let key = xkbcommon::xkb::Keycode::new(u32::from(keycode));
+        let layout = self.core.xkb_state.0.key_get_layout(key);
+        let level = self.core.xkb_state.0.key_get_level(key, layout);
+        let layout = usize::try_from(layout).ok()?;
+        let level = usize::try_from(level).ok()?;
+        let width = usize::from(self.core.xkb_desc.keys[usize::from(keycode)].width);
+        let slot = layout.checked_mul(width)?.checked_add(level)?;
+        Some(self.core.xkb_desc.key_action(keycode, slot))
+    }
+
+    fn lock_modifiers_action(&self, keycode: u8) -> Option<crate::kms::xkb_desc::Action> {
+        self.current_key_action(keycode)
             .filter(|action| action[0] == crate::kms::xkb_desc::SA_LOCK_MODS)
-            .fold(0, |mask, action| mask | u32::from(action[2]))
     }
 
     fn synchronize_floating_keyboard_states(&mut self, state: &ServerState) {
@@ -12499,49 +12515,40 @@ impl KmsBackend {
                 .collect();
             let mut lock_filter_priv_by_key = HashMap::new();
             for keycode in &down_keys {
-                let xkb_keycode = xkbcommon::xkb::Keycode::new(u32::from(*keycode));
-                let keymap = &self.core.xkb_keymap.0;
-                let lock_action_key = (0..keymap.num_layouts_for_key(xkb_keycode)).any(|layout| {
-                    (0..keymap.num_levels_for_key(xkb_keycode, layout)).any(|level| {
-                        keymap
-                            .key_get_syms_by_level(xkb_keycode, layout, level)
-                            .iter()
-                            .any(|keysym| {
-                                matches!(
-                                    keysym.raw(),
-                                    xkbcommon::xkb::keysyms::KEY_Caps_Lock
-                                        | xkbcommon::xkb::keysyms::KEY_Shift_Lock
-                                        | xkbcommon::xkb::keysyms::KEY_Num_Lock
-                                        | xkbcommon::xkb::keysyms::KEY_Scroll_Lock
-                                        | xkbcommon::xkb::keysyms::KEY_ISO_Lock
-                                        | xkbcommon::xkb::keysyms::KEY_ISO_Level3_Lock
-                                        | xkbcommon::xkb::keysyms::KEY_ISO_Level5_Lock
-                                        | xkbcommon::xkb::keysyms::KEY_ISO_Group_Lock
-                                        | xkbcommon::xkb::keysyms::KEY_ISO_Next_Group_Lock
-                                        | xkbcommon::xkb::keysyms::KEY_ISO_Prev_Group_Lock
-                                        | xkbcommon::xkb::keysyms::KEY_ISO_First_Group_Lock
-                                        | xkbcommon::xkb::keysyms::KEY_ISO_Last_Group_Lock
-                                )
-                            })
-                    })
-                });
-                if lock_action_key {
-                    // The master's copied locked state already includes the
-                    // held lock key's action. Xorg retains its filter across
-                    // DetachFromMaster and clears only filter->priv on keyup
-                    // (xkb/xkbActions.c:372-383). Preserve those pre-press
-                    // bits for the floating release instead of replaying a
-                    // second LockMods press.
-                    if let Some(priv_bits) = self
-                        .lock_filter_priv_by_device
-                        .get(&device_id)
-                        .and_then(|held| held.get(keycode))
-                    {
-                        lock_filter_priv_by_key.insert(*keycode, *priv_bits);
-                    }
+                // Xorg keeps the active LockMods filter on the held key
+                // across DetachFromMaster (xkb/xkbActions.c:372-384). Preserve
+                // its up-action data for the floating release.
+                if let Some(filter) = self
+                    .lock_filter_priv_by_device
+                    .get(&device_id)
+                    .and_then(|held| held.get(keycode))
+                {
+                    lock_filter_priv_by_key.insert(*keycode, *filter);
                     continue;
                 }
-                xkb_state.update_key(xkb_keycode, xkbcommon::xkb::KeyDirection::Down);
+
+                // The attached press has already changed the master state
+                // copied above. LockMods and LockGroup both use
+                // _XkbFilterLockState (xkb/xkbActions.c:362-384); LockGroup
+                // updates locked_group on press (:362-367). ISOLock has a
+                // separate filter that can change locked modifiers/group
+                // (:397-440). DetachFromMaster only changes attachment
+                // (dix/events.c:1461-1468), so replaying those selected
+                // actions would apply a second lock to the floating state.
+                if self.current_key_action(*keycode).is_some_and(|action| {
+                    matches!(
+                        action[0],
+                        crate::kms::xkb_desc::SA_LOCK_MODS
+                            | crate::kms::xkb_desc::SA_LOCK_GROUP
+                            | crate::kms::xkb_desc::SA_ISO_LOCK
+                    )
+                }) {
+                    continue;
+                }
+                xkb_state.update_key(
+                    xkbcommon::xkb::Keycode::new(u32::from(*keycode)),
+                    xkbcommon::xkb::KeyDirection::Down,
+                );
             }
             self.floating_keyboard_states.insert(
                 device_id,
@@ -12598,7 +12605,9 @@ impl KmsBackend {
                 xkbcommon::xkb::KeyDirection::Up
             },
         );
-        if let Some(priv_bits) = lock_filter_priv {
+        if let Some(filter) = lock_filter_priv
+            && !filter.no_unlock
+        {
             let xkb_state = &mut floating.xkb_state.0;
             let locked_mods = xkb_state.serialize_mods(xkbcommon::xkb::STATE_MODS_LOCKED);
             let depressed_mods = xkb_state.serialize_mods(xkbcommon::xkb::STATE_MODS_DEPRESSED);
@@ -12607,13 +12616,14 @@ impl KmsBackend {
                 xkb_state.serialize_layout(xkbcommon::xkb::STATE_LAYOUT_DEPRESSED);
             let latched_layout = xkb_state.serialize_layout(xkbcommon::xkb::STATE_LAYOUT_LATCHED);
             let locked_layout = xkb_state.serialize_layout(xkbcommon::xkb::STATE_LAYOUT_LOCKED);
-            // XkbFilterLockState release: `locked_mods &= ~filter->priv`.
+            // XkbFilterLockState release clears `filter->priv` only when
+            // LockNoUnlock is absent (xkb/xkbActions.c:382-384).
             // xkb_state_update_mask preserves the other components while
             // replacing only that saved lock subset.
             xkb_state.update_mask(
                 depressed_mods,
                 latched_mods,
-                locked_mods & !priv_bits,
+                locked_mods & !filter.pre_press_locked_mods,
                 depressed_layout,
                 latched_layout,
                 locked_layout,
@@ -20988,22 +20998,27 @@ impl KmsBackend {
         };
         if !floating_keyboard && let Some(device_id) = keyboard_device_id {
             if raw.pressed {
-                let action_mask = self.lock_modifiers_action_mask(raw.keycode);
-                if action_mask != 0 {
+                if let Some(action) = self.lock_modifiers_action(raw.keycode) {
                     let locked_mods = self
                         .core
                         .xkb_state
                         .0
                         .serialize_mods(xkbcommon::xkb::STATE_MODS_LOCKED);
-                    let priv_bits = if transition.master_accepted {
-                        locked_mods & action_mask
+                    let pre_press_locked_mods = if transition.master_accepted {
+                        locked_mods & u32::from(action[2])
                     } else {
                         0
                     };
                     self.lock_filter_priv_by_device
                         .entry(device_id)
                         .or_default()
-                        .insert(raw.keycode, priv_bits);
+                        .insert(
+                            raw.keycode,
+                            LockFilterPriv {
+                                pre_press_locked_mods,
+                                no_unlock: action[1] & XKB_SA_LOCK_NO_UNLOCK != 0,
+                            },
+                        );
                 }
             } else if let Some(held) = self.lock_filter_priv_by_device.get_mut(&device_id) {
                 held.remove(&raw.keycode);
@@ -34700,7 +34715,8 @@ mod tests {
     }
 
     #[test]
-    fn xi_dynamic_caps_lock_release_after_keyboard_grab_preserves_locked_state() {
+    // Mutation killed: save the action mask as filter->priv instead of only its pre-press locked bits.
+    fn xi_lockmods_default_caps_from_unlocked_survives_keyboard_grab() {
         use yserver_core::{
             backend::Backend,
             core_loop::{DeviceInfo, HostInputEvent, InputOrigin, process_request},
@@ -34904,7 +34920,488 @@ mod tests {
     }
 
     #[test]
-    fn xi_dynamic_caps_lock_release_after_keyboard_grab_clears_saved_prepress_lock() {
+    // Mutation killed: ignore LockNoUnlock and unconditionally clear the saved Lock bit on floating release.
+    fn xi_lockmods_affect_lock_survives_floating_keyboard_release() {
+        use yserver_core::{
+            backend::Backend,
+            core_loop::{HostInputEvent, InputOrigin},
+            host_x11::HostKeyEvent,
+            resources::ROOT_WINDOW,
+            server::ServerState,
+            xinput::InputSourceId,
+        };
+
+        const CLIENT: u32 = 0xA742;
+        const SOURCE: InputSourceId = InputSourceId(0xA7421);
+        const CAPS_LOCK: u8 = 66;
+        const LETTER_A: u8 = 38;
+        const LOCK_MASK: u32 = 1 << 1;
+
+        fn set_caps_lock_action(mut action: [u8; 8], flags: u8) -> Vec<u8> {
+            let mut body = vec![0u8; 32];
+            body[0..2].copy_from_slice(&0x0100u16.to_le_bytes()); // XkbUseCoreKbd
+            body[2..4].copy_from_slice(&0x0010u16.to_le_bytes()); // XkbKeyActionsMask
+            body[6] = 8; // min_key_code
+            body[7] = 255; // max_key_code
+            body[14] = CAPS_LOCK; // first_key_act
+            body[15] = 1; // n_key_acts
+            body[16..18].copy_from_slice(&1u16.to_le_bytes()); // total_acts
+            body.extend_from_slice(&[1, 0, 0, 0]); // one action for Caps
+            action[1] = flags;
+            body.extend_from_slice(&action);
+            body
+        }
+
+        fn state_snapshot(backend: &KmsBackend, state: &ServerState) -> String {
+            format!(
+                "{:?}",
+                (
+                    (
+                        state
+                            .xi_devices
+                            .devices()
+                            .iter()
+                            .map(|device| (
+                                device.id,
+                                device.source_id,
+                                device.facet,
+                                device.enabled,
+                                device.attached_master,
+                                device.buttons_down,
+                                device.properties.clone(),
+                            ))
+                            .collect::<Vec<_>>(),
+                        state.keys_down,
+                        state.buttons_down,
+                        state.key_down_by_device.clone(),
+                        state.xi2_detached_masters.clone(),
+                        state.floating_pointer_positions.clone(),
+                        state.xi2_keyboard_grabs.clone(),
+                    ),
+                    (
+                        state.clients[&CLIENT].xi2_masks.clone(),
+                        state.clients[&CLIENT].xi1_event_classes.clone(),
+                        state.clients[&CLIENT].xi1_window_event_classes.clone(),
+                        backend
+                            .floating_keyboard_states
+                            .keys()
+                            .copied()
+                            .collect::<Vec<_>>(),
+                        backend.lock_filter_priv_by_device.clone(),
+                        backend.core.xkb_desc.acts[usize::from(CAPS_LOCK)].clone(),
+                        backend
+                            .core
+                            .xkb_state
+                            .0
+                            .serialize_mods(xkbcommon::xkb::STATE_MODS_LOCKED),
+                    ),
+                )
+            )
+        }
+
+        let mut backend = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        backend
+            .core
+            .xid_map
+            .insert(backend.core.window_id, ROOT_WINDOW);
+        let mut peer = kbd_map_client_id(&mut state, CLIENT);
+        xkb_client_request(&mut state, &mut backend, CLIENT, 136, 0, &[1, 0, 0, 0]);
+        assert_eq!(kbd_map_drain(&mut peer)[0], 1, "XkbUseExtension reply");
+        let baseline = state_snapshot(&backend, &state);
+        let original_caps_action = backend.core.xkb_desc.acts[usize::from(CAPS_LOCK)].clone();
+        let original_caps_action_value = original_caps_action.as_ref().unwrap()[0];
+
+        // The supported action writer must retain LockNoUnlock from this real SetMap request.
+        xkb_client_request(
+            &mut state,
+            &mut backend,
+            CLIENT,
+            136,
+            9,
+            &set_caps_lock_action(original_caps_action_value, 0x02),
+        );
+        assert_eq!(
+            backend.core.xkb_desc.acts[usize::from(CAPS_LOCK)]
+                .as_ref()
+                .map(|actions| actions[0]),
+            Some([
+                original_caps_action_value[0],
+                0x02,
+                original_caps_action_value[2],
+                original_caps_action_value[3],
+                original_caps_action_value[4],
+                original_caps_action_value[5],
+                original_caps_action_value[6],
+                original_caps_action_value[7],
+            ]),
+            "SetMap and the keymap writer retain LockMods(affect=lock)",
+        );
+        let _ = kbd_map_drain(&mut peer);
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceAdded(dynamic_test_device(SOURCE, true, false)),
+        );
+        let keyboard_id = state
+            .xi_devices
+            .facet(SOURCE, yserver_core::xinput::XiFacetKind::Keyboard)
+            .expect("physical keyboard facet follows production add path");
+        let key = |keycode, pressed| {
+            HostInputEvent::Key(HostKeyEvent {
+                origin: InputOrigin::Physical(SOURCE),
+                pressed,
+                keycode,
+                time: 10,
+                root_x: 0,
+                root_y: 0,
+                event_x: 0,
+                event_y: 0,
+                state: 0,
+            })
+        };
+
+        // First turn Lock on; the second press is the held action crossing the grab.
+        Backend::on_host_input(&mut backend, &mut state, key(CAPS_LOCK, true));
+        Backend::on_host_input(&mut backend, &mut state, key(CAPS_LOCK, false));
+        assert_eq!(
+            backend
+                .core
+                .xkb_state
+                .0
+                .serialize_mods(xkbcommon::xkb::STATE_MODS_LOCKED)
+                & LOCK_MASK,
+            LOCK_MASK,
+            "Lock is on before the held press",
+        );
+        Backend::on_host_input(&mut backend, &mut state, key(CAPS_LOCK, true));
+        assert!(state.key_down_by_device[&keyboard_id].contains_key(&CAPS_LOCK));
+
+        process_dynamic_test_keyboard_grab(&mut backend, &mut state, CLIENT, keyboard_id, 2);
+        let _ = kbd_map_drain(&mut peer);
+        assert_eq!(
+            state
+                .xi_devices
+                .device(keyboard_id)
+                .unwrap()
+                .attached_master,
+            None
+        );
+        assert!(
+            backend.floating_keyboard_states[&keyboard_id]
+                .down_keys
+                .contains(&CAPS_LOCK)
+        );
+
+        Backend::on_host_input(&mut backend, &mut state, key(CAPS_LOCK, false));
+        assert_eq!(
+            backend.floating_keyboard_states[&keyboard_id]
+                .xkb_state
+                .0
+                .serialize_mods(xkbcommon::xkb::STATE_MODS_LOCKED)
+                & LOCK_MASK,
+            LOCK_MASK,
+            "LockNoUnlock keeps the inherited Lock bit on floating release",
+        );
+
+        Backend::on_host_input(&mut backend, &mut state, key(LETTER_A, true));
+        assert_eq!(
+            backend.floating_keyboard_states[&keyboard_id]
+                .xkb_state
+                .0
+                .serialize_mods(xkbcommon::xkb::STATE_MODS_LOCKED)
+                & LOCK_MASK,
+            LOCK_MASK,
+            "the next floating key is cooked with Lock still enabled",
+        );
+        Backend::on_host_input(&mut backend, &mut state, key(LETTER_A, false));
+        assert!(
+            backend.floating_keyboard_states[&keyboard_id]
+                .down_keys
+                .is_empty()
+        );
+
+        process_dynamic_test_keyboard_ungrab(&mut backend, &mut state, CLIENT, keyboard_id, 3);
+        let _ = kbd_map_drain(&mut peer);
+        assert!(!state.xi2_keyboard_grabs.contains_key(&keyboard_id));
+        assert!(!state.xi2_detached_masters.contains_key(&keyboard_id));
+        assert!(!backend.floating_keyboard_states.contains_key(&keyboard_id));
+
+        // Restore the original action and clear the master key/Lock state through host input.
+        xkb_client_request(
+            &mut state,
+            &mut backend,
+            CLIENT,
+            136,
+            9,
+            &set_caps_lock_action(original_caps_action_value, original_caps_action_value[1]),
+        );
+        let _ = kbd_map_drain(&mut peer);
+        for _ in 0..3 {
+            if backend
+                .core
+                .xkb_state
+                .0
+                .serialize_mods(xkbcommon::xkb::STATE_MODS_LOCKED)
+                & LOCK_MASK
+                == 0
+            {
+                break;
+            }
+            Backend::on_host_input(&mut backend, &mut state, key(CAPS_LOCK, true));
+            Backend::on_host_input(&mut backend, &mut state, key(CAPS_LOCK, false));
+        }
+        assert_eq!(
+            backend
+                .core
+                .xkb_state
+                .0
+                .serialize_mods(xkbcommon::xkb::STATE_MODS_LOCKED)
+                & LOCK_MASK,
+            0,
+            "cleanup restores the starting Lock state",
+        );
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceRemoved { source_id: SOURCE },
+        );
+        assert_eq!(state_snapshot(&backend, &state), baseline);
+        assert_eq!(
+            backend.core.xkb_desc.acts[usize::from(CAPS_LOCK)],
+            original_caps_action,
+            "cleanup restores the original Caps action",
+        );
+    }
+
+    #[test]
+    // Mutation killed: replay a held SA_LOCK_GROUP key with update_key(Down) when detaching, applying the relative lock twice.
+    fn xi_lockmods_held_group_lock_key_is_not_replayed_on_detach() {
+        use yserver_core::{
+            backend::Backend,
+            core_loop::{HostInputEvent, InputOrigin},
+            host_x11::HostKeyEvent,
+            resources::ROOT_WINDOW,
+            server::ServerState,
+            xinput::{InputSourceId, XiFacetKind},
+        };
+
+        const CLIENT: u32 = 0xA743;
+        const SOURCE: InputSourceId = InputSourceId(0xA7431);
+        const GROUP_LOCK_KEY: u8 = 38;
+        const LOCK_GROUP_ACTION: [u8; 8] = [0x06, 0, 1, 0, 0, 0, 0, 0];
+
+        fn set_key_actions(keycode: u8, action_slots: usize, action: [u8; 8]) -> Vec<u8> {
+            let mut body = vec![0u8; 32];
+            body[0..2].copy_from_slice(&0x0100u16.to_le_bytes()); // XkbUseCoreKbd
+            body[2..4].copy_from_slice(&0x0010u16.to_le_bytes()); // XkbKeyActionsMask
+            body[6] = 8; // min_key_code
+            body[7] = 255; // max_key_code
+            body[14] = keycode; // first_key_act
+            body[15] = 1; // one key
+            body[16..18].copy_from_slice(&u16::try_from(action_slots).unwrap().to_le_bytes());
+            body.extend_from_slice(&[u8::try_from(action_slots).unwrap(), 0, 0, 0]);
+            for _ in 0..action_slots {
+                body.extend_from_slice(&action);
+            }
+            body
+        }
+
+        fn state_snapshot(backend: &KmsBackend, state: &ServerState) -> String {
+            format!(
+                "{:?}",
+                (
+                    (
+                        state
+                            .xi_devices
+                            .devices()
+                            .iter()
+                            .map(|device| (
+                                device.id,
+                                device.source_id,
+                                device.facet,
+                                device.enabled,
+                                device.attached_master,
+                                device.buttons_down,
+                                device.properties.clone(),
+                            ))
+                            .collect::<Vec<_>>(),
+                        state.keys_down,
+                        state.buttons_down,
+                        state.key_down_by_device.clone(),
+                        state.xi2_detached_masters.clone(),
+                        state.floating_pointer_positions.clone(),
+                        state.xi2_keyboard_grabs.clone(),
+                    ),
+                    (
+                        state.clients[&CLIENT].xi2_masks.clone(),
+                        state.clients[&CLIENT].xi1_event_classes.clone(),
+                        state.clients[&CLIENT].xi1_window_event_classes.clone(),
+                    ),
+                    (
+                        backend
+                            .floating_keyboard_states
+                            .keys()
+                            .copied()
+                            .collect::<Vec<_>>(),
+                        backend.lock_filter_priv_by_device.clone(),
+                        backend.core.xkb_desc.acts[usize::from(GROUP_LOCK_KEY)].clone(),
+                        backend
+                            .core
+                            .xkb_state
+                            .0
+                            .serialize_layout(xkbcommon::xkb::STATE_LAYOUT_LOCKED),
+                        backend.core.locked_group,
+                    ),
+                )
+            )
+        }
+
+        let mut backend = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        backend
+            .core
+            .xid_map
+            .insert(backend.core.window_id, ROOT_WINDOW);
+        let mut peer = kbd_map_client_id(&mut state, CLIENT);
+        xkb_client_request(&mut state, &mut backend, CLIENT, 136, 0, &[1, 0, 0, 0]);
+        assert_eq!(kbd_map_drain(&mut peer)[0], 1, "XkbUseExtension reply");
+        let baseline = state_snapshot(&backend, &state);
+        let original_rmlvo = backend.core.xkb_rmlvo.clone();
+
+        // A second layout makes a duplicate relative LockGroup press observable.
+        let multigroup_rmlvo = crate::kms::core::XkbRmlvo {
+            layout: "us,ru".to_owned(),
+            ..original_rmlvo.clone()
+        };
+        assert!(backend.core.recompile_keymap(&multigroup_rmlvo).is_some());
+        assert_eq!(backend.core.keymap_group_count(), 2);
+        let action_slots = backend.core.xkb_desc.keys[usize::from(GROUP_LOCK_KEY)].num_syms();
+        assert!(
+            action_slots >= 2,
+            "the key has symbol slots in both layouts and levels"
+        );
+        xkb_client_request(
+            &mut state,
+            &mut backend,
+            CLIENT,
+            136,
+            9,
+            &set_key_actions(GROUP_LOCK_KEY, action_slots, LOCK_GROUP_ACTION),
+        );
+        assert!(
+            backend.core.xkb_desc.acts[usize::from(GROUP_LOCK_KEY)]
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|action| action[0] == crate::kms::xkb_desc::SA_LOCK_GROUP),
+            "the real SetMap request assigns LockGroup(+1) at every key level",
+        );
+        let _ = kbd_map_drain(&mut peer);
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceAdded(dynamic_test_device(SOURCE, true, false)),
+        );
+        let keyboard_id = state
+            .xi_devices
+            .facet(SOURCE, XiFacetKind::Keyboard)
+            .expect("physical keyboard facet follows production add path");
+        let key = |pressed| {
+            HostInputEvent::Key(HostKeyEvent {
+                origin: InputOrigin::Physical(SOURCE),
+                pressed,
+                keycode: GROUP_LOCK_KEY,
+                time: 10,
+                root_x: 0,
+                root_y: 0,
+                event_x: 0,
+                event_y: 0,
+                state: 0,
+            })
+        };
+
+        Backend::on_host_input(&mut backend, &mut state, key(true));
+        assert_eq!(
+            backend.core.locked_group, 1,
+            "the attached press locks group 2"
+        );
+        assert!(state.key_down_by_device[&keyboard_id].contains_key(&GROUP_LOCK_KEY));
+
+        process_dynamic_test_keyboard_grab(&mut backend, &mut state, CLIENT, keyboard_id, 2);
+        let _ = kbd_map_drain(&mut peer);
+        assert_eq!(
+            state
+                .xi_devices
+                .device(keyboard_id)
+                .unwrap()
+                .attached_master,
+            None,
+            "XIGrabDevice floats the held keyboard",
+        );
+        assert_eq!(
+            backend.floating_keyboard_states[&keyboard_id]
+                .xkb_state
+                .0
+                .serialize_layout(xkbcommon::xkb::STATE_LAYOUT_LOCKED),
+            1,
+            "detachment inherits the one locked group without replaying LockGroup; master locked={:?}, floating cached={}",
+            backend
+                .core
+                .xkb_state
+                .0
+                .serialize_layout(xkbcommon::xkb::STATE_LAYOUT_LOCKED),
+            backend.floating_keyboard_states[&keyboard_id].locked_group,
+        );
+
+        Backend::on_host_input(&mut backend, &mut state, key(false));
+        assert_eq!(
+            backend.floating_keyboard_states[&keyboard_id]
+                .xkb_state
+                .0
+                .serialize_layout(xkbcommon::xkb::STATE_LAYOUT_LOCKED),
+            1,
+            "releasing the held LockGroup key does not lock a second group",
+        );
+        assert!(
+            state
+                .key_down_by_device
+                .get(&keyboard_id)
+                .is_none_or(std::collections::HashMap::is_empty)
+        );
+        process_dynamic_test_keyboard_ungrab(&mut backend, &mut state, CLIENT, keyboard_id, 3);
+        let _ = kbd_map_drain(&mut peer);
+        assert!(!state.xi2_keyboard_grabs.contains_key(&keyboard_id));
+        assert!(!state.xi2_detached_masters.contains_key(&keyboard_id));
+        assert!(!backend.floating_keyboard_states.contains_key(&keyboard_id));
+
+        // The master accepted the initial press but does not receive the floating
+        // release. After reattachment, reconcile that master hold through real
+        // host input, then use the same LockGroup action to return to group 1.
+        Backend::on_host_input(&mut backend, &mut state, key(true));
+        Backend::on_host_input(&mut backend, &mut state, key(false));
+        Backend::on_host_input(&mut backend, &mut state, key(true));
+        Backend::on_host_input(&mut backend, &mut state, key(false));
+        assert_eq!(backend.core.locked_group, 0);
+        assert_eq!(
+            state.keys_down[usize::from(GROUP_LOCK_KEY / 8)] & (1 << (GROUP_LOCK_KEY % 8)),
+            0
+        );
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceRemoved { source_id: SOURCE },
+        );
+        assert!(backend.core.recompile_keymap(&original_rmlvo).is_some());
+        assert_eq!(state_snapshot(&backend, &state), baseline);
+    }
+
+    #[test]
+    // Mutation killed: treat the default action as LockNoUnlock and fail to clear its saved pre-press Lock bit.
+    fn xi_lockmods_default_caps_clears_saved_prepress_lock_after_keyboard_grab() {
         use yserver_core::{
             backend::Backend,
             core_loop::{HostInputEvent, InputOrigin, process_request},
@@ -34982,7 +35479,8 @@ mod tests {
         Backend::on_host_input(&mut backend, &mut state, key(true));
         assert!(state.key_down_by_device[&keyboard_id].contains_key(&CAPS_LOCK));
         assert_eq!(
-            backend.lock_filter_priv_by_device[&keyboard_id][&CAPS_LOCK], LOCK_MASK,
+            backend.lock_filter_priv_by_device[&keyboard_id][&CAPS_LOCK].pre_press_locked_mods,
+            LOCK_MASK,
             "the floating release carries Xorg's pre-press Lock bit",
         );
 
