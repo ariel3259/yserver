@@ -50,11 +50,15 @@ source XIQueryDevice uses), for slaves and masters. Follow the Xorg handlers
 (`Xi/getbmap.c`, `Xi/setbmap.c`, `Xi/queryst.c`) for errors and layout.
 
 **Tests (B through the dispatcher):**
-1. On 4: GetDeviceButtonMapping returns 10 entries, SetDeviceButtonMapping
-   accepts a 10-entry map and rejects an 11-entry one as Xorg does, and
-   QueryDeviceState reports 10 buttons and 2 valuators. *Kills:* the
-   hard-coded 7/4.
-2. On a physical pointer: unchanged values.
+1. On 4: GetDeviceButtonMapping returns 10 entries, and QueryDeviceState
+   reports 10 buttons and 2 valuators. *Kills:* the hard-coded 7/4.
+2. SetDeviceButtonMapping has no length ceiling. Xorg's `ApplyPointerMapping`
+   (`dix/inpututils.c:43-124`, from `Xi/setbmap.c:95-123`) checks only the
+   request length, device access, and `MappingBusy` for a changed held button,
+   then copies the map. So a 10-entry and an 11-entry map on 4 both return
+   `MappingSuccess`. Remove the existing `map_length > XI1_NUM_BUTTONS`
+   BadValue. *Kills:* keeping a count ceiling.
+3. On a physical pointer: Get/Query values are unchanged.
 
 ### Task 3 — VT-release timeout cannot lose an applied write (G)
 
