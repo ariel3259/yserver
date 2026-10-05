@@ -1,19 +1,21 @@
-# C.0 stage 5 revision: Owner software clock, then Legacy removal
+# C.0 revision: Owner software clock (stage 3e), then Legacy removal (stage 5)
 
-**Status:** decision record, 2026-10-05 (user decision). The stage 5 design
-still has to be written and reviewed before implementation.
+**Status:** decision record, 2026-10-05 (user decision; revised the same day:
+the software clock moves from stage 5 to a new stage 3e). The stage 3e and
+stage 5 designs still have to be written and reviewed before implementation.
 **Amends:** [the C.0 design](2026-08-26-phase-c0-atomic-kms-migration-design.md)
 and [the stage 3 umbrella](2026-09-22-phase-c0-stage-3-lifecycle-design.md) §6.
 Where they disagree, this record wins.
 
 ## Decision
 
-Stage 5 is split in two parts:
+The work is split in two stages:
 
-- **5a: Owner software clock.** Devices without DRM vblank stop falling back
+- **Stage 3e: Owner software clock.** A new lifecycle sub-stage, after 3d
+  (recovery, quarantine, shutdown) and before stage 4. Devices without DRM vblank stop falling back
   to `Legacy` and run `Owner` with a software clock. Devices with DRM vblank
   keep the hardware clock (`KernelSequence`, GET/QUEUE_SEQUENCE).
-- **5b: Legacy removal.** Once 5a works on the no-vblank cohort, the `Legacy`
+- **Stage 5: Legacy removal.** Once 3e works on the no-vblank cohort, the `Legacy`
   route is deleted. That covers its transport state, legacy writers, legacy
   cursor/gamma paths and mixed Owner/Legacy servers.
 
@@ -47,7 +49,7 @@ the C.0 scope limit that created no software clock (C.0 design :1458, :3240,
   ([Arch forum](https://bbs.archlinux.org/viewtopic.php?id=300341),
   [NVIDIA forum, flip event timeout](https://forums.developer.nvidia.com/t/bug-570-124-04-freeze-on-monitor-wakeup-flip-event-timeout/325659)).
 
-## Requirements for 5a (to be specified in the stage 5 design)
+## Requirements for 3e (to be specified in the stage 3e design)
 
 1. **Anchor** the clock to each Owner commit's flip-complete event.
 2. **Snap** the anchor to the mode's refresh-period grid, to remove the
@@ -75,6 +77,14 @@ the C.0 scope limit that created no software clock (C.0 design :1458, :3240,
 
 ## Process
 
-Stage 5 follows the usual C.0 flow: a stage 5 design for 5a and 5b, codex
-review, split plans, then implementation. 5b starts only after 5a is accepted
-on the no-vblank cohort.
+Each stage follows the usual C.0 flow: design, codex review until no design
+defect, split plans, then implementation. Stage 3e starts after 3d is
+accepted; stage 5 starts only after 3e is accepted on the no-vblank cohort.
+
+**Why 3e and not stage 5:** stage 4 (the assembled Owner server, the deferred
+real-server tests and the upstream-fix revalidation) then validates both clocks
+once, instead of being repeated for the software clock after stage 5; and
+stage 5 shrinks to the Legacy deletion. 3e goes after 3d, not inside it,
+because the software clock changes the clock qualification that recovery's
+reinstall relies on, and its validation needs `vblank=0` runs with the user
+present.
