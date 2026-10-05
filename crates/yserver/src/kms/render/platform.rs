@@ -2567,6 +2567,9 @@ impl From<Rc<drm::Device>> for AttachedDrmDevice {
 
 pub(crate) struct KmsDevice {
     pub(crate) key: crate::platform::drm::DrmDeviceKey,
+    /// Primary-node path used to reopen this same kernel device after its fd
+    /// family has been closed.
+    pub(crate) device_path: std::path::PathBuf,
     pub(crate) device: AttachedDrmDevice,
     /// Complete descriptor/lease inventory for this Owner incarnation.
     pub(crate) incarnation_fd_set:
@@ -2585,6 +2588,30 @@ pub(crate) struct KmsDevice {
             crate::kms::render::resources::CommitResources,
         >,
     >,
+}
+
+impl KmsDevice {
+    pub(crate) fn from_reopened_device(
+        device: crate::kms::backend::PlatformInitDevice,
+        owner: crate::kms::owner::device::DeviceCommitOwner<
+            crate::kms::render::resources::CommitResources,
+        >,
+    ) -> Self {
+        let cursor = KmsCursorState::new_with_nvidia_policy(drm_device_is_nvidia(&device.device));
+        Self {
+            key: device.key,
+            device_path: device.device_path,
+            device: device.device.into(),
+            incarnation_fd_set: device.incarnation_fd_set,
+            helper_lease: Some(device.helper_lease),
+            helper_reaped: false,
+            event_reader_detached: false,
+            active_property_cache: Default::default(),
+            cursor,
+            executor: Some(device.executor),
+            owner: Some(owner),
+        }
+    }
 }
 
 /// A connector probe runs with the duplicated KMS file description supplied
@@ -3665,6 +3692,7 @@ impl PlatformBackend {
                 let (incarnation, lifecycle_epoch) = device.executor.owner_identity();
                 KmsDevice {
                     key: device.key,
+                    device_path: device.device_path,
                     device: device.device.into(),
                     incarnation_fd_set: device.incarnation_fd_set,
                     helper_lease: Some(device.helper_lease),
@@ -4178,6 +4206,7 @@ impl PlatformBackend {
             initial_scanout_rollback_armed: false,
             devices: vec![KmsDevice {
                 key: device_key,
+                device_path: std::path::PathBuf::from(device.path()),
                 device: device.into(),
                 incarnation_fd_set: Rc::new(std::cell::RefCell::new(
                     crate::kms::executor::IncarnationFdSet::new(),
@@ -6120,6 +6149,7 @@ impl PlatformBackend {
     ) {
         self.devices.push(KmsDevice {
             key,
+            device_path: std::path::PathBuf::from(device.path()),
             device: std::rc::Rc::new(device).into(),
             incarnation_fd_set: std::rc::Rc::new(std::cell::RefCell::new(
                 crate::kms::executor::IncarnationFdSet::new(),
@@ -6149,6 +6179,7 @@ impl PlatformBackend {
     ) {
         self.devices.push(KmsDevice {
             key,
+            device_path: std::path::PathBuf::from(device.path()),
             device: std::rc::Rc::new(device).into(),
             incarnation_fd_set: std::rc::Rc::new(std::cell::RefCell::new(
                 crate::kms::executor::IncarnationFdSet::new(),
@@ -6178,6 +6209,26 @@ impl PlatformBackend {
             }
         }
         events
+    }
+
+    pub(crate) fn poll_executor_handshakes(
+        &mut self,
+    ) -> Vec<(crate::platform::drm::DrmDeviceKey, std::io::Result<()>)> {
+        let mut results = Vec::new();
+        for device in &mut self.devices {
+            let Some(executor) = device.executor.as_mut() else {
+                continue;
+            };
+            if !executor.helper_handshake_pending() {
+                continue;
+            }
+            match executor.poll_helper_ready() {
+                Ok(Some(())) => results.push((device.key, Ok(()))),
+                Ok(None) => {}
+                Err(error) => results.push((device.key, Err(error))),
+            }
+        }
+        results
     }
 
     pub(crate) fn tick_executors(
@@ -11246,9 +11297,11 @@ mod tests {
     }
 
     fn test_kms_device(key: crate::platform::drm::DrmDeviceKey) -> KmsDevice {
+        let device = Rc::new(drm::Device::for_tests().expect("test DRM device"));
         KmsDevice {
             key,
-            device: Rc::new(drm::Device::for_tests().expect("test DRM device")).into(),
+            device_path: std::path::PathBuf::from(device.path()),
+            device: device.into(),
             incarnation_fd_set: Rc::new(std::cell::RefCell::new(
                 crate::kms::executor::IncarnationFdSet::new(),
             )),
@@ -11858,6 +11911,7 @@ mod tests {
         };
         platform.devices.push(KmsDevice {
             key: second_key,
+            device_path: std::path::PathBuf::from("/dev/null"),
             device: Rc::new(drm::Device::for_tests().expect("second test DRM device")).into(),
             incarnation_fd_set: Rc::new(std::cell::RefCell::new(
                 crate::kms::executor::IncarnationFdSet::new(),
@@ -11892,6 +11946,7 @@ mod tests {
                 major: 226,
                 minor: 1,
             },
+            device_path: std::path::PathBuf::from(second_device.path()),
             device: second_device.into(),
             incarnation_fd_set: Rc::new(std::cell::RefCell::new(
                 crate::kms::executor::IncarnationFdSet::new(),
@@ -12522,6 +12577,7 @@ mod tests {
         };
         platform.devices.push(KmsDevice {
             key: nvidia_key,
+            device_path: std::path::PathBuf::from("/dev/null"),
             device: Rc::new(drm::Device::for_tests().expect("test DRM device")).into(),
             incarnation_fd_set: Rc::new(std::cell::RefCell::new(
                 crate::kms::executor::IncarnationFdSet::new(),

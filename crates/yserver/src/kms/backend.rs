@@ -839,10 +839,145 @@ pub(crate) fn primary_output_center(outputs: &[ActiveOutput], fb_w: u16, fb_h: u
 /// One DRM/KMS device opened during platform bring-up.
 pub(crate) struct PlatformInitDevice {
     pub(crate) key: crate::platform::drm::DrmDeviceKey,
+    pub(crate) device_path: PathBuf,
     pub(crate) device: Rc<drm::Device>,
     pub(crate) executor: crate::kms::executor::KmsIoExecutor,
     pub(crate) incarnation_fd_set: Rc<std::cell::RefCell<crate::kms::executor::IncarnationFdSet>>,
     pub(crate) helper_lease: crate::kms::executor::LeaseId,
+}
+
+pub(crate) enum PlatformDeviceOpenError {
+    DeviceOpen(io::Error),
+    Initialization(io::Error),
+}
+
+pub(crate) const HELPER_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Open one KMS card and prepare its supervised executor. Startup and
+/// recovery share this path so both acquire DRM master, enable the same
+/// client capabilities, and account the helper lease identically.
+pub(crate) fn open_platform_init_device(
+    device_path: &Path,
+    incarnation: crate::kms::owner::identity::IncarnationId,
+    lifecycle_epoch: crate::kms::owner::lifecycle::LifecycleEpochId,
+    expected_key: Option<crate::platform::drm::DrmDeviceKey>,
+    opened: &[(crate::platform::drm::DrmDeviceKey, PathBuf)],
+) -> Result<PlatformInitDevice, PlatformDeviceOpenError> {
+    let (mut platform_device, inheritable_lock) = open_platform_init_device_unready(
+        device_path,
+        incarnation,
+        lifecycle_epoch,
+        expected_key,
+        opened,
+    )?;
+    platform_device
+        .executor
+        .await_helper_ready(HELPER_READY_TIMEOUT)
+        .map_err(|err| {
+            PlatformDeviceOpenError::Initialization(io::Error::new(
+                err.kind(),
+                format!(
+                    "yserver: KMS executor handshake failed for {}: {err}",
+                    device_path.display()
+                ),
+            ))
+        })?;
+    drop(inheritable_lock);
+    Ok(platform_device)
+}
+
+/// Recovery shares startup's device/master/capability/identity/lock/executor
+/// open path but returns with the inherited lock held by the executor. The
+/// core starts the handshake after installing the new entry and consumes its
+/// reply from the executor control fd.
+pub(crate) fn open_platform_init_device_for_recovery(
+    device_path: &Path,
+    incarnation: crate::kms::owner::identity::IncarnationId,
+    lifecycle_epoch: crate::kms::owner::lifecycle::LifecycleEpochId,
+    expected_key: Option<crate::platform::drm::DrmDeviceKey>,
+    opened: &[(crate::platform::drm::DrmDeviceKey, PathBuf)],
+) -> Result<PlatformInitDevice, PlatformDeviceOpenError> {
+    let (mut platform_device, inheritable_lock) = open_platform_init_device_unready(
+        device_path,
+        incarnation,
+        lifecycle_epoch,
+        expected_key,
+        opened,
+    )?;
+    platform_device
+        .executor
+        .hold_startup_lock_until_helper_ready(inheritable_lock);
+    Ok(platform_device)
+}
+
+fn open_platform_init_device_unready(
+    device_path: &Path,
+    incarnation: crate::kms::owner::identity::IncarnationId,
+    lifecycle_epoch: crate::kms::owner::lifecycle::LifecycleEpochId,
+    expected_key: Option<crate::platform::drm::DrmDeviceKey>,
+    opened: &[(crate::platform::drm::DrmDeviceKey, PathBuf)],
+) -> Result<
+    (
+        PlatformInitDevice,
+        crate::kms::executor::device_lock::InheritableDeviceLock,
+    ),
+    PlatformDeviceOpenError,
+> {
+    let path = device_path.to_string_lossy().into_owned();
+    let device = Rc::new(drm::Device::open(&path).map_err(PlatformDeviceOpenError::DeviceOpen)?);
+    let device_key =
+        crate::platform::drm::primary_device_key_from_fd(std::os::fd::AsFd::as_fd(&*device))
+            .map_err(PlatformDeviceOpenError::Initialization)?;
+    if let Some(expected_key) = expected_key
+        && device_key != expected_key
+    {
+        return Err(PlatformDeviceOpenError::Initialization(io::Error::new(
+            io::ErrorKind::NotConnected,
+            format!(
+                "DRM path {} now resolves to {device_key}, expected {expected_key}",
+                device_path.display()
+            ),
+        )));
+    }
+    validate_unique_kms_device_identity(opened, device_key, device_path)
+        .map_err(PlatformDeviceOpenError::Initialization)?;
+
+    let device_lock = crate::kms::executor::device_lock::acquire_device_lock_or_refuse(&device_key)
+        .map_err(PlatformDeviceOpenError::Initialization)?;
+    let inheritable_lock = device_lock.into_inheritable();
+    let incarnation_fd_set = Rc::new(std::cell::RefCell::new(
+        crate::kms::executor::IncarnationFdSet::new(),
+    ));
+    let helper_lease = incarnation_fd_set
+        .borrow_mut()
+        .register_alias_from(std::os::fd::AsFd::as_fd(&*device))
+        .map_err(PlatformDeviceOpenError::Initialization)?;
+    let executor = crate::kms::executor::KmsIoExecutor::spawn_with_device_lock(
+        std::os::fd::AsFd::as_fd(&*device),
+        incarnation,
+        lifecycle_epoch,
+        &inheritable_lock,
+    )
+    .map_err(|err| {
+        PlatformDeviceOpenError::Initialization(io::Error::new(
+            err.kind(),
+            format!(
+                "yserver: cannot start the KMS executor for {}: {err}",
+                device_path.display()
+            ),
+        ))
+    })?;
+    Ok((
+        PlatformInitDevice {
+            key: device_key,
+            device_path: device_path.to_path_buf(),
+            device,
+            executor,
+            incarnation_fd_set,
+            helper_lease,
+        },
+        inheritable_lock,
+    ))
 }
 
 /// Transient handoff from device discovery to the long-lived renderer.
@@ -1011,10 +1146,17 @@ pub(crate) fn platform_init(
     let mut layouts = Vec::new();
     let mut open_errors = Vec::new();
     for device_path in device_paths {
-        let device_path_str = device_path.to_string_lossy().into_owned();
-        let device = match drm::Device::open(&device_path_str) {
-            Ok(device) => Rc::new(device),
-            Err(err) => {
+        let incarnation = crate::kms::owner::identity::IncarnationId::first();
+        let lifecycle_epoch = crate::kms::owner::lifecycle::LifecycleEpochId::first();
+        let platform_device = match open_platform_init_device(
+            device_path,
+            incarnation,
+            lifecycle_epoch,
+            None,
+            &opened_device_paths,
+        ) {
+            Ok(device) => device,
+            Err(PlatformDeviceOpenError::DeviceOpen(err)) => {
                 log::warn!(
                     "yserver: skipping DRM device {}: open failed: {err}",
                     device_path.display()
@@ -1022,18 +1164,14 @@ pub(crate) fn platform_init(
                 open_errors.push(format!("{}: open failed: {err}", device_path.display()));
                 continue;
             }
+            Err(PlatformDeviceOpenError::Initialization(err)) => return Err(err),
         };
-        let device_key =
-            crate::platform::drm::primary_device_key_from_fd(std::os::fd::AsFd::as_fd(&*device))?;
-        validate_unique_kms_device_identity(&opened_device_paths, device_key, device_path)?;
+        let device_key = platform_device.key;
         opened_device_paths.push((device_key, device_path.clone()));
 
-        let device_lock =
-            crate::kms::executor::device_lock::acquire_device_lock_or_refuse(&device_key)?;
-        let inheritable_lock = device_lock.into_inheritable();
-
         if devices.is_empty() {
-            render_node = render_node_for_device(&device_path_str, &device);
+            render_node =
+                render_node_for_device(&device_path.to_string_lossy(), &platform_device.device);
         }
         if !devices.is_empty() {
             log::info!(
@@ -1042,49 +1180,7 @@ pub(crate) fn platform_init(
                 device_path.display()
             );
         }
-        let incarnation = crate::kms::owner::identity::IncarnationId::first();
-        let lifecycle_epoch = crate::kms::owner::lifecycle::LifecycleEpochId::first();
-        let incarnation_fd_set = Rc::new(std::cell::RefCell::new(
-            crate::kms::executor::IncarnationFdSet::new(),
-        ));
-        let helper_lease = incarnation_fd_set
-            .borrow_mut()
-            .register_alias_from(std::os::fd::AsFd::as_fd(&*device))?;
-        let mut executor = crate::kms::executor::KmsIoExecutor::spawn_with_device_lock(
-            std::os::fd::AsFd::as_fd(&*device),
-            incarnation,
-            lifecycle_epoch,
-            &inheritable_lock,
-        )
-        .map_err(|err| {
-            io::Error::new(
-                err.kind(),
-                format!(
-                    "yserver: cannot start the KMS executor for {}: {err}",
-                    device_path.display()
-                ),
-            )
-        })?;
-        executor
-            .await_helper_ready(std::time::Duration::from_secs(30))
-            .map_err(|err| {
-                io::Error::new(
-                    err.kind(),
-                    format!(
-                        "yserver: KMS executor handshake failed for {}: {err}",
-                        device_path.display()
-                    ),
-                )
-            })?;
-        drop(inheritable_lock);
-
-        devices.push(PlatformInitDevice {
-            key: device_key,
-            device,
-            executor,
-            incarnation_fd_set,
-            helper_lease,
-        });
+        devices.push(platform_device);
     }
 
     // Finish every fallible per-device identity qualification before the

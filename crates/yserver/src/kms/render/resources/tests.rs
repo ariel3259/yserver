@@ -3472,6 +3472,7 @@ pub(crate) fn run_sink_gamma_gate_four_states(
     let mut backend = crate::kms::render::backend::KmsBackend::for_tests();
     backend.platform.devices = vec![crate::kms::render::platform::KmsDevice {
         key: device_key,
+        device_path: std::path::PathBuf::from(device.path()),
         device: Rc::clone(&device).into(),
         incarnation_fd_set: Rc::new(std::cell::RefCell::new(
             crate::kms::executor::IncarnationFdSet::new(),

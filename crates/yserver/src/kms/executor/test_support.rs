@@ -42,6 +42,8 @@ pub enum ScriptedReply {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 #[doc(hidden)]
 pub enum StubBehaviour {
+    NeverHandshake,
+    HandshakeAndAcceptCallsWith(u64),
     NeverReply,
     ExitBeforeReply,
     RejectWith(i32),
@@ -120,6 +122,10 @@ pub enum StubBehaviour {
 impl StubBehaviour {
     pub(crate) fn to_arg_string(self) -> String {
         match self {
+            Self::NeverHandshake => "never-handshake".to_string(),
+            Self::HandshakeAndAcceptCallsWith(sequence) => {
+                format!("handshake-accept-calls:{sequence}")
+            }
             Self::NeverReply => "never-reply".to_string(),
             Self::ExitBeforeReply => "exit-before-reply".to_string(),
             Self::RejectWith(errno) => format!("reject:{errno}"),
@@ -202,7 +208,14 @@ impl StubBehaviour {
     }
 
     pub(crate) fn from_arg_str(s: &str) -> Option<Self> {
-        if s == "never-reply" {
+        if s == "never-handshake" {
+            Some(Self::NeverHandshake)
+        } else if let Some(sequence) = s.strip_prefix("handshake-accept-calls:") {
+            sequence
+                .parse::<u64>()
+                .ok()
+                .map(Self::HandshakeAndAcceptCallsWith)
+        } else if s == "never-reply" {
             Some(Self::NeverReply)
         } else if s == "exit-before-reply" {
             Some(Self::ExitBeforeReply)
@@ -360,6 +373,31 @@ pub fn spawn_stub_helper(behaviour: StubBehaviour) -> io::Result<KmsIoExecutor> 
     )
 }
 
+/// Spawn a test helper on the supplied fd with an explicit Owner identity.
+/// Recovery tests use this to prove that a reopened helper carries the fresh
+/// incarnation and transition epoch.
+#[doc(hidden)]
+#[cfg(test)]
+pub(crate) fn spawn_stub_helper_with_identity_for_tests(
+    behaviour: StubBehaviour,
+    kms_fd: impl AsFd,
+    incarnation: IncarnationId,
+    lifecycle_epoch: crate::kms::owner::lifecycle::LifecycleEpochId,
+) -> io::Result<KmsIoExecutor> {
+    let _spawn_guard = process_spawn_guard_for_tests();
+    let exe = executor_executable()?;
+    super::spawn_internal_full(
+        &exe,
+        kms_fd.as_fd(),
+        incarnation,
+        lifecycle_epoch,
+        None,
+        Some(behaviour),
+        false,
+        false,
+    )
+}
+
 /// Spawn a process-isolated stub helper configured with `behaviour` and an inherited event/KMS fd.
 #[doc(hidden)]
 pub fn spawn_stub_helper_with_event_fd(
@@ -493,6 +531,31 @@ fn run_stub_helper(behaviour: StubBehaviour) -> io::Result<()> {
     let control = UnixStream::from(control_fd);
 
     match behaviour {
+        StubBehaviour::NeverHandshake => loop {
+            std::thread::sleep(Duration::from_secs(3600));
+        },
+        StubBehaviour::HandshakeAndAcceptCallsWith(sequence) => {
+            let mut request = [0u8; 64];
+            let received = transport::recv_frame(&control, &mut request)?;
+            if received.len == 0 {
+                return Ok(());
+            }
+            let handshake =
+                protocol::decode_handshake_request(&request[..received.len]).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("protocol error: {error:?}"),
+                    )
+                })?;
+            let reply = protocol::HandshakeReply {
+                incarnation: handshake.incarnation,
+                lifecycle_epoch: handshake.lifecycle_epoch,
+                // SAFETY: getpid has no preconditions.
+                helper_pid: unsafe { libc::getpid() as u32 },
+            };
+            transport::send_frame(&control, &protocol::encode_handshake_reply(&reply))?;
+            serve_call_families(&control, sequence, false, None, None)
+        }
         StubBehaviour::NeverReply => loop {
             std::thread::sleep(Duration::from_secs(3600));
         },

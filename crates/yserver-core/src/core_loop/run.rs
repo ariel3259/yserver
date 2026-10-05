@@ -544,10 +544,40 @@ const REQUEST_TIME_BUDGET: Duration = Duration::from_millis(8);
 /// One backend-owned source registered with the core poller. The vector index
 /// is encoded in its mio token, preserving the exact fd identity even when
 /// several entries share one `BackendFdKind`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BackendPollSource {
     fd: RawFd,
     kind: BackendFdKind,
+}
+
+fn deregister_backend_poll_sources(
+    registry: &mio::Registry,
+    sources: &[BackendPollSource],
+) -> io::Result<()> {
+    for source in sources {
+        if let Err(error) = registry.deregister(&mut SourceFd(&source.fd))
+            && !matches!(error.raw_os_error(), Some(libc::EBADF | libc::ENOENT))
+        {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn register_backend_poll_sources(
+    registry: &mio::Registry,
+    sources: &[BackendPollSource],
+) -> io::Result<()> {
+    for (index, source) in sources.iter().enumerate() {
+        let token = backend_token(index).ok_or_else(|| {
+            io::Error::other(format!(
+                "backend exposes too many poll fds: {}",
+                sources.len()
+            ))
+        })?;
+        registry.register(&mut SourceFd(&source.fd), token, Interest::READABLE)?;
+    }
+    Ok(())
 }
 
 /// Whether this iteration's request drain must stop, given how many
@@ -2273,21 +2303,12 @@ pub fn run_core(
     // the core never sees the libinput fd in production. The Libinput
     // arm is registered defensively in case a backend variant chooses
     // to skip the dedicated thread and run libinput on the core poll.
-    let backend_poll_sources: Vec<_> = backend
+    let mut backend_poll_sources: Vec<_> = backend
         .poll_fds()
         .into_iter()
         .map(|(fd, kind)| BackendPollSource { fd, kind })
         .collect();
-    for (index, source) in backend_poll_sources.iter().enumerate() {
-        let token = backend_token(index).ok_or_else(|| {
-            io::Error::other(format!(
-                "backend exposes too many poll fds: {}",
-                backend_poll_sources.len()
-            ))
-        })?;
-        poll.registry()
-            .register(&mut SourceFd(&source.fd), token, Interest::READABLE)?;
-    }
+    register_backend_poll_sources(poll.registry(), &backend_poll_sources)?;
 
     // Probe input devices at startup, Xorg-style: drain libinput's
     // initial device enumeration and seed `state.xi_devices` BEFORE the
@@ -2361,6 +2382,19 @@ pub fn run_core(
         // Driving this before computing poll_timeout ensures any deadline or
         // readiness modified during before_block bounds the subsequent poll.
         backend.before_block();
+        // Backends can replace device incarnations while servicing this loop.
+        // Refresh their sources after `before_block` so newly opened executor
+        // control fds become pollable before the next wait.
+        let current_backend_poll_sources: Vec<_> = backend
+            .poll_fds()
+            .into_iter()
+            .map(|(fd, kind)| BackendPollSource { fd, kind })
+            .collect();
+        if current_backend_poll_sources != backend_poll_sources {
+            deregister_backend_poll_sources(poll.registry(), &backend_poll_sources)?;
+            backend_poll_sources = current_backend_poll_sources;
+            register_backend_poll_sources(poll.registry(), &backend_poll_sources)?;
+        }
         // Compute poll timeout. If there are runnable deferred requests, do
         // not block: drain them immediately. Otherwise, blocking could wait for
         // a fresh fd event, leaving the backlog stranded.

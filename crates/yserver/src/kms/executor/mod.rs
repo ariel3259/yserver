@@ -502,6 +502,9 @@ pub struct KmsIoExecutor {
     in_flight: Option<InFlight>,
     queued_terminal_event: Option<HostCallEvent>,
     helper_pid: Option<libc::pid_t>,
+    helper_handshake_pending: bool,
+    helper_handshake_error: Option<io::Error>,
+    helper_startup_lock: Option<device_lock::InheritableDeviceLock>,
     #[cfg(test)]
     sent_requests_for_tests: usize,
     #[cfg(test)]
@@ -643,57 +646,113 @@ impl KmsIoExecutor {
 
     #[doc(hidden)]
     pub fn await_helper_ready(&mut self, timeout: Duration) -> io::Result<()> {
-        let request = protocol::HandshakeRequest {
-            incarnation: self.incarnation,
-            lifecycle_epoch: self.lifecycle_epoch,
-        };
-        let frame = protocol::encode_handshake_request(&request);
-        send_frame(&self.control, &frame)?;
-
+        self.begin_helper_ready()?;
         let deadline = Instant::now() + timeout;
         loop {
             let readable = wait_readable_bounded(self.control.as_raw_fd(), deadline)?;
             if !readable {
+                self.helper_handshake_pending = false;
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "timed out waiting for executor helper readiness handshake",
                 ));
             }
-            let mut buf = [0u8; 64];
-            let received = match recv_frame(&self.control, &mut buf) {
-                Ok(rf) => rf,
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-                Err(err) => return Err(err),
-            };
-            if received.len == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "executor helper control socket closed during handshake",
-                ));
+            match self.poll_helper_ready()? {
+                Some(()) => return Ok(()),
+                None => continue,
             }
-            let reply = protocol::decode_handshake_reply(&buf[..received.len]).map_err(|err| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("executor helper malformed handshake reply: {err:?}"),
-                )
-            })?;
-            if reply.incarnation != self.incarnation
-                || reply.lifecycle_epoch != self.lifecycle_epoch
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "executor helper handshake mismatch: expected ({:?}, {:?}), got ({:?}, {:?})",
-                        self.incarnation,
-                        self.lifecycle_epoch,
-                        reply.incarnation,
-                        reply.lifecycle_epoch
-                    ),
-                ));
-            }
-            self.helper_pid = Some(reply.helper_pid as libc::pid_t);
-            return Ok(());
         }
+    }
+
+    /// Start the helper readiness handshake without waiting for its reply.
+    /// Recovery uses the executor control fd as a core-loop event source.
+    #[doc(hidden)]
+    pub fn begin_helper_ready(&mut self) -> io::Result<()> {
+        if self.helper_handshake_pending {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "executor helper readiness handshake is already pending",
+            ));
+        }
+        let request = protocol::HandshakeRequest {
+            incarnation: self.incarnation,
+            lifecycle_epoch: self.lifecycle_epoch,
+        };
+        let frame = protocol::encode_handshake_request(&request);
+        self.helper_handshake_pending = true;
+        if let Err(error) = send_frame(&self.control, &frame) {
+            self.helper_handshake_error = Some(io::Error::new(error.kind(), error.to_string()));
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Consume a readiness reply when the control fd is readable. `None`
+    /// means the nonblocking socket had no complete reply yet.
+    #[doc(hidden)]
+    pub fn poll_helper_ready(&mut self) -> io::Result<Option<()>> {
+        if !self.helper_handshake_pending {
+            return Ok(None);
+        }
+        if let Some(error) = self.helper_handshake_error.take() {
+            self.helper_handshake_pending = false;
+            return Err(error);
+        }
+        let mut buf = [0u8; 64];
+        let received = match recv_frame(&self.control, &mut buf) {
+            Ok(received) => received,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => return Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+            Err(error) => {
+                self.helper_handshake_pending = false;
+                return Err(error);
+            }
+        };
+        if received.len == 0 {
+            self.helper_handshake_pending = false;
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "executor helper control socket closed during handshake",
+            ));
+        }
+        let reply = match protocol::decode_handshake_reply(&buf[..received.len]) {
+            Ok(reply) => reply,
+            Err(error) => {
+                self.helper_handshake_pending = false;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("executor helper malformed handshake reply: {error:?}"),
+                ));
+            }
+        };
+        if reply.incarnation != self.incarnation || reply.lifecycle_epoch != self.lifecycle_epoch {
+            self.helper_handshake_pending = false;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "executor helper handshake mismatch: expected ({:?}, {:?}), got ({:?}, {:?})",
+                    self.incarnation,
+                    self.lifecycle_epoch,
+                    reply.incarnation,
+                    reply.lifecycle_epoch
+                ),
+            ));
+        }
+        self.helper_pid = Some(reply.helper_pid as libc::pid_t);
+        self.helper_handshake_pending = false;
+        self.helper_startup_lock.take();
+        Ok(Some(()))
+    }
+
+    pub(crate) fn hold_startup_lock_until_helper_ready(
+        &mut self,
+        lock: device_lock::InheritableDeviceLock,
+    ) {
+        self.helper_startup_lock = Some(lock);
+    }
+
+    pub(crate) fn helper_handshake_pending(&self) -> bool {
+        self.helper_handshake_pending
     }
 
     #[doc(hidden)]
@@ -719,6 +778,7 @@ impl KmsIoExecutor {
         match self.child.try_wait() {
             Ok(Some(status)) => {
                 self.reaped = Some(status);
+                self.helper_startup_lock.take();
                 if self.reap_proof.is_none() && !self.reap_proof_taken {
                     self.reap_proof = Some(ReapProof(()));
                 }
@@ -1625,6 +1685,9 @@ pub(crate) fn spawn_internal_full(
         in_flight: None,
         queued_terminal_event: None,
         helper_pid: None,
+        helper_handshake_pending: false,
+        helper_handshake_error: None,
+        helper_startup_lock: None,
         #[cfg(test)]
         sent_requests_for_tests: 0,
         #[cfg(test)]

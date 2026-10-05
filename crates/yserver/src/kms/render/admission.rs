@@ -1302,36 +1302,73 @@ impl KmsBackend {
     }
 
     pub(super) fn lifecycle_owner_devices(&self) -> Vec<DrmDeviceKey> {
+        let owner_incarnations = self
+            .lifecycle_owner_incarnation_devices()
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
         self.platform
             .devices
             .iter()
             .filter_map(|entry| {
-                self.platform
-                    .transport_gate(&entry.key)
-                    .is_some_and(|gate| {
-                        gate.state() == crate::kms::render::resources::TransportState::Owner
-                    })
-                    .then_some(entry.key)
+                (owner_incarnations.contains(&entry.key)
+                    && self
+                        .platform
+                        .transport_gate(&entry.key)
+                        .is_some_and(|gate| {
+                            gate.state() == crate::kms::render::resources::TransportState::Owner
+                        }))
+                .then_some(entry.key)
             })
             .collect()
     }
 
-    /// Owner incarnations remain Owner-owned after their transport gate closes
-    /// on an unknown result. VT routing must keep those devices out of the
-    /// Legacy ioctl path until a later lifecycle task replaces the Owner.
+    /// Return every live Owner incarnation, regardless of its transport gate.
+    /// Lifecycle inputs and Legacy-route exclusion are keyed to ownership; the
+    /// gate controls only whether Owner transport may submit work.
     pub(super) fn lifecycle_owner_incarnation_devices(&self) -> Vec<DrmDeviceKey> {
         self.platform
             .devices
             .iter()
             .filter_map(|entry| {
-                self.platform
-                    .transport_gate(&entry.key)
-                    .is_some_and(|gate| {
-                        gate.state() == crate::kms::render::resources::TransportState::Owner
-                            || gate.state() == crate::kms::render::resources::TransportState::Closed
-                                && entry.owner.is_some()
-                    })
+                let has_owner_incarnation = entry.owner.is_some();
+                let arbiter_state = self
+                    .lifecycle_coordinator
+                    .device(&entry.key)
+                    .map(|arbiter| arbiter.state());
+                let not_removed = arbiter_state.is_none_or(|state| {
+                    state != crate::kms::owner::lifecycle::DeviceLifecycleState::Removed
+                });
+                let registered_or_open_gate = arbiter_state.is_some()
+                    || self
+                        .platform
+                        .transport_gate(&entry.key)
+                        .is_some_and(|gate| {
+                            gate.state() == crate::kms::render::resources::TransportState::Owner
+                        });
+                (has_owner_incarnation && not_removed && registered_or_open_gate)
                     .then_some(entry.key)
+            })
+            .collect()
+    }
+
+    /// Retained Owner identities stay out of Legacy routing even after their
+    /// arbiter reaches `Removed`. Lifecycle input delivery uses the live set
+    /// above; this identity set is only for deciding which entries have never
+    /// been Legacy devices.
+    pub(super) fn lifecycle_owner_route_devices(&self) -> Vec<DrmDeviceKey> {
+        self.platform
+            .devices
+            .iter()
+            .filter_map(|entry| {
+                let arbiter_registered = self.lifecycle_coordinator.device(&entry.key).is_some();
+                let owner_transport_selected = entry.owner.is_some()
+                    && self
+                        .platform
+                        .transport_gate(&entry.key)
+                        .is_some_and(|gate| {
+                            gate.state() == crate::kms::render::resources::TransportState::Owner
+                        });
+                (arbiter_registered || owner_transport_selected).then_some(entry.key)
             })
             .collect()
     }
@@ -1449,7 +1486,7 @@ impl KmsBackend {
         &mut self,
         target: crate::kms::owner::lifecycle::SeatTarget,
     ) {
-        let owner_devices = self.lifecycle_owner_devices();
+        let owner_devices = self.lifecycle_owner_incarnation_devices();
         for device in owner_devices.iter().copied() {
             if let Err(error) = self.lifecycle_register_owner_device(device) {
                 log::error!("lifecycle seat observation registration for {device:?}: {error:?}");
@@ -1479,7 +1516,7 @@ impl KmsBackend {
         &mut self,
         target: crate::kms::owner::lifecycle::SeatTarget,
     ) -> bool {
-        let owner_devices = self.lifecycle_owner_devices();
+        let owner_devices = self.lifecycle_owner_incarnation_devices();
         if owner_devices.is_empty() {
             #[cfg(test)]
             self.vt_call_trace_for_tests.push("legacy_set_seat_target");
@@ -1508,7 +1545,7 @@ impl KmsBackend {
             }
         };
         let live_owner_devices = self
-            .lifecycle_owner_devices()
+            .lifecycle_owner_incarnation_devices()
             .into_iter()
             .collect::<HashSet<_>>();
         for dispatch in dispatches {
@@ -7505,7 +7542,7 @@ impl KmsBackend {
     }
 
     pub(crate) fn lifecycle_begin_owner_event_batch(&mut self, device: DrmDeviceKey) {
-        if self.lifecycle_owner_devices().contains(&device)
+        if self.lifecycle_owner_incarnation_devices().contains(&device)
             && let Err(error) = self.lifecycle_register_owner_device(device)
         {
             log::error!("lifecycle owner-event registration for {device:?}: {error:?}");
