@@ -13070,6 +13070,7 @@ fn border_press_reports_negative_content_coords_on_the_wire() {
         // `resolve_pointer_hit` takes the live-root path and the hit is
         // resolved from `root_x`/`root_y` alone.
         let press = HostPointerEvent {
+            origin: yserver_core::core_loop::InputOrigin::XTest(4),
             kind: PointerEventKind::ButtonPress,
             host_xid: 0,
             detail: 1,
@@ -13111,6 +13112,20 @@ fn border_press_reports_negative_content_coords_on_the_wire() {
             (event_x, event_y),
             (want_x, want_y),
             "{name}: root ({rx},{ry}) must be reported as content ({want_x},{want_y})"
+        );
+        // Release before the next probe: XTEST 4 keeps its own button
+        // state, and a press of a button it already holds is dropped
+        // (Xorg `UpdateDeviceState`, Xi/exevents.c:948).
+        yserver_core::core_loop::pointer_fanout::pointer_event_fanout_to_state(
+            &mut f.state,
+            &mut f.backend,
+            &xid_map,
+            HostPointerEvent {
+                kind: PointerEventKind::ButtonRelease,
+                ..press
+            },
+            /*handle_grabs=*/ false,
+            /*is_replay=*/ false,
         );
         // Drain any trailing events (crossings) before the next probe.
         while f._peer.read(&mut sink).map(|k| k > 0).unwrap_or(false) {}

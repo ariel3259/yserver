@@ -70,6 +70,8 @@ pub(crate) fn is_session_scoped(message: &Message) -> bool {
 
         Message::HostInput(_)
         | Message::CrtcConfigReady
+        | Message::DeviceConfigResult { .. }
+        | Message::InputPaused
         | Message::Shutdown
         | Message::ResetRequested
         | Message::VtRelease
@@ -98,9 +100,9 @@ mod tests {
     use crate::core_loop::message::HostInputEvent;
     use yserver_protocol::x11::ClientId;
 
-    fn device_removed(node: &str) -> Message {
+    fn device_removed() -> Message {
         Message::HostInput(HostInputEvent::DeviceRemoved {
-            device_node: node.into(),
+            source_id: crate::xinput::InputSourceId(1),
         })
     }
 
@@ -172,7 +174,7 @@ mod tests {
         let old = Generation::default();
         let current = GenerationCounter::new();
         current.bump();
-        let msg = device_removed("/dev/input/event3");
+        let msg = device_removed();
         assert!(should_dispatch(current.current(), old, &msg));
     }
 
@@ -187,11 +189,12 @@ mod tests {
             Message::ResetRequested,
             Message::CrtcConfigReady,
             Message::VtRelease,
+            Message::InputPaused,
             Message::VtAcquire,
             Message::SwitchVt(1),
             Message::DumpScanout,
             Message::DumpDrawables,
-            device_removed("/dev/input/event0"),
+            device_removed(),
             Message::ClientDisconnected {
                 id: ClientId(1),
                 reason: std::io::Error::other("gone"),

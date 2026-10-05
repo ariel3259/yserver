@@ -17,7 +17,7 @@
 //! `nested::handle_request`'s ChangeWindowAttributes path on
 //! ROOT_WINDOW pokes the container).
 
-use std::{io, sync::Mutex};
+use std::{collections::VecDeque, io, sync::Mutex};
 
 use yserver_protocol::x11::{ClipRectangles, FontMetrics, ResourceId, glx, xfixes};
 
@@ -34,6 +34,8 @@ use crate::{
 /// assert against `Vec<RecordedCall>` snapshots.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordedCall {
+    /// The backend input-session cleanup hook ran at a generation boundary.
+    ResetInputSession,
     /// A key event handed to `on_host_input`; `repeat` distinguishes
     /// `HostInputEvent::KeyRepeat` from device `HostInputEvent::Key`.
     HostKey {
@@ -524,11 +526,39 @@ pub struct RecordingBackend {
     /// one per pending Present scrapped by same-target supersession.
     /// Lets a test assert exactly one call per victim.
     pub present_skip_count: u32,
-    /// `(device_node, change)` pairs passed to `apply_device_config`, in
-    /// call order, so xinput property-write tests can assert exactly what
-    /// reached the backend (the trait's default impl is a no-op and
-    /// doesn't record anything).
-    pub applied_device_configs: Vec<(String, crate::xinput::libinput_props::DeviceConfigChange)>,
+    /// Source/change pairs passed to `start_device_config`, in call order.
+    pub started_device_configs: Vec<(
+        crate::xinput::InputSourceId,
+        crate::xinput::libinput_props::DeviceConfigChange,
+    )>,
+    /// Shared cancellation handles passed with submitted input commands.
+    pub device_config_cancel_tokens: Vec<crate::xinput::libinput_props::DeviceConfigCancelToken>,
+    /// Results returned by successive `start_device_config` calls. Empty
+    /// means each setting is confirmed synchronously.
+    pub device_config_start_results: VecDeque<
+        Result<
+            crate::xinput::libinput_props::DeviceConfigStart,
+            crate::xinput::libinput_props::DeviceConfigError,
+        >,
+    >,
+    /// Whether this recording backend should exercise VT lifecycle dispatch.
+    pub vt_switching_armed: bool,
+    /// Whether the test backend simulates queueing the input pause barrier.
+    pub vt_release_pause_queued: bool,
+    /// Set when the release has crossed the test backend's yield boundary.
+    pub vt_release_finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Test probe: capture output already written when the VT release finishes.
+    #[cfg(test)]
+    pub vt_release_probe_client: Option<u32>,
+    /// Whether the probe client had reply bytes written before release finished.
+    #[cfg(test)]
+    pub vt_release_wire_visible_before_finish: bool,
+    /// Test probe: source whose config inventory value is sampled at release.
+    #[cfg(test)]
+    pub vt_release_probe_source: Option<crate::xinput::InputSourceId>,
+    /// The probe source's inventory accel speed observed at release finish.
+    #[cfg(test)]
+    pub vt_release_inventory_accel_before_finish: Option<f32>,
 }
 
 impl Default for RecordingBackend {
@@ -628,7 +658,20 @@ impl RecordingBackend {
             enqueued_present_completions: Vec::new(),
             arm_present_syncobj_wait_result: None,
             present_skip_count: 0,
-            applied_device_configs: Vec::new(),
+            started_device_configs: Vec::new(),
+            device_config_cancel_tokens: Vec::new(),
+            device_config_start_results: VecDeque::new(),
+            vt_switching_armed: false,
+            vt_release_pause_queued: false,
+            vt_release_finished: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            vt_release_probe_client: None,
+            #[cfg(test)]
+            vt_release_wire_visible_before_finish: false,
+            #[cfg(test)]
+            vt_release_probe_source: None,
+            #[cfg(test)]
+            vt_release_inventory_accel_before_finish: None,
         }
     }
 
@@ -752,6 +795,45 @@ impl Backend for RecordingBackend {
 
     fn window_id(&self) -> u32 {
         self.fake_window_id
+    }
+
+    fn vt_switching_armed(&self) -> bool {
+        self.vt_switching_armed
+    }
+
+    fn begin_vt_release(&mut self) -> bool {
+        self.vt_release_pause_queued
+    }
+
+    fn finish_vt_release(
+        &mut self,
+        state: &mut crate::server::ServerState,
+        input_inventory: &crate::core_loop::input_inventory::InputInventory,
+    ) {
+        #[cfg(test)]
+        {
+            self.vt_release_wire_visible_before_finish = self
+                .vt_release_probe_client
+                .and_then(|client_id| state.clients.get(&client_id))
+                .and_then(|client| {
+                    let writer = client.writer.lock().ok()?;
+                    match &*writer {
+                        crate::transport::Transport::Capture(bytes) => {
+                            Some(!bytes.lock().ok()?.is_empty())
+                        }
+                        _ => None,
+                    }
+                })
+                .unwrap_or(false);
+            self.vt_release_inventory_accel_before_finish = self
+                .vt_release_probe_source
+                .and_then(|source| input_inventory.get(source))
+                .map(|entry| entry.config.accel.current);
+        }
+        #[cfg(not(test))]
+        let _ = (state, input_inventory);
+        self.vt_release_finished
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn root_visual_xid(&self) -> u32 {
@@ -902,14 +984,20 @@ impl Backend for RecordingBackend {
             .is_some_and(|(owner, _)| *owner == client_id)
     }
 
-    fn apply_device_config(
+    fn start_device_config(
         &mut self,
-        device_node: &str,
+        source: crate::xinput::InputSourceId,
         change: crate::xinput::libinput_props::DeviceConfigChange,
-    ) -> Result<(), crate::xinput::libinput_props::DeviceConfigError> {
-        self.applied_device_configs
-            .push((device_node.to_owned(), change));
-        Ok(())
+        cancel: crate::xinput::libinput_props::DeviceConfigCancelToken,
+    ) -> Result<
+        crate::xinput::libinput_props::DeviceConfigStart,
+        crate::xinput::libinput_props::DeviceConfigError,
+    > {
+        self.started_device_configs.push((source, change));
+        self.device_config_cancel_tokens.push(cancel);
+        self.device_config_start_results.pop_front().unwrap_or(Ok(
+            crate::xinput::libinput_props::DeviceConfigStart::Applied,
+        ))
     }
 
     fn signal_present_wake(&mut self, present_id: u64) {
@@ -1117,6 +1205,10 @@ impl Backend for RecordingBackend {
     fn ping(&mut self, _origin: Option<OriginContext>) -> io::Result<()> {
         self.record(RecordedCall::Ping);
         Ok(())
+    }
+
+    fn reset_input_session(&mut self, _old_state: &mut crate::server::ServerState) {
+        self.record(RecordedCall::ResetInputSession);
     }
 
     fn on_host_input(
@@ -1336,7 +1428,7 @@ impl Backend for RecordingBackend {
             empty_rounds = 0;
             for info in batch {
                 seeded += 1;
-                state.xi_seed_touchpad(&info);
+                state.xi_register_source(&info);
             }
         }
         self.probe_rounds_run.set(rounds_run);
