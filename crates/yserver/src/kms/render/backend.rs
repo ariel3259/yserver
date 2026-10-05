@@ -48198,7 +48198,9 @@ mod tests {
         let mut backend = KmsBackend::for_tests();
         let mut state = ServerState::new();
         let _peer = kbd_map_client_id(&mut state, 73);
-        let mapping = [3u8, 2, 1, 4, 5, 6, 7];
+        // PickPointer is the ten-button CorePointer (`dix/devices.c:662-690`),
+        // so SetPointerMapping must supply all ten entries.
+        let mapping = [3u8, 2, 1, 4, 5, 6, 7, 8, 9, 10];
         yserver_core::core_loop::process_request::process_request(
             &mut state,
             &mut backend as &mut dyn Backend,
@@ -48207,7 +48209,7 @@ mod tests {
             RequestHeader {
                 opcode: 116,
                 data: u8::try_from(mapping.len()).unwrap(),
-                length_units: 3,
+                length_units: 4,
             },
             &mapping,
             None,
