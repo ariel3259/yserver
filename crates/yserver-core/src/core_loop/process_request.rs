@@ -35820,16 +35820,18 @@ fn emit_xi2_device_changed_bootstrap(
     };
     let mut buf = Vec::new();
     for master_id in selected_masters {
-        let sourceid = state
-            .xi_last_slave(master_id)
-            .filter(|sourceid| {
-                state.xi_devices.device(*sourceid).is_some_and(|device| {
-                    device.enabled && device.attached_master == Some(master_id)
-                })
-            })
-            .unwrap_or(master_id);
+        // Xorg serializes the source ID retained by each copied class
+        // (`Xi/xiquerydevice.c:278,326`); it is independent of `lastSlave`,
+        // which may already have been cleared by disable/removal.
+        let Some(sourceid) = state
+            .xi_devices
+            .device(master_id)
+            .map(|device| device.class_sourceid)
+        else {
+            continue;
+        };
         let Some((classes, num_classes)) =
-            crate::xinput::hotplug::device_changed_class_block(state, sourceid, byte_order)
+            crate::xinput::hotplug::device_changed_class_block(state, master_id, byte_order)
         else {
             continue;
         };
@@ -45523,6 +45525,9 @@ mod tests {
 
     #[test]
     fn xi_select_events_on_root_bootstraps_device_changed() {
+        // Xorg initializes the core pair with CorePointerProc (devices.c:724-730,
+        // :655-694), so a fresh master bootstrap has 3 classes, not the old
+        // unconditional physical-pointer set of 7.
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
@@ -45555,7 +45560,11 @@ mod tests {
             .find(|&i| wire[i] == 35 && u16::from_le_bytes([wire[i + 8], wire[i + 9]]) == 1)
             .expect("bootstrap XI_DeviceChanged event");
         assert_eq!(wire[event_offset + 10], 2, "deviceid low byte");
-        assert_eq!(wire[event_offset + 16], 7, "num_classes low byte");
+        assert_eq!(
+            wire[event_offset + 16],
+            3,
+            "the initial master uses CorePointerProc's three classes"
+        );
         assert_eq!(
             wire[event_offset + 18],
             2,
@@ -45601,7 +45610,7 @@ mod tests {
             .expect("XISelectEvents on master pointer");
         }
 
-        fn device_changed(bytes: &[u8]) -> (u16, u16, u8, u16, i32) {
+        fn device_changed(bytes: &[u8]) -> (u16, u16, u8, u16, Option<i32>) {
             let offset = (0..bytes.len().saturating_sub(32))
                 .find(|&offset| {
                     bytes[offset] == 35
@@ -45634,8 +45643,10 @@ mod tests {
                 }
                 class_offset += units * 4;
             }
-            let (class_source, scroll_value) = valuator_two.expect("vertical scroll valuator");
-            assert_eq!(class_source, sourceid, "classes use the reported source");
+            let scroll_value = valuator_two.map(|(class_source, value)| {
+                assert_eq!(class_source, sourceid, "classes use the reported source");
+                value
+            });
             (deviceid, sourceid, reason, num_classes, scroll_value)
         }
 
@@ -45643,8 +45654,11 @@ mod tests {
         let mut bootstrap_peer = install_capture_client(&mut state, 101);
         let mut backend = RecordingBackend::new();
 
-        // With no observed physical source, XISelectEvents reports the
-        // current master pointer classes and keeps sourceid at master 2.
+        // Before: this expected the physical pointer shape on a fresh master.
+        // Xorg initializes the core master pair through CorePointerProc
+        // (`dix/devices.c:724-730, 655-694`), so the initial master has three
+        // classes and no valuator 2; XIQueryDevice serializes stored source IDs
+        // (`Xi/xiquerydevice.c:278,326`).
         select_master_pointer(&mut state, &mut backend, 101, 1);
         assert_eq!(
             state
@@ -45659,8 +45673,8 @@ mod tests {
         let fallback = read_all_available(&mut bootstrap_peer);
         assert_eq!(
             device_changed(&fallback),
-            (2, 2, 1, 7, 0),
-            "bootstrap does not invent XTEST pointer 4 as a physical source"
+            (2, 2, 1, 3, None),
+            "the initial class set has CorePointerProc shape and sourceid 2"
         );
 
         let source = InputSourceId(0xA71);
@@ -45726,8 +45740,8 @@ mod tests {
         select_master_pointer(&mut state, &mut backend, 102, 2);
         assert_eq!(
             device_changed(&read_all_available(&mut late_peer)),
-            (2, source_id, 1, 7, 1),
-            "a late selector bootstraps from the current last slave and its scroll state"
+            (2, source_id, 1, 7, Some(1)),
+            "a late selector bootstraps from the stored physical class set and scroll state"
         );
         assert_eq!(state.xi_last_slave(2), Some(source_id));
         assert_eq!(
@@ -46550,96 +46564,52 @@ mod tests {
         assert_eq!(xi_query_side_effect_snapshot(&state, 1), before);
     }
 
-    /// Tier 2b T7 regression: the `XI_DeviceChanged` event emitted by
-    /// `emit_xi2_device_changed_bootstrap` (driven from XISelectEvents at
-    /// connect time) must advertise the SAME scroll-class `flags` u32 as
-    /// XIQueryDevice does, namely `0`. xserver populates both paths from a
-    /// single `axis->scroll.flags` source (`Xi/xiquerydevice.c:ListScrollInfo`
-    /// and `dix/eventconvert.c:appendScrollInfo`), so they cannot legitimately
-    /// differ. yserver's XIQueryDevice site emits `0`; a stale `flags = 1` in
-    /// the bootstrap path would re-arm the 2026-05-29 Chrome crash-class
-    /// (NoEmulation declared while still emitting emulated XI_ButtonPress
-    /// 4..7).
     #[test]
-    fn t7_xi2_device_changed_bootstrap_scroll_flags_match_xiquerydevice() {
+    fn xi2_device_changed_bootstrap_matches_initial_master_query_classes() {
+        // Before: this asserted seven physical classes and two scroll classes
+        // on a fresh master. Xorg's CorePointerProc creates 10 buttons and two
+        // relative valuators with no scroll classes (dix/devices.c:655-700;
+        // InitCoreDevices calls it at :724-730).
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
-        let mut backend = RecordingBackend::new();
-        state
-            .clients
-            .get_mut(&1)
-            .unwrap()
-            .xi2_masks
-            .insert((ROOT_WINDOW, 0), u64::from(XI2_DEVICE_CHANGED_MASK));
-
-        emit_xi2_device_changed_bootstrap(
-            &mut state,
-            &mut backend,
-            None,
-            ClientId(1),
-            SequenceNumber(7),
-            XI2_MAJOR_OPCODE,
-        )
-        .expect("emit_xi2_device_changed_bootstrap");
-
-        let wire = read_all_available(&mut peer);
+        let mut select_body = Vec::new();
+        select_body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        select_body.extend_from_slice(&1u16.to_le_bytes());
+        select_body.extend_from_slice(&[0; 2]);
+        select_body.extend_from_slice(&0u16.to_le_bytes()); // XIAllDevices
+        select_body.extend_from_slice(&1u16.to_le_bytes());
+        select_body.extend_from_slice(&XI2_DEVICE_CHANGED_MASK.to_le_bytes());
+        let wire = dispatch_xi_request_wire(&mut state, &mut peer, 1, 46, &select_body);
         // Locate the XI_DeviceChanged event (opcode 35, evtype 1).
         let off = (0..wire.len().saturating_sub(32))
             .find(|&i| wire[i] == 35 && u16::from_le_bytes([wire[i + 8], wire[i + 9]]) == 1)
             .expect("XI_DeviceChanged event in wire");
         assert_eq!(wire[off + 1], XI2_MAJOR_OPCODE, "major opcode = XI2 ext");
-        // Header layout (see encode_xi2_device_changed_event):
-        //   0       u8   35 (GenericEvent)
-        //   1       u8   major_opcode
-        //   2..4    u16  sequence
-        //   4..8    u32  length (classes.len() / 4)
-        //   8..10   u16  evtype = 1
-        //   10..12  u16  deviceid
-        //   12..16  u32  time
-        //   16..18  u16  num_classes
-        //   18..20  u16  sourceid
-        //   20      u8   reason
-        //   21..32  pad
-        //   32..    classes
         let num_classes = u16::from_le_bytes([wire[off + 16], wire[off + 17]]);
-        assert_eq!(num_classes, 7, "Button + 4 Valuators + 2 Scrolls");
-
-        // Walk past the 32-byte event header and the non-scroll classes.
-        // Layout matches what `emit_xi2_device_changed_bootstrap` writes:
-        //   - 32 bytes header
-        //   - Button(7): 8 (header) + 4 (state words for 7 buttons) + 4*7
-        //     = 40 bytes
-        //   - Valuator x4: 11 units * 4 = 44 bytes each, 176 total
-        //   - Scroll x2: 6 units * 4 = 24 bytes each
-        let classes_start = off + 32;
-        let mut pos = classes_start;
-        let mut scroll_offsets = Vec::new();
-        for _ in 0..num_classes {
-            let cls_type = u16::from_le_bytes([wire[pos], wire[pos + 1]]);
-            let units = u16::from_le_bytes([wire[pos + 2], wire[pos + 3]]) as usize;
-            if cls_type == 3 {
-                // Scroll class — `flags` is a u32 at offset 12 within the
-                // 24-byte class body (after type/length/sourceid/number/
-                // scroll_type/pad).
-                scroll_offsets.push(pos);
-            }
-            pos += units * 4;
-        }
-        assert_eq!(scroll_offsets.len(), 2, "two scroll classes (V + H)");
-        for s_off in scroll_offsets {
-            let flags = u32::from_le_bytes([
-                wire[s_off + 12],
-                wire[s_off + 13],
-                wire[s_off + 14],
-                wire[s_off + 15],
-            ]);
-            assert_eq!(
-                flags, 0,
-                "XI_DeviceChanged scroll flags must match XIQueryDevice (0); see the \
-                 XIQueryDevice `write_scroll_class` comment for the 2026-05-29 \
-                 Chrome crash-class rationale"
-            );
-        }
+        assert_eq!(num_classes, 3, "initial CorePointerProc classes");
+        let event_class_len =
+            u32::from_le_bytes(wire[off + 4..off + 8].try_into().unwrap()) as usize * 4;
+        let event_classes = &wire[off + 32..off + 32 + event_class_len];
+        let (query_classes, query_num_classes) = query_device_class_block(&mut state, &mut peer, 2);
+        assert_eq!(query_num_classes, 3);
+        assert_eq!(event_classes, query_classes);
+        let class_headers = parse_xi2_class_headers(event_classes, num_classes);
+        assert_eq!(
+            class_headers
+                .iter()
+                .map(|class| class.0)
+                .collect::<Vec<_>>(),
+            [1, 2, 2]
+        );
+        assert_eq!(
+            u16::from_le_bytes([event_classes[6], event_classes[7]]),
+            10,
+            "CorePointerProc button class has ten buttons"
+        );
+        assert!(
+            class_headers.iter().all(|class| class.0 != 3),
+            "the fresh master has no scroll class or absent valuator reference"
+        );
     }
 
     #[test]

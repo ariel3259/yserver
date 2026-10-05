@@ -106,51 +106,79 @@ pub enum XiDeviceChangeReason {
 
 #[derive(Clone, Copy)]
 enum DeviceClassSnapshot {
-    Pointer(crate::xinput::query::XiQueryClassData),
-    Keyboard,
+    Pointer {
+        data: crate::xinput::query::XiQueryClassData,
+        sourceid: u16,
+        shape: super::XiClassShape,
+    },
+    Keyboard {
+        sourceid: u16,
+    },
 }
 
-fn snapshot_device_classes(state: &mut ServerState, sourceid: u16) -> Option<DeviceClassSnapshot> {
-    match state.xi_devices.role(sourceid)? {
-        XiDeviceRole::MasterPointer | XiDeviceRole::SlavePointer => {
-            Some(DeviceClassSnapshot::Pointer(
-                crate::core_loop::fanout::pointer_class_data_for_device(state, sourceid),
-            ))
+fn snapshot_device_classes(
+    state: &mut ServerState,
+    class_device_id: u16,
+    data_device_id: u16,
+) -> Option<DeviceClassSnapshot> {
+    let device = state.xi_devices.device(class_device_id)?;
+    let sourceid = device.class_sourceid;
+    let shape = device.class_shape;
+    match shape {
+        super::XiClassShape::CorePointer | super::XiClassShape::PhysicalPointer => {
+            Some(DeviceClassSnapshot::Pointer {
+                data: crate::core_loop::fanout::pointer_class_data_for_device(
+                    state,
+                    data_device_id,
+                ),
+                sourceid,
+                shape,
+            })
         }
-        XiDeviceRole::MasterKeyboard | XiDeviceRole::SlaveKeyboard => {
-            Some(DeviceClassSnapshot::Keyboard)
-        }
+        super::XiClassShape::Keyboard => Some(DeviceClassSnapshot::Keyboard { sourceid }),
     }
 }
 
 fn encode_device_classes(
     classes: DeviceClassSnapshot,
-    sourceid: u16,
     byte_order: ClientByteOrder,
 ) -> (Vec<u8>, u16) {
     match classes {
-        DeviceClassSnapshot::Pointer(data) => {
-            crate::xinput::query::build_pointer_classes(byte_order, sourceid, data)
+        DeviceClassSnapshot::Pointer {
+            data,
+            sourceid,
+            shape,
+        } => {
+            crate::xinput::query::build_pointer_classes_for_shape(byte_order, sourceid, data, shape)
         }
-        DeviceClassSnapshot::Keyboard => {
+        DeviceClassSnapshot::Keyboard { sourceid } => {
             crate::xinput::query::build_key_classes(byte_order, sourceid)
         }
     }
 }
 
-/// Build one DeviceChanged class block using the same encoders as
-/// XIQueryDevice. The caller chooses the event device and reason.
+/// Build one master DeviceChanged class block from the classes retained on
+/// that master. Xorg `ChangeMasterDeviceClasses` deep-copies classes before
+/// sending its event (`Xi/exevents.c:765-795`); query serialization reads the
+/// copied source IDs (`Xi/xiquerydevice.c:278,326`).
 pub(crate) fn device_changed_class_block(
     state: &mut ServerState,
-    sourceid: u16,
+    master_id: u16,
     byte_order: ClientByteOrder,
 ) -> Option<(Vec<u8>, u16)> {
-    let snapshot = snapshot_device_classes(state, sourceid)?;
-    Some(encode_device_classes(snapshot, sourceid, byte_order))
+    let sourceid = state.xi_devices.device(master_id)?.class_sourceid;
+    let data_device_id = state
+        .xi_devices
+        .device(sourceid)
+        .map_or(master_id, |device| device.id);
+    let snapshot = snapshot_device_classes(state, master_id, data_device_id)?;
+    Some(encode_device_classes(snapshot, byte_order))
 }
 
-/// Emit an XI2 `XI_DeviceChanged` event on `id`, using the classes and
-/// source identity of `sourceid`. Selection may be on any window for the
+/// Emit an XI2 `XI_DeviceChanged` event on `id`. For a master, use its stored
+/// class shape/source ID and the indicated source's current class values; for
+/// a slave, use its own classes. Xorg copies classes before sending the
+/// master event (`Xi/exevents.c:765-795`). Selection may be on any window for the
 /// exact event device, XIAllDevices, or XIAllMasterDevices when `id` is a
 /// master, matching Xorg's `SendEventToAllWindows` (Xi/exevents.c:760).
 /// Returns clients whose output buffers overflowed.
@@ -163,13 +191,22 @@ pub fn emit_xi2_device_changed(
     let Some(id_role) = state.xi_devices.role(id) else {
         return Vec::new();
     };
-    let Some(source_classes) = snapshot_device_classes(state, sourceid) else {
-        return Vec::new();
-    };
     let is_master = matches!(
         id_role,
         XiDeviceRole::MasterPointer | XiDeviceRole::MasterKeyboard
     );
+    let (class_device_id, event_sourceid, data_device_id) = if is_master {
+        let Some(master) = state.xi_devices.device(id) else {
+            return Vec::new();
+        };
+        (id, master.class_sourceid, sourceid)
+    } else {
+        (sourceid, sourceid, sourceid)
+    };
+    let Some(source_classes) = snapshot_device_classes(state, class_device_id, data_device_id)
+    else {
+        return Vec::new();
+    };
     // Xorg SendEventToAllWindows delivers at the root and recursively at
     // each selected child (Xi/exevents.c:3283-3292). DeviceChanged has no
     // window field, but each selected window still produces a delivery.
@@ -207,8 +244,7 @@ pub fn emit_xi2_device_changed(
                 state,
                 std::slice::from_ref(&client_id),
                 |buf, sequence, order| {
-                    let (classes, num_classes) =
-                        encode_device_classes(source_classes, sourceid, order);
+                    let (classes, num_classes) = encode_device_classes(source_classes, order);
                     x11::encode_xi2_device_changed_event(
                         buf,
                         order,
@@ -217,7 +253,7 @@ pub fn emit_xi2_device_changed(
                         id,
                         time,
                         num_classes,
-                        sourceid,
+                        event_sourceid,
                         reason as u8,
                         &classes,
                     );

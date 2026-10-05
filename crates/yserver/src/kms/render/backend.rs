@@ -35052,6 +35052,603 @@ mod tests {
         assert!(backend.core.pending_pointer_events.is_empty());
     }
 
+    fn xi_master_classes_dispatch_request(
+        state: &mut yserver_core::server::ServerState,
+        backend: &mut KmsBackend,
+        peer: &mut std::os::unix::net::UnixStream,
+        client: u32,
+        sequence: u16,
+        minor: u8,
+        body: &[u8],
+    ) -> Vec<u8> {
+        use yserver_core::core_loop::process_request;
+        use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
+
+        process_request::process_request(
+            state,
+            backend,
+            ClientId(client),
+            SequenceNumber(sequence),
+            RequestHeader {
+                opcode: 137,
+                data: minor,
+                length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+            },
+            body,
+            None,
+        )
+        .expect("XI request through the core dispatcher");
+        kbd_map_drain(peer)
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct XiMasterClassSummary {
+        class_types: Vec<u16>,
+        class_source_ids: Vec<u16>,
+        button_count: Option<u16>,
+        scroll_flags: Vec<u32>,
+    }
+
+    fn xi_master_class_summary(reply: &[u8], target_id: u16) -> XiMasterClassSummary {
+        assert_eq!(reply.first(), Some(&1), "XIQueryDevice reply: {reply:?}");
+        let num_devices = usize::from(u16::from_le_bytes([reply[8], reply[9]]));
+        let mut device_offset = 32;
+        for _ in 0..num_devices {
+            let device_id = u16::from_le_bytes([reply[device_offset], reply[device_offset + 1]]);
+            let num_classes = usize::from(u16::from_le_bytes([
+                reply[device_offset + 6],
+                reply[device_offset + 7],
+            ]));
+            let name_len = usize::from(u16::from_le_bytes([
+                reply[device_offset + 8],
+                reply[device_offset + 9],
+            ]));
+            let mut class_offset = device_offset + 12 + name_len;
+            while !class_offset.is_multiple_of(4) {
+                class_offset += 1;
+            }
+            let mut class_types = Vec::with_capacity(num_classes);
+            let mut class_source_ids = Vec::with_capacity(num_classes);
+            let mut button_count = None;
+            let mut scroll_flags = Vec::new();
+            for _ in 0..num_classes {
+                let class_type = u16::from_le_bytes([reply[class_offset], reply[class_offset + 1]]);
+                let class_units = usize::from(u16::from_le_bytes([
+                    reply[class_offset + 2],
+                    reply[class_offset + 3],
+                ]));
+                class_types.push(class_type);
+                class_source_ids.push(u16::from_le_bytes([
+                    reply[class_offset + 4],
+                    reply[class_offset + 5],
+                ]));
+                if class_type == 1 {
+                    button_count = Some(u16::from_le_bytes([
+                        reply[class_offset + 6],
+                        reply[class_offset + 7],
+                    ]));
+                } else if class_type == 3 {
+                    scroll_flags.push(u32::from_le_bytes(
+                        reply[class_offset + 12..class_offset + 16]
+                            .try_into()
+                            .unwrap(),
+                    ));
+                }
+                class_offset += class_units * 4;
+            }
+            if device_id == target_id {
+                return XiMasterClassSummary {
+                    class_types,
+                    class_source_ids,
+                    button_count,
+                    scroll_flags,
+                };
+            }
+            device_offset = class_offset;
+        }
+        panic!("XIQueryDevice reply omitted device {target_id}");
+    }
+
+    fn xi_master_changed_summaries(bytes: &[u8]) -> Vec<(u16, u16, u8, XiMasterClassSummary)> {
+        let mut result = Vec::new();
+        let mut offset = 0;
+        while offset + 32 <= bytes.len() {
+            assert_eq!(bytes[offset], 35, "XI2 GenericEvent stream");
+            let units = usize::try_from(u32::from_le_bytes(
+                bytes[offset + 4..offset + 8].try_into().unwrap(),
+            ))
+            .unwrap();
+            let event_len = 32 + units * 4;
+            assert!(
+                offset + event_len <= bytes.len(),
+                "complete DeviceChanged event"
+            );
+            assert_eq!(
+                u16::from_le_bytes([bytes[offset + 8], bytes[offset + 9]]),
+                1,
+                "XI_DeviceChanged"
+            );
+            let num_classes =
+                usize::from(u16::from_le_bytes([bytes[offset + 16], bytes[offset + 17]]));
+            let mut class_offset = offset + 32;
+            let mut summary = XiMasterClassSummary {
+                class_types: Vec::with_capacity(num_classes),
+                class_source_ids: Vec::with_capacity(num_classes),
+                button_count: None,
+                scroll_flags: Vec::new(),
+            };
+            for _ in 0..num_classes {
+                let class_type = u16::from_le_bytes([bytes[class_offset], bytes[class_offset + 1]]);
+                let class_units = usize::from(u16::from_le_bytes([
+                    bytes[class_offset + 2],
+                    bytes[class_offset + 3],
+                ]));
+                summary.class_types.push(class_type);
+                summary.class_source_ids.push(u16::from_le_bytes([
+                    bytes[class_offset + 4],
+                    bytes[class_offset + 5],
+                ]));
+                if class_type == 1 {
+                    summary.button_count = Some(u16::from_le_bytes([
+                        bytes[class_offset + 6],
+                        bytes[class_offset + 7],
+                    ]));
+                } else if class_type == 3 {
+                    summary.scroll_flags.push(u32::from_le_bytes(
+                        bytes[class_offset + 12..class_offset + 16]
+                            .try_into()
+                            .unwrap(),
+                    ));
+                }
+                class_offset += class_units * 4;
+            }
+            assert_eq!(class_offset, offset + event_len, "class block fills event");
+            result.push((
+                u16::from_le_bytes([bytes[offset + 10], bytes[offset + 11]]),
+                u16::from_le_bytes([bytes[offset + 18], bytes[offset + 19]]),
+                bytes[offset + 20],
+                summary,
+            ));
+            offset += event_len;
+        }
+        assert_eq!(offset, bytes.len(), "complete XI2 event stream");
+        result
+    }
+
+    #[test]
+    fn xi_master_classes_initial_pointer_uses_core_pointer_shape_and_own_sourceid() {
+        // Kills an encoder mutation that always gives master 2 the physical
+        // pointer class set instead of CorePointerProc's initial classes.
+        use yserver_core::server::ServerState;
+
+        const CLIENT: u32 = 0xA740;
+        let mut state = ServerState::new();
+        let mut backend = KmsBackend::for_tests();
+        let mut peer = kbd_map_client_id(&mut state, CLIENT);
+        let before_ids: Vec<_> = state.xi_devices.devices().iter().map(|d| d.id).collect();
+        let before_properties: HashMap<_, _> = state
+            .xi_devices
+            .devices()
+            .iter()
+            .map(|device| (device.id, device.properties.clone()))
+            .collect();
+        let before_selections = (
+            state.clients[&CLIENT].event_masks.clone(),
+            state.clients[&CLIENT].xi2_masks.clone(),
+            state.clients[&CLIENT].xi1_event_classes.clone(),
+            state.clients[&CLIENT].xi1_window_event_classes.clone(),
+        );
+        let before_held = (
+            state.keys_down,
+            state.buttons_down,
+            state
+                .xi_devices
+                .devices()
+                .iter()
+                .map(|device| (device.id, device.buttons_down))
+                .collect::<Vec<_>>(),
+        );
+        let before_detached = state.xi2_detached_masters.clone();
+        let before_floating = state.floating_pointer_positions.clone();
+
+        let pointer = xi_master_classes_dispatch_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            CLIENT,
+            1,
+            48,
+            &[2, 0, 0, 0],
+        );
+        assert_eq!(
+            xi_master_class_summary(&pointer, 2),
+            XiMasterClassSummary {
+                class_types: vec![1, 2, 2],
+                class_source_ids: vec![2, 2, 2],
+                button_count: Some(10),
+                scroll_flags: vec![],
+            },
+            "a fresh master pointer uses CorePointerProc classes sourced from itself"
+        );
+
+        let keyboard = xi_master_classes_dispatch_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            CLIENT,
+            2,
+            48,
+            &[3, 0, 0, 0],
+        );
+        assert_eq!(
+            xi_master_class_summary(&keyboard, 3),
+            XiMasterClassSummary {
+                class_types: vec![0],
+                class_source_ids: vec![3],
+                button_count: None,
+                scroll_flags: vec![],
+            },
+            "a fresh master keyboard keeps its own initial key-class sourceid"
+        );
+
+        assert_eq!(
+            state
+                .xi_devices
+                .devices()
+                .iter()
+                .map(|d| d.id)
+                .collect::<Vec<_>>(),
+            before_ids,
+            "read-only queries do not change registry membership"
+        );
+        for device in state.xi_devices.devices() {
+            assert_eq!(device.properties, before_properties[&device.id]);
+        }
+        assert_eq!(
+            (
+                state.keys_down,
+                state.buttons_down,
+                state
+                    .xi_devices
+                    .devices()
+                    .iter()
+                    .map(|device| (device.id, device.buttons_down))
+                    .collect::<Vec<_>>(),
+            ),
+            before_held
+        );
+        assert_eq!(state.xi2_detached_masters, before_detached);
+        assert_eq!(state.floating_pointer_positions, before_floating);
+        assert_eq!(
+            (
+                state.clients[&CLIENT].event_masks.clone(),
+                state.clients[&CLIENT].xi2_masks.clone(),
+                state.clients[&CLIENT].xi1_event_classes.clone(),
+                state.clients[&CLIENT].xi1_window_event_classes.clone(),
+            ),
+            before_selections
+        );
+    }
+
+    #[test]
+    fn xi_master_classes_store_last_slave_shape_after_removal_then_xtest_switch() {
+        // Kills deriving class sourceid from lastSlave after it is cleared,
+        // and kills encoding master 2 with a fixed physical class shape.
+        use yserver_core::{
+            backend::Backend,
+            core_loop::{DeviceInfo, HostInputEvent, InputOrigin},
+            resources::ROOT_WINDOW,
+            server::ServerState,
+            xinput::{InputCapabilities, InputSourceId, XiFacetKind},
+        };
+
+        const CLIENT: u32 = 0xA741;
+        const SOURCE: InputSourceId = InputSourceId(0xA741);
+        const DEVICE_CHANGED_MASK: u32 = 1 << 1;
+        let mut state = ServerState::new();
+        let mut backend = KmsBackend::for_tests();
+        backend
+            .core
+            .xid_map
+            .insert(backend.core.window_id, ROOT_WINDOW);
+        let mut peer = kbd_map_client_id(&mut state, CLIENT);
+        let initial_registry: Vec<_> = state
+            .xi_devices
+            .devices()
+            .iter()
+            .map(|device| {
+                (
+                    device.id,
+                    device.enabled,
+                    device.session_enabled,
+                    device.client_disabled,
+                    device.source_id,
+                    device.facet,
+                    device.attached_master,
+                    device.properties.clone(),
+                )
+            })
+            .collect();
+        let initial_properties: HashMap<_, _> = state
+            .xi_devices
+            .devices()
+            .iter()
+            .map(|device| (device.id, device.properties.clone()))
+            .collect();
+        let initial_held = (
+            state.keys_down,
+            state.buttons_down,
+            state
+                .xi_devices
+                .devices()
+                .iter()
+                .map(|device| (device.id, device.buttons_down))
+                .collect::<Vec<_>>(),
+        );
+        let initial_detached = state.xi2_detached_masters.clone();
+        let initial_floating = state.floating_pointer_positions.clone();
+        let initial_selections = (
+            state.clients[&CLIENT].event_masks.clone(),
+            state.clients[&CLIENT].xi2_masks.clone(),
+            state.clients[&CLIENT].xi1_event_classes.clone(),
+            state.clients[&CLIENT].xi1_window_event_classes.clone(),
+        );
+
+        let mut select = Vec::new();
+        select.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        select.extend_from_slice(&1u16.to_le_bytes());
+        select.extend_from_slice(&[0; 2]);
+        select.extend_from_slice(&2u16.to_le_bytes());
+        select.extend_from_slice(&1u16.to_le_bytes());
+        select.extend_from_slice(&DEVICE_CHANGED_MASK.to_le_bytes());
+        let selection_result = xi_master_classes_dispatch_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            CLIENT,
+            1,
+            46,
+            &select,
+        );
+        let initial_bootstrap = xi_master_changed_summaries(&selection_result);
+        assert_eq!(
+            initial_bootstrap.len(),
+            1,
+            "master selection gets one bootstrap"
+        );
+        assert_eq!(
+            initial_bootstrap[0],
+            (
+                2,
+                2,
+                1,
+                XiMasterClassSummary {
+                    class_types: vec![1, 2, 2],
+                    class_source_ids: vec![2; 3],
+                    button_count: Some(10),
+                    scroll_flags: vec![],
+                },
+            ),
+            "the initial DeviceChanged block matches master 2's stored CorePointerProc classes"
+        );
+        let selected_masks = (
+            state.clients[&CLIENT].event_masks.clone(),
+            state.clients[&CLIENT].xi2_masks.clone(),
+            state.clients[&CLIENT].xi1_event_classes.clone(),
+            state.clients[&CLIENT].xi1_window_event_classes.clone(),
+        );
+        let mut expected_xi2_selections = initial_selections.1.clone();
+        expected_xi2_selections.insert((ROOT_WINDOW, 2), u64::from(DEVICE_CHANGED_MASK));
+        assert_eq!(selected_masks.1, expected_xi2_selections);
+
+        let info = DeviceInfo {
+            source_id: SOURCE,
+            enabled: true,
+            resume_key: None,
+            capabilities: InputCapabilities {
+                keyboard: false,
+                pointer: true,
+                touch: false,
+            },
+            name: "master class test mouse".to_owned(),
+            device_node: "/dev/input/event-master-class".to_owned(),
+            sysname: "event-master-class".to_owned(),
+            vendor_id: 0x1234,
+            product_id: 0x5678,
+            is_touchpad: false,
+            config: Default::default(),
+        };
+        Backend::on_host_input(&mut backend, &mut state, HostInputEvent::DeviceAdded(info));
+        let physical_id = state
+            .xi_devices
+            .facet(SOURCE, XiFacetKind::PointerTouch)
+            .expect("DeviceAdded publishes the physical pointer facet");
+        assert_eq!(physical_id, 6);
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::PointerMotion {
+                origin: InputOrigin::Physical(SOURCE),
+                x: 240,
+                y: 160,
+                time: 1,
+                relative: false,
+                dx: 0,
+                dy: 0,
+                motion_delta: None,
+            },
+        );
+        let physical_changed = xi_master_changed_summaries(&kbd_map_drain(&mut peer));
+        assert_eq!(
+            physical_changed.len(),
+            1,
+            "one selected DeviceChanged event"
+        );
+        assert_eq!(
+            physical_changed[0],
+            (
+                2,
+                physical_id,
+                1,
+                XiMasterClassSummary {
+                    class_types: vec![1, 2, 2, 2, 2, 3, 3],
+                    class_source_ids: vec![physical_id; 7],
+                    button_count: Some(7),
+                    scroll_flags: vec![0, 0],
+                },
+            ),
+            "SlaveSwitch carries the copied physical classes and their sourceid"
+        );
+        let physical_query = xi_master_classes_dispatch_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            CLIENT,
+            2,
+            48,
+            &[2, 0, 0, 0],
+        );
+        assert_eq!(
+            xi_master_class_summary(&physical_query, 2),
+            physical_changed[0].3,
+            "XIQueryDevice serializes the same stored physical class set"
+        );
+        assert!(kbd_map_drain(&mut peer).is_empty());
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceRemoved { source_id: SOURCE },
+        );
+        assert_eq!(state.xi_last_slave(2), None, "removal clears lastSlave");
+        assert!(state.xi_devices.source(SOURCE).is_none());
+        assert!(state.xi_devices.device(physical_id).is_none());
+        assert!(
+            kbd_map_drain(&mut peer).is_empty(),
+            "removal has no class-switch event"
+        );
+        let removed_query = xi_master_classes_dispatch_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            CLIENT,
+            3,
+            48,
+            &[2, 0, 0, 0],
+        );
+        assert_eq!(
+            xi_master_class_summary(&removed_query, 2),
+            physical_changed[0].3,
+            "clearing lastSlave preserves the copied classes and sourceid"
+        );
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::PointerMotion {
+                origin: InputOrigin::XTest(4),
+                x: 400,
+                y: 300,
+                time: 2,
+                relative: false,
+                dx: 0,
+                dy: 0,
+                motion_delta: None,
+            },
+        );
+        let xtest_changed = xi_master_changed_summaries(&kbd_map_drain(&mut peer));
+        assert_eq!(
+            xtest_changed.len(),
+            1,
+            "XTEST source switch changes master classes"
+        );
+        assert_eq!(
+            xtest_changed[0],
+            (
+                2,
+                4,
+                1,
+                XiMasterClassSummary {
+                    class_types: vec![1, 2, 2],
+                    class_source_ids: vec![4; 3],
+                    button_count: Some(10),
+                    scroll_flags: vec![],
+                },
+            ),
+            "SlaveSwitch carries XTEST 4's CorePointerProc classes"
+        );
+        let xtest_query = xi_master_classes_dispatch_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            CLIENT,
+            4,
+            48,
+            &[2, 0, 0, 0],
+        );
+        assert_eq!(
+            xi_master_class_summary(&xtest_query, 2),
+            xtest_changed[0].3,
+            "XIQueryDevice and DeviceChanged use the same stored XTEST classes"
+        );
+
+        let final_registry: Vec<_> = state
+            .xi_devices
+            .devices()
+            .iter()
+            .map(|device| {
+                (
+                    device.id,
+                    device.enabled,
+                    device.session_enabled,
+                    device.client_disabled,
+                    device.source_id,
+                    device.facet,
+                    device.attached_master,
+                    device.properties.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            final_registry, initial_registry,
+            "removing the test mouse restores the original live registry"
+        );
+        for device in state.xi_devices.devices() {
+            assert_eq!(device.properties, initial_properties[&device.id]);
+            assert_eq!(device.buttons_down, 0);
+        }
+        assert_eq!(
+            (
+                state.keys_down,
+                state.buttons_down,
+                state
+                    .xi_devices
+                    .devices()
+                    .iter()
+                    .map(|device| (device.id, device.buttons_down))
+                    .collect::<Vec<_>>(),
+            ),
+            initial_held
+        );
+        assert!(state.key_down_by_device.is_empty());
+        assert_eq!(state.xi2_detached_masters, initial_detached);
+        assert_eq!(state.floating_pointer_positions, initial_floating);
+        assert_eq!(selected_masks.0, initial_selections.0);
+        assert_eq!(selected_masks.2, initial_selections.2);
+        assert_eq!(selected_masks.3, initial_selections.3);
+        assert_eq!(
+            (
+                state.clients[&CLIENT].event_masks.clone(),
+                state.clients[&CLIENT].xi2_masks.clone(),
+                state.clients[&CLIENT].xi1_event_classes.clone(),
+                state.clients[&CLIENT].xi1_window_event_classes.clone(),
+            ),
+            selected_masks
+        );
+        assert!(state.pending_xi_device_removals.is_empty());
+        assert!(state.clients[&CLIENT].outbound.is_empty());
+    }
+
     #[test]
     fn xi_slave_switch_kms_keyboard_precedes_raw_and_key_events() {
         use yserver_core::{

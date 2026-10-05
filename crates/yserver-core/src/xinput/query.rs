@@ -4,7 +4,9 @@ use std::io::{self, Error, ErrorKind};
 
 use yserver_protocol::x11::{self, AtomId, ClientByteOrder, SequenceNumber};
 
-use super::{DEVICEID_MASTER_KEYBOARD, DEVICEID_MASTER_POINTER, XiDevice, XiFacetKind};
+use super::{
+    DEVICEID_MASTER_KEYBOARD, DEVICEID_MASTER_POINTER, XiClassShape, XiDevice, XiFacetKind,
+};
 
 /// XI2 device selectors use the same XInput `BadDevice` error for an
 /// unrecognized exact ID.
@@ -43,9 +45,9 @@ pub(crate) fn encode_reply(
     for device in devices {
         let (use_type, attachment, class) = device_descriptor(device)?;
         let (classes, num_classes) = match class {
-            DeviceClass::Pointer => build_pointer_classes(
+            DeviceClass::Pointer => build_pointer_classes_for_shape(
                 byte_order,
-                device.id,
+                device.class_sourceid,
                 if device.id == super::DEVICEID_MASTER_POINTER {
                     class_data
                 } else {
@@ -54,8 +56,9 @@ pub(crate) fn encode_reply(
                         ..class_data
                     }
                 },
+                device.class_shape,
             ),
-            DeviceClass::Keyboard => build_key_classes(byte_order, device.id),
+            DeviceClass::Keyboard => build_key_classes(byte_order, device.class_sourceid),
         };
         write_device_info(
             byte_order,
@@ -156,11 +159,26 @@ pub(crate) fn build_pointer_classes(
     source_id: u16,
     data: XiQueryClassData,
 ) -> (Vec<u8>, u16) {
-    if source_id == super::DEVICEID_XTEST_POINTER {
-        // XTEST pointer 4 is initialized by `CorePointerProc`
-        // (`dix/devices.c:662-694`); keep its shape distinct from physical
-        // pointers, whose generic classes below support GDK's scroll setup.
-        return build_xtest_pointer_classes(byte_order, source_id, data);
+    let shape = if source_id == super::DEVICEID_XTEST_POINTER {
+        XiClassShape::CorePointer
+    } else {
+        XiClassShape::PhysicalPointer
+    };
+    build_pointer_classes_for_shape(byte_order, source_id, data, shape)
+}
+
+pub(crate) fn build_pointer_classes_for_shape(
+    byte_order: ClientByteOrder,
+    source_id: u16,
+    data: XiQueryClassData,
+    shape: XiClassShape,
+) -> (Vec<u8>, u16) {
+    if shape == XiClassShape::CorePointer {
+        // Xorg initializes master pointer 2 and XTEST pointer 4 through
+        // `CorePointerProc` (`dix/devices.c:655-700`, `:724-730`). Keep that
+        // shape distinct from physical pointers, whose existing generic
+        // classes below support GDK's scroll setup.
+        return build_core_pointer_classes(byte_order, source_id, data);
     }
 
     // GDK builds its seat/device table from the XI2 hierarchy and probes the
@@ -220,7 +238,7 @@ pub(crate) fn build_pointer_classes(
     (classes, 7)
 }
 
-fn build_xtest_pointer_classes(
+fn build_core_pointer_classes(
     byte_order: ClientByteOrder,
     source_id: u16,
     data: XiQueryClassData,

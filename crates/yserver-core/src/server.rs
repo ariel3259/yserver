@@ -2279,11 +2279,24 @@ impl ServerState {
             return false;
         }
         *last_slave = Some(slave_id);
+        // Xorg UpdateFromMaster copies each present class from the new slave
+        // and records that slave ID in the copied class (`Xi/exevents.c:592,
+        // 630`). Store the class metadata separately from lastSlave so
+        // disable/removal can clear the latter without resetting XIQueryDevice
+        // or DeviceChanged's retained class source.
+        let class_shape = device.class_shape;
+        if let Some(master) = self.xi_devices.device_mut(master_id) {
+            master.class_shape = class_shape;
+            master.class_sourceid = slave_id;
+        }
         true
     }
 
-    /// Clear a source reference before its slave is disabled, detached, or
-    /// removed. It is harmless when the device was not current.
+    /// Clear only the `lastSlave` reference before its slave is disabled,
+    /// detached, or removed. Xorg's `DisableDevice` does the same at
+    /// `dix/devices.c:488-492`; copied classes and their source IDs remain
+    /// stored until a later `DeepCopyDeviceClasses` switch replaces them.
+    /// It is harmless when the device was not current.
     pub fn xi_clear_last_slave(&mut self, slave_id: u16) {
         if self.xi_last_pointer_slave == Some(slave_id) {
             self.xi_last_pointer_slave = None;

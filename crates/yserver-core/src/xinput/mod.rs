@@ -152,6 +152,14 @@ pub struct XiDevice {
     pub facet: Option<XiFacetKind>,
     /// Master this slave is attached to, when it is a slave device.
     pub attached_master: Option<u16>,
+    /// Source ID stored on this device's classes. Initial ButtonClass and
+    /// ValuatorClass records use the device's own ID (`dix/devices.c:1307,
+    /// 1382`); copied master classes retain the copied ID independently of
+    /// `lastSlave` (`Xi/exevents.c:592,630`).
+    pub(crate) class_sourceid: u16,
+    /// Shape of this device's current XI class set. A master copies this on
+    /// each slave switch; clearing `lastSlave` intentionally leaves it alone.
+    pub(crate) class_shape: XiClassShape,
     /// True when the pointer facet is a touchpad. Set from source metadata
     /// when registered; the legacy slice helper also maintains it. Used to
     /// select the XI 1.x device-type atom
@@ -176,8 +184,27 @@ pub struct XiDevice {
     pub scroll_axis_values: [i32; 2],
 }
 
+/// The XI class layouts represented by this registry stage.
+///
+/// `CorePointer` is Xorg `CorePointerProc` (`dix/devices.c:655-700`), used by
+/// masters 2 and XTEST pointer 4 initially. Physical pointers retain yserver's
+/// existing seven-class layout; keyboard devices have a KeyClass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum XiClassShape {
+    CorePointer,
+    PhysicalPointer,
+    Keyboard,
+}
+
 impl XiDevice {
     fn new(id: u16, name: &str) -> Self {
+        // Xorg's initial key class also carries its own ID
+        // (`xkb/xkbInit.c:547`); DeepCopyDeviceClasses replaces it on switch.
+        let class_shape = match id {
+            DEVICEID_MASTER_POINTER | DEVICEID_XTEST_POINTER => XiClassShape::CorePointer,
+            DEVICEID_MASTER_KEYBOARD | DEVICEID_XTEST_KEYBOARD => XiClassShape::Keyboard,
+            _ => unreachable!("new() is for fixed XI devices"),
+        };
         Self {
             id,
             name: name.to_owned(),
@@ -191,6 +218,8 @@ impl XiDevice {
                 DEVICEID_XTEST_KEYBOARD => Some(DEVICEID_MASTER_KEYBOARD),
                 _ => None,
             },
+            class_sourceid: id,
+            class_shape,
             is_touchpad: false,
             device_node: None,
             properties: BTreeMap::new(),
@@ -213,6 +242,11 @@ impl XiDevice {
             source_id: Some(info.source_id),
             facet: Some(facet),
             attached_master: info.enabled.then_some(home_master),
+            class_sourceid: id,
+            class_shape: match facet {
+                XiFacetKind::Keyboard => XiClassShape::Keyboard,
+                XiFacetKind::PointerTouch => XiClassShape::PhysicalPointer,
+            },
             is_touchpad: facet == XiFacetKind::PointerTouch && info.is_touchpad,
             device_node: Some(info.device_node.clone()),
             properties: BTreeMap::new(),
