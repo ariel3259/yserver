@@ -3347,6 +3347,18 @@ fn run_core_with_inventory(
         // loops below depend on it for latency bounding, and measured
         // from here so the first request of the iteration always runs.
         let drain_start = Instant::now();
+        // Apply backend topology boundaries before admitting any deferred
+        // request. The wake is a notification, and can be ordered behind a
+        // request even though the boundary was produced first.
+        drain_requesterless_publications(
+            state,
+            backend,
+            &mut randr_mutation_gate,
+            !xdmcp_terminate_pending
+                && deferred_reset_action.is_none()
+                && !reset_trigger.has_pending(),
+            None,
+        );
         // Drain backlog from prior iterations first. The ready ring gives each
         // active client one turn while the count/time cap still guarantees
         // input and page-flip maintenance between request slices.
@@ -3863,6 +3875,16 @@ fn run_core_with_inventory(
                                 xi_config_lane.reject_unsubmitted_for_vt_release = false;
                             }
                             Message::VtAcquire => {
+                                dispatch_vt_acquire(state, backend);
+                                drain_requesterless_publications(
+                                    state,
+                                    backend,
+                                    &mut randr_mutation_gate,
+                                    !xdmcp_terminate_pending
+                                        && deferred_reset_action.is_none()
+                                        && !reset_trigger.has_pending(),
+                                    None,
+                                );
                                 drain_vt_release_requests(
                                     state,
                                     backend,
