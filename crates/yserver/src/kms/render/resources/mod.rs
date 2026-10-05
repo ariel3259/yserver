@@ -579,6 +579,9 @@ impl ResourceService {
         if !matches!(payload, AllocationPayload::DirectFramebuffer(_)) {
             return Err((ResourceError::InvalidState, payload));
         }
+        if !registry.alias_creation_allowed() {
+            return Err((ResourceError::InvalidState, payload));
+        }
         if self
             .check_direct_framebuffer_adoptability(capacity, role, &permit)
             .is_err()
@@ -586,7 +589,15 @@ impl ResourceService {
             return Err((ResourceError::InvalidProof, payload));
         }
         let lease = self.adopt_unchecked_with_kind(payload, UseKind::DirectFramebuffer)?;
-        registry.register_payload_alias(lease.key());
+        if !registry.register_payload_alias(lease.key()) {
+            log::error!(
+                "resource: payload alias registration was refused after direct framebuffer admission"
+            );
+            let payload = self
+                .release_fresh_adoption(lease)
+                .unwrap_or_else(|_| panic!("new direct framebuffer alias could not be reclaimed"));
+            return Err((ResourceError::InvalidState, payload));
+        }
         Ok(lease)
     }
 
@@ -602,10 +613,19 @@ impl ResourceService {
         payload: AllocationPayload,
         registry: &mut DrmCleanupRegistry,
     ) -> Result<AllocationLease, (ResourceError, AllocationPayload)> {
+        if !registry.alias_creation_allowed() && payload.file_owned_alias_present() {
+            return Err((ResourceError::InvalidState, payload));
+        }
         let carries_file_owned_alias = payload.file_owned_alias_present();
         let lease = self.adopt_unchecked(payload)?;
-        if carries_file_owned_alias {
-            registry.register_payload_alias(lease.key());
+        if carries_file_owned_alias && !registry.register_payload_alias(lease.key()) {
+            log::error!(
+                "resource: payload alias registration was refused after file-owned alias admission"
+            );
+            let payload = self
+                .release_fresh_adoption(lease)
+                .unwrap_or_else(|_| panic!("new file-owned alias could not be reclaimed"));
+            return Err((ResourceError::InvalidState, payload));
         }
         Ok(lease)
     }
@@ -963,6 +983,22 @@ impl ResourceService {
         Ok(())
     }
 
+    /// Freeze every allocation owned by the selected incarnation. Poisoning
+    /// closes admission for the whole device, so even allocations not present
+    /// in the last uncertain commit must remain retained until teardown has
+    /// a proof for them.
+    pub(crate) fn freeze_incarnation(&mut self, device: DrmDeviceKey, incarnation: IncarnationId) {
+        if self.device != device || self.incarnation != incarnation {
+            return;
+        }
+        let keys = self.entries.keys().copied().collect::<Vec<_>>();
+        for key in keys {
+            // The key belongs to this service's bound incarnation, checked
+            // above, and each entry is still present in the same core turn.
+            let _ = self.freeze(key);
+        }
+    }
+
     pub(crate) fn is_frozen(&self, key: &AllocationKey) -> bool {
         self.entries.get(key).map(|e| e.frozen()).unwrap_or(false)
     }
@@ -1310,6 +1346,49 @@ impl ResourceService {
             }
         }
         transitions
+    }
+
+    pub(crate) fn discharge_file_owned_for_family(
+        &mut self,
+        key: AllocationKey,
+        registry: &mut DrmCleanupRegistry,
+    ) -> Result<(), std::io::Error> {
+        let entry = self.entries.get(&key).ok_or_else(|| {
+            std::io::Error::other(format!(
+                "file-family alias {key:?} is absent from its resource service"
+            ))
+        })?;
+        let mut payload = entry.payload.borrow_mut();
+        match payload.as_mut() {
+            Some(payload) => payload.discharge_file_owned(registry),
+            None => Err(std::io::Error::other(format!(
+                "file-family alias {key:?} has no resource payload"
+            ))),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn file_owned_gbm_bo_count_for_tests(&self) -> usize {
+        self.entries
+            .values()
+            .filter(|entry| {
+                entry
+                    .payload
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|payload| match payload {
+                        AllocationPayload::Scanout(allocation) => allocation
+                            .file_owned()
+                            .is_some_and(|file_owned| file_owned.gbm_bo().is_some()),
+                        AllocationPayload::DirectFramebuffer(_)
+                        | AllocationPayload::Storage(_)
+                        | AllocationPayload::CopiedSource(_)
+                        | AllocationPayload::Unused(_) => false,
+                        #[cfg(test)]
+                        AllocationPayload::Spy(_) => false,
+                    })
+            })
+            .count()
     }
 
     /// Like `service_ready`, but discharges a payload's file-owned half

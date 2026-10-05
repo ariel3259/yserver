@@ -841,6 +841,8 @@ pub(crate) struct PlatformInitDevice {
     pub(crate) key: crate::platform::drm::DrmDeviceKey,
     pub(crate) device: Rc<drm::Device>,
     pub(crate) executor: crate::kms::executor::KmsIoExecutor,
+    pub(crate) incarnation_fd_set: Rc<std::cell::RefCell<crate::kms::executor::IncarnationFdSet>>,
+    pub(crate) helper_lease: crate::kms::executor::LeaseId,
 }
 
 /// Transient handoff from device discovery to the long-lived renderer.
@@ -1042,6 +1044,12 @@ pub(crate) fn platform_init(
         }
         let incarnation = crate::kms::owner::identity::IncarnationId::first();
         let lifecycle_epoch = crate::kms::owner::lifecycle::LifecycleEpochId::first();
+        let incarnation_fd_set = Rc::new(std::cell::RefCell::new(
+            crate::kms::executor::IncarnationFdSet::new(),
+        ));
+        let helper_lease = incarnation_fd_set
+            .borrow_mut()
+            .register_alias_from(std::os::fd::AsFd::as_fd(&*device))?;
         let mut executor = crate::kms::executor::KmsIoExecutor::spawn_with_device_lock(
             std::os::fd::AsFd::as_fd(&*device),
             incarnation,
@@ -1074,6 +1082,8 @@ pub(crate) fn platform_init(
             key: device_key,
             device,
             executor,
+            incarnation_fd_set,
+            helper_lease,
         });
     }
 

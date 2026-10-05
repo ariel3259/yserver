@@ -25,6 +25,9 @@ use std::{
     sync::Arc,
 };
 
+#[cfg(test)]
+use std::os::fd::AsRawFd;
+
 use ash::vk;
 use yserver_core::{
     backend::{
@@ -1971,6 +1974,8 @@ pub struct KmsBackend {
         crate::kms::owner::lifecycle::LifecycleCoordinator<DrmDeviceKey, OutputKey, IncarnationId>,
     pub(crate) lifecycle_drivers:
         std::collections::BTreeMap<DrmDeviceKey, crate::kms::render::admission::LifecycleDriver>,
+    /// Owner incarnations whose poison hook has started fd-family retirement.
+    pub(super) pending_poisoned_barriers: HashSet<DrmDeviceKey>,
     /// Last acknowledged ACTIVE state for each Owner device. Missing entries
     /// are conservatively treated as lit until the first registration.
     pub(crate) owner_dpms_installed_active: HashMap<DrmDeviceKey, bool>,
@@ -2574,6 +2579,10 @@ struct ProbeWorker {
     incarnation: Option<IncarnationId>,
     epoch: u64,
     join: std::thread::JoinHandle<()>,
+    lease: Option<(
+        Rc<RefCell<crate::kms::executor::IncarnationFdSet>>,
+        crate::kms::executor::LeaseId,
+    )>,
     stuck: bool,
 }
 
@@ -2590,6 +2599,22 @@ struct ProbeWorkerLedger {
 }
 
 impl ProbeWorkerLedger {
+    fn release_lease(
+        lease: Option<(
+            Rc<RefCell<crate::kms::executor::IncarnationFdSet>>,
+            crate::kms::executor::LeaseId,
+        )>,
+    ) {
+        if let Some((fd_set, lease)) = lease
+            && let Err(error) = fd_set.borrow_mut().release_with_proof(
+                lease,
+                crate::kms::executor::ReapProof::after_probe_worker_join(),
+            )
+        {
+            log::error!("kms: could not release joined connector-probe lease: {error:?}");
+        }
+    }
+
     /// A result is sent immediately before its worker returns. Join that
     /// worker while consuming the result so the ledger cannot retain a
     /// completed answer until a later, unrelated core wakeup. The worker has
@@ -2602,8 +2627,10 @@ impl ProbeWorkerLedger {
         if !matches_result {
             return;
         }
-        if let Some(worker) = self.workers.remove(&result.device) {
+        if let Some(mut worker) = self.workers.remove(&result.device) {
+            let lease = worker.lease.take();
             let _ = worker.join.join();
+            Self::release_lease(lease);
         }
     }
 
@@ -2616,8 +2643,10 @@ impl ProbeWorkerLedger {
         finished
             .into_iter()
             .filter_map(|device| {
-                self.workers.remove(&device).map(|worker| {
+                self.workers.remove(&device).map(|mut worker| {
+                    let lease = worker.lease.take();
                     let _ = worker.join.join();
+                    Self::release_lease(lease);
                     (device, worker.incarnation, worker.epoch, worker.stuck)
                 })
             })
@@ -2797,7 +2826,7 @@ pub struct LiveKmsFixture {
     pub(crate) backend: KmsBackend,
     snapshot: Option<LiveKmsCrtcSnapshot>,
     // Held only for their `Drop`: never read, by design.
-    _master: crate::kms::executor::test_support::DrmMasterGuard,
+    _master: Option<crate::kms::executor::test_support::DrmMasterGuard>,
     _exclusive: crate::kms::executor::test_support::LiveKmsFixtureGuard,
 }
 
@@ -3175,6 +3204,14 @@ fn restore_primary_output_after_rebuild(
 }
 
 impl KmsBackend {
+    fn owner_device_poisoned(&self, device: DrmDeviceKey) -> bool {
+        self.lifecycle_coordinator
+            .device(&device)
+            .is_some_and(|arbiter| {
+                arbiter.state() == crate::kms::owner::lifecycle::DeviceLifecycleState::Poisoned
+            })
+    }
+
     /// Service retired-output bundles and the resource releases their
     /// destruction makes ready, without composing. One entry for every site
     /// that services owner or resource completions -- `before_block`,
@@ -3195,6 +3232,112 @@ impl KmsBackend {
             self.drm_cleanup_registry.as_mut(),
         ) {
             let _ = service.service_ready_with_registry(registry);
+        }
+    }
+
+    pub(crate) fn barrier_ready(&self, incarnation: IncarnationId) -> bool {
+        let device = self.platform.devices.iter().find(|device| {
+            device
+                .owner
+                .as_ref()
+                .is_some_and(|owner| owner.incarnation() == incarnation)
+        });
+        let Some(device) = device else {
+            return false;
+        };
+        device.incarnation_fd_set.borrow().remaining_leases() == 0
+            && device.helper_reaped
+            && device.event_reader_detached
+            && device.device.attached().is_none()
+            && self.drm_cleanup_registry.as_ref().is_some_and(|registry| {
+                registry.incarnation() == incarnation
+                    && registry.submitters_detached()
+                    && registry.is_family_closed()
+            })
+    }
+
+    fn poll_poisoned_barrier(&mut self, device: DrmDeviceKey) -> bool {
+        let poisoned = self
+            .lifecycle_coordinator
+            .device(&device)
+            .is_some_and(|arbiter| {
+                arbiter.state() == crate::kms::owner::lifecycle::DeviceLifecycleState::Poisoned
+            });
+        if !poisoned {
+            return false;
+        }
+        let Some(incarnation) = self
+            .platform
+            .owner_ref(device)
+            .map(|owner| owner.incarnation())
+        else {
+            return false;
+        };
+        if self.barrier_ready(incarnation) {
+            return true;
+        }
+        let Some(fd_set) = self.platform.incarnation_fd_set(device) else {
+            return false;
+        };
+        if fd_set.borrow().remaining_leases() != 0 || !self.platform.helper_is_reaped(device) {
+            return false;
+        }
+        let Some(registry) = self.drm_cleanup_registry.as_mut().filter(|registry| {
+            registry.device_key() == device && registry.incarnation() == incarnation
+        }) else {
+            return false;
+        };
+
+        // Step 1 has completed: every executor/helper and connector-probe
+        // lease was released by its wait/join proof. Only now can aliases and
+        // the platform control handle be detached.
+        registry.mark_helper_reaped();
+        let scanout_native_owners_ready = self
+            .platform
+            .detach_managed_scanout_aliases(device, registry);
+        if !self.platform.control_device_detached(device)
+            && !self.platform.detach_control_device(device)
+        {
+            return false;
+        }
+        registry.mark_control_closed();
+        if !scanout_native_owners_ready {
+            return false;
+        }
+
+        let mut service = self.resource_service.as_mut();
+        let proof = registry.try_mint_file_family_closed(|registry, key| {
+            if let Some(service) = service.as_deref_mut() {
+                service.discharge_file_owned_for_family(key, registry)
+            } else {
+                Err(io::Error::other("file-owned alias has no resource service"))
+            }
+        });
+        match proof {
+            Ok(proof) => {
+                if let Err(error) = registry.retire_closed_family(proof) {
+                    log::error!("kms: closed-family retirement failed for {device:?}: {error:?}");
+                    false
+                } else {
+                    true
+                }
+            }
+            Err(_error) => {
+                // A remaining Rc owner is a barrier condition, not a mint.
+                // Other errors are also fail-closed and retried on the next
+                // core iteration after the owning subsystem advances.
+                false
+            }
+        }
+    }
+
+    fn poll_poisoned_barriers(&mut self) {
+        let devices = std::mem::take(&mut self.pending_poisoned_barriers);
+        for device in devices {
+            let still_poisoned = self.owner_device_poisoned(device);
+            if still_poisoned && !self.poll_poisoned_barrier(device) {
+                self.pending_poisoned_barriers.insert(device);
+            }
         }
     }
 
@@ -3245,7 +3388,7 @@ impl KmsBackend {
         let device = self
             .platform
             .device_for_key(service.device())
-            .map(|entry| Rc::clone(&entry.device));
+            .and_then(|entry| entry.device.clone_rc());
         let Some(device) = device else {
             log::error!(
                 "render: refusing to install resource service without its DRM device {}",
@@ -3834,6 +3977,12 @@ impl KmsBackend {
         let primary = self.platform.primary_device().ok_or_else(|| {
             io::Error::other("direct scanout submitted without an opened KMS device")
         })?;
+        let Some(attached) = primary.device.attached() else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "direct scanout submitted after its DRM device detached",
+            ));
+        };
         // B-10/R11: `true` on every production device today (no gate
         // installed, R8).
         let legacy_write_permitted = self.platform.allows_legacy(
@@ -3841,7 +3990,7 @@ impl KmsBackend {
             crate::kms::render::resources::WriterClass::Primary,
         );
         crate::drm::modeset::submit_direct_scanout(
-            &primary.device,
+            attached,
             fb,
             &plane_states,
             legacy_write_permitted,
@@ -4749,17 +4898,19 @@ impl KmsBackend {
         let primary = self.platform.primary_device().ok_or_else(|| {
             io::Error::other("scanout M2: composed unflip requested without a KMS device")
         })?;
+        let Some(attached) = primary.device.attached() else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "scanout M2: DRM device detached before composed unflip",
+            ));
+        };
         // B-10/R11: `true` on every production device today (no gate
         // installed, R8).
         let legacy_write_permitted = self.platform.allows_legacy(
             &primary.key,
             crate::kms::render::resources::WriterClass::Unflip,
         );
-        crate::drm::modeset::submit_composed_scanout(
-            &primary.device,
-            &planes,
-            legacy_write_permitted,
-        )?;
+        crate::drm::modeset::submit_composed_scanout(attached, &planes, legacy_write_permitted)?;
         self.scanout_m2.unflip_awaiting_outputs = (0..planes.len()).collect();
         let describe_frame = |frame: &DirectPresentFrame| {
             (
@@ -5145,8 +5296,14 @@ impl KmsBackend {
         let Some(primary) = self.platform.primary_device() else {
             return false;
         };
+        if self.owner_device_poisoned(primary.key) {
+            return false;
+        }
+        let Some(device) = primary.device.clone_rc() else {
+            return false;
+        };
         let Ok(framebuffer) = crate::drm::modeset::import_direct_scanout_framebuffer(
-            Rc::clone(&primary.device),
+            device,
             fd.as_fd(),
             u32::from(width),
             u32::from(height),
@@ -5410,7 +5567,7 @@ impl KmsBackend {
         }
         let token = self.next_crtc_config_token();
         let was_active = self.device_outputs_powered_on(output_key.device_key);
-        let kms_fd = self
+        let kms_device = self
             .platform
             .device_for_output(&output_key)
             .ok_or_else(|| {
@@ -5418,10 +5575,14 @@ impl KmsBackend {
                     io::ErrorKind::NotFound,
                     format!("no KMS device for asynchronous output {output_key:?}"),
                 )
-            })?
-            .device
-            .as_fd()
-            .try_clone_to_owned()?;
+            })?;
+        let Some(attached) = kms_device.device.attached() else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                format!("no open KMS fd for asynchronous output {output_key:?}"),
+            ));
+        };
+        let kms_fd = attached.as_fd().try_clone_to_owned()?;
         let (source_selector, copied_sink) = self
             .platform
             .scanout_qualification_devices_for_kms(output_key.device_key)?;
@@ -5793,8 +5954,26 @@ impl KmsBackend {
             self.scanout_m0.m1_probe_reject = self.scanout_m0.m1_probe_reject.saturating_add(1);
             return;
         };
+        if self.owner_device_poisoned(primary.key) {
+            self.scanout_m1.insert_with_serial(
+                source_id,
+                Some(backing_serial),
+                ScanoutM1ProbeEntry::rejected(),
+            );
+            self.scanout_m0.m1_probe_reject = self.scanout_m0.m1_probe_reject.saturating_add(1);
+            return;
+        }
+        let Some(device) = primary.device.clone_rc() else {
+            self.scanout_m1.insert_with_serial(
+                source_id,
+                Some(backing_serial),
+                ScanoutM1ProbeEntry::rejected(),
+            );
+            self.scanout_m0.m1_probe_reject = self.scanout_m0.m1_probe_reject.saturating_add(1);
+            return;
+        };
         let result = crate::drm::modeset::import_direct_scanout_framebuffer(
-            Rc::clone(&primary.device),
+            device,
             fd.as_fd(),
             u32::from(width),
             u32::from(height),
@@ -7862,6 +8041,7 @@ impl KmsBackend {
             admission_conductors: std::collections::BTreeMap::new(),
             lifecycle_coordinator: crate::kms::owner::lifecycle::LifecycleCoordinator::new(),
             lifecycle_drivers: std::collections::BTreeMap::new(),
+            pending_poisoned_barriers: HashSet::new(),
             owner_dpms_installed_active: HashMap::new(),
             resource_service: None,
             retired_output_deadline_override: None,
@@ -8778,7 +8958,7 @@ impl KmsBackend {
                 .expect("live-scene fixture output has a KMS owner");
             let pool = crate::kms::vk::scanout::ScanoutBoPool::allocate(
                 Arc::clone(&vk),
-                Rc::clone(&kms_device.device),
+                kms_device.device.clone_rc().expect("attached KMS device"),
                 layout.scanout_route,
                 u32::from(layout.width),
                 u32::from(layout.height),
@@ -8925,7 +9105,7 @@ impl KmsBackend {
              KmsDevice -- a multi-device fixture must not share it silently"
         );
         for kms_device in &mut base.platform.devices {
-            kms_device.device = Rc::clone(&real_device);
+            kms_device.device = Rc::clone(&real_device).into();
         }
         // The seed backend uses the scripted prober because its fd is a test
         // stand-in. Once the live DRM fd is installed, use the same prober as
@@ -8948,7 +9128,7 @@ impl KmsBackend {
                 .expect("live-scene fixture output has a KMS owner");
             let pool = crate::kms::vk::scanout::ScanoutBoPool::allocate(
                 Arc::clone(&vk),
-                Rc::clone(&kms_device.device),
+                kms_device.device.clone_rc().expect("attached KMS device"),
                 layout.scanout_route,
                 u32::from(layout.width),
                 u32::from(layout.height),
@@ -9038,7 +9218,10 @@ impl KmsBackend {
             "live-KMS fixture expects one KMS device from the existing live-scene fixture"
         );
 
-        let device = Rc::clone(&backend.platform.devices[0].device);
+        let device = backend.platform.devices[0]
+            .device
+            .clone_rc()
+            .expect("attached test DRM device");
         let actual_primary = crate::platform::drm::primary_device_key_from_fd(device.as_fd())?;
         assert_eq!(
             actual_primary, reported_primary,
@@ -9117,7 +9300,7 @@ impl KmsBackend {
         backend.platform.scanout_pools.clear();
         backend.platform.bo_generations.clear();
         backend.platform.devices[0].key = actual_primary;
-        backend.platform.devices[0].device = Rc::clone(&device);
+        backend.platform.devices[0].device = Rc::clone(&device).into();
         let route = backend.platform.scanout_route_for_kms(actual_primary)?;
         let vk = Arc::clone(
             backend
@@ -9198,7 +9381,7 @@ impl KmsBackend {
         Ok(LiveKmsFixture {
             backend,
             snapshot: Some(snapshot),
-            _master: master,
+            _master: Some(master),
             _exclusive: exclusive,
         })
     }
@@ -9442,6 +9625,7 @@ impl KmsBackend {
             admission_conductors: std::collections::BTreeMap::new(),
             lifecycle_coordinator: crate::kms::owner::lifecycle::LifecycleCoordinator::new(),
             lifecycle_drivers: std::collections::BTreeMap::new(),
+            pending_poisoned_barriers: HashSet::new(),
             owner_dpms_installed_active: HashMap::new(),
             resource_service: None,
             retired_output_deadline_override: None,
@@ -12432,10 +12616,13 @@ impl KmsBackend {
     }
 
     fn kms_provider_name(device: &crate::kms::render::platform::KmsDevice) -> String {
-        std::path::Path::new(device.device.path())
+        let Some(attached) = device.device.attached() else {
+            return format!("DRM device {} (detached)", device.key);
+        };
+        std::path::Path::new(attached.path())
             .file_name()
             .and_then(std::ffi::OsStr::to_str)
-            .unwrap_or_else(|| device.device.path())
+            .unwrap_or_else(|| attached.path())
             .to_string()
     }
 
@@ -16430,7 +16617,7 @@ impl KmsBackend {
         let Some(device) = self
             .platform
             .device_for_key(crtc_key.device_key)
-            .map(|device| Rc::clone(&device.device))
+            .and_then(|device| device.device.clone_rc())
         else {
             return Ok(0);
         };
@@ -17618,7 +17805,7 @@ impl KmsBackend {
         let Some(device) = self
             .platform
             .device_for_output(&request.key)
-            .map(|kms| Rc::clone(&kms.device))
+            .and_then(|kms| kms.device.clone_rc())
         else {
             log::warn!(
                 "kms: relight of {connector} skipped: DRM device {} is gone",
@@ -24371,7 +24558,10 @@ impl KmsBackend {
         let Some(device) = self.platform.device_for_output(&layout.key) else {
             return Ok(None);
         };
-        let info = device.device.get_crtc(crtc).map_err(|e| {
+        let Some(attached) = device.device.attached() else {
+            return Ok(None);
+        };
+        let info = attached.get_crtc(crtc).map_err(|e| {
             io::Error::other(format!(
                 "get_crtc gamma size for {output_key:?} failed: {e}"
             ))
@@ -24790,6 +24980,12 @@ impl KmsBackend {
         let Some(device) = self.platform.device_for_key(device_key) else {
             return Ok(());
         };
+        let Some(attached) = device.device.attached() else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                format!("gamma output {output_key:?} belongs to a detached DRM device"),
+            ));
+        };
         // B-10/R11: `true` on every production device today (no gate
         // installed, R8), checked immediately before the `set_gamma`
         // ioctl below.
@@ -24799,9 +24995,7 @@ impl KmsBackend {
         ) {
             return Err(crate::drm::transport_gate_refusal("gamma"));
         }
-        device
-            .device
-            .set_gamma(crtc, &lut.red, &lut.green, &lut.blue)
+        attached.set_gamma(crtc, &lut.red, &lut.green, &lut.blue)
     }
 
     fn reapply_gamma_for_output(&self, output_key: &OutputKey) {
@@ -24891,7 +25085,10 @@ impl KmsBackend {
             .iter()
             .any(|(key, _)| {
                 self.platform.device_for_key(*key).is_some_and(|device| {
-                    std::os::fd::AsRawFd::as_raw_fd(&device.device.as_fd()) == drm_fd
+                    device
+                        .device
+                        .attached()
+                        .is_some_and(|attached| attached.as_fd().as_raw_fd() == drm_fd)
                 })
             })
     }
@@ -24907,7 +25104,11 @@ impl KmsBackend {
                 let Some(device) = self.platform.device_for_key(*device_key) else {
                     continue;
                 };
-                if std::os::fd::AsRawFd::as_raw_fd(&device.device.as_fd()) != drm_fd {
+                if !device
+                    .device
+                    .attached()
+                    .is_some_and(|attached| attached.as_fd().as_raw_fd() == drm_fd)
+                {
                     continue;
                 }
                 let crate::drm::event_stream::DrmEventRecord::PageFlip {
@@ -24958,12 +25159,12 @@ impl KmsBackend {
         DrmDeviceKey,
         Vec<crate::kms::owner::device::OwnerEvent<crate::kms::render::resources::CommitResources>>,
     )> {
-        let Some(device) = self
-            .platform
-            .devices
-            .iter()
-            .find(|device| std::os::fd::AsRawFd::as_raw_fd(&device.device.as_fd()) == drm_fd)
-        else {
+        let Some(device) = self.platform.devices.iter().find(|device| {
+            device
+                .device
+                .attached()
+                .is_some_and(|attached| attached.as_fd().as_raw_fd() == drm_fd)
+        }) else {
             return Vec::new();
         };
         let device_key = device.key;
@@ -26700,7 +26901,10 @@ impl KmsBackend {
         }
         log::info!("kms: VT release — suspended; drmDropMaster");
         for device in &self.platform.devices {
-            if let Err(err) = device.device.release_master_lock() {
+            let Some(attached) = device.device.attached() else {
+                continue;
+            };
+            if let Err(err) = attached.release_master_lock() {
                 log::warn!("kms: drmDropMaster failed on {}: {err}", device.key);
             }
         }
@@ -26900,7 +27104,10 @@ impl KmsBackend {
             if self.vt_skip_master_ioctls_for_tests {
                 continue;
             }
-            if let Err(err) = ::drm::Device::release_master_lock(device.device.as_ref()) {
+            let Some(attached) = device.device.attached() else {
+                continue;
+            };
+            if let Err(err) = ::drm::Device::release_master_lock(attached) {
                 log::warn!("kms: drmDropMaster failed on {}: {err}", device.key);
             }
         }
@@ -28046,6 +28253,23 @@ impl KmsBackend {
                 });
                 continue;
             }
+            if incarnation.is_some()
+                && self
+                    .lifecycle_coordinator
+                    .device(&device)
+                    .is_some_and(|arbiter| {
+                        arbiter.state()
+                            == crate::kms::owner::lifecycle::DeviceLifecycleState::Poisoned
+                    })
+            {
+                self.queue_probe_result(ProbeWorkerResult {
+                    device,
+                    incarnation,
+                    epoch,
+                    result: Err(io::Error::from_raw_os_error(libc::ENODEV)),
+                });
+                continue;
+            }
             let Some(kms_device) = self.platform.device_for_key(device) else {
                 self.queue_probe_result(ProbeWorkerResult {
                     device,
@@ -28055,9 +28279,16 @@ impl KmsBackend {
                 });
                 continue;
             };
-            let fd = match crate::kms::render::platform::duplicate_connector_probe_fd(
-                kms_device.device.as_ref(),
-            ) {
+            let Some(attached) = kms_device.device.attached() else {
+                self.queue_probe_result(ProbeWorkerResult {
+                    device,
+                    incarnation,
+                    epoch,
+                    result: Err(io::Error::from_raw_os_error(libc::ENODEV)),
+                });
+                continue;
+            };
+            let fd = match crate::kms::render::platform::duplicate_connector_probe_fd(attached) {
                 Ok(fd) => fd,
                 Err(error) => {
                     self.queue_probe_result(ProbeWorkerResult {
@@ -28068,6 +28299,15 @@ impl KmsBackend {
                     });
                     continue;
                 }
+            };
+            let lease = if incarnation.is_some() {
+                let lease = kms_device
+                    .incarnation_fd_set
+                    .borrow_mut()
+                    .register_external_lease();
+                Some((Rc::clone(&kms_device.incarnation_fd_set), lease))
+            } else {
+                None
             };
             let sender = result_sender.clone();
             let wake = core_sender.clone();
@@ -28110,16 +28350,25 @@ impl KmsBackend {
                             incarnation,
                             epoch,
                             join,
+                            lease,
                             stuck: false,
                         },
                     );
                 }
-                Err(error) => self.queue_probe_result(ProbeWorkerResult {
-                    device,
-                    incarnation,
-                    epoch,
-                    result: Err(error),
-                }),
+                Err(error) => {
+                    if let Some((fd_set, lease)) = lease {
+                        let _ = fd_set.borrow_mut().release_with_proof(
+                            lease,
+                            crate::kms::executor::ReapProof::after_probe_worker_spawn_failed(),
+                        );
+                    }
+                    self.queue_probe_result(ProbeWorkerResult {
+                        device,
+                        incarnation,
+                        epoch,
+                        result: Err(error),
+                    });
+                }
             }
         }
         if self
@@ -28471,7 +28720,6 @@ impl KmsBackend {
 
     fn on_vt_acquire_legacy(&mut self, state: &mut ServerState) {
         use crate::vt::state::VtEventKind;
-        use ::drm::Device as _;
 
         log::info!("kms: VT acquire — begin; VT_RELDISP(VT_ACKACQ)");
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -28488,8 +28736,11 @@ impl KmsBackend {
             if self.vt_skip_master_ioctls_for_tests {
                 continue;
             }
+            let Some(attached) = device.device.attached() else {
+                continue;
+            };
             if let Err(err) = try_acquire_master_bounded(
-                || device.device.acquire_master_lock(),
+                || ::drm::Device::acquire_master_lock(attached),
                 10,
                 std::time::Duration::from_millis(5),
             ) {
@@ -28505,7 +28756,10 @@ impl KmsBackend {
                 "kms: at least one DRM device did not regain master; keeping scanout closed and exiting"
             );
             for device in &self.platform.devices {
-                if let Err(error) = device.device.release_master_lock() {
+                let Some(attached) = device.device.attached() else {
+                    continue;
+                };
+                if let Err(error) = ::drm::Device::release_master_lock(attached) {
                     log::warn!(
                         "kms: cleanup drmDropMaster failed on {} after partial acquire: {error}",
                         device.key
@@ -28593,7 +28847,7 @@ impl KmsBackend {
                 .is_some_and(|gate| {
                     gate.state() == crate::kms::render::resources::TransportState::Closed
                 });
-            if removed || closed {
+            if removed || closed || device.device.attached().is_none() {
                 log::info!(
                     "kms: VT acquire — skipping removed or closed DRM device {}",
                     device.key
@@ -28606,8 +28860,11 @@ impl KmsBackend {
             if self.vt_skip_master_ioctls_for_tests {
                 continue;
             }
+            let Some(attached) = device.device.attached() else {
+                continue;
+            };
             if let Err(err) = try_acquire_master_bounded(
-                || ::drm::Device::acquire_master_lock(device.device.as_ref()),
+                || ::drm::Device::acquire_master_lock(attached),
                 10,
                 std::time::Duration::from_millis(5),
             ) {
@@ -28621,7 +28878,10 @@ impl KmsBackend {
         if !acquired {
             log::error!("kms: at least one DRM device did not regain master; exiting");
             for device in &self.platform.devices {
-                if let Err(error) = ::drm::Device::release_master_lock(device.device.as_ref()) {
+                let Some(attached) = device.device.attached() else {
+                    continue;
+                };
+                if let Err(error) = ::drm::Device::release_master_lock(attached) {
                     log::warn!(
                         "kms: cleanup drmDropMaster failed on {} after partial acquire: {error}",
                         device.key
@@ -29620,6 +29880,7 @@ impl Backend for KmsBackend {
         self.telemetry.maybe_emit(self.engine.pending_count());
         let events = self.platform.tick_executors(std::time::Instant::now());
         self.record_host_call_events(events);
+        self.poll_poisoned_barriers();
         let now = std::time::Instant::now();
         // Pre-Cfb completion pass: runs on every device with a service,
         // Legacy included (2c-i progress, M-16/6.1). The direct-framebuffer
@@ -29681,6 +29942,7 @@ impl Backend for KmsBackend {
             .push("on_executor_readable");
         let events = self.platform.drain_executor_events();
         self.record_host_call_events(events);
+        self.platform.reap_terminated_helper_leases();
     }
 
     fn mark_dirty(&mut self) {
@@ -30627,7 +30889,7 @@ impl Backend for KmsBackend {
         let Some(device) = self
             .platform
             .device_for_key(crtc_key.device_key)
-            .map(|device| Rc::clone(&device.device))
+            .and_then(|device| device.device.clone_rc())
         else {
             return Ok(0);
         };
@@ -31186,18 +31448,16 @@ impl Backend for KmsBackend {
                 .map(CrtcConfigApply::Applied);
         }
 
-        let output_device = Rc::clone(
-            &self
-                .platform
-                .device_for_output(&output_key)
-                .ok_or_else(|| {
-                    io::Error::other(format!(
-                        "RANDR output {output_id} belongs to unavailable DRM device {}",
-                        output_key.device_key
-                    ))
-                })?
-                .device,
-        );
+        let output_device = self
+            .platform
+            .device_for_output(&output_key)
+            .and_then(|device| device.device.clone_rc())
+            .ok_or_else(|| {
+                io::Error::other(format!(
+                    "RANDR output {output_id} belongs to unavailable or detached DRM device {}",
+                    output_key.device_key
+                ))
+            })?;
         // Discovery and advertised-mode validation are deliberately completed
         // while the old topology is still lit. The live DRM output stays in
         // the pending entry; the executor receives one owned KMS-fd duplicate
@@ -31579,18 +31839,16 @@ impl Backend for KmsBackend {
                 output_key.connector_name
             )));
         }
-        let output_device = Rc::clone(
-            &self
-                .platform
-                .device_for_output(&output_key)
-                .ok_or_else(|| {
-                    io::Error::other(format!(
-                        "RANDR output {output_id} belongs to unavailable DRM device {}",
-                        output_key.device_key
-                    ))
-                })?
-                .device,
-        );
+        let output_device = self
+            .platform
+            .device_for_output(&output_key)
+            .and_then(|device| device.device.clone_rc())
+            .ok_or_else(|| {
+                io::Error::other(format!(
+                    "RANDR output {output_id} belongs to unavailable or detached DRM device {}",
+                    output_key.device_key
+                ))
+            })?;
 
         // Provider policy authorizes only the attempt. Exact real-operation
         // DMA-BUF allocation/import/render/TEST_ONLY probing remains in
@@ -38944,13 +39202,19 @@ impl Backend for KmsBackend {
         // path below remains responsible only for Legacy devices.
         self.lifecycle_set_dpms_power(level)?;
         let legacy_devices = self.dpms_legacy_devices();
-        let has_owner_outputs = self.platform.outputs.iter().any(|output| {
-            self.platform
-                .transport_gate(&output.key.device_key)
-                .is_some_and(|gate| {
-                    gate.state() == crate::kms::render::resources::TransportState::Owner
-                })
-        });
+        // Poison closes the transport gate immediately, while the lifecycle
+        // coordinator still owns that incarnation. Keep its DPMS requests
+        // logical during that interval; falling back to Legacy here would
+        // issue KMS calls through the detached event/control path.
+        let owner_incarnations = self
+            .lifecycle_owner_incarnation_devices()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let has_owner_outputs = self
+            .platform
+            .outputs
+            .iter()
+            .any(|output| owner_incarnations.contains(&output.key.device_key));
         let has_legacy_outputs = self
             .platform
             .outputs
@@ -39195,19 +39459,12 @@ impl KmsBackend {
         &self,
         target_device: DrmDeviceKey,
     ) -> Option<HashSet<DrmDeviceKey>> {
-        let target_is_legacy = !self
-            .platform
-            .transport_gate(&target_device)
-            .is_some_and(|gate| {
-                gate.state() == crate::kms::render::resources::TransportState::Owner
-            });
-        let has_owner_device = self.platform.devices.iter().any(|device| {
-            self.platform
-                .transport_gate(&device.key)
-                .is_some_and(|gate| {
-                    gate.state() == crate::kms::render::resources::TransportState::Owner
-                })
-        });
+        let owner_incarnations = self
+            .lifecycle_owner_incarnation_devices()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let target_is_legacy = !owner_incarnations.contains(&target_device);
+        let has_owner_device = !owner_incarnations.is_empty();
         (target_is_legacy && has_owner_device).then(|| self.dpms_legacy_devices())
     }
 
@@ -39765,7 +40022,13 @@ mod tests {
             .devices
             .push(crate::kms::render::platform::KmsDevice {
                 key,
-                device,
+                device: device.into(),
+                incarnation_fd_set: std::rc::Rc::new(std::cell::RefCell::new(
+                    crate::kms::executor::IncarnationFdSet::new(),
+                )),
+                helper_lease: None,
+                helper_reaped: false,
+                event_reader_detached: false,
                 active_property_cache: Default::default(),
                 cursor: crate::kms::render::platform::KmsCursorState::new(),
                 executor: None,
@@ -55359,7 +55622,8 @@ mod tests {
             .device_for_key(device_key)
             .expect("live-scene fixture output has a KMS owner")
             .device
-            .clone();
+            .clone_rc()
+            .expect("live-scene fixture DRM device attached");
         let cleanup_calls = Rc::new(RefCell::new(Vec::new()));
         let mut registry = DrmCleanupRegistry::new_with_device_and_io(
             kms_device_rc,
@@ -55581,7 +55845,8 @@ mod tests {
             .device_for_key(device_key)
             .expect("live-scene fixture output has a KMS owner")
             .device
-            .clone();
+            .clone_rc()
+            .expect("live-scene fixture DRM device attached");
         let cleanup_calls = Rc::new(RefCell::new(Vec::new()));
         let mut registry = DrmCleanupRegistry::new_with_device_and_io(
             kms_device_rc,
@@ -60861,7 +61126,7 @@ mod tests {
             .devices
             .first()
             .and_then(|d| d.executor.as_ref())
-            .and_then(|e| e.control_fd())
+            .and_then(|executor| executor.control_fd())
             .expect("control fd");
         crate::kms::executor::test_support::wait_readable(fd.as_fd(), timeout);
     }
@@ -64556,13 +64821,16 @@ mod tests {
         if use_real_connector {
             use ::drm::{ClientCapability, Device as _};
 
-            let drm_device = Rc::clone(
-                &backend
-                    .platform
-                    .device_for_key(sink_primary)
-                    .ok_or_else(|| std::io::Error::other("copied fixture KMS device disappeared"))?
-                    .device,
-            );
+            let drm_device = backend
+                .platform
+                .device_for_key(sink_primary)
+                .and_then(|device| device.device.clone_rc())
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "copied fixture KMS device disappeared or detached",
+                    )
+                })?;
             for capability in [ClientCapability::UniversalPlanes, ClientCapability::Atomic] {
                 let _ = drm_device.set_client_capability(capability, true);
             }
@@ -64647,10 +64915,16 @@ mod tests {
             .platform
             .device_for_key(sink_primary)
             .ok_or_else(|| std::io::Error::other("copied fixture sink KMS device disappeared"))?;
+        let drm_device = kms_device.device.clone_rc().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "copied fixture sink KMS device detached",
+            )
+        })?;
         let plans = crate::kms::vk::scanout::CopiedScanoutPool::exact_allocation_plans(
             &source_vk,
             &sink_vk,
-            &kms_device.device,
+            &drm_device,
             u32::from(output.width),
             &output.output.scanout_modifiers,
         );
@@ -64665,7 +64939,7 @@ mod tests {
             match crate::kms::vk::scanout::CopiedScanoutPool::allocate_exact(
                 Arc::clone(&source_vk),
                 Arc::clone(&sink_vk),
-                Rc::clone(&kms_device.device),
+                Rc::clone(&drm_device),
                 route,
                 destination_route,
                 u32::from(output.width),
@@ -64861,12 +65135,26 @@ mod tests {
         backend.platform.devices[0].owner = Some(
             crate::kms::owner::device::DeviceCommitOwner::new(incarnation, lifecycle, 1),
         );
+        let helper_lease = backend.platform.devices[0]
+            .incarnation_fd_set
+            .borrow_mut()
+            .register_alias_from(
+                backend.platform.devices[0]
+                    .device
+                    .attached()
+                    .expect("live-scene fixture DRM device attached")
+                    .as_fd(),
+            )?;
+        backend.platform.devices[0].helper_lease = Some(helper_lease);
         let device = backend
             .platform
             .device_for_key(device_key)
             .ok_or_else(|| std::io::Error::other("live-scene fixture device disappeared"))?
             .device
-            .clone();
+            .clone_rc()
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotConnected, "fixture device detached")
+            })?;
         let cleanup_calls = Rc::new(RefCell::new(Vec::new()));
         let cleanup_io = MockCleanupIo::new(Rc::clone(&cleanup_calls));
         let mut registry = DrmCleanupRegistry::new_with_device_and_io(
@@ -70068,7 +70356,8 @@ mod tests {
             let drm_event_fd: std::os::fd::OwnedFd = drm_event_fd.into();
             backend.platform.devices[0].device = std::rc::Rc::new(
                 crate::drm::Device::from_file_for_tests(std::fs::File::from(drm_event_fd)),
-            );
+            )
+            .into();
             backend
                 .try_finish_legacy_transport(device, std::time::Instant::now())
                 .expect("clear the Legacy permit through the production handoff");
@@ -70192,13 +70481,13 @@ mod tests {
         c0_conv_ciii_id_push_output_for_device(&mut backend, owner_device, 91, "owner-test");
         let owner_output_idx = 1;
         let vk = backend.platform.vk().expect("live test Vulkan").clone();
-        let drm = std::rc::Rc::clone(
-            &backend
-                .platform
-                .device_for_key(owner_device)
-                .expect("Owner KMS device")
-                .device,
-        );
+        let drm = backend
+            .platform
+            .device_for_key(owner_device)
+            .expect("Owner KMS device")
+            .device
+            .clone_rc()
+            .expect("Owner test DRM device attached");
         let mut owner_bo = crate::kms::vk::scanout::ScanoutBo::for_tests(drm, vk);
         owner_bo.state.transition_to_recording();
         owner_bo.state.transition_to_submitted(-1);
@@ -71740,13 +72029,36 @@ mod tests {
         backend: &mut super::KmsBackend,
         behaviour: crate::kms::executor::test_support::StubBehaviour,
     ) {
-        if let Some(executor) = backend.platform.devices[0].executor.as_mut() {
+        let device = &mut backend.platform.devices[0];
+        if let Some(executor) = device.executor.as_mut() {
             crate::kms::executor::test_support::kill_and_reap(executor);
+            if let Some(proof) = executor.take_reap_proof()
+                && let Some(lease) = device.helper_lease.take()
+            {
+                device
+                    .incarnation_fd_set
+                    .borrow_mut()
+                    .release_with_proof(lease, proof)
+                    .expect("release reaped Owner fixture helper lease");
+            }
         }
-        backend.platform.devices[0].executor = Some(
-            crate::kms::executor::test_support::spawn_stub_helper(behaviour)
-                .expect("replace Owner test executor"),
+        let executor = crate::kms::executor::test_support::spawn_stub_helper(behaviour)
+            .expect("replace Owner test executor");
+        let device = &mut backend.platform.devices[0];
+        device.helper_lease = Some(
+            device
+                .incarnation_fd_set
+                .borrow_mut()
+                .register_alias_from(
+                    device
+                        .device
+                        .attached()
+                        .expect("attached test DRM device")
+                        .as_fd(),
+                )
+                .expect("track replacement Owner helper lease"),
         );
+        device.executor = Some(executor);
     }
 
     fn c0_3aii_apply_dpms_transition(
@@ -72078,7 +72390,23 @@ mod tests {
         backend.platform.devices[0].key = device_key;
         backend.platform.outputs[0].key.device_key = device_key;
         backend.platform.outputs[0].scanout_route.kms_device_key = device_key;
-        let drm_device = Rc::clone(&backend.platform.devices[0].device);
+        let scanout_route = backend.platform.outputs[0].scanout_route;
+        match backend.platform.scanout_pools[0]
+            .as_mut()
+            .expect("live-scene fixture retains its scanout pool")
+        {
+            crate::kms::vk::scanout::OutputScanout::Shared(pool) => {
+                pool.route = scanout_route;
+            }
+            crate::kms::vk::scanout::OutputScanout::Copied(pool) => {
+                pool.route = scanout_route;
+                pool.destinations.route = scanout_route;
+            }
+        }
+        let drm_device = backend.platform.devices[0]
+            .device
+            .clone_rc()
+            .expect("attached test DRM device");
         for capability in [ClientCapability::UniversalPlanes, ClientCapability::Atomic] {
             let _ = drm_device.set_client_capability(capability, true);
         }
@@ -72343,20 +72671,20 @@ mod tests {
         let executor = crate::kms::executor::test_support::spawn_stub_helper(behaviour)
             .map_err(|error| std::io::Error::other(format!("second Owner executor: {error}")))?;
         let (incarnation, lifecycle) = executor.owner_identity();
-        let drm_device_a = std::rc::Rc::clone(
-            &backend
-                .platform
-                .device_for_key(device_a)
-                .expect("first fixture device")
-                .device,
-        );
+        let drm_device_a = backend
+            .platform
+            .device_for_key(device_a)
+            .expect("first fixture device")
+            .device
+            .clone_rc()
+            .expect("first fixture DRM device attached");
         let second_device = backend
             .platform
             .devices
             .iter_mut()
             .find(|entry| entry.key == device_b)
             .expect("second fixture device");
-        second_device.device = drm_device_a;
+        second_device.device = drm_device_a.into();
         second_device.executor = Some(executor);
         second_device.owner = Some(crate::kms::owner::device::DeviceCommitOwner::new(
             incarnation,
@@ -72509,13 +72837,16 @@ mod tests {
             std::io::Error::other("copied live modeset fixture has no real connector")
         })?;
         let output_key = OutputKey::new(device_key, connector.clone());
-        let drm_device = Rc::clone(
-            &backend
-                .platform
-                .device_for_key(device_key)
-                .ok_or_else(|| std::io::Error::other("copied modeset KMS device disappeared"))?
-                .device,
-        );
+        let drm_device = backend
+            .platform
+            .device_for_key(device_key)
+            .and_then(|device| device.device.clone_rc())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "copied modeset KMS device disappeared or detached",
+                )
+            })?;
         for capability in [ClientCapability::UniversalPlanes, ClientCapability::Atomic] {
             let _ = drm_device.set_client_capability(capability, true);
         }
@@ -72568,7 +72899,23 @@ mod tests {
         backend.platform.devices[0].key = device_key;
         backend.platform.outputs[0].key.device_key = device_key;
         backend.platform.outputs[0].scanout_route.kms_device_key = device_key;
-        let drm_device = Rc::clone(&backend.platform.devices[0].device);
+        let scanout_route = backend.platform.outputs[0].scanout_route;
+        match backend.platform.scanout_pools[0]
+            .as_mut()
+            .expect("live-scene fixture retains its scanout pool")
+        {
+            crate::kms::vk::scanout::OutputScanout::Shared(pool) => {
+                pool.route = scanout_route;
+            }
+            crate::kms::vk::scanout::OutputScanout::Copied(pool) => {
+                pool.route = scanout_route;
+                pool.destinations.route = scanout_route;
+            }
+        }
+        let drm_device = backend.platform.devices[0]
+            .device
+            .clone_rc()
+            .expect("attached test DRM device");
         for capability in [ClientCapability::UniversalPlanes, ClientCapability::Atomic] {
             let _ = drm_device.set_client_capability(capability, true);
         }
@@ -72585,7 +72932,10 @@ mod tests {
             })?;
 
         let mut fixture = finish_owner_live_fixture(backend, false)?;
-        let drm_device = Rc::clone(&fixture.backend.platform.devices[0].device);
+        let drm_device = fixture.backend.platform.devices[0]
+            .device
+            .clone_rc()
+            .expect("attached fixture DRM device");
         let reserved_routes = fixture
             .backend
             .platform
@@ -73572,11 +73922,15 @@ mod tests {
             }
             if let Some((device, _)) = backend.core_driver_drm_events_for_tests.front() {
                 let device = *device;
-                let Some(fd) = backend
-                    .platform
-                    .device_for_key(device)
-                    .map(|device| std::os::fd::AsRawFd::as_raw_fd(&device.device.as_fd()))
-                else {
+                let Some(fd) = backend.platform.device_for_key(device).map(|device| {
+                    std::os::fd::AsRawFd::as_raw_fd(
+                        &device
+                            .device
+                            .attached()
+                            .expect("attached test DRM device")
+                            .as_fd(),
+                    )
+                }) else {
                     return Err(format!(
                         "{label}: synthetic DRM event has no device {device}"
                     ));
@@ -80379,7 +80733,8 @@ mod tests {
             .find(|entry| entry.key == device)
             .expect("live KMS device")
             .device
-            .as_ref();
+            .attached()
+            .expect("attached test DRM device");
         let connector_crtc_id = u32::from(
             crate::drm::modeset::PropMap::for_object(drm_device, output.output.connector)
                 .expect("connector properties")
@@ -80454,7 +80809,10 @@ mod tests {
         let current = &backend.platform.outputs[0];
         let crtc_mode_id = u32::from(
             crate::drm::modeset::PropMap::for_object(
-                backend.platform.devices[0].device.as_ref(),
+                backend.platform.devices[0]
+                    .device
+                    .attached()
+                    .expect("attached test DRM device"),
                 current.output.crtc,
             )
             .expect("CRTC properties")
@@ -90574,7 +90932,7 @@ mod tests {
         let (reader, mut writer) =
             crate::drm::event_stream::test_support::nonblocking_pipe().expect("DRM event pipe");
         backend.platform.devices[0].device =
-            Rc::new(crate::drm::Device::from_file_for_tests(reader));
+            Rc::new(crate::drm::Device::from_file_for_tests(reader)).into();
         let page_event = crate::kms::owner::test_fixtures::page_event_bytes(
             1,
             101,
@@ -90593,7 +90951,12 @@ mod tests {
         let mut state = yserver_core::server::ServerState::new();
         backend.on_page_flip_ready(
             &mut state,
-            backend.platform.devices[0].device.as_fd().as_raw_fd(),
+            backend.platform.devices[0]
+                .device
+                .attached()
+                .expect("attached test DRM device")
+                .as_fd()
+                .as_raw_fd(),
         );
 
         assert_eq!(
@@ -90816,7 +91179,7 @@ mod tests {
         let (reader, mut writer) =
             crate::drm::event_stream::test_support::nonblocking_pipe().expect("DRM event pipe");
         backend.platform.devices[0].device =
-            Rc::new(crate::drm::Device::from_file_for_tests(reader));
+            Rc::new(crate::drm::Device::from_file_for_tests(reader)).into();
         let page_event = crate::kms::owner::test_fixtures::page_event_bytes(
             1,
             101,
@@ -90852,7 +91215,12 @@ mod tests {
         );
         backend.on_page_flip_ready(
             &mut state,
-            backend.platform.devices[0].device.as_fd().as_raw_fd(),
+            backend.platform.devices[0]
+                .device
+                .attached()
+                .expect("attached test DRM device")
+                .as_fd()
+                .as_raw_fd(),
         );
 
         let next_commit = backend
@@ -93499,7 +93867,10 @@ mod tests {
             .primary_device()
             .ok_or_else(|| io::Error::other("live fixture has no primary device"))?;
         let framebuffer = crate::drm::modeset::import_direct_scanout_framebuffer(
-            Rc::clone(&primary.device),
+            primary
+                .device
+                .clone_rc()
+                .expect("attached primary KMS device"),
             imported_fd.as_fd(),
             u32::from(width),
             u32::from(height),
@@ -96226,7 +96597,8 @@ mod tests {
             .device_for_key(device)
             .expect("live KMS fixture retained card1")
             .device
-            .clone();
+            .clone_rc()
+            .expect("attached test DRM device");
         let actual_path = super::card_path_for_key(device).unwrap_or_else(|error| {
             panic!("cannot map live KMS primary {device} to card1: {error}")
         });
@@ -96291,6 +96663,8 @@ mod tests {
             .device_for_key(device)
             .expect("card1 device")
             .device
+            .attached()
+            .expect("attached test DRM device")
             .as_fd()
             .as_raw_fd();
         assert!(
@@ -97769,7 +98143,8 @@ mod tests {
                 .device_for_key(device)
                 .expect("live KMS fixture retained card1")
                 .device
-                .clone();
+                .clone_rc()
+                .expect("attached test DRM device");
             let actual_path = super::card_path_for_key(device).unwrap_or_else(|error| {
                 panic!("cannot map live primary {device} to card1: {error}")
             });
@@ -98551,7 +98926,8 @@ mod tests {
             .device_for_key(device)
             .expect("live KMS fixture retained card1")
             .device
-            .clone();
+            .clone_rc()
+            .expect("attached test DRM device");
         let actual_path = super::card_path_for_key(device).unwrap_or_else(|error| {
             panic!("cannot map live KMS primary {device} to card1: {error}")
         });
@@ -98605,6 +98981,8 @@ mod tests {
             .device_for_key(device)
             .expect("card1 device")
             .device
+            .attached()
+            .expect("attached test DRM device")
             .as_fd()
             .as_raw_fd();
         let accepted_fences = Rc::new(RefCell::new(Vec::<(
@@ -100109,7 +100487,8 @@ mod tests {
             .device_for_key(device)
             .expect("card1 live fixture retains its KMS device")
             .device
-            .clone();
+            .clone_rc()
+            .expect("attached test DRM device");
         let actual_path = super::card_path_for_key(device).unwrap_or_else(|error| {
             panic!("cannot map live KMS primary {device} to card1: {error}")
         });
@@ -100212,6 +100591,8 @@ mod tests {
             .device_for_key(device)
             .expect("card1 KMS device")
             .device
+            .attached()
+            .expect("attached test DRM device")
             .as_fd()
             .as_raw_fd();
         let hardware_complete = Rc::new(std::cell::RefCell::new(std::collections::HashSet::new()));
@@ -100514,6 +100895,8 @@ mod tests {
                     .device_for_key(other_device)
                     .expect("second Owner device has a KMS handle")
                     .device
+                    .attached()
+                    .expect("attached test DRM device")
                     .as_fd(),
             );
             let other_commit = c0_hw_3b_compose_until_accepted_through_core_driver(
@@ -100865,7 +101248,8 @@ mod tests {
             .device_for_key(sink_primary)
             .ok_or_else(|| std::io::Error::other("F8: card1 KMS device disappeared"))?
             .device
-            .clone();
+            .clone_rc()
+            .expect("attached test DRM device");
         let plans = crate::kms::vk::scanout::CopiedScanoutPool::exact_allocation_plans(
             &renderer_vk,
             &sink_vk,
@@ -100957,7 +101341,8 @@ mod tests {
             .device_for_key(device)
             .expect("copied hardware KMS device")
             .device
-            .clone();
+            .clone_rc()
+            .expect("attached test DRM device");
         let executor = crate::kms::executor::KmsIoExecutor::spawn(
             device_rc.as_fd(),
             crate::kms::owner::identity::IncarnationId::first(),
@@ -101101,6 +101486,8 @@ mod tests {
             .device_for_key(device)
             .expect("KMS device")
             .device
+            .attached()
+            .expect("attached test DRM device")
             .as_fd()
             .as_raw_fd();
         let mut registered = Vec::<(
@@ -111081,6 +111468,8 @@ mod tests {
             .device_for_key(device)
             .expect("synthetic Owner device")
             .device
+            .attached()
+            .expect("attached test DRM device")
             .as_fd()
             .as_raw_fd();
         let observation = backend
@@ -111450,6 +111839,7 @@ mod tests {
                 incarnation: Some(incarnation),
                 epoch,
                 join,
+                lease: None,
                 stuck: false,
             },
         );
@@ -112840,7 +113230,7 @@ mod tests {
         .expect("spawn card1 acquire fixture executor");
         let (incarnation, lifecycle) = executor.owner_identity();
         backend.platform.devices[0].key = key;
-        backend.platform.devices[0].device = std::rc::Rc::clone(&source);
+        backend.platform.devices[0].device = std::rc::Rc::clone(&source).into();
         backend.platform.devices[0].executor = Some(executor);
         backend.platform.devices[0].owner = Some(
             crate::kms::owner::device::DeviceCommitOwner::new(incarnation, lifecycle, 1),
@@ -113609,7 +113999,10 @@ mod tests {
                     outputs[0].output.crtc_out_fence_ptr_prop,
                 )
             };
-            let drm_device = std::rc::Rc::clone(&fixture.backend.platform.devices[0].device);
+            let drm_device = fixture.backend.platform.devices[0]
+                .device
+                .clone_rc()
+                .expect("attached fixture DRM device");
             let active_property = fixture.backend.platform.devices[0]
                 .active_property_cache
                 .get_or_discover(drm_device.as_ref(), real_crtc)
@@ -115854,13 +116247,13 @@ mod tests {
             .primary_device()
             .expect("live KMS fixture has card1")
             .key;
-        let device_rc = Rc::clone(
-            &backend
-                .platform
-                .device_for_key(device)
-                .expect("card1 device is retained")
-                .device,
-        );
+        let device_rc = backend
+            .platform
+            .device_for_key(device)
+            .expect("card1 device is retained")
+            .device
+            .clone_rc()
+            .expect("attached test DRM device");
         assert_eq!(
             super::card_path_for_key(device).expect("map card1 device identity"),
             card1
@@ -115935,6 +116328,8 @@ mod tests {
             .device_for_key(device)
             .expect("card1 Owner device")
             .device
+            .attached()
+            .expect("attached test DRM device")
             .as_fd()
             .as_raw_fd();
         let hardware_complete = Rc::new(RefCell::new(HashSet::new()));
@@ -116461,7 +116856,7 @@ mod tests {
             eprintln!("kernel planes {label}: device {device} is absent");
             return;
         };
-        let drm = kms.device.as_ref();
+        let drm = kms.device.attached().expect("attached test DRM device");
         let planes = drm
             .plane_handles()
             .map(|handles| {
@@ -117300,7 +117695,8 @@ mod tests {
             .device_for_key(device)
             .expect("live fixture device")
             .device
-            .clone();
+            .clone_rc()
+            .expect("attached test DRM device");
         let object_ids = description
             .objects
             .iter()
@@ -124459,6 +124855,8 @@ mod tests {
                 .device_for_key(device)
                 .unwrap()
                 .device
+                .attached()
+                .expect("attached test DRM device")
                 .as_fd()
                 .as_raw_fd();
             backend.platform.script_connector_probes_for_tests(
@@ -126095,13 +126493,13 @@ mod tests {
             .primary_device()
             .expect("live KMS fixture has card1")
             .key;
-        let device_rc = Rc::clone(
-            &backend
-                .platform
-                .device_for_key(device)
-                .expect("card1 device is retained")
-                .device,
-        );
+        let device_rc = backend
+            .platform
+            .device_for_key(device)
+            .expect("card1 device is retained")
+            .device
+            .clone_rc()
+            .expect("attached test DRM device");
         assert_eq!(
             super::card_path_for_key(device).expect("map card1 device identity"),
             card1
@@ -126192,6 +126590,8 @@ mod tests {
             .device_for_key(device)
             .expect("card1 Owner device")
             .device
+            .attached()
+            .expect("attached test DRM device")
             .as_fd()
             .as_raw_fd();
         let hardware_complete = Rc::new(std::cell::RefCell::new(std::collections::HashSet::new()));
@@ -126245,7 +126645,8 @@ mod tests {
                     .device_for_key(device)
                     .unwrap()
                     .device
-                    .as_ref(),
+                    .attached()
+                    .expect("attached test DRM device"),
             )
             .expect("duplicate card1 master fd"),
         )
@@ -126577,13 +126978,13 @@ mod tests {
             super::card_path_for_key(card1_device).expect("map card1 device identity"),
             card1
         );
-        let card1_device_rc = Rc::clone(
-            &backend
-                .platform
-                .device_for_key(card1_device)
-                .expect("card1 KMS device")
-                .device,
-        );
+        let card1_device_rc = backend
+            .platform
+            .device_for_key(card1_device)
+            .expect("card1 KMS device")
+            .device
+            .clone_rc()
+            .expect("attached test DRM device");
         let executor = crate::kms::executor::KmsIoExecutor::spawn(
             card1_device_rc.as_fd(),
             crate::kms::owner::identity::IncarnationId::first(),
@@ -126708,7 +127109,8 @@ mod tests {
                     .device_for_key(vkms_key)
                     .expect("vkms Legacy device")
                     .device
-                    .as_ref(),
+                    .attached()
+                    .expect("attached test DRM device"),
             )
             .unwrap_or_else(|error| {
                 panic!("vkms Owner qualification failed: duplicate connector-probe fd: {error}")
@@ -126725,13 +127127,13 @@ mod tests {
                     "vkms Owner qualification failed: no connected vkms connector advertises a usable mode"
                 )
             });
-        let vkms_device_rc = Rc::clone(
-            &backend
-                .platform
-                .device_for_key(vkms_key)
-                .expect("inserted vkms Owner device")
-                .device,
-        );
+        let vkms_device_rc = backend
+            .platform
+            .device_for_key(vkms_key)
+            .expect("inserted vkms Owner device")
+            .device
+            .clone_rc()
+            .expect("attached test DRM device");
         let vkms_output = crate::drm::modeset::discover_output_for_connector(
             vkms_device_rc.as_ref(),
             &vkms_connector.key.connector_name,
@@ -127357,7 +127759,10 @@ mod tests {
                 .devices
                 .iter()
                 .filter(|entry| entry.key == readded_key)
-                .all(|entry| Rc::ptr_eq(&entry.device, &vkms_device_rc))
+                .all(|entry| entry
+                    .device
+                    .attached()
+                    .is_some_and(|device| std::ptr::eq(device, vkms_device_rc.as_ref())))
         );
         assert!(
             backend
@@ -128048,6 +128453,926 @@ mod tests {
         tree_request(&mut state, &mut b, 8, TREE_A);
         assert_eq!(tree_events(&mut peer).len(), 3);
         assert_eq!(state.dpms.last_activity, idle_since);
+    }
+
+    fn c0_3di_barrier_backend(
+        behaviour: crate::kms::executor::test_support::StubBehaviour,
+    ) -> (super::KmsBackend, DrmDeviceKey, IncarnationId) {
+        use crate::kms::render::resources::{DrmCleanupRegistry, ResourceService};
+
+        let mut backend = backend_with_stub_executors_with_behaviour_for_tests(1, behaviour);
+        let device = backend.platform.devices[0].key;
+        let incarnation = backend.platform.devices[0]
+            .owner
+            .as_ref()
+            .expect("Owner device")
+            .incarnation();
+        let drm_device = backend.platform.devices[0]
+            .device
+            .clone_rc()
+            .expect("attached test DRM device");
+        let registry = DrmCleanupRegistry::new(Rc::clone(&drm_device), device, incarnation);
+        let service = ResourceService::new(device, incarnation);
+        backend.install_resource_service_with_registry(service, registry);
+        install_admission_owner_gate(&mut backend, device);
+        backend
+            .lifecycle_register_owner_device(device)
+            .expect("register Owner lifecycle");
+        (backend, device, incarnation)
+    }
+
+    fn c0_3di_drive_completion_loss_to_poison(
+        backend: &mut super::KmsBackend,
+        state: &mut ServerState,
+        device: DrmDeviceKey,
+        timeout: std::time::Duration,
+    ) {
+        backend.core_driver_owner_events_for_tests.push_back((
+            device,
+            vec![crate::kms::owner::device::OwnerEvent::MechanismFailed {
+                reason: crate::kms::owner::completion::MechanismFailure::FencePollError,
+            }],
+        ));
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            state,
+            "route completion loss through the core driver",
+            timeout,
+            &|backend| {
+                backend
+                    .lifecycle_coordinator
+                    .device(&device)
+                    .is_some_and(|arbiter| {
+                        arbiter.state()
+                            == crate::kms::owner::lifecycle::DeviceLifecycleState::Poisoned
+                    })
+            },
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        let conductor = backend
+            .admission_conductors
+            .get(&device)
+            .expect("Owner admission conductor");
+        assert!(conductor.recovery_stopped);
+        assert!(conductor.lifecycle_admission_closed);
+        assert!(
+            !backend
+                .drm_cleanup_registry
+                .as_ref()
+                .expect("file-family registry")
+                .alias_creation_allowed()
+        );
+        assert!(backend.platform.devices[0].event_reader_detached);
+        assert!(
+            backend.platform.devices[0]
+                .executor
+                .as_ref()
+                .expect("helper process")
+                .termination_requested_for_tests()
+        );
+    }
+
+    fn c0_3di_assert_old_file_native_objects_gone(
+        backend: &super::KmsBackend,
+        device: DrmDeviceKey,
+        incarnation: IncarnationId,
+        test_name: &str,
+    ) {
+        let mut pool_gbm_devices = 0;
+        let mut pool_gbm_bos = 0;
+        for (output, scanout) in backend
+            .platform
+            .outputs
+            .iter()
+            .zip(&backend.platform.scanout_pools)
+        {
+            if output.key.device_key == device
+                && let Some(scanout) = scanout.as_ref()
+            {
+                let (devices, bos) = scanout.file_family_gbm_object_counts_for_tests();
+                pool_gbm_devices += devices;
+                pool_gbm_bos += bos;
+            }
+        }
+        assert_eq!(
+            pool_gbm_devices, 0,
+            "{test_name}: the old incarnation's scanout pools retain no GBM device"
+        );
+        assert_eq!(
+            pool_gbm_bos, 0,
+            "{test_name}: the old incarnation's scanout pools retain no GBM BO"
+        );
+        let old_service = backend
+            .resource_service
+            .as_ref()
+            .filter(|service| service.device() == device && service.incarnation() == incarnation)
+            .expect("old incarnation resource service remains available for quarantine");
+        let old_registry = backend
+            .drm_cleanup_registry
+            .as_ref()
+            .filter(|registry| {
+                registry.device_key() == device && registry.incarnation() == incarnation
+            })
+            .expect("old incarnation cleanup registry remains in quarantine");
+        assert_eq!(
+            old_registry.retained_native_file_object_count_for_tests(),
+            0,
+            "{test_name}: the old incarnation retains no native GBM device"
+        );
+        assert_eq!(
+            old_service.file_owned_gbm_bo_count_for_tests(),
+            0,
+            "{test_name}: family closure destroyed every managed old-incarnation GBM BO"
+        );
+    }
+
+    fn c0_3di_file_description_fds_for_tests(
+        fd: std::os::fd::RawFd,
+    ) -> std::io::Result<Vec<std::os::fd::RawFd>> {
+        #[cfg(target_os = "linux")]
+        {
+            let pid = unsafe { libc::getpid() };
+            let mut matching = Vec::new();
+            for entry in std::fs::read_dir("/proc/self/fd")? {
+                let entry = entry?;
+                let Some(candidate) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.parse::<std::os::fd::RawFd>().ok())
+                else {
+                    continue;
+                };
+                if candidate == fd {
+                    matching.push(candidate);
+                    continue;
+                }
+                // SAFETY: KCMP_FILE only compares the two open descriptors;
+                // both process ids are this process and `candidate` came
+                // from its live /proc/self/fd directory.
+                let result = unsafe { libc::syscall(libc::SYS_kcmp, pid, pid, 0, fd, candidate) };
+                if result == 0 {
+                    matching.push(candidate);
+                } else if result < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::EBADF) {
+                        return Err(error);
+                    }
+                }
+            }
+            Ok(matching)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = fd;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "proc fd description comparison requires Linux kcmp",
+            ))
+        }
+    }
+
+    fn c0_3di_card_fd_numbers_for_tests(
+        card_path: &std::path::Path,
+    ) -> std::io::Result<Vec<std::os::fd::RawFd>> {
+        #[cfg(target_os = "linux")]
+        {
+            let mut matching = Vec::new();
+            for entry in std::fs::read_dir("/proc/self/fd")? {
+                let entry = entry?;
+                let Some(candidate) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.parse::<std::os::fd::RawFd>().ok())
+                else {
+                    continue;
+                };
+                match std::fs::read_link(entry.path()) {
+                    Ok(target) if target == card_path => matching.push(candidate),
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(matching)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = card_path;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "proc fd inspection requires Linux",
+            ))
+        }
+    }
+
+    fn c0_3di_assert_end_state(backend: &super::KmsBackend, test_name: &str) {
+        let installed = backend
+            .platform
+            .outputs
+            .iter()
+            .map(|output| output.key.clone())
+            .collect::<Vec<_>>();
+        c0_3bi_assert_end_state(backend, test_name, &c0_3bi_expected_end_state(installed));
+        if let Some((device, incarnation)) = backend
+            .drm_cleanup_registry
+            .as_ref()
+            .filter(|registry| registry.is_family_closed())
+            .map(|registry| (registry.device_key(), registry.incarnation()))
+        {
+            c0_3di_assert_old_file_native_objects_gone(backend, device, incarnation, test_name);
+        }
+    }
+
+    #[test]
+    fn c0_3di_poison_requests_termination_and_retires_the_family_vulkan() {
+        use std::os::fd::{AsFd, AsRawFd};
+        use yserver_core::backend::Backend;
+
+        let (mut backend, device, incarnation) =
+            c0_3di_barrier_backend(crate::kms::executor::test_support::StubBehaviour::NeverReply);
+        let raw_fd = backend.platform.devices[0]
+            .device
+            .attached()
+            .expect("attached test DRM device")
+            .as_fd()
+            .as_raw_fd();
+        let extra_device_ref = backend.platform.devices[0]
+            .device
+            .clone_rc()
+            .expect("hold a device reference through control detach");
+        let mut state = ServerState::new();
+        c0_3di_drive_completion_loss_to_poison(
+            &mut backend,
+            &mut state,
+            device,
+            std::time::Duration::from_secs(8),
+        );
+        c0_3bi_core_driver_until_with_state(
+            &mut backend,
+            &mut state,
+            "reap helper and detach the control device",
+            std::time::Duration::from_secs(5),
+            &|backend| {
+                backend.platform.helper_is_reaped(device)
+                    && backend.platform.control_device_detached(device)
+            },
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+
+        assert!(!backend.barrier_ready(incarnation));
+        assert!(
+            Backend::poll_fds(&backend)
+                .iter()
+                .all(|(fd, _)| *fd != raw_fd),
+            "the detached device fd leaves poll_fds before the final owner closes it"
+        );
+        assert!(
+            !backend
+                .drm_cleanup_registry
+                .as_ref()
+                .unwrap()
+                .is_family_closed(),
+            "closing the control alias alone is not the family-closure proof"
+        );
+        drop(extra_device_ref);
+        c0_3bi_core_driver_until_with_state(
+            &mut backend,
+            &mut state,
+            "close the final old-family reference and mint its proof",
+            std::time::Duration::from_secs(5),
+            &|backend| backend.barrier_ready(incarnation),
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(
+            backend
+                .lifecycle_coordinator
+                .device(&device)
+                .unwrap()
+                .state(),
+            crate::kms::owner::lifecycle::DeviceLifecycleState::Poisoned
+        );
+        assert!(backend.platform.helper_is_reaped(device));
+        assert_eq!(
+            backend
+                .platform
+                .incarnation_fd_set(device)
+                .unwrap()
+                .borrow()
+                .remaining_leases(),
+            0
+        );
+        assert!(
+            backend
+                .drm_cleanup_registry
+                .as_ref()
+                .unwrap()
+                .is_family_closed()
+        );
+        assert!(backend.barrier_ready(incarnation));
+        assert!(backend.poll_poisoned_barrier(device));
+        let detached_caps = backend
+            .platform
+            .discover_completion_caps(device)
+            .expect_err("detached devices refuse completion-capability discovery");
+        assert_eq!(detached_caps.kind(), std::io::ErrorKind::NotConnected);
+        c0_3di_assert_end_state(
+            &backend,
+            "c0_3di_poison_requests_termination_and_retires_the_family_vulkan",
+        );
+    }
+
+    #[test]
+    fn c0_3di_stuck_probe_worker_blocks_the_barrier_vulkan() {
+        use std::{
+            os::fd::{AsFd, AsRawFd},
+            time::Duration,
+        };
+
+        let (mut backend, device, incarnation) =
+            c0_3di_barrier_backend(crate::kms::executor::test_support::StubBehaviour::NeverReply);
+        let mut state = ServerState::new();
+        backend
+            .platform
+            .install_scripted_connector_prober_for_tests();
+        let probe_barrier = crate::kms::render::platform::ProbeBarrier::new();
+        backend.platform.script_blocked_connector_probe_for_tests(
+            device,
+            Ok(Vec::new()),
+            probe_barrier.clone(),
+        );
+        let (_poll, sender, _receiver) =
+            yserver_core::core_loop::channel().expect("core wake channel");
+        yserver_core::backend::Backend::set_input_sender(&mut backend, sender);
+        super::KmsBackend::record_display_hotplug_edge(&mut backend);
+        backend.hotplug_rescan_deadline =
+            Some(std::time::Instant::now() - Duration::from_millis(1));
+        c0_3bi_core_driver_until_with_state(
+            &mut backend,
+            &mut state,
+            "start the blocked probe through the hotplug core entry",
+            Duration::from_secs(3),
+            &|backend| {
+                backend.probe_workers.workers.contains_key(&device)
+                    && probe_barrier.wait_started(Duration::ZERO)
+            },
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            backend
+                .platform
+                .incarnation_fd_set(device)
+                .unwrap()
+                .borrow()
+                .remaining_leases(),
+            2,
+            "the real helper and blocked probe worker each hold an incarnation lease"
+        );
+        c0_3di_drive_completion_loss_to_poison(
+            &mut backend,
+            &mut state,
+            device,
+            Duration::from_secs(8),
+        );
+        c0_3bi_core_driver_until_with_state(
+            &mut backend,
+            &mut state,
+            "reap helper while the probe worker is held",
+            Duration::from_secs(3),
+            &|backend| backend.platform.helper_is_reaped(device),
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert!(backend.platform.helper_is_reaped(device));
+        assert!(!backend.platform.control_device_detached(device));
+        let drm_fd = backend.platform.devices[0]
+            .device
+            .attached()
+            .expect("attached test DRM device")
+            .as_fd()
+            .as_raw_fd();
+        assert!(
+            yserver_core::backend::Backend::poll_fds(&backend)
+                .iter()
+                .all(|(fd, _)| *fd != drm_fd),
+            "the event reader is detached while the device handle remains attached"
+        );
+        assert!(
+            backend.probe_workers.workers.contains_key(&device),
+            "the blocked probe worker remains live after helper reap"
+        );
+        assert!(!backend.barrier_ready(incarnation));
+        assert!(
+            !backend
+                .drm_cleanup_registry
+                .as_ref()
+                .unwrap()
+                .is_family_closed()
+        );
+        assert!(
+            backend.scene_wants_compose(),
+            "the fixture retains scene work while the test Owner is poisoned"
+        );
+        // The shared fixture's scene output is a synthetic Legacy output,
+        // unrelated to the poisoned Owner key. Disable only that Legacy
+        // fallback around the wakeup query so this assertion measures the
+        // barrier's deadline, not legitimate scene work.
+        let kms_outputs_active = backend.kms_outputs_active;
+        backend.kms_outputs_active = false;
+        let wakeup = yserver_core::backend::Backend::next_wakeup(&backend);
+        let queried_at = std::time::Instant::now();
+        backend.kms_outputs_active = kms_outputs_active;
+        assert!(
+            wakeup.is_none_or(|wakeup| wakeup > queried_at + Duration::from_millis(1)),
+            "a stuck probe worker must not make the core poll the barrier every millisecond; wakeup={wakeup:?}"
+        );
+
+        probe_barrier.release();
+        c0_3bi_core_driver_until_with_state(
+            &mut backend,
+            &mut state,
+            "join the probe and close the old fd family",
+            Duration::from_secs(3),
+            &|backend| backend.barrier_ready(incarnation),
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert!(!backend.probe_workers.workers.contains_key(&device));
+        assert_eq!(
+            backend
+                .platform
+                .incarnation_fd_set(device)
+                .unwrap()
+                .borrow()
+                .remaining_leases(),
+            0,
+            "joining the probe worker releases its incarnation lease"
+        );
+        assert!(
+            backend
+                .drm_cleanup_registry
+                .as_ref()
+                .unwrap()
+                .is_family_closed()
+        );
+        c0_3di_assert_end_state(
+            &backend,
+            "c0_3di_stuck_probe_worker_blocks_the_barrier_vulkan",
+        );
+    }
+
+    #[test]
+    fn c0_3di_unreaped_helper_blocks_the_barrier_vulkan() {
+        use std::{
+            os::fd::{AsFd, AsRawFd},
+            time::Duration,
+        };
+        use yserver_core::backend::Backend;
+
+        struct ResumeHelperOnDrop(libc::pid_t);
+
+        impl Drop for ResumeHelperOnDrop {
+            fn drop(&mut self) {
+                // SAFETY: The PID is the helper child owned by this test
+                // fixture. Resuming it lets any pending SIGTERM finish.
+                unsafe {
+                    libc::kill(self.0, libc::SIGCONT);
+                }
+            }
+        }
+
+        let (mut backend, device, incarnation) =
+            c0_3di_barrier_backend(crate::kms::executor::test_support::StubBehaviour::NeverReply);
+        let helper_pid = backend.platform.devices[0]
+            .executor
+            .as_ref()
+            .expect("helper process")
+            .child_pid();
+        // SAFETY: SIGSTOP pauses this fixture's helper child so the core
+        // driver's termination request cannot also reap it in the same turn.
+        assert_eq!(unsafe { libc::kill(helper_pid, libc::SIGSTOP) }, 0);
+        let _resume_on_drop = ResumeHelperOnDrop(helper_pid);
+        let mut state = ServerState::new();
+        c0_3di_drive_completion_loss_to_poison(
+            &mut backend,
+            &mut state,
+            device,
+            Duration::from_secs(8),
+        );
+        assert!(
+            backend.platform.devices[0]
+                .executor
+                .as_ref()
+                .unwrap()
+                .termination_requested_for_tests()
+        );
+        assert!(backend.platform.devices[0].helper_lease.is_some());
+        assert!(!backend.barrier_ready(incarnation));
+        assert!(
+            !backend
+                .drm_cleanup_registry
+                .as_ref()
+                .unwrap()
+                .is_family_closed(),
+            "a termination request does not mint the family closure"
+        );
+        assert!(!backend.platform.control_device_detached(device));
+        let drm_fd = backend.platform.devices[0]
+            .device
+            .attached()
+            .expect("attached test DRM device")
+            .as_fd()
+            .as_raw_fd();
+        assert!(
+            yserver_core::backend::Backend::poll_fds(&backend)
+                .iter()
+                .all(|(fd, _)| *fd != drm_fd),
+            "the event reader is detached while the helper lease keeps the device open"
+        );
+        assert!(
+            Backend::poll_fds(&backend).iter().any(|(_, kind)| matches!(
+                kind,
+                yserver_core::backend::BackendFdKind::ExecutorControl
+            )),
+            "the helper control socket remains registered to wake the core on hangup"
+        );
+        // The shared fixture's scene output is a synthetic Legacy output,
+        // unrelated to the poisoned Owner key. Isolate the helper barrier
+        // deadline from legitimate Legacy scene work.
+        let kms_outputs_active = backend.kms_outputs_active;
+        backend.kms_outputs_active = false;
+        let wakeup = Backend::next_wakeup(&backend);
+        let queried_at = std::time::Instant::now();
+        backend.kms_outputs_active = kms_outputs_active;
+        assert!(
+            wakeup.is_none_or(|wakeup| wakeup > queried_at + Duration::from_millis(1)),
+            "an unreaped helper must not make the core poll the barrier every millisecond; wakeup={wakeup:?}"
+        );
+
+        // SAFETY: SIGCONT resumes only the fixture's helper child; the
+        // pending SIGTERM then lets the core driver observe the real reap.
+        assert_eq!(unsafe { libc::kill(helper_pid, libc::SIGCONT) }, 0);
+        c0_3bi_core_driver_until_with_state(
+            &mut backend,
+            &mut state,
+            "reap helper and close the old fd family",
+            Duration::from_secs(3),
+            &|backend| backend.barrier_ready(incarnation),
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert!(
+            backend
+                .drm_cleanup_registry
+                .as_ref()
+                .unwrap()
+                .is_family_closed()
+        );
+        c0_3di_assert_end_state(&backend, "c0_3di_unreaped_helper_blocks_the_barrier_vulkan");
+    }
+
+    #[test]
+    #[ignore = "needs tty3, card1 DRM master, HDMI-2, and a Vulkan ICD"]
+    fn c0_hw_3di_poison_retires_family_on_card1_drm() {
+        use std::{
+            os::fd::{AsFd, AsRawFd},
+            path::PathBuf,
+            rc::Rc,
+            time::Duration,
+        };
+
+        use crate::kms::render::resources::{DrmCleanupRegistry, ResourceService};
+
+        let card1 = PathBuf::from("/dev/dri/card1");
+        if let Err(error) = std::fs::metadata(&card1) {
+            eprintln!("environmental skip: /dev/dri/card1 is unavailable: {error}");
+            return;
+        }
+        let driver =
+            std::fs::read_link("/sys/class/drm/card1/device/driver").expect("card1 driver link");
+        assert_eq!(
+            driver.file_name().and_then(|name| name.to_str()),
+            Some("nvidia")
+        );
+        let vblank = std::fs::read_to_string("/sys/module/nvidia_drm/parameters/vblank")
+            .expect("nvidia-drm vblank parameter");
+        assert!(matches!(vblank.trim(), "Y" | "1"));
+
+        let preflight = super::KmsBackend::for_tests_with_vk_live_scene_real_drm()
+            .unwrap_or_else(|error| panic!("card1 poison preflight failed: {error}"));
+        let preflight_key = preflight
+            .platform
+            .vk
+            .as_ref()
+            .and_then(|vk| vk.selected_drm_identity)
+            .and_then(|identity| identity.primary)
+            .expect("Vulkan reports a primary DRM identity");
+        assert_eq!(
+            super::card_path_for_key(preflight_key).expect("map Vulkan primary"),
+            card1,
+            "the hardware fixture must use card1"
+        );
+        drop(preflight);
+
+        for cycle in 1..=4 {
+            eprintln!("c0_hw_3di_poison_retires_family_on_card1_drm cycle {cycle}/4");
+            let base = super::KmsBackend::for_tests_with_vk_live_scene_real_drm()
+                .unwrap_or_else(|error| panic!("cycle {cycle}: card1 Vulkan fixture: {error}"));
+            let mut fixture =
+                super::KmsBackend::for_tests_with_live_kms_from_backend(base, Some("HDMI-2"))
+                    .unwrap_or_else(|error| panic!("cycle {cycle}: card1 HDMI-2 fixture: {error}"));
+            let backend = &mut fixture.backend;
+            backend.resource_cleanup_on_drop_for_tests = true;
+            let device = backend
+                .platform
+                .primary_device()
+                .expect("card1 has a primary device")
+                .key;
+            assert_eq!(
+                super::card_path_for_key(device).expect("map fixture device"),
+                card1
+            );
+            let device_rc = backend
+                .platform
+                .device_for_key(device)
+                .expect("card1 KMS device")
+                .device
+                .clone_rc()
+                .expect("attached card1 device");
+            let raw_fd = device_rc.as_fd().as_raw_fd();
+            let executor = crate::kms::executor::KmsIoExecutor::spawn(
+                device_rc.as_fd(),
+                crate::kms::owner::identity::IncarnationId::first(),
+            )
+            .unwrap_or_else(|error| panic!("cycle {cycle}: spawn card1 helper: {error}"));
+            let (incarnation, lifecycle) = executor.owner_identity();
+            let helper_lease = backend.platform.devices[0]
+                .incarnation_fd_set
+                .borrow_mut()
+                .register_alias_from(device_rc.as_fd())
+                .expect("register card1 helper lease");
+            backend.platform.devices[0].helper_lease = Some(helper_lease);
+            backend.platform.devices[0].executor = Some(executor);
+            backend.platform.devices[0].owner = Some(
+                crate::kms::owner::device::DeviceCommitOwner::new(incarnation, lifecycle, 1),
+            );
+            backend.platform.owner_completion_detached = true;
+            backend
+                .platform
+                .owner_for(device)
+                .expect("card1 Owner")
+                .completion_deadline_override = Some(Duration::from_millis(500));
+            let dispatches_before = backend
+                .admission_trace_for_tests(device)
+                .into_iter()
+                .filter(|step| {
+                    matches!(
+                        step,
+                        crate::kms::render::admission::AdmissionTraceStep::Dispatched(_)
+                    )
+                })
+                .count();
+
+            let mut registry = DrmCleanupRegistry::new(Rc::clone(&device_rc), device, incarnation);
+            let mut service = ResourceService::new(device, incarnation);
+            for output_idx in 0..backend.platform.scanout_pools.len() {
+                let bo_count = backend.platform.scanout_pools[output_idx]
+                    .as_ref()
+                    .map_or(0, |scanout| scanout.display_pool().bos.len());
+                for bo_idx in 0..bo_count {
+                    backend
+                        .platform
+                        .register_managed_scanout_bo(
+                            &mut service,
+                            &mut registry,
+                            output_idx,
+                            bo_idx,
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("cycle {cycle}: register scanout BO: {error:?}")
+                        });
+                }
+            }
+            backend.install_resource_service_with_registry(service, registry);
+            install_admission_owner_gate(backend, device);
+            backend.install_admission_conductor_with_backend_composed_for_tests(
+                device,
+                AdmissionSourceFixture::new_source().0,
+            );
+            backend
+                .lifecycle_register_owner_device(device)
+                .expect("register card1 Owner lifecycle");
+
+            let output_idx = backend
+                .platform
+                .outputs
+                .iter()
+                .position(|output| output.key.device_key == device)
+                .expect("card1 HDMI-2 output");
+            let output_key = backend.platform.outputs[output_idx].key.clone();
+            assert_eq!(output_key.connector_name, "HDMI-2");
+            let output_id = backend.randr_id_alloc.ids_for(&output_key).output_id;
+            backend
+                .output_key_by_id
+                .insert(output_id, output_key.clone());
+            {
+                let output = &backend.platform.outputs[output_idx];
+                let entry = backend.randr_id_alloc.entry_mut(&output_key);
+                entry.connected = true;
+                entry.config = super::ConnectorConfig::Enabled {
+                    mode_w: output.width,
+                    mode_h: output.height,
+                    vrefresh: output.output.picked.vrefresh,
+                    x: output.x,
+                    y: output.y,
+                };
+                entry.modes = output.output.modes.clone();
+                entry.edid = output.output.edid.clone();
+                entry.mm_width = output.output.mm_width;
+                entry.mm_height = output.output.mm_height;
+                entry.connector_type = output.output.connector_type.clone();
+            }
+
+            backend.activate_admission_clock_probes(device);
+            let hardware_complete = Rc::new(RefCell::new(HashSet::new()));
+            let hardware_crtc =
+                u32::from(CrtcKey::for_output(&backend.platform.outputs[output_idx]).crtc);
+            let clock_key = backend
+                .platform
+                .owner_ref(device)
+                .and_then(|owner| owner.clock_key_for_hardware_crtc(hardware_crtc))
+                .expect("HDMI-2 CRTC clock record");
+            c0_hw_3b_drive_until(
+                backend,
+                device,
+                raw_fd,
+                "card1 HDMI-2 Owner clock probe",
+                Duration::from_secs(20),
+                &|backend| {
+                    backend
+                        .platform
+                        .owner_ref(device)
+                        .and_then(|owner| owner.clock(clock_key))
+                        .is_some_and(|clock| {
+                            clock.probe == crate::kms::owner::clock::ProbeState::Succeeded
+                        })
+                },
+                &hardware_complete,
+            )
+            .unwrap_or_else(|error| panic!("cycle {cycle}: card1 clock probe: {error}"));
+
+            backend.scene.mark_scene_structure_dirty();
+            let mut state = ServerState::new();
+            c0_3bi_core_driver_until_with_state(
+                backend,
+                &mut state,
+                "withhold card1 composed completion through its deadline",
+                Duration::from_secs(15),
+                &|backend| {
+                    backend
+                        .lifecycle_coordinator
+                        .device(&device)
+                        .is_some_and(|arbiter| {
+                            arbiter.state()
+                                == crate::kms::owner::lifecycle::DeviceLifecycleState::Poisoned
+                        })
+                        && backend.platform.helper_is_reaped(device)
+                        && backend.platform.control_device_detached(device)
+                },
+                None,
+            )
+            .unwrap_or_else(|error| panic!("cycle {cycle}: poison card1: {error}"));
+            let dispatches_after = backend
+                .admission_trace_for_tests(device)
+                .into_iter()
+                .filter(|step| {
+                    matches!(
+                        step,
+                        crate::kms::render::admission::AdmissionTraceStep::Dispatched(_)
+                    )
+                })
+                .count();
+            assert_eq!(dispatches_after, dispatches_before + 1);
+            assert_eq!(
+                backend
+                    .lifecycle_coordinator
+                    .device(&device)
+                    .unwrap()
+                    .state(),
+                crate::kms::owner::lifecycle::DeviceLifecycleState::Poisoned
+            );
+            assert!(backend.platform.control_device_detached(device));
+            assert!(
+                !backend
+                    .drm_cleanup_registry
+                    .as_ref()
+                    .unwrap()
+                    .is_family_closed()
+            );
+            assert!(
+                backend
+                    .platform
+                    .owner_ref(device)
+                    .unwrap()
+                    .tombstones()
+                    .iter()
+                    .any(|tombstone| matches!(
+                        tombstone.terminal,
+                        crate::kms::owner::record::TerminalState::CompletionUnknown(_)
+                    ))
+            );
+
+            let snapshot = fixture
+                .snapshot
+                .take()
+                .expect("card1 snapshot remains available for restoration");
+            snapshot
+                .restore()
+                .unwrap_or_else(|error| panic!("cycle {cycle}: restore card1 CRTC: {error}"));
+            drop(snapshot);
+            drop(fixture._master.take());
+            // Snapshot every process-local descriptor that still refers to
+            // the old open file description after the helper and workers have
+            // been released. This also includes aliases created after setup.
+            let old_description_fds =
+                c0_3di_file_description_fds_for_tests(raw_fd).unwrap_or_else(|error| {
+                    panic!("cycle {cycle}: inspect old card1 fd family before close: {error}")
+                });
+            assert!(old_description_fds.contains(&raw_fd));
+            drop(device_rc);
+            c0_3bi_core_driver_until_with_state(
+                backend,
+                &mut state,
+                "release card1's final external device handles and close its family",
+                Duration::from_secs(5),
+                &|backend| backend.barrier_ready(incarnation),
+                None,
+            )
+            .unwrap_or_else(|error| panic!("cycle {cycle}: close card1 family: {error}"));
+
+            assert!(backend.barrier_ready(incarnation));
+            assert!(
+                backend
+                    .drm_cleanup_registry
+                    .as_ref()
+                    .unwrap()
+                    .is_family_closed()
+            );
+            assert_eq!(
+                backend
+                    .platform
+                    .incarnation_fd_set(device)
+                    .unwrap()
+                    .borrow()
+                    .remaining_leases(),
+                0
+            );
+            let still_open_old_description_fds = old_description_fds
+                .iter()
+                .copied()
+                .filter(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) } != -1)
+                .collect::<Vec<_>>();
+            assert!(
+                still_open_old_description_fds.is_empty(),
+                "cycle {cycle}: /proc/self/fd still contains descriptor numbers that referred to the old card1 open file description: {still_open_old_description_fds:?}"
+            );
+            let card_fd_entries =
+                c0_3di_card_fd_numbers_for_tests(&card1).unwrap_or_else(|error| {
+                    panic!("cycle {cycle}: inspect /proc/self/fd for card1 after mint: {error}")
+                });
+            assert!(
+                card_fd_entries.is_empty(),
+                "cycle {cycle}: /proc/self/fd still contains card1 entries after the old family mint: {card_fd_entries:?}"
+            );
+            assert!(
+                Backend::poll_fds(backend)
+                    .iter()
+                    .all(|(fd, _)| *fd != raw_fd)
+            );
+            let mut expected = c0_3bi_expected_end_state([output_key.clone()]);
+            expected.quarantined_allocations = backend
+                .scene
+                .owner_buffer_identities_for_tests(output_idx)
+                .into_iter()
+                .map(|owner| owner.managed_key)
+                .collect();
+            c0_3bi_assert_end_state(
+                backend,
+                "c0_hw_3di_poison_retires_family_on_card1_drm",
+                &expected,
+            );
+            c0_3di_assert_old_file_native_objects_gone(
+                backend,
+                device,
+                incarnation,
+                "c0_hw_3di_poison_retires_family_on_card1_drm",
+            );
+            eprintln!("c0_hw_3di_poison_retires_family_on_card1_drm cycle {cycle}/4 passed");
+        }
     }
 }
 

@@ -883,6 +883,54 @@ impl OutputScanout {
         }
     }
 
+    /// Discharge the pool's counted DRM aliases while retaining its managed
+    /// allocation leases. A poisoned incarnation still owns those scanout
+    /// allocations as quarantine; only the file-family barrier may close
+    /// their file-owned backing. Ordinary pool retirement uses
+    /// `detach_managed_entries`, which also releases the managed leases.
+    pub(crate) fn detach_file_family_aliases(
+        &mut self,
+        registry: &mut crate::kms::render::resources::DrmCleanupRegistry,
+    ) {
+        match self {
+            Self::Shared(pool) => {
+                for bo in &mut pool.bos {
+                    discharge_husk_registration(bo, Some(registry));
+                }
+            }
+            Self::Copied(pool) => {
+                for bo in &mut pool.destinations.bos {
+                    discharge_husk_registration(bo, Some(registry));
+                }
+            }
+        }
+    }
+
+    /// Move the pool's Rust owner for the GBM device into the family-close
+    /// registry. Managed GBM BO handles are owned by the resource service
+    /// after conversion, so the registry drops this owner only after it has
+    /// discharged the BOs while the DRM fd is still open.
+    pub(crate) fn detach_gbm_device(&mut self) -> Option<Box<dyn std::any::Any>> {
+        let gbm_device = match self {
+            Self::Shared(pool) => pool.gbm_device.take(),
+            Self::Copied(pool) => pool.destinations.gbm_device.take(),
+        }?;
+        Some(Box::new(gbm_device))
+    }
+
+    pub(crate) fn has_file_family_gbm_bos(&self) -> bool {
+        self.display_pool().bos.iter().any(|bo| bo.gbm_bo.is_some())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn file_family_gbm_object_counts_for_tests(&self) -> (usize, usize) {
+        let pool = self.display_pool();
+        (
+            if pool.gbm_device.is_some() { 1 } else { 0 },
+            pool.bos.iter().filter(|bo| bo.gbm_bo.is_some()).count(),
+        )
+    }
+
     pub(crate) fn drain_all_pending(&mut self, render_vk: &VkContext) -> io::Result<()> {
         match self {
             Self::Shared(pool) => {

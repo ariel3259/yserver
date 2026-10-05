@@ -94,7 +94,8 @@ fn prepare_managed_scanout_flip() -> ManagedScanoutFlip {
         .device_for_key(device_key)
         .expect("live output has a KMS device")
         .device
-        .clone();
+        .clone_rc()
+        .expect("attached test DRM device");
     let drm_fd = device.as_fd().as_raw_fd();
 
     let incarnation = IncarnationId::first();
@@ -449,7 +450,8 @@ fn c0_2ci_sink_gamma_gate_four_states_master_drm() {
         .device_for_key(device_key)
         .expect("live-KMS fixture has its master-holding device")
         .device
-        .clone();
+        .clone_rc()
+        .expect("attached test DRM device");
     let crtc = *device
         .resource_handles()
         .expect("drm resource handles on live master-holding device")

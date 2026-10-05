@@ -4,7 +4,7 @@
 //! owner fork: it records the device-scoped admission intent and performs the
 //! request-side preparation without reserving a dispatch capacity role.
 
-use std::{collections::BTreeSet, io, rc::Rc};
+use std::{collections::BTreeSet, io};
 
 use crate::{
     kms::{
@@ -128,7 +128,15 @@ pub(crate) fn description(
             framebuffer,
         })
         .collect::<Vec<_>>();
-    let drm_device = Rc::clone(&backend.platform.devices[device_index].device);
+    let drm_device = backend.platform.devices[device_index]
+        .device
+        .clone_rc()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "owner unflip DRM device detached before property discovery",
+            )
+        })?;
     let property_ids = discover_composed_property_ids(
         &drm_device,
         &planes,

@@ -5,7 +5,7 @@
 //! owner description/resources for its admission, and waking the conductor
 //! after a retirement.
 
-use std::{io, rc::Rc};
+use std::io;
 
 use crate::{
     kms::{
@@ -123,7 +123,9 @@ pub(crate) fn description(
         .iter()
         .position(|entry| entry.key == device)
         .ok_or_else(|| "direct owner KMS device is unavailable".to_string())?;
-    let drm_device = Rc::clone(&backend.platform.devices[device_index].device);
+    let Some(drm_device) = backend.platform.devices[device_index].device.clone_rc() else {
+        return Err("direct owner KMS device detached before property discovery".to_string());
+    };
     let property_ids = discover_composed_property_ids(
         &drm_device,
         &members,

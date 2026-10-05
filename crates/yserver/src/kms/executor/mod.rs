@@ -105,6 +105,17 @@ impl ReapProof {
     pub const fn for_tests() -> Self {
         Self(())
     }
+
+    /// A probe-worker lease may be released only after its owner joined the
+    /// worker thread. Kept crate-private so callers cannot manufacture a
+    /// lease-release proof without crossing that join boundary.
+    pub(crate) const fn after_probe_worker_join() -> Self {
+        Self(())
+    }
+
+    pub(crate) const fn after_probe_worker_spawn_failed() -> Self {
+        Self(())
+    }
 }
 
 /// Tracks the complete set of open descriptors and helper leases for a KMS device incarnation.
@@ -112,7 +123,7 @@ impl ReapProof {
 #[doc(hidden)]
 #[allow(dead_code)]
 pub struct IncarnationFdSet {
-    leases: HashMap<LeaseId, OwnedFd>,
+    leases: HashMap<LeaseId, Option<OwnedFd>>,
     next_lease_id: u64,
 }
 
@@ -125,8 +136,26 @@ impl IncarnationFdSet {
     pub(crate) fn register_alias(&mut self, fd: OwnedFd) -> LeaseId {
         self.next_lease_id = self.next_lease_id.wrapping_add(1);
         let id = LeaseId(self.next_lease_id);
-        self.leases.insert(id, fd);
+        self.leases.insert(id, Some(fd));
         id
+    }
+
+    /// Register a lease whose fd is held by a joined worker. The worker's
+    /// original duplicate is the lease holder; recording it here avoids
+    /// creating a second fd solely for accounting.
+    pub(crate) fn register_external_lease(&mut self) -> LeaseId {
+        self.next_lease_id = self.next_lease_id.wrapping_add(1);
+        let id = LeaseId(self.next_lease_id);
+        self.leases.insert(id, None);
+        id
+    }
+
+    pub(crate) fn register_alias_from(
+        &mut self,
+        fd: std::os::fd::BorrowedFd<'_>,
+    ) -> io::Result<LeaseId> {
+        let alias = fd.try_clone_to_owned()?;
+        Ok(self.register_alias(alias))
     }
 
     pub(crate) fn release(&mut self, lease: LeaseId) -> Result<(), LeaseError> {
@@ -150,6 +179,10 @@ impl IncarnationFdSet {
 
     pub(crate) fn outstanding(&self) -> usize {
         self.leases.len()
+    }
+
+    pub(crate) fn remaining_leases(&self) -> usize {
+        self.outstanding()
     }
 
     pub(crate) fn may_open_fresh_incarnation(&self) -> Result<(), LeaseError> {
@@ -507,6 +540,22 @@ impl KmsIoExecutor {
     #[allow(dead_code)]
     pub fn state(&self) -> ExecutorState {
         self.state
+    }
+
+    pub(crate) fn termination_requested(&self) -> bool {
+        self.termination_requested
+    }
+
+    /// Return wait-status evidence for the incarnation lease without
+    /// publishing `ExecutorState::Reaped`. The control socket can still have
+    /// queued replies that the core must drain after the child exits.
+    pub(crate) fn take_observed_reap_proof(&mut self) -> Option<ReapProof> {
+        if !self.check_child_exited() {
+            return None;
+        }
+        let proof = self.reap_proof.take()?;
+        self.reap_proof_taken = true;
+        Some(proof)
     }
 
     #[doc(hidden)]

@@ -2690,7 +2690,7 @@ impl KmsBackend {
         let drm_device = self
             .platform
             .device_for_key(device)
-            .map(|entry| std::rc::Rc::clone(&entry.device))
+            .and_then(|entry| entry.device.clone_rc())
             .ok_or_else(|| preparation_error(Stage::Discovery))?;
         let reserved_routes = self
             .platform
@@ -3073,6 +3073,9 @@ impl KmsBackend {
         if outputs.is_empty() {
             return Err("lifecycle device has no protocol outputs".to_string());
         }
+        let Some(attached) = device_entry.device.attached() else {
+            return Err("lifecycle device is detached".to_string());
+        };
         let members = outputs
             .iter()
             .map(
@@ -3086,7 +3089,7 @@ impl KmsBackend {
             )
             .collect::<Vec<_>>();
         let property_ids = crate::kms::render::composed_commit::discover_composed_property_ids(
-            device_entry.device.as_ref(),
+            attached,
             &members,
             &mut device_entry.active_property_cache,
         )
@@ -3204,7 +3207,7 @@ impl KmsBackend {
         let drm_device = self
             .platform
             .device_for_key(device)
-            .map(|entry| std::rc::Rc::clone(&entry.device))
+            .and_then(|entry| entry.device.clone_rc())
             .ok_or_else(|| "VTAcquire DRM device disappeared".to_string())?;
         let level = self.lifecycle_coordinator.protocol_dpms_level();
         let epoch = self.lifecycle_coordinator.dpms_epoch();
@@ -3686,7 +3689,7 @@ impl KmsBackend {
         let drm_device = self
             .platform
             .device_for_key(device)
-            .map(|entry| std::rc::Rc::clone(&entry.device))
+            .and_then(|entry| entry.device.clone_rc())
             .ok_or_else(|| "hotplug DRM device disappeared".to_string())?;
         let level = self.lifecycle_coordinator.protocol_dpms_level();
         let epoch = self.lifecycle_coordinator.dpms_epoch();
@@ -4103,7 +4106,13 @@ impl KmsBackend {
                 .device_for_key(device)
                 .zip(self.platform.device_for_key(service.device()))
                 .is_some_and(|(target, service_device)| {
-                    target.device.as_fd().as_raw_fd() == service_device.device.as_fd().as_raw_fd()
+                    target
+                        .device
+                        .attached()
+                        .zip(service_device.device.attached())
+                        .is_some_and(|(target, service)| {
+                            target.as_fd().as_raw_fd() == service.as_fd().as_raw_fd()
+                        })
                 });
             same_fd
                 && service.incarnation() == incarnation
@@ -7436,9 +7445,49 @@ impl KmsBackend {
         match self.lifecycle_coordinator.report_completion_loss(&device) {
             Ok(dispatch) => {
                 let requester = self.lifecycle_current_tag(device);
+                if self
+                    .lifecycle_coordinator
+                    .device(&device)
+                    .is_some_and(|arbiter| {
+                        arbiter.state()
+                            == crate::kms::owner::lifecycle::DeviceLifecycleState::Poisoned
+                    })
+                {
+                    self.on_poisoned(device);
+                }
                 self.lifecycle_queue_actions(device, dispatch.actions, requester);
             }
             Err(error) => log::error!("lifecycle completion loss for {device:?}: {error:?}"),
+        }
+    }
+
+    pub(super) fn on_poisoned(&mut self, device: DrmDeviceKey) {
+        self.pending_poisoned_barriers.insert(device);
+        if let Some(conductor) = self.admission_conductors.get_mut(&device) {
+            conductor.recovery_stopped = true;
+            conductor.lifecycle_admission_closed = true;
+        }
+        if let Some(gate) = self.platform.transport_gate_mut(&device) {
+            gate.force_close();
+        }
+        if let Some(registry) = self.drm_cleanup_registry.as_mut()
+            && registry.device_key() == device
+        {
+            registry.freeze_incarnation();
+            registry.detach_submitters();
+            if let Some(service) = self.resource_service.as_mut() {
+                service.freeze_incarnation(device, registry.incarnation());
+            }
+        }
+        let _ = self.platform.detach_event_reader(device);
+        self.platform.request_executor_termination(device);
+        let events = self
+            .platform
+            .owner_for(device)
+            .map(crate::kms::owner::device::DeviceCommitOwner::quarantine_live)
+            .unwrap_or_default();
+        if !events.is_empty() {
+            self.route_owner_event_batch(device, events, std::time::Instant::now());
         }
     }
 
@@ -7844,8 +7893,11 @@ impl KmsBackend {
                 framebuffer,
             });
         }
+        let Some(attached) = kms_device.device.attached() else {
+            return Err("composed output DRM device is detached".to_string());
+        };
         crate::kms::render::composed_commit::discover_composed_property_ids(
-            &kms_device.device,
+            attached,
             &planes,
             &mut kms_device.active_property_cache,
         )

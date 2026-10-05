@@ -55,6 +55,164 @@ fn real_vk_context() -> Arc<VkContext> {
     }
 }
 
+#[test]
+fn c0_3di_mint_refuses_while_the_device_is_still_referenced() {
+    use std::{
+        fs::OpenOptions,
+        os::{
+            fd::{AsFd, AsRawFd},
+            unix::fs::MetadataExt,
+        },
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    let key = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let incarnation = IncarnationId::first();
+    let path = std::env::temp_dir().join(format!(
+        "yserver-c0-3di-mint-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time is after the Unix epoch")
+            .as_nanos()
+    ));
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .expect("create a unique backing file for fd-closure verification");
+    let metadata = file.metadata().expect("stat unique backing file");
+    let device = Rc::new(crate::drm::Device::from_file_for_tests(file));
+    let fd = device.as_fd().as_raw_fd();
+    let mut registry = DrmCleanupRegistry::new(Rc::clone(&device), key, incarnation);
+    registry.mark_helper_reaped();
+    registry.detach_submitters();
+    registry.mark_control_closed();
+
+    let error = registry
+        .try_mint_file_family_closed(|_, _| Ok(()))
+        .expect_err("an external Rc owner must refuse family closure");
+    assert!(error.to_string().contains("1 outstanding device reference"));
+    assert!(!registry.is_family_closed());
+    // SAFETY: `fd` was borrowed from the still-live device and F_GETFD only
+    // inspects the descriptor.
+    assert_ne!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+
+    drop(device);
+    let proof = registry
+        .try_mint_file_family_closed(|_, _| Ok(()))
+        .expect("the registry closes the final device handle");
+    assert!(registry.is_family_closed());
+    // SAFETY: The last registry-owned `Device` has been dropped. If another
+    // test reused its numeric descriptor, fstat distinguishes that new file
+    // from this uniquely named backing file.
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } == -1 {
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+    } else {
+        let stat = unsafe { stat.assume_init() };
+        assert_ne!(
+            (u128::from(stat.st_dev), u128::from(stat.st_ino)),
+            (u128::from(metadata.dev()), u128::from(metadata.ino())),
+            "the old file description is closed even if its numeric fd was reused"
+        );
+    }
+    registry.retire_closed_family(proof).unwrap();
+    std::fs::remove_file(path).expect("remove unique backing file");
+}
+
+#[test]
+fn c0_3di_payload_alias_is_registered_unconditionally() {
+    use std::num::NonZeroU32;
+
+    let key = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let incarnation = IncarnationId::first();
+    let device = Rc::new(crate::drm::Device::for_tests().expect("open test DRM device"));
+    let mut registry = DrmCleanupRegistry::new_with_io(
+        key,
+        incarnation,
+        Box::new(MockCleanupIo::new(Rc::new(RefCell::new(Vec::new())))),
+    );
+    let right = registry.register_right(60, 61, GemOwner::Right);
+    let payload = DirectFramebufferAllocation::new(
+        right,
+        None,
+        drm::control::framebuffer::Handle::from(NonZeroU32::new(60).unwrap()),
+        drm::buffer::Handle::from(NonZeroU32::new(61).unwrap()),
+        GemOwner::Right,
+        Some(device),
+    );
+    let mut service = ResourceService::new(key, incarnation);
+
+    let _held = service
+        .adopt_with_registry(AllocationPayload::DirectFramebuffer(payload), &mut registry)
+        .unwrap();
+
+    assert_eq!(registry.payload_aliases(), 1);
+}
+
+#[test]
+fn c0_3di_native_gbm_device_outlives_file_owned_bo_discharge() {
+    let key = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let incarnation = IncarnationId::first();
+    let mut registry = DrmCleanupRegistry::new_with_io(
+        key,
+        incarnation,
+        Box::new(MockCleanupIo::new(Rc::new(RefCell::new(Vec::new())))),
+    );
+    registry.detach_fake_submitters();
+    registry.reap_fake_helper();
+    registry.close_fake_control();
+
+    struct NativeGbmDeviceDrop(Rc<Cell<bool>>);
+    impl Drop for NativeGbmDeviceDrop {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+    let native_device_dropped = Rc::new(Cell::new(false));
+    registry.retain_native_file_object(Box::new(NativeGbmDeviceDrop(Rc::clone(
+        &native_device_dropped,
+    ))));
+    let bo_dropped = Rc::new(Cell::new(false));
+    let payload_key = AllocationKey {
+        device: key,
+        incarnation,
+        generation: 1,
+    };
+    assert!(registry.register_payload_alias(payload_key));
+
+    let proof = registry
+        .try_mint_file_family_closed(|_, actual_key| {
+            assert_eq!(actual_key, payload_key);
+            assert!(
+                !native_device_dropped.get(),
+                "GBM BOs must be discharged while their native gbm_device is still alive"
+            );
+            bo_dropped.set(true);
+            Ok(())
+        })
+        .unwrap();
+
+    assert!(bo_dropped.get());
+    assert!(native_device_dropped.get());
+    assert!(registry.is_family_closed());
+    registry.retire_closed_family(proof).unwrap();
+}
+
 #[derive(Debug)]
 pub(crate) struct SpyAllocation {
     pub(crate) drops: Rc<Cell<usize>>,
@@ -3314,7 +3472,13 @@ pub(crate) fn run_sink_gamma_gate_four_states(
     let mut backend = crate::kms::render::backend::KmsBackend::for_tests();
     backend.platform.devices = vec![crate::kms::render::platform::KmsDevice {
         key: device_key,
-        device: Rc::clone(&device),
+        device: Rc::clone(&device).into(),
+        incarnation_fd_set: Rc::new(std::cell::RefCell::new(
+            crate::kms::executor::IncarnationFdSet::new(),
+        )),
+        helper_lease: None,
+        helper_reaped: false,
+        event_reader_detached: false,
         active_property_cache: Default::default(),
         cursor: crate::kms::render::platform::KmsCursorState::new(),
         executor: None,
@@ -3489,7 +3653,10 @@ fn assert_sink_gated_four_states(
 #[test]
 fn c0_2ci_sink_legacy_page_flip_gate_four_states() {
     let platform = crate::kms::render::platform::PlatformBackend::for_tests();
-    let device = Rc::clone(&platform.devices[0].device);
+    let device = platform.devices[0]
+        .device
+        .clone_rc()
+        .expect("attached test DRM device");
     let output = &platform.outputs[0].output;
     let fb = ::drm::control::from_u32(1).unwrap();
     assert_sink_gated_four_states(WriterClass::Primary, |permitted| {
@@ -3508,7 +3675,10 @@ fn c0_2ci_sink_legacy_page_flip_gate_four_states() {
 #[test]
 fn c0_2ci_sink_direct_atomic_flip_gate_four_states() {
     let platform = crate::kms::render::platform::PlatformBackend::for_tests();
-    let device = Rc::clone(&platform.devices[0].device);
+    let device = platform.devices[0]
+        .device
+        .clone_rc()
+        .expect("attached test DRM device");
     let output = &platform.outputs[0].output;
     let fb = ::drm::control::from_u32(1).unwrap();
     let plane_states = [crate::drm::modeset::DirectScanoutPlaneState {
@@ -3526,7 +3696,10 @@ fn c0_2ci_sink_direct_atomic_flip_gate_four_states() {
 #[test]
 fn c0_2ci_sink_composed_unflip_gate_four_states() {
     let platform = crate::kms::render::platform::PlatformBackend::for_tests();
-    let device = Rc::clone(&platform.devices[0].device);
+    let device = platform.devices[0]
+        .device
+        .clone_rc()
+        .expect("attached test DRM device");
     let output = &platform.outputs[0].output;
     let fb = ::drm::control::from_u32(1).unwrap();
     let planes = [crate::drm::modeset::ComposedScanoutPlaneState { output, fb }];
@@ -3538,7 +3711,10 @@ fn c0_2ci_sink_composed_unflip_gate_four_states() {
 #[test]
 fn c0_2ci_sink_modeset_install_gate_four_states() {
     let platform = crate::kms::render::platform::PlatformBackend::for_tests();
-    let device = Rc::clone(&platform.devices[0].device);
+    let device = platform.devices[0]
+        .device
+        .clone_rc()
+        .expect("attached test DRM device");
     let output = &platform.outputs[0].output;
     let fb = ::drm::control::from_u32(1).unwrap();
     assert_sink_gated_four_states(WriterClass::Modeset, |permitted| {
@@ -3549,7 +3725,10 @@ fn c0_2ci_sink_modeset_install_gate_four_states() {
 #[test]
 fn c0_2ci_sink_output_disable_gate_four_states() {
     let platform = crate::kms::render::platform::PlatformBackend::for_tests();
-    let device = Rc::clone(&platform.devices[0].device);
+    let device = platform.devices[0]
+        .device
+        .clone_rc()
+        .expect("attached test DRM device");
     let output = &platform.outputs[0].output;
     assert_sink_gated_four_states(WriterClass::Modeset, |permitted| {
         crate::drm::modeset::disable_output(&device, output, permitted)
@@ -3559,7 +3738,10 @@ fn c0_2ci_sink_output_disable_gate_four_states() {
 #[test]
 fn c0_conv_ciii_sink_recorder_counts_entry_before_the_permit() {
     let platform = crate::kms::render::platform::PlatformBackend::for_tests();
-    let device = Rc::clone(&platform.devices[0].device);
+    let device = platform.devices[0]
+        .device
+        .clone_rc()
+        .expect("attached test DRM device");
     let output = &platform.outputs[0].output;
     let fb = ::drm::control::from_u32(1).unwrap();
     let legacy = sink_gate_at_state(TransportState::Legacy);

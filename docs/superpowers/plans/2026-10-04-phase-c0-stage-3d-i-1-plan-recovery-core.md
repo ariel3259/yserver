@@ -151,9 +151,11 @@ predicate; a driver hook `on_poisoned(device)` (name free) called from the exist
 
 | Test | Scenario | Must fail under |
 | --- | --- | --- |
-| `c0_3di_poison_requests_termination_and_retires_the_family_vulkan` | completion loss → `Poisoned`; the helper is reaped and no worker is live: the barrier mints exactly once, then the old fd set is closed | close the control alias before the lease holders are released; or treat the control close alone as the closure proof |
-| `c0_3di_stuck_probe_worker_blocks_the_barrier_vulkan` | children reaped, one probe worker blocked: the barrier stays false; joining the worker makes it true | count only executor leases |
+| `c0_3di_poison_requests_termination_and_retires_the_family_vulkan` | completion loss → `Poisoned`; the helper is reaped and no worker is live: the barrier mints exactly once, then the old fd set is closed; the old pool has no GBM device or BO after mint | close the control alias before the lease holders are released; treat the control close alone as the closure proof; or drop only the pool's `GbmDevice` `Rc` while keeping its BOs |
+| `c0_3di_stuck_probe_worker_blocks_the_barrier_vulkan` | children reaped, one probe worker blocked: the barrier stays false; joining the worker makes it true; the core has no ≤1 ms barrier poll | count only executor leases; arm an unbounded 1 ms barrier poll |
 | `c0_3di_mint_refuses_while_the_device_is_still_referenced` | an extra `Rc<drm::Device>` is held (as `KmsDevice` held it before IN-0): the mint returns an error and no proof; after the holder is dropped it mints, and the fd is closed (fstat on a dup taken earlier shows the description gone, or the device's fd number is reusable) | mint without `try_unwrap` (drop only the registry's own handle) |
+| `c0_3di_payload_alias_is_registered_unconditionally` | adopting a file-owned payload records one family alias | put `register_payload_alias` only inside `debug_assert!` and run this test in release mode |
+| `c0_3di_native_gbm_device_outlives_file_owned_bo_discharge` | the family barrier destroys file-owned GBM BOs while retaining their native `gbm_device`, then releases the device before mint | drop only the pool's `GbmDevice` `Rc` before discharging its BOs |
 | `c0_3di_unreaped_helper_blocks_the_barrier_vulkan` | the helper gives no wait status: the barrier stays false and a wakeup stays armed | treat termination request as reap |
 
 **Hardware (M-2):** `c0_hw_3di_poison_retires_family_on_card1_drm` — on card1, a real composed commit's

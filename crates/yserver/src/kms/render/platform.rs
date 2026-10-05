@@ -2539,9 +2539,41 @@ fn mode_via_connector_handle<T: Copy>(
 
 /// One opened display/KMS device. Renderer identity and render-node resources
 /// deliberately live in `RenderDevice` instead.
+pub(crate) struct AttachedDrmDevice(Option<Rc<drm::Device>>);
+
+impl AttachedDrmDevice {
+    pub(crate) fn new(device: Rc<drm::Device>) -> Self {
+        Self(Some(device))
+    }
+
+    pub(crate) fn attached(&self) -> Option<&drm::Device> {
+        self.0.as_deref()
+    }
+
+    pub(crate) fn clone_rc(&self) -> Option<Rc<drm::Device>> {
+        self.0.as_ref().map(Rc::clone)
+    }
+
+    pub(crate) fn take(&mut self) -> Option<Rc<drm::Device>> {
+        self.0.take()
+    }
+}
+
+impl From<Rc<drm::Device>> for AttachedDrmDevice {
+    fn from(device: Rc<drm::Device>) -> Self {
+        Self::new(device)
+    }
+}
+
 pub(crate) struct KmsDevice {
     pub(crate) key: crate::platform::drm::DrmDeviceKey,
-    pub(crate) device: Rc<drm::Device>,
+    pub(crate) device: AttachedDrmDevice,
+    /// Complete descriptor/lease inventory for this Owner incarnation.
+    pub(crate) incarnation_fd_set:
+        std::rc::Rc<std::cell::RefCell<crate::kms::executor::IncarnationFdSet>>,
+    pub(crate) helper_lease: Option<crate::kms::executor::LeaseId>,
+    pub(crate) helper_reaped: bool,
+    pub(crate) event_reader_detached: bool,
     /// Cached per-CRTC `ACTIVE` property ids used by composed owner commits.
     pub(crate) active_property_cache: crate::kms::render::composed_commit::ActivePropertyCache,
     pub(crate) cursor: KmsCursorState,
@@ -2951,8 +2983,12 @@ fn initialize_cursor_plane_for_device(
     crtcs: &[::drm::control::crtc::Handle],
     boundary: &str,
 ) {
+    let Some(device) = kms_device.device.clone_rc() else {
+        kms_device.cursor.headless_deferred = true;
+        return;
+    };
     kms_device.cursor.headless_deferred = false;
-    match crate::kms::cursor_plane::CursorPlane::new(Rc::clone(&kms_device.device), crtcs) {
+    match crate::kms::cursor_plane::CursorPlane::new(device, crtcs) {
         Ok(plane) => install_cursor_plane_for_device(kms_device, crtcs, boundary, plane),
         Err(error) => {
             kms_device.cursor.note_initialization_failure(&error);
@@ -3557,7 +3593,16 @@ impl Drop for PlatformBackend {
                 .get(&device.key)
                 .map(|g| g.allows_legacy(crate::kms::render::resources::WriterClass::Modeset))
                 .unwrap_or(true);
-            drm::modeset::disable_output(&device.device, output, allow_legacy)
+            let Some(attached) = device.device.attached() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    format!(
+                        "initial scanout rollback found detached device {}",
+                        device.key
+                    ),
+                ));
+            };
+            drm::modeset::disable_output(attached, output, allow_legacy)
         });
         self.initial_scanout_rollback_armed = false;
     }
@@ -3620,7 +3665,11 @@ impl PlatformBackend {
                 let (incarnation, lifecycle_epoch) = device.executor.owner_identity();
                 KmsDevice {
                     key: device.key,
-                    device: device.device,
+                    device: device.device.into(),
+                    incarnation_fd_set: device.incarnation_fd_set,
+                    helper_lease: Some(device.helper_lease),
+                    helper_reaped: false,
+                    event_reader_detached: false,
                     active_property_cache: Default::default(),
                     cursor,
                     executor: Some(device.executor),
@@ -3656,7 +3705,16 @@ impl PlatformBackend {
         // `PlatformBackend` (and any transport gate) exists (R8).
         let mut initial_scanout_rollback =
             InitialScanoutRollbackGuard::new_with(&devices, &mut layouts, |device, output| {
-                drm::modeset::disable_output(&device.device, output, true)
+                let Some(attached) = device.device.attached() else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        format!(
+                            "initial scanout rollback found detached device {}",
+                            device.key
+                        ),
+                    ));
+                };
+                drm::modeset::disable_output(attached, output, true)
             });
 
         let requested_render_node = render_node.as_ref().map(|node| node.key());
@@ -3769,6 +3827,15 @@ impl PlatformBackend {
                         layout.key.connector_name, layout.key.device_key
                     ))
                 })?;
+            let Some(drm_device) = device.device.clone_rc() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    format!(
+                        "scanout allocation found detached DRM device {}",
+                        device.key
+                    ),
+                ));
+            };
             let scanout_route = selected_renderer.scanout_route_to(device);
             scanout_routes.push(scanout_route);
             let allocation: io::Result<OutputScanout> = if route_requires_copy_free_probe(
@@ -3776,7 +3843,7 @@ impl PlatformBackend {
             ) {
                 match allocate_copy_free_scanout_pool(
                     Arc::clone(&vk),
-                    Rc::clone(&device.device),
+                    Rc::clone(&drm_device),
                     &layout.output,
                     scanout_route,
                     w,
@@ -3832,7 +3899,7 @@ impl PlatformBackend {
                             allocate_copied_scanout_pool(
                                 Arc::clone(&vk),
                                 sink_vk,
-                                Rc::clone(&device.device),
+                                Rc::clone(&drm_device),
                                 &layout.output,
                                 scanout_route,
                                 destination_route,
@@ -3892,7 +3959,7 @@ impl PlatformBackend {
             } else {
                 ScanoutBoPool::allocate(
                     Arc::clone(&vk),
-                    Rc::clone(&device.device),
+                    drm_device,
                     scanout_route,
                     w,
                     h,
@@ -4111,7 +4178,13 @@ impl PlatformBackend {
             initial_scanout_rollback_armed: false,
             devices: vec![KmsDevice {
                 key: device_key,
-                device,
+                device: device.into(),
+                incarnation_fd_set: Rc::new(std::cell::RefCell::new(
+                    crate::kms::executor::IncarnationFdSet::new(),
+                )),
+                helper_lease: None,
+                helper_reaped: false,
+                event_reader_detached: false,
                 active_property_cache: Default::default(),
                 cursor: KmsCursorState::new(),
                 executor: None,
@@ -4358,7 +4431,7 @@ impl PlatformBackend {
             .ok_or_else(|| io::Error::other("test output has no KMS device"))?;
         let pool = crate::kms::vk::scanout::ScanoutBoPool::allocate(
             vk,
-            Rc::clone(&kms_device.device),
+            kms_device.device.clone_rc().expect("attached KMS device"),
             layout.scanout_route,
             u32::from(layout.width),
             u32::from(layout.height),
@@ -5451,7 +5524,13 @@ impl PlatformBackend {
     > {
         let mut all = Vec::with_capacity(self.devices.len());
         for device in &self.devices {
-            let fd = duplicate_connector_probe_fd(device.device.as_ref())?;
+            let Some(attached) = device.device.attached() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    format!("connector probe found detached device {}", device.key),
+                ));
+            };
+            let fd = duplicate_connector_probe_fd(attached)?;
             let probes = self.connector_prober.probe_connectors(device.key, fd)?;
             all.push((device.key, probes));
         }
@@ -5465,7 +5544,16 @@ impl PlatformBackend {
     pub(crate) fn probe_connector_snapshot(&self) -> io::Result<Vec<ConnectorSnapshot>> {
         let mut snapshot = Vec::new();
         for device in &self.devices {
-            let fd = duplicate_connector_probe_fd(device.device.as_ref())?;
+            let Some(attached) = device.device.attached() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    format!(
+                        "connector snapshot probe found detached device {}",
+                        device.key
+                    ),
+                ));
+            };
+            let fd = duplicate_connector_probe_fd(attached)?;
             snapshot.extend(self.connector_prober.probe_snapshot(device.key, fd)?);
         }
         Ok(snapshot)
@@ -5482,8 +5570,21 @@ impl PlatformBackend {
     > {
         let mut results = std::collections::BTreeMap::new();
         for device in &self.devices {
-            let result = duplicate_connector_probe_fd(device.device.as_ref())
-                .and_then(|fd| self.connector_prober.probe_snapshot(device.key, fd));
+            let result = device.device.attached().map_or_else(
+                || {
+                    Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        format!(
+                            "connector snapshot probe found detached device {}",
+                            device.key
+                        ),
+                    ))
+                },
+                |attached| {
+                    duplicate_connector_probe_fd(attached)
+                        .and_then(|fd| self.connector_prober.probe_snapshot(device.key, fd))
+                },
+            );
 
             results.insert(device.key, result);
         }
@@ -5639,7 +5740,11 @@ impl PlatformBackend {
             fds.push((ctx.fd(), BackendFdKind::Libinput));
         }
         for device in &self.devices {
-            fds.push((device.device.as_fd().as_raw_fd(), BackendFdKind::Drm));
+            if !device.event_reader_detached
+                && let Some(attached) = device.device.attached()
+            {
+                fds.push((attached.as_fd().as_raw_fd(), BackendFdKind::Drm));
+            }
             if let Some(control) = device.executor.as_ref().and_then(|e| e.control_fd()) {
                 fds.push((control.as_raw_fd(), BackendFdKind::ExecutorControl));
             }
@@ -5687,11 +5792,12 @@ impl PlatformBackend {
         )>,
         std::io::Result<crate::drm::event_stream::DrainStop>,
     ) {
-        let Some(kms_device) = self
-            .devices
-            .iter_mut()
-            .find(|d| d.device.as_fd().as_raw_fd() == drm_fd)
-        else {
+        let Some(kms_device) = self.devices.iter_mut().find(|d| {
+            !d.event_reader_detached
+                && d.device
+                    .attached()
+                    .is_some_and(|device| device.as_fd().as_raw_fd() == drm_fd)
+        }) else {
             return (
                 Vec::new(),
                 Err(std::io::Error::new(
@@ -5819,14 +5925,18 @@ impl PlatformBackend {
         })?;
         let incarnation = owner.incarnation();
         let topology_generation = owner.topology_generation();
-        let atomic_enabled = kms_device.device.atomic_client_cap_enabled();
-        let crtc_in_event = kms_device
-            .device
+        let Some(attached) = kms_device.device.attached() else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                format!("cannot discover completion capabilities for detached device {key}"),
+            ));
+        };
+        let atomic_enabled = attached.atomic_client_cap_enabled();
+        let crtc_in_event = attached
             .get_driver_capability(::drm::DriverCapability::CRTCInVBlankEvent)
             .map(|v| v == 1)
             .unwrap_or(false);
-        let monotonic = kms_device
-            .device
+        let monotonic = attached
             .get_driver_capability(::drm::DriverCapability::MonotonicTimestamp)
             .map(|v| v == 1)
             .unwrap_or(false);
@@ -5837,7 +5947,7 @@ impl PlatformBackend {
                 let has_out_fence = if let Some(prop) = output.output.crtc_out_fence_ptr_prop {
                     u32::from(prop) != 0
                 } else if let Ok(props) =
-                    crate::drm::modeset::PropMap::for_object(&kms_device.device, output.output.crtc)
+                    crate::drm::modeset::PropMap::for_object(attached, output.output.crtc)
                 {
                     props.id("OUT_FENCE_PTR").is_ok()
                 } else {
@@ -5922,7 +6032,16 @@ impl PlatformBackend {
                 )),
             );
         }
-        let drm_fd = kms_device.device.as_fd().as_raw_fd();
+        let Some(attached) = kms_device.device.attached() else {
+            return (
+                Vec::new(),
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "device detached before legacy event drain",
+                )),
+            );
+        };
+        let drm_fd = attached.as_fd().as_raw_fd();
         let (keyed_events, drain_res) = self.drain_owner_events(drm_fd, now);
         let events: Vec<
             crate::kms::owner::device::OwnerEvent<crate::kms::render::resources::CommitResources>,
@@ -6001,7 +6120,13 @@ impl PlatformBackend {
     ) {
         self.devices.push(KmsDevice {
             key,
-            device: std::rc::Rc::new(device),
+            device: std::rc::Rc::new(device).into(),
+            incarnation_fd_set: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::kms::executor::IncarnationFdSet::new(),
+            )),
+            helper_lease: None,
+            helper_reaped: false,
+            event_reader_detached: false,
             active_property_cache: Default::default(),
             cursor: KmsCursorState::new(),
             executor: None,
@@ -6024,7 +6149,13 @@ impl PlatformBackend {
     ) {
         self.devices.push(KmsDevice {
             key,
-            device: std::rc::Rc::new(device),
+            device: std::rc::Rc::new(device).into(),
+            incarnation_fd_set: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::kms::executor::IncarnationFdSet::new(),
+            )),
+            helper_lease: None,
+            helper_reaped: false,
+            event_reader_detached: false,
             active_property_cache: Default::default(),
             cursor: KmsCursorState::new(),
             executor: None,
@@ -6056,10 +6187,144 @@ impl PlatformBackend {
         crate::platform::drm::DrmDeviceKey,
         crate::kms::executor::HostCallEvent,
     )> {
-        self.devices
+        let mut events = Vec::new();
+        for device in &mut self.devices {
+            let Some(executor) = device.executor.as_mut() else {
+                continue;
+            };
+            if let Some(event) = executor.tick(now) {
+                events.push((device.key, event));
+            }
+        }
+        events
+    }
+
+    /// Release helper leases at an explicit termination edge or the
+    /// helper-control socket's readable/hangup callback. The ordinary
+    /// `before_block` tick does not poll wait status while an exit event is
+    /// still pending.
+    pub(crate) fn reap_terminated_helper_leases(&mut self) {
+        for device in &mut self.devices {
+            let Some(lease) = device.helper_lease else {
+                continue;
+            };
+            let Some(executor) = device.executor.as_mut() else {
+                continue;
+            };
+            if executor.state() != crate::kms::executor::ExecutorState::Stalled
+                && executor.state() != crate::kms::executor::ExecutorState::Reaped
+                && !executor.termination_requested()
+            {
+                continue;
+            }
+            let Some(proof) = executor.take_observed_reap_proof() else {
+                continue;
+            };
+            let _ = executor.try_reap();
+            match device
+                .incarnation_fd_set
+                .borrow_mut()
+                .release_with_proof(lease, proof)
+            {
+                Ok(()) => {
+                    device.helper_lease = None;
+                    device.helper_reaped = true;
+                }
+                Err(error) => log::error!(
+                    "kms: could not release helper lease for {:?}: {error:?}",
+                    device.key
+                ),
+            }
+        }
+    }
+
+    pub(crate) fn request_executor_termination(&mut self, key: crate::platform::drm::DrmDeviceKey) {
+        if let Some(executor) = self
+            .devices
             .iter_mut()
-            .filter_map(|d| Some((d.key, d.executor.as_mut()?.tick(now)?)))
-            .collect()
+            .find(|device| device.key == key)
+            .and_then(|device| device.executor.as_mut())
+        {
+            executor.request_termination();
+        }
+    }
+
+    pub(crate) fn detach_event_reader(&mut self, key: crate::platform::drm::DrmDeviceKey) -> bool {
+        let Some(device) = self.devices.iter_mut().find(|device| device.key == key) else {
+            return false;
+        };
+        device.event_reader_detached = true;
+        true
+    }
+
+    pub(crate) fn detach_control_device(
+        &mut self,
+        key: crate::platform::drm::DrmDeviceKey,
+    ) -> bool {
+        let Some(device) = self.devices.iter_mut().find(|device| device.key == key) else {
+            return false;
+        };
+        if !device.event_reader_detached {
+            return false;
+        }
+        device.cursor.plane.take();
+        device.device.take().is_some()
+    }
+
+    pub(crate) fn control_device_detached(&self, key: crate::platform::drm::DrmDeviceKey) -> bool {
+        self.devices
+            .iter()
+            .find(|device| device.key == key)
+            .is_some_and(|device| device.device.attached().is_none())
+    }
+
+    pub(crate) fn detach_managed_scanout_aliases(
+        &mut self,
+        key: crate::platform::drm::DrmDeviceKey,
+        registry: &mut crate::kms::render::resources::DrmCleanupRegistry,
+    ) -> bool {
+        let mut has_only_detached_native_owners = true;
+        for (output, scanout) in self.outputs.iter().zip(&mut self.scanout_pools) {
+            if output.key.device_key == key
+                && let Some(scanout) = scanout.as_mut()
+            {
+                scanout.detach_file_family_aliases(registry);
+                if !scanout.has_file_family_gbm_bos() {
+                    if let Some(gbm_device) = scanout.detach_gbm_device() {
+                        registry.retain_native_file_object(gbm_device);
+                    }
+                } else {
+                    // An unmanaged BO still points at the pool's native
+                    // gbm_device. Keep both alive and refuse to mint until
+                    // the pool owner has discharged that BO.
+                    has_only_detached_native_owners = false;
+                }
+            }
+        }
+        has_only_detached_native_owners
+    }
+
+    pub(crate) fn incarnation_fd_set(
+        &self,
+        key: crate::platform::drm::DrmDeviceKey,
+    ) -> Option<std::rc::Rc<std::cell::RefCell<crate::kms::executor::IncarnationFdSet>>> {
+        self.devices
+            .iter()
+            .find(|device| device.key == key)
+            .map(|device| std::rc::Rc::clone(&device.incarnation_fd_set))
+    }
+
+    pub(crate) fn helper_is_reaped(&self, key: crate::platform::drm::DrmDeviceKey) -> bool {
+        self.devices
+            .iter()
+            .find(|device| device.key == key)
+            .is_some_and(|device| {
+                device.helper_reaped
+                    || (device.helper_lease.is_none()
+                        && device.executor.as_ref().is_none_or(|executor| {
+                            executor.state() == crate::kms::executor::ExecutorState::Reaped
+                        }))
+            })
     }
 
     /// Register one source-renderer completion with the stable copied-scanout
@@ -6508,9 +6773,13 @@ impl PlatformBackend {
     }
 
     fn drm_device_index_for_fd(&self, drm_fd: RawFd) -> Option<usize> {
-        self.devices
-            .iter()
-            .position(|device| device.device.as_fd().as_raw_fd() == drm_fd)
+        self.devices.iter().position(|device| {
+            !device.event_reader_detached
+                && device
+                    .device
+                    .attached()
+                    .is_some_and(|device| device.as_fd().as_raw_fd() == drm_fd)
+        })
     }
 
     /// Drain page-flip events that belong to the topology epoch just taken
@@ -6580,10 +6849,12 @@ impl PlatformBackend {
                 .devices
                 .iter()
                 .filter(|device| devices.is_none_or(|devices| devices.contains(&device.key)))
-                .map(|device| libc::pollfd {
-                    fd: device.device.as_fd().as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
+                .filter_map(|device| {
+                    device.device.attached().map(|attached| libc::pollfd {
+                        fd: attached.as_fd().as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    })
                 })
                 .collect();
             if poll_fds.is_empty() {
@@ -8199,7 +8470,7 @@ impl PlatformBackend {
             .ok_or_else(|| io::Error::other("copied scanout output index out of range"))?;
         let device = self
             .device_for_output(&output_key)
-            .map(|device| Rc::clone(&device.device))
+            .and_then(|device| device.device.clone_rc())
             .ok_or_else(|| io::Error::other("copied scanout KMS device disappeared"))?;
         // B-10/R11: computed once, outside the closure below, so the
         // closure's disjoint-field capture of `self.scanout_pools` is not
@@ -8533,12 +8804,15 @@ impl PlatformBackend {
             Some(i) => i,
             None => return Ok(false),
         };
-        let device = Rc::clone(
-            &self
-                .device_for_output(output_key)
-                .ok_or_else(|| io::Error::other(format!("no DRM device for {output_key:?}")))?
-                .device,
-        );
+        let device = self
+            .device_for_output(output_key)
+            .and_then(|device| device.device.clone_rc())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    format!("no attached DRM device for {output_key:?}"),
+                )
+            })?;
 
         // B-10/R11: `true` on every production device today (no gate
         // installed, R8).
@@ -8629,12 +8903,15 @@ impl PlatformBackend {
     ) -> io::Result<ResolvedConnectorEnable> {
         let connector = output.connector_name.clone();
         debug_assert_eq!(output_key.connector_name, connector);
-        let device = Rc::clone(
-            &self
-                .device_for_output(output_key)
-                .ok_or_else(|| io::Error::other(format!("no DRM device for {output_key:?}")))?
-                .device,
-        );
+        let device = self
+            .device_for_output(output_key)
+            .and_then(|device| device.device.clone_rc())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    format!("no attached DRM device for {output_key:?}"),
+                )
+            })?;
         let scanout_route = self.scanout_route_for_kms(output_key.device_key)?;
 
         if let Some(conflict) = self.outputs.iter().find(|layout| {
@@ -9582,7 +9859,7 @@ impl PlatformBackend {
         for (i, layout) in self.outputs.iter().enumerate() {
             let Some(device) = self
                 .device_for_output(&layout.key)
-                .map(|device| Rc::clone(&device.device))
+                .and_then(|device| device.device.clone_rc())
             else {
                 log::warn!(
                     "render disable_output: no DRM device {} for {}",
@@ -9681,7 +9958,7 @@ impl PlatformBackend {
                 }
                 let Some(device) = self
                     .device_for_output(&layout.key)
-                    .map(|device| Rc::clone(&device.device))
+                    .and_then(|device| device.device.clone_rc())
                 else {
                     let error = io::Error::new(
                         io::ErrorKind::NotFound,
@@ -9780,7 +10057,7 @@ impl PlatformBackend {
                 }
                 let Some(device) = self
                     .device_for_output(&layout.key)
-                    .map(|device| Rc::clone(&device.device))
+                    .and_then(|device| device.device.clone_rc())
                 else {
                     let error = io::Error::new(
                         io::ErrorKind::NotFound,
@@ -10971,7 +11248,13 @@ mod tests {
     fn test_kms_device(key: crate::platform::drm::DrmDeviceKey) -> KmsDevice {
         KmsDevice {
             key,
-            device: Rc::new(drm::Device::for_tests().expect("test DRM device")),
+            device: Rc::new(drm::Device::for_tests().expect("test DRM device")).into(),
+            incarnation_fd_set: Rc::new(std::cell::RefCell::new(
+                crate::kms::executor::IncarnationFdSet::new(),
+            )),
+            helper_lease: None,
+            helper_reaped: false,
+            event_reader_detached: false,
             active_property_cache: Default::default(),
             cursor: KmsCursorState::new(),
             executor: None,
@@ -11123,7 +11406,10 @@ mod tests {
         boundary: &str,
     ) {
         let plane = crate::kms::cursor_plane::CursorPlane::for_tests_stub(
-            Rc::clone(&device.device),
+            device
+                .device
+                .clone_rc()
+                .expect("attached cursor test device"),
             64,
             64,
         );
@@ -11572,7 +11858,13 @@ mod tests {
         };
         platform.devices.push(KmsDevice {
             key: second_key,
-            device: Rc::new(drm::Device::for_tests().expect("second test DRM device")),
+            device: Rc::new(drm::Device::for_tests().expect("second test DRM device")).into(),
+            incarnation_fd_set: Rc::new(std::cell::RefCell::new(
+                crate::kms::executor::IncarnationFdSet::new(),
+            )),
+            helper_lease: None,
+            helper_reaped: false,
+            event_reader_detached: false,
             active_property_cache: Default::default(),
             cursor: KmsCursorState::new(),
             executor: None,
@@ -11587,7 +11879,12 @@ mod tests {
     #[test]
     fn drm_device_fd_lookup_distinguishes_same_kind_poll_sources() {
         let mut platform = PlatformBackend::for_tests();
-        let first_fd = platform.devices[0].device.as_fd().as_raw_fd();
+        let first_fd = platform.devices[0]
+            .device
+            .attached()
+            .expect("attached test DRM device")
+            .as_fd()
+            .as_raw_fd();
         let second_device = Rc::new(drm::Device::for_tests().expect("second test DRM device"));
         let second_fd = second_device.as_fd().as_raw_fd();
         platform.devices.push(KmsDevice {
@@ -11595,7 +11892,13 @@ mod tests {
                 major: 226,
                 minor: 1,
             },
-            device: second_device,
+            device: second_device.into(),
+            incarnation_fd_set: Rc::new(std::cell::RefCell::new(
+                crate::kms::executor::IncarnationFdSet::new(),
+            )),
+            helper_lease: None,
+            helper_reaped: false,
+            event_reader_detached: false,
             active_property_cache: Default::default(),
             cursor: KmsCursorState::new(),
             executor: None,
@@ -11929,8 +12232,18 @@ mod tests {
             minor: 93,
         };
         platform.devices.push(test_kms_device(secondary_key));
-        let primary_fd = platform.devices[0].device.as_fd().as_raw_fd();
-        let secondary_fd = platform.devices[1].device.as_fd().as_raw_fd();
+        let primary_fd = platform.devices[0]
+            .device
+            .attached()
+            .expect("attached test DRM device")
+            .as_fd()
+            .as_raw_fd();
+        let secondary_fd = platform.devices[1]
+            .device
+            .attached()
+            .expect("attached test DRM device")
+            .as_fd()
+            .as_raw_fd();
         platform.outputs.push(test_active_output_for(
             secondary_key,
             "secondary",
@@ -11949,8 +12262,24 @@ mod tests {
             |device, crtcs, boundary| {
                 calls.set(calls.get() + 1);
                 assert_eq!(device.key, secondary_key);
-                assert_eq!(device.device.as_fd().as_raw_fd(), secondary_fd);
-                assert_ne!(device.device.as_fd().as_raw_fd(), primary_fd);
+                assert_eq!(
+                    device
+                        .device
+                        .attached()
+                        .expect("attached test DRM device")
+                        .as_fd()
+                        .as_raw_fd(),
+                    secondary_fd
+                );
+                assert_ne!(
+                    device
+                        .device
+                        .attached()
+                        .expect("attached test DRM device")
+                        .as_fd()
+                        .as_raw_fd(),
+                    primary_fd
+                );
                 assert_eq!(crtcs, &[raw_crtc]);
                 install_test_cursor_plane(device, crtcs, boundary);
             },
@@ -12193,7 +12522,13 @@ mod tests {
         };
         platform.devices.push(KmsDevice {
             key: nvidia_key,
-            device: Rc::new(drm::Device::for_tests().expect("test DRM device")),
+            device: Rc::new(drm::Device::for_tests().expect("test DRM device")).into(),
+            incarnation_fd_set: Rc::new(std::cell::RefCell::new(
+                crate::kms::executor::IncarnationFdSet::new(),
+            )),
+            helper_lease: None,
+            helper_reaped: false,
+            event_reader_detached: false,
             active_property_cache: Default::default(),
             cursor: KmsCursorState::new_with_nvidia_policy(true),
             executor: None,
@@ -12779,6 +13114,18 @@ mod tests {
                     minor: i as u32,
                 };
                 let mut dev = test_kms_device(key);
+                let lease = dev
+                    .incarnation_fd_set
+                    .borrow_mut()
+                    .register_alias_from(
+                        dev.device
+                            .attached()
+                            .expect("attached test DRM device")
+                            .as_fd(),
+                    )
+                    .expect("track stub helper lease");
+                dev.helper_lease = Some(lease);
+                dev.helper_reaped = false;
                 dev.executor = Some(test_support::spawn_stub_helper(behaviour).expect("spawn"));
                 let (incarnation, epoch) =
                     dev.executor.as_ref().expect("executor").owner_identity();
@@ -12818,6 +13165,15 @@ mod tests {
                         executor.state(),
                         crate::kms::executor::ExecutorState::Reaped
                     );
+                    if let Some(proof) = executor.take_reap_proof()
+                        && let Some(lease) = dev.helper_lease.take()
+                    {
+                        dev.incarnation_fd_set
+                            .borrow_mut()
+                            .release_with_proof(lease, proof)
+                            .expect("release reaped stub helper lease");
+                        dev.helper_reaped = true;
+                    }
                 }
             }
         }

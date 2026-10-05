@@ -9456,10 +9456,10 @@ fn tick_one_output(
     let output_key = platform.outputs[output_idx].key.clone();
     let drm_device = platform
         .device_for_output(&output_key)
-        .map(|device| device.device.clone())
+        .and_then(|device| device.device.clone_rc())
         .ok_or_else(|| {
             SceneError::Present(PresentError::Io(std::io::Error::other(format!(
-                "no DRM device for output {:?}",
+                "no attached DRM device for output {:?}",
                 output_key
             ))))
         })?;

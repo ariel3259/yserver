@@ -218,9 +218,10 @@ pub(crate) struct FamilyInventory {
 pub(crate) struct DrmCleanupRegistry {
     device_key: DrmDeviceKey,
     incarnation: IncarnationId,
-    io: Box<dyn CleanupIo>,
+    io: Option<Box<dyn CleanupIo>>,
     device: Option<Rc<Device>>,
     frozen: bool,
+    family_closing: bool,
     family_closed: bool,
     /// Outstanding file-owned payload aliases, keyed by the entry that holds
     /// them. `register_payload_alias` records one at adoption;
@@ -231,6 +232,10 @@ pub(crate) struct DrmCleanupRegistry {
     /// its device alias and the already-held role charge until R3 retry or
     /// the incarnation's family-close handoff.
     pending_cleanup: Vec<PendingCleanupEntry>,
+    /// Native owners such as `gbm_device` objects that must stay alive until
+    /// their BOs have been destroyed, then be dropped before the DRM fd's
+    /// final close. They are moved here from quarantined scanout pools.
+    retained_native_file_objects: Vec<Box<dyn std::any::Any>>,
     family_inventory: FamilyInventory,
     returned_descriptors: Vec<std::os::fd::OwnedFd>,
     /// Spec 4.1: set once pool-husk accounting can no longer be trusted --
@@ -250,6 +255,10 @@ impl std::fmt::Debug for DrmCleanupRegistry {
             .field("frozen", &self.frozen)
             .field("family_closed", &self.family_closed)
             .field("payload_aliases", &self.payload_aliases())
+            .field(
+                "retained_native_file_objects",
+                &self.retained_native_file_objects.len(),
+            )
             .finish()
     }
 }
@@ -265,12 +274,14 @@ impl DrmCleanupRegistry {
         Self {
             device_key,
             incarnation,
-            io,
+            io: Some(io),
             device: Some(device),
             frozen: false,
+            family_closing: false,
             family_closed: false,
             payload_alias_keys: BTreeSet::new(),
             pending_cleanup: Vec::new(),
+            retained_native_file_objects: Vec::new(),
             family_inventory: FamilyInventory::default(),
             returned_descriptors: Vec::new(),
             husk_accounting_failed: Rc::new(Cell::new(false)),
@@ -285,12 +296,14 @@ impl DrmCleanupRegistry {
         Self {
             device_key,
             incarnation,
-            io,
+            io: Some(io),
             device: None,
             frozen: false,
+            family_closing: false,
             family_closed: false,
             payload_alias_keys: BTreeSet::new(),
             pending_cleanup: Vec::new(),
+            retained_native_file_objects: Vec::new(),
             family_inventory: FamilyInventory::default(),
             returned_descriptors: Vec::new(),
             husk_accounting_failed: Rc::new(Cell::new(false)),
@@ -306,12 +319,14 @@ impl DrmCleanupRegistry {
         Self {
             device_key,
             incarnation,
-            io,
+            io: Some(io),
             device: Some(device),
             frozen: false,
+            family_closing: false,
             family_closed: false,
             payload_alias_keys: BTreeSet::new(),
             pending_cleanup: Vec::new(),
+            retained_native_file_objects: Vec::new(),
             family_inventory: FamilyInventory::default(),
             returned_descriptors: Vec::new(),
             husk_accounting_failed: Rc::new(Cell::new(false)),
@@ -330,8 +345,25 @@ impl DrmCleanupRegistry {
         self.frozen
     }
 
+    pub(crate) fn alias_creation_allowed(&self) -> bool {
+        !self.frozen && !self.family_closing && !self.family_closed
+    }
+
     pub(crate) fn is_family_closed(&self) -> bool {
         self.family_closed
+    }
+
+    pub(crate) fn retain_native_file_object(&mut self, object: Box<dyn std::any::Any>) {
+        self.retained_native_file_objects.push(object);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_native_file_object_count_for_tests(&self) -> usize {
+        self.retained_native_file_objects.len()
+    }
+
+    pub(crate) fn submitters_detached(&self) -> bool {
+        self.family_inventory.submitters_detached
     }
 
     /// F8-M2: lets a router's own teardown step decide when it is safe to
@@ -341,6 +373,23 @@ impl DrmCleanupRegistry {
     /// racing a future `deliver_descriptor`.
     pub(crate) fn helper_reaped(&self) -> bool {
         self.family_inventory.helper_reaped
+    }
+
+    /// Production evidence supplied only after all executor and probe leases
+    /// for this incarnation have been released.
+    pub(crate) fn mark_helper_reaped(&mut self) {
+        self.family_inventory.helper_reaped = true;
+    }
+
+    /// Production evidence that no submitter/event reader can use this
+    /// incarnation again. The caller must detach the platform device before
+    /// recording that its control alias has closed.
+    pub(crate) fn detach_submitters(&mut self) {
+        self.family_inventory.submitters_detached = true;
+    }
+
+    pub(crate) fn mark_control_closed(&mut self) {
+        self.family_inventory.control_closed = true;
     }
 
     pub(crate) fn register_right(
@@ -356,8 +405,12 @@ impl DrmCleanupRegistry {
     /// open file description (adoption of a `GbmDevice`/right pair). The
     /// barrier does not wait for this to drop; it discharges and unregisters
     /// it during `try_mint_file_family_closed`.
-    pub(crate) fn register_payload_alias(&mut self, key: AllocationKey) {
+    pub(crate) fn register_payload_alias(&mut self, key: AllocationKey) -> bool {
+        if self.frozen || self.family_closing || self.family_closed {
+            return false;
+        }
         self.payload_alias_keys.insert(key);
+        true
     }
 
     pub(crate) fn unregister_payload_alias(&mut self, key: AllocationKey) {
@@ -428,7 +481,9 @@ impl DrmCleanupRegistry {
         if right.state == RightState::Closed {
             return Ok(());
         }
-        if self.frozen || right.state == RightState::Frozen {
+        if (self.frozen && !self.family_closing)
+            || (right.state == RightState::Frozen && !self.family_closing)
+        {
             right.state = RightState::Frozen;
             return Err((io::Error::other("incarnation is frozen"), right));
         }
@@ -441,7 +496,12 @@ impl DrmCleanupRegistry {
         }
 
         if right.state == RightState::Registered {
-            if let Err(err) = self.io.remove_fb(right.fb) {
+            if let Err(err) = self
+                .io
+                .as_mut()
+                .expect("cleanup I/O remains available until family close")
+                .remove_fb(right.fb)
+            {
                 return Err((err, right));
             }
             right.state = RightState::FramebufferRemoved;
@@ -449,7 +509,10 @@ impl DrmCleanupRegistry {
 
         if right.state == RightState::FramebufferRemoved {
             let res = if right.gem_owner == GemOwner::Right {
-                self.io.close_gem(right.gem)
+                self.io
+                    .as_mut()
+                    .expect("cleanup I/O remains available until family close")
+                    .close_gem(right.gem)
             } else {
                 Ok(())
             };
@@ -607,8 +670,16 @@ impl DrmCleanupRegistry {
         }
 
         let keys: Vec<AllocationKey> = self.payload_alias_keys.iter().copied().collect();
+        // Poison freezes ordinary submitters, but family closure is the one
+        // authorized teardown path that must discharge their aliases while
+        // the fd is still open. Alias registration remains refused during
+        // this narrow cleanup window.
+        self.family_closing = true;
         for key in keys {
-            discharge_payload_alias(self, key)?;
+            if let Err(error) = discharge_payload_alias(self, key) {
+                self.family_closing = false;
+                return Err(error);
+            }
             self.payload_alias_keys.remove(&key);
         }
 
@@ -622,8 +693,32 @@ impl DrmCleanupRegistry {
             entry.charge.release();
         }
 
-        // Registry performs the description's last close
-        self.device = None;
+        // `GBM BufferObject` stores the native `gbm_device` pointer but does
+        // not own the Rust `gbm::Device<Rc<drm::Device>>`. The service has
+        // discharged every BO above; now release those device owners while
+        // the DRM descriptor is still open.
+        self.retained_native_file_objects.clear();
+
+        // Drop DeviceCleanupIo's clone before checking that the registry's
+        // handle is the last strong reference. A proof is only valid once
+        // that final OwnedFd is actually closed.
+        let cleanup_io = self.io.take();
+        drop(cleanup_io);
+        if let Some(device) = self.device.take() {
+            match Rc::try_unwrap(device) {
+                Ok(device) => drop(device),
+                Err(device) => {
+                    let outstanding = Rc::strong_count(&device).saturating_sub(1);
+                    self.io = Some(Box::new(DeviceCleanupIo::new(Rc::clone(&device))));
+                    self.device = Some(device);
+                    self.family_closing = false;
+                    return Err(io::Error::other(format!(
+                        "DRM file family still has {outstanding} outstanding device reference(s)"
+                    )));
+                }
+            }
+        }
+        self.family_closing = false;
         self.family_closed = true;
 
         Ok(FileFamilyClosed {
