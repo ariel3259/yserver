@@ -1828,6 +1828,272 @@ mod tests {
     }
 
     #[test]
+    fn xi_query_button_state_reports_each_slave_and_master_holds() {
+        // Kills: zero-filling ButtonClass.state, copying the master's state
+        // into slave queries, using the registry's n-1 button bit as the XI2
+        // bit, or reporting held state in DeviceChanged (which Xorg's event
+        // converter intentionally zero-fills).
+        use crate::{
+            backend::Backend,
+            core_loop::{HostInputEvent, InputOrigin, run::dispatch_pending_host_events},
+            resources::ROOT_WINDOW,
+            server::ServerState,
+            xinput::{InputCapabilities, InputSourceId, XiFacetKind},
+        };
+
+        fn drive_button(
+            state: &mut ServerState,
+            backend: &mut HostX11Backend,
+            origin: InputOrigin,
+            button: u16,
+            pressed: bool,
+            time: u32,
+        ) {
+            Backend::on_host_input(
+                backend,
+                state,
+                HostInputEvent::PointerButton {
+                    origin,
+                    button,
+                    pressed,
+                    time,
+                },
+            );
+            assert!(dispatch_pending_host_events(state, backend));
+        }
+
+        fn snapshot(state: &ServerState) -> String {
+            format!(
+                "{:?}",
+                (
+                    &state.xi_devices,
+                    state.keys_down,
+                    state.buttons_down,
+                    state.xi_last_slave(2),
+                    state.xi_last_slave(3),
+                    &state.xi2_detached_masters,
+                    &state.floating_pointer_positions,
+                    &state.unpublished_pointer_buttons_down,
+                    state.clients.get(&1).map(|client| (
+                        &client.event_masks,
+                        &client.xi2_masks,
+                        &client.xi1_event_classes,
+                        &client.xi1_window_event_classes,
+                    )),
+                )
+            )
+        }
+
+        fn query_button_state(
+            state: &mut ServerState,
+            backend: &mut HostX11Backend,
+            peer: &mut crate::transport::CapturedPeer,
+            sequence: u16,
+            device_id: u16,
+        ) -> u32 {
+            let before = snapshot(state);
+            let mut body = device_id.to_le_bytes().to_vec();
+            body.extend_from_slice(&[0; 2]);
+            dispatch_test_request(state, backend, sequence, 137, 48, &body);
+            let wire = drain_capture(peer);
+            assert_eq!(wire[0], 1, "XIQueryDevice reply");
+            assert_eq!(u16::from_le_bytes([wire[8], wire[9]]), 1);
+            let mut offset = 32;
+            assert_eq!(
+                u16::from_le_bytes([wire[offset], wire[offset + 1]]),
+                device_id
+            );
+            let num_classes = u16::from_le_bytes([wire[offset + 6], wire[offset + 7]]);
+            let name_len = usize::from(u16::from_le_bytes([wire[offset + 8], wire[offset + 9]]));
+            offset += 12 + name_len;
+            offset = offset.div_ceil(4) * 4;
+
+            let mut button_state = None;
+            for _ in 0..num_classes {
+                let class_type = u16::from_le_bytes([wire[offset], wire[offset + 1]]);
+                let class_len =
+                    usize::from(u16::from_le_bytes([wire[offset + 2], wire[offset + 3]]));
+                if class_type == 1 {
+                    let num_buttons = u16::from_le_bytes([wire[offset + 6], wire[offset + 7]]);
+                    assert!(num_buttons > 0);
+                    button_state = Some(u32::from_le_bytes(
+                        wire[offset + 8..offset + 12].try_into().unwrap(),
+                    ));
+                }
+                offset += class_len * 4;
+            }
+            assert_eq!(snapshot(state), before, "XIQueryDevice has no side effects");
+            button_state.expect("queried pointer has a ButtonClass")
+        }
+
+        fn device_changed_button_state(bytes: &[u8]) -> u32 {
+            assert_eq!(bytes[0], 35, "XI_DeviceChanged GenericEvent");
+            assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), 1);
+            let class = 32;
+            assert_eq!(u16::from_le_bytes([bytes[class], bytes[class + 1]]), 1);
+            u32::from_le_bytes(bytes[class + 8..class + 12].try_into().unwrap())
+        }
+
+        let mut state = ServerState::new();
+        let mut peer = install_xtest_client(&mut state, 1);
+        let mut backend = dummy_backend();
+        backend.xid_map.insert(backend.window_id, ROOT_WINDOW);
+
+        let source_id = InputSourceId(0x5849);
+        let info = crate::core_loop::DeviceInfo {
+            source_id,
+            enabled: true,
+            resume_key: None,
+            capabilities: InputCapabilities {
+                keyboard: false,
+                pointer: true,
+                touch: false,
+            },
+            name: "button-state-mouse".to_owned(),
+            device_node: "/dev/input/event-button-state".to_owned(),
+            sysname: "event-button-state".to_owned(),
+            vendor_id: 0,
+            product_id: 0,
+            is_touchpad: false,
+            config: Default::default(),
+        };
+        let physical_id = state
+            .xi_register_source(&info)
+            .into_iter()
+            .find(|id| {
+                state
+                    .xi_devices
+                    .device(*id)
+                    .is_some_and(|device| device.facet == Some(XiFacetKind::PointerTouch))
+            })
+            .expect("physical pointer facet registered");
+        assert_eq!(physical_id, 6);
+
+        // Establish a physical master class source before the leak snapshot.
+        for (pressed, time) in [(true, 1), (false, 2)] {
+            drive_button(
+                &mut state,
+                &mut backend,
+                InputOrigin::Physical(source_id),
+                0x110,
+                pressed,
+                time,
+            );
+        }
+        assert_eq!(state.xi_last_slave(2), Some(physical_id));
+        let before = snapshot(&state);
+
+        // Select DeviceChanged on master 2 through the request dispatcher.
+        let mut select = Vec::new();
+        select.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        select.extend_from_slice(&1u16.to_le_bytes());
+        select.extend_from_slice(&[0; 2]);
+        select.extend_from_slice(&2u16.to_le_bytes());
+        select.extend_from_slice(&1u16.to_le_bytes());
+        select.extend_from_slice(&2u32.to_le_bytes()); // XI_DeviceChanged
+        dispatch_test_request(&mut state, &mut backend, 1, 137, 46, &select);
+        let bootstrap = drain_capture(&mut peer);
+        assert!(
+            !bootstrap.is_empty(),
+            "master selection bootstraps DeviceChanged"
+        );
+        assert_eq!(device_changed_button_state(&bootstrap), 0);
+
+        // Hold physical Button1 and XTEST Button3 through on_host_input and
+        // the normal queued-host-event dispatch path.
+        drive_button(
+            &mut state,
+            &mut backend,
+            InputOrigin::Physical(source_id),
+            0x110,
+            true,
+            3,
+        );
+        drive_button(
+            &mut state,
+            &mut backend,
+            InputOrigin::XTest(crate::xinput::DEVICEID_XTEST_POINTER),
+            0x111,
+            true,
+            4,
+        );
+        let changed = drain_capture(&mut peer);
+        assert!(!changed.is_empty(), "slave switch emitted DeviceChanged");
+        assert_eq!(
+            device_changed_button_state(&changed),
+            0,
+            "Xorg DeviceChanged button state stays zero-filled"
+        );
+
+        let physical_button_state =
+            query_button_state(&mut state, &mut backend, &mut peer, 2, physical_id);
+        assert_eq!(
+            physical_button_state & 0b001,
+            0,
+            "protocol bit 0 stays clear for Button1; kills n-1 placement"
+        );
+        assert_eq!(
+            physical_button_state, 0b010,
+            "physical slave reports held Button1 at protocol bit 1"
+        );
+        assert_eq!(
+            query_button_state(
+                &mut state,
+                &mut backend,
+                &mut peer,
+                3,
+                crate::xinput::DEVICEID_XTEST_POINTER,
+            ),
+            0b1000,
+            "XTEST slave reports held Button3 at protocol bit 3"
+        );
+        assert_eq!(
+            query_button_state(&mut state, &mut backend, &mut peer, 4, 2),
+            0b1010,
+            "master reports the aggregate of attached slaves at bits 1 and 3"
+        );
+
+        for (origin, button, time) in [
+            (InputOrigin::XTest(4), 0x111, 5),
+            (InputOrigin::Physical(source_id), 0x110, 6),
+        ] {
+            drive_button(&mut state, &mut backend, origin, button, false, time);
+        }
+        assert_eq!(state.buttons_down, 0);
+        assert_eq!(
+            state.xi_devices.device(physical_id).unwrap().buttons_down,
+            0
+        );
+        assert_eq!(state.xi_devices.device(4).unwrap().buttons_down, 0);
+        // Restore the master class source to the baseline physical facet.
+        for (pressed, time) in [(true, 7), (false, 8)] {
+            drive_button(
+                &mut state,
+                &mut backend,
+                InputOrigin::Physical(source_id),
+                0x110,
+                pressed,
+                time,
+            );
+        }
+        let _device_changed = drain_capture(&mut peer);
+
+        // Remove the temporary selection and verify every observable state
+        // map, property set, held mask, class source, and registry entry is
+        // back at the exact pre-scenario snapshot.
+        let mut unselect = Vec::new();
+        unselect.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        unselect.extend_from_slice(&1u16.to_le_bytes());
+        unselect.extend_from_slice(&[0; 2]);
+        unselect.extend_from_slice(&2u16.to_le_bytes());
+        unselect.extend_from_slice(&0u16.to_le_bytes());
+        dispatch_test_request(&mut state, &mut backend, 5, 137, 46, &unselect);
+        assert!(drain_capture(&mut peer).is_empty());
+        assert_eq!(state.xi_last_slave(2), Some(physical_id));
+        assert_eq!(snapshot(&state), before);
+    }
+
+    #[test]
     fn xtest_fake_input_keycode_outside_target_keymap_is_bad_value() {
         // Mutation killed: remove the FakeInput target keymap range check so
         // keycode 7 reaches the host input path.

@@ -148,9 +148,9 @@ fn encode_device_classes(
             data,
             sourceid,
             shape,
-        } => {
-            crate::xinput::query::build_pointer_classes_for_shape(byte_order, sourceid, data, shape)
-        }
+        } => crate::xinput::query::build_pointer_classes_for_shape(
+            byte_order, sourceid, data, shape, false,
+        ),
         DeviceClassSnapshot::Keyboard { sourceid } => {
             crate::xinput::query::build_key_classes(byte_order, sourceid)
         }

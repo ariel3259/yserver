@@ -488,6 +488,14 @@ pub(crate) fn pointer_class_data_for_device(
             state.atoms.intern("Button Horiz Wheel Left", false),
             state.atoms.intern("Button Horiz Wheel Right", false),
         ],
+        button_state: if device_id == crate::xinput::DEVICEID_MASTER_POINTER {
+            state.buttons_down
+        } else {
+            state
+                .xi_devices
+                .device(device_id)
+                .map_or(0, |device| device.buttons_down)
+        },
         axis_labels: [
             state.atoms.intern("Rel X", false),
             state.atoms.intern("Rel Y", false),

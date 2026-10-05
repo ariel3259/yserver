@@ -18609,6 +18609,7 @@ fn handle_xi2_request(
                     state.atoms.intern("Button Horiz Wheel Left", false),
                     state.atoms.intern("Button Horiz Wheel Right", false),
                 ],
+                button_state: state.buttons_down,
                 axis_labels: [
                     state.atoms.intern("Rel X", false),
                     state.atoms.intern("Rel Y", false),

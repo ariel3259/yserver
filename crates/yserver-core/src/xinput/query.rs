@@ -19,6 +19,9 @@ pub enum XiQueryError {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct XiQueryClassData {
     pub button_labels: [AtomId; 7],
+    /// Logical held-button bits, where button `n` is bit `n - 1`. Xorg's
+    /// ListButtonInfo reads the queried class at `Xi/xiquerydevice.c:282-285`.
+    pub button_state: u16,
     pub axis_labels: [AtomId; 4],
     pub pointer: (i32, i32),
     pub scroll: [i32; 2],
@@ -52,11 +55,13 @@ pub(crate) fn encode_reply(
                     class_data
                 } else {
                     XiQueryClassData {
+                        button_state: device.buttons_down,
                         scroll: device.scroll_axis_values,
                         ..class_data
                     }
                 },
                 device.class_shape,
+                true,
             ),
             DeviceClass::Keyboard => build_key_classes(byte_order, device.class_sourceid),
         };
@@ -164,21 +169,26 @@ pub(crate) fn build_pointer_classes(
     } else {
         XiClassShape::PhysicalPointer
     };
-    build_pointer_classes_for_shape(byte_order, source_id, data, shape)
+    build_pointer_classes_for_shape(byte_order, source_id, data, shape, false)
 }
 
+/// `report_button_state` follows Xorg's caller split: XIQueryDevice's
+/// `ListDeviceClasses` passes `rc == Success` to `ListButtonInfo`
+/// (`Xi/xiquerydevice.c:577-584`), while DeviceChanged zeroes its button mask
+/// (`dix/eventconvert.c:491-511`).
 pub(crate) fn build_pointer_classes_for_shape(
     byte_order: ClientByteOrder,
     source_id: u16,
     data: XiQueryClassData,
     shape: XiClassShape,
+    report_button_state: bool,
 ) -> (Vec<u8>, u16) {
     if shape == XiClassShape::CorePointer {
         // Xorg initializes master pointer 2 and XTEST pointer 4 through
         // `CorePointerProc` (`dix/devices.c:655-700`, `:724-730`). Keep that
         // shape distinct from physical pointers, whose existing generic
         // classes below support GDK's scroll setup.
-        return build_core_pointer_classes(byte_order, source_id, data);
+        return build_core_pointer_classes(byte_order, source_id, data, report_button_state);
     }
 
     // GDK builds its seat/device table from the XI2 hierarchy and probes the
@@ -187,7 +197,16 @@ pub(crate) fn build_pointer_classes_for_shape(
     // The two scroll valuators must remain declared: GDK's scroll-valuator
     // setup asserts that each ScrollClass axis is below the valuator count.
     let mut classes = Vec::new();
-    write_button_class(byte_order, &mut classes, source_id, &data.button_labels);
+    // Xorg's ListButtonInfo applies SetBit by button index
+    // (`Xi/xiquerydevice.c:282-285`).
+    write_button_class(
+        byte_order,
+        &mut classes,
+        source_id,
+        &data.button_labels,
+        data.button_state,
+        report_button_state,
+    );
 
     write_valuator_class(
         byte_order,
@@ -242,6 +261,7 @@ fn build_core_pointer_classes(
     byte_order: ClientByteOrder,
     source_id: u16,
     data: XiQueryClassData,
+    report_button_state: bool,
 ) -> (Vec<u8>, u16) {
     // `CorePointerProc` declares 10 buttons, the first seven core labels, and
     // only Rel X / Rel Y (`dix/devices.c:662-694`). Its
@@ -260,7 +280,14 @@ fn build_core_pointer_classes(
         AtomId(0),
         AtomId(0),
     ];
-    write_button_class(byte_order, &mut classes, source_id, &button_labels);
+    write_button_class(
+        byte_order,
+        &mut classes,
+        source_id,
+        &button_labels,
+        data.button_state,
+        report_button_state,
+    );
     write_valuator_class(
         byte_order,
         &mut classes,
@@ -291,6 +318,8 @@ fn write_button_class(
     out: &mut Vec<u8>,
     source_id: u16,
     labels: &[AtomId],
+    button_state: u16,
+    report_state: bool,
 ) {
     let num_buttons = u16::try_from(labels.len()).unwrap_or(u16::MAX);
     let state_words = num_buttons.div_ceil(32) as usize;
@@ -299,7 +328,21 @@ fn write_button_class(
     x11::write_u16(byte_order, out, (byte_len / 4) as u16);
     x11::write_u16(byte_order, out, source_id);
     x11::write_u16(byte_order, out, num_buttons);
-    out.extend(std::iter::repeat_n(0u8, 4 * state_words));
+    let mut state = vec![0u8; 4 * state_words];
+    if report_state {
+        // Xorg stores button `n` in ButtonClass.down bit `n`
+        // (`dix/getevents.c:93-99`, from `Xi/exevents.c:895,951`), then
+        // ListButtonInfo copies down bit `i` to protocol bit `i` for
+        // `i < numButtons` (`Xi/xiquerydevice.c:282-285`). The registry
+        // stores button `n` at bit `n - 1`, so shift it to protocol bit `n`;
+        // the strict bound also leaves button `numButtons` unreported.
+        for button_number in 1..labels.len().min(u16::BITS as usize + 1) {
+            if button_state & (1u16 << (button_number - 1)) != 0 {
+                state[button_number / 8] |= 1 << (button_number % 8);
+            }
+        }
+    }
+    out.extend_from_slice(&state);
     for atom in labels {
         x11::write_u32(byte_order, out, atom.0);
     }
