@@ -72,8 +72,10 @@ the C.0 scope limit that created no software clock (C.0 design :1458, :3240,
 
 - This machine with `nvidia-drm vblank=0`. The parameter is read-only at
   runtime, so it needs a module reload or reboot, with the user present.
-- An NVIDIA branch-580 GPU (Maxwell/Pascal/Volta), for example the
-  maintainer's GTX 1050 Ti, as a validation target.
+- No branch-580 GPU (Maxwell/Pascal/Volta) is available (user, 2026-10-05).
+  The `vblank=0` runs on this machine are the 3e acceptance target; they
+  exercise the same no-vblank driver behaviour (sequence 0, send-time
+  stamps).
 
 ## Process
 
