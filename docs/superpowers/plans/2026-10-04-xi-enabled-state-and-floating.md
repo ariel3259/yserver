@@ -187,25 +187,18 @@ client-disabled facet whose sibling facet is enabled is applied.
    the same write gets `BadMatch` and nothing reaches the backend. *Kills:*
    the per-facet check; the old suspended-only check.
 
-### Task 6 — Client-disabled survives VT and reset (A1)
+### Task 6 — Client-disabled survives VT, not reset (A1)
 
 **Do:** a client-disabled facet stays disabled across VT suspend/resume (no
-Disabled or Enabled events for it on either side) and across server reset.
-For reset, the inventory carries the client-disabled facet kinds and the
-replay registers it disabled and floating with `Device Enabled = 0`. The
-inventory lives in the runner, outside `ServerState`. Pick one route and test
-it through the real reset path: either the runner copies the registry's
-client-disabled facts into the inventory at the start of reset, before the
-old registry is dropped, or the request outcome carries the change to the
-runner, the way libinput completions reach `finish_xi_config_result`.
+Disabled or Enabled events for it on either side). Across a server reset it
+is NOT kept: Xorg re-creates and enables every device for the new generation
+(`dix/main.c:247-249, 299-306`, `devices.c:779-784`), and the inventory
+replay already registers facets enabled.
 
-**Tests (B via `dispatch_host_input` / the reset path):**
+**Tests (B via `dispatch_host_input`):**
 1. Client-disable a pointer, run a VT round trip: no events for that facet,
    and it is still floating. The other facets get Disabled/Enabled. *Kills:*
    re-enabling every facet on resume.
-2. Client-disable, then reset: after the replay the facet is disabled, its
-   property is 0, and it reports use 5. *Kills:* not storing the fact in the
-   inventory.
 
 ### Task 7 — Hardware check (user watching)
 

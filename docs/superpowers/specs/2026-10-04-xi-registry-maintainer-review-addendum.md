@@ -32,8 +32,11 @@ neither *client-disabled* (a client wrote `Device Enabled = 0`) nor
 independent facts. Xorg keeps them apart the same way: VT leave records an
 already disabled device in `XI86_DEVICE_DISABLED` and VT enter does not
 re-enable it (`hw/xfree86/common/xf86Events.c:302-320`). A client-disabled
-facet stays disabled across a VT round trip and across a server reset that
-replays the inventory.
+facet stays disabled across a VT round trip. It does not survive a server
+reset: Xorg closes and re-creates every device for the new generation
+(`dix/main.c:247-249, 299-306`, `devices.c:1052-1123`), and devices come up
+enabled (`devices.c:779-784`). The replay therefore registers every facet
+enabled.
 
 **A2. A disabled slave floats.** While disabled, a slave reports
 `use = XIFloatingSlave (5)` and `attachment = 0` in `XIQueryDevice` and in
