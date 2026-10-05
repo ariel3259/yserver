@@ -14,6 +14,8 @@ pub(crate) mod cursor_plane;
 pub(crate) mod evidence;
 #[doc(hidden)]
 pub mod executor;
+pub(crate) mod font_index;
+
 pub(crate) mod hotplug;
 #[doc(hidden)]
 pub mod owner;

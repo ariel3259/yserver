@@ -829,6 +829,21 @@ pub trait Backend {
     /// (KMS) and F2 (host-X11); inert until then.
     fn on_host_input(&mut self, state: &mut ServerState, ev: HostInputEvent);
 
+    /// Reconcile backend-owned per-device state after XI slave attachment
+    /// changes. XKB implementations use this to create a floating slave's
+    /// independent state or retire it when the slave is attached again.
+    /// Backends without per-device keyboard state need no work.
+    fn sync_floating_keyboard_states(&mut self, _state: &ServerState) {}
+
+    /// Release holds owned by one still-enabled physical XI facet before a
+    /// client-driven Device Enabled disable is committed. Backends without
+    /// host-device state have no cleanup to perform.
+    fn disable_xi_facet(&mut self, _state: &mut ServerState, _device_id: u16) {}
+
+    /// Reconcile backend-owned state after a client-driven XI facet enable.
+    /// The core has already restored the facet's role-derived home master.
+    fn enable_xi_facet(&mut self, _state: &mut ServerState, _device_id: u16) {}
+
     /// `drm_fd` is readable. The backend should drain completion events from
     /// that exact DRM device and submit the next composite/flip. The fd is one
     /// returned by [`Backend::poll_fds`] with [`BackendFdKind::Drm`].
@@ -1089,6 +1104,23 @@ pub trait Backend {
     /// Direct-mode VT release signal. Default no-op.
     fn on_vt_release(&mut self, _state: &mut ServerState) {}
 
+    /// Begin a direct-mode VT release before the core drains input-thread
+    /// configuration results. Return true only when a FIFO pause barrier was
+    /// queued; the core waits for its acknowledgement only in that case.
+    fn begin_vt_release(&mut self) -> bool {
+        false
+    }
+
+    /// Finish the release after the core has consumed the input pause barrier.
+    /// Backends that only implement `on_vt_release` retain their old behavior.
+    fn finish_vt_release(
+        &mut self,
+        state: &mut ServerState,
+        _input_inventory: &crate::core_loop::input_inventory::InputInventory,
+    ) {
+        self.on_vt_release(state);
+    }
+
     /// Direct-mode VT acquire signal. Default no-op.
     fn on_vt_acquire(&mut self, _state: &mut ServerState) {}
 
@@ -1132,9 +1164,9 @@ pub trait Backend {
     /// from the main loop. On real hardware the desktop's clients can
     /// enumerate devices (`XIQueryDevice` / `XListInputDevices`) seconds
     /// before that burst lands, so they cache a plain pointer and never
-    /// recognise the touchpad (observed on M2/Asahi MATE: all four
-    /// libinput devices first processed ~2s AFTER the clients queried
-    /// device 4).
+    /// recognise the physical touchpad facet (observed on M2/Asahi MATE:
+    /// all four libinput devices first processed ~2s after clients queried
+    /// the registry's initial devices).
     ///
     /// Implementations MUST be bounded and non-blocking: if libinput has
     /// nothing yet, return immediately rather than waiting. Backends without
@@ -1146,10 +1178,9 @@ pub trait Backend {
         0
     }
 
-    /// Apply a decoded touchpad config change to the live input device
-    /// identified by `device_node`. `Ok` = applied (or nothing to apply
-    /// on this backend). `Err(Unsupported)` → BadMatch, `Err(Invalid)`
-    /// → BadValue.
+    /// Start applying a decoded libinput config change to the live input
+    /// source. `Applied` confirms synchronous application; `Pending(token)`
+    /// means the backend will report the actual setter result later.
     ///
     /// Default: no-op success — only backends that own a live libinput
     /// context write through to a device.
@@ -1159,12 +1190,16 @@ pub trait Backend {
     /// Returns `DeviceConfigError::Unsupported` when the setting isn't
     /// available on the addressed device, or `Invalid` when the value
     /// is out of range / not a legal one-hot.
-    fn apply_device_config(
+    fn start_device_config(
         &mut self,
-        _device_node: &str,
+        _source: crate::xinput::InputSourceId,
         _change: crate::xinput::libinput_props::DeviceConfigChange,
-    ) -> Result<(), crate::xinput::libinput_props::DeviceConfigError> {
-        Ok(())
+        _cancel: crate::xinput::libinput_props::DeviceConfigCancelToken,
+    ) -> Result<
+        crate::xinput::libinput_props::DeviceConfigStart,
+        crate::xinput::libinput_props::DeviceConfigError,
+    > {
+        Ok(crate::xinput::libinput_props::DeviceConfigStart::Applied)
     }
 
     /// Hand the backend a core-channel sender so backend-originated shutdowns
@@ -2976,6 +3011,13 @@ pub trait Backend {
     /// contribution here. Default no-op.
     fn client_disconnected(&mut self, _client_id: yserver_protocol::x11::ClientId) {}
 
+    /// Retire state held by the old input session immediately before a
+    /// server-generation reset destroys its clients and replaces its XI
+    /// registry. Backends whose input state lives entirely in `ServerState`
+    /// need no extra work; stateful backends can route releases while the old
+    /// facets and resources are still present. Default no-op.
+    fn reset_input_session(&mut self, _old_state: &mut ServerState) {}
+
     /// GLX-TFP Task 3.5: promote the backing for `host_xid` to
     /// dma-buf-exportable storage (idempotent) WITHOUT touching the
     /// lifetime refcount (`glx_refs`) or allocating/exporting a dmabuf fd.
@@ -3153,12 +3195,11 @@ pub trait Backend {
     fn windows_restructured(&mut self, _state: &mut ServerState) {}
 
     /// After the server moved the pointer on its own (XTEST fake motion),
-    /// hand the new position to whatever tracks physical pointer input, so
-    /// the next real motion continues from there instead of jumping back.
-    /// The KMS backend's direct-mode input thread accumulates relative
-    /// deltas from its own copy of the position ([`Self::warp_pointer_root`]
-    /// resyncs it the same way). Default no-op: host-forwarding backends get
-    /// their position from the host.
+    /// hand the new position to backends that keep a producer-side pointer
+    /// position, so the next real motion continues from there. KMS integrates
+    /// physical relative deltas from its current cursor and needs no resync.
+    /// Default no-op: host-forwarding backends get their position from the
+    /// host.
     fn resync_input_position(&mut self) {}
 
     fn query_pointer(&mut self, origin: Option<OriginContext>) -> io::Result<PointerPosition>;

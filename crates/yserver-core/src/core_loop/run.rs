@@ -21,17 +21,18 @@ use mio::{Events, Interest, Poll, unix::SourceFd};
 use super::{
     auth::AuthState,
     client_io::{self, WriteOutcome},
-    generation,
+    generation::{self, Generation},
     input_inventory::InputInventory,
-    message::{HostInputEvent, Message, SetupAllocateResponse},
+    message::{HostInputEvent, Message, SetupAllocateResponse, XiConfigRequest},
     poll_tokens::{
         ClientIdAllocator, NOTIFY_TOKEN, backend_token, client_token, listener_token,
         token_to_backend_index, token_to_client, token_to_listener_index,
     },
     process_request::{
-        CrtcConfigPublication, CrtcConfigReply, PendingForcedReprobe, RequestOutcome,
-        complete_crtc_config_reply, complete_forced_reprobe_reply,
-        fire_present_configure_notify_for_window, process_request, publish_crtc_config,
+        CrtcConfigPublication, CrtcConfigReply, PendingForcedReprobe, PropertyDispatchError,
+        RequestOutcome, ValidatedXiChange, complete_crtc_config_reply,
+        complete_forced_reprobe_reply, fire_present_configure_notify_for_window, process_request,
+        publish_crtc_config,
     },
     reset::{GenerationLocals, ResetAction, ResetPolicy, ResetTrigger, reset_generation},
     sender::{CoreReceiver, CoreSender},
@@ -66,6 +67,12 @@ use crate::{
 /// timestamps cross the reader boundary, and the core maintains small
 /// per-client maps in addition to the existing per-opcode counters.
 const TELEMETRY_EMIT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Maximum time the core waits for the input thread's VT pause barrier. Xorg
+/// handles XI property requests synchronously before its VT disable sequence
+/// (`Xi/xiproperty.c:1156-1158`, `hw/xfree86/common/xf86Events.c:310-313`);
+/// this deadline prevents a failed producer from freezing that boundary.
+const VT_INPUT_PAUSE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Number of opcodes to show in the per-second telemetry emit.
 const TELEMETRY_TOP_N: usize = 3;
@@ -632,12 +639,30 @@ pub(crate) struct PendingBackendRequests {
     crtc_by_client: HashMap<yserver_protocol::x11::ClientId, CrtcConfigToken>,
     forced_reprobe_by_token: HashMap<CrtcConfigToken, ParkedForcedReprobe>,
     forced_reprobe_by_client: HashMap<yserver_protocol::x11::ClientId, CrtcConfigToken>,
+    xi_config_clients: HashSet<yserver_protocol::x11::ClientId>,
 }
 
 impl PendingBackendRequests {
     fn client_is_blocked(&self, client: yserver_protocol::x11::ClientId) -> bool {
         self.crtc_by_client.contains_key(&client)
             || self.forced_reprobe_by_client.contains_key(&client)
+            || self.xi_config_clients.contains(&client)
+    }
+
+    fn block_xi_config(&mut self, client: yserver_protocol::x11::ClientId) -> bool {
+        self.xi_config_clients.insert(client)
+    }
+
+    fn unblock_xi_config(&mut self, client: yserver_protocol::x11::ClientId) {
+        self.xi_config_clients.remove(&client);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn xi_config_client_is_blocked_for_test(
+        &self,
+        client: yserver_protocol::x11::ClientId,
+    ) -> bool {
+        self.xi_config_clients.contains(&client)
     }
 
     fn park_crtc(&mut self, parked: ParkedCrtcConfig) -> Result<(), &'static str> {
@@ -753,6 +778,7 @@ impl PendingBackendRequests {
             && self.crtc_by_client.is_empty()
             && self.forced_reprobe_by_token.is_empty()
             && self.forced_reprobe_by_client.is_empty()
+            && self.xi_config_clients.is_empty()
     }
 
     pub(crate) fn take_all_crtc_tokens(&mut self) -> Vec<CrtcConfigToken> {
@@ -1211,6 +1237,60 @@ fn observe_xdmcp_session_departure(
     }
 }
 
+/// An accepted recognized property write waiting for its FIFO turn. The
+/// generation is stamped by the runner, after request parsing has captured
+/// only request-local wire data.
+struct QueuedXiConfig {
+    request: XiConfigRequest,
+    generation: Generation,
+    request_wire_bytes: usize,
+}
+
+struct XiConfigCompletion {
+    validated: ValidatedXiChange,
+    generation: Generation,
+    request_wire_bytes: usize,
+}
+
+/// The one submitted input operation remains here through reset or client
+/// disconnect. `protocol=None` drops generation/atom/reply metadata while the
+/// source, setting and token continue to occupy the global FIFO lane.
+struct XiConfigInFlight {
+    token: crate::xinput::libinput_props::DeviceConfigToken,
+    source: crate::xinput::InputSourceId,
+    change: crate::xinput::libinput_props::DeviceConfigChange,
+    cancel: crate::xinput::libinput_props::DeviceConfigCancelToken,
+    protocol: Option<XiConfigCompletion>,
+}
+
+/// The client has already received BadMatch, but the input thread may have
+/// crossed its pre-apply cancellation check before the timeout. Keep enough
+/// information to reconcile a later confirmation without another reply.
+struct TimedOutXiConfig {
+    change: crate::xinput::libinput_props::DeviceConfigChange,
+}
+
+#[derive(Default)]
+pub(crate) struct XiConfigLane {
+    queued: VecDeque<QueuedXiConfig>,
+    in_flight: Option<XiConfigInFlight>,
+    timed_out: HashMap<
+        (
+            crate::xinput::libinput_props::DeviceConfigToken,
+            crate::xinput::InputSourceId,
+        ),
+        TimedOutXiConfig,
+    >,
+    reject_unsubmitted_for_vt_release: bool,
+}
+
+impl XiConfigLane {
+    #[cfg(test)]
+    pub(super) fn is_empty(&self) -> bool {
+        self.queued.is_empty() && self.in_flight.is_none() && self.timed_out.is_empty()
+    }
+}
+
 /// Per-client FIFO queues behind a round-robin ready ring.
 ///
 /// Request order is preserved within each client, as required by X11, while a
@@ -1498,7 +1578,35 @@ fn grant_request_credit(
 /// `ClientSetupComplete`, the reader thread's `ClientDisconnected`, a
 /// failed outbound drain and the writable-interest reconcile — which is
 /// what lets the trigger be an *event* rather than a state check.
-fn disconnect_with_pending_cleanup(
+pub(super) fn disconnect_with_xi_pending_cleanup(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    pending: &mut PendingBackendRequests,
+    gate: &mut RandrMutationGate,
+    xi_config_lane: &mut XiConfigLane,
+    reset_trigger: &mut ResetTrigger,
+    client: yserver_protocol::x11::ClientId,
+) {
+    abandon_client_randr_requests(backend, pending, gate, client);
+    xi_config_lane
+        .queued
+        .retain(|queued| queued.request.client != client);
+    if xi_config_lane
+        .in_flight
+        .as_ref()
+        .and_then(|in_flight| in_flight.protocol.as_ref())
+        .is_some_and(|protocol| protocol.validated.request.client == client)
+        && let Some(in_flight) = xi_config_lane.in_flight.as_mut()
+    {
+        in_flight.protocol = None;
+    }
+    pending.unblock_xi_config(client);
+
+    crate::core_loop::process_disconnect::process_disconnect(state, backend, client);
+    reset_trigger.note_client_departed(state.clients.len());
+}
+
+pub(super) fn disconnect_with_pending_cleanup(
     state: &mut ServerState,
     backend: &mut dyn Backend,
     pending: &mut PendingBackendRequests,
@@ -1529,6 +1637,649 @@ fn abandon_client_randr_requests(
     pending.detach_forced_reprobe_requester(client);
 }
 
+pub(super) fn cancel_unsubmitted_xi_configs(
+    lane: &mut XiConfigLane,
+    pending: &mut PendingBackendRequests,
+) {
+    lane.queued.clear();
+    pending.xi_config_clients.clear();
+    if let Some(in_flight) = lane.in_flight.as_mut() {
+        in_flight.protocol = None;
+    }
+}
+
+fn xi_error_for_config(
+    request: &XiConfigRequest,
+    error: crate::xinput::libinput_props::DeviceConfigError,
+) -> PropertyDispatchError {
+    use crate::xinput::libinput_props::DeviceConfigError as ConfigError;
+    match error {
+        ConfigError::Unsupported => PropertyDispatchError::BadMatch,
+        ConfigError::Invalid => PropertyDispatchError::BadValue {
+            error_value: u32::from(request.format),
+        },
+        ConfigError::Cancelled => PropertyDispatchError::BadMatch,
+        // xf86-input-libinput returns BadMatch when its shared handle is
+        // absent (`xf86libinput.c:4392-4409, 4579-4607`).
+        ConfigError::SourceGone => PropertyDispatchError::BadMatch,
+    }
+}
+
+fn emit_xi_config_error(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    pending: &mut PendingBackendRequests,
+    gate: &mut RandrMutationGate,
+    lane: &mut XiConfigLane,
+    reset_trigger: &mut ResetTrigger,
+    request: &XiConfigRequest,
+    error: PropertyDispatchError,
+    generation: Generation,
+    request_wire_bytes: usize,
+    current_generation: Generation,
+) {
+    if generation == current_generation && state.clients.contains_key(&request.client.0) {
+        match crate::core_loop::process_request::emit_property_dispatch_error(
+            state,
+            request.client,
+            request.sequence,
+            error,
+            request.minor_opcode,
+        ) {
+            Ok(RequestOutcome::Disconnect(client)) => disconnect_with_xi_pending_cleanup(
+                state,
+                backend,
+                pending,
+                gate,
+                lane,
+                reset_trigger,
+                client,
+            ),
+            Ok(RequestOutcome::Handled) => {}
+            Ok(
+                RequestOutcome::PendingCrtcConfig(_)
+                | RequestOutcome::PendingForcedReprobe(_)
+                | RequestOutcome::PendingXiConfig(_),
+            ) => {
+                unreachable!("error emission cannot start backend work")
+            }
+            Err(err) => warn!("XI config error reply failed: {err}"),
+        }
+        grant_request_credit(state, request.client, request_wire_bytes);
+    }
+    pending.unblock_xi_config(request.client);
+}
+
+fn apply_confirmed_xi_config(
+    state: &mut ServerState,
+    input_inventory: &mut InputInventory,
+    source: crate::xinput::InputSourceId,
+    change: crate::xinput::libinput_props::DeviceConfigChange,
+    validated: Option<&ValidatedXiChange>,
+) -> Result<(u16, yserver_protocol::x11::AtomId, crate::xinput::PropWhat), PropertyDispatchError> {
+    if let Some(info) = state.xi_devices.source_mut(source) {
+        info.config.apply_confirmed(change);
+    }
+    input_inventory.update_config(source, change);
+    crate::core_loop::process_request::commit_confirmed_xi_change(state, source, change, validated)
+}
+
+fn drive_xi_config_lane(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    input_inventory: &mut InputInventory,
+    pending: &mut PendingBackendRequests,
+    gate: &mut RandrMutationGate,
+    lane: &mut XiConfigLane,
+    reset_trigger: &mut ResetTrigger,
+    current_generation: Generation,
+) {
+    while lane.in_flight.is_none() {
+        let Some(queued) = lane.queued.pop_front() else {
+            break;
+        };
+        let client = queued.request.client;
+        if queued.generation != current_generation || !state.clients.contains_key(&client.0) {
+            pending.unblock_xi_config(client);
+            continue;
+        }
+        let validated =
+            match crate::core_loop::process_request::validate_xi_change(state, &queued.request) {
+                Ok(validated) => validated,
+                Err(error) => {
+                    emit_xi_config_error(
+                        state,
+                        backend,
+                        pending,
+                        gate,
+                        lane,
+                        reset_trigger,
+                        &queued.request,
+                        error,
+                        queued.generation,
+                        queued.request_wire_bytes,
+                        current_generation,
+                    );
+                    continue;
+                }
+            };
+        let cancel = crate::xinput::libinput_props::DeviceConfigCancelToken::new();
+        match backend.start_device_config(validated.source_id, validated.change, cancel.clone()) {
+            Ok(crate::xinput::libinput_props::DeviceConfigStart::Applied) => {
+                match apply_confirmed_xi_config(
+                    state,
+                    input_inventory,
+                    validated.source_id,
+                    validated.change,
+                    Some(&validated),
+                ) {
+                    Ok((facet_id, property, what)) => {
+                        let _ = crate::core_loop::process_request::emit_property_change(
+                            state, facet_id, property, what,
+                        );
+                        backend.mark_dirty();
+                        pending.unblock_xi_config(client);
+                        grant_request_credit(state, client, queued.request_wire_bytes);
+                    }
+                    Err(error) => emit_xi_config_error(
+                        state,
+                        backend,
+                        pending,
+                        gate,
+                        lane,
+                        reset_trigger,
+                        &queued.request,
+                        error,
+                        queued.generation,
+                        queued.request_wire_bytes,
+                        current_generation,
+                    ),
+                }
+            }
+            Ok(crate::xinput::libinput_props::DeviceConfigStart::Pending(token)) => {
+                lane.in_flight = Some(XiConfigInFlight {
+                    token,
+                    source: validated.source_id,
+                    change: validated.change,
+                    cancel,
+                    protocol: Some(XiConfigCompletion {
+                        validated,
+                        generation: queued.generation,
+                        request_wire_bytes: queued.request_wire_bytes,
+                    }),
+                });
+                break;
+            }
+            Err(error) => {
+                let error = xi_error_for_config(&queued.request, error);
+                emit_xi_config_error(
+                    state,
+                    backend,
+                    pending,
+                    gate,
+                    lane,
+                    reset_trigger,
+                    &queued.request,
+                    error,
+                    queued.generation,
+                    queued.request_wire_bytes,
+                    current_generation,
+                );
+            }
+        }
+    }
+}
+
+/// Accept the owned request outcome produced by XI1/XI2 request parsing.
+/// This is shared by the main request dispatcher and focused tests so the
+/// production lane performs generation stamping, disabled-source rejection,
+/// client blocking, dequeue-time validation, backend start, and commit.
+pub(super) fn route_pending_xi_config(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    input_inventory: &mut InputInventory,
+    pending: &mut PendingBackendRequests,
+    gate: &mut RandrMutationGate,
+    lane: &mut XiConfigLane,
+    reset_trigger: &mut ResetTrigger,
+    request: XiConfigRequest,
+    request_wire_bytes: usize,
+    current_generation: Generation,
+) {
+    let client = request.client;
+    let source_disabled = !state
+        .xi_devices
+        .source_has_enabled_facet(request.expected_source);
+    if lane.reject_unsubmitted_for_vt_release || source_disabled {
+        let error = crate::core_loop::process_request::validate_xi_change(state, &request)
+            .err()
+            .unwrap_or(PropertyDispatchError::BadMatch);
+        emit_xi_config_error(
+            state,
+            backend,
+            pending,
+            gate,
+            lane,
+            reset_trigger,
+            &request,
+            error,
+            current_generation,
+            request_wire_bytes,
+            current_generation,
+        );
+    } else if !pending.block_xi_config(client) {
+        log::error!(
+            "client {} entered XI config lane while already blocked",
+            client.0
+        );
+        disconnect_with_xi_pending_cleanup(
+            state,
+            backend,
+            pending,
+            gate,
+            lane,
+            reset_trigger,
+            client,
+        );
+    } else {
+        lane.queued.push_back(QueuedXiConfig {
+            request,
+            generation: current_generation,
+            request_wire_bytes,
+        });
+        drive_xi_config_lane(
+            state,
+            backend,
+            input_inventory,
+            pending,
+            gate,
+            lane,
+            reset_trigger,
+            current_generation,
+        );
+    }
+}
+
+pub(super) fn cancel_queued_xi_configs_for_source(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    pending: &mut PendingBackendRequests,
+    gate: &mut RandrMutationGate,
+    lane: &mut XiConfigLane,
+    reset_trigger: &mut ResetTrigger,
+    source: crate::xinput::InputSourceId,
+    current_generation: Generation,
+) {
+    let mut retained = VecDeque::new();
+    while let Some(queued) = lane.queued.pop_front() {
+        if queued.request.expected_source != source {
+            retained.push_back(queued);
+            continue;
+        }
+        let error = crate::core_loop::process_request::validate_xi_change(state, &queued.request)
+            .err()
+            .unwrap_or_else(|| {
+                if state.xi_devices.source(source).is_some() {
+                    PropertyDispatchError::BadMatch
+                } else {
+                    PropertyDispatchError::BadDevice {
+                        deviceid: queued.request.deviceid,
+                    }
+                }
+            });
+        emit_xi_config_error(
+            state,
+            backend,
+            pending,
+            gate,
+            lane,
+            reset_trigger,
+            &queued.request,
+            error,
+            queued.generation,
+            queued.request_wire_bytes,
+            current_generation,
+        );
+    }
+    lane.queued = retained;
+}
+
+/// Fail config requests still queued in the core lane when VT release starts.
+/// They have not reached an input-thread handle, so they cannot be committed;
+/// the in-flight operation is completed by the input pause barrier instead.
+fn fail_unsubmitted_xi_configs_for_vt_release(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    pending: &mut PendingBackendRequests,
+    gate: &mut RandrMutationGate,
+    lane: &mut XiConfigLane,
+    reset_trigger: &mut ResetTrigger,
+    current_generation: Generation,
+) {
+    while let Some(queued) = lane.queued.pop_front() {
+        let error = crate::core_loop::process_request::validate_xi_change(state, &queued.request)
+            .err()
+            .unwrap_or(PropertyDispatchError::BadMatch);
+        emit_xi_config_error(
+            state,
+            backend,
+            pending,
+            gate,
+            lane,
+            reset_trigger,
+            &queued.request,
+            error,
+            queued.generation,
+            queued.request_wire_bytes,
+            current_generation,
+        );
+    }
+    lane.reject_unsubmitted_for_vt_release = true;
+}
+
+/// Cancel the one submitted XI config write if the input thread cannot
+/// confirm it before VT release finishes. A later Applied result is retained
+/// for reconciliation, while the client's BadMatch remains final.
+fn fail_in_flight_xi_config_for_vt_release(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    pending: &mut PendingBackendRequests,
+    gate: &mut RandrMutationGate,
+    lane: &mut XiConfigLane,
+    reset_trigger: &mut ResetTrigger,
+    current_generation: Generation,
+) {
+    let Some(in_flight) = lane.in_flight.take() else {
+        return;
+    };
+    in_flight.cancel.cancel();
+    let protocol = in_flight.protocol;
+    lane.timed_out.insert(
+        (in_flight.token, in_flight.source),
+        TimedOutXiConfig {
+            change: in_flight.change,
+        },
+    );
+    if let Some(protocol) = protocol {
+        emit_xi_config_error(
+            state,
+            backend,
+            pending,
+            gate,
+            lane,
+            reset_trigger,
+            &protocol.validated.request,
+            PropertyDispatchError::BadMatch,
+            protocol.generation,
+            protocol.request_wire_bytes,
+            current_generation,
+        );
+    }
+}
+
+/// Dispatch the production `Message::VtRelease` lifecycle callback. Keep the
+/// process-lifetime source inventory and backend device facets in the same
+/// unavailable boundary before the backend releases DRM master. The callback
+/// drains already-submitted config results after the input thread's FIFO pause
+/// and before KMS performs the yielding operations.
+/// Xorg's `ProcXIChangeProperty` runs `change_property` before returning
+/// (`Xi/xiproperty.c:1156-1158`), and its VT handler calls `DisableDevice`
+/// after processing held keys (`xf86Events.c:302-313`).
+pub fn dispatch_vt_release(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    input_inventory: &mut InputInventory,
+    before_yield: impl FnOnce(&mut ServerState, &mut dyn Backend, &mut InputInventory, bool),
+) {
+    if backend.vt_switching_armed() {
+        input_inventory.suspend_all();
+        let pause_barrier_queued = backend.begin_vt_release();
+        before_yield(state, backend, input_inventory, pause_barrier_queued);
+        backend.finish_vt_release(state, input_inventory);
+    }
+}
+
+/// Dispatch the production `Message::VtAcquire` lifecycle callback.
+pub fn dispatch_vt_acquire(state: &mut ServerState, backend: &mut dyn Backend) {
+    if backend.vt_switching_armed() {
+        backend.on_vt_acquire(state);
+    }
+}
+
+/// Dispatch one host input event through the same lifecycle and XI-config
+/// cancellation path used by `run_core`.
+pub(super) fn dispatch_host_input(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    input_inventory: &mut InputInventory,
+    pending: &mut PendingBackendRequests,
+    gate: &mut RandrMutationGate,
+    xi_config_lane: &mut XiConfigLane,
+    reset_trigger: &mut ResetTrigger,
+    ev: HostInputEvent,
+    current_generation: Generation,
+) {
+    // Process-lifetime bookkeeping: maintain `InputInventory` regardless of
+    // generation (it always dispatches, see above) so a device lifecycle
+    // transition is never missed, even mid-reset once resets exist. Nothing
+    // consumes the inventory yet — purely additive.
+    let config_source_lifecycle = match &ev {
+        HostInputEvent::DeviceAdded(info) => {
+            input_inventory.add(info.clone());
+            None
+        }
+        HostInputEvent::DeviceSuspended { source_id, .. } => {
+            input_inventory.suspend(*source_id);
+            Some(*source_id)
+        }
+        HostInputEvent::DeviceResumed(info) => {
+            input_inventory.resume(info.clone());
+            None
+        }
+        HostInputEvent::DeviceRemoved { source_id, .. } => {
+            input_inventory.remove(*source_id);
+            Some(*source_id)
+        }
+        _ => None,
+    };
+    handle_host_input(state, backend, ev);
+    if let Some(source_id) = config_source_lifecycle {
+        cancel_queued_xi_configs_for_source(
+            state,
+            backend,
+            pending,
+            gate,
+            xi_config_lane,
+            reset_trigger,
+            source_id,
+            current_generation,
+        );
+    }
+    backend.mark_dirty();
+}
+
+fn finish_xi_config_result(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    input_inventory: &mut InputInventory,
+    pending: &mut PendingBackendRequests,
+    gate: &mut RandrMutationGate,
+    lane: &mut XiConfigLane,
+    reset_trigger: &mut ResetTrigger,
+    token: crate::xinput::libinput_props::DeviceConfigToken,
+    source: crate::xinput::InputSourceId,
+    result: Result<(), crate::xinput::libinput_props::DeviceConfigError>,
+    current_generation: Generation,
+) {
+    let matches_submitted = lane
+        .in_flight
+        .as_ref()
+        .is_some_and(|in_flight| in_flight.token == token && in_flight.source == source);
+    if !matches_submitted {
+        if let Some(timed_out) = lane.timed_out.remove(&(token, source)) {
+            if result.is_ok() {
+                match apply_confirmed_xi_config(
+                    state,
+                    input_inventory,
+                    source,
+                    timed_out.change,
+                    None,
+                ) {
+                    Ok((facet_id, property, what)) => {
+                        let _ = crate::core_loop::process_request::emit_property_change(
+                            state, facet_id, property, what,
+                        );
+                        backend.mark_dirty();
+                    }
+                    Err(error) => {
+                        warn!(
+                            "late applied input config could not be reconciled token={} source={}: {error:?}",
+                            token.0, source.0
+                        );
+                    }
+                }
+            }
+            drive_xi_config_lane(
+                state,
+                backend,
+                input_inventory,
+                pending,
+                gate,
+                lane,
+                reset_trigger,
+                current_generation,
+            );
+            return;
+        }
+        warn!(
+            "discarding stale input config result token={} source={}",
+            token.0, source.0
+        );
+        return;
+    }
+    let in_flight = lane
+        .in_flight
+        .take()
+        .expect("matching submitted config exists");
+    let protocol = in_flight.protocol.filter(|protocol| {
+        protocol.generation == current_generation
+            && state
+                .clients
+                .contains_key(&protocol.validated.request.client.0)
+    });
+    match result {
+        Ok(()) => {
+            // Xorg stores the property only after all check-only handlers
+            // succeed (`Xi/xiproperty.c:759-801`); commit only the confirmed
+            // libinput result here.
+            let validated = protocol.as_ref().map(|protocol| &protocol.validated);
+            match apply_confirmed_xi_config(
+                state,
+                input_inventory,
+                in_flight.source,
+                in_flight.change,
+                validated,
+            ) {
+                Ok((facet_id, property, what)) => {
+                    let _ = crate::core_loop::process_request::emit_property_change(
+                        state, facet_id, property, what,
+                    );
+                    backend.mark_dirty();
+                    if let Some(protocol) = protocol.as_ref() {
+                        let client = protocol.validated.request.client;
+                        pending.unblock_xi_config(client);
+                        grant_request_credit(state, client, protocol.request_wire_bytes);
+                    }
+                }
+                Err(error) => {
+                    if let Some(protocol) = protocol.as_ref() {
+                        let request = &protocol.validated.request;
+                        emit_xi_config_error(
+                            state,
+                            backend,
+                            pending,
+                            gate,
+                            lane,
+                            reset_trigger,
+                            request,
+                            error,
+                            protocol.generation,
+                            protocol.request_wire_bytes,
+                            current_generation,
+                        );
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            if let Some(protocol) = protocol.as_ref() {
+                let request = &protocol.validated.request;
+                emit_xi_config_error(
+                    state,
+                    backend,
+                    pending,
+                    gate,
+                    lane,
+                    reset_trigger,
+                    request,
+                    xi_error_for_config(request, error),
+                    protocol.generation,
+                    protocol.request_wire_bytes,
+                    current_generation,
+                );
+            }
+        }
+    }
+    drive_xi_config_lane(
+        state,
+        backend,
+        input_inventory,
+        pending,
+        gate,
+        lane,
+        reset_trigger,
+        current_generation,
+    );
+}
+
+/// Dispatch the process-lifetime completion message through the same runner
+/// path used by `run_core`. Keeping the `Message` boundary here lets tests
+/// exercise token/source matching and late-generation commits without
+/// substituting a completion-only test helper.
+pub(super) fn dispatch_device_config_result(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    input_inventory: &mut InputInventory,
+    pending: &mut PendingBackendRequests,
+    gate: &mut RandrMutationGate,
+    lane: &mut XiConfigLane,
+    reset_trigger: &mut ResetTrigger,
+    message: Message,
+    current_generation: Generation,
+) {
+    let Message::DeviceConfigResult {
+        token,
+        source,
+        result,
+    } = message
+    else {
+        unreachable!("device config dispatcher received a different message")
+    };
+    finish_xi_config_result(
+        state,
+        backend,
+        input_inventory,
+        pending,
+        gate,
+        lane,
+        reset_trigger,
+        token,
+        source,
+        result,
+        current_generation,
+    );
+}
+
 pub(crate) fn cancel_all_pending_backend_requests(
     backend: &mut dyn Backend,
     pending: &mut PendingBackendRequests,
@@ -1542,10 +2293,14 @@ pub(crate) fn cancel_all_pending_backend_requests(
 fn process_one_request(
     state: &mut ServerState,
     backend: &mut dyn Backend,
+    input_inventory: &mut InputInventory,
     telemetry: &mut LoopTelemetry,
     pending: &mut PendingBackendRequests,
     gate: &mut RandrMutationGate,
+    xi_config_lane: &mut XiConfigLane,
+
     reset_trigger: &mut ResetTrigger,
+    current_generation: Generation,
     requests_this_iter: &mut u32,
     request_budget: &mut usize,
     gate_mutation: bool,
@@ -1609,6 +2364,10 @@ fn process_one_request(
     {
         let departed = yserver_protocol::x11::ClientId(departed);
         abandon_client_randr_requests(backend, pending, gate, departed);
+        xi_config_lane
+            .queued
+            .retain(|queued| queued.request.client != departed);
+        pending.unblock_xi_config(departed);
         reset_trigger.note_client_departed(state.clients.len());
     }
     if let Some(start) = req_start {
@@ -1625,9 +2384,15 @@ fn process_one_request(
     let mut pending_gate_mutation = false;
     match outcome {
         RequestOutcome::Handled => grant_request_credit(state, req_client, req_wire_bytes),
-        RequestOutcome::Disconnect(disc_id) => {
-            disconnect_with_pending_cleanup(state, backend, pending, gate, reset_trigger, disc_id);
-        }
+        RequestOutcome::Disconnect(disc_id) => disconnect_with_xi_pending_cleanup(
+            state,
+            backend,
+            pending,
+            gate,
+            xi_config_lane,
+            reset_trigger,
+            disc_id,
+        ),
         RequestOutcome::PendingCrtcConfig(continuation) => {
             let token = continuation.token;
             let parked = ParkedCrtcConfig {
@@ -1643,19 +2408,15 @@ fn process_one_request(
                     req_client.0,
                     token.0,
                 );
-                // If this token is not already owned by another waiter, it is
-                // the just-started operation and can be cancelled safely.
                 if !pending.crtc_by_token.contains_key(&token) {
                     backend.cancel_crtc_config(token);
                 }
-                // An ordering/token contract violation cannot be replied to
-                // safely without overtaking an earlier request from this
-                // client. Disconnect it and cancel any older parked work.
-                disconnect_with_pending_cleanup(
+                disconnect_with_xi_pending_cleanup(
                     state,
                     backend,
                     pending,
                     gate,
+                    xi_config_lane,
                     reset_trigger,
                     req_client,
                 );
@@ -1679,11 +2440,12 @@ fn process_one_request(
                 {
                     backend.cancel_forced_reprobe(token);
                 }
-                disconnect_with_pending_cleanup(
+                disconnect_with_xi_pending_cleanup(
                     state,
                     backend,
                     pending,
                     gate,
+                    xi_config_lane,
                     reset_trigger,
                     req_client,
                 );
@@ -1697,16 +2459,29 @@ fn process_one_request(
                 );
                 let _ = pending.take_forced_reprobe_reply(token);
                 backend.cancel_forced_reprobe(token);
-                disconnect_with_pending_cleanup(
+                disconnect_with_xi_pending_cleanup(
                     state,
                     backend,
                     pending,
                     gate,
+                    xi_config_lane,
                     reset_trigger,
                     req_client,
                 );
             }
         }
+        RequestOutcome::PendingXiConfig(request) => route_pending_xi_config(
+            state,
+            backend,
+            input_inventory,
+            pending,
+            gate,
+            xi_config_lane,
+            reset_trigger,
+            request,
+            req_wire_bytes,
+            current_generation,
+        ),
     }
     if gate_mutation && !pending_gate_mutation {
         gate.finish_synchronous();
@@ -1716,10 +2491,14 @@ fn process_one_request(
 fn drain_pending_requests(
     state: &mut ServerState,
     backend: &mut dyn Backend,
+    input_inventory: &mut InputInventory,
     telemetry: &mut LoopTelemetry,
     pending: &mut PendingBackendRequests,
     gate: &mut RandrMutationGate,
+    xi_config_lane: &mut XiConfigLane,
+
     reset_trigger: &mut ResetTrigger,
+    current_generation: Generation,
     deferred_requests: &mut FairRequestQueue,
     server_grab_waiters: &mut VecDeque<DeferredRequest>,
     requests_this_iter: &mut u32,
@@ -1729,10 +2508,13 @@ fn drain_pending_requests(
     drain_expired_randr_gate_waiters(
         state,
         backend,
+        input_inventory,
         telemetry,
         pending,
         gate,
+        xi_config_lane,
         reset_trigger,
+        current_generation,
         deferred_requests,
         server_grab_waiters,
         requests_this_iter,
@@ -1754,10 +2536,13 @@ fn drain_pending_requests(
         process_one_request(
             state,
             backend,
+            input_inventory,
             telemetry,
             pending,
             gate,
+            xi_config_lane,
             reset_trigger,
+            current_generation,
             requests_this_iter,
             request_budget,
             gate_mutation,
@@ -1771,10 +2556,13 @@ fn drain_pending_requests(
             drain_expired_randr_gate_waiters(
                 state,
                 backend,
+                input_inventory,
                 telemetry,
                 pending,
                 gate,
+                xi_config_lane,
                 reset_trigger,
+                current_generation,
                 deferred_requests,
                 server_grab_waiters,
                 requests_this_iter,
@@ -1794,10 +2582,13 @@ fn drain_pending_requests(
 fn drain_expired_randr_gate_waiters(
     state: &mut ServerState,
     backend: &mut dyn Backend,
+    input_inventory: &mut InputInventory,
     telemetry: &mut LoopTelemetry,
     pending: &mut PendingBackendRequests,
     gate: &mut RandrMutationGate,
+    xi_config_lane: &mut XiConfigLane,
     reset_trigger: &mut ResetTrigger,
+    current_generation: Generation,
     deferred_requests: &mut FairRequestQueue,
     server_grab_waiters: &mut VecDeque<DeferredRequest>,
     requests_this_iter: &mut u32,
@@ -1821,16 +2612,52 @@ fn drain_expired_randr_gate_waiters(
         process_one_request(
             state,
             backend,
+            input_inventory,
             telemetry,
             pending,
             gate,
+            xi_config_lane,
             reset_trigger,
+            current_generation,
             requests_this_iter,
             request_budget,
             false,
             request,
         );
     }
+}
+
+fn drain_vt_release_requests(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    input_inventory: &mut InputInventory,
+    telemetry: &mut LoopTelemetry,
+    pending: &mut PendingBackendRequests,
+    gate: &mut RandrMutationGate,
+    lane: &mut XiConfigLane,
+    reset_trigger: &mut ResetTrigger,
+    current_generation: Generation,
+    deferred_requests: &mut FairRequestQueue,
+    server_grab_waiters: &mut VecDeque<DeferredRequest>,
+) {
+    let mut requests_this_iter = 0;
+    let mut request_budget = usize::MAX;
+    drain_pending_requests(
+        state,
+        backend,
+        input_inventory,
+        telemetry,
+        pending,
+        gate,
+        lane,
+        reset_trigger,
+        current_generation,
+        deferred_requests,
+        server_grab_waiters,
+        &mut requests_this_iter,
+        &mut request_budget,
+        Instant::now(),
+    );
 }
 
 /// Process one X protocol request and run its post-handler bookkeeping
@@ -1898,7 +2725,9 @@ fn process_request_inline(
     // path performs this bookkeeping exactly once when the result is applied.
     if !matches!(
         &outcome,
-        RequestOutcome::PendingCrtcConfig(_) | RequestOutcome::PendingForcedReprobe(_)
+        RequestOutcome::PendingCrtcConfig(_)
+            | RequestOutcome::PendingForcedReprobe(_)
+            | RequestOutcome::PendingXiConfig(_),
     ) {
         if std::mem::take(&mut state.damage_notify_flush_pending) {
             backend.flush_before_damage_notify();
@@ -2009,7 +2838,9 @@ fn drain_ready_crtc_configs_with_gate_policy(
                     }
                 }
                 Ok(
-                    RequestOutcome::PendingCrtcConfig(_) | RequestOutcome::PendingForcedReprobe(_),
+                    RequestOutcome::PendingCrtcConfig(_)
+                    | RequestOutcome::PendingForcedReprobe(_)
+                    | RequestOutcome::PendingXiConfig(_),
                 ) => {
                     unreachable!("forced reprobe completion cannot park a second backend request")
                 }
@@ -2107,7 +2938,9 @@ fn drain_ready_crtc_configs_with_gate_policy(
                     grant_request_credit(state, reply.client_id, reply.request_wire_bytes);
                 }
             }
-            RequestOutcome::PendingCrtcConfig(_) | RequestOutcome::PendingForcedReprobe(_) => {
+            RequestOutcome::PendingCrtcConfig(_)
+            | RequestOutcome::PendingForcedReprobe(_)
+            | RequestOutcome::PendingXiConfig(_) => {
                 unreachable!("CRTC completion cannot start a second asynchronous request")
             }
         }
@@ -2250,6 +3083,34 @@ const REPEAT_PERIOD: Duration = Duration::from_millis(40);
 /// of the run — the whole point of the single-threaded refactor is
 /// that only this thread can mutate them.
 pub fn run_core(
+    poll: Poll,
+    rx: CoreReceiver,
+    sender: CoreSender,
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    listeners: impl IntoIterator<Item = Listener>,
+    client_id_allocator: &ClientIdAllocator,
+    auth: Arc<AuthState>,
+    reset_policy: ResetPolicy,
+    xdmcp: Option<XdmcpService>,
+) -> io::Result<()> {
+    let mut input_inventory = InputInventory::new();
+    run_core_with_inventory(
+        poll,
+        rx,
+        sender,
+        state,
+        backend,
+        listeners,
+        client_id_allocator,
+        auth,
+        reset_policy,
+        xdmcp,
+        &mut input_inventory,
+    )
+}
+
+fn run_core_with_inventory(
     mut poll: Poll,
     rx: CoreReceiver,
     sender: CoreSender,
@@ -2260,6 +3121,7 @@ pub fn run_core(
     auth: Arc<AuthState>,
     reset_policy: ResetPolicy,
     xdmcp: Option<XdmcpService>,
+    input_inventory: &mut InputInventory,
 ) -> io::Result<()> {
     let setup_registry = setup_thread::make_registry();
     // The generation counter is shared with every `CoreSender`; the
@@ -2313,8 +3175,9 @@ pub fn run_core(
     // Probe input devices at startup, Xorg-style: drain libinput's
     // initial device enumeration and seed `state.xi_devices` BEFORE the
     // serve loop begins, so the first client to connect sees the real
-    // device model (e.g. device 4 = touchpad) immediately. Without this
-    // the registry carries only the static {2,3,4,5} model until
+    // device model (including a physical touchpad facet with its dynamic
+    // ID) immediately. Without this the registry carries only the static
+    // master and XTEST devices until
     // libinput's first `DeviceAdded` burst is dispatched from the loop,
     // which on real hardware can land seconds after the desktop's
     // clients have already enumerated devices and cached a plain
@@ -2355,10 +3218,11 @@ pub fn run_core(
     let mut randr_mutation_gate = RandrMutationGate::default();
     let mut deferred_reset_action = None;
     let mut xdmcp_terminate_pending = false;
+    let mut xi_config_lane = XiConfigLane::default();
+
     // Process-lifetime, not per-generation — see `input_inventory`'s
     // module docs. Populated below on every `HostInput` device event;
     // nothing consumes it yet (step 1 of the server-reset plan).
-    let mut input_inventory = InputInventory::new();
     loop {
         // The grab can be dropped by paths that have no release check of
         // their own — notably the two disconnect sites outside the message
@@ -2412,7 +3276,11 @@ pub fn run_core(
             // commit retry). `Duration::ZERO` keeps mio returning
             // immediately when a deadline is already due.
             let now = Instant::now();
-            let repeat_deadline = state.repeat_state.as_ref().map(|r| r.next_fire);
+            let repeat_deadline = state
+                .key_repeats
+                .values()
+                .map(|repeat| repeat.next_fire)
+                .min();
             let backend_deadline = backend.next_wakeup();
             let dpms_deadline = state.dpms_transition_deadline();
             let ss_idle_deadline = state.screensaver_idle_deadline();
@@ -2480,10 +3348,13 @@ pub fn run_core(
         drain_pending_requests(
             state,
             backend,
+            input_inventory,
             &mut telemetry,
             &mut pending_backend_requests,
             &mut randr_mutation_gate,
+            &mut xi_config_lane,
             &mut reset_trigger,
+            rx.current_generation(),
             &mut deferred_requests,
             &mut server_grab_waiters,
             &mut requests_this_iter,
@@ -2573,7 +3444,8 @@ pub fn run_core(
                 NOTIFY_TOKEN => {
                     let mut channel_requests = 0_usize;
                     let mut channel_requests_by_client = HashMap::new();
-                    for (msg_generation, msg) in rx.try_recv_all_tagged() {
+                    let mut channel_messages: VecDeque<_> = rx.try_recv_all_tagged().collect();
+                    while let Some((msg_generation, msg)) = channel_messages.pop_front() {
                         // Discard stale session-scoped traffic at the top
                         // of dispatch (server-reset plan step 2). Inert
                         // today: the generation never advances yet, so
@@ -2671,11 +3543,12 @@ pub fn run_core(
                                     &setup_reply,
                                 ) {
                                     error!("ClientSetupComplete for client {} failed: {err}", id.0);
-                                    disconnect_with_pending_cleanup(
+                                    disconnect_with_xi_pending_cleanup(
                                         state,
                                         backend,
                                         &mut pending_backend_requests,
                                         &mut randr_mutation_gate,
+                                        &mut xi_config_lane,
                                         &mut reset_trigger,
                                         id,
                                     );
@@ -2705,11 +3578,12 @@ pub fn run_core(
                                         // departure must not drain an
                                         // armed set and start a
                                         // generation mid-retry.
-                                        disconnect_with_pending_cleanup(
+                                        disconnect_with_xi_pending_cleanup(
                                             state,
                                             backend,
                                             &mut pending_backend_requests,
                                             &mut randr_mutation_gate,
+                                            &mut xi_config_lane,
                                             &mut reset_trigger,
                                             id,
                                         );
@@ -2721,11 +3595,12 @@ pub fn run_core(
                                 }
                             }
                             Message::ClientDisconnected { id, reason: _ } => {
-                                disconnect_with_pending_cleanup(
+                                disconnect_with_xi_pending_cleanup(
                                     state,
                                     backend,
                                     &mut pending_backend_requests,
                                     &mut randr_mutation_gate,
+                                    &mut xi_config_lane,
                                     &mut reset_trigger,
                                     id,
                                 );
@@ -2734,24 +3609,17 @@ pub fn run_core(
                                 if telemetry.enabled {
                                     telemetry.record_host_input(Instant::now());
                                 }
-                                // Process-lifetime bookkeeping: maintain
-                                // `InputInventory` regardless of
-                                // generation (it always dispatches, see
-                                // above) so a device add/remove is never
-                                // missed, even mid-reset once resets
-                                // exist. Nothing consumes the inventory
-                                // yet — purely additive.
-                                match &ev {
-                                    HostInputEvent::DeviceAdded(info) => {
-                                        input_inventory.add(info.clone());
-                                    }
-                                    HostInputEvent::DeviceRemoved { device_node } => {
-                                        input_inventory.remove(device_node);
-                                    }
-                                    _ => {}
-                                }
-                                handle_host_input(state, backend, ev);
-                                backend.mark_dirty();
+                                dispatch_host_input(
+                                    state,
+                                    backend,
+                                    input_inventory,
+                                    &mut pending_backend_requests,
+                                    &mut randr_mutation_gate,
+                                    &mut xi_config_lane,
+                                    &mut reset_trigger,
+                                    ev,
+                                    rx.current_generation(),
+                                );
                             }
                             Message::CrtcConfigReady => {
                                 if let Some(service) = xdmcp.as_mut() {
@@ -2783,6 +3651,23 @@ pub fn run_core(
                                     publish_old_generation,
                                 );
                             }
+                            message @ Message::DeviceConfigResult { .. } => {
+                                dispatch_device_config_result(
+                                    state,
+                                    backend,
+                                    input_inventory,
+                                    &mut pending_backend_requests,
+                                    &mut randr_mutation_gate,
+                                    &mut xi_config_lane,
+                                    &mut reset_trigger,
+                                    message,
+                                    rx.current_generation(),
+                                )
+                            }
+                            Message::InputPaused => {
+                                // Consumed only by the synchronous VT-release
+                                // barrier; ignore any duplicate or stale ack.
+                            }
                             Message::VtRelease => {
                                 // When VT switching isn't armed there is no
                                 // switch to service — ignore. (Deliberate
@@ -2790,36 +3675,211 @@ pub fn run_core(
                                 // DumpDrawables via the Ctrl-Alt-Enter /
                                 // Ctrl-Alt-F12 hotkeys, not this path.)
                                 if backend.vt_switching_armed() {
-                                    backend.on_vt_release(state);
-                                    // VTRelease can supersede an in-progress
-                                    // Owner acquire. Consume its EpisodeEnd
-                                    // now so the RANDR gate turn is released
-                                    // even when no reinstall result will
-                                    // publish a topology update.
-                                    drain_requesterless_publications(
+                                    drain_vt_release_requests(
                                         state,
                                         backend,
+                                        input_inventory,
+                                        &mut telemetry,
+                                        &mut pending_backend_requests,
                                         &mut randr_mutation_gate,
-                                        true,
-                                        None,
+                                        &mut xi_config_lane,
+                                        &mut reset_trigger,
+                                        rx.current_generation(),
+                                        &mut deferred_requests,
+                                        &mut server_grab_waiters,
+                                    );
+                                    fail_unsubmitted_xi_configs_for_vt_release(
+                                        state,
+                                        backend,
+                                        &mut pending_backend_requests,
+                                        &mut randr_mutation_gate,
+                                        &mut xi_config_lane,
+                                        &mut reset_trigger,
+                                        rx.current_generation(),
                                     );
                                 }
+                                dispatch_vt_release(
+                                    state,
+                                    backend,
+                                    input_inventory,
+                                    |state, backend, input_inventory, pause_barrier_queued| {
+                                        let mut deferred = VecDeque::new();
+                                        let mut pause_acknowledged = false;
+                                        if pause_barrier_queued {
+                                            let deadline = Instant::now() + VT_INPUT_PAUSE_TIMEOUT;
+                                            loop {
+                                                let remaining = deadline
+                                                    .saturating_duration_since(Instant::now());
+                                                if remaining.is_zero() {
+                                                    break;
+                                                }
+                                                // Messages after VtRelease may already be in
+                                                // this batch: prefer them before receiving, or a
+                                                // pre-drained pause ack could be stranded behind
+                                                // the release.
+                                                let message = if let Some(message) =
+                                                    channel_messages.pop_front()
+                                                {
+                                                    Ok(message)
+                                                } else {
+                                                    rx.recv_tagged_timeout(remaining)
+                                                };
+                                                let Ok((completion_generation, completion)) =
+                                                    message
+                                                else {
+                                                    break;
+                                                };
+                                                if !generation::should_dispatch(
+                                                    rx.current_generation(),
+                                                    completion_generation,
+                                                    &completion,
+                                                ) {
+                                                    continue;
+                                                }
+                                                match completion {
+                                                    message @ Message::DeviceConfigResult {
+                                                        ..
+                                                    } => {
+                                                        dispatch_device_config_result(
+                                                            state,
+                                                            backend,
+                                                            input_inventory,
+                                                            &mut pending_backend_requests,
+                                                            &mut randr_mutation_gate,
+                                                            &mut xi_config_lane,
+                                                            &mut reset_trigger,
+                                                            message,
+                                                            rx.current_generation(),
+                                                        );
+                                                        drain_vt_release_requests(
+                                                            state,
+                                                            backend,
+                                                            input_inventory,
+                                                            &mut telemetry,
+                                                            &mut pending_backend_requests,
+                                                            &mut randr_mutation_gate,
+                                                            &mut xi_config_lane,
+                                                            &mut reset_trigger,
+                                                            rx.current_generation(),
+                                                            &mut deferred_requests,
+                                                            &mut server_grab_waiters,
+                                                        );
+                                                    }
+                                                    Message::InputPaused => {
+                                                        drain_vt_release_requests(
+                                                            state,
+                                                            backend,
+                                                            input_inventory,
+                                                            &mut telemetry,
+                                                            &mut pending_backend_requests,
+                                                            &mut randr_mutation_gate,
+                                                            &mut xi_config_lane,
+                                                            &mut reset_trigger,
+                                                            rx.current_generation(),
+                                                            &mut deferred_requests,
+                                                            &mut server_grab_waiters,
+                                                        );
+                                                        pause_acknowledged = true;
+                                                        break;
+                                                    }
+                                                    Message::Request {
+                                                        id,
+                                                        sequence,
+                                                        accepted_at,
+                                                        header,
+                                                        body,
+                                                        attached_fd,
+                                                    } => {
+                                                        if telemetry.enabled {
+                                                            channel_requests += 1;
+                                                            *channel_requests_by_client
+                                                                .entry(id)
+                                                                .or_insert(0) += 1;
+                                                            telemetry.record_request_accepted(
+                                                                id, sequence,
+                                                            );
+                                                        }
+                                                        telemetry.record_deferred_push(id);
+                                                        deferred_requests.push_back(
+                                                            DeferredRequest {
+                                                                id,
+                                                                sequence,
+                                                                accepted_at,
+                                                                header,
+                                                                body,
+                                                                attached_fd,
+                                                                randr_gate_ticket: None,
+                                                                randr_gate_expired: false,
+                                                            },
+                                                        );
+                                                        drain_vt_release_requests(
+                                                            state,
+                                                            backend,
+                                                            input_inventory,
+                                                            &mut telemetry,
+                                                            &mut pending_backend_requests,
+                                                            &mut randr_mutation_gate,
+                                                            &mut xi_config_lane,
+                                                            &mut reset_trigger,
+                                                            rx.current_generation(),
+                                                            &mut deferred_requests,
+                                                            &mut server_grab_waiters,
+                                                        );
+                                                    }
+                                                    message => deferred.push_back((
+                                                        completion_generation,
+                                                        message,
+                                                    )),
+                                                }
+                                            }
+                                        }
+                                        if pause_barrier_queued && !pause_acknowledged {
+                                            warn!(
+                                                "VT input pause barrier was not acknowledged within {:?}; failing outstanding XI config write",
+                                                VT_INPUT_PAUSE_TIMEOUT,
+                                            );
+                                        }
+                                        // This is normally empty after InputPaused because
+                                        // input-thread config results precede the FIFO ack.
+                                        // Still reject any residue, including when no barrier
+                                        // could be queued, before KMS starts yielding the VT.
+                                        fail_in_flight_xi_config_for_vt_release(
+                                            state,
+                                            backend,
+                                            &mut pending_backend_requests,
+                                            &mut randr_mutation_gate,
+                                            &mut xi_config_lane,
+                                            &mut reset_trigger,
+                                            rx.current_generation(),
+                                        );
+                                        channel_messages.append(&mut deferred);
+                                    },
+                                );
+                                xi_config_lane.reject_unsubmitted_for_vt_release = false;
                             }
                             Message::VtAcquire => {
-                                if backend.vt_switching_armed() {
-                                    backend.on_vt_acquire(state);
-                                    // Owner acquire reserves RANDR mutations
-                                    // inside the backend entry. Consume the
-                                    // begin marker before this channel batch
-                                    // reaches the pending-request drain below.
-                                    drain_requesterless_publications(
-                                        state,
-                                        backend,
-                                        &mut randr_mutation_gate,
-                                        true,
-                                        None,
-                                    );
-                                }
+                                drain_vt_release_requests(
+                                    state,
+                                    backend,
+                                    input_inventory,
+                                    &mut telemetry,
+                                    &mut pending_backend_requests,
+                                    &mut randr_mutation_gate,
+                                    &mut xi_config_lane,
+                                    &mut reset_trigger,
+                                    rx.current_generation(),
+                                    &mut deferred_requests,
+                                    &mut server_grab_waiters,
+                                );
+                                fail_unsubmitted_xi_configs_for_vt_release(
+                                    state,
+                                    backend,
+                                    &mut pending_backend_requests,
+                                    &mut randr_mutation_gate,
+                                    &mut xi_config_lane,
+                                    &mut reset_trigger,
+                                    rx.current_generation(),
+                                );
                             }
                             Message::SwitchVt(vt) => {
                                 if backend.vt_switching_armed() {
@@ -2841,10 +3901,13 @@ pub fn run_core(
                     drain_pending_requests(
                         state,
                         backend,
+                        input_inventory,
                         &mut telemetry,
                         &mut pending_backend_requests,
                         &mut randr_mutation_gate,
+                        &mut xi_config_lane,
                         &mut reset_trigger,
+                        rx.current_generation(),
                         &mut deferred_requests,
                         &mut server_grab_waiters,
                         &mut requests_this_iter,
@@ -2878,11 +3941,12 @@ pub fn run_core(
                     match client_io::drain_outbound(client) {
                         Ok(WriteOutcome::Done | WriteOutcome::WouldBlock) => {}
                         Ok(WriteOutcome::Disconnect) | Err(_) => {
-                            disconnect_with_pending_cleanup(
+                            disconnect_with_xi_pending_cleanup(
                                 state,
                                 backend,
                                 &mut pending_backend_requests,
                                 &mut randr_mutation_gate,
+                                &mut xi_config_lane,
                                 &mut reset_trigger,
                                 client_id,
                             );
@@ -2913,7 +3977,7 @@ pub fn run_core(
         // elapsed (either because the poll woke on the timeout, or
         // because an unrelated event arrived after the deadline),
         // fan out a synthetic KeyRelease+KeyPress pair.
-        if state.repeat_state.is_some() {
+        if !state.key_repeats.is_empty() {
             // Only poke the compositor when a repeat actually fired.
             // `fire_pending_repeats` returns false when the armed key
             // is merely not-yet-due (the common case every iteration
@@ -2970,21 +4034,23 @@ pub fn run_core(
         // RECORD data connections whose stream write failed (queued, since
         // the write can happen inside another client's disconnect).
         for disc_id in crate::core_loop::record::take_failed_recorders(state) {
-            disconnect_with_pending_cleanup(
+            disconnect_with_xi_pending_cleanup(
                 state,
                 backend,
                 &mut pending_backend_requests,
                 &mut randr_mutation_gate,
+                &mut xi_config_lane,
                 &mut reset_trigger,
                 disc_id,
             );
         }
         for disc_id in reconcile_client_writable_interest(poll.registry(), state) {
-            disconnect_with_pending_cleanup(
+            disconnect_with_xi_pending_cleanup(
                 state,
                 backend,
                 &mut pending_backend_requests,
                 &mut randr_mutation_gate,
+                &mut xi_config_lane,
                 &mut reset_trigger,
                 disc_id,
             );
@@ -3069,13 +4135,18 @@ pub fn run_core(
                 return Ok(());
             }
             Some(ResetAction::Reset) => {
+                // Unsubmitted client requests belong to the generation
+                // being retired. Keep an already submitted input command in
+                // the process-lifetime lane, but discard its old protocol
+                // continuation so a late success commits using current atoms.
+                cancel_unsubmitted_xi_configs(&mut xi_config_lane, &mut pending_backend_requests);
                 let outcome = reset_generation(
                     state,
                     backend,
                     poll.registry(),
                     &generations,
                     &setup_registry,
-                    &input_inventory,
+                    input_inventory,
                     GenerationLocals {
                         deferred_requests: &mut deferred_requests,
                         server_grab_waiters: &mut server_grab_waiters,
@@ -3602,7 +4673,10 @@ fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend)
 /// SetClipRectangles, etc.) cannot recursively re-dispatch — the new
 /// request's reply lands in `pending_replies` and the next
 /// outer-loop iteration drains anything `wait_for_reply` re-enqueued.
-fn dispatch_pending_host_events(state: &mut ServerState, backend: &mut dyn Backend) -> bool {
+pub(crate) fn dispatch_pending_host_events(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+) -> bool {
     let mut any = false;
     while let Some(event) = backend.pop_pending_host_event() {
         any = true;
@@ -4363,43 +5437,53 @@ pub fn handle_host_input(state: &mut ServerState, backend: &mut dyn Backend, ev:
     backend.on_host_input(state, ev);
 }
 
-/// Arm / refresh / clear `state.repeat_state` from an incoming host
-/// input event. X11 spec: only the most recently pressed key
-/// repeats — pressing a different key replaces the armed key;
-/// releasing the armed key clears it; releases of other keys are
-/// ignored. Non-key events don't affect repeat state.
+/// Arm / refresh / clear repeat state for the origin of an incoming host
+/// input event. Each keyboard view has one current repeat key, matching
+/// Xorg's per-device XKB repeat state: a key press from another keyboard
+/// cannot replace it. A matching release clears that origin's timer.
 fn update_repeat_state(state: &mut ServerState, ev: &HostInputEvent) {
-    use crate::core_loop::message::HostInputEvent::Key;
+    use crate::core_loop::{
+        InputOrigin,
+        message::HostInputEvent::{DeviceRemoved, DeviceSuspended, Key},
+    };
     let Key(key) = ev else {
+        let source_id = match ev {
+            DeviceRemoved { source_id } | DeviceSuspended { source_id } => *source_id,
+            _ => return,
+        };
+        state.key_repeats.remove(&InputOrigin::Physical(source_id));
         return;
     };
+    if !crate::core_loop::key_fanout::keyboard_origin_is_live(state, key.origin) {
+        state.key_repeats.remove(&key.origin);
+        return;
+    }
     if key.pressed {
-        let synthetic = state
-            .repeat_state
-            .as_ref()
-            .is_some_and(|r| r.event.keycode == key.keycode && r.event.pressed);
-        if synthetic {
-            // This is a repeat we just fired; don't reset the timer.
+        if crate::core_loop::key_fanout::keyboard_key_is_down(state, key.origin, key.keycode) {
+            // A duplicate press is not a new XKB press and does not restart
+            // this origin's repeat delay.
             return;
         }
-        // ChangeKeyboardControl gate: global auto-repeat off disables
-        // all repeat; otherwise the per-key bitmap decides. A
-        // non-repeating press still replaces (disarms) the armed key —
-        // only the most recently pressed key may repeat.
+        // ChangeKeyboardControl gate: global auto-repeat off disables all
+        // repeat; otherwise the per-key bitmap decides. A non-repeating key
+        // replaces the current repeat key for this origin only.
         if !state.keyboard_control.key_auto_repeats(key.keycode) {
-            state.repeat_state = None;
+            state.key_repeats.remove(&key.origin);
             return;
         }
-        state.repeat_state = Some(KeyRepeatState {
-            event: *key,
-            next_fire: Instant::now() + REPEAT_INITIAL_DELAY,
-        });
+        state.key_repeats.insert(
+            key.origin,
+            KeyRepeatState {
+                event: *key,
+                next_fire: Instant::now() + REPEAT_INITIAL_DELAY,
+            },
+        );
     } else if state
-        .repeat_state
-        .as_ref()
-        .is_some_and(|r| r.event.keycode == key.keycode)
+        .key_repeats
+        .get(&key.origin)
+        .is_some_and(|repeat| repeat.event.keycode == key.keycode)
     {
-        state.repeat_state = None;
+        state.key_repeats.remove(&key.origin);
     }
 }
 
@@ -4418,35 +5502,70 @@ fn update_repeat_state(state: &mut ServerState, ev: &HostInputEvent) {
 /// key is held (or while a phantom key is stuck armed) busy-spins the
 /// compositor at the iteration rate instead of the repeat rate
 /// (idle free-run, [[project_idle_compositor_redraw_loop]] cut 2a).
-fn fire_pending_repeats(state: &mut ServerState, backend: &mut dyn Backend) -> bool {
-    let Some(armed) = state.repeat_state else {
-        return false;
-    };
-    // Repeat may have been disabled (ChangeKeyboardControl) after the
-    // key was armed — disarm instead of firing.
-    if !state.keyboard_control.key_auto_repeats(armed.event.keycode) {
-        state.repeat_state = None;
-        return false;
+pub fn fire_pending_repeats(state: &mut ServerState, backend: &mut dyn Backend) -> bool {
+    let mut origins: Vec<_> = state.key_repeats.keys().copied().collect();
+    origins.sort_by_key(|origin| match origin {
+        crate::core_loop::InputOrigin::Physical(source) => (0, source.0),
+        crate::core_loop::InputOrigin::XTest(device_id) => (1, u64::from(*device_id)),
+        crate::core_loop::InputOrigin::NestedHost => (2, 0),
+    });
+
+    // A drained source may lose its held key before its timer fires. Do not
+    // synthesize a new press for that key; the origin's held set is the
+    // authority for whether repeat remains active.
+    let stale_origins: Vec<_> = origins
+        .iter()
+        .copied()
+        .filter(|origin| {
+            let Some(armed) = state.key_repeats.get(origin) else {
+                return true;
+            };
+            !crate::core_loop::key_fanout::keyboard_origin_is_live(state, *origin)
+                || !crate::core_loop::key_fanout::keyboard_key_is_down(
+                    state,
+                    *origin,
+                    armed.event.keycode,
+                )
+                || !state.keyboard_control.key_auto_repeats(armed.event.keycode)
+        })
+        .collect();
+    for origin in stale_origins {
+        state.key_repeats.remove(&origin);
     }
+
     let now = Instant::now();
-    if now < armed.next_fire {
+    let due: Vec<_> = origins
+        .into_iter()
+        .filter_map(|origin| {
+            state
+                .key_repeats
+                .get(&origin)
+                .filter(|armed| armed.next_fire <= now)
+                .copied()
+                .map(|armed| (origin, armed))
+        })
+        .collect();
+    if due.is_empty() {
         return false;
     }
-    let mut next_fire = armed.next_fire;
-    while now >= next_fire {
-        next_fire += REPEAT_PERIOD;
+
+    for (origin, armed) in due {
+        let mut next_fire = armed.next_fire;
+        while now >= next_fire {
+            next_fire += REPEAT_PERIOD;
+        }
+        // Update the timer first so any reentrant arming during fan-out
+        // doesn't double-fire.
+        if let Some(repeat) = state.key_repeats.get_mut(&origin) {
+            repeat.next_fire = next_fire;
+        }
+        let mut release = armed.event;
+        release.pressed = false;
+        let mut press = armed.event;
+        press.pressed = true;
+        backend.on_host_input(state, HostInputEvent::KeyRepeat(release));
+        backend.on_host_input(state, HostInputEvent::KeyRepeat(press));
     }
-    // Update the timer first so any reentrant arming during fan-out
-    // doesn't double-fire.
-    if let Some(s) = state.repeat_state.as_mut() {
-        s.next_fire = next_fire;
-    }
-    let mut release = armed.event;
-    release.pressed = false;
-    let mut press = armed.event;
-    press.pressed = true;
-    backend.on_host_input(state, HostInputEvent::KeyRepeat(release));
-    backend.on_host_input(state, HostInputEvent::KeyRepeat(press));
     true
 }
 
@@ -4626,6 +5745,8 @@ fn handle_client_setup_complete(
     let transport_label = match &stream {
         Transport::Unix(_) => "unix",
         Transport::Tcp(_) => "TCP",
+        #[cfg(test)]
+        Transport::Capture(_) => "test capture",
     };
     // The reader inherits the setup thread's binding rather than
     // re-reading the counter, so the connection keeps ONE generation
@@ -4863,6 +5984,1139 @@ fn _hint(_: Transport) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn install_xi_config_test_client(
+        state: &mut ServerState,
+        client_id: u32,
+    ) -> crate::transport::CapturedPeer {
+        use crate::server::ClientState;
+        use std::sync::{Arc, Mutex, atomic::AtomicU16};
+        use yserver_protocol::x11::ClientByteOrder;
+
+        let (transport, peer) = crate::transport::Transport::capture_pair();
+        state.clients.insert(
+            client_id,
+            ClientState {
+                writer: Arc::new(Mutex::new(transport)),
+                byte_order: ClientByteOrder::LittleEndian,
+                last_sequence: Arc::new(AtomicU16::new(0)),
+                resource_id_base: 0,
+                resource_id_mask: u32::MAX,
+                event_masks: HashMap::new(),
+                save_set: HashSet::new(),
+                big_requests_enabled: false,
+                xi2_masks: HashMap::new(),
+                xi1_event_classes: HashSet::new(),
+                xi1_window_event_classes: HashMap::new(),
+                outbound: VecDeque::new(),
+                watching_writable: false,
+                focused_window: crate::resources::ROOT_WINDOW,
+                reader_control: None,
+                is_local: true,
+                fd_passing: true,
+            },
+        );
+        peer
+    }
+
+    fn xi_vt_config_fixture(
+        client: u32,
+        source: crate::xinput::InputSourceId,
+    ) -> (
+        ServerState,
+        crate::transport::CapturedPeer,
+        InputInventory,
+        crate::core_loop::DeviceInfo,
+        u16,
+    ) {
+        let mut state = ServerState::new();
+        let peer = install_xi_config_test_client(&mut state, client);
+        let info = crate::core_loop::DeviceInfo {
+            source_id: source,
+            enabled: true,
+            resume_key: None,
+            capabilities: crate::xinput::InputCapabilities {
+                pointer: true,
+                ..Default::default()
+            },
+            name: "VT config pointer".into(),
+            device_node: format!("/dev/input/event{}", source.0),
+            sysname: format!("event{}", source.0),
+            vendor_id: 1,
+            product_id: 2,
+            is_touchpad: false,
+            config: crate::core_loop::message::LibinputConfigSnapshot {
+                accel: crate::core_loop::message::FloatSetting {
+                    available: true,
+                    current: 0.0,
+                    default: 0.0,
+                },
+                ..Default::default()
+            },
+        };
+        let device_id = state.xi_register_source(&info)[0];
+        let mut inventory = InputInventory::new();
+        inventory.add(info.clone());
+        (state, peer, inventory, info, device_id)
+    }
+
+    fn xi_vt_accel_request(
+        client: yserver_protocol::x11::ClientId,
+        sequence: u16,
+        device_id: u16,
+        state: &ServerState,
+        speed: f32,
+    ) -> DeferredRequest {
+        let mut body = Vec::new();
+        body.extend_from_slice(&device_id.to_le_bytes());
+        body.push(crate::xinput::XI_PROP_MODE_REPLACE);
+        body.push(32);
+        body.extend_from_slice(
+            &state
+                .atoms
+                .id_for("libinput Accel Speed")
+                .expect("acceleration property atom")
+                .0
+                .to_le_bytes(),
+        );
+        body.extend_from_slice(&state.float_atom.0.to_le_bytes());
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&speed.to_le_bytes());
+        DeferredRequest {
+            id: client,
+            sequence: yserver_protocol::x11::SequenceNumber(sequence),
+            accepted_at: None,
+            randr_gate_ticket: None,
+            randr_gate_expired: false,
+            header: yserver_protocol::x11::RequestHeader {
+                opcode: 137,
+                data: 57,
+                length_units: 6,
+            },
+            body,
+            attached_fd: None,
+        }
+    }
+
+    fn xi_vt_following_focus_request(client: yserver_protocol::x11::ClientId) -> DeferredRequest {
+        DeferredRequest {
+            id: client,
+            sequence: yserver_protocol::x11::SequenceNumber(2),
+            accepted_at: None,
+            randr_gate_ticket: None,
+            randr_gate_expired: false,
+            header: yserver_protocol::x11::RequestHeader {
+                opcode: 43,
+                data: 0,
+                length_units: 1,
+            },
+            body: Vec::new(),
+            attached_fd: None,
+        }
+    }
+
+    fn send_vt_test_request(
+        sender: &crate::core_loop::sender::BoundSender,
+        request: DeferredRequest,
+    ) {
+        sender
+            .send(Message::Request {
+                id: request.id,
+                sequence: request.sequence,
+                accepted_at: request.accepted_at,
+                header: request.header,
+                body: request.body,
+                attached_fd: request.attached_fd,
+            })
+            .expect("queue runner request");
+    }
+
+    fn run_core_for_vt_test(
+        state: &mut ServerState,
+        backend: &mut crate::backend::recording::RecordingBackend,
+        enqueue: impl FnOnce(&CoreSender, &crate::core_loop::sender::BoundSender),
+    ) -> InputInventory {
+        let (poll, sender, receiver) = crate::core_loop::channel().expect("core channel");
+        let request_sender = sender.bind();
+        enqueue(&sender, &request_sender);
+        let mut input_inventory = InputInventory::new();
+        run_core_with_inventory(
+            poll,
+            receiver,
+            sender.clone_handle(),
+            state,
+            backend,
+            [],
+            &ClientIdAllocator::new(),
+            AuthState::new(None),
+            ResetPolicy::NoReset,
+            None,
+            &mut input_inventory,
+        )
+        .expect("run core through VT release and shutdown messages");
+        input_inventory
+    }
+
+    fn run_core_for_vt_test_with_timeout(
+        mut state: ServerState,
+        mut backend: crate::backend::recording::RecordingBackend,
+        peer: crate::transport::CapturedPeer,
+        timeout: std::time::Duration,
+        enqueue: impl FnOnce(&CoreSender, &crate::core_loop::sender::BoundSender) + Send + 'static,
+    ) -> Result<
+        (
+            ServerState,
+            crate::backend::recording::RecordingBackend,
+            crate::transport::CapturedPeer,
+            InputInventory,
+        ),
+        std::sync::mpsc::RecvTimeoutError,
+    > {
+        let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
+        let runner = std::thread::spawn(move || {
+            let input_inventory = run_core_for_vt_test(&mut state, &mut backend, enqueue);
+            let _ = finished_tx.send((state, backend, peer, input_inventory));
+        });
+        drop(runner);
+        finished_rx.recv_timeout(timeout)
+    }
+
+    #[test]
+    fn xi_vt_timeout_cancelled_command_keeps_bad_match_and_state() {
+        // Mutation killed: omit the core's cancellation before it fails the
+        // still-pending request at the VT barrier timeout.
+        use crate::xinput::libinput_props::{
+            DeviceConfigError, DeviceConfigStart, DeviceConfigToken,
+        };
+        use std::io::Read;
+
+        let client = yserver_protocol::x11::ClientId(62);
+        let source = crate::xinput::InputSourceId(620);
+        let (mut state, peer, _fixture_inventory, info, device) =
+            xi_vt_config_fixture(client.0, source);
+        state.clients.get_mut(&client.0).unwrap().xi2_masks.insert(
+            (crate::resources::ROOT_WINDOW, 0),
+            u64::from(crate::xinput::XI2_PROPERTY_EVENT_MASK),
+        );
+        let mut backend = crate::backend::recording::RecordingBackend::new();
+        backend.vt_switching_armed = true;
+        backend.vt_release_pause_queued = true;
+        backend.vt_release_probe_client = Some(client.0);
+        backend.vt_release_probe_source = Some(source);
+        let release_finished = backend.vt_release_finished.clone();
+        backend
+            .device_config_start_results
+            .push_back(Ok(DeviceConfigStart::Pending(DeviceConfigToken(620))));
+        let request = xi_vt_accel_request(client, 1, device, &state, 0.75);
+        let registry_before: Vec<_> = state
+            .xi_devices
+            .devices()
+            .iter()
+            .map(|entry| {
+                (
+                    entry.id,
+                    entry.source_id,
+                    entry.enabled,
+                    entry.attached_master,
+                )
+            })
+            .collect();
+        let properties_before: Vec<_> = state
+            .xi_devices
+            .devices()
+            .iter()
+            .map(|entry| (entry.id, entry.properties.clone()))
+            .collect();
+        let held_before = (
+            state.keys_down,
+            state.buttons_down,
+            state.key_down_by_device.clone(),
+        );
+        let detached_before = state.xi2_detached_masters.clone();
+        let floating_before = state.floating_pointer_positions.clone();
+        let selections_before = (
+            state.clients[&client.0].xi2_masks.clone(),
+            state.clients[&client.0].xi1_event_classes.clone(),
+            state.clients[&client.0].xi1_window_event_classes.clone(),
+            state.clients[&client.0].event_masks.clone(),
+        );
+
+        let (state, backend, mut peer, inventory) = run_core_for_vt_test_with_timeout(
+            state,
+            backend,
+            peer,
+            std::time::Duration::from_secs(2),
+            move |sender, requests| {
+                sender
+                    .send(Message::HostInput(HostInputEvent::DeviceAdded(
+                        info.clone(),
+                    )))
+                    .unwrap();
+                send_vt_test_request(requests, request);
+                sender.send(Message::VtRelease).unwrap();
+                sender.send(Message::VtAcquire).unwrap();
+                sender
+                    .send(Message::HostInput(HostInputEvent::DeviceResumed(info)))
+                    .unwrap();
+                let late_result_sender = sender.clone_handle();
+                drop(std::thread::spawn(move || {
+                    std::thread::sleep(
+                        VT_INPUT_PAUSE_TIMEOUT + std::time::Duration::from_millis(100),
+                    );
+                    while !release_finished.load(std::sync::atomic::Ordering::SeqCst) {
+                        std::thread::yield_now();
+                    }
+                    late_result_sender
+                        .send(Message::DeviceConfigResult {
+                            token: DeviceConfigToken(620),
+                            source,
+                            result: Err(DeviceConfigError::Cancelled),
+                        })
+                        .unwrap();
+                    late_result_sender.send(Message::Shutdown).unwrap();
+                }));
+            },
+        )
+        .unwrap_or_else(|error| panic!("cancelled VT config timed out: {error:?}"));
+
+        assert!(backend.device_config_cancel_tokens[0].is_cancelled());
+        assert_eq!(backend.started_device_configs.len(), 1);
+        assert_eq!(inventory.get(source).unwrap().config.accel.current, 0.0);
+        assert_eq!(backend.vt_release_inventory_accel_before_finish, Some(0.0));
+        assert_eq!(
+            state
+                .xi_devices
+                .devices()
+                .iter()
+                .map(|entry| (
+                    entry.id,
+                    entry.source_id,
+                    entry.enabled,
+                    entry.attached_master
+                ))
+                .collect::<Vec<_>>(),
+            registry_before,
+        );
+        for (id, properties) in properties_before {
+            assert_eq!(state.xi_devices.device(id).unwrap().properties, properties);
+        }
+        let mut error = [0; 32];
+        peer.read_exact(&mut error).unwrap();
+        assert_eq!(error[0], 0);
+        assert_eq!(error[1], yserver_protocol::x11::error::BAD_MATCH);
+        peer.set_nonblocking(true).unwrap();
+        let mut extra = [0; 1];
+        assert!(
+            matches!(peer.read(&mut extra), Err(ref err) if err.kind() == io::ErrorKind::WouldBlock),
+            "cancelled result emits no property event or second reply",
+        );
+        assert_eq!(
+            (
+                state.keys_down,
+                state.buttons_down,
+                state.key_down_by_device.clone(),
+            ),
+            held_before,
+        );
+        assert_eq!(state.xi2_detached_masters, detached_before);
+        assert_eq!(state.floating_pointer_positions, floating_before);
+        assert_eq!(
+            (
+                state.clients[&client.0].xi2_masks.clone(),
+                state.clients[&client.0].xi1_event_classes.clone(),
+                state.clients[&client.0].xi1_window_event_classes.clone(),
+                state.clients[&client.0].event_masks.clone(),
+            ),
+            selections_before,
+        );
+    }
+
+    #[test]
+    fn xi_vt_release_config_write_without_input_thread_does_not_hang() {
+        // Mutation killed: wait for InputPaused even though begin_vt_release
+        // did not queue an input-thread pause barrier.
+        let client = yserver_protocol::x11::ClientId(60);
+        let mut state = ServerState::new();
+        let peer = install_xi_config_test_client(&mut state, client.0);
+        let mut backend = crate::backend::recording::RecordingBackend::new();
+        backend.vt_switching_armed = true;
+        let registry_before: Vec<_> = state
+            .xi_devices
+            .devices()
+            .iter()
+            .map(|entry| {
+                (
+                    entry.id,
+                    entry.source_id,
+                    entry.enabled,
+                    entry.attached_master,
+                )
+            })
+            .collect();
+        let properties_before: Vec<_> = state
+            .xi_devices
+            .devices()
+            .iter()
+            .map(|entry| (entry.id, entry.properties.clone()))
+            .collect();
+        let held_before = (
+            state.keys_down,
+            state.buttons_down,
+            state.key_down_by_device.clone(),
+        );
+        let detached_before = state.xi2_detached_masters.clone();
+        let floating_before = state.floating_pointer_positions.clone();
+        let selections_before = (
+            state.clients[&client.0].xi2_masks.clone(),
+            state.clients[&client.0].xi1_event_classes.clone(),
+            state.clients[&client.0].xi1_window_event_classes.clone(),
+            state.clients[&client.0].event_masks.clone(),
+        );
+
+        let (state, backend, _peer, _inventory) = run_core_for_vt_test_with_timeout(
+            state,
+            backend,
+            peer,
+            std::time::Duration::from_millis(250),
+            |sender, _requests| {
+                sender.send(Message::VtRelease).unwrap();
+                sender.send(Message::Shutdown).unwrap();
+            },
+        )
+        .unwrap_or_else(|error| panic!("VT release without input thread timed out: {error:?}"));
+
+        assert!(
+            backend
+                .vt_release_finished
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "VT release must finish without an input-thread barrier",
+        );
+        assert_eq!(
+            state
+                .xi_devices
+                .devices()
+                .iter()
+                .map(|entry| (
+                    entry.id,
+                    entry.source_id,
+                    entry.enabled,
+                    entry.attached_master
+                ))
+                .collect::<Vec<_>>(),
+            registry_before,
+        );
+        assert_eq!(
+            state
+                .xi_devices
+                .devices()
+                .iter()
+                .map(|entry| (entry.id, entry.properties.clone()))
+                .collect::<Vec<_>>(),
+            properties_before,
+        );
+        assert_eq!(
+            (
+                state.keys_down,
+                state.buttons_down,
+                state.key_down_by_device.clone(),
+            ),
+            held_before,
+        );
+        assert_eq!(state.xi2_detached_masters, detached_before);
+        assert_eq!(state.floating_pointer_positions, floating_before);
+        assert_eq!(
+            (
+                state.clients[&client.0].xi2_masks.clone(),
+                state.clients[&client.0].xi1_event_classes.clone(),
+                state.clients[&client.0].xi1_window_event_classes.clone(),
+                state.clients[&client.0].event_masks.clone(),
+            ),
+            selections_before,
+        );
+    }
+
+    #[test]
+    fn xi_vt_timeout_late_applied_reconciles_inventory_property_and_event() {
+        // Mutation killed: discard a timed-out operation's late Applied
+        // result instead of reconciling its confirmed state without a reply.
+        use crate::xinput::libinput_props::{DeviceConfigStart, DeviceConfigToken};
+        use std::io::Read;
+
+        let client = yserver_protocol::x11::ClientId(61);
+        let source = crate::xinput::InputSourceId(610);
+        let (mut state, peer, _fixture_inventory, info, device) =
+            xi_vt_config_fixture(client.0, source);
+        let accel_atom = state.atoms.id_for("libinput Accel Speed").unwrap();
+        state.clients.get_mut(&client.0).unwrap().xi2_masks.insert(
+            (crate::resources::ROOT_WINDOW, 0),
+            u64::from(crate::xinput::XI2_PROPERTY_EVENT_MASK),
+        );
+        let mut backend = crate::backend::recording::RecordingBackend::new();
+        backend.vt_switching_armed = true;
+        backend.vt_release_pause_queued = true;
+        backend.vt_release_probe_client = Some(client.0);
+        backend.vt_release_probe_source = Some(source);
+        let release_finished = backend.vt_release_finished.clone();
+        backend
+            .device_config_start_results
+            .push_back(Ok(DeviceConfigStart::Pending(DeviceConfigToken(610))));
+        let request = xi_vt_accel_request(client, 1, device, &state, 0.75);
+        let registry_before: Vec<_> = state
+            .xi_devices
+            .devices()
+            .iter()
+            .map(|entry| {
+                (
+                    entry.id,
+                    entry.source_id,
+                    entry.enabled,
+                    entry.session_enabled,
+                    entry.client_disabled,
+                    entry.attached_master,
+                )
+            })
+            .collect();
+        let property_maps_before: Vec<_> = state
+            .xi_devices
+            .devices()
+            .iter()
+            .map(|entry| (entry.id, entry.properties.clone()))
+            .collect();
+        let held_before = (
+            state.keys_down,
+            state.buttons_down,
+            state.key_down_by_device.clone(),
+            state.xi_devices.device(device).unwrap().buttons_down,
+        );
+        let detached_before = state.xi2_detached_masters.clone();
+        let floating_before = state.floating_pointer_positions.clone();
+        let selections_before = (
+            state.clients[&client.0].xi2_masks.clone(),
+            state.clients[&client.0].xi1_event_classes.clone(),
+            state.clients[&client.0].xi1_window_event_classes.clone(),
+            state.clients[&client.0].event_masks.clone(),
+        );
+
+        let started_at = Instant::now();
+        let (state, backend, mut peer, inventory) = run_core_for_vt_test_with_timeout(
+            state,
+            backend,
+            peer,
+            std::time::Duration::from_secs(2),
+            move |sender, requests| {
+                sender
+                    .send(Message::HostInput(HostInputEvent::DeviceAdded(
+                        info.clone(),
+                    )))
+                    .unwrap();
+                send_vt_test_request(requests, request);
+                sender.send(Message::VtRelease).unwrap();
+                sender.send(Message::VtAcquire).unwrap();
+                sender
+                    .send(Message::HostInput(HostInputEvent::DeviceResumed(info)))
+                    .unwrap();
+                let late_result_sender = sender.clone_handle();
+                drop(std::thread::spawn(move || {
+                    std::thread::sleep(
+                        VT_INPUT_PAUSE_TIMEOUT + std::time::Duration::from_millis(100),
+                    );
+                    while !release_finished.load(std::sync::atomic::Ordering::SeqCst) {
+                        std::thread::yield_now();
+                    }
+                    late_result_sender
+                        .send(Message::DeviceConfigResult {
+                            token: DeviceConfigToken(610),
+                            source,
+                            result: Ok(()),
+                        })
+                        .unwrap();
+                    late_result_sender.send(Message::Shutdown).unwrap();
+                }));
+            },
+        )
+        .unwrap_or_else(|error| panic!("unacknowledged VT pause barrier timed out: {error:?}"));
+        assert!(
+            started_at.elapsed() >= VT_INPUT_PAUSE_TIMEOUT,
+            "a queued pause barrier must receive the full bounded wait",
+        );
+
+        assert!(backend.vt_release_wire_visible_before_finish);
+        assert!(
+            backend
+                .vt_release_finished
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        assert_eq!(backend.started_device_configs.len(), 1);
+        assert!(
+            backend.device_config_cancel_tokens[0].is_cancelled(),
+            "VT timeout shares cancellation with the submitted input command",
+        );
+        let mut error = [0; 32];
+        peer.read_exact(&mut error).unwrap();
+        assert_eq!(error[0], 0);
+        assert_eq!(error[1], yserver_protocol::x11::error::BAD_MATCH);
+        for (id, properties) in property_maps_before {
+            let current = &state.xi_devices.device(id).unwrap().properties;
+            if id == device {
+                assert_eq!(current.len(), properties.len());
+                for (property, previous) in properties {
+                    let actual = current.get(&property).expect("property remains present");
+                    if property == accel_atom {
+                        assert_eq!(actual.data, 0.75_f32.to_le_bytes());
+                        assert_eq!(actual.format, previous.format);
+                        assert_eq!(actual.type_atom, previous.type_atom);
+                    } else {
+                        assert_eq!(actual, &previous);
+                    }
+                }
+            } else {
+                assert_eq!(current, &properties);
+            }
+        }
+        assert_eq!(backend.vt_release_inventory_accel_before_finish, Some(0.0));
+        assert_eq!(
+            inventory.get(source).unwrap().config.accel.current,
+            0.75,
+            "confirmed late result updates the process-lifetime inventory",
+        );
+        assert_eq!(
+            state
+                .xi_devices
+                .source(source)
+                .unwrap()
+                .config
+                .accel
+                .current,
+            0.75,
+            "confirmed late result updates the active XI source snapshot",
+        );
+        let mut property_event = [0; 32];
+        peer.read_exact(&mut property_event).unwrap();
+        assert_eq!(property_event[0], 35, "XI2 GenericEvent");
+        assert_eq!(
+            u16::from_le_bytes([property_event[8], property_event[9]]),
+            12,
+            "XI_PropertyEvent follows reconciliation",
+        );
+        assert_eq!(
+            u16::from_le_bytes([property_event[10], property_event[11]]),
+            device,
+            "property event names the current facet",
+        );
+        assert_eq!(
+            u32::from_le_bytes(property_event[16..20].try_into().unwrap()),
+            accel_atom.0,
+        );
+        assert_eq!(property_event[20], 2, "what = Modified");
+        peer.set_nonblocking(true).unwrap();
+        let mut late_reply = [0; 1];
+        assert!(
+            matches!(peer.read(&mut late_reply), Err(ref err) if err.kind() == io::ErrorKind::WouldBlock),
+            "late reconciliation emits no second reply",
+        );
+        assert_eq!(
+            state
+                .xi_devices
+                .devices()
+                .iter()
+                .map(|entry| (
+                    entry.id,
+                    entry.source_id,
+                    entry.enabled,
+                    entry.session_enabled,
+                    entry.client_disabled,
+                    entry.attached_master,
+                ))
+                .collect::<Vec<_>>(),
+            registry_before,
+        );
+        assert_eq!(
+            (
+                state.keys_down,
+                state.buttons_down,
+                state.key_down_by_device.clone(),
+                state.xi_devices.device(device).unwrap().buttons_down,
+            ),
+            held_before,
+        );
+        assert_eq!(state.xi2_detached_masters, detached_before);
+        assert_eq!(state.floating_pointer_positions, floating_before);
+        assert_eq!(
+            (
+                state.clients[&client.0].xi2_masks.clone(),
+                state.clients[&client.0].xi1_event_classes.clone(),
+                state.clients[&client.0].xi1_window_event_classes.clone(),
+                state.clients[&client.0].event_masks.clone(),
+            ),
+            selections_before,
+        );
+    }
+
+    #[test]
+    fn xi_config_completion_same_client_request_order_survives_error() {
+        use crate::xinput::libinput_props::{
+            DeviceConfigError, DeviceConfigStart, DeviceConfigToken,
+        };
+        use std::io::Read;
+        use yserver_protocol::x11::{ClientId, SequenceNumber};
+
+        let client = ClientId(57);
+        let mut state = ServerState::new();
+        let mut peer = install_xi_config_test_client(&mut state, client.0);
+        let info = crate::core_loop::DeviceInfo {
+            source_id: crate::xinput::InputSourceId(570),
+            enabled: true,
+            resume_key: None,
+            capabilities: crate::xinput::InputCapabilities {
+                pointer: true,
+                ..Default::default()
+            },
+            name: "ordered config pointer".into(),
+            device_node: "/dev/input/event570".into(),
+            sysname: "event570".into(),
+            vendor_id: 1,
+            product_id: 2,
+            is_touchpad: false,
+            config: crate::core_loop::message::LibinputConfigSnapshot {
+                accel: crate::core_loop::message::FloatSetting {
+                    available: true,
+                    current: 0.0,
+                    default: 0.0,
+                },
+                ..Default::default()
+            },
+        };
+        let ids = state.xi_register_source(&info);
+        let device_id = ids[0];
+        let source = info.source_id;
+        let mut inventory = InputInventory::new();
+        inventory.add(info);
+        let property = state.atoms.id_for("libinput Accel Speed").unwrap();
+        let before = state
+            .xi_devices
+            .device(device_id)
+            .unwrap()
+            .properties
+            .clone();
+        let mut body = Vec::new();
+        body.extend_from_slice(&device_id.to_le_bytes());
+        body.push(crate::xinput::XI_PROP_MODE_REPLACE);
+        body.push(32);
+        body.extend_from_slice(&property.0.to_le_bytes());
+        body.extend_from_slice(&state.float_atom.0.to_le_bytes());
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&0.5_f32.to_le_bytes());
+        let first = DeferredRequest {
+            id: client,
+            sequence: SequenceNumber(1),
+            accepted_at: None,
+            randr_gate_ticket: None,
+            randr_gate_expired: false,
+            header: yserver_protocol::x11::RequestHeader {
+                opcode: 137,
+                data: 57,
+                length_units: 6,
+            },
+            body,
+            attached_fd: None,
+        };
+
+        let token = DeviceConfigToken(570);
+        let mut backend = crate::backend::recording::RecordingBackend::new();
+        backend
+            .device_config_start_results
+            .push_back(Ok(DeviceConfigStart::Pending(token)));
+        let mut pending = PendingBackendRequests::default();
+        let mut gate = RandrMutationGate::default();
+        let mut lane = XiConfigLane::default();
+        let mut reset_trigger = ResetTrigger::new(ResetPolicy::NoReset);
+        let mut requests_this_iter = 0;
+        let mut request_budget = 10;
+        process_one_request(
+            &mut state,
+            &mut backend,
+            &mut inventory,
+            &mut LoopTelemetry::default(),
+            &mut pending,
+            &mut gate,
+            &mut lane,
+            &mut reset_trigger,
+            Generation::default(),
+            &mut requests_this_iter,
+            &mut request_budget,
+            false,
+            first,
+        );
+        assert!(pending.client_is_blocked(client));
+        assert!(!lane.is_empty());
+        assert_eq!(backend.started_device_configs.len(), 1);
+        assert_eq!(
+            state.xi_devices.device(device_id).unwrap().properties,
+            before
+        );
+
+        let mut later = DeferredRequest {
+            id: client,
+            sequence: SequenceNumber(2),
+            accepted_at: None,
+            randr_gate_ticket: None,
+            randr_gate_expired: false,
+            header: yserver_protocol::x11::RequestHeader {
+                opcode: 43, // GetInputFocus reply is easy to identify.
+                data: 0,
+                length_units: 1,
+            },
+            body: Vec::new(),
+            attached_fd: None,
+        };
+        let mut deferred = FairRequestQueue::default();
+        deferred.push_back(later);
+        assert!(deferred.pop_front_unblocked(&pending, &state).is_none());
+        peer.set_nonblocking(true).unwrap();
+        let mut bytes = [0u8; 64];
+        assert!(
+            matches!(peer.read(&mut bytes), Err(ref error) if error.kind() == io::ErrorKind::WouldBlock)
+        );
+        peer.set_nonblocking(false).unwrap();
+
+        dispatch_device_config_result(
+            &mut state,
+            &mut backend,
+            &mut inventory,
+            &mut pending,
+            &mut gate,
+            &mut lane,
+            &mut reset_trigger,
+            Message::DeviceConfigResult {
+                token,
+                source,
+                result: Err(DeviceConfigError::Invalid),
+            },
+            Generation::default(),
+        );
+        assert!(!pending.client_is_blocked(client));
+        later = deferred
+            .pop_front_unblocked(&pending, &state)
+            .expect("later request unblocks after the earlier error");
+        process_one_request(
+            &mut state,
+            &mut backend,
+            &mut inventory,
+            &mut LoopTelemetry::default(),
+            &mut pending,
+            &mut gate,
+            &mut lane,
+            &mut reset_trigger,
+            Generation::default(),
+            &mut requests_this_iter,
+            &mut request_budget,
+            false,
+            later,
+        );
+
+        let mut wire = [0u8; 64];
+        peer.read_exact(&mut wire).unwrap();
+        assert_eq!(wire[0], 0, "first packet is the earlier request's X_Error");
+        assert_eq!(wire[1], yserver_protocol::x11::error::BAD_VALUE);
+        assert_eq!(u16::from_le_bytes([wire[2], wire[3]]), 1);
+        assert_eq!(u16::from_le_bytes([wire[8], wire[9]]), 57);
+        assert_eq!(wire[10], 137);
+        assert_eq!(wire[32], 1, "second packet answers GetInputFocus");
+        assert_eq!(u16::from_le_bytes([wire[34], wire[35]]), 2);
+        assert_eq!(
+            state.xi_devices.device(device_id).unwrap().properties,
+            before
+        );
+        assert_eq!(inventory.get(source).unwrap().config.accel.current, 0.0);
+        assert!(lane.is_empty());
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn xi_vt_release_config_write_applied_reply_precedes_release_completion() {
+        // Mutation killed: finish VT release before the pause barrier drains
+        // the in-flight XI config, leaving the client blocked across release.
+        use crate::xinput::libinput_props::{DeviceConfigStart, DeviceConfigToken};
+        use std::io::Read;
+
+        let client = yserver_protocol::x11::ClientId(58);
+        let source = crate::xinput::InputSourceId(580);
+        let (mut state, mut peer, _fixture_inventory, info, device) =
+            xi_vt_config_fixture(client.0, source);
+        let mut backend = crate::backend::recording::RecordingBackend::new();
+        backend.vt_switching_armed = true;
+        backend.vt_release_pause_queued = true;
+        backend.vt_release_probe_client = Some(client.0);
+        backend.vt_release_probe_source = Some(source);
+        backend
+            .device_config_start_results
+            .push_back(Ok(DeviceConfigStart::Pending(DeviceConfigToken(580))));
+        let registry_before: Vec<_> = state
+            .xi_devices
+            .devices()
+            .iter()
+            .map(|entry| {
+                (
+                    entry.id,
+                    entry.source_id,
+                    entry.enabled,
+                    entry.session_enabled,
+                    entry.client_disabled,
+                    entry.attached_master,
+                )
+            })
+            .collect();
+        let property_maps_before: Vec<_> = state
+            .xi_devices
+            .devices()
+            .iter()
+            .map(|entry| (entry.id, entry.properties.clone()))
+            .collect();
+        let held_before = (
+            state.keys_down,
+            state.buttons_down,
+            state.key_down_by_device.clone(),
+            state.xi_devices.device(device).unwrap().buttons_down,
+        );
+        let detached_before = state.xi2_detached_masters.clone();
+        let floating_before = state.floating_pointer_positions.clone();
+        let selections_before = (
+            state.clients[&client.0].xi2_masks.clone(),
+            state.clients[&client.0].xi1_event_classes.clone(),
+            state.clients[&client.0].xi1_window_event_classes.clone(),
+            state.clients[&client.0].event_masks.clone(),
+        );
+        let request = xi_vt_accel_request(client, 1, device, &state, 0.5);
+        run_core_for_vt_test(&mut state, &mut backend, |sender, requests| {
+            sender
+                .send(Message::HostInput(HostInputEvent::DeviceAdded(info)))
+                .unwrap();
+            send_vt_test_request(requests, request);
+            sender.send(Message::VtRelease).unwrap();
+            send_vt_test_request(requests, xi_vt_following_focus_request(client));
+            sender
+                .send(Message::DeviceConfigResult {
+                    token: DeviceConfigToken(580),
+                    source,
+                    result: Ok(()),
+                })
+                .unwrap();
+            sender.send(Message::InputPaused).unwrap();
+            sender.send(Message::Shutdown).unwrap();
+        });
+        assert!(
+            backend.vt_release_wire_visible_before_finish,
+            "runner must write the following reply before VT release finishes",
+        );
+        assert_eq!(
+            backend.vt_release_inventory_accel_before_finish,
+            Some(0.5),
+            "the runner inventory carries the applied value at the release boundary",
+        );
+        let mut reply = [0; 32];
+        peer.read_exact(&mut reply).unwrap();
+        assert_eq!(reply[0], 1);
+        assert_eq!(u16::from_le_bytes([reply[2], reply[3]]), 2);
+        assert!(
+            backend
+                .vt_release_finished
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        assert_eq!(backend.started_device_configs.len(), 1);
+        assert_eq!(
+            state
+                .xi_devices
+                .devices()
+                .iter()
+                .map(|entry| (
+                    entry.id,
+                    entry.source_id,
+                    entry.enabled,
+                    entry.session_enabled,
+                    entry.client_disabled,
+                    entry.attached_master,
+                ))
+                .collect::<Vec<_>>(),
+            registry_before,
+        );
+        for (id, before) in property_maps_before {
+            let after = &state.xi_devices.device(id).unwrap().properties;
+            if id != device {
+                assert_eq!(*after, before);
+                continue;
+            }
+            assert_eq!(after.len(), before.len());
+            for (atom, old_value) in before {
+                if atom == state.atoms.id_for("libinput Accel Speed").unwrap() {
+                    assert_eq!(after.get(&atom).unwrap().data, 0.5_f32.to_le_bytes());
+                } else {
+                    assert_eq!(after.get(&atom), Some(&old_value));
+                }
+            }
+        }
+        assert_eq!(
+            (
+                state.keys_down,
+                state.buttons_down,
+                state.key_down_by_device.clone(),
+                state.xi_devices.device(device).unwrap().buttons_down,
+            ),
+            held_before,
+        );
+        assert_eq!(state.xi2_detached_masters, detached_before);
+        assert_eq!(state.floating_pointer_positions, floating_before);
+        assert_eq!(
+            (
+                state.clients[&client.0].xi2_masks.clone(),
+                state.clients[&client.0].xi1_event_classes.clone(),
+                state.clients[&client.0].xi1_window_event_classes.clone(),
+                state.clients[&client.0].event_masks.clone(),
+            ),
+            selections_before,
+        );
+    }
+
+    #[test]
+    fn xi_vt_release_config_write_retired_handle_bad_match_has_no_resume_reply() {
+        // Mutation killed: park SourceGone until source rebind (or expose it as
+        // BadDevice), allowing the pre-pause property write to answer late.
+        use crate::xinput::libinput_props::{DeviceConfigStart, DeviceConfigToken};
+        use std::io::Read;
+
+        let client = yserver_protocol::x11::ClientId(59);
+        let source = crate::xinput::InputSourceId(590);
+        let (mut state, mut peer, _fixture_inventory, info, device) =
+            xi_vt_config_fixture(client.0, source);
+        let mut backend = crate::backend::recording::RecordingBackend::new();
+        backend.vt_switching_armed = true;
+        backend.vt_release_pause_queued = true;
+        backend.vt_release_probe_client = Some(client.0);
+        backend.vt_release_probe_source = Some(source);
+        backend
+            .device_config_start_results
+            .push_back(Ok(DeviceConfigStart::Pending(DeviceConfigToken(590))));
+        let request = xi_vt_accel_request(client, 1, device, &state, 0.75);
+        let property_maps_before: Vec<_> = state
+            .xi_devices
+            .devices()
+            .iter()
+            .map(|entry| (entry.id, entry.properties.clone()))
+            .collect();
+        let inventory_accel_before = 0.0;
+        let registry_before: Vec<_> = state
+            .xi_devices
+            .devices()
+            .iter()
+            .map(|entry| {
+                (
+                    entry.id,
+                    entry.source_id,
+                    entry.enabled,
+                    entry.session_enabled,
+                    entry.client_disabled,
+                    entry.attached_master,
+                )
+            })
+            .collect();
+        let held_before = (
+            state.keys_down,
+            state.buttons_down,
+            state.key_down_by_device.clone(),
+        );
+        let detached_before = state.xi2_detached_masters.clone();
+        let floating_before = state.floating_pointer_positions.clone();
+        let selections_before = (
+            state.clients[&client.0].xi2_masks.clone(),
+            state.clients[&client.0].xi1_event_classes.clone(),
+            state.clients[&client.0].xi1_window_event_classes.clone(),
+            state.clients[&client.0].event_masks.clone(),
+        );
+
+        run_core_for_vt_test(&mut state, &mut backend, |sender, requests| {
+            sender
+                .send(Message::HostInput(HostInputEvent::DeviceAdded(
+                    info.clone(),
+                )))
+                .unwrap();
+            send_vt_test_request(requests, request);
+            sender.send(Message::VtRelease).unwrap();
+            sender
+                .send(Message::DeviceConfigResult {
+                    token: DeviceConfigToken(590),
+                    source,
+                    result: Err(crate::xinput::libinput_props::DeviceConfigError::SourceGone),
+                })
+                .unwrap();
+            sender.send(Message::InputPaused).unwrap();
+            sender.send(Message::VtAcquire).unwrap();
+            sender
+                .send(Message::HostInput(HostInputEvent::DeviceResumed(info)))
+                .unwrap();
+            sender.send(Message::Shutdown).unwrap();
+        });
+        assert!(backend.vt_release_wire_visible_before_finish);
+        assert!(
+            backend
+                .vt_release_finished
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        let mut error = [0; 32];
+        peer.read_exact(&mut error).unwrap();
+        assert_eq!(error[0], 0);
+        assert_eq!(error[1], yserver_protocol::x11::error::BAD_MATCH);
+        for (id, properties) in property_maps_before {
+            assert_eq!(
+                state.xi_devices.device(id).unwrap().properties,
+                properties,
+                "failed SourceGone does not alter any device property map",
+            );
+        }
+        assert_eq!(
+            backend.vt_release_inventory_accel_before_finish,
+            Some(inventory_accel_before),
+        );
+        peer.set_nonblocking(true).unwrap();
+        let mut late_reply = [0; 1];
+        assert!(
+            matches!(peer.read(&mut late_reply), Err(ref err) if err.kind() == io::ErrorKind::WouldBlock),
+            "resume must not emit a second or delayed answer for the pre-pause write",
+        );
+        assert_eq!(
+            state
+                .xi_devices
+                .devices()
+                .iter()
+                .map(|entry| (
+                    entry.id,
+                    entry.source_id,
+                    entry.enabled,
+                    entry.session_enabled,
+                    entry.client_disabled,
+                    entry.attached_master,
+                ))
+                .collect::<Vec<_>>(),
+            registry_before,
+        );
+        assert_eq!(
+            (
+                state.keys_down,
+                state.buttons_down,
+                state.key_down_by_device.clone(),
+            ),
+            held_before,
+        );
+        assert_eq!(state.xi2_detached_masters, detached_before);
+        assert_eq!(state.floating_pointer_positions, floating_before);
+        assert_eq!(
+            (
+                state.clients[&client.0].xi2_masks.clone(),
+                state.clients[&client.0].xi1_event_classes.clone(),
+                state.clients[&client.0].xi1_window_event_classes.clone(),
+                state.clients[&client.0].event_masks.clone(),
+            ),
+            selections_before,
+        );
+    }
 
     /// #132: `xrandr --dpi` (RRSetScreenSize with the same pixels, new mm)
     /// reaches NEW clients' setup reply, as Xorg's `pScreen->mmWidth`.
@@ -5490,10 +7744,13 @@ mod tests {
         process_one_request(
             state,
             backend,
+            &mut InputInventory::default(),
             &mut telemetry,
             pending,
             gate,
+            &mut XiConfigLane::default(),
             reset,
+            Generation::default(),
             &mut requests_this_iter,
             &mut request_budget,
             false,
@@ -5516,10 +7773,13 @@ mod tests {
         drain_pending_requests(
             state,
             backend,
+            &mut InputInventory::default(),
             &mut telemetry,
             pending,
             gate,
+            &mut XiConfigLane::default(),
             &mut reset,
+            Generation::default(),
             queue,
             &mut server_grab_waiters,
             &mut requests_this_iter,
@@ -9480,7 +11740,6 @@ mod tests {
         let mut backend = RecordingBackend::new();
         backend.ready_crtc_configs.push(token);
         backend.crtc_config_results.insert(token, Ok(false));
-
         drain_ready_crtc_configs_with_gate(
             &mut state,
             &mut backend,
@@ -9514,11 +11773,13 @@ mod tests {
                 request_wire_bytes: 28,
             })
             .unwrap();
-        disconnect_with_pending_cleanup(
+        let mut xi_config_lane = XiConfigLane::default();
+        disconnect_with_xi_pending_cleanup(
             &mut state,
             &mut backend,
             &mut pending,
             &mut RandrMutationGate::default(),
+            &mut xi_config_lane,
             &mut ResetTrigger::new(ResetPolicy::NoReset),
             client_id,
         );
@@ -10592,6 +12853,7 @@ mod tests {
 
         let key = |keycode: u8, pressed: bool| {
             HostInputEvent::Key(HostKeyEvent {
+                origin: crate::core_loop::InputOrigin::NestedHost,
                 pressed,
                 keycode,
                 time: 0,
@@ -10605,26 +12867,34 @@ mod tests {
 
         // Press A → armed on A.
         handle_host_input(&mut state, &mut backend, key(38, true));
-        let armed = state.repeat_state.expect("press should arm repeat_state");
+        let armed = state
+            .key_repeats
+            .get(&crate::core_loop::InputOrigin::NestedHost)
+            .expect("press should arm repeat state for NestedHost");
         assert_eq!(armed.event.keycode, 38);
         assert!(armed.event.pressed);
 
         // Press B (different keycode) → replaces armed key.
         handle_host_input(&mut state, &mut backend, key(39, true));
-        let armed = state.repeat_state.expect("second press should re-arm");
+        let armed = state
+            .key_repeats
+            .get(&crate::core_loop::InputOrigin::NestedHost)
+            .expect("second press should replace the same origin's repeat");
         assert_eq!(armed.event.keycode, 39);
 
         // Release A while B is armed → ignored (only the armed key's
         // release clears).
         handle_host_input(&mut state, &mut backend, key(38, false));
         assert!(
-            state.repeat_state.is_some(),
+            state
+                .key_repeats
+                .contains_key(&crate::core_loop::InputOrigin::NestedHost),
             "release of non-armed key must not clear",
         );
 
         // Release B → clears.
         handle_host_input(&mut state, &mut backend, key(39, false));
-        assert!(state.repeat_state.is_none());
+        assert!(state.key_repeats.is_empty());
     }
 
     /// Regression guard for the idle free-run fix (cut 2a): the caller
@@ -10651,6 +12921,7 @@ mod tests {
             &mut state,
             &mut backend,
             HostInputEvent::Key(HostKeyEvent {
+                origin: crate::core_loop::InputOrigin::NestedHost,
                 pressed: true,
                 keycode: 38,
                 time: 0,
@@ -10661,7 +12932,25 @@ mod tests {
                 state: 0,
             }),
         );
-        assert!(state.repeat_state.is_some());
+        assert!(
+            state
+                .key_repeats
+                .contains_key(&crate::core_loop::InputOrigin::NestedHost)
+        );
+        let transition = crate::core_loop::key_fanout::key_transition_status(
+            &state,
+            crate::core_loop::InputOrigin::NestedHost,
+            38,
+            true,
+        )
+        .expect("NestedHost has a master keyboard");
+        crate::core_loop::key_fanout::commit_key_transition(
+            &mut state,
+            crate::core_loop::InputOrigin::NestedHost,
+            38,
+            true,
+            transition,
+        );
 
         // Freshly armed → `next_fire` is INITIAL_DELAY in the future →
         // NOT due → must return false (the idle busy-spin case).
@@ -10671,7 +12960,10 @@ mod tests {
         );
 
         // Force the deadline into the past → must fire.
-        if let Some(s) = state.repeat_state.as_mut() {
+        if let Some(s) = state
+            .key_repeats
+            .get_mut(&crate::core_loop::InputOrigin::NestedHost)
+        {
             s.next_fire = Instant::now() - Duration::from_millis(1);
         }
         assert!(
@@ -10698,6 +12990,7 @@ mod tests {
             &mut state,
             &mut backend,
             HostInputEvent::Key(HostKeyEvent {
+                origin: crate::core_loop::InputOrigin::NestedHost,
                 pressed: true,
                 keycode: 38,
                 time: 0,
@@ -10708,7 +13001,24 @@ mod tests {
                 state: 0,
             }),
         );
-        if let Some(s) = state.repeat_state.as_mut() {
+        let transition = crate::core_loop::key_fanout::key_transition_status(
+            &state,
+            crate::core_loop::InputOrigin::NestedHost,
+            38,
+            true,
+        )
+        .expect("NestedHost has a master keyboard");
+        crate::core_loop::key_fanout::commit_key_transition(
+            &mut state,
+            crate::core_loop::InputOrigin::NestedHost,
+            38,
+            true,
+            transition,
+        );
+        if let Some(s) = state
+            .key_repeats
+            .get_mut(&crate::core_loop::InputOrigin::NestedHost)
+        {
             s.next_fire = Instant::now() - Duration::from_millis(1);
         }
         assert!(fire_pending_repeats(&mut state, &mut backend));
@@ -10738,6 +13048,20 @@ mod tests {
                 },
             ]
         );
+        let transition = crate::core_loop::key_fanout::key_transition_status(
+            &state,
+            crate::core_loop::InputOrigin::NestedHost,
+            38,
+            true,
+        )
+        .expect("NestedHost has a master keyboard");
+        crate::core_loop::key_fanout::commit_key_transition(
+            &mut state,
+            crate::core_loop::InputOrigin::NestedHost,
+            38,
+            true,
+            transition,
+        );
     }
 
     /// Helper: a touchpad `DeviceInfo` mirroring libinput's enumeration
@@ -10746,6 +13070,14 @@ mod tests {
     fn probe_touchpad_info() -> crate::core_loop::DeviceInfo {
         use crate::core_loop::message::{BoolSetting, LibinputConfigSnapshot};
         crate::core_loop::DeviceInfo {
+            source_id: crate::xinput::InputSourceId(u64::from(line!())),
+            enabled: true,
+            resume_key: None,
+            capabilities: crate::xinput::InputCapabilities {
+                keyboard: false,
+                pointer: true,
+                touch: false,
+            },
             name: "SynPS/2 Synaptics TouchPad".into(),
             device_node: "/dev/input/event4".into(),
             sysname: "event4".into(),
@@ -10774,12 +13106,12 @@ mod tests {
     }
 
     #[cfg(test)]
-    fn slave_pointer_name(state: &ServerState) -> String {
+    fn xtest_pointer_name(state: &ServerState) -> String {
         state
             .xi_devices
             .iter()
-            .find(|d| d.id == crate::xinput::DEVICEID_SLAVE_POINTER)
-            .expect("slave pointer (id 4) always present")
+            .find(|d| d.id == crate::xinput::DEVICEID_XTEST_POINTER)
+            .expect("XTEST pointer (id 4) always present")
             .name
             .clone()
     }
@@ -10793,21 +13125,20 @@ mod tests {
 
         let mut state = ServerState::new();
         let mut backend = RecordingBackend::new(); // no probe_rounds configured
-        let before = slave_pointer_name(&state);
+        let before = xtest_pointer_name(&state);
 
         let seeded = backend.probe_input_devices(&mut state);
 
         assert_eq!(seeded, 0, "no-op probe seeds nothing");
         assert_eq!(
-            slave_pointer_name(&state),
+            xtest_pointer_name(&state),
             before,
             "device 4 unchanged when nothing to probe",
         );
     }
 
-    /// A backend whose startup probe enumerates a touchpad seeds the
-    /// XI2 registry: device 4 becomes the real touchpad BEFORE the
-    /// serve loop — the whole point of the Xorg-style startup probe.
+    /// A backend whose startup probe enumerates a touchpad seeds its
+    /// physical facet before the serve loop while keeping XTEST 4 intact.
     #[test]
     fn probe_input_devices_seeds_touchpad_before_loop() {
         use crate::backend::recording::RecordingBackend;
@@ -10818,18 +13149,40 @@ mod tests {
         backend.probe_rounds.push_back(vec![probe_touchpad_info()]);
 
         assert_ne!(
-            slave_pointer_name(&state),
+            xtest_pointer_name(&state),
             "SynPS/2 Synaptics TouchPad",
-            "precondition: device 4 starts as the generic slave pointer",
+            "precondition: device 4 starts as the virtual XTEST pointer",
         );
 
         let seeded = backend.probe_input_devices(&mut state);
 
         assert_eq!(seeded, 1, "exactly one device seeded");
         assert_eq!(
-            slave_pointer_name(&state),
-            "SynPS/2 Synaptics TouchPad",
-            "device 4 is the touchpad after the startup probe",
+            xtest_pointer_name(&state),
+            crate::xinput::registry::NAME_XTEST_POINTER,
+            "device 4 remains the virtual XTEST pointer after startup probe",
+        );
+        let physical_pointer = state
+            .xi_devices
+            .iter()
+            .find(|device| {
+                device.name == "SynPS/2 Synaptics TouchPad"
+                    && device.facet == Some(crate::xinput::XiFacetKind::PointerTouch)
+            })
+            .expect("startup probe registers a physical touchpad pointer facet");
+        assert!(physical_pointer.id >= 6, "physical facet IDs start at 6");
+        let tap_atom = state
+            .atoms
+            .id_for(crate::xinput::PROP_TAPPING_ENABLED)
+            .unwrap();
+        assert!(physical_pointer.properties.contains_key(&tap_atom));
+        assert!(
+            !state
+                .xi_devices
+                .device(crate::xinput::DEVICEID_XTEST_POINTER)
+                .unwrap()
+                .properties
+                .contains_key(&tap_atom)
         );
     }
 

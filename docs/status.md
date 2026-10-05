@@ -229,6 +229,20 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-10-02 dynamic XI device registry implemented (branch
+  `feat/xi-dynamic-registry-implementation`):** KMS/libinput publishes
+  source-owned keyboard, pointer, and touchpad facets with independent
+  properties; recognized property writes commit only after libinput confirms
+  them. XI1 and XI2 expose hotplug through presence and hierarchy notifications.
+  VT continuation preserves proven source identities and settings, and server
+  reset replays the current enabled and suspended inventory into a fresh XI
+  registry. Direct touch and a server-wide acceleration default are not
+  provided. `xinput set-prop 4 ...` targets the virtual XTEST pointer and
+  configures no physical device; use each physical device's own ID, as in the
+  [per-device acceleration loop](superpowers/specs/2026-09-29-dynamic-xinput-device-registry-design.md#mouse-acceleration-configuration).
+  Each physical device has its own `Device Enabled` state for `xinput disable`
+  and `xinput enable`. Hardware verification: see PR.
+
 - **2026-09-29 RANDR CRTC rotation and reflection (branch
   `feat/randr-rotation`):** SetCrtcConfig accepts modesetting's
   `rotations = 0x3f`; GetCrtcInfo and the three RANDR events carry the

@@ -538,7 +538,6 @@ yserver-mate-hw-trace log="warn":
 yserver-mate-hw-vkdebug log="trace":
     cargo build --bin yserver
     bash -c '\
-        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
         RUST_LOG="{{log}}" RUST_BACKTRACE=full \
             YSERVER_VK_VALIDATION=1 \
             VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation \
@@ -549,11 +548,10 @@ yserver-mate-hw-vkdebug log="trace":
         yserver_pid=$!;\
         sleep 2;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
-            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
+            XDG_SESSION_TYPE=x11 \
             dbus-run-session mate-session --display :7 > mate-vkdebug.log 2>&1;\
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;\
-        rm -rf "$xdg_rd" 2>/dev/null;\
         echo "yserver log: yserver-hw-mate-vkdebug.log";\
         echo "mate log:    mate-vkdebug.log";\
         echo "radv dumps:  ~/radv_dumps/ (if any)";'
@@ -903,7 +901,6 @@ yserver-e27-hw-telemetry log="info":
     cargo build --release --bin yserver
     rm -f yserver-e27.submit.tsv
     bash -c '\
-        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
@@ -913,13 +910,12 @@ yserver-e27-hw-telemetry log="info":
         yserver_pid=$!;\
         sleep 2;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET GDK_BACKEND=x11 \
-            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
+            XDG_SESSION_TYPE=x11 \
             DISPLAY=:7 enlightenment_start > e27-hw.log 2>&1 &\
         sleep 2;\
         DISPLAY=:7 wezterm ;\
         kill -TERM $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;\
-        rm -rf "$xdg_rd" 2>/dev/null;'
+        wait $yserver_pid 2>/dev/null;'
 
 # ============================== openbox ==============================
 
@@ -961,7 +957,6 @@ yserver-openbox-picom-xrender-hw-telemetry log="info":
     cargo build --release --bin yserver
     rm -f yserver-openbox-picom.submit.tsv
     bash -c '\
-        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
@@ -971,15 +966,41 @@ yserver-openbox-picom-xrender-hw-telemetry log="info":
         yserver_pid=$!;\
         sleep 2;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET GDK_BACKEND=x11 \
-            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
+            XDG_SESSION_TYPE=x11 \
             DISPLAY=:7 openbox > openbox-picom.log 2>&1 &\
         sleep 2;\
         DISPLAY=:7 picom --backend xrender --log-level warn --log-file picom.log > picom.out 2>&1 &\
         sleep 1;\
         DISPLAY=:7 wezterm ;\
         kill -TERM $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;\
-        rm -rf "$xdg_rd" 2>/dev/null;'
+        wait $yserver_pid 2>/dev/null;'
+
+# =========================== CDE ===================================
+yserver-cde-hw log="info":
+    cargo build --release --bin yserver
+    bash -c '\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11;\
+        export XDG_SESSION_TYPE=x11;\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-cde.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        env PATH=$PATH:/usr/dt/bin DISPLAY=:7 /usr/dt/bin/Xsession > cde.log 2>&1 ;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;'
+
+yserver-cde-hw-trace log="info":
+    cargo build --release --bin yserver
+    bash -c '\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11;\
+        export XDG_SESSION_TYPE=x11;\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-cde.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        env PATH=$PATH:/usr/dt/bin DISPLAY=:7 x11trace -n -k -o cde.xtrace /usr/dt/bin/Xsession > cde.log 2>&1 ;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;'
 
 # ============================== awesome ==============================
 
@@ -1059,11 +1080,10 @@ yserver-awesome-hw-audit log="info" interval="30" idle="5":
 # Long-run resource telemetry (vram / vram by use / gpu load / pixmap pool live) only, for
 # leaving a session up for a day; plain `log=info` recipes grow by GB/hour.
 # Contributors send the log (`gzip -k`), they don't read it. The last sample
-# is post-teardown (pool drained): read the floor from `grep -v 'entries=0'`.
+# is post-teardown; idle pool entries are trimmed after 60 s, so entries=0 mid-run is real.
 yserver-awesome-hw-resources:
     cargo build --release --bin yserver
     bash -c '\
-        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
@@ -1073,11 +1093,10 @@ yserver-awesome-hw-resources:
         yserver_pid=$!;\
         sleep 2;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET GDK_BACKEND=x11 \
-            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
+            XDG_SESSION_TYPE=x11 \
             DISPLAY=:7 awesome > awesome.log 2>&1 ;\
         kill -TERM $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;\
-        rm -rf "$xdg_rd" 2>/dev/null;'
+        wait $yserver_pid 2>/dev/null;'
 
 # Validation-layer session on yserver only (clients don't inherit it):
 # awesome + picom --backend glx + glxgears, stops itself after `seconds`.
@@ -1091,7 +1110,6 @@ yserver-awesome-hw-validation bin="target/release/yserver" label="current" secon
     if [ "{{bin}}" = "target/release/yserver" ]; then cargo build --release --bin yserver || exit 1; fi
     log="$PWD/yserver-validation-{{label}}.vk.log"
     rm -f "$log"
-    xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd"
     VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation \
     VK_KHRONOS_VALIDATION_DEBUG_ACTION=VK_DBG_LAYER_ACTION_LOG_MSG \
     VK_KHRONOS_VALIDATION_LOG_FILENAME="$log" \
@@ -1101,7 +1119,7 @@ yserver-awesome-hw-validation bin="target/release/yserver" label="current" secon
     ys=$!
     sleep 2
     unset WAYLAND_DISPLAY WAYLAND_SOCKET
-    export DISPLAY=:7 GDK_BACKEND=x11 XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd"
+    export DISPLAY=:7 GDK_BACKEND=x11 XDG_SESSION_TYPE=x11
     awesome > awesome.log 2>&1 & aw=$!
     sleep 2
     picom --backend glx > picom.log 2>&1 & pc=$!
@@ -1110,7 +1128,6 @@ yserver-awesome-hw-validation bin="target/release/yserver" label="current" secon
     sleep {{seconds}}
     kill -TERM $gg $pc $aw 2>/dev/null; wait $gg $pc $aw 2>/dev/null
     kill -TERM $ys 2>/dev/null; wait $ys 2>/dev/null
-    rm -rf "$xdg_rd"
     echo "== {{label}}: $log"
     if [ -f "$log" ]; then grep -oE '\[ [A-Za-z0-9_-]+ \]' "$log" | sort | uniq -c | sort -rn; else echo "   (no validation messages)"; fi
 
@@ -1140,7 +1157,6 @@ yserver-awesome-hw-telemetry log="info":
     cargo build --release --bin yserver
     rm -f yserver-awesome.submit.tsv
     bash -c '\
-        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
@@ -1150,11 +1166,10 @@ yserver-awesome-hw-telemetry log="info":
         yserver_pid=$!;\
         sleep 2;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET GDK_BACKEND=x11 \
-            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
+            XDG_SESSION_TYPE=x11 \
             DISPLAY=:7 awesome > awesome.log 2>&1 ;\
         kill -TERM $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;\
-        rm -rf "$xdg_rd" 2>/dev/null;'
+        wait $yserver_pid 2>/dev/null;'
 
 # Deterministic phased workload for damage-repaint before/after measurement.
 #
@@ -1183,7 +1198,6 @@ yserver-awesome-hw-telemetry log="info":
 yserver-awesome-hw-workload clip scale="1" log="warn,yserver::startup=info,yserver::kms::render::telemetry=info":
     RUSTFLAGS="-C debug-assertions=yes" cargo build --release --bin yserver
     bash -c '\
-        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11 XDG_SESSION_TYPE=x11;\
         YSERVER_LOOP_TELEMETRY=1 RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
@@ -1191,17 +1205,16 @@ yserver-awesome-hw-workload clip scale="1" log="warn,yserver::startup=info,yserv
         yserver_pid=$!;\
         sleep 2;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET GDK_BACKEND=x11 \
-            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
+            XDG_SESSION_TYPE=x11 \
             DISPLAY=:7 awesome > awesome.log 2>&1 &\
         awesome_pid=$!;\
         sleep 2;\
-        DISPLAY=:7 XDG_RUNTIME_DIR="$xdg_rd" \
+        DISPLAY=:7 \
             tools/damage-workload.sh "{{clip}}" damage-phases.log "{{scale}}" \
                 > damage-workload.log 2>&1;\
         kill -TERM $awesome_pid 2>/dev/null;\
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;\
-        rm -rf "$xdg_rd" 2>/dev/null;\
         echo "workload done: yserver-hw-awesome.log + damage-phases.log";\
         tail -5 damage-workload.log;\
         echo "read it with: tools/damage-phases.py yserver-hw-awesome.log damage-phases.log"'
@@ -1415,7 +1428,6 @@ yserver-fvwm3-hw-telemetry log="info":
     cargo build --release --bin yserver
     rm -f yserver-fvwm3.submit.tsv
     bash -c '\
-        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
@@ -1425,32 +1437,29 @@ yserver-fvwm3-hw-telemetry log="info":
         yserver_pid=$!;\
         sleep 2;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET GDK_BACKEND=x11 \
-            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
+            XDG_SESSION_TYPE=x11 \
             DISPLAY=:7 fvwm3 > fvwm3-hw.log 2>&1 &\
         sleep 1;\
         DISPLAY=:7 wezterm ;\
         kill -TERM $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;\
-        rm -rf "$xdg_rd" 2>/dev/null;'
+        wait $yserver_pid 2>/dev/null;'
 
 # ============================== WINDOW MAKER ==============================
 
 yserver-wmaker-xterm-hw log="info":
     cargo build --release --bin yserver
     bash -c '\
-        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
         YSERVER_SCENE_WALK_ALL=1 \
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-wmaker.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
-            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
+            XDG_SESSION_TYPE=x11 \
             wmaker > wmaker-hw.log 2>&1 &\
         sleep 2;\
         DISPLAY=:7 wezterm;\
         kill -TERM $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;\
-        rm -rf "$xdg_rd" 2>/dev/null;'
+        wait $yserver_pid 2>/dev/null;'
 
 # wmaker + wezterm on yserver with x11trace tunnelling. wmaker connects
 # to the fake display `:8`; x11trace forwards every request/event to
@@ -1463,7 +1472,6 @@ yserver-wmaker-xterm-hw-trace log="debug":
     cargo build --release --bin yserver
     rm -f wmaker.xtrace
     bash -c '\
-        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
         YSERVER_SCENE_WALK_ALL=1 \
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-wmaker.log 2>&1 &\
         yserver_pid=$!;\
@@ -1472,13 +1480,12 @@ yserver-wmaker-xterm-hw-trace log="debug":
         xtrace_pid=$!;\
         sleep 1;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:8 GDK_BACKEND=x11 \
-            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
+            XDG_SESSION_TYPE=x11 \
             wmaker > wmaker-hw.log 2>&1 &\
         sleep 2;\
         DISPLAY=:8 wezterm;\
         kill -TERM $xtrace_pid $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;\
-        rm -rf "$xdg_rd" 2>/dev/null;'
+        wait $yserver_pid 2>/dev/null;'
 
 # ============================== VNG SUITE ==============================
 

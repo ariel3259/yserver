@@ -21,6 +21,8 @@ pub const SERVER_OWNER: ClientId = ClientId(0);
 #[derive(Debug, Default)]
 pub struct ClientRemovedResources {
     pub closed_fonts: Vec<u32>,
+    /// Host pixmaps of the removed pixmap resources, plus those the removed
+    /// GCs held as clip mask / tile / stipple: candidates for the orphan gate.
     pub freed_pixmaps: Vec<u32>,
     /// One host backing per removed `NameWindowPixmap` name, NOT deduplicated: each owns a ref.
     pub freed_names: Vec<crate::backend::PixmapHandle>,
@@ -263,6 +265,9 @@ pub struct ResourceTable {
     dri3_syncobjs: HashMap<u32, ClientId>,
     /// Backings whose last freed name's alias ref waits for a background/border/GC release site.
     deferred_name_refs: HashSet<u32>,
+    /// Host cursors a window let go of (cursor change, destroy); drained by
+    /// [`Self::take_unreferenced_cursor_hosts`].
+    dropped_cursor_hosts: Vec<u32>,
 }
 
 impl Default for ResourceTable {
@@ -299,6 +304,7 @@ impl Default for ResourceTable {
                 do_not_propagate_mask: 0,
                 colormap: ROOT_COLORMAP,
                 cursor: None,
+                cursor_host: None,
                 owner: SERVER_OWNER,
                 properties: HashMap::new(),
                 host_xid: None,
@@ -397,6 +403,7 @@ impl Default for ResourceTable {
             colormaps,
             dri3_syncobjs: HashMap::new(),
             deferred_name_refs: HashSet::new(),
+            dropped_cursor_hosts: Vec::new(),
         }
     }
 }
@@ -683,6 +690,10 @@ impl ResourceTable {
                 Some(None) | None => parent.map_or(ROOT_COLORMAP, |p| p.colormap),
             },
             cursor: request.cursor,
+            cursor_host: request
+                .cursor
+                .filter(|c| c.0 != 0)
+                .and_then(|c| self.cursors.get(&c.0).and_then(|c| c.host_xid)),
             owner,
             properties: HashMap::new(),
             host_xid: None,
@@ -851,6 +862,9 @@ impl ResourceTable {
         if let Some(parent) = self.windows.get_mut(&window.parent.0) {
             parent.children.retain(|child| *child != id);
         }
+        if let Some(host) = window.cursor_host {
+            self.dropped_cursor_hosts.push(host.as_raw());
+        }
         destroyed.push(id);
         for child in window.children {
             self.destroy_window_inner(child, destroyed);
@@ -987,6 +1001,13 @@ impl ResourceTable {
             }
             if let Some(cursor) = request.cursor {
                 window.cursor = Some(cursor);
+                let host = (cursor.0 != 0)
+                    .then(|| self.cursors.get(&cursor.0).and_then(|c| c.host_xid))
+                    .flatten();
+                if let Some(old) = window.cursor_host.filter(|old| Some(*old) != host) {
+                    self.dropped_cursor_hosts.push(old.as_raw());
+                }
+                window.cursor_host = host;
             }
         }
 
@@ -2223,7 +2244,15 @@ impl ResourceTable {
     /// (`dix/dispatch.c:1580`) emits BadGC via `dixLookupGC` before
     /// any state mutation — yserver mirrors that with the handler-
     /// side check + `get_mut` here.
-    pub fn change_gc(&mut self, _requester: ClientId, request: GcChange) {
+    ///
+    /// Returns the host pixmaps the change displaced from the GC, for the
+    /// caller's orphan gate (Xorg drops the GC's ref on the old tile /
+    /// stipple at `dix/gc.c:256`/`:273`).
+    pub fn change_gc(
+        &mut self,
+        _requester: ClientId,
+        request: GcChange,
+    ) -> Vec<crate::backend::PixmapHandle> {
         let clip_pixmap_host_xid = request
             .clip_mask
             .flatten()
@@ -2238,8 +2267,9 @@ impl ResourceTable {
             .and_then(|pixmap| self.pixmaps.get(&pixmap.0))
             .and_then(|p| p.host_xid);
         let Some(gc) = self.gcs.get_mut(&request.gc.0) else {
-            return;
+            return Vec::new();
         };
+        let before = gc.held_host_pixmaps();
         Self::apply_gc_change(
             gc,
             GcChangeView {
@@ -2277,6 +2307,7 @@ impl ResourceTable {
         if request.stipple.is_some() {
             gc.stipple_host_xid = stipple_host_xid;
         }
+        Gc::displaced(before, gc.held_host_pixmaps())
     }
 
     /// Apply the `Some`-valued attributes of a CreateGC / ChangeGC
@@ -2399,10 +2430,16 @@ impl ResourceTable {
     /// SetClipRectangles — silent no-op if `request.gc` is unknown
     /// (caller MUST have BadGC-gated; Xorg's `ProcSetClipRectangles`
     /// (`dix/dispatch.c:1651`) emits BadGC via `dixLookupGC` first).
-    pub fn set_clip_rectangles(&mut self, _requester: ClientId, request: SetClipRectanglesRequest) {
+    /// Returns the clip-mask host pixmap it displaced, as [`Self::change_gc`].
+    pub fn set_clip_rectangles(
+        &mut self,
+        _requester: ClientId,
+        request: SetClipRectanglesRequest,
+    ) -> Vec<crate::backend::PixmapHandle> {
         let Some(gc) = self.gcs.get_mut(&request.gc.0) else {
-            return;
+            return Vec::new();
         };
+        let before = gc.held_host_pixmaps();
         // SetClipRectangles supersedes any prior clip-mask pixmap, and its
         // origin is the GC's clip origin (`SetClipRects`, `dix/gc.c:1021`):
         // a later ChangeGC of the origin moves the same rectangles.
@@ -2411,6 +2448,7 @@ impl ResourceTable {
         gc.clip_x_origin = request.clip.x_origin;
         gc.clip_y_origin = request.clip.y_origin;
         gc.clip_rectangles = Some(request.clip);
+        Gc::displaced(before, gc.held_host_pixmaps())
     }
 
     /// The GC's clip origin alone, as XFixesSetGCClipRegion sets it even
@@ -2422,24 +2460,36 @@ impl ResourceTable {
         }
     }
 
-    pub fn clear_gc_clip(&mut self, gc: ResourceId) {
-        if let Some(g) = self.gcs.get_mut(&gc.0) {
-            g.clip_rectangles = None;
-            g.clip_pixmap = None;
-            g.clip_pixmap_host_xid = None;
-        }
+    /// Returns the clip-mask host pixmap it displaced, as [`Self::change_gc`].
+    pub fn clear_gc_clip(&mut self, gc: ResourceId) -> Vec<crate::backend::PixmapHandle> {
+        let Some(g) = self.gcs.get_mut(&gc.0) else {
+            return Vec::new();
+        };
+        let before = g.held_host_pixmaps();
+        g.clip_rectangles = None;
+        g.clip_pixmap = None;
+        g.clip_pixmap_host_xid = None;
+        Gc::displaced(before, g.held_host_pixmaps())
     }
 
-    pub fn copy_gc(&mut self, src: ResourceId, dst: ResourceId, value_mask: u32) {
+    /// Returns the host pixmaps copied over in `dst`, as [`Self::change_gc`]
+    /// (Xorg `CopyGC` drops the old tile / stipple, `dix/gc.c:673`/`:685`).
+    pub fn copy_gc(
+        &mut self,
+        src: ResourceId,
+        dst: ResourceId,
+        value_mask: u32,
+    ) -> Vec<crate::backend::PixmapHandle> {
         // Snapshot the source GC under the immutable borrow so we can
         // then take a mutable borrow of dst. Cheap because the only
         // owned field copied here is `dashes`.
         let Some(src_gc) = self.gcs.get(&src.0).cloned() else {
-            return;
+            return Vec::new();
         };
         let Some(dst_gc) = self.gcs.get_mut(&dst.0) else {
-            return;
+            return Vec::new();
         };
+        let before = dst_gc.held_host_pixmaps();
         if value_mask & 0x0000_0001 != 0 {
             dst_gc.function = src_gc.function;
         }
@@ -2517,10 +2567,15 @@ impl ResourceTable {
         if value_mask & 0x0040_0000 != 0 {
             dst_gc.arc_mode = src_gc.arc_mode;
         }
+        Gc::displaced(before, dst_gc.held_host_pixmaps())
     }
 
-    pub fn free_gc(&mut self, id: ResourceId) {
-        self.gcs.remove(&id.0);
+    /// Returns the host pixmaps the GC held (Xorg `FreeGC`, `dix/gc.c:776-781`).
+    pub fn free_gc(&mut self, id: ResourceId) -> Vec<crate::backend::PixmapHandle> {
+        self.gcs
+            .remove(&id.0)
+            .map(|gc| Gc::displaced(gc.held_host_pixmaps(), [None; 3]))
+            .unwrap_or_default()
     }
 
     pub fn gc(&self, id: ResourceId) -> Option<&Gc> {
@@ -2919,15 +2974,35 @@ impl ResourceTable {
             }
         }
         self.cursor_host_names.remove(&old_host);
+        for w in self.windows.values_mut() {
+            if w.cursor_host.map(|h| h.as_raw()) == Some(old_host) {
+                w.cursor_host = src.host_xid;
+            }
+        }
         changed
     }
 
-    /// True iff some cursor XID still refers to host cursor `host`.
+    /// True iff some cursor XID or some window's cursor attribute still
+    /// refers to host cursor `host` (Xorg `pCurs->refcnt`).
     #[must_use]
     pub fn cursor_host_referenced(&self, host: u32) -> bool {
         self.cursors
             .values()
             .any(|c| c.host_xid.map(|h| h.as_raw()) == Some(host))
+            || self
+                .windows
+                .values()
+                .any(|w| w.cursor_host.map(|h| h.as_raw()) == Some(host))
+    }
+
+    /// Host cursors a window dropped since the last call that nothing
+    /// references any more: the caller frees each on the backend, once.
+    pub fn take_unreferenced_cursor_hosts(&mut self) -> Vec<u32> {
+        let mut hosts = std::mem::take(&mut self.dropped_cursor_hosts);
+        hosts.sort_unstable();
+        hosts.dedup();
+        hosts.retain(|&host| !self.cursor_host_referenced(host));
+        hosts
     }
 
     /// Remove a cursor from the table and return its host XID when this
@@ -2940,9 +3015,19 @@ impl ResourceTable {
     pub fn free_cursor(&mut self, id: ResourceId) -> Option<u32> {
         let host_xid = self.cursors.get(&id.0).and_then(|c| c.host_xid);
         self.cursors.remove(&id.0);
-        host_xid
+        let freed = host_xid
             .map(|h| h.as_raw())
-            .filter(|host| !self.cursor_host_referenced(*host))
+            .filter(|host| !self.cursor_host_referenced(*host));
+        if let Some(host) = freed {
+            self.cursor_host_released(host);
+        }
+        freed
+    }
+
+    /// The caller frees host cursor `host` itself: no pending window drop
+    /// may free it again.
+    pub fn cursor_host_released(&mut self, host: u32) {
+        self.dropped_cursor_hosts.retain(|&h| h != host);
     }
 
     /// Mark a cursor as animated (RENDER CreateAnimCursor product).
@@ -3015,7 +3100,18 @@ impl ResourceTable {
         if !name_ids.is_empty() {
             self.forget_composite_names(&name_ids);
         }
-        self.gcs.retain(|_, g| g.owner != client);
+        self.gcs.retain(|_, g| {
+            if g.owner != client {
+                return true;
+            }
+            freed_pixmaps.extend(
+                g.held_host_pixmaps()
+                    .into_iter()
+                    .flatten()
+                    .map(crate::backend::PixmapHandle::as_raw),
+            );
+            false
+        });
         let mut freed_colormaps = Vec::new();
         self.colormaps.retain(|_, c| {
             if c.owner == client {
@@ -3043,6 +3139,8 @@ impl ResourceTable {
         freed_cursors.sort_unstable();
         freed_cursors.dedup();
         freed_cursors.retain(|host| !self.cursor_host_referenced(*host));
+        self.dropped_cursor_hosts
+            .retain(|host| !freed_cursors.contains(host));
         let mut closed_fonts = Vec::new();
         self.fonts.retain(|_, f| {
             if f.owner == client {
@@ -3343,6 +3441,10 @@ pub struct Window {
     pub do_not_propagate_mask: u16,
     pub colormap: ResourceId,
     pub cursor: Option<ResourceId>,
+    /// Host cursor `cursor` named when it was set. The window holds it
+    /// (Xorg `pCurs->refcnt`, `dix/window.c:1536`) after its XID is freed,
+    /// so a freed cursor stays this window's until the window drops it.
+    pub cursor_host: Option<crate::backend::CursorHandle>,
     pub owner: ClientId,
     pub properties: HashMap<AtomId, PropertyValue>,
     pub host_xid: Option<crate::backend::WindowHandle>,
@@ -3506,6 +3608,7 @@ impl Window {
             do_not_propagate_mask: 0,
             colormap: ROOT_COLORMAP,
             cursor: None,
+            cursor_host: None,
             owner: SERVER_OWNER,
             properties: HashMap::new(),
             host_xid: None,
@@ -3633,6 +3736,32 @@ pub struct Gc {
     pub dash_offset: i16,
     pub arc_mode: ArcMode,
     pub owner: ClientId,
+}
+
+impl Gc {
+    /// Host pixmaps this GC keeps alive: clip mask, tile, stipple.
+    fn held_host_pixmaps(&self) -> [Option<crate::backend::PixmapHandle>; 3] {
+        [
+            self.clip_pixmap_host_xid,
+            self.tile_host_xid,
+            self.stipple_host_xid,
+        ]
+    }
+
+    /// Handles in `before` that `after` no longer holds, deduplicated.
+    fn displaced(
+        before: [Option<crate::backend::PixmapHandle>; 3],
+        after: [Option<crate::backend::PixmapHandle>; 3],
+    ) -> Vec<crate::backend::PixmapHandle> {
+        let mut out: Vec<_> = before
+            .into_iter()
+            .flatten()
+            .filter(|h| !after.contains(&Some(*h)))
+            .collect();
+        out.sort_unstable_by_key(|h| h.as_raw());
+        out.dedup();
+        out
+    }
 }
 
 /// Internal projection of CreateGC / ChangeGC's value-list onto a

@@ -92,6 +92,7 @@ impl Backend for HostX11Backend {
         match ev {
             HostInputEvent::Key(raw) | HostInputEvent::KeyRepeat(raw) => {
                 self.push_pending_host_event(HostEvent::Key(HostKeyEvent {
+                    origin: raw.origin,
                     pressed: raw.pressed,
                     keycode: raw.keycode,
                     time: raw.time,
@@ -102,8 +103,15 @@ impl Backend for HostX11Backend {
                     state: raw.state,
                 }));
             }
-            HostInputEvent::PointerMotion { x, y, time, .. } => {
+            HostInputEvent::PointerMotion {
+                origin, x, y, time, ..
+            } => {
                 self.push_pending_host_event(HostEvent::Pointer(HostPointerEvent {
+                    // XTEST selects its virtual device with GetXTestDevice
+                    // (Xext/xtest.c:351); preserve that source ID through
+                    // nested host fanout. Physical nested input arrives as
+                    // NestedHost on the same path.
+                    origin,
                     kind: PointerEventKind::MotionNotify,
                     host_xid: container,
                     detail: 0,
@@ -129,23 +137,26 @@ impl Backend for HostX11Backend {
             // has no XI2 smooth-scroll valuators to signal one. No-op.
             HostInputEvent::PointerScrollStop { .. } => {}
             HostInputEvent::PointerButton {
+                origin,
                 button,
                 pressed,
                 time,
+                ..
             } => {
                 // `button` is a Linux input code (BTN_LEFT = 0x110, …).
                 // Translate to X11 button numbers — same mapping as
                 // `KmsBackend::process_pointer_button`.
                 let detail = match button {
-                    0x110 => 1, // BTN_LEFT
-                    0x111 => 3, // BTN_RIGHT
-                    0x112 => 2, // BTN_MIDDLE
-                    0x113 => 8, // BTN_SIDE
-                    0x114 => 9, // BTN_EXTRA
-                    0x180 => 4, // SYNTH_SCROLL_UP
-                    0x181 => 5, // SYNTH_SCROLL_DOWN
-                    0x182 => 6, // SYNTH_SCROLL_LEFT
-                    0x183 => 7, // SYNTH_SCROLL_RIGHT
+                    0x110 => 1,  // BTN_LEFT
+                    0x111 => 3,  // BTN_RIGHT
+                    0x112 => 2,  // BTN_MIDDLE
+                    0x113 => 8,  // BTN_SIDE
+                    0x114 => 9,  // BTN_EXTRA
+                    0x115 => 10, // BTN_FORWARD -> X 10 via btn_linux2xorg (xf86-input-libinput/src/xf86libinput.c:253-272)
+                    0x180 => 4,  // SYNTH_SCROLL_UP
+                    0x181 => 5,  // SYNTH_SCROLL_DOWN
+                    0x182 => 6,  // SYNTH_SCROLL_LEFT
+                    0x183 => 7,  // SYNTH_SCROLL_RIGHT
                     _ => {
                         log::debug!(
                             "ynest: dropping HostInputEvent::PointerButton for unknown linux code 0x{button:x}"
@@ -159,6 +170,7 @@ impl Backend for HostX11Backend {
                     PointerEventKind::ButtonRelease
                 };
                 self.push_pending_host_event(HostEvent::Pointer(HostPointerEvent {
+                    origin,
                     kind,
                     host_xid: container,
                     detail,
@@ -177,7 +189,10 @@ impl Backend for HostX11Backend {
             }
             // Device add/remove are plumbing-only in the host-X11 backend;
             // the nested backend has no XI2 device registry of its own.
-            HostInputEvent::DeviceAdded(_) | HostInputEvent::DeviceRemoved { .. } => {}
+            HostInputEvent::DeviceAdded(_)
+            | HostInputEvent::DeviceSuspended { .. }
+            | HostInputEvent::DeviceResumed(_)
+            | HostInputEvent::DeviceRemoved { .. } => {}
         }
     }
 
