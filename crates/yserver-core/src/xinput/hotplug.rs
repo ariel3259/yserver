@@ -27,9 +27,10 @@ pub enum DevicePresenceChange {
 }
 
 /// Emit an XI1 `DevicePresenceNotify` for one physical facet. Device 256's
-/// `_devicePresence` class is a global selection, retained canonically per
-/// window and aggregated on `xi1_event_classes` like other server-wide XI1
-/// notifications.
+/// `_devicePresence` class is selected on a window. Xorg's
+/// `SendEventToAllWindows` walks the root and descendants and tests each
+/// window's selection (`Xi/selectev.c:69-111,141-180`,
+/// `Xi/exevents.c:3279-3312`, `dix/devices.c:333-346`).
 pub fn emit_xi1_device_presence(
     state: &mut ServerState,
     id: u16,
@@ -38,14 +39,18 @@ pub fn emit_xi1_device_presence(
     if !(6..=127).contains(&id) {
         return Vec::new();
     }
-    let targets: Vec<ClientId> = state
+    let targets: Vec<(ClientId, ResourceId)> = state
         .clients
         .iter()
-        .filter_map(|(client_id, client)| {
+        .flat_map(|(client_id, client)| {
             client
-                .xi1_event_classes
-                .contains(&super::XI1_DEVICE_PRESENCE_CLASS)
-                .then_some(ClientId(*client_id))
+                .xi1_window_event_classes
+                .iter()
+                .filter_map(move |(window, classes)| {
+                    classes
+                        .contains(&super::XI1_DEVICE_PRESENCE_CLASS)
+                        .then_some((ClientId(*client_id), *window))
+                })
         })
         .collect();
     if targets.is_empty() {
@@ -54,17 +59,32 @@ pub fn emit_xi1_device_presence(
 
     let time = state.timestamp_now();
     let device_id = u8::try_from(id).expect("physical XI device ids fit in one byte");
-    crate::core_loop::fanout::fanout_event_to_clients(state, &targets, |buf, sequence, order| {
-        x11::encode_xi1_device_presence_notify_event(
-            buf,
-            order,
-            sequence,
-            XI1_DEVICE_PRESENCE_EVENT_TYPE,
-            time,
-            change as u8,
-            device_id,
+    let mut disconnected = HashSet::new();
+    for (client_id, _selected_window) in targets {
+        if disconnected.contains(&client_id.0) {
+            continue;
+        }
+        disconnected.extend(
+            crate::core_loop::fanout::fanout_event_to_clients(
+                state,
+                std::slice::from_ref(&client_id),
+                |buf, sequence, order| {
+                    x11::encode_xi1_device_presence_notify_event(
+                        buf,
+                        order,
+                        sequence,
+                        XI1_DEVICE_PRESENCE_EVENT_TYPE,
+                        time,
+                        change as u8,
+                        device_id,
+                    );
+                },
+            )
+            .into_iter()
+            .map(|client| client.0),
         );
-    })
+    }
+    disconnected.into_iter().map(ClientId).collect()
 }
 
 /// Store and publish one `Device Enabled` change through the same property
@@ -297,7 +317,10 @@ impl XiHierarchyStep {
     }
 }
 
-/// Publish one XI2 hierarchy step to clients selecting it on XIAllDevices.
+/// Publish one XI2 hierarchy step to every window selecting it on
+/// XIAllDevices. Xorg tests selection at each root/descendant window during
+/// `SendEventToAllWindows` (`Xi/xichangehierarchy.c:119`,
+/// `Xi/exevents.c:3279-3312`).
 ///
 /// The event contains every currently live device, with flags set only on
 /// `changed_ids`. A removal event additionally appends the removed facet
@@ -367,17 +390,17 @@ pub fn emit_xi_hierarchy_changed(
         });
     }
 
-    let targets: Vec<ClientId> = state
+    let targets: Vec<(ClientId, ResourceId)> = state
         .clients
         .iter()
-        .filter_map(|(id, client)| {
+        .flat_map(|(id, client)| {
             client
                 .xi2_masks
                 .iter()
-                .any(|((_, device_id), mask)| {
-                    *device_id == 0 && (mask & XI_HIERARCHY_CHANGED_MASK_WIDE) != 0
+                .filter_map(move |(&(window, device_id), &mask)| {
+                    (device_id == 0 && (mask & XI_HIERARCHY_CHANGED_MASK_WIDE) != 0)
+                        .then_some((ClientId(*id), window))
                 })
-                .then_some(ClientId(*id))
         })
         .collect();
     if targets.is_empty() {
@@ -385,16 +408,31 @@ pub fn emit_xi_hierarchy_changed(
     }
 
     let time = state.timestamp_now();
-    fanout_event_to_clients(state, &targets, |buf, sequence, byte_order| {
-        x11::encode_xi2_hierarchy_changed_event(
-            buf,
-            byte_order,
-            sequence,
-            XI2_MAJOR_OPCODE,
-            time,
-            &infos,
+    let mut disconnected = HashSet::new();
+    for (client_id, _selected_window) in targets {
+        if disconnected.contains(&client_id.0) {
+            continue;
+        }
+        disconnected.extend(
+            fanout_event_to_clients(
+                state,
+                std::slice::from_ref(&client_id),
+                |buf, sequence, order| {
+                    x11::encode_xi2_hierarchy_changed_event(
+                        buf,
+                        order,
+                        sequence,
+                        XI2_MAJOR_OPCODE,
+                        time,
+                        &infos,
+                    );
+                },
+            )
+            .into_iter()
+            .map(|client| client.0),
         );
-    })
+    }
+    disconnected.into_iter().map(ClientId).collect()
 }
 
 /// Capture one live hierarchy descriptor for the lifecycle publisher to pass

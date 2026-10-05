@@ -31894,6 +31894,279 @@ mod tests {
     }
 
     #[test]
+    fn xi_hotplug_per_window_host_lifecycle_delivers_each_window_copy() {
+        use yserver_core::{
+            backend::Backend,
+            core_loop::{HostInputEvent, process_disconnect::process_disconnect, process_request},
+            resources::ROOT_WINDOW,
+            server::ServerState,
+            xinput::{
+                InputSourceId, XI1_DEVICE_PRESENCE_CLASS, XI2_HIERARCHY_CHANGED_MASK, XiFacetKind,
+            },
+        };
+        use yserver_protocol::x11::{ClientId, RequestHeader, ResourceId, SequenceNumber};
+
+        const CLIENT_A: u32 = 5;
+        const CLIENT_B: u32 = 6;
+        const SOURCE: InputSourceId = InputSourceId(0xA11CE);
+        let child = ResourceId(0x10_0A11);
+
+        #[derive(Debug, PartialEq)]
+        struct Xi1InputStateSnapshot {
+            device: u16,
+            keys_down: [u8; 32],
+            buttons_down: [u8; 32],
+            valuator_mode: u8,
+            valuators: [i32; 4],
+        }
+
+        fn dispatch(
+            state: &mut ServerState,
+            backend: &mut KmsBackend,
+            client: u32,
+            sequence: u16,
+            opcode: u8,
+            data: u8,
+            body: &[u8],
+        ) {
+            let outcome = process_request::process_request(
+                state,
+                backend,
+                ClientId(client),
+                SequenceNumber(sequence),
+                RequestHeader {
+                    opcode,
+                    data,
+                    length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+                },
+                body,
+                None,
+            )
+            .expect("request passes through the core dispatcher");
+            assert!(
+                matches!(outcome, process_request::RequestOutcome::Handled),
+                "request outcome: {outcome:?}"
+            );
+        }
+
+        fn xi1_device_input_snapshot(state: &ServerState) -> Vec<Xi1InputStateSnapshot> {
+            let mut snapshot = state
+                .xi1_device_input_state
+                .iter()
+                .map(|(device, input)| Xi1InputStateSnapshot {
+                    device: *device,
+                    keys_down: input.keys_down,
+                    buttons_down: input.buttons_down,
+                    valuator_mode: input.valuator_mode,
+                    valuators: input.valuators,
+                })
+                .collect::<Vec<_>>();
+            snapshot.sort_unstable_by_key(|input| input.device);
+            snapshot
+        }
+
+        fn select_hierarchy(
+            state: &mut ServerState,
+            backend: &mut KmsBackend,
+            client: u32,
+            sequence: u16,
+            window: ResourceId,
+        ) {
+            let mut body = Vec::with_capacity(16);
+            body.extend_from_slice(&window.0.to_le_bytes());
+            body.extend_from_slice(&1u16.to_le_bytes()); // one mask
+            body.extend_from_slice(&[0; 2]);
+            body.extend_from_slice(&0u16.to_le_bytes()); // XIAllDevices
+            body.extend_from_slice(&1u16.to_le_bytes()); // one 32-bit mask word
+            body.extend_from_slice(&XI2_HIERARCHY_CHANGED_MASK.to_le_bytes());
+            dispatch(state, backend, client, sequence, 137, 46, &body);
+        }
+
+        fn select_presence(
+            state: &mut ServerState,
+            backend: &mut KmsBackend,
+            client: u32,
+            sequence: u16,
+            window: ResourceId,
+        ) {
+            let mut body = Vec::with_capacity(12);
+            body.extend_from_slice(&window.0.to_le_bytes());
+            body.extend_from_slice(&1u16.to_le_bytes()); // one event class
+            body.extend_from_slice(&[0; 2]);
+            body.extend_from_slice(&XI1_DEVICE_PRESENCE_CLASS.to_le_bytes());
+            dispatch(state, backend, client, sequence, 137, 6, &body);
+        }
+
+        fn event_copies(bytes: &[u8], presence: bool) -> Vec<&[u8]> {
+            let mut found = Vec::new();
+            let mut offset = 0;
+            while offset < bytes.len() {
+                assert!(offset + 32 <= bytes.len(), "complete event header");
+                let generic = bytes[offset] == 35;
+                let event_len = if generic {
+                    let units =
+                        u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap())
+                            as usize;
+                    32 + units * 4
+                } else {
+                    32
+                };
+                assert!(offset + event_len <= bytes.len(), "complete event body");
+                let matches = if presence {
+                    bytes[offset] & 0x7f == 81 // XI_FIRST_EVENT 66 + DevicePresenceNotify 15
+                } else {
+                    generic
+                        && u16::from_le_bytes([bytes[offset + 8], bytes[offset + 9]])
+                            == u16::try_from(yserver_core::xinput::XI2_HIERARCHY_CHANGED_EVENT_TYPE)
+                                .unwrap()
+                };
+                if matches {
+                    found.push(&bytes[offset..offset + event_len]);
+                }
+                offset += event_len;
+            }
+            found
+        }
+
+        fn assert_per_window_copies(bytes: &[u8], expected: usize, presence: bool) {
+            let copies = event_copies(bytes, presence);
+            assert_eq!(
+                copies.len(),
+                expected,
+                "one copy for each selected window; presence={presence}; wire={bytes:02x?}"
+            );
+            if copies.len() == 2 {
+                assert_eq!(copies[0], copies[1], "wire copies have no window field");
+            }
+        }
+
+        // Mutation killed: make either lifecycle emitter deduplicate targets per client.
+        // Xorg delivers separately to each selected window, including descendants
+        // (Xi/exevents.c:3279-3312; Xi/xichangehierarchy.c:119; dix/devices.c:333-346).
+        let mut state = ServerState::new();
+        let mut backend = KmsBackend::for_tests();
+        backend
+            .core
+            .xid_map
+            .insert(backend.core.window_id, ROOT_WINDOW);
+        let mut peer_a = kbd_map_client_id(&mut state, CLIENT_A);
+        let mut peer_b = kbd_map_client_id(&mut state, CLIENT_B);
+        let initial_devices = state
+            .xi_devices
+            .devices()
+            .iter()
+            .map(|device| {
+                (
+                    device.id,
+                    device.source_id,
+                    device.facet,
+                    device.enabled,
+                    device.attached_master,
+                    device.buttons_down,
+                    device.properties.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let initial_keys_down = state.keys_down;
+        let initial_buttons_down = state.buttons_down;
+        let initial_key_down_by_device = state.key_down_by_device.clone();
+        let initial_xi1_device_input_state = xi1_device_input_snapshot(&state);
+        let initial_detached_masters = state.xi2_detached_masters.clone();
+        let initial_floating_pointer_positions = state.floating_pointer_positions.clone();
+        let mut create = Vec::with_capacity(28);
+        create.extend_from_slice(&child.0.to_le_bytes());
+        create.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        create.extend_from_slice(&0i16.to_le_bytes());
+        create.extend_from_slice(&0i16.to_le_bytes());
+        create.extend_from_slice(&32u16.to_le_bytes());
+        create.extend_from_slice(&32u16.to_le_bytes());
+        create.extend_from_slice(&0u16.to_le_bytes());
+        create.extend_from_slice(&0u16.to_le_bytes());
+        create.extend_from_slice(&0u32.to_le_bytes());
+        create.extend_from_slice(&0u32.to_le_bytes());
+        dispatch(&mut state, &mut backend, CLIENT_A, 1, 1, 0, &create);
+        select_hierarchy(&mut state, &mut backend, CLIENT_A, 2, ROOT_WINDOW);
+        select_hierarchy(&mut state, &mut backend, CLIENT_A, 3, child);
+        select_hierarchy(&mut state, &mut backend, CLIENT_B, 1, ROOT_WINDOW);
+        select_presence(&mut state, &mut backend, CLIENT_A, 4, ROOT_WINDOW);
+        select_presence(&mut state, &mut backend, CLIENT_A, 5, child);
+        select_presence(&mut state, &mut backend, CLIENT_B, 2, ROOT_WINDOW);
+        assert!(kbd_map_drain(&mut peer_a).is_empty());
+        assert!(kbd_map_drain(&mut peer_b).is_empty());
+
+        let mut info = dynamic_test_device(SOURCE, true, false);
+        info.enabled = false;
+        Backend::on_host_input(&mut backend, &mut state, HostInputEvent::DeviceAdded(info));
+        let added_a = kbd_map_drain(&mut peer_a);
+        let added_b = kbd_map_drain(&mut peer_b);
+        for (bytes, expected) in [(&added_a, 2), (&added_b, 1)] {
+            assert_per_window_copies(bytes, expected, true);
+            assert_per_window_copies(bytes, expected, false);
+        }
+        assert!(
+            state
+                .xi_devices
+                .facet(SOURCE, XiFacetKind::Keyboard)
+                .is_some()
+        );
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceRemoved { source_id: SOURCE },
+        );
+        let removed_a = kbd_map_drain(&mut peer_a);
+        let removed_b = kbd_map_drain(&mut peer_b);
+        for (bytes, expected) in [(&removed_a, 2), (&removed_b, 1)] {
+            assert_per_window_copies(bytes, expected, true);
+            assert_per_window_copies(bytes, expected, false);
+        }
+        assert!(state.xi_devices.source_ids().is_empty());
+
+        process_disconnect(&mut state, &mut backend, ClientId(CLIENT_A));
+        process_disconnect(&mut state, &mut backend, ClientId(CLIENT_B));
+        assert!(state.clients.is_empty(), "all selections are released");
+        assert!(
+            state.resources.window(child).is_none(),
+            "child window is released"
+        );
+        assert_eq!(state.selections, Default::default());
+        assert_eq!(state.xi_devices.source_ids(), Vec::<InputSourceId>::new());
+        assert_eq!(
+            state
+                .xi_devices
+                .devices()
+                .iter()
+                .map(|device| {
+                    (
+                        device.id,
+                        device.source_id,
+                        device.facet,
+                        device.enabled,
+                        device.attached_master,
+                        device.buttons_down,
+                        device.properties.clone(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            initial_devices,
+            "registry entries and property maps return to their pre-hotplug state"
+        );
+        assert_eq!(state.keys_down, initial_keys_down);
+        assert_eq!(state.buttons_down, initial_buttons_down);
+        assert_eq!(state.key_down_by_device, initial_key_down_by_device);
+        assert_eq!(
+            xi1_device_input_snapshot(&state),
+            initial_xi1_device_input_state
+        );
+        assert_eq!(state.xi2_detached_masters, initial_detached_masters);
+        assert_eq!(
+            state.floating_pointer_positions,
+            initial_floating_pointer_positions
+        );
+    }
+
+    #[test]
     fn xi2_dynamic_hotplug_publishes_atomic_hierarchy_steps() {
         use std::{
             collections::{HashMap, HashSet, VecDeque},
