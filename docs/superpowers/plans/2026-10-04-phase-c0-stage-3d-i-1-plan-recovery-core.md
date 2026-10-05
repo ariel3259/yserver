@@ -8,6 +8,13 @@
 > prompt; the coordinator re-runs them before each commit. Every other `c0_hw_*`, `_drm` or
 > `render_acceptance` test stays forbidden. No git writes.
 
+**Revision 5 (2026-10-04, coordinator) — implementation stop on Task 3, confirmed:** Task 3 asks for
+connector rediscovery on the fresh incarnation, but the only production rediscovery route
+(`platform_init` → `discover_outputs`) reaches `GETCONNECTOR(force)` on the core, and the off-core probe
+move was assigned to Task 5 only. Fix: the off-core rediscovery mechanism moves into Task 3 (the
+device-scoped request on 3c-ii's probe worker); Task 5 reuses it for the acquire preparation. No design
+change: decision 4 already names that worker as the route.
+
 **Revision 4 (2026-10-04, coordinator) — implementation stop on Task 1, confirmed:** the registry's
 family-closure mint does not hold the last reference to the DRM device — `DeviceCleanupIo` keeps an `Rc`
 clone (`drm_cleanup.rs` ~265), `KmsDevice.device` keeps one (`platform.rs` ~2544) and stays in `poll_fds` —
@@ -183,12 +190,19 @@ task can test the state machine before Tasks 3–4 deliver the real reopen.
 **Deliver:** decision 3 — the shared open path, the new entry (`IncarnationId::next`, executor, owner,
 property/connector rediscovery, clock probe), the old entry's objects moved into the transition's
 quarantine. The open happens only with the barrier ready and the transition id/epoch current.
+The open itself (`Device::open`, master, atomic caps) and non-forcing property reads may run on the core;
+**connector rediscovery may not.** Task 3 delivers the device-scoped rediscovery request: a 3c-ii probe
+worker for the **new** incarnation (its fd dup registered as a lease on the new `IncarnationFdSet`, joined
+on return), the result tagged with incarnation and transition id/epoch and consumed on the core; a stale or
+superseded result is discarded and its worker still joined. Startup's synchronous `discover_outputs` is not
+reused on this path. Task 5 routes the acquire preparation through this same request.
 
 | Test | Scenario | Must fail under |
 | --- | --- | --- |
 | `c0_3di_reopen_waits_for_the_barrier_vulkan` | poisoned with a lease outstanding: no open is attempted until it is released | open on termination request |
 | `c0_3di_fresh_incarnation_identity_vulkan` | after reopen: a new `IncarnationId`, a new executor and owner, the old ones in quarantine; a result tagged with the old incarnation is stale | reuse the old `IncarnationId` |
 | `c0_3di_stale_transition_cannot_open_vulkan` | a VT release supersedes the attempt between barrier and open: no open | skip the id/epoch check before open |
+| `c0_3di_rediscovery_probe_is_off_the_core_vulkan` | the new incarnation's rediscovery prober is blocked: the core keeps serving requests and deadlines; a VT release supersedes the attempt; the late answer is discarded and its worker joined | run `discover_outputs` / `get_connector(..., true)` on the core |
 
 **Hardware (M-2):** `c0_hw_3di_reopen_fresh_incarnation_on_card1_drm` — after Task 1's poison on card1,
 the barrier releases and the device is reopened: the new fd holds DRM master, a new executor answers a
@@ -212,7 +226,7 @@ service).
 
 **Deliver:** decision 4's first half. `lifecycle_prepare_acquire_topology` no longer calls
 `get_connector(..., true)` on the core: the forced discovery for the incarnation being installed runs on
-the 3c-ii probe worker (lease on the incarnation's `IncarnationFdSet`, joined on return), its result is
+Task 3's device-scoped rediscovery request (the 3c-ii probe worker, lease on the incarnation's `IncarnationFdSet`, joined on return); its result is
 tagged with incarnation and transition epoch and consumed by the preparation on the core; a stale result
 is discarded. The preparation's `#[cfg(not(test))]` fork is removed; tests drive the production branch
 through the scripted prober seam. The VT acquire uses the same path (its existing tests keep their
