@@ -1800,10 +1800,10 @@ fn pointer_event_fanout_to_state_inner(
     let mut xi2_grab_window_target: Option<(ClientId, ResourceId, i16, i16)> = None;
 
     // Physical wheel input arrives as button 4–7 transitions, then this
-    // fanout adds the XI2 Motion carrying the scroll valuator. Xorg changes
-    // the event type to MotionNotify before its grab-mask filter
-    // (dix/getevents.c:1742-1750, especially :1747), so a Motion-only XI2
-    // grab must accept the emulated wheel press as Motion.
+    // fanout adds the XI2 Motion carrying the scroll valuator. Xorg turns a
+    // scroll ButtonPress into MotionNotify and fills it before separately
+    // generating legacy wheel buttons (dix/getevents.c:1646-1697, 1703-1718),
+    // so a Motion-only XI2 grab must accept the emulated wheel press as Motion.
     let xi2_scroll_button_press = event.kind == PointerEventKind::ButtonPress
         && button_transition.source_accepted
         && (4..=7).contains(&event.detail);
@@ -2058,8 +2058,8 @@ fn pointer_event_fanout_to_state_inner(
     }
 
     // Xorg builds the smooth-scroll MotionNotify before it generates the
-    // separate legacy wheel-button transitions (dix/getevents.c:1747,
-    // 1753-1763). Route that Motion by XI_Motion selections and grab masks;
+    // separate legacy wheel-button transitions (dix/getevents.c:1646-1697,
+    // 1703-1718). Route that Motion by XI_Motion selections and grab masks;
     // it is independent of the emulated ButtonPress's master aggregation.
     if let Some((axis, axis_idx)) = scroll_axis_info {
         const XI_MOTION_EVENT: u16 = 6;
@@ -2073,22 +2073,41 @@ fn pointer_event_fanout_to_state_inner(
         let mut motion_targets = natural_targets.clone();
         let active_motion_grab = active_source_grab
             .filter(|grab| grab.via_xi2 && grab.xi2_mask & (1_u64 << XI_MOTION_EVENT) != 0);
+        let mut motion_grab_window_target = None;
         if xi2_grab_delivery {
             motion_targets.clear();
             if let Some(grab) = active_motion_grab {
                 motion_targets.push(grab.owner);
             }
         } else if let Some(grab) = active_motion_grab
-            && xi2_grab_window_target.is_some_and(|(owner, ..)| owner == grab.owner)
-            && !motion_targets.contains(&grab.owner)
+            && grab.owner_events
+            && !natural_targets.contains(&grab.owner)
         {
+            // This smooth-scroll Motion is a distinct event from the
+            // emulated wheel ButtonPress handled above. Xorg's
+            // DeliverGrabbedEvent performs owner-events delivery per event,
+            // then falls back to the grab window only when this Motion
+            // reached no natural owner selection (dix/events.c:4431-4464).
+            // Do not key it from `xi2_grab_window_target`: that marker is
+            // derived from the paired ButtonPress and can disagree with the
+            // Motion selection.
             motion_targets.push(grab.owner);
+            motion_grab_window_target = active_grab_target_for_source(state, xi_source).and_then(
+                |(window, owner, gx, gy, _, via_xi2, _)| {
+                    (via_xi2 && owner == grab.owner).then_some((
+                        owner,
+                        window,
+                        clamp_grab_coord(event.root_x, gx),
+                        clamp_grab_coord(event.root_y, gy),
+                    ))
+                },
+            );
         }
 
         for cid in motion_targets {
             let natural_for_client = natural_targets.contains(&cid);
-            let fallback_grab_target =
-                xi2_grab_window_target.filter(|(owner, ..)| *owner == cid && !natural_for_client);
+            let fallback_grab_target = motion_grab_window_target
+                .filter(|(owner, ..)| *owner == cid && !natural_for_client);
             let grab_scoped = (xi2_grab_delivery
                 && active_motion_grab.is_some_and(|g| g.owner == cid))
                 || fallback_grab_target.is_some();
@@ -5505,7 +5524,7 @@ mod tests {
         let release_events = xi2_event_ids(&read_all_capture_available(&mut peer));
 
         // Xorg makes the scroll valuator Motion before generating legacy
-        // wheel-button emulation (dix/getevents.c:1742-1763). The separate
+        // wheel-button emulation (dix/getevents.c:1646-1697, 1703-1718). The separate
         // button transition is rejected by master aggregation while XTEST
         // holds button 5, but the physical scroll Motion still reaches the
         // attached master.

@@ -34108,6 +34108,440 @@ mod tests {
         assert!(!state.xi1_frozen[&2].frozen());
     }
 
+    fn xi_owner_events_scroll_fixture() -> (
+        super::KmsBackend,
+        yserver_core::server::ServerState,
+        std::os::unix::net::UnixStream,
+        yserver_core::xinput::InputSourceId,
+        u16,
+        yserver_protocol::x11::ResourceId,
+    ) {
+        use yserver_core::{
+            backend::Backend,
+            core_loop::{DeviceInfo, HostInputEvent, InputOrigin},
+            resources::ROOT_WINDOW,
+            server::ServerState,
+            xinput::{InputCapabilities, InputSourceId, XiFacetKind},
+        };
+        use yserver_protocol::x11::ResourceId;
+
+        const CLIENT: u32 = 5;
+        const SOURCE: InputSourceId = InputSourceId(0xA7341);
+        const CHILD: ResourceId = ResourceId(0x0010_A734);
+
+        let mut backend = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        let mut peer = kbd_map_client_id(&mut state, CLIENT);
+        backend
+            .core
+            .xid_map
+            .insert(backend.core.window_id, ROOT_WINDOW);
+
+        // This is the same DeviceAdded callback the KMS backend receives
+        // from the input lifecycle, so the source and its enabled pointer
+        // facet are produced by the real registry path.
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceAdded(DeviceInfo {
+                source_id: SOURCE,
+                enabled: true,
+                resume_key: None,
+                capabilities: InputCapabilities {
+                    keyboard: false,
+                    pointer: true,
+                    touch: false,
+                },
+                name: "owner-events smooth-scroll mouse".to_owned(),
+                device_node: "/dev/input/event-owner-scroll".to_owned(),
+                sysname: "event-owner-scroll".to_owned(),
+                vendor_id: 1,
+                product_id: 1,
+                is_touchpad: false,
+                config: Default::default(),
+            }),
+        );
+        let pointer_id = state
+            .xi_devices
+            .facet(SOURCE, XiFacetKind::PointerTouch)
+            .expect("physical pointer facet follows DeviceAdded");
+
+        // Create and map an owned child through the core request dispatcher.
+        // This gives the owner natural delivery on the child while the active
+        // grab's root window remains an observable fallback target.
+        let mut create_window = Vec::with_capacity(28);
+        create_window.extend_from_slice(&CHILD.0.to_le_bytes());
+        create_window.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        create_window.extend_from_slice(&20i16.to_le_bytes());
+        create_window.extend_from_slice(&30i16.to_le_bytes());
+        create_window.extend_from_slice(&100u16.to_le_bytes());
+        create_window.extend_from_slice(&100u16.to_le_bytes());
+        create_window.extend_from_slice(&0u16.to_le_bytes()); // border width
+        create_window.extend_from_slice(&1u16.to_le_bytes()); // InputOutput
+        create_window.extend_from_slice(&yserver_core::resources::ROOT_VISUAL.0.to_le_bytes());
+        create_window.extend_from_slice(&0u32.to_le_bytes()); // value mask
+        assert!(
+            xi_xtest_grab_request(
+                &mut state,
+                &mut backend,
+                &mut peer,
+                1,
+                1,
+                24,
+                &create_window,
+            )
+            .is_empty()
+        );
+        assert!(
+            xi_xtest_grab_request(
+                &mut state,
+                &mut backend,
+                &mut peer,
+                2,
+                8,
+                0,
+                &CHILD.0.to_le_bytes(),
+            )
+            .is_empty()
+        );
+
+        // Place the live source over the child through the KMS input
+        // callback used for host motion.
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::PointerMotion {
+                origin: InputOrigin::Physical(SOURCE),
+                x: 45,
+                y: 65,
+                time: 40,
+                relative: false,
+                dx: 0,
+                dy: 0,
+                motion_delta: None,
+            },
+        );
+
+        (backend, state, peer, SOURCE, pointer_id, CHILD)
+    }
+
+    fn xi_owner_events_select_body(
+        window: yserver_protocol::x11::ResourceId,
+        mask: u32,
+    ) -> Vec<u8> {
+        let mut body = Vec::with_capacity(20);
+        body.extend_from_slice(&window.0.to_le_bytes());
+        body.extend_from_slice(&1u16.to_le_bytes()); // one event mask
+        body.extend_from_slice(&[0; 2]);
+        body.extend_from_slice(&2u16.to_le_bytes()); // master pointer
+        body.extend_from_slice(&u16::from(mask != 0).to_le_bytes()); // mask_len
+        if mask != 0 {
+            body.extend_from_slice(&mask.to_le_bytes());
+        }
+        body
+    }
+
+    fn xi_owner_events_grab_body(mask: u32) -> Vec<u8> {
+        let mut body = Vec::with_capacity(20);
+        body.extend_from_slice(&yserver_core::resources::ROOT_WINDOW.0.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+        body.extend_from_slice(&0u32.to_le_bytes()); // no cursor
+        body.extend_from_slice(&2u16.to_le_bytes()); // master pointer
+        body.extend_from_slice(&[1, 1, 1, 0]); // async, async paired, owner_events=true
+        body.extend_from_slice(&1u16.to_le_bytes());
+        body.extend_from_slice(&mask.to_le_bytes());
+        body
+    }
+
+    fn xi_owner_events_scroll_events(bytes: &[u8]) -> Vec<(u16, u32, i16, i16)> {
+        let mut events = Vec::new();
+        let mut offset = 0;
+        while offset < bytes.len() {
+            assert_eq!(bytes[offset], 35, "XI2 GenericEvent stream: {bytes:02x?}");
+            let extra_units = u32::from_le_bytes(
+                bytes[offset + 4..offset + 8]
+                    .try_into()
+                    .expect("GenericEvent length"),
+            ) as usize;
+            let event_len = 32 + extra_units * 4;
+            assert!(offset + event_len <= bytes.len(), "complete GenericEvent");
+            let read_i16_fp1616 = |at: usize| {
+                (i32::from_le_bytes(bytes[offset + at..offset + at + 4].try_into().unwrap()) >> 16)
+                    as i16
+            };
+            events.push((
+                u16::from_le_bytes(bytes[offset + 8..offset + 10].try_into().unwrap()),
+                u32::from_le_bytes(bytes[offset + 24..offset + 28].try_into().unwrap()),
+                read_i16_fp1616(40),
+                read_i16_fp1616(44),
+            ));
+            offset += event_len;
+        }
+        events
+    }
+
+    fn xi_owner_events_state_snapshot(
+        state: &yserver_core::server::ServerState,
+        backend: &super::KmsBackend,
+        client: u32,
+    ) -> String {
+        let selections = &state.clients[&client];
+        format!(
+            "registry={:?}; held={:?}; detached={:?}; floating={:?}; properties={:?}; \
+             selections={:?}; cursor={:?}; pointer_grab={:?}; slave_grabs={:?}; keyboard_grabs={:?}",
+            xi_xtest_registry_snapshot(state),
+            xi_xtest_held_snapshot(state, backend),
+            state.xi2_detached_masters,
+            state.floating_pointer_positions,
+            xi_xtest_property_snapshot(state),
+            (
+                &selections.xi2_masks,
+                &selections.xi1_event_classes,
+                &selections.xi1_window_event_classes,
+            ),
+            (
+                state.pointer_root,
+                backend.core.cursor_x,
+                backend.core.cursor_y,
+            ),
+            state.active_pointer_grab,
+            state.xi2_pointer_grabs,
+            state.xi2_keyboard_grabs,
+        )
+    }
+
+    // Xorg dix/events.c:4431-4464 tries owner-events natural delivery for
+    // each event and calls DeliverOneGrabbedEvent only if that event reached
+    // nobody. Kills requiring the emulated ButtonPress branch to create the
+    // fallback marker used by its separate smooth-scroll Motion.
+    #[test]
+    fn xi_owner_events_scroll_motion_falls_back_by_its_own_type() {
+        use yserver_core::{
+            backend::Backend,
+            core_loop::{HostInputEvent, InputOrigin},
+        };
+        use yserver_protocol::x11::ClientId;
+
+        const CLIENT: u32 = 5;
+        const XI_BUTTON_PRESS: u32 = 1 << 4;
+        const XI_MOTION: u32 = 1 << 6;
+
+        let (mut backend, mut state, mut peer, source, pointer, child) =
+            xi_owner_events_scroll_fixture();
+        let before = xi_owner_events_state_snapshot(&state, &backend, CLIENT);
+        assert_eq!(
+            xi_xtest_grab_request(
+                &mut state,
+                &mut backend,
+                &mut peer,
+                3,
+                137,
+                47,
+                &[2, 0, 3, 0],
+            )
+            .first(),
+            Some(&1),
+            "XIQueryVersion reply"
+        );
+
+        // Use the core request dispatcher for the selection and active grab.
+        assert!(
+            xi_xtest_grab_request(
+                &mut state,
+                &mut backend,
+                &mut peer,
+                4,
+                137,
+                46,
+                &xi_owner_events_select_body(child, XI_BUTTON_PRESS),
+            )
+            .is_empty()
+        );
+        let grab_reply = xi_xtest_grab_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            5,
+            137,
+            51,
+            &xi_owner_events_grab_body(XI_MOTION),
+        );
+        assert_eq!(xi_xtest_grab_reply_status(&grab_reply), Some(0));
+        assert!(state.active_pointer_grab.is_some_and(|grab| {
+            grab.owner == ClientId(CLIENT)
+                && grab.grab_window.0 == yserver_core::resources::ROOT_WINDOW.0
+        }));
+
+        let origin = InputOrigin::Physical(source);
+        for pressed in [true, false] {
+            Backend::on_host_input(
+                &mut backend,
+                &mut state,
+                HostInputEvent::PointerButton {
+                    origin,
+                    button: 0x180, // input-thread SYNTH_SCROLL_UP
+                    pressed,
+                    time: 50,
+                },
+            );
+        }
+        let events = xi_owner_events_scroll_events(&kbd_map_drain(&mut peer));
+        assert_eq!(events.len(), 2, "one scroll Motion and one emulated press");
+        let press = events.iter().find(|event| event.0 == 4).unwrap();
+        let motion = events.iter().find(|event| event.0 == 6).unwrap();
+        assert_eq!((press.1, press.2, press.3), (child.0, 25, 35));
+        assert_eq!(
+            (motion.1, motion.2, motion.3),
+            (yserver_core::resources::ROOT_WINDOW.0, 45, 65),
+            "Motion falls back to the root grab window with root-relative coordinates"
+        );
+        assert_eq!(state.xi_devices.device(pointer).unwrap().buttons_down, 0);
+        assert_eq!(state.buttons_down, 0);
+
+        let _ungrab_events = xi_xtest_grab_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            6,
+            137,
+            52,
+            &xi_xtest_ungrab_body(2),
+        );
+        assert!(
+            xi_xtest_grab_request(
+                &mut state,
+                &mut backend,
+                &mut peer,
+                7,
+                137,
+                46,
+                &xi_owner_events_select_body(child, 0),
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            xi_owner_events_state_snapshot(&state, &backend, CLIENT),
+            before,
+            "ungrab and deselect restore registry, held state, maps, and selections"
+        );
+    }
+
+    // Xorg dix/events.c:4431-4464 keeps an event on its natural selected
+    // window when owner-events delivery succeeds. Kills unconditionally
+    // redirecting Motion to the grab window despite a natural Motion selection.
+    #[test]
+    fn xi_owner_events_scroll_motion_stays_on_naturally_selected_child() {
+        use yserver_core::{
+            backend::Backend,
+            core_loop::{HostInputEvent, InputOrigin},
+        };
+
+        const CLIENT: u32 = 5;
+        const XI_BUTTON_PRESS: u32 = 1 << 4;
+        const XI_MOTION: u32 = 1 << 6;
+
+        let (mut backend, mut state, mut peer, source, pointer, child) =
+            xi_owner_events_scroll_fixture();
+        let before = xi_owner_events_state_snapshot(&state, &backend, CLIENT);
+        assert_eq!(
+            xi_xtest_grab_request(
+                &mut state,
+                &mut backend,
+                &mut peer,
+                3,
+                137,
+                47,
+                &[2, 0, 3, 0],
+            )
+            .first(),
+            Some(&1),
+            "XIQueryVersion reply"
+        );
+        assert!(
+            xi_xtest_grab_request(
+                &mut state,
+                &mut backend,
+                &mut peer,
+                4,
+                137,
+                46,
+                &xi_owner_events_select_body(child, XI_BUTTON_PRESS | XI_MOTION),
+            )
+            .is_empty()
+        );
+        let grab_reply = xi_xtest_grab_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            5,
+            137,
+            51,
+            &xi_owner_events_grab_body(XI_MOTION),
+        );
+        assert_eq!(xi_xtest_grab_reply_status(&grab_reply), Some(0));
+
+        let origin = InputOrigin::Physical(source);
+        for pressed in [true, false] {
+            Backend::on_host_input(
+                &mut backend,
+                &mut state,
+                HostInputEvent::PointerButton {
+                    origin,
+                    button: 0x180, // input-thread SYNTH_SCROLL_UP
+                    pressed,
+                    time: 60,
+                },
+            );
+        }
+        let events = xi_owner_events_scroll_events(&kbd_map_drain(&mut peer));
+        assert_eq!(events.len(), 2, "one scroll Motion and one emulated press");
+        assert!(
+            events
+                .iter()
+                .any(|event| { event.0 == 4 && (event.1, event.2, event.3) == (child.0, 25, 35) })
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| { event.0 == 6 && (event.1, event.2, event.3) == (child.0, 25, 35) })
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.1 != yserver_core::resources::ROOT_WINDOW.0),
+            "neither event fell back to the root grab window"
+        );
+        assert_eq!(state.xi_devices.device(pointer).unwrap().buttons_down, 0);
+        assert_eq!(state.buttons_down, 0);
+
+        let _ungrab_events = xi_xtest_grab_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            6,
+            137,
+            52,
+            &xi_xtest_ungrab_body(2),
+        );
+        assert!(
+            xi_xtest_grab_request(
+                &mut state,
+                &mut backend,
+                &mut peer,
+                7,
+                137,
+                46,
+                &xi_owner_events_select_body(child, 0),
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            xi_owner_events_state_snapshot(&state, &backend, CLIENT),
+            before,
+            "ungrab and deselect restore registry, held state, maps, and selections"
+        );
+    }
+
     #[test]
     fn xi_dynamic_owner_events_grab_fallback_preserves_slave_button_and_motion_identity() {
         use yserver_core::{
