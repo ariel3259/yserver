@@ -1153,16 +1153,9 @@ pub(super) fn route_pending_xi_config(
     current_generation: Generation,
 ) {
     let client = request.client;
-    let source_disabled = state
+    let source_disabled = !state
         .xi_devices
-        .source(request.expected_source)
-        .is_some_and(|source| !source.enabled)
-        || state
-            .xi_devices
-            .device(request.deviceid)
-            .is_some_and(|device| {
-                device.source_id == Some(request.expected_source) && !device.enabled
-            });
+        .source_has_enabled_facet(request.expected_source);
     if source_disabled {
         let error = crate::core_loop::process_request::validate_xi_change(state, &request)
             .err()

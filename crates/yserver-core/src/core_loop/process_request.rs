@@ -25585,7 +25585,13 @@ pub(super) fn validate_xi_change(
         }
     }
 
-    if !source.enabled || !device.enabled {
+    // libinput's property setter sees the source's shared handle, not the
+    // target XI facet. The handle stays open while any source facet remains
+    // enabled (xf86libinput.c:416-432, 4392-4410).
+    if !state
+        .xi_devices
+        .source_has_enabled_facet(request.expected_source)
+    {
         return Err(PropertyDispatchError::BadMatch);
     }
     if !crate::xinput::descriptor_available(descriptor, &source.config) {
@@ -49515,6 +49521,317 @@ mod tests {
         assert!(pending.is_empty());
         assert!(read_all_available(&mut peer_live).is_empty());
         assert!(read_all_available(&mut peer_suspended).is_empty());
+    }
+
+    #[test]
+    fn xi_libinput_write_uses_enabled_sibling_facets() {
+        use crate::xinput::libinput_props::DeviceConfigChange;
+
+        // Mutation killed: restore the per-facet `!device.enabled` BadMatch
+        // gate in the XI config path. The pointer write below must reach
+        // libinput while its keyboard sibling remains enabled.
+        // Xorg's shared handle stays open until every facet is disabled
+        // (xf86libinput.c:416-432), and property checks fail only when that
+        // shared handle is null (xf86libinput.c:4392-4410).
+        let mut state = ServerState::new();
+        let mut peer = install_capture_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let baseline_device_ids: Vec<_> = state
+            .xi_devices
+            .devices()
+            .iter()
+            .map(|device| device.id)
+            .collect();
+        let baseline_source_ids = state.xi_devices.source_ids();
+        let baseline_properties = xi_property_snapshot(&state);
+        let baseline_pointer_buttons = state.buttons_down;
+        let baseline_device_buttons: Vec<_> = state
+            .xi_devices
+            .devices()
+            .iter()
+            .map(|device| (device.id, device.buttons_down))
+            .collect();
+        let baseline_key_holds = state.key_down_by_device.clone();
+        let baseline_detached_masters = state.xi2_detached_masters.clone();
+        let baseline_floating_positions = state.floating_pointer_positions.clone();
+        let baseline_selections = {
+            let client = &state.clients[&1];
+            (
+                client.xi2_masks.clone(),
+                client.xi1_event_classes.clone(),
+                client.xi1_window_event_classes.clone(),
+            )
+        };
+        let core_xi2_header = |minor, body: &[u8]| {
+            let mut header = xi2_header_for_body(minor, body);
+            header.opcode = 137;
+            header
+        };
+
+        let source = crate::xinput::InputSourceId(u64::from(line!()));
+        let info = crate::core_loop::DeviceInfo {
+            source_id: source,
+            enabled: true,
+            resume_key: None,
+            capabilities: crate::xinput::InputCapabilities {
+                keyboard: true,
+                pointer: true,
+                touch: false,
+            },
+            name: "Mixed keyboard and pointer".into(),
+            device_node: "/dev/input/event88".into(),
+            sysname: "event88".into(),
+            vendor_id: 0x046d,
+            product_id: 0xc52f,
+            is_touchpad: false,
+            config: crate::core_loop::message::LibinputConfigSnapshot {
+                accel: crate::core_loop::message::FloatSetting {
+                    available: true,
+                    current: 0.0,
+                    default: 0.0,
+                },
+                ..Default::default()
+            },
+        };
+        let ids = state.xi_register_source(&info);
+        let pointer = state
+            .xi_devices
+            .facet(source, crate::xinput::XiFacetKind::PointerTouch)
+            .expect("mixed source pointer facet");
+        let keyboard = state
+            .xi_devices
+            .facet(source, crate::xinput::XiFacetKind::Keyboard)
+            .expect("mixed source keyboard facet");
+        let mut inventory = crate::core_loop::input_inventory::InputInventory::new();
+        inventory.add(info);
+        let mut pending = crate::core_loop::run::PendingBackendRequests::default();
+        let mut lane = crate::core_loop::run::XiConfigLane::default();
+
+        // Match the post-EnableDevice property value before exercising the
+        // client disable transition (the fixture registered the source).
+        let enabled_atom = state.xi_device_enabled_atom.0;
+        let enabled_write = xi2_change_property_body(
+            pointer,
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            8,
+            enabled_atom,
+            crate::xinput::XA_INTEGER.0,
+            &[1],
+        );
+        assert!(matches!(
+            process_request(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                SequenceNumber(1),
+                core_xi2_header(57, &enabled_write),
+                &enabled_write,
+                None,
+            )
+            .unwrap(),
+            RequestOutcome::Handled
+        ));
+
+        let disable_pointer = xi2_change_property_body(
+            pointer,
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            8,
+            enabled_atom,
+            crate::xinput::XA_INTEGER.0,
+            &[0],
+        );
+        assert!(matches!(
+            process_request(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                SequenceNumber(2),
+                core_xi2_header(57, &disable_pointer),
+                &disable_pointer,
+                None,
+            )
+            .unwrap(),
+            RequestOutcome::Handled
+        ));
+        assert!(state.xi_devices.device(pointer).unwrap().client_disabled);
+        assert!(!state.xi_devices.device(pointer).unwrap().enabled);
+        assert!(state.xi_devices.device(keyboard).unwrap().enabled);
+
+        let accel_atom = state.atoms.id_for("libinput Accel Speed").unwrap();
+        let accel_body = xi2_change_property_body(
+            pointer,
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            32,
+            accel_atom.0,
+            state.float_atom.0,
+            &0.75_f32.to_le_bytes(),
+        );
+        let outcome = process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(3),
+            core_xi2_header(57, &accel_body),
+            &accel_body,
+            None,
+        )
+        .unwrap();
+        let RequestOutcome::PendingXiConfig(request) = outcome else {
+            panic!("recognized libinput write must enter the config lane: {outcome:?}");
+        };
+        route_t3_config_request(
+            &mut state,
+            &mut backend,
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            request,
+        );
+        assert_eq!(
+            backend.started_device_configs,
+            [(source, DeviceConfigChange::AccelSpeed(0.75))],
+            "a disabled pointer facet can configure the still-open shared source"
+        );
+        assert_eq!(
+            inventory.get(source).unwrap().config.accel.current,
+            0.75,
+            "the applied setting reaches the source inventory"
+        );
+        assert_eq!(
+            f32::from_le_bytes(
+                state.xi_devices.device(pointer).unwrap().properties[&accel_atom].data[..4]
+                    .try_into()
+                    .unwrap()
+            ),
+            0.75,
+            "the confirmed value is committed to the disabled facet property"
+        );
+
+        let disable_keyboard = xi2_change_property_body(
+            keyboard,
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            8,
+            enabled_atom,
+            crate::xinput::XA_INTEGER.0,
+            &[0],
+        );
+        assert!(matches!(
+            process_request(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                SequenceNumber(4),
+                core_xi2_header(57, &disable_keyboard),
+                &disable_keyboard,
+                None,
+            )
+            .unwrap(),
+            RequestOutcome::Handled
+        ));
+        assert!(
+            state
+                .xi_devices
+                .devices()
+                .iter()
+                .filter(|device| device.source_id == Some(source))
+                .all(|device| !device.enabled)
+        );
+
+        let accel_body = xi2_change_property_body(
+            pointer,
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            32,
+            accel_atom.0,
+            state.float_atom.0,
+            &0.25_f32.to_le_bytes(),
+        );
+        let outcome = process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(5),
+            core_xi2_header(57, &accel_body),
+            &accel_body,
+            None,
+        )
+        .unwrap();
+        let RequestOutcome::PendingXiConfig(request) = outcome else {
+            panic!("recognized libinput write must enter the config lane: {outcome:?}");
+        };
+        route_t3_config_request(
+            &mut state,
+            &mut backend,
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            request,
+        );
+        assert_xi_config_error(&read_all_available(&mut peer), x11::error::BAD_MATCH, 5, 57);
+        assert_eq!(
+            backend.started_device_configs.len(),
+            1,
+            "no config reaches the backend once every facet is disabled"
+        );
+        assert_eq!(
+            inventory.get(source).unwrap().config.accel.current,
+            0.75,
+            "a rejected write does not alter source settings"
+        );
+        assert!(lane.is_empty());
+        assert!(pending.is_empty());
+
+        let removed = state.xi_unregister_source(source);
+        assert_eq!(removed, ids);
+        assert_eq!(
+            state.take_xi_removed_device_descriptors().len(),
+            ids.len(),
+            "the source removal publisher owns every removed descriptor"
+        );
+        inventory.remove(source);
+        assert!(inventory.is_empty());
+        assert_eq!(
+            state
+                .xi_devices
+                .devices()
+                .iter()
+                .map(|device| device.id)
+                .collect::<Vec<_>>(),
+            baseline_device_ids,
+            "registry returns to its original device set"
+        );
+        assert_eq!(state.xi_devices.source_ids(), baseline_source_ids);
+        assert!(state.xi_devices.source(source).is_none());
+        assert_eq!(xi_property_snapshot(&state), baseline_properties);
+        assert_eq!(state.buttons_down, baseline_pointer_buttons);
+        assert_eq!(
+            state
+                .xi_devices
+                .devices()
+                .iter()
+                .map(|device| (device.id, device.buttons_down))
+                .collect::<Vec<_>>(),
+            baseline_device_buttons
+        );
+        assert_eq!(state.key_down_by_device, baseline_key_holds);
+        assert_eq!(state.xi2_detached_masters, baseline_detached_masters);
+        assert_eq!(
+            state.floating_pointer_positions,
+            baseline_floating_positions
+        );
+        let client = &state.clients[&1];
+        assert_eq!(
+            (
+                &client.xi2_masks,
+                &client.xi1_event_classes,
+                &client.xi1_window_event_classes,
+            ),
+            (
+                &baseline_selections.0,
+                &baseline_selections.1,
+                &baseline_selections.2,
+            )
+        );
+        assert!(read_all_available(&mut peer).is_empty());
     }
 
     #[test]

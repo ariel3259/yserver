@@ -331,6 +331,20 @@ impl XiRegistry {
         self.sources.get(&source_id).map(|record| &record.info)
     }
 
+    /// Whether any XI facet still keeps the source's shared libinput handle
+    /// active. xf86-input-libinput decrements its shared `enabled_count` per
+    /// facet and closes the handle only at zero (`src/xf86libinput.c:416-432`);
+    /// its property guard rejects writes only after that handle is null
+    /// (`src/xf86libinput.c:4392-4410`).
+    #[must_use]
+    pub fn source_has_enabled_facet(&self, source_id: InputSourceId) -> bool {
+        self.sources
+            .get(&source_id)
+            .into_iter()
+            .flat_map(|record| record.facets.values())
+            .any(|device_id| self.device(*device_id).is_some_and(|device| device.enabled))
+    }
+
     pub fn source_mut(&mut self, source_id: InputSourceId) -> Option<&mut DeviceInfo> {
         self.sources
             .get_mut(&source_id)
