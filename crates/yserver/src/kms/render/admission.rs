@@ -407,7 +407,7 @@ impl AdmissionSource for LifecycleOnlyAdmissionSource {
     }
 }
 
-enum LifecycleDriverWork {
+pub(super) enum LifecycleDriverWork {
     Actions {
         requester: Option<TransitionTag<IncarnationId>>,
         actions: Vec<LifecycleAction<IncarnationId>>,
@@ -426,6 +426,10 @@ enum LifecycleDriverWork {
         commit: CommitId,
         tag: ClientModesetTag<IncarnationId>,
         terminal: TerminalState,
+    },
+    RunNormalRecoveryAttempt {
+        tag: TransitionTag<IncarnationId>,
+        recovery_id: crate::kms::owner::lifecycle::RecoveryId,
     },
 }
 
@@ -735,7 +739,7 @@ impl LifecycleDriver {
             .insert(crtc, InstalledCrtcPower::Unknown { incarnation });
     }
 
-    fn enqueue(&mut self, work: LifecycleDriverWork) {
+    pub(super) fn enqueue(&mut self, work: LifecycleDriverWork) {
         #[cfg(test)]
         if self.draining {
             self.queued_while_draining = self.queued_while_draining.saturating_add(1);
@@ -1565,7 +1569,7 @@ impl KmsBackend {
         }
     }
 
-    fn lifecycle_drain_driver(&mut self, device: DrmDeviceKey) {
+    pub(super) fn lifecycle_drain_driver(&mut self, device: DrmDeviceKey) {
         let Some(driver) = self.lifecycle_drivers.get_mut(&device) else {
             return;
         };
@@ -1637,6 +1641,9 @@ impl KmsBackend {
                     terminal,
                 } => {
                     self.lifecycle_finish_client_modeset(device, commit, tag, terminal);
+                }
+                LifecycleDriverWork::RunNormalRecoveryAttempt { tag, recovery_id } => {
+                    self.lifecycle_run_normal_recovery_attempt(device, tag, recovery_id);
                 }
             }
         }
@@ -1763,6 +1770,12 @@ impl KmsBackend {
                     .device(&device)
                     .and_then(|arbiter| arbiter.transition())
                     .map(|transition| transition.kind);
+                if transition_kind
+                    == Some(crate::kms::owner::lifecycle::LifecycleKind::NormalRecovery)
+                {
+                    self.lifecycle_start_normal_recovery(device, tag);
+                    return;
+                }
                 if transition_kind
                     == Some(crate::kms::owner::lifecycle::LifecycleKind::DeviceRemoved)
                 {
@@ -1896,7 +1909,7 @@ impl KmsBackend {
         }
     }
 
-    fn lifecycle_tag_current(
+    pub(super) fn lifecycle_tag_current(
         &self,
         device: DrmDeviceKey,
         tag: TransitionTag<IncarnationId>,

@@ -82,6 +82,25 @@ use crate::{
     platform::drm::{DrmDeviceKey, ModeIdentity},
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NormalRecoveryAttemptResult {
+    #[allow(dead_code)]
+    Qualified,
+    #[allow(dead_code)]
+    Failed,
+    #[allow(dead_code)]
+    CompletionUnknown,
+    Unavailable,
+}
+
+type NormalRecoveryAttemptRuntime = Box<
+    dyn FnMut(
+        DrmDeviceKey,
+        crate::kms::owner::lifecycle::RecoveryId,
+        crate::kms::owner::lifecycle::TransitionTag<IncarnationId>,
+    ) -> NormalRecoveryAttemptResult,
+>;
+
 #[cfg(test)]
 struct RealDrmTestSerial {
     state: std::sync::Mutex<RealDrmTestSerialState>,
@@ -1974,6 +1993,10 @@ pub struct KmsBackend {
         crate::kms::owner::lifecycle::LifecycleCoordinator<DrmDeviceKey, OutputKey, IncarnationId>,
     pub(crate) lifecycle_drivers:
         std::collections::BTreeMap<DrmDeviceKey, crate::kms::render::admission::LifecycleDriver>,
+    /// Device-scoped NormalRecovery attempt selected when the backend is
+    /// constructed. Until the real reopen/reinstall path lands, production
+    /// reports `Unavailable`, which consumes the incident's single attempt.
+    normal_recovery_attempt: NormalRecoveryAttemptRuntime,
     /// Owner incarnations whose poison hook has started fd-family retirement.
     pub(super) pending_poisoned_barriers: HashSet<DrmDeviceKey>,
     /// Last acknowledged ACTIVE state for each Owner device. Missing entries
@@ -3335,8 +3358,150 @@ impl KmsBackend {
         let devices = std::mem::take(&mut self.pending_poisoned_barriers);
         for device in devices {
             let still_poisoned = self.owner_device_poisoned(device);
-            if still_poisoned && !self.poll_poisoned_barrier(device) {
+            if !still_poisoned {
+                continue;
+            }
+            if !self.poll_poisoned_barrier(device) {
                 self.pending_poisoned_barriers.insert(device);
+                continue;
+            }
+            let is_normal_recovery = self
+                .lifecycle_coordinator
+                .device(&device)
+                .and_then(|arbiter| arbiter.transition())
+                .is_some_and(|transition| {
+                    transition.kind == crate::kms::owner::lifecycle::LifecycleKind::NormalRecovery
+                });
+            if is_normal_recovery && let Some(tag) = self.lifecycle_current_tag(device) {
+                self.lifecycle_queue_input(
+                    device,
+                    crate::kms::owner::lifecycle::ArbiterInput::FdFamilyBarrierCleared { tag },
+                );
+            }
+        }
+    }
+
+    pub(super) fn lifecycle_start_normal_recovery(
+        &mut self,
+        device: DrmDeviceKey,
+        tag: crate::kms::owner::lifecycle::TransitionTag<IncarnationId>,
+    ) {
+        use crate::kms::owner::lifecycle::{
+            ArbiterInput, DeviceLifecycleState, LifecycleKind, RecoveryAttemptBudget,
+            RecoveryAttemptOutcome, RecoveryAttemptTrigger,
+        };
+
+        if !self.lifecycle_tag_current(device, tag)
+            || !self
+                .lifecycle_coordinator
+                .device(&device)
+                .is_some_and(|arbiter| {
+                    arbiter.state() == DeviceLifecycleState::Poisoned
+                        && arbiter.transition().is_some_and(|transition| {
+                            transition.kind == LifecycleKind::NormalRecovery
+                        })
+                        && arbiter.recovery().is_some_and(|incident| {
+                            incident.state()
+                                == crate::kms::owner::lifecycle::RecoveryIncidentState::Active
+                                && incident.budget() == RecoveryAttemptBudget::Available
+                        })
+                })
+        {
+            return;
+        }
+
+        let Some(incarnation) = self
+            .platform
+            .owner_ref(device)
+            .map(|owner| owner.incarnation())
+        else {
+            return;
+        };
+        if !self.barrier_ready(incarnation) {
+            self.pending_poisoned_barriers.insert(device);
+            return;
+        }
+        let Some(incident) = self
+            .lifecycle_coordinator
+            .device(&device)
+            .and_then(|arbiter| arbiter.recovery())
+        else {
+            return;
+        };
+
+        let Some(driver) = self.lifecycle_drivers.get_mut(&device) else {
+            return;
+        };
+        driver.enqueue(crate::kms::render::admission::LifecycleDriverWork::Input(
+            ArbiterInput::RecoveryAttempt {
+                tag,
+                outcome: RecoveryAttemptOutcome::Started(RecoveryAttemptTrigger::AfterReap),
+            },
+        ));
+        driver.enqueue(
+            crate::kms::render::admission::LifecycleDriverWork::RunNormalRecoveryAttempt {
+                tag,
+                recovery_id: incident.id(),
+            },
+        );
+        self.lifecycle_drain_driver(device);
+    }
+
+    pub(super) fn lifecycle_run_normal_recovery_attempt(
+        &mut self,
+        device: DrmDeviceKey,
+        tag: crate::kms::owner::lifecycle::TransitionTag<IncarnationId>,
+        recovery_id: crate::kms::owner::lifecycle::RecoveryId,
+    ) {
+        use crate::kms::owner::lifecycle::{
+            ArbiterInput, DeviceLifecycleState, LifecycleKind, RecoveryAttemptOutcome,
+            RecoveryIncidentState,
+        };
+
+        let current_attempt = self
+            .lifecycle_coordinator
+            .device(&device)
+            .is_some_and(|arbiter| {
+                self.lifecycle_tag_current(device, tag)
+                    && arbiter.state() == DeviceLifecycleState::Recovering(recovery_id)
+                    && arbiter
+                        .transition()
+                        .is_some_and(|transition| transition.kind == LifecycleKind::NormalRecovery)
+                    && arbiter.recovery().is_some_and(|incident| {
+                        incident.id() == recovery_id
+                            && incident.state() == RecoveryIncidentState::Attempting
+                    })
+            });
+        let Some(incarnation) = self
+            .platform
+            .owner_ref(device)
+            .map(|owner| owner.incarnation())
+        else {
+            return;
+        };
+        if !current_attempt || !self.barrier_ready(incarnation) {
+            return;
+        }
+
+        match (self.normal_recovery_attempt)(device, recovery_id, tag) {
+            NormalRecoveryAttemptResult::Qualified => self.lifecycle_queue_input(
+                device,
+                ArbiterInput::RecoveryAttempt {
+                    tag,
+                    outcome: RecoveryAttemptOutcome::Qualified,
+                },
+            ),
+            NormalRecoveryAttemptResult::Failed | NormalRecoveryAttemptResult::Unavailable => {
+                self.lifecycle_queue_input(
+                    device,
+                    ArbiterInput::RecoveryAttempt {
+                        tag,
+                        outcome: RecoveryAttemptOutcome::FailedOrUnknown,
+                    },
+                );
+            }
+            NormalRecoveryAttemptResult::CompletionUnknown => {
+                self.lifecycle_report_completion_loss(device);
             }
         }
     }
@@ -8041,6 +8206,7 @@ impl KmsBackend {
             admission_conductors: std::collections::BTreeMap::new(),
             lifecycle_coordinator: crate::kms::owner::lifecycle::LifecycleCoordinator::new(),
             lifecycle_drivers: std::collections::BTreeMap::new(),
+            normal_recovery_attempt: Box::new(|_, _, _| NormalRecoveryAttemptResult::Unavailable),
             pending_poisoned_barriers: HashSet::new(),
             owner_dpms_installed_active: HashMap::new(),
             resource_service: None,
@@ -9544,7 +9710,13 @@ impl KmsBackend {
     #[doc(hidden)]
     #[must_use]
     pub fn for_tests() -> Self {
-        let mut b = Self::for_tests_seed();
+        Self::for_tests_with_recovery_attempt(Box::new(|_, _, _| {
+            NormalRecoveryAttemptResult::Unavailable
+        }))
+    }
+
+    fn for_tests_with_recovery_attempt(attempt: NormalRecoveryAttemptRuntime) -> Self {
+        let mut b = Self::for_tests_seed_with_recovery_attempt(attempt);
         b.init_root_storage();
         // Stage 5 Phase A: seed the default-cursor record so test
         // paths that exercise `define_cursor` / effective-cursor
@@ -9559,6 +9731,14 @@ impl KmsBackend {
     /// storage. Used by `for_tests_with_vk` so root allocation
     /// happens after the Vk context is attached.
     fn for_tests_seed() -> Self {
+        Self::for_tests_seed_with_recovery_attempt(Box::new(|_, _, _| {
+            NormalRecoveryAttemptResult::Unavailable
+        }))
+    }
+
+    fn for_tests_seed_with_recovery_attempt(
+        normal_recovery_attempt: NormalRecoveryAttemptRuntime,
+    ) -> Self {
         let (probe_result_sender, probe_result_receiver) = std::sync::mpsc::channel();
         let mut backend = Self {
             core: KmsCore::for_tests(),
@@ -9625,6 +9805,7 @@ impl KmsBackend {
             admission_conductors: std::collections::BTreeMap::new(),
             lifecycle_coordinator: crate::kms::owner::lifecycle::LifecycleCoordinator::new(),
             lifecycle_drivers: std::collections::BTreeMap::new(),
+            normal_recovery_attempt,
             pending_poisoned_barriers: HashSet::new(),
             owner_dpms_installed_active: HashMap::new(),
             resource_service: None,
@@ -39967,7 +40148,7 @@ mod tests {
         platform::drm::DrmDeviceKey,
     };
     use std::{
-        cell::RefCell,
+        cell::{Cell, RefCell},
         collections::{HashMap, HashSet, VecDeque},
         io,
         os::fd::AsFd,
@@ -128458,9 +128639,23 @@ mod tests {
     fn c0_3di_barrier_backend(
         behaviour: crate::kms::executor::test_support::StubBehaviour,
     ) -> (super::KmsBackend, DrmDeviceKey, IncarnationId) {
+        c0_3di_barrier_backend_with_attempt(
+            behaviour,
+            Box::new(|_, _, _| super::NormalRecoveryAttemptResult::Unavailable),
+        )
+    }
+
+    fn c0_3di_barrier_backend_with_attempt(
+        behaviour: crate::kms::executor::test_support::StubBehaviour,
+        attempt: super::NormalRecoveryAttemptRuntime,
+    ) -> (super::KmsBackend, DrmDeviceKey, IncarnationId) {
         use crate::kms::render::resources::{DrmCleanupRegistry, ResourceService};
 
-        let mut backend = backend_with_stub_executors_with_behaviour_for_tests(1, behaviour);
+        let mut backend = super::KmsBackend::for_tests_with_recovery_attempt(attempt);
+        backend.platform =
+            crate::kms::render::platform::PlatformBackend::platform_with_stub_executors_with_behaviour_for_tests(
+                1, behaviour,
+            );
         let device = backend.platform.devices[0].key;
         let incarnation = backend.platform.devices[0]
             .owner
@@ -128479,6 +128674,54 @@ mod tests {
             .lifecycle_register_owner_device(device)
             .expect("register Owner lifecycle");
         (backend, device, incarnation)
+    }
+
+    fn c0_3di_add_owner_output(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        crtc: u32,
+    ) -> (OutputKey, u32, u32) {
+        push_test_output(backend, crtc);
+        let output = backend
+            .platform
+            .outputs
+            .last_mut()
+            .expect("new test output");
+        let output_key = OutputKey::new(device, output.key.connector_name.clone());
+        output.key = output_key.clone();
+        output.scanout_route.kms_device_key = device;
+        let instance_id = backend
+            .platform
+            .allocate_output_instance_id(&output_key)
+            .expect("test output instance");
+        *backend
+            .platform
+            .output_instance_ids
+            .last_mut()
+            .expect("test output instance slot") = instance_id;
+        let ids = backend.randr_id_alloc.ids_for(&output_key);
+        backend
+            .output_key_by_id
+            .insert(ids.output_id, output_key.clone());
+        let output = backend.platform.outputs.last().expect("new test output");
+        let entry = backend.randr_id_alloc.entry_mut(&output_key);
+        entry.connected = true;
+        entry.config = super::ConnectorConfig::Enabled {
+            mode_w: output.width,
+            mode_h: output.height,
+            vrefresh: output.output.picked.vrefresh,
+            x: output.x,
+            y: output.y,
+        };
+        entry.modes = output.output.modes.clone();
+        entry.edid = output.output.edid.clone();
+        entry.mm_width = output.output.mm_width;
+        entry.mm_height = output.output.mm_height;
+        entry.connector_type = output.output.connector_type.clone();
+        backend
+            .lifecycle_register_owner_device(device)
+            .expect("register Owner output with lifecycle arbiter");
+        (output_key, ids.output_id, ids.crtc_id)
     }
 
     fn c0_3di_drive_completion_loss_to_poison(
@@ -128684,6 +128927,111 @@ mod tests {
         }
     }
 
+    fn c0_3di_urgent_withdrawal_count(backend: &super::KmsBackend, start: usize) -> usize {
+        backend.core_entry_deliveries_for_tests[start..]
+            .iter()
+            .filter(|delivery| {
+                matches!(
+                    delivery,
+                    yserver_core::core_loop::run::CoreEntryDelivery::UrgentWithdrawal { .. }
+                )
+            })
+            .count()
+    }
+
+    type C0RecoveryFailureFixture = (
+        super::KmsBackend,
+        ServerState,
+        DrmDeviceKey,
+        IncarnationId,
+        OutputKey,
+        u32,
+        u32,
+        Rc<Cell<usize>>,
+        Rc<RefCell<Vec<crate::kms::owner::lifecycle::RecoveryId>>>,
+        usize,
+    );
+
+    fn c0_3di_failed_recovery_fixture(
+        result: super::NormalRecoveryAttemptResult,
+    ) -> C0RecoveryFailureFixture {
+        use crate::kms::executor::test_support::StubBehaviour;
+        use yserver_core::backend::Backend;
+
+        let attempts = Rc::new(Cell::new(0));
+        let recovery_ids = Rc::new(RefCell::new(Vec::new()));
+        let attempts_for_runtime = Rc::clone(&attempts);
+        let ids_for_runtime = Rc::clone(&recovery_ids);
+        let runtime = Box::new(move |_, recovery_id, _| {
+            attempts_for_runtime.set(attempts_for_runtime.get() + 1);
+            ids_for_runtime.borrow_mut().push(recovery_id);
+            result
+        });
+        let (mut backend, device, incarnation) =
+            c0_3di_barrier_backend_with_attempt(StubBehaviour::NeverReply, runtime);
+        let (output_key, output_id, crtc_id) = c0_3di_add_owner_output(&mut backend, device, 0x3d1);
+        let mut state = ServerState::new();
+        backend.rebuild_randr_state(&mut state, None, false);
+        let (_poll, sender, _receiver) =
+            yserver_core::core_loop::channel().expect("core wake channel");
+        Backend::set_input_sender(&mut backend, sender);
+        let delivery_start = backend.core_entry_deliveries_for_tests.len();
+        c0_3di_drive_completion_loss_to_poison(
+            &mut backend,
+            &mut state,
+            device,
+            std::time::Duration::from_secs(8),
+        );
+        c0_3bi_core_driver_until_with_state(
+            &mut backend,
+            &mut state,
+            "finish the one NormalRecovery attempt",
+            std::time::Duration::from_secs(8),
+            &|backend| {
+                backend
+                    .lifecycle_coordinator
+                    .device(&device)
+                    .is_some_and(|arbiter| {
+                        arbiter.state()
+                            == crate::kms::owner::lifecycle::DeviceLifecycleState::RecoveryFailed
+                    })
+                    && c0_3di_urgent_withdrawal_count(backend, delivery_start) == 1
+            },
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(attempts.get(), 1, "the incident is attempted once");
+        assert_eq!(recovery_ids.borrow().len(), 1);
+        assert!(backend.barrier_ready(incarnation));
+        let registry = backend
+            .drm_cleanup_registry
+            .as_ref()
+            .expect("old family registry");
+        assert!(
+            registry.is_family_closed(),
+            "the old family remains quarantined closed"
+        );
+        assert_eq!(registry.incarnation(), incarnation);
+        assert!(
+            backend
+                .resource_service
+                .as_ref()
+                .is_some_and(|service| service.incarnation() == incarnation)
+        );
+        (
+            backend,
+            state,
+            device,
+            incarnation,
+            output_key,
+            output_id,
+            crtc_id,
+            attempts,
+            recovery_ids,
+            delivery_start,
+        )
+    }
+
     #[test]
     fn c0_3di_poison_requests_termination_and_retires_the_family_vulkan() {
         use std::os::fd::{AsFd, AsRawFd};
@@ -128753,7 +129101,7 @@ mod tests {
                 .device(&device)
                 .unwrap()
                 .state(),
-            crate::kms::owner::lifecycle::DeviceLifecycleState::Poisoned
+            crate::kms::owner::lifecycle::DeviceLifecycleState::RecoveryFailed
         );
         assert!(backend.platform.helper_is_reaped(device));
         assert_eq!(
@@ -128773,7 +129121,10 @@ mod tests {
                 .is_family_closed()
         );
         assert!(backend.barrier_ready(incarnation));
-        assert!(backend.poll_poisoned_barrier(device));
+        assert!(
+            !backend.pending_poisoned_barriers.contains(&device),
+            "the completed barrier is not polled or minted again after the attempt"
+        );
         let detached_caps = backend
             .platform
             .discover_completion_caps(device)
@@ -129033,6 +129384,199 @@ mod tests {
                 .is_family_closed()
         );
         c0_3di_assert_end_state(&backend, "c0_3di_unreaped_helper_blocks_the_barrier_vulkan");
+    }
+
+    #[test]
+    fn c0_3di_rec1_one_attempt_per_incident_vulkan() {
+        use yserver_core::backend::Backend;
+
+        let (
+            mut backend,
+            mut state,
+            device,
+            incarnation,
+            output_key,
+            output_id,
+            crtc_id,
+            attempts,
+            recovery_ids,
+            delivery_start,
+        ) = c0_3di_failed_recovery_fixture(super::NormalRecoveryAttemptResult::CompletionUnknown);
+        let recovery_id = recovery_ids.borrow()[0];
+        assert_eq!(
+            backend
+                .lifecycle_coordinator
+                .device(&device)
+                .and_then(|arbiter| arbiter.recovery())
+                .map(|incident| incident.id()),
+            Some(recovery_id),
+            "completion unknown fails the incident that was started"
+        );
+        c0_3bi_assert_one_urgent_withdrawal_delivered(
+            &backend,
+            &state,
+            delivery_start,
+            output_id,
+            crtc_id,
+            "unknown completion during NormalRecovery",
+        );
+
+        assert!(backend.lifecycle_set_dpms_power(3).expect("DPMS off"));
+        assert!(backend.lifecycle_set_dpms_power(0).expect("DPMS on"));
+        assert!(
+            backend
+                .lifecycle_set_dpms_power(2)
+                .expect("second DPMS off")
+        );
+        assert!(backend.lifecycle_set_dpms_power(0).expect("second DPMS on"));
+        assert!(
+            Backend::begin_crtc_config(
+                &mut backend,
+                output_id,
+                &output_key.connector_name,
+                None,
+                0,
+                0,
+            )
+            .is_err(),
+            "a client modeset is refused against the failed, withdrawn device"
+        );
+
+        let next_wakeups_before = backend
+            .core_entry_trace_for_tests
+            .borrow()
+            .iter()
+            .filter(|entry| **entry == "next_wakeup")
+            .count();
+        for _ in 0..12 {
+            backend
+                .core_driver_owner_events_for_tests
+                .push_back((device, Vec::new()));
+            c0_3bi_core_driver_until_with_state(
+                &mut backend,
+                &mut state,
+                "drive post-failure next_wakeup without a retry",
+                std::time::Duration::from_secs(1),
+                &|backend| backend.core_driver_owner_events_for_tests.is_empty(),
+                None,
+            )
+            .unwrap_or_else(|error| panic!("{error}"));
+        }
+        let next_wakeups_after = backend
+            .core_entry_trace_for_tests
+            .borrow()
+            .iter()
+            .filter(|entry| **entry == "next_wakeup")
+            .count();
+        assert!(next_wakeups_after >= next_wakeups_before + 12);
+        assert_eq!(
+            attempts.get(),
+            1,
+            "DPMS, client work and wakeups do not retry"
+        );
+        assert_eq!(recovery_ids.borrow().as_slice(), [recovery_id]);
+        let arbiter = backend
+            .lifecycle_coordinator
+            .device(&device)
+            .expect("Owner arbiter remains registered");
+        assert_eq!(
+            arbiter.state(),
+            crate::kms::owner::lifecycle::DeviceLifecycleState::RecoveryFailed
+        );
+        assert_eq!(
+            arbiter.recovery().map(|incident| incident.id()),
+            Some(recovery_id)
+        );
+        assert!(!arbiter.admission_open());
+        assert!(backend.barrier_ready(incarnation));
+        c0_3di_assert_end_state(&backend, "c0_3di_rec1_one_attempt_per_incident_vulkan");
+    }
+
+    #[test]
+    fn c0_3di_recovery_failed_withdraws_once_vulkan() {
+        let (
+            backend,
+            state,
+            _device,
+            _incarnation,
+            _output_key,
+            output_id,
+            crtc_id,
+            attempts,
+            _recovery_ids,
+            delivery_start,
+        ) = c0_3di_failed_recovery_fixture(super::NormalRecoveryAttemptResult::Failed);
+
+        c0_3bi_assert_one_urgent_withdrawal_delivered(
+            &backend,
+            &state,
+            delivery_start,
+            output_id,
+            crtc_id,
+            "failed NormalRecovery",
+        );
+        assert_eq!(
+            c0_3di_urgent_withdrawal_count(&backend, delivery_start),
+            1,
+            "one failed attempt produces one urgent withdrawal publication"
+        );
+        assert_eq!(attempts.get(), 1);
+        c0_3di_assert_end_state(&backend, "c0_3di_recovery_failed_withdraws_once_vulkan");
+    }
+
+    #[test]
+    fn c0_3di_timer_never_retries_vulkan() {
+        let (
+            mut backend,
+            mut state,
+            device,
+            incarnation,
+            _output_key,
+            _output_id,
+            _crtc_id,
+            attempts,
+            recovery_ids,
+            _delivery_start,
+        ) = c0_3di_failed_recovery_fixture(super::NormalRecoveryAttemptResult::Failed);
+        let recovery_id = recovery_ids.borrow()[0];
+        backend.vt_state = crate::vt::state::VtState::Suspended;
+
+        for _ in 0..8 {
+            backend.hotplug_rescan_deadline =
+                Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
+            backend
+                .core_driver_owner_events_for_tests
+                .push_back((device, Vec::new()));
+            c0_3bi_core_driver_until_with_state(
+                &mut backend,
+                &mut state,
+                "fire a core deadline after RecoveryFailed",
+                std::time::Duration::from_secs(1),
+                &|backend| {
+                    backend.hotplug_rescan_deadline.is_none()
+                        && backend.core_driver_owner_events_for_tests.is_empty()
+                },
+                None,
+            )
+            .unwrap_or_else(|error| panic!("{error}"));
+        }
+
+        assert_eq!(attempts.get(), 1, "deadline wakeups do not retry recovery");
+        assert_eq!(recovery_ids.borrow().as_slice(), [recovery_id]);
+        let arbiter = backend
+            .lifecycle_coordinator
+            .device(&device)
+            .expect("Owner arbiter remains registered");
+        assert_eq!(
+            arbiter.state(),
+            crate::kms::owner::lifecycle::DeviceLifecycleState::RecoveryFailed
+        );
+        assert_eq!(
+            arbiter.recovery().map(|incident| incident.id()),
+            Some(recovery_id)
+        );
+        assert!(backend.barrier_ready(incarnation));
+        c0_3di_assert_end_state(&backend, "c0_3di_timer_never_retries_vulkan");
     }
 
     #[test]

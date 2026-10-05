@@ -1210,7 +1210,14 @@ impl<O: Ord, I: Clone + Eq> LifecycleArbiter<O, I> {
         }
         self.recovery = outcome.recovery.current_incident;
         if outcome.logical.poison_device {
-            self.state = DeviceLifecycleState::Poisoned;
+            self.state = if active_kind == LifecycleKind::NormalRecovery
+                && self.recovery.is_some_and(|incident| {
+                    incident.state() == super::RecoveryIncidentState::RecoveryFailed
+                }) {
+                DeviceLifecycleState::RecoveryFailed
+            } else {
+                DeviceLifecycleState::Poisoned
+            };
             self.admission_open = false;
         } else if outcome.logical.release_seat {
             self.state = DeviceLifecycleState::Quiescing;
@@ -1374,6 +1381,7 @@ impl<O: Ord, I: Clone + Eq> LifecycleArbiter<O, I> {
                         self.recovery = resolution.incident;
                         self.state = DeviceLifecycleState::RecoveryFailed;
                         self.admission_open = false;
+                        actions.push(LifecycleAction::WithdrawOutputs(self.current_work_tag()));
                     }
                     RecoveryAttemptOutcome::Started(_) => unreachable!(),
                 }
