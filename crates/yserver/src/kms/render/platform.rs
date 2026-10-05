@@ -2618,11 +2618,30 @@ impl KmsDevice {
 /// by the backend. Implementations are selected while the backend is built;
 /// the worker path itself has no test-only fork.
 pub(crate) trait ConnectorProber: Send + Sync {
+    fn provides_live_kms_metadata(&self) -> bool {
+        true
+    }
+
+    fn duplicate_acquire_probe_fd(&self, attached: Option<&drm::Device>) -> io::Result<OwnedFd> {
+        let Some(attached) = attached else {
+            return Err(io::Error::from_raw_os_error(libc::ENODEV));
+        };
+        duplicate_connector_probe_fd(attached)
+    }
+
     fn probe_snapshot(
         &self,
         key: crate::platform::drm::DrmDeviceKey,
         fd: OwnedFd,
     ) -> io::Result<Vec<ConnectorSnapshot>>;
+
+    fn probe_acquire_snapshot(
+        &self,
+        key: crate::platform::drm::DrmDeviceKey,
+        fd: OwnedFd,
+    ) -> io::Result<Vec<ConnectorSnapshot>> {
+        self.probe_snapshot(key, fd)
+    }
 
     fn probe_connectors(
         &self,
@@ -2698,6 +2717,12 @@ pub(crate) struct ScriptedConnectorProber {
         >,
     >,
     observations: Arc<std::sync::Mutex<Vec<ProbeObservation>>>,
+    latest_snapshots: Arc<
+        std::sync::Mutex<
+            std::collections::BTreeMap<crate::platform::drm::DrmDeviceKey, Vec<ConnectorSnapshot>>,
+        >,
+    >,
+    probe_start_waker: Arc<std::sync::Mutex<Option<yserver_core::core_loop::CoreSender>>>,
 }
 
 enum ScriptedProbeAnswer {
@@ -2744,10 +2769,11 @@ impl ProbeBarrier {
         ready.notify_all();
     }
 
-    fn block_worker(&self) {
+    fn block_worker(&self, on_started: impl FnOnce()) {
         let (lock, ready) = &*self.state;
         let mut state = lock.lock().expect("probe barrier lock");
         state.0 = true;
+        on_started();
         ready.notify_all();
         while !state.1 {
             state = ready.wait(state).expect("probe barrier wait");
@@ -2768,6 +2794,28 @@ impl ScriptedConnectorProber {
         Self {
             answers: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
             observations: Arc::new(std::sync::Mutex::new(Vec::new())),
+            latest_snapshots: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
+            probe_start_waker: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    fn set_probe_start_waker(&self, waker: yserver_core::core_loop::CoreSender) {
+        *self
+            .probe_start_waker
+            .lock()
+            .expect("scripted prober wake lock") = Some(waker);
+    }
+
+    fn notify_probe_start(&self) {
+        let waker = self
+            .probe_start_waker
+            .lock()
+            .expect("scripted prober wake lock")
+            .clone();
+        if let Some(waker) = waker
+            && let Err(error) = waker.send(yserver_core::core_loop::Message::CrtcConfigReady)
+        {
+            log::warn!("kms: scripted probe start could not wake core: {error}");
         }
     }
 
@@ -2924,21 +2972,30 @@ impl ScriptedConnectorProber {
             });
         fd_closed
     }
-}
 
-impl ConnectorProber for ScriptedConnectorProber {
-    fn probe_snapshot(
+    fn run_snapshot_answer(
         &self,
         key: crate::platform::drm::DrmDeviceKey,
         fd: OwnedFd,
+        answer: ScriptedProbeAnswer,
+        allow_cached: bool,
     ) -> io::Result<Vec<ConnectorSnapshot>> {
         let fd_closed = self.observe(key, fd.as_raw_fd());
-        let result = match self.next_answer(key) {
+        let result = match answer {
             ScriptedProbeAnswer::Snapshot(result) => scripted_probe_result(result),
             ScriptedProbeAnswer::BlockSnapshot { result, barrier } => {
-                barrier.block_worker();
+                barrier.block_worker(|| self.notify_probe_start());
                 scripted_probe_result(result)
             }
+            ScriptedProbeAnswer::Unscripted if allow_cached => self
+                .latest_snapshots
+                .lock()
+                .expect("scripted prober snapshot cache lock")
+                .get(&key)
+                .cloned()
+                .ok_or_else(|| {
+                    io::Error::other(format!("unscripted acquire snapshot probe for {key}"))
+                }),
             ScriptedProbeAnswer::Unscripted => Err(io::Error::other(format!(
                 "unscripted connector snapshot probe for {key}"
             ))),
@@ -2948,7 +3005,42 @@ impl ConnectorProber for ScriptedConnectorProber {
         };
         drop(fd);
         fd_closed.store(true, std::sync::atomic::Ordering::Release);
+        if let Ok(snapshots) = &result {
+            self.latest_snapshots
+                .lock()
+                .expect("scripted prober snapshot cache lock")
+                .insert(key, snapshots.clone());
+        }
         result
+    }
+}
+
+impl ConnectorProber for ScriptedConnectorProber {
+    fn provides_live_kms_metadata(&self) -> bool {
+        false
+    }
+
+    fn duplicate_acquire_probe_fd(&self, attached: Option<&drm::Device>) -> io::Result<OwnedFd> {
+        match attached {
+            Some(attached) => duplicate_connector_probe_fd(attached),
+            None => std::fs::File::open("/dev/null").map(Into::into),
+        }
+    }
+
+    fn probe_snapshot(
+        &self,
+        key: crate::platform::drm::DrmDeviceKey,
+        fd: OwnedFd,
+    ) -> io::Result<Vec<ConnectorSnapshot>> {
+        self.run_snapshot_answer(key, fd, self.next_answer(key), false)
+    }
+
+    fn probe_acquire_snapshot(
+        &self,
+        key: crate::platform::drm::DrmDeviceKey,
+        fd: OwnedFd,
+    ) -> io::Result<Vec<ConnectorSnapshot>> {
+        self.run_snapshot_answer(key, fd, self.next_answer(key), true)
     }
 
     fn probe_connectors(
@@ -2960,7 +3052,7 @@ impl ConnectorProber for ScriptedConnectorProber {
         let result = match self.next_answer(key) {
             ScriptedProbeAnswer::Connectors(result) => scripted_probe_result(result),
             ScriptedProbeAnswer::BlockConnectors { result, barrier } => {
-                barrier.block_worker();
+                barrier.block_worker(|| self.notify_probe_start());
                 scripted_probe_result(result)
             }
             ScriptedProbeAnswer::Unscripted => Err(io::Error::other(format!(
@@ -4449,7 +4541,6 @@ impl PlatformBackend {
         Ok(())
     }
 
-    #[cfg(test)]
     pub(crate) fn allocate_test_output_scanout(
         &self,
         vk: std::sync::Arc<crate::kms::vk::device::VkContext>,
@@ -5642,6 +5733,16 @@ impl PlatformBackend {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_scripted_probe_start_waker_for_tests(
+        &mut self,
+        waker: yserver_core::core_loop::CoreSender,
+    ) {
+        self.scripted_connector_prober
+            .get_or_insert_with(ScriptedConnectorProber::new)
+            .set_probe_start_waker(waker);
+    }
+
+    #[cfg(test)]
     pub(crate) fn connector_prober_is_scripted_for_tests(&self) -> bool {
         self.connector_prober.is_scripted_for_tests()
     }
@@ -6254,10 +6355,10 @@ impl PlatformBackend {
         events
     }
 
-    /// Release helper leases at an explicit termination edge or the
-    /// helper-control socket's readable/hangup callback. The ordinary
-    /// `before_block` tick does not poll wait status while an exit event is
-    /// still pending.
+    /// Release helper leases after the control-socket callback or the
+    /// nonblocking executor tick has observed a reap proof. EOF may precede
+    /// waitpid readiness, so the core calls this after both edges and before
+    /// pruning a reaped executor's control fd.
     pub(crate) fn reap_terminated_helper_leases(&mut self) {
         for device in &mut self.devices {
             let Some(lease) = device.helper_lease else {

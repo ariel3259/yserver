@@ -2104,8 +2104,7 @@ pub struct KmsBackend {
     /// Use real connector/CRTC/plane and property discovery for the live-KMS
     /// fixtures. The ordinary Vulkan fixture intentionally keeps synthetic
     /// KMS object ids and must continue to use its seeded property schema.
-    #[cfg(test)]
-    pub(crate) acquire_uses_live_kms_discovery_for_tests: bool,
+    pub(crate) acquire_uses_live_kms_discovery: bool,
     /// Per-window geometry tracked outside `KmsCore` (v1 doesn't
     /// need it). Keyed by host xid; mutated by
     /// `register_top_level` / `register_subwindow` /
@@ -2526,6 +2525,13 @@ pub struct KmsBackend {
     /// Core-channel sender for backend-originated shutdowns. Handed in via
     /// `set_input_sender` after the channel is created in `lib.rs`.
     input_sender: Option<yserver_core::core_loop::CoreSender>,
+    /// Test core-entry driver relay for CoreSender wakes. The real core polls
+    /// Mio's waker; the synthetic driver polls backend fds with libc::poll.
+    #[cfg(test)]
+    core_driver_wake_fd_for_tests: Option<std::os::fd::OwnedFd>,
+    #[cfg(test)]
+    core_driver_messages_for_tests:
+        std::sync::Arc<std::sync::Mutex<Vec<yserver_core::core_loop::Message>>>,
     /// Optional asynchronous cross-device scanout qualifier. Absence keeps the
     /// existing synchronous `apply_crtc_config` path unchanged.
     crtc_config_probe_executor: Option<Box<dyn CrtcConfigProbeExecutor>>,
@@ -4180,6 +4186,97 @@ impl KmsBackend {
                 );
                 log::warn!("kms: could not start recovery connector probe: {error}");
                 None
+            }
+        }
+    }
+
+    /// Run acquire's forced connector refresh on the same incarnation-scoped
+    /// probe-worker path used by NormalRecovery. The worker owns its fd lease
+    /// until its tagged result is joined on the core.
+    pub(super) fn start_acquire_topology_probe(
+        &mut self,
+        device: DrmDeviceKey,
+        transition: crate::kms::owner::lifecycle::TransitionTag<IncarnationId>,
+    ) -> bool {
+        if !self.lifecycle_tag_current(device, transition)
+            || self.probe_workers.workers.contains_key(&device)
+        {
+            return false;
+        }
+        let Some(entry) = self.platform.device_for_key(device) else {
+            return false;
+        };
+        if entry.owner.as_ref().map(|owner| owner.incarnation()) != Some(transition.incarnation) {
+            return false;
+        }
+        let prober = Arc::clone(&self.platform.connector_prober);
+        let Ok(fd) = prober.duplicate_acquire_probe_fd(entry.device.attached()) else {
+            return false;
+        };
+        let epoch = self.next_probe_epoch;
+        let Some(next_epoch) = epoch.checked_add(1) else {
+            return false;
+        };
+        self.next_probe_epoch = next_epoch;
+        let lease = entry
+            .incarnation_fd_set
+            .borrow_mut()
+            .register_external_lease();
+        let fd_set = Rc::clone(&entry.incarnation_fd_set);
+        let sender = self.probe_result_sender.clone();
+        let wake = self
+            .input_sender
+            .as_ref()
+            .map(|sender| sender.clone_handle());
+        let thread = std::thread::Builder::new()
+            .name(format!(
+                "yserver-acquire-probe-{}-{}",
+                device.major, device.minor
+            ))
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    prober
+                        .probe_acquire_snapshot(device, fd)
+                        .map(ProbeWorkerAnswer::Snapshot)
+                }))
+                .unwrap_or_else(|_| Err(io::Error::from_raw_os_error(libc::EIO)));
+                if sender
+                    .send(ProbeWorkerResult {
+                        device,
+                        incarnation: Some(transition.incarnation),
+                        epoch,
+                        transition: Some(transition),
+                        result,
+                    })
+                    .is_ok()
+                    && let Some(wake) = wake
+                    && let Err(error) = wake.send(yserver_core::core_loop::Message::CrtcConfigReady)
+                {
+                    log::warn!("kms: acquire connector probe could not wake core: {error}");
+                }
+            });
+        match thread {
+            Ok(join) => {
+                self.probe_workers.workers.insert(
+                    device,
+                    ProbeWorker {
+                        incarnation: Some(transition.incarnation),
+                        epoch,
+                        transition: Some(transition),
+                        join,
+                        lease: Some((fd_set, lease)),
+                        stuck: false,
+                    },
+                );
+                true
+            }
+            Err(error) => {
+                let _ = fd_set.borrow_mut().release_with_proof(
+                    lease,
+                    crate::kms::executor::ReapProof::after_probe_worker_spawn_failed(),
+                );
+                log::warn!("kms: could not start acquire connector probe: {error}");
+                false
             }
         }
     }
@@ -9114,8 +9211,7 @@ impl KmsBackend {
             drm_hotplug_add_log_records_for_tests: Vec::new(),
             #[cfg(test)]
             core_driver_composed_offers_for_tests: Vec::new(),
-            #[cfg(test)]
-            acquire_uses_live_kms_discovery_for_tests: false,
+            acquire_uses_live_kms_discovery: true,
             cow_id: None,
             deferred_cow_release: false,
             scanout_m0: ScanoutM0Telemetry::default(),
@@ -9209,6 +9305,10 @@ impl KmsBackend {
             floating_keyboard_states: HashMap::new(),
             lock_filter_priv_by_device: HashMap::new(),
             input_sender: None,
+            #[cfg(test)]
+            core_driver_wake_fd_for_tests: None,
+            #[cfg(test)]
+            core_driver_messages_for_tests: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             crtc_config_probe_executor,
             pending_crtc_config_probes: HashMap::new(),
             ready_crtc_config_results: HashMap::new(),
@@ -10474,7 +10574,7 @@ impl KmsBackend {
             0,
             0,
         )];
-        backend.acquire_uses_live_kms_discovery_for_tests = true;
+        backend.acquire_uses_live_kms_discovery = true;
         backend.platform.rebuild_output_instance_ids_for_tests()?;
         backend.platform.fb_w = backend.platform.outputs[0].width;
         backend.platform.fb_h = backend.platform.outputs[0].height;
@@ -10770,8 +10870,7 @@ impl KmsBackend {
             drm_hotplug_add_log_records_for_tests: Vec::new(),
             #[cfg(test)]
             core_driver_composed_offers_for_tests: Vec::new(),
-            #[cfg(test)]
-            acquire_uses_live_kms_discovery_for_tests: false,
+            acquire_uses_live_kms_discovery: false,
             cow_id: None,
             deferred_cow_release: false,
             scanout_m0: ScanoutM0Telemetry::default(),
@@ -10864,6 +10963,10 @@ impl KmsBackend {
             floating_keyboard_states: HashMap::new(),
             lock_filter_priv_by_device: HashMap::new(),
             input_sender: None,
+            #[cfg(test)]
+            core_driver_wake_fd_for_tests: None,
+            #[cfg(test)]
+            core_driver_messages_for_tests: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             crtc_config_probe_executor: None,
             pending_crtc_config_probes: HashMap::new(),
             ready_crtc_config_results: HashMap::new(),
@@ -29972,7 +30075,7 @@ impl KmsBackend {
                 )
             })
         else {
-            return false;
+            return self.lifecycle_consume_acquire_probe_result(result);
         };
         if probe_epoch != result.epoch
             || Some(new_incarnation) != result.incarnation
@@ -30010,6 +30113,21 @@ impl KmsBackend {
             }
         }
         true
+    }
+
+    fn lifecycle_consume_acquire_probe_result(&mut self, result: ProbeWorkerResult) -> bool {
+        let (Some(tag), Some(incarnation)) = (result.transition, result.incarnation) else {
+            return false;
+        };
+        if result.epoch == 0 || incarnation != tag.incarnation {
+            return false;
+        }
+        let snapshots = match result.result {
+            Ok(ProbeWorkerAnswer::Snapshot(snapshots)) => Ok(snapshots),
+            Ok(ProbeWorkerAnswer::Connectors(_)) => Err(io::Error::from_raw_os_error(libc::EINVAL)),
+            Err(error) => Err(error),
+        };
+        self.lifecycle_resume_acquire_probe(result.device, tag, snapshots)
     }
 
     fn consume_probe_worker_result(
@@ -32100,6 +32218,11 @@ impl Backend for KmsBackend {
         self.telemetry.maybe_emit(self.engine.pending_count());
         let events = self.platform.tick_executors(std::time::Instant::now());
         self.record_host_call_events(events);
+        // The helper control socket can report EOF before waitpid makes the
+        // child reapable. A later tick may observe the reap and remove that
+        // socket from poll_fds, so consume its proof here before the source is
+        // pruned; otherwise the fd-family barrier can lose its final wake.
+        self.platform.reap_terminated_helper_leases();
         self.poll_poisoned_barriers();
         let now = std::time::Instant::now();
         // Pre-Cfb completion pass: runs on every device with a service,
@@ -80287,6 +80410,7 @@ mod tests {
         use std::sync::Arc;
 
         let mut backend = super::KmsBackend::for_tests_with_vk_live_scene_real_drm()?;
+        c0_3bi_enable_core_wake_driver_for_tests(&mut backend);
         let sink_vk =
             backend.platform.vk.as_ref().cloned().ok_or_else(|| {
                 std::io::Error::other("copied fixture has no sink Vulkan context")
@@ -87918,6 +88042,7 @@ mod tests {
         use std::sync::Arc;
 
         let mut backend = super::KmsBackend::for_tests_with_vk_live_scene_real_drm()?;
+        c0_3bi_enable_core_wake_driver_for_tests(&mut backend);
         let device_key = backend
             .platform
             .vk
@@ -88059,7 +88184,7 @@ mod tests {
             0,
             0,
         );
-        backend.acquire_uses_live_kms_discovery_for_tests = true;
+        backend.acquire_uses_live_kms_discovery = true;
         backend.platform.scanout_pools[0] =
             Some(crate::kms::vk::scanout::OutputScanout::Shared(pool));
         let pool_depth = backend.platform.scanout_pools[0]
@@ -89595,15 +89720,6 @@ mod tests {
             }
 
             let wakeup = Backend::next_wakeup(backend).unwrap_or(end).min(end);
-            // This test driver has no Mio Poll for CoreSender's Waker.
-            // Production workers send CrtcConfigReady even when their result
-            // is late and the episode has already ended, so model that wake
-            // while any worker remains in the ledger.
-            let wakeup = if !backend.probe_workers.workers.is_empty() {
-                wakeup.min(Instant::now() + std::time::Duration::from_millis(2))
-            } else {
-                wakeup
-            };
             let wait = wakeup.saturating_duration_since(Instant::now());
             let timeout_ms = if wait.is_zero() {
                 0
@@ -89630,6 +89746,15 @@ mod tests {
                     revents: 0,
                 })
                 .collect::<Vec<_>>();
+            let core_wake_index = backend.core_driver_wake_fd_for_tests.as_ref().map(|fd| {
+                let index = poll_fds.len();
+                poll_fds.push(libc::pollfd {
+                    fd: std::os::fd::AsRawFd::as_raw_fd(fd),
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+                index
+            });
             let count = libc::nfds_t::try_from(poll_fds.len())
                 .map_err(|_| format!("{label}: poll descriptor count overflow"))?;
             let poll_result = unsafe { libc::poll(poll_fds.as_mut_ptr(), count, timeout_ms) };
@@ -89671,6 +89796,28 @@ mod tests {
                             .into_iter()
                             .map(|(_, commit)| commit),
                     );
+                }
+            }
+            if core_wake_index.is_some_and(|index| {
+                poll_fds[index].revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0
+            }) {
+                let Some(fd) = backend.core_driver_wake_fd_for_tests.as_ref() else {
+                    unreachable!("core wake fd index requires its owned fd");
+                };
+                let mut bytes = [0_u8; 128];
+                loop {
+                    // SAFETY: bytes is writable and fd is the owned nonblocking
+                    // UnixStream reader installed for the test core wake relay.
+                    let read = unsafe {
+                        libc::read(
+                            std::os::fd::AsRawFd::as_raw_fd(fd),
+                            bytes.as_mut_ptr().cast(),
+                            bytes.len(),
+                        )
+                    };
+                    if read <= 0 {
+                        break;
+                    }
                 }
             }
             if stop_before_iteration_tail_when_done && done(backend) {
@@ -127494,7 +127641,7 @@ mod tests {
             "worker-answer acquire known release",
         );
         let (_poll, sender, receiver) = channel().expect("core wake channel");
-        Backend::set_input_sender(backend, sender);
+        let receiver = c0_3bi_install_core_wake_driver_channel_for_tests(backend, sender, receiver);
         let mut snapshot = c0_3ci_test_probe_results(backend)
             .remove(&device)
             .expect("Owner probe result")
@@ -127733,8 +127880,8 @@ mod tests {
                 .platform
                 .connector_probe_observations_for_tests()
                 .len(),
-            probe_count_while_released + 1,
-            "the acquire worker is the first probe spawned for this edge"
+            probe_count_while_released + 2,
+            "the acquire episode probe is followed by its transition-tagged preparation probe"
         );
         c0_3bi_assert_one_published_topology_episode_delivered(
             backend,
@@ -127799,7 +127946,7 @@ mod tests {
             .platform
             .script_connector_probe_for_tests(legacy, Err(io::Error::from_raw_os_error(libc::EIO)));
         let (_poll, sender, receiver) = channel().expect("core shutdown channel");
-        Backend::set_input_sender(backend, sender);
+        let receiver = c0_3bi_install_core_wake_driver_channel_for_tests(backend, sender, receiver);
         let started = std::time::Instant::now();
 
         c0_3cii_start_blocked_acquire(
@@ -127879,7 +128026,7 @@ mod tests {
             barrier_b.clone(),
         );
         let (_poll, sender, receiver) = channel().expect("core wake channel");
-        Backend::set_input_sender(backend, sender);
+        let receiver = c0_3bi_install_core_wake_driver_channel_for_tests(backend, sender, receiver);
         let delivery_start = backend.core_entry_deliveries_for_tests.len();
 
         c0_3cii_start_blocked_acquire(
@@ -128508,7 +128655,8 @@ mod tests {
                 Err(io::Error::from_raw_os_error(errno)),
             );
             let (_poll, sender, receiver) = channel().expect("core wake channel");
-            Backend::set_input_sender(backend, sender);
+            let receiver =
+                c0_3bi_install_core_wake_driver_channel_for_tests(backend, sender, receiver);
 
             let delivery_start = backend.core_entry_deliveries_for_tests.len();
             c0_3cii_start_blocked_acquire(backend, &mut state, device_a, &barrier_a, case);
@@ -129742,6 +129890,52 @@ mod tests {
         );
     }
 
+    fn c0_3cii_start_tagged_blocked_acquire(
+        backend: &mut super::KmsBackend,
+        state: &mut ServerState,
+        device: DrmDeviceKey,
+        barrier: &crate::kms::render::platform::ProbeBarrier,
+        label: &str,
+    ) {
+        backend.core_driver_vt_acquires_for_tests += 1;
+        let tagged_worker_started = |backend: &super::KmsBackend| {
+            backend
+                .probe_workers
+                .workers
+                .get(&device)
+                .is_some_and(|worker| worker.transition.is_some())
+                && backend
+                    .core_entry_trace_for_tests
+                    .borrow()
+                    .contains(&"vt_acquire")
+        };
+        let driven = c0_3bi_core_driver_until_mode(
+            backend,
+            state,
+            label,
+            std::time::Duration::from_secs(1),
+            &tagged_worker_started,
+            None,
+            false,
+            true,
+        );
+        if let Err(error) = driven {
+            assert!(tagged_worker_started(backend), "{label}: {error}");
+        }
+        assert!(
+            barrier.wait_started(std::time::Duration::from_secs(1)),
+            "{label}: the transition-tagged prober is blocked on its barrier"
+        );
+        assert!(
+            backend
+                .platform
+                .connector_probe_observations_for_tests()
+                .iter()
+                .any(|observation| observation.key == device),
+            "{label}: the tagged worker entered the scripted prober"
+        );
+    }
+
     fn c0_3cii_finish_probe_workers(
         backend: &mut super::KmsBackend,
         state: &mut ServerState,
@@ -129843,11 +130037,10 @@ mod tests {
 
     fn c0_3cii_install_core_shutdown_channel(
         backend: &mut super::KmsBackend,
-    ) -> yserver_core::core_loop::CoreReceiver {
+    ) -> CoreDriverMessageReceiverForTests {
         let (_poll, sender, receiver) =
             yserver_core::core_loop::channel().expect("core shutdown channel");
-        Backend::set_input_sender(backend, sender);
-        receiver
+        c0_3bi_install_core_wake_driver_channel_for_tests(backend, sender, receiver)
     }
 
     #[cfg(target_os = "linux")]
@@ -131284,6 +131477,15 @@ mod tests {
             c0_3cii_deliver_hotplug_once(backend, &mut state, label, &|backend| {
                 backend.drm_hotplug_records_for_tests.len() == record_start + 1
             });
+            c0_3bi_core_driver_until_with_state(
+                backend,
+                &mut state,
+                "observe the renderer removal shutdown message",
+                std::time::Duration::from_secs(3),
+                &|_| receiver.has_message(|message| matches!(message, Message::Shutdown)),
+                None,
+            )
+            .expect("renderer removal queues its core shutdown message");
             assert!(
                 receiver
                     .try_recv_all_tagged()
@@ -133201,14 +133403,28 @@ mod tests {
         let (mut fixture, device, outputs, _) =
             c0_3ci_live_release_fixture(StubBehaviour::AcceptKernelCalls(1_000), false);
         let backend = &mut fixture.backend;
-        assert!(backend.acquire_uses_live_kms_discovery_for_tests);
+        assert!(backend.acquire_uses_live_kms_discovery);
 
         // This fixture has real DRM connector/CRTC/plane handles and live
         // Vulkan scanout allocations, but its helper is an IPC stub. Preparing
         // the description exercises the acquire builder without a modeset or
         // DRM-master operation.
+        let snapshots = backend
+            .platform
+            .outputs
+            .iter()
+            .filter(|layout| layout.key.device_key == device)
+            .map(|layout| crate::kms::render::platform::ConnectorSnapshot {
+                key: layout.key.clone(),
+                modes: layout.output.modes.clone(),
+                mm_width: 0,
+                mm_height: 0,
+                edid: Vec::new(),
+                connector_type: String::new(),
+            })
+            .collect::<Vec<_>>();
         let prepared = backend
-            .lifecycle_prepare_acquire_topology(device)
+            .lifecycle_prepare_acquire_topology(device, &snapshots)
             .expect("prepare the acquire reinstall on the live-KMS Owner fixture");
         let description = prepared.description.clone();
         let rediscovered_object_ids = prepared
@@ -134951,7 +135167,7 @@ mod tests {
             .platform
             .script_connector_probe_for_tests(device, Err(io::Error::from_raw_os_error(libc::EIO)));
         let (_poll, sender, receiver) = channel().expect("core wake channel");
-        Backend::set_input_sender(backend, sender);
+        let receiver = c0_3bi_install_core_wake_driver_channel_for_tests(backend, sender, receiver);
         let delivery_start = backend.core_entry_deliveries_for_tests.len();
 
         // The executor stub only models IPC failure handling. It does not
@@ -135037,7 +135253,7 @@ mod tests {
             },
         );
         let (_poll, sender, receiver) = channel().expect("core wake channel");
-        Backend::set_input_sender(backend, sender);
+        let receiver = c0_3bi_install_core_wake_driver_channel_for_tests(backend, sender, receiver);
         let delivery_start = backend.core_entry_deliveries_for_tests.len();
         c0_3ci_acquire_with_scripted_layout_through_core_driver(
             backend,
@@ -143561,9 +143777,7 @@ mod tests {
         );
         backend
             .lifecycle_register_owner_device(vkms_key)
-            .unwrap_or_else(|error| {
-                panic!("vkms Owner qualification failed: lifecycle registration: {error:?}")
-            });
+            .unwrap_or_else(|error| panic!("{error:?}"));
 
         let card1_output_index = backend
             .platform
@@ -144786,7 +145000,84 @@ mod tests {
         backend
             .lifecycle_register_owner_device(device)
             .expect("register Owner lifecycle");
+        c0_3bi_enable_core_wake_driver_for_tests(&mut backend);
         (backend, device, incarnation)
+    }
+
+    #[derive(Clone)]
+    struct CoreDriverMessageReceiverForTests {
+        messages: std::sync::Arc<std::sync::Mutex<Vec<yserver_core::core_loop::Message>>>,
+    }
+
+    impl CoreDriverMessageReceiverForTests {
+        fn try_recv_all_tagged(
+            &self,
+        ) -> impl Iterator<Item = ((), yserver_core::core_loop::Message)> {
+            std::mem::take(&mut *self.messages.lock().expect("core message log"))
+                .into_iter()
+                .map(|message| ((), message))
+        }
+
+        fn has_message(&self, matches: impl Fn(&yserver_core::core_loop::Message) -> bool) -> bool {
+            self.messages
+                .lock()
+                .expect("core message log")
+                .iter()
+                .any(matches)
+        }
+    }
+
+    fn c0_3bi_enable_core_wake_driver_for_tests(
+        backend: &mut super::KmsBackend,
+    ) -> CoreDriverMessageReceiverForTests {
+        let (_poll, sender, receiver) =
+            yserver_core::core_loop::channel().expect("core wake channel");
+        c0_3bi_install_core_wake_driver_channel_for_tests(backend, sender, receiver)
+    }
+
+    fn c0_3bi_install_core_wake_driver_channel_for_tests(
+        backend: &mut super::KmsBackend,
+        sender: yserver_core::core_loop::CoreSender,
+        receiver: yserver_core::core_loop::CoreReceiver,
+    ) -> CoreDriverMessageReceiverForTests {
+        let (reader, writer) =
+            std::os::unix::net::UnixStream::pair().expect("create core wake relay socket");
+        reader
+            .set_nonblocking(true)
+            .expect("make core wake relay readable without blocking");
+        writer
+            .set_nonblocking(true)
+            .expect("make core wake relay writer nonblocking");
+        let read_fd: std::os::fd::OwnedFd = reader.into();
+        let write_fd: std::os::fd::OwnedFd = writer.into();
+        backend
+            .platform
+            .set_scripted_probe_start_waker_for_tests(sender.clone_handle());
+        backend.input_sender = Some(sender);
+        backend.core_driver_wake_fd_for_tests = Some(read_fd);
+        let message_log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        backend.core_driver_messages_for_tests = std::sync::Arc::clone(&message_log);
+        let relay_message_log = std::sync::Arc::clone(&message_log);
+        std::thread::Builder::new()
+            .name("yserver-test-core-wake-relay".to_string())
+            .spawn(move || {
+                use std::os::fd::AsRawFd;
+                while let Ok((_generation, message)) = receiver.recv_tagged() {
+                    relay_message_log
+                        .lock()
+                        .expect("core message log")
+                        .push(message);
+                    let byte = [1_u8];
+                    // SAFETY: write_fd stays owned by this relay thread.
+                    let _ = unsafe {
+                        libc::write(write_fd.as_raw_fd(), byte.as_ptr().cast(), byte.len())
+                    };
+                }
+            })
+            .expect("spawn core wake relay");
+        CoreDriverMessageReceiverForTests {
+            messages: message_log,
+        }
     }
 
     fn c0_3di_add_owner_output(
@@ -144993,6 +145284,10 @@ mod tests {
         let epoch = backend.next_probe_epoch;
         backend.next_probe_epoch += 1;
         let result_sender = backend.probe_result_sender.clone();
+        let wake = backend
+            .input_sender
+            .as_ref()
+            .map(yserver_core::core_loop::CoreSender::clone_handle);
         let (started_sender, started_receiver) = std::sync::mpsc::channel();
         let (release_sender, release_receiver) = std::sync::mpsc::channel();
         let thread = std::thread::Builder::new()
@@ -145011,6 +145306,9 @@ mod tests {
                     transition: None,
                     result: Ok(super::ProbeWorkerAnswer::Snapshot(Vec::new())),
                 });
+                if let Some(wake) = wake {
+                    let _ = wake.send(yserver_core::core_loop::Message::CrtcConfigReady);
+                }
             })
             .expect("spawn held test probe worker");
         backend.probe_workers.workers.insert(
@@ -145377,7 +145675,6 @@ mod tests {
         result: super::NormalRecoveryAttemptResult,
     ) -> C0RecoveryFailureFixture {
         use crate::kms::executor::test_support::StubBehaviour;
-        use yserver_core::backend::Backend;
 
         let attempts = Rc::new(Cell::new(0));
         let recovery_ids = Rc::new(RefCell::new(Vec::new()));
@@ -145393,9 +145690,6 @@ mod tests {
         let (output_key, output_id, crtc_id) = c0_3di_add_owner_output(&mut backend, device, 0x3d1);
         let mut state = ServerState::new();
         backend.rebuild_randr_state(&mut state, None, false);
-        let (_poll, sender, _receiver) =
-            yserver_core::core_loop::channel().expect("core wake channel");
-        Backend::set_input_sender(&mut backend, sender);
         let delivery_start = backend.core_entry_deliveries_for_tests.len();
         c0_3di_drive_completion_loss_to_poison(
             &mut backend,
@@ -145456,7 +145750,6 @@ mod tests {
     #[test]
     fn c0_3di_poison_requests_termination_and_retires_the_family_vulkan() {
         use std::os::fd::{AsFd, AsRawFd};
-        use yserver_core::backend::Backend;
 
         let (mut backend, device, incarnation) =
             c0_3di_barrier_backend(crate::kms::executor::test_support::StubBehaviour::NeverReply);
@@ -145582,9 +145875,6 @@ mod tests {
             Ok(Vec::new()),
             probe_barrier.clone(),
         );
-        let (_poll, sender, _receiver) =
-            yserver_core::core_loop::channel().expect("core wake channel");
-        yserver_core::backend::Backend::set_input_sender(&mut backend, sender);
         super::KmsBackend::record_display_hotplug_edge(&mut backend);
         backend.hotplug_rescan_deadline =
             Some(std::time::Instant::now() - Duration::from_millis(1));
@@ -145709,7 +145999,6 @@ mod tests {
             os::fd::{AsFd, AsRawFd},
             time::Duration,
         };
-        use yserver_core::backend::Backend;
 
         struct ResumeHelperOnDrop(libc::pid_t);
 
@@ -145815,8 +146104,6 @@ mod tests {
 
     #[test]
     fn c0_3di_rec1_one_attempt_per_incident_vulkan() {
-        use yserver_core::backend::Backend;
-
         let (
             mut backend,
             mut state,
@@ -146244,7 +146531,6 @@ mod tests {
     #[test]
     fn c0_3di_reopen_waits_for_the_barrier_vulkan() {
         use std::time::Duration;
-        use yserver_core::backend::Backend;
 
         let (mut backend, device, incarnation) =
             c0_3di_barrier_backend(crate::kms::executor::test_support::StubBehaviour::NeverReply);
@@ -146252,9 +146538,6 @@ mod tests {
         c0_3di_add_owner_output(&mut backend, device, 0x3d1);
         let mut state = ServerState::new();
         backend.rebuild_randr_state(&mut state, None, false);
-        let (_poll, sender, _receiver) =
-            yserver_core::core_loop::channel().expect("core wake channel");
-        Backend::set_input_sender(&mut backend, sender);
 
         let opens = Rc::new(Cell::new(0));
         c0_3di_install_fake_recovery_opener(&mut backend, Rc::clone(&opens));
@@ -146335,16 +146618,12 @@ mod tests {
     #[test]
     fn c0_3di_fresh_incarnation_identity_vulkan() {
         use std::time::Duration;
-        use yserver_core::backend::Backend;
 
         let (mut backend, device, incarnation) =
             c0_3di_barrier_backend(crate::kms::executor::test_support::StubBehaviour::NeverReply);
         c0_3di_add_owner_output(&mut backend, device, 0x3d1);
         let mut state = ServerState::new();
         backend.rebuild_randr_state(&mut state, None, false);
-        let (_poll, sender, _receiver) =
-            yserver_core::core_loop::channel().expect("core wake channel");
-        Backend::set_input_sender(&mut backend, sender);
         let opens = Rc::new(Cell::new(0));
         c0_3di_install_fake_recovery_opener(&mut backend, Rc::clone(&opens));
         let rediscovery_barrier = crate::kms::render::platform::ProbeBarrier::new();
@@ -146502,7 +146781,6 @@ mod tests {
     #[test]
     fn c0_3di_stale_transition_cannot_open_vulkan() {
         use std::time::Duration;
-        use yserver_core::backend::Backend;
 
         // First pin the plan's VT race: supersede the attempt while the old
         // family barrier is still pending. There is no recovery open.
@@ -146513,9 +146791,6 @@ mod tests {
             c0_3di_add_owner_output(&mut pending, pending_device, 0x3d1);
             let mut pending_state = ServerState::new();
             pending.rebuild_randr_state(&mut pending_state, None, false);
-            let (_poll, sender, _receiver) =
-                yserver_core::core_loop::channel().expect("core wake channel");
-            Backend::set_input_sender(&mut pending, sender);
             let pending_opens = Rc::new(Cell::new(0));
             c0_3di_install_fake_recovery_opener(&mut pending, Rc::clone(&pending_opens));
             let old_worker_release = c0_3di_hold_probe_worker_for_barrier(
@@ -146571,9 +146846,6 @@ mod tests {
         c0_3di_add_owner_output(&mut backend, device, 0x3d1);
         let mut state = ServerState::new();
         backend.rebuild_randr_state(&mut state, None, false);
-        let (_poll, sender, _receiver) =
-            yserver_core::core_loop::channel().expect("core wake channel");
-        Backend::set_input_sender(&mut backend, sender);
         let opens = Rc::new(Cell::new(0));
         c0_3di_install_fake_recovery_opener_with_behaviour(
             &mut backend,
@@ -146697,7 +146969,6 @@ mod tests {
     #[test]
     fn c0_3di_vt_release_supersedes_recovery_after_poison_vulkan() {
         use std::time::Duration;
-        use yserver_core::backend::Backend;
 
         let release_vt = |backend: &mut super::KmsBackend,
                           state: &mut ServerState,
@@ -146742,9 +147013,6 @@ mod tests {
         c0_3di_add_owner_output(&mut pending, pending_device, 0x3d1);
         let mut pending_state = ServerState::new();
         pending.rebuild_randr_state(&mut pending_state, None, false);
-        let (_poll, sender, _receiver) =
-            yserver_core::core_loop::channel().expect("core wake channel");
-        Backend::set_input_sender(&mut pending, sender);
         let pending_opens = Rc::new(Cell::new(0));
         c0_3di_install_fake_recovery_opener(&mut pending, Rc::clone(&pending_opens));
         let old_worker_release =
@@ -146818,9 +147086,6 @@ mod tests {
         c0_3di_add_owner_output(&mut recovering, recovering_device, 0x3d1);
         let mut recovering_state = ServerState::new();
         recovering.rebuild_randr_state(&mut recovering_state, None, false);
-        let (_poll, sender, _receiver) =
-            yserver_core::core_loop::channel().expect("core wake channel");
-        Backend::set_input_sender(&mut recovering, sender);
         let recovering_opens = Rc::new(Cell::new(0));
         c0_3di_install_fake_recovery_opener(&mut recovering, Rc::clone(&recovering_opens));
         let rediscovery_barrier = crate::kms::render::platform::ProbeBarrier::new();
@@ -146918,9 +147183,6 @@ mod tests {
         c0_3di_add_owner_output(&mut failed, failed_device, 0x3d1);
         let mut failed_state = ServerState::new();
         failed.rebuild_randr_state(&mut failed_state, None, false);
-        let (_poll, sender, _receiver) =
-            yserver_core::core_loop::channel().expect("core wake channel");
-        Backend::set_input_sender(&mut failed, sender);
         c0_3di_drive_completion_loss_to_poison(
             &mut failed,
             &mut failed_state,
@@ -146967,7 +147229,6 @@ mod tests {
     #[test]
     fn c0_3di_rediscovery_probe_is_off_the_core_vulkan() {
         use std::time::Duration;
-        use yserver_core::backend::Backend;
 
         let core_thread = std::thread::current().id();
         let (mut backend, device, old_incarnation) =
@@ -146975,9 +147236,6 @@ mod tests {
         c0_3di_add_owner_output(&mut backend, device, 0x3d1);
         let mut state = ServerState::new();
         backend.rebuild_randr_state(&mut state, None, false);
-        let (_poll, sender, _receiver) =
-            yserver_core::core_loop::channel().expect("core wake channel");
-        Backend::set_input_sender(&mut backend, sender);
         let opens = Rc::new(Cell::new(0));
         c0_3di_install_fake_recovery_opener(&mut backend, Rc::clone(&opens));
         let probe_barrier = crate::kms::render::platform::ProbeBarrier::new();
@@ -147116,16 +147374,12 @@ mod tests {
     #[test]
     fn c0_3di_reopen_handshake_is_off_the_core_vulkan() {
         use std::time::{Duration, Instant};
-        use yserver_core::backend::Backend;
 
         let (mut backend, device, old_incarnation) =
             c0_3di_barrier_backend(crate::kms::executor::test_support::StubBehaviour::NeverReply);
         c0_3di_add_owner_output(&mut backend, device, 0x3d1);
         let mut state = ServerState::new();
         backend.rebuild_randr_state(&mut state, None, false);
-        let (_poll, sender, _receiver) =
-            yserver_core::core_loop::channel().expect("core wake channel");
-        Backend::set_input_sender(&mut backend, sender);
         let opens = Rc::new(Cell::new(0));
         c0_3di_install_fake_recovery_opener_with_behaviour(
             &mut backend,
@@ -147278,6 +147532,258 @@ mod tests {
                 .is_empty()
         );
         c0_3di_assert_end_state(&backend, "c0_3di_reopen_handshake_is_off_the_core_vulkan");
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3di_preparation_probe_is_off_the_core_vulkan() {
+        use crate::kms::executor::test_support::StubBehaviour;
+        use std::{io::Read, time::Duration};
+        use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
+
+        let (mut fixture, device, outputs, _) =
+            c0_3ci_live_release_fixture(StubBehaviour::AcceptKernelCalls(1_000), false);
+        let backend = &mut fixture.backend;
+        backend.vt_skip_master_ioctls_for_tests = true;
+        backend.platform.owner_completion_detached = true;
+        let mut state = c0_3ci_core_state(backend);
+        c0_3ci_release_owner_to_suspended(backend, &mut state, device, "Task 5 fixture release");
+        let snapshot = c0_3ci_test_probe_results(backend)
+            .remove(&device)
+            .expect("Owner snapshot")
+            .expect("healthy Owner probe");
+        backend
+            .platform
+            .install_scripted_connector_prober_for_tests();
+        backend
+            .platform
+            .queue_connector_probe_for_tests(device, Ok(snapshot.clone()));
+        let barrier = crate::kms::render::platform::ProbeBarrier::new();
+        backend.platform.queue_blocked_connector_probe_for_tests(
+            device,
+            Ok(snapshot),
+            barrier.clone(),
+        );
+        let descriptions_before = backend.lifecycle_drivers[&device]
+            .acquire_topology_descriptions_for_tests()
+            .len();
+        let validations_before = backend.lifecycle_drivers[&device]
+            .topology_test_stats()
+            .0
+            .len();
+        c0_3cii_start_tagged_blocked_acquire(
+            backend,
+            &mut state,
+            device,
+            &barrier,
+            "hold transition-tagged acquire preparation probe",
+        );
+        let mut peer = c0_3aii_install_dpms_core_client(&mut state, 74);
+        let outcome = yserver_core::core_loop::process_request::process_request(
+            &mut state,
+            backend,
+            ClientId(74),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 128,
+                data: yserver_protocol::x11::randr::RR_GET_SCREEN_RESOURCES_CURRENT,
+                length_units: 2,
+            },
+            &yserver_core::resources::ROOT_WINDOW.0.to_le_bytes(),
+            None,
+        )
+        .expect("serve RandR query while the forced probe is blocked");
+        assert!(matches!(
+            outcome,
+            yserver_core::core_loop::process_request::RequestOutcome::Handled
+        ));
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "serve query and deadline while preparation probe is blocked",
+            Duration::from_millis(100),
+            &|_| true,
+            None,
+        )
+        .expect("the core remains responsive during the blocked worker");
+        let mut reply = [0; 32];
+        peer.read_exact(&mut reply)
+            .expect("RandR reply arrives while worker is blocked");
+        assert_eq!(reply[0], 1);
+        backend.core_driver_vt_releases_for_tests += 1;
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "VT release supersedes blocked acquire preparation",
+            Duration::from_secs(2),
+            &|backend| {
+                backend.vt_state == crate::vt::state::VtState::Suspended
+                    && backend.owner_vt_release.is_none()
+            },
+            None,
+        )
+        .expect("VT release wins over the blocked preparation");
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .acquire_topology_descriptions_for_tests()
+                .len(),
+            descriptions_before
+        );
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .topology_test_stats()
+                .0
+                .len(),
+            validations_before,
+            "no install validation is sent for the superseded acquire"
+        );
+        barrier.release();
+        c0_3cii_finish_probe_workers(backend, &mut state, "join stale preparation probe");
+        let expected = c0_3ci_expected_end_state_with_acquire_preparation(backend, outputs);
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3di_preparation_probe_is_off_the_core_vulkan",
+            &expected,
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3di_stale_preparation_probe_discarded_vulkan() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let (mut fixture, device, outputs, _) =
+            c0_3ci_live_release_fixture(StubBehaviour::AcceptKernelCalls(1_000), false);
+        let backend = &mut fixture.backend;
+        backend.vt_skip_master_ioctls_for_tests = true;
+        backend.platform.owner_completion_detached = true;
+        let mut state = c0_3ci_core_state(backend);
+        c0_3ci_release_owner_to_suspended(backend, &mut state, device, "stale-result fixture");
+        let snapshot = c0_3ci_test_probe_results(backend)
+            .remove(&device)
+            .expect("Owner snapshot")
+            .expect("healthy Owner probe");
+        backend
+            .platform
+            .install_scripted_connector_prober_for_tests();
+        backend
+            .platform
+            .queue_connector_probe_for_tests(device, Ok(snapshot.clone()));
+        let barrier = crate::kms::render::platform::ProbeBarrier::new();
+        backend.platform.queue_blocked_connector_probe_for_tests(
+            device,
+            Ok(snapshot),
+            barrier.clone(),
+        );
+        let descriptions_before = backend.lifecycle_drivers[&device]
+            .acquire_topology_descriptions_for_tests()
+            .len();
+        c0_3cii_start_tagged_blocked_acquire(
+            backend,
+            &mut state,
+            device,
+            &barrier,
+            "start acquire before stale-result release",
+        );
+        backend.core_driver_vt_releases_for_tests += 1;
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "supersede transition before late probe answer",
+            std::time::Duration::from_secs(2),
+            &|backend| backend.vt_state == crate::vt::state::VtState::Suspended,
+            None,
+        )
+        .expect("release supersedes acquire");
+        barrier.release();
+        c0_3cii_finish_probe_workers(backend, &mut state, "join and discard stale result");
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .acquire_topology_descriptions_for_tests()
+                .len(),
+            descriptions_before,
+            "late probe result from the old transition installs nothing"
+        );
+        assert!(
+            backend.lifecycle_drivers[&device]
+                .acquire_probe_cache_tags_for_tests()
+                .is_empty(),
+            "late probe result from the old transition is not retained for a later dispatch"
+        );
+        let expected = c0_3ci_expected_end_state_with_acquire_preparation(backend, outputs);
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3di_stale_preparation_probe_discarded_vulkan",
+            &expected,
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3ci_acquire_reinstall_probe_off_core_vulkan() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let (mut fixture, device, outputs, _) =
+            c0_3ci_live_release_fixture(StubBehaviour::AcceptKernelCalls(1_000), false);
+        let backend = &mut fixture.backend;
+        backend.vt_skip_master_ioctls_for_tests = true;
+        let mut state = c0_3ci_core_state(backend);
+        c0_3ci_release_owner_to_suspended(backend, &mut state, device, "reinstall probe fixture");
+        let snapshot = c0_3ci_test_probe_results(backend)
+            .remove(&device)
+            .expect("Owner snapshot")
+            .expect("healthy Owner probe");
+        backend
+            .platform
+            .install_scripted_connector_prober_for_tests();
+        backend
+            .platform
+            .queue_connector_probe_for_tests(device, Ok(snapshot.clone()));
+        let barrier = crate::kms::render::platform::ProbeBarrier::new();
+        backend.platform.queue_blocked_connector_probe_for_tests(
+            device,
+            Ok(snapshot),
+            barrier.clone(),
+        );
+        let before = backend.lifecycle_drivers[&device]
+            .acquire_topology_descriptions_for_tests()
+            .len();
+        c0_3cii_start_tagged_blocked_acquire(
+            backend,
+            &mut state,
+            device,
+            &barrier,
+            "block acquire reinstall probe off core",
+        );
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .acquire_topology_descriptions_for_tests()
+                .len(),
+            before,
+            "preparation remains pending until probe completion"
+        );
+        barrier.release();
+        c0_3cii_finish_probe_workers(backend, &mut state, "join acquire reinstall probe");
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "continue acquire preparation after worker join",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend.lifecycle_drivers[&device]
+                    .acquire_topology_descriptions_for_tests()
+                    .len()
+                    > before
+            },
+            None,
+        )
+        .expect("preparation resumes after the worker has joined");
+        let expected = c0_3ci_expected_end_state_with_acquire_preparation(backend, outputs);
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3ci_acquire_reinstall_probe_off_core_vulkan",
+            &expected,
+        );
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! between that source, A1's pure decider, and the managed 2c-i seams.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     sync::Arc,
 };
 
@@ -565,6 +565,9 @@ pub(crate) struct LifecycleDriver {
     topology_commits: BTreeMap<CommitId, TransitionTag<IncarnationId>>,
     topology_prepared_acquire: BTreeMap<CommitId, PreparedAcquireTopology>,
     topology_prepared_hotplug: BTreeMap<CommitId, PreparedHotplugTopology>,
+    pending_acquire_probe: Option<PendingAcquireProbe>,
+    acquire_probe_snapshots:
+        HashMap<TransitionTag<IncarnationId>, Vec<crate::kms::render::platform::ConnectorSnapshot>>,
     client_modeset_commits: BTreeMap<CommitId, ClientModesetTag<IncarnationId>>,
     topology_dpms_active: BTreeMap<CommitId, bool>,
     owner_commit_power_changes: BTreeMap<CommitId, Vec<OwnerCrtcPowerChange>>,
@@ -609,6 +612,12 @@ pub(crate) struct LifecycleDriver {
     hotplug_topology_description: Option<CommitDescription>,
 }
 
+struct PendingAcquireProbe {
+    tag: TransitionTag<IncarnationId>,
+    decision: AdmissionDecision,
+    token: AdmissionToken,
+}
+
 impl LifecycleDriver {
     pub(crate) fn has_cancelled_sent_topology_validation(&self) -> bool {
         self.pending_topology_validations
@@ -626,6 +635,8 @@ impl LifecycleDriver {
             topology_commits: BTreeMap::new(),
             topology_prepared_acquire: BTreeMap::new(),
             topology_prepared_hotplug: BTreeMap::new(),
+            pending_acquire_probe: None,
+            acquire_probe_snapshots: HashMap::new(),
             client_modeset_commits: BTreeMap::new(),
             topology_dpms_active: BTreeMap::new(),
             owner_commit_power_changes: BTreeMap::new(),
@@ -674,6 +685,11 @@ impl LifecycleDriver {
     #[cfg(test)]
     pub(crate) fn acquire_topology_descriptions_for_tests(&self) -> &[CommitDescription] {
         &self.acquire_topology_descriptions
+    }
+
+    #[cfg(test)]
+    pub(crate) fn acquire_probe_cache_tags_for_tests(&self) -> Vec<TransitionTag<IncarnationId>> {
+        self.acquire_probe_snapshots.keys().copied().collect()
     }
 
     #[cfg(test)]
@@ -1946,6 +1962,51 @@ impl KmsBackend {
         }
     }
 
+    pub(super) fn lifecycle_resume_acquire_probe(
+        &mut self,
+        device: DrmDeviceKey,
+        tag: TransitionTag<IncarnationId>,
+        result: std::io::Result<Vec<crate::kms::render::platform::ConnectorSnapshot>>,
+    ) -> bool {
+        let pending = self.lifecycle_drivers.get_mut(&device).and_then(|driver| {
+            if driver
+                .pending_acquire_probe
+                .as_ref()
+                .is_some_and(|pending| pending.tag == tag)
+            {
+                driver.pending_acquire_probe.take()
+            } else {
+                None
+            }
+        });
+        let Some(pending) = pending else {
+            return false;
+        };
+        if !self.lifecycle_tag_current(device, tag) {
+            self.admission_abort(device, pending.token);
+            return true;
+        }
+        match result {
+            Ok(snapshots) => {
+                if let Some(driver) = self.lifecycle_drivers.get_mut(&device) {
+                    driver.acquire_probe_snapshots.insert(tag, snapshots);
+                }
+                let _ = self.admission_dispatch_lifecycle_topology(
+                    device,
+                    pending.token,
+                    pending.decision,
+                    tag,
+                );
+            }
+            Err(error) => {
+                log::warn!("VTAcquire connector rediscovery failed: {error}");
+                self.admission_abort(device, pending.token);
+                self.lifecycle_report_never_dispatched(device, tag);
+            }
+        }
+        true
+    }
+
     pub(super) fn lifecycle_tag_current(
         &self,
         device: DrmDeviceKey,
@@ -2703,7 +2764,6 @@ impl KmsBackend {
                     clock_key: None,
                     mode_blob: None,
                     allocation_keys: Vec::new(),
-                    #[cfg(test)]
                     framebuffer_handles_for_tests: Vec::new(),
                 },
             });
@@ -2912,7 +2972,6 @@ impl KmsBackend {
             clock_key,
             mode_blob: None,
             allocation_keys: Vec::new(),
-            #[cfg(test)]
             framebuffer_handles_for_tests: Vec::new(),
         };
 
@@ -2962,7 +3021,6 @@ impl KmsBackend {
             } else {
                 return Err(preparation_error(Stage::Allocation));
             }
-            #[cfg(test)]
             let framebuffer_handles_for_tests = scanout
                 .display_pool()
                 .bos
@@ -3012,10 +3070,7 @@ impl KmsBackend {
             prepared_set.scanout = Some(scanout);
             prepared_set.scene = Some(scene);
             prepared_set.allocation_keys = allocation_keys;
-            #[cfg(test)]
-            {
-                prepared_set.framebuffer_handles_for_tests = framebuffer_handles_for_tests;
-            }
+            prepared_set.framebuffer_handles_for_tests = framebuffer_handles_for_tests;
             (mode_blob_id, framebuffer)
         } else {
             (0, 0)
@@ -3175,11 +3230,10 @@ impl KmsBackend {
     pub(super) fn lifecycle_prepare_acquire_topology(
         &mut self,
         device: DrmDeviceKey,
+        snapshots: &[crate::kms::render::platform::ConnectorSnapshot],
     ) -> Result<PreparedAcquireTopology, String> {
         use crate::{
-            drm::modeset::{
-                PropMap, discover_output_for_connector, output_for_exact_probe_assignment,
-            },
+            drm::modeset::PropMap,
             kms::render::{
                 admission::PreparedAcquireOutput,
                 client_modeset::{
@@ -3267,48 +3321,30 @@ impl KmsBackend {
         let mut crtc_state = Vec::with_capacity(requests.len());
         let mut prepared_sets = Vec::with_capacity(requests.len());
         let mut common_property_ids = None;
-        let mut reserved_routes = requests
-            .iter()
-            .map(|(_, _, output, _, _, _, _, _, _)| (output.encoder, output.crtc, output.plane))
-            .collect::<Vec<_>>();
-
         let prepare_outputs = (|| -> Result<(), String> {
             for (_index, key, old_output, _route, width, height, vrefresh, x, y) in requests {
-                let requested_mode = yserver_core::backend::ModeSpec {
-                    width,
-                    height,
-                    vrefresh,
-                };
-                #[cfg(test)]
-                let use_live_kms_discovery = self.acquire_uses_live_kms_discovery_for_tests
-                    && drm_device.resource_handles().is_ok_and(|resources| {
-                        resources.connectors().contains(&old_output.connector)
-                    });
-                // Live-KMS fixtures can also carry synthetic secondary Owner
-                // outputs. Keep those on their seeded schema; real connectors
-                // use the same fresh object/property discovery as production.
-                #[cfg(test)]
-                let output = if use_live_kms_discovery {
-                    reserved_routes.retain(|(_, crtc, _)| *crtc != old_output.crtc);
-                    let discovered = discover_output_for_connector(
-                        &drm_device,
-                        &key.connector_name,
-                        &reserved_routes,
-                    )
-                    .map_err(|error| format!("acquire output discovery for {key:?}: {error}"))?;
-                    let output = output_for_exact_probe_assignment(
-                        &drm_device,
-                        discovered.connector,
-                        discovered.encoder,
-                        discovered.crtc,
-                        discovered.plane,
-                        requested_mode,
-                    )
-                    .map_err(|error| format!("acquire exact mode for {key:?}: {error}"))?;
-                    reserved_routes.push((output.encoder, output.crtc, output.plane));
-                    output
+                let use_live_kms_discovery = self.acquire_uses_live_kms_discovery
+                    && self.platform.connector_prober.provides_live_kms_metadata();
+                let mut output = old_output;
+                if let Some(snapshot) = snapshots.iter().find(|snapshot| snapshot.key == key) {
+                    let Some(selected) = snapshot.modes.iter().find(|mode| {
+                        mode.width == width && mode.height == height && mode.vrefresh == vrefresh
+                    }) else {
+                        return Err(format!(
+                            "acquire forced probe found no requested mode for {key:?}"
+                        ));
+                    };
+                    output.picked = selected.clone();
+                    output.modes = snapshot.modes.clone();
+                } else if use_live_kms_discovery {
+                    return Err(format!(
+                        "acquire forced probe did not find connected {key:?}"
+                    ));
                 } else {
-                    let mut output = old_output;
+                    // The scripted fixture seam may use synthetic connectors
+                    // that are absent from its DRM fd. It still executes the
+                    // same asynchronous worker path; seeded modes model the
+                    // worker's answer for those synthetic outputs.
                     let selected = output
                         .modes
                         .iter()
@@ -3320,29 +3356,7 @@ impl KmsBackend {
                         .cloned()
                         .unwrap_or_else(|| output.picked.clone());
                     output.picked = selected;
-                    output
-                };
-                #[cfg(not(test))]
-                let output = {
-                    reserved_routes.retain(|(_, crtc, _)| *crtc != old_output.crtc);
-                    let discovered = discover_output_for_connector(
-                        &drm_device,
-                        &key.connector_name,
-                        &reserved_routes,
-                    )
-                    .map_err(|error| format!("acquire output discovery for {key:?}: {error}"))?;
-                    let output = output_for_exact_probe_assignment(
-                        &drm_device,
-                        discovered.connector,
-                        discovered.encoder,
-                        discovered.crtc,
-                        discovered.plane,
-                        requested_mode,
-                    )
-                    .map_err(|error| format!("acquire exact mode for {key:?}: {error}"))?;
-                    reserved_routes.push((output.encoder, output.crtc, output.plane));
-                    output
-                };
+                }
                 let projection = stage_dpms_projection(key.clone(), level, epoch)
                     .map_err(|error| format!("acquire DPMS projection for {key:?}: {error}"))?;
                 let properties = {
@@ -3352,7 +3366,6 @@ impl KmsBackend {
                         .iter_mut()
                         .find(|entry| entry.key == device)
                         .ok_or_else(|| "VTAcquire device entry disappeared".to_string())?;
-                    #[cfg(test)]
                     let common = if use_live_kms_discovery {
                         discover_composed_property_ids(
                             &drm_device,
@@ -3374,18 +3387,6 @@ impl KmsBackend {
                                 .unwrap_or(22),
                         }
                     };
-                    #[cfg(not(test))]
-                    let common = discover_composed_property_ids(
-                        &drm_device,
-                        &[ComposedPlane {
-                            output: &output,
-                            framebuffer: ::drm::control::from_u32(1)
-                                .expect("property discovery framebuffer is nonzero"),
-                        }],
-                        &mut device_entry.active_property_cache,
-                    )
-                    .map_err(|error| format!("acquire KMS properties for {key:?}: {error}"))?;
-                    #[cfg(test)]
                     let (connector_crtc_id, crtc_mode_id) = if use_live_kms_discovery {
                         (
                             u32::from(
@@ -3406,23 +3407,6 @@ impl KmsBackend {
                     } else {
                         (23, 24)
                     };
-                    #[cfg(not(test))]
-                    let (connector_crtc_id, crtc_mode_id) = (
-                        u32::from(
-                            PropMap::for_object(&drm_device, output.connector)
-                                .and_then(|properties| properties.id("CRTC_ID"))
-                                .map_err(|error| {
-                                    format!("acquire connector CRTC_ID for {key:?}: {error}")
-                                })?,
-                        ),
-                        u32::from(
-                            PropMap::for_object(&drm_device, output.crtc)
-                                .and_then(|properties| properties.id("MODE_ID"))
-                                .map_err(|error| {
-                                    format!("acquire CRTC MODE_ID for {key:?}: {error}")
-                                })?,
-                        ),
-                    );
                     ClientModesetPropertyIds {
                         connector_crtc_id,
                         crtc_mode_id,
@@ -3441,7 +3425,6 @@ impl KmsBackend {
                 };
                 let common = properties.common;
                 common_property_ids.get_or_insert(common);
-                #[cfg(test)]
                 let (mode_blob_id, mode_blob) = if use_live_kms_discovery {
                     let raw: u64 = drm_device
                         .create_property_blob(&output.mode)
@@ -3457,46 +3440,27 @@ impl KmsBackend {
                 } else {
                     (0x1000u32.saturating_add(u32::from(output.crtc)), None)
                 };
-                #[cfg(not(test))]
-                let (mode_blob_id, mode_blob) = {
-                    let raw: u64 = drm_device
-                        .create_property_blob(&output.mode)
-                        .map_err(|error| format!("acquire MODE_ID blob for {key:?}: {error}"))?
-                        .into();
-                    let blob = crate::kms::render::client_modeset::OwnedModeBlob::new(
-                        std::rc::Rc::clone(&drm_device),
-                        raw,
-                    );
-                    let id = u32::try_from(raw)
-                        .map_err(|_| format!("acquire MODE_ID blob handle overflow for {key:?}"))?;
-                    (id, Some(blob))
-                };
-                let mut scanout = {
-                    #[cfg(test)]
-                    {
-                        let vk = self.platform.vk.as_ref().cloned().ok_or_else(|| {
-                            "VTAcquire test fixture has no Vulkan context".to_string()
-                        })?;
-                        self.platform
-                            .allocate_test_output_scanout(vk, _index)
-                            .map_err(|error| {
-                                format!("acquire fresh test scanout for {key:?}: {error}")
-                            })?
-                    }
-                    #[cfg(not(test))]
-                    {
-                        self.platform
-                            .allocate_prepared_client_scanout_pool(
-                                std::rc::Rc::clone(&drm_device),
-                                &output,
-                                _route,
-                                u32::from(width),
-                                u32::from(height),
-                            )
-                            .map_err(|error| {
-                                format!("acquire fresh scanout pool for {key:?}: {error}")
-                            })?
-                    }
+                let mut scanout = if use_live_kms_discovery {
+                    self.platform
+                        .allocate_prepared_client_scanout_pool(
+                            std::rc::Rc::clone(&drm_device),
+                            &output,
+                            _route,
+                            u32::from(width),
+                            u32::from(height),
+                        )
+                        .map_err(|error| {
+                            format!("acquire fresh scanout pool for {key:?}: {error}")
+                        })?
+                } else {
+                    let vk = self.platform.vk.as_ref().cloned().ok_or_else(|| {
+                        "scripted acquire fixture has no Vulkan context".to_string()
+                    })?;
+                    self.platform
+                        .allocate_test_output_scanout(vk, _index)
+                        .map_err(|error| {
+                            format!("acquire fresh scripted scanout for {key:?}: {error}")
+                        })?
                 };
                 let framebuffer = scanout
                     .display_pool()
@@ -3612,7 +3576,6 @@ impl KmsBackend {
                         clock_key: Some(clock_key),
                         mode_blob,
                         allocation_keys,
-                        #[cfg(test)]
                         framebuffer_handles_for_tests: Vec::new(),
                     },
                 });
@@ -4049,7 +4012,6 @@ impl KmsBackend {
                         clock_key: Some(clock_key),
                         mode_blob,
                         allocation_keys,
-                        #[cfg(test)]
                         framebuffer_handles_for_tests: Vec::new(),
                     },
                 });
@@ -4379,8 +4341,45 @@ impl KmsBackend {
                         | crate::kms::owner::lifecycle::LifecycleKind::TopologyRebuild
                 )
             });
+        if acquire_install
+            && !self
+                .lifecycle_drivers
+                .get(&device)
+                .is_some_and(|driver| driver.acquire_probe_snapshots.contains_key(&tag))
+        {
+            let already_pending = self
+                .lifecycle_drivers
+                .get(&device)
+                .and_then(|driver| driver.pending_acquire_probe.as_ref())
+                .is_some_and(|pending| pending.tag == tag);
+            if !already_pending
+                && self.start_acquire_topology_probe(device, tag)
+                && let Some(driver) = self.lifecycle_drivers.get_mut(&device)
+            {
+                driver.pending_acquire_probe = Some(PendingAcquireProbe {
+                    tag,
+                    decision,
+                    token,
+                });
+                return AdmissionOutcome::NothingAdmissible;
+            }
+            if already_pending {
+                // The transition already owns an outstanding probe and its
+                // admission token. A duplicate lifecycle delivery is inert.
+                self.admission_abort(device, token);
+                return AdmissionOutcome::NothingAdmissible;
+            }
+            self.admission_abort(device, token);
+            self.lifecycle_report_never_dispatched(device, tag);
+            return AdmissionOutcome::BeginRefused;
+        }
         let prepared_acquire = if acquire_install {
-            match self.lifecycle_prepare_acquire_topology(device) {
+            let snapshots = self
+                .lifecycle_drivers
+                .get_mut(&device)
+                .and_then(|driver| driver.acquire_probe_snapshots.remove(&tag))
+                .unwrap_or_default();
+            match self.lifecycle_prepare_acquire_topology(device, &snapshots) {
                 Ok(prepared) => Some(prepared),
                 Err(error) => {
                     log::warn!("VTAcquire topology preparation refused: {error}");

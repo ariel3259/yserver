@@ -100,7 +100,6 @@ pub(crate) struct PreparedClientModesetSet {
     pub(crate) clock_key: Option<crate::kms::owner::clock::ClockKey>,
     pub(crate) mode_blob: Option<OwnedModeBlob>,
     pub(crate) allocation_keys: Vec<crate::kms::render::resources::AllocationKey>,
-    #[cfg(test)]
     pub(crate) framebuffer_handles_for_tests: Vec<u32>,
 }
 
