@@ -44619,6 +44619,110 @@ mod tests {
     }
 
     #[test]
+    fn xi_client_disabled_facet_stays_disabled_across_vt_round_trip() {
+        use yserver_core::{
+            backend::Backend,
+            core_loop::HostInputEvent,
+            server::ServerState,
+            xinput::{InputSourceId, XiFacetKind},
+        };
+
+        // Mutation killed: clear client_disabled when DeviceResumed arrives,
+        // thereby enabling every facet on VT entry. Xorg preserves the
+        // XI86_DEVICE_DISABLED flag and skips EnableDevice for that device
+        // (xf86Events.c:307-320).
+        const SOURCE: InputSourceId = InputSourceId(0xD4_06);
+        let mut state = ServerState::new();
+        let original_core_properties =
+            [2, 3, 4, 5].map(|id| state.xi_devices.device(id).unwrap().properties.clone());
+        let mut backend = KmsBackend::for_tests();
+        let mut peer = kbd_map_client_id(&mut state, 5);
+        let info = dynamic_test_device(SOURCE, true, true);
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceAdded(info.clone()),
+        );
+        let pointer = state
+            .xi_devices
+            .facet(SOURCE, XiFacetKind::PointerTouch)
+            .expect("mixed source pointer facet");
+        let keyboard = state
+            .xi_devices
+            .facet(SOURCE, XiFacetKind::Keyboard)
+            .expect("mixed source keyboard facet");
+        select_device_enabled_transition_events(&mut state, &mut backend, pointer, 1);
+        let _ = kbd_map_drain(&mut peer);
+
+        let disable = device_enabled_write_body_xi2(
+            pointer,
+            state.xi_device_enabled_atom.0,
+            8,
+            yserver_core::xinput::XA_INTEGER.0,
+            &[0],
+        );
+        let disabled =
+            device_enabled_request_bytes(&mut state, &mut backend, &mut peer, 57, 4, &disable);
+        assert_eq!(
+            device_enabled_event_kinds(&disabled),
+            [
+                "xi2-property",
+                "xi1-property",
+                "presence",
+                "hierarchy",
+                "xi2-property",
+                "xi1-property"
+            ],
+            "the real XIChangeProperty request disables the pointer facet"
+        );
+        assert!(state.xi_devices.device(pointer).unwrap().client_disabled);
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceSuspended { source_id: SOURCE },
+        );
+        let suspended = kbd_map_drain(&mut peer);
+        assert_eq!(
+            device_enabled_event_kinds(&suspended),
+            ["xi2-property", "presence", "hierarchy"],
+            "VT leave publishes the still-enabled keyboard only"
+        );
+        let pointer_device = state.xi_devices.device(pointer).unwrap();
+        assert!(!pointer_device.enabled);
+        assert!(pointer_device.client_disabled);
+        assert_eq!(pointer_device.attached_master, None);
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceResumed(info),
+        );
+        let resumed = kbd_map_drain(&mut peer);
+        assert_eq!(
+            device_enabled_event_kinds(&resumed),
+            ["xi2-property", "presence", "hierarchy"],
+            "VT entry enables the keyboard only, with no pointer-facet events"
+        );
+        let pointer_device = state.xi_devices.device(pointer).unwrap();
+        assert!(!pointer_device.enabled);
+        assert!(pointer_device.client_disabled);
+        assert_eq!(pointer_device.attached_master, None);
+        assert_eq!(
+            pointer_device.properties[&state.xi_device_enabled_atom].data,
+            [0]
+        );
+        assert!(state.xi_devices.device(keyboard).unwrap().enabled);
+
+        assert_device_enabled_write_cleanup(
+            &mut state,
+            &mut backend,
+            SOURCE,
+            &original_core_properties,
+        );
+    }
+
+    #[test]
     fn xi_device_enabled_write_disables_only_requested_facet_and_drops_its_input() {
         use yserver_core::{
             backend::Backend,
