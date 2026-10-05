@@ -95,3 +95,36 @@ then re-enables the facet only if it is no longer client-disabled.
    stays disabled and floating, with no Enabled events. After resume it is
    enabled, with Enabled events. *Kills:* the early return skipping the
    session fact.
+
+---
+
+## Third review (2026-10-05)
+
+### Task 5 — Every XI1 consumer follows the registry's current classes (C3)
+
+**Do:** sweep every hard-coded XI1 shape consumer and derive the button and
+valuator counts from the queried device's current class shape (the same source
+XIQueryDevice uses), for slaves and masters. That includes `NUM_BUTTONS` /
+`NUM_AXES` in `xi1_state_notify.rs`, `XI1_POINTER_AXES` / `XI1_NUM_BUTTONS` in
+`process_request.rs`, and every other hard-coded user: DeviceStateNotify,
+including its continuation events (`Xi/exevents.c` DeviceFocusEvent /
+`FixDeviceStateNotify`); GetDeviceControl (`Xi/getdctl.c`); SetDeviceValuators
+(`Xi/setdval.c`, where an out-of-range axis is BadValue); and any remaining
+one. Follow the Xorg handler for each.
+
+**Tests (B through the dispatcher / event path), one per consumer:**
+- XTEST 4: DeviceStateNotify reports 10 buttons and 2 axes, with no valuator
+  continuation.
+- GetDeviceControl reports 2 axes.
+- SetDeviceValuators with first_valuator 2 on the fresh master is BadValue.
+- A physical pointer is unchanged.
+Each test kills reintroducing the hard-coded constant.
+
+### Task 6 — SetDeviceButtonMapping overwrites only the supplied prefix
+
+**Do:** as Xorg `do_butmap_change` does (`memcpy(&map[1], map, len)`,
+`dix/inpututils.c:72-80`), a short map replaces only the first `len` entries
+and keeps the tail.
+
+**Test:** set a custom 10-entry map, then update only button 1. Buttons 2–10
+keep their custom values. *Kills:* replacing the whole map.
