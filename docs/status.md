@@ -41,10 +41,11 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   VT continuation preserves proven source identities and settings, and server
   reset replays the current enabled and suspended inventory into a fresh XI
   registry. Direct touch and a server-wide acceleration default are not
-  provided. Known limitations: under an owner-events XI grab, wheel smooth-scroll
-  Motion can be lost when the client selected ButtonPress but not Motion on the window under the pointer;
-  a `LockMods` action with `affect=lock` (lock without unlock) unlocks if its keyboard floats under an XI
-  grab while that key is held. Hardware verification: see PR.
+  provided. `xinput set-prop 4 ...` targets the virtual XTEST pointer and
+  configures no physical device; use each physical device's own ID, as in the
+  [per-device acceleration loop](superpowers/specs/2026-09-29-dynamic-xinput-device-registry-design.md#mouse-acceleration-configuration).
+  Each physical device has its own `Device Enabled` state for `xinput disable`
+  and `xinput enable`. Hardware verification: see PR.
 
 - **2026-09-29 RANDR CRTC rotation and reflection (branch
   `feat/randr-rotation`):** SetCrtcConfig accepts modesetting's

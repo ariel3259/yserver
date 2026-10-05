@@ -1,44 +1,47 @@
 # PR #198 maintainer review: triage (2026-10-04)
 
-Review by joske on PR #198 (dynamic XI device registry). Each item was checked
-against `xorg-server-21.1.24` (`../xserver`, tag checked out read-only) and the
-branch at `018834ad` (rebased onto `joske/master` `dbf0d403`).
-
-Verdicts: **real** = divergence confirmed in source, needs a fix;
-**done** = fixed on the branch; **answer** = needs a reply, not code;
-**hw** = needs a supervised hardware run.
+Review by joske on PR #198 (dynamic XI device registry), checked against
+`xorg-server-21.1.24`. The branch is `feat/xi-dynamic-registry-rebased` at
+`f0e9aaeb`, rebased onto `joske/master`. Implementation findings map to the
+fixing commits below. The supervised hardware pass remains open.
 
 ## Process
 
-| # | Item | Verdict | Evidence / action |
-|---|------|---------|-------------------|
-| P1 | Rebase instead of merging master | done | 48 commits replayed onto `dbf0d403`, no merge commits. Every commit passes `cargo check --workspace --all-targets`; the merge-time adaptations moved into the commit that broke them (`origin` fields → "preserve source identity", `device_id` → "scope XI grabs", `DEVICEID_SLAVE_*` / ReplayPointer paired-master thaw → "leave 4/5 as virtual XTEST"). Full gate green on the tip. Backup tag `backup/xi-before-rebase`. |
-| P2 | `border_press_reports_negative_content_coords_on_the_wire` fails | done (test bug) | The test pressed button 1 eight times without a release. XTEST 4 now keeps its own button state and a second press of a held button is dropped exactly like Xorg `UpdateDeviceState` (`Xi/exevents.c:948`). Reproduced without Vulkan: presses delivered `[true, false]` without release, `[true, true]` with. Fixed in `018834ad`. Not run under lavapipe here (no lavapipe ICD on this box). |
+| # | Item | Verdict | Fix / evidence |
+|---|---|---|---|
+| P1 | Rebase instead of merging master | fixed | Branch history is rebased with no merge commits; the source fixes are listed below. There is no standalone rebase commit. |
+| P2 | `border_press_reports_negative_content_coords_on_the_wire` fails | fixed | `018834ad` corrects the test to release between repeated XTEST presses, matching Xorg's held-button guard (`Xi/exevents.c:948`). |
 
 ## Differences from Xorg
 
-| # | Item | Verdict | Xorg | Branch today |
-|---|------|---------|------|--------------|
-| X1 | Disabled / newly added slaves float until enabled, also across VT | real | `DisableDevice` sets `dev->master = NULL` (`dix/devices.c:539`); `EnableDevice` attaches (`:389`); VT leave = `xf86ReleaseKeys` + `DisableDevice` (`xf86Events.c:310-312`) | slaves keep `attached_master` while disabled/suspended |
-| X2 | "Device Enabled" property on every device | real | `AddInputDevice` creates it (`devices.c:308`), `EnableDevice`/`DisableDevice` update it (`:414`, `:529`), writes go through the property handler (`:149`) | no such property anywhere |
-| X3 | XIGrabDevice on XTEST 4/5 floats them | real | `ActivatePointerGrab`: any non-master XI2 explicit grab → `DetachFromMaster` (`dix/events.c:1622`) | not traced yet |
-| X4 | XIQueryDevice button state; master class sourceid = last slave | real | `ButtonInfoData` reports `down` bits (`Xi/xiquerydevice.c:282`); `DeepCopyDeviceClasses` sets `sourceid = from->id` (`Xi/exevents.c:592`) | not traced yet |
-| X5 | Masters/XTEST have no device type; XTEST = CorePointerProc (10 buttons, 2 axes, no scroll); XTEST button 10 dropped | real | `CorePointerProc` `NBUTTONS 10` (`devices.c:662`) | not traced yet |
-| X6 | XTestFakeInput with unknown device → BadDevice | real | `dixLookupDevice(..., deviceid & 0177)` → error, `errorValue = deviceid & 0177` (`Xext/xtest.c:182-185`) | unknown id is passed on and dropped later (`fake_input_device_id`) |
-| X7 | Hierarchy/DevicePresence: one per selecting window; one device per facet with its own Added→Enabled | real | `XISendDeviceHierarchyEvent` → `SendEventToAllWindows` (`Xi/xichangehierarchy.c:119`) | not traced yet |
-| X8 | The two documented limitations are divergences | real | scroll Motion under owner-events grab falls back to the grab window (`dix/events.c:4431-4464`) | documented in `docs/status.md` as accepted |
+| # | Item | Verdict | Fixing commit(s) and Xorg reference |
+|---|---|---|---|
+| X1 | Disabled/new slaves float until enabled, including across VT | fixed | `8281bb1a`, `8fac38e3`, `2a735ffa`; Xorg clears the master on disable and reattaches on enable (`dix/devices.c:388–393,539`). |
+| X2 | `Device Enabled` exists on every device | fixed | `1106f4f2`, `41df0716`; Xorg creates the non-deletable property on each device (`dix/devices.c:308–311`) and updates it through `DeviceSetProperty` (`:149–167`). |
+| X3 | XI2 explicit grabs float XTEST 4/5 | fixed | `caee9cda`; Xorg detaches a grabbed slave (`dix/events.c:1621–1624`). |
+| X4 | XIQueryDevice button state and master class `sourceid` | fixed | `20aae912`, `78aca3ee`; Xorg reports held buttons (`Xi/xiquerydevice.c:282`) and stores class provenance when copying (`Xi/exevents.c:592,630`). |
+| X5 | Masters/XTEST have no XI1 type; XTEST pointer shape and button 10 | fixed | `a309ca56`, `f88073d0`; Xorg initializes XTEST with `CorePointerProc` (`Xext/xtest.c:621–629`, `dix/devices.c:657–690`). |
+| X6 | Unknown XTestFakeInput device returns `BadDevice` | fixed | `f88073d0`; Xorg validates `deviceid & 0177` and reports that ID (`Xext/xtest.c:182–186`). |
+| X7 | Hierarchy/presence delivery is per selecting window and facet | fixed | `8fac38e3`, `a8e65f75`; Xorg sends hierarchy through `SendEventToAllWindows` (`Xi/xichangehierarchy.c:119`) and walks selected windows (`Xi/exevents.c:3279–3312`). |
+| X8 | Owner-events smooth-scroll fallback and `LockNoUnlock` behavior | fixed | `f71ffd11`, `45c3f6a6`; Xorg decides fallback for each event (`dix/events.c:4431–4464`) and honors lock-action flags (`xkb/xkbActions.c:372–395`). |
 
-## Testing
+## Testing and documentation
 
-| # | Item | Verdict | Notes |
-|---|------|---------|-------|
-| T1 | Touchpad laptop + grab-heavy desktop (Cinnamon/XFCE/KDE) | hw | after the fixes |
-| T2 | VT round trip holding a key; xkb reset (`0849769a`) removed | answer + hw | Intentional, replaced by "release physical state once across VT suspend": at VtRelease every physical source releases its held keys/buttons through the normal path (Xorg `xf86ReleaseKeys` + `DisableDevice`), so depressed modifiers clear through xkb while locks (Caps/Num) survive, as on Xorg. The old reset also dropped Caps Lock. Hold-a-key VT run to be done after the fixes. |
-| T3 | XI property write while switched away blocks until resume | real (to confirm against xf86-input-libinput) | A write submitted before suspend waits for resume; a write after suspend fails BadMatch. Xorg's driver accepts the value while the device is off and applies it on `DEVICE_ON`. |
+| # | Item | Verdict | Fix / remaining acceptance |
+|---|---|---|---|
+| T1 | Touchpad laptop and a grab-heavy desktop | open (hardware) | No touchpad laptop on our side; the maintainer offered to cover it. The grab paths it exercises changed in `f71ffd11` and `45c3f6a6`. |
+| T2 | VT round trip while a key is held | answered | `d4239b60`, `2a735ffa`; held physical state is released once and client-disabled state survives VT. The supervised VT run remains part of hardware acceptance. |
+| T3 | XI property write at VT release | fixed | `4df57890`, `f0e9aaeb`; a source-off write fails `BadMatch`, and submitted writes are answered before VT yield. |
+| S1 | `xinput set-prop 4 ...` targets the virtual XTEST pointer | fixed | `91e4b57d` and the docs commit after `f0e9aaeb` document using the physical device's own ID and the design's per-device acceleration loop. |
+| S2 | Fold the 2026-09-30 design-review reports | fixed | The docs commit after `f0e9aaeb` folds them into the branch review as one dispositions section and fixes the links. |
 
-## Smaller
+## Reviews of the addendum and plans
 
-| # | Item | Verdict |
-|---|------|---------|
-| S1 | `xinput set-prop 4 …` now hits the virtual XTEST pointer → release notes/docs | doc |
-| S2 | Fold the four adversarial-review findings files into the branch-review summary | doc |
+| Review verdict | Finding and resolution |
+|---|---|
+| Addendum review: 2 blocking, 1 major, 0 minor | **B-1:** hierarchy/presence events have no window field; E1 now sends one copy to each selecting window (`a8e65f75`; Xorg `Xi/xichangehierarchy.c:119`, `Xi/exevents.c:3279–3312`). **B-2:** master class `sourceid` is stored class provenance, not current `lastSlave`; C2 and `78aca3ee` preserve it (`Xi/exevents.c:592,630`; `Xi/xiquerydevice.c:278,326`). **M-1:** the requested touchpad/desktop-grab scenario was added to supervised hardware acceptance; execution remains pending. |
+| Plan 1 review: 1 blocking, 1 major, 0 minor | **B-1:** drain held input before committing disabled state (`8281bb1a`; Xorg `dix/devices.c:466–468,504–506`). **M-1:** capture the attached `XIDeviceDisabled` descriptor before floating the facet (`8fac38e3`; Xorg `dix/devices.c:528–539`). |
+| Plan 2 review: 2 blocking, 0 major, 0 minor | **B-1:** the addendum's C3 said absolute valuators while the plan said relative; Xorg is relative, and the addendum was corrected (`87c52356`), matching `CorePointerProc` (`a309ca56`; `dix/devices.c:657–690,1644–1646`). **B-2:** same-device XI2 grab replacement preserves the floating attachment and position (`caee9cda`; `dix/events.c:1463–1464,1621–1624,1649–1650`). |
+| Plan 3 review: 0 blocking, 0 major, 0 minor; coverage incomplete | No findings were demonstrated. Its VT-release completion handoff question was resolved by `f0e9aaeb`, which consumes and answers submitted configuration writes before yielding the VT; VT device transitions follow Xorg's `hw/xfree86/common/xf86Events.c:302–320` path. |
+
+The final supervised hardware pass remains open.

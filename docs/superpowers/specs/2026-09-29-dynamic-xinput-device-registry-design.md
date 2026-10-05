@@ -318,11 +318,9 @@ findings documents for the historical text.
 
 ## Review correction record
 
-The 2026-09-30 corrections and their task mapping are recorded in
-[the first adversarial findings](../findings/2026-09-30-dynamic-xinput-adversarial-plan-review.md)
-and [round 2](../findings/2026-09-30-dynamic-xinput-adversarial-review-round-2.md)
-and [round 3](../findings/2026-09-30-dynamic-xinput-adversarial-review-round-3.md)
-with their correction dispositions.
+The 2026-09-30 corrections and their task mapping are summarized in the
+[earlier design reviews (2026-09-30)](../findings/2026-10-02-xi-registry-branch-review.md#earlier-design-reviews-2026-09-30)
+and their correction dispositions.
 They preserve the approved registry topology, virtual 4/5 and absence of an
 exact selector. The keyboard/pointer plan contains 18 separate task boundaries;
 the touch plan follows with 10. Implementation began 2026-09-30; progress is

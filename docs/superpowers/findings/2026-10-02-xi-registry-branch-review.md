@@ -246,3 +246,24 @@ Two new defects are reachable:
    A memory-only libxkbcommon probe confirmed: normal release and R4’s copied floating release retain mask **2**; R5’s saved-mask operation produces **0**. This requires a custom action and a slave grab, so it is minor. The default-Caps test misses the flag.
 
 All **five new R5 tests passed** in the existing binaries built after the changed sources. The pointer suite had **37 passes and 24 socket-limited failures**; the backend subset had **3 passes and 6 socket-limited failures**. A socketpair probe confirmed `send` returns `EPERM`. No fresh build, hardware test, ignored test, environment-variable change, file edit, or git write occurred.
+
+## Earlier design reviews (2026-09-30)
+
+The four adversarial review rounds and local source checks are condensed here;
+their old standalone reports are removed.
+
+| Finding ID / summary | Disposition |
+|---|---|
+| R1: B1, H1–H6, M1–M7, L1–L5 — source identity, dynamic XI1/XI2 routing, grabs, properties, lifecycle, reset and task boundaries | Incorporated into the approved keyboard/pointer contracts and implemented across the registry, request, lifecycle and reset commits. Xorg anchors include `dix/devices.c:308–311`, `Xi/exevents.c:922–992`, and `Xext/xtest.c:182–186`. |
+| R1: H7–H9; R2: R2-6–R2-8 and R2-15; R3: R3-7, R3-8 and R3-11 — direct-touch classes, delivery and emulation | Closed by the explicit direct-touch scope revision; touchpads remain pointer facets. No direct-touch behavior was implemented. |
+| R1: L6 — KDE KCM with a pointer that has no acceleration property | Kept as an unverified real-client follow-up; the branch does not claim a KDE KCM run. |
+| R1: L7 — asserted plan-size and prior-approval requirements | Withdrawn; the review found no such requirement in `AGENTS.md` or the approved design. |
+| R2: R2-1–R2-5, R2-9, R2-10, R2-12–R2-14 — VT/input ownership, aggregation, staged interfaces, byte order, source IDs, continuation and property rules | Incorporated in the revised contracts and implementation. Relevant Xorg behavior includes release-before-disable (`dix/devices.c:466–468`), per-device event guards (`Xi/exevents.c:922–992`), and swapped XI requests (`Xi/xiselectev.c:116–143`; `Xi/xipassivegrab.c:50–75`). |
+| R2: R2-11; R3: R3-5 — deletion and recreation of driver properties | Resolved in the property contract and implementation: delete/unlink follows the existing GetProperty rule; successful backend writes recreate supported properties. Xorg references: `Xi/xiproperty.c:657,759–801`. |
+| R2: R2-13 — nonexistent constructor name | Corrected in the plan to the actual backend/platform constructor chain. |
+| R3: R3-1, R3-3, R3-4, R3-9, R3-10, R3-12 — pause/resume windows, reset state, release ownership, last-slave state and input resynchronization | Converted into explicit lifecycle/reset contracts and implemented; reset replay is in `493d0f57`, VT cleanup in `d4239b60`, and client-disabled reset behavior in `7fee0953`. Xorg anchors include `dix/main.c:299–306`, `dix/devices.c:466–468,504–539`, and `hw/xfree86/common/xf86Events.c:302–320`. |
+| R3: R3-2 — configuration writes could wait across VT release | Superseded by the addendum's pre-yield completion contract and fixed in `f0e9aaeb`; Xorg disables/re-enables devices during VT transitions at `hw/xfree86/common/xf86Events.c:302–320`. |
+| R3: R3-6 — master XKB state under multiple keyboard sources | Made explicit in the per-device/master transition rules and implemented; Xorg's action semantics are at `xkb/xkbActions.c:372–395`. |
+| R3: R3-11 — touch-plan scope and wording | Covered by the direct-touch scope revision; see the disposition above. |
+| R4 — interrupted review; no finding IDs or convergence verdict | Its reset and back-to-back VT questions were source-audited in the local checks and turned into reset/recovery contracts. The interrupted review remains historical and is not represented as a completed verdict. |
+| Local checks — reset-held state and back-to-back VT continuation | Source conclusions became explicit reset and token-checked recovery-window contracts; implementation and runtime acceptance remain governed by their test and hardware gates. |
