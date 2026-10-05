@@ -3747,6 +3747,7 @@ impl KmsBackend {
             crate::kms::render::platform::KmsDevice::from_reopened_device(opened.device, owner);
         let new_device = fresh_entry.device.clone_rc();
         let old_entry = std::mem::replace(&mut self.platform.devices[old_index], fresh_entry);
+        self.platform.poll_source_generation = self.platform.poll_source_generation.wrapping_add(1);
         let old_service = self.resource_service.take();
         let old_registry = self.drm_cleanup_registry.take();
         self.quarantined_normal_recoveries
@@ -33084,6 +33085,10 @@ impl Backend for KmsBackend {
         // Direct mode only: DRM fd + present-completion epfd. libinput runs
         // on its own thread, not the core poll.
         self.platform.poll_fds()
+    }
+
+    fn poll_source_generation(&self) -> u64 {
+        self.platform.poll_source_generation()
     }
 
     fn vt_switching_armed(&self) -> bool {
@@ -145241,6 +145246,7 @@ mod tests {
 
         let (mut backend, device, incarnation) =
             c0_3di_barrier_backend(crate::kms::executor::test_support::StubBehaviour::NeverReply);
+        let generation_before_detach = backend.platform.poll_source_generation();
         let raw_fd = backend.platform.devices[0]
             .device
             .attached()
@@ -145270,6 +145276,11 @@ mod tests {
             None,
         )
         .unwrap_or_else(|error| panic!("{error}"));
+
+        assert!(
+            backend.platform.poll_source_generation() > generation_before_detach,
+            "poison detach must advance the poll-source generation"
+        );
 
         assert!(!backend.barrier_ready(incarnation));
         assert!(
@@ -145788,6 +145799,7 @@ mod tests {
 
         let (mut backend, device, incarnation) =
             c0_3di_barrier_backend(crate::kms::executor::test_support::StubBehaviour::NeverReply);
+        let generation_before_detach = backend.platform.poll_source_generation();
         c0_3di_add_owner_output(&mut backend, device, 0x3d1);
         let mut state = ServerState::new();
         backend.rebuild_randr_state(&mut state, None, false);
@@ -145818,6 +145830,11 @@ mod tests {
             None,
         )
         .unwrap_or_else(|error| panic!("{error}"));
+        let generation_after_detach = backend.platform.poll_source_generation();
+        assert!(
+            generation_after_detach > generation_before_detach,
+            "poison detach must advance the poll-source generation"
+        );
         assert_eq!(opens.get(), 0, "the reopen waits for every old lease");
         assert!(!backend.barrier_ready(incarnation));
         assert!(backend.probe_workers.workers.contains_key(&device));
@@ -145842,6 +145859,14 @@ mod tests {
             None,
         )
         .unwrap_or_else(|error| panic!("{error}"));
+        assert!(
+            backend.platform.poll_source_generation() > generation_after_detach,
+            "recovery reopen must advance the poll-source generation"
+        );
+        assert!(
+            backend.platform.poll_source_generation() >= generation_before_detach + 3,
+            "the poison detach and recovery reopen each advance the generation"
+        );
         assert!(backend.barrier_ready(incarnation));
         assert_eq!(opens.get(), 1);
         assert!(!backend.probe_workers.workers.contains_key(&device));

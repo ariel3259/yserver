@@ -337,6 +337,7 @@ pub struct RecordingBackend {
     pub scanout_render_completion_count: std::sync::atomic::AtomicU32,
     /// Stable test-owned fd inventory returned by `poll_fds`.
     poll_sources: Vec<(std::os::fd::RawFd, crate::backend::BackendFdKind)>,
+    poll_source_generation: u64,
     /// Optional test notification sent after a DRM fd is dispatched,
     /// allowing a test thread to wait without timing-dependent sleeps.
     page_flip_ready_tx: Option<crossbeam_channel::Sender<std::os::fd::RawFd>>,
@@ -694,6 +695,7 @@ impl RecordingBackend {
             page_flip_fds: Mutex::new(Vec::new()),
             scanout_render_completion_count: std::sync::atomic::AtomicU32::new(0),
             poll_sources: Vec::new(),
+            poll_source_generation: 0,
             page_flip_ready_tx: None,
             scanout_render_completion_tx: None,
             wakeup_deadline: None,
@@ -868,6 +870,15 @@ impl RecordingBackend {
         self.poll_sources = sources;
         self.page_flip_ready_tx = Some(page_flip_ready_tx);
         self
+    }
+
+    /// Update the test poll inventory and mark a possible fd incarnation change.
+    pub fn replace_poll_sources_for_tests(
+        &mut self,
+        sources: Vec<(std::os::fd::RawFd, crate::backend::BackendFdKind)>,
+    ) {
+        self.poll_sources = sources;
+        self.poll_source_generation = self.poll_source_generation.wrapping_add(1);
     }
 
     /// Configure a test notification for copied-scanout completion dispatch.
@@ -1849,6 +1860,10 @@ impl Backend for RecordingBackend {
 
     fn poll_fds(&self) -> Vec<(std::os::fd::RawFd, crate::backend::BackendFdKind)> {
         self.poll_sources.clone()
+    }
+
+    fn poll_source_generation(&self) -> u64 {
+        self.poll_source_generation
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

@@ -1480,6 +1480,14 @@ pub trait Backend {
     /// `BackendFdKind` for readiness dispatch.
     fn poll_fds(&self) -> Vec<(std::os::fd::RawFd, BackendFdKind)>;
 
+    /// Changes whenever a polled fd is detached or its open file description
+    /// is replaced while retaining the same numeric fd and kind. The core
+    /// uses this to refresh registrations across fd-number reuse. Backends
+    /// whose poll sources are stable can keep the default generation.
+    fn poll_source_generation(&self) -> u64 {
+        0
+    }
+
     /// Downcast to `Any` for backend-specific operations (e.g. KMS composite).
     fn as_any(&self) -> &dyn Any;
     /// Mutable downcast to `Any` for backend-specific operations.

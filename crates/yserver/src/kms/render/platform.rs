@@ -3262,6 +3262,8 @@ pub struct PlatformBackend {
     next_scanout_render_job_id: u64,
     pub owner_completion_poller: crate::kms::render::completion_poller::CompletionPoller,
     pub owner_completion_detached: bool,
+    /// Incarnation marker for poll sources whose fd number can be reused.
+    pub(crate) poll_source_generation: u64,
     #[cfg(test)]
     owner_host_call_observations_for_tests: Vec<(
         crate::platform::drm::DrmDeviceKey,
@@ -4136,6 +4138,7 @@ impl PlatformBackend {
             next_scanout_render_job_id: 1,
             owner_completion_poller,
             owner_completion_detached: false,
+            poll_source_generation: 0,
             #[cfg(test)]
             owner_host_call_observations_for_tests: Vec::new(),
             vk: Some(vk),
@@ -4311,6 +4314,7 @@ impl PlatformBackend {
             next_scanout_render_job_id: 1,
             owner_completion_poller,
             owner_completion_detached: false,
+            poll_source_generation: 0,
             #[cfg(test)]
             owner_host_call_observations_for_tests: Vec::new(),
             vk: None,
@@ -6304,7 +6308,10 @@ impl PlatformBackend {
         let Some(device) = self.devices.iter_mut().find(|device| device.key == key) else {
             return false;
         };
-        device.event_reader_detached = true;
+        if !device.event_reader_detached {
+            device.event_reader_detached = true;
+            self.poll_source_generation = self.poll_source_generation.wrapping_add(1);
+        }
         true
     }
 
@@ -6319,7 +6326,15 @@ impl PlatformBackend {
             return false;
         }
         device.cursor.plane.take();
-        device.device.take().is_some()
+        let detached = device.device.take().is_some();
+        if detached {
+            self.poll_source_generation = self.poll_source_generation.wrapping_add(1);
+        }
+        detached
+    }
+
+    pub(crate) fn poll_source_generation(&self) -> u64 {
+        self.poll_source_generation
     }
 
     pub(crate) fn control_device_detached(&self, key: crate::platform::drm::DrmDeviceKey) -> bool {

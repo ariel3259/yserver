@@ -3171,6 +3171,7 @@ fn run_core_with_inventory(
         .map(|(fd, kind)| BackendPollSource { fd, kind })
         .collect();
     register_backend_poll_sources(poll.registry(), &backend_poll_sources)?;
+    let mut backend_poll_source_generation = backend.poll_source_generation();
 
     // Probe input devices at startup, Xorg-style: drain libinput's
     // initial device enumeration and seed `state.xi_devices` BEFORE the
@@ -3254,10 +3255,14 @@ fn run_core_with_inventory(
             .into_iter()
             .map(|(fd, kind)| BackendPollSource { fd, kind })
             .collect();
-        if current_backend_poll_sources != backend_poll_sources {
+        let current_backend_poll_source_generation = backend.poll_source_generation();
+        if current_backend_poll_sources != backend_poll_sources
+            || current_backend_poll_source_generation != backend_poll_source_generation
+        {
             deregister_backend_poll_sources(poll.registry(), &backend_poll_sources)?;
             backend_poll_sources = current_backend_poll_sources;
             register_backend_poll_sources(poll.registry(), &backend_poll_sources)?;
+            backend_poll_source_generation = current_backend_poll_source_generation;
         }
         // Compute poll timeout. If there are runnable deferred requests, do
         // not block: drain them immediately. Otherwise, blocking could wait for
@@ -11968,6 +11973,80 @@ mod tests {
         assert!(!state.clients[&7].watching_writable);
 
         drop(peer);
+    }
+
+    /// Reusing an fd number for a new open description during before_block
+    /// must refresh the core registration even when `(fd, kind)` is unchanged.
+    #[test]
+    fn backend_poll_generation_refreshes_reused_fd_description() {
+        use crate::backend::{BackendFdKind, recording::RecordingBackend};
+        use std::{io::Write, os::fd::FromRawFd};
+
+        let (poll, sender, rx) = channel().unwrap();
+        let sender_for_core = sender.clone_handle();
+        let (old_reader, old_writer) = UnixStream::pair().unwrap();
+        let old_fd = old_reader.as_raw_fd();
+        drop(old_writer);
+        let (new_reader, mut new_writer) = UnixStream::pair().unwrap();
+        let mut old_reader = Some(old_reader);
+        let mut new_reader = Some(new_reader);
+        let (swapped_tx, swapped_rx) = crossbeam_channel::bounded(1);
+        let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
+        let mut backend = RecordingBackend::new()
+            .with_poll_sources(vec![(old_fd, BackendFdKind::Drm)], ready_tx)
+            .with_before_block_action(move |backend| {
+                let Some(old_reader) = old_reader.take() else {
+                    return;
+                };
+                let new_reader = new_reader.take().expect("new reader exists on first pass");
+                let new_fd = new_reader.as_raw_fd();
+                // Replacing the numeric descriptor closes its old open
+                // description, which also removes the old epoll registration.
+                let result = unsafe { libc::dup2(new_fd, old_fd) };
+                assert_eq!(result, old_fd, "dup2 must reuse the old fd number");
+                drop(new_reader);
+                std::mem::forget(old_reader);
+                backend.replace_poll_sources_for_tests(vec![(old_fd, BackendFdKind::Drm)]);
+                let _ = swapped_tx.send(());
+            });
+
+        let handle = std::thread::spawn(move || {
+            let mut state = ServerState::new();
+            let alloc = ClientIdAllocator::new();
+            let result = run_core(
+                poll,
+                rx,
+                sender_for_core,
+                &mut state,
+                &mut backend,
+                None,
+                &alloc,
+                AuthState::new(None),
+                ResetPolicy::NoReset,
+                None,
+            );
+            (result, backend)
+        });
+
+        swapped_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("before_block replaced the open description");
+        new_writer.write_all(&[1]).unwrap();
+        assert_eq!(
+            ready_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            old_fd,
+            "readiness from the reused descriptor must be dispatched"
+        );
+        sender.send(Message::Shutdown).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(handle.is_finished(), "run_core did not return");
+        handle.join().unwrap().0.unwrap();
+        // dup2 installed the replacement description at this number; own
+        // and close it now that the core has dropped its registration.
+        let _replacement_reader = unsafe { OwnedFd::from_raw_fd(old_fd) };
     }
 
     /// Multi-device regression: two DRM fds of the same kind must get
