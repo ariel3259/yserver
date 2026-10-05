@@ -2695,7 +2695,7 @@ impl PlatformBackend {
             Err(e) => {
                 return Err(io::Error::other(format!(
                     "render PlatformBackend: VkContext init failed (render backend requires Vulkan; \
-                     no pixman fallback): {e:?}"
+                     no pixman fallback): {e}"
                 )));
             }
         };
