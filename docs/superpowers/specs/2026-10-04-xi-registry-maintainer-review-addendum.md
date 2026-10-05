@@ -236,3 +236,26 @@ Each test names the mutation it must kill, for example: dropping the float
 in A3, building the disable hierarchy after the float, sending one hierarchy
 event per client instead of per window, defaulting an unknown XTEST device to
 4, or keeping the "resolve after rebind" wait.
+
+## Amendments after the maintainer's second review (2026-10-05)
+
+- **C3:** every XI1 consumer of the class shape follows the device's actual
+  classes: `XListInputDevices`, `XOpenDevice`, `GetDeviceButtonMapping`,
+  `SetDeviceButtonMapping` and `QueryDeviceState`.
+- **C6:** a wheel button (4–7) becomes smooth-scroll Motion only when the source
+  device has a scroll class in that direction. Xorg `GetPointerEvents` converts
+  through the device's `v_scroll_axis` / `h_scroll_axis` (`dix/getevents.c`). XTEST
+  4 has none, so it sends plain wheel buttons, and physical devices keep smooth
+  scrolling.
+- **G:** on a barrier timeout, the in-flight write is cancelled with a token the
+  input thread checks before applying. If libinput had already applied it, the
+  late result is reconciled: inventory and property are committed, and the
+  property event is sent. The client keeps the `BadMatch` it received, and no
+  second reply is sent.
+- **A1:** a session disable records `session_enabled = false` even for a facet
+  that is already client-disabled. Enabling it while the session is away clears
+  only the client fact, and the facet re-enables at resume. Xorg itself ends up
+  inconsistent in this sequence: `EnableDevice` fails while the device fd is
+  paused, the device stays flagged `XI86_DEVICE_DISABLED` at VT enter, and the
+  outer store leaves the property at 1. The two-reason model is kept
+  deliberately.
