@@ -75,7 +75,14 @@ the C.0 scope limit that created no software clock (C.0 design :1458, :3240,
 - No branch-580 GPU (Maxwell/Pascal/Volta) is available (user, 2026-10-05).
   The `vblank=0` runs on this machine are the 3e acceptance target; they
   exercise the same no-vblank driver behaviour (sequence 0, send-time
-  stamps).
+  stamps). nvidia-drm 615 with `vblank=0` takes the same path as 595 on
+  current kernels: `drm_vblank_init()` is skipped under
+  `NV_DRM_CRTC_STATE_HAS_NO_VBLANK`, and flip events go through
+  `drm_crtc_send_vblank_event()` from the flip-done path in both.
+- **Out of scope for 3e:** behaviour of older driver branches that is not
+  reproduced by `vblank=0` here (NVKMS flip queueing, property support and
+  other non-clock differences). It is handled only when users report an
+  issue about it.
 
 ## Process
 
