@@ -265,6 +265,10 @@ pub enum Message {
         source: crate::xinput::InputSourceId,
         result: Result<(), crate::xinput::libinput_props::DeviceConfigError>,
     },
+    /// The input thread has processed every config command ahead of its VT
+    /// pause command and completed the suspend dispatch. Results for those
+    /// commands were sent before this process-lifetime barrier.
+    InputPaused,
     /// signalfd readable.
     Shutdown,
     /// SIGHUP under a policy other than `-noreset` → cross the

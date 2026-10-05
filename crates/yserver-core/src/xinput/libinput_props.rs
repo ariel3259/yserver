@@ -69,14 +69,15 @@ pub enum DeviceConfigChange {
 }
 
 /// Why a config apply failed → mapped to an X error by the dispatch layer.
-/// `Unsupported` → BadMatch, `Invalid` → BadValue.
+/// `Unsupported` / `SourceGone` → BadMatch, `Invalid` → BadValue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceConfigError {
     /// Setting not supported on this device.
     Unsupported,
     /// Value out of range / not a legal one-hot / wrong byte count.
     Invalid,
-    /// The runtime input source is no longer bound to a live libinput handle.
+    /// The runtime input source is no longer bound to a live libinput handle;
+    /// this is terminal for the request and maps to BadMatch.
     SourceGone,
 }
 

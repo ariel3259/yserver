@@ -854,6 +854,23 @@ pub trait Backend {
     /// Direct-mode VT release signal. Default no-op.
     fn on_vt_release(&mut self, _state: &mut ServerState) {}
 
+    /// Begin a direct-mode VT release before the core drains input-thread
+    /// configuration results. Return true only when a FIFO pause barrier was
+    /// queued; the core waits for its acknowledgement only in that case.
+    fn begin_vt_release(&mut self) -> bool {
+        false
+    }
+
+    /// Finish the release after the core has consumed the input pause barrier.
+    /// Backends that only implement `on_vt_release` retain their old behavior.
+    fn finish_vt_release(
+        &mut self,
+        state: &mut ServerState,
+        _input_inventory: &crate::core_loop::input_inventory::InputInventory,
+    ) {
+        self.on_vt_release(state);
+    }
+
     /// Direct-mode VT acquire signal. Default no-op.
     fn on_vt_acquire(&mut self, _state: &mut ServerState) {}
 

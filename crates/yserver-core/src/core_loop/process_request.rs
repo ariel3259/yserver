@@ -48991,7 +48991,9 @@ mod tests {
         for (start_result, async_error, expected_error) in [
             (Err(ConfigError::Unsupported), None, x11::error::BAD_MATCH),
             (Err(ConfigError::Invalid), None, x11::error::BAD_VALUE),
-            (Err(ConfigError::SourceGone), None, XI2_FIRST_ERROR),
+            // Xorg's libinput property handler returns BadMatch when the
+            // shared handle is absent (xf86libinput.c:4392-4409, 4579-4607).
+            (Err(ConfigError::SourceGone), None, x11::error::BAD_MATCH),
             (
                 Ok(DeviceConfigStart::Pending(DeviceConfigToken(203))),
                 Some(ConfigError::Invalid),
@@ -49005,7 +49007,7 @@ mod tests {
             (
                 Ok(DeviceConfigStart::Pending(DeviceConfigToken(203))),
                 Some(ConfigError::SourceGone),
-                XI2_FIRST_ERROR,
+                x11::error::BAD_MATCH,
             ),
         ] {
             let mut state = ServerState::new();
@@ -49281,6 +49283,9 @@ mod tests {
         inventory.add(replacement.clone());
         assert!(replacement_ids.contains(&TEST_PHYSICAL_POINTER_ID));
 
+        // B's device has already been unregistered, so ProcXIChangeProperty's
+        // dixLookupDevice returns BadDevice (Xi/xiproperty.c:1140-1142;
+        // dix/devices.c:1259-1274).
         let error_b = read_all_available(&mut peer_b);
         assert_xi_config_error(&error_b, XI2_FIRST_ERROR, 2, 57);
         assert_eq!(
@@ -49305,8 +49310,11 @@ mod tests {
             },
             crate::core_loop::generation::Generation::default(),
         );
+        // A's backend result is SourceGone while its request still names the
+        // in-flight device; libinput maps the missing shared handle to
+        // BadMatch (xf86libinput.c:4392-4409, 4579-4607).
         let error_a = read_all_available(&mut peer_a);
-        assert_xi_config_error(&error_a, XI2_FIRST_ERROR, 1, 57);
+        assert_xi_config_error(&error_a, x11::error::BAD_MATCH, 1, 57);
 
         let replacement_device = state
             .xi_devices

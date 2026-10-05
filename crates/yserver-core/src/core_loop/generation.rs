@@ -71,6 +71,7 @@ pub(crate) fn is_session_scoped(message: &Message) -> bool {
         Message::HostInput(_)
         | Message::CrtcConfigReady
         | Message::DeviceConfigResult { .. }
+        | Message::InputPaused
         | Message::Shutdown
         | Message::ResetRequested
         | Message::VtRelease
@@ -188,6 +189,7 @@ mod tests {
             Message::ResetRequested,
             Message::CrtcConfigReady,
             Message::VtRelease,
+            Message::InputPaused,
             Message::VtAcquire,
             Message::SwitchVt(1),
             Message::DumpScanout,

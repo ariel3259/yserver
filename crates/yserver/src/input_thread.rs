@@ -769,7 +769,6 @@ pub(crate) fn run(
     // a ~250ms timeout so we re-dispatch and complete the deferred open.
     let mut hotplug_retry_until: Option<std::time::Instant> = None;
     let mut resume_retry_window: Option<(crate::input::context::ResumeWindowToken, Instant)> = None;
-    let mut waiting_device_configs = VecDeque::new();
 
     // Platform-specific event buffer.
     #[cfg(target_os = "linux")]
@@ -794,7 +793,6 @@ pub(crate) fn run(
             &mut state,
             &sender,
             &mut pending_motion,
-            &mut waiting_device_configs,
         )?;
         if hotplug_retry_until.is_some_and(|until| Instant::now() >= until) {
             hotplug_retry_until = None;
@@ -866,42 +864,40 @@ pub(crate) fn run(
         // --- common dispatch (platform-independent) ---
         if got_control {
             let commands = control.drain();
-            process_config_commands(
-                control.take_configs(),
-                &sender,
-                &mut waiting_device_configs,
-                |source, change| {
-                    let result = input_ctx.apply_device_config(source, change);
-                    let may_wait = matches!(result, Err(DeviceConfigError::SourceGone))
-                        && input_ctx.can_wait_for_device_config(source);
-                    (result, may_wait)
-                },
-            )?;
+            process_config_commands(control.take_configs(), &sender, |source, change| {
+                input_ctx.apply_device_config(source, change)
+            })?;
             if let Some((fw, fh)) = control.take_resize() {
                 log::debug!("input thread: updating cursor extent to {fw}×{fh}");
                 state.set_extent(fw, fh);
             }
             for command in commands {
                 paused = match command {
-                    InputThreadCommand::Pause if !paused => {
-                        if let Some(m) = pending_motion.take() {
-                            sender.send(Message::HostInput(m))?;
+                    InputThreadCommand::Pause => {
+                        if !paused {
+                            if let Some(m) = pending_motion.take() {
+                                sender.send(Message::HostInput(m))?;
+                            }
+                            let events = input_ctx.suspend();
+                            process_batch(
+                                &mut state,
+                                &sender,
+                                &mut pending_motion,
+                                events,
+                                current_time_ms(),
+                            )?;
+                            if let Some(m) = pending_motion.take() {
+                                sender.send(Message::HostInput(m))?;
+                            }
+                            resume_retry_window = None;
+                            hotplug_retry_until = None;
+                            pending_motion = None;
+                            reset_hotkeys_after_vt_pause(&mut state);
                         }
-                        let events = input_ctx.suspend();
-                        process_batch(
-                            &mut state,
-                            &sender,
-                            &mut pending_motion,
-                            events,
-                            current_time_ms(),
-                        )?;
-                        if let Some(m) = pending_motion.take() {
-                            sender.send(Message::HostInput(m))?;
-                        }
-                        resume_retry_window = None;
-                        hotplug_retry_until = None;
-                        pending_motion = None;
-                        reset_hotkeys_after_vt_pause(&mut state);
+                        // Config results from this wake were sent before the
+                        // pause command was handled. This is the core's FIFO
+                        // barrier before the VT release yields the session.
+                        sender.send(Message::InputPaused)?;
                         true
                     }
                     InputThreadCommand::Resume if paused => match input_ctx.resume() {
@@ -918,13 +914,8 @@ pub(crate) fn run(
                                 &mut state,
                                 &sender,
                                 &mut pending_motion,
-                                &mut waiting_device_configs,
                             )?;
                             state.hotkey.reset();
-                            let lifecycle_events = snapshot_lifecycle_events_for_waiters(
-                                &waiting_device_configs,
-                                &events,
-                            );
                             process_batch(
                                 &mut state,
                                 &sender,
@@ -932,14 +923,6 @@ pub(crate) fn run(
                                 events,
                                 current_time_ms(),
                             )?;
-                            if let Some(lifecycle_events) = lifecycle_events {
-                                service_waiting_device_configs(
-                                    &sender,
-                                    &mut waiting_device_configs,
-                                    &lifecycle_events,
-                                    |source, change| input_ctx.apply_device_config(source, change),
-                                )?;
-                            }
                             if let Some(m) = pending_motion.take() {
                                 sender.send(Message::HostInput(m))?;
                             }
@@ -965,7 +948,6 @@ pub(crate) fn run(
             &mut state,
             &sender,
             &mut pending_motion,
-            &mut waiting_device_configs,
         )?;
 
         if !should_dispatch_batch(paused) {
@@ -987,7 +969,6 @@ pub(crate) fn run(
             &mut state,
             &sender,
             &mut pending_motion,
-            &mut waiting_device_configs,
         )?;
 
         let device_change = events.iter().any(|e| {
@@ -996,18 +977,8 @@ pub(crate) fn run(
                 InputEvent::DeviceAdded(_) | InputEvent::DeviceRemoved { .. }
             )
         });
-        let lifecycle_events =
-            snapshot_lifecycle_events_for_waiters(&waiting_device_configs, &events);
         let time_ms = current_time_ms();
         process_batch(&mut state, &sender, &mut pending_motion, events, time_ms)?;
-        if let Some(lifecycle_events) = lifecycle_events {
-            service_waiting_device_configs(
-                &sender,
-                &mut waiting_device_configs,
-                &lifecycle_events,
-                |source, change| input_ctx.apply_device_config(source, change),
-            )?;
-        }
         if device_change {
             hotplug_retry_until =
                 Some(std::time::Instant::now() + std::time::Duration::from_millis(2500));
@@ -1028,7 +999,6 @@ fn finish_expired_resume_window(
     state: &mut LibinputThreadState,
     sender: &CoreSender,
     pending_motion: &mut Option<HostInputEvent>,
-    waiting_device_configs: &mut VecDeque<(DeviceConfigToken, InputSourceId, DeviceConfigChange)>,
 ) -> io::Result<()> {
     let Some((token, deadline)) = *window else {
         return Ok(());
@@ -1039,16 +1009,7 @@ fn finish_expired_resume_window(
     }
     let events = input_ctx.finish_resume_window(token, now);
     *window = None;
-    let lifecycle_events = snapshot_lifecycle_events_for_waiters(waiting_device_configs, &events);
     process_batch(state, sender, pending_motion, events, current_time_ms())?;
-    if let Some(lifecycle_events) = lifecycle_events {
-        service_waiting_device_configs(
-            sender,
-            waiting_device_configs,
-            &lifecycle_events,
-            |source, change| input_ctx.apply_device_config(source, change),
-        )?;
-    }
     if let Some(motion) = pending_motion.take() {
         sender.send(Message::HostInput(motion))?;
     }
@@ -1058,81 +1019,17 @@ fn finish_expired_resume_window(
 fn process_config_commands(
     configs: Vec<(DeviceConfigToken, InputSourceId, DeviceConfigChange)>,
     sender: &CoreSender,
-    waiting: &mut VecDeque<(DeviceConfigToken, InputSourceId, DeviceConfigChange)>,
-    mut apply: impl FnMut(InputSourceId, DeviceConfigChange) -> (Result<(), DeviceConfigError>, bool),
-) -> io::Result<()> {
-    for (token, source, change) in configs {
-        let (result, may_wait) = apply(source, change);
-        match result {
-            Ok(()) => sender.send(Message::DeviceConfigResult {
-                token,
-                source,
-                result: Ok(()),
-            })?,
-            Err(DeviceConfigError::SourceGone) if may_wait => {
-                waiting.push_back((token, source, change));
-            }
-            Err(error) => sender.send(Message::DeviceConfigResult {
-                token,
-                source,
-                result: Err(error),
-            })?,
-        }
-    }
-    Ok(())
-}
-
-fn service_waiting_device_configs(
-    sender: &CoreSender,
-    waiting: &mut VecDeque<(DeviceConfigToken, InputSourceId, DeviceConfigChange)>,
-    lifecycle_events: &[InputEvent],
     mut apply: impl FnMut(InputSourceId, DeviceConfigChange) -> Result<(), DeviceConfigError>,
 ) -> io::Result<()> {
-    let mut resumed = std::collections::HashSet::new();
-    let mut removed = std::collections::HashSet::new();
-    for event in lifecycle_events {
-        match event {
-            InputEvent::DeviceResumed(info) => {
-                resumed.insert(info.source_id);
-            }
-            InputEvent::DeviceRemoved { source_id } => {
-                removed.insert(*source_id);
-            }
-            _ => {}
-        }
+    for (token, source, change) in configs {
+        let result = apply(source, change);
+        sender.send(Message::DeviceConfigResult {
+            token,
+            source,
+            result,
+        })?;
     }
-    if resumed.is_empty() && removed.is_empty() {
-        return Ok(());
-    }
-
-    let mut remaining = VecDeque::new();
-    while let Some((token, source, change)) = waiting.pop_front() {
-        if removed.contains(&source) {
-            sender.send(Message::DeviceConfigResult {
-                token,
-                source,
-                result: Err(DeviceConfigError::SourceGone),
-            })?;
-        } else if resumed.contains(&source) {
-            let result = apply(source, change);
-            sender.send(Message::DeviceConfigResult {
-                token,
-                source,
-                result,
-            })?;
-        } else {
-            remaining.push_back((token, source, change));
-        }
-    }
-    *waiting = remaining;
     Ok(())
-}
-
-fn snapshot_lifecycle_events_for_waiters(
-    waiting: &VecDeque<(DeviceConfigToken, InputSourceId, DeviceConfigChange)>,
-    events: &[InputEvent],
-) -> Option<Vec<InputEvent>> {
-    (!waiting.is_empty()).then(|| events.to_vec())
 }
 
 fn current_time_ms() -> u32 {
@@ -1143,24 +1040,6 @@ fn current_time_ms() -> u32 {
 mod tests {
     use super::*;
 
-    fn resumed_info(source_id: InputSourceId) -> yserver_core::core_loop::DeviceInfo {
-        yserver_core::core_loop::DeviceInfo {
-            source_id,
-            enabled: true,
-            resume_key: None,
-            capabilities: yserver_core::xinput::InputCapabilities {
-                pointer: true,
-                ..Default::default()
-            },
-            name: "test pointer".into(),
-            device_node: "/dev/input/event99".into(),
-            sysname: "event99".into(),
-            vendor_id: 1,
-            product_id: 2,
-            is_touchpad: false,
-            config: Default::default(),
-        }
-    }
     use crate::input::hotkey::{
         LINUX_KEY_BACKSPACE, LINUX_KEY_ENTER, LINUX_KEY_F12, LINUX_KEY_LEFTALT, LINUX_KEY_LEFTCTRL,
         LINUX_KEY_RIGHTALT, LINUX_KEY_RIGHTCTRL,
@@ -2181,21 +2060,17 @@ mod tests {
         let token = DeviceConfigToken(17);
         let change = DeviceConfigChange::AccelSpeed(0.5);
         control.push_config(token, source, change);
-        let mut waiting = VecDeque::new();
-
         process_config_commands(
             control.take_configs(),
             &sender,
-            &mut waiting,
             |actual_source, actual_change| {
                 assert_eq!(actual_source, source);
                 assert_eq!(actual_change, change);
-                (Ok(()), false)
+                Ok(())
             },
         )
         .expect("send confirmed result");
 
-        assert!(waiting.is_empty());
         assert!(matches!(
             receiver.try_recv_all().next(),
             Some(Message::DeviceConfigResult {
@@ -2208,118 +2083,19 @@ mod tests {
     }
 
     #[test]
-    fn submitted_config_waits_for_proven_resume_then_reports_success() {
+    fn submitted_config_source_gone_reports_terminal_result_immediately() {
+        // Mutation killed: restore the continuation queue so SourceGone is
+        // withheld until a resume lifecycle event.
         let (_poll, sender, receiver) = yserver_core::core_loop::channel().unwrap();
         let source = InputSourceId(92);
         let token = DeviceConfigToken(18);
         let change = DeviceConfigChange::NaturalScroll(true);
-        let mut waiting = VecDeque::new();
 
-        process_config_commands(
-            vec![(token, source, change)],
-            &sender,
-            &mut waiting,
-            |_, _| (Err(DeviceConfigError::SourceGone), true),
-        )
-        .expect("queue the proven-continuation wait");
-        assert_eq!(waiting, VecDeque::from([(token, source, change)]));
-        assert!(receiver.try_recv_all().next().is_none());
+        process_config_commands(vec![(token, source, change)], &sender, |_, _| {
+            Err(DeviceConfigError::SourceGone)
+        })
+        .expect("send terminal result for a missing handle");
 
-        let resumed = resumed_info(source);
-        service_waiting_device_configs(
-            &sender,
-            &mut waiting,
-            &[InputEvent::DeviceResumed(resumed)],
-            |actual_source, actual_change| {
-                assert_eq!(actual_source, source);
-                assert_eq!(actual_change, change);
-                Ok(())
-            },
-        )
-        .expect("apply to the proven rebind and report it");
-
-        assert!(waiting.is_empty());
-        assert!(matches!(
-            receiver.try_recv_all().next(),
-            Some(Message::DeviceConfigResult {
-                token: actual_token,
-                source: actual_source,
-                result: Ok(()),
-            }) if actual_token == token && actual_source == source
-        ));
-    }
-
-    #[test]
-    fn waiting_config_snapshot_keeps_resume_events_after_batch_consumption() {
-        let (_poll, sender, receiver) = yserver_core::core_loop::channel().unwrap();
-        let source = InputSourceId(94);
-        let token = DeviceConfigToken(20);
-        let change = DeviceConfigChange::NaturalScroll(true);
-        let events = vec![InputEvent::DeviceResumed(resumed_info(source))];
-        let waiting = VecDeque::from([(token, source, change)]);
-
-        let snapshot = snapshot_lifecycle_events_for_waiters(&waiting, &events)
-            .expect("a pending config keeps the lifecycle events beside the consumed batch");
-        assert!(matches!(
-            snapshot.as_slice(),
-            [InputEvent::DeviceResumed(info)] if info.source_id == source
-        ));
-        assert!(
-            snapshot_lifecycle_events_for_waiters(&VecDeque::new(), &events).is_none(),
-            "the common path without a waiting config needs no batch clone"
-        );
-        drop(events); // process_batch consumes the original input vector.
-
-        let mut waiting = waiting;
-        service_waiting_device_configs(
-            &sender,
-            &mut waiting,
-            &snapshot,
-            |actual_source, actual_change| {
-                assert_eq!(actual_source, source);
-                assert_eq!(actual_change, change);
-                Ok(())
-            },
-        )
-        .expect("resume lifecycle event retries the waiting config");
-
-        assert!(waiting.is_empty());
-        assert!(matches!(
-            receiver.try_recv_all().next(),
-            Some(Message::DeviceConfigResult {
-                token: actual_token,
-                source: actual_source,
-                result: Ok(()),
-            }) if actual_token == token && actual_source == source
-        ));
-    }
-
-    #[test]
-    fn submitted_config_expiring_without_rebind_reports_source_gone() {
-        let (_poll, sender, receiver) = yserver_core::core_loop::channel().unwrap();
-        let source = InputSourceId(93);
-        let token = DeviceConfigToken(19);
-        let change = DeviceConfigChange::Tap(false);
-        let mut waiting = VecDeque::new();
-
-        process_config_commands(
-            vec![(token, source, change)],
-            &sender,
-            &mut waiting,
-            |_, _| (Err(DeviceConfigError::SourceGone), true),
-        )
-        .expect("queue the proven-continuation wait");
-        assert_eq!(waiting.len(), 1);
-
-        service_waiting_device_configs(
-            &sender,
-            &mut waiting,
-            &[InputEvent::DeviceRemoved { source_id: source }],
-            |_, _| panic!("removed source must not be applied"),
-        )
-        .expect("report source expiry");
-
-        assert!(waiting.is_empty());
         assert!(matches!(
             receiver.try_recv_all().next(),
             Some(Message::DeviceConfigResult {
@@ -2328,5 +2104,6 @@ mod tests {
                 result: Err(DeviceConfigError::SourceGone),
             }) if actual_token == token && actual_source == source
         ));
+        assert!(receiver.try_recv_all().next().is_none());
     }
 }

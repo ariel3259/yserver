@@ -12217,9 +12217,12 @@ impl KmsBackend {
         self.input_thread_control = Some(control);
     }
 
-    fn pause_input_thread(&self) {
+    fn pause_input_thread(&self) -> bool {
         if let Some(control) = self.input_thread_control.as_ref() {
             control.pause();
+            true
+        } else {
+            false
         }
     }
 
@@ -23116,15 +23119,22 @@ impl Backend for KmsBackend {
         // would deadlock that handshake.
     }
 
-    fn on_vt_release(&mut self, state: &mut ServerState) {
+    fn begin_vt_release(&mut self) -> bool {
+        log::info!("kms: VT release — begin (pause input)");
+        self.pause_input_thread()
+    }
+
+    fn finish_vt_release(
+        &mut self,
+        state: &mut ServerState,
+        _input_inventory: &yserver_core::core_loop::input_inventory::InputInventory,
+    ) {
         use crate::vt::state::VtEventKind;
         use ::drm::Device as _;
 
         // Step logging is load-bearing: if a switch wedges, the last line
         // printed pinpoints which step stalled (kernel blocks the VT switch
         // until VT_RELDISP, so a stall here freezes the whole session).
-        log::info!("kms: VT release — begin (pause input)");
-        self.pause_input_thread();
         log::info!("kms: VT release — input paused; run_suspend");
         self.drive_vt_event(state, VtEventKind::Disable);
         log::info!("kms: VT release — suspended; drmDropMaster");
@@ -60936,7 +60946,12 @@ mod tests {
         // This is the production callback invoked for Message::VtRelease;
         // the empty headless fixture still exercises drive_vt_event and
         // run_suspend without opening DRM or switching a real VT.
-        dispatch_vt_release(&mut state, &mut backend, &mut input_inventory);
+        dispatch_vt_release(
+            &mut state,
+            &mut backend,
+            &mut input_inventory,
+            |_, _, _, _| {},
+        );
         assert!(!input_inventory.get(SOURCE).unwrap().enabled);
         assert!(!state.xi_devices.source(SOURCE).unwrap().enabled);
         assert_eq!(state.xi_devices.device(keyboard).unwrap().id, keyboard);
@@ -61261,7 +61276,12 @@ mod tests {
             "production KMS input routes a published-source-less key to guarded internal state",
         );
 
-        dispatch_vt_release(&mut state, &mut backend, &mut input_inventory);
+        dispatch_vt_release(
+            &mut state,
+            &mut backend,
+            &mut input_inventory,
+            |_, _, _, _| {},
+        );
         assert!(
             input_inventory
                 .devices_by_source()

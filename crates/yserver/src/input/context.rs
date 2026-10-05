@@ -339,12 +339,6 @@ impl SendContext {
     ) -> Result<(), DeviceConfigError> {
         self.0.apply_device_config(source, change)
     }
-
-    /// Whether a submitted command may wait for this source's proven
-    /// continuation during VT recovery.
-    pub(crate) fn can_wait_for_device_config(&self, source: InputSourceId) -> bool {
-        self.0.can_wait_for_device_config(source)
-    }
 }
 
 impl AsFd for SendContext {
@@ -621,8 +615,8 @@ impl Context {
     /// source ID, so it cannot name a physical configuration target.
     ///
     /// Returns [`DeviceConfigError::SourceGone`] when the source ID no longer
-    /// has a live pointer handle. The input thread may retain a request across
-    /// a confirmed resume; a removed source completes with `SourceGone`.
+    /// has a live pointer handle. The input thread reports that result
+    /// immediately; a property write is never retained for a later rebind.
     ///
     /// Errors map libinput's [`input::DeviceConfigError`] onto the
     /// X-layer's [`DeviceConfigError`]: `Unsupported` → BadMatch,
@@ -651,13 +645,6 @@ impl Context {
             }
         }
         Err(DeviceConfigError::SourceGone)
-    }
-
-    fn can_wait_for_device_config(&self, source: InputSourceId) -> bool {
-        self.resume_tracker
-            .paused
-            .get(&source)
-            .is_some_and(|info| info.resume_key.is_some())
     }
 }
 
