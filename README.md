@@ -29,12 +29,16 @@ See [`docs/extensions.txt`](docs/extensions.txt) for a list of all supported/imp
   dtterm, dtfile, dtpad, and the Motif/Xaw apps around it
 - old-style toolkits (Motif, Xaw, Tk, xterm) draw like on Xorg: lines, text and
   clipping, exposures and GraphicsExpose, GetImage of windows with children
-- CDE and Motif apps start as fast as on Xorg — font lookups are indexed and cached;
-  compressed bitmap fonts report their real default char, bounds and properties
+- CDE and Motif apps start as fast as on Xorg 
+- font lookups are indexed and cached
+- compressed bitmap fonts now work as expected
 - fractional scaling via RANDR transforms (Cinnamon 125%/150%, `xrandr --scale`),
   screen rotation and reflection, virtual monitors (`xrandr --setmonitor`), and
-  `xrandr --dpi` reaching new applications
+- `xrandr --dpi` now works
 - RECORD extension (pynput and other global input listeners)
+- one XInput device per physical device (mouse, keyboard and touchpad, as on Xorg) (@ariel3259)
+- runs on Vulkan 1.2 GPUs such as Intel Haswell and Ivy Bridge; older drivers get a
+  clear error naming what is missing
 - XFCE dialogs under the compositor keep their button bar when scrolled; MATE tray
   icons keep their pixels when moved
 - the Cinnamon lock screen shows up again, and fullscreen windows can be
