@@ -19954,10 +19954,10 @@ fn handle_xi2_request(
         2 => {
             debug!("client {} #{} XListInputDevices", client_id.0, sequence.0);
             // Keep the same descriptor order as XIQueryDevice selector 0.
-            // XI1 has no enabled field; it does preserve Xorg's type/use
-            // values and the existing master, XTEST, and physical class
-            // shapes.
+            // XI1 has no enabled field. Match Xorg's None type for masters
+            // and XTEST devices while preserving each physical facet's type.
             const POINTER_AXES: [(i32, i32); 4] = [(-1, -1), (-1, -1), (-1, 0), (-1, 0)];
+            const XTEST_POINTER_AXES: [(i32, i32); 2] = [(-1, -1), (-1, -1)];
             let pointer_classes = [
                 x11::Xi1DeviceClass::Button { num_buttons: 7 },
                 x11::Xi1DeviceClass::Valuator {
@@ -19965,11 +19965,24 @@ fn handle_xi2_request(
                     axes: &POINTER_AXES,
                 },
             ];
+            let xtest_pointer_classes = [
+                x11::Xi1DeviceClass::Button { num_buttons: 10 },
+                x11::Xi1DeviceClass::Valuator {
+                    mode: 0,
+                    axes: &XTEST_POINTER_AXES,
+                },
+            ];
             let keyboard_classes = [x11::Xi1DeviceClass::Key {
                 min_keycode: 8,
                 max_keycode: 255,
                 num_keys: 248,
             }];
+            // XI1 copies `d->xinput_type` directly to the type atom
+            // (`Xi/listdev.c:171-173`). The server-created master and XTEST
+            // devices keep calloc's initial None value
+            // (`dix/devices.c:259-261`); physical types are assigned by the
+            // input driver (`Xi/extinit.c:1207-1210`).
+            let no_type_atom = x11::AtomId(0);
             let mouse_atom = state.atoms.intern(crate::xinput::XI_ATOM_MOUSE, true);
             let keyboard_atom = state.atoms.intern(crate::xinput::XI_ATOM_KEYBOARD, true);
             let touchpad_atom = state.atoms.intern(crate::xinput::XI_ATOM_TOUCHPAD, true);
@@ -19981,22 +19994,16 @@ fn handle_xi2_request(
                 .map(|device| {
                     let (use_code, type_atom, classes) = match device.id {
                         crate::xinput::DEVICEID_MASTER_POINTER => {
-                            (0, mouse_atom, &pointer_classes[..])
+                            (0, no_type_atom, &pointer_classes[..])
                         }
                         crate::xinput::DEVICEID_MASTER_KEYBOARD => {
-                            (1, keyboard_atom, &keyboard_classes[..])
+                            (1, no_type_atom, &keyboard_classes[..])
                         }
-                        crate::xinput::DEVICEID_XTEST_POINTER => (
-                            4,
-                            if device.is_touchpad {
-                                touchpad_atom
-                            } else {
-                                mouse_atom
-                            },
-                            &pointer_classes[..],
-                        ),
+                        crate::xinput::DEVICEID_XTEST_POINTER => {
+                            (4, no_type_atom, &xtest_pointer_classes[..])
+                        }
                         crate::xinput::DEVICEID_XTEST_KEYBOARD => {
-                            (3, keyboard_atom, &keyboard_classes[..])
+                            (3, no_type_atom, &keyboard_classes[..])
                         }
                         _ => match device
                             .facet
@@ -46122,224 +46129,171 @@ mod tests {
         );
     }
 
-    /// Drive `XListInputDevices` (XI 1.x, major 131 minor 2) and return
-    /// `(device id, type atom)` pairs for the current registry snapshot.
-    /// The atom sits at bytes 0-3 of each 8-byte device-info descriptor
-    /// immediately after the 32-byte reply header.
-    fn list_input_devices_type_atoms(
+    /// Drive one XI request through the core dispatcher and return its wire
+    /// reply. The actual XInput extension major opcode is 137; `minor` is the
+    /// XI 1.x / XI2 request number in the data byte.
+    fn dispatch_xi_request_wire(
         state: &mut ServerState,
         peer: &mut UnixStream,
-    ) -> Vec<(u16, u32)> {
+        sequence: u16,
+        minor: u8,
+        body: &[u8],
+    ) -> Vec<u8> {
         let mut backend = RecordingBackend::new();
-        let header = RequestHeader {
-            opcode: 131,
-            data: 2,
-            // ListInputDevices (XI minor 2) is Fixed(1): just the 4-byte
-            // request header = 1 unit. (Was 0 — pre-dated the length
-            // gate, now BadLengths before the handler enumerates devices.)
-            length_units: 1,
-        };
-        handle_xi2_request(
+        process_request(
             state,
             &mut backend,
-            None,
             ClientId(1),
-            SequenceNumber(1),
-            header,
-            &[],
+            SequenceNumber(sequence),
+            RequestHeader {
+                opcode: XI2_MAJOR_OPCODE,
+                data: minor,
+                length_units: u32::try_from((4 + body.len()).div_ceil(4)).unwrap(),
+            },
+            body,
+            None,
         )
-        .expect("XListInputDevices");
-        let wire = read_all_available(peer);
-        let ndevices = wire[8] as usize;
-        let reply_length = u32::from_le_bytes(wire[4..8].try_into().unwrap()) as usize;
-        assert_eq!(
-            wire.len(),
-            32 + reply_length * 4,
-            "reply length covers all records"
-        );
-        let mut result = Vec::with_capacity(ndevices);
-        let mut off = 32;
-        for _ in 0..ndevices {
-            let type_atom =
-                u32::from_le_bytes([wire[off], wire[off + 1], wire[off + 2], wire[off + 3]]);
-            result.push((u16::from(wire[off + 4]), type_atom));
-            off += 8;
-        }
-        result
+        .expect("XI request through core dispatcher");
+        read_all_available(peer)
     }
 
-    /// Device 4 remains the virtual XTEST pointer when a physical source is
-    /// registered, so its XI1 type stays MOUSE beside dynamic facets.
+    /// Read-only XI replies must leave the registry, holds, floating state,
+    /// property maps, and every client selection unchanged.
+    fn xi_query_side_effect_snapshot(state: &ServerState, client_id: u32) -> String {
+        let client = &state.clients[&client_id];
+        format!(
+            "registry={:?}; keys={:?}; buttons={}; device_buttons={:?}; \
+             detached={:?}; floating={:?}; properties={:?}; selections={:?}",
+            state.xi_devices,
+            state.keys_down,
+            state.buttons_down,
+            state
+                .xi_devices
+                .devices()
+                .iter()
+                .map(|device| (device.id, device.buttons_down))
+                .collect::<Vec<_>>(),
+            state.xi2_detached_masters,
+            state.floating_pointer_positions,
+            state
+                .xi_devices
+                .devices()
+                .iter()
+                .map(|device| (device.id, &device.properties))
+                .collect::<Vec<_>>(),
+            (
+                &client.event_masks,
+                &client.xi2_masks,
+                &client.xi1_event_classes,
+                &client.xi1_window_event_classes,
+            ),
+        )
+    }
+
+    /// Device 4 must keep Xorg's CorePointerProc shape, while physical pointer
+    /// facets retain their GDK-compatible generic XI2 classes.
     #[test]
-    fn list_input_devices_xtest_pointer_keeps_mouse_type() {
+    fn xi_xtest_classes_query_device_4_has_core_pointer_shape() {
+        // Kills routing XTEST 4 through the physical pointer class encoder:
+        // that mutation returns seven classes, four axes, and scroll classes.
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
+        let physical_pointer = seed_pointer_for_t3(&mut state);
+        let before = xi_query_side_effect_snapshot(&state, 1);
 
-        // Look up the pre-interned type atoms from the server's atom table.
-        let mouse_atom = state.atoms.intern(crate::xinput::XI_ATOM_MOUSE, true).0;
-        let kbd_atom = state.atoms.intern(crate::xinput::XI_ATOM_KEYBOARD, true).0;
-        let touchpad_atom = state.atoms.intern(crate::xinput::XI_ATOM_TOUCHPAD, true).0;
-        assert_ne!(mouse_atom, 0, "MOUSE pre-interned");
-        assert_ne!(kbd_atom, 0, "KEYBOARD pre-interned");
-        assert_ne!(touchpad_atom, 0, "TOUCHPAD pre-interned");
-
-        // Masters and XTEST are the four stable entries before any
-        // physical source is registered.
-        let types = list_input_devices_type_atoms(&mut state, &mut peer);
+        // XIQueryDevice(4), not XIAllDevices, is sent through process_request.
+        let (xtest_classes, xtest_num_classes) =
+            query_device_class_block(&mut state, &mut peer, crate::xinput::DEVICEID_XTEST_POINTER);
+        assert_eq!(xtest_num_classes, 3, "button + two valuator classes only");
+        let xtest_classes_info = parse_xi2_class_headers(&xtest_classes, xtest_num_classes);
         assert_eq!(
-            types,
-            [
-                (2, mouse_atom),
-                (3, kbd_atom),
-                (4, mouse_atom),
-                (5, kbd_atom)
-            ]
+            xtest_classes_info
+                .iter()
+                .map(|class| class.0)
+                .collect::<Vec<_>>(),
+            [1, 2, 2],
+            "XTEST 4 has ButtonClass and exactly two ValuatorClass records"
         );
 
-        // A physical touchpad gets a separate dynamic facet and must not
-        // repurpose virtual XTEST pointer 4.
-        let touchpad_info = crate::core_loop::DeviceInfo {
-            source_id: crate::xinput::InputSourceId(u64::from(line!())),
-            enabled: true,
-            resume_key: None,
-            capabilities: crate::xinput::InputCapabilities {
-                keyboard: false,
-                pointer: true,
-                touch: false,
-            },
-            name: "SynPS/2 Synaptics TouchPad".into(),
-            device_node: "/dev/input/event4".into(),
-            sysname: "event4".into(),
-            vendor_id: 0x046d,
-            product_id: 0xc52f,
-            is_touchpad: true,
-            config: crate::core_loop::message::LibinputConfigSnapshot {
-                tap: crate::core_loop::message::BoolSetting {
-                    available: true,
-                    current: true,
-                    default: false,
-                },
-                natural_scroll: crate::core_loop::message::BoolSetting {
-                    available: true,
-                    current: false,
-                    default: true,
-                },
-                dwt: crate::core_loop::message::BoolSetting {
-                    available: true,
-                    current: true,
-                    default: true,
-                },
-                ..Default::default()
-            },
-        };
-        let touchpad_source = touchpad_info.source_id;
-        let physical_ids = state.xi_register_source(&touchpad_info);
-        let physical_pointer = physical_ids
-            .iter()
-            .copied()
-            .find(|id| {
-                state.xi_devices.device(*id).is_some_and(|device| {
-                    device.facet == Some(crate::xinput::XiFacetKind::PointerTouch)
-                })
+        let button = &xtest_classes_info[0];
+        assert_eq!(button.1, 13, "10 buttons plus one state word");
+        assert_eq!(u16::from_le_bytes([xtest_classes[6], xtest_classes[7]]), 10);
+        assert_eq!(u16::from_le_bytes([xtest_classes[4], xtest_classes[5]]), 4);
+        let expected_labels = [
+            state.atoms.id_for("Button Left").unwrap().0,
+            state.atoms.id_for("Button Middle").unwrap().0,
+            state.atoms.id_for("Button Right").unwrap().0,
+            state.atoms.id_for("Button Wheel Up").unwrap().0,
+            state.atoms.id_for("Button Wheel Down").unwrap().0,
+            state.atoms.id_for("Button Horiz Wheel Left").unwrap().0,
+            state.atoms.id_for("Button Horiz Wheel Right").unwrap().0,
+            0,
+            0,
+            0,
+        ];
+        let actual_labels = (0..10)
+            .map(|index| {
+                let start = 12 + index * 4;
+                u32::from_le_bytes(xtest_classes[start..start + 4].try_into().unwrap())
             })
-            .expect("registered touchpad pointer facet");
-        assert!(physical_pointer >= 6, "physical facet IDs start at 6");
-        let types = list_input_devices_type_atoms(&mut state, &mut peer);
+            .collect::<Vec<_>>();
         assert_eq!(
-            types.len(),
-            5,
-            "the physical pointer is a fifth registry entry"
-        );
-        assert_eq!(
-            types
-                .iter()
-                .find(|(id, _)| *id == crate::xinput::DEVICEID_XTEST_POINTER)
-                .unwrap()
-                .1,
-            mouse_atom
-        );
-        assert_eq!(
-            types
-                .iter()
-                .find(|(id, _)| *id == physical_pointer)
-                .unwrap()
-                .1,
-            touchpad_atom
-        );
-        assert_eq!(
-            state
-                .xi_devices
-                .device(crate::xinput::DEVICEID_XTEST_POINTER)
-                .unwrap()
-                .name,
-            crate::xinput::registry::NAME_XTEST_POINTER
-        );
-        assert!(
-            state
-                .xi_devices
-                .device(crate::xinput::DEVICEID_XTEST_POINTER)
-                .unwrap()
-                .properties
-                .contains_key(&state.xtest_device_atom)
-        );
-        let tap_atom = state
-            .atoms
-            .id_for(crate::xinput::PROP_TAPPING_ENABLED)
-            .unwrap();
-        assert!(
-            state
-                .xi_devices
-                .device(physical_pointer)
-                .unwrap()
-                .properties
-                .contains_key(&tap_atom)
-        );
-        assert!(
-            !state
-                .xi_devices
-                .device(crate::xinput::DEVICEID_XTEST_POINTER)
-                .unwrap()
-                .properties
-                .contains_key(&tap_atom)
+            actual_labels, expected_labels,
+            "XTEST labels are the seven core labels followed by three None atoms"
         );
 
-        // Removal still leaves the virtual device intact.
-        state.xi_unregister_source(touchpad_source);
-        let types = list_input_devices_type_atoms(&mut state, &mut peer);
+        for (index, expected_label) in ["Rel X", "Rel Y"].into_iter().enumerate() {
+            let start = button.2 + button.1 * 4 + index * 44;
+            let class = &xtest_classes[start..start + 44];
+            assert_eq!(u16::from_le_bytes([class[0], class[1]]), 2);
+            assert_eq!(u16::from_le_bytes([class[2], class[3]]), 11);
+            assert_eq!(u16::from_le_bytes([class[4], class[5]]), 4);
+            assert_eq!(
+                u16::from_le_bytes([class[6], class[7]]),
+                u16::try_from(index).unwrap()
+            );
+            assert_eq!(
+                u32::from_le_bytes(class[8..12].try_into().unwrap()),
+                state.atoms.id_for(expected_label).unwrap().0
+            );
+            assert_eq!(i32::from_le_bytes(class[12..16].try_into().unwrap()), -1);
+            assert_eq!(i32::from_le_bytes(class[20..24].try_into().unwrap()), -1);
+            assert_eq!(class[40], 0, "Relative mode");
+        }
+
+        // The physical pointer stays on the existing generic 7-class shape.
+        let (physical_classes, physical_num_classes) =
+            query_device_class_block(&mut state, &mut peer, physical_pointer);
         assert_eq!(
-            types,
-            [
-                (2, mouse_atom),
-                (3, kbd_atom),
-                (4, mouse_atom),
-                (5, kbd_atom)
-            ]
+            physical_num_classes, 7,
+            "physical pointer keeps its two scroll class declarations"
         );
-        assert_ne!(touchpad_atom, mouse_atom);
+        let physical_classes_info =
+            parse_xi2_class_headers(&physical_classes, physical_num_classes);
+        assert_eq!(
+            physical_classes_info
+                .iter()
+                .map(|class| class.0)
+                .collect::<Vec<_>>(),
+            [1, 2, 2, 2, 2, 3, 3]
+        );
+        assert_eq!(
+            u16::from_le_bytes([physical_classes[6], physical_classes[7]]),
+            7
+        );
+        assert_eq!(xi_query_side_effect_snapshot(&state, 1), before);
     }
 
     /// Drive XIQueryDevice (opcode 48) and return the RAW class-block
-    /// bytes (and `num_classes`) for one selected device.
-    /// Walks the device-info array exactly like
-    /// `query_device_ids_and_names` but slices out the target's trailing
-    /// class bytes rather than just its name.
+    /// bytes (and `num_classes`) for one exact device selector.
     fn query_device_class_block(
         state: &mut ServerState,
         peer: &mut UnixStream,
         target_id: u16,
     ) -> (Vec<u8>, u16) {
-        let mut backend = RecordingBackend::new();
-        handle_xi2_request(
-            state,
-            &mut backend,
-            None,
-            ClientId(1),
-            SequenceNumber(1),
-            xi2_header(48),
-            &[0, 0, 0, 0], // deviceid=XIAllDevices, pad
-        )
-        .expect("XIQueryDevice");
-        let wire = read_all_available(peer);
+        let mut body = target_id.to_le_bytes().to_vec();
+        body.extend_from_slice(&[0, 0]); // XIQueryDevice pad
+        let wire = dispatch_xi_request_wire(state, peer, 1, 48, &body);
         assert_eq!(wire[0], 1, "XIQueryDevice reply");
         let reply_length = u32::from_le_bytes(wire[4..8].try_into().unwrap()) as usize;
         assert_eq!(
@@ -46370,61 +46324,230 @@ mod tests {
         panic!("requested device not present in XIQueryDevice reply");
     }
 
-    /// Regression guard: XIQueryDevice's virtual XTEST pointer class
-    /// block matches its DeviceChanged block. A physical touchpad has a
-    /// separate facet beginning at 6, with its own source ID in classes.
+    fn parse_xi2_class_headers(classes: &[u8], num_classes: u16) -> Vec<(u16, usize, usize)> {
+        let mut parsed = Vec::with_capacity(usize::from(num_classes));
+        let mut offset = 0;
+        for _ in 0..num_classes {
+            let class_type = u16::from_le_bytes([classes[offset], classes[offset + 1]]);
+            let units = usize::from(u16::from_le_bytes([
+                classes[offset + 2],
+                classes[offset + 3],
+            ]));
+            assert!(units > 0, "XI2 class record has a nonzero length");
+            parsed.push((class_type, units, offset));
+            offset += units * 4;
+        }
+        assert_eq!(offset, classes.len(), "all bytes belong to class records");
+        parsed
+    }
+
+    /// XI1 reports `None` for masters and XTEST devices, while physical
+    /// pointer devices retain their MOUSE atom and class descriptors.
     #[test]
-    fn query_xtest_pointer_matches_device_changed_block() {
+    fn xi_xtest_classes_xi1_list_and_open_device_match_xtest_pointer() {
+        // Kills reverting ids 2..5 to MOUSE/KEYBOARD atoms, or reusing the
+        // physical pointer's 7-button / four-axis ListInputDevices classes.
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
-
-        let (wire_classes, wire_num) =
-            query_device_class_block(&mut state, &mut peer, crate::xinput::DEVICEID_XTEST_POINTER);
-        let (builder_classes, builder_num) =
-            crate::core_loop::fanout::build_slave_pointer_class_block(&mut state);
-
-        assert_eq!(
-            wire_num, builder_num,
-            "XIQueryDevice XTEST pointer num_classes must match the shared builder"
-        );
-        assert_eq!(
-            wire_classes, builder_classes,
-            "XIQueryDevice XTEST-pointer class bytes must be byte-identical to the \
-             XI_DeviceChanged fanout block (both call build_slave_pointer_class_block)"
-        );
-
-        // A renamed touchpad gets its own physical facet; it does not
-        // replace or alter the XTEST pointer's class block.
-        let physical_pointer = seed_pointer_for_t3(&mut state);
-        state
-            .xi_devices
-            .iter_mut()
-            .find(|d| d.id == physical_pointer)
+        let physical_info = crate::core_loop::DeviceInfo {
+            source_id: crate::xinput::InputSourceId(u64::from(line!())),
+            enabled: true,
+            resume_key: None,
+            capabilities: crate::xinput::InputCapabilities {
+                keyboard: false,
+                pointer: true,
+                touch: false,
+            },
+            name: "Logitech USB mouse".into(),
+            device_node: "/dev/input/event-mouse".into(),
+            sysname: "event-mouse".into(),
+            vendor_id: 0x046d,
+            product_id: 0xc52f,
+            is_touchpad: false,
+            config: Default::default(),
+        };
+        let physical_pointer = state.xi_register_source(&physical_info)[0];
+        let mouse_atom = state.atoms.id_for(crate::xinput::XI_ATOM_MOUSE).unwrap().0;
+        let touchpad_info = crate::core_loop::DeviceInfo {
+            source_id: crate::xinput::InputSourceId(u64::from(line!())),
+            enabled: true,
+            resume_key: None,
+            capabilities: crate::xinput::InputCapabilities {
+                keyboard: false,
+                pointer: true,
+                touch: false,
+            },
+            name: "SynPS/2 Synaptics TouchPad".into(),
+            device_node: "/dev/input/event-touchpad".into(),
+            sysname: "event-touchpad".into(),
+            vendor_id: 0x06cb,
+            product_id: 0x00bd,
+            is_touchpad: true,
+            config: Default::default(),
+        };
+        let physical_touchpad = state.xi_register_source(&touchpad_info)[0];
+        let touchpad_atom = state
+            .atoms
+            .id_for(crate::xinput::XI_ATOM_TOUCHPAD)
             .unwrap()
-            .name = "SynPS/2 Synaptics TouchPad".to_owned();
-        let (wire_classes, _) =
-            query_device_class_block(&mut state, &mut peer, crate::xinput::DEVICEID_XTEST_POINTER);
-        let (builder_classes, _) =
-            crate::core_loop::fanout::build_slave_pointer_class_block(&mut state);
+            .0;
+        let keyboard_info = crate::core_loop::DeviceInfo {
+            source_id: crate::xinput::InputSourceId(u64::from(line!())),
+            enabled: true,
+            resume_key: None,
+            capabilities: crate::xinput::InputCapabilities {
+                keyboard: true,
+                pointer: false,
+                touch: false,
+            },
+            name: "USB keyboard".into(),
+            device_node: "/dev/input/event-keyboard".into(),
+            sysname: "event-keyboard".into(),
+            vendor_id: 0x046d,
+            product_id: 0xc31c,
+            is_touchpad: false,
+            config: Default::default(),
+        };
+        let physical_keyboard = state.xi_register_source(&keyboard_info)[0];
+        let keyboard_atom = state
+            .atoms
+            .id_for(crate::xinput::XI_ATOM_KEYBOARD)
+            .unwrap()
+            .0;
+        let before = xi_query_side_effect_snapshot(&state, 1);
+
+        let wire = dispatch_xi_request_wire(&mut state, &mut peer, 1, 2, &[]);
+        assert_eq!(wire[0], 1, "XListInputDevices reply");
+        let reply_length = u32::from_le_bytes(wire[4..8].try_into().unwrap()) as usize;
         assert_eq!(
-            wire_classes, builder_classes,
-            "XTEST-pointer class blocks must stay byte-identical after a touchpad rename"
+            wire.len(),
+            32 + reply_length * 4,
+            "reply length covers records"
         );
-        let (physical_classes, _) =
-            query_device_class_block(&mut state, &mut peer, physical_pointer);
+        let count = usize::from(wire[8]);
+        let mut device_records = Vec::with_capacity(count);
+        let mut offset = 32;
+        for _ in 0..count {
+            let type_atom = u32::from_le_bytes(wire[offset..offset + 4].try_into().unwrap());
+            let id = u16::from(wire[offset + 4]);
+            let class_count = wire[offset + 5];
+            device_records.push((id, type_atom, class_count));
+            offset += 8;
+        }
         assert_eq!(
-            u16::from_le_bytes([physical_classes[4], physical_classes[5]]),
-            physical_pointer,
-            "physical class records identify their registry facet"
+            device_records
+                .iter()
+                .filter(|(id, _, _)| (2..=5).contains(id))
+                .map(|(id, atom, _)| (*id, *atom))
+                .collect::<Vec<_>>(),
+            [(2, 0), (3, 0), (4, 0), (5, 0)],
+            "master and XTEST types are None"
         );
         assert_eq!(
-            state
-                .xi_devices
-                .device(crate::xinput::DEVICEID_XTEST_POINTER)
+            device_records
+                .iter()
+                .find(|(id, _, _)| *id == physical_pointer)
                 .unwrap()
-                .name,
-            crate::xinput::registry::NAME_XTEST_POINTER
+                .1,
+            mouse_atom,
+            "physical pointer type remains MOUSE"
         );
+        assert_eq!(
+            device_records
+                .iter()
+                .find(|(id, _, _)| *id == physical_touchpad)
+                .unwrap()
+                .1,
+            touchpad_atom,
+            "physical touchpad type remains TOUCHPAD"
+        );
+        assert_eq!(
+            device_records
+                .iter()
+                .find(|(id, _, _)| *id == physical_keyboard)
+                .unwrap()
+                .1,
+            keyboard_atom,
+            "physical keyboard type remains KEYBOARD"
+        );
+
+        let mut xtest_pointer_classes = Vec::new();
+        let mut physical_pointer_classes = Vec::new();
+        for (device_id, _, class_count) in &device_records {
+            for _ in 0..*class_count {
+                let class_type = wire[offset];
+                let class_len = usize::from(wire[offset + 1]);
+                assert!(class_len >= 4, "XI1 class descriptor has a valid length");
+                if *device_id == crate::xinput::DEVICEID_XTEST_POINTER {
+                    xtest_pointer_classes.push(wire[offset..offset + class_len].to_vec());
+                } else if *device_id == physical_pointer {
+                    physical_pointer_classes.push(wire[offset..offset + class_len].to_vec());
+                }
+                assert!(matches!(class_type, 0..=3 | 5..=6));
+                offset += class_len;
+            }
+        }
+        assert_eq!(
+            xtest_pointer_classes
+                .iter()
+                .map(|class| class[0])
+                .collect::<Vec<_>>(),
+            [1, 2],
+            "XTEST XI1 listing has ButtonClass and ValuatorClass"
+        );
+        assert_eq!(
+            u16::from_le_bytes([xtest_pointer_classes[0][2], xtest_pointer_classes[0][3]]),
+            10
+        );
+        assert_eq!(xtest_pointer_classes[1][2], 2, "XTEST has two valuators");
+        assert_eq!(
+            xtest_pointer_classes[1][3], 0,
+            "XTEST valuators are relative"
+        );
+        for axis in 0..2 {
+            let axis_start = 8 + axis * 12;
+            assert_eq!(
+                i32::from_le_bytes(
+                    xtest_pointer_classes[1][axis_start + 4..axis_start + 8]
+                        .try_into()
+                        .unwrap()
+                ),
+                -1
+            );
+            assert_eq!(
+                i32::from_le_bytes(
+                    xtest_pointer_classes[1][axis_start + 8..axis_start + 12]
+                        .try_into()
+                        .unwrap()
+                ),
+                -1
+            );
+        }
+        assert_eq!(
+            physical_pointer_classes
+                .iter()
+                .map(|class| class[0])
+                .collect::<Vec<_>>(),
+            [1, 2],
+            "physical XI1 pointer still has its existing classes"
+        );
+        assert_eq!(
+            u16::from_le_bytes([
+                physical_pointer_classes[0][2],
+                physical_pointer_classes[0][3]
+            ]),
+            7
+        );
+        assert_eq!(physical_pointer_classes[1][2], 4);
+
+        // XOpenDevice exposes class/event-base tags sourced from the same
+        // button and valuator classes (`Xi/opendev.c:120-155`).
+        let opened = dispatch_xi_request_wire(&mut state, &mut peer, 2, 3, &[4, 0, 0, 0]);
+        assert_eq!(opened.len(), 40, "four class tags follow the reply header");
+        assert_eq!(opened[0], 1, "XOpenDevice reply");
+        assert_eq!(opened[8], 4, "button, valuator, feedback, and other");
+        assert_eq!(&opened[32..40], &[1, 69, 2, 71, 3, 0, 6, 76]);
+        assert_eq!(xi_query_side_effect_snapshot(&state, 1), before);
     }
 
     /// Tier 2b T7 regression: the `XI_DeviceChanged` event emitted by
@@ -46521,6 +46644,8 @@ mod tests {
 
     #[test]
     fn legacy_device_changed_fanout_emits_for_selected_xtest_pointer() {
+        // Kills routing XTEST 4 through the generic physical pointer encoder;
+        // Xorg `CorePointerProc` defines 10 buttons and two relative axes.
         use crate::{
             core_loop::fanout::emit_xi2_device_changed_slave_pointer,
             xinput::DEVICEID_XTEST_POINTER,
@@ -46541,11 +46666,20 @@ mod tests {
                 .properties
                 .contains_key(&state.xtest_device_atom)
         );
-        // Client selects XI_DeviceChanged on the virtual XTEST pointer
-        // (device 4) at the root window — the way GDK/Chromium subscribe.
-        state.clients.get_mut(&1).unwrap().xi2_masks.insert(
-            (ROOT_WINDOW, DEVICEID_XTEST_POINTER),
-            u64::from(XI2_DEVICE_CHANGED_MASK),
+        let before = xi_query_side_effect_snapshot(&state, 1);
+        // Install the real XISelectEvents mask through the core dispatcher.
+        let mut select_body = Vec::new();
+        select_body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        select_body.extend_from_slice(&1u16.to_le_bytes()); // num_masks
+        select_body.extend_from_slice(&0u16.to_le_bytes()); // pad
+        select_body.extend_from_slice(&DEVICEID_XTEST_POINTER.to_le_bytes());
+        select_body.extend_from_slice(&1u16.to_le_bytes()); // mask_len
+        select_body.extend_from_slice(&XI2_DEVICE_CHANGED_MASK.to_le_bytes());
+        assert!(dispatch_xi_request_wire(&mut state, &mut peer, 1, 46, &select_body).is_empty());
+        assert!(
+            state.clients[&1]
+                .xi2_masks
+                .contains_key(&(ROOT_WINDOW, DEVICEID_XTEST_POINTER))
         );
 
         // This helper emits only the bootstrapped XTEST pointer event; the
@@ -46559,7 +46693,7 @@ mod tests {
         assert_eq!(wire[off + 10], 4, "deviceid = XTEST pointer");
         assert_eq!(wire[off + 18], 4, "sourceid = the XTEST pointer itself");
         assert_eq!(wire[off + 20], 2, "reason = XIDeviceChange");
-        assert_eq!(wire[off + 16], 7, "num_classes low byte");
+        assert_eq!(wire[off + 16], 3, "Button + two Valuator classes");
 
         // A second helper call exercises the same selected-device fanout.
         let dropped = emit_xi2_device_changed_slave_pointer(&mut state, 137);
@@ -46569,6 +46703,22 @@ mod tests {
             .find(|&i| wire[i] == 35 && u16::from_le_bytes([wire[i + 8], wire[i + 9]]) == 1)
             .expect("second legacy XI_DeviceChanged fanout");
         assert_eq!(wire[off + 10], 4, "deviceid = XTEST pointer");
+
+        // Clear the selection through XISelectEvents and confirm no request
+        // or event state remains after this scenario.
+        let mut unselect_body = Vec::new();
+        unselect_body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        unselect_body.extend_from_slice(&1u16.to_le_bytes()); // num_masks
+        unselect_body.extend_from_slice(&0u16.to_le_bytes()); // pad
+        unselect_body.extend_from_slice(&DEVICEID_XTEST_POINTER.to_le_bytes());
+        unselect_body.extend_from_slice(&0u16.to_le_bytes()); // mask_len = remove
+        assert!(dispatch_xi_request_wire(&mut state, &mut peer, 4, 46, &unselect_body).is_empty());
+        assert!(
+            !state.clients[&1]
+                .xi2_masks
+                .contains_key(&(ROOT_WINDOW, DEVICEID_XTEST_POINTER))
+        );
+        assert_eq!(xi_query_side_effect_snapshot(&state, 1), before);
     }
 
     #[test]

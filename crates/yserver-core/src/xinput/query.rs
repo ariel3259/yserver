@@ -30,8 +30,8 @@ enum DeviceClass {
 
 /// Encode a registry-selected XI2 device list as an `XIQueryDevice` reply.
 /// Every multi-byte reply and class field follows the requesting client's
-/// byte order. Class values and shapes preserve yserver's existing master
-/// pointer and GDK-compatible generic slave-pointer descriptors.
+/// byte order. The XTEST pointer uses `CorePointerProc`; physical slave
+/// pointers retain yserver's GDK-compatible generic descriptors.
 pub(crate) fn encode_reply(
     byte_order: ClientByteOrder,
     sequence: SequenceNumber,
@@ -156,10 +156,16 @@ pub(crate) fn build_pointer_classes(
     source_id: u16,
     data: XiQueryClassData,
 ) -> (Vec<u8>, u16) {
+    if source_id == super::DEVICEID_XTEST_POINTER {
+        // XTEST pointer 4 is initialized by `CorePointerProc`
+        // (`dix/devices.c:662-694`); keep its shape distinct from physical
+        // pointers, whose generic classes below support GDK's scroll setup.
+        return build_xtest_pointer_classes(byte_order, source_id, data);
+    }
+
     // GDK builds its seat/device table from the XI2 hierarchy and probes the
-    // first slave pointer for libinput-style properties. Keep the generic
-    // button/valuator/scroll shape for compatibility; this does not assign
-    // physical ownership or properties to virtual XTEST device 4.
+    // first physical slave pointer for libinput-style properties. Keep the
+    // generic button/valuator/scroll shape for physical devices.
     // The two scroll valuators must remain declared: GDK's scroll-valuator
     // setup asserts that each ScrollClass axis is below the valuator count.
     let mut classes = Vec::new();
@@ -212,6 +218,54 @@ pub(crate) fn build_pointer_classes(
     write_scroll_class(byte_order, &mut classes, source_id, 2, 1);
     write_scroll_class(byte_order, &mut classes, source_id, 3, 2);
     (classes, 7)
+}
+
+fn build_xtest_pointer_classes(
+    byte_order: ClientByteOrder,
+    source_id: u16,
+    data: XiQueryClassData,
+) -> (Vec<u8>, u16) {
+    // `CorePointerProc` declares 10 buttons, the first seven core labels, and
+    // only Rel X / Rel Y (`dix/devices.c:662-694`). Its
+    // `InitPointerDeviceStruct` call selects relative valuators
+    // (`dix/devices.c:687-694`, `:1644-1646`); it declares no scroll classes.
+    let mut classes = Vec::new();
+    let button_labels = [
+        data.button_labels[0],
+        data.button_labels[1],
+        data.button_labels[2],
+        data.button_labels[3],
+        data.button_labels[4],
+        data.button_labels[5],
+        data.button_labels[6],
+        AtomId(0),
+        AtomId(0),
+        AtomId(0),
+    ];
+    write_button_class(byte_order, &mut classes, source_id, &button_labels);
+    write_valuator_class(
+        byte_order,
+        &mut classes,
+        source_id,
+        0,
+        data.axis_labels[0],
+        -1,
+        -1,
+        0,
+        data.pointer.0,
+    );
+    write_valuator_class(
+        byte_order,
+        &mut classes,
+        source_id,
+        1,
+        data.axis_labels[1],
+        -1,
+        -1,
+        0,
+        data.pointer.1,
+    );
+    (classes, 3)
 }
 
 fn write_button_class(
