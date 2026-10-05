@@ -1605,22 +1605,34 @@ impl ServerState {
         self.active_pointer_grab = None;
     }
 
-    /// Temporarily float a physical slave for an explicit XI2 grab, saving
-    /// the attachment so deactivation and disconnect can restore it.
+    /// Temporarily float a slave for an explicit XI2 grab, saving its
+    /// attachment so deactivation and disconnect can restore it. XTEST 4/5
+    /// have no physical facet, but are slaves like the dynamic facets. Xorg
+    /// detaches every slave for explicit pointer/keyboard XI2 grabs
+    /// (`dix/events.c:1621-1624,1743-1746`); `DetachFromMaster` returns early
+    /// only when it is already floating (`dix/events.c:1461-1468`).
     pub fn detach_xi2_slave(&mut self, device_id: u16) -> bool {
         let Some(device) = self.xi_devices.device(device_id) else {
             return false;
         };
-        if device.facet.is_none() || !device.enabled {
+        let Some(role) = self.xi_devices.role(device_id) else {
+            return false;
+        };
+        if !device.enabled
+            || !matches!(
+                role,
+                crate::xinput::XiDeviceRole::SlavePointer
+                    | crate::xinput::XiDeviceRole::SlaveKeyboard
+            )
+        {
             return false;
         }
         let Some(master) = device.attached_master else {
             return false;
         };
-        let facet = device.facet;
         self.xi_clear_last_slave(device_id);
         self.xi2_detached_masters.insert(device_id, master);
-        if facet == Some(crate::xinput::XiFacetKind::PointerTouch) {
+        if role == crate::xinput::XiDeviceRole::SlavePointer {
             self.floating_pointer_positions.insert(
                 device_id,
                 (
