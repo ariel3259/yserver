@@ -136,7 +136,7 @@ them. Before any slave has supplied classes, the master's own initial classes
 carry its own ID.
 
 **C3. XTEST shape.** The XTEST pointer 4 has the `CorePointerProc` shape:
-10 buttons with the core labels, 2 absolute valuators, and no scroll classes
+10 buttons with the core labels, 2 relative valuators (`InitPointerDeviceStruct`, `devices.c:1644-1646`), and no scroll classes
 (`dix/devices.c:655-700`). XTEST input on button 10 is delivered, not dropped.
 
 **C4. Device type.** Masters 2/3 and XTEST 4/5 have no XI1 device type

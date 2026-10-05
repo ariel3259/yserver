@@ -93,8 +93,11 @@ master, in the XI2 bit layout (bit n for button n,
 **Do:** `detach_xi2_slave` and its callers float 4 and 5 like a physical
 facet on an explicit (non-implicit) XI2 grab. While floating, XTEST input to
 4 has its own position and no master effect, and input to 5 uses floating
-XKB state, exactly as the existing physical-floating rules. Ungrab, client
-disconnect and grab replacement re-attach them. Plan 1's "disabled never
+XKB state, exactly as the existing physical-floating rules. Ungrab and client
+disconnect re-attach them. A same-device XI2 grab replacement keeps the slave
+floating, with its saved master and floating position: `DetachFromMaster`
+returns at once for an already floating device (`dix/events.c:1463-1464`), and
+the old grab is freed without a reattach (`:1649-1650`). Plan 1's "disabled never
 reattaches" does not apply, because 4/5 are always enabled.
 
 **Tests (B through `XIGrabDevice` / `XIUngrabDevice` requests and XTEST
@@ -104,7 +107,10 @@ input):**
    the master pointer. Ungrab: attached again, and the next XTEST motion moves
    the master. *Kills:* the `facet.is_none()` early return.
 2. Grab 5, then inject a key on 5: the master keyboard state is unchanged.
-3. (A) Grab 4 and disconnect the client: 4 is re-attached, and
+3. Grab 4, move it with XTEST, then replace the grab with another XI2 grab
+   from the same client: 4 stays floating at the moved position. *Kills:*
+   reattach-then-detach on replacement.
+4. (A) Grab 4 and disconnect the client: 4 is re-attached, and
    `xi2_detached_masters` and `floating_pointer_positions` are empty.
 
 Check first whether Xorg sends a hierarchy event for a grab-time detach
