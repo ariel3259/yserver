@@ -23019,6 +23019,11 @@ fn handle_xi2_request(
             if !xi1_device_has_valuators(&state.xi_devices, dev) {
                 return xi1_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, minor);
             }
+            // `IsXTestDevice` rejects the XTEST pointer with BadMatch,
+            // ahead of the axis-range check (`Xi/setdval.c:113-114`).
+            if dev == crate::xinput::DEVICEID_XTEST_POINTER {
+                return xi1_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, minor);
+            }
             let axis_count = xi1_device_valuator_count(&state.xi_devices, dev)
                 .expect("validated valuator class");
             if u16::from(first) + u16::from(num) > u16::from(axis_count) {
@@ -51918,6 +51923,28 @@ mod tests {
         assert_eq!(wire[0], 0, "X error");
         assert_eq!(wire[1], x11::error::BAD_VALUE);
         assert_eq!(xi_query_side_effect_snapshot(&state, 1), before);
+    }
+
+    #[test]
+    fn xi1_set_device_valuators_xtest_pointer_is_bad_match() {
+        // Kills: accept valid-axis writes on the XTEST pointer. Xorg returns
+        // BadMatch for IsXTestDevice (Xi/setdval.c:113-114), before the
+        // range check (:116), so an out-of-range write is BadMatch too; the
+        // master pointer (id 2) is still accepted.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut body = vec![4, 0, 1, 0]; // XTEST pointer, axis 0, one value
+        body.extend_from_slice(&7i32.to_le_bytes());
+        let wire = dispatch_xi_request_wire(&mut state, &mut peer, 1, 33, &body);
+        assert_eq!(wire[0], 0, "X error");
+        assert_eq!(wire[1], x11::error::BAD_MATCH);
+        body[1] = 9; // out of range
+        let wire = dispatch_xi_request_wire(&mut state, &mut peer, 1, 33, &body);
+        assert_eq!(wire[1], x11::error::BAD_MATCH);
+        let mut ok = vec![2, 0, 1, 0];
+        ok.extend_from_slice(&7i32.to_le_bytes());
+        let wire = dispatch_xi_request_wire(&mut state, &mut peer, 1, 33, &ok);
+        assert_eq!(wire[0], 1, "master pointer still accepted");
     }
 
     #[test]
