@@ -25,6 +25,30 @@ See [`docs/extensions.txt`](docs/extensions.txt) for a list of all supported/imp
 
 ### Recent work
 
+- CDE (the Common Desktop Environment) runs: dtsession, dtwm with its panel,
+  dtterm, dtfile, dtpad, and the Motif/Xaw apps around it
+- old-style toolkits (Motif, Xaw, Tk, xterm) draw like on Xorg: lines, text and
+  clipping, exposures and GraphicsExpose, GetImage of windows with children
+- CDE and Motif apps start as fast as on Xorg — font lookups are indexed and cached;
+  compressed bitmap fonts report their real default char, bounds and properties
+- fractional scaling via RANDR transforms (Cinnamon 125%/150%, `xrandr --scale`),
+  screen rotation and reflection, virtual monitors (`xrandr --setmonitor`), and
+  `xrandr --dpi` reaching new applications
+- RECORD extension (pynput and other global input listeners)
+- XFCE dialogs under the compositor keep their button bar when scrolled; MATE tray
+  icons keep their pixels when moved
+- the Cinnamon lock screen shows up again, and fullscreen windows can be
+  re-composited after leaving fullscreen
+- fix slow VRAM growth: the cache of freed pixmaps is capped, and pixmaps held by
+  GCs and freed cursors are released
+- window backgrounds no longer flash in odd colours (CDE with sloppy focus)
+- lower CPU use with x11vnc and other screen grabbers
+- xmodmap and xkbcomp changes reach XKB clients; XI2 raw key events
+- a regression suite that runs the real server in a VM and compares it with Xorg,
+  in CI
+
+### Previously
+
 - XDMCP session negotiation with a display manager, and a TCP listener —
   both optional Cargo build features, off by default; see
   [`docs/setup.md`](docs/setup.md)
@@ -49,9 +73,6 @@ See [`docs/extensions.txt`](docs/extensions.txt) for a list of all supported/imp
 - multi-GPU: the render node is resolved on split display/render SoCs, and
   non-desktop connectors are ignored (touchbar on M2 macbook pro)
 - binary packages for aarch64 as well as x86_64
-
-### Previously
-
 - `starty` launcher (startx-style: display number picking, MIT-MAGIC-COOKIE-1, session teardown)
 - Present completions paced to the vblank, and the Present 1.4 acquire timeline honored
   (fixes free-running clients, fullscreen video, Plasma's spinner)
@@ -125,6 +146,7 @@ https://github.com/user-attachments/assets/dc266c55-e9ee-4649-a0c4-be3db2526713
 - bspwm/sxhkd
 - i3/fastcompmgr
 - enlightenment e16 + e27
+- CDE (dtwm)
 
 ## Hardware tested
 
