@@ -317,6 +317,17 @@ impl ResourceService {
             .collect()
     }
 
+    #[cfg(test)]
+    pub(crate) fn adopt_test_marker(&mut self) -> Result<AllocationKey, ResourceError> {
+        let payload = AllocationPayload::Spy(tests::SpyAllocation {
+            drops: Rc::new(std::cell::Cell::new(0)),
+        });
+        let lease = self.adopt(payload).map_err(|(error, _)| error)?;
+        let key = lease.key();
+        drop(lease);
+        Ok(key)
+    }
+
     pub(crate) fn has_pending_obligations(&self, key: &AllocationKey) -> bool {
         if let Some(entry) = self.entries.get(key) {
             !entry.availability.borrow().pending_obligations.is_empty()

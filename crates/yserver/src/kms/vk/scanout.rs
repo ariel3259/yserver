@@ -3721,6 +3721,15 @@ impl ScanoutBo {
             husk_registration: None,
         }
     }
+
+    /// Shape-only fixture for lifecycle quarantine tests. The synthetic BO
+    /// has no native DRM object and therefore cannot keep an old fd family
+    /// alive while the test exercises the barrier.
+    pub(crate) fn for_tests_without_drm(drm: Rc<crate::drm::Device>, vk: Arc<VkContext>) -> Self {
+        let mut bo = Self::for_tests(drm, vk);
+        bo.drm = None;
+        bo
+    }
 }
 
 impl ScanoutBo {

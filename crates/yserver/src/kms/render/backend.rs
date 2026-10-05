@@ -114,6 +114,17 @@ type NormalRecoveryDeviceOpener = Box<
     ) -> io::Result<RecoveryOpenedDevice>,
 >;
 
+type NormalRecoveryScanoutSetup = Box<
+    dyn FnMut(
+        &mut PlatformBackend,
+        DrmDeviceKey,
+        IncarnationId,
+        Rc<drm::Device>,
+        &mut crate::kms::render::resources::ResourceService,
+        &mut crate::kms::render::resources::DrmCleanupRegistry,
+    ) -> io::Result<()>,
+>;
+
 struct PendingNormalRecovery {
     recovery_id: crate::kms::owner::lifecycle::RecoveryId,
     transition: crate::kms::owner::lifecycle::TransitionTag<IncarnationId>,
@@ -139,6 +150,8 @@ struct QuarantinedNormalRecovery {
     #[allow(dead_code)] // retains the old incarnation's service until its barrier
     resource_service: Option<crate::kms::render::resources::ResourceService>,
     cleanup_registry: Option<crate::kms::render::resources::DrmCleanupRegistry>,
+    #[allow(dead_code)]
+    scanout_pools: Vec<(OutputKey, Option<crate::kms::vk::scanout::OutputScanout>)>,
 }
 
 fn open_normal_recovery_device(
@@ -159,6 +172,64 @@ fn open_normal_recovery_device(
         | crate::kms::backend::PlatformDeviceOpenError::Initialization(error) => error,
     })?;
     Ok(RecoveryOpenedDevice { device })
+}
+
+fn allocate_and_register_recovery_scanout_pools(
+    platform: &mut PlatformBackend,
+    device: DrmDeviceKey,
+    incarnation: IncarnationId,
+    drm_device: Rc<drm::Device>,
+    service: &mut crate::kms::render::resources::ResourceService,
+    registry: &mut crate::kms::render::resources::DrmCleanupRegistry,
+) -> io::Result<()> {
+    if service.device() != device
+        || service.incarnation() != incarnation
+        || registry.device_key() != device
+        || registry.incarnation() != incarnation
+    {
+        return Err(io::Error::other(
+            "fresh recovery scanout setup received a mismatched resource pair",
+        ));
+    }
+    let output_indices = platform
+        .outputs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, output)| (output.key.device_key == device).then_some(index))
+        .collect::<Vec<_>>();
+    if output_indices.is_empty() {
+        return Err(io::Error::other("fresh recovery has no remembered outputs"));
+    }
+    for output_idx in output_indices {
+        let output = &platform.outputs[output_idx];
+        let output_description = output.output.clone();
+        let route = output.scanout_route;
+        let width = u32::from(output.width);
+        let height = u32::from(output.height);
+        let pool = platform.allocate_prepared_client_scanout_pool(
+            Rc::clone(&drm_device),
+            &output_description,
+            route,
+            width,
+            height,
+        )?;
+        platform.scanout_pools[output_idx] = Some(pool);
+        let bo_count = platform.scanout_pools[output_idx]
+            .as_ref()
+            .map_or(0, |scanout| scanout.display_pool().bos.len());
+        for bo_idx in 0..bo_count {
+            platform
+                .register_managed_scanout_bo(service, registry, output_idx, bo_idx)
+                .map_err(|error| {
+                    io::Error::other(format!(
+                        "register recovery output {output_idx} BO {bo_idx}: {error:?}"
+                    ))
+                })?;
+        }
+        platform.bo_generations[output_idx] =
+            vec![crate::kms::render::platform::BoGenerationEntry::default(); bo_count];
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2081,6 +2152,7 @@ pub struct KmsBackend {
     normal_recovery_attempt: NormalRecoveryAttemptRuntime,
     normal_recovery_attempt_scripted: bool,
     normal_recovery_device_opener: NormalRecoveryDeviceOpener,
+    normal_recovery_scanout_setup: NormalRecoveryScanoutSetup,
     pending_normal_recovery_handshakes: HashMap<DrmDeviceKey, PendingNormalRecoveryHandshake>,
     pending_normal_recoveries: HashMap<DrmDeviceKey, PendingNormalRecovery>,
     quarantined_normal_recoveries: Vec<QuarantinedNormalRecovery>,
@@ -3750,12 +3822,28 @@ impl KmsBackend {
         self.platform.poll_source_generation = self.platform.poll_source_generation.wrapping_add(1);
         let old_service = self.resource_service.take();
         let old_registry = self.drm_cleanup_registry.take();
+        let mut old_scanout_pools = Vec::new();
+        for (output_idx, output) in self.platform.outputs.iter().enumerate() {
+            if output.key.device_key != device {
+                continue;
+            }
+            let old_pool = self
+                .platform
+                .scanout_pools
+                .get_mut(output_idx)
+                .and_then(Option::take);
+            old_scanout_pools.push((output.key.clone(), old_pool));
+            if let Some(generations) = self.platform.bo_generations.get_mut(output_idx) {
+                generations.clear();
+            }
+        }
         self.quarantined_normal_recoveries
             .push(QuarantinedNormalRecovery {
                 transition: tag,
                 device: old_entry,
                 resource_service: old_service,
                 cleanup_registry: old_registry,
+                scanout_pools: old_scanout_pools,
             });
         if let Some(new_device) = new_device {
             self.resource_service = Some(crate::kms::render::resources::ResourceService::new(
@@ -4127,6 +4215,7 @@ impl KmsBackend {
                         executor_identity.0,
                     )
                 }),
+                scanout_pools: Vec::new(),
             });
     }
 
@@ -4244,10 +4333,69 @@ impl KmsBackend {
             if !rediscovery_complete || !clock_ready {
                 continue;
             }
+            if let Err(error) = self.rebuild_normal_recovery_scanout_pools(device, new_incarnation)
+            {
+                log::warn!("kms: NormalRecovery scanout-pool rebuild for {device} failed: {error}");
+                self.pending_normal_recoveries.remove(&device);
+                self.finish_normal_recovery_attempt(
+                    device,
+                    recovery_id,
+                    transition,
+                    NormalRecoveryAttemptResult::Failed,
+                );
+                continue;
+            }
             self.pending_normal_recoveries.remove(&device);
             let result = (self.normal_recovery_attempt)(device, recovery_id, transition);
             self.finish_normal_recovery_attempt(device, recovery_id, transition, result);
         }
+    }
+
+    /// Rebuild the reopened incarnation's scanout pools after Task 3's joined,
+    /// device-scoped rediscovery and clock probe. The selected setup allocates
+    /// per output, as startup does, and performs no connector query.
+    fn rebuild_normal_recovery_scanout_pools(
+        &mut self,
+        device: DrmDeviceKey,
+        incarnation: IncarnationId,
+    ) -> io::Result<()> {
+        let entry = self
+            .platform
+            .device_for_key(device)
+            .filter(|entry| {
+                entry
+                    .owner
+                    .as_ref()
+                    .is_some_and(|owner| owner.incarnation() == incarnation)
+            })
+            .ok_or_else(|| io::Error::other("fresh recovery device is no longer current"))?;
+        let drm_device = entry
+            .device
+            .clone_rc()
+            .ok_or_else(|| io::Error::other("fresh recovery device is detached"))?;
+        if !self.resource_service.as_ref().is_some_and(|service| {
+            service.device() == device && service.incarnation() == incarnation
+        }) || !self.drm_cleanup_registry.as_ref().is_some_and(|registry| {
+            registry.device_key() == device && registry.incarnation() == incarnation
+        }) {
+            return Err(io::Error::other("fresh recovery resource pair is missing"));
+        }
+        let mut service = self.resource_service.take().expect("validated service");
+        let mut registry = self
+            .drm_cleanup_registry
+            .take()
+            .expect("validated cleanup registry");
+        let result = (self.normal_recovery_scanout_setup)(
+            &mut self.platform,
+            device,
+            incarnation,
+            drm_device,
+            &mut service,
+            &mut registry,
+        );
+        self.resource_service = Some(service);
+        self.drm_cleanup_registry = Some(registry);
+        result
     }
 
     fn offer_scene_composed_generations(&mut self) {
@@ -8979,6 +9127,7 @@ impl KmsBackend {
             normal_recovery_attempt: Box::new(|_, _, _| NormalRecoveryAttemptResult::Unavailable),
             normal_recovery_attempt_scripted: false,
             normal_recovery_device_opener: Box::new(open_normal_recovery_device),
+            normal_recovery_scanout_setup: Box::new(allocate_and_register_recovery_scanout_pools),
             pending_normal_recovery_handshakes: HashMap::new(),
             pending_normal_recoveries: HashMap::new(),
             quarantined_normal_recoveries: Vec::new(),
@@ -10634,6 +10783,7 @@ impl KmsBackend {
             normal_recovery_attempt,
             normal_recovery_attempt_scripted: true,
             normal_recovery_device_opener: Box::new(open_normal_recovery_device),
+            normal_recovery_scanout_setup: Box::new(allocate_and_register_recovery_scanout_pools),
             pending_normal_recovery_handshakes: HashMap::new(),
             pending_normal_recoveries: HashMap::new(),
             quarantined_normal_recoveries: Vec::new(),
@@ -144743,7 +144893,7 @@ mod tests {
         backend: &mut super::KmsBackend,
         opens: Rc<Cell<usize>>,
     ) {
-        c0_3di_install_fake_recovery_opener_with_behaviour(
+        let _ = c0_3di_install_fake_recovery_opener_with_behaviour(
             backend,
             opens,
             crate::kms::executor::test_support::StubBehaviour::HandshakeAndAcceptCallsWith(0x3d1),
@@ -144754,7 +144904,7 @@ mod tests {
         backend: &mut super::KmsBackend,
         opens: Rc<Cell<usize>>,
         behaviour: crate::kms::executor::test_support::StubBehaviour,
-    ) {
+    ) -> Rc<RefCell<Vec<crate::kms::render::resources::AllocationKey>>> {
         backend.normal_recovery_attempt_scripted = false;
         backend.normal_recovery_device_opener = Box::new(move |key, path, incarnation, epoch| {
             use std::os::fd::AsFd;
@@ -144790,6 +144940,41 @@ mod tests {
         backend
             .platform
             .install_scripted_connector_prober_for_tests();
+        let marker_keys = Rc::new(RefCell::new(Vec::new()));
+        let marker_keys_for_setup = Rc::clone(&marker_keys);
+        backend.normal_recovery_scanout_setup = Box::new(
+            move |platform, device, incarnation, _drm_device, service, registry| {
+                if service.device() != device
+                    || service.incarnation() != incarnation
+                    || registry.device_key() != device
+                    || registry.incarnation() != incarnation
+                {
+                    return Err(std::io::Error::other(
+                        "test recovery received a mismatched resource pair",
+                    ));
+                }
+                let output_count = platform.outputs.len();
+                platform.scanout_pools.resize_with(output_count, || None);
+                platform.bo_generations.resize_with(output_count, Vec::new);
+                for output in &platform.outputs {
+                    if output.key.device_key != device {
+                        continue;
+                    }
+                    let key = service.adopt_test_marker().map_err(|error| {
+                        std::io::Error::other(format!("test marker: {error:?}"))
+                    })?;
+                    if key.device != device || key.incarnation != incarnation {
+                        return Err(std::io::Error::other(
+                            "test recovery marker has the wrong incarnation",
+                        ));
+                    }
+                    marker_keys_for_setup.borrow_mut().push(key);
+                    let _ = service.service_ready();
+                }
+                Ok(())
+            },
+        );
+        marker_keys
     }
 
     fn c0_3di_hold_probe_worker_for_barrier(
@@ -145055,10 +145240,24 @@ mod tests {
             backend.resource_service.as_ref().is_some_and(|service| {
                 service.device() == device
                     && service.incarnation() == new_incarnation
-                    && service.allocation_end_state_for_tests().is_empty()
+                    && service
+                        .allocation_end_state_for_tests()
+                        .iter()
+                        .all(|allocation| {
+                            allocation.key.device == device
+                                && allocation.key.incarnation == new_incarnation
+                        })
             }),
-            "{test_name}: Task 3 installs a fresh empty resource service; pool creation is Task 4"
+            "{test_name}: the new service contains no foreign incarnation allocations"
         );
+        let new_allocations = backend
+            .resource_service
+            .as_ref()
+            .expect("new incarnation resource service")
+            .allocation_end_state_for_tests();
+        assert!(new_allocations.iter().all(|allocation| {
+            allocation.key.device == device && allocation.key.incarnation == new_incarnation
+        }));
         assert!(
             backend
                 .drm_cleanup_registry
@@ -145128,6 +145327,21 @@ mod tests {
                 .file_owned_gbm_bo_count_for_tests(),
             0,
             "{test_name}: family closure released every old-incarnation GBM BO"
+        );
+        assert!(
+            old_quarantine.scanout_pools.iter().any(|(key, pool)| {
+                key.device_key == device && key.connector_name == "HDMI-2" && pool.is_some()
+            }),
+            "{test_name}: old scanout pool structs remain in quarantine"
+        );
+        let old_keys = old_allocations
+            .iter()
+            .map(|allocation| allocation.key)
+            .collect::<HashSet<_>>();
+        assert!(
+            old_keys
+                .iter()
+                .all(|key| { key.device == device && key.incarnation == old_incarnation })
         );
         assert!(backend.platform.outputs.iter().any(|output| {
             output.key.device_key == device && output.key.connector_name == "HDMI-2"
@@ -145790,6 +146004,241 @@ mod tests {
         );
         assert!(backend.barrier_ready(incarnation));
         c0_3di_assert_end_state(&backend, "c0_3di_timer_never_retries_vulkan");
+    }
+
+    #[test]
+    fn c0_3di_pools_rebuilt_on_the_new_incarnation_vulkan() {
+        use std::time::Duration;
+
+        let (mut backend, device, old_incarnation) =
+            c0_3di_barrier_backend(crate::kms::executor::test_support::StubBehaviour::NeverReply);
+        c0_3di_add_owner_output(&mut backend, device, 0x3d1);
+        let old_key = backend
+            .resource_service
+            .as_mut()
+            .expect("old resource service")
+            .adopt_test_marker()
+            .expect("old scanout marker");
+        backend
+            .resource_service
+            .as_mut()
+            .expect("old resource service")
+            .freeze(old_key)
+            .expect("freeze old scanout marker");
+        let mut state = ServerState::new();
+        backend.rebuild_randr_state(&mut state, None, false);
+        let opens = Rc::new(Cell::new(0));
+        let marker_keys = c0_3di_install_fake_recovery_opener_with_behaviour(
+            &mut backend,
+            Rc::clone(&opens),
+            crate::kms::executor::test_support::StubBehaviour::HandshakeAndAcceptCallsWith(0x3d1),
+        );
+        let marker_keys_for_setup = Rc::clone(&marker_keys);
+        backend.normal_recovery_scanout_setup = Box::new(
+            move |platform, device, incarnation, _drm_device, service, registry| {
+                if service.device() != device
+                    || service.incarnation() != incarnation
+                    || registry.device_key() != device
+                    || registry.incarnation() != incarnation
+                {
+                    return Err(std::io::Error::other(
+                        "test recovery received a mismatched resource pair",
+                    ));
+                }
+                let output_count = platform.outputs.len();
+                platform.scanout_pools.resize_with(output_count, || None);
+                platform.bo_generations.resize_with(output_count, Vec::new);
+                for (index, output) in platform.outputs.iter().enumerate() {
+                    if output.key.device_key != device {
+                        continue;
+                    }
+                    let mut pool = crate::kms::vk::scanout::ScanoutBoPool::for_tests();
+                    pool.route = output.scanout_route;
+                    platform.scanout_pools[index] =
+                        Some(crate::kms::vk::scanout::OutputScanout::Shared(pool));
+                    let key = service.adopt_test_marker().map_err(|error| {
+                        std::io::Error::other(format!("test marker: {error:?}"))
+                    })?;
+                    marker_keys_for_setup.borrow_mut().push(key);
+                    let _ = service.service_ready();
+                }
+                Ok(())
+            },
+        );
+        backend
+            .platform
+            .queue_connector_probe_for_tests(device, Ok(vec![c0_3di_snapshot(device, "HDMI-2")]));
+        c0_3di_drive_completion_loss_to_poison(
+            &mut backend,
+            &mut state,
+            device,
+            Duration::from_secs(8),
+        );
+        c0_3bi_core_driver_until_with_state(
+            &mut backend,
+            &mut state,
+            "reopen and register the replacement scanout pool",
+            Duration::from_secs(8),
+            &|backend| {
+                backend
+                    .lifecycle_coordinator
+                    .device(&device)
+                    .is_some_and(|arbiter| {
+                        arbiter.state()
+                            == crate::kms::owner::lifecycle::DeviceLifecycleState::RecoveryFailed
+                    })
+                    && !backend.pending_normal_recoveries.contains_key(&device)
+            },
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+
+        let new_incarnation = old_incarnation.next();
+        let active_pool = backend
+            .platform
+            .outputs
+            .iter()
+            .position(|output| output.key.device_key == device)
+            .and_then(|index| backend.platform.scanout_pools[index].as_ref());
+        assert!(
+            active_pool.is_some(),
+            "the fresh incarnation has a scanout pool"
+        );
+        assert!(!marker_keys.borrow().is_empty());
+        assert!(
+            marker_keys
+                .borrow()
+                .iter()
+                .all(|key| { key.device == device && key.incarnation == new_incarnation })
+        );
+        let old_service = backend
+            .quarantined_normal_recoveries
+            .iter()
+            .find(|quarantine| quarantine.transition.incarnation == old_incarnation)
+            .and_then(|quarantine| quarantine.resource_service.as_ref())
+            .expect("old resource service remains quarantined");
+        assert!(
+            old_service
+                .allocation_end_state_for_tests()
+                .iter()
+                .any(|allocation| { allocation.key == old_key && allocation.frozen })
+        );
+        assert_eq!(opens.get(), 1);
+        let output_idx = backend
+            .platform
+            .outputs
+            .iter()
+            .position(|output| output.key.device_key == device)
+            .expect("fresh output");
+        let _synthetic_pool = backend.platform.scanout_pools[output_idx].take();
+        c0_3di_assert_end_state(
+            &backend,
+            "c0_3di_pools_rebuilt_on_the_new_incarnation_vulkan",
+        );
+    }
+
+    #[test]
+    fn c0_3di_old_pool_survives_until_its_barrier_vulkan() {
+        use std::time::Duration;
+
+        let _real_drm_test_guard = super::RealDrmTestSerial::acquire();
+        let (mut backend, device, old_incarnation) =
+            c0_3di_barrier_backend(crate::kms::executor::test_support::StubBehaviour::NeverReply);
+        c0_3di_add_owner_output(&mut backend, device, 0x3d1);
+        let output_idx = backend
+            .platform
+            .outputs
+            .iter()
+            .position(|output| output.key.device_key == device)
+            .expect("test output");
+        let output_count = backend.platform.outputs.len();
+        backend
+            .platform
+            .scanout_pools
+            .resize_with(output_count, || None);
+        let mut old_pool = crate::kms::vk::scanout::ScanoutBoPool::for_tests();
+        old_pool.route = backend.platform.outputs[output_idx].scanout_route;
+        let drm = backend.platform.devices[0]
+            .device
+            .clone_rc()
+            .expect("old test DRM device");
+        let vk = crate::kms::vk::device::VkContext::new().expect("test Vulkan context");
+        let mut on_screen_bo = crate::kms::vk::scanout::ScanoutBo::for_tests_without_drm(drm, vk);
+        on_screen_bo.state.mark_on_screen_after_modeset();
+        old_pool.bos.push(on_screen_bo);
+        backend.platform.scanout_pools[output_idx] =
+            Some(crate::kms::vk::scanout::OutputScanout::Shared(old_pool));
+        let mut state = ServerState::new();
+        backend.rebuild_randr_state(&mut state, None, false);
+        let opens = Rc::new(Cell::new(0));
+        c0_3di_install_fake_recovery_opener(&mut backend, Rc::clone(&opens));
+        let release_old_probe =
+            c0_3di_hold_probe_worker_for_barrier(&mut backend, device, old_incarnation);
+        backend
+            .platform
+            .queue_connector_probe_for_tests(device, Ok(vec![c0_3di_snapshot(device, "HDMI-2")]));
+        c0_3di_drive_completion_loss_to_poison(
+            &mut backend,
+            &mut state,
+            device,
+            Duration::from_secs(8),
+        );
+        assert!(backend.platform.scanout_pools[output_idx].is_some());
+        assert!(
+            backend.platform.scanout_pools[output_idx]
+                .as_ref()
+                .is_some_and(|pool| pool
+                    .display_pool()
+                    .bos
+                    .iter()
+                    .any(|bo| { bo.state.phase == crate::kms::vk::scanout::BoPhase::OnScreen }))
+        );
+        assert_eq!(
+            opens.get(),
+            0,
+            "no replacement opens before the old lease joins"
+        );
+        assert!(!backend.barrier_ready(old_incarnation));
+
+        let _ = release_old_probe.send(());
+        c0_3bi_core_driver_until_with_state(
+            &mut backend,
+            &mut state,
+            "join the old probe and finish recovery",
+            Duration::from_secs(8),
+            &|backend| {
+                opens.get() == 1
+                    && backend
+                        .lifecycle_coordinator
+                        .device(&device)
+                        .is_some_and(|arbiter| {
+                            arbiter.state()
+                                == crate::kms::owner::lifecycle::DeviceLifecycleState::RecoveryFailed
+                        })
+                    && !backend.pending_normal_recoveries.contains_key(&device)
+            },
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert!(
+            backend
+                .quarantined_normal_recoveries
+                .iter()
+                .any(|quarantine| {
+                    quarantine.transition.incarnation == old_incarnation
+                        && quarantine.scanout_pools.iter().any(|(_, pool)| {
+                            pool.as_ref().is_some_and(|pool| {
+                                pool.display_pool().bos.iter().any(|bo| {
+                                    bo.state.phase == crate::kms::vk::scanout::BoPhase::OnScreen
+                                })
+                            })
+                        })
+                })
+        );
+        c0_3di_assert_end_state(
+            &backend,
+            "c0_3di_old_pool_survives_until_its_barrier_vulkan",
+        );
     }
 
     #[test]
@@ -147137,6 +147586,31 @@ mod tests {
             );
             assert!(backend.resource_service.as_ref().is_some_and(|service| {
                 service.device() == device && service.incarnation() == fresh_incarnation
+            }));
+            let fresh_allocations = backend
+                .resource_service
+                .as_ref()
+                .expect("fresh card1 resource service")
+                .allocation_end_state_for_tests();
+            assert!(
+                !fresh_allocations.is_empty(),
+                "cycle {cycle}: fresh scanout BOs are registered"
+            );
+            assert!(fresh_allocations.iter().all(|allocation| {
+                allocation.key.device == device && allocation.key.incarnation == fresh_incarnation
+            }));
+            let output_idx = backend
+                .platform
+                .outputs
+                .iter()
+                .position(|output| output.key.device_key == device)
+                .expect("fresh card1 output");
+            let fresh_pool = backend.platform.scanout_pools[output_idx]
+                .as_ref()
+                .expect("fresh card1 scanout pool");
+            assert!(fresh_pool.display_pool().bos.iter().all(|bo| {
+                bo.managed_key()
+                    .is_some_and(|key| key.device == device && key.incarnation == fresh_incarnation)
             }));
             assert!(
                 backend
