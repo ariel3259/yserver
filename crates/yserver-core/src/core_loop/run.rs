@@ -3019,7 +3019,10 @@ fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend)
 /// SetClipRectangles, etc.) cannot recursively re-dispatch — the new
 /// request's reply lands in `pending_replies` and the next
 /// outer-loop iteration drains anything `wait_for_reply` re-enqueued.
-fn dispatch_pending_host_events(state: &mut ServerState, backend: &mut dyn Backend) -> bool {
+pub(crate) fn dispatch_pending_host_events(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+) -> bool {
     let mut any = false;
     while let Some(event) = backend.pop_pending_host_event() {
         any = true;

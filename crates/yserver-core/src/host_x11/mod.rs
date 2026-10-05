@@ -1387,8 +1387,10 @@ mod tests {
     };
     use crate::backend::OriginContext;
     use std::{
-        collections::{HashMap, VecDeque},
+        collections::{HashMap, HashSet, VecDeque},
+        io::{ErrorKind, Read},
         os::unix::net::UnixStream,
+        sync::{Arc, Mutex, atomic::AtomicU16},
     };
     use yserver_protocol::x11::ClientId;
 
@@ -1439,6 +1441,418 @@ mod tests {
             depth_gcs: HashMap::new(),
             host_drawable_depths: HashMap::new(),
         }
+    }
+
+    fn install_xtest_client(
+        state: &mut crate::server::ServerState,
+        id: u32,
+    ) -> crate::transport::CapturedPeer {
+        use crate::{resources::ROOT_WINDOW, server::ClientState, transport::Transport};
+        use yserver_protocol::x11::ClientByteOrder;
+
+        let (writer, peer) = Transport::capture_pair();
+        state.clients.insert(
+            id,
+            ClientState {
+                writer: Arc::new(Mutex::new(writer)),
+                is_local: true,
+                fd_passing: true,
+                byte_order: ClientByteOrder::LittleEndian,
+                last_sequence: Arc::new(AtomicU16::new(0)),
+                resource_id_base: 0,
+                resource_id_mask: u32::MAX,
+                event_masks: HashMap::new(),
+                save_set: HashSet::new(),
+                big_requests_enabled: false,
+                xi2_masks: HashMap::new(),
+                xi1_event_classes: HashSet::new(),
+                xi1_window_event_classes: HashMap::new(),
+                outbound: VecDeque::new(),
+                watching_writable: false,
+                focused_window: ROOT_WINDOW,
+                reader_control: None,
+            },
+        );
+        peer
+    }
+
+    fn drain_capture(peer: &mut crate::transport::CapturedPeer) -> Vec<u8> {
+        peer.set_nonblocking(true).expect("set nonblocking");
+        let mut bytes = Vec::new();
+        let mut buffer = [0u8; 256];
+        loop {
+            match peer.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => bytes.extend_from_slice(&buffer[..count]),
+                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                Err(error) => panic!("capture read failed: {error}"),
+            }
+        }
+        peer.set_nonblocking(false).expect("set blocking");
+        bytes
+    }
+
+    fn dispatch_test_request(
+        state: &mut crate::server::ServerState,
+        backend: &mut HostX11Backend,
+        sequence: u16,
+        opcode: u8,
+        data: u8,
+        body: &[u8],
+    ) {
+        use yserver_protocol::x11::{RequestHeader, SequenceNumber};
+
+        crate::core_loop::process_request::process_request(
+            state,
+            backend,
+            ClientId(1),
+            SequenceNumber(sequence),
+            RequestHeader {
+                opcode,
+                data,
+                length_units: u32::try_from((body.len() + 4) / 4).expect("request length"),
+            },
+            body,
+            None,
+        )
+        .expect("process X11 request");
+    }
+
+    fn select_xtest_pointer_button_press(
+        state: &mut crate::server::ServerState,
+        backend: &mut HostX11Backend,
+    ) {
+        use crate::resources::ROOT_WINDOW;
+
+        let mut body = Vec::with_capacity(16);
+        body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        body.extend_from_slice(&1u16.to_le_bytes()); // num_masks
+        body.extend_from_slice(&[0; 2]);
+        body.extend_from_slice(&4u16.to_le_bytes()); // XTEST pointer
+        body.extend_from_slice(&1u16.to_le_bytes()); // mask length in 4-byte units
+        body.extend_from_slice(&((1u32 << 4) | (1u32 << 5)).to_le_bytes());
+        dispatch_test_request(state, backend, 1, 137, 46, &body);
+    }
+
+    fn fake_input_body(event_type: u8, detail: u8, device_id: Option<u8>) -> Vec<u8> {
+        let mut body = vec![0u8; if device_id.is_some() { 32 } else { 28 }];
+        body[0] = event_type;
+        body[1] = detail;
+        if let Some(device_id) = device_id {
+            body[31] = device_id;
+        }
+        body
+    }
+
+    fn input_state_snapshot(state: &crate::server::ServerState) -> String {
+        format!(
+            "{:?}",
+            (
+                state
+                    .xi_devices
+                    .devices()
+                    .iter()
+                    .map(|device| {
+                        (
+                            device.id,
+                            device.name.clone(),
+                            device.enabled,
+                            device.session_enabled,
+                            device.client_disabled,
+                            device.source_id,
+                            device.facet,
+                            device.attached_master,
+                            device.properties.clone(),
+                            device.buttons_down,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                state.keys_down,
+                state.buttons_down,
+                state.key_down_by_device.clone(),
+                state.xi2_detached_masters.clone(),
+                state.floating_pointer_positions.clone(),
+                state.pointer_root,
+                state
+                    .clients
+                    .iter()
+                    .map(|(id, client)| {
+                        (
+                            *id,
+                            client.xi2_masks.clone(),
+                            client.xi1_event_classes.clone(),
+                            client.xi1_window_event_classes.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        )
+    }
+
+    fn assert_xtest_error(bytes: &[u8], code: u8, value: u32) {
+        assert_eq!(bytes.len(), 32, "one X error and no input event");
+        assert_eq!(bytes[0], 0, "X error response");
+        assert_eq!(bytes[1], code, "X error code");
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().expect("error value")),
+            value,
+            "X errorValue",
+        );
+        assert_eq!(
+            u16::from_le_bytes(bytes[8..10].try_into().expect("minor opcode")),
+            2,
+            "XTEST FakeInput minor opcode",
+        );
+        assert_eq!(bytes[10], 146, "XTEST major opcode");
+    }
+
+    #[test]
+    fn xtest_fake_input_unknown_xi_device_is_bad_device_without_fallback() {
+        // Mutation killed: make an absent XI device use the default XTEST
+        // pointer (4), allowing a request for id 77 to inject a real press.
+        use crate::{
+            core_loop::run::dispatch_pending_host_events, resources::ROOT_WINDOW,
+            server::ServerState,
+        };
+
+        let mut state = ServerState::new();
+        let mut peer = install_xtest_client(&mut state, 1);
+        let mut backend = dummy_backend();
+        backend.xid_map.insert(backend.window_id, ROOT_WINDOW);
+        select_xtest_pointer_button_press(&mut state, &mut backend);
+        assert!(
+            drain_capture(&mut peer).is_empty(),
+            "selection has no reply"
+        );
+        let before = input_state_snapshot(&state);
+
+        let body = fake_input_body(
+            crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_BUTTON_PRESS_OFFSET,
+            1,
+            Some(77),
+        );
+        dispatch_test_request(
+            &mut state,
+            &mut backend,
+            2,
+            146,
+            yserver_protocol::x11::xtest::FAKE_INPUT,
+            &body,
+        );
+
+        assert!(
+            !dispatch_pending_host_events(&mut state, &mut backend),
+            "an invalid target must not enqueue host input"
+        );
+        assert_xtest_error(&drain_capture(&mut peer), 157, 77);
+        assert_eq!(input_state_snapshot(&state), before);
+    }
+
+    #[test]
+    fn xtest_fake_input_xi_class_and_device_motion_pairing_errors() {
+        // Mutations killed: skip the target device's key/button/valuator
+        // class check; accept DeviceMotionNotify without DeviceValuator.
+        use crate::{core_loop::run::dispatch_pending_host_events, server::ServerState};
+
+        let mut state = ServerState::new();
+        let mut peer = install_xtest_client(&mut state, 1);
+        let mut backend = dummy_backend();
+        let before = input_state_snapshot(&state);
+
+        // Device 5 has a KeyClass but no ButtonClass.
+        let button_on_keyboard = fake_input_body(
+            crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_BUTTON_PRESS_OFFSET,
+            1,
+            Some(crate::xinput::DEVICEID_XTEST_KEYBOARD as u8),
+        );
+        dispatch_test_request(
+            &mut state,
+            &mut backend,
+            1,
+            146,
+            yserver_protocol::x11::xtest::FAKE_INPUT,
+            &button_on_keyboard,
+        );
+        assert!(
+            !dispatch_pending_host_events(&mut state, &mut backend),
+            "class-invalid event must not enqueue host input"
+        );
+        assert_xtest_error(
+            &drain_capture(&mut peer),
+            2,
+            u32::from(crate::server::XI_FIRST_EVENT)
+                + u32::from(crate::xinput::XI_DEVICE_BUTTON_PRESS_OFFSET),
+        );
+        assert_eq!(input_state_snapshot(&state), before);
+
+        let device_motion = fake_input_body(
+            crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_MOTION_NOTIFY_OFFSET,
+            0,
+            Some(crate::xinput::DEVICEID_XTEST_POINTER as u8),
+        );
+        dispatch_test_request(
+            &mut state,
+            &mut backend,
+            2,
+            146,
+            yserver_protocol::x11::xtest::FAKE_INPUT,
+            &device_motion,
+        );
+        assert!(
+            !dispatch_pending_host_events(&mut state, &mut backend),
+            "unpaired device motion must not enqueue host input"
+        );
+        assert_xtest_error(&drain_capture(&mut peer), 16, 0);
+        assert_eq!(input_state_snapshot(&state), before);
+    }
+
+    #[test]
+    fn xtest_fake_input_core_button_range_and_button_ten_delivery() {
+        // Mutations killed: bypass the button detail 1..=count validation
+        // (accepting 0/11), or translate FakeInput button 10 through BTN_TASK
+        // (0x117) instead of BTN_FORWARD (0x115), which libinput maps to X
+        // button 10 in btn_linux2xorg (xf86-input-libinput/src/xf86libinput.c:253-272).
+        use crate::{
+            backend::Backend,
+            core_loop::{HostInputEvent, InputOrigin, run::dispatch_pending_host_events},
+            resources::ROOT_WINDOW,
+            server::ServerState,
+        };
+
+        let mut state = ServerState::new();
+        let mut peer = install_xtest_client(&mut state, 1);
+        let mut backend = dummy_backend();
+        backend.xid_map.insert(backend.window_id, ROOT_WINDOW);
+        select_xtest_pointer_button_press(&mut state, &mut backend);
+        assert!(
+            drain_capture(&mut peer).is_empty(),
+            "selection has no reply"
+        );
+        let before = input_state_snapshot(&state);
+
+        for (sequence, detail) in [(2, 0), (3, 11)] {
+            let body = fake_input_body(
+                yserver_protocol::x11::xtest::FAKE_BUTTON_PRESS,
+                detail,
+                None,
+            );
+            dispatch_test_request(
+                &mut state,
+                &mut backend,
+                sequence,
+                146,
+                yserver_protocol::x11::xtest::FAKE_INPUT,
+                &body,
+            );
+            assert!(
+                !dispatch_pending_host_events(&mut state, &mut backend),
+                "invalid button {detail} must not enqueue input"
+            );
+            assert_xtest_error(&drain_capture(&mut peer), 2, u32::from(detail));
+            assert_eq!(input_state_snapshot(&state), before);
+        }
+
+        for (sequence, event_type, expected_type) in [
+            (4, yserver_protocol::x11::xtest::FAKE_BUTTON_PRESS, 4u16),
+            (5, yserver_protocol::x11::xtest::FAKE_BUTTON_RELEASE, 5u16),
+        ] {
+            let body = fake_input_body(event_type, 10, None);
+            dispatch_test_request(
+                &mut state,
+                &mut backend,
+                sequence,
+                146,
+                yserver_protocol::x11::xtest::FAKE_INPUT,
+                &body,
+            );
+            assert!(dispatch_pending_host_events(&mut state, &mut backend));
+            let event = drain_capture(&mut peer);
+            assert!(
+                !event.is_empty(),
+                "button {event_type} produced no selected event; core={} xtest={} masks={:?}",
+                state.buttons_down,
+                state.xi_devices.device(4).unwrap().buttons_down,
+                state.clients[&1].xi2_masks,
+            );
+            assert_eq!(event[0], 35, "XI2 GenericEvent");
+            assert_eq!(
+                u16::from_le_bytes(event[8..10].try_into().expect("event type")),
+                expected_type,
+            );
+            assert_eq!(
+                u16::from_le_bytes(event[16..18].try_into().expect("event detail")),
+                10,
+                "Xorg GetPointerEvents receives and reports detail 10",
+            );
+        }
+
+        for (pressed, expected_type, time) in [(true, 4u16, 6), (false, 5u16, 7)] {
+            Backend::on_host_input(
+                &mut backend,
+                &mut state,
+                HostInputEvent::PointerButton {
+                    origin: InputOrigin::XTest(crate::xinput::DEVICEID_XTEST_POINTER),
+                    button: 0x115, // BTN_FORWARD -> X button 10 per btn_linux2xorg.
+                    pressed,
+                    time,
+                },
+            );
+            assert!(dispatch_pending_host_events(&mut state, &mut backend));
+            let event = drain_capture(&mut peer);
+            assert_eq!(event[0], 35, "XI2 GenericEvent");
+            assert_eq!(
+                u16::from_le_bytes(event[8..10].try_into().expect("event type")),
+                expected_type,
+            );
+            assert_eq!(
+                u16::from_le_bytes(event[16..18].try_into().expect("event detail")),
+                10,
+                "BTN_FORWARD is X button 10",
+            );
+        }
+        assert_eq!(input_state_snapshot(&state), before);
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::PointerButton {
+                origin: InputOrigin::XTest(crate::xinput::DEVICEID_XTEST_POINTER),
+                button: 0x117, // BTN_TASK must not be aliased to button 10.
+                pressed: true,
+                time: 8,
+            },
+        );
+        assert!(!dispatch_pending_host_events(&mut state, &mut backend));
+        assert!(drain_capture(&mut peer).is_empty());
+        assert_eq!(input_state_snapshot(&state), before);
+    }
+
+    #[test]
+    fn xtest_fake_input_keycode_outside_target_keymap_is_bad_value() {
+        // Mutation killed: remove the FakeInput target keymap range check so
+        // keycode 7 reaches the host input path.
+        use crate::{core_loop::run::dispatch_pending_host_events, server::ServerState};
+
+        let mut state = ServerState::new();
+        let mut peer = install_xtest_client(&mut state, 1);
+        let mut backend = dummy_backend();
+        let before = input_state_snapshot(&state);
+        let body = fake_input_body(yserver_protocol::x11::xtest::FAKE_KEY_PRESS, 7, None);
+        dispatch_test_request(
+            &mut state,
+            &mut backend,
+            1,
+            146,
+            yserver_protocol::x11::xtest::FAKE_INPUT,
+            &body,
+        );
+
+        assert!(
+            !dispatch_pending_host_events(&mut state, &mut backend),
+            "out-of-range keycode must not enqueue host input"
+        );
+        assert_xtest_error(&drain_capture(&mut peer), 2, 7);
+        assert_eq!(input_state_snapshot(&state), before);
     }
 
     #[test]

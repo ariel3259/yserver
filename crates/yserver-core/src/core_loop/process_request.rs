@@ -10532,7 +10532,9 @@ fn handle_xtest_request(
                 "client {} #{} XTEST::FakeInput type={} detail={} root_xy=({},{})",
                 client_id.0, sequence.0, fi.event_type, fi.detail, fi.root_x, fi.root_y
             );
-            dispatch_fake_input_with_body(state, backend, fi, body);
+            return dispatch_fake_input_with_body(
+                state, backend, client_id, sequence, header, fi, body,
+            );
         }
         x11xtest::GRAB_CONTROL => {
             debug!(
@@ -10560,23 +10562,228 @@ fn handle_xtest_request(
 /// libXtst packs the deviceid into byte 31 of the first event and
 /// device-motion axes into trailing deviceValuator events (Xorg
 /// Xext/xtest.c ProcXTestFakeInput).
+#[allow(clippy::too_many_lines)]
 fn dispatch_fake_input_with_body(
     state: &mut ServerState,
     backend: &mut dyn Backend,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
     fi: yserver_protocol::x11::xtest::FakeInput,
     body: &[u8],
-) {
+) -> io::Result<RequestOutcome> {
     use crate::{core_loop::HostInputEvent, host_x11::HostKeyEvent};
     use yserver_protocol::x11::xtest as x11xtest;
 
-    // XTestFakeDevice{Key,Button,Motion}Event arrive with the XI 1.x
-    // wire event codes instead of the core FAKE_* codes. Route them
-    // through the same host-input pipeline — the input stack attributes
-    // events to the master + slave pair, and the XI1/XI2 fanouts report
-    // the slave, which is the device XTS fakes on.
     let xi_first = crate::server::XI_FIRST_EVENT;
-    if fi.event_type >= xi_first {
-        let offset = fi.event_type - xi_first;
+    let event_type = fi.event_type & 0x7f;
+    let xi_device_event = event_type >= xi_first;
+    let xi_offset = if xi_device_event {
+        Some(event_type - xi_first)
+    } else {
+        None
+    };
+    let target_device_id = if xi_device_event {
+        // ProcXTestFakeInput first validates that the request contains full
+        // xEvents, then masks the device id's MORE_EVENTS bit and looks it up
+        // (Xext/xtest.c:170-186).
+        if body.len() < 32 || !body.len().is_multiple_of(32) {
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_LENGTH,
+                0,
+                u16::from(header.data),
+                header.opcode,
+            );
+        }
+        let Some(device_id) = fake_input_device_id(body) else {
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_LENGTH,
+                0,
+                u16::from(header.data),
+                header.opcode,
+            );
+        };
+        if state.xi_devices.device(device_id).is_none() {
+            // XI_BadDevice is the XInput extension's first error.
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                XI2_FIRST_ERROR,
+                u32::from(device_id),
+                u16::from(header.data),
+                header.opcode,
+            );
+        }
+
+        // Check the event's device class before the DeviceMotion valuator
+        // pairing, as Xorg does at xtest.c:189-226. Class failures carry the
+        // original event type in errorValue.
+        let class_ok = match xi_offset {
+            Some(crate::xinput::XI_DEVICE_KEY_PRESS_OFFSET)
+            | Some(crate::xinput::XI_DEVICE_KEY_RELEASE_OFFSET) => {
+                xi1_device_has_keys(&state.xi_devices, device_id)
+            }
+            Some(crate::xinput::XI_DEVICE_BUTTON_PRESS_OFFSET)
+            | Some(crate::xinput::XI_DEVICE_BUTTON_RELEASE_OFFSET) => {
+                xi1_device_has_buttons(&state.xi_devices, device_id)
+            }
+            Some(crate::xinput::XI_DEVICE_MOTION_NOTIFY_OFFSET) => {
+                xi1_device_has_valuators(&state.xi_devices, device_id)
+            }
+            _ => false,
+        };
+        if !class_ok {
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_VALUE,
+                u32::from(fi.event_type),
+                u16::from(header.data),
+                header.opcode,
+            );
+        }
+        if xi_offset == Some(crate::xinput::XI_DEVICE_MOTION_NOTIFY_OFFSET) && body.len() == 32 {
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_LENGTH,
+                0,
+                u16::from(header.data),
+                header.opcode,
+            );
+        }
+
+        match xi_offset {
+            Some(crate::xinput::XI_DEVICE_KEY_PRESS_OFFSET)
+            | Some(crate::xinput::XI_DEVICE_KEY_RELEASE_OFFSET)
+                if !fake_input_keycode_valid(fi.detail) =>
+            {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    u32::from(fi.detail),
+                    u16::from(header.data),
+                    header.opcode,
+                );
+            }
+            Some(crate::xinput::XI_DEVICE_BUTTON_PRESS_OFFSET)
+            | Some(crate::xinput::XI_DEVICE_BUTTON_RELEASE_OFFSET)
+                if !fake_input_button_valid(&state.xi_devices, device_id, fi.detail) =>
+            {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    u32::from(fi.detail),
+                    u16::from(header.data),
+                    header.opcode,
+                );
+            }
+            _ => {}
+        }
+        device_id
+    } else {
+        // Core FakeInput selects the XTEST keyboard or pointer from the event
+        // type before checking its class/detail (xtest.c:282-326, 357-410).
+        let device_id = match event_type {
+            x11xtest::FAKE_KEY_PRESS | x11xtest::FAKE_KEY_RELEASE => {
+                crate::xinput::DEVICEID_XTEST_KEYBOARD
+            }
+            x11xtest::FAKE_BUTTON_PRESS
+            | x11xtest::FAKE_BUTTON_RELEASE
+            | x11xtest::FAKE_MOTION_NOTIFY => crate::xinput::DEVICEID_XTEST_POINTER,
+            _ => {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    u32::from(fi.event_type),
+                    u16::from(header.data),
+                    header.opcode,
+                );
+            }
+        };
+        let class_ok = match event_type {
+            x11xtest::FAKE_KEY_PRESS | x11xtest::FAKE_KEY_RELEASE => {
+                xi1_device_has_keys(&state.xi_devices, device_id)
+            }
+            x11xtest::FAKE_BUTTON_PRESS | x11xtest::FAKE_BUTTON_RELEASE => {
+                xi1_device_has_buttons(&state.xi_devices, device_id)
+            }
+            x11xtest::FAKE_MOTION_NOTIFY => xi1_device_has_valuators(&state.xi_devices, device_id),
+            _ => false,
+        };
+        if !class_ok {
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                XI2_FIRST_ERROR,
+                0,
+                u16::from(header.data),
+                header.opcode,
+            );
+        }
+        match event_type {
+            x11xtest::FAKE_KEY_PRESS | x11xtest::FAKE_KEY_RELEASE
+                if !fake_input_keycode_valid(fi.detail) =>
+            {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    u32::from(fi.detail),
+                    u16::from(header.data),
+                    header.opcode,
+                );
+            }
+            x11xtest::FAKE_BUTTON_PRESS | x11xtest::FAKE_BUTTON_RELEASE
+                if !fake_input_button_valid(&state.xi_devices, device_id, fi.detail) =>
+            {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    u32::from(fi.detail),
+                    u16::from(header.data),
+                    header.opcode,
+                );
+            }
+            x11xtest::FAKE_MOTION_NOTIFY if fi.detail != 0 && fi.detail != 1 => {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    u32::from(fi.detail),
+                    u16::from(header.data),
+                    header.opcode,
+                );
+            }
+            _ => {}
+        }
+        device_id
+    };
+
+    let fi = yserver_protocol::x11::xtest::FakeInput { event_type, ..fi };
+    let origin = crate::core_loop::InputOrigin::XTest(target_device_id);
+
+    if let Some(offset) = xi_offset {
         match offset {
             crate::xinput::XI_DEVICE_KEY_PRESS_OFFSET
             | crate::xinput::XI_DEVICE_KEY_RELEASE_OFFSET => {
@@ -10584,7 +10791,7 @@ fn dispatch_fake_input_with_body(
                 backend.on_host_input(
                     state,
                     HostInputEvent::Key(HostKeyEvent {
-                        origin: fake_input_origin(body, crate::xinput::DEVICEID_XTEST_KEYBOARD),
+                        origin,
                         pressed,
                         keycode: fi.detail,
                         time: fi.time,
@@ -10599,38 +10806,22 @@ fn dispatch_fake_input_with_body(
             crate::xinput::XI_DEVICE_BUTTON_PRESS_OFFSET
             | crate::xinput::XI_DEVICE_BUTTON_RELEASE_OFFSET => {
                 let pressed = offset == crate::xinput::XI_DEVICE_BUTTON_PRESS_OFFSET;
-                let fake = yserver_protocol::x11::xtest::FakeInput {
-                    event_type: if pressed {
-                        x11xtest::FAKE_BUTTON_PRESS
-                    } else {
-                        x11xtest::FAKE_BUTTON_RELEASE
+                let button = fake_input_button_code(fi.detail)
+                    .expect("validated XI device button number has an input code");
+                backend.on_host_input(
+                    state,
+                    HostInputEvent::PointerButton {
+                        origin,
+                        button,
+                        pressed,
+                        time: fi.time,
                     },
-                    ..fi
-                };
-                dispatch_fake_input_with_body(state, backend, fake, body);
+                );
             }
             crate::xinput::XI_DEVICE_MOTION_NOTIFY_OFFSET => {
-                // Device-motion fakes are DEVICE-coordinate space and
-                // do NOT move the sprite — Xorg uses POINTER_ABSOLUTE
-                // without POINTER_DESKTOP (Xext/xtest.c:265), and a
-                // Xephyr probe confirms the cursor stays put while the
-                // DeviceMotionNotify is delivered at the CURRENT
-                // position with the axis payload riding the trailing
-                // deviceValuator chain. yserver pre-fix warped the
-                // cursor to (axis0, axis1), which tore the pointer off
-                // the XTS windows mid-test and starved every
-                // selection-walk delivery (the AllowDeviceEvents
-                // ispfrozen probes).
-                //
-                // fi.detail == 0 means absolute; relative device fakes
-                // stay unsupported (XTS uses absolute only).
-                if fi.detail != 0 {
-                    log::debug!("XTEST FakeInput: relative device motion not supported, dropping");
-                    return;
-                }
-                // Collect axes from ALL trailing deviceValuator events
-                // (32-byte chunks: num at [6], first at [7], then up
-                // to six INT32 values).
+                // Device-motion fakes are DEVICE-coordinate space and do
+                // NOT move the sprite — Xorg uses POINTER_ABSOLUTE without
+                // POINTER_DESKTOP (Xext/xtest.c:265).
                 let mut axes = crate::server::Xi1MotionAxes {
                     first: 0,
                     count: 0,
@@ -10659,12 +10850,6 @@ fn dispatch_fake_input_with_body(
                     }
                     chunk += 32;
                 }
-                if axes.count == 0 {
-                    log::debug!("XTEST FakeInput: device motion without valuator event, dropping");
-                    return;
-                }
-                // Route the XI1 DeviceMotionNotify at the current
-                // sprite position.
                 let target = crate::core_loop::key_fanout::deepest_window_at_pointer(state);
                 let (ox, oy) = state.resources.window_absolute_position(target);
                 let (root_x, root_y) = state.pointer_root;
@@ -10673,7 +10858,7 @@ fn dispatch_fake_input_with_body(
                 let _ = crate::core_loop::pointer_fanout::xi1_route_device_event(
                     state,
                     crate::server::Xi1QueuedEvent {
-                        deviceid: fake_input_device_id(body, crate::xinput::DEVICEID_XTEST_POINTER),
+                        deviceid: target_device_id,
                         evcode: crate::server::XI_FIRST_EVENT
                             + crate::xinput::XI_DEVICE_MOTION_NOTIFY_OFFSET,
                         detail: 0,
@@ -10685,20 +10870,15 @@ fn dispatch_fake_input_with_body(
                         state_mask: 0,
                         natural_target: target,
                         focus_route: crate::server::Xi1FocusRoute::Walk,
-                        axes: Some(axes),
+                        axes: (axes.count != 0).then_some(axes),
                         replay_floor: None,
                     },
                     true,
                 );
             }
-            _ => {
-                log::debug!(
-                    "XTEST FakeInput: unsupported XI device fake event type {} (offset {offset}), dropping",
-                    fi.event_type
-                );
-            }
+            _ => unreachable!("XI event type was validated before injection"),
         }
-        return;
+        return Ok(RequestOutcome::Handled);
     }
 
     match fi.event_type {
@@ -10707,7 +10887,7 @@ fn dispatch_fake_input_with_body(
             backend.on_host_input(
                 state,
                 HostInputEvent::Key(HostKeyEvent {
-                    origin: fake_input_origin(body, crate::xinput::DEVICEID_XTEST_KEYBOARD),
+                    origin,
                     pressed,
                     keycode: fi.detail,
                     time: fi.time,
@@ -10721,30 +10901,17 @@ fn dispatch_fake_input_with_body(
         }
         x11xtest::FAKE_BUTTON_PRESS | x11xtest::FAKE_BUTTON_RELEASE => {
             let pressed = fi.event_type == x11xtest::FAKE_BUTTON_PRESS;
-            // Translate X button number → Linux input code, since both
-            // backends' `on_host_input` paths consume Linux codes.
-            let linux_code = match fi.detail {
-                1 => 0x110, // BTN_LEFT
-                2 => 0x112, // BTN_MIDDLE
-                3 => 0x111, // BTN_RIGHT
-                4 => 0x180, // SYNTH_SCROLL_UP
-                5 => 0x181, // SYNTH_SCROLL_DOWN
-                6 => 0x182, // SYNTH_SCROLL_LEFT
-                7 => 0x183, // SYNTH_SCROLL_RIGHT
-                8 => 0x113, // BTN_SIDE
-                9 => 0x114, // BTN_EXTRA
-                _ => {
-                    log::debug!(
-                        "XTEST FakeInput: dropping button event for unsupported X button {}",
-                        fi.detail
-                    );
-                    return;
-                }
-            };
+            // Xorg's XTEST pointer has 10 buttons (dix/devices.c:655-700);
+            // ProcXTestFakeInput validates 1..numButtons and passes the detail
+            // unchanged to GetPointerEvents (Xext/xtest.c:401-425). BTN_FORWARD
+            // (0x115) maps to X button 10 via libinput's btn_linux2xorg
+            // (xf86-input-libinput/src/xf86libinput.c:253-272).
+            let linux_code = fake_input_button_code(fi.detail)
+                .expect("validated core button number has an input code");
             backend.on_host_input(
                 state,
                 HostInputEvent::PointerButton {
-                    origin: fake_input_origin(body, crate::xinput::DEVICEID_XTEST_POINTER),
+                    origin,
                     button: linux_code,
                     pressed,
                     time: fi.time,
@@ -10760,7 +10927,7 @@ fn dispatch_fake_input_with_body(
             // raw relative motion, so XI2 RawMotion reports it.
             let motion = if fi.detail == 0 {
                 HostInputEvent::PointerMotion {
-                    origin: fake_input_origin(body, crate::xinput::DEVICEID_XTEST_POINTER),
+                    origin,
                     x: i32::from(fi.root_x),
                     y: i32::from(fi.root_y),
                     time: fi.time,
@@ -10773,7 +10940,7 @@ fn dispatch_fake_input_with_body(
                 let (x, y) = state.pointer_root;
                 let (dx, dy) = (i32::from(fi.root_x), i32::from(fi.root_y));
                 HostInputEvent::PointerMotion {
-                    origin: fake_input_origin(body, crate::xinput::DEVICEID_XTEST_POINTER),
+                    origin,
                     x: i32::from(x) + dx,
                     y: i32::from(y) + dy,
                     time: fi.time,
@@ -10789,22 +10956,59 @@ fn dispatch_fake_input_with_body(
             backend.resync_input_position();
         }
         other => {
-            log::debug!("XTEST FakeInput: unknown event type {other}, dropping");
+            unreachable!("core FakeInput event type was validated: {other}");
         }
+    }
+    Ok(RequestOutcome::Handled)
+}
+
+fn fake_input_keycode_valid(keycode: u8) -> bool {
+    // QueryDevice's KeyClass is shared by the master, XTEST, and physical
+    // keyboard facets: keycodes 8..=255 (xinput/query.rs:259-272).
+    keycode >= 8
+}
+
+fn fake_input_button_count(devices: &crate::xinput::XiRegistry, device_id: u16) -> Option<u8> {
+    if !xi1_device_has_buttons(devices, device_id) {
+        return None;
+    }
+    match device_id {
+        crate::xinput::DEVICEID_MASTER_POINTER | crate::xinput::DEVICEID_XTEST_POINTER => Some(10),
+        _ => Some(7), // the current physical pointer class has seven buttons
     }
 }
 
-fn fake_input_origin(body: &[u8], default_device: u16) -> crate::core_loop::InputOrigin {
-    crate::core_loop::InputOrigin::XTest(fake_input_device_id(body, default_device))
+fn fake_input_button_valid(
+    devices: &crate::xinput::XiRegistry,
+    device_id: u16,
+    button: u8,
+) -> bool {
+    button != 0 && fake_input_button_count(devices, device_id).is_some_and(|count| button <= count)
 }
 
-fn fake_input_device_id(body: &[u8], default_device: u16) -> u16 {
-    body.first()
-        .copied()
-        .filter(|event_type| event_type & 0x7f >= crate::server::XI_FIRST_EVENT)
-        .and_then(|_| body.get(31).copied())
-        // XI1 reserves the top device-byte bit for MORE_EVENTS.
-        .map_or(default_device, |device_id| u16::from(device_id & 0x7f))
+fn fake_input_button_code(button: u8) -> Option<u16> {
+    Some(match button {
+        1 => 0x110,  // BTN_LEFT
+        2 => 0x112,  // BTN_MIDDLE
+        3 => 0x111,  // BTN_RIGHT
+        4 => 0x180,  // SYNTH_SCROLL_UP
+        5 => 0x181,  // SYNTH_SCROLL_DOWN
+        6 => 0x182,  // SYNTH_SCROLL_LEFT
+        7 => 0x183,  // SYNTH_SCROLL_RIGHT
+        8 => 0x113,  // BTN_SIDE
+        9 => 0x114,  // BTN_EXTRA
+        10 => 0x115, // BTN_FORWARD -> X 10 via btn_linux2xorg (xf86-input-libinput/src/xf86libinput.c:253-272)
+        _ => return None,
+    })
+}
+
+fn fake_input_device_id(body: &[u8]) -> Option<u16> {
+    if body.first().copied()? & 0x7f < crate::server::XI_FIRST_EVENT {
+        return None;
+    }
+    // XI1 reserves the top device-byte bit for MORE_EVENTS. Keep a missing or
+    // unknown device distinct from a core FakeInput's default 4/5 target.
+    body.get(31).map(|device_id| u16::from(device_id & 0x7f))
 }
 
 /// Apply a DPMS level transition. Updates `state.dpms.power_level`

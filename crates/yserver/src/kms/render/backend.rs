@@ -15355,15 +15355,16 @@ impl KmsBackend {
         origin: yserver_core::core_loop::InputOrigin,
     ) {
         let detail = match code {
-            0x110 => 1, // BTN_LEFT
-            0x111 => 3, // BTN_RIGHT
-            0x112 => 2, // BTN_MIDDLE
-            0x113 => 8, // BTN_SIDE
-            0x114 => 9, // BTN_EXTRA
-            0x180 => 4, // SYNTH_SCROLL_UP
-            0x181 => 5, // SYNTH_SCROLL_DOWN
-            0x182 => 6, // SYNTH_SCROLL_LEFT
-            0x183 => 7, // SYNTH_SCROLL_RIGHT
+            0x110 => 1,  // BTN_LEFT
+            0x111 => 3,  // BTN_RIGHT
+            0x112 => 2,  // BTN_MIDDLE
+            0x113 => 8,  // BTN_SIDE
+            0x114 => 9,  // BTN_EXTRA
+            0x115 => 10, // BTN_FORWARD -> X 10 via btn_linux2xorg (xf86-input-libinput/src/xf86libinput.c:253-272)
+            0x180 => 4,  // SYNTH_SCROLL_UP
+            0x181 => 5,  // SYNTH_SCROLL_DOWN
+            0x182 => 6,  // SYNTH_SCROLL_LEFT
+            0x183 => 7,  // SYNTH_SCROLL_RIGHT
             _ => {
                 log::debug!("render: unmapped libinput button code 0x{code:x}, dropping");
                 return;
@@ -21146,7 +21147,7 @@ impl KmsBackend {
         // (dix/devices.c:2636-2642).
         let mapping = state.pointer_mapping_override.as_deref();
         let mut releases = Vec::new();
-        for logical_detail in 1..=9 {
+        for logical_detail in 1..=10 {
             let bit = 1u16 << (logical_detail - 1);
             if held & bit == 0 {
                 continue;
@@ -21172,7 +21173,8 @@ impl KmsBackend {
                 7 => 0x183,
                 8 => 0x113,
                 9 => 0x114,
-                _ => unreachable!("button release loop is bounded to 1..=9"),
+                10 => 0x115, // BTN_FORWARD -> X 10 via btn_linux2xorg (xf86-input-libinput/src/xf86libinput.c:253-272)
+                _ => unreachable!("button release loop is bounded to 1..=10"),
             };
             releases.push((physical_detail, code));
         }
@@ -21656,6 +21658,7 @@ impl Backend for KmsBackend {
                         0x112 => 2,
                         0x113 => 8,
                         0x114 => 9,
+                        0x115 => 10, // BTN_FORWARD -> X 10 via btn_linux2xorg (xf86-input-libinput/src/xf86libinput.c:253-272)
                         0x180 => 4,
                         0x181 => 5,
                         0x182 => 6,
@@ -24728,7 +24731,7 @@ impl Backend for KmsBackend {
             .collect();
         held_pointers.sort_by_key(|(device_id, _, _)| *device_id);
         for (_, origin, buttons) in held_pointers {
-            for detail in 1u16..=9 {
+            for detail in 1u16..=10 {
                 if buttons & (1 << (detail - 1)) == 0 {
                     continue;
                 }
@@ -24742,7 +24745,8 @@ impl Backend for KmsBackend {
                     7 => 0x183,
                     8 => 0x113,
                     9 => 0x114,
-                    _ => unreachable!("button release loop is bounded to 1..=9"),
+                    10 => 0x115, // BTN_FORWARD -> X 10 via btn_linux2xorg (xf86-input-libinput/src/xf86libinput.c:253-272)
+                    _ => unreachable!("button release loop is bounded to 1..=10"),
                 };
                 Backend::on_host_input(
                     self,
@@ -31547,6 +31551,205 @@ mod tests {
         }
         assert_eq!(w.check(t0 + WarnThrottle::PERIOD), Some(5));
         assert_eq!(w.check(t0 + WarnThrottle::PERIOD), None);
+    }
+
+    #[test]
+    fn kms_fake_input_button_ten_uses_btn_forward_not_btn_task() {
+        // Mutation killed: map BTN_FORWARD through BTN_TASK in the KMS
+        // code-to-detail table, or alias physical BTN_TASK to X button 10.
+        use super::KmsBackend;
+        use yserver_core::{
+            backend::Backend,
+            core_loop::{DeviceInfo, HostInputEvent, InputOrigin, process_request},
+            resources::ROOT_WINDOW,
+            server::ServerState,
+            xinput::{DEVICEID_XTEST_POINTER, InputCapabilities, InputSourceId, XiFacetKind},
+        };
+        use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
+
+        const CLIENT: u32 = 5;
+        const SOURCE: InputSourceId = InputSourceId(0xB1041);
+        const XI_BUTTON_PRESS_RELEASE: u32 = (1 << 4) | (1 << 5);
+
+        fn assert_button_events(bytes: &[u8], expected_type: u16) {
+            assert!(!bytes.is_empty(), "selected button event is delivered");
+            let mut offset = 0;
+            let mut count = 0;
+            while offset < bytes.len() {
+                assert_eq!(bytes[offset], 35, "XI2 GenericEvent");
+                let extra_units = u32::from_le_bytes(
+                    bytes[offset + 4..offset + 8]
+                        .try_into()
+                        .expect("GenericEvent length"),
+                ) as usize;
+                let event_len = 32 + extra_units * 4;
+                assert!(offset + event_len <= bytes.len(), "complete GenericEvent");
+                assert_eq!(
+                    u16::from_le_bytes(
+                        bytes[offset + 8..offset + 10]
+                            .try_into()
+                            .expect("event type")
+                    ),
+                    expected_type,
+                );
+                assert_eq!(
+                    u16::from_le_bytes(
+                        bytes[offset + 16..offset + 18]
+                            .try_into()
+                            .expect("button detail")
+                    ),
+                    10,
+                    "BTN_FORWARD is X button 10",
+                );
+                count += 1;
+                offset += event_len;
+            }
+            assert!(count > 0);
+        }
+
+        fn input_state_snapshot(state: &ServerState) -> String {
+            format!(
+                "{:?}",
+                (
+                    state
+                        .xi_devices
+                        .devices()
+                        .iter()
+                        .map(|device| (
+                            device.id,
+                            device.source_id,
+                            device.facet,
+                            device.enabled,
+                            device.attached_master,
+                            device.buttons_down,
+                            device.properties.clone(),
+                        ))
+                        .collect::<Vec<_>>(),
+                    state.keys_down,
+                    state.buttons_down,
+                    state.key_down_by_device.clone(),
+                    state.xi2_detached_masters.clone(),
+                    state.floating_pointer_positions.clone(),
+                    state.clients[&CLIENT].xi2_masks.clone(),
+                )
+            )
+        }
+
+        let mut backend = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        backend
+            .core
+            .xid_map
+            .insert(backend.core.window_id, ROOT_WINDOW);
+        let mut peer = kbd_map_client_id(&mut state, CLIENT);
+
+        kbd_map_request(&mut state, &mut backend, 137, 47, &[2, 0, 3, 0]);
+        assert_eq!(kbd_map_drain(&mut peer)[0], 1, "XIQueryVersion reply");
+        let mut select = Vec::new();
+        select.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        select.extend_from_slice(&2u16.to_le_bytes());
+        select.extend_from_slice(&[0; 2]);
+        for device_id in [2u16, DEVICEID_XTEST_POINTER] {
+            select.extend_from_slice(&device_id.to_le_bytes());
+            select.extend_from_slice(&1u16.to_le_bytes());
+            select.extend_from_slice(&XI_BUTTON_PRESS_RELEASE.to_le_bytes());
+        }
+        kbd_map_request(&mut state, &mut backend, 137, 46, &select);
+        assert!(
+            kbd_map_drain(&mut peer).is_empty(),
+            "XISelectEvents has no reply"
+        );
+        let baseline = input_state_snapshot(&state);
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceAdded(DeviceInfo {
+                source_id: SOURCE,
+                enabled: true,
+                resume_key: None,
+                capabilities: InputCapabilities {
+                    keyboard: false,
+                    pointer: true,
+                    touch: false,
+                },
+                name: "BTN_FORWARD regression mouse".to_owned(),
+                device_node: "/dev/input/event-btn-forward-test".to_owned(),
+                sysname: "event-btn-forward-test".to_owned(),
+                vendor_id: 1,
+                product_id: 1,
+                is_touchpad: false,
+                config: Default::default(),
+            }),
+        );
+        let pointer_id = state
+            .xi_devices
+            .facet(SOURCE, XiFacetKind::PointerTouch)
+            .expect("physical pointer facet follows production add path");
+        let after_add = input_state_snapshot(&state);
+
+        for (sequence, event_type, expected_type) in [
+            (2, yserver_protocol::x11::xtest::FAKE_BUTTON_PRESS, 4u16),
+            (3, yserver_protocol::x11::xtest::FAKE_BUTTON_RELEASE, 5u16),
+        ] {
+            let mut body = vec![0u8; 28];
+            body[0] = event_type;
+            body[1] = 10;
+            process_request::process_request(
+                &mut state,
+                &mut backend,
+                ClientId(CLIENT),
+                SequenceNumber(sequence),
+                RequestHeader {
+                    opcode: 146,
+                    data: 2,
+                    length_units: 8,
+                },
+                &body,
+                None,
+            )
+            .expect("production XTEST FakeInput request");
+            assert_button_events(&kbd_map_drain(&mut peer), expected_type);
+        }
+
+        for (pressed, expected_type) in [(true, 4u16), (false, 5u16)] {
+            Backend::on_host_input(
+                &mut backend,
+                &mut state,
+                HostInputEvent::PointerButton {
+                    origin: InputOrigin::Physical(SOURCE),
+                    button: 0x115, // BTN_FORWARD -> X 10 (btn_linux2xorg, xf86-input-libinput/src/xf86libinput.c:253-272).
+                    pressed,
+                    time: 10,
+                },
+            );
+            assert_button_events(&kbd_map_drain(&mut peer), expected_type);
+        }
+        assert_eq!(input_state_snapshot(&state), after_add);
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::PointerButton {
+                origin: InputOrigin::Physical(SOURCE),
+                button: 0x117, // BTN_TASK must not be aliased to X button 10.
+                pressed: true,
+                time: 11,
+            },
+        );
+        assert!(kbd_map_drain(&mut peer).is_empty());
+        assert_eq!(input_state_snapshot(&state), after_add);
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceRemoved { source_id: SOURCE },
+        );
+        assert!(kbd_map_drain(&mut peer).is_empty());
+        assert_eq!(input_state_snapshot(&state), baseline);
+        assert!(state.xi_devices.source(SOURCE).is_none());
+        assert!(state.xi_devices.device(pointer_id).is_none());
+        assert_eq!(state.xi_devices.len(), 4, "masters and XTEST only");
     }
 
     #[test]
