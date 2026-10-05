@@ -196,6 +196,27 @@ pub(crate) enum XiClassShape {
     Keyboard,
 }
 
+impl XiClassShape {
+    /// Number of ButtonClass entries serialized for this XI device shape.
+    /// Keep XI1 consumers tied to the same registry shape as XIQueryDevice.
+    pub(crate) const fn button_count(self) -> u8 {
+        match self {
+            Self::CorePointer => 10,
+            Self::PhysicalPointer => 7,
+            Self::Keyboard => 0,
+        }
+    }
+
+    /// Number of ValuatorClass entries serialized for this XI device shape.
+    pub(crate) const fn valuator_count(self) -> u8 {
+        match self {
+            Self::CorePointer => 2,
+            Self::PhysicalPointer => 4,
+            Self::Keyboard => 0,
+        }
+    }
+}
+
 impl XiDevice {
     fn new(id: u16, name: &str) -> Self {
         // Xorg's initial key class also carries its own ID

@@ -17,6 +17,11 @@
 //!
 //! [`LibinputConfigSnapshot`]: crate::core_loop::message::LibinputConfigSnapshot
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
 /// A typed device-config write target (one variant per libinput setter).
 ///
 /// Produced by [`decode_change`] after a successful [`validate_value`]
@@ -79,6 +84,30 @@ pub enum DeviceConfigError {
     /// The runtime input source is no longer bound to a live libinput handle;
     /// this is terminal for the request and maps to BadMatch.
     SourceGone,
+    /// The core cancelled this queued command before the input thread applied it.
+    Cancelled,
+}
+
+/// Shared cancellation state for one source-targeted configuration command.
+/// The core sets it at a VT barrier timeout; the input thread checks it before
+/// touching its libinput handle.
+#[derive(Debug, Clone, Default)]
+pub struct DeviceConfigCancelToken(Arc<AtomicBool>);
+
+impl DeviceConfigCancelToken {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
 }
 
 /// Opaque identity for one input-thread configuration application.

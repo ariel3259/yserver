@@ -22535,11 +22535,9 @@ fn handle_xi2_request(
             reply.extend_from_slice(&[0u8; 23]);
             buf.extend_from_slice(&reply);
         }
-        // GetDeviceButtonMapping: { deviceid }. Real reply: the 7-button
-        // identity map the device advertises in ListInputDevices — the
-        // old nElts=0 zero-stub contradicted the ButtonInfo class there,
-        // and SetDeviceButtonMapping's BadValue check (below) keys off
-        // this length.
+        // GetDeviceButtonMapping: { deviceid }. The map length follows the
+        // device's current ButtonClass, including masters whose shape was
+        // copied from their last slave.
         28 => {
             let dev = u16::from(*body.first().unwrap_or(&0));
             if !xi1_device_valid(&state.xi_devices, dev) {
@@ -22555,28 +22553,43 @@ fn handle_xi2_request(
             if !xi1_device_has_buttons(&state.xi_devices, dev) {
                 return xi1_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, minor);
             }
+            let button_count = usize::from(
+                state
+                    .xi_devices
+                    .device(dev)
+                    .expect("validated XI device")
+                    .class_shape
+                    .button_count(),
+            );
             // nElts lives at byte 8 (first byte after the reply header);
             // map bytes follow the 32-byte header, padded to 4 bytes.
             // Use the device's stored map if set (xts5
             // SetDeviceButtonMapping-1 verifies that a custom map
             // round-trips); otherwise identity.
-            let mut reply = x11::fixed_reply(byte_order, sequence, 0, 2);
-            reply.push(XI1_NUM_BUTTONS);
+            let mut reply = x11::fixed_reply(
+                byte_order,
+                sequence,
+                0,
+                u32::try_from(button_count.div_ceil(4)).unwrap_or(u32::MAX),
+            );
+            reply.push(u8::try_from(button_count).expect("XI ButtonClass fits XI1 nElts"));
             reply.extend_from_slice(&[0u8; 23]);
             let stored = state.xi1_button_map.get(&dev).cloned();
-            for i in 0..XI1_NUM_BUTTONS {
+            for i in 0..button_count {
                 let mapped = stored
                     .as_ref()
-                    .and_then(|m| m.get(usize::from(i)).copied())
-                    .unwrap_or(i + 1);
+                    .and_then(|m| m.get(i).copied())
+                    .unwrap_or_else(|| u8::try_from(i + 1).expect("XI ButtonClass fits XI1"));
                 reply.push(mapped);
             }
-            reply.push(0); // pad 7 -> 8
+            while !reply.len().is_multiple_of(4) {
+                reply.push(0);
+            }
             buf.extend_from_slice(&reply);
         }
-        // SetDeviceButtonMapping: { deviceid, map_length }. map_length
-        // must equal the device's button count (XTS
-        // XSetDeviceButtonMapping-6).
+        // SetDeviceButtonMapping: { deviceid, map_length }. Xorg passes the
+        // supplied length directly to ApplyPointerMapping; it is not capped
+        // by the device's ButtonClass count.
         29 => {
             let dev = u16::from(*body.first().unwrap_or(&0));
             let map_length = *body.get(1).unwrap_or(&0);
@@ -22593,80 +22606,72 @@ fn handle_xi2_request(
             if !xi1_device_has_buttons(&state.xi_devices, dev) {
                 return xi1_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, minor);
             }
-            // Xorg's `setbmap.c::ProcXSetDeviceButtonMapping` does NOT
-            // reject mismatched `map_length` with BadValue. It calls
-            // `ApplyPointerMapping(dev, map, map_length, client)` which
-            // returns `MappingSuccess` whenever the map is a valid
-            // permutation of [0..N]. We approximate by accepting any
-            // `map_length <= XI1_NUM_BUTTONS` (the spec ceiling for our
-            // synthetic device) and emitting `MappingSuccess` as the
-            // reply status. Over-long maps remain BadValue so absurd
-            // requests don't silently succeed.
-            if map_length > XI1_NUM_BUTTONS {
-                return xi1_error(
-                    state,
-                    client_id,
-                    sequence,
-                    x11::error::BAD_VALUE,
-                    u32::from(map_length),
-                    minor,
-                );
-            }
             // Read the map bytes from the body (after the 4-byte
-            // header that holds deviceid/map_length/pad). xts5
-            // SetDeviceButtonMapping-7 sets map[0] = map[1] (a
-            // non-zero duplicate) and expects a BadValue X error;
-            // Xorg `BadDeviceMap` (dix/devices.c) rejects any
-            // duplicate non-zero value. Zero (disabled button) may
-            // repeat.
+            // header that holds deviceid/map_length/pad). Xorg's
+            // ApplyPointerMapping only checks device access and whether a
+            // changed held button makes the mapping busy, then copies the
+            // supplied bytes (`dix/inpututils.c:43-124`).
             let map_bytes: Vec<u8> = (0..usize::from(map_length))
                 .filter_map(|i| body.get(4 + i).copied())
                 .collect();
-            let mut seen = std::collections::HashSet::new();
-            for &b in &map_bytes {
-                if b != 0 && !seen.insert(b) {
-                    return xi1_error(
-                        state,
-                        client_id,
+            let current_map = state.xi1_button_map.get(&dev);
+            let buttons_down = state
+                .xi1_device_input_state
+                .get(&dev)
+                .map(|device_state| &device_state.buttons_down);
+            let mapping_busy = map_bytes.iter().enumerate().any(|(index, new_mapping)| {
+                let button = index + 1;
+                let previous_mapping = current_map
+                    .and_then(|mapping| mapping.get(index))
+                    .copied()
+                    .unwrap_or_else(|| u8::try_from(button).unwrap_or(u8::MAX));
+                let button_is_down = buttons_down.is_some_and(|down| {
+                    down.get(button / 8)
+                        .is_some_and(|byte| byte & (1 << (button % 8)) != 0)
+                });
+                previous_mapping != *new_mapping && button_is_down
+            });
+            if mapping_busy {
+                // Xorg ApplyPointerMapping returns MappingBusy before copying
+                // the map or emitting MappingNotify (`dix/inpututils.c:62-65`).
+                let mut reply = xi1_zero_reply(byte_order, sequence);
+                reply[8] = 1; // MappingBusy
+                buf.extend_from_slice(&reply);
+            } else {
+                // Persist the map so xts5 SetDeviceButtonMapping-1 sees
+                // it round-trip through GetDeviceButtonMapping.
+                state.xi1_button_map.insert(dev, map_bytes);
+                // Reply first, then DeviceMappingNotify event in the same
+                // outbound write. request_kind=2 = MappingPointer.
+                buf.extend_from_slice(&xi1_zero_reply(byte_order, sequence));
+                if crate::core_loop::xi1_focus::xi1_client_wants_device_mapping_notify(
+                    state, client_id, dev,
+                ) {
+                    let time = state.timestamp_now();
+                    #[allow(clippy::cast_possible_truncation)]
+                    let device_byte = dev as u8;
+                    crate::xinput::encode_xi1_device_mapping_notify(
+                        &mut buf,
+                        byte_order,
+                        crate::server::XI_FIRST_EVENT
+                            + crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET,
+                        device_byte,
                         sequence,
-                        x11::error::BAD_VALUE,
-                        u32::from(b),
-                        minor,
+                        time,
+                        2,
+                        0,
+                        0,
                     );
                 }
-            }
-            // Persist the map so xts5 SetDeviceButtonMapping-1 sees
-            // it round-trip through GetDeviceButtonMapping.
-            state.xi1_button_map.insert(dev, map_bytes);
-            // Reply first, then DeviceMappingNotify event in the same
-            // outbound write. request_kind=2 = MappingPointer.
-            buf.extend_from_slice(&xi1_zero_reply(byte_order, sequence));
-            if crate::core_loop::xi1_focus::xi1_client_wants_device_mapping_notify(
-                state, client_id, dev,
-            ) {
-                let time = state.timestamp_now();
-                #[allow(clippy::cast_possible_truncation)]
-                let device_byte = dev as u8;
-                crate::xinput::encode_xi1_device_mapping_notify(
-                    &mut buf,
-                    byte_order,
-                    crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET,
-                    device_byte,
-                    sequence,
-                    time,
+                crate::core_loop::xi1_focus::emit_device_mapping_notify(
+                    state,
+                    Some(client_id),
+                    dev,
                     2,
                     0,
                     0,
                 );
             }
-            crate::core_loop::xi1_focus::emit_device_mapping_notify(
-                state,
-                Some(client_id),
-                dev,
-                2,
-                0,
-                0,
-            );
         }
         // QueryDeviceState: { deviceid }. Snapshot of the device's
         // key / button / valuator state (Xorg Xi/queryst.c) — the same
@@ -22697,6 +22702,11 @@ fn handle_xi2_request(
                 .get(&dev)
                 .copied()
                 .unwrap_or_default();
+            let class_shape = state
+                .xi_devices
+                .device(dev)
+                .expect("validated XI device")
+                .class_shape;
             let mut data: Vec<u8> = Vec::new();
             let mut num_classes = 0u8;
             if xi1_device_has_keys(&state.xi_devices, dev) {
@@ -22711,23 +22721,23 @@ fn handle_xi2_request(
             if xi1_device_has_buttons(&state.xi_devices, dev) {
                 data.push(1); // class = ButtonClass
                 data.push(36); // length
-                data.push(7); // num_buttons
+                data.push(class_shape.button_count()); // num_buttons
                 data.push(0); // pad
                 data.extend_from_slice(&dev_state.buttons_down);
                 num_classes += 1;
             }
             if xi1_device_has_valuators(&state.xi_devices, dev) {
-                // 4 axes: X / Y are the sprite position, the two
-                // scroll axes carry no accumulated state.
+                let valuator_count = usize::from(class_shape.valuator_count());
+                let valuator_length = 4 + 4 * valuator_count;
                 data.push(2); // class = ValuatorClass
-                data.push(4 + 4 * 4); // length = header + 4 axes
-                data.push(4); // num_valuators
+                data.push(u8::try_from(valuator_length).expect("XI valuator block fits XI1"));
+                data.push(class_shape.valuator_count()); // num_valuators
                 data.push(dev_state.valuator_mode); // mode (in-proximity)
                 // Stored axis values (Xorg axisVal): axes 0/1 track
                 // the sprite under real motion; fakes write their
                 // explicit payload.
-                for v in dev_state.valuators {
-                    x11::write_u32(byte_order, &mut data, v.cast_unsigned());
+                for value in dev_state.valuators.iter().take(valuator_count) {
+                    x11::write_u32(byte_order, &mut data, value.cast_unsigned());
                 }
                 num_classes += 1;
             }
@@ -51514,13 +51524,12 @@ mod tests {
     }
 
     #[test]
-    fn xi1_query_device_state_reports_real_classes() {
-        // QueryDeviceState (minor 30) on the virtual XTEST pointer must report
-        // ButtonState (7 buttons, down-bitmask) + ValuatorState (4
-        // axes, sprite position) — not the old num_classes=0 stub.
+    fn xi1_button_shape_query_device_state_uses_core_pointer_shape() {
+        // Mutation killed: hard-code the former seven-button/four-valuator
+        // physical shape for the XTEST pointer instead of its CorePointer
+        // class shape.
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
-        let mut backend = RecordingBackend::new();
         {
             let entry = state
                 .xi1_device_input_state
@@ -51529,40 +51538,119 @@ mod tests {
             entry.buttons_down[0] = 0b0000_0010; // button 1 down
             entry.valuators = [120, 45, 0, 0]; // axes as of last motion
         }
+        let before = xi_query_side_effect_snapshot(&state, 1);
 
-        handle_xi2_request(
+        let wire = dispatch_xi_request_wire(
             &mut state,
-            &mut backend,
-            None,
-            ClientId(1),
-            SequenceNumber(1),
-            xi2_header(30),
+            &mut peer,
+            1,
+            30,
             &[
                 u8::try_from(crate::xinput::DEVICEID_XTEST_POINTER).unwrap(),
                 0,
                 0,
                 0,
-            ], // deviceid + pad
-        )
-        .unwrap();
-        let wire = read_all_available(&mut peer);
+            ],
+        );
         assert_eq!(
             wire.len(),
-            32 + 36 + 20,
+            32 + 36 + 12,
             "reply + xButtonState + xValuatorState"
         );
         assert_eq!(wire[8], 2, "num_classes");
         let bs = &wire[32..68];
-        assert_eq!((bs[0], bs[1], bs[2]), (1, 36, 7), "ButtonClass/len/count");
+        assert_eq!((bs[0], bs[1], bs[2]), (1, 36, 10), "ButtonClass/len/count");
         assert_eq!(bs[4], 0b0000_0010, "button 1 down bit");
         let vs = &wire[68..];
         assert_eq!(
             (vs[0], vs[1], vs[2], vs[3]),
-            (2, 20, 4, 0),
+            (2, 12, 2, 0),
             "ValuatorClass/len/axes/mode"
         );
         assert_eq!(i32::from_le_bytes(vs[4..8].try_into().unwrap()), 120);
         assert_eq!(i32::from_le_bytes(vs[8..12].try_into().unwrap()), 45);
+        assert_eq!(xi_query_side_effect_snapshot(&state, 1), before);
+    }
+
+    #[test]
+    fn xi1_button_shape_xtest_get_mapping_has_ten_entries() {
+        // Mutation killed: keep GetDeviceButtonMapping's old seven-entry
+        // reply instead of reading the XTEST device's ButtonClass shape.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let before = xi_query_side_effect_snapshot(&state, 1);
+
+        let wire = dispatch_xi_request_wire(&mut state, &mut peer, 1, 28, &[4, 0, 0, 0]);
+
+        assert_eq!(wire[0], 1, "GetDeviceButtonMapping reply");
+        assert_eq!(wire[8], 10, "nElts follows XTEST's ten-button class");
+        assert_eq!(wire.len(), 32 + 12, "ten map bytes padded to three words");
+        assert_eq!(&wire[32..42], &(1..=10).collect::<Vec<_>>());
+        assert_eq!(&wire[42..44], &[0, 0], "reply map padding");
+        assert_eq!(xi_query_side_effect_snapshot(&state, 1), before);
+    }
+
+    #[test]
+    fn xi1_button_shape_set_mapping_accepts_ten_and_eleven_entries() {
+        // Mutation killed: retain the map_length > XI1_NUM_BUTTONS BadValue
+        // ceiling, which rejects Xorg's valid eleven-entry request on device 4.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let before = xi_query_side_effect_snapshot(&state, 1);
+
+        for (sequence, map) in [(1, (1..=10).collect::<Vec<_>>()), (2, (1..=11).collect())] {
+            let mut body = vec![4, u8::try_from(map.len()).unwrap(), 0, 0];
+            body.extend_from_slice(&map);
+            let wire = dispatch_xi_request_wire(&mut state, &mut peer, sequence, 29, &body);
+            assert_eq!(
+                wire.len(),
+                32,
+                "MappingSuccess reply for {} entries",
+                map.len()
+            );
+            assert_eq!(wire[0], 1, "SetDeviceButtonMapping reply");
+            assert_eq!(wire[8], 0, "MappingSuccess");
+            assert!(read_all_available(&mut peer).is_empty());
+        }
+
+        assert_eq!(state.xi1_button_map, [(4, (1..=11).collect())].into());
+        assert_eq!(xi_query_side_effect_snapshot(&state, 1), before);
+    }
+
+    #[test]
+    fn xi1_button_shape_physical_pointer_keeps_seven_buttons_and_four_valuators() {
+        // Mutation killed: apply CorePointer's ten-button/two-valuator shape
+        // to a physical slave whose XI class descriptors remain seven/four.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let physical_pointer = seed_pointer_for_t3(&mut state);
+        let before = xi_query_side_effect_snapshot(&state, 1);
+
+        let mapping = dispatch_xi_request_wire(
+            &mut state,
+            &mut peer,
+            1,
+            28,
+            &[u8::try_from(physical_pointer).unwrap(), 0, 0, 0],
+        );
+        assert_eq!(mapping[8], 7, "physical button-map count");
+        assert_eq!(&mapping[32..39], &(1..=7).collect::<Vec<_>>());
+
+        let query = dispatch_xi_request_wire(
+            &mut state,
+            &mut peer,
+            2,
+            30,
+            &[u8::try_from(physical_pointer).unwrap(), 0, 0, 0],
+        );
+        assert_eq!(query[34], 7, "physical ButtonClass reports seven buttons");
+        assert_eq!(
+            query[32 + 36 + 2],
+            4,
+            "physical ValuatorClass reports four axes"
+        );
+        assert_eq!(query.len(), 32 + 36 + 20);
+        assert_eq!(xi_query_side_effect_snapshot(&state, 1), before);
     }
 
     #[test]

@@ -172,6 +172,36 @@ fn update_from_pointer_master(
     dropped
 }
 
+/// Whether a wheel button's direction has a ScrollClass on its generating
+/// slave. Xorg maps buttons 4/5 to the vertical axis and 6/7 to the horizontal
+/// axis (`dix/getevents.c:1661-1677`), then emulates only when that axis is
+/// present (`:1652-1657,1684-1692`). XTEST is initialized by `CorePointerProc`
+/// with two relative axes and no ScrollClass (`dix/devices.c:660-690`).
+/// Physical libinput pointers install horizontal and vertical ScrollClasses
+/// (`xf86-input-libinput/src/xf86libinput.c:1109-1117`). For a master copy,
+/// `slave_deviceid` remains the generating slave, so its class shape controls
+/// the conversion.
+fn pointer_source_has_scroll_class(
+    state: &ServerState,
+    source: PointerXiSource,
+    button: u8,
+) -> bool {
+    let axis = match button {
+        4 | 5 => 2,
+        6 | 7 => 3,
+        _ => return false,
+    };
+    let Some(device_id) = source.slave_deviceid else {
+        return false;
+    };
+    state.xi_devices.device(device_id).is_some_and(|device| {
+        matches!(
+            (device.class_shape, axis),
+            (crate::xinput::XiClassShape::PhysicalPointer, 2 | 3)
+        )
+    })
+}
+
 fn pointer_button_transition(
     state: &mut ServerState,
     origin: crate::core_loop::InputOrigin,
@@ -1804,9 +1834,10 @@ fn pointer_event_fanout_to_state_inner(
     // scroll ButtonPress into MotionNotify and fills it before separately
     // generating legacy wheel buttons (dix/getevents.c:1646-1697, 1703-1718),
     // so a Motion-only XI2 grab must accept the emulated wheel press as Motion.
+    let source_has_scroll_class = pointer_source_has_scroll_class(state, xi_source, event.detail);
     let xi2_scroll_button_press = event.kind == PointerEventKind::ButtonPress
         && button_transition.source_accepted
-        && (4..=7).contains(&event.detail);
+        && source_has_scroll_class;
     let xi2_grab_accepts_event = |mask: u64| {
         mask & (1_u64 << xi2_evtype) != 0 || (xi2_scroll_button_press && mask & (1_u64 << 6) != 0)
     };
@@ -2021,7 +2052,7 @@ fn pointer_event_fanout_to_state_inner(
     // ButtonRelease doesn't carry an axis update; only ButtonPress does.
     let scroll_axis_info: Option<(u8, usize)> = if event.kind == PointerEventKind::ButtonPress
         && button_transition.source_accepted
-        && (event.detail >= 4 && event.detail <= 7)
+        && source_has_scroll_class
     {
         let (axis_idx, delta): (usize, i32) = match event.detail {
             4 => (0, -1),
@@ -2389,7 +2420,7 @@ fn pointer_event_fanout_to_state_inner(
                         let xi2_flags: u32 = if matches!(
                             event.kind,
                             PointerEventKind::ButtonPress | PointerEventKind::ButtonRelease
-                        ) && (4..=7).contains(&event.detail)
+                        ) && source_has_scroll_class
                         {
                             x11::XI_POINTER_EMULATED
                         } else {

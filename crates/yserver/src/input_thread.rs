@@ -37,7 +37,9 @@ use yserver_core::{
     host_x11::HostKeyEvent,
     xinput::{
         InputSourceId,
-        libinput_props::{DeviceConfigChange, DeviceConfigError, DeviceConfigToken},
+        libinput_props::{
+            DeviceConfigCancelToken, DeviceConfigChange, DeviceConfigError, DeviceConfigToken,
+        },
     },
 };
 
@@ -260,7 +262,14 @@ pub(crate) enum InputThreadCommand {
 #[derive(Debug)]
 pub(crate) struct InputThreadControl {
     commands: Mutex<VecDeque<InputThreadCommand>>,
-    configs: Mutex<VecDeque<(DeviceConfigToken, InputSourceId, DeviceConfigChange)>>,
+    configs: Mutex<
+        VecDeque<(
+            DeviceConfigToken,
+            InputSourceId,
+            DeviceConfigChange,
+            DeviceConfigCancelToken,
+        )>,
+    >,
     efd: EventFd,
     /// Latched pending resize. Written by the core thread via
     /// `push_resize`; read+cleared by the input thread via `take_resize`.
@@ -315,9 +324,10 @@ impl InputThreadControl {
         token: DeviceConfigToken,
         source: InputSourceId,
         change: DeviceConfigChange,
+        cancel: DeviceConfigCancelToken,
     ) {
         if let Ok(mut q) = self.configs.lock() {
-            q.push_back((token, source, change));
+            q.push_back((token, source, change, cancel));
         }
         self.wake();
     }
@@ -344,7 +354,12 @@ impl InputThreadControl {
     /// `command`, so `drain` alone would skip it).
     pub(crate) fn take_configs(
         &self,
-    ) -> Vec<(DeviceConfigToken, InputSourceId, DeviceConfigChange)> {
+    ) -> Vec<(
+        DeviceConfigToken,
+        InputSourceId,
+        DeviceConfigChange,
+        DeviceConfigCancelToken,
+    )> {
         self.configs
             .lock()
             .map(|mut q| q.drain(..).collect())
@@ -1017,12 +1032,21 @@ fn finish_expired_resume_window(
 }
 
 fn process_config_commands(
-    configs: Vec<(DeviceConfigToken, InputSourceId, DeviceConfigChange)>,
+    configs: Vec<(
+        DeviceConfigToken,
+        InputSourceId,
+        DeviceConfigChange,
+        DeviceConfigCancelToken,
+    )>,
     sender: &CoreSender,
     mut apply: impl FnMut(InputSourceId, DeviceConfigChange) -> Result<(), DeviceConfigError>,
 ) -> io::Result<()> {
-    for (token, source, change) in configs {
-        let result = apply(source, change);
+    for (token, source, change, cancel) in configs {
+        let result = if cancel.is_cancelled() {
+            Err(DeviceConfigError::Cancelled)
+        } else {
+            apply(source, change)
+        };
         sender.send(Message::DeviceConfigResult {
             token,
             source,
@@ -2013,6 +2037,7 @@ mod tests {
             DeviceConfigToken(1),
             InputSourceId(2),
             DeviceConfigChange::NaturalScroll(false),
+            DeviceConfigCancelToken::new(),
         );
         // No pause/resume was published, so the latched command is empty.
         assert!(control.drain().is_empty());
@@ -2039,8 +2064,14 @@ mod tests {
             DeviceConfigToken(1),
             source,
             DeviceConfigChange::NaturalScroll(true),
+            DeviceConfigCancelToken::new(),
         );
-        control.push_config(DeviceConfigToken(2), source, DeviceConfigChange::Tap(false));
+        control.push_config(
+            DeviceConfigToken(2),
+            source,
+            DeviceConfigChange::Tap(false),
+            DeviceConfigCancelToken::new(),
+        );
         control.pause();
         assert_eq!(control.drain(), vec![InputThreadCommand::Pause]);
         let configs = control.take_configs();
@@ -2059,7 +2090,7 @@ mod tests {
         let source = InputSourceId(91);
         let token = DeviceConfigToken(17);
         let change = DeviceConfigChange::AccelSpeed(0.5);
-        control.push_config(token, source, change);
+        control.push_config(token, source, change, DeviceConfigCancelToken::new());
         process_config_commands(
             control.take_configs(),
             &sender,
@@ -2083,6 +2114,44 @@ mod tests {
     }
 
     #[test]
+    fn xi_vt_timeout_input_thread_skips_cancelled_config_before_apply() {
+        // Mutation killed: remove the input thread's cancel-token check so a
+        // command queued before VT pause still touches the libinput apply path.
+        let (_poll, sender, receiver) = yserver_core::core_loop::channel().unwrap();
+        let control = InputThreadControl::new().expect("control");
+        let source = InputSourceId(93);
+        let token = DeviceConfigToken(19);
+        let change = DeviceConfigChange::AccelSpeed(0.75);
+        let cancel = yserver_core::xinput::libinput_props::DeviceConfigCancelToken::new();
+        cancel.cancel();
+        control.push_config(token, source, change, cancel);
+        let mut apply_calls = 0;
+
+        process_config_commands(
+            control.take_configs(),
+            &sender,
+            |actual_source, actual_change| {
+                assert_eq!(actual_source, source);
+                assert_eq!(actual_change, change);
+                apply_calls += 1;
+                Ok(())
+            },
+        )
+        .expect("send cancellation result");
+
+        assert_eq!(apply_calls, 0, "cancelled command never reaches libinput");
+        assert!(matches!(
+            receiver.try_recv_all().next(),
+            Some(Message::DeviceConfigResult {
+                token: actual_token,
+                source: actual_source,
+                result: Err(DeviceConfigError::Cancelled),
+            }) if actual_token == token && actual_source == source
+        ));
+        assert!(receiver.try_recv_all().next().is_none());
+    }
+
+    #[test]
     fn submitted_config_source_gone_reports_terminal_result_immediately() {
         // Mutation killed: restore the continuation queue so SourceGone is
         // withheld until a resume lifecycle event.
@@ -2091,9 +2160,11 @@ mod tests {
         let token = DeviceConfigToken(18);
         let change = DeviceConfigChange::NaturalScroll(true);
 
-        process_config_commands(vec![(token, source, change)], &sender, |_, _| {
-            Err(DeviceConfigError::SourceGone)
-        })
+        process_config_commands(
+            vec![(token, source, change, DeviceConfigCancelToken::new())],
+            &sender,
+            |_, _| Err(DeviceConfigError::SourceGone),
+        )
         .expect("send terminal result for a missing handle");
 
         assert!(matches!(

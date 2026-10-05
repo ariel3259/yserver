@@ -1828,6 +1828,368 @@ mod tests {
     }
 
     #[test]
+    fn xtest_wheel_buttons_remain_plain_while_physical_wheels_smooth_scroll() {
+        // Mutation killed: convert every button 4–7 to smooth scrolling
+        // without consulting the generating slave's ScrollClass shape.
+        use crate::{
+            backend::Backend,
+            core_loop::{HostInputEvent, InputOrigin, run::dispatch_pending_host_events},
+            resources::ROOT_WINDOW,
+            server::ServerState,
+            xinput::{InputCapabilities, InputSourceId, XiFacetKind},
+        };
+
+        fn snapshot(state: &ServerState) -> String {
+            format!(
+                "{:?}",
+                (
+                    &state.xi_devices,
+                    state.keys_down,
+                    state.buttons_down,
+                    &state.key_down_by_device,
+                    state.xi_last_slave(2),
+                    state.xi_last_slave(3),
+                    &state.xi2_detached_masters,
+                    &state.floating_pointer_positions,
+                    &state.unpublished_pointer_buttons_down,
+                    state.pointer_root,
+                    state
+                        .clients
+                        .iter()
+                        .map(|(id, client)| (
+                            *id,
+                            &client.event_masks,
+                            &client.xi2_masks,
+                            &client.xi1_event_classes,
+                            &client.xi1_window_event_classes,
+                        ))
+                        .collect::<Vec<_>>(),
+                )
+            )
+        }
+
+        let registry_snapshot = |state: &ServerState| {
+            state
+                .xi_devices
+                .devices()
+                .iter()
+                .map(|device| {
+                    (
+                        device.id,
+                        device.name.clone(),
+                        device.enabled,
+                        device.session_enabled,
+                        device.client_disabled,
+                        device.source_id,
+                        device.facet,
+                        device.attached_master,
+                        device.class_sourceid,
+                        device.class_shape,
+                        (
+                            device.properties.clone(),
+                            device.buttons_down,
+                            device.scroll_axis_values,
+                        ),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let selections_snapshot = |state: &ServerState| {
+            state
+                .clients
+                .iter()
+                .map(|(id, client)| {
+                    (
+                        *id,
+                        client.event_masks.clone(),
+                        client.xi2_masks.clone(),
+                        client.xi1_event_classes.clone(),
+                        client.xi1_window_event_classes.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        fn parse_events(bytes: &[u8]) -> Vec<(u16, u16, u16, u32, u32, u32)> {
+            let mut events = Vec::new();
+            let mut offset = 0;
+            while offset < bytes.len() {
+                assert_eq!(bytes[offset], 35, "XI2 GenericEvent");
+                let event_len = 32
+                    + usize::try_from(u32::from_le_bytes(
+                        bytes[offset + 4..offset + 8].try_into().unwrap(),
+                    ))
+                    .unwrap()
+                        * 4;
+                let event_type =
+                    u16::from_le_bytes(bytes[offset + 8..offset + 10].try_into().unwrap());
+                let device_id =
+                    u16::from_le_bytes(bytes[offset + 10..offset + 12].try_into().unwrap());
+                let detail =
+                    u32::from_le_bytes(bytes[offset + 16..offset + 20].try_into().unwrap());
+                let source_id =
+                    u16::from_le_bytes(bytes[offset + 52..offset + 54].try_into().unwrap());
+                let flags = u32::from_le_bytes(bytes[offset + 56..offset + 60].try_into().unwrap());
+                let valuator_mask = if event_type == 6 {
+                    u32::from_le_bytes(bytes[offset + 112..offset + 116].try_into().unwrap())
+                } else {
+                    0
+                };
+                events.push((
+                    event_type,
+                    device_id,
+                    source_id,
+                    detail,
+                    flags,
+                    valuator_mask,
+                ));
+                offset += event_len;
+            }
+            assert_eq!(offset, bytes.len(), "complete XI2 event stream");
+            events
+        }
+
+        let mut state = ServerState::new();
+        let mut peer = install_xtest_client(&mut state, 1);
+        let mut backend = dummy_backend();
+        backend.xid_map.insert(backend.window_id, ROOT_WINDOW);
+
+        let source_id = InputSourceId(0x5849);
+        let info = crate::core_loop::DeviceInfo {
+            source_id,
+            enabled: true,
+            resume_key: None,
+            capabilities: InputCapabilities {
+                keyboard: false,
+                pointer: true,
+                touch: false,
+            },
+            name: "wheel-test-mouse".to_owned(),
+            device_node: "/dev/input/event-wheel-test".to_owned(),
+            sysname: "event-wheel-test".to_owned(),
+            vendor_id: 0,
+            product_id: 0,
+            is_touchpad: false,
+            config: Default::default(),
+        };
+        let physical_id = state
+            .xi_register_source(&info)
+            .into_iter()
+            .find(|id| {
+                state
+                    .xi_devices
+                    .device(*id)
+                    .is_some_and(|device| device.facet == Some(XiFacetKind::PointerTouch))
+            })
+            .expect("physical pointer facet registered");
+
+        // Select ButtonPress, ButtonRelease, and Motion on XTEST, its master,
+        // and the physical pointer using the production XISelectEvents path.
+        let mut select = Vec::new();
+        select.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        select.extend_from_slice(&3u16.to_le_bytes());
+        select.extend_from_slice(&[0; 2]);
+        let mask = (1u32 << 4) | (1u32 << 5) | (1u32 << 6);
+        for device_id in [4u16, 2, physical_id] {
+            select.extend_from_slice(&device_id.to_le_bytes());
+            select.extend_from_slice(&1u16.to_le_bytes());
+            select.extend_from_slice(&mask.to_le_bytes());
+        }
+        dispatch_test_request(&mut state, &mut backend, 1, 137, 46, &select);
+        assert!(
+            drain_capture(&mut peer).is_empty(),
+            "selection has no reply"
+        );
+
+        // Establish XTEST as the master's last source through XTestFakeInput,
+        // then compare state after the wheel sequence against this baseline.
+        for (sequence, event_type) in [
+            (2, yserver_protocol::x11::xtest::FAKE_BUTTON_PRESS),
+            (3, yserver_protocol::x11::xtest::FAKE_BUTTON_RELEASE),
+        ] {
+            dispatch_test_request(
+                &mut state,
+                &mut backend,
+                sequence,
+                146,
+                yserver_protocol::x11::xtest::FAKE_INPUT,
+                &fake_input_body(event_type, 1, None),
+            );
+            assert!(dispatch_pending_host_events(&mut state, &mut backend));
+            assert!(!drain_capture(&mut peer).is_empty());
+        }
+        let xtest_before = snapshot(&state);
+
+        let mut xtest_events = Vec::new();
+        for (sequence, event_type) in [
+            (4, yserver_protocol::x11::xtest::FAKE_BUTTON_PRESS),
+            (5, yserver_protocol::x11::xtest::FAKE_BUTTON_RELEASE),
+        ] {
+            dispatch_test_request(
+                &mut state,
+                &mut backend,
+                sequence,
+                146,
+                yserver_protocol::x11::xtest::FAKE_INPUT,
+                &fake_input_body(event_type, 5, None),
+            );
+            assert!(dispatch_pending_host_events(&mut state, &mut backend));
+            xtest_events.extend(drain_capture(&mut peer));
+        }
+        let mut xtest_forms = parse_events(&xtest_events);
+        xtest_forms.sort_unstable();
+        assert_eq!(
+            xtest_forms,
+            vec![
+                (4, 2, 4, 5, 0, 0),
+                (4, 4, 4, 5, 0, 0),
+                (5, 2, 4, 5, 0, 0),
+                (5, 4, 4, 5, 0, 0),
+            ],
+            "XTEST button 5 remains a plain press/release on slave 4 and master 2",
+        );
+        assert_eq!(
+            snapshot(&state),
+            xtest_before,
+            "XTEST wheel leaves no state behind"
+        );
+        assert_eq!(
+            state.xi_devices.device(4).unwrap().scroll_axis_values,
+            [0, 0]
+        );
+        assert_eq!(state.scroll_axis_value, [0, 0]);
+
+        // Switch the master to the physical source by sending an ordinary
+        // button through on_host_input, then test the physical wheel path.
+        for (pressed, time) in [(true, 6), (false, 7)] {
+            Backend::on_host_input(
+                &mut backend,
+                &mut state,
+                HostInputEvent::PointerButton {
+                    origin: InputOrigin::Physical(source_id),
+                    button: 0x110,
+                    pressed,
+                    time,
+                },
+            );
+            assert!(dispatch_pending_host_events(&mut state, &mut backend));
+            assert!(!drain_capture(&mut peer).is_empty());
+        }
+        let mut expected_registry = registry_snapshot(&state);
+        expected_registry
+            .iter_mut()
+            .find(|device| device.0 == physical_id)
+            .expect("registered physical pointer")
+            .10
+            .2 = [1, 0];
+        let registry_ids_before: Vec<_> = expected_registry.iter().map(|device| device.0).collect();
+        let selections_before = selections_snapshot(&state);
+        let last_slaves_before = (state.xi_last_slave(2), state.xi_last_slave(3));
+        let held_state_before = (
+            state.keys_down,
+            state.buttons_down,
+            state.key_down_by_device.clone(),
+            state.unpublished_pointer_buttons_down.clone(),
+        );
+        let detached_masters_before = state.xi2_detached_masters.clone();
+        let floating_positions_before = state.floating_pointer_positions.clone();
+
+        let mut physical_events = Vec::new();
+        for (pressed, time) in [(true, 8), (false, 9)] {
+            Backend::on_host_input(
+                &mut backend,
+                &mut state,
+                HostInputEvent::PointerButton {
+                    origin: InputOrigin::Physical(source_id),
+                    button: 0x181, // SYNTH_SCROLL_DOWN -> X button 5
+                    pressed,
+                    time,
+                },
+            );
+            assert!(dispatch_pending_host_events(&mut state, &mut backend));
+            physical_events.extend(drain_capture(&mut peer));
+        }
+        let physical_forms = parse_events(&physical_events);
+        assert_eq!(
+            physical_forms
+                .iter()
+                .filter(|(event_type, _, _, _, _, _)| *event_type == 6)
+                .map(|(_, device_id, source_id, _, _, valuator_mask)| {
+                    (*device_id, *source_id, *valuator_mask)
+                })
+                .collect::<Vec<_>>(),
+            vec![(physical_id, physical_id, 7), (2, physical_id, 7)],
+            "physical button 5 still generates vertical smooth-scroll Motion on slave and master",
+        );
+        assert_eq!(
+            physical_forms
+                .iter()
+                .filter(|(event_type, _, _, _, _, _)| *event_type == 4 || *event_type == 5)
+                .count(),
+            4,
+            "physical wheel keeps its emulated button forms",
+        );
+        assert_eq!(
+            state
+                .xi_devices
+                .device(physical_id)
+                .unwrap()
+                .scroll_axis_values,
+            [1, 0]
+        );
+        assert_eq!(state.scroll_axis_value, [1, 0]);
+        assert_eq!(
+            state.xi_devices.device(4).unwrap().scroll_axis_values,
+            [0, 0]
+        );
+        assert_eq!(
+            registry_snapshot(&state),
+            expected_registry,
+            "the registry changes only by the physical scroll valuator value",
+        );
+        assert_eq!(
+            state
+                .xi_devices
+                .devices()
+                .iter()
+                .map(|device| device.id)
+                .collect::<Vec<_>>(),
+            registry_ids_before,
+            "the source registry has no added or removed devices",
+        );
+        assert_eq!(
+            (
+                state.keys_down,
+                state.buttons_down,
+                state.key_down_by_device.clone(),
+                state.unpublished_pointer_buttons_down.clone(),
+            ),
+            held_state_before,
+            "press/release leaves held state unchanged",
+        );
+        assert_eq!(state.xi2_detached_masters, detached_masters_before);
+        assert_eq!(state.floating_pointer_positions, floating_positions_before);
+        assert_eq!(
+            (state.xi_last_slave(2), state.xi_last_slave(3)),
+            last_slaves_before,
+            "wheel input does not leave a changed last-slave reference",
+        );
+        assert_eq!(
+            state.xi_last_slave(2),
+            Some(physical_id),
+            "the master remains attached to the physical source after the completed wheel input",
+        );
+        assert_eq!(selections_snapshot(&state), selections_before);
+        assert!(state.clients[&1].xi2_masks.contains_key(&(ROOT_WINDOW, 4)));
+        assert!(state.clients[&1].xi2_masks.contains_key(&(ROOT_WINDOW, 2)));
+        assert!(
+            state.clients[&1]
+                .xi2_masks
+                .contains_key(&(ROOT_WINDOW, physical_id))
+        );
+    }
+
+    #[test]
     fn xi_query_button_state_reports_each_slave_and_master_holds() {
         // Kills: zero-filling ButtonClass.state, copying the master's state
         // into slave queries, using the registry's n-1 button bit as the XI2

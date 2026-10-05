@@ -703,20 +703,35 @@ struct XiConfigInFlight {
     token: crate::xinput::libinput_props::DeviceConfigToken,
     source: crate::xinput::InputSourceId,
     change: crate::xinput::libinput_props::DeviceConfigChange,
+    cancel: crate::xinput::libinput_props::DeviceConfigCancelToken,
     protocol: Option<XiConfigCompletion>,
+}
+
+/// The client has already received BadMatch, but the input thread may have
+/// crossed its pre-apply cancellation check before the timeout. Keep enough
+/// information to reconcile a later confirmation without another reply.
+struct TimedOutXiConfig {
+    change: crate::xinput::libinput_props::DeviceConfigChange,
 }
 
 #[derive(Default)]
 pub(crate) struct XiConfigLane {
     queued: VecDeque<QueuedXiConfig>,
     in_flight: Option<XiConfigInFlight>,
+    timed_out: HashMap<
+        (
+            crate::xinput::libinput_props::DeviceConfigToken,
+            crate::xinput::InputSourceId,
+        ),
+        TimedOutXiConfig,
+    >,
     reject_unsubmitted_for_vt_release: bool,
 }
 
 impl XiConfigLane {
     #[cfg(test)]
     pub(super) fn is_empty(&self) -> bool {
-        self.queued.is_empty() && self.in_flight.is_none()
+        self.queued.is_empty() && self.in_flight.is_none() && self.timed_out.is_empty()
     }
 }
 
@@ -985,6 +1000,7 @@ fn xi_error_for_config(
         ConfigError::Invalid => PropertyDispatchError::BadValue {
             error_value: u32::from(request.format),
         },
+        ConfigError::Cancelled => PropertyDispatchError::BadMatch,
         // xf86-input-libinput returns BadMatch when its shared handle is
         // absent (`xf86libinput.c:4392-4409, 4579-4607`).
         ConfigError::SourceGone => PropertyDispatchError::BadMatch,
@@ -1081,7 +1097,8 @@ fn drive_xi_config_lane(
                     continue;
                 }
             };
-        match backend.start_device_config(validated.source_id, validated.change) {
+        let cancel = crate::xinput::libinput_props::DeviceConfigCancelToken::new();
+        match backend.start_device_config(validated.source_id, validated.change, cancel.clone()) {
             Ok(crate::xinput::libinput_props::DeviceConfigStart::Applied) => {
                 match apply_confirmed_xi_config(
                     state,
@@ -1117,6 +1134,7 @@ fn drive_xi_config_lane(
                     token,
                     source: validated.source_id,
                     change: validated.change,
+                    cancel,
                     protocol: Some(XiConfigCompletion {
                         validated,
                         generation: queued.generation,
@@ -1276,9 +1294,9 @@ fn fail_unsubmitted_xi_configs_for_vt_release(
     lane.reject_unsubmitted_for_vt_release = true;
 }
 
-/// Reject the one submitted XI config write if the input thread cannot
-/// confirm it before VT release finishes. This path never updates inventory
-/// or property state; only a confirmed completion may commit those values.
+/// Cancel the one submitted XI config write if the input thread cannot
+/// confirm it before VT release finishes. A later Applied result is retained
+/// for reconciliation, while the client's BadMatch remains final.
 fn fail_in_flight_xi_config_for_vt_release(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -1290,21 +1308,28 @@ fn fail_in_flight_xi_config_for_vt_release(
     let Some(in_flight) = lane.in_flight.take() else {
         return;
     };
-    let Some(protocol) = in_flight.protocol else {
-        return;
-    };
-    emit_xi_config_error(
-        state,
-        backend,
-        pending,
-        lane,
-        reset_trigger,
-        &protocol.validated.request,
-        PropertyDispatchError::BadMatch,
-        protocol.generation,
-        protocol.request_wire_bytes,
-        current_generation,
+    in_flight.cancel.cancel();
+    let protocol = in_flight.protocol;
+    lane.timed_out.insert(
+        (in_flight.token, in_flight.source),
+        TimedOutXiConfig {
+            change: in_flight.change,
+        },
     );
+    if let Some(protocol) = protocol {
+        emit_xi_config_error(
+            state,
+            backend,
+            pending,
+            lane,
+            reset_trigger,
+            &protocol.validated.request,
+            PropertyDispatchError::BadMatch,
+            protocol.generation,
+            protocol.request_wire_bytes,
+            current_generation,
+        );
+    }
 }
 
 /// Dispatch the production `Message::VtRelease` lifecycle callback. Keep the
@@ -1403,6 +1428,40 @@ fn finish_xi_config_result(
         .as_ref()
         .is_some_and(|in_flight| in_flight.token == token && in_flight.source == source);
     if !matches_submitted {
+        if let Some(timed_out) = lane.timed_out.remove(&(token, source)) {
+            if result.is_ok() {
+                match apply_confirmed_xi_config(
+                    state,
+                    input_inventory,
+                    source,
+                    timed_out.change,
+                    None,
+                ) {
+                    Ok((facet_id, property, what)) => {
+                        let _ = crate::core_loop::process_request::emit_property_change(
+                            state, facet_id, property, what,
+                        );
+                        backend.mark_dirty();
+                    }
+                    Err(error) => {
+                        warn!(
+                            "late applied input config could not be reconciled token={} source={}: {error:?}",
+                            token.0, source.0
+                        );
+                    }
+                }
+            }
+            drive_xi_config_lane(
+                state,
+                backend,
+                input_inventory,
+                pending,
+                lane,
+                reset_trigger,
+                current_generation,
+            );
+            return;
+        }
         warn!(
             "discarding stale input config result token={} source={}",
             token.0, source.0
@@ -1898,6 +1957,34 @@ const REPEAT_PERIOD: Duration = Duration::from_millis(40);
 /// of the run — the whole point of the single-threaded refactor is
 /// that only this thread can mutate them.
 pub fn run_core(
+    poll: Poll,
+    rx: CoreReceiver,
+    sender: CoreSender,
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    listeners: impl IntoIterator<Item = Listener>,
+    client_id_allocator: &ClientIdAllocator,
+    auth: Arc<AuthState>,
+    reset_policy: ResetPolicy,
+    xdmcp: Option<XdmcpService>,
+) -> io::Result<()> {
+    let mut input_inventory = InputInventory::new();
+    run_core_with_inventory(
+        poll,
+        rx,
+        sender,
+        state,
+        backend,
+        listeners,
+        client_id_allocator,
+        auth,
+        reset_policy,
+        xdmcp,
+        &mut input_inventory,
+    )
+}
+
+fn run_core_with_inventory(
     mut poll: Poll,
     rx: CoreReceiver,
     sender: CoreSender,
@@ -1908,6 +1995,7 @@ pub fn run_core(
     auth: Arc<AuthState>,
     reset_policy: ResetPolicy,
     xdmcp: Option<XdmcpService>,
+    input_inventory: &mut InputInventory,
 ) -> io::Result<()> {
     let setup_registry = setup_thread::make_registry();
     // The generation counter is shared with every `CoreSender`; the
@@ -2014,7 +2102,6 @@ pub fn run_core(
     // Process-lifetime, not per-generation — see `input_inventory`'s
     // module docs. Populated below on every `HostInput` device event;
     // nothing consumes it yet (step 1 of the server-reset plan).
-    let mut input_inventory = InputInventory::new();
     loop {
         // The grab can be dropped by paths that have no release check of
         // their own — notably the two disconnect sites outside the message
@@ -2124,7 +2211,7 @@ pub fn run_core(
         drain_pending_requests(
             state,
             backend,
-            &mut input_inventory,
+            input_inventory,
             &mut telemetry,
             &mut pending_backend_requests,
             &mut xi_config_lane,
@@ -2374,7 +2461,7 @@ pub fn run_core(
                                 dispatch_host_input(
                                     state,
                                     backend,
-                                    &mut input_inventory,
+                                    input_inventory,
                                     &mut pending_backend_requests,
                                     &mut xi_config_lane,
                                     &mut reset_trigger,
@@ -2395,7 +2482,7 @@ pub fn run_core(
                                 dispatch_device_config_result(
                                     state,
                                     backend,
-                                    &mut input_inventory,
+                                    input_inventory,
                                     &mut pending_backend_requests,
                                     &mut xi_config_lane,
                                     &mut reset_trigger,
@@ -2420,7 +2507,7 @@ pub fn run_core(
                                     drain_vt_release_requests(
                                         state,
                                         backend,
-                                        &mut input_inventory,
+                                        input_inventory,
                                         &mut telemetry,
                                         &mut pending_backend_requests,
                                         &mut xi_config_lane,
@@ -2441,7 +2528,7 @@ pub fn run_core(
                                 dispatch_vt_release(
                                     state,
                                     backend,
-                                    &mut input_inventory,
+                                    input_inventory,
                                     |state, backend, input_inventory, pause_barrier_queued| {
                                         let mut deferred = VecDeque::new();
                                         let mut pause_acknowledged = false;
@@ -2613,7 +2700,7 @@ pub fn run_core(
                     drain_pending_requests(
                         state,
                         backend,
-                        &mut input_inventory,
+                        input_inventory,
                         &mut telemetry,
                         &mut pending_backend_requests,
                         &mut xi_config_lane,
@@ -2848,7 +2935,7 @@ pub fn run_core(
                     poll.registry(),
                     &generations,
                     &setup_registry,
-                    &input_inventory,
+                    input_inventory,
                     GenerationLocals {
                         deferred_requests: &mut deferred_requests,
                         server_grab_waiters: &mut server_grab_waiters,
@@ -4768,11 +4855,12 @@ mod tests {
         state: &mut ServerState,
         backend: &mut crate::backend::recording::RecordingBackend,
         enqueue: impl FnOnce(&CoreSender, &crate::core_loop::sender::BoundSender),
-    ) {
+    ) -> InputInventory {
         let (poll, sender, receiver) = crate::core_loop::channel().expect("core channel");
         let request_sender = sender.bind();
         enqueue(&sender, &request_sender);
-        run_core(
+        let mut input_inventory = InputInventory::new();
+        run_core_with_inventory(
             poll,
             receiver,
             sender.clone_handle(),
@@ -4783,8 +4871,10 @@ mod tests {
             AuthState::new(None),
             ResetPolicy::NoReset,
             None,
+            &mut input_inventory,
         )
         .expect("run core through VT release and shutdown messages");
+        input_inventory
     }
 
     fn run_core_for_vt_test_with_timeout(
@@ -4798,16 +4888,167 @@ mod tests {
             ServerState,
             crate::backend::recording::RecordingBackend,
             crate::transport::CapturedPeer,
+            InputInventory,
         ),
         std::sync::mpsc::RecvTimeoutError,
     > {
         let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
         let runner = std::thread::spawn(move || {
-            run_core_for_vt_test(&mut state, &mut backend, enqueue);
-            let _ = finished_tx.send((state, backend, peer));
+            let input_inventory = run_core_for_vt_test(&mut state, &mut backend, enqueue);
+            let _ = finished_tx.send((state, backend, peer, input_inventory));
         });
         drop(runner);
         finished_rx.recv_timeout(timeout)
+    }
+
+    #[test]
+    fn xi_vt_timeout_cancelled_command_keeps_bad_match_and_state() {
+        // Mutation killed: omit the core's cancellation before it fails the
+        // still-pending request at the VT barrier timeout.
+        use crate::xinput::libinput_props::{
+            DeviceConfigError, DeviceConfigStart, DeviceConfigToken,
+        };
+        use std::io::Read;
+
+        let client = yserver_protocol::x11::ClientId(62);
+        let source = crate::xinput::InputSourceId(620);
+        let (mut state, peer, _fixture_inventory, info, device) =
+            xi_vt_config_fixture(client.0, source);
+        state.clients.get_mut(&client.0).unwrap().xi2_masks.insert(
+            (crate::resources::ROOT_WINDOW, 0),
+            u64::from(crate::xinput::XI2_PROPERTY_EVENT_MASK),
+        );
+        let mut backend = crate::backend::recording::RecordingBackend::new();
+        backend.vt_switching_armed = true;
+        backend.vt_release_pause_queued = true;
+        backend.vt_release_probe_client = Some(client.0);
+        backend.vt_release_probe_source = Some(source);
+        let release_finished = backend.vt_release_finished.clone();
+        backend
+            .device_config_start_results
+            .push_back(Ok(DeviceConfigStart::Pending(DeviceConfigToken(620))));
+        let request = xi_vt_accel_request(client, 1, device, &state, 0.75);
+        let registry_before: Vec<_> = state
+            .xi_devices
+            .devices()
+            .iter()
+            .map(|entry| {
+                (
+                    entry.id,
+                    entry.source_id,
+                    entry.enabled,
+                    entry.attached_master,
+                )
+            })
+            .collect();
+        let properties_before: Vec<_> = state
+            .xi_devices
+            .devices()
+            .iter()
+            .map(|entry| (entry.id, entry.properties.clone()))
+            .collect();
+        let held_before = (
+            state.keys_down,
+            state.buttons_down,
+            state.key_down_by_device.clone(),
+        );
+        let detached_before = state.xi2_detached_masters.clone();
+        let floating_before = state.floating_pointer_positions.clone();
+        let selections_before = (
+            state.clients[&client.0].xi2_masks.clone(),
+            state.clients[&client.0].xi1_event_classes.clone(),
+            state.clients[&client.0].xi1_window_event_classes.clone(),
+            state.clients[&client.0].event_masks.clone(),
+        );
+
+        let (state, backend, mut peer, inventory) = run_core_for_vt_test_with_timeout(
+            state,
+            backend,
+            peer,
+            std::time::Duration::from_secs(2),
+            move |sender, requests| {
+                sender
+                    .send(Message::HostInput(HostInputEvent::DeviceAdded(
+                        info.clone(),
+                    )))
+                    .unwrap();
+                send_vt_test_request(requests, request);
+                sender.send(Message::VtRelease).unwrap();
+                sender.send(Message::VtAcquire).unwrap();
+                sender
+                    .send(Message::HostInput(HostInputEvent::DeviceResumed(info)))
+                    .unwrap();
+                let late_result_sender = sender.clone_handle();
+                drop(std::thread::spawn(move || {
+                    std::thread::sleep(
+                        VT_INPUT_PAUSE_TIMEOUT + std::time::Duration::from_millis(100),
+                    );
+                    while !release_finished.load(std::sync::atomic::Ordering::SeqCst) {
+                        std::thread::yield_now();
+                    }
+                    late_result_sender
+                        .send(Message::DeviceConfigResult {
+                            token: DeviceConfigToken(620),
+                            source,
+                            result: Err(DeviceConfigError::Cancelled),
+                        })
+                        .unwrap();
+                    late_result_sender.send(Message::Shutdown).unwrap();
+                }));
+            },
+        )
+        .unwrap_or_else(|error| panic!("cancelled VT config timed out: {error:?}"));
+
+        assert!(backend.device_config_cancel_tokens[0].is_cancelled());
+        assert_eq!(backend.started_device_configs.len(), 1);
+        assert_eq!(inventory.get(source).unwrap().config.accel.current, 0.0);
+        assert_eq!(backend.vt_release_inventory_accel_before_finish, Some(0.0));
+        assert_eq!(
+            state
+                .xi_devices
+                .devices()
+                .iter()
+                .map(|entry| (
+                    entry.id,
+                    entry.source_id,
+                    entry.enabled,
+                    entry.attached_master
+                ))
+                .collect::<Vec<_>>(),
+            registry_before,
+        );
+        for (id, properties) in properties_before {
+            assert_eq!(state.xi_devices.device(id).unwrap().properties, properties);
+        }
+        let mut error = [0; 32];
+        peer.read_exact(&mut error).unwrap();
+        assert_eq!(error[0], 0);
+        assert_eq!(error[1], yserver_protocol::x11::error::BAD_MATCH);
+        peer.set_nonblocking(true).unwrap();
+        let mut extra = [0; 1];
+        assert!(
+            matches!(peer.read(&mut extra), Err(ref err) if err.kind() == io::ErrorKind::WouldBlock),
+            "cancelled result emits no property event or second reply",
+        );
+        assert_eq!(
+            (
+                state.keys_down,
+                state.buttons_down,
+                state.key_down_by_device.clone(),
+            ),
+            held_before,
+        );
+        assert_eq!(state.xi2_detached_masters, detached_before);
+        assert_eq!(state.floating_pointer_positions, floating_before);
+        assert_eq!(
+            (
+                state.clients[&client.0].xi2_masks.clone(),
+                state.clients[&client.0].xi1_event_classes.clone(),
+                state.clients[&client.0].xi1_window_event_classes.clone(),
+                state.clients[&client.0].event_masks.clone(),
+            ),
+            selections_before,
+        );
     }
 
     #[test]
@@ -4852,7 +5093,7 @@ mod tests {
             state.clients[&client.0].event_masks.clone(),
         );
 
-        let (state, backend, _peer) = run_core_for_vt_test_with_timeout(
+        let (state, backend, _peer, _inventory) = run_core_for_vt_test_with_timeout(
             state,
             backend,
             peer,
@@ -4915,16 +5156,21 @@ mod tests {
     }
 
     #[test]
-    fn xi_vt_release_config_write_unacknowledged_barrier_times_out_bad_match() {
-        // Mutation killed: replace the bounded pause-barrier receive with an
-        // unbounded receive, leaving the client write blocked indefinitely.
+    fn xi_vt_timeout_late_applied_reconciles_inventory_property_and_event() {
+        // Mutation killed: discard a timed-out operation's late Applied
+        // result instead of reconciling its confirmed state without a reply.
         use crate::xinput::libinput_props::{DeviceConfigStart, DeviceConfigToken};
         use std::io::Read;
 
         let client = yserver_protocol::x11::ClientId(61);
         let source = crate::xinput::InputSourceId(610);
-        let (state, peer, _fixture_inventory, info, device) =
+        let (mut state, peer, _fixture_inventory, info, device) =
             xi_vt_config_fixture(client.0, source);
+        let accel_atom = state.atoms.id_for("libinput Accel Speed").unwrap();
+        state.clients.get_mut(&client.0).unwrap().xi2_masks.insert(
+            (crate::resources::ROOT_WINDOW, 0),
+            u64::from(crate::xinput::XI2_PROPERTY_EVENT_MASK),
+        );
         let mut backend = crate::backend::recording::RecordingBackend::new();
         backend.vt_switching_armed = true;
         backend.vt_release_pause_queued = true;
@@ -4972,7 +5218,7 @@ mod tests {
         );
 
         let started_at = Instant::now();
-        let (state, backend, mut peer) = run_core_for_vt_test_with_timeout(
+        let (state, backend, mut peer, inventory) = run_core_for_vt_test_with_timeout(
             state,
             backend,
             peer,
@@ -5021,23 +5267,72 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst)
         );
         assert_eq!(backend.started_device_configs.len(), 1);
+        assert!(
+            backend.device_config_cancel_tokens[0].is_cancelled(),
+            "VT timeout shares cancellation with the submitted input command",
+        );
         let mut error = [0; 32];
         peer.read_exact(&mut error).unwrap();
         assert_eq!(error[0], 0);
         assert_eq!(error[1], yserver_protocol::x11::error::BAD_MATCH);
         for (id, properties) in property_maps_before {
-            assert_eq!(
-                state.xi_devices.device(id).unwrap().properties,
-                properties,
-                "timed-out writes do not change device property maps",
-            );
+            let current = &state.xi_devices.device(id).unwrap().properties;
+            if id == device {
+                assert_eq!(current.len(), properties.len());
+                for (property, previous) in properties {
+                    let actual = current.get(&property).expect("property remains present");
+                    if property == accel_atom {
+                        assert_eq!(actual.data, 0.75_f32.to_le_bytes());
+                        assert_eq!(actual.format, previous.format);
+                        assert_eq!(actual.type_atom, previous.type_atom);
+                    } else {
+                        assert_eq!(actual, &previous);
+                    }
+                }
+            } else {
+                assert_eq!(current, &properties);
+            }
         }
         assert_eq!(backend.vt_release_inventory_accel_before_finish, Some(0.0));
+        assert_eq!(
+            inventory.get(source).unwrap().config.accel.current,
+            0.75,
+            "confirmed late result updates the process-lifetime inventory",
+        );
+        assert_eq!(
+            state
+                .xi_devices
+                .source(source)
+                .unwrap()
+                .config
+                .accel
+                .current,
+            0.75,
+            "confirmed late result updates the active XI source snapshot",
+        );
+        let mut property_event = [0; 32];
+        peer.read_exact(&mut property_event).unwrap();
+        assert_eq!(property_event[0], 35, "XI2 GenericEvent");
+        assert_eq!(
+            u16::from_le_bytes([property_event[8], property_event[9]]),
+            12,
+            "XI_PropertyEvent follows reconciliation",
+        );
+        assert_eq!(
+            u16::from_le_bytes([property_event[10], property_event[11]]),
+            device,
+            "property event names the current facet",
+        );
+        assert_eq!(
+            u32::from_le_bytes(property_event[16..20].try_into().unwrap()),
+            accel_atom.0,
+        );
+        assert_eq!(property_event[20], 2, "what = Modified");
         peer.set_nonblocking(true).unwrap();
         let mut late_reply = [0; 1];
         assert!(
             matches!(peer.read(&mut late_reply), Err(ref err) if err.kind() == io::ErrorKind::WouldBlock),
-            "resume must not emit a second or delayed answer for the pre-pause write",
+            "late reconciliation emits no second reply",
         );
         assert_eq!(
             state

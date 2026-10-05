@@ -531,6 +531,8 @@ pub struct RecordingBackend {
         crate::xinput::InputSourceId,
         crate::xinput::libinput_props::DeviceConfigChange,
     )>,
+    /// Shared cancellation handles passed with submitted input commands.
+    pub device_config_cancel_tokens: Vec<crate::xinput::libinput_props::DeviceConfigCancelToken>,
     /// Results returned by successive `start_device_config` calls. Empty
     /// means each setting is confirmed synchronously.
     pub device_config_start_results: VecDeque<
@@ -657,6 +659,7 @@ impl RecordingBackend {
             arm_present_syncobj_wait_result: None,
             present_skip_count: 0,
             started_device_configs: Vec::new(),
+            device_config_cancel_tokens: Vec::new(),
             device_config_start_results: VecDeque::new(),
             vt_switching_armed: false,
             vt_release_pause_queued: false,
@@ -985,11 +988,13 @@ impl Backend for RecordingBackend {
         &mut self,
         source: crate::xinput::InputSourceId,
         change: crate::xinput::libinput_props::DeviceConfigChange,
+        cancel: crate::xinput::libinput_props::DeviceConfigCancelToken,
     ) -> Result<
         crate::xinput::libinput_props::DeviceConfigStart,
         crate::xinput::libinput_props::DeviceConfigError,
     > {
         self.started_device_configs.push((source, change));
+        self.device_config_cancel_tokens.push(cancel);
         self.device_config_start_results.pop_front().unwrap_or(Ok(
             crate::xinput::libinput_props::DeviceConfigStart::Applied,
         ))

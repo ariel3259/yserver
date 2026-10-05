@@ -21269,15 +21269,19 @@ impl KmsBackend {
     /// captured while attached, then explicitly handed to the emitter before
     /// the live facet is floated.
     fn publish_disabled_xi_facet(state: &mut ServerState, device_id: u16) {
-        if !state
+        let was_enabled = state
             .xi_devices
             .device(device_id)
-            .is_some_and(|device| device.enabled)
-        {
+            .is_some_and(|device| device.enabled);
+
+        // Session state is independent of client disable. A facet the client
+        // already disabled still needs to remember that the VT went away so
+        // a Device Enabled=1 write cannot reattach it before resume.
+        state.xi_set_facet_session_enabled(device_id, false);
+        if !was_enabled {
             return;
         }
 
-        state.xi_set_facet_session_enabled(device_id, false);
         yserver_core::xinput::hotplug::publish_facet_disabled(state, device_id);
     }
 
@@ -24091,6 +24095,7 @@ impl Backend for KmsBackend {
         &mut self,
         source: yserver_core::xinput::InputSourceId,
         change: yserver_core::xinput::libinput_props::DeviceConfigChange,
+        cancel: yserver_core::xinput::libinput_props::DeviceConfigCancelToken,
     ) -> Result<
         yserver_core::xinput::libinput_props::DeviceConfigStart,
         yserver_core::xinput::libinput_props::DeviceConfigError,
@@ -24110,7 +24115,7 @@ impl Backend for KmsBackend {
             self.next_device_config_token.max(1),
         );
         self.next_device_config_token = token.0.wrapping_add(1).max(1);
-        control.push_config(token, source, change);
+        control.push_config(token, source, change, cancel);
         Ok(yserver_core::xinput::libinput_props::DeviceConfigStart::Pending(token))
     }
 
@@ -46741,6 +46746,356 @@ mod tests {
             &mut backend,
             SOURCE,
             &original_core_properties,
+        );
+    }
+
+    #[test]
+    fn xi_session_disable_client_disabled_facet_reenables_only_after_resume() {
+        use yserver_core::{
+            backend::Backend,
+            core_loop::HostInputEvent,
+            server::ServerState,
+            xinput::{InputSourceId, XiFacetKind},
+        };
+
+        // Mutation killed: return before recording session_enabled=false for
+        // an already client-disabled facet, so Device Enabled=1 reattaches it
+        // during suspension.
+        const SOURCE: InputSourceId = InputSourceId(0xD4_07);
+        let mut state = ServerState::new();
+        let original_core_properties =
+            [2, 3, 4, 5].map(|id| state.xi_devices.device(id).unwrap().properties.clone());
+        let mut backend = KmsBackend::for_tests();
+        let mut peer = kbd_map_client_id(&mut state, 5);
+        let info = dynamic_test_device(SOURCE, false, true);
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceAdded(info.clone()),
+        );
+        let pointer = state
+            .xi_devices
+            .facet(SOURCE, XiFacetKind::PointerTouch)
+            .expect("physical pointer facet");
+        select_device_enabled_transition_events(&mut state, &mut backend, pointer, 1);
+        assert!(kbd_map_drain(&mut peer).is_empty());
+        assert_eq!(state.xi_devices.source_ids(), [SOURCE]);
+        let registry_ids_before = state
+            .xi_devices
+            .devices()
+            .iter()
+            .map(|device| device.id)
+            .collect::<Vec<_>>();
+        let properties_before = state
+            .xi_devices
+            .devices()
+            .iter()
+            .map(|device| (device.id, device.properties.clone()))
+            .collect::<Vec<_>>();
+        let selections_before = (
+            state.clients[&5].xi2_masks.clone(),
+            state.clients[&5].xi1_event_classes.clone(),
+            state.clients[&5].xi1_window_event_classes.clone(),
+            state.clients[&5].event_masks.clone(),
+        );
+
+        let disable = device_enabled_write_body_xi2(
+            pointer,
+            state.xi_device_enabled_atom.0,
+            8,
+            yserver_core::xinput::XA_INTEGER.0,
+            &[0],
+        );
+        let disabled =
+            device_enabled_request_bytes(&mut state, &mut backend, &mut peer, 57, 4, &disable);
+        assert_eq!(
+            device_enabled_event_kinds(&disabled),
+            [
+                "xi2-property",
+                "xi1-property",
+                "presence",
+                "hierarchy",
+                "xi2-property",
+                "xi1-property"
+            ]
+        );
+        assert!(state.xi_devices.device(pointer).unwrap().client_disabled);
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceSuspended { source_id: SOURCE },
+        );
+        assert!(kbd_map_drain(&mut peer).is_empty());
+        let suspended_device = state.xi_devices.device(pointer).unwrap();
+        assert!(!suspended_device.session_enabled);
+        assert!(suspended_device.client_disabled);
+        assert!(!suspended_device.enabled);
+        assert_eq!(suspended_device.attached_master, None);
+        assert_eq!(
+            suspended_device.properties[&state.xi_device_enabled_atom].data,
+            [0]
+        );
+        assert!(state.xi2_detached_masters.is_empty());
+        assert!(state.floating_pointer_positions.is_empty());
+
+        let enable_while_suspended = device_enabled_write_body_xi2(
+            pointer,
+            state.xi_device_enabled_atom.0,
+            8,
+            yserver_core::xinput::XA_INTEGER.0,
+            &[1],
+        );
+        let suspended_enable_events = device_enabled_request_bytes(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            57,
+            5,
+            &enable_while_suspended,
+        );
+        assert_eq!(
+            device_enabled_event_kinds(&suspended_enable_events),
+            ["xi2-property", "xi1-property"],
+            "a client preference write while away has no Enabled transition events",
+        );
+        let suspended_device = state.xi_devices.device(pointer).unwrap();
+        assert!(!suspended_device.session_enabled);
+        assert!(!suspended_device.client_disabled);
+        assert!(!suspended_device.enabled);
+        assert_eq!(suspended_device.attached_master, None);
+        assert_eq!(
+            suspended_device.properties[&state.xi_device_enabled_atom].data,
+            [1],
+            "the client's nonzero value is stored while the session remains away",
+        );
+        assert!(state.xi2_detached_masters.is_empty());
+        assert!(state.floating_pointer_positions.is_empty());
+
+        let mut resumed = info;
+        resumed.enabled = true;
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceResumed(resumed),
+        );
+        assert_eq!(
+            device_enabled_event_kinds(&kbd_map_drain(&mut peer)),
+            ["xi2-property", "xi1-property", "presence", "hierarchy"],
+            "resume publishes one normal enable sequence",
+        );
+        let enabled_device = state.xi_devices.device(pointer).unwrap();
+        assert!(enabled_device.session_enabled);
+        assert!(!enabled_device.client_disabled);
+        assert!(enabled_device.enabled);
+        assert_eq!(enabled_device.attached_master, Some(2));
+        assert_eq!(
+            enabled_device.properties[&state.xi_device_enabled_atom].data,
+            [1]
+        );
+        assert_eq!(
+            state
+                .xi_devices
+                .devices()
+                .iter()
+                .map(|device| device.id)
+                .collect::<Vec<_>>(),
+            registry_ids_before,
+        );
+        assert_eq!(state.xi_devices.source_ids(), [SOURCE]);
+        assert_eq!(
+            state
+                .xi_devices
+                .devices()
+                .iter()
+                .map(|device| (device.id, device.properties.clone()))
+                .collect::<Vec<_>>(),
+            properties_before
+                .into_iter()
+                .map(|(id, mut properties)| {
+                    if id == pointer {
+                        properties.insert(
+                            state.xi_device_enabled_atom,
+                            enabled_device.properties[&state.xi_device_enabled_atom].clone(),
+                        );
+                    }
+                    (id, properties)
+                })
+                .collect::<Vec<_>>(),
+        );
+        assert!(state.keys_down.iter().all(|byte| *byte == 0));
+        assert_eq!(state.buttons_down, 0);
+        assert!(state.key_down_by_device.is_empty());
+        assert!(state.xi2_detached_masters.is_empty());
+        assert!(state.floating_pointer_positions.is_empty());
+        assert_eq!(
+            (
+                state.clients[&5].xi2_masks.clone(),
+                state.clients[&5].xi1_event_classes.clone(),
+                state.clients[&5].xi1_window_event_classes.clone(),
+                state.clients[&5].event_masks.clone(),
+            ),
+            selections_before,
+        );
+
+        assert_device_enabled_write_cleanup(
+            &mut state,
+            &mut backend,
+            SOURCE,
+            &original_core_properties,
+        );
+    }
+
+    #[test]
+    fn xi1_button_shape_set_mapping_is_busy_while_changed_button_held() {
+        use yserver_core::{
+            backend::Backend,
+            core_loop::{HostInputEvent, InputOrigin},
+            server::ServerState,
+            xinput::{InputSourceId, XiFacetKind},
+        };
+        // Mutation killed: skip ApplyPointerMapping's changed-held-button check,
+        // so SetDeviceButtonMapping incorrectly succeeds while Button1 is down.
+        let mut state = ServerState::new();
+        let mut backend = KmsBackend::for_tests();
+        let mut peer = kbd_map_client_id(&mut state, 5);
+        let source = InputSourceId(0xB071);
+        let info = dynamic_test_device(source, false, true);
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::DeviceAdded(info.clone()),
+        );
+        let device = state
+            .xi_devices
+            .facet(source, XiFacetKind::PointerTouch)
+            .expect("dynamic pointer facet");
+        assert!(state.xi_devices.device(device).unwrap().enabled);
+        let source_ids_before = state.xi_devices.source_ids();
+        let device_ids_before: Vec<_> = state
+            .xi_devices
+            .devices()
+            .iter()
+            .map(|device| device.id)
+            .collect();
+        let properties_before: Vec<_> = state
+            .xi_devices
+            .devices()
+            .iter()
+            .map(|device| (device.id, device.properties.clone()))
+            .collect();
+        let detached_before = state.xi2_detached_masters.clone();
+        let floating_before = state.floating_pointer_positions.clone();
+        let selections_before = (
+            state.clients[&5].xi2_masks.clone(),
+            state.clients[&5].xi1_event_classes.clone(),
+            state.clients[&5].xi1_window_event_classes.clone(),
+            state.clients[&5].event_masks.clone(),
+        );
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::PointerButton {
+                origin: InputOrigin::Physical(source),
+                button: 0x110, // BTN_LEFT -> Button1
+                pressed: true,
+                time: 1,
+            },
+        );
+        assert_eq!(state.xi_devices.device(device).unwrap().buttons_down & 1, 1);
+        let held = state
+            .xi1_device_input_state
+            .get(&device)
+            .expect("host ButtonPress updates XI1 held state");
+        assert_eq!(
+            held.buttons_down[0] & 0b10,
+            0b10,
+            "Button1 held through input path"
+        );
+        assert_eq!(state.xi_devices.device(device).unwrap().buttons_down & 1, 1);
+
+        let mut map_body = vec![u8::try_from(device).unwrap(), 7, 0, 0];
+        map_body.extend_from_slice(&[2, 1, 3, 4, 5, 6, 7]);
+        device_enabled_xi_request(&mut state, &mut backend, 29, 2, &map_body);
+        let response = kbd_map_drain(&mut peer);
+        assert_eq!(response.len(), 32, "MappingBusy is only the reply");
+        assert_eq!((response[0], response[8]), (1, 1), "MappingBusy");
+
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::PointerButton {
+                origin: InputOrigin::Physical(source),
+                button: 0x110,
+                pressed: false,
+                time: 2,
+            },
+        );
+        assert_eq!(state.xi_devices.device(device).unwrap().buttons_down, 0);
+        assert_eq!(
+            state
+                .xi1_device_input_state
+                .get(&device)
+                .unwrap()
+                .buttons_down[0],
+            0
+        );
+        assert!(
+            !state.xi1_button_map.contains_key(&device),
+            "busy map is not committed"
+        );
+        assert_eq!(state.xi_devices.source_ids(), source_ids_before);
+        assert_eq!(
+            state
+                .xi_devices
+                .devices()
+                .iter()
+                .map(|device| device.id)
+                .collect::<Vec<_>>(),
+            device_ids_before,
+            "no registry device was added or lost",
+        );
+        assert_eq!(
+            state
+                .xi_devices
+                .devices()
+                .iter()
+                .map(|device| (device.id, device.properties.clone()))
+                .collect::<Vec<_>>(),
+            properties_before,
+            "mapping refusal leaves property maps unchanged",
+        );
+        assert_eq!(state.buttons_down, 0);
+        assert!(
+            state
+                .xi_devices
+                .devices()
+                .iter()
+                .all(|device| device.buttons_down == 0)
+        );
+        assert!(
+            state
+                .xi1_device_input_state
+                .values()
+                .all(|input| input.buttons_down.iter().all(|byte| *byte == 0))
+        );
+        assert_eq!(state.xi2_detached_masters, detached_before);
+        assert_eq!(state.floating_pointer_positions, floating_before);
+        assert_eq!(
+            (
+                &state.clients[&5].xi2_masks,
+                &state.clients[&5].xi1_event_classes,
+                &state.clients[&5].xi1_window_event_classes,
+                &state.clients[&5].event_masks,
+            ),
+            (
+                &selections_before.0,
+                &selections_before.1,
+                &selections_before.2,
+                &selections_before.3,
+            ),
+            "no client selection state changed",
         );
     }
 

@@ -944,6 +944,7 @@ pub trait Backend {
         &mut self,
         _source: crate::xinput::InputSourceId,
         _change: crate::xinput::libinput_props::DeviceConfigChange,
+        _cancel: crate::xinput::libinput_props::DeviceConfigCancelToken,
     ) -> Result<
         crate::xinput::libinput_props::DeviceConfigStart,
         crate::xinput::libinput_props::DeviceConfigError,
