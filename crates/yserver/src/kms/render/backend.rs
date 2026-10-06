@@ -19493,6 +19493,10 @@ fn ensure_scanout_readback_op<'a>(
 /// allocates once, and the per-row reads that follow fit.
 const SCANOUT_READBACK_GRANULE: u64 = 1024 * 1024;
 
+/// How often an otherwise idle server re-polls the fences of freed
+/// drawables parked in `pending_retire`.
+const PENDING_RETIRE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
+
 /// Return the platform's scanout readback buffer, (re)allocating it when it
 /// is missing, smaller than `needed_bytes`, or from another `VkContext`.
 fn ensure_scanout_readback(
@@ -22167,10 +22171,16 @@ impl Backend for KmsBackend {
         let rescan_deadline = self
             .hotplug_rescan_deadline
             .map(|until| if now >= until { now } else { until });
+        // A drawable freed while its GPU work was in flight waits in
+        // `pending_retire` for `before_block` to see its fence signal; with
+        // no other activity nothing would wake us to release it.
+        let retire_deadline =
+            (self.store.pending_retire_count() > 0).then(|| now + PENDING_RETIRE_POLL_INTERVAL);
         scene_deadline
             .into_iter()
             .chain(present_deadline)
             .chain(rescan_deadline)
+            .chain(retire_deadline)
             // Not gated on `allow_kms_timers`: `maybe_composite` closes the
             // paint frame on its timeout while dark too (#177).
             .chain(self.engine.open_frame_timeout_deadline())
@@ -44150,6 +44160,48 @@ mod tests {
         b.platform.wait_idle_bounded();
         b.poll_pending_retire_with_invalidate();
         assert!(b.store.get(sprite).is_none(), "sprite pixmap released");
+    }
+
+    /// A pixmap freed while its clear is in flight is parked; an otherwise
+    /// idle server must still wake to release it once the fence signals.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn idle_server_wakes_to_release_a_pixmap_freed_in_flight() {
+        use yserver_core::backend::Backend;
+        let mut b = match KmsBackend::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+        // Display dark: no compose deadline, so any wake is the retire poll.
+        b.kms_outputs_active = false;
+        let xid = b.create_pixmap(None, 32, 61, 59).expect("pixmap").as_raw();
+        let id = b.store.lookup(xid).expect("pixmap in store");
+        b.free_pixmap(None, xid).expect("free pixmap");
+        assert_eq!(b.store.pending_retire_count(), 1, "clear still in flight");
+        b.engine
+            .close_open_frame(
+                &mut b.store,
+                &mut b.platform,
+                crate::kms::render::frame_builder::CloseReason::SyncWait,
+            )
+            .expect("close frame");
+        b.engine
+            .flush_submit_group(
+                &mut b.store,
+                &mut b.platform,
+                crate::kms::render::submit_group::FlushReason::SyncBoundary,
+            )
+            .expect("flush");
+        let wake = b.next_wakeup().expect("parked pixmap schedules a wake");
+        assert!(wake <= std::time::Instant::now() + super::PENDING_RETIRE_POLL_INTERVAL);
+        b.platform.wait_idle_bounded();
+        b.before_block();
+        assert!(b.store.get(id).is_none(), "freed pixmap released on wake");
+        assert_eq!(b.store.pending_retire_count(), 0);
+        assert!(b.next_wakeup().is_none(), "nothing left to wake for");
     }
 
     /// A GrabPointer cursor is the top-priority sprite: it overrides the
