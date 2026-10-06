@@ -151,6 +151,12 @@ pub enum ArbiterInput<I> {
         tag: TransitionTag<I>,
         outcome: RecoveryAttemptOutcome,
     },
+    /// Qualification of a reopened NormalRecovery incarnation. The old
+    /// transition tag is checked before the arbiter adopts the fresh identity.
+    RecoveryQualified {
+        tag: TransitionTag<I>,
+        incarnation: I,
+    },
     DeviceStateChanged(DeviceLifecycleState),
     /// A read-only seat ownership observation from the existing VT path.
     /// It updates the external prerequisite and retries bounded convergence,
@@ -456,8 +462,13 @@ impl<O: Ord, I: Clone + Eq> LifecycleArbiter<O, I> {
                 self.apply_allocated_incident(event_id, incident)
             }
             ArbiterInput::RecoveryAttempt { tag, outcome } => {
-                self.apply_recovery_attempt(tag, outcome)
+                self.apply_recovery_attempt(tag, outcome, None)
             }
+            ArbiterInput::RecoveryQualified { tag, incarnation } => self.apply_recovery_attempt(
+                tag,
+                RecoveryAttemptOutcome::Qualified,
+                Some(incarnation),
+            ),
             ArbiterInput::DeviceStateChanged(state) => {
                 self.state = state;
                 if state == DeviceLifecycleState::Ready && self.transition.is_none() {
@@ -528,7 +539,9 @@ impl<O: Ord, I: Clone + Eq> LifecycleArbiter<O, I> {
         // Admission closes before the snapshot changes or any representative
         // is invalidated. The current transition already owns the close if it
         // exists; a new transition publishes a tagged close below.
-        if let Some(active) = self.transition {
+        let poisoned_dpms_projection =
+            self.state == DeviceLifecycleState::Poisoned && kind == LifecycleKind::DPMS;
+        if !poisoned_dpms_projection && let Some(active) = self.transition {
             if kind.outranks(active.kind) {
                 let old_tag = self.tag_for(active.id, self.epoch);
                 self.force_epoch_bump(&mut actions);
@@ -1167,7 +1180,20 @@ impl<O: Ord, I: Clone + Eq> LifecycleArbiter<O, I> {
         if outcome.logical.release_seat {
             actions.push(LifecycleAction::ReleaseSeat(work_tag.clone()));
         }
-        if outcome.logical.withdraw_protocol_work || row == CompletionUnknownRow::VTRelease {
+        // NormalLive's Table U logical obligation also terminalizes protocol
+        // work affected by the lost completion, but a recoverable live loss
+        // does not withdraw the still-published topology. The one output
+        // withdrawal belongs to the attempt's terminal failure (or to a
+        // higher-priority teardown row), preserving decision 2 while the
+        // acquire reinstall is in progress.
+        let recovery_still_live = row == CompletionUnknownRow::NormalLive
+            && (outcome.recovery.new_incident.is_some()
+                || outcome.recovery.current_incident.is_some_and(|incident| {
+                    incident.state() != super::RecoveryIncidentState::RecoveryFailed
+                }));
+        if outcome.logical.withdraw_protocol_work && !recovery_still_live
+            || row == CompletionUnknownRow::VTRelease
+        {
             actions.push(LifecycleAction::WithdrawOutputs(work_tag.clone()));
         }
         if outcome.logical.withdraw_protocol_work {
@@ -1308,6 +1334,7 @@ impl<O: Ord, I: Clone + Eq> LifecycleArbiter<O, I> {
         &mut self,
         tag: TransitionTag<I>,
         outcome: RecoveryAttemptOutcome,
+        recovered_incarnation: Option<I>,
     ) -> Vec<LifecycleAction<I>> {
         if !self.is_current_transition_tag(&tag) {
             return vec![LifecycleAction::StaleResultIgnored {
@@ -1363,6 +1390,11 @@ impl<O: Ord, I: Clone + Eq> LifecycleArbiter<O, I> {
                 self.coalesced_epoch_bumped = false;
                 match outcome {
                     RecoveryAttemptOutcome::Qualified => {
+                        if active.kind == LifecycleKind::NormalRecovery
+                            && let Some(incarnation) = recovered_incarnation
+                        {
+                            self.incarnation = incarnation;
+                        }
                         self.recovery = resolution.incident;
                         if resolution.representative_disposition.is_none()
                             || active.kind != LifecycleKind::NormalRecovery

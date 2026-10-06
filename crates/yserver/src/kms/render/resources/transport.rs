@@ -582,4 +582,27 @@ impl TransportGate {
         self.state = TransportState::Owner;
         Ok(())
     }
+
+    /// Bind a newly opened, barrier-qualified incarnation to the existing
+    /// Owner transport. The previous gate must already be force-closed and
+    /// drained; replacing its shared flags leaves all stale handles closed.
+    pub(crate) fn bind_recovered_incarnation(
+        &mut self,
+        incarnation: IncarnationId,
+    ) -> Result<(), ResourceError> {
+        if self.state() != TransportState::Closed
+            || self.outstanding_owner_writes != 0
+            || self.incarnation.next() != incarnation
+        {
+            return Err(ResourceError::InvalidProof);
+        }
+        self.incarnation = incarnation;
+        self.state = TransportState::Owner;
+        self.closed_admission = Rc::new(Cell::new(false));
+        self.forced_closed = Rc::new(Cell::new(false));
+        self.outstanding_owner_writes = 0;
+        self.next_serial = 0;
+        self.issued_serials.clear();
+        Ok(())
+    }
 }

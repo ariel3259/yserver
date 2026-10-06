@@ -4136,7 +4136,7 @@ impl SceneCompositor {
         resource_service: Option<&mut ResourceService>,
     ) {
         if let Some(inner) = self.inner.as_mut() {
-            drain_retired_output_bundles(inner, platform, resource_service);
+            drain_retired_output_bundles(inner, platform, resource_service, None);
         }
     }
 
@@ -4879,11 +4879,12 @@ impl SceneCompositor {
         &mut self,
         platform: &mut PlatformBackend,
         resource_service: Option<&mut ResourceService>,
+        cleanup_registry: Option<&mut crate::kms::render::resources::DrmCleanupRegistry>,
     ) {
         let Some(inner) = self.inner.as_mut() else {
             return;
         };
-        drain_retired_output_bundles(inner, platform, resource_service);
+        drain_retired_output_bundles(inner, platform, resource_service, cleanup_registry);
     }
 
     /// True while one specific output has an atomic pageflip awaiting
@@ -5295,7 +5296,7 @@ impl SceneCompositor {
         if platform.renderer_failed {
             return Ok(Vec::new());
         }
-        drain_retired_output_bundles(inner, platform, resource_service.as_deref_mut());
+        drain_retired_output_bundles(inner, platform, resource_service.as_deref_mut(), None);
         if platform.renderer_failed {
             return Ok(Vec::new());
         }
@@ -5856,6 +5857,15 @@ fn handle_scanout_render_completion_inner(
         };
         let state = &mut inner.outputs[output_idx];
         let mut prepared = state.owner_buffers.remove(owner_buffer_index);
+        // This exact render-completion notification proves the Vulkan
+        // submission has finished. CompletionUnknown may immediately
+        // quarantine and drop the owner buffer; preserve the independent
+        // render proof on its CPU fence ticket so KMS-only recovery does not
+        // falsely latch `renderer_failed` while dropping an already-finished
+        // submission.
+        if let Some(ticket) = prepared.pending_ack().and_then(|ack| ack.ticket.as_ref()) {
+            ticket.mark_signaled_from_render_completion();
+        }
         let Some(batch) = prepared
             .pending_ack_mut()
             .and_then(|ack| ack.managed_batch.take())
@@ -6311,6 +6321,13 @@ fn handle_retired_scanout_render_completion(
         }
     }
     if completion_stage == ScanoutRenderCompletionStage::Render {
+        // This exact retired-job completion is independent proof that the
+        // original render submission is finished. The ticket can be dropped
+        // once the quarantined retired buffer drains, so retain that proof
+        // before releasing it.
+        if let Some(ticket) = buffer.pending_ack().and_then(|ack| ack.ticket.as_ref()) {
+            ticket.mark_signaled_from_render_completion();
+        }
         let Some(batch) = buffer
             .pending_ack_mut()
             .and_then(|ack| ack.managed_batch.take())
@@ -7191,6 +7208,7 @@ fn drain_retired_output_bundles(
     inner: &mut SceneCompositorInner,
     platform: &mut PlatformBackend,
     mut resource_service: Option<&mut ResourceService>,
+    mut cleanup_registry: Option<&mut crate::kms::render::resources::DrmCleanupRegistry>,
 ) {
     let vk = Arc::clone(&inner.vk);
     inner.retired_outputs.retain(|_, bundles| {
@@ -7213,6 +7231,11 @@ fn drain_retired_output_bundles(
                 platform,
                 resource_service.as_deref(),
             );
+            if retired_output_bundle_ready_for_release(bundle, resource_service.as_deref())
+                && let Some(registry) = cleanup_registry.as_deref_mut()
+            {
+                bundle.pool.detach_managed_entries(Some(registry));
+            }
         }
         bundles.retain(|bundle| {
             !retired_output_bundle_is_drained(bundle, resource_service.as_deref())
@@ -7222,6 +7245,30 @@ fn drain_retired_output_bundles(
 }
 
 fn retired_output_bundle_is_drained(
+    bundle: &RetiredOutputBundle,
+    resource_service: Option<&ResourceService>,
+) -> bool {
+    retired_output_bundle_ready_for_release(bundle, resource_service)
+        && !retired_pool_has_managed_entries(&bundle.pool)
+}
+
+fn retired_pool_has_managed_entries(pool: &OutputScanout) -> bool {
+    match pool {
+        OutputScanout::Shared(pool) => pool.bos.iter().any(|bo| bo.managed_key().is_some()),
+        OutputScanout::Copied(pool) => {
+            pool.destinations
+                .bos
+                .iter()
+                .any(|bo| bo.managed_key().is_some())
+                || pool
+                    .sources
+                    .iter()
+                    .any(|source| source.managed_key().is_some())
+        }
+    }
+}
+
+fn retired_output_bundle_ready_for_release(
     bundle: &RetiredOutputBundle,
     resource_service: Option<&ResourceService>,
 ) -> bool {

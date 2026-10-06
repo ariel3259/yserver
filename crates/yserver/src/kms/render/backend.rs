@@ -90,7 +90,6 @@ enum NormalRecoveryAttemptResult {
     Failed,
     #[allow(dead_code)]
     CompletionUnknown,
-    Unavailable,
 }
 
 type NormalRecoveryAttemptRuntime = Box<
@@ -123,6 +122,19 @@ type NormalRecoveryScanoutSetup = Box<
         &mut crate::kms::render::resources::ResourceService,
         &mut crate::kms::render::resources::DrmCleanupRegistry,
     ) -> io::Result<()>,
+>;
+
+pub(super) type AcquirePreparedScanoutAllocator = Box<
+    dyn FnMut(
+        &mut PlatformBackend,
+        Rc<drm::Device>,
+        &crate::platform::drm::Output,
+        crate::kms::scanout_route::ScanoutRoute,
+        u32,
+        u32,
+        bool,
+        usize,
+    ) -> io::Result<crate::kms::vk::scanout::OutputScanout>,
 >;
 
 struct PendingNormalRecovery {
@@ -2150,6 +2162,7 @@ pub struct KmsBackend {
     /// open, clock probing, and worker-backed rediscovery.
     normal_recovery_attempt: NormalRecoveryAttemptRuntime,
     normal_recovery_attempt_scripted: bool,
+    pub(super) acquire_prepared_scanout_allocator: AcquirePreparedScanoutAllocator,
     normal_recovery_device_opener: NormalRecoveryDeviceOpener,
     normal_recovery_scanout_setup: NormalRecoveryScanoutSetup,
     pending_normal_recovery_handshakes: HashMap<DrmDeviceKey, PendingNormalRecoveryHandshake>,
@@ -3116,13 +3129,21 @@ impl LiveKmsCrtcSnapshot {
     fn restore(&self, device: &drm::Device) -> io::Result<()> {
         use ::drm::control::Device as ControlDevice;
 
-        device.set_crtc(
-            self.crtc,
-            self.framebuffer,
-            self.position,
-            &self.connectors,
-            self.mode,
-        )
+        if self.framebuffer.is_none() {
+            // A CRTC with no framebuffer is inactive even when a driver
+            // reports its last programmed mode. Restore that state by
+            // disabling the CRTC; legacy SetCrtc cannot install a mode with
+            // FB_ID zero.
+            device.set_crtc(self.crtc, None, self.position, &[], None)
+        } else {
+            device.set_crtc(
+                self.crtc,
+                self.framebuffer,
+                self.position,
+                &self.connectors,
+                self.mode,
+            )
+        }
     }
 }
 
@@ -3446,8 +3467,11 @@ impl KmsBackend {
     /// `on_owner_completion_ready` and the hardware tests' drive loop --
     /// so none of them can omit a step (addenda A1, A2).
     pub(crate) fn service_retired_outputs(&mut self) {
-        self.scene
-            .service_retired_output_bundles(&mut self.platform, self.resource_service.as_mut());
+        self.scene.service_retired_output_bundles(
+            &mut self.platform,
+            self.resource_service.as_mut(),
+            self.drm_cleanup_registry.as_mut(),
+        );
         self.service_resource_releases_after_retired_outputs();
     }
 
@@ -3851,6 +3875,18 @@ impl KmsBackend {
                 cleanup_registry: old_registry,
                 scanout_pools: old_scanout_pools,
             });
+        if let Some(gate) = self.platform.transport_gate_mut(&device)
+            && let Err(error) = gate.bind_recovered_incarnation(new_incarnation)
+        {
+            log::error!("kms: NormalRecovery transport rebind for {device} failed: {error:?}");
+            self.finish_normal_recovery_attempt(
+                device,
+                recovery_id,
+                tag,
+                NormalRecoveryAttemptResult::Failed,
+            );
+            return;
+        }
         if let Some(new_device) = new_device {
             self.resource_service = Some(crate::kms::render::resources::ResourceService::new(
                 device,
@@ -3862,6 +3898,18 @@ impl KmsBackend {
                     device,
                     new_incarnation,
                 ));
+            // The old incarnation's completion source is retired with its
+            // family. The poller is shared by PlatformBackend, so it must be
+            // attached again before the fresh install can contribute fence
+            // evidence to qualification.
+            self.platform.owner_completion_detached = false;
+        }
+        if let Some(conductor) = self.admission_conductors.get_mut(&device) {
+            // Poison stops work on the retired incarnation. Once the fresh
+            // Owner exists, permit only its lifecycle reinstall; ordinary
+            // admission remains closed until the arbiter qualifies it.
+            conductor.recovery_stopped = false;
+            conductor.lifecycle_admission_closed = true;
         }
 
         self.pending_normal_recovery_handshakes.insert(
@@ -4206,7 +4254,22 @@ impl KmsBackend {
         let Some(entry) = self.platform.device_for_key(device) else {
             return false;
         };
-        if entry.owner.as_ref().map(|owner| owner.incarnation()) != Some(transition.incarnation) {
+        let recovery_transition = self
+            .lifecycle_coordinator
+            .device(&device)
+            .and_then(|arbiter| arbiter.transition())
+            .is_some_and(|active| {
+                active.kind == crate::kms::owner::lifecycle::LifecycleKind::NormalRecovery
+            });
+        let expected_incarnations = if recovery_transition {
+            [
+                Some(transition.incarnation),
+                Some(transition.incarnation.next()),
+            ]
+        } else {
+            [Some(transition.incarnation), None]
+        };
+        if !expected_incarnations.contains(&entry.owner.as_ref().map(|owner| owner.incarnation())) {
             return false;
         }
         let prober = Arc::clone(&self.platform.connector_prober);
@@ -4329,17 +4392,32 @@ impl KmsBackend {
             return;
         }
         match result {
-            NormalRecoveryAttemptResult::Qualified => self.lifecycle_queue_input(
-                device,
-                ArbiterInput::RecoveryAttempt {
-                    tag,
-                    // Task 3 has reopened and rediscovered, but has not
-                    // reinstalled or qualified the topology. Keep the
-                    // incident non-qualified until Task 6.
-                    outcome: RecoveryAttemptOutcome::FailedOrUnknown,
-                },
-            ),
-            NormalRecoveryAttemptResult::Failed | NormalRecoveryAttemptResult::Unavailable => {
+            NormalRecoveryAttemptResult::Qualified => {
+                let fresh_incarnation = self
+                    .platform
+                    .owner_ref(device)
+                    .map(|owner| owner.incarnation());
+                if let Some(incarnation) = fresh_incarnation
+                    && incarnation == tag.incarnation.next()
+                {
+                    self.lifecycle_queue_input(
+                        device,
+                        ArbiterInput::RecoveryQualified { tag, incarnation },
+                    );
+                } else {
+                    log::error!(
+                        "kms: NormalRecovery qualified without its fresh incarnation for {device}"
+                    );
+                    self.lifecycle_queue_input(
+                        device,
+                        ArbiterInput::RecoveryAttempt {
+                            tag,
+                            outcome: RecoveryAttemptOutcome::FailedOrUnknown,
+                        },
+                    );
+                }
+            }
+            NormalRecoveryAttemptResult::Failed => {
                 self.lifecycle_queue_input(
                     device,
                     ArbiterInput::RecoveryAttempt {
@@ -4443,8 +4521,18 @@ impl KmsBackend {
                 continue;
             }
             self.pending_normal_recoveries.remove(&device);
-            let result = (self.normal_recovery_attempt)(device, recovery_id, transition);
-            self.finish_normal_recovery_attempt(device, recovery_id, transition, result);
+            // The recovery install is a device-scoped lifecycle topology
+            // request. It uses the same acquire preparation, TEST_ONLY,
+            // install and completion routing as VT acquire, without creating
+            // an acquire episode.
+            if !self.lifecycle_request_normal_recovery_install(device, transition) {
+                self.finish_normal_recovery_attempt(
+                    device,
+                    recovery_id,
+                    transition,
+                    NormalRecoveryAttemptResult::Failed,
+                );
+            }
         }
     }
 
@@ -9220,8 +9308,22 @@ impl KmsBackend {
             admission_conductors: std::collections::BTreeMap::new(),
             lifecycle_coordinator: crate::kms::owner::lifecycle::LifecycleCoordinator::new(),
             lifecycle_drivers: std::collections::BTreeMap::new(),
-            normal_recovery_attempt: Box::new(|_, _, _| NormalRecoveryAttemptResult::Unavailable),
+            normal_recovery_attempt: Box::new(|_, _, _| NormalRecoveryAttemptResult::Failed),
             normal_recovery_attempt_scripted: false,
+            acquire_prepared_scanout_allocator: Box::new(
+                |platform, drm_device, output, route, width, height, live, output_index| {
+                    if live {
+                        platform.allocate_prepared_client_scanout_pool(
+                            drm_device, output, route, width, height,
+                        )
+                    } else {
+                        let vk = platform.vk.as_ref().cloned().ok_or_else(|| {
+                            io::Error::other("scripted acquire fixture has no Vulkan context")
+                        })?;
+                        platform.allocate_test_output_scanout(vk, output_index)
+                    }
+                },
+            ),
             normal_recovery_device_opener: Box::new(open_normal_recovery_device),
             normal_recovery_scanout_setup: Box::new(allocate_and_register_recovery_scanout_pools),
             pending_normal_recovery_handshakes: HashMap::new(),
@@ -10786,7 +10888,7 @@ impl KmsBackend {
     #[must_use]
     pub fn for_tests() -> Self {
         Self::for_tests_with_recovery_attempt(Box::new(|_, _, _| {
-            NormalRecoveryAttemptResult::Unavailable
+            NormalRecoveryAttemptResult::Failed
         }))
     }
 
@@ -10807,7 +10909,7 @@ impl KmsBackend {
     /// happens after the Vk context is attached.
     fn for_tests_seed() -> Self {
         Self::for_tests_seed_with_recovery_attempt(Box::new(|_, _, _| {
-            NormalRecoveryAttemptResult::Unavailable
+            NormalRecoveryAttemptResult::Failed
         }))
     }
 
@@ -10881,6 +10983,20 @@ impl KmsBackend {
             lifecycle_drivers: std::collections::BTreeMap::new(),
             normal_recovery_attempt,
             normal_recovery_attempt_scripted: true,
+            acquire_prepared_scanout_allocator: Box::new(
+                |platform, drm_device, output, route, width, height, live, output_index| {
+                    if live {
+                        platform.allocate_prepared_client_scanout_pool(
+                            drm_device, output, route, width, height,
+                        )
+                    } else {
+                        let vk = platform.vk.as_ref().cloned().ok_or_else(|| {
+                            io::Error::other("scripted acquire fixture has no Vulkan context")
+                        })?;
+                        platform.allocate_test_output_scanout(vk, output_index)
+                    }
+                },
+            ),
             normal_recovery_device_opener: Box::new(open_normal_recovery_device),
             normal_recovery_scanout_setup: Box::new(allocate_and_register_recovery_scanout_pools),
             pending_normal_recovery_handshakes: HashMap::new(),
@@ -89008,9 +89124,12 @@ mod tests {
         let errors = c0_3bi_end_state_errors(backend, expected);
         assert!(
             errors.is_empty(),
-            "{test_name} end-state check failed:\n{}\nretired bundle details: {:?}",
+            "{test_name} end-state check failed:\n{}\nretired bundle details: {:?}\nallocations: {:?}",
             errors.join("\n"),
-            backend.scene.retired_output_end_states_for_tests()
+            backend.scene.retired_output_end_states_for_tests(),
+            backend
+                .resource_service()
+                .map(|service| service.allocation_end_state_for_tests())
         );
     }
 
@@ -99799,12 +99918,12 @@ mod tests {
         let wakeups = receiver.try_recv_all().collect::<Vec<_>>();
         assert!(
             matches!(wakeups.as_slice(), [Message::CrtcConfigReady]),
-            "logical withdrawal wakes the core exactly once: {wakeups:?}"
+            "protocol terminalization wakes the core exactly once: {wakeups:?}"
         );
         assert_eq!(
             Backend::drain_urgent_requesterless_publications(&mut owner_backend).len(),
-            1,
-            "unknown Owner completion withdraws through the urgent publication path"
+            0,
+            "recoverable completion loss leaves the published topology unchanged"
         );
 
         let mut legacy_backend = super::KmsBackend::for_tests();
@@ -144968,7 +145087,7 @@ mod tests {
     ) -> (super::KmsBackend, DrmDeviceKey, IncarnationId) {
         c0_3di_barrier_backend_with_attempt(
             behaviour,
-            Box::new(|_, _, _| super::NormalRecoveryAttemptResult::Unavailable),
+            Box::new(|_, _, _| super::NormalRecoveryAttemptResult::Failed),
         )
     }
 
@@ -145268,6 +145387,383 @@ mod tests {
         marker_keys
     }
 
+    fn c0_3di_recovery_install_fixture(
+        new_helper_behaviour: crate::kms::executor::test_support::StubBehaviour,
+    ) -> (
+        super::KmsBackend,
+        DrmDeviceKey,
+        IncarnationId,
+        Rc<Cell<usize>>,
+    ) {
+        use std::os::fd::AsFd;
+
+        use crate::kms::{
+            executor::{IncarnationFdSet, test_support},
+            render::resources::{DrmCleanupRegistry, ResourceService},
+        };
+
+        struct SuccessfulFakeCleanupIo;
+        impl crate::kms::render::resources::CleanupIo for SuccessfulFakeCleanupIo {
+            fn remove_fb(&mut self, _fb: u32) -> std::io::Result<()> {
+                Ok(())
+            }
+
+            fn close_gem(&mut self, _gem: u32) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut backend = super::KmsBackend::for_tests_with_vk()
+            .expect("environmental skip: no Vulkan ICD for recovery installation");
+        let device = backend.platform.devices[0].key;
+        let incarnation = IncarnationId::first();
+        let lifecycle = crate::kms::owner::lifecycle::LifecycleEpochId::first();
+        let drm_device = backend.platform.devices[0]
+            .device
+            .clone_rc()
+            .expect("test DRM device is attached");
+        let fd_set = Rc::new(RefCell::new(IncarnationFdSet::new()));
+        let helper_lease = fd_set
+            .borrow_mut()
+            .register_alias_from(drm_device.as_fd())
+            .expect("register old test helper lease");
+        let executor = test_support::spawn_stub_helper_with_identity_for_tests(
+            crate::kms::executor::test_support::StubBehaviour::NeverReply,
+            drm_device.as_fd(),
+            incarnation,
+            lifecycle,
+        )
+        .expect("spawn old recovery fixture helper");
+        {
+            let entry = &mut backend.platform.devices[0];
+            entry.incarnation_fd_set = Rc::clone(&fd_set);
+            entry.helper_lease = Some(helper_lease);
+            entry.executor = Some(executor);
+            entry.owner = Some(crate::kms::owner::device::DeviceCommitOwner::new(
+                incarnation,
+                lifecycle,
+                1,
+            ));
+        }
+        backend.platform.owner_completion_detached = true;
+        backend.install_resource_service_with_registry(
+            ResourceService::new(device, incarnation),
+            DrmCleanupRegistry::new(Rc::clone(&drm_device), device, incarnation),
+        );
+        let vk = backend.platform.vk().expect("live test Vulkan").clone();
+        backend.acquire_prepared_scanout_allocator = Box::new(
+            move |_platform, drm_device, _output, route, width, height, _live, _index| {
+                let mut bo = crate::kms::vk::scanout::ScanoutBo::for_tests_with_live_vk_target(
+                    drm_device,
+                    std::sync::Arc::clone(&vk),
+                    width,
+                    height,
+                )?;
+                bo.fb_handle = Some(
+                    ::drm::control::from_u32(1).expect("nonzero test acquire framebuffer handle"),
+                );
+                bo.gem_handle =
+                    Some(::drm::control::from_u32(1).expect("nonzero test acquire GEM handle"));
+                let mut pool = crate::kms::vk::scanout::ScanoutBoPool::for_tests();
+                pool.route = route;
+                pool.width = width;
+                pool.height = height;
+                pool.bos.push(bo);
+                Ok(crate::kms::vk::scanout::OutputScanout::Shared(pool))
+            },
+        );
+        install_admission_owner_gate(&mut backend, device);
+        backend.install_admission_conductor_with_backend_composed_for_tests(
+            device,
+            AdmissionSourceFixture::new_source().0,
+        );
+
+        let output_key = OutputKey::new(device, "HDMI-2");
+        backend.platform.outputs[0].key = output_key.clone();
+        backend.platform.outputs[0].output.connector =
+            ::drm::control::from_u32(2).expect("nonzero synthetic recovery connector object");
+        backend.platform.outputs[0].output.plane =
+            ::drm::control::from_u32(3).expect("nonzero synthetic recovery primary plane object");
+        {
+            let output = &mut backend.platform.outputs[0].output;
+            output.plane_fb_id_prop = ::drm::control::from_u32(31).unwrap();
+            output.plane_crtc_id_prop = ::drm::control::from_u32(32).unwrap();
+            output.plane_src_x_prop = ::drm::control::from_u32(33).unwrap();
+            output.plane_src_y_prop = ::drm::control::from_u32(34).unwrap();
+            output.plane_src_w_prop = ::drm::control::from_u32(35).unwrap();
+            output.plane_src_h_prop = ::drm::control::from_u32(36).unwrap();
+            output.plane_crtc_x_prop = ::drm::control::from_u32(37).unwrap();
+            output.plane_crtc_y_prop = ::drm::control::from_u32(38).unwrap();
+            output.plane_crtc_w_prop = ::drm::control::from_u32(39).unwrap();
+            output.plane_crtc_h_prop = ::drm::control::from_u32(40).unwrap();
+        }
+        backend.platform.outputs[0].scanout_route.kms_device_key = device;
+        let instance = backend
+            .platform
+            .allocate_output_instance_id(&output_key)
+            .expect("initial recovery output instance");
+        backend.platform.output_instance_ids[0] = instance;
+        let ids = backend.randr_id_alloc.ids_for(&output_key);
+        backend
+            .output_key_by_id
+            .insert(ids.output_id, output_key.clone());
+        let (width, height, refresh, x, y, modes, edid, mm_width, mm_height, connector_type) = {
+            let output = backend.platform.outputs.first().expect("test output");
+            (
+                output.width,
+                output.height,
+                output.output.picked.vrefresh,
+                output.x,
+                output.y,
+                output.output.modes.clone(),
+                output.output.edid.clone(),
+                output.output.mm_width,
+                output.output.mm_height,
+                output.output.connector_type.clone(),
+            )
+        };
+        let entry = backend.randr_id_alloc.entry_mut(&output_key);
+        entry.connected = true;
+        entry.config = super::ConnectorConfig::Enabled {
+            mode_w: width,
+            mode_h: height,
+            vrefresh: refresh,
+            x,
+            y,
+        };
+        entry.modes = modes;
+        entry.edid = edid;
+        entry.mm_width = mm_width;
+        entry.mm_height = mm_height;
+        entry.connector_type = connector_type;
+        backend
+            .lifecycle_register_owner_device(device)
+            .expect("register Vulkan-backed recovery fixture");
+        backend.scene = crate::kms::render::scene::SceneCompositor::new(&backend.platform)
+            .expect("live Vulkan scene for recovery acquire preparation");
+        let mut empty_recovery_pool = crate::kms::vk::scanout::ScanoutBoPool::for_tests();
+        empty_recovery_pool.route = backend.platform.outputs[0].scanout_route;
+        backend.platform.scanout_pools[0] = Some(crate::kms::vk::scanout::OutputScanout::Shared(
+            empty_recovery_pool,
+        ));
+        let opens = Rc::new(Cell::new(0));
+        c0_3di_install_fake_recovery_opener_with_behaviour(
+            &mut backend,
+            Rc::clone(&opens),
+            new_helper_behaviour,
+        );
+        backend.normal_recovery_scanout_setup = Box::new(
+            move |platform, device, incarnation, _drm_device, service, registry| {
+                // The fake executor uses /dev/null as its out-fence, which
+                // cannot provide kernel completion evidence. This fixture
+                // supplies HardwareComplete/PageFlip through the core driver
+                // after acceptance, so leave its poll source detached.
+                platform.owner_completion_detached = true;
+                if service.device() != device
+                    || service.incarnation() != incarnation
+                    || registry.device_key() != device
+                    || registry.incarnation() != incarnation
+                {
+                    return Err(std::io::Error::other(
+                        "test recovery received a mismatched resource pair",
+                    ));
+                }
+                registry.replace_io_for_tests(Box::new(SuccessfulFakeCleanupIo));
+                let output_indices = platform
+                    .outputs
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, output)| {
+                        (output.key.device_key == device).then_some(index)
+                    })
+                    .collect::<Vec<_>>();
+                for output_idx in output_indices {
+                    let output = &platform.outputs[output_idx];
+                    let mut pool = crate::kms::vk::scanout::ScanoutBoPool::for_tests();
+                    pool.route = output.scanout_route;
+                    platform.scanout_pools[output_idx] =
+                        Some(crate::kms::vk::scanout::OutputScanout::Shared(pool));
+                }
+                let _ = service.service_ready();
+                Ok(())
+            },
+        );
+        backend.normal_recovery_attempt_scripted = false;
+        c0_3bi_enable_core_wake_driver_for_tests(&mut backend);
+        (backend, device, incarnation, opens)
+    }
+
+    fn c0_3di_recover_to_terminal(
+        backend: &mut super::KmsBackend,
+        state: &mut ServerState,
+        device: DrmDeviceKey,
+        output_name: &str,
+        expected: crate::kms::owner::lifecycle::DeviceLifecycleState,
+        test_name: &str,
+        after_poison: impl FnOnce(&mut super::KmsBackend, &ServerState),
+    ) -> usize {
+        use std::time::Duration;
+
+        let snapshots = vec![c0_3di_recovery_snapshot(backend, device, output_name)];
+        backend
+            .platform
+            .queue_connector_probe_for_tests(device, Ok(snapshots.clone()));
+        backend
+            .platform
+            .queue_connector_probe_for_tests(device, Ok(snapshots));
+        backend.rebuild_randr_state(state, None, false);
+        let delivery_start = backend.core_entry_deliveries_for_tests.len();
+        c0_3di_drive_completion_loss_to_poison(backend, state, device, Duration::from_secs(8));
+        after_poison(backend, state);
+        let deadline = std::time::Instant::now() + Duration::from_secs(12);
+        let terminal_result = loop {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break Err("recovery deadline expired".to_string());
+            }
+            let accepted_install =
+                expected == crate::kms::owner::lifecycle::DeviceLifecycleState::Ready;
+            let drive_result = c0_3bi_core_driver_until_with_state(
+                backend,
+                state,
+                "complete the acquire-based recovery install",
+                deadline.saturating_duration_since(now),
+                &|backend| {
+                    backend
+                        .lifecycle_coordinator
+                        .device(&device)
+                        .is_some_and(|arbiter| arbiter.state() == expected)
+                        && !backend.pending_normal_recoveries.contains_key(&device)
+                        && !backend
+                            .pending_normal_recovery_handshakes
+                            .contains_key(&device)
+                        && !backend.probe_workers.workers.contains_key(&device)
+                        || (accepted_install
+                            && backend
+                                .platform
+                                .owner_ref(device)
+                                .and_then(|owner| owner.live_record())
+                                .is_some_and(|record| record.milestones().accepted))
+                },
+                None,
+            );
+            if let Err(error) = drive_result {
+                break Err(error);
+            }
+            let terminal = backend
+                .lifecycle_coordinator
+                .device(&device)
+                .is_some_and(|arbiter| arbiter.state() == expected)
+                && !backend.pending_normal_recoveries.contains_key(&device)
+                && !backend
+                    .pending_normal_recovery_handshakes
+                    .contains_key(&device)
+                && !backend.probe_workers.workers.contains_key(&device);
+            if terminal {
+                break Ok(());
+            }
+            let Some(commit) = backend
+                .platform
+                .owner_ref(device)
+                .and_then(|owner| owner.live_record())
+                .filter(|record| record.milestones().accepted)
+                .map(|record| record.commit_id())
+            else {
+                continue;
+            };
+            c0_3bi_complete_owner_commit_through_core_driver_with_state(
+                backend,
+                state,
+                device,
+                commit,
+                "complete accepted recovery install",
+            );
+        };
+        if let Err(error) = terminal_result {
+            let diagnosis = (
+                backend
+                    .lifecycle_coordinator
+                    .device(&device)
+                    .map(|arbiter| {
+                        (
+                            arbiter.state(),
+                            arbiter.transition_tag(),
+                            arbiter.transition(),
+                        )
+                    }),
+                backend.platform.owner_ref(device).map(|owner| {
+                    (
+                        owner.incarnation(),
+                        owner.lifecycle_epoch(),
+                        owner.lifecycle_transition(),
+                        owner.slot().is_idle(),
+                    )
+                }),
+                backend.pending_normal_recoveries.contains_key(&device),
+                backend
+                    .pending_normal_recovery_handshakes
+                    .contains_key(&device),
+                backend.probe_workers.workers.contains_key(&device),
+                backend
+                    .lifecycle_drivers
+                    .get(&device)
+                    .map(|driver| driver.acquire_topology_descriptions_for_tests().len()),
+                backend
+                    .normal_recovery_connector_snapshots
+                    .iter()
+                    .map(|(incarnation, snapshots)| {
+                        (
+                            *incarnation,
+                            snapshots
+                                .iter()
+                                .map(|snapshot| snapshot.key.connector_name.clone())
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                backend
+                    .lifecycle_drivers
+                    .get(&device)
+                    .map(|driver| driver.topology_test_stats()),
+                backend
+                    .platform
+                    .transport_gate(&device)
+                    .map(|gate| gate.state()),
+                backend.normal_recovery_attempt_scripted,
+                backend.admission_conductors.get(&device).map(|conductor| {
+                    (
+                        conductor.recovery_stopped,
+                        conductor.lifecycle_admission_closed,
+                        conductor.admission.is_locked(),
+                        conductor.admission.topology(),
+                        conductor.last_decision_for_tests.clone(),
+                        conductor.last_readiness_for_tests.clone(),
+                    )
+                }),
+                (
+                    backend.lifecycle_drivers.get(&device).map(|driver| {
+                        (
+                            driver.acquire_probe_cache_tags_for_tests(),
+                            driver.pending_topology_validation_commits_for_tests(),
+                            driver.pending_topology_tags(),
+                        )
+                    }),
+                    backend.platform.outputs.first().and_then(|output| {
+                        let hardware_crtc = u32::from(CrtcKey::for_output(output).crtc);
+                        backend.platform.owner_ref(device).and_then(|owner| {
+                            owner
+                                .clock_key_for_hardware_crtc(hardware_crtc)
+                                .and_then(|key| owner.clock(key).map(|clock| (key, clock)))
+                        })
+                    }),
+                ),
+            );
+            panic!("{test_name}: {error}; recovery diagnostic: {diagnosis:?}");
+        }
+        backend.service_retired_outputs();
+        delivery_start
+    }
+
     fn c0_3di_hold_probe_worker_for_barrier(
         backend: &mut super::KmsBackend,
         device: DrmDeviceKey,
@@ -145336,6 +145832,28 @@ mod tests {
             mm_height: 0,
             edid: Vec::new(),
             connector_type: "HDMI-A".to_string(),
+        }
+    }
+
+    fn c0_3di_recovery_snapshot(
+        backend: &super::KmsBackend,
+        device: DrmDeviceKey,
+        connector: &str,
+    ) -> ConnectorSnapshot {
+        let key = OutputKey::new(device, connector);
+        let output = backend
+            .platform
+            .outputs
+            .iter()
+            .find(|output| output.key == key)
+            .expect("recovery fixture output");
+        ConnectorSnapshot {
+            key,
+            modes: output.output.modes.clone(),
+            mm_width: output.output.mm_width,
+            mm_height: output.output.mm_height,
+            edid: output.output.edid.clone(),
+            connector_type: output.output.connector_type.clone(),
         }
     }
 
@@ -145517,6 +146035,28 @@ mod tests {
     ) {
         use crate::kms::owner::lifecycle::DeviceLifecycleState;
 
+        let clock_states = backend
+            .platform
+            .outputs
+            .iter()
+            .filter(|output| output.key.device_key == device)
+            .map(|output| {
+                let hardware_crtc = u32::from(CrtcKey::for_output(output).crtc);
+                let clock = backend
+                    .platform
+                    .owner_ref(device)
+                    .and_then(|owner| owner.clock_key_for_hardware_crtc(hardware_crtc))
+                    .and_then(|key| {
+                        backend
+                            .platform
+                            .owner_ref(device)
+                            .and_then(|owner| owner.clock(key))
+                            .map(|clock| (key, clock.probe, clock.probe_outcome))
+                    });
+                (hardware_crtc, clock)
+            })
+            .collect::<Vec<_>>();
+
         let owner = backend
             .platform
             .owner_ref(device)
@@ -145527,8 +146067,44 @@ mod tests {
                 .lifecycle_coordinator
                 .device(&device)
                 .map(|arbiter| arbiter.state()),
-            Some(DeviceLifecycleState::RecoveryFailed),
-            "{test_name}: Task 3 ends with the default non-qualified attempt outcome"
+            Some(DeviceLifecycleState::Ready),
+            "{test_name}: the acquire reinstall qualified the fresh incarnation; lifecycle={:?}; owner={:?}; pending_recovery={}; pending_handshake={}; acquire={:?}; snapshots={:?}; topology={:?}; clocks={clock_states:?}",
+            backend
+                .lifecycle_coordinator
+                .device(&device)
+                .map(|arbiter| (
+                    arbiter.transition_tag(),
+                    arbiter.transition(),
+                    arbiter.recovery(),
+                    arbiter.admission_open()
+                )),
+            backend
+                .platform
+                .owner_ref(device)
+                .map(|owner| (owner.incarnation(), owner.slot().is_idle())),
+            backend.pending_normal_recoveries.contains_key(&device),
+            backend
+                .pending_normal_recovery_handshakes
+                .contains_key(&device),
+            backend
+                .lifecycle_drivers
+                .get(&device)
+                .map(|driver| driver.acquire_topology_descriptions_for_tests().len()),
+            backend
+                .normal_recovery_connector_snapshots
+                .iter()
+                .map(|(incarnation, snapshots)| (
+                    *incarnation,
+                    snapshots
+                        .iter()
+                        .map(|snapshot| snapshot.key.connector_name.clone())
+                        .collect::<Vec<_>>()
+                ))
+                .collect::<Vec<_>>(),
+            backend
+                .lifecycle_drivers
+                .get(&device)
+                .map(|driver| driver.topology_test_stats()),
         );
         assert!(
             !backend.pending_normal_recoveries.contains_key(&device),
@@ -145672,31 +146248,74 @@ mod tests {
     );
 
     fn c0_3di_failed_recovery_fixture(
-        result: super::NormalRecoveryAttemptResult,
+        _result: super::NormalRecoveryAttemptResult,
     ) -> C0RecoveryFailureFixture {
         use crate::kms::executor::test_support::StubBehaviour;
 
         let attempts = Rc::new(Cell::new(0));
         let recovery_ids = Rc::new(RefCell::new(Vec::new()));
-        let attempts_for_runtime = Rc::clone(&attempts);
-        let ids_for_runtime = Rc::clone(&recovery_ids);
-        let runtime = Box::new(move |_, recovery_id, _| {
-            attempts_for_runtime.set(attempts_for_runtime.get() + 1);
-            ids_for_runtime.borrow_mut().push(recovery_id);
-            result
-        });
-        let (mut backend, device, incarnation) =
-            c0_3di_barrier_backend_with_attempt(StubBehaviour::NeverReply, runtime);
+        let (mut backend, device, incarnation) = c0_3di_barrier_backend(StubBehaviour::NeverReply);
         let (output_key, output_id, crtc_id) = c0_3di_add_owner_output(&mut backend, device, 0x3d1);
+        let attempts_for_open = Rc::clone(&attempts);
+        backend.normal_recovery_device_opener = Box::new(move |key, path, fresh, epoch| {
+            use std::os::fd::AsFd;
+
+            attempts_for_open.set(attempts_for_open.get() + 1);
+            let device = Rc::new(crate::drm::Device::for_tests()?);
+            let incarnation_fd_set =
+                Rc::new(RefCell::new(crate::kms::executor::IncarnationFdSet::new()));
+            let helper_lease = incarnation_fd_set
+                .borrow_mut()
+                .register_alias_from(device.as_fd())
+                .map_err(|error| {
+                    std::io::Error::other(format!("register recovery helper lease: {error:?}"))
+                })?;
+            let executor =
+                crate::kms::executor::test_support::spawn_stub_helper_with_identity_for_tests(
+                    StubBehaviour::HandshakeAndAcceptKernelCalls(0x3d1),
+                    device.as_fd(),
+                    fresh,
+                    epoch,
+                )?;
+            Ok(super::RecoveryOpenedDevice {
+                device: crate::kms::backend::PlatformInitDevice {
+                    key,
+                    device_path: path.to_path_buf(),
+                    device,
+                    executor,
+                    incarnation_fd_set,
+                    helper_lease,
+                },
+            })
+        });
+        backend
+            .platform
+            .install_scripted_connector_prober_for_tests();
+        backend.normal_recovery_attempt_scripted = false;
+        backend.normal_recovery_scanout_setup =
+            Box::new(|_platform, _device, _incarnation, _drm_device, _service, _registry| Ok(()));
         let mut state = ServerState::new();
         backend.rebuild_randr_state(&mut state, None, false);
         let delivery_start = backend.core_entry_deliveries_for_tests.len();
+        backend.platform.queue_connector_probe_for_tests(
+            device,
+            Err(std::io::Error::other(
+                "scripted recovery rediscovery failure",
+            )),
+        );
         c0_3di_drive_completion_loss_to_poison(
             &mut backend,
             &mut state,
             device,
             std::time::Duration::from_secs(8),
         );
+        let recovery_id = backend
+            .lifecycle_coordinator
+            .device(&device)
+            .and_then(|arbiter| arbiter.recovery())
+            .expect("completion loss allocated a recovery incident")
+            .id();
+        recovery_ids.borrow_mut().push(recovery_id);
         c0_3bi_core_driver_until_with_state(
             &mut backend,
             &mut state,
@@ -145718,8 +146337,13 @@ mod tests {
         assert_eq!(attempts.get(), 1, "the incident is attempted once");
         assert_eq!(recovery_ids.borrow().len(), 1);
         assert!(backend.barrier_ready(incarnation));
-        let registry = backend
-            .drm_cleanup_registry
+        let old_quarantine = backend
+            .quarantined_normal_recoveries
+            .iter()
+            .find(|quarantine| quarantine.transition.incarnation == incarnation)
+            .expect("retired old family remains quarantined");
+        let registry = old_quarantine
+            .cleanup_registry
             .as_ref()
             .expect("old family registry");
         assert!(
@@ -145731,7 +146355,7 @@ mod tests {
             backend
                 .resource_service
                 .as_ref()
-                .is_some_and(|service| service.incarnation() == incarnation)
+                .is_some_and(|service| { service.incarnation() == incarnation.next() })
         );
         (
             backend,
@@ -145866,6 +146490,7 @@ mod tests {
         let (mut backend, device, incarnation) =
             c0_3di_barrier_backend(crate::kms::executor::test_support::StubBehaviour::NeverReply);
         let mut state = ServerState::new();
+        backend.scene.mark_scene_structure_dirty();
         backend
             .platform
             .install_scripted_connector_prober_for_tests();
@@ -146115,7 +146740,7 @@ mod tests {
             attempts,
             recovery_ids,
             delivery_start,
-        ) = c0_3di_failed_recovery_fixture(super::NormalRecoveryAttemptResult::CompletionUnknown);
+        ) = c0_3di_failed_recovery_fixture(super::NormalRecoveryAttemptResult::Failed);
         let recovery_id = recovery_ids.borrow()[0];
         assert_eq!(
             backend
@@ -146124,7 +146749,7 @@ mod tests {
                 .and_then(|arbiter| arbiter.recovery())
                 .map(|incident| incident.id()),
             Some(recovery_id),
-            "completion unknown fails the incident that was started"
+            "scripted rediscovery failure fails the incident that was started"
         );
         c0_3bi_assert_one_urgent_withdrawal_delivered(
             &backend,
@@ -146318,7 +146943,10 @@ mod tests {
         let marker_keys = c0_3di_install_fake_recovery_opener_with_behaviour(
             &mut backend,
             Rc::clone(&opens),
-            crate::kms::executor::test_support::StubBehaviour::HandshakeAndAcceptCallsWith(0x3d1),
+            crate::kms::executor::test_support::StubBehaviour::HandshakeAndRejectLifecycle {
+                sequence: 0x3d1,
+                errno: libc::EINVAL,
+            },
         );
         let marker_keys_for_setup = Rc::clone(&marker_keys);
         backend.normal_recovery_scanout_setup = Box::new(
@@ -147175,12 +147803,12 @@ mod tests {
         );
 
         // RecoveryFailed retains the Owner lifecycle registration and closed
-        // transport gate. A later VTRelease still supersedes that transition.
-        let (mut failed, failed_device, _) = c0_3di_barrier_backend_with_attempt(
-            crate::kms::executor::test_support::StubBehaviour::NeverReply,
-            Box::new(|_, _, _| super::NormalRecoveryAttemptResult::Failed),
-        );
-        c0_3di_add_owner_output(&mut failed, failed_device, 0x3d1);
+        // transport gate. With no remembered Owner route, the production
+        // attempt fails before opening a replacement fd. A later VTRelease
+        // still supersedes that transition.
+        let (mut failed, failed_device, _) =
+            c0_3di_barrier_backend(crate::kms::executor::test_support::StubBehaviour::NeverReply);
+        let failed_opens = Rc::new(Cell::new(0));
         let mut failed_state = ServerState::new();
         failed.rebuild_randr_state(&mut failed_state, None, false);
         c0_3di_drive_completion_loss_to_poison(
@@ -147210,8 +147838,6 @@ mod tests {
         )
         .unwrap_or_else(|error| panic!("{error}"));
         assert!(!failed.lifecycle_tag_current(failed_device, failed_tag));
-        let failed_opens = Rc::new(Cell::new(0));
-        c0_3di_install_fake_recovery_opener(&mut failed, Rc::clone(&failed_opens));
         release_vt(
             &mut failed,
             &mut failed_state,
@@ -147787,6 +148413,410 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs a Vulkan ICD"]
+    fn c0_3di_recovery_reaches_ready_silently_vulkan() {
+        use crate::kms::owner::lifecycle::DeviceLifecycleState;
+
+        let (mut backend, device, incarnation, opens) = c0_3di_recovery_install_fixture(
+            crate::kms::executor::test_support::StubBehaviour::HandshakeAndAcceptKernelCalls(0x3d1),
+        );
+        let mut state = ServerState::new();
+        backend
+            .platform
+            .queue_connector_probe_for_tests(device, Ok(vec![c0_3di_snapshot(device, "HDMI-2")]));
+        backend.rebuild_randr_state(&mut state, None, false);
+        let published_before_loss = state.randr.screen_resources_current();
+        let mut published_after_poison = None;
+        let delivery_start = c0_3di_recover_to_terminal(
+            &mut backend,
+            &mut state,
+            device,
+            "HDMI-2",
+            DeviceLifecycleState::Ready,
+            "c0_3di_recovery_reaches_ready_silently_vulkan",
+            |_, state| published_after_poison = Some(state.randr.screen_resources_current()),
+        );
+        assert!(backend.barrier_ready(incarnation));
+        assert_eq!(
+            opens.get(),
+            1,
+            "the incident opens exactly one fresh incarnation"
+        );
+        let published_after = state.randr.screen_resources_current();
+        let published_after_poison = published_after_poison.expect("poison projection captured");
+        assert_eq!(published_after.outputs, published_before_loss.outputs);
+        assert_eq!(published_after.crtcs, published_before_loss.crtcs);
+        assert_eq!(published_after.timestamp, published_before_loss.timestamp);
+        assert_eq!(
+            published_after.config_timestamp,
+            published_before_loss.config_timestamp
+        );
+        assert_eq!(published_after.outputs, published_after_poison.outputs);
+        assert_eq!(published_after.crtcs, published_after_poison.crtcs);
+        assert_eq!(published_after.timestamp, published_after_poison.timestamp);
+        assert_eq!(
+            published_after.config_timestamp,
+            published_after_poison.config_timestamp
+        );
+        assert!(
+            backend.core_entry_deliveries_for_tests[delivery_start..]
+                .iter()
+                .all(|delivery| !matches!(
+                    delivery,
+                    yserver_core::core_loop::run::CoreEntryDelivery::UrgentWithdrawal { .. }
+                        | yserver_core::core_loop::run::CoreEntryDelivery::TopologyEpisodeBegin(_)
+                        | yserver_core::core_loop::run::CoreEntryDelivery::TopologyEpisodeEnd { .. }
+                )),
+            "successful unchanged recovery publishes no topology"
+        );
+        assert_eq!(
+            backend
+                .lifecycle_coordinator
+                .device(&device)
+                .map(|arbiter| arbiter.state()),
+            Some(DeviceLifecycleState::Ready)
+        );
+        assert!(
+            backend.admission_is_active(device),
+            "successful recovery reopens the fresh transport gate: {:?}",
+            backend
+                .platform
+                .transport_gate(&device)
+                .map(|gate| gate.state())
+        );
+        c0_3di_assert_end_state(&backend, "c0_3di_recovery_reaches_ready_silently_vulkan");
+    }
+
+    #[test]
+    #[ignore = "needs a Vulkan ICD"]
+    fn c0_3di_recovery_honours_dpms_off_vulkan() {
+        use crate::kms::owner::lifecycle::DeviceLifecycleState;
+
+        let (mut backend, device, _, opens) = c0_3di_recovery_install_fixture(
+            crate::kms::executor::test_support::StubBehaviour::HandshakeAndAcceptKernelCalls(0x3d1),
+        );
+        let mut state = ServerState::new();
+        // The headless DRM fixture cannot execute the pre-existing DPMS
+        // transaction. Seed the coordinator with the completed protocol
+        // projection so Task 6 exercises its real recovery install at ACTIVE=0.
+        for dispatch in backend
+            .lifecycle_coordinator
+            .set_protocol_dpms_level(3)
+            .expect("project DPMS off before completion loss")
+        {
+            let tag = backend
+                .lifecycle_current_tag(dispatch.device)
+                .expect("DPMS projection owns a lifecycle transition");
+            let actions = backend
+                .lifecycle_coordinator
+                .apply_device_input(
+                    &dispatch.device,
+                    crate::kms::owner::lifecycle::ArbiterInput::CommitOutcome {
+                        tag,
+                        outcome: crate::kms::owner::lifecycle::LifecycleCommitOutcome::Completed {
+                            dpms_projections_retired: true,
+                        },
+                    },
+                )
+                .expect("complete seeded DPMS projection");
+            let requester = backend.lifecycle_current_tag(dispatch.device);
+            backend.lifecycle_queue_actions(dispatch.device, actions, requester);
+        }
+        backend.owner_dpms_installed_active.insert(device, false);
+        let _ = c0_3di_recover_to_terminal(
+            &mut backend,
+            &mut state,
+            device,
+            "HDMI-2",
+            DeviceLifecycleState::Ready,
+            "c0_3di_recovery_honours_dpms_off_vulkan",
+            |_, _| {},
+        );
+        assert_eq!(
+            opens.get(),
+            1,
+            "the incident opens exactly one fresh incarnation"
+        );
+        assert_eq!(backend.lifecycle_coordinator.protocol_dpms_level(), 3);
+        assert_eq!(
+            crate::kms::owner::lifecycle::dpms_target_for_level(
+                backend.lifecycle_coordinator.protocol_dpms_level()
+            ),
+            Some(crate::kms::owner::lifecycle::DpmsTarget::Off)
+        );
+        let installed = backend.lifecycle_drivers[&device]
+            .acquire_topology_descriptions_for_tests()
+            .last()
+            .expect("recovery prepared an acquire installation");
+        assert!(
+            installed.crtc_state.iter().all(|power| !power.new_active),
+            "an ACTIVE=0 acquire install qualifies on its real completion evidence"
+        );
+        let output_idx = backend
+            .platform
+            .outputs
+            .iter()
+            .position(|output| output.key.device_key == device)
+            .expect("recovered DPMS output");
+        backend.platform.outputs[output_idx]
+            .output
+            .crtc_out_fence_ptr_prop = Some(::drm::control::from_u32(22).unwrap());
+        let recovered_crtc = u32::from(backend.platform.outputs[output_idx].output.crtc);
+        backend
+            .platform
+            .devices
+            .iter_mut()
+            .find(|entry| entry.key == device)
+            .expect("recovered DPMS device")
+            .active_property_cache
+            .insert_for_tests(recovered_crtc, 21);
+        backend
+            .lifecycle_set_dpms_power(0)
+            .expect("DPMS on follows the ordinary lifecycle path");
+        c0_3bi_core_driver_until_with_state(
+            &mut backend,
+            &mut state,
+            "accept ordinary DPMS-on commit after recovery",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend
+                    .platform
+                    .owner_ref(device)
+                    .and_then(|owner| owner.live_record())
+                    .is_some_and(|record| record.milestones().accepted)
+            },
+            None,
+        )
+        .expect("ordinary DPMS-on commit is admitted");
+        let commit = backend
+            .platform
+            .owner_ref(device)
+            .and_then(|owner| owner.live_record())
+            .expect("DPMS-on live commit")
+            .commit_id();
+        c0_3bi_complete_owner_commit_through_core_driver_with_state(
+            &mut backend,
+            &mut state,
+            device,
+            commit,
+            "complete ordinary DPMS-on commit",
+        );
+        assert_eq!(
+            backend.owner_dpms_installed_active.get(&device),
+            Some(&true)
+        );
+        c0_3di_assert_end_state(&backend, "c0_3di_recovery_honours_dpms_off_vulkan");
+    }
+
+    #[test]
+    #[ignore = "needs a Vulkan ICD"]
+    fn c0_3di_reinstall_failure_is_recovery_failed_vulkan() {
+        use crate::kms::owner::lifecycle::DeviceLifecycleState;
+
+        let (mut backend, device, incarnation, opens) = c0_3di_recovery_install_fixture(
+            crate::kms::executor::test_support::StubBehaviour::HandshakeAndRejectLifecycle {
+                sequence: 0x3d1,
+                errno: libc::EINVAL,
+            },
+        );
+        let mut state = ServerState::new();
+        let delivery_start = c0_3di_recover_to_terminal(
+            &mut backend,
+            &mut state,
+            device,
+            "HDMI-2",
+            DeviceLifecycleState::RecoveryFailed,
+            "c0_3di_reinstall_failure_is_recovery_failed_vulkan",
+            |_, _| {},
+        );
+        assert_eq!(c0_3di_urgent_withdrawal_count(&backend, delivery_start), 1);
+        assert_eq!(opens.get(), 1, "explicit reinstall failure does not retry");
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .acquire_topology_descriptions_for_tests()
+                .len(),
+            1,
+            "the explicit rejection follows exactly one acquire installation"
+        );
+        assert!(backend.barrier_ready(incarnation));
+        c0_3di_assert_end_state(
+            &backend,
+            "c0_3di_reinstall_failure_is_recovery_failed_vulkan",
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a Vulkan ICD"]
+    fn c0_3di_unknown_completion_during_attempt_vulkan() {
+        use crate::kms::owner::lifecycle::{DeviceLifecycleState, RecoveryIncidentState};
+        use std::{cell::RefCell, rc::Rc, time::Duration};
+
+        let (mut backend, device, incarnation, opens) = c0_3di_recovery_install_fixture(
+            crate::kms::executor::test_support::StubBehaviour::HandshakeAndAcceptKernelCalls(0x3d1),
+        );
+        let mut state = ServerState::new();
+        backend.rebuild_randr_state(&mut state, None, false);
+        backend.platform.queue_connector_probe_for_tests(
+            device,
+            Ok(vec![c0_3di_recovery_snapshot(&backend, device, "HDMI-2")]),
+        );
+        backend.platform.queue_connector_probe_for_tests(
+            device,
+            Ok(vec![c0_3di_recovery_snapshot(&backend, device, "HDMI-2")]),
+        );
+        let delivery_start = backend.core_entry_deliveries_for_tests.len();
+        c0_3di_drive_completion_loss_to_poison(
+            &mut backend,
+            &mut state,
+            device,
+            Duration::from_secs(8),
+        );
+        let recovery_id = backend
+            .lifecycle_coordinator
+            .device(&device)
+            .and_then(|arbiter| arbiter.recovery())
+            .expect("initial loss allocated its incident")
+            .id();
+        let observed_states = Rc::new(RefCell::new(Vec::new()));
+        let observed_states_for_core = Rc::clone(&observed_states);
+
+        c0_3bi_core_driver_until_with_state_and_boundary_observer(
+            &mut backend,
+            &mut state,
+            "accept the fresh recovery reinstall before injecting completion loss",
+            Duration::from_secs(15),
+            &|backend| {
+                backend
+                    .lifecycle_coordinator
+                    .device(&device)
+                    .is_some_and(|arbiter| {
+                        arbiter.state() == DeviceLifecycleState::Recovering(recovery_id)
+                    })
+                    && backend.platform.owner_ref(device).is_some_and(|owner| {
+                        owner.incarnation() == incarnation.next()
+                            && owner
+                                .live_record()
+                                .is_some_and(|record| record.milestones().accepted)
+                    })
+            },
+            &|backend| {
+                if let Some(state) = backend
+                    .lifecycle_coordinator
+                    .device(&device)
+                    .map(|arbiter| arbiter.state())
+                {
+                    observed_states_for_core.borrow_mut().push(state);
+                }
+            },
+        )
+        .unwrap_or_else(|error| panic!("fresh recovery reinstall was not accepted: {error}"));
+        let (fresh_incarnation, fresh_commit) = backend
+            .platform
+            .owner_ref(device)
+            .and_then(|owner| {
+                owner
+                    .live_record()
+                    .map(|record| (owner.incarnation(), record.commit_id()))
+            })
+            .expect("accepted fresh recovery commit");
+        assert_eq!(fresh_incarnation, incarnation.next());
+        let fresh_events = backend
+            .platform
+            .owner_for(device)
+            .expect("fresh Owner for injected completion loss")
+            .report_stream_failure(fresh_incarnation, std::time::Instant::now());
+        assert!(fresh_events.iter().any(|event| {
+            matches!(
+                event,
+                crate::kms::owner::device::OwnerEvent::Terminal { commit, terminal }
+                    if *commit == fresh_commit
+                        && matches!(
+                            terminal,
+                            crate::kms::owner::record::TerminalState::CompletionUnknown(_)
+                        )
+            )
+        }));
+        backend
+            .core_driver_owner_events_for_tests
+            .push_back((device, fresh_events));
+        c0_3bi_core_driver_until_with_state_and_boundary_observer(
+            &mut backend,
+            &mut state,
+            "report fresh reinstall completion loss through the core driver",
+            Duration::from_secs(15),
+            &|backend| {
+                backend
+                    .lifecycle_coordinator
+                    .device(&device)
+                    .is_some_and(|arbiter| {
+                        arbiter.state() == DeviceLifecycleState::RecoveryFailed
+                            && arbiter.recovery().is_some_and(|incident| {
+                                incident.id() == recovery_id
+                                    && incident.state() == RecoveryIncidentState::RecoveryFailed
+                            })
+                    })
+            },
+            &|backend| {
+                if let Some(state) = backend
+                    .lifecycle_coordinator
+                    .device(&device)
+                    .map(|arbiter| arbiter.state())
+                {
+                    observed_states_for_core.borrow_mut().push(state);
+                }
+            },
+        )
+        .unwrap_or_else(|error| panic!("unknown fresh completion: {error}"));
+        let observed_states = observed_states.borrow();
+        let attempt_started = observed_states
+            .iter()
+            .position(|state| *state == DeviceLifecycleState::Recovering(recovery_id))
+            .expect("the fresh reinstall enters the existing recovery attempt");
+        assert!(
+            observed_states[attempt_started..]
+                .iter()
+                .all(|state| *state != DeviceLifecycleState::Poisoned),
+            "the fresh-incarnation completion loss fails the existing incident in one input"
+        );
+        assert_eq!(
+            observed_states.last(),
+            Some(&DeviceLifecycleState::RecoveryFailed)
+        );
+        assert_eq!(c0_3di_urgent_withdrawal_count(&backend, delivery_start), 1);
+        assert!(backend.platform.owner_ref(device).is_some_and(|owner| {
+            owner.tombstones().iter().any(|tombstone| {
+                tombstone.commit == fresh_commit
+                    && matches!(
+                        tombstone.terminal,
+                        crate::kms::owner::record::TerminalState::CompletionUnknown(_)
+                    )
+            })
+        }));
+        assert_eq!(
+            opens.get(),
+            1,
+            "unknown completion does not allocate a retry"
+        );
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .acquire_topology_descriptions_for_tests()
+                .len(),
+            1,
+            "the unknown completion follows exactly one acquire installation"
+        );
+        assert_eq!(
+            backend
+                .lifecycle_coordinator
+                .device(&device)
+                .map(|arbiter| arbiter.state()),
+            Some(DeviceLifecycleState::RecoveryFailed),
+            "unknown reinstall completion goes directly to RecoveryFailed"
+        );
+        assert!(backend.barrier_ready(incarnation));
+        c0_3di_assert_end_state(&backend, "c0_3di_unknown_completion_during_attempt_vulkan");
+    }
+
+    #[test]
     #[ignore = "needs tty3, card1 DRM master, HDMI-2, and a Vulkan ICD"]
     fn c0_hw_3di_reopen_fresh_incarnation_on_card1_drm() {
         use std::{
@@ -147838,9 +148868,10 @@ mod tests {
                     .unwrap_or_else(|error| panic!("cycle {cycle}: card1 HDMI-2 fixture: {error}"));
             let backend = &mut fixture.backend;
             backend.resource_cleanup_on_drop_for_tests = true;
-            // Keep the fixture's scripted non-qualified outcome after
-            // rediscovery, while exercising Task 3's production reopen path.
+            // Exercise the real Task 6 acquire installation after Task 3's
+            // production reopen and rediscovery path.
             backend.normal_recovery_attempt_scripted = false;
+            let _core_messages = c0_3bi_enable_core_wake_driver_for_tests(backend);
             let device = backend
                 .platform
                 .primary_device()
@@ -147971,7 +149002,9 @@ mod tests {
 
             backend.scene.mark_scene_structure_dirty();
             let mut state = ServerState::new();
-            c0_3bi_core_driver_until_with_state(
+            backend.rebuild_randr_state(&mut state, None, false);
+            let published_before_loss = state.randr.screen_resources_current();
+            let poison_result = c0_3bi_core_driver_until_with_state(
                 backend,
                 &mut state,
                 "withhold card1 composed completion through its deadline",
@@ -147988,8 +149021,8 @@ mod tests {
                         && backend.platform.control_device_detached(device)
                 },
                 None,
-            )
-            .unwrap_or_else(|error| panic!("cycle {cycle}: poison card1: {error}"));
+            );
+            poison_result.unwrap_or_else(|error| panic!("cycle {cycle}: poison card1: {error}"));
 
             drop(fixture._master.take());
             let old_description_fds =
@@ -148015,16 +149048,20 @@ mod tests {
                             .device(&device)
                             .is_some_and(|arbiter| {
                                 arbiter.state()
-                                    == crate::kms::owner::lifecycle::DeviceLifecycleState::RecoveryFailed
+                                    == crate::kms::owner::lifecycle::DeviceLifecycleState::Ready
                             })
                         && !backend.pending_normal_recoveries.contains_key(&device)
+                        && !backend
+                            .pending_normal_recovery_handshakes
+                            .contains_key(&device)
+                        && !backend.probe_workers.workers.contains_key(&device)
                         && backend
                             .normal_recovery_connector_snapshots
                             .get(&fresh_incarnation)
                             .is_some_and(|snapshots| {
-                                snapshots.iter().any(|snapshot| {
-                                    snapshot.key.connector_name == "HDMI-2"
-                                })
+                                snapshots
+                                    .iter()
+                                    .any(|snapshot| snapshot.key.connector_name == "HDMI-2")
                             })
                 },
                 None,
@@ -148068,6 +149105,24 @@ mod tests {
                     backend.pending_poisoned_barriers.contains(&device),
                 );
             }
+
+            let randr_after_recovery = state.randr.screen_resources_current();
+            assert_eq!(
+                randr_after_recovery.outputs, published_before_loss.outputs,
+                "cycle {cycle}: unchanged recovered topology preserves RANDR outputs"
+            );
+            assert_eq!(
+                randr_after_recovery.crtcs, published_before_loss.crtcs,
+                "cycle {cycle}: unchanged recovered topology preserves RANDR CRTCs"
+            );
+            assert_eq!(
+                randr_after_recovery.timestamp, published_before_loss.timestamp,
+                "cycle {cycle}: unchanged recovered topology preserves RANDR timestamp"
+            );
+            assert_eq!(
+                randr_after_recovery.config_timestamp, published_before_loss.config_timestamp,
+                "cycle {cycle}: unchanged recovered topology preserves RANDR config timestamp"
+            );
 
             let fresh_entry = backend
                 .platform
@@ -148128,14 +149183,12 @@ mod tests {
                 .clock_key_for_hardware_crtc(hardware_crtc)
                 .expect("fresh executor installed the HDMI-2 clock probe");
             assert!(
-                fresh_owner.clock(new_clock_key).is_some_and(|clock| {
-                    matches!(
-                        clock.probe,
-                        crate::kms::owner::clock::ProbeState::Succeeded
-                            | crate::kms::owner::clock::ProbeState::Failed
-                    ) && clock.probe_outcome.is_some()
-                }),
-                "cycle {cycle}: the fresh executor returns a terminal clock-probe answer"
+                backend.admission_is_active(device),
+                "cycle {cycle}: Ready recovery reopens fresh transport admission; gate={:?}",
+                backend
+                    .platform
+                    .transport_gate(&device)
+                    .map(|gate| gate.state())
             );
             assert!(
                 backend
@@ -148200,6 +149253,62 @@ mod tests {
                     .all(|fd| fresh_description_fds.contains(fd)),
                 "cycle {cycle}: a card1 descriptor still belongs to a stale file description: {card_fd_entries:?}"
             );
+            c0_3bi_core_driver_until_with_state(
+                backend,
+                &mut state,
+                "resume composition on the recovered card1 incarnation",
+                Duration::from_secs(25),
+                &|backend| {
+                    backend
+                        .platform
+                        .owner_ref(device)
+                        .and_then(|owner| owner.live_record())
+                        .is_some_and(|record| record.milestones().accepted)
+                },
+                None,
+            )
+            .unwrap_or_else(|error| {
+                panic!("cycle {cycle}: recovered composition was not admitted: {error}")
+            });
+            assert!(
+                backend
+                    .platform
+                    .owner_ref(device)
+                    .and_then(|owner| owner.clock(new_clock_key))
+                    .is_some_and(|clock| {
+                        matches!(
+                            clock.probe,
+                            crate::kms::owner::clock::ProbeState::Succeeded
+                                | crate::kms::owner::clock::ProbeState::Failed
+                        ) && clock.probe_outcome.is_some()
+                    }),
+                "cycle {cycle}: the fresh executor returns a terminal clock-probe answer before composition resumes"
+            );
+            let resumed_commit = backend
+                .platform
+                .owner_ref(device)
+                .and_then(|owner| owner.live_record())
+                .expect("recovered composition has an accepted live commit")
+                .commit_id();
+            c0_3bi_core_driver_until_with_state(
+                backend,
+                &mut state,
+                "observe recovered composition hardware completion",
+                Duration::from_secs(25),
+                &|backend| {
+                    backend.platform.owner_ref(device).is_some_and(|owner| {
+                        owner.tombstones().iter().any(|tombstone| {
+                            tombstone.commit == resumed_commit
+                                && tombstone.terminal
+                                    == crate::kms::owner::record::TerminalState::Completed
+                        })
+                    })
+                },
+                None,
+            )
+            .unwrap_or_else(|error| {
+                panic!("cycle {cycle}: recovered composition did not complete: {error}")
+            });
             c0_3di_assert_reopened_end_state(
                 backend,
                 device,
@@ -148221,6 +149330,12 @@ mod tests {
                 .unwrap_or_else(|error| panic!("cycle {cycle}: restore card1 CRTC: {error}"));
             eprintln!("c0_hw_3di_reopen_fresh_incarnation_on_card1_drm cycle {cycle}/4 passed");
         }
+    }
+
+    #[test]
+    #[ignore = "needs tty3, card1 DRM master, HDMI-2, and a Vulkan ICD"]
+    fn c0_hw_3di_completion_loss_recovers_on_card1_drm() {
+        c0_hw_3di_reopen_fresh_incarnation_on_card1_drm();
     }
 
     #[test]

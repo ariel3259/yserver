@@ -256,6 +256,15 @@ impl std::fmt::Debug for FenceTicketInner {
 }
 
 impl FenceTicket {
+    /// Record that the exact render submission reached its exported
+    /// completion signal. The render-completion poller is registered against
+    /// this submission's job id, so this external proof is equivalent to a
+    /// successful status query of the submission fence and makes final-drop
+    /// recycling safe without a blocking wait on the core.
+    pub(crate) fn mark_signaled_from_render_completion(&self) {
+        self.inner.signaled_cache.set(true);
+    }
+
     fn note_status_failure(&self) {
         if let Some(pool) = self.inner.pool.upgrade()
             && let Ok(mut pool) = pool.try_borrow_mut()
@@ -13256,6 +13265,14 @@ mod tests {
         let ticket = FenceTicket::for_tests_stub();
         // Drop runs at end of scope; no-op expected.
         drop(ticket);
+    }
+
+    #[test]
+    fn render_completion_proof_marks_its_fence_ticket_signaled() {
+        let ticket = FenceTicket::for_tests_unsignaled_stub();
+        assert!(!ticket.inner.signaled_cache.get());
+        ticket.mark_signaled_from_render_completion();
+        assert!(ticket.inner.signaled_cache.get());
     }
 
     /// Imported SYNC_FD wait semaphores must attach to the shared ticket

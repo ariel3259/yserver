@@ -3722,6 +3722,38 @@ impl ScanoutBo {
         }
     }
 
+    pub(crate) fn for_tests_with_live_vk_target(
+        drm: Rc<crate::drm::Device>,
+        vk: Arc<VkContext>,
+        width: u32,
+        height: u32,
+    ) -> io::Result<Self> {
+        let mut target = crate::kms::vk::target::DrawableImage::new_server_owned_window(
+            Arc::clone(&vk),
+            width,
+            height,
+        )
+        .map_err(|error| io::Error::other(format!("test scanout target allocation: {error:?}")))?;
+        let (image, memory, view) = target
+            .take_server_owned_scanout_handles()
+            .ok_or_else(|| io::Error::other("test scanout target has non-owned backing"))?;
+        let mut bo = Self::for_tests(drm, vk);
+        bo.width = width;
+        bo.height = height;
+        bo.vk_image = image;
+        bo.vk_memory = memory;
+        bo.vk_image_view = view;
+        crate::kms::vk::mem_accounting::recategorise(
+            memory,
+            crate::kms::vk::mem_accounting::MemCategory::Scanout,
+        );
+        bo.vk_semaphore = create_export_semaphore(&bo.vk)
+            .map_err(|result| scanout_vk_error("test scanout semaphore", result))?;
+        bo.vk_transfer = allocate_transfer_resources(&bo.vk, width, height)
+            .map_err(|result| scanout_vk_error("test scanout transfer resources", result))?;
+        Ok(bo)
+    }
+
     /// Shape-only fixture for lifecycle quarantine tests. The synthetic BO
     /// has no native DRM object and therefore cannot keep an old fd family
     /// alive while the test exercises the barrier.

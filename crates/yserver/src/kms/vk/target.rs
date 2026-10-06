@@ -746,6 +746,21 @@ impl DrawableImage {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn take_server_owned_scanout_handles(
+        &mut self,
+    ) -> Option<(vk::Image, vk::DeviceMemory, vk::ImageView)> {
+        let ImageBacking::ServerOwned { vk_memory } = &mut self.backing else {
+            return None;
+        };
+        let memory = std::mem::replace(vk_memory, vk::DeviceMemory::null());
+        Some((
+            std::mem::replace(&mut self.vk_image, vk::Image::null()),
+            memory,
+            std::mem::replace(&mut self.vk_image_view, vk::ImageView::null()),
+        ))
+    }
+
     /// Borrow the client-supplied dma-buf fd for a DRI3-imported image,
     /// or `None` for server-owned storage. Used to synchronize a read
     /// (e.g. a PresentPixmap copy) against the producing client's

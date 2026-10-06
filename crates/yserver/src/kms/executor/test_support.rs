@@ -44,6 +44,12 @@ pub enum ScriptedReply {
 pub enum StubBehaviour {
     NeverHandshake,
     HandshakeAndAcceptCallsWith(u64),
+    HandshakeAndAcceptKernelCalls(u64),
+    HandshakeAndRejectLifecycle {
+        sequence: u64,
+        errno: i32,
+    },
+    HandshakeAndWithholdLifecycleAfterValidation(u64),
     NeverReply,
     ExitBeforeReply,
     RejectWith(i32),
@@ -125,6 +131,15 @@ impl StubBehaviour {
             Self::NeverHandshake => "never-handshake".to_string(),
             Self::HandshakeAndAcceptCallsWith(sequence) => {
                 format!("handshake-accept-calls:{sequence}")
+            }
+            Self::HandshakeAndAcceptKernelCalls(sequence) => {
+                format!("handshake-accept-kernel:{sequence}")
+            }
+            Self::HandshakeAndRejectLifecycle { sequence, errno } => {
+                format!("handshake-reject-lifecycle:{sequence}:{errno}")
+            }
+            Self::HandshakeAndWithholdLifecycleAfterValidation(sequence) => {
+                format!("handshake-withhold-lifecycle:{sequence}")
             }
             Self::NeverReply => "never-reply".to_string(),
             Self::ExitBeforeReply => "exit-before-reply".to_string(),
@@ -215,6 +230,22 @@ impl StubBehaviour {
                 .parse::<u64>()
                 .ok()
                 .map(Self::HandshakeAndAcceptCallsWith)
+        } else if let Some(sequence) = s.strip_prefix("handshake-accept-kernel:") {
+            sequence
+                .parse::<u64>()
+                .ok()
+                .map(Self::HandshakeAndAcceptKernelCalls)
+        } else if let Some(rest) = s.strip_prefix("handshake-reject-lifecycle:") {
+            let (sequence, errno) = rest.split_once(':')?;
+            Some(Self::HandshakeAndRejectLifecycle {
+                sequence: sequence.parse().ok()?,
+                errno: errno.parse().ok()?,
+            })
+        } else if let Some(sequence) = s.strip_prefix("handshake-withhold-lifecycle:") {
+            sequence
+                .parse::<u64>()
+                .ok()
+                .map(Self::HandshakeAndWithholdLifecycleAfterValidation)
         } else if s == "never-reply" {
             Some(Self::NeverReply)
         } else if s == "exit-before-reply" {
@@ -525,6 +556,28 @@ pub fn run_stub_helper_if_requested() -> Option<io::Result<()>> {
     }
 }
 
+fn accept_helper_handshake(control: &UnixStream) -> io::Result<()> {
+    let mut request = [0u8; 64];
+    let received = transport::recv_frame(control, &mut request)?;
+    if received.len == 0 {
+        return Ok(());
+    }
+    let handshake =
+        protocol::decode_handshake_request(&request[..received.len]).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("protocol error: {error:?}"),
+            )
+        })?;
+    let reply = protocol::HandshakeReply {
+        incarnation: handshake.incarnation,
+        lifecycle_epoch: handshake.lifecycle_epoch,
+        // SAFETY: getpid has no preconditions.
+        helper_pid: unsafe { libc::getpid() as u32 },
+    };
+    transport::send_frame(control, &protocol::encode_handshake_reply(&reply))
+}
+
 fn run_stub_helper(behaviour: StubBehaviour) -> io::Result<()> {
     let control_fd = take_inherited_fd(CONTROL_FD, "executor control")?;
     let _kms_fd = take_inherited_fd(KMS_FD, "executor KMS")?;
@@ -535,26 +588,29 @@ fn run_stub_helper(behaviour: StubBehaviour) -> io::Result<()> {
             std::thread::sleep(Duration::from_secs(3600));
         },
         StubBehaviour::HandshakeAndAcceptCallsWith(sequence) => {
-            let mut request = [0u8; 64];
-            let received = transport::recv_frame(&control, &mut request)?;
-            if received.len == 0 {
-                return Ok(());
-            }
-            let handshake =
-                protocol::decode_handshake_request(&request[..received.len]).map_err(|error| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("protocol error: {error:?}"),
-                    )
-                })?;
-            let reply = protocol::HandshakeReply {
-                incarnation: handshake.incarnation,
-                lifecycle_epoch: handshake.lifecycle_epoch,
-                // SAFETY: getpid has no preconditions.
-                helper_pid: unsafe { libc::getpid() as u32 },
-            };
-            transport::send_frame(&control, &protocol::encode_handshake_reply(&reply))?;
+            accept_helper_handshake(&control)?;
             serve_call_families(&control, sequence, false, None, None)
+        }
+        StubBehaviour::HandshakeAndAcceptKernelCalls(sequence) => {
+            accept_helper_handshake(&control)?;
+            serve_kernel_faithful_calls(&control, sequence, None, None, None, None, None, false)
+        }
+        StubBehaviour::HandshakeAndRejectLifecycle { sequence, errno } => {
+            accept_helper_handshake(&control)?;
+            serve_kernel_faithful_calls(
+                &control,
+                sequence,
+                None,
+                None,
+                None,
+                None,
+                Some(errno),
+                false,
+            )
+        }
+        StubBehaviour::HandshakeAndWithholdLifecycleAfterValidation(sequence) => {
+            accept_helper_handshake(&control)?;
+            serve_kernel_faithful_calls(&control, sequence, None, None, None, None, None, true)
         }
         StubBehaviour::NeverReply => loop {
             std::thread::sleep(Duration::from_secs(3600));
@@ -1296,7 +1352,15 @@ fn serve_kernel_faithful_calls(
                         0,
                     )
                 } else {
-                    let fence_count = request.out_fence_slots.len();
+                    // TEST_ONLY validation accepts the atomic description but
+                    // does not install out fences. Returning dummy descriptors
+                    // here makes DeviceCommitOwner classify a successful
+                    // validation reply as malformed instead of Passed.
+                    let fence_count = if is_validation {
+                        0
+                    } else {
+                        request.out_fence_slots.len()
+                    };
                     let fence_mask = if fence_count >= 32 {
                         u32::MAX
                     } else if fence_count == 0 {

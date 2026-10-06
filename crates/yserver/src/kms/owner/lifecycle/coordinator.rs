@@ -1268,7 +1268,13 @@ mod tests {
                     expected.logical.release_seat,
                     "seat action differed for {kind:?}"
                 );
-                let withdraw_outputs = expected.logical.withdraw_protocol_work
+                let normal_live_remains_published = row == CompletionUnknownRow::NormalLive
+                    && (expected.recovery.new_incident.is_some()
+                        || expected.recovery.current_incident.is_some_and(|incident| {
+                            incident.state() != RecoveryIncidentState::RecoveryFailed
+                        }));
+                let withdraw_outputs = (expected.logical.withdraw_protocol_work
+                    && !normal_live_remains_published)
                     || kind == CompletionUnknownRowKind::VTRelease;
                 assert_eq!(
                     dispatch

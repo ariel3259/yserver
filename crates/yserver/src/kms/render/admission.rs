@@ -1907,8 +1907,19 @@ impl KmsBackend {
                 #[cfg(test)]
                 self.vt_call_trace_for_tests.push("release_seat_action");
             }
+            LifecycleAction::TerminalizeProtocolWork(_) => {
+                let recovering_live_device = self
+                    .lifecycle_coordinator
+                    .device(&device)
+                    .is_some_and(|arbiter| {
+                        arbiter.state()
+                            == crate::kms::owner::lifecycle::DeviceLifecycleState::Poisoned
+                    });
+                if recovering_live_device {
+                    self.wake_crtc_config_ready();
+                }
+            }
             LifecycleAction::DispositionChanged { .. }
-            | LifecycleAction::TerminalizeProtocolWork(_)
             | LifecycleAction::AllocateRecoveryIncident { .. }
             | LifecycleAction::RecoveryTableF(_)
             | LifecycleAction::CompletionLossTableU { .. }
@@ -2007,20 +2018,81 @@ impl KmsBackend {
         true
     }
 
+    pub(super) fn lifecycle_request_normal_recovery_install(
+        &mut self,
+        device: DrmDeviceKey,
+        tag: TransitionTag<IncarnationId>,
+    ) -> bool {
+        let current_recovery = self
+            .lifecycle_coordinator
+            .device(&device)
+            .is_some_and(|arbiter| {
+                arbiter.transition_tag() == Some(tag)
+                    && matches!(
+                        arbiter.state(),
+                        crate::kms::owner::lifecycle::DeviceLifecycleState::Recovering(id)
+                            if arbiter.recovery().is_some_and(|incident| incident.id() == id)
+                    )
+                    && arbiter.transition().is_some_and(|transition| {
+                        transition.kind
+                            == crate::kms::owner::lifecycle::LifecycleKind::NormalRecovery
+                    })
+            });
+        if !current_recovery
+            || !self
+                .platform
+                .owner_ref(device)
+                .is_some_and(|owner| owner.lifecycle_epoch() == tag.lifecycle_epoch)
+        {
+            return false;
+        }
+        let Some(conductor) = self.admission_conductors.get_mut(&device) else {
+            return false;
+        };
+        if conductor
+            .admission
+            .request_topology(TopologyWork::Transition(tag))
+            .is_err()
+        {
+            return false;
+        }
+        self.admission_wake(device, false);
+        true
+    }
+
     pub(super) fn lifecycle_tag_current(
         &self,
         device: DrmDeviceKey,
         tag: TransitionTag<IncarnationId>,
     ) -> bool {
-        self.lifecycle_coordinator
-            .device(&device)
-            .and_then(|arbiter| arbiter.transition_tag())
-            == Some(tag)
-            && self.platform.owner_ref(device).is_some_and(|owner| {
-                owner.incarnation() == tag.incarnation
-                    && owner.lifecycle_epoch() == tag.lifecycle_epoch
-                    && owner.lifecycle_transition() == Some(tag.transition)
-            })
+        let recovering_fresh_incarnation =
+            self.lifecycle_coordinator
+                .device(&device)
+                .is_some_and(|arbiter| {
+                    arbiter.transition_tag() == Some(tag)
+                        && arbiter.transition().is_some_and(|transition| {
+                            transition.kind
+                                == crate::kms::owner::lifecycle::LifecycleKind::NormalRecovery
+                        })
+                });
+        let Some(owner) = self.platform.owner_ref(device) else {
+            return false;
+        };
+        let incarnation_matches = owner.incarnation() == tag.incarnation
+            || (recovering_fresh_incarnation && owner.incarnation() == tag.incarnation.next());
+        recovering_fresh_incarnation
+            && incarnation_matches
+            && owner.lifecycle_epoch() == tag.lifecycle_epoch
+            && owner.lifecycle_transition() == Some(tag.transition)
+            || (!recovering_fresh_incarnation
+                && owner.incarnation() == tag.incarnation
+                && owner.lifecycle_epoch() == tag.lifecycle_epoch
+                && owner.lifecycle_transition() == Some(tag.transition)
+                && self
+                    .lifecycle_coordinator
+                    .device(&device)
+                    .and_then(|arbiter| arbiter.transition_tag())
+                    == Some(tag))
     }
 
     pub(crate) fn client_modeset_tag_current(
@@ -2101,18 +2173,30 @@ impl KmsBackend {
         if u32::from(output.output.crtc) != target_crtc {
             return Err(ResourceError::InvalidState);
         }
-        let scanout = self
+        let Some(scanout) = self
             .platform
             .scanout_pools
             .get(output_idx)
             .and_then(Option::as_ref)
-            .ok_or(ResourceError::InvalidState)?;
+        else {
+            // The recovery path can hand its first fresh scanout pool
+            // directly to the acquire preparation. In that case there is no
+            // installed pool from this incarnation to displace.
+            return if self.lifecycle_is_normal_recovery(device) {
+                Ok(None)
+            } else {
+                Err(ResourceError::InvalidState)
+            };
+        };
         if !matches!(
             scanout,
             crate::kms::vk::scanout::OutputScanout::Shared(_)
                 | crate::kms::vk::scanout::OutputScanout::Copied(_)
         ) {
             return Err(ResourceError::InvalidState);
+        }
+        if scanout.display_pool().bos.is_empty() && self.lifecycle_is_normal_recovery(device) {
+            return Ok(None);
         }
         let allocations = scanout
             .display_pool()
@@ -3440,28 +3524,17 @@ impl KmsBackend {
                 } else {
                     (0x1000u32.saturating_add(u32::from(output.crtc)), None)
                 };
-                let mut scanout = if use_live_kms_discovery {
-                    self.platform
-                        .allocate_prepared_client_scanout_pool(
-                            std::rc::Rc::clone(&drm_device),
-                            &output,
-                            _route,
-                            u32::from(width),
-                            u32::from(height),
-                        )
-                        .map_err(|error| {
-                            format!("acquire fresh scanout pool for {key:?}: {error}")
-                        })?
-                } else {
-                    let vk = self.platform.vk.as_ref().cloned().ok_or_else(|| {
-                        "scripted acquire fixture has no Vulkan context".to_string()
-                    })?;
-                    self.platform
-                        .allocate_test_output_scanout(vk, _index)
-                        .map_err(|error| {
-                            format!("acquire fresh scripted scanout for {key:?}: {error}")
-                        })?
-                };
+                let mut scanout = (self.acquire_prepared_scanout_allocator)(
+                    &mut self.platform,
+                    std::rc::Rc::clone(&drm_device),
+                    &output,
+                    _route,
+                    u32::from(width),
+                    u32::from(height),
+                    use_live_kms_discovery,
+                    _index,
+                )
+                .map_err(|error| format!("acquire fresh scanout pool for {key:?}: {error}"))?;
                 let framebuffer = scanout
                     .display_pool()
                     .bos
@@ -4234,6 +4307,10 @@ impl KmsBackend {
                 .admission
                 .cancel_topology(TopologyWork::Transition(tag));
         }
+        if self.lifecycle_tag_current(device, tag) && self.lifecycle_is_normal_recovery(device) {
+            self.lifecycle_report_acquire_install_failure(device, tag);
+            return;
+        }
         self.lifecycle_queue_input(
             device,
             ArbiterInput::CommitOutcome {
@@ -4328,7 +4405,11 @@ impl KmsBackend {
             .device(&device)
             .and_then(|arbiter| arbiter.transition())
             .is_some_and(|transition| {
-                transition.kind == crate::kms::owner::lifecycle::LifecycleKind::VTAcquire
+                matches!(
+                    transition.kind,
+                    crate::kms::owner::lifecycle::LifecycleKind::VTAcquire
+                        | crate::kms::owner::lifecycle::LifecycleKind::NormalRecovery
+                )
             });
         let hotplug_install = self
             .lifecycle_coordinator
@@ -4384,15 +4465,7 @@ impl KmsBackend {
                 Err(error) => {
                     log::warn!("VTAcquire topology preparation refused: {error}");
                     self.admission_abort(device, token);
-                    self.lifecycle_queue_input(
-                        device,
-                        ArbiterInput::CommitOutcome {
-                            tag,
-                            outcome: LifecycleCommitOutcome::Rejected {
-                                topology_latched_generation: None,
-                            },
-                        },
-                    );
+                    self.lifecycle_report_never_dispatched(device, tag);
                     return AdmissionOutcome::PreparationRefused;
                 }
             }
@@ -4442,15 +4515,7 @@ impl KmsBackend {
             Err(error) => {
                 log::warn!("lifecycle topology description refused: {error}");
                 self.admission_abort(device, token);
-                self.lifecycle_queue_input(
-                    device,
-                    ArbiterInput::CommitOutcome {
-                        tag,
-                        outcome: LifecycleCommitOutcome::Rejected {
-                            topology_latched_generation: None,
-                        },
-                    },
-                );
+                self.lifecycle_report_never_dispatched(device, tag);
                 return AdmissionOutcome::PreparationRefused;
             }
         };
@@ -6120,15 +6185,24 @@ impl KmsBackend {
     ) {
         let tag = pending.tag;
         let dpms_active = pending.dpms_active;
+        let commit_incarnation = self
+            .platform
+            .owner_ref(device)
+            .map_or(tag.incarnation, |owner| owner.incarnation());
         let owner_commit_power_changes = pending
             .description
             .crtc_state
             .iter()
-            .map(|state| OwnerCrtcPowerChange {
-                incarnation: tag.incarnation,
-                crtc: state.crtc_id,
-                new_active: state.new_active,
-                expected_completion: state.old_active || state.new_active,
+            .map(|state| {
+                OwnerCrtcPowerChange {
+                    // NormalRecovery retains the transition tag from the
+                    // failed incarnation, but the reinstall and its
+                    // completion evidence belong to the fresh owner.
+                    incarnation: commit_incarnation,
+                    crtc: state.crtc_id,
+                    new_active: state.new_active,
+                    expected_completion: state.old_active || state.new_active,
+                }
             })
             .collect::<Vec<_>>();
         let decision = pending.decision.clone();
@@ -6920,7 +6994,11 @@ impl KmsBackend {
             .device(&device)
             .and_then(|arbiter| arbiter.transition())
             .is_some_and(|transition| {
-                transition.kind == crate::kms::owner::lifecycle::LifecycleKind::VTAcquire
+                matches!(
+                    transition.kind,
+                    crate::kms::owner::lifecycle::LifecycleKind::VTAcquire
+                        | crate::kms::owner::lifecycle::LifecycleKind::NormalRecovery
+                )
             });
         let hotplug_install = self
             .lifecycle_coordinator
@@ -7047,6 +7125,43 @@ impl KmsBackend {
         }
         if current {
             match terminal {
+                TerminalState::Completed if self.lifecycle_is_normal_recovery(device) => {
+                    let fresh_incarnation = self
+                        .platform
+                        .owner_ref(device)
+                        .map(|owner| owner.incarnation());
+                    if let Some(incarnation) = fresh_incarnation
+                        && incarnation == tag.incarnation.next()
+                    {
+                        if self.owner_outputs_powered_on(device) {
+                            // An earlier scene tick can be discarded while
+                            // recovery admission is closed. Re-dirty the
+                            // freshly installed projection after its terminal
+                            // evidence arrives, and wake the core to compose
+                            // a generation that ordinary admission can use.
+                            self.scene.wake_for_devices(
+                                &self.platform,
+                                &std::collections::HashSet::from([device]),
+                            );
+                            self.wake_crtc_config_ready();
+                        }
+                        self.lifecycle_queue_input(
+                            device,
+                            ArbiterInput::RecoveryQualified { tag, incarnation },
+                        );
+                    } else {
+                        log::error!(
+                            "lifecycle NormalRecovery completion has no current fresh incarnation for {device:?}"
+                        );
+                        self.lifecycle_queue_input(
+                            device,
+                            ArbiterInput::RecoveryAttempt {
+                                tag,
+                                outcome: crate::kms::owner::lifecycle::RecoveryAttemptOutcome::FailedOrUnknown,
+                            },
+                        );
+                    }
+                }
                 TerminalState::Completed => self.lifecycle_queue_input(
                     device,
                     ArbiterInput::CommitOutcome {
@@ -7058,15 +7173,19 @@ impl KmsBackend {
                 ),
                 TerminalState::FailedBeforeSubmit(FailureCause::IoctlRejected { errno }) => {
                     if acquire_install {
-                        self.close_owner_after_acquire_probe_failure(device);
-                        self.lifecycle_queue_input(
-                            device,
-                            ArbiterInput::CommitOutcome {
-                                tag,
-                                outcome: LifecycleCommitOutcome::AcquireInstallRejected,
-                            },
-                        );
-                        self.acquire_episode_participant_terminal(device);
+                        if self.lifecycle_is_normal_recovery(device) {
+                            self.lifecycle_report_acquire_install_failure(device, tag);
+                        } else {
+                            self.close_owner_after_acquire_probe_failure(device);
+                            self.lifecycle_queue_input(
+                                device,
+                                ArbiterInput::CommitOutcome {
+                                    tag,
+                                    outcome: LifecycleCommitOutcome::AcquireInstallRejected,
+                                },
+                            );
+                            self.acquire_episode_participant_terminal(device);
+                        }
                         if let Some(driver) = self.lifecycle_drivers.get_mut(&device) {
                             driver.topology_commits.remove(&commit);
                             driver.topology_dpms_active.remove(&commit);
@@ -7097,15 +7216,19 @@ impl KmsBackend {
                 }
                 TerminalState::FailedBeforeSubmit(FailureCause::NeverDispatched(_)) => {
                     if acquire_install {
-                        self.close_owner_after_acquire_probe_failure(device);
-                        self.lifecycle_queue_input(
-                            device,
-                            ArbiterInput::CommitOutcome {
-                                tag,
-                                outcome: LifecycleCommitOutcome::AcquireInstallRejected,
-                            },
-                        );
-                        self.acquire_episode_participant_terminal(device);
+                        if self.lifecycle_is_normal_recovery(device) {
+                            self.lifecycle_report_acquire_install_failure(device, tag);
+                        } else {
+                            self.close_owner_after_acquire_probe_failure(device);
+                            self.lifecycle_queue_input(
+                                device,
+                                ArbiterInput::CommitOutcome {
+                                    tag,
+                                    outcome: LifecycleCommitOutcome::AcquireInstallRejected,
+                                },
+                            );
+                            self.acquire_episode_participant_terminal(device);
+                        }
                         if let Some(driver) = self.lifecycle_drivers.get_mut(&device) {
                             driver.topology_commits.remove(&commit);
                             driver.topology_dpms_active.remove(&commit);
@@ -7123,7 +7246,9 @@ impl KmsBackend {
                     );
                 }
                 TerminalState::CompletionUnknown(_) => {
-                    if acquire_install || hotplug_install {
+                    if (acquire_install && !self.lifecycle_is_normal_recovery(device))
+                        || hotplug_install
+                    {
                         self.close_owner_after_acquire_probe_failure(device);
                     }
                     self.lifecycle_report_completion_loss(device);
@@ -7184,6 +7309,59 @@ impl KmsBackend {
         if let Some(driver) = self.lifecycle_drivers.get_mut(&device) {
             driver.topology_commits.remove(&commit);
             driver.topology_dpms_active.remove(&commit);
+        }
+    }
+
+    fn lifecycle_is_normal_recovery(&self, device: DrmDeviceKey) -> bool {
+        self.lifecycle_coordinator
+            .device(&device)
+            .and_then(|arbiter| arbiter.transition())
+            .is_some_and(|transition| {
+                transition.kind == crate::kms::owner::lifecycle::LifecycleKind::NormalRecovery
+            })
+    }
+
+    fn lifecycle_report_acquire_install_failure(
+        &mut self,
+        device: DrmDeviceKey,
+        tag: TransitionTag<IncarnationId>,
+    ) {
+        let current = self.lifecycle_tag_current(device, tag);
+        let transition_kind = self
+            .lifecycle_coordinator
+            .device(&device)
+            .and_then(|arbiter| arbiter.transition())
+            .map(|transition| transition.kind);
+        if current
+            && transition_kind == Some(crate::kms::owner::lifecycle::LifecycleKind::NormalRecovery)
+        {
+            self.lifecycle_queue_input(
+                device,
+                ArbiterInput::RecoveryAttempt {
+                    tag,
+                    outcome: crate::kms::owner::lifecycle::RecoveryAttemptOutcome::FailedOrUnknown,
+                },
+            );
+        } else if current
+            && transition_kind == Some(crate::kms::owner::lifecycle::LifecycleKind::VTAcquire)
+        {
+            self.lifecycle_queue_input(
+                device,
+                ArbiterInput::CommitOutcome {
+                    tag,
+                    outcome: LifecycleCommitOutcome::AcquireInstallRejected,
+                },
+            );
+        } else {
+            self.lifecycle_queue_input(
+                device,
+                ArbiterInput::CommitOutcome {
+                    tag,
+                    outcome: LifecycleCommitOutcome::Rejected {
+                        topology_latched_generation: None,
+                    },
+                },
+            );
         }
     }
 
@@ -7512,6 +7690,12 @@ impl KmsBackend {
 
     pub(super) fn on_poisoned(&mut self, device: DrmDeviceKey) {
         self.pending_poisoned_barriers.insert(device);
+        // The old scene and its scanout pool remain attached until the
+        // completion-loss barrier permits retirement. They are no longer a
+        // valid composition target once the Owner buffers have been
+        // quarantined, so park this device's outputs until recovery promotes
+        // a fresh scene identity (or failure withdraws the topology).
+        self.scene.withdraw_device_outputs(device);
         if let Some(conductor) = self.admission_conductors.get_mut(&device) {
             conductor.recovery_stopped = true;
             conductor.lifecycle_admission_closed = true;

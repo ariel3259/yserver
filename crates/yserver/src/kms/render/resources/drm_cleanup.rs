@@ -333,6 +333,11 @@ impl DrmCleanupRegistry {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn replace_io_for_tests(&mut self, io: Box<dyn CleanupIo>) {
+        self.io = Some(io);
+    }
+
     pub(crate) fn device_key(&self) -> DrmDeviceKey {
         self.device_key
     }
