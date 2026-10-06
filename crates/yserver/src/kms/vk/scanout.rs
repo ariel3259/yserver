@@ -1509,7 +1509,7 @@ pub(crate) fn record_copied_transport_copy(
             &vk::DependencyInfo::default().image_memory_barriers(&local_to_copy),
         );
 
-        let regions = [vk::ImageCopy2::default()
+        let regions = [vk::ImageCopy::default()
             .src_subresource(color_subresource_layers())
             .dst_subresource(color_subresource_layers())
             .extent(vk::Extent3D {
@@ -1517,14 +1517,13 @@ pub(crate) fn record_copied_transport_copy(
                 height,
                 depth: 1,
             })];
-        device.cmd_copy_image2(
+        device.cmd_copy_image(
             command_buffer,
-            &vk::CopyImageInfo2::default()
-                .src_image(render_image)
-                .src_image_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                .dst_image(transport_image)
-                .dst_image_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .regions(&regions),
+            render_image,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            transport_image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &regions,
         );
 
         let local_to_general = [
@@ -2049,7 +2048,7 @@ impl CopiedScanoutPool {
                 command_buffer,
                 &vk::DependencyInfo::default().image_memory_barriers(&local_to_copy),
             );
-            let regions = [vk::ImageCopy2::default()
+            let regions = [vk::ImageCopy::default()
                 .src_subresource(color_subresource_layers())
                 .dst_subresource(color_subresource_layers())
                 .extent(vk::Extent3D {
@@ -2057,14 +2056,13 @@ impl CopiedScanoutPool {
                     height: source.height(),
                     depth: 1,
                 })];
-            self.sink_vk.device.cmd_copy_image2(
+            self.sink_vk.device.cmd_copy_image(
                 command_buffer,
-                &vk::CopyImageInfo2::default()
-                    .src_image(source.imported_sink_image())
-                    .src_image_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                    .dst_image(destination.vk_image)
-                    .dst_image_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .regions(&regions),
+                source.imported_sink_image(),
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                destination.vk_image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &regions,
             );
             let source_to_general = [vk::ImageMemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::COPY)
@@ -2319,7 +2317,7 @@ impl CopiedScanoutPool {
                 command_buffer,
                 &vk::DependencyInfo::default().image_memory_barriers(&local_to_copy),
             );
-            let regions = [vk::ImageCopy2::default()
+            let regions = [vk::ImageCopy::default()
                 .src_subresource(color_subresource_layers())
                 .dst_subresource(color_subresource_layers())
                 .extent(vk::Extent3D {
@@ -2327,14 +2325,13 @@ impl CopiedScanoutPool {
                     height: source.height(),
                     depth: 1,
                 })];
-            self.sink_vk.device.cmd_copy_image2(
+            self.sink_vk.device.cmd_copy_image(
                 command_buffer,
-                &vk::CopyImageInfo2::default()
-                    .src_image(source.imported_sink_image())
-                    .src_image_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                    .dst_image(destination.shared.image)
-                    .dst_image_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .regions(&regions),
+                source.imported_sink_image(),
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                destination.shared.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &regions,
             );
             let source_to_general = [vk::ImageMemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::COPY)

@@ -23306,6 +23306,11 @@ fn handle_xi2_request(
             if !xi1_device_has_valuators(&state.xi_devices, dev) {
                 return xi1_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, minor);
             }
+            // `IsXTestDevice` rejects the XTEST pointer with BadMatch,
+            // ahead of the axis-range check (`Xi/setdval.c:113-114`).
+            if dev == crate::xinput::DEVICEID_XTEST_POINTER {
+                return xi1_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, minor);
+            }
             let axis_count = xi1_device_valuator_count(&state.xi_devices, dev)
                 .expect("validated valuator class");
             if u16::from(first) + u16::from(num) > u16::from(axis_count) {
@@ -36731,6 +36736,7 @@ mod tests {
                 xi1_window_event_classes: HashMap::new(),
                 outbound: VecDeque::new(),
                 watching_writable: false,
+                write_failed: false,
                 focused_window: ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
@@ -37330,6 +37336,47 @@ mod tests {
             Vec::new(),
             "a move is not a resize and must not expose the window",
         );
+    }
+
+    /// Present family: a Present ConfigureNotify selector over
+    /// `OUTBOUND_CAP` is flagged for the core loop to disconnect, and the
+    /// reading selector still gets the event.
+    #[test]
+    fn overflowing_present_selector_is_flagged_for_disconnect() {
+        use crate::server::PresentEventSelection;
+        use yserver_protocol::x11::present as x11present;
+
+        const WINDOW: ResourceId = ResourceId(0x200);
+        let mut state = ServerState::new();
+        let _slow = install_client(&mut state, 1);
+        let mut fast = install_client(&mut state, 2);
+        for (eid, owner) in [(0x0010_0042, 1), (0x0020_0042, 2)] {
+            state.present_event_selections.insert(
+                eid,
+                PresentEventSelection {
+                    owner: ClientId(owner),
+                    window: WINDOW,
+                    event_mask: x11present::EVENT_MASK_CONFIGURE_NOTIFY,
+                },
+            );
+        }
+        client_io::saturate_for_test(state.clients.get_mut(&1).unwrap());
+        fire_present_configure_notify_for_window(
+            &mut state,
+            WINDOW,
+            yserver_protocol::x11::Geometry {
+                root: crate::resources::ROOT_WINDOW,
+                x: 1,
+                y: 2,
+                width: 30,
+                height: 40,
+                border_width: 0,
+                depth: 24,
+            },
+        );
+        assert_eq!(client_io::failed_writers(&state.clients), [ClientId(1)]);
+        let bytes = read_all_available(&mut fast);
+        assert_eq!(bytes.first(), Some(&35), "Present GenericEvent");
     }
 
     /// Xorg's Present screen hook receives every real ConfigNotify, including
@@ -52224,6 +52271,28 @@ mod tests {
         assert_eq!(wire[0], 0, "X error");
         assert_eq!(wire[1], x11::error::BAD_VALUE);
         assert_eq!(xi_query_side_effect_snapshot(&state, 1), before);
+    }
+
+    #[test]
+    fn xi1_set_device_valuators_xtest_pointer_is_bad_match() {
+        // Kills: accept valid-axis writes on the XTEST pointer. Xorg returns
+        // BadMatch for IsXTestDevice (Xi/setdval.c:113-114), before the
+        // range check (:116), so an out-of-range write is BadMatch too; the
+        // master pointer (id 2) is still accepted.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut body = vec![4, 0, 1, 0]; // XTEST pointer, axis 0, one value
+        body.extend_from_slice(&7i32.to_le_bytes());
+        let wire = dispatch_xi_request_wire(&mut state, &mut peer, 1, 33, &body);
+        assert_eq!(wire[0], 0, "X error");
+        assert_eq!(wire[1], x11::error::BAD_MATCH);
+        body[1] = 9; // out of range
+        let wire = dispatch_xi_request_wire(&mut state, &mut peer, 1, 33, &body);
+        assert_eq!(wire[1], x11::error::BAD_MATCH);
+        let mut ok = vec![2, 0, 1, 0];
+        ok.extend_from_slice(&7i32.to_le_bytes());
+        let wire = dispatch_xi_request_wire(&mut state, &mut peer, 1, 33, &ok);
+        assert_eq!(wire[0], 1, "master pointer still accepted");
     }
 
     #[test]

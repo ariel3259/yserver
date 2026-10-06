@@ -8234,28 +8234,26 @@ fn submit_damage_audit_compare(
             height: audit.candidate.extent.height,
             depth: 1,
         };
-        let copy = [vk::BufferImageCopy2::default()
+        let copy = [vk::BufferImageCopy::default()
             .image_subresource(
                 vk::ImageSubresourceLayers::default()
                     .aspect_mask(vk::ImageAspectFlags::COLOR)
                     .layer_count(1),
             )
             .image_extent(extent)];
-        vk.device.cmd_copy_image_to_buffer2(
+        vk.device.cmd_copy_image_to_buffer(
             cb,
-            &vk::CopyImageToBufferInfo2::default()
-                .src_image(audit.candidate.image)
-                .src_image_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                .dst_buffer(audit.compare.candidate_buffer())
-                .regions(&copy),
+            audit.candidate.image,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            audit.compare.candidate_buffer(),
+            &copy,
         );
-        vk.device.cmd_copy_image_to_buffer2(
+        vk.device.cmd_copy_image_to_buffer(
             cb,
-            &vk::CopyImageToBufferInfo2::default()
-                .src_image(audit.reference.image)
-                .src_image_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                .dst_buffer(audit.compare.reference_buffer())
-                .regions(&copy),
+            audit.reference.image,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            audit.compare.reference_buffer(),
+            &copy,
         );
 
         audit.compare.record_after_transfers(cb);

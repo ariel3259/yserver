@@ -172,7 +172,7 @@ fn git_status(dir: &Path, args: &[&str]) -> bool {
 fn compile_shader(glslc: &Path, src: &Path, dst: &Path, stage: &str) {
     let status = Command::new(glslc)
         .arg(format!("-fshader-stage={stage}"))
-        .arg("--target-env=vulkan1.3")
+        .arg("--target-env=vulkan1.2")
         .arg("-O") // size+perf optimisation; debug-friendly enough
         .arg("-o")
         .arg(dst)

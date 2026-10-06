@@ -9,6 +9,7 @@
 #   tools/vng-suite.sh --registry tools/vng-scenarios/suite-selftest/suite.list
 #   tools/vng-suite.sh --out target/vng-suite/mine   # fixed run directory
 #   tools/vng-suite.sh --regen-goldens xrandr-dpi    # rerun on Xorg, rewrite goldens
+#   tools/vng-suite.sh --env YSERVER_VK_MAX_API_VERSION=1.2   # guest env, repeatable
 #
 # A scenario passes only if its guest wrote RESULT "pass", the host driver (or
 # vng-shot) exited 0, the guest ran under KVM and finished, the server was
@@ -38,6 +39,7 @@ binary=
 filter=
 run=
 regen=
+declare -a extra_env=()
 
 usage() {
     sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed 's/^# \?//;$d'
@@ -51,6 +53,7 @@ while [ $# -gt 0 ]; do
         --registry) registry=$2; shift 2;;
         --out) run=$2; shift 2;;
         --regen-goldens) regen=1; shift;;
+        --env) extra_env+=(--env "$2"); shift 2;;
         -h|--help) usage 0;;
         -*) echo "vng-suite: unknown argument $1" >&2; usage 1;;
         *) [ -z "$filter" ] || { echo "vng-suite: one filter only" >&2; exit 1; }
@@ -175,6 +178,7 @@ run_leg() {
     shift
     local -a args=(--gpu "$gpu" --binary "$binary" --timeout $((timeout_s + 60)) "$@") cmd
     [ -z "$hook" ] || args+=(--root-hook "$hook")
+    args+=(${extra_env[@]+"${extra_env[@]}"})
     if [ -n "$host" ]; then
         cmd=("$host" "$leg" "${args[@]}")
     else

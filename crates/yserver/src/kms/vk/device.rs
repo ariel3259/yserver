@@ -13,6 +13,7 @@ use std::{
     },
 };
 
+use super::api_level;
 use crate::platform::drm::DrmDeviceKey;
 
 /// DRM node identities advertised by one Vulkan physical device through
@@ -325,11 +326,27 @@ impl VkContext {
         drop_wait_policy: DropWaitPolicy,
     ) -> Result<Arc<Self>, VkInitError> {
         let entry = unsafe { ash::Entry::load()? };
+        let api_version_cap =
+            std::env::var(api_level::API_VERSION_CAP_ENV)
+                .ok()
+                .and_then(|value| {
+                    let cap = api_level::parse_api_version_cap(&value);
+                    if cap.is_none() {
+                        log::warn!(
+                            "vulkan: ignoring {}={value:?} (expected major.minor, e.g. 1.2)",
+                            api_level::API_VERSION_CAP_ENV
+                        );
+                    }
+                    cap
+                });
+        let loader_api_version = unsafe { entry.try_enumerate_instance_version() }.unwrap_or(None);
+        let instance_api_version =
+            api_level::instance_api_version(loader_api_version, api_version_cap);
         let app_info = vk::ApplicationInfo::default()
             .application_name(c"yserver")
             .application_version(vk::make_api_version(0, 0, 1, 0))
             .engine_name(c"yserver-kms")
-            .api_version(vk::API_VERSION_1_3);
+            .api_version(instance_api_version);
 
         let ext_cstrs = super::instance::required_instance_extensions();
         let ext_ptrs: Vec<_> = ext_cstrs.iter().map(|c| c.as_ptr()).collect();
@@ -450,6 +467,30 @@ impl VkContext {
                     return Err(VkInitError::Vk(e));
                 }
             };
+        let has_device_extension = |name: &CStr| {
+            supported_device_exts
+                .iter()
+                .any(|p| p.extension_name_as_c_str().is_ok_and(|s| s == name))
+        };
+        let api_path = match select_device_api_path(
+            &instance,
+            physical_device,
+            instance_api_version,
+            profile,
+            has_device_extension,
+        ) {
+            Ok(path) => path,
+            Err(error) => {
+                log::error!("vulkan: {error}");
+                unsafe {
+                    if let Some(m) = debug_messenger {
+                        debug_utils_instance.destroy_debug_utils_messenger(m, None);
+                    }
+                    instance.destroy_instance(None);
+                }
+                return Err(error);
+            }
+        };
         let device_extension_names: Vec<&'static CStr> = wanted
             .iter()
             .copied()
@@ -476,6 +517,7 @@ impl VkContext {
         // scanout — true of that list, false of this one, and a
         // misleading warning costs more than the line it would save.
         let mut device_extension_names = device_extension_names;
+        device_extension_names.extend_from_slice(api_path.required_extensions());
         let memory_budget = supported_device_exts.iter().any(|p| {
             p.extension_name_as_c_str()
                 .map(|s| s == crate::kms::vk::vram::REQUIRED_EXTENSION)
@@ -500,9 +542,15 @@ impl VkContext {
             .queue_priorities(&priorities)];
 
         let compositor_features = profile == DeviceProfile::Compositor;
+        // Vulkan 1.3 enables both as core features; 1.2 through the
+        // extension feature structs of the extensions `api_path` enabled.
         let mut features13 = vk::PhysicalDeviceVulkan13Features::default()
             .dynamic_rendering(compositor_features)
             .synchronization2(true);
+        let mut sync2_features =
+            vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
+        let mut dynamic_rendering_features =
+            vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
 
         // `logicOp` (the X11 GcFunction Xor/And/Or/Invert fill path —
         // all 16 variants map 1:1 to `VkLogicOp`) and `dualSrcBlend`
@@ -541,14 +589,25 @@ impl VkContext {
             );
         }
 
-        let device_info = vk::DeviceCreateInfo::default()
+        let mut device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_info)
             .enabled_extension_names(&device_extensions)
-            .enabled_features(&enabled_features)
-            .push_next(&mut features13);
+            .enabled_features(&enabled_features);
+        match api_path {
+            api_level::ApiPath::Core13 => device_info = device_info.push_next(&mut features13),
+            api_level::ApiPath::Khr12 { dynamic_rendering } => {
+                device_info = device_info.push_next(&mut sync2_features);
+                if dynamic_rendering {
+                    device_info = device_info.push_next(&mut dynamic_rendering_features);
+                }
+            }
+        }
 
         let device = match unsafe { instance.create_device(physical_device, &device_info, None) } {
-            Ok(d) => d,
+            // The 1.2 path reaches dynamic rendering and synchronization2
+            // through their KHR entry points; see `api_level::load_device`.
+            Ok(d) if api_path == api_level::ApiPath::Core13 => d,
+            Ok(d) => unsafe { api_level::load_device(&instance, d.handle(), api_path) },
             Err(e) => {
                 unsafe {
                     if let Some(m) = debug_messenger {
@@ -881,6 +940,16 @@ pub enum VkInitError {
     DuplicateRenderNodeIdentity(String),
     #[error("physical device lacks required Vulkan feature `{0}` (no fallback implemented for it)")]
     MissingRequiredFeature(&'static str),
+    #[error(
+        "Vulkan device {device} is unsupported: yserver needs {requirement}; this device reports \
+         Vulkan {version} and lacks {missing}"
+    )]
+    UnsupportedApiVersion {
+        device: String,
+        requirement: &'static str,
+        version: String,
+        missing: String,
+    },
 }
 
 impl From<vk::Result> for VkInitError {
@@ -943,6 +1012,74 @@ fn select_device_features_for_profile(
             component_alpha: false,
         }),
     }
+}
+
+/// Log the selected device's API version and driver, then choose how it
+/// provides dynamic rendering and synchronization2 (or refuse it by name).
+fn select_device_api_path(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    instance_api_version: u32,
+    profile: DeviceProfile,
+    has_extension: impl Fn(&CStr) -> bool,
+) -> Result<api_level::ApiPath, VkInitError> {
+    let props = unsafe { instance.get_physical_device_properties(physical_device) };
+    let device_name = props
+        .device_name_as_c_str()
+        .map_or_else(|_| "<unnamed>".into(), |s| s.to_string_lossy().into_owned());
+    // VkPhysicalDeviceDriverProperties is core only from 1.2.
+    let driver = if vk::api_version_minor(props.api_version) >= 2
+        || vk::api_version_major(props.api_version) > 1
+    {
+        let mut driver_props = vk::PhysicalDeviceDriverProperties::default();
+        let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut driver_props);
+        unsafe { instance.get_physical_device_properties2(physical_device, &mut props2) };
+        format!(
+            "{} {}",
+            driver_props
+                .driver_name_as_c_str()
+                .map_or_else(|_| "<unnamed>".into(), CStr::to_string_lossy),
+            driver_props
+                .driver_info_as_c_str()
+                .map_or_else(|_| "".into(), CStr::to_string_lossy),
+        )
+    } else {
+        "(driver properties need Vulkan 1.2)".to_owned()
+    };
+    let major_minor = |v: u32| (vk::api_version_major(v), vk::api_version_minor(v));
+    let capped = major_minor(instance_api_version) < major_minor(props.api_version);
+    let usable_version = if capped {
+        instance_api_version
+    } else {
+        props.api_version
+    };
+    // Only worth saying when the instance, not the device, decides the path.
+    let version = if !capped || major_minor(instance_api_version) >= (1, 3) {
+        api_level::format_api_version(props.api_version)
+    } else {
+        format!(
+            "{} (used as {}.{}, the instance API version)",
+            api_level::format_api_version(props.api_version),
+            vk::api_version_major(instance_api_version),
+            vk::api_version_minor(instance_api_version),
+        )
+    };
+    let renders = profile == DeviceProfile::Compositor;
+    let selected = api_level::select_api_path(usable_version, renders, has_extension);
+    log::info!(
+        "vulkan: device {device_name} reports API {version}, driver {driver}; {}",
+        match selected {
+            Ok(api_level::ApiPath::Core13) => "using core Vulkan 1.3",
+            Ok(api_level::ApiPath::Khr12 { .. }) => "using Vulkan 1.2 with KHR extensions",
+            Err(_) => "unsupported",
+        }
+    );
+    selected.map_err(|shortfall| VkInitError::UnsupportedApiVersion {
+        device: device_name,
+        requirement: shortfall.requirement,
+        version,
+        missing: shortfall.missing.join(" and "),
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
