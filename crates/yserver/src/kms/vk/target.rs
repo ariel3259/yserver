@@ -869,6 +869,7 @@ impl DrawableImage {
             .command_buffer_count(1);
         let cb = unsafe { self.vk.device.allocate_command_buffers(&alloc_info)?[0] };
 
+        let mut cb_pending = false;
         let result = (|| -> Result<(), vk::Result> {
             let device = &self.vk.device;
             let begin = vk::CommandBufferBeginInfo::default()
@@ -935,16 +936,26 @@ impl DrawableImage {
 
             let cb_info = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
             let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cb_info)];
-            unsafe {
-                crate::vk_count!(queue_submit2);
-                crate::vk_count!(submit_other);
-                device.queue_submit2(self.vk.graphics_queue, &submit, vk::Fence::null())?;
-                device.queue_wait_idle(self.vk.graphics_queue)?;
+            crate::vk_count!(queue_submit2);
+            crate::vk_count!(submit_other);
+            if let Err(e) =
+                unsafe { device.queue_submit2(self.vk.graphics_queue, &submit, vk::Fence::null()) }
+            {
+                cb_pending = super::ops::submit_error_may_leave_pending(e);
+                return Err(e);
+            }
+            if let Err(e) = unsafe { device.queue_wait_idle(self.vk.graphics_queue) } {
+                cb_pending = true;
+                return Err(e);
             }
             Ok(())
         })();
 
-        unsafe { self.vk.device.free_command_buffers(pool, &[cb]) };
+        // A CB still pending after a failed submit or wait is leaked, not
+        // freed (VUID-vkFreeCommandBuffers-pCommandBuffers-00047).
+        if !cb_pending {
+            unsafe { self.vk.device.free_command_buffers(pool, &[cb]) };
+        }
         if result.is_ok() {
             self.current_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
         }
