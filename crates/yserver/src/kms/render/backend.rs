@@ -24969,6 +24969,10 @@ fn ensure_scanout_readback_op<'a>(
 /// allocates once, and the per-row reads that follow fit.
 const SCANOUT_READBACK_GRANULE: u64 = 1024 * 1024;
 
+/// How often an otherwise idle server re-polls the fences of freed
+/// drawables parked in `pending_retire`.
+const PENDING_RETIRE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
+
 /// Return the platform's scanout readback buffer, (re)allocating it when it
 /// is missing, smaller than `needed_bytes`, or from another `VkContext`.
 fn ensure_scanout_readback(
@@ -32416,15 +32420,31 @@ impl Backend for KmsBackend {
     }
 
     fn flush_before_damage_notify(&mut self) {
-        // A compositor may sample a redirected backing as soon as it receives
-        // DamageNotify. Close+submit the frame first so dma-buf implicit sync
-        // contains the producer fence before the notification is observable.
+        // A compositor may sample a redirected backing after DamageNotify
+        // or after retrieving coalesced damage via Subtract/FetchRegion.
+        // Close all recording paths before publishing their producer fences.
+        if let Err(error) = self.engine.flush_render_batch(
+            &mut self.store,
+            &mut self.platform,
+            crate::kms::render::engine::RenderFlushReason::Other,
+        ) {
+            log::warn!("render damage boundary batch flush failed: {error:?}");
+        }
         if let Err(error) = self.engine.close_open_frame(
             &mut self.store,
             &mut self.platform,
             crate::kms::render::frame_builder::CloseReason::RedirectSourceBoundary,
         ) {
             log::warn!("render DamageNotify submission boundary failed: {error:?}");
+        }
+        // Closing an already-closed frame does not drain command buffers
+        // parked in the submit group (including the render batch above).
+        if let Err(error) = self.engine.flush_submit_group(
+            &mut self.store,
+            &mut self.platform,
+            crate::kms::render::submit_group::FlushReason::SyncBoundary,
+        ) {
+            log::warn!("render damage boundary submit flush failed: {error:?}");
         }
     }
 
@@ -32475,11 +32495,17 @@ impl Backend for KmsBackend {
         let rescan_deadline = self
             .hotplug_rescan_deadline
             .map(|until| if now >= until { now } else { until });
+        // A drawable freed while its GPU work was in flight waits in
+        // `pending_retire` for `before_block` to see its fence signal; with
+        // no other activity nothing would wake us to release it.
+        let retire_deadline =
+            (self.store.pending_retire_count() > 0).then(|| now + PENDING_RETIRE_POLL_INTERVAL);
         let next_deadline = scene_deadline
             .into_iter()
             .chain(present_deadline)
             .chain(retired_output_deadline)
             .chain(rescan_deadline)
+            .chain(retire_deadline)
             // Not gated on `allow_kms_timers`: `maybe_composite` closes the
             // paint frame on its timeout while dark too (#177).
             .chain(self.engine.open_frame_timeout_deadline())
@@ -53026,6 +53052,89 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn damage_boundary_submits_render_batches_and_queued_commands() {
+        use crate::kms::{
+            cpu_types::Repeat,
+            render::{
+                engine::{RenderFlushReason, ResolvedSource, SourceDrawable},
+                target::Dst,
+            },
+            vk::ops::render::CompositeRect,
+        };
+        use yserver_core::backend::Backend;
+
+        for already_queued in [false, true] {
+            let mut b = KmsBackend::for_tests_with_vk().expect("live Vulkan ICD");
+            let src = b.create_pixmap(None, 32, 4, 4).expect("source");
+            let dst = b.create_pixmap(None, 32, 4, 4).expect("destination");
+            b.engine
+                .close_open_frame(
+                    &mut b.store,
+                    &mut b.platform,
+                    crate::kms::render::frame_builder::CloseReason::SyncWait,
+                )
+                .expect("submit initial clears");
+            b.platform.submit_group_set_max_size_for_tests(16);
+            let src_id = b.store.lookup(src.as_raw()).expect("source storage");
+            let dst_id = b.store.lookup(dst.as_raw()).expect("destination storage");
+            let appended = b
+                .engine
+                .try_append_render_batch(
+                    &mut b.store,
+                    &mut b.platform,
+                    1, // PictOpSrc
+                    ResolvedSource::Drawable(SourceDrawable::whole(src_id)),
+                    ResolvedSource::None,
+                    Dst::server_internal(dst_id),
+                    &[CompositeRect {
+                        src_x: 0,
+                        src_y: 0,
+                        mask_x: 0,
+                        mask_y: 0,
+                        dst_x: 0,
+                        dst_y: 0,
+                        width: 4,
+                        height: 4,
+                    }],
+                    None,
+                    Repeat::None,
+                    Repeat::None,
+                    None,
+                    None,
+                    false,
+                    0,
+                    0,
+                    0,
+                )
+                .expect("record composite");
+            assert!(appended.is_some(), "composite takes the batch path");
+            if already_queued {
+                b.engine
+                    .flush_render_batch(&mut b.store, &mut b.platform, RenderFlushReason::Other)
+                    .expect("close batch without submitting");
+                assert!(b.platform.submit_group_size() > 0);
+            } else {
+                assert!(b.engine.has_pending_batches_for_tests());
+            }
+
+            b.flush_before_damage_notify();
+
+            assert!(
+                !b.engine.has_pending_batches_for_tests(),
+                "damage boundary must close a pending render batch"
+            );
+            assert_eq!(
+                b.platform.submit_group_size(),
+                0,
+                "damage boundary must submit even without an open frame"
+            );
+            assert_eq!(b.engine.pending_group_ops_count_for_tests(), 0);
+            b.platform.wait_idle_bounded();
+        }
+    }
+
     /// Window-storage step 5: the root and the COW own their storage outside the lifecycle.
     #[test]
     #[ignore = "needs live Vulkan ICD"]
@@ -55317,6 +55426,48 @@ mod tests {
         b.platform.wait_idle_bounded();
         b.poll_pending_retire_with_invalidate();
         assert!(b.store.get(sprite).is_none(), "sprite pixmap released");
+    }
+
+    /// A pixmap freed while its clear is in flight is parked; an otherwise
+    /// idle server must still wake to release it once the fence signals.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn idle_server_wakes_to_release_a_pixmap_freed_in_flight() {
+        use yserver_core::backend::Backend;
+        let mut b = match KmsBackend::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+        // Display dark: no compose deadline, so any wake is the retire poll.
+        b.kms_outputs_active = false;
+        let xid = b.create_pixmap(None, 32, 61, 59).expect("pixmap").as_raw();
+        let id = b.store.lookup(xid).expect("pixmap in store");
+        b.free_pixmap(None, xid).expect("free pixmap");
+        assert_eq!(b.store.pending_retire_count(), 1, "clear still in flight");
+        b.engine
+            .close_open_frame(
+                &mut b.store,
+                &mut b.platform,
+                crate::kms::render::frame_builder::CloseReason::SyncWait,
+            )
+            .expect("close frame");
+        b.engine
+            .flush_submit_group(
+                &mut b.store,
+                &mut b.platform,
+                crate::kms::render::submit_group::FlushReason::SyncBoundary,
+            )
+            .expect("flush");
+        let wake = b.next_wakeup().expect("parked pixmap schedules a wake");
+        assert!(wake <= std::time::Instant::now() + super::PENDING_RETIRE_POLL_INTERVAL);
+        b.platform.wait_idle_bounded();
+        b.before_block();
+        assert!(b.store.get(id).is_none(), "freed pixmap released on wake");
+        assert_eq!(b.store.pending_retire_count(), 0);
+        assert!(b.next_wakeup().is_none(), "nothing left to wake for");
     }
 
     /// A GrabPointer cursor is the top-priority sprite: it overrides the

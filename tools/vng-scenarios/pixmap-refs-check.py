@@ -28,8 +28,9 @@ for line in open(f"{out}/yserver.log", errors="replace"):
 
 def settled(end):
     # Rows are stamped truncated and written within the next second; the
-    # probe sleeps 4 s after each phase, so these were written in its gap.
-    rows = [n for t, n in samples if end + 1.5 <= t <= end + 2.5]
+    # probe sleeps 5 s after each phase, so these were written in its gap.
+    # 2.5 s wide: the sampler drifts and now and then skips a second.
+    rows = [n for t, n in samples if end + 1.0 <= t <= end + 3.5]
     return rows[-1] if rows else None
 
 

@@ -83,7 +83,8 @@ impl Drop for OpsCommandPool {
 /// failure window of `record(...)` and `end_command_buffer`):
 ///   0. pre-submit failure (begin/record/end): CB safe to free.
 ///   1a. fence-create failure: CB safe to free.
-///   1b. submit failure: destroy fence, CB safe to free.
+///   1b. submit failure: destroy fence, CB safe to free (after a
+///       device loss: leak both, like path 2).
 ///   2.  wait failure (CB in flight): LEAK CB + fence. Renderer
 ///       must be torn down.
 ///   3.  success: destroy fence + free CB; Ok(()).
@@ -99,8 +100,18 @@ where
     run_one_shot_op_with_wait(vk, pool, None, record).map_err(|e| e.result)
 }
 
+/// Whether a failed `vkQueueSubmit2` may have left its command buffers
+/// pending. The spec only guarantees an unaffected state for the
+/// out-of-memory errors; after `ERROR_DEVICE_LOST` the validation layer
+/// treats them as in use, so freeing them is
+/// VUID-vkFreeCommandBuffers-pCommandBuffers-00047.
+pub(crate) fn submit_error_may_leave_pending(result: vk::Result) -> bool {
+    result == vk::Result::ERROR_DEVICE_LOST
+}
+
 /// Failure of [`run_one_shot_op_with_wait`]. `in_flight` is true only when
-/// the submission's fence wait failed: the work may still be running, so
+/// the submission's fence wait failed, or its submit failed with a lost
+/// device: the work may still be running, so
 /// anything it writes must be abandoned rather than freed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OneShotError {
@@ -155,7 +166,8 @@ where
     //   1a. create_fence fails: CB recorded, no fence yet. Free
     //       CB, return Err. No fence to destroy.
     //   1b. queue_submit2 fails: CB never queued. Destroy fence,
-    //       free CB, return Err.
+    //       free CB, return Err. ERROR_DEVICE_LOST may leave the CB
+    //       pending: abandon both, like path 2.
     //   2.  wait_for_fences fails: CB IS in flight or device is
     //       lost. ABANDON the CB and the fence — Vulkan handles
     //       are leaked until VkContext::Drop. Same leak-not-UB
@@ -188,7 +200,8 @@ where
         let fence = unsafe { vk.device.create_fence(&fence_info, None) }?;
 
         // Path 1b — submit failure. Destroy the fence; the CB is
-        // still safe to free (cb_safe_to_free stays true).
+        // still safe to free, unless the device was lost (then both
+        // are abandoned like path 2).
         let cb_info = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
         let waits = wait_semaphore.map(|semaphore| {
             [vk::SemaphoreSubmitInfo::default()
@@ -203,7 +216,11 @@ where
         crate::vk_count!(queue_submit2);
         crate::vk_count!(submit_one_shot);
         if let Err(e) = unsafe { vk.device.queue_submit2(vk.graphics_queue, &submit, fence) } {
-            unsafe { vk.device.destroy_fence(fence, None) };
+            if submit_error_may_leave_pending(e) {
+                cb_safe_to_free = false;
+            } else {
+                unsafe { vk.device.destroy_fence(fence, None) };
+            }
             return Err(e);
         }
 
@@ -317,7 +334,10 @@ impl ReusableOneShot {
             vk.device
                 .queue_submit2(vk.graphics_queue, &submit, self.fence)
         }
-        .map_err(not_submitted)?;
+        .map_err(|result| OneShotError {
+            result,
+            in_flight: submit_error_may_leave_pending(result),
+        })?;
         unsafe { vk.device.wait_for_fences(&[self.fence], true, u64::MAX) }.map_err(|result| {
             log::error!(
                 "ReusableOneShot: wait_for_fences failed ({result:?}); CB and fence abandoned"

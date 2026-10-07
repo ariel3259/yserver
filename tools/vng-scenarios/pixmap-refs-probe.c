@@ -53,7 +53,7 @@ static void run(const char *name, void (*body)(void)) {
     body();
     sync_server(c);
     phase(name, "end");
-    sleep(4);
+    sleep(5);
 }
 
 static xcb_gcontext_t gc_deep, gc_deep2;
@@ -239,7 +239,7 @@ int main(void) {
     sleep(2);
     phase("baseline", "start");
     phase("baseline", "end");
-    sleep(4);
+    sleep(5);
     run("clip", clip);
     run("clip_rects", clip_rects);
     run("tile", tile);

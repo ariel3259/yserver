@@ -62,7 +62,7 @@ use crate::{
         scanout_route::{RenderKmsRelationship, ScanoutRoute},
         vk::{
             device::{VkContext, VkInitError, VulkanDeviceSelector},
-            ops::OpsCommandPool,
+            ops::{OpsCommandPool, submit_error_may_leave_pending},
             scanout::{
                 BoPhase, BoState, CopiedScanoutPlan, CopiedScanoutPool, DisposableProbeError,
                 OutputScanout, ScanoutAllocationPlan, ScanoutBoPool,
@@ -255,6 +255,24 @@ impl std::fmt::Debug for FenceTicketInner {
     }
 }
 
+/// Logs a failed `vkGetFenceStatus`. A lost device fails every fence at
+/// once (hundreds within a second at teardown, #214), so only the first
+/// `ERROR_DEVICE_LOST` is logged; the rest go to debug.
+fn log_fence_status_error(site: &str, error: vk::Result) {
+    static DEVICE_LOST_LOGGED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    if error != vk::Result::ERROR_DEVICE_LOST {
+        log::warn!("{site}: get_fence_status: {error:?}");
+    } else if !DEVICE_LOST_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        log::error!(
+            "{site}: get_fence_status: {error:?}; further device-lost fence errors are \
+             logged at debug"
+        );
+    } else {
+        log::debug!("{site}: get_fence_status: {error:?}");
+    }
+}
+
 impl FenceTicket {
     /// Record that the exact render submission reached its exported
     /// completion signal. The render-completion poller is registered against
@@ -308,7 +326,7 @@ impl FenceTicket {
         match self.poll_signaled_result(vk) {
             Ok(signaled) => signaled,
             Err(e) => {
-                log::warn!("FenceTicket::poll_signaled: get_fence_status: {e:?}");
+                log_fence_status_error("FenceTicket::poll_signaled", e);
                 false
             }
         }
@@ -450,7 +468,8 @@ impl Drop for FenceTicketInner {
                 }
                 Ok(false) => false,
                 Err(e) => {
-                    log::warn!("FenceTicketInner::drop: get_fence_status: {e:?}");
+                    log_fence_status_error("FenceTicketInner::drop", e);
+                    pool.renderer_failed = true;
                     false
                 }
             };
@@ -467,12 +486,20 @@ impl Drop for FenceTicketInner {
             // this fence (it might be referenced by an
             // in-flight submit). Leak the handle and flag the
             // renderer as failed so the next op surfaces the
-            // condition.
-            log::error!(
-                "FenceTicket: leaked unsignaled fence {:?} on drop \
-                 — renderer_failed will be set on next platform access",
-                self.fence,
-            );
+            // condition. Once the renderer has failed (a lost device
+            // fails every pending fence) the leak is expected: debug.
+            if pool.renderer_failed {
+                log::debug!(
+                    "FenceTicket: leaked unsignaled fence {:?} on drop (renderer failed)",
+                    self.fence,
+                );
+            } else {
+                log::error!(
+                    "FenceTicket: leaked unsignaled fence {:?} on drop \
+                     — renderer_failed will be set on next platform access",
+                    self.fence,
+                );
+            }
             pool.renderer_failed = true;
             pool.leaked_fences.push(self.fence);
         }
@@ -7827,7 +7854,7 @@ impl PlatformBackend {
         // never taken.
         if self.force_next_submit_failure {
             self.force_next_submit_failure = false;
-            return self.abort_flush(entries, n, reason, vk::Result::ERROR_DEVICE_LOST);
+            return self.abort_flush(entries, n, reason, vk::Result::ERROR_DEVICE_LOST, false);
         }
         // GLX-TFP read→write wait: snapshot every exported dma-buf's
         // WRITE-scope reservation fences and import them as temporary
@@ -7935,12 +7962,15 @@ impl PlatformBackend {
                 Ok(outcome)
             }
             Err(e) => {
-                unsafe {
-                    for semaphore in imported_wait_semaphores {
-                        vk.device.destroy_semaphore(semaphore, None);
+                let may_be_pending = submit_error_may_leave_pending(e);
+                if !may_be_pending {
+                    unsafe {
+                        for semaphore in imported_wait_semaphores {
+                            vk.device.destroy_semaphore(semaphore, None);
+                        }
                     }
                 }
-                self.abort_flush(entries, n, reason, e)
+                self.abort_flush(entries, n, reason, e, may_be_pending)
             }
         }
     }
@@ -7976,15 +8006,22 @@ impl PlatformBackend {
     /// surfaces the underlying `vk::Result`. Both the real
     /// `queue_submit2 Err` arm and the test-only fault injection
     /// (Task 3 Step 7) route through this helper so cleanup is uniform.
+    ///
+    /// `may_be_pending` (the submit failed with a lost device) leaks the
+    /// CBs instead: freeing them would be
+    /// VUID-vkFreeCommandBuffers-pCommandBuffers-00047.
     fn abort_flush(
         &mut self,
         entries: Vec<super::submit_group::GroupEntry>,
         n: usize,
         reason: FlushReason,
         err: vk::Result,
+        may_be_pending: bool,
     ) -> Result<FlushOutcome, vk::Result> {
         self.renderer_failed = true;
-        if let (Some(vk), Some(pool)) = (self.vk.as_ref(), self.ops_command_pool_handle()) {
+        if may_be_pending {
+            log::error!("flush_submit_group: submit failed ({err:?}); leaking {n} command buffers");
+        } else if let (Some(vk), Some(pool)) = (self.vk.as_ref(), self.ops_command_pool_handle()) {
             let cbs: Vec<vk::CommandBuffer> = entries.iter().map(|e| e.cb).collect();
             if !cbs.is_empty() {
                 unsafe { vk.device.free_command_buffers(pool, &cbs) };

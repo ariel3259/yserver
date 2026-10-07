@@ -668,6 +668,19 @@ yserver-plasma-hw log="info":
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null'
 
+# KWin with buffer age off (full repaints): discriminates the Dolphin hover flicker (#100).
+yserver-plasma-hw-no-buffer-age log="info":
+    cargo build --release --bin yserver
+    bash -c '\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-plasma.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
+            XDG_SESSION_TYPE=x11 KWIN_USE_BUFFER_AGE=0 \
+            dbus-run-session startplasma-x11 > plasma.log 2>&1;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null'
+
 yserver-plasma-hw-trace log="debug":
     cargo build --release --bin yserver
     rm -f plasma.xtrace

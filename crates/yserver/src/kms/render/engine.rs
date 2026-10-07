@@ -2418,9 +2418,12 @@ impl RenderEngine {
         // Wait on each ticket in order. Off-hot-path; one wait
         // per pending op is fine at shutdown.
         while let Some(mut op) = inner.submitted.pop_front() {
-            let _ = op.ticket.wait(&inner.vk);
-            unsafe {
-                device.free_command_buffers(pool, &[op.cb]);
+            // A failed wait (lost device) leaves the CB pending: leak it
+            // (VUID-vkFreeCommandBuffers-pCommandBuffers-00047).
+            if op.ticket.wait(&inner.vk).is_ok() {
+                unsafe {
+                    device.free_command_buffers(pool, &[op.cb]);
+                }
             }
             drop(op.staging.take());
             // Phase B.2 Mechanism 3: explicit release of retired
@@ -3085,7 +3088,8 @@ impl RenderEngine {
                 })
             }
             Err(e) => {
-                // Platform's abort_flush already freed CBs + set renderer_failed.
+                // Platform's abort_flush already freed (or, after a device loss,
+                // leaked) the CBs + set renderer_failed.
                 if let Err(re) = rollback_pre_submit(store, &mut open_frame) {
                     log::error!(
                         "rollback_pre_submit failed during close-frame error unwind \
