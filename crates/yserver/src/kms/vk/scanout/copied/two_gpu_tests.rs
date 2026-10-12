@@ -584,3 +584,30 @@ fn copied_source_transfers_across_gpus_two_gpu() {
         panic!("NVIDIA renderer -> AMD RADV sink 1920x1080 failed: {error}")
     });
 }
+
+#[test]
+#[ignore = "needs the NVIDIA and AMD Vulkan devices"]
+fn copied_source_imports_on_the_sink_at_unaligned_widths_two_gpu() {
+    let mut failures = Vec::new();
+    for (width, height) in [
+        (1366, 768),
+        (1440, 900),
+        (1680, 1050),
+        (1920, 1080),
+        (2560, 1440),
+    ] {
+        match run_two_gpu_transfer(NVIDIA_VENDOR_ID, width, height) {
+            Ok(()) => eprintln!("two_gpu sink import and logical digest {width}x{height}: passed"),
+            Err(error) => {
+                eprintln!(
+                    "two_gpu sink import and logical digest {width}x{height}: failed: {error}"
+                );
+                failures.push(format!("{width}x{height}: {error}"));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "two-GPU copied import failures: {failures:#?}"
+    );
+}
