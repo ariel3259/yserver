@@ -31,7 +31,10 @@ The padded columns are never read into a destination. If an import still fails, 
 **Direction (user, 2026-10-11).** Reverse PRIME (#95, AprilGrimoire) was built and validated in the other direction: the AMD Radeon 780M iGPU renders and the NVIDIA RTX 4070 shows, at 1600×1200. There the renderer's `DEVICE_LOCAL` memory is system RAM (UMA), and 1600×4 bytes is 256-aligned, so neither defect appears.
 - **Who renders:** the primary card is the first card, in enumeration order, with a connected connector (`platform/drm.rs` `primary_kms_card_candidate_index`). Its render node renders everything.
 - **When these defects appear:** when a discrete GPU is primary and a monitor is also on an integrated GPU's output, e.g. a desktop whose dGPU enumerates as `card0`, or a render-node override.
-- **Effect on April's direction:** none, and this plan keeps it that way. The system-memory preference only changes a renderer whose `DEVICE_LOCAL` type is not already system memory; the padding only changes widths that are not multiples of 64.
+- **Effect on April's direction:**
+  - On an APU renderer, the system-memory preference moves the transport from the `DEVICE_LOCAL` carve-out to a GTT type. Both are system RAM, so the dGPU sink still reads them.
+  - The padding only changes widths that are not multiples of 64.
+  - Task 1 pins this direction with its own test.
 - The PR text (Task 3) says this.
 
 **Base:** `joske/master` `0e5c09ea` (layout refactor phase 2 merged), branch `fix/copied-prime-transport` (renamed from `fix/copied-transport-pitch`), worktree `~/Projects/yserver-fix-copied-pitch`. It is independent of the KMS-owner PR series and goes upstream as its own small PR.
@@ -90,6 +93,7 @@ The padded columns are never read into a destination. If an import still fails, 
     - `DeviceLocal` picks type 1 in every case.
 
     **Mutation:** treat `DEVICE_LOCAL | HOST_VISIBLE` (type 4) as acceptable for `CrossDevice`; it must not be chosen.
+  - `copied_source_transfers_from_igpu_to_dgpu_two_gpu` (April's direction): the renderer is the AMD radv context and the sink is the NVIDIA context; same transfer and pixel check at 1920×1080 and 1600×1200. It passes before and after the change; the report names the memory type chosen in each run. **Mutation:** a `CrossDevice` choice that returns no type (`None`), which must fail allocation. Only Vulkan devices and render nodes are used, never `card1`.
   - `copied_source_transfers_across_gpus_two_gpu`, `#[ignore = "needs the NVIDIA and AMD Vulkan devices"]`, at 1920×1080:
     - contexts as in Task 2's `two_gpu` test;
     - `CopiedRenderSource::allocate_exact` with the linear plan;
