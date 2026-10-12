@@ -28,6 +28,12 @@ The padded columns are never read into a destination. If an import still fails, 
 - Mesa 26.1.8 radv requires a linear pitch that is a multiple of 256 bytes on GFX9–GFX11 (`ac_surface.c` `ac_surface_get_pitch_align`, `ac_surface_override_offset_stride`);
 - 1920, 2560, 3840, 1280 and 1000 import on this host; the extra widths 1440 and 1680 are predicted from the 128-byte rule and are confirmed by this plan's test.
 
+**Direction (user, 2026-10-11).** Reverse PRIME (#95, AprilGrimoire) was built and validated in the other direction: the AMD Radeon 780M iGPU renders and the NVIDIA RTX 4070 shows, at 1600×1200. There the renderer's `DEVICE_LOCAL` memory is system RAM (UMA), and 1600×4 bytes is 256-aligned, so neither defect appears.
+- **Who renders:** the primary card is the first card, in enumeration order, with a connected connector (`platform/drm.rs` `primary_kms_card_candidate_index`). Its render node renders everything.
+- **When these defects appear:** when a discrete GPU is primary and a monitor is also on an integrated GPU's output, e.g. a desktop whose dGPU enumerates as `card0`, or a render-node override.
+- **Effect on April's direction:** none, and this plan keeps it that way. The system-memory preference only changes a renderer whose `DEVICE_LOCAL` type is not already system memory; the padding only changes widths that are not multiples of 64.
+- The PR text (Task 3) says this.
+
 **Base:** `joske/master` `0e5c09ea` (layout refactor phase 2 merged), branch `fix/copied-prime-transport` (renamed from `fix/copied-transport-pitch`), worktree `~/Projects/yserver-fix-copied-pitch`. It is independent of the KMS-owner PR series and goes upstream as its own small PR.
 
 ## Global Constraints
