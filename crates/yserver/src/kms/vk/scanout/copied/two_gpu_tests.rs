@@ -557,6 +557,28 @@ impl DisposableProbeAttempt for TwoGpuAttempt {
     }
 }
 
+/// The `--ignored` suite also runs on GPU-less CI with lavapipe as the only
+/// ICD; like the other hardware tests, these skip when their devices are absent.
+/// Once both are present, every failure is a test failure.
+fn gpu_pair_or_skip() -> bool {
+    let gpus = match enumerate_test_gpus() {
+        Ok(gpus) => gpus,
+        Err(error) => {
+            eprintln!("skipping: no Vulkan devices: {error}");
+            return false;
+        }
+    };
+    let has_nvidia = gpus.iter().any(|gpu| gpu.vendor_id == NVIDIA_VENDOR_ID);
+    let has_radv = gpus
+        .iter()
+        .any(|gpu| gpu.vendor_id == AMD_VENDOR_ID && gpu.driver_id == vk::DriverId::MESA_RADV);
+    if !(has_nvidia && has_radv) {
+        eprintln!("skipping: needs an NVIDIA and an AMD RADV Vulkan device; found {gpus:?}");
+        return false;
+    }
+    true
+}
+
 fn run_two_gpu_transfer(render_vendor: u32, width: u32, height: u32) -> Result<(), String> {
     let (renderer, sink, render_vk, sink_vk) =
         two_gpu_contexts(render_vendor).map_err(|error| error.to_string())?;
@@ -570,6 +592,9 @@ fn run_two_gpu_transfer(render_vendor: u32, width: u32, height: u32) -> Result<(
 #[test]
 #[ignore = "needs the NVIDIA and AMD Vulkan devices"]
 fn copied_source_transfers_from_igpu_to_dgpu_two_gpu() {
+    if !gpu_pair_or_skip() {
+        return;
+    }
     for (width, height) in [(1920, 1080), (1600, 1200)] {
         run_two_gpu_transfer(AMD_VENDOR_ID, width, height).unwrap_or_else(|error| {
             panic!("AMD RADV renderer -> NVIDIA sink {width}x{height} failed: {error}")
@@ -580,6 +605,9 @@ fn copied_source_transfers_from_igpu_to_dgpu_two_gpu() {
 #[test]
 #[ignore = "needs the NVIDIA and AMD Vulkan devices"]
 fn copied_source_transfers_across_gpus_two_gpu() {
+    if !gpu_pair_or_skip() {
+        return;
+    }
     run_two_gpu_transfer(NVIDIA_VENDOR_ID, 1920, 1080).unwrap_or_else(|error| {
         panic!("NVIDIA renderer -> AMD RADV sink 1920x1080 failed: {error}")
     });
@@ -588,6 +616,9 @@ fn copied_source_transfers_across_gpus_two_gpu() {
 #[test]
 #[ignore = "needs the NVIDIA and AMD Vulkan devices"]
 fn copied_source_imports_on_the_sink_at_unaligned_widths_two_gpu() {
+    if !gpu_pair_or_skip() {
+        return;
+    }
     let mut failures = Vec::new();
     for (width, height) in [
         (1366, 768),
