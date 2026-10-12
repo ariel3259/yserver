@@ -37,7 +37,7 @@ The padded columns are never read into a destination. If an import still fails, 
 
 ## Review Focus
 
-1. **A copy region or readback that uses the transport's allocated extent instead of the logical one.** It would read or write the padded columns into the destination or the digest. Expected: every region uses `width()` / `height()` (logical). Pinned by the pixel test of Task 1.
+1. **A copy region or readback that uses the transport's allocated extent instead of the logical one.** It would read or write the padded columns into the destination or the digest. Expected: every region uses `width()` / `height()` (logical). **The bounds evidence is Task 1's copy-region audit** (every `vk::ImageCopy`, `BufferImageCopy` and digest listed in the report with its extent). The pixel test only shows that the logical content is preserved: a copy widened to the transport width could still produce the expected first columns *(plan review r1, m-1)*.
 2. **Memory accounting and the qualification probe** (`allocate_exact_for_disposable_probe`) see the padded transport. Expected: the probe uses the same padded allocation as the live pool, so it qualifies what will run.
 3. **A width already a multiple of 64.** Expected: no padding; the allocation is byte-identical to today's.
 
