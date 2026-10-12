@@ -1,5 +1,8 @@
 use super::*;
 
+#[cfg(test)]
+mod two_gpu_tests;
+
 /// Exact usage of GPU B's imported alias of A's DMA-BUF transport. Keep this
 /// single value shared by the capability query and actual import.
 pub(super) const COPIED_SINK_IMPORT_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::TRANSFER_SRC;

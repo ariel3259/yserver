@@ -38,6 +38,14 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   `nix 0.31.3` still requires. Revisit the pin when upstream compatibility
   is restored.
 
+- **2026-10-11 copied PRIME transport, Task 1 (branch
+  `fix/copied-prime-transport`):** copied-source exports prefer compatible
+  system memory on the renderer; same-device exports retain the historical
+  device-local preference. Headless NVIDIA ↔ AMD RADV transfer tests, disposal
+  checks, and the Task 1 gate passed. Transport pitch padding (Task 2) remains
+  pending. See `target/codex-reports/copied_t1_report.md` for test and hardware
+  results.
+
 - **2026-10-07 #100 fix:** submit paint before
   DamageSubtract consumes coalesced damage and before XFixes FetchRegion
   publishes it. The KMS boundary drains render batches, open frames and queued
