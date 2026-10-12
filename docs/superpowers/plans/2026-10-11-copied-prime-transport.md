@@ -90,6 +90,13 @@ The padded columns are never read into a destination. If an import still fails, 
     - a pattern rendered on the renderer, copied through the transport, and copied on the sink into a sink-local image, matches on readback.
 
     **Mutation:** `CrossDevice` → today's choice. The sink submit then fails with device lost, and the test must fail, not hang.
+
+    **Disposal contract** *(plan review r2, M-1)*:
+    - The headless harness owns both contexts, the source, the sink-local image, the pattern and digest resources, and every submission resource as **one disposable attempt**, as the pool probe's aggregate owner does (`scanout.rs` ~L669, `probe.rs` ~L99).
+    - Fence waits are bounded.
+    - Normal destruction happens only after completion is proved on both devices.
+    - On device loss or an unproved completion, the attempt keeps (leaks) the referenced graph instead of destroying it or waiting without bound. This mirrors the production probe's quarantine (`copied.rs` ~L1302).
+    - The contract covers the initial failing run, the device-local mutation, and Task 2's `two_gpu` test, which reuses the harness.
 - [ ] **Step 2:** Run them; they fail.
 - [ ] **Step 3:** Implement.
 - [ ] **Step 4:** Gate (all five steps) and the load gate for the new tests. Record the change in `amdgpu ... Not enough memory for command submission` lines; only the mutation run may add them.
