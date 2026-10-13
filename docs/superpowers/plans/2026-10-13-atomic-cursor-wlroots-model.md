@@ -32,7 +32,7 @@ hidden. No KMS thread.
 - **AMD and i915:** amdgpu (`atomic_async_*`) and i915 (`intel_legacy_cursor_update`) apply legacy moves immediately,
   so on them this model trades an immediate update for added cursor latency: up to two frames in the worst case,
   when motion arrives just after a commit started and waits for its retirement. The user chose one model for every
-  driver (2026-10-13); Task 5 measures that latency on amdgpu.
+  driver (2026-10-13); Task 7 measures that latency on amdgpu.
 - **Spike diff:** `~/Projects/claude-scratch/yserver-pr1/bin-spike/spike-final.diff`. Reference only; its scene parts
   predate 3b and it was NVIDIA-only.
 
@@ -50,7 +50,7 @@ hidden. No KMS thread.
 - **Test rules:**
   - **A**, end-state checks: no cursor commit left in flight, no unsent position, the recorded commit sequence exact.
   - **B**, advance only through `Backend` trait entries or `yserver_core::core_loop::run_core`.
-  - **C**, hardware validation per real-path task (Task 5).
+  - **C**, hardware validation per real-path task (Task 7).
   - **F**, each new test 5 times under 16 `nproc` busy loops started outside the tests and killed afterwards.
 - Every test names the mutation that must make it fail; run it once.
 - Show/hide and image upload keep master's legacy ioctls (`set_cursor2`); only positions go atomic.
@@ -86,16 +86,16 @@ hidden. No KMS thread.
 1. **A cursor-only commit in flight when the topology changes or the VT is released.** Its flip event must be
    drained by the existing old-event discard, never attributed to the next scene flip on a reused CRTC. Add cursor
    in-flight CRTCs to `pending_pageflip_crtcs` (`backend/kms/crtc_config.rs:42`) and to the VT path's equivalent
-   (Task 3 test).
+   (Task 5 test).
 2. **A RANDR mode change passing through zero active CRTCs.** The plane-to-CRTC position properties are discovery
    data and must survive `CursorPlane::retain_crtcs`; the spike fell back to the software cursor here (Task 1 test).
 3. **Motion while a direct-scanout successor or unflip is pending.** Nothing may be submitted to those CRTCs, and
    every CRTC's position must ride the next direct or composed transaction (Tasks 2–3 tests).
 4. **The cursor shown again during direct scanout after a game hid it.** The existing path must bind the plane or
-   unflip; the cursor must never be invisible while shown (Task 4 test).
+   unflip; the cursor must never be invisible while shown (Task 6 test).
 5. **Cursor latency on amdgpu and i915**, where legacy moves were immediate. It is measured motion-to-visible, not
    only motion-to-accept: motion arriving just after a commit started waits for that commit's retirement and is
-   visible a frame later (Task 1 instrumentation, Task 5 acceptance).
+   visible a frame later (Task 1 instrumentation, Task 7 acceptance).
 
 ---
 
@@ -113,7 +113,7 @@ hidden. No KMS thread.
 - **`AtomicCommitSink`,** held per KMS device:
   - Construction: a constructor parameter. In production it is the device's `atomic_commit`. A `#[cfg(test)]`
     recorder stores each request's object/property/value triples and flags. The recorder's result can be scripted
-    per call (`Ok`, `EBUSY`, `EINVAL`) for Task 3's rejection test.
+    per call (`Ok`, `EBUSY`, `EINVAL`) for Task 5's rejection tests.
   - It records each commit's kind (`cursor-only`, `scene-with-cursor`, `scene`), ioctl time and result.
   - Debug log: `atomic commit kind=… crtc=… ioctl_us=… result=…`.
   - Per-second info line under `YSERVER_LOOP_TELEMETRY`: per-kind counts, EBUSY, max/p99 ioctl µs, and two cursor
@@ -162,13 +162,12 @@ hidden. No KMS thread.
 - [ ] Test: a legacy-path device's scene commits carry no cursor properties. Mutation: append unconditionally.
 - [ ] Gate; commit `feat(kms): the cursor position rides the scene's atomic commits`.
 
-### Task 3: Cursor-only commits, retirement and the shared gate
+### Task 3: Cursor-only commits, retirement and the scene gate
 
-**Files:** `platform/cursor.rs`, `platform/flip_events.rs`, `backend/portable/pointer.rs`,
-`backend/kms/{scanout.rs,present.rs,crtc_config.rs,session.rs}`,
+**Files:** `platform/cursor.rs`, `platform/flip_events.rs`, `backend/portable/pointer.rs`, `backend/trait_impl.rs`,
 `crates/yserver-render/src/kms/render/scene/{sink.rs,tick.rs}`.
 
-**Interfaces / invariants:**
+**Interfaces / invariants** (Tasks 4 and 5 build on these):
 - **Per-CRTC state:** `atomic_pending_moves` (latest wins) and `atomic_cursor_commits_in_flight`.
 - **Motion on an atomic-path device never submits directly (M-5).**
   - It stores the position (with its event timestamp) and marks the backend's scheduling pass as wanted.
@@ -188,21 +187,9 @@ hidden. No KMS thread.
   1. submits a waiting direct candidate whose CRTCs are all clear;
   2. otherwise lets the scene submit if it has a frame ready for that output;
   3. only then sends the unsent position as a cursor-only commit.
-- **Direct Present behind a cursor commit (M-1, B-2).** It depends on whether a direct frame already owns scanout.
-  - **First entry** (no direct frame `current` or `pending`): a cursor-only commit in flight on any of its outputs is
-    treated exactly like master's "scene flip pending" case (`present.rs` ~L839). The Present is not taken direct
-    this time (`Ok(false)`, pins released, composed path as today), and the next Present retries. No queued-only
-    direct state is ever created, so no cancellation owner is needed.
-  - **Successor** (a direct frame is `current`, fully retired): the Present goes into master's successor slot
-    (latest-wins, the same pin/Skip rules). The cursor-only retirement that clears its last blocking CRTC calls the
-    `submit_queued_direct_successor` path. If an unflip was requested meanwhile, master's composed replacement — which
-    exists because `current` is set — Skips it as today.
 - **Scene gate:** new `OutputSink::output_commit_in_flight(output_idx) -> bool` (`false` in `TestSink` unless set).
   The scene's per-output submit gate (`tick_one_output`) and `has_output_ready_for_submit` treat it like a non-empty
   `pending_acks`. The composed unflip also waits while a cursor-only commit is in flight on its outputs.
-- **Old events:** `pending_pageflip_crtcs` and the VT-release path's set include CRTCs with a cursor-only commit in
-  flight, so the old-event discard drains them (Review Focus 1). `cursor_plane_hide_all` and topology changes clear
-  the per-CRTC state only after that discard.
 
 - [ ] Test `idle_motion_coalesces_until_cursor_flip_retires` (via `Backend::warp_pointer_root` and
   `on_page_flip_ready`): one cursor-only commit, nothing until retirement, then one commit with the latest position.
@@ -214,6 +201,27 @@ hidden. No KMS thread.
 - [ ] Test (M-5): scene damage is pending behind a cursor-only commit. Then come the retirement, then more motion,
   then the scheduling pass. The next commit is the scene's, carrying the latest position, and no cursor-only commit
   goes out in between. Mutation: let motion submit a cursor-only commit immediately.
+- [ ] Test `legacy_path_pointer_motion_keeps_one_legacy_move_and_no_atomic_commit`. Mutation: route the legacy device
+  through the atomic branch.
+- [ ] Gate; commit `feat(kms): cursor-only atomic commits, one commit in flight per CRTC`.
+
+### Task 4: Direct scanout and the cursor commit stream
+
+**Files:** `backend/kms/{present.rs,scanout.rs}`, `platform/cursor.rs`.
+
+**Interfaces / invariants:**
+- **Direct Present behind a cursor commit (M-1, B-2).** It depends on whether a direct frame already owns scanout.
+  - **First entry** (no direct frame `current` or `pending`): a cursor-only commit in flight on any of its outputs is
+    treated exactly like master's "scene flip pending" case (`present.rs` ~L839). The Present is not taken direct
+    this time (`Ok(false)`, pins released, composed path as today), and the next Present retries. No queued-only
+    direct state is ever created, so no cancellation owner is needed.
+  - **Successor** (a direct frame is `current`, fully retired): the Present goes into master's successor slot
+    (latest-wins, the same pin/Skip rules). The cursor-only retirement that clears its last blocking CRTC calls the
+    `submit_queued_direct_successor` path. If an unflip was requested meanwhile, master's composed replacement — which
+    exists because `current` is set — Skips it as today.
+- Direct first-entry admission, `submit_queued_direct_successor` and the composed unflip check the Task 3 blocker
+  (no cursor-only commit in flight on their CRTCs). Step 1 of Task 3's arbitration resumes a retained successor.
+
 - [ ] Test (Review Focus 3): motion while a direct successor is pending sends nothing; the successor carries it.
   Mutation: drop the direct blocker.
 - [ ] Test (M-1, successor behind a cursor commit):
@@ -228,6 +236,27 @@ hidden. No KMS thread.
   - after the retirement, the next eligible Present enters direct;
   - a root overlay appearing in between leaves nothing retained.
   Mutation: queue the first-entry Present in the successor slot.
+- [ ] Gate; commit `feat(kms): direct scanout waits for and resumes after cursor-only commits`.
+
+### Task 5: Rejections, topology changes and VT release
+
+**Files:** `platform/cursor.rs`, `platform/flip_events.rs`, `backend/kms/{scanout.rs,crtc_config.rs,session.rs}`.
+
+**Interfaces / invariants:** the **Rejections** rules in Global Constraints (EBUSY → `cursor_retry_waits_for_flip`;
+other errors → legacy hide, then software fallback or motion-driven hide recovery), and:
+- **Old events:** `pending_pageflip_crtcs` and the VT-release path's set include CRTCs with a cursor-only commit in
+  flight, so the old-event discard drains them (Review Focus 1). `cursor_plane_hide_all` and topology changes clear
+  the per-CRTC state only after that discard.
+
+- [ ] Test (M-2): the recorder rejects a cursor-only commit with EBUSY. Expect:
+  - no in-flight state and the position still unsent;
+  - one EBUSY counted;
+  - the next scene frame submits without any synthetic flip event and carries the position;
+  - no second cursor-only attempt in the same pass.
+  Mutation: mark in flight before the ioctl result.
+- [ ] Test (M-6): after a cursor-only EBUSY on an idle desktop, three successive scheduling passes without new input
+  attempt no cursor-only commit, and the compose-wanted predicate is false. New motion does not change that. A flip
+  event on the CRTC re-enables exactly one cursor-only commit. Mutation: do not mark `cursor_retry_waits_for_flip`.
 - [ ] Test (M-3): the recorder rejects a cursor-only commit with EINVAL.
   - The plane is hidden through the legacy ioctl and the CRTC goes to software fallback.
   - The next scene request carries no cursor fields and is accepted.
@@ -239,23 +268,12 @@ hidden. No KMS thread.
     - When it fails three times, the device is `permanently_disabled` and no fourth hide is attempted.
     - No retry depends on a flip event.
   Mutation: keep the unsent position after EINVAL; separately, never retry the hide.
-- [ ] Test (M-6): after a cursor-only EBUSY on an idle desktop, three successive scheduling passes without new input
-  attempt no cursor-only commit, and the compose-wanted predicate is false. New motion does not change that. A flip
-  event on the CRTC re-enables exactly one cursor-only commit. Mutation: do not mark `cursor_retry_waits_for_flip`.
-- [ ] Test (M-2): the recorder rejects a cursor-only commit with EBUSY. Expect:
-  - no in-flight state and the position still unsent;
-  - one EBUSY counted;
-  - the next scene frame submits without any synthetic flip event and carries the position;
-  - no second cursor-only attempt in the same pass.
-  Mutation: mark in flight before the ioctl result.
 - [ ] Test (Review Focus 1): a cursor-only commit in flight at a RANDR change. Its event is discarded, and the first
   scene flip after the change retires the scene's own frame. Mutation: leave cursor CRTCs out of
   `pending_pageflip_crtcs`.
-- [ ] Test `legacy_path_pointer_motion_keeps_one_legacy_move_and_no_atomic_commit`. Mutation: route the legacy device
-  through the atomic branch.
-- [ ] Gate; commit `feat(kms): cursor-only atomic commits, one commit in flight per CRTC`.
+- [ ] Gate; commit `feat(kms): cursor commit rejections and topology changes keep the stream consistent`.
 
-### Task 4: A hidden cursor does not block direct scanout
+### Task 6: A hidden cursor does not block direct scanout
 
 **Files:**
 - `crates/yserver-render/src/kms/render/scene/cursor.rs`: `classify_cursor_mode_from_per_output` (L28) and
@@ -283,7 +301,7 @@ direct scanout on every GPU; the unflip reason is literally `composite_tick_soft
   the cursor invisible. Mutation: skip the bind on show.
 - [ ] Gate; commit `fix(kms): a hidden cursor does not keep direct scanout off`.
 
-### Task 5: Hardware validation (with the user's approval)
+### Task 7: Hardware validation (with the user's approval)
 
 Run on **card1 (NVIDIA)**, then on **card0 (AMD)** after the user moves the monitor cable. Use
 `~/Projects/claude-scratch/yserver-pr1/hw_spike_matrix.sh` with master (on NVIDIA: the software cursor; on AMD:
@@ -326,6 +344,10 @@ Record the tables in this plan and in `docs/status.md`.
 6. Cargo.lock unchanged. FreeBSD: "not checked" (CI runs it).
 
 ## Review log
+
+Task numbers in rounds 1–4 refer to the plan as it was then. After round 4, Task 3 was split into Tasks 3–5
+(cursor stream, direct scanout, rejections/topology); the hidden cursor became Task 6 and hardware Task 7.
+
 
 - **Round 1 (codex `gpt-6.1-sol` xhigh, instrument `111490f`, 2026-10-13), on the NVIDIA-only revision:** 1 blocking,
   2 major, 0 minor. All three were verified against the code and applied:
