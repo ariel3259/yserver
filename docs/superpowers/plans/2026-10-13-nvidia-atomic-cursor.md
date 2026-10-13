@@ -30,8 +30,9 @@ hidden. No KMS thread.
   `nv_drm_atomic_commit` ignores `legacy_cursor_update`. A legacy cursor ioctl is therefore a blocking commit that
   waits for the pending flip and its own vblank (`nvidia-drm-modeset.c:746`, `:897`).
 - **AMD and i915:** amdgpu (`atomic_async_*`) and i915 (`intel_legacy_cursor_update`) apply legacy moves immediately,
-  so on them this model trades an immediate update for at most one vblank of added cursor latency. The user chose
-  one model for every driver (2026-10-13); Task 5 measures that latency on amdgpu.
+  so on them this model trades an immediate update for added cursor latency: up to two frames in the worst case,
+  when motion arrives just after a commit started and waits for its retirement. The user chose one model for every
+  driver (2026-10-13); Task 5 measures that latency on amdgpu.
 - **Spike diff:** `~/Projects/claude-scratch/yserver-pr1/bin-spike/spike-final.diff`. Reference only; its scene parts
   predate 3b and it was NVIDIA-only.
 
@@ -54,8 +55,18 @@ hidden. No KMS thread.
 - Every test names the mutation that must make it fail; run it once.
 - Show/hide and image upload keep master's legacy ioctls (`set_cursor2`); only positions go atomic.
 - **Only accepted commits are in flight.** A commit counts as in flight only after its ioctl returned success. A
-  rejected cursor-only commit leaves no in-flight state: its position stays unsent and the next scheduling pass may
-  carry it in a scene commit. EBUSY is counted and warned (it is a bookkeeping bug), never retried in a loop.
+  rejected cursor-only commit leaves no in-flight state. EBUSY is counted and warned (it is a bookkeeping bug), never
+  retried in a loop.
+- **Rejections.**
+  - **EBUSY on a cursor-only commit:** the position stays unsent, and the next scheduling pass may carry it in a scene
+    commit.
+  - **Any other rejection (EINVAL, ENOSPC, …) of a request carrying cursor fields** follows master's legacy rule
+    (`platform/cursor.rs` ~L619): hide the plane through the legacy ioctl, and only after a successful hide mark the
+    CRTC for transient software fallback (`note_einval`).
+    - If the hide fails, hardware ownership is retained.
+    - Either way, the unsent position is dropped and that CRTC carries **no cursor fields** until the next successful
+      show, so a scene commit is never poisoned by cursor state.
+    - A rejected scene commit that carried cursor fields gets the same treatment before the scene's retry.
 - The intermediate-disable RANDR stall (~3.1 s in `disable_output`, present with every cursor mode) is out of scope.
 
 ## Review Focus
@@ -70,8 +81,9 @@ hidden. No KMS thread.
    every CRTC's position must ride the next direct or composed transaction (Tasks 2–3 tests).
 4. **The cursor shown again during direct scanout after a game hid it.** The existing path must bind the plane or
    unflip; the cursor must never be invisible while shown (Task 4 test).
-5. **Cursor latency on amdgpu and i915**, where legacy moves were immediate. The added delay must stay within one
-   vblank, measured by the motion-to-commit instrumentation (Task 1) and on hardware (Task 5).
+5. **Cursor latency on amdgpu and i915**, where legacy moves were immediate. It is measured motion-to-visible, not
+   only motion-to-accept: motion arriving just after a commit started waits for that commit's retirement and is
+   visible a frame later (Task 1 instrumentation, Task 5 acceptance).
 
 ---
 
@@ -92,9 +104,13 @@ hidden. No KMS thread.
     per call (`Ok`, `EBUSY`, `EINVAL`) for Task 3's rejection test.
   - It records each commit's kind (`cursor-only`, `scene-with-cursor`, `scene`), ioctl time and result.
   - Debug log: `atomic commit kind=… crtc=… ioctl_us=… result=…`.
-  - Per-second info line under `YSERVER_LOOP_TELEMETRY`: per-kind counts, EBUSY, max/p99 ioctl µs, and max/p99
-    **motion-to-commit delay**. That delay is the time from the pointer event that produced a position to the
-    accepted commit carrying it (Review Focus 5).
+  - Per-second info line under `YSERVER_LOOP_TELEMETRY`: per-kind counts, EBUSY, max/p99 ioctl µs, and two cursor
+    latencies, both measured from the pointer event that produced a position (Review Focus 5):
+    - **motion-to-accept:** to the accepted commit carrying it;
+    - **motion-to-visible:** to the flip event retiring that commit. The pointer event's timestamp is carried with
+      the position into the commit's bookkeeping.
+  - On the legacy path, both latencies are measured to the `move_cursor` return, so the two paths are compared on the
+    same scale.
 - **`KmsCursorState` path choice:**
   - `atomic_cursor: bool` is decided per device from `supports_atomic_positions` over its active CRTCs. The decision
     is recomputed at every topology refresh.
@@ -151,12 +167,15 @@ hidden. No KMS thread.
   1. submits a waiting direct candidate whose CRTCs are all clear;
   2. otherwise lets the scene submit if it has a frame ready for that output;
   3. only then sends the unsent position as a cursor-only commit.
-- **Direct Present behind a cursor commit (M-1).**
-  - When an eligible direct Present arrives while a cursor-only commit is in flight on any of its outputs and no
-    direct frame is pending, it is retained in master's direct successor slot (`present.rs` ~L834): latest-wins, the
-    same pin/skip-completion rules as today.
-  - The cursor-only retirement that clears its last blocking CRTC calls the same submission path as
-    `submit_queued_direct_successor`, so a waiting Present never depends on a later direct event.
+- **Direct Present behind a cursor commit (M-1, B-2).** It depends on whether a direct frame already owns scanout.
+  - **First entry** (no direct frame `current` or `pending`): a cursor-only commit in flight on any of its outputs is
+    treated exactly like master's "scene flip pending" case (`present.rs` ~L839). The Present is not taken direct
+    this time (`Ok(false)`, pins released, composed path as today), and the next Present retries. No queued-only
+    direct state is ever created, so no cancellation owner is needed.
+  - **Successor** (a direct frame is `current`, fully retired): the Present goes into master's successor slot
+    (latest-wins, the same pin/Skip rules). The cursor-only retirement that clears its last blocking CRTC calls the
+    `submit_queued_direct_successor` path. If an unflip was requested meanwhile, master's composed replacement — which
+    exists because `current` is set — Skips it as today.
 - **Scene gate:** new `OutputSink::output_commit_in_flight(output_idx) -> bool` (`false` in `TestSink` unless set).
   The scene's per-output submit gate (`tick_one_output`) and `has_output_ready_for_submit` treat it like a non-empty
   `pending_acks`. The composed unflip also waits while a cursor-only commit is in flight on its outputs.
@@ -173,12 +192,23 @@ hidden. No KMS thread.
   Mutation: `output_commit_in_flight` always false.
 - [ ] Test (Review Focus 3): motion while a direct successor is pending sends nothing; the successor carries it.
   Mutation: drop the direct blocker.
-- [ ] Test (M-1, cursor first):
-  - a cursor-only commit is in flight, then an eligible fullscreen Present arrives;
+- [ ] Test (M-1, successor behind a cursor commit):
+  - a direct frame is current, a cursor-only commit is in flight, then an eligible Present arrives;
   - it is retained, not submitted;
   - the cursor retirement submits it, its completion arrives, and its pins retire;
   - no further cursor-only commit goes out before it.
-  Mutation: retirement does not resume the waiting candidate.
+  Mutation: retirement does not resume the waiting successor.
+- [ ] Test (B-2, first entry behind a cursor commit):
+  - no direct frame exists and a cursor-only commit is in flight;
+  - an eligible Present returns `Ok(false)`: no queued successor, pins released, composed completion delivered;
+  - after the retirement, the next eligible Present enters direct;
+  - a root overlay appearing in between leaves nothing retained.
+  Mutation: queue the first-entry Present in the successor slot.
+- [ ] Test (M-3): the recorder rejects a cursor-only commit with EINVAL.
+  - The plane is hidden through the legacy ioctl and the CRTC goes to software fallback.
+  - The next scene request carries no cursor fields and is accepted.
+  - With the hide scripted to fail, hardware ownership is retained and scene requests still carry no cursor fields.
+  Mutation: keep the unsent position after EINVAL.
 - [ ] Test (M-2): the recorder rejects a cursor-only commit with EBUSY. Expect:
   - no in-flight state and the position still unsent;
   - one EBUSY counted;
@@ -236,8 +266,11 @@ is reported as "i915 not validated".
 **Acceptance:**
 - **NVIDIA:** each matrix row equals the software cursor (0 round trips > 8 ms, drag p99 within 1 px, 60 fps,
   0 drops).
-- **AMD:** each row equals or beats master's legacy cursor, and the motion-to-commit p99 is ≤ one frame (16.7 ms at
-  60 Hz).
+- **AMD:** each row equals or beats master's legacy cursor.
+  - Report motion-to-accept and motion-to-visible (p50/p99/max) for master's legacy cursor and this branch, with
+    sustained motion and with single motions after idle.
+  - Acceptance: motion-to-visible p99 ≤ two frames (33.4 ms at 60 Hz).
+  - The table is reported to the user and the maintainer as the price of one model for every driver.
 - **Both:**
   - direct submits > 0 in fullscreen, with the cursor visible and with it hidden;
   - EBUSY 0;
@@ -267,6 +300,14 @@ Record the tables in this plan and in `docs/status.md`.
   - **M-1:** a direct Present waiting behind a cursor-only commit is retained in the successor slot and resumed by the
     cursor retirement (Task 3).
   - **M-2:** in flight means accepted; the rejection test (Task 3).
+- **Round 2 (same instrument, 2026-10-13):** 1 blocking, 2 major, 0 minor; B-1 and M-2 confirmed applied, M-1
+  traded. All three were verified against the code and applied:
+  - **B-2:** the first direct entry behind a cursor commit follows master's "scene flip pending" branch instead of
+    queueing, so no queued-only direct state exists (Task 3).
+  - **M-3:** non-EBUSY rejections hide the plane through the legacy rollback and stop carrying cursor fields (Global
+    Constraints, Task 3 test).
+  - **M-4:** cursor latency is measured motion-to-visible as well as motion-to-accept, and the claim is corrected to
+    up to two frames (Task 1, Task 5).
 - **Scope change (user, 2026-10-13):** Tasks 1–3 apply to every driver with atomic cursor position properties (AMD
   and i915 too), chosen by capability. Hardware validation on AMD was added.
 
