@@ -414,6 +414,15 @@ impl PlatformBackend {
             })
     }
 
+    /// Whether any CRTC in a grouped transaction is still owned by a
+    /// cursor-only commit. Direct scanout and composed unflip submit one
+    /// atomic request for every listed output, so all of them must be clear.
+    pub(crate) fn cursor_commit_in_flight_for_outputs(&self, output_indices: &[usize]) -> bool {
+        output_indices
+            .iter()
+            .any(|output_idx| self.cursor_commit_in_flight_for_output(*output_idx))
+    }
+
     pub(crate) fn any_cursor_commit_in_flight(&self) -> bool {
         self.devices
             .iter()

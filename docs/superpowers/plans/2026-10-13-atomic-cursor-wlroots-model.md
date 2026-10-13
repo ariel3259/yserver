@@ -352,6 +352,9 @@ Record the tables in this plan and in `docs/status.md`.
    `two_gpu`/`_drm` tests are skipped without the user's approval.
 5. Rule F for the task's new tests.
 6. Cargo.lock unchanged. FreeBSD: "not checked" (CI runs it).
+7. The source layout rules master's CI checks since #243 (`tools/check-layout.sh`): file-size ceilings, the
+   `backend/portable` seam, `yserver-render`'s dependencies. Until the branch is rebased past `a343264b`, run the
+   script's body from the worktree root.
 
 ## Review log
 

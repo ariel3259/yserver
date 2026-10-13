@@ -561,7 +561,14 @@ impl KmsBackend {
         // A cursor/overlay/topology invalidation which arrived while the
         // predecessor was in flight wins over the queued Present. Leave the
         // successor retained for the composed-unflip teardown to Skip.
-        if self.scanout_m2.unflip_requested {
+        if self.scanout_m2.unflip_requested || self.scanout_m2.pending.is_some() {
+            return;
+        }
+        let direct_outputs: Vec<_> = (0..self.platform.outputs.len()).collect();
+        if self
+            .platform
+            .cursor_commit_in_flight_for_outputs(&direct_outputs)
+        {
             return;
         }
         let Some(mut successor) = self.scanout_m2.queued_successor.take() else {
@@ -842,7 +849,14 @@ impl KmsBackend {
     /// AMD rejects independent per-CRTC replacement with `ENOSPC`; replacing
     /// the complete set together avoids both that intermediate state and the
     /// visible blackout of a disable/re-enable cycle.
-    fn submit_composed_unflip(&mut self) -> io::Result<()> {
+    fn submit_composed_unflip(&mut self) -> io::Result<bool> {
+        let output_indices: Vec<_> = (0..self.platform.outputs.len()).collect();
+        if self
+            .platform
+            .cursor_commit_in_flight_for_outputs(&output_indices)
+        {
+            return Ok(false);
+        }
         if !self.direct_scanout_topology_eligible() {
             return Err(io::Error::other(
                 "scanout M2: grouped unflip requires one DRM device and homogeneous refresh",
@@ -910,7 +924,7 @@ impl KmsBackend {
             self.scanout_m2.pending.as_ref().map(describe_frame),
             self.scanout_m2.current.as_ref().map(describe_frame)
         );
-        Ok(())
+        Ok(true)
     }
 
     pub(in crate::kms::render::backend) fn retire_direct_output(
@@ -1745,7 +1759,27 @@ impl KmsBackend {
     }
 
     pub(super) fn scene_wants_compose(&self) -> bool {
-        self.scene_wants_scene() || self.platform.has_eligible_atomic_cursor_move()
+        if self.scanout_m2.pending.is_some() || !self.scanout_m2.unflip_awaiting_outputs.is_empty()
+        {
+            // The grouped direct or composed transaction's flip events are
+            // the next progress source; its state will be re-arbitrated there.
+            return false;
+        }
+        let outputs: Vec<_> = (0..self.platform.outputs.len()).collect();
+        let direct_transaction_waiting = self.scanout_m2.pending.is_some()
+            || self.scanout_m2.queued_successor.is_some()
+            || self.scanout_m2.unflip_requested;
+        let unflip_waiting_for_cursor = self.scanout_m2.current.is_some()
+            && self.scanout_m2.unflip_requested
+            && self.platform.cursor_commit_in_flight_for_outputs(&outputs);
+        if unflip_waiting_for_cursor {
+            // The cursor flip event is the next progress source. Re-arming an
+            // immediate scene wake here would spin while the grouped unflip is
+            // correctly waiting for that event.
+            return false;
+        }
+        self.scene_wants_scene()
+            || (!direct_transaction_waiting && self.platform.has_eligible_atomic_cursor_move())
     }
 }
 
@@ -2090,6 +2124,10 @@ impl KmsBackend {
         // Animated-cursor frame advance — after both gates above so
         // DPMS-off / VT-away never uploads (spec "DPMS / VT gating").
         self.tick_cursor_animation();
+        // Arbitration step 1: a direct successor retained behind a cursor-only
+        // commit gets the first opportunity once all of its CRTCs are clear.
+        // The helper leaves it in the slot while any CRTC is still blocked.
+        self.submit_queued_direct_successor();
         if self.scanout_m2.active() {
             use crate::kms::render::scene::CursorPlaneMode;
             let cursor_mode = self.scene.cursor_mode();
@@ -2110,44 +2148,68 @@ impl KmsBackend {
             // the direct transaction itself has fully retired.
             if self.scanout_m2.pending.is_some()
                 || !self.scanout_m2.unflip_awaiting_outputs.is_empty()
-                || (self.scanout_m2.hold_direct && !self.scanout_m2.unflip_requested)
             {
                 self.drain_render_telemetry();
                 self.telemetry.maybe_emit(self.engine.pending_count());
                 return Ok(());
             }
-            if self.scanout_m2.current.is_some()
-                && self.scanout_m2.unflip_requested
-                && self.platform.any_cursor_commit_in_flight()
-            {
+            if self.scanout_m2.hold_direct && !self.scanout_m2.unflip_requested {
+                // A fully-retired direct frame may continue receiving cursor
+                // motion. Let the scheduling pass send cursor-only commits
+                // while there is no direct successor waiting; once a
+                // successor is retained, its grouped direct transaction gets
+                // every later position and no CRTC is extended by another
+                // cursor-only commit.
+                if self.scanout_m2.current.is_some() && self.scanout_m2.queued_successor.is_none() {
+                    for output_idx in 0..self.platform.outputs.len() {
+                        if let Err(error) = self
+                            .platform
+                            .submit_atomic_cursor_move_for_output(output_idx)
+                        {
+                            log::warn!(
+                                "render maybe_composite: cursor-only atomic commit failed for output {output_idx}: {error}"
+                            );
+                        }
+                    }
+                }
                 self.drain_render_telemetry();
                 self.telemetry.maybe_emit(self.engine.pending_count());
                 return Ok(());
             }
             if self.scanout_m2.current.is_some() && self.scanout_m2.unflip_requested {
-                if let Err(error) = self.submit_composed_unflip() {
-                    log::error!(
-                        "scanout_m2: synchronized composed unflip failed: {error}; degrading to per-output composed flips"
-                    );
-                    // The atomic transaction never replaced the planes: the
-                    // kernel is still scanning the direct dma-buf, so the
-                    // direct frame's pins must stay held. Arm the composed-flip
-                    // retirement machinery and fall through into the per-output
-                    // scene compose path below — the scene flips replace the
-                    // planes this tick, and `retire_direct_output` releases the
-                    // direct frame only after every output has retired on the
-                    // composed framebuffer.
-                    self.scanout_m2.unflip_awaiting_outputs =
-                        (0..self.platform.outputs.len()).collect();
-                    self.scanout_m2.degraded_composed_unflip = true;
-                    self.scene.mark_scene_structure_dirty();
-                } else {
-                    // The atomic replacement itself is now pending on every
-                    // CRTC. Do not fall through into per-output scene flips in
-                    // this same tick: KMS correctly rejects those with EBUSY.
-                    self.drain_render_telemetry();
-                    self.telemetry.maybe_emit(self.engine.pending_count());
-                    return Ok(());
+                match self.submit_composed_unflip() {
+                    Ok(true) => {
+                        // The atomic replacement itself is now pending on every
+                        // CRTC. Do not fall through into per-output scene flips in
+                        // this same tick: KMS correctly rejects those with EBUSY.
+                        self.drain_render_telemetry();
+                        self.telemetry.maybe_emit(self.engine.pending_count());
+                        return Ok(());
+                    }
+                    Ok(false) => {
+                        // A cursor-only commit still owns one of these CRTCs.
+                        // Keep direct scanout active and retry after retirement.
+                        self.drain_render_telemetry();
+                        self.telemetry.maybe_emit(self.engine.pending_count());
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        log::error!(
+                            "scanout_m2: synchronized composed unflip failed: {error}; degrading to per-output composed flips"
+                        );
+                        // The atomic transaction never replaced the planes: the
+                        // kernel is still scanning the direct dma-buf, so the
+                        // direct frame's pins must stay held. Arm the composed-flip
+                        // retirement machinery and fall through into the per-output
+                        // scene compose path below — the scene flips replace the
+                        // planes this tick, and `retire_direct_output` releases the
+                        // direct frame only after every output has retired on the
+                        // composed framebuffer.
+                        self.scanout_m2.unflip_awaiting_outputs =
+                            (0..self.platform.outputs.len()).collect();
+                        self.scanout_m2.degraded_composed_unflip = true;
+                        self.scene.mark_scene_structure_dirty();
+                    }
                 }
             }
         }
