@@ -244,6 +244,32 @@ fn backend_with_live_scene() -> Option<KmsBackend> {
     Some(backend)
 }
 
+fn backend_with_hidden_dead_zone_scene() -> Option<KmsBackend> {
+    let mut backend = match KmsBackend::for_tests_with_vk() {
+        Ok(backend) => backend,
+        Err(error) => {
+            eprintln!("skipping: no Vulkan test device: {error}");
+            return None;
+        }
+    };
+    push_test_output(&mut backend, 0xCA11);
+    backend.platform.outputs[1].x = 900;
+    backend.platform.outputs[1].width = 800;
+    backend.platform.outputs[1].height = 400;
+    backend.platform.fb_w = 1700;
+    backend.platform.fb_h = 600;
+    let layouts = backend.platform.scene_output_layouts();
+    backend.scene = crate::kms::render::scene::SceneCompositor::new(&backend.platform, &layouts)
+        .expect("construct dead-zone live scene");
+    backend.scene.scene_structure_dirty = false;
+    for drawable in backend.store.armed_damaged_ids() {
+        if let Some(snapshot) = backend.store.peek_presentation_damage(drawable) {
+            backend.store.ack_presentation_damage(snapshot);
+        }
+    }
+    Some(backend)
+}
+
 fn seed_cursor_position(backend: &mut KmsBackend) -> crate::drm::atomic::CursorPlanePosition {
     backend.platform.for_tests_seed_atomic_cursor_position(
         0,
@@ -398,6 +424,45 @@ fn idle_motion_coalesces_until_cursor_flip_retires() {
         "the latest cursor flip records motion-to-visible"
     );
     assert_no_cursor_work(&backend, device_key);
+}
+
+#[test]
+// Mutation: restore Task 6's Hidden fast-path skip. Re-entry must wake the
+// scene through the Backend pointer entry and make this predicate true.
+fn hidden_cursor_motion_from_dead_zone_wakes_scene_on_reentry() {
+    use yserver_core::{backend::Backend, server::ServerState};
+
+    let Some(mut backend) = backend_with_hidden_dead_zone_scene() else {
+        return;
+    };
+    let mut state = ServerState::new();
+    assert!(!backend.cursor_hidden, "this is not XFIXES HideCursor");
+    assert_eq!(
+        backend.scene.cursor_mode(),
+        crate::kms::render::scene::CursorPlaneMode::Hidden,
+    );
+    assert!(!backend.for_tests_scene_wants_compose());
+
+    // The gap and the shorter output's lower edge form the dead zone.
+    Backend::warp_pointer_root(&mut backend, &mut state, 850, 450);
+    assert_eq!(
+        (backend.core.cursor_x, backend.core.cursor_y),
+        (850.0, 450.0)
+    );
+    assert_eq!(
+        backend.scene.cursor_mode(),
+        crate::kms::render::scene::CursorPlaneMode::Hidden,
+    );
+    // Model the scene consuming that wake. The next pointer event alone must
+    // re-arm the scheduling predicate when it returns to output 1.
+    backend.scene.scene_structure_dirty = false;
+    assert!(!backend.for_tests_scene_wants_compose());
+    Backend::warp_pointer_root(&mut backend, &mut state, 950, 350);
+    assert_eq!(
+        (backend.core.cursor_x, backend.core.cursor_y),
+        (950.0, 350.0)
+    );
+    assert!(backend.for_tests_scene_wants_compose());
 }
 
 #[test]
