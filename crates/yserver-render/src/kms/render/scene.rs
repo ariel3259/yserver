@@ -276,10 +276,13 @@ pub enum CursorPlaneMode {
     /// Every active output is in HW mode + no transitions pending
     /// — pointer fast path may issue `cursor_plane_move` directly.
     Hw,
+    /// Every active output has the cursor hidden and no transition is pending.
+    /// Direct scanout is compatible and pointer motion has nothing to move.
+    Hidden,
     /// At least one output is currently SW or in transition. The
     /// pointer fast path falls back to `scene.wake_for_damage`.
     Mixed,
-    /// Every output is in SW (or Hidden) mode — scene wake required.
+    /// At least one output needs software cursor composition.
     Sw,
 }
 

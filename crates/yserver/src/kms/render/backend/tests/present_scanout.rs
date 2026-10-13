@@ -2345,6 +2345,14 @@ struct AtomicCursorDirectPresent {
 }
 
 fn atomic_cursor_scanout_backend() -> Option<KmsBackend> {
+    atomic_cursor_scanout_backend_with_hidden_cursor(false)
+}
+
+fn atomic_cursor_hidden_scanout_backend() -> Option<KmsBackend> {
+    atomic_cursor_scanout_backend_with_hidden_cursor(true)
+}
+
+fn atomic_cursor_scanout_backend_with_hidden_cursor(hidden: bool) -> Option<KmsBackend> {
     let mut backend = match KmsBackend::for_tests_with_vk() {
         Ok(backend) => backend,
         Err(error) => {
@@ -2360,7 +2368,9 @@ fn atomic_cursor_scanout_backend() -> Option<KmsBackend> {
     let layouts = backend.platform.scene_output_layouts();
     backend.scene = crate::kms::render::scene::SceneCompositor::new(&backend.platform, &layouts)
         .expect("construct live two-output scene");
-    backend.scene.for_tests_set_hw_cursor_mode();
+    if !hidden {
+        backend.scene.for_tests_set_hw_cursor_mode();
+    }
     backend.scene.scene_structure_dirty = false;
     for drawable in backend.store.armed_damaged_ids() {
         if let Some(snapshot) = backend.store.peek_presentation_damage(drawable) {
@@ -3056,6 +3066,132 @@ fn prepare_atomic_cursor_direct_present_with_extent(
         source_id,
         target_id,
     }
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+// Mutation: keep the M1/M2 direct gate or composite unflip gate Hw-only.
+fn hidden_cursor_allows_fullscreen_direct_scanout_without_unflip() {
+    use yserver_core::backend::Backend;
+
+    let Some(mut backend) = atomic_cursor_hidden_scanout_backend() else {
+        return;
+    };
+    let recorder = atomic_cursor_recording_sink(&mut backend);
+    assert_eq!(
+        backend.scene.cursor_mode(),
+        crate::kms::render::scene::CursorPlaneMode::Hidden
+    );
+
+    // Exercise XFIXES HideCursor through the backend contract while every
+    // scene output is already retired in Hidden mode.
+    Backend::set_cursor_hidden(&mut backend, true);
+    assert!(backend.cursor_hidden);
+    Backend::maybe_composite(&mut backend).expect("schedule hidden-cursor scene");
+
+    let direct = prepare_atomic_cursor_direct_present(&mut backend, 91);
+    backend.scanout_m1.entries.remove(&direct.source_id);
+    Backend::note_present_scanout_candidate(&mut backend, direct.candidate);
+    assert_eq!(
+        backend.scanout_m0.m1_probe_reject, 1,
+        "the M1 probe must reach its later geometry rejection after Hidden passes cursor eligibility"
+    );
+    assert_eq!(
+        backend.scanout_m0.m1_gate_open, 1,
+        "the M1 diagnostic must report Hidden as direct-compatible"
+    );
+    backend.scanout_m1.entries.insert(
+        direct.source_id,
+        crate::kms::render::backend::ScanoutM1ProbeEntry::accepted(
+            crate::drm::modeset::DirectScanoutProbeFramebuffer::for_tests(atomic_cursor_raw(
+                0x9e01,
+            )),
+        ),
+    );
+    assert!(
+        Backend::try_present_direct(&mut backend, direct.candidate, direct.event,)
+            .expect("eligible fullscreen Present"),
+        "a fully hidden cursor must not reject direct scanout"
+    );
+    assert!(backend.scanout_m2.pending.is_some());
+
+    Backend::maybe_composite(&mut backend).expect("composite tick during direct scanout");
+    assert!(
+        !backend.scanout_m2.unflip_requested,
+        "Hidden must not request a direct unflip"
+    );
+    assert_eq!(recorder.records().len(), 1);
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+// Mutation: skip the direct cursor rebind/fallback on ShowCursor. The test
+// requires either a visible plane or a scheduled composed unflip.
+fn showing_cursor_during_direct_scanout_rebinds_or_requests_unflip() {
+    use yserver_core::backend::Backend;
+
+    let Some(mut backend) = atomic_cursor_hidden_scanout_backend() else {
+        return;
+    };
+    let recorder = atomic_cursor_recording_sink(&mut backend);
+    Backend::set_cursor_hidden(&mut backend, true);
+
+    let positions = [0, 1].map(|output_idx| {
+        backend.platform.for_tests_seed_atomic_cursor_position(
+            output_idx,
+            atomic_cursor_raw(0x9a00 + u32::try_from(output_idx).unwrap()),
+            atomic_cursor_raw(0x9b00 + u32::try_from(output_idx).unwrap()),
+            atomic_cursor_raw(0x9c00 + u32::try_from(output_idx).unwrap()),
+            820,
+            130,
+            0,
+            0,
+        )
+    });
+    for position in positions {
+        backend.platform.devices[0]
+            .cursor
+            .plane
+            .as_mut()
+            .expect("test cursor plane")
+            .for_tests_set_visible(position.crtc, false);
+    }
+
+    let cursor_xid = 0x9d00;
+    backend.insert_cursor_record(cursor_xid, 1, 1, 0, 0, vec![0xff; 4]);
+    backend.effective_cursor_xid = Some(cursor_xid);
+
+    let direct = prepare_atomic_cursor_direct_present(&mut backend, 92);
+    assert!(
+        Backend::try_present_direct(&mut backend, direct.candidate, direct.event,)
+            .expect("fullscreen Present while hidden")
+    );
+    assert_eq!(recorder.records().len(), 1);
+    assert!(
+        backend
+            .platform
+            .cursor_plane_atomic_positions_for_outputs(&[0, 1])
+            .is_empty(),
+        "the hidden plane must not be rebound by the direct transaction"
+    );
+
+    // The test cursor plane intentionally has no dumb buffer, so its legacy
+    // show operation fails and the backend must schedule a composed fallback.
+    // A real plane may instead bind successfully and keep direct scanout.
+    backend.scanout_m2.cursor_bound_all = false;
+    Backend::set_cursor_hidden(&mut backend, false);
+    assert!(!backend.cursor_hidden);
+    assert!(backend.scene.scene_structure_dirty);
+    let first_crtc = positions[0].crtc;
+    let plane_visible = backend.platform.devices[0]
+        .cursor
+        .plane
+        .as_ref()
+        .is_some_and(|plane| plane.is_visible_on(first_crtc));
+    assert!(
+        plane_visible || backend.scanout_m2.unflip_requested,
+        "ShowCursor must bind the plane or schedule a composed unflip"
+    );
 }
 
 fn seed_two_atomic_cursor_positions(

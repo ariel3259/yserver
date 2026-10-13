@@ -743,6 +743,7 @@ impl KmsBackend {
                 matches!(
                     self.scene.cursor_mode(),
                     crate::kms::render::scene::CursorPlaneMode::Hw
+                        | crate::kms::render::scene::CursorPlaneMode::Hidden
                 ),
                 self.scene.root_overlay.is_empty(),
                 authoritative_root && scene_eligible,

@@ -599,9 +599,7 @@ fn classify_cursor_mode_dual_output_cursor_on_one_monitor_is_hw() {
     );
 }
 
-/// Single-output Hw is Hw; single-output Hidden is Sw (degenerate
-/// — no Hw plane active, scene wake is what'd update a future SW
-/// cursor draw).
+/// Single-output Hw is Hw; single-output Sw and SwPending are Sw.
 #[test]
 fn classify_cursor_mode_single_output_cases() {
     assert_eq!(
@@ -610,7 +608,7 @@ fn classify_cursor_mode_single_output_cases() {
     );
     assert_eq!(
         classify_cursor_mode_from_per_output([OutputCursorMode::Hidden]),
-        CursorPlaneMode::Sw,
+        CursorPlaneMode::Hidden,
     );
     assert_eq!(
         classify_cursor_mode_from_per_output([OutputCursorMode::Sw { prev: None }]),
@@ -620,6 +618,28 @@ fn classify_cursor_mode_single_output_cases() {
         classify_cursor_mode_from_per_output([OutputCursorMode::SwPending]),
         CursorPlaneMode::Sw,
     );
+}
+
+#[test]
+// Mutation: classify all-Hidden outputs as Sw. The first assertion must fail.
+fn cursor_mode_hidden_outputs_and_mixed_hidden_modes() {
+    let Some(gpu) = crate::kms::render::gpu::GpuCore::for_tests_with_vk() else {
+        eprintln!("skipping: no Vulkan test device");
+        return;
+    };
+    let mut sink = TestSink::new();
+    sink.gpu = gpu;
+    let layouts = [layout_at((0, 0, 800, 600)), layout_at((800, 0, 800, 600))];
+    let mut scene = SceneCompositor::new(&sink, &layouts).expect("construct live test scene");
+
+    assert_eq!(scene.cursor_mode(), CursorPlaneMode::Hidden);
+
+    scene.inner.as_mut().unwrap().outputs[1].last_frame_cursor_mode =
+        OutputCursorMode::Sw { prev: None };
+    assert_eq!(scene.cursor_mode(), CursorPlaneMode::Sw);
+
+    scene.inner.as_mut().unwrap().outputs[1].last_frame_cursor_mode = OutputCursorMode::Hw;
+    assert_eq!(scene.cursor_mode(), CursorPlaneMode::Hw);
 }
 
 /// Hw + Sw on different outputs IS Mixed (one output's SW sprite

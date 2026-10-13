@@ -1090,6 +1090,7 @@ impl KmsBackend {
                 matches!(
                     self.scene.cursor_mode(),
                     crate::kms::render::scene::CursorPlaneMode::Hw
+                        | crate::kms::render::scene::CursorPlaneMode::Hidden
                 ),
                 self.scene.root_overlay.is_empty(),
                 target,
@@ -1552,7 +1553,11 @@ impl KmsBackend {
         let scanout_allowed = self.scanout_allowed();
         let kms_outputs_active = self.kms_outputs_active;
         let cursor_mode = self.scene.cursor_mode();
-        let cursor_hw = matches!(cursor_mode, crate::kms::render::scene::CursorPlaneMode::Hw);
+        let cursor_hw = matches!(
+            cursor_mode,
+            crate::kms::render::scene::CursorPlaneMode::Hw
+                | crate::kms::render::scene::CursorPlaneMode::Hidden
+        );
         let root_overlay_empty = self.scene.root_overlay.is_empty();
         // Page flipping is off while any CRTC is transformed
         // (modesetting/present.c:266).
@@ -2156,13 +2161,13 @@ impl KmsBackend {
             let cursor_mode = self.scene.cursor_mode();
             if self.platform.any_output_transformed() {
                 self.request_direct_unflip("composite_tick_crtc_transform");
-            } else if !matches!(cursor_mode, CursorPlaneMode::Hw)
+            } else if !matches!(cursor_mode, CursorPlaneMode::Hw | CursorPlaneMode::Hidden)
                 || !self.scene.root_overlay.is_empty()
             {
                 let reason = match cursor_mode {
                     CursorPlaneMode::Mixed => "composite_tick_mixed_cursor",
                     CursorPlaneMode::Sw => "composite_tick_software_or_hidden_cursor",
-                    CursorPlaneMode::Hw => "composite_tick_root_overlay",
+                    CursorPlaneMode::Hw | CursorPlaneMode::Hidden => "composite_tick_root_overlay",
                 };
                 self.request_direct_unflip(reason);
             }

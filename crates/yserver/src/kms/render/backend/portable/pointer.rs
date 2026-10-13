@@ -611,9 +611,15 @@ impl KmsBackend {
             // scene so the SW cursor stays in sync with the eventual
             // plane bind.
             let cursor_mode = self.scene.cursor_mode();
-            if self.cursor_hidden {
-                // XFIXES HideCursor: there is no sprite to move. Showing
-                // it again displays it at the then-current position.
+            if self.cursor_hidden
+                || matches!(
+                    cursor_mode,
+                    crate::kms::render::scene::CursorPlaneMode::Hidden
+                )
+            {
+                // A globally hidden cursor, or one hidden on every output,
+                // has no sprite to move. Showing it again uses the current
+                // pointer position.
             } else if matches!(
                 cursor_mode,
                 crate::kms::render::scene::CursorPlaneMode::Hw
