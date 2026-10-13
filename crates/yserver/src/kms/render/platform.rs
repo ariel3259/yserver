@@ -186,6 +186,13 @@ pub(crate) struct KmsCursorState {
     /// Pointer-event timestamp paired with `pending_move` across an EBUSY
     /// retry. Atomic positions carry this timestamp directly.
     pending_move_timestamp: Option<Instant>,
+    /// Latest discovered atomic position for each cursor-visible CRTC. The
+    /// position remains available for every scene commit; the unsent copy is
+    /// consumed only after an accepted commit carries it.
+    atomic_positions:
+        HashMap<::drm::control::crtc::Handle, crate::drm::atomic::CursorPlanePosition>,
+    atomic_unsent_positions:
+        HashMap<::drm::control::crtc::Handle, crate::drm::atomic::CursorPlanePosition>,
     permanently_disabled: bool,
     /// CursorPlane::new was attempted for an active startup topology and
     /// failed transiently. Only explicit active-topology/resume boundaries

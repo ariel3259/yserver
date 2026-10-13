@@ -46,6 +46,9 @@ impl AtomicCommitKind {
 /// the position until an accepted commit and its retiring flip are observed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CursorPlanePosition {
+    /// DRM node that owns the following CRTC/plane handles. Raw DRM handles
+    /// are only unique within one device.
+    pub(crate) device_key: crate::platform::drm::DrmDeviceKey,
     pub(crate) crtc: crtc::Handle,
     pub(crate) plane: plane::Handle,
     pub(crate) crtc_x: property::Handle,

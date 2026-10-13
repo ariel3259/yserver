@@ -334,6 +334,10 @@ is reported as "i915 not validated".
   - the cursor stays hardware after the RANDR change;
   - the VT switch restores the cursor.
 
+- **Shared and copied flip callers** (no hardware-free fixture reaches them; Task 2 tests them at helper level):
+  shared flips with a visible cursor are recorded as `scene-with-cursor` in the per-second line. On a copied output
+  this is checked when one is available.
+
 Record the tables in this plan and in `docs/status.md`.
 
 ## Gate (every task)
@@ -349,6 +353,10 @@ Record the tables in this plan and in `docs/status.md`.
 6. Cargo.lock unchanged. FreeBSD: "not checked" (CI runs it).
 
 ## Review log
+
+- **Task 2 (2026-10-13):** the direct and unflip caller tests go through `Backend` entries with the recording
+  sink. The shared and copied flip callers have no hardware-free scene fixture (`for_tests_with_vk_live_scene`
+  needs a KMS device), so they are tested at helper level, and Task 7 checks them on hardware.
 
 - **Task 2 stop (2026-10-13):** a position without a device identity cannot be cleared unambiguously when two
   devices reuse CRTC handles; `CursorPlanePosition` gains `device_key`, and Task 2 may touch `drm/atomic.rs`,

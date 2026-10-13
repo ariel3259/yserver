@@ -528,10 +528,31 @@ impl KmsBackend {
                 src_h: u32::from(layout.height),
             })
             .collect();
-        let primary = self.platform.primary_device().ok_or_else(|| {
-            io::Error::other("direct scanout submitted without an opened KMS device")
-        })?;
-        crate::drm::modeset::submit_direct_scanout(&primary.device, fb, &plane_states)?;
+        let (device, atomic_commit_sink) = self
+            .platform
+            .primary_device()
+            .map(|primary| {
+                (
+                    Rc::clone(&primary.device),
+                    Rc::clone(&primary.atomic_commit_sink),
+                )
+            })
+            .ok_or_else(|| {
+                io::Error::other("direct scanout submitted without an opened KMS device")
+            })?;
+        let output_indices: Vec<_> = (0..self.platform.outputs.len()).collect();
+        let cursor_positions = self
+            .platform
+            .cursor_plane_atomic_positions_for_outputs(&output_indices);
+        crate::drm::modeset::submit_direct_scanout(
+            &device,
+            atomic_commit_sink.as_ref(),
+            fb,
+            &plane_states,
+            &cursor_positions,
+        )?;
+        self.platform
+            .cursor_plane_scene_commit_submitted(&cursor_positions);
         frame.awaiting_outputs = (0..self.platform.outputs.len()).collect();
         Ok(())
     }
@@ -848,11 +869,32 @@ impl KmsBackend {
                 })
             })
             .collect::<io::Result<_>>()?;
-        let primary = self.platform.primary_device().ok_or_else(|| {
-            io::Error::other("scanout M2: composed unflip requested without a KMS device")
-        })?;
-        crate::drm::modeset::submit_composed_scanout(&primary.device, &planes)?;
-        self.scanout_m2.unflip_awaiting_outputs = (0..planes.len()).collect();
+        let output_count = planes.len();
+        let (device, atomic_commit_sink) = self
+            .platform
+            .primary_device()
+            .map(|primary| {
+                (
+                    Rc::clone(&primary.device),
+                    Rc::clone(&primary.atomic_commit_sink),
+                )
+            })
+            .ok_or_else(|| {
+                io::Error::other("scanout M2: composed unflip requested without a KMS device")
+            })?;
+        let output_indices: Vec<_> = (0..planes.len()).collect();
+        let cursor_positions = self
+            .platform
+            .cursor_plane_atomic_positions_for_outputs(&output_indices);
+        crate::drm::modeset::submit_composed_scanout(
+            &device,
+            atomic_commit_sink.as_ref(),
+            &planes,
+            &cursor_positions,
+        )?;
+        self.platform
+            .cursor_plane_scene_commit_submitted(&cursor_positions);
+        self.scanout_m2.unflip_awaiting_outputs = (0..output_count).collect();
         let describe_frame = |frame: &DirectPresentFrame| {
             (
                 frame.source_id.as_u64(),
@@ -862,7 +904,7 @@ impl KmsBackend {
         };
         log::debug!(
             "scanout_m2: submitted atomic composed unflip outputs={} reason={} last_reason={} pending={:?} current={:?}",
-            planes.len(),
+            output_count,
             self.scanout_m2.unflip_reason.unwrap_or("unknown"),
             self.scanout_m2.unflip_last_reason.unwrap_or("unknown"),
             self.scanout_m2.pending.as_ref().map(describe_frame),
@@ -1751,7 +1793,10 @@ impl KmsBackend {
             // state) but STILL run the sequence handler so the armed-target
             // map clears — leaving a stuck entry across suspend is exactly
             // the permanent-stall failure mode this guards against.
-            if let Ok((_flips, sequences)) = self.platform.drain_page_flip_events(drm_fd) {
+            if let Ok((flips, sequences)) = self.platform.drain_page_flip_events(drm_fd) {
+                for (output_idx, _) in flips {
+                    self.record_atomic_cursor_commit_retirement(output_idx);
+                }
                 for seq in sequences {
                     self.on_crtc_sequence_event(
                         seq.device_key,
@@ -1772,6 +1817,7 @@ impl KmsBackend {
             }
         };
         for (output_idx, clock) in flipped {
+            self.record_atomic_cursor_commit_retirement(output_idx);
             let direct_retired = self.retire_direct_output(output_idx, clock);
             let scene_retired = !direct_retired
                 && self.scene.handle_page_flip_complete(
@@ -1828,6 +1874,17 @@ impl KmsBackend {
             crate::kms::render::submit_group::FlushReason::PageflipRetire,
         ) {
             log::warn!("render on_page_flip_ready: flush_submit_group failed: {e:?}");
+        }
+    }
+
+    fn record_atomic_cursor_commit_retirement(&self, output_idx: usize) {
+        let Some(layout) = self.platform.outputs.get(output_idx) else {
+            return;
+        };
+        if let Some(device) = self.platform.device_for_output(&layout.key) {
+            device
+                .atomic_commit_sink
+                .note_cursor_commit_retired(layout.output.crtc, std::time::Instant::now());
         }
     }
 

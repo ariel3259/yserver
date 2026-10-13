@@ -133,6 +133,19 @@ impl SceneCompositor {
         classify_cursor_mode_from_per_output(inner.outputs.iter().map(|o| o.last_frame_cursor_mode))
     }
 
+    /// Set up the already-retired hardware-cursor state needed by direct
+    /// Present backend tests. Production never calls this fixture helper.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn for_tests_set_hw_cursor_mode(&mut self) {
+        if let Some(inner) = self.inner.as_mut() {
+            for output in &mut inner.outputs {
+                output.last_frame_cursor_mode = OutputCursorMode::Hw;
+                output.force_show_retry_version = None;
+            }
+        }
+    }
+
     /// Stage 5 Phase D — steady-state HW sprite-change path. Called
     /// synchronously from the backend's `refresh_effective_cursor`.
     /// Marks each output that already has (or is retiring into) a HW

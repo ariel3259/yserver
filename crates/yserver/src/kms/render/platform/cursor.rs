@@ -63,6 +63,8 @@ impl KmsCursorState {
             plane: None,
             pending_move: None,
             pending_move_timestamp: None,
+            atomic_positions: HashMap::new(),
+            atomic_unsent_positions: HashMap::new(),
             permanently_disabled: false,
             initialization_retryable: false,
             headless_deferred: true,
@@ -71,6 +73,40 @@ impl KmsCursorState {
             atomic_cursor: false,
             sprite_signature: None,
         }
+    }
+
+    fn remember_atomic_position(
+        &mut self,
+        device_key: crate::platform::drm::DrmDeviceKey,
+        crtc: ::drm::control::crtc::Handle,
+        x: i32,
+        y: i32,
+        motion_timestamp: Option<Instant>,
+    ) {
+        let Some((plane, crtc_x, crtc_y)) = self
+            .plane
+            .as_ref()
+            .and_then(|plane| plane.atomic_position_properties(crtc))
+        else {
+            return;
+        };
+        let position = crate::drm::atomic::CursorPlanePosition {
+            device_key,
+            crtc,
+            plane,
+            crtc_x,
+            crtc_y,
+            x,
+            y,
+            motion_timestamp,
+        };
+        self.atomic_positions.insert(crtc, position);
+        self.atomic_unsent_positions.insert(crtc, position);
+    }
+
+    fn clear_atomic_position(&mut self, crtc: ::drm::control::crtc::Handle) {
+        self.atomic_positions.remove(&crtc);
+        self.atomic_unsent_positions.remove(&crtc);
     }
 
     fn available_on(&self, crtc: ::drm::control::crtc::Handle) -> bool {
@@ -312,6 +348,140 @@ impl PlatformBackend {
             .is_some_and(|device| device.cursor.available_on(layout.output.crtc))
     }
 
+    /// Latest position for every listed output whose owning device selected
+    /// the atomic cursor path and whose cursor plane is currently visible.
+    #[must_use]
+    pub(crate) fn cursor_plane_atomic_positions_for_outputs(
+        &self,
+        output_indices: &[usize],
+    ) -> Vec<crate::drm::atomic::CursorPlanePosition> {
+        let mut positions = Vec::new();
+        for output_idx in output_indices {
+            let Some(layout) = self.outputs.get(*output_idx) else {
+                continue;
+            };
+            let Some(device) = self.device_for_key(layout.key.device_key) else {
+                continue;
+            };
+            let crtc = layout.output.crtc;
+            if !device.cursor.atomic_cursor
+                || !device
+                    .cursor
+                    .plane
+                    .as_ref()
+                    .is_some_and(|plane| plane.is_visible_on(crtc))
+            {
+                continue;
+            }
+            if let Some(position) = device.cursor.atomic_positions.get(&crtc).copied() {
+                positions.push(position);
+            }
+        }
+        positions
+    }
+
+    /// Clear only the unsent values carried by an accepted scene commit. The
+    /// latest positions stay cached so subsequent scene commits continue to
+    /// include the cursor plane state.
+    pub(crate) fn cursor_plane_scene_commit_submitted(
+        &mut self,
+        positions: &[crate::drm::atomic::CursorPlanePosition],
+    ) {
+        for position in positions {
+            for device in &mut self.devices {
+                if device.key != position.device_key {
+                    continue;
+                }
+                let matches_latest = device
+                    .cursor
+                    .atomic_positions
+                    .get(&position.crtc)
+                    .is_some_and(|latest| latest == position);
+                if !matches_latest {
+                    continue;
+                }
+                if device
+                    .cursor
+                    .atomic_unsent_positions
+                    .get(&position.crtc)
+                    .is_some_and(|unsent| unsent == position)
+                {
+                    device.cursor.atomic_unsent_positions.remove(&position.crtc);
+                }
+                if let Some(latest) = device.cursor.atomic_positions.get_mut(&position.crtc) {
+                    latest.motion_timestamp = None;
+                }
+            }
+        }
+    }
+
+    /// Seed one already-visible cursor position without issuing a DRM ioctl.
+    /// Tests use the normal output-origin conversion and production cache;
+    /// production never calls this helper.
+    #[cfg(test)]
+    pub(crate) fn for_tests_seed_atomic_cursor_position(
+        &mut self,
+        output_idx: usize,
+        plane_handle: ::drm::control::plane::Handle,
+        crtc_x: ::drm::control::property::Handle,
+        crtc_y: ::drm::control::property::Handle,
+        root_x: i32,
+        root_y: i32,
+        hot_x: u16,
+        hot_y: u16,
+    ) -> crate::drm::atomic::CursorPlanePosition {
+        let layout = &self.outputs[output_idx];
+        let device_key = layout.key.device_key;
+        let crtc = layout.output.crtc;
+        let (crtc_x_local, crtc_y_local) =
+            cursor_root_to_crtc_local(root_x, root_y, layout.x, layout.y, hot_x, hot_y);
+        let device = self
+            .devices
+            .iter_mut()
+            .find(|device| device.key == device_key)
+            .expect("test output has an owning KMS device");
+        if device.cursor.plane.is_none() {
+            device.cursor.plane = Some(crate::kms::cursor_plane::CursorPlane::for_tests_stub(
+                Rc::clone(&device.device),
+                64,
+                64,
+            ));
+        }
+        let plane = device
+            .cursor
+            .plane
+            .as_mut()
+            .expect("test cursor plane was installed");
+        plane.for_tests_set_atomic_position_properties(crtc, plane_handle, crtc_x, crtc_y);
+        plane.for_tests_set_visible(crtc, true);
+        device.cursor.atomic_cursor = true;
+        device.cursor.remember_atomic_position(
+            device_key,
+            crtc,
+            crtc_x_local,
+            crtc_y_local,
+            Some(Instant::now()),
+        );
+        device
+            .cursor
+            .atomic_positions
+            .get(&crtc)
+            .copied()
+            .expect("test cursor plane exposes atomic position properties")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_atomic_position_is_unsent(
+        &self,
+        device_key: crate::platform::drm::DrmDeviceKey,
+        crtc: ::drm::control::crtc::Handle,
+    ) -> bool {
+        self.devices
+            .iter()
+            .find(|device| device.key == device_key)
+            .is_some_and(|device| device.cursor.atomic_unsent_positions.contains_key(&crtc))
+    }
+
     #[must_use]
     pub(crate) fn cursor_plane_fits_for_output(
         &self,
@@ -486,6 +656,10 @@ impl PlatformBackend {
         match result {
             Ok(()) => {
                 self.devices[device_idx].cursor.note_cursor_success(crtc);
+                let device_key = self.devices[device_idx].key;
+                self.devices[device_idx]
+                    .cursor
+                    .remember_atomic_position(device_key, crtc, cx, cy, None);
                 Ok(())
             }
             Err(error) => {
@@ -629,6 +803,7 @@ impl PlatformBackend {
                 .as_ref()
                 .expect("checked cursor plane")
                 .move_to(crtc, cx, cy);
+            state.remember_atomic_position(device_key, crtc, cx, cy, Some(motion_timestamp));
             atomic_commit_sink.record_legacy_move(motion_timestamp, Instant::now());
             if let Err(e) = move_result {
                 if e.raw_os_error() == Some(libc::EBUSY) {
@@ -732,6 +907,9 @@ impl PlatformBackend {
             };
             plane.hide(crtc)
         };
+        if result.is_ok() {
+            self.devices[device_idx].cursor.clear_atomic_position(crtc);
+        }
         apply_cursor_operation_result(&mut self.devices[device_idx].cursor, crtc, &result);
         result
     }
@@ -808,6 +986,8 @@ impl PlatformBackend {
             }
             device.cursor.pending_move = None;
             device.cursor.pending_move_timestamp = None;
+            device.cursor.atomic_positions.clear();
+            device.cursor.atomic_unsent_positions.clear();
             device.cursor.transient_fallback_crtcs.clear();
             let crtcs = crtcs_by_device.remove(&device.key).unwrap_or_default();
             if device.cursor.should_retry_initialization(!crtcs.is_empty()) {
@@ -905,6 +1085,8 @@ impl PlatformBackend {
         for device in &mut self.devices {
             device.cursor.pending_move = None;
             device.cursor.pending_move_timestamp = None;
+            device.cursor.atomic_positions.clear();
+            device.cursor.atomic_unsent_positions.clear();
             let Some(plane) = device.cursor.plane.as_mut() else {
                 continue;
             };
@@ -919,6 +1101,7 @@ impl PlatformBackend {
                     crtcs.push(crtc);
                 }
             }
+            let mut hidden_crtcs = Vec::new();
             for crtc in crtcs {
                 if let Err(error) = plane.hide(crtc) {
                     if error.kind() == io::ErrorKind::PermissionDenied {
@@ -932,9 +1115,14 @@ impl PlatformBackend {
                             device.key
                         );
                     }
+                } else {
+                    hidden_crtcs.push(crtc);
                 }
             }
             plane.invalidate_uploaded_version();
+            for crtc in hidden_crtcs {
+                device.cursor.clear_atomic_position(crtc);
+            }
         }
         if found {
             Ok(())

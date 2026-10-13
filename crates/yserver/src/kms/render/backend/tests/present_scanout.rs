@@ -2298,3 +2298,302 @@ fn scanout_m0_shape_ignores_region_xid_identity_but_not_presence() {
              shape and must still be logged",
     );
 }
+
+fn atomic_cursor_raw<T: ::drm::control::ResourceHandle>(value: u32) -> T {
+    ::drm::control::from_u32(value).expect("nonzero test handle")
+}
+
+fn atomic_cursor_recording_sink(
+    backend: &mut KmsBackend,
+) -> std::rc::Rc<crate::drm::atomic::tests_support::RecordingAtomicCommitExecutor> {
+    use crate::drm::atomic::{AtomicCommitSink, tests_support::RecordingAtomicCommitExecutor};
+
+    let recorder = std::rc::Rc::new(RecordingAtomicCommitExecutor::default());
+    backend.platform.devices[0].atomic_commit_sink =
+        std::rc::Rc::new(AtomicCommitSink::new(recorder.clone()));
+    recorder
+}
+
+fn assert_atomic_cursor_properties(
+    record: &crate::drm::atomic::tests_support::AtomicCommitRecord,
+    positions: &[crate::drm::atomic::CursorPlanePosition],
+) {
+    for position in positions {
+        for (property, value) in [
+            (position.crtc_x, i64::from(position.x) as u64),
+            (position.crtc_y, i64::from(position.y) as u64),
+        ] {
+            assert!(
+                record.properties.iter().any(|update| {
+                    update.object == position.plane.into()
+                        && update.property == property
+                        && update.value == value
+                }),
+                "missing cursor property {property:?}={value} on plane {:?}: {:?}",
+                position.plane,
+                record.properties,
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+// Mutation: `submit_direct_frame` gathers an empty output list. The direct
+// Present caller must record both CRTC-local cursor positions.
+fn eligible_fullscreen_present_records_cursor_positions_for_both_outputs() {
+    use yserver_core::backend::{
+        Backend, CompletedPresentEvent, PresentScanoutCandidate, PresentWake,
+    };
+
+    let mut backend = match KmsBackend::for_tests_with_vk() {
+        Ok(backend) => backend,
+        Err(error) => {
+            eprintln!("skipping: no Vulkan device: {error}");
+            return;
+        }
+    };
+    push_test_output(&mut backend, 0x5200);
+    backend.platform.fb_w = 1600;
+    backend.platform.outputs[1].x = 800;
+    backend.platform.outputs[1].y = 100;
+    let layouts = backend.platform.scene_output_layouts();
+    backend.scene = crate::kms::render::scene::SceneCompositor::new(&backend.platform, &layouts)
+        .expect("live SceneCompositor");
+    backend.scene.for_tests_set_hw_cursor_mode();
+
+    let recorder = atomic_cursor_recording_sink(&mut backend);
+    let positions = [
+        backend.platform.for_tests_seed_atomic_cursor_position(
+            0,
+            atomic_cursor_raw(51),
+            atomic_cursor_raw(61),
+            atomic_cursor_raw(62),
+            850,
+            140,
+            5,
+            10,
+        ),
+        backend.platform.for_tests_seed_atomic_cursor_position(
+            1,
+            atomic_cursor_raw(52),
+            atomic_cursor_raw(63),
+            atomic_cursor_raw(64),
+            850,
+            140,
+            5,
+            10,
+        ),
+    ];
+    assert_eq!((positions[0].x, positions[0].y), (845, 130));
+    assert_eq!((positions[1].x, positions[1].y), (45, 30));
+
+    let target_xid = 0x6e00;
+    let source_xid = target_xid + 1;
+    seed_window(&mut backend, target_xid, None, 0, 0);
+    let target = backend
+        .windows
+        .get_mut(&target_xid)
+        .expect("fullscreen target");
+    target.width = 1600;
+    target.height = 600;
+    backend.core.top_level_order.push(target_xid);
+    let source_id = backend
+        .store
+        .allocate(
+            source_xid,
+            crate::kms::render::store::DrawableKind::Pixmap,
+            24,
+            false,
+            Storage::for_tests_null(
+                ash::vk::Extent2D {
+                    width: 1600,
+                    height: 600,
+                },
+                ash::vk::Format::B8G8R8A8_UNORM,
+            ),
+        )
+        .expect("fullscreen Present source");
+    backend.scanout_m1.entries.insert(
+        source_id,
+        crate::kms::render::backend::ScanoutM1ProbeEntry::accepted(
+            crate::drm::modeset::DirectScanoutProbeFramebuffer::for_tests(atomic_cursor_raw(71)),
+        ),
+    );
+    backend.scanout_m2.eligible_root_streak =
+        crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1;
+
+    let crtc_id = u32::from(backend.platform.outputs[0].output.crtc);
+    bind_test_randr_crtc(&mut backend, 0, crtc_id);
+    let candidate = PresentScanoutCandidate {
+        client_id: 1,
+        present_id: 45,
+        crtc_id,
+        crtc_epoch: backend.present_crtc_clock_epoch(crtc_id),
+        src_pixmap_xid: source_xid,
+        dst_window_xid: target_xid,
+        src_host_xid: source_xid,
+        paint_dst_host_xid: target_xid,
+        completion_dst_host_xid: target_xid,
+        src_width: 1600,
+        src_height: 600,
+        x_off: 0,
+        y_off: 0,
+        valid_region_xid: 0,
+        update_region_xid: 0,
+        update_is_full: true,
+        explicit_sync: false,
+        options: 0,
+    };
+    let event = CompletedPresentEvent {
+        client_id: yserver_protocol::x11::ClientId(1),
+        serial: 12,
+        host_xid: source_xid,
+        dst_host_xid: target_xid,
+        options: 0,
+        present_id: 45,
+        window_generation: 0,
+        crtc_id,
+        crtc_epoch: candidate.crtc_epoch,
+        msc_offset: 0,
+        completion_clock: None,
+        wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+        completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+        emit_idle: true,
+    };
+
+    assert!(
+        Backend::try_present_direct(&mut backend, candidate, event)
+            .expect("eligible fullscreen direct Present"),
+        "the fullscreen Present should enter direct scanout"
+    );
+    let records = recorder.records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].kind,
+        crate::drm::atomic::AtomicCommitKind::SceneWithCursor
+    );
+    assert_atomic_cursor_properties(&records[0], &positions);
+    assert!(backend.scanout_m2.pending.is_some());
+    assert!(positions.iter().all(|position| {
+        !backend
+            .platform
+            .for_tests_atomic_position_is_unsent(position.device_key, position.crtc)
+    }));
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+// Mutation: `submit_composed_unflip` gathers an empty output list. The real
+// shape-triggered unflip must record each output's local cursor coordinates.
+fn shape_triggered_composed_unflip_records_cursor_positions_for_both_outputs() {
+    use yserver_core::backend::Backend;
+
+    let mut backend = match KmsBackend::for_tests_with_vk() {
+        Ok(backend) => backend,
+        Err(error) => {
+            eprintln!("skipping: no Vulkan device: {error}");
+            return;
+        }
+    };
+    push_test_output(&mut backend, 0x5300);
+    backend.platform.outputs[1].x = 800;
+    backend.platform.outputs[1].y = 100;
+    let output_count = backend.platform.outputs.len();
+    backend
+        .platform
+        .scanout_pools
+        .resize_with(output_count, || None);
+    backend
+        .platform
+        .bo_generations
+        .resize_with(output_count, Vec::new);
+    let recorder = atomic_cursor_recording_sink(&mut backend);
+    let positions = [
+        backend.platform.for_tests_seed_atomic_cursor_position(
+            0,
+            atomic_cursor_raw(51),
+            atomic_cursor_raw(61),
+            atomic_cursor_raw(62),
+            850,
+            140,
+            5,
+            10,
+        ),
+        backend.platform.for_tests_seed_atomic_cursor_position(
+            1,
+            atomic_cursor_raw(52),
+            atomic_cursor_raw(63),
+            atomic_cursor_raw(64),
+            850,
+            140,
+            5,
+            10,
+        ),
+    ];
+    assert_eq!((positions[0].x, positions[0].y), (845, 130));
+    assert_eq!((positions[1].x, positions[1].y), (45, 30));
+
+    let vk = std::sync::Arc::clone(
+        backend
+            .platform
+            .gpu
+            .vk
+            .as_ref()
+            .expect("test fixture Vulkan context"),
+    );
+    let kms_device = std::rc::Rc::clone(&backend.platform.devices[0].device);
+    for (output_idx, fb) in [(0, 701), (1, 702)] {
+        let layout = &backend.platform.outputs[output_idx];
+        let pool = crate::kms::vk::scanout::ScanoutBoPool::for_tests_on_screen_framebuffer(
+            std::sync::Arc::clone(&vk),
+            std::rc::Rc::clone(&kms_device),
+            layout.scanout_route,
+            u32::from(layout.width),
+            u32::from(layout.height),
+            atomic_cursor_raw(fb),
+        );
+        backend.platform.scanout_pools[output_idx] =
+            Some(crate::kms::vk::scanout::OutputScanout::Shared(pool));
+    }
+
+    let cow = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+    let (stage, source) = (0x6f00_0003, 0x6f00_0007);
+    let (width, height) = seed_cow_stage(&mut backend, stage);
+    seed_window(&mut backend, source, None, 0, 0);
+    retain_direct_frame_from_source_test(
+        &mut backend,
+        source,
+        stage,
+        u16::try_from(width).expect("test root width"),
+        u16::try_from(height).expect("test root height"),
+    );
+    backend.scanout_m2.unflip_shadow_ready = true;
+
+    Backend::set_shape_rectangles(&mut backend, None, cow, 0, Some(&[]))
+        .expect("empty COW bounding shape");
+    assert!(backend.scanout_m2.unflip_requested);
+    assert_eq!(
+        backend.scanout_m2.unflip_reason,
+        Some("shape_clips_direct_frame")
+    );
+
+    Backend::maybe_composite(&mut backend).expect("submit composed unflip");
+
+    let records = recorder.records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].kind,
+        crate::drm::atomic::AtomicCommitKind::SceneWithCursor
+    );
+    assert_atomic_cursor_properties(&records[0], &positions);
+    assert_eq!(
+        backend.scanout_m2.unflip_awaiting_outputs,
+        std::collections::HashSet::from([0, 1])
+    );
+    assert!(positions.iter().all(|position| {
+        !backend
+            .platform
+            .for_tests_atomic_position_is_unsent(position.device_key, position.crtc)
+    }));
+}

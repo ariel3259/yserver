@@ -404,6 +404,14 @@ impl CursorPlane {
         self.atomic_positions.insert(crtc, (plane, crtc_x, crtc_y));
     }
 
+    /// Set only the in-memory binding observation. Production never calls
+    /// this; atomic scene-path tests use it to model a cursor that was already
+    /// shown without issuing `set_cursor2` against the test DRM fd.
+    #[cfg(test)]
+    pub(crate) fn for_tests_set_visible(&mut self, crtc: crtc::Handle, visible: bool) {
+        self.visible.insert(crtc, visible);
+    }
+
     /// Whether this device's explicitly exposed cursor planes can cover all
     /// requested CRTCs simultaneously. Drivers exposing no universal cursor
     /// planes return true and are probed through legacy ioctls at bind time.
