@@ -1,87 +1,111 @@
-# NVIDIA hardware cursor in the wlroots model — implementation plan
+# Hardware cursor in the wlroots model — implementation plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or
 > superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** on nvidia-drm, drive the hardware cursor through atomic commits in the wlroots model so the NVIDIA
-software-cursor policy can go, and let direct scanout engage when the cursor is hidden — without a KMS thread.
+**Goal:** drive the hardware cursor through atomic commits in the wlroots model on every driver that exposes atomic
+cursor planes. This lets the NVIDIA software-cursor policy go, and lets direct scanout engage when the cursor is
+hidden. No KMS thread.
 
-**Architecture:** one commit stream per CRTC with at most one commit in flight. The cursor plane's `CRTC_X`/`CRTC_Y`
-ride every scene commit on that CRTC (shared flip, copied flip, direct scanout, composed unflip). When nothing is in
-flight on the CRTC, motion sends a cursor-only `NONBLOCK | PAGE_FLIP_EVENT` commit, and further motion coalesces
-(latest wins) until it retires. While a cursor-only commit is in flight, the scene and direct scanout wait for it
-exactly as they wait for their own flip. Other drivers keep master's legacy cursor ioctls unchanged.
+**Architecture:** one commit stream per CRTC with at most one commit in flight.
+- The cursor plane's `CRTC_X`/`CRTC_Y` ride every scene commit on that CRTC: shared flip, copied flip, direct
+  scanout and composed unflip. Grouped transactions carry every participating CRTC's position.
+- When nothing is in flight on the CRTC, motion sends a cursor-only `NONBLOCK | PAGE_FLIP_EVENT` commit. Further
+  motion coalesces (latest wins) until it retires.
+- While a cursor-only commit is in flight, the scene and direct scanout wait for it exactly as they wait for their own
+  flip, and they are resumed by its retirement.
+- Devices whose cursor planes lack atomic position properties, or that expose no cursor planes, keep master's legacy
+  cursor ioctls.
 
-**Tech Stack:** Rust, `drm` crate atomic requests, nvidia-drm (open kernel modules), the 3b `OutputSink` /
-`CursorPlaneSink` seam (`crates/yserver-render/src/kms/render/scene/sink.rs`).
+**Tech Stack:** Rust, `drm` crate atomic requests, nvidia-drm (open kernel modules), amdgpu, i915, the 3b
+`OutputSink` / `CursorPlaneSink` seam (`crates/yserver-render/src/kms/render/scene/sink.rs`).
 
-**Evidence (measured 2026-10-13 on card1, spike on master 7b5fff83, branch `spike/nvidia-atomic-cursor`):**
-software cursor, legacy hardware cursor and this model were compared on pure motion, window drag, windowed mpv plus
-motion and fullscreen mpv plus motion. This model matched the software cursor on every test (0 round trips over 8 ms,
-drag p99 12 px, 60 fps, 0 mpv drops). It got 2068 direct submits where the software cursor gets 0. EBUSY was 0, and
-NONBLOCK ioctl time had a p99 of 60–150 µs. The legacy cursor had 1200 stalls. Root cause of the legacy stall:
-nvidia-drm has no `atomic_async_check`/`atomic_async_update`, and its own `nv_drm_atomic_commit` ignores
-`legacy_cursor_update`, so a legacy cursor ioctl is a blocking commit that waits for the pending flip and its own
-vblank (`nvidia-drm-modeset.c:746`, `:897`). The spike diff is
-`~/Projects/claude-scratch/yserver-pr1/bin-spike/spike-final.diff` (reference only — its scene parts predate 3b).
+**Evidence (spike, measured 2026-10-13 on card1, master 7b5fff83, branch `spike/nvidia-atomic-cursor`):**
+- **Tests compared:** software cursor, legacy hardware cursor and this model, on pure motion, window drag, windowed
+  mpv plus motion, and fullscreen mpv plus motion.
+- **Result:** this model matched the software cursor on every test: 0 round trips over 8 ms, drag p99 12 px, 60 fps,
+  0 mpv drops. It got 2068 direct submits where the software cursor gets 0. EBUSY was 0, and NONBLOCK ioctl time had
+  a p99 of 60–150 µs. The legacy cursor had 1200 stalls.
+- **Root cause of the legacy stall:** nvidia-drm has no `atomic_async_check`/`atomic_async_update`, and its own
+  `nv_drm_atomic_commit` ignores `legacy_cursor_update`. A legacy cursor ioctl is therefore a blocking commit that
+  waits for the pending flip and its own vblank (`nvidia-drm-modeset.c:746`, `:897`).
+- **AMD and i915:** amdgpu (`atomic_async_*`) and i915 (`intel_legacy_cursor_update`) apply legacy moves immediately,
+  so on them this model trades an immediate update for at most one vblank of added cursor latency. The user chose
+  one model for every driver (2026-10-13); Task 5 measures that latency on amdgpu.
+- **Spike diff:** `~/Projects/claude-scratch/yserver-pr1/bin-spike/spike-final.diff`. Reference only; its scene parts
+  predate 3b and it was NVIDIA-only.
 
 ## Global Constraints
 
-- Behaviour changes only for devices where `drm_device_is_nvidia` is true; every other driver issues exactly master's
-  legacy `set_cursor2` / `move_cursor` calls (a test pins this).
+- **Path choice per device:** the atomic path applies to a device when every active CRTC has a cursor plane with
+  `CRTC_X` and `CRTC_Y`. Otherwise the device keeps master's legacy `set_cursor2` / `move_cursor` calls exactly (a
+  test pins this). The choice is by capability, never by driver name. The NVIDIA software-cursor policy is deleted.
 - No environment variable switches behaviour (project rule). `YSERVER_LOOP_TELEMETRY` stays a pure diagnostic.
-- No `cfg(test)` forks or test-only behaviour in production bodies; test seams are `#[cfg(test)]` items production does
-  not call, or constructor parameters. No side effects inside `debug_assert!`. No sleeps to order events.
-- Test rules: **A** end-state checks (no cursor commit left in flight, no unsent position, the recorded commit
-  sequence exact); **B** advance only through `Backend` trait entries or `yserver_core::core_loop::run_core`;
-  **C** hardware validation per real-path task (Task 5); **F** each new test 5 times under 16 `nproc` busy loops
-  started outside the tests and killed afterwards.
+- **No test-only behaviour in production:**
+  - no `cfg(test)` forks or test-only behaviour in production bodies;
+  - test seams are `#[cfg(test)]` items production does not call, or constructor parameters;
+  - no side effects inside `debug_assert!`;
+  - no sleeps to order events.
+- **Test rules:**
+  - **A**, end-state checks: no cursor commit left in flight, no unsent position, the recorded commit sequence exact.
+  - **B**, advance only through `Backend` trait entries or `yserver_core::core_loop::run_core`.
+  - **C**, hardware validation per real-path task (Task 5).
+  - **F**, each new test 5 times under 16 `nproc` busy loops started outside the tests and killed afterwards.
 - Every test names the mutation that must make it fail; run it once.
 - Show/hide and image upload keep master's legacy ioctls (`set_cursor2`); only positions go atomic.
-- EBUSY on any commit of this stream is a bookkeeping bug: count it, warn, and handle it the way master handles a
-  failed flip or move today. No retry loops.
+- **Only accepted commits are in flight.** A commit counts as in flight only after its ioctl returned success. A
+  rejected cursor-only commit leaves no in-flight state: its position stays unsent and the next scheduling pass may
+  carry it in a scene commit. EBUSY is counted and warned (it is a bookkeeping bug), never retried in a loop.
 - The intermediate-disable RANDR stall (~3.1 s in `disable_output`, present with every cursor mode) is out of scope.
 
 ## Review Focus
 
 1. **A cursor-only commit in flight when the topology changes or the VT is released.** Its flip event must be
    drained by the existing old-event discard, never attributed to the next scene flip on a reused CRTC. Add cursor
-   in-flight CRTCs to `pending_pageflip_crtcs` (`backend/kms/crtc_config.rs:42`) and the VT path's equivalent (Task 3
-   test).
+   in-flight CRTCs to `pending_pageflip_crtcs` (`backend/kms/crtc_config.rs:42`) and to the VT path's equivalent
+   (Task 3 test).
 2. **A RANDR mode change passing through zero active CRTCs.** The plane-to-CRTC position properties are discovery
-   data and must survive `CursorPlane::retain_crtcs` (the spike fell back to the software cursor here; Task 1 test).
-3. **Motion while a direct-scanout successor or unflip is pending.** Nothing may be submitted to the CRTC, and the
-   position must ride the next direct or composed commit (Task 3 test).
+   data and must survive `CursorPlane::retain_crtcs`; the spike fell back to the software cursor here (Task 1 test).
+3. **Motion while a direct-scanout successor or unflip is pending.** Nothing may be submitted to those CRTCs, and
+   every CRTC's position must ride the next direct or composed transaction (Tasks 2–3 tests).
 4. **The cursor shown again during direct scanout after a game hid it.** The existing path must bind the plane or
    unflip; the cursor must never be invisible while shown (Task 4 test).
-5. **Cursor on a copied (PRIME) output.** The position rides the copied flip on the sink device's CRTC, with the sink
-   device's cursor plane (Task 2 test).
+5. **Cursor latency on amdgpu and i915**, where legacy moves were immediate. The added delay must stay within one
+   vblank, measured by the motion-to-commit instrumentation (Task 1) and on hardware (Task 5).
 
 ---
 
-### Task 1: Atomic position properties and a recordable commit sink
+### Task 1: Atomic position properties, the path choice and a recordable commit sink
 
 **Files:** `crates/yserver/src/kms/cursor_plane.rs`, new `crates/yserver/src/drm/atomic.rs` (+ `drm/mod.rs`),
 `crates/yserver/src/kms/render/platform/cursor.rs`, `platform/init.rs`.
 
 **Interfaces — produces:**
 - `CursorPlane::atomic_position_properties(crtc) -> Option<(plane::Handle, property::Handle, property::Handle)>`
-  and `supports_atomic_positions(&[crtc]) -> bool`. Filled at discovery from every cursor plane with `CRTC_X` and
-  `CRTC_Y`; **`retain_crtcs` never prunes them.**
-- `crate::drm::atomic::CursorPlanePosition { crtc, plane, crtc_x, crtc_y, x, y }` with
+  and `supports_atomic_positions(&[crtc]) -> bool`. They are filled at discovery from every cursor plane with
+  `CRTC_X` and `CRTC_Y`; **`retain_crtcs` never prunes them.**
+- `crate::drm::atomic::CursorPlanePosition { crtc, plane, crtc_x, crtc_y, x, y }`, with
   `add_to(&self, req: &mut AtomicModeReq)`.
-- An `AtomicCommitSink` held per KMS device (constructor parameter; production = the device's `atomic_commit`; the
-  `#[cfg(test)]` recorder stores each request's object/property/value triples and flags). It records the commit kind
-  (`cursor-only`, `scene-with-cursor`, `scene`), ioctl time and result. Debug log
-  `atomic commit kind=… crtc=… ioctl_us=… result=…`; a per-second info line under `YSERVER_LOOP_TELEMETRY`:
-  per-kind counts, EBUSY, max/p99 ioctl µs.
-- `KmsCursorState::new_with_atomic_cursor(nvidia: bool)` replaces `new_with_nvidia_policy`; on NVIDIA,
-  `topology_blocked` is also true when a CRTC has no atomic position properties (software fallback, as today).
+- **`AtomicCommitSink`,** held per KMS device:
+  - Construction: a constructor parameter. In production it is the device's `atomic_commit`. A `#[cfg(test)]`
+    recorder stores each request's object/property/value triples and flags. The recorder's result can be scripted
+    per call (`Ok`, `EBUSY`, `EINVAL`) for Task 3's rejection test.
+  - It records each commit's kind (`cursor-only`, `scene-with-cursor`, `scene`), ioctl time and result.
+  - Debug log: `atomic commit kind=… crtc=… ioctl_us=… result=…`.
+  - Per-second info line under `YSERVER_LOOP_TELEMETRY`: per-kind counts, EBUSY, max/p99 ioctl µs, and max/p99
+    **motion-to-commit delay**. That delay is the time from the pointer event that produced a position to the
+    accepted commit carrying it (Review Focus 5).
+- **`KmsCursorState` path choice:**
+  - `atomic_cursor: bool` is decided per device from `supports_atomic_positions` over its active CRTCs. The decision
+    is recomputed at every topology refresh.
+  - `new_with_nvidia_policy` and the policy are removed.
+  - A device whose CRTCs lack the properties keeps the legacy path, not the software cursor.
 
-- [ ] Test `nvidia_cursor_keeps_atomic_positions_across_a_zero_crtc_topology_step`: install, `retain_crtcs(∅)`,
-  `retain_crtcs({crtc})` → `supports_atomic_positions` true, `is_visible_on` false. Mutation: prune
+- [ ] Test `cursor_keeps_atomic_positions_across_a_zero_crtc_topology_step`: install, `retain_crtcs(∅)`,
+  `retain_crtcs({crtc})`. Expect `supports_atomic_positions` true and `is_visible_on` false. Mutation: prune
   `atomic_positions` in `retain_crtcs`.
-- [ ] Test: a plane without `CRTC_X` on NVIDIA blocks the topology (software cursor). Mutation: drop the check.
+- [ ] Test: a device whose cursor plane lacks `CRTC_X` chooses the legacy path (not software, not atomic). Mutation:
+  choose atomic unconditionally.
 - [ ] Gate (below); commit `feat(kms): atomic cursor position properties and a recordable commit sink`.
 
 ### Task 2: The cursor rides every scene commit
@@ -90,88 +114,138 @@ vblank (`nvidia-drm-modeset.c:746`, `:897`). The spike diff is
 `platform/scanout_bos.rs` (copied flip, ~L123), `backend/kms/scanout.rs` (direct ~L534, composed unflip ~L854),
 `crates/yserver/src/drm/{page_flip.rs,modeset.rs}`.
 
-**Interfaces:** `PlatformBackend::cursor_plane_atomic_position_for_output(output_idx) -> Option<CursorPlanePosition>`
-(NVIDIA device, plane visible on that CRTC, latest position); the four submit functions take
-`Option<&CursorPlanePosition>` and append it; on success `cursor_plane_scene_commit_submitted(output_idx)` clears that
-CRTC's unsent position.
+**Interfaces:**
+- `PlatformBackend::cursor_plane_atomic_positions_for_outputs(&[output_idx]) -> Vec<CursorPlanePosition>` returns one
+  entry per listed output whose device uses the atomic path and whose plane is visible on that CRTC, at the latest
+  position.
+- The single-output submitters (shared and copied flip) take that list for their one output.
+- The grouped submitters (`submit_direct_scanout`, `submit_composed_scanout`) take the list for every participating
+  output.
+- After a successful request, `cursor_plane_scene_commit_submitted(&[CursorPlanePosition])` clears the unsent
+  position of exactly the CRTCs it carried. A failed request clears nothing.
 
 - [ ] Test (shared flip, through `tick_maybe_composite_for_tests` or the scripted scene path): the recorded request
   carries the cursor plane's `CRTC_X`/`CRTC_Y` = the latest position. Mutation: omit the append.
-- [ ] Test: direct scanout and composed unflip requests carry the position. Mutation: omit it in one of them.
-- [ ] Test (copied, Review Focus 5): the copied flip carries the sink device's cursor plane position. Mutation: use
-  the renderer device's plane.
-- [ ] Test: non-NVIDIA scene commits carry no cursor properties. Mutation: append unconditionally.
-- [ ] Gate; commit `feat(kms): the NVIDIA cursor position rides the scene's atomic commit`.
+- [ ] Test (B-1): a **two-CRTC** direct transaction and a two-CRTC composed unflip with different output origins.
+  Both planes' property triples are present with each CRTC's local coordinates. Mutation: append only the first
+  output's position.
+- [ ] Test: the copied flip carries the sink device's cursor plane position. Mutation: use the renderer device's
+  plane.
+- [ ] Test: a legacy-path device's scene commits carry no cursor properties. Mutation: append unconditionally.
+- [ ] Gate; commit `feat(kms): the cursor position rides the scene's atomic commits`.
 
 ### Task 3: Cursor-only commits, retirement and the shared gate
 
-**Files:** `platform/cursor.rs`, `platform/flip_events.rs`, `backend/portable/pointer.rs`, `backend/kms/scanout.rs`,
-`backend/kms/crtc_config.rs`, `backend/kms/session.rs`, `crates/yserver-render/src/kms/render/scene/{sink.rs,tick.rs}`.
+**Files:** `platform/cursor.rs`, `platform/flip_events.rs`, `backend/portable/pointer.rs`,
+`backend/kms/{scanout.rs,present.rs,crtc_config.rs,session.rs}`,
+`crates/yserver-render/src/kms/render/scene/{sink.rs,tick.rs}`.
 
 **Interfaces / invariants:**
-- Per CRTC: `atomic_pending_moves` (latest wins), `atomic_cursor_commits_in_flight`. Motion on NVIDIA stores the
-  position; if the CRTC has no scene flip awaiting retirement, no direct/unflip transaction pending and no cursor-only
-  commit in flight, it submits a cursor-only commit and marks it in flight.
-- A flip event on a CRTC with a cursor-only commit in flight retires that commit (at most one commit in flight per
-  CRTC, so the CRTC identifies it). After retirement the backend's next scheduling pass sends the unsent position as
-  a cursor-only commit only if the scene has nothing ready for that output; otherwise it rides the scene commit.
-- New `OutputSink::output_commit_in_flight(output_idx) -> bool` (default `false` for `TestSink` unless set). The
-  scene's per-output submit gate (`tick_one_output`) and `has_output_ready_for_submit` treat it like a non-empty
-  `pending_acks`. Direct submission (`try_present_direct` path) and the composed unflip wait while any cursor-only
-  commit is in flight on their outputs.
-- `pending_pageflip_crtcs` (and the VT-release path's set) include CRTCs with a cursor-only commit in flight, so the
-  old-event discard drains them (Review Focus 1). `cursor_plane_hide_all` and topology changes clear the per-CRTC
-  state only after that discard.
-- The NVIDIA software-cursor policy is deleted.
+- **Per-CRTC state:** `atomic_pending_moves` (latest wins) and `atomic_cursor_commits_in_flight`.
+- **Motion on an atomic-path device:** store the position. If the CRTC has no scene flip awaiting retirement, no
+  direct/unflip transaction pending, no direct candidate waiting (below) and no cursor-only commit in flight, submit a
+  cursor-only commit. Mark it in flight **only if the ioctl succeeded**.
+- **Retirement:** a flip event on a CRTC with a cursor-only commit in flight retires that commit. With at most one
+  commit in flight per CRTC, the CRTC identifies it.
+- **Arbitration after a retirement.** The backend's next scheduling pass, in this order:
+  1. submits a waiting direct candidate whose CRTCs are all clear;
+  2. otherwise lets the scene submit if it has a frame ready for that output;
+  3. only then sends the unsent position as a cursor-only commit.
+- **Direct Present behind a cursor commit (M-1).**
+  - When an eligible direct Present arrives while a cursor-only commit is in flight on any of its outputs and no
+    direct frame is pending, it is retained in master's direct successor slot (`present.rs` ~L834): latest-wins, the
+    same pin/skip-completion rules as today.
+  - The cursor-only retirement that clears its last blocking CRTC calls the same submission path as
+    `submit_queued_direct_successor`, so a waiting Present never depends on a later direct event.
+- **Scene gate:** new `OutputSink::output_commit_in_flight(output_idx) -> bool` (`false` in `TestSink` unless set).
+  The scene's per-output submit gate (`tick_one_output`) and `has_output_ready_for_submit` treat it like a non-empty
+  `pending_acks`. The composed unflip also waits while a cursor-only commit is in flight on its outputs.
+- **Old events:** `pending_pageflip_crtcs` and the VT-release path's set include CRTCs with a cursor-only commit in
+  flight, so the old-event discard drains them (Review Focus 1). `cursor_plane_hide_all` and topology changes clear
+  the per-CRTC state only after that discard.
 
-- [ ] Test `nvidia_idle_motion_coalesces_until_cursor_flip_retires` (via `Backend::warp_pointer_root` and
-  `on_page_flip_ready`): one cursor-only commit, then nothing until retirement, then one commit with the latest
-  position. Mutation: first-wins insertion.
+- [ ] Test `idle_motion_coalesces_until_cursor_flip_retires` (via `Backend::warp_pointer_root` and
+  `on_page_flip_ready`): one cursor-only commit, nothing until retirement, then one commit with the latest position.
+  Mutation: first-wins insertion.
 - [ ] Test: motion during a pending scene flip sends nothing; the next scene request carries the latest position.
   Mutation: ignore the scene blocker.
-- [ ] Test: the scene does not submit while a cursor-only commit is in flight and submits after its retirement.
+- [ ] Test: the scene does not submit while a cursor-only commit is in flight, and submits after its retirement.
   Mutation: `output_commit_in_flight` always false.
 - [ ] Test (Review Focus 3): motion while a direct successor is pending sends nothing; the successor carries it.
   Mutation: drop the direct blocker.
-- [ ] Test (Review Focus 1): a cursor-only commit in flight at a RANDR change — its event is discarded, the first
+- [ ] Test (M-1, cursor first):
+  - a cursor-only commit is in flight, then an eligible fullscreen Present arrives;
+  - it is retained, not submitted;
+  - the cursor retirement submits it, its completion arrives, and its pins retire;
+  - no further cursor-only commit goes out before it.
+  Mutation: retirement does not resume the waiting candidate.
+- [ ] Test (M-2): the recorder rejects a cursor-only commit with EBUSY. Expect:
+  - no in-flight state and the position still unsent;
+  - one EBUSY counted;
+  - the next scene frame submits without any synthetic flip event and carries the position;
+  - no second cursor-only attempt in the same pass.
+  Mutation: mark in flight before the ioctl result.
+- [ ] Test (Review Focus 1): a cursor-only commit in flight at a RANDR change. Its event is discarded, and the first
   scene flip after the change retires the scene's own frame. Mutation: leave cursor CRTCs out of
   `pending_pageflip_crtcs`.
-- [ ] Test `non_nvidia_pointer_motion_keeps_one_legacy_move_and_no_atomic_commit`. Mutation: route non-NVIDIA through
-  the atomic branch.
-- [ ] Gate; commit `feat(kms): NVIDIA cursor-only atomic commits, one commit in flight per CRTC`.
+- [ ] Test `legacy_path_pointer_motion_keeps_one_legacy_move_and_no_atomic_commit`. Mutation: route the legacy device
+  through the atomic branch.
+- [ ] Gate; commit `feat(kms): cursor-only atomic commits, one commit in flight per CRTC`.
 
 ### Task 4: A hidden cursor does not block direct scanout
 
-**Files:** `crates/yserver-render/src/kms/render/scene/cursor.rs` (`classify_cursor_mode_from_per_output` L28,
-`cursor_mode` L114), the `CursorPlaneMode` enum (`yserver-render/src/kms/render/scene.rs:275`),
-`crates/yserver/src/kms/render/backend/kms/scanout.rs` (`scanout_m1_probe_eligible` calls ~L1013 and the
-diagnostic one ~L1465, composite-tick unflip ~L2034), `backend/portable/pointer.rs` (mode match).
+**Files:**
+- `crates/yserver-render/src/kms/render/scene/cursor.rs`: `classify_cursor_mode_from_per_output` (L28) and
+  `cursor_mode` (L114);
+- the `CursorPlaneMode` enum (`yserver-render/src/kms/render/scene.rs:275`);
+- `crates/yserver/src/kms/render/backend/kms/scanout.rs`: the `scanout_m1_probe_eligible` calls (~L1013, and the
+  diagnostic one ~L1465) and the composite-tick unflip (~L2034);
+- `backend/portable/pointer.rs`: the mode match.
 
-**Cause:** XFIXES `HideCursor` makes every output `OutputCursorMode::Hidden`; the classifier maps "no Hw and no Sw"
-to `CursorPlaneMode::Sw`, and both direct gates require `Hw`, so a hidden cursor — which needs no composition — blocks
-direct scanout on every GPU (the unflip reason is literally `composite_tick_software_or_hidden_cursor`).
+**Cause:** XFIXES `HideCursor` makes every output `OutputCursorMode::Hidden`. The classifier maps "no Hw and no Sw"
+to `CursorPlaneMode::Sw`, and both direct gates require `Hw`. So a hidden cursor, which needs no composition, blocks
+direct scanout on every GPU; the unflip reason is literally `composite_tick_software_or_hidden_cursor`.
 
-**Invariant:** a cursor that is hidden on every output is direct-compatible. Add `CursorPlaneMode::Hidden` (all
-outputs `Hidden`, no pending transition); both direct gates accept `Hw | Hidden`; the pointer fast path treats
-`Hidden` as "nothing to move". `Mixed` stays as today.
+**Invariant:** a cursor that is hidden on every output is direct-compatible.
+- Add `CursorPlaneMode::Hidden`: every output `Hidden`, no pending transition.
+- Both direct gates accept `Hw | Hidden`.
+- The pointer fast path treats `Hidden` as "nothing to move".
+- `Mixed` stays as today.
 
 - [ ] Test (render crate, `TestSink`): all outputs hidden → `cursor_mode() == Hidden`; Hidden + Sw → `Sw`;
   Hidden + Hw → `Hw`. Mutation: map all-Hidden to `Sw`.
 - [ ] Test (backend): after `HideCursor`, an eligible fullscreen Present enters direct scanout and the composite tick
   does not request an unflip. Mutation: gate on `Hw` only.
-- [ ] Test (Review Focus 4): `ShowCursor` during direct scanout binds the plane (Hw) or unflips (Sw); never leaves the
-  cursor invisible. Mutation: skip the bind on show.
+- [ ] Test (Review Focus 4): `ShowCursor` during direct scanout binds the plane (Hw) or unflips (Sw), and never leaves
+  the cursor invisible. Mutation: skip the bind on show.
 - [ ] Gate; commit `fix(kms): a hidden cursor does not keep direct scanout off`.
 
-### Task 5: Hardware validation (card1, with the user's approval)
+### Task 5: Hardware validation (with the user's approval)
 
-Run `~/Projects/claude-scratch/yserver-pr1/hw_spike_matrix.sh` with master (software cursor), master with the policy
-lifted (legacy) and this branch. Then fullscreen mpv with the cursor hidden (`xdotool` / an XFIXES HideCursor client),
-a RANDR mode change while moving, and a VT switch by a person from a tty3 login. Stop at the first Xid or `ERR!`.
-Acceptance: each matrix row equals the software cursor (0 round trips > 8 ms, drag p99 within 1 px, 60 fps, 0 drops);
-direct submits > 0 in fullscreen with the cursor visible and with it hidden; EBUSY 0; NONBLOCK ioctl p99 < 1 ms; the
-cursor stays hardware after the RANDR change; the VT switch restores the cursor. Record the table in this plan and in
-`docs/status.md`.
+Run on **card1 (NVIDIA)**, then on **card0 (AMD)** after the user moves the monitor cable. Use
+`~/Projects/claude-scratch/yserver-pr1/hw_spike_matrix.sh` with master (on NVIDIA: the software cursor; on AMD:
+master's legacy hardware cursor), master with the NVIDIA policy lifted (NVIDIA only), and this branch. On each card
+also run:
+- fullscreen mpv with the cursor hidden (an XFIXES `HideCursor` client);
+- a RANDR mode change while moving;
+- a VT switch, done by a person from a tty3 login.
+
+Stop at the first Xid or `ERR!`. **i915:** ask the maintainer to run the matrix on an Intel machine. A run without it
+is reported as "i915 not validated".
+
+**Acceptance:**
+- **NVIDIA:** each matrix row equals the software cursor (0 round trips > 8 ms, drag p99 within 1 px, 60 fps,
+  0 drops).
+- **AMD:** each row equals or beats master's legacy cursor, and the motion-to-commit p99 is ≤ one frame (16.7 ms at
+  60 Hz).
+- **Both:**
+  - direct submits > 0 in fullscreen, with the cursor visible and with it hidden;
+  - EBUSY 0;
+  - NONBLOCK ioctl p99 < 1 ms;
+  - the cursor stays hardware after the RANDR change;
+  - the VT switch restores the cursor.
+
+Record the tables in this plan and in `docs/status.md`.
 
 ## Gate (every task)
 
@@ -180,12 +254,23 @@ cursor stays hardware after the RANDR change; the VT switch restores the cursor.
    `--features yserver/xdmcp`.
 3. `cargo test --workspace --locked`, and each file under `crates/yserver/tests/` by name.
 4. The lavapipe ignored suite in the form master's CI uses (`.github/workflows`), with
-   `VK_DRIVER_FILES=~/Projects/claude-scratch/yserver-pr1/lvp/lvp_icd.json YSERVER_ALLOW_SOFTWARE_VULKAN=1`;
+   `VK_DRIVER_FILES=~/Projects/claude-scratch/yserver-pr1/lvp/lvp_icd.json YSERVER_ALLOW_SOFTWARE_VULKAN=1`.
    `two_gpu`/`_drm` tests are skipped without the user's approval.
 5. Rule F for the task's new tests.
 6. Cargo.lock unchanged. FreeBSD: "not checked" (CI runs it).
 
+## Review log
+
+- **Round 1 (codex `gpt-6.1-sol` xhigh, instrument `111490f`, 2026-10-13), on the NVIDIA-only revision:** 1 blocking,
+  2 major, 0 minor. All three were verified against the code and applied:
+  - **B-1:** grouped direct and unflip transactions carry every participating CRTC's position (Task 2).
+  - **M-1:** a direct Present waiting behind a cursor-only commit is retained in the successor slot and resumed by the
+    cursor retirement (Task 3).
+  - **M-2:** in flight means accepted; the rejection test (Task 3).
+- **Scope change (user, 2026-10-13):** Tasks 1–3 apply to every driver with atomic cursor position properties (AMD
+  and i915 too), chosen by capability. Hardware validation on AMD was added.
+
 ## Non-goals
 
 The KMS owner thread; the RANDR intermediate-disable stall; tearing / async page flips; atomic show/hide or cursor
-image changes; the software clock; any change for non-NVIDIA drivers.
+image changes; the software clock.
