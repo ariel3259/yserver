@@ -3373,6 +3373,9 @@ fn direct_successor_waits_for_retirement_and_carries_motion() {
 
     retire_atomic_cursor_test_output(&mut backend, &mut state, 0, 2);
     retire_atomic_cursor_test_output(&mut backend, &mut state, 1, 2);
+    // A Copy completion is ready only once its GPU signal has executed; wait for the
+    // device (bounded by the driver) instead of racing a slow software ICD.
+    backend.platform.wait_idle_bounded();
     let completed = Backend::drain_completed_present_events(&mut backend);
     assert_eq!(
         completed
@@ -3552,6 +3555,9 @@ fn cursor_retirement_resumes_a_direct_successor_on_the_last_crtc() {
 
     retire_atomic_cursor_test_output(&mut backend, &mut state, 0, 3);
     retire_atomic_cursor_test_output(&mut backend, &mut state, 1, 3);
+    // A Copy completion is ready only once its GPU signal has executed; wait for the
+    // device (bounded by the driver) instead of racing a slow software ICD.
+    backend.platform.wait_idle_bounded();
     let completed = Backend::drain_completed_present_events(&mut backend);
     assert_eq!(
         completed
@@ -3643,6 +3649,9 @@ fn first_direct_entry_declines_behind_cursor_commit_without_retaining_state() {
     // admitted fixture state so this last Present isolates cursor retirement.
     backend.scanout_m2.eligible_root_streak =
         crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1;
+    // A Copy completion is ready only once its GPU signal has executed; wait for the
+    // device (bounded by the driver) instead of racing a slow software ICD.
+    backend.platform.wait_idle_bounded();
     let completed = Backend::drain_completed_present_events(&mut backend);
     assert!(
         completed.iter().any(|event| {
