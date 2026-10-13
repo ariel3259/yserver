@@ -168,14 +168,15 @@ hidden. No KMS thread.
 ### Task 3: Cursor-only commits, retirement and the scene gate
 
 **Files:** `platform.rs` (`KmsCursorState`), `platform/cursor.rs`, `platform/flip_events.rs`,
-`backend/portable/pointer.rs`, `backend/trait_impl.rs`,
+`backend/portable/pointer.rs`, `backend/kms/scanout.rs` (`scene_wants_compose`, `backend_scanout_next_wakeup`,
+`backend_scanout_maybe_composite`), `platform/scene_sink.rs` (the `OutputSink` impl),
 `crates/yserver-render/src/kms/render/scene/{sink.rs,tick.rs}`.
 
 **Interfaces / invariants** (Tasks 4 and 5 build on these):
 - **Per-CRTC state:** `atomic_pending_moves` (latest wins) and `atomic_cursor_commits_in_flight`.
 - **Motion on an atomic-path device never submits directly (M-5).**
   - It stores the position (with its event timestamp) and marks the backend's scheduling pass as wanted.
-  - The compose-wanted predicate that runs `maybe_composite` (`backend/trait_impl.rs:166`) includes "an unsent cursor
+  - The compose-wanted predicate that runs `maybe_composite` (`scene_wants_compose` in `backend/kms/scanout.rs`; `trait_impl.rs:166` only delegates) includes "an unsent cursor
     position eligible for a cursor-only commit exists". Eligible means not under `cursor_retry_waits_for_flip` and
     not in hide recovery.
   - **Cursor-only commits are decided only in that pass**, so motion cannot bypass the arbitration below.
@@ -353,6 +354,10 @@ Record the tables in this plan and in `docs/status.md`.
 6. Cargo.lock unchanged. FreeBSD: "not checked" (CI runs it).
 
 ## Review log
+
+- **Task 3 stop (2026-10-13):** the compose-wanted predicate and the scene gate live in `backend/kms/scanout.rs`,
+  and the `OutputSink` impl in `platform/scene_sink.rs`; both were added to Task 3. File lists name the main files.
+  A task may also change any file that owns or calls the interfaces it names, and the report lists them.
 
 - **Task 2 (2026-10-13):** the direct and unflip caller tests go through `Backend` entries with the recording
   sink. The shared and copied flip callers have no hardware-free scene fixture (`for_tests_with_vk_live_scene`
