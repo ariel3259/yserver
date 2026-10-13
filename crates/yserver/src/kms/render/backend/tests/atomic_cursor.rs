@@ -480,7 +480,7 @@ fn cursor_only_commit_blocks_scene_readiness_until_its_flip_retires() {
 #[test]
 // Mutation: let pointer motion submit cursor-only immediately, bypassing scene priority.
 fn scene_damage_after_cursor_retirement_submits_scene_with_latest_position() {
-    use yserver_core::{backend::Backend, server::ServerState};
+    use yserver_core::server::ServerState;
 
     let Some(mut backend) = backend_with_live_scene() else {
         return;
@@ -576,5 +576,80 @@ fn legacy_path_pointer_motion_keeps_one_legacy_move_and_no_atomic_commit() {
         1,
         "one visible legacy cursor move was attempted",
     );
+    assert_no_cursor_work(&backend, device_key);
+}
+
+#[test]
+// Mutation: do not set `cursor_retry_waits_for_flip` after a cursor-only EBUSY.
+fn cursor_only_ebusy_waits_for_the_next_flip_before_retrying() {
+    use yserver_core::server::ServerState;
+
+    let Some(mut backend) = backend_with_live_scene() else {
+        return;
+    };
+    let recorder = recording_sink(&mut backend, 0);
+    let device_key = backend.platform.devices[0].key;
+    let position = seed_cursor_position(&mut backend);
+    let mut state = ServerState::new();
+    recorder.script_result(Err(io::Error::from_raw_os_error(libc::EBUSY)));
+
+    warp(&mut backend, &mut state, 180, 130);
+    maybe_composite(&mut backend);
+    let crtc = position.crtc;
+    assert_eq!(recorder.records().len(), 1);
+    assert_eq!(recorder.records()[0].kind, AtomicCommitKind::CursorOnly);
+    assert_eq!(
+        backend.platform.devices[0]
+            .atomic_commit_sink
+            .for_tests_ebusy_count(),
+        1,
+    );
+    assert!(backend.platform.cursor_retry_waits_for_flip(0));
+    assert!(
+        backend
+            .platform
+            .for_tests_atomic_position_is_unsent(device_key, crtc)
+    );
+    assert!(
+        !backend
+            .platform
+            .for_tests_atomic_cursor_commit_is_in_flight(device_key, crtc)
+    );
+    assert!(!backend.for_tests_scene_wants_compose());
+
+    for _ in 0..3 {
+        maybe_composite(&mut backend);
+        assert_eq!(
+            recorder.records().len(),
+            1,
+            "no cursor-only retry occurs before a flip event",
+        );
+        assert!(!backend.for_tests_scene_wants_compose());
+    }
+
+    warp(&mut backend, &mut state, 260, 170);
+    let latest = backend
+        .platform
+        .for_tests_atomic_cursor_pending_position(device_key, crtc)
+        .expect("new motion replaces the unsent position");
+    assert!(backend.platform.cursor_retry_waits_for_flip(0));
+    maybe_composite(&mut backend);
+    assert_eq!(recorder.records().len(), 1);
+    assert!(!backend.for_tests_scene_wants_compose());
+
+    retire_test_flip(&mut backend, &mut state, 1);
+    assert!(!backend.platform.cursor_retry_waits_for_flip(0));
+    assert!(backend.for_tests_scene_wants_compose());
+    maybe_composite(&mut backend);
+    let records = recorder.records();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[1].kind, AtomicCommitKind::CursorOnly);
+    assert_cursor_properties(&records[1], latest);
+    assert!(
+        backend
+            .platform
+            .for_tests_atomic_cursor_commit_is_in_flight(device_key, crtc)
+    );
+    retire_test_flip(&mut backend, &mut state, 2);
     assert_no_cursor_work(&backend, device_key);
 }

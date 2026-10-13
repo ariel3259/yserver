@@ -40,6 +40,23 @@ use drm::{
 
 use crate::drm::Device;
 
+/// Legacy cursor-plane hide operation. Production uses `set_cursor2`; the
+/// executor is retained on the plane so rejection rollback uses the same
+/// ioctl path as ordinary hide operations.
+pub(crate) trait CursorHideExecutor {
+    fn hide(&self, device: &Device, crtc: crtc::Handle) -> io::Result<()>;
+}
+
+#[derive(Default)]
+pub(crate) struct DrmCursorHideExecutor;
+
+impl CursorHideExecutor for DrmCursorHideExecutor {
+    #[allow(deprecated)]
+    fn hide(&self, device: &Device, crtc: crtc::Handle) -> io::Result<()> {
+        device.set_cursor2::<DumbBuffer>(crtc, None, (0, 0))
+    }
+}
+
 /// A failed cursor bind/reposition operation, including whether the cursor is
 /// still bound after best-effort rollback. Callers must not switch an output
 /// to software composition while `remains_visible()` is true: doing so would
@@ -160,6 +177,7 @@ pub const HW_CURSOR_FALLBACK_H: u32 = 64;
 /// Sw→Hw transition before another.
 pub struct CursorPlane {
     device: Rc<Device>,
+    hide_executor: Rc<dyn CursorHideExecutor>,
     dumb: Option<DumbBuffer>,
     ptr: NonNull<u8>,
     len: usize,
@@ -343,6 +361,7 @@ impl CursorPlane {
 
         let plane = Self {
             device,
+            hide_executor: Rc::new(DrmCursorHideExecutor),
             dumb: Some(dumb),
             ptr,
             len,
@@ -379,6 +398,7 @@ impl CursorPlane {
         let ptr = NonNull::new(test_backing.as_mut_ptr()).expect("non-empty test cursor buffer");
         Self {
             device,
+            hide_executor: Rc::new(DrmCursorHideExecutor),
             dumb: None,
             ptr,
             len,
@@ -410,6 +430,11 @@ impl CursorPlane {
     #[cfg(test)]
     pub(crate) fn for_tests_set_visible(&mut self, crtc: crtc::Handle, visible: bool) {
         self.visible.insert(crtc, visible);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_set_hide_executor(&mut self, executor: Rc<dyn CursorHideExecutor>) {
+        self.hide_executor = executor;
     }
 
     /// Whether this device's explicitly exposed cursor planes can cover all
@@ -593,7 +618,7 @@ impl CursorPlane {
 
     #[allow(deprecated)]
     fn hide_legacy(&mut self, crtc: crtc::Handle) -> io::Result<()> {
-        self.device.set_cursor2::<DumbBuffer>(crtc, None, (0, 0))?;
+        self.hide_executor.hide(&self.device, crtc)?;
         self.visible.insert(crtc, false);
         Ok(())
     }

@@ -544,13 +544,22 @@ impl KmsBackend {
         let cursor_positions = self
             .platform
             .cursor_plane_atomic_positions_for_outputs(&output_indices);
-        crate::drm::modeset::submit_direct_scanout(
+        let result = crate::drm::modeset::submit_direct_scanout(
             &device,
             atomic_commit_sink.as_ref(),
             fb,
             &plane_states,
             &cursor_positions,
-        )?;
+        );
+        if let Err(error) = &result
+            && atomic_commit_sink.take_last_cursor_rejection()
+        {
+            let outcome = self
+                .platform
+                .reject_atomic_cursor_commit(&cursor_positions, &error.to_string());
+            self.handle_cursor_move_outcome(outcome);
+        }
+        result?;
         self.platform
             .cursor_plane_scene_commit_submitted(&cursor_positions);
         frame.awaiting_outputs = (0..self.platform.outputs.len()).collect();
@@ -900,12 +909,21 @@ impl KmsBackend {
         let cursor_positions = self
             .platform
             .cursor_plane_atomic_positions_for_outputs(&output_indices);
-        crate::drm::modeset::submit_composed_scanout(
+        let result = crate::drm::modeset::submit_composed_scanout(
             &device,
             atomic_commit_sink.as_ref(),
             &planes,
             &cursor_positions,
-        )?;
+        );
+        if let Err(error) = &result
+            && atomic_commit_sink.take_last_cursor_rejection()
+        {
+            let outcome = self
+                .platform
+                .reject_atomic_cursor_commit(&cursor_positions, &error.to_string());
+            self.handle_cursor_move_outcome(outcome);
+        }
+        result?;
         self.platform
             .cursor_plane_scene_commit_submitted(&cursor_positions);
         self.scanout_m2.unflip_awaiting_outputs = (0..output_count).collect();
@@ -1781,6 +1799,11 @@ impl KmsBackend {
         self.scene_wants_scene()
             || (!direct_transaction_waiting && self.platform.has_eligible_atomic_cursor_move())
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_scene_wants_compose(&self) -> bool {
+        self.scene_wants_compose()
+    }
 }
 
 impl KmsBackend {
@@ -2162,13 +2185,14 @@ impl KmsBackend {
                 // cursor-only commit.
                 if self.scanout_m2.current.is_some() && self.scanout_m2.queued_successor.is_none() {
                     for output_idx in 0..self.platform.outputs.len() {
-                        if let Err(error) = self
+                        match self
                             .platform
                             .submit_atomic_cursor_move_for_output(output_idx)
                         {
-                            log::warn!(
+                            Ok(outcome) => self.handle_cursor_move_outcome(outcome),
+                            Err(error) => log::warn!(
                                 "render maybe_composite: cursor-only atomic commit failed for output {output_idx}: {error}"
-                            );
+                            ),
                         }
                     }
                 }
@@ -2331,6 +2355,8 @@ impl KmsBackend {
                 }
             }
         };
+        let cursor_outcome = self.platform.take_deferred_cursor_move_outcome();
+        self.handle_cursor_move_outcome(cursor_outcome);
         for output_idx in 0..self.platform.outputs.len() {
             if scene_submitted_outputs.contains(&output_idx)
                 || self.scene.has_pending_page_flip(output_idx)
@@ -2342,13 +2368,14 @@ impl KmsBackend {
             {
                 continue;
             }
-            if let Err(error) = self
+            match self
                 .platform
                 .submit_atomic_cursor_move_for_output(output_idx)
             {
-                log::warn!(
+                Ok(outcome) => self.handle_cursor_move_outcome(outcome),
+                Err(error) => log::warn!(
                     "render maybe_composite: cursor-only atomic commit failed for output {output_idx}: {error}"
-                );
+                ),
             }
         }
         self.drain_paint_submit_telemetry();

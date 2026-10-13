@@ -169,6 +169,13 @@ impl PlatformBackend {
             }
         })();
 
+        if atomic_commit_sink.take_last_cursor_rejection()
+            && let Err(error) = &result
+        {
+            let rejected = self.reject_atomic_cursor_commit(&cursor_positions, &error.to_string());
+            self.defer_cursor_move_outcome(rejected);
+        }
+
         if result.is_ok() {
             self.cursor_plane_scene_commit_submitted(&cursor_positions);
         }

@@ -2373,9 +2373,600 @@ fn atomic_cursor_scanout_backend() -> Option<KmsBackend> {
     Some(backend)
 }
 
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+// Mutation: mark a cursor-only commit in flight before its ioctl result.
+fn cursor_only_ebusy_leaves_position_for_the_next_direct_scene_transaction() {
+    use yserver_core::{backend::Backend, server::ServerState};
+
+    let Some(mut backend) = atomic_cursor_scanout_backend() else {
+        return;
+    };
+    let recorder = atomic_cursor_recording_sink(&mut backend);
+    let position = backend.platform.for_tests_seed_atomic_cursor_position(
+        1,
+        atomic_cursor_raw(0x9201),
+        atomic_cursor_raw(0x9301),
+        atomic_cursor_raw(0x9401),
+        1100,
+        170,
+        0,
+        0,
+    );
+    let device_key = position.device_key;
+    let crtc = position.crtc;
+    recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EBUSY)));
+    let mut state = ServerState::new();
+
+    Backend::maybe_composite(&mut backend).expect("cursor-only EBUSY scheduling pass");
+    assert_eq!(recorder.records().len(), 1);
+    assert_eq!(
+        recorder.records()[0].kind,
+        crate::drm::atomic::AtomicCommitKind::CursorOnly,
+    );
+    assert_eq!(
+        recorder.records()[0].result,
+        crate::drm::atomic::tests_support::ScriptedResult::Error {
+            kind: std::io::ErrorKind::ResourceBusy,
+            raw_os_error: Some(libc::EBUSY),
+        },
+    );
+    assert_eq!(
+        backend.platform.devices[0]
+            .atomic_commit_sink
+            .for_tests_ebusy_count(),
+        1,
+    );
+    assert!(
+        backend
+            .platform
+            .for_tests_atomic_position_is_unsent(device_key, crtc)
+    );
+    assert!(
+        !backend
+            .platform
+            .for_tests_atomic_cursor_commit_is_in_flight(device_key, crtc)
+    );
+    assert!(backend.platform.cursor_retry_waits_for_flip(1));
+    assert!(
+        backend.platform.devices[0]
+            .test_page_flip_event_source
+            .as_ref()
+            .unwrap()
+            .queued_flip_count()
+            == 0,
+        "no synthetic flip is delivered before the next scene transaction",
+    );
+
+    let direct = prepare_atomic_cursor_direct_present(&mut backend, 81);
+    assert!(
+        Backend::try_present_direct(&mut backend, direct.candidate, direct.event,)
+            .expect("direct scene transaction carries the unsent cursor position")
+    );
+    let records = recorder.records();
+    assert_eq!(records.len(), 2);
+    assert_eq!(
+        records.iter().map(|record| record.kind).collect::<Vec<_>>(),
+        vec![
+            crate::drm::atomic::AtomicCommitKind::CursorOnly,
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+        ],
+    );
+    assert_atomic_cursor_properties(&records[1], &[position]);
+    assert!(
+        !backend
+            .platform
+            .for_tests_atomic_position_is_unsent(device_key, crtc)
+    );
+    assert!(backend.platform.cursor_retry_waits_for_flip(1));
+
+    retire_atomic_cursor_test_output(&mut backend, &mut state, 0, 1);
+    retire_atomic_cursor_test_output(&mut backend, &mut state, 1, 1);
+    assert!(!backend.platform.cursor_retry_waits_for_flip(1));
+    assert_atomic_cursor_quiescent(&backend);
+}
+
+fn assert_atomic_cursorless_scene_record(
+    record: &crate::drm::atomic::tests_support::AtomicCommitRecord,
+    position: crate::drm::atomic::CursorPlanePosition,
+) {
+    assert_eq!(record.kind, crate::drm::atomic::AtomicCommitKind::Scene);
+    assert!(
+        record
+            .properties
+            .iter()
+            .all(|update| update.object != position.plane.into()),
+        "cursor plane properties must be absent from the scene request: {:?}",
+        record.properties,
+    );
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+// Mutation: keep the unsent position after EINVAL; separately, never retry a failed hide.
+fn cursor_einval_rolls_back_and_hide_recovery_is_motion_driven_and_bounded() {
+    use std::io;
+    use yserver_core::backend::Backend;
+
+    // A successful rollback hide enters the legacy transient fallback and the
+    // next accepted direct scene transaction has no cursor properties.
+    let Some(mut hidden_backend) = atomic_cursor_scanout_backend() else {
+        return;
+    };
+    let recorder = atomic_cursor_recording_sink(&mut hidden_backend);
+    let position = hidden_backend
+        .platform
+        .for_tests_seed_atomic_cursor_position(
+            0,
+            atomic_cursor_raw(0x9501),
+            atomic_cursor_raw(0x9601),
+            atomic_cursor_raw(0x9701),
+            90,
+            70,
+            0,
+            0,
+        );
+    let hide = std::rc::Rc::new(super::RecordingCursorHideExecutor::default());
+    hide.script([super::TestCursorHideResult::Ok]);
+    super::install_recording_cursor_hide_executor(&mut hidden_backend, 0, hide.clone());
+    recorder.script_result(Err(io::Error::from_raw_os_error(libc::EINVAL)));
+    Backend::maybe_composite(&mut hidden_backend).expect("cursor-only EINVAL rollback");
+
+    assert_eq!(recorder.records().len(), 1);
+    assert_eq!(
+        recorder.records()[0].kind,
+        crate::drm::atomic::AtomicCommitKind::CursorOnly,
+    );
+    assert_eq!(
+        recorder.records()[0].result,
+        crate::drm::atomic::tests_support::ScriptedResult::Error {
+            kind: io::ErrorKind::InvalidInput,
+            raw_os_error: Some(libc::EINVAL),
+        },
+    );
+    assert_eq!(hide.calls(), vec![position.crtc]);
+    assert!(!hidden_backend.platform.cursor_plane_visible_for_output(0));
+    assert_eq!(
+        hidden_backend
+            .platform
+            .for_tests_cursor_fallback_remaining(position.device_key, position.crtc),
+        Some(1),
+    );
+    assert!(hidden_backend.for_tests_scene_wants_compose());
+    assert!(
+        hidden_backend
+            .platform
+            .for_tests_atomic_cursor_pending_position(position.device_key, position.crtc)
+            .is_none()
+    );
+    assert!(
+        !hidden_backend
+            .platform
+            .for_tests_atomic_cursor_commit_is_in_flight(position.device_key, position.crtc)
+    );
+    assert!(
+        hidden_backend
+            .platform
+            .cursor_plane_atomic_positions_for_outputs(&[0])
+            .is_empty(),
+        "fallback scene requests must not carry the rejected cursor position",
+    );
+
+    let direct = prepare_atomic_cursor_direct_present(&mut hidden_backend, 82);
+    assert!(
+        Backend::try_present_direct(&mut hidden_backend, direct.candidate, direct.event,)
+            .expect("fallback direct scene request without cursor fields")
+    );
+    let records = recorder.records();
+    assert_eq!(records.len(), 2);
+    assert_atomic_cursorless_scene_record(&records[1], position);
+    assert!(
+        !hidden_backend
+            .platform
+            .for_tests_atomic_position_is_unsent(position.device_key, position.crtc)
+    );
+    let mut hidden_state = yserver_core::server::ServerState::new();
+    retire_atomic_cursor_test_output(&mut hidden_backend, &mut hidden_state, 0, 1);
+    retire_atomic_cursor_test_output(&mut hidden_backend, &mut hidden_state, 1, 1);
+    assert_atomic_cursor_quiescent(&hidden_backend);
+
+    // A failed rollback hide retains the visible hardware plane. Motion
+    // retries it without a flip event; a successful retry enters software
+    // fallback and drives a cursorless direct-to-scene unflip.
+    let Some(mut recovered_backend) = atomic_cursor_scanout_backend() else {
+        return;
+    };
+    let recorder = atomic_cursor_recording_sink(&mut recovered_backend);
+    let position = recovered_backend
+        .platform
+        .for_tests_seed_atomic_cursor_position(
+            0,
+            atomic_cursor_raw(0x9502),
+            atomic_cursor_raw(0x9602),
+            atomic_cursor_raw(0x9702),
+            90,
+            70,
+            0,
+            0,
+        );
+    let hide = std::rc::Rc::new(super::RecordingCursorHideExecutor::default());
+    hide.script([
+        super::TestCursorHideResult::Error(libc::EIO),
+        super::TestCursorHideResult::Error(libc::EIO),
+        super::TestCursorHideResult::Ok,
+    ]);
+    super::install_recording_cursor_hide_executor(&mut recovered_backend, 0, hide.clone());
+    let direct = prepare_atomic_cursor_direct_present(&mut recovered_backend, 85);
+    assert!(
+        Backend::try_present_direct(&mut recovered_backend, direct.candidate, direct.event,)
+            .expect("initial direct scene frame carries the visible cursor")
+    );
+    assert_eq!(recorder.records().len(), 1);
+    assert_eq!(
+        recorder.records()[0].kind,
+        crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+    );
+    assert_atomic_cursor_properties(&recorder.records()[0], &[position]);
+
+    let mut recovered_state = yserver_core::server::ServerState::new();
+    retire_atomic_cursor_test_output(&mut recovered_backend, &mut recovered_state, 0, 1);
+    retire_atomic_cursor_test_output(&mut recovered_backend, &mut recovered_state, 1, 1);
+    assert!(recovered_backend.scanout_m2.current.is_some());
+
+    recorder.script_result(Err(io::Error::from_raw_os_error(libc::EINVAL)));
+    Backend::warp_pointer_root(&mut recovered_backend, &mut recovered_state, 90, 70);
+    Backend::maybe_composite(&mut recovered_backend).expect("failed rollback hide");
+    assert_eq!(recorder.records().len(), 2);
+    assert_eq!(
+        recorder.records()[1].kind,
+        crate::drm::atomic::AtomicCommitKind::CursorOnly,
+    );
+    assert_eq!(
+        recorder.records()[1].result,
+        crate::drm::atomic::tests_support::ScriptedResult::Error {
+            kind: io::ErrorKind::InvalidInput,
+            raw_os_error: Some(libc::EINVAL),
+        },
+    );
+    assert!(recovered_backend.scanout_m2.unflip_requested);
+    assert!(
+        recovered_backend
+            .platform
+            .cursor_plane_visible_for_output(0)
+    );
+    assert_eq!(
+        recovered_backend
+            .platform
+            .for_tests_cursor_hide_recovery_attempts(position.device_key, position.crtc),
+        Some(0),
+    );
+    assert!(
+        !recovered_backend
+            .platform
+            .for_tests_atomic_position_is_unsent(position.device_key, position.crtc)
+    );
+    assert_eq!(
+        recovered_backend.platform.devices[0]
+            .test_page_flip_event_source
+            .as_ref()
+            .unwrap()
+            .queued_flip_count(),
+        0,
+        "the failed hide is recovered without waiting for a flip event",
+    );
+
+    Backend::warp_pointer_root(&mut recovered_backend, &mut recovered_state, 91, 71);
+    assert_eq!(hide.calls(), vec![position.crtc, position.crtc]);
+    assert_eq!(
+        recovered_backend
+            .platform
+            .for_tests_cursor_hide_recovery_attempts(position.device_key, position.crtc),
+        Some(1),
+    );
+    assert_eq!(
+        recovered_backend.platform.devices[0]
+            .test_page_flip_event_source
+            .as_ref()
+            .unwrap()
+            .queued_flip_count(),
+        0,
+    );
+    Backend::warp_pointer_root(&mut recovered_backend, &mut recovered_state, 92, 72);
+    assert_eq!(
+        hide.calls(),
+        vec![position.crtc, position.crtc, position.crtc]
+    );
+    assert!(
+        recovered_backend
+            .platform
+            .for_tests_cursor_hide_recovery_attempts(position.device_key, position.crtc)
+            .is_none()
+    );
+    assert!(
+        !recovered_backend
+            .platform
+            .cursor_plane_visible_for_output(0)
+    );
+    assert_eq!(
+        recovered_backend
+            .platform
+            .for_tests_cursor_fallback_remaining(position.device_key, position.crtc),
+        Some(1),
+    );
+    assert_eq!(
+        recovered_backend.platform.devices[0]
+            .test_page_flip_event_source
+            .as_ref()
+            .unwrap()
+            .queued_flip_count(),
+        0,
+    );
+    assert!(
+        recovered_backend
+            .platform
+            .cursor_plane_atomic_positions_for_outputs(&[0])
+            .is_empty()
+    );
+
+    recovered_backend
+        .platform
+        .scanout_pools
+        .resize_with(2, || None);
+    recovered_backend
+        .platform
+        .bo_generations
+        .resize_with(2, Vec::new);
+    let vk = std::sync::Arc::clone(
+        recovered_backend
+            .platform
+            .gpu
+            .vk
+            .as_ref()
+            .expect("test fixture Vulkan context"),
+    );
+    let kms_device = std::rc::Rc::clone(&recovered_backend.platform.devices[0].device);
+    for (output_idx, fb) in [(0, 0x8803), (1, 0x8804)] {
+        let layout = &recovered_backend.platform.outputs[output_idx];
+        let pool = crate::kms::vk::scanout::ScanoutBoPool::for_tests_on_screen_framebuffer(
+            std::sync::Arc::clone(&vk),
+            std::rc::Rc::clone(&kms_device),
+            layout.scanout_route,
+            u32::from(layout.width),
+            u32::from(layout.height),
+            atomic_cursor_raw(fb),
+        );
+        recovered_backend.platform.scanout_pools[output_idx] =
+            Some(crate::kms::vk::scanout::OutputScanout::Shared(pool));
+    }
+    recovered_backend.scanout_m2.unflip_shadow_ready = true;
+    Backend::maybe_composite(&mut recovered_backend).expect("submit cursorless composed unflip");
+    assert_eq!(recorder.records().len(), 3);
+    assert_atomic_cursorless_scene_record(&recorder.records()[2], position);
+    assert_eq!(
+        recovered_backend.scanout_m2.unflip_awaiting_outputs,
+        std::collections::HashSet::from([0, 1]),
+    );
+    assert_atomic_cursor_quiescent(&recovered_backend);
+    retire_atomic_cursor_test_output(&mut recovered_backend, &mut recovered_state, 0, 2);
+    retire_atomic_cursor_test_output(&mut recovered_backend, &mut recovered_state, 1, 2);
+    assert!(!recovered_backend.scanout_m2.active());
+    assert_atomic_cursor_quiescent(&recovered_backend);
+
+    // Three failed motion-led retries permanently disable the cursor. Later
+    // motion must not issue a fourth legacy hide or restore an atomic field.
+    let Some(mut disabled_backend) = atomic_cursor_scanout_backend() else {
+        return;
+    };
+    let recorder = atomic_cursor_recording_sink(&mut disabled_backend);
+    let position = disabled_backend
+        .platform
+        .for_tests_seed_atomic_cursor_position(
+            0,
+            atomic_cursor_raw(0x9503),
+            atomic_cursor_raw(0x9603),
+            atomic_cursor_raw(0x9703),
+            90,
+            70,
+            0,
+            0,
+        );
+    let hide = std::rc::Rc::new(super::RecordingCursorHideExecutor::default());
+    hide.script([
+        super::TestCursorHideResult::Error(libc::EIO),
+        super::TestCursorHideResult::Error(libc::EIO),
+        super::TestCursorHideResult::Error(libc::EIO),
+        super::TestCursorHideResult::Error(libc::EIO),
+    ]);
+    super::install_recording_cursor_hide_executor(&mut disabled_backend, 0, hide.clone());
+    recorder.script_result(Err(io::Error::from_raw_os_error(libc::EINVAL)));
+    Backend::maybe_composite(&mut disabled_backend).expect("initial hide failure");
+    let mut disabled_state = yserver_core::server::ServerState::new();
+    for (x, y) in [(91, 71), (92, 72), (93, 73)] {
+        Backend::warp_pointer_root(&mut disabled_backend, &mut disabled_state, x, y);
+    }
+    assert_eq!(hide.calls(), vec![position.crtc; 4]);
+    assert!(
+        disabled_backend
+            .platform
+            .for_tests_cursor_permanently_disabled(position.device_key)
+    );
+    assert!(disabled_backend.platform.cursor_plane_visible_for_output(0));
+    assert!(
+        !disabled_backend
+            .platform
+            .for_tests_atomic_position_is_unsent(position.device_key, position.crtc)
+    );
+    assert!(
+        disabled_backend
+            .platform
+            .cursor_plane_atomic_positions_for_outputs(&[0])
+            .is_empty()
+    );
+    Backend::warp_pointer_root(&mut disabled_backend, &mut disabled_state, 94, 74);
+    assert_eq!(hide.calls(), vec![position.crtc; 4]);
+    assert_eq!(recorder.records().len(), 1);
+    assert_eq!(
+        recorder.records()[0].kind,
+        crate::drm::atomic::AtomicCommitKind::CursorOnly,
+    );
+    assert_eq!(
+        recorder.records()[0].result,
+        crate::drm::atomic::tests_support::ScriptedResult::Error {
+            kind: io::ErrorKind::InvalidInput,
+            raw_os_error: Some(libc::EINVAL),
+        },
+    );
+    assert!(
+        disabled_backend
+            .platform
+            .cursor_plane_atomic_positions_for_outputs(&[0])
+            .is_empty()
+    );
+    assert!(
+        !disabled_backend
+            .platform
+            .for_tests_atomic_cursor_commit_is_in_flight(position.device_key, position.crtc)
+    );
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+// Mutation: leave cursor CRTCs out of pending_pageflip_crtcs during RANDR quiesce.
+fn randr_change_discards_an_inflight_cursor_flip_before_the_next_scene_flip() {
+    use std::os::fd::{AsFd as _, AsRawFd as _};
+    use yserver_core::backend::Backend;
+
+    let Some(mut backend) = atomic_cursor_scanout_backend() else {
+        return;
+    };
+    backend.platform.for_tests_accept_output_power_commits();
+    let recorder = atomic_cursor_recording_sink(&mut backend);
+    let position = backend.platform.for_tests_seed_atomic_cursor_position(
+        0,
+        atomic_cursor_raw(0x9801),
+        atomic_cursor_raw(0x9901),
+        atomic_cursor_raw(0x9a01),
+        110,
+        80,
+        0,
+        0,
+    );
+    let hide = std::rc::Rc::new(super::RecordingCursorHideExecutor::default());
+    hide.script([
+        super::TestCursorHideResult::Ok,
+        super::TestCursorHideResult::Ok,
+    ]);
+    super::install_recording_cursor_hide_executor(&mut backend, 0, hide);
+
+    Backend::maybe_composite(&mut backend).expect("accepted cursor-only commit");
+    assert_eq!(recorder.records().len(), 1);
+    assert_eq!(
+        recorder.records()[0].kind,
+        crate::drm::atomic::AtomicCommitKind::CursorOnly,
+    );
+    assert!(
+        backend
+            .platform
+            .for_tests_atomic_cursor_commit_is_in_flight(position.device_key, position.crtc)
+    );
+
+    let event_source = std::rc::Rc::clone(
+        backend.platform.devices[0]
+            .test_page_flip_event_source
+            .as_ref()
+            .expect("recording page-flip event source"),
+    );
+    event_source.queue_flip(position.crtc, 51);
+    event_source.delay_next_ready_checks(1);
+
+    let connector = backend.platform.outputs[1].key.connector_name.clone();
+    let output_id = Backend::randr_outputs_and_modes(&mut backend)
+        .0
+        .into_iter()
+        .find(|output| output.name == connector)
+        .expect("second output in RandR projection")
+        .output_id;
+    // Keep the topology dark through this test boundary. The fixture has no
+    // scanout framebuffer to re-light, and this test is about old-event
+    // ownership across the RandR transition.
+    backend.kms_outputs_active = false;
+    assert!(
+        Backend::apply_crtc_config(&mut backend, output_id, &connector, None, 0, 0,)
+            .expect("disable second output through the topology entry point")
+    );
+
+    assert_eq!(
+        event_source.queued_flip_count(),
+        0,
+        "the old cursor-only event must be discarded before CRTC reuse",
+    );
+    assert!(
+        !backend
+            .platform
+            .for_tests_atomic_cursor_commit_is_in_flight(position.device_key, position.crtc)
+    );
+    assert_eq!(backend.platform.outputs.len(), 1);
+    backend.kms_outputs_active = true;
+    backend.scene.for_tests_set_hw_cursor_mode();
+
+    let direct = prepare_atomic_cursor_direct_present_with_extent(&mut backend, 84, 800, 600);
+    assert!(
+        Backend::try_present_direct(&mut backend, direct.candidate, direct.event,)
+            .expect("first post-RANDR scene transaction")
+    );
+    assert_eq!(recorder.records().len(), 2);
+    assert_eq!(
+        recorder.records()[1].kind,
+        crate::drm::atomic::AtomicCommitKind::Scene,
+    );
+    assert!(
+        recorder.records()[1]
+            .properties
+            .iter()
+            .all(|update| update.object != position.plane.into()),
+        "topology discard must not resurrect cursor properties",
+    );
+    assert_eq!(event_source.queued_flip_count(), 0);
+
+    event_source.queue_flip(position.crtc, 52);
+    let drm_fd = backend.platform.devices[0].device.as_fd().as_raw_fd();
+    let mut state = yserver_core::server::ServerState::new();
+    Backend::on_page_flip_ready(&mut backend, &mut state, drm_fd);
+    assert!(backend.scanout_m2.pending.is_none());
+    assert_eq!(
+        backend
+            .scanout_m2
+            .current
+            .as_ref()
+            .map(|frame| frame.candidate.present_id),
+        Some(84),
+        "the new scene frame, rather than the old cursor flip, must retire",
+    );
+    assert!(
+        !backend
+            .platform
+            .for_tests_atomic_cursor_commit_is_in_flight(position.device_key, position.crtc)
+    );
+    assert!(
+        backend
+            .platform
+            .for_tests_atomic_cursor_pending_position(position.device_key, position.crtc)
+            .is_none()
+    );
+}
+
 fn prepare_atomic_cursor_direct_present(
     backend: &mut KmsBackend,
     present_id: u64,
+) -> AtomicCursorDirectPresent {
+    prepare_atomic_cursor_direct_present_with_extent(backend, present_id, 1600, 600)
+}
+
+fn prepare_atomic_cursor_direct_present_with_extent(
+    backend: &mut KmsBackend,
+    present_id: u64,
+    width: u16,
+    height: u16,
 ) -> AtomicCursorDirectPresent {
     use ash::vk;
     use yserver_core::backend::{CompletedPresentEvent, PresentScanoutCandidate, PresentWake};
@@ -2391,8 +2982,8 @@ fn prepare_atomic_cursor_direct_present(
             .windows
             .get_mut(&target_xid)
             .expect("fullscreen test target");
-        target.width = 1600;
-        target.height = 600;
+        target.width = width;
+        target.height = height;
     }
     backend.core.top_level_order.push(target_xid);
     let source_id = backend
@@ -2404,8 +2995,8 @@ fn prepare_atomic_cursor_direct_present(
             false,
             Storage::for_tests_null(
                 vk::Extent2D {
-                    width: 1600,
-                    height: 600,
+                    width: u32::from(width),
+                    height: u32::from(height),
                 },
                 vk::Format::B8G8R8A8_UNORM,
             ),
@@ -2433,8 +3024,8 @@ fn prepare_atomic_cursor_direct_present(
         src_host_xid: source_xid,
         paint_dst_host_xid: target_xid,
         completion_dst_host_xid: target_xid,
-        src_width: 1600,
-        src_height: 600,
+        src_width: width,
+        src_height: height,
         x_off: 0,
         y_off: 0,
         valid_region_xid: 0,

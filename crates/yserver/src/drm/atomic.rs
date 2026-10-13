@@ -1,7 +1,7 @@
 //! Atomic commit request assembly, timing, and cursor latency telemetry.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     io,
     rc::Rc,
@@ -189,6 +189,7 @@ impl AtomicCommitExecutor for DrmAtomicCommitExecutor {
 pub(crate) struct AtomicCommitSink {
     executor: Rc<dyn AtomicCommitExecutor>,
     metrics: RefCell<CommitWindow>,
+    last_rejection_carried_cursor: Cell<bool>,
 }
 
 impl AtomicCommitSink {
@@ -198,6 +199,7 @@ impl AtomicCommitSink {
         Self {
             executor,
             metrics: RefCell::new(CommitWindow::new(Instant::now())),
+            last_rejection_carried_cursor: Cell::new(false),
         }
     }
 
@@ -215,6 +217,8 @@ impl AtomicCommitSink {
         let result = self
             .executor
             .atomic_commit(device, flags, kind, request, events);
+        self.last_rejection_carried_cursor
+            .set(result.is_err() && kind != AtomicCommitKind::Scene);
         let finished = Instant::now();
         let elapsed = finished.saturating_duration_since(started);
         self.metrics.borrow_mut().record_commit(
@@ -303,6 +307,13 @@ impl AtomicCommitSink {
         );
     }
 
+    /// Whether the most recent rejected ioctl belonged to a request carrying
+    /// cursor fields. Callers use this to distinguish an atomic rejection
+    /// from failures while assembling fences or rendering the scene.
+    pub(crate) fn take_last_cursor_rejection(&self) -> bool {
+        self.last_rejection_carried_cursor.replace(false)
+    }
+
     #[cfg(test)]
     pub(crate) fn for_tests_motion_to_accept_sample_count(&self) -> usize {
         self.metrics.borrow().motion_to_accept_us.len()
@@ -311,6 +322,11 @@ impl AtomicCommitSink {
     #[cfg(test)]
     pub(crate) fn for_tests_motion_to_visible_sample_count(&self) -> usize {
         self.metrics.borrow().motion_to_visible_us.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_ebusy_count(&self) -> u64 {
+        self.metrics.borrow().ebusy
     }
 }
 

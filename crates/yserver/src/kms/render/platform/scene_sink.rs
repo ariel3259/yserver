@@ -121,20 +121,26 @@ impl OutputSink for PlatformBackend {
         };
         let output = &self.outputs[output_idx].output;
         let mut shared_cursor_commit_submitted = false;
+        let mut cursor_rejection_error = None;
         let outcome = match pool {
             OutputScanout::Shared(pool) => {
                 let Some(bo) = pool.bos.get_mut(bo_idx) else {
                     return FinishOutcome::Unavailable(FrameTargetError::NoSlot);
                 };
-                let result = submit_shared_scanout_frame(
+                let submitted = submit_shared_scanout_frame(
                     &drm_device,
                     atomic_commit_sink.as_ref(),
                     output,
                     bo,
                     record,
                     &cursor_positions,
-                )
-                .map(FrameHandoff::FlipPending);
+                );
+                if let Err(error) = &submitted
+                    && atomic_commit_sink.take_last_cursor_rejection()
+                {
+                    cursor_rejection_error = Some(error.to_string());
+                }
+                let result = submitted.map(FrameHandoff::FlipPending);
                 shared_cursor_commit_submitted = result.is_ok();
                 FinishOutcome::Finished {
                     result,
@@ -164,6 +170,10 @@ impl OutputSink for PlatformBackend {
         };
         if shared_cursor_commit_submitted {
             self.cursor_plane_scene_commit_submitted(&cursor_positions);
+        }
+        if let Some(error) = cursor_rejection_error {
+            let rejected = self.reject_atomic_cursor_commit(&cursor_positions, &error);
+            self.defer_cursor_move_outcome(rejected);
         }
         outcome
     }

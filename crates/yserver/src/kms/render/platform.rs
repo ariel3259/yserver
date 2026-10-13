@@ -47,7 +47,14 @@ use scanout_bos::*;
 #[cfg(test)]
 mod tests;
 
-use std::{collections::HashMap, io, os::fd::OwnedFd, rc::Rc, sync::Arc, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    io,
+    os::fd::OwnedFd,
+    rc::Rc,
+    sync::Arc,
+    time::Instant,
+};
 
 use ash::vk;
 use yserver_core::backend::PresentClockSample;
@@ -178,6 +185,11 @@ struct TransientCursorFallback {
     failures: u8,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct CursorHideRecovery {
+    attempts: u8,
+}
+
 /// Per-DRM-device hardware cursor state. Raw CRTC handles and legacy cursor
 /// ioctls are device-local, so none of these fields may live at platform scope.
 pub(crate) struct KmsCursorState {
@@ -197,6 +209,12 @@ pub(crate) struct KmsCursorState {
     /// in flight only after its atomic ioctl succeeded.
     atomic_cursor_commits_in_flight:
         HashMap<::drm::control::crtc::Handle, crate::drm::atomic::CursorPlanePosition>,
+    /// A cursor-only EBUSY proves another commit is pending on this CRTC.
+    /// Keep the latest position unsent until that CRTC's next flip event.
+    cursor_retry_waits_for_flip: HashSet<::drm::control::crtc::Handle>,
+    /// A rejected cursor request whose legacy hide failed. Pointer motion
+    /// retries this hide, with a device-wide terminal failure after 3 tries.
+    cursor_hide_recovery: HashMap<::drm::control::crtc::Handle, CursorHideRecovery>,
     permanently_disabled: bool,
     /// CursorPlane::new was attempted for an active startup topology and
     /// failed transiently. Only explicit active-topology/resume boundaries
@@ -398,6 +416,11 @@ pub(crate) struct PlatformBackend {
     initial_scanout_rollback_armed: bool,
     // DRM / output side
     pub(crate) devices: Vec<KmsDevice>,
+    pub(super) output_power_executor: Rc<dyn power::OutputPowerExecutor>,
+    /// Cursor rollback outcomes raised while the scene owns the platform
+    /// borrow. The backend drains this immediately after the submit pass to
+    /// wake the scene and request an unflip when needed.
+    deferred_cursor_move_outcome: CursorMoveOutcome,
     /// Immutable same-instance Vulkan inventory of graphics+transfer
     /// queue-capable render-identified devices. Handles are valid for exactly
     /// the lifetime of `vk` below.

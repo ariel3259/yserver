@@ -710,6 +710,9 @@ impl PlatformBackend {
         Ok(Self {
             initial_scanout_rollback_armed,
             devices,
+            output_power_executor: Rc::new(super::power::DrmOutputPowerExecutor),
+            deferred_cursor_move_outcome: crate::kms::render::platform::CursorMoveOutcome::default(
+            ),
             render_devices,
             selected_render_device: Some(selected_render_device),
             outputs,
@@ -788,6 +791,9 @@ impl PlatformBackend {
                 test_page_flip_event_source: Some(test_page_flip_event_source),
                 cursor: KmsCursorState::new(),
             }],
+            output_power_executor: Rc::new(super::power::DrmOutputPowerExecutor),
+            deferred_cursor_move_outcome: crate::kms::render::platform::CursorMoveOutcome::default(
+            ),
             render_devices: Vec::new(),
             selected_render_device: None,
             outputs: vec![ActiveOutput::new(
