@@ -17,6 +17,63 @@ use std::{
 };
 use yserver_core::backend::{BackendFdKind, PresentClockSample, PresentClockSource};
 
+pub(crate) type KernelPageFlip = (::drm::control::crtc::Handle, u32, std::time::Duration);
+pub(crate) type KernelCrtcSequence = (u64, i64, u64);
+
+pub(crate) trait PageFlipEventSource {
+    fn drain_events(
+        &self,
+        device: &crate::drm::Device,
+    ) -> io::Result<(Vec<KernelPageFlip>, Vec<KernelCrtcSequence>)>;
+}
+
+pub(crate) struct DrmPageFlipEventSource;
+
+impl PageFlipEventSource for DrmPageFlipEventSource {
+    fn drain_events(
+        &self,
+        device: &crate::drm::Device,
+    ) -> io::Result<(Vec<KernelPageFlip>, Vec<KernelCrtcSequence>)> {
+        let mut flips = Vec::new();
+        let mut sequences = Vec::new();
+        crate::drm::page_flip::drain_events(
+            device,
+            |crtc, frame, duration| flips.push((crtc, frame, duration)),
+            |user_data, time_ns, sequence| sequences.push((user_data, time_ns, sequence)),
+        )?;
+        Ok((flips, sequences))
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct RecordingPageFlipEventSource {
+    flips: std::cell::RefCell<std::collections::VecDeque<KernelPageFlip>>,
+    sequences: std::cell::RefCell<std::collections::VecDeque<KernelCrtcSequence>>,
+}
+
+#[cfg(test)]
+impl RecordingPageFlipEventSource {
+    pub(crate) fn queue_flip(&self, crtc: ::drm::control::crtc::Handle, frame: u32) {
+        self.flips
+            .borrow_mut()
+            .push_back((crtc, frame, std::time::Duration::ZERO));
+    }
+}
+
+#[cfg(test)]
+impl PageFlipEventSource for RecordingPageFlipEventSource {
+    fn drain_events(
+        &self,
+        _device: &crate::drm::Device,
+    ) -> io::Result<(Vec<KernelPageFlip>, Vec<KernelCrtcSequence>)> {
+        Ok((
+            self.flips.borrow_mut().drain(..).collect(),
+            self.sequences.borrow_mut().drain(..).collect(),
+        ))
+    }
+}
+
 impl PlatformBackend {
     pub(super) fn prune_present_clocks_to_live_outputs(&mut self) {
         let live: HashSet<CrtcKey> = self.outputs.iter().map(CrtcKey::for_output).collect();
@@ -256,8 +313,6 @@ impl PlatformBackend {
         &mut self,
         drm_fd: RawFd,
     ) -> io::Result<DrainedPageFlipEvents> {
-        use ::drm::control::crtc;
-
         let device_index = self.drm_device_index_for_fd(drm_fd).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -266,28 +321,22 @@ impl PlatformBackend {
         })?;
         let device_key = self.devices[device_index].key;
         let device = Rc::clone(&self.devices[device_index].device);
+        let event_source = Rc::clone(&self.devices[device_index].page_flip_event_source);
 
         // Capture the kernel vblank (msc=frame, ust=duration) alongside the
         // CRTC so Present pacing can complete NotifyMSC with real values.
-        let mut flipped: Vec<(crtc::Handle, u32, std::time::Duration)> = Vec::new();
-        let mut sequenced: Vec<SequenceCompletion> = Vec::new();
-        crate::drm::page_flip::drain_events(
-            &device,
-            |c, frame, dur| {
-                flipped.push((c, frame, dur));
-            },
-            |user_data, time_ns, sequence| {
-                // Raw kernel values; validation (time_ns sign, crtc_id
-                // resolution) and tag decode happen in
-                // `on_crtc_sequence_event`.
-                sequenced.push(SequenceCompletion {
-                    device_key,
-                    user_data,
-                    time_ns,
-                    sequence,
-                });
-            },
-        )?;
+        let (flipped, raw_sequences) = event_source.drain_events(&device)?;
+        // Raw kernel values; validation (time_ns sign, crtc_id resolution)
+        // and tag decode happen in `on_crtc_sequence_event`.
+        let sequenced: Vec<SequenceCompletion> = raw_sequences
+            .into_iter()
+            .map(|(user_data, time_ns, sequence)| SequenceCompletion {
+                device_key,
+                user_data,
+                time_ns,
+                sequence,
+            })
+            .collect();
 
         let mut completions = Vec::with_capacity(flipped.len());
         for (crtc, frame, dur) in flipped {

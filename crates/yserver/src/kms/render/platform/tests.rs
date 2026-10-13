@@ -525,6 +525,8 @@ fn test_kms_device(key: crate::platform::drm::DrmDeviceKey) -> KmsDevice {
         atomic_commit_sink: Rc::new(crate::drm::atomic::AtomicCommitSink::new(Rc::new(
             crate::drm::atomic::DrmAtomicCommitExecutor,
         ))),
+        page_flip_event_source: Rc::new(flip_events::DrmPageFlipEventSource),
+        test_page_flip_event_source: None,
         cursor: KmsCursorState::new(),
     }
 }
@@ -1113,6 +1115,8 @@ fn cursor_route_qualifies_colliding_raw_crtcs_by_device() {
         atomic_commit_sink: Rc::new(crate::drm::atomic::AtomicCommitSink::new(Rc::new(
             crate::drm::atomic::DrmAtomicCommitExecutor,
         ))),
+        page_flip_event_source: Rc::new(flip_events::DrmPageFlipEventSource),
+        test_page_flip_event_source: None,
         cursor: KmsCursorState::new(),
     });
     platform.outputs[0].key.device_key = second_key;
@@ -1136,6 +1140,8 @@ fn drm_device_fd_lookup_distinguishes_same_kind_poll_sources() {
         atomic_commit_sink: Rc::new(crate::drm::atomic::AtomicCommitSink::new(Rc::new(
             crate::drm::atomic::DrmAtomicCommitExecutor,
         ))),
+        page_flip_event_source: Rc::new(flip_events::DrmPageFlipEventSource),
+        test_page_flip_event_source: None,
         cursor: KmsCursorState::new(),
     });
 

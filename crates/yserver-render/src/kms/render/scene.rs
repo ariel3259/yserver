@@ -523,6 +523,8 @@ struct DamageAuditLedgerEntry {
 enum TickSkipReason {
     /// `pending_acks` non-empty — flip in flight, KMS would EBUSY.
     PendingAcks,
+    /// An accepted non-scene commit owns this CRTC until its flip retires.
+    CursorCommitInFlight,
     /// `next_submit_retry_at` deadline still in the future.
     RetryDeadline,
     /// `output_damage` is empty and this is not the first frame.

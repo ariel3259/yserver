@@ -46,6 +46,10 @@ impl OutputSink for PlatformBackend {
         }
     }
 
+    fn output_commit_in_flight(&self, output_idx: usize) -> bool {
+        self.cursor_commit_in_flight_for_output(output_idx)
+    }
+
     fn slot_count(&self, output_idx: usize) -> Option<usize> {
         self.scanout_pools
             .get(output_idx)

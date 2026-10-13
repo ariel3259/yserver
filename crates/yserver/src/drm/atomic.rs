@@ -261,7 +261,6 @@ impl AtomicCommitSink {
 
     /// Complete motion-to-visible timing when the corresponding accepted
     /// commit's page-flip event retires.
-    #[allow(dead_code)] // called by cursor flip retirement in Task 3
     pub(crate) fn note_cursor_commit_retired(&self, crtc: crtc::Handle, retired_at: Instant) {
         self.metrics
             .borrow_mut()
@@ -302,6 +301,16 @@ impl AtomicCommitSink {
             visible.0,
             visible.1,
         );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_motion_to_accept_sample_count(&self) -> usize {
+        self.metrics.borrow().motion_to_accept_us.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_motion_to_visible_sample_count(&self) -> usize {
+        self.metrics.borrow().motion_to_visible_us.len()
     }
 }
 

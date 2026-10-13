@@ -64,7 +64,8 @@ impl KmsCursorState {
             pending_move: None,
             pending_move_timestamp: None,
             atomic_positions: HashMap::new(),
-            atomic_unsent_positions: HashMap::new(),
+            atomic_pending_moves: HashMap::new(),
+            atomic_cursor_commits_in_flight: HashMap::new(),
             permanently_disabled: false,
             initialization_retryable: false,
             headless_deferred: true,
@@ -83,6 +84,9 @@ impl KmsCursorState {
         y: i32,
         motion_timestamp: Option<Instant>,
     ) {
+        if !self.atomic_cursor {
+            return;
+        }
         let Some((plane, crtc_x, crtc_y)) = self
             .plane
             .as_ref()
@@ -101,12 +105,12 @@ impl KmsCursorState {
             motion_timestamp,
         };
         self.atomic_positions.insert(crtc, position);
-        self.atomic_unsent_positions.insert(crtc, position);
+        self.atomic_pending_moves.insert(crtc, position);
     }
 
     fn clear_atomic_position(&mut self, crtc: ::drm::control::crtc::Handle) {
         self.atomic_positions.remove(&crtc);
-        self.atomic_unsent_positions.remove(&crtc);
+        self.atomic_pending_moves.remove(&crtc);
     }
 
     fn available_on(&self, crtc: ::drm::control::crtc::Handle) -> bool {
@@ -380,6 +384,134 @@ impl PlatformBackend {
         positions
     }
 
+    /// Whether a cursor-only position can make the scheduling pass runnable.
+    /// Task 5 adds the per-CRTC rejection and hide-recovery exclusions here.
+    pub(crate) fn has_eligible_atomic_cursor_move(&self) -> bool {
+        self.devices.iter().any(|device| {
+            device.cursor.atomic_cursor
+                && device.cursor.atomic_pending_moves.iter().any(|(crtc, _)| {
+                    !device
+                        .cursor
+                        .atomic_cursor_commits_in_flight
+                        .contains_key(crtc)
+                        && device.cursor.available_on(*crtc)
+                })
+        })
+    }
+
+    /// Whether the scene's output gate must wait for an accepted cursor-only
+    /// commit on this output.
+    pub(crate) fn cursor_commit_in_flight_for_output(&self, output_idx: usize) -> bool {
+        let Some(layout) = self.outputs.get(output_idx) else {
+            return false;
+        };
+        self.device_for_key(layout.key.device_key)
+            .is_some_and(|device| {
+                device
+                    .cursor
+                    .atomic_cursor_commits_in_flight
+                    .contains_key(&layout.output.crtc)
+            })
+    }
+
+    pub(crate) fn any_cursor_commit_in_flight(&self) -> bool {
+        self.devices
+            .iter()
+            .any(|device| !device.cursor.atomic_cursor_commits_in_flight.is_empty())
+    }
+
+    /// Submit the pending move for one output. The caller is the scheduling
+    /// pass, after direct and scene work have had their turn. A rejected ioctl
+    /// leaves the position unsent and creates no in-flight record.
+    pub(crate) fn submit_atomic_cursor_move_for_output(
+        &mut self,
+        output_idx: usize,
+    ) -> io::Result<bool> {
+        use ::drm::control::AtomicCommitFlags;
+
+        let Some(layout) = self.outputs.get(output_idx) else {
+            return Ok(false);
+        };
+        let device_key = layout.key.device_key;
+        let crtc = layout.output.crtc;
+        let Some(device_idx) = self
+            .devices
+            .iter()
+            .position(|device| device.key == device_key)
+        else {
+            return Ok(false);
+        };
+        let cursor = &self.devices[device_idx].cursor;
+        if !cursor.atomic_cursor
+            || cursor.atomic_cursor_commits_in_flight.contains_key(&crtc)
+            || !cursor.available_on(crtc)
+            || !cursor
+                .plane
+                .as_ref()
+                .is_some_and(|plane| plane.is_visible_on(crtc))
+        {
+            return Ok(false);
+        }
+        let Some(position) = cursor.atomic_pending_moves.get(&crtc).copied() else {
+            return Ok(false);
+        };
+        let device = Rc::clone(&self.devices[device_idx].device);
+        let commit_sink = Rc::clone(&self.devices[device_idx].atomic_commit_sink);
+        let mut request = crate::drm::atomic::AtomicCommitRequest::new();
+        request.add_cursor_position(position);
+        let event = crate::drm::atomic::AtomicCommitEvent {
+            crtc,
+            motion_timestamp: position.motion_timestamp,
+        };
+        commit_sink.submit(
+            &device,
+            AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK,
+            crate::drm::atomic::AtomicCommitKind::CursorOnly,
+            request,
+            &[event],
+        )?;
+
+        let cursor = &mut self.devices[device_idx].cursor;
+        if cursor
+            .atomic_pending_moves
+            .get(&crtc)
+            .is_some_and(|pending| *pending == position)
+        {
+            cursor.atomic_pending_moves.remove(&crtc);
+        }
+        if let Some(latest) = cursor.atomic_positions.get_mut(&crtc)
+            && *latest == position
+        {
+            latest.motion_timestamp = None;
+        }
+        cursor
+            .atomic_cursor_commits_in_flight
+            .insert(crtc, position);
+        Ok(true)
+    }
+
+    /// Attribute a flip event to this CRTC's cursor-only commit, if present.
+    /// The caller still records general scene-commit latency independently.
+    pub(crate) fn retire_atomic_cursor_commit_for_output(&mut self, output_idx: usize) -> bool {
+        let Some(layout) = self.outputs.get(output_idx) else {
+            return false;
+        };
+        let device_key = layout.key.device_key;
+        let crtc = layout.output.crtc;
+        let Some(device) = self
+            .devices
+            .iter_mut()
+            .find(|device| device.key == device_key)
+        else {
+            return false;
+        };
+        device
+            .cursor
+            .atomic_cursor_commits_in_flight
+            .remove(&crtc)
+            .is_some()
+    }
+
     /// Clear only the unsent values carried by an accepted scene commit. The
     /// latest positions stay cached so subsequent scene commits continue to
     /// include the cursor plane state.
@@ -402,11 +534,11 @@ impl PlatformBackend {
                 }
                 if device
                     .cursor
-                    .atomic_unsent_positions
+                    .atomic_pending_moves
                     .get(&position.crtc)
                     .is_some_and(|unsent| unsent == position)
                 {
-                    device.cursor.atomic_unsent_positions.remove(&position.crtc);
+                    device.cursor.atomic_pending_moves.remove(&position.crtc);
                 }
                 if let Some(latest) = device.cursor.atomic_positions.get_mut(&position.crtc) {
                     latest.motion_timestamp = None;
@@ -479,7 +611,36 @@ impl PlatformBackend {
         self.devices
             .iter()
             .find(|device| device.key == device_key)
-            .is_some_and(|device| device.cursor.atomic_unsent_positions.contains_key(&crtc))
+            .is_some_and(|device| device.cursor.atomic_pending_moves.contains_key(&crtc))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_atomic_cursor_commit_is_in_flight(
+        &self,
+        device_key: crate::platform::drm::DrmDeviceKey,
+        crtc: ::drm::control::crtc::Handle,
+    ) -> bool {
+        self.devices
+            .iter()
+            .find(|device| device.key == device_key)
+            .is_some_and(|device| {
+                device
+                    .cursor
+                    .atomic_cursor_commits_in_flight
+                    .contains_key(&crtc)
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_atomic_cursor_pending_position(
+        &self,
+        device_key: crate::platform::drm::DrmDeviceKey,
+        crtc: ::drm::control::crtc::Handle,
+    ) -> Option<crate::drm::atomic::CursorPlanePosition> {
+        self.devices
+            .iter()
+            .find(|device| device.key == device_key)
+            .and_then(|device| device.cursor.atomic_pending_moves.get(&crtc).copied())
     }
 
     #[must_use]
@@ -688,11 +849,11 @@ impl PlatformBackend {
         }
     }
 
-    /// Legacy cursor move per visible CRTC. Hidden CRTCs are skipped — the
+    /// Cursor move per visible CRTC. Hidden CRTCs are skipped — the
     /// kernel naturally clips off-output coords on the visible ones, so no
-    /// per-output geometry test is needed beyond the visibility filter. Task
-    /// 1 keeps this behavior on all devices until Task 3 adds the atomic
-    /// motion branch.
+    /// per-output geometry test is needed beyond the visibility filter.
+    /// Atomic-capable devices record the latest position for the scheduling
+    /// pass; other devices keep the legacy move ioctl.
     ///
     /// Returns the legacy move's EBUSY count, if any. Other errors are logged
     /// per-CRTC and not counted.
@@ -798,6 +959,11 @@ impl PlatformBackend {
                 continue;
             }
             let (cx, cy) = cursor_root_to_crtc_local(x, y, layout_x, layout_y, hot_x, hot_y);
+            if state.atomic_cursor {
+                state.remember_atomic_position(device_key, crtc, cx, cy, Some(motion_timestamp));
+                continue;
+            }
+
             let move_result = state
                 .plane
                 .as_ref()
@@ -987,7 +1153,7 @@ impl PlatformBackend {
             device.cursor.pending_move = None;
             device.cursor.pending_move_timestamp = None;
             device.cursor.atomic_positions.clear();
-            device.cursor.atomic_unsent_positions.clear();
+            device.cursor.atomic_pending_moves.clear();
             device.cursor.transient_fallback_crtcs.clear();
             let crtcs = crtcs_by_device.remove(&device.key).unwrap_or_default();
             if device.cursor.should_retry_initialization(!crtcs.is_empty()) {
@@ -1086,7 +1252,7 @@ impl PlatformBackend {
             device.cursor.pending_move = None;
             device.cursor.pending_move_timestamp = None;
             device.cursor.atomic_positions.clear();
-            device.cursor.atomic_unsent_positions.clear();
+            device.cursor.atomic_pending_moves.clear();
             let Some(plane) = device.cursor.plane.as_mut() else {
                 continue;
             };

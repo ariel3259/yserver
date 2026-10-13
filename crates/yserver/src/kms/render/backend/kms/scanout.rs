@@ -1736,12 +1736,16 @@ impl KmsBackend {
     /// `next_wakeup` never wakes for, the paint would be stranded (the
     /// xfce submenu bug — a menu painted after its map-compose sat
     /// off-screen until an unrelated event poked the loop).
-    pub(super) fn scene_wants_compose(&self) -> bool {
+    pub(super) fn scene_wants_scene(&self) -> bool {
         self.scene.scene_structure_dirty
             || self.store.has_pending_presentation_damage()
             // An invalidated or never-presented frame owes a repaint no producer
             // reports; without this the tick is never driven to paint it.
             || self.scene.owes_repaint()
+    }
+
+    pub(super) fn scene_wants_compose(&self) -> bool {
+        self.scene_wants_scene() || self.platform.has_eligible_atomic_cursor_move()
     }
 }
 
@@ -1877,7 +1881,9 @@ impl KmsBackend {
         }
     }
 
-    fn record_atomic_cursor_commit_retirement(&self, output_idx: usize) {
+    fn record_atomic_cursor_commit_retirement(&mut self, output_idx: usize) {
+        self.platform
+            .retire_atomic_cursor_commit_for_output(output_idx);
         let Some(layout) = self.platform.outputs.get(output_idx) else {
             return;
         };
@@ -1960,7 +1966,7 @@ impl KmsBackend {
         let allow_kms_timers = self.scanout_allowed() && self.kms_outputs_active;
         let scene_deadline = if allow_kms_timers {
             if self.scene_wants_compose() {
-                if self.scene.has_output_ready_for_submit() {
+                if self.scene.has_output_ready_for_submit(&self.platform) {
                     Some(now)
                 } else {
                     self.scene.earliest_retry_deadline()
@@ -2110,6 +2116,14 @@ impl KmsBackend {
                 self.telemetry.maybe_emit(self.engine.pending_count());
                 return Ok(());
             }
+            if self.scanout_m2.current.is_some()
+                && self.scanout_m2.unflip_requested
+                && self.platform.any_cursor_commit_in_flight()
+            {
+                self.drain_render_telemetry();
+                self.telemetry.maybe_emit(self.engine.pending_count());
+                return Ok(());
+            }
             if self.scanout_m2.current.is_some() && self.scanout_m2.unflip_requested {
                 if let Err(error) = self.submit_composed_unflip() {
                     log::error!(
@@ -2143,7 +2157,7 @@ impl KmsBackend {
         // submits) also carries this id.
         self.telemetry.advance_frame();
         let can_submit_scene =
-            self.scene_wants_compose() && self.scene.has_output_ready_for_submit();
+            self.scene_wants_scene() && self.scene.has_output_ready_for_submit(&self.platform);
         // #214 telemetry: did this tick's compose close submit paint, and
         // did the tick then compose anything?
         let mut legacy_close_submitted = false;
@@ -2192,6 +2206,9 @@ impl KmsBackend {
                 log::warn!("render maybe_composite: flush_submit_group failed: {e:?}");
             }
         }
+        // Task 4 inserts ready direct-candidate arbitration here. Direct
+        // Present callbacks keep their existing admission/submission paths.
+        let mut scene_submitted_outputs = HashSet::new();
         let result = if !can_submit_scene {
             Ok(())
         } else {
@@ -2211,6 +2228,7 @@ impl KmsBackend {
                 cow_host_xid,
             ) {
                 Ok(composed_outputs) => {
+                    scene_submitted_outputs.extend(composed_outputs.iter().copied());
                     if legacy_close_submitted {
                         crate::kms::vk::submit_stats::SUBMITS
                             .record_legacy_sc_tick(!composed_outputs.is_empty());
@@ -2251,6 +2269,26 @@ impl KmsBackend {
                 }
             }
         };
+        for output_idx in 0..self.platform.outputs.len() {
+            if scene_submitted_outputs.contains(&output_idx)
+                || self.scene.has_pending_page_flip(output_idx)
+                || self.scene.output_submit_retry_pending(output_idx)
+                || (self.scene_wants_scene()
+                    && self
+                        .scene
+                        .output_ready_for_submit(output_idx, &self.platform))
+            {
+                continue;
+            }
+            if let Err(error) = self
+                .platform
+                .submit_atomic_cursor_move_for_output(output_idx)
+            {
+                log::warn!(
+                    "render maybe_composite: cursor-only atomic commit failed for output {output_idx}: {error}"
+                );
+            }
+        }
         self.drain_paint_submit_telemetry();
         result
     }

@@ -27,7 +27,7 @@
 mod connectors;
 mod cursor;
 mod devices;
-mod flip_events;
+pub(crate) mod flip_events;
 mod init;
 mod power;
 mod qualify;
@@ -191,7 +191,11 @@ pub(crate) struct KmsCursorState {
     /// consumed only after an accepted commit carries it.
     atomic_positions:
         HashMap<::drm::control::crtc::Handle, crate::drm::atomic::CursorPlanePosition>,
-    atomic_unsent_positions:
+    atomic_pending_moves:
+        HashMap<::drm::control::crtc::Handle, crate::drm::atomic::CursorPlanePosition>,
+    /// Accepted cursor-only commits, keyed by CRTC. A cursor-only commit is
+    /// in flight only after its atomic ioctl succeeded.
+    atomic_cursor_commits_in_flight:
         HashMap<::drm::control::crtc::Handle, crate::drm::atomic::CursorPlanePosition>,
     permanently_disabled: bool,
     /// CursorPlane::new was attempted for an active startup topology and
@@ -205,7 +209,7 @@ pub(crate) struct KmsCursorState {
     topology_blocked: bool,
     transient_fallback_crtcs: HashMap<::drm::control::crtc::Handle, TransientCursorFallback>,
     /// Capability-selected atomic position path for this device's active
-    /// CRTC topology. Pointer dispatch remains legacy until Task 3.
+    /// CRTC topology.
     pub(crate) atomic_cursor: bool,
     sprite_signature: Option<(u16, u16, u16, u16)>,
 }
@@ -358,6 +362,9 @@ pub(crate) struct KmsDevice {
     pub(crate) key: crate::platform::drm::DrmDeviceKey,
     pub(crate) device: Rc<drm::Device>,
     pub(crate) atomic_commit_sink: Rc<crate::drm::atomic::AtomicCommitSink>,
+    pub(crate) page_flip_event_source: Rc<dyn flip_events::PageFlipEventSource>,
+    #[cfg(test)]
+    pub(crate) test_page_flip_event_source: Option<Rc<flip_events::RecordingPageFlipEventSource>>,
     pub(crate) cursor: KmsCursorState,
 }
 

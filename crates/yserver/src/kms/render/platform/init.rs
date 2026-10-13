@@ -10,6 +10,7 @@ use crate::{
             InitialScanoutRollbackGuard, KmsCursorState, KmsDevice, PlatformBackend, RenderDevice,
             RollbackScanoutOutput, SCANOUT_POOL_DEPTH, WAKEUP_EVENTFD_TOKEN,
             cursor::initialize_cursor_plane_for_device,
+            flip_events::{DrmPageFlipEventSource, PageFlipEventSource},
             qualify::{
                 allocate_copied_scanout_pool, allocate_copy_free_scanout_pool,
                 route_requires_copy_free_probe,
@@ -346,6 +347,9 @@ impl PlatformBackend {
                     atomic_commit_sink: Rc::new(crate::drm::atomic::AtomicCommitSink::new(
                         Rc::new(crate::drm::atomic::DrmAtomicCommitExecutor),
                     )),
+                    page_flip_event_source: Rc::new(DrmPageFlipEventSource),
+                    #[cfg(test)]
+                    test_page_flip_event_source: None,
                     cursor,
                 }
             })
@@ -763,6 +767,14 @@ impl PlatformBackend {
             RenderKmsRelationship::Unknown,
         );
         let device = Rc::new(drm::Device::for_tests().expect("test drm device"));
+        #[cfg(test)]
+        let test_page_flip_event_source =
+            Rc::new(super::flip_events::RecordingPageFlipEventSource::default());
+        #[cfg(test)]
+        let page_flip_event_source: Rc<dyn PageFlipEventSource> =
+            test_page_flip_event_source.clone();
+        #[cfg(not(test))]
+        let page_flip_event_source: Rc<dyn PageFlipEventSource> = Rc::new(DrmPageFlipEventSource);
         Self {
             initial_scanout_rollback_armed: false,
             devices: vec![KmsDevice {
@@ -771,6 +783,9 @@ impl PlatformBackend {
                 atomic_commit_sink: Rc::new(crate::drm::atomic::AtomicCommitSink::new(Rc::new(
                     crate::drm::atomic::DrmAtomicCommitExecutor,
                 ))),
+                page_flip_event_source,
+                #[cfg(test)]
+                test_page_flip_event_source: Some(test_page_flip_event_source),
                 cursor: KmsCursorState::new(),
             }],
             render_devices: Vec::new(),

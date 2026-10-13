@@ -96,6 +96,10 @@ fn push_test_device(backend: &mut KmsBackend, key: DrmDeviceKey) {
             atomic_commit_sink: std::rc::Rc::new(crate::drm::atomic::AtomicCommitSink::new(
                 std::rc::Rc::new(crate::drm::atomic::DrmAtomicCommitExecutor),
             )),
+            page_flip_event_source: std::rc::Rc::new(
+                crate::kms::render::platform::flip_events::DrmPageFlipEventSource,
+            ),
+            test_page_flip_event_source: None,
             cursor: crate::kms::render::platform::KmsCursorState::new(),
         });
 }
