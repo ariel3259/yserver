@@ -341,6 +341,30 @@ is reported as "i915 not validated".
 
 Record the tables in this plan and in `docs/status.md`.
 
+### Task 7 results — NVIDIA (card1, 2026-10-13, branch d0d61759, master 7e325a61; Xid 0 throughout)
+
+| test | master, software cursor | master, legacy HW cursor (policy lifted) | branch |
+|---|---|---|---|
+| pure motion 250 Hz 20 s: round trips > 8 ms / max | 0 / 1.9 ms | 1200 / 17.1 ms | **0 / 1.9 ms** |
+| window drag: lag p99 px / query p99 ms | 12 / 0.39–0.40 | 13–19 / 17.2–31.1 | **12 / 0.36–0.41** |
+| windowed mpv + motion: > 8 ms; frames/s; mpv drops | 0; 60; 0 | 900; 60; 0 | **0; 60; 0** |
+| fullscreen mpv + motion: > 8 ms; live direct submits; unflips | 0; 0 (software cursor blocks direct); 0 | 896; 2053; 2 | **0; 2066; 2** |
+| cursor hidden (XFIXES) **before** fullscreen mpv: direct submits in the first 14 s | – | **0** (the Task 6 bug) | **863** |
+| cursor hidden after direct entry: direct submits while hidden | 0 | 515 | 515 |
+
+- EBUSY 0 on every branch run. NONBLOCK ioctl p99: scene-with-cursor 60–360 µs, cursor-only 25–80 µs.
+- RANDR mode change while moving: the cursor stays hardware (`topology_blocked` never set). The ~3.1 s stall in
+  `disable_output` appears with **every** binary, the software cursor included (pre-existing, out of scope).
+- MATE session (`hw_cursor_mate_dpms.sh`): 5 DPMS off/on cycles while moving, then a screensaver lock. No old-event
+  drain timeout, no EBUSY, no panic, clean exit, and the desktop is back after every cycle. 2 of 5 DPMS-offs show the
+  same pre-existing ~3.1 s `disable_output` stall.
+- **Open:**
+  - The latency fields of the per-second line were non-zero in only a few seconds of each motion phase
+    (motion-to-visible ~20 ms when present). The instrumentation must be checked before the AMD run, whose acceptance
+    depends on it.
+  - VT switch: not run yet. It needs the one-time root setup (`claude-scratch/yserver-pr1/vt-auto/`).
+  - AMD (card0) and i915: not run yet.
+
 ## Gate (every task)
 
 1. `cargo +nightly fmt`, then `cargo +nightly fmt -- --check`.
