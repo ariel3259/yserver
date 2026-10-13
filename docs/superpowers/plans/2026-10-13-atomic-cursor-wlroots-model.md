@@ -109,7 +109,8 @@ hidden. No KMS thread.
 - `CursorPlane::atomic_position_properties(crtc) -> Option<(plane::Handle, property::Handle, property::Handle)>`
   and `supports_atomic_positions(&[crtc]) -> bool`. They are filled at discovery from every cursor plane with
   `CRTC_X` and `CRTC_Y`; **`retain_crtcs` never prunes them.**
-- `crate::drm::atomic::CursorPlanePosition { crtc, plane, crtc_x, crtc_y, x, y }`, with
+- `crate::drm::atomic::CursorPlanePosition { device_key, crtc, plane, crtc_x, crtc_y, x, y }` (plus the motion
+  timestamp), with
   `add_to(&self, req: &mut AtomicModeReq)`.
 - **`AtomicCommitSink`,** held per KMS device:
   - Construction: a constructor parameter. In production it is the device's `atomic_commit`. A `#[cfg(test)]`
@@ -141,7 +142,7 @@ hidden. No KMS thread.
 
 **Files:** `crates/yserver/src/kms/render/platform/scene_sink.rs` (shared flip, ~L440),
 `platform/scanout_bos.rs` (copied flip, ~L123), `backend/kms/scanout.rs` (direct ~L534, composed unflip ~L854),
-`crates/yserver/src/drm/{page_flip.rs,modeset.rs}`.
+`crates/yserver/src/drm/{page_flip.rs,modeset.rs,atomic.rs}`, `platform.rs`, `platform/{cursor.rs,init.rs}`.
 
 **Interfaces:**
 - `PlatformBackend::cursor_plane_atomic_positions_for_outputs(&[output_idx]) -> Vec<CursorPlanePosition>` returns one
@@ -151,7 +152,8 @@ hidden. No KMS thread.
 - The grouped submitters (`submit_direct_scanout`, `submit_composed_scanout`) take the list for every participating
   output.
 - After a successful request, `cursor_plane_scene_commit_submitted(&[CursorPlanePosition])` clears the unsent
-  position of exactly the CRTCs it carried. A failed request clears nothing.
+  position of exactly the (device, CRTC) pairs it carried. CRTC and plane handles are only unique within a DRM
+  device, so every position names its `device_key`. A failed request clears nothing.
 
 - [ ] Test (shared flip, through `tick_maybe_composite_for_tests` or the scripted scene path): the recorded request
   carries the cursor plane's `CRTC_X`/`CRTC_Y` = the latest position. Mutation: omit the append.
@@ -347,6 +349,10 @@ Record the tables in this plan and in `docs/status.md`.
 6. Cargo.lock unchanged. FreeBSD: "not checked" (CI runs it).
 
 ## Review log
+
+- **Task 2 stop (2026-10-13):** a position without a device identity cannot be cleared unambiguously when two
+  devices reuse CRTC handles; `CursorPlanePosition` gains `device_key`, and Task 2 may touch `drm/atomic.rs`,
+  `platform.rs`, `platform/{cursor.rs,init.rs}`.
 
 - **Task 1 stop (2026-10-13):** `KmsCursorState` and `KmsDevice` live in `kms/render/platform.rs`, which no
   file list named; added to Tasks 1, 3 and 5.
