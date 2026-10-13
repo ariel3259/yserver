@@ -102,6 +102,7 @@ hidden. No KMS thread.
 ### Task 1: Atomic position properties, the path choice and a recordable commit sink
 
 **Files:** `crates/yserver/src/kms/cursor_plane.rs`, new `crates/yserver/src/drm/atomic.rs` (+ `drm/mod.rs`),
+`crates/yserver/src/kms/render/platform.rs` (where `KmsCursorState` and `KmsDevice` are defined),
 `crates/yserver/src/kms/render/platform/cursor.rs`, `platform/init.rs`.
 
 **Interfaces — produces:**
@@ -164,7 +165,8 @@ hidden. No KMS thread.
 
 ### Task 3: Cursor-only commits, retirement and the scene gate
 
-**Files:** `platform/cursor.rs`, `platform/flip_events.rs`, `backend/portable/pointer.rs`, `backend/trait_impl.rs`,
+**Files:** `platform.rs` (`KmsCursorState`), `platform/cursor.rs`, `platform/flip_events.rs`,
+`backend/portable/pointer.rs`, `backend/trait_impl.rs`,
 `crates/yserver-render/src/kms/render/scene/{sink.rs,tick.rs}`.
 
 **Interfaces / invariants** (Tasks 4 and 5 build on these):
@@ -240,7 +242,8 @@ hidden. No KMS thread.
 
 ### Task 5: Rejections, topology changes and VT release
 
-**Files:** `platform/cursor.rs`, `platform/flip_events.rs`, `backend/kms/{scanout.rs,crtc_config.rs,session.rs}`.
+**Files:** `platform.rs` (`KmsCursorState`), `platform/cursor.rs`, `platform/flip_events.rs`,
+`backend/kms/{scanout.rs,crtc_config.rs,session.rs}`.
 
 **Interfaces / invariants:** the **Rejections** rules in Global Constraints (EBUSY → `cursor_retry_waits_for_flip`;
 other errors → legacy hide, then software fallback or motion-driven hide recovery), and:
@@ -344,6 +347,9 @@ Record the tables in this plan and in `docs/status.md`.
 6. Cargo.lock unchanged. FreeBSD: "not checked" (CI runs it).
 
 ## Review log
+
+- **Task 1 stop (2026-10-13):** `KmsCursorState` and `KmsDevice` live in `kms/render/platform.rs`, which no
+  file list named; added to Tasks 1, 3 and 5.
 
 Task numbers in rounds 1–4 refer to the plan as it was then. After round 4, Task 3 was split into Tasks 3–5
 (cursor stream, direct scanout, rejections/topology); the hidden cursor became Task 6 and hardware Task 7.
