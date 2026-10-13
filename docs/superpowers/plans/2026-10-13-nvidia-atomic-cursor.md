@@ -58,8 +58,11 @@ hidden. No KMS thread.
   rejected cursor-only commit leaves no in-flight state. EBUSY is counted and warned (it is a bookkeeping bug), never
   retried in a loop.
 - **Rejections.**
-  - **EBUSY on a cursor-only commit:** the position stays unsent, and the next scheduling pass may carry it in a scene
-    commit.
+  - **EBUSY on a cursor-only commit (M-6):**
+    - The position stays unsent, and a scene or direct commit may carry it.
+    - The CRTC is marked `cursor_retry_waits_for_flip`: no further cursor-only commit is attempted on it until the
+      next flip event on that CRTC. An EBUSY means something is pending there, so that event will come.
+    - New motion does not clear the mark.
   - **Any other rejection (EINVAL, ENOSPC, …) of a request carrying cursor fields** follows master's legacy rule
     (`platform/cursor.rs` ~L619): hide the plane through the legacy ioctl, and only after a successful hide mark the
     CRTC for transient software fallback (`note_einval`).
@@ -67,7 +70,9 @@ hidden. No KMS thread.
       - it carries no cursor fields;
       - the outcome wakes the scene and requests a direct unflip when needed, through the existing
         `handle_cursor_move_outcome` handoff (`backend/kms/scanout.rs` ~L267);
-      - the hide is retried at each later flip retirement on that CRTC, at most 3 times;
+      - the hide is retried on later **pointer motion** on that CRTC (M-3, round 4), at most 3 times, at most once per
+        scheduling pass. Motion is what makes a frozen sprite visible, so recovery needs no unrelated flip; without
+        motion the frozen sprite is where the pointer is;
       - a successful retry completes the software fallback;
       - after the third failure the device's hardware cursor is marked `permanently_disabled` with an error log, and
         the sprite stays where the kernel has it, as master's legacy rollback already accepts.
@@ -165,15 +170,21 @@ hidden. No KMS thread.
 
 **Interfaces / invariants:**
 - **Per-CRTC state:** `atomic_pending_moves` (latest wins) and `atomic_cursor_commits_in_flight`.
-- **Motion on an atomic-path device never submits directly (M-5).** It stores the position (with its event
-  timestamp) and marks the backend's scheduling pass as wanted. The compose-wanted predicate that runs
-  `maybe_composite` (`backend/trait_impl.rs:166`) includes "an unsent cursor position exists". All commits on a CRTC
-  are decided in that one pass, so motion cannot bypass the arbitration below. A cursor-only commit is marked in
-  flight **only if its ioctl succeeded**.
+- **Motion on an atomic-path device never submits directly (M-5).**
+  - It stores the position (with its event timestamp) and marks the backend's scheduling pass as wanted.
+  - The compose-wanted predicate that runs `maybe_composite` (`backend/trait_impl.rs:166`) includes "an unsent cursor
+    position eligible for a cursor-only commit exists". Eligible means not under `cursor_retry_waits_for_flip` and
+    not in hide recovery.
+  - **Cursor-only commits are decided only in that pass**, so motion cannot bypass the arbitration below.
+  - **Direct scanout keeps master's own callbacks** (round 4 M-5). First-entry admission inside Present handling
+    (`present.rs` ~L834–869) and `submit_queued_direct_successor` stay where they are and submit immediately as today.
+    They check the same blockers: no cursor-only commit in flight on their CRTCs. No direct work is deferred to the
+    pass, so no deferred first-entry state exists.
+  - A cursor-only commit is marked in flight **only if its ioctl succeeded**.
 - **Retirement:** a flip event on a CRTC with a cursor-only commit in flight retires that commit. With at most one
   commit in flight per CRTC, the CRTC identifies it.
-- **Arbitration (the scheduling pass, the only place commits on a CRTC are decided),** in this order, for each CRTC
-  with nothing in flight:
+- **Arbitration (the scheduling pass, the only place cursor-only commits are decided),** in this order, for each
+  CRTC with nothing in flight:
   1. submits a waiting direct candidate whose CRTCs are all clear;
   2. otherwise lets the scene submit if it has a frame ready for that output;
   3. only then sends the unsent position as a cursor-only commit.
@@ -221,10 +232,16 @@ hidden. No KMS thread.
   - The plane is hidden through the legacy ioctl and the CRTC goes to software fallback.
   - The next scene request carries no cursor fields and is accepted.
   - With the hide scripted to fail, hardware ownership is retained and scene requests still carry no cursor fields.
-  - **Hide recovery:** the hide is retried at the next flip retirement. When it is scripted to succeed, the CRTC moves
-    to software fallback and cursor motion is visible again through the scene. When it fails three times, the device
-    is `permanently_disabled` and no fourth hide is attempted.
+  - **Hide recovery (idle desktop, no other damage):**
+    - Motion retries the hide; a failed first retry is followed by another on the next motion.
+    - When the hide is scripted to succeed, the CRTC moves to software fallback and the motion is visible through the
+      scene.
+    - When it fails three times, the device is `permanently_disabled` and no fourth hide is attempted.
+    - No retry depends on a flip event.
   Mutation: keep the unsent position after EINVAL; separately, never retry the hide.
+- [ ] Test (M-6): after a cursor-only EBUSY on an idle desktop, three successive scheduling passes without new input
+  attempt no cursor-only commit, and the compose-wanted predicate is false. New motion does not change that. A flip
+  event on the CRTC re-enables exactly one cursor-only commit. Mutation: do not mark `cursor_retry_waits_for_flip`.
 - [ ] Test (M-2): the recorder rejects a cursor-only commit with EBUSY. Expect:
   - no in-flight state and the position still unsent;
   - one EBUSY counted;
@@ -330,6 +347,13 @@ Record the tables in this plan and in `docs/status.md`.
     retirements) and a final state (`permanently_disabled`) (Global Constraints, Task 3 test).
   - **M-5:** motion only records a position; every commit on a CRTC is decided in the scheduling pass, so a ready
     scene frame cannot be starved (Task 3 test).
+- **Round 4 (same instrument, 2026-10-13):** 0 blocking, 3 major, 0 minor; B-1, M-1, M-2, B-2 and M-4 confirmed
+  applied, M-3 and M-5 partial. All three were verified against the code and applied:
+  - **M-3:** hide recovery is driven by pointer motion, not by flips that may never come on an idle desktop.
+  - **M-5:** the single-pass rule is narrowed to cursor-only commits. Direct admission and successor submission keep
+    master's callbacks and check the cursor blocker, so no deferred direct state exists.
+  - **M-6:** after EBUSY a CRTC waits for its next flip event before another cursor-only attempt, and the
+    compose-wanted predicate ignores ineligible positions.
 - **Scope change (user, 2026-10-13):** Tasks 1–3 apply to every driver with atomic cursor position properties (AMD
   and i915 too), chosen by capability. Hardware validation on AMD was added.
 
