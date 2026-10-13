@@ -61,8 +61,8 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   - a MATE session through 5 DPMS cycles while moving.
 
   amdgpu and i915 now use the same model: their cursor can be up to a frame later than with the immediate legacy
-  move. `tools/cursor-bench/` measures this on a given card. AMD, i915 and the VT switch are not yet validated on
-  hardware. Plan: `docs/superpowers/plans/2026-10-13-atomic-cursor-wlroots-model.md`.
+  move. `tools/cursor-bench/` measures this on a given card. On an AMD integrated GPU (amdgpu) every bench row matches master's legacy cursor and
+  motion-to-visible p99 stays at 20–30 ms. i915 and the VT switch are not yet validated on hardware. Plan: `docs/superpowers/plans/2026-10-13-atomic-cursor-wlroots-model.md`.
 
 - **2026-10-13 phase 3b, scene compositor in `yserver-render` (branch
   `refactor/phase3b-scene-split`):** the scene (`kms::render::scene`, with

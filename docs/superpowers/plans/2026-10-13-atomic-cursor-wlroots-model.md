@@ -365,6 +365,31 @@ Record the tables in this plan and in `docs/status.md`.
   - VT switch: not run yet. It needs the one-time root setup (`claude-scratch/yserver-pr1/vt-auto/`).
   - AMD (card0) and i915: not run yet.
 
+### Task 7 results — AMD (card0 = Ryzen integrated GPU, amdgpu, HDMI-A-1 1920x1080@60; 2026-10-13, branch 15b02cc3 vs master 7e325a61)
+
+Run with `tools/cursor-bench`. Rendering is on the same device (`relationship: Same`). No new amdgpu kernel errors
+(19 before, 19 after).
+
+| test | master (legacy cursor ioctls) | branch |
+|---|---|---|
+| pure motion 250 Hz 20 s: round trips > 8 ms / max | 0 / 0.41 ms | **0 / 0.37 ms** |
+| window drag: lag p99 px / query p99 ms | 12 / 0.24–0.32 | **12 / 0.26–0.31** |
+| windowed mpv + motion: > 8 ms; mpv drops | 0; 0 | **0; 0** |
+| fullscreen mpv + motion: > 8 ms; mpv drops | 0; 0 | **0; 0** |
+| branch cursor latency (motion seconds), p99 per second: median / max | – | accept 3.8–4.0 / 24.6 ms; **visible 20.3–20.6 / 30.0 ms** (RANDR excluded) |
+| EBUSY | 0 | 0 |
+
+- **Acceptance met:** every row equals master, and motion-to-visible p99 stays under two frames (33.4 ms).
+- **Direct scanout does not engage on this iGPU with either binary**, so the hidden-cursor row cannot be shown here.
+  The cursor gate is open (`m1_gates[... cursor=Hw|Hidden ...]`, `m1_gate_reject[cursor=0]`). Direct entry is blocked
+  by the source buffer instead:
+  - `reject_regions` for every Present;
+  - `scanout M1 add_fb2 rejected linear buffer with explicit modifier (EINVAL) and legacy metadata (EINVAL)` for
+    mpv's buffers.
+
+  This is pre-existing and out of scope.
+- i915: not run (no Intel machine). VT switch: not run.
+
 ## Gate (every task)
 
 1. `cargo +nightly fmt`, then `cargo +nightly fmt -- --check`.
