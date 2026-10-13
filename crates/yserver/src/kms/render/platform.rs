@@ -47,7 +47,7 @@ use scanout_bos::*;
 #[cfg(test)]
 mod tests;
 
-use std::{collections::HashMap, io, os::fd::OwnedFd, rc::Rc, sync::Arc};
+use std::{collections::HashMap, io, os::fd::OwnedFd, rc::Rc, sync::Arc, time::Instant};
 
 use ash::vk;
 use yserver_core::backend::PresentClockSample;
@@ -183,6 +183,9 @@ struct TransientCursorFallback {
 pub(crate) struct KmsCursorState {
     pub(crate) plane: Option<crate::kms::cursor_plane::CursorPlane>,
     pending_move: Option<(i32, i32, u16, u16)>,
+    /// Pointer-event timestamp paired with `pending_move` across an EBUSY
+    /// retry. Atomic positions carry this timestamp directly.
+    pending_move_timestamp: Option<Instant>,
     permanently_disabled: bool,
     /// CursorPlane::new was attempted for an active startup topology and
     /// failed transiently. Only explicit active-topology/resume boundaries
@@ -194,7 +197,9 @@ pub(crate) struct KmsCursorState {
     headless_deferred: bool,
     topology_blocked: bool,
     transient_fallback_crtcs: HashMap<::drm::control::crtc::Handle, TransientCursorFallback>,
-    nvidia_policy_disabled: bool,
+    /// Capability-selected atomic position path for this device's active
+    /// CRTC topology. Pointer dispatch remains legacy until Task 3.
+    pub(crate) atomic_cursor: bool,
     sprite_signature: Option<(u16, u16, u16, u16)>,
 }
 
@@ -345,6 +350,7 @@ struct TerminalDisposableProbeMarker {
 pub(crate) struct KmsDevice {
     pub(crate) key: crate::platform::drm::DrmDeviceKey,
     pub(crate) device: Rc<drm::Device>,
+    pub(crate) atomic_commit_sink: Rc<crate::drm::atomic::AtomicCommitSink>,
     pub(crate) cursor: KmsCursorState,
 }
 

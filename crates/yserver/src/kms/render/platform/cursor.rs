@@ -6,6 +6,7 @@ use std::{
     collections::{HashMap, HashSet},
     io,
     rc::Rc,
+    time::Instant,
 };
 
 /// True iff a cursor-plane ioctl error means the driver does not
@@ -58,19 +59,16 @@ pub(super) fn cursor_dimensions_fit(
 
 impl KmsCursorState {
     pub(crate) fn new() -> Self {
-        Self::new_with_nvidia_policy(false)
-    }
-
-    pub(super) fn new_with_nvidia_policy(nvidia_policy_disabled: bool) -> Self {
         Self {
             plane: None,
             pending_move: None,
+            pending_move_timestamp: None,
             permanently_disabled: false,
             initialization_retryable: false,
             headless_deferred: true,
             topology_blocked: false,
             transient_fallback_crtcs: HashMap::new(),
-            nvidia_policy_disabled,
+            atomic_cursor: false,
             sprite_signature: None,
         }
     }
@@ -79,7 +77,6 @@ impl KmsCursorState {
         self.plane.is_some()
             && !self.permanently_disabled
             && !self.topology_blocked
-            && !self.nvidia_policy_disabled
             && self
                 .transient_fallback_crtcs
                 .get(&crtc)
@@ -118,10 +115,12 @@ impl KmsCursorState {
                 // recovery. A position-only retry must not race it or clear a
                 // failed bind/hotspot/upload observation.
                 self.pending_move = None;
+                self.pending_move_timestamp = None;
             }
             CursorFailureDisposition::Permanent => {
                 self.permanently_disabled = true;
                 self.pending_move = None;
+                self.pending_move_timestamp = None;
                 self.transient_fallback_crtcs.clear();
             }
         }
@@ -196,6 +195,7 @@ pub(super) fn apply_cursor_show_failure_state(
         && !error.needs_full_rebind()
     {
         state.pending_move = Some(desired_move);
+        state.pending_move_timestamp = Some(Instant::now());
     }
     disposition
 }
@@ -220,14 +220,16 @@ pub(super) fn install_cursor_plane_for_device(
     plane: crate::kms::cursor_plane::CursorPlane,
 ) {
     kms_device.cursor.topology_blocked = !plane.supports_crtcs(crtcs);
+    kms_device.cursor.atomic_cursor = plane.supports_atomic_positions(crtcs);
     kms_device.cursor.initialization_retryable = false;
     kms_device.cursor.headless_deferred = false;
     log::info!(
-        "render cursor: device {} initialized {}x{} ARGB8888 for {} active CRTC(s) at {boundary}; topology_blocked={}",
+        "render cursor: device {} initialized {}x{} ARGB8888 for {} active CRTC(s) at {boundary}; atomic_cursor={} topology_blocked={}",
         kms_device.key,
         plane.width(),
         plane.height(),
         crtcs.len(),
+        kms_device.cursor.atomic_cursor,
         kms_device.cursor.topology_blocked,
     );
     kms_device.cursor.plane = Some(plane);
@@ -512,16 +514,14 @@ impl PlatformBackend {
         }
     }
 
-    /// Atomic cursor move per visible CRTC. Hidden CRTCs are
-    /// skipped — the kernel naturally clips off-output coords on
-    /// the visible ones, so no per-output geometry test is needed
-    /// beyond the visibility filter.
+    /// Legacy cursor move per visible CRTC. Hidden CRTCs are skipped — the
+    /// kernel naturally clips off-output coords on the visible ones, so no
+    /// per-output geometry test is needed beyond the visibility filter. Task
+    /// 1 keeps this behavior on all devices until Task 3 adds the atomic
+    /// motion branch.
     ///
-    /// Returns the number of per-CRTC commits that the kernel
-    /// rejected with `EBUSY` (cursor commit lost to a pending
-    /// primary-plane commit on the same CRTC — the move's effect
-    /// is dropped, the caller's telemetry counts it). Other
-    /// errors are logged per-CRTC and not counted.
+    /// Returns the legacy move's EBUSY count, if any. Other errors are logged
+    /// per-CRTC and not counted.
     ///
     /// # Errors
     /// `Err` only when the plane is unavailable; per-CRTC ioctl
@@ -533,6 +533,7 @@ impl PlatformBackend {
         hot_x: u16,
         hot_y: u16,
     ) -> io::Result<CursorMoveOutcome> {
+        let motion_timestamp = Instant::now();
         let mut aggregate = CursorMoveOutcome::default();
         let mut found = false;
         for device_idx in 0..self.devices.len() {
@@ -540,8 +541,18 @@ impl PlatformBackend {
                 continue;
             }
             found = true;
-            let outcome = self.try_cursor_plane_move_for_device(device_idx, x, y, hot_x, hot_y)?;
+            let outcome = self.try_cursor_plane_move_for_device(
+                device_idx,
+                x,
+                y,
+                hot_x,
+                hot_y,
+                motion_timestamp,
+            )?;
             aggregate.merge(outcome);
+        }
+        for device in &self.devices {
+            device.atomic_commit_sink.emit_telemetry_if_due();
         }
         found
             .then_some(aggregate)
@@ -570,11 +581,15 @@ impl PlatformBackend {
         let Some((x, y, hot_x, hot_y)) = self.devices[device_idx].cursor.pending_move else {
             return Ok(CursorMoveOutcome::default());
         };
-        self.try_cursor_plane_move_for_device(device_idx, x, y, hot_x, hot_y)
+        let motion_timestamp = self.devices[device_idx]
+            .cursor
+            .pending_move_timestamp
+            .unwrap_or_else(Instant::now);
+        self.try_cursor_plane_move_for_device(device_idx, x, y, hot_x, hot_y, motion_timestamp)
     }
 
     /// Internal helper: per-CRTC `move_to` iteration that returns the
-    /// number of CRTCs whose atomic commit returned `EBUSY`. Shared by
+    /// number of CRTCs whose move ioctl returned `EBUSY`. Shared by
     /// `cursor_plane_move` (first-attempt path) and
     /// `cursor_plane_drain_pending_move` (retry path).
     fn try_cursor_plane_move_for_device(
@@ -584,8 +599,10 @@ impl PlatformBackend {
         y: i32,
         hot_x: u16,
         hot_y: u16,
+        motion_timestamp: Instant,
     ) -> io::Result<CursorMoveOutcome> {
         let device_key = self.devices[device_idx].key;
+        let atomic_commit_sink = Rc::clone(&self.devices[device_idx].atomic_commit_sink);
         let layouts: Vec<(::drm::control::crtc::Handle, i32, i32)> = self
             .outputs
             .iter()
@@ -612,6 +629,7 @@ impl PlatformBackend {
                 .as_ref()
                 .expect("checked cursor plane")
                 .move_to(crtc, cx, cy);
+            atomic_commit_sink.record_legacy_move(motion_timestamp, Instant::now());
             if let Err(e) = move_result {
                 if e.raw_os_error() == Some(libc::EBUSY) {
                     outcome.ebusy_count = outcome.ebusy_count.saturating_add(1);
@@ -642,8 +660,9 @@ impl PlatformBackend {
                 }
             }
         }
-        state.pending_move =
-            (keep_pending || outcome.ebusy_count > 0).then_some((x, y, hot_x, hot_y));
+        let keep_pending = keep_pending || outcome.ebusy_count > 0;
+        state.pending_move = keep_pending.then_some((x, y, hot_x, hot_y));
+        state.pending_move_timestamp = keep_pending.then_some(motion_timestamp);
         Ok(outcome)
     }
 
@@ -788,6 +807,7 @@ impl PlatformBackend {
                 continue;
             }
             device.cursor.pending_move = None;
+            device.cursor.pending_move_timestamp = None;
             device.cursor.transient_fallback_crtcs.clear();
             let crtcs = crtcs_by_device.remove(&device.key).unwrap_or_default();
             if device.cursor.should_retry_initialization(!crtcs.is_empty()) {
@@ -801,6 +821,11 @@ impl PlatformBackend {
                 .plane
                 .as_ref()
                 .is_some_and(|plane| !plane.supports_crtcs(&crtcs));
+            device.cursor.atomic_cursor = device
+                .cursor
+                .plane
+                .as_ref()
+                .is_some_and(|plane| plane.supports_atomic_positions(&crtcs));
             if blocked != device.cursor.topology_blocked {
                 log::warn!(
                     "render cursor: device {} topology_blocked {} -> {} for {} active CRTC(s)",
@@ -879,6 +904,7 @@ impl PlatformBackend {
         let mut found = false;
         for device in &mut self.devices {
             device.cursor.pending_move = None;
+            device.cursor.pending_move_timestamp = None;
             let Some(plane) = device.cursor.plane.as_mut() else {
                 continue;
             };

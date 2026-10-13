@@ -92,6 +92,9 @@ fn push_test_device(backend: &mut KmsBackend, key: DrmDeviceKey) {
         .push(crate::kms::render::platform::KmsDevice {
             key,
             device,
+            atomic_commit_sink: std::rc::Rc::new(crate::drm::atomic::AtomicCommitSink::new(
+                std::rc::Rc::new(crate::drm::atomic::DrmAtomicCommitExecutor),
+            )),
             cursor: crate::kms::render::platform::KmsCursorState::new(),
         });
 }

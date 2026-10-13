@@ -26,21 +26,6 @@ use crate::{
 };
 use std::{collections::HashMap, io, os::fd::AsFd as _, path::PathBuf, rc::Rc, sync::Arc};
 
-fn drm_device_is_nvidia(device: &drm::Device) -> bool {
-    use ::drm::Device as _;
-    device
-        .get_driver()
-        .ok()
-        .map(|driver| {
-            driver
-                .name()
-                .to_string_lossy()
-                .to_ascii_lowercase()
-                .contains("nvidia")
-        })
-        .unwrap_or(false)
-}
-
 fn retain_live_vk_contexts_after_terminal_probe(
     live_vk: &Arc<VkContext>,
     copied_contexts: &HashMap<RenderDeviceId, Arc<VkContext>>,
@@ -354,11 +339,13 @@ impl PlatformBackend {
         let mut devices: Vec<KmsDevice> = devices
             .into_iter()
             .map(|device| {
-                let cursor =
-                    KmsCursorState::new_with_nvidia_policy(drm_device_is_nvidia(&device.device));
+                let cursor = KmsCursorState::new();
                 KmsDevice {
                     key: device.key,
                     device: device.device,
+                    atomic_commit_sink: Rc::new(crate::drm::atomic::AtomicCommitSink::new(
+                        Rc::new(crate::drm::atomic::DrmAtomicCommitExecutor),
+                    )),
                     cursor,
                 }
             })
@@ -781,6 +768,9 @@ impl PlatformBackend {
             devices: vec![KmsDevice {
                 key: device_key,
                 device,
+                atomic_commit_sink: Rc::new(crate::drm::atomic::AtomicCommitSink::new(Rc::new(
+                    crate::drm::atomic::DrmAtomicCommitExecutor,
+                ))),
                 cursor: KmsCursorState::new(),
             }],
             render_devices: Vec::new(),
