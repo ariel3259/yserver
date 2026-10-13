@@ -63,9 +63,16 @@ hidden. No KMS thread.
   - **Any other rejection (EINVAL, ENOSPC, …) of a request carrying cursor fields** follows master's legacy rule
     (`platform/cursor.rs` ~L619): hide the plane through the legacy ioctl, and only after a successful hide mark the
     CRTC for transient software fallback (`note_einval`).
-    - If the hide fails, hardware ownership is retained.
-    - Either way, the unsent position is dropped and that CRTC carries **no cursor fields** until the next successful
-      show, so a scene commit is never poisoned by cursor state.
+    - If the hide fails, hardware ownership is retained and the CRTC enters **hide recovery**:
+      - it carries no cursor fields;
+      - the outcome wakes the scene and requests a direct unflip when needed, through the existing
+        `handle_cursor_move_outcome` handoff (`backend/kms/scanout.rs` ~L267);
+      - the hide is retried at each later flip retirement on that CRTC, at most 3 times;
+      - a successful retry completes the software fallback;
+      - after the third failure the device's hardware cursor is marked `permanently_disabled` with an error log, and
+        the sprite stays where the kernel has it, as master's legacy rollback already accepts.
+    - In every case the unsent position is dropped, and the CRTC carries **no cursor fields** until the next
+      successful show, so a scene commit is never poisoned by cursor state.
     - A rejected scene commit that carried cursor fields gets the same treatment before the scene's retry.
 - The intermediate-disable RANDR stall (~3.1 s in `disable_output`, present with every cursor mode) is out of scope.
 
@@ -158,12 +165,15 @@ hidden. No KMS thread.
 
 **Interfaces / invariants:**
 - **Per-CRTC state:** `atomic_pending_moves` (latest wins) and `atomic_cursor_commits_in_flight`.
-- **Motion on an atomic-path device:** store the position. If the CRTC has no scene flip awaiting retirement, no
-  direct/unflip transaction pending, no direct candidate waiting (below) and no cursor-only commit in flight, submit a
-  cursor-only commit. Mark it in flight **only if the ioctl succeeded**.
+- **Motion on an atomic-path device never submits directly (M-5).** It stores the position (with its event
+  timestamp) and marks the backend's scheduling pass as wanted. The compose-wanted predicate that runs
+  `maybe_composite` (`backend/trait_impl.rs:166`) includes "an unsent cursor position exists". All commits on a CRTC
+  are decided in that one pass, so motion cannot bypass the arbitration below. A cursor-only commit is marked in
+  flight **only if its ioctl succeeded**.
 - **Retirement:** a flip event on a CRTC with a cursor-only commit in flight retires that commit. With at most one
   commit in flight per CRTC, the CRTC identifies it.
-- **Arbitration after a retirement.** The backend's next scheduling pass, in this order:
+- **Arbitration (the scheduling pass, the only place commits on a CRTC are decided),** in this order, for each CRTC
+  with nothing in flight:
   1. submits a waiting direct candidate whose CRTCs are all clear;
   2. otherwise lets the scene submit if it has a frame ready for that output;
   3. only then sends the unsent position as a cursor-only commit.
@@ -190,6 +200,9 @@ hidden. No KMS thread.
   Mutation: ignore the scene blocker.
 - [ ] Test: the scene does not submit while a cursor-only commit is in flight, and submits after its retirement.
   Mutation: `output_commit_in_flight` always false.
+- [ ] Test (M-5): scene damage is pending behind a cursor-only commit. Then come the retirement, then more motion,
+  then the scheduling pass. The next commit is the scene's, carrying the latest position, and no cursor-only commit
+  goes out in between. Mutation: let motion submit a cursor-only commit immediately.
 - [ ] Test (Review Focus 3): motion while a direct successor is pending sends nothing; the successor carries it.
   Mutation: drop the direct blocker.
 - [ ] Test (M-1, successor behind a cursor commit):
@@ -208,7 +221,10 @@ hidden. No KMS thread.
   - The plane is hidden through the legacy ioctl and the CRTC goes to software fallback.
   - The next scene request carries no cursor fields and is accepted.
   - With the hide scripted to fail, hardware ownership is retained and scene requests still carry no cursor fields.
-  Mutation: keep the unsent position after EINVAL.
+  - **Hide recovery:** the hide is retried at the next flip retirement. When it is scripted to succeed, the CRTC moves
+    to software fallback and cursor motion is visible again through the scene. When it fails three times, the device
+    is `permanently_disabled` and no fourth hide is attempted.
+  Mutation: keep the unsent position after EINVAL; separately, never retry the hide.
 - [ ] Test (M-2): the recorder rejects a cursor-only commit with EBUSY. Expect:
   - no in-flight state and the position still unsent;
   - one EBUSY counted;
@@ -308,6 +324,12 @@ Record the tables in this plan and in `docs/status.md`.
     Constraints, Task 3 test).
   - **M-4:** cursor latency is measured motion-to-visible as well as motion-to-accept, and the claim is corrected to
     up to two frames (Task 1, Task 5).
+- **Round 3 (same instrument, 2026-10-13):** 0 blocking, 2 major, 0 minor; B-1, M-1, M-2, B-2 and M-4 confirmed
+  applied, M-3 partial. Both findings were verified against the code and applied:
+  - **M-3:** hide recovery has an owner (the outcome handoff wakes the scene and unflips), a bounded retry (3 flip
+    retirements) and a final state (`permanently_disabled`) (Global Constraints, Task 3 test).
+  - **M-5:** motion only records a position; every commit on a CRTC is decided in the scheduling pass, so a ready
+    scene frame cannot be starved (Task 3 test).
 - **Scope change (user, 2026-10-13):** Tasks 1–3 apply to every driver with atomic cursor position properties (AMD
   and i915 too), chosen by capability. Hardware validation on AMD was added.
 
