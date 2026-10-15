@@ -153,6 +153,11 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   - NVIDIA, CS2 for about 8 minutes: median 312 direct flips/s (p10 231, max 413),
     1.0 flip per Present, no second below 60. Menus (composed, cursor visible):
     median 199/s. The user's verdict: smooth, low-latency play.
+  - AMD iGPU (card0), mpv Vulkan immediate with XFIXES-hidden cursor, after
+    Amendment B: 507–536 direct async flips/s, 1.0 per Present, 0 core skips
+    (7/s before Amendment B). Present→submit p50/p99 10/34 µs, async
+    turnaround p50/p99 41/87 µs. Present→flip reads about 0 µs: amdgpu stamps
+    async flips with the last vblank, so that metric is not meaningful there.
   - AMD iGPU (card0), GL: 329 direct async flips/s (0.999 per Present),
     present_to_submit 10 µs, async turnaround 58 µs. Composed path with a visible
     cursor: 474/s at 0.47 ms composite GPU time.
