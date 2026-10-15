@@ -260,7 +260,7 @@ pub(in crate::kms::render::backend) fn scanout_m1_outputs_cover_root(
 }
 
 impl KmsBackend {
-    pub(super) fn monotonic_now(&self) -> std::time::Instant {
+    pub(in crate::kms::render::backend) fn monotonic_now(&self) -> std::time::Instant {
         (self.pstate.monotonic_clock)()
     }
 

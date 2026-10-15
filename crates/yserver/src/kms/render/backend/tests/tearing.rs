@@ -5,6 +5,15 @@ use crate::drm::atomic::{
     tests_support::RecordingAtomicCommitExecutor,
 };
 
+fn init_tearing_test_logger() {
+    let _ = env_logger::Builder::new()
+        .is_test(true)
+        .filter_level(log::LevelFilter::Error)
+        .filter_module("yserver", log::LevelFilter::Warn)
+        .filter_module("yserver_render", log::LevelFilter::Warn)
+        .try_init();
+}
+
 fn recording_sink(
     backend: &mut KmsBackend,
     device_idx: usize,
@@ -287,6 +296,7 @@ fn retire_recorded_direct_flip(
 }
 
 fn direct_backend(output_count: usize) -> KmsBackend {
+    init_tearing_test_logger();
     let mut backend = KmsBackend::for_tests_with_vk().expect("Vulkan test fixture");
     if output_count == 2 {
         backend.platform.fb_w = 1600;
@@ -372,7 +382,11 @@ fn qualify_test_direct_async(
     let mut state = enter_tearing_without_direct_scanout(backend, window, first_present);
     Backend::set_cursor_hidden(backend, true);
     damage_root_and_composite(backend);
-    assert!(backend.scene.has_pending_page_flips());
+    assert!(
+        backend.scene.has_pending_page_flips(),
+        "expected a pending scene page flip: {}",
+        tearing_composite_diagnostics(backend, None),
+    );
     retire_composed_frame(backend, &mut state, 20);
     assert!(matches!(
         backend.pstate.tearing.state,
@@ -693,6 +707,27 @@ fn tearing_composite_diagnostics(backend: &KmsBackend, recorder_count: Option<us
     let deadline = backend.for_tests_tearing_cursor_compose_deadline_at(now);
     let scene_wants_scene = backend.for_tests_scene_wants_scene();
     let has_output_ready_for_submit = backend.scene.has_output_ready_for_submit(&backend.platform);
+    let submit_retry_state: Vec<_> = backend
+        .scene
+        .submit_retry_state_for_tests()
+        .into_iter()
+        .map(|(output_idx, retry_at, failed_submit_bo_count)| {
+            let next_submit_retry_at = retry_at.map(|retry_at| {
+                retry_at.checked_duration_since(now).map_or_else(
+                    || format!("overdue by {:?}", now.duration_since(retry_at)),
+                    |remaining| format!("in {remaining:?}"),
+                )
+            });
+            format!(
+                "output[{output_idx}]: next_submit_retry_at={next_submit_retry_at:?}, \
+                 failed_submit_bo_count={failed_submit_bo_count}"
+            )
+        })
+        .collect();
+    let vk = backend.platform.gpu.vk.as_deref();
+    let supports_sync_fd = vk.is_some_and(|vk| vk.supports_sync_fd());
+    let sync_fd_export_probe =
+        vk.map_or_else(|| "NoVkContext".to_owned(), signalled_sync_fd_export_probe);
     let output_readiness: Vec<_> = (0..backend.platform.outputs.len())
         .map(|output_idx| {
             format!(
@@ -720,12 +755,71 @@ fn tearing_composite_diagnostics(backend: &KmsBackend, recorder_count: Option<us
         .collect();
 
     format!(
-        "cursor_mode={:?}, scene_wants_scene={scene_wants_scene}, scene_wants_compose={}, has_output_ready_for_submit={has_output_ready_for_submit}, output_readiness={output_readiness:?}, cursor_compose_deadline={deadline:?} at monotonic_now={now:?} (last_cursor_compose={:?}, interval={:?}), scanout_pools={scanout_pools:?}, recorder_record_count={recorder_count:?}",
+        "cursor_mode={:?}, scene_wants_scene={scene_wants_scene}, scene_wants_compose={}, has_output_ready_for_submit={has_output_ready_for_submit}, output_readiness={output_readiness:?}, submit_retry_state={submit_retry_state:?}, renderer_failed={}, supports_sync_fd={supports_sync_fd}, sync_fd_export_probe={sync_fd_export_probe}, cursor_compose_deadline={deadline:?} at monotonic_now={now:?} (last_cursor_compose={:?}, interval={:?}), scanout_pools={scanout_pools:?}, recorder_record_count={recorder_count:?}",
         backend.scene.cursor_mode(),
         backend.for_tests_scene_wants_compose(),
-        backend.tearing.last_cursor_compose,
-        backend.tearing.cursor_compose_interval(&backend.platform),
+        backend.platform_renderer_failed_for_tests(),
+        backend.pstate.tearing.last_cursor_compose,
+        backend.pstate.tearing.cursor_compose_interval(&backend.platform),
     )
+}
+
+fn signalled_sync_fd_export_probe(vk: &crate::kms::vk::device::VkContext) -> String {
+    use std::os::fd::{FromRawFd as _, OwnedFd};
+
+    let ext = match vk.semaphore_fd_ext() {
+        Ok(ext) => ext,
+        Err(error) => return format!("Err({error:?})"),
+    };
+    let mut export_info = ash::vk::ExportSemaphoreCreateInfo::default()
+        .handle_types(ash::vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+    let create_info = ash::vk::SemaphoreCreateInfo::default().push_next(&mut export_info);
+    // SAFETY: the device is held by the fixture's live VkContext.
+    let semaphore = match unsafe { vk.device.create_semaphore(&create_info, None) } {
+        Ok(semaphore) => semaphore,
+        Err(error) => return format!("Err(create_semaphore: {error:?})"),
+    };
+
+    let signal_info = [ash::vk::SemaphoreSubmitInfo::default()
+        .semaphore(semaphore)
+        .stage_mask(ash::vk::PipelineStageFlags2::ALL_COMMANDS)];
+    let submit_info = ash::vk::SubmitInfo2::default().signal_semaphore_infos(&signal_info);
+    // SAFETY: the semaphore belongs to this device and is signalled once on
+    // its graphics queue, with no command buffers or waits.
+    if let Err(error) = unsafe {
+        vk.device
+            .queue_submit2(vk.graphics_queue, &[submit_info], ash::vk::Fence::null())
+    } {
+        // SAFETY: queue_submit2 failed, so no operation references the semaphore.
+        unsafe { vk.device.destroy_semaphore(semaphore, None) };
+        return format!("Err(queue_submit2: {error:?})");
+    }
+    // SAFETY: waiting the submitting queue idle retires the signal operation.
+    if let Err(error) = unsafe { vk.device.queue_wait_idle(vk.graphics_queue) } {
+        // SAFETY: queue_wait_idle failed, so the probe cannot safely export it.
+        unsafe { vk.device.destroy_semaphore(semaphore, None) };
+        return format!("Err(queue_wait_idle: {error:?})");
+    }
+
+    let export_info = ash::vk::SemaphoreGetFdInfoKHR::default()
+        .semaphore(semaphore)
+        .handle_type(ash::vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+    // SAFETY: extension availability was checked above and the semaphore was
+    // created with SYNC_FD export capability and has a signalled payload.
+    let export_result = unsafe { ext.get_semaphore_fd(&export_info) };
+    // SAFETY: the queue is idle and export has returned, so no operation uses it.
+    unsafe { vk.device.destroy_semaphore(semaphore, None) };
+
+    match export_result {
+        Ok(-1) => "Ok(-1)".to_owned(),
+        Ok(fd) if fd >= 0 => {
+            // SAFETY: successful Vulkan fd export transfers this descriptor to us.
+            drop(unsafe { OwnedFd::from_raw_fd(fd) });
+            "Ok(fd>=0)".to_owned()
+        }
+        Ok(fd) => format!("Ok({fd})"),
+        Err(error) => format!("Err({error:?})"),
+    }
 }
 
 fn assert_tearing_off(backend: &KmsBackend) {
@@ -864,7 +958,11 @@ fn retire_registered_cursor_in_dead_zone(
         (850.0, 450.0)
     );
     damage_root_and_composite(backend);
-    assert!(backend.scene.has_pending_page_flips());
+    assert!(
+        backend.scene.has_pending_page_flips(),
+        "expected a pending scene page flip: {}",
+        tearing_composite_diagnostics(backend, None),
+    );
     retire_composed_frame(backend, state, 1);
     assert_eq!(
         backend.scene.cursor_mode(),
@@ -1092,7 +1190,11 @@ fn prepare_visible_hw_cursor(
 
     damage_root(backend);
     Backend::maybe_composite(backend).expect("compose visible hardware cursor");
-    assert!(backend.scene.has_pending_page_flips());
+    assert!(
+        backend.scene.has_pending_page_flips(),
+        "expected a pending scene page flip: {}",
+        tearing_composite_diagnostics(backend, None),
+    );
     retire_composed_frame(backend, state, 1);
     assert_eq!(
         backend.scene.cursor_mode(),
@@ -1310,7 +1412,11 @@ fn entry_waits_for_queued_show_on_retire() {
     Backend::set_cursor_hidden(&mut backend, false);
     Backend::warp_pointer_root(&mut backend, &mut state, 100, 100);
     damage_root_and_composite(&mut backend);
-    assert!(backend.scene.has_pending_page_flips());
+    assert!(
+        backend.scene.has_pending_page_flips(),
+        "expected a pending scene page flip: {}",
+        tearing_composite_diagnostics(&backend, None),
+    );
     retire_composed_frame(&mut backend, &mut state, 1);
     assert_eq!(
         backend.scene.cursor_mode(),
@@ -1345,7 +1451,11 @@ fn entry_waits_for_queued_show_on_retire() {
 
     let (show_executor, hide_executor) = install_cursor_plane_with_successful_show(&mut backend);
     damage_root_and_composite(&mut backend);
-    assert!(backend.scene.has_pending_page_flips());
+    assert!(
+        backend.scene.has_pending_page_flips(),
+        "expected a pending scene page flip: {}",
+        tearing_composite_diagnostics(&backend, None),
+    );
     assert!(backend.scene.cursor_transition_pending());
     let pending_scene_commit = recorder.records().len() - 1;
     assert_eq!(
@@ -2046,7 +2156,11 @@ fn vt_release_exits_tearing_and_resume_needs_probation() {
     assert_commit_sequence(&recorder, &[AtomicCommitKind::Scene]);
     Backend::set_cursor_hidden(&mut backend, true);
     damage_root_and_composite(&mut backend);
-    assert!(backend.scene.has_pending_page_flips());
+    assert!(
+        backend.scene.has_pending_page_flips(),
+        "expected a pending scene page flip: {}",
+        tearing_composite_diagnostics(&backend, None),
+    );
     retire_composed_frame(&mut backend, &mut state, 2);
     assert_eq!(
         backend.scene.cursor_mode(),
@@ -2106,7 +2220,11 @@ fn vt_release_exits_tearing_and_resume_needs_probation() {
             assert_eq!(backend.pstate.tearing.probation, index as u8 + 1);
             assert_eq!(backend.pstate.scanout_m2.eligible_root_streak, index as u8 + 1);
             damage_root_and_composite(&mut backend);
-            assert!(backend.scene.has_pending_page_flips());
+            assert!(
+                backend.scene.has_pending_page_flips(),
+                "expected a pending scene page flip: {}",
+                tearing_composite_diagnostics(&backend, None),
+            );
             assert_eq!(recorder.records().len(), before_present + 1);
             assert_eq!(
                 recorder.records()[before_present].kind,
@@ -2868,6 +2986,7 @@ fn scene_backend_with_recording_pools_and_dead_zone(
     output_count: usize,
     dead_zone: bool,
 ) -> Result<KmsBackend, String> {
+    init_tearing_test_logger();
     let screen_width = match (output_count, dead_zone) {
         (2, true) => 1700,
         (2, false) => 1600,
@@ -3122,7 +3241,11 @@ fn composed_frame_submits_without_waiting_for_vblank_tick() {
     Backend::maybe_composite(&mut backend).expect("compose W Copy in one pass");
     assert_eq!(recorder.records().len(), 2);
     assert_eq!(recorder.records()[1].kind, AtomicCommitKind::Async);
-    assert!(backend.scene.has_pending_page_flips());
+    assert!(
+        backend.scene.has_pending_page_flips(),
+        "expected a pending scene page flip: {}",
+        tearing_composite_diagnostics(&backend, None),
+    );
     assert!(backend.pstate.tearing.is_on());
     assert!(!backend.platform.any_cursor_plane_visible());
     retire_composed_frame(&mut backend, &mut scene_state, 46);
@@ -3211,7 +3334,11 @@ fn show_cursor_during_held_direct_hidden_tearing_makes_cursor_visible() {
 
     damage_root(&mut backend);
     Backend::maybe_composite(&mut backend).expect("compose visible software cursor");
-    assert!(backend.scene.has_pending_page_flips());
+    assert!(
+        backend.scene.has_pending_page_flips(),
+        "expected a pending scene page flip: {}",
+        tearing_composite_diagnostics(&backend, None),
+    );
     assert!(!backend.platform.any_cursor_plane_visible());
     assert!(backend.pstate.tearing.is_on());
     retire_composed_frame(&mut backend, &mut state, 44);
@@ -3363,7 +3490,11 @@ fn entry_from_held_direct_with_visible_hw_cursor_runs_handoff() {
     assert_commit_sequence(&recorder, &[AtomicCommitKind::Scene; 9]);
 
     Backend::maybe_composite(&mut backend).expect("compose software cursor after hide");
-    assert!(backend.scene.has_pending_page_flips());
+    assert!(
+        backend.scene.has_pending_page_flips(),
+        "expected a pending scene page flip: {}",
+        tearing_composite_diagnostics(&backend, None),
+    );
     assert!(!backend.scene.cursor_transition_pending());
     assert_eq!(
         recorder.records().last().unwrap().kind,
@@ -3567,7 +3698,11 @@ fn handoff_keeps_newest_copy_not_retained_direct_frame() {
         peer = next_peer;
         sequence = next_sequence;
         Backend::maybe_composite(&mut backend).expect("compose F0 fallback Copy");
-        assert!(backend.scene.has_pending_page_flips());
+        assert!(
+            backend.scene.has_pending_page_flips(),
+            "expected a pending scene page flip: {}",
+            tearing_composite_diagnostics(&backend, None),
+        );
         retire_composed_frame(&mut backend, &mut state, frame_id);
         frame_id += 1;
     }
@@ -3764,7 +3899,11 @@ fn dead_zone_motion_during_tearing_requests_cursor_handoff() {
     );
 
     Backend::maybe_composite(&mut backend).expect("draw cursor after dead-zone handoff");
-    assert!(backend.scene.has_pending_page_flips());
+    assert!(
+        backend.scene.has_pending_page_flips(),
+        "expected a pending scene page flip: {}",
+        tearing_composite_diagnostics(&backend, None),
+    );
     assert_eq!(
         recorder.records().last().unwrap().kind,
         AtomicCommitKind::Async
@@ -4288,7 +4427,11 @@ fn copies_keep_copy_completion_with_composed_async() {
     assert_eq!(recorder.records().len(), 1);
     assert_eq!(recorder.records()[0].kind, AtomicCommitKind::Async);
     assert!(backend.pstate.tearing.is_on());
-    assert!(backend.scene.has_pending_page_flips());
+    assert!(
+        backend.scene.has_pending_page_flips(),
+        "expected a pending scene page flip: {}",
+        tearing_composite_diagnostics(&backend, None),
+    );
 
     // Replace the real batch ticket with a controllable unsignalled test
     // ticket so readiness can be asserted without blocking lavapipe's queue.
@@ -4367,7 +4510,11 @@ fn copies_keep_copy_completion_with_composed_async() {
         backend.pending_present_batches.len(),
         pending_batches_before_copy + 1
     );
-    assert!(backend.scene.has_pending_page_flips());
+    assert!(
+        backend.scene.has_pending_page_flips(),
+        "expected a pending scene page flip: {}",
+        tearing_composite_diagnostics(&backend, None),
+    );
 
     // Retire the older composed frame, then let exactly one pass submit the
     // scene frame for the Copy damage. Copy completion remains gated by its
@@ -4381,7 +4528,11 @@ fn copies_keep_copy_completion_with_composed_async() {
     Backend::maybe_composite(&mut backend).expect("submit composed frame for Copy damage");
     assert_eq!(recorder.records().len(), 2);
     assert_eq!(recorder.records()[1].kind, AtomicCommitKind::Async);
-    assert!(backend.scene.has_pending_page_flips());
+    assert!(
+        backend.scene.has_pending_page_flips(),
+        "expected a pending scene page flip: {}",
+        tearing_composite_diagnostics(&backend, None),
+    );
     assert!(
         Backend::drain_completed_present_events(&mut backend).is_empty(),
         "scene flip submission must not complete an unready Copy"
@@ -4420,7 +4571,11 @@ fn copies_keep_copy_completion_with_composed_async() {
         peer = next_peer;
         sequence = next_sequence;
         observed.extend(completions);
-        assert!(backend.scene.has_pending_page_flips());
+        assert!(
+            backend.scene.has_pending_page_flips(),
+            "expected a pending scene page flip: {}",
+            tearing_composite_diagnostics(&backend, None),
+        );
         assert_eq!(recorder.records().len(), 2);
         assert_eq!(
             observed.last().expect("GPU-ready Copy notification").mode,
@@ -4442,7 +4597,11 @@ fn copies_keep_copy_completion_with_composed_async() {
     );
     assert_eq!(observed.len(), 2);
     assert!(backend.pending_present_batches.is_empty());
-    assert!(backend.scene.has_pending_page_flips());
+    assert!(
+        backend.scene.has_pending_page_flips(),
+        "expected a pending scene page flip: {}",
+        tearing_composite_diagnostics(&backend, None),
+    );
     assert!(backend.pstate.tearing.is_on());
 
     retire_composed_frame(&mut backend, &mut state, 67);
@@ -5567,7 +5726,11 @@ fn transparent_cursor_is_hidden_for_direct_scanout_and_define_cursor_handoff() {
     assert!(!backend.cursor_hidden, "the cursor is not XFIXES-hidden");
     assert!(backend.effective_cursor_hidden());
     damage_root_and_composite(&mut backend);
-    assert!(backend.scene.has_pending_page_flips());
+    assert!(
+        backend.scene.has_pending_page_flips(),
+        "expected a pending scene page flip: {}",
+        tearing_composite_diagnostics(&backend, None),
+    );
     retire_composed_frame(&mut backend, &mut state, 51);
     assert_eq!(
         backend.scene.cursor_mode(),
@@ -5658,7 +5821,11 @@ fn transparent_cursor_is_hidden_for_direct_scanout_and_define_cursor_handoff() {
     assert!(!backend.pstate.scanout_m2.unflip_requested);
     damage_root(&mut backend);
     Backend::maybe_composite(&mut backend).expect("compose visible one-pixel cursor");
-    assert!(backend.scene.has_pending_page_flips());
+    assert!(
+        backend.scene.has_pending_page_flips(),
+        "expected a pending scene page flip: {}",
+        tearing_composite_diagnostics(&backend, None),
+    );
     retire_composed_frame(&mut backend, &mut state, 53);
     assert_eq!(
         backend.scene.cursor_mode(),
@@ -5685,7 +5852,11 @@ fn transparent_cursor_is_hidden_for_direct_scanout_and_define_cursor_handoff() {
         .expect("define transparent RENDER cursor");
     assert!(backend.effective_cursor_hidden());
     Backend::maybe_composite(&mut backend).expect("compose hidden RENDER cursor");
-    assert!(backend.scene.has_pending_page_flips());
+    assert!(
+        backend.scene.has_pending_page_flips(),
+        "expected a pending scene page flip: {}",
+        tearing_composite_diagnostics(&backend, None),
+    );
     retire_composed_frame(&mut backend, &mut state, 54);
     assert_eq!(
         backend.scene.cursor_mode(),
