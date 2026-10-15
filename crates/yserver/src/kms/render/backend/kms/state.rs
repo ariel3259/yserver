@@ -343,13 +343,24 @@ pub(in crate::kms::render::backend) enum TearingState {
         window: u32,
         host_window: u32,
         crtc_epoch: u64,
+        admission: TearingAdmissionContext,
     },
+}
+
+/// Facts from the last Present admitted to tearing. Scene-only passes reuse
+/// this candidate and target to revalidate ownership against the live tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::kms::render::backend) struct TearingAdmissionContext {
+    pub(in crate::kms::render::backend) candidate: PresentScanoutCandidate,
+    pub(in crate::kms::render::backend) target: ScanoutM0Target,
+    pub(in crate::kms::render::backend) root_host_xid: u32,
 }
 
 pub(in crate::kms::render::backend) struct Tearing {
     pub(in crate::kms::render::backend) state: TearingState,
     pub(in crate::kms::render::backend) probation: u8,
     pub(in crate::kms::render::backend) probation_owner: Option<u32>,
+    pub(in crate::kms::render::backend) hide_failed_logged: bool,
 }
 
 impl Tearing {
@@ -358,6 +369,7 @@ impl Tearing {
             state: TearingState::Off,
             probation: 0,
             probation_owner: None,
+            hide_failed_logged: false,
         }
     }
 

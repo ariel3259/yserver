@@ -48,6 +48,18 @@ pub trait Platform: OutputSink + Sized + 'static {
     fn tearing_active(_b: &XBackend<Self>) -> bool {
         false
     }
+    /// Whether the effective cursor sprite overlaps any live output.
+    fn cursor_intersects_outputs(
+        _b: &XBackend<Self>,
+        _cursor_x: i64,
+        _cursor_y: i64,
+        _hot_x: i64,
+        _hot_y: i64,
+        _width: i64,
+        _height: i64,
+    ) -> bool {
+        false
+    }
     /// Leave tearing when a portable window lifecycle change affects its owner.
     fn exit_tearing_for_window(_b: &mut XBackend<Self>, _host_xid: u32, _reason: &'static str) {}
     /// Leave direct scanout for the composed scene.

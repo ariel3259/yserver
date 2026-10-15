@@ -1064,6 +1064,12 @@ impl KmsBackend {
             .remove(&output_idx)
         {
             let degraded = self.pstate.scanout_m2.degraded_composed_unflip;
+            let cursor_handoff = !degraded
+                && self.pstate.scanout_m2.unflip_reason == Some("tearing_cursor_handoff");
+            if cursor_handoff {
+                self.scene
+                    .retire_external_cursor_handoff(output_idx, &mut self.platform);
+            }
             if self.pstate.scanout_m2.unflip_awaiting_outputs.is_empty() {
                 self.stop_direct_after_scanout_replaced(if degraded {
                     "degraded composed unflip"
@@ -2108,6 +2114,43 @@ impl KmsBackend {
         }
     }
 
+    fn prepare_tearing_scene_pass(&mut self) {
+        if std::mem::take(&mut self.platform.scene_cursor_hide_failed)
+            && self.pstate.tearing.is_on()
+            && !self.pstate.tearing.hide_failed_logged
+            && self.platform.any_cursor_plane_visible()
+        {
+            log::warn!("kms: tearing cursor-plane hide failed; keeping composed flips on vsync");
+            self.pstate.tearing.hide_failed_logged = true;
+        }
+
+        if !self.pstate.tearing.is_on() {
+            return;
+        }
+        if !self.tearing_scene_still_owned() {
+            self.exit_tearing("eligibility_lost");
+            return;
+        }
+        if self.tearing_cursor_wants_visible() && self.pstate.scanout_m2.active() {
+            self.request_direct_unflip("tearing_cursor_handoff");
+        }
+        if self.platform.any_cursor_plane_visible() {
+            return;
+        }
+        for output_idx in 0..self.platform.outputs.len() {
+            let Some(shape) = self.platform.scene_async_shape(output_idx) else {
+                continue;
+            };
+            let stream = crate::drm::async_flip::AsyncStream::Composed(
+                self.platform.outputs[output_idx].output.crtc,
+            );
+            if self.platform.async_ledger.allows(stream, &shape) {
+                self.platform
+                    .set_scene_flip_timing(output_idx, crate::drm::async_flip::FlipTiming::Async);
+            }
+        }
+    }
+
     pub(in crate::kms::render::backend) fn backend_scanout_next_wakeup(
         &self,
     ) -> Option<std::time::Instant> {
@@ -2159,6 +2202,10 @@ impl KmsBackend {
     pub(in crate::kms::render::backend) fn backend_scanout_maybe_composite(
         &mut self,
     ) -> io::Result<()> {
+        for output_idx in 0..self.platform.outputs.len() {
+            self.platform
+                .set_scene_flip_timing(output_idx, crate::drm::async_flip::FlipTiming::Vsync);
+        }
         // GPU-reset recovery: once the renderer has observed a lost
         // device (a submit returned `ERROR_DEVICE_LOST` → `abort_flush`
         // latched `renderer_failed`), every subsequent tick used to
@@ -2223,6 +2270,9 @@ impl KmsBackend {
         // Animated-cursor frame advance — after both gates above so
         // DPMS-off / VT-away never uploads (spec "DPMS / VT gating").
         self.tick_cursor_animation();
+        // Check visibility and current scene ownership before the held-direct
+        // return below. Pointer motion from a dead zone wakes this pass.
+        self.prepare_tearing_scene_pass();
         // Arbitration step 1: a direct successor retained behind a cursor-only
         // commit gets the first opportunity once all of its CRTCs are clear.
         // The helper leaves it in the slot while any CRTC is still blocked.

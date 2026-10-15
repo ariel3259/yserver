@@ -734,6 +734,8 @@ impl PlatformBackend {
             async_ledger: crate::drm::async_flip::AsyncFlipLedger::default(),
             async_outcomes: HashMap::new(),
             requested_flip_timing: crate::drm::async_flip::FlipTiming::Vsync,
+            scene_flip_timings: Vec::new(),
+            scene_cursor_hide_failed: false,
             input_ctx,
             #[cfg(target_os = "linux")]
             hotplug_monitor,
@@ -866,6 +868,8 @@ impl PlatformBackend {
             async_ledger: crate::drm::async_flip::AsyncFlipLedger::default(),
             async_outcomes: HashMap::new(),
             requested_flip_timing: crate::drm::async_flip::FlipTiming::Vsync,
+            scene_flip_timings: Vec::new(),
+            scene_cursor_hide_failed: false,
             input_ctx: None,
             #[cfg(target_os = "linux")]
             hotplug_monitor,

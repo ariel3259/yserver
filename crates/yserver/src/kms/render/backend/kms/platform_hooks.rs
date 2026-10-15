@@ -53,6 +53,25 @@ impl Platform for PlatformBackend {
         b.pstate.tearing.is_on()
     }
 
+    fn cursor_intersects_outputs(
+        b: &KmsBackend,
+        cursor_x: i64,
+        cursor_y: i64,
+        hot_x: i64,
+        hot_y: i64,
+        width: i64,
+        height: i64,
+    ) -> bool {
+        b.platform.outputs.iter().any(|output| {
+            let dx = cursor_x - hot_x - i64::from(output.x);
+            let dy = cursor_y - hot_y - i64::from(output.y);
+            dx < i64::from(output.width)
+                && dx + width > 0
+                && dy < i64::from(output.height)
+                && dy + height > 0
+        })
+    }
+
     fn exit_tearing_for_window(b: &mut KmsBackend, host_xid: u32, reason: &'static str) {
         b.exit_tearing_for_window(host_xid, reason);
     }

@@ -452,6 +452,29 @@ impl<P: Platform> XBackend<P> {
         }
     }
 
+    /// Whether the currently-effective sprite should be visible in the live
+    /// output layout, regardless of the scene's retired HW/SW classification.
+    pub(in crate::kms::render::backend) fn tearing_cursor_wants_visible(&self) -> bool {
+        if self.cursor_hidden {
+            return false;
+        }
+        let Some(record) = self
+            .effective_cursor_xid
+            .and_then(|xid| self.cursor_records.get(&xid))
+        else {
+            return false;
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let cursor_x = self.core.cursor_x as i64;
+        #[allow(clippy::cast_possible_truncation)]
+        let cursor_y = self.core.cursor_y as i64;
+        let width = i64::from(record.width);
+        let height = i64::from(record.height);
+        let hot_x = i64::from(record.hot_x);
+        let hot_y = i64::from(record.hot_y);
+        P::cursor_intersects_outputs(self, cursor_x, cursor_y, hot_x, hot_y, width, height)
+    }
+
     /// XFIXES `HideCursor` / `ShowCursor` edge. Hiding drops the scene's
     /// cursor entry (the scene then assigns `Hidden` on every output, which
     /// detaches a bound HW plane on the next retire) and, while a direct
@@ -472,6 +495,12 @@ impl<P: Platform> XBackend<P> {
             return;
         };
         self.display_cursor_by_handle(xid);
+        if P::tearing_active(self) {
+            if self.tearing_cursor_wants_visible() && P::direct_scanout_owns_frame(self) {
+                P::request_direct_unflip(self, "tearing_cursor_handoff");
+            }
+            return;
+        }
         // Under direct scanout nothing composes, and the scene's cursor
         // mode may still read Hidden, so `display_cursor_by_handle` can
         // skip the plane. Rebind it directly.
