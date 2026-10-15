@@ -149,6 +149,7 @@ impl KmsBackend {
             tearing: Tearing::new(),
             direct_frame_submitter: KmsBackend::submit_direct_frame_live,
             vt_resume_executor: std::rc::Rc::new(DrmVtResumeExecutor),
+            monotonic_clock: std::rc::Rc::new(std::time::Instant::now),
             armed_vblank_targets: std::collections::HashMap::new(),
             absolute_vblank_targets: std::collections::HashMap::new(),
             crtc_queue_sequence_unsupported_devices: HashSet::new(),

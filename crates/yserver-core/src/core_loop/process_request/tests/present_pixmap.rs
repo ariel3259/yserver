@@ -294,6 +294,19 @@ fn run_core_present_requests_and_wait(
 ) -> Vec<u8> {
     use std::io::Read;
 
+    struct ShutdownOnDrop {
+        sender: crate::core_loop::CoreSender,
+        active: bool,
+    }
+
+    impl Drop for ShutdownOnDrop {
+        fn drop(&mut self) {
+            if self.active {
+                let _ = self.sender.send(crate::core_loop::Message::Shutdown);
+            }
+        }
+    }
+
     let (poll, sender, receiver) = crate::core_loop::channel().expect("core channel");
     let request_sender = sender.bind();
     for (sequence, header, body) in requests {
@@ -325,14 +338,20 @@ fn run_core_present_requests_and_wait(
                 None,
             )
         });
+        let mut shutdown = ShutdownOnDrop {
+            sender: sender.clone_handle(),
+            active: true,
+        };
 
         let mut reply = [0; 32];
         peer.read_exact(&mut reply)
             .expect("GetInputFocus response proves request processing completed");
         assert_eq!(reply[0], 1, "GetInputFocus reply");
-        sender
+        shutdown
+            .sender
             .send(crate::core_loop::Message::Shutdown)
             .expect("stop run_core after its iteration tail");
+        shutdown.active = false;
         runner.join().expect("run_core thread panicked").unwrap();
     });
     read_all_available(peer)
@@ -346,6 +365,175 @@ fn assert_present_error(peer: &mut UnixStream, expected_code: u8, expected_value
         u32::from_le_bytes(error[4..8].try_into().unwrap()),
         expected_value
     );
+}
+
+#[test]
+fn future_synced_acquire_wait_is_superseded_without_blocking_successor_completion() {
+    use crate::backend::recording::RecordedCall;
+    use yserver_protocol::x11::{CreatePixmapRequest, CreateWindowRequest, present as x11present};
+
+    const CLIENT: u32 = 1;
+    const WINDOW: u32 = 0x00e0_0e01;
+    const WINDOW_HOST: u32 = 0x0040_0e01;
+    const OLDER_PIXMAP: u32 = 0x00e0_0e10;
+    const SUCCESSOR_PIXMAP: u32 = 0x00e0_0e11;
+    const OLDER_HOST: u32 = 0x0040_0e10;
+    const SUCCESSOR_HOST: u32 = 0x0040_0e11;
+    const ACQUIRE: u32 = 0x00e0_0e30;
+    const RELEASE: u32 = 0x00e0_0e31;
+    const WAIT_ID: u64 = 0x7200;
+    const PRESENT_EID: u32 = 0x0020_0e40;
+    const TARGET_MSC: u64 = 105;
+
+    // Mutation: restore the `!entry.source_ready` skip; the future fence
+    // waiter must be scrapped, while due fence waiters remain protected by
+    // `synced_async_present_acquire_waits_survive_the_next_frame_and_execute`.
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, CLIENT);
+    peer.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .expect("bound core round-trip waits");
+    let mut backend = RecordingBackend::new();
+    backend.present_ust_msc = (100, 0x1000);
+    backend.present_display_idle = false;
+    backend.present_absolute_vblank_arm_supported = false;
+    backend.present_scanout_blackout = false;
+    backend.present_syncobj_wait = crate::backend::PresentSourceWait::Deferred(WAIT_ID);
+    backend.seed_dri3_syncobj_for_test(ACQUIRE, ClientId(CLIENT));
+    backend.seed_dri3_syncobj_for_test(RELEASE, ClientId(CLIENT));
+    state.present_event_selections.insert(
+        PRESENT_EID,
+        crate::server::PresentEventSelection {
+            owner: ClientId(CLIENT),
+            window: ResourceId(WINDOW),
+            event_mask: x11present::EVENT_MASK_COMPLETE_NOTIFY,
+        },
+    );
+
+    state.resources.create_window(
+        ClientId(CLIENT),
+        CreateWindowRequest {
+            depth: 24,
+            window: ResourceId(WINDOW),
+            parent: ROOT_WINDOW,
+            width: 100,
+            height: 100,
+            class: 1,
+            visual: crate::resources::ROOT_VISUAL,
+            ..Default::default()
+        },
+    );
+    let _ = state.resources.map_window(ResourceId(WINDOW));
+    state
+        .resources
+        .window_mut(ResourceId(WINDOW))
+        .expect("destination window")
+        .host_xid = crate::backend::WindowHandle::from_raw(WINDOW_HOST);
+    for (pixmap, host_xid) in [
+        (OLDER_PIXMAP, OLDER_HOST),
+        (SUCCESSOR_PIXMAP, SUCCESSOR_HOST),
+    ] {
+        state.resources.create_pixmap(
+            ClientId(CLIENT),
+            CreatePixmapRequest {
+                depth: 24,
+                pixmap: ResourceId(pixmap),
+                drawable: ResourceId(WINDOW),
+                width: 100,
+                height: 100,
+            },
+        );
+        assert!(state.resources.set_pixmap_host_xid(
+            ResourceId(pixmap),
+            crate::backend::PixmapHandle::from_raw(host_xid).expect("valid test pixmap host xid"),
+        ));
+    }
+
+    let mut older = pixmap_synced_body(WINDOW, OLDER_PIXMAP, ACQUIRE, RELEASE, 1, 2);
+    older[8..12].copy_from_slice(&1_u32.to_le_bytes());
+    older[60..68].copy_from_slice(&TARGET_MSC.to_le_bytes());
+    let _ = run_core_present_request_and_wait(
+        &mut state,
+        &mut backend,
+        &mut peer,
+        1,
+        2,
+        x11present::PIXMAP_SYNCED,
+        &older,
+    );
+    assert!(
+        state
+            .present_pending_exec
+            .get(&1)
+            .is_some_and(|entry| !entry.source_ready && entry.wait_id == Some(WAIT_ID))
+    );
+
+    let mut successor = pixmap_body(WINDOW, SUCCESSOR_PIXMAP);
+    successor[8..12].copy_from_slice(&2_u32.to_le_bytes());
+    successor[44..52].copy_from_slice(&TARGET_MSC.to_le_bytes());
+    let _ = run_core_present_request_and_wait(
+        &mut state,
+        &mut backend,
+        &mut peer,
+        3,
+        4,
+        x11present::PIXMAP,
+        &successor,
+    );
+    assert!(state.present_pending_exec.contains_key(&2));
+    assert!(!state.present_pending_exec.contains_key(&1));
+    assert!(state.present_wait_to_id.is_empty());
+    assert_eq!(backend.finished_present_source_waits, vec![WAIT_ID]);
+    assert_eq!(backend.present_skip_count, 1);
+
+    // The successor was parked at MSC 105. Advancing the real run_core clock
+    // executes it while the older acquire point remains unsignalled.
+    backend.present_ust_msc = (TARGET_MSC, 0x2000);
+    let mut wire = run_core_present_wait_drain(&mut state, &mut backend, &mut peer, 5);
+    let successor_completion = backend
+        .enqueued_present_completions
+        .iter()
+        .find(|(event, _)| event.present_id == 2)
+        .expect("the executed successor enqueued its completion")
+        .0
+        .clone();
+    backend
+        .completed_present_events_to_drain
+        .push(successor_completion);
+    wire.extend(run_core_present_wait_drain(
+        &mut state,
+        &mut backend,
+        &mut peer,
+        6,
+    ));
+    let copied_sources: Vec<u32> = backend
+        .calls()
+        .iter()
+        .filter_map(|call| match call {
+            RecordedCall::CopyArea { src_host_xid, .. } => Some(*src_host_xid),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(copied_sources, vec![SUCCESSOR_HOST]);
+    assert_eq!(
+        complete_notify_modes(&wire),
+        vec![
+            x11present::COMPLETE_MODE_SKIP,
+            x11present::COMPLETE_MODE_COPY
+        ],
+        "the scrapped future waiter completes as Skip before its successor's Copy"
+    );
+    assert_eq!(
+        *backend.signalled_dri3_syncobjs.lock().unwrap(),
+        vec![(RELEASE, 2)],
+        "scrapping releases the older synced buffer through its release point"
+    );
+    assert_eq!(backend.finished_present_source_waits, vec![WAIT_ID]);
+    assert_eq!(backend.present_skip_count, 1);
+    assert!(state.present_pending_exec.is_empty());
+    assert!(state.present_wait_to_id.is_empty());
+    assert!(state.present_pending_complete.is_empty());
+    assert!(state.present_complete_gate.is_empty());
+    assert!(backend.ready_present_source_waits.is_empty());
 }
 
 #[test]
@@ -1778,6 +1966,8 @@ fn supersession_never_crosses_crtc_or_epoch_domains() {
     const PREDECESSOR: u64 = 800;
     let mut state = ServerState::new();
     let mut backend = RecordingBackend::new();
+    backend.present_crtc_clock_epoch_by_crtc.insert(11, 1);
+    backend.present_ust_msc_by_crtc.insert(11, (100, 1));
     let mut predecessor =
         present_pending_entry_with(PREDECESSOR, WINDOW, 0x0040_1502, Some(500), true);
     predecessor.pending.crtc_id = 11;

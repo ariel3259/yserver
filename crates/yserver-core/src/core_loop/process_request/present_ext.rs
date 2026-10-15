@@ -288,21 +288,25 @@ fn complete_pending_present_as_skip(
 /// succeeded (arm-before-scrap: see the comment at each call site) —
 /// scrap happens at arrival regardless of whether the successor's own
 /// source was ready or deferred, and regardless of its own park/execute
-/// msc-due classification. A victim must already be source-ready, which
-/// means it was parked only for a future MSC; entries with an armed source
-/// or acquire wait remain until that wait signals.
+/// msc-due classification.
 ///
 /// Gated on the successor having a known effective target. A successor
 /// with `effective_target_msc = None` never scraps because target
-/// equivalence is not known. Victims are source-ready entries in
+/// equivalence is not known. Victims are covered entries in
 /// `present_pending_exec` for the same window, CRTC domain, and effective
-/// target whose coverage (`present_supersession_covers`) passes.
-/// `source_ready: true` is set only when a source-ready Present is parked
-/// by the MSC classifier (at `arrival_execute_or_park_present_pixmap`
-/// below or when a source wait resolves in `drain_ready_present_pixmaps`).
-/// The two deferred request producers at the Pixmap and PixmapSynced
-/// handlers insert `source_ready: false, wait_id: Some(_)`; those entries
-/// are still waiting for their source/acquire fence and must not be scrapped.
+/// target. Their target is classified at successor arrival with the same
+/// general-clock/flip-in-flight classifier used by
+/// `arrival_execute_or_park_present_pixmap`: `Park` victims are scrapped
+/// whether waiting for MSC or their producer, while `ExecuteNow` victims
+/// waiting for a source/acquire fence remain until that fence signals.
+///
+/// `source_ready` records producer readiness, independently of MSC
+/// parking. The ready `Pixmap` and `PixmapSynced` arrival paths insert
+/// `source_ready: true, wait_id: None` only when the MSC classifier parks
+/// them; the deferred source-pixmap and acquire-syncobj paths insert
+/// `source_ready: false, wait_id: Some(_)`. When either wait resolves,
+/// `drain_ready_present_pixmaps` runs the same MSC classifier before it
+/// executes or parks the request.
 pub(super) fn supersede_covered_pending_presents(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -312,10 +316,11 @@ pub(super) fn supersede_covered_pending_presents(
         return;
     };
     let window = successor.request.window();
-
+    let (successor_msc_due, _, _) =
+        classify_present_pixmap_msc_due_at_arrival(state, backend, successor);
     let mut victim_ids: Vec<u64> = Vec::new();
     for (&pid, entry) in &state.present_pending_exec {
-        if !entry.source_ready
+        if successor_msc_due != crate::present_scheduler::MscDue::Park
             || entry.pending.request.window() != window
             || entry.pending.crtc_id != successor.crtc_id
             || entry.pending.crtc_epoch != successor.crtc_epoch
@@ -1280,22 +1285,8 @@ pub(super) fn arrival_execute_or_park_present_pixmap(
     present_id: u64,
     pending: PendingPresentPixmap,
 ) {
-    let epoch_current = backend.present_crtc_clock_epoch(pending.crtc_id) == pending.crtc_epoch;
-    let clock_msc = if epoch_current {
-        refresh_present_crtc_general_clock(state, backend, pending.crtc_id, pending.crtc_epoch).msc
-    } else {
-        cached_present_crtc_clock(state, pending.crtc_id, pending.crtc_epoch).msc
-    };
-    let flip_in_flight = epoch_current && backend.present_flip_in_flight(pending.crtc_id);
-    let due = if epoch_current {
-        crate::present_scheduler::classify_msc_due(
-            pending.effective_target_msc,
-            clock_msc,
-            flip_in_flight,
-        )
-    } else {
-        crate::present_scheduler::MscDue::ExecuteNow
-    };
+    let (due, clock_msc, flip_in_flight) =
+        classify_present_pixmap_msc_due_at_arrival(state, backend, &pending);
     match due {
         crate::present_scheduler::MscDue::ExecuteNow => {
             let stage = match &pending.request {
@@ -1333,6 +1324,34 @@ pub(super) fn arrival_execute_or_park_present_pixmap(
             );
         }
     }
+}
+
+/// Shared arrival-time MSC classification for both the actual ready-source
+/// path and supersession's decision about whether a fence waiter is parked
+/// for a future target. Keep the general clock, epoch fallback, and in-flight
+/// flip handling in one place so those decisions cannot drift apart.
+fn classify_present_pixmap_msc_due_at_arrival(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    pending: &PendingPresentPixmap,
+) -> (crate::present_scheduler::MscDue, u64, bool) {
+    let epoch_current = backend.present_crtc_clock_epoch(pending.crtc_id) == pending.crtc_epoch;
+    let clock_msc = if epoch_current {
+        refresh_present_crtc_general_clock(state, backend, pending.crtc_id, pending.crtc_epoch).msc
+    } else {
+        cached_present_crtc_clock(state, pending.crtc_id, pending.crtc_epoch).msc
+    };
+    let flip_in_flight = epoch_current && backend.present_flip_in_flight(pending.crtc_id);
+    let due = if epoch_current {
+        crate::present_scheduler::classify_msc_due(
+            pending.effective_target_msc,
+            clock_msc,
+            flip_in_flight,
+        )
+    } else {
+        crate::present_scheduler::MscDue::ExecuteNow
+    };
+    (due, clock_msc, flip_in_flight)
 }
 
 pub(crate) fn drain_ready_present_pixmaps(state: &mut ServerState, backend: &mut dyn Backend) {

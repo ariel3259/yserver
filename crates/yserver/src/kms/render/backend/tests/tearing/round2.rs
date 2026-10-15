@@ -1,10 +1,32 @@
 use super::*;
 use std::time::Duration;
 
+fn install_controlled_scheduler_clock(
+    backend: &mut crate::kms::render::backend::KmsBackend,
+) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+    use std::{rc::Rc, sync::atomic::Ordering, time::Instant};
+
+    let base = Instant::now();
+    let elapsed_ns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let clock_elapsed_ns = std::sync::Arc::clone(&elapsed_ns);
+    backend.for_tests_set_monotonic_clock(Rc::new(move || {
+        base + Duration::from_nanos(clock_elapsed_ns.load(Ordering::SeqCst))
+    }));
+    elapsed_ns
+}
+
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: let generic request mark_dirty calls force ordinary scene wakes while tearing.
 fn task6_present_and_xtest_motion_keep_cursor_compose_cap_under_run_core_load() {
+    // Exercise eager flip delivery and the reviewer's delayed-until-input-end ordering.
+    run_task6_present_and_xtest_motion_keep_cursor_compose_cap_under_run_core_load(false);
+    run_task6_present_and_xtest_motion_keep_cursor_compose_cap_under_run_core_load(true);
+}
+
+fn run_task6_present_and_xtest_motion_keep_cursor_compose_cap_under_run_core_load(
+    delay_fake_flip_delivery_until_input_end: bool,
+) {
     use std::{
         collections::VecDeque,
         io::{self, Read},
@@ -20,8 +42,8 @@ fn task6_present_and_xtest_motion_keep_cursor_compose_cap_under_run_core_load() 
     use yserver_core::{
         backend::Backend,
         core_loop::{
-            Message, ResetPolicy, auth::AuthState, channel, poll_tokens::ClientIdAllocator,
-            run_core,
+            CoreSender, Message, ResetPolicy, auth::AuthState, channel,
+            poll_tokens::ClientIdAllocator, run_core,
         },
         server::{BackendCapabilities, ServerState},
     };
@@ -36,10 +58,77 @@ fn task6_present_and_xtest_motion_keep_cursor_compose_cap_under_run_core_load() 
     type SharedFlips =
         Arc<Mutex<VecDeque<crate::kms::render::platform::flip_events::KernelPageFlip>>>;
 
+    #[derive(Default)]
+    struct CommitProgress {
+        kinds: Vec<AtomicCommitKind>,
+        drained: usize,
+    }
+
+    struct SharedCommitRecorder {
+        progress: Mutex<CommitProgress>,
+        changed: Condvar,
+    }
+
+    struct ProducerShutdownOnDrop {
+        sender: CoreSender,
+        reader_stop: Arc<AtomicBool>,
+        active: bool,
+    }
+
+    impl ProducerShutdownOnDrop {
+        fn shutdown(&mut self) {
+            self.reader_stop.store(true, Ordering::SeqCst);
+            let _ = self.sender.send(Message::Shutdown);
+            self.active = false;
+        }
+    }
+
+    impl Drop for ProducerShutdownOnDrop {
+        fn drop(&mut self) {
+            if self.active {
+                self.reader_stop.store(true, Ordering::SeqCst);
+                let _ = self.sender.send(Message::Shutdown);
+            }
+        }
+    }
+
+    fn wait_for_commit_progress<'a>(
+        commits: &'a SharedCommitRecorder,
+        deadline: Instant,
+        description: &str,
+        predicate: impl Fn(&CommitProgress) -> bool,
+    ) -> std::sync::MutexGuard<'a, CommitProgress> {
+        let mut progress = commits.progress.lock().expect("commit progress");
+        while !predicate(&progress) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                let accepted = progress.kinds.len();
+                let drained = progress.drained;
+                drop(progress);
+                panic!(
+                    "timed out waiting for {description}: accepted={accepted} drained={drained}"
+                );
+            }
+            let (next, timeout) = commits
+                .changed
+                .wait_timeout(progress, remaining)
+                .expect("commit progress wait");
+            progress = next;
+            if timeout.timed_out() && !predicate(&progress) {
+                let accepted = progress.kinds.len();
+                let drained = progress.drained;
+                drop(progress);
+                panic!(
+                    "timed out waiting for {description}: accepted={accepted} drained={drained}"
+                );
+            }
+        }
+        progress
+    }
+
     struct RunCoreFlipSource {
         flips: SharedFlips,
-        drained: Arc<AtomicUsize>,
-        drained_changed: Arc<Condvar>,
+        commits: Arc<SharedCommitRecorder>,
     }
 
     impl crate::kms::render::platform::flip_events::PageFlipEventSource for RunCoreFlipSource {
@@ -73,8 +162,9 @@ fn task6_present_and_xtest_motion_keep_cursor_compose_cap_under_run_core_load() 
             }
             let flips: Vec<_> = self.flips.lock().expect("flip queue").drain(..).collect();
             if !flips.is_empty() {
-                self.drained.fetch_add(flips.len(), Ordering::SeqCst);
-                self.drained_changed.notify_all();
+                let mut progress = self.commits.progress.lock().expect("commit progress");
+                progress.drained += flips.len();
+                self.commits.changed.notify_all();
             }
             Ok((flips, Vec::new()))
         }
@@ -95,11 +185,6 @@ fn task6_present_and_xtest_motion_keep_cursor_compose_cap_under_run_core_load() 
         }
     }
 
-    struct SharedCommitRecorder {
-        kinds: Mutex<Vec<AtomicCommitKind>>,
-        changed: Condvar,
-    }
-
     struct RunCoreCommitExecutor(Arc<SharedCommitRecorder>);
 
     impl crate::drm::atomic::AtomicCommitExecutor for RunCoreCommitExecutor {
@@ -111,7 +196,8 @@ fn task6_present_and_xtest_motion_keep_cursor_compose_cap_under_run_core_load() 
             _request: crate::drm::atomic::AtomicCommitRequest,
             _events: &[crate::drm::atomic::AtomicCommitEvent],
         ) -> io::Result<()> {
-            self.0.kinds.lock().expect("commit records").push(kind);
+            let mut progress = self.0.progress.lock().expect("commit progress");
+            progress.kinds.push(kind);
             self.0.changed.notify_all();
             Ok(())
         }
@@ -211,19 +297,18 @@ fn task6_present_and_xtest_motion_keep_cursor_compose_cap_under_run_core_load() 
     backend.platform.devices[0].device = Rc::new(device);
 
     let flips: SharedFlips = Arc::new(Mutex::new(VecDeque::new()));
-    let drained = Arc::new(AtomicUsize::new(0));
-    let drained_changed = Arc::new(Condvar::new());
+    let commits = Arc::new(SharedCommitRecorder {
+        progress: Mutex::new(CommitProgress::default()),
+        changed: Condvar::new(),
+    });
+    let allow_fake_flip_delivery =
+        Arc::new(AtomicBool::new(!delay_fake_flip_delivery_until_input_end));
     backend.platform.devices[0].page_flip_event_source = Rc::new(RunCoreFlipSource {
         flips: Arc::clone(&flips),
-        drained: Arc::clone(&drained),
-        drained_changed: Arc::clone(&drained_changed),
+        commits: Arc::clone(&commits),
     });
     backend.platform.devices[0].test_page_flip_event_source = None;
 
-    let commits = Arc::new(SharedCommitRecorder {
-        kinds: Mutex::new(Vec::new()),
-        changed: Condvar::new(),
-    });
     backend.platform.devices[0].atomic_commit_sink = Rc::new(AtomicCommitSink::new(Rc::new(
         RunCoreCommitExecutor(Arc::clone(&commits)),
     )));
@@ -232,11 +317,15 @@ fn task6_present_and_xtest_motion_keep_cursor_compose_cap_under_run_core_load() 
         .set_tearing_on(true);
     backend.pstate.tearing.last_cursor_compose = None;
     backend.pstate.tearing.deferred_cursor_wake = None;
+    let scheduler_time_ns = install_controlled_scheduler_clock(&mut backend);
     recorder.clear_records();
 
     let mpv_peer = install_test_core_client(&mut state);
     let _xtest_peer = install_test_core_client_as(&mut state, ClientId(2));
     let mut endstate_peer = install_test_core_client_as(&mut state, ClientId(3));
+    endstate_peer
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("bound core round-trip waits");
     state
         .clients
         .get_mut(&ClientId(1).0)
@@ -252,8 +341,10 @@ fn task6_present_and_xtest_motion_keep_cursor_compose_cap_under_run_core_load() 
     let reaction_sequence = Arc::clone(&client_sequence);
     let motion_notifications = Arc::new(AtomicUsize::new(0));
     let reactions = Arc::new(AtomicUsize::new(0));
+    let motion_progress = Arc::new((Mutex::new(0_usize), Condvar::new()));
     let reader_notifications = Arc::clone(&motion_notifications);
     let reader_reactions = Arc::clone(&reactions);
+    let reader_motion_progress = Arc::clone(&motion_progress);
     let reader_stop = Arc::new(AtomicBool::new(false));
     let reader_stop_thread = Arc::clone(&reader_stop);
     mpv_peer
@@ -283,6 +374,9 @@ fn task6_present_and_xtest_motion_keep_cursor_compose_cap_under_run_core_load() 
                     *sequence = (*sequence).wrapping_add(1);
                     reader_reactions.fetch_add(1, Ordering::SeqCst);
                     reader_notifications.fetch_add(1, Ordering::SeqCst);
+                    let (count, changed) = &*reader_motion_progress;
+                    *count.lock().expect("MotionNotify progress") += 1;
+                    changed.notify_all();
                 }
                 Ok(()) => {}
                 Err(error)
@@ -301,31 +395,80 @@ fn task6_present_and_xtest_motion_keep_cursor_compose_cap_under_run_core_load() 
         }
     });
 
-    let motion_duration = refresh_interval * 7;
     let producer_commits = Arc::clone(&commits);
-    let producer_drained = Arc::clone(&drained);
-    let producer_drained_changed = Arc::clone(&drained_changed);
     let expected_motion_notifications = Arc::clone(&motion_notifications);
+    let producer_motion_progress = Arc::clone(&motion_progress);
+    let producer_scheduler_time_ns = Arc::clone(&scheduler_time_ns);
+    let producer_allow_fake_flip_delivery = Arc::clone(&allow_fake_flip_delivery);
     let producer_reader_stop = Arc::clone(&reader_stop);
     let producer_client_sequence = Arc::clone(&client_sequence);
-    let run_started = Instant::now();
+    let motion_duration = refresh_interval * 7;
+    let motion_duration_ns = u64::try_from(motion_duration.as_nanos()).unwrap();
+    let refresh_interval_ns = u64::try_from(refresh_interval.as_nanos()).unwrap();
+    let refresh_windows = motion_duration
+        .as_nanos()
+        .div_ceil(refresh_interval.as_nanos())
+        .max(1);
     let producer = thread::spawn(move || {
+        let mut shutdown_on_drop = ProducerShutdownOnDrop {
+            sender: shutdown_sender,
+            reader_stop: Arc::clone(&producer_reader_stop),
+            active: true,
+        };
         let client_id = ClientId(1);
         let xtest_client_id = ClientId(2);
-        let started = Instant::now();
-        let end = started + motion_duration;
-        let present_interval = Duration::from_nanos(1_000_000_000 / 130);
-        let mut next_present = started;
+        let present_interval_ns = 1_000_000_000_u64 / 130;
+        let mut next_present_ns = 0_u64;
         let mut xtest_sequence = 1_u16;
+        let mut barrier_sequence = 1_u16;
         let mut sent_motion = 0_usize;
         let mut sent_presents = 0_usize;
-        while Instant::now() < end {
+        let mut final_pointer_position = (0_i32, 0_i32);
+        let mut core_barrier = |peer: &mut std::os::unix::net::UnixStream| {
+            request_sender
+                .send(Message::Request {
+                    id: ClientId(3),
+                    sequence: SequenceNumber(barrier_sequence),
+                    accepted_at: None,
+                    header: RequestHeader {
+                        opcode: 43, // GetInputFocus: a state-free run_core round-trip.
+                        data: 0,
+                        length_units: 1,
+                    },
+                    body: Vec::new(),
+                    attached_fd: None,
+                })
+                .expect("queue core round-trip barrier");
+            barrier_sequence = barrier_sequence.wrapping_add(1);
+            let mut reply = [0_u8; 32];
+            peer.read_exact(&mut reply)
+                .expect("read core round-trip barrier reply");
+            assert_eq!(reply[0], 1, "GetInputFocus barrier gets an X11 reply");
+        };
+        let wait_for_motion = |expected: usize| {
+            let (count, changed) = &*producer_motion_progress;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut count = count.lock().expect("MotionNotify progress");
+            while *count < expected {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                assert!(!remaining.is_zero(), "timed out waiting for MotionNotify");
+                let (next, timeout) = changed
+                    .wait_timeout(count, remaining)
+                    .expect("MotionNotify barrier wait");
+                count = next;
+                assert!(!timeout.timed_out() || *count >= expected);
+            }
+        };
+        let mut now_ns = 0_u64;
+        while now_ns < motion_duration_ns {
+            producer_scheduler_time_ns.store(now_ns, Ordering::SeqCst);
             let step = i16::try_from(sent_motion).expect("test pointer step fits");
             let x = 100 + step.rem_euclid(i16::try_from(screen_width - 100).unwrap());
             let y = 100
                 + step
                     .wrapping_mul(7)
                     .rem_euclid(i16::try_from(screen_height - 100).unwrap());
+            final_pointer_position = (i32::from(x), i32::from(y));
             let mut body = vec![0_u8; 32];
             body[0] = 6; // MotionNotify, as sent by xdotool through XTEST.
             body[20..22].copy_from_slice(&x.to_le_bytes());
@@ -343,12 +486,11 @@ fn task6_present_and_xtest_motion_keep_cursor_compose_cap_under_run_core_load() 
                     body,
                     attached_fd: None,
                 })
-                .expect("queue real XTEST FakeInput motion request");
+                .expect("queue XTEST FakeInput motion request");
             xtest_sequence = xtest_sequence.wrapping_add(1);
             sent_motion += 1;
 
-            let now = Instant::now();
-            if now >= next_present {
+            if now_ns >= next_present_ns {
                 let mut present_body = vec![0_u8; 68];
                 present_body[0..4].copy_from_slice(&WINDOW.0.to_le_bytes());
                 let pixmap = [PIXMAP, PIXMAP_ALTERNATE][sent_presents & 1];
@@ -372,71 +514,103 @@ fn task6_present_and_xtest_motion_keep_cursor_compose_cap_under_run_core_load() 
                         body: present_body,
                         attached_fd: None,
                     })
-                    .expect("queue real PresentPixmap request");
+                    .expect("queue PresentPixmap request");
                 *sequence = (*sequence).wrapping_add(1);
                 sent_presents += 1;
-                next_present += present_interval;
+                next_present_ns = next_present_ns.saturating_add(present_interval_ns);
             }
-            // Target ~333 Hz, within xdotool's hardware-run range and with
-            // enough margin for the loaded repetition requirement.
-            thread::sleep(Duration::from_millis(3));
+            // Each barrier makes run_core consume this virtual 3 ms step
+            // before the next one. The observed MotionNotify and its client
+            // reaction form the second barrier, so neither scheduling speed
+            // nor sleeps decide when the next virtual deadline is reached.
+            core_barrier(&mut endstate_peer);
+            wait_for_motion(sent_motion);
+            core_barrier(&mut endstate_peer);
+            now_ns = now_ns.saturating_add(3_000_000);
         }
-        let motion_elapsed = Instant::now().saturating_duration_since(started);
 
-        let motion_drain_deadline = Instant::now() + Duration::from_secs(2);
-        while expected_motion_notifications.load(Ordering::SeqCst) < sent_motion
-            && Instant::now() < motion_drain_deadline
-        {
-            thread::sleep(Duration::from_millis(2));
+        if delay_fake_flip_delivery_until_input_end {
+            producer_allow_fake_flip_delivery.store(true, Ordering::SeqCst);
+            let _progress = producer_commits.progress.lock().expect("commit progress");
+            producer_commits.changed.notify_all();
         }
+
         let observed_motion = expected_motion_notifications.load(Ordering::SeqCst);
 
-        // Keep the core running through the last cursor deadline, then retire
-        // every commit so the end-state checks see an empty transaction stream.
-        thread::sleep(refresh_interval * 2);
-        let drain_deadline = Instant::now() + Duration::from_secs(2);
+        // Drain work from the input stream and observe two unchanged commit
+        // snapshots before advancing the cursor deadline. These round-trips
+        // settle earlier iteration tails before the post-deadline quiescence
+        // barrier.
+        let settle_deadline = Instant::now() + Duration::from_secs(10);
+        let mut settled_commit_count = None;
         loop {
-            let accepted = producer_commits.kinds.lock().expect("commit records").len();
-            if producer_drained.load(Ordering::SeqCst) >= accepted {
+            assert!(
+                !settle_deadline
+                    .saturating_duration_since(Instant::now())
+                    .is_zero(),
+                "timed out settling pre-deadline fake flips"
+            );
+            core_barrier(&mut endstate_peer);
+            core_barrier(&mut endstate_peer);
+            let progress = wait_for_commit_progress(
+                &producer_commits,
+                settle_deadline,
+                "pre-deadline fake flip retirements",
+                |progress| progress.drained >= progress.kinds.len(),
+            );
+            let accepted = progress.kinds.len();
+            drop(progress);
+            if settled_commit_count == Some(accepted) {
                 break;
             }
-            if Instant::now() >= drain_deadline {
-                break;
-            }
-            let guard = producer_commits.kinds.lock().expect("commit records");
-            let (_guard, _) = producer_drained_changed
-                .wait_timeout(guard, Duration::from_millis(5))
-                .expect("flip drain wait");
+            settled_commit_count = Some(accepted);
         }
-        // A source drain increments `drained` before run_core retires the
-        // returned events. Round-trip through the real core after the last
-        // drain so shutdown cannot race the callback that clears scene flips.
-        request_sender
-            .send(Message::Request {
-                id: ClientId(3),
-                sequence: SequenceNumber(1),
-                accepted_at: None,
-                header: RequestHeader {
-                    opcode: 43, // GetInputFocus is a state-free core round-trip.
-                    data: 0,
-                    length_units: 1,
-                },
-                body: Vec::new(),
-                attached_fd: None,
-            })
-            .expect("queue end-state core round-trip");
-        let mut barrier_reply = [0_u8; 32];
-        endstate_peer
-            .read_exact(&mut barrier_reply)
-            .expect("read end-state core round-trip reply");
-        assert_eq!(barrier_reply[0], 1, "end-state barrier gets an X11 reply");
-        producer_reader_stop.store(true, Ordering::SeqCst);
-        let _ = shutdown_sender.send(Message::Shutdown);
-        (sent_motion, sent_presents, observed_motion, motion_elapsed)
+        // The delayed-flip variant releases its fake events only after the
+        // input stream ends. Advance past the cursor deadline, then wait for
+        // quiescence: every accepted commit's event is drained, and two
+        // unchanged run_core round-trips let the deadline wake and any work it
+        // creates settle. A settling Present may already include the final
+        // cursor position, so quiescence does not require another submission.
+        producer_scheduler_time_ns.store(
+            motion_duration_ns.saturating_add(refresh_interval_ns * 2),
+            Ordering::SeqCst,
+        );
+        let quiescence_deadline = Instant::now() + Duration::from_secs(10);
+        let mut stable_commit_count = None;
+        loop {
+            core_barrier(&mut endstate_peer);
+            core_barrier(&mut endstate_peer);
+            let progress = wait_for_commit_progress(
+                &producer_commits,
+                quiescence_deadline,
+                "post-deadline quiescence (all accepted fake flips drained)",
+                |progress| progress.drained == progress.kinds.len(),
+            );
+            let accepted = progress.kinds.len();
+            let drained = progress.drained;
+            drop(progress);
+            assert_eq!(
+                accepted, drained,
+                "every recorded commit's fake flip event is retired before Shutdown"
+            );
+            if stable_commit_count == Some(accepted) {
+                break;
+            }
+            stable_commit_count = Some(accepted);
+        }
+        shutdown_on_drop.shutdown();
+        (
+            sent_motion,
+            sent_presents,
+            observed_motion,
+            final_pointer_position,
+            motion_duration,
+        )
     });
 
     let event_flips = Arc::clone(&flips);
     let event_commits = Arc::clone(&commits);
+    let event_allow_fake_flip_delivery = Arc::clone(&allow_fake_flip_delivery);
     let event_peer = event_peer;
     let event_stop = Arc::new(AtomicBool::new(false));
     let event_stop_thread = Arc::clone(&event_stop);
@@ -446,20 +620,23 @@ fn task6_present_and_xtest_motion_keep_cursor_compose_cap_under_run_core_load() 
         let mut peer = event_peer;
         let mut sent_events = 0_usize;
         loop {
-            let mut kinds = event_commits.kinds.lock().expect("commit records");
-            while kinds.len() == sent_events && !event_stop_thread.load(Ordering::SeqCst) {
+            let mut progress = event_commits.progress.lock().expect("commit progress");
+            while (progress.kinds.len() == sent_events
+                || !event_allow_fake_flip_delivery.load(Ordering::SeqCst))
+                && !event_stop_thread.load(Ordering::SeqCst)
+            {
                 let (next, _) = event_commits
                     .changed
-                    .wait_timeout(kinds, Duration::from_millis(20))
+                    .wait_timeout(progress, Duration::from_millis(20))
                     .expect("commit notification wait");
-                kinds = next;
+                progress = next;
             }
-            if kinds.len() == sent_events && event_stop_thread.load(Ordering::SeqCst) {
+            if progress.kinds.len() == sent_events && event_stop_thread.load(Ordering::SeqCst) {
                 return;
             }
-            let newly_accepted = kinds.len() - sent_events;
-            sent_events = kinds.len();
-            drop(kinds);
+            let newly_accepted = progress.kinds.len() - sent_events;
+            sent_events = progress.kinds.len();
+            drop(progress);
             for index in 0..newly_accepted {
                 let frame = u32::try_from(sent_events - newly_accepted + index + 1)
                     .expect("test frame fits");
@@ -491,21 +668,23 @@ fn task6_present_and_xtest_motion_keep_cursor_compose_cap_under_run_core_load() 
         None,
     )
     .expect("run_core drives PresentPixmap, XTEST motion, MotionNotify and fake CRTC retirements");
-    let run_elapsed = run_started.elapsed();
-    let (sent_motion, sent_presents, observed_motion, motion_elapsed) =
-        producer.join().expect("mixed Present/motion producer");
+    let producer_result = producer.join();
     mpv_reader
         .join()
         .expect("MotionNotify client response thread");
-    event_stop.store(true, Ordering::SeqCst);
-    commits.changed.notify_all();
+    {
+        let _progress = commits.progress.lock().expect("commit progress");
+        event_stop.store(true, Ordering::SeqCst);
+        commits.changed.notify_all();
+    }
     event_thread.join().expect("fake DRM event producer");
+    let (sent_motion, sent_presents, observed_motion, final_pointer_position, motion_elapsed) =
+        producer_result.expect("mixed Present/motion producer");
 
-    let accepted_kinds = commits.kinds.lock().expect("commit records").clone();
-    let refresh_windows = run_elapsed
-        .as_nanos()
-        .div_ceil(refresh_interval.as_nanos())
-        .max(1);
+    let progress = commits.progress.lock().expect("commit progress");
+    let accepted_kinds = progress.kinds.clone();
+    let drained = progress.drained;
+    drop(progress);
     let build_calls = backend
         .telemetry
         .lifetime
@@ -546,7 +725,7 @@ fn task6_present_and_xtest_motion_keep_cursor_compose_cap_under_run_core_load() 
     );
     assert!(
         accepted_kinds.len() as u128 <= sent_presents as u128 + refresh_windows,
-        "{} async composed flips exceed {} client frames + {} refresh intervals over {run_elapsed:?}",
+        "{} async composed flips exceed {} client frames + {} virtual refresh intervals",
         accepted_kinds.len(),
         sent_presents,
         refresh_windows
@@ -556,11 +735,39 @@ fn task6_present_and_xtest_motion_keep_cursor_compose_cap_under_run_core_load() 
         "{build_calls} build_scene calls exceed {sent_presents} client frames + {refresh_windows} refresh intervals"
     );
     assert!(backend.pstate.tearing.is_on());
+    // With scene and cursor wakes clear and no flip pending below, the last
+    // committed software-cursor position is the core's final pointer position.
+    assert_eq!(
+        state.pointer_root,
+        (
+            i16::try_from(final_pointer_position.0).expect("final pointer x fits root coords"),
+            i16::try_from(final_pointer_position.1).expect("final pointer y fits root coords"),
+        ),
+        "run_core leaves the server pointer at the final XTEST motion"
+    );
+    assert_eq!(
+        (backend.core.cursor_x, backend.core.cursor_y),
+        (
+            final_pointer_position.0 as f32,
+            final_pointer_position.1 as f32,
+        ),
+        "quiescent scene cursor state matches the final pointer position"
+    );
     assert_eq!(backend.pstate.tearing.deferred_cursor_wake, None);
     assert!(!backend.scene.cursor_only_wake_pending());
     assert!(!backend.scene.scene_structure_dirty);
-    assert!(!backend.scene.has_pending_page_flips());
-    assert_eq!(drained.load(Ordering::SeqCst), accepted_kinds.len());
+    assert!(
+        !backend.scene.has_pending_page_flips(),
+        "pending flips after observable fake flip retirement: accepted={} drained={} queued={}",
+        accepted_kinds.len(),
+        drained,
+        flips.lock().expect("flip queue").len()
+    );
+    assert_eq!(drained, accepted_kinds.len());
+    assert!(
+        flips.lock().expect("flip queue").is_empty(),
+        "all accepted fake flip events are consumed before shutdown"
+    );
     assert!(backend.kms_outputs_active);
     assert!(backend.scanout_allowed());
 }
@@ -569,6 +776,7 @@ fn task6_present_and_xtest_motion_keep_cursor_compose_cap_under_run_core_load() 
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: ignore the active grouped cursor handoff when applying the compose interval cap.
 fn task5_handoff_unflip_starts_cursor_compose_interval() {
+    use std::sync::atomic::Ordering;
     use yserver_core::{backend::Backend, server::ServerState};
 
     const WINDOW: u32 = 0x7c58;
@@ -597,7 +805,9 @@ fn task5_handoff_unflip_starts_cursor_compose_interval() {
 
     // This pending timer is stale while the cursor is hidden on held direct scanout.
     // Keep the previous compose time absent so only the grouped unflip can start
-    // the interval used by the following visible cursor motion.
+    // the interval used by the following visible cursor motion. The injected
+    // monotonic clock keeps that pointer operation inside the interval under load.
+    let scheduler_time_ns = install_controlled_scheduler_clock(&mut backend);
     backend.pstate.tearing.last_cursor_compose = None;
     backend.pstate.tearing.deferred_cursor_wake =
         Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
@@ -617,6 +827,8 @@ fn task5_handoff_unflip_starts_cursor_compose_interval() {
         .expect("successful composed unflip starts the cursor interval");
     assert_eq!(backend.pstate.tearing.deferred_cursor_wake, None);
     let interval = backend.pstate.tearing.cursor_compose_interval(&backend.platform);
+    let interval_ns = u64::try_from(interval.as_nanos()).unwrap();
+    scheduler_time_ns.store(interval_ns / 2, Ordering::SeqCst);
     Backend::warp_pointer_root(&mut backend, &mut state, 121, 100);
     assert_eq!(
         backend.pstate.tearing.deferred_cursor_wake,
@@ -640,7 +852,7 @@ fn task5_handoff_unflip_starts_cursor_compose_interval() {
     );
 
     // Advance the scheduled timer through the production entry without sleeping.
-    backend.pstate.tearing.deferred_cursor_wake = Some(std::time::Instant::now());
+    scheduler_time_ns.store(interval_ns, Ordering::SeqCst);
     Backend::maybe_composite(&mut backend).expect("compose the deferred cursor motion");
     assert_eq!(recorder.records().len(), 2);
     assert_eq!(recorder.records()[1].kind, AtomicCommitKind::Async);

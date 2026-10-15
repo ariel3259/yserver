@@ -26,6 +26,14 @@ use yserver_core::{backend::Backend as _, server::ServerState};
 use crate::kms::render::backend::DirectFrameSubmitter;
 
 impl KmsBackend {
+    #[cfg(test)]
+    pub(crate) fn for_tests_set_monotonic_clock(
+        &mut self,
+        clock: Rc<dyn Fn() -> std::time::Instant>,
+    ) {
+        self.pstate.monotonic_clock = clock;
+    }
+
     /// Test-only entry point: drives the production `get_image` path
     /// but returns just the pixel bytes (header stripped). Acceptance
     /// tests use this so they can index into the result starting at
@@ -579,6 +587,7 @@ impl KmsBackend {
             vt_resume_executor: std::rc::Rc::new(
                 crate::kms::render::backend::kms::session::DrmVtResumeExecutor,
             ),
+            monotonic_clock: Rc::new(std::time::Instant::now),
             armed_vblank_targets: std::collections::HashMap::new(),
             absolute_vblank_targets: std::collections::HashMap::new(),
             crtc_queue_sequence_unsupported_devices: HashSet::new(),

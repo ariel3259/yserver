@@ -381,9 +381,12 @@ impl Tearing {
         self.probation_owner = None;
     }
 
-    pub(in crate::kms::render::backend) fn note_composed_submit(&mut self) {
+    pub(in crate::kms::render::backend) fn note_composed_submit(
+        &mut self,
+        now: std::time::Instant,
+    ) {
         if self.is_on() {
-            self.last_cursor_compose = Some(std::time::Instant::now());
+            self.last_cursor_compose = Some(now);
             self.deferred_cursor_wake = None;
         }
     }
@@ -828,6 +831,9 @@ pub struct KmsBackendState {
     pub(in crate::kms::render::backend) scanout_m1: ScanoutM1ProbeCache,
     pub(in crate::kms::render::backend) scanout_m2: ScanoutM2State,
     pub(in crate::kms::render::backend) tearing: Tearing,
+    /// Monotonic clock for KMS cursor-composition pacing.
+    pub(in crate::kms::render::backend) monotonic_clock:
+        std::rc::Rc<dyn Fn() -> std::time::Instant>,
     pub(in crate::kms::render::backend) direct_frame_submitter: DirectFrameSubmitter,
     pub(in crate::kms::render::backend) vt_resume_executor:
         std::rc::Rc<dyn super::session::VtResumeExecutor>,

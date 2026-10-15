@@ -260,6 +260,10 @@ pub(in crate::kms::render::backend) fn scanout_m1_outputs_cover_root(
 }
 
 impl KmsBackend {
+    pub(super) fn monotonic_now(&self) -> std::time::Instant {
+        (self.pstate.monotonic_clock)()
+    }
+
     /// The direct scanout cursor gate depends on KMS plane visibility, so it
     /// stays with the KMS implementation while cursor image policy remains
     /// portable.
@@ -2042,7 +2046,7 @@ impl KmsBackend {
             return false;
         }
         let cursor_compose_blocked = self
-            .tearing_cursor_compose_deadline(std::time::Instant::now())
+            .tearing_cursor_compose_deadline(self.monotonic_now())
             .is_some();
         (self.scene_wants_scene() && !cursor_compose_blocked)
             || (!cursor_compose_blocked
@@ -2243,7 +2247,7 @@ impl KmsBackend {
     pub(in crate::kms::render::backend) fn backend_scanout_next_wakeup(
         &self,
     ) -> Option<std::time::Instant> {
-        let now = std::time::Instant::now();
+        let now = self.monotonic_now();
         let allow_kms_timers = self.scanout_allowed() && self.kms_outputs_active;
         let scene_deadline = if allow_kms_timers {
             if self.scene_wants_compose() {
@@ -2367,7 +2371,7 @@ impl KmsBackend {
                 .pstate
                 .tearing
                 .deferred_cursor_wake
-                .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+                .is_some_and(|deadline| self.monotonic_now() >= deadline)
         {
             self.pstate.tearing.deferred_cursor_wake = None;
             if !self.scene.scene_structure_dirty {
@@ -2438,7 +2442,7 @@ impl KmsBackend {
             if self.pstate.scanout_m2.current.is_some() && self.pstate.scanout_m2.unflip_requested {
                 match self.submit_composed_unflip() {
                     Ok(true) => {
-                        self.pstate.tearing.note_composed_submit();
+                        self.pstate.tearing.note_composed_submit(self.monotonic_now());
                         // The atomic replacement itself is now pending on every
                         // CRTC. Do not fall through into per-output scene flips in
                         // this same tick: KMS correctly rejects those with EBUSY.
@@ -2474,7 +2478,7 @@ impl KmsBackend {
             }
         }
         let composed_outputs = if self
-            .tearing_cursor_compose_deadline(std::time::Instant::now())
+            .tearing_cursor_compose_deadline(self.monotonic_now())
             .is_some()
         {
             None
@@ -2492,7 +2496,9 @@ impl KmsBackend {
             .as_ref()
             .is_some_and(|outputs| !outputs.is_empty())
         {
-            self.pstate.tearing.note_composed_submit();
+            self.pstate
+                .tearing
+                .note_composed_submit(self.monotonic_now());
         }
         let scene_submitted_outputs: HashSet<usize> =
             composed_outputs.into_iter().flatten().collect();

@@ -228,20 +228,27 @@ VKD3D, CS2) send `PresentPixmapSynced` before the GPU finishes the frame. A GPU-
 every frame scrapped before its fence signals: CS2 on NVIDIA went from 311 direct flips/s to 7–50/s once the scene
 loaded the GPU (330–360 Presents/s, 300–340 scrapped/s); mpv on the AMD iGPU showed 7 flips/s for 515 Presents/s.
 
-Xorg scraps only Presents queued for a future MSC (`present_scmd.c:803-823`, `if (!vblank->queued) continue;`); a due
-Present waiting for its wait fence sits in `present_execute_wait` (`present_execute.c:61-77`) and executes when the
-fence triggers. yserver adopts the same rule for every Present, not only while tearing:
+Xorg does not hit this because an explicit-sync **flip** never waits in the server: `present_execute_wait`
+(`present_execute.c:61-95`) waits for the acquire syncobj only for copies (`!vblank->flip`), so the flip
+reaches the kernel at once and the driver waits for the fence. A due Xorg copy whose fence has not
+signalled stays `queued` (the wait returns before `present_execute` clears it at `present_scmd.c:576`), so
+Xorg's supersession (`present_scmd.c:803-823`) can scrap it. yserver waits for every acquire fence in the
+core, flips included, so it needs the following rule to get Xorg's flip behaviour. It applies to every
+Present, not only while tearing:
 
-- the core scraps a pending Present only while it is parked for a future MSC;
-- a due Present waiting for its source/acquire fence is never scrapped by a successor; it executes when its fence
-  signals, in arrival order;
+- a covered same-window, same-CRTC, same-target Present is scrapped when it would be parked for a future
+  MSC, whether or not its source/acquire fence has signalled (its armed wait is released);
+- a due Present (one that would execute now if its fence were ready) that waits for its source/acquire
+  fence is never scrapped by a successor; it executes when its fence signals, in arrival order;
 - once executed, the backend's single latest-wins successor slot still replaces an older ready frame while a flip
   is in flight, so a frame that is already stale is dropped there.
 - order is preserved: a fence-waiting Present whose fence signals after a newer same-window, same-target Present
   has already executed completes as Skip (it would otherwise show an older frame after a newer one).
 
 This amends the 2026-08-11 async-supersession spec (its sentence "requests still waiting for their acquire/source
-fence remain in core and can be scrapped there"), which deviated from Xorg. Memory is bounded by the client's
+fence remain in core and can be scrapped there") for due Presents. Due copies waiting for their fence are
+kept where Xorg would scrap them; this is the one deliberate difference, because yserver cannot tell at that
+point whether the frame will be flipped or copied. Memory is bounded by the client's
 swapchain images, since each pending Present holds one of the client's buffers. Vsync Presents remain paced by vblank.
 
 ### 2. Building and submitting the commit

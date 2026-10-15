@@ -135,7 +135,8 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 - **2026-10-15 tearing-on-demand Amendment B (core supersession parity with
   Xorg, spec §1b):** the core scraps a pending Present only while it is parked
-  for a future MSC. A due Present waiting for its acquire/source fence executes
+  for a future MSC (whether or not its fence has signalled). A due Present waiting
+  for its acquire/source fence is never scrapped; it executes
   when the fence signals, in arrival order. It completes as Skip if a newer
   same-window, same-target Present has already executed. This applies to every
   Present, not only while tearing; Vsync stays paced by vblank. Before this, an
@@ -147,8 +148,8 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   Hardware (Xid 0 throughout):
   - NVIDIA RTX 5060 Ti (driver 615), mpv Vulkan immediate with XFIXES-hidden
     cursor: 519–549 direct async flips/s, every Present shown, 0 core skips
-    (about 77/s before Amendment B). Present→flip p50 179 µs against about
-    16.6 ms with vsync. GL interval 0: 155 flips/s for 164–186 Presents/s.
+    (about 77/s before Amendment B). Present→submit p50 about 43 µs (p99
+    about 140 µs); Present→flip is `n/a` on nvidia-drm (see below). GL interval 0: 155 flips/s for 164–186 Presents/s.
   - NVIDIA, CS2 for about 8 minutes: median 312 direct flips/s (p10 231, max 413),
     1.0 flip per Present, no second below 60. Menus (composed, cursor visible):
     median 199/s. The user's verdict: smooth, low-latency play.
