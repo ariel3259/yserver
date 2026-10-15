@@ -691,7 +691,7 @@ impl KmsBackend {
         #[allow(clippy::cast_possible_truncation)]
         let cy = self.core.cursor_y as i32;
         if self.effective_cursor_hidden() {
-            <PlatformBackend as crate::kms::render::backend::seam::Platform>::hide_cursor_under_direct_scanout(self);
+            <PlatformBackend as crate::kms::render::backend::seam::Platform>::recover_hidden_cursor_on_resume(self);
         } else {
             self.platform.rearm_cursor(hot_x, hot_y, cx, cy);
         }
@@ -988,7 +988,7 @@ impl KmsBackend {
             let cy = self.core.cursor_y as i32;
             log::info!("kms: dpms wake — rearm_cursor hot=({hot_x},{hot_y}) pos=({cx},{cy})");
             if self.effective_cursor_hidden() {
-                <PlatformBackend as crate::kms::render::backend::seam::Platform>::hide_cursor_under_direct_scanout(self);
+                <PlatformBackend as crate::kms::render::backend::seam::Platform>::recover_hidden_cursor_on_resume(self);
             } else {
                 self.platform.rearm_cursor(hot_x, hot_y, cx, cy);
             }

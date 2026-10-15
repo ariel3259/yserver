@@ -143,8 +143,7 @@ impl Platform for PlatformBackend {
     }
 
     fn hide_cursor_under_direct_scanout(b: &mut KmsBackend) {
-        let direct_active = b.pstate.scanout_m2.active();
-        if !direct_active {
+        if !b.pstate.scanout_m2.active() {
             return;
         }
         if !b.platform.any_cursor_plane_visible() {
@@ -170,6 +169,19 @@ impl Platform for PlatformBackend {
         }
         if !b.sync_direct_cursor_scene_state() {
             b.request_direct_unflip("cursor_scene_sync_failed");
+        }
+    }
+
+    fn recover_hidden_cursor_on_resume(b: &mut KmsBackend) {
+        for output_idx in 0..b.platform.outputs.len() {
+            if !b.platform.cursor_plane_visible_for_output(output_idx) {
+                continue;
+            }
+            if let Err(error) = b.platform.cursor_plane_hide_on_crtc(output_idx) {
+                log::warn!(
+                    "render resume: hidden cursor plane detach failed on output {output_idx}: {error}"
+                );
+            }
         }
     }
 

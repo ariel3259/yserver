@@ -1528,6 +1528,103 @@ fn task5_tearing_window_destroy_exits_and_restores_cursor_policy() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: restore the direct-ownership guard on resume recovery so the stale plane stays bound.
+fn hidden_cursor_while_vt_suspended_retries_failed_plane_hide_on_resume() {
+    use std::rc::Rc;
+    use yserver_core::{backend::Backend, core_loop::input_inventory::InputInventory};
+
+    struct LogicalVtResume;
+
+    impl crate::kms::render::backend::kms::session::VtResumeExecutor for LogicalVtResume {
+        fn acquire_master(
+            &self,
+            _device: &crate::kms::render::platform::KmsDevice,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn release_master(
+            &self,
+            _device: &crate::kms::render::platform::KmsDevice,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn probe_connector_snapshot(
+            &self,
+            platform: &crate::kms::render::platform::PlatformBackend,
+        ) -> std::io::Result<Vec<crate::kms::render::platform::ConnectorSnapshot>> {
+            Ok(platform
+                .outputs
+                .iter()
+                .map(|output| crate::kms::render::platform::ConnectorSnapshot {
+                    key: output.key.clone(),
+                    modes: vec![output.output.picked.clone()],
+                    mm_width: 0,
+                    mm_height: 0,
+                    edid: Vec::new(),
+                    connector_type: "test".to_owned(),
+                })
+                .collect())
+        }
+    }
+
+    let Some(mut backend) = live_scene_backend() else {
+        return;
+    };
+    backend.for_tests_set_vt_resume_executor(Rc::new(LogicalVtResume));
+    backend.platform.for_tests_accept_output_power_commits();
+    let recorder = recording_sink(&mut backend, 0);
+
+    let visible_cursor = create_bitmap_cursor_via_backend(&mut backend, true, true);
+    let root = backend.core.window_id;
+    Backend::define_cursor(&mut backend, None, root, visible_cursor.as_raw())
+        .expect("define visible cursor through Backend");
+    assert!(!backend.effective_cursor_hidden());
+
+    let crtc = backend.platform.outputs[0].output.crtc;
+    let device = &mut backend.platform.devices[0];
+    let mut plane =
+        crate::kms::cursor_plane::CursorPlane::for_tests_stub(Rc::clone(&device.device), 64, 64);
+    plane.for_tests_set_visible(crtc, true);
+    let hide_executor = Rc::new(RecordingCursorHideExecutor::default());
+    hide_executor.script([
+        TestCursorHideResult::Error(libc::EIO),
+        TestCursorHideResult::Error(libc::EIO),
+        TestCursorHideResult::Ok,
+    ]);
+    let hide_executor_trait: Rc<dyn crate::kms::cursor_plane::CursorHideExecutor> =
+        hide_executor.clone();
+    plane.for_tests_set_hide_executor(hide_executor_trait);
+    device.cursor.plane = Some(plane);
+    assert!(backend.platform.any_cursor_plane_visible());
+
+    let mut state = ServerState::new();
+    Backend::finish_vt_release(&mut backend, &mut state, &InputInventory::default());
+    assert!(!backend.pstate.scanout_m2.active());
+    assert_eq!(hide_executor.calls(), [crtc, crtc]);
+    assert!(backend.platform.any_cursor_plane_visible());
+
+    Backend::set_cursor_hidden(&mut backend, true);
+    assert!(backend.effective_cursor_hidden());
+    assert!(backend.platform.any_cursor_plane_visible());
+
+    Backend::on_vt_acquire(&mut backend, &mut state);
+    assert_eq!(hide_executor.calls(), [crtc, crtc, crtc]);
+    assert!(!backend.platform.any_cursor_plane_visible());
+    assert!(backend.effective_cursor_hidden());
+    assert_tearing_off(&backend);
+    assert_eq!(backend.pstate.vt_state, crate::vt::state::VtState::Active);
+    assert!(backend.scanout_allowed());
+    assert!(backend.kms_outputs_active);
+    assert_eq!(backend.pstate.tearing.deferred_cursor_wake, None);
+    assert_direct_queue_drained(&backend);
+    assert!(!backend.scene.has_pending_page_flips());
+    assert_commit_sequence(&recorder, &[]);
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutations: count EINVAL and non-OS errors as accepted Async commits, count Presents only at submission, or retain tearing state on exit.
 fn tearing_summary_counts_async_and_fallbacks() {
     use yserver_core::backend::Backend;

@@ -95,6 +95,9 @@ pub trait Platform: OutputSink + Sized + 'static {
     }
     /// XFIXES HideCursor while no compose runs: detach the cursor planes.
     fn hide_cursor_under_direct_scanout(_b: &mut XBackend<Self>) {}
+    /// Reapply a hidden cursor policy after output resume, including stale
+    /// plane bindings left by a failed best-effort suspend hide.
+    fn recover_hidden_cursor_on_resume(_b: &mut XBackend<Self>) {}
     /// The cursor sprite's size or hotspot changed.
     fn note_cursor_sprite(
         _b: &mut XBackend<Self>,
