@@ -228,6 +228,116 @@ fn dispatch_present_body(
     .unwrap();
 }
 
+fn run_core_present_wait_drain(
+    state: &mut ServerState,
+    backend: &mut RecordingBackend,
+    peer: &mut UnixStream,
+    sequence: u16,
+) -> Vec<u8> {
+    run_core_present_requests_and_wait(
+        state,
+        backend,
+        peer,
+        vec![(
+            SequenceNumber(sequence),
+            RequestHeader {
+                opcode: 43, // GetInputFocus: round-trip after the core drains backend waits.
+                data: 0,
+                length_units: 1,
+            },
+            Vec::new(),
+        )],
+    )
+}
+
+fn run_core_present_request_and_wait(
+    state: &mut ServerState,
+    backend: &mut RecordingBackend,
+    peer: &mut UnixStream,
+    present_sequence: u16,
+    round_trip_sequence: u16,
+    minor: u8,
+    body: &[u8],
+) -> Vec<u8> {
+    run_core_present_requests_and_wait(
+        state,
+        backend,
+        peer,
+        vec![
+            (
+                SequenceNumber(present_sequence),
+                RequestHeader {
+                    opcode: 145,
+                    data: minor,
+                    length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+                },
+                body.to_vec(),
+            ),
+            (
+                SequenceNumber(round_trip_sequence),
+                RequestHeader {
+                    opcode: 43, // GetInputFocus: confirms Present dispatch and wait drain.
+                    data: 0,
+                    length_units: 1,
+                },
+                Vec::new(),
+            ),
+        ],
+    )
+}
+
+fn run_core_present_requests_and_wait(
+    state: &mut ServerState,
+    backend: &mut RecordingBackend,
+    peer: &mut UnixStream,
+    requests: Vec<(SequenceNumber, RequestHeader, Vec<u8>)>,
+) -> Vec<u8> {
+    use std::io::Read;
+
+    let (poll, sender, receiver) = crate::core_loop::channel().expect("core channel");
+    let request_sender = sender.bind();
+    for (sequence, header, body) in requests {
+        request_sender
+            .send(crate::core_loop::Message::Request {
+                id: ClientId(1),
+                sequence,
+                accepted_at: None,
+                header,
+                body,
+                attached_fd: None,
+            })
+            .expect("queue request for run_core");
+    }
+    let sender_for_core = sender.clone_handle();
+
+    std::thread::scope(|scope| {
+        let runner = scope.spawn(|| {
+            crate::core_loop::run_core(
+                poll,
+                receiver,
+                sender_for_core,
+                state,
+                backend,
+                [],
+                &crate::core_loop::poll_tokens::ClientIdAllocator::new(),
+                crate::core_loop::auth::AuthState::new(None),
+                crate::core_loop::ResetPolicy::NoReset,
+                None,
+            )
+        });
+
+        let mut reply = [0; 32];
+        peer.read_exact(&mut reply)
+            .expect("GetInputFocus response proves request processing completed");
+        assert_eq!(reply[0], 1, "GetInputFocus reply");
+        sender
+            .send(crate::core_loop::Message::Shutdown)
+            .expect("stop run_core after its iteration tail");
+        runner.join().expect("run_core thread panicked").unwrap();
+    });
+    read_all_available(peer)
+}
+
 fn assert_present_error(peer: &mut UnixStream, expected_code: u8, expected_value: u32) {
     let mut error = [0u8; 32];
     peer.read_exact(&mut error).unwrap();
@@ -235,6 +345,415 @@ fn assert_present_error(peer: &mut UnixStream, expected_code: u8, expected_value
     assert_eq!(
         u32::from_le_bytes(error[4..8].try_into().unwrap()),
         expected_value
+    );
+}
+
+#[test]
+fn synced_async_present_acquire_waits_survive_the_next_frame_and_execute() {
+    use crate::backend::recording::RecordedCall;
+    use yserver_protocol::x11::{CreatePixmapRequest, CreateWindowRequest};
+
+    const CLIENT: u32 = 1;
+    const WINDOW: u32 = 0x00e0_0b01;
+    const WINDOW_HOST: u32 = 0x0040_0b01;
+    const PIXMAP_BASE: u32 = 0x00e0_0b10;
+    const PIXMAP_HOST_BASE: u32 = 0x0040_0b10;
+    const ACQUIRE: u32 = 0x00e0_0b30;
+    const RELEASE: u32 = 0x00e0_0b31;
+    const WAIT_BASE: u64 = 0x7000;
+    const FRAME_COUNT: u32 = 20;
+
+    // Mutation: remove the `source_ready` gate from core supersession so a
+    // successor scraps an entry still waiting on its acquire point.
+    // Logical timing: submit every 3 ms and signal that frame's acquire point
+    // 4 ms later, after the next submission. The explicit Backend wait ids
+    // keep this schedule deterministic without sleeping.
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, CLIENT);
+    peer.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .expect("bound core round-trip waits");
+    let mut backend = RecordingBackend::new();
+    backend.present_ust_msc = (10, 0x1000);
+    backend.present_flip_in_flight = true;
+    backend.seed_dri3_syncobj_for_test(ACQUIRE, ClientId(CLIENT));
+    backend.seed_dri3_syncobj_for_test(RELEASE, ClientId(CLIENT));
+
+    state.resources.create_window(
+        ClientId(CLIENT),
+        CreateWindowRequest {
+            depth: 24,
+            window: ResourceId(WINDOW),
+            parent: ROOT_WINDOW,
+            width: 100,
+            height: 100,
+            class: 1,
+            visual: crate::resources::ROOT_VISUAL,
+            ..Default::default()
+        },
+    );
+    let _ = state.resources.map_window(ResourceId(WINDOW));
+    state
+        .resources
+        .window_mut(ResourceId(WINDOW))
+        .expect("destination window")
+        .host_xid = crate::backend::WindowHandle::from_raw(WINDOW_HOST);
+
+    for frame in 0..FRAME_COUNT {
+        let pixmap = PIXMAP_BASE + frame;
+        let pixmap_host = PIXMAP_HOST_BASE + frame;
+        state.resources.create_pixmap(
+            ClientId(CLIENT),
+            CreatePixmapRequest {
+                depth: 24,
+                pixmap: ResourceId(pixmap),
+                drawable: ResourceId(WINDOW),
+                width: 100,
+                height: 100,
+            },
+        );
+        let _ = state.resources.set_pixmap_host_xid(
+            ResourceId(pixmap),
+            crate::backend::PixmapHandle::from_raw(pixmap_host)
+                .expect("valid test pixmap host xid"),
+        );
+
+        let acquire_point = u64::from(frame) + 1;
+        let release_point = acquire_point + 1;
+        let mut body = pixmap_synced_body(
+            WINDOW,
+            pixmap,
+            ACQUIRE,
+            RELEASE,
+            acquire_point,
+            release_point,
+        );
+        body[8..12].copy_from_slice(&(frame + 1).to_le_bytes());
+        body[52..56].copy_from_slice(&crate::present_scheduler::PRESENT_OPTION_ASYNC.to_le_bytes());
+        let wait_id = WAIT_BASE + u64::from(frame);
+        if frame > 0 {
+            let preceding_present_id = u64::from(frame);
+            let preceding_wait_id = WAIT_BASE + u64::from(frame - 1);
+            assert!(
+                state
+                    .present_pending_exec
+                    .get(&preceding_present_id)
+                    .is_some_and(
+                        |entry| !entry.source_ready && entry.wait_id == Some(preceding_wait_id)
+                    ),
+                "frame {frame} arrives at 3 ms while the preceding frame's 4 ms acquire wait is pending"
+            );
+            backend.ready_present_source_waits.push(preceding_wait_id);
+        }
+        backend.present_syncobj_wait = crate::backend::PresentSourceWait::Deferred(wait_id);
+        let present_sequence = frame * 3 + 1;
+        let _ = run_core_present_request_and_wait(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            u16::try_from(present_sequence).unwrap(),
+            u16::try_from(present_sequence + 1).unwrap(),
+            yserver_protocol::x11::present::PIXMAP_SYNCED,
+            &body,
+        );
+    }
+
+    backend
+        .ready_present_source_waits
+        .push(WAIT_BASE + u64::from(FRAME_COUNT - 1));
+    let _ = run_core_present_wait_drain(
+        &mut state,
+        &mut backend,
+        &mut peer,
+        u16::try_from(FRAME_COUNT * 3).unwrap(),
+    );
+
+    let copied_sources: Vec<u32> = backend
+        .calls()
+        .iter()
+        .filter_map(|call| match call {
+            RecordedCall::CopyArea { src_host_xid, .. } => Some(*src_host_xid),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        copied_sources,
+        (0..FRAME_COUNT)
+            .map(|frame| PIXMAP_HOST_BASE + frame)
+            .collect::<Vec<_>>(),
+        "all 20 acquire-waiting frames execute once, in arrival order"
+    );
+    assert!(state.present_pending_exec.is_empty());
+    assert!(state.present_wait_to_id.is_empty());
+    assert!(state.present_pending_complete.is_empty());
+    assert_eq!(
+        backend.present_skip_count, 0,
+        "no acquire-waiting frame is scrapped"
+    );
+    let mut completion_gates: Vec<u64> = state.present_complete_gate.keys().copied().collect();
+    completion_gates.sort_unstable();
+    assert_eq!(
+        completion_gates,
+        (1..=u64::from(FRAME_COUNT)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn ready_present_acquire_waits_in_one_drain_execute_in_arrival_order() {
+    use crate::backend::recording::RecordedCall;
+    use yserver_protocol::x11::{CreatePixmapRequest, CreateWindowRequest};
+
+    const CLIENT: u32 = 1;
+    const WINDOW: u32 = 0x00e0_0d01;
+    const WINDOW_HOST: u32 = 0x0040_0d01;
+    const PIXMAP_BASE: u32 = 0x00e0_0d10;
+    const PIXMAP_HOST_BASE: u32 = 0x0040_0d10;
+    const ACQUIRE: u32 = 0x00e0_0d30;
+    const RELEASE: u32 = 0x00e0_0d31;
+    const WAIT_BASE: u64 = 0x7100;
+    const FRAME_COUNT: u32 = 3;
+
+    // Mutation: remove the ready-wait sort by Present ID; reversed ready IDs
+    // must then copy in the wrong order.
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, CLIENT);
+    peer.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .expect("bound core round-trip waits");
+    let mut backend = RecordingBackend::new();
+    backend.present_ust_msc = (10, 0x1000);
+    backend.present_flip_in_flight = true;
+    backend.seed_dri3_syncobj_for_test(ACQUIRE, ClientId(CLIENT));
+    backend.seed_dri3_syncobj_for_test(RELEASE, ClientId(CLIENT));
+    state.resources.create_window(
+        ClientId(CLIENT),
+        CreateWindowRequest {
+            depth: 24,
+            window: ResourceId(WINDOW),
+            parent: ROOT_WINDOW,
+            width: 100,
+            height: 100,
+            class: 1,
+            visual: crate::resources::ROOT_VISUAL,
+            ..Default::default()
+        },
+    );
+    let _ = state.resources.map_window(ResourceId(WINDOW));
+    state
+        .resources
+        .window_mut(ResourceId(WINDOW))
+        .expect("destination window")
+        .host_xid = crate::backend::WindowHandle::from_raw(WINDOW_HOST);
+
+    for frame in 0..FRAME_COUNT {
+        let pixmap = PIXMAP_BASE + frame;
+        state.resources.create_pixmap(
+            ClientId(CLIENT),
+            CreatePixmapRequest {
+                depth: 24,
+                pixmap: ResourceId(pixmap),
+                drawable: ResourceId(WINDOW),
+                width: 100,
+                height: 100,
+            },
+        );
+        let _ = state.resources.set_pixmap_host_xid(
+            ResourceId(pixmap),
+            crate::backend::PixmapHandle::from_raw(PIXMAP_HOST_BASE + frame)
+                .expect("valid test pixmap host xid"),
+        );
+
+        let present_id = u64::from(frame + 1);
+        let wait_id = WAIT_BASE + u64::from(frame);
+        let mut body =
+            pixmap_synced_body(WINDOW, pixmap, ACQUIRE, RELEASE, present_id, present_id + 1);
+        body[8..12].copy_from_slice(&(frame + 1).to_le_bytes());
+        body[52..56].copy_from_slice(&crate::present_scheduler::PRESENT_OPTION_ASYNC.to_le_bytes());
+        backend.present_syncobj_wait = crate::backend::PresentSourceWait::Deferred(wait_id);
+        let present_sequence = frame * 2 + 1;
+        let _ = run_core_present_request_and_wait(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            u16::try_from(present_sequence).unwrap(),
+            u16::try_from(present_sequence + 1).unwrap(),
+            yserver_protocol::x11::present::PIXMAP_SYNCED,
+            &body,
+        );
+        assert!(state.present_pending_exec.contains_key(&present_id));
+    }
+
+    for frame in (0..FRAME_COUNT).rev() {
+        backend
+            .ready_present_source_waits
+            .push(WAIT_BASE + u64::from(frame));
+    }
+    let _ = run_core_present_wait_drain(
+        &mut state,
+        &mut backend,
+        &mut peer,
+        u16::try_from(FRAME_COUNT * 2 + 1).unwrap(),
+    );
+
+    let copied_sources: Vec<u32> = backend
+        .calls()
+        .iter()
+        .filter_map(|call| match call {
+            RecordedCall::CopyArea { src_host_xid, .. } => Some(*src_host_xid),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        copied_sources,
+        (0..FRAME_COUNT)
+            .map(|frame| PIXMAP_HOST_BASE + frame)
+            .collect::<Vec<_>>(),
+        "a single reversed readiness drain still executes in Present arrival order"
+    );
+    assert_eq!(
+        backend.finished_present_source_waits,
+        (0..FRAME_COUNT)
+            .map(|frame| WAIT_BASE + u64::from(frame))
+            .collect::<Vec<_>>(),
+        "each waiter is finished once in arrival order"
+    );
+    assert_eq!(backend.present_skip_count, 0);
+    assert!(state.present_pending_exec.is_empty());
+    assert!(state.present_wait_to_id.is_empty());
+    assert!(state.present_pending_complete.is_empty());
+}
+
+#[test]
+fn late_older_acquire_wait_completes_as_skip_after_newer_same_target_executes() {
+    use crate::backend::recording::RecordedCall;
+    use yserver_protocol::x11::{CreatePixmapRequest, CreateWindowRequest, present as x11present};
+
+    const CLIENT: u32 = 1;
+    const WINDOW: u32 = 0x00e0_0c01;
+    const WINDOW_HOST: u32 = 0x0040_0c01;
+    const OLDER_PIXMAP: u32 = 0x00e0_0c10;
+    const NEWER_PIXMAP: u32 = 0x00e0_0c11;
+    const OLDER_HOST: u32 = 0x0040_0c10;
+    const NEWER_HOST: u32 = 0x0040_0c11;
+    const ACQUIRE: u32 = 0x00e0_0c30;
+    const RELEASE: u32 = 0x00e0_0c31;
+    const OLDER_WAIT: u64 = 0x7100;
+    const NEWER_WAIT: u64 = 0x7101;
+    const PRESENT_EID: u32 = 0x0020_0c40;
+
+    // Mutation: remove the stale-wait check after a newer covered Present
+    // executes; the older source must not be copied after the newer one.
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, CLIENT);
+    peer.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .expect("bound core round-trip waits");
+    let mut backend = RecordingBackend::new();
+    backend.present_ust_msc = (10, 0x1000);
+    backend.present_flip_in_flight = true;
+    backend.seed_dri3_syncobj_for_test(ACQUIRE, ClientId(CLIENT));
+    backend.seed_dri3_syncobj_for_test(RELEASE, ClientId(CLIENT));
+    state.present_event_selections.insert(
+        PRESENT_EID,
+        crate::server::PresentEventSelection {
+            owner: ClientId(CLIENT),
+            window: ResourceId(WINDOW),
+            event_mask: x11present::EVENT_MASK_COMPLETE_NOTIFY,
+        },
+    );
+
+    state.resources.create_window(
+        ClientId(CLIENT),
+        CreateWindowRequest {
+            depth: 24,
+            window: ResourceId(WINDOW),
+            parent: ROOT_WINDOW,
+            width: 100,
+            height: 100,
+            class: 1,
+            visual: crate::resources::ROOT_VISUAL,
+            ..Default::default()
+        },
+    );
+    let _ = state.resources.map_window(ResourceId(WINDOW));
+    state
+        .resources
+        .window_mut(ResourceId(WINDOW))
+        .expect("destination window")
+        .host_xid = crate::backend::WindowHandle::from_raw(WINDOW_HOST);
+    for (pixmap, host_xid) in [(OLDER_PIXMAP, OLDER_HOST), (NEWER_PIXMAP, NEWER_HOST)] {
+        state.resources.create_pixmap(
+            ClientId(CLIENT),
+            CreatePixmapRequest {
+                depth: 24,
+                pixmap: ResourceId(pixmap),
+                drawable: ResourceId(WINDOW),
+                width: 100,
+                height: 100,
+            },
+        );
+        let _ = state.resources.set_pixmap_host_xid(
+            ResourceId(pixmap),
+            crate::backend::PixmapHandle::from_raw(host_xid).expect("valid test pixmap host xid"),
+        );
+    }
+
+    for (pixmap, serial, wait_id) in [
+        (OLDER_PIXMAP, 1_u32, OLDER_WAIT),
+        (NEWER_PIXMAP, 2_u32, NEWER_WAIT),
+    ] {
+        let mut body = pixmap_synced_body(WINDOW, pixmap, ACQUIRE, RELEASE, u64::from(serial), 10);
+        body[8..12].copy_from_slice(&serial.to_le_bytes());
+        body[52..56].copy_from_slice(&crate::present_scheduler::PRESENT_OPTION_ASYNC.to_le_bytes());
+        backend.present_syncobj_wait = crate::backend::PresentSourceWait::Deferred(wait_id);
+        let present_sequence = serial * 2 - 1;
+        let _ = run_core_present_request_and_wait(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            u16::try_from(present_sequence).unwrap(),
+            u16::try_from(present_sequence + 1).unwrap(),
+            x11present::PIXMAP_SYNCED,
+            &body,
+        );
+    }
+    assert_eq!(state.present_pending_exec.len(), 2);
+
+    backend.ready_present_source_waits.push(NEWER_WAIT);
+    let _ = run_core_present_wait_drain(&mut state, &mut backend, &mut peer, 5);
+    assert_eq!(state.present_pending_exec.len(), 1);
+    assert!(state.present_pending_exec.contains_key(&1));
+
+    backend.ready_present_source_waits.push(OLDER_WAIT);
+    let late_older_wire = run_core_present_wait_drain(&mut state, &mut backend, &mut peer, 6);
+
+    let copied_sources: Vec<u32> = backend
+        .calls()
+        .iter()
+        .filter_map(|call| match call {
+            RecordedCall::CopyArea { src_host_xid, .. } => Some(*src_host_xid),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(copied_sources, vec![NEWER_HOST]);
+    assert_eq!(
+        complete_notify_modes(&late_older_wire),
+        vec![x11present::COMPLETE_MODE_SKIP],
+        "the older frame completes as Skip only after its acquire point signals"
+    );
+    assert_eq!(
+        *backend.signalled_dri3_syncobjs.lock().unwrap(),
+        vec![(RELEASE, 10)],
+        "the skipped older Present releases its synced buffer after its wait resolves"
+    );
+    assert_eq!(backend.present_skip_count, 1);
+    assert!(state.present_pending_exec.is_empty());
+    assert!(state.present_wait_to_id.is_empty());
+    assert!(state.present_pending_complete.is_empty());
+    assert_eq!(
+        state
+            .present_complete_gate
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![2]
     );
 }
 
@@ -1881,6 +2400,7 @@ fn deferred_present_pixmap_copies_only_after_source_readiness() {
         PendingPresentEntry {
             pending,
             source_ready: false,
+            superseded_by_executed_present_id: None,
             wait_id: Some(WAIT_ID),
             pin: Some(999),
         },
@@ -2011,6 +2531,7 @@ fn destroyed_window_purges_parked_present_wait_before_producer_ready() {
         PendingPresentEntry {
             pending,
             source_ready: false,
+            superseded_by_executed_present_id: None,
             wait_id: Some(WAIT_ID),
             pin: Some(PIN_ID),
         },

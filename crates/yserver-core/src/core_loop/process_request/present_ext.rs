@@ -234,6 +234,52 @@ fn fire_present_idle_notify_now(
     }
 }
 
+/// Complete a covered, same-target Present as Skip after its source is no
+/// longer allowed to be shown. The entry's producer wait and source pin are
+/// owned by the caller; this handles the buffer wake and ordered wire
+/// completion shared by arrival-time MSC scrap and a late fence waiter.
+fn complete_pending_present_as_skip(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    pending: &PendingPresentPixmap,
+    target: u64,
+) {
+    backend.note_present_skip();
+    match &pending.wake {
+        crate::backend::PresentWake::Pixmap { idle_fence_xid } if *idle_fence_xid != 0 => {
+            if let Err(e) = backend.dri3_trigger_fence(*idle_fence_xid) {
+                log::warn!(
+                    "PRESENT supersede: trigger idle fence 0x{idle_fence_xid:x} failed: {e}"
+                );
+            }
+            crate::core_loop::sync_await::fence_triggered(state, *idle_fence_xid);
+        }
+        crate::backend::PresentWake::PixmapSynced {
+            release,
+            release_syncobj,
+            release_value,
+        } => {
+            if let Err(e) = release.signal(*release_value) {
+                log::warn!(
+                    "PRESENT supersede: signal release syncobj 0x{release_syncobj:x}@\
+                     {release_value} failed: {e}"
+                );
+            }
+        }
+        _ => {}
+    }
+    let event = completed_event_for_pending(pending);
+    fire_present_idle_notify_now(state, &event);
+    state
+        .present_pending_complete
+        .push(crate::server::PendingPresentComplete {
+            event,
+            effective_target_msc: target,
+            mode: yserver_protocol::x11::present::COMPLETE_MODE_SKIP,
+            emit_idle: false,
+        });
+}
+
 /// Task 8 §Supersession: scan `present_pending_exec` for entries covered
 /// by the newly-arriving successor `successor` and scrap them. Called in
 /// BOTH Present::Pixmap and Present::PixmapSynced handlers right after
@@ -242,16 +288,21 @@ fn fire_present_idle_notify_now(
 /// succeeded (arm-before-scrap: see the comment at each call site) —
 /// scrap happens at arrival regardless of whether the successor's own
 /// source was ready or deferred, and regardless of its own park/execute
-/// msc-due classification.
+/// msc-due classification. A victim must already be source-ready, which
+/// means it was parked only for a future MSC; entries with an armed source
+/// or acquire wait remain until that wait signals.
 ///
 /// Gated on the successor having a known effective target. A successor
 /// with `effective_target_msc = None` never scraps because target
-/// equivalence is not known. Victims are entries in
+/// equivalence is not known. Victims are source-ready entries in
 /// `present_pending_exec` for the same window, CRTC domain, and effective
-/// target whose coverage
-/// (`present_supersession_covers`) passes — everything in the store is
-/// unexecuted by definition, so no additional "not yet executed" check
-/// is needed.
+/// target whose coverage (`present_supersession_covers`) passes.
+/// `source_ready: true` is set only when a source-ready Present is parked
+/// by the MSC classifier (at `arrival_execute_or_park_present_pixmap`
+/// below or when a source wait resolves in `drain_ready_present_pixmaps`).
+/// The two deferred request producers at the Pixmap and PixmapSynced
+/// handlers insert `source_ready: false, wait_id: Some(_)`; those entries
+/// are still waiting for their source/acquire fence and must not be scrapped.
 pub(super) fn supersede_covered_pending_presents(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -264,7 +315,8 @@ pub(super) fn supersede_covered_pending_presents(
 
     let mut victim_ids: Vec<u64> = Vec::new();
     for (&pid, entry) in &state.present_pending_exec {
-        if entry.pending.request.window() != window
+        if !entry.source_ready
+            || entry.pending.request.window() != window
             || entry.pending.crtc_id != successor.crtc_id
             || entry.pending.crtc_epoch != successor.crtc_epoch
             || entry.pending.effective_target_msc != Some(target)
@@ -297,10 +349,6 @@ pub(super) fn supersede_covered_pending_presents(
         let Some(entry) = state.present_pending_exec.remove(&pid) else {
             continue;
         };
-        // Task 10 telemetry: one `note_present_skip` per scrapped victim
-        // — the copy that did NOT happen. KMS surfaces this as
-        // `present_skips/s` in `render_telemetry`.
-        backend.note_present_skip();
         // 1. Cancel the source/acquire wait if armed, and release the
         // entry's own source pin.
         if let Some(wid) = entry.wait_id {
@@ -310,53 +358,17 @@ pub(super) fn supersede_covered_pending_presents(
         if let Some(pin) = entry.pin {
             backend.release_present_source(pin);
         }
-        // 2. By-XID buffer release, immediately — the victim never
-        // reached `enqueue_present_completion`, so this is its sole
-        // release path (no backend `PinnedWake` / gate entry exists for
-        // it). The X11 fence mirror write is REQUIRED here, as it is in
-        // the window-destroy purge: without it a client's own fence query
-        // could disagree with its unblocked wait for up to a period.
-        match &entry.pending.wake {
-            crate::backend::PresentWake::Pixmap { idle_fence_xid } if *idle_fence_xid != 0 => {
-                if let Err(e) = backend.dri3_trigger_fence(*idle_fence_xid) {
-                    log::warn!(
-                        "PRESENT supersede: trigger idle fence 0x{idle_fence_xid:x} failed: {e}"
-                    );
-                }
-                crate::core_loop::sync_await::fence_triggered(state, *idle_fence_xid);
-            }
-            crate::backend::PresentWake::PixmapSynced {
-                release,
-                release_syncobj,
-                release_value,
-            } => {
-                if let Err(e) = release.signal(*release_value) {
-                    log::warn!(
-                        "PRESENT supersede: signal release syncobj 0x{release_syncobj:x}@\
-                         {release_value} failed: {e}"
-                    );
-                }
-            }
-            _ => {}
-        }
-        let event = completed_event_for_pending(&entry.pending);
-        // 3. Fire IdleNotify only, now — CompleteNotify is parked below.
-        fire_present_idle_notify_now(state, &event);
+        // The entry never reached `enqueue_present_completion`; this is its
+        // sole buffer-release path. The X11 fence mirror is updated together
+        // with the wake so QueryFence cannot lag behind a released buffer.
+        complete_pending_present_as_skip(state, backend, &entry.pending, target);
         log::debug!(
             target: "present_pace",
             "PACE-INSTR t={} pid={} stage=superseded by={} window=0x{:x} eff={}",
             pace_instr_ms(), pid, successor.present_id, window, target
         );
-        // 4. Park the Skip for ordered delivery at the target clock.
-        // 5. The entry + side-map row are already gone (removed above).
-        state
-            .present_pending_complete
-            .push(crate::server::PendingPresentComplete {
-                event,
-                effective_target_msc: target,
-                mode: yserver_protocol::x11::present::COMPLETE_MODE_SKIP,
-                emit_idle: false,
-            });
+        // The entry + side-map row are already gone (removed above); the
+        // Skip is queued by `complete_pending_present_as_skip`.
     }
 }
 
@@ -1085,6 +1097,34 @@ pub(super) fn execute_present_pixmap_copy(
     Ok(())
 }
 
+/// Finds older source/acquire waiters that this Present would cover if it
+/// executes. Such entries stay pending until their producer fence signals,
+/// then complete as Skip rather than painting over the newer frame.
+fn covered_older_pending_wait_ids(
+    state: &ServerState,
+    successor: &PendingPresentPixmap,
+) -> Vec<u64> {
+    let Some(target) = successor.effective_target_msc else {
+        return Vec::new();
+    };
+    state
+        .present_pending_exec
+        .iter()
+        .filter(|(pid, entry)| {
+            **pid < successor.present_id
+                && !entry.source_ready
+                && entry.wait_id.is_some()
+                && entry.pending.request.window() == successor.request.window()
+                && entry.pending.window_generation == successor.window_generation
+                && entry.pending.crtc_id == successor.crtc_id
+                && entry.pending.crtc_epoch == successor.crtc_epoch
+                && entry.pending.effective_target_msc == Some(target)
+                && present_supersession_covers(successor, &entry.pending)
+        })
+        .map(|(pid, _)| *pid)
+        .collect()
+}
+
 /// Task 8 §Supersession copy-failure reroute (round-4 F5). Wrapper
 /// around `execute_present_pixmap_copy` used by ALL THREE execute sites
 /// (`execute_parked_present_ids`, `arrival_execute_or_park_present_pixmap`'s
@@ -1119,9 +1159,21 @@ pub(super) fn execute_present_pixmap_copy_or_reroute(
     let wake = pending.wake.clone();
     let effective_target_msc = pending.effective_target_msc;
     let present_id = pending.present_id;
+    // A source/acquire waiter cannot be released before its producer
+    // signals. Remember covered older waiters only after this frame really
+    // executes; when those fences signal, they resolve as Skip instead of
+    // painting stale content over this newer frame.
+    let older_wait_ids = covered_older_pending_wait_ids(state, &pending);
 
     match execute_present_pixmap_copy(state, backend, pending) {
-        Ok(()) => true,
+        Ok(()) => {
+            for older_id in older_wait_ids {
+                if let Some(entry) = state.present_pending_exec.get_mut(&older_id) {
+                    entry.superseded_by_executed_present_id = Some(present_id);
+                }
+            }
+            true
+        }
         Err(e) => {
             log::warn!("present copy failed, rerouting completion (pid={present_id}): {e}");
             // Accepted trade (Task 0 item (a) has the same shape for
@@ -1274,6 +1326,7 @@ pub(super) fn arrival_execute_or_park_present_pixmap(
                 crate::server::PendingPresentEntry {
                     pending,
                     source_ready: true,
+                    superseded_by_executed_present_id: None,
                     wait_id: None,
                     pin,
                 },
@@ -1283,7 +1336,19 @@ pub(super) fn arrival_execute_or_park_present_pixmap(
 }
 
 pub(crate) fn drain_ready_present_pixmaps(state: &mut ServerState, backend: &mut dyn Backend) {
-    for wait_id in backend.drain_ready_present_source_waits() {
+    let mut ready_wait_ids = backend.drain_ready_present_source_waits();
+    // If multiple producer fences are ready in one backend drain, execute
+    // them in Present arrival order. If a newer one became ready in an
+    // earlier drain, its execution marks older still-waiting entries so they
+    // resolve as Skip when their own fence eventually signals.
+    ready_wait_ids.sort_by_key(|wait_id| {
+        state
+            .present_wait_to_id
+            .get(wait_id)
+            .copied()
+            .unwrap_or(u64::MAX)
+    });
+    for wait_id in ready_wait_ids {
         let present_id = state.present_wait_to_id.remove(&wait_id);
         let entry = present_id.and_then(|pid| state.present_pending_exec.remove(&pid));
         let outcome = entry.map(|mut entry| {
@@ -1291,6 +1356,27 @@ pub(crate) fn drain_ready_present_pixmaps(state: &mut ServerState, backend: &mut
                 PendingPresentRequest::Pixmap(_) => "source_signaled",
                 PendingPresentRequest::PixmapSynced(_) => "acquire_signaled",
             };
+            log::debug!(
+                target: "present_pace",
+                "PACE-INSTR t={} pid={} stage={} wait_id={}",
+                pace_instr_ms(), entry.pending.present_id, stage, wait_id
+            );
+            if let Some(newer_present_id) = entry.superseded_by_executed_present_id {
+                let target = entry
+                    .pending
+                    .effective_target_msc
+                    .expect("only known same-target Presents are marked stale");
+                complete_pending_present_as_skip(state, backend, &entry.pending, target);
+                if let Some(pin) = entry.pin {
+                    backend.release_present_source(pin);
+                }
+                log::debug!(
+                    target: "present_pace",
+                    "PACE-INSTR t={} pid={} stage=stale_wait_skip by={}",
+                    pace_instr_ms(), entry.pending.present_id, newer_present_id
+                );
+                return None;
+            }
             let epoch_current = backend.present_crtc_clock_epoch(entry.pending.crtc_id)
                 == entry.pending.crtc_epoch;
             let clock_msc = if epoch_current {
@@ -1320,11 +1406,6 @@ pub(crate) fn drain_ready_present_pixmaps(state: &mut ServerState, backend: &mut
             } else {
                 crate::present_scheduler::MscDue::ExecuteNow
             };
-            log::debug!(
-                target: "present_pace",
-                "PACE-INSTR t={} pid={} stage={} wait_id={}",
-                pace_instr_ms(), entry.pending.present_id, stage, wait_id
-            );
             match due {
                 // The entry became source-ready AND is msc-due: execute now
                 // — releasing the ENTRY pin on both the success and
@@ -1882,6 +1963,7 @@ pub(super) fn handle_present_request(
                             crate::server::PendingPresentEntry {
                                 pending,
                                 source_ready: false,
+                                superseded_by_executed_present_id: None,
                                 wait_id: Some(wait_id),
                                 pin,
                             },
@@ -2281,6 +2363,7 @@ pub(super) fn handle_present_request(
                                 crate::server::PendingPresentEntry {
                                     pending,
                                     source_ready: false,
+                                    superseded_by_executed_present_id: None,
                                     wait_id: Some(wait_id),
                                     pin,
                                 },

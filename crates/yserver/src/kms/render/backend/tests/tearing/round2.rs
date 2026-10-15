@@ -1136,6 +1136,734 @@ fn tearing_summary_counts_async_and_fallbacks() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: keep the oldest ready successor instead of replacing it with the latest frame.
+fn tearing_on_uncapped_async_stream_reaches_backend_latest_wins_slot() {
+    use yserver_core::server::ServerState;
+
+    const WINDOW: u32 = 0x7a61;
+    const FIRST_PRESENT: u64 = 2_000;
+    const FRAME_COUNT: u64 = 20;
+
+    let mut backend = live_scene_backend();
+    let recorder = recording_sink(&mut backend, 0);
+    qualify_test_direct_async(&mut backend, &recorder, WINDOW, 2_100);
+    assert!(backend.pstate.tearing.is_on());
+
+    let sink = std::rc::Rc::clone(&backend.platform.devices[0].atomic_commit_sink);
+    let before = sink.for_tests_tearing_counts();
+    let mut state = ServerState::new();
+    let (width, height) = backend.platform.fb_dimensions();
+
+    // The delayed-acquire companion sends frames through this entry only
+    // after its 3 ms / 4 ms logical wait schedule.
+    for frame in 0..FRAME_COUNT {
+        let present_id = FIRST_PRESENT + frame;
+        assert!(
+            try_direct_present_for_window(
+                &mut backend,
+                present_id,
+                WINDOW,
+                width,
+                height,
+                yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+            )
+            .is_some(),
+            "ready frame {present_id} must reach the Backend while the prior flip is in flight"
+        );
+    }
+
+    assert_eq!(
+        backend
+            .pstate.scanout_m2
+            .pending
+            .as_ref()
+            .map(|frame| frame.candidate.present_id),
+        Some(FIRST_PRESENT),
+        "the first frame remains the in-flight flip"
+    );
+    assert_eq!(
+        backend
+            .pstate.scanout_m2
+            .queued_successor
+            .as_ref()
+            .map(|frame| frame.candidate.present_id),
+        Some(FIRST_PRESENT + FRAME_COUNT - 1),
+        "the newest ready frame occupies the single backend successor slot"
+    );
+    assert_eq!(
+        backend
+            .pstate.scanout_m2
+            .deferred_successor_skips
+            .iter()
+            .map(|event| event.present_id)
+            .collect::<Vec<_>>(),
+        (FIRST_PRESENT + 1..FIRST_PRESENT + FRAME_COUNT - 1).collect::<Vec<_>>(),
+        "only the older ready successors are skipped by backend latest-wins"
+    );
+    assert_eq!(
+        recorder.records().len(),
+        1,
+        "only the in-flight frame submits"
+    );
+
+    retire_direct_present(&mut backend, &mut state, 50);
+    assert_eq!(
+        backend
+            .pstate.scanout_m2
+            .completed
+            .iter()
+            .map(|event| (event.present_id, event.completion_mode))
+            .collect::<Vec<_>>(),
+        std::iter::once((
+            FIRST_PRESENT,
+            yserver_protocol::x11::present::COMPLETE_MODE_FLIP,
+        ))
+        .chain(
+            (FIRST_PRESENT + 1..FIRST_PRESENT + FRAME_COUNT - 1).map(|present_id| {
+                (
+                    present_id,
+                    yserver_protocol::x11::present::COMPLETE_MODE_SKIP,
+                )
+            })
+        )
+        .collect::<Vec<_>>(),
+        "the retired flip completes before ordered skips for replaced successors"
+    );
+    assert_eq!(
+        recorder.records().len(),
+        2,
+        "the newest successor submits at retirement"
+    );
+    retire_direct_present(&mut backend, &mut state, 51);
+    assert_direct_queue_drained(&backend);
+
+    assert_eq!(
+        sink.for_tests_tearing_counts().client_present_direct - before.client_present_direct,
+        FRAME_COUNT,
+        "all uncapped frames are counted at Backend entry, including replaced successors"
+    );
+
+    seed_pending_tearing_cursor_wake(&mut backend);
+    assert!(
+        try_direct_present_for_window(&mut backend, 2_020, WINDOW, width, height, 0).is_some(),
+        "a non-Async Backend Present exits tearing"
+    );
+    assert_tearing_off(&backend);
+    retire_direct_present(&mut backend, &mut state, 52);
+    assert_direct_queue_drained(&backend);
+    assert!(!backend.scene.has_pending_page_flips());
+    assert_commit_sequence(
+        &recorder,
+        &[
+            AtomicCommitKind::Async,
+            AtomicCommitKind::Async,
+            AtomicCommitKind::Scene,
+        ],
+    );
+    assert_tearing_off(&backend);
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: scrap fence-waiting victims in supersede_covered_pending_presents.
+fn tearing_on_delayed_acquire_stream_survives_core_supersession() {
+    use std::{
+        io::Read,
+        os::{
+            fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd},
+            unix::net::UnixStream,
+        },
+        sync::{Arc, Condvar, Mutex},
+        thread,
+    };
+    use yserver_core::{
+        backend::{Backend, SyncobjHandle},
+        core_loop::{
+            BoundSender, CoreSender, Message, ResetPolicy, auth::AuthState, channel,
+            poll_tokens::ClientIdAllocator, run_core,
+        },
+        server::{BackendCapabilities, ServerState},
+    };
+    use yserver_protocol::x11::{
+        ClientId, CreatePixmapRequest, RequestHeader, ResourceId, SequenceNumber, present,
+    };
+
+    const WINDOW: ResourceId = ResourceId(0x0100_7d90);
+    const PIXMAP_BASE: u32 = 0x0100_7da0;
+    const FIRST_SERIAL: u32 = 4_000;
+    const FRAME_COUNT: u64 = 20;
+    const ACQUIRE_SYNCOBJ: u32 = 0x00d0_0a11;
+    const RELEASE_SYNCOBJ: u32 = 0x00d0_0a12;
+
+    #[derive(Debug, Default)]
+    struct VirtualTime {
+        now_ms: u64,
+        generation: u64,
+        observed_generation: u64,
+    }
+
+    #[derive(Debug, Default)]
+    struct AcquireTimeline {
+        time: Mutex<VirtualTime>,
+        observed: Condvar,
+    }
+
+    impl AcquireTimeline {
+        fn advance_to(&self, now_ms: u64) -> u64 {
+            let mut time = self.time.lock().expect("virtual acquire clock");
+            assert!(now_ms >= time.now_ms, "virtual acquire time is monotonic");
+            time.now_ms = now_ms;
+            time.generation += 1;
+            time.generation
+        }
+
+        fn wait_until_observed(&self, generation: u64) {
+            let mut time = self.time.lock().expect("virtual acquire clock");
+            while time.observed_generation < generation {
+                time = self
+                    .observed
+                    .wait(time)
+                    .expect("wait for the production source-wait drain");
+            }
+        }
+    }
+
+    impl SyncobjHandle for AcquireTimeline {
+        fn signal(&self, _value: u64) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn import_sync_file(&self, _value: u64, _fd: BorrowedFd<'_>) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl crate::kms::render::imported_syncobj::PresentSyncobj for AcquireTimeline {
+        fn timeline_value(&self) -> std::io::Result<u64> {
+            let mut time = self.time.lock().expect("virtual acquire clock");
+            time.observed_generation = time.generation;
+            self.observed.notify_all();
+            Ok(time.now_ms)
+        }
+
+        fn signaled_eventfd(&self, _value: u64) -> std::io::Result<OwnedFd> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "test timeline uses the polling fallback",
+            ))
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct ReleaseTimeline {
+        signaled: Mutex<Vec<u64>>,
+    }
+
+    impl SyncobjHandle for ReleaseTimeline {
+        fn signal(&self, value: u64) -> std::io::Result<()> {
+            self.signaled.lock().expect("release timeline").push(value);
+            Ok(())
+        }
+
+        fn import_sync_file(&self, _value: u64, _fd: BorrowedFd<'_>) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl crate::kms::render::imported_syncobj::PresentSyncobj for ReleaseTimeline {
+        fn timeline_value(&self) -> std::io::Result<u64> {
+            Ok(self
+                .signaled
+                .lock()
+                .expect("release timeline")
+                .last()
+                .copied()
+                .unwrap_or(0))
+        }
+
+        fn signaled_eventfd(&self, _value: u64) -> std::io::Result<OwnedFd> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "test release timeline does not export eventfds",
+            ))
+        }
+    }
+
+    struct ShutdownOnDrop {
+        sender: CoreSender,
+        active: bool,
+    }
+
+    impl Drop for ShutdownOnDrop {
+        fn drop(&mut self) {
+            if self.active {
+                let _ = self.sender.send(Message::Shutdown);
+            }
+        }
+    }
+
+    fn read_barrier(
+        peer: &mut UnixStream,
+        request_sender: &BoundSender,
+        sequence: &mut u16,
+    ) -> Vec<super::TestPresentCompletion> {
+        let current_sequence = *sequence;
+        *sequence = sequence.wrapping_add(1);
+        request_sender
+            .send(Message::Request {
+                id: ClientId(1),
+                sequence: SequenceNumber(current_sequence),
+                accepted_at: None,
+                header: RequestHeader {
+                    opcode: 43, // GetInputFocus: core-loop round trip.
+                    data: 0,
+                    length_units: 1,
+                },
+                body: Vec::new(),
+                attached_fd: None,
+            })
+            .expect("queue core-loop barrier");
+
+        let mut completions = Vec::new();
+        loop {
+            let mut first = [0_u8; 1];
+            peer.read_exact(&mut first)
+                .expect("read core-loop response");
+            match first[0] {
+                35 => {
+                    let mut event = [0_u8; 40];
+                    event[0] = first[0];
+                    peer.read_exact(&mut event[1..])
+                        .expect("read Present CompleteNotify");
+                    assert_eq!(
+                        u16::from_le_bytes([event[8], event[9]]),
+                        u16::from(present::EVENT_COMPLETE_NOTIFY),
+                    );
+                    completions.push(super::TestPresentCompletion {
+                        serial: u32::from_le_bytes(event[20..24].try_into().unwrap()),
+                        mode: event[11],
+                    });
+                }
+                1 => {
+                    let mut reply = [0_u8; 32];
+                    reply[0] = first[0];
+                    peer.read_exact(&mut reply[1..])
+                        .expect("read GetInputFocus reply");
+                    break;
+                }
+                response => panic!("unexpected X11 response {response} from run_core"),
+            }
+        }
+        completions
+    }
+
+    fn run_core_for_barriers(
+        state: &mut ServerState,
+        backend: &mut KmsBackend,
+        peer: &mut UnixStream,
+        sequence: &mut u16,
+        barrier_count: usize,
+    ) -> Vec<super::TestPresentCompletion> {
+        let (poll, sender, receiver) = channel().expect("core-loop flush channel");
+        let request_sender = sender.bind();
+        let shutdown_sender = sender.clone_handle();
+        let mut producer_peer = peer.try_clone().expect("clone core client peer");
+        let mut producer_sequence = *sequence;
+        let driver = thread::spawn(move || {
+            let mut shutdown = ShutdownOnDrop {
+                sender: shutdown_sender,
+                active: true,
+            };
+            let mut completed = Vec::new();
+            for _ in 0..barrier_count {
+                completed.extend(read_barrier(
+                    &mut producer_peer,
+                    &request_sender,
+                    &mut producer_sequence,
+                ));
+            }
+            shutdown
+                .sender
+                .send(Message::Shutdown)
+                .expect("stop core-loop flush");
+            shutdown.active = false;
+            (producer_sequence, completed)
+        });
+        run_core(
+            poll,
+            receiver,
+            sender.clone_handle(),
+            state,
+            backend,
+            [],
+            &ClientIdAllocator::new(),
+            AuthState::new(None),
+            ResetPolicy::NoReset,
+            None,
+        )
+        .expect("run_core flush");
+        let (new_sequence, completed) = driver.join().expect("core-loop flush driver panicked");
+        *sequence = new_sequence;
+        completed
+    }
+
+    let mut backend = live_scene_backend();
+    let recorder = recording_sink(&mut backend, 0);
+    let (pollable_device, _device_peer) = pollable_test_device();
+    backend.platform.devices[0].device = pollable_device;
+    let (outputs, modes) = Backend::randr_outputs_and_modes(&mut backend);
+    let (width, height) = Backend::fb_dimensions(&backend);
+    let mut state = ServerState::with_randr_outputs_and_modes(
+        width,
+        height,
+        outputs,
+        modes,
+        BackendCapabilities::from_backend(&backend),
+    );
+    let stage_host =
+        super::materialize_test_cow_stage(&mut backend, &mut state, ClientId(1), WINDOW);
+    super::enter_tearing_without_direct_scanout_for_state_ids(
+        &mut backend,
+        &mut state,
+        WINDOW.0,
+        stage_host,
+        stage_host,
+        3_100,
+    );
+    Backend::set_cursor_hidden(&mut backend, true);
+    super::damage_root_and_composite(&mut backend);
+    assert!(backend.scene.has_pending_page_flips());
+    super::retire_composed_frame(&mut backend, &mut state, 70);
+    assert!(backend.pstate.tearing.is_on());
+    for index in 0..7_u64 {
+        assert!(
+            super::try_direct_present_for_ids(
+                &mut backend,
+                3_200 + index,
+                WINDOW.0,
+                stage_host,
+                stage_host,
+                width,
+                height,
+                yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+            )
+            .is_none()
+        );
+    }
+    assert_eq!(backend.pstate.scanout_m2.eligible_root_streak, 7);
+    recorder.clear_records();
+    let sink = std::rc::Rc::clone(&backend.platform.devices[0].atomic_commit_sink);
+    let before_direct = sink.for_tests_tearing_counts().client_present_direct;
+    let before_skips = backend.telemetry.lifetime.present_skips;
+    let mut peer = super::install_test_core_client(&mut state);
+    peer.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .expect("bound core-loop response waits");
+
+    let acquire = Arc::new(AcquireTimeline::default());
+    let release = Arc::new(ReleaseTimeline::default());
+    backend
+        .pstate.dri3_syncobjs
+        .insert(ACQUIRE_SYNCOBJ, (ClientId(1), acquire.clone()));
+    backend
+        .pstate.dri3_syncobjs
+        .insert(RELEASE_SYNCOBJ, (ClientId(1), release.clone()));
+    // Force the existing timeline-poll fallback. run_core still discovers
+    // readiness through Backend::drain_ready_present_source_waits.
+    backend.pstate.syncobj_eventfd_supported = Some(false);
+
+    let mut crtcs: Vec<_> = backend
+        .platform
+        .outputs
+        .iter()
+        .map(|layout| layout.output.crtc)
+        .collect();
+    crtcs.sort_by_key(|crtc| u32::from(*crtc));
+    let direct_shape = crate::drm::async_flip::AsyncShape {
+        fourcc: 0x3432_5258,
+        modifier: 0,
+        pitch: u32::from(width) * 4,
+        width: u32::from(width),
+        height: u32::from(height),
+        crtcs,
+        direct: true,
+    };
+    // Establish the M1 topology signature before injecting accepted probe
+    // results for the synthetic scanout buffers below. The fixture's mode
+    // geometry intentionally cannot run a real TEST_ONLY probe.
+    let (topology_candidate, _, _) = super::prepare_direct_present_for_ids(
+        &mut backend,
+        3_300,
+        WINDOW.0,
+        stage_host,
+        width,
+        height,
+        yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+    );
+    Backend::note_present_scanout_candidate(&mut backend, topology_candidate);
+    for frame in 0..FRAME_COUNT {
+        let pixmap = ResourceId(PIXMAP_BASE + u32::try_from(frame).unwrap());
+        let host_pixmap = Backend::create_pixmap(&mut backend, None, 24, width, height)
+            .expect("create explicit-sync Present source");
+        state.resources.create_pixmap(
+            ClientId(1),
+            CreatePixmapRequest {
+                depth: 24,
+                pixmap,
+                drawable: WINDOW,
+                width,
+                height,
+            },
+        );
+        assert!(state.resources.set_pixmap_host_xid(pixmap, host_pixmap));
+        let source_id = backend
+            .store
+            .lookup(host_pixmap.as_raw())
+            .expect("Present source has KMS storage");
+        backend.pstate.scanout_m1.entries.insert(
+            source_id,
+            crate::kms::render::backend::ScanoutM1ProbeEntry::accepted_with_shape(
+                crate::drm::modeset::DirectScanoutProbeFramebuffer::for_tests(raw(
+                    0x8700 + u32::try_from(frame).unwrap()
+                )),
+                direct_shape.clone(),
+            ),
+        );
+    }
+    let first_present_id = state.present_next_id;
+    super::select_test_present_complete_events(&mut state, WINDOW.0);
+
+    let (poll, sender, receiver) = channel().expect("core-loop request channel");
+    let request_sender = sender.bind();
+    let shutdown_sender = sender.clone_handle();
+    let producer_peer = peer.try_clone().expect("clone core client peer");
+    let driver = thread::spawn(move || {
+        let mut shutdown = ShutdownOnDrop {
+            sender: shutdown_sender,
+            active: true,
+        };
+        let mut producer_peer = producer_peer;
+        let mut request_sequence = 1_u16;
+        let mut completions = Vec::new();
+        for frame in 0..FRAME_COUNT {
+            let arrival_ms = frame * 3;
+            acquire.advance_to(arrival_ms);
+            let pixmap = PIXMAP_BASE + u32::try_from(frame).unwrap();
+            let serial = FIRST_SERIAL + u32::try_from(frame).unwrap();
+            let mut body = vec![0_u8; 84];
+            body[0..4].copy_from_slice(&WINDOW.0.to_le_bytes());
+            body[4..8].copy_from_slice(&pixmap.to_le_bytes());
+            body[8..12].copy_from_slice(&serial.to_le_bytes());
+            body[28..32].copy_from_slice(&ACQUIRE_SYNCOBJ.to_le_bytes());
+            body[32..36].copy_from_slice(&RELEASE_SYNCOBJ.to_le_bytes());
+            body[36..44].copy_from_slice(&(arrival_ms + 4).to_le_bytes());
+            body[44..52].copy_from_slice(&(frame + 1).to_le_bytes());
+            body[52..56].copy_from_slice(
+                &yserver_core::present_scheduler::PRESENT_OPTION_ASYNC.to_le_bytes(),
+            );
+            let present_sequence = request_sequence;
+            request_sequence = request_sequence.wrapping_add(1);
+            request_sender
+                .send(Message::Request {
+                    id: ClientId(1),
+                    sequence: SequenceNumber(present_sequence),
+                    accepted_at: None,
+                    header: RequestHeader {
+                        opcode: 145,
+                        data: present::PIXMAP_SYNCED,
+                        length_units: 22,
+                    },
+                    body,
+                    attached_fd: None,
+                })
+                .expect("queue real PresentPixmapSynced request");
+            completions.extend(read_barrier(
+                &mut producer_peer,
+                &request_sender,
+                &mut request_sequence,
+            ));
+
+            // At frame i's arrival + 1 ms, frame i-1's acquire point is
+            // ready. The barrier wakes run_core, and the generation wait
+            // proves the production source-wait drain observed this time.
+            let prior_signal_ms = arrival_ms + 1;
+            let generation = acquire.advance_to(prior_signal_ms);
+            completions.extend(read_barrier(
+                &mut producer_peer,
+                &request_sender,
+                &mut request_sequence,
+            ));
+            acquire.wait_until_observed(generation);
+        }
+
+        let final_signal_ms = (FRAME_COUNT - 1) * 3 + 4;
+        let generation = acquire.advance_to(final_signal_ms);
+        completions.extend(read_barrier(
+            &mut producer_peer,
+            &request_sender,
+            &mut request_sequence,
+        ));
+        acquire.wait_until_observed(generation);
+
+        shutdown
+            .sender
+            .send(Message::Shutdown)
+            .expect("stop request core");
+        shutdown.active = false;
+        (request_sequence, completions)
+    });
+    run_core(
+        poll,
+        receiver,
+        sender.clone_handle(),
+        &mut state,
+        &mut backend,
+        [],
+        &ClientIdAllocator::new(),
+        AuthState::new(None),
+        ResetPolicy::NoReset,
+        None,
+    )
+    .expect("run_core PresentPixmapSynced stream");
+    let (request_sequence, mut completions) = driver.join().expect("Present driver panicked");
+
+    assert!(state.present_pending_exec.is_empty());
+    assert!(state.present_wait_to_id.is_empty());
+    assert!(backend.pstate.pending_present_source_waits.is_empty());
+    assert_eq!(
+        sink.for_tests_tearing_counts().client_present_direct - before_direct,
+        FRAME_COUNT,
+        "all 20 core requests reach the direct Backend entry; tearing={:?}, eligible_root_streak={}, unflip={:?}, completions={completions:?}",
+        backend.pstate.tearing.state,
+        backend.pstate.scanout_m2.eligible_root_streak,
+        backend.pstate.scanout_m2.unflip_reason,
+    );
+    assert_eq!(
+        backend
+            .pstate.scanout_m2
+            .pending
+            .as_ref()
+            .map(|frame| frame.candidate.present_id),
+        Some(first_present_id),
+        "first ready frame remains the in-flight async flip"
+    );
+    assert_eq!(
+        backend
+            .pstate.scanout_m2
+            .queued_successor
+            .as_ref()
+            .map(|frame| frame.candidate.present_id),
+        Some(first_present_id + FRAME_COUNT - 1),
+        "latest ready frame remains in the Backend successor slot"
+    );
+    let backend_successor_skips: Vec<_> = backend
+        .pstate.scanout_m2
+        .deferred_successor_skips
+        .iter()
+        .map(|event| event.present_id)
+        .collect();
+    assert_eq!(
+        backend_successor_skips,
+        (first_present_id + 1..first_present_id + FRAME_COUNT - 1).collect::<Vec<_>>(),
+        "only executed frames replaced by the in-flight Backend successor are skipped"
+    );
+    assert_eq!(
+        backend.telemetry.lifetime.present_skips - before_skips,
+        u64::try_from(backend_successor_skips.len()).unwrap(),
+        "note_present_skip records only Backend successor replacements, with zero core fence-wait scraps"
+    );
+    assert_commit_sequence(&recorder, &[AtomicCommitKind::Async]);
+
+    // Retire the two async flips through Backend's real page-flip callback;
+    // core completion delivery still runs through run_core after each event.
+    let retire = |backend: &mut KmsBackend, state: &mut ServerState, frame: u32| {
+        let source = backend.platform.devices[0]
+            .test_page_flip_event_source
+            .as_ref()
+            .expect("recording page-flip source");
+        for output in &backend.platform.outputs {
+            source.queue_flip(output.output.crtc, frame);
+        }
+        let drm_fd = backend.platform.devices[0].device.as_fd().as_raw_fd();
+        Backend::on_page_flip_ready(backend, state, drm_fd);
+        Backend::maybe_composite(backend).expect("settle retired async Present");
+    };
+    let mut next_flush_sequence = request_sequence;
+    retire(&mut backend, &mut state, 100);
+    assert_eq!(recorder.records().len(), 2);
+    assert_commit_sequence(
+        &recorder,
+        &[AtomicCommitKind::Async, AtomicCommitKind::Async],
+    );
+    completions.extend(run_core_for_barriers(
+        &mut state,
+        &mut backend,
+        &mut peer,
+        &mut next_flush_sequence,
+        2,
+    ));
+    retire(&mut backend, &mut state, 101);
+    completions.extend(run_core_for_barriers(
+        &mut state,
+        &mut backend,
+        &mut peer,
+        &mut next_flush_sequence,
+        2,
+    ));
+
+    let expected_completions: Vec<_> = (0..FRAME_COUNT)
+        .map(|frame| super::TestPresentCompletion {
+            serial: FIRST_SERIAL + u32::try_from(frame).unwrap(),
+            mode: if frame == 0 || frame == FRAME_COUNT - 1 {
+                present::COMPLETE_MODE_FLIP
+            } else {
+                present::COMPLETE_MODE_SKIP
+            },
+        })
+        .collect();
+    assert_eq!(completions, expected_completions);
+    assert_eq!(
+        state.present_next_id,
+        first_present_id + FRAME_COUNT,
+        "all 20 Present requests allocated and completed their core IDs"
+    );
+    assert!(state.present_pending_exec.is_empty());
+    assert!(state.present_wait_to_id.is_empty());
+    assert!(state.present_pending_complete.is_empty());
+    assert!(state.present_complete_gate.is_empty());
+    assert!(backend.pstate.pending_present_source_waits.is_empty());
+    assert_direct_queue_drained(&backend);
+    assert!(!backend.scene.has_pending_page_flips());
+    assert!(backend.pstate.tearing.is_on());
+    assert_eq!(
+        backend.telemetry.lifetime.present_skips - before_skips,
+        FRAME_COUNT - 2,
+        "all skips belong to the 18 Backend latest-wins successor replacements"
+    );
+    assert!(
+        backend
+            .platform
+            .async_ledger
+            .allows(crate::drm::async_flip::AsyncStream::Direct, &direct_shape)
+    );
+    assert_eq!(
+        backend
+            .platform
+            .async_ledger
+            .for_tests_consecutive_einval(crate::drm::async_flip::AsyncStream::Direct),
+        0,
+        "accepted async direct flips leave no suspension history"
+    );
+    let mut release_points = release.signaled.lock().expect("release points").clone();
+    release_points.sort_unstable();
+    assert_eq!(
+        release_points,
+        (1..FRAME_COUNT).collect::<Vec<_>>(),
+        "the 19 retired sources signal release; the final displayed frame remains current"
+    );
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: retain the Copy receipt timestamp unless the async ioctl succeeds, even after its Vsync fallback succeeds.
 fn tearing_copy_receipt_is_consumed_by_successful_vsync_fallback() {
     use yserver_core::{

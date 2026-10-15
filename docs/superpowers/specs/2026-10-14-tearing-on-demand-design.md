@@ -219,6 +219,31 @@ The next eligible Present may re-enter direct scanout with vsync.
 - non-fullscreen windows and the desktop: composed with vsync;
 - the scene's own flips outside `On`: vsync.
 
+### 1b. Core supersession parity with Xorg (amendment B, user-approved 2026-10-15)
+
+Hardware runs showed that the core's supersession (`supersede_covered_pending_presents`,
+yserver-core `present_ext.rs`) scraps a pending Present that is already due and only waiting for its source /
+acquire fence whenever a same-target successor arrives. Explicit-sync Vulkan clients (NVIDIA's WSI, radv, DXVK,
+VKD3D, CS2) send `PresentPixmapSynced` before the GPU finishes the frame. A GPU-bound client therefore has almost
+every frame scrapped before its fence signals: CS2 on NVIDIA went from 311 direct flips/s to 7–50/s once the scene
+loaded the GPU (330–360 Presents/s, 300–340 scrapped/s); mpv on the AMD iGPU showed 7 flips/s for 515 Presents/s.
+
+Xorg scraps only Presents queued for a future MSC (`present_scmd.c:803-823`, `if (!vblank->queued) continue;`); a due
+Present waiting for its wait fence sits in `present_execute_wait` (`present_execute.c:61-77`) and executes when the
+fence triggers. yserver adopts the same rule for every Present, not only while tearing:
+
+- the core scraps a pending Present only while it is parked for a future MSC;
+- a due Present waiting for its source/acquire fence is never scrapped by a successor; it executes when its fence
+  signals, in arrival order;
+- once executed, the backend's single latest-wins successor slot still replaces an older ready frame while a flip
+  is in flight, so a frame that is already stale is dropped there.
+- order is preserved: a fence-waiting Present whose fence signals after a newer same-window, same-target Present
+  has already executed completes as Skip (it would otherwise show an older frame after a newer one).
+
+This amends the 2026-08-11 async-supersession spec (its sentence "requests still waiting for their acquire/source
+fence remain in core and can be scrapped there"), which deviated from Xorg. Memory is bounded by the client's
+swapchain images, since each pending Present holds one of the client's buffers. Vsync Presents remain paced by vblank.
+
 ### 2. Building and submitting the commit
 
 `submit_direct_scanout` (`modeset.rs:1570`) and `submit_scene_flip_with_fences`

@@ -648,3 +648,19 @@ Hardware validation on NVIDIA found three defects; the user approved fixing all 
    most one cursor-only compose per refresh interval. Mutation: cap only the physical path.
 3. **Async flip turnaround telemetry was wrong** (~1.2 s while 600 flips/s). Measure from the accepted async ioctl of
    that commit to its own flip event. Test with the recording sink and a scripted event source.
+
+### Amendment B (after the CS2 and AMD runs, 2026-10-15, user-approved; spec §1b)
+
+Core supersession parity with Xorg: `supersede_covered_pending_presents` scraps a victim only while it is parked for
+a future MSC; due Presents waiting for their source/acquire fence are never scrapped and execute when the fence
+signals, in arrival order. The backend's latest-wins successor slot is unchanged. One exception, to keep presentation order: a fence-waiting Present whose fence signals after a NEWER same-window, same-target Present has already executed completes as Skip instead of executing (showing it would put an older frame on screen after a newer one). This is not scrapping while waiting.
+
+- Find every producer of "pending, waiting for fence" vs "parked for MSC" in `present_pending_exec` before changing
+  the predicate; state both meanings in the commit message with file:line.
+- Tests (core and Backend-driven): GPU slower than CPU — Presents every 3 ms with acquire points signalling 4 ms after
+  submission, over ≥ 20 frames, tearing On: every frame executes (Flip or backend latest-wins Skip only when a flip
+  is in flight), none is scrapped while waiting. Vsync-parked successors still scrap parked victims (existing tests
+  stay green). The 2026-08-11 tests that asserted scrapping of fence-waiting requests are updated to the new rule,
+  each change justified in the report. Mutation: scrap fence-waiting victims again.
+- Warframe regression guard (the 2026-08-11 motivation): an uncapped async stream with a flip in flight stays uncapped
+  (requests reach the backend, which keeps one successor).

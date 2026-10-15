@@ -894,7 +894,7 @@ pub struct KmsBackendState {
         u32,
         (
             yserver_protocol::x11::ClientId,
-            std::sync::Arc<crate::kms::render::imported_syncobj::ImportedSyncobj>,
+            std::sync::Arc<dyn crate::kms::render::imported_syncobj::PresentSyncobj>,
         ),
     >,
 
