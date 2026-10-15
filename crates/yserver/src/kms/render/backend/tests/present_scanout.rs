@@ -2404,6 +2404,13 @@ fn atomic_cursor_scanout_backend_with_hidden_cursor(hidden: bool) -> Option<KmsB
     backend.scene = crate::kms::render::scene::SceneCompositor::new(&backend.platform, &layouts)
         .expect("construct live two-output scene");
     if !hidden {
+        let cursor_xid = 0x7f10;
+        backend.insert_cursor_record(cursor_xid, 1, 1, 0, 0, vec![0xff; 4]);
+        let root = backend.core.window_id;
+        yserver_core::backend::Backend::define_cursor(&mut backend, None, root, cursor_xid)
+            .expect("select the fixture's visible root cursor");
+        assert_eq!(backend.effective_cursor_xid, Some(cursor_xid));
+        assert!(!backend.effective_cursor_hidden());
         backend.scene.for_tests_set_hw_cursor_mode();
     }
     backend.scene.scene_structure_dirty = false;
@@ -3749,6 +3756,13 @@ fn eligible_fullscreen_present_records_cursor_positions_for_both_outputs() {
     let layouts = backend.platform.scene_output_layouts();
     backend.scene = crate::kms::render::scene::SceneCompositor::new(&backend.platform, &layouts)
         .expect("live SceneCompositor");
+    let cursor_xid = 0x7f10;
+    backend.insert_cursor_record(cursor_xid, 1, 1, 0, 0, vec![0xff; 4]);
+    let root = backend.core.window_id;
+    Backend::define_cursor(&mut backend, None, root, cursor_xid)
+        .expect("select the fixture's visible root cursor");
+    assert_eq!(backend.effective_cursor_xid, Some(cursor_xid));
+    assert!(!backend.effective_cursor_hidden());
     backend.scene.for_tests_set_hw_cursor_mode();
 
     let recorder = atomic_cursor_recording_sink(&mut backend);

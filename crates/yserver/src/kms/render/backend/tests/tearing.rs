@@ -635,8 +635,18 @@ fn enter_tearing_without_direct_scanout_for_state_ids(
         .expect("select the fixture's visible root cursor");
     Backend::set_cursor_hidden(backend, true);
     Backend::set_cursor_hidden(backend, false);
-    damage_root_and_composite(backend);
-    assert!(backend.scene.has_pending_page_flips());
+    damage_root(backend);
+    let composite_result = Backend::maybe_composite(backend);
+    assert!(
+        composite_result.is_ok() && backend.scene.has_pending_page_flips(),
+        "initial tearing scene compose did not submit a page flip: maybe_composite={composite_result:?}; {}",
+        tearing_composite_diagnostics(
+            backend,
+            backend.platform.devices[0]
+                .atomic_commit_sink
+                .for_tests_record_count(),
+        ),
+    );
     retire_composed_frame(backend, state, 1);
     assert_eq!(
         backend.scene.cursor_mode(),
@@ -676,6 +686,46 @@ fn enter_tearing_without_direct_scanout_for_state_ids(
         backend.scene.cursor_mode(),
         backend.core.top_level_order
     );
+}
+
+fn tearing_composite_diagnostics(backend: &KmsBackend, recorder_count: Option<usize>) -> String {
+    let now = backend.monotonic_now();
+    let deadline = backend.for_tests_tearing_cursor_compose_deadline_at(now);
+    let scene_wants_scene = backend.for_tests_scene_wants_scene();
+    let has_output_ready_for_submit = backend.scene.has_output_ready_for_submit(&backend.platform);
+    let output_readiness: Vec<_> = (0..backend.platform.outputs.len())
+        .map(|output_idx| {
+            format!(
+                "output[{output_idx}]: scene_wants_scene={scene_wants_scene}, output_ready_for_submit={}",
+                backend.scene.output_ready_for_submit(output_idx, &backend.platform),
+            )
+        })
+        .collect();
+    let scanout_pools: Vec<_> = (0..backend.platform.outputs.len())
+        .map(|output_idx| {
+            let phases = backend
+                .platform
+                .scanout_pools
+                .get(output_idx)
+                .and_then(Option::as_ref)
+                .map(|pool| {
+                    pool.display_pool()
+                        .bos
+                        .iter()
+                        .map(|bo| bo.state.phase)
+                        .collect::<Vec<_>>()
+                });
+            (output_idx, phases.is_some(), phases)
+        })
+        .collect();
+
+    format!(
+        "cursor_mode={:?}, scene_wants_scene={scene_wants_scene}, scene_wants_compose={}, has_output_ready_for_submit={has_output_ready_for_submit}, output_readiness={output_readiness:?}, cursor_compose_deadline={deadline:?} at monotonic_now={now:?} (last_cursor_compose={:?}, interval={:?}), scanout_pools={scanout_pools:?}, recorder_record_count={recorder_count:?}",
+        backend.scene.cursor_mode(),
+        backend.for_tests_scene_wants_compose(),
+        backend.tearing.last_cursor_compose,
+        backend.tearing.cursor_compose_interval(&backend.platform),
+    )
 }
 
 fn assert_tearing_off(backend: &KmsBackend) {

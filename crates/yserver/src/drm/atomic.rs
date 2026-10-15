@@ -254,6 +254,11 @@ pub(crate) trait AtomicCommitExecutor {
         request: AtomicCommitRequest,
         events: &[AtomicCommitEvent],
     ) -> io::Result<()>;
+
+    #[cfg(test)]
+    fn for_tests_record_count(&self) -> Option<usize> {
+        None
+    }
 }
 
 #[derive(Default)]
@@ -288,6 +293,11 @@ impl AtomicCommitSink {
     /// cfg(test) request recorder through the same constructor.
     pub(crate) fn new(executor: Rc<dyn AtomicCommitExecutor>) -> Self {
         Self::new_with_clock(executor, Rc::new(monotonic_timestamp))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_record_count(&self) -> Option<usize> {
+        self.executor.for_tests_record_count()
     }
 
     #[cfg(test)]
@@ -1302,6 +1312,11 @@ pub(crate) mod tests_support {
     }
 
     impl AtomicCommitExecutor for RecordingAtomicCommitExecutor {
+        #[cfg(test)]
+        fn for_tests_record_count(&self) -> Option<usize> {
+            Some(self.records.borrow().len())
+        }
+
         fn atomic_commit(
             &self,
             _device: &Device,

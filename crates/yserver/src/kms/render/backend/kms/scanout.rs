@@ -2058,6 +2058,19 @@ impl KmsBackend {
     pub(crate) fn for_tests_scene_wants_compose(&self) -> bool {
         self.scene_wants_compose()
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_scene_wants_scene(&self) -> bool {
+        self.scene_wants_scene()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_tearing_cursor_compose_deadline_at(
+        &self,
+        now: std::time::Instant,
+    ) -> Option<std::time::Instant> {
+        self.tearing_cursor_compose_deadline(now)
+    }
 }
 
 impl KmsBackend {
