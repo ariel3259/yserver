@@ -120,6 +120,15 @@ The backend keeps a **tearing state**: `Off`, or `On` for one client window
 (`dst_window_xid` + CRTC epoch). It enters `On` on the first Present that meets the
 condition.
 
+**A fully transparent cursor counts as hidden** (user decision after the NVIDIA run, 2026-10-14). Many clients hide
+the pointer by defining an empty cursor image instead of XFIXES `HideCursor` (mpv's autohide, SDL's hidden cursor).
+Treating it as visible would force the KWin model to compose every frame and never reach direct scanout, defeating
+C1. A cursor whose image has alpha 0 on every pixel is classified when the cursor is created (once per cursor
+image) and behaves like XFIXES-hidden everywhere the cursor's visibility is decided: the scene assigns
+`CursorAssignment::Hidden`, `tearing_cursor_wants_visible` is false, and direct scanout is eligible. Outside tearing,
+the same classification applies; nothing is drawn either way, so it only removes useless plane or software-cursor
+work.
+
 **While `On`:**
 
 - **Cursor hidden** (`CursorPlaneMode::Hidden`): the frame goes through direct

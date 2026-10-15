@@ -630,3 +630,21 @@ Compare with the same client under vsync (`fifo`) on the same build. The result 
 - [ ] **Step 4:** the hardware runs. The user watches the monitor; send the per-step observation guide first.
 - [ ] **Step 5:** `docs/status.md` entry with the measured numbers. Commit
   `feat(kms): tearing telemetry and hardware results`.
+
+### Amendment A (after the NVIDIA hardware run, 2026-10-14, user-approved)
+
+Hardware validation on NVIDIA found three defects; the user approved fixing all three.
+
+1. **Transparent cursor = hidden** (spec §1, "A fully transparent cursor counts as hidden"). mpv hides the pointer with
+   an empty cursor image; with tearing `On` the direct gate rejected every frame (`m1_gate_reject[cursor=134]`) and
+   all frames were composed. Classify alpha-0-everywhere cursor images at creation (core, glyph, RENDER, animated
+   cursors) and treat them as hidden in every visibility decision (scene assignment, `tearing_cursor_wants_visible`,
+   direct gate, pointer fast path). Tests: an empty `CreateCursor`/`RenderCreateCursor` image while `On` reaches
+   direct async; a cursor with one opaque pixel still takes the handoff; switching between the two through
+   `DefineCursor` moves between direct and composed correctly. Mutation: classify by XFIXES only.
+2. **The cursor-only recomposition cap missed XTest motion.** With xdotool moving the pointer, the scene built
+   ~5,500 frames/s. Apply the cap at the single point every pointer-motion source reaches (physical, XTest,
+   WarpPointer), not only the physical path. Test: XTest motion at 1 kHz while `On` with a visible cursor gives at
+   most one cursor-only compose per refresh interval. Mutation: cap only the physical path.
+3. **Async flip turnaround telemetry was wrong** (~1.2 s while 600 flips/s). Measure from the accepted async ioctl of
+   that commit to its own flip event. Test with the recording sink and a scripted event source.

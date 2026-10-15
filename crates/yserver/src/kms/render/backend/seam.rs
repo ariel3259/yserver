@@ -62,6 +62,13 @@ pub trait Platform: OutputSink + Sized + 'static {
     }
     /// Route pointer motion while KMS tearing owns cursor composition.
     fn cursor_motion_during_tearing(_b: &mut XBackend<Self>, _cursor_visible: bool) {}
+    /// Whether generic request wakeups should leave a cursor-only tearing cap
+    /// intact instead of converting them into scene damage.
+    fn tearing_cursor_compose_cap_applies(_b: &XBackend<Self>) -> bool {
+        false
+    }
+    /// Record copy damage relevant to an active tearing stream.
+    fn note_tearing_copy_damage(_b: &mut XBackend<Self>, _dst_window_xid: u32) {}
     /// Leave tearing when a portable window lifecycle change affects its owner.
     fn exit_tearing_for_window(_b: &mut XBackend<Self>, _host_xid: u32, _reason: &'static str) {}
     /// Leave direct scanout for the composed scene.

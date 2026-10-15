@@ -57,12 +57,7 @@ impl KmsBackend {
             .direct_shape_chain_covers_root(candidate.paint_dst_host_xid, root)
             && (!matches!(target, ScanoutM0Target::Unredirected)
                 || self.unredirected_direct_scene_eligible(candidate.paint_dst_host_xid, root));
-        let cursor_hw = !include_cursor_term
-            || matches!(
-                self.scene.cursor_mode(),
-                crate::kms::render::scene::CursorPlaneMode::Hw
-                    | crate::kms::render::scene::CursorPlaneMode::Hidden
-            );
+        let cursor_hw = !include_cursor_term || self.direct_cursor_eligible();
         !self.platform.any_output_transformed()
             && self.direct_present_crtc_eligible(candidate.crtc_id, candidate.crtc_epoch)
             && scanout_direct_eligible(
@@ -252,6 +247,7 @@ impl KmsBackend {
         self.pstate.tearing.last_cursor_compose = None;
         self.pstate.tearing.deferred_cursor_wake = None;
         self.platform.async_ledger.clear();
+        self.platform.set_tearing_on(false);
         if was_on {
             log::info!("kms: leaving tearing: {reason}");
         }
@@ -786,6 +782,8 @@ impl KmsBackend {
         candidate: PresentScanoutCandidate,
         event: yserver_core::backend::CompletedPresentEvent,
     ) -> io::Result<bool> {
+        let present_received_at = std::time::Instant::now();
+        let present_received_monotonic = crate::drm::atomic::monotonic_timestamp();
         let source_id = self.store.lookup(candidate.src_host_xid);
         let leaf_id = self.store.lookup(candidate.paint_dst_host_xid);
         let paint_target = self.resolve_paint_target(candidate.paint_dst_host_xid);
@@ -807,6 +805,7 @@ impl KmsBackend {
             target,
             tearing_gate_ignoring_cursor,
         );
+        self.platform.set_tearing_on(self.pstate.tearing.is_on());
         self.register_tearing_copy_fallback(candidate, authoritative_root, source_id);
         if self.pstate.scanout_m2.reentry_blocked_until_composed {
             return Ok(false);
@@ -838,6 +837,8 @@ impl KmsBackend {
         let Some((completion_output_idx, _)) = self.present_crtc_output(candidate.crtc_id) else {
             return Ok(false);
         };
+        self.platform
+            .note_direct_present_received(completion_output_idx);
         debug_assert_eq!(
             event.crtc_id, candidate.crtc_id,
             "direct candidate and completion must share one CRTC domain"
@@ -892,6 +893,8 @@ impl KmsBackend {
             fallback_target_pin,
             source_id,
             candidate,
+            present_received_at,
+            present_received_monotonic,
             fallback_target,
             event,
             completion_output_idx,
@@ -1402,6 +1405,20 @@ impl KmsBackend {
     ) -> Vec<yserver_core::backend::CompletedPresentEvent> {
         let mut completed = self.drain_completed_present_events_impl();
         completed.append(&mut self.pstate.scanout_m2.completed);
+        for event in &completed {
+            if event.completion_mode != yserver_protocol::x11::present::COMPLETE_MODE_SKIP {
+                continue;
+            }
+            let Some((output_idx, _)) = self.present_crtc_output(event.crtc_id) else {
+                continue;
+            };
+            let Some(output) = self.platform.outputs.get(output_idx) else {
+                continue;
+            };
+            if let Some(device) = self.platform.device_for_output(&output.key) {
+                device.atomic_commit_sink.note_skip_completion();
+            }
+        }
         completed
     }
 

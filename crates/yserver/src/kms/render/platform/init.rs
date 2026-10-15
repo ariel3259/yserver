@@ -719,6 +719,9 @@ impl PlatformBackend {
         Ok(Self {
             initial_scanout_rollback_armed,
             devices,
+            tearing_on: false,
+            tearing_copy_received_at: None,
+            tearing_copy_received_monotonic: None,
             output_power_executor: Rc::new(super::power::DrmOutputPowerExecutor),
             deferred_cursor_move_outcome: crate::kms::render::platform::CursorMoveOutcome::default(
             ),
@@ -806,6 +809,9 @@ impl PlatformBackend {
                 test_page_flip_event_source: Some(test_page_flip_event_source),
                 cursor: KmsCursorState::new(),
             }],
+            tearing_on: false,
+            tearing_copy_received_at: None,
+            tearing_copy_received_monotonic: None,
             output_power_executor: Rc::new(super::power::DrmOutputPowerExecutor),
             deferred_cursor_move_outcome: crate::kms::render::platform::CursorMoveOutcome::default(
             ),

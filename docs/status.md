@@ -110,6 +110,16 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   tests cover HW, transformed-output SW, XFIXES-hidden, DPMS-off, and owner
   destruction. Hardware validation remains in Task 6.
 
+- **2026-10-14 tearing-on-demand Amendment A, item 1:** Cursor records cache
+  whether every final BGRA alpha byte is zero; an animated cursor is hidden
+  only when all its snapshotted frames are transparent. The effective-hidden
+  predicate combines XFIXES state, missing cursor images, and image transparency
+  across scene visibility, direct scanout, tearing handoff, pointer motion, and
+  VT/DPMS rearm. Cursor tests cover core, glyph, RENDER, recolor, animation, and
+  transparent-to-opaque handoff. The ignored tearing suite's other 49 tests pass
+  under lavapipe; `entry_waits_for_queued_show_on_retire` reaches its assertions
+  but the lavapipe worker segfaults during test shutdown.
+
 - **2026-10-13 hardware cursor in the wlroots model (branch `feat/atomic-cursor`):** on every device whose
   cursor planes expose `CRTC_X`/`CRTC_Y`, the cursor is driven through atomic commits. Each CRTC has one commit
   stream with at most one commit in flight:

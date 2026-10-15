@@ -237,6 +237,7 @@ fn backend_with_live_scene() -> Option<KmsBackend> {
     let layouts = backend.platform.scene_output_layouts();
     backend.scene = crate::kms::render::scene::SceneCompositor::new(&backend.platform, &layouts)
         .expect("construct hardware-free live scene");
+    install_visible_cursor_via_backend(&mut backend);
     backend.scene.for_tests_set_hw_cursor_mode();
     backend.scene.scene_structure_dirty = false;
     for drawable in backend.store.armed_damaged_ids() {
@@ -245,6 +246,28 @@ fn backend_with_live_scene() -> Option<KmsBackend> {
         }
     }
     Some(backend)
+}
+
+fn install_visible_cursor_via_backend(backend: &mut KmsBackend) {
+    use yserver_core::backend::Backend;
+
+    let source = Backend::create_pixmap(backend, None, 1, 1, 1).expect("cursor source pixmap");
+    Backend::put_image(backend, None, source.as_raw(), 1, 1, 1, 0, 0, &[1, 0, 0, 0])
+        .expect("paint visible cursor pixel");
+    let cursor = Backend::create_cursor(
+        backend,
+        None,
+        source,
+        None,
+        (u16::MAX, u16::MAX, u16::MAX),
+        (0, 0, 0),
+        0,
+        0,
+    )
+    .expect("create visible cursor");
+    Backend::define_cursor(backend, None, backend.core.window_id, cursor.as_raw())
+        .expect("define visible root cursor");
+    assert!(!backend.effective_cursor_hidden());
 }
 
 fn backend_with_hidden_dead_zone_scene() -> Option<KmsBackend> {
@@ -438,7 +461,11 @@ fn hidden_cursor_motion_from_dead_zone_wakes_scene_on_reentry() {
     let Some(mut backend) = backend_with_hidden_dead_zone_scene() else {
         return;
     };
+    install_visible_cursor_via_backend(&mut backend);
     let mut state = ServerState::new();
+    Backend::warp_pointer_root(&mut backend, &mut state, 850, 450);
+    // Model the initial retirement at a location covered by neither output.
+    backend.scene.scene_structure_dirty = false;
     assert!(!backend.cursor_hidden, "this is not XFIXES HideCursor");
     assert_eq!(
         backend.scene.cursor_mode(),
@@ -447,7 +474,6 @@ fn hidden_cursor_motion_from_dead_zone_wakes_scene_on_reentry() {
     assert!(!backend.for_tests_scene_wants_compose());
 
     // The gap and the shorter output's lower edge form the dead zone.
-    Backend::warp_pointer_root(&mut backend, &mut state, 850, 450);
     assert_eq!(
         (backend.core.cursor_x, backend.core.cursor_y),
         (850.0, 450.0)
@@ -840,6 +866,7 @@ fn direct_scanout_probe_tests_the_request_it_commits() {
         &planes,
         &[position],
         crate::drm::async_flip::FlipTiming::Vsync,
+        crate::drm::atomic::TearingCommitContext::NONE,
     )
     .expect("record live direct commit");
 

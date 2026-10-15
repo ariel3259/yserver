@@ -53,7 +53,7 @@ use std::{
     os::fd::OwnedFd,
     rc::Rc,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use ash::vk;
@@ -164,7 +164,18 @@ pub(crate) struct SequenceCompletion {
     pub(crate) sequence: u64,
 }
 
-type DrainedPageFlipEvents = (Vec<(usize, PresentClockSample)>, Vec<SequenceCompletion>);
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FlipEventTimestamps {
+    /// CLOCK_MONOTONIC receipt time used by async ioctl-to-event turnaround.
+    pub(crate) received_at_monotonic: Option<Duration>,
+    /// Kernel completion time converted to CLOCK_MONOTONIC for Present latency.
+    pub(crate) completion_at_monotonic: Option<Duration>,
+}
+
+type DrainedPageFlipEvents = (
+    Vec<(usize, PresentClockSample, FlipEventTimestamps)>,
+    Vec<SequenceCompletion>,
+);
 
 /// Process-local identity of one KMS CRTC.
 ///
@@ -421,6 +432,13 @@ pub struct PlatformBackend {
     initial_scanout_rollback_armed: bool,
     // DRM / output side
     pub(crate) devices: Vec<KmsDevice>,
+    /// Shared tearing state used by per-device commit telemetry and the
+    /// composed scene submit path.
+    pub(crate) tearing_on: bool,
+    /// Earliest backend-received Copy damage waiting for an async composed
+    /// commit. Retained across coalesced scene work.
+    pub(crate) tearing_copy_received_at: Option<Instant>,
+    pub(crate) tearing_copy_received_monotonic: Option<Duration>,
     pub(super) output_power_executor: Rc<dyn power::OutputPowerExecutor>,
     /// Cursor rollback outcomes raised while the scene owns the platform
     /// borrow. The backend drains this immediately after the submit pass to
@@ -547,6 +565,67 @@ pub struct PlatformBackend {
     pub(crate) first_pageflip_logged: Vec<bool>,
 
     pub(crate) shutting_down: bool,
+}
+
+impl PlatformBackend {
+    pub(crate) fn set_tearing_on(&mut self, on: bool) {
+        self.tearing_on = on;
+        for device in &self.devices {
+            device.atomic_commit_sink.set_tearing_on(on);
+        }
+        if !on {
+            self.tearing_copy_received_at = None;
+            self.tearing_copy_received_monotonic = None;
+        }
+    }
+
+    pub(crate) fn note_tearing_copy_damage(
+        &mut self,
+        received_at: Instant,
+        received_monotonic: Option<Duration>,
+    ) {
+        if self.tearing_on && self.tearing_copy_received_at.is_none() {
+            self.tearing_copy_received_at = Some(received_at);
+            self.tearing_copy_received_monotonic = received_monotonic;
+        }
+    }
+
+    pub(crate) fn emit_tearing_summary_if_due(&self, on: bool, avg_gpu_render_ns: u64) {
+        for device in &self.devices {
+            device.atomic_commit_sink.emit_tearing_summary_if_due(
+                device.key,
+                on,
+                avg_gpu_render_ns,
+            );
+            device
+                .atomic_commit_sink
+                .emit_present_latency_summary_if_due(device.key);
+        }
+    }
+
+    pub(crate) fn note_tearing_async_flip_event(
+        &self,
+        output_idx: usize,
+        timestamps: FlipEventTimestamps,
+    ) {
+        let Some(output) = self.outputs.get(output_idx) else {
+            return;
+        };
+        if let Some(device) = self.device_for_output(&output.key) {
+            device
+                .atomic_commit_sink
+                .note_async_flip_event(output.output.crtc, timestamps);
+        }
+    }
+
+    pub(crate) fn note_direct_present_received(&self, output_idx: usize) {
+        let Some(output) = self.outputs.get(output_idx) else {
+            return;
+        };
+        if let Some(device) = self.device_for_output(&output.key) {
+            device.atomic_commit_sink.note_direct_present_received();
+        }
+    }
 }
 
 /// One live scanout route a connector snapshot removed, with the layout

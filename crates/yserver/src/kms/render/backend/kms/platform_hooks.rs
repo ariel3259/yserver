@@ -91,6 +91,25 @@ impl Platform for PlatformBackend {
         }
     }
 
+    fn tearing_cursor_compose_cap_applies(b: &KmsBackend) -> bool {
+        b.tearing_cursor_compose_cap_applies()
+    }
+
+    fn note_tearing_copy_damage(b: &mut KmsBackend, dst_window_xid: u32) {
+        if b.pstate.tearing.is_on()
+            && matches!(
+                b.pstate.tearing.state,
+                crate::kms::render::backend::TearingState::On { host_window, .. }
+                    if dst_window_xid == host_window || dst_window_xid == b.core.window_id
+            )
+        {
+            b.platform.note_tearing_copy_damage(
+                std::time::Instant::now(),
+                crate::drm::atomic::monotonic_timestamp(),
+            );
+        }
+    }
+
     fn exit_tearing_for_window(b: &mut KmsBackend, host_xid: u32, reason: &'static str) {
         b.exit_tearing_for_window(host_xid, reason);
     }
@@ -119,15 +138,19 @@ impl Platform for PlatformBackend {
     }
 
     fn hide_cursor_under_direct_scanout(b: &mut KmsBackend) {
-        if b.pstate.scanout_m2.active() {
-            for output_idx in 0..b.platform.outputs.len() {
-                if let Err(error) = b.platform.cursor_plane_hide_on_crtc(output_idx) {
-                    log::warn!(
-                        "scanout_m2: cursor hide failed on output {output_idx}: {error}; unflipping"
-                    );
-                    b.request_direct_unflip("cursor_hide_failed");
-                    return;
-                }
+        if !b.platform.any_cursor_plane_visible() {
+            return;
+        }
+        for output_idx in 0..b.platform.outputs.len() {
+            if !b.platform.cursor_plane_visible_for_output(output_idx) {
+                continue;
+            }
+            if let Err(error) = b.platform.cursor_plane_hide_on_crtc(output_idx) {
+                log::warn!(
+                    "scanout_m2: cursor hide failed on output {output_idx}: {error}; unflipping"
+                );
+                b.request_direct_unflip("cursor_hide_failed");
+                return;
             }
         }
     }
@@ -269,6 +292,8 @@ impl Platform for PlatformBackend {
 
     fn before_block(b: &mut KmsBackend) {
         b.reclaim_retired_gpu_work();
+        b.platform
+            .emit_tearing_summary_if_due(b.pstate.tearing.is_on(), b.telemetry.avg_gpu_render_ns());
     }
 
     fn flush_before_damage_notify(b: &mut KmsBackend) {

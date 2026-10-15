@@ -404,9 +404,28 @@ impl<P: Platform> XBackend<P> {
         // The sprite's reference moved: the cursor it showed may be gone.
         self.collect_released_cursors();
         let Some(xid) = new_xid else {
+            self.scene.clear_cursor();
+            P::hide_cursor_under_direct_scanout(self);
             return;
         };
         self.display_cursor_by_handle(xid);
+    }
+
+    /// Whether the effective sprite is hidden after combining XFIXES state,
+    /// cursor selection, and the cached image-alpha classification.
+    pub(in crate::kms::render::backend) fn effective_cursor_hidden(&self) -> bool {
+        if self.cursor_hidden {
+            return true;
+        }
+        let Some(xid) = self.effective_cursor_xid else {
+            return true;
+        };
+        if let Some(anim) = self.anim_cursor_records.get(&xid) {
+            return anim.is_fully_transparent;
+        }
+        self.cursor_records
+            .get(&xid)
+            .is_none_or(|record| record.is_fully_transparent)
     }
 
     /// Whether anything besides a cursor XID still references host cursor
@@ -455,7 +474,7 @@ impl<P: Platform> XBackend<P> {
     /// Whether the currently-effective sprite should be visible in the live
     /// output layout, regardless of the scene's retired HW/SW classification.
     pub(in crate::kms::render::backend) fn tearing_cursor_wants_visible(&self) -> bool {
-        if self.cursor_hidden {
+        if self.effective_cursor_hidden() {
             return false;
         }
         let Some(record) = self
@@ -486,7 +505,7 @@ impl<P: Platform> XBackend<P> {
             return;
         }
         self.cursor_hidden = hidden;
-        if hidden {
+        if self.effective_cursor_hidden() {
             self.scene.clear_cursor();
             P::hide_cursor_under_direct_scanout(self);
             return;
@@ -496,16 +515,14 @@ impl<P: Platform> XBackend<P> {
         };
         self.display_cursor_by_handle(xid);
         if P::tearing_active(self) {
-            if self.tearing_cursor_wants_visible() && P::direct_scanout_owns_frame(self) {
+            if self.tearing_cursor_wants_visible()
+                && P::direct_scanout_owns_frame(self)
+            {
                 P::request_direct_unflip(self, "tearing_cursor_handoff");
             }
             return;
         }
-        // Under direct scanout nothing composes, and the scene's cursor
-        // mode may still read Hidden, so `display_cursor_by_handle` can
-        // skip the plane. Rebind it directly.
         if P::direct_scanout_owns_frame(self)
-            && !P::tearing_active(self)
             && let Some(record) = self.cursor_records.get(&xid).cloned()
             && !P::refresh_direct_cursor(self, &record)
         {
@@ -599,14 +616,7 @@ impl<P: Platform> XBackend<P> {
     ) {
         let version = self.next_cursor_version;
         self.next_cursor_version = self.next_cursor_version.saturating_add(1);
-        let minted = crate::kms::render::cursor::CursorRecord::new(
-            record.width,
-            record.height,
-            record.hot_x,
-            record.hot_y,
-            record.bgra_bytes.clone(),
-            version,
-        );
+        let minted = record.with_version(version);
         self.cursor_records.insert(xid, minted);
         // Keep cursor_pixmaps truthful per-frame: a `None` frame
         // REMOVES the entry — leaving the prior frame's pixmap
@@ -630,10 +640,11 @@ impl<P: Platform> XBackend<P> {
     /// animation tick. Keeps the sample-view readiness guard
     /// (Vk-less fixtures build records without sprite allocs).
     fn display_cursor_by_handle(&mut self, xid: u32) {
-        // XFIXES HideCursor: the effective cursor (and a running
-        // animation) keep advancing, nothing reaches the screen.
-        // `apply_cursor_hidden(false)` re-displays the current one.
-        if self.cursor_hidden {
+        // Hidden cursors (including empty images and animations whose frames
+        // are all empty) keep tracking their effective handle but draw nothing.
+        if self.effective_cursor_hidden() {
+            self.scene.clear_cursor();
+            P::hide_cursor_under_direct_scanout(self);
             return;
         }
         let Some(record) = self.cursor_records.get(&xid).cloned() else {
@@ -676,6 +687,19 @@ impl<P: Platform> XBackend<P> {
                 record_version: record.version,
                 bgra_bytes: Some(std::sync::Arc::new(record.bgra_bytes.clone())),
             });
+
+        if P::tearing_active(self) {
+            if self.tearing_cursor_wants_visible() && P::direct_scanout_owns_frame(self) {
+                P::request_direct_unflip(self, "tearing_cursor_handoff");
+            }
+            return;
+        }
+        if P::direct_scanout_owns_frame(self) {
+            if !P::refresh_direct_cursor(self, &record) {
+                P::request_direct_unflip(self, "cursor_show_failed");
+            }
+            return;
+        }
 
         // Stage 5 Phase D — steady-state HW sprite-change. When the
         // plane is fully bound, the scene won't re-tick (v2's
@@ -939,6 +963,7 @@ impl<P: Platform> XBackend<P> {
         let xid = self.core.next_host_xid();
         let handle = CursorHandle::from_raw(xid)
             .ok_or_else(|| io::Error::other("create_anim_cursor: xid was 0"))?;
+        let is_fully_transparent = snap.iter().all(|frame| frame.record.is_fully_transparent);
         // Alias frame 0 in the canonical maps so every static-cursor
         // code path (effective walk, XFixes, scene) works untouched.
         self.cursor_records
@@ -948,7 +973,10 @@ impl<P: Platform> XBackend<P> {
         }
         self.anim_cursor_records.insert(
             xid,
-            crate::kms::render::cursor::AnimCursorRecord { frames: snap },
+            crate::kms::render::cursor::AnimCursorRecord {
+                frames: snap,
+                is_fully_transparent,
+            },
         );
         Ok(Some(handle))
     }

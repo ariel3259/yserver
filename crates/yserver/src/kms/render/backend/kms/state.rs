@@ -222,6 +222,11 @@ pub(in crate::kms::render::backend) struct DirectPresentFrame {
     pub(in crate::kms::render::backend) fallback_target_pin: u64,
     pub(in crate::kms::render::backend) source_id: DrawableId,
     pub(in crate::kms::render::backend) candidate: PresentScanoutCandidate,
+    /// Backend receipt time retained across the latest-wins direct successor
+    /// slot until its atomic submit.
+    pub(in crate::kms::render::backend) present_received_at: std::time::Instant,
+    /// Receipt timestamp in CLOCK_MONOTONIC's domain, shared with DRM UST.
+    pub(in crate::kms::render::backend) present_received_monotonic: Option<std::time::Duration>,
     pub(in crate::kms::render::backend) fallback_target: PaintTarget,
     pub(in crate::kms::render::backend) event: yserver_core::backend::CompletedPresentEvent,
     /// Output whose CRTC domain owns CompleteNotify/MSC for this Present.

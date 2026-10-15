@@ -689,7 +689,11 @@ impl KmsBackend {
         let cx = self.core.cursor_x as i32;
         #[allow(clippy::cast_possible_truncation)]
         let cy = self.core.cursor_y as i32;
-        self.platform.rearm_cursor(hot_x, hot_y, cx, cy);
+        if self.effective_cursor_hidden() {
+            <PlatformBackend as crate::kms::render::backend::seam::Platform>::hide_cursor_under_direct_scanout(self);
+        } else {
+            self.platform.rearm_cursor(hot_x, hot_y, cx, cy);
+        }
 
         // Input is resumed by `on_vt_acquire` after this returns; there is no
         // on-core libinput context to resume here.
@@ -982,7 +986,11 @@ impl KmsBackend {
             #[allow(clippy::cast_possible_truncation)]
             let cy = self.core.cursor_y as i32;
             log::info!("kms: dpms wake — rearm_cursor hot=({hot_x},{hot_y}) pos=({cx},{cy})");
-            self.platform.rearm_cursor(hot_x, hot_y, cx, cy);
+            if self.effective_cursor_hidden() {
+                <PlatformBackend as crate::kms::render::backend::seam::Platform>::hide_cursor_under_direct_scanout(self);
+            } else {
+                self.platform.rearm_cursor(hot_x, hot_y, cx, cy);
+            }
             // Outputs were dark; any incremental damage tracking is
             // stale. Force a fresh full frame on the next composite tick.
             self.scene.wake_for_damage();

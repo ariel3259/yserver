@@ -260,6 +260,20 @@ pub(in crate::kms::render::backend) fn scanout_m1_outputs_cover_root(
 }
 
 impl KmsBackend {
+    /// The direct scanout cursor gate depends on KMS plane visibility, so it
+    /// stays with the KMS implementation while cursor image policy remains
+    /// portable.
+    pub(in crate::kms::render::backend) fn direct_cursor_eligible(&self) -> bool {
+        if self.effective_cursor_hidden() {
+            return !self.platform.any_cursor_plane_visible();
+        }
+        matches!(
+            self.scene.cursor_mode(),
+            crate::kms::render::scene::CursorPlaneMode::Hw
+                | crate::kms::render::scene::CursorPlaneMode::Hidden
+        )
+    }
+
     pub(in crate::kms::render::backend) fn handle_cursor_move_outcome(
         &mut self,
         outcome: crate::kms::render::platform::CursorMoveOutcome,
@@ -343,14 +357,12 @@ impl KmsBackend {
             return;
         }
         let tearing = self.pstate.tearing.is_on();
-        if tearing || self.cursor_hidden {
-            // Tearing keeps every cursor plane detached, including when the
-            // cursor became visible through motion or XFIXES ShowCursor.
-            // Otherwise XFIXES HideCursor: the direct frame owns the planes
-            // now, so make sure no stale sprite stays bound on any of them.
+        if tearing || self.effective_cursor_hidden() {
+            // Tearing keeps every cursor plane detached. A hidden effective
+            // cursor also must not leave a stale sprite bound over direct scanout.
             let mut failed = false;
             for output_idx in 0..self.platform.outputs.len() {
-                if tearing && !self.platform.cursor_plane_visible_for_output(output_idx) {
+                if !self.platform.cursor_plane_visible_for_output(output_idx) {
                     continue;
                 }
                 if let Err(error) = self.platform.cursor_plane_hide_on_crtc(output_idx) {
@@ -571,6 +583,11 @@ impl KmsBackend {
             &plane_states,
             &cursor_positions,
             attempt_timing,
+            crate::drm::atomic::TearingCommitContext::direct(
+                Some(frame.present_received_at),
+                frame.present_received_monotonic,
+                false,
+            ),
         );
         let async_outcome = if attempt_timing == crate::drm::async_flip::FlipTiming::Async {
             match result {
@@ -594,6 +611,11 @@ impl KmsBackend {
                         &plane_states,
                         &cursor_positions,
                         crate::drm::async_flip::FlipTiming::Vsync,
+                        crate::drm::atomic::TearingCommitContext::direct(
+                            Some(frame.present_received_at),
+                            frame.present_received_monotonic,
+                            true,
+                        ),
                     );
                     crate::drm::async_flip::AsyncOutcome::FellBack { suspended }
                 }
@@ -916,6 +938,26 @@ impl KmsBackend {
                 target.backing_id().as_u64()
             )));
         }
+        if self.platform.gpu.vk().is_none() {
+            return Err(io::Error::other(
+                "NoVk: direct fallback materialization needs Vulkan storage",
+            ));
+        }
+        let has_live_source_image = self
+            .store
+            .get(source_id)
+            .is_some_and(|drawable| drawable.storage.image != ash::vk::Image::null());
+        let has_live_target_image = self
+            .store
+            .get(target.backing_id())
+            .is_some_and(|drawable| drawable.storage.image != ash::vk::Image::null());
+        if !has_live_source_image || !has_live_target_image {
+            return Err(io::Error::other(format!(
+                "scanout M2: direct fallback source {} or target {} has no Vulkan image",
+                source_id.as_u64(),
+                target.backing_id().as_u64(),
+            )));
+        }
         self.engine
             .cow_copy_area(
                 &mut self.store,
@@ -1225,11 +1267,7 @@ impl KmsBackend {
             || !scanout_m1_probe_eligible(
                 self.scanout_allowed(),
                 self.kms_outputs_active,
-                matches!(
-                    self.scene.cursor_mode(),
-                    crate::kms::render::scene::CursorPlaneMode::Hw
-                        | crate::kms::render::scene::CursorPlaneMode::Hidden
-                ),
+                self.direct_cursor_eligible(),
                 self.scene.root_overlay.is_empty(),
                 target,
                 coverage,
@@ -1742,11 +1780,7 @@ impl KmsBackend {
         let scanout_allowed = self.scanout_allowed();
         let kms_outputs_active = self.kms_outputs_active;
         let cursor_mode = self.scene.cursor_mode();
-        let cursor_hw = matches!(
-            cursor_mode,
-            crate::kms::render::scene::CursorPlaneMode::Hw
-                | crate::kms::render::scene::CursorPlaneMode::Hidden
-        );
+        let cursor_hw = self.direct_cursor_eligible();
         let root_overlay_empty = self.scene.root_overlay.is_empty();
         // Page flipping is off while any CRTC is transformed
         // (modesetting/present.c:266).
@@ -1952,6 +1986,40 @@ impl KmsBackend {
         self.pstate.vt_state.allows_scanout()
     }
 
+    /// Whether cursor-only work is rate-limited for the currently visible
+    /// software cursor, including the interval after a grouped cursor handoff
+    /// was submitted but before its retirement reveals the software cursor.
+    pub(in crate::kms::render::backend) fn tearing_cursor_compose_cap_applies(&self) -> bool {
+        if !self.pstate.tearing.is_on() || self.effective_cursor_hidden() {
+            return false;
+        }
+
+        matches!(
+            self.scene.cursor_mode(),
+            crate::kms::render::scene::CursorPlaneMode::Sw
+        ) || (self.pstate.scanout_m2.unflip_reason == Some("tearing_cursor_handoff")
+            && !self.pstate.scanout_m2.unflip_awaiting_outputs.is_empty())
+    }
+
+    /// Earliest time a cursor-only software-scene wake may be composed while
+    /// tearing. Other scene damage is deliberately excluded from this gate.
+    fn tearing_cursor_compose_deadline(
+        &self,
+        now: std::time::Instant,
+    ) -> Option<std::time::Instant> {
+        if !self.tearing_cursor_compose_cap_applies()
+            || !self.scene.cursor_only_wake_pending()
+            || self.store.has_pending_presentation_damage()
+            || self.scene.owes_repaint()
+        {
+            return None;
+        }
+
+        let last_compose = self.pstate.tearing.last_cursor_compose?;
+        let deadline = last_compose + self.pstate.tearing.cursor_compose_interval(&self.platform);
+        (now < deadline).then_some(deadline)
+    }
+
     pub(super) fn scene_wants_compose(&self) -> bool {
         if self.pstate.scanout_m2.pending.is_some()
             || !self.pstate.scanout_m2.unflip_awaiting_outputs.is_empty()
@@ -1973,8 +2041,13 @@ impl KmsBackend {
             // correctly waiting for that event.
             return false;
         }
-        self.scene_wants_scene()
-            || (!direct_transaction_waiting && self.platform.has_eligible_atomic_cursor_move())
+        let cursor_compose_blocked = self
+            .tearing_cursor_compose_deadline(std::time::Instant::now())
+            .is_some();
+        (self.scene_wants_scene() && !cursor_compose_blocked)
+            || (!cursor_compose_blocked
+                && !direct_transaction_waiting
+                && self.platform.has_eligible_atomic_cursor_move())
     }
 
     #[cfg(test)]
@@ -2032,7 +2105,7 @@ impl KmsBackend {
             // map clears — leaving a stuck entry across suspend is exactly
             // the permanent-stall failure mode this guards against.
             if let Ok((flips, sequences)) = self.platform.drain_page_flip_events(drm_fd) {
-                for (output_idx, _) in flips {
+                for (output_idx, _, _) in flips {
                     self.record_atomic_cursor_commit_retirement(output_idx);
                 }
                 for seq in sequences {
@@ -2054,7 +2127,9 @@ impl KmsBackend {
                 return;
             }
         };
-        for (output_idx, clock) in flipped {
+        for (output_idx, clock, timestamps) in flipped {
+            self.platform
+                .note_tearing_async_flip_event(output_idx, timestamps);
             self.record_atomic_cursor_commit_retirement(output_idx);
             let direct_retired = self.retire_direct_output(output_idx, clock);
             let scene_retired = !direct_retired
@@ -2178,7 +2253,8 @@ impl KmsBackend {
                     self.scene.earliest_retry_deadline()
                 }
             } else {
-                self.scene.earliest_retry_deadline()
+                self.tearing_cursor_compose_deadline(now)
+                    .or_else(|| self.scene.earliest_retry_deadline())
             }
         } else {
             None
@@ -2294,7 +2370,9 @@ impl KmsBackend {
                 .is_some_and(|deadline| std::time::Instant::now() >= deadline)
         {
             self.pstate.tearing.deferred_cursor_wake = None;
-            self.scene.wake_for_damage();
+            if !self.scene.scene_structure_dirty {
+                self.scene.wake_for_cursor_damage();
+            }
         }
         // Animated-cursor frame advance — after both gates above so
         // DPMS-off / VT-away never uploads (spec "DPMS / VT gating").
@@ -2395,7 +2473,14 @@ impl KmsBackend {
                 }
             }
         }
-        let composed_outputs = self.compose_tick();
+        let composed_outputs = if self
+            .tearing_cursor_compose_deadline(std::time::Instant::now())
+            .is_some()
+        {
+            None
+        } else {
+            self.compose_tick()
+        };
         if let Some(composed) = &composed_outputs
             && self.pstate.scanout_m2.reentry_blocked_until_composed
             && composed.len() == self.platform.outputs.len()

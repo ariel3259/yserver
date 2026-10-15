@@ -119,6 +119,10 @@ impl OutputSink for PlatformBackend {
             .flatten()
             .unwrap_or(self.requested_flip_timing);
         let async_ledger = &mut self.async_ledger;
+        let tearing_context = crate::drm::atomic::TearingCommitContext::composed(
+            self.tearing_copy_received_at,
+            self.tearing_copy_received_monotonic,
+        );
         let Some(pool) = self
             .scanout_pools
             .get_mut(output_idx)
@@ -146,6 +150,7 @@ impl OutputSink for PlatformBackend {
                     &cursor_positions,
                     async_ledger,
                     timing,
+                    tearing_context,
                 );
                 if let Err(error) = &submitted
                     && atomic_commit_sink.take_last_cursor_rejection()
@@ -191,6 +196,13 @@ impl OutputSink for PlatformBackend {
                 crate::drm::async_flip::AsyncStream::Composed(output.crtc),
                 async_outcome,
             );
+            // The receipt belongs to this damage once any commit for it is
+            // accepted. An EINVAL retry can successfully submit Vsync, and
+            // later damage must not inherit the old frame's timestamp.
+            if self.tearing_copy_received_at.is_some() {
+                self.tearing_copy_received_at = None;
+                self.tearing_copy_received_monotonic = None;
+            }
         }
         if shared_cursor_commit_submitted {
             self.cursor_plane_scene_commit_submitted(&cursor_positions);
@@ -551,6 +563,7 @@ fn submit_shared_scanout_frame(
     cursor_positions: &[crate::drm::atomic::CursorPlanePosition],
     async_ledger: &mut crate::drm::async_flip::AsyncFlipLedger,
     timing: crate::drm::async_flip::FlipTiming,
+    tearing_context: crate::drm::atomic::TearingCommitContext,
 ) -> Result<(ComposeSubmit, crate::drm::async_flip::AsyncOutcome), PresentError> {
     use std::os::fd::{FromRawFd, IntoRawFd};
 
@@ -580,7 +593,7 @@ fn submit_shared_scanout_frame(
         crate::drm::async_flip::FlipTiming::Vsync
     };
     let mut out_fence: i32 = -1;
-    let mut submit_result = crate::drm::page_flip::submit_scene_flip_with_fences(
+    let mut submit_result = crate::drm::page_flip::submit_scene_flip_with_fences_tearing(
         drm,
         atomic_commit_sink,
         output,
@@ -589,6 +602,7 @@ fn submit_shared_scanout_frame(
         &mut out_fence,
         cursor_positions,
         attempt_timing,
+        tearing_context,
     );
     let async_outcome = if attempt_timing == crate::drm::async_flip::FlipTiming::Async {
         match submit_result {
@@ -605,7 +619,7 @@ fn submit_shared_scanout_frame(
                     .unwrap_or(-1);
                 bo.state.transition_to_submitted(retry_fd);
                 out_fence = -1;
-                submit_result = crate::drm::page_flip::submit_scene_flip_with_fences(
+                submit_result = crate::drm::page_flip::submit_scene_flip_with_fences_tearing(
                     drm,
                     atomic_commit_sink,
                     output,
@@ -614,6 +628,10 @@ fn submit_shared_scanout_frame(
                     &mut out_fence,
                     cursor_positions,
                     crate::drm::async_flip::FlipTiming::Vsync,
+                    crate::drm::atomic::TearingCommitContext {
+                        async_fallback: true,
+                        ..tearing_context
+                    },
                 );
                 crate::drm::async_flip::AsyncOutcome::FellBack { suspended }
             }

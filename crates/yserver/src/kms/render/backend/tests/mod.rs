@@ -988,6 +988,8 @@ fn retain_direct_frame_from_source_test(
             explicit_sync: false,
             options: 0,
         },
+        present_received_at: std::time::Instant::now(),
+        present_received_monotonic: None,
         fallback_target: PaintTarget::new(fallback_id, (0, 0), None, 24),
         event: CompletedPresentEvent {
             client_id: yserver_protocol::x11::ClientId(1),
@@ -1221,6 +1223,8 @@ pub(super) fn install_direct_frame_for_target_test(
         fallback_target_pin,
         source_id,
         candidate,
+        present_received_at: std::time::Instant::now(),
+        present_received_monotonic: None,
         fallback_target: PaintTarget::new(fallback_id, (0, 0), None, 24),
         event: CompletedPresentEvent {
             client_id: yserver_protocol::x11::ClientId(1),

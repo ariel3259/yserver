@@ -172,6 +172,7 @@ impl SceneCompositor {
             inner,
             root_overlay,
             scene_structure_dirty,
+            cursor_only_wake,
             ..
         } = self;
         let Some(inner) = inner.as_mut() else {
@@ -317,6 +318,7 @@ impl SceneCompositor {
         }
         if clear_dirty {
             *scene_structure_dirty = false;
+            *cursor_only_wake = false;
         }
         // Vulkan may export the already-signalled SYNC_FD sentinel (`fd=-1`).
         // Such a job has no pollable fd, so drain only after every composed
