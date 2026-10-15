@@ -51,9 +51,13 @@ Gamma/LUT, overlay planes, tearing (C1 keeps its own cursor policy), cursor scal
 - The applied state is invalidated (the next commit sends the full cursor state) after DRM master loss and resume,
   every modeset, and every cursor-plane reassignment.
 - **Reassignment.** DRM rejects moving a bound plane straight from CRTC A to CRTC B (it requires an intermediate
-  off state). When the matching moves a bound plane, yserver first waits for A's outstanding commit and event,
-  sends a detach-only commit on A and waits for it to be accepted. Only then does a commit on B attach the plane.
-  Until the plane is attached on B, B uses the software cursor.
+  off state). When the matching moves a bound plane, A's detach must be accepted before B's attach is sent:
+  - If A is being disabled, the detach rides A's lifecycle disable commit (§2.4).
+  - If A stays active, losing the plane is A's HW→SW transition. The detach rides **A's scene frame that starts
+    painting its software cursor** (§2.2). A skipped or rejected frame defers the reassignment, and A keeps its
+    hardware cursor meanwhile.
+  - Only after A's detach is accepted (and A's outstanding event has drained) does a separate commit on B attach the
+    plane. Until then, B uses the software cursor.
 
 ### 2.2 Who submits what
 
@@ -143,8 +147,10 @@ no pending intents, no in-flight obligations, no leaked framebuffers.
    animation arrives while every buffer is in use. No buffer is rewritten or removed while any user remains. In
    particular, an animation frame must not rewrite F0 after the commit replacing F0 is accepted but before its flip
    event. Mutations: release at the first replacing event, or at acceptance instead of the event → fails.
-5. Reassignment: the matching moves a bound plane from CRTC A to B. The commits are: A's detach accepted first,
-   then B's attach. B uses the software cursor until its attach is accepted. No commit both detaches and attaches.
+5. Reassignment: the matching moves a bound plane from CRTC A to B. A's detach is accepted first, then B's attach.
+   B uses the software cursor until its attach is accepted, and no commit both detaches and attaches. With A
+   remaining active, A's detach rides the scene frame that paints A's software cursor. If that frame is skipped (no
+   BO), the reassignment is deferred and A keeps its hardware cursor, so A is never left without a cursor.
 6. Ownership: a held direct frame with no successor gets show, hide, animation and first bind through cursor-only
    commits. A skipped (no-BO) frame does not publish its assignment. Cross-output motion. Mixed mode.
 7. Lifecycle: DPMS off/on, VT leave/resume and output removal detach the plane in the disable commit and reclaim
