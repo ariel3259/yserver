@@ -20,13 +20,15 @@ fn install_controlled_scheduler_clock(
 // Mutation: let generic request mark_dirty calls force ordinary scene wakes while tearing.
 fn task6_present_and_xtest_motion_keep_cursor_compose_cap_under_run_core_load() {
     // Exercise eager flip delivery and the reviewer's delayed-until-input-end ordering.
-    run_task6_present_and_xtest_motion_keep_cursor_compose_cap_under_run_core_load(false);
-    run_task6_present_and_xtest_motion_keep_cursor_compose_cap_under_run_core_load(true);
+    if !run_task6_present_and_xtest_motion_keep_cursor_compose_cap_under_run_core_load(false) {
+        return;
+    }
+    assert!(run_task6_present_and_xtest_motion_keep_cursor_compose_cap_under_run_core_load(true));
 }
 
 fn run_task6_present_and_xtest_motion_keep_cursor_compose_cap_under_run_core_load(
     delay_fake_flip_delivery_until_input_end: bool,
-) {
+) -> bool {
     use std::{
         collections::VecDeque,
         io::{self, Read},
@@ -203,7 +205,9 @@ fn run_task6_present_and_xtest_motion_keep_cursor_compose_cap_under_run_core_loa
         }
     }
 
-    let mut backend = live_scene_backend();
+    let Some(mut backend) = live_scene_backend() else {
+        return false;
+    };
     let recorder = recording_sink(&mut backend, 0);
     let (outputs, modes) = Backend::randr_outputs_and_modes(&mut backend);
     let (screen_width, screen_height) = Backend::fb_dimensions(&backend);
@@ -770,6 +774,7 @@ fn run_task6_present_and_xtest_motion_keep_cursor_compose_cap_under_run_core_loa
     );
     assert!(backend.kms_outputs_active);
     assert!(backend.scanout_allowed());
+    true
 }
 
 #[test]
@@ -780,7 +785,9 @@ fn task5_handoff_unflip_starts_cursor_compose_interval() {
     use yserver_core::{backend::Backend, server::ServerState};
 
     const WINDOW: u32 = 0x7c58;
-    let mut backend = live_scene_backend();
+    let Some(mut backend) = live_scene_backend() else {
+        return;
+    };
     let recorder = recording_sink(&mut backend, 0);
     qualify_test_direct_async(&mut backend, &recorder, WINDOW, 15_050);
     let mut state = ServerState::new();
@@ -885,7 +892,9 @@ fn task5_client_frame_is_never_deferred_by_cursor_cap() {
     use yserver_protocol::x11::{ClientId, ResourceId};
 
     const WINDOW: ResourceId = ResourceId(0x0100_7c60);
-    let mut backend = live_scene_backend();
+    let Some(mut backend) = live_scene_backend() else {
+        return;
+    };
     for device in &mut backend.platform.devices {
         device.async_page_flip = true;
     }
@@ -981,7 +990,10 @@ fn task5_exit_restores_cursor_policy_per_state() {
 
     // (a) A visible cursor on an untransformed output returns to HW through
     // the next Vsync scene commit.
-    let (mut hw, hw_recorder, mut hw_state) = live_tearing_cursor_backend(0x7c70, 15_200);
+    let Some((mut hw, hw_recorder, mut hw_state)) = live_tearing_cursor_backend(0x7c70, 15_200)
+    else {
+        return;
+    };
     let (show_executor, _hide_executor) = install_cursor_plane_with_successful_show(&mut hw);
     seed_pending_tearing_cursor_wake(&mut hw);
     exit_tearing_with_copy_present(&mut hw, 0x7c70, 15_300);
@@ -1002,7 +1014,10 @@ fn task5_exit_restores_cursor_policy_per_state() {
     assert_commit_sequence(&hw_recorder, &[AtomicCommitKind::Scene]);
 
     // (b) A transformed output keeps a visible cursor in the composed scene.
-    let (mut sw, sw_recorder, mut sw_state) = live_tearing_cursor_backend(0x7c71, 15_400);
+    let Some((mut sw, sw_recorder, mut sw_state)) = live_tearing_cursor_backend(0x7c71, 15_400)
+    else {
+        return;
+    };
     seed_pending_tearing_cursor_wake(&mut sw);
     let (outputs, modes) = Backend::randr_outputs_and_modes(&mut sw);
     let (screen_width, screen_height) = Backend::fb_dimensions(&sw);
@@ -1038,8 +1053,11 @@ fn task5_exit_restores_cursor_policy_per_state() {
     assert_commit_sequence(&sw_recorder, &[AtomicCommitKind::Scene]);
 
     // (c) XFIXES-hidden stays Hidden after the same exit.
-    let (mut hidden, hidden_recorder, mut hidden_state) =
-        live_tearing_cursor_backend(0x7c72, 15_600);
+    let Some((mut hidden, hidden_recorder, mut hidden_state)) =
+        live_tearing_cursor_backend(0x7c72, 15_600)
+    else {
+        return;
+    };
     Backend::set_cursor_hidden(&mut hidden, true);
     seed_pending_tearing_cursor_wake(&mut hidden);
     exit_tearing_with_copy_present(&mut hidden, 0x7c72, 15_700);
@@ -1059,7 +1077,10 @@ fn task5_exit_restores_cursor_policy_per_state() {
 
     // (d) DPMS off clears tearing state without submitting a cursor plane
     // commit; resume owns reapplying the cursor policy.
-    let (mut dark, dark_recorder, _dark_state) = live_tearing_cursor_backend(0x7c73, 15_800);
+    let Some((mut dark, dark_recorder, _dark_state)) = live_tearing_cursor_backend(0x7c73, 15_800)
+    else {
+        return;
+    };
     dark.platform.for_tests_accept_output_power_commits();
     seed_pending_tearing_cursor_wake(&mut dark);
     Backend::set_dpms_power(&mut dark, 3).expect("turn test output off");
@@ -1078,7 +1099,10 @@ fn task5_tearing_window_destroy_exits_and_restores_cursor_policy() {
     use yserver_core::backend::Backend;
 
     const WINDOW: u32 = 0x7c80;
-    let (mut backend, recorder, mut state) = live_tearing_cursor_backend(WINDOW, 15_900);
+    let Some((mut backend, recorder, mut state)) = live_tearing_cursor_backend(WINDOW, 15_900)
+    else {
+        return;
+    };
     seed_pending_tearing_cursor_wake(&mut backend);
 
     Backend::destroy_subwindow(&mut backend, None, WINDOW)
@@ -1108,7 +1132,9 @@ fn tearing_summary_counts_async_and_fallbacks() {
     use yserver_core::backend::Backend;
 
     const WINDOW: u32 = 0x7a60;
-    let mut backend = live_scene_backend();
+    let Some(mut backend) = live_scene_backend() else {
+        return;
+    };
     let recorder = recording_sink(&mut backend, 0);
     qualify_test_direct_async(&mut backend, &recorder, WINDOW, 700);
     assert!(backend.pstate.tearing.is_on());
@@ -1356,7 +1382,9 @@ fn tearing_on_uncapped_async_stream_reaches_backend_latest_wins_slot() {
     const FIRST_PRESENT: u64 = 2_000;
     const FRAME_COUNT: u64 = 20;
 
-    let mut backend = live_scene_backend();
+    let Some(mut backend) = live_scene_backend() else {
+        return;
+    };
     let recorder = recording_sink(&mut backend, 0);
     qualify_test_direct_async(&mut backend, &recorder, WINDOW, 2_100);
     assert!(backend.pstate.tearing.is_on());
@@ -1719,7 +1747,9 @@ fn tearing_on_delayed_acquire_stream_survives_core_supersession() {
         completed
     }
 
-    let mut backend = live_scene_backend();
+    let Some(mut backend) = live_scene_backend() else {
+        return;
+    };
     let recorder = recording_sink(&mut backend, 0);
     let (pollable_device, _device_peer) = pollable_test_device();
     backend.platform.devices[0].device = pollable_device;
@@ -2085,7 +2115,9 @@ fn tearing_copy_receipt_is_consumed_by_successful_vsync_fallback() {
     use yserver_protocol::x11::{ClientId, ResourceId};
 
     const WINDOW: ResourceId = ResourceId(0x0100_7d00);
-    let mut backend = live_scene_backend();
+    let Some(mut backend) = live_scene_backend() else {
+        return;
+    };
     for device in &mut backend.platform.devices {
         device.async_page_flip = true;
     }
@@ -2175,7 +2207,10 @@ fn composed_async_turnaround_uses_its_own_commit_flip_timestamp() {
     use yserver_core::backend::Backend;
 
     const WINDOW: u32 = 0x7c88;
-    let (mut backend, recorder, mut state) = live_tearing_cursor_backend(WINDOW, 12_000);
+    let Some((mut backend, recorder, mut state)) = live_tearing_cursor_backend(WINDOW, 12_000)
+    else {
+        return;
+    };
     let accepted_at = Rc::new(Cell::new(
         crate::drm::atomic::monotonic_timestamp().expect("CLOCK_MONOTONIC timestamp"),
     ));
@@ -2348,7 +2383,9 @@ fn delayed_flip_delivery_keeps_turnaround_and_present_latency_in_their_clock_dom
     use yserver_core::server::ServerState;
 
     const WINDOW: u32 = 0x7c89;
-    let mut backend = live_scene_backend();
+    let Some(mut backend) = live_scene_backend() else {
+        return;
+    };
     let recorder = recording_sink(&mut backend, 0);
     qualify_test_direct_async(&mut backend, &recorder, WINDOW, 16_000);
     let mut state = ServerState::new();
@@ -2386,7 +2423,9 @@ fn boottime_flip_timestamp_is_converted_before_present_latency_is_sampled() {
     use yserver_core::server::ServerState;
 
     const WINDOW: u32 = 0x7c8a;
-    let mut backend = live_scene_backend();
+    let Some(mut backend) = live_scene_backend() else {
+        return;
+    };
     let recorder = recording_sink(&mut backend, 0);
     qualify_test_direct_async(&mut backend, &recorder, WINDOW, 16_200);
     let mut state = ServerState::new();
@@ -2426,7 +2465,9 @@ fn implausible_flip_timestamp_is_reported_as_unavailable() {
     use yserver_core::server::ServerState;
 
     const WINDOW: u32 = 0x7c8b;
-    let mut backend = live_scene_backend();
+    let Some(mut backend) = live_scene_backend() else {
+        return;
+    };
     let recorder = recording_sink(&mut backend, 0);
     qualify_test_direct_async(&mut backend, &recorder, WINDOW, 16_400);
     let mut state = ServerState::new();
@@ -2504,7 +2545,10 @@ fn discarded_vt_flip_events_do_not_shift_the_next_async_turnaround_match() {
     }
 
     const WINDOW: u32 = 0x7d90;
-    let (mut backend, recorder, mut state) = live_tearing_cursor_backend(WINDOW, 16_100);
+    let Some((mut backend, recorder, mut state)) = live_tearing_cursor_backend(WINDOW, 16_100)
+    else {
+        return;
+    };
     backend.for_tests_set_vt_resume_executor(Rc::new(LogicalVtResume));
     backend.platform.for_tests_accept_output_power_commits();
 
