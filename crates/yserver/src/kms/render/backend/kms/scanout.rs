@@ -493,12 +493,15 @@ impl KmsBackend {
         frame: &mut DirectPresentFrame,
         timing: crate::drm::async_flip::FlipTiming,
     ) -> io::Result<crate::drm::async_flip::AsyncOutcome> {
-        #[cfg(test)]
-        if self.pstate.scanout_m2.test_submit_direct_without_drm {
-            frame.awaiting_outputs = (0..self.platform.outputs.len()).collect();
-            frame.async_outcome = crate::drm::async_flip::AsyncOutcome::NotRequested;
-            return Ok(crate::drm::async_flip::AsyncOutcome::NotRequested);
-        }
+        let submitter = self.pstate.direct_frame_submitter;
+        submitter(self, frame, timing)
+    }
+
+    pub(in crate::kms::render::backend) fn submit_direct_frame_live(
+        &mut self,
+        frame: &mut DirectPresentFrame,
+        timing: crate::drm::async_flip::FlipTiming,
+    ) -> io::Result<crate::drm::async_flip::AsyncOutcome> {
         let fb = self
             .pstate
             .scanout_m1
@@ -623,6 +626,17 @@ impl KmsBackend {
         frame.awaiting_outputs = (0..self.platform.outputs.len()).collect();
         frame.async_outcome = async_outcome;
         Ok(async_outcome)
+    }
+
+    #[cfg(test)]
+    pub(in crate::kms::render::backend) fn submit_direct_frame_for_tests(
+        backend: &mut KmsBackend,
+        frame: &mut DirectPresentFrame,
+        _timing: crate::drm::async_flip::FlipTiming,
+    ) -> io::Result<crate::drm::async_flip::AsyncOutcome> {
+        frame.awaiting_outputs = (0..backend.platform.outputs.len()).collect();
+        frame.async_outcome = crate::drm::async_flip::AsyncOutcome::NotRequested;
+        Ok(crate::drm::async_flip::AsyncOutcome::NotRequested)
     }
 
     pub(super) fn direct_frame_flip_timing(
@@ -2196,6 +2210,11 @@ impl KmsBackend {
                     .then(|| self.cursor_anim_deadline())
                     .flatten(),
             )
+            .chain(
+                allow_kms_timers
+                    .then_some(self.pstate.tearing.deferred_cursor_wake)
+                    .flatten(),
+            )
             .min()
     }
 
@@ -2267,6 +2286,16 @@ impl KmsBackend {
             self.drain_paint_submit_telemetry();
             return Ok(());
         }
+        if self.pstate.tearing.is_on()
+            && self
+                .pstate
+                .tearing
+                .deferred_cursor_wake
+                .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            self.pstate.tearing.deferred_cursor_wake = None;
+            self.scene.wake_for_damage();
+        }
         // Animated-cursor frame advance — after both gates above so
         // DPMS-off / VT-away never uploads (spec "DPMS / VT gating").
         self.tick_cursor_animation();
@@ -2331,6 +2360,7 @@ impl KmsBackend {
             if self.pstate.scanout_m2.current.is_some() && self.pstate.scanout_m2.unflip_requested {
                 match self.submit_composed_unflip() {
                     Ok(true) => {
+                        self.pstate.tearing.note_composed_submit();
                         // The atomic replacement itself is now pending on every
                         // CRTC. Do not fall through into per-output scene flips in
                         // this same tick: KMS correctly rejects those with EBUSY.
@@ -2372,6 +2402,12 @@ impl KmsBackend {
         {
             self.pstate.scanout_m2.reentry_blocked_until_composed = false;
             log::debug!("scanout_m2: composed fallback submitted; re-entry barrier cleared");
+        }
+        if composed_outputs
+            .as_ref()
+            .is_some_and(|outputs| !outputs.is_empty())
+        {
+            self.pstate.tearing.note_composed_submit();
         }
         let scene_submitted_outputs: HashSet<usize> =
             composed_outputs.into_iter().flatten().collect();

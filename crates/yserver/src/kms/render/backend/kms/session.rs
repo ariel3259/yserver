@@ -147,6 +147,7 @@ impl KmsBackend {
             scanout_m1: ScanoutM1ProbeCache::new(),
             scanout_m2: ScanoutM2State::new(),
             tearing: Tearing::new(),
+            direct_frame_submitter: KmsBackend::submit_direct_frame_live,
             vt_resume_executor: std::rc::Rc::new(DrmVtResumeExecutor),
             armed_vblank_targets: std::collections::HashMap::new(),
             absolute_vblank_targets: std::collections::HashMap::new(),

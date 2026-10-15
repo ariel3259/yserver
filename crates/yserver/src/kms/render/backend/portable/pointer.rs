@@ -619,7 +619,7 @@ impl<P: Platform> XBackend<P> {
                 // Tearing owns cursor policy until exit. Motion must stay on
                 // the scene wake path even if the last retired scene frame
                 // still reports an HW cursor mode.
-                self.scene.wake_for_damage();
+                P::cursor_motion_during_tearing(self, !self.cursor_hidden);
             } else if self.cursor_hidden {
                 // XFIXES HideCursor: there is no sprite to move. Showing
                 // it again displays it at the then-current position.

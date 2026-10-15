@@ -235,6 +235,13 @@ pub(in crate::kms::render::backend) struct DirectPresentFrame {
     pub(in crate::kms::render::backend) async_outcome: crate::drm::async_flip::AsyncOutcome,
 }
 
+pub(in crate::kms::render::backend) type DirectFrameSubmitter =
+    fn(
+        &mut KmsBackend,
+        &mut DirectPresentFrame,
+        crate::drm::async_flip::FlipTiming,
+    ) -> io::Result<crate::drm::async_flip::AsyncOutcome>;
+
 /// Require a short stable run before entering direct ownership. Compositors
 /// such as E27 alternate full-root Presents with authoritative region-limited
 /// Presents; entering on every eligible member of that stream otherwise
@@ -274,10 +281,6 @@ pub(in crate::kms::render::backend) struct ScanoutM2State {
     /// per-output scene compose path. Keep direct-frame pins held until those
     /// composed flips replace every direct plane.
     pub(in crate::kms::render::backend) degraded_composed_unflip: bool,
-    #[cfg(test)]
-    pub(in crate::kms::render::backend) test_force_active: bool,
-    #[cfg(test)]
-    pub(in crate::kms::render::backend) test_submit_direct_without_drm: bool,
 }
 
 impl ScanoutM2State {
@@ -300,24 +303,11 @@ impl ScanoutM2State {
             unflip_fallback_source: None,
             unflip_shadow_ready: false,
             degraded_composed_unflip: false,
-            #[cfg(test)]
-            test_force_active: false,
-            #[cfg(test)]
-            test_submit_direct_without_drm: false,
         }
     }
 
     pub(in crate::kms::render::backend) fn active(&self) -> bool {
-        self.pending.is_some() || self.queued_successor.is_some() || self.current.is_some() || {
-            #[cfg(test)]
-            {
-                self.test_force_active
-            }
-            #[cfg(not(test))]
-            {
-                false
-            }
-        }
+        self.pending.is_some() || self.queued_successor.is_some() || self.current.is_some()
     }
 
     pub(in crate::kms::render::backend) fn admit_eligible_root(&mut self) -> bool {
@@ -361,6 +351,8 @@ pub(in crate::kms::render::backend) struct Tearing {
     pub(in crate::kms::render::backend) probation: u8,
     pub(in crate::kms::render::backend) probation_owner: Option<u32>,
     pub(in crate::kms::render::backend) hide_failed_logged: bool,
+    pub(in crate::kms::render::backend) last_cursor_compose: Option<std::time::Instant>,
+    pub(in crate::kms::render::backend) deferred_cursor_wake: Option<std::time::Instant>,
 }
 
 impl Tearing {
@@ -370,6 +362,8 @@ impl Tearing {
             probation: 0,
             probation_owner: None,
             hide_failed_logged: false,
+            last_cursor_compose: None,
+            deferred_cursor_wake: None,
         }
     }
 
@@ -380,6 +374,27 @@ impl Tearing {
     pub(in crate::kms::render::backend) fn reset_probation(&mut self) {
         self.probation = 0;
         self.probation_owner = None;
+    }
+
+    pub(in crate::kms::render::backend) fn note_composed_submit(&mut self) {
+        if self.is_on() {
+            self.last_cursor_compose = Some(std::time::Instant::now());
+            self.deferred_cursor_wake = None;
+        }
+    }
+
+    pub(in crate::kms::render::backend) fn cursor_compose_interval(
+        &self,
+        platform: &PlatformBackend,
+    ) -> std::time::Duration {
+        let refresh_hz = platform
+            .outputs
+            .iter()
+            .map(|output| output.output.picked.vrefresh)
+            .filter(|refresh_hz| *refresh_hz > 0)
+            .max()
+            .unwrap_or(60);
+        std::time::Duration::from_nanos(1_000_000_000 / u64::from(refresh_hz))
     }
 }
 
@@ -808,6 +823,7 @@ pub struct KmsBackendState {
     pub(in crate::kms::render::backend) scanout_m1: ScanoutM1ProbeCache,
     pub(in crate::kms::render::backend) scanout_m2: ScanoutM2State,
     pub(in crate::kms::render::backend) tearing: Tearing,
+    pub(in crate::kms::render::backend) direct_frame_submitter: DirectFrameSubmitter,
     pub(in crate::kms::render::backend) vt_resume_executor:
         std::rc::Rc<dyn super::session::VtResumeExecutor>,
 

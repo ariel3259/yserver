@@ -60,6 +60,8 @@ pub trait Platform: OutputSink + Sized + 'static {
     ) -> bool {
         false
     }
+    /// Route pointer motion while KMS tearing owns cursor composition.
+    fn cursor_motion_during_tearing(_b: &mut XBackend<Self>, _cursor_visible: bool) {}
     /// Leave tearing when a portable window lifecycle change affects its owner.
     fn exit_tearing_for_window(_b: &mut XBackend<Self>, _host_xid: u32, _reason: &'static str) {}
     /// Leave direct scanout for the composed scene.

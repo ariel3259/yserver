@@ -88,7 +88,7 @@ fn compose_right(b: &mut KmsBackend) -> Vec<u8> {
         &b.windows,
         &outputs,
         b.platform.fb_dimensions(),
-        b.tearing.is_on(),
+        b.pstate.tearing.is_on(),
     );
     b.scene
         .compose_transformed_for_tests(&input, &mut b.store, &b.platform, 1)
@@ -405,7 +405,7 @@ fn the_cursor_is_software_on_every_output_and_scales_with_the_content() {
             &b.windows,
             &outputs,
             b.platform.fb_dimensions(),
-            b.tearing.is_on(),
+            b.pstate.tearing.is_on(),
         );
         let assignment =
             b.scene
@@ -472,7 +472,7 @@ fn root_reads_never_see_the_software_cursor() {
         &b.windows,
         &outputs,
         b.platform.fb_dimensions(),
-        b.tearing.is_on(),
+        b.pstate.tearing.is_on(),
     );
     let (bo, read) = b
         .scene

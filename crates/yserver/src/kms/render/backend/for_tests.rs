@@ -2,8 +2,9 @@ use crate::kms::{
     core::KmsCore,
     render::{
         backend::{
-            ConnectorConfig, KmsBackend, KmsBackendState, PaintTargetShape, RandrIdAllocator,
-            ScanoutM0Telemetry, ScanoutM1ProbeCache, ScanoutM2State, ScenePlacement, Tearing,
+            ConnectorConfig, KmsBackend, KmsBackendState, PaintTargetShape,
+            RandrIdAllocator, ScanoutM0Telemetry, ScanoutM1ProbeCache, ScanoutM2State,
+            ScenePlacement, Tearing,
         },
         engine::{RenderEngine, decode_x11_pixel_for_storage},
         gpu::GpuCore,
@@ -20,6 +21,9 @@ use std::{
     rc::Rc,
 };
 use yserver_core::{backend::Backend as _, server::ServerState};
+
+#[cfg(test)]
+use crate::kms::render::backend::DirectFrameSubmitter;
 
 impl KmsBackend {
     /// Test-only entry point: drives the production `get_image` path
@@ -547,6 +551,21 @@ impl KmsBackend {
         b
     }
 
+    /// Test fixture with a caller supplied direct-frame submitter. The
+    /// ordinary fixture uses the live KMS submitter; focused tests can inject
+    /// a recording submitter at construction without a production test branch.
+    #[doc(hidden)]
+    #[cfg(test)]
+    pub(in crate::kms::render::backend) fn for_tests_with_direct_submitter(
+        submitter: DirectFrameSubmitter,
+    ) -> Self {
+        let mut b = Self::for_tests_seed();
+        b.pstate.direct_frame_submitter = submitter;
+        b.init_root_storage();
+        let _ = b.init_cursor_sprite();
+        b
+    }
+
     /// Construct the test fixture **without** initialising root
     /// storage. Used by `for_tests_with_vk` so root allocation
     /// happens after the Vk context is attached.
@@ -556,6 +575,7 @@ impl KmsBackend {
             scanout_m1: ScanoutM1ProbeCache::new(),
             scanout_m2: ScanoutM2State::new(),
             tearing: Tearing::new(),
+            direct_frame_submitter: KmsBackend::submit_direct_frame_live,
             vt_resume_executor: std::rc::Rc::new(
                 crate::kms::render::backend::kms::session::DrmVtResumeExecutor,
             ),

@@ -249,6 +249,8 @@ impl KmsBackend {
         self.pstate.tearing.state = TearingState::Off;
         self.pstate.tearing.reset_probation();
         self.pstate.tearing.hide_failed_logged = false;
+        self.pstate.tearing.last_cursor_compose = None;
+        self.pstate.tearing.deferred_cursor_wake = None;
         self.platform.async_ledger.clear();
         if was_on {
             log::info!("kms: leaving tearing: {reason}");

@@ -90,6 +90,26 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   Recording-sink and Vulkan-backed scene fixtures cover both submit routes;
   hardware validation remains in Task 6.
 
+- **2026-10-14 tearing-on-demand Task 3:** Present `Async` requests can enter
+  tearing after probation when the full-root gate passes with the cursor term
+  ignored. The owner is the paint destination host window; exits clear the
+  async ledger and restore normal cursor policy. Tearing suppresses hardware
+  cursor planes, while direct async scanout remains available when no plane is
+  visible. Hardware validation remains in Task 6.
+
+- **2026-10-14 tearing-on-demand Task 4:** Composed scene passes use async only
+  after the shared gate revalidates the owner. Visible-cursor transitions from
+  held direct scanout hand off through a composed pass; the cursor plane is
+  hidden at unflip retirement, and Copy fallback sources are registered for
+  safe replacement. Hardware validation remains in Task 6.
+
+- **2026-10-14 tearing-on-demand Task 5:** Visible software-cursor motion while
+  tearing is on recomposes at most once per shortest output refresh interval.
+  The core-loop deadline triggers the deferred pass; client Copy damage remains
+  immediate, and composed submits or tearing exits clear the timer state. Exit
+  tests cover HW, transformed-output SW, XFIXES-hidden, DPMS-off, and owner
+  destruction. Hardware validation remains in Task 6.
+
 - **2026-10-13 hardware cursor in the wlroots model (branch `feat/atomic-cursor`):** on every device whose
   cursor planes expose `CRTC_X`/`CRTC_Y`, the cursor is driven through atomic commits. Each CRTC has one commit
   stream with at most one commit in flight:

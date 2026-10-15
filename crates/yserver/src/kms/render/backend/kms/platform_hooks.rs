@@ -72,6 +72,25 @@ impl Platform for PlatformBackend {
         })
     }
 
+    fn cursor_motion_during_tearing(b: &mut KmsBackend, cursor_visible: bool) {
+        if !cursor_visible {
+            b.scene.wake_for_damage();
+            return;
+        }
+
+        let now = std::time::Instant::now();
+        let interval = b.pstate.tearing.cursor_compose_interval(&b.platform);
+        match b.pstate.tearing.last_cursor_compose {
+            Some(last_compose) if now < last_compose + interval => {
+                b.pstate.tearing.deferred_cursor_wake = Some(last_compose + interval);
+            }
+            _ => {
+                b.pstate.tearing.deferred_cursor_wake = None;
+                b.scene.wake_for_damage();
+            }
+        }
+    }
+
     fn exit_tearing_for_window(b: &mut KmsBackend, host_xid: u32, reason: &'static str) {
         b.exit_tearing_for_window(host_xid, reason);
     }
