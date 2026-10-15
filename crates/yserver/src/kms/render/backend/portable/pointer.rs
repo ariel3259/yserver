@@ -615,7 +615,12 @@ impl<P: Platform> XBackend<P> {
             // scene so the SW cursor stays in sync with the eventual
             // plane bind.
             let cursor_mode = self.scene.cursor_mode();
-            if self.cursor_hidden {
+            if P::tearing_active(self) {
+                // Tearing owns cursor policy until exit. Motion must stay on
+                // the scene wake path even if the last retired scene frame
+                // still reports an HW cursor mode.
+                self.scene.wake_for_damage();
+            } else if self.cursor_hidden {
                 // XFIXES HideCursor: there is no sprite to move. Showing
                 // it again displays it at the then-current position.
             } else if matches!(

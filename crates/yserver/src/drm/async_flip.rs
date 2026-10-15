@@ -128,4 +128,9 @@ impl AsyncFlipLedger {
             .get(&stream)
             .map_or(0, |state| state.consecutive_einval)
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_is_empty(&self) -> bool {
+        self.streams.is_empty()
+    }
 }

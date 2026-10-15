@@ -127,6 +127,9 @@ pub struct SceneInput<'a> {
     pub outputs: &'a [OutputLayout],
     /// The logical screen size.
     pub fb_size: (u16, u16),
+    /// Disable hardware-cursor assignment while a direct tearing stream owns
+    /// cursor visibility policy.
+    pub hw_cursor_suppressed: bool,
 }
 
 /// The transform of output `idx`, `None` at identity or past the end.

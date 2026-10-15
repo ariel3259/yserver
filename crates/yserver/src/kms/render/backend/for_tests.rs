@@ -3,7 +3,7 @@ use crate::kms::{
     render::{
         backend::{
             ConnectorConfig, KmsBackend, KmsBackendState, PaintTargetShape, RandrIdAllocator,
-            ScanoutM0Telemetry, ScanoutM1ProbeCache, ScanoutM2State, ScenePlacement,
+            ScanoutM0Telemetry, ScanoutM1ProbeCache, ScanoutM2State, ScenePlacement, Tearing,
         },
         engine::{RenderEngine, decode_x11_pixel_for_storage},
         gpu::GpuCore,
@@ -99,6 +99,7 @@ impl KmsBackend {
                 &self.windows,
                 &outputs,
                 self.platform.fb_dimensions(),
+                self.pstate.tearing.is_on(),
             ),
             &mut self.store,
             0,
@@ -129,6 +130,7 @@ impl KmsBackend {
                 &self.windows,
                 &outputs,
                 self.platform.fb_dimensions(),
+                self.pstate.tearing.is_on(),
             ),
             &mut self.store,
             0,
@@ -553,6 +555,10 @@ impl KmsBackend {
             scanout_m0: ScanoutM0Telemetry::default(),
             scanout_m1: ScanoutM1ProbeCache::new(),
             scanout_m2: ScanoutM2State::new(),
+            tearing: Tearing::new(),
+            vt_resume_executor: std::rc::Rc::new(
+                crate::kms::render::backend::kms::session::DrmVtResumeExecutor,
+            ),
             armed_vblank_targets: std::collections::HashMap::new(),
             absolute_vblank_targets: std::collections::HashMap::new(),
             crtc_queue_sequence_unsupported_devices: HashSet::new(),

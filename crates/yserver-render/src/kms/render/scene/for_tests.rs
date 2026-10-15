@@ -63,7 +63,7 @@ impl SceneCompositor {
             cursor,
             None,
             None,
-            hw_cursor_allowed(input.outputs),
+            hw_cursor_allowed(input.outputs) && !input.hw_cursor_suppressed,
             Visibility::On,
         )
         .cursor_assignment

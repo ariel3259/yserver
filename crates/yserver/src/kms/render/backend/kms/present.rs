@@ -1,6 +1,7 @@
 use crate::kms::render::{
     backend::{
         ABSOLUTE_SEQ_TAG, DirectPresentFrame, KmsBackend, ScanoutM0Target, ScanoutM1ProbeEntry,
+        TEARING_ENTRY_PROBATION, TearingState,
         kms::scanout::{
             phase_b_flip_in_flight_for_scheduler, scanout_direct_eligible,
             scanout_m2_is_authoritative_root,
@@ -21,6 +22,139 @@ pub(in crate::kms::render::backend) fn absolute_seq_user_data(crtc_id: u32) -> u
 }
 
 impl KmsBackend {
+    fn direct_candidate_gate(
+        &self,
+        candidate: PresentScanoutCandidate,
+        authoritative_root: bool,
+        scene_eligible: bool,
+        unbordered: bool,
+        cursor_term: bool,
+    ) -> bool {
+        !self.platform.any_output_transformed()
+            && self.direct_present_crtc_eligible(candidate.crtc_id, candidate.crtc_epoch)
+            && scanout_direct_eligible(
+                self.scanout_allowed(),
+                self.kms_outputs_active,
+                cursor_term,
+                self.scene.root_overlay.is_empty(),
+                authoritative_root && scene_eligible,
+                unbordered,
+                candidate.x_off,
+                candidate.y_off,
+                candidate.valid_region_xid,
+            )
+    }
+
+    fn tearing_gate_ignoring_cursor(
+        &self,
+        candidate: PresentScanoutCandidate,
+        authoritative_root: bool,
+        scene_eligible: bool,
+        unbordered: bool,
+    ) -> bool {
+        self.direct_candidate_gate(
+            candidate,
+            authoritative_root,
+            scene_eligible,
+            unbordered,
+            true,
+        ) && self.platform.outputs.iter().all(|output| {
+            self.platform
+                .device_for_key(output.key.device_key)
+                .is_some_and(|device| device.async_page_flip)
+        })
+    }
+
+    fn note_tearing_present(
+        &mut self,
+        candidate: PresentScanoutCandidate,
+        authoritative_root: bool,
+        gate_ignoring_cursor: bool,
+    ) -> bool {
+        let was_on = self.pstate.tearing.is_on();
+        match self.pstate.tearing.state {
+            TearingState::On {
+                window, crtc_epoch, ..
+            } if candidate.dst_window_xid == window
+                && (candidate.crtc_epoch != crtc_epoch
+                    || !gate_ignoring_cursor
+                    || candidate.options
+                        & yserver_core::present_scheduler::PRESENT_OPTION_ASYNC
+                        == 0) =>
+            {
+                self.exit_tearing("direct_present_no_longer_qualifies");
+            }
+            TearingState::On { window, .. }
+                if authoritative_root && candidate.dst_window_xid != window =>
+            {
+                self.exit_tearing("authoritative_root_window_changed");
+            }
+            TearingState::On { .. } => return was_on,
+            TearingState::Off => {}
+        }
+
+        if !authoritative_root {
+            return was_on;
+        }
+        let qualifies = gate_ignoring_cursor
+            && candidate.options & yserver_core::present_scheduler::PRESENT_OPTION_ASYNC != 0;
+        if !qualifies {
+            self.pstate.tearing.reset_probation();
+            return was_on;
+        }
+
+        if self.pstate.tearing.probation_owner != Some(candidate.dst_window_xid) {
+            self.pstate.tearing.probation_owner = Some(candidate.dst_window_xid);
+            self.pstate.tearing.probation = 1;
+        } else {
+            self.pstate.tearing.probation = self
+                .pstate
+                .tearing
+                .probation
+                .saturating_add(1)
+                .min(TEARING_ENTRY_PROBATION);
+        }
+        if self.pstate.tearing.probation >= TEARING_ENTRY_PROBATION
+            && !self.scene.cursor_transition_pending()
+        {
+            self.pstate.tearing.state = TearingState::On {
+                window: candidate.dst_window_xid,
+                // Lifecycle teardown reports the window's host ID. For a
+                // redirected window, completion may name its backing pixmap.
+                host_window: candidate.paint_dst_host_xid,
+                crtc_epoch: candidate.crtc_epoch,
+            };
+            self.pstate.scanout_m2.cursor_bound_all = false;
+            log::info!(
+                "kms: entering tearing for window=0x{:x} crtc_epoch={}",
+                candidate.dst_window_xid,
+                candidate.crtc_epoch,
+            );
+        }
+        was_on
+    }
+
+    pub(super) fn exit_tearing(&mut self, reason: &'static str) {
+        let was_on = self.pstate.tearing.is_on();
+        self.pstate.tearing.state = TearingState::Off;
+        self.pstate.tearing.reset_probation();
+        self.platform.async_ledger.clear();
+        if was_on {
+            log::info!("kms: leaving tearing: {reason}");
+        }
+    }
+
+    pub(in crate::kms::render::backend) fn exit_tearing_for_window(
+        &mut self,
+        host_xid: u32,
+        reason: &'static str,
+    ) {
+        if matches!(self.pstate.tearing.state, TearingState::On { host_window, .. } if host_window == host_xid)
+        {
+            self.exit_tearing(reason);
+        }
+    }
+
     pub(in crate::kms::render::backend) fn poke_present_completion_wakeup(&self, context: &str) {
         match self.platform.wakeup_eventfd.write(1) {
             Ok(_) | Err(nix::errno::Errno::EAGAIN) => {}
@@ -539,9 +673,6 @@ impl KmsBackend {
         candidate: PresentScanoutCandidate,
         event: yserver_core::backend::CompletedPresentEvent,
     ) -> io::Result<bool> {
-        if self.pstate.scanout_m2.reentry_blocked_until_composed {
-            return Ok(false);
-        }
         let source_id = self.store.lookup(candidate.src_host_xid);
         let leaf_id = self.store.lookup(candidate.paint_dst_host_xid);
         let paint_target = self.resolve_paint_target(candidate.paint_dst_host_xid);
@@ -570,24 +701,32 @@ impl KmsBackend {
         // longer starts at storage (0, 0). A candidate that does not
         // resolve at all is rejected further down.
         let unbordered = paint_target.is_none_or(|t| !t.has_border_clip());
-        // No transformed CRTC is ever flipped directly (spec D5).
-        let eligible = !self.platform.any_output_transformed()
-            && self.direct_present_crtc_eligible(candidate.crtc_id, candidate.crtc_epoch)
-            && scanout_direct_eligible(
-                self.scanout_allowed(),
-                self.kms_outputs_active,
-                matches!(
-                    self.scene.cursor_mode(),
-                    crate::kms::render::scene::CursorPlaneMode::Hw
-                        | crate::kms::render::scene::CursorPlaneMode::Hidden
-                ),
-                self.scene.root_overlay.is_empty(),
-                authoritative_root && scene_eligible,
-                unbordered,
-                candidate.x_off,
-                candidate.y_off,
-                candidate.valid_region_xid,
-            );
+        let tearing_gate_ignoring_cursor = self.tearing_gate_ignoring_cursor(
+            candidate,
+            authoritative_root,
+            scene_eligible,
+            unbordered,
+        );
+        let was_tearing_on =
+            self.note_tearing_present(candidate, authoritative_root, tearing_gate_ignoring_cursor);
+        if self.pstate.scanout_m2.reentry_blocked_until_composed {
+            return Ok(false);
+        }
+        // No transformed CRTC is ever flipped directly (spec D5). During
+        // tearing, the scene's cursor classification cannot retire a new HW
+        // assignment, but the existing direct gate still decides whether this
+        // Present itself may be scanned out.
+        let eligible = self.direct_candidate_gate(
+            candidate,
+            authoritative_root,
+            scene_eligible,
+            unbordered,
+            matches!(
+                self.scene.cursor_mode(),
+                crate::kms::render::scene::CursorPlaneMode::Hw
+                    | crate::kms::render::scene::CursorPlaneMode::Hidden
+            ),
+        );
         if !eligible {
             // A child/video/game Present updates the COW shadow, but Muffin's
             // currently scanned root-stage buffer remains authoritative until
@@ -595,7 +734,9 @@ impl KmsBackend {
             // Present turns playback into direct/composed thrash. Only an
             // ineligible authoritative-root successor invalidates the direct
             // ownership contract and must expose the Copy fallback.
-            if authoritative_root {
+            if authoritative_root
+                && !(self.pstate.tearing.is_on() && tearing_gate_ignoring_cursor)
+            {
                 self.pstate.scanout_m2.reset_eligible_root_probation();
                 self.request_direct_unflip("ineligible_authoritative_root_present");
                 if self.pstate.scanout_m2.active() {
@@ -709,9 +850,12 @@ impl KmsBackend {
             <Self as Backend>::release_present_source(self, fallback_target_pin);
             return Ok(false);
         }
-        if let Err(error) =
-            self.submit_direct_frame(&mut frame, self.platform.requested_flip_timing)
-        {
+        let timing = if was_tearing_on {
+            self.direct_frame_flip_timing(&frame)
+        } else {
+            crate::drm::async_flip::FlipTiming::Vsync
+        };
+        if let Err(error) = self.submit_direct_frame(&mut frame, timing) {
             self.request_direct_unflip("eligible_direct_successor_submit_failed");
             <Self as Backend>::release_present_source(self, source_pin);
             <Self as Backend>::release_present_source(self, fallback_target_pin);

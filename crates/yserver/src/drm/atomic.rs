@@ -580,6 +580,10 @@ pub(crate) mod tests_support {
             self.records.borrow().clone()
         }
 
+        pub(crate) fn clear_records(&self) {
+            self.records.borrow_mut().clear();
+        }
+
         pub(crate) fn script_result(&self, result: io::Result<()>) {
             self.scripted_results
                 .borrow_mut()

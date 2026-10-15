@@ -585,6 +585,8 @@ be measured on hardware (Task 6).
   - `present_to_submit_us` p50/p99/max, split `direct` vs `composed`, measured from the backend's receipt of the
     Present (direct) or of the Copy damage (composed) to the accepted async commit;
   - composed GPU cost from the existing `avg_gpu_render_ns`;
+  - async flip turnaround from the accepted async ioctl to its flip event (p50/p99/max), and `Skip` completions per
+    second while `On`;
   - one `log::info!` line `tearing_summary` per second, only while `On`.
 - Modify: `tools/cursor-bench/` (add `tests/tearing.sh`; update `README.md`)
 - Modify: `docs/status.md` (an entry for this feature)
@@ -601,6 +603,15 @@ using the GPU (check `fuser /dev/dri/cardN /dev/nvidia*` and ask the user first)
 | AMD iGPU | the same four rows with radv | — | same; Mesa sends `0x19`, and the core clears `0x10` |
 
 For all runs: Xid 0, `EBUSY` not above the #244 baseline, no `panicked`, no `timed out waiting for`.
+
+**Uncapped direct scanout (C1 goal) — acceptance:** with mpv `--vulkan-swap-mode=immediate --fs` and the cursor
+hidden, on NVIDIA and AMD, report per second:
+- async direct flips vs the client's frame rate;
+- `Skip` completions;
+- async flip turnaround, from the ioctl to the flip event (p50/p99/max).
+
+The direct flip rate must follow the client well above the refresh rate, not stay at refresh. If a driver's
+turnaround caps it, record that driver's number as its limit; it is not a defect of this plan.
 
 **Visible-cursor measurement (maintainer request):** from `tearing_summary`, report for direct (cursor hidden) and
 composed (cursor visible, moving):

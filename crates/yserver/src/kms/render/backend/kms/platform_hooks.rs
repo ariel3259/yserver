@@ -49,6 +49,14 @@ impl Platform for PlatformBackend {
         b.pstate.scanout_m2.active()
     }
 
+    fn tearing_active(b: &KmsBackend) -> bool {
+        b.pstate.tearing.is_on()
+    }
+
+    fn exit_tearing_for_window(b: &mut KmsBackend, host_xid: u32, reason: &'static str) {
+        b.exit_tearing_for_window(host_xid, reason);
+    }
+
     fn request_direct_unflip(b: &mut KmsBackend, reason: &'static str) {
         b.request_direct_unflip(reason);
     }

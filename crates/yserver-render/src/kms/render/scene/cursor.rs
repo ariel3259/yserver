@@ -74,6 +74,19 @@ impl SceneBuild {
 }
 
 impl SceneCompositor {
+    /// Whether any submitted, unretired frame still carries a cursor-plane
+    /// action. Tearing entry waits for these actions to retire first.
+    pub fn cursor_transition_pending(&self) -> bool {
+        self.inner.as_ref().is_some_and(|inner| {
+            inner.outputs.iter().any(|output| {
+                output
+                    .pending_acks
+                    .iter()
+                    .any(|ack| ack.cursor_transition.is_some())
+            })
+        })
+    }
+
     /// Put the pixels a software cursor covers back into `bytes`, a tight
     /// BGRA8 read of `read` from compose image `image` (`cursor_save`).
     pub fn restore_under_cursor(&self, image: vk::Image, read: vk::Rect2D, bytes: &mut [u8]) {

@@ -98,6 +98,44 @@ impl crate::kms::cursor_plane::CursorHideExecutor for RecordingCursorHideExecuto
     }
 }
 
+type CursorShowCall = (::drm::control::crtc::Handle, (i32, i32), i32, i32);
+
+#[derive(Default)]
+pub(crate) struct RecordingCursorShowExecutor {
+    calls: RefCell<Vec<CursorShowCall>>,
+}
+
+impl RecordingCursorShowExecutor {
+    pub(crate) fn calls(&self) -> Vec<CursorShowCall> {
+        self.calls.borrow().clone()
+    }
+}
+
+impl crate::kms::cursor_plane::CursorShowExecutor for RecordingCursorShowExecutor {
+    fn show(
+        &self,
+        _device: &crate::drm::Device,
+        _buffer: &crate::kms::cursor_plane::CursorPlaneBuffer,
+        crtc: ::drm::control::crtc::Handle,
+        hotspot: (i32, i32),
+        img_x: i32,
+        img_y: i32,
+    ) -> io::Result<()> {
+        self.calls.borrow_mut().push((crtc, hotspot, img_x, img_y));
+        Ok(())
+    }
+
+    fn move_to(
+        &self,
+        _device: &crate::drm::Device,
+        _crtc: ::drm::control::crtc::Handle,
+        _img_x: i32,
+        _img_y: i32,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 pub(crate) fn install_recording_cursor_hide_executor(
     backend: &mut KmsBackend,
     device_idx: usize,

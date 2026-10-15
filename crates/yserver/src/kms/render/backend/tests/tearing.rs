@@ -55,32 +55,122 @@ fn prepare_direct_present(
     yserver_core::backend::CompletedPresentEvent,
     crate::drm::async_flip::AsyncShape,
 ) {
+    prepare_direct_present_for_window(
+        backend,
+        present_id,
+        0x7380,
+        width,
+        height,
+        yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+    )
+}
+
+fn prepare_direct_present_for_window(
+    backend: &mut KmsBackend,
+    present_id: u64,
+    target_xid: u32,
+    width: u16,
+    height: u16,
+    options: u32,
+) -> (
+    yserver_core::backend::PresentScanoutCandidate,
+    yserver_core::backend::CompletedPresentEvent,
+    crate::drm::async_flip::AsyncShape,
+) {
+    prepare_direct_present_for_ids(
+        backend, present_id, target_xid, target_xid, width, height, options,
+    )
+}
+
+fn prepare_direct_present_for_ids(
+    backend: &mut KmsBackend,
+    present_id: u64,
+    protocol_window_xid: u32,
+    host_window_xid: u32,
+    width: u16,
+    height: u16,
+    options: u32,
+) -> (
+    yserver_core::backend::PresentScanoutCandidate,
+    yserver_core::backend::CompletedPresentEvent,
+    crate::drm::async_flip::AsyncShape,
+) {
+    prepare_direct_present_for_ids_with_storage(
+        backend,
+        present_id,
+        protocol_window_xid,
+        host_window_xid,
+        width,
+        height,
+        options,
+        false,
+    )
+}
+
+fn prepare_direct_present_for_ids_with_storage(
+    backend: &mut KmsBackend,
+    present_id: u64,
+    protocol_window_xid: u32,
+    host_window_xid: u32,
+    width: u16,
+    height: u16,
+    options: u32,
+    allocate_live_storage: bool,
+) -> (
+    yserver_core::backend::PresentScanoutCandidate,
+    yserver_core::backend::CompletedPresentEvent,
+    crate::drm::async_flip::AsyncShape,
+) {
     use crate::kms::render::store::{DrawableKind, Storage};
     use ash::vk;
     use yserver_core::backend::{CompletedPresentEvent, PresentScanoutCandidate, PresentWake};
 
-    let target_xid = 0x7300 + u32::try_from(present_id).expect("test id fits") * 0x10;
-    let source_xid = target_xid + 1;
-    super::seed_window(backend, target_xid, None, 0, 0);
-    let target = backend.windows.get_mut(&target_xid).expect("target window");
+    let source_xid = 0x8300 + u32::try_from(present_id).expect("test id fits") * 0x10;
+    if !backend.windows.contains_key(&host_window_xid) {
+        let target_id = super::seed_window(backend, host_window_xid, None, 0, 0);
+        if allocate_live_storage {
+            backend.store.detach_xid(host_window_xid);
+            backend.store_decref_with_invalidate(target_id);
+            let storage = backend
+                .platform
+                .gpu
+                .allocate_drawable_storage(width, height, 24)
+                .expect("allocate live fallback window storage");
+            backend
+                .store
+                .allocate(host_window_xid, DrawableKind::Window, 24, true, storage)
+                .expect("register live fallback window storage");
+        }
+    }
+    let target = backend
+        .windows
+        .get_mut(&host_window_xid)
+        .expect("target window");
     target.width = width;
     target.height = height;
-    backend.core.top_level_order.push(target_xid);
+    if (width, height) == (backend.platform.fb_w, backend.platform.fb_h)
+        && !backend.core.top_level_order.contains(&host_window_xid)
+    {
+        backend.core.top_level_order.push(host_window_xid);
+    }
+    let source_storage = if allocate_live_storage {
+        backend
+            .platform
+            .gpu
+            .allocate_drawable_storage(width, height, 24)
+            .expect("allocate live direct source storage")
+    } else {
+        Storage::for_tests_null(
+            vk::Extent2D {
+                width: u32::from(width),
+                height: u32::from(height),
+            },
+            vk::Format::B8G8R8A8_UNORM,
+        )
+    };
     let source_id = backend
         .store
-        .allocate(
-            source_xid,
-            DrawableKind::Pixmap,
-            24,
-            false,
-            Storage::for_tests_null(
-                vk::Extent2D {
-                    width: u32::from(width),
-                    height: u32::from(height),
-                },
-                vk::Format::B8G8R8A8_UNORM,
-            ),
-        )
+        .allocate(source_xid, DrawableKind::Pixmap, 24, false, source_storage)
         .expect("allocate direct source");
     let mut crtcs: Vec<_> = backend
         .platform
@@ -108,8 +198,12 @@ fn prepare_direct_present(
         ),
     );
 
-    let output = &backend.platform.outputs[0].output;
-    let crtc_id = u32::from(output.crtc);
+    let output_layout = &backend.platform.outputs[0];
+    let crtc_id = backend
+        .crtc_key_by_id
+        .iter()
+        .find_map(|(&crtc_id, key)| (key == &output_layout.key).then_some(crtc_id))
+        .unwrap_or_else(|| u32::from(output_layout.output.crtc));
     let crtc_epoch = backend.present_crtc_clock_epoch(crtc_id);
     let candidate = PresentScanoutCandidate {
         client_id: 1,
@@ -117,10 +211,10 @@ fn prepare_direct_present(
         crtc_id,
         crtc_epoch,
         src_pixmap_xid: source_xid,
-        dst_window_xid: target_xid,
+        dst_window_xid: protocol_window_xid,
         src_host_xid: source_xid,
-        paint_dst_host_xid: target_xid,
-        completion_dst_host_xid: target_xid,
+        paint_dst_host_xid: host_window_xid,
+        completion_dst_host_xid: host_window_xid,
         src_width: width,
         src_height: height,
         x_off: 0,
@@ -129,14 +223,14 @@ fn prepare_direct_present(
         update_region_xid: 0,
         update_is_full: true,
         explicit_sync: false,
-        options: 0,
+        options,
     };
     let event = CompletedPresentEvent {
         client_id: yserver_protocol::x11::ClientId(1),
         serial: u32::try_from(present_id).expect("test serial fits"),
         host_xid: source_xid,
-        dst_host_xid: target_xid,
-        options: 0,
+        dst_host_xid: host_window_xid,
+        options,
         present_id,
         window_generation: 0,
         crtc_id,
@@ -207,12 +301,14 @@ fn direct_backend(output_count: usize) -> KmsBackend {
     let layouts = backend.platform.scene_output_layouts();
     backend.scene = crate::kms::render::scene::SceneCompositor::new(&backend.platform, &layouts)
         .expect("construct direct test scene");
-    backend.scene.for_tests_set_hw_cursor_mode();
     backend.scene.scene_structure_dirty = false;
     backend.scanout_m2.cursor_bound_all = true;
     backend.scanout_m2.eligible_root_streak =
         crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1;
     backend.platform.requested_flip_timing = crate::drm::async_flip::FlipTiming::Async;
+    for device in &mut backend.platform.devices {
+        device.async_page_flip = true;
+    }
     backend
 }
 
@@ -231,25 +327,1459 @@ fn try_direct_present(
     width: u16,
     height: u16,
 ) -> crate::drm::async_flip::AsyncShape {
+    try_direct_present_for_window(
+        backend,
+        present_id,
+        0x7380,
+        width,
+        height,
+        yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+    )
+    .expect("eligible direct Present must submit")
+}
+
+fn qualify_test_direct_async(
+    backend: &mut KmsBackend,
+    recorder: &std::rc::Rc<RecordingAtomicCommitExecutor>,
+    window: u32,
+    first_present: u64,
+) {
     use yserver_core::backend::Backend;
 
-    let (candidate, event, shape) = prepare_direct_present(backend, present_id, width, height);
+    let mut state = enter_tearing_without_direct_scanout(backend, window, first_present);
+    Backend::set_cursor_hidden(backend, true);
+    damage_root_and_composite(backend);
+    assert!(backend.scene.has_pending_page_flips());
+    retire_composed_frame(backend, &mut state, 20);
+    assert!(matches!(
+        backend.tearing.state,
+        crate::kms::render::backend::TearingState::On { window: owner, .. } if owner == window
+    ));
+    assert_eq!(
+        backend.scene.cursor_mode(),
+        crate::kms::render::scene::CursorPlaneMode::Hidden
+    );
+    let (width, height) = backend.platform.fb_dimensions();
+    let before_warmup = recorder.records().len();
+    for index in 0..7_u64 {
+        assert!(
+            try_direct_present_for_window(
+                backend,
+                first_present + 8 + index,
+                window,
+                width,
+                height,
+                yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+            )
+            .is_none()
+        );
+    }
+    assert_eq!(recorder.records().len(), before_warmup);
+    assert_eq!(backend.scanout_m2.eligible_root_streak, 7);
+    assert!(backend.scanout_m2.current.is_none());
+    assert!(backend.scanout_m2.pending.is_none());
+    assert!(backend.scanout_m2.queued_successor.is_none());
+    recorder.clear_records();
+}
+
+fn try_direct_present_for_window(
+    backend: &mut KmsBackend,
+    present_id: u64,
+    target_xid: u32,
+    width: u16,
+    height: u16,
+    options: u32,
+) -> Option<crate::drm::async_flip::AsyncShape> {
+    try_direct_present_for_ids(
+        backend, present_id, target_xid, target_xid, target_xid, width, height, options,
+    )
+}
+
+fn try_direct_present_for_ids(
+    backend: &mut KmsBackend,
+    present_id: u64,
+    protocol_window_xid: u32,
+    host_window_xid: u32,
+    completion_dst_host_xid: u32,
+    width: u16,
+    height: u16,
+    options: u32,
+) -> Option<crate::drm::async_flip::AsyncShape> {
+    use yserver_core::backend::Backend;
+
+    let (mut candidate, mut event, shape) = prepare_direct_present_for_ids(
+        backend,
+        present_id,
+        protocol_window_xid,
+        host_window_xid,
+        width,
+        height,
+        options,
+    );
+    candidate.completion_dst_host_xid = completion_dst_host_xid;
+    event.dst_host_xid = completion_dst_host_xid;
     let submitted = Backend::try_present_direct(backend, candidate, event)
         .unwrap_or_else(|error| panic!("direct Present entry {present_id}: {error}"));
-    assert!(
-        submitted,
-        "eligible direct Present {present_id} must submit"
+    submitted.then_some(shape)
+}
+
+fn try_direct_present_with_live_storage(
+    backend: &mut KmsBackend,
+    present_id: u64,
+    target_xid: u32,
+    width: u16,
+    height: u16,
+    options: u32,
+) -> Option<crate::drm::async_flip::AsyncShape> {
+    use yserver_core::backend::Backend;
+
+    let (candidate, event, shape) = prepare_direct_present_for_ids_with_storage(
+        backend, present_id, target_xid, target_xid, width, height, options, true,
     );
-    shape
+    let submitted = Backend::try_present_direct(backend, candidate, event)
+        .unwrap_or_else(|error| panic!("live-storage direct Present {present_id}: {error}"));
+    submitted.then_some(shape)
+}
+
+fn retire_direct_present(
+    backend: &mut KmsBackend,
+    state: &mut yserver_core::server::ServerState,
+    frame: u32,
+) {
+    use yserver_core::backend::Backend;
+
+    retire_recorded_direct_flip(backend, state, frame);
+    Backend::maybe_composite(backend).expect("settle post-retirement scene work");
+}
+
+fn qualify_direct_async(
+    backend: &mut KmsBackend,
+    recorder: &std::rc::Rc<RecordingAtomicCommitExecutor>,
+    state: &mut yserver_core::server::ServerState,
+    window: u32,
+    start_present: u64,
+    count: u32,
+) {
+    use yserver_core::backend::Backend;
+
+    use crate::drm::async_flip::FlipTiming;
+
+    assert_eq!(backend.platform.requested_flip_timing, FlipTiming::Async);
+    for index in 0..count {
+        let present_id = start_present + u64::from(index);
+        let before = recorder.records().len();
+        let (width, height) = backend.platform.fb_dimensions();
+        let (candidate, event, _) = prepare_direct_present_for_window(
+            backend,
+            present_id,
+            window,
+            width,
+            height,
+            yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+        );
+        let leaf_id = backend.store.lookup(candidate.paint_dst_host_xid);
+        let paint_target = backend.resolve_paint_target(candidate.paint_dst_host_xid);
+        let paint_id = paint_target.map(|target| target.backing_id());
+        let m0_target = backend.scanout_m0_target(candidate.paint_dst_host_xid, leaf_id, paint_id);
+        let root = (
+            u32::from(backend.platform.fb_w),
+            u32::from(backend.platform.fb_h),
+        );
+        let window_rect = leaf_id.and_then(|id| backend.window_absolute_rect(id));
+        let root_coverage = window_rect.is_some_and(|rect| {
+            rect.offset.x == 0
+                && rect.offset.y == 0
+                && (rect.extent.width, rect.extent.height) == root
+                && (
+                    u32::from(candidate.src_width),
+                    u32::from(candidate.src_height),
+                ) == root
+        });
+        let authoritative =
+            crate::kms::render::backend::scanout_m2_is_authoritative_root(m0_target, root_coverage);
+        let direct_gate = backend
+            .direct_present_crtc_eligible(candidate.crtc_id, candidate.crtc_epoch)
+            && crate::kms::render::backend::scanout_direct_eligible(
+                backend.scanout_allowed(),
+                backend.kms_outputs_active,
+                true,
+                backend.scene.root_overlay.is_empty(),
+                authoritative
+                    && backend.direct_shape_chain_covers_root(candidate.paint_dst_host_xid, root),
+                paint_target.is_none_or(|target| !target.has_border_clip()),
+                candidate.x_off,
+                candidate.y_off,
+                candidate.valid_region_xid,
+            );
+        let diagnostic = format!(
+            "m0={m0_target:?} root={root:?} window_rect={window_rect:?} source={}x{} root_coverage={root_coverage} authoritative={authoritative} direct_gate={direct_gate} async_devices={} topology={} crtc_eligible={}",
+            candidate.src_width,
+            candidate.src_height,
+            backend.platform.outputs.iter().all(|output| backend
+                .platform
+                .device_for_key(output.key.device_key)
+                .is_some_and(|device| device.async_page_flip)),
+            backend.direct_scanout_topology_eligible(),
+            backend.direct_present_crtc_eligible(candidate.crtc_id, candidate.crtc_epoch),
+        );
+        let submitted = Backend::try_present_direct(backend, candidate, event)
+            .unwrap_or_else(|error| panic!("direct Present entry {present_id}: {error}"));
+        assert!(
+            submitted,
+            "qualifying root Present {present_id} must submit ({diagnostic}; tearing={:?}, probation={}, owner={:?}, m2_streak={}, scene_cursor={:?}, scene_pending={})",
+            backend.tearing.state,
+            backend.tearing.probation,
+            backend.tearing.probation_owner,
+            backend.scanout_m2.eligible_root_streak,
+            backend.scene.cursor_mode(),
+            backend.scene.has_pending_page_flips(),
+        );
+        retire_direct_present(backend, state, index + 1);
+        assert_eq!(recorder.records().len(), before + 1);
+        assert_eq!(
+            recorder.records()[before].kind,
+            AtomicCommitKind::Scene,
+            "the probation frame must remain Vsync"
+        );
+    }
+}
+
+fn enter_tearing_without_direct_scanout(
+    backend: &mut KmsBackend,
+    window: u32,
+    first_present: u64,
+) -> yserver_core::server::ServerState {
+    enter_tearing_without_direct_scanout_for_ids(backend, window, window, window, first_present)
+}
+
+fn enter_tearing_without_direct_scanout_for_ids(
+    backend: &mut KmsBackend,
+    protocol_window_xid: u32,
+    host_window_xid: u32,
+    completion_dst_host_xid: u32,
+    first_present: u64,
+) -> yserver_core::server::ServerState {
+    use yserver_core::{backend::Backend, server::ServerState};
+
+    let mut state = ServerState::new();
+    let cursor_xid = 0x7f10;
+    backend.insert_cursor_record(cursor_xid, 1, 1, 0, 0, vec![0xff; 4]);
+    backend.effective_cursor_xid = Some(cursor_xid);
+    Backend::set_cursor_hidden(backend, true);
+    Backend::set_cursor_hidden(backend, false);
+    damage_root_and_composite(backend);
+    assert!(backend.scene.has_pending_page_flips());
+    retire_composed_frame(backend, &mut state, 1);
+    assert_eq!(
+        backend.scene.cursor_mode(),
+        crate::kms::render::scene::CursorPlaneMode::Sw,
+        "the fixture has a visible software cursor because it has no HW plane"
+    );
+    for device in &mut backend.platform.devices {
+        device.async_page_flip = true;
+    }
+    let (width, height) = backend.platform.fb_dimensions();
+
+    for index in 0..u64::from(crate::kms::render::backend::TEARING_ENTRY_PROBATION) {
+        assert!(
+            try_direct_present_for_ids(
+                backend,
+                first_present + index,
+                protocol_window_xid,
+                host_window_xid,
+                completion_dst_host_xid,
+                width,
+                height,
+                yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+            )
+            .is_none(),
+            "the real direct gate rejects the SW cursor"
+        );
+    }
+    assert!(
+        matches!(
+            backend.tearing.state,
+            crate::kms::render::backend::TearingState::On { window: owner, .. }
+                if owner == protocol_window_xid
+        ),
+        "probation={} owner={:?} cursor={:?} root_order={:?}",
+        backend.tearing.probation,
+        backend.tearing.probation_owner,
+        backend.scene.cursor_mode(),
+        backend.core.top_level_order
+    );
+    state
+}
+
+fn assert_tearing_off(backend: &KmsBackend) {
+    assert!(matches!(
+        backend.tearing.state,
+        crate::kms::render::backend::TearingState::Off
+    ));
+    assert_eq!(backend.tearing.probation, 0);
+    assert_eq!(backend.tearing.probation_owner, None);
+    assert!(backend.platform.async_ledger.for_tests_is_empty());
+}
+
+fn assert_direct_queue_drained(backend: &KmsBackend) {
+    assert!(backend.scanout_m2.pending.is_none());
+    assert!(backend.scanout_m2.queued_successor.is_none());
+    assert!(backend.scanout_m2.deferred_successor_skips.is_empty());
+}
+
+fn assert_commit_sequence(
+    recorder: &std::rc::Rc<RecordingAtomicCommitExecutor>,
+    expected: &[AtomicCommitKind],
+) {
+    let actual: Vec<_> = recorder
+        .records()
+        .iter()
+        .map(|record| record.kind)
+        .collect();
+    assert_eq!(actual, expected);
+}
+
+fn install_hidden_cursor_plane(
+    backend: &mut KmsBackend,
+) -> std::rc::Rc<RecordingCursorHideExecutor> {
+    let device = &mut backend.platform.devices[0];
+    let mut plane = crate::kms::cursor_plane::CursorPlane::for_tests_stub(
+        std::rc::Rc::clone(&device.device),
+        64,
+        64,
+    );
+    let executor = std::rc::Rc::new(RecordingCursorHideExecutor::default());
+    executor.script([TestCursorHideResult::Ok; 8]);
+    plane.for_tests_set_hide_executor(executor.clone());
+    device.cursor.plane = Some(plane);
+    executor
+}
+
+fn install_cursor_plane_with_successful_show(
+    backend: &mut KmsBackend,
+) -> (
+    std::rc::Rc<super::RecordingCursorShowExecutor>,
+    std::rc::Rc<RecordingCursorHideExecutor>,
+) {
+    let device = &mut backend.platform.devices[0];
+    let executor = std::rc::Rc::new(super::RecordingCursorShowExecutor::default());
+    let mut plane = crate::kms::cursor_plane::CursorPlane::for_tests_with_show_executor(
+        std::rc::Rc::clone(&device.device),
+        64,
+        64,
+        true,
+        executor.clone(),
+    );
+    let hide_executor = std::rc::Rc::new(RecordingCursorHideExecutor::default());
+    hide_executor.script([TestCursorHideResult::Ok; 8]);
+    plane.for_tests_set_hide_executor(hide_executor.clone());
+    device.cursor.plane = Some(plane);
+    (executor, hide_executor)
+}
+
+fn retire_registered_cursor_in_dead_zone(
+    backend: &mut KmsBackend,
+    state: &mut yserver_core::server::ServerState,
+) {
+    use yserver_core::backend::Backend;
+
+    let source = Backend::create_pixmap(backend, None, 1, 1, 1)
+        .expect("create visible cursor source pixmap");
+    Backend::put_image(backend, None, source.as_raw(), 1, 1, 1, 0, 0, &[1, 0, 0, 0])
+        .expect("paint visible cursor source bit");
+    let cursor = Backend::create_cursor(
+        backend,
+        None,
+        source,
+        None,
+        (u16::MAX, u16::MAX, u16::MAX),
+        (0, 0, 0),
+        0,
+        0,
+    )
+    .expect("create visible cursor");
+    Backend::define_cursor(backend, None, backend.core.window_id, cursor.as_raw())
+        .expect("register cursor on root");
+    assert!(backend.cursor_records.contains_key(&cursor.as_raw()));
+    assert_eq!(backend.effective_cursor_xid, Some(cursor.as_raw()));
+    assert!(!backend.cursor_hidden, "the registered cursor is visible");
+
+    // Output 0 ends at (800, 600); output 1 starts at (900, 0) and
+    // ends at (1700, 400). This point lies in the real gap between them.
+    Backend::warp_pointer_root(backend, state, 850, 450);
+    assert_eq!(
+        (backend.core.cursor_x, backend.core.cursor_y),
+        (850.0, 450.0)
+    );
+    damage_root_and_composite(backend);
+    assert!(backend.scene.has_pending_page_flips());
+    retire_composed_frame(backend, state, 1);
+    assert_eq!(
+        backend.scene.cursor_mode(),
+        crate::kms::render::scene::CursorPlaneMode::Hidden,
+        "the retired scene classifies the registered visible cursor as off-output"
+    );
+    assert_eq!(backend.effective_cursor_xid, Some(cursor.as_raw()));
+    assert!(
+        !backend.cursor_hidden,
+        "Hidden came from the dead zone, not XFIXES"
+    );
+}
+
+fn qualify_from_dead_zone(
+    backend: &mut KmsBackend,
+    recorder: &std::rc::Rc<RecordingAtomicCommitExecutor>,
+    state: &mut yserver_core::server::ServerState,
+    window: u32,
+    first_present: u64,
+) {
+    let (width, height) = backend.platform.fb_dimensions();
+    for index in 0..u64::from(crate::kms::render::backend::TEARING_ENTRY_PROBATION) {
+        let before = recorder.records().len();
+        let submitted = try_direct_present_for_window(
+            backend,
+            first_present + index,
+            window,
+            width,
+            height,
+            yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+        )
+        .is_some();
+        let output_count = backend.platform.outputs.len();
+        if submitted {
+            assert_eq!(index, 7, "M2 admission submits the eighth root Present");
+            assert_eq!(recorder.records().len(), before + 1);
+            assert_eq!(recorder.records()[before].kind, AtomicCommitKind::Scene);
+            retire_direct_present(backend, state, index as u32 + 2);
+        } else {
+            assert!(
+                index < 7,
+                "the eighth eligible root Present reaches M2 admission"
+            );
+            damage_root_and_composite(backend);
+            assert_eq!(recorder.records().len(), before + output_count);
+            assert!(
+                recorder.records()[before..]
+                    .iter()
+                    .all(|record| record.kind == AtomicCommitKind::Scene)
+            );
+            retire_composed_frame(backend, state, index as u32 + 2);
+        }
+    }
+    assert!(matches!(
+        backend.tearing.state,
+        crate::kms::render::backend::TearingState::On { window: owner, .. } if owner == window
+    ));
+    let expected = vec![AtomicCommitKind::Scene; backend.platform.outputs.len() * 8 + 1];
+    assert_commit_sequence(recorder, &expected);
 }
 
 #[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutations: drop the Async option, fullscreen gate, or CRTC async capability check.
+fn entry_needs_async_option_gate_and_capability() {
+    use yserver_core::{backend::Backend, server::ServerState};
+
+    const WINDOW: u32 = 0x7400;
+    let mut backend = direct_backend(1);
+    let recorder = recording_sink(&mut backend, 0);
+    let mut state = ServerState::new();
+    Backend::set_cursor_hidden(&mut backend, true);
+    qualify_direct_async(&mut backend, &recorder, &mut state, WINDOW, 100, 8);
+    assert!(matches!(
+        backend.tearing.state,
+        crate::kms::render::backend::TearingState::On { window: WINDOW, .. }
+    ));
+
+    let before = recorder.records().len();
+    let _shape = try_direct_present_for_window(
+        &mut backend,
+        108,
+        WINDOW,
+        800,
+        600,
+        yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+    )
+    .expect("ninth direct Present");
+    assert_eq!(
+        recorder.records()[before].kind,
+        AtomicCommitKind::Async,
+        "Async begins on the first direct commit after the eight-frame entry probation"
+    );
+    retire_direct_present(&mut backend, &mut state, 9);
+
+    let before = recorder.records().len();
+    assert!(try_direct_present_for_window(&mut backend, 109, WINDOW, 800, 600, 0).is_some());
+    assert_eq!(recorder.records()[before].kind, AtomicCommitKind::Scene);
+    assert_tearing_off(&backend);
+    retire_direct_present(&mut backend, &mut state, 10);
+    assert!(backend.platform.async_ledger.for_tests_is_empty());
+    let mut expected = vec![AtomicCommitKind::Scene; 8];
+    expected.extend([AtomicCommitKind::Async, AtomicCommitKind::Scene]);
+    assert_commit_sequence(&recorder, &expected);
+    assert_direct_queue_drained(&backend);
+
+    let mut no_option = direct_backend(1);
+    let no_option_recorder = recording_sink(&mut no_option, 0);
+    let mut no_option_state = ServerState::new();
+    for index in 0..9 {
+        assert!(
+            try_direct_present_for_window(&mut no_option, 200 + index, WINDOW + 1, 800, 600, 0,)
+                .is_some()
+        );
+        retire_direct_present(&mut no_option, &mut no_option_state, index as u32 + 1);
+    }
+    assert_tearing_off(&no_option);
+    assert_commit_sequence(&no_option_recorder, &[AtomicCommitKind::Scene; 9]);
+    assert_direct_queue_drained(&no_option);
+
+    let mut not_fullscreen = direct_backend(1);
+    let not_fullscreen_recorder = recording_sink(&mut not_fullscreen, 0);
+    for index in 0..9 {
+        assert!(
+            try_direct_present_for_window(
+                &mut not_fullscreen,
+                300 + index,
+                WINDOW + 2,
+                400,
+                300,
+                yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+            )
+            .is_none()
+        );
+        Backend::maybe_composite(&mut not_fullscreen).expect("finish declined Present");
+    }
+    assert_tearing_off(&not_fullscreen);
+    assert!(not_fullscreen_recorder.records().is_empty());
+    assert_direct_queue_drained(&not_fullscreen);
+
+    let mut no_capability = direct_backend(1);
+    no_capability.platform.devices[0].async_page_flip = false;
+    let no_capability_recorder = recording_sink(&mut no_capability, 0);
+    let mut no_capability_state = ServerState::new();
+    for index in 0..9 {
+        assert!(
+            try_direct_present_for_window(
+                &mut no_capability,
+                400 + index,
+                WINDOW + 3,
+                800,
+                600,
+                yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+            )
+            .is_some()
+        );
+        retire_direct_present(
+            &mut no_capability,
+            &mut no_capability_state,
+            index as u32 + 1,
+        );
+    }
+    assert_tearing_off(&no_capability);
+    assert_commit_sequence(&no_capability_recorder, &[AtomicCommitKind::Scene; 9]);
+    assert_direct_queue_drained(&no_capability);
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: fail to reset the tearing probation after an authoritative-root Present without Async.
+fn probation_resets_on_non_async_root_present() {
+    use yserver_core::server::ServerState;
+
+    const WINDOW: u32 = 0x7500;
+    let mut backend = direct_backend(1);
+    let recorder = recording_sink(&mut backend, 0);
+    let mut state = ServerState::new();
+    qualify_direct_async(&mut backend, &recorder, &mut state, WINDOW, 500, 7);
+    assert!(try_direct_present_for_window(&mut backend, 507, WINDOW, 800, 600, 0).is_some());
+    retire_direct_present(&mut backend, &mut state, 8);
+    qualify_direct_async(&mut backend, &recorder, &mut state, WINDOW, 508, 7);
+    assert!(matches!(
+        backend.tearing.state,
+        crate::kms::render::backend::TearingState::Off
+    ));
+    assert_eq!(backend.tearing.probation, 7);
+    assert_eq!(backend.tearing.probation_owner, Some(WINDOW));
+    assert_commit_sequence(&recorder, &[AtomicCommitKind::Scene; 15]);
+    assert_direct_queue_drained(&backend);
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: enter tearing as soon as probation reaches eight, even with ShowOnRetire queued.
+fn entry_waits_for_queued_show_on_retire() {
+    use yserver_core::{backend::Backend, server::ServerState};
+
+    const WINDOW: u32 = 0x7550;
+    const CURSOR: u32 = 0x7551;
+    let mut backend = live_scene_backend();
+    let recorder = recording_sink(&mut backend, 0);
+    let mut state = ServerState::new();
+    backend.insert_cursor_record(CURSOR, 1, 1, 0, 0, vec![0xff; 4]);
+    backend.effective_cursor_xid = Some(CURSOR);
+    Backend::set_cursor_hidden(&mut backend, true);
+    Backend::set_cursor_hidden(&mut backend, false);
+    Backend::warp_pointer_root(&mut backend, &mut state, 100, 100);
+    damage_root_and_composite(&mut backend);
+    assert!(backend.scene.has_pending_page_flips());
+    retire_composed_frame(&mut backend, &mut state, 1);
+    assert_eq!(
+        backend.scene.cursor_mode(),
+        crate::kms::render::scene::CursorPlaneMode::Sw
+    );
+    for device in &mut backend.platform.devices {
+        device.async_page_flip = true;
+    }
+    for index in 0..7_u64 {
+        let before = recorder.records().len();
+        assert!(
+            try_direct_present_for_window(
+                &mut backend,
+                1600 + index,
+                WINDOW,
+                800,
+                600,
+                yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+            )
+            .is_none()
+        );
+        damage_root_and_composite(&mut backend);
+        assert_eq!(recorder.records().len(), before + 1);
+        assert_eq!(recorder.records()[before].kind, AtomicCommitKind::Scene);
+        retire_composed_frame(&mut backend, &mut state, index as u32 + 2);
+    }
+    assert!(matches!(
+        backend.tearing.state,
+        crate::kms::render::backend::TearingState::Off
+    ));
+    assert_eq!(backend.tearing.probation, 7);
+
+    let (show_executor, hide_executor) = install_cursor_plane_with_successful_show(&mut backend);
+    damage_root_and_composite(&mut backend);
+    assert!(backend.scene.has_pending_page_flips());
+    assert!(backend.scene.cursor_transition_pending());
+    let pending_scene_commit = recorder.records().len() - 1;
+    assert_eq!(
+        recorder.records()[pending_scene_commit].kind,
+        AtomicCommitKind::Scene
+    );
+
+    let before_eighth = recorder.records().len();
+    assert!(
+        try_direct_present_for_window(
+            &mut backend,
+            1607,
+            WINDOW,
+            800,
+            600,
+            yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+        )
+        .is_none()
+    );
+    assert!(matches!(
+        backend.tearing.state,
+        crate::kms::render::backend::TearingState::Off
+    ));
+    assert_eq!(backend.tearing.probation, 8);
+    assert_eq!(recorder.records().len(), before_eighth);
+    assert!(backend.scene.cursor_transition_pending());
+    assert!(!backend.platform.any_cursor_plane_visible());
+
+    retire_composed_frame(&mut backend, &mut state, 9);
+    assert!(!backend.scene.cursor_transition_pending());
+    assert!(backend.platform.any_cursor_plane_visible());
+    assert_eq!(
+        backend.scene.cursor_mode(),
+        crate::kms::render::scene::CursorPlaneMode::Hw
+    );
+    assert_eq!(show_executor.calls().len(), 1);
+    assert!(matches!(
+        backend.tearing.state,
+        crate::kms::render::backend::TearingState::Off
+    ));
+
+    let before_entry = recorder.records().len();
+    assert!(
+        try_direct_present_for_window(
+            &mut backend,
+            1608,
+            WINDOW,
+            800,
+            600,
+            yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+        )
+        .is_none()
+    );
+    assert!(matches!(
+        backend.tearing.state,
+        crate::kms::render::backend::TearingState::On { window: WINDOW, .. }
+    ));
+    assert_eq!(recorder.records().len(), before_entry);
+    assert!(backend.platform.any_cursor_plane_visible());
+    assert_eq!(show_executor.calls().len(), 1);
+    assert!(!backend.scene.cursor_transition_pending());
+    for index in 0..7_u32 {
+        let submitted = try_direct_present_for_window(
+            &mut backend,
+            1609 + u64::from(index),
+            WINDOW,
+            800,
+            600,
+            yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+        )
+        .is_some();
+        assert_eq!(submitted, index == 6);
+        if index < 6 {
+            assert_eq!(recorder.records().len(), before_entry);
+        }
+    }
+    assert_eq!(recorder.records().len(), before_entry + 1);
+    assert_eq!(
+        recorder.records()[before_entry].kind,
+        AtomicCommitKind::Scene
+    );
+    assert!(backend.scanout_m2.pending.is_some());
+    assert_eq!(hide_executor.calls().len(), 0);
+    retire_direct_present(&mut backend, &mut state, 10);
+    assert!(matches!(
+        backend.tearing.state,
+        crate::kms::render::backend::TearingState::On { window: WINDOW, .. }
+    ));
+    assert_eq!(hide_executor.calls().len(), 1);
+    assert!(!backend.platform.any_cursor_plane_visible());
+    assert_eq!(show_executor.calls().len(), 1);
+    assert!(backend.scanout_m2.pending.is_none());
+    assert!(backend.scanout_m2.queued_successor.is_none());
+
+    assert_eq!(hide_executor.calls().len(), 1);
+    assert!(!backend.platform.any_cursor_plane_visible());
+    assert_eq!(show_executor.calls().len(), 1);
+    assert!(!backend.scene.cursor_transition_pending());
+    assert!(backend.scanout_m2.pending.is_none());
+    assert!(backend.scanout_m2.queued_successor.is_none());
+    assert_eq!(
+        recorder
+            .records()
+            .iter()
+            .map(|record| record.kind)
+            .collect::<Vec<_>>(),
+        vec![AtomicCommitKind::Scene; 10]
+    );
+    assert_direct_queue_drained(&backend);
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: let a non-fullscreen Present from another window change the active tearing owner.
+fn async_from_non_fullscreen_window_does_not_affect_on() {
+    use yserver_core::{backend::Backend, server::ServerState};
+
+    const WINDOW: u32 = 0x7600;
+    let mut backend = direct_backend(1);
+    let recorder = recording_sink(&mut backend, 0);
+    let mut state = ServerState::new();
+    qualify_direct_async(&mut backend, &recorder, &mut state, WINDOW, 700, 8);
+
+    assert!(
+        try_direct_present_for_window(
+            &mut backend,
+            708,
+            WINDOW + 1,
+            400,
+            300,
+            yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+        )
+        .is_none()
+    );
+    Backend::maybe_composite(&mut backend).expect("settle non-fullscreen Present");
+    assert!(matches!(
+        backend.tearing.state,
+        crate::kms::render::backend::TearingState::On { window: WINDOW, .. }
+    ));
+
+    let before = recorder.records().len();
+    assert!(
+        try_direct_present_for_window(
+            &mut backend,
+            709,
+            WINDOW,
+            800,
+            600,
+            yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+        )
+        .is_some()
+    );
+    assert_eq!(recorder.records()[before].kind, AtomicCommitKind::Async);
+    retire_direct_present(&mut backend, &mut state, 9);
+    let mut expected = vec![AtomicCommitKind::Scene; 8];
+    expected.push(AtomicCommitKind::Async);
+    assert_commit_sequence(&recorder, &expected);
+    assert_direct_queue_drained(&backend);
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: ignore a same-window Present that drops PresentOptionAsync while tearing is active.
+fn non_async_present_from_w_exits() {
+    use yserver_core::server::ServerState;
+
+    const WINDOW: u32 = 0x7700;
+    let mut backend = direct_backend(1);
+    let recorder = recording_sink(&mut backend, 0);
+    let mut state = ServerState::new();
+    qualify_direct_async(&mut backend, &recorder, &mut state, WINDOW, 800, 8);
+    assert!(
+        try_direct_present_for_window(
+            &mut backend,
+            808,
+            WINDOW,
+            800,
+            600,
+            yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+        )
+        .is_some()
+    );
+    assert_eq!(
+        recorder.records().last().unwrap().kind,
+        AtomicCommitKind::Async
+    );
+    retire_direct_present(&mut backend, &mut state, 9);
+    let old_shape = backend
+        .scanout_m1
+        .entries
+        .values()
+        .find_map(|entry| entry.async_shape.clone())
+        .expect("an accepted async shape was cached");
+    assert!(!backend.platform.async_ledger.for_tests_is_empty());
+
+    let before = recorder.records().len();
+    assert!(try_direct_present_for_window(&mut backend, 809, WINDOW, 800, 600, 0).is_some());
+    assert_eq!(recorder.records()[before].kind, AtomicCommitKind::Scene);
+    assert_tearing_off(&backend);
+    retire_direct_present(&mut backend, &mut state, 10);
+    assert!(backend.platform.async_ledger.for_tests_is_empty());
+
+    qualify_direct_async(&mut backend, &recorder, &mut state, WINDOW, 810, 8);
+    assert!(matches!(
+        backend.tearing.state,
+        crate::kms::render::backend::TearingState::On { .. }
+    ));
+    assert_eq!(recorder.records().len(), 18);
+    assert_ne!(old_shape.width, 0);
+    let mut expected = vec![AtomicCommitKind::Scene; 8];
+    expected.extend([AtomicCommitKind::Async, AtomicCommitKind::Scene]);
+    expected.extend([AtomicCommitKind::Scene; 8]);
+    assert_commit_sequence(&recorder, &expected);
+    assert_direct_queue_drained(&backend);
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: store `completion_dst_host_xid` as the lifecycle owner, or keep lifecycle exits behind direct-frame ownership.
+fn lifecycle_teardown_exits_protocol_owner_without_direct_frame() {
+    use yserver_core::backend::Backend;
+
+    const PROTOCOL_WINDOW: u32 = 0x7701;
+    const HOST_WINDOW: u32 = 0x9701;
+    const REDIRECTED_BACKING_PIXMAP: u32 = 0xa701;
+
+    for destroy in [false, true] {
+        let mut backend = live_scene_backend();
+        let recorder = recording_sink(&mut backend, 0);
+        let _state = enter_tearing_without_direct_scanout_for_ids(
+            &mut backend,
+            PROTOCOL_WINDOW,
+            HOST_WINDOW,
+            REDIRECTED_BACKING_PIXMAP,
+            820,
+        );
+        assert!(matches!(
+            backend.tearing.state,
+            crate::kms::render::backend::TearingState::On {
+                window: PROTOCOL_WINDOW,
+                ..
+            }
+        ));
+        assert!(backend.scanout_m2.pending.is_none());
+        assert!(backend.scanout_m2.current.is_none());
+        assert!(backend.scanout_m2.queued_successor.is_none());
+        assert_eq!(
+            recorder.records().len(),
+            1,
+            "only the setup scene frame committed"
+        );
+
+        if destroy {
+            Backend::destroy_subwindow(&mut backend, None, HOST_WINDOW)
+                .expect("destroy teardown entry");
+        } else {
+            Backend::unmap_subwindow(&mut backend, None, HOST_WINDOW)
+                .expect("unmap teardown entry");
+        }
+
+        assert_tearing_off(&backend);
+        assert!(backend.scanout_m2.pending.is_none());
+        assert!(backend.scanout_m2.current.is_none());
+        assert!(backend.scanout_m2.queued_successor.is_none());
+        assert_commit_sequence(&recorder, &[AtomicCommitKind::Scene]);
+    }
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: return on the re-entry barrier before evaluating an authoritative Present's probation transition.
+fn non_async_authoritative_present_resets_probation_during_reentry_barrier() {
+    use yserver_core::{
+        backend::{Backend, DrawState, GcFunction, OriginContext, SubwindowMode},
+        server::ServerState,
+    };
+    use yserver_protocol::x11::ClientId;
+
+    const WINDOW: u32 = 0x7702;
+    let mut backend = live_scene_backend();
+    for device in &mut backend.platform.devices {
+        device.async_page_flip = true;
+    }
+    let recorder = recording_sink(&mut backend, 0);
+    let mut state = ServerState::new();
+    let (width, height) = backend.platform.fb_dimensions();
+    for index in 0..7_u64 {
+        assert!(
+            try_direct_present_with_live_storage(
+                &mut backend,
+                840 + index,
+                WINDOW,
+                width,
+                height,
+                yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+            )
+            .is_none()
+        );
+        damage_root_and_composite(&mut backend);
+        retire_composed_frame(&mut backend, &mut state, index as u32 + 1);
+    }
+    assert_eq!(backend.tearing.probation, 7);
+    assert_eq!(backend.scanout_m2.eligible_root_streak, 7);
+    assert!(
+        try_direct_present_with_live_storage(
+            &mut backend,
+            847,
+            WINDOW,
+            width,
+            height,
+            yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+        )
+        .is_some()
+    );
+    assert!(backend.tearing.is_on());
+    retire_direct_present(&mut backend, &mut state, 8);
+    assert!(backend.scanout_m2.current.is_some());
+
+    let origin = Some(OriginContext {
+        client_id: ClientId(7),
+        nested_seq: 0,
+        opcode: 70,
+    });
+    let root = backend.core.window_id;
+    Backend::apply_draw_state(
+        &mut backend,
+        origin,
+        &DrawState {
+            function: GcFunction::Invert,
+            subwindow_mode: SubwindowMode::IncludeInferiors,
+            ..DrawState::default()
+        },
+    )
+    .expect("set root-overlay GC state");
+    Backend::fill_rectangle(&mut backend, origin, root, u32::MAX, 10, 10, 50, 1)
+        .expect("toggle root overlay while direct scanout is active");
+    assert!(!backend.scene.root_overlay.is_empty());
+    Backend::maybe_composite(&mut backend).expect("submit grouped composed unflip");
+    assert!(backend.scanout_m2.unflip_requested);
+    assert!(!backend.scanout_m2.unflip_awaiting_outputs.is_empty());
+    retire_composed_frame(&mut backend, &mut state, 9);
+    assert!(backend.scanout_m2.reentry_blocked_until_composed);
+    assert!(backend.scanout_m2.current.is_none());
+    assert!(backend.tearing.is_on());
+
+    Backend::fill_rectangle(&mut backend, origin, root, u32::MAX, 10, 10, 50, 1)
+        .expect("remove the overlay before the option-only exit");
+    assert!(backend.scene.root_overlay.is_empty());
+
+    assert!(try_direct_present_for_window(&mut backend, 848, WINDOW, width, height, 0).is_none());
+    assert_eq!(backend.tearing.probation, 0);
+    assert_eq!(backend.tearing.probation_owner, None);
+    assert!(backend.scanout_m2.reentry_blocked_until_composed);
+    assert_tearing_off(&backend);
+    damage_root_and_composite(&mut backend);
+    retire_composed_frame(&mut backend, &mut state, 10);
+    assert!(!backend.scanout_m2.reentry_blocked_until_composed);
+    assert_commit_sequence(&recorder, &[AtomicCommitKind::Scene; 4]);
+    assert_direct_queue_drained(&backend);
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: advance tearing probation for both 0x9 and 0x8 Present options.
+fn alternating_async_and_vsync_presents_never_enter() {
+    use yserver_core::server::ServerState;
+
+    const WINDOW: u32 = 0x7800;
+    let mut backend = direct_backend(1);
+    let recorder = recording_sink(&mut backend, 0);
+    let mut state = ServerState::new();
+    for index in 0..40_u64 {
+        let options = if index % 2 == 0 { 0x9 } else { 0x8 };
+        assert!(
+            try_direct_present_for_window(&mut backend, 900 + index, WINDOW, 800, 600, options,)
+                .is_some()
+        );
+        retire_direct_present(&mut backend, &mut state, index as u32 + 1);
+    }
+    assert_tearing_off(&backend);
+    assert_commit_sequence(&recorder, &[AtomicCommitKind::Scene; 40]);
+    assert_direct_queue_drained(&backend);
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: count qualifying Presents from different root windows as one probation streak.
+fn probation_restarts_when_another_window_takes_the_root() {
+    use yserver_core::server::ServerState;
+
+    const WINDOW_A: u32 = 0x7900;
+    const WINDOW_B: u32 = 0x7a00;
+    let mut backend = direct_backend(1);
+    let recorder = recording_sink(&mut backend, 0);
+    let mut state = ServerState::new();
+    qualify_direct_async(&mut backend, &recorder, &mut state, WINDOW_A, 1000, 4);
+    qualify_direct_async(&mut backend, &recorder, &mut state, WINDOW_B, 1004, 4);
+    assert!(matches!(
+        backend.tearing.state,
+        crate::kms::render::backend::TearingState::Off
+    ));
+    assert_eq!(backend.tearing.probation, 4);
+    assert_eq!(backend.tearing.probation_owner, Some(WINDOW_B));
+    qualify_direct_async(&mut backend, &recorder, &mut state, WINDOW_B, 1008, 4);
+    assert!(matches!(
+        backend.tearing.state,
+        crate::kms::render::backend::TearingState::On {
+            window: WINDOW_B,
+            ..
+        }
+    ));
+    assert_commit_sequence(&recorder, &[AtomicCommitKind::Scene; 12]);
+    assert_direct_queue_drained(&backend);
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: make the tearing gate depend on XFIXES-hidden instead of a retired, registered-cursor dead-zone frame.
+fn dead_zone_hidden_cursor_tears_like_xfixes_hidden() {
+    use yserver_core::server::ServerState;
+
+    const WINDOW: u32 = 0x7b00;
+    let mut backend = live_scene_backend_with_dead_zone();
+    install_hidden_cursor_plane(&mut backend);
+    let recorder = recording_sink(&mut backend, 0);
+    let mut state = ServerState::new();
+    retire_registered_cursor_in_dead_zone(&mut backend, &mut state);
+    assert_eq!(recorder.records().len(), backend.platform.outputs.len());
+    qualify_from_dead_zone(&mut backend, &recorder, &mut state, WINDOW, 1100);
+    assert!(matches!(
+        backend.tearing.state,
+        crate::kms::render::backend::TearingState::On { window: WINDOW, .. }
+    ));
+
+    assert!(
+        try_direct_present_for_window(
+            &mut backend,
+            1108,
+            WINDOW,
+            1700,
+            600,
+            yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+        )
+        .is_some()
+    );
+    assert_eq!(
+        recorder.records().last().unwrap().kind,
+        AtomicCommitKind::Async
+    );
+    retire_direct_present(&mut backend, &mut state, 10);
+    assert!(!backend.platform.any_cursor_plane_visible());
+    let mut expected = vec![AtomicCommitKind::Scene; backend.platform.outputs.len() * 8 + 1];
+    expected.push(AtomicCommitKind::Async);
+    assert_commit_sequence(&recorder, &expected);
+    assert_direct_queue_drained(&backend);
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: keep the direct cursor bind/show branch active while tearing is On; Hidden must come from a retired dead-zone frame.
+fn hidden_entry_never_binds_plane_on_retirement_show_or_motion() {
+    use yserver_core::{backend::Backend, server::ServerState};
+
+    const WINDOW: u32 = 0x7c00;
+    let mut backend = live_scene_backend_with_dead_zone();
+    let (show_executor, hide_executor) = install_cursor_plane_with_successful_show(&mut backend);
+    let recorder = recording_sink(&mut backend, 0);
+    let mut state = ServerState::new();
+    retire_registered_cursor_in_dead_zone(&mut backend, &mut state);
+    assert!(backend.effective_cursor_xid.is_some());
+    assert!(!backend.cursor_hidden);
+    qualify_from_dead_zone(&mut backend, &recorder, &mut state, WINDOW, 1200);
+    assert!(matches!(
+        backend.tearing.state,
+        crate::kms::render::backend::TearingState::On { .. }
+    ));
+
+    let accepted_shape = try_direct_present_for_window(
+        &mut backend,
+        1208,
+        WINDOW,
+        1700,
+        600,
+        yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+    )
+    .expect("owner direct frame after probation");
+    assert!(!backend.platform.any_cursor_plane_visible());
+    assert_eq!(
+        recorder.records().last().unwrap().kind,
+        AtomicCommitKind::Async
+    );
+    retire_direct_present(&mut backend, &mut state, 9);
+    assert!(!backend.platform.any_cursor_plane_visible());
+    assert!(show_executor.calls().is_empty());
+    assert_eq!(hide_executor.calls().len(), 0);
+
+    Backend::warp_pointer_root(&mut backend, &mut state, 100, 100);
+    assert!(!backend.platform.any_cursor_plane_visible());
+    Backend::set_cursor_hidden(&mut backend, true);
+    assert!(!backend.platform.any_cursor_plane_visible());
+    Backend::set_cursor_hidden(&mut backend, false);
+    assert!(!backend.platform.any_cursor_plane_visible());
+    assert!(backend.tearing.is_on());
+    assert!(!backend.scanout_m2.unflip_requested);
+    assert!(backend.scanout_m2.pending.is_none());
+    assert!(backend.scanout_m2.queued_successor.is_none());
+    assert!(show_executor.calls().is_empty());
+    for record in recorder
+        .records()
+        .iter()
+        .filter(|r| r.kind == AtomicCommitKind::Async)
+    {
+        assert!(!backend.platform.any_cursor_plane_visible());
+        assert!(
+            record
+                .flags
+                .contains(::drm::control::AtomicCommitFlags::PAGE_FLIP_ASYNC)
+        );
+    }
+    let mut expected = vec![AtomicCommitKind::Scene; backend.platform.outputs.len() * 8 + 1];
+    expected.push(AtomicCommitKind::Async);
+    assert_commit_sequence(&recorder, &expected);
+    assert!(
+        backend
+            .platform
+            .async_ledger
+            .allows(crate::drm::async_flip::AsyncStream::Direct, &accepted_shape)
+    );
+    assert_direct_queue_drained(&backend);
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: leave tearing active across DPMS off, or preserve its probation across DPMS on.
+fn dpms_off_exits_tearing_and_on_requires_fresh_probation() {
+    use yserver_core::backend::Backend;
+
+    const WINDOW: u32 = 0x7d00;
+    let mut backend = live_scene_backend();
+    backend.platform.for_tests_accept_output_power_commits();
+    let recorder = recording_sink(&mut backend, 0);
+    let mut state = enter_tearing_without_direct_scanout(&mut backend, WINDOW, 1300);
+    assert_eq!(recorder.records().len(), 1);
+    assert_eq!(recorder.records()[0].kind, AtomicCommitKind::Scene);
+
+    Backend::set_dpms_power(&mut backend, 3).expect("DPMS off fixture");
+    assert_tearing_off(&backend);
+    assert!(backend.platform.async_ledger.for_tests_is_empty());
+    assert!(backend.scanout_m2.pending.is_none());
+    assert!(backend.scanout_m2.queued_successor.is_none());
+    assert!(backend.scanout_m2.current.is_none());
+
+    Backend::set_dpms_power(&mut backend, 0).expect("DPMS on fixture");
+    let before = recorder.records().len();
+    let mut resumed_commit_count = 0;
+    for index in 0..8_u32 {
+        let result = try_direct_present_for_window(
+            &mut backend,
+            1309 + u64::from(index),
+            WINDOW,
+            800,
+            600,
+            yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+        );
+        if result.is_some() {
+            resumed_commit_count += 1;
+            retire_direct_present(&mut backend, &mut state, index + 1);
+        }
+    }
+    assert!(matches!(
+        backend.tearing.state,
+        crate::kms::render::backend::TearingState::On { .. }
+    ));
+    assert_eq!(
+        resumed_commit_count, 1,
+        "M2 keeps its independent admission probation"
+    );
+    assert_eq!(recorder.records().len(), before + 1);
+    assert_eq!(recorder.records()[before].kind, AtomicCommitKind::Scene);
+
+    assert!(
+        try_direct_present_for_window(
+            &mut backend,
+            1317,
+            WINDOW,
+            800,
+            600,
+            yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+        )
+        .is_some()
+    );
+    assert_eq!(
+        recorder.records().last().unwrap().kind,
+        AtomicCommitKind::Async
+    );
+    retire_direct_present(&mut backend, &mut state, 9);
+    assert_commit_sequence(
+        &recorder,
+        &[
+            AtomicCommitKind::Scene,
+            AtomicCommitKind::Scene,
+            AtomicCommitKind::Async,
+        ],
+    );
+    assert_direct_queue_drained(&backend);
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: retain tearing on VT release or skip the fresh eight-Present Vsync probation after acquire.
+fn vt_release_exits_tearing_and_resume_needs_probation() {
+    use yserver_core::{backend::Backend, core_loop::input_inventory::InputInventory};
+
+    struct LogicalVtResume;
+
+    impl crate::kms::render::backend::kms::session::VtResumeExecutor for LogicalVtResume {
+        fn acquire_master(
+            &self,
+            _device: &crate::kms::render::platform::KmsDevice,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn release_master(
+            &self,
+            _device: &crate::kms::render::platform::KmsDevice,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn probe_connector_snapshot(
+            &self,
+            platform: &crate::kms::render::platform::PlatformBackend,
+        ) -> std::io::Result<Vec<crate::kms::render::platform::ConnectorSnapshot>> {
+            Ok(platform
+                .outputs
+                .iter()
+                .map(|output| crate::kms::render::platform::ConnectorSnapshot {
+                    key: output.key.clone(),
+                    modes: vec![output.output.picked.clone()],
+                    mm_width: 0,
+                    mm_height: 0,
+                    edid: Vec::new(),
+                    connector_type: "test".to_owned(),
+                })
+                .collect())
+        }
+    }
+
+    const WINDOW: u32 = 0x7e00;
+    let mut backend = live_scene_backend();
+    backend.for_tests_set_vt_resume_executor(std::rc::Rc::new(LogicalVtResume));
+    backend.platform.for_tests_accept_output_power_commits();
+    let recorder = recording_sink(&mut backend, 0);
+    let mut state = enter_tearing_without_direct_scanout(&mut backend, WINDOW, 1400);
+    assert_commit_sequence(&recorder, &[AtomicCommitKind::Scene]);
+    Backend::set_cursor_hidden(&mut backend, true);
+    damage_root_and_composite(&mut backend);
+    assert!(backend.scene.has_pending_page_flips());
+    retire_composed_frame(&mut backend, &mut state, 2);
+    assert_eq!(
+        backend.scene.cursor_mode(),
+        crate::kms::render::scene::CursorPlaneMode::Hidden
+    );
+    assert!(backend.tearing.is_on());
+    assert!(backend.scanout_m2.current.is_none());
+
+    Backend::finish_vt_release(&mut backend, &mut state, &InputInventory::default());
+    assert_tearing_off(&backend);
+    assert!(backend.platform.async_ledger.for_tests_is_empty());
+    assert!(backend.scanout_m2.pending.is_none());
+    assert!(backend.scanout_m2.queued_successor.is_none());
+    assert!(backend.scanout_m2.current.is_none());
+    Backend::on_vt_acquire(&mut backend, &mut state);
+    assert_tearing_off(&backend);
+    assert_direct_queue_drained(&backend);
+    assert_eq!(backend.vt_state, crate::vt::state::VtState::Active);
+    assert!(backend.scanout_allowed());
+    assert!(backend.kms_outputs_active);
+    assert!(backend.platform.devices[0].async_page_flip);
+    damage_root_and_composite(&mut backend);
+    assert!(
+        backend.scene.has_pending_page_flips(),
+        "resumed VT must queue the repaint before new Presents"
+    );
+    retire_composed_frame(&mut backend, &mut state, 3);
+    assert!(!backend.scanout_m2.reentry_blocked_until_composed);
+    assert_eq!(
+        backend.scene.cursor_mode(),
+        crate::kms::render::scene::CursorPlaneMode::Hidden
+    );
+
+    let before_resume = recorder.records().len();
+    for index in 0..u64::from(crate::kms::render::backend::TEARING_ENTRY_PROBATION) {
+        let before_present = recorder.records().len();
+        let submitted = try_direct_present_for_window(
+            &mut backend,
+            1409 + index,
+            WINDOW,
+            800,
+            600,
+            yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+        )
+        .is_some();
+        if submitted {
+            assert_eq!(index, 7, "M2 admission resumes on the eighth root Present");
+            assert_eq!(recorder.records().len(), before_present + 1);
+            assert_eq!(
+                recorder.records()[before_present].kind,
+                AtomicCommitKind::Scene
+            );
+            retire_direct_present(&mut backend, &mut state, index as u32 + 10);
+        } else {
+            assert!(index < 7);
+            assert_eq!(recorder.records().len(), before_present);
+            assert_eq!(backend.tearing.probation, index as u8 + 1);
+            assert_eq!(backend.scanout_m2.eligible_root_streak, index as u8 + 1);
+            damage_root_and_composite(&mut backend);
+            assert!(backend.scene.has_pending_page_flips());
+            assert_eq!(recorder.records().len(), before_present + 1);
+            assert_eq!(
+                recorder.records()[before_present].kind,
+                AtomicCommitKind::Scene
+            );
+            retire_composed_frame(&mut backend, &mut state, index as u32 + 10);
+        }
+    }
+    assert!(matches!(
+        backend.tearing.state,
+        crate::kms::render::backend::TearingState::On { window: WINDOW, .. }
+    ));
+    assert_eq!(
+        recorder.records()[before_resume..]
+            .iter()
+            .map(|record| record.kind)
+            .collect::<Vec<_>>(),
+        vec![AtomicCommitKind::Scene; 8],
+        "all eight resumed Presents remain Vsync, with the eighth direct"
+    );
+
+    assert!(
+        try_direct_present_for_window(
+            &mut backend,
+            1417,
+            WINDOW,
+            800,
+            600,
+            yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+        )
+        .is_some()
+    );
+    assert_eq!(
+        recorder.records().last().unwrap().kind,
+        AtomicCommitKind::Async
+    );
+    retire_direct_present(&mut backend, &mut state, 18);
+    assert_eq!(
+        recorder.records()[before_resume..]
+            .iter()
+            .map(|record| record.kind)
+            .collect::<Vec<_>>(),
+        [AtomicCommitKind::Scene; 8]
+            .into_iter()
+            .chain([AtomicCommitKind::Async])
+            .collect::<Vec<_>>(),
+    );
+    assert!(!backend.platform.any_cursor_plane_visible());
+
+    assert!(try_direct_present_for_window(&mut backend, 1418, WINDOW, 800, 600, 0).is_some());
+    assert_eq!(
+        recorder.records().last().unwrap().kind,
+        AtomicCommitKind::Scene
+    );
+    assert_tearing_off(&backend);
+    retire_direct_present(&mut backend, &mut state, 19);
+    assert_eq!(
+        recorder.records()[before_resume..]
+            .iter()
+            .map(|record| record.kind)
+            .collect::<Vec<_>>(),
+        [AtomicCommitKind::Scene; 8]
+            .into_iter()
+            .chain([AtomicCommitKind::Async, AtomicCommitKind::Scene,])
+            .collect::<Vec<_>>()
+    );
+    assert_direct_queue_drained(&backend);
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: let topology quiesce preserve the active tearing state and async ledger.
+fn topology_change_exits_tearing() {
+    use yserver_core::backend::Backend;
+
+    const WINDOW: u32 = 0x7f00;
+    let mut backend = live_scene_backend();
+    backend.platform.for_tests_accept_output_power_commits();
+    let recorder = recording_sink(&mut backend, 0);
+    let _state = enter_tearing_without_direct_scanout(&mut backend, WINDOW, 1500);
+    assert_eq!(recorder.records().len(), 1);
+
+    let (outputs, _) = Backend::randr_outputs_and_modes(&mut backend);
+    let output = outputs.first().expect("test output projection");
+    let connector = backend.platform.outputs[0].key.connector_name.clone();
+    let _result =
+        Backend::apply_crtc_config(&mut backend, output.output_id, &connector, None, 0, 0);
+    assert_tearing_off(&backend);
+    assert!(backend.platform.async_ledger.for_tests_is_empty());
+    assert!(backend.scanout_m2.pending.is_none());
+    assert!(backend.scanout_m2.queued_successor.is_none());
+    assert!(backend.scanout_m2.current.is_none());
+    assert_commit_sequence(&recorder, &[AtomicCommitKind::Scene]);
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutations: keep cursor positions in the async builder, or keep OUT_FENCE_PTR.
 fn async_direct_request_has_flag_no_out_fence_no_cursor() {
     use yserver_core::server::ServerState;
 
-    let mut backend = direct_backend(1);
+    let mut backend = live_scene_backend();
     let recorder = recording_sink(&mut backend, 0);
+    qualify_test_direct_async(&mut backend, &recorder, 0x7380, 600);
     let position = backend.platform.for_tests_seed_atomic_cursor_position(
         0,
         raw(51),
@@ -260,6 +1790,12 @@ fn async_direct_request_has_flag_no_out_fence_no_cursor() {
         3,
         4,
     );
+    backend.platform.devices[0]
+        .cursor
+        .plane
+        .as_mut()
+        .expect("seeded cursor plane")
+        .for_tests_set_visible(position.crtc, false);
     set_scene_fence_properties(&mut backend.platform.outputs[0].output);
     let shape = try_direct_present(&mut backend, 61, 800, 600);
 
@@ -494,13 +2030,15 @@ fn vsync_requests_unchanged() {
 }
 
 #[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutations: drop the same-frame Vsync resubmit or consume a cursor move on an
 // accepted async flip.
 fn async_einval_resubmits_same_frame_vsync() {
     use yserver_core::server::ServerState;
 
-    let mut backend = direct_backend(1);
+    let mut backend = live_scene_backend();
     let recorder = recording_sink(&mut backend, 0);
+    qualify_test_direct_async(&mut backend, &recorder, 0x7380, 3000);
     let position = backend.platform.for_tests_seed_atomic_cursor_position(
         0,
         raw(51),
@@ -511,6 +2049,12 @@ fn async_einval_resubmits_same_frame_vsync() {
         3,
         4,
     );
+    backend.platform.devices[0]
+        .cursor
+        .plane
+        .as_mut()
+        .expect("seeded cursor plane")
+        .for_tests_set_visible(position.crtc, false);
     recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EINVAL)));
     recorder.script_result(Ok(()));
     recorder.script_result(Ok(()));
@@ -527,7 +2071,7 @@ fn async_einval_resubmits_same_frame_vsync() {
     let first = recorder.records();
     assert_eq!(first.len(), 2);
     assert_eq!(first[0].kind, AtomicCommitKind::Async);
-    assert_eq!(first[1].kind, AtomicCommitKind::SceneWithCursor);
+    assert_eq!(first[1].kind, AtomicCommitKind::Scene);
     assert_eq!(first[0].properties[0].value, first[1].properties[0].value);
     assert!(
         first[0]
@@ -535,11 +2079,12 @@ fn async_einval_resubmits_same_frame_vsync() {
             .iter()
             .all(|update| update.object != position.plane.into())
     );
-    assert!(first[1].properties.iter().any(|update| {
-        update.object == position.plane.into()
-            && update.property == position.crtc_x
-            && update.value == i64::from(position.x) as u64
-    }));
+    assert!(
+        first[1]
+            .properties
+            .iter()
+            .all(|update| update.object != position.plane.into())
+    );
     assert!(
         backend
             .platform
@@ -559,6 +2104,12 @@ fn async_einval_resubmits_same_frame_vsync() {
         3,
         4,
     );
+    backend.platform.devices[0]
+        .cursor
+        .plane
+        .as_mut()
+        .expect("seeded cursor plane")
+        .for_tests_set_visible(pending_cursor.crtc, false);
     let _next_shape = try_direct_present(&mut backend, 32, 800, 600);
     assert!(
         backend
@@ -590,12 +2141,14 @@ fn async_einval_resubmits_same_frame_vsync() {
 }
 
 #[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutations: suspend after one EINVAL, or never suspend this grouped stream.
 fn multi_crtc_async_einval_suspends_after_two() {
     use yserver_core::server::ServerState;
 
-    let mut backend = direct_backend(2);
+    let mut backend = live_scene_backend_with_outputs(2);
     let recorder = recording_sink(&mut backend, 0);
+    qualify_test_direct_async(&mut backend, &recorder, 0x7380, 4000);
     for _ in 0..2 {
         recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EINVAL)));
         recorder.script_result(Ok(()));
@@ -712,12 +2265,14 @@ fn multi_crtc_async_einval_suspends_after_two() {
 }
 
 #[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: fail to make a changed shape current before its EBUSY submission.
 fn direct_shape_change_on_ebusy_resets_consecutive_einval_history() {
     use yserver_core::{backend::Backend, server::ServerState};
 
-    let mut backend = direct_backend(2);
+    let mut backend = live_scene_backend_with_outputs(2);
     let recorder = recording_sink(&mut backend, 0);
+    qualify_test_direct_async(&mut backend, &recorder, 0x7380, 5000);
     recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EINVAL)));
     recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EBUSY)));
     recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EBUSY)));
@@ -767,7 +2322,7 @@ fn direct_shape_change_on_ebusy_resets_consecutive_einval_history() {
 
     backend.scanout_m2.eligible_root_streak =
         crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1;
-    set_direct_second_crtc(&mut backend, 101);
+    set_direct_second_crtc(&mut backend, 201);
     let shape_a_again = try_direct_present(&mut backend, 73, 1600, 600);
     assert_eq!(shape_a, shape_a_again);
     assert_eq!(
@@ -812,12 +2367,14 @@ fn direct_shape_change_on_ebusy_resets_consecutive_einval_history() {
 }
 
 #[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: treat EBUSY as EINVAL and resubmit the direct frame as Vsync.
 fn async_ebusy_is_not_suspension() {
     use yserver_core::backend::Backend;
 
-    let mut backend = direct_backend(1);
+    let mut backend = live_scene_backend();
     let recorder = recording_sink(&mut backend, 0);
+    qualify_test_direct_async(&mut backend, &recorder, 0x7380, 6000);
     recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EBUSY)));
     let (candidate, event, shape) = prepare_direct_present(&mut backend, 51, 800, 600);
     assert_eq!(
@@ -856,13 +2413,43 @@ fn live_scene_backend_with_outputs(output_count: usize) -> KmsBackend {
         .unwrap_or_else(|error| panic!("recording scene fixture unavailable: {error}"))
 }
 
+fn live_scene_backend_with_dead_zone() -> KmsBackend {
+    let mut backend = scene_backend_with_recording_pools_and_dead_zone(2, true)
+        .unwrap_or_else(|error| panic!("dead-zone scene fixture unavailable: {error}"));
+    for device in &mut backend.platform.devices {
+        device.async_page_flip = true;
+    }
+    backend
+}
+
 fn scene_backend_with_recording_pools(output_count: usize) -> Result<KmsBackend, String> {
-    let screen_width = if output_count == 2 { 1600 } else { 800 };
+    scene_backend_with_recording_pools_and_dead_zone(output_count, false)
+}
+
+fn scene_backend_with_recording_pools_and_dead_zone(
+    output_count: usize,
+    dead_zone: bool,
+) -> Result<KmsBackend, String> {
+    let screen_width = match (output_count, dead_zone) {
+        (2, true) => 1700,
+        (2, false) => 1600,
+        (1, false) => 800,
+        _ => return Err("unsupported recording scene fixture topology".to_owned()),
+    };
     let mut backend = KmsBackend::for_tests_with_vk_dimensions(screen_width, 600)
         .map_err(|error| format!("Vulkan fixture unavailable: {error}"))?;
     if output_count == 2 {
         super::push_test_output(&mut backend, 201);
-        backend.platform.outputs[1].x = 800;
+        if dead_zone {
+            backend.platform.outputs[1].x = 900;
+            backend.platform.outputs[1].height = 400;
+            backend.platform.outputs[1].output.picked.height = 400;
+            for mode in &mut backend.platform.outputs[1].output.modes {
+                mode.height = 400;
+            }
+        } else {
+            backend.platform.outputs[1].x = 800;
+        }
     } else {
         assert_eq!(output_count, 1);
     }
@@ -951,6 +2538,12 @@ fn scene_backend_with_recording_pools(output_count: usize) -> Result<KmsBackend,
         backend.platform.scanout_pools[output_idx] =
             Some(crate::kms::vk::scanout::OutputScanout::Shared(pool));
     }
+    for output in &backend.platform.outputs {
+        backend
+            .crtc_key_by_id
+            .insert(u32::from(output.output.crtc), output.key.clone());
+    }
+    backend.refresh_present_crtc_clock_epochs();
     Ok(backend)
 }
 

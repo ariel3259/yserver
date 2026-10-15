@@ -209,7 +209,7 @@ impl SceneCompositor {
         if let Err(e) = ensure_intermediates(inner, input.outputs) {
             log::warn!("render scene tick: transform intermediate allocation failed: {e}");
         }
-        let hw_cursor = hw_cursor_allowed(input.outputs);
+        let hw_cursor = hw_cursor_allowed(input.outputs) && !input.hw_cursor_suppressed;
         if damage_audit_enabled() {
             emit_damage_audit_heartbeat(inner);
         }

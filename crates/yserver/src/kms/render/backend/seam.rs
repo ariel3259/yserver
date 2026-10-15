@@ -44,6 +44,12 @@ pub trait Platform: OutputSink + Sized + 'static {
     fn direct_scanout_owns_frame(_b: &XBackend<Self>) -> bool {
         false
     }
+    /// Whether KMS tearing owns the cursor policy for the current frame.
+    fn tearing_active(_b: &XBackend<Self>) -> bool {
+        false
+    }
+    /// Leave tearing when a portable window lifecycle change affects its owner.
+    fn exit_tearing_for_window(_b: &mut XBackend<Self>, _host_xid: u32, _reason: &'static str) {}
     /// Leave direct scanout for the composed scene.
     fn request_direct_unflip(_b: &mut XBackend<Self>, _reason: &'static str) {}
     /// Whether every direct frame is the COW or one of its descendants.

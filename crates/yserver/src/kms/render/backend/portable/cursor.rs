@@ -476,6 +476,7 @@ impl<P: Platform> XBackend<P> {
         // mode may still read Hidden, so `display_cursor_by_handle` can
         // skip the plane. Rebind it directly.
         if P::direct_scanout_owns_frame(self)
+            && !P::tearing_active(self)
             && let Some(record) = self.cursor_records.get(&xid).cloned()
             && !P::refresh_direct_cursor(self, &record)
         {
@@ -655,19 +656,23 @@ impl<P: Platform> XBackend<P> {
         // queueing path; if any output is transitioning, the
         // bytes land in the deferred slot until the wait set
         // drains.
-        let refreshes_visible_cursor = match self.scene.cursor_mode() {
-            crate::kms::render::scene::CursorPlaneMode::Hw
-            | crate::kms::render::scene::CursorPlaneMode::Mixed => true,
-            crate::kms::render::scene::CursorPlaneMode::Hidden
-            | crate::kms::render::scene::CursorPlaneMode::Sw => false,
-        };
+        let refreshes_visible_cursor = !P::tearing_active(self)
+            && match self.scene.cursor_mode() {
+                crate::kms::render::scene::CursorPlaneMode::Hw
+                | crate::kms::render::scene::CursorPlaneMode::Mixed => true,
+                crate::kms::render::scene::CursorPlaneMode::Hidden
+                | crate::kms::render::scene::CursorPlaneMode::Sw => false,
+            };
         if refreshes_visible_cursor {
             // Direct root scanout does not need a composed primary-plane
             // retirement merely to replace cursor pixels. Update the legacy
             // cursor planes in place; if any output rejects the operation,
             // fall through to the scene state machine and unwind M2 so its
             // ordinary per-output retry/fallback can retire safely.
-            if P::direct_scanout_owns_frame(self) && P::refresh_direct_cursor(self, &record) {
+            if P::direct_scanout_owns_frame(self)
+                && !P::tearing_active(self)
+                && P::refresh_direct_cursor(self, &record)
+            {
                 return;
             }
             let refreshes_hw_binding = self.scene.queue_steady_state_cursor_upload(record.version);

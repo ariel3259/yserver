@@ -342,11 +342,17 @@ impl KmsBackend {
         if self.pstate.scanout_m2.cursor_bound_all {
             return;
         }
-        if self.cursor_hidden {
-            // XFIXES HideCursor: the direct frame owns the planes now, so
-            // make sure no stale sprite stays bound on any of them.
+        let tearing = self.pstate.tearing.is_on();
+        if tearing || self.cursor_hidden {
+            // Tearing keeps every cursor plane detached, including when the
+            // cursor became visible through motion or XFIXES ShowCursor.
+            // Otherwise XFIXES HideCursor: the direct frame owns the planes
+            // now, so make sure no stale sprite stays bound on any of them.
             let mut failed = false;
             for output_idx in 0..self.platform.outputs.len() {
+                if tearing && !self.platform.cursor_plane_visible_for_output(output_idx) {
+                    continue;
+                }
                 if let Err(error) = self.platform.cursor_plane_hide_on_crtc(output_idx) {
                     failed = true;
                     log::warn!(
@@ -398,7 +404,10 @@ impl KmsBackend {
         &mut self,
         record: &crate::kms::render::cursor::CursorRecord,
     ) -> bool {
-        if !self.pstate.scanout_m2.active() || self.platform.outputs.is_empty() {
+        if self.pstate.tearing.is_on()
+            || !self.pstate.scanout_m2.active()
+            || self.platform.outputs.is_empty()
+        {
             return false;
         }
         #[allow(clippy::cast_possible_truncation)]
@@ -528,7 +537,8 @@ impl KmsBackend {
             .cursor_plane_atomic_positions_for_outputs(&output_indices);
         let async_shape = if timing == crate::drm::async_flip::FlipTiming::Async {
             Some(
-                self.scanout_m1
+                self.pstate
+                    .scanout_m1
                     .entries
                     .get(&frame.source_id)
                     .and_then(|entry| entry.async_shape.clone())
@@ -615,6 +625,40 @@ impl KmsBackend {
         Ok(async_outcome)
     }
 
+    pub(super) fn direct_frame_flip_timing(
+        &self,
+        frame: &DirectPresentFrame,
+    ) -> crate::drm::async_flip::FlipTiming {
+        let owns_stream = matches!(
+            self.pstate.tearing.state,
+            crate::kms::render::backend::TearingState::On {
+                window,
+                crtc_epoch,
+                ..
+            } if window == frame.candidate.dst_window_xid
+                && crtc_epoch == frame.candidate.crtc_epoch
+        );
+        let async_shape = self
+            .pstate
+            .scanout_m1
+            .entries
+            .get(&frame.source_id)
+            .and_then(|entry| entry.async_shape.as_ref());
+        if owns_stream
+            && frame.candidate.options & yserver_core::present_scheduler::PRESENT_OPTION_ASYNC != 0
+            && !self.platform.any_cursor_plane_visible()
+            && async_shape.is_some_and(|shape| {
+                self.platform
+                    .async_ledger
+                    .allows(crate::drm::async_flip::AsyncStream::Direct, shape)
+            })
+        {
+            crate::drm::async_flip::FlipTiming::Async
+        } else {
+            crate::drm::async_flip::FlipTiming::Vsync
+        }
+    }
+
     fn submit_queued_direct_successor(&mut self) {
         // A cursor/overlay/topology invalidation which arrived while the
         // predecessor was in flight wins over the queued Present. Leave the
@@ -632,7 +676,8 @@ impl KmsBackend {
         let Some(mut successor) = self.pstate.scanout_m2.queued_successor.take() else {
             return;
         };
-        match self.submit_direct_frame(&mut successor, self.platform.requested_flip_timing) {
+        let timing = self.direct_frame_flip_timing(&successor);
+        match self.submit_direct_frame(&mut successor, timing) {
             Ok(_) => {
                 log::debug!(
                     "scanout_m2: submitted queued direct successor source_id={} present_id={} outputs={}",

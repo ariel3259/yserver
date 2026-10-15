@@ -336,6 +336,44 @@ impl ScanoutM2State {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::kms::render::backend) enum TearingState {
+    Off,
+    On {
+        window: u32,
+        host_window: u32,
+        crtc_epoch: u64,
+    },
+}
+
+pub(in crate::kms::render::backend) struct Tearing {
+    pub(in crate::kms::render::backend) state: TearingState,
+    pub(in crate::kms::render::backend) probation: u8,
+    pub(in crate::kms::render::backend) probation_owner: Option<u32>,
+}
+
+impl Tearing {
+    pub(in crate::kms::render::backend) fn new() -> Self {
+        Self {
+            state: TearingState::Off,
+            probation: 0,
+            probation_owner: None,
+        }
+    }
+
+    pub(in crate::kms::render::backend) fn is_on(&self) -> bool {
+        matches!(self.state, TearingState::On { .. })
+    }
+
+    pub(in crate::kms::render::backend) fn reset_probation(&mut self) {
+        self.probation = 0;
+        self.probation_owner = None;
+    }
+}
+
+pub(in crate::kms::render::backend) const TEARING_ENTRY_PROBATION: u8 =
+    SCANOUT_M2_ELIGIBLE_ROOT_PROBATION;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::kms::render::backend) struct ScanoutM1OutputGeometry {
     pub(in crate::kms::render::backend) x: i32,
@@ -757,6 +795,9 @@ pub struct KmsBackendState {
     pub(in crate::kms::render::backend) scanout_m0: ScanoutM0Telemetry,
     pub(in crate::kms::render::backend) scanout_m1: ScanoutM1ProbeCache,
     pub(in crate::kms::render::backend) scanout_m2: ScanoutM2State,
+    pub(in crate::kms::render::backend) tearing: Tearing,
+    pub(in crate::kms::render::backend) vt_resume_executor:
+        std::rc::Rc<dyn super::session::VtResumeExecutor>,
 
     /// Per-CRTC armed absolute MSC for idle vblank pacing. Keyed by the
     /// stable `crtc::Handle`; presence means "a `DRM_CRTC_SEQUENCE` is

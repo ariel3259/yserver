@@ -8,11 +8,14 @@ the wlroots-model atomic cursor (#244, `e118bc3e`) and its follow-ups (#246, `a1
 
 ## Goal
 
-A fullscreen client that asks for tearing gets tearing: its frames are flipped with
-`DRM_MODE_PAGE_FLIP_ASYNC` instead of waiting for vblank. Nothing else changes.
+Code name **C1**. Uncapped direct scanout: a fullscreen client that asks for tearing gets its frames flipped with
+`DRM_MODE_PAGE_FLIP_ASYNC`, so the direct-scanout flip rate is no longer capped by vblank. Nothing else changes.
 
-Showing every frame the client produces is **not** a goal. The single-successor
-latest-wins slot and `Skip` completions stay as they are today.
+- With async flips the rate is bounded by the flip's completion turnaround (one commit in flight per CRTC), not by
+  the refresh. Success is the async flip rate following the client's frame rate well above the refresh rate; the
+  turnaround is measured per driver in the hardware validation.
+- The single-successor latest-wins slot and `Skip` completions stay as they are. Frames are skipped only when the
+  client outpaces the flip turnaround.
 
 ## Decisions (approved)
 
