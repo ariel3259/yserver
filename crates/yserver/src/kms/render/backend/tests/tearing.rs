@@ -6122,8 +6122,8 @@ fn define_visible_cursor_rebinds_held_vsync_direct_scanout() {
     assert!(backend.platform.async_ledger.for_tests_is_empty());
     assert_eq!(
         backend.scene.cursor_mode(),
-        crate::kms::render::scene::CursorPlaneMode::Hidden,
-        "the plane was rebound without requiring a scene retirement"
+        crate::kms::render::scene::CursorPlaneMode::Hw,
+        "the scene records the hardware plane rebound during direct scanout"
     );
     assert!(!backend.scene.has_pending_page_flips());
     assert!(!backend.scene.cursor_transition_pending());

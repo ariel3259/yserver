@@ -356,6 +356,16 @@ impl KmsBackend {
                 .is_some_and(references)
     }
 
+    /// Keep the scene's per-output cursor mode aligned with cursor planes
+    /// changed outside a composed scene retirement.
+    pub(super) fn sync_direct_cursor_scene_state(&mut self) -> bool {
+        let visible_by_output: Vec<_> = (0..self.platform.outputs.len())
+            .map(|output_idx| self.platform.cursor_plane_visible_for_output(output_idx))
+            .collect();
+        self.scene
+            .record_external_cursor_plane_bindings(&visible_by_output)
+    }
+
     fn bind_direct_cursor_on_all_outputs(&mut self) {
         if self.pstate.scanout_m2.cursor_bound_all {
             return;
@@ -376,7 +386,8 @@ impl KmsBackend {
                     );
                 }
             }
-            if failed {
+            let scene_synced = self.sync_direct_cursor_scene_state();
+            if failed || !scene_synced {
                 self.request_direct_unflip("cursor_hide_failed");
             } else {
                 self.pstate.scanout_m2.cursor_bound_all = true;
@@ -403,7 +414,8 @@ impl KmsBackend {
                 );
             }
         }
-        if failed {
+        let scene_synced = self.sync_direct_cursor_scene_state();
+        if failed || !scene_synced {
             self.request_direct_unflip("cursor_bind_failed");
         } else {
             self.pstate.scanout_m2.cursor_bound_all = true;
@@ -430,6 +442,7 @@ impl KmsBackend {
         let x = self.core.cursor_x as i32;
         #[allow(clippy::cast_possible_truncation)]
         let y = self.core.cursor_y as i32;
+        let mut failed = false;
         for output_idx in 0..self.platform.outputs.len() {
             if let Err(error) = self.platform.cursor_plane_upload_image_for_output(
                 output_idx,
@@ -441,7 +454,8 @@ impl KmsBackend {
                 log::warn!(
                     "scanout_m2: direct cursor upload failed on output {output_idx}: {error}; unflipping"
                 );
-                return false;
+                failed = true;
+                break;
             }
             if let Err(error) = self.platform.cursor_plane_show_on_crtc(
                 output_idx,
@@ -453,11 +467,13 @@ impl KmsBackend {
                 log::warn!(
                     "scanout_m2: direct cursor show failed on output {output_idx}: {error}; unflipping"
                 );
-                return false;
+                failed = true;
+                break;
             }
         }
-        self.pstate.scanout_m2.cursor_bound_all = true;
-        true
+        let scene_synced = self.sync_direct_cursor_scene_state();
+        self.pstate.scanout_m2.cursor_bound_all = !failed && scene_synced;
+        !failed && scene_synced
     }
 
     fn pin_present_wake_for_direct(

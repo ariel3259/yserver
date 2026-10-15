@@ -194,6 +194,36 @@ impl SceneCompositor {
         classify_cursor_mode_from_per_output(inner.outputs.iter().map(|o| o.last_frame_cursor_mode))
     }
 
+    /// Record cursor-plane ownership after an external scanout transaction
+    /// binds or hides the physical planes without a scene retirement.
+    ///
+    /// `visible_by_output` is the observed plane state in scene output order.
+    /// Pending scene acknowledgements own their own retirement state, so they
+    /// must drain before an external observation can become authoritative.
+    pub fn record_external_cursor_plane_bindings(&mut self, visible_by_output: &[bool]) -> bool {
+        let Some(inner) = self.inner.as_mut() else {
+            return false;
+        };
+        if visible_by_output.len() != inner.outputs.len()
+            || inner
+                .outputs
+                .iter()
+                .any(|output| !output.pending_acks.is_empty())
+        {
+            return false;
+        }
+        for (output, visible) in inner.outputs.iter_mut().zip(visible_by_output) {
+            output.last_frame_cursor_mode = if *visible {
+                OutputCursorMode::Hw
+            } else {
+                OutputCursorMode::Hidden
+            };
+            output.force_show_retry_version = None;
+            output.cursor_prev_pos = None;
+        }
+        true
+    }
+
     /// Whether a visible cursor footprint was committed by the last retired
     /// scene frame on this output. Test fixtures use this to distinguish a
     /// software cursor draw from a mode-only cursor transition.

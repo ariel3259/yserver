@@ -143,9 +143,14 @@ impl Platform for PlatformBackend {
     }
 
     fn hide_cursor_under_direct_scanout(b: &mut KmsBackend) {
+        let direct_active = b.pstate.scanout_m2.active();
         if !b.platform.any_cursor_plane_visible() {
+            if direct_active && !b.sync_direct_cursor_scene_state() {
+                b.request_direct_unflip("cursor_scene_sync_failed");
+            }
             return;
         }
+        let mut failed = false;
         for output_idx in 0..b.platform.outputs.len() {
             if !b.platform.cursor_plane_visible_for_output(output_idx) {
                 continue;
@@ -154,9 +159,14 @@ impl Platform for PlatformBackend {
                 log::warn!(
                     "scanout_m2: cursor hide failed on output {output_idx}: {error}; unflipping"
                 );
-                b.request_direct_unflip("cursor_hide_failed");
-                return;
+                failed = true;
             }
+        }
+        if failed && direct_active {
+            b.request_direct_unflip("cursor_hide_failed");
+        }
+        if direct_active && !b.sync_direct_cursor_scene_state() {
+            b.request_direct_unflip("cursor_scene_sync_failed");
         }
     }
 
