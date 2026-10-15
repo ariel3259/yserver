@@ -1140,8 +1140,8 @@ impl KmsBackend {
             .remove(&output_idx)
         {
             let degraded = self.pstate.scanout_m2.degraded_composed_unflip;
-            let cursor_handoff = !degraded
-                && self.pstate.scanout_m2.unflip_reason == Some("tearing_cursor_handoff");
+            let cursor_handoff =
+                !degraded && self.pstate.scanout_m2.unflip_reason == Some("tearing_cursor_handoff");
             if cursor_handoff {
                 self.scene
                     .retire_external_cursor_handoff(output_idx, &mut self.platform);
@@ -2471,7 +2471,9 @@ impl KmsBackend {
             if self.pstate.scanout_m2.current.is_some() && self.pstate.scanout_m2.unflip_requested {
                 match self.submit_composed_unflip() {
                     Ok(true) => {
-                        self.pstate.tearing.note_composed_submit(self.monotonic_now());
+                        self.pstate
+                            .tearing
+                            .note_composed_submit(self.monotonic_now());
                         // The atomic replacement itself is now pending on every
                         // CRTC. Do not fall through into per-output scene flips in
                         // this same tick: KMS correctly rejects those with EBUSY.

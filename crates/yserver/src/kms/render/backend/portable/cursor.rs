@@ -514,19 +514,11 @@ impl<P: Platform> XBackend<P> {
             return;
         };
         self.display_cursor_by_handle(xid);
-        if P::tearing_active(self) {
-            if self.tearing_cursor_wants_visible()
-                && P::direct_scanout_owns_frame(self)
-            {
-                P::request_direct_unflip(self, "tearing_cursor_handoff");
-            }
-            return;
-        }
-        if P::direct_scanout_owns_frame(self)
-            && let Some(record) = self.cursor_records.get(&xid).cloned()
-            && !P::refresh_direct_cursor(self, &record)
+        if P::tearing_active(self)
+            && self.tearing_cursor_wants_visible()
+            && P::direct_scanout_owns_frame(self)
         {
-            P::request_direct_unflip(self, "cursor_show_failed");
+            P::request_direct_unflip(self, "tearing_cursor_handoff");
         }
     }
 

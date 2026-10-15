@@ -144,8 +144,11 @@ impl Platform for PlatformBackend {
 
     fn hide_cursor_under_direct_scanout(b: &mut KmsBackend) {
         let direct_active = b.pstate.scanout_m2.active();
+        if !direct_active {
+            return;
+        }
         if !b.platform.any_cursor_plane_visible() {
-            if direct_active && !b.sync_direct_cursor_scene_state() {
+            if !b.sync_direct_cursor_scene_state() {
                 b.request_direct_unflip("cursor_scene_sync_failed");
             }
             return;
@@ -162,10 +165,10 @@ impl Platform for PlatformBackend {
                 failed = true;
             }
         }
-        if failed && direct_active {
+        if failed {
             b.request_direct_unflip("cursor_hide_failed");
         }
-        if direct_active && !b.sync_direct_cursor_scene_state() {
+        if !b.sync_direct_cursor_scene_state() {
             b.request_direct_unflip("cursor_scene_sync_failed");
         }
     }

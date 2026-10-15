@@ -679,7 +679,10 @@ fn run_task6_present_and_xtest_motion_keep_cursor_compose_cap_under_run_core_loa
     );
     assert!(!backend.scene.has_pending_page_flips());
 
-    let refresh_interval = backend.pstate.tearing.cursor_compose_interval(&backend.platform);
+    let refresh_interval = backend
+        .pstate
+        .tearing
+        .cursor_compose_interval(&backend.platform);
     let (device_stream, event_peer) =
         std::os::unix::net::UnixStream::pair().expect("DRM test socket");
     device_stream
@@ -1220,11 +1223,15 @@ fn task5_handoff_unflip_starts_cursor_compose_interval() {
     assert!(backend.pstate.scanout_m2.current.is_some());
 
     let compose_time = backend
-        .pstate.tearing
+        .pstate
+        .tearing
         .last_cursor_compose
         .expect("successful composed unflip starts the cursor interval");
     assert_eq!(backend.pstate.tearing.deferred_cursor_wake, None);
-    let interval = backend.pstate.tearing.cursor_compose_interval(&backend.platform);
+    let interval = backend
+        .pstate
+        .tearing
+        .cursor_compose_interval(&backend.platform);
     let interval_ns = u64::try_from(interval.as_nanos()).unwrap();
     scheduler_time_ns.store(interval_ns / 2, Ordering::SeqCst);
     Backend::warp_pointer_root(&mut backend, &mut state, 121, 100);
@@ -1323,7 +1330,10 @@ fn task5_client_frame_is_never_deferred_by_cursor_cap() {
         crate::kms::render::scene::CursorPlaneMode::Sw
     );
 
-    let interval = backend.pstate.tearing.cursor_compose_interval(&backend.platform);
+    let interval = backend
+        .pstate
+        .tearing
+        .cursor_compose_interval(&backend.platform);
     let last_compose = std::time::Instant::now() + std::time::Duration::from_secs(30);
     backend.pstate.tearing.last_cursor_compose = Some(last_compose);
     Backend::warp_pointer_root(&mut backend, &mut state, 101, 100);
@@ -1745,7 +1755,13 @@ fn tearing_summary_counts_async_and_fallbacks() {
     expected.push(AtomicCommitKind::Scene);
     assert_commit_sequence(&recorder, &expected);
     assert_tearing_off(&backend);
-    assert!(backend.pstate.scanout_m2.deferred_successor_skips.is_empty());
+    assert!(
+        backend
+            .pstate
+            .scanout_m2
+            .deferred_successor_skips
+            .is_empty()
+    );
     let (eligible_presents, flips, skips, present_to_submit, present_to_flip) =
         sink.for_tests_present_latency_state();
     assert_eq!(
@@ -1805,7 +1821,8 @@ fn tearing_on_uncapped_async_stream_reaches_backend_latest_wins_slot() {
 
     assert_eq!(
         backend
-            .pstate.scanout_m2
+            .pstate
+            .scanout_m2
             .pending
             .as_ref()
             .map(|frame| frame.candidate.present_id),
@@ -1814,7 +1831,8 @@ fn tearing_on_uncapped_async_stream_reaches_backend_latest_wins_slot() {
     );
     assert_eq!(
         backend
-            .pstate.scanout_m2
+            .pstate
+            .scanout_m2
             .queued_successor
             .as_ref()
             .map(|frame| frame.candidate.present_id),
@@ -1823,7 +1841,8 @@ fn tearing_on_uncapped_async_stream_reaches_backend_latest_wins_slot() {
     );
     assert_eq!(
         backend
-            .pstate.scanout_m2
+            .pstate
+            .scanout_m2
             .deferred_successor_skips
             .iter()
             .map(|event| event.present_id)
@@ -1840,7 +1859,8 @@ fn tearing_on_uncapped_async_stream_reaches_backend_latest_wins_slot() {
     retire_direct_present(&mut backend, &mut state, 50);
     assert_eq!(
         backend
-            .pstate.scanout_m2
+            .pstate
+            .scanout_m2
             .completed
             .iter()
             .map(|event| (event.present_id, event.completion_mode))
@@ -2195,10 +2215,12 @@ fn tearing_on_delayed_acquire_stream_survives_core_supersession() {
     let acquire = Arc::new(AcquireTimeline::default());
     let release = Arc::new(ReleaseTimeline::default());
     backend
-        .pstate.dri3_syncobjs
+        .pstate
+        .dri3_syncobjs
         .insert(ACQUIRE_SYNCOBJ, (ClientId(1), acquire.clone()));
     backend
-        .pstate.dri3_syncobjs
+        .pstate
+        .dri3_syncobjs
         .insert(RELEASE_SYNCOBJ, (ClientId(1), release.clone()));
     // Force the existing timeline-poll fallback. run_core still discovers
     // readiness through Backend::drain_ready_present_source_waits.
@@ -2372,7 +2394,8 @@ fn tearing_on_delayed_acquire_stream_survives_core_supersession() {
     );
     assert_eq!(
         backend
-            .pstate.scanout_m2
+            .pstate
+            .scanout_m2
             .pending
             .as_ref()
             .map(|frame| frame.candidate.present_id),
@@ -2381,7 +2404,8 @@ fn tearing_on_delayed_acquire_stream_survives_core_supersession() {
     );
     assert_eq!(
         backend
-            .pstate.scanout_m2
+            .pstate
+            .scanout_m2
             .queued_successor
             .as_ref()
             .map(|frame| frame.candidate.present_id),
@@ -2389,7 +2413,8 @@ fn tearing_on_delayed_acquire_stream_survives_core_supersession() {
         "latest ready frame remains in the Backend successor slot"
     );
     let backend_successor_skips: Vec<_> = backend
-        .pstate.scanout_m2
+        .pstate
+        .scanout_m2
         .deferred_successor_skips
         .iter()
         .map(|event| event.present_id)

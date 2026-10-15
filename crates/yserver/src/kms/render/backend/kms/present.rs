@@ -822,8 +822,7 @@ impl KmsBackend {
             // Present turns playback into direct/composed thrash. Only an
             // ineligible authoritative-root successor invalidates the direct
             // ownership contract and must expose the Copy fallback.
-            if authoritative_root
-                && !(self.pstate.tearing.is_on() && tearing_gate_ignoring_cursor)
+            if authoritative_root && !(self.pstate.tearing.is_on() && tearing_gate_ignoring_cursor)
             {
                 self.pstate.scanout_m2.reset_eligible_root_probation();
                 self.request_direct_unflip("ineligible_authoritative_root_present");

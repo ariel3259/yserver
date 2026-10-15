@@ -1906,6 +1906,7 @@ impl<P: Platform> XBackend<P> {
         _origin: Option<OriginContext>,
         host_xid: u32,
     ) -> io::Result<()> {
+        P::exit_tearing_for_window(self, host_xid, "window_mapped");
         if P::direct_frame_references_host_drawable(self, host_xid) {
             P::request_direct_unflip(self, "map_direct_frame_drawable");
         }
@@ -2001,6 +2002,7 @@ impl<P: Platform> XBackend<P> {
         _origin: Option<OriginContext>,
         host_xid: u32,
     ) -> io::Result<()> {
+        P::exit_tearing_for_window(self, host_xid, "window_unmapped");
         if P::direct_frame_references_host_drawable(self, host_xid) {
             P::request_direct_unflip(self, "unmap_direct_frame_drawable");
         }

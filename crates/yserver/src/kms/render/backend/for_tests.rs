@@ -2,9 +2,8 @@ use crate::kms::{
     core::KmsCore,
     render::{
         backend::{
-            ConnectorConfig, KmsBackend, KmsBackendState, PaintTargetShape,
-            RandrIdAllocator, ScanoutM0Telemetry, ScanoutM1ProbeCache, ScanoutM2State,
-            ScenePlacement, Tearing,
+            ConnectorConfig, KmsBackend, KmsBackendState, PaintTargetShape, RandrIdAllocator,
+            ScanoutM0Telemetry, ScanoutM1ProbeCache, ScanoutM2State, ScenePlacement, Tearing,
         },
         engine::{RenderEngine, decode_x11_pixel_for_storage},
         gpu::GpuCore,
