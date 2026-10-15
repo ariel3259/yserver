@@ -49,8 +49,11 @@ Gamma/LUT, overlay planes, tearing (C1 keeps its own cursor policy), cursor scal
   state (for example motion coalesced B→C→B, or positions equal after integer rounding), the pending work is
   consumed without an ioctl and without an in-flight or flip-event obligation.
 - The applied state is invalidated (the next commit sends the full cursor state) after DRM master loss and resume,
-  every modeset, and every cursor-plane reassignment. A plane that leaves a CRTC is detached in the same commit that
-  attaches it elsewhere, or in an earlier one.
+  every modeset, and every cursor-plane reassignment.
+- **Reassignment.** DRM rejects moving a bound plane straight from CRTC A to CRTC B (it requires an intermediate
+  off state). When the matching moves a bound plane, yserver first waits for A's outstanding commit and event,
+  sends a detach-only commit on A and waits for it to be accepted. Only then does a commit on B attach the plane.
+  Until the plane is attached on B, B uses the software cursor.
 
 ### 2.2 Who submits what
 
@@ -71,9 +74,15 @@ Gamma/LUT, overlay planes, tearing (C1 keeps its own cursor policy), cursor scal
 - Sprites live in per-device dumb buffers sized to `DRM_CAP_CURSOR_WIDTH/HEIGHT`, image at the top-left corner, each
   with an ARGB8888 framebuffer (AddFB2). `SRC_*` and `CRTC_W/H` cover the whole buffer (no scaling); `CRTC_X/Y` =
   pointer − hotspot.
-- A framebuffer has a **user count**: every CRTC whose applied state, submitted (in-flight) commit or built-but-
-  unsent commit references it. A buffer is rewritten, and its framebuffer removed, only at user count zero. This
-  covers several outputs showing the same sprite and retiring at different times.
+- A framebuffer has a **user count**. Each CRTC counts as a user while the framebuffer is:
+  - *on screen*, until the flip event of the commit that replaced it (accepting the replacement is not enough,
+    because the hardware may still be reading it);
+  - referenced by a submitted, in-flight commit;
+  - referenced by a commit built but not yet sent.
+
+  A buffer is rewritten, and its framebuffer removed (RMFB), only at user count zero. This covers several outputs
+  showing the same sprite and retiring at different times. For a blocking commit that has no flip event, the *on
+  screen* reference ends when the commit returns successfully and the old events have drained.
 - An image change, and also a **hotspot-only change**, writes a free buffer and switches `FB_ID`. Virtio forwards
   the hotspot to the host only on a framebuffer change (`virtgpu_plane.c`).
 - When no buffer is free, the newest wanted image stays pending (older pending images are dropped) and is written
@@ -103,8 +112,9 @@ of C1 and this work merges second adapts to the other in its rebase.
   ownership stays HW and the plane is left as it is (logged once). The cursor never shows twice.
 - **Frame commit rejected because of its cursor properties:**
   - *HW→SW frame (hide):* the frame already paints the software cursor. Retry it with an explicit detach. If that
-    is rejected, retry without cursor properties, keep the output HW and request a new frame without the software
-    cursor.
+    is rejected too, that frame is **not** submitted: it would show the software cursor while the hardware cursor is
+    still bound. The output stays HW, the previous primary framebuffer stays on screen, and the scene renders a
+    replacement frame without the software cursor. That frame is submitted without cursor properties.
   - *SW→HW frame (show):* the frame was rendered without the software cursor. Retry it without cursor properties
     (one frame without a cursor), keep the output SW and request an immediate recompose with the software cursor.
   - *HW-only change riding a frame:* retry without cursor properties; the change is handled as a rejected cursor-only
@@ -130,17 +140,22 @@ no pending intents, no in-flight obligations, no leaked framebuffers.
    eligible. Virtual driver with the cap rejected **and the plane exposed** → SW. Virtual driver with the cap
    accepted and `HOTSPOT_X/Y` present → HW with hotspot set.
 4. Framebuffer lifetime: two outputs share a sprite and retire at staggered times; one output skips frames; an
-   animation arrives while every buffer is in use. No buffer is rewritten or removed while any user remains.
-   Mutation: release at the first replacing event → fails.
-5. Ownership: a held direct frame with no successor gets show, hide, animation and first bind through cursor-only
+   animation arrives while every buffer is in use. No buffer is rewritten or removed while any user remains. In
+   particular, an animation frame must not rewrite F0 after the commit replacing F0 is accepted but before its flip
+   event. Mutations: release at the first replacing event, or at acceptance instead of the event → fails.
+5. Reassignment: the matching moves a bound plane from CRTC A to B. The commits are: A's detach accepted first,
+   then B's attach. B uses the software cursor until its attach is accepted. No commit both detaches and attaches.
+6. Ownership: a held direct frame with no successor gets show, hide, animation and first bind through cursor-only
    commits. A skipped (no-BO) frame does not publish its assignment. Cross-output motion. Mixed mode.
-6. Lifecycle: DPMS off/on, VT leave/resume and output removal detach the plane in the disable commit and reclaim
+7. Lifecycle: DPMS off/on, VT leave/resume and output removal detach the plane in the disable commit and reclaim
    after the drain. A failed disable keeps ownership. Resume sends the full state.
-7. No-op: B→C→B coalescing and integer-equal motion produce no ioctl and no event obligation.
-8. Hotspot-only change switches `FB_ID` (virtio needs it).
-9. Errors: every §3 case, including a rejected detach (no double cursor), a SW→HW show failure (one cursorless
+8. No-op: B→C→B coalescing and integer-equal motion produce no ioctl and no event obligation.
+9. Hotspot-only change switches `FB_ID` (virtio needs it).
+10. Errors: every §3 case, checking **every accepted intermediate frame** and not only the final recovery. This
+   includes a rejected detach: the software-cursor frame is never submitted while the plane is bound, so no accepted
+   frame shows two cursors. It also includes a SW→HW show failure (one cursorless
    frame, then a SW recompose), and repeated rejected animation frames (no retry loop: one retry per key per epoch).
-10. Gate: no `set_cursor2` / `move_cursor` left under `crates/`.
+11. Gate: no `set_cursor2` / `move_cursor` left under `crates/`.
 
 ## 5. Hardware validation (with the user's approval, per card)
 
