@@ -970,6 +970,7 @@ fn retain_direct_frame_from_source_test(
         completion_output_idx: 0,
         completion_clock,
         awaiting_outputs: std::collections::HashSet::new(),
+        async_outcome: crate::drm::async_flip::AsyncOutcome::NotRequested,
     });
     b.pstate.scanout_m2.hold_direct = true;
 }
@@ -1210,6 +1211,7 @@ pub(super) fn install_direct_frame_for_target_test(
         } else {
             std::collections::HashSet::from([0])
         },
+        async_outcome: crate::drm::async_flip::AsyncOutcome::NotRequested,
     };
     if current {
         b.pstate.scanout_m2.current = Some(frame);

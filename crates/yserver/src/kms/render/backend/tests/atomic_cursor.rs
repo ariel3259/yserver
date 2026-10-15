@@ -79,6 +79,7 @@ fn shared_scene_flip_records_the_latest_cursor_position() {
         -1,
         &mut out_fence,
         &positions,
+        crate::drm::async_flip::FlipTiming::Vsync,
     )
     .expect("record shared scene flip");
 
@@ -149,6 +150,7 @@ fn copied_scene_flip_uses_the_sink_devices_cursor_plane() {
         -1,
         &mut out_fence,
         &positions,
+        crate::drm::async_flip::FlipTiming::Vsync,
     )
     .expect("record copied sink flip");
 
@@ -204,6 +206,7 @@ fn legacy_scene_flip_has_no_atomic_cursor_properties() {
         -1,
         &mut out_fence,
         &positions,
+        crate::drm::async_flip::FlipTiming::Vsync,
     )
     .expect("record legacy scene flip");
 
@@ -504,6 +507,7 @@ fn motion_during_scene_flip_waits_and_scene_request_carries_latest_position() {
         -1,
         &mut out_fence,
         &positions,
+        crate::drm::async_flip::FlipTiming::Vsync,
     )
     .expect("record the next scene request");
     backend
@@ -596,6 +600,7 @@ fn scene_damage_after_cursor_retirement_submits_scene_with_latest_position() {
         -1,
         &mut out_fence,
         &positions,
+        crate::drm::async_flip::FlipTiming::Vsync,
     )
     .expect("record prioritized scene request");
     backend
@@ -780,6 +785,7 @@ fn scene_commit_failure_blames_the_cursor_only_when_its_fields_cause_it() {
             -1,
             &mut out_fence,
             &[position],
+            crate::drm::async_flip::FlipTiming::Vsync,
         );
         assert!(result.is_err(), "{name}: the scene commit itself failed");
         assert_eq!(
@@ -827,8 +833,15 @@ fn direct_scanout_probe_tests_the_request_it_commits() {
     let sink = &platform.devices[0].atomic_commit_sink;
     crate::drm::modeset::test_direct_scanout(device, sink, raw(91), &planes, &[position])
         .expect("record M1 probe");
-    crate::drm::modeset::submit_direct_scanout(device, sink, raw(91), &planes, &[position])
-        .expect("record live direct commit");
+    crate::drm::modeset::submit_direct_scanout(
+        device,
+        sink,
+        raw(91),
+        &planes,
+        &[position],
+        crate::drm::async_flip::FlipTiming::Vsync,
+    )
+    .expect("record live direct commit");
 
     let records = recorder.records();
     assert_eq!(records.len(), 2);

@@ -82,6 +82,14 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   page-flip behavior changes in this task. Protocol and encoding tests cover
   the advertisement; hardware validation remains in Task 6.
 
+- **2026-10-14 tearing-on-demand Task 2:** Atomic direct and composed requests
+  can now carry `PAGE_FLIP_ASYNC` without cursor properties or `OUT_FENCE_PTR`.
+  An async `EINVAL` retries the same frame with Vsync and records consecutive
+  failures by stream and shape; two failures suspend that shape. Production
+  callers still select Vsync until Task 3 wires the Present request policy.
+  Recording-sink and Vulkan-backed scene fixtures cover both submit routes;
+  hardware validation remains in Task 6.
+
 - **2026-10-13 hardware cursor in the wlroots model (branch `feat/atomic-cursor`):** on every device whose
   cursor planes expose `CRTC_X`/`CRTC_Y`, the cursor is driven through atomic commits. Each CRTC has one commit
   stream with at most one commit in flight:
@@ -7503,13 +7511,15 @@ regression and must not be reverted on this evidence. The diagnostic selector
 and harness remain useful reproduction tools, but `post95` stays the production
 behavior.
 
-This branch deliberately stops at VBlank-synchronized direct scanout. It does
-not advertise async-tear capability or submit `PAGE_FLIP_ASYNC`. On-demand
-tearing is a separate follow-up (Phase C): only a Present that both qualifies
-for fullscreen direct scanout and carries an effective `PresentOptionAsync` or
-`PresentOptionAsyncMayTear` request may use an async KMS flip, and only when the
-DRM device reports support. Synced Presents, ineligible windows, and unsupported
-devices retain the tear-free path provided here.
+Production flips still use VBlank synchronization at this task boundary. Task 1
+advertises `PresentCapabilityAsync` on devices that report async page-flip
+support, and Task 2 adds async request building, same-frame Vsync fallback and
+per-stream shape suspension. No production caller requests `PAGE_FLIP_ASYNC`
+until Task 3 wires the Present request policy. The intended policy is limited
+to eligible fullscreen direct Presents carrying an effective
+`PresentOptionAsync` or `PresentOptionAsyncMayTear` request on a supporting DRM
+device; synced Presents, ineligible windows and unsupported devices retain the
+Vsync path.
 
 ## Damage-clipped repaint for non-composited desktops (branch `fix/noncomposited-damage-repaint`, 2026-09-01 → 2026-09-03)
 

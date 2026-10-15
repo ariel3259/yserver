@@ -21,6 +21,7 @@ pub(crate) enum AtomicCommitKind {
     CursorOnly,
     SceneWithCursor,
     Scene,
+    Async,
 }
 
 impl AtomicCommitKind {
@@ -29,6 +30,7 @@ impl AtomicCommitKind {
             Self::CursorOnly => "cursor-only",
             Self::SceneWithCursor => "scene-with-cursor",
             Self::Scene => "scene",
+            Self::Async => "async",
         }
     }
 
@@ -37,6 +39,7 @@ impl AtomicCommitKind {
             Self::CursorOnly => 0,
             Self::SceneWithCursor => 1,
             Self::Scene => 2,
+            Self::Async => 3,
         }
     }
 }
@@ -372,10 +375,11 @@ impl AtomicCommitSink {
         let visible = percentile(&snapshot.motion_to_visible_us);
         log::info!(
             target: "yserver::kms::render::backend::kms",
-            "atomic commits/s cursor_only={} scene_with_cursor={} scene={} ebusy={} ioctl_us_max/p99 cursor_only={}/{} scene_with_cursor={}/{} scene={}/{} motion_to_accept_us_max/p99={}/{} motion_to_visible_us_max/p99={}/{}",
+            "atomic commits/s cursor_only={} scene_with_cursor={} scene={} async={} ebusy={} ioctl_us_max/p99 cursor_only={}/{} scene_with_cursor={}/{} scene={}/{} async={}/{} motion_to_accept_us_max/p99={}/{} motion_to_visible_us_max/p99={}/{}",
             counts[0],
             counts[1],
             counts[2],
+            counts[3],
             snapshot.ebusy,
             summaries[0].0,
             summaries[0].1,
@@ -383,6 +387,8 @@ impl AtomicCommitSink {
             summaries[1].1,
             summaries[2].0,
             summaries[2].1,
+            summaries[3].0,
+            summaries[3].1,
             accept.0,
             accept.1,
             visible.0,
@@ -415,7 +421,7 @@ impl AtomicCommitSink {
 
 struct CommitWindow {
     started: Instant,
-    ioctl_us: [Vec<u64>; 3],
+    ioctl_us: [Vec<u64>; 4],
     ebusy: u64,
     motion_to_accept_us: Vec<u64>,
     motion_to_visible_us: Vec<u64>,
@@ -423,7 +429,7 @@ struct CommitWindow {
 }
 
 struct CommitWindowSnapshot {
-    ioctl_us: [Vec<u64>; 3],
+    ioctl_us: [Vec<u64>; 4],
     ebusy: u64,
     motion_to_accept_us: Vec<u64>,
     motion_to_visible_us: Vec<u64>,

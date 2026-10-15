@@ -112,6 +112,8 @@ impl OutputSink for PlatformBackend {
             )));
         };
         let cursor_positions = self.cursor_plane_atomic_positions_for_outputs(&[output_idx]);
+        let timing = self.requested_flip_timing;
+        let async_ledger = &mut self.async_ledger;
         let Some(pool) = self
             .scanout_pools
             .get_mut(output_idx)
@@ -122,8 +124,10 @@ impl OutputSink for PlatformBackend {
         let output = &self.outputs[output_idx].output;
         let mut shared_cursor_commit_submitted = false;
         let mut cursor_rejection_error = None;
+        let mut async_outcome = None;
         let outcome = match pool {
             OutputScanout::Shared(pool) => {
+                let allocation_plan = pool.allocation_plan;
                 let Some(bo) = pool.bos.get_mut(bo_idx) else {
                     return FinishOutcome::Unavailable(FrameTargetError::NoSlot);
                 };
@@ -131,17 +135,25 @@ impl OutputSink for PlatformBackend {
                     &drm_device,
                     atomic_commit_sink.as_ref(),
                     output,
+                    allocation_plan,
                     bo,
                     record,
                     &cursor_positions,
+                    async_ledger,
+                    timing,
                 );
                 if let Err(error) = &submitted
                     && atomic_commit_sink.take_last_cursor_rejection()
                 {
                     cursor_rejection_error = Some(error.to_string());
                 }
-                let result = submitted.map(FrameHandoff::FlipPending);
-                shared_cursor_commit_submitted = result.is_ok();
+                if let Ok((_, result)) = &submitted {
+                    async_outcome = Some(*result);
+                    shared_cursor_commit_submitted =
+                        *result != crate::drm::async_flip::AsyncOutcome::Accepted;
+                }
+                let result =
+                    submitted.map(|(compose, _async_outcome)| FrameHandoff::FlipPending(compose));
                 FinishOutcome::Finished {
                     result,
                     previous_gpu_ns: bo.last_gpu_render_ns.take(),
@@ -168,6 +180,12 @@ impl OutputSink for PlatformBackend {
                 }
             }
         };
+        if let Some(async_outcome) = async_outcome {
+            self.async_outcomes.insert(
+                crate::drm::async_flip::AsyncStream::Composed(output.crtc),
+                async_outcome,
+            );
+        }
         if shared_cursor_commit_submitted {
             self.cursor_plane_scene_commit_submitted(&cursor_positions);
         }
@@ -455,10 +473,13 @@ fn submit_shared_scanout_frame(
     drm: &crate::drm::Device,
     atomic_commit_sink: &crate::drm::atomic::AtomicCommitSink,
     output: &crate::platform::drm::Output,
+    allocation_plan: crate::kms::vk::scanout::ScanoutAllocationPlan,
     bo: &mut ScanoutBo,
     record: &mut RecordFrame<'_>,
     cursor_positions: &[crate::drm::atomic::CursorPlanePosition],
-) -> Result<ComposeSubmit, PresentError> {
+    async_ledger: &mut crate::drm::async_flip::AsyncFlipLedger,
+    timing: crate::drm::async_flip::FlipTiming,
+) -> Result<(ComposeSubmit, crate::drm::async_flip::AsyncOutcome), PresentError> {
     use std::os::fd::{FromRawFd, IntoRawFd};
 
     if bo.state.phase != BoPhase::Free {
@@ -474,8 +495,36 @@ fn submit_shared_scanout_frame(
         .map_or(-1, IntoRawFd::into_raw_fd);
     bo.state.transition_to_submitted(fd);
 
+    const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
+    let modifier = match allocation_plan {
+        crate::kms::vk::scanout::ScanoutAllocationPlan::GbmModifier(modifier)
+        | crate::kms::vk::scanout::ScanoutAllocationPlan::DrmModifier(modifier) => modifier,
+        crate::kms::vk::scanout::ScanoutAllocationPlan::PaddedExplicitLinear { .. }
+        | crate::kms::vk::scanout::ScanoutAllocationPlan::ExplicitLinear
+        | crate::kms::vk::scanout::ScanoutAllocationPlan::LegacyLinear => 0,
+    };
+    let shape = crate::drm::async_flip::AsyncShape {
+        fourcc: DRM_FORMAT_XRGB8888,
+        modifier,
+        pitch: bo.pitch,
+        width: bo.width,
+        height: bo.height,
+        crtcs: vec![output.crtc],
+        direct: false,
+    };
+    let stream = crate::drm::async_flip::AsyncStream::Composed(output.crtc);
+    if timing == crate::drm::async_flip::FlipTiming::Async {
+        async_ledger.observe_shape(stream, &shape);
+    }
+    let attempt_timing = if timing == crate::drm::async_flip::FlipTiming::Async
+        && async_ledger.allows(stream, &shape)
+    {
+        crate::drm::async_flip::FlipTiming::Async
+    } else {
+        crate::drm::async_flip::FlipTiming::Vsync
+    };
     let mut out_fence: i32 = -1;
-    match crate::drm::page_flip::submit_scene_flip_with_fences(
+    let mut submit_result = crate::drm::page_flip::submit_scene_flip_with_fences(
         drm,
         atomic_commit_sink,
         output,
@@ -483,18 +532,56 @@ fn submit_shared_scanout_frame(
         fd,
         &mut out_fence,
         cursor_positions,
-    ) {
+        attempt_timing,
+    );
+    let async_outcome = if attempt_timing == crate::drm::async_flip::FlipTiming::Async {
+        match submit_result {
+            Ok(()) => {
+                async_ledger.note_accepted(stream, &shape);
+                submit_result = Ok(());
+                crate::drm::async_flip::AsyncOutcome::Accepted
+            }
+            Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {
+                let suspended = async_ledger.note_einval(stream, &shape);
+                let retry_fd = bo
+                    .state
+                    .transition_to_recording_after_atomic_reject()
+                    .unwrap_or(-1);
+                bo.state.transition_to_submitted(retry_fd);
+                out_fence = -1;
+                submit_result = crate::drm::page_flip::submit_scene_flip_with_fences(
+                    drm,
+                    atomic_commit_sink,
+                    output,
+                    fb_handle,
+                    retry_fd,
+                    &mut out_fence,
+                    cursor_positions,
+                    crate::drm::async_flip::FlipTiming::Vsync,
+                );
+                crate::drm::async_flip::AsyncOutcome::FellBack { suspended }
+            }
+            Err(error) => {
+                submit_result = Err(error);
+                crate::drm::async_flip::AsyncOutcome::NotRequested
+            }
+        }
+    } else {
+        crate::drm::async_flip::AsyncOutcome::NotRequested
+    };
+
+    match submit_result {
         Ok(()) => {
             if let Some(reclaimed) = bo.state.transition_to_pending(out_fence) {
-                // SAFETY: `reclaimed` was inserted by
-                // `transition_to_submitted` above.
+                // SAFETY: this is the in-fence fd retained across any async
+                // EINVAL retry and returned after atomic acceptance.
                 drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(reclaimed) });
             }
-            Ok(submitted)
+            Ok((submitted, async_outcome))
         }
         Err(error) => {
             if let Some(reclaimed) = bo.state.transition_to_recording_after_atomic_reject() {
-                // SAFETY: same fd we just inserted.
+                // SAFETY: same fd inserted by `transition_to_submitted`.
                 drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(reclaimed) });
             }
             if out_fence >= 0 {

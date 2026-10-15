@@ -15,6 +15,7 @@ use yserver_core::backend::{
 };
 
 use crate::{
+    drm::async_flip::AsyncShape,
     internal_probe::RouteProbeRequest,
     kms::{
         backend::OutputKey,
@@ -149,18 +150,35 @@ pub(in crate::kms::render::backend) struct ScanoutM1ProbeEntry {
     /// Retained solely for its FB/GEM lifetime; `Drop` performs teardown.
     pub(in crate::kms::render::backend) _framebuffer:
         Option<crate::drm::modeset::DirectScanoutProbeFramebuffer>,
+    /// Exact source allocation shape used by the async suspension ledger.
+    pub(in crate::kms::render::backend) async_shape: Option<AsyncShape>,
 }
 
 impl ScanoutM1ProbeEntry {
     pub(in crate::kms::render::backend) fn rejected() -> Self {
-        Self { _framebuffer: None }
+        Self {
+            _framebuffer: None,
+            async_shape: None,
+        }
     }
 
+    #[cfg(test)]
     pub(in crate::kms::render::backend) fn accepted(
         framebuffer: crate::drm::modeset::DirectScanoutProbeFramebuffer,
     ) -> Self {
         Self {
             _framebuffer: Some(framebuffer),
+            async_shape: None,
+        }
+    }
+
+    pub(in crate::kms::render::backend) fn accepted_with_shape(
+        framebuffer: crate::drm::modeset::DirectScanoutProbeFramebuffer,
+        async_shape: AsyncShape,
+    ) -> Self {
+        Self {
+            _framebuffer: Some(framebuffer),
+            async_shape: Some(async_shape),
         }
     }
 
@@ -214,6 +232,7 @@ pub(in crate::kms::render::backend) struct DirectPresentFrame {
     pub(in crate::kms::render::backend) completion_clock:
         Option<yserver_core::backend::PresentClockSample>,
     pub(in crate::kms::render::backend) awaiting_outputs: HashSet<usize>,
+    pub(in crate::kms::render::backend) async_outcome: crate::drm::async_flip::AsyncOutcome,
 }
 
 /// Require a short stable run before entering direct ownership. Compositors

@@ -667,6 +667,7 @@ impl KmsBackend {
             completion_output_idx,
             completion_clock: None,
             awaiting_outputs: HashSet::new(),
+            async_outcome: crate::drm::async_flip::AsyncOutcome::NotRequested,
         };
 
         if self.pstate.scanout_m2.pending.is_some() {
@@ -708,7 +709,9 @@ impl KmsBackend {
             <Self as Backend>::release_present_source(self, fallback_target_pin);
             return Ok(false);
         }
-        if let Err(error) = self.submit_direct_frame(&mut frame) {
+        if let Err(error) =
+            self.submit_direct_frame(&mut frame, self.platform.requested_flip_timing)
+        {
             self.request_direct_unflip("eligible_direct_successor_submit_failed");
             <Self as Backend>::release_present_source(self, source_pin);
             <Self as Backend>::release_present_source(self, fallback_target_pin);

@@ -479,11 +479,16 @@ impl KmsBackend {
         }
     }
 
-    pub(super) fn submit_direct_frame(&mut self, frame: &mut DirectPresentFrame) -> io::Result<()> {
+    pub(super) fn submit_direct_frame(
+        &mut self,
+        frame: &mut DirectPresentFrame,
+        timing: crate::drm::async_flip::FlipTiming,
+    ) -> io::Result<crate::drm::async_flip::AsyncOutcome> {
         #[cfg(test)]
         if self.pstate.scanout_m2.test_submit_direct_without_drm {
             frame.awaiting_outputs = (0..self.platform.outputs.len()).collect();
-            return Ok(());
+            frame.async_outcome = crate::drm::async_flip::AsyncOutcome::NotRequested;
+            return Ok(crate::drm::async_flip::AsyncOutcome::NotRequested);
         }
         let fb = self
             .pstate
@@ -521,13 +526,72 @@ impl KmsBackend {
         let cursor_positions = self
             .platform
             .cursor_plane_atomic_positions_for_outputs(&output_indices);
-        let result = crate::drm::modeset::submit_direct_scanout(
+        let async_shape = if timing == crate::drm::async_flip::FlipTiming::Async {
+            Some(
+                self.scanout_m1
+                    .entries
+                    .get(&frame.source_id)
+                    .and_then(|entry| entry.async_shape.clone())
+                    .ok_or_else(|| {
+                        io::Error::other("direct async submit has no probed buffer shape")
+                    })?,
+            )
+        } else {
+            None
+        };
+        let stream = crate::drm::async_flip::AsyncStream::Direct;
+        if let Some(shape) = &async_shape {
+            self.platform.async_ledger.observe_shape(stream, shape);
+        }
+        let async_allowed = async_shape
+            .as_ref()
+            .is_some_and(|shape| self.platform.async_ledger.allows(stream, shape));
+        let attempt_timing = if async_allowed {
+            crate::drm::async_flip::FlipTiming::Async
+        } else {
+            crate::drm::async_flip::FlipTiming::Vsync
+        };
+        let mut result = crate::drm::modeset::submit_direct_scanout(
             &device,
             atomic_commit_sink.as_ref(),
             fb,
             &plane_states,
             &cursor_positions,
+            attempt_timing,
         );
+        let async_outcome = if attempt_timing == crate::drm::async_flip::FlipTiming::Async {
+            match result {
+                Ok(()) => {
+                    let shape = async_shape
+                        .as_ref()
+                        .expect("async submit carries its shape");
+                    self.platform.async_ledger.note_accepted(stream, shape);
+                    result = Ok(());
+                    crate::drm::async_flip::AsyncOutcome::Accepted
+                }
+                Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {
+                    let shape = async_shape
+                        .as_ref()
+                        .expect("async submit carries its shape");
+                    let suspended = self.platform.async_ledger.note_einval(stream, shape);
+                    result = crate::drm::modeset::submit_direct_scanout(
+                        &device,
+                        atomic_commit_sink.as_ref(),
+                        fb,
+                        &plane_states,
+                        &cursor_positions,
+                        crate::drm::async_flip::FlipTiming::Vsync,
+                    );
+                    crate::drm::async_flip::AsyncOutcome::FellBack { suspended }
+                }
+                Err(error) => {
+                    result = Err(error);
+                    crate::drm::async_flip::AsyncOutcome::NotRequested
+                }
+            }
+        } else {
+            crate::drm::async_flip::AsyncOutcome::NotRequested
+        };
         if let Err(error) = &result
             && atomic_commit_sink.take_last_cursor_rejection()
         {
@@ -537,10 +601,18 @@ impl KmsBackend {
             self.handle_cursor_move_outcome(outcome);
         }
         result?;
-        self.platform
-            .cursor_plane_scene_commit_submitted(&cursor_positions);
+        if attempt_timing == crate::drm::async_flip::FlipTiming::Vsync
+            || matches!(
+                async_outcome,
+                crate::drm::async_flip::AsyncOutcome::FellBack { .. }
+            )
+        {
+            self.platform
+                .cursor_plane_scene_commit_submitted(&cursor_positions);
+        }
         frame.awaiting_outputs = (0..self.platform.outputs.len()).collect();
-        Ok(())
+        frame.async_outcome = async_outcome;
+        Ok(async_outcome)
     }
 
     fn submit_queued_direct_successor(&mut self) {
@@ -560,8 +632,8 @@ impl KmsBackend {
         let Some(mut successor) = self.pstate.scanout_m2.queued_successor.take() else {
             return;
         };
-        match self.submit_direct_frame(&mut successor) {
-            Ok(()) => {
+        match self.submit_direct_frame(&mut successor, self.platform.requested_flip_timing) {
+            Ok(_) => {
                 log::debug!(
                     "scanout_m2: submitted queued direct successor source_id={} present_id={} outputs={}",
                     successor.source_id.as_u64(),
@@ -1297,10 +1369,28 @@ impl KmsBackend {
                     height,
                     output_geometry,
                 );
-                self.pstate
-                    .scanout_m1
-                    .entries
-                    .insert(source_id, ScanoutM1ProbeEntry::accepted(framebuffer));
+                let mut crtcs: Vec<_> = self
+                    .platform
+                    .outputs
+                    .iter()
+                    .map(|layout| layout.output.crtc)
+                    .collect();
+                crtcs.sort_by_key(|crtc| u32::from(*crtc));
+                self.pstate.scanout_m1.entries.insert(
+                    source_id,
+                    ScanoutM1ProbeEntry::accepted_with_shape(
+                        framebuffer,
+                        crate::drm::async_flip::AsyncShape {
+                            fourcc,
+                            modifier,
+                            pitch,
+                            width: u32::from(width),
+                            height: u32::from(height),
+                            crtcs,
+                            direct: true,
+                        },
+                    ),
+                );
                 self.pstate.scanout_m0.m1_probe_pass =
                     self.pstate.scanout_m0.m1_probe_pass.saturating_add(1);
             }

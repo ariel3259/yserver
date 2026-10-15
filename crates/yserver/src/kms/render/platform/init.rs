@@ -731,6 +731,9 @@ impl PlatformBackend {
             ust_msc: std::collections::HashMap::new(),
             completion_clocks: std::collections::HashMap::new(),
             software_msc: std::collections::HashMap::new(),
+            async_ledger: crate::drm::async_flip::AsyncFlipLedger::default(),
+            async_outcomes: HashMap::new(),
+            requested_flip_timing: crate::drm::async_flip::FlipTiming::Vsync,
             input_ctx,
             #[cfg(target_os = "linux")]
             hotplug_monitor,
@@ -860,6 +863,9 @@ impl PlatformBackend {
             ust_msc: std::collections::HashMap::new(),
             completion_clocks: std::collections::HashMap::new(),
             software_msc: std::collections::HashMap::new(),
+            async_ledger: crate::drm::async_flip::AsyncFlipLedger::default(),
+            async_outcomes: HashMap::new(),
+            requested_flip_timing: crate::drm::async_flip::FlipTiming::Vsync,
             input_ctx: None,
             #[cfg(target_os = "linux")]
             hotplug_monitor,

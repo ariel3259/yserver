@@ -1263,6 +1263,7 @@ fn grouped_direct_waits_all_outputs_and_uses_selected_reference_sample() {
         completion_output_idx: 0,
         completion_clock: None,
         awaiting_outputs: std::collections::HashSet::from([0, 1]),
+        async_outcome: crate::drm::async_flip::AsyncOutcome::NotRequested,
     });
 
     let reference = PresentClockSample {

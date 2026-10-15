@@ -60,7 +60,10 @@ use ash::vk;
 use yserver_core::backend::PresentClockSample;
 
 use crate::{
-    drm,
+    drm::{
+        self,
+        async_flip::{AsyncFlipLedger, FlipTiming},
+    },
     kms::{
         backend::{ActiveOutput, OutputKey},
         scanout_route::ScanoutRoute,
@@ -463,6 +466,18 @@ pub struct PlatformBackend {
     /// report a real `frame > 0` this map stays empty (the real value
     /// is used directly).
     pub(crate) software_msc: std::collections::HashMap<CrtcKey, u64>,
+
+    /// Per-stream history for async page-flip EINVAL fallback. Cleared when
+    /// the backend leaves its active KMS session.
+    pub(crate) async_ledger: AsyncFlipLedger,
+    /// Most recent outcome per independently submitted stream. The scene
+    /// output contract does not carry flip timing, so retain the result here
+    /// for the Present policy and diagnostics that follow a synchronous submit.
+    pub(crate) async_outcomes:
+        HashMap<crate::drm::async_flip::AsyncStream, crate::drm::async_flip::AsyncOutcome>,
+    /// The submit timing selected by the caller. Production initializes this
+    /// to Vsync; the later Present policy may request Async for eligible work.
+    pub(crate) requested_flip_timing: FlipTiming,
 
     // Input side
     input_ctx: Option<crate::input::SendContext>,

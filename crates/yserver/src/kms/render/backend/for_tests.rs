@@ -273,6 +273,13 @@ impl KmsBackend {
     /// back to headless use `for_tests` directly.
     #[doc(hidden)]
     pub fn for_tests_with_vk() -> Result<Self, io::Error> {
+        Self::for_tests_with_vk_dimensions(800, 600)
+    }
+
+    /// Vk-backed fixture with a caller-selected virtual-screen size.
+    /// Used by scene tests that install synthetic outputs without a DRM node.
+    #[doc(hidden)]
+    pub fn for_tests_with_vk_dimensions(width: u16, height: u16) -> Result<Self, io::Error> {
         use std::sync::Arc;
         // Build the test seed WITHOUT the root drawable. If
         // `for_tests()` were used, `init_root_storage` would have
@@ -284,6 +291,8 @@ impl KmsBackend {
         // `set_container_background_pixmap`) segfaults inside the
         // descriptor-set bind.
         let mut base = Self::for_tests_seed();
+        base.platform.fb_w = width.max(1);
+        base.platform.fb_h = height.max(1);
         let vk = crate::kms::vk::device::VkContext::new()
             .map_err(|e| io::Error::other(format!("render for_tests_with_vk: VkContext: {e:?}")))?;
         let ops_pool = crate::kms::vk::ops::OpsCommandPool::new(Arc::clone(&vk)).map_err(|e| {
