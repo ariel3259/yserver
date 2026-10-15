@@ -27,63 +27,124 @@ Gamma/LUT, overlay planes, tearing (C1 keeps its own cursor policy), cursor scal
 - A CRTC uses a hardware cursor plane only if the #246 matching assigns it a cursor plane that exposes all of
   `FB_ID`, `CRTC_ID`, `CRTC_X`, `CRTC_Y`, `CRTC_W`, `CRTC_H`, `SRC_X`, `SRC_Y`, `SRC_W`, `SRC_H`. Otherwise that
   CRTC uses the software cursor. Evaluated at device open and on every topology change.
-- At device open, before plane enumeration, yserver sets `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` on every device.
-  Virtualized drivers (virtio-gpu, vmwgfx, qxl, vboxvideo) hide their cursor plane from atomic clients without it.
-  If the plane exposes `HOTSPOT_X`/`HOTSPOT_Y`, every commit that shows the plane or changes the sprite sets them.
-  If the kernel rejects the cap (< 6.6), yserver continues; such drivers then expose no cursor plane and those
-  CRTCs use the software cursor (accepted outcome, user decision "option a").
+- **Hotspot cap.** At device open yserver sets `DRM_CLIENT_CAP_ATOMIC` first, then
+  `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT`, before plane enumeration. The cap exists since Linux 6.8 (the uAPI header's
+  "6.6" comment is wrong). A rejection on a physical driver is normal and changes nothing.
+- **Virtualized drivers** (driver name `virtio_gpu`, `vmwgfx`, `qxl`, `vboxvideo`): a cursor plane is eligible only
+  if the cap was accepted AND the plane exposes `HOTSPOT_X`/`HOTSPOT_Y`. This is decided by feature detection, not
+  by kernel version, so backports are handled. Kernels before 6.8 can still expose the plane without hotspot
+  support, and there the CRTC uses the software cursor (accepted outcome, user decision "option a").
 - Devices without cursor planes (Apple DCP) and CRTCs left unassigned by the matching use the software cursor, as
   today.
 - Deleted: `set_cursor2`, `move_cursor`, the legacy hide operation, and every "no atomic positions → legacy move"
   branch. Devices that relied on them use the software cursor.
 
-## 2. Cursor plane intent on the commit stream
+## 2. Cursor plane state and its owners
 
-- Each CRTC holds the *intended* cursor plane state: `Visible { fb, x, y, hotspot }` or `Hidden`.
-- Every atomic commit on that CRTC carries the current intent: scene flips, Vsync direct scanout and cursor-only
-  commits when the CRTC is idle. A commit adds only the properties that differ from the last *applied* state.
-  The applied state advances when the commit is accepted.
-- **Show and hide share the frame's commit.** The scene's per-output `CursorAssignment` (HW vs SW) and the frame that
-  stops (or starts) painting the software cursor travel in the same atomic commit as the plane's show (or hide).
-  `ShowOnRetire` / `HideOnRetire` and their stored coordinates are removed. Positions are read when each commit is
-  built, so the #244 jump cannot occur.
-- Pointer motion only updates the intent's position. The #244 cursor-only scheduling pass (CRTC idle →
-  `NONBLOCK | PAGE_FLIP_EVENT`; after EBUSY, wait for the CRTC's next flip event) is unchanged.
-- **Sprite framebuffers.** The sprite goes into a per-device dumb buffer sized to `DRM_CAP_CURSOR_WIDTH/HEIGHT`,
-  image at the top-left corner, as today. Each buffer gets an ARGB8888 framebuffer (AddFB2). `SRC_*` and
-  `CRTC_W/H` cover the whole buffer (no scaling); `CRTC_X/Y` = pointer − hotspot. An image change writes the
-  alternate buffer (two per device) and switches `FB_ID`. A replaced framebuffer is removed, and its buffer reused,
-  only after the page-flip event of the commit that replaced it.
-- **Tearing (C1).** While tearing is On the intent is `Hidden` and async commits carry no cursor properties, as C1
-  specifies. Whichever of C1 and this work merges second adapts to the other in its rebase.
+### 2.1 Applied state, intent, no-ops
+
+- Per CRTC, yserver tracks the **applied** cursor plane state, which is what the last *accepted* commit set (`fb`,
+  position, hotspot, or detached), and the **intent**, which is what it should be.
+- A commit carries only the cursor properties that differ from the applied state. When the intent equals the applied
+  state (for example motion coalesced B→C→B, or positions equal after integer rounding), the pending work is
+  consumed without an ioctl and without an in-flight or flip-event obligation.
+- The applied state is invalidated (the next commit sends the full cursor state) after DRM master loss and resume,
+  every modeset, and every cursor-plane reassignment. A plane that leaves a CRTC is detached in the same commit that
+  attaches it elsewhere, or in an earlier one.
+
+### 2.2 Who submits what
+
+| Change | Owner |
+|---|---|
+| HW↔SW transition of an output (the scene's `CursorAssignment` changes) | the **scene frame** for that output that stops or starts painting the software cursor: plane show or hide goes in that frame's commit. A frame that is not submitted (no BO, skipped, failed) publishes nothing, and its assignment is not applied by any other commit. |
+| HW-only change while the output stays HW: motion, image/animation frame, hotspot, crossing into or out of an output whose cursor is HW | the **cursor-only commit**, generalized from #244: when the CRTC is idle it sends whatever HW-only intent differs from the applied state (position, `FB_ID`, hotspot, attach/detach), not only positions of an already visible plane. While a frame or direct flip is in flight, the change rides that commit if it has not been built yet, or waits for its event (#244's EBUSY rule). |
+| Show, hide, animation and first bind during **held Vsync direct scanout** | the cursor-only commit (a direct frame never paints a software cursor). This replaces today's direct hooks (`refresh_direct_cursor`, `hide_cursor_under_direct_scanout`, first bind at direct retirement). If the plane cannot take the cursor, direct scanout unflips as today. |
+| DPMS off, VT leave, output removal | the **lifecycle disable commit**: it detaches the cursor plane (`FB_ID=0`, `CRTC_ID=0`) in the same blocking commit that disables the CRTC (§2.4). |
+
+- Per-output cursor mode (HW, SW, Mixed while outputs differ) changes when the commit that carried the transition
+  is accepted, and its flip event retires it as today, so Mixed bookkeeping is kept.
+- `ShowOnRetire` / `HideOnRetire` and their stored coordinates are removed. Every position is read when a commit is
+  built.
+
+### 2.3 Sprite framebuffers
+
+- Sprites live in per-device dumb buffers sized to `DRM_CAP_CURSOR_WIDTH/HEIGHT`, image at the top-left corner, each
+  with an ARGB8888 framebuffer (AddFB2). `SRC_*` and `CRTC_W/H` cover the whole buffer (no scaling); `CRTC_X/Y` =
+  pointer − hotspot.
+- A framebuffer has a **user count**: every CRTC whose applied state, submitted (in-flight) commit or built-but-
+  unsent commit references it. A buffer is rewritten, and its framebuffer removed, only at user count zero. This
+  covers several outputs showing the same sprite and retiring at different times.
+- An image change, and also a **hotspot-only change**, writes a free buffer and switches `FB_ID`. Virtio forwards
+  the hotspot to the host only on a framebuffer change (`virtgpu_plane.c`).
+- When no buffer is free, the newest wanted image stays pending (older pending images are dropped) and is written
+  when a buffer's user count reaches zero. A live buffer is never overwritten. The pool starts with two buffers per
+  device and may grow to one per CRTC plus one.
+
+### 2.4 Lifecycle
+
+- DPMS off, VT leave and output removal send one blocking commit that disables the CRTC and detaches its cursor
+  plane. On success the applied state is detached, and framebuffers whose last user was that CRTC are reclaimed
+  after the old flip events have drained (blocking all-off commits produce no replacing event). On failure the
+  previous ownership is kept and today's error path runs.
+- Resume and modeset start from an invalidated applied state (§2.1).
+
+### 2.5 Tearing (C1)
+
+While tearing is On the intent is detached, and async commits carry no cursor properties, as C1 specifies. Whichever
+of C1 and this work merges second adapts to the other in its rebase.
 
 ## 3. Errors
 
-- **EINVAL on a cursor-only commit:** that CRTC switches to the software cursor (logged once), intent `Hidden`. The
-  scene paints the cursor from its next frame.
-- **EINVAL on a scene or direct commit that carried a cursor change:** retry the same frame without cursor
-  properties and switch that CRTC to the software cursor. If the retry also fails, it is today's flip error path.
+- **Attribution.** As today, a rejected commit that carried cursor properties is tested with `TEST_ONLY` without
+  them, to tell a cursor rejection from a frame rejection (`drm/atomic.rs`).
+- **Cursor-only commit rejected (EINVAL):** the applied state is unchanged (the kernel kept the previous binding).
+  The CRTC is marked *SW-pending*. yserver sends a detach-only commit (`FB_ID=0`, `CRTC_ID=0`). When that is
+  accepted, the output becomes SW and the scene recomposes with the software cursor. If the detach is also rejected,
+  ownership stays HW and the plane is left as it is (logged once). The cursor never shows twice.
+- **Frame commit rejected because of its cursor properties:**
+  - *HW→SW frame (hide):* the frame already paints the software cursor. Retry it with an explicit detach. If that
+    is rejected, retry without cursor properties, keep the output HW and request a new frame without the software
+    cursor.
+  - *SW→HW frame (show):* the frame was rendered without the software cursor. Retry it without cursor properties
+    (one frame without a cursor), keep the output SW and request an immediate recompose with the software cursor.
+  - *HW-only change riding a frame:* retry without cursor properties; the change is handled as a rejected cursor-only
+    change above.
+  - If the retry also fails, it is today's flip error path.
 - **EBUSY:** unchanged from #244, never a cursor failure.
-- A CRTC switched to software by EINVAL retries the plane only on the next topology change or sprite shape/size
-  change. This matches today's `set_cursor2` backoff.
+- **Re-qualification.** The key is (width, height, hotspot), as today's backoff signature. Pixel or animation-frame
+  changes never re-qualify. After a rejection, a CRTC retries the plane once per new key per topology epoch. A
+  rejected key is not retried until the next topology change.
 
 ## 4. Tests (rules A/B/C/F)
 
-1. Through `Backend` / `run_core` with the recording atomic sink: show, hide, image change and motion. Every commit
-   carries the right `FB_ID`/`CRTC_ID`/`SRC`/`CRTC`/`HOTSPOT` values. Show and hide share the commit of the frame
-   that stops or starts painting the software cursor. End state: no pending intents, no leaked framebuffers.
-2. #244 jump regression: crossing into a window with another cursor while the pointer moves between the request
-   and the commit. The committed position equals the current pointer. Must fail on master.
-3. Capability matrix: missing plane or any required property → software cursor; `HOTSPOT_X/Y` present → set;
-   hotspot cap rejected → virtual driver CRTCs use software.
-4. Framebuffer lifetime: a replaced framebuffer is removed only after its replacing commit's event. Mutation: remove
-   it at replacement → the test fails.
-5. Gate: no `set_cursor2` / `move_cursor` left under `crates/`.
-6. Error paths: EINVAL cursor-only → SW; EINVAL on a frame commit → retried without cursor, then SW; EBUSY → no SW.
+All through `Backend` / `run_core` with the recording atomic sink and controllable flip events. End state for each:
+no pending intents, no in-flight obligations, no leaked framebuffers.
+
+1. Show, hide, image change and motion: each commit carries the right `FB_ID`/`CRTC_ID`/`SRC`/`CRTC`/`HOTSPOT`.
+   Show and hide share the commit of the frame that stops or starts painting the software cursor.
+2. **#244 jump regression:** drive the real window-enter path (pointer crosses into a window with another cursor),
+   defer submission and retirement, move the pointer from P0 to P1 in between, and record the **whole** cursor
+   operation trace: atomic properties, and on master the legacy ioctl seam. Assert that nothing after the motion
+   sets P0. Must fail on master.
+3. Capability matrix: missing plane or any required property → SW. Physical driver with the cap rejected → HW still
+   eligible. Virtual driver with the cap rejected **and the plane exposed** → SW. Virtual driver with the cap
+   accepted and `HOTSPOT_X/Y` present → HW with hotspot set.
+4. Framebuffer lifetime: two outputs share a sprite and retire at staggered times; one output skips frames; an
+   animation arrives while every buffer is in use. No buffer is rewritten or removed while any user remains.
+   Mutation: release at the first replacing event → fails.
+5. Ownership: a held direct frame with no successor gets show, hide, animation and first bind through cursor-only
+   commits. A skipped (no-BO) frame does not publish its assignment. Cross-output motion. Mixed mode.
+6. Lifecycle: DPMS off/on, VT leave/resume and output removal detach the plane in the disable commit and reclaim
+   after the drain. A failed disable keeps ownership. Resume sends the full state.
+7. No-op: B→C→B coalescing and integer-equal motion produce no ioctl and no event obligation.
+8. Hotspot-only change switches `FB_ID` (virtio needs it).
+9. Errors: every §3 case, including a rejected detach (no double cursor), a SW→HW show failure (one cursorless
+   frame, then a SW recompose), and repeated rejected animation frames (no retry loop: one retry per key per epoch).
+10. Gate: no `set_cursor2` / `move_cursor` left under `crates/`.
 
 ## 5. Hardware validation (with the user's approval, per card)
 
 - NVIDIA (card1): motion, drag, animated cursor; 0 core stalls (#244's criterion); EBUSY within #244's numbers.
 - AMD iGPU (card0): the same, plus Vsync direct scanout with a visible cursor and Plasma X11 window drags.
-- virtio-gpu VM on kernel ≥ 6.6: the guest hotspot matches the host cursor. If no VM is available, the PR lists it
+- virtio-gpu VM on kernel ≥ 6.8: the guest hotspot matches the host cursor. If no VM is available, the PR lists it
   as pending validation.
