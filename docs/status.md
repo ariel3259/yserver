@@ -116,9 +116,48 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   predicate combines XFIXES state, missing cursor images, and image transparency
   across scene visibility, direct scanout, tearing handoff, pointer motion, and
   VT/DPMS rearm. Cursor tests cover core, glyph, RENDER, recolor, animation, and
-  transparent-to-opaque handoff. The ignored tearing suite's other 49 tests pass
-  under lavapipe; `entry_waits_for_queued_show_on_retire` reaches its assertions
-  but the lavapipe worker segfaults during test shutdown.
+  transparent-to-opaque handoff. The segfault seen in
+  `entry_waits_for_queued_show_on_retire` was a real defect: the unflip shadow
+  copy read a null Vulkan image. It now rejects an unavailable image before
+  copying.
+
+- **2026-10-15 tearing-on-demand Task 6 (telemetry and bench):** loop telemetry
+  adds `tearing_summary` (async/vsync submits, EINVAL fallbacks, suspensions,
+  entries and exits) and `present_latency_summary`. In the latter,
+  `async_flip_turnaround` is ioctl to event receipt. `present_to_flip_event`
+  maps the kernel flip timestamp into the submit clock and prints `n/a` when it
+  cannot detect the clock domain (nvidia-drm today).
+  `tools/cursor-bench/tests/tearing.sh` runs mpv (Vulkan immediate/mailbox/fifo)
+  and GL interval 0 with the cursor visible and XFIXES-hidden. `aggregate.sh`
+  summarises the logs and skips unavailable windows. The cursor-only
+  recomposition cap now also covers `run_core`'s `mark_dirty` wake: `build_scene`
+  fell from about 5.7k/s to about 405/s with a moving visible cursor.
+
+- **2026-10-15 tearing-on-demand Amendment B (core supersession parity with
+  Xorg, spec §1b):** the core scraps a pending Present only while it is parked
+  for a future MSC. A due Present waiting for its acquire/source fence executes
+  when the fence signals, in arrival order. It completes as Skip if a newer
+  same-window, same-target Present has already executed. This applies to every
+  Present, not only while tearing; Vsync stays paced by vblank. Before this, an
+  explicit-sync Vulkan client that presents before the GPU finishes (NVIDIA WSI,
+  radv, DXVK, CS2) had almost every frame scrapped: CS2 sent 330–360 Presents/s
+  with 300–340/s scrapped and stuttered. A `run_core`-driven regression with late
+  acquire points covers it.
+
+  Hardware (Xid 0 throughout):
+  - NVIDIA RTX 5060 Ti (driver 615), mpv Vulkan immediate with XFIXES-hidden
+    cursor: 519–549 direct async flips/s, every Present shown, 0 core skips
+    (about 77/s before Amendment B). Present→flip p50 179 µs against about
+    16.6 ms with vsync. GL interval 0: 155 flips/s for 164–186 Presents/s.
+  - NVIDIA, CS2 for about 8 minutes: median 312 direct flips/s (p10 231, max 413),
+    1.0 flip per Present, no second below 60. Menus (composed, cursor visible):
+    median 199/s. The user's verdict: smooth, low-latency play.
+  - AMD iGPU (card0), GL: 329 direct async flips/s (0.999 per Present),
+    present_to_submit 10 µs, async turnaround 58 µs. Composed path with a visible
+    cursor: 474/s at 0.47 ms composite GPU time.
+  - Controls: mpv mailbox and fifo never entered tearing.
+  - Known gaps: `present_to_flip_event` is `n/a` on NVIDIA. AMD fifo with a
+    moving cursor runs at about 30 flips/s (pre-existing, also on master).
 
 - **2026-10-13 hardware cursor in the wlroots model (branch `feat/atomic-cursor`):** on every device whose
   cursor planes expose `CRTC_X`/`CRTC_Y`, the cursor is driven through atomic commits. Each CRTC has one commit
