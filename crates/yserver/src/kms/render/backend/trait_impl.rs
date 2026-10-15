@@ -1767,8 +1767,8 @@ impl<P: Platform> Backend for XBackend<P> {
         P::arm_present_completion_idle_vblanks(self, crtc_id, target_mscs)
     }
 
-    fn present_capabilities(&self, window: u32) -> PresentCaps {
-        P::present_capabilities(self, window)
+    fn present_capabilities(&self, window: u32, crtc_id: u32) -> PresentCaps {
+        P::present_capabilities(self, window, crtc_id)
     }
 
     fn xkb_proxy(

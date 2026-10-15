@@ -14,6 +14,7 @@ mod render_clip;
 mod render_picture;
 mod root_scanout;
 mod stacking;
+mod tearing;
 mod vt_session;
 mod window_border;
 mod window_tree;
@@ -148,6 +149,7 @@ fn push_test_device(backend: &mut KmsBackend, key: DrmDeviceKey) {
         .push(crate::kms::render::platform::KmsDevice {
             key,
             device,
+            async_page_flip: false,
             atomic_commit_sink: std::rc::Rc::new(crate::drm::atomic::AtomicCommitSink::new(
                 std::rc::Rc::new(crate::drm::atomic::DrmAtomicCommitExecutor),
             )),

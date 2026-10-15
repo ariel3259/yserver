@@ -1223,12 +1223,22 @@ impl KmsBackend {
     pub(in crate::kms::render::backend) fn backend_present_present_capabilities(
         &self,
         _window: u32,
+        crtc_id: u32,
     ) -> PresentCaps {
+        let async_flip = self
+            .present_crtc_output(crtc_id)
+            .and_then(|(_, crtc_key)| {
+                self.platform
+                    .device_for_key(crtc_key.device_key)
+                    .map(|device| device.async_page_flip)
+            })
+            .unwrap_or(false);
         // Mirror v1's conservative "Copy-path only" caps. syncobj
         // tracks Dri3Caps::syncobj. flip_path / async_may_tear stay
         // false until alien-BO scanout integration lands on v2.
         PresentCaps {
             flip_path: false,
+            async_flip,
             async_may_tear: false,
             syncobj: self.dri3_capabilities().syncobj,
         }

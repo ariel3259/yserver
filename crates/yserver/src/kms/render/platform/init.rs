@@ -341,9 +341,18 @@ impl PlatformBackend {
             .into_iter()
             .map(|device| {
                 let cursor = KmsCursorState::new();
+                let async_page_flip = {
+                    use ::drm::Device as _;
+                    device
+                        .device
+                        .get_driver_capability(::drm::DriverCapability::AtomicASyncPageFlip)
+                        .ok()
+                        .is_some_and(|value| value != 0)
+                };
                 KmsDevice {
                     key: device.key,
                     device: device.device,
+                    async_page_flip,
                     atomic_commit_sink: Rc::new(crate::drm::atomic::AtomicCommitSink::new(
                         Rc::new(crate::drm::atomic::DrmAtomicCommitExecutor),
                     )),
@@ -783,6 +792,7 @@ impl PlatformBackend {
             devices: vec![KmsDevice {
                 key: device_key,
                 device,
+                async_page_flip: false,
                 atomic_commit_sink: Rc::new(crate::drm::atomic::AtomicCommitSink::new(Rc::new(
                     crate::drm::atomic::DrmAtomicCommitExecutor,
                 ))),

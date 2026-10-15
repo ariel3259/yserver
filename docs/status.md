@@ -76,6 +76,12 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   (`surface::tests`); the AppKit layer (`src/macos/`) is compiled and run on macOS only. No input yet (M2).
   Recipe: `just macos-run [display] [geometry] [log]`.
 
+- **2026-10-14 tearing-on-demand Task 1:** Each opened KMS device now records
+  `DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP`; Present `Async` capability follows the
+  device owning a window's selected CRTC. `AsyncMayTear` remains unset and no
+  page-flip behavior changes in this task. Protocol and encoding tests cover
+  the advertisement; hardware validation remains in Task 6.
+
 - **2026-10-13 hardware cursor in the wlroots model (branch `feat/atomic-cursor`):** on every device whose
   cursor planes expose `CRTC_X`/`CRTC_Y`, the cursor is driven through atomic commits. Each CRTC has one commit
   stream with at most one commit in flight:

@@ -638,8 +638,8 @@ impl Platform for PlatformBackend {
         KmsBackend::backend_present_arm_present_completion_idle_vblanks(b, crtc_id, target_mscs)
     }
 
-    fn present_capabilities(b: &KmsBackend, window: u32) -> PresentCaps {
-        KmsBackend::backend_present_present_capabilities(b, window)
+    fn present_capabilities(b: &KmsBackend, window: u32, crtc_id: u32) -> PresentCaps {
+        KmsBackend::backend_present_present_capabilities(b, window, crtc_id)
     }
 
     fn dpms_capable(_b: &KmsBackend) -> bool {

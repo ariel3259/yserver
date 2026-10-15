@@ -566,7 +566,7 @@ pub trait Platform: OutputSink + Sized + 'static {
         Ok(0)
     }
 
-    fn present_capabilities(_b: &XBackend<Self>, _window: u32) -> PresentCaps {
+    fn present_capabilities(_b: &XBackend<Self>, _window: u32, _crtc_id: u32) -> PresentCaps {
         PresentCaps::default()
     }
 

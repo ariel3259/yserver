@@ -1524,7 +1524,15 @@ pub(super) fn handle_present_request(
         }
         x11present::QUERY_CAPABILITIES => {
             let target = x11present::parse_query_capabilities(body).unwrap_or(0);
-            let caps = backend.present_capabilities(target).encode();
+            let target_resource = ResourceId(target);
+            let crtc_id = if state.resources.window(target_resource).is_some() {
+                default_present_crtc_for_window(state, target_resource)
+            } else if present_crtc_exists(state, target) {
+                target
+            } else {
+                0
+            };
+            let caps = backend.present_capabilities(target, crtc_id).encode();
             debug!(
                 "client {} #{} PRESENT::QueryCapabilities target=0x{target:x} -> 0x{caps:x}",
                 client_id.0, sequence.0
@@ -1666,7 +1674,7 @@ pub(super) fn handle_present_request(
             // off here when the cap isn't advertised. Computed up
             // front so the deferred-completion enqueue (inside the
             // `if let` below) uses the masked options.
-            let caps = backend.present_capabilities(req.window);
+            let caps = backend.present_capabilities(req.window, domain.crtc_id);
             let masked_options = if caps.async_may_tear {
                 req.options
             } else {
@@ -2103,13 +2111,6 @@ pub(super) fn handle_present_request(
                     PRESENT_MAJOR_OPCODE,
                 );
             }
-            let caps = backend.present_capabilities(req.window);
-            let masked_options = if caps.async_may_tear {
-                req.options
-            } else {
-                const PRESENT_OPTION_ASYNC_MAY_TEAR: u32 = 0x10;
-                req.options & !PRESENT_OPTION_ASYNC_MAY_TEAR
-            };
             let domain =
                 match select_present_domain(state, backend, req.window, req.target_crtc, false) {
                     Ok(domain) => domain,
@@ -2125,6 +2126,13 @@ pub(super) fn handle_present_request(
                         );
                     }
                 };
+            let caps = backend.present_capabilities(req.window, domain.crtc_id);
+            let masked_options = if caps.async_may_tear {
+                req.options
+            } else {
+                const PRESENT_OPTION_ASYNC_MAY_TEAR: u32 = 0x10;
+                req.options & !PRESENT_OPTION_ASYNC_MAY_TEAR
+            };
             // INSTRUMENTATION (2026-05-29): synced variant uses acquire_syncobj
             // (explicit-sync timeline) as its wait. Log src kind+SIZE + the
             // acquire/release syncobj so a blank run shows whether content-sized

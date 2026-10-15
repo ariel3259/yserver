@@ -379,6 +379,8 @@ struct TerminalDisposableProbeMarker {
 pub(crate) struct KmsDevice {
     pub(crate) key: crate::platform::drm::DrmDeviceKey,
     pub(crate) device: Rc<drm::Device>,
+    /// `DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP`, sampled once when this KMS device opens.
+    pub(crate) async_page_flip: bool,
     pub(crate) atomic_commit_sink: Rc<crate::drm::atomic::AtomicCommitSink>,
     pub(crate) page_flip_event_source: Rc<dyn flip_events::PageFlipEventSource>,
     #[cfg(test)]
