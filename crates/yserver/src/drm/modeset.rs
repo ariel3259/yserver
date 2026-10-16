@@ -1140,15 +1140,65 @@ pub(crate) fn disable_output_with_executor(
     output: &Output,
     executor: &dyn AtomicCommitExecutor,
 ) -> io::Result<()> {
+    disable_output_with_cursor_executor(device, output, None, executor)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct DisableOutputPropertyHandles {
+    pub(crate) connector_crtc_id: property::Handle,
+    pub(crate) crtc_active: property::Handle,
+    pub(crate) crtc_mode_id: property::Handle,
+}
+
+#[cfg(test)]
+impl DisableOutputPropertyHandles {
+    pub(crate) fn for_tests() -> Self {
+        Self {
+            connector_crtc_id: ::drm::control::from_u32(0xD001).expect("test property handle"),
+            crtc_active: ::drm::control::from_u32(0xD002).expect("test property handle"),
+            crtc_mode_id: ::drm::control::from_u32(0xD003).expect("test property handle"),
+        }
+    }
+}
+
+pub(crate) fn disable_output_with_cursor_executor(
+    device: &Device,
+    output: &Output,
+    cursor_detach: Option<crate::drm::atomic::AtomicCursorPlaneDetach>,
+    executor: &dyn AtomicCommitExecutor,
+) -> io::Result<()> {
     let connector_props = PropMap::for_object(device, output.connector)?;
     let crtc_props = PropMap::for_object(device, output.crtc)?;
 
+    disable_output_with_properties(
+        device,
+        output,
+        cursor_detach,
+        DisableOutputPropertyHandles {
+            connector_crtc_id: connector_props.id("CRTC_ID")?,
+            crtc_active: crtc_props.id("ACTIVE")?,
+            crtc_mode_id: crtc_props.id("MODE_ID")?,
+        },
+        executor,
+    )
+}
+
+pub(crate) fn disable_output_with_properties(
+    device: &Device,
+    output: &Output,
+    cursor_detach: Option<crate::drm::atomic::AtomicCursorPlaneDetach>,
+    properties: DisableOutputPropertyHandles,
+    executor: &dyn AtomicCommitExecutor,
+) -> io::Result<()> {
     let mut req = AtomicCommitRequest::new();
+    if let Some(cursor_detach) = cursor_detach {
+        cursor_detach.add_to(&mut req);
+    }
     req.add_raw_property(output.plane.into(), output.plane_fb_id_prop, 0);
     req.add_raw_property(output.plane.into(), output.plane_crtc_id_prop, 0);
-    req.add_raw_property(output.crtc.into(), crtc_props.id("ACTIVE")?, 0);
-    req.add_raw_property(output.crtc.into(), crtc_props.id("MODE_ID")?, 0);
-    req.add_raw_property(output.connector.into(), connector_props.id("CRTC_ID")?, 0);
+    req.add_raw_property(output.crtc.into(), properties.crtc_active, 0);
+    req.add_raw_property(output.crtc.into(), properties.crtc_mode_id, 0);
+    req.add_raw_property(output.connector.into(), properties.connector_crtc_id, 0);
 
     executor
         .atomic_commit(

@@ -137,18 +137,6 @@ impl crate::kms::cursor_plane::CursorShowExecutor for RecordingCursorShowExecuto
     }
 }
 
-pub(crate) fn install_recording_cursor_hide_executor(
-    backend: &mut KmsBackend,
-    device_idx: usize,
-    executor: Rc<RecordingCursorHideExecutor>,
-) {
-    backend.platform.devices[device_idx]
-        .cursor
-        .plane
-        .as_mut()
-        .expect("test cursor plane is installed")
-        .for_tests_set_hide_executor(executor);
-}
 use yserver_core::{
     backend::{Backend, CrtcConfigApply, CrtcConfigToken, Dri3Caps, ModeSpec},
     core_loop::{CoreSender, Message},

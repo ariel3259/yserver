@@ -8,8 +8,9 @@ pub(in crate::kms::render) trait OutputPowerExecutor {
 
     fn disable(
         &self,
-        device: &drm::Device,
+        _device: &drm::Device,
         output: &crate::platform::drm::Output,
+        cursor_detach: Option<crate::drm::atomic::AtomicCursorPlaneDetach>,
         services: &super::services::KmsServices,
     ) -> io::Result<()>;
 
@@ -29,9 +30,15 @@ impl OutputPowerExecutor for DrmOutputPowerExecutor {
         &self,
         device: &drm::Device,
         output: &crate::platform::drm::Output,
+        cursor_detach: Option<crate::drm::atomic::AtomicCursorPlaneDetach>,
         services: &super::services::KmsServices,
     ) -> io::Result<()> {
-        drm::modeset::disable_output_with_executor(device, output, services.atomic.as_ref())
+        drm::modeset::disable_output_with_cursor_executor(
+            device,
+            output,
+            cursor_detach,
+            services.atomic.as_ref(),
+        )
     }
 
     fn enable(
@@ -83,7 +90,8 @@ impl OutputPowerExecutor for RecordingOutputPowerExecutor {
         &self,
         _device: &drm::Device,
         output: &crate::platform::drm::Output,
-        _services: &super::services::KmsServices,
+        cursor_detach: Option<crate::drm::atomic::AtomicCursorPlaneDetach>,
+        services: &super::services::KmsServices,
     ) -> io::Result<()> {
         self.records.borrow_mut().push(OutputPowerRecord {
             enabled: false,
@@ -91,7 +99,13 @@ impl OutputPowerExecutor for RecordingOutputPowerExecutor {
             crtc: output.crtc,
             framebuffer: None,
         });
-        Ok(())
+        drm::modeset::disable_output_with_properties(
+            _device,
+            output,
+            cursor_detach,
+            drm::modeset::DisableOutputPropertyHandles::for_tests(),
+            services.atomic.as_ref(),
+        )
     }
 
     fn enable(
@@ -174,25 +188,30 @@ impl PlatformBackend {
         }
 
         let mut first_err: Option<io::Error> = None;
-        for (i, layout) in self.outputs.iter().enumerate() {
+        for i in 0..self.outputs.len() {
+            let output_key = self.outputs[i].key.clone();
+            let connector_name = self.outputs[i].output.connector_name.clone();
             let Some(device) = self
-                .device_for_output(&layout.key)
+                .device_for_output(&output_key)
                 .map(|device| Rc::clone(&device.device))
             else {
                 log::warn!(
                     "render disable_output: no DRM device {} for {}",
-                    layout.key.device_key,
-                    layout.output.connector_name,
+                    output_key.device_key,
+                    connector_name,
                 );
                 continue;
             };
-            if let Err(e) =
-                self.output_power_executor
-                    .disable(&device, &layout.output, &self.services)
-            {
+            let cursor_detach = self.cursor_plane_detach_for_output(i);
+            if let Err(e) = self.output_power_executor.disable(
+                &device,
+                &self.outputs[i].output,
+                cursor_detach,
+                &self.services,
+            ) {
                 log::warn!(
                     "render disable_output: failed for {} (output {i}): {e}",
-                    layout.output.connector_name,
+                    connector_name,
                 );
                 // Disarm the matching scanout pool so its Drop
                 // doesn't try to destroy framebuffers KMS may
@@ -200,9 +219,12 @@ impl PlatformBackend {
                 if let Some(pool) = self.scanout_pools.get_mut(i).and_then(|p| p.as_mut()) {
                     pool.disarm();
                 }
+                self.quarantine_cursor_output(i);
                 if first_err.is_none() {
                     first_err = Some(e);
                 }
+            } else {
+                self.accept_cursor_lifecycle_detach(i);
             }
         }
         match first_err {
@@ -316,16 +338,18 @@ impl PlatformBackend {
                 }
             }
         } else {
-            for layout in &self.outputs {
+            for output_idx in 0..self.outputs.len() {
+                let output_key = self.outputs[output_idx].key.clone();
+                let connector_name = self.outputs[output_idx].output.connector_name.clone();
                 let Some(device) = self
-                    .device_for_output(&layout.key)
+                    .device_for_output(&output_key)
                     .map(|device| Rc::clone(&device.device))
                 else {
                     let error = io::Error::new(
                         io::ErrorKind::NotFound,
                         format!(
                             "dpms_set_outputs_active(false): no DRM device {} for {}",
-                            layout.key.device_key, layout.output.connector_name,
+                            output_key.device_key, connector_name,
                         ),
                     );
                     log::error!("{error}");
@@ -334,17 +358,23 @@ impl PlatformBackend {
                     }
                     continue;
                 };
-                if let Err(e) =
-                    self.output_power_executor
-                        .disable(&device, &layout.output, &self.services)
-                {
+                let cursor_detach = self.cursor_plane_detach_for_output(output_idx);
+                if let Err(e) = self.output_power_executor.disable(
+                    &device,
+                    &self.outputs[output_idx].output,
+                    cursor_detach,
+                    &self.services,
+                ) {
                     log::error!(
                         "dpms_set_outputs_active(false): disable_output for {} failed: {e}",
-                        layout.output.connector_name,
+                        connector_name,
                     );
                     if first_err.is_none() {
                         first_err = Some(e);
                     }
+                    self.quarantine_cursor_output(output_idx);
+                } else {
+                    self.accept_cursor_lifecycle_detach(output_idx);
                 }
             }
         }

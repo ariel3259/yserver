@@ -23,6 +23,8 @@ impl SpriteBufferLease {
 struct SpriteBuffer {
     buffer: CursorBuffer,
     version: Option<u64>,
+    users: usize,
+    prepared_users: usize,
 }
 
 /// A per-DRM-device pool. All framebuffer allocations use driver cursor-cap
@@ -32,6 +34,7 @@ pub(crate) struct SpritePool {
     width: u32,
     height: u32,
     buffers: Vec<SpriteBuffer>,
+    max_buffers: usize,
     wanted: Option<WantedSprite>,
     candidate: Option<SpriteBufferLease>,
 }
@@ -49,9 +52,22 @@ impl SpritePool {
             width,
             height,
             buffers: Vec::new(),
+            max_buffers: 2,
             wanted: None,
             candidate: None,
         }
+    }
+
+    pub(crate) fn set_active_crtc_count(&mut self, count: usize) {
+        self.max_buffers = count.saturating_add(1).max(2);
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        for buffer in std::mem::take(&mut self.buffers) {
+            std::mem::forget(buffer);
+        }
+        self.candidate = None;
+        self.wanted = None;
     }
 
     pub(crate) fn prepare(
@@ -90,7 +106,7 @@ impl SpritePool {
             };
             let second = match CursorBuffer::allocate(
                 Rc::clone(&device),
-                io,
+                Rc::clone(&io),
                 self.width,
                 self.height,
             ) {
@@ -108,20 +124,16 @@ impl SpritePool {
                 SpriteBuffer {
                     buffer: first,
                     version: None,
+                    users: 0,
+                    prepared_users: 0,
                 },
                 SpriteBuffer {
                     buffer: second,
                     version: None,
+                    users: 0,
+                    prepared_users: 0,
                 },
             ];
-        } else if self.buffers.len() < 2 {
-            match CursorBuffer::allocate(device, io, self.width, self.height) {
-                Ok(buffer) => self.buffers.push(SpriteBuffer {
-                    buffer,
-                    version: None,
-                }),
-                Err(error) => return allocation_outcome(error),
-            }
         }
 
         let wanted_version = self
@@ -136,8 +148,28 @@ impl SpritePool {
             return Ok(CursorUploadOutcome::Ready);
         }
         let slot = self
-            .candidate
-            .map_or(0, |previous| (previous.slot + 1) % self.buffers.len());
+            .buffers
+            .iter()
+            .enumerate()
+            .find(|(_, buffer)| buffer.users == 0 && buffer.prepared_users == 0)
+            .map(|(slot, _)| slot);
+        let slot = if let Some(slot) = slot {
+            slot
+        } else if self.buffers.len() < self.max_buffers {
+            let buffer = match CursorBuffer::allocate(device, io, self.width, self.height) {
+                Ok(buffer) => buffer,
+                Err(error) => return allocation_outcome(error),
+            };
+            self.buffers.push(SpriteBuffer {
+                buffer,
+                version: None,
+                users: 0,
+                prepared_users: 0,
+            });
+            self.buffers.len() - 1
+        } else {
+            return Ok(CursorUploadOutcome::Deferred);
+        };
         let wanted = self.wanted.as_ref().expect("wanted sprite is retained");
         match self.buffers[slot]
             .buffer
@@ -174,6 +206,51 @@ impl SpritePool {
             .map(|buffer| u32::from(buffer.buffer.fb_id()))
     }
 
+    pub(crate) fn reserve(&mut self, lease: SpriteBufferLease) -> bool {
+        let Some(buffer) = self.buffers.get_mut(lease.slot) else {
+            return false;
+        };
+        if buffer.version != Some(lease.version) {
+            return false;
+        }
+        buffer.prepared_users = buffer.prepared_users.saturating_add(1);
+        true
+    }
+
+    pub(crate) fn accept_reserved(&mut self, lease: SpriteBufferLease) -> bool {
+        let Some(buffer) = self.buffers.get_mut(lease.slot) else {
+            return false;
+        };
+        if buffer.version != Some(lease.version) || buffer.prepared_users == 0 {
+            return false;
+        }
+        buffer.prepared_users -= 1;
+        buffer.users = buffer.users.saturating_add(1);
+        true
+    }
+
+    pub(crate) fn reject_reserved(&mut self, lease: SpriteBufferLease) -> bool {
+        let Some(buffer) = self.buffers.get_mut(lease.slot) else {
+            return false;
+        };
+        if buffer.version != Some(lease.version) || buffer.prepared_users == 0 {
+            return false;
+        }
+        buffer.prepared_users -= 1;
+        true
+    }
+
+    pub(crate) fn release_user(&mut self, lease: SpriteBufferLease) -> bool {
+        let Some(buffer) = self.buffers.get_mut(lease.slot) else {
+            return false;
+        };
+        if buffer.version != Some(lease.version) || buffer.users == 0 {
+            return false;
+        }
+        buffer.users -= 1;
+        true
+    }
+
     #[allow(
         dead_code,
         reason = "A5 cancels candidates rejected before atomic submission"
@@ -182,9 +259,30 @@ impl SpritePool {
         if self.candidate != Some(lease) {
             return false;
         }
-        drop(self.buffers.remove(lease.slot));
+        let Some(buffer) = self.buffers.get_mut(lease.slot) else {
+            return false;
+        };
+        if buffer.users != 0 || buffer.prepared_users != 0 {
+            return false;
+        }
+        buffer.version = None;
         self.candidate = None;
         true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn user_count(&self, lease: SpriteBufferLease) -> Option<usize> {
+        self.buffers
+            .get(lease.slot)
+            .filter(|buffer| buffer.version == Some(lease.version))
+            .map(|buffer| buffer.users)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn all_users_zero(&self) -> bool {
+        self.buffers
+            .iter()
+            .all(|buffer| buffer.users == 0 && buffer.prepared_users == 0)
     }
 
     #[cfg(test)]

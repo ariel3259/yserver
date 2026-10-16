@@ -275,8 +275,12 @@ fn define_visible_cursor_rebinds_held_vsync_direct_scanout() {
     Backend::define_cursor(&mut backend, None, root, visible.as_raw())
         .expect("select opaque root cursor while direct scanout is held");
     assert!(!backend.effective_cursor_hidden());
-    assert_eq!(show_executor.calls().len(), 1);
-    assert_eq!(hide_executor.calls().len(), 0);
+    assert!(show_executor.calls().is_empty());
+    assert!(hide_executor.calls().is_empty());
+    assert_commit_sequence(
+        &recorder,
+        &[AtomicCommitKind::Scene, AtomicCommitKind::CursorOnly],
+    );
     assert!(backend.platform.any_cursor_plane_visible());
     assert!(backend.pstate.scanout_m2.active());
     assert!(backend.pstate.scanout_m2.hold_direct);

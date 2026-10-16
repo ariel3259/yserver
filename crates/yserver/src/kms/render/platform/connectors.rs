@@ -262,14 +262,19 @@ impl PlatformBackend {
         );
 
         // DRM disable (ALLOW_MODESET atomic commit zeroing the CRTC).
-        if let Err(e) = crate::drm::modeset::disable_output_with_executor(
+        let cursor_detach = self.cursor_plane_detach_for_output(idx);
+        if let Err(e) = crate::drm::modeset::disable_output_with_cursor_executor(
             &device,
             &self.outputs[idx].output,
+            cursor_detach,
             self.services.atomic.as_ref(),
         ) {
             log::error!("render disable_connector: disable_output({connector}) failed: {e}");
+            self.quarantine_cursor_output(idx);
             return Err(e);
         }
+
+        self.accept_cursor_lifecycle_detach(idx);
 
         self.remove_connector_at(idx);
 

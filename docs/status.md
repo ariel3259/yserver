@@ -33,6 +33,27 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-10-16 atomic-cursor-only A5:** eligible hardware cursor show, move,
+  and hide operations use owned full-state atomic commits. Accepted state is
+  the visibility source, and prior sprite leases stay held until their event.
+  Blocking output disable requests carry an atomic cursor detach. The held-
+  direct tearing handoff waits for its detach event before software reveal or
+  async primary submission. Recording-sink tests cover full attach geometry,
+  rejected attach/detach ownership, event retirement, and the C1 adapters. Four
+  targeted mutations failed their intended assertions and were reverted. The
+  three new lavapipe scenarios and adapted C1 handoff each passed 20/20 under
+  16 busy loops. Nightly/stable formatting, yserver build, default and whole
+  ignored workspace suites, standalone default/ignored render acceptance,
+  default and workspace Clippy, and layout passed. The default workspace run
+  had 1,158 yserver, 1,732 core, 494 protocol, and 582 render tests pass. The
+  ignored workspace run had 174 yserver, 1 DRI3 fd-leak, 10 GLX TFP, 191 render
+  acceptance, 64 yserver-render, and 2 doctests pass, with no capability skips.
+  Stable rustfmt printed its configured nightly-only option notices, and Mesa
+  printed device-info lookup diagnostics; neither affected test results.
+  Obsolete tests that fabricated cursor bindings or scene modes were mapped to
+  the Backend-path ownership/adapter and direct-successor tests in the task
+  report. No hardware validation was run; controller Task C11 owns it.
+
 - **2026-10-16 atomic-cursor-only A4:** a per-device
   sprite pool now stages two driver-capacity ARGB8888 framebuffers at the
   existing cursor upload boundary. It retains the newest wanted image on

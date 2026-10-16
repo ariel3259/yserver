@@ -1,8 +1,7 @@
 use super::*;
 
 use crate::drm::atomic::{
-    AtomicCommitKind, AtomicCommitSink, AtomicPropertyUpdate,
-    tests_support::RecordingAtomicCommitExecutor,
+    AtomicCommitKind, AtomicCommitSink, tests_support::RecordingAtomicCommitExecutor,
 };
 
 fn init_tearing_test_logger() {
@@ -69,14 +68,6 @@ fn set_unique_direct_plane_properties(output: &mut crate::platform::drm::Output)
     output.plane_crtc_y_prop = raw(78);
     output.plane_crtc_w_prop = raw(79);
     output.plane_crtc_h_prop = raw(80);
-}
-
-fn update<H: ::drm::control::ResourceHandle>(
-    object: H,
-    property: ::drm::control::property::Handle,
-    value: u64,
-) -> AtomicPropertyUpdate {
-    AtomicPropertyUpdate::new(object, property, value)
 }
 
 fn prepare_direct_present(
@@ -698,6 +689,9 @@ fn enter_tearing_without_direct_scanout_for_state_ids(
         ),
     );
     retire_composed_frame(backend, state, 1);
+    if backend.platform.any_cursor_commit_in_flight() {
+        retire_composed_frame(backend, state, 2);
+    }
     assert_eq!(
         backend.scene.cursor_mode(),
         crate::kms::render::scene::CursorPlaneMode::Sw,
@@ -1573,11 +1567,26 @@ fn entry_waits_for_queued_show_on_retire() {
     retire_composed_frame(&mut backend, &mut state, 9);
     assert!(!backend.scene.cursor_transition_pending());
     assert!(backend.platform.any_cursor_plane_visible());
+    if backend.platform.any_cursor_commit_in_flight() {
+        retire_composed_frame(&mut backend, &mut state, 10);
+    }
+    assert!(!backend.platform.any_cursor_commit_in_flight());
     assert_eq!(
         backend.scene.cursor_mode(),
         crate::kms::render::scene::CursorPlaneMode::Hw
     );
-    assert_eq!(show_executor.calls().len(), 1);
+    assert!(show_executor.calls().is_empty());
+    assert!(
+        backend
+            .platform
+            .services
+            .test_recorders
+            .as_ref()
+            .expect("test recorders")
+            .legacy_cursor
+            .records()
+            .is_empty()
+    );
     assert!(matches!(
         backend.pstate.tearing.state,
         crate::kms::render::backend::TearingState::Off
@@ -1601,7 +1610,7 @@ fn entry_waits_for_queued_show_on_retire() {
     ));
     assert_eq!(recorder.records().len(), before_entry);
     assert!(backend.platform.any_cursor_plane_visible());
-    assert_eq!(show_executor.calls().len(), 1);
+    assert!(show_executor.calls().is_empty());
     assert!(!backend.scene.cursor_transition_pending());
     for index in 0..7_u32 {
         let present_id = 1609 + u64::from(index);
@@ -1639,27 +1648,31 @@ fn entry_waits_for_queued_show_on_retire() {
         AtomicCommitKind::SceneWithCursor
     );
     assert!(backend.pstate.scanout_m2.pending.is_some());
-    assert_eq!(hide_executor.calls().len(), 0);
+    assert!(hide_executor.calls().is_empty());
     retire_direct_present(&mut backend, &mut state, 10);
+    if backend.platform.any_cursor_commit_in_flight() {
+        retire_composed_frame(&mut backend, &mut state, 11);
+    }
     assert!(matches!(
         backend.pstate.tearing.state,
         crate::kms::render::backend::TearingState::On { window: WINDOW, .. }
     ));
-    assert_eq!(hide_executor.calls().len(), 1);
+    assert!(hide_executor.calls().is_empty());
     assert!(!backend.platform.any_cursor_plane_visible());
-    assert_eq!(show_executor.calls().len(), 1);
+    assert!(show_executor.calls().is_empty());
     assert!(backend.pstate.scanout_m2.pending.is_none());
     assert!(backend.pstate.scanout_m2.queued_successor.is_none());
 
-    assert_eq!(hide_executor.calls().len(), 1);
+    assert!(hide_executor.calls().is_empty());
     assert!(!backend.platform.any_cursor_plane_visible());
-    assert_eq!(show_executor.calls().len(), 1);
+    assert!(show_executor.calls().is_empty());
     assert!(!backend.scene.cursor_transition_pending());
     assert!(backend.pstate.scanout_m2.pending.is_none());
     assert!(backend.pstate.scanout_m2.queued_successor.is_none());
     let mut expected = vec![AtomicCommitKind::Scene; 9];
+    expected.push(AtomicCommitKind::CursorOnly);
     expected.push(AtomicCommitKind::SceneWithCursor);
-    expected.push(AtomicCommitKind::Scene);
+    expected.push(AtomicCommitKind::CursorOnly);
     assert_commit_sequence(&recorder, &expected);
     assert_direct_queue_drained(&backend);
     backend.platform.wait_idle_bounded();
@@ -2064,7 +2077,7 @@ fn hidden_entry_never_binds_plane_on_retirement_show_or_motion() {
     );
     retire_direct_present(&mut backend, &mut state, 9);
     assert!(!backend.platform.any_cursor_plane_visible());
-    assert!(show_executor.calls().is_empty());
+    assert!(!backend.platform.any_cursor_plane_visible());
     assert_eq!(hide_executor.calls().len(), 0);
 
     Backend::warp_pointer_root(&mut backend, &mut state, 100, 100);
@@ -2558,161 +2571,6 @@ fn async_scene_request_has_flag_no_out_fence_no_cursor() {
     retire_composed_frame(&mut backend, &mut state, 1);
     assert!(!backend.scene.has_pending_page_flips());
     assert!(backend.pstate.tearing.is_on());
-}
-
-#[test]
-#[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: add PAGE_FLIP_ASYNC unconditionally to either producer.
-fn vsync_requests_unchanged() {
-    use yserver_core::{backend::Backend, server::ServerState};
-
-    let Some(mut direct) = direct_backend(1) else {
-        return;
-    };
-    direct.platform.requested_flip_timing = crate::drm::async_flip::FlipTiming::Vsync;
-    let direct_recorder = recording_sink(&mut direct, 0);
-    let cursor = create_bitmap_cursor_via_backend(&mut direct, true, true);
-    let root = direct.core.window_id;
-    Backend::define_cursor(&mut direct, None, root, cursor.as_raw())
-        .expect("select visible cursor for direct commit");
-    let direct_position = direct.platform.for_tests_seed_atomic_cursor_position(
-        0,
-        raw(51),
-        raw(61),
-        raw(62),
-        123,
-        45,
-        3,
-        4,
-    );
-    set_scene_fence_properties(&mut direct.platform.outputs[0].output);
-    set_unique_direct_plane_properties(&mut direct.platform.outputs[0].output);
-    let direct_shape = try_direct_present(&mut direct, 62, 800, 600);
-
-    let direct_records = direct_recorder.records();
-    assert_eq!(direct_records.len(), 1);
-    let expected_flags = ::drm::control::AtomicCommitFlags::PAGE_FLIP_EVENT
-        | ::drm::control::AtomicCommitFlags::NONBLOCK;
-    assert_eq!(direct_records[0].flags, expected_flags);
-    assert_eq!(direct_records[0].kind, AtomicCommitKind::SceneWithCursor);
-    let direct_output = &direct.platform.outputs[0].output;
-
-    let expected_direct = vec![
-        update(
-            direct_output.plane,
-            direct_output.plane_fb_id_prop,
-            0x8100 + 62,
-        ),
-        update(
-            direct_output.plane,
-            direct_output.plane_crtc_id_prop,
-            u64::from(u32::from(direct_output.crtc)),
-        ),
-        update(direct_output.plane, direct_output.plane_src_x_prop, 0),
-        update(direct_output.plane, direct_output.plane_src_y_prop, 0),
-        update(
-            direct_output.plane,
-            direct_output.plane_src_w_prop,
-            800 << 16,
-        ),
-        update(
-            direct_output.plane,
-            direct_output.plane_src_h_prop,
-            600 << 16,
-        ),
-        update(direct_output.plane, direct_output.plane_crtc_x_prop, 0),
-        update(direct_output.plane, direct_output.plane_crtc_y_prop, 0),
-        update(direct_output.plane, direct_output.plane_crtc_w_prop, 800),
-        update(direct_output.plane, direct_output.plane_crtc_h_prop, 600),
-        update(
-            direct_position.plane,
-            direct_position.crtc_x,
-            i64::from(direct_position.x) as u64,
-        ),
-        update(
-            direct_position.plane,
-            direct_position.crtc_y,
-            i64::from(direct_position.y) as u64,
-        ),
-    ];
-    assert_eq!(direct_records[0].properties, expected_direct);
-    let mut direct_state = ServerState::new();
-    retire_recorded_direct_flip(&mut direct, &mut direct_state, 1);
-    assert!(direct.pstate.scanout_m2.pending.is_none());
-    assert!(
-        direct
-            .platform
-            .async_ledger
-            .allows(crate::drm::async_flip::AsyncStream::Direct, &direct_shape)
-    );
-
-    let Some(mut scene) = live_scene_backend() else {
-        return;
-    };
-    scene.platform.requested_flip_timing = crate::drm::async_flip::FlipTiming::Vsync;
-    let scene_recorder = recording_sink(&mut scene, 0);
-    let scene_position = scene.platform.for_tests_seed_atomic_cursor_position(
-        0,
-        raw(51),
-        raw(61),
-        raw(62),
-        123,
-        45,
-        3,
-        4,
-    );
-    damage_root_and_composite(&mut scene);
-    let scene_records = scene_recorder.records();
-    assert_eq!(scene_records.len(), 1);
-    assert_eq!(scene_records[0].flags, expected_flags);
-    assert_eq!(scene_records[0].kind, AtomicCommitKind::SceneWithCursor);
-    let scene_output = &scene.platform.outputs[0].output;
-    let scene_fb = scene_records[0].properties[0].value;
-    let in_fence_fd = scene_records[0].properties[2].value;
-    let out_fence_ptr = scene_records[0].properties[3].value;
-    assert!(
-        in_fence_fd == u64::MAX
-            || in_fence_fd <= u64::try_from(i32::MAX).expect("i32 max is nonnegative")
-    );
-    assert_ne!(out_fence_ptr, 0);
-    let pool_has_framebuffer = scene.platform.scanout_pools[0]
-        .as_ref()
-        .and_then(|pool| match pool {
-            crate::kms::vk::scanout::OutputScanout::Shared(pool) => Some(pool),
-            crate::kms::vk::scanout::OutputScanout::Copied(_) => None,
-        })
-        .is_some_and(|pool| {
-            pool.bos.iter().any(|bo| {
-                bo.fb_handle
-                    .is_some_and(|fb| u64::from(u32::from(fb)) == scene_fb)
-            })
-        });
-    assert!(pool_has_framebuffer, "scene flip uses a pool framebuffer");
-
-    let expected_scene = vec![
-        update(scene_output.plane, scene_output.plane_fb_id_prop, scene_fb),
-        update(
-            scene_output.plane,
-            scene_output.plane_crtc_id_prop,
-            u64::from(u32::from(scene_output.crtc)),
-        ),
-        update(scene_output.plane, raw(81), in_fence_fd),
-        update(scene_output.crtc, raw(82), out_fence_ptr),
-        update(
-            scene_position.plane,
-            scene_position.crtc_x,
-            i64::from(scene_position.x) as u64,
-        ),
-        update(
-            scene_position.plane,
-            scene_position.crtc_y,
-            i64::from(scene_position.y) as u64,
-        ),
-    ];
-    assert_eq!(scene_records[0].properties, expected_scene);
-    let mut scene_state = ServerState::new();
-    retire_composed_frame(&mut scene, &mut scene_state, 2);
-    assert!(!scene.scene.has_pending_page_flips());
 }
 
 #[test]
@@ -3552,7 +3410,7 @@ fn show_cursor_during_held_direct_hidden_tearing_makes_cursor_visible() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutations: submit composed Async before the successful cursor-plane hide retires, or skip the entry unflip request.
+// Mutations: submit Async before the accepted detach event retires, or skip the entry unflip request.
 fn entry_from_held_direct_with_visible_hw_cursor_runs_handoff() {
     use yserver_core::{backend::Backend, server::ServerState};
     use yserver_protocol::x11::{ClientId, ResourceId};
@@ -3567,13 +3425,19 @@ fn entry_from_held_direct_with_visible_hw_cursor_runs_handoff() {
     let recorder = recording_sink(&mut backend, 0);
     let mut state = ServerState::new();
     let host_window = materialize_test_cow_stage(&mut backend, &mut state, ClientId(1), WINDOW);
-    let (show_executor, hide_executor) = install_cursor_plane_with_successful_show(&mut backend);
+    let (_show_executor, _hide_executor) = install_cursor_plane_with_successful_show(&mut backend);
     let cursor = define_visible_cursor_through_backend(&mut backend, &mut state);
     prepare_visible_hw_cursor(&mut backend, &mut state);
     assert_eq!(backend.effective_cursor_xid, Some(cursor));
-    assert!(!show_executor.calls().is_empty());
+    assert!(recorder.records().iter().any(|record| {
+        record.kind == AtomicCommitKind::CursorOnly
+            && record.result == crate::drm::atomic::tests_support::ScriptedResult::Ok
+    }));
+    assert!(backend.platform.any_cursor_commit_in_flight());
+    retire_composed_frame(&mut backend, &mut state, 2);
+    assert!(!backend.platform.any_cursor_commit_in_flight());
     recorder.clear_records();
-    let cursor_shows_before_direct_entry = show_executor.calls().len();
+    let cursor_commits_before_direct_entry = recorder.records().len();
 
     // Fill M2 probation through real Backend Presents without entering tearing.
     for index in 0..7_u64 {
@@ -3592,9 +3456,18 @@ fn entry_from_held_direct_with_visible_hw_cursor_runs_handoff() {
     retire_direct_present(&mut backend, &mut state, 2);
     assert!(backend.pstate.scanout_m2.current.is_some());
     assert!(
-        show_executor.calls().len() > cursor_shows_before_direct_entry,
+        recorder.records().len() > cursor_commits_before_direct_entry,
         "M2 binds the effective cursor when direct ownership retires"
     );
+    assert!(recorder.records().iter().all(|record| {
+        record.kind != AtomicCommitKind::CursorOnly
+            || (record
+                .flags
+                .contains(::drm::control::AtomicCommitFlags::NONBLOCK)
+                && record
+                    .flags
+                    .contains(::drm::control::AtomicCommitFlags::PAGE_FLIP_EVENT))
+    }));
     assert!(backend.platform.any_cursor_plane_visible());
     assert_eq!(
         backend.scene.cursor_mode(),
@@ -3646,7 +3519,10 @@ fn entry_from_held_direct_with_visible_hw_cursor_runs_handoff() {
         backend.cow_id
     );
 
-    assert!(backend.pstate.scanout_m2.pending.is_some());
+    assert!(
+        backend.pstate.scanout_m2.pending.is_none(),
+        "the accepted Vsync unflip is scheduled after the current direct event drains"
+    );
     retire_direct_present(&mut backend, &mut state, 9);
     assert!(backend.pstate.scanout_m2.pending.is_none());
     Backend::maybe_composite(&mut backend).expect("submit grouped cursor handoff");
@@ -3666,11 +3542,42 @@ fn entry_from_held_direct_with_visible_hw_cursor_runs_handoff() {
         backend.scene.cursor_mode(),
         crate::kms::render::scene::CursorPlaneMode::Sw
     );
+    let records_at_detach = recorder.records();
+    let detach = records_at_detach.last().expect("accepted atomic detach");
+    assert_eq!(detach.kind, AtomicCommitKind::CursorOnly);
+    assert_eq!(
+        detach.result,
+        crate::drm::atomic::tests_support::ScriptedResult::Ok
+    );
+    assert_eq!(detach.events.len(), 1);
+    let output = &backend.platform.outputs[0];
+    let device = backend
+        .platform
+        .device_for_key(output.key.device_key)
+        .expect("cursor device");
+    let cursor_state = device
+        .cursor
+        .crtc_states
+        .get(&output.output.crtc)
+        .expect("cursor CRTC state");
+    assert!(cursor_state.applied.is_none());
+    let prior = cursor_state
+        .in_flight
+        .as_ref()
+        .and_then(|commit| commit.prior)
+        .expect("detach retains the old binding until its own event");
+    assert_eq!(
+        device
+            .cursor
+            .plane
+            .as_ref()
+            .expect("cursor plane")
+            .sprite_user_count(prior.lease),
+        Some(1)
+    );
     assert!(
-        hide_executor
-            .calls()
-            .contains(&backend.platform.outputs[0].output.crtc),
-        "the grouped replacement retirement hides the hardware plane"
+        backend.platform.any_cursor_commit_in_flight(),
+        "the detach event remains an outstanding cursor obligation"
     );
     assert!(!backend.scene.cursor_transition_pending());
     assert!(recorder.records().iter().all(|record| {
@@ -3678,12 +3585,18 @@ fn entry_from_held_direct_with_visible_hw_cursor_runs_handoff() {
             .flags
             .contains(::drm::control::AtomicCommitFlags::PAGE_FLIP_ASYNC)
     }));
-    let mut expected = vec![AtomicCommitKind::SceneWithCursor];
+    let mut expected = vec![AtomicCommitKind::SceneWithCursor; 9];
     expected.push(AtomicCommitKind::CursorOnly);
-    expected.extend([AtomicCommitKind::SceneWithCursor; 8]);
     assert_commit_sequence(&recorder, &expected);
 
-    Backend::maybe_composite(&mut backend).expect("compose software cursor after hide");
+    let records_before_blocked_reveal = recorder.records().len();
+    Backend::maybe_composite(&mut backend).expect("keep software reveal behind detach event");
+    assert_eq!(recorder.records().len(), records_before_blocked_reveal);
+    assert!(!backend.scene.has_pending_page_flips());
+    retire_composed_frame(&mut backend, &mut state, 11);
+    assert!(!backend.platform.any_cursor_commit_in_flight());
+
+    Backend::maybe_composite(&mut backend).expect("compose software cursor after detach event");
     assert!(
         backend.scene.has_pending_page_flips(),
         "expected a pending scene page flip: {}",
@@ -3695,7 +3608,7 @@ fn entry_from_held_direct_with_visible_hw_cursor_runs_handoff() {
         AtomicCommitKind::Async
     );
     assert!(!backend.platform.any_cursor_plane_visible());
-    retire_composed_frame(&mut backend, &mut state, 11);
+    retire_composed_frame(&mut backend, &mut state, 12);
     assert_eq!(
         backend.scene.cursor_mode(),
         crate::kms::render::scene::CursorPlaneMode::Sw
@@ -3709,11 +3622,53 @@ fn entry_from_held_direct_with_visible_hw_cursor_runs_handoff() {
     assert!(!backend.pstate.scanout_m2.unflip_shadow_ready);
     assert!(!backend.scene.has_pending_page_flips());
     assert_direct_queue_drained(&backend);
-    let mut expected = vec![AtomicCommitKind::SceneWithCursor];
+    let mut expected = vec![AtomicCommitKind::SceneWithCursor; 9];
     expected.push(AtomicCommitKind::CursorOnly);
-    expected.extend([AtomicCommitKind::SceneWithCursor; 8]);
     expected.push(AtomicCommitKind::Async);
     assert_commit_sequence(&recorder, &expected);
+
+    let output = &backend.platform.outputs[0];
+    let cursor_device = backend
+        .platform
+        .device_for_key(output.key.device_key)
+        .expect("cursor device");
+    let cursor_state = cursor_device
+        .cursor
+        .crtc_states
+        .get(&output.output.crtc)
+        .expect("cursor CRTC state");
+    assert!(cursor_state.applied.is_none());
+    assert!(cursor_state.lifecycle_pending.is_none());
+    assert!(cursor_state.intent.is_none());
+    assert!(cursor_state.in_flight.is_none());
+    assert!(
+        cursor_device
+            .cursor
+            .plane
+            .as_ref()
+            .expect("cursor plane")
+            .sprite_pool_users_are_zero()
+    );
+    assert!(!backend.platform.any_cursor_commit_in_flight());
+    assert!(recorder.records().iter().all(|record| {
+        record.kind != AtomicCommitKind::CursorOnly
+            || (record
+                .flags
+                .contains(::drm::control::AtomicCommitFlags::NONBLOCK)
+                && record
+                    .flags
+                    .contains(::drm::control::AtomicCommitFlags::PAGE_FLIP_EVENT))
+    }));
+    let recorders = std::rc::Rc::clone(
+        backend
+            .platform
+            .services
+            .test_recorders
+            .as_ref()
+            .expect("recording test services"),
+    );
+    drop(backend);
+    assert_eq!(recorders.cursor_buffer_ledger.end_state(), (0, 0, 0));
 }
 
 #[test]
@@ -3828,10 +3783,14 @@ fn handoff_keeps_newest_copy_not_retained_direct_frame() {
         BackendCapabilities::from_backend(&backend),
     );
     let stage_host = materialize_test_cow_stage(&mut backend, &mut state, ClientId(1), WINDOW);
-    let (show_executor, hide_executor) = install_cursor_plane_with_successful_show(&mut backend);
+    let (_show_executor, hide_executor) = install_cursor_plane_with_successful_show(&mut backend);
     define_visible_cursor_through_backend(&mut backend, &mut state);
     prepare_visible_hw_cursor(&mut backend, &mut state);
-    assert!(!show_executor.calls().is_empty());
+    assert!(backend.platform.any_cursor_plane_visible());
+    if backend.platform.any_cursor_commit_in_flight() {
+        retire_composed_frame(&mut backend, &mut state, 2);
+    }
+    assert!(!backend.platform.any_cursor_commit_in_flight());
 
     let width = screen_width;
     let height = screen_height;
@@ -4041,6 +4000,11 @@ fn handoff_keeps_newest_copy_not_retained_direct_frame() {
     frame_id += 1;
     assert!(backend.pstate.scanout_m2.current.is_none());
     assert!(!backend.platform.any_cursor_plane_visible());
+    if backend.platform.any_cursor_commit_in_flight() {
+        retire_composed_frame(&mut backend, &mut state, frame_id);
+        frame_id += 1;
+    }
+    assert!(!backend.platform.any_cursor_commit_in_flight());
     Backend::maybe_composite(&mut backend).expect("compose F1 with software cursor");
     assert_eq!(
         recorder.records().last().unwrap().kind,
@@ -4053,7 +4017,7 @@ fn handoff_keeps_newest_copy_not_retained_direct_frame() {
         backend.scene.cursor_mode(),
         crate::kms::render::scene::CursorPlaneMode::Sw
     );
-    assert!(!hide_executor.calls().is_empty());
+    assert!(hide_executor.calls().is_empty());
 
     let root = backend.core.window_id;
     let composed_pixel = root_pixel(&mut backend, root, 10, 10).expect("GetImage composed root");
@@ -4069,9 +4033,8 @@ fn handoff_keeps_newest_copy_not_retained_direct_frame() {
     assert!(!backend.platform.any_cursor_plane_visible());
     assert!(!backend.scene.has_pending_page_flips());
     assert_direct_queue_drained(&backend);
-    let mut expected = vec![AtomicCommitKind::SceneWithCursor; 8];
+    let mut expected = vec![AtomicCommitKind::SceneWithCursor; 16];
     expected.push(AtomicCommitKind::CursorOnly);
-    expected.extend([AtomicCommitKind::SceneWithCursor; 8]);
     expected.push(AtomicCommitKind::Async);
     assert_commit_sequence(&recorder, &expected);
     assert_eq!(
@@ -4525,70 +4488,6 @@ fn overlapping_window_without_w_present_returns_to_vsync() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: allow a composed Async commit while the cursor plane remains bound.
-fn cursor_toggle_cycles_never_async_with_bound_plane() {
-    use yserver_core::backend::Backend;
-
-    let Some(mut backend) = live_scene_backend() else {
-        return;
-    };
-    let recorder = recording_sink(&mut backend, 0);
-    let mut state = enter_tearing_without_direct_scanout(&mut backend, 0x7862, 14_100);
-    let (show_executor, hide_executor) = install_cursor_plane_with_successful_show(&mut backend);
-    let crtc = backend.platform.outputs[0].output.crtc;
-    backend.platform.devices[0]
-        .cursor
-        .plane
-        .as_mut()
-        .expect("recording cursor plane")
-        .for_tests_set_visible(crtc, true);
-    backend.scene.for_tests_set_hw_cursor_mode();
-    recorder.clear_records();
-
-    for frame in 70..75 {
-        Backend::set_cursor_hidden(&mut backend, true);
-        Backend::set_cursor_hidden(&mut backend, false);
-        damage_root(&mut backend);
-        Backend::maybe_composite(&mut backend).expect("compose cursor visibility cycle");
-        assert!(backend.pstate.tearing.is_on());
-        let plane_visible = backend.platform.any_cursor_plane_visible();
-        let records = recorder.records();
-        let record = records.last().expect("cycle commit");
-        assert_eq!(
-            record.kind,
-            if plane_visible {
-                AtomicCommitKind::Scene
-            } else {
-                AtomicCommitKind::Async
-            }
-        );
-        if record.kind == AtomicCommitKind::Async {
-            assert!(!plane_visible);
-        }
-        retire_composed_frame(&mut backend, &mut state, frame);
-        assert!(!backend.platform.any_cursor_plane_visible());
-        assert!(!backend.scene.has_pending_page_flips());
-    }
-
-    assert_commit_sequence(
-        &recorder,
-        &[
-            AtomicCommitKind::Scene,
-            AtomicCommitKind::Async,
-            AtomicCommitKind::Async,
-            AtomicCommitKind::Async,
-            AtomicCommitKind::Async,
-        ],
-    );
-    assert!(show_executor.calls().is_empty());
-    assert!(!hide_executor.calls().is_empty());
-    assert!(backend.pstate.tearing.is_on());
-    assert!(!backend.pstate.scanout_m2.unflip_requested);
-    assert!(!backend.scene.has_pending_page_flips());
-}
-
-#[test]
-#[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutations: report Flip for a Copy, or complete it at scene-flip submission before its GPU ticket signals.
 fn copies_keep_copy_completion_with_composed_async() {
     use yserver_core::{
@@ -4859,62 +4758,6 @@ fn copies_keep_copy_completion_with_composed_async() {
         &[AtomicCommitKind::Async, AtomicCommitKind::Async],
     );
     let _keep_client_alive = peer;
-}
-
-#[test]
-#[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: allow Async when a hardware cursor plane is still physically visible.
-fn hide_failure_keeps_visible_cursor_frames_vsync() {
-    use yserver_core::backend::Backend;
-
-    const WINDOW: u32 = 0x7840;
-    let Some(mut backend) = live_scene_backend() else {
-        return;
-    };
-    let recorder = recording_sink(&mut backend, 0);
-    let mut state = enter_tearing_without_direct_scanout(&mut backend, WINDOW, 12_600);
-    recorder.clear_records();
-    backend.scene.for_tests_set_hw_cursor_mode();
-    let device = &mut backend.platform.devices[0];
-    let show_executor = std::rc::Rc::new(super::RecordingCursorShowExecutor::default());
-    let mut plane = crate::kms::cursor_plane::CursorPlane::for_tests_with_show_executor(
-        std::rc::Rc::clone(&device.device),
-        64,
-        64,
-        true,
-        show_executor,
-    );
-    let crtc = backend.platform.outputs[0].output.crtc;
-    plane.for_tests_set_visible(crtc, true);
-    let hide_executor = std::rc::Rc::new(RecordingCursorHideExecutor::default());
-    hide_executor.script([TestCursorHideResult::Error(libc::EIO); 8]);
-    plane.for_tests_set_hide_executor(hide_executor.clone());
-    device.cursor.plane = Some(plane);
-
-    damage_root(&mut backend);
-    Backend::maybe_composite(&mut backend).expect("submit cursor transition frame");
-    assert_eq!(
-        recorder.records().last().unwrap().kind,
-        AtomicCommitKind::Scene
-    );
-    retire_composed_frame(&mut backend, &mut state, 40);
-    assert!(backend.platform.any_cursor_plane_visible());
-
-    damage_root(&mut backend);
-    Backend::maybe_composite(&mut backend).expect("submit vsync cursor fallback");
-    assert_eq!(
-        recorder.records().last().unwrap().kind,
-        AtomicCommitKind::Scene
-    );
-    assert!(backend.platform.any_cursor_plane_visible());
-    assert!(backend.pstate.tearing.is_on());
-    retire_composed_frame(&mut backend, &mut state, 49);
-    assert!(!backend.scene.has_pending_page_flips());
-    assert!(backend.pstate.tearing.hide_failed_logged);
-    assert_commit_sequence(
-        &recorder,
-        &[AtomicCommitKind::Scene, AtomicCommitKind::Scene],
-    );
 }
 
 #[test]

@@ -243,6 +243,31 @@ impl AtomicCursorFixture {
             "recording page-flip events remain undrained",
         );
         for output in &self.backend.platform.outputs {
+            let device = self
+                .backend
+                .platform
+                .device_for_key(output.key.device_key)
+                .expect("fixture output has a KMS device");
+            let state = device.cursor.crtc_states.get(&output.output.crtc);
+            assert!(
+                state.is_none_or(|state| {
+                    state.applied.is_none()
+                        && state.lifecycle_pending.is_none()
+                        && state.intent.is_none()
+                        && state.in_flight.is_none()
+                }),
+                "cursor binding, lifecycle owner, intent, or event obligation remains for {:?}",
+                output.output.crtc,
+            );
+            assert!(
+                device
+                    .cursor
+                    .plane
+                    .as_ref()
+                    .is_none_or(|plane| plane.sprite_pool_users_are_zero()),
+                "cursor sprite pool retains a framebuffer user for {:?}",
+                output.output.crtc,
+            );
             assert!(
                 !self
                     .backend

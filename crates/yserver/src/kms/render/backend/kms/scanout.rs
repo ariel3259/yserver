@@ -2115,6 +2115,14 @@ impl KmsBackend {
             // the next progress source; its state will be re-arbitrated there.
             return false;
         }
+        if self.pstate.tearing.is_on()
+            && self.platform.any_cursor_commit_in_flight()
+            && !self.platform.any_cursor_plane_visible()
+        {
+            // A successful detach still owns the old sprite until its event.
+            // Keep both software reveal and an async primary commit behind it.
+            return false;
+        }
         let outputs: Vec<_> = (0..self.platform.outputs.len()).collect();
         let direct_transaction_waiting = self.pstate.scanout_m2.pending.is_some()
             || self.pstate.scanout_m2.queued_successor.is_some()
@@ -2227,10 +2235,17 @@ impl KmsBackend {
                 return;
             }
         };
+        // Consume every obligation that existed when this event batch was
+        // drained before a retirement callback can accept a new cursor show.
+        // That new show must not be retired by another event from this batch.
+        let cursor_retirements: Vec<_> = flipped
+            .iter()
+            .map(|(output_idx, _, _)| self.record_atomic_cursor_commit_retirement(*output_idx))
+            .collect();
+        let _ = cursor_retirements;
         for (output_idx, clock, timestamps) in flipped {
             self.platform
                 .note_tearing_async_flip_event(output_idx, timestamps);
-            self.record_atomic_cursor_commit_retirement(output_idx);
             let direct_retired = self.retire_direct_output(output_idx, clock);
             let scene_retired = !direct_retired
                 && self.scene.handle_page_flip_complete(
@@ -2244,14 +2259,19 @@ impl KmsBackend {
             // Retry only the cursor state owned by the card whose output just
             // retired. A page flip on card A must not consume card B's EBUSY
             // slot or EINVAL backoff.
-            match self
-                .platform
-                .cursor_plane_drain_pending_move_for_output(output_idx)
-            {
-                Ok(outcome) => {
-                    self.handle_cursor_move_outcome(outcome);
+            let grouped_direct_work_waiting = self.pstate.scanout_m2.pending.is_some()
+                || self.pstate.scanout_m2.queued_successor.is_some()
+                || !self.pstate.scanout_m2.unflip_awaiting_outputs.is_empty();
+            if !grouped_direct_work_waiting {
+                match self
+                    .platform
+                    .cursor_plane_drain_pending_move_for_output(output_idx)
+                {
+                    Ok(outcome) => {
+                        self.handle_cursor_move_outcome(outcome);
+                    }
+                    Err(e) => log::debug!("render cursor drain on page-flip retire: {e}"),
                 }
-                Err(e) => log::debug!("render cursor drain on page-flip retire: {e}"),
             }
         }
         // Idle vblank arming: clear the arm + advance the Present clock for
@@ -2290,17 +2310,22 @@ impl KmsBackend {
         }
     }
 
-    fn record_atomic_cursor_commit_retirement(&mut self, output_idx: usize) {
-        self.platform
+    fn record_atomic_cursor_commit_retirement(&mut self, output_idx: usize) -> bool {
+        let retired = self
+            .platform
             .retire_atomic_cursor_commit_for_output(output_idx);
+        if !retired {
+            return false;
+        }
         let Some(layout) = self.platform.outputs.get(output_idx) else {
-            return;
+            return true;
         };
         if let Some(device) = self.platform.device_for_output(&layout.key) {
             device
                 .atomic_commit_sink
                 .note_cursor_commit_retired(layout.output.crtc, std::time::Instant::now());
         }
+        true
     }
 
     fn prepare_tearing_scene_pass(&mut self) {
@@ -2324,6 +2349,13 @@ impl KmsBackend {
             self.request_direct_unflip("tearing_cursor_handoff");
         }
         if self.platform.any_cursor_plane_visible() {
+            return;
+        }
+        if self.platform.any_cursor_commit_in_flight() {
+            for output_idx in 0..self.platform.outputs.len() {
+                self.platform
+                    .set_scene_flip_timing(output_idx, crate::drm::async_flip::FlipTiming::Vsync);
+            }
             return;
         }
         for output_idx in 0..self.platform.outputs.len() {

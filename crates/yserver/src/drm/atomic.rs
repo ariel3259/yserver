@@ -110,6 +110,20 @@ pub(crate) struct CursorPlanePosition {
     pub(crate) motion_timestamp: Option<Instant>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AtomicCursorPlaneDetach {
+    pub(crate) plane: plane::Handle,
+    pub(crate) fb_id: property::Handle,
+    pub(crate) crtc_id: property::Handle,
+}
+
+impl AtomicCursorPlaneDetach {
+    pub(crate) fn add_to(self, request: &mut AtomicCommitRequest) {
+        request.add_cursor_property(self.plane.into(), self.fb_id, 0);
+        request.add_cursor_property(self.plane.into(), self.crtc_id, 0);
+    }
+}
+
 impl CursorPlanePosition {
     /// Append this cursor's `CRTC_X` and `CRTC_Y` values to an atomic request.
     #[allow(dead_code)] // consumed by the scene commit path in Task 2
@@ -190,6 +204,21 @@ impl AtomicCommitRequest {
             position.crtc_y,
             i64::from(position.y) as u64,
         ));
+    }
+
+    pub(crate) fn add_cursor_property(
+        &mut self,
+        object: RawResourceHandle,
+        property: property::Handle,
+        value: u64,
+    ) {
+        self.request.add_raw_property(object, property, value);
+        self.cursor_properties.push((object, property));
+        self.record_property(AtomicPropertyUpdate {
+            object,
+            property,
+            value,
+        });
     }
 
     fn record_property(&mut self, update: AtomicPropertyUpdate) {
@@ -667,11 +696,6 @@ impl AtomicCommitSink {
     /// pins on the cursor. Other failures leave the cursor state untouched.
     pub(crate) fn take_last_cursor_rejection(&self) -> bool {
         self.last_rejection_was_cursor.replace(false)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_tests_motion_to_accept_sample_count(&self) -> usize {
-        self.metrics.borrow().motion_to_accept_us.len()
     }
 
     #[cfg(test)]

@@ -26,6 +26,9 @@
 
 mod connectors;
 mod cursor;
+mod cursor_commit;
+mod cursor_lifecycle;
+mod cursor_state;
 mod devices;
 pub(crate) mod flip_events;
 mod init;
@@ -39,6 +42,7 @@ pub mod services;
 use connectors::*;
 #[cfg(test)]
 use cursor::*;
+use cursor_state::CursorCrtcState;
 #[cfg(test)]
 use init::*;
 pub(crate) use qualify::*;
@@ -209,6 +213,9 @@ pub(super) struct CursorHideRecovery {
 /// ioctls are device-local, so none of these fields may live at platform scope.
 pub(crate) struct KmsCursorState {
     pub(crate) plane: Option<crate::kms::cursor_plane::CursorPlane>,
+    /// Per-CRTC accepted full cursor state. This is authoritative for
+    /// visibility and framebuffer ownership; legacy plane bookkeeping is not.
+    pub(crate) crtc_states: HashMap<::drm::control::crtc::Handle, CursorCrtcState>,
     pending_move: Option<(i32, i32, u16, u16)>,
     /// Pointer-event timestamp paired with `pending_move` across an EBUSY
     /// retry. Atomic positions carry this timestamp directly.
@@ -222,8 +229,7 @@ pub(crate) struct KmsCursorState {
         HashMap<::drm::control::crtc::Handle, crate::drm::atomic::CursorPlanePosition>,
     /// Accepted cursor-only commits, keyed by CRTC. A cursor-only commit is
     /// in flight only after its atomic ioctl succeeded.
-    atomic_cursor_commits_in_flight:
-        HashMap<::drm::control::crtc::Handle, crate::drm::atomic::CursorPlanePosition>,
+    atomic_cursor_commits_in_flight: HashMap<::drm::control::crtc::Handle, ()>,
     /// A cursor-only EBUSY proves another commit is pending on this CRTC.
     /// Keep the latest position unsent until that CRTC's next flip event.
     cursor_retry_waits_for_flip: HashSet<::drm::control::crtc::Handle>,

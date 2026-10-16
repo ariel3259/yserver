@@ -43,7 +43,7 @@ use crate::drm::Device;
 #[cfg(test)]
 use ops::RecordingCursorBufferIo;
 use ops::{CursorBuffer, CursorBufferIo, DrmCursorBufferIo, DrmLegacyCursorIo, LegacyCursorIo};
-use sprites::SpritePool;
+use sprites::{SpriteBufferLease, SpritePool};
 use topology::{
     CursorPlaneDiscovery, CursorPlaneDiscoveryIo, CursorPlaneProperties, DrmCursorPlaneDiscovery,
     cursor_plane_topology,
@@ -54,9 +54,8 @@ pub(crate) use topology::{CursorPlaneTestPlane, CursorPlaneTestSnapshot};
 #[cfg(test)]
 use topology::{CursorPlaneTopology, DiscoveredCursorPlane};
 
-/// Legacy cursor-plane hide operation. Production uses `set_cursor2`; the
-/// executor is retained on the plane so rejection rollback uses the same
-/// ioctl path as ordinary hide operations.
+/// Legacy cursor-plane hide operation retained for compatibility cleanup and
+/// tests. The KMS platform path submits atomic cursor state instead.
 #[allow(dead_code)]
 pub(crate) trait CursorHideExecutor {
     fn hide(&self, device: &Device, crtc: crtc::Handle) -> io::Result<()>;
@@ -212,6 +211,10 @@ impl std::fmt::Display for CursorShowError {
 
 impl std::error::Error for CursorShowError {}
 
+#[allow(
+    dead_code,
+    reason = "legacy cursor error adapter remains for tasks B/C cleanup"
+)]
 fn bind_failure(prior_visible: bool, error: io::Error) -> CursorShowError {
     if prior_visible {
         CursorShowError::StillVisible {
@@ -223,6 +226,10 @@ fn bind_failure(prior_visible: bool, error: io::Error) -> CursorShowError {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "legacy cursor error adapter remains for tasks B/C cleanup"
+)]
 fn move_failure(move_error: io::Error, rollback: io::Result<()>) -> CursorShowError {
     match rollback {
         Ok(()) => CursorShowError::Unbound(move_error),
@@ -233,6 +240,10 @@ fn move_failure(move_error: io::Error, rollback: io::Result<()>) -> CursorShowEr
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "legacy cursor adapter remains for tasks B/C cleanup"
+)]
 fn show_with_rollback(
     visible: &mut HashMap<crtc::Handle, bool>,
     crtc: crtc::Handle,
@@ -540,10 +551,12 @@ impl CursorPlane {
             .dumb()
             .map_or(CursorPlaneBuffer::Test, CursorPlaneBuffer::Dumb);
 
+        let mut sprite_pool = SpritePool::new(width, height);
+        sprite_pool.set_active_crtc_count(crtcs.len());
         let plane = Self {
             device,
             cursor_buffer: Some(cursor_buffer),
-            sprite_pool: SpritePool::new(width, height),
+            sprite_pool,
             operations: CursorPlaneOperations::Legacy(legacy_io),
             dumb: Some(dumb),
             ptr,
@@ -774,11 +787,6 @@ impl CursorPlane {
     }
 
     #[cfg(test)]
-    pub(crate) fn for_tests_clear_properties(&mut self, crtc: crtc::Handle) {
-        self.properties_by_crtc.remove(&crtc);
-    }
-
-    #[cfg(test)]
     pub(crate) fn for_tests_queue_discovery_snapshot(
         &self,
         snapshot: CursorPlaneTestSnapshot,
@@ -952,13 +960,8 @@ impl CursorPlane {
         Ok(())
     }
 
-    /// Stage 5 Phase B — versioned upload. Memcpys `bgra_bytes` into
-    /// the shared dumb buffer ONLY when `version` differs from
-    /// `uploaded_version`. **Never calls `set_cursor2`**; binding
-    /// the buffer to a CRTC is a separate step (`show`).
-    /// This split is load-bearing for the per-output transition
-    /// state machine — uploading must not prematurely show pixels
-    /// on CRTCs whose Sw→Hw retire is still pending.
+    /// Versioned legacy-buffer upload. It never binds the image; the atomic
+    /// platform path obtains a separate candidate sprite lease to submit.
     ///
     /// # Errors
     /// Same as [`Self::load_image`].
@@ -1005,6 +1008,45 @@ impl CursorPlane {
         self.uploaded_version
     }
 
+    pub(crate) fn candidate_sprite(&self) -> Option<(SpriteBufferLease, u32)> {
+        let lease = self.sprite_pool.candidate_lease()?;
+        Some((lease, self.sprite_pool.framebuffer_for_lease(lease)?))
+    }
+
+    pub(crate) fn reserve_sprite(&mut self, lease: SpriteBufferLease) -> bool {
+        self.sprite_pool.reserve(lease)
+    }
+
+    pub(crate) fn accept_reserved_sprite(&mut self, lease: SpriteBufferLease) -> bool {
+        self.sprite_pool.accept_reserved(lease)
+    }
+
+    pub(crate) fn reject_reserved_sprite(&mut self, lease: SpriteBufferLease) -> bool {
+        self.sprite_pool.reject_reserved(lease)
+    }
+
+    pub(crate) fn release_sprite_user(&mut self, lease: SpriteBufferLease) -> bool {
+        self.sprite_pool.release_user(lease)
+    }
+
+    pub(crate) fn cancel_sprite_candidate(&mut self, lease: SpriteBufferLease) -> bool {
+        self.sprite_pool.cancel_candidate(lease)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sprite_user_count(&self, lease: SpriteBufferLease) -> Option<usize> {
+        self.sprite_pool.user_count(lease)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sprite_pool_users_are_zero(&self) -> bool {
+        self.sprite_pool.all_users_zero()
+    }
+
+    pub(crate) fn disarm_sprite_pool(&mut self) {
+        self.sprite_pool.disarm();
+    }
+
     #[cfg(test)]
     #[allow(
         dead_code,
@@ -1026,18 +1068,24 @@ impl CursorPlane {
     /// `upload_image` will memcpy unconditionally regardless of
     /// version. Used by global recovery paths (VT-leave, full
     /// modeset, `drain_all`).
+    #[allow(
+        dead_code,
+        reason = "legacy cursor upload invalidation remains for tasks B/C cleanup"
+    )]
     pub fn invalidate_uploaded_version(&mut self) {
         self.uploaded_version = None;
     }
 
-    /// Make the cursor visible on `crtc` at image-top-left position
-    /// `(img_x, img_y)` in CRTC-local coordinates, with the given
-    /// `hotspot`. Showing and hiding remain legacy `set_cursor2` operations;
-    /// steady pointer motion is selected separately by device capability.
+    /// Legacy adapter: make the cursor visible on `crtc` at image-top-left
+    /// position `(img_x, img_y)` with the given `hotspot`.
     /// Idempotent — repeated calls just re-bind and reposition.
     ///
     /// # Errors
     /// Ioctl failure.
+    #[allow(
+        dead_code,
+        reason = "legacy cursor adapter remains for tasks B/C cleanup"
+    )]
     pub fn show(
         &mut self,
         crtc: crtc::Handle,
@@ -1088,12 +1136,11 @@ impl CursorPlane {
         }
     }
 
-    /// Detach the cursor from `crtc`. The plane buffer is retained so
-    /// a future `show` doesn't have to re-allocate. Uses the legacy
-    /// `set_cursor2` ioctl, as required for plane show/hide.
+    /// Legacy adapter: detach the cursor from `crtc` while retaining its
+    /// backing buffer for a later legacy `show`.
     ///
     /// # Errors
-    /// `set_cursor2` ioctl failure.
+    /// Legacy bind executor failure.
     pub fn hide(&mut self, crtc: crtc::Handle) -> io::Result<()> {
         log::debug!(
             "cursor_plane::hide CRTC={crtc:?} prior_visible={}",
@@ -1118,10 +1165,8 @@ impl CursorPlane {
         Ok(())
     }
 
-    /// Move the cursor on `crtc` to image-top-left `(x, y)` in
-    /// CRTC-local coordinates with the master's legacy ioctl. Task 1 keeps
-    /// this call for every device; Task 3 switches capable devices to the
-    /// atomic position path.
+    /// Legacy adapter: move the cursor on `crtc` to image-top-left `(x, y)` in
+    /// CRTC-local coordinates. The KMS platform uses its atomic cursor path.
     ///
     /// # Errors
     /// `move_cursor` ioctl failure.
@@ -1135,6 +1180,10 @@ impl CursorPlane {
     }
 
     /// True iff the plane is currently bound (via `show`) on `crtc`.
+    #[allow(
+        dead_code,
+        reason = "legacy visibility map remains for tasks B/C cleanup"
+    )]
     #[must_use]
     pub fn is_visible_on(&self, crtc: crtc::Handle) -> bool {
         self.visible.get(&crtc).copied().unwrap_or(false)
@@ -1158,6 +1207,7 @@ impl CursorPlane {
     /// `true` into the new route would skip the required show transition.
     pub fn retain_crtcs(&mut self, active: &HashSet<crtc::Handle>) {
         self.visible.retain(|crtc, _| active.contains(crtc));
+        self.sprite_pool.set_active_crtc_count(active.len());
     }
 
     /// Cursor plane width in pixels (driver-reported).

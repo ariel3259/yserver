@@ -359,6 +359,7 @@ impl KmsBackend {
     /// failure; subsequent outputs still attempted.
     pub fn disable_output(&mut self) -> io::Result<()> {
         self.exit_tearing("shutdown");
+        let old_pending_pageflips = self.pending_pageflip_crtcs();
         // Stage 5 Task 6.1: explicitly flush open render batches
         // before drain_all walks the submitted queue. drain_all only
         // waits on already-submitted CBs; an open pending batch
@@ -403,14 +404,25 @@ impl KmsBackend {
         // `BufWriter::Drop` would lose the buffered tail to a
         // subsequent power-cycle. See `submit_trace::SubmitTrace::flush`.
         self.telemetry.flush_submit_trace();
-        let result = self.platform.disable_output();
-        if result.is_ok() {
-            self.stop_direct_after_scanout_replaced("shutdown");
-            self.pending_completed_events_on_shutdown
-                .append(&mut self.pstate.scanout_m2.completed);
-            self.pstate.scanout_m1.clear("shutdown");
+        self.platform.disable_output()?;
+        if let Err(error) = self.platform.discard_old_drm_events_after_all_off(
+            &old_pending_pageflips,
+            std::time::Duration::from_secs(1),
+        ) {
+            for device in &mut self.platform.devices {
+                if let Some(plane) = device.cursor.plane.as_mut() {
+                    plane.disarm_sprite_pool();
+                }
+            }
+            return Err(error);
         }
-        result
+        self.platform
+            .clear_atomic_cursor_state_after_old_events_discard();
+        self.stop_direct_after_scanout_replaced("shutdown");
+        self.pending_completed_events_on_shutdown
+            .append(&mut self.pstate.scanout_m2.completed);
+        self.pstate.scanout_m1.clear("shutdown");
+        Ok(())
     }
 
     /// Suspend sequence — called by `drive_vt_event` when the state machine
@@ -460,21 +472,6 @@ impl KmsBackend {
 
         // 4. Wait for in-flight GPU work, bounded.
         self.platform.wait_idle_bounded();
-
-        // The primary plane is the only plane `disable_output` detaches.
-        // A hardware cursor is programmed through its own plane/ioctl, and
-        // some drivers (notably AMD Polaris) reject an atomic CRTC disable
-        // while that plane remains attached.  Normally `scene.drain_all`
-        // hides it, but that must happen *after* the all-off transaction so
-        // scene acknowledgements and BO phases are not discarded while KMS
-        // may still scan them out.  Hide cursor planes separately first.
-        //
-        // This is intentionally best-effort: a software cursor has no plane,
-        // and an already-detached cursor needs no recovery.  The following
-        // all-off atomic transaction remains the authoritative VT boundary.
-        if let Err(error) = self.platform.cursor_plane_hide_all() {
-            log::debug!("kms: VT suspend could not hide hardware cursor planes: {error}");
-        }
 
         // 4b. Take the complete old CRTC set off-screen before discarding any
         //     scene acknowledgement or BO phase. Otherwise a surviving CRTC
