@@ -8,9 +8,9 @@ use crate::kms::{
         gpu::GpuCore,
         platform::PlatformBackend,
         scene::{
-            ComposeRenderTarget, ComposeSubmit, CursorPlaneSink, CursorShowFailure, FinishOutcome,
-            FlipRetirement, FrameHandoff, FrameTargetError, OutputRoute, OutputSink, RecordFrame,
-            RenderCompletion, SlotToken,
+            ComposeRenderTarget, ComposeSubmit, CursorPlaneSink, CursorShowFailure,
+            CursorUploadOutcome, FinishOutcome, FlipRetirement, FrameHandoff, FrameTargetError,
+            OutputRoute, OutputSink, RecordFrame, RenderCompletion, SlotToken,
         },
     },
     vk::{
@@ -356,7 +356,7 @@ impl CursorPlaneSink for PlatformBackend {
         width: u32,
         height: u32,
         bgra_bytes: &[u8],
-    ) -> io::Result<()> {
+    ) -> io::Result<CursorUploadOutcome> {
         self.cursor_plane_upload_image_for_output(output_idx, version, width, height, bgra_bytes)
     }
 

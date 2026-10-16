@@ -563,6 +563,7 @@ impl KmsBackend {
             scanout_m0: ScanoutM0Telemetry::default(),
             scanout_m1: ScanoutM1ProbeCache::new(),
             scanout_m2: ScanoutM2State::new(),
+            deferred_direct_cursor: None,
             tearing: Tearing::new(),
             vt_resume_executor: std::rc::Rc::new(
                 crate::kms::render::backend::kms::session::DrmVtResumeExecutor,

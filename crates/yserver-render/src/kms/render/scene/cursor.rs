@@ -109,9 +109,10 @@ impl SceneCompositor {
         let transition = Some(CursorTransition::HideOnRetire {
             reveal_sw_after: true,
         });
+        let retained_mode = inner.outputs[output_idx].last_frame_cursor_mode;
         let result = apply_cursor_transition_on_retire(inner, output_idx, sink, transition);
         let desired_mode = OutputCursorMode::SwPending;
-        let resolution = resolve_retired_cursor_state(result, desired_mode);
+        let resolution = resolve_retired_cursor_state(result, desired_mode, retained_mode);
         let state = &mut inner.outputs[output_idx];
         state.force_show_retry_version = update_force_show_retry_version(
             state.force_show_retry_version,
@@ -127,6 +128,7 @@ impl SceneCompositor {
         }
         if resolution.force_repaint {
             force_cursor_retry_repaint(state);
+            self.scene_structure_dirty = true;
         }
         true
     }
@@ -411,6 +413,7 @@ pub(super) fn derive_cursor_transition(
 pub(super) fn resolve_retired_cursor_state(
     result: CursorTransitionResult,
     desired_mode: OutputCursorMode,
+    retained_mode: OutputCursorMode,
 ) -> CursorRetireResolution {
     match result {
         CursorTransitionResult::Applied => CursorRetireResolution {
@@ -443,6 +446,12 @@ pub(super) fn resolve_retired_cursor_state(
             clear_presented_metadata: false,
             force_repaint: true,
         },
+        CursorTransitionResult::Deferred => CursorRetireResolution {
+            actual_mode: retained_mode,
+            commit_desired_metadata: false,
+            clear_presented_metadata: false,
+            force_repaint: true,
+        },
     }
 }
 
@@ -457,9 +466,10 @@ pub(super) fn update_force_show_retry_version(
         _ => None,
     };
     match (attempted, result) {
-        (Some(version), CursorTransitionResult::VisibleNeedsShowRetry) => {
-            Some(current.map_or(version, |pending| pending.max(version)))
-        }
+        (
+            Some(version),
+            CursorTransitionResult::VisibleNeedsShowRetry | CursorTransitionResult::Deferred,
+        ) => Some(current.map_or(version, |pending| pending.max(version))),
         (Some(version), CursorTransitionResult::Applied | CursorTransitionResult::Hidden)
             if current == Some(version) =>
         {
@@ -581,7 +591,10 @@ pub(super) fn apply_cursor_transition_on_retire(
                         entry.extent.height,
                         bytes.as_ref(),
                     ) {
-                        Ok(()) => true,
+                        Ok(crate::kms::render::scene::CursorUploadOutcome::Ready) => true,
+                        Ok(crate::kms::render::scene::CursorUploadOutcome::Deferred) => {
+                            return CursorTransitionResult::Deferred;
+                        }
                         Err(e) => {
                             log::warn!(
                                 "render cursor: retire-time upload (v{upload_version}) failed: {e}"
@@ -592,9 +605,9 @@ pub(super) fn apply_cursor_transition_on_retire(
                 } else {
                     log::debug!(
                         "render cursor: retire-time upload (v{upload_version}) — \
-                         no matching entry bytes; binding with current buffer"
+                         no matching entry bytes; retaining the current binding for retry"
                     );
-                    false
+                    return CursorTransitionResult::Deferred;
                 }
             } else {
                 true

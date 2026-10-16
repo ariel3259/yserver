@@ -250,8 +250,11 @@ fn hw_to_sw_uses_cursorless_hide_then_one_frame_gap_progression() {
     assert_eq!(prev_pos, Some(None));
     assert_eq!(mode_after, OutputCursorMode::SwPending);
 
-    let pending =
-        resolve_retired_cursor_state(CursorTransitionResult::HiddenNeedsRepaint, mode_after);
+    let pending = resolve_retired_cursor_state(
+        CursorTransitionResult::HiddenNeedsRepaint,
+        mode_after,
+        OutputCursorMode::Hw,
+    );
     assert_eq!(pending.actual_mode, OutputCursorMode::SwPending);
     assert!(pending.commit_desired_metadata);
     assert!(pending.force_repaint);
@@ -316,8 +319,11 @@ fn cursorless_hide_phase_removes_sw_draw_sample_and_presented_metadata() {
 #[test]
 fn repeated_hide_failure_keeps_hw_over_cursorless_frames_and_retries() {
     let assignment = CursorAssignment::Sw { pos: (100, 100) };
-    let failed =
-        resolve_retired_cursor_state(CursorTransitionResult::Visible, OutputCursorMode::SwPending);
+    let failed = resolve_retired_cursor_state(
+        CursorTransitionResult::Visible,
+        OutputCursorMode::SwPending,
+        OutputCursorMode::Hw,
+    );
     assert_eq!(failed.actual_mode, OutputCursorMode::Hw);
     assert!(failed.force_repaint);
     assert!(cursorless_hide_frame_required(
@@ -437,8 +443,11 @@ fn pending_show_output_receives_later_sprite_retry() {
 
 #[test]
 fn failed_unbound_show_records_hidden_and_clears_claimed_metadata() {
-    let resolution =
-        resolve_retired_cursor_state(CursorTransitionResult::Hidden, OutputCursorMode::Hw);
+    let resolution = resolve_retired_cursor_state(
+        CursorTransitionResult::Hidden,
+        OutputCursorMode::Hw,
+        OutputCursorMode::Hidden,
+    );
     assert_eq!(resolution.actual_mode, OutputCursorMode::Hidden);
     assert!(!resolution.commit_desired_metadata);
     assert!(resolution.clear_presented_metadata);
@@ -451,6 +460,7 @@ fn failed_hide_retains_actual_hw_and_last_known_metadata() {
         OutputCursorMode::Sw {
             prev: Some((10, 20)),
         },
+        OutputCursorMode::Hw,
     );
     assert_eq!(resolution.actual_mode, OutputCursorMode::Hw);
     assert!(!resolution.commit_desired_metadata);
@@ -461,6 +471,7 @@ fn failed_hide_retains_actual_hw_and_last_known_metadata() {
 fn failed_visible_rebind_forces_full_show_retry_without_claiming_version() {
     let resolution = resolve_retired_cursor_state(
         CursorTransitionResult::VisibleNeedsShowRetry,
+        OutputCursorMode::Hw,
         OutputCursorMode::Hw,
     );
     assert_eq!(resolution.actual_mode, OutputCursorMode::Hw);

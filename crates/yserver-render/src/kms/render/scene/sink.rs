@@ -188,6 +188,15 @@ pub struct CursorShowFailure {
     pub error: Box<dyn std::error::Error + Send + Sync>,
 }
 
+/// Result of staging an image in cursor framebuffer storage. `Deferred`
+/// leaves the applied binding authoritative and schedules the newest wanted
+/// image for a later Backend pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CursorUploadOutcome {
+    Ready,
+    Deferred,
+}
+
 impl std::fmt::Display for CursorShowFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Display::fmt(&self.error, f)
@@ -209,7 +218,7 @@ pub trait CursorPlaneSink {
         width: u32,
         height: u32,
         bgra_bytes: &[u8],
-    ) -> io::Result<()>;
+    ) -> io::Result<CursorUploadOutcome>;
     /// # Errors
     ///
     /// The show failed.

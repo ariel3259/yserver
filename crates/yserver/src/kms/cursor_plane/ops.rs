@@ -62,6 +62,7 @@ pub(crate) struct CursorMapping {
     ptr: NonNull<u8>,
     len: usize,
     owned: Option<Box<[u8]>>,
+    _recording: Option<Rc<RefCell<Box<[u8]>>>>,
 }
 
 impl CursorMapping {
@@ -74,14 +75,15 @@ impl CursorMapping {
     }
 
     #[allow(dead_code, reason = "consumed by the A1 atomic cursor backend fixture")]
-    pub(crate) fn recording(len: usize) -> io::Result<Self> {
-        let mut owned = vec![0_u8; len].into_boxed_slice();
-        let ptr = NonNull::new(owned.as_mut_ptr())
+    pub(crate) fn recording(backing: Rc<RefCell<Box<[u8]>>>) -> io::Result<Self> {
+        let ptr = NonNull::new(backing.borrow_mut().as_mut_ptr())
             .ok_or_else(|| io::Error::other("empty cursor mapping"))?;
+        let len = backing.borrow().len();
         Ok(Self {
             ptr,
             len,
-            owned: Some(owned),
+            owned: None,
+            _recording: Some(backing),
         })
     }
 }
@@ -270,6 +272,7 @@ impl CursorBufferIo for DrmCursorBufferIo {
             ptr,
             len,
             owned: None,
+            _recording: None,
         })
     }
 
@@ -376,6 +379,8 @@ pub(crate) struct CursorBuffer {
     fb: Option<framebuffer::Handle>,
     stride: u32,
     len: usize,
+    width: u32,
+    height: u32,
 }
 
 #[allow(dead_code, reason = "consumed by the A1 atomic cursor backend fixture")]
@@ -384,6 +389,8 @@ pub(crate) enum CursorBufferRecord {
     Create {
         device_fd: i32,
         handle: u32,
+        width: u32,
+        height: u32,
     },
     Map {
         device_fd: i32,
@@ -393,6 +400,9 @@ pub(crate) enum CursorBufferRecord {
         device_fd: i32,
         handle: u32,
         fb: u32,
+        width: u32,
+        height: u32,
+        format: u32,
     },
     RemoveFb {
         device_fd: i32,
@@ -415,6 +425,24 @@ pub(crate) struct CursorBufferLedger {
     live_dumb: RefCell<HashSet<(i32, u32)>>,
     live_mappings: RefCell<HashSet<(i32, u32)>>,
     live_framebuffers: RefCell<HashSet<(i32, u32)>>,
+    storage: RefCell<CursorBufferStorageMap>,
+    failures: RefCell<Vec<CursorBufferFailure>>,
+}
+
+type CursorBufferStorageMap = HashMap<(i32, u32), Rc<RefCell<Box<[u8]>>>>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CursorBufferOperation {
+    Create,
+    Map,
+    AddFb,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CursorBufferFailure {
+    operation: CursorBufferOperation,
+    successful_calls_before_failure: usize,
+    raw_os_error: i32,
 }
 
 #[allow(dead_code, reason = "consumed by the A1 atomic cursor backend fixture")]
@@ -429,6 +457,47 @@ impl CursorBufferLedger {
             self.live_mappings.borrow().len(),
             self.live_framebuffers.borrow().len(),
         )
+    }
+
+    #[allow(
+        dead_code,
+        reason = "A4 Backend allocation tests inject raw acquisition failures"
+    )]
+    pub(crate) fn fail_after(
+        &self,
+        operation: CursorBufferOperation,
+        successful_calls: usize,
+        raw_os_error: i32,
+    ) {
+        self.failures.borrow_mut().push(CursorBufferFailure {
+            operation,
+            successful_calls_before_failure: successful_calls,
+            raw_os_error,
+        });
+    }
+
+    #[allow(
+        dead_code,
+        reason = "A4 Backend upload tests inspect the recorded mmap bytes"
+    )]
+    pub(crate) fn mapped_bytes(&self, device_fd: i32, handle: u32) -> Option<Vec<u8>> {
+        self.storage
+            .borrow()
+            .get(&(device_fd, handle))
+            .map(|storage| storage.borrow().to_vec())
+    }
+
+    fn take_failure(&self, operation: CursorBufferOperation) -> Option<i32> {
+        let mut failures = self.failures.borrow_mut();
+        let index = failures
+            .iter()
+            .position(|failure| failure.operation == operation)?;
+        let failure = &mut failures[index];
+        if failure.successful_calls_before_failure != 0 {
+            failure.successful_calls_before_failure -= 1;
+            return None;
+        }
+        Some(failures.remove(index).raw_os_error)
     }
 }
 
@@ -465,6 +534,9 @@ impl CursorBufferIo for RecordingCursorBufferIo {
         width: u32,
         height: u32,
     ) -> io::Result<CursorDumbBuffer> {
+        if let Some(raw_os_error) = self.ledger.take_failure(CursorBufferOperation::Create) {
+            return Err(io::Error::from_raw_os_error(raw_os_error));
+        }
         let fd = device.as_fd().as_raw_fd();
         let mut next = self.next_handle.borrow_mut();
         let handle = *next;
@@ -482,17 +554,26 @@ impl CursorBufferIo for RecordingCursorBufferIo {
             .and_then(|pitch| pitch.checked_mul(usize::try_from(height).ok()?))
             .ok_or_else(|| io::Error::other("cursor mapping size overflow"))?;
         self.ledger.live_dumb.borrow_mut().insert((fd, handle));
+        self.ledger.storage.borrow_mut().insert(
+            (fd, handle),
+            Rc::new(RefCell::new(vec![0_u8; len].into_boxed_slice())),
+        );
         self.ledger
             .records
             .borrow_mut()
             .push(CursorBufferRecord::Create {
                 device_fd: fd,
                 handle,
+                width,
+                height,
             });
         Ok(CursorDumbBuffer::recording(device, handle, pitch, len))
     }
 
     fn map_dumb(&self, device: &Device, dumb: &mut CursorDumbBuffer) -> io::Result<CursorMapping> {
+        if let Some(raw_os_error) = self.ledger.take_failure(CursorBufferOperation::Map) {
+            return Err(io::Error::from_raw_os_error(raw_os_error));
+        }
         let fd = device.as_fd().as_raw_fd();
         ensure_device(device, dumb.device_fd)?;
         if !self.ledger.live_dumb.borrow().contains(&(fd, dumb.handle)) {
@@ -509,7 +590,14 @@ impl CursorBufferIo for RecordingCursorBufferIo {
                 device_fd: fd,
                 handle: dumb.handle,
             });
-        CursorMapping::recording(dumb.len)
+        let storage = self
+            .ledger
+            .storage
+            .borrow()
+            .get(&(fd, dumb.handle))
+            .cloned()
+            .ok_or_else(|| io::Error::other("recording cursor backing is not live"))?;
+        CursorMapping::recording(storage)
     }
 
     fn add_argb_framebuffer(
@@ -519,6 +607,9 @@ impl CursorBufferIo for RecordingCursorBufferIo {
         _width: u32,
         _height: u32,
     ) -> io::Result<framebuffer::Handle> {
+        if let Some(raw_os_error) = self.ledger.take_failure(CursorBufferOperation::AddFb) {
+            return Err(io::Error::from_raw_os_error(raw_os_error));
+        }
         let fd = device.as_fd().as_raw_fd();
         ensure_device(device, dumb.device_fd)?;
         if !self
@@ -546,6 +637,9 @@ impl CursorBufferIo for RecordingCursorBufferIo {
                 device_fd: fd,
                 handle: dumb.handle,
                 fb: raw_fb,
+                width: _width,
+                height: _height,
+                format: u32::from_be_bytes(*b"AR24"),
             });
         Ok(fb)
     }
@@ -610,6 +704,7 @@ impl CursorBufferIo for RecordingCursorBufferIo {
                 "unknown recording cursor dumb buffer",
             ));
         }
+        self.ledger.storage.borrow_mut().remove(&(fd, dumb.handle));
         self.ledger
             .records
             .borrow_mut()
@@ -666,6 +761,8 @@ impl CursorBuffer {
             fb: Some(fb),
             stride,
             len,
+            width,
+            height,
         };
         // The newly allocated ARGB image starts transparent.
         buffer.clear();
@@ -694,6 +791,57 @@ impl CursorBuffer {
 
     pub(crate) fn stride(&self) -> u32 {
         self.stride
+    }
+
+    pub(crate) fn io(&self) -> Rc<dyn CursorBufferIo> {
+        Rc::clone(&self.io)
+    }
+
+    pub(crate) fn write_image(
+        &mut self,
+        image_w: u32,
+        image_h: u32,
+        bgra_bytes: &[u8],
+    ) -> io::Result<()> {
+        if image_w == 0 || image_h == 0 || image_w > self.width || image_h > self.height {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cursor exceeds sprite framebuffer dimensions",
+            ));
+        }
+        let row_len = usize::try_from(image_w)
+            .ok()
+            .and_then(|width| width.checked_mul(4))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "cursor width overflow"))?;
+        let expected = row_len
+            .checked_mul(usize::try_from(image_h).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "cursor height overflow")
+            })?)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "cursor byte size overflow")
+            })?;
+        if bgra_bytes.len() != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cursor bytes must equal width*height*4",
+            ));
+        }
+        self.clear();
+        let pitch = usize::try_from(self.stride)
+            .map_err(|_| io::Error::other("cursor pitch does not fit usize"))?;
+        for row in 0..usize::try_from(image_h).expect("validated cursor height fits usize") {
+            // SAFETY: the mapping covers `len`, each destination row fits the
+            // full-size dumb-buffer pitch, and `bgra_bytes` was checked for
+            // the exact tightly packed source size.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bgra_bytes.as_ptr().add(row * row_len),
+                    self.ptr().as_ptr().add(row * pitch),
+                    row_len,
+                );
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn clear(&mut self) {

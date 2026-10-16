@@ -11,17 +11,29 @@ pub(crate) struct AtomicCursorFixture {
 impl AtomicCursorFixture {
     pub(crate) fn new() -> Result<Option<Self>, String> {
         let backend = KmsBackend::for_tests_with_vk().map_err(|error| error.to_string())?;
-        Self::from_live_backend(backend)
+        Self::from_live_backend(backend, Some(64), Some(64))
+    }
+
+    pub(crate) fn new_with_cursor_capabilities(
+        cursor_width: Option<u64>,
+        cursor_height: Option<u64>,
+    ) -> Result<Option<Self>, String> {
+        let backend = KmsBackend::for_tests_with_vk().map_err(|error| error.to_string())?;
+        Self::from_live_backend(backend, cursor_width, cursor_height)
     }
 
     pub(crate) fn new_with_two_outputs() -> Result<Option<Self>, String> {
         let mut backend = KmsBackend::for_tests_with_vk_dimensions(1600, 600)
             .map_err(|error| error.to_string())?;
         super::super::push_test_output(&mut backend, 2);
-        Self::from_live_backend(backend)
+        Self::from_live_backend(backend, Some(64), Some(64))
     }
 
-    fn from_live_backend(mut backend: KmsBackend) -> Result<Option<Self>, String> {
+    fn from_live_backend(
+        mut backend: KmsBackend,
+        cursor_width: Option<u64>,
+        cursor_height: Option<u64>,
+    ) -> Result<Option<Self>, String> {
         install_recording_device_caps(&mut backend);
         let vk = Arc::clone(
             backend
@@ -37,7 +49,9 @@ impl AtomicCursorFixture {
             );
             return Ok(None);
         }
-        backend.platform.for_tests_initialize_cursor_planes();
+        backend
+            .platform
+            .for_tests_initialize_cursor_planes_with_capabilities(cursor_width, cursor_height);
         install_recording_scanout_pools(&mut backend, vk)?;
         let layouts = backend.platform.scene_output_layouts();
         backend.scene =
@@ -59,9 +73,18 @@ impl AtomicCursorFixture {
     }
 
     pub(crate) fn without_scene() -> Result<Self, String> {
+        Self::without_scene_with_cursor_capabilities(Some(64), Some(64))
+    }
+
+    pub(crate) fn without_scene_with_cursor_capabilities(
+        cursor_width: Option<u64>,
+        cursor_height: Option<u64>,
+    ) -> Result<Self, String> {
         let mut backend = KmsBackend::for_tests();
         install_recording_device_caps(&mut backend);
-        backend.platform.for_tests_initialize_cursor_planes();
+        backend
+            .platform
+            .for_tests_initialize_cursor_planes_with_capabilities(cursor_width, cursor_height);
         let recorders = Rc::clone(
             backend
                 .platform

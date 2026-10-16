@@ -33,6 +33,34 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-10-16 atomic-cursor-only A4:** a per-device
+  sprite pool now stages two driver-capacity ARGB8888 framebuffers at the
+  existing cursor upload boundary. It retains the newest wanted image on
+  allocation pressure, clears the full mapped extent before each tight image
+  copy, and rolls back partial create/map/AddFB2 acquisitions. `Ready` and
+  `Deferred` now travel through scene and direct-scanout upload callers; a
+  deferred direct update keeps the existing cursor mode and schedules a
+  Backend retry. The legacy cursor buffer and binding remain authoritative in
+  A4; atomic lease binding and submitted/on-screen ownership are A5 work.
+  Targeted Backend tests pass for sub-64 capability values, full-capacity
+  geometry, ARGB bytes/padding and reuse, rollback, core-loop PutImage
+  validation, unchanged readback, and oversized-source software admission.
+  The malformed-request test's temporary BadLength mutation failed on the
+  exact short-request sequence 5/opcode 72 after its valid control passed; the
+  guard was restored. All five allocation/image mutations failed their byte or
+  resource-ledger assertions and were reverted. Under 16 busy loops, cap
+  dimensions passed 5/5; the GPU-fed full-buffer and allocation-failure tests
+  each passed 20/20; the raw-wire malformed-request test passed 20/20 after its
+  final rewrite. Nightly/stable formatting, yserver build, default and whole
+  ignored workspace suites, default and ignored render acceptance, both
+  Clippy gates, layout, and `git diff --check` passed. The ignored workspace
+  run executed 173 yserver, 1 DRI3 fd-leak, 10 GLX TFP, 191 render-acceptance,
+  64 yserver-render, and 2 doctests with no failures or SYNC_FD capability
+  skips. Stable `cargo fmt --all` reports that two configured rustfmt options
+  require nightly; the required nightly formatter passes. Lavapipe render
+  acceptance emitted Mesa device-info lookup diagnostics while all 191 tests
+  passed. No hardware validation was run; controller Task C11 owns it.
+
 - **2026-10-16 atomic-cursor-only A3 fix round 1:** the review gaps are closed.
   `cursor_plane/topology.rs` now owns atomic cursor discovery, ten-property
   qualification, virtual-driver hotspot checks, and exclusive CRTC matching.

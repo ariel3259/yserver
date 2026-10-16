@@ -905,6 +905,9 @@ impl From<crate::kms::vk::logic_fill_pipeline::LogicFillError> for SceneError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CursorTransitionResult {
     Applied,
+    /// Sprite storage is temporarily unavailable. Preserve the current
+    /// applied mode and retry the newest wanted record on a later tick.
+    Deferred,
     /// The requested HW show did not remain bound. The retired frame omitted
     /// the SW sprite, so actual mode is Hidden until the forced repaint.
     Hidden,

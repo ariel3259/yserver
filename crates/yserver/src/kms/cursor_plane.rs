@@ -24,6 +24,7 @@
 //! hazard).
 
 pub(crate) mod ops;
+pub(crate) mod sprites;
 pub(crate) mod topology;
 
 use std::{
@@ -39,7 +40,10 @@ use drm::{
 };
 
 use crate::drm::Device;
+#[cfg(test)]
+use ops::RecordingCursorBufferIo;
 use ops::{CursorBuffer, CursorBufferIo, DrmCursorBufferIo, DrmLegacyCursorIo, LegacyCursorIo};
+use sprites::SpritePool;
 use topology::{
     CursorPlaneDiscovery, CursorPlaneDiscoveryIo, CursorPlaneProperties, DrmCursorPlaneDiscovery,
     cursor_plane_topology,
@@ -265,6 +269,14 @@ fn show_with_rollback(
 pub const HW_CURSOR_FALLBACK_W: u32 = 64;
 pub const HW_CURSOR_FALLBACK_H: u32 = 64;
 
+fn cursor_cap_dimension(capability: io::Result<u64>, fallback: u32) -> u32 {
+    capability
+        .ok()
+        .filter(|value| *value != 0)
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(fallback)
+}
+
 /// A single shared DRM dumb buffer holding the current cursor image,
 /// plus per-CRTC visibility state.
 ///
@@ -276,6 +288,7 @@ pub const HW_CURSOR_FALLBACK_H: u32 = 64;
 pub struct CursorPlane {
     device: Rc<Device>,
     cursor_buffer: Option<CursorBuffer>,
+    sprite_pool: SpritePool,
     operations: CursorPlaneOperations,
     dumb: Option<CursorPlaneBuffer>,
     ptr: NonNull<u8>,
@@ -485,18 +498,14 @@ impl CursorPlane {
     ) -> io::Result<Self> {
         let discovery_io: Rc<dyn CursorPlaneDiscoveryIo> = Rc::new(DrmCursorPlaneDiscovery);
         let discovery = discovery_io.discover(&device)?;
-        let width = device
-            .get_driver_capability(DriverCapability::CursorWidth)
-            .ok()
-            .filter(|&w| w >= u64::from(HW_CURSOR_FALLBACK_W))
-            .and_then(|w| u32::try_from(w).ok())
-            .unwrap_or(HW_CURSOR_FALLBACK_W);
-        let height = device
-            .get_driver_capability(DriverCapability::CursorHeight)
-            .ok()
-            .filter(|&h| h >= u64::from(HW_CURSOR_FALLBACK_H))
-            .and_then(|h| u32::try_from(h).ok())
-            .unwrap_or(HW_CURSOR_FALLBACK_H);
+        let width = cursor_cap_dimension(
+            device.get_driver_capability(DriverCapability::CursorWidth),
+            HW_CURSOR_FALLBACK_W,
+        );
+        let height = cursor_cap_dimension(
+            device.get_driver_capability(DriverCapability::CursorHeight),
+            HW_CURSOR_FALLBACK_H,
+        );
         Self::from_discovery(
             device,
             crtcs,
@@ -534,6 +543,7 @@ impl CursorPlane {
         let plane = Self {
             device,
             cursor_buffer: Some(cursor_buffer),
+            sprite_pool: SpritePool::new(width, height),
             operations: CursorPlaneOperations::Legacy(legacy_io),
             dumb: Some(dumb),
             ptr,
@@ -570,6 +580,18 @@ impl CursorPlane {
         crtcs: &[crtc::Handle],
         buffer_io: Rc<dyn CursorBufferIo>,
         legacy_io: Rc<dyn LegacyCursorIo>,
+    ) -> io::Result<Self> {
+        Self::for_tests_with_capabilities(device, crtcs, buffer_io, legacy_io, Some(64), Some(64))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_with_capabilities(
+        device: Rc<Device>,
+        crtcs: &[crtc::Handle],
+        buffer_io: Rc<dyn CursorBufferIo>,
+        legacy_io: Rc<dyn LegacyCursorIo>,
+        cursor_width: Option<u64>,
+        cursor_height: Option<u64>,
     ) -> io::Result<Self> {
         let planes = crtcs
             .iter()
@@ -615,8 +637,14 @@ impl CursorPlane {
             legacy_io,
             discovery_io.clone(),
             discovery,
-            HW_CURSOR_FALLBACK_W,
-            HW_CURSOR_FALLBACK_H,
+            cursor_cap_dimension(
+                cursor_width.ok_or_else(|| io::Error::other("cursor width query unavailable")),
+                HW_CURSOR_FALLBACK_W,
+            ),
+            cursor_cap_dimension(
+                cursor_height.ok_or_else(|| io::Error::other("cursor height query unavailable")),
+                HW_CURSOR_FALLBACK_H,
+            ),
         )?;
         plane.test_discovery = Some(discovery_io);
         Ok(plane)
@@ -648,20 +676,22 @@ impl CursorPlane {
     }
 
     /// Build an ioctl-free cursor plane for platform state-machine tests.
-    /// The backing allocation is real, so upload/version paths are safe; show
-    /// remains unavailable because there is deliberately no dumb buffer.
+    /// The recording backing exercises the production allocation/upload path;
+    /// show remains unavailable because there is deliberately no DRM dumb
+    /// buffer.
     #[cfg(test)]
     pub(crate) fn for_tests_stub(device: Rc<Device>, width: u32, height: u32) -> Self {
-        let stride = width.checked_mul(4).expect("test cursor stride overflow");
-        let len = usize::try_from(stride)
-            .expect("test cursor stride fits usize")
-            .checked_mul(usize::try_from(height).expect("test cursor height fits usize"))
-            .expect("test cursor allocation overflow");
-        let mut test_backing = vec![0_u8; len].into_boxed_slice();
-        let ptr = NonNull::new(test_backing.as_mut_ptr()).expect("non-empty test cursor buffer");
+        let (buffer_io, _) = RecordingCursorBufferIo::new(1);
+        let cursor_buffer =
+            CursorBuffer::allocate(Rc::clone(&device), Rc::new(buffer_io), width, height)
+                .expect("recording cursor backing allocation");
+        let stride = cursor_buffer.stride();
+        let len = cursor_buffer.len();
+        let ptr = cursor_buffer.ptr();
         Self {
             device: Rc::clone(&device),
-            cursor_buffer: None,
+            cursor_buffer: Some(cursor_buffer),
+            sprite_pool: SpritePool::new(width, height),
             operations: CursorPlaneOperations::Executors {
                 hide: Rc::new(DrmCursorHideExecutor),
                 show: Rc::new(DrmCursorShowExecutor),
@@ -685,7 +715,7 @@ impl CursorPlane {
             pending_discovery: None,
             #[cfg(test)]
             test_discovery: None,
-            _test_backing: Some(test_backing),
+            _test_backing: None,
         }
     }
 
@@ -938,19 +968,53 @@ impl CursorPlane {
         image_w: u32,
         image_h: u32,
         bgra_bytes: &[u8],
-    ) -> io::Result<()> {
-        if self.uploaded_version == Some(version) {
-            return Ok(());
+    ) -> io::Result<yserver_render::kms::render::scene::CursorUploadOutcome> {
+        if self.uploaded_version == Some(version)
+            && self
+                .sprite_pool
+                .candidate_lease()
+                .is_some_and(|lease| lease.version() == version)
+        {
+            return Ok(yserver_render::kms::render::scene::CursorUploadOutcome::Ready);
+        }
+        let Some(buffer) = self.cursor_buffer.as_mut() else {
+            return Err(io::Error::other("cursor plane already destroyed"));
+        };
+        let buffer_io = buffer.io();
+        match self.sprite_pool.prepare(
+            Rc::clone(&self.device),
+            buffer_io,
+            version,
+            image_w,
+            image_h,
+            bgra_bytes,
+        )? {
+            yserver_render::kms::render::scene::CursorUploadOutcome::Ready => {}
+            deferred @ yserver_render::kms::render::scene::CursorUploadOutcome::Deferred => {
+                return Ok(deferred);
+            }
         }
         self.load_image(image_w, image_h, bgra_bytes)?;
         self.uploaded_version = Some(version);
-        Ok(())
+        Ok(yserver_render::kms::render::scene::CursorUploadOutcome::Ready)
     }
 
     /// The version currently held in the dumb buffer, if any.
     #[must_use]
     pub fn uploaded_version(&self) -> Option<u64> {
         self.uploaded_version
+    }
+
+    #[cfg(test)]
+    #[allow(
+        dead_code,
+        reason = "A4 Backend tests inspect staged and retryable cursor versions"
+    )]
+    pub(crate) fn for_tests_sprite_pool_versions(&self) -> (Option<u64>, Option<u64>) {
+        (
+            self.sprite_pool.wanted_version(),
+            self.sprite_pool.candidate_version(),
+        )
     }
 
     /// Invalidate the tracked uploaded version. The next
@@ -1030,7 +1094,13 @@ impl CursorPlane {
             "cursor_plane::hide CRTC={crtc:?} prior_visible={}",
             self.visible.get(&crtc).copied().unwrap_or(false),
         );
-        self.hide_legacy(crtc)
+        self.hide_legacy(crtc)?;
+        if !self.is_visible()
+            && let Some(lease) = self.sprite_pool.candidate_lease()
+        {
+            self.sprite_pool.cancel_candidate(lease);
+        }
+        Ok(())
     }
 
     #[allow(deprecated)]

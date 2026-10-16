@@ -1,6 +1,1042 @@
 use super::support::AtomicCursorFixture;
 
 #[test]
+// Mutation: rejecting valid sub-64 cursor caps or accepting zero/overflow query results breaks these allocations.
+fn atomic_cursor_only_cursor_cap_dimensions_use_valid_values_and_per_axis_fallbacks() {
+    let rows = [
+        (Some(32), Some(24), 32, 24),
+        (None, Some(24), 64, 24),
+        (Some(0), Some(u64::MAX), 64, 64),
+    ];
+    for (cursor_width, cursor_height, expected_width, expected_height) in rows {
+        let fixture = AtomicCursorFixture::without_scene_with_cursor_capabilities(
+            cursor_width,
+            cursor_height,
+        )
+        .expect("build recording Backend cursor fixture");
+        let records = fixture.recorders.cursor_buffer_ledger.records();
+        let creates: Vec<_> = records
+            .iter()
+            .filter_map(|record| match record {
+                crate::kms::cursor_plane::ops::CursorBufferRecord::Create {
+                    width, height, ..
+                } => Some((*width, *height)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(creates, vec![(expected_width, expected_height)]);
+        let framebuffers: Vec<_> = records
+            .iter()
+            .filter_map(|record| match record {
+                crate::kms::cursor_plane::ops::CursorBufferRecord::AddFb {
+                    width,
+                    height,
+                    format,
+                    ..
+                } => Some((*width, *height, *format)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            framebuffers,
+            vec![(
+                expected_width,
+                expected_height,
+                u32::from_be_bytes(*b"AR24")
+            )],
+        );
+        fixture.assert_cursor_quiescent();
+        let ledger = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
+        drop(fixture);
+        assert_eq!(ledger.end_state(), (0, 0, 0));
+    }
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutations: publish before AddFB2, omit AddFB2-failure unmap, omit map-failure destroy, or retain partial first allocations.
+fn atomic_cursor_only_failed_sprite_allocation_preserves_prior_image() {
+    use crate::kms::cursor_plane::ops::CursorBufferOperation;
+    use yserver_core::backend::{AnyHandle, Backend};
+
+    let cases = [
+        (CursorBufferOperation::AddFb, 0, "addfb"),
+        (CursorBufferOperation::Create, 0, "create"),
+        (CursorBufferOperation::Map, 0, "map"),
+        (CursorBufferOperation::Create, 1, "second-initial-create"),
+    ];
+    for (operation, successes_before_failure, label) in cases {
+        let Some(mut fixture) =
+            AtomicCursorFixture::new_with_cursor_capabilities(Some(32), Some(24))
+                .expect("build allocation-failure cursor fixture")
+        else {
+            return;
+        };
+        let ledger = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
+        let initial_records = ledger.records().len();
+        ledger.fail_after(operation, successes_before_failure, libc::ENOMEM);
+
+        let source = Backend::create_pixmap(&mut fixture.backend, None, 32, 1, 1)
+            .expect("create depth-32 cursor pixmap through Backend");
+        let pixels = [0x41, 0x52, 0x63, 0xff];
+        Backend::put_image(
+            &mut fixture.backend,
+            None,
+            source.as_raw(),
+            32,
+            1,
+            1,
+            0,
+            0,
+            &pixels,
+        )
+        .expect("upload complete cursor source through Backend");
+        let picture = Backend::render_create_picture(
+            &mut fixture.backend,
+            None,
+            AnyHandle::Pixmap(source),
+            0,
+            0,
+            &[],
+        )
+        .expect("create source picture through Backend")
+        .expect("picture handle");
+        let cursor = Backend::render_create_cursor(&mut fixture.backend, None, picture, 0, 0)
+            .expect("create ARGB cursor through Backend")
+            .expect("cursor handle");
+        let root = fixture.backend.core.window_id;
+        Backend::define_cursor(&mut fixture.backend, None, root, cursor.as_raw())
+            .expect("define cursor through Backend");
+        Backend::warp_pointer_root(&mut fixture.backend, &mut fixture.state, 80, 90);
+        let root = fixture.backend.core.window_id;
+        let root_width = fixture.backend.platform.fb_w;
+        let root_height = fixture.backend.platform.fb_h;
+        Backend::clear_area(
+            &mut fixture.backend,
+            None,
+            root,
+            0,
+            None,
+            0,
+            0,
+            root_width,
+            root_height,
+            (0, 0),
+        )
+        .expect("damage root through Backend");
+        Backend::maybe_composite(&mut fixture.backend)
+            .expect("submit cursor frame through Backend");
+        fixture.retire_output(0, 1);
+
+        let version = fixture.backend.cursor_records[&cursor.as_raw()].version;
+        let plane = fixture.backend.platform.devices[0]
+            .cursor
+            .plane
+            .as_ref()
+            .expect("initialized cursor plane");
+        let pool_versions = plane.for_tests_sprite_pool_versions();
+        assert_eq!(
+            pool_versions.0,
+            Some(version),
+            "{label}: wanted image is retained"
+        );
+        assert_eq!(
+            fixture
+                .backend
+                .platform
+                .cursor_plane_uploaded_version_for_output(0),
+            None,
+            "{label}: Deferred is not a successful upload",
+        );
+        assert!(
+            fixture.recorders.legacy_cursor.records().is_empty(),
+            "{label}: Deferred does not bind or replace the existing image",
+        );
+        assert!(
+            !fixture.backend.platform.cursor_plane_visible_for_output(0),
+            "{label}: Deferred leaves the current hardware binding unchanged",
+        );
+        assert_eq!(
+            ledger.end_state(),
+            (1, 1, 1),
+            "{label}: only the pre-existing legacy backing remains live",
+        );
+        let rollback: Vec<_> = ledger.records()[initial_records..].to_vec();
+        match label {
+            "create" => assert!(rollback.is_empty(), "failed create acquires nothing"),
+            "map" => assert!(matches!(
+                rollback.as_slice(),
+                [
+                    crate::kms::cursor_plane::ops::CursorBufferRecord::Create { .. },
+                    crate::kms::cursor_plane::ops::CursorBufferRecord::Destroy { .. }
+                ]
+            )),
+            "addfb" => assert!(matches!(
+                rollback.as_slice(),
+                [
+                    crate::kms::cursor_plane::ops::CursorBufferRecord::Create { .. },
+                    crate::kms::cursor_plane::ops::CursorBufferRecord::Map { .. },
+                    crate::kms::cursor_plane::ops::CursorBufferRecord::Unmap { .. },
+                    crate::kms::cursor_plane::ops::CursorBufferRecord::Destroy { .. }
+                ]
+            )),
+            "second-initial-create" => assert!(matches!(
+                rollback.as_slice(),
+                [
+                    crate::kms::cursor_plane::ops::CursorBufferRecord::Create { .. },
+                    crate::kms::cursor_plane::ops::CursorBufferRecord::Map { .. },
+                    crate::kms::cursor_plane::ops::CursorBufferRecord::AddFb { .. },
+                    crate::kms::cursor_plane::ops::CursorBufferRecord::RemoveFb { .. },
+                    crate::kms::cursor_plane::ops::CursorBufferRecord::Unmap { .. },
+                    crate::kms::cursor_plane::ops::CursorBufferRecord::Destroy { .. }
+                ]
+            )),
+            _ => unreachable!("known allocation failure case"),
+        }
+        assert_eq!(
+            pool_versions,
+            (Some(version), None),
+            "{label}: wanted image remains retryable while no candidate is published",
+        );
+
+        Backend::maybe_composite(&mut fixture.backend)
+            .expect("Backend scheduler retries deferred cursor staging");
+        assert!(
+            fixture.backend.scene.has_pending_page_flips(),
+            "{label}: retry is carried by a real Backend scene frame",
+        );
+        fixture.retire_output(0, 2);
+        assert_eq!(
+            fixture
+                .backend
+                .platform
+                .cursor_plane_uploaded_version_for_output(0),
+            Some(version),
+            "{label}: retry stages and uploads the retained wanted record",
+        );
+        assert_eq!(
+            fixture.backend.platform.devices[0]
+                .cursor
+                .plane
+                .as_ref()
+                .expect("cursor plane")
+                .for_tests_sprite_pool_versions(),
+            (Some(version), Some(version)),
+        );
+
+        Backend::set_cursor_hidden(&mut fixture.backend, true);
+        Backend::clear_area(
+            &mut fixture.backend,
+            None,
+            root,
+            0,
+            None,
+            0,
+            0,
+            root_width,
+            root_height,
+            (0, 0),
+        )
+        .expect("damage root for Backend cursor hide");
+        Backend::maybe_composite(&mut fixture.backend).expect("submit cursor hide frame");
+        fixture.retire_output(0, 3);
+        fixture.assert_cursor_quiescent();
+        assert_eq!(
+            fixture.backend.platform.devices[0]
+                .cursor
+                .plane
+                .as_ref()
+                .expect("cursor plane")
+                .for_tests_sprite_pool_versions(),
+            (Some(version), None),
+            "{label}: hide cancels the staged candidate lease",
+        );
+        assert_eq!(
+            fixture
+                .recorders
+                .atomic
+                .records()
+                .into_iter()
+                .map(|record| record.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                crate::drm::atomic::AtomicCommitKind::Scene,
+                crate::drm::atomic::AtomicCommitKind::Scene,
+                crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            ],
+            "{label}: accepted order is original scene, successful retry, then hide",
+        );
+        let resources = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
+        drop(fixture);
+        assert_eq!(
+            resources.end_state(),
+            (0, 0, 0),
+            "{label}: teardown releases every resource"
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: omitting the per-device full-size sprite pool leaves fewer than two staged allocations.
+fn atomic_cursor_only_full_buffer_argb_upload_and_cleanup() {
+    use yserver_core::backend::{AnyHandle, Backend};
+
+    let Some(mut fixture) = AtomicCursorFixture::new_with_cursor_capabilities(Some(32), Some(24))
+        .expect("build cursor fixture with sub-64 driver caps")
+    else {
+        return;
+    };
+    let initial_creates = fixture
+        .recorders
+        .cursor_buffer_ledger
+        .records()
+        .iter()
+        .filter(|record| {
+            matches!(
+                record,
+                crate::kms::cursor_plane::ops::CursorBufferRecord::Create { .. }
+            )
+        })
+        .count();
+    assert_eq!(
+        initial_creates, 1,
+        "the legacy full-size cursor backing is initialized once"
+    );
+
+    let root = fixture.backend.core.window_id;
+    let create_argb_cursor =
+        |fixture: &mut AtomicCursorFixture, width: u16, height: u16, bytes: &[u8]| {
+            let source = Backend::create_pixmap(&mut fixture.backend, None, 32, width, height)
+                .expect("create depth-32 cursor pixmap through Backend");
+            Backend::put_image(
+                &mut fixture.backend,
+                None,
+                source.as_raw(),
+                32,
+                width,
+                height,
+                0,
+                0,
+                bytes,
+            )
+            .expect("upload exact ARGB source pixels through Backend");
+            let picture = Backend::render_create_picture(
+                &mut fixture.backend,
+                None,
+                AnyHandle::Pixmap(source),
+                0,
+                0,
+                &[],
+            )
+            .expect("create source picture through Backend")
+            .expect("picture handle");
+            let cursor = Backend::render_create_cursor(&mut fixture.backend, None, picture, 0, 0)
+                .expect("create ARGB cursor through Backend")
+                .expect("ARGB cursor handle");
+            Backend::define_cursor(&mut fixture.backend, None, root, cursor.as_raw())
+                .expect("define ARGB cursor through Backend");
+            cursor.as_raw()
+        };
+    let first_pixels = [
+        0x11, 0x22, 0x33, 0xff, 0x44, 0x55, 0x66, 0xff, 0x77, 0x88, 0x99, 0xff, 0xaa, 0xbb, 0xcc,
+        0xff,
+    ];
+    let first_cursor = create_argb_cursor(&mut fixture, 2, 2, &first_pixels);
+    assert_eq!(
+        fixture.backend.cursor_records[&first_cursor].bgra_bytes,
+        first_pixels
+    );
+    Backend::warp_pointer_root(&mut fixture.backend, &mut fixture.state, 100, 90);
+    let width = fixture.backend.platform.fb_w;
+    let height = fixture.backend.platform.fb_h;
+    Backend::clear_area(
+        &mut fixture.backend,
+        None,
+        root,
+        0,
+        None,
+        0,
+        0,
+        width,
+        height,
+        (0, 0),
+    )
+    .expect("damage root through Backend");
+    Backend::maybe_composite(&mut fixture.backend).expect("submit cursor image frame");
+    fixture.retire_output(0, 1);
+
+    let first_create = fixture
+        .recorders
+        .cursor_buffer_ledger
+        .records()
+        .into_iter()
+        .filter_map(|record| match record {
+            crate::kms::cursor_plane::ops::CursorBufferRecord::Create {
+                device_fd, handle, ..
+            } if handle != 1 => Some((device_fd, handle)),
+            _ => None,
+        })
+        .next()
+        .expect("first full-size sprite allocation");
+    let first_storage = fixture
+        .recorders
+        .cursor_buffer_ledger
+        .mapped_bytes(first_create.0, first_create.1)
+        .expect("first sprite mapping remains owned by its pool");
+    assert_eq!(&first_storage[..8], &first_pixels[..8]);
+    assert!(first_storage[8..256].iter().all(|byte| *byte == 0));
+    assert_eq!(&first_storage[256..264], &first_pixels[8..]);
+    assert!(first_storage[264..].iter().all(|byte| *byte == 0));
+
+    let smaller_pixels = [0xde, 0xad, 0xbe, 0xff];
+    let smaller_cursor = create_argb_cursor(&mut fixture, 1, 1, &smaller_pixels);
+    assert_eq!(
+        fixture.backend.cursor_records[&smaller_cursor].bgra_bytes, smaller_pixels,
+        "well-formed ARGB readback keeps exactly width*height*4 bytes",
+    );
+    Backend::clear_area(
+        &mut fixture.backend,
+        None,
+        root,
+        0,
+        None,
+        0,
+        0,
+        width,
+        height,
+        (0, 0),
+    )
+    .expect("damage root for second cursor image through Backend");
+    Backend::maybe_composite(&mut fixture.backend).expect("submit smaller cursor image frame");
+    fixture.retire_output(0, 2);
+    let sprite_creates: Vec<_> = fixture
+        .recorders
+        .cursor_buffer_ledger
+        .records()
+        .into_iter()
+        .filter_map(|record| match record {
+            crate::kms::cursor_plane::ops::CursorBufferRecord::Create {
+                device_fd,
+                handle,
+                width,
+                height,
+            } if handle != 1 => Some((device_fd, handle, width, height)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        sprite_creates,
+        vec![
+            (first_create.0, first_create.1, 32, 24),
+            (first_create.0, first_create.1 + 1, 32, 24),
+        ],
+        "reported sub-64 dimensions size complete candidate buffers",
+    );
+    let add_fb_records: Vec<_> = fixture
+        .recorders
+        .cursor_buffer_ledger
+        .records()
+        .into_iter()
+        .filter_map(|record| match record {
+            crate::kms::cursor_plane::ops::CursorBufferRecord::AddFb {
+                device_fd,
+                handle,
+                width,
+                height,
+                format,
+                ..
+            } if handle != 1 => Some((device_fd, handle, width, height, format)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(add_fb_records.len(), 2);
+    assert!(add_fb_records.iter().all(|record| {
+        (record.0, record.2, record.3, record.4)
+            == (first_create.0, 32, 24, u32::from_be_bytes(*b"AR24"))
+    }));
+    let smaller_storage = fixture
+        .recorders
+        .cursor_buffer_ledger
+        .mapped_bytes(first_create.0, sprite_creates[1].1)
+        .expect("second full-size sprite mapping remains live");
+    assert_eq!(&smaller_storage[..4], &smaller_pixels);
+    assert!(smaller_storage[4..].iter().all(|byte| *byte == 0));
+
+    let reused_pixels = [0x12, 0x34, 0x56, 0xff];
+    let reused_cursor = create_argb_cursor(&mut fixture, 1, 1, &reused_pixels);
+    Backend::clear_area(
+        &mut fixture.backend,
+        None,
+        root,
+        0,
+        None,
+        0,
+        0,
+        width,
+        height,
+        (0, 0),
+    )
+    .expect("damage root for reused cursor slot through Backend");
+    Backend::maybe_composite(&mut fixture.backend).expect("submit reused cursor slot frame");
+    fixture.retire_output(0, 3);
+    let reused_storage = fixture
+        .recorders
+        .cursor_buffer_ledger
+        .mapped_bytes(first_create.0, sprite_creates[0].1)
+        .expect("reused sprite mapping remains live");
+    assert_eq!(&reused_storage[..4], &reused_pixels);
+    assert!(
+        reused_storage[4..].iter().all(|byte| *byte == 0),
+        "smaller replacement clears pixels from the previously staged larger sprite",
+    );
+
+    let creates = fixture
+        .recorders
+        .cursor_buffer_ledger
+        .records()
+        .iter()
+        .filter(|record| {
+            matches!(
+                record,
+                crate::kms::cursor_plane::ops::CursorBufferRecord::Create { .. }
+            )
+        })
+        .count();
+    assert_eq!(
+        creates - initial_creates,
+        2,
+        "pool starts with two framebuffers per device"
+    );
+    assert_eq!(
+        fixture.recorders.atomic.records()[0].kind,
+        crate::drm::atomic::AtomicCommitKind::Scene,
+        "the upload is reached through the accepted Backend scene frame",
+    );
+
+    Backend::set_cursor_hidden(&mut fixture.backend, true);
+    Backend::clear_area(
+        &mut fixture.backend,
+        None,
+        root,
+        0,
+        None,
+        0,
+        0,
+        width,
+        height,
+        (0, 0),
+    )
+    .expect("damage root for cursor hide through Backend");
+    Backend::maybe_composite(&mut fixture.backend).expect("submit cursor hide frame");
+    fixture.retire_output(0, 4);
+    for frame in 1..=32 {
+        if !fixture.backend.scene.has_pending_page_flips() {
+            break;
+        }
+        fixture.retire_output(0, frame);
+    }
+    fixture.assert_cursor_quiescent();
+    assert_eq!(
+        fixture.backend.platform.devices[0]
+            .cursor
+            .plane
+            .as_ref()
+            .expect("cursor plane")
+            .for_tests_sprite_pool_versions(),
+        (
+            Some(fixture.backend.cursor_records[&reused_cursor].version),
+            None
+        ),
+        "hide cancels the final staged lease after all output obligations retire",
+    );
+    let atomic_kinds: Vec<_> = fixture
+        .recorders
+        .atomic
+        .records()
+        .into_iter()
+        .map(|record| record.kind)
+        .collect();
+    assert_eq!(
+        atomic_kinds,
+        vec![
+            crate::drm::atomic::AtomicCommitKind::Scene,
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+        ],
+        "the accepted frame sequence is initial scene then cursor hide",
+    );
+
+    let ledger = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
+    drop(fixture);
+    assert_eq!(ledger.end_state(), (0, 0, 0));
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: replace the short-ZPixmap silent return in drawing.rs with BadLength; this must expose that exact X11 error.
+fn atomic_cursor_only_malformed_cursor_source_stops_at_request_validation() {
+    use std::{
+        collections::{HashMap, HashSet, VecDeque},
+        io::{Read, Write},
+        os::unix::net::UnixStream,
+        sync::{Arc, Mutex, atomic::AtomicU16},
+        time::Duration,
+    };
+    use yserver_core::{
+        backend::{AnyHandle, Backend},
+        core_loop::{
+            CoreSender, Message, ResetPolicy, auth::AuthState, channel, client_reader,
+            poll_tokens::ClientIdAllocator, run_core,
+        },
+        server::ClientState,
+        transport::Transport,
+    };
+    use yserver_protocol::x11::{ClientByteOrder, ClientId, ResourceId};
+
+    fn wire_request(opcode: u8, data: u8, body: &[u8]) -> Vec<u8> {
+        let byte_len = body.len() + 4;
+        assert_eq!(byte_len % 4, 0, "X11 request is four-byte aligned");
+        let length_units = u16::try_from(byte_len / 4).expect("request length fits");
+        let mut wire = vec![opcode, data];
+        wire.extend_from_slice(&length_units.to_le_bytes());
+        wire.extend_from_slice(body);
+        assert_eq!(wire.len(), usize::from(length_units) * 4);
+        wire
+    }
+
+    fn read_response(peer: &mut UnixStream) -> Vec<u8> {
+        let mut packet = vec![0; 32];
+        peer.read_exact(&mut packet).expect("read X11 response");
+        if packet[0] == 1 {
+            let extra_words = u32::from_le_bytes(packet[4..8].try_into().unwrap());
+            let extra_bytes = usize::try_from(extra_words).expect("reply length fits") * 4;
+            let start = packet.len();
+            packet.resize(start + extra_bytes, 0);
+            peer.read_exact(&mut packet[start..])
+                .expect("read variable GetImage reply data");
+        }
+        packet
+    }
+
+    fn put_image_body(drawable: u32, gc: u32, width: u16, height: u16, pixels: &[u8]) -> Vec<u8> {
+        let mut body = Vec::with_capacity(20 + pixels.len());
+        body.extend_from_slice(&drawable.to_le_bytes());
+        body.extend_from_slice(&gc.to_le_bytes());
+        body.extend_from_slice(&width.to_le_bytes());
+        body.extend_from_slice(&height.to_le_bytes());
+        body.extend_from_slice(&0_i16.to_le_bytes());
+        body.extend_from_slice(&0_i16.to_le_bytes());
+        body.extend_from_slice(&[0, 32, 0, 0]);
+        body.extend_from_slice(pixels);
+        body
+    }
+
+    let mut backend = crate::kms::render::backend::KmsBackend::for_tests_with_vk()
+        .expect("build lavapipe backend for core-loop request validation");
+    if !backend
+        .platform
+        .gpu
+        .vk
+        .as_ref()
+        .is_some_and(|vk| vk.supports_sync_fd())
+    {
+        eprintln!("skipping: Vulkan device lacks SYNC_FD semaphore export; cursor test needs it");
+        return;
+    }
+    backend
+        .platform
+        .for_tests_initialize_cursor_planes_with_capabilities(Some(32), Some(24));
+    let recorders = std::rc::Rc::clone(
+        backend
+            .platform
+            .services
+            .test_recorders
+            .as_ref()
+            .expect("test backend owns recording services"),
+    );
+    let (drm_fd, _drm_peer) = UnixStream::pair().expect("pollable synthetic DRM fd");
+    let pollable_device = std::rc::Rc::new(crate::drm::Device::from_inherited_kms_fd(
+        std::os::fd::OwnedFd::from(drm_fd),
+        "<atomic cursor core-loop test fd>",
+    ));
+    recorders.page_flip_events.register_device(&pollable_device);
+    backend.platform.devices[0].device = pollable_device;
+    let mut fixture = AtomicCursorFixture {
+        backend,
+        recorders,
+        state: yserver_core::server::ServerState::new(),
+    };
+    let client_id = ClientId(1);
+    let pixmap_id = ResourceId(0x1001);
+    let gc_id = ResourceId(0x1002);
+    let pool_records_before = fixture.recorders.cursor_buffer_ledger.records();
+    let legacy_record = pool_records_before
+        .iter()
+        .find_map(|record| match record {
+            crate::kms::cursor_plane::ops::CursorBufferRecord::Create {
+                device_fd, handle, ..
+            } => Some((*device_fd, *handle)),
+            _ => None,
+        })
+        .expect("legacy cursor backing exists");
+    let legacy_pixels_before = fixture
+        .recorders
+        .cursor_buffer_ledger
+        .mapped_bytes(legacy_record.0, legacy_record.1)
+        .expect("legacy cursor mapping is live");
+    assert_eq!(fixture.backend.effective_cursor_xid, None);
+
+    let (transport, mut peer) = Transport::pair().expect("client socket pair");
+    let writer = transport
+        .try_clone()
+        .expect("clone client transport for core writer");
+    peer.set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("set reply timeout");
+    let (reader_control, reader_control_rx) = crossbeam_channel::unbounded();
+    fixture.state.clients.insert(
+        client_id.0,
+        ClientState {
+            writer: Arc::new(Mutex::new(writer)),
+            is_local: true,
+            fd_passing: true,
+            internal: false,
+            byte_order: ClientByteOrder::LittleEndian,
+            last_sequence: Arc::new(AtomicU16::new(0)),
+            resource_id_base: 0,
+            resource_id_mask: u32::MAX,
+            event_masks: HashMap::new(),
+            save_set: HashSet::new(),
+            big_requests_enabled: false,
+            xi2_masks: HashMap::new(),
+            xi1_event_classes: HashSet::new(),
+            xi1_window_event_classes: HashMap::new(),
+            outbound: VecDeque::new(),
+            watching_writable: false,
+            write_failed: false,
+            focused_window: yserver_core::resources::ROOT_WINDOW,
+            reader_control: Some(reader_control.clone()),
+        },
+    );
+
+    let (poll, core_sender, receiver) = channel().expect("core channel");
+    client_reader::spawn(
+        client_id,
+        transport,
+        ClientByteOrder::LittleEndian,
+        0,
+        reader_control_rx,
+        core_sender.bind(),
+    )
+    .expect("spawn reader for the synthetic X11 client");
+    let shutdown = core_sender.clone_handle();
+    let root = yserver_core::resources::ROOT_WINDOW;
+    let known_pixels: Vec<u8> = [
+        0x11, 0x22, 0x33, 0xff, 0x44, 0x55, 0x66, 0xff, 0x77, 0x88, 0x99, 0xff, 0xaa, 0xbb, 0xcc,
+        0xff,
+    ]
+    .into_iter()
+    .collect();
+    let short_pixels: Vec<u8> = [
+        0xe1, 0xe2, 0xe3, 0xff, 0xd1, 0xd2, 0xd3, 0xff, 0xc1, 0xc2, 0xc3, 0xff,
+    ]
+    .into_iter()
+    .collect();
+    let control_pixels = known_pixels.clone();
+    let driver = std::thread::spawn(move || {
+        struct ShutdownOnDrop(CoreSender);
+        impl Drop for ShutdownOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.send(Message::Shutdown);
+            }
+        }
+        let _shutdown_on_drop = ShutdownOnDrop(shutdown);
+
+        let mut wire_requests = Vec::new();
+        let mut create_pixmap = Vec::new();
+        create_pixmap.extend_from_slice(&pixmap_id.0.to_le_bytes());
+        create_pixmap.extend_from_slice(&root.0.to_le_bytes());
+        create_pixmap.extend_from_slice(&2_u16.to_le_bytes());
+        create_pixmap.extend_from_slice(&2_u16.to_le_bytes());
+        wire_requests.extend_from_slice(&wire_request(53, 32, &create_pixmap));
+
+        let mut create_gc = Vec::new();
+        create_gc.extend_from_slice(&gc_id.0.to_le_bytes());
+        create_gc.extend_from_slice(&pixmap_id.0.to_le_bytes());
+        create_gc.extend_from_slice(&0_u32.to_le_bytes());
+        wire_requests.extend_from_slice(&wire_request(55, 0, &create_gc));
+
+        let valid = wire_request(
+            72,
+            2,
+            &put_image_body(pixmap_id.0, gc_id.0, 2, 2, &control_pixels),
+        );
+        assert_eq!(valid.len(), 40, "valid 2x2 ZPixmap is 10 request units");
+        wire_requests.extend_from_slice(&valid);
+
+        let mut get_image = Vec::new();
+        get_image.extend_from_slice(&pixmap_id.0.to_le_bytes());
+        get_image.extend_from_slice(&0_i16.to_le_bytes());
+        get_image.extend_from_slice(&0_i16.to_le_bytes());
+        get_image.extend_from_slice(&2_u16.to_le_bytes());
+        get_image.extend_from_slice(&2_u16.to_le_bytes());
+        get_image.extend_from_slice(&u32::MAX.to_le_bytes());
+        wire_requests.extend_from_slice(&wire_request(73, 2, &get_image));
+
+        let short = wire_request(
+            72,
+            2,
+            &put_image_body(pixmap_id.0, gc_id.0, 2, 2, &short_pixels),
+        );
+        assert_eq!(short.len(), 36, "short PutImage is exactly 9 request units");
+        assert_eq!(
+            short.len(),
+            4 + 20 + 12,
+            "header, fixed body, and payload match"
+        );
+        wire_requests.extend_from_slice(&short);
+
+        let zero_size = wire_request(72, 2, &put_image_body(pixmap_id.0, gc_id.0, 0, 2, &[]));
+        assert_eq!(zero_size.len(), 24, "zero-size PutImage is 6 request units");
+        wire_requests.extend_from_slice(&zero_size);
+        wire_requests.extend_from_slice(&wire_request(73, 2, &get_image));
+        wire_requests.extend_from_slice(&wire_request(43, 0, &[]));
+        peer.write_all(&wire_requests)
+            .expect("send raw X11 request stream including the 9-unit short PutImage");
+
+        let mut packets = Vec::new();
+        loop {
+            let packet = read_response(&mut peer);
+            let sequence = u16::from_le_bytes([packet[2], packet[3]]);
+            let is_focus_reply = packet[0] == 1 && sequence == 8;
+            packets.push(packet);
+            if is_focus_reply {
+                break;
+            }
+        }
+        packets
+    });
+
+    run_core(
+        poll,
+        receiver,
+        core_sender.clone_handle(),
+        &mut fixture.state,
+        &mut fixture.backend,
+        [],
+        &ClientIdAllocator::new(),
+        AuthState::new(None),
+        ResetPolicy::NoReset,
+        None,
+    )
+    .expect("run core through valid, short, zero-size PutImage and sync");
+    let packets = driver.join().expect("X11 request driver");
+    let _ = reader_control.send(yserver_core::server::ReaderControl::Shutdown);
+    let get_image_reply = |sequence: u16| {
+        packets
+            .iter()
+            .find(|packet| packet[0] == 1 && u16::from_le_bytes([packet[2], packet[3]]) == sequence)
+            .unwrap_or_else(|| panic!("missing GetImage reply for sequence {sequence}"))
+    };
+    let valid_reply = get_image_reply(4);
+    assert_eq!(
+        &valid_reply[32..48],
+        known_pixels,
+        "valid PutImage reaches Backend and is readable"
+    );
+    let unchanged_reply = get_image_reply(7);
+    assert_eq!(
+        &unchanged_reply[32..48],
+        known_pixels,
+        "short and zero-size requests leave the source pixmap unchanged",
+    );
+    let short_request_errors: Vec<_> = packets
+        .iter()
+        .filter(|packet| {
+            packet[0] == 0 && u16::from_le_bytes([packet[2], packet[3]]) == 5 && packet[10] == 72
+        })
+        .map(|packet| (packet[1], packet[10]))
+        .collect();
+    assert!(
+        short_request_errors.is_empty(),
+        "short request sequence 5 opcode 72 must follow the existing silent length guard; observed {short_request_errors:?}",
+    );
+    assert_eq!(
+        fixture.backend.effective_cursor_xid, None,
+        "invalid source update does not alter the current cursor"
+    );
+    assert_eq!(
+        fixture.recorders.cursor_buffer_ledger.records(),
+        pool_records_before,
+        "validation cases do not allocate or stage a cursor sprite",
+    );
+    assert_eq!(
+        fixture
+            .recorders
+            .cursor_buffer_ledger
+            .mapped_bytes(legacy_record.0, legacy_record.1)
+            .expect("legacy cursor mapping remains live"),
+        legacy_pixels_before,
+        "validation cases do not write the legacy cursor backing",
+    );
+
+    let host_pixmap = fixture
+        .state
+        .resources
+        .pixmap(pixmap_id)
+        .and_then(|pixmap| pixmap.host_xid)
+        .expect("core-created pixmap has a Backend drawable");
+    let picture = Backend::render_create_picture(
+        &mut fixture.backend,
+        None,
+        AnyHandle::Pixmap(host_pixmap),
+        0,
+        0,
+        &[],
+    )
+    .expect("create picture for unchanged pixmap")
+    .expect("picture handle");
+    let cursor = Backend::render_create_cursor(&mut fixture.backend, None, picture, 0, 0)
+        .expect("read unchanged pixmap as a RENDER cursor")
+        .expect("cursor handle");
+    assert_eq!(
+        fixture.backend.cursor_records[&cursor.as_raw()].bgra_bytes,
+        known_pixels,
+        "normal RENDER cursor readback preserves every valid source pixel",
+    );
+    assert_eq!(
+        fixture.backend.effective_cursor_xid, None,
+        "readback alone does not define a cursor"
+    );
+
+    fixture.assert_cursor_quiescent();
+    let validation_resources = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
+    drop(fixture);
+    assert_eq!(
+        validation_resources.end_state(),
+        (0, 0, 0),
+        "core-loop validation fixture releases every cursor allocation",
+    );
+
+    let Some(mut admission) = AtomicCursorFixture::new_with_cursor_capabilities(Some(32), Some(24))
+        .expect("build oversized-cursor admission fixture")
+    else {
+        return;
+    };
+    let admission_records_before = admission.recorders.cursor_buffer_ledger.records();
+
+    // This well-formed Backend source exceeds the 32x24 cursor cap; admission falls back to SW before pool upload.
+    let oversized = Backend::create_pixmap(&mut admission.backend, None, 32, 33, 1)
+        .expect("create oversized valid cursor pixmap through Backend");
+    let oversized_pixels = vec![0x5a; 33 * 4];
+    Backend::put_image(
+        &mut admission.backend,
+        None,
+        oversized.as_raw(),
+        32,
+        33,
+        1,
+        0,
+        0,
+        &oversized_pixels,
+    )
+    .expect("upload oversized but well-formed ARGB source through Backend");
+    let oversized_picture = Backend::render_create_picture(
+        &mut admission.backend,
+        None,
+        AnyHandle::Pixmap(oversized),
+        0,
+        0,
+        &[],
+    )
+    .expect("create oversized source picture")
+    .expect("oversized source picture handle");
+    let oversized_cursor =
+        Backend::render_create_cursor(&mut admission.backend, None, oversized_picture, 0, 0)
+            .expect("create well-formed oversized cursor")
+            .expect("oversized cursor handle");
+    Backend::set_cursor_hidden(&mut admission.backend, false);
+    let root = admission.backend.core.window_id;
+    Backend::define_cursor(
+        &mut admission.backend,
+        None,
+        root,
+        oversized_cursor.as_raw(),
+    )
+    .expect("define oversized cursor through Backend");
+    assert_eq!(
+        admission.backend.effective_cursor_xid,
+        Some(oversized_cursor.as_raw()),
+        "Backend definition selects the oversized cursor",
+    );
+    Backend::warp_pointer_root(&mut admission.backend, &mut admission.state, 80, 90);
+    let root = admission.backend.core.window_id;
+    let width = admission.backend.platform.fb_w;
+    let height = admission.backend.platform.fb_h;
+    Backend::clear_area(
+        &mut admission.backend,
+        None,
+        root,
+        0,
+        None,
+        0,
+        0,
+        width,
+        height,
+        (0, 0),
+    )
+    .expect("damage scene for oversized cursor admission");
+    Backend::maybe_composite(&mut admission.backend).expect("compose oversized SW cursor");
+    admission.retire_output(0, 1);
+    assert_eq!(
+        admission.backend.scene.cursor_mode(),
+        yserver_render::kms::render::scene::CursorPlaneMode::Sw,
+        "well-formed source above the driver cap uses software cursor fallback",
+    );
+    assert_eq!(
+        admission.backend.platform.devices[0]
+            .cursor
+            .plane
+            .as_ref()
+            .expect("cursor plane")
+            .for_tests_sprite_pool_versions(),
+        (None, None),
+        "oversized source is rejected before sprite-pool upload",
+    );
+    assert_eq!(
+        admission.recorders.cursor_buffer_ledger.records(),
+        admission_records_before,
+        "oversized admission does not allocate cursor sprite buffers",
+    );
+
+    Backend::set_cursor_hidden(&mut admission.backend, true);
+    Backend::clear_area(
+        &mut admission.backend,
+        None,
+        root,
+        0,
+        None,
+        0,
+        0,
+        width,
+        height,
+        (0, 0),
+    )
+    .expect("damage root for oversized cursor hide");
+    Backend::maybe_composite(&mut admission.backend).expect("submit cursor hide through Backend");
+    admission.retire_output(0, 2);
+    admission.assert_cursor_quiescent();
+    let resources = std::rc::Rc::clone(&admission.recorders.cursor_buffer_ledger);
+    drop(admission);
+    assert_eq!(
+        resources.end_state(),
+        (0, 0, 0),
+        "test teardown releases cursor allocations"
+    );
+}
+
+#[test]
 // Mutation: reordering caps in the shared production KMS-open body must break this recorded trace.
 fn atomic_cursor_only_shared_kms_open_body_orders_caps_before_driver_query() {
     use crate::drm::client_caps::{

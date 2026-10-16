@@ -447,24 +447,36 @@ impl KmsBackend {
         {
             return false;
         }
+        self.pstate.deferred_direct_cursor = None;
+        let cursor_was_bound = self.pstate.scanout_m2.cursor_bound_all;
         #[allow(clippy::cast_possible_truncation)]
         let x = self.core.cursor_x as i32;
         #[allow(clippy::cast_possible_truncation)]
         let y = self.core.cursor_y as i32;
         let mut failed = false;
         for output_idx in 0..self.platform.outputs.len() {
-            if let Err(error) = self.platform.cursor_plane_upload_image_for_output(
+            let upload = self.platform.cursor_plane_upload_image_for_output(
                 output_idx,
                 record.version,
                 u32::from(record.width),
                 u32::from(record.height),
                 &record.bgra_bytes,
-            ) {
-                log::warn!(
-                    "scanout_m2: direct cursor upload failed on output {output_idx}: {error}; unflipping"
-                );
-                failed = true;
-                break;
+            );
+            match upload {
+                Ok(yserver_render::kms::render::scene::CursorUploadOutcome::Ready) => {}
+                Ok(yserver_render::kms::render::scene::CursorUploadOutcome::Deferred) => {
+                    self.pstate.deferred_direct_cursor = Some(record.with_version(record.version));
+                    self.scene.wake_for_cursor_damage();
+                    self.pstate.scanout_m2.cursor_bound_all = cursor_was_bound;
+                    return true;
+                }
+                Err(error) => {
+                    log::warn!(
+                        "scanout_m2: direct cursor upload failed on output {output_idx}: {error}; unflipping"
+                    );
+                    failed = true;
+                    break;
+                }
             }
             if let Err(error) = self.platform.cursor_plane_show_on_crtc(
                 output_idx,
@@ -2415,6 +2427,11 @@ impl KmsBackend {
         // The helper leaves it in the slot while any CRTC is still blocked.
         self.submit_queued_direct_successor();
         if self.pstate.scanout_m2.active() {
+            if let Some(record) = self.pstate.deferred_direct_cursor.take()
+                && !self.refresh_direct_cursor_on_all_outputs(&record)
+            {
+                self.request_direct_unflip("cursor_show_failed");
+            }
             use crate::kms::render::scene::CursorPlaneMode;
             let cursor_mode = self.scene.cursor_mode();
             if self.platform.any_output_transformed() {

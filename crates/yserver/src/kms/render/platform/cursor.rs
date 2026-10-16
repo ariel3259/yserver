@@ -324,6 +324,15 @@ impl PlatformBackend {
     /// allocation path and recorded raw cursor operations. Cursor topology
     /// is synthetic at this fixture boundary; production discovery stays DRM-backed.
     pub(crate) fn for_tests_initialize_cursor_planes(&mut self) {
+        self.for_tests_initialize_cursor_planes_with_capabilities(Some(64), Some(64));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_initialize_cursor_planes_with_capabilities(
+        &mut self,
+        cursor_width: Option<u64>,
+        cursor_height: Option<u64>,
+    ) {
         for device in &mut self.devices {
             let crtcs: Vec<_> = self
                 .outputs
@@ -332,11 +341,13 @@ impl PlatformBackend {
                 .map(|output| output.output.crtc)
                 .collect();
             if !crtcs.is_empty() {
-                match crate::kms::cursor_plane::CursorPlane::for_tests_with_ops(
+                match crate::kms::cursor_plane::CursorPlane::for_tests_with_capabilities(
                     Rc::clone(&device.device),
                     &crtcs,
                     Rc::clone(&device.cursor_buffer_io),
                     Rc::clone(&device.legacy_cursor_io),
+                    cursor_width,
+                    cursor_height,
                 ) {
                     Ok(plane) => {
                         install_cursor_plane_for_device(device, &crtcs, "Vk backend fixture", plane)
@@ -1034,7 +1045,7 @@ impl PlatformBackend {
         width: u32,
         height: u32,
         bgra_bytes: &[u8],
-    ) -> io::Result<()> {
+    ) -> io::Result<yserver_render::kms::render::scene::CursorUploadOutcome> {
         let (device_idx, crtc, _, _) = self.cursor_output_route(output_idx)?;
         let state = &mut self.devices[device_idx].cursor;
         if !state.available_on(crtc) {
@@ -1048,7 +1059,13 @@ impl PlatformBackend {
         // Only a real upload attempt is classified. The availability
         // precheck above and scene-side version races are not driver
         // observations and must not extend this output's backoff.
-        apply_cursor_operation_result(state, crtc, &result);
+        if let Err(error) = &result {
+            let failure = error.raw_os_error().map_or_else(
+                || io::Error::new(error.kind(), error.to_string()),
+                io::Error::from_raw_os_error,
+            );
+            apply_cursor_operation_result(state, crtc, &Err(failure));
+        }
         result
     }
 

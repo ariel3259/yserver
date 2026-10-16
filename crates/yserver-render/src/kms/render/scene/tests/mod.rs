@@ -149,7 +149,7 @@ impl CursorPlaneSink for TestSink {
         _width: u32,
         _height: u32,
         _bgra_bytes: &[u8],
-    ) -> io::Result<()> {
+    ) -> io::Result<CursorUploadOutcome> {
         Err(io::Error::other("cursor plane unavailable for output"))
     }
 

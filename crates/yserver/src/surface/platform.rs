@@ -34,9 +34,9 @@ use crate::kms::{
         gpu::{FencePool, GpuCore},
         resize_fault,
         scene::{
-            CursorPlaneSink, CursorShowFailure, FinishOutcome, FlipRetirement, FrameTargetError,
-            OffscreenTarget, OutputLayout, OutputRoute, OutputSink, PreparedOutputs, RecordFrame,
-            RenderCompletion, SceneCompositor, SlotToken,
+            CursorPlaneSink, CursorShowFailure, CursorUploadOutcome, FinishOutcome, FlipRetirement,
+            FrameTargetError, OffscreenTarget, OutputLayout, OutputRoute, OutputSink,
+            PreparedOutputs, RecordFrame, RenderCompletion, SceneCompositor, SlotToken,
         },
     },
     vk::{
@@ -361,7 +361,7 @@ impl CursorPlaneSink for SurfacePlatform {
         width: u32,
         height: u32,
         bgra_bytes: &[u8],
-    ) -> io::Result<()> {
+    ) -> io::Result<CursorUploadOutcome> {
         let hot = self.cursor.image.as_ref().map_or((0, 0), |image| image.hot);
         self.cursor.image = Some(CursorImage {
             version,
@@ -370,7 +370,7 @@ impl CursorPlaneSink for SurfacePlatform {
             hot,
             bgra: Arc::from(bgra_bytes),
         });
-        Ok(())
+        Ok(CursorUploadOutcome::Ready)
     }
 
     fn show(
