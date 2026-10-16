@@ -215,13 +215,23 @@ impl AtomicCursorFixture {
         use std::os::fd::{AsFd as _, AsRawFd as _};
         use yserver_core::backend::Backend;
 
-        let output = &self.backend.platform.outputs[output_idx].output;
-        let device = &self.backend.platform.devices[0].device;
-        self.recorders.page_flip_events.register_device(device);
+        let (crtc, device_key) = {
+            let output = &self.backend.platform.outputs[output_idx];
+            (output.output.crtc, output.key.device_key)
+        };
+        let device = Rc::clone(
+            &self
+                .backend
+                .platform
+                .device_for_key(device_key)
+                .expect("fixture output has a KMS device")
+                .device,
+        );
+        self.recorders.page_flip_events.register_device(&device);
         self.recorders
             .page_flip_events
-            .queue_flip_for_device(device, output.crtc, frame);
-        let drm_fd = self.backend.platform.devices[0].device.as_fd().as_raw_fd();
+            .queue_flip_for_device(&device, crtc, frame);
+        let drm_fd = device.as_fd().as_raw_fd();
         Backend::on_page_flip_ready(&mut self.backend, &mut self.state, drm_fd);
     }
 
@@ -307,6 +317,37 @@ impl AtomicCursorFixture {
                 output.output.crtc,
             );
         }
+    }
+
+    pub(crate) fn install_copied_recording_route(
+        &mut self,
+        route: crate::kms::scanout_route::ScanoutRoute,
+    ) -> Result<(), String> {
+        use crate::kms::vk::scanout::OutputScanout;
+
+        let vk = Arc::clone(
+            self.backend
+                .platform
+                .gpu
+                .vk
+                .as_ref()
+                .expect("Vulkan cursor fixture owns its Vk context"),
+        );
+        let Some(Some(OutputScanout::Shared(mut destinations))) = self
+            .backend
+            .platform
+            .scanout_pools
+            .get_mut(0)
+            .map(Option::take)
+        else {
+            return Err("copied recording route requires the shared test destination pool".into());
+        };
+        destinations.route = route;
+        let copied =
+            crate::kms::vk::scanout::CopiedScanoutPool::for_tests_recording_pool(vk, destinations)
+                .map_err(|error| format!("allocate copied recording route: {error}"))?;
+        self.backend.platform.scanout_pools[0] = Some(OutputScanout::Copied(copied));
+        Ok(())
     }
 }
 

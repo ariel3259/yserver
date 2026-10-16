@@ -21,6 +21,13 @@ use crate::kms::{
 use ash::vk;
 use std::{io, os::fd::OwnedFd, rc::Rc};
 
+impl PlatformBackend {
+    #[cfg(test)]
+    pub(crate) fn for_tests_pending_scanout_render_completion_count(&self) -> usize {
+        self.pending_scanout_render_completions.len()
+    }
+}
+
 impl OutputSink for PlatformBackend {
     fn gpu(&self) -> &GpuCore {
         &self.gpu

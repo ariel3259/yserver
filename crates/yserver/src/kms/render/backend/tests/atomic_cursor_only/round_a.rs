@@ -2675,7 +2675,7 @@ fn clone_drm_output(output: &crate::platform::drm::Output) -> crate::platform::d
     }
 }
 
-fn damage_cursor_root(fixture: &mut AtomicCursorFixture) {
+pub(super) fn damage_cursor_root(fixture: &mut AtomicCursorFixture) {
     use yserver_core::backend::Backend;
 
     let root = fixture.backend.core.window_id;
@@ -3811,9 +3811,8 @@ fn atomic_cursor_only_shutdown_disables_before_scene_drain_and_drains_delayed_ev
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutations: omit the blocking VT detach, clear ownership before its event
-// drain, or rearm without the invalidated full state.
-fn atomic_cursor_only_vt_release_detaches_and_resume_rearms_full_state() {
+// Mutation: rearm a cursor on VT resume even though it remained hidden during suspend.
+fn atomic_cursor_only_vt_release_keeps_hidden_cursor_detached_after_resume() {
     use std::rc::Rc;
     use yserver_core::{backend::Backend, core_loop::input_inventory::InputInventory};
 
@@ -3921,8 +3920,6 @@ fn atomic_cursor_only_vt_release_detaches_and_resume_rearms_full_state() {
             .in_flight
             .is_none()
     );
-    Backend::set_cursor_hidden(&mut fixture.backend, false);
-
     Backend::finish_vt_release(
         &mut fixture.backend,
         &mut fixture.state,
@@ -3972,22 +3969,13 @@ fn atomic_cursor_only_vt_release_detaches_and_resume_rearms_full_state() {
     Backend::on_vt_acquire(&mut fixture.backend, &mut fixture.state);
     assert!(fixture.backend.scanout_allowed());
     assert!(fixture.backend.kms_outputs_active);
-    let resume_show = fixture.recorders.atomic.records().last().unwrap().clone();
+    let after_resume = fixture.recorders.atomic.records();
     assert_eq!(
-        resume_show.kind,
-        crate::drm::atomic::AtomicCommitKind::CursorOnly
+        after_resume.len(),
+        4,
+        "hidden resume submits no cursor show"
     );
-    assert!(
-        resume_show
-            .flags
-            .contains(::drm::control::AtomicCommitFlags::NONBLOCK)
-    );
-    assert!(
-        resume_show
-            .flags
-            .contains(::drm::control::AtomicCommitFlags::PAGE_FLIP_EVENT)
-    );
-    let binding = fixture
+    let resumed_state = fixture
         .backend
         .platform
         .device_for_key(device_key)
@@ -3995,82 +3983,32 @@ fn atomic_cursor_only_vt_release_detaches_and_resume_rearms_full_state() {
         .cursor
         .crtc_states
         .get(&crtc)
-        .unwrap()
-        .applied
         .unwrap();
-    assert_eq!(binding.lease, prior.lease);
-    for (property, value) in [
-        (binding.properties.fb_id, u64::from(binding.framebuffer)),
-        (binding.properties.crtc_id, u64::from(u32::from(crtc))),
-        (binding.properties.src_x, 0),
-        (binding.properties.src_y, 0),
-        (
-            binding.properties.src_w,
-            u64::from(
-                fixture.backend.platform.devices[0]
-                    .cursor
-                    .plane
-                    .as_ref()
-                    .unwrap()
-                    .width(),
-            ) << 16,
-        ),
-        (
-            binding.properties.src_h,
-            u64::from(
-                fixture.backend.platform.devices[0]
-                    .cursor
-                    .plane
-                    .as_ref()
-                    .unwrap()
-                    .height(),
-            ) << 16,
-        ),
-        (
-            binding.properties.crtc_w,
-            u64::from(
-                fixture.backend.platform.devices[0]
-                    .cursor
-                    .plane
-                    .as_ref()
-                    .unwrap()
-                    .width(),
-            ),
-        ),
-        (
-            binding.properties.crtc_h,
-            u64::from(
-                fixture.backend.platform.devices[0]
-                    .cursor
-                    .plane
-                    .as_ref()
-                    .unwrap()
-                    .height(),
-            ),
-        ),
-    ] {
-        assert!(
-            resume_show.properties.iter().any(|update| {
-                update.object == binding.properties.plane.into()
-                    && update.property == property
-                    && update.value == value
-            }),
-            "resume full-state show omitted {property:?}={value}"
-        );
-    }
-    fixture.retire_output(0, 3);
-    Backend::set_cursor_hidden(&mut fixture.backend, true);
+    assert!(resumed_state.applied.is_none());
+    assert!(resumed_state.intent.is_none());
+    assert!(resumed_state.in_flight.is_none());
+    assert!(!fixture.backend.platform.cursor_plane_visible_for_output(0));
+    assert!(
+        !fixture
+            .backend
+            .platform
+            .cursor_atomic_event_pending_for_output(0),
+        "hidden VT resume creates no cursor event obligation",
+    );
+    assert_eq!(
+        fixture.backend.platform.devices[0]
+            .cursor
+            .plane
+            .as_ref()
+            .unwrap()
+            .sprite_user_count(prior.lease),
+        Some(0),
+        "the blocked detach retired the old user and hidden resume did not reacquire it",
+    );
     damage_cursor_root(&mut fixture);
-    Backend::maybe_composite(&mut fixture.backend).expect("hide after VT resume");
+    Backend::maybe_composite(&mut fixture.backend).expect("compose hidden VT resume state");
     if fixture.backend.scene.has_pending_page_flips() {
-        fixture.retire_output(0, 4);
-    }
-    if fixture
-        .backend
-        .platform
-        .cursor_atomic_event_pending_for_output(0)
-    {
-        fixture.retire_output(0, 5);
+        fixture.retire_output(0, 3);
     }
     fixture.assert_cursor_quiescent();
     assert_eq!(
@@ -4086,15 +4024,98 @@ fn atomic_cursor_only_vt_release_detaches_and_resume_rearms_full_state() {
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
             crate::drm::atomic::AtomicCommitKind::Scene,
-            crate::drm::atomic::AtomicCommitKind::CursorOnly,
-            crate::drm::atomic::AtomicCommitKind::CursorOnly,
+            crate::drm::atomic::AtomicCommitKind::Scene,
         ],
-        "VT sequence is attach, rejected hide, blocking detach, full-state reattach, and cleanup",
+        "VT sequence is attach, rejected hide, blocking detach, and cursorless resume frame",
     );
     assert!(fixture.recorders.legacy_cursor.records().is_empty());
     let resources = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
     drop(fixture);
     assert_eq!(resources.end_state(), (0, 0, 0));
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: inject FB 0x8101 while the recorded Backend commit expects 0x8100; the direct FB assertion must fail.
+fn atomic_cursor_only_direct_probe_uses_backend_recorded_sink() {
+    use yserver_core::backend::Backend;
+
+    let Some(mut fixture) = AtomicCursorFixture::new_with_cursor_capabilities(Some(32), Some(24))
+        .expect("build direct-probe cursor fixture")
+    else {
+        return;
+    };
+    fixture
+        .backend
+        .platform
+        .for_tests_accept_output_power_commits();
+    let setup = setup_cursor_only_direct_present(&mut fixture);
+
+    let mut entered_direct = false;
+    for attempt in 0..16_u64 {
+        let (candidate, event) = direct_present_for_id(&setup, 22_000 + attempt);
+        Backend::note_present_scanout_candidate(&mut fixture.backend, candidate);
+        if Backend::try_present_direct(&mut fixture.backend, candidate, event)
+            .expect("submit direct probe through Backend")
+        {
+            fixture.retire_output(0, 30 + u32::try_from(attempt).expect("frame fits"));
+            Backend::maybe_composite(&mut fixture.backend)
+                .expect("settle direct probe retirement through Backend");
+            entered_direct = fixture.backend.pstate.scanout_m2.active();
+            if entered_direct {
+                break;
+            }
+        } else if fixture.backend.scene.has_pending_page_flips() {
+            fixture.retire_output(0, 60 + u32::try_from(attempt).expect("frame fits"));
+            Backend::maybe_composite(&mut fixture.backend)
+                .expect("settle direct probe fallback through Backend");
+        }
+    }
+    assert!(
+        entered_direct,
+        "recorded probe acceptance reaches direct scanout"
+    );
+    let direct = fixture
+        .recorders
+        .atomic
+        .records()
+        .into_iter()
+        .find(|record| {
+            record.properties.iter().any(|update| {
+                update.property == setup_plane_fb_id(&fixture) && update.value == 0x8100
+            })
+        })
+        .expect("accepted direct framebuffer is submitted through the atomic sink");
+    assert!(direct.events.len() == 1);
+    assert!(fixture.backend.pstate.scanout_m2.active());
+
+    Backend::set_dpms_power(&mut fixture.backend, 3).expect("disable Backend direct scanout");
+    let _ = Backend::drain_completed_present_events(&mut fixture.backend);
+    let _ = Backend::drain_retired_present_idle_events(&mut fixture.backend);
+    assert!(!fixture.backend.pstate.scanout_m2.active());
+    fixture.assert_cursor_quiescent();
+    assert_eq!(
+        fixture
+            .recorders
+            .atomic
+            .records()
+            .iter()
+            .map(|record| record.kind)
+            .collect::<Vec<_>>(),
+        vec![
+            crate::drm::atomic::AtomicCommitKind::Scene,
+            crate::drm::atomic::AtomicCommitKind::Scene,
+        ],
+        "accepted direct probe and Backend DPMS teardown are recorded exactly once",
+    );
+    assert!(fixture.recorders.legacy_cursor.records().is_empty());
+    let resources = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
+    drop(fixture);
+    assert_eq!(resources.end_state(), (0, 0, 0));
+}
+
+fn setup_plane_fb_id(fixture: &AtomicCursorFixture) -> ::drm::control::property::Handle {
+    fixture.backend.platform.outputs[0].output.plane_fb_id_prop
 }
 
 #[test]

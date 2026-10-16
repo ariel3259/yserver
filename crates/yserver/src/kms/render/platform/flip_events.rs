@@ -143,6 +143,7 @@ pub(crate) struct RecordingPageFlipEventSource {
     registered_devices: std::cell::RefCell<HashSet<RawFd>>,
     legacy_device_fd: std::cell::Cell<Option<RawFd>>,
     delayed_ready_checks: std::cell::Cell<usize>,
+    next_drain_error: std::cell::Cell<Option<i32>>,
 }
 
 impl RecordingPageFlipEventSource {
@@ -305,6 +306,11 @@ impl RecordingPageFlipEventSource {
     }
 
     #[cfg(test)]
+    pub(crate) fn fail_next_drain(&self, raw_os_error: i32) {
+        self.next_drain_error.set(Some(raw_os_error));
+    }
+
+    #[cfg(test)]
     pub(crate) fn queued_flip_count(&self) -> usize {
         self.events
             .borrow()
@@ -332,6 +338,9 @@ impl PageFlipEventSource for RecordingPageFlipEventSource {
         &self,
         device: &crate::drm::Device,
     ) -> io::Result<(Vec<KernelPageFlip>, Vec<KernelCrtcSequence>)> {
+        if let Some(raw_os_error) = self.next_drain_error.take() {
+            return Err(io::Error::from_raw_os_error(raw_os_error));
+        }
         let fd = device.as_fd().as_raw_fd();
         let mut events = self.events.borrow_mut();
         let device_events = events.entry(fd).or_default();

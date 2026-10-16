@@ -33,6 +33,25 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-10-16 atomic-cursor-only A5 fix round 2:** Restored copied-scene
+  routing coverage through `Backend` using a real lavapipe copy source, a
+  synthetic recording KMS sink, and distinct atomic recorders; direct-probe
+  scanout is also asserted through the Backend recorder. The VT resume test
+  keeps the cursor hidden throughout suspend and verifies no resumed binding,
+  intent, or event obligation. Shutdown now forwards queued PRESENT
+  completions when old DRM-event draining fails while retaining the existing
+  cursor quarantine path. Four targeted mutations failed their regressions
+  and were reverted. Copied-scene, VT-resume, and direct-probe tests passed
+  20/20 each under 16 CPU busy loops; shutdown-drain passed 5/5. Final gates
+  passed after splitting the new regressions into `round_b.rs` to meet the
+  6,000-line test-file ceiling: default workspace yserver 1,154 passed / 185
+  ignored, core 1,732, protocol 494, render 581 / 64 ignored; full ignored
+  workspace yserver 185, DRI3 1, GLX TFP 10, render-acceptance 191,
+  yserver-render 64, and 2 doctests passed. No capability skips were reported.
+  Clippy and layout passed. Mesa printed device-information diagnostics during
+  lavapipe runs, without failures. No hardware validation was run; controller
+  Task C11 owns it.
+
 - **2026-10-16 atomic-cursor-only A5 fix round 1:** deferred show errors now
   pass through the scene sink without resolving a still-unaccepted attach as
   Hidden. Scene position-only commits clear an intent only when its lease and

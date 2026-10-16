@@ -408,6 +408,13 @@ impl KmsBackend {
                     plane.disarm_sprite_pool();
                 }
             }
+            // A failed old-event drain keeps the cursor backing quarantined,
+            // but PRESENT completions are independent protocol obligations
+            // and still need to reach the shutdown caller.
+            let completed = self.drain_completed_present_events_impl();
+            self.pending_completed_events_on_shutdown.extend(completed);
+            let completed = self.force_drain_all_present_batches();
+            self.pending_completed_events_on_shutdown.extend(completed);
             return Err(error);
         }
         self.platform
