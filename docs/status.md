@@ -61,6 +61,22 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   incremental compilation allowed the exact test suites to pass. No hardware
   was used; Task C11 owns hardware validation.
 
+- **2026-10-16 atomic-cursor-only A3 fix round 2:** the review follow-up now
+  reads raw composed scanout pixels on both sides of a CRTC boundary. The
+  ineligible CRTC's BO contains the software cursor pixel, while the eligible
+  peer's BO matches its background with the cursor bound to the hardware plane.
+  The test hides and drains through `Backend`, checks the exact two-output
+  commit sequence, and releases all cursor framebuffer resources. A second
+  Backend-driven RandR disable removes the output before quiescence assertions
+  and checks the final output-off record. Both mutations for the pixel
+  assertions and the omitted-disable mutation fail their expected checks and
+  were reverted. Under 16 busy loops the pixel test passed 20/20 and the RandR
+  teardown test passed 5/5. Default/ignored workspace suites, standalone
+  render acceptance, both Clippy gates, formatting, build, and layout passed.
+  The ignored workspace and render-acceptance runs executed their Vulkan tests
+  under lavapipe with no SYNC_FD capability skips. No hardware validation was
+  run; Task C11 owns it.
+
 - **2026-10-16 atomic-cursor-only A2:** KMS `Device::open` now records
   hotspot-cap acceptance and the DRM driver name after requesting
   UNIVERSAL_PLANES → ATOMIC → CURSOR_PLANE_HOTSPOT. Hotspot-cap rejection is

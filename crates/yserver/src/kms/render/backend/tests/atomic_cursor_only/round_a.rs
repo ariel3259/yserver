@@ -476,7 +476,8 @@ fn atomic_cursor_only_hotplug_source_arms_backend_debounce() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: bypass the recording CRTC discovery service; the Backend enable must fail before its modeset record.
+// Mutation: bypass the recording CRTC discovery service; Backend enable must fail before its modeset record.
+// Mutation: skip final Backend disable; output/resource quiescence must fail.
 fn atomic_cursor_only_randr_modeset_uses_injected_backend_services() {
     use yserver_core::backend::Backend;
 
@@ -549,6 +550,25 @@ fn atomic_cursor_only_randr_modeset_uses_injected_backend_services() {
             .collect::<Vec<_>>(),
         vec![false, true, true],
         "the accepted config records quiesce, modeset, and re-light in order",
+    );
+    assert!(
+        Backend::apply_crtc_config(&mut fixture.backend, output_id, &connector, None, 0, 0,)
+            .expect("Backend RandR teardown disables the output"),
+    );
+    assert!(
+        fixture.backend.platform.outputs.is_empty(),
+        "Backend RandR disable must remove the active output before quiescence",
+    );
+    assert_eq!(
+        fixture
+            .recorders
+            .output_power
+            .records()
+            .iter()
+            .map(|record| record.enabled)
+            .collect::<Vec<_>>(),
+        vec![false, true, true, false],
+        "Backend teardown records the final output-off operation",
     );
     fixture.assert_cursor_quiescent();
 
@@ -1067,6 +1087,295 @@ fn atomic_cursor_only_eligibility_matrix() {
         );
         fixture.assert_cursor_quiescent();
     }
+
+    let ledger = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
+    drop(fixture);
+    assert_eq!(ledger.end_state(), (0, 0, 0));
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutations: omit an ineligible output's software draw or add a draw on the eligible peer; raw scanout pixels must fail.
+fn atomic_cursor_only_composed_cursor_pixels_follow_output_local_eligibility() {
+    use std::time::Duration;
+    use yserver_core::backend::Backend;
+
+    let Some(mut fixture) =
+        AtomicCursorFixture::new_with_two_outputs().expect("build two-output cursor scene fixture")
+    else {
+        return;
+    };
+    assert_eq!(fixture.backend.platform.outputs.len(), 2);
+    assert_eq!(fixture.backend.platform.outputs[0].x, 0);
+    assert_eq!(fixture.backend.platform.outputs[1].x, 800);
+    let device_key = fixture.backend.platform.devices[0].key;
+    fixture
+        .backend
+        .platform
+        .for_tests_accept_output_power_commits();
+
+    let mut ineligible_properties = ATOMIC_CURSOR_PROPERTIES.to_vec();
+    ineligible_properties.retain(|property| *property != "CRTC_Y");
+    let snapshot = cursor_topology_snapshot(
+        "amdgpu",
+        false,
+        &[1, 2],
+        &[
+            (10, vec![1], ineligible_properties),
+            (11, vec![2], ATOMIC_CURSOR_PROPERTIES.to_vec()),
+        ],
+    );
+    assert!(
+        fixture
+            .backend
+            .platform
+            .for_tests_queue_cursor_discovery_snapshot(device_key, snapshot)
+    );
+    let calls_before = fixture
+        .backend
+        .platform
+        .for_tests_cursor_discovery_calls(device_key)
+        .expect("cursor discovery recorder");
+    fixture.recorders.connector_snapshot.queue_snapshot(vec![
+        connector_snapshot_for_output(&fixture.backend.platform.outputs[0]),
+        connector_snapshot_for_output(&fixture.backend.platform.outputs[1]),
+    ]);
+    fixture
+        .recorders
+        .hotplug
+        .queue_change()
+        .expect("queue topology hotplug edge");
+    let (base, elapsed_ms) = schedule_rescan_clock(&mut fixture.backend);
+    Backend::on_display_hotplug(&mut fixture.backend, &mut fixture.state);
+    assert_eq!(
+        fixture.backend.pstate.hotplug_rescan_deadline,
+        Some(base + Duration::from_millis(150)),
+        "Backend advertises the real topology debounce deadline",
+    );
+    assert!(Backend::next_wakeup(&fixture.backend).is_some());
+    elapsed_ms.set(149);
+    Backend::poll_deferred_input(&mut fixture.backend, &mut fixture.state);
+    assert_eq!(
+        fixture
+            .backend
+            .platform
+            .for_tests_cursor_discovery_calls(device_key),
+        Some(calls_before),
+        "no plane enumeration occurs before the debounce deadline",
+    );
+    elapsed_ms.set(150);
+    Backend::poll_deferred_input(&mut fixture.backend, &mut fixture.state);
+    assert_eq!(
+        fixture
+            .backend
+            .platform
+            .for_tests_cursor_discovery_calls(device_key),
+        Some(calls_before + 1),
+        "the consumed edge rediscovered this device once",
+    );
+    assert!(
+        !fixture
+            .backend
+            .platform
+            .cursor_plane_available_for_output(0)
+    );
+    assert!(
+        fixture
+            .backend
+            .platform
+            .cursor_plane_available_for_output(1)
+    );
+    assert!(
+        fixture
+            .backend
+            .platform
+            .cursor_plane_fits_for_output(1, 2, 1)
+    );
+
+    let root = fixture.backend.core.window_id;
+    let source =
+        Backend::create_pixmap(&mut fixture.backend, None, 1, 2, 1).expect("create cursor bitmap");
+    Backend::put_image(
+        &mut fixture.backend,
+        None,
+        source.as_raw(),
+        1,
+        2,
+        1,
+        0,
+        0,
+        &[3, 0, 0, 0],
+    )
+    .expect("paint two visible cursor pixels");
+    let cursor = Backend::create_cursor(
+        &mut fixture.backend,
+        None,
+        source,
+        None,
+        (u16::MAX, u16::MAX, u16::MAX),
+        (0, 0, 0),
+        0,
+        0,
+    )
+    .expect("create a cursor that spans the CRTC boundary");
+    assert_eq!(
+        (
+            fixture.backend.cursor_records[&cursor.as_raw()].width,
+            fixture.backend.cursor_records[&cursor.as_raw()].height,
+        ),
+        (2, 1),
+        "the visible cursor spans one pixel on either output",
+    );
+    Backend::define_cursor(&mut fixture.backend, None, root, cursor.as_raw())
+        .expect("define the two-pixel cursor");
+    Backend::set_cursor_hidden(&mut fixture.backend, false);
+    assert!(!fixture.backend.effective_cursor_hidden());
+    Backend::warp_pointer_root(&mut fixture.backend, &mut fixture.state, 799, 110);
+    Backend::fill_rectangle(
+        &mut fixture.backend,
+        None,
+        root,
+        0x0011_2233,
+        0,
+        0,
+        1600,
+        600,
+    )
+    .expect("paint a uniform scene background through Backend");
+    Backend::clear_area(
+        &mut fixture.backend,
+        None,
+        root,
+        0,
+        None,
+        0,
+        0,
+        1600,
+        600,
+        (0, 0),
+    )
+    .expect("damage both outputs through Backend");
+
+    let records_before = fixture.recorders.atomic.records().len();
+    Backend::maybe_composite(&mut fixture.backend).expect("compose the initial cursor frame");
+    assert!(fixture.backend.scene.has_pending_page_flips());
+    fixture.retire_output(0, 101);
+    fixture.retire_output(1, 102);
+    assert!(
+        fixture
+            .backend
+            .scene
+            .for_tests_cursor_footprint_was_presented(0)
+    );
+    assert!(
+        fixture
+            .backend
+            .scene
+            .for_tests_cursor_footprint_was_presented(1)
+    );
+    assert!(!fixture.backend.platform.cursor_plane_visible_for_output(0));
+    assert!(
+        fixture.backend.platform.cursor_plane_visible_for_output(1),
+        "eligible peer owns the cursor on its hardware plane",
+    );
+
+    Backend::clear_area(
+        &mut fixture.backend,
+        None,
+        root,
+        0,
+        None,
+        0,
+        0,
+        1600,
+        600,
+        (0, 0),
+    )
+    .expect("damage the active cursor frame through Backend");
+    Backend::maybe_composite(&mut fixture.backend).expect("compose both output-local cursor paths");
+    fixture.retire_output(0, 103);
+    fixture.retire_output(1, 104);
+
+    let read_pixel = |backend: &mut crate::kms::render::backend::KmsBackend, x: i32| -> [u8; 4] {
+        let bytes = crate::kms::render::backend::read_scanout_region(
+            backend,
+            ash::vk::Rect2D {
+                offset: ash::vk::Offset2D { x, y: 110 },
+                extent: ash::vk::Extent2D {
+                    width: 1,
+                    height: 1,
+                },
+            },
+            crate::kms::render::backend::ScanoutReadSelection::PermissiveDump,
+        )
+        .expect("read the raw composed scene output");
+        bytes.try_into().expect("one BGRA pixel")
+    };
+    let background = read_pixel(&mut fixture.backend, 798);
+    let software_cursor = read_pixel(&mut fixture.backend, 799);
+    let hardware_peer_composed_pixel = read_pixel(&mut fixture.backend, 800);
+    assert_ne!(
+        &software_cursor[..3],
+        &background[..3],
+        "ineligible CRTC scanout contains the software cursor pixel",
+    );
+    assert_eq!(
+        &hardware_peer_composed_pixel[..3],
+        &background[..3],
+        "eligible peer scanout omits the cursor pixel carried by its hardware plane",
+    );
+    assert!(fixture.backend.platform.cursor_plane_visible_for_output(1));
+    assert!(
+        fixture
+            .recorders
+            .legacy_cursor
+            .records()
+            .iter()
+            .any(|record| {
+                record.operation == crate::kms::cursor_plane::ops::LegacyCursorOperation::Bind
+                    && record.framebuffer.is_some()
+            })
+    );
+
+    Backend::set_cursor_hidden(&mut fixture.backend, true);
+    Backend::clear_area(
+        &mut fixture.backend,
+        None,
+        root,
+        0,
+        None,
+        0,
+        0,
+        1600,
+        600,
+        (0, 0),
+    )
+    .expect("damage cursor hide through Backend");
+    Backend::maybe_composite(&mut fixture.backend).expect("compose cursor hide");
+    fixture.retire_output(0, 105);
+    fixture.retire_output(1, 106);
+    assert!(!fixture.backend.platform.cursor_plane_visible_for_output(1));
+    fixture.assert_cursor_quiescent();
+    assert_eq!(
+        fixture.recorders.atomic.records()[records_before..]
+            .iter()
+            .map(|record| record.kind)
+            .collect::<Vec<_>>(),
+        vec![
+            crate::drm::atomic::AtomicCommitKind::Scene,
+            crate::drm::atomic::AtomicCommitKind::Scene,
+            crate::drm::atomic::AtomicCommitKind::Scene,
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            crate::drm::atomic::AtomicCommitKind::Scene,
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+        ],
+        "exact show, active, and hide commit sequence for both CRTCs",
+    );
+    assert!(
+        fixture.recorders.atomic.records()[records_before..]
+            .iter()
+            .all(|record| record.result == crate::drm::atomic::tests_support::ScriptedResult::Ok)
+    );
 
     let ledger = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
     drop(fixture);

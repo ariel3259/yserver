@@ -10,7 +10,18 @@ pub(crate) struct AtomicCursorFixture {
 
 impl AtomicCursorFixture {
     pub(crate) fn new() -> Result<Option<Self>, String> {
-        let mut backend = KmsBackend::for_tests_with_vk().map_err(|error| error.to_string())?;
+        let backend = KmsBackend::for_tests_with_vk().map_err(|error| error.to_string())?;
+        Self::from_live_backend(backend)
+    }
+
+    pub(crate) fn new_with_two_outputs() -> Result<Option<Self>, String> {
+        let mut backend = KmsBackend::for_tests_with_vk_dimensions(1600, 600)
+            .map_err(|error| error.to_string())?;
+        super::super::push_test_output(&mut backend, 2);
+        Self::from_live_backend(backend)
+    }
+
+    fn from_live_backend(mut backend: KmsBackend) -> Result<Option<Self>, String> {
         install_recording_device_caps(&mut backend);
         let vk = Arc::clone(
             backend
