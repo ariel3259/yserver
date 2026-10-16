@@ -33,6 +33,14 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-10-16 atomic-cursor-only A1 fix round 3:** the direct-successor
+  regression now creates its fullscreen target, all source drawables and
+  prequalified synthetic M1 framebuffers before the first Backend action.
+  A preflight catches delayed fixture creation; the target test passed 20/20
+  loaded lavapipe runs. Default and ignored workspace suites, render acceptance,
+  both Clippy gates, and layout checks passed. No hardware validation was run;
+  the fixture limitations recorded in the A1 report remain outside this fix.
+
 - **2026-10-16 atomic-cursor-only A1 fix round 2:** the direct successor test
   prepares synthetic composed buffers before Backend actions, reaches fallback
   readiness through Backend entries, and checks M1 framebuffer-cache release

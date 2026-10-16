@@ -6,6 +6,9 @@ fn output_crtc_key(backend: &KmsBackend, output_idx: usize) -> CrtcKey {
 
 fn bind_test_randr_crtc(backend: &mut KmsBackend, output_idx: usize, crtc_id: u32) {
     let output_key = backend.platform.outputs[output_idx].key.clone();
+    if backend.pstate.crtc_key_by_id.get(&crtc_id) == Some(&output_key) {
+        return;
+    }
     backend.pstate.crtc_key_by_id.insert(crtc_id, output_key);
     backend.refresh_present_crtc_clock_epochs();
 }
@@ -1374,8 +1377,36 @@ fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
         layout.output.plane_crtc_w_prop = property(8);
         layout.output.plane_crtc_h_prop = property(9);
     }
-    let mut state = yserver_core::server::ServerState::new();
+    // Prepare every window, store entry, synthetic M1 framebuffer, and its
+    // Present candidate before the Backend-driven scenario starts.
     let predecessor = prepare_atomic_cursor_direct_present(&mut b, 77);
+    let target_xid = predecessor.candidate.dst_window_xid;
+    let first_successor = prepare_atomic_cursor_direct_present_for_target(&mut b, 78, target_xid);
+    let latest_successor = prepare_atomic_cursor_direct_present_for_target(&mut b, 79, target_xid);
+    let rejected_successor =
+        prepare_atomic_cursor_direct_present_for_target(&mut b, 80, target_xid);
+    // Mutation: move a successor's fixture creation below the first Backend
+    // action; the preflight must fail before the scenario can start.
+    assert!(b.windows.contains_key(&target_xid));
+    assert!(b.store.lookup(target_xid).is_some());
+    for present_id in [77_u64, 78, 79, 80] {
+        let suffix = u32::try_from(present_id).expect("test Present id fits in XID");
+        let source_xid = 0x7300 + suffix * 0x10 + 1;
+        let source_id = b
+            .store
+            .lookup(source_xid)
+            .expect("fixture source is prepared");
+        assert!(
+            b.pstate
+                .scanout_m1
+                .entries
+                .get(&source_id)
+                .and_then(crate::kms::render::backend::ScanoutM1ProbeEntry::framebuffer)
+                .is_some(),
+            "fixture source has its prequalified M1 framebuffer",
+        );
+    }
+    let mut state = yserver_core::server::ServerState::new();
     let qualified_fb = b
         .pstate
         .scanout_m1
@@ -1399,12 +1430,10 @@ fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
         "accepted direct request must reference the qualified M1 framebuffer",
     );
 
-    let first_successor = prepare_atomic_cursor_direct_present(&mut b, 78);
     assert!(
         Backend::try_present_direct(&mut b, first_successor.candidate, first_successor.event)
             .expect("Backend retains the first successor")
     );
-    let latest_successor = prepare_atomic_cursor_direct_present(&mut b, 79);
     assert!(
         Backend::try_present_direct(&mut b, latest_successor.candidate, latest_successor.event)
             .expect("Backend coalesces the latest successor")
@@ -1525,7 +1554,6 @@ fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
     Backend::maybe_composite(&mut b).expect("move cursor while direct frame is held");
     assert_eq!(recorder.records().len(), 4);
     draw_atomic_cursor_test_root_overlay(&mut b, 2);
-    let rejected_successor = prepare_atomic_cursor_direct_present(&mut b, 80);
     assert!(
         !Backend::try_present_direct(
             &mut b,
@@ -3242,24 +3270,50 @@ fn prepare_atomic_cursor_direct_present_with_extent(
     width: u16,
     height: u16,
 ) -> AtomicCursorDirectPresent {
+    prepare_atomic_cursor_direct_present_on_target(backend, present_id, width, height, None)
+}
+
+fn prepare_atomic_cursor_direct_present_for_target(
+    backend: &mut KmsBackend,
+    present_id: u64,
+    target_xid: u32,
+) -> AtomicCursorDirectPresent {
+    prepare_atomic_cursor_direct_present_on_target(backend, present_id, 1600, 600, Some(target_xid))
+}
+
+fn prepare_atomic_cursor_direct_present_on_target(
+    backend: &mut KmsBackend,
+    present_id: u64,
+    width: u16,
+    height: u16,
+    existing_target_xid: Option<u32>,
+) -> AtomicCursorDirectPresent {
     use ash::vk;
     use yserver_core::backend::{CompletedPresentEvent, PresentScanoutCandidate, PresentWake};
 
     use crate::kms::render::store::{DrawableKind, Storage};
 
     let suffix = u32::try_from(present_id).expect("test Present id fits in XID");
-    let target_xid = 0x7300 + suffix * 0x10;
-    let source_xid = target_xid + 1;
-    let target_id = seed_window(backend, target_xid, None, 0, 0);
-    {
-        let target = backend
-            .windows
-            .get_mut(&target_xid)
-            .expect("fullscreen test target");
-        target.width = width;
-        target.height = height;
-    }
-    backend.core.top_level_order.push(target_xid);
+    let target_xid = existing_target_xid.unwrap_or(0x7300 + suffix * 0x10);
+    let source_xid = 0x7300 + suffix * 0x10 + 1;
+    let target_id = if existing_target_xid.is_some() {
+        backend
+            .store
+            .lookup(target_xid)
+            .expect("preprepared fullscreen test target")
+    } else {
+        let target_id = seed_window(backend, target_xid, None, 0, 0);
+        {
+            let target = backend
+                .windows
+                .get_mut(&target_xid)
+                .expect("fullscreen test target");
+            target.width = width;
+            target.height = height;
+        }
+        backend.core.top_level_order.push(target_xid);
+        target_id
+    };
     let source_id = backend
         .store
         .allocate(
