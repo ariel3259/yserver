@@ -20,8 +20,10 @@ and applies it at retirement, which causes the #244 jump.
 
 **Why the legacy ioctls can go (user, 2026-10-16).** GPUs whose drivers cannot do atomic cursor commits also have no
 Vulkan driver, and yserver renders only through Vulkan, so the legacy cursor path only serves hardware that cannot
-run yserver. A display-only device fed by another GPU (the copied route) needs no Vulkan of its own. If it has no
-usable atomic cursor plane, it gets the software cursor (§1).
+run yserver. This also holds for the copied route: there the other GPU composes, but the display device imports the
+frame and copies it into its own scanout buffers through its own Vulkan transfer context
+(`VkContext::new_transfer_for_device`, `platform/init.rs`). A display device without Vulkan therefore cannot be a sink
+either.
 
 ## Non-goals
 
