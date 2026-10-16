@@ -363,6 +363,18 @@ VK_DRIVER_FILES=/home/ariel_santangelo/Projects/claude-scratch/yserver-pr1/lvp/l
 
 Expected: every command exits 0, clippy has no warnings, and ordinary/ignored suites have no failures; report capability skips explicitly. Check formatter changes and run the relevant targeted tests again only if formatting changed behavior-sensitive code. Stage only this task's named files and commit once with `git commit -m "docs: record approved atomic cursor hardware validation"`. Do not batch this commit with the next task.
 
+
+**Deferred from sub-plan A (controller rulings; not coverable by the narrowed fixture — must be checked here):**
+- [ ] **Mode blob through a real modeset:** on each card, a RANDR mode change (and one rejected mode, if the card
+  offers an invalid combination) creates the `MODE_ID` blob, commits with it, and releases it after both the accepted
+  and the rejected commit. Evidence: the yserver log (blob create/destroy lines), no growing blob count after 10 mode
+  changes.
+- [ ] **Scanout qualification worker services:** the re-exec'd qualification worker runs its TEST_ONLY commits and
+  mode blobs through the production services (startup log shows the qualification result per CRTC; no fallback
+  caused by a service mismatch).
+- [ ] **Hotplug rediscovery:** unplug and replug one monitor. After the 150 ms debounce yserver rediscovers exactly
+  once (one rescan log line per edge), the cursor plane re-qualifies, and the cursor reappears on the replugged output.
+
 ## Spec coverage table
 
 This is the complete cross-plan ledger, repeated so this plan can be reviewed independently. Task IDs prefixed **C** are owned here; other prefixes refer to the ordered sibling plans. A/B checkpoints are working increments; final ownership/error/deletion requirements are complete only after their listed later tasks. Each §1–§4 bullet/sub-bullet and every numbered §4 test has an explicit owner; §5 is included for the final controller task.
