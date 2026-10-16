@@ -25,6 +25,65 @@ use std::{
     sync::Arc,
 };
 
+pub(crate) trait ConnectorSnapshotIo {
+    fn probe(&self, devices: &[KmsDevice]) -> io::Result<Vec<ConnectorSnapshot>>;
+}
+
+pub(crate) struct DrmConnectorSnapshotIo;
+
+impl ConnectorSnapshotIo for DrmConnectorSnapshotIo {
+    fn probe(&self, devices: &[KmsDevice]) -> io::Result<Vec<ConnectorSnapshot>> {
+        let mut snapshot = Vec::new();
+        for device in devices {
+            let probes = crate::platform::drm::probe_connector_snapshots(&device.device).map_err(
+                |error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!(
+                            "probe connector snapshot on DRM device {}: {error}",
+                            device.key
+                        ),
+                    )
+                },
+            )?;
+            snapshot.extend(
+                probes
+                    .iter()
+                    .map(|probe| ConnectorSnapshot::from_probe(device.key, probe)),
+            );
+        }
+        Ok(snapshot)
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) struct RecordingConnectorSnapshotIo {
+    queued: std::cell::RefCell<std::collections::VecDeque<io::Result<Vec<ConnectorSnapshot>>>>,
+}
+
+impl RecordingConnectorSnapshotIo {
+    #[allow(dead_code)]
+    pub(crate) fn new() -> Self {
+        Self {
+            queued: std::cell::RefCell::new(std::collections::VecDeque::new()),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn queue_snapshot(&self, snapshot: Vec<ConnectorSnapshot>) {
+        self.queued.borrow_mut().push_back(Ok(snapshot));
+    }
+}
+
+impl ConnectorSnapshotIo for RecordingConnectorSnapshotIo {
+    fn probe(&self, _devices: &[KmsDevice]) -> io::Result<Vec<ConnectorSnapshot>> {
+        self.queued
+            .borrow_mut()
+            .pop_front()
+            .unwrap_or_else(|| Err(io::Error::from_raw_os_error(libc::ENOTTY)))
+    }
+}
+
 pub(super) fn scanout_pool_needs_reallocation(
     existing: Option<&ActiveOutput>,
     existing_pool_route: Option<ScanoutRoute>,
@@ -169,26 +228,10 @@ impl PlatformBackend {
     /// quiesce GPU/page-flip/direct work only after every device probe has
     /// succeeded, and before applying removals.
     pub(crate) fn probe_connector_snapshot(&self) -> io::Result<Vec<ConnectorSnapshot>> {
-        let mut snapshot = Vec::new();
-        for device in &self.devices {
-            let probes = crate::platform::drm::probe_connector_snapshots(&device.device).map_err(
-                |error| {
-                    io::Error::new(
-                        error.kind(),
-                        format!(
-                            "probe connector snapshot on DRM device {}: {error}",
-                            device.key
-                        ),
-                    )
-                },
-            )?;
-            snapshot.extend(
-                probes
-                    .iter()
-                    .map(|probe| ConnectorSnapshot::from_probe(device.key, probe)),
-            );
+        if self.devices.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(snapshot)
+        self.services.connector_snapshot.probe(&self.devices)
     }
 
     /// Disable a single connector: issue a DRM `disable_output` for the
@@ -1108,7 +1151,7 @@ impl PlatformBackend {
         rescan.dropped_keys.sort();
         rescan.dropped_keys.dedup();
         rescan.dropped_old_indices.sort_unstable_by(|a, b| b.cmp(a));
-        let cursor_changed_devices: HashSet<_> = rescan
+        let mut cursor_changed_devices: HashSet<_> = rescan
             .dropped_old_indices
             .iter()
             .filter_map(|idx| self.outputs.get(*idx))
@@ -1166,11 +1209,31 @@ impl PlatformBackend {
         // the expensive assignment/scanout allocation if a client enables it.
         rescan.added_count = rescan.added_keys.len();
 
-        if !rescan.dropped_old_indices.is_empty() {
+        for device in &self.devices {
+            let active_crtcs: HashSet<_> = self
+                .outputs
+                .iter()
+                .filter(|output| output.key.device_key == device.key)
+                .map(|output| output.output.crtc)
+                .collect();
+            if active_crtcs != device.cursor.cursor_topology_crtcs
+                || device
+                    .cursor
+                    .plane
+                    .as_ref()
+                    .is_some_and(crate::kms::cursor_plane::CursorPlane::has_pending_topology)
+            {
+                cursor_changed_devices.insert(device.key);
+            }
+        }
+
+        if !rescan.dropped_old_indices.is_empty() || !cursor_changed_devices.is_empty() {
             // Packing and the extent recompute deliberately do NOT happen
             // here. They are layout policy and run in the backend caller,
             // after it has decided which departed routes keep their slot.
-            self.prune_present_clocks_to_live_outputs();
+            if !rescan.dropped_old_indices.is_empty() {
+                self.prune_present_clocks_to_live_outputs();
+            }
             self.refresh_cursor_topology_for_devices(&cursor_changed_devices);
         }
         rescan

@@ -1529,12 +1529,19 @@ impl KmsBackend {
                 .iter()
                 .any(|entry| entry.preserves_active_output(output))
         });
+        let cursor_topology_changed = match self.platform.probe_cursor_topology_changes() {
+            Ok(changed) => changed,
+            Err(error) => {
+                log::error!("kms: cursor topology probe failed: {error}");
+                return;
+            }
+        };
 
         // Only an active removal can drop a pool or invalidate the scene's
         // output-index ledger. Metadata and inactive-connector changes leave
         // normal composition and direct scanout undisturbed.
         let mut quiesced = false;
-        if active_removed {
+        if active_removed || !cursor_topology_changed.is_empty() {
             match self.quiesce_before_topology_mutation("display hotplug rescan") {
                 Ok(()) => quiesced = true,
                 Err(error) => {

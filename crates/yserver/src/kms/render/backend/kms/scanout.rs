@@ -371,6 +371,15 @@ impl KmsBackend {
             return;
         }
         let tearing = self.pstate.tearing.is_on();
+        if tearing && self.pstate.scanout_m2.unflip_requested && self.tearing_cursor_wants_visible()
+        {
+            // The grouped composed replacement will retire the external
+            // cursor handoff. Keep the currently visible plane bound until
+            // that replacement retires; hiding here would make the cursor
+            // disappear while direct scanout still owns the primary plane.
+            self.pstate.scanout_m2.cursor_bound_all = true;
+            return;
+        }
         if tearing || self.effective_cursor_hidden() {
             // Tearing keeps every cursor plane detached. A hidden effective
             // cursor also must not leave a stale sprite bound over direct scanout.

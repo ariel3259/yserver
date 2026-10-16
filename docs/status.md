@@ -33,6 +33,27 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-10-16 atomic-cursor-only A3:** cursor-plane discovery now
+  qualifies assigned CRTCs independently from the full ten-property atomic
+  set. Virtual drivers additionally require accepted hotspot-cap negotiation
+  and both hotspot properties; a physical driver's rejected cap does not
+  disqualify ordinary atomic properties. No-plane and unassigned outputs use
+  software, and pointer motion has no reachable legacy move route for them.
+  Full hotplug rescans compare per-device cursor/CRTC snapshots after the
+  debounce and refresh only changed device state after the all-off path; the
+  lightweight connector reprobe does not enumerate planes. The lavapipe
+  eligibility matrix passed 20/20 under 16 busy loops; the two-card
+  same-handle topology test passed 5/5 under the same load. All four requested
+  mutations failed their named assertions. Formatting, yserver build, both
+  workspace test suites (including all 168 ignored yserver library tests), the
+  191-test ignored render-acceptance suite, both Clippy gates, and layout check
+  passed. The lavapipe device exposed SYNC_FD, so no capability skips occurred.
+  Existing platform-state tests cover first-enable initialization and
+  last-disable/re-enable retention separately. The exact headless → active →
+  zero → active sequence is not covered end-to-end through Backend entries:
+  the test KMS device has no injectable successful modeset/property-query path.
+  No hardware was used; Task C11 owns hardware validation.
+
 - **2026-10-16 atomic-cursor-only A2:** KMS `Device::open` now records
   hotspot-cap acceptance and the DRM driver name after requesting
   UNIVERSAL_PLANES → ATOMIC → CURSOR_PLANE_HOTSPOT. Hotspot-cap rejection is

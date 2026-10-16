@@ -13,7 +13,12 @@ use crate::{
             RecordingCursorBufferIo, RecordingLegacyCursorIo,
         },
         hotplug::{DisplayHotplugSource, DrmDisplayHotplugSource, RecordingDisplayHotplugSource},
-        render::platform::flip_events::{DrmPageFlipEventSource, PageFlipEventSource},
+        render::platform::{
+            connectors::{
+                ConnectorSnapshotIo, DrmConnectorSnapshotIo, RecordingConnectorSnapshotIo,
+            },
+            flip_events::{DrmPageFlipEventSource, PageFlipEventSource},
+        },
     },
 };
 
@@ -27,6 +32,7 @@ pub struct KmsServices {
     pub(crate) atomic: Rc<dyn AtomicCommitExecutor>,
     pub(crate) page_flip_events: Rc<dyn PageFlipEventSource>,
     pub(crate) hotplug: Rc<dyn DisplayHotplugSource>,
+    pub(crate) connector_snapshot: Rc<dyn ConnectorSnapshotIo>,
     pub(crate) monotonic_clock: Rc<dyn Fn() -> Instant>,
     pub(crate) test_recorders: Option<Rc<KmsTestRecorders>>,
 }
@@ -56,6 +62,7 @@ pub(crate) struct KmsTestRecorders {
     pub(crate) page_flip_events:
         Rc<crate::kms::render::platform::flip_events::RecordingPageFlipEventSource>,
     pub(crate) hotplug: Rc<RecordingDisplayHotplugSource>,
+    pub(crate) connector_snapshot: Rc<RecordingConnectorSnapshotIo>,
 }
 
 impl KmsServices {
@@ -74,6 +81,7 @@ impl KmsServices {
             atomic: Rc::new(DrmAtomicCommitExecutor),
             page_flip_events: Rc::new(DrmPageFlipEventSource),
             hotplug: Rc::new(DrmDisplayHotplugSource::new()),
+            connector_snapshot: Rc::new(DrmConnectorSnapshotIo),
             monotonic_clock: Rc::new(Instant::now),
             test_recorders: None,
         }
@@ -91,6 +99,7 @@ impl KmsServices {
         );
         let hotplug =
             Rc::new(RecordingDisplayHotplugSource::new().expect("recording hotplug socket pair"));
+        let connector_snapshot = Rc::new(RecordingConnectorSnapshotIo::new());
         let test_recorders = Rc::new(KmsTestRecorders {
             atomic: Rc::clone(&atomic),
             mode_blobs: Rc::clone(&mode_blobs),
@@ -98,6 +107,7 @@ impl KmsServices {
             legacy_cursor: Rc::clone(&legacy_cursor),
             page_flip_events: Rc::clone(&page_flip_events),
             hotplug: Rc::clone(&hotplug),
+            connector_snapshot: Rc::clone(&connector_snapshot),
         });
         Self {
             mode_blobs,
@@ -106,6 +116,7 @@ impl KmsServices {
             atomic,
             page_flip_events,
             hotplug,
+            connector_snapshot,
             monotonic_clock: Rc::new(Instant::now),
             test_recorders: Some(test_recorders),
         }

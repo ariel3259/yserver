@@ -607,6 +607,7 @@ impl AtomicCommitSink {
 
     /// Record the legacy path's motion-to-return latency. Both telemetry
     /// latency measures intentionally use this same return time.
+    #[allow(dead_code)] // retained until Task B removes the legacy motion route
     pub(crate) fn record_legacy_move(&self, motion_timestamp: Instant, returned_at: Instant) {
         self.metrics
             .borrow_mut()
@@ -1104,6 +1105,7 @@ impl CommitWindow {
         self.reset_tearing_counters();
     }
 
+    #[allow(dead_code)] // retained until Task B removes the legacy motion route
     fn record_legacy_move(&mut self, motion_timestamp: Instant, returned_at: Instant) {
         let latency = elapsed_us(motion_timestamp, returned_at);
         self.motion_to_accept_us.push(latency);

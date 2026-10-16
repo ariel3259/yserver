@@ -174,8 +174,7 @@ fn copied_scene_flip_uses_the_sink_devices_cursor_plane() {
 }
 
 #[test]
-// Mutation: return atomic positions for every visible plane without checking
-// the per-device atomic capability. The legacy request would gain cursor fields.
+// Mutation: ignore per-CRTC qualification. The ineligible visible CRTC would leak cursor fields.
 fn legacy_scene_flip_has_no_atomic_cursor_properties() {
     let mut backend = KmsBackend::for_tests();
     let recorder = recording_sink(&mut backend, 0);
@@ -190,7 +189,12 @@ fn legacy_scene_flip_has_no_atomic_cursor_properties() {
         3,
         4,
     );
-    backend.platform.devices[0].cursor.atomic_cursor = false;
+    backend.platform.devices[0]
+        .cursor
+        .plane
+        .as_mut()
+        .expect("seeded cursor plane")
+        .for_tests_clear_properties(position.crtc);
     let positions = backend
         .platform
         .cursor_plane_atomic_positions_for_outputs(&[0]);
@@ -644,8 +648,8 @@ fn scene_damage_after_cursor_retirement_submits_scene_with_latest_position() {
 }
 
 #[test]
-// Mutation: route an atomic-capable backend through its legacy move branch.
-fn legacy_path_pointer_motion_keeps_one_legacy_move_and_no_atomic_commit() {
+// Mutation: route an ineligible CRTC through legacy cursor motion.
+fn ineligible_pointer_motion_never_uses_legacy_cursor_ioctl() {
     use yserver_core::server::ServerState;
 
     let Some(mut backend) = backend_with_live_scene() else {
@@ -661,18 +665,28 @@ fn legacy_path_pointer_motion_keeps_one_legacy_move_and_no_atomic_commit() {
     );
     plane.for_tests_set_visible(crtc, true);
     backend.platform.devices[0].cursor.plane = Some(plane);
-    backend.platform.devices[0].cursor.atomic_cursor = false;
     let mut state = ServerState::new();
 
     warp(&mut backend, &mut state, 150, 120);
 
     assert_eq!(recorder.records().len(), 0);
+    assert!(
+        backend
+            .platform
+            .services
+            .test_recorders
+            .as_ref()
+            .expect("recording KMS services")
+            .legacy_cursor
+            .records()
+            .is_empty()
+    );
     assert_eq!(
         backend.platform.devices[0]
             .atomic_commit_sink
             .for_tests_motion_to_accept_sample_count(),
-        1,
-        "one visible legacy cursor move was attempted",
+        0,
+        "ineligible output did not enter the legacy move path",
     );
     assert_no_cursor_work(&backend, device_key);
 }

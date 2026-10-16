@@ -283,6 +283,12 @@ fn define_visible_cursor_rebinds_held_vsync_direct_scanout() {
     assert!(!backend.pstate.scanout_m2.unflip_requested);
     assert!(backend.pstate.scanout_m2.unflip_awaiting_outputs.is_empty());
     Backend::maybe_composite(&mut backend).expect("keep held direct scanout with rebound cursor");
+    assert_eq!(
+        recorder.records().last().unwrap().kind,
+        AtomicCommitKind::CursorOnly,
+        "the rebound cursor position is submitted atomically"
+    );
+    retire_direct_present(&mut backend, &mut state, 71);
 
     assert!(matches!(
         backend.pstate.tearing.state,
@@ -303,6 +309,9 @@ fn define_visible_cursor_rebinds_held_vsync_direct_scanout() {
     assert!(!backend.pstate.scanout_m2.unflip_requested);
     assert!(backend.pstate.scanout_m2.unflip_awaiting_outputs.is_empty());
     assert_direct_queue_drained(&backend);
-    assert_commit_sequence(&recorder, &[AtomicCommitKind::Scene]);
+    assert_commit_sequence(
+        &recorder,
+        &[AtomicCommitKind::Scene, AtomicCommitKind::CursorOnly],
+    );
     backend.platform.wait_idle_bounded();
 }

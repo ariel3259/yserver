@@ -239,11 +239,10 @@ pub(crate) struct KmsCursorState {
     /// cursor-plane construction. Only a successful explicit RANDR enable may
     /// consume this state; connected-Off probes and ordinary frames cannot.
     headless_deferred: bool,
-    topology_blocked: bool,
     transient_fallback_crtcs: HashMap<::drm::control::crtc::Handle, TransientCursorFallback>,
-    /// Capability-selected atomic position path for this device's active
-    /// CRTC topology.
-    pub(crate) atomic_cursor: bool,
+    /// Epoch of the last actual cursor-plane or active-CRTC topology change.
+    pub(crate) cursor_topology_epoch: u64,
+    pub(super) cursor_topology_crtcs: HashSet<::drm::control::crtc::Handle>,
     sprite_signature: Option<(u16, u16, u16, u16)>,
 }
 

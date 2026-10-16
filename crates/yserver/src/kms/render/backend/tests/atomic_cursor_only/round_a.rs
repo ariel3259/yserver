@@ -477,3 +477,588 @@ fn atomic_cursor_only_flip_events_are_scoped_to_the_ready_device() {
     drop(fixture);
     assert_eq!(resources.end_state(), (0, 0, 0));
 }
+
+const ATOMIC_CURSOR_PROPERTIES: [&str; 10] = [
+    "FB_ID", "CRTC_ID", "CRTC_X", "CRTC_Y", "CRTC_W", "CRTC_H", "SRC_X", "SRC_Y", "SRC_W", "SRC_H",
+];
+
+fn cursor_topology_snapshot(
+    driver_name: &str,
+    hotspot_cap_accepted: bool,
+    crtcs: &[u32],
+    planes: &[(u32, Vec<u32>, Vec<&str>)],
+) -> crate::kms::cursor_plane::CursorPlaneTestSnapshot {
+    crate::kms::cursor_plane::CursorPlaneTestSnapshot {
+        crtcs: crtcs.to_vec(),
+        planes: planes
+            .iter()
+            .map(|(handle, possible_crtcs, properties)| {
+                crate::kms::cursor_plane::CursorPlaneTestPlane {
+                    handle: *handle,
+                    possible_crtcs: possible_crtcs.clone(),
+                    property_names: properties.iter().map(|name| (*name).to_owned()).collect(),
+                }
+            })
+            .collect(),
+        driver_name: driver_name.to_owned(),
+        hotspot_cap_accepted,
+    }
+}
+
+fn connector_snapshot_for_output(
+    output: &crate::kms::backend::ActiveOutput,
+) -> crate::kms::render::platform::ConnectorSnapshot {
+    crate::kms::render::platform::ConnectorSnapshot {
+        key: output.key.clone(),
+        modes: vec![crate::platform::drm::Mode::default()],
+        mm_width: 0,
+        mm_height: 0,
+        edid: Vec::new(),
+        connector_type: "test".to_owned(),
+    }
+}
+
+fn schedule_rescan_clock(
+    backend: &mut crate::kms::render::backend::KmsBackend,
+) -> (std::time::Instant, std::rc::Rc<std::cell::Cell<u64>>) {
+    use std::{cell::Cell, time::Duration};
+    let base = std::time::Instant::now();
+    let elapsed_ms = std::rc::Rc::new(Cell::new(0_u64));
+    let clock_ms = std::rc::Rc::clone(&elapsed_ms);
+    backend.for_tests_set_monotonic_clock(std::rc::Rc::new(move || {
+        base + Duration::from_millis(clock_ms.get())
+    }));
+    (base, elapsed_ms)
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: require only CRTC_X/Y, use one card-wide gate, allow a virtual
+// plane after cap rejection, or reuse old discovery; the named matrix rows fail.
+fn atomic_cursor_only_eligibility_matrix() {
+    use yserver_core::backend::Backend;
+
+    let Some(mut fixture) = AtomicCursorFixture::new().expect("build cursor scene fixture") else {
+        return;
+    };
+    let device_key = fixture.backend.platform.devices[0].key;
+    let crtc = fixture.backend.platform.outputs[0].output.crtc;
+    fixture
+        .backend
+        .platform
+        .for_tests_accept_output_power_commits();
+    assert_eq!(crtc, ::drm::control::from_u32(1).expect("fixture CRTC"));
+    fixture.define_visible_cursor();
+    let (base, elapsed_ms) = schedule_rescan_clock(&mut fixture.backend);
+    let properties: Vec<_> = ATOMIC_CURSOR_PROPERTIES.to_vec();
+    let mut rows = Vec::new();
+    rows.push((
+        "no plane".to_owned(),
+        cursor_topology_snapshot("amdgpu", true, &[1], &[]),
+        false,
+    ));
+    rows.push((
+        "unassigned CRTC".to_owned(),
+        cursor_topology_snapshot("amdgpu", true, &[1], &[(10, vec![2], properties.clone())]),
+        false,
+    ));
+    for missing in ATOMIC_CURSOR_PROPERTIES {
+        let without = properties
+            .iter()
+            .copied()
+            .filter(|name| *name != missing)
+            .collect();
+        rows.push((
+            format!("missing {missing}"),
+            cursor_topology_snapshot("amdgpu", true, &[1], &[(10, vec![1], without)]),
+            false,
+        ));
+    }
+    let mut virtual_properties = properties.clone();
+    virtual_properties.extend(["HOTSPOT_X", "HOTSPOT_Y"]);
+    for driver in ["virtio_gpu", "vmwgfx", "qxl", "vboxvideo"] {
+        rows.push((
+            format!("{driver} rejected hotspot cap"),
+            cursor_topology_snapshot(
+                driver,
+                false,
+                &[1],
+                &[(10, vec![1], virtual_properties.clone())],
+            ),
+            false,
+        ));
+    }
+    for missing in ["HOTSPOT_X", "HOTSPOT_Y"] {
+        let without: Vec<_> = virtual_properties
+            .iter()
+            .copied()
+            .filter(|name| *name != missing)
+            .collect();
+        rows.push((
+            format!("accepted virtual cap without {missing}"),
+            cursor_topology_snapshot("virtio_gpu", true, &[1], &[(10, vec![1], without)]),
+            false,
+        ));
+    }
+    rows.push((
+        "virtual plane with accepted cap and both hotspots".to_owned(),
+        cursor_topology_snapshot(
+            "virtio_gpu",
+            true,
+            &[1],
+            &[(10, vec![1], virtual_properties.clone())],
+        ),
+        true,
+    ));
+    rows.push((
+        "maximum matching retains exclusive plane preference".to_owned(),
+        cursor_topology_snapshot(
+            "amdgpu",
+            false,
+            &[1, 2, 3],
+            &[
+                (21, vec![1, 2], properties.clone()),
+                (22, vec![1, 3], properties.clone()),
+                (23, vec![1, 3], properties.clone()),
+                (24, vec![1], properties.clone()),
+            ],
+        ),
+        true,
+    ));
+    rows.push((
+        "physical plane with rejected cap and ordinary properties".to_owned(),
+        cursor_topology_snapshot("amdgpu", false, &[1], &[(10, vec![1], properties.clone())]),
+        true,
+    ));
+
+    for (row_index, (name, snapshot, eligible)) in rows.into_iter().enumerate() {
+        assert!(
+            fixture
+                .backend
+                .platform
+                .for_tests_queue_cursor_discovery_snapshot(device_key, snapshot)
+        );
+        let calls_before = fixture
+            .backend
+            .platform
+            .for_tests_cursor_discovery_calls(device_key)
+            .expect("fixture discovery recorder");
+        assert!(Backend::reprobe_connectors(&mut fixture.backend, &mut fixture.state).is_err());
+        assert_eq!(
+            fixture
+                .backend
+                .platform
+                .for_tests_cursor_discovery_calls(device_key),
+            Some(calls_before),
+            "{name}: ordinary reprobe must not enumerate planes",
+        );
+        fixture
+            .recorders
+            .connector_snapshot
+            .queue_snapshot(vec![connector_snapshot_for_output(
+                &fixture.backend.platform.outputs[0],
+            )]);
+        fixture
+            .recorders
+            .hotplug
+            .queue_change()
+            .expect("queue hotplug edge");
+        Backend::on_display_hotplug(&mut fixture.backend, &mut fixture.state);
+        let deadline = fixture
+            .backend
+            .pstate
+            .hotplug_rescan_deadline
+            .expect("Backend arms its debounce deadline");
+        assert!(Backend::next_wakeup(&fixture.backend).is_some());
+        assert_eq!(
+            deadline,
+            base + std::time::Duration::from_millis(row_index as u64 * 150 + 150)
+        );
+        elapsed_ms.set(row_index as u64 * 150 + 149);
+        Backend::poll_deferred_input(&mut fixture.backend, &mut fixture.state);
+        assert_eq!(
+            fixture
+                .backend
+                .platform
+                .for_tests_cursor_discovery_calls(device_key),
+            Some(calls_before),
+            "{name}: no plane enumeration before the debounce deadline",
+        );
+        elapsed_ms.set(row_index as u64 * 150 + 150);
+        Backend::poll_deferred_input(&mut fixture.backend, &mut fixture.state);
+        assert_eq!(
+            fixture
+                .backend
+                .platform
+                .for_tests_cursor_discovery_calls(device_key),
+            Some(calls_before + 1),
+            "{name}: consumed hotplug must rediscover once",
+        );
+
+        assert_eq!(
+            fixture.backend.platform.devices[0]
+                .cursor
+                .plane
+                .as_ref()
+                .and_then(|plane| plane.properties_for(crtc)),
+            eligible.then(|| {
+                fixture.backend.platform.devices[0]
+                    .cursor
+                    .plane
+                    .as_ref()
+                    .expect("cursor plane")
+                    .properties_for(crtc)
+                    .expect("eligible plane properties")
+            }),
+            "{name}: discovered property map",
+        );
+        assert_eq!(
+            fixture
+                .backend
+                .platform
+                .cursor_plane_available_for_output(0),
+            eligible,
+            "{name}: output-local availability",
+        );
+        assert_eq!(
+            fixture
+                .backend
+                .platform
+                .cursor_plane_fits_for_output(0, 1, 1),
+            eligible,
+            "{name}: output-local image fit",
+        );
+        if name == "maximum matching retains exclusive plane preference" {
+            let plane = fixture.backend.platform.devices[0]
+                .cursor
+                .plane
+                .as_ref()
+                .expect("cursor plane");
+            let assignments: Vec<_> = [1_u32, 2, 3]
+                .into_iter()
+                .map(|raw| {
+                    plane
+                        .properties_for(::drm::control::from_u32(raw).expect("test CRTC"))
+                        .expect("maximum matching covers each CRTC")
+                        .plane
+                })
+                .collect();
+            assert_eq!(
+                assignments
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len(),
+                3
+            );
+            assert_eq!(
+                assignments[0],
+                ::drm::control::from_u32(24).expect("exclusive plane")
+            );
+        }
+        let records_before = fixture.recorders.atomic.records().len();
+        let root = fixture.backend.core.window_id;
+        let (width, height) = (fixture.backend.platform.fb_w, fixture.backend.platform.fb_h);
+        Backend::set_cursor_hidden(&mut fixture.backend, false);
+        Backend::warp_pointer_root(&mut fixture.backend, &mut fixture.state, 120, 110);
+        Backend::clear_area(
+            &mut fixture.backend,
+            None,
+            root,
+            0,
+            None,
+            0,
+            0,
+            width,
+            height,
+            (0, 0),
+        )
+        .expect("damage root through Backend");
+        Backend::maybe_composite(&mut fixture.backend).expect("compose eligibility row");
+        let records = fixture.recorders.atomic.records();
+        let accepted_scene = records[records_before..]
+            .iter()
+            .rev()
+            .find(|record| {
+                matches!(
+                    record.kind,
+                    crate::drm::atomic::AtomicCommitKind::Scene
+                        | crate::drm::atomic::AtomicCommitKind::SceneWithCursor
+                )
+            })
+            .unwrap_or_else(|| panic!("{name}: accepted scene record missing"));
+        assert_eq!(
+            accepted_scene.result,
+            crate::drm::atomic::tests_support::ScriptedResult::Ok,
+            "{name}: the scene carrying the software cursor must be accepted",
+        );
+        let first_frame = u32::try_from(row_index * 2 + 1).expect("frame index fits");
+        fixture.retire_output(0, first_frame);
+        Backend::set_cursor_hidden(&mut fixture.backend, true);
+        Backend::clear_area(
+            &mut fixture.backend,
+            None,
+            root,
+            0,
+            None,
+            0,
+            0,
+            width,
+            height,
+            (0, 0),
+        )
+        .expect("damage cursor hide through Backend");
+        Backend::maybe_composite(&mut fixture.backend).expect("compose cursor hide");
+        if fixture.backend.scene.has_pending_page_flips() {
+            fixture.retire_output(0, first_frame + 1);
+        }
+        fixture.assert_cursor_quiescent();
+    }
+
+    let ledger = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
+    drop(fixture);
+    assert_eq!(ledger.end_state(), (0, 0, 0));
+}
+
+#[test]
+// Mutation: share raw-handle caches between cards or refresh every card's
+// applied topology; the unchanged peer's epoch assertion fails.
+fn atomic_cursor_only_topology_rechecks_only_affected_device() {
+    use std::time::Duration;
+    use yserver_core::backend::Backend;
+
+    let mut fixture = AtomicCursorFixture::without_scene().expect("build backend fixture");
+    fixture
+        .backend
+        .platform
+        .for_tests_accept_output_power_commits();
+    let first_key = fixture.backend.platform.devices[0].key;
+    let second_key = crate::platform::drm::DrmDeviceKey { major: 0, minor: 1 };
+    let second_device = std::rc::Rc::new(crate::drm::Device::for_tests().expect("second DRM fd"));
+    let events = std::rc::Rc::clone(&fixture.recorders.page_flip_events);
+    events.register_device(&second_device);
+    let first_peer = {
+        let route = fixture.backend.platform.outputs[0].scanout_route;
+        let mut output = clone_drm_output(&fixture.backend.platform.outputs[0].output);
+        output.connector_name = "card-a-peer".to_owned();
+        output.connector = ::drm::control::from_u32(2).expect("peer connector");
+        output.encoder = ::drm::control::from_u32(2).expect("peer encoder");
+        output.crtc = ::drm::control::from_u32(2).expect("peer CRTC");
+        output.plane = ::drm::control::from_u32(2).expect("peer plane");
+        crate::kms::backend::ActiveOutput::new(
+            route,
+            output,
+            crate::drm::Swapchain::empty_for_tests(),
+            800,
+            0,
+        )
+    };
+    fixture.backend.platform.outputs.push(first_peer);
+    let second_route = crate::kms::scanout_route::ScanoutRoute::new(
+        crate::kms::render::platform::RenderDeviceId::UnverifiedFallback,
+        second_key,
+        crate::kms::scanout_route::RenderKmsRelationship::Unknown,
+    );
+    let second_output = {
+        let mut output = clone_drm_output(&fixture.backend.platform.outputs[0].output);
+        output.connector_name = "card-b".to_owned();
+        crate::kms::backend::ActiveOutput::new(
+            second_route,
+            output,
+            crate::drm::Swapchain::empty_for_tests(),
+            800,
+            0,
+        )
+    };
+    fixture.backend.platform.outputs.push(second_output);
+    fixture
+        .backend
+        .platform
+        .devices
+        .push(crate::kms::render::platform::KmsDevice {
+            key: second_key,
+            device: std::rc::Rc::clone(&second_device),
+            async_page_flip: false,
+            atomic_commit_sink: std::rc::Rc::new(crate::drm::atomic::AtomicCommitSink::new(
+                std::rc::Rc::clone(&fixture.backend.platform.services.atomic),
+            )),
+            page_flip_event_source: events.clone(),
+            cursor_buffer_io: std::rc::Rc::clone(&fixture.backend.platform.services.cursor_buffers),
+            legacy_cursor_io: std::rc::Rc::clone(&fixture.backend.platform.services.legacy_cursor),
+            test_page_flip_event_source: Some(events),
+            cursor: crate::kms::render::platform::KmsCursorState::new(),
+        });
+    for _ in 0..2 {
+        fixture.backend.platform.scanout_pools.push(None);
+        fixture.backend.platform.bo_generations.push(Vec::new());
+        fixture.backend.platform.first_pageflip_logged.push(false);
+    }
+    fixture
+        .backend
+        .platform
+        .for_tests_initialize_cursor_planes();
+    let colliding_crtc = fixture.backend.platform.outputs[0].output.crtc;
+    assert_eq!(
+        colliding_crtc,
+        fixture.backend.platform.outputs[2].output.crtc
+    );
+    let first_epoch = fixture.backend.platform.devices[0]
+        .cursor
+        .cursor_topology_epoch;
+    let second_epoch = fixture.backend.platform.devices[1]
+        .cursor
+        .cursor_topology_epoch;
+
+    let (base, elapsed_ms) = schedule_rescan_clock(&mut fixture.backend);
+    assert!(
+        fixture
+            .backend
+            .platform
+            .for_tests_queue_cursor_discovery_snapshot(
+                first_key,
+                cursor_topology_snapshot(
+                    "amdgpu",
+                    false,
+                    &[1, 2],
+                    &[(20, vec![2], ATOMIC_CURSOR_PROPERTIES.to_vec())],
+                ),
+            )
+    );
+    fixture.recorders.connector_snapshot.queue_snapshot(vec![
+        connector_snapshot_for_output(&fixture.backend.platform.outputs[0]),
+        connector_snapshot_for_output(&fixture.backend.platform.outputs[1]),
+        connector_snapshot_for_output(&fixture.backend.platform.outputs[2]),
+    ]);
+    fixture
+        .recorders
+        .hotplug
+        .queue_change()
+        .expect("queue edge");
+    Backend::on_display_hotplug(&mut fixture.backend, &mut fixture.state);
+    let deadline = Backend::next_wakeup(&fixture.backend).expect("real debounce deadline");
+    assert_eq!(deadline, base + Duration::from_millis(150));
+    elapsed_ms.set(150);
+    Backend::poll_deferred_input(&mut fixture.backend, &mut fixture.state);
+
+    assert_eq!(
+        fixture.backend.platform.devices[0]
+            .cursor
+            .cursor_topology_epoch,
+        first_epoch + 1
+    );
+    assert_eq!(
+        fixture.backend.platform.devices[1]
+            .cursor
+            .cursor_topology_epoch,
+        second_epoch
+    );
+    assert_eq!(fixture.backend.platform.devices[0].key, first_key);
+    assert_eq!(fixture.backend.platform.devices[1].key, second_key);
+    assert!(
+        fixture.backend.platform.devices[0]
+            .cursor
+            .plane
+            .as_ref()
+            .is_some_and(|plane| plane.properties_for(colliding_crtc).is_none())
+    );
+    assert!(
+        fixture.backend.platform.devices[0]
+            .cursor
+            .plane
+            .as_ref()
+            .is_some_and(|plane| plane
+                .properties_for(::drm::control::from_u32(2).unwrap())
+                .is_some())
+    );
+    assert!(
+        fixture.backend.platform.devices[1]
+            .cursor
+            .plane
+            .as_ref()
+            .is_some_and(|plane| plane.properties_for(colliding_crtc).is_some())
+    );
+    assert!(
+        !fixture
+            .backend
+            .platform
+            .cursor_plane_available_for_output(0)
+    );
+    assert!(
+        fixture
+            .backend
+            .platform
+            .cursor_plane_available_for_output(1)
+    );
+    assert!(
+        fixture
+            .backend
+            .platform
+            .cursor_plane_fits_for_output(1, 1, 1)
+    );
+    assert!(
+        fixture
+            .backend
+            .platform
+            .cursor_plane_available_for_output(2)
+    );
+    assert!(
+        fixture
+            .backend
+            .platform
+            .cursor_plane_fits_for_output(2, 1, 1)
+    );
+
+    let stable_first_epoch = fixture.backend.platform.devices[0]
+        .cursor
+        .cursor_topology_epoch;
+    let stable_second_epoch = fixture.backend.platform.devices[1]
+        .cursor
+        .cursor_topology_epoch;
+    assert!(
+        fixture
+            .backend
+            .platform
+            .for_tests_queue_cursor_discovery_snapshot(
+                first_key,
+                cursor_topology_snapshot(
+                    "amdgpu",
+                    false,
+                    &[1, 2],
+                    &[(20, vec![2], ATOMIC_CURSOR_PROPERTIES.to_vec())],
+                ),
+            )
+    );
+    fixture.recorders.connector_snapshot.queue_snapshot(vec![
+        connector_snapshot_for_output(&fixture.backend.platform.outputs[0]),
+        connector_snapshot_for_output(&fixture.backend.platform.outputs[1]),
+        connector_snapshot_for_output(&fixture.backend.platform.outputs[2]),
+    ]);
+    fixture
+        .recorders
+        .hotplug
+        .queue_change()
+        .expect("queue unchanged-topology edge");
+    Backend::on_display_hotplug(&mut fixture.backend, &mut fixture.state);
+    assert_eq!(
+        fixture.backend.pstate.hotplug_rescan_deadline,
+        Some(base + Duration::from_millis(300))
+    );
+    elapsed_ms.set(299);
+    Backend::poll_deferred_input(&mut fixture.backend, &mut fixture.state);
+    elapsed_ms.set(300);
+    Backend::poll_deferred_input(&mut fixture.backend, &mut fixture.state);
+    assert_eq!(
+        fixture.backend.platform.devices[0]
+            .cursor
+            .cursor_topology_epoch,
+        stable_first_epoch,
+        "unchanged connector/plane topology does not advance its epoch",
+    );
+    assert_eq!(
+        fixture.backend.platform.devices[1]
+            .cursor
+            .cursor_topology_epoch,
+        stable_second_epoch,
+        "unchanged peer topology does not advance its epoch",
+    );
+    fixture.assert_cursor_quiescent();
+}

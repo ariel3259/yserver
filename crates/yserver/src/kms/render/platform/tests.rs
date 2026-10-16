@@ -527,8 +527,13 @@ fn test_kms_device(key: crate::platform::drm::DrmDeviceKey) -> KmsDevice {
             crate::drm::atomic::DrmAtomicCommitExecutor,
         ))),
         page_flip_event_source: Rc::new(flip_events::DrmPageFlipEventSource),
-        cursor_buffer_io: Rc::new(crate::kms::cursor_plane::ops::DrmCursorBufferIo),
-        legacy_cursor_io: Rc::new(crate::kms::cursor_plane::ops::DrmLegacyCursorIo),
+        cursor_buffer_io: {
+            let (io, _) = crate::kms::cursor_plane::ops::RecordingCursorBufferIo::new(256);
+            Rc::new(io)
+        },
+        legacy_cursor_io: Rc::new(
+            crate::kms::cursor_plane::ops::RecordingLegacyCursorIo::default(),
+        ),
         test_page_flip_event_source: None,
         cursor: KmsCursorState::new(),
     }
@@ -675,8 +680,13 @@ fn install_test_cursor_plane(
     crtcs: &[::drm::control::crtc::Handle],
     boundary: &str,
 ) {
-    let plane =
-        crate::kms::cursor_plane::CursorPlane::for_tests_stub(Rc::clone(&device.device), 64, 64);
+    let plane = crate::kms::cursor_plane::CursorPlane::for_tests_with_ops(
+        Rc::clone(&device.device),
+        crtcs,
+        Rc::clone(&device.cursor_buffer_io),
+        Rc::clone(&device.legacy_cursor_io),
+    )
+    .expect("synthetic plane discovery and allocation");
     install_cursor_plane_for_device(device, crtcs, boundary, plane);
 }
 
@@ -1729,15 +1739,18 @@ fn cursor_capacity_is_evaluated_per_card() {
 }
 
 #[test]
-fn cursor_plane_without_atomic_position_properties_keeps_the_legacy_path() {
+fn cursor_plane_without_required_properties_is_not_eligible() {
     let mut platform = PlatformBackend::for_tests();
     let crtc = platform.outputs[0].output.crtc;
-    install_test_cursor_plane(&mut platform.devices[0], &[crtc], "legacy path test");
+    let plane = crate::kms::cursor_plane::CursorPlane::for_tests_stub(
+        Rc::clone(&platform.devices[0].device),
+        64,
+        64,
+    );
+    install_cursor_plane_for_device(&mut platform.devices[0], &[crtc], "incomplete plane", plane);
 
-    assert!(!platform.devices[0].cursor.atomic_cursor);
-    assert!(!platform.devices[0].cursor.topology_blocked);
     assert!(platform.devices[0].cursor.plane.is_some());
-    assert!(platform.cursor_plane_available_for_output(0));
+    assert!(!platform.cursor_plane_available_for_output(0));
 
     platform.devices[0]
         .cursor
@@ -1750,9 +1763,16 @@ fn cursor_plane_without_atomic_position_properties_keeps_the_legacy_path() {
             ::drm::control::from_u32(31).unwrap(),
             ::drm::control::from_u32(32).unwrap(),
         );
-    let device_key = platform.devices[0].key;
-    platform.refresh_cursor_topology_for_devices(&HashSet::from([device_key]));
-    assert!(platform.devices[0].cursor.atomic_cursor);
+    assert!(platform.cursor_plane_available_for_output(0));
+    assert!(
+        platform.devices[0]
+            .cursor
+            .plane
+            .as_ref()
+            .and_then(|plane| plane.properties_for(crtc))
+            .is_some()
+    );
+    assert_eq!(platform.devices[0].cursor.cursor_topology_epoch, 1);
 }
 
 #[test]
