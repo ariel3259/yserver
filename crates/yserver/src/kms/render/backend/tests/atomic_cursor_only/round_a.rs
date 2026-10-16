@@ -1,5 +1,116 @@
 use super::support::AtomicCursorFixture;
 
+#[test]
+// Mutation: swapping ATOMIC and CURSOR_PLANE_HOTSPOT must break the recorded order assertion.
+fn atomic_cursor_only_device_caps_are_negotiated_and_cached() {
+    use crate::drm::client_caps::{
+        DeviceClientCapability, DeviceControl, DeviceControlCall, RecordingDeviceControl,
+    };
+    use std::sync::Arc;
+
+    let control = Arc::new(RecordingDeviceControl::new(
+        [Ok(()), Ok(()), Ok(())],
+        Ok("amdgpu".to_owned()),
+    ));
+    let dependency: Arc<dyn DeviceControl + Send + Sync> = control.clone();
+    let device = crate::drm::Device::for_tests_with_control(dependency)
+        .expect("accepted client capabilities open the test KMS device");
+
+    assert_eq!(
+        control.calls(),
+        vec![
+            DeviceControlCall::SetClientCapability(DeviceClientCapability::UniversalPlanes),
+            DeviceControlCall::SetClientCapability(DeviceClientCapability::Atomic),
+            DeviceControlCall::SetClientCapability(DeviceClientCapability::CursorPlaneHotspot),
+            DeviceControlCall::DriverName,
+        ],
+    );
+    let caps = device
+        .cursor_caps()
+        .expect("test KMS device negotiated caps");
+    assert!(caps.cursor_plane_hotspot_cap_accepted());
+    assert_eq!(caps.driver_name(), "amdgpu");
+}
+
+#[test]
+// Mutation: making hotspot-cap rejection fatal must fail this physical-driver startup assertion.
+fn atomic_cursor_only_hotspot_rejection_is_cached_without_failing_open() {
+    use crate::drm::client_caps::{DeviceControl, RecordingDeviceControl};
+    use std::sync::Arc;
+
+    let control = Arc::new(RecordingDeviceControl::new(
+        [Ok(()), Ok(()), Err(libc::EOPNOTSUPP)],
+        Ok("amdgpu".to_owned()),
+    ));
+    let dependency: Arc<dyn DeviceControl + Send + Sync> = control;
+    let device = crate::drm::Device::for_tests_with_control(dependency)
+        .expect("physical driver hotspot rejection is non-fatal");
+
+    let caps = device
+        .cursor_caps()
+        .expect("test KMS device negotiated caps");
+    assert!(!caps.cursor_plane_hotspot_cap_accepted());
+    assert_eq!(caps.driver_name(), "amdgpu");
+}
+
+#[test]
+// Mutation: renegotiating an inherited KMS fd must fail the no-call and empty-cache assertions.
+fn atomic_cursor_only_inherited_fd_reuses_caps_without_negotiation() {
+    use crate::drm::client_caps::{DeviceControl, RecordingDeviceControl};
+    use std::{
+        os::{fd::OwnedFd, unix::net::UnixStream},
+        sync::Arc,
+    };
+
+    let control = Arc::new(RecordingDeviceControl::new(
+        [Ok(()), Ok(()), Ok(())],
+        Ok("amdgpu".to_owned()),
+    ));
+    let dependency: Arc<dyn DeviceControl + Send + Sync> = control.clone();
+    let (stream, peer) = UnixStream::pair().expect("create synthetic inherited fd");
+    let fd = OwnedFd::from(stream);
+    let device = crate::drm::Device::from_inherited_kms_fd_with_control(
+        fd,
+        "<test inherited fd>",
+        dependency,
+    );
+    drop(peer);
+
+    assert!(device.cursor_caps().is_none());
+    assert!(control.calls().is_empty());
+}
+
+#[test]
+// Mutation: negotiating on a render node must fail the empty call and cache assertions.
+fn atomic_cursor_only_render_node_skips_kms_capability_negotiation() {
+    use crate::drm::client_caps::{DeviceControl, RecordingDeviceControl};
+    use std::sync::Arc;
+
+    let control = Arc::new(RecordingDeviceControl::new(
+        [Ok(()), Ok(()), Ok(())],
+        Ok("render-only".to_owned()),
+    ));
+    let dependency: Arc<dyn DeviceControl + Send + Sync> = control.clone();
+    let device = crate::drm::Device::open_render_node_with_control("/dev/null", dependency)
+        .expect("open synthetic render node");
+
+    assert!(device.cursor_caps().is_none());
+    assert!(control.calls().is_empty());
+}
+
+#[test]
+// Mutation: dropping the cache from AtomicCursorFixture must fail the platform visibility assertions.
+fn atomic_cursor_only_backend_fixture_exposes_device_caps() {
+    let fixture = AtomicCursorFixture::without_scene().expect("build backend fixture");
+    let device = &fixture.backend.platform.devices[0].device;
+    let caps = device
+        .cursor_caps()
+        .expect("backend fixture device retains negotiated cursor caps");
+    assert!(caps.cursor_plane_hotspot_cap_accepted());
+    assert_eq!(caps.driver_name(), "atomic-cursor-fixture");
+    fixture.assert_cursor_quiescent();
+}
+
 fn clone_drm_output(output: &crate::platform::drm::Output) -> crate::platform::drm::Output {
     crate::platform::drm::Output {
         connector: output.connector,

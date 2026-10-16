@@ -33,6 +33,19 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-10-16 atomic-cursor-only A2:** KMS `Device::open` now records
+  hotspot-cap acceptance and the DRM driver name after requesting
+  UNIVERSAL_PLANES → ATOMIC → CURSOR_PLANE_HOTSPOT. Hotspot-cap rejection is
+  debug-level and non-fatal; render-node and inherited-fd constructors retain
+  no KMS capability cache. Recording constructor tests cover order, accepted
+  and rejected results, inherited/render-node behavior, and the Backend
+  fixture's cached values. Five tests passed five times each under 16 busy
+  loops. The default and whole ignored workspace suites, DRI3 fd-leak test,
+  render acceptance, both Clippy gates, and layout check passed on lavapipe.
+  Linux glibc build passed. Linux musl and FreeBSD checks could not reach the
+  crate because local cross pkg-config/sysroot or C compiler support is
+  unavailable. No hardware validation was run; Task C11 owns it.
+
 - **2026-10-16 atomic-cursor-only A1 fix round 3:** the direct-successor
   regression now creates its fullscreen target, all source drawables and
   prequalified synthetic M1 framebuffers before the first Backend action.

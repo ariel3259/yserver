@@ -100,30 +100,37 @@ Names below are proposed interfaces, not implementation bodies. Use existing `Cr
 ## Task A2: Negotiate and retain hotspot capability before discovery
 
 **Files:**
-- Modify: `crates/yserver/src/drm/device.rs`, `crates/yserver/src/platform/drm.rs`, `crates/yserver/src/kms/outputs.rs`, `crates/yserver/src/kms/render/platform/init.rs`.
-- Create: `crates/yserver/src/drm/client_caps.rs`, `crates/yserver/src/kms/cursor_plane/topology.rs`.
-- Test: `crates/yserver/src/kms/render/backend/tests/atomic_cursor_only/round_a.rs`.
+- Modify: `crates/yserver/src/drm/device.rs`, `crates/yserver/src/drm/mod.rs`, `crates/yserver/src/kms/cursor_plane.rs`, and `crates/yserver/src/kms/render/backend/tests/atomic_cursor_only/round_a.rs`.
+- Create: `crates/yserver/src/drm/client_caps.rs` and `crates/yserver/src/kms/cursor_plane/topology.rs`.
+- Modify the `AtomicCursorFixture` support in `crates/yserver/src/kms/render/backend/tests/atomic_cursor_only/support.rs` so its platform device carries recorded capability results.
 
 **Interfaces:**
-- Consumes: A1's construction I/O trace, `Device::open`, existing device driver-name query; evidence P-open/P-backend.
-- Produces: `Device::cursor_caps(&self) -> Option<&CursorDeviceCaps>`, populated at real KMS open; render-node/inherited-probe constructors do not negotiate KMS capabilities; `negotiate_client_caps(device: &Device, io: &dyn DeviceControlIo) -> io::Result<CursorDeviceCaps>`. Extend A1's existing `DeviceControlIo` with `driver_name(&self, device: &Device) -> io::Result<String>`; its existing `set` method submits capability ioctls. No trait-object downcast or test-only capability branch is needed. Handle the hotspot uAPI value with the existing dependency's supported API or a small portable request wrapper; verify local headers/dependency source at implementation time.
+- A1 does not provide a construction I/O trace or `DeviceControlIo`. Add a `DeviceControl: Send + Sync` dependency stored as `Arc<dyn DeviceControl + Send + Sync>` on `Device`. Its production implementation submits the client-cap requests and queries the driver's name through the DRM version query; recording tests inject a scripted implementation through a constructor parameter. Do not add cfg(test) branches in production function bodies.
+- `Device::open` negotiates `DRM_CLIENT_CAP_UNIVERSAL_PLANES`, then `DRM_CLIENT_CAP_ATOMIC`, then `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT`, and only returns after this sequence and the driver-name query. These requests precede plane enumeration through existing `Device::open` callers. A hotspot-cap rejection is debug-level, non-fatal, and cached as `false`; the driver name is cached from the DRM driver query.
+- A3 consumes `Device::cursor_caps(&self) -> Option<&CursorDeviceCaps>`, `CursorDeviceCaps::cursor_plane_hotspot_cap_accepted()`, `CursorDeviceCaps::driver_name()`, and `CursorDeviceCaps::is_virtualized_cursor_driver()`. Primary KMS opens return `Some`; render-node and inherited-fd constructors return `None` and do not negotiate. Inherited probe fds keep their existing constructor signature and reuse the fd's capabilities.
+- The hotspot request uses a small `_IOW('d', 0x0d, drm_set_client_cap)` wrapper with the 16-byte uAPI payload; request typing must build on Linux glibc, Linux musl, and FreeBSD without `libc::Ioctl`.
 
-- [ ] **Step 1: Add `atomic_cursor_only_caps_precede_plane_enumeration`.** Inspect the production construction trace, then advance through Backend reprobe/compose. Assert Atomic → hotspot-cap → first plane enumeration, one negotiated result per fd, no kernel-version query, and normal physical-driver rejection. Parameterize accepted/rejected cap and construction of an inherited probe fd (which must not negotiate again). Mutations: swap Atomic/hotspot, enumerate first, or renegotiate an inherited probe fd; each corresponding trace/eligibility assertion fails.
-- [ ] **Step 2: Run red and confirm the missing hotspot request/order assertion.** Construction is the real production initialization with injected syscalls, not a direct test call to the negotiation helper.
-- [ ] **Step 3: Persist the result and wire all device-open callers.** Query the actual kernel driver name, not a PCI vendor string. Do not make a render-node opener acquire master or set KMS caps. Cap rejection does not fail physical-device startup. The active server retains its cached result for eligibility. Inherited disposable-probe fds reuse kernel capabilities without renegotiation and return `None` from the new getter; those helpers do not discover/program cursor planes. Keep their existing constructor signature. A cursor discovery caller without a negotiated result is ineligible, never an optimistic HW probe.
-- [ ] **Step 4: Run green, each order/duplicate-negotiation mutation, and F stress.** Compile the new ioctl wrapper on glibc, musl and FreeBSD using the repository's existing cross-build/CI target setup; record unavailable local targets as unexecuted, never as passes.
-- [ ] **Step 5: Per-task gate and one commit.** After the targeted red/green, mutation checks (reverted) and F stress, run all commands:
+- [x] **Step 1: Add constructor tests in `round_a.rs`.** Assert exact UniversalPlanes → Atomic → CursorPlaneHotspot → driver-name call order, cached hotspot `true`, cached driver name, physical-driver hotspot rejection as non-fatal cached `false`, render-node and inherited-fd non-negotiation, and visibility of cached values on `AtomicCursorFixture`'s platform device. Do not depend on an A1 construction trace or call the negotiation helper directly.
+- [x] **Step 2: Run red before adding the seam, then green after implementation.** Use `/dev/null` test constructors with the recording dependency. Production `Device::open` uses the same negotiation helper after DRM master acquisition; no hardware or plane enumeration is needed for these constructor contract tests.
+- [x] **Step 3: Add the production and recording dependencies.** The production dependency issues `DRM_IOCTL_SET_CLIENT_CAP` and queries the actual driver name. Keep render-node and inherited-fd constructors non-negotiating, retain the inherited constructor's signature, and cache cursor caps only after a primary KMS open succeeds.
+- [x] **Step 4: Apply and revert the named mutations, then run F stress.** Swapping ATOMIC and CURSOR_PLANE_HOTSPOT must fail the call-order assertion; treating hotspot rejection as fatal must fail the physical-driver rejection test. Run every new test five times under 16 busy loops. Build the ioctl wrapper for available Linux glibc, Linux musl, and FreeBSD CI targets; record unavailable local targets as unexecuted. Cross-target checks were attempted; missing local cross sysroots/tooling are recorded in the A2 report.
+- [x] **Step 5: Run the task gates.** After TDD, reverted mutations, and load runs, run:
 
 ```bash
 cargo +nightly fmt
 cargo fmt --all
+cargo build --bin yserver
+VK_DRIVER_FILES=/home/ariel_santangelo/Projects/claude-scratch/yserver-pr1/lvp/lvp_icd.json YSERVER_ALLOW_SOFTWARE_VULKAN=1 cargo test --workspace --locked --features xdmcp
+VK_DRIVER_FILES=/home/ariel_santangelo/Projects/claude-scratch/yserver-pr1/lvp/lvp_icd.json YSERVER_ALLOW_SOFTWARE_VULKAN=1 cargo test --workspace --locked --features xdmcp --no-fail-fast -- --ignored
+VK_DRIVER_FILES=/home/ariel_santangelo/Projects/claude-scratch/yserver-pr1/lvp/lvp_icd.json YSERVER_ALLOW_SOFTWARE_VULKAN=1 cargo test -p yserver --test dri3_fd_leak
+VK_DRIVER_FILES=/home/ariel_santangelo/Projects/claude-scratch/yserver-pr1/lvp/lvp_icd.json YSERVER_ALLOW_SOFTWARE_VULKAN=1 cargo test -p yserver --test dri3_fd_leak -- --ignored
+VK_DRIVER_FILES=/home/ariel_santangelo/Projects/claude-scratch/yserver-pr1/lvp/lvp_icd.json YSERVER_ALLOW_SOFTWARE_VULKAN=1 cargo test -p yserver --test render_acceptance -- --ignored
 cargo clippy --all-targets -- -D warnings
 cargo clippy --workspace --all-targets --features xdmcp -- -D warnings
-cargo test --workspace --locked --features xdmcp
-VK_DRIVER_FILES=/home/ariel_santangelo/Projects/claude-scratch/yserver-pr1/lvp/lvp_icd.json YSERVER_ALLOW_SOFTWARE_VULKAN=1 cargo test --workspace --locked --features xdmcp --no-fail-fast -- --ignored
+tools/check-layout.sh
 ```
 
-Expected: every command exits 0, clippy has no warnings, and ordinary/ignored suites have no failures; report capability skips explicitly. Check formatter changes and run the relevant targeted tests again only if formatting changed behavior-sensitive code. Stage only this task's named files and commit once with `git commit -m "feat: negotiate atomic cursor hotspot capability"`. Do not batch this commit with the next task.
+Expected: every available gate exits 0, clippy has no warnings, and ordinary/ignored suites have no failures; report lavapipe capability skips separately. No hardware validation or git writes are part of A2; the controller reviews and commits the working tree.
 
 ## Task A3: Select atomic eligibility independently for each CRTC
 

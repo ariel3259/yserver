@@ -11,6 +11,7 @@ pub(crate) struct AtomicCursorFixture {
 impl AtomicCursorFixture {
     pub(crate) fn new() -> Result<Option<Self>, String> {
         let mut backend = KmsBackend::for_tests_with_vk().map_err(|error| error.to_string())?;
+        install_recording_device_caps(&mut backend);
         let vk = Arc::clone(
             backend
                 .platform
@@ -48,6 +49,7 @@ impl AtomicCursorFixture {
 
     pub(crate) fn without_scene() -> Result<Self, String> {
         let mut backend = KmsBackend::for_tests();
+        install_recording_device_caps(&mut backend);
         backend.platform.for_tests_initialize_cursor_planes();
         let recorders = Rc::clone(
             backend
@@ -170,6 +172,26 @@ impl AtomicCursorFixture {
             );
         }
     }
+}
+
+fn install_recording_device_caps(backend: &mut KmsBackend) {
+    use crate::drm::client_caps::{DeviceControl, recording_control};
+
+    let control = recording_control("atomic-cursor-fixture");
+    let dependency: Arc<dyn DeviceControl + Send + Sync> = control;
+    let device = Rc::new(
+        crate::drm::Device::for_tests_with_control(dependency)
+            .expect("record capabilities on synthetic DRM device"),
+    );
+    backend
+        .platform
+        .services
+        .test_recorders
+        .as_ref()
+        .expect("for_tests selects recording KMS services")
+        .page_flip_events
+        .register_device(&device);
+    backend.platform.devices[0].device = device;
 }
 
 fn install_recording_scanout_pools(
