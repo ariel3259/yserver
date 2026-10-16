@@ -65,15 +65,12 @@ impl Device {
             .read(true)
             .write(true)
             .open("/dev/null")?;
-        let mut device = Self {
+        Self::open_kms_device(
             file,
-            path: "/dev/null".to_string(),
-            master_ownership: MasterOwnership::None,
+            "/dev/null".to_string(),
+            MasterOwnership::None,
             device_control,
-            cursor_caps: None,
-        };
-        device.negotiate_cursor_caps()?;
-        Ok(device)
+        )
     }
 
     /// Open a render node without taking DRM master.
@@ -144,19 +141,36 @@ impl Device {
             .write(true)
             .open(path)
             .map_err(|err| open_error(path, &err))?;
+        Self::open_kms_device(
+            file,
+            path.to_string(),
+            MasterOwnership::AcquiredHere,
+            device_control,
+        )
+    }
+
+    /// Shared KMS initialization body for real opens and recording tests.
+    fn open_kms_device(
+        file: File,
+        path: String,
+        master_ownership: MasterOwnership,
+        device_control: Arc<dyn DeviceControl + Send + Sync>,
+    ) -> io::Result<Self> {
         let mut device = Self {
             file,
-            path: path.to_string(),
-            master_ownership: MasterOwnership::AcquiredHere,
+            path,
+            master_ownership,
             device_control,
             cursor_caps: None,
         };
-        device.acquire_master_lock().map_err(|err| {
-            io::Error::new(
-                err.kind(),
-                format!("failed to acquire DRM master on {path}: {err}"),
-            )
-        })?;
+        if device.master_ownership == MasterOwnership::AcquiredHere {
+            device.acquire_master_lock().map_err(|err| {
+                io::Error::new(
+                    err.kind(),
+                    format!("failed to acquire DRM master on {}: {err}", device.path),
+                )
+            })?;
+        }
         device.negotiate_cursor_caps()?;
         Ok(device)
     }

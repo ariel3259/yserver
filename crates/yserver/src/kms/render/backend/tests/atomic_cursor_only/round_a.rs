@@ -1,8 +1,8 @@
 use super::support::AtomicCursorFixture;
 
 #[test]
-// Mutation: swapping ATOMIC and CURSOR_PLANE_HOTSPOT must break the recorded order assertion.
-fn atomic_cursor_only_device_caps_are_negotiated_and_cached() {
+// Mutation: reordering caps in the shared production KMS-open body must break this recorded trace.
+fn atomic_cursor_only_shared_kms_open_body_orders_caps_before_driver_query() {
     use crate::drm::client_caps::{
         DeviceClientCapability, DeviceControl, DeviceControlCall, RecordingDeviceControl,
     };

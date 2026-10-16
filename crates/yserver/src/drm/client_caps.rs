@@ -95,10 +95,8 @@ struct DrmSetClientCap {
 
 // _IOW('d', 0x0d, struct drm_set_client_cap), whose two u64 fields make
 // the ioctl payload 16 bytes on Linux glibc, Linux musl, and FreeBSD.
-const DRM_IOCTL_SET_CLIENT_CAP: u32 = (1_u32 << 30)
-    | ((std::mem::size_of::<DrmSetClientCap>() as u32) << 16)
-    | (0x64_u32 << 8)
-    | 0x0d;
+const DRM_IOCTL_SET_CLIENT_CAP: nix::sys::ioctl::ioctl_num_type =
+    nix::request_code_write!(b'd', 0x0d, std::mem::size_of::<DrmSetClientCap>());
 const DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT: u64 = 6;
 
 fn set_cursor_plane_hotspot_cap(device: &Device) -> io::Result<()> {
@@ -231,4 +229,47 @@ pub(crate) fn recording_control(driver_name: &str) -> Arc<RecordingDeviceControl
         [Ok(()), Ok(()), Ok(())],
         Ok(driver_name.to_owned()),
     ))
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "freebsd")))]
+mod tests {
+    #[test]
+    // Mutation: changing the target's _IOW direction encoding must fail this ABI assertion.
+    fn set_client_cap_ioctl_matches_target_abi() {
+        #[cfg(all(
+            target_os = "linux",
+            not(any(
+                target_arch = "mips",
+                target_arch = "mips32r6",
+                target_arch = "mips64",
+                target_arch = "mips64r6",
+                target_arch = "powerpc",
+                target_arch = "powerpc64",
+                target_arch = "sparc64"
+            ))
+        ))]
+        let expected = 0x4010_640d_u64;
+
+        #[cfg(any(
+            target_os = "freebsd",
+            all(
+                target_os = "linux",
+                any(
+                    target_arch = "mips",
+                    target_arch = "mips32r6",
+                    target_arch = "mips64",
+                    target_arch = "mips64r6",
+                    target_arch = "powerpc",
+                    target_arch = "powerpc64",
+                    target_arch = "sparc64"
+                )
+            )
+        ))]
+        let expected = 0x8010_640d_u64;
+
+        assert_eq!(
+            format!("{:#x}", super::DRM_IOCTL_SET_CLIENT_CAP),
+            format!("{expected:#x}"),
+        );
+    }
 }

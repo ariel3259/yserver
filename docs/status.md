@@ -46,6 +46,19 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   crate because local cross pkg-config/sysroot or C compiler support is
   unavailable. No hardware validation was run; Task C11 owns it.
 
+- **2026-10-16 atomic-cursor-only A2 fix round 1:** SET_CLIENT_CAP now uses
+  nix's target-aware `_IOW` request encoding. The ABI regression test pins
+  Linux's generic request to `0x4010640d` and FreeBSD/Linux direction variants
+  to `0x8010640d` under their target cfgs. Real opens and the recording test
+  constructor now enter the same KMS initialization body, so capability order
+  is observed on the shared path. The order, request-encoding, and inherited-fd
+  duplicate-negotiation mutations each failed their corresponding assertion;
+  both new/changed tests passed five times under 16 busy loops. The required
+  workspace, ignored, integration, Clippy, build, formatting, and layout gates
+  passed on Linux glibc with lavapipe for tests. Musl and FreeBSD crate checks
+  remain unexecuted because their local cross compiler/pkg-config sysroots are
+  unavailable. No hardware validation was run; Task C11 owns it.
+
 - **2026-10-16 atomic-cursor-only A1 fix round 3:** the direct-successor
   regression now creates its fullscreen target, all source drawables and
   prequalified synthetic M1 framebuffers before the first Backend action.
