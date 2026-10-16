@@ -18,6 +18,11 @@ still move the cursor with `move_cursor`. The scene sequences plane transitions 
 (`yserver-render` `scene/cursor.rs`, `scene/tick.rs`). `ShowOnRetire` captures x,y when the show is requested
 and applies it at retirement, which causes the #244 jump.
 
+**Why the legacy ioctls can go (user, 2026-10-16).** GPUs whose drivers cannot do atomic cursor commits also have no
+Vulkan driver, and yserver renders only through Vulkan, so the legacy cursor path only serves hardware that cannot
+run yserver. A display-only device fed by another GPU (the copied route) needs no Vulkan of its own. If it has no
+usable atomic cursor plane, it gets the software cursor (§1).
+
 ## Non-goals
 
 Gamma/LUT, overlay planes, tearing (C1 keeps its own cursor policy), cursor scaling, new cursor protocol features.
