@@ -477,6 +477,7 @@ pub(crate) struct CursorBufferLedger {
     live_framebuffers: RefCell<HashSet<(i32, u32)>>,
     storage: RefCell<CursorBufferStorageMap>,
     failures: RefCell<Vec<CursorBufferFailure>>,
+    failures_taken: RefCell<Vec<CursorBufferOperation>>,
 }
 
 type CursorBufferStorageMap = HashMap<(i32, u32), Rc<RefCell<Box<[u8]>>>>;
@@ -508,6 +509,10 @@ impl CursorBufferLedger {
             self.live_mappings.borrow().len(),
             self.live_framebuffers.borrow().len(),
         )
+    }
+
+    pub(crate) fn failures_taken(&self) -> Vec<CursorBufferOperation> {
+        self.failures_taken.borrow().clone()
     }
 
     #[allow(
@@ -548,7 +553,9 @@ impl CursorBufferLedger {
             failure.successful_calls_before_failure -= 1;
             return None;
         }
-        Some(failures.remove(index).raw_os_error)
+        let raw_os_error = failures.remove(index).raw_os_error;
+        self.failures_taken.borrow_mut().push(operation);
+        Some(raw_os_error)
     }
 }
 

@@ -35,6 +35,10 @@ pub trait Platform: OutputSink + Sized + 'static {
     /// What the scene reads of every live output, in output order.
     fn output_layouts(&self) -> Vec<OutputLayout>;
 
+    /// Record entry into the portable Backend::put_image trait method.
+    /// KMS uses a construction-selected observer; other platforms do nothing.
+    fn note_backend_put_image_entry(_b: &mut XBackend<Self>) {}
+
     /// A drawable's storage is gone; forget platform caches keyed by it.
     fn note_drawable_retired(_st: &mut Self::BackendState, _id: DrawableId) {}
     /// The keyboard LEDs should show `lit`, the lit XKB indicators (bit 0

@@ -80,6 +80,23 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   environmental test output. No hardware validation was run; controller Task
   C11 owns it.
 
+- **2026-10-16 atomic-cursor-only A4 fix round 2:** live-image allocation
+  failure now injects `Create`/allocation pressure after a prior cursor frame
+  has committed, then verifies the prior legacy image remains visible,
+  byte-identical, and bound until Backend retries. The malformed PutImage test
+  now counts calls at the actual `Backend::put_image` trait entry, independent
+  of renderer submissions. The direct-hide fixture installs its accepted
+  scanout probe and output-power dependency before the scenario; subsequent
+  state transitions run through Backend entries and page-flip events. All three
+  regressions passed their focused mutation checks and 20/20 loaded runs under
+  16 busy loops. The default workspace suite, whole ignored lavapipe suite,
+  standalone render-acceptance runs, build, both Clippy gates, formatting, and
+  layout check passed. The ignored workspace suite ran 177 yserver, 1 DRI3, 10
+  GLX TFP, 191 render-acceptance, 64 yserver-render, and 2 doctests without
+  failures or SYNC_FD capability skips. Mesa loader device-info diagnostics
+  appeared during Vulkan fixture teardown; all tests passed. No hardware
+  validation was run; controller Task C11 owns it.
+
 - **2026-10-16 atomic-cursor-only A3 fix round 1:** the review gaps are closed.
   `cursor_plane/topology.rs` now owns atomic cursor discovery, ten-property
   qualification, virtual-driver hotspot checks, and exclusive CRTC matching.

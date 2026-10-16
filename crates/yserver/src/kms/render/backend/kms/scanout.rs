@@ -1322,6 +1322,62 @@ impl KmsBackend {
             return;
         }
 
+        // Backend fixtures inject the result of a completed M1 probe here,
+        // after direct-scanout eligibility and cache checks but before the
+        // fixture's synthetic output data reaches the DRM-only qualification
+        // path. Production always returns `None` and performs the full output
+        // tiling, dma-buf import, and atomic TEST_ONLY checks below.
+        if let Some(result) = self
+            .platform
+            .services
+            .scanout_probe_results
+            .take_result(source_id)
+        {
+            match result {
+                crate::drm::modeset::DirectScanoutTestResult::Accepted(framebuffer) => {
+                    let mut crtcs: Vec<_> = self
+                        .platform
+                        .outputs
+                        .iter()
+                        .map(|layout| layout.output.crtc)
+                        .collect();
+                    crtcs.sort_by_key(|crtc| u32::from(*crtc));
+                    let width = u32::from(candidate.src_width);
+                    let height = u32::from(candidate.src_height);
+                    self.pstate.scanout_m1.entries.insert(
+                        source_id,
+                        ScanoutM1ProbeEntry::accepted_with_shape(
+                            framebuffer,
+                            crate::drm::async_flip::AsyncShape {
+                                fourcc: 0x3432_5258,
+                                modifier: 0,
+                                pitch: width.saturating_mul(4),
+                                width,
+                                height,
+                                crtcs,
+                                direct: true,
+                            },
+                        ),
+                    );
+                    self.pstate.scanout_m0.m1_probe_pass =
+                        self.pstate.scanout_m0.m1_probe_pass.saturating_add(1);
+                }
+                crate::drm::modeset::DirectScanoutTestResult::Rejected(error) => {
+                    log::debug!(
+                        "scanout_m1: injected TEST_ONLY rejected source_id={}: {error}",
+                        source_id.as_u64(),
+                    );
+                    self.pstate
+                        .scanout_m1
+                        .entries
+                        .insert(source_id, ScanoutM1ProbeEntry::rejected());
+                    self.pstate.scanout_m0.m1_probe_reject =
+                        self.pstate.scanout_m0.m1_probe_reject.saturating_add(1);
+                }
+            }
+            return;
+        }
+
         let root = (u32::from(self.platform.fb_w), u32::from(self.platform.fb_h));
         let output_geometry: Vec<ScanoutM1OutputGeometry> = self
             .platform

@@ -25,6 +25,103 @@ use crate::{
     },
 };
 
+/// A probe result source keeps scanout qualification on the production path
+/// while allowing backend fixtures to supply the result of DRM `TEST_ONLY`.
+pub(crate) trait InjectedScanoutProbeResults {
+    fn take_result(
+        &self,
+        source_id: crate::kms::render::store::DrawableId,
+    ) -> Option<crate::drm::modeset::DirectScanoutTestResult>;
+}
+
+pub(crate) struct NoInjectedScanoutProbeResults;
+
+impl InjectedScanoutProbeResults for NoInjectedScanoutProbeResults {
+    fn take_result(
+        &self,
+        _source_id: crate::kms::render::store::DrawableId,
+    ) -> Option<crate::drm::modeset::DirectScanoutTestResult> {
+        None
+    }
+}
+
+/// Observes calls at the `Backend` trait boundary. Production installs a
+/// no-op observer; core-loop tests count calls independently of renderer work
+/// that may return early.
+pub(crate) trait BackendEntryObserver {
+    fn put_image_entered(&self);
+}
+
+pub(crate) struct NoopBackendEntryObserver;
+
+impl BackendEntryObserver for NoopBackendEntryObserver {
+    fn put_image_entered(&self) {}
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct RecordingScanoutProbeResults {
+    results: std::cell::RefCell<
+        std::collections::HashMap<
+            crate::kms::render::store::DrawableId,
+            std::collections::VecDeque<crate::drm::modeset::DirectScanoutTestResult>,
+        >,
+    >,
+}
+
+#[cfg(test)]
+impl RecordingScanoutProbeResults {
+    pub(crate) fn queue_accepted(
+        &self,
+        source_id: crate::kms::render::store::DrawableId,
+        framebuffer: u32,
+    ) {
+        let framebuffer = ::drm::control::from_u32(framebuffer)
+            .expect("synthetic direct-scanout FB handle is nonzero");
+        self.results
+            .borrow_mut()
+            .entry(source_id)
+            .or_default()
+            .push_back(crate::drm::modeset::DirectScanoutTestResult::Accepted(
+                crate::drm::modeset::DirectScanoutProbeFramebuffer::for_tests(framebuffer),
+            ));
+    }
+}
+
+#[cfg(test)]
+impl InjectedScanoutProbeResults for RecordingScanoutProbeResults {
+    fn take_result(
+        &self,
+        source_id: crate::kms::render::store::DrawableId,
+    ) -> Option<crate::drm::modeset::DirectScanoutTestResult> {
+        self.results
+            .borrow_mut()
+            .get_mut(&source_id)
+            .and_then(std::collections::VecDeque::pop_front)
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct RecordingBackendEntryObserver {
+    put_image_entries: std::cell::Cell<u64>,
+}
+
+#[cfg(test)]
+impl RecordingBackendEntryObserver {
+    pub(crate) fn put_image_entries(&self) -> u64 {
+        self.put_image_entries.get()
+    }
+}
+
+#[cfg(test)]
+impl BackendEntryObserver for RecordingBackendEntryObserver {
+    fn put_image_entered(&self) {
+        self.put_image_entries
+            .set(self.put_image_entries.get().saturating_add(1));
+    }
+}
+
 /// Raw operations retained by a KMS backend. Production algorithms keep
 /// constructing requests, scheduling cursor work, and retiring events.
 #[derive(Clone)]
@@ -39,6 +136,8 @@ pub struct KmsServices {
     pub(crate) hotplug: Rc<dyn DisplayHotplugSource>,
     pub(crate) connector_snapshot: Rc<dyn ConnectorSnapshotIo>,
     pub(crate) monotonic_clock: Rc<dyn Fn() -> Instant>,
+    pub(crate) scanout_probe_results: Rc<dyn InjectedScanoutProbeResults>,
+    pub(crate) backend_entry_observer: Rc<dyn BackendEntryObserver>,
     pub(crate) test_recorders: Option<Rc<KmsTestRecorders>>,
 }
 
@@ -74,6 +173,10 @@ pub(crate) struct KmsTestRecorders {
         Rc<crate::kms::render::platform::flip_events::RecordingPageFlipEventSource>,
     pub(crate) hotplug: Rc<RecordingDisplayHotplugSource>,
     pub(crate) connector_snapshot: Rc<RecordingConnectorSnapshotIo>,
+    #[cfg(test)]
+    pub(crate) scanout_probe_results: Rc<RecordingScanoutProbeResults>,
+    #[cfg(test)]
+    pub(crate) backend_entry_observer: Rc<RecordingBackendEntryObserver>,
 }
 
 pub(crate) trait CrtcOutputDiscovery {
@@ -166,6 +269,8 @@ impl KmsServices {
             hotplug: Rc::new(DrmDisplayHotplugSource::new()),
             connector_snapshot: Rc::new(DrmConnectorSnapshotIo),
             monotonic_clock: Rc::new(Instant::now),
+            scanout_probe_results: Rc::new(NoInjectedScanoutProbeResults),
+            backend_entry_observer: Rc::new(NoopBackendEntryObserver),
             test_recorders: None,
         }
     }
@@ -188,6 +293,8 @@ impl KmsServices {
         let hotplug =
             Rc::new(RecordingDisplayHotplugSource::new().expect("recording hotplug socket pair"));
         let connector_snapshot = Rc::new(RecordingConnectorSnapshotIo::new());
+        let scanout_probe_results = Rc::new(RecordingScanoutProbeResults::default());
+        let backend_entry_observer = Rc::new(RecordingBackendEntryObserver::default());
         let test_recorders = Rc::new(KmsTestRecorders {
             atomic: Rc::clone(&atomic),
             mode_blobs: Rc::clone(&mode_blobs),
@@ -200,6 +307,8 @@ impl KmsServices {
             page_flip_events: Rc::clone(&page_flip_events),
             hotplug: Rc::clone(&hotplug),
             connector_snapshot: Rc::clone(&connector_snapshot),
+            scanout_probe_results: Rc::clone(&scanout_probe_results),
+            backend_entry_observer: Rc::clone(&backend_entry_observer),
         });
         Self {
             mode_blobs,
@@ -212,6 +321,8 @@ impl KmsServices {
             hotplug,
             connector_snapshot,
             monotonic_clock: Rc::new(Instant::now),
+            scanout_probe_results,
+            backend_entry_observer,
             test_recorders: Some(test_recorders),
         }
     }
@@ -240,6 +351,8 @@ impl KmsServices {
             hotplug,
             connector_snapshot: Rc::new(RecordingConnectorSnapshotIo::new()),
             monotonic_clock: Rc::new(Instant::now),
+            scanout_probe_results: Rc::new(NoInjectedScanoutProbeResults),
+            backend_entry_observer: Rc::new(NoopBackendEntryObserver),
             test_recorders: None,
         }
     }

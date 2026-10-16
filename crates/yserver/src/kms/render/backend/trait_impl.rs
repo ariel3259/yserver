@@ -1106,6 +1106,7 @@ impl<P: Platform> Backend for XBackend<P> {
         dst_y: i16,
         data: &[u8],
     ) -> io::Result<()> {
+        P::note_backend_put_image_entry(self);
         Self::backend_draw_put_image(
             self, _origin, host_xid, depth, width, height, dst_x, dst_y, data,
         )

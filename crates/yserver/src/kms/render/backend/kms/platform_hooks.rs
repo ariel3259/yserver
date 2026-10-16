@@ -30,6 +30,13 @@ impl Platform for PlatformBackend {
         self.scene_output_layouts()
     }
 
+    fn note_backend_put_image_entry(b: &mut KmsBackend) {
+        b.platform
+            .services
+            .backend_entry_observer
+            .put_image_entered();
+    }
+
     fn note_drawable_retired(st: &mut KmsBackendState, id: DrawableId) {
         st.scanout_m1.remove(id);
     }

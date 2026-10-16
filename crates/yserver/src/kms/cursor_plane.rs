@@ -1017,6 +1017,11 @@ impl CursorPlane {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_tests_reset_unbound_sprite_pool(&mut self) {
+        self.sprite_pool = SpritePool::new(self.width, self.height);
+    }
+
     /// Invalidate the tracked uploaded version. The next
     /// `upload_image` will memcpy unconditionally regardless of
     /// version. Used by global recovery paths (VT-leave, full
