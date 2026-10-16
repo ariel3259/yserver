@@ -217,23 +217,6 @@ fn atomic_cursor_only_hotplug_source_arms_backend_debounce() {
     let deadline = Backend::next_wakeup(&fixture.backend).expect("Backend advertises debounce");
     assert_eq!(deadline, base + Duration::from_millis(150));
 
-    elapsed_ms.set(149);
-    Backend::poll_deferred_input(&mut fixture.backend, &mut fixture.state);
-    assert_eq!(Backend::next_wakeup(&fixture.backend), Some(deadline));
-
-    elapsed_ms.set(150);
-    Backend::poll_deferred_input(&mut fixture.backend, &mut fixture.state);
-    assert_eq!(
-        Backend::next_wakeup(&fixture.backend),
-        None,
-        "the due Backend rescan consumes the one debounce deadline",
-    );
-    Backend::poll_deferred_input(&mut fixture.backend, &mut fixture.state);
-    assert_eq!(
-        Backend::next_wakeup(&fixture.backend),
-        None,
-        "a second Backend poll cannot rediscover without a new hotplug edge",
-    );
     fixture.assert_cursor_quiescent();
     assert!(
         fixture.recorders.atomic.records().is_empty(),

@@ -33,6 +33,17 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-10-16 atomic-cursor-only A1 fix round 2:** the direct successor test
+  prepares synthetic composed buffers before Backend actions, reaches fallback
+  readiness through Backend entries, and checks M1 framebuffer-cache release
+  after pixmap teardown. Direct teardown passed 20/20 loaded lavapipe runs; the
+  hotplug deadline test passed 5/5 loaded runs and stops at the 150 ms deadline
+  because the brief excludes connector rediscovery. Default and ignored
+  workspace suites, render acceptance, Clippy, and layout gates passed. Worker
+  qualification recorder coverage and post-debounce rediscovery remain open
+  under the fixture boundaries described in the A1 report. No hardware
+  validation is part of A1; Task C11 owns that evidence.
+
 - **2026-10-15 macOS M3: window, scale, clipboard, bundle (branch `feat/macos-m0`, plan
   `plans/2026-10-14-macos-m3-window.md`):** the X screen follows the window. Resizes are coalesced per frame-clock
   tick (`surface/resize.rs` `ResizeCoalescer`); the root and the output size are separate, so RRSetScreenSize and a

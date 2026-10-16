@@ -1312,6 +1312,8 @@ fn grouped_direct_waits_all_outputs_and_uses_selected_reference_sample() {
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: restore success-without-request submission; the qualified framebuffer assertion must fail.
 // Mutation: retain the current direct frame after the composed Backend unflip; final ownership assertions must fail.
+// Mutation: retain a retired source's M1 framebuffer after drawable teardown; the cache-release assertions must fail.
+// Mutation: drop Backend's Present-copy fallback-ready update; the composed teardown must remain blocked.
 fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
     use std::os::fd::{AsFd as _, AsRawFd as _};
     use yserver_core::backend::Backend;
@@ -1332,6 +1334,31 @@ fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
         return;
     }
     let recorder = atomic_cursor_recording_sink(&mut b);
+    // Install fixture-owned composed scanout buffers before the behavioral
+    // scenario starts; teardown below must reach readiness through Backend.
+    b.platform.scanout_pools.resize_with(2, || None);
+    b.platform.bo_generations.resize_with(2, Vec::new);
+    let vk = std::sync::Arc::clone(
+        b.platform
+            .gpu
+            .vk
+            .as_ref()
+            .expect("test fixture Vulkan context"),
+    );
+    let kms_device = std::rc::Rc::clone(&b.platform.devices[0].device);
+    for (output_idx, fb) in [(0, 0x8901), (1, 0x8902)] {
+        let layout = &b.platform.outputs[output_idx];
+        let pool = crate::kms::vk::scanout::ScanoutBoPool::for_tests_on_screen_framebuffer(
+            std::sync::Arc::clone(&vk),
+            std::rc::Rc::clone(&kms_device),
+            layout.scanout_route,
+            u32::from(layout.width),
+            u32::from(layout.height),
+            atomic_cursor_raw(fb),
+        );
+        b.platform.scanout_pools[output_idx] =
+            Some(crate::kms::vk::scanout::OutputScanout::Shared(pool));
+    }
     seed_two_atomic_cursor_positions(&mut b, 850, 140);
     for (output_idx, layout) in b.platform.outputs.iter_mut().enumerate() {
         let base = 71 + u32::try_from(output_idx).expect("output index fits") * 16;
@@ -1494,34 +1521,32 @@ fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
     assert!(b.pstate.scanout_m2.pending.is_none());
     assert!(b.pstate.scanout_m2.queued_successor.is_none());
 
-    b.platform.scanout_pools.resize_with(2, || None);
-    b.platform.bo_generations.resize_with(2, Vec::new);
-    let vk = std::sync::Arc::clone(
-        b.platform
-            .gpu
-            .vk
-            .as_ref()
-            .expect("test fixture Vulkan context"),
-    );
-    let kms_device = std::rc::Rc::clone(&b.platform.devices[0].device);
-    for (output_idx, fb) in [(0, 0x8901), (1, 0x8902)] {
-        let layout = &b.platform.outputs[output_idx];
-        let pool = crate::kms::vk::scanout::ScanoutBoPool::for_tests_on_screen_framebuffer(
-            std::sync::Arc::clone(&vk),
-            std::rc::Rc::clone(&kms_device),
-            layout.scanout_route,
-            u32::from(layout.width),
-            u32::from(layout.height),
-            atomic_cursor_raw(fb),
-        );
-        b.platform.scanout_pools[output_idx] =
-            Some(crate::kms::vk::scanout::OutputScanout::Shared(pool));
-    }
     Backend::warp_pointer_root(&mut b, &mut state, 1160, 260);
     Backend::maybe_composite(&mut b).expect("move cursor while direct frame is held");
     assert_eq!(recorder.records().len(), 4);
     draw_atomic_cursor_test_root_overlay(&mut b, 2);
-    b.pstate.scanout_m2.unflip_shadow_ready = true;
+    let rejected_successor = prepare_atomic_cursor_direct_present(&mut b, 80);
+    assert!(
+        !Backend::try_present_direct(
+            &mut b,
+            rejected_successor.candidate,
+            rejected_successor.event,
+        )
+        .expect("root overlay declines direct successor"),
+        "root overlay sends the new source through the composed fallback",
+    );
+    assert!(b.pstate.scanout_m2.unflip_requested);
+    assert_eq!(
+        b.pstate.scanout_m2.unflip_fallback_source,
+        Some(rejected_successor.source_id),
+        "Backend retains the fallback source until its Present Copy is reported",
+    );
+    Backend::note_present_pixmap(
+        &mut b,
+        rejected_successor.candidate.src_pixmap_xid,
+        rejected_successor.candidate.dst_window_xid,
+    );
+    assert!(b.pstate.scanout_m2.unflip_shadow_ready);
     Backend::warp_pointer_root(&mut b, &mut state, 1320, 330);
     let unflip_positions = b
         .platform
@@ -1570,6 +1595,15 @@ fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
         "every direct buffer idle obligation is delivered once after replacement",
     );
     Backend::client_disconnected(&mut b, yserver_protocol::x11::ClientId(2));
+    for source_xid in [
+        predecessor.candidate.src_pixmap_xid,
+        first_successor.candidate.src_pixmap_xid,
+        latest_successor.candidate.src_pixmap_xid,
+        rejected_successor.candidate.src_pixmap_xid,
+    ] {
+        Backend::free_pixmap(&mut b, None, source_xid)
+            .expect("release test source pixmap after direct teardown");
+    }
     assert!(!b.scene.has_pending_page_flips());
     assert!(!b.pstate.scanout_m2.active());
     assert!(b.pstate.scanout_m2.current.is_none());
@@ -1580,6 +1614,17 @@ fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
     assert!(b.pstate.scanout_m2.completed.is_empty());
     assert!(b.pstate.scanout_m2.idled.is_empty());
     assert!(b.present_source_pins.is_empty());
+    for source_id in [
+        predecessor.source_id,
+        first_successor.source_id,
+        latest_successor.source_id,
+        rejected_successor.source_id,
+    ] {
+        assert!(
+            !b.pstate.scanout_m1.entries.contains_key(&source_id),
+            "retired source {source_id:?} must release its cached M1 framebuffer",
+        );
+    }
     assert_eq!(
         b.platform.devices[0]
             .test_page_flip_event_source
