@@ -221,6 +221,28 @@ fn move_failure(move_error: io::Error, rollback: io::Result<()>) -> CursorShowEr
     }
 }
 
+fn show_with_rollback(
+    visible: &mut HashMap<crtc::Handle, bool>,
+    crtc: crtc::Handle,
+    prior_visible: bool,
+    bind: impl FnOnce() -> io::Result<()>,
+    position: impl FnOnce() -> io::Result<()>,
+    hide: impl FnOnce() -> io::Result<()>,
+) -> Result<(), CursorShowError> {
+    bind().map_err(|error| bind_failure(prior_visible, error))?;
+    visible.insert(crtc, true);
+    match position() {
+        Ok(()) => Ok(()),
+        Err(move_error) => {
+            let rollback = hide();
+            if rollback.is_ok() {
+                visible.insert(crtc, false);
+            }
+            Err(move_failure(move_error, rollback))
+        }
+    }
+}
+
 /// Fallback cursor size when `DRM_CAP_CURSOR_WIDTH/HEIGHT` query fails
 /// (very old drivers, broken devices). Every Intel / AMD / mainstream-
 /// Mali iGPU since ~2010 supports at least 64×64.
@@ -833,43 +855,31 @@ impl CursorPlane {
                     )));
                 };
                 let prior_visible = self.is_visible_on(crtc);
-                io.bind(&self.device, crtc, Some(buffer), hotspot)
-                    .map_err(|error| bind_failure(prior_visible, error))?;
-                self.visible.insert(crtc, true);
-                match io.position(&self.device, crtc, img_x, img_y) {
-                    Ok(()) => Ok(()),
-                    Err(move_error) => Err(move_failure(move_error, self.hide_legacy(crtc))),
-                }
+                show_with_rollback(
+                    &mut self.visible,
+                    crtc,
+                    prior_visible,
+                    || io.bind(&self.device, crtc, Some(buffer), hotspot),
+                    || io.position(&self.device, crtc, img_x, img_y),
+                    || io.bind(&self.device, crtc, None, (0, 0)),
+                )
             }
-            CursorPlaneOperations::Executors { .. } => {
-                self.show_legacy(crtc, hotspot, img_x, img_y)
+            CursorPlaneOperations::Executors { hide, show } => {
+                let Some(buffer) = self.dumb.as_ref() else {
+                    return Err(CursorShowError::Unbound(io::Error::other(
+                        "cursor plane already destroyed",
+                    )));
+                };
+                let prior_visible = self.is_visible_on(crtc);
+                show_with_rollback(
+                    &mut self.visible,
+                    crtc,
+                    prior_visible,
+                    || show.show(&self.device, buffer, crtc, hotspot, img_x, img_y),
+                    || show.move_to(&self.device, crtc, img_x, img_y),
+                    || hide.hide(&self.device, crtc),
+                )
             }
-        }
-    }
-
-    #[allow(deprecated)]
-    fn show_legacy(
-        &mut self,
-        crtc: crtc::Handle,
-        hotspot: (i32, i32),
-        img_x: i32,
-        img_y: i32,
-    ) -> Result<(), CursorShowError> {
-        let Some(buffer) = self.dumb.as_ref() else {
-            return Err(CursorShowError::Unbound(io::Error::other(
-                "cursor plane already destroyed",
-            )));
-        };
-        let prior_visible = self.is_visible_on(crtc);
-        let CursorPlaneOperations::Executors { show, .. } = &self.operations else {
-            unreachable!("legacy cursor operations use the shared production path")
-        };
-        show.show(&self.device, buffer, crtc, hotspot, img_x, img_y)
-            .map_err(|error| bind_failure(prior_visible, error))?;
-        self.visible.insert(crtc, true);
-        match show.move_to(&self.device, crtc, img_x, img_y) {
-            Ok(()) => Ok(()),
-            Err(move_error) => Err(move_failure(move_error, self.hide_legacy(crtc))),
         }
     }
 

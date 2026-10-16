@@ -219,7 +219,11 @@ impl PlatformBackend {
         );
 
         // DRM disable (ALLOW_MODESET atomic commit zeroing the CRTC).
-        if let Err(e) = crate::drm::modeset::disable_output(&device, &self.outputs[idx].output) {
+        if let Err(e) = crate::drm::modeset::disable_output_with_executor(
+            &device,
+            &self.outputs[idx].output,
+            self.services.atomic.as_ref(),
+        ) {
             log::error!("render disable_connector: disable_output({connector}) failed: {e}");
             return Err(e);
         }
@@ -498,6 +502,7 @@ impl PlatformBackend {
         let pool = match qualified {
             qualified @ QualifiedScanoutPlan::Shared(_) => {
                 match replay_copy_free_scanout_plan(
+                    &self.services.modeset(),
                     vk,
                     device,
                     &output,
@@ -540,6 +545,7 @@ impl PlatformBackend {
                     RenderKmsRelationship::Same,
                 );
                 match replay_copied_scanout_plan(
+                    &self.services.modeset(),
                     vk,
                     sink_vk,
                     device,
@@ -686,6 +692,7 @@ impl PlatformBackend {
                 let allocation: io::Result<OutputScanout> =
                     if route_requires_copy_free_probe(scanout_route) {
                         match allocate_copy_free_scanout_pool(
+                            &self.services.modeset(),
                             Arc::clone(&vk),
                             Rc::clone(&device),
                             &output,
@@ -717,6 +724,7 @@ impl PlatformBackend {
                                             RenderKmsRelationship::Same,
                                         );
                                         allocate_copied_scanout_pool(
+                                            &self.services.modeset(),
                                             Arc::clone(&vk),
                                             sink_vk,
                                             Rc::clone(&device),
@@ -833,7 +841,13 @@ impl PlatformBackend {
 
         // Commit the modeset.  On failure, pool is freed (dropped below).
         if new_pool_committed_framebuffer.is_none()
-            && let Err(e) = crate::drm::modeset::commit_modeset(&device, &output, fb_for_commit)
+            && let Err(e) = crate::drm::modeset::commit_modeset_with_io(
+                &device,
+                &output,
+                fb_for_commit,
+                self.services.mode_blobs.as_ref(),
+                self.services.atomic.as_ref(),
+            )
         {
             log::error!(
                 "render enable_connector: commit_modeset for {connector} ({}×{}@{}) at ({x},{y}) failed: {e}",

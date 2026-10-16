@@ -635,16 +635,26 @@ impl CursorBuffer {
         let mapping = match io.map_dumb(&device, &mut dumb) {
             Ok(mapping) => mapping,
             Err(error) => {
-                let _ = io.destroy_dumb(&device, dumb);
-                return Err(error);
+                let handle = dumb.handle;
+                let cleanup = io.destroy_dumb(&device, dumb);
+                return Err(allocation_cleanup_error(
+                    error,
+                    format!("destroy cursor dumb buffer {handle:#x}"),
+                    cleanup,
+                ));
             }
         };
         let fb = match io.add_argb_framebuffer(&device, &dumb, width, height) {
             Ok(fb) => fb,
             Err(error) => {
                 io.unmap_dumb(&device, &dumb, mapping);
-                let _ = io.destroy_dumb(&device, dumb);
-                return Err(error);
+                let handle = dumb.handle;
+                let cleanup = io.destroy_dumb(&device, dumb);
+                return Err(allocation_cleanup_error(
+                    error,
+                    format!("destroy cursor dumb buffer {handle:#x}"),
+                    cleanup,
+                ));
             }
         };
         let len = mapping.len();
@@ -692,6 +702,20 @@ impl CursorBuffer {
     }
 }
 
+fn allocation_cleanup_error(
+    operation_error: io::Error,
+    cleanup_context: String,
+    cleanup_result: io::Result<()>,
+) -> io::Error {
+    match cleanup_result {
+        Ok(()) => operation_error,
+        Err(cleanup_error) => io::Error::new(
+            operation_error.kind(),
+            format!("{operation_error}; rollback {cleanup_context} failed: {cleanup_error}"),
+        ),
+    }
+}
+
 impl Drop for CursorBuffer {
     fn drop(&mut self) {
         if let Some(fb) = self.fb.take()
@@ -707,5 +731,72 @@ impl Drop for CursorBuffer {
         {
             log::warn!("cursor dumb-buffer destroy failed: {error}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct MapAndDestroyFailure;
+
+    impl CursorBufferIo for MapAndDestroyFailure {
+        fn create_dumb(
+            &self,
+            device: &Device,
+            _width: u32,
+            _height: u32,
+        ) -> io::Result<CursorDumbBuffer> {
+            Ok(CursorDumbBuffer::recording(device, 0x51, 256, 4096))
+        }
+
+        fn map_dumb(
+            &self,
+            _device: &Device,
+            _dumb: &mut CursorDumbBuffer,
+        ) -> io::Result<CursorMapping> {
+            Err(io::Error::other("map failed"))
+        }
+
+        fn add_argb_framebuffer(
+            &self,
+            _device: &Device,
+            _dumb: &CursorDumbBuffer,
+            _width: u32,
+            _height: u32,
+        ) -> io::Result<framebuffer::Handle> {
+            unreachable!("framebuffer creation follows a successful map")
+        }
+
+        fn remove_framebuffer(&self, _device: &Device, _fb: framebuffer::Handle) -> io::Result<()> {
+            unreachable!("allocation did not reach framebuffer creation")
+        }
+
+        fn unmap_dumb(&self, _device: &Device, _dumb: &CursorDumbBuffer, _mapping: CursorMapping) {
+            unreachable!("allocation did not create a mapping")
+        }
+
+        fn destroy_dumb(&self, _device: &Device, _dumb: CursorDumbBuffer) -> io::Result<()> {
+            Err(io::Error::other("destroy failed"))
+        }
+    }
+
+    #[test]
+    // Mutation: discard destroy_dumb's rollback error; cleanup context must remain observable.
+    fn cursor_allocation_preserves_map_and_destroy_errors() {
+        let device = Rc::new(Device::for_tests().expect("test device"));
+        let error = match CursorBuffer::allocate(device, Rc::new(MapAndDestroyFailure), 32, 32) {
+            Ok(_) => panic!("map failure must reject cursor allocation"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        let message = error.to_string();
+        assert!(message.contains("map failed"), "{message}");
+        assert!(
+            message.contains("destroy cursor dumb buffer 0x51"),
+            "{message}"
+        );
+        assert!(message.contains("destroy failed"), "{message}");
     }
 }

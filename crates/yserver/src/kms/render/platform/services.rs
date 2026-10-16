@@ -31,6 +31,23 @@ pub struct KmsServices {
     pub(crate) test_recorders: Option<Rc<KmsTestRecorders>>,
 }
 
+/// The subset needed by isolated scanout qualification workers. Worker code
+/// constructs this pair locally because `Rc`-backed backend services cannot
+/// cross the worker boundary.
+pub(crate) struct KmsModesetServices {
+    pub(crate) mode_blobs: Rc<dyn ModeBlobIo>,
+    pub(crate) atomic: Rc<dyn AtomicCommitExecutor>,
+}
+
+impl KmsModesetServices {
+    pub(crate) fn production() -> Self {
+        Self {
+            mode_blobs: Rc::new(DrmModeBlobIo),
+            atomic: Rc::new(DrmAtomicCommitExecutor),
+        }
+    }
+}
+
 pub(crate) struct KmsTestRecorders {
     pub(crate) atomic: Rc<crate::drm::atomic::tests_support::RecordingAtomicCommitExecutor>,
     pub(crate) mode_blobs: Rc<RecordingModeBlobIo>,
@@ -42,6 +59,13 @@ pub(crate) struct KmsTestRecorders {
 }
 
 impl KmsServices {
+    pub(crate) fn modeset(&self) -> KmsModesetServices {
+        KmsModesetServices {
+            mode_blobs: Rc::clone(&self.mode_blobs),
+            atomic: Rc::clone(&self.atomic),
+        }
+    }
+
     pub fn production() -> Self {
         Self {
             mode_blobs: Rc::new(DrmModeBlobIo),

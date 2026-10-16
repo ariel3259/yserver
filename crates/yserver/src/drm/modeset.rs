@@ -20,7 +20,7 @@ use crate::drm::{
         AtomicCommitEvent, AtomicCommitExecutor, AtomicCommitKind, AtomicCommitRequest,
         AtomicCommitSink, CursorPlanePosition,
     },
-    io::{DrmModeBlobIo, ModeBlobIo},
+    io::ModeBlobIo,
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1135,10 +1135,6 @@ impl PropMap {
     }
 }
 
-pub fn disable_output(device: &Device, output: &Output) -> io::Result<()> {
-    disable_output_with_executor(device, output, &crate::drm::atomic::DrmAtomicCommitExecutor)
-}
-
 pub(crate) fn disable_output_with_executor(
     device: &Device,
     output: &Output,
@@ -1170,20 +1166,6 @@ pub(crate) fn disable_output_with_executor(
         })
 }
 
-pub fn commit_modeset(
-    device: &Device,
-    output: &Output,
-    fb_id: framebuffer::Handle,
-) -> io::Result<()> {
-    commit_modeset_with_io(
-        device,
-        output,
-        fb_id,
-        &DrmModeBlobIo,
-        &crate::drm::atomic::DrmAtomicCommitExecutor,
-    )
-}
-
 pub(crate) fn commit_modeset_with_io(
     device: &Device,
     output: &Output,
@@ -1204,20 +1186,6 @@ pub(crate) fn commit_modeset_with_io(
 
 /// Validate a complete connector/CRTC/primary-plane modeset without changing
 /// the hardware state.
-pub(crate) fn test_modeset(
-    device: &Device,
-    output: &Output,
-    fb_id: framebuffer::Handle,
-) -> io::Result<()> {
-    test_modeset_with_io(
-        device,
-        output,
-        fb_id,
-        &DrmModeBlobIo,
-        &crate::drm::atomic::DrmAtomicCommitExecutor,
-    )
-}
-
 pub(crate) fn test_modeset_with_io(
     device: &Device,
     output: &Output,
@@ -1272,20 +1240,6 @@ impl std::error::Error for StrictTestModesetError {
 /// TEST_ONLY variant for disposable helpers. Unlike the live path, mode-blob
 /// cleanup is part of the authoritative result and overrides atomic success or
 /// rejection when it fails.
-pub(crate) fn test_modeset_strict(
-    device: &Device,
-    output: &Output,
-    fb_id: framebuffer::Handle,
-) -> Result<(), StrictTestModesetError> {
-    test_modeset_strict_with_io(
-        device,
-        output,
-        fb_id,
-        &DrmModeBlobIo,
-        &crate::drm::atomic::DrmAtomicCommitExecutor,
-    )
-}
-
 pub(crate) fn test_modeset_strict_with_io(
     device: &Device,
     output: &Output,

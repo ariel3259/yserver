@@ -487,6 +487,7 @@ impl PlatformBackend {
         let mut scanout_routes = Vec::with_capacity(initial_scanout_rollback.outputs().len());
         let mut scanout_alloc_errors: Vec<String> = Vec::new();
         let mut copy_vk_contexts: HashMap<RenderDeviceId, Arc<VkContext>> = HashMap::new();
+        let modeset_services = services.modeset();
         for (i, layout) in initial_scanout_rollback.outputs().iter().enumerate() {
             let w = u32::from(layout.width);
             let h = u32::from(layout.height);
@@ -506,6 +507,7 @@ impl PlatformBackend {
                 scanout_route,
             ) {
                 match allocate_copy_free_scanout_pool(
+                    &modeset_services,
                     Arc::clone(&vk),
                     Rc::clone(&device.device),
                     &layout.output,
@@ -556,6 +558,7 @@ impl PlatformBackend {
                             let destination_route =
                                 ScanoutRoute::new(sink_id, device.key, RenderKmsRelationship::Same);
                             allocate_copied_scanout_pool(
+                                &modeset_services,
                                 Arc::clone(&vk),
                                 sink_vk,
                                 Rc::clone(&device.device),
@@ -779,6 +782,8 @@ impl PlatformBackend {
                 .expect("test services have recording dependencies")
                 .page_flip_events,
         );
+        #[cfg(test)]
+        test_page_flip_event_source.register_device(&device);
         #[cfg(test)]
         let page_flip_event_source: Rc<dyn PageFlipEventSource> =
             test_page_flip_event_source.clone();

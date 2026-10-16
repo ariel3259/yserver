@@ -1,5 +1,35 @@
 use super::support::AtomicCursorFixture;
 
+fn clone_drm_output(output: &crate::platform::drm::Output) -> crate::platform::drm::Output {
+    crate::platform::drm::Output {
+        connector: output.connector,
+        connector_name: output.connector_name.clone(),
+        encoder: output.encoder,
+        crtc: output.crtc,
+        plane: output.plane,
+        mode: output.mode,
+        picked: output.picked.clone(),
+        plane_fb_id_prop: output.plane_fb_id_prop,
+        plane_crtc_id_prop: output.plane_crtc_id_prop,
+        plane_src_x_prop: output.plane_src_x_prop,
+        plane_src_y_prop: output.plane_src_y_prop,
+        plane_src_w_prop: output.plane_src_w_prop,
+        plane_src_h_prop: output.plane_src_h_prop,
+        plane_crtc_x_prop: output.plane_crtc_x_prop,
+        plane_crtc_y_prop: output.plane_crtc_y_prop,
+        plane_crtc_w_prop: output.plane_crtc_w_prop,
+        plane_crtc_h_prop: output.plane_crtc_h_prop,
+        plane_in_fence_fd_prop: output.plane_in_fence_fd_prop,
+        crtc_out_fence_ptr_prop: output.crtc_out_fence_ptr_prop,
+        scanout_modifiers: output.scanout_modifiers.clone(),
+        mm_width: output.mm_width,
+        mm_height: output.mm_height,
+        edid: output.edid.clone(),
+        connector_type: output.connector_type.clone(),
+        modes: output.modes.clone(),
+    }
+}
+
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: bypass the injected atomic executor; the accepted commit sequence must fail.
@@ -190,10 +220,24 @@ fn atomic_cursor_only_hotplug_source_arms_backend_debounce() {
     elapsed_ms.set(149);
     Backend::poll_deferred_input(&mut fixture.backend, &mut fixture.state);
     assert_eq!(Backend::next_wakeup(&fixture.backend), Some(deadline));
+
+    elapsed_ms.set(150);
+    Backend::poll_deferred_input(&mut fixture.backend, &mut fixture.state);
+    assert_eq!(
+        Backend::next_wakeup(&fixture.backend),
+        None,
+        "the due Backend rescan consumes the one debounce deadline",
+    );
+    Backend::poll_deferred_input(&mut fixture.backend, &mut fixture.state);
+    assert_eq!(
+        Backend::next_wakeup(&fixture.backend),
+        None,
+        "a second Backend poll cannot rediscover without a new hotplug edge",
+    );
     fixture.assert_cursor_quiescent();
     assert!(
         fixture.recorders.atomic.records().is_empty(),
-        "hotplug debounce alone must not submit atomic commits",
+        "an empty synthetic connector rescan must not submit atomic commits",
     );
 
     let ledger = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
@@ -202,12 +246,18 @@ fn atomic_cursor_only_hotplug_source_arms_backend_debounce() {
 }
 
 #[test]
-// The controller drops startup discovery/modeset from this fixture, so this checks recorder selection and
-// the empty blob ledger at the fixture boundary. MODE_ID=0 and missing-release mutations cannot run here.
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: select production mode-blob operations in KmsServices::for_tests; the service identity assertion must fail.
 fn atomic_cursor_only_mode_blob_lifetime_uses_shared_modeset() {
     use yserver_core::backend::Backend;
 
-    let mut fixture = AtomicCursorFixture::without_scene().expect("build backend fixture");
+    let Some(mut fixture) = AtomicCursorFixture::new().expect("build backend fixture") else {
+        return;
+    };
+    fixture
+        .backend
+        .initialize_provider_output_sources()
+        .expect("automatically attach the selected renderer to the synthetic KMS sink");
     let selected: std::rc::Rc<dyn crate::drm::io::ModeBlobIo> =
         std::rc::Rc::clone(&fixture.backend.platform.services.mode_blobs);
     let recording: std::rc::Rc<dyn crate::drm::io::ModeBlobIo> =
@@ -221,15 +271,47 @@ fn atomic_cursor_only_mode_blob_lifetime_uses_shared_modeset() {
         Some(0),
         "for_tests must select the recording mode-blob operations",
     );
-    assert_eq!(fixture.recorders.mode_blobs.live_count(), 0);
-    assert!(fixture.recorders.mode_blobs.records().is_empty());
 
-    Backend::set_cursor_hidden(&mut fixture.backend, true);
+    let output = clone_drm_output(&fixture.backend.platform.outputs[0].output);
+    let connector = output.connector_name.clone();
+    let mode = yserver_core::backend::ModeSpec {
+        width: output.picked.width,
+        height: output.picked.height,
+        vrefresh: output.picked.vrefresh,
+    };
+    let output_id = fixture
+        .backend
+        .randr_outputs_and_modes()
+        .0
+        .into_iter()
+        .find(|candidate| candidate.name == connector)
+        .expect("synthetic RANDR output")
+        .output_id;
+    fixture
+        .backend
+        .platform
+        .for_tests_accept_output_power_commits();
+    fixture.backend.pstate.crtc_config_discovery_override = Some(output);
+
+    let attempt = Backend::apply_crtc_config(
+        &mut fixture.backend,
+        output_id,
+        &connector,
+        Some(mode),
+        13,
+        0,
+    );
+    let error = attempt.expect_err("synthetic /dev/null KMS must reject DRM property lookup");
+    assert_eq!(
+        error.raw_os_error(),
+        Some(libc::ENOTTY),
+        "RANDR reaches the shared modeset entry, whose direct property lookup is the deepest operation available on the fixture fd",
+    );
     assert_eq!(fixture.recorders.mode_blobs.live_count(), 0);
     assert!(fixture.recorders.mode_blobs.records().is_empty());
     assert!(
         fixture.recorders.atomic.records().is_empty(),
-        "the fixture boundary must not submit a startup or shared modeset",
+        "the fake KMS fd must stop at property lookup before atomic submission",
     );
     fixture.assert_cursor_quiescent();
 
@@ -238,4 +320,66 @@ fn atomic_cursor_only_mode_blob_lifetime_uses_shared_modeset() {
     drop(fixture);
     assert_eq!(blobs.live_count(), 0);
     assert_eq!(cursor_resources.end_state(), (0, 0, 0));
+}
+
+#[test]
+// Mutation: drain the shared recording queue without matching the DRM device; the colliding CRTC event must remain queued.
+fn atomic_cursor_only_flip_events_are_scoped_to_the_ready_device() {
+    use std::os::fd::{AsFd as _, AsRawFd as _};
+    use yserver_core::backend::Backend;
+
+    let mut fixture = AtomicCursorFixture::without_scene().expect("build backend fixture");
+    let primary = std::rc::Rc::clone(&fixture.backend.platform.devices[0].device);
+    let second = std::rc::Rc::new(
+        crate::drm::Device::for_tests().expect("open second synthetic DRM device"),
+    );
+    let second_key = crate::platform::drm::DrmDeviceKey { major: 0, minor: 1 };
+    let source = std::rc::Rc::clone(&fixture.recorders.page_flip_events);
+    source.register_device(&second);
+    fixture
+        .backend
+        .platform
+        .devices
+        .push(crate::kms::render::platform::KmsDevice {
+            key: second_key,
+            device: std::rc::Rc::clone(&second),
+            async_page_flip: false,
+            atomic_commit_sink: std::rc::Rc::new(crate::drm::atomic::AtomicCommitSink::new(
+                std::rc::Rc::clone(&fixture.backend.platform.services.atomic),
+            )),
+            page_flip_event_source: source.clone(),
+            cursor_buffer_io: std::rc::Rc::clone(&fixture.backend.platform.services.cursor_buffers),
+            legacy_cursor_io: std::rc::Rc::clone(&fixture.backend.platform.services.legacy_cursor),
+            test_page_flip_event_source: Some(source.clone()),
+            cursor: crate::kms::render::platform::KmsCursorState::new(),
+        });
+
+    let colliding_crtc = ::drm::control::from_u32(1).expect("synthetic CRTC handle");
+    source.queue_flip_for_device(&primary, colliding_crtc, 7);
+    source.queue_flip_for_device(&second, colliding_crtc, 8);
+    let primary_fd = primary.as_fd().as_raw_fd();
+    Backend::on_page_flip_ready(&mut fixture.backend, &mut fixture.state, primary_fd);
+
+    assert_eq!(source.queued_flip_count_for_device(&primary), 0);
+    assert_eq!(
+        source.queued_flip_count_for_device(&second),
+        1,
+        "draining one DRM fd cannot consume the other card's colliding CRTC event",
+    );
+    Backend::on_page_flip_ready(
+        &mut fixture.backend,
+        &mut fixture.state,
+        second.as_fd().as_raw_fd(),
+    );
+    assert_eq!(source.queued_flip_count(), 0);
+    assert!(fixture.recorders.atomic.records().is_empty());
+    assert!(!fixture.backend.scene.has_pending_page_flips());
+    assert!(fixture.backend.pstate.scanout_m2.pending.is_none());
+    assert!(fixture.backend.pstate.scanout_m2.current.is_none());
+    assert!(fixture.backend.pstate.scanout_m2.queued_successor.is_none());
+    fixture.assert_cursor_quiescent();
+
+    let resources = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
+    drop(fixture);
+    assert_eq!(resources.end_state(), (0, 0, 0));
 }

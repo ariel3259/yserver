@@ -6,6 +6,7 @@ pub(in crate::kms::render) trait OutputPowerExecutor {
         &self,
         device: &drm::Device,
         output: &crate::platform::drm::Output,
+        services: &super::services::KmsServices,
     ) -> io::Result<()>;
 
     fn enable(
@@ -13,6 +14,7 @@ pub(in crate::kms::render) trait OutputPowerExecutor {
         device: &drm::Device,
         output: &crate::platform::drm::Output,
         framebuffer: ::drm::control::framebuffer::Handle,
+        services: &super::services::KmsServices,
     ) -> io::Result<()>;
 }
 
@@ -23,8 +25,9 @@ impl OutputPowerExecutor for DrmOutputPowerExecutor {
         &self,
         device: &drm::Device,
         output: &crate::platform::drm::Output,
+        services: &super::services::KmsServices,
     ) -> io::Result<()> {
-        drm::modeset::disable_output(device, output)
+        drm::modeset::disable_output_with_executor(device, output, services.atomic.as_ref())
     }
 
     fn enable(
@@ -32,8 +35,15 @@ impl OutputPowerExecutor for DrmOutputPowerExecutor {
         device: &drm::Device,
         output: &crate::platform::drm::Output,
         framebuffer: ::drm::control::framebuffer::Handle,
+        services: &super::services::KmsServices,
     ) -> io::Result<()> {
-        drm::modeset::commit_modeset(device, output, framebuffer)
+        drm::modeset::commit_modeset_with_io(
+            device,
+            output,
+            framebuffer,
+            services.mode_blobs.as_ref(),
+            services.atomic.as_ref(),
+        )
     }
 }
 
@@ -46,6 +56,7 @@ impl OutputPowerExecutor for AcceptingOutputPowerExecutor {
         &self,
         _device: &drm::Device,
         _output: &crate::platform::drm::Output,
+        _services: &super::services::KmsServices,
     ) -> io::Result<()> {
         Ok(())
     }
@@ -55,6 +66,7 @@ impl OutputPowerExecutor for AcceptingOutputPowerExecutor {
         _device: &drm::Device,
         _output: &crate::platform::drm::Output,
         _framebuffer: ::drm::control::framebuffer::Handle,
+        _services: &super::services::KmsServices,
     ) -> io::Result<()> {
         Ok(())
     }
@@ -135,7 +147,10 @@ impl PlatformBackend {
                 );
                 continue;
             };
-            if let Err(e) = drm::modeset::disable_output(&device, &layout.output) {
+            if let Err(e) =
+                self.output_power_executor
+                    .disable(&device, &layout.output, &self.services)
+            {
                 log::warn!(
                     "render disable_output: failed for {} (output {i}): {e}",
                     layout.output.connector_name,
@@ -223,10 +238,12 @@ impl PlatformBackend {
                     }
                     continue;
                 };
-                if let Err(e) = self
-                    .output_power_executor
-                    .enable(&device, &layout.output, fb_id)
-                {
+                if let Err(e) = self.output_power_executor.enable(
+                    &device,
+                    &layout.output,
+                    fb_id,
+                    &self.services,
+                ) {
                     log::error!(
                         "dpms_set_outputs_active(true): commit_modeset for {} failed: {e}",
                         layout.output.connector_name,
@@ -270,7 +287,10 @@ impl PlatformBackend {
                     }
                     continue;
                 };
-                if let Err(e) = self.output_power_executor.disable(&device, &layout.output) {
+                if let Err(e) =
+                    self.output_power_executor
+                        .disable(&device, &layout.output, &self.services)
+                {
                     log::error!(
                         "dpms_set_outputs_active(false): disable_output for {} failed: {e}",
                         layout.output.connector_name,

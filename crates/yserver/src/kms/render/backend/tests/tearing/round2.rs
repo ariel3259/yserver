@@ -2535,8 +2535,10 @@ fn tearing_on_delayed_acquire_stream_survives_core_supersession() {
             .test_page_flip_event_source
             .as_ref()
             .expect("recording page-flip source");
+        let device = &backend.platform.devices[0].device;
+        source.register_device(device);
         for output in &backend.platform.outputs {
-            source.queue_flip(output.output.crtc, frame);
+            source.queue_flip_for_device(device, output.output.crtc, frame);
         }
         let drm_fd = backend.platform.devices[0].device.as_fd().as_raw_fd();
         Backend::on_page_flip_ready(backend, state, drm_fd);
@@ -2742,11 +2744,19 @@ fn composed_async_turnaround_uses_its_own_commit_flip_timestamp() {
 
     let event_at = accepted_at.get() + Duration::from_micros(150);
     let crtc = backend.platform.outputs[0].output.crtc;
-    backend.platform.devices[0]
+    let event_source = backend.platform.devices[0]
         .test_page_flip_event_source
         .as_ref()
-        .expect("recording page-flip event source")
-        .queue_flip_with_timestamps(crtc, 91, Duration::from_micros(1_321_315), event_at);
+        .expect("recording page-flip event source");
+    let device = &backend.platform.devices[0].device;
+    event_source.register_device(device);
+    event_source.queue_flip_with_timestamps_for_device(
+        device,
+        crtc,
+        91,
+        Duration::from_micros(1_321_315),
+        event_at,
+    );
     let drm_fd = backend.platform.devices[0].device.as_fd().as_raw_fd();
     Backend::on_page_flip_ready(&mut backend, &mut state, drm_fd);
 
@@ -2827,17 +2837,20 @@ fn deliver_clock_test_flip(
     use std::os::fd::{AsFd as _, AsRawFd as _};
     use yserver_core::backend::Backend;
 
-    backend.platform.devices[0]
+    let event_source = backend.platform.devices[0]
         .test_page_flip_event_source
         .as_ref()
-        .expect("recording page-flip event source")
-        .queue_flip_with_clock_samples(
-            crtc,
-            frame,
-            kernel_ust,
-            Some(received_at_monotonic),
-            Some(received_at_boottime),
-        );
+        .expect("recording page-flip event source");
+    let device = &backend.platform.devices[0].device;
+    event_source.register_device(device);
+    event_source.queue_flip_with_clock_samples_for_device(
+        device,
+        crtc,
+        frame,
+        kernel_ust,
+        Some(received_at_monotonic),
+        Some(received_at_boottime),
+    );
     let drm_fd = backend.platform.devices[0].device.as_fd().as_raw_fd();
     Backend::on_page_flip_ready(backend, state, drm_fd);
 }
@@ -3086,7 +3099,9 @@ fn discarded_vt_flip_events_do_not_shift_the_next_async_turnaround_match() {
             .as_ref()
             .expect("recording page-flip source"),
     );
-    event_source.queue_flip_at(crtc, 92, Duration::from_millis(100));
+    let device = &backend.platform.devices[0].device;
+    event_source.register_device(device);
+    event_source.queue_flip_at_for_device(device, crtc, 92, Duration::from_millis(100));
     Backend::finish_vt_release(&mut backend, &mut state, &InputInventory::default());
     assert_tearing_off(&backend);
     assert_eq!(
@@ -3120,7 +3135,9 @@ fn discarded_vt_flip_events_do_not_shift_the_next_async_turnaround_match() {
     assert!(backend.scene.has_pending_page_flips());
 
     let event_at = accepted_at.get() + Duration::from_micros(175);
-    event_source.queue_flip_at(crtc, 94, event_at);
+    let device = &backend.platform.devices[0].device;
+    event_source.register_device(device);
+    event_source.queue_flip_at_for_device(device, crtc, 94, event_at);
     let drm_fd = backend.platform.devices[0].device.as_fd().as_raw_fd();
     Backend::on_page_flip_ready(&mut backend, &mut state, drm_fd);
 

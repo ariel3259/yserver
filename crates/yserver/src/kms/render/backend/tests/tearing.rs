@@ -314,8 +314,14 @@ fn retire_recorded_direct_flip(
         .test_page_flip_event_source
         .as_ref()
         .expect("recording page-flip source");
+    let device = &backend.platform.devices[0].device;
+    source.register_device(device);
     for (index, output) in backend.platform.outputs.iter().enumerate() {
-        source.queue_flip(output.output.crtc, frame + u32::try_from(index).unwrap());
+        source.queue_flip_for_device(
+            device,
+            output.output.crtc,
+            frame + u32::try_from(index).unwrap(),
+        );
     }
     let drm_fd = backend.platform.devices[0].device.as_fd().as_raw_fd();
     Backend::on_page_flip_ready(backend, state, drm_fd);
@@ -3278,12 +3284,14 @@ fn retire_composed_frame(
     use yserver_core::backend::Backend;
 
     backend.platform.wait_idle_bounded();
+    let source = backend.platform.devices[0]
+        .test_page_flip_event_source
+        .as_ref()
+        .expect("recording page-flip source");
+    let device = &backend.platform.devices[0].device;
+    source.register_device(device);
     for output in &backend.platform.outputs {
-        backend.platform.devices[0]
-            .test_page_flip_event_source
-            .as_ref()
-            .expect("recording page-flip source")
-            .queue_flip(output.output.crtc, frame);
+        source.queue_flip_for_device(device, output.output.crtc, frame);
     }
     let drm_fd = backend.platform.devices[0].device.as_fd().as_raw_fd();
     Backend::on_page_flip_ready(backend, state, drm_fd);

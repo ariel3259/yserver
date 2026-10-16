@@ -1311,6 +1311,7 @@ fn grouped_direct_waits_all_outputs_and_uses_selected_reference_sample() {
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: restore success-without-request submission; the qualified framebuffer assertion must fail.
+// Mutation: retain the current direct frame after the composed Backend unflip; final ownership assertions must fail.
 fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
     use std::os::fd::{AsFd as _, AsRawFd as _};
     use yserver_core::backend::Backend;
@@ -1417,14 +1418,17 @@ fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
     assert!(b.pstate.scanout_m2.completed.is_empty());
 
     for (index, output) in b.platform.outputs.iter().enumerate() {
-        b.platform.devices[0]
+        let device = &b.platform.devices[0].device;
+        let source = b.platform.devices[0]
             .test_page_flip_event_source
             .as_ref()
-            .expect("recording flip source")
-            .queue_flip(
-                output.output.crtc,
-                1 + u32::try_from(index).expect("output index fits"),
-            );
+            .expect("recording flip source");
+        source.register_device(device);
+        source.queue_flip_for_device(
+            device,
+            output.output.crtc,
+            1 + u32::try_from(index).expect("output index fits"),
+        );
     }
     let drm_fd = b.platform.devices[0].device.as_fd().as_raw_fd();
     Backend::on_page_flip_ready(&mut b, &mut state, drm_fd);
@@ -1461,14 +1465,17 @@ fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
     assert!(b.pstate.scanout_m2.hold_direct);
 
     for (index, output) in b.platform.outputs.iter().enumerate() {
-        b.platform.devices[0]
+        let device = &b.platform.devices[0].device;
+        let source = b.platform.devices[0]
             .test_page_flip_event_source
             .as_ref()
-            .expect("recording flip source")
-            .queue_flip(
-                output.output.crtc,
-                3 + u32::try_from(index).expect("output index fits"),
-            );
+            .expect("recording flip source");
+        source.register_device(device);
+        source.queue_flip_for_device(
+            device,
+            output.output.crtc,
+            3 + u32::try_from(index).expect("output index fits"),
+        );
     }
     Backend::on_page_flip_ready(&mut b, &mut state, drm_fd);
     assert_eq!(
@@ -1486,6 +1493,106 @@ fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
     );
     assert!(b.pstate.scanout_m2.pending.is_none());
     assert!(b.pstate.scanout_m2.queued_successor.is_none());
+
+    b.platform.scanout_pools.resize_with(2, || None);
+    b.platform.bo_generations.resize_with(2, Vec::new);
+    let vk = std::sync::Arc::clone(
+        b.platform
+            .gpu
+            .vk
+            .as_ref()
+            .expect("test fixture Vulkan context"),
+    );
+    let kms_device = std::rc::Rc::clone(&b.platform.devices[0].device);
+    for (output_idx, fb) in [(0, 0x8901), (1, 0x8902)] {
+        let layout = &b.platform.outputs[output_idx];
+        let pool = crate::kms::vk::scanout::ScanoutBoPool::for_tests_on_screen_framebuffer(
+            std::sync::Arc::clone(&vk),
+            std::rc::Rc::clone(&kms_device),
+            layout.scanout_route,
+            u32::from(layout.width),
+            u32::from(layout.height),
+            atomic_cursor_raw(fb),
+        );
+        b.platform.scanout_pools[output_idx] =
+            Some(crate::kms::vk::scanout::OutputScanout::Shared(pool));
+    }
+    Backend::warp_pointer_root(&mut b, &mut state, 1160, 260);
+    Backend::maybe_composite(&mut b).expect("move cursor while direct frame is held");
+    assert_eq!(recorder.records().len(), 4);
+    draw_atomic_cursor_test_root_overlay(&mut b, 2);
+    b.pstate.scanout_m2.unflip_shadow_ready = true;
+    Backend::warp_pointer_root(&mut b, &mut state, 1320, 330);
+    let unflip_positions = b
+        .platform
+        .cursor_plane_atomic_positions_for_outputs(&[0, 1]);
+    Backend::maybe_composite(&mut b).expect("wait for cursor-only retirements before unflip");
+    retire_atomic_cursor_test_output(&mut b, &mut state, 0, 4);
+    Backend::maybe_composite(&mut b).expect("keep unflip behind the second CRTC");
+    retire_atomic_cursor_test_output(&mut b, &mut state, 1, 4);
+    Backend::maybe_composite(&mut b).expect("submit composed direct teardown");
+    let records = recorder.records();
+    assert_eq!(records.len(), 5);
+    assert_eq!(
+        records.iter().map(|record| record.kind).collect::<Vec<_>>(),
+        vec![
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            crate::drm::atomic::AtomicCommitKind::CursorOnly,
+            crate::drm::atomic::AtomicCommitKind::CursorOnly,
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+        ],
+        "Backend replaces held direct ownership with one composed scene commit",
+    );
+    assert_atomic_cursor_properties(&records[4], &unflip_positions);
+    retire_atomic_cursor_test_output(&mut b, &mut state, 0, 5);
+    retire_atomic_cursor_test_output(&mut b, &mut state, 1, 5);
+
+    let completed = Backend::drain_completed_present_events(&mut b);
+    assert_eq!(
+        completed
+            .iter()
+            .map(|event| (event.present_id, event.completion_mode))
+            .collect::<Vec<_>>(),
+        vec![
+            (77, yserver_protocol::x11::present::COMPLETE_MODE_FLIP),
+            (78, yserver_protocol::x11::present::COMPLETE_MODE_SKIP),
+            (79, yserver_protocol::x11::present::COMPLETE_MODE_FLIP),
+        ],
+    );
+    let idled = Backend::drain_retired_present_idle_events(&mut b);
+    assert_eq!(
+        idled
+            .iter()
+            .map(|event| event.present_id)
+            .collect::<Vec<_>>(),
+        vec![78, 77, 79],
+        "every direct buffer idle obligation is delivered once after replacement",
+    );
+    Backend::client_disconnected(&mut b, yserver_protocol::x11::ClientId(2));
+    assert!(!b.scene.has_pending_page_flips());
+    assert!(!b.pstate.scanout_m2.active());
+    assert!(b.pstate.scanout_m2.current.is_none());
+    assert!(b.pstate.scanout_m2.pending.is_none());
+    assert!(b.pstate.scanout_m2.queued_successor.is_none());
+    assert!(b.pstate.scanout_m2.deferred_successor_skips.is_empty());
+    assert!(b.pstate.scanout_m2.unflip_awaiting_outputs.is_empty());
+    assert!(b.pstate.scanout_m2.completed.is_empty());
+    assert!(b.pstate.scanout_m2.idled.is_empty());
+    assert!(b.present_source_pins.is_empty());
+    assert_eq!(
+        b.platform.devices[0]
+            .test_page_flip_event_source
+            .as_ref()
+            .expect("recording flip source")
+            .queued_flip_count(),
+        0,
+    );
+    assert_atomic_cursor_quiescent(&b);
+    assert!(
+        b.pstate.scanout_m2.current.is_none(),
+        "Backend must replace and release the held direct frame before the test ends",
+    );
 }
 
 #[test]
@@ -2994,7 +3101,9 @@ fn randr_change_discards_an_inflight_cursor_flip_before_the_next_scene_flip() {
             .as_ref()
             .expect("recording page-flip event source"),
     );
-    event_source.queue_flip(position.crtc, 51);
+    let device = std::rc::Rc::clone(&backend.platform.devices[0].device);
+    event_source.register_device(&device);
+    event_source.queue_flip_for_device(&device, position.crtc, 51);
     event_source.delay_next_ready_checks(1);
 
     let connector = backend.platform.outputs[1].key.connector_name.clone();
@@ -3046,7 +3155,8 @@ fn randr_change_discards_an_inflight_cursor_flip_before_the_next_scene_flip() {
     );
     assert_eq!(event_source.queued_flip_count(), 0);
 
-    event_source.queue_flip(position.crtc, 52);
+    event_source.register_device(&device);
+    event_source.queue_flip_for_device(&device, position.crtc, 52);
     let drm_fd = backend.platform.devices[0].device.as_fd().as_raw_fd();
     let mut state = yserver_core::server::ServerState::new();
     Backend::on_page_flip_ready(&mut backend, &mut state, drm_fd);
@@ -3334,11 +3444,13 @@ fn retire_atomic_cursor_test_output(
     use yserver_core::backend::Backend;
 
     let output = &backend.platform.outputs[output_idx].output;
-    backend.platform.devices[0]
+    let device = &backend.platform.devices[0].device;
+    let source = backend.platform.devices[0]
         .test_page_flip_event_source
         .as_ref()
-        .expect("recording test page-flip source")
-        .queue_flip(output.crtc, frame);
+        .expect("recording test page-flip source");
+    source.register_device(device);
+    source.queue_flip_for_device(device, output.crtc, frame);
     let drm_fd = backend.platform.devices[0].device.as_fd().as_raw_fd();
     Backend::on_page_flip_ready(backend, state, drm_fd);
 }

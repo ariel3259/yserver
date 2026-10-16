@@ -329,11 +329,13 @@ fn retire_test_flip(
 
     let output = &backend.platform.outputs[0].output;
     let crtc = output.crtc;
-    backend.platform.devices[0]
+    let device = &backend.platform.devices[0].device;
+    let source = backend.platform.devices[0]
         .test_page_flip_event_source
         .as_ref()
-        .expect("test event source")
-        .queue_flip(crtc, frame);
+        .expect("test event source");
+    source.register_device(device);
+    source.queue_flip_for_device(device, crtc, frame);
     let drm_fd = backend.platform.devices[0].device.as_fd().as_raw_fd();
     Backend::on_page_flip_ready(backend, state, drm_fd);
 }

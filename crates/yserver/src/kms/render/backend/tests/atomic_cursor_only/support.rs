@@ -103,14 +103,48 @@ impl AtomicCursorFixture {
         use yserver_core::backend::Backend;
 
         let output = &self.backend.platform.outputs[output_idx].output;
+        let device = &self.backend.platform.devices[0].device;
+        self.recorders.page_flip_events.register_device(device);
         self.recorders
             .page_flip_events
-            .queue_flip(output.crtc, frame);
+            .queue_flip_for_device(device, output.crtc, frame);
         let drm_fd = self.backend.platform.devices[0].device.as_fd().as_raw_fd();
         Backend::on_page_flip_ready(&mut self.backend, &mut self.state, drm_fd);
     }
 
     pub(crate) fn assert_cursor_quiescent(&self) {
+        assert!(
+            !self.backend.scene.has_pending_page_flips(),
+            "scene page-flip obligations remain",
+        );
+        assert!(self.backend.pstate.scanout_m2.pending.is_none());
+        assert!(self.backend.pstate.scanout_m2.current.is_none());
+        assert!(self.backend.pstate.scanout_m2.queued_successor.is_none());
+        assert!(
+            self.backend
+                .pstate
+                .scanout_m2
+                .deferred_successor_skips
+                .is_empty()
+        );
+        assert!(
+            self.backend
+                .pstate
+                .scanout_m2
+                .unflip_awaiting_outputs
+                .is_empty()
+        );
+        assert!(self.backend.pstate.scanout_m2.completed.is_empty());
+        assert!(self.backend.pstate.scanout_m2.idled.is_empty());
+        assert!(
+            self.backend.platform.async_ledger.for_tests_is_empty(),
+            "async flip ledger retains an output obligation",
+        );
+        assert_eq!(
+            self.recorders.page_flip_events.queued_flip_count(),
+            0,
+            "recording page-flip events remain undrained",
+        );
         for output in &self.backend.platform.outputs {
             assert!(
                 !self
