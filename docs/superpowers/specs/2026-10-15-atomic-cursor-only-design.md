@@ -1,6 +1,6 @@
 # Atomic-only hardware cursor — design
 
-Status: draft for review (2026-10-15). Branch `feat/atomic-cursor-only`, base joske/master `8b8b1364`.
+Status: approved (2026-10-15). Branch `feat/atomic-cursor-only`, rebased on joske/master `9524c80d` (includes C1, #249).
 
 ## Goal
 
@@ -103,8 +103,10 @@ Gamma/LUT, overlay planes, tearing (C1 keeps its own cursor policy), cursor scal
 
 ### 2.5 Tearing (C1)
 
-While tearing is On the intent is detached, and async commits carry no cursor properties, as C1 specifies. Whichever
-of C1 and this work merges second adapts to the other in its rebase.
+While tearing is On the intent is detached, and async commits carry no cursor properties, as C1 specifies. C1
+merged first (#249); this work adapts to it. C1's tearing spec (`2026-10-14-tearing-on-demand-design.md`) says the
+cursor plane is hidden at the unflip retirement. Under this design that detach is owned by the frame that starts
+painting the software cursor (§2.2), and this spec supersedes that wording.
 
 ## 3. Errors
 
