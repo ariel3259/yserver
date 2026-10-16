@@ -371,6 +371,7 @@ impl CursorPlaneSink for PlatformBackend {
         self.cursor_plane_show_on_crtc(output_idx, hot_x, hot_y, x, y)
             .map_err(|error| CursorShowFailure {
                 remains_visible: error.remains_visible(),
+                deferred: error.is_deferred(),
                 error: Box::new(error),
             })
     }

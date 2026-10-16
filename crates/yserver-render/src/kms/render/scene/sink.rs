@@ -185,6 +185,9 @@ pub trait OutputSink {
 #[derive(Debug)]
 pub struct CursorShowFailure {
     pub remains_visible: bool,
+    /// The requested show has not been rejected; it remains queued for a
+    /// later scene/backend pass (for example while a CRTC flip is in flight).
+    pub deferred: bool,
     pub error: Box<dyn std::error::Error + Send + Sync>,
 }
 

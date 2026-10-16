@@ -143,6 +143,10 @@ impl CursorHideExecutor for DrmCursorHideExecutor {
 #[derive(Debug)]
 pub enum CursorShowError {
     Unbound(io::Error),
+    Deferred {
+        operation_error: io::Error,
+        remains_visible: bool,
+    },
     StillVisible {
         operation_error: io::Error,
         rollback_error: Option<io::Error>,
@@ -152,13 +156,27 @@ pub enum CursorShowError {
 impl CursorShowError {
     #[must_use]
     pub fn remains_visible(&self) -> bool {
-        matches!(self, Self::StillVisible { .. })
+        match self {
+            Self::Unbound(_) => false,
+            Self::Deferred {
+                remains_visible, ..
+            } => *remains_visible,
+            Self::StillVisible { .. } => true,
+        }
+    }
+
+    #[must_use]
+    pub fn is_deferred(&self) -> bool {
+        matches!(self, Self::Deferred { .. })
     }
 
     #[must_use]
     pub fn operation_error(&self) -> &io::Error {
         match self {
             Self::Unbound(error) => error,
+            Self::Deferred {
+                operation_error, ..
+            } => operation_error,
             Self::StillVisible {
                 operation_error, ..
             } => operation_error,
@@ -168,7 +186,7 @@ impl CursorShowError {
     #[must_use]
     pub fn rollback_error(&self) -> Option<&io::Error> {
         match self {
-            Self::Unbound(_) => None,
+            Self::Unbound(_) | Self::Deferred { .. } => None,
             Self::StillVisible { rollback_error, .. } => rollback_error.as_ref(),
         }
     }
@@ -192,6 +210,13 @@ impl std::fmt::Display for CursorShowError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unbound(error) => write!(f, "cursor remains unbound: {error}"),
+            Self::Deferred {
+                operation_error,
+                remains_visible,
+            } => write!(
+                f,
+                "cursor operation deferred ({operation_error}); prior binding visible={remains_visible}"
+            ),
             Self::StillVisible {
                 operation_error,
                 rollback_error,
@@ -1029,10 +1054,6 @@ impl CursorPlane {
         self.sprite_pool.release_user(lease)
     }
 
-    pub(crate) fn cancel_sprite_candidate(&mut self, lease: SpriteBufferLease) -> bool {
-        self.sprite_pool.cancel_candidate(lease)
-    }
-
     #[cfg(test)]
     pub(crate) fn sprite_user_count(&self, lease: SpriteBufferLease) -> Option<usize> {
         self.sprite_pool.user_count(lease)
@@ -1057,11 +1078,6 @@ impl CursorPlane {
             self.sprite_pool.wanted_version(),
             self.sprite_pool.candidate_version(),
         )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_tests_reset_unbound_sprite_pool(&mut self) {
-        self.sprite_pool = SpritePool::new(self.width, self.height);
     }
 
     /// Invalidate the tracked uploaded version. The next

@@ -29,6 +29,22 @@ impl AtomicCursorFixture {
         Self::from_live_backend(backend, Some(64), Some(64))
     }
 
+    pub(crate) fn new_with_overlapping_outputs() -> Result<Option<Self>, String> {
+        let mut backend = KmsBackend::for_tests_with_vk_dimensions(800, 600)
+            .map_err(|error| error.to_string())?;
+        super::super::push_test_output(&mut backend, 2);
+        backend.platform.outputs[1].x = 0;
+        Self::from_live_backend(backend, Some(64), Some(64))
+    }
+
+    pub(crate) fn new_with_gap_outputs() -> Result<Option<Self>, String> {
+        let mut backend = KmsBackend::for_tests_with_vk_dimensions(1700, 600)
+            .map_err(|error| error.to_string())?;
+        super::super::push_test_output(&mut backend, 2);
+        backend.platform.outputs[1].x = 900;
+        Self::from_live_backend(backend, Some(64), Some(64))
+    }
+
     fn from_live_backend(
         mut backend: KmsBackend,
         cursor_width: Option<u64>,

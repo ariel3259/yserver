@@ -33,7 +33,10 @@ pub(crate) fn prepare_cursor_commit(
                 || old.is_none_or(|previous| {
                     previous.lease != binding.lease || previous.framebuffer != binding.framebuffer
                 });
-            let geometry = attach || new_framebuffer;
+            // Sprite buffers are allocated at the driver's fixed cursor
+            // capacity, so replacing an image does not change its geometry.
+            // Only attachment or invalidation needs a full geometry restore.
+            let geometry = attach;
             if attach || new_framebuffer {
                 add(properties.fb_id, u64::from(binding.framebuffer));
             }
@@ -54,16 +57,12 @@ pub(crate) fn prepare_cursor_commit(
                 add(properties.crtc_w, u64::from(width));
                 add(properties.crtc_h, u64::from(height));
             }
-            if (!valid
-                || new_framebuffer
-                || old.is_none_or(|previous| previous.hot_x != binding.hot_x))
+            if (!valid || old.is_none_or(|previous| previous.hot_x != binding.hot_x))
                 && let Some(property) = properties.hotspot_x
             {
                 add(property, u64::from(binding.hot_x));
             }
-            if (!valid
-                || new_framebuffer
-                || old.is_none_or(|previous| previous.hot_y != binding.hot_y))
+            if (!valid || old.is_none_or(|previous| previous.hot_y != binding.hot_y))
                 && let Some(property) = properties.hotspot_y
             {
                 add(property, u64::from(binding.hot_y));

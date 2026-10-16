@@ -720,14 +720,9 @@ impl PlatformBackend {
                 .cursor
                 .atomic_pending_moves
                 .remove(&crtc);
-            if let Some(binding) = prepared.next
-                && prepared
-                    .prior
-                    .is_none_or(|prior| prior.lease != binding.lease)
-                && let Some(plane) = self.devices[device_idx].cursor.plane.as_mut()
-            {
-                plane.cancel_sprite_candidate(binding.lease);
-            }
+            // The upload cache and SpritePool candidate describe the same
+            // staged image. Keep that candidate after rejection so the scene
+            // retry can reuse it without a second upload or allocation.
             if prepared.prior.is_some() && prepared.next.is_none() {
                 self.scene_cursor_hide_failed = true;
             }
@@ -927,7 +922,15 @@ impl PlatformBackend {
                     binding.y = position.y;
                 }
                 if let Some(state) = device.cursor.crtc_states.get_mut(&position.crtc)
-                    && matches!(state.intent, Some(CursorIntent::Show(binding)) if binding.x == position.x && binding.y == position.y)
+                    && let Some(applied) = state.applied
+                    && matches!(
+                        state.intent,
+                        Some(CursorIntent::Show(binding))
+                            if binding.lease == applied.lease
+                                && binding.framebuffer == applied.framebuffer
+                                && binding.x == position.x
+                                && binding.y == position.y
+                    )
                 {
                     state.intent = None;
                 }
@@ -1027,6 +1030,42 @@ impl PlatformBackend {
                     .atomic_cursor_commits_in_flight
                     .contains_key(&crtc)
             })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_cursor_show_intent(
+        &self,
+        output_idx: usize,
+    ) -> Option<(
+        crate::kms::cursor_plane::sprites::SpriteBufferLease,
+        u32,
+        i32,
+        i32,
+    )> {
+        let (device_idx, crtc, _, _) = self.cursor_output_route(output_idx).ok()?;
+        match self.devices[device_idx]
+            .cursor
+            .crtc_states
+            .get(&crtc)?
+            .intent?
+        {
+            CursorIntent::Show(binding) => {
+                Some((binding.lease, binding.framebuffer, binding.x, binding.y))
+            }
+            CursorIntent::Hide => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_cursor_hide_intent_pending(&self, output_idx: usize) -> bool {
+        let Ok((device_idx, crtc, _, _)) = self.cursor_output_route(output_idx) else {
+            return false;
+        };
+        self.devices[device_idx]
+            .cursor
+            .crtc_states
+            .get(&crtc)
+            .is_some_and(|state| matches!(state.intent, Some(CursorIntent::Hide)))
     }
 
     #[cfg(test)]
@@ -1258,8 +1297,11 @@ impl PlatformBackend {
             .map_err(crate::kms::cursor_plane::CursorShowError::Unbound)?;
         let (cx, cy) = cursor_root_to_crtc_local(x, y, layout_x, layout_y, hot_x, hot_y);
         if !self.devices[device_idx].cursor.available_on(crtc) {
-            return Err(crate::kms::cursor_plane::CursorShowError::Unbound(
+            return Err(self.cursor_show_failure(
+                device_idx,
+                crtc,
                 io::Error::other("cursor plane unavailable for output"),
+                false,
             ));
         }
         let candidate = self.devices[device_idx]
@@ -1268,10 +1310,15 @@ impl PlatformBackend {
             .as_ref()
             .and_then(|plane| plane.candidate_sprite())
             .ok_or_else(|| {
-                crate::kms::cursor_plane::CursorShowError::Unbound(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "cursor image has no prepared framebuffer lease",
-                ))
+                self.cursor_show_failure(
+                    device_idx,
+                    crtc,
+                    io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "cursor image has no prepared framebuffer lease",
+                    ),
+                    true,
+                )
             })?;
         let properties = self.devices[device_idx]
             .cursor
@@ -1279,9 +1326,12 @@ impl PlatformBackend {
             .as_ref()
             .and_then(|plane| plane.properties_for(crtc))
             .ok_or_else(|| {
-                crate::kms::cursor_plane::CursorShowError::Unbound(io::Error::other(
-                    "atomic cursor plane properties unavailable",
-                ))
+                self.cursor_show_failure(
+                    device_idx,
+                    crtc,
+                    io::Error::other("atomic cursor plane properties unavailable"),
+                    false,
+                )
             })?;
         let binding = CursorBinding {
             properties,
@@ -1309,20 +1359,37 @@ impl PlatformBackend {
                 Ok(())
             }
             Err(error) => {
-                let remains_visible = self.devices[device_idx]
-                    .cursor
-                    .crtc_states
-                    .get(&crtc)
-                    .is_some_and(|state| state.applied.is_some());
-                if remains_visible {
-                    Err(crate::kms::cursor_plane::CursorShowError::StillVisible {
-                        operation_error: error,
-                        rollback_error: None,
-                    })
-                } else {
-                    Err(crate::kms::cursor_plane::CursorShowError::Unbound(error))
-                }
+                let deferred = error.kind() == io::ErrorKind::WouldBlock
+                    || error.raw_os_error() == Some(libc::EBUSY);
+                Err(self.cursor_show_failure(device_idx, crtc, error, deferred))
             }
+        }
+    }
+
+    fn cursor_show_failure(
+        &self,
+        device_idx: usize,
+        crtc: ::drm::control::crtc::Handle,
+        operation_error: io::Error,
+        deferred: bool,
+    ) -> crate::kms::cursor_plane::CursorShowError {
+        let remains_visible = self.devices[device_idx]
+            .cursor
+            .crtc_states
+            .get(&crtc)
+            .is_some_and(|state| state.applied.is_some());
+        if deferred {
+            crate::kms::cursor_plane::CursorShowError::Deferred {
+                operation_error,
+                remains_visible,
+            }
+        } else if remains_visible {
+            crate::kms::cursor_plane::CursorShowError::StillVisible {
+                operation_error,
+                rollback_error: None,
+            }
+        } else {
+            crate::kms::cursor_plane::CursorShowError::Unbound(operation_error)
         }
     }
 
@@ -1446,12 +1513,22 @@ impl PlatformBackend {
             if state.permanently_disabled {
                 break;
             }
-            let Some(applied) = state
-                .crtc_states
-                .get(&crtc)
-                .and_then(|crtc_state| crtc_state.applied)
-            else {
+            let Some(crtc_state) = state.crtc_states.get(&crtc) else {
                 continue;
+            };
+            // Motion updates the position of the newest show intent. In
+            // particular, keep its staged replacement lease instead of
+            // rebuilding it from the last accepted image. A pending detach
+            // also wins over motion and must remain a detach.
+            let binding = match crtc_state.intent {
+                Some(CursorIntent::Show(binding)) => binding,
+                Some(CursorIntent::Hide) => continue,
+                None => {
+                    let Some(applied) = crtc_state.applied else {
+                        continue;
+                    };
+                    applied
+                }
             };
             if !state
                 .plane
@@ -1462,14 +1539,15 @@ impl PlatformBackend {
             }
             let (cx, cy) = cursor_root_to_crtc_local(x, y, layout_x, layout_y, hot_x, hot_y);
             state.remember_atomic_position(device_key, crtc, cx, cy, Some(motion_timestamp));
-            state.crtc_states.entry(crtc).or_default().intent =
-                Some(CursorIntent::Show(CursorBinding {
+            if let Some(crtc_state) = state.crtc_states.get_mut(&crtc) {
+                crtc_state.intent = Some(CursorIntent::Show(CursorBinding {
                     x: cx,
                     y: cy,
                     hot_x,
                     hot_y,
-                    ..applied
+                    ..binding
                 }));
+            }
         }
         state.pending_move = None;
         state.pending_move_timestamp = None;

@@ -33,6 +33,26 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-10-16 atomic-cursor-only A5 fix round 1:** deferred show errors now
+  pass through the scene sink without resolving a still-unaccepted attach as
+  Hidden. Scene position-only commits clear an intent only when its lease and
+  framebuffer match the accepted binding, so motion during a pending replacement
+  cannot discard the new image. Failed live-pool Create keeps both accepted
+  CRTC images bound and retries without an atomic detach. Shutdown disables
+  before scene drain and still drains pending PRESENT completions on disable
+  error; VT resume restores all cursor properties. Tearing stays on VSync after
+  a rejected cursor detach. Backend regression tests assert full recorded
+  sequences, retained ownership, and zero outstanding cursor leases. The 22
+  ignored atomic-cursor tests passed 20/20 under 16 busy loops, and the tearing-
+  on rejected-detach test passed 20/20. Nightly/stable formatting, server build,
+  default and whole ignored workspace suites, standalone default/ignored render
+  acceptance, both Clippy gates, and layout passed. Default workspace results:
+  yserver 1,153 passed / 183 ignored; core 1,732 passed; protocol 494 passed;
+  render 581 passed / 64 ignored. The whole ignored run passed 183 yserver,
+  1 DRI3 fd-leak, 10 GLX TFP, 191 render-acceptance, 64 yserver-render, and 2
+  doctests; no capability skips were reported. Mesa printed loader device-info
+  diagnostics. Hardware validation remains with controller Task C11.
+
 - **2026-10-16 atomic-cursor-only A5:** eligible hardware cursor show, move,
   and hide operations use owned full-state atomic commits. Accepted state is
   the visibility source, and prior sprite leases stay held until their event.

@@ -503,28 +503,6 @@ pub(super) fn reset_cursor_mode_for_lifecycle(mode: &mut OutputCursorMode) {
     *mode = OutputCursorMode::Hidden;
 }
 
-pub(super) fn resolve_failed_cursor_upload(
-    output_idx: usize,
-    prior_visible: bool,
-    hide_live_binding: impl FnOnce() -> io::Result<()>,
-) -> CursorTransitionResult {
-    if !prior_visible {
-        // Hidden/Sw→Hw can fail before the plane has ever been bound. There
-        // is no rollback to perform; issuing set_cursor2(None) here can itself
-        // return EINVAL and falsely manufacture HW ownership.
-        return CursorTransitionResult::Hidden;
-    }
-    match hide_live_binding() {
-        Ok(()) => CursorTransitionResult::Hidden,
-        Err(error) => {
-            log::warn!(
-                "render cursor: upload failed and hide_on_crtc({output_idx}) rollback failed: {error}"
-            );
-            CursorTransitionResult::VisibleNeedsShowRetry
-        }
-    }
-}
-
 pub(super) fn resolve_cursor_hide_on_retire(
     output_idx: usize,
     reveal_sw_after: bool,
@@ -613,19 +591,21 @@ pub(super) fn apply_cursor_transition_on_retire(
                 true
             };
             if !upload_ready {
-                // A steady-HW rebind can fail its per-device upload while an
-                // old binding is live. Switch to SW only if detaching that old
-                // binding succeeds; otherwise retain actual HW ownership. A
-                // never-bound output has nothing to detach and resolves
-                // directly to Hidden without probing hide.
-                resolve_failed_cursor_upload(output_idx, prior_visible, || {
-                    sink.cursor_plane_mut().hide(output_idx)
-                })
+                // Keep the accepted image bound until the wanted replacement
+                // has a complete framebuffer. Allocation or mapping pressure
+                // cannot turn an image update into a speculative detach.
+                if prior_visible {
+                    CursorTransitionResult::VisibleNeedsShowRetry
+                } else {
+                    CursorTransitionResult::Hidden
+                }
             } else {
                 match sink.cursor_plane_mut().show(output_idx, hot_x, hot_y, x, y) {
                     Ok(()) => CursorTransitionResult::Applied,
                     Err(error) => {
-                        let actual = if error.remains_visible {
+                        let actual = if error.deferred {
+                            CursorTransitionResult::Deferred
+                        } else if error.remains_visible {
                             CursorTransitionResult::VisibleNeedsShowRetry
                         } else {
                             CursorTransitionResult::Hidden

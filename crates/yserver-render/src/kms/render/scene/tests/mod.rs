@@ -163,6 +163,7 @@ impl CursorPlaneSink for TestSink {
     ) -> Result<(), CursorShowFailure> {
         Err(CursorShowFailure {
             remains_visible: false,
+            deferred: false,
             error: Box::new(io::Error::other(
                 "cursor remains unbound: cursor plane unavailable for output",
             )),

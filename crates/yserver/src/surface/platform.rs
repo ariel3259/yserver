@@ -384,6 +384,7 @@ impl CursorPlaneSink for SurfacePlatform {
         let Some(image) = self.cursor.image.as_mut() else {
             return Err(CursorShowFailure {
                 remains_visible: self.cursor.shown,
+                deferred: false,
                 error: "no cursor image uploaded".into(),
             });
         };

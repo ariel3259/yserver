@@ -382,6 +382,36 @@ impl KmsBackend {
         // Phase B.1 Task 21: drain close events emitted by shutdown.
         self.drain_frame_builder_telemetry();
         self.sync_descriptor_pool_telemetry();
+
+        // Take the complete event snapshot before scene teardown. Disabling
+        // the CRTCs first makes its blocking cursor detaches the final KMS
+        // cursor operations; `scene.drain_all` below can then only observe
+        // detached state and cannot create an obligation missing from this
+        // snapshot.
+        if let Err(error) = self.platform.disable_output() {
+            // A failed KMS disable must preserve cursor ownership, but it
+            // must not strand PRESENT completions already drained from the
+            // renderer. Keep those protocol events available to the caller
+            // even on this fail-stop path.
+            let completed = self.drain_completed_present_events_impl();
+            self.pending_completed_events_on_shutdown.extend(completed);
+            let completed = self.force_drain_all_present_batches();
+            self.pending_completed_events_on_shutdown.extend(completed);
+            return Err(error);
+        }
+        if let Err(error) = self.platform.discard_old_drm_events_after_all_off(
+            &old_pending_pageflips,
+            std::time::Duration::from_secs(1),
+        ) {
+            for device in &mut self.platform.devices {
+                if let Some(plane) = device.cursor.plane.as_mut() {
+                    plane.disarm_sprite_pool();
+                }
+            }
+            return Err(error);
+        }
+        self.platform
+            .clear_atomic_cursor_state_after_old_events_discard();
         self.scene.drain_all(&mut self.platform);
 
         // Stage 5 Task 6.1: drain the pending PRESENT batch queue
@@ -404,20 +434,6 @@ impl KmsBackend {
         // `BufWriter::Drop` would lose the buffered tail to a
         // subsequent power-cycle. See `submit_trace::SubmitTrace::flush`.
         self.telemetry.flush_submit_trace();
-        self.platform.disable_output()?;
-        if let Err(error) = self.platform.discard_old_drm_events_after_all_off(
-            &old_pending_pageflips,
-            std::time::Duration::from_secs(1),
-        ) {
-            for device in &mut self.platform.devices {
-                if let Some(plane) = device.cursor.plane.as_mut() {
-                    plane.disarm_sprite_pool();
-                }
-            }
-            return Err(error);
-        }
-        self.platform
-            .clear_atomic_cursor_state_after_old_events_discard();
         self.stop_direct_after_scanout_replaced("shutdown");
         self.pending_completed_events_on_shutdown
             .append(&mut self.pstate.scanout_m2.completed);

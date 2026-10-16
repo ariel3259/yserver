@@ -132,35 +132,6 @@ fn live_source_device_lost_is_the_only_fatal_vulkan_present_error() {
 }
 
 #[test]
-fn upload_failure_hides_only_a_recorded_live_binding() {
-    use std::cell::Cell;
-
-    let hidden_hide_calls = Cell::new(0);
-    let hidden = resolve_failed_cursor_upload(0, false, || {
-        hidden_hide_calls.set(hidden_hide_calls.get() + 1);
-        Err(io::Error::from_raw_os_error(libc::EINVAL))
-    });
-    assert_eq!(hidden, CursorTransitionResult::Hidden);
-    assert_eq!(hidden_hide_calls.get(), 0);
-
-    let visible_hide_calls = Cell::new(0);
-    let hidden_after_rollback = resolve_failed_cursor_upload(0, true, || {
-        visible_hide_calls.set(visible_hide_calls.get() + 1);
-        Ok(())
-    });
-    assert_eq!(hidden_after_rollback, CursorTransitionResult::Hidden);
-    assert_eq!(visible_hide_calls.get(), 1);
-
-    let visible_hide_calls = Cell::new(0);
-    let retained = resolve_failed_cursor_upload(0, true, || {
-        visible_hide_calls.set(visible_hide_calls.get() + 1);
-        Err(io::Error::from_raw_os_error(libc::EIO))
-    });
-    assert_eq!(retained, CursorTransitionResult::VisibleNeedsShowRetry);
-    assert_eq!(visible_hide_calls.get(), 1);
-}
-
-#[test]
 fn retire_hide_skips_ioctl_when_fast_path_already_unbound_the_plane() {
     use std::cell::Cell;
 
