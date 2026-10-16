@@ -501,60 +501,6 @@ fn hidden_cursor_motion_from_dead_zone_wakes_scene_on_reentry() {
 }
 
 #[test]
-// Mutation: ignore the scene flip blocker and send the position as cursor-only.
-fn motion_during_scene_flip_waits_and_scene_request_carries_latest_position() {
-    use yserver_core::server::ServerState;
-
-    let Some(mut backend) = backend_with_live_scene() else {
-        return;
-    };
-    let recorder = recording_sink(&mut backend, 0);
-    let device_key = backend.platform.devices[0].key;
-    seed_cursor_position(&mut backend);
-    let crtc = backend.platform.outputs[0].output.crtc;
-    backend.scene.test_set_flip_in_flight(true);
-    let mut state = ServerState::new();
-
-    warp(&mut backend, &mut state, 210, 95);
-    let latest = backend
-        .platform
-        .for_tests_atomic_cursor_pending_position(device_key, crtc)
-        .expect("motion remains unsent while a scene flip is pending");
-    maybe_composite(&mut backend);
-    assert!(recorder.records().is_empty());
-
-    retire_test_flip(&mut backend, &mut state, 1);
-    backend.scene.test_set_flip_in_flight(false);
-    let positions = backend
-        .platform
-        .cursor_plane_atomic_positions_for_outputs(&[0]);
-    assert_eq!(positions, vec![latest]);
-    set_scene_fence_properties(&mut backend.platform.outputs[0].output);
-    let mut out_fence = -1;
-    crate::drm::page_flip::submit_scene_flip_with_fences(
-        &backend.platform.devices[0].device,
-        &backend.platform.devices[0].atomic_commit_sink,
-        &backend.platform.outputs[0].output,
-        raw(71),
-        -1,
-        &mut out_fence,
-        &positions,
-        crate::drm::async_flip::FlipTiming::Vsync,
-    )
-    .expect("record the next scene request");
-    backend
-        .platform
-        .cursor_plane_scene_commit_submitted(&positions);
-    retire_test_flip(&mut backend, &mut state, 2);
-
-    let records = recorder.records();
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].kind, AtomicCommitKind::SceneWithCursor);
-    assert_cursor_properties(&records[0], latest);
-    assert_no_cursor_work(&backend, device_key);
-}
-
-#[test]
 // Mutation: make `output_commit_in_flight` always false in the backend sink.
 fn cursor_only_commit_blocks_scene_readiness_until_its_flip_retires() {
     use crate::kms::render::scene::OutputSink;

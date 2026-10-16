@@ -411,11 +411,6 @@ impl KmsBackend {
         output_device: &Rc<crate::drm::Device>,
         connector: &str,
     ) -> io::Result<crate::platform::drm::Output> {
-        #[cfg(test)]
-        if let Some(output) = self.pstate.crtc_config_discovery_override.take() {
-            return Ok(output);
-        }
-
         let reserved_routes: Vec<_> = self
             .platform
             .outputs
@@ -431,15 +426,14 @@ impl KmsBackend {
                 )
             })
             .collect();
-        crate::platform::drm::discover_output_for_connector(
-            output_device,
-            connector,
-            &reserved_routes,
-        )
-        .map_err(|error| {
-            log::error!("begin_crtc_config: target discovery for {connector} failed: {error}");
-            error
-        })
+        self.platform
+            .services
+            .crtc_output_discovery
+            .discover(output_device, connector, &reserved_routes)
+            .map_err(|error| {
+                log::error!("begin_crtc_config: target discovery for {connector} failed: {error}");
+                error
+            })
     }
 
     fn stale_crtc_config_probe_reason(&self, pending: &PendingCrtcConfigProbe) -> Option<String> {
@@ -1038,15 +1032,16 @@ impl KmsBackend {
                 })
                 .collect();
             Some(
-                crate::platform::drm::discover_output_for_connector(
-                    &output_device,
-                    connector,
-                    &reserved_routes,
-                )
-                .map_err(|e| {
-                    log::error!("apply_crtc_config: target discovery for {connector} failed: {e}");
-                    e
-                })?,
+                self.platform
+                    .services
+                    .crtc_output_discovery
+                    .discover(&output_device, connector, &reserved_routes)
+                    .map_err(|e| {
+                        log::error!(
+                            "apply_crtc_config: target discovery for {connector} failed: {e}"
+                        );
+                        e
+                    })?,
             )
         } else {
             None

@@ -1,6 +1,9 @@
-use crate::kms::render::platform::{
-    CursorFailureDisposition, CursorHideRecovery, CursorMoveOutcome, KmsCursorState, KmsDevice,
-    PlatformBackend, TransientCursorFallback,
+use crate::kms::{
+    cursor_plane::CursorPlaneFactory,
+    render::platform::{
+        CursorFailureDisposition, CursorHideRecovery, CursorMoveOutcome, KmsCursorState, KmsDevice,
+        PlatformBackend, TransientCursorFallback,
+    },
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -290,9 +293,10 @@ pub(super) fn initialize_cursor_plane_for_device(
     kms_device: &mut KmsDevice,
     crtcs: &[::drm::control::crtc::Handle],
     boundary: &str,
+    factory: &dyn CursorPlaneFactory,
 ) {
     kms_device.cursor.headless_deferred = false;
-    match crate::kms::cursor_plane::CursorPlane::new_with_ops(
+    match factory.create(
         Rc::clone(&kms_device.device),
         crtcs,
         Rc::clone(&kms_device.cursor_buffer_io),
@@ -372,6 +376,21 @@ impl PlatformBackend {
             .find(|device| device.key == device_key)
             .and_then(|device| device.cursor.plane.as_ref())
             .and_then(crate::kms::cursor_plane::CursorPlane::for_tests_discovery_calls)
+    }
+
+    pub(crate) fn for_tests_cursor_initialization_state(
+        &self,
+        device_key: crate::platform::drm::DrmDeviceKey,
+    ) -> Option<(bool, bool)> {
+        self.devices
+            .iter()
+            .find(|device| device.key == device_key)
+            .map(|device| {
+                (
+                    device.cursor.headless_deferred,
+                    device.cursor.initialization_retryable,
+                )
+            })
     }
 }
 
@@ -1408,9 +1427,12 @@ impl PlatformBackend {
         &mut self,
         changed_devices: &HashSet<crate::platform::drm::DrmDeviceKey>,
     ) {
+        let factory = Rc::clone(&self.services.cursor_plane_factory);
         self.refresh_cursor_topology_for_devices_with(
             changed_devices,
-            initialize_cursor_plane_for_device,
+            move |device, crtcs, boundary| {
+                initialize_cursor_plane_for_device(device, crtcs, boundary, factory.as_ref());
+            },
         );
     }
 

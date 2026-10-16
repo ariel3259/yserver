@@ -154,7 +154,14 @@ fn async_crtc_config_test_backend() -> (KmsBackend, u32, ModeSpec) {
         requested.vrefresh,
         false,
     ));
-    backend.pstate.crtc_config_discovery_override = Some(discovered);
+    backend
+        .platform
+        .services
+        .test_recorders
+        .as_ref()
+        .expect("recording KMS services")
+        .crtc_output_discovery
+        .queue_output(discovered);
     (backend, output_id, requested)
 }
 
@@ -177,11 +184,7 @@ fn async_crtc_config_begin_keeps_old_topology_lit() {
         copied_sink.is_some(),
         "fixture must exercise copied sink wire data"
     );
-    let discovered = backend
-        .pstate
-        .crtc_config_discovery_override
-        .as_ref()
-        .expect("fixture has prepared output");
+    let discovered = &backend.platform.outputs[0].output;
     let kms = ProbeKmsHandles {
         connector: discovered.connector,
         encoder: discovered.encoder,

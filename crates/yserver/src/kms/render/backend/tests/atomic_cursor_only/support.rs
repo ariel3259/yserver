@@ -66,6 +66,67 @@ impl AtomicCursorFixture {
         })
     }
 
+    pub(crate) fn headless_for_lifecycle() -> Result<
+        Option<(
+            Self,
+            crate::kms::backend::OutputKey,
+            crate::platform::drm::Output,
+        )>,
+        String,
+    > {
+        let mut backend = crate::kms::render::backend::KmsBackend::for_tests();
+        let device_key = backend.platform.devices[0].key;
+        let render_device_id = crate::kms::scanout_route::RenderDeviceId::DrmRender(device_key);
+        install_recording_device_caps(&mut backend);
+        let active = backend
+            .platform
+            .outputs
+            .pop()
+            .expect("test seed has one output to retain as an enable template");
+        let key = active.key;
+        let output = active.output;
+        backend.platform.render_devices = vec![crate::kms::render::platform::RenderDevice {
+            id: render_device_id,
+            physical_device: ash::vk::PhysicalDevice::default(),
+            selector: crate::kms::vk::device::VulkanDeviceSelector::for_tests(1),
+            advertised_primary_node: Some(device_key),
+            advertised_render_node: Some(device_key),
+            render_node: None,
+            render_node_device: None,
+            syncobj_timeline: false,
+        }];
+        backend.platform.selected_render_device = Some(render_device_id);
+        backend
+            .initialize_provider_output_sources()
+            .map_err(|error| format!("initialize lifecycle fixture provider source: {error}"))?;
+        backend.platform.scanout_pools.clear();
+        backend.platform.bo_generations.clear();
+        backend.platform.first_pageflip_logged.clear();
+        backend.pstate.randr_id_alloc = crate::kms::render::backend::RandrIdAllocator::default();
+        backend.pstate.output_identity_by_id.clear();
+        backend.pstate.output_key_by_id.clear();
+        backend.pstate.crtc_key_by_id.clear();
+        backend.kms_outputs_active = false;
+
+        let recorders = Rc::clone(
+            backend
+                .platform
+                .services
+                .test_recorders
+                .as_ref()
+                .expect("for_tests selects recording KMS services"),
+        );
+        Ok(Some((
+            Self {
+                backend,
+                recorders,
+                state: yserver_core::server::ServerState::new(),
+            },
+            key,
+            output,
+        )))
+    }
+
     pub(crate) fn define_visible_cursor(&mut self) -> u32 {
         use yserver_core::backend::Backend;
 

@@ -300,6 +300,141 @@ fn atomic_cursor_only_trace_covers_backend_motion_and_retirement() {
 }
 
 #[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: remove the scene-flip cursor blocker so motion submits CursorOnly before scene retirement.
+fn atomic_cursor_only_motion_waits_for_scene_retirement_and_carries_latest_position() {
+    use yserver_core::backend::Backend;
+
+    let Some(mut fixture) = AtomicCursorFixture::new().expect("build cursor fixture") else {
+        return;
+    };
+    fixture.define_visible_cursor();
+    let root = fixture.backend.core.window_id;
+    let width = fixture.backend.platform.fb_w;
+    let height = fixture.backend.platform.fb_h;
+    let records_before = fixture.recorders.atomic.records().len();
+    let damage_root = |fixture: &mut AtomicCursorFixture| {
+        Backend::clear_area(
+            &mut fixture.backend,
+            None,
+            root,
+            0,
+            None,
+            0,
+            0,
+            width,
+            height,
+            (0, 0),
+        )
+        .expect("damage root through Backend");
+    };
+
+    Backend::warp_pointer_root(&mut fixture.backend, &mut fixture.state, 100, 90);
+    damage_root(&mut fixture);
+    Backend::maybe_composite(&mut fixture.backend).expect("submit initial cursor scene");
+    assert!(
+        fixture.backend.scene.has_pending_page_flips(),
+        "Backend composition owns the scene until its page flip retires",
+    );
+    assert_eq!(
+        fixture.recorders.atomic.records()[records_before].kind,
+        crate::drm::atomic::AtomicCommitKind::Scene,
+    );
+    fixture.retire_output(0, 1);
+    assert!(fixture.backend.platform.cursor_plane_visible_for_output(0));
+
+    damage_root(&mut fixture);
+    Backend::maybe_composite(&mut fixture.backend)
+        .expect("submit scene binding the eligible cursor plane");
+    let binding_scene = fixture.recorders.atomic.records();
+    assert_eq!(binding_scene.len(), records_before + 2);
+    assert_eq!(
+        binding_scene[records_before + 1].kind,
+        crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+    );
+    fixture.retire_output(0, 2);
+
+    // Begin the tested scene flip after an accepted Backend frame has
+    // established HW cursor ownership on the real test output.
+    damage_root(&mut fixture);
+    Backend::maybe_composite(&mut fixture.backend).expect("submit scene before motion");
+    assert!(fixture.backend.scene.has_pending_page_flips());
+    assert_eq!(fixture.recorders.atomic.records().len(), records_before + 3,);
+    Backend::warp_pointer_root(&mut fixture.backend, &mut fixture.state, 210, 95);
+    Backend::maybe_composite(&mut fixture.backend)
+        .expect("run Backend scheduling while the scene flip is pending");
+    assert_eq!(
+        fixture.recorders.atomic.records().len(),
+        records_before + 3,
+        "motion cannot submit a cursor-only commit before scene retirement",
+    );
+
+    fixture.retire_output(0, 3);
+    damage_root(&mut fixture);
+    Backend::maybe_composite(&mut fixture.backend)
+        .expect("submit scene with the latest cursor position");
+
+    let records = fixture.recorders.atomic.records();
+    assert_eq!(records.len(), records_before + 4);
+    assert_eq!(
+        records[records_before + 2].kind,
+        crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+    );
+    let hardware_scene = &records[records_before + 3];
+    assert_eq!(
+        hardware_scene.kind,
+        crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+    );
+    let crtc = fixture.backend.platform.outputs[0].output.crtc;
+    let properties = fixture.backend.platform.devices[0]
+        .cursor
+        .plane
+        .as_ref()
+        .expect("fixture cursor plane")
+        .properties_for(crtc)
+        .expect("eligible cursor plane properties");
+    for (property, value) in [
+        (properties.crtc_x, 210_i64 as u64),
+        (properties.crtc_y, 95_i64 as u64),
+    ] {
+        assert!(
+            hardware_scene.properties.iter().any(|update| {
+                update.object == properties.plane.into()
+                    && update.property == property
+                    && update.value == value
+            }),
+            "accepted scene carries latest cursor property {property:?}={value}",
+        );
+    }
+    fixture.retire_output(0, 4);
+
+    Backend::set_cursor_hidden(&mut fixture.backend, true);
+    damage_root(&mut fixture);
+    Backend::maybe_composite(&mut fixture.backend).expect("submit cursor hide scene");
+    assert!(fixture.backend.scene.has_pending_page_flips());
+    fixture.retire_output(0, 5);
+    fixture.assert_cursor_quiescent();
+    assert_eq!(
+        fixture.recorders.atomic.records()[records_before..]
+            .iter()
+            .map(|record| record.kind)
+            .collect::<Vec<_>>(),
+        vec![
+            crate::drm::atomic::AtomicCommitKind::Scene,
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+        ],
+        "the exact accepted sequence is initial scene, binding scene, pending scene, latest-position scene, and hide",
+    );
+
+    let ledger = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
+    drop(fixture);
+    assert_eq!(ledger.end_state(), (0, 0, 0));
+}
+
+#[test]
 // Mutation: ignore the selected hotplug source; the queued edge must fail to arm Backend's deadline.
 fn atomic_cursor_only_hotplug_source_arms_backend_debounce() {
     use std::{cell::Cell, time::Duration};
@@ -341,8 +476,8 @@ fn atomic_cursor_only_hotplug_source_arms_backend_debounce() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: select production mode-blob operations in KmsServices::for_tests; the service identity assertion must fail.
-fn atomic_cursor_only_mode_blob_lifetime_uses_shared_modeset() {
+// Mutation: bypass the recording CRTC discovery service; the Backend enable must fail before its modeset record.
+fn atomic_cursor_only_randr_modeset_uses_injected_backend_services() {
     use yserver_core::backend::Backend;
 
     let Some(mut fixture) = AtomicCursorFixture::new().expect("build backend fixture") else {
@@ -385,7 +520,7 @@ fn atomic_cursor_only_mode_blob_lifetime_uses_shared_modeset() {
         .backend
         .platform
         .for_tests_accept_output_power_commits();
-    fixture.backend.pstate.crtc_config_discovery_override = Some(output);
+    fixture.recorders.crtc_output_discovery.queue_output(output);
 
     let attempt = Backend::apply_crtc_config(
         &mut fixture.backend,
@@ -395,17 +530,25 @@ fn atomic_cursor_only_mode_blob_lifetime_uses_shared_modeset() {
         13,
         0,
     );
-    let error = attempt.expect_err("synthetic /dev/null KMS must reject DRM property lookup");
-    assert_eq!(
-        error.raw_os_error(),
-        Some(libc::ENOTTY),
-        "RANDR reaches the shared modeset entry, whose direct property lookup is the deepest operation available on the fixture fd",
-    );
+    assert!(attempt.expect("recorded CRTC discovery and modeset succeed"));
+    assert_eq!(fixture.recorders.crtc_output_discovery.calls(), 1);
+    assert_eq!(fixture.backend.platform.outputs[0].x, 13);
     assert_eq!(fixture.recorders.mode_blobs.live_count(), 0);
     assert!(fixture.recorders.mode_blobs.records().is_empty());
     assert!(
         fixture.recorders.atomic.records().is_empty(),
         "the fake KMS fd must stop at property lookup before atomic submission",
+    );
+    assert_eq!(
+        fixture
+            .recorders
+            .output_power
+            .records()
+            .iter()
+            .map(|record| record.enabled)
+            .collect::<Vec<_>>(),
+        vec![false, true, true],
+        "the accepted config records quiesce, modeset, and re-light in order",
     );
     fixture.assert_cursor_quiescent();
 
@@ -533,8 +676,8 @@ fn schedule_rescan_clock(
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: require only CRTC_X/Y, use one card-wide gate, allow a virtual
-// plane after cap rejection, or reuse old discovery; the named matrix rows fail.
+// Mutation: omit software cursor drawing or eligible cursor-plane X/Y fields;
+// the accepted footprint and HW-scene assertions must fail.
 fn atomic_cursor_only_eligibility_matrix() {
     use yserver_core::backend::Backend;
 
@@ -632,6 +775,11 @@ fn atomic_cursor_only_eligibility_matrix() {
     ));
 
     for (row_index, (name, snapshot, eligible)) in rows.into_iter().enumerate() {
+        let candidate_planes: Vec<::drm::control::plane::Handle> = snapshot
+            .planes
+            .iter()
+            .map(|plane| ::drm::control::from_u32(plane.handle).expect("test plane"))
+            .collect();
         assert!(
             fixture
                 .backend
@@ -756,6 +904,7 @@ fn atomic_cursor_only_eligibility_matrix() {
             );
         }
         let records_before = fixture.recorders.atomic.records().len();
+        let legacy_records_before = fixture.recorders.legacy_cursor.records().len();
         let root = fixture.backend.core.window_id;
         let (width, height) = (fixture.backend.platform.fb_w, fixture.backend.platform.fb_h);
         Backend::set_cursor_hidden(&mut fixture.backend, false);
@@ -791,8 +940,95 @@ fn atomic_cursor_only_eligibility_matrix() {
             crate::drm::atomic::tests_support::ScriptedResult::Ok,
             "{name}: the scene carrying the software cursor must be accepted",
         );
+        assert_eq!(
+            accepted_scene.kind,
+            crate::drm::atomic::AtomicCommitKind::Scene,
+            "{name}: the first accepted frame establishes cursor ownership",
+        );
+        if !eligible {
+            assert!(
+                !accepted_scene.properties.iter().any(|update| {
+                    candidate_planes
+                        .iter()
+                        .any(|plane| update.object == (*plane).into())
+                }),
+                "{name}: ineligible CRTC must not receive cursor-plane properties",
+            );
+        }
         let first_frame = u32::try_from(row_index * 2 + 1).expect("frame index fits");
         fixture.retire_output(0, first_frame);
+        if eligible {
+            assert!(
+                fixture.backend.platform.cursor_plane_visible_for_output(0),
+                "{name}: Backend retirement binds the eligible hardware plane",
+            );
+            Backend::clear_area(
+                &mut fixture.backend,
+                None,
+                root,
+                0,
+                None,
+                0,
+                0,
+                width,
+                height,
+                (0, 0),
+            )
+            .expect("damage eligible hardware cursor through Backend");
+            Backend::maybe_composite(&mut fixture.backend)
+                .expect("compose the active hardware cursor");
+            let records = fixture.recorders.atomic.records();
+            let hardware_scene = records[records_before + 1..]
+                .iter()
+                .rev()
+                .find(|record| {
+                    matches!(
+                        record.kind,
+                        crate::drm::atomic::AtomicCommitKind::Scene
+                            | crate::drm::atomic::AtomicCommitKind::SceneWithCursor
+                    )
+                })
+                .expect("eligible hardware scene record");
+            assert_eq!(
+                hardware_scene.kind,
+                crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+                "{name}: accepted scene uses the eligible output-local cursor plane",
+            );
+            let properties = fixture.backend.platform.devices[0]
+                .cursor
+                .plane
+                .as_ref()
+                .expect("eligible cursor plane")
+                .properties_for(crtc)
+                .expect("eligible CRTC properties");
+            for property in [properties.crtc_x, properties.crtc_y] {
+                assert!(
+                    hardware_scene.properties.iter().any(|update| {
+                        update.object == properties.plane.into() && update.property == property
+                    }),
+                    "{name}: accepted hardware scene omitted required property {property:?}",
+                );
+            }
+            assert!(
+                fixture.recorders.legacy_cursor.records()[legacy_records_before..]
+                    .iter()
+                    .any(|record| {
+                        record.operation
+                            == crate::kms::cursor_plane::ops::LegacyCursorOperation::Bind
+                            && record.framebuffer.is_some()
+                    }),
+                "{name}: Backend retirement binds a real eligible cursor framebuffer",
+            );
+            fixture.retire_output(0, first_frame + 1);
+        } else {
+            assert!(
+                fixture
+                    .backend
+                    .scene
+                    .for_tests_cursor_footprint_was_presented(0),
+                "{name}: accepted scene paints the software cursor on an ineligible output",
+            );
+        }
         Backend::set_cursor_hidden(&mut fixture.backend, true);
         Backend::clear_area(
             &mut fixture.backend,
@@ -811,6 +1047,24 @@ fn atomic_cursor_only_eligibility_matrix() {
         if fixture.backend.scene.has_pending_page_flips() {
             fixture.retire_output(0, first_frame + 1);
         }
+        let expected_scene_kind = if eligible {
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor
+        } else {
+            crate::drm::atomic::AtomicCommitKind::Scene
+        };
+        let mut expected_scene_sequence = vec![crate::drm::atomic::AtomicCommitKind::Scene];
+        if eligible {
+            expected_scene_sequence.push(crate::drm::atomic::AtomicCommitKind::SceneWithCursor);
+        }
+        expected_scene_sequence.push(expected_scene_kind);
+        assert_eq!(
+            fixture.recorders.atomic.records()[records_before..]
+                .iter()
+                .map(|record| record.kind)
+                .collect::<Vec<_>>(),
+            expected_scene_sequence,
+            "{name}: exact show/hide scene commit sequence",
+        );
         fixture.assert_cursor_quiescent();
     }
 
@@ -820,8 +1074,235 @@ fn atomic_cursor_only_eligibility_matrix() {
 }
 
 #[test]
-// Mutation: share raw-handle caches between cards or refresh every card's
-// applied topology; the unchanged peer's epoch assertion fails.
+// Mutation: suppress retryable cursor initialization after the CRTC returns;
+// the second Backend enable must fail to create an eligible plane.
+fn atomic_cursor_only_headless_enable_disable_enable_retries_initialization() {
+    use std::time::Duration;
+    use yserver_core::backend::Backend;
+
+    let Some((mut fixture, key, output)) =
+        AtomicCursorFixture::headless_for_lifecycle().expect("build headless lifecycle fixture")
+    else {
+        return;
+    };
+    fixture
+        .backend
+        .platform
+        .for_tests_accept_output_power_commits();
+    let device_key = key.device_key;
+    let crtc = output.crtc;
+    let factory = std::rc::Rc::clone(&fixture.recorders.cursor_plane_factory);
+    factory.queue_error(libc::EIO);
+    factory.queue_snapshot(cursor_topology_snapshot(
+        "amdgpu",
+        false,
+        &[crtc.into()],
+        &[(10, vec![crtc.into()], ATOMIC_CURSOR_PROPERTIES.to_vec())],
+    ));
+
+    assert!(fixture.backend.platform.outputs.is_empty());
+    assert_eq!(
+        factory.calls(),
+        0,
+        "headless construction defers cursor init"
+    );
+    assert_eq!(
+        fixture
+            .backend
+            .platform
+            .for_tests_cursor_initialization_state(device_key),
+        Some((true, false)),
+    );
+    let (base, elapsed_ms) = schedule_rescan_clock(&mut fixture.backend);
+    fixture.recorders.connector_snapshot.queue_snapshot(vec![
+        crate::kms::render::platform::ConnectorSnapshot {
+            key: key.clone(),
+            modes: output.modes.clone(),
+            mm_width: output.mm_width,
+            mm_height: output.mm_height,
+            edid: output.edid.clone(),
+            connector_type: output.connector_type.clone(),
+        },
+    ]);
+    fixture
+        .recorders
+        .hotplug
+        .queue_change()
+        .expect("queue initial connected connector edge");
+    Backend::on_display_hotplug(&mut fixture.backend, &mut fixture.state);
+    let deadline = fixture
+        .backend
+        .pstate
+        .hotplug_rescan_deadline
+        .expect("Backend arms the hotplug debounce deadline");
+    assert_eq!(deadline, base + Duration::from_millis(150));
+    assert!(Backend::next_wakeup(&fixture.backend).is_some());
+    assert!(Backend::reprobe_connectors(&mut fixture.backend, &mut fixture.state).is_err());
+    assert_eq!(
+        factory.calls(),
+        0,
+        "lightweight reprobe does not initialize planes"
+    );
+    elapsed_ms.set(149);
+    Backend::poll_deferred_input(&mut fixture.backend, &mut fixture.state);
+    assert_eq!(
+        factory.calls(),
+        0,
+        "cursor init waits for the rescan deadline"
+    );
+    elapsed_ms.set(150);
+    Backend::poll_deferred_input(&mut fixture.backend, &mut fixture.state);
+    assert_eq!(fixture.backend.platform.outputs.len(), 0);
+    assert_eq!(factory.calls(), 0, "connected-Off discovery stays headless");
+
+    let (outputs, _) = Backend::randr_outputs_and_modes(&mut fixture.backend);
+    let output_id = outputs
+        .iter()
+        .find(|candidate| candidate.name == key.connector_name)
+        .expect("connected headless connector is in RANDR registry")
+        .output_id;
+    let mode = yserver_core::backend::ModeSpec {
+        width: output.picked.width,
+        height: output.picked.height,
+        vrefresh: output.picked.vrefresh,
+    };
+
+    fixture
+        .recorders
+        .crtc_output_discovery
+        .queue_output(clone_drm_output(&output));
+    assert!(
+        Backend::apply_crtc_config(
+            &mut fixture.backend,
+            output_id,
+            &key.connector_name,
+            Some(mode),
+            0,
+            0,
+        )
+        .expect("first explicit output activation")
+    );
+    assert_eq!(fixture.backend.platform.outputs.len(), 1);
+    assert_eq!(
+        factory.calls(),
+        1,
+        "first active CRTC attempts initialization"
+    );
+    assert_eq!(
+        fixture
+            .backend
+            .platform
+            .for_tests_cursor_initialization_state(device_key),
+        Some((false, true)),
+        "transient first failure is retained as an initialization retry",
+    );
+    let active_epoch = fixture.backend.platform.devices[0]
+        .cursor
+        .cursor_topology_epoch;
+
+    assert!(
+        Backend::apply_crtc_config(
+            &mut fixture.backend,
+            output_id,
+            &key.connector_name,
+            None,
+            0,
+            0,
+        )
+        .expect("disable the only active output")
+    );
+    assert!(fixture.backend.platform.outputs.is_empty());
+    assert_eq!(factory.calls(), 1, "zero-output topology does not retry");
+    assert_eq!(
+        fixture.backend.platform.devices[0]
+            .cursor
+            .cursor_topology_epoch,
+        active_epoch + 1,
+    );
+
+    fixture
+        .recorders
+        .crtc_output_discovery
+        .queue_output(clone_drm_output(&output));
+    assert!(
+        Backend::apply_crtc_config(
+            &mut fixture.backend,
+            output_id,
+            &key.connector_name,
+            Some(mode),
+            0,
+            0,
+        )
+        .expect("reactivate output and retry cursor initialization")
+    );
+    assert_eq!(fixture.backend.platform.outputs.len(), 1);
+    assert_eq!(
+        factory.calls(),
+        2,
+        "active topology retries initialization once"
+    );
+    assert!(
+        fixture.backend.platform.devices[0]
+            .cursor
+            .plane
+            .as_ref()
+            .and_then(|plane| plane.properties_for(crtc))
+            .is_some()
+    );
+    assert_eq!(
+        fixture
+            .backend
+            .platform
+            .for_tests_cursor_initialization_state(device_key),
+        Some((false, false)),
+    );
+
+    assert!(
+        Backend::apply_crtc_config(
+            &mut fixture.backend,
+            output_id,
+            &key.connector_name,
+            None,
+            0,
+            0,
+        )
+        .expect("Backend teardown disables the last output")
+    );
+    assert!(fixture.backend.platform.outputs.is_empty());
+    fixture.assert_cursor_quiescent();
+    let output_power_records = fixture.recorders.output_power.records();
+    let synthetic_fb = ::drm::control::from_u32(0xF001).expect("synthetic framebuffer");
+    assert_eq!(
+        output_power_records
+            .iter()
+            .map(|record| (
+                record.enabled,
+                record.connector,
+                record.crtc,
+                record.framebuffer,
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (true, output.connector, crtc, Some(synthetic_fb)),
+            (true, output.connector, crtc, Some(synthetic_fb)),
+            (false, output.connector, crtc, None),
+            (true, output.connector, crtc, Some(synthetic_fb)),
+            (true, output.connector, crtc, Some(synthetic_fb)),
+            (false, output.connector, crtc, None),
+        ],
+        "accepted modeset and DPMS commits must follow enable/disable/enable/disable order",
+    );
+    assert!(fixture.recorders.atomic.records().is_empty());
+    assert_eq!(fixture.recorders.crtc_output_discovery.calls(), 2);
+    let ledger = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
+    drop(fixture);
+    assert_eq!(ledger.end_state(), (0, 0, 0));
+}
+
+#[test]
+// Mutation: share raw-handle caches between cards, refresh every card's
+// applied topology, or skip the final Backend teardown; the peer/end-state
+// assertions fail.
 fn atomic_cursor_only_topology_rechecks_only_affected_device() {
     use std::time::Duration;
     use yserver_core::backend::Backend;
@@ -1060,5 +1541,31 @@ fn atomic_cursor_only_topology_rechecks_only_affected_device() {
         stable_second_epoch,
         "unchanged peer topology does not advance its epoch",
     );
+
+    fixture
+        .recorders
+        .connector_snapshot
+        .queue_snapshot(Vec::new());
+    fixture
+        .recorders
+        .hotplug
+        .queue_change()
+        .expect("queue final disconnected topology edge");
+    Backend::on_display_hotplug(&mut fixture.backend, &mut fixture.state);
+    let teardown_deadline = fixture
+        .backend
+        .pstate
+        .hotplug_rescan_deadline
+        .expect("Backend arms final teardown debounce");
+    assert_eq!(teardown_deadline, base + Duration::from_millis(450));
+    elapsed_ms.set(449);
+    Backend::poll_deferred_input(&mut fixture.backend, &mut fixture.state);
+    assert_eq!(fixture.backend.platform.outputs.len(), 3);
+    elapsed_ms.set(450);
+    Backend::poll_deferred_input(&mut fixture.backend, &mut fixture.state);
+    assert!(fixture.backend.platform.outputs.is_empty());
     fixture.assert_cursor_quiescent();
+    let ledger = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
+    drop(fixture);
+    assert_eq!(ledger.end_state(), (0, 0, 0));
 }

@@ -2,6 +2,10 @@ use crate::{drm, kms::render::platform::PlatformBackend};
 use std::{io, rc::Rc};
 
 pub(in crate::kms::render) trait OutputPowerExecutor {
+    fn fallback_modeset_framebuffer(&self) -> Option<::drm::control::framebuffer::Handle> {
+        None
+    }
+
     fn disable(
         &self,
         device: &drm::Device,
@@ -48,26 +52,61 @@ impl OutputPowerExecutor for DrmOutputPowerExecutor {
 }
 
 #[cfg(test)]
-struct AcceptingOutputPowerExecutor;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OutputPowerRecord {
+    pub(crate) enabled: bool,
+    pub(crate) connector: ::drm::control::connector::Handle,
+    pub(crate) crtc: ::drm::control::crtc::Handle,
+    pub(crate) framebuffer: Option<::drm::control::framebuffer::Handle>,
+}
 
 #[cfg(test)]
-impl OutputPowerExecutor for AcceptingOutputPowerExecutor {
+#[derive(Default)]
+pub(crate) struct RecordingOutputPowerExecutor {
+    records: std::cell::RefCell<Vec<OutputPowerRecord>>,
+}
+
+#[cfg(test)]
+impl RecordingOutputPowerExecutor {
+    pub(crate) fn records(&self) -> Vec<OutputPowerRecord> {
+        self.records.borrow().clone()
+    }
+}
+
+#[cfg(test)]
+impl OutputPowerExecutor for RecordingOutputPowerExecutor {
+    fn fallback_modeset_framebuffer(&self) -> Option<::drm::control::framebuffer::Handle> {
+        Some(::drm::control::from_u32(0xF001).expect("synthetic test framebuffer"))
+    }
+
     fn disable(
         &self,
         _device: &drm::Device,
-        _output: &crate::platform::drm::Output,
+        output: &crate::platform::drm::Output,
         _services: &super::services::KmsServices,
     ) -> io::Result<()> {
+        self.records.borrow_mut().push(OutputPowerRecord {
+            enabled: false,
+            connector: output.connector,
+            crtc: output.crtc,
+            framebuffer: None,
+        });
         Ok(())
     }
 
     fn enable(
         &self,
         _device: &drm::Device,
-        _output: &crate::platform::drm::Output,
-        _framebuffer: ::drm::control::framebuffer::Handle,
+        output: &crate::platform::drm::Output,
+        framebuffer: ::drm::control::framebuffer::Handle,
         _services: &super::services::KmsServices,
     ) -> io::Result<()> {
+        self.records.borrow_mut().push(OutputPowerRecord {
+            enabled: true,
+            connector: output.connector,
+            crtc: output.crtc,
+            framebuffer: Some(framebuffer),
+        });
         Ok(())
     }
 }
@@ -226,7 +265,13 @@ impl PlatformBackend {
                                     })
                                 })
                         });
-                let Some((bo_idx, fb_id)) = front else {
+                let (bo_idx, fb_id) = if let Some((bo_idx, fb_id)) = front {
+                    (Some(bo_idx), fb_id)
+                } else if let Some(fb_id) =
+                    self.output_power_executor.fallback_modeset_framebuffer()
+                {
+                    (None, fb_id)
+                } else {
                     let error = io::Error::other(format!(
                         "dpms_set_outputs_active(true): no framebuffer for output {}; \
                          an ordinary page flip cannot restore MODE_ID/ACTIVE",
@@ -251,8 +296,10 @@ impl PlatformBackend {
                     if first_err.is_none() {
                         first_err = Some(e);
                     }
-                } else if let Some(scanout) = self.scanout_pools.get_mut(i).and_then(Option::as_mut)
-                {
+                } else if let (Some(bo_idx), Some(scanout)) = (
+                    bo_idx,
+                    self.scanout_pools.get_mut(i).and_then(Option::as_mut),
+                ) {
                     scanout.display_pool_mut().bos[bo_idx]
                         .state
                         .mark_on_screen_after_modeset();
@@ -309,6 +356,12 @@ impl PlatformBackend {
 
     #[cfg(test)]
     pub(crate) fn for_tests_accept_output_power_commits(&mut self) {
-        self.output_power_executor = Rc::new(AcceptingOutputPowerExecutor);
+        let executor = self
+            .services
+            .test_recorders
+            .as_ref()
+            .map(|recorders| Rc::clone(&recorders.output_power))
+            .unwrap_or_else(|| Rc::new(RecordingOutputPowerExecutor::default()));
+        self.output_power_executor = executor;
     }
 }

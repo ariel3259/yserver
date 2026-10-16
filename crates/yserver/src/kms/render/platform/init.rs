@@ -381,7 +381,12 @@ impl PlatformBackend {
                 );
                 continue;
             }
-            initialize_cursor_plane_for_device(kms_device, &crtcs, "active startup");
+            initialize_cursor_plane_for_device(
+                kms_device,
+                &crtcs,
+                "active startup",
+                services.cursor_plane_factory.as_ref(),
+            );
         }
 
         let rollback_atomic = Rc::clone(&services.atomic);

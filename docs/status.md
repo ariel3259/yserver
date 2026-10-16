@@ -33,26 +33,33 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
-- **2026-10-16 atomic-cursor-only A3:** cursor-plane discovery now
-  qualifies assigned CRTCs independently from the full ten-property atomic
-  set. Virtual drivers additionally require accepted hotspot-cap negotiation
-  and both hotspot properties; a physical driver's rejected cap does not
-  disqualify ordinary atomic properties. No-plane and unassigned outputs use
-  software, and pointer motion has no reachable legacy move route for them.
-  Full hotplug rescans compare per-device cursor/CRTC snapshots after the
-  debounce and refresh only changed device state after the all-off path; the
-  lightweight connector reprobe does not enumerate planes. The lavapipe
-  eligibility matrix passed 20/20 under 16 busy loops; the two-card
-  same-handle topology test passed 5/5 under the same load. All four requested
-  mutations failed their named assertions. Formatting, yserver build, both
-  workspace test suites (including all 168 ignored yserver library tests), the
-  191-test ignored render-acceptance suite, both Clippy gates, and layout check
-  passed. The lavapipe device exposed SYNC_FD, so no capability skips occurred.
-  Existing platform-state tests cover first-enable initialization and
-  last-disable/re-enable retention separately. The exact headless → active →
-  zero → active sequence is not covered end-to-end through Backend entries:
-  the test KMS device has no injectable successful modeset/property-query path.
-  No hardware was used; Task C11 owns hardware validation.
+- **2026-10-16 atomic-cursor-only A3 fix round 1:** the review gaps are closed.
+  `cursor_plane/topology.rs` now owns atomic cursor discovery, ten-property
+  qualification, virtual-driver hotspot checks, and exclusive CRTC matching.
+  No-plane and unassigned outputs use software composition, with the stale
+  optimistic legacy-probe documentation removed. Injectable cursor-plane,
+  CRTC-discovery, and output-power services let the tests exercise real
+  `Backend` lifecycle entries without hardware. The lifecycle test covers
+  headless → active → zero → active → zero, proves that a transient cursor
+  initialization error retries on the next active topology, checks exact
+  discovery/power calls, and ends with no cursor resources live. The eligibility
+  matrix checks the accepted software-cursor footprint for ineligible rows and
+  accepted hardware cursor properties plus framebuffer binding for eligible
+  rows. The motion regression now establishes visibility and exercises scene
+  flip retirement through `Backend`; the two-card topology test tears down
+  through the hotplug/debounce path. Under 16 busy loops, lifecycle and topology
+  each passed 5/5, while the lavapipe matrix, motion, and RandR modeset tests each
+  passed 20/20. Six mutations failed their named assertions and were reverted.
+  Nightly and stable formatting, yserver build, default and ignored workspace
+  suites, standalone default and ignored render-acceptance runs, both Clippy
+  gates, layout, and `git diff --check` passed. The lavapipe ignored workspace
+  run executed 169 yserver, 1 DRI3 fd-leak, 10 GLX TFP, 191 render-acceptance,
+  64 yserver-render, and 2 doctests with no failures. Stable `cargo fmt --all`
+  continues to report that two configured rustfmt options require nightly; the
+  required nightly formatter passes. One initial test link hit a full-filesystem
+  bus error; cleaning generated yserver Cargo artifacts and disabling
+  incremental compilation allowed the exact test suites to pass. No hardware
+  was used; Task C11 owns hardware validation.
 
 - **2026-10-16 atomic-cursor-only A2:** KMS `Device::open` now records
   hotspot-cap acceptance and the DRM driver name after requesting

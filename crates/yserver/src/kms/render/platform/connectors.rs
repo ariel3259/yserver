@@ -470,13 +470,21 @@ impl PlatformBackend {
         x: i32,
         y: i32,
     ) -> io::Result<()> {
+        let cursor_factory = Rc::clone(&self.services.cursor_plane_factory);
         self.enable_connector_with_cursor_factory(
             output_key,
             output,
             mode_spec,
             x,
             y,
-            initialize_cursor_plane_for_device,
+            move |device, crtcs, boundary| {
+                initialize_cursor_plane_for_device(
+                    device,
+                    crtcs,
+                    boundary,
+                    cursor_factory.as_ref(),
+                );
+            },
         )
     }
 
@@ -651,6 +659,7 @@ impl PlatformBackend {
             scanout_route,
             pool,
         } = prepared;
+        let cursor_factory = Rc::clone(&self.services.cursor_plane_factory);
         self.enable_connector_inner(
             &output_key,
             output,
@@ -658,7 +667,14 @@ impl PlatformBackend {
             x,
             y,
             Some((scanout_route, pool)),
-            initialize_cursor_plane_for_device,
+            move |device, crtcs, boundary| {
+                initialize_cursor_plane_for_device(
+                    device,
+                    crtcs,
+                    boundary,
+                    cursor_factory.as_ref(),
+                );
+            },
         )
     }
 
@@ -875,6 +891,7 @@ impl PlatformBackend {
                         .and_then(|bo| bo.fb_handle)
                         .or_else(|| pool.bos.iter().find_map(|bo| bo.fb_handle))
                 })
+                .or_else(|| self.output_power_executor.fallback_modeset_framebuffer())
                 .ok_or_else(|| {
                     io::Error::other(format!(
                         "enable_connector {connector}: no fb handle available for initial modeset"
@@ -884,13 +901,9 @@ impl PlatformBackend {
 
         // Commit the modeset.  On failure, pool is freed (dropped below).
         if new_pool_committed_framebuffer.is_none()
-            && let Err(e) = crate::drm::modeset::commit_modeset_with_io(
-                &device,
-                &output,
-                fb_for_commit,
-                self.services.mode_blobs.as_ref(),
-                self.services.atomic.as_ref(),
-            )
+            && let Err(e) =
+                self.output_power_executor
+                    .enable(&device, &output, fb_for_commit, &self.services)
         {
             log::error!(
                 "render enable_connector: commit_modeset for {connector} ({}×{}@{}) at ({x},{y}) failed: {e}",

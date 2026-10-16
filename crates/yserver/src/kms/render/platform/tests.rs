@@ -1739,43 +1739,6 @@ fn cursor_capacity_is_evaluated_per_card() {
 }
 
 #[test]
-fn cursor_plane_without_required_properties_is_not_eligible() {
-    let mut platform = PlatformBackend::for_tests();
-    let crtc = platform.outputs[0].output.crtc;
-    let plane = crate::kms::cursor_plane::CursorPlane::for_tests_stub(
-        Rc::clone(&platform.devices[0].device),
-        64,
-        64,
-    );
-    install_cursor_plane_for_device(&mut platform.devices[0], &[crtc], "incomplete plane", plane);
-
-    assert!(platform.devices[0].cursor.plane.is_some());
-    assert!(!platform.cursor_plane_available_for_output(0));
-
-    platform.devices[0]
-        .cursor
-        .plane
-        .as_mut()
-        .expect("installed cursor plane")
-        .for_tests_set_atomic_position_properties(
-            crtc,
-            ::drm::control::from_u32(21).unwrap(),
-            ::drm::control::from_u32(31).unwrap(),
-            ::drm::control::from_u32(32).unwrap(),
-        );
-    assert!(platform.cursor_plane_available_for_output(0));
-    assert!(
-        platform.devices[0]
-            .cursor
-            .plane
-            .as_ref()
-            .and_then(|plane| plane.properties_for(crtc))
-            .is_some()
-    );
-    assert_eq!(platform.devices[0].cursor.cursor_topology_epoch, 1);
-}
-
-#[test]
 fn topology_refresh_on_card_b_preserves_card_a_cursor_retry_state() {
     let mut platform = PlatformBackend::for_tests();
     let card_a = platform.devices[0].key;
