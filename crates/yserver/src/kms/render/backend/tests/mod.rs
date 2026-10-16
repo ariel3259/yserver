@@ -1,4 +1,5 @@
 mod atomic_cursor;
+mod atomic_cursor_only;
 mod crossings;
 mod cursor;
 mod deadlines;
@@ -194,6 +195,8 @@ fn push_test_device(backend: &mut KmsBackend, key: DrmDeviceKey) {
             page_flip_event_source: std::rc::Rc::new(
                 crate::kms::render::platform::flip_events::DrmPageFlipEventSource,
             ),
+            cursor_buffer_io: std::rc::Rc::new(crate::kms::cursor_plane::ops::DrmCursorBufferIo),
+            legacy_cursor_io: std::rc::Rc::new(crate::kms::cursor_plane::ops::DrmLegacyCursorIo),
             test_page_flip_event_source: None,
             cursor: crate::kms::render::platform::KmsCursorState::new(),
         });

@@ -131,7 +131,6 @@ impl PageFlipEventSource for DrmPageFlipEventSource {
     }
 }
 
-#[cfg(test)]
 #[derive(Default)]
 pub(crate) struct RecordingPageFlipEventSource {
     flips: std::cell::RefCell<std::collections::VecDeque<KernelPageFlip>>,
@@ -139,7 +138,6 @@ pub(crate) struct RecordingPageFlipEventSource {
     delayed_ready_checks: std::cell::Cell<usize>,
 }
 
-#[cfg(test)]
 impl RecordingPageFlipEventSource {
     pub(crate) fn queue_flip(&self, crtc: ::drm::control::crtc::Handle, frame: u32) {
         self.queue_flip_at(crtc, frame, std::time::Duration::ZERO);
@@ -198,7 +196,6 @@ impl RecordingPageFlipEventSource {
     }
 }
 
-#[cfg(test)]
 impl PageFlipEventSource for RecordingPageFlipEventSource {
     fn drain_events(
         &self,
@@ -242,9 +239,9 @@ impl PlatformBackend {
         for device in &self.devices {
             fds.push((device.device.as_fd().as_raw_fd(), BackendFdKind::Drm));
         }
-        #[cfg(target_os = "linux")]
-        if let Some(mon) = self.hotplug_monitor.as_ref() {
-            fds.push((mon.raw_fd(), BackendFdKind::DrmHotplug));
+        let hotplug_fd = self.services.hotplug.raw_fd();
+        if hotplug_fd >= 0 {
+            fds.push((hotplug_fd, BackendFdKind::DrmHotplug));
         }
         // Stage 5 Task 6.1: stable inner epfd for deferred PRESENT
         // completion. Always present.

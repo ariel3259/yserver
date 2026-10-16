@@ -151,6 +151,7 @@ pub(crate) struct PlatformInitDevice {
 /// secondary entries exist for provider identity and later device routing.
 /// Empty `devices` and `layouts` is a valid zero-card headless platform.
 pub(crate) struct PlatformInit {
+    pub(crate) services: crate::kms::render::platform::services::KmsServices,
     pub(crate) devices: Vec<PlatformInitDevice>,
     /// Selected render endpoint, separate from the KMS-device inventory.
     /// `None` is valid for headless startup or unavailable DRI3.
@@ -190,11 +191,7 @@ fn render_node_for_device(
 fn activate_initial_scanout_outputs(
     device_key: crate::platform::drm::DrmDeviceKey,
     device: &Rc<drm::Device>,
-    commit: fn(
-        &crate::drm::Device,
-        &crate::platform::drm::Output,
-        ::drm::control::framebuffer::Handle,
-    ) -> io::Result<()>,
+    services: &crate::kms::render::platform::services::KmsServices,
 ) -> io::Result<Vec<PlatformInitOutput>> {
     let outputs = crate::platform::drm::discover_outputs(device)?;
     if !outputs.is_empty() {
@@ -229,7 +226,13 @@ fn activate_initial_scanout_outputs(
             break;
         }
         let initial_fb = buffers[0].fb_id();
-        if let Err(err) = commit(device, &output, initial_fb) {
+        if let Err(err) = crate::drm::modeset::commit_modeset_with_io(
+            device,
+            &output,
+            initial_fb,
+            services.mode_blobs.as_ref(),
+            services.atomic.as_ref(),
+        ) {
             bring_up_err = Some(err);
             break;
         }
@@ -241,7 +244,11 @@ fn activate_initial_scanout_outputs(
     }
     if let Some(err) = bring_up_err {
         for done in layouts.iter_mut().rev() {
-            if let Err(disable_err) = drm::modeset::disable_output(device, &done.output) {
+            if let Err(disable_err) = drm::modeset::disable_output_with_executor(
+                device,
+                &done.output,
+                services.atomic.as_ref(),
+            ) {
                 log::warn!(
                     "initial scanout rollback: failed to disable {}: {disable_err}; \
                      leaving its buffers for DRM-fd close",
@@ -292,11 +299,7 @@ fn validate_unique_kms_device_identity(
 /// committed gets disabled before returning so the next caller starts clean.
 pub(crate) fn platform_init(
     device_paths: &[PathBuf],
-    commit: fn(
-        &crate::drm::Device,
-        &crate::platform::drm::Output,
-        ::drm::control::framebuffer::Handle,
-    ) -> io::Result<()>,
+    services: crate::kms::render::platform::services::KmsServices,
 ) -> io::Result<PlatformInit> {
     let mut devices = Vec::with_capacity(device_paths.len());
     let mut opened_device_paths = Vec::with_capacity(device_paths.len());
@@ -342,7 +345,7 @@ pub(crate) fn platform_init(
     // the primary was already scanning out, bypassing the renderer's
     // construction-wide rollback guard.
     if let Some(primary) = devices.first() {
-        layouts = activate_initial_scanout_outputs(primary.key, &primary.device, commit)?;
+        layouts = activate_initial_scanout_outputs(primary.key, &primary.device, &services)?;
     }
 
     if devices.is_empty() {
@@ -381,6 +384,7 @@ pub(crate) fn platform_init(
     };
 
     Ok(PlatformInit {
+        services,
         devices,
         render_node,
         layouts,
@@ -393,14 +397,6 @@ pub(crate) fn platform_init(
 #[cfg(test)]
 mod platform_init_tests {
     use super::*;
-
-    fn unused_commit(
-        _device: &crate::drm::Device,
-        _output: &crate::platform::drm::Output,
-        _fb: ::drm::control::framebuffer::Handle,
-    ) -> io::Result<()> {
-        unreachable!("a zero-device platform must not commit an output")
-    }
 
     #[test]
     fn duplicate_kms_identity_rejects_distinct_alias_paths() {
@@ -435,8 +431,11 @@ mod platform_init_tests {
 
     #[test]
     fn accepts_empty_device_list_as_headless() {
-        let init = platform_init(&[], unused_commit)
-            .expect("an empty DRM device list should produce a headless platform");
+        let init = platform_init(
+            &[],
+            crate::kms::render::platform::services::KmsServices::for_tests(),
+        )
+        .expect("an empty DRM device list should produce a headless platform");
         assert!(init.devices.is_empty());
         assert!(init.layouts.is_empty());
         assert_eq!((init.fb_w, init.fb_h), (0, 0));
@@ -449,8 +448,11 @@ mod platform_init_tests {
             std::env::temp_dir().join(format!("yserver-missing-drm-{suffix}-a")),
             std::env::temp_dir().join(format!("yserver-missing-drm-{suffix}-b")),
         ];
-        let init = platform_init(&paths, unused_commit)
-            .expect("missing DRM paths should produce a headless platform");
+        let init = platform_init(
+            &paths,
+            crate::kms::render::platform::services::KmsServices::for_tests(),
+        )
+        .expect("missing DRM paths should produce a headless platform");
         assert!(init.devices.is_empty());
         assert!(init.layouts.is_empty());
         assert_eq!((init.fb_w, init.fb_h), (0, 0));

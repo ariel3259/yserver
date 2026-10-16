@@ -1832,19 +1832,10 @@ impl KmsBackend {
         &mut self,
         _state: &mut ServerState,
     ) {
-        #[cfg(target_os = "linux")]
-        {
-            let saw_change = self
-                .platform
-                .hotplug_monitor
-                .as_mut()
-                .map(|monitor| monitor.drain())
-                .unwrap_or(false);
-            if saw_change {
-                self.pstate.hotplug_rescan_deadline =
-                    Some(std::time::Instant::now() + std::time::Duration::from_millis(150));
-                log::debug!("kms: display hotplug edge — rescan armed (+150ms)");
-            }
+        if self.platform.services.hotplug.drain_changes() {
+            self.pstate.hotplug_rescan_deadline =
+                Some(self.monotonic_now() + std::time::Duration::from_millis(150));
+            log::debug!("kms: display hotplug edge — rescan armed (+150ms)");
         }
     }
 

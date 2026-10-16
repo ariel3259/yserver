@@ -527,6 +527,8 @@ fn test_kms_device(key: crate::platform::drm::DrmDeviceKey) -> KmsDevice {
             crate::drm::atomic::DrmAtomicCommitExecutor,
         ))),
         page_flip_event_source: Rc::new(flip_events::DrmPageFlipEventSource),
+        cursor_buffer_io: Rc::new(crate::kms::cursor_plane::ops::DrmCursorBufferIo),
+        legacy_cursor_io: Rc::new(crate::kms::cursor_plane::ops::DrmLegacyCursorIo),
         test_page_flip_event_source: None,
         cursor: KmsCursorState::new(),
     }
@@ -1118,6 +1120,8 @@ fn cursor_route_qualifies_colliding_raw_crtcs_by_device() {
             crate::drm::atomic::DrmAtomicCommitExecutor,
         ))),
         page_flip_event_source: Rc::new(flip_events::DrmPageFlipEventSource),
+        cursor_buffer_io: Rc::new(crate::kms::cursor_plane::ops::DrmCursorBufferIo),
+        legacy_cursor_io: Rc::new(crate::kms::cursor_plane::ops::DrmLegacyCursorIo),
         test_page_flip_event_source: None,
         cursor: KmsCursorState::new(),
     });
@@ -1144,6 +1148,8 @@ fn drm_device_fd_lookup_distinguishes_same_kind_poll_sources() {
             crate::drm::atomic::DrmAtomicCommitExecutor,
         ))),
         page_flip_event_source: Rc::new(flip_events::DrmPageFlipEventSource),
+        cursor_buffer_io: Rc::new(crate::kms::cursor_plane::ops::DrmCursorBufferIo),
+        legacy_cursor_io: Rc::new(crate::kms::cursor_plane::ops::DrmLegacyCursorIo),
         test_page_flip_event_source: None,
         cursor: KmsCursorState::new(),
     });

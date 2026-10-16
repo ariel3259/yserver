@@ -1,3 +1,5 @@
+#[cfg(not(test))]
+use crate::kms::render::platform::flip_events::DrmPageFlipEventSource;
 use crate::{
     drm,
     kms::{
@@ -10,7 +12,7 @@ use crate::{
             InitialScanoutRollbackGuard, KmsCursorState, KmsDevice, PlatformBackend, RenderDevice,
             RollbackScanoutOutput, SCANOUT_POOL_DEPTH, WAKEUP_EVENTFD_TOKEN,
             cursor::initialize_cursor_plane_for_device,
-            flip_events::{DrmPageFlipEventSource, PageFlipEventSource},
+            flip_events::PageFlipEventSource,
             qualify::{
                 allocate_copied_scanout_pool, allocate_copy_free_scanout_pool,
                 route_requires_copy_free_probe,
@@ -280,11 +282,11 @@ impl Drop for PlatformBackend {
         if !self.initial_scanout_rollback_armed {
             return;
         }
-        rollback_initial_scanout_with(
-            &self.devices,
-            &mut self.outputs,
-            &mut drm::modeset::disable_output,
-        );
+        let atomic = Rc::clone(&self.services.atomic);
+        let mut disable = |device: &drm::Device, output: &crate::platform::drm::Output| {
+            drm::modeset::disable_output_with_executor(device, output, atomic.as_ref())
+        };
+        rollback_initial_scanout_with(&self.devices, &mut self.outputs, &mut disable);
         self.initial_scanout_rollback_armed = false;
     }
 }
@@ -309,24 +311,20 @@ impl PlatformBackend {
     /// failures from `OpsCommandPool::new`. An individual `ScanoutBoPool`
     /// failure is non-fatal while another output remains displayable; startup
     /// fails if every connected output lacks a live pool.
-    pub(crate) fn open_with_commit(
+    pub(crate) fn open_with_services(
         device_paths: &[PathBuf],
-        commit: fn(
-            &drm::Device,
-            &crate::platform::drm::Output,
-            ::drm::control::framebuffer::Handle,
-        ) -> io::Result<()>,
+        services: super::services::KmsServices,
     ) -> io::Result<Self> {
         // `core_platform_init` runs the hardware-Vulkan preflight after it
         // discovers an active output but before allocating or committing
         // scanout. Headless platforms skip it and may use software Vulkan.
-        let platform_init = core_platform_init(device_paths, commit)?;
+        let platform_init = core_platform_init(device_paths, services)?;
         Self::from_platform_init(platform_init)
     }
 
     /// Shared bring-up body: Vk + pools + epoll + cursor plane init
     /// from a pre-built [`PlatformInit`]. Called by
-    /// [`open_with_commit`] (Direct mode — the only mode).
+    /// [`open_with_services`] (Direct mode — the only mode).
     fn from_platform_init(platform_init: PlatformInit) -> io::Result<Self> {
         let PlatformInit {
             devices,
@@ -335,6 +333,7 @@ impl PlatformBackend {
             fb_w,
             fb_h,
             input_ctx,
+            services,
         } = platform_init;
 
         let mut devices: Vec<KmsDevice> = devices
@@ -354,9 +353,11 @@ impl PlatformBackend {
                     device: device.device,
                     async_page_flip,
                     atomic_commit_sink: Rc::new(crate::drm::atomic::AtomicCommitSink::new(
-                        Rc::new(crate::drm::atomic::DrmAtomicCommitExecutor),
+                        Rc::clone(&services.atomic),
                     )),
-                    page_flip_event_source: Rc::new(DrmPageFlipEventSource),
+                    page_flip_event_source: Rc::clone(&services.page_flip_events),
+                    cursor_buffer_io: Rc::clone(&services.cursor_buffers),
+                    legacy_cursor_io: Rc::clone(&services.legacy_cursor),
                     #[cfg(test)]
                     test_page_flip_event_source: None,
                     cursor,
@@ -383,11 +384,11 @@ impl PlatformBackend {
             initialize_cursor_plane_for_device(kms_device, &crtcs, "active startup");
         }
 
-        let mut initial_scanout_rollback = InitialScanoutRollbackGuard::new_with(
-            &devices,
-            &mut layouts,
-            drm::modeset::disable_output,
-        );
+        let rollback_atomic = Rc::clone(&services.atomic);
+        let mut initial_scanout_rollback =
+            InitialScanoutRollbackGuard::new_with(&devices, &mut layouts, move |device, output| {
+                drm::modeset::disable_output_with_executor(device, output, rollback_atomic.as_ref())
+            });
 
         let requested_render_node = render_node.as_ref().map(|node| node.key());
         let vk_result = devices.first().map_or_else(VkContext::new, |display| {
@@ -674,21 +675,6 @@ impl PlatformBackend {
         let scanout_render_completion_epfd =
             crate::kms::render::completion_poller::CompletionPoller::new()?;
 
-        #[cfg(target_os = "linux")]
-        let hotplug_monitor = match crate::kms::hotplug::DrmHotplugMonitor::new() {
-            Ok(monitor) => monitor,
-            Err(e) => {
-                // Don't fail bring-up — yserver runs fine without runtime
-                // hotplug — but surface WHY (udev/netlink/permission) so a
-                // silently-disabled monitor is diagnosable.
-                log::warn!(
-                    "render PlatformBackend: DRM hotplug monitor unavailable ({e}); \
-                     runtime display hotplug disabled"
-                );
-                None
-            }
-        };
-
         log::info!(
             "render PlatformBackend: ready — {} outputs, fb {}x{}, {} scanout pools live",
             initial_scanout_rollback.outputs().len(),
@@ -719,6 +705,7 @@ impl PlatformBackend {
         Ok(Self {
             initial_scanout_rollback_armed,
             devices,
+            services,
             tearing_on: false,
             tearing_copy_received_at: None,
             tearing_copy_received_monotonic: None,
@@ -740,8 +727,6 @@ impl PlatformBackend {
             scene_flip_timings: Vec::new(),
             scene_cursor_hide_failed: false,
             input_ctx,
-            #[cfg(target_os = "linux")]
-            hotplug_monitor,
             present_completion_epfd,
             wakeup_eventfd,
             scanout_render_completion_epfd,
@@ -778,8 +763,7 @@ impl PlatformBackend {
         let scanout_render_completion_epfd =
             crate::kms::render::completion_poller::CompletionPoller::new()
                 .expect("test scanout completion poller");
-        #[cfg(target_os = "linux")]
-        let hotplug_monitor = None;
+        let services = super::services::KmsServices::for_tests();
         let device_key = crate::platform::drm::DrmDeviceKey { major: 0, minor: 0 };
         let test_route = ScanoutRoute::new(
             RenderDeviceId::UnverifiedFallback,
@@ -788,8 +772,13 @@ impl PlatformBackend {
         );
         let device = Rc::new(drm::Device::for_tests().expect("test drm device"));
         #[cfg(test)]
-        let test_page_flip_event_source =
-            Rc::new(super::flip_events::RecordingPageFlipEventSource::default());
+        let test_page_flip_event_source = Rc::clone(
+            &services
+                .test_recorders
+                .as_ref()
+                .expect("test services have recording dependencies")
+                .page_flip_events,
+        );
         #[cfg(test)]
         let page_flip_event_source: Rc<dyn PageFlipEventSource> =
             test_page_flip_event_source.clone();
@@ -801,14 +790,17 @@ impl PlatformBackend {
                 key: device_key,
                 device,
                 async_page_flip: false,
-                atomic_commit_sink: Rc::new(crate::drm::atomic::AtomicCommitSink::new(Rc::new(
-                    crate::drm::atomic::DrmAtomicCommitExecutor,
+                atomic_commit_sink: Rc::new(crate::drm::atomic::AtomicCommitSink::new(Rc::clone(
+                    &services.atomic,
                 ))),
                 page_flip_event_source,
+                cursor_buffer_io: Rc::clone(&services.cursor_buffers),
+                legacy_cursor_io: Rc::clone(&services.legacy_cursor),
                 #[cfg(test)]
                 test_page_flip_event_source: Some(test_page_flip_event_source),
                 cursor: KmsCursorState::new(),
             }],
+            services,
             tearing_on: false,
             tearing_copy_received_at: None,
             tearing_copy_received_monotonic: None,
@@ -877,8 +869,6 @@ impl PlatformBackend {
             scene_flip_timings: Vec::new(),
             scene_cursor_hide_failed: false,
             input_ctx: None,
-            #[cfg(target_os = "linux")]
-            hotplug_monitor,
             present_completion_epfd,
             wakeup_eventfd,
             scanout_render_completion_epfd,

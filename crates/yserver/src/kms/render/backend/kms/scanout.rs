@@ -525,8 +525,7 @@ impl KmsBackend {
         frame: &mut DirectPresentFrame,
         timing: crate::drm::async_flip::FlipTiming,
     ) -> io::Result<crate::drm::async_flip::AsyncOutcome> {
-        let submitter = self.pstate.direct_frame_submitter;
-        submitter(self, frame, timing)
+        self.submit_direct_frame_live(frame, timing)
     }
 
     pub(in crate::kms::render::backend) fn submit_direct_frame_live(
@@ -668,17 +667,6 @@ impl KmsBackend {
         frame.awaiting_outputs = (0..self.platform.outputs.len()).collect();
         frame.async_outcome = async_outcome;
         Ok(async_outcome)
-    }
-
-    #[cfg(test)]
-    pub(in crate::kms::render::backend) fn submit_direct_frame_for_tests(
-        backend: &mut KmsBackend,
-        frame: &mut DirectPresentFrame,
-        _timing: crate::drm::async_flip::FlipTiming,
-    ) -> io::Result<crate::drm::async_flip::AsyncOutcome> {
-        frame.awaiting_outputs = (0..backend.platform.outputs.len()).collect();
-        frame.async_outcome = crate::drm::async_flip::AsyncOutcome::NotRequested;
-        Ok(crate::drm::async_flip::AsyncOutcome::NotRequested)
     }
 
     pub(super) fn direct_frame_flip_timing(

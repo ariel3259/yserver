@@ -9,8 +9,7 @@ use drm::{
     buffer::{DrmFourcc, DrmModifier, Handle as DrmBufferHandle, PlanarBuffer},
     control::{
         AtomicCommitFlags, Device as ControlDevice, FbCmd2Flags, Mode as DrmMode, ModeTypeFlags,
-        PlaneType, ResourceHandles, atomic::AtomicModeReq, connector, crtc, encoder, framebuffer,
-        plane, property,
+        PlaneType, ResourceHandles, connector, crtc, encoder, framebuffer, plane, property,
     },
 };
 use yserver_core::backend::ModeSpec;
@@ -18,9 +17,10 @@ use yserver_core::backend::ModeSpec;
 use crate::drm::{
     Device,
     atomic::{
-        AtomicCommitEvent, AtomicCommitKind, AtomicCommitRequest, AtomicCommitSink,
-        CursorPlanePosition,
+        AtomicCommitEvent, AtomicCommitExecutor, AtomicCommitKind, AtomicCommitRequest,
+        AtomicCommitSink, CursorPlanePosition,
     },
+    io::{DrmModeBlobIo, ModeBlobIo},
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1136,18 +1136,32 @@ impl PropMap {
 }
 
 pub fn disable_output(device: &Device, output: &Output) -> io::Result<()> {
+    disable_output_with_executor(device, output, &crate::drm::atomic::DrmAtomicCommitExecutor)
+}
+
+pub(crate) fn disable_output_with_executor(
+    device: &Device,
+    output: &Output,
+    executor: &dyn AtomicCommitExecutor,
+) -> io::Result<()> {
     let connector_props = PropMap::for_object(device, output.connector)?;
     let crtc_props = PropMap::for_object(device, output.crtc)?;
 
-    let mut req = AtomicModeReq::new();
+    let mut req = AtomicCommitRequest::new();
     req.add_raw_property(output.plane.into(), output.plane_fb_id_prop, 0);
     req.add_raw_property(output.plane.into(), output.plane_crtc_id_prop, 0);
     req.add_raw_property(output.crtc.into(), crtc_props.id("ACTIVE")?, 0);
     req.add_raw_property(output.crtc.into(), crtc_props.id("MODE_ID")?, 0);
     req.add_raw_property(output.connector.into(), connector_props.id("CRTC_ID")?, 0);
 
-    device
-        .atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req)
+    executor
+        .atomic_commit(
+            device,
+            AtomicCommitFlags::ALLOW_MODESET,
+            AtomicCommitKind::Scene,
+            req,
+            &[],
+        )
         .map_err(|err| {
             io::Error::new(
                 err.kind(),
@@ -1161,12 +1175,30 @@ pub fn commit_modeset(
     output: &Output,
     fb_id: framebuffer::Handle,
 ) -> io::Result<()> {
+    commit_modeset_with_io(
+        device,
+        output,
+        fb_id,
+        &DrmModeBlobIo,
+        &crate::drm::atomic::DrmAtomicCommitExecutor,
+    )
+}
+
+pub(crate) fn commit_modeset_with_io(
+    device: &Device,
+    output: &Output,
+    fb_id: framebuffer::Handle,
+    mode_blobs: &dyn ModeBlobIo,
+    executor: &dyn AtomicCommitExecutor,
+) -> io::Result<()> {
     finish_best_effort_modeset(modeset_with_flags(
         device,
         output,
         fb_id,
         AtomicCommitFlags::ALLOW_MODESET,
         "atomic modeset commit",
+        mode_blobs,
+        executor,
     )?)
 }
 
@@ -1177,12 +1209,30 @@ pub(crate) fn test_modeset(
     output: &Output,
     fb_id: framebuffer::Handle,
 ) -> io::Result<()> {
+    test_modeset_with_io(
+        device,
+        output,
+        fb_id,
+        &DrmModeBlobIo,
+        &crate::drm::atomic::DrmAtomicCommitExecutor,
+    )
+}
+
+pub(crate) fn test_modeset_with_io(
+    device: &Device,
+    output: &Output,
+    fb_id: framebuffer::Handle,
+    mode_blobs: &dyn ModeBlobIo,
+    executor: &dyn AtomicCommitExecutor,
+) -> io::Result<()> {
     finish_best_effort_modeset(modeset_with_flags(
         device,
         output,
         fb_id,
         AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::TEST_ONLY,
         "atomic modeset TEST_ONLY",
+        mode_blobs,
+        executor,
     )?)
 }
 
@@ -1227,12 +1277,30 @@ pub(crate) fn test_modeset_strict(
     output: &Output,
     fb_id: framebuffer::Handle,
 ) -> Result<(), StrictTestModesetError> {
+    test_modeset_strict_with_io(
+        device,
+        output,
+        fb_id,
+        &DrmModeBlobIo,
+        &crate::drm::atomic::DrmAtomicCommitExecutor,
+    )
+}
+
+pub(crate) fn test_modeset_strict_with_io(
+    device: &Device,
+    output: &Output,
+    fb_id: framebuffer::Handle,
+    mode_blobs: &dyn ModeBlobIo,
+    executor: &dyn AtomicCommitExecutor,
+) -> Result<(), StrictTestModesetError> {
     let attempt = modeset_with_flags(
         device,
         output,
         fb_id,
         AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::TEST_ONLY,
         "atomic modeset TEST_ONLY",
+        mode_blobs,
+        executor,
     )
     .map_err(|source| StrictTestModesetError {
         source,
@@ -1252,6 +1320,8 @@ fn modeset_with_flags(
     fb_id: framebuffer::Handle,
     flags: AtomicCommitFlags,
     operation: &str,
+    mode_blobs: &dyn ModeBlobIo,
+    executor: &dyn AtomicCommitExecutor,
 ) -> io::Result<ModesetWithBlobResult> {
     let connector_props = PropMap::for_object(device, output.connector)?;
     let crtc_props = PropMap::for_object(device, output.crtc)?;
@@ -1275,8 +1345,7 @@ fn modeset_with_flags(
     let plane_crtc_w_prop = plane_props.id("CRTC_W")?;
     let plane_crtc_h_prop = plane_props.id("CRTC_H")?;
 
-    let mode_blob = device.create_property_blob(&output.mode)?;
-    let mode_blob_raw: u64 = mode_blob.into();
+    let mode_blob_raw = mode_blobs.create_property_blob(device, &output.mode)?;
 
     let crtc_id_raw: u32 = output.crtc.into();
     let plane_crtc_raw: u32 = output.crtc.into();
@@ -1285,7 +1354,7 @@ fn modeset_with_flags(
     let src_w = u64::from(mode_w) << 16;
     let src_h = u64::from(mode_h) << 16;
 
-    let mut req = AtomicModeReq::new();
+    let mut req = AtomicCommitRequest::new();
     req.add_raw_property(
         output.connector.into(),
         connector_crtc_id_prop,
@@ -1308,21 +1377,25 @@ fn modeset_with_flags(
     req.add_raw_property(output.plane.into(), plane_crtc_w_prop, u64::from(mode_w));
     req.add_raw_property(output.plane.into(), plane_crtc_h_prop, u64::from(mode_h));
 
-    let atomic = device.atomic_commit(flags, req).map_err(|err| {
-        io::Error::new(
-            err.kind(),
-            format!(
-                "{operation} rejected (mode {}, {}x{}): {err}",
-                output.picked.name, output.picked.width, output.picked.height
-            ),
-        )
-    });
-    let blob_cleanup = device.destroy_property_blob(mode_blob_raw).map_err(|err| {
-        io::Error::new(
-            err.kind(),
-            format!("{operation} could not destroy mode blob {mode_blob_raw}: {err}"),
-        )
-    });
+    let atomic = executor
+        .atomic_commit(device, flags, AtomicCommitKind::Scene, req, &[])
+        .map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!(
+                    "{operation} rejected (mode {}, {}x{}): {err}",
+                    output.picked.name, output.picked.width, output.picked.height
+                ),
+            )
+        });
+    let blob_cleanup = mode_blobs
+        .destroy_property_blob(device, mode_blob_raw)
+        .map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!("{operation} could not destroy mode blob {mode_blob_raw}: {err}"),
+            )
+        });
     Ok(ModesetWithBlobResult {
         atomic,
         blob_cleanup,

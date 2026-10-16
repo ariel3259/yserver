@@ -5493,6 +5493,8 @@ fn present_capabilities_follow_the_windows_output_device() {
             page_flip_event_source: Rc::new(
                 crate::kms::render::platform::flip_events::DrmPageFlipEventSource,
             ),
+            cursor_buffer_io: Rc::new(crate::kms::cursor_plane::ops::DrmCursorBufferIo),
+            legacy_cursor_io: Rc::new(crate::kms::cursor_plane::ops::DrmLegacyCursorIo),
             #[cfg(test)]
             test_page_flip_event_source: None,
             cursor: crate::kms::render::platform::KmsCursorState::new(),

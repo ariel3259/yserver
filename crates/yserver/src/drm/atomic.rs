@@ -1239,10 +1239,12 @@ fn flip_latency_percentiles(values: &[u64]) -> (String, String, String) {
     (p50.to_string(), p99.to_string(), max.to_string())
 }
 
-#[cfg(test)]
 #[allow(dead_code)]
 pub(crate) mod tests_support {
-    use super::*;
+    use super::{
+        AtomicCommitEvent, AtomicCommitExecutor, AtomicCommitFlags, AtomicCommitKind,
+        AtomicCommitRequest, AtomicPropertyUpdate, Device, RefCell, io,
+    };
     use std::collections::VecDeque;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]

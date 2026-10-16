@@ -1,17 +1,14 @@
-use crate::{
-    drm,
-    kms::{
-        core::KmsCore,
-        render::{
-            backend::{
-                CrtcConfigProbeExecutor, KmsBackend, KmsBackendState, RandrIdAllocator,
-                ScanoutM0Telemetry, ScanoutM1ProbeCache, ScanoutM2State, Tearing,
-                kms::export::probe_dmabuf_export_support,
-            },
-            engine::RenderEngine,
-            platform::PlatformBackend,
-            scene::SceneCompositor,
+use crate::kms::{
+    core::KmsCore,
+    render::{
+        backend::{
+            CrtcConfigProbeExecutor, KmsBackend, KmsBackendState, RandrIdAllocator,
+            ScanoutM0Telemetry, ScanoutM1ProbeCache, ScanoutM2State, Tearing,
+            kms::export::probe_dmabuf_export_support,
         },
+        engine::RenderEngine,
+        platform::PlatformBackend,
+        scene::SceneCompositor,
     },
 };
 use std::{
@@ -94,32 +91,28 @@ impl KmsBackend {
     /// # Errors
     ///
     /// Propagates DRM / Vk / libinput init failures from
-    /// `PlatformBackend::open_with_commit`, plus FontLoader / XKB
+    /// `PlatformBackend::open_with_services`, plus FontLoader / XKB
     /// init failures from `KmsCore::new`.
     pub fn open(
         device_paths: &[std::path::PathBuf],
         console_guard: crate::kms::ConsoleGuardOpt,
         layout: Option<String>,
     ) -> io::Result<Self> {
-        Self::open_with_commit(
+        Self::open_with_services(
             device_paths,
             console_guard,
             layout,
-            drm::modeset::commit_modeset,
+            crate::kms::render::platform::services::KmsServices::production(),
         )
     }
 
-    fn open_with_commit(
+    pub fn open_with_services(
         device_paths: &[std::path::PathBuf],
         console_guard: crate::kms::ConsoleGuardOpt,
         layout: Option<String>,
-        commit: fn(
-            &crate::drm::Device,
-            &crate::platform::drm::Output,
-            ::drm::control::framebuffer::Handle,
-        ) -> io::Result<()>,
+        services: crate::kms::render::platform::services::KmsServices,
     ) -> io::Result<Self> {
-        let platform = PlatformBackend::open_with_commit(device_paths, commit)?;
+        let platform = PlatformBackend::open_with_services(device_paths, services)?;
         let (fb_w, fb_h) = (platform.fb_w, platform.fb_h);
         let mut core = KmsCore::new(fb_w, fb_h, layout)?;
         // Warp the pointer to the centre of the primary output at startup
@@ -147,9 +140,8 @@ impl KmsBackend {
             scanout_m1: ScanoutM1ProbeCache::new(),
             scanout_m2: ScanoutM2State::new(),
             tearing: Tearing::new(),
-            direct_frame_submitter: KmsBackend::submit_direct_frame_live,
             vt_resume_executor: std::rc::Rc::new(DrmVtResumeExecutor),
-            monotonic_clock: std::rc::Rc::new(std::time::Instant::now),
+            monotonic_clock: std::rc::Rc::clone(&platform.services.monotonic_clock),
             armed_vblank_targets: std::collections::HashMap::new(),
             absolute_vblank_targets: std::collections::HashMap::new(),
             crtc_queue_sequence_unsupported_devices: HashSet::new(),
@@ -872,7 +864,7 @@ impl KmsBackend {
         state: &mut ServerState,
     ) {
         if let Some(deadline) = self.pstate.hotplug_rescan_deadline
-            && std::time::Instant::now() >= deadline
+            && self.monotonic_now() >= deadline
         {
             self.pstate.hotplug_rescan_deadline = None;
             self.run_display_rescan(state);

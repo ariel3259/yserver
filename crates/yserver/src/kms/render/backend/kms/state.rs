@@ -240,13 +240,6 @@ pub(in crate::kms::render::backend) struct DirectPresentFrame {
     pub(in crate::kms::render::backend) async_outcome: crate::drm::async_flip::AsyncOutcome,
 }
 
-pub(in crate::kms::render::backend) type DirectFrameSubmitter =
-    fn(
-        &mut KmsBackend,
-        &mut DirectPresentFrame,
-        crate::drm::async_flip::FlipTiming,
-    ) -> io::Result<crate::drm::async_flip::AsyncOutcome>;
-
 /// Require a short stable run before entering direct ownership. Compositors
 /// such as E27 alternate full-root Presents with authoritative region-limited
 /// Presents; entering on every eligible member of that stream otherwise
@@ -834,7 +827,6 @@ pub struct KmsBackendState {
     /// Monotonic clock for KMS cursor-composition pacing.
     pub(in crate::kms::render::backend) monotonic_clock:
         std::rc::Rc<dyn Fn() -> std::time::Instant>,
-    pub(in crate::kms::render::backend) direct_frame_submitter: DirectFrameSubmitter,
     pub(in crate::kms::render::backend) vt_resume_executor:
         std::rc::Rc<dyn super::session::VtResumeExecutor>,
 

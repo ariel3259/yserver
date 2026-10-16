@@ -1309,38 +1309,78 @@ fn grouped_direct_waits_all_outputs_and_uses_selected_reference_sample() {
 }
 
 #[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: restore success-without-request submission; the qualified framebuffer assertion must fail.
 fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
-    use yserver_core::backend::{PresentClockSample, PresentClockSource};
+    use std::os::fd::{AsFd as _, AsRawFd as _};
+    use yserver_core::backend::Backend;
 
-    let mut b = crate::kms::render::backend::KmsBackend::for_tests_with_direct_submitter(
-        crate::kms::render::backend::KmsBackend::submit_direct_frame_for_tests,
-    );
-    b.pstate.scanout_m2.cursor_bound_all = true;
-    let fallback_id = seed_window(&mut b, 0x6a00, None, 0, 0);
-
-    install_direct_frame_for_target_test(&mut b, 0x6b00, fallback_id, false);
-    let predecessor = b.pstate.scanout_m2.pending.take().expect("predecessor");
-
-    install_direct_frame_for_target_test(&mut b, 0x6c00, fallback_id, false);
-    let mut first_successor = b.pstate.scanout_m2.pending.take().expect("first successor");
-    first_successor.candidate.present_id = 78;
-    first_successor.event.present_id = 78;
-    first_successor.event.serial = 10;
-
-    install_direct_frame_for_target_test(&mut b, 0x6d00, fallback_id, false);
-    let mut latest_successor = b
+    let Some(mut b) = atomic_cursor_scanout_backend() else {
+        return;
+    };
+    if !b
+        .platform
+        .gpu
+        .vk
+        .as_ref()
+        .is_some_and(|vk| vk.supports_sync_fd())
+    {
+        eprintln!(
+            "skipping: Vulkan device lacks SYNC_FD semaphore export; direct scanout tests need it"
+        );
+        return;
+    }
+    let recorder = atomic_cursor_recording_sink(&mut b);
+    seed_two_atomic_cursor_positions(&mut b, 850, 140);
+    for (output_idx, layout) in b.platform.outputs.iter_mut().enumerate() {
+        let base = 71 + u32::try_from(output_idx).expect("output index fits") * 16;
+        let property = |offset| atomic_cursor_raw(base + offset);
+        layout.output.plane_fb_id_prop = property(0);
+        layout.output.plane_crtc_id_prop = property(1);
+        layout.output.plane_src_x_prop = property(2);
+        layout.output.plane_src_y_prop = property(3);
+        layout.output.plane_src_w_prop = property(4);
+        layout.output.plane_src_h_prop = property(5);
+        layout.output.plane_crtc_x_prop = property(6);
+        layout.output.plane_crtc_y_prop = property(7);
+        layout.output.plane_crtc_w_prop = property(8);
+        layout.output.plane_crtc_h_prop = property(9);
+    }
+    let mut state = yserver_core::server::ServerState::new();
+    let predecessor = prepare_atomic_cursor_direct_present(&mut b, 77);
+    let qualified_fb = b
         .pstate
-        .scanout_m2
-        .pending
-        .take()
-        .expect("latest successor");
-    latest_successor.candidate.present_id = 79;
-    latest_successor.event.present_id = 79;
-    latest_successor.event.serial = 11;
+        .scanout_m1
+        .entries
+        .get(&predecessor.source_id)
+        .and_then(crate::kms::render::backend::ScanoutM1ProbeEntry::framebuffer)
+        .expect("predecessor has a qualified M1 framebuffer")
+        .handle();
 
-    b.pstate.scanout_m2.pending = Some(predecessor);
-    b.queue_direct_successor(first_successor);
-    b.queue_direct_successor(latest_successor);
+    assert!(
+        Backend::try_present_direct(&mut b, predecessor.candidate, predecessor.event)
+            .expect("Backend admits the qualified predecessor")
+    );
+    let first_record = recorder.records().first().cloned().expect("direct request");
+    assert!(
+        first_record.properties.iter().any(|update| {
+            update.object == b.platform.outputs[0].output.plane.into()
+                && update.property == b.platform.outputs[0].output.plane_fb_id_prop
+                && update.value == u64::from(u32::from(qualified_fb))
+        }),
+        "accepted direct request must reference the qualified M1 framebuffer",
+    );
+
+    let first_successor = prepare_atomic_cursor_direct_present(&mut b, 78);
+    assert!(
+        Backend::try_present_direct(&mut b, first_successor.candidate, first_successor.event)
+            .expect("Backend retains the first successor")
+    );
+    let latest_successor = prepare_atomic_cursor_direct_present(&mut b, 79);
+    assert!(
+        Backend::try_present_direct(&mut b, latest_successor.candidate, latest_successor.event)
+            .expect("Backend coalesces the latest successor")
+    );
 
     assert_eq!(
         b.pstate
@@ -1376,12 +1416,18 @@ fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
     assert!(b.pstate.scanout_m2.hold_direct);
     assert!(b.pstate.scanout_m2.completed.is_empty());
 
-    let first_clock = PresentClockSample {
-        msc: 100,
-        ust: 1_000,
-        source: PresentClockSource::PageFlip,
-    };
-    assert!(b.retire_direct_output(0, first_clock));
+    for (index, output) in b.platform.outputs.iter().enumerate() {
+        b.platform.devices[0]
+            .test_page_flip_event_source
+            .as_ref()
+            .expect("recording flip source")
+            .queue_flip(
+                output.output.crtc,
+                1 + u32::try_from(index).expect("output index fits"),
+            );
+    }
+    let drm_fd = b.platform.devices[0].device.as_fd().as_raw_fd();
+    Backend::on_page_flip_ready(&mut b, &mut state, drm_fd);
 
     assert_eq!(
         b.pstate
@@ -1405,16 +1451,26 @@ fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
         Some(79),
         "retirement immediately submits the retained direct successor"
     );
+    assert_eq!(
+        recorder.records().len(),
+        2,
+        "latest successor submits one request"
+    );
     assert!(b.pstate.scanout_m2.queued_successor.is_none());
     assert!(!b.pstate.scanout_m2.unflip_requested);
     assert!(b.pstate.scanout_m2.hold_direct);
 
-    let second_clock = PresentClockSample {
-        msc: 101,
-        ust: 1_100,
-        source: PresentClockSource::PageFlip,
-    };
-    assert!(b.retire_direct_output(0, second_clock));
+    for (index, output) in b.platform.outputs.iter().enumerate() {
+        b.platform.devices[0]
+            .test_page_flip_event_source
+            .as_ref()
+            .expect("recording flip source")
+            .queue_flip(
+                output.output.crtc,
+                3 + u32::try_from(index).expect("output index fits"),
+            );
+    }
+    Backend::on_page_flip_ready(&mut b, &mut state, drm_fd);
     assert_eq!(
         b.pstate
             .scanout_m2
@@ -1428,6 +1484,8 @@ fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
             (79, yserver_protocol::x11::present::COMPLETE_MODE_FLIP),
         ]
     );
+    assert!(b.pstate.scanout_m2.pending.is_none());
+    assert!(b.pstate.scanout_m2.queued_successor.is_none());
 }
 
 #[test]

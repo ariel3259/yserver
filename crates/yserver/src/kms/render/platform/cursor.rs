@@ -286,7 +286,12 @@ pub(super) fn initialize_cursor_plane_for_device(
     boundary: &str,
 ) {
     kms_device.cursor.headless_deferred = false;
-    match crate::kms::cursor_plane::CursorPlane::new(Rc::clone(&kms_device.device), crtcs) {
+    match crate::kms::cursor_plane::CursorPlane::new_with_ops(
+        Rc::clone(&kms_device.device),
+        crtcs,
+        Rc::clone(&kms_device.cursor_buffer_io),
+        Rc::clone(&kms_device.legacy_cursor_io),
+    ) {
         Ok(plane) => install_cursor_plane_for_device(kms_device, crtcs, boundary, plane),
         Err(error) => {
             kms_device.cursor.note_initialization_failure(&error);
@@ -299,6 +304,42 @@ pub(super) fn initialize_cursor_plane_for_device(
                 "render cursor: device {} initialization failed at {boundary} ({error}); using software cursor, {retry}",
                 kms_device.key
             );
+        }
+    }
+}
+
+#[cfg(test)]
+impl PlatformBackend {
+    /// Initialise synthetic active outputs with the production cursor
+    /// allocation path and recorded raw cursor operations. Cursor topology
+    /// is synthetic at this fixture boundary; production discovery stays DRM-backed.
+    pub(crate) fn for_tests_initialize_cursor_planes(&mut self) {
+        for device in &mut self.devices {
+            let crtcs: Vec<_> = self
+                .outputs
+                .iter()
+                .filter(|output| output.key.device_key == device.key)
+                .map(|output| output.output.crtc)
+                .collect();
+            if !crtcs.is_empty() {
+                match crate::kms::cursor_plane::CursorPlane::for_tests_with_ops(
+                    Rc::clone(&device.device),
+                    &crtcs,
+                    Rc::clone(&device.cursor_buffer_io),
+                    Rc::clone(&device.legacy_cursor_io),
+                ) {
+                    Ok(plane) => {
+                        install_cursor_plane_for_device(device, &crtcs, "Vk backend fixture", plane)
+                    }
+                    Err(error) => {
+                        device.cursor.note_initialization_failure(&error);
+                        log::warn!(
+                            "render cursor: device {} fixture initialization failed ({error}); using software cursor",
+                            device.key
+                        );
+                    }
+                }
+            }
         }
     }
 }

@@ -33,6 +33,7 @@ mod power;
 mod qualify;
 mod scanout_bos;
 mod scene_sink;
+pub mod services;
 
 #[cfg(test)]
 use connectors::*;
@@ -397,6 +398,8 @@ pub(crate) struct KmsDevice {
     pub(crate) async_page_flip: bool,
     pub(crate) atomic_commit_sink: Rc<crate::drm::atomic::AtomicCommitSink>,
     pub(crate) page_flip_event_source: Rc<dyn flip_events::PageFlipEventSource>,
+    pub(crate) cursor_buffer_io: Rc<dyn crate::kms::cursor_plane::ops::CursorBufferIo>,
+    pub(crate) legacy_cursor_io: Rc<dyn crate::kms::cursor_plane::ops::LegacyCursorIo>,
     #[cfg(test)]
     pub(crate) test_page_flip_event_source: Option<Rc<flip_events::RecordingPageFlipEventSource>>,
     pub(crate) cursor: KmsCursorState,
@@ -432,6 +435,7 @@ pub struct PlatformBackend {
     initial_scanout_rollback_armed: bool,
     // DRM / output side
     pub(crate) devices: Vec<KmsDevice>,
+    pub(crate) services: services::KmsServices,
     /// Shared tearing state used by per-device commit telemetry and the
     /// composed scene submit path.
     pub(crate) tearing_on: bool,
@@ -506,8 +510,6 @@ pub struct PlatformBackend {
 
     // Input side
     input_ctx: Option<crate::input::SendContext>,
-    #[cfg(target_os = "linux")]
-    pub(crate) hotplug_monitor: Option<crate::kms::hotplug::DrmHotplugMonitor>,
 
     /// Stage 5 Task 6.1: inner poll FD aggregating per-batch
     /// sync_file FDs for deferred PRESENT completion. Exposed via
