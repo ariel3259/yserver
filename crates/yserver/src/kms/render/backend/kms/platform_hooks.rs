@@ -143,6 +143,7 @@ impl Platform for PlatformBackend {
     }
 
     fn hide_cursor_under_direct_scanout(b: &mut KmsBackend) {
+        b.pstate.deferred_direct_cursor = None;
         if !b.pstate.scanout_m2.active() {
             return;
         }

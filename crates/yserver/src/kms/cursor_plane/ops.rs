@@ -89,19 +89,48 @@ impl CursorMapping {
 }
 
 pub(crate) trait CursorBufferIo {
-    fn create_dumb(&self, device: &Device, width: u32, height: u32)
-    -> io::Result<CursorDumbBuffer>;
+    fn create_dumb(
+        &self,
+        device: &Device,
+        descriptor: CursorFramebufferDescriptor,
+    ) -> io::Result<CursorDumbBuffer>;
     fn map_dumb(&self, device: &Device, dumb: &mut CursorDumbBuffer) -> io::Result<CursorMapping>;
-    fn add_argb_framebuffer(
+    fn add_framebuffer(
         &self,
         device: &Device,
         dumb: &CursorDumbBuffer,
-        width: u32,
-        height: u32,
+        descriptor: CursorFramebufferDescriptor,
     ) -> io::Result<framebuffer::Handle>;
+    fn write_image(
+        &self,
+        mapping: &CursorMapping,
+        stride: u32,
+        capacity_width: u32,
+        capacity_height: u32,
+        image_width: u32,
+        image_height: u32,
+        bgra_bytes: &[u8],
+    ) -> io::Result<()>;
     fn remove_framebuffer(&self, device: &Device, fb: framebuffer::Handle) -> io::Result<()>;
     fn unmap_dumb(&self, device: &Device, dumb: &CursorDumbBuffer, mapping: CursorMapping);
     fn destroy_dumb(&self, device: &Device, dumb: CursorDumbBuffer) -> io::Result<()>;
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CursorFramebufferDescriptor {
+    width: u32,
+    height: u32,
+    format: DrmFourcc,
+}
+
+impl CursorFramebufferDescriptor {
+    fn argb8888(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            format: DrmFourcc::Argb8888,
+        }
+    }
 }
 
 /// Legacy cursor operations retained until the atomic cursor submission path
@@ -233,10 +262,13 @@ impl CursorBufferIo for DrmCursorBufferIo {
     fn create_dumb(
         &self,
         device: &Device,
-        width: u32,
-        height: u32,
+        descriptor: CursorFramebufferDescriptor,
     ) -> io::Result<CursorDumbBuffer> {
-        let dumb = device.create_dumb_buffer((width, height), DrmFourcc::Argb8888, 32)?;
+        let dumb = device.create_dumb_buffer(
+            (descriptor.width, descriptor.height),
+            descriptor.format,
+            32,
+        )?;
         let handle = dumb.handle().into();
         let pitch = dumb.pitch();
         let len = usize::try_from(dumb.size().0)
@@ -276,12 +308,11 @@ impl CursorBufferIo for DrmCursorBufferIo {
         })
     }
 
-    fn add_argb_framebuffer(
+    fn add_framebuffer(
         &self,
         device: &Device,
         dumb: &CursorDumbBuffer,
-        width: u32,
-        height: u32,
+        descriptor: CursorFramebufferDescriptor,
     ) -> io::Result<framebuffer::Handle> {
         ensure_device(device, dumb.device_fd)?;
         let raw_dumb = dumb
@@ -291,10 +322,30 @@ impl CursorBufferIo for DrmCursorBufferIo {
         device.add_planar_framebuffer(
             &CursorPlanarBuffer {
                 dumb: *raw_dumb,
-                width,
-                height,
+                descriptor,
             },
             FbCmd2Flags::empty(),
+        )
+    }
+
+    fn write_image(
+        &self,
+        mapping: &CursorMapping,
+        stride: u32,
+        capacity_width: u32,
+        capacity_height: u32,
+        image_width: u32,
+        image_height: u32,
+        bgra_bytes: &[u8],
+    ) -> io::Result<()> {
+        write_mapped_image(
+            mapping,
+            stride,
+            capacity_width,
+            capacity_height,
+            image_width,
+            image_height,
+            bgra_bytes,
         )
     }
 
@@ -341,17 +392,16 @@ fn ensure_device(device: &Device, expected_fd: i32) -> io::Result<()> {
 
 struct CursorPlanarBuffer {
     dumb: DumbBuffer,
-    width: u32,
-    height: u32,
+    descriptor: CursorFramebufferDescriptor,
 }
 
 impl PlanarBuffer for CursorPlanarBuffer {
     fn size(&self) -> (u32, u32) {
-        (self.width, self.height)
+        (self.descriptor.width, self.descriptor.height)
     }
 
     fn format(&self) -> DrmFourcc {
-        DrmFourcc::Argb8888
+        self.descriptor.format
     }
 
     fn modifier(&self) -> Option<DrmModifier> {
@@ -436,6 +486,7 @@ pub(crate) enum CursorBufferOperation {
     Create,
     Map,
     AddFb,
+    Write,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -531,13 +582,14 @@ impl CursorBufferIo for RecordingCursorBufferIo {
     fn create_dumb(
         &self,
         device: &Device,
-        width: u32,
-        height: u32,
+        descriptor: CursorFramebufferDescriptor,
     ) -> io::Result<CursorDumbBuffer> {
         if let Some(raw_os_error) = self.ledger.take_failure(CursorBufferOperation::Create) {
             return Err(io::Error::from_raw_os_error(raw_os_error));
         }
         let fd = device.as_fd().as_raw_fd();
+        let width = descriptor.width;
+        let height = descriptor.height;
         let mut next = self.next_handle.borrow_mut();
         let handle = *next;
         *next = next.wrapping_add(1).max(1);
@@ -600,12 +652,11 @@ impl CursorBufferIo for RecordingCursorBufferIo {
         CursorMapping::recording(storage)
     }
 
-    fn add_argb_framebuffer(
+    fn add_framebuffer(
         &self,
         device: &Device,
         dumb: &CursorDumbBuffer,
-        _width: u32,
-        _height: u32,
+        descriptor: CursorFramebufferDescriptor,
     ) -> io::Result<framebuffer::Handle> {
         if let Some(raw_os_error) = self.ledger.take_failure(CursorBufferOperation::AddFb) {
             return Err(io::Error::from_raw_os_error(raw_os_error));
@@ -637,11 +688,35 @@ impl CursorBufferIo for RecordingCursorBufferIo {
                 device_fd: fd,
                 handle: dumb.handle,
                 fb: raw_fb,
-                width: _width,
-                height: _height,
-                format: u32::from_be_bytes(*b"AR24"),
+                width: descriptor.width,
+                height: descriptor.height,
+                format: descriptor.format as u32,
             });
         Ok(fb)
+    }
+
+    fn write_image(
+        &self,
+        mapping: &CursorMapping,
+        stride: u32,
+        capacity_width: u32,
+        capacity_height: u32,
+        image_width: u32,
+        image_height: u32,
+        bgra_bytes: &[u8],
+    ) -> io::Result<()> {
+        if let Some(raw_os_error) = self.ledger.take_failure(CursorBufferOperation::Write) {
+            return Err(io::Error::from_raw_os_error(raw_os_error));
+        }
+        write_mapped_image(
+            mapping,
+            stride,
+            capacity_width,
+            capacity_height,
+            image_width,
+            image_height,
+            bgra_bytes,
+        )
     }
 
     fn remove_framebuffer(&self, device: &Device, fb: framebuffer::Handle) -> io::Result<()> {
@@ -725,7 +800,8 @@ impl CursorBuffer {
         width: u32,
         height: u32,
     ) -> io::Result<Self> {
-        let mut dumb = io.create_dumb(&device, width, height)?;
+        let descriptor = CursorFramebufferDescriptor::argb8888(width, height);
+        let mut dumb = io.create_dumb(&device, descriptor)?;
         let stride = dumb.pitch();
         let mapping = match io.map_dumb(&device, &mut dumb) {
             Ok(mapping) => mapping,
@@ -739,7 +815,7 @@ impl CursorBuffer {
                 ));
             }
         };
-        let fb = match io.add_argb_framebuffer(&device, &dumb, width, height) {
+        let fb = match io.add_framebuffer(&device, &dumb, descriptor) {
             Ok(fb) => fb,
             Err(error) => {
                 io.unmap_dumb(&device, &dumb, mapping);
@@ -767,6 +843,34 @@ impl CursorBuffer {
         // The newly allocated ARGB image starts transparent.
         buffer.clear();
         Ok(buffer)
+    }
+
+    pub(crate) fn release(mut self) -> io::Result<()> {
+        self.release_resources()
+    }
+
+    fn release_resources(&mut self) -> io::Result<()> {
+        let mut cleanup_error = None;
+        if let Some(fb) = self.fb.take()
+            && let Err(error) = self.io.remove_framebuffer(&self.device, fb)
+        {
+            cleanup_error = Some(error);
+        }
+        if let (Some(dumb), Some(mapping)) = (self.dumb.as_ref(), self.mapping.take()) {
+            self.io.unmap_dumb(&self.device, dumb, mapping);
+        }
+        if let Some(dumb) = self.dumb.take()
+            && let Err(error) = self.io.destroy_dumb(&self.device, dumb)
+        {
+            if let Some(previous) = cleanup_error {
+                cleanup_error = Some(io::Error::other(format!(
+                    "{previous}; destroy cursor dumb buffer failed: {error}"
+                )));
+            } else {
+                cleanup_error = Some(error);
+            }
+        }
+        cleanup_error.map_or(Ok(()), Err)
     }
 
     #[allow(dead_code)] // consumed by atomic cursor operations in the next phase
@@ -826,28 +930,80 @@ impl CursorBuffer {
                 "cursor bytes must equal width*height*4",
             ));
         }
-        self.clear();
-        let pitch = usize::try_from(self.stride)
-            .map_err(|_| io::Error::other("cursor pitch does not fit usize"))?;
-        for row in 0..usize::try_from(image_h).expect("validated cursor height fits usize") {
-            // SAFETY: the mapping covers `len`, each destination row fits the
-            // full-size dumb-buffer pitch, and `bgra_bytes` was checked for
-            // the exact tightly packed source size.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    bgra_bytes.as_ptr().add(row * row_len),
-                    self.ptr().as_ptr().add(row * pitch),
-                    row_len,
-                );
-            }
-        }
-        Ok(())
+        let _ = expected;
+        self.io.write_image(
+            self.mapping
+                .as_ref()
+                .expect("cursor mapping is live during upload"),
+            self.stride,
+            self.width,
+            self.height,
+            image_w,
+            image_h,
+            bgra_bytes,
+        )
     }
 
     pub(crate) fn clear(&mut self) {
         // SAFETY: mapping remains live and covers `len` writable bytes.
         unsafe { std::ptr::write_bytes(self.ptr().as_ptr(), 0, self.len) };
     }
+}
+
+fn write_mapped_image(
+    mapping: &CursorMapping,
+    stride: u32,
+    capacity_width: u32,
+    capacity_height: u32,
+    image_width: u32,
+    image_height: u32,
+    bgra_bytes: &[u8],
+) -> io::Result<()> {
+    let pitch = usize::try_from(stride)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "cursor pitch overflow"))?;
+    let row_len = usize::try_from(image_width)
+        .ok()
+        .and_then(|width| width.checked_mul(4))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "cursor row overflow"))?;
+    let capacity_row_len = usize::try_from(capacity_width)
+        .ok()
+        .and_then(|width| width.checked_mul(4))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "cursor width overflow"))?;
+    if row_len > pitch || capacity_row_len > pitch || image_height > capacity_height {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cursor image does not fit the mapped framebuffer geometry",
+        ));
+    }
+    let len = pitch
+        .checked_mul(
+            usize::try_from(capacity_height).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "cursor height overflow")
+            })?,
+        )
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "cursor mapping overflow"))?;
+    if len > mapping.len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cursor mapping is smaller than its framebuffer geometry",
+        ));
+    }
+    // SAFETY: the allocation mapping covers its padded pitch and height.
+    unsafe { std::ptr::write_bytes(mapping.ptr.as_ptr(), 0, len) };
+    for row in 0..usize::try_from(image_height)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "cursor height overflow"))?
+    {
+        // SAFETY: image validation checked the source size and each
+        // destination row fits within the padded framebuffer pitch.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bgra_bytes.as_ptr().add(row * row_len),
+                mapping.ptr.as_ptr().add(row * pitch),
+                row_len,
+            );
+        }
+    }
+    Ok(())
 }
 
 fn allocation_cleanup_error(
@@ -857,27 +1013,16 @@ fn allocation_cleanup_error(
 ) -> io::Error {
     match cleanup_result {
         Ok(()) => operation_error,
-        Err(cleanup_error) => io::Error::new(
-            operation_error.kind(),
-            format!("{operation_error}; rollback {cleanup_context} failed: {cleanup_error}"),
-        ),
+        Err(cleanup_error) => io::Error::other(format!(
+            "{operation_error}; rollback {cleanup_context} failed: {cleanup_error}"
+        )),
     }
 }
 
 impl Drop for CursorBuffer {
     fn drop(&mut self) {
-        if let Some(fb) = self.fb.take()
-            && let Err(error) = self.io.remove_framebuffer(&self.device, fb)
-        {
-            log::warn!("cursor RMFB failed: {error}");
-        }
-        if let (Some(dumb), Some(mapping)) = (self.dumb.as_ref(), self.mapping.take()) {
-            self.io.unmap_dumb(&self.device, dumb, mapping);
-        }
-        if let Some(dumb) = self.dumb.take()
-            && let Err(error) = self.io.destroy_dumb(&self.device, dumb)
-        {
-            log::warn!("cursor dumb-buffer destroy failed: {error}");
+        if let Err(error) = self.release_resources() {
+            log::warn!("cursor buffer cleanup failed: {error}");
         }
     }
 }
@@ -892,8 +1037,7 @@ mod tests {
         fn create_dumb(
             &self,
             device: &Device,
-            _width: u32,
-            _height: u32,
+            _descriptor: CursorFramebufferDescriptor,
         ) -> io::Result<CursorDumbBuffer> {
             Ok(CursorDumbBuffer::recording(device, 0x51, 256, 4096))
         }
@@ -906,14 +1050,26 @@ mod tests {
             Err(io::Error::other("map failed"))
         }
 
-        fn add_argb_framebuffer(
+        fn add_framebuffer(
             &self,
             _device: &Device,
             _dumb: &CursorDumbBuffer,
-            _width: u32,
-            _height: u32,
+            _descriptor: CursorFramebufferDescriptor,
         ) -> io::Result<framebuffer::Handle> {
             unreachable!("framebuffer creation follows a successful map")
+        }
+
+        fn write_image(
+            &self,
+            _mapping: &CursorMapping,
+            _stride: u32,
+            _capacity_width: u32,
+            _capacity_height: u32,
+            _image_width: u32,
+            _image_height: u32,
+            _bgra_bytes: &[u8],
+        ) -> io::Result<()> {
+            unreachable!("image write follows successful allocation")
         }
 
         fn remove_framebuffer(&self, _device: &Device, _fb: framebuffer::Handle) -> io::Result<()> {

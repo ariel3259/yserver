@@ -318,6 +318,7 @@ impl KmsBackend {
         if !self.pstate.scanout_m2.active() {
             return;
         }
+        self.pstate.deferred_direct_cursor = None;
         if !self.pstate.scanout_m2.unflip_requested {
             self.pstate.scanout_m2.unflip_reason = Some(reason);
         }
@@ -815,6 +816,7 @@ impl KmsBackend {
         &mut self,
         reason: &'static str,
     ) {
+        self.pstate.deferred_direct_cursor = None;
         if let Some(mut pending) = self.pstate.scanout_m2.pending.take() {
             pending.event.completion_mode = yserver_protocol::x11::present::COMPLETE_MODE_COPY;
             pending.event.emit_idle = true;
@@ -2427,10 +2429,17 @@ impl KmsBackend {
         // The helper leaves it in the slot while any CRTC is still blocked.
         self.submit_queued_direct_successor();
         if self.pstate.scanout_m2.active() {
-            if let Some(record) = self.pstate.deferred_direct_cursor.take()
-                && !self.refresh_direct_cursor_on_all_outputs(&record)
-            {
-                self.request_direct_unflip("cursor_show_failed");
+            if let Some(record) = self.pstate.deferred_direct_cursor.take() {
+                let current_record = self
+                    .effective_cursor_xid
+                    .and_then(|xid| self.cursor_records.get(&xid))
+                    .is_some_and(|current| current.version == record.version);
+                if current_record
+                    && !self.effective_cursor_hidden()
+                    && !self.refresh_direct_cursor_on_all_outputs(&record)
+                {
+                    self.request_direct_unflip("cursor_show_failed");
+                }
             }
             use crate::kms::render::scene::CursorPlaneMode;
             let cursor_mode = self.scene.cursor_mode();

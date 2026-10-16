@@ -61,6 +61,25 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   acceptance emitted Mesa device-info lookup diagnostics while all 191 tests
   passed. No hardware validation was run; controller Task C11 owns it.
 
+- **2026-10-16 atomic-cursor-only A4 fix round 1:** deferred direct cursor work
+  is cancelled on hide and direct-scanout ownership teardown, and scheduler
+  replay checks the current visible cursor version. Only `WouldBlock` allocation
+  failures defer; permanent allocator and rollback errors propagate. A live
+  replacement that hits write backpressure retains its previous visible bytes,
+  version and binding until a Backend retry succeeds. The malformed PutImage
+  test now asserts one Backend upload for the valid control and none for short
+  or zero-size requests. Cursor framebuffer creation and the recording ledger
+  share one ARGB8888 descriptor. Under 16 busy loops, cap dimensions passed
+  5/5 and full-buffer, rollback, permanent-error, live-replacement, direct-hide,
+  and malformed-input tests passed 20/20 each; new tests assert exact accepted
+  atomic commit sequences and quiescent end states. Eleven targeted mutations
+  failed their assertions and were reverted. Default and whole ignored workspace
+  suites, render acceptance (including 191 ignored tests), both Clippy gates,
+  nightly/stable formatting, build, layout, and whitespace checks passed; no
+  SYNC_FD capability skips occurred. Mesa loader device-info diagnostics remain
+  environmental test output. No hardware validation was run; controller Task
+  C11 owns it.
+
 - **2026-10-16 atomic-cursor-only A3 fix round 1:** the review gaps are closed.
   `cursor_plane/topology.rs` now owns atomic cursor discovery, ten-property
   qualification, virtual-driver hotspot checks, and exclusive CRTC matching.

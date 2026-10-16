@@ -85,19 +85,25 @@ impl SpritePool {
             ) {
                 Ok(buffer) => buffer,
                 Err(error) => {
-                    log::warn!("cursor sprite pool first allocation deferred: {error}");
-                    return Ok(CursorUploadOutcome::Deferred);
+                    return allocation_outcome(error);
                 }
             };
-            let second =
-                match CursorBuffer::allocate(Rc::clone(&device), io, self.width, self.height) {
-                    Ok(buffer) => buffer,
-                    Err(error) => {
-                        drop(first);
-                        log::warn!("cursor sprite pool second allocation deferred: {error}");
-                        return Ok(CursorUploadOutcome::Deferred);
+            let second = match CursorBuffer::allocate(
+                Rc::clone(&device),
+                io,
+                self.width,
+                self.height,
+            ) {
+                Ok(buffer) => buffer,
+                Err(error) => {
+                    if let Err(cleanup_error) = first.release() {
+                        return Err(io::Error::other(format!(
+                            "{error}; releasing first cursor sprite allocation failed: {cleanup_error}"
+                        )));
                     }
-                };
+                    return allocation_outcome(error);
+                }
+            };
             self.buffers = vec![
                 SpriteBuffer {
                     buffer: first,
@@ -114,10 +120,7 @@ impl SpritePool {
                     buffer,
                     version: None,
                 }),
-                Err(error) => {
-                    log::warn!("cursor sprite pool growth deferred: {error}");
-                    return Ok(CursorUploadOutcome::Deferred);
-                }
+                Err(error) => return allocation_outcome(error),
             }
         }
 
@@ -200,6 +203,15 @@ impl SpritePool {
     )]
     pub(crate) fn candidate_version(&self) -> Option<u64> {
         self.candidate.map(|lease| lease.version)
+    }
+}
+
+fn allocation_outcome(error: io::Error) -> io::Result<CursorUploadOutcome> {
+    if error.kind() == io::ErrorKind::WouldBlock {
+        log::debug!("cursor sprite pool allocation deferred by pool pressure: {error}");
+        Ok(CursorUploadOutcome::Deferred)
+    } else {
+        Err(error)
     }
 }
 

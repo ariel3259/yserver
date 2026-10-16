@@ -42,7 +42,7 @@ fn atomic_cursor_only_cursor_cap_dimensions_use_valid_values_and_per_axis_fallba
             vec![(
                 expected_width,
                 expected_height,
-                u32::from_be_bytes(*b"AR24")
+                drm::buffer::DrmFourcc::Argb8888 as u32
             )],
         );
         fixture.assert_cursor_quiescent();
@@ -74,7 +74,7 @@ fn atomic_cursor_only_failed_sprite_allocation_preserves_prior_image() {
         };
         let ledger = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
         let initial_records = ledger.records().len();
-        ledger.fail_after(operation, successes_before_failure, libc::ENOMEM);
+        ledger.fail_after(operation, successes_before_failure, libc::EAGAIN);
 
         let source = Backend::create_pixmap(&mut fixture.backend, None, 32, 1, 1)
             .expect("create depth-32 cursor pixmap through Backend");
@@ -278,6 +278,172 @@ fn atomic_cursor_only_failed_sprite_allocation_preserves_prior_image() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: turn any non-WouldBlock allocation error into Deferred and this test will observe an unwanted retry.
+fn atomic_cursor_only_permanent_sprite_allocation_errors_are_not_deferred() {
+    use crate::kms::cursor_plane::ops::CursorBufferOperation;
+    use yserver_core::backend::{AnyHandle, Backend};
+
+    for (operation, successful_calls, label) in [
+        (CursorBufferOperation::Create, 0, "create"),
+        (CursorBufferOperation::Map, 0, "map"),
+        (CursorBufferOperation::AddFb, 0, "addfb"),
+        (CursorBufferOperation::Create, 1, "second-initial-create"),
+    ] {
+        let Some(mut fixture) =
+            AtomicCursorFixture::new_with_cursor_capabilities(Some(32), Some(24))
+                .expect("build permanent-allocation-error fixture")
+        else {
+            return;
+        };
+        let ledger = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
+        let initial_records = ledger.records().len();
+        ledger.fail_after(operation, successful_calls, libc::EINVAL);
+
+        let source = Backend::create_pixmap(&mut fixture.backend, None, 32, 1, 1)
+            .expect("create depth-32 cursor pixmap through Backend");
+        let pixels = [0x41, 0x52, 0x63, 0xff];
+        Backend::put_image(
+            &mut fixture.backend,
+            None,
+            source.as_raw(),
+            32,
+            1,
+            1,
+            0,
+            0,
+            &pixels,
+        )
+        .expect("upload complete cursor source through Backend");
+        let picture = Backend::render_create_picture(
+            &mut fixture.backend,
+            None,
+            AnyHandle::Pixmap(source),
+            0,
+            0,
+            &[],
+        )
+        .expect("create source picture through Backend")
+        .expect("picture handle");
+        let cursor = Backend::render_create_cursor(&mut fixture.backend, None, picture, 0, 0)
+            .expect("create ARGB cursor through Backend")
+            .expect("cursor handle");
+        let root = fixture.backend.core.window_id;
+        Backend::define_cursor(&mut fixture.backend, None, root, cursor.as_raw())
+            .expect("define cursor through Backend");
+        let (root_width, root_height) = fixture.backend.platform.fb_dimensions();
+        Backend::clear_area(
+            &mut fixture.backend,
+            None,
+            root,
+            0,
+            None,
+            0,
+            0,
+            root_width,
+            root_height,
+            (0, 0),
+        )
+        .expect("damage root through Backend");
+        Backend::maybe_composite(&mut fixture.backend)
+            .expect("submit cursor staging through Backend");
+        fixture.retire_output(0, 1);
+
+        let version = fixture.backend.cursor_records[&cursor.as_raw()].version;
+        assert_eq!(
+            fixture.backend.platform.devices[0]
+                .cursor
+                .plane
+                .as_ref()
+                .expect("cursor plane")
+                .for_tests_sprite_pool_versions(),
+            (Some(version), None),
+            "{label}: failed allocation keeps wanted bytes without publishing a candidate",
+        );
+        assert_eq!(
+            fixture
+                .backend
+                .platform
+                .cursor_plane_uploaded_version_for_output(0),
+            None,
+            "{label}: permanent errors are not successful uploads",
+        );
+        assert_eq!(
+            ledger.end_state(),
+            (1, 1, 1),
+            "{label}: rollback is complete"
+        );
+
+        let after_failure = ledger.records();
+        Backend::maybe_composite(&mut fixture.backend)
+            .expect("run another Backend scheduling turn after permanent error");
+        if fixture.backend.scene.has_pending_page_flips() {
+            fixture.retire_output(0, 2);
+        }
+        assert_eq!(
+            ledger.records(),
+            after_failure,
+            "{label}: a permanent allocation error does not schedule an endless retry",
+        );
+        assert_eq!(
+            fixture.backend.platform.devices[0]
+                .cursor
+                .plane
+                .as_ref()
+                .expect("cursor plane")
+                .for_tests_sprite_pool_versions(),
+            (Some(version), None),
+        );
+
+        Backend::set_cursor_hidden(&mut fixture.backend, true);
+        Backend::clear_area(
+            &mut fixture.backend,
+            None,
+            root,
+            0,
+            None,
+            0,
+            0,
+            root_width,
+            root_height,
+            (0, 0),
+        )
+        .expect("damage root for cursor teardown");
+        Backend::maybe_composite(&mut fixture.backend).expect("submit cursor teardown");
+        if fixture.backend.scene.has_pending_page_flips() {
+            fixture.retire_output(0, 3);
+        }
+        fixture.assert_cursor_quiescent();
+        assert_eq!(
+            fixture
+                .recorders
+                .atomic
+                .records()
+                .into_iter()
+                .map(|record| record.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                crate::drm::atomic::AtomicCommitKind::Scene,
+                crate::drm::atomic::AtomicCommitKind::Scene,
+                crate::drm::atomic::AtomicCommitKind::Scene,
+            ],
+            "{label}: initial frame, non-retrying scheduler turn, then hide",
+        );
+        let resources = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
+        drop(fixture);
+        assert_eq!(
+            resources.end_state(),
+            (0, 0, 0),
+            "{label}: teardown releases resources"
+        );
+        assert!(
+            initial_records > 0,
+            "{label}: fixture owns its legacy backing"
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: omitting the per-device full-size sprite pool leaves fewer than two staged allocations.
 fn atomic_cursor_only_full_buffer_argb_upload_and_cleanup() {
     use yserver_core::backend::{AnyHandle, Backend};
@@ -453,7 +619,12 @@ fn atomic_cursor_only_full_buffer_argb_upload_and_cleanup() {
     assert_eq!(add_fb_records.len(), 2);
     assert!(add_fb_records.iter().all(|record| {
         (record.0, record.2, record.3, record.4)
-            == (first_create.0, 32, 24, u32::from_be_bytes(*b"AR24"))
+            == (
+                first_create.0,
+                32,
+                24,
+                drm::buffer::DrmFourcc::Argb8888 as u32,
+            )
     }));
     let smaller_storage = fixture
         .recorders
@@ -571,6 +742,423 @@ fn atomic_cursor_only_full_buffer_argb_upload_and_cleanup() {
     let ledger = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
     drop(fixture);
     assert_eq!(ledger.end_state(), (0, 0, 0));
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: let a deferred replacement overwrite the legacy image or publish its candidate before the write completes.
+fn atomic_cursor_only_deferred_replacement_keeps_live_prior_image_until_retry() {
+    use crate::kms::cursor_plane::ops::CursorBufferOperation;
+    use yserver_core::backend::{AnyHandle, Backend};
+
+    let Some(mut fixture) = AtomicCursorFixture::new_with_cursor_capabilities(Some(32), Some(24))
+        .expect("build live cursor fixture")
+    else {
+        return;
+    };
+    let root = fixture.backend.core.window_id;
+    let create_cursor = |fixture: &mut AtomicCursorFixture, pixels: &[u8]| {
+        let source = Backend::create_pixmap(&mut fixture.backend, None, 32, 1, 1)
+            .expect("create cursor source through Backend");
+        Backend::put_image(
+            &mut fixture.backend,
+            None,
+            source.as_raw(),
+            32,
+            1,
+            1,
+            0,
+            0,
+            pixels,
+        )
+        .expect("upload cursor pixels through Backend");
+        let picture = Backend::render_create_picture(
+            &mut fixture.backend,
+            None,
+            AnyHandle::Pixmap(source),
+            0,
+            0,
+            &[],
+        )
+        .expect("create cursor picture through Backend")
+        .expect("picture handle");
+        Backend::render_create_cursor(&mut fixture.backend, None, picture, 0, 0)
+            .expect("create cursor through Backend")
+            .expect("cursor handle")
+    };
+    let first_pixels = [0x11, 0x22, 0x33, 0xff];
+    let first_cursor = create_cursor(&mut fixture, &first_pixels);
+    Backend::define_cursor(&mut fixture.backend, None, root, first_cursor.as_raw())
+        .expect("show first cursor through Backend");
+    let (root_width, root_height) = fixture.backend.platform.fb_dimensions();
+    Backend::clear_area(
+        &mut fixture.backend,
+        None,
+        root,
+        0,
+        None,
+        0,
+        0,
+        root_width,
+        root_height,
+        (0, 0),
+    )
+    .expect("damage root for initial cursor frame");
+    Backend::maybe_composite(&mut fixture.backend).expect("submit initial cursor frame");
+    fixture.retire_output(0, 1);
+    assert!(fixture.backend.platform.cursor_plane_visible_for_output(0));
+
+    let first_version = fixture.backend.cursor_records[&first_cursor.as_raw()].version;
+    let legacy_record = fixture.recorders.cursor_buffer_ledger.records()[0].clone();
+    let (device_fd, legacy_handle) = match legacy_record {
+        crate::kms::cursor_plane::ops::CursorBufferRecord::Create {
+            device_fd, handle, ..
+        } => (device_fd, handle),
+        _ => unreachable!("first cursor-buffer record allocates the legacy backing"),
+    };
+    let prior_bytes = fixture
+        .recorders
+        .cursor_buffer_ledger
+        .mapped_bytes(device_fd, legacy_handle)
+        .expect("legacy image mapping remains live");
+    assert_eq!(&prior_bytes[..4], &first_pixels);
+    let prior_binds = fixture.recorders.legacy_cursor.records();
+    assert!(
+        prior_binds.iter().any(|record| {
+            record.operation == crate::kms::cursor_plane::ops::LegacyCursorOperation::Bind
+        }),
+        "the prior image was shown through Backend retirement",
+    );
+
+    fixture.recorders.cursor_buffer_ledger.fail_after(
+        CursorBufferOperation::Write,
+        0,
+        libc::EAGAIN,
+    );
+    let replacement_pixels = [0xde, 0xad, 0xbe, 0xff];
+    let replacement = create_cursor(&mut fixture, &replacement_pixels);
+    Backend::define_cursor(&mut fixture.backend, None, root, replacement.as_raw())
+        .expect("replace cursor through Backend");
+    Backend::clear_area(
+        &mut fixture.backend,
+        None,
+        root,
+        0,
+        None,
+        0,
+        0,
+        root_width,
+        root_height,
+        (0, 0),
+    )
+    .expect("damage root for deferred replacement");
+    Backend::maybe_composite(&mut fixture.backend).expect("submit deferred replacement frame");
+    fixture.retire_output(0, 2);
+
+    let replacement_version = fixture.backend.cursor_records[&replacement.as_raw()].version;
+    assert_eq!(
+        fixture.backend.platform.devices[0]
+            .cursor
+            .plane
+            .as_ref()
+            .expect("cursor plane")
+            .uploaded_version(),
+        Some(first_version),
+        "deferred upload cannot publish the replacement version",
+    );
+    assert_eq!(
+        fixture.backend.platform.devices[0]
+            .cursor
+            .plane
+            .as_ref()
+            .expect("cursor plane")
+            .for_tests_sprite_pool_versions(),
+        (Some(replacement_version), Some(first_version)),
+        "the newest wanted image is kept while the prior candidate remains owned",
+    );
+    assert!(fixture.backend.platform.cursor_plane_visible_for_output(0));
+    assert_eq!(
+        fixture
+            .recorders
+            .cursor_buffer_ledger
+            .mapped_bytes(device_fd, legacy_handle)
+            .expect("legacy image mapping remains live"),
+        prior_bytes,
+        "failed replacement leaves the visible legacy pixels unchanged",
+    );
+    assert_eq!(
+        fixture.recorders.legacy_cursor.records(),
+        prior_binds,
+        "deferred replacement issues no new bind or hide",
+    );
+
+    Backend::maybe_composite(&mut fixture.backend).expect("Backend scheduler retries replacement");
+    fixture.retire_output(0, 3);
+    assert_eq!(
+        fixture.backend.platform.devices[0]
+            .cursor
+            .plane
+            .as_ref()
+            .expect("cursor plane")
+            .uploaded_version(),
+        Some(replacement_version),
+        "successful retry publishes the replacement",
+    );
+    assert_eq!(
+        &fixture
+            .recorders
+            .cursor_buffer_ledger
+            .mapped_bytes(device_fd, legacy_handle)
+            .expect("legacy mapping remains live")[..4],
+        &replacement_pixels,
+    );
+
+    Backend::set_cursor_hidden(&mut fixture.backend, true);
+    Backend::clear_area(
+        &mut fixture.backend,
+        None,
+        root,
+        0,
+        None,
+        0,
+        0,
+        root_width,
+        root_height,
+        (0, 0),
+    )
+    .expect("damage root for cursor teardown");
+    Backend::maybe_composite(&mut fixture.backend).expect("submit cursor hide");
+    fixture.retire_output(0, 4);
+    fixture.assert_cursor_quiescent();
+    assert_eq!(
+        fixture
+            .recorders
+            .atomic
+            .records()
+            .into_iter()
+            .map(|record| record.kind)
+            .collect::<Vec<_>>(),
+        vec![
+            crate::drm::atomic::AtomicCommitKind::Scene,
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+        ],
+        "replacement sequence: initial scene, deferred frame, successful retry, then hide",
+    );
+    let resources = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
+    drop(fixture);
+    assert_eq!(resources.end_state(), (0, 0, 0));
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: replay a saved direct cursor record after Backend::set_cursor_hidden(true); the cursor must stay detached.
+fn atomic_cursor_only_hide_cancels_deferred_direct_cursor_retry() {
+    use crate::kms::cursor_plane::ops::CursorBufferOperation;
+    use yserver_core::backend::{AnyHandle, Backend};
+
+    let Some(mut fixture) = AtomicCursorFixture::new_with_cursor_capabilities(Some(32), Some(24))
+        .expect("build direct cursor fixture")
+    else {
+        return;
+    };
+    let root = fixture.backend.core.window_id;
+    let create_cursor = |fixture: &mut AtomicCursorFixture, pixels: &[u8]| {
+        let source = Backend::create_pixmap(&mut fixture.backend, None, 32, 1, 1)
+            .expect("create cursor source through Backend");
+        Backend::put_image(
+            &mut fixture.backend,
+            None,
+            source.as_raw(),
+            32,
+            1,
+            1,
+            0,
+            0,
+            pixels,
+        )
+        .expect("upload cursor pixels through Backend");
+        let picture = Backend::render_create_picture(
+            &mut fixture.backend,
+            None,
+            AnyHandle::Pixmap(source),
+            0,
+            0,
+            &[],
+        )
+        .expect("create cursor picture through Backend")
+        .expect("picture handle");
+        Backend::render_create_cursor(&mut fixture.backend, None, picture, 0, 0)
+            .expect("create cursor through Backend")
+            .expect("cursor handle")
+    };
+
+    let first_cursor = create_cursor(&mut fixture, &[0x11, 0x22, 0x33, 0xff]);
+    Backend::define_cursor(&mut fixture.backend, None, root, first_cursor.as_raw())
+        .expect("define visible cursor through Backend");
+    let (root_width, root_height) = fixture.backend.platform.fb_dimensions();
+    Backend::clear_area(
+        &mut fixture.backend,
+        None,
+        root,
+        0,
+        None,
+        0,
+        0,
+        root_width,
+        root_height,
+        (0, 0),
+    )
+    .expect("damage root for initial cursor frame");
+    Backend::maybe_composite(&mut fixture.backend).expect("submit initial cursor frame");
+    fixture.retire_output(0, 1);
+    assert!(fixture.backend.platform.cursor_plane_visible_for_output(0));
+
+    let output = &mut fixture.backend.platform.outputs[0].output;
+    output.plane_fb_id_prop = test_raw(71);
+    output.plane_crtc_id_prop = test_raw(72);
+    output.plane_src_x_prop = test_raw(73);
+    output.plane_src_y_prop = test_raw(74);
+    output.plane_src_w_prop = test_raw(75);
+    output.plane_src_h_prop = test_raw(76);
+    output.plane_crtc_x_prop = test_raw(77);
+    output.plane_crtc_y_prop = test_raw(78);
+    output.plane_crtc_w_prop = test_raw(79);
+    output.plane_crtc_h_prop = test_raw(80);
+    for layout in &fixture.backend.platform.outputs {
+        fixture
+            .backend
+            .pstate
+            .crtc_key_by_id
+            .insert(u32::from(layout.output.crtc), layout.key.clone());
+    }
+    fixture.backend.refresh_present_crtc_clock_epochs();
+
+    let mut direct_entered = false;
+    for attempt in 0..16_u64 {
+        let (candidate, event) = prepare_cursor_only_direct_present(&mut fixture, 21_000 + attempt);
+        if Backend::try_present_direct(&mut fixture.backend, candidate, event)
+            .expect("submit direct Present through Backend")
+        {
+            fixture.retire_output(0, 20 + u32::try_from(attempt).expect("frame fits"));
+            Backend::maybe_composite(&mut fixture.backend)
+                .expect("settle accepted direct retirement");
+            direct_entered = fixture.backend.pstate.scanout_m2.active();
+            if direct_entered {
+                break;
+            }
+        } else if fixture.backend.scene.has_pending_page_flips() {
+            fixture.retire_output(0, 40 + u32::try_from(attempt).expect("frame fits"));
+            Backend::maybe_composite(&mut fixture.backend)
+                .expect("settle composed probation frame");
+        }
+    }
+    assert!(
+        direct_entered,
+        "Backend Presents complete M2 probation: allowed={}, outputs_active={}, topology={}, cursor_eligible={}, mode={:?}, streak={}, scene_pending={}",
+        fixture.backend.scanout_allowed(),
+        fixture.backend.kms_outputs_active,
+        fixture.backend.direct_scanout_topology_eligible(),
+        fixture.backend.direct_cursor_eligible(),
+        fixture.backend.scene.cursor_mode(),
+        fixture.backend.pstate.scanout_m2.eligible_root_streak,
+        fixture.backend.scene.has_pending_page_flips(),
+    );
+
+    fixture.recorders.cursor_buffer_ledger.fail_after(
+        CursorBufferOperation::Write,
+        0,
+        libc::EAGAIN,
+    );
+    let deferred_cursor = create_cursor(&mut fixture, &[0xde, 0xad, 0xbe, 0xff]);
+    Backend::define_cursor(&mut fixture.backend, None, root, deferred_cursor.as_raw())
+        .expect("replace direct cursor through Backend");
+    let deferred_version = fixture.backend.cursor_records[&deferred_cursor.as_raw()].version;
+    assert_eq!(
+        fixture
+            .backend
+            .pstate
+            .deferred_direct_cursor
+            .as_ref()
+            .map(|record| record.version),
+        Some(deferred_version),
+        "direct upload backpressure retains the current wanted record",
+    );
+    assert!(fixture.backend.platform.cursor_plane_visible_for_output(0));
+
+    Backend::set_cursor_hidden(&mut fixture.backend, true);
+    assert!(
+        fixture.backend.pstate.deferred_direct_cursor.is_none(),
+        "Backend hide cancels the obsolete direct retry immediately",
+    );
+    assert!(!fixture.backend.platform.cursor_plane_visible_for_output(0));
+    Backend::maybe_composite(&mut fixture.backend).expect("run direct retry scheduling turn");
+    assert!(fixture.backend.pstate.scanout_m2.active());
+    assert!(
+        fixture.backend.pstate.deferred_direct_cursor.is_none(),
+        "hidden cursor is not requeued",
+    );
+    assert!(!fixture.backend.platform.cursor_plane_visible_for_output(0));
+    assert_eq!(
+        fixture.backend.platform.devices[0]
+            .cursor
+            .plane
+            .as_ref()
+            .expect("cursor plane")
+            .uploaded_version(),
+        Some(fixture.backend.cursor_records[&first_cursor.as_raw()].version),
+        "hidden retry does not upload or bind the deferred sprite",
+    );
+
+    for frame in 50..64 {
+        if !fixture
+            .backend
+            .platform
+            .cursor_atomic_event_pending_for_output(0)
+        {
+            break;
+        }
+        fixture.retire_output(0, frame);
+    }
+    assert!(
+        !fixture
+            .backend
+            .platform
+            .cursor_atomic_event_pending_for_output(0),
+        "Backend page-flip events retire cursor-only commits before DPMS",
+    );
+    fixture
+        .backend
+        .platform
+        .for_tests_accept_output_power_commits();
+    Backend::set_dpms_power(&mut fixture.backend, 3).expect("Backend DPMS drains direct scanout");
+    let _ = Backend::drain_completed_present_events(&mut fixture.backend);
+    let _ = Backend::drain_retired_present_idle_events(&mut fixture.backend);
+    fixture.assert_cursor_quiescent();
+    assert_eq!(
+        fixture
+            .recorders
+            .atomic
+            .records()
+            .into_iter()
+            .map(|record| record.kind)
+            .collect::<Vec<_>>(),
+        vec![
+            crate::drm::atomic::AtomicCommitKind::Scene,
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            crate::drm::atomic::AtomicCommitKind::CursorOnly,
+        ],
+        "direct sequence: initial scene, direct replacement, cursor detach",
+    );
+    assert_eq!(
+        fixture.recorders.page_flip_events.queued_flip_count(),
+        0,
+        "DPMS teardown drains direct event obligations",
+    );
+    let resources = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
+    drop(fixture);
+    assert_eq!(resources.end_state(), (0, 0, 0));
 }
 
 #[test]
@@ -818,6 +1406,7 @@ fn atomic_cursor_only_malformed_cursor_source_stops_at_request_validation() {
         packets
     });
 
+    let backend_put_images_before = fixture.backend.telemetry.lifetime.paint_submits;
     run_core(
         poll,
         receiver,
@@ -844,6 +1433,11 @@ fn atomic_cursor_only_malformed_cursor_source_stops_at_request_validation() {
         &valid_reply[32..48],
         known_pixels,
         "valid PutImage reaches Backend and is readable"
+    );
+    assert_eq!(
+        fixture.backend.telemetry.lifetime.paint_submits - backend_put_images_before,
+        1,
+        "the valid control request enters Backend::put_image once; short and zero-size requests do not",
     );
     let unchanged_reply = get_image_reply(7);
     assert_eq!(
@@ -1034,6 +1628,160 @@ fn atomic_cursor_only_malformed_cursor_source_stops_at_request_validation() {
         (0, 0, 0),
         "test teardown releases cursor allocations"
     );
+}
+
+fn test_raw<T: ::drm::control::ResourceHandle>(value: u32) -> T {
+    ::drm::control::from_u32(value).expect("nonzero synthetic DRM handle")
+}
+
+fn prepare_cursor_only_direct_present(
+    fixture: &mut AtomicCursorFixture,
+    present_id: u64,
+) -> (
+    yserver_core::backend::PresentScanoutCandidate,
+    yserver_core::backend::CompletedPresentEvent,
+) {
+    use crate::kms::render::store::DrawableKind;
+    use ash::vk;
+    use yserver_core::backend::{
+        Backend, CompletedPresentEvent, PresentScanoutCandidate, PresentWake,
+    };
+
+    const WINDOW: u32 = 0x7380;
+    let width = u32::from(fixture.backend.platform.fb_w);
+    let height = u32::from(fixture.backend.platform.fb_h);
+    if !fixture.backend.windows.contains_key(&WINDOW) {
+        super::super::seed_window(&mut fixture.backend, WINDOW, None, 0, 0);
+    }
+    if fixture
+        .backend
+        .store
+        .lookup(WINDOW)
+        .and_then(|id| fixture.backend.store.get(id))
+        .is_some_and(|drawable| drawable.storage.image == vk::Image::null())
+    {
+        let old = fixture
+            .backend
+            .store
+            .lookup(WINDOW)
+            .expect("seed window storage");
+        fixture.backend.store.detach_xid(WINDOW);
+        fixture.backend.store_decref_with_invalidate(old);
+        let storage = fixture
+            .backend
+            .platform
+            .gpu
+            .allocate_drawable_storage(
+                u16::try_from(width).expect("test width fits"),
+                u16::try_from(height).expect("test height fits"),
+                24,
+            )
+            .expect("allocate live direct fallback window storage");
+        fixture
+            .backend
+            .store
+            .allocate(WINDOW, DrawableKind::Window, 24, true, storage)
+            .expect("register live direct fallback window storage");
+    }
+    let target = fixture
+        .backend
+        .windows
+        .get_mut(&WINDOW)
+        .expect("synthetic root-sized window");
+    target.width = u16::try_from(width).expect("test width fits");
+    target.height = u16::try_from(height).expect("test height fits");
+    if !fixture.backend.core.top_level_order.contains(&WINDOW) {
+        fixture.backend.core.top_level_order.push(WINDOW);
+    }
+
+    let source_xid = 0x8300;
+    let source_id = fixture.backend.store.lookup(source_xid).unwrap_or_else(|| {
+        let storage = fixture
+            .backend
+            .platform
+            .gpu
+            .allocate_drawable_storage(
+                u16::try_from(width).expect("test width fits"),
+                u16::try_from(height).expect("test height fits"),
+                24,
+            )
+            .expect("allocate live direct Present source storage");
+        fixture
+            .backend
+            .store
+            .allocate(source_xid, DrawableKind::Pixmap, 24, false, storage)
+            .expect("register live direct Present source")
+    });
+    let output = &fixture.backend.platform.outputs[0];
+    let crtc = output.output.crtc;
+    let shape = crate::drm::async_flip::AsyncShape {
+        fourcc: 0x3432_5258,
+        modifier: 0,
+        pitch: width * 4,
+        width,
+        height,
+        crtcs: vec![crtc],
+        direct: true,
+    };
+    fixture
+        .backend
+        .pstate
+        .scanout_m1
+        .entries
+        .entry(source_id)
+        .or_insert_with(|| {
+            crate::kms::render::backend::ScanoutM1ProbeEntry::accepted_with_shape(
+                crate::drm::modeset::DirectScanoutProbeFramebuffer::for_tests(test_raw(
+                    0x8100 + u32::try_from(present_id).expect("test present ID fits"),
+                )),
+                shape,
+            )
+        });
+    let crtc_id = fixture
+        .backend
+        .pstate
+        .crtc_key_by_id
+        .iter()
+        .find_map(|(&id, key)| (key == &output.key).then_some(id))
+        .unwrap_or_else(|| u32::from(crtc));
+    let crtc_epoch = fixture.backend.present_crtc_clock_epoch(crtc_id);
+    let candidate = PresentScanoutCandidate {
+        client_id: 1,
+        present_id,
+        crtc_id,
+        crtc_epoch,
+        src_pixmap_xid: source_xid,
+        dst_window_xid: WINDOW,
+        src_host_xid: source_xid,
+        paint_dst_host_xid: WINDOW,
+        completion_dst_host_xid: WINDOW,
+        src_width: u16::try_from(width).expect("test width fits"),
+        src_height: u16::try_from(height).expect("test height fits"),
+        x_off: 0,
+        y_off: 0,
+        valid_region_xid: 0,
+        update_region_xid: 0,
+        update_is_full: true,
+        explicit_sync: false,
+        options: 0,
+    };
+    let event = CompletedPresentEvent {
+        client_id: yserver_protocol::x11::ClientId(1),
+        serial: u32::try_from(present_id).expect("test serial fits"),
+        host_xid: source_xid,
+        dst_host_xid: WINDOW,
+        options: 0,
+        present_id,
+        window_generation: 0,
+        crtc_id,
+        crtc_epoch,
+        msc_offset: 0,
+        completion_clock: None,
+        wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+        completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+        emit_idle: true,
+    };
+    (candidate, event)
 }
 
 #[test]
