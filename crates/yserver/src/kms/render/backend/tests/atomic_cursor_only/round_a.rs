@@ -2663,7 +2663,9 @@ fn atomic_cursor_only_backend_fixture_exposes_device_caps() {
     fixture.assert_cursor_quiescent();
 }
 
-fn clone_drm_output(output: &crate::platform::drm::Output) -> crate::platform::drm::Output {
+pub(super) fn clone_drm_output(
+    output: &crate::platform::drm::Output,
+) -> crate::platform::drm::Output {
     crate::platform::drm::Output {
         connector: output.connector,
         connector_name: output.connector_name.clone(),
@@ -4570,11 +4572,11 @@ fn atomic_cursor_only_flip_events_are_scoped_to_the_ready_device() {
     assert_eq!(resources.end_state(), (0, 0, 0));
 }
 
-const ATOMIC_CURSOR_PROPERTIES: [&str; 10] = [
+pub(super) const ATOMIC_CURSOR_PROPERTIES: [&str; 10] = [
     "FB_ID", "CRTC_ID", "CRTC_X", "CRTC_Y", "CRTC_W", "CRTC_H", "SRC_X", "SRC_Y", "SRC_W", "SRC_H",
 ];
 
-fn cursor_topology_snapshot(
+pub(super) fn cursor_topology_snapshot(
     driver_name: &str,
     hotspot_cap_accepted: bool,
     crtcs: &[u32],
@@ -4610,7 +4612,7 @@ fn connector_snapshot_for_output(
     }
 }
 
-fn schedule_rescan_clock(
+pub(super) fn schedule_rescan_clock(
     backend: &mut crate::kms::render::backend::KmsBackend,
 ) -> (std::time::Instant, std::rc::Rc<std::cell::Cell<u64>>) {
     use std::{cell::Cell, time::Duration};
@@ -5328,7 +5330,7 @@ fn atomic_cursor_only_composed_cursor_pixels_follow_output_local_eligibility() {
 }
 
 #[test]
-// Mutations: suppress retryable cursor initialization after the CRTC returns, or make the recording power executor skip production modeset assembly; the eligible-plane or recorded-request assertions must fail.
+// Mutations: suppress retryable cursor initialization, omit the post-modeset gamma restore, or skip production modeset assembly; the lifecycle assertions must fail.
 fn atomic_cursor_only_headless_enable_disable_enable_retries_initialization() {
     use std::time::Duration;
     use yserver_core::backend::Backend;
@@ -5409,16 +5411,24 @@ fn atomic_cursor_only_headless_enable_disable_enable_retries_initialization() {
     assert_eq!(factory.calls(), 0, "connected-Off discovery stays headless");
 
     let (outputs, _) = Backend::randr_outputs_and_modes(&mut fixture.backend);
-    let output_id = outputs
+    let randr_output = outputs
         .iter()
         .find(|candidate| candidate.name == key.connector_name)
         .expect("connected headless connector is in RANDR registry")
-        .output_id;
+        .clone();
+    let output_id = randr_output.output_id;
+    let crtc_id = randr_output.crtc_id;
     let mode = yserver_core::backend::ModeSpec {
         width: output.picked.width,
         height: output.picked.height,
         vrefresh: output.picked.vrefresh,
     };
+    let red: Vec<_> = (0..256).map(|value| value as u16).collect();
+    let green: Vec<_> = (0..256).map(|value| (value * 2) as u16).collect();
+    let blue: Vec<_> = (0..256).map(|value| u16::MAX - value as u16).collect();
+    Backend::set_crtc_gamma(&mut fixture.backend, crtc_id, &red, &green, &blue)
+        .expect("cache gamma through Backend while the output is off");
+    assert!(fixture.recorders.gamma.commits().is_empty());
 
     fixture
         .recorders
@@ -5436,6 +5446,8 @@ fn atomic_cursor_only_headless_enable_disable_enable_retries_initialization() {
         .expect("first explicit output activation")
     );
     assert_eq!(fixture.backend.platform.outputs.len(), 1);
+    assert_eq!(fixture.recorders.gamma.commits().len(), 1);
+    assert_eq!(fixture.recorders.gamma.commits()[0].red, red);
     assert_eq!(
         factory.calls(),
         1,
@@ -5489,6 +5501,12 @@ fn atomic_cursor_only_headless_enable_disable_enable_retries_initialization() {
         .expect("reactivate output and retry cursor initialization")
     );
     assert_eq!(fixture.backend.platform.outputs.len(), 1);
+    let gamma_commits = fixture.recorders.gamma.commits();
+    assert_eq!(gamma_commits.len(), 2);
+    assert_eq!(gamma_commits[1].crtc, u32::from(crtc));
+    assert_eq!(gamma_commits[1].red, red);
+    assert_eq!(gamma_commits[1].green, green);
+    assert_eq!(gamma_commits[1].blue, blue);
     assert_eq!(
         factory.calls(),
         2,

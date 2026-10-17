@@ -1208,6 +1208,13 @@ impl KmsBackend {
             desired_active && had_outputs,
             "RANDR CRTC configuration",
         )?;
+        if desired_active && !had_outputs {
+            // The connector's first-output modeset already restored scanout,
+            // so avoid a redundant DPMS/modeset cycle. That modeset may reset
+            // the hardware LUT, though; restore the cached RandR gamma state
+            // independently of the composed-output relight.
+            self.reapply_gamma_for_live_outputs();
+        }
         self.kms_outputs_active = desired_active;
 
         // Update input extent (cursor clamp) to reflect new fb size.

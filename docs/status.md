@@ -40,7 +40,11 @@ Cross-cutting bugs and followups that don't fit a stage live in
   services. Backend-path lavapipe fixtures cover real recorded RandR mode-blob
   assembly with a cursor plane, partial wake failure, reprobe removal, zero-
   output activation, DPMS/VT lifecycle, transparent-cursor resume, and retained
-  ownership after failed disable/drain. Re-exec qualification, real mode-blob
+  ownership after failed disable/drain. First-output activation from zero
+  outputs reapplies cached RandR gamma after its modeset without a redundant
+  output relight; the Backend regression recorded the LUT across last-output
+  disable and reactivation and passed 20/20 loaded runs. Re-exec qualification,
+  real mode-blob
   identity on hardware and hardware validation remain controller Task C11
   work. This is an interim A checkpoint: conservative retirement-time scene
   adapter removal and final recovery/reassignment and legacy deletion remain

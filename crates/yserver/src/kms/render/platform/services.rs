@@ -227,6 +227,7 @@ impl BackendEntryObserver for RecordingBackendEntryObserver {
 #[derive(Clone)]
 pub struct KmsServices {
     pub(crate) mode_blobs: Rc<dyn ModeBlobIo>,
+    pub(crate) gamma: Rc<dyn GammaIo>,
     pub(crate) cursor_buffers: Rc<dyn CursorBufferIo>,
     pub(crate) legacy_cursor: Rc<dyn LegacyCursorIo>,
     pub(crate) cursor_plane_factory: Rc<dyn CursorPlaneFactory>,
@@ -269,6 +270,8 @@ pub(crate) struct KmsTestRecorders {
     pub(crate) crtc_output_discovery: Rc<RecordingCrtcOutputDiscovery>,
     #[cfg(test)]
     pub(crate) output_power: Rc<super::power::RecordingOutputPowerExecutor>,
+    #[cfg(test)]
+    pub(crate) gamma: Rc<RecordingGammaIo>,
     pub(crate) page_flip_events:
         Rc<crate::kms::render::platform::flip_events::RecordingPageFlipEventSource>,
     pub(crate) hotplug: Rc<RecordingDisplayHotplugSource>,
@@ -349,6 +352,107 @@ impl CrtcOutputDiscovery for RecordingCrtcOutputDiscovery {
     }
 }
 
+/// Device gamma operations selected with the other KMS services so RandR
+/// cache restoration follows the same path with real devices and fixtures.
+pub(crate) trait GammaIo {
+    fn gamma_size(
+        &self,
+        device: &crate::drm::Device,
+        crtc: ::drm::control::crtc::Handle,
+    ) -> std::io::Result<u16>;
+
+    fn set_gamma(
+        &self,
+        device: &crate::drm::Device,
+        crtc: ::drm::control::crtc::Handle,
+        red: &[u16],
+        green: &[u16],
+        blue: &[u16],
+    ) -> std::io::Result<()>;
+}
+
+pub(crate) struct DrmGammaIo;
+
+impl GammaIo for DrmGammaIo {
+    fn gamma_size(
+        &self,
+        device: &crate::drm::Device,
+        crtc: ::drm::control::crtc::Handle,
+    ) -> std::io::Result<u16> {
+        use ::drm::control::Device as _;
+
+        let info = device
+            .get_crtc(crtc)
+            .map_err(|error| std::io::Error::other(format!("get_crtc failed: {error}")))?;
+        Ok(u16::try_from(info.gamma_length()).unwrap_or(u16::MAX))
+    }
+
+    fn set_gamma(
+        &self,
+        device: &crate::drm::Device,
+        crtc: ::drm::control::crtc::Handle,
+        red: &[u16],
+        green: &[u16],
+        blue: &[u16],
+    ) -> std::io::Result<()> {
+        use ::drm::control::Device as _;
+
+        device
+            .set_gamma(crtc, red, green, blue)
+            .map_err(|error| std::io::Error::other(format!("set_gamma failed: {error}")))
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GammaCommit {
+    pub(crate) crtc: u32,
+    pub(crate) red: Vec<u16>,
+    pub(crate) green: Vec<u16>,
+    pub(crate) blue: Vec<u16>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct RecordingGammaIo {
+    commits: std::cell::RefCell<Vec<GammaCommit>>,
+}
+
+#[cfg(test)]
+impl RecordingGammaIo {
+    pub(crate) fn commits(&self) -> Vec<GammaCommit> {
+        self.commits.borrow().clone()
+    }
+}
+
+#[cfg(test)]
+impl GammaIo for RecordingGammaIo {
+    fn gamma_size(
+        &self,
+        _device: &crate::drm::Device,
+        _crtc: ::drm::control::crtc::Handle,
+    ) -> std::io::Result<u16> {
+        Ok(256)
+    }
+
+    fn set_gamma(
+        &self,
+        _device: &crate::drm::Device,
+        crtc: ::drm::control::crtc::Handle,
+        red: &[u16],
+        green: &[u16],
+        blue: &[u16],
+    ) -> std::io::Result<()> {
+        self.commits.borrow_mut().push(GammaCommit {
+            crtc: u32::from(crtc),
+            red: red.to_vec(),
+            green: green.to_vec(),
+            blue: blue.to_vec(),
+        });
+        Ok(())
+    }
+}
+
 impl KmsServices {
     pub(crate) fn modeset(&self) -> KmsModesetServices {
         KmsModesetServices {
@@ -360,6 +464,7 @@ impl KmsServices {
     pub fn production() -> Self {
         Self {
             mode_blobs: Rc::new(DrmModeBlobIo),
+            gamma: Rc::new(DrmGammaIo),
             cursor_buffers: Rc::new(DrmCursorBufferIo),
             legacy_cursor: Rc::new(DrmLegacyCursorIo),
             cursor_plane_factory: Rc::new(DrmCursorPlaneFactory),
@@ -381,6 +486,7 @@ impl KmsServices {
             Rc::new(crate::drm::atomic::tests_support::RecordingAtomicCommitExecutor::default());
         let crtc_output_discovery = Rc::new(RecordingCrtcOutputDiscovery::default());
         let output_power = Rc::new(super::power::RecordingOutputPowerExecutor::default());
+        let gamma = Rc::new(RecordingGammaIo::default());
         let mode_blobs = Rc::new(RecordingModeBlobIo::default());
         let (cursor_buffers, cursor_buffer_ledger) = RecordingCursorBufferIo::new(256);
         let cursor_buffers = Rc::new(cursor_buffers);
@@ -404,6 +510,7 @@ impl KmsServices {
             cursor_plane_factory: Rc::clone(&cursor_plane_factory),
             crtc_output_discovery: Rc::clone(&crtc_output_discovery),
             output_power,
+            gamma: Rc::clone(&gamma),
             page_flip_events: Rc::clone(&page_flip_events),
             hotplug: Rc::clone(&hotplug),
             connector_snapshot: Rc::clone(&connector_snapshot),
@@ -412,6 +519,7 @@ impl KmsServices {
         });
         Self {
             mode_blobs,
+            gamma,
             cursor_buffers,
             legacy_cursor,
             cursor_plane_factory,
@@ -442,6 +550,7 @@ impl KmsServices {
             Rc::new(RecordingDisplayHotplugSource::new().expect("recording hotplug socket pair"));
         Self {
             mode_blobs,
+            gamma: Rc::new(DrmGammaIo),
             cursor_buffers,
             legacy_cursor,
             cursor_plane_factory: Rc::new(DrmCursorPlaneFactory),

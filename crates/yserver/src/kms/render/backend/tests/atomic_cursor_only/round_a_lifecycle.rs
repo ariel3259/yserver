@@ -996,3 +996,200 @@ fn atomic_cursor_only_failed_disable_retains_users() {
     drop(fixture);
     assert_eq!(resources.end_state(), (0, 0, 0));
 }
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: skip gamma restore after a first-output modeset; the re-enable must record the cached LUT again.
+fn atomic_cursor_only_headless_reactivation_reapplies_cached_gamma() {
+    use super::round_a::{
+        ATOMIC_CURSOR_PROPERTIES, clone_drm_output, cursor_topology_snapshot, schedule_rescan_clock,
+    };
+    use std::time::Duration;
+    use yserver_core::backend::Backend;
+
+    let Some((mut fixture, key, output)) =
+        AtomicCursorFixture::headless_for_lifecycle().expect("build headless fixture")
+    else {
+        return;
+    };
+    fixture
+        .backend
+        .platform
+        .for_tests_record_complete_output_power_commits();
+    let crtc = output.crtc;
+    let factory = Rc::clone(&fixture.recorders.cursor_plane_factory);
+    factory.queue_error(libc::EIO);
+    factory.queue_snapshot(cursor_topology_snapshot(
+        "amdgpu",
+        false,
+        &[crtc.into()],
+        &[(10, vec![crtc.into()], ATOMIC_CURSOR_PROPERTIES.to_vec())],
+    ));
+    let (base, elapsed_ms) = schedule_rescan_clock(&mut fixture.backend);
+    fixture.recorders.connector_snapshot.queue_snapshot(vec![
+        crate::kms::render::platform::ConnectorSnapshot {
+            key: key.clone(),
+            modes: output.modes.clone(),
+            mm_width: output.mm_width,
+            mm_height: output.mm_height,
+            edid: output.edid.clone(),
+            connector_type: output.connector_type.clone(),
+        },
+    ]);
+    fixture
+        .recorders
+        .hotplug
+        .queue_change()
+        .expect("queue headless connector discovery edge");
+    Backend::on_display_hotplug(&mut fixture.backend, &mut fixture.state);
+    let deadline = fixture
+        .backend
+        .pstate
+        .hotplug_rescan_deadline
+        .expect("Backend schedules headless connector rescan");
+    assert_eq!(deadline, base + Duration::from_millis(150));
+    assert!(Backend::reprobe_connectors(&mut fixture.backend, &mut fixture.state).is_err());
+    elapsed_ms.set(150);
+    Backend::poll_deferred_input(&mut fixture.backend, &mut fixture.state);
+    assert!(fixture.backend.platform.outputs.is_empty());
+
+    let (outputs, _) = Backend::randr_outputs_and_modes(&mut fixture.backend);
+    let randr_output = outputs
+        .into_iter()
+        .find(|candidate| candidate.name == key.connector_name)
+        .expect("connected headless RANDR output");
+    let output_id = randr_output.output_id;
+    let crtc_id = randr_output.crtc_id;
+    let mode = yserver_core::backend::ModeSpec {
+        width: output.picked.width,
+        height: output.picked.height,
+        vrefresh: output.picked.vrefresh,
+    };
+    let red: Vec<_> = (0..256).map(|value| value as u16).collect();
+    let green: Vec<_> = (0..256).map(|value| (value * 2) as u16).collect();
+    let blue: Vec<_> = (0..256).map(|value| u16::MAX - value as u16).collect();
+    let atomic_before = fixture.recorders.atomic.records().len();
+
+    fixture
+        .recorders
+        .crtc_output_discovery
+        .queue_output(clone_drm_output(&output));
+    assert!(
+        Backend::apply_crtc_config(
+            &mut fixture.backend,
+            output_id,
+            &key.connector_name,
+            Some(mode),
+            0,
+            0,
+        )
+        .expect("activate the first output from headless")
+    );
+    assert_eq!(fixture.backend.platform.outputs.len(), 1);
+    assert_eq!(
+        factory.calls(),
+        1,
+        "first cursor initialization is transiently failed"
+    );
+    Backend::set_crtc_gamma(&mut fixture.backend, crtc_id, &red, &green, &blue)
+        .expect("set gamma through Backend while the output is active");
+    assert_eq!(fixture.recorders.gamma.commits().len(), 2);
+    assert_eq!(fixture.recorders.gamma.commits()[1].red, red);
+
+    assert!(
+        Backend::apply_crtc_config(
+            &mut fixture.backend,
+            output_id,
+            &key.connector_name,
+            None,
+            0,
+            0,
+        )
+        .expect("disable the last output")
+    );
+    assert!(fixture.backend.platform.outputs.is_empty());
+
+    fixture
+        .recorders
+        .crtc_output_discovery
+        .queue_output(clone_drm_output(&output));
+    assert!(
+        Backend::apply_crtc_config(
+            &mut fixture.backend,
+            output_id,
+            &key.connector_name,
+            Some(mode),
+            0,
+            0,
+        )
+        .expect("reactivate the first output from zero outputs")
+    );
+    assert_eq!(fixture.backend.platform.outputs.len(), 1);
+    assert_eq!(
+        factory.calls(),
+        2,
+        "active topology retries cursor initialization"
+    );
+    let gamma_commits = fixture.recorders.gamma.commits();
+    assert_eq!(
+        gamma_commits.len(),
+        3,
+        "the cached gamma LUT is applied after reactivation's modeset",
+    );
+    assert_eq!(gamma_commits[2].crtc, u32::from(crtc));
+    assert_eq!(gamma_commits[2].red, red);
+    assert_eq!(gamma_commits[2].green, green);
+    assert_eq!(gamma_commits[2].blue, blue);
+
+    assert!(
+        Backend::apply_crtc_config(
+            &mut fixture.backend,
+            output_id,
+            &key.connector_name,
+            None,
+            0,
+            0,
+        )
+        .expect("Backend teardown disables the reactivated output")
+    );
+    fixture.assert_cursor_quiescent();
+
+    let records = fixture.recorders.atomic.records();
+    let records = &records[atomic_before..];
+    assert_eq!(records.len(), 4);
+    assert!(
+        records
+            .iter()
+            .all(|record| record.kind == crate::drm::atomic::AtomicCommitKind::Scene)
+    );
+    let mode_id = ::drm::control::from_u32(0xD102).expect("recorded MODE_ID property");
+    let modesets: Vec<_> = records
+        .iter()
+        .filter(|record| {
+            record
+                .properties
+                .iter()
+                .any(|update| update.object == crtc.into() && update.property == mode_id)
+        })
+        .collect();
+    assert_eq!(modesets.len(), 2, "one modeset per headless activation");
+    let blocking_disables: Vec<_> = records
+        .iter()
+        .filter(|record| record.properties.iter().all(|update| update.value == 0))
+        .collect();
+    assert_eq!(
+        blocking_disables.len(),
+        2,
+        "one disable at each zero-output boundary"
+    );
+    assert!(records.iter().all(|record| record.events.is_empty()));
+    assert!(
+        records
+            .iter()
+            .all(|record| record.result == crate::drm::atomic::tests_support::ScriptedResult::Ok)
+    );
+
+    let ledger = Rc::clone(&fixture.recorders.cursor_buffer_ledger);
+    drop(fixture);
+    assert_eq!(ledger.end_state(), (0, 0, 0));
+}

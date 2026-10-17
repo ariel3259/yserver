@@ -1659,8 +1659,6 @@ impl KmsBackend {
             u16,
         )>,
     > {
-        use ::drm::control::Device as ControlDevice;
-
         let Some(layout) = self
             .platform
             .outputs
@@ -1673,12 +1671,16 @@ impl KmsBackend {
         let Some(device) = self.platform.device_for_output(&layout.key) else {
             return Ok(None);
         };
-        let info = device.device.get_crtc(crtc).map_err(|e| {
-            io::Error::other(format!(
-                "get_crtc gamma size for {output_key:?} failed: {e}"
-            ))
-        })?;
-        let size = u16::try_from(info.gamma_length()).unwrap_or(u16::MAX);
+        let size = self
+            .platform
+            .services
+            .gamma
+            .gamma_size(&device.device, crtc)
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "get_crtc gamma size for {output_key:?} failed: {error}"
+                ))
+            })?;
         Ok(Some((layout.key.device_key, crtc, size)))
     }
 
@@ -1730,8 +1732,6 @@ impl KmsBackend {
     }
 
     fn apply_gamma_to_live_output(&self, output_key: &OutputKey) -> io::Result<()> {
-        use ::drm::control::Device as ControlDevice;
-
         let Some((device_key, crtc, gamma_size)) = self.live_crtc_and_gamma_size(output_key)?
         else {
             return Ok(());
@@ -1743,9 +1743,10 @@ impl KmsBackend {
         let Some(device) = self.platform.device_for_key(device_key) else {
             return Ok(());
         };
-        device
-            .device
-            .set_gamma(crtc, &lut.red, &lut.green, &lut.blue)
+        self.platform
+            .services
+            .gamma
+            .set_gamma(&device.device, crtc, &lut.red, &lut.green, &lut.blue)
             .map_err(|e| io::Error::other(format!("set_gamma for {output_key:?} failed: {e}")))
     }
 
