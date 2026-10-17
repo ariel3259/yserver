@@ -547,48 +547,50 @@ pub(super) fn apply_cursor_transition_on_retire(
             y,
         } => {
             let prior_visible = sink.cursor_plane().visible(output_idx);
-            // Upload if version doesn't match. `upload_image` is
-            // already idempotent-deduplicated by value inside
-            // `CursorPlane`, but skipping the FFI when we know the
-            // version matches is cheaper. Bytes come from the
+            // Stage the complete image identity, including its hotspot.
+            // A hotspot-only update may keep the same image version, so the
+            // backend owns the deduplication decision. Bytes come from the
             // scene's current `CursorEntry` (cloned-Arc, no copy)
             // when its version matches the transition's. A mismatch never
             // binds stale pixels: the old binding must be hidden successfully
             // or remain authoritative with a version-qualified Show retry.
-            let upload_ready = if sink.cursor_plane().uploaded_version(output_idx)
-                != Some(upload_version)
+            let upload_ready = if sink.cursor_plane().uploaded_image_matches(
+                output_idx,
+                upload_version,
+                hot_x,
+                hot_y,
+            ) {
+                true
+            } else if let Some(entry) = inner.cursor.as_ref()
+                && entry.record_version == upload_version
+                && let Some(bytes) = entry.bgra_bytes.as_ref()
             {
-                if let Some(entry) = inner.cursor.as_ref()
-                    && entry.record_version == upload_version
-                    && let Some(bytes) = entry.bgra_bytes.as_ref()
-                {
-                    match sink.cursor_plane_mut().upload(
-                        output_idx,
-                        upload_version,
-                        entry.extent.width,
-                        entry.extent.height,
-                        bytes.as_ref(),
-                    ) {
-                        Ok(crate::kms::render::scene::CursorUploadOutcome::Ready) => true,
-                        Ok(crate::kms::render::scene::CursorUploadOutcome::Deferred) => {
-                            return CursorTransitionResult::Deferred;
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "render cursor: retire-time upload (v{upload_version}) failed: {e}"
-                            );
-                            false
-                        }
+                match sink.cursor_plane_mut().upload(
+                    output_idx,
+                    upload_version,
+                    hot_x,
+                    hot_y,
+                    entry.extent.width,
+                    entry.extent.height,
+                    bytes.as_ref(),
+                ) {
+                    Ok(crate::kms::render::scene::CursorUploadOutcome::Ready) => true,
+                    Ok(crate::kms::render::scene::CursorUploadOutcome::Deferred) => {
+                        return CursorTransitionResult::Deferred;
                     }
-                } else {
-                    log::debug!(
-                        "render cursor: retire-time upload (v{upload_version}) — \
-                         no matching entry bytes; retaining the current binding for retry"
-                    );
-                    return CursorTransitionResult::Deferred;
+                    Err(e) => {
+                        log::warn!(
+                            "render cursor: retire-time upload (v{upload_version}) failed: {e}"
+                        );
+                        false
+                    }
                 }
             } else {
-                true
+                log::debug!(
+                    "render cursor: retire-time upload (v{upload_version}) — \
+                     no matching entry bytes; retaining the current binding for retry"
+                );
+                return CursorTransitionResult::Deferred;
             };
             if !upload_ready {
                 // Keep the accepted image bound until the wanted replacement

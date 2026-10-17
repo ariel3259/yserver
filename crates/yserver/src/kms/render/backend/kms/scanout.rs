@@ -459,6 +459,8 @@ impl KmsBackend {
             let upload = self.platform.cursor_plane_upload_image_for_output(
                 output_idx,
                 record.version,
+                record.hot_x,
+                record.hot_y,
                 u32::from(record.width),
                 u32::from(record.height),
                 &record.bgra_bytes,

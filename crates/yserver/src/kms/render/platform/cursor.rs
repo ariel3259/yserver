@@ -1334,6 +1334,8 @@ impl PlatformBackend {
         &mut self,
         output_idx: usize,
         version: u64,
+        hot_x: u16,
+        hot_y: u16,
         width: u32,
         height: u32,
         bgra_bytes: &[u8],
@@ -1347,7 +1349,7 @@ impl PlatformBackend {
             .plane
             .as_mut()
             .expect("available cursor state has a plane")
-            .upload_image(version, width, height, bgra_bytes);
+            .upload_image(version, hot_x, hot_y, width, height, bgra_bytes);
         // Only a real upload attempt is classified. The availability
         // precheck above and scene-side version races are not driver
         // observations and must not extend this output's backoff.
@@ -1387,6 +1389,24 @@ impl PlatformBackend {
             .plane
             .as_ref()
             .and_then(|plane| plane.uploaded_version())
+    }
+
+    pub(crate) fn cursor_plane_uploaded_image_matches_for_output(
+        &self,
+        output_idx: usize,
+        version: u64,
+        hot_x: u16,
+        hot_y: u16,
+    ) -> bool {
+        let Ok((device_idx, crtc, _, _)) = self.cursor_output_route(output_idx) else {
+            return false;
+        };
+        let state = &self.devices[device_idx].cursor;
+        state.available_on(crtc)
+            && state
+                .plane
+                .as_ref()
+                .is_some_and(|plane| plane.uploaded_image_matches(version, hot_x, hot_y))
     }
 
     /// Submit an atomic binding on `output_idx`'s CRTC at root position `(x, y)`.

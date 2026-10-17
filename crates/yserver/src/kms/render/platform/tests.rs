@@ -1473,7 +1473,7 @@ fn primary_first_explicit_enable_initializes_and_exposes_fresh_upload_state() {
 
     let bytes = vec![0_u8; 16 * 16 * 4];
     platform
-        .cursor_plane_upload_image_for_output(0, 7, 16, 16, &bytes)
+        .cursor_plane_upload_image_for_output(0, 7, 0, 0, 16, 16, &bytes)
         .expect("fresh lazy plane accepts its first retire-time upload");
     assert_eq!(
         platform.cursor_plane_uploaded_version_for_output(0),
@@ -1640,7 +1640,7 @@ fn initialized_cursor_plane_persists_but_reuploads_across_last_disable_and_reena
         install_test_cursor_plane,
     ));
     platform
-        .cursor_plane_upload_image_for_output(0, 9, 16, 16, &[0_u8; 16 * 16 * 4])
+        .cursor_plane_upload_image_for_output(0, 9, 0, 0, 16, 16, &[0_u8; 16 * 16 * 4])
         .unwrap();
     assert_eq!(
         platform.devices[0]
@@ -1684,7 +1684,7 @@ fn initialized_cursor_plane_persists_but_reuploads_across_last_disable_and_reena
     assert!(platform.cursor_plane_available_for_output(0));
     assert_eq!(platform.cursor_plane_uploaded_version_for_output(0), None);
     platform
-        .cursor_plane_upload_image_for_output(0, 10, 16, 16, &[0_u8; 16 * 16 * 4])
+        .cursor_plane_upload_image_for_output(0, 10, 0, 0, 16, 16, &[0_u8; 16 * 16 * 4])
         .expect("first retirement after re-enable refreshes retained storage");
     assert_eq!(
         platform.cursor_plane_uploaded_version_for_output(0),

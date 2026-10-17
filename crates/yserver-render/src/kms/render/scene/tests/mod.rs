@@ -138,14 +138,22 @@ impl CursorPlaneSink for TestSink {
         false
     }
 
-    fn uploaded_version(&self, _output_idx: usize) -> Option<u64> {
-        None
+    fn uploaded_image_matches(
+        &self,
+        _output_idx: usize,
+        _version: u64,
+        _hot_x: u16,
+        _hot_y: u16,
+    ) -> bool {
+        false
     }
 
     fn upload(
         &mut self,
         _output_idx: usize,
         _version: u64,
+        _hot_x: u16,
+        _hot_y: u16,
         _width: u32,
         _height: u32,
         _bgra_bytes: &[u8],

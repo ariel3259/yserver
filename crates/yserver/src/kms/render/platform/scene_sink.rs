@@ -389,19 +389,29 @@ impl CursorPlaneSink for PlatformBackend {
         self.cursor_plane_visible_for_output(output_idx)
     }
 
-    fn uploaded_version(&self, output_idx: usize) -> Option<u64> {
-        self.cursor_plane_uploaded_version_for_output(output_idx)
+    fn uploaded_image_matches(
+        &self,
+        output_idx: usize,
+        version: u64,
+        hot_x: u16,
+        hot_y: u16,
+    ) -> bool {
+        self.cursor_plane_uploaded_image_matches_for_output(output_idx, version, hot_x, hot_y)
     }
 
     fn upload(
         &mut self,
         output_idx: usize,
         version: u64,
+        hot_x: u16,
+        hot_y: u16,
         width: u32,
         height: u32,
         bgra_bytes: &[u8],
     ) -> io::Result<CursorUploadOutcome> {
-        self.cursor_plane_upload_image_for_output(output_idx, version, width, height, bgra_bytes)
+        self.cursor_plane_upload_image_for_output(
+            output_idx, version, hot_x, hot_y, width, height, bgra_bytes,
+        )
     }
 
     fn show(

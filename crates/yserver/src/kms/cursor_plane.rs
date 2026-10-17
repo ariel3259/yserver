@@ -993,16 +993,13 @@ impl CursorPlane {
     pub fn upload_image(
         &mut self,
         version: u64,
+        hot_x: u16,
+        hot_y: u16,
         image_w: u32,
         image_h: u32,
         bgra_bytes: &[u8],
     ) -> io::Result<yserver_render::kms::render::scene::CursorUploadOutcome> {
-        if self.uploaded_version == Some(version)
-            && self
-                .sprite_pool
-                .candidate_lease()
-                .is_some_and(|lease| lease.version() == version)
-        {
+        if self.uploaded_image_matches(version, hot_x, hot_y) {
             return Ok(yserver_render::kms::render::scene::CursorUploadOutcome::Ready);
         }
         let Some(buffer) = self.cursor_buffer.as_mut() else {
@@ -1013,6 +1010,8 @@ impl CursorPlane {
             Rc::clone(&self.device),
             buffer_io,
             version,
+            hot_x,
+            hot_y,
             image_w,
             image_h,
             bgra_bytes,
@@ -1031,6 +1030,14 @@ impl CursorPlane {
     #[must_use]
     pub fn uploaded_version(&self) -> Option<u64> {
         self.uploaded_version
+    }
+
+    pub(crate) fn uploaded_image_matches(&self, version: u64, hot_x: u16, hot_y: u16) -> bool {
+        self.uploaded_version == Some(version)
+            && self
+                .sprite_pool
+                .candidate_lease()
+                .is_some_and(|lease| lease.matches(version, hot_x, hot_y))
     }
 
     pub(crate) fn candidate_sprite(&self) -> Option<(SpriteBufferLease, u32)> {
@@ -1563,7 +1570,7 @@ mod tests {
         let mut p = PlatformBackend::for_tests();
         assert!(!p.cursor_plane_available());
         assert!(
-            p.cursor_plane_upload_image_for_output(0, 1, 16, 16, &[0u8; 16 * 16 * 4])
+            p.cursor_plane_upload_image_for_output(0, 1, 0, 0, 16, 16, &[0u8; 16 * 16 * 4])
                 .is_err()
         );
         assert!(p.cursor_plane_show_on_crtc(0, 0, 0, 0, 0).is_err());

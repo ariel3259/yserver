@@ -210,7 +210,13 @@ impl std::fmt::Display for CursorShowFailure {
 pub trait CursorPlaneSink {
     fn fits(&self, output_idx: usize, width: u32, height: u32) -> bool;
     fn visible(&self, output_idx: usize) -> bool;
-    fn uploaded_version(&self, output_idx: usize) -> Option<u64>;
+    fn uploaded_image_matches(
+        &self,
+        output_idx: usize,
+        version: u64,
+        hot_x: u16,
+        hot_y: u16,
+    ) -> bool;
     /// # Errors
     ///
     /// The upload failed.
@@ -218,6 +224,8 @@ pub trait CursorPlaneSink {
         &mut self,
         output_idx: usize,
         version: u64,
+        hot_x: u16,
+        hot_y: u16,
         width: u32,
         height: u32,
         bgra_bytes: &[u8],

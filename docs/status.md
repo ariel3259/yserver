@@ -70,6 +70,26 @@ Cross-cutting bugs and followups that don't fit a stage live in
   would violate the Backend-path test rule. Hardware validation remains with
   controller Task C11; no hardware was used here.
 
+- **2026-10-17 atomic-cursor-only A7 (implementation complete):** Cursor sprite
+  identity now includes hotspot as well as version, and scene retirement passes
+  that full identity through the upload path. The per-device pool preserves
+  shared framebuffer bytes until every CRTC replacement event retires, caps
+  growth at `max(2, N+1)`, coalesces pressure to the newest animation frame,
+  and retries it after the final old user releases without pointer motion.
+  Backend tests withhold output B's recorded page-flip event while retiring A's
+  events, keeping B's real scene commit in flight; no allocator seam was added.
+  Tests cover staggered shared-FB replacement, pool pressure, same-version
+  hotspot changes, and colliding synthetic KMS handles across device-backed
+  fixtures. The four new ignored tests passed 20/20 each under 16 CPU busy
+  loops. The six requested ownership/pressure/hotspot mutations failed their
+  intended assertions and were reverted. Default and whole ignored workspace
+  suites, render-acceptance default/ignored, build, both Clippy gates, nightly
+  and stable formatting, and layout passed under lavapipe. No SYNC_FD capability
+  skips were reported. The new 1,058-line test module is under the 6,000-line
+  test ceiling; the layout script enumerates tracked paths, so this untracked
+  file was also counted directly. Hardware validation remains with controller
+  Task C11; no hardware was used here.
+
 The repository-wide code-quality and technical-debt review from 2026-07-26
 lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 

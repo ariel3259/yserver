@@ -7,22 +7,30 @@ use super::ops::{CursorBuffer, CursorBufferIo};
 use crate::drm::Device;
 use yserver_render::kms::render::scene::CursorUploadOutcome;
 
-/// A staged slot/version pair for the atomic binding phase.
+/// A staged image/hotspot identity for the atomic binding phase.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SpriteBufferLease {
     slot: usize,
     version: u64,
+    hot_x: u16,
+    hot_y: u16,
 }
 
 impl SpriteBufferLease {
+    #[cfg(test)]
     pub(crate) fn version(self) -> u64 {
         self.version
+    }
+
+    pub(crate) fn matches(self, version: u64, hot_x: u16, hot_y: u16) -> bool {
+        self.version == version && self.hot_x == hot_x && self.hot_y == hot_y
     }
 }
 
 struct SpriteBuffer {
     buffer: CursorBuffer,
     version: Option<u64>,
+    hotspot: Option<(u16, u16)>,
     users: usize,
     prepared_users: usize,
 }
@@ -41,6 +49,8 @@ pub(crate) struct SpritePool {
 
 struct WantedSprite {
     version: u64,
+    hot_x: u16,
+    hot_y: u16,
     width: u32,
     height: u32,
     bgra_bytes: Vec<u8>,
@@ -75,6 +85,8 @@ impl SpritePool {
         device: Rc<Device>,
         io: Rc<dyn CursorBufferIo>,
         version: u64,
+        hot_x: u16,
+        hot_y: u16,
         image_width: u32,
         image_height: u32,
         bgra_bytes: &[u8],
@@ -88,6 +100,8 @@ impl SpritePool {
         )?;
         self.wanted = Some(WantedSprite {
             version,
+            hot_x,
+            hot_y,
             width: image_width,
             height: image_height,
             bgra_bytes: bgra_bytes.to_vec(),
@@ -124,12 +138,14 @@ impl SpritePool {
                 SpriteBuffer {
                     buffer: first,
                     version: None,
+                    hotspot: None,
                     users: 0,
                     prepared_users: 0,
                 },
                 SpriteBuffer {
                     buffer: second,
                     version: None,
+                    hotspot: None,
                     users: 0,
                     prepared_users: 0,
                 },
@@ -143,7 +159,7 @@ impl SpritePool {
             .version;
         if self
             .candidate
-            .is_some_and(|lease| lease.version == wanted_version)
+            .is_some_and(|lease| lease.matches(wanted_version, hot_x, hot_y))
         {
             return Ok(CursorUploadOutcome::Ready);
         }
@@ -163,6 +179,7 @@ impl SpritePool {
             self.buffers.push(SpriteBuffer {
                 buffer,
                 version: None,
+                hotspot: None,
                 users: 0,
                 prepared_users: 0,
             });
@@ -177,7 +194,13 @@ impl SpritePool {
         {
             Ok(()) => {
                 self.buffers[slot].version = Some(version);
-                self.candidate = Some(SpriteBufferLease { slot, version });
+                self.buffers[slot].hotspot = Some((wanted.hot_x, wanted.hot_y));
+                self.candidate = Some(SpriteBufferLease {
+                    slot,
+                    version,
+                    hot_x: wanted.hot_x,
+                    hot_y: wanted.hot_y,
+                });
                 Ok(CursorUploadOutcome::Ready)
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -202,7 +225,7 @@ impl SpritePool {
     pub(crate) fn framebuffer_for_lease(&self, lease: SpriteBufferLease) -> Option<u32> {
         self.buffers
             .get(lease.slot)
-            .filter(|buffer| buffer.version == Some(lease.version))
+            .filter(|buffer| lease_matches(buffer, lease))
             .map(|buffer| u32::from(buffer.buffer.fb_id()))
     }
 
@@ -210,7 +233,7 @@ impl SpritePool {
         let Some(buffer) = self.buffers.get_mut(lease.slot) else {
             return false;
         };
-        if buffer.version != Some(lease.version) {
+        if !lease_matches(buffer, lease) {
             return false;
         }
         buffer.prepared_users = buffer.prepared_users.saturating_add(1);
@@ -221,7 +244,7 @@ impl SpritePool {
         let Some(buffer) = self.buffers.get_mut(lease.slot) else {
             return false;
         };
-        if buffer.version != Some(lease.version) || buffer.prepared_users == 0 {
+        if !lease_matches(buffer, lease) || buffer.prepared_users == 0 {
             return false;
         }
         buffer.prepared_users -= 1;
@@ -230,16 +253,16 @@ impl SpritePool {
     }
 
     pub(crate) fn can_accept_reserved(&self, lease: SpriteBufferLease) -> bool {
-        self.buffers.get(lease.slot).is_some_and(|buffer| {
-            buffer.version == Some(lease.version) && buffer.prepared_users > 0
-        })
+        self.buffers
+            .get(lease.slot)
+            .is_some_and(|buffer| lease_matches(buffer, lease) && buffer.prepared_users > 0)
     }
 
     pub(crate) fn reject_reserved(&mut self, lease: SpriteBufferLease) -> bool {
         let Some(buffer) = self.buffers.get_mut(lease.slot) else {
             return false;
         };
-        if buffer.version != Some(lease.version) || buffer.prepared_users == 0 {
+        if !lease_matches(buffer, lease) || buffer.prepared_users == 0 {
             return false;
         }
         buffer.prepared_users -= 1;
@@ -250,7 +273,7 @@ impl SpritePool {
         let Some(buffer) = self.buffers.get_mut(lease.slot) else {
             return false;
         };
-        if buffer.version != Some(lease.version) || buffer.users == 0 {
+        if !lease_matches(buffer, lease) || buffer.users == 0 {
             return false;
         }
         buffer.users -= 1;
@@ -272,6 +295,7 @@ impl SpritePool {
             return false;
         }
         buffer.version = None;
+        buffer.hotspot = None;
         self.candidate = None;
         true
     }
@@ -280,7 +304,7 @@ impl SpritePool {
     pub(crate) fn user_count(&self, lease: SpriteBufferLease) -> Option<usize> {
         self.buffers
             .get(lease.slot)
-            .filter(|buffer| buffer.version == Some(lease.version))
+            .filter(|buffer| lease_matches(buffer, lease))
             .map(|buffer| buffer.users)
     }
 
@@ -308,6 +332,10 @@ impl SpritePool {
     pub(crate) fn candidate_version(&self) -> Option<u64> {
         self.candidate.map(|lease| lease.version)
     }
+}
+
+fn lease_matches(buffer: &SpriteBuffer, lease: SpriteBufferLease) -> bool {
+    buffer.version == Some(lease.version) && buffer.hotspot == Some((lease.hot_x, lease.hot_y))
 }
 
 fn allocation_outcome(error: io::Error) -> io::Result<CursorUploadOutcome> {
