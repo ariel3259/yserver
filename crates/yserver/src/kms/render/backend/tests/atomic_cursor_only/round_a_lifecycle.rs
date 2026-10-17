@@ -160,6 +160,20 @@ fn assert_detached_ids(
     assert_property(record, plane, properties.crtc_id, 0);
 }
 
+fn cursor_properties_for_output(
+    fixture: &AtomicCursorFixture,
+    output_idx: usize,
+) -> crate::kms::cursor_plane::topology::CursorPlaneProperties {
+    let layout = &fixture.backend.platform.outputs[output_idx];
+    fixture
+        .backend
+        .platform
+        .device_for_key(layout.key.device_key)
+        .and_then(|device| device.cursor.plane.as_ref())
+        .and_then(|plane| plane.properties_for(layout.output.crtc))
+        .expect("eligible output cursor properties")
+}
+
 fn attached_fixture() -> Option<AtomicCursorFixture> {
     use yserver_core::backend::Backend;
 
@@ -333,7 +347,7 @@ fn enter_direct_scanout(fixture: &mut AtomicCursorFixture) {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutations: skip lifecycle cursor invalidation, hide reconciliation when direct is inactive, omit its full detached state, clear a lease before the old-event drain, or rearm through a legacy cursor operation.
+// Mutations: skip lifecycle/modeset cursor invalidation, hide reconciliation when direct is inactive, omit its full detached state, clear a lease before the old-event drain, or rearm through a legacy cursor operation.
 fn atomic_cursor_only_lifecycle_invalidates_and_drains() {
     use yserver_core::{backend::Backend, core_loop::input_inventory::InputInventory};
 
@@ -515,65 +529,122 @@ fn atomic_cursor_only_lifecycle_invalidates_and_drains() {
     drop(fixture);
     assert_eq!(resources.end_state(), (0, 0, 0));
 
-    // Exercise the real Backend RandR modeset entry with the production
-    // output-power path. This Vk fixture intentionally has no cursor plane,
-    // so the synthetic DRM error cannot quarantine a test cursor framebuffer.
-    // The entry reaches direct object-property lookup (ENOTTY); real mode-blob
-    // identity through a modeset remains C11 hardware validation.
-    let backend = crate::kms::render::backend::KmsBackend::for_tests_with_vk()
-        .expect("build Vulkan modeset fixture");
-    let recorders = Rc::clone(
-        backend
-            .platform
-            .services
-            .test_recorders
-            .as_ref()
-            .expect("recording KMS services"),
-    );
-    let mut modeset_fixture = AtomicCursorFixture {
-        backend,
-        recorders,
-        state: yserver_core::server::ServerState::new(),
+    // RandR set_crtc_config uses the same production modeset builder as DPMS.
+    // This fixture has an initialized cursor plane; the accepted primary
+    // modeset must be assembled and recorded before the route is re-lit.
+    let Some(mut modeset_fixture) = attached_fixture() else {
+        return;
     };
-    modeset_fixture
-        .backend
-        .initialize_provider_output_sources()
-        .expect("initialize provider route before RANDR modeset");
     let output =
         clone_output_for_recorded_discovery(&modeset_fixture.backend.platform.outputs[0].output);
     let connector = output.connector_name.clone();
+    let mode = yserver_core::backend::ModeSpec {
+        width: output.picked.width,
+        height: output.picked.height,
+        vrefresh: output.picked.vrefresh,
+    };
     let output_id = Backend::randr_outputs_and_modes(&mut modeset_fixture.backend)
         .0
         .into_iter()
         .find(|candidate| candidate.name == connector)
         .expect("RandR output")
         .output_id;
+    let providers = Backend::randr_providers(&mut modeset_fixture.backend);
+    let source_id = providers
+        .iter()
+        .find(|provider| {
+            !provider.is_gpu
+                && provider.outputs.is_empty()
+                && provider.capabilities
+                    & yserver_protocol::x11::randr::PROVIDER_CAPABILITY_SOURCE_OUTPUT
+                    != 0
+        })
+        .expect("selected render source provider")
+        .provider_id;
+    let sink_id = providers
+        .iter()
+        .find(|provider| provider.outputs.contains(&output_id))
+        .expect("KMS sink provider")
+        .provider_id;
+    modeset_fixture.state.randr.set_providers(providers);
+    assert!(
+        Backend::set_provider_output_source(
+            &mut modeset_fixture.backend,
+            &mut modeset_fixture.state,
+            sink_id,
+            Some(source_id),
+        )
+        .expect("attach output to selected renderer through Backend")
+    );
     modeset_fixture
         .recorders
         .crtc_output_discovery
         .queue_output(output);
-    let before_attempt = modeset_fixture.recorders.atomic.records().len();
-    let error = Backend::apply_crtc_config(
-        &mut modeset_fixture.backend,
-        output_id,
-        &connector,
-        Some(yserver_core::backend::ModeSpec {
-            width: 800,
-            height: 600,
-            vrefresh: 60,
-        }),
-        13,
-        0,
-    )
-    .expect_err("synthetic DRM stops at direct property lookup");
-    assert_eq!(error.raw_os_error(), Some(libc::ENOTTY));
-    assert_eq!(modeset_fixture.recorders.crtc_output_discovery.calls(), 1);
-    assert_eq!(
-        modeset_fixture.recorders.atomic.records().len(),
-        before_attempt
+    let before_modeset = modeset_fixture.recorders.atomic.records().len();
+    let before_blobs = modeset_fixture.recorders.mode_blobs.records().len();
+    assert!(
+        Backend::apply_crtc_config(
+            &mut modeset_fixture.backend,
+            output_id,
+            &connector,
+            Some(mode),
+            13,
+            0,
+        )
+        .expect("Backend RandR set_crtc_config reaches the shared production modeset")
     );
-    assert_eq!(modeset_fixture.backend.platform.outputs.len(), 1);
-    assert_eq!(modeset_fixture.backend.platform.outputs[0].x, 0);
+    assert_eq!(modeset_fixture.backend.platform.outputs[0].x, 13);
+    let records = modeset_fixture.recorders.atomic.records();
+    assert_eq!(records.len(), before_modeset + 3);
+    assert!(records[before_modeset..].iter().all(|record| {
+        record.kind == crate::drm::atomic::AtomicCommitKind::Scene
+            && record.flags == ::drm::control::AtomicCommitFlags::ALLOW_MODESET
+            && record.events.is_empty()
+    }));
+    assert!(
+        records[before_modeset]
+            .properties
+            .iter()
+            .all(|update| update.value == 0)
+    );
+    let created_blobs: Vec<_> = modeset_fixture.recorders.mode_blobs.records()[before_blobs..]
+        .iter()
+        .filter_map(|record| match record {
+            crate::drm::io::ModeBlobRecord::Create { blob, .. } => Some(*blob),
+            crate::drm::io::ModeBlobRecord::Destroy { .. } => None,
+        })
+        .collect();
+    assert_eq!(
+        created_blobs.len(),
+        2,
+        "enable and relight each create a mode blob"
+    );
+    let crtc = modeset_fixture.backend.platform.outputs[0].output.crtc;
+    let mode_id = ::drm::control::from_u32(0xD102).expect("recorded CRTC MODE_ID property");
+    assert_property(
+        &records[before_modeset + 1],
+        crtc,
+        mode_id,
+        created_blobs[0],
+    );
+    assert_property(
+        &records[before_modeset + 2],
+        crtc,
+        mode_id,
+        created_blobs[1],
+    );
+    assert_eq!(modeset_fixture.recorders.mode_blobs.live_count(), 0);
+    let modeset_state = &modeset_fixture.backend.platform.devices[0]
+        .cursor
+        .crtc_states[&crtc];
+    assert!(
+        !modeset_state.valid,
+        "modeset leaves cursor comparison invalidated"
+    );
+    assert!(modeset_state.applied.is_none());
+
+    Backend::set_dpms_power(&mut modeset_fixture.backend, 3)
+        .expect("modeset fixture final all-off teardown");
     assert_eq!(modeset_fixture.recorders.mode_blobs.live_count(), 0);
     modeset_fixture.assert_cursor_quiescent();
     let resources = Rc::clone(&modeset_fixture.recorders.cursor_buffer_ledger);
@@ -583,9 +654,163 @@ fn atomic_cursor_only_lifecycle_invalidates_and_drains() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutations: clear actual cursor users when a blocking disable fails, or clear lifecycle/cache references before old events drain; retained ownership and retry assertions must fail.
-fn atomic_cursor_only_failed_disable_retains_users() {
+// Mutation: reconcile hidden cursor intent on a CRTC whose wake failed, or omit the enabled-CRTC submission guard; failed-route intent/event assertions must fail.
+fn atomic_cursor_only_partial_wake_reconciles_only_enabled_routes() {
     use yserver_core::backend::Backend;
+
+    let Some(mut fixture) =
+        AtomicCursorFixture::new_with_two_outputs().expect("build two-output partial-wake fixture")
+    else {
+        return;
+    };
+    fixture
+        .backend
+        .platform
+        .for_tests_record_complete_output_power_commits();
+    Backend::set_cursor_hidden(&mut fixture.backend, true);
+    let cursor0 = cursor_properties_for_output(&fixture, 0);
+    let cursor1 = cursor_properties_for_output(&fixture, 1);
+
+    let before_off = fixture.recorders.atomic.records().len();
+    Backend::set_dpms_power(&mut fixture.backend, 3).expect("disable both outputs before wake");
+    let off_records = fixture.recorders.atomic.records();
+    assert_eq!(off_records.len(), before_off + 2);
+    assert_detached_ids(&off_records[before_off], cursor0);
+    assert_detached_ids(&off_records[before_off + 1], cursor1);
+
+    fixture.recorders.atomic.script_result(Ok(()));
+    fixture
+        .recorders
+        .atomic
+        .script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
+    let before_wake = fixture.recorders.atomic.records().len();
+    let error = Backend::set_dpms_power(&mut fixture.backend, 0)
+        .expect_err("second output wake is rejected after the first succeeds");
+    assert!(error.to_string().contains("atomic modeset commit rejected"));
+    let records = fixture.recorders.atomic.records();
+    assert_eq!(records.len(), before_wake + 3);
+    assert_eq!(
+        records[before_wake].kind,
+        crate::drm::atomic::AtomicCommitKind::Scene
+    );
+    assert_eq!(
+        records[before_wake + 1].kind,
+        crate::drm::atomic::AtomicCommitKind::Scene
+    );
+    assert_eq!(
+        records[before_wake + 2].kind,
+        crate::drm::atomic::AtomicCommitKind::CursorOnly
+    );
+    assert_detached_ids(&records[before_wake + 2], cursor0);
+    assert!(
+        !records[before_wake + 2]
+            .properties
+            .iter()
+            .any(|update| update.object == cursor1.plane.into())
+    );
+    assert!(fixture.backend.platform.cursor_output_is_active(0));
+    assert!(!fixture.backend.platform.cursor_output_is_active(1));
+    assert!(
+        fixture.backend.platform.devices[0].cursor.crtc_states
+            [&fixture.backend.platform.outputs[1].output.crtc]
+            .intent
+            .is_none()
+    );
+    assert!(
+        fixture
+            .backend
+            .platform
+            .cursor_atomic_event_pending_for_output(0)
+    );
+    assert!(
+        !fixture
+            .backend
+            .platform
+            .cursor_atomic_event_pending_for_output(1)
+    );
+    fixture.retire_output(0, 61);
+
+    let before_retry = fixture.recorders.atomic.records().len();
+    Backend::set_dpms_power(&mut fixture.backend, 0)
+        .expect("retry both output modesets after partial wake");
+    let records = fixture.recorders.atomic.records();
+    assert_eq!(records.len(), before_retry + 4);
+    assert_eq!(
+        records[before_retry + 2].kind,
+        crate::drm::atomic::AtomicCommitKind::CursorOnly
+    );
+    assert_eq!(
+        records[before_retry + 3].kind,
+        crate::drm::atomic::AtomicCommitKind::CursorOnly
+    );
+    assert_detached_ids(&records[before_retry + 2], cursor0);
+    assert_detached_ids(&records[before_retry + 3], cursor1);
+    fixture.retire_output(0, 62);
+    fixture.retire_output(1, 63);
+    Backend::set_dpms_power(&mut fixture.backend, 3).expect("final all-off after partial wake");
+    fixture.assert_cursor_quiescent();
+    assert!(fixture.recorders.legacy_cursor.records().is_empty());
+    assert_eq!(fixture.recorders.mode_blobs.live_count(), 0);
+    let resources = Rc::clone(&fixture.recorders.cursor_buffer_ledger);
+    drop(fixture);
+    assert_eq!(resources.end_state(), (0, 0, 0));
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: remove the cursor detach from connector-removal's blocking disable; the recorded same-request IDs and framebuffer end state must fail.
+fn atomic_cursor_only_reprobe_removal_detaches_before_reclaim() {
+    use yserver_core::backend::Backend;
+
+    let Some(mut fixture) = attached_fixture() else {
+        return;
+    };
+    let cursor = cursor_properties_for_output(&fixture, 0);
+    let base = std::time::Instant::now();
+    let elapsed_ms = Rc::new(std::cell::Cell::new(0_u64));
+    let clock_ms = Rc::clone(&elapsed_ms);
+    fixture
+        .backend
+        .for_tests_set_monotonic_clock(Rc::new(move || {
+            base + std::time::Duration::from_millis(clock_ms.get())
+        }));
+    fixture
+        .recorders
+        .connector_snapshot
+        .queue_snapshot(Vec::new());
+    fixture
+        .recorders
+        .hotplug
+        .queue_change()
+        .expect("queue output removal edge");
+    Backend::on_display_hotplug(&mut fixture.backend, &mut fixture.state);
+    elapsed_ms.set(150);
+    let before_removal = fixture.recorders.atomic.records().len();
+    Backend::poll_deferred_input(&mut fixture.backend, &mut fixture.state);
+    assert!(fixture.backend.platform.outputs.is_empty());
+    let records = fixture.recorders.atomic.records();
+    assert_eq!(records.len(), before_removal + 1);
+    let disable = records.last().expect("blocking removal disable");
+    assert_eq!(disable.kind, crate::drm::atomic::AtomicCommitKind::Scene);
+    assert_eq!(
+        disable.flags,
+        ::drm::control::AtomicCommitFlags::ALLOW_MODESET
+    );
+    assert!(disable.events.is_empty());
+    assert!(disable.properties.iter().all(|update| update.value == 0));
+    assert_detached_ids(disable, cursor);
+    fixture.assert_cursor_quiescent();
+    assert!(fixture.recorders.legacy_cursor.records().is_empty());
+    let resources = Rc::clone(&fixture.recorders.cursor_buffer_ledger);
+    drop(fixture);
+    assert_eq!(resources.end_state(), (0, 0, 0));
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutations: clear actual cursor users when a blocking disable fails, clear lifecycle/cache references before old events drain, or wake before the successful recovery disable; retained ownership, order, and retry assertions must fail.
+fn atomic_cursor_only_failed_disable_retains_users() {
+    use yserver_core::{backend::Backend, core_loop::input_inventory::InputInventory};
 
     let Some(mut fixture) = attached_fixture() else {
         return;
@@ -645,43 +870,32 @@ fn atomic_cursor_only_failed_disable_retains_users() {
         "rejected disable retains the on-screen framebuffer user",
     );
 
-    // Recover the active CRTC through Backend, then make a successful blocking
-    // disable/drain before treating the route as resumable.
-    Backend::set_dpms_power(&mut fixture.backend, 0).expect("recover active output after failure");
+    // Retry and drain the blocking disable before any wake. A failed
+    // lifecycle detach never becomes resumable just because the caller asks
+    // for DPMS On.
+    let before_recovery_disable = fixture.recorders.atomic.records().len();
+    Backend::finish_vt_release(
+        &mut fixture.backend,
+        &mut fixture.state,
+        &InputInventory::default(),
+    );
+    let recovery_disable = fixture.recorders.atomic.records();
+    assert_eq!(recovery_disable.len(), before_recovery_disable + 1);
     let recovered_state = &fixture.backend.platform.devices[0].cursor.crtc_states[&crtc];
-    assert_eq!(recovered_state.applied, Some(initial));
+    assert!(
+        recovery_disable
+            .last()
+            .unwrap()
+            .properties
+            .iter()
+            .all(|update| update.value == 0)
+    );
+    assert_eq!(recovered_state.applied, None);
+    assert!(recovered_state.lifecycle_pending.is_none());
     assert!(
         !recovered_state.valid,
-        "accepted modeset invalidates comparison only"
+        "VT master loss invalidates comparison after the successful blocking detach"
     );
-    assert_eq!(
-        fixture.backend.platform.devices[0]
-            .cursor
-            .plane
-            .as_ref()
-            .unwrap()
-            .sprite_user_count(initial.lease),
-        initial_users,
-        "modeset invalidation preserves the current owner's lease",
-    );
-
-    make_pending_cursor_move(&mut fixture, initial.x + 1, initial.y);
-    let full_state_move = fixture.recorders.atomic.records().last().unwrap().clone();
-    assert!(matches!(
-        full_state_move.kind,
-        crate::drm::atomic::AtomicCommitKind::CursorOnly
-            | crate::drm::atomic::AtomicCommitKind::SceneWithCursor
-    ));
-    assert_full_attach(
-        &fixture,
-        &full_state_move,
-        initial.framebuffer,
-        initial.x + 1,
-        initial.y,
-    );
-    queue_pending_cursor_event(&fixture, 51);
-    Backend::set_dpms_power(&mut fixture.backend, 3)
-        .expect("successful recovery disable and drain");
     assert_eq!(fixture.recorders.page_flip_events.queued_flip_count(), 0);
     assert_eq!(
         fixture.backend.platform.devices[0]
@@ -692,11 +906,15 @@ fn atomic_cursor_only_failed_disable_retains_users() {
             .sprite_user_count(initial.lease),
         Some(0),
     );
+    assert_eq!(
+        fixture.backend.pstate.vt_state,
+        crate::vt::state::VtState::Suspended,
+        "successful recovery disable completes before resume",
+    );
     fixture.assert_cursor_quiescent();
 
-    let before_recovery_wake = fixture.recorders.atomic.records().len();
-    Backend::set_dpms_power(&mut fixture.backend, 0)
-        .expect("resume after successful disable/drain");
+    let before_recovery_wake = recovery_disable.len();
+    Backend::on_vt_acquire(&mut fixture.backend, &mut fixture.state);
     let records = fixture.recorders.atomic.records();
     assert_eq!(records.len(), before_recovery_wake + 2);
     let rebound = fixture.backend.platform.devices[0].cursor.crtc_states[&crtc]
@@ -706,7 +924,7 @@ fn atomic_cursor_only_failed_disable_retains_users() {
         &fixture,
         &records[before_recovery_wake + 1],
         rebound.framebuffer,
-        initial.x + 1,
+        initial.x,
         initial.y,
     );
     assert!(
@@ -766,7 +984,7 @@ fn atomic_cursor_only_failed_disable_retains_users() {
         &fixture,
         &records[before_final_wake + 1],
         final_binding.framebuffer,
-        initial.x + 1,
+        initial.x,
         initial.y,
     );
     retire_cursor_event(&mut fixture, 54);

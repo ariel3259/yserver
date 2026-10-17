@@ -1096,7 +1096,7 @@ pub(super) fn push_test_output(b: &mut crate::kms::render::backend::KmsBackend, 
         .platform
         .scanout_route_for_kms(device_key)
         .expect("test fixture has a scanout route");
-    b.platform.outputs.push(ActiveOutput::new(
+    let active = ActiveOutput::new(
         scanout_route,
         crate::platform::drm::Output {
             connector: ::drm::control::from_u32(crtc_id).unwrap(),
@@ -1143,7 +1143,11 @@ pub(super) fn push_test_output(b: &mut crate::kms::render::backend::KmsBackend, 
         crate::drm::Swapchain::empty_for_tests(),
         800,
         0,
-    ));
+    );
+    b.platform
+        .active_cursor_crtcs
+        .insert(crate::kms::render::platform::CrtcKey::for_output(&active));
+    b.platform.outputs.push(active);
 }
 
 pub(super) fn install_direct_frame_for_target_test(

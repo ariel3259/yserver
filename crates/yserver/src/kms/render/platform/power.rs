@@ -71,15 +71,10 @@ pub(crate) struct OutputPowerRecord {
 #[derive(Default)]
 pub(crate) struct RecordingOutputPowerExecutor {
     records: std::cell::RefCell<Vec<OutputPowerRecord>>,
-    assemble_modesets: std::cell::Cell<bool>,
 }
 
 #[cfg(test)]
 impl RecordingOutputPowerExecutor {
-    pub(crate) fn assemble_modesets(&self) {
-        self.assemble_modesets.set(true);
-    }
-
     pub(crate) fn records(&self) -> Vec<OutputPowerRecord> {
         self.records.borrow().clone()
     }
@@ -126,69 +121,13 @@ impl OutputPowerExecutor for RecordingOutputPowerExecutor {
             crtc: output.crtc,
             framebuffer: Some(framebuffer),
         });
-        if !self.assemble_modesets.get() {
-            return Ok(());
-        }
-
-        let mode_blob = services
-            .mode_blobs
-            .create_property_blob(_device, &output.mode)?;
-        let properties = drm::modeset::DisableOutputPropertyHandles::for_tests();
-        let (mode_w, mode_h) = output.mode.size();
-        let mut request = crate::drm::atomic::AtomicCommitRequest::new();
-        request.add_raw_property(
-            output.connector.into(),
-            properties.connector_crtc_id,
-            u64::from(u32::from(output.crtc)),
-        );
-        request.add_raw_property(output.crtc.into(), properties.crtc_mode_id, mode_blob);
-        request.add_raw_property(output.crtc.into(), properties.crtc_active, 1);
-        request.add_raw_property(
-            output.plane.into(),
-            output.plane_fb_id_prop,
-            u64::from(u32::from(framebuffer)),
-        );
-        request.add_raw_property(
-            output.plane.into(),
-            output.plane_crtc_id_prop,
-            u64::from(u32::from(output.crtc)),
-        );
-        request.add_raw_property(output.plane.into(), output.plane_src_x_prop, 0);
-        request.add_raw_property(output.plane.into(), output.plane_src_y_prop, 0);
-        request.add_raw_property(
-            output.plane.into(),
-            output.plane_src_w_prop,
-            u64::from(mode_w) << 16,
-        );
-        request.add_raw_property(
-            output.plane.into(),
-            output.plane_src_h_prop,
-            u64::from(mode_h) << 16,
-        );
-        request.add_raw_property(output.plane.into(), output.plane_crtc_x_prop, 0);
-        request.add_raw_property(output.plane.into(), output.plane_crtc_y_prop, 0);
-        request.add_raw_property(
-            output.plane.into(),
-            output.plane_crtc_w_prop,
-            u64::from(mode_w),
-        );
-        request.add_raw_property(
-            output.plane.into(),
-            output.plane_crtc_h_prop,
-            u64::from(mode_h),
-        );
-        let result = services.atomic.atomic_commit(
+        drm::modeset::commit_modeset_with_io(
             _device,
-            ::drm::control::AtomicCommitFlags::ALLOW_MODESET,
-            crate::drm::atomic::AtomicCommitKind::Scene,
-            request,
-            &[],
-        );
-        let cleanup = services
-            .mode_blobs
-            .destroy_property_blob(_device, mode_blob);
-        result?;
-        cleanup
+            output,
+            framebuffer,
+            services.mode_blobs.as_ref(),
+            services.atomic.as_ref(),
+        )
     }
 }
 
@@ -320,10 +259,12 @@ impl PlatformBackend {
             // before blank) or any registered fb — same selection
             // logic as `requery_outputs_and_modeset` at :2030.
             for (i, layout) in self.outputs.iter().enumerate() {
+                let cursor_key = crate::kms::render::platform::CrtcKey::for_output(layout);
                 let Some(device) = self
                     .device_for_output(&layout.key)
                     .map(|device| Rc::clone(&device.device))
                 else {
+                    self.active_cursor_crtcs.remove(&cursor_key);
                     let error = io::Error::new(
                         io::ErrorKind::NotFound,
                         format!(
@@ -362,6 +303,7 @@ impl PlatformBackend {
                 {
                     (None, fb_id)
                 } else {
+                    self.active_cursor_crtcs.remove(&cursor_key);
                     let error = io::Error::other(format!(
                         "dpms_set_outputs_active(true): no framebuffer for output {}; \
                          an ordinary page flip cannot restore MODE_ID/ACTIVE",
@@ -379,6 +321,7 @@ impl PlatformBackend {
                     fb_id,
                     &self.services,
                 ) {
+                    self.active_cursor_crtcs.remove(&cursor_key);
                     log::error!(
                         "dpms_set_outputs_active(true): commit_modeset for {} failed: {e}",
                         layout.output.connector_name,
@@ -387,10 +330,8 @@ impl PlatformBackend {
                         first_err = Some(e);
                     }
                 } else {
-                    modeset_crtcs.push(crate::kms::render::platform::CrtcKey::new(
-                        layout.key.device_key,
-                        layout.output.crtc,
-                    ));
+                    modeset_crtcs.push(cursor_key);
+                    self.active_cursor_crtcs.insert(cursor_key);
                     if let (Some(bo_idx), Some(scanout)) = (
                         bo_idx,
                         self.scanout_pools.get_mut(i).and_then(Option::as_mut),
@@ -418,6 +359,8 @@ impl PlatformBackend {
             for output_idx in 0..self.outputs.len() {
                 let output_key = self.outputs[output_idx].key.clone();
                 let connector_name = self.outputs[output_idx].output.connector_name.clone();
+                let cursor_key =
+                    crate::kms::render::platform::CrtcKey::for_output(&self.outputs[output_idx]);
                 let Some(device) = self
                     .device_for_output(&output_key)
                     .map(|device| Rc::clone(&device.device))
@@ -452,6 +395,7 @@ impl PlatformBackend {
                     self.quarantine_cursor_output(output_idx);
                 } else {
                     self.accept_cursor_lifecycle_detach(output_idx);
+                    self.active_cursor_crtcs.remove(&cursor_key);
                 }
             }
         }
@@ -480,7 +424,6 @@ impl PlatformBackend {
             .as_ref()
             .map(|recorders| Rc::clone(&recorders.output_power))
             .unwrap_or_else(|| Rc::new(RecordingOutputPowerExecutor::default()));
-        executor.assemble_modesets();
         self.output_power_executor = executor;
     }
 }

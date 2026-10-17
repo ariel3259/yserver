@@ -338,6 +338,7 @@ impl PlatformBackend {
         cursor_height: Option<u64>,
         hotspot_properties: bool,
     ) {
+        self.active_cursor_crtcs = self.outputs.iter().map(CrtcKey::for_output).collect();
         for device in &mut self.devices {
             let crtcs: Vec<_> = self
                 .outputs
@@ -450,6 +451,14 @@ impl PlatformBackend {
             .is_some_and(|device| device.cursor.available_on(layout.output.crtc))
     }
 
+    #[must_use]
+    pub(crate) fn cursor_output_is_active(&self, output_idx: usize) -> bool {
+        self.outputs.get(output_idx).is_some_and(|output| {
+            self.active_cursor_crtcs
+                .contains(&CrtcKey::for_output(output))
+        })
+    }
+
     /// Invalidate only the accepted-state comparison for one device-qualified
     /// CRTC. Accepted bindings and their sprite leases remain real owners until
     /// a detach/replacement commit and its required drain settle them.
@@ -484,6 +493,9 @@ impl PlatformBackend {
             let Some(output_idx) = self.output_index_for_crtc(key) else {
                 continue;
             };
+            if !self.cursor_output_is_active(output_idx) {
+                continue;
+            }
             if !self.cursor_plane_available_for_output(output_idx) {
                 continue;
             }
@@ -503,6 +515,9 @@ impl PlatformBackend {
         primary_successor: bool,
     ) -> Option<CursorPlaneUpdate> {
         let layout = self.outputs.get(output_idx)?;
+        if !self.cursor_output_is_active(output_idx) {
+            return None;
+        }
         let device = self.device_for_key(layout.key.device_key)?;
         let crtc = layout.output.crtc;
         let cursor = &device.cursor;
@@ -758,6 +773,9 @@ impl PlatformBackend {
         let Some(layout) = self.outputs.get(output_idx) else {
             return Ok(CursorMoveOutcome::default());
         };
+        if !self.cursor_output_is_active(output_idx) {
+            return Ok(CursorMoveOutcome::default());
+        }
         let device_key = layout.key.device_key;
         let crtc = layout.output.crtc;
         let Some(device_idx) = self
@@ -1067,8 +1085,10 @@ impl PlatformBackend {
         std::mem::take(&mut self.deferred_cursor_move_outcome)
     }
 
-    /// Drop atomic per-CRTC state only after the old-event drain has proved
-    /// that no cursor-only flip can be attributed to the next topology epoch.
+    /// Drop old event obligations only after the event drain proves that no
+    /// cursor-only flip can be attributed to the next topology epoch. Keep
+    /// the accepted detached comparison valid; the following modeset or
+    /// resume boundary invalidates it before cursor reconciliation.
     pub(crate) fn clear_atomic_cursor_state_after_old_events_discard(&mut self) {
         for device in &mut self.devices {
             let pending: Vec<_> = device
@@ -1092,7 +1112,6 @@ impl PlatformBackend {
                     if let Some(binding) = state.lifecycle_pending.take() {
                         plane.release_sprite_user(binding.lease);
                     }
-                    super::cursor_lifecycle::invalidate_applied_comparison(state);
                     state.intent = None;
                 }
                 plane.recover_sprite_pool_after_all_off();
@@ -2042,11 +2061,11 @@ impl PlatformBackend {
             } else {
                 false
             };
-            if crtc_set_changed || plane_changed {
+            let topology_changed = crtc_set_changed || plane_changed;
+            if topology_changed {
                 device.cursor.cursor_topology_epoch =
                     device.cursor.cursor_topology_epoch.saturating_add(1);
             }
-            device.cursor.cursor_topology_crtcs = active_crtcs;
             device.cursor.pending_move = None;
             device.cursor.pending_move_timestamp = None;
             device.cursor.atomic_cursor_commits_in_flight.clear();
@@ -2054,10 +2073,13 @@ impl PlatformBackend {
             device.cursor.cursor_hide_recovery.clear();
             device.cursor.transient_fallback_crtcs.clear();
             for state in device.cursor.crtc_states.values_mut() {
-                super::cursor_lifecycle::invalidate_applied_comparison(state);
+                if topology_changed {
+                    super::cursor_lifecycle::invalidate_applied_comparison(state);
+                }
                 state.intent = None;
                 state.intent_motion_timestamp = None;
             }
+            device.cursor.cursor_topology_crtcs = active_crtcs;
             if device.cursor.should_retry_initialization(!crtcs.is_empty()) {
                 factory(device, &crtcs, "lifecycle retry");
             }
@@ -2173,6 +2195,9 @@ impl PlatformBackend {
             .iter()
             .enumerate()
             .filter_map(|(output_idx, layout)| {
+                if !self.cursor_output_is_active(output_idx) {
+                    return None;
+                }
                 let device = self.device_for_key(layout.key.device_key)?;
                 device
                     .cursor

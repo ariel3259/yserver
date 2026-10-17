@@ -20,7 +20,7 @@ use crate::drm::{
         AtomicCommitEvent, AtomicCommitExecutor, AtomicCommitKind, AtomicCommitRequest,
         AtomicCommitSink,
     },
-    io::ModeBlobIo,
+    io::{ModeBlobIo, ModesetObject},
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1327,27 +1327,28 @@ fn modeset_with_flags(
     mode_blobs: &dyn ModeBlobIo,
     executor: &dyn AtomicCommitExecutor,
 ) -> io::Result<ModesetWithBlobResult> {
-    let connector_props = PropMap::for_object(device, output.connector)?;
-    let crtc_props = PropMap::for_object(device, output.crtc)?;
-    let plane_props = PropMap::for_object(device, output.plane)?;
-
     // Resolve every fallible property lookup before creating the mode blob.
     // Probe helpers share the parent's DRM file description, so an early `?`
     // after blob creation would otherwise leave that object attached to the
     // still-live parent fd even after the child exits.
-    let connector_crtc_id_prop = connector_props.id("CRTC_ID")?;
-    let crtc_mode_id_prop = crtc_props.id("MODE_ID")?;
-    let crtc_active_prop = crtc_props.id("ACTIVE")?;
-    let plane_fb_id_prop = plane_props.id("FB_ID")?;
-    let plane_crtc_id_prop = plane_props.id("CRTC_ID")?;
-    let plane_src_x_prop = plane_props.id("SRC_X")?;
-    let plane_src_y_prop = plane_props.id("SRC_Y")?;
-    let plane_src_w_prop = plane_props.id("SRC_W")?;
-    let plane_src_h_prop = plane_props.id("SRC_H")?;
-    let plane_crtc_x_prop = plane_props.id("CRTC_X")?;
-    let plane_crtc_y_prop = plane_props.id("CRTC_Y")?;
-    let plane_crtc_w_prop = plane_props.id("CRTC_W")?;
-    let plane_crtc_h_prop = plane_props.id("CRTC_H")?;
+    let connector_props =
+        mode_blobs.properties_for_object(device, ModesetObject::Connector(output.connector))?;
+    let crtc_props = mode_blobs.properties_for_object(device, ModesetObject::Crtc(output.crtc))?;
+    let plane_props =
+        mode_blobs.properties_for_object(device, ModesetObject::Plane(output.plane))?;
+    let connector_crtc_id_prop = modeset_property_id(&connector_props, "CRTC_ID")?;
+    let crtc_mode_id_prop = modeset_property_id(&crtc_props, "MODE_ID")?;
+    let crtc_active_prop = modeset_property_id(&crtc_props, "ACTIVE")?;
+    let plane_fb_id_prop = modeset_property_id(&plane_props, "FB_ID")?;
+    let plane_crtc_id_prop = modeset_property_id(&plane_props, "CRTC_ID")?;
+    let plane_src_x_prop = modeset_property_id(&plane_props, "SRC_X")?;
+    let plane_src_y_prop = modeset_property_id(&plane_props, "SRC_Y")?;
+    let plane_src_w_prop = modeset_property_id(&plane_props, "SRC_W")?;
+    let plane_src_h_prop = modeset_property_id(&plane_props, "SRC_H")?;
+    let plane_crtc_x_prop = modeset_property_id(&plane_props, "CRTC_X")?;
+    let plane_crtc_y_prop = modeset_property_id(&plane_props, "CRTC_Y")?;
+    let plane_crtc_w_prop = modeset_property_id(&plane_props, "CRTC_W")?;
+    let plane_crtc_h_prop = modeset_property_id(&plane_props, "CRTC_H")?;
 
     let mode_blob_raw = mode_blobs.create_property_blob(device, &output.mode)?;
 
@@ -1404,6 +1405,16 @@ fn modeset_with_flags(
         atomic,
         blob_cleanup,
     })
+}
+
+fn modeset_property_id(
+    properties: &HashMap<String, property::Handle>,
+    name: &str,
+) -> io::Result<property::Handle> {
+    properties
+        .get(name)
+        .copied()
+        .ok_or_else(|| io::Error::other(format!("property {name:?} not exposed")))
 }
 
 fn finish_best_effort_modeset(result: ModesetWithBlobResult) -> io::Result<()> {

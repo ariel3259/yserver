@@ -304,6 +304,10 @@ impl PlatformBackend {
 
     pub(super) fn remove_connector_at(&mut self, idx: usize) {
         let output_key = self.outputs[idx].key.clone();
+        self.active_cursor_crtcs
+            .remove(&crate::kms::render::platform::CrtcKey::for_output(
+                &self.outputs[idx],
+            ));
         let changed_device = self.outputs[idx].key.device_key;
         self.cancel_scanout_render_completions_for_output(&output_key);
         if let Err(error) = self.drain_scanout_pool_at(idx) {
@@ -922,6 +926,7 @@ impl PlatformBackend {
             return Err(e);
         }
         self.invalidate_cursor_applied(cursor_key);
+        self.active_cursor_crtcs.insert(cursor_key);
 
         // A synchronous modeset has already latched this framebuffer; unlike
         // an ordinary page flip no completion event will promote it from
@@ -1180,6 +1185,10 @@ impl PlatformBackend {
             .collect();
         for idx in rescan.dropped_old_indices.iter().copied() {
             let dropped_key = self.outputs[idx].key.clone();
+            self.active_cursor_crtcs
+                .remove(&crate::kms::render::platform::CrtcKey::for_output(
+                    &self.outputs[idx],
+                ));
             rescan.dropped_layouts.push(DroppedRoute {
                 key: dropped_key.clone(),
                 x: self.outputs[idx].x,

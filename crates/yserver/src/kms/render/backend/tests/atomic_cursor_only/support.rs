@@ -231,6 +231,10 @@ impl AtomicCursorFixture {
             .outputs
             .pop()
             .expect("test seed has one output to retain as an enable template");
+        backend
+            .platform
+            .active_cursor_crtcs
+            .remove(&crate::kms::render::platform::CrtcKey::for_output(&active));
         let key = active.key;
         let output = active.output;
         backend.platform.render_devices = vec![crate::kms::render::platform::RenderDevice {

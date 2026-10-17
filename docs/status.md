@@ -31,19 +31,20 @@ Cross-cutting bugs and followups that don't fit a stage live in
 - **2026-10-17 atomic-cursor-only A8 checkpoint:** Added device-qualified
   cursor comparison invalidation at accepted output modesets and VT/master
   lifecycle boundaries, preserving actual accepted bindings and framebuffer
-  owners until blocking detach plus event drain. Hidden resume now submits a
-  complete detached cursor state on every eligible live route, including when
-  direct scanout is inactive. Backend-path lavapipe fixtures cover DPMS/VT
-  detach and rebind, transparent-cursor resume, retained ownership after failed
-  disable/drain, and the reachable RandR configuration path. Hidden-reconcile,
-  failed-disable, pre-drain-clear, and legacy-rearm mutations failed as
-  expected; the modeset-invalidation mutation did not fail its checkpoint and
-  remains a test-sensitivity concern. The fixture stops at ENOTTY during direct
-  property lookup, so real mode-blob identity through modesets, re-exec
-  qualification and hotplug rediscovery remain deferred to controller Task
-  C11 hardware validation. This is an interim A checkpoint: conservative
-  retirement-time scene adapter removal and final recovery/reassignment and
-  legacy deletion remain later work. No hardware was used.
+  owners until blocking detach plus event drain. Draining an accepted blocking
+  detach preserves its valid detached comparison; actual modeset and resume
+  boundaries invalidate it before cursor reconciliation. Hidden resume submits
+  a complete detached cursor state only to CRTCs whose wake modeset succeeded,
+  including when direct scanout is inactive. The output-power recorder now
+  calls the shared production modeset builder through injected property/blob
+  services. Backend-path lavapipe fixtures cover real recorded RandR mode-blob
+  assembly with a cursor plane, partial wake failure, reprobe removal, zero-
+  output activation, DPMS/VT lifecycle, transparent-cursor resume, and retained
+  ownership after failed disable/drain. Re-exec qualification, real mode-blob
+  identity on hardware and hardware validation remain controller Task C11
+  work. This is an interim A checkpoint: conservative retirement-time scene
+  adapter removal and final recovery/reassignment and legacy deletion remain
+  later work. No hardware was used.
 
 - **2026-10-16 atomic-cursor-only A6 fix round 1:** Preserved a staged
   stationary image replacement when a direct primary successor projects the

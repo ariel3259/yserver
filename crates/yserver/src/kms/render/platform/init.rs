@@ -705,6 +705,10 @@ impl PlatformBackend {
             .zip(scanout_routes)
             .map(|(layout, route)| layout.qualify(route))
             .collect::<Vec<_>>();
+        let active_cursor_crtcs = outputs
+            .iter()
+            .map(crate::kms::render::platform::CrtcKey::for_output)
+            .collect();
         debug_assert!(outputs.iter().zip(&scanout_pools).all(|(output, pool)| {
             pool.as_ref()
                 .is_none_or(|pool| pool.route() == output.scanout_route)
@@ -723,6 +727,7 @@ impl PlatformBackend {
             render_devices,
             selected_render_device: Some(selected_render_device),
             outputs,
+            active_cursor_crtcs,
             fb_w,
             fb_h,
             output_transforms: HashMap::new(),
@@ -867,6 +872,12 @@ impl PlatformBackend {
                 0,
                 0,
             )],
+            active_cursor_crtcs: std::collections::HashSet::from([
+                crate::kms::render::platform::CrtcKey::new(
+                    device_key,
+                    ::drm::control::from_u32(1).unwrap(),
+                ),
+            ]),
             fb_w: 800,
             fb_h: 600,
             output_transforms: HashMap::new(),

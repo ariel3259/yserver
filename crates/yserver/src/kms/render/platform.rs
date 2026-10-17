@@ -452,6 +452,9 @@ pub struct PlatformBackend {
     pub(crate) render_devices: Vec<RenderDevice>,
     pub(crate) selected_render_device: Option<RenderDeviceId>,
     pub(crate) outputs: Vec<ActiveOutput>,
+    /// CRTCs whose most recent blocking modeset/enable succeeded. Cursor
+    /// atomic submissions are rejected for routes whose wake failed.
+    pub(crate) active_cursor_crtcs: HashSet<CrtcKey>,
     pub(crate) fb_w: u16,
     pub(crate) fb_h: u16,
     /// Non-identity current CRTC transforms (RANDR `SetCrtcTransform`),

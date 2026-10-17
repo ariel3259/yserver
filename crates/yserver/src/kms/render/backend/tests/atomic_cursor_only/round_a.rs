@@ -3965,12 +3965,20 @@ fn atomic_cursor_only_vt_release_keeps_hidden_cursor_detached_after_resume() {
     Backend::on_vt_acquire(&mut fixture.backend, &mut fixture.state);
     assert!(fixture.backend.scanout_allowed());
     assert!(fixture.backend.kms_outputs_active);
+    let before_resume = after_release.len();
     let after_resume = fixture.recorders.atomic.records();
     assert_eq!(
         after_resume.len(),
-        5,
-        "hidden resume submits one cursor detach after output activation"
+        before_resume + 2,
+        "resume records output modeset, then hidden cursor detach"
     );
+    let activation = &after_resume[before_resume];
+    assert_eq!(activation.kind, crate::drm::atomic::AtomicCommitKind::Scene);
+    assert_eq!(
+        activation.flags,
+        ::drm::control::AtomicCommitFlags::ALLOW_MODESET
+    );
+    assert!(activation.events.is_empty());
     let hidden_resume = after_resume.last().unwrap();
     assert_eq!(
         hidden_resume.kind,
@@ -4046,12 +4054,14 @@ fn atomic_cursor_only_vt_release_keeps_hidden_cursor_detached_after_resume() {
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
             crate::drm::atomic::AtomicCommitKind::Scene,
+            crate::drm::atomic::AtomicCommitKind::Scene,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
             crate::drm::atomic::AtomicCommitKind::Scene,
         ],
-        "VT sequence is attach, rejected hide, blocking detach, hidden detach, and cursorless resume frame",
+        "VT sequence is attach, rejected hide, blocking detach, resume modeset, hidden detach, and cursorless frame",
     );
     assert!(fixture.recorders.legacy_cursor.records().is_empty());
+    assert_eq!(fixture.recorders.mode_blobs.live_count(), 0);
     let resources = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
     drop(fixture);
     assert_eq!(resources.end_state(), (0, 0, 0));
@@ -4375,9 +4385,30 @@ fn atomic_cursor_only_randr_modeset_uses_injected_backend_services() {
     assert_eq!(fixture.recorders.crtc_output_discovery.calls(), 1);
     assert_eq!(fixture.backend.platform.outputs[0].x, 13);
     assert_eq!(fixture.recorders.mode_blobs.live_count(), 0);
-    assert!(fixture.recorders.mode_blobs.records().is_empty());
+    let mode_blob_records = fixture.recorders.mode_blobs.records();
+    assert_eq!(mode_blob_records.len(), 4);
+    assert!(matches!(
+        mode_blob_records.as_slice(),
+        [
+            crate::drm::io::ModeBlobRecord::Create { .. },
+            crate::drm::io::ModeBlobRecord::Destroy { .. },
+            crate::drm::io::ModeBlobRecord::Create { .. },
+            crate::drm::io::ModeBlobRecord::Destroy { .. },
+        ]
+    ));
+    assert_eq!(fixture.recorders.mode_blobs.live_count(), 0);
+    let mode_blobs: Vec<_> = mode_blob_records
+        .iter()
+        .filter_map(|record| match record {
+            crate::drm::io::ModeBlobRecord::Create { blob, .. } => Some(*blob),
+            crate::drm::io::ModeBlobRecord::Destroy { .. } => None,
+        })
+        .collect();
+    assert_eq!(mode_blobs.len(), 2);
+    let crtc = fixture.backend.platform.outputs[0].output.crtc;
+    let mode_id_property = ::drm::control::from_u32(0xD102).expect("recorded MODE_ID property");
     let quiesce_commits = fixture.recorders.atomic.records();
-    assert_eq!(quiesce_commits.len(), 1);
+    assert_eq!(quiesce_commits.len(), 3);
     assert_eq!(
         quiesce_commits[0].kind,
         crate::drm::atomic::AtomicCommitKind::Scene,
@@ -4393,6 +4424,19 @@ fn atomic_cursor_only_randr_modeset_uses_injected_backend_services() {
             .iter()
             .all(|update| update.value == 0)
     );
+    for (modeset, expected_blob) in quiesce_commits[1..].iter().zip(mode_blobs) {
+        assert_eq!(modeset.kind, crate::drm::atomic::AtomicCommitKind::Scene);
+        assert_eq!(
+            modeset.flags,
+            ::drm::control::AtomicCommitFlags::ALLOW_MODESET
+        );
+        assert!(modeset.events.is_empty());
+        assert!(modeset.properties.iter().any(|update| {
+            update.object == crtc.into()
+                && update.property == mode_id_property
+                && update.value == expected_blob
+        }));
+    }
     assert_eq!(
         fixture
             .recorders
@@ -4425,13 +4469,16 @@ fn atomic_cursor_only_randr_modeset_uses_injected_backend_services() {
     );
     fixture.assert_cursor_quiescent();
     let disable_commits = fixture.recorders.atomic.records();
-    assert_eq!(disable_commits.len(), 2);
-    assert!(disable_commits.iter().all(|record| {
-        record.kind == crate::drm::atomic::AtomicCommitKind::Scene
-            && record.flags == ::drm::control::AtomicCommitFlags::ALLOW_MODESET
-            && record.events.is_empty()
-            && record.properties.iter().all(|update| update.value == 0)
-    }));
+    assert_eq!(disable_commits.len(), 4);
+    for off_commit in [&disable_commits[0], &disable_commits[3]] {
+        assert_eq!(off_commit.kind, crate::drm::atomic::AtomicCommitKind::Scene);
+        assert_eq!(
+            off_commit.flags,
+            ::drm::control::AtomicCommitFlags::ALLOW_MODESET
+        );
+        assert!(off_commit.events.is_empty());
+        assert!(off_commit.properties.iter().all(|update| update.value == 0));
+    }
 
     let blobs = std::rc::Rc::clone(&fixture.recorders.mode_blobs);
     let cursor_resources = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
@@ -5260,8 +5307,7 @@ fn atomic_cursor_only_composed_cursor_pixels_follow_output_local_eligibility() {
 }
 
 #[test]
-// Mutation: suppress retryable cursor initialization after the CRTC returns;
-// the second Backend enable must fail to create an eligible plane.
+// Mutations: suppress retryable cursor initialization after the CRTC returns, or make the recording power executor skip production modeset assembly; the eligible-plane or recorded-request assertions must fail.
 fn atomic_cursor_only_headless_enable_disable_enable_retries_initialization() {
     use std::time::Duration;
     use yserver_core::backend::Backend;
@@ -5274,7 +5320,7 @@ fn atomic_cursor_only_headless_enable_disable_enable_retries_initialization() {
     fixture
         .backend
         .platform
-        .for_tests_accept_output_power_commits();
+        .for_tests_record_complete_output_power_commits();
     let device_key = key.device_key;
     let crtc = output.crtc;
     let factory = std::rc::Rc::clone(&fixture.recorders.cursor_plane_factory);
@@ -5442,6 +5488,12 @@ fn atomic_cursor_only_headless_enable_disable_enable_retries_initialization() {
             .for_tests_cursor_initialization_state(device_key),
         Some((false, false)),
     );
+    let active_crtc_state = fixture.backend.platform.devices[0]
+        .cursor
+        .crtc_states
+        .get(&crtc)
+        .expect("active cursor route state");
+    assert!(!active_crtc_state.valid);
 
     assert!(
         Backend::apply_crtc_config(
@@ -5478,7 +5530,11 @@ fn atomic_cursor_only_headless_enable_disable_enable_retries_initialization() {
         ],
         "accepted modeset and DPMS commits must follow enable/disable/enable/disable order",
     );
-    let blocking_disables = fixture.recorders.atomic.records();
+    let atomic_records = fixture.recorders.atomic.records();
+    let blocking_disables: Vec<_> = atomic_records
+        .iter()
+        .filter(|record| record.properties.iter().all(|update| update.value == 0))
+        .collect();
     assert_eq!(blocking_disables.len(), 2);
     assert!(blocking_disables.iter().all(|record| {
         record.kind == crate::drm::atomic::AtomicCommitKind::Scene
@@ -5486,6 +5542,41 @@ fn atomic_cursor_only_headless_enable_disable_enable_retries_initialization() {
             && record.events.is_empty()
             && record.properties.iter().all(|update| update.value == 0)
     }));
+    let mode_id = ::drm::control::from_u32(0xD102).expect("recorded CRTC MODE_ID property");
+    let mode_commits: Vec<_> = atomic_records
+        .iter()
+        .filter(|record| {
+            record
+                .properties
+                .iter()
+                .any(|update| update.property == mode_id && update.object == output.crtc.into())
+        })
+        .collect();
+    assert_eq!(
+        mode_commits.len(),
+        4,
+        "each zero-output activation has a real modeset and relight"
+    );
+    let blobs: Vec<_> = fixture
+        .recorders
+        .mode_blobs
+        .records()
+        .into_iter()
+        .filter_map(|record| match record {
+            crate::drm::io::ModeBlobRecord::Create { blob, .. } => Some(blob),
+            crate::drm::io::ModeBlobRecord::Destroy { .. } => None,
+        })
+        .collect();
+    assert_eq!(blobs.len(), mode_commits.len());
+    for (commit, blob) in mode_commits.iter().zip(blobs) {
+        assert!(
+            commit
+                .properties
+                .iter()
+                .any(|update| { update.property == mode_id && update.value == blob })
+        );
+    }
+    assert_eq!(fixture.recorders.mode_blobs.live_count(), 0);
     assert_eq!(fixture.recorders.crtc_output_discovery.calls(), 2);
     let ledger = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
     drop(fixture);
