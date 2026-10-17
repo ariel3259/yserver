@@ -29,11 +29,77 @@ use crate::{
                 RenderCompletionReadiness,
             },
         },
+        vk::scanout::CopiedScanoutPool,
     },
 };
 
 #[cfg(test)]
 use crate::kms::render::platform::flip_events::RecordingRenderCompletionReadiness;
+
+/// Submits the sink-side copy for a real copied-render completion. This
+/// construction-selected operation boundary lets tests inject a copy failure
+/// without replacing rendering, synchronization, or Backend completion flow.
+pub(crate) trait CopiedScanoutCopySubmitter {
+    fn submit_copy(
+        &self,
+        pool: &mut CopiedScanoutPool,
+        bo_idx: usize,
+        render_completion: Option<OwnedFd>,
+    ) -> std::io::Result<Option<OwnedFd>>;
+}
+
+pub(crate) struct VulkanCopiedScanoutCopySubmitter;
+
+impl CopiedScanoutCopySubmitter for VulkanCopiedScanoutCopySubmitter {
+    fn submit_copy(
+        &self,
+        pool: &mut CopiedScanoutPool,
+        bo_idx: usize,
+        render_completion: Option<OwnedFd>,
+    ) -> std::io::Result<Option<OwnedFd>> {
+        pool.submit_copy(bo_idx, render_completion)
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct RecordingCopiedScanoutCopySubmitter {
+    fail_next: std::cell::Cell<bool>,
+    attempts: std::cell::Cell<u64>,
+    failures: std::cell::Cell<u64>,
+}
+
+#[cfg(test)]
+impl RecordingCopiedScanoutCopySubmitter {
+    pub(crate) fn fail_next(&self) {
+        self.fail_next.set(true);
+    }
+
+    pub(crate) fn attempts(&self) -> u64 {
+        self.attempts.get()
+    }
+
+    pub(crate) fn failures(&self) -> u64 {
+        self.failures.get()
+    }
+}
+
+#[cfg(test)]
+impl CopiedScanoutCopySubmitter for RecordingCopiedScanoutCopySubmitter {
+    fn submit_copy(
+        &self,
+        pool: &mut CopiedScanoutPool,
+        bo_idx: usize,
+        render_completion: Option<OwnedFd>,
+    ) -> std::io::Result<Option<OwnedFd>> {
+        self.attempts.set(self.attempts.get().saturating_add(1));
+        if self.fail_next.replace(false) {
+            self.failures.set(self.failures.get().saturating_add(1));
+            return Err(std::io::Error::from_raw_os_error(libc::EIO));
+        }
+        pool.submit_copy(bo_idx, render_completion)
+    }
+}
 
 /// The low-level DRM `TEST_ONLY` probe used after Backend validates the
 /// drawable metadata, output geometry, and cursor state. Tests replace only
@@ -241,6 +307,7 @@ pub struct KmsServices {
     pub(crate) atomic: Rc<dyn AtomicCommitExecutor>,
     pub(crate) page_flip_events: Rc<dyn PageFlipEventSource>,
     pub(crate) render_completion_readiness: Rc<dyn RenderCompletionReadiness>,
+    pub(crate) copied_scanout_copy: Rc<dyn CopiedScanoutCopySubmitter>,
     pub(crate) hotplug: Rc<dyn DisplayHotplugSource>,
     pub(crate) connector_snapshot: Rc<dyn ConnectorSnapshotIo>,
     pub(crate) monotonic_clock: Rc<dyn Fn() -> Instant>,
@@ -283,6 +350,8 @@ pub(crate) struct KmsTestRecorders {
         Rc<crate::kms::render::platform::flip_events::RecordingPageFlipEventSource>,
     #[cfg(test)]
     pub(crate) render_completion_readiness: Rc<RecordingRenderCompletionReadiness>,
+    #[cfg(test)]
+    pub(crate) copied_scanout_copy: Rc<RecordingCopiedScanoutCopySubmitter>,
     pub(crate) hotplug: Rc<RecordingDisplayHotplugSource>,
     pub(crate) connector_snapshot: Rc<RecordingConnectorSnapshotIo>,
     #[cfg(test)]
@@ -481,6 +550,7 @@ impl KmsServices {
             atomic: Rc::new(DrmAtomicCommitExecutor),
             page_flip_events: Rc::new(DrmPageFlipEventSource),
             render_completion_readiness: Rc::new(PollRenderCompletionReadiness),
+            copied_scanout_copy: Rc::new(VulkanCopiedScanoutCopySubmitter),
             hotplug: Rc::new(DrmDisplayHotplugSource::new()),
             connector_snapshot: Rc::new(DrmConnectorSnapshotIo),
             monotonic_clock: Rc::new(Instant::now),
@@ -507,6 +577,7 @@ impl KmsServices {
             crate::kms::render::platform::flip_events::RecordingPageFlipEventSource::default(),
         );
         let render_completion_readiness = Rc::new(RecordingRenderCompletionReadiness::default());
+        let copied_scanout_copy = Rc::new(RecordingCopiedScanoutCopySubmitter::default());
         let hotplug =
             Rc::new(RecordingDisplayHotplugSource::new().expect("recording hotplug socket pair"));
         let connector_snapshot = Rc::new(RecordingConnectorSnapshotIo::new());
@@ -524,6 +595,7 @@ impl KmsServices {
             gamma: Rc::clone(&gamma),
             page_flip_events: Rc::clone(&page_flip_events),
             render_completion_readiness: Rc::clone(&render_completion_readiness),
+            copied_scanout_copy: Rc::clone(&copied_scanout_copy),
             hotplug: Rc::clone(&hotplug),
             connector_snapshot: Rc::clone(&connector_snapshot),
             direct_scanout_test_only: Rc::clone(&direct_scanout_test_only),
@@ -539,6 +611,7 @@ impl KmsServices {
             atomic,
             page_flip_events,
             render_completion_readiness,
+            copied_scanout_copy,
             hotplug,
             connector_snapshot,
             monotonic_clock: Rc::new(Instant::now),
@@ -571,6 +644,7 @@ impl KmsServices {
             atomic,
             page_flip_events,
             render_completion_readiness: Rc::new(PollRenderCompletionReadiness),
+            copied_scanout_copy: Rc::new(VulkanCopiedScanoutCopySubmitter),
             hotplug,
             connector_snapshot: Rc::new(RecordingConnectorSnapshotIo::new()),
             monotonic_clock: Rc::new(Instant::now),

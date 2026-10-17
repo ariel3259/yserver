@@ -89,17 +89,43 @@ pub(crate) fn store_cursor_frame_updates(
 /// until the final atomic request is built. Rebuild only the position delta
 /// from the current pointer while retaining the frame-owned sprite lease.
 pub(crate) fn cursor_frame_updates_for_submit(
-    platform: &PlatformBackend,
+    platform: &mut PlatformBackend,
     output_idx: usize,
     bo_idx: usize,
     frame: CursorFrameId,
 ) -> io::Result<Vec<CursorPlaneUpdate>> {
-    let staged = platform
-        .staged_cursor_frames
-        .get(&(output_idx, bo_idx))
-        .filter(|staged| staged.plan.frame == frame)
-        .ok_or_else(|| io::Error::other("copied cursor frame identity mismatch"))?;
-    let mut updates = staged.cursor_updates.clone();
+    let (mut updates, assignment, sprite) = {
+        let staged = platform
+            .staged_cursor_frames
+            .get(&(output_idx, bo_idx))
+            .filter(|staged| staged.plan.frame == frame)
+            .ok_or_else(|| io::Error::other("copied cursor frame identity mismatch"))?;
+        (
+            staged.cursor_updates.clone(),
+            staged.plan.assignment,
+            staged.plan.sprite.clone(),
+        )
+    };
+    if updates.is_empty()
+        && assignment == crate::kms::render::scene::CursorFrameAssignment::Hardware
+    {
+        // The frame plan retains its complete desired binding even when it
+        // initially matched the applied state. Rebuild once at final submit
+        // so motion queued while the copied render waited can join this
+        // primary commit instead of being cleared as an empty delta settles.
+        if let Some(update) =
+            platform.prepare_scene_cursor_frame_update(output_idx, assignment, sprite.as_ref())?
+        {
+            platform.reserve_cursor_plane_updates(std::slice::from_ref(&update))?;
+            updates.push(update);
+            let staged = platform
+                .staged_cursor_frames
+                .get_mut(&(output_idx, bo_idx))
+                .expect("copied cursor frame was validated before rebuilding its delta");
+            staged.cursor_updates = updates.clone();
+            staged.cursor_updates_reserved = true;
+        }
+    }
     let layout = platform
         .outputs
         .get(output_idx)

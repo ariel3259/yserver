@@ -1021,6 +1021,11 @@ impl KmsBackend {
                 None
             };
             let old_pending_pageflips = self.pending_pageflip_crtcs();
+            // Remove copied completions before the blocking renderer wait.
+            // A completion that has not reached readiness must lose its
+            // assignment/lease first; otherwise a later fd signal can race
+            // DPMS and publish a cursor receipt for a canceled frame.
+            self.platform.clear_scanout_render_completions();
             log::info!("kms: dpms sleep — wait_idle_bounded");
             self.platform.wait_idle_bounded();
             log::info!("kms: dpms sleep — disable_output per output");

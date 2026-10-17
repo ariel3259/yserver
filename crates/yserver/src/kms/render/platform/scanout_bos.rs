@@ -96,6 +96,7 @@ impl PlatformBackend {
                 error: io::Error::other("copied scanout atomic commit sink disappeared"),
                 cursor_rejected: false,
             })?;
+        let copied_scanout_copy = Rc::clone(&self.services.copied_scanout_copy);
 
         let mut recovery_failed = false;
         let result = (|| {
@@ -121,7 +122,11 @@ impl PlatformBackend {
                 .fb_handle
                 .ok_or_else(|| io::Error::other("copied destination has no framebuffer"))?;
 
-            let copy_completion = match copied.submit_copy(bo_idx, render_completion) {
+            let copy_completion = match copied_scanout_copy.submit_copy(
+                copied,
+                bo_idx,
+                render_completion,
+            ) {
                 Ok(fd) => fd,
                 Err(error) => {
                     if let Err(recovery_error) = copied.recover_copy_failure(bo_idx) {

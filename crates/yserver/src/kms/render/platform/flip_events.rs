@@ -45,8 +45,10 @@ impl RenderCompletionReadiness for PollRenderCompletionReadiness {
 #[derive(Default)]
 pub(crate) struct RecordingRenderCompletionReadiness {
     hold_ready: std::cell::Cell<bool>,
+    hold_without_polling: std::cell::Cell<bool>,
     observed_ready: std::cell::RefCell<HashSet<u64>>,
     released_ready: std::cell::RefCell<HashSet<u64>>,
+    captured_fds: std::cell::RefCell<std::collections::HashMap<u64, OwnedFd>>,
 }
 
 #[cfg(test)]
@@ -54,6 +56,62 @@ impl RecordingRenderCompletionReadiness {
     pub(crate) fn hold_ready_jobs(&self) {
         self.hold_ready.set(true);
         self.released_ready.borrow_mut().clear();
+    }
+
+    /// Retain copied jobs without polling their real GPU sync files. Tests use
+    /// this only to cancel in the same scheduling turn, then observe the
+    /// original fd signal after Backend has removed the job.
+    pub(crate) fn hold_jobs_without_polling(&self) {
+        self.hold_without_polling.set(true);
+        self.captured_fds.borrow_mut().clear();
+        self.observed_ready.borrow_mut().clear();
+    }
+
+    pub(crate) fn release_unpolled_jobs(&self) {
+        self.hold_without_polling.set(false);
+    }
+
+    pub(crate) fn captured_fd_is_signaled(&self, job_id: u64) -> io::Result<bool> {
+        let captured = self.captured_fds.borrow();
+        let fd = captured
+            .get(&job_id)
+            .ok_or_else(|| io::Error::other("copied completion has no captured sync fd"))?;
+        PollRenderCompletionReadiness.is_ready(job_id, Some(fd.as_fd()))
+    }
+
+    pub(crate) fn wait_for_captured_fd_signal(&self, job_id: u64) -> io::Result<()> {
+        let captured = self.captured_fds.borrow();
+        let fd = captured
+            .get(&job_id)
+            .ok_or_else(|| io::Error::other("copied completion has no captured sync fd"))?;
+        let mut poll_fd = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: this is one initialized pollfd and the duplicated SYNC_FD is
+        // kept alive by `captured` for the entire blocking poll.
+        let ready = unsafe { libc::poll(&mut poll_fd, 1, 10_000) };
+        if ready == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "copied render completion did not signal within ten seconds",
+            ));
+        }
+        if ready < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if poll_fd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) == 0 {
+            return Err(io::Error::other(format!(
+                "copied render completion fd returned poll flags 0x{:x}",
+                poll_fd.revents
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn captured_fd_exists(&self, job_id: u64) -> bool {
+        self.captured_fds.borrow().contains_key(&job_id)
     }
 
     pub(crate) fn release_ready_jobs(&self) {
@@ -76,6 +134,16 @@ impl RecordingRenderCompletionReadiness {
 #[cfg(test)]
 impl RenderCompletionReadiness for RecordingRenderCompletionReadiness {
     fn is_ready(&self, job_id: u64, fd: Option<BorrowedFd<'_>>) -> io::Result<bool> {
+        if self.hold_without_polling.get() {
+            if let Some(fd) = fd
+                && !self.captured_fds.borrow().contains_key(&job_id)
+            {
+                self.captured_fds
+                    .borrow_mut()
+                    .insert(job_id, fd.try_clone_to_owned()?);
+            }
+            return Ok(false);
+        }
         if !PollRenderCompletionReadiness.is_ready(job_id, fd)? {
             return Ok(false);
         }

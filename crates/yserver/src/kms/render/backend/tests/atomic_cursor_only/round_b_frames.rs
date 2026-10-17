@@ -138,7 +138,7 @@ fn atomic_cursor_only_unavailable_handoff_publishes_no_receipt() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: omit cancelled-plan lease release; the prepared-user and final framebuffer ledger assertions fail.
+// Mutation: omit canceled-plan lease release; the prepared-user and final framebuffer ledger assertions fail.
 fn atomic_cursor_only_cancelled_copied_frame_publishes_no_receipt() {
     use crate::kms::render::scene::{
         CursorFrameAssignment, CursorPlaneMode, OutputRoute, OutputSink,
@@ -153,7 +153,7 @@ fn atomic_cursor_only_cancelled_copied_frame_publishes_no_receipt() {
     fixture
         .recorders
         .render_completion_readiness
-        .hold_ready_jobs();
+        .hold_jobs_without_polling();
     assert_eq!(
         OutputSink::route(&fixture.backend.platform, 0),
         OutputRoute::Copied,
@@ -210,20 +210,26 @@ fn atomic_cursor_only_cancelled_copied_frame_publishes_no_receipt() {
         .backend
         .platform
         .for_tests_pending_scanout_render_completion_ids()[0];
-    wait_for_held_scanout_job(&mut fixture, job_id);
     assert!(
         fixture
             .recorders
             .render_completion_readiness
-            .observed_ready_jobs()
-            .contains(&job_id)
+            .captured_fd_exists(job_id),
+        "the real Vulkan job owns a pollable completion fd before cancellation",
     );
-
+    assert!(
+        !fixture
+            .recorders
+            .render_completion_readiness
+            .observed_ready_jobs()
+            .contains(&job_id),
+        "the production completion queue has not observed readiness before cancellation",
+    );
     let old_frame = fixture.backend.platform.staged_cursor_frames[&(0, bo_idx)]
         .plan
         .frame;
     Backend::set_dpms_power(&mut fixture.backend, 3)
-        .expect("Backend DPMS-off cancels the signalled copied frame before delivery");
+        .expect("Backend DPMS-off cancels the undelivered copied frame");
     assert_eq!(
         fixture.backend.scene.for_tests_cursor_commit_receipt(0),
         None,
@@ -263,11 +269,19 @@ fn atomic_cursor_only_cancelled_copied_frame_publishes_no_receipt() {
             .all(|record| record.events.is_empty()),
         "DPMS may detach the output, but the canceled copied frame emits no page-flip request",
     );
+    let commits_at_cancel = sink_atomic.records().len();
     fixture
         .recorders
         .render_completion_readiness
-        .release_ready_job(job_id);
-    let commits_at_cancel = sink_atomic.records().len();
+        .wait_for_captured_fd_signal(job_id)
+        .expect("the canceled job's original GPU completion fd eventually signals");
+    assert!(
+        fixture
+            .recorders
+            .render_completion_readiness
+            .captured_fd_is_signaled(job_id)
+            .expect("observe the old job's signaled completion fd"),
+    );
     Backend::on_scanout_render_completion(&mut fixture.backend, &mut fixture.state);
     assert_eq!(
         fixture.backend.scene.for_tests_cursor_commit_receipt(0),
@@ -280,6 +294,14 @@ fn atomic_cursor_only_cancelled_copied_frame_publishes_no_receipt() {
         1,
         "DPMS-off retains output A so it can be re-enabled through Backend",
     );
+    fixture
+        .recorders
+        .render_completion_readiness
+        .release_unpolled_jobs();
+    fixture
+        .recorders
+        .render_completion_readiness
+        .hold_ready_jobs();
     Backend::set_dpms_power(&mut fixture.backend, 0).expect("Backend DPMS-on re-enables output A");
     super::round_a::damage_cursor_root(&mut fixture);
     let output_crtc = fixture.backend.platform.outputs[0].output.crtc;
@@ -315,6 +337,131 @@ fn atomic_cursor_only_cancelled_copied_frame_publishes_no_receipt() {
     );
     assert!(fixture.recorders.legacy_cursor.records().is_empty());
     fixture.assert_cursor_quiescent();
+    let ledger = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
+    drop(fixture);
+    assert_eq!(ledger.end_state(), (0, 0, 0));
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: treat a copied sink-copy EIO as successful; the no-receipt assertion must fail.
+fn atomic_cursor_only_sink_copy_failure_releases_frame_and_retries() {
+    use crate::kms::render::scene::{CursorAcceptedMode, CursorPrimaryContent};
+    use yserver_core::backend::Backend;
+
+    let Some(mut fixture) = AtomicCursorFixture::new().expect("build copied failure fixture")
+    else {
+        return;
+    };
+    let sink_atomic = install_copied_recording_route(&mut fixture);
+    fixture
+        .recorders
+        .render_completion_readiness
+        .hold_ready_jobs();
+    fixture.recorders.copied_scanout_copy.fail_next();
+
+    let cursor = create_solid_argb_cursor(&mut fixture, 32, [0, 0, 255, 255]);
+    let root = fixture.backend.core.window_id;
+    Backend::define_cursor(&mut fixture.backend, None, root, cursor)
+        .expect("define hardware cursor through Backend");
+    Backend::warp_pointer_root(&mut fixture.backend, &mut fixture.state, 100, 90);
+    super::round_a::damage_cursor_root(&mut fixture);
+    let accepted_mode_before = fixture.backend.scene.cursor_mode();
+    Backend::maybe_composite(&mut fixture.backend).expect("submit real copied rendering");
+    let job = fixture
+        .backend
+        .platform
+        .for_tests_pending_scanout_render_completion_ids()[0];
+    let (_, _, _, failed_frame) = fixture
+        .backend
+        .platform
+        .for_tests_pending_scanout_render_completion_associations()[0];
+    wait_for_held_scanout_job(&mut fixture, job);
+    assert_eq!(
+        fixture.backend.scene.for_tests_cursor_commit_receipt(0),
+        None
+    );
+    assert_eq!(
+        cursor_plane_for_output(&fixture, 0).for_tests_prepared_sprite_user_count(),
+        1,
+        "the staged frame owns its sprite until the copy dependency fails",
+    );
+
+    fixture
+        .recorders
+        .render_completion_readiness
+        .release_ready_job(job);
+    Backend::on_scanout_render_completion(&mut fixture.backend, &mut fixture.state);
+    assert_eq!(fixture.recorders.copied_scanout_copy.attempts(), 1);
+    assert_eq!(fixture.recorders.copied_scanout_copy.failures(), 1);
+    assert_eq!(
+        fixture.backend.scene.for_tests_cursor_commit_receipt(0),
+        None
+    );
+    assert_eq!(fixture.backend.scene.cursor_mode(), accepted_mode_before);
+    assert!(!fixture.backend.scene.has_pending_page_flip(0));
+    assert_eq!(
+        fixture
+            .backend
+            .platform
+            .for_tests_pending_scanout_render_completion_count(),
+        0,
+    );
+    assert!(fixture.backend.platform.staged_cursor_frames.is_empty());
+    assert_eq!(
+        cursor_plane_for_output(&fixture, 0).for_tests_prepared_sprite_user_count(),
+        0,
+        "the failed copied frame releases its reserved sprite lease",
+    );
+    assert!(
+        sink_atomic.records().is_empty(),
+        "copy failure precedes KMS"
+    );
+
+    let crtc = fixture.backend.platform.outputs[0].output.crtc;
+    let (retry_job, _retry_bo, retry_frame) = wait_for_copied_job_for_crtc(&mut fixture, crtc);
+    assert_ne!(retry_job, job);
+    assert_ne!(retry_frame, failed_frame);
+    wait_for_held_scanout_job(&mut fixture, retry_job);
+    fixture
+        .recorders
+        .render_completion_readiness
+        .release_ready_job(retry_job);
+    Backend::on_scanout_render_completion(&mut fixture.backend, &mut fixture.state);
+    let retry_receipt = fixture
+        .backend
+        .scene
+        .for_tests_cursor_commit_receipt(0)
+        .expect("retry publishes a receipt after the copied KMS acceptance");
+    assert_eq!(retry_receipt.frame, Some(retry_frame));
+    assert_eq!(retry_receipt.mode, CursorAcceptedMode::Hardware);
+    assert_eq!(
+        retry_receipt.primary_cursor,
+        CursorPrimaryContent::Cursorless
+    );
+    assert_eq!(fixture.recorders.copied_scanout_copy.attempts(), 2);
+    assert_eq!(fixture.recorders.copied_scanout_copy.failures(), 1);
+    let records = sink_atomic.records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].kind,
+        crate::drm::atomic::AtomicCommitKind::SceneWithCursor
+    );
+    assert_eq!(records[0].events.len(), 1);
+    fixture.retire_output(0, 1);
+    fixture
+        .backend
+        .disable_output()
+        .expect("Backend disables and drains the retried output");
+    fixture.assert_cursor_quiescent();
+    assert!(fixture.backend.platform.staged_cursor_frames.is_empty());
+    assert_eq!(
+        fixture
+            .backend
+            .platform
+            .for_tests_pending_scanout_render_completion_count(),
+        0
+    );
     let ledger = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
     drop(fixture);
     assert_eq!(ledger.end_state(), (0, 0, 0));
@@ -1973,6 +2120,159 @@ fn atomic_cursor_only_composed_unflip_partial_reservation_failure_releases_prior
     let _ = Backend::drain_completed_present_events(&mut fixture.backend);
     let _ = Backend::drain_retired_present_idle_events(&mut fixture.backend);
     fixture.assert_cursor_quiescent();
+    let ledger = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
+    drop(fixture);
+    assert_eq!(ledger.end_state(), (0, 0, 0));
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: omit the copied frame's cursor_updates from SceneWithCursor; the late X/Y delta must disappear.
+fn atomic_cursor_only_second_copied_frame_carries_late_motion_delta() {
+    use crate::kms::render::scene::{CursorAcceptedMode, CursorPrimaryContent};
+    use yserver_core::backend::Backend;
+
+    let Some(mut fixture) = AtomicCursorFixture::new().expect("build copied motion fixture") else {
+        return;
+    };
+    let sink_atomic = install_copied_recording_route(&mut fixture);
+    fixture
+        .recorders
+        .render_completion_readiness
+        .hold_ready_jobs();
+
+    let root = fixture.backend.core.window_id;
+    let cursor = create_solid_argb_cursor(&mut fixture, 32, [0, 0, 255, 255]);
+    Backend::define_cursor(&mut fixture.backend, None, root, cursor)
+        .expect("define the hardware cursor through Backend");
+    let p0 = (100, 90);
+    Backend::warp_pointer_root(&mut fixture.backend, &mut fixture.state, p0.0, p0.1);
+    super::round_a::damage_cursor_root(&mut fixture);
+    Backend::maybe_composite(&mut fixture.backend).expect("build first copied frame");
+
+    let first_job = fixture
+        .backend
+        .platform
+        .for_tests_pending_scanout_render_completion_ids()[0];
+    wait_for_held_scanout_job(&mut fixture, first_job);
+    fixture
+        .recorders
+        .render_completion_readiness
+        .release_ready_job(first_job);
+    Backend::on_scanout_render_completion(&mut fixture.backend, &mut fixture.state);
+    let first_receipt = fixture
+        .backend
+        .scene
+        .for_tests_cursor_commit_receipt(0)
+        .expect("first copied frame accepted its cursor binding");
+    assert_eq!(first_receipt.mode, CursorAcceptedMode::Hardware);
+    assert_eq!(
+        first_receipt.primary_cursor,
+        CursorPrimaryContent::Cursorless
+    );
+    let first_record = sink_atomic.records().pop().expect("first copied commit");
+    assert_eq!(
+        first_record.kind,
+        crate::drm::atomic::AtomicCommitKind::SceneWithCursor
+    );
+    fixture.retire_output(0, 1);
+    assert!(
+        !fixture.backend.scene.has_pending_page_flip(0),
+        "the output is ready before its second copied completion is produced",
+    );
+
+    sink_atomic.clear_records();
+    super::round_a::damage_cursor_root(&mut fixture);
+    Backend::maybe_composite(&mut fixture.backend).expect("build the second copied frame");
+    let crtc = fixture.backend.platform.outputs[0].output.crtc;
+    let (second_job, second_bo, second_frame) = wait_for_copied_job_for_crtc(&mut fixture, crtc);
+    let staged = &fixture.backend.platform.staged_cursor_frames[&(0, second_bo)];
+    assert_eq!(staged.plan.frame, second_frame);
+    assert!(
+        staged.cursor_updates.is_empty(),
+        "the second frame starts with no cursor delta because its binding and position match applied state",
+    );
+    wait_for_held_scanout_job(&mut fixture, second_job);
+
+    let p1 = (137, 119);
+    Backend::warp_pointer_root(&mut fixture.backend, &mut fixture.state, p1.0, p1.1);
+    super::round_a::damage_cursor_root(&mut fixture);
+    Backend::maybe_composite(&mut fixture.backend)
+        .expect("retain late motion behind the second copied frame");
+    assert!(sink_atomic.records().is_empty());
+    assert_eq!(
+        fixture
+            .backend
+            .platform
+            .for_tests_pending_scanout_render_completion_count(),
+        1,
+        "the second frame remains the only pending scene acknowledgement",
+    );
+
+    fixture
+        .recorders
+        .render_completion_readiness
+        .release_ready_job(second_job);
+    Backend::on_scanout_render_completion(&mut fixture.backend, &mut fixture.state);
+    let receipt = fixture
+        .backend
+        .scene
+        .for_tests_cursor_commit_receipt(0)
+        .expect("second copied frame publishes after atomic acceptance");
+    assert_eq!(receipt.frame, Some(second_frame));
+    assert_eq!(receipt.mode, CursorAcceptedMode::Hardware);
+    assert_eq!(receipt.primary_cursor, CursorPrimaryContent::Cursorless);
+    let records = sink_atomic.records();
+    assert_eq!(
+        records.len(),
+        1,
+        "the late delta rides the copied primary commit"
+    );
+    let record = &records[0];
+    assert_eq!(
+        record.kind,
+        crate::drm::atomic::AtomicCommitKind::SceneWithCursor
+    );
+    assert_eq!(record.events.len(), 1);
+    assert_eq!(
+        record.events[0].crtc,
+        fixture.backend.platform.outputs[0].output.crtc
+    );
+    let cursor_properties = cursor_plane_for_output(&fixture, 0)
+        .properties_for(fixture.backend.platform.outputs[0].output.crtc)
+        .expect("output cursor properties");
+    assert!(record.properties.iter().any(|update| {
+        update.object == cursor_properties.plane.into()
+            && update.property == cursor_properties.crtc_x
+            && update.value == p1.0 as i64 as u64
+    }));
+    assert!(record.properties.iter().any(|update| {
+        update.object == cursor_properties.plane.into()
+            && update.property == cursor_properties.crtc_y
+            && update.value == p1.1 as i64 as u64
+    }));
+    assert!(
+        !record.properties.iter().any(|update| {
+            update.object == cursor_properties.plane.into()
+                && update.property == cursor_properties.fb_id
+        }),
+        "motion reuses the accepted sprite framebuffer",
+    );
+
+    fixture.retire_output(0, 2);
+    fixture
+        .backend
+        .disable_output()
+        .expect("Backend disables and drains the copied output");
+    fixture.assert_cursor_quiescent();
+    assert!(fixture.backend.platform.staged_cursor_frames.is_empty());
+    assert_eq!(
+        fixture
+            .backend
+            .platform
+            .for_tests_pending_scanout_render_completion_count(),
+        0
+    );
     let ledger = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
     drop(fixture);
     assert_eq!(ledger.end_state(), (0, 0, 0));
