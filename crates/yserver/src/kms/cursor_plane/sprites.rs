@@ -229,6 +229,12 @@ impl SpritePool {
         true
     }
 
+    pub(crate) fn can_accept_reserved(&self, lease: SpriteBufferLease) -> bool {
+        self.buffers.get(lease.slot).is_some_and(|buffer| {
+            buffer.version == Some(lease.version) && buffer.prepared_users > 0
+        })
+    }
+
     pub(crate) fn reject_reserved(&mut self, lease: SpriteBufferLease) -> bool {
         let Some(buffer) = self.buffers.get_mut(lease.slot) else {
             return false;

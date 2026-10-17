@@ -129,6 +129,20 @@ impl OutputSink for PlatformBackend {
             .get(output_idx)
             .and_then(Option::as_ref)
             .is_some_and(|pool| matches!(pool, OutputScanout::Shared(_)));
+        let target_slot_exists = self
+            .scanout_pools
+            .get(output_idx)
+            .and_then(Option::as_ref)
+            .is_some_and(|pool| match pool {
+                OutputScanout::Shared(pool) => pool.bos.get(bo_idx).is_some(),
+                OutputScanout::Copied(pool) => {
+                    pool.sources.get(bo_idx).is_some()
+                        && pool.destinations.bos.get(bo_idx).is_some()
+                }
+            });
+        if !target_slot_exists {
+            return FinishOutcome::Unavailable(FrameTargetError::NoSlot);
+        }
         // Async requests are cursorless by construction. Do not prepare or
         // reserve a cursor delta that an Async EINVAL fallback could later
         // accidentally settle as accepted.
@@ -146,13 +160,11 @@ impl OutputSink for PlatformBackend {
             self.tearing_copy_received_at,
             self.tearing_copy_received_monotonic,
         );
-        let Some(pool) = self
+        let pool = self
             .scanout_pools
             .get_mut(output_idx)
             .and_then(Option::as_mut)
-        else {
-            return FinishOutcome::Unavailable(FrameTargetError::NoSlot);
-        };
+            .expect("scanout pool was checked before cursor reservation");
         let output = &self.outputs[output_idx].output;
         let mut shared_cursor_commit_submitted = false;
         let mut cursor_rejection_error: Option<io::Error> = None;
@@ -160,9 +172,10 @@ impl OutputSink for PlatformBackend {
         let outcome = match pool {
             OutputScanout::Shared(pool) => {
                 let allocation_plan = pool.allocation_plan;
-                let Some(bo) = pool.bos.get_mut(bo_idx) else {
-                    return FinishOutcome::Unavailable(FrameTargetError::NoSlot);
-                };
+                let bo = pool
+                    .bos
+                    .get_mut(bo_idx)
+                    .expect("shared scanout slot was checked before cursor reservation");
                 let submitted = submit_shared_scanout_frame(
                     &drm_device,
                     atomic_commit_sink.as_ref(),
@@ -198,12 +211,15 @@ impl OutputSink for PlatformBackend {
             }
             OutputScanout::Copied(pool) => {
                 debug_assert!(timing == crate::drm::async_flip::FlipTiming::Vsync);
-                let Some(source) = pool.sources.get_mut(bo_idx) else {
-                    return FinishOutcome::Unavailable(FrameTargetError::NoSlot);
-                };
-                let Some(destination) = pool.destinations.bos.get_mut(bo_idx) else {
-                    return FinishOutcome::Unavailable(FrameTargetError::NoSlot);
-                };
+                let source = pool
+                    .sources
+                    .get_mut(bo_idx)
+                    .expect("copied source slot was checked before cursor reservation");
+                let destination = pool
+                    .destinations
+                    .bos
+                    .get_mut(bo_idx)
+                    .expect("copied destination was checked before cursor reservation");
                 let result = submit_copied_scanout_render(source, &mut destination.state, record);
                 let fail_stop = result
                     .as_ref()
@@ -234,9 +250,8 @@ impl OutputSink for PlatformBackend {
             let rejected = self.reject_atomic_cursor_commit(&cursor_updates, &error);
             self.defer_cursor_move_outcome(rejected);
         } else if shared_cursor_commit_submitted {
-            if let Err(error) = self.cursor_plane_scene_commit_submitted(&cursor_updates) {
-                log::error!("render cursor scene acceptance settlement failed: {error}");
-            }
+            self.cursor_plane_scene_commit_submitted(&cursor_updates)
+                .expect("accepted shared scene commit keeps its reserved cursor leases");
         } else {
             self.reject_cursor_plane_update_reservations(&cursor_updates);
         }

@@ -199,6 +199,10 @@ fn atomic_cursor_only_copied_scene_routes_to_sink_device_via_backend() {
     );
     fixture.backend.refresh_present_crtc_clock_epochs();
     fixture
+        .backend
+        .platform
+        .for_tests_initialize_cursor_planes_with_capabilities(Some(64), Some(64));
+    fixture
         .install_copied_recording_route(route)
         .expect("install lavapipe copied scene route");
     let layouts = fixture.backend.platform.scene_output_layouts();
@@ -210,6 +214,8 @@ fn atomic_cursor_only_copied_scene_routes_to_sink_device_via_backend() {
         OutputRoute::Copied,
         "Backend scene output must enter the copied route",
     );
+    fixture.define_visible_cursor();
+    Backend::warp_pointer_root(&mut fixture.backend, &mut fixture.state, 100, 90);
     damage_cursor_root(&mut fixture);
     Backend::maybe_composite(&mut fixture.backend).expect("submit copied scene frame");
 
@@ -236,10 +242,53 @@ fn atomic_cursor_only_copied_scene_routes_to_sink_device_via_backend() {
             .iter()
             .map(|record| record.kind)
             .collect::<Vec<_>>(),
-        vec![crate::drm::atomic::AtomicCommitKind::Scene],
-        "one copied scene flip is recorded on the sink device",
+        vec![
+            crate::drm::atomic::AtomicCommitKind::Scene,
+            crate::drm::atomic::AtomicCommitKind::CursorOnly,
+        ],
+        "the copied first scene is followed by its accepted cursor attach",
     );
     assert_eq!(sink_atomic.records()[0].events.len(), 1);
+    let properties = fixture
+        .backend
+        .platform
+        .device_for_key(sink_key)
+        .unwrap()
+        .cursor
+        .plane
+        .as_ref()
+        .expect("copied sink owns its cursor plane")
+        .properties_for(crtc)
+        .expect("copied sink cursor properties");
+    let initial_records = sink_atomic.records();
+    let attach_fields: Vec<_> = initial_records[1]
+        .properties
+        .iter()
+        .filter(|update| update.object == properties.plane.into())
+        .collect();
+    assert!(
+        attach_fields
+            .iter()
+            .any(|update| { update.property == properties.fb_id && update.value != 0 })
+    );
+    assert!(fixture.recorders.atomic.records().is_empty());
+    fixture.retire_output(0, 2);
+
+    Backend::warp_pointer_root(&mut fixture.backend, &mut fixture.state, 130, 100);
+    let sink_crtc_state = &fixture
+        .backend
+        .platform
+        .device_for_key(sink_key)
+        .expect("copied cursor sink device")
+        .cursor
+        .crtc_states[&crtc];
+    let pending_motion = match sink_crtc_state.intent.expect("copied-route motion intent") {
+        crate::kms::render::platform::cursor_state::CursorIntent::Show(binding) => binding,
+        crate::kms::render::platform::cursor_state::CursorIntent::Hide => {
+            panic!("copied-route motion keeps the accepted image visible")
+        }
+    };
+    assert_eq!((pending_motion.x, pending_motion.y), (130, 100));
     assert!(fixture.recorders.atomic.records().is_empty());
     fixture
         .backend
@@ -260,8 +309,11 @@ fn atomic_cursor_only_copied_scene_routes_to_sink_device_via_backend() {
             .iter()
             .map(|record| record.kind)
             .collect::<Vec<_>>(),
-        vec![crate::drm::atomic::AtomicCommitKind::Scene],
-        "copied scene uses the sink's atomic recorder",
+        vec![
+            crate::drm::atomic::AtomicCommitKind::Scene,
+            crate::drm::atomic::AtomicCommitKind::CursorOnly,
+        ],
+        "copied attach uses the sink's atomic recorder and the newer intent survives until teardown",
     );
     assert_eq!(
         fixture

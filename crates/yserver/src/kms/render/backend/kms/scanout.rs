@@ -486,6 +486,16 @@ impl KmsBackend {
                 x,
                 y,
             ) {
+                if error.is_deferred()
+                    && (self.pstate.scanout_m2.pending.is_some()
+                        || self.pstate.scanout_m2.queued_successor.is_some())
+                {
+                    log::debug!(
+                        "scanout_m2: direct cursor replacement waits for output {output_idx} flip retirement"
+                    );
+                    self.pstate.scanout_m2.cursor_bound_all = cursor_was_bound;
+                    return true;
+                }
                 log::warn!(
                     "scanout_m2: direct cursor show failed on output {output_idx}: {error}; unflipping"
                 );
@@ -688,12 +698,10 @@ impl KmsBackend {
                 .reject_cursor_plane_update_reservations(&cursor_updates);
         }
         result?;
-        if !cursor_updates.is_empty()
-            && let Err(error) = self
-                .platform
+        if !cursor_updates.is_empty() {
+            self.platform
                 .cursor_plane_scene_commit_submitted(&cursor_updates)
-        {
-            return Err(error);
+                .expect("accepted direct commit keeps its reserved cursor leases");
         }
         frame.awaiting_outputs = (0..self.platform.outputs.len()).collect();
         frame.async_outcome = async_outcome;
@@ -1089,28 +1097,31 @@ impl KmsBackend {
         let cursor_updates = self
             .platform
             .cursor_plane_updates_for_primary_outputs(&output_indices);
+        let framebuffers: Vec<_> = (0..output_count)
+            .map(|output_idx| {
+                self.platform
+                    .retained_composed_framebuffer(output_idx)
+                    .ok_or_else(|| {
+                        io::Error::other(format!(
+                            "scanout M2: output {output_idx} has no retained composed framebuffer"
+                        ))
+                    })
+            })
+            .collect::<io::Result<_>>()?;
         self.platform
             .reserve_cursor_plane_updates(&cursor_updates)?;
         let planes: Vec<crate::drm::modeset::ComposedScanoutPlaneState<'_>> = self
             .platform
             .outputs
             .iter()
-            .enumerate()
-            .map(|(output_idx, layout)| {
-                let fb = self
-                    .platform
-                    .retained_composed_framebuffer(output_idx)
-                    .ok_or_else(|| {
-                        io::Error::other(format!(
-                            "scanout M2: output {output_idx} has no retained composed framebuffer"
-                        ))
-                    })?;
-                Ok(crate::drm::modeset::ComposedScanoutPlaneState {
+            .zip(framebuffers)
+            .map(
+                |(layout, fb)| crate::drm::modeset::ComposedScanoutPlaneState {
                     output: &layout.output,
                     fb,
-                })
-            })
-            .collect::<io::Result<_>>()?;
+                },
+            )
+            .collect();
         let result = crate::drm::modeset::submit_composed_scanout(
             &device,
             atomic_commit_sink.as_ref(),
@@ -1130,7 +1141,8 @@ impl KmsBackend {
         }
         result?;
         self.platform
-            .cursor_plane_scene_commit_submitted(&cursor_updates)?;
+            .cursor_plane_scene_commit_submitted(&cursor_updates)
+            .expect("accepted composed unflip keeps its reserved cursor leases");
         self.pstate.scanout_m2.unflip_awaiting_outputs = (0..output_count).collect();
         let describe_frame = |frame: &DirectPresentFrame| {
             (
@@ -2229,7 +2241,7 @@ impl KmsBackend {
             // the permanent-stall failure mode this guards against.
             if let Ok((flips, sequences)) = self.platform.drain_page_flip_events(drm_fd) {
                 for (output_idx, _, _) in flips {
-                    self.record_atomic_cursor_commit_retirement(output_idx);
+                    self.record_atomic_cursor_commit_retirement(output_idx, true);
                 }
                 for seq in sequences {
                     self.on_crtc_sequence_event(
@@ -2253,9 +2265,17 @@ impl KmsBackend {
         // Consume every obligation that existed when this event batch was
         // drained before a retirement callback can accept a new cursor show.
         // That new show must not be retired by another event from this batch.
+        let defer_cursor_retry_for_primary_successor =
+            self.pstate.scanout_m2.queued_successor.is_some()
+                || self.pstate.scanout_m2.unflip_requested;
         let cursor_retirements: Vec<_> = flipped
             .iter()
-            .map(|(output_idx, _, _)| self.record_atomic_cursor_commit_retirement(*output_idx))
+            .map(|(output_idx, _, _)| {
+                self.record_atomic_cursor_commit_retirement(
+                    *output_idx,
+                    !defer_cursor_retry_for_primary_successor,
+                )
+            })
             .collect();
         let _ = cursor_retirements;
         for (output_idx, clock, timestamps) in flipped {
@@ -2325,10 +2345,14 @@ impl KmsBackend {
         }
     }
 
-    fn record_atomic_cursor_commit_retirement(&mut self, output_idx: usize) -> bool {
+    fn record_atomic_cursor_commit_retirement(
+        &mut self,
+        output_idx: usize,
+        retry_wait_ready: bool,
+    ) -> bool {
         let retired = self
             .platform
-            .retire_atomic_cursor_commit_for_output(output_idx);
+            .retire_atomic_cursor_commit_for_output(output_idx, retry_wait_ready);
         if !retired {
             return false;
         }

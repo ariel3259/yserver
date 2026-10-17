@@ -172,7 +172,8 @@ impl PlatformBackend {
         })();
 
         if result.is_ok() {
-            self.cursor_plane_scene_commit_submitted(&cursor_updates)?;
+            self.cursor_plane_scene_commit_submitted(&cursor_updates)
+                .expect("accepted copied commit keeps its reserved cursor leases");
         } else if atomic_commit_sink.take_last_cursor_rejection() {
             let error = result.as_ref().expect_err("checked copied submit error");
             let rejected = self.reject_atomic_cursor_commit(&cursor_updates, error);

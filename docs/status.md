@@ -28,6 +28,21 @@ Earlier program docs are archived:
 Cross-cutting bugs and followups that don't fit a stage live in
 [`known-issues.md`](known-issues.md).
 
+- **2026-10-16 atomic-cursor-only A6 fix round 1:** Preserved a staged
+  stationary image replacement when a direct primary successor projects the
+  accepted binding, and allowed a permanent-failure cursor to submit the Hide
+  needed to detach its accepted binding. Shared scene submission now checks
+  every target slot before reserving cursor leases, unflip resolves retained
+  framebuffers before reservation, and accepted settlement is enforced after
+  successful submits. The focused stationary-replacement, permanent-detach,
+  and copied-sink tests passed; the full default and ignored workspace suites,
+  render-acceptance ignored suite, both clippy gates, formatting and layout
+  passed. Teardown notices also reproduce on task base `aa199a8`. Coverage is
+  still incomplete: Async tests do not establish a pending cursor intent, the
+  four Async mutations and producer-reservation mutations were not run, and
+  copied/direct/unflip motion-delta assertions are not complete. See the
+  appended Fix round 1 report; no hardware validation was run.
+
 - **2026-10-16 atomic-cursor-only A6 (implementation complete):** Cursor commits
   prepare full-state deltas from last accepted per-CRTC state. Scene, direct,
   copied, cursor-only and composed-unflip producers share reservation and

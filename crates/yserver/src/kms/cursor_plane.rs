@@ -1046,6 +1046,10 @@ impl CursorPlane {
         self.sprite_pool.accept_reserved(lease)
     }
 
+    pub(crate) fn can_accept_reserved_sprite(&self, lease: SpriteBufferLease) -> bool {
+        self.sprite_pool.can_accept_reserved(lease)
+    }
+
     pub(crate) fn reject_reserved_sprite(&mut self, lease: SpriteBufferLease) -> bool {
         self.sprite_pool.reject_reserved(lease)
     }

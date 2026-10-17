@@ -2361,7 +2361,7 @@ fn test_raw<T: ::drm::control::ResourceHandle>(value: u32) -> T {
     ::drm::control::from_u32(value).expect("nonzero synthetic DRM handle")
 }
 
-struct CursorOnlyDirectPresentSetup {
+pub(super) struct CursorOnlyDirectPresentSetup {
     source_xid: u32,
     window_xid: u32,
     width: u16,
@@ -2370,7 +2370,7 @@ struct CursorOnlyDirectPresentSetup {
     crtc_epoch: u64,
 }
 
-fn setup_cursor_only_direct_present(
+pub(super) fn setup_cursor_only_direct_present(
     fixture: &mut AtomicCursorFixture,
 ) -> CursorOnlyDirectPresentSetup {
     use crate::kms::render::store::DrawableKind;
@@ -2483,7 +2483,7 @@ fn setup_cursor_only_direct_present(
     }
 }
 
-fn direct_present_for_id(
+pub(super) fn direct_present_for_id(
     setup: &CursorOnlyDirectPresentSetup,
     present_id: u64,
 ) -> (

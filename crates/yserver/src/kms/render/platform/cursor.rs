@@ -422,17 +422,18 @@ impl PlatformBackend {
         let cursor = &device.cursor;
         let plane = cursor.plane.as_ref()?;
         let properties = plane.properties_for(crtc)?;
-        if cursor.permanently_disabled
-            || cursor.cursor_hide_recovery.contains_key(&crtc)
-            || cursor.atomic_cursor_commits_in_flight.contains_key(&crtc)
-        {
-            return None;
-        }
         let state = cursor.crtc_states.get(&crtc)?;
         if state.in_flight.is_some() {
             return None;
         }
         let intent = state.intent?;
+        if (cursor.permanently_disabled && matches!(intent, CursorIntent::Show(_)))
+            || (cursor.cursor_hide_recovery.contains_key(&crtc)
+                && matches!(intent, CursorIntent::Show(_)))
+            || cursor.atomic_cursor_commits_in_flight.contains_key(&crtc)
+        {
+            return None;
+        }
         let mut next = match intent {
             CursorIntent::Show(binding) => Some(binding),
             CursorIntent::Hide => None,
@@ -514,6 +515,8 @@ impl PlatformBackend {
                 .iter_mut()
                 .find(|device| device.key == device_key)
                 .and_then(|device| device.cursor.crtc_states.get_mut(&crtc))
+                && state.intent
+                    == Some(state.applied.map_or(CursorIntent::Hide, CursorIntent::Show))
             {
                 state.intent = None;
                 state.intent_motion_timestamp = None;
@@ -807,6 +810,35 @@ impl PlatformBackend {
         &mut self,
         updates: &[CursorPlaneUpdate],
     ) -> io::Result<()> {
+        // Validate the complete transaction before transferring any lease.
+        // A successful ioctl has already changed kernel state, so partial
+        // acceptance would leave userspace unable to describe ownership.
+        for update in updates {
+            let Some(device) = self
+                .devices
+                .iter()
+                .find(|device| device.key == update.device_key)
+            else {
+                return Err(io::Error::other(
+                    "accepted cursor update device disappeared",
+                ));
+            };
+            if let Some(next) = update.prepared.next.filter(|next| {
+                update
+                    .prepared
+                    .prior
+                    .is_none_or(|prior| prior.lease != next.lease)
+            }) && !device
+                .cursor
+                .plane
+                .as_ref()
+                .is_some_and(|plane| plane.can_accept_reserved_sprite(next.lease))
+            {
+                return Err(io::Error::other(
+                    "accepted cursor commit lost its reserved framebuffer lease",
+                ));
+            }
+        }
         for update in updates {
             let Some(device) = self
                 .devices
@@ -864,7 +896,11 @@ impl PlatformBackend {
 
     /// Attribute a flip event to this CRTC's cursor-only commit, if present.
     /// The caller still records general scene-commit latency independently.
-    pub(crate) fn retire_atomic_cursor_commit_for_output(&mut self, output_idx: usize) -> bool {
+    pub(crate) fn retire_atomic_cursor_commit_for_output(
+        &mut self,
+        output_idx: usize,
+        retry_wait_ready: bool,
+    ) -> bool {
         let Some(layout) = self.outputs.get(output_idx) else {
             return false;
         };
@@ -890,7 +926,8 @@ impl PlatformBackend {
         {
             plane.release_sprite_user(prior.lease);
         }
-        let retry_reenabled = device.cursor.cursor_retry_waits_for_flip.remove(&crtc);
+        let retry_reenabled =
+            retry_wait_ready && device.cursor.cursor_retry_waits_for_flip.remove(&crtc);
         retired || retry_reenabled
     }
 
