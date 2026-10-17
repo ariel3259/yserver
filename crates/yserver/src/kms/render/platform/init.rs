@@ -764,6 +764,10 @@ impl PlatformBackend {
     /// existing shape from Stage 1b.
     #[doc(hidden)]
     pub(crate) fn for_tests() -> Self {
+        Self::for_tests_with_services(super::services::KmsServices::for_tests())
+    }
+
+    pub(crate) fn for_tests_with_services(services: super::services::KmsServices) -> Self {
         let wakeup_eventfd = nix::sys::eventfd::EventFd::from_value_and_flags(
             0,
             nix::sys::eventfd::EfdFlags::EFD_CLOEXEC | nix::sys::eventfd::EfdFlags::EFD_NONBLOCK,
@@ -778,7 +782,6 @@ impl PlatformBackend {
         let scanout_render_completion_epfd =
             crate::kms::render::completion_poller::CompletionPoller::new()
                 .expect("test scanout completion poller");
-        let services = super::services::KmsServices::for_tests();
         let device_key = crate::platform::drm::DrmDeviceKey { major: 0, minor: 0 };
         let test_route = ScanoutRoute::new(
             RenderDeviceId::UnverifiedFallback,

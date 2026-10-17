@@ -1289,10 +1289,13 @@ fn tick_one_output(
         CursorAssignment::Sw { pos } => CursorFrameAssignment::Software { pos },
         CursorAssignment::Hidden => CursorFrameAssignment::Hidden,
     };
+    let hardware_only = prev_mode == OutputCursorMode::Hw
+        && !matches!(assignment, CursorFrameAssignment::Software { .. });
     let cursor_frame = CursorFramePlan {
         frame,
         assignment,
-        sprite: (!matches!(assignment, CursorFrameAssignment::Hidden))
+        hardware_only,
+        sprite: (!hardware_only && !matches!(assignment, CursorFrameAssignment::Hidden))
             .then(|| inner.cursor.clone())
             .flatten(),
     };

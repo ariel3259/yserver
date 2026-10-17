@@ -330,14 +330,22 @@ impl OutputSink for PlatformBackend {
         if cursor_rejected {
             // A scene-owned cursor rejection abandons this frame with its old
             // primary and actual binding intact. Recovery may recompose; no
-            // cursor-only intent is published from the rejected frame plan.
+            // ownership transition is published from the rejected frame plan.
             self.reject_cursor_plane_update_reservations(&cursor_updates);
+            self.restore_failed_hardware_cursor_intents(&cursor_updates);
             super::cursor_frames::mark_cursor_frame_updates_settled(
                 self, output_idx, bo_idx, frame,
             );
         } else if shared_cursor_commit_submitted && scene_cursor_owner {
-            if let Err(error) = self.cursor_plane_scene_frame_submitted(output_idx, &cursor_updates)
+            let settlement = if cursor_updates
+                .iter()
+                .any(|update| update.owner == super::cursor_frames::CursorCommitOwner::HardwareOnly)
             {
+                self.cursor_plane_scene_commit_submitted(&cursor_updates)
+            } else {
+                self.cursor_plane_scene_frame_submitted(output_idx, frame, &cursor_updates)
+            };
+            if let Err(error) = settlement {
                 // The atomic request already changed the display. Stop future
                 // rendering and quarantine the sprite pool if even accepted-
                 // state recovery cannot account for its framebuffer leases.
@@ -356,6 +364,7 @@ impl OutputSink for PlatformBackend {
             );
         } else if !copied_handoff_waiting {
             self.reject_cursor_plane_update_reservations(&cursor_updates);
+            self.restore_failed_hardware_cursor_intents(&cursor_updates);
             super::cursor_frames::mark_cursor_frame_updates_settled(
                 self, output_idx, bo_idx, frame,
             );
@@ -515,9 +524,14 @@ impl OutputSink for PlatformBackend {
         };
         match self.submit_copied_scanout(output_idx, bo_idx, fd, &cursor_updates) {
             Ok(()) => {
-                if let Err(error) =
-                    self.cursor_plane_scene_frame_submitted(output_idx, &cursor_updates)
-                {
+                let settlement = if cursor_updates.iter().any(|update| {
+                    update.owner == super::cursor_frames::CursorCommitOwner::HardwareOnly
+                }) {
+                    self.cursor_plane_scene_commit_submitted(&cursor_updates)
+                } else {
+                    self.cursor_plane_scene_frame_submitted(output_idx, frame, &cursor_updates)
+                };
+                if let Err(error) = settlement {
                     log::error!(
                         "accepted copied scene frame could not settle cursor leases: {error}"
                     );
@@ -551,6 +565,7 @@ impl OutputSink for PlatformBackend {
                         self, output_idx, bo_idx, frame,
                     );
                 }
+                self.restore_failed_hardware_cursor_intents(&cursor_updates);
                 super::cursor_frames::cancel_cursor_frame(self, output_idx, bo_idx, frame);
                 Err(submit_error.error)
             }

@@ -14,6 +14,14 @@ impl AtomicCursorFixture {
         Self::from_live_backend(backend, Some(64), Some(64))
     }
 
+    pub(crate) fn new_with_clock(
+        clock: Rc<dyn Fn() -> std::time::Instant>,
+    ) -> Result<Option<Self>, String> {
+        let backend =
+            KmsBackend::for_tests_with_vk_and_clock(clock).map_err(|error| error.to_string())?;
+        Self::from_live_backend(backend, Some(64), Some(64))
+    }
+
     pub(crate) fn new_with_scanout_acquisition_script(
         unavailable: impl IntoIterator<Item = bool>,
     ) -> Result<Option<Self>, String> {
@@ -93,7 +101,13 @@ impl AtomicCursorFixture {
     }
 
     pub(crate) fn new_with_overlapping_outputs() -> Result<Option<Self>, String> {
-        let mut backend = KmsBackend::for_tests_with_vk_dimensions(800, 600)
+        Self::new_with_overlapping_outputs_and_clock(Rc::new(std::time::Instant::now))
+    }
+
+    pub(crate) fn new_with_overlapping_outputs_and_clock(
+        clock: Rc<dyn Fn() -> std::time::Instant>,
+    ) -> Result<Option<Self>, String> {
+        let mut backend = KmsBackend::for_tests_with_vk_dimensions_and_clock(800, 600, clock)
             .map_err(|error| error.to_string())?;
         super::super::push_test_output(&mut backend, 2);
         backend.platform.outputs[1].x = 0;
@@ -442,7 +456,7 @@ impl AtomicCursorFixture {
                         && state.intent.is_none()
                         && state.in_flight.is_none()
                 }),
-                "cursor binding, lifecycle owner, intent, or event obligation remains for {:?}",
+                "cursor binding, lifecycle owner, intent, or event obligation remains for {:?}: {state:?}",
                 output.output.crtc,
             );
             assert!(

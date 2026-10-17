@@ -30,6 +30,10 @@ impl Platform for PlatformBackend {
         self.scene_output_layouts()
     }
 
+    fn monotonic_now(b: &KmsBackend) -> std::time::Instant {
+        b.monotonic_now()
+    }
+
     fn note_backend_put_image_entry(b: &mut KmsBackend) {
         b.platform
             .services
@@ -116,7 +120,7 @@ impl Platform for PlatformBackend {
             )
         {
             b.platform.note_tearing_copy_damage(
-                std::time::Instant::now(),
+                b.monotonic_now(),
                 crate::drm::atomic::monotonic_timestamp(),
             );
         }
@@ -150,39 +154,7 @@ impl Platform for PlatformBackend {
     }
 
     fn hide_cursor_under_direct_scanout(b: &mut KmsBackend) {
-        b.pstate.deferred_direct_cursor = None;
-        let direct_scanout = b.pstate.scanout_m2.active();
-        if !direct_scanout {
-            // A composed shared frame owns the hide together with the
-            // cursorless primary. Detaching here would split HW→Hidden into
-            // a cursor-only transaction and leave frame ownership ambiguous.
-            b.scene.wake_for_damage();
-            return;
-        }
-        if !b.platform.any_cursor_plane_visible() {
-            if !b.sync_direct_cursor_scene_state() {
-                b.request_direct_unflip("cursor_scene_sync_failed");
-            }
-            return;
-        }
-        let mut failed = false;
-        for output_idx in 0..b.platform.outputs.len() {
-            if !b.platform.cursor_plane_visible_for_output(output_idx) {
-                continue;
-            }
-            if let Err(error) = b.platform.cursor_plane_hide_on_crtc(output_idx) {
-                log::warn!(
-                    "scanout_m2: cursor hide failed on output {output_idx}: {error}; unflipping"
-                );
-                failed = true;
-            }
-        }
-        if failed {
-            b.request_direct_unflip("cursor_hide_failed");
-        }
-        if !b.sync_direct_cursor_scene_state() {
-            b.request_direct_unflip("cursor_scene_sync_failed");
-        }
+        b.hide_cursor_under_direct_scanout();
     }
 
     fn recover_hidden_cursor_on_resume(b: &mut KmsBackend) {
@@ -198,48 +170,101 @@ impl Platform for PlatformBackend {
         b.platform.cursor_pointer_root = pos;
     }
 
+    fn queue_cursor_intent(
+        b: &mut KmsBackend,
+        record: Option<&crate::kms::render::cursor::CursorRecord>,
+        visible: bool,
+        pos: (i32, i32),
+    ) -> bool {
+        let direct_owns_primary = b.pstate.scanout_m2.active();
+        let hardware_cursor_outputs: Vec<_> = (0..b.platform.outputs.len())
+            .map(|output_idx| {
+                direct_owns_primary
+                    || (b.scene.output_uses_hardware_cursor(output_idx)
+                        && !b.scene.output_cursor_transition_pending(output_idx))
+            })
+            .collect();
+        let handled = b.platform.queue_cursor_intent(
+            record,
+            visible,
+            pos,
+            b.pstate.tearing.is_on(),
+            direct_owns_primary,
+            &hardware_cursor_outputs,
+        );
+        if direct_owns_primary {
+            b.refresh_direct_cursor_bound_state();
+        }
+        handled
+    }
+
+    fn observe_cursor_intent(
+        b: &mut KmsBackend,
+        record: Option<&crate::kms::render::cursor::CursorRecord>,
+        visible: bool,
+        pos: (i32, i32),
+    ) -> bool {
+        b.platform.cursor_pointer_root = pos;
+        let direct_owns_primary = b.pstate.scanout_m2.active();
+        let hardware_cursor_outputs: Vec<_> = (0..b.platform.outputs.len())
+            .map(|output_idx| {
+                direct_owns_primary
+                    || (b.scene.output_uses_hardware_cursor(output_idx)
+                        && !b.scene.output_cursor_transition_pending(output_idx))
+            })
+            .collect();
+        let handled = b.platform.queue_cursor_intent(
+            record,
+            visible,
+            pos,
+            b.pstate.tearing.is_on(),
+            direct_owns_primary,
+            &hardware_cursor_outputs,
+        );
+        if direct_owns_primary {
+            b.refresh_direct_cursor_bound_state();
+        }
+        let visible = visible && !b.pstate.tearing.is_on() && !b.platform.tearing_on;
+        let Some(record) = record.filter(|_| visible) else {
+            return handled;
+        };
+        for (output_idx, layout) in b.platform.outputs.iter().enumerate() {
+            let x = pos.0 - i32::from(record.hot_x) - layout.x;
+            let y = pos.1 - i32::from(record.hot_y) - layout.y;
+            let intersects = x < i32::from(layout.width)
+                && x + i32::from(record.width) > 0
+                && y < i32::from(layout.height)
+                && y + i32::from(record.height) > 0;
+            if !intersects {
+                continue;
+            }
+            if !hardware_cursor_outputs
+                .get(output_idx)
+                .copied()
+                .unwrap_or(false)
+                || !b.platform.cursor_output_is_active(output_idx)
+                || !b.platform.cursor_plane_available_for_output(output_idx)
+                || !b.platform.cursor_plane_fits_for_output(
+                    output_idx,
+                    u32::from(record.width),
+                    u32::from(record.height),
+                )
+            {
+                return false;
+            }
+        }
+        true
+    }
+
     fn move_hw_cursor(
         b: &mut KmsBackend,
-        mixed: bool,
-        (cx, cy): (i32, i32),
-        (hot_x, hot_y): (u16, u16),
-        (cw, ch): (i32, i32),
+        needs_software_repaint: bool,
+        _pos: (i32, i32),
+        _hot: (u16, u16),
+        _size: (i32, i32),
     ) {
-        if mixed {
-            // Hardware and software cursor ownership may coexist on
-            // arbitrary cards. Record/dispatch every visible HW plane
-            // position and also repaint the SW outputs.
-            match b.platform.cursor_plane_move(cx, cy) {
-                Ok(outcome) => {
-                    b.handle_cursor_move_outcome(outcome);
-                }
-                Err(e) => log::debug!("render cursor mixed path: move failed: {e}"),
-            }
-            b.scene.wake_for_damage();
-        } else if !b.pstate.scanout_m2.active()
-            && cw > 0
-            && ch > 0
-            && b.platform
-                .cursor_crtc_membership_dirty(cx, cy, hot_x, hot_y, cw, ch)
-        {
-            // The cursor footprint crossed onto/off a CRTC the
-            // plane isn't bound to. The move-only fast path
-            // can't rebind across CRTCs, so route this motion
-            // through one compose tick — the scene's
-            // `CursorAssignment` then issues the show/hide on
-            // retire. Pre-#30 the continuous idle redraw loop
-            // masked this; idle desktops now stop compositing,
-            // so the seam crossing must be detected here or the
-            // cursor stays frozen on the CRTC it was last bound
-            // to (invisible on the screen it moved onto).
-            b.scene.wake_for_damage();
-        } else {
-            match b.platform.cursor_plane_move(cx, cy) {
-                Ok(outcome) => {
-                    b.handle_cursor_move_outcome(outcome);
-                }
-                Err(e) => log::debug!("render cursor fast path: move failed: {e}"),
-            }
+        if needs_software_repaint {
+            b.scene.wake_for_cursor_damage();
         }
     }
 

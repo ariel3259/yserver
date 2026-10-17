@@ -17,6 +17,10 @@ pub enum CursorFrameAssignment {
 pub struct CursorFramePlan {
     pub frame: CursorFrameId,
     pub assignment: CursorFrameAssignment,
+    /// The accepted output already owns the hardware cursor and this frame
+    /// does not change that ownership. Its cursor delta comes from the live
+    /// hardware intent, not from a frame-captured sprite snapshot.
+    pub hardware_only: bool,
     pub sprite: Option<CursorEntry>,
 }
 

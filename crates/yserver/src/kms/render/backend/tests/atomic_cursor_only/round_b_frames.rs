@@ -2621,7 +2621,7 @@ fn atomic_cursor_only_software_frame_keeps_rendered_cursor_snapshot() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: release F0's prepared sprite lease early; pressure writes V1/V2/V3 over F0's mapped V0 bytes.
+// Mutation: release a frame-owned first-bind lease early; pressure must not rewrite A's staged V0 buffer.
 fn atomic_cursor_only_built_sprite_is_not_reused_before_submit() {
     use crate::kms::render::scene::{
         CursorAcceptedMode, CursorFrameAssignment, CursorPrimaryContent,
@@ -2730,11 +2730,17 @@ fn atomic_cursor_only_built_sprite_is_not_reused_before_submit() {
     let f0_staged = &fixture.backend.platform.staged_cursor_frames[&(0, bo_a)];
     assert_eq!(f0_staged.plan.frame, frame_a);
     assert_eq!(f0_staged.plan.assignment, CursorFrameAssignment::Hardware);
+    assert!(!f0_staged.plan.hardware_only);
+    assert_eq!(
+        f0_staged.plan.sprite.as_ref().unwrap().record_version,
+        v0_version,
+        "the accepted first-bind frame owns its immutable V0 sprite snapshot",
+    );
     assert!(f0_staged.cursor_updates_reserved);
     let f0_binding = f0_staged.cursor_updates[0]
         .prepared
         .next
-        .expect("F0 staged hardware attachment");
+        .expect("F0 staged first-bind hardware attachment");
     assert_eq!(f0_binding.lease.version(), v0_version);
     let (f0_device_fd, f0_handle, f0_bytes) =
         cursor_framebuffer_bytes(&fixture, f0_binding.framebuffer);
@@ -2742,7 +2748,7 @@ fn atomic_cursor_only_built_sprite_is_not_reused_before_submit() {
     assert_eq!(
         cursor_plane_for_output(&fixture, 0).for_tests_prepared_sprite_user_count(),
         1,
-        "F0 keeps a real prepared lease while its copied completion is held",
+        "F0 retains its frame-owned sprite lease while copied completion is held",
     );
 
     fixture
@@ -2773,6 +2779,14 @@ fn atomic_cursor_only_built_sprite_is_not_reused_before_submit() {
     assert_eq!(first.len(), 1);
     assert_primary_framebuffer(&fixture, &first[0], 1, u32::from(b0_pool_fb));
     assert_eq!(first[0].events[0].crtc, crtc_b);
+    assert!(
+        fixture.backend.platform.devices[0]
+            .cursor
+            .crtc_states
+            .get(&crtc_b)
+            .and_then(|state| state.applied)
+            .is_none()
+    );
     fixture.retire_output(1, 1);
 
     let v1 = create_solid_argb_cursor(&mut fixture, 32, [255, 0, 0, 255]);
@@ -2786,10 +2800,11 @@ fn atomic_cursor_only_built_sprite_is_not_reused_before_submit() {
     let b1_staged = &fixture.backend.platform.staged_cursor_frames[&(1, bo_b1)];
     assert_eq!(b1_staged.plan.frame, frame_b1);
     assert_eq!(b1_staged.plan.assignment, CursorFrameAssignment::Hardware);
+    assert!(!b1_staged.plan.hardware_only);
     let b1_fb = b1_staged.cursor_updates[0]
         .prepared
         .next
-        .expect("B1 staged V1 sprite")
+        .expect("B1 staged first-bind V1 sprite")
         .framebuffer;
     fixture
         .recorders
@@ -2804,13 +2819,21 @@ fn atomic_cursor_only_built_sprite_is_not_reused_before_submit() {
     assert_eq!(b1_receipt.frame, Some(frame_b1));
     assert_eq!(b1_receipt.mode, CursorAcceptedMode::Hardware);
     assert_eq!(b1_receipt.primary_cursor, CursorPrimaryContent::Cursorless);
+    let b1_binding = fixture
+        .backend
+        .platform
+        .device_for_key(fixture.backend.platform.outputs[1].key.device_key)
+        .unwrap()
+        .cursor
+        .crtc_states[&crtc_b]
+        .applied
+        .expect("B1 accepted V1 cursor binding");
+    assert_eq!(b1_binding.lease.version(), v1_version);
+    assert_eq!(b1_binding.framebuffer, b1_fb);
+    let (_, _, b1_bytes) = cursor_framebuffer_bytes(&fixture, b1_binding.framebuffer);
     let b1 = sink_atomic.records().pop().expect("B1 atomic record");
     assert_eq!(b1.events[0].crtc, crtc_b);
-    assert_cursor_framebuffer(&fixture, &b1, 1, b1_fb);
-    assert_eq!(
-        cursor_framebuffer_bytes(&fixture, f0_binding.framebuffer).2,
-        f0_bytes
-    );
+    assert_cursor_framebuffer(&fixture, &b1, 1, b1_binding.framebuffer);
     fixture.retire_output(1, 2);
 
     let v2 = create_solid_argb_cursor(&mut fixture, 32, [0, 255, 0, 255]);
@@ -2822,11 +2845,8 @@ fn atomic_cursor_only_built_sprite_is_not_reused_before_submit() {
     wait_for_held_scanout_job(&mut fixture, job_b2);
     let b2_staged = &fixture.backend.platform.staged_cursor_frames[&(1, bo_b2)];
     assert_eq!(b2_staged.plan.frame, frame_b2);
-    let b2_fb = b2_staged.cursor_updates[0]
-        .prepared
-        .next
-        .expect("B2 staged V2 sprite")
-        .framebuffer;
+    assert!(b2_staged.plan.hardware_only);
+    assert!(b2_staged.cursor_updates.is_empty());
     fixture
         .recorders
         .render_completion_readiness
@@ -2840,26 +2860,42 @@ fn atomic_cursor_only_built_sprite_is_not_reused_before_submit() {
     assert_eq!(b2_receipt.frame, Some(frame_b2));
     assert_eq!(b2_receipt.mode, CursorAcceptedMode::Hardware);
     assert_eq!(b2_receipt.primary_cursor, CursorPrimaryContent::Cursorless);
+    let b2_binding = fixture
+        .backend
+        .platform
+        .device_for_key(fixture.backend.platform.outputs[1].key.device_key)
+        .unwrap()
+        .cursor
+        .crtc_states[&crtc_b]
+        .applied
+        .expect("B2 accepted V2 cursor binding");
+    assert_eq!(b2_binding.lease.version(), v2_version);
     let b2 = sink_atomic.records().pop().expect("B2 atomic record");
     assert_eq!(b2.events[0].crtc, crtc_b);
-    assert_cursor_framebuffer(&fixture, &b2, 1, b2_fb);
+    assert_cursor_framebuffer(&fixture, &b2, 1, b2_binding.framebuffer);
+    assert_eq!(
+        cursor_framebuffer_bytes(&fixture, b1_binding.framebuffer).2,
+        b1_bytes,
+        "B2 keeps B1's old framebuffer immutable until B2's replacement event",
+    );
     assert_eq!(
         cursor_framebuffer_bytes(&fixture, f0_binding.framebuffer).2,
-        f0_bytes
+        f0_bytes,
+        "B2 cannot overwrite F0 while its copied render completion is held",
     );
     fixture.retire_output(1, 3);
 
     let v3 = create_solid_argb_cursor(&mut fixture, 32, [255, 255, 0, 255]);
     Backend::define_cursor(&mut fixture.backend, None, root, v3)
         .expect("define pressure version V3 through Backend");
-    let f0_bytes_after_pressure = fixture
-        .recorders
-        .cursor_buffer_ledger
-        .mapped_bytes(f0_device_fd, f0_handle)
-        .expect("F0 framebuffer mapping remains live under pool pressure");
     assert_eq!(
-        f0_bytes_after_pressure, f0_bytes,
-        "newer cursor versions never rewrite F0's reserved V0 buffer",
+        fixture
+            .recorders
+            .cursor_buffer_ledger
+            .mapped_bytes(f0_device_fd, f0_handle)
+            .expect("F0 framebuffer remains mapped under cursor pool pressure"),
+        f0_bytes,
+        "newer cursor versions never rewrite F0's reserved V0 framebuffer",
     );
     assert!(fixture.recorders.cursor_buffer_ledger.records().iter().all(|record| {
         !matches!(record, crate::kms::cursor_plane::ops::CursorBufferRecord::RemoveFb { fb, .. } if *fb == f0_binding.framebuffer)
@@ -2884,6 +2920,25 @@ fn atomic_cursor_only_built_sprite_is_not_reused_before_submit() {
     assert_eq!(f0_receipt.frame, Some(frame_a));
     assert_eq!(f0_receipt.mode, CursorAcceptedMode::Hardware);
     assert_eq!(f0_receipt.primary_cursor, CursorPrimaryContent::Cursorless);
+    let f0_binding = fixture
+        .backend
+        .platform
+        .device_for_key(fixture.backend.platform.outputs[0].key.device_key)
+        .unwrap()
+        .cursor
+        .crtc_states[&crtc_a]
+        .applied
+        .expect("A accepted its live cursor binding");
+    assert_eq!(
+        f0_binding.lease.version(),
+        v0_version,
+        "A's copied frame submits the first-bind sprite that its staged plan owns",
+    );
+    assert_eq!(
+        &cursor_framebuffer_bytes(&fixture, f0_binding.framebuffer).2[..4],
+        &[0, 0, 255, 255],
+        "the first-bind framebuffer still contains the staged V0 bytes",
+    );
     let records = sink_atomic.records();
     assert_eq!(records.len(), 4);
     assert_eq!(

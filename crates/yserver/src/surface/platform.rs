@@ -296,6 +296,13 @@ impl OutputSink for SurfacePlatform {
         {
             receipt.frame = Some(frame);
             receipt.mode = accept_cursor_frame(self, output_idx, &cursor);
+            if matches!(
+                receipt.mode,
+                CursorAcceptedMode::Hardware | CursorAcceptedMode::Hidden
+            ) {
+                receipt.primary_cursor =
+                    crate::kms::render::scene::CursorPrimaryContent::Cursorless;
+            }
         }
         outcome
     }
@@ -361,6 +368,12 @@ fn accept_cursor_frame(
     output_idx: usize,
     plan: &CursorFramePlan,
 ) -> CursorAcceptedMode {
+    if plan.hardware_only {
+        // The native host cursor already owns visibility and sprite state. A
+        // primary frame carries cursorless content and must not hide it just
+        // because this frame did not capture a new sprite snapshot.
+        return accepted_cursor_mode(platform);
+    }
     match plan.assignment {
         CursorFrameAssignment::Hardware => {
             let Some(sprite) = plan.sprite.as_ref() else {
@@ -1063,6 +1076,65 @@ impl Platform for SurfacePlatform {
     }
 
     fn note_cursor_pointer(_b: &mut XBackend<Self>, _pos: (i32, i32)) {}
+
+    fn queue_cursor_intent(
+        b: &mut XBackend<Self>,
+        record: Option<&crate::kms::render::cursor::CursorRecord>,
+        visible: bool,
+        _pos: (i32, i32),
+    ) -> bool {
+        let output_idx = 0;
+        let mut accepted_mode = CursorAcceptedMode::Hidden;
+        if let Some(record) = record {
+            let hot = (record.hot_x, record.hot_y);
+            let already_uploaded = b
+                .platform
+                .cursor
+                .image
+                .as_ref()
+                .is_some_and(|image| image.version == record.version && image.hot == hot);
+            let uploaded = already_uploaded
+                || matches!(
+                    b.platform.upload(
+                        output_idx,
+                        record.version,
+                        hot.0,
+                        hot.1,
+                        u32::from(record.width),
+                        u32::from(record.height),
+                        &record.bgra_bytes,
+                    ),
+                    Ok(CursorUploadOutcome::Ready)
+                );
+            if visible && uploaded {
+                if let Err(failure) = b.platform.show(output_idx, hot.0, hot.1, 0, 0) {
+                    log::warn!("surface: native cursor show failed: {}", failure.error);
+                } else {
+                    accepted_mode = CursorAcceptedMode::Hardware;
+                }
+            } else if !visible {
+                let _ = b.platform.hide(output_idx);
+            }
+        } else {
+            let _ = b.platform.hide(output_idx);
+        }
+        if b.platform.cursor.shown {
+            accepted_mode = CursorAcceptedMode::Hardware;
+        }
+        if !b.platform.outputs.is_empty() {
+            b.scene.note_cursor_commit_accepted(
+                output_idx,
+                crate::kms::render::scene::CursorCommitReceipt {
+                    frame: None,
+                    mode: accepted_mode,
+                    primary_cursor: crate::kms::render::scene::CursorPrimaryContent::Cursorless,
+                    needs_recompose: false,
+                },
+            );
+        }
+        b.flush_host_cursor();
+        true
+    }
 
     /// The window system moves its cursor itself: nothing to compose.
     fn move_hw_cursor(

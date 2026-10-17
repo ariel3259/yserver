@@ -292,6 +292,92 @@ impl KmsBackend {
         }
     }
 
+    fn submit_atomic_cursor_intent_for_output(
+        &mut self,
+        output_idx: usize,
+    ) -> io::Result<crate::kms::render::platform::CursorMoveOutcome> {
+        let was_in_flight = self.platform.cursor_commit_in_flight_for_output(output_idx);
+        let outcome = self
+            .platform
+            .submit_atomic_cursor_intent_for_output(output_idx)?;
+        if !was_in_flight && self.platform.cursor_commit_in_flight_for_output(output_idx) {
+            let mode = if self.platform.cursor_plane_visible_for_output(output_idx) {
+                crate::kms::render::scene::CursorAcceptedMode::Hardware
+            } else {
+                crate::kms::render::scene::CursorAcceptedMode::Hidden
+            };
+            self.scene.note_cursor_commit_accepted(
+                output_idx,
+                crate::kms::render::scene::CursorCommitReceipt {
+                    frame: None,
+                    mode,
+                    primary_cursor: crate::kms::render::scene::CursorPrimaryContent::Cursorless,
+                    needs_recompose: false,
+                },
+            );
+        }
+        Ok(outcome)
+    }
+
+    /// Submit cursor intent already prepared by the shared queue while a
+    /// direct primary frame is held. This adapter preserves A5's direct
+    /// cursor path without uploading or creating a second binding authority.
+    pub(in crate::kms::render::backend) fn refresh_direct_cursor_on_all_outputs(
+        &mut self,
+        _record: &crate::kms::render::cursor::CursorRecord,
+    ) -> bool {
+        if !self.pstate.scanout_m2.active()
+            || self.pstate.tearing.is_on()
+            || self.platform.outputs.is_empty()
+        {
+            return false;
+        }
+        for output_idx in 0..self.platform.outputs.len() {
+            match self.submit_atomic_cursor_intent_for_output(output_idx) {
+                Ok(outcome) => self.handle_cursor_move_outcome(outcome),
+                Err(error) => {
+                    log::warn!(
+                        "scanout_m2: prepared direct cursor intent failed on output {output_idx}: {error}"
+                    );
+                    self.refresh_direct_cursor_bound_state();
+                    return false;
+                }
+            }
+        }
+        self.refresh_direct_cursor_bound_state();
+        true
+    }
+
+    /// Submit the hide intent already prepared by the shared queue while a
+    /// direct primary frame is held.
+    pub(in crate::kms::render::backend) fn hide_cursor_under_direct_scanout(&mut self) {
+        if !self.pstate.scanout_m2.active() {
+            return;
+        }
+        for output_idx in 0..self.platform.outputs.len() {
+            if !self.platform.cursor_plane_visible_for_output(output_idx) {
+                continue;
+            }
+            match self.submit_atomic_cursor_intent_for_output(output_idx) {
+                Ok(outcome) => self.handle_cursor_move_outcome(outcome),
+                Err(error) => {
+                    log::warn!(
+                        "scanout_m2: prepared direct cursor hide failed on output {output_idx}: {error}"
+                    );
+                    self.request_direct_unflip("cursor_hide_failed");
+                }
+            }
+        }
+        self.refresh_direct_cursor_bound_state();
+    }
+
+    pub(in crate::kms::render::backend) fn refresh_direct_cursor_bound_state(&mut self) {
+        let output_indices: Vec<_> = (0..self.platform.outputs.len()).collect();
+        self.pstate.scanout_m2.cursor_bound_all = self
+            .platform
+            .cursor_intents_settled_for_outputs(&output_indices);
+    }
+
     /// Whether every frame direct scanout holds (on screen, submitted, or
     /// queued) is the composite overlay window or a descendant of it.
     /// `false` when there are none, or when any is an ordinary window.
@@ -318,7 +404,6 @@ impl KmsBackend {
         if !self.pstate.scanout_m2.active() {
             return;
         }
-        self.pstate.deferred_direct_cursor = None;
         if !self.pstate.scanout_m2.unflip_requested {
             self.pstate.scanout_m2.unflip_reason = Some(reason);
         }
@@ -357,161 +442,14 @@ impl KmsBackend {
                 .is_some_and(references)
     }
 
-    /// Keep the scene's per-output cursor mode aligned with cursor planes
-    /// changed outside a composed scene retirement.
-    pub(super) fn sync_direct_cursor_scene_state(&mut self) -> bool {
-        let visible_by_output: Vec<_> = (0..self.platform.outputs.len())
-            .map(|output_idx| self.platform.cursor_plane_visible_for_output(output_idx))
-            .collect();
-        self.scene
-            .record_external_cursor_plane_bindings(&visible_by_output)
-    }
-
+    /// Direct frames never paint a cursor. Stage the current portable cursor
+    /// observation for the regular cursor-only scheduler after direct retire.
     fn bind_direct_cursor_on_all_outputs(&mut self) {
         if self.pstate.scanout_m2.cursor_bound_all {
             return;
         }
-        let tearing = self.pstate.tearing.is_on();
-        if tearing && self.pstate.scanout_m2.unflip_requested && self.tearing_cursor_wants_visible()
-        {
-            // The grouped composed replacement will retire the external
-            // cursor handoff. Keep the currently visible plane bound until
-            // that replacement retires; hiding here would make the cursor
-            // disappear while direct scanout still owns the primary plane.
-            self.pstate.scanout_m2.cursor_bound_all = true;
-            return;
-        }
-        if tearing || self.effective_cursor_hidden() {
-            // Tearing keeps every cursor plane detached. A hidden effective
-            // cursor also must not leave a stale sprite bound over direct scanout.
-            let mut failed = false;
-            for output_idx in 0..self.platform.outputs.len() {
-                if !self.platform.cursor_plane_visible_for_output(output_idx) {
-                    continue;
-                }
-                if let Err(error) = self.platform.cursor_plane_hide_on_crtc(output_idx) {
-                    failed = true;
-                    log::warn!(
-                        "scanout_m2: cursor hide failed on output {output_idx}: {error}; unflipping"
-                    );
-                }
-            }
-            let scene_synced = self.sync_direct_cursor_scene_state();
-            if failed || !scene_synced {
-                self.request_direct_unflip("cursor_hide_failed");
-            } else {
-                self.pstate.scanout_m2.cursor_bound_all = true;
-            }
-            return;
-        }
-        let (hot_x, hot_y) = self
-            .effective_cursor_xid
-            .and_then(|xid| self.cursor_records.get(&xid))
-            .map_or((0, 0), |record| (record.hot_x, record.hot_y));
-        #[allow(clippy::cast_possible_truncation)]
-        let x = self.core.cursor_x as i32;
-        #[allow(clippy::cast_possible_truncation)]
-        let y = self.core.cursor_y as i32;
-        let mut failed = false;
-        for output_idx in 0..self.platform.outputs.len() {
-            if let Err(error) = self
-                .platform
-                .cursor_plane_show_on_crtc(output_idx, hot_x, hot_y, x, y)
-            {
-                failed = true;
-                log::warn!(
-                    "scanout_m2: cursor bind failed on output {output_idx}: {error}; unflipping"
-                );
-            }
-        }
-        let scene_synced = self.sync_direct_cursor_scene_state();
-        if failed || !scene_synced {
-            self.request_direct_unflip("cursor_bind_failed");
-        } else {
-            self.pstate.scanout_m2.cursor_bound_all = true;
-        }
-    }
-
-    /// Replace the live hardware sprite without disturbing an authoritative
-    /// root scanout. M2 is restricted to one DRM device, and its existing
-    /// direct-frame retirement already binds the cursor synchronously on each
-    /// participating CRTC. A sprite-only update can use the same ownership
-    /// model: upload once per output route (deduplicated by version inside the
-    /// cursor plane), then rebind at the current position.
-    pub(in crate::kms::render::backend) fn refresh_direct_cursor_on_all_outputs(
-        &mut self,
-        record: &crate::kms::render::cursor::CursorRecord,
-    ) -> bool {
-        if self.pstate.tearing.is_on()
-            || !self.pstate.scanout_m2.active()
-            || self.platform.outputs.is_empty()
-        {
-            return false;
-        }
-        self.pstate.deferred_direct_cursor = None;
-        let cursor_was_bound = self.pstate.scanout_m2.cursor_bound_all;
-        #[allow(clippy::cast_possible_truncation)]
-        let x = self.core.cursor_x as i32;
-        #[allow(clippy::cast_possible_truncation)]
-        let y = self.core.cursor_y as i32;
-        let mut failed = false;
-        for output_idx in 0..self.platform.outputs.len() {
-            let upload = self.platform.cursor_plane_upload_image_for_output(
-                output_idx,
-                record.version,
-                record.hot_x,
-                record.hot_y,
-                u32::from(record.width),
-                u32::from(record.height),
-                &record.bgra_bytes,
-            );
-            match upload {
-                Ok(yserver_render::kms::render::scene::CursorUploadOutcome::Ready) => {}
-                Ok(yserver_render::kms::render::scene::CursorUploadOutcome::Deferred) => {
-                    self.pstate.deferred_direct_cursor = Some(record.with_version(record.version));
-                    self.scene.wake_for_cursor_damage();
-                    self.pstate.scanout_m2.cursor_bound_all = cursor_was_bound;
-                    return true;
-                }
-                Err(error) => {
-                    log::warn!(
-                        "scanout_m2: direct cursor upload failed on output {output_idx}: {error}; unflipping"
-                    );
-                    failed = true;
-                    break;
-                }
-            }
-            if let Err(error) = self.platform.cursor_plane_show_on_crtc(
-                output_idx,
-                record.hot_x,
-                record.hot_y,
-                x,
-                y,
-            ) {
-                if error.is_deferred()
-                    && (self.pstate.scanout_m2.pending.is_some()
-                        || self.pstate.scanout_m2.queued_successor.is_some())
-                {
-                    log::debug!(
-                        "scanout_m2: direct cursor replacement waits for output {output_idx} flip retirement"
-                    );
-                    // Keep staging the same wanted sprite on later CRTCs.
-                    // The blocked CRTC retains its own full-state intent and
-                    // its event will retry it after retirement; returning here
-                    // would leave the remaining direct outputs on the old
-                    // sprite indefinitely.
-                    continue;
-                }
-                log::warn!(
-                    "scanout_m2: direct cursor show failed on output {output_idx}: {error}; unflipping"
-                );
-                failed = true;
-                break;
-            }
-        }
-        let scene_synced = self.sync_direct_cursor_scene_state();
-        self.pstate.scanout_m2.cursor_bound_all = !failed && scene_synced;
-        !failed && scene_synced
+        self.queue_effective_cursor_intent();
+        self.refresh_direct_cursor_bound_state();
     }
 
     fn pin_present_wake_for_direct(
@@ -708,6 +646,26 @@ impl KmsBackend {
             self.platform
                 .cursor_plane_scene_commit_submitted(&cursor_updates)
                 .expect("accepted direct commit keeps its reserved cursor leases");
+            for update in &cursor_updates {
+                if let Some(output_idx) = self.platform.outputs.iter().position(|layout| {
+                    layout.key.device_key == update.device_key && layout.output.crtc == update.crtc
+                }) {
+                    self.scene.note_cursor_commit_accepted(
+                        output_idx,
+                        crate::kms::render::scene::CursorCommitReceipt {
+                            frame: None,
+                            mode: if update.prepared.next.is_some() {
+                                crate::kms::render::scene::CursorAcceptedMode::Hardware
+                            } else {
+                                crate::kms::render::scene::CursorAcceptedMode::Hidden
+                            },
+                            primary_cursor:
+                                crate::kms::render::scene::CursorPrimaryContent::Cursorless,
+                            needs_recompose: false,
+                        },
+                    );
+                }
+            }
         }
         frame.awaiting_outputs = (0..self.platform.outputs.len()).collect();
         frame.async_outcome = async_outcome;
@@ -839,7 +797,6 @@ impl KmsBackend {
         &mut self,
         reason: &'static str,
     ) {
-        self.pstate.deferred_direct_cursor = None;
         if let Some(mut pending) = self.pstate.scanout_m2.pending.take() {
             pending.event.completion_mode = yserver_protocol::x11::present::COMPLETE_MODE_COPY;
             pending.event.emit_idle = true;
@@ -1149,6 +1106,25 @@ impl KmsBackend {
         self.platform
             .cursor_plane_scene_commit_submitted(&cursor_updates)
             .expect("accepted composed unflip keeps its reserved cursor leases");
+        for update in &cursor_updates {
+            if let Some(output_idx) = self.platform.outputs.iter().position(|layout| {
+                layout.key.device_key == update.device_key && layout.output.crtc == update.crtc
+            }) {
+                self.scene.note_cursor_commit_accepted(
+                    output_idx,
+                    crate::kms::render::scene::CursorCommitReceipt {
+                        frame: None,
+                        mode: if update.prepared.next.is_some() {
+                            crate::kms::render::scene::CursorAcceptedMode::Hardware
+                        } else {
+                            crate::kms::render::scene::CursorAcceptedMode::Hidden
+                        },
+                        primary_cursor: crate::kms::render::scene::CursorPrimaryContent::Cursorless,
+                        needs_recompose: false,
+                    },
+                );
+            }
+        }
         self.pstate.scanout_m2.unflip_awaiting_outputs = (0..output_count).collect();
         let describe_frame = |frame: &DirectPresentFrame| {
             (
@@ -2224,6 +2200,7 @@ impl KmsBackend {
             // slot or EINVAL backoff.
             let grouped_direct_work_waiting = self.pstate.scanout_m2.pending.is_some()
                 || self.pstate.scanout_m2.queued_successor.is_some()
+                || self.pstate.scanout_m2.unflip_requested
                 || !self.pstate.scanout_m2.unflip_awaiting_outputs.is_empty();
             if !grouped_direct_work_waiting {
                 match self
@@ -2287,10 +2264,11 @@ impl KmsBackend {
         let Some(layout) = self.platform.outputs.get(output_idx) else {
             return true;
         };
+        let retired_at = self.monotonic_now();
         if let Some(device) = self.platform.device_for_output(&layout.key) {
             device
                 .atomic_commit_sink
-                .note_cursor_commit_retired(layout.output.crtc, std::time::Instant::now());
+                .note_cursor_commit_retired(layout.output.crtc, retired_at);
         }
         true
     }
@@ -2473,6 +2451,12 @@ impl KmsBackend {
         // Animated-cursor frame advance — after both gates above so
         // DPMS-off / VT-away never uploads (spec "DPMS / VT gating").
         self.tick_cursor_animation();
+        // Let a ready primary frame consume the current observation and own
+        // its cursor transition. The cursor-only scheduler prepares the
+        // observation below only when no scene frame owns that output.
+        if !self.scene_wants_scene() {
+            self.queue_effective_cursor_intent();
+        }
         // Check visibility and current scene ownership before the held-direct
         // return below. Pointer motion from a dead zone wakes this pass.
         self.prepare_tearing_scene_pass();
@@ -2481,18 +2465,6 @@ impl KmsBackend {
         // The helper leaves it in the slot while any CRTC is still blocked.
         self.submit_queued_direct_successor();
         if self.pstate.scanout_m2.active() {
-            if let Some(record) = self.pstate.deferred_direct_cursor.take() {
-                let current_record = self
-                    .effective_cursor_xid
-                    .and_then(|xid| self.cursor_records.get(&xid))
-                    .is_some_and(|current| current.version == record.version);
-                if current_record
-                    && !self.effective_cursor_hidden()
-                    && !self.refresh_direct_cursor_on_all_outputs(&record)
-                {
-                    self.request_direct_unflip("cursor_show_failed");
-                }
-            }
             use crate::kms::render::scene::CursorPlaneMode;
             let cursor_mode = self.scene.cursor_mode();
             if self.platform.any_output_transformed() {
@@ -2529,10 +2501,7 @@ impl KmsBackend {
                     && self.pstate.scanout_m2.queued_successor.is_none()
                 {
                     for output_idx in 0..self.platform.outputs.len() {
-                        match self
-                            .platform
-                            .submit_atomic_cursor_intent_for_output(output_idx)
-                        {
+                        match self.submit_atomic_cursor_intent_for_output(output_idx) {
                             Ok(outcome) => self.handle_cursor_move_outcome(outcome),
                             Err(error) => log::warn!(
                                 "render maybe_composite: cursor-only atomic commit failed for output {output_idx}: {error}"
@@ -2618,17 +2587,11 @@ impl KmsBackend {
             if scene_submitted_outputs.contains(&output_idx)
                 || self.scene.has_pending_page_flip(output_idx)
                 || self.scene.output_submit_retry_pending(output_idx)
-                || (self.scene_wants_scene()
-                    && self
-                        .scene
-                        .output_ready_for_submit(output_idx, &self.platform))
+                || self.scene_wants_scene()
             {
                 continue;
             }
-            match self
-                .platform
-                .submit_atomic_cursor_intent_for_output(output_idx)
-            {
+            match self.submit_atomic_cursor_intent_for_output(output_idx) {
                 Ok(outcome) => self.handle_cursor_move_outcome(outcome),
                 Err(error) => log::warn!(
                     "render maybe_composite: cursor-only atomic commit failed for output {output_idx}: {error}"

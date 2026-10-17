@@ -823,11 +823,6 @@ pub struct KmsBackendState {
     pub(in crate::kms::render::backend) scanout_m0: ScanoutM0Telemetry,
     pub(in crate::kms::render::backend) scanout_m1: ScanoutM1ProbeCache,
     pub(in crate::kms::render::backend) scanout_m2: ScanoutM2State,
-    /// Newest direct-scanout cursor record whose pool upload was deferred.
-    /// Retried only from Backend scheduling, while the direct frame remains
-    /// authoritative.
-    pub(in crate::kms::render::backend) deferred_direct_cursor:
-        Option<std::sync::Arc<crate::kms::render::cursor::CursorRecord>>,
     pub(in crate::kms::render::backend) tearing: Tearing,
     /// Monotonic clock for KMS cursor-composition pacing.
     pub(in crate::kms::render::backend) monotonic_clock:

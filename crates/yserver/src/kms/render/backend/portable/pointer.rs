@@ -606,16 +606,19 @@ impl<P: Platform> XBackend<P> {
         if new_x != self.core.cursor_x || new_y != self.core.cursor_y {
             self.core.cursor_x = new_x;
             self.core.cursor_y = new_y;
-            // Stage 5 Phase D — pointer fast path. When the plane
-            // is fully bound on every output AND no transition is
-            // pending, route motion through `cursor_plane_move`.
-            // Atomic-capable devices record the latest position for
-            // the scheduling pass; devices without atomic position
-            // properties keep the legacy move ioctl. Neither path
-            // does GPU work. The Mixed state (any output still has
-            // a Sw→Hw or Hw→Sw transition pending) also wakes the
-            // scene so the SW cursor stays in sync with the eventual
-            // plane bind.
+            #[allow(clippy::cast_possible_truncation)]
+            let pointer = (new_x as i32, new_y as i32);
+            let record = self
+                .effective_cursor_xid
+                .and_then(|xid| self.cursor_records.get(&xid).cloned());
+            let intent_handled = if self.effective_cursor_hidden() {
+                true
+            } else {
+                P::queue_cursor_intent(self, record.as_deref(), true, pointer)
+            };
+            // Queue the latest position before choosing the scene wake.
+            // HW-only outputs can settle it with an atomic cursor commit;
+            // SW and Mixed outputs repaint their cursor in a scene frame.
             let cursor_mode = self.scene.cursor_mode();
             if self.effective_cursor_hidden() {
                 // The effective cursor has no visible pixels, so pointer
@@ -624,11 +627,7 @@ impl<P: Platform> XBackend<P> {
                 // Tearing owns cursor policy until exit. Keep motion on the
                 // platform's capped scene-wake path.
                 P::cursor_motion_during_tearing(self, true);
-            } else if matches!(
-                cursor_mode,
-                crate::kms::render::scene::CursorPlaneMode::Hw
-                    | crate::kms::render::scene::CursorPlaneMode::Mixed
-            ) {
+            } else {
                 #[allow(clippy::cast_possible_truncation)]
                 let cx = new_x as i32;
                 #[allow(clippy::cast_possible_truncation)]
@@ -645,16 +644,18 @@ impl<P: Platform> XBackend<P> {
                         )
                     })
                     .unwrap_or((0, 0, 0, 0));
-                let mixed = matches!(
+                let needs_software_repaint = matches!(
                     cursor_mode,
-                    crate::kms::render::scene::CursorPlaneMode::Mixed
+                    crate::kms::render::scene::CursorPlaneMode::Sw
+                        | crate::kms::render::scene::CursorPlaneMode::Mixed
                 );
-                P::move_hw_cursor(self, mixed, (cx, cy), (hot_x, hot_y), (cw, ch));
-            } else {
-                // Software cursors need repaint; an all-Hidden cursor also
-                // needs a scene pass so motion back onto an output can be
-                // assigned there again.
-                self.scene.wake_for_damage();
+                P::move_hw_cursor(
+                    self,
+                    needs_software_repaint || !intent_handled,
+                    (cx, cy),
+                    (hot_x, hot_y),
+                    (cw, ch),
+                );
             }
         }
         let prev = server_state.barrier_bypass;

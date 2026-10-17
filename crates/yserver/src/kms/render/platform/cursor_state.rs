@@ -32,6 +32,7 @@ pub(crate) struct CursorPropertyUpdate {
 /// and unflip commit paths so every owner settles the same framebuffer leases.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CursorPlaneUpdate {
+    pub(crate) owner: super::cursor_frames::CursorCommitOwner,
     pub(crate) device_key: crate::platform::drm::DrmDeviceKey,
     pub(crate) crtc: ::drm::control::crtc::Handle,
     pub(crate) prepared: PreparedCursorCommit,

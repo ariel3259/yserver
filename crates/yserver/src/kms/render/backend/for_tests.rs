@@ -286,10 +286,29 @@ impl KmsBackend {
         Self::for_tests_with_vk_dimensions(800, 600)
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_tests_with_vk_and_clock(
+        monotonic_clock: Rc<dyn Fn() -> std::time::Instant>,
+    ) -> Result<Self, io::Error> {
+        Self::for_tests_with_vk_dimensions_and_clock(800, 600, monotonic_clock)
+    }
+
     /// Vk-backed fixture with a caller-selected virtual-screen size.
     /// Used by scene tests that install synthetic outputs without a DRM node.
     #[doc(hidden)]
     pub fn for_tests_with_vk_dimensions(width: u16, height: u16) -> Result<Self, io::Error> {
+        Self::for_tests_with_vk_dimensions_and_clock(
+            width,
+            height,
+            Rc::new(std::time::Instant::now),
+        )
+    }
+
+    pub(crate) fn for_tests_with_vk_dimensions_and_clock(
+        width: u16,
+        height: u16,
+        monotonic_clock: Rc<dyn Fn() -> std::time::Instant>,
+    ) -> Result<Self, io::Error> {
         use std::sync::Arc;
         // Build the test seed WITHOUT the root drawable. If
         // `for_tests()` were used, `init_root_storage` would have
@@ -300,7 +319,10 @@ impl KmsBackend {
         // root — any `render_composite` against it (e.g.
         // `set_container_background_pixmap`) segfaults inside the
         // descriptor-set bind.
-        let mut base = Self::for_tests_seed();
+        let services = crate::kms::render::platform::services::KmsServices::for_tests_with_clock(
+            monotonic_clock,
+        );
+        let mut base = Self::for_tests_seed_with_services(services);
         base.platform.fb_w = width.max(1);
         base.platform.fb_h = height.max(1);
         let vk = crate::kms::vk::device::VkContext::new()
@@ -544,7 +566,9 @@ impl KmsBackend {
     #[doc(hidden)]
     #[must_use]
     pub fn for_tests() -> Self {
-        let mut b = Self::for_tests_seed();
+        let mut b = Self::for_tests_seed_with_services(
+            crate::kms::render::platform::services::KmsServices::for_tests(),
+        );
         b.init_root_storage();
         // Stage 5 Phase A: seed the default-cursor record so test
         // paths that exercise `define_cursor` / effective-cursor
@@ -559,16 +583,24 @@ impl KmsBackend {
     /// storage. Used by `for_tests_with_vk` so root allocation
     /// happens after the Vk context is attached.
     fn for_tests_seed() -> Self {
+        Self::for_tests_seed_with_services(
+            crate::kms::render::platform::services::KmsServices::for_tests(),
+        )
+    }
+
+    fn for_tests_seed_with_services(
+        services: crate::kms::render::platform::services::KmsServices,
+    ) -> Self {
+        let monotonic_clock = Rc::clone(&services.monotonic_clock);
         let pstate = KmsBackendState {
             scanout_m0: ScanoutM0Telemetry::default(),
             scanout_m1: ScanoutM1ProbeCache::new(),
             scanout_m2: ScanoutM2State::new(),
-            deferred_direct_cursor: None,
             tearing: Tearing::new(),
             vt_resume_executor: std::rc::Rc::new(
                 crate::kms::render::backend::kms::session::DrmVtResumeExecutor,
             ),
-            monotonic_clock: Rc::new(std::time::Instant::now),
+            monotonic_clock,
             armed_vblank_targets: std::collections::HashMap::new(),
             absolute_vblank_targets: std::collections::HashMap::new(),
             crtc_queue_sequence_unsupported_devices: HashSet::new(),
@@ -611,7 +643,7 @@ impl KmsBackend {
         };
         let mut backend = Self::assemble(
             KmsCore::for_tests(),
-            PlatformBackend::for_tests(),
+            PlatformBackend::for_tests_with_services(services),
             RenderEngine::stub(),
             SceneCompositor::stub(),
             pstate,

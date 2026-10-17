@@ -9,6 +9,56 @@ use ash::vk;
 use std::panic::Location;
 
 impl SceneCompositor {
+    /// Replace the cursor observation used by future frame plans without
+    /// scheduling a primary repaint. Hardware cursor producers use this while
+    /// their accepted per-output mode remains hardware or hidden.
+    pub fn observe_cursor(&mut self, cursor: Option<crate::kms::render::scene::CursorEntry>) {
+        if let Some(inner) = self.inner.as_mut() {
+            inner.cursor = cursor;
+        }
+    }
+
+    /// Whether this output's last accepted cursor state paints the cursor into
+    /// the primary framebuffer. A hardware-only intent must leave these
+    /// outputs to their scene frame owner.
+    pub fn output_uses_software_cursor(&self, output_idx: usize) -> bool {
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.outputs.get(output_idx))
+            .is_some_and(|output| {
+                matches!(
+                    output.last_frame_cursor_mode,
+                    super::OutputCursorMode::Sw { .. } | super::OutputCursorMode::SwPending
+                )
+            })
+    }
+
+    /// Whether this output's last accepted frame left its cursor plane owning
+    /// the visible sprite. A first bind from Hidden is a scene-frame
+    /// transition; only an already accepted HW cursor can receive HW-only
+    /// updates while the primary is idle.
+    pub fn output_uses_hardware_cursor(&self, output_idx: usize) -> bool {
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.outputs.get(output_idx))
+            .is_some_and(|output| output.last_frame_cursor_mode == super::OutputCursorMode::Hw)
+    }
+
+    /// Whether a submitted frame still owns this output's cursor mode change.
+    /// HW-only observations may be retained during a stable primary flip, but
+    /// they must not compete with a frame that changes HW/SW ownership.
+    pub fn output_cursor_transition_pending(&self, output_idx: usize) -> bool {
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.outputs.get(output_idx))
+            .is_some_and(|output| {
+                output
+                    .pending_acks
+                    .iter()
+                    .any(|ack| ack.cursor_transition.is_some())
+            })
+    }
+
     pub(super) fn note_structure_change(&mut self) {
         self.scene_structure_dirty = true;
         self.cursor_only_wake = false;

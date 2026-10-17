@@ -1600,7 +1600,7 @@ fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
         }
     }
     let records = recorder.records();
-    assert_eq!(records.len(), 7);
+    assert_eq!(records.len(), 5);
     assert_eq!(
         records.iter().map(|record| record.kind).collect::<Vec<_>>(),
         vec![
@@ -1608,20 +1608,11 @@ fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
             crate::drm::atomic::AtomicCommitKind::Scene,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
-            crate::drm::atomic::AtomicCommitKind::CursorOnly,
-            crate::drm::atomic::AtomicCommitKind::CursorOnly,
-            crate::drm::atomic::AtomicCommitKind::Scene,
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
         ],
         "Backend replaces held direct ownership with one composed scene commit",
     );
-    for position in &unflip_positions {
-        assert!(
-            !records[6]
-                .properties
-                .iter()
-                .any(|update| update.object == position.plane.into())
-        );
-    }
+    assert_atomic_cursor_properties(&records[4], &unflip_positions);
     retire_atomic_cursor_test_output(&mut b, &mut state, 0, 11);
     retire_atomic_cursor_test_output(&mut b, &mut state, 1, 11);
 
@@ -3610,22 +3601,21 @@ fn direct_successor_waits_for_retirement_and_carries_motion() {
     assert_eq!(recorder.records().len(), 1, "{:?}", recorder.records());
     retire_atomic_cursor_test_output(&mut backend, &mut state, 1, 1);
     let records = recorder.records();
-    assert_eq!(records.len(), 3, "{:?}", records);
+    assert_eq!(records.len(), 2, "{:?}", records);
     assert_eq!(
         records.iter().map(|record| record.kind).collect::<Vec<_>>(),
         vec![
             crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
-            crate::drm::atomic::AtomicCommitKind::CursorOnly,
-            crate::drm::atomic::AtomicCommitKind::CursorOnly,
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
         ],
+        "the unbuilt direct successor carries the newest cursor position",
     );
-    assert_atomic_cursor_properties(&records[1], &latest_positions[..1]);
-    assert_atomic_cursor_properties(&records[2], &latest_positions[1..]);
+    assert_atomic_cursor_properties(&records[1], &latest_positions);
     assert_eq!(
         backend
             .pstate
             .scanout_m2
-            .queued_successor
+            .pending
             .as_ref()
             .map(|frame| frame.candidate.present_id),
         Some(52),
@@ -3633,10 +3623,9 @@ fn direct_successor_waits_for_retirement_and_carries_motion() {
     retire_atomic_cursor_test_output(&mut backend, &mut state, 0, 2);
     retire_atomic_cursor_test_output(&mut backend, &mut state, 1, 2);
     Backend::maybe_composite(&mut backend)
-        .expect("resume retained direct successor after cursor events");
+        .expect("settle direct successor after its own flip events");
     let records = recorder.records();
-    assert_eq!(records.len(), 4);
-    assert_eq!(records[3].kind, crate::drm::atomic::AtomicCommitKind::Scene);
+    assert_eq!(records.len(), 2);
     // A Copy completion is ready only once its GPU signal has executed; wait for the
     // device (bounded by the driver) instead of racing a slow software ICD.
     backend.platform.wait_idle_bounded();
@@ -3646,12 +3635,12 @@ fn direct_successor_waits_for_retirement_and_carries_motion() {
             .iter()
             .map(|event| event.present_id)
             .collect::<Vec<_>>(),
-        vec![51],
+        vec![51, 52],
     );
     assert_eq!(
         backend.store.get(first.source_id).unwrap().refcount,
-        first_source_refcount + 1,
-        "the predecessor stays pinned until the queued successor retires",
+        first_source_refcount,
+        "retiring the accepted successor releases the prior direct source",
     );
 
     // Keep the same direct frame current and exercise the composed-unflip
@@ -3690,7 +3679,7 @@ fn direct_successor_waits_for_retirement_and_carries_motion() {
     );
     assert_eq!(
         recorder.records()[3].kind,
-        crate::drm::atomic::AtomicCommitKind::Scene
+        crate::drm::atomic::AtomicCommitKind::CursorOnly
     );
 
     draw_atomic_cursor_test_root_overlay(&mut backend, 2);
@@ -3707,35 +3696,14 @@ fn direct_successor_waits_for_retirement_and_carries_motion() {
     Backend::maybe_composite(&mut backend).expect("unflip still waits for the second CRTC");
     assert_eq!(recorder.records().len(), 4);
     retire_atomic_cursor_test_output(&mut backend, &mut state, 1, 3);
-    Backend::maybe_composite(&mut backend).expect("submit pending cursor move before unflip");
+    Backend::maybe_composite(&mut backend).expect("submit grouped unflip with latest cursor move");
     let records = recorder.records();
     assert_eq!(records.len(), 5);
     assert_eq!(
         records[4].kind,
-        crate::drm::atomic::AtomicCommitKind::CursorOnly
-    );
-    for output_idx in 0..backend.platform.outputs.len() {
-        if backend
-            .platform
-            .cursor_atomic_event_pending_for_output(output_idx)
-        {
-            retire_atomic_cursor_test_output(
-                &mut backend,
-                &mut state,
-                output_idx,
-                4 + output_idx as u32,
-            );
-        }
-    }
-    Backend::maybe_composite(&mut backend)
-        .expect("submit grouped composed unflip after cursor event");
-    let records = recorder.records();
-    assert_eq!(records.len(), 6);
-    assert_eq!(
-        records[5].kind,
         crate::drm::atomic::AtomicCommitKind::SceneWithCursor
     );
-    assert_atomic_cursor_properties(&records[5], &unflip_positions);
+    assert_atomic_cursor_properties(&records[4], &unflip_positions);
     assert_eq!(
         backend.pstate.scanout_m2.unflip_awaiting_outputs,
         std::collections::HashSet::from([0, 1]),
@@ -3745,13 +3713,9 @@ fn direct_successor_waits_for_retirement_and_carries_motion() {
     retire_atomic_cursor_test_output(&mut backend, &mut state, 1, 6);
     assert!(!backend.pstate.scanout_m2.active());
     backend.platform.wait_idle_bounded();
-    assert_eq!(
-        Backend::drain_completed_present_events(&mut backend)
-            .iter()
-            .map(|event| event.present_id)
-            .collect::<Vec<_>>(),
-        vec![52],
-        "queued successor completes after the composed unflip retires",
+    assert!(
+        Backend::drain_completed_present_events(&mut backend).is_empty(),
+        "the direct successor was completed at its own retirement without a duplicate unflip completion",
     );
     Backend::client_disconnected(&mut backend, yserver_protocol::x11::ClientId(2));
     assert_atomic_cursor_quiescent(&backend);

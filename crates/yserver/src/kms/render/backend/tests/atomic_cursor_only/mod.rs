@@ -3,6 +3,8 @@ mod round_a_lifecycle;
 mod round_a_lifetime;
 mod round_b;
 mod round_b_frames;
+mod round_b_producers;
+mod round_b_rejections;
 mod round_c;
 mod round_d;
 mod round_e;

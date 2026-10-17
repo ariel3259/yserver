@@ -562,6 +562,11 @@ impl KmsServices {
 
     #[cfg(test)]
     pub(crate) fn for_tests() -> Self {
+        Self::for_tests_with_clock(Rc::new(Instant::now))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_with_clock(monotonic_clock: Rc<dyn Fn() -> Instant>) -> Self {
         let atomic =
             Rc::new(crate::drm::atomic::tests_support::RecordingAtomicCommitExecutor::default());
         let crtc_output_discovery = Rc::new(RecordingCrtcOutputDiscovery::default());
@@ -614,7 +619,7 @@ impl KmsServices {
             copied_scanout_copy,
             hotplug,
             connector_snapshot,
-            monotonic_clock: Rc::new(Instant::now),
+            monotonic_clock,
             direct_scanout_test_only,
             backend_entry_observer,
             test_recorders: Some(test_recorders),
@@ -623,6 +628,11 @@ impl KmsServices {
 
     #[cfg(not(test))]
     pub(crate) fn for_tests() -> Self {
+        Self::for_tests_with_clock(Rc::new(Instant::now))
+    }
+
+    #[cfg(not(test))]
+    pub(crate) fn for_tests_with_clock(monotonic_clock: Rc<dyn Fn() -> Instant>) -> Self {
         let atomic =
             Rc::new(crate::drm::atomic::tests_support::RecordingAtomicCommitExecutor::default());
         let mode_blobs = Rc::new(RecordingModeBlobIo::default());
@@ -647,7 +657,7 @@ impl KmsServices {
             copied_scanout_copy: Rc::new(VulkanCopiedScanoutCopySubmitter),
             hotplug,
             connector_snapshot: Rc::new(RecordingConnectorSnapshotIo::new()),
-            monotonic_clock: Rc::new(Instant::now),
+            monotonic_clock,
             direct_scanout_test_only: Rc::new(DrmDirectScanoutTestOnlyExecutor),
             backend_entry_observer: Rc::new(NoopBackendEntryObserver),
             test_recorders: None,

@@ -221,7 +221,10 @@ fn atomic_cursor_only_deferred_direct_replacement_reaches_later_crtcs() {
         "the later CRTC binds the replacement framebuffer with its own hotspot",
     );
     assert!(state1.intent.is_none());
-    assert!(fixture.backend.pstate.scanout_m2.cursor_bound_all);
+    assert!(
+        !fixture.backend.pstate.scanout_m2.cursor_bound_all,
+        "a blocked per-output replacement is not published as bound on every CRTC",
+    );
 
     fixture.retire_output(1, 60);
     fixture.retire_output(0, 61);

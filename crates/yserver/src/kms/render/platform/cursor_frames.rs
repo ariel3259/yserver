@@ -12,6 +12,7 @@ use std::io;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CursorCommitOwner {
     Scene(CursorFrameId),
+    HardwareOnly,
 }
 
 pub(crate) struct StagedCursorFrame {
@@ -94,7 +95,7 @@ pub(crate) fn cursor_frame_updates_for_submit(
     bo_idx: usize,
     frame: CursorFrameId,
 ) -> io::Result<Vec<CursorPlaneUpdate>> {
-    let (mut updates, assignment, sprite) = {
+    let (mut updates, assignment, hardware_only, sprite) = {
         let staged = platform
             .staged_cursor_frames
             .get(&(output_idx, bo_idx))
@@ -103,19 +104,35 @@ pub(crate) fn cursor_frame_updates_for_submit(
         (
             staged.cursor_updates.clone(),
             staged.plan.assignment,
+            staged.plan.hardware_only,
             staged.plan.sprite.clone(),
         )
     };
-    if updates.is_empty()
+    if hardware_only {
+        // Copied rendering can wait after this plan is staged. Sample the
+        // current full-state intent only when its final atomic request is
+        // built; the primary frame never captures HW cursor coordinates.
+        updates = platform.cursor_plane_updates_for_outputs(&[output_idx]);
+        platform.reserve_cursor_plane_updates(&updates)?;
+        let staged = platform
+            .staged_cursor_frames
+            .get_mut(&(output_idx, bo_idx))
+            .expect("copied cursor frame was validated before rebuilding its delta");
+        staged.cursor_updates = updates.clone();
+        staged.cursor_updates_reserved = !updates.is_empty();
+    } else if updates.is_empty()
         && assignment == crate::kms::render::scene::CursorFrameAssignment::Hardware
     {
         // The frame plan retains its complete desired binding even when it
         // initially matched the applied state. Rebuild once at final submit
         // so motion queued while the copied render waited can join this
         // primary commit instead of being cleared as an empty delta settles.
-        if let Some(update) =
-            platform.prepare_scene_cursor_frame_update(output_idx, assignment, sprite.as_ref())?
-        {
+        if let Some(update) = platform.prepare_scene_cursor_frame_update(
+            output_idx,
+            frame,
+            assignment,
+            sprite.as_ref(),
+        )? {
             platform.reserve_cursor_plane_updates(std::slice::from_ref(&update))?;
             updates.push(update);
             let staged = platform
@@ -186,13 +203,14 @@ pub(crate) fn prepare_frame_cursor_commit(
     bo_idx: usize,
     frame: CursorFrameId,
 ) -> io::Result<Vec<CursorPlaneUpdate>> {
-    let (owner, assignment, sprite) = platform
+    let (owner, assignment, hardware_only, sprite) = platform
         .staged_cursor_frames
         .get(&(output_idx, bo_idx))
         .map(|staged| {
             (
                 staged.owner,
                 staged.plan.assignment,
+                staged.plan.hardware_only,
                 staged.plan.sprite.clone(),
             )
         })
@@ -200,10 +218,25 @@ pub(crate) fn prepare_frame_cursor_commit(
     if owner != CursorCommitOwner::Scene(frame) {
         return Err(io::Error::other("cursor frame plan identity mismatch"));
     }
-    let updates = platform
-        .prepare_scene_cursor_frame_update(output_idx, assignment, sprite.as_ref())?
-        .into_iter()
-        .collect::<Vec<_>>();
+    let updates = if hardware_only {
+        let copied = platform
+            .scanout_pools
+            .get(output_idx)
+            .and_then(Option::as_ref)
+            .is_some_and(|pool| {
+                matches!(pool, crate::kms::render::platform::OutputScanout::Copied(_))
+            });
+        if copied {
+            Vec::new()
+        } else {
+            platform.cursor_plane_updates_for_outputs(&[output_idx])
+        }
+    } else {
+        platform
+            .prepare_scene_cursor_frame_update(output_idx, frame, assignment, sprite.as_ref())?
+            .into_iter()
+            .collect::<Vec<_>>()
+    };
     // Scene plans stay in this slot-keyed table. The cursor-only scheduler
     // reads `CursorCrtcState.intent` and never consults staged frame owners.
     Ok(updates)
