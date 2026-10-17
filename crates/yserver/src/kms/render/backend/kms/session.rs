@@ -659,6 +659,7 @@ impl KmsBackend {
         // successful all-off quiesce cleared every arm already; prune remains
         // useful for metadata-only/no-direct transitions.
         self.prune_armed_targets_to_live_outputs();
+        self.platform.invalidate_live_cursor_applied();
 
         // 2a. Re-light every live output. The connector snapshot is read-only
         //     for surviving routes; on a VT/seat resume the kernel may have
@@ -862,6 +863,7 @@ impl KmsBackend {
         // until VT_RELDISP, so a stall here freezes the whole session).
         log::info!("kms: VT release — input paused; run_suspend");
         self.drive_vt_event(state, VtEventKind::Disable);
+        self.platform.invalidate_live_cursor_applied();
         log::info!("kms: VT release — suspended; drmDropMaster");
         for device in &self.platform.devices {
             if let Err(err) = self.pstate.vt_resume_executor.release_master(device) {
@@ -967,13 +969,9 @@ impl KmsBackend {
         );
 
         if want_active {
-            // ── Wake side. Mirrors KmsBackend::run_resume around the
-            //    modeset commit: commit_modeset, then re-arm the cursor
-            //    plane via legacy ioctl. Without rearm_cursor the cursor
-            //    plane stays bound to a CRTC that was disabled — the
-            //    first subsequent atomic page-flip then EINVALs because
-            //    the kernel sees a stale plane→CRTC reference. See
-            //    project_einval_atomic_commit_storm_wedge memory entry.
+            // ── Wake side. Re-light the CRTC, invalidate the cached cursor
+            //    comparison, then reconcile the accepted policy with atomic
+            //    cursor-plane state.
             //
             // ALWAYS run rearm_cursor + wake_for_damage regardless of
             // dpms_set_outputs_active's result. That helper is best-
@@ -986,6 +984,7 @@ impl KmsBackend {
             // failure, the next set_dpms_power(On) retry sees
             // kms_outputs_active=false and re-attempts (idempotent on
             // the outputs that already came up).
+            self.platform.invalidate_live_cursor_applied();
             let res = self.platform.dpms_set_outputs_active(true);
             self.reapply_gamma_for_live_outputs();
             let (hot_x, hot_y) = self
@@ -1107,6 +1106,8 @@ impl KmsBackend {
             self.request_exit();
             return;
         }
+
+        self.platform.invalidate_live_cursor_applied();
 
         log::info!("kms: VT acquire — master held={acquired}; run_resume");
         self.drive_vt_event(state, VtEventKind::Enable);

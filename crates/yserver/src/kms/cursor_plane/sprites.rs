@@ -45,6 +45,7 @@ pub(crate) struct SpritePool {
     max_buffers: usize,
     wanted: Option<WantedSprite>,
     candidate: Option<SpriteBufferLease>,
+    quarantined: bool,
 }
 
 struct WantedSprite {
@@ -65,6 +66,7 @@ impl SpritePool {
             max_buffers: 2,
             wanted: None,
             candidate: None,
+            quarantined: false,
         }
     }
 
@@ -73,11 +75,13 @@ impl SpritePool {
     }
 
     pub(crate) fn disarm(&mut self) {
-        for buffer in std::mem::take(&mut self.buffers) {
-            std::mem::forget(buffer);
-        }
-        self.candidate = None;
-        self.wanted = None;
+        self.quarantined = true;
+    }
+
+    /// Release the destruction quarantine after a blocking all-off and its
+    /// old-event drain have proved that no cursor framebuffer is in use.
+    pub(crate) fn recover_after_all_off(&mut self) {
+        self.quarantined = false;
     }
 
     pub(crate) fn prepare(
@@ -331,6 +335,16 @@ impl SpritePool {
     )]
     pub(crate) fn candidate_version(&self) -> Option<u64> {
         self.candidate.map(|lease| lease.version)
+    }
+}
+
+impl Drop for SpritePool {
+    fn drop(&mut self) {
+        if self.quarantined {
+            for buffer in std::mem::take(&mut self.buffers) {
+                std::mem::forget(buffer);
+            }
+        }
     }
 }
 

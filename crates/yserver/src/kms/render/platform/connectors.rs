@@ -721,6 +721,8 @@ impl PlatformBackend {
             existing_idx,
             needs_pool_realloc,
         } = resolved;
+        let cursor_key =
+            crate::kms::render::platform::CrtcKey::new(output_key.device_key, output.crtc);
         let w = mode_spec.width;
         let h = mode_spec.height;
 
@@ -919,6 +921,7 @@ impl PlatformBackend {
             // new_pool dropped here (freed on stack unwind).
             return Err(e);
         }
+        self.invalidate_cursor_applied(cursor_key);
 
         // A synchronous modeset has already latched this framebuffer; unlike
         // an ordinary page flip no completion event will promote it from

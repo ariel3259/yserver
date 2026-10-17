@@ -1123,6 +1123,10 @@ impl CursorPlane {
         self.sprite_pool.disarm();
     }
 
+    pub(crate) fn recover_sprite_pool_after_all_off(&mut self) {
+        self.sprite_pool.recover_after_all_off();
+    }
+
     #[cfg(test)]
     #[allow(
         dead_code,

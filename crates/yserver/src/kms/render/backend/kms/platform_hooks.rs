@@ -182,16 +182,7 @@ impl Platform for PlatformBackend {
     }
 
     fn recover_hidden_cursor_on_resume(b: &mut KmsBackend) {
-        for output_idx in 0..b.platform.outputs.len() {
-            if !b.platform.cursor_plane_visible_for_output(output_idx) {
-                continue;
-            }
-            if let Err(error) = b.platform.cursor_plane_hide_on_crtc(output_idx) {
-                log::warn!(
-                    "render resume: hidden cursor plane detach failed on output {output_idx}: {error}"
-                );
-            }
-        }
+        b.platform.recover_hidden_cursor_on_resume();
     }
 
     fn note_cursor_sprite(b: &mut KmsBackend, width: u16, height: u16, hot_x: u16, hot_y: u16) {

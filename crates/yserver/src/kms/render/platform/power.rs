@@ -71,10 +71,15 @@ pub(crate) struct OutputPowerRecord {
 #[derive(Default)]
 pub(crate) struct RecordingOutputPowerExecutor {
     records: std::cell::RefCell<Vec<OutputPowerRecord>>,
+    assemble_modesets: std::cell::Cell<bool>,
 }
 
 #[cfg(test)]
 impl RecordingOutputPowerExecutor {
+    pub(crate) fn assemble_modesets(&self) {
+        self.assemble_modesets.set(true);
+    }
+
     pub(crate) fn records(&self) -> Vec<OutputPowerRecord> {
         self.records.borrow().clone()
     }
@@ -113,7 +118,7 @@ impl OutputPowerExecutor for RecordingOutputPowerExecutor {
         _device: &drm::Device,
         output: &crate::platform::drm::Output,
         framebuffer: ::drm::control::framebuffer::Handle,
-        _services: &super::services::KmsServices,
+        services: &super::services::KmsServices,
     ) -> io::Result<()> {
         self.records.borrow_mut().push(OutputPowerRecord {
             enabled: true,
@@ -121,7 +126,69 @@ impl OutputPowerExecutor for RecordingOutputPowerExecutor {
             crtc: output.crtc,
             framebuffer: Some(framebuffer),
         });
-        Ok(())
+        if !self.assemble_modesets.get() {
+            return Ok(());
+        }
+
+        let mode_blob = services
+            .mode_blobs
+            .create_property_blob(_device, &output.mode)?;
+        let properties = drm::modeset::DisableOutputPropertyHandles::for_tests();
+        let (mode_w, mode_h) = output.mode.size();
+        let mut request = crate::drm::atomic::AtomicCommitRequest::new();
+        request.add_raw_property(
+            output.connector.into(),
+            properties.connector_crtc_id,
+            u64::from(u32::from(output.crtc)),
+        );
+        request.add_raw_property(output.crtc.into(), properties.crtc_mode_id, mode_blob);
+        request.add_raw_property(output.crtc.into(), properties.crtc_active, 1);
+        request.add_raw_property(
+            output.plane.into(),
+            output.plane_fb_id_prop,
+            u64::from(u32::from(framebuffer)),
+        );
+        request.add_raw_property(
+            output.plane.into(),
+            output.plane_crtc_id_prop,
+            u64::from(u32::from(output.crtc)),
+        );
+        request.add_raw_property(output.plane.into(), output.plane_src_x_prop, 0);
+        request.add_raw_property(output.plane.into(), output.plane_src_y_prop, 0);
+        request.add_raw_property(
+            output.plane.into(),
+            output.plane_src_w_prop,
+            u64::from(mode_w) << 16,
+        );
+        request.add_raw_property(
+            output.plane.into(),
+            output.plane_src_h_prop,
+            u64::from(mode_h) << 16,
+        );
+        request.add_raw_property(output.plane.into(), output.plane_crtc_x_prop, 0);
+        request.add_raw_property(output.plane.into(), output.plane_crtc_y_prop, 0);
+        request.add_raw_property(
+            output.plane.into(),
+            output.plane_crtc_w_prop,
+            u64::from(mode_w),
+        );
+        request.add_raw_property(
+            output.plane.into(),
+            output.plane_crtc_h_prop,
+            u64::from(mode_h),
+        );
+        let result = services.atomic.atomic_commit(
+            _device,
+            ::drm::control::AtomicCommitFlags::ALLOW_MODESET,
+            crate::drm::atomic::AtomicCommitKind::Scene,
+            request,
+            &[],
+        );
+        let cleanup = services
+            .mode_blobs
+            .destroy_property_blob(_device, mode_blob);
+        result?;
+        cleanup
     }
 }
 
@@ -248,6 +315,7 @@ impl PlatformBackend {
     pub(crate) fn dpms_set_outputs_active(&mut self, active: bool) -> io::Result<()> {
         let mut first_err: Option<io::Error> = None;
         if active {
+            let mut modeset_crtcs = Vec::new();
             // Re-commit modeset. Pick the OnScreen BO (last frame
             // before blank) or any registered fb — same selection
             // logic as `requery_outputs_and_modeset` at :2030.
@@ -318,24 +386,33 @@ impl PlatformBackend {
                     if first_err.is_none() {
                         first_err = Some(e);
                     }
-                } else if let (Some(bo_idx), Some(scanout)) = (
-                    bo_idx,
-                    self.scanout_pools.get_mut(i).and_then(Option::as_mut),
-                ) {
-                    scanout.display_pool_mut().bos[bo_idx]
-                        .state
-                        .mark_on_screen_after_modeset();
-                    if let Err(error) = scanout.note_kms_modeset_installed(bo_idx) {
-                        log::error!(
-                            "dpms_set_outputs_active(true): copied ownership ledger failed for \
-                             output {i} bo {bo_idx}: {error}"
-                        );
-                        self.gpu.renderer_failed = true;
-                        if first_err.is_none() {
-                            first_err = Some(error);
+                } else {
+                    modeset_crtcs.push(crate::kms::render::platform::CrtcKey::new(
+                        layout.key.device_key,
+                        layout.output.crtc,
+                    ));
+                    if let (Some(bo_idx), Some(scanout)) = (
+                        bo_idx,
+                        self.scanout_pools.get_mut(i).and_then(Option::as_mut),
+                    ) {
+                        scanout.display_pool_mut().bos[bo_idx]
+                            .state
+                            .mark_on_screen_after_modeset();
+                        if let Err(error) = scanout.note_kms_modeset_installed(bo_idx) {
+                            log::error!(
+                                "dpms_set_outputs_active(true): copied ownership ledger failed for \
+                                 output {i} bo {bo_idx}: {error}"
+                            );
+                            self.gpu.renderer_failed = true;
+                            if first_err.is_none() {
+                                first_err = Some(error);
+                            }
                         }
                     }
                 }
+            }
+            for key in modeset_crtcs {
+                self.invalidate_cursor_applied(key);
             }
         } else {
             for output_idx in 0..self.outputs.len() {
@@ -392,6 +469,18 @@ impl PlatformBackend {
             .as_ref()
             .map(|recorders| Rc::clone(&recorders.output_power))
             .unwrap_or_else(|| Rc::new(RecordingOutputPowerExecutor::default()));
+        self.output_power_executor = executor;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_record_complete_output_power_commits(&mut self) {
+        let executor = self
+            .services
+            .test_recorders
+            .as_ref()
+            .map(|recorders| Rc::clone(&recorders.output_power))
+            .unwrap_or_else(|| Rc::new(RecordingOutputPowerExecutor::default()));
+        executor.assemble_modesets();
         self.output_power_executor = executor;
     }
 }

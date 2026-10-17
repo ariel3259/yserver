@@ -1,8 +1,8 @@
 use crate::kms::{
     cursor_plane::CursorPlaneFactory,
     render::platform::{
-        CursorFailureDisposition, CursorMoveOutcome, KmsCursorState, KmsDevice, PlatformBackend,
-        TransientCursorFallback,
+        CrtcKey, CursorFailureDisposition, CursorMoveOutcome, KmsCursorState, KmsDevice,
+        PlatformBackend, TransientCursorFallback,
         cursor_state::{CursorBinding, CursorIntent, CursorPlaneUpdate},
     },
 };
@@ -448,6 +448,53 @@ impl PlatformBackend {
         };
         self.device_for_key(layout.key.device_key)
             .is_some_and(|device| device.cursor.available_on(layout.output.crtc))
+    }
+
+    /// Invalidate only the accepted-state comparison for one device-qualified
+    /// CRTC. Accepted bindings and their sprite leases remain real owners until
+    /// a detach/replacement commit and its required drain settle them.
+    pub(crate) fn invalidate_cursor_applied(&mut self, key: CrtcKey) {
+        if let Some(state) = self
+            .devices
+            .iter_mut()
+            .find(|device| device.key == key.device_key)
+            .and_then(|device| device.cursor.crtc_states.get_mut(&key.crtc))
+        {
+            super::cursor_lifecycle::invalidate_applied_comparison(state);
+        }
+    }
+
+    pub(crate) fn invalidate_live_cursor_applied(&mut self) {
+        let routes: Vec<_> = self.outputs.iter().map(CrtcKey::for_output).collect();
+        for key in routes {
+            self.invalidate_cursor_applied(key);
+        }
+    }
+
+    /// Reconcile the cursor policy after a resume when the effective cursor is
+    /// hidden. Every eligible live route receives a full detached state after
+    /// invalidation, including routes whose blocking all-off already cleared
+    /// their accepted owner. Keep failed detaches' accepted bindings and leases.
+    pub(crate) fn recover_hidden_cursor_on_resume(&mut self) {
+        let routes: Vec<_> = self.outputs.iter().map(CrtcKey::for_output).collect();
+        for key in &routes {
+            self.invalidate_cursor_applied(*key);
+        }
+        for key in routes {
+            let Some(output_idx) = self.output_index_for_crtc(key) else {
+                continue;
+            };
+            if !self.cursor_plane_available_for_output(output_idx) {
+                continue;
+            }
+            if let Err(error) = self.cursor_plane_hide_on_crtc(output_idx) {
+                log::warn!(
+                    "render resume: hidden cursor plane detach failed on device {} CRTC {:?}: {error}",
+                    key.device_key,
+                    key.crtc
+                );
+            }
+        }
     }
 
     fn prepare_cursor_update_for_output(
@@ -1045,9 +1092,10 @@ impl PlatformBackend {
                     if let Some(binding) = state.lifecycle_pending.take() {
                         plane.release_sprite_user(binding.lease);
                     }
-                    state.valid = false;
+                    super::cursor_lifecycle::invalidate_applied_comparison(state);
                     state.intent = None;
                 }
+                plane.recover_sprite_pool_after_all_off();
             }
             device.cursor.atomic_cursor_commits_in_flight.clear();
             device.cursor.cursor_retry_waits_for_flip.clear();
@@ -2006,7 +2054,7 @@ impl PlatformBackend {
             device.cursor.cursor_hide_recovery.clear();
             device.cursor.transient_fallback_crtcs.clear();
             for state in device.cursor.crtc_states.values_mut() {
-                state.valid = false;
+                super::cursor_lifecycle::invalidate_applied_comparison(state);
                 state.intent = None;
                 state.intent_motion_timestamp = None;
             }

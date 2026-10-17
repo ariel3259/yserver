@@ -1,4 +1,5 @@
 mod round_a;
+mod round_a_lifecycle;
 mod round_a_lifetime;
 mod round_b;
 mod round_c;

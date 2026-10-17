@@ -3807,7 +3807,7 @@ fn atomic_cursor_only_shutdown_disables_before_scene_drain_and_drains_delayed_ev
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: rearm a cursor on VT resume even though it remained hidden during suspend.
+// Mutation: resume with an attached cursor instead of the full detached state.
 fn atomic_cursor_only_vt_release_keeps_hidden_cursor_detached_after_resume() {
     use std::rc::Rc;
     use yserver_core::{backend::Backend, core_loop::input_inventory::InputInventory};
@@ -3968,9 +3968,24 @@ fn atomic_cursor_only_vt_release_keeps_hidden_cursor_detached_after_resume() {
     let after_resume = fixture.recorders.atomic.records();
     assert_eq!(
         after_resume.len(),
-        4,
-        "hidden resume submits no cursor show"
+        5,
+        "hidden resume submits one cursor detach after output activation"
     );
+    let hidden_resume = after_resume.last().unwrap();
+    assert_eq!(
+        hidden_resume.kind,
+        crate::drm::atomic::AtomicCommitKind::CursorOnly
+    );
+    for property in [prior.properties.fb_id, prior.properties.crtc_id] {
+        assert!(
+            hidden_resume.properties.iter().any(|update| {
+                update.object == prior.properties.plane.into()
+                    && update.property == property
+                    && update.value == 0
+            }),
+            "hidden resume omitted detached cursor property {property:?}"
+        );
+    }
     let resumed_state = fixture
         .backend
         .platform
@@ -3982,14 +3997,25 @@ fn atomic_cursor_only_vt_release_keeps_hidden_cursor_detached_after_resume() {
         .unwrap();
     assert!(resumed_state.applied.is_none());
     assert!(resumed_state.intent.is_none());
-    assert!(resumed_state.in_flight.is_none());
+    assert!(resumed_state.in_flight.is_some());
     assert!(!fixture.backend.platform.cursor_plane_visible_for_output(0));
+    assert!(
+        fixture
+            .backend
+            .platform
+            .cursor_atomic_event_pending_for_output(0)
+    );
+    fixture.retire_output(0, 3);
+    assert!(
+        fixture.backend.platform.devices[0].cursor.crtc_states[&crtc]
+            .in_flight
+            .is_none()
+    );
     assert!(
         !fixture
             .backend
             .platform
-            .cursor_atomic_event_pending_for_output(0),
-        "hidden VT resume creates no cursor event obligation",
+            .cursor_atomic_event_pending_for_output(0)
     );
     assert_eq!(
         fixture.backend.platform.devices[0]
@@ -4020,9 +4046,10 @@ fn atomic_cursor_only_vt_release_keeps_hidden_cursor_detached_after_resume() {
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
             crate::drm::atomic::AtomicCommitKind::Scene,
+            crate::drm::atomic::AtomicCommitKind::CursorOnly,
             crate::drm::atomic::AtomicCommitKind::Scene,
         ],
-        "VT sequence is attach, rejected hide, blocking detach, and cursorless resume frame",
+        "VT sequence is attach, rejected hide, blocking detach, hidden detach, and cursorless resume frame",
     );
     assert!(fixture.recorders.legacy_cursor.records().is_empty());
     let resources = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
