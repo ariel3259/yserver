@@ -195,6 +195,11 @@ fn atomic_cursor_only_stationary_hw_image_and_animation_make_progress() {
         Backend::create_anim_cursor(&mut fixture.backend, None, &[(replacement, 40), (next, 40)])
             .expect("create animation through Backend")
             .expect("animation handle");
+    let expected_animation_pixels = fixture.backend.anim_cursor_records[&animation.as_raw()].frames
+        [1]
+    .record
+    .bgra_bytes
+    .clone();
     let root = fixture.backend.core.window_id;
     Backend::define_cursor(&mut fixture.backend, None, root, animation.as_raw())
         .expect("select animation through Backend");
@@ -222,6 +227,11 @@ fn atomic_cursor_only_stationary_hw_image_and_animation_make_progress() {
             .cursor_plane_uploaded_version_for_output(0)
             .expect("uploaded animation frame version"),
         "the accepted sprite identity is the newest animation record",
+    );
+    assert_eq!(
+        fixture.backend.cursor_records[&animation.as_raw()].bgra_bytes,
+        expected_animation_pixels,
+        "retirement preserves the current animation frame's pixels",
     );
     assert_eq!(
         fixture
@@ -789,7 +799,7 @@ fn atomic_cursor_only_held_direct_hotspot_and_visibility_progress() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutations: use only cursor_hidden, turn cursor wakes into generic damage, reset the cap per observation, cap client damage, replace run_core WarpPointer with Backend warps, replace the sink after On entry, or omit final Backend cleanup.
+// Mutations: use only cursor_hidden, turn cursor wakes into generic damage, reset the cap per observation, cap XTEST deadline or CopyArea progress, replace run_core WarpPointer with Backend warps, replace the sink after On entry, or omit final Backend cleanup.
 fn atomic_cursor_only_tearing_cursor_cap_survives_all_motion_sources() {
     assert!(
         super::super::tearing::round2::run_task6_present_and_xtest_motion_keep_cursor_compose_cap_under_run_core_load(false),

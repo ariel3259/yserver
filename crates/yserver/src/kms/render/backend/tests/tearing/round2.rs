@@ -1285,6 +1285,13 @@ pub(in crate::kms::render::backend::tests) fn run_task6_present_and_xtest_motion
             .unwrap()
             .saturating_add(refresh_interval_ns / 2)
     });
+    let first_cursor_deadline_ns = last_cursor_compose
+        .map(|last| {
+            u64::try_from(last.saturating_duration_since(clock_base).as_nanos())
+                .unwrap()
+                .saturating_add(refresh_interval_ns)
+        })
+        .unwrap_or_else(|| initial_scheduler_time_ns.saturating_add(refresh_interval_ns));
     backend.platform.devices[0]
         .atomic_commit_sink
         .set_tearing_on(true);
@@ -1439,7 +1446,6 @@ pub(in crate::kms::render::backend::tests) fn run_task6_present_and_xtest_motion
     );
     let motion_duration = refresh_interval * 7;
     let motion_duration_ns = u64::try_from(motion_duration.as_nanos()).unwrap();
-    let motion_end_ns = initial_scheduler_time_ns.saturating_add(motion_duration_ns);
     let refresh_windows = motion_duration
         .as_nanos()
         .div_ceil(refresh_interval.as_nanos())
@@ -1454,10 +1460,10 @@ pub(in crate::kms::render::backend::tests) fn run_task6_present_and_xtest_motion
         let xtest_client_id = ClientId(2);
         let warp_client_id = ClientId(4);
         let present_interval_ns = 1_000_000_000_u64 / 130;
-        let mut next_present_ns = initial_scheduler_time_ns;
         let mut xtest_sequence = 1_u16;
         let mut warp_sequence = 1_u16;
         let mut barrier_sequence = 1_u16;
+        let mut isolated_motion = 0_usize;
         let mut sent_motion = 0_usize;
         let mut sent_presents = 0_usize;
         let mut final_pointer_position = (0_i32, 0_i32);
@@ -1496,8 +1502,6 @@ pub(in crate::kms::render::backend::tests) fn run_task6_present_and_xtest_motion
                 assert!(!timeout.timed_out() || *count >= expected);
             }
         };
-        let mut now_ns = initial_scheduler_time_ns;
-
         // Exercise both real XWarpPointer request forms while the cursor
         // compose cap is closed. The second destination is the nested test
         // window, so run_core must resolve its window origin before calling
@@ -1575,9 +1579,196 @@ pub(in crate::kms::render::backend::tests) fn run_task6_present_and_xtest_motion
             "root and window WarpPointer requests stay behind the cursor deadline",
         );
 
+        // Keep XTEST motion separate from Presents. Each deadline gets two
+        // coalesced motions below the cap and one at the deadline that must
+        // result in exactly one cursor-bearing async compose.
+        producer_allow_fake_flip_delivery.store(true, Ordering::SeqCst);
+        let flip_drain = wait_for_commit_progress(
+            &producer_commits,
+            Instant::now() + Duration::from_secs(30),
+            "pre-XTEST fake flip drain",
+            |progress| progress.drained == progress.flip_obligations,
+        );
+        drop(flip_drain);
+
+        let mut cursor_deadline_ns = first_cursor_deadline_ns;
+        for deadline_index in 0..3 {
+            let before_deadline_commits = producer_commits
+                .progress
+                .lock()
+                .expect("cursor deadline progress")
+                .kinds
+                .len();
+            for (motion_index, offset_ns) in [refresh_interval_ns / 2, refresh_interval_ns / 4]
+                .into_iter()
+                .enumerate()
+            {
+                producer_scheduler_time_ns.store(
+                    cursor_deadline_ns.saturating_sub(offset_ns),
+                    Ordering::SeqCst,
+                );
+                let x = i16::try_from(210 + deadline_index * 4 + motion_index)
+                    .expect("isolated XTEST x fits");
+                let y = i16::try_from(170 + deadline_index * 3 + motion_index)
+                    .expect("isolated XTEST y fits");
+                let mut body = vec![0_u8; 32];
+                body[0] = 6; // MotionNotify, as sent by xdotool through XTEST.
+                body[20..22].copy_from_slice(&x.to_le_bytes());
+                body[22..24].copy_from_slice(&y.to_le_bytes());
+                request_sender
+                    .send(Message::Request {
+                        id: xtest_client_id,
+                        sequence: SequenceNumber(xtest_sequence),
+                        accepted_at: None,
+                        header: RequestHeader {
+                            opcode: 146,
+                            data: 2,
+                            length_units: 8,
+                        },
+                        body,
+                        attached_fd: None,
+                    })
+                    .expect("queue isolated XTEST motion before deadline");
+                xtest_sequence = xtest_sequence.wrapping_add(1);
+                isolated_motion += 1;
+                core_barrier(&mut endstate_peer);
+                wait_for_motion(isolated_motion + 2);
+                core_barrier(&mut endstate_peer);
+                let progress = producer_commits
+                    .progress
+                    .lock()
+                    .expect("pre-deadline cursor progress");
+                assert_eq!(
+                    progress.kinds.len(),
+                    before_deadline_commits,
+                    "XTEST motion {motion_index} before deadline {deadline_index} stays capped",
+                );
+            }
+
+            producer_scheduler_time_ns.store(cursor_deadline_ns, Ordering::SeqCst);
+            let x = i16::try_from(212 + deadline_index * 4).expect("deadline XTEST x fits");
+            let y = i16::try_from(172 + deadline_index * 3).expect("deadline XTEST y fits");
+            let mut body = vec![0_u8; 32];
+            body[0] = 6; // MotionNotify, as sent by xdotool through XTEST.
+            body[20..22].copy_from_slice(&x.to_le_bytes());
+            body[22..24].copy_from_slice(&y.to_le_bytes());
+            request_sender
+                .send(Message::Request {
+                    id: xtest_client_id,
+                    sequence: SequenceNumber(xtest_sequence),
+                    accepted_at: None,
+                    header: RequestHeader {
+                        opcode: 146,
+                        data: 2,
+                        length_units: 8,
+                    },
+                    body,
+                    attached_fd: None,
+                })
+                .expect("queue isolated XTEST motion at deadline");
+            xtest_sequence = xtest_sequence.wrapping_add(1);
+            isolated_motion += 1;
+            core_barrier(&mut endstate_peer);
+            wait_for_motion(isolated_motion + 2);
+            core_barrier(&mut endstate_peer);
+
+            let progress = wait_for_commit_progress(
+                &producer_commits,
+                Instant::now() + Duration::from_secs(30),
+                "one cursor compose at each isolated XTEST deadline",
+                |progress| progress.kinds.len() > before_deadline_commits,
+            );
+            assert_eq!(
+                progress.kinds.len(),
+                before_deadline_commits + 1,
+                "each isolated XTEST deadline produces exactly one cursor compose",
+            );
+            assert_eq!(
+                progress.kinds[before_deadline_commits],
+                AtomicCommitKind::Async,
+                "each XTEST deadline records the cursor-bearing async compose",
+            );
+            drop(progress);
+
+            let drained = wait_for_commit_progress(
+                &producer_commits,
+                Instant::now() + Duration::from_secs(30),
+                "isolated XTEST cursor compose flip retirement",
+                |progress| progress.drained == progress.flip_obligations,
+            );
+            drop(drained);
+            core_barrier(&mut endstate_peer);
+            core_barrier(&mut endstate_peer);
+            let settled = producer_commits
+                .progress
+                .lock()
+                .expect("settled XTEST cursor progress");
+            assert_eq!(
+                settled.kinds.len(),
+                before_deadline_commits + 1,
+                "XTEST deadline {deadline_index} leaves no duplicate cursor compose",
+            );
+            cursor_deadline_ns = cursor_deadline_ns.saturating_add(refresh_interval_ns);
+        }
+        assert_eq!(
+            sent_presents, 0,
+            "the isolated XTEST deadline phase contains no concurrent PresentPixmap requests",
+        );
+
         // A CopyArea request and a structural ConfigureWindow request are
         // client causes. Both must remain urgent while cursor-only motion is
         // capped, and both travel through run_core's real X11 dispatcher.
+        // Leave one fresh XTEST position pending below its cursor deadline so
+        // CopyArea must carry that cursor progress immediately.
+        let before_copy_motion = producer_commits
+            .progress
+            .lock()
+            .expect("pre-CopyArea XTEST progress")
+            .kinds
+            .len();
+        producer_scheduler_time_ns.store(
+            cursor_deadline_ns.saturating_sub(refresh_interval_ns / 2),
+            Ordering::SeqCst,
+        );
+        let mut body = vec![0_u8; 32];
+        body[0] = 6; // MotionNotify, as sent by xdotool through XTEST.
+        body[20..22].copy_from_slice(&245_i16.to_le_bytes());
+        body[22..24].copy_from_slice(&199_i16.to_le_bytes());
+        request_sender
+            .send(Message::Request {
+                id: xtest_client_id,
+                sequence: SequenceNumber(xtest_sequence),
+                accepted_at: None,
+                header: RequestHeader {
+                    opcode: 146,
+                    data: 2,
+                    length_units: 8,
+                },
+                body,
+                attached_fd: None,
+            })
+            .expect("queue capped XTEST motion before CopyArea");
+        xtest_sequence = xtest_sequence.wrapping_add(1);
+        isolated_motion += 1;
+        core_barrier(&mut endstate_peer);
+        wait_for_motion(isolated_motion + 2);
+        core_barrier(&mut endstate_peer);
+        let capped_copy_motion = producer_commits
+            .progress
+            .lock()
+            .expect("capped CopyArea XTEST progress");
+        assert_eq!(
+            capped_copy_motion.kinds.len(),
+            before_copy_motion,
+            "the XTEST position before CopyArea remains capped below its deadline",
+        );
+        drop(capped_copy_motion);
+        let before_copy_area = producer_commits
+            .progress
+            .lock()
+            .expect("pre-CopyArea commit progress")
+            .kinds
+            .len();
         let mut gc_body = vec![0_u8; 12];
         gc_body[0..4].copy_from_slice(&GC.0.to_le_bytes());
         gc_body[4..8].copy_from_slice(&WINDOW.0.to_le_bytes());
@@ -1623,6 +1814,32 @@ pub(in crate::kms::render::backend::tests) fn run_task6_present_and_xtest_motion
             .expect("queue client CopyArea while cursor cap is closed");
         *client_sequence = client_sequence.wrapping_add(1);
         drop(client_sequence);
+        core_barrier(&mut endstate_peer);
+        let copy_progress = wait_for_commit_progress(
+            &producer_commits,
+            Instant::now() + Duration::from_secs(30),
+            "immediate CopyArea cursor compose",
+            |progress| progress.kinds.len() > before_copy_area,
+        );
+        assert_eq!(
+            copy_progress.kinds.len(),
+            before_copy_area + 1,
+            "CopyArea records one immediate async cursor-bearing compose",
+        );
+        assert_eq!(
+            copy_progress.kinds[before_copy_area],
+            AtomicCommitKind::Async,
+            "CopyArea cursor compose stays async while tearing is On",
+        );
+        drop(copy_progress);
+        let copy_flip_progress = wait_for_commit_progress(
+            &producer_commits,
+            Instant::now() + Duration::from_secs(30),
+            "CopyArea cursor compose flip retirement",
+            |progress| progress.drained == progress.flip_obligations,
+        );
+        drop(copy_flip_progress);
+        core_barrier(&mut endstate_peer);
         core_barrier(&mut endstate_peer);
 
         let before_structure = producer_commits
@@ -1710,6 +1927,9 @@ pub(in crate::kms::render::backend::tests) fn run_task6_present_and_xtest_motion
             producer_allow_fake_flip_delivery.store(false, Ordering::SeqCst);
         }
 
+        let mut now_ns = cursor_deadline_ns;
+        let mut next_present_ns = now_ns;
+        let motion_end_ns = now_ns.saturating_add(motion_duration_ns);
         while now_ns < motion_end_ns {
             producer_scheduler_time_ns.store(now_ns, Ordering::SeqCst);
             let step = i16::try_from(sent_motion).expect("test pointer step fits");
@@ -1774,7 +1994,7 @@ pub(in crate::kms::render::backend::tests) fn run_task6_present_and_xtest_motion
             // reaction form the second barrier, so neither scheduling speed
             // nor sleeps decide when the next virtual deadline is reached.
             core_barrier(&mut endstate_peer);
-            wait_for_motion(sent_motion);
+            wait_for_motion(sent_motion + isolated_motion + 2);
             core_barrier(&mut endstate_peer);
             now_ns = now_ns.saturating_add(3_000_000);
         }
@@ -1785,7 +2005,7 @@ pub(in crate::kms::render::backend::tests) fn run_task6_present_and_xtest_motion
             producer_commits.changed.notify_all();
         }
 
-        wait_for_motion(sent_motion + 2);
+        wait_for_motion(sent_motion + isolated_motion + 2);
         let observed_motion = expected_motion_notifications.load(Ordering::SeqCst);
 
         // Drain work from the input stream and observe two unchanged commit
@@ -1857,6 +2077,7 @@ pub(in crate::kms::render::backend::tests) fn run_task6_present_and_xtest_motion
         shutdown_on_drop.shutdown();
         (
             sent_motion,
+            isolated_motion,
             sent_presents,
             observed_motion,
             final_pointer_position,
@@ -1933,8 +2154,14 @@ pub(in crate::kms::render::backend::tests) fn run_task6_present_and_xtest_motion
     mpv_reader
         .join()
         .expect("MotionNotify client response thread");
-    let (sent_motion, sent_presents, observed_motion, final_pointer_position, motion_elapsed) =
-        producer_result.expect("mixed Present/motion producer");
+    let (
+        sent_motion,
+        isolated_motion,
+        sent_presents,
+        observed_motion,
+        final_pointer_position,
+        motion_elapsed,
+    ) = producer_result.expect("isolated and mixed Present/motion producers");
 
     let progress = commits.progress.lock().expect("commit progress");
     let accepted_kinds = progress.kinds[run_core_start_commit_index..].to_vec();
@@ -1967,7 +2194,7 @@ pub(in crate::kms::render::backend::tests) fn run_task6_present_and_xtest_motion
     );
     assert_eq!(
         observed_motion,
-        sent_motion + 2,
+        sent_motion + isolated_motion + 2,
         "every XTEST motion and both root/window WarpPointer requests reach the fullscreen client's PointerMotionMask"
     );
     assert_eq!(reactions.load(Ordering::SeqCst), observed_motion);
