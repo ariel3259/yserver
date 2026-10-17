@@ -276,6 +276,8 @@ VK_DRIVER_FILES=/home/ariel_santangelo/Projects/claude-scratch/yserver-pr1/lvp/l
 
 Expected: every command exits 0, clippy has no warnings, and ordinary/ignored suites have no failures; report capability skips explicitly. Check formatter changes and run the relevant targeted tests again only if formatting changed behavior-sensitive code. Stage only this task's named files and commit once with `git commit -m "fix: preserve cursor framebuffers through all users"`. Do not batch this commit with the next task.
 
+- **Ruling (controller, A7 dispatch 2):** the A1 scripted no-slot allocator was cut when A1 was narrowed. Skip B's next scene through the real path: withhold B's page-flip events via the A1 recorded flip-event fixture so B keeps a commit in flight / no Free scanout BO. Fallback only if unreachable: a construction-selected fixture service scripting `acquire_scanout_bo` → None for one output, configured before the scenario.
+
 ## Task A8: Close the foundation checkpoint across modesets and lifecycle
 
 **Files:**
