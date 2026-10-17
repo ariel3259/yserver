@@ -1,11 +1,11 @@
 use crate::kms::render::{
     scene::{
-        FailedSubmitBo, InFlightStage, OutputCursorMode, OutputSceneState, OutputSink,
+        FailedSubmitBo, InFlightStage, OutputCursorMode, OutputRoute, OutputSceneState, OutputSink,
         RenderCompletion, SceneCompositor, SceneCompositorInner,
         cursor::{
             apply_cursor_transition_on_retire, force_cursor_retry_repaint,
-            note_cursor_commit_accepted_inner, resolve_retired_cursor_state,
-            update_force_show_retry_version,
+            note_cursor_commit_accepted_inner, output_cursor_mode_from_receipt,
+            resolve_retired_cursor_state, update_force_show_retry_version,
         },
         tick::tick_skip_log_enabled,
     },
@@ -196,22 +196,44 @@ impl SceneCompositor {
             // Hw after a rolled-back show and never claim Sw/Hidden while a
             // failed hide or rollback left the hardware sprite visible.
             let retained_mode = inner.outputs[output_idx].last_frame_cursor_mode;
-            let cursor_result =
-                apply_cursor_transition_on_retire(inner, output_idx, sink, ack.cursor_transition);
+            let shared_frame_receipt = (sink.route(output_idx) == OutputRoute::Shared)
+                .then_some(ack.cursor_receipt)
+                .flatten()
+                .filter(|receipt| receipt.frame == Some(ack.cursor_frame.frame));
+            let (cursor_result, cursor_mode_after_retire) =
+                if let Some(receipt) = shared_frame_receipt {
+                    // The shared frame already accepted its cursor delta with
+                    // the primary. Retirement records that receipt; it must
+                    // not issue a second show/hide transaction.
+                    (
+                        crate::kms::render::scene::CursorTransitionResult::Applied,
+                        output_cursor_mode_from_receipt(receipt),
+                    )
+                } else {
+                    (
+                        apply_cursor_transition_on_retire(
+                            inner,
+                            output_idx,
+                            sink,
+                            ack.cursor_transition,
+                        ),
+                        ack.cursor_mode_after_retire,
+                    )
+                };
             let state = inner
                 .outputs
                 .get_mut(output_idx)
                 .expect("range checked above");
             let resolution = resolve_retired_cursor_state(
                 cursor_result,
-                ack.cursor_mode_after_retire,
+                cursor_mode_after_retire,
                 retained_mode,
             );
             state.force_show_retry_version = update_force_show_retry_version(
                 state.force_show_retry_version,
                 ack.cursor_transition,
                 cursor_result,
-                ack.cursor_mode_after_retire,
+                cursor_mode_after_retire,
             );
             state.last_frame_cursor_mode = resolution.actual_mode;
             if resolution.commit_desired_metadata {
@@ -235,7 +257,7 @@ impl SceneCompositor {
                 self.scene_structure_dirty = true;
             }
             let actually_sw_composed =
-                matches!(ack.cursor_mode_after_retire, OutputCursorMode::Sw { .. });
+                matches!(cursor_mode_after_retire, OutputCursorMode::Sw { .. });
             if actually_sw_composed && sink.cursor_plane_mut().note_composed_retirement(output_idx)
             {
                 // Consume this output/device's own EINVAL backoff one

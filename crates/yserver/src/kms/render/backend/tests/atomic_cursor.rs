@@ -65,9 +65,8 @@ fn backend_with_live_scene() -> Option<KmsBackend> {
     )
     .expect("damage root through Backend");
     Backend::maybe_composite(&mut fixture.backend).expect("submit visible cursor scene");
-    fixture.retire_output(0, 1);
     assert!(fixture.backend.platform.any_cursor_commit_in_flight());
-    fixture.retire_output(0, 2);
+    fixture.retire_output(0, 1);
     assert!(!fixture.backend.platform.any_cursor_commit_in_flight());
     assert!(fixture.backend.platform.cursor_plane_visible_for_output(0));
     Some(fixture.backend)

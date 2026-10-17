@@ -2759,8 +2759,8 @@ fn atomic_cursor_only_atomic_binding_has_full_geometry_and_retirement() {
     );
     assert_eq!(
         first[0].kind,
-        crate::drm::atomic::AtomicCommitKind::Scene,
-        "the first scene frame establishes cursor ownership",
+        crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+        "the first scene frame carries its hardware cursor attach",
     );
     assert_eq!(
         first[0].result,
@@ -2773,20 +2773,16 @@ fn atomic_cursor_only_atomic_binding_has_full_geometry_and_retirement() {
         "eligible cursor work must not call the legacy cursor interface",
     );
 
-    fixture.retire_output(0, 1);
     let after_show = recorders.atomic.records();
     assert_eq!(
         after_show
             .iter()
             .map(|record| record.kind)
             .collect::<Vec<_>>(),
-        vec![
-            crate::drm::atomic::AtomicCommitKind::Scene,
-            crate::drm::atomic::AtomicCommitKind::CursorOnly,
-        ],
-        "the retirement adapter binds the cursor in one owned atomic commit",
+        vec![crate::drm::atomic::AtomicCommitKind::SceneWithCursor],
+        "the frame and cursor attach share one accepted atomic request",
     );
-    let show = &after_show[1];
+    let show = &after_show[0];
     assert!(
         show.flags
             .contains(::drm::control::AtomicCommitFlags::NONBLOCK)
@@ -2869,6 +2865,7 @@ fn atomic_cursor_only_atomic_binding_has_full_geometry_and_retirement() {
             .sprite_user_count(binding.lease),
         Some(1)
     );
+    fixture.retire_output(0, 1);
 
     Backend::warp_pointer_root(&mut fixture.backend, &mut fixture.state, 180, 140);
     let latest = fixture
@@ -2881,7 +2878,7 @@ fn atomic_cursor_only_atomic_binding_has_full_geometry_and_retirement() {
         "Backend motion must retain one cursor intent"
     );
     Backend::maybe_composite(&mut fixture.backend)
-        .expect("defer cursor-only motion until show retires");
+        .expect("submit cursor-only motion after the frame retires");
     assert_eq!(
         recorders.atomic.records().len(),
         2,
@@ -2889,18 +2886,12 @@ fn atomic_cursor_only_atomic_binding_has_full_geometry_and_retirement() {
     );
     fixture.retire_output(0, 2);
     let after_motion_retire = recorders.atomic.records();
-    assert_eq!(after_motion_retire.len(), 3);
+    assert_eq!(after_motion_retire.len(), 2);
     assert_eq!(
-        after_motion_retire[2].kind,
+        after_motion_retire[1].kind,
         crate::drm::atomic::AtomicCommitKind::CursorOnly
     );
     assert!(fixture.backend.platform.cursor_plane_visible_for_output(0));
-    assert!(
-        fixture
-            .backend
-            .platform
-            .for_tests_atomic_cursor_commit_is_in_flight(latest[0].device_key, latest[0].crtc,)
-    );
     assert_eq!(
         fixture
             .backend
@@ -2914,8 +2905,6 @@ fn atomic_cursor_only_atomic_binding_has_full_geometry_and_retirement() {
             .sprite_user_count(binding.lease),
         Some(1)
     );
-    fixture.retire_output(0, 3);
-
     let after_motion = recorders.atomic.records();
     assert_eq!(
         after_motion
@@ -2923,11 +2912,10 @@ fn atomic_cursor_only_atomic_binding_has_full_geometry_and_retirement() {
             .map(|record| record.kind)
             .collect::<Vec<_>>(),
         vec![
-            crate::drm::atomic::AtomicCommitKind::Scene,
-            crate::drm::atomic::AtomicCommitKind::CursorOnly,
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
         ],
-        "accepted scene, binding, and queued motion requests must stay ordered",
+        "the accepted scene attach precedes the cursor-only motion",
     );
     assert!(
         after_motion.iter().all(|record| {
@@ -2938,13 +2926,13 @@ fn atomic_cursor_only_atomic_binding_has_full_geometry_and_retirement() {
         (latest[0].crtc_x, i64::from(latest[0].x) as u64),
         (latest[0].crtc_y, i64::from(latest[0].y) as u64),
     ] {
-        assert!(after_motion[2].properties.iter().any(|update| {
+        assert!(after_motion[1].properties.iter().any(|update| {
             update.object == latest[0].plane.into()
                 && update.property == property
                 && update.value == value
         }));
     }
-    assert_eq!(after_motion[2].events.len(), 1);
+    assert_eq!(after_motion[1].events.len(), 1);
     assert_eq!(
         fixture
             .backend
@@ -2965,7 +2953,10 @@ fn atomic_cursor_only_atomic_binding_has_full_geometry_and_retirement() {
     let hide = before_hide_retire
         .last()
         .expect("hide submits atomic cursor state");
-    assert_eq!(hide.kind, crate::drm::atomic::AtomicCommitKind::CursorOnly);
+    assert_eq!(
+        hide.kind,
+        crate::drm::atomic::AtomicCommitKind::SceneWithCursor
+    );
     assert_eq!(hide.events.len(), 1);
     for property in [properties.fb_id, properties.crtc_id] {
         assert!(
@@ -3011,12 +3002,11 @@ fn atomic_cursor_only_atomic_binding_has_full_geometry_and_retirement() {
             .map(|record| record.kind)
             .collect::<Vec<_>>(),
         vec![
-            crate::drm::atomic::AtomicCommitKind::Scene,
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
-            crate::drm::atomic::AtomicCommitKind::CursorOnly,
-            crate::drm::atomic::AtomicCommitKind::CursorOnly,
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
         ],
-        "the accepted commit sequence is show, motion, hide",
+        "the accepted sequence is attach with frame, motion, detach with frame",
     );
     assert!(recorders.legacy_cursor.records().is_empty());
 

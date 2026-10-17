@@ -1062,6 +1062,8 @@ impl Platform for SurfacePlatform {
         Ok(())
     }
 
+    fn note_cursor_pointer(_b: &mut XBackend<Self>, _pos: (i32, i32)) {}
+
     /// The window system moves its cursor itself: nothing to compose.
     fn move_hw_cursor(
         _b: &mut XBackend<Self>,

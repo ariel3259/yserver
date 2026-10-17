@@ -458,6 +458,10 @@ pub struct PlatformBackend {
     pub(crate) active_cursor_crtcs: HashSet<CrtcKey>,
     pub(crate) fb_w: u16,
     pub(crate) fb_h: u16,
+    /// Latest authoritative root pointer position. Scene-owned HW bindings
+    /// sample this when their atomic request is prepared, even if the cursor
+    /// was software or hidden while the pointer moved.
+    pub(crate) cursor_pointer_root: (i32, i32),
     /// Non-identity current CRTC transforms (RANDR `SetCrtcTransform`),
     /// client-owned like the logical screen size, so keyed by output and
     /// kept across the `outputs` rebuilds of a topology change.

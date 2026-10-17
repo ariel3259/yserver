@@ -152,8 +152,15 @@ impl Platform for PlatformBackend {
     fn hide_cursor_under_direct_scanout(b: &mut KmsBackend) {
         b.pstate.deferred_direct_cursor = None;
         let direct_scanout = b.pstate.scanout_m2.active();
+        if !direct_scanout {
+            // A composed shared frame owns the hide together with the
+            // cursorless primary. Detaching here would split HW→Hidden into
+            // a cursor-only transaction and leave frame ownership ambiguous.
+            b.scene.wake_for_damage();
+            return;
+        }
         if !b.platform.any_cursor_plane_visible() {
-            if direct_scanout && !b.sync_direct_cursor_scene_state() {
+            if !b.sync_direct_cursor_scene_state() {
                 b.request_direct_unflip("cursor_scene_sync_failed");
             }
             return;
@@ -170,14 +177,11 @@ impl Platform for PlatformBackend {
                 failed = true;
             }
         }
-        if direct_scanout && failed {
+        if failed {
             b.request_direct_unflip("cursor_hide_failed");
         }
-        if direct_scanout && !b.sync_direct_cursor_scene_state() {
+        if !b.sync_direct_cursor_scene_state() {
             b.request_direct_unflip("cursor_scene_sync_failed");
-        }
-        if !direct_scanout {
-            b.scene.wake_for_damage();
         }
     }
 
@@ -188,6 +192,10 @@ impl Platform for PlatformBackend {
     fn note_cursor_sprite(b: &mut KmsBackend, width: u16, height: u16, hot_x: u16, hot_y: u16) {
         b.platform
             .cursor_plane_note_sprite_hotspot(width, height, hot_x, hot_y);
+    }
+
+    fn note_cursor_pointer(b: &mut KmsBackend, pos: (i32, i32)) {
+        b.platform.cursor_pointer_root = pos;
     }
 
     fn move_hw_cursor(

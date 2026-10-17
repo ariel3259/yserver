@@ -1,7 +1,7 @@
 //! Per-frame cursor metadata retained across shared and copied scanout submits.
 
 use crate::kms::render::{
-    platform::{PlatformBackend, cursor_state::PreparedCursorCommit},
+    platform::{PlatformBackend, cursor_state::CursorPlaneUpdate},
     scene::{
         CursorAcceptedMode, CursorCommitReceipt, CursorFrameId, CursorFramePlan,
         CursorPrimaryContent,
@@ -9,7 +9,13 @@ use crate::kms::render::{
 };
 use std::io;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CursorCommitOwner {
+    Scene(CursorFrameId),
+}
+
 pub(crate) struct StagedCursorFrame {
+    pub(crate) owner: CursorCommitOwner,
     pub(crate) plan: CursorFramePlan,
     pub(crate) primary_cursor: Option<CursorPrimaryContent>,
 }
@@ -29,6 +35,7 @@ pub(crate) fn stage_cursor_frame(
     platform.staged_cursor_frames.insert(
         key,
         StagedCursorFrame {
+            owner: CursorCommitOwner::Scene(plan.frame),
             plan,
             primary_cursor: None,
         },
@@ -57,17 +64,28 @@ pub(crate) fn prepare_frame_cursor_commit(
     output_idx: usize,
     bo_idx: usize,
     frame: CursorFrameId,
-) -> io::Result<Option<PreparedCursorCommit>> {
-    let staged = platform
+) -> io::Result<Vec<CursorPlaneUpdate>> {
+    let (owner, assignment, sprite) = platform
         .staged_cursor_frames
         .get(&(output_idx, bo_idx))
+        .map(|staged| {
+            (
+                staged.owner,
+                staged.plan.assignment,
+                staged.plan.sprite.clone(),
+            )
+        })
         .ok_or_else(|| io::Error::other("cursor frame plan was not staged"))?;
-    if staged.plan.frame != frame {
+    if owner != CursorCommitOwner::Scene(frame) {
         return Err(io::Error::other("cursor frame plan identity mismatch"));
     }
-    // B1 carries the plan through the existing conservative scene adapter.
-    // Scene-owned cursor deltas are introduced in B2/B3.
-    Ok(None)
+    let updates = platform
+        .prepare_scene_cursor_frame_update(output_idx, assignment, sprite.as_ref())?
+        .into_iter()
+        .collect::<Vec<_>>();
+    // Scene plans stay in this slot-keyed table. The cursor-only scheduler
+    // reads `CursorCrtcState.intent` and never consults staged frame owners.
+    Ok(updates)
 }
 
 pub(crate) fn record_primary_cursor(
@@ -98,7 +116,7 @@ pub(crate) fn accept_cursor_frame(
 ) -> CursorCommitReceipt {
     let staged = platform.staged_cursor_frames.remove(&(output_idx, bo_idx));
     debug_assert!(staged.as_ref().is_some_and(|staged| {
-        staged.plan.frame == frame
+        staged.owner == CursorCommitOwner::Scene(frame)
             && staged
                 .primary_cursor
                 .is_none_or(|recorded| recorded == primary_cursor)

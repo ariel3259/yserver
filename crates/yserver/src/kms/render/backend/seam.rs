@@ -111,6 +111,10 @@ pub trait Platform: OutputSink + Sized + 'static {
         _hot_y: u16,
     ) {
     }
+    /// Record the final, confined root pointer position without causing
+    /// cursor attachment or scene damage. KMS samples it when building a
+    /// frame-owned HW cursor delta; host-window platforms need no cache.
+    fn note_cursor_pointer(_b: &mut XBackend<Self>, _pos: (i32, i32)) {}
     /// `XWarpPointer` moved the X pointer to root `(x, y)`; a windowed
     /// platform moves the host pointer to match.
     fn host_pointer_warped(_b: &mut XBackend<Self>, _x: i32, _y: i32) {}

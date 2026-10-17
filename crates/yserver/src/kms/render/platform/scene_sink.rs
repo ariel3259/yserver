@@ -165,18 +165,20 @@ impl OutputSink for PlatformBackend {
         {
             return FinishOutcome::Unavailable(FrameTargetError::NoDevice(error));
         }
-        if let Err(error) =
-            super::cursor_frames::prepare_frame_cursor_commit(self, output_idx, bo_idx, frame)
-        {
-            super::cursor_frames::cancel_cursor_frame(self, output_idx, bo_idx, frame);
-            return FinishOutcome::Unavailable(FrameTargetError::NoDevice(error));
-        }
         // Async requests are cursorless by construction. Do not prepare or
         // reserve a cursor delta that an Async EINVAL fallback could later
         // accidentally settle as accepted.
-        let cursor_updates = if shared_route && timing == crate::drm::async_flip::FlipTiming::Vsync
-        {
-            self.cursor_plane_updates_for_primary_outputs(&[output_idx])
+        let scene_cursor_owner =
+            shared_route && timing == crate::drm::async_flip::FlipTiming::Vsync;
+        let cursor_updates = if scene_cursor_owner {
+            match super::cursor_frames::prepare_frame_cursor_commit(self, output_idx, bo_idx, frame)
+            {
+                Ok(updates) => updates,
+                Err(error) => {
+                    super::cursor_frames::cancel_cursor_frame(self, output_idx, bo_idx, frame);
+                    return FinishOutcome::Unavailable(FrameTargetError::NoDevice(error));
+                }
+            }
         } else {
             Vec::new()
         };
@@ -196,7 +198,7 @@ impl OutputSink for PlatformBackend {
             .expect("scanout pool was checked before cursor reservation");
         let output = &self.outputs[output_idx].output;
         let mut shared_cursor_commit_submitted = false;
-        let mut cursor_rejection_error: Option<io::Error> = None;
+        let mut cursor_rejected = false;
         let mut async_outcome = None;
         let mut outcome = match pool {
             OutputScanout::Shared(pool) => {
@@ -217,13 +219,8 @@ impl OutputSink for PlatformBackend {
                     timing,
                     tearing_context,
                 );
-                if let Err(error) = &submitted
-                    && atomic_commit_sink.take_last_cursor_rejection()
-                {
-                    cursor_rejection_error = Some(match error {
-                        PresentError::Io(error) => io::Error::new(error.kind(), error.to_string()),
-                        error => io::Error::other(error.to_string()),
-                    });
+                if submitted.is_err() && atomic_commit_sink.take_last_cursor_rejection() {
+                    cursor_rejected = true;
                 }
                 if let Ok((_, result)) = &submitted {
                     async_outcome = Some(*result);
@@ -287,9 +284,14 @@ impl OutputSink for PlatformBackend {
                 self.tearing_copy_received_monotonic = None;
             }
         }
-        if let Some(error) = cursor_rejection_error {
-            let rejected = self.reject_atomic_cursor_commit(&cursor_updates, &error);
-            self.defer_cursor_move_outcome(rejected);
+        if cursor_rejected {
+            // A scene-owned cursor rejection abandons this frame with its old
+            // primary and actual binding intact. Recovery may recompose; no
+            // cursor-only intent is published from the rejected frame plan.
+            self.reject_cursor_plane_update_reservations(&cursor_updates);
+        } else if shared_cursor_commit_submitted && scene_cursor_owner {
+            self.cursor_plane_scene_frame_submitted(output_idx, &cursor_updates)
+                .expect("accepted shared scene frame keeps its reserved cursor leases");
         } else if shared_cursor_commit_submitted {
             self.cursor_plane_scene_commit_submitted(&cursor_updates)
                 .expect("accepted shared scene commit keeps its reserved cursor leases");

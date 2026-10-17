@@ -185,6 +185,7 @@ impl KmsBackend {
             export_holders: Default::default(),
         };
         let mut b = Self::assemble(core, platform, engine, scene, pstate, kms_outputs_active);
+        b.platform.cursor_pointer_root = (init_cx, init_cy);
         // Validate every route already committed during platform bring-up,
         // then apply Xorg's one-shot AutoBindGPU-shaped startup policy: every
         // opened KMS endpoint distinct from the selected renderer becomes an

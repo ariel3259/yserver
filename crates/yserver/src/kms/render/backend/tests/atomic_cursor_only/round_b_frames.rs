@@ -467,6 +467,460 @@ fn atomic_cursor_only_frame_receipts_name_the_accepted_frame() {
     assert_eq!(ledger.end_state(), (0, 0, 0));
 }
 
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: retain the two-phase cursorless HW→SW frame; the SW-primary plus detach assertion fails.
+// Mutation: apply the requested mode before frame acceptance; the pre-accept mode assertion fails.
+fn atomic_cursor_only_shared_transition_is_one_primary_commit() {
+    use crate::kms::render::scene::{CursorAcceptedMode, CursorPlaneMode, CursorPrimaryContent};
+    use yserver_core::backend::Backend;
+
+    let Some(mut fixture) = AtomicCursorFixture::new().expect("build shared transition fixture")
+    else {
+        return;
+    };
+    fixture
+        .backend
+        .platform
+        .for_tests_accept_output_power_commits();
+    let root = fixture.backend.core.window_id;
+    let oversized = create_oversized_cursor(&mut fixture, (2, 3));
+    Backend::define_cursor(&mut fixture.backend, None, root, oversized)
+        .expect("establish software mode through Backend");
+    Backend::warp_pointer_root(&mut fixture.backend, &mut fixture.state, 100, 90);
+    super::round_a::damage_cursor_root(&mut fixture);
+    Backend::maybe_composite(&mut fixture.backend).expect("accept initial software frame");
+    let software = fixture
+        .backend
+        .scene
+        .for_tests_cursor_commit_receipt(0)
+        .expect("software frame receipt");
+    assert_eq!(software.mode, CursorAcceptedMode::Software);
+    assert!(matches!(
+        software.primary_cursor,
+        CursorPrimaryContent::Software { .. }
+    ));
+    assert_eq!(fixture.backend.scene.cursor_mode(), CursorPlaneMode::Sw);
+    assert_eq!(
+        fixture.recorders.atomic.records()[0].kind,
+        crate::drm::atomic::AtomicCommitKind::SceneWithCursor
+    );
+    fixture.retire_output(0, 1);
+    assert_eq!(fixture.backend.scene.cursor_mode(), CursorPlaneMode::Sw);
+
+    // Software → hardware: the cursorless primary and attach share one
+    // accepted request. The scene receipt remains frame-scoped.
+    fixture.define_visible_cursor();
+    super::round_a::damage_cursor_root(&mut fixture);
+    assert_eq!(fixture.backend.scene.cursor_mode(), CursorPlaneMode::Sw);
+    Backend::maybe_composite(&mut fixture.backend).expect("accept shared SW→HW frame");
+    let hardware = fixture
+        .backend
+        .scene
+        .for_tests_cursor_commit_receipt(0)
+        .expect("accepted hardware frame receipt");
+    assert_eq!(hardware.mode, CursorAcceptedMode::Hardware);
+    assert_eq!(hardware.primary_cursor, CursorPrimaryContent::Cursorless);
+    assert_eq!(fixture.backend.scene.cursor_mode(), CursorPlaneMode::Mixed);
+    assert_eq!(
+        fixture.recorders.atomic.records()[1].kind,
+        crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+        "the cursor attach rides the primary frame",
+    );
+    assert_eq!(fixture.recorders.atomic.records()[1].events.len(), 1);
+    assert!(fixture.backend.platform.cursor_plane_visible_for_output(0));
+    fixture.retire_output(0, 2);
+    assert_eq!(fixture.backend.scene.cursor_mode(), CursorPlaneMode::Hw);
+
+    // Hardware → software: the accepted primary contains SW pixels while
+    // the same request detaches the old HW binding.
+    let software_again = create_oversized_cursor(&mut fixture, (3, 4));
+    Backend::define_cursor(&mut fixture.backend, None, root, software_again)
+        .expect("request software mode through Backend");
+    super::round_a::damage_cursor_root(&mut fixture);
+    assert_eq!(
+        fixture.backend.scene.for_tests_cursor_commit_receipt(0),
+        Some(hardware),
+        "the last accepted output mode remains HW until the shared frame is accepted",
+    );
+    assert!(fixture.backend.platform.cursor_plane_visible_for_output(0));
+    Backend::maybe_composite(&mut fixture.backend).expect("accept shared HW→SW frame");
+    let software_again_receipt = fixture
+        .backend
+        .scene
+        .for_tests_cursor_commit_receipt(0)
+        .expect("accepted software handoff receipt");
+    assert_eq!(software_again_receipt.mode, CursorAcceptedMode::Software);
+    assert_eq!(fixture.backend.scene.cursor_mode(), CursorPlaneMode::Mixed);
+    assert!(matches!(
+        software_again_receipt.primary_cursor,
+        CursorPrimaryContent::Software { .. }
+    ));
+    assert_eq!(fixture.backend.scene.cursor_mode(), CursorPlaneMode::Mixed);
+    assert_eq!(
+        fixture.recorders.atomic.records()[2].kind,
+        crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+        "the SW pixels and plane detach share one accepted request",
+    );
+    let output = &fixture.backend.platform.outputs[0];
+    let crtc = output.output.crtc;
+    let device = fixture
+        .backend
+        .platform
+        .device_for_key(output.key.device_key)
+        .expect("transition output device");
+    let plane_properties = device
+        .cursor
+        .plane
+        .as_ref()
+        .and_then(|plane| plane.properties_for(crtc))
+        .expect("eligible cursor properties");
+    let handoff = &fixture.recorders.atomic.records()[2];
+    for property in [plane_properties.fb_id, plane_properties.crtc_id] {
+        assert!(handoff.properties.iter().any(|update| {
+            update.object == plane_properties.plane.into()
+                && update.property == property
+                && update.value == 0
+        }));
+    }
+    assert!(
+        handoff
+            .properties
+            .iter()
+            .any(|update| update.object == output.output.plane.into()
+                && update.property == output.output.plane_fb_id_prop),
+        "the same request carries its primary framebuffer",
+    );
+    assert!(!fixture.backend.platform.cursor_plane_visible_for_output(0));
+    fixture.retire_output(0, 3);
+    assert_eq!(fixture.backend.scene.cursor_mode(), CursorPlaneMode::Sw);
+
+    Backend::set_cursor_hidden(&mut fixture.backend, true);
+    super::round_a::damage_cursor_root(&mut fixture);
+    Backend::maybe_composite(&mut fixture.backend).expect("accept hidden software frame");
+    let hidden = fixture
+        .backend
+        .scene
+        .for_tests_cursor_commit_receipt(0)
+        .expect("hidden frame receipt");
+    assert_eq!(hidden.mode, CursorAcceptedMode::Hidden);
+    assert_eq!(hidden.primary_cursor, CursorPrimaryContent::Cursorless);
+    fixture.retire_output(0, 4);
+    assert_eq!(
+        fixture
+            .recorders
+            .atomic
+            .records()
+            .iter()
+            .map(|record| record.kind)
+            .collect::<Vec<_>>(),
+        [
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            crate::drm::atomic::AtomicCommitKind::Scene,
+        ],
+        "accepted transition sequence is SW, attach, SW+detach, hidden",
+    );
+    assert!(fixture.backend.platform.staged_cursor_frames.is_empty());
+    fixture
+        .backend
+        .disable_output()
+        .expect("disable and drain through Backend");
+    fixture.assert_cursor_quiescent();
+    let ledger = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
+    drop(fixture);
+    assert_eq!(ledger.end_state(), (0, 0, 0));
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: publish the staged Hardware assignment as global cursor-only intent; the no-BO record and intent assertions fail.
+fn atomic_cursor_only_no_bo_does_not_publish_assignment() {
+    use crate::kms::render::scene::{CursorAcceptedMode, CursorPlaneMode};
+    use yserver_core::backend::Backend;
+
+    let Some(mut fixture) = AtomicCursorFixture::new().expect("build no-BO transition fixture")
+    else {
+        return;
+    };
+    fixture
+        .backend
+        .platform
+        .for_tests_accept_output_power_commits();
+    // No output frame is pending yet. Withhold the already-allocated pool as
+    // a construction-selected no-slot fixture option: Backend reaches the
+    // real acquire_scanout_bo entry and observes NoBO, without forging BO phase.
+    let scanout_pool = fixture.backend.platform.scanout_pools[0]
+        .take()
+        .expect("Vulkan fixture owns a shared scanout pool");
+    fixture.define_visible_cursor();
+    Backend::warp_pointer_root(&mut fixture.backend, &mut fixture.state, 140, 110);
+    super::round_a::damage_cursor_root(&mut fixture);
+    let receipt_before = fixture.backend.scene.for_tests_cursor_commit_receipt(0);
+    Backend::maybe_composite(&mut fixture.backend).expect("unavailable slot is a clean skip");
+    assert_eq!(
+        fixture.backend.scene.for_tests_cursor_commit_receipt(0),
+        receipt_before
+    );
+    assert_eq!(fixture.backend.scene.cursor_mode(), CursorPlaneMode::Hidden);
+    assert!(fixture.recorders.atomic.records().is_empty());
+    assert!(fixture.backend.platform.staged_cursor_frames.is_empty());
+    assert!(!fixture.backend.scene.has_pending_page_flips());
+    let (device_key, crtc) = {
+        let output = &fixture.backend.platform.outputs[0];
+        (output.key.device_key, output.output.crtc)
+    };
+    let cursor_state = fixture
+        .backend
+        .platform
+        .device_for_key(device_key)
+        .and_then(|device| device.cursor.crtc_states.get(&crtc));
+    assert!(cursor_state.is_none_or(|state| state.intent.is_none()));
+
+    // An idle scheduler pass while the real slot is unavailable must not
+    // attach the unsubmitted scene assignment through cursor-only work.
+    Backend::maybe_composite(&mut fixture.backend).expect("repeat idle no-slot pass");
+    assert!(fixture.recorders.atomic.records().is_empty());
+    assert_eq!(
+        fixture.backend.scene.for_tests_cursor_commit_receipt(0),
+        receipt_before
+    );
+
+    fixture.backend.platform.scanout_pools[0] = Some(scanout_pool);
+    Backend::maybe_composite(&mut fixture.backend).expect("available slot accepts the scene plan");
+    let accepted = fixture
+        .backend
+        .scene
+        .for_tests_cursor_commit_receipt(0)
+        .expect("available retry receipt");
+    assert_eq!(accepted.mode, CursorAcceptedMode::Hardware);
+    assert_eq!(
+        fixture.recorders.atomic.records()[0].kind,
+        crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+    );
+    fixture.retire_output(0, 1);
+    Backend::set_cursor_hidden(&mut fixture.backend, true);
+    Backend::maybe_composite(&mut fixture.backend).expect("hide accepted cursor through scene");
+    fixture.retire_output(0, 2);
+    fixture
+        .backend
+        .disable_output()
+        .expect("disable and drain through Backend");
+    fixture.assert_cursor_quiescent();
+    let ledger = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
+    drop(fixture);
+    assert_eq!(ledger.end_state(), (0, 0, 0));
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: transfer a rejected frame's Scene plan to cursor-only intent; the unchanged receipt and empty idle trace fail.
+fn atomic_cursor_only_failed_frame_cannot_be_stolen_by_cursor_only() {
+    use crate::kms::render::scene::{CursorAcceptedMode, CursorPlaneMode};
+    use yserver_core::backend::Backend;
+
+    let Some(mut fixture) = AtomicCursorFixture::new().expect("build rejected transition fixture")
+    else {
+        return;
+    };
+    fixture
+        .backend
+        .platform
+        .for_tests_accept_output_power_commits();
+    let root = fixture.backend.core.window_id;
+    let software_cursor = create_oversized_cursor(&mut fixture, (2, 3));
+    Backend::define_cursor(&mut fixture.backend, None, root, software_cursor)
+        .expect("establish software cursor through Backend");
+    Backend::warp_pointer_root(&mut fixture.backend, &mut fixture.state, 100, 90);
+    super::round_a::damage_cursor_root(&mut fixture);
+    Backend::maybe_composite(&mut fixture.backend).expect("accept software baseline");
+    let baseline = fixture
+        .backend
+        .scene
+        .for_tests_cursor_commit_receipt(0)
+        .expect("software baseline receipt");
+    assert_eq!(baseline.mode, CursorAcceptedMode::Software);
+    fixture.retire_output(0, 1);
+
+    fixture.define_visible_cursor();
+    super::round_a::damage_cursor_root(&mut fixture);
+    fixture
+        .recorders
+        .atomic
+        .script_result(Err(std::io::Error::from_raw_os_error(5)));
+    Backend::maybe_composite(&mut fixture.backend).expect("rejected handoff is recoverable");
+    assert_eq!(
+        fixture.backend.scene.for_tests_cursor_commit_receipt(0),
+        Some(baseline)
+    );
+    assert_eq!(fixture.backend.scene.cursor_mode(), CursorPlaneMode::Sw);
+    assert!(!fixture.backend.scene.has_pending_page_flip(0));
+    assert!(fixture.backend.platform.staged_cursor_frames.is_empty());
+    let output = &fixture.backend.platform.outputs[0];
+    let device = fixture
+        .backend
+        .platform
+        .device_for_key(output.key.device_key)
+        .expect("cursor output device");
+    let state = device.cursor.crtc_states.get(&output.output.crtc);
+    assert!(state.is_none_or(|state| {
+        state.applied.is_none() && state.intent.is_none() && state.in_flight.is_none()
+    }));
+
+    let records_after_reject = fixture.recorders.atomic.records().len();
+    Backend::maybe_composite(&mut fixture.backend).expect("idle scheduling before retry");
+    assert_eq!(
+        fixture.recorders.atomic.records().len(),
+        records_after_reject
+    );
+    assert_eq!(
+        fixture.backend.scene.for_tests_cursor_commit_receipt(0),
+        Some(baseline)
+    );
+    assert_eq!(fixture.backend.scene.cursor_mode(), CursorPlaneMode::Sw);
+    assert!(fixture.backend.platform.staged_cursor_frames.is_empty());
+
+    let retry_deadline = fixture
+        .backend
+        .scene
+        .earliest_retry_deadline()
+        .expect("rejected frame schedules production retry");
+    while std::time::Instant::now() < retry_deadline {
+        std::hint::spin_loop();
+    }
+    Backend::maybe_composite(&mut fixture.backend).expect("retry accepted handoff through Backend");
+    assert_eq!(
+        fixture
+            .backend
+            .scene
+            .for_tests_cursor_commit_receipt(0)
+            .expect("accepted retry receipt")
+            .mode,
+        CursorAcceptedMode::Hardware,
+    );
+    fixture.retire_output(0, 2);
+    Backend::set_cursor_hidden(&mut fixture.backend, true);
+    Backend::maybe_composite(&mut fixture.backend).expect("hide accepted retry cursor");
+    fixture.retire_output(0, 3);
+    fixture
+        .backend
+        .disable_output()
+        .expect("disable and drain through Backend");
+    fixture.assert_cursor_quiescent();
+    let ledger = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
+    drop(fixture);
+    assert_eq!(ledger.end_state(), (0, 0, 0));
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: observe pointer updates only in HW/Mixed mode; the first-attach P1 and hidden-show P2 coordinates fail.
+fn atomic_cursor_only_first_hw_attach_samples_motion_while_software() {
+    use crate::kms::render::scene::{CursorAcceptedMode, CursorPrimaryContent};
+    use yserver_core::backend::Backend;
+
+    let Some(mut fixture) = AtomicCursorFixture::new().expect("build first-attach fixture") else {
+        return;
+    };
+    fixture
+        .backend
+        .platform
+        .for_tests_accept_output_power_commits();
+    let root = fixture.backend.core.window_id;
+    let oversized = create_oversized_cursor(&mut fixture, (1, 2));
+    Backend::define_cursor(&mut fixture.backend, None, root, oversized)
+        .expect("establish software mode");
+    Backend::warp_pointer_root(&mut fixture.backend, &mut fixture.state, 90, 80);
+    super::round_a::damage_cursor_root(&mut fixture);
+    Backend::maybe_composite(&mut fixture.backend).expect("accept software baseline");
+    assert_eq!(
+        fixture
+            .backend
+            .scene
+            .for_tests_cursor_commit_receipt(0)
+            .expect("software baseline")
+            .mode,
+        CursorAcceptedMode::Software,
+    );
+    fixture.retire_output(0, 1);
+
+    Backend::warp_pointer_root(&mut fixture.backend, &mut fixture.state, 230, 170);
+    fixture.define_visible_cursor();
+    super::round_a::damage_cursor_root(&mut fixture);
+    Backend::maybe_composite(&mut fixture.backend).expect("attach first HW sprite at P1");
+    let first = fixture
+        .backend
+        .scene
+        .for_tests_cursor_commit_receipt(0)
+        .expect("first hardware attach receipt");
+    assert_eq!(first.mode, CursorAcceptedMode::Hardware);
+    assert_eq!(first.primary_cursor, CursorPrimaryContent::Cursorless);
+    assert_eq!(
+        fixture.recorders.atomic.records()[1].kind,
+        crate::drm::atomic::AtomicCommitKind::SceneWithCursor
+    );
+    let (output_x, output_y, device_key, crtc) = {
+        let output = &fixture.backend.platform.outputs[0];
+        (
+            output.x,
+            output.y,
+            output.key.device_key,
+            output.output.crtc,
+        )
+    };
+    let device = fixture
+        .backend
+        .platform
+        .device_for_key(device_key)
+        .expect("cursor output device");
+    let binding = device
+        .cursor
+        .crtc_states
+        .get(&crtc)
+        .and_then(|state| state.applied)
+        .expect("accepted attach binding");
+    assert_eq!(binding.x, 230 - output_x - i32::from(binding.hot_x));
+    assert_eq!(binding.y, 170 - output_y - i32::from(binding.hot_y));
+    fixture.retire_output(0, 2);
+
+    Backend::set_cursor_hidden(&mut fixture.backend, true);
+    Backend::maybe_composite(&mut fixture.backend).expect("detach cursor while hidden");
+    fixture.retire_output(0, 3);
+    Backend::warp_pointer_root(&mut fixture.backend, &mut fixture.state, 345, 215);
+    Backend::set_cursor_hidden(&mut fixture.backend, false);
+    super::round_a::damage_cursor_root(&mut fixture);
+    Backend::maybe_composite(&mut fixture.backend).expect("show cursor at hidden P2 motion");
+    let shown = fixture
+        .backend
+        .scene
+        .for_tests_cursor_commit_receipt(0)
+        .expect("hidden motion show receipt");
+    assert_eq!(shown.mode, CursorAcceptedMode::Hardware);
+    let binding = fixture
+        .backend
+        .platform
+        .device_for_key(device_key)
+        .and_then(|device| device.cursor.crtc_states.get(&crtc))
+        .and_then(|state| state.applied)
+        .expect("accepted reattach binding");
+    assert_eq!(binding.x, 345 - output_x - i32::from(binding.hot_x));
+    assert_eq!(binding.y, 215 - output_y - i32::from(binding.hot_y));
+    fixture.retire_output(0, 4);
+
+    Backend::set_cursor_hidden(&mut fixture.backend, true);
+    Backend::maybe_composite(&mut fixture.backend).expect("final cursor detach");
+    fixture.retire_output(0, 5);
+    fixture
+        .backend
+        .disable_output()
+        .expect("disable and drain through Backend");
+    fixture.assert_cursor_quiescent();
+    let ledger = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
+    drop(fixture);
+    assert_eq!(ledger.end_state(), (0, 0, 0));
+}
+
 fn create_oversized_cursor(fixture: &mut AtomicCursorFixture, hot: (u16, u16)) -> u32 {
     use yserver_core::backend::Backend;
 

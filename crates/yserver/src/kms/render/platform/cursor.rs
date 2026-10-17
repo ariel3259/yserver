@@ -1,9 +1,12 @@
 use crate::kms::{
     cursor_plane::CursorPlaneFactory,
-    render::platform::{
-        CrtcKey, CursorFailureDisposition, CursorMoveOutcome, KmsCursorState, KmsDevice,
-        PlatformBackend, TransientCursorFallback,
-        cursor_state::{CursorBinding, CursorIntent, CursorPlaneUpdate},
+    render::{
+        platform::{
+            CrtcKey, CursorFailureDisposition, CursorMoveOutcome, KmsCursorState, KmsDevice,
+            PlatformBackend, TransientCursorFallback,
+            cursor_state::{CursorBinding, CursorIntent, CursorPlaneUpdate},
+        },
+        scene::{CursorEntry, CursorFrameAssignment, CursorUploadOutcome},
     },
 };
 use std::{
@@ -572,6 +575,174 @@ impl PlatformBackend {
         })
     }
 
+    /// Prepare the cursor delta owned by one shared scene frame. The frame's
+    /// staged assignment is deliberately kept out of `CursorCrtcState.intent`,
+    /// which is read only by cursor-only scheduling.
+    pub(crate) fn prepare_scene_cursor_frame_update(
+        &mut self,
+        output_idx: usize,
+        assignment: CursorFrameAssignment,
+        sprite: Option<&CursorEntry>,
+    ) -> io::Result<Option<CursorPlaneUpdate>> {
+        let (device_idx, crtc, layout_x, layout_y) = self.cursor_output_route(output_idx)?;
+        if !self.cursor_output_is_active(output_idx) {
+            return Err(io::Error::other("scene cursor output is not active"));
+        }
+
+        let next = match assignment {
+            CursorFrameAssignment::Hardware => {
+                let sprite = sprite.ok_or_else(|| {
+                    io::Error::other("hardware cursor frame has no staged sprite")
+                })?;
+                if !self.cursor_plane_available_for_output(output_idx)
+                    || !self.cursor_plane_fits_for_output(
+                        output_idx,
+                        sprite.extent.width,
+                        sprite.extent.height,
+                    )
+                {
+                    return Err(io::Error::other(
+                        "scene selected an unavailable hardware cursor plane",
+                    ));
+                }
+                let bytes = sprite
+                    .bgra_bytes
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("hardware cursor frame has no pixel data"))?;
+                if !self.cursor_plane_uploaded_image_matches_for_output(
+                    output_idx,
+                    sprite.record_version,
+                    u16::try_from(sprite.hot_x).unwrap_or(u16::MAX),
+                    u16::try_from(sprite.hot_y).unwrap_or(u16::MAX),
+                ) {
+                    match self.cursor_plane_upload_frame_image_for_output(
+                        output_idx,
+                        sprite.record_version,
+                        u16::try_from(sprite.hot_x).unwrap_or(u16::MAX),
+                        u16::try_from(sprite.hot_y).unwrap_or(u16::MAX),
+                        sprite.extent.width,
+                        sprite.extent.height,
+                        bytes.as_ref(),
+                    )? {
+                        CursorUploadOutcome::Ready => {}
+                        CursorUploadOutcome::Deferred => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::WouldBlock,
+                                "scene cursor sprite buffer is still in use",
+                            ));
+                        }
+                    }
+                }
+                let device = &self.devices[device_idx];
+                let plane = device
+                    .cursor
+                    .plane
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("scene cursor plane disappeared"))?;
+                let (lease, framebuffer) = plane
+                    .candidate_sprite()
+                    .ok_or_else(|| io::Error::other("scene cursor upload has no framebuffer"))?;
+                let properties = plane
+                    .properties_for(crtc)
+                    .ok_or_else(|| io::Error::other("scene cursor properties disappeared"))?;
+                let pointer = self.cursor_pointer_root;
+                let (x, y) = super::cursor::cursor_root_to_crtc_local(
+                    pointer.0,
+                    pointer.1,
+                    layout_x,
+                    layout_y,
+                    u16::try_from(sprite.hot_x).unwrap_or(u16::MAX),
+                    u16::try_from(sprite.hot_y).unwrap_or(u16::MAX),
+                );
+                Some(CursorBinding {
+                    properties,
+                    lease,
+                    framebuffer,
+                    x,
+                    y,
+                    hot_x: u16::try_from(sprite.hot_x).unwrap_or(u16::MAX),
+                    hot_y: u16::try_from(sprite.hot_y).unwrap_or(u16::MAX),
+                })
+            }
+            CursorFrameAssignment::Software { .. } | CursorFrameAssignment::Hidden => None,
+        };
+
+        let device = &self.devices[device_idx];
+        let state = device.cursor.crtc_states.get(&crtc);
+        if state.is_some_and(|state| state.in_flight.is_some()) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "scene cursor frame waits for the prior cursor event",
+            ));
+        }
+        let prior = state.and_then(|state| state.applied);
+        let valid = state.is_some_and(|state| state.valid);
+        let properties = next
+            .map(|binding| binding.properties)
+            .or_else(|| {
+                device
+                    .cursor
+                    .plane
+                    .as_ref()
+                    .and_then(|plane| plane.properties_for(crtc))
+            })
+            .or_else(|| prior.map(|binding| binding.properties));
+        let Some(properties) = properties else {
+            // There is no cursor plane to detach on a software/hidden frame.
+            return Ok(None);
+        };
+        let (width, height) = device
+            .cursor
+            .plane
+            .as_ref()
+            .map_or((0, 0), |plane| (plane.width(), plane.height()));
+        let prepared = super::cursor_commit::prepare_cursor_commit(
+            properties, crtc, prior, valid, next, width, height,
+        );
+        if prepared.updates.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(CursorPlaneUpdate {
+            device_key: self.devices[device_idx].key,
+            crtc,
+            motion_timestamp: state.and_then(|state| state.intent_motion_timestamp),
+            prepared,
+        }))
+    }
+
+    /// Upload a frame-owned sprite candidate without changing any ordinary
+    /// cursor-only intent. The candidate becomes applied only with the scene
+    /// frame's atomic commit.
+    fn cursor_plane_upload_frame_image_for_output(
+        &mut self,
+        output_idx: usize,
+        version: u64,
+        hot_x: u16,
+        hot_y: u16,
+        width: u32,
+        height: u32,
+        bgra_bytes: &[u8],
+    ) -> io::Result<CursorUploadOutcome> {
+        let (device_idx, crtc, _, _) = self.cursor_output_route(output_idx)?;
+        let state = &mut self.devices[device_idx].cursor;
+        if !state.available_on(crtc) {
+            return Err(io::Error::other("cursor plane unavailable for scene frame"));
+        }
+        let result = state
+            .plane
+            .as_mut()
+            .expect("available scene cursor state has a plane")
+            .upload_image(version, hot_x, hot_y, width, height, bgra_bytes);
+        if let Err(error) = &result {
+            let failure = error.raw_os_error().map_or_else(
+                || io::Error::new(error.kind(), error.to_string()),
+                io::Error::from_raw_os_error,
+            );
+            apply_cursor_operation_result(state, crtc, &Err(failure));
+        }
+        result
+    }
+
     /// Prepare full-state deltas for one or more producer-owned commits. An
     /// intent equal to accepted state is consumed without producing a DRM
     /// request, so idle scheduling stays quiescent after coalesced motion.
@@ -1130,6 +1301,34 @@ impl PlatformBackend {
         updates: &[CursorPlaneUpdate],
     ) -> io::Result<()> {
         self.accept_cursor_plane_updates(updates)
+    }
+
+    /// Settle the scene frame's cursor deltas and discard older cursor-only
+    /// intent for that CRTC. The frame plan is authoritative for this submit;
+    /// it is never inserted into the intent consumed by idle cursor-only work.
+    pub(crate) fn cursor_plane_scene_frame_submitted(
+        &mut self,
+        output_idx: usize,
+        updates: &[CursorPlaneUpdate],
+    ) -> io::Result<()> {
+        self.accept_cursor_plane_updates(updates)?;
+        let Some((device_key, crtc)) = self
+            .outputs
+            .get(output_idx)
+            .map(|layout| (layout.key.device_key, layout.output.crtc))
+        else {
+            return Ok(());
+        };
+        if let Some(device) = self
+            .devices
+            .iter_mut()
+            .find(|device| device.key == device_key)
+            && let Some(state) = device.cursor.crtc_states.get_mut(&crtc)
+        {
+            state.intent = None;
+            state.intent_motion_timestamp = None;
+        }
+        Ok(())
     }
 
     /// Construct a cursor position record for legacy tests without issuing a

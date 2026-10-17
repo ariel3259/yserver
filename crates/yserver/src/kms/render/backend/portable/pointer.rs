@@ -601,6 +601,8 @@ impl<P: Platform> XBackend<P> {
             (self.core.cursor_x, self.core.cursor_y),
             (root_x, root_y),
         );
+        #[allow(clippy::cast_possible_truncation)]
+        P::note_cursor_pointer(self, (new_x as i32, new_y as i32));
         if new_x != self.core.cursor_x || new_y != self.core.cursor_y {
             self.core.cursor_x = new_x;
             self.core.cursor_y = new_y;

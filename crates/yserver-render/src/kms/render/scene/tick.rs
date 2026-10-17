@@ -4,9 +4,10 @@ use crate::kms::{
         scene::{
             CarriedDamage, ComposeRenderTarget, CursorAssignment, CursorFrameAssignment,
             CursorFramePlan, CursorPrimaryContent, CursorTransition, FailedSubmitBo, FinishOutcome,
-            FrameHandoff, FullReason, InFlightStage, OutputRoute, OutputSceneState, OutputSink,
-            OutputWalkReport, PendingAck, Repaint, RepaintPlan, ScalePass, SceneCompositor,
-            SceneCompositorInner, SceneError, SceneInput, TickOutcome, TickSkipReason, Visibility,
+            FrameHandoff, FullReason, InFlightStage, OutputCursorMode, OutputRoute,
+            OutputSceneState, OutputSink, OutputWalkReport, PendingAck, Repaint, RepaintPlan,
+            ScalePass, SceneCompositor, SceneCompositorInner, SceneError, SceneInput, TickOutcome,
+            TickSkipReason, Visibility,
             build::build_scene_with,
             compose::{
                 compose_submit_was_complete, present_error_is_device_lost,
@@ -14,7 +15,8 @@ use crate::kms::{
             },
             cursor::{
                 cursor_damage_for_frame, cursorless_hide_frame_required, derive_cursor_transition,
-                effective_cursor_prev_mode, hw_cursor_allowed, note_cursor_commit_accepted_inner,
+                effective_cursor_prev_mode, force_cursor_retry_repaint, hw_cursor_allowed,
+                note_cursor_commit_accepted_inner,
             },
             damage::{clip_rect_to_output_extent, fan_out_carried_damage},
             damage_audit::{
@@ -718,7 +720,8 @@ fn tick_one_output(
         sink.cursor_plane().visible(output_idx),
         built.cursor_assignment,
     );
-    if cursorless_hide_frame_required(prev_mode, built.cursor_assignment) {
+    let shared_output = sink.route(output_idx) == OutputRoute::Shared;
+    if !shared_output && cursorless_hide_frame_required(prev_mode, built.cursor_assignment) {
         // Two-phase Hw→Sw/Hidden handoff: the frame retired immediately
         // before hide must contain no software cursor. If the hide ioctl
         // fails, the old HW sprite remains the sole visible cursor; if it
@@ -737,12 +740,31 @@ fn tick_one_output(
     drawn.extend(built.presented_ids.iter().copied());
     had_pieces.extend(built.pieces_ids.iter().copied());
 
-    // Stage 5 Phase D — derive the per-output cursor transition
-    // and new prev_pos from `built.cursor_assignment` and the
-    // last-frame mode. Both are queued on the PendingAck below
-    // and applied transactionally on successful retirement.
-    let (mut cursor_transition_to_queue, cursor_prev_pos_after_retire, cursor_mode_after_retire) =
-        derive_cursor_transition(prev_mode, built.cursor_assignment);
+    // Retain the transition marker through retirement for C1's safety gate.
+    // Shared frames already carry their atomic cursor transition, so their
+    // primary pixels, mode and software footprint all settle with this one
+    // frame. Copied routes keep the conservative retirement adapter.
+    let (
+        mut cursor_transition_to_queue,
+        mut cursor_prev_pos_after_retire,
+        mut cursor_mode_after_retire,
+    ) = derive_cursor_transition(prev_mode, built.cursor_assignment);
+    if shared_output {
+        match built.cursor_assignment {
+            CursorAssignment::Hw { .. } => {
+                cursor_prev_pos_after_retire = Some(None);
+                cursor_mode_after_retire = OutputCursorMode::Hw;
+            }
+            CursorAssignment::Sw { pos } => {
+                cursor_prev_pos_after_retire = Some(Some(pos));
+                cursor_mode_after_retire = OutputCursorMode::Sw { prev: Some(pos) };
+            }
+            CursorAssignment::Hidden => {
+                cursor_prev_pos_after_retire = Some(None);
+                cursor_mode_after_retire = OutputCursorMode::Hidden;
+            }
+        }
+    }
     if inner.outputs[output_idx].force_show_retry_version.is_some()
         && let CursorAssignment::Hw {
             x,
@@ -966,7 +988,6 @@ fn tick_one_output(
     // Shared outputs only: a copied (reverse-PRIME) output renders
     // `Repaint::Full` unconditionally and never consults this state, so it must
     // not accumulate any either.
-    let shared_output = sink.route(output_idx) == OutputRoute::Shared;
     // A transformed frame repaints the whole BO, so its damage (in
     // intermediate pixels) never enters the per-BO model.
     if shared_output && transform.is_none() {
@@ -1299,7 +1320,17 @@ fn tick_one_output(
     let mut accepted_cursor_receipt = None;
     let (render_result, previous_gpu_ns, copied_prepare_failed) =
         match sink.finish_frame(output_idx, token.bo_idx, cursor_frame.clone(), &mut record) {
-            FinishOutcome::Unavailable(error) => return Err(error.into()),
+            FinishOutcome::Unavailable(error) => {
+                // `finish_frame` may reject a scene-owned cursor plan before
+                // it invokes the render callback. Return the acquired scanout
+                // slot as well as the staged frame so a later Backend pass
+                // can retry the still-damaged scene.
+                sink.cancel_slot(output_idx, token.bo_idx);
+                force_cursor_retry_repaint(
+                    inner.outputs.get_mut(output_idx).expect("checked output"),
+                );
+                return Err(error.into());
+            }
             FinishOutcome::Finished {
                 result,
                 previous_gpu_ns,

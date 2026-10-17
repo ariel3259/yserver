@@ -311,7 +311,22 @@ pub(super) fn note_cursor_commit_accepted_inner(
     let Some(output) = inner.outputs.get_mut(output_idx) else {
         return;
     };
+    output.last_frame_cursor_mode = output_cursor_mode_from_receipt(receipt);
     output.cursor_commit_receipt = Some(receipt);
+}
+
+pub(super) fn output_cursor_mode_from_receipt(receipt: CursorCommitReceipt) -> OutputCursorMode {
+    match receipt.mode {
+        crate::kms::render::scene::CursorAcceptedMode::Hardware => OutputCursorMode::Hw,
+        crate::kms::render::scene::CursorAcceptedMode::Software => {
+            let prev = match receipt.primary_cursor {
+                crate::kms::render::scene::CursorPrimaryContent::Software { pos, .. } => Some(pos),
+                crate::kms::render::scene::CursorPrimaryContent::Cursorless => None,
+            };
+            OutputCursorMode::Sw { prev }
+        }
+        crate::kms::render::scene::CursorAcceptedMode::Hidden => OutputCursorMode::Hidden,
+    }
 }
 
 // ────────────────────────────────────────────────────────────────
