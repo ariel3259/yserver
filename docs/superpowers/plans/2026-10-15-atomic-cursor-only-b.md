@@ -41,6 +41,7 @@
 4. An output gap or unequal output heights changes footprint membership: attach/detach current HW peers and repaint only required SW peers; B6 tests this.
 5. Window entry changes sprite, then motion arrives both before submission and before retirement: the complete operation trace must never restore the old position; B7 tests this.
 
+- **Controller rulings carried from sub-plan A (2026-10-17).** A1 was narrowed: there is no `ScanoutSlotAllocator` and no full discovery/GBM/PRIME injection. Where a step says "A1's `ScanoutSlotAllocator`", produce no-slot through the real path — withhold that output's recorded page-flip events (the A1 per-device flip-event fixture) so its scanout BOs stay busy — or, only if unreachable, a construction-selected fixture option configured before the scenario (A7 precedent). Modesets go through Backend RandR with the injected property/blob services from A8. Real mode-blob growth, the re-exec qualification worker and hotplug rediscovery stay in C11. Never write backend state mid-scenario (`for_tests_*` setters are construction-time only).
 ---
 
 ## Production-path evidence
