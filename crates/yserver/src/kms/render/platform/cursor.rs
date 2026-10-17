@@ -1085,33 +1085,43 @@ impl PlatformBackend {
         &mut self,
         updates: &[CursorPlaneUpdate],
     ) -> io::Result<()> {
+        self.accept_cursor_plane_updates_with_validation(updates, true)
+    }
+
+    fn accept_cursor_plane_updates_with_validation(
+        &mut self,
+        updates: &[CursorPlaneUpdate],
+        validate_reservations: bool,
+    ) -> io::Result<()> {
         // Validate the complete transaction before transferring any lease.
         // A successful ioctl has already changed kernel state, so partial
         // acceptance would leave userspace unable to describe ownership.
-        for update in updates {
-            let Some(device) = self
-                .devices
-                .iter()
-                .find(|device| device.key == update.device_key)
-            else {
-                return Err(io::Error::other(
-                    "accepted cursor update device disappeared",
-                ));
-            };
-            if let Some(next) = update.prepared.next.filter(|next| {
-                update
-                    .prepared
-                    .prior
-                    .is_none_or(|prior| prior.lease != next.lease)
-            }) && !device
-                .cursor
-                .plane
-                .as_ref()
-                .is_some_and(|plane| plane.can_accept_reserved_sprite(next.lease))
-            {
-                return Err(io::Error::other(
-                    "accepted cursor commit lost its reserved framebuffer lease",
-                ));
+        if validate_reservations {
+            for update in updates {
+                let Some(device) = self
+                    .devices
+                    .iter()
+                    .find(|device| device.key == update.device_key)
+                else {
+                    return Err(io::Error::other(
+                        "accepted cursor update device disappeared",
+                    ));
+                };
+                if let Some(next) = update.prepared.next.filter(|next| {
+                    update
+                        .prepared
+                        .prior
+                        .is_none_or(|prior| prior.lease != next.lease)
+                }) && !device
+                    .cursor
+                    .plane
+                    .as_ref()
+                    .is_some_and(|plane| plane.can_accept_reserved_sprite(next.lease))
+                {
+                    return Err(io::Error::other(
+                        "accepted cursor commit lost its reserved framebuffer lease",
+                    ));
+                }
             }
         }
         for update in updates {
@@ -1311,7 +1321,16 @@ impl PlatformBackend {
         output_idx: usize,
         updates: &[CursorPlaneUpdate],
     ) -> io::Result<()> {
-        self.accept_cursor_plane_updates(updates)?;
+        if let Err(error) = self.accept_cursor_plane_updates(updates) {
+            // The primary+cursor ioctl has already succeeded. Preserve its
+            // actual binding by consuming the reservation without repeating
+            // the preflight check that just failed; dropping it would let a
+            // later upload overwrite a framebuffer KMS is scanning out.
+            log::error!(
+                "accepted shared scene cursor settlement preflight failed ({error}); recovering the accepted lease"
+            );
+            self.accept_cursor_plane_updates_with_validation(updates, false)?;
+        }
         let Some((device_key, crtc)) = self
             .outputs
             .get(output_idx)
@@ -1319,14 +1338,45 @@ impl PlatformBackend {
         else {
             return Ok(());
         };
+        let accepted_sprite = updates
+            .iter()
+            .find(|update| update.device_key == device_key && update.crtc == crtc)
+            .and_then(|update| update.prepared.next);
         if let Some(device) = self
             .devices
             .iter_mut()
             .find(|device| device.key == device_key)
-            && let Some(state) = device.cursor.crtc_states.get_mut(&crtc)
         {
-            state.intent = None;
-            state.intent_motion_timestamp = None;
+            if let Some(binding) = accepted_sprite {
+                for (other_crtc, state) in &mut device.cursor.crtc_states {
+                    if *other_crtc == crtc
+                        || binding.lease.version()
+                            < match state.intent {
+                                Some(CursorIntent::Show(pending)) => pending.lease.version(),
+                                Some(CursorIntent::Hide) | None => continue,
+                            }
+                    {
+                        continue;
+                    }
+                    let Some(CursorIntent::Show(pending)) = state.intent.as_mut() else {
+                        continue;
+                    };
+                    // The accepted frame makes this sprite the newest
+                    // hardware image. Retarget already queued moves on the
+                    // other CRTCs without changing their output-local pointer
+                    // position or their own plane properties.
+                    pending.x += i32::from(pending.hot_x) - i32::from(binding.hot_x);
+                    pending.y += i32::from(pending.hot_y) - i32::from(binding.hot_y);
+                    pending.lease = binding.lease;
+                    pending.framebuffer = binding.framebuffer;
+                    pending.hot_x = binding.hot_x;
+                    pending.hot_y = binding.hot_y;
+                }
+            }
+            if let Some(state) = device.cursor.crtc_states.get_mut(&crtc) {
+                state.intent = None;
+                state.intent_motion_timestamp = None;
+            }
         }
         Ok(())
     }

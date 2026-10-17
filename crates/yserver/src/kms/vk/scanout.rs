@@ -354,6 +354,10 @@ pub struct TransferResources {
 #[allow(dead_code)] // wired in via KmsBackend in a later commit.
 pub struct ScanoutBoPool {
     pub bos: Vec<ScanoutBo>,
+    /// Fixture-only acquisition schedule. Empty in production pools; entries
+    /// set before a test scenario can make the real allocator report a busy
+    /// pool without editing Backend state while the scenario is running.
+    pub(crate) unavailable_acquisitions: std::collections::VecDeque<bool>,
     pub width: u32,
     pub height: u32,
     /// Stable renderer and KMS endpoints this pool connects. Kept separately

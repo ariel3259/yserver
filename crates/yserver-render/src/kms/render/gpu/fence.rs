@@ -139,6 +139,14 @@ impl FenceTicket {
         self.inner.fence
     }
 
+    /// Mark a ticket whose recording/submit path returned before any GPU work
+    /// was queued. This is safe only while the caller knows
+    /// `vkQueueSubmit2` was never issued for this ticket.
+    pub fn cancel_unsubmitted(&self) {
+        debug_assert!(self.inner.imported_wait_semaphores.borrow().is_empty());
+        self.inner.unsubmitted.set(true);
+    }
+
     /// Keep this submission's exported signal semaphore alive until its
     /// fence retires. Called only after a successful `vkQueueSubmit2`,
     /// once the semaphore's sync_file has been exported — destroying it
@@ -174,6 +182,7 @@ impl FenceTicket {
             inner: Rc::new(FenceTicketInner {
                 fence: vk::Fence::null(),
                 signaled_cache: Cell::new(true),
+                unsubmitted: Cell::new(false),
                 pool: Weak::<RefCell<FencePoolInner>>::new(),
                 vk: None,
                 imported_wait_semaphores: RefCell::new(Vec::new()),
@@ -190,6 +199,7 @@ impl FenceTicket {
             inner: Rc::new(FenceTicketInner {
                 fence: vk::Fence::null(),
                 signaled_cache: Cell::new(false),
+                unsubmitted: Cell::new(false),
                 pool: Weak::<RefCell<FencePoolInner>>::new(),
                 vk: None,
                 imported_wait_semaphores: RefCell::new(Vec::new()),
@@ -235,7 +245,8 @@ impl Drop for FenceTicketInner {
             return;
         };
         let mut pool = pool.borrow_mut();
-        let signaled = self.signaled_cache.get()
+        let signaled = self.unsubmitted.get()
+            || self.signaled_cache.get()
             || match unsafe { pool.vk.device.get_fence_status(self.fence) } {
                 Ok(true) => {
                     self.signaled_cache.set(true);
@@ -376,6 +387,7 @@ impl FencePool {
             inner: Rc::new(FenceTicketInner {
                 fence,
                 signaled_cache: Cell::new(false),
+                unsubmitted: Cell::new(false),
                 pool: Rc::downgrade(&self.inner),
                 vk: Some(vk),
                 imported_wait_semaphores: RefCell::new(Vec::new()),

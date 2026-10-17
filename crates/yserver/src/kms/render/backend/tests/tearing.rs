@@ -1328,7 +1328,17 @@ fn qualify_from_dead_zone(
         backend.pstate.tearing.state,
         crate::kms::render::backend::TearingState::On { window: owner, .. } if owner == window
     ));
-    let expected = vec![AtomicCommitKind::Scene; backend.platform.outputs.len() * 8 + 1];
+    let mut expected = vec![AtomicCommitKind::Scene; backend.platform.outputs.len() * 8 + 1];
+    if backend
+        .platform
+        .devices
+        .iter()
+        .any(|device| device.cursor.plane.is_some())
+    {
+        for kind in expected.iter_mut().take(backend.platform.outputs.len()) {
+            *kind = AtomicCommitKind::SceneWithCursor;
+        }
+    }
     assert_commit_sequence(recorder, &expected);
 }
 
@@ -1540,7 +1550,7 @@ fn entry_waits_for_queued_show_on_retire() {
     let pending_scene_commit = recorder.records().len() - 1;
     assert_eq!(
         recorder.records()[pending_scene_commit].kind,
-        AtomicCommitKind::Scene
+        AtomicCommitKind::SceneWithCursor
     );
 
     let before_eighth = recorder.records().len();
@@ -1562,7 +1572,7 @@ fn entry_waits_for_queued_show_on_retire() {
     assert_eq!(backend.pstate.tearing.probation, 8);
     assert_eq!(recorder.records().len(), before_eighth);
     assert!(backend.scene.cursor_transition_pending());
-    assert!(!backend.platform.any_cursor_plane_visible());
+    assert!(backend.platform.any_cursor_plane_visible());
 
     retire_composed_frame(&mut backend, &mut state, 9);
     assert!(!backend.scene.cursor_transition_pending());
@@ -1669,10 +1679,9 @@ fn entry_waits_for_queued_show_on_retire() {
     assert!(!backend.scene.cursor_transition_pending());
     assert!(backend.pstate.scanout_m2.pending.is_none());
     assert!(backend.pstate.scanout_m2.queued_successor.is_none());
-    let mut expected = vec![AtomicCommitKind::Scene; 9];
-    expected.push(AtomicCommitKind::CursorOnly);
-    expected.push(AtomicCommitKind::Scene);
-    expected.push(AtomicCommitKind::CursorOnly);
+    let mut expected = vec![AtomicCommitKind::Scene; 8];
+    expected.push(AtomicCommitKind::SceneWithCursor);
+    expected.extend([AtomicCommitKind::Scene, AtomicCommitKind::CursorOnly]);
     assert_commit_sequence(&recorder, &expected);
     assert_direct_queue_drained(&backend);
     backend.platform.wait_idle_bounded();
@@ -2034,6 +2043,8 @@ fn dead_zone_hidden_cursor_tears_like_xfixes_hidden() {
     retire_direct_present(&mut backend, &mut state, 10);
     assert!(!backend.platform.any_cursor_plane_visible());
     let mut expected = vec![AtomicCommitKind::Scene; backend.platform.outputs.len() * 8 + 1];
+    expected[0] = AtomicCommitKind::SceneWithCursor;
+    expected[1] = AtomicCommitKind::SceneWithCursor;
     expected.push(AtomicCommitKind::Async);
     assert_commit_sequence(&recorder, &expected);
     assert_direct_queue_drained(&backend);
@@ -2116,6 +2127,8 @@ fn hidden_entry_never_binds_plane_on_retirement_show_or_motion() {
         );
     }
     let mut expected = vec![AtomicCommitKind::Scene; backend.platform.outputs.len() * 8 + 1];
+    expected[0] = AtomicCommitKind::SceneWithCursor;
+    expected[1] = AtomicCommitKind::SceneWithCursor;
     expected.push(AtomicCommitKind::Async);
     expected.push(AtomicCommitKind::Scene);
     assert_commit_sequence(&recorder, &expected);
@@ -3424,12 +3437,11 @@ fn entry_from_held_direct_with_visible_hw_cursor_runs_handoff() {
     prepare_visible_hw_cursor(&mut backend, &mut state);
     assert_eq!(backend.effective_cursor_xid, Some(cursor));
     assert!(recorder.records().iter().any(|record| {
-        record.kind == AtomicCommitKind::CursorOnly
+        record.kind == AtomicCommitKind::SceneWithCursor
             && record.result == crate::drm::atomic::tests_support::ScriptedResult::Ok
     }));
-    assert!(backend.platform.any_cursor_commit_in_flight());
-    retire_composed_frame(&mut backend, &mut state, 2);
     assert!(!backend.platform.any_cursor_commit_in_flight());
+    assert!(!backend.scene.has_pending_page_flips());
     recorder.clear_records();
     let cursor_commits_before_direct_entry = recorder.records().len();
 

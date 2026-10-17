@@ -324,7 +324,8 @@ fn atomic_cursor_only_direct_and_unflip_carry_motion_deltas() {
         fixture
             .backend
             .platform
-            .cursor_atomic_event_pending_for_output(0)
+            .cursor_commit_in_flight_for_output(0),
+        "the direct cursor-only event owns the motion retirement",
     );
     fixture.retire_output(0, 60);
 
@@ -564,8 +565,7 @@ fn atomic_cursor_only_shared_scene_settlement_and_ebusy_through_backend() {
             .map(|record| record.kind)
             .collect::<Vec<_>>(),
         vec![
-            crate::drm::atomic::AtomicCommitKind::Scene,
-            crate::drm::atomic::AtomicCommitKind::CursorOnly,
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
             crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
         ],
     );

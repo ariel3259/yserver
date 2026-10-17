@@ -30,10 +30,7 @@ fn atomic_cursor_only_equal_state_consumes_without_ioctl() {
             .iter()
             .map(|record| record.kind)
             .collect::<Vec<_>>(),
-        vec![
-            crate::drm::atomic::AtomicCommitKind::Scene,
-            crate::drm::atomic::AtomicCommitKind::CursorOnly,
-        ],
+        vec![crate::drm::atomic::AtomicCommitKind::SceneWithCursor],
     );
 
     damage_cursor_root(&mut fixture);
@@ -43,9 +40,9 @@ fn atomic_cursor_only_equal_state_consumes_without_ioctl() {
     Backend::maybe_composite(&mut fixture.backend).expect("queue first motion behind scene");
     Backend::warp_pointer_root(&mut fixture.backend, &mut fixture.state, 100, 90);
     Backend::maybe_composite(&mut fixture.backend).expect("coalesce motion back to accepted B");
-    assert_eq!(fixture.recorders.atomic.records().len(), 3);
+    assert_eq!(fixture.recorders.atomic.records().len(), 2);
     fixture.retire_output(0, 3);
-    assert_eq!(fixture.recorders.atomic.records().len(), 3);
+    assert_eq!(fixture.recorders.atomic.records().len(), 2);
 
     let device_key = fixture.backend.platform.outputs[0].key.device_key;
     let crtc = fixture.backend.platform.outputs[0].output.crtc;
@@ -81,7 +78,7 @@ fn atomic_cursor_only_equal_state_consumes_without_ioctl() {
     );
     Backend::maybe_composite(&mut fixture.backend).expect("settle fractional host motion at B");
     Backend::maybe_composite(&mut fixture.backend).expect("repeat idle scheduling at B");
-    assert_eq!(fixture.recorders.atomic.records().len(), 3);
+    assert_eq!(fixture.recorders.atomic.records().len(), 2);
     assert!(Backend::next_wakeup(&fixture.backend).is_none());
 
     fixture
@@ -98,8 +95,7 @@ fn atomic_cursor_only_equal_state_consumes_without_ioctl() {
             .map(|record| record.kind)
             .collect::<Vec<_>>(),
         vec![
-            crate::drm::atomic::AtomicCommitKind::Scene,
-            crate::drm::atomic::AtomicCommitKind::CursorOnly,
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
             crate::drm::atomic::AtomicCommitKind::Scene,
             crate::drm::atomic::AtomicCommitKind::Scene,
         ],
@@ -136,13 +132,13 @@ fn atomic_cursor_only_busy_stream_keeps_latest_intent() {
     Backend::warp_pointer_root(&mut fixture.backend, &mut fixture.state, 125, 95);
     Backend::maybe_composite(&mut fixture.backend).expect("exercise cursor-only EBUSY");
     let records = fixture.recorders.atomic.records();
-    assert_eq!(records.len(), 3);
+    assert_eq!(records.len(), 2);
     assert_eq!(
-        records[2].kind,
+        records[1].kind,
         crate::drm::atomic::AtomicCommitKind::CursorOnly
     );
     assert_eq!(
-        records[2].result,
+        records[1].result,
         crate::drm::atomic::tests_support::ScriptedResult::Error {
             kind: std::io::ErrorKind::ResourceBusy,
             raw_os_error: Some(libc::EBUSY),
@@ -187,29 +183,19 @@ fn atomic_cursor_only_busy_stream_keeps_latest_intent() {
 
     Backend::maybe_composite(&mut fixture.backend).expect("idle turn does not retry EBUSY");
     Backend::maybe_composite(&mut fixture.backend).expect("second idle turn stays quiescent");
-    assert_eq!(fixture.recorders.atomic.records().len(), 3);
+    assert_eq!(fixture.recorders.atomic.records().len(), 2);
     assert!(Backend::next_wakeup(&fixture.backend).is_none());
 
     damage_cursor_root(&mut fixture);
     Backend::maybe_composite(&mut fixture.backend).expect("real primary flip carries the intent");
-    assert_eq!(fixture.recorders.atomic.records().len(), 4);
+    assert_eq!(fixture.recorders.atomic.records().len(), 3);
     assert_eq!(
-        fixture.recorders.atomic.records()[3].kind,
+        fixture.recorders.atomic.records()[2].kind,
         crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
     );
-    assert!(
-        fixture
-            .backend
-            .platform
-            .cursor_atomic_event_pending_for_output(0)
-    );
+    assert!(fixture.backend.scene.has_pending_page_flip(0));
     fixture.retire_output(0, 3);
-    assert!(
-        !fixture
-            .backend
-            .platform
-            .cursor_atomic_event_pending_for_output(0)
-    );
+    assert!(!fixture.backend.scene.has_pending_page_flip(0));
 
     fixture
         .backend
@@ -225,8 +211,7 @@ fn atomic_cursor_only_busy_stream_keeps_latest_intent() {
             .map(|record| record.kind)
             .collect::<Vec<_>>(),
         vec![
-            crate::drm::atomic::AtomicCommitKind::Scene,
-            crate::drm::atomic::AtomicCommitKind::CursorOnly,
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
             crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
             crate::drm::atomic::AtomicCommitKind::Scene,
@@ -268,18 +253,17 @@ fn atomic_cursor_only_all_builders_use_accepted_deltas() {
     damage_cursor_root(&mut fixture);
     Backend::maybe_composite(&mut fixture.backend).expect("submit stable cursor scene frame");
     let records = fixture.recorders.atomic.records();
-    assert_eq!(records.len(), 3);
+    assert_eq!(records.len(), 2);
     assert_eq!(
         records.iter().map(|record| record.kind).collect::<Vec<_>>(),
         vec![
-            crate::drm::atomic::AtomicCommitKind::Scene,
-            crate::drm::atomic::AtomicCommitKind::CursorOnly,
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
             crate::drm::atomic::AtomicCommitKind::Scene,
         ],
         "a stable cursor adds no cursor properties to a primary scene frame",
     );
     assert!(
-        records[2]
+        records[1]
             .properties
             .iter()
             .all(|update| update.object != properties.plane.into()),
@@ -291,8 +275,8 @@ fn atomic_cursor_only_all_builders_use_accepted_deltas() {
     damage_cursor_root(&mut fixture);
     Backend::maybe_composite(&mut fixture.backend).expect("submit motion scene frame");
     let before_retirement = fixture.recorders.atomic.records();
-    assert_eq!(before_retirement.len(), 4);
-    let motion_scene = &before_retirement[3];
+    assert_eq!(before_retirement.len(), 3);
+    let motion_scene = &before_retirement[2];
     assert_eq!(
         motion_scene.kind,
         crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
@@ -320,10 +304,10 @@ fn atomic_cursor_only_all_builders_use_accepted_deltas() {
     Backend::warp_pointer_root(&mut fixture.backend, &mut fixture.state, 145, 115);
     Backend::maybe_composite(&mut fixture.backend)
         .expect("retain newer cursor motion behind scene retirement");
-    assert_eq!(fixture.recorders.atomic.records().len(), 4);
+    assert_eq!(fixture.recorders.atomic.records().len(), 3);
     fixture.retire_output(0, 4);
-    assert_eq!(fixture.recorders.atomic.records().len(), 5);
-    let newest = &fixture.recorders.atomic.records()[4];
+    assert_eq!(fixture.recorders.atomic.records().len(), 4);
+    let newest = &fixture.recorders.atomic.records()[3];
     assert_eq!(
         newest.kind,
         crate::drm::atomic::AtomicCommitKind::CursorOnly,
@@ -355,8 +339,7 @@ fn atomic_cursor_only_all_builders_use_accepted_deltas() {
             .map(|record| record.kind)
             .collect::<Vec<_>>(),
         vec![
-            crate::drm::atomic::AtomicCommitKind::Scene,
-            crate::drm::atomic::AtomicCommitKind::CursorOnly,
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
             crate::drm::atomic::AtomicCommitKind::Scene,
             crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,

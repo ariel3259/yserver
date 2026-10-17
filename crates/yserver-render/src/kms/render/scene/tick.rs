@@ -1183,6 +1183,7 @@ fn tick_one_output(
         Ok(ticket) => ticket,
         Err(error) => {
             inner.outputs[output_idx].pool_ring.release(slot);
+            sink.cancel_slot(output_idx, token.bo_idx);
             if vk_result_is_device_lost(error) {
                 sink.gpu_mut().renderer_failed = true;
             }
@@ -1222,7 +1223,12 @@ fn tick_one_output(
             .cursor_saves
             .prepare(&inner.vk, image, cursor_rect)
     });
-    sink.check_frame_target(output_idx)?;
+    if let Err(error) = sink.check_frame_target(output_idx) {
+        compose_ticket.cancel_unsubmitted();
+        inner.outputs[output_idx].pool_ring.release(slot);
+        sink.cancel_slot(output_idx, token.bo_idx);
+        return Err(error.into());
+    }
     // Retained root-`IncludeInferiors` overlay: per-output apply list
     // (output-local XOR rects), computed against the SAME per-output
     // layout the compose uses. Empty in the common case (no active
@@ -1234,10 +1240,18 @@ fn tick_one_output(
     let (xor_pipeline, xor_layout) = if overlay_ops.is_empty() {
         (vk::Pipeline::null(), vk::PipelineLayout::null())
     } else {
-        let pl = inner.overlay_xor_cache.get(
+        let pl = match inner.overlay_xor_cache.get(
             yserver_protocol::x11::gc::GcFunction::Xor,
             crate::kms::vk::logic_fill_pipeline::LogicFillChannels::Color,
-        )?;
+        ) {
+            Ok(pl) => pl,
+            Err(error) => {
+                compose_ticket.cancel_unsubmitted();
+                inner.outputs[output_idx].pool_ring.release(slot);
+                sink.cancel_slot(output_idx, token.bo_idx);
+                return Err(error.into());
+            }
+        };
         (pl, inner.overlay_xor_cache.pipeline_layout())
     };
     let mut gpu_submitted = false;
@@ -1326,6 +1340,8 @@ fn tick_one_output(
                 // slot as well as the staged frame so a later Backend pass
                 // can retry the still-damaged scene.
                 sink.cancel_slot(output_idx, token.bo_idx);
+                inner.outputs[output_idx].pool_ring.release(slot);
+                compose_ticket.cancel_unsubmitted();
                 force_cursor_retry_repaint(
                     inner.outputs.get_mut(output_idx).expect("checked output"),
                 );
@@ -1499,6 +1515,7 @@ fn tick_one_output(
                     token.bo_idx,
                 );
             } else {
+                compose_ticket.cancel_unsubmitted();
                 log::warn!(
                     "render scene: compose record/queue submit failed for output \
                      {output_idx} (bo {}): {e}",

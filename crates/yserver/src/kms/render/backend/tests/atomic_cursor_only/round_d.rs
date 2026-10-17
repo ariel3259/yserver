@@ -299,13 +299,20 @@ fn atomic_cursor_only_permanent_failure_still_detaches_accepted_binding() {
     );
 
     Backend::set_cursor_hidden(&mut fixture.backend, true);
+    damage_cursor_root(&mut fixture);
+    Backend::maybe_composite(&mut fixture.backend).expect("submit shared hardware detach");
     let records = fixture.recorders.atomic.records();
     let detach = records
-        .last()
+        .iter()
+        .rev()
+        .find(|record| {
+            record.kind == crate::drm::atomic::AtomicCommitKind::SceneWithCursor
+                && !record.events.is_empty()
+        })
         .expect("permanent failure cleanup submits an atomic detach");
     assert_eq!(
         detach.kind,
-        crate::drm::atomic::AtomicCommitKind::CursorOnly
+        crate::drm::atomic::AtomicCommitKind::SceneWithCursor
     );
     let properties = fixture.backend.platform.devices[0]
         .cursor

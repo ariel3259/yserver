@@ -290,8 +290,15 @@ impl OutputSink for PlatformBackend {
             // cursor-only intent is published from the rejected frame plan.
             self.reject_cursor_plane_update_reservations(&cursor_updates);
         } else if shared_cursor_commit_submitted && scene_cursor_owner {
-            self.cursor_plane_scene_frame_submitted(output_idx, &cursor_updates)
-                .expect("accepted shared scene frame keeps its reserved cursor leases");
+            if let Err(error) = self.cursor_plane_scene_frame_submitted(output_idx, &cursor_updates)
+            {
+                // The atomic request already changed the display. Stop future
+                // rendering and quarantine the sprite pool if even accepted-
+                // state recovery cannot account for its framebuffer leases.
+                log::error!("accepted shared scene frame could not settle cursor leases: {error}");
+                self.quarantine_cursor_output(output_idx);
+                self.gpu.renderer_failed = true;
+            }
         } else if shared_cursor_commit_submitted {
             self.cursor_plane_scene_commit_submitted(&cursor_updates)
                 .expect("accepted shared scene commit keeps its reserved cursor leases");

@@ -28,11 +28,46 @@ pub(crate) mod sprites;
 pub(crate) mod topology;
 
 use std::{
-    collections::{HashMap, HashSet},
+    cell::RefCell,
+    collections::{HashMap, HashSet, VecDeque},
     io,
     ptr::NonNull,
     rc::Rc,
 };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CursorLeaseBoundary {
+    Reserve,
+    Accept,
+}
+
+#[derive(Default)]
+struct CursorLeaseFailureScript(RefCell<VecDeque<(CursorLeaseBoundary, usize)>>);
+
+impl CursorLeaseFailureScript {
+    fn fail_next(&self, boundary: CursorLeaseBoundary) -> bool {
+        let mut script = self.0.borrow_mut();
+        let Some((next, remaining)) = script.front_mut() else {
+            return false;
+        };
+        if *next != boundary {
+            return false;
+        }
+        if *remaining > 0 {
+            *remaining -= 1;
+            return false;
+        }
+        script.pop_front();
+        true
+    }
+
+    #[cfg(test)]
+    fn push(&mut self, boundary: CursorLeaseBoundary, matching_calls_to_skip: usize) {
+        self.0
+            .get_mut()
+            .push_back((boundary, matching_calls_to_skip));
+    }
+}
 
 use drm::{
     Device as DrmDevice, DriverCapability,
@@ -325,6 +360,7 @@ pub struct CursorPlane {
     device: Rc<Device>,
     cursor_buffer: Option<CursorBuffer>,
     sprite_pool: SpritePool,
+    lease_failures: CursorLeaseFailureScript,
     operations: CursorPlaneOperations,
     dumb: Option<CursorPlaneBuffer>,
     ptr: NonNull<u8>,
@@ -582,6 +618,7 @@ impl CursorPlane {
             device,
             cursor_buffer: Some(cursor_buffer),
             sprite_pool,
+            lease_failures: CursorLeaseFailureScript::default(),
             operations: CursorPlaneOperations::Legacy(legacy_io),
             dumb: Some(dumb),
             ptr,
@@ -774,6 +811,7 @@ impl CursorPlane {
             device: Rc::clone(&device),
             cursor_buffer: Some(cursor_buffer),
             sprite_pool: SpritePool::new(width, height),
+            lease_failures: CursorLeaseFailureScript::default(),
             operations: CursorPlaneOperations::Executors {
                 hide: Rc::new(DrmCursorHideExecutor),
                 show: Rc::new(DrmCursorShowExecutor),
@@ -1090,7 +1128,8 @@ impl CursorPlane {
     }
 
     pub(crate) fn reserve_sprite(&mut self, lease: SpriteBufferLease) -> bool {
-        self.sprite_pool.reserve(lease)
+        !self.lease_failures.fail_next(CursorLeaseBoundary::Reserve)
+            && self.sprite_pool.reserve(lease)
     }
 
     pub(crate) fn accept_reserved_sprite(&mut self, lease: SpriteBufferLease) -> bool {
@@ -1098,7 +1137,17 @@ impl CursorPlane {
     }
 
     pub(crate) fn can_accept_reserved_sprite(&self, lease: SpriteBufferLease) -> bool {
-        self.sprite_pool.can_accept_reserved(lease)
+        !self.lease_failures.fail_next(CursorLeaseBoundary::Accept)
+            && self.sprite_pool.can_accept_reserved(lease)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_script_lease_failure_after(
+        &mut self,
+        boundary: CursorLeaseBoundary,
+        matching_calls_to_skip: usize,
+    ) {
+        self.lease_failures.push(boundary, matching_calls_to_skip);
     }
 
     pub(crate) fn reject_reserved_sprite(&mut self, lease: SpriteBufferLease) -> bool {

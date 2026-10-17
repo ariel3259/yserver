@@ -109,6 +109,21 @@ pub(crate) fn add_cursor_plane_updates(
     }
 }
 
+/// Append cursor deltas only to a Vsync scene request. Async scene requests
+/// are cursorless by contract, even when the frame was prepared with a shared
+/// route cursor plan.
+pub(crate) fn add_vsync_scene_cursor_updates(
+    request: &mut AtomicCommitRequest,
+    updates: &[CursorPlaneUpdate],
+    timing: crate::drm::async_flip::FlipTiming,
+) -> bool {
+    if timing != crate::drm::async_flip::FlipTiming::Vsync {
+        return false;
+    }
+    add_cursor_plane_updates(request, updates);
+    !updates.is_empty()
+}
+
 pub(crate) fn request_for_cursor_updates(updates: &[CursorPlaneUpdate]) -> AtomicCommitRequest {
     let mut request = AtomicCommitRequest::new();
     add_cursor_plane_updates(&mut request, updates);

@@ -2315,10 +2315,7 @@ impl KmsBackend {
         if self.tearing_cursor_wants_visible() && self.pstate.scanout_m2.active() {
             self.request_direct_unflip("tearing_cursor_handoff");
         }
-        if self.platform.any_cursor_plane_visible() {
-            return;
-        }
-        if self.platform.any_cursor_commit_in_flight() {
+        if self.platform.any_cursor_plane_visible() || self.platform.any_cursor_commit_in_flight() {
             for output_idx in 0..self.platform.outputs.len() {
                 self.platform
                     .set_scene_flip_timing(output_idx, crate::drm::async_flip::FlipTiming::Vsync);

@@ -635,12 +635,14 @@ fn atomic_cursor_only_shared_transition_is_one_primary_commit() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: publish the staged Hardware assignment as global cursor-only intent; the no-BO record and intent assertions fail.
+// Mutation: apply Hardware mode when scanout-slot acquisition returns no BO; the Hidden-mode and unchanged-receipt assertions fail.
 fn atomic_cursor_only_no_bo_does_not_publish_assignment() {
     use crate::kms::render::scene::{CursorAcceptedMode, CursorPlaneMode};
     use yserver_core::backend::Backend;
 
-    let Some(mut fixture) = AtomicCursorFixture::new().expect("build no-BO transition fixture")
+    let Some(mut fixture) =
+        AtomicCursorFixture::new_with_scanout_acquisition_script([true, true, false])
+            .expect("build no-BO transition fixture")
     else {
         return;
     };
@@ -648,12 +650,9 @@ fn atomic_cursor_only_no_bo_does_not_publish_assignment() {
         .backend
         .platform
         .for_tests_accept_output_power_commits();
-    // No output frame is pending yet. Withhold the already-allocated pool as
-    // a construction-selected no-slot fixture option: Backend reaches the
-    // real acquire_scanout_bo entry and observes NoBO, without forging BO phase.
-    let scanout_pool = fixture.backend.platform.scanout_pools[0]
-        .take()
-        .expect("Vulkan fixture owns a shared scanout pool");
+    // The acquisition schedule is part of fixture construction, before the
+    // scenario starts. Backend reaches the real acquire_scanout_bo entry and
+    // sees two unavailable acquisitions before the fixture permits a retry.
     fixture.define_visible_cursor();
     Backend::warp_pointer_root(&mut fixture.backend, &mut fixture.state, 140, 110);
     super::round_a::damage_cursor_root(&mut fixture);
@@ -687,7 +686,6 @@ fn atomic_cursor_only_no_bo_does_not_publish_assignment() {
         receipt_before
     );
 
-    fixture.backend.platform.scanout_pools[0] = Some(scanout_pool);
     Backend::maybe_composite(&mut fixture.backend).expect("available slot accepts the scene plan");
     let accepted = fixture
         .backend
@@ -938,4 +936,326 @@ fn create_oversized_cursor(fixture: &mut AtomicCursorFixture, hot: (u16, u16)) -
     )
     .expect("create oversized software cursor")
     .as_raw()
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: omit pre-render reservation rollback or descriptor-slot release; retry cannot accept and teardown retains a lease.
+fn atomic_cursor_only_shared_reservation_failure_releases_slots_and_retries() {
+    use crate::kms::{cursor_plane::CursorLeaseBoundary, render::scene::CursorAcceptedMode};
+    use yserver_core::backend::Backend;
+
+    let Some(mut fixture) =
+        AtomicCursorFixture::new_with_cursor_lease_failures(CursorLeaseBoundary::Reserve, 3)
+            .expect("build scripted Shared reservation fixture")
+    else {
+        return;
+    };
+    fixture
+        .backend
+        .platform
+        .for_tests_accept_output_power_commits();
+    fixture.define_visible_cursor();
+    Backend::warp_pointer_root(&mut fixture.backend, &mut fixture.state, 140, 110);
+    super::round_a::damage_cursor_root(&mut fixture);
+
+    Backend::maybe_composite(&mut fixture.backend).expect("failed reservation is retryable");
+    assert!(fixture.recorders.atomic.records().is_empty());
+    assert!(fixture.backend.platform.staged_cursor_frames.is_empty());
+    assert!(!fixture.backend.scene.has_pending_page_flips());
+    assert!(
+        fixture.backend.platform.devices[0]
+            .cursor
+            .plane
+            .as_ref()
+            .expect("cursor plane")
+            .sprite_pool_users_are_zero(),
+        "a failed reservation leaves no prepared or accepted lease",
+    );
+
+    for _ in 0..3 {
+        Backend::maybe_composite(&mut fixture.backend).expect("retry after reservation failure");
+        if fixture
+            .backend
+            .scene
+            .for_tests_cursor_commit_receipt(0)
+            .is_some()
+        {
+            break;
+        }
+    }
+    assert!(
+        fixture
+            .backend
+            .scene
+            .for_tests_cursor_commit_receipt(0)
+            .is_some(),
+        "Backend retry leaves the damaged shared frame pending"
+    );
+    let receipt = fixture
+        .backend
+        .scene
+        .for_tests_cursor_commit_receipt(0)
+        .expect("retry publishes the accepted frame receipt");
+    assert_eq!(receipt.mode, CursorAcceptedMode::Hardware);
+    assert_eq!(
+        fixture.recorders.atomic.records()[0].kind,
+        crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+    );
+    fixture.retire_output(0, 1);
+
+    Backend::set_cursor_hidden(&mut fixture.backend, true);
+    super::round_a::damage_cursor_root(&mut fixture);
+    Backend::maybe_composite(&mut fixture.backend).expect("submit cursorless scene frame");
+    fixture.retire_output(0, 2);
+    fixture
+        .backend
+        .disable_output()
+        .expect("disable and drain through Backend");
+    fixture.assert_cursor_quiescent();
+    let ledger = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
+    drop(fixture);
+    assert_eq!(ledger.end_state(), (0, 0, 0));
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: drop the accepted-Shared lease recovery after its preflight fails; mode or lease teardown assertions fail.
+fn atomic_cursor_only_shared_settlement_failure_recovers_accepted_lease() {
+    use crate::kms::{cursor_plane::CursorLeaseBoundary, render::scene::CursorAcceptedMode};
+    use yserver_core::backend::Backend;
+
+    let Some(mut fixture) =
+        AtomicCursorFixture::new_with_cursor_lease_failure(CursorLeaseBoundary::Accept)
+            .expect("build scripted accepted-settlement fixture")
+    else {
+        return;
+    };
+    fixture
+        .backend
+        .platform
+        .for_tests_accept_output_power_commits();
+    fixture.define_visible_cursor();
+    Backend::warp_pointer_root(&mut fixture.backend, &mut fixture.state, 140, 110);
+    super::round_a::damage_cursor_root(&mut fixture);
+    Backend::maybe_composite(&mut fixture.backend)
+        .expect("accepted atomic frame recovers its cursor lease settlement");
+
+    let receipt = fixture
+        .backend
+        .scene
+        .for_tests_cursor_commit_receipt(0)
+        .expect("accepted frame publishes its receipt");
+    assert_eq!(receipt.mode, CursorAcceptedMode::Hardware);
+    assert!(fixture.backend.platform.cursor_plane_visible_for_output(0));
+    assert!(fixture.backend.scene.has_pending_page_flips());
+    assert_eq!(
+        fixture.recorders.atomic.records()[0].kind,
+        crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+    );
+    fixture.retire_output(0, 1);
+
+    Backend::set_cursor_hidden(&mut fixture.backend, true);
+    super::round_a::damage_cursor_root(&mut fixture);
+    Backend::maybe_composite(&mut fixture.backend).expect("detach through a shared frame");
+    fixture.retire_output(0, 2);
+    fixture
+        .backend
+        .disable_output()
+        .expect("disable and drain through Backend");
+    fixture.assert_cursor_quiescent();
+    let ledger = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
+    drop(fixture);
+    assert_eq!(ledger.end_state(), (0, 0, 0));
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: skip the degraded composed-unflip fallback after cursor reservation fails; its accepted per-output trace and teardown assertions fail.
+fn atomic_cursor_only_composed_unflip_reservation_failure_rolls_back_before_fallback() {
+    use yserver_core::backend::{AnyHandle, Backend};
+
+    let Some(mut fixture) = AtomicCursorFixture::new_with_two_outputs_cursor_lease_failures(
+        crate::kms::cursor_plane::CursorLeaseBoundary::Reserve,
+        [2, 0],
+    )
+    .expect("build two-output reservation rollback fixture") else {
+        return;
+    };
+    fixture
+        .backend
+        .platform
+        .for_tests_accept_output_power_commits();
+    let direct = super::round_a::setup_cursor_only_direct_present(&mut fixture);
+
+    let source = Backend::create_pixmap(&mut fixture.backend, None, 64, 64, 1)
+        .expect("create boundary cursor source through Backend");
+    Backend::put_image(
+        &mut fixture.backend,
+        None,
+        source.as_raw(),
+        64,
+        64,
+        1,
+        0,
+        0,
+        &[0x31; 8 * 64],
+    )
+    .expect("paint boundary cursor through Backend");
+    let picture = Backend::render_create_picture(
+        &mut fixture.backend,
+        None,
+        AnyHandle::Pixmap(source),
+        0,
+        0,
+        &[],
+    )
+    .expect("create cursor picture through Backend")
+    .expect("cursor picture");
+    let cursor = Backend::render_create_cursor(&mut fixture.backend, None, picture, 32, 0)
+        .expect("create boundary cursor through Backend")
+        .expect("cursor handle");
+    let root = fixture.backend.core.window_id;
+    Backend::define_cursor(&mut fixture.backend, None, root, cursor.as_raw())
+        .expect("define boundary cursor through Backend");
+    Backend::warp_pointer_root(&mut fixture.backend, &mut fixture.state, 800, 90);
+    super::round_a::damage_cursor_root(&mut fixture);
+    Backend::maybe_composite(&mut fixture.backend).expect("submit initial cursor frames");
+    fixture.retire_output(0, 1);
+    fixture.retire_output(1, 1);
+    fixture.retire_output(0, 2);
+    fixture.retire_output(1, 2);
+    assert!(fixture.backend.platform.cursor_plane_visible_for_output(0));
+    assert!(fixture.backend.platform.cursor_plane_visible_for_output(1));
+
+    let mut direct_entered = false;
+    for attempt in 0..16_u64 {
+        let (candidate, event) = super::round_a::direct_present_for_id(&direct, 25_000 + attempt);
+        Backend::note_present_scanout_candidate(&mut fixture.backend, candidate);
+        if Backend::try_present_direct(&mut fixture.backend, candidate, event)
+            .expect("submit direct probe through Backend")
+        {
+            let frame = 10 + u32::try_from(attempt).expect("frame fits");
+            fixture.retire_output(0, frame);
+            fixture.retire_output(1, frame);
+            Backend::maybe_composite(&mut fixture.backend).expect("settle direct retirement");
+            if fixture.backend.pstate.scanout_m2.active() {
+                direct_entered = true;
+                break;
+            }
+        } else if fixture.backend.scene.has_pending_page_flips() {
+            let frame = 40 + u32::try_from(attempt).expect("frame fits");
+            fixture.retire_output(0, frame);
+            fixture.retire_output(1, frame);
+            Backend::maybe_composite(&mut fixture.backend)
+                .expect("settle composed direct-probation frame");
+        }
+    }
+    assert!(direct_entered, "Backend direct Presents enter held scanout");
+
+    // The new lease spans both CRTCs. The fixture script allows both initial
+    // Shared attachments, then fails the direct sprite replacement and the
+    // composed-unflip retry at the same real reservation boundary.
+    let replacement_source = Backend::create_pixmap(&mut fixture.backend, None, 64, 64, 1)
+        .expect("create replacement cursor source through Backend");
+    Backend::put_image(
+        &mut fixture.backend,
+        None,
+        replacement_source.as_raw(),
+        64,
+        64,
+        1,
+        0,
+        0,
+        &[0xa7; 8 * 64],
+    )
+    .expect("paint replacement cursor through Backend");
+    let replacement_picture = Backend::render_create_picture(
+        &mut fixture.backend,
+        None,
+        AnyHandle::Pixmap(replacement_source),
+        0,
+        0,
+        &[],
+    )
+    .expect("create replacement picture through Backend")
+    .expect("replacement picture");
+    let replacement =
+        Backend::render_create_cursor(&mut fixture.backend, None, replacement_picture, 32, 0)
+            .expect("create replacement cursor through Backend")
+            .expect("replacement cursor");
+    Backend::define_cursor(&mut fixture.backend, None, root, replacement.as_raw())
+        .expect("define replacement cursor before unflip");
+    Backend::warp_pointer_root(&mut fixture.backend, &mut fixture.state, 801, 90);
+    assert!(
+        fixture
+            .backend
+            .platform
+            .for_tests_cursor_show_intent(0)
+            .is_some()
+    );
+    assert!(
+        fixture
+            .backend
+            .platform
+            .for_tests_cursor_show_intent(1)
+            .is_some()
+    );
+    assert!(fixture.backend.pstate.scanout_m2.unflip_requested);
+    Backend::unmap_subwindow(&mut fixture.backend, None, direct.window_xid)
+        .expect("request composed unflip through Backend");
+    assert!(fixture.backend.pstate.scanout_m2.unflip_requested);
+    let before_unflip = fixture.recorders.atomic.records().len();
+    Backend::maybe_composite(&mut fixture.backend)
+        .expect("reservation failure falls back to per-output scene commits");
+
+    assert!(fixture.backend.pstate.scanout_m2.degraded_composed_unflip);
+    assert_eq!(
+        fixture.backend.pstate.scanout_m2.unflip_awaiting_outputs,
+        [0, 1].into(),
+        "fallback waits for both composed output flips",
+    );
+    assert!(fixture.backend.scene.has_pending_page_flips());
+    assert!(fixture.backend.platform.staged_cursor_frames.is_empty());
+    assert!(fixture.backend.platform.cursor_plane_visible_for_output(0));
+    assert!(fixture.backend.platform.cursor_plane_visible_for_output(1));
+    assert_eq!(
+        fixture.recorders.atomic.records()[before_unflip..]
+            .iter()
+            .map(|record| record.kind)
+            .collect::<Vec<_>>(),
+        [
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+        ],
+        "failed grouped reservation submits only the two Backend scene fallbacks",
+    );
+    fixture.retire_output(0, 61);
+    fixture.retire_output(1, 61);
+    assert!(!fixture.backend.pstate.scanout_m2.active());
+    assert!(
+        fixture
+            .backend
+            .pstate
+            .scanout_m2
+            .unflip_awaiting_outputs
+            .is_empty()
+    );
+    assert!(!fixture.backend.scene.has_pending_page_flips());
+
+    Backend::set_cursor_hidden(&mut fixture.backend, true);
+    super::round_a::damage_cursor_root(&mut fixture);
+    Backend::maybe_composite(&mut fixture.backend).expect("submit hidden cursor frames");
+    fixture.retire_output(0, 62);
+    fixture.retire_output(1, 62);
+    fixture
+        .backend
+        .disable_output()
+        .expect("disable and drain through Backend");
+    let _ = Backend::drain_completed_present_events(&mut fixture.backend);
+    let _ = Backend::drain_retired_present_idle_events(&mut fixture.backend);
+    fixture.assert_cursor_quiescent();
+    let ledger = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
+    drop(fixture);
+    assert_eq!(ledger.end_state(), (0, 0, 0));
 }

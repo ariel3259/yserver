@@ -34,6 +34,9 @@ impl PlatformBackend {
     pub(crate) fn acquire_scanout_bo(&mut self, output_idx: usize) -> Option<SlotToken> {
         self.debug_assert_scanout_pool_route(output_idx);
         let scanout = self.scanout_pools.get_mut(output_idx)?.as_mut()?;
+        if !scanout.display_pool_mut().permits_next_slot_acquisition() {
+            return None;
+        }
         let gens = self.bo_generations.get(output_idx)?;
         for (bo_idx, bo) in scanout.display_pool().bos.iter().enumerate() {
             if bo.state.phase == BoPhase::Free {

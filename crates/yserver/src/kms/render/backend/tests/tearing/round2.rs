@@ -307,11 +307,10 @@ fn define_cursor_rebind_routes_motion_to_bound_plane_during_vsync_direct_scanout
 
     finish_held_direct_cursor_test(&mut backend, &mut state, &recorder, WINDOW, 90, Some(1));
     let mut expected = vec![AtomicCommitKind::Scene];
-    expected.extend([AtomicCommitKind::CursorOnly; 2]);
-    expected.extend([AtomicCommitKind::CursorOnly; 10]);
+    expected.extend([AtomicCommitKind::CursorOnly; 12]);
     expected.push(AtomicCommitKind::Scene);
-    expected.extend([AtomicCommitKind::Scene; 2]);
-    expected.push(AtomicCommitKind::CursorOnly);
+    expected.push(AtomicCommitKind::SceneWithCursor);
+    expected.push(AtomicCommitKind::Scene);
     assert_commit_sequence(&recorder, &expected);
     backend.platform.wait_idle_bounded();
 }
@@ -619,11 +618,11 @@ fn atomic_cursor_only_c1_adapters_publish_only_accepted_bindings() {
         Some(0)
     );
 
-    recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EINVAL)));
+    let records_before_hide = recorder.records().len();
     Backend::set_cursor_hidden(&mut backend, true);
     let rejected_hide_records = recorder.records();
-    let rejected_hide = rejected_hide_records.last().unwrap();
-    assert_eq!(rejected_hide.kind, AtomicCommitKind::CursorOnly);
+    assert_eq!(rejected_hide_records.len(), records_before_hide);
+    assert!(!backend.pstate.scanout_m2.active());
     assert!(backend.platform.cursor_plane_visible_for_output(0));
     assert_eq!(
         backend.scene.cursor_mode(),
@@ -642,6 +641,59 @@ fn atomic_cursor_only_c1_adapters_publish_only_accepted_bindings() {
     let transparent = create_bitmap_cursor_via_backend(&mut backend, false, false);
     Backend::define_cursor(&mut backend, None, root, transparent.as_raw())
         .expect("Backend cursor change retries the hidden detach");
+    assert!(backend.platform.cursor_plane_visible_for_output(0));
+    recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EINVAL)));
+    recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EINVAL)));
+    Backend::maybe_composite(&mut backend).expect("submit shared frame-owned cursor detach");
+    let shared_detach_records = recorder.records();
+    assert_eq!(shared_detach_records.len(), records_before_hide + 3);
+    for rejected in &shared_detach_records[records_before_hide..records_before_hide + 2] {
+        assert_eq!(rejected.kind, AtomicCommitKind::SceneWithCursor);
+        assert!(matches!(
+            rejected.result,
+            crate::drm::atomic::tests_support::ScriptedResult::Error {
+                raw_os_error: Some(libc::EINVAL),
+                ..
+            }
+        ));
+        assert!(rejected.properties.iter().any(|update| {
+            update.object == animated_binding.properties.plane.into()
+                && update.property == animated_binding.properties.fb_id
+                && update.value == 0
+        }));
+    }
+    assert_eq!(
+        shared_detach_records[records_before_hide + 2].kind,
+        AtomicCommitKind::Scene,
+        "a cursorless retry frame keeps the accepted plane binding when its detach retries reject",
+    );
+    assert!(backend.platform.cursor_plane_visible_for_output(0));
+    assert_eq!(
+        backend.platform.devices[0].cursor.crtc_states[&crtc].applied,
+        Some(animated_binding),
+        "a rejected shared detach retains the last accepted binding",
+    );
+    assert_eq!(
+        backend.scene.cursor_mode(),
+        crate::kms::render::scene::CursorPlaneMode::Hw,
+        "rejected transition frames do not advance the scene cursor mode",
+    );
+    let retry_deadline = backend
+        .scene
+        .earliest_retry_deadline()
+        .expect("rejected shared frame schedules the production retry deadline");
+    while std::time::Instant::now() < retry_deadline {
+        std::hint::spin_loop();
+    }
+    Backend::mark_dirty(&mut backend);
+    Backend::maybe_composite(&mut backend).expect("retry the rejected shared cursor detach");
+    let retried_detach_records = recorder.records();
+    let retried_detach = retried_detach_records.last().unwrap();
+    assert_eq!(retried_detach.kind, AtomicCommitKind::SceneWithCursor);
+    assert_eq!(
+        retried_detach.result,
+        crate::drm::atomic::tests_support::ScriptedResult::Ok,
+    );
     assert!(!backend.platform.cursor_plane_visible_for_output(0));
     assert!(backend.platform.cursor_commit_in_flight_for_outputs(&[0]));
     let before_early_present = recorder.records().len();
@@ -699,18 +751,29 @@ fn atomic_cursor_only_c1_adapters_publish_only_accepted_bindings() {
                 crate::drm::atomic::tests_support::ScriptedResult::Ok
             ),
             (
-                AtomicCommitKind::CursorOnly,
+                AtomicCommitKind::SceneWithCursor,
                 crate::drm::atomic::tests_support::ScriptedResult::Error {
                     kind: std::io::ErrorKind::InvalidInput,
                     raw_os_error: Some(libc::EINVAL),
                 },
             ),
             (
-                AtomicCommitKind::CursorOnly,
+                AtomicCommitKind::SceneWithCursor,
+                crate::drm::atomic::tests_support::ScriptedResult::Error {
+                    kind: std::io::ErrorKind::InvalidInput,
+                    raw_os_error: Some(libc::EINVAL),
+                },
+            ),
+            (
+                AtomicCommitKind::Scene,
+                crate::drm::atomic::tests_support::ScriptedResult::Ok
+            ),
+            (
+                AtomicCommitKind::SceneWithCursor,
                 crate::drm::atomic::tests_support::ScriptedResult::Ok
             ),
         ],
-        "the trace includes accepted work and both rejected atomic attempts in order"
+        "the trace includes accepted work, rejected shared detaches, and the eventual Backend retry"
     );
     assert!(!backend.platform.cursor_commit_in_flight_for_outputs(&[0]));
     assert!(!backend.platform.any_cursor_commit_in_flight());
@@ -896,35 +959,29 @@ fn tearing_on_rejected_cursor_detach_stays_vsync_until_backend_retry() {
             .flags
             .contains(::drm::control::AtomicCommitFlags::PAGE_FLIP_ASYNC)
     );
-    assert!(backend.platform.any_cursor_plane_visible());
-    retire_composed_frame(&mut backend, &mut state, 72);
-
-    let transparent = create_bitmap_cursor_via_backend(&mut backend, false, false);
-    let root = backend.core.window_id;
-    Backend::define_cursor(&mut backend, None, root, transparent.as_raw())
-        .expect("request Backend cursor detach retry");
-    damage_root(&mut backend);
-    Backend::maybe_composite(&mut backend).expect("retry tearing cursor detach");
-    let retry = recorder.records().last().cloned().unwrap();
-    assert_eq!(retry.kind, AtomicCommitKind::CursorOnly);
-    assert_eq!(
-        retry.result,
-        crate::drm::atomic::tests_support::ScriptedResult::Ok
-    );
     assert!(!backend.platform.any_cursor_plane_visible());
     assert!(backend.platform.any_cursor_commit_in_flight());
-    assert!(backend.pstate.tearing.is_on());
-
-    let before_event = recorder.records().len();
+    assert!(backend.scene.has_pending_page_flips());
+    assert_eq!(fallback.kind, AtomicCommitKind::SceneWithCursor);
+    assert_eq!(
+        fallback.result,
+        crate::drm::atomic::tests_support::ScriptedResult::Ok
+    );
+    let before_detach_event = recorder.records().len();
     damage_root(&mut backend);
-    Backend::maybe_composite(&mut backend).expect("keep Async gated until detach event");
-    assert_eq!(recorder.records().len(), before_event);
+    Backend::maybe_composite(&mut backend).expect("keep Async gated until shared detach retires");
+    assert_eq!(recorder.records().len(), before_detach_event);
     assert!(backend.platform.any_cursor_commit_in_flight());
-    retire_recorded_direct_flip(&mut backend, &mut state, 73);
+    assert!(backend.scene.has_pending_page_flips());
+    assert!(backend.pstate.tearing.is_on());
+    retire_composed_frame(&mut backend, &mut state, 72);
+    assert!(!backend.platform.any_cursor_plane_visible());
     assert!(!backend.platform.any_cursor_commit_in_flight());
-    Backend::maybe_composite(&mut backend).expect("resume tearing Async after detach retirement");
-    let resumed = recorder.records().last().cloned().unwrap();
-    assert_eq!(resumed.kind, AtomicCommitKind::Async);
+
+    damage_root(&mut backend);
+    Backend::maybe_composite(&mut backend).expect("submit Async after detach retirement");
+    let resumed_async = recorder.records().last().cloned().unwrap();
+    assert_eq!(resumed_async.kind, AtomicCommitKind::Async);
     assert!(backend.pstate.tearing.is_on());
     retire_composed_frame(&mut backend, &mut state, 74);
 
@@ -950,8 +1007,7 @@ fn tearing_on_rejected_cursor_detach_stays_vsync_until_backend_retry() {
     let mut expected = vec![AtomicCommitKind::Scene; 9];
     expected.extend([
         AtomicCommitKind::CursorOnly,
-        AtomicCommitKind::Scene,
-        AtomicCommitKind::CursorOnly,
+        AtomicCommitKind::SceneWithCursor,
         AtomicCommitKind::Async,
     ]);
     assert_eq!(
@@ -1984,7 +2040,10 @@ fn task5_exit_restores_cursor_policy_per_state() {
     Backend::mark_dirty(&mut hw);
     Backend::maybe_composite(&mut hw).expect("compose after tearing exit to HW");
     assert_eq!(hw_recorder.records().len(), 1);
-    assert_eq!(hw_recorder.records()[0].kind, AtomicCommitKind::Scene);
+    assert_eq!(
+        hw_recorder.records()[0].kind,
+        AtomicCommitKind::SceneWithCursor
+    );
     retire_composed_frame(&mut hw, &mut hw_state, 74);
     assert_eq!(
         hw.scene.cursor_mode(),
@@ -1993,10 +2052,7 @@ fn task5_exit_restores_cursor_policy_per_state() {
     assert!(hw.platform.any_cursor_plane_visible());
     assert_tearing_off(&hw);
     assert!(hw.kms_outputs_active);
-    assert_commit_sequence(
-        &hw_recorder,
-        &[AtomicCommitKind::Scene, AtomicCommitKind::CursorOnly],
-    );
+    assert_commit_sequence(&hw_recorder, &[AtomicCommitKind::SceneWithCursor]);
 
     // (b) A transformed output keeps a visible cursor in the composed scene.
     let Some((mut sw, sw_recorder, mut sw_state)) = live_tearing_cursor_backend(0x7c71, 15_400)
