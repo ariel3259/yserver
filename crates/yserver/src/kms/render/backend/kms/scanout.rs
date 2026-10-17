@@ -2471,9 +2471,16 @@ impl KmsBackend {
                     for output_idx in 0..self.platform.outputs.len() {
                         match self.submit_atomic_cursor_intent_for_output(output_idx) {
                             Ok(outcome) => self.handle_cursor_move_outcome(outcome),
-                            Err(error) => log::warn!(
-                                "render maybe_composite: cursor-only atomic commit failed for output {output_idx}: {error}"
-                            ),
+                            Err(error) => {
+                                log::warn!(
+                                    "render maybe_composite: cursor-only atomic commit failed for output {output_idx}: {error}"
+                                );
+                                if error.raw_os_error() == Some(libc::EINVAL) {
+                                    // A held direct primary has no software cursor pixels to reveal.
+                                    self.scene.wake_for_damage();
+                                    self.request_direct_unflip("held_direct_cursor_einval");
+                                }
+                            }
                         }
                     }
                 }
