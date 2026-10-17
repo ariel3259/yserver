@@ -493,20 +493,36 @@ impl AtomicCursorFixture {
                 .as_ref()
                 .expect("Vulkan cursor fixture owns its Vk context"),
         );
-        let Some(Some(OutputScanout::Shared(mut destinations))) = self
-            .backend
-            .platform
-            .scanout_pools
-            .get_mut(0)
-            .map(Option::take)
-        else {
-            return Err("copied recording route requires the shared test destination pool".into());
-        };
-        destinations.route = route;
-        let copied =
-            crate::kms::vk::scanout::CopiedScanoutPool::for_tests_recording_pool(vk, destinations)
-                .map_err(|error| format!("allocate copied recording route: {error}"))?;
-        self.backend.platform.scanout_pools[0] = Some(OutputScanout::Copied(copied));
+        for output_idx in 0..self.backend.platform.scanout_pools.len() {
+            let Some(Some(OutputScanout::Shared(mut destinations))) = self
+                .backend
+                .platform
+                .scanout_pools
+                .get_mut(output_idx)
+                .map(Option::take)
+            else {
+                return Err(format!(
+                    "copied recording route requires shared destination pool for output {output_idx}"
+                ));
+            };
+            destinations.route = route;
+            let mut copied = crate::kms::vk::scanout::CopiedScanoutPool::for_tests_recording_pool(
+                Arc::clone(&vk),
+                destinations,
+            )
+            .map_err(|error| format!("allocate copied recording route: {error}"))?;
+            if let Some(front_idx) = copied
+                .destinations
+                .bos
+                .iter()
+                .position(|bo| bo.state.phase == crate::kms::vk::scanout::BoPhase::OnScreen)
+            {
+                copied
+                    .note_kms_modeset_installed(front_idx)
+                    .map_err(|error| format!("record copied fixture front ownership: {error}"))?;
+            }
+            self.backend.platform.scanout_pools[output_idx] = Some(OutputScanout::Copied(copied));
+        }
         Ok(())
     }
 }

@@ -18,6 +18,8 @@ pub(crate) struct StagedCursorFrame {
     pub(crate) owner: CursorCommitOwner,
     pub(crate) plan: CursorFramePlan,
     pub(crate) primary_cursor: Option<CursorPrimaryContent>,
+    pub(crate) cursor_updates: Vec<CursorPlaneUpdate>,
+    pub(crate) cursor_updates_reserved: bool,
 }
 
 pub(crate) fn stage_cursor_frame(
@@ -38,6 +40,8 @@ pub(crate) fn stage_cursor_frame(
             owner: CursorCommitOwner::Scene(plan.frame),
             plan,
             primary_cursor: None,
+            cursor_updates: Vec::new(),
+            cursor_updates_reserved: false,
         },
     );
     Ok(())
@@ -54,8 +58,99 @@ pub(crate) fn cancel_cursor_frame(
         .staged_cursor_frames
         .get(&key)
         .is_some_and(|staged| staged.plan.frame == frame)
+        && let Some(staged) = platform.staged_cursor_frames.remove(&key)
+        && staged.cursor_updates_reserved
     {
-        platform.staged_cursor_frames.remove(&key);
+        platform.reject_cursor_plane_update_reservations(&staged.cursor_updates);
+    }
+}
+
+pub(crate) fn store_cursor_frame_updates(
+    platform: &mut PlatformBackend,
+    output_idx: usize,
+    bo_idx: usize,
+    frame: CursorFrameId,
+    updates: Vec<CursorPlaneUpdate>,
+    reserved: bool,
+) -> io::Result<()> {
+    let staged = platform
+        .staged_cursor_frames
+        .get_mut(&(output_idx, bo_idx))
+        .ok_or_else(|| io::Error::other("cursor frame plan was not staged"))?;
+    if staged.plan.frame != frame {
+        return Err(io::Error::other("cursor frame plan identity mismatch"));
+    }
+    staged.cursor_updates = updates;
+    staged.cursor_updates_reserved = reserved;
+    Ok(())
+}
+
+/// The copied job keeps its frame's cursor lease, but position remains live
+/// until the final atomic request is built. Rebuild only the position delta
+/// from the current pointer while retaining the frame-owned sprite lease.
+pub(crate) fn cursor_frame_updates_for_submit(
+    platform: &PlatformBackend,
+    output_idx: usize,
+    bo_idx: usize,
+    frame: CursorFrameId,
+) -> io::Result<Vec<CursorPlaneUpdate>> {
+    let staged = platform
+        .staged_cursor_frames
+        .get(&(output_idx, bo_idx))
+        .filter(|staged| staged.plan.frame == frame)
+        .ok_or_else(|| io::Error::other("copied cursor frame identity mismatch"))?;
+    let mut updates = staged.cursor_updates.clone();
+    let layout = platform
+        .outputs
+        .get(output_idx)
+        .ok_or_else(|| io::Error::other("copied cursor output disappeared"))?;
+    let pointer = platform.cursor_pointer_root;
+    for update in &mut updates {
+        let Some(mut next) = update.prepared.next else {
+            continue;
+        };
+        if update.device_key != layout.key.device_key || update.crtc != layout.output.crtc {
+            continue;
+        }
+        let (x, y) = super::cursor::cursor_root_to_crtc_local(
+            pointer.0, pointer.1, layout.x, layout.y, next.hot_x, next.hot_y,
+        );
+        next.x = x;
+        next.y = y;
+        let device = platform
+            .device_for_key(update.device_key)
+            .ok_or_else(|| io::Error::other("copied cursor device disappeared"))?;
+        let state = device.cursor.crtc_states.get(&update.crtc);
+        let valid = state.is_some_and(|state| state.valid);
+        let (width, height) = device
+            .cursor
+            .plane
+            .as_ref()
+            .map_or((0, 0), |plane| (plane.width(), plane.height()));
+        update.prepared = super::cursor_commit::prepare_cursor_commit(
+            next.properties,
+            update.crtc,
+            update.prepared.prior,
+            valid,
+            Some(next),
+            width,
+            height,
+        );
+        update.motion_timestamp = state.and_then(|state| state.intent_motion_timestamp);
+    }
+    Ok(updates)
+}
+
+pub(crate) fn mark_cursor_frame_updates_settled(
+    platform: &mut PlatformBackend,
+    output_idx: usize,
+    bo_idx: usize,
+    frame: CursorFrameId,
+) {
+    if let Some(staged) = platform.staged_cursor_frames.get_mut(&(output_idx, bo_idx))
+        && staged.plan.frame == frame
+    {
+        staged.cursor_updates_reserved = false;
     }
 }
 
@@ -117,6 +212,7 @@ pub(crate) fn accept_cursor_frame(
     let staged = platform.staged_cursor_frames.remove(&(output_idx, bo_idx));
     debug_assert!(staged.as_ref().is_some_and(|staged| {
         staged.owner == CursorCommitOwner::Scene(frame)
+            && !staged.cursor_updates_reserved
             && staged
                 .primary_cursor
                 .is_none_or(|recorded| recorded == primary_cursor)
@@ -145,15 +241,30 @@ pub(crate) fn cancel_cursor_frame_for_slot(
     output_idx: usize,
     bo_idx: usize,
 ) {
-    platform.staged_cursor_frames.remove(&(output_idx, bo_idx));
+    if let Some(staged) = platform.staged_cursor_frames.remove(&(output_idx, bo_idx))
+        && staged.cursor_updates_reserved
+    {
+        platform.reject_cursor_plane_update_reservations(&staged.cursor_updates);
+    }
 }
 
 pub(crate) fn clear_cursor_frames(platform: &mut PlatformBackend) {
-    platform.staged_cursor_frames.clear();
+    let staged = std::mem::take(&mut platform.staged_cursor_frames);
+    for frame in staged.into_values() {
+        if frame.cursor_updates_reserved {
+            platform.reject_cursor_plane_update_reservations(&frame.cursor_updates);
+        }
+    }
 }
 
 pub(crate) fn cancel_cursor_frames_for_output(platform: &mut PlatformBackend, output_idx: usize) {
-    platform
+    let staged = platform
         .staged_cursor_frames
-        .retain(|(staged_output_idx, _), _| *staged_output_idx != output_idx);
+        .keys()
+        .filter(|(staged_output_idx, _)| *staged_output_idx == output_idx)
+        .copied()
+        .collect::<Vec<_>>();
+    for key in staged {
+        cancel_cursor_frame_for_slot(platform, key.0, key.1);
+    }
 }

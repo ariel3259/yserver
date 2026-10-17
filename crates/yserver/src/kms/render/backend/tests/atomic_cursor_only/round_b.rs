@@ -219,10 +219,13 @@ fn atomic_cursor_only_copied_scene_routes_to_sink_device_via_backend() {
     damage_cursor_root(&mut fixture);
     Backend::maybe_composite(&mut fixture.backend).expect("submit copied scene frame");
     let receipt_after_render = fixture.backend.scene.for_tests_cursor_commit_receipt(0);
-    let scene_commit_accepted = sink_atomic
-        .records()
-        .iter()
-        .any(|record| record.kind == crate::drm::atomic::AtomicCommitKind::Scene);
+    let scene_commit_accepted = sink_atomic.records().iter().any(|record| {
+        matches!(
+            record.kind,
+            crate::drm::atomic::AtomicCommitKind::Scene
+                | crate::drm::atomic::AtomicCommitKind::SceneWithCursor
+        )
+    });
     assert_eq!(
         receipt_after_render.is_some(),
         scene_commit_accepted,
@@ -272,11 +275,8 @@ fn atomic_cursor_only_copied_scene_routes_to_sink_device_via_backend() {
             .iter()
             .map(|record| record.kind)
             .collect::<Vec<_>>(),
-        vec![
-            crate::drm::atomic::AtomicCommitKind::Scene,
-            crate::drm::atomic::AtomicCommitKind::CursorOnly,
-        ],
-        "the copied first scene is followed by its accepted cursor attach",
+        vec![crate::drm::atomic::AtomicCommitKind::SceneWithCursor],
+        "the copied scene and its cursor attach are accepted atomically together",
     );
     assert_eq!(sink_atomic.records()[0].events.len(), 1);
     let properties = fixture
@@ -291,7 +291,7 @@ fn atomic_cursor_only_copied_scene_routes_to_sink_device_via_backend() {
         .properties_for(crtc)
         .expect("copied sink cursor properties");
     let initial_records = sink_atomic.records();
-    let attach_fields: Vec<_> = initial_records[1]
+    let attach_fields: Vec<_> = initial_records[0]
         .properties
         .iter()
         .filter(|update| update.object == properties.plane.into())
@@ -339,10 +339,7 @@ fn atomic_cursor_only_copied_scene_routes_to_sink_device_via_backend() {
             .iter()
             .map(|record| record.kind)
             .collect::<Vec<_>>(),
-        vec![
-            crate::drm::atomic::AtomicCommitKind::Scene,
-            crate::drm::atomic::AtomicCommitKind::CursorOnly,
-        ],
+        vec![crate::drm::atomic::AtomicCommitKind::SceneWithCursor],
         "copied attach uses the sink's atomic recorder and the newer intent survives until teardown",
     );
     assert_eq!(

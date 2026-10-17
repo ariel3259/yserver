@@ -24,10 +24,16 @@ use crate::{
             connectors::{
                 ConnectorSnapshotIo, DrmConnectorSnapshotIo, RecordingConnectorSnapshotIo,
             },
-            flip_events::{DrmPageFlipEventSource, PageFlipEventSource},
+            flip_events::{
+                DrmPageFlipEventSource, PageFlipEventSource, PollRenderCompletionReadiness,
+                RenderCompletionReadiness,
+            },
         },
     },
 };
+
+#[cfg(test)]
+use crate::kms::render::platform::flip_events::RecordingRenderCompletionReadiness;
 
 /// The low-level DRM `TEST_ONLY` probe used after Backend validates the
 /// drawable metadata, output geometry, and cursor state. Tests replace only
@@ -234,6 +240,7 @@ pub struct KmsServices {
     pub(crate) crtc_output_discovery: Rc<dyn CrtcOutputDiscovery>,
     pub(crate) atomic: Rc<dyn AtomicCommitExecutor>,
     pub(crate) page_flip_events: Rc<dyn PageFlipEventSource>,
+    pub(crate) render_completion_readiness: Rc<dyn RenderCompletionReadiness>,
     pub(crate) hotplug: Rc<dyn DisplayHotplugSource>,
     pub(crate) connector_snapshot: Rc<dyn ConnectorSnapshotIo>,
     pub(crate) monotonic_clock: Rc<dyn Fn() -> Instant>,
@@ -274,6 +281,8 @@ pub(crate) struct KmsTestRecorders {
     pub(crate) gamma: Rc<RecordingGammaIo>,
     pub(crate) page_flip_events:
         Rc<crate::kms::render::platform::flip_events::RecordingPageFlipEventSource>,
+    #[cfg(test)]
+    pub(crate) render_completion_readiness: Rc<RecordingRenderCompletionReadiness>,
     pub(crate) hotplug: Rc<RecordingDisplayHotplugSource>,
     pub(crate) connector_snapshot: Rc<RecordingConnectorSnapshotIo>,
     #[cfg(test)]
@@ -471,6 +480,7 @@ impl KmsServices {
             crtc_output_discovery: Rc::new(DrmCrtcOutputDiscovery),
             atomic: Rc::new(DrmAtomicCommitExecutor),
             page_flip_events: Rc::new(DrmPageFlipEventSource),
+            render_completion_readiness: Rc::new(PollRenderCompletionReadiness),
             hotplug: Rc::new(DrmDisplayHotplugSource::new()),
             connector_snapshot: Rc::new(DrmConnectorSnapshotIo),
             monotonic_clock: Rc::new(Instant::now),
@@ -496,6 +506,7 @@ impl KmsServices {
         let page_flip_events = Rc::new(
             crate::kms::render::platform::flip_events::RecordingPageFlipEventSource::default(),
         );
+        let render_completion_readiness = Rc::new(RecordingRenderCompletionReadiness::default());
         let hotplug =
             Rc::new(RecordingDisplayHotplugSource::new().expect("recording hotplug socket pair"));
         let connector_snapshot = Rc::new(RecordingConnectorSnapshotIo::new());
@@ -512,6 +523,7 @@ impl KmsServices {
             output_power,
             gamma: Rc::clone(&gamma),
             page_flip_events: Rc::clone(&page_flip_events),
+            render_completion_readiness: Rc::clone(&render_completion_readiness),
             hotplug: Rc::clone(&hotplug),
             connector_snapshot: Rc::clone(&connector_snapshot),
             direct_scanout_test_only: Rc::clone(&direct_scanout_test_only),
@@ -526,6 +538,7 @@ impl KmsServices {
             crtc_output_discovery,
             atomic,
             page_flip_events,
+            render_completion_readiness,
             hotplug,
             connector_snapshot,
             monotonic_clock: Rc::new(Instant::now),
@@ -557,6 +570,7 @@ impl KmsServices {
             crtc_output_discovery: Rc::new(DrmCrtcOutputDiscovery),
             atomic,
             page_flip_events,
+            render_completion_readiness: Rc::new(PollRenderCompletionReadiness),
             hotplug,
             connector_snapshot: Rc::new(RecordingConnectorSnapshotIo::new()),
             monotonic_clock: Rc::new(Instant::now),

@@ -41,6 +41,36 @@ impl PlatformBackend {
     pub(crate) fn for_tests_pending_scanout_render_completion_count(&self) -> usize {
         self.pending_scanout_render_completions.len()
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_pending_scanout_render_completion_ids(&self) -> Vec<u64> {
+        self.pending_scanout_render_completions
+            .iter()
+            .map(|pending| pending.job_id)
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_pending_scanout_render_completion_associations(
+        &self,
+    ) -> Vec<(
+        u64,
+        super::CrtcKey,
+        usize,
+        crate::kms::render::scene::CursorFrameId,
+    )> {
+        self.pending_scanout_render_completions
+            .iter()
+            .map(|pending| {
+                (
+                    pending.job_id,
+                    pending.crtc_key,
+                    pending.bo_idx,
+                    pending.cursor_frame,
+                )
+            })
+            .collect()
+    }
 }
 
 impl OutputSink for PlatformBackend {
@@ -140,11 +170,6 @@ impl OutputSink for PlatformBackend {
             .copied()
             .flatten()
             .unwrap_or(self.requested_flip_timing);
-        let shared_route = self
-            .scanout_pools
-            .get(output_idx)
-            .and_then(Option::as_ref)
-            .is_some_and(|pool| matches!(pool, OutputScanout::Shared(_)));
         let target_slot_exists = self
             .scanout_pools
             .get(output_idx)
@@ -168,8 +193,7 @@ impl OutputSink for PlatformBackend {
         // Async requests are cursorless by construction. Do not prepare or
         // reserve a cursor delta that an Async EINVAL fallback could later
         // accidentally settle as accepted.
-        let scene_cursor_owner =
-            shared_route && timing == crate::drm::async_flip::FlipTiming::Vsync;
+        let scene_cursor_owner = timing == crate::drm::async_flip::FlipTiming::Vsync;
         let cursor_updates = if scene_cursor_owner {
             match super::cursor_frames::prepare_frame_cursor_commit(self, output_idx, bo_idx, frame)
             {
@@ -183,6 +207,18 @@ impl OutputSink for PlatformBackend {
             Vec::new()
         };
         if let Err(error) = self.reserve_cursor_plane_updates(&cursor_updates) {
+            super::cursor_frames::cancel_cursor_frame(self, output_idx, bo_idx, frame);
+            return FinishOutcome::Unavailable(FrameTargetError::NoDevice(error));
+        }
+        if let Err(error) = super::cursor_frames::store_cursor_frame_updates(
+            self,
+            output_idx,
+            bo_idx,
+            frame,
+            cursor_updates.clone(),
+            !cursor_updates.is_empty(),
+        ) {
+            self.reject_cursor_plane_update_reservations(&cursor_updates);
             super::cursor_frames::cancel_cursor_frame(self, output_idx, bo_idx, frame);
             return FinishOutcome::Unavailable(FrameTargetError::NoDevice(error));
         }
@@ -284,11 +320,21 @@ impl OutputSink for PlatformBackend {
                 self.tearing_copy_received_monotonic = None;
             }
         }
+        let copied_handoff_waiting = matches!(
+            &outcome,
+            FinishOutcome::Finished {
+                result: Ok(FrameHandoff::RenderCompletion { .. }),
+                ..
+            }
+        );
         if cursor_rejected {
             // A scene-owned cursor rejection abandons this frame with its old
             // primary and actual binding intact. Recovery may recompose; no
             // cursor-only intent is published from the rejected frame plan.
             self.reject_cursor_plane_update_reservations(&cursor_updates);
+            super::cursor_frames::mark_cursor_frame_updates_settled(
+                self, output_idx, bo_idx, frame,
+            );
         } else if shared_cursor_commit_submitted && scene_cursor_owner {
             if let Err(error) = self.cursor_plane_scene_frame_submitted(output_idx, &cursor_updates)
             {
@@ -299,11 +345,20 @@ impl OutputSink for PlatformBackend {
                 self.quarantine_cursor_output(output_idx);
                 self.gpu.renderer_failed = true;
             }
+            super::cursor_frames::mark_cursor_frame_updates_settled(
+                self, output_idx, bo_idx, frame,
+            );
         } else if shared_cursor_commit_submitted {
             self.cursor_plane_scene_commit_submitted(&cursor_updates)
                 .expect("accepted shared scene commit keeps its reserved cursor leases");
-        } else {
+            super::cursor_frames::mark_cursor_frame_updates_settled(
+                self, output_idx, bo_idx, frame,
+            );
+        } else if !copied_handoff_waiting {
             self.reject_cursor_plane_update_reservations(&cursor_updates);
+            super::cursor_frames::mark_cursor_frame_updates_settled(
+                self, output_idx, bo_idx, frame,
+            );
         }
         match &mut outcome {
             FinishOutcome::Finished {
@@ -378,7 +433,14 @@ impl OutputSink for PlatformBackend {
         fd: Option<OwnedFd>,
     ) -> io::Result<u64> {
         let output_key = self.outputs[output_idx].key.clone();
-        match self.register_scanout_render_completion(output_key, bo_idx, fd) {
+        let Some(frame) = super::cursor_frames::staged_cursor_frame_id(self, output_idx, bo_idx)
+        else {
+            super::cursor_frames::cancel_cursor_frame_for_slot(self, output_idx, bo_idx);
+            return Err(io::Error::other(
+                "scanout completion has no staged cursor frame",
+            ));
+        };
+        match self.register_scanout_render_completion(output_key, bo_idx, frame, fd) {
             Ok(job_id) => Ok(job_id),
             Err(error) => {
                 super::cursor_frames::cancel_cursor_frame_for_slot(self, output_idx, bo_idx);
@@ -390,15 +452,36 @@ impl OutputSink for PlatformBackend {
     fn drain_render_completions(&mut self) -> Vec<RenderCompletion> {
         self.drain_scanout_render_completions()
             .into_iter()
-            .map(|completion| RenderCompletion {
-                job_id: completion.job_id,
-                output: self
+            .filter_map(|completion| {
+                let output_idx = self
                     .outputs
                     .iter()
-                    .position(|output| output.key == completion.output_key)
-                    .ok_or_else(|| format!("{:?}", completion.output_key)),
-                bo_idx: completion.bo_idx,
-                fd: completion.fd,
+                    .position(|output| output.key == completion.output_key);
+                let still_owned = output_idx.is_some_and(|output_idx| {
+                    super::CrtcKey::for_output(&self.outputs[output_idx]) == completion.crtc_key
+                        && super::cursor_frames::staged_cursor_frame_id(
+                            self,
+                            output_idx,
+                            completion.bo_idx,
+                        ) == Some(completion.cursor_frame)
+                });
+                if !still_owned {
+                    if let Some(output_idx) = output_idx {
+                        super::cursor_frames::cancel_cursor_frame(
+                            self,
+                            output_idx,
+                            completion.bo_idx,
+                            completion.cursor_frame,
+                        );
+                    }
+                    return None;
+                }
+                Some(RenderCompletion {
+                    job_id: completion.job_id,
+                    output: Ok(output_idx.expect("owned completion has an output")),
+                    bo_idx: completion.bo_idx,
+                    fd: completion.fd,
+                })
             })
             .collect()
     }
@@ -421,8 +504,34 @@ impl OutputSink for PlatformBackend {
             .get(&(output_idx, bo_idx))
             .and_then(|staged| staged.primary_cursor)
             .ok_or_else(|| io::Error::other("copied cursor frame has no recorded pixels"))?;
-        match self.submit_copied_scanout(output_idx, bo_idx, fd) {
+        let cursor_updates = match super::cursor_frames::cursor_frame_updates_for_submit(
+            self, output_idx, bo_idx, frame,
+        ) {
+            Ok(updates) => updates,
+            Err(error) => {
+                super::cursor_frames::cancel_cursor_frame(self, output_idx, bo_idx, frame);
+                return Err(error);
+            }
+        };
+        match self.submit_copied_scanout(output_idx, bo_idx, fd, &cursor_updates) {
             Ok(()) => {
+                if let Err(error) =
+                    self.cursor_plane_scene_frame_submitted(output_idx, &cursor_updates)
+                {
+                    log::error!(
+                        "accepted copied scene frame could not settle cursor leases: {error}"
+                    );
+                    self.quarantine_cursor_output(output_idx);
+                    self.gpu.renderer_failed = true;
+                    super::cursor_frames::mark_cursor_frame_updates_settled(
+                        self, output_idx, bo_idx, frame,
+                    );
+                    super::cursor_frames::cancel_cursor_frame(self, output_idx, bo_idx, frame);
+                    return Err(error);
+                }
+                super::cursor_frames::mark_cursor_frame_updates_settled(
+                    self, output_idx, bo_idx, frame,
+                );
                 let mode = self.accepted_cursor_mode(output_idx, primary_cursor);
                 Ok(super::cursor_frames::accept_cursor_frame(
                     self,
@@ -433,9 +542,17 @@ impl OutputSink for PlatformBackend {
                     primary_cursor,
                 ))
             }
-            Err(error) => {
+            Err(submit_error) => {
+                if submit_error.cursor_rejected {
+                    let outcome =
+                        self.reject_atomic_cursor_commit(&cursor_updates, &submit_error.error);
+                    self.defer_cursor_move_outcome(outcome);
+                    super::cursor_frames::mark_cursor_frame_updates_settled(
+                        self, output_idx, bo_idx, frame,
+                    );
+                }
                 super::cursor_frames::cancel_cursor_frame(self, output_idx, bo_idx, frame);
-                Err(error)
+                Err(submit_error.error)
             }
         }
     }

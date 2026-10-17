@@ -125,7 +125,9 @@ const WAKEUP_EVENTFD_TOKEN: u64 = u64::MAX;
 struct PendingScanoutRenderCompletion {
     job_id: u64,
     output_key: OutputKey,
+    crtc_key: CrtcKey,
     bo_idx: usize,
+    cursor_frame: yserver_render::kms::render::scene::CursorFrameId,
     /// `None` is Vulkan's valid already-signalled SYNC_FD payload (`fd=-1`).
     /// It bypasses readiness polling but remains a real synchronization
     /// payload that the sink imports as raw -1.
@@ -137,7 +139,9 @@ struct PendingScanoutRenderCompletion {
 pub(crate) struct ReadyScanoutRenderCompletion {
     pub(crate) job_id: u64,
     pub(crate) output_key: OutputKey,
+    pub(crate) crtc_key: CrtcKey,
     pub(crate) bo_idx: usize,
+    pub(crate) cursor_frame: yserver_render::kms::render::scene::CursorFrameId,
     pub(crate) fd: Option<OwnedFd>,
 }
 
@@ -536,9 +540,6 @@ pub struct PlatformBackend {
     /// Present completion poller: the two readiness streams have different
     /// ownership, cancellation, and delivery semantics.
     scanout_render_completion_epfd: crate::kms::render::completion_poller::CompletionPoller,
-    /// Readiness source for copied-render completion delivery. Tests may
-    /// select a holding source before a scenario to exercise cancellation.
-    pub(crate) scanout_completion_readiness: Rc<dyn flip_events::ScanoutCompletionReadiness>,
     pending_scanout_render_completions: std::collections::VecDeque<PendingScanoutRenderCompletion>,
     next_scanout_render_job_id: u64,
 

@@ -1,6 +1,6 @@
 use crate::kms::render::{
     scene::{
-        FailedSubmitBo, InFlightStage, OutputCursorMode, OutputRoute, OutputSceneState, OutputSink,
+        FailedSubmitBo, InFlightStage, OutputCursorMode, OutputSceneState, OutputSink,
         RenderCompletion, SceneCompositor, SceneCompositorInner,
         cursor::{
             apply_cursor_transition_on_retire, force_cursor_retry_repaint,
@@ -196,30 +196,28 @@ impl SceneCompositor {
             // Hw after a rolled-back show and never claim Sw/Hidden while a
             // failed hide or rollback left the hardware sprite visible.
             let retained_mode = inner.outputs[output_idx].last_frame_cursor_mode;
-            let shared_frame_receipt = (sink.route(output_idx) == OutputRoute::Shared)
-                .then_some(ack.cursor_receipt)
-                .flatten()
+            let frame_receipt = ack
+                .cursor_receipt
                 .filter(|receipt| receipt.frame == Some(ack.cursor_frame.frame));
-            let (cursor_result, cursor_mode_after_retire) =
-                if let Some(receipt) = shared_frame_receipt {
-                    // The shared frame already accepted its cursor delta with
-                    // the primary. Retirement records that receipt; it must
-                    // not issue a second show/hide transaction.
-                    (
-                        crate::kms::render::scene::CursorTransitionResult::Applied,
-                        output_cursor_mode_from_receipt(receipt),
-                    )
-                } else {
-                    (
-                        apply_cursor_transition_on_retire(
-                            inner,
-                            output_idx,
-                            sink,
-                            ack.cursor_transition,
-                        ),
-                        ack.cursor_mode_after_retire,
-                    )
-                };
+            let (cursor_result, cursor_mode_after_retire) = if let Some(receipt) = frame_receipt {
+                // The primary frame already accepted its cursor delta.
+                // Retirement records that receipt; it must not issue a
+                // second show/hide transaction.
+                (
+                    crate::kms::render::scene::CursorTransitionResult::Applied,
+                    output_cursor_mode_from_receipt(receipt),
+                )
+            } else {
+                (
+                    apply_cursor_transition_on_retire(
+                        inner,
+                        output_idx,
+                        sink,
+                        ack.cursor_transition,
+                    ),
+                    ack.cursor_mode_after_retire,
+                )
+            };
             let state = inner
                 .outputs
                 .get_mut(output_idx)
