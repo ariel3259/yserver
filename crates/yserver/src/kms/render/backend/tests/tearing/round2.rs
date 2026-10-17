@@ -178,12 +178,8 @@ fn finish_held_direct_cursor_test(
     assert_eq!(records.len(), before_unflip + 1);
     assert_eq!(
         records[before_unflip].kind,
-        if visible_cursor_output.is_some() {
-            AtomicCommitKind::SceneWithCursor
-        } else {
-            AtomicCommitKind::Scene
-        },
-        "the grouped unflip carries the bound cursor position when visible"
+        AtomicCommitKind::Scene,
+        "the grouped unflip omits cursor properties already accepted by an earlier commit"
     );
     assert_eq!(
         backend.pstate.scanout_m2.unflip_awaiting_outputs,
@@ -313,8 +309,8 @@ fn define_cursor_rebind_routes_motion_to_bound_plane_during_vsync_direct_scanout
     let mut expected = vec![AtomicCommitKind::Scene];
     expected.extend([AtomicCommitKind::CursorOnly; 2]);
     expected.extend([AtomicCommitKind::CursorOnly; 10]);
-    expected.push(AtomicCommitKind::SceneWithCursor);
-    expected.extend([AtomicCommitKind::SceneWithCursor; 2]);
+    expected.push(AtomicCommitKind::Scene);
+    expected.extend([AtomicCommitKind::Scene; 2]);
     expected.push(AtomicCommitKind::CursorOnly);
     assert_commit_sequence(&recorder, &expected);
     backend.platform.wait_idle_bounded();
@@ -870,7 +866,7 @@ fn tearing_on_rejected_cursor_detach_stays_vsync_until_backend_retry() {
     Backend::maybe_composite(&mut backend).expect("submit tearing handoff scene");
     assert_eq!(
         recorder.records().last().unwrap().kind,
-        AtomicCommitKind::SceneWithCursor
+        AtomicCommitKind::Scene
     );
     recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
     retire_composed_frame(&mut backend, &mut state, 71);
@@ -951,10 +947,10 @@ fn tearing_on_rejected_cursor_detach_stays_vsync_until_backend_retry() {
     assert_direct_queue_drained(&backend);
     assert!(backend.platform.async_ledger.for_tests_is_empty());
     let records = recorder.records();
-    let mut expected = vec![AtomicCommitKind::SceneWithCursor; 9];
+    let mut expected = vec![AtomicCommitKind::Scene; 9];
     expected.extend([
         AtomicCommitKind::CursorOnly,
-        AtomicCommitKind::SceneWithCursor,
+        AtomicCommitKind::Scene,
         AtomicCommitKind::CursorOnly,
         AtomicCommitKind::Async,
     ]);

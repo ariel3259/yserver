@@ -3,7 +3,7 @@ use crate::kms::{
     render::platform::{
         CursorFailureDisposition, CursorMoveOutcome, KmsCursorState, KmsDevice, PlatformBackend,
         TransientCursorFallback,
-        cursor_state::{CursorBinding, CursorIntent},
+        cursor_state::{CursorBinding, CursorIntent, CursorPlaneUpdate},
     },
 };
 use std::{
@@ -68,8 +68,6 @@ impl KmsCursorState {
             crtc_states: HashMap::new(),
             pending_move: None,
             pending_move_timestamp: None,
-            atomic_positions: HashMap::new(),
-            atomic_pending_moves: HashMap::new(),
             atomic_cursor_commits_in_flight: HashMap::new(),
             cursor_retry_waits_for_flip: HashSet::new(),
             cursor_hide_recovery: HashMap::new(),
@@ -83,40 +81,10 @@ impl KmsCursorState {
         }
     }
 
-    fn remember_atomic_position(
-        &mut self,
-        device_key: crate::platform::drm::DrmDeviceKey,
-        crtc: ::drm::control::crtc::Handle,
-        x: i32,
-        y: i32,
-        motion_timestamp: Option<Instant>,
-    ) {
-        let Some((plane, crtc_x, crtc_y)) = self
-            .plane
-            .as_ref()
-            .and_then(|plane| plane.atomic_position_properties(crtc))
-        else {
-            return;
-        };
-        let position = crate::drm::atomic::CursorPlanePosition {
-            device_key,
-            crtc,
-            plane,
-            crtc_x,
-            crtc_y,
-            x,
-            y,
-            motion_timestamp,
-        };
-        self.atomic_positions.insert(crtc, position);
-        if !self.cursor_hide_recovery.contains_key(&crtc) {
-            self.atomic_pending_moves.insert(crtc, position);
-        }
-    }
-
     fn clear_atomic_position(&mut self, crtc: ::drm::control::crtc::Handle) {
-        self.atomic_positions.remove(&crtc);
-        self.atomic_pending_moves.remove(&crtc);
+        if let Some(state) = self.crtc_states.get_mut(&crtc) {
+            state.intent_motion_timestamp = None;
+        }
     }
 
     fn available_on(&self, crtc: ::drm::control::crtc::Handle) -> bool {
@@ -443,66 +411,189 @@ impl PlatformBackend {
             .is_some_and(|device| device.cursor.available_on(layout.output.crtc))
     }
 
-    /// Latest position for every listed output whose owning device selected
-    /// the atomic cursor path and whose cursor plane is currently visible.
-    #[must_use]
+    fn prepare_cursor_update_for_output(
+        &self,
+        output_idx: usize,
+        primary_successor: bool,
+    ) -> Option<CursorPlaneUpdate> {
+        let layout = self.outputs.get(output_idx)?;
+        let device = self.device_for_key(layout.key.device_key)?;
+        let crtc = layout.output.crtc;
+        let cursor = &device.cursor;
+        let plane = cursor.plane.as_ref()?;
+        let properties = plane.properties_for(crtc)?;
+        if cursor.permanently_disabled
+            || cursor.cursor_hide_recovery.contains_key(&crtc)
+            || cursor.atomic_cursor_commits_in_flight.contains_key(&crtc)
+        {
+            return None;
+        }
+        let state = cursor.crtc_states.get(&crtc)?;
+        if state.in_flight.is_some() {
+            return None;
+        }
+        let intent = state.intent?;
+        let mut next = match intent {
+            CursorIntent::Show(binding) => Some(binding),
+            CursorIntent::Hide => None,
+        };
+        // An EBUSY cursor show may leave a replacement image staged while a
+        // primary direct/unflip successor is already waiting for this CRTC.
+        // Let that successor carry only the motion of the accepted binding;
+        // the replacement remains the newest intent and is submitted after
+        // the successor's event retires.
+        if primary_successor
+            && cursor.cursor_retry_waits_for_flip.contains(&crtc)
+            && let (Some(prior), Some(wanted)) = (state.applied, next)
+            && prior.lease != wanted.lease
+        {
+            next = Some(CursorBinding {
+                x: wanted.x,
+                y: wanted.y,
+                ..prior
+            });
+        }
+        let prepared = super::cursor_commit::prepare_cursor_commit(
+            properties,
+            crtc,
+            state.applied,
+            state.valid,
+            next,
+            plane.width(),
+            plane.height(),
+        );
+        Some(CursorPlaneUpdate {
+            device_key: layout.key.device_key,
+            crtc,
+            motion_timestamp: prepared.next.and(state.intent_motion_timestamp),
+            prepared,
+        })
+    }
+
+    /// Prepare full-state deltas for one or more producer-owned commits. An
+    /// intent equal to accepted state is consumed without producing a DRM
+    /// request, so idle scheduling stays quiescent after coalesced motion.
+    pub(crate) fn cursor_plane_updates_for_outputs(
+        &mut self,
+        output_indices: &[usize],
+    ) -> Vec<CursorPlaneUpdate> {
+        self.cursor_plane_updates_for_outputs_with_policy(output_indices, false)
+    }
+
+    /// Prepare updates for producer-owned primary successors. A pending
+    /// replacement waiting for an older event may contribute position only
+    /// from the accepted binding; its staged lease stays in `intent`.
+    pub(crate) fn cursor_plane_updates_for_primary_outputs(
+        &mut self,
+        output_indices: &[usize],
+    ) -> Vec<CursorPlaneUpdate> {
+        self.cursor_plane_updates_for_outputs_with_policy(output_indices, true)
+    }
+
+    fn cursor_plane_updates_for_outputs_with_policy(
+        &mut self,
+        output_indices: &[usize],
+        primary_successor: bool,
+    ) -> Vec<CursorPlaneUpdate> {
+        let mut updates = Vec::new();
+        let mut noops = Vec::new();
+        for output_idx in output_indices {
+            if let Some(update) =
+                self.prepare_cursor_update_for_output(*output_idx, primary_successor)
+            {
+                if update.prepared.updates.is_empty() {
+                    noops.push((update.device_key, update.crtc));
+                } else {
+                    updates.push(update);
+                }
+            }
+        }
+        for (device_key, crtc) in noops {
+            if let Some(state) = self
+                .devices
+                .iter_mut()
+                .find(|device| device.key == device_key)
+                .and_then(|device| device.cursor.crtc_states.get_mut(&crtc))
+            {
+                state.intent = None;
+                state.intent_motion_timestamp = None;
+            }
+        }
+        updates
+    }
+
+    /// Read-only preparation used by TEST_ONLY direct probes. It cannot
+    /// reserve leases, publish accepted state, or create event obligations.
+    pub(crate) fn preview_cursor_plane_updates_for_outputs(
+        &self,
+        output_indices: &[usize],
+    ) -> Vec<CursorPlaneUpdate> {
+        output_indices
+            .iter()
+            .filter_map(|output_idx| self.prepare_cursor_update_for_output(*output_idx, true))
+            .filter(|update| !update.prepared.updates.is_empty())
+            .collect()
+    }
+
+    #[cfg(test)]
     pub(crate) fn cursor_plane_atomic_positions_for_outputs(
         &self,
         output_indices: &[usize],
     ) -> Vec<crate::drm::atomic::CursorPlanePosition> {
-        let mut positions = Vec::new();
-        for output_idx in output_indices {
-            let Some(layout) = self.outputs.get(*output_idx) else {
-                continue;
-            };
-            let Some(device) = self.device_for_key(layout.key.device_key) else {
-                continue;
-            };
-            let crtc = layout.output.crtc;
-            if device
-                .cursor
-                .plane
-                .as_ref()
-                .is_none_or(|plane| plane.properties_for(crtc).is_none())
-                || device.cursor.permanently_disabled
-                || device.cursor.cursor_hide_recovery.contains_key(&crtc)
-                || !device
-                    .cursor
-                    .crtc_states
-                    .get(&crtc)
-                    .is_some_and(|state| state.applied.is_some())
-            {
-                continue;
-            }
-            if let Some(position) = device.cursor.atomic_positions.get(&crtc).copied() {
-                positions.push(position);
-            }
-        }
-        positions
-    }
-
-    /// Whether a cursor-only position can make the scheduling pass runnable.
-    pub(crate) fn has_eligible_atomic_cursor_move(&self) -> bool {
-        self.devices.iter().any(|device| {
-            device.cursor.crtc_states.iter().any(|(crtc, state)| {
-                device
+        output_indices
+            .iter()
+            .filter_map(|output_idx| {
+                let layout = self.outputs.get(*output_idx)?;
+                let device = self.device_for_key(layout.key.device_key)?;
+                let crtc = layout.output.crtc;
+                let state = device.cursor.crtc_states.get(&crtc)?;
+                if device.cursor.permanently_disabled || state.applied.is_none() {
+                    return None;
+                }
+                let binding = match state.intent {
+                    Some(CursorIntent::Show(binding)) => binding,
+                    Some(CursorIntent::Hide) | None => state.applied?,
+                };
+                let (plane, crtc_x, crtc_y) = device
                     .cursor
                     .plane
-                    .as_ref()
-                    .is_some_and(|plane| plane.properties_for(*crtc).is_some())
-                    && state.intent.is_some()
-                    && state.in_flight.is_none()
-                    && !device
-                        .cursor
-                        .atomic_cursor_commits_in_flight
-                        .contains_key(crtc)
+                    .as_ref()?
+                    .atomic_position_properties(crtc)?;
+                Some(crate::drm::atomic::CursorPlanePosition {
+                    device_key: layout.key.device_key,
+                    crtc,
+                    plane,
+                    crtc_x,
+                    crtc_y,
+                    x: binding.x,
+                    y: binding.y,
+                    motion_timestamp: state.intent_motion_timestamp,
+                })
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_eligible_atomic_cursor_move(&self) -> bool {
+        self.has_eligible_atomic_cursor_intent()
+    }
+
+    /// Whether a full-state cursor intent can make the scheduling pass runnable.
+    pub(crate) fn has_eligible_atomic_cursor_intent(&self) -> bool {
+        self.devices.iter().any(|device| {
+            device.cursor.crtc_states.iter().any(|(crtc, state)| {
+                state.intent.is_some()
                     && !device.cursor.cursor_retry_waits_for_flip.contains(crtc)
-                    && !device.cursor.cursor_hide_recovery.contains_key(crtc)
-                    && match state.intent {
-                        Some(CursorIntent::Show(_)) => device.cursor.available_on(*crtc),
-                        Some(CursorIntent::Hide) => true,
-                        None => false,
-                    }
+                    && self
+                        .outputs
+                        .iter()
+                        .position(|layout| {
+                            layout.key.device_key == device.key && layout.output.crtc == *crtc
+                        })
+                        .and_then(|output_idx| {
+                            self.prepare_cursor_update_for_output(output_idx, false)
+                        })
+                        .is_some_and(|update| !update.prepared.updates.is_empty())
             })
         })
     }
@@ -566,35 +657,17 @@ impl PlatformBackend {
             .any(|device| !device.cursor.atomic_cursor_commits_in_flight.is_empty())
     }
 
-    /// Submit the pending move for one output. The caller is the scheduling
-    /// pass, after direct and scene work have had their turn. A rejected ioctl
-    /// leaves the position unsent and creates no in-flight record.
-    pub(crate) fn submit_atomic_cursor_move_for_output(
+    /// Submit the newest full-state cursor intent for one output. The caller
+    /// runs after direct and scene producers have had their turn. Only an
+    /// accepted delta creates an event obligation.
+    pub(crate) fn submit_atomic_cursor_intent_for_output(
         &mut self,
         output_idx: usize,
     ) -> io::Result<CursorMoveOutcome> {
-        let submitted = self.submit_atomic_cursor_intent_for_output(output_idx)?;
-        if submitted
-            && let Some(layout) = self.outputs.get(output_idx)
-            && let Some(device) = self.device_for_key(layout.key.device_key)
-            && device
-                .cursor
-                .cursor_retry_waits_for_flip
-                .contains(&layout.output.crtc)
-        {
-            return Ok(CursorMoveOutcome {
-                ebusy_count: 1,
-                ..CursorMoveOutcome::default()
-            });
-        }
-        Ok(CursorMoveOutcome::default())
-    }
-
-    fn submit_atomic_cursor_intent_for_output(&mut self, output_idx: usize) -> io::Result<bool> {
         use ::drm::control::AtomicCommitFlags;
 
         let Some(layout) = self.outputs.get(output_idx) else {
-            return Ok(false);
+            return Ok(CursorMoveOutcome::default());
         };
         let device_key = layout.key.device_key;
         let crtc = layout.output.crtc;
@@ -603,93 +676,41 @@ impl PlatformBackend {
             .iter()
             .position(|device| device.key == device_key)
         else {
-            return Ok(false);
+            return Ok(CursorMoveOutcome::default());
         };
-        let (prepared, device, sink, lease_to_reserve, motion_timestamp) = {
-            let cursor = &mut self.devices[device_idx].cursor;
-            let Some(plane) = cursor.plane.as_ref() else {
-                return Ok(false);
-            };
-            let Some(properties) = plane.properties_for(crtc) else {
-                return Ok(false);
-            };
-            if cursor.atomic_cursor_commits_in_flight.contains_key(&crtc)
-                || cursor.cursor_retry_waits_for_flip.contains(&crtc)
-            {
-                cursor.cursor_retry_waits_for_flip.insert(crtc);
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "cursor atomic commit waits for the prior CRTC event",
-                ));
-            }
-            let Some(state) = cursor.crtc_states.get(&crtc) else {
-                return Ok(false);
-            };
-            let Some(intent) = state.intent else {
-                return Ok(false);
-            };
-            if matches!(intent, CursorIntent::Show(_)) && !cursor.available_on(crtc) {
-                return Ok(false);
-            }
-            let next = match intent {
-                CursorIntent::Show(binding) => Some(binding),
-                CursorIntent::Hide => None,
-            };
-            let prepared = super::cursor_commit::prepare_cursor_commit(
-                properties,
-                crtc,
-                state.applied,
-                state.valid,
-                next,
-                plane.width(),
-                plane.height(),
-            );
-            let lease_to_reserve = prepared
-                .next
-                .filter(|next| prepared.prior.is_none_or(|prior| prior.lease != next.lease))
-                .map(|binding| binding.lease);
-            let timestamp = prepared.next.and_then(|_| {
-                cursor
-                    .atomic_positions
-                    .get(&crtc)
-                    .and_then(|position| position.motion_timestamp)
-            });
-            (
-                prepared,
-                Rc::clone(&self.devices[device_idx].device),
-                Rc::clone(&self.devices[device_idx].atomic_commit_sink),
-                lease_to_reserve,
-                timestamp,
-            )
-        };
-
-        if prepared.updates.is_empty() {
-            let cursor = &mut self.devices[device_idx].cursor;
-            if let Some(state) = cursor.crtc_states.get_mut(&crtc) {
-                state.intent = None;
-            }
-            cursor.atomic_pending_moves.remove(&crtc);
-            return Ok(false);
-        }
-
-        if let Some(lease) = lease_to_reserve {
-            let reserved = self.devices[device_idx]
+        if self.devices[device_idx]
+            .cursor
+            .atomic_cursor_commits_in_flight
+            .contains_key(&crtc)
+            || self.devices[device_idx]
                 .cursor
-                .plane
-                .as_mut()
-                .is_some_and(|plane| plane.reserve_sprite(lease));
-            if !reserved {
-                return Err(io::Error::other(
-                    "cursor sprite lease became stale before submit",
-                ));
-            }
+                .cursor_retry_waits_for_flip
+                .contains(&crtc)
+        {
+            self.devices[device_idx]
+                .cursor
+                .cursor_retry_waits_for_flip
+                .insert(crtc);
+            return Ok(CursorMoveOutcome {
+                ebusy_count: 1,
+                ..CursorMoveOutcome::default()
+            });
         }
-
+        let updates = self.cursor_plane_updates_for_outputs(&[output_idx]);
+        if updates.is_empty() {
+            return Ok(CursorMoveOutcome::default());
+        }
+        self.reserve_cursor_plane_updates(&updates)?;
+        let device = Rc::clone(&self.devices[device_idx].device);
+        let sink = Rc::clone(&self.devices[device_idx].atomic_commit_sink);
         let event = crate::drm::atomic::AtomicCommitEvent {
             crtc,
-            motion_timestamp,
+            motion_timestamp: updates
+                .iter()
+                .find(|update| update.crtc == crtc)
+                .and_then(|update| update.motion_timestamp),
         };
-        let request = super::cursor_commit::request_for_cursor_commit(&prepared);
+        let request = super::cursor_commit::request_for_cursor_updates(&updates);
         if let Err(error) = sink.submit(
             &device,
             AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK,
@@ -697,90 +718,148 @@ impl PlatformBackend {
             request,
             &[event],
         ) {
-            let _ = sink.take_last_cursor_rejection();
-            if let Some(lease) = lease_to_reserve
-                && let Some(plane) = self.devices[device_idx].cursor.plane.as_mut()
-            {
-                plane.reject_reserved_sprite(lease);
-            }
+            let cursor_rejected = sink.take_last_cursor_rejection();
             if error.raw_os_error() == Some(libc::EBUSY) {
+                self.reject_cursor_plane_update_reservations(&updates);
                 self.devices[device_idx]
                     .cursor
                     .cursor_retry_waits_for_flip
                     .insert(crtc);
-                return Err(error);
+                return Ok(CursorMoveOutcome {
+                    ebusy_count: 1,
+                    ..CursorMoveOutcome::default()
+                });
             }
-            if let Some(state) = self.devices[device_idx].cursor.crtc_states.get_mut(&crtc) {
-                state.intent = None;
-            }
-            self.devices[device_idx]
-                .cursor
-                .note_cursor_failure_pair(crtc, &error, None);
-            self.devices[device_idx]
-                .cursor
-                .atomic_pending_moves
-                .remove(&crtc);
-            // The upload cache and SpritePool candidate describe the same
-            // staged image. Keep that candidate after rejection so the scene
-            // retry can reuse it without a second upload or allocation.
-            if prepared.prior.is_some() && prepared.next.is_none() {
-                self.scene_cursor_hide_failed = true;
+            if cursor_rejected {
+                let _ = self.reject_atomic_cursor_commit(&updates, &error);
+            } else {
+                self.reject_cursor_plane_update_reservations(&updates);
             }
             return Err(error);
         }
+        self.accept_cursor_plane_updates(&updates)?;
+        Ok(CursorMoveOutcome::default())
+    }
 
-        if let Some(lease) = lease_to_reserve {
-            let accepted = self.devices[device_idx]
+    pub(crate) fn reserve_cursor_plane_updates(
+        &mut self,
+        updates: &[CursorPlaneUpdate],
+    ) -> io::Result<()> {
+        let mut reserved = Vec::new();
+        for update in updates {
+            let Some(next) = update.prepared.next.filter(|next| {
+                update
+                    .prepared
+                    .prior
+                    .is_none_or(|prior| prior.lease != next.lease)
+            }) else {
+                continue;
+            };
+            let Some(device) = self
+                .devices
+                .iter_mut()
+                .find(|device| device.key == update.device_key)
+            else {
+                self.reject_cursor_plane_update_reservations(&reserved);
+                return Err(io::Error::other("cursor update device disappeared"));
+            };
+            if !device
                 .cursor
                 .plane
                 .as_mut()
-                .is_some_and(|plane| plane.accept_reserved_sprite(lease));
-            if !accepted {
+                .is_some_and(|plane| plane.reserve_sprite(next.lease))
+            {
+                self.reject_cursor_plane_update_reservations(&reserved);
                 return Err(io::Error::other(
-                    "accepted cursor commit lost its reserved framebuffer lease",
+                    "cursor sprite lease became stale before submit",
                 ));
             }
+            reserved.push(update.clone());
         }
-        let cursor = &mut self.devices[device_idx].cursor;
-        let state = cursor.crtc_states.entry(crtc).or_default();
-        state.applied = prepared.next;
-        state.valid = true;
-        if prepared.next.is_some() {
-            state.resume_visible = false;
-        }
-        state.intent = None;
-        state.in_flight = Some(prepared);
-        cursor.atomic_cursor_commits_in_flight.insert(crtc, ());
-        cursor.cursor_retry_waits_for_flip.remove(&crtc);
-        cursor.atomic_pending_moves.remove(&crtc);
-        if let Some(binding) = state.applied {
-            let position = cursor
-                .plane
-                .as_ref()
-                .and_then(|plane| plane.atomic_position_properties(crtc));
-            if let Some((plane, crtc_x, crtc_y)) = position {
-                let motion_timestamp = cursor
-                    .atomic_positions
-                    .get(&crtc)
-                    .and_then(|position| position.motion_timestamp);
-                cursor.atomic_positions.insert(
-                    crtc,
-                    crate::drm::atomic::CursorPlanePosition {
-                        device_key,
-                        crtc,
-                        plane,
-                        crtc_x,
-                        crtc_y,
-                        x: binding.x,
-                        y: binding.y,
-                        motion_timestamp,
-                    },
-                );
+        Ok(())
+    }
+
+    pub(crate) fn reject_cursor_plane_update_reservations(
+        &mut self,
+        updates: &[CursorPlaneUpdate],
+    ) {
+        for update in updates {
+            let Some(next) = update.prepared.next.filter(|next| {
+                update
+                    .prepared
+                    .prior
+                    .is_none_or(|prior| prior.lease != next.lease)
+            }) else {
+                continue;
+            };
+            if let Some(device) = self
+                .devices
+                .iter_mut()
+                .find(|device| device.key == update.device_key)
+                && let Some(plane) = device.cursor.plane.as_mut()
+            {
+                plane.reject_reserved_sprite(next.lease);
             }
-        } else {
-            cursor.clear_atomic_position(crtc);
         }
-        Ok(true)
+    }
+
+    pub(crate) fn accept_cursor_plane_updates(
+        &mut self,
+        updates: &[CursorPlaneUpdate],
+    ) -> io::Result<()> {
+        for update in updates {
+            let Some(device) = self
+                .devices
+                .iter_mut()
+                .find(|device| device.key == update.device_key)
+            else {
+                return Err(io::Error::other(
+                    "accepted cursor update device disappeared",
+                ));
+            };
+            if let Some(next) = update.prepared.next.filter(|next| {
+                update
+                    .prepared
+                    .prior
+                    .is_none_or(|prior| prior.lease != next.lease)
+            }) {
+                let accepted = device
+                    .cursor
+                    .plane
+                    .as_mut()
+                    .is_some_and(|plane| plane.accept_reserved_sprite(next.lease));
+                if !accepted {
+                    return Err(io::Error::other(
+                        "accepted cursor commit lost its reserved framebuffer lease",
+                    ));
+                }
+            }
+            let state = device.cursor.crtc_states.entry(update.crtc).or_default();
+            state.applied = update.prepared.next;
+            state.valid = true;
+            if update.prepared.next.is_some() {
+                state.resume_visible = false;
+            }
+            let desired = update
+                .prepared
+                .next
+                .map_or(CursorIntent::Hide, CursorIntent::Show);
+            if state.intent == Some(desired) {
+                state.intent = None;
+                state.intent_motion_timestamp = None;
+            }
+            state.in_flight = Some(update.prepared.clone());
+            device
+                .cursor
+                .atomic_cursor_commits_in_flight
+                .insert(update.crtc, ());
+            device
+                .cursor
+                .cursor_retry_waits_for_flip
+                .remove(&update.crtc);
+            device.cursor.note_cursor_success(update.crtc);
+        }
+        Ok(())
     }
 
     /// Attribute a flip event to this CRTC's cursor-only commit, if present.
@@ -821,23 +900,31 @@ impl PlatformBackend {
     /// recovery. In both cases the rejected position is discarded.
     pub(crate) fn reject_atomic_cursor_commit(
         &mut self,
-        positions: &[crate::drm::atomic::CursorPlanePosition],
-        error: &str,
+        updates: &[CursorPlaneUpdate],
+        error: &io::Error,
     ) -> CursorMoveOutcome {
+        self.reject_cursor_plane_update_reservations(updates);
         let mut outcome = CursorMoveOutcome::default();
-        for position in positions {
+        for update in updates {
             let Some(device) = self
                 .devices
                 .iter_mut()
-                .find(|device| device.key == position.device_key)
+                .find(|device| device.key == update.device_key)
             else {
                 continue;
             };
-            let crtc = position.crtc;
-            device.cursor.clear_atomic_position(crtc);
+            let crtc = update.crtc;
             device.cursor.cursor_retry_waits_for_flip.remove(&crtc);
+            device.cursor.note_cursor_failure_pair(crtc, error, None);
             if let Some(state) = device.cursor.crtc_states.get_mut(&crtc) {
-                state.intent = None;
+                let rejected_intent = update
+                    .prepared
+                    .next
+                    .map_or(CursorIntent::Hide, CursorIntent::Show);
+                if state.intent == Some(rejected_intent) {
+                    state.intent = None;
+                    state.intent_motion_timestamp = None;
+                }
             }
             outcome.retry_required = true;
             self.scene_cursor_hide_failed = true;
@@ -861,8 +948,6 @@ impl PlatformBackend {
     /// that no cursor-only flip can be attributed to the next topology epoch.
     pub(crate) fn clear_atomic_cursor_state_after_old_events_discard(&mut self) {
         for device in &mut self.devices {
-            device.cursor.atomic_positions.clear();
-            device.cursor.atomic_pending_moves.clear();
             let pending: Vec<_> = device
                 .cursor
                 .crtc_states
@@ -895,63 +980,17 @@ impl PlatformBackend {
         }
     }
 
-    /// Clear only the unsent values carried by an accepted scene commit. The
-    /// latest positions stay cached so subsequent scene commits continue to
-    /// include the cursor plane state.
+    /// Settle the same prepared cursor leases regardless of which producer
+    /// carried them in the accepted primary-plane transaction.
     pub(crate) fn cursor_plane_scene_commit_submitted(
         &mut self,
-        positions: &[crate::drm::atomic::CursorPlanePosition],
-    ) {
-        for position in positions {
-            for device in &mut self.devices {
-                if device.key != position.device_key {
-                    continue;
-                }
-                let matches_latest = device
-                    .cursor
-                    .atomic_positions
-                    .get(&position.crtc)
-                    .is_some_and(|latest| latest == position);
-                if !matches_latest {
-                    continue;
-                }
-                if let Some(state) = device.cursor.crtc_states.get_mut(&position.crtc)
-                    && let Some(binding) = state.applied.as_mut()
-                {
-                    binding.x = position.x;
-                    binding.y = position.y;
-                }
-                if let Some(state) = device.cursor.crtc_states.get_mut(&position.crtc)
-                    && let Some(applied) = state.applied
-                    && matches!(
-                        state.intent,
-                        Some(CursorIntent::Show(binding))
-                            if binding.lease == applied.lease
-                                && binding.framebuffer == applied.framebuffer
-                                && binding.x == position.x
-                                && binding.y == position.y
-                    )
-                {
-                    state.intent = None;
-                }
-                if device
-                    .cursor
-                    .atomic_pending_moves
-                    .get(&position.crtc)
-                    .is_some_and(|unsent| unsent == position)
-                {
-                    device.cursor.atomic_pending_moves.remove(&position.crtc);
-                }
-                if let Some(latest) = device.cursor.atomic_positions.get_mut(&position.crtc) {
-                    latest.motion_timestamp = None;
-                }
-            }
-        }
+        updates: &[CursorPlaneUpdate],
+    ) -> io::Result<()> {
+        self.accept_cursor_plane_updates(updates)
     }
 
-    /// Seed one already-visible cursor position without issuing a DRM ioctl.
-    /// Tests use the normal output-origin conversion and production cache;
-    /// production never calls this helper.
+    /// Construct a cursor position record for legacy tests without issuing a
+    /// DRM ioctl. Production commit producers consume full-state intents.
     #[cfg(test)]
     pub(crate) fn for_tests_seed_atomic_cursor_position(
         &mut self,
@@ -988,19 +1027,29 @@ impl PlatformBackend {
             .expect("test cursor plane was installed");
         plane.for_tests_set_atomic_position_properties(crtc, plane_handle, crtc_x, crtc_y);
         plane.for_tests_set_visible(crtc, true);
-        device.cursor.remember_atomic_position(
-            device_key,
-            crtc,
-            crtc_x_local,
-            crtc_y_local,
-            Some(Instant::now()),
-        );
+        let (plane_handle, crtc_x, crtc_y) = device
+            .cursor
+            .plane
+            .as_ref()
+            .and_then(|plane| plane.atomic_position_properties(crtc))
+            .expect("test cursor plane exposes atomic position properties");
+        let motion_timestamp = Instant::now();
         device
             .cursor
-            .atomic_positions
-            .get(&crtc)
-            .copied()
-            .expect("test cursor plane exposes atomic position properties")
+            .crtc_states
+            .entry(crtc)
+            .or_default()
+            .intent_motion_timestamp = Some(motion_timestamp);
+        crate::drm::atomic::CursorPlanePosition {
+            device_key,
+            crtc,
+            plane: plane_handle,
+            crtc_x,
+            crtc_y,
+            x: crtc_x_local,
+            y: crtc_y_local,
+            motion_timestamp: Some(motion_timestamp),
+        }
     }
 
     #[cfg(test)]
@@ -1012,7 +1061,8 @@ impl PlatformBackend {
         self.devices
             .iter()
             .find(|device| device.key == device_key)
-            .is_some_and(|device| device.cursor.atomic_pending_moves.contains_key(&crtc))
+            .and_then(|device| device.cursor.crtc_states.get(&crtc))
+            .is_some_and(|state| state.intent.is_some())
     }
 
     #[cfg(test)]
@@ -1074,10 +1124,33 @@ impl PlatformBackend {
         device_key: crate::platform::drm::DrmDeviceKey,
         crtc: ::drm::control::crtc::Handle,
     ) -> Option<crate::drm::atomic::CursorPlanePosition> {
-        self.devices
+        let device = self
+            .devices
             .iter()
-            .find(|device| device.key == device_key)
-            .and_then(|device| device.cursor.atomic_pending_moves.get(&crtc).copied())
+            .find(|device| device.key == device_key)?;
+        let binding = match device.cursor.crtc_states.get(&crtc)?.intent? {
+            CursorIntent::Show(binding) => binding,
+            CursorIntent::Hide => return None,
+        };
+        let (plane, crtc_x, crtc_y) = device
+            .cursor
+            .plane
+            .as_ref()?
+            .atomic_position_properties(crtc)?;
+        Some(crate::drm::atomic::CursorPlanePosition {
+            device_key,
+            crtc,
+            plane,
+            crtc_x,
+            crtc_y,
+            x: binding.x,
+            y: binding.y,
+            motion_timestamp: device
+                .cursor
+                .crtc_states
+                .get(&crtc)?
+                .intent_motion_timestamp,
+        })
     }
 
     #[cfg(test)]
@@ -1342,22 +1415,28 @@ impl PlatformBackend {
             hot_x,
             hot_y,
         };
-        let device_key = self.devices[device_idx].key;
-        self.devices[device_idx]
-            .cursor
-            .remember_atomic_position(device_key, crtc, cx, cy, None);
-        self.devices[device_idx]
+        let state = self.devices[device_idx]
             .cursor
             .crtc_states
             .entry(crtc)
-            .or_default()
-            .intent = Some(CursorIntent::Show(binding));
+            .or_default();
+        state.intent = Some(CursorIntent::Show(binding));
+        state.intent_motion_timestamp = None;
         let result = self.submit_atomic_cursor_intent_for_output(output_idx);
         match result {
-            Ok(_) => {
+            Ok(outcome) if outcome.ebusy_count == 0 => {
                 self.devices[device_idx].cursor.note_cursor_success(crtc);
                 Ok(())
             }
+            Ok(_) => Err(self.cursor_show_failure(
+                device_idx,
+                crtc,
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "cursor show waits for the prior CRTC event",
+                ),
+                true,
+            )),
             Err(error) => {
                 let deferred = error.kind() == io::ErrorKind::WouldBlock
                     || error.raw_os_error() == Some(libc::EBUSY);
@@ -1467,11 +1546,7 @@ impl PlatformBackend {
             return Ok(CursorMoveOutcome::default());
         }
         match self.submit_atomic_cursor_intent_for_output(output_idx) {
-            Ok(_) => Ok(CursorMoveOutcome::default()),
-            Err(error) if error.raw_os_error() == Some(libc::EBUSY) => Ok(CursorMoveOutcome {
-                ebusy_count: 1,
-                ..CursorMoveOutcome::default()
-            }),
+            Ok(outcome) => Ok(outcome),
             Err(error) => {
                 log::warn!("render cursor pending atomic intent rejected: {error}");
                 Ok(CursorMoveOutcome {
@@ -1538,7 +1613,6 @@ impl PlatformBackend {
                 continue;
             }
             let (cx, cy) = cursor_root_to_crtc_local(x, y, layout_x, layout_y, hot_x, hot_y);
-            state.remember_atomic_position(device_key, crtc, cx, cy, Some(motion_timestamp));
             if let Some(crtc_state) = state.crtc_states.get_mut(&crtc) {
                 crtc_state.intent = Some(CursorIntent::Show(CursorBinding {
                     x: cx,
@@ -1547,6 +1621,7 @@ impl PlatformBackend {
                     hot_y,
                     ..binding
                 }));
+                crtc_state.intent_motion_timestamp = Some(motion_timestamp);
             }
         }
         state.pending_move = None;
@@ -1627,14 +1702,19 @@ impl PlatformBackend {
         {
             return Err(io::Error::other("atomic cursor plane unavailable"));
         }
-        self.devices[device_idx]
+        let state = self.devices[device_idx]
             .cursor
             .crtc_states
             .entry(crtc)
-            .or_default()
-            .intent = Some(CursorIntent::Hide);
+            .or_default();
+        state.intent = Some(CursorIntent::Hide);
+        state.intent_motion_timestamp = None;
         match self.submit_atomic_cursor_intent_for_output(output_idx) {
-            Ok(_) => Ok(()),
+            Ok(outcome) if outcome.ebusy_count == 0 => Ok(()),
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "cursor hide waits for the prior CRTC event",
+            )),
             Err(error) => {
                 self.scene_cursor_hide_failed = true;
                 Err(error)
@@ -1825,8 +1905,6 @@ impl PlatformBackend {
             device.cursor.cursor_topology_crtcs = active_crtcs;
             device.cursor.pending_move = None;
             device.cursor.pending_move_timestamp = None;
-            device.cursor.atomic_positions.clear();
-            device.cursor.atomic_pending_moves.clear();
             device.cursor.atomic_cursor_commits_in_flight.clear();
             device.cursor.cursor_retry_waits_for_flip.clear();
             device.cursor.cursor_hide_recovery.clear();
@@ -1834,6 +1912,7 @@ impl PlatformBackend {
             for state in device.cursor.crtc_states.values_mut() {
                 state.valid = false;
                 state.intent = None;
+                state.intent_motion_timestamp = None;
             }
             if device.cursor.should_retry_initialization(!crtcs.is_empty()) {
                 factory(device, &crtcs, "lifecycle retry");

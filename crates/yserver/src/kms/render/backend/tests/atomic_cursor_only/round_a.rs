@@ -754,9 +754,9 @@ fn atomic_cursor_only_full_buffer_argb_upload_and_cleanup() {
         vec![
             crate::drm::atomic::AtomicCommitKind::Scene,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
-            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            crate::drm::atomic::AtomicCommitKind::Scene,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
-            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            crate::drm::atomic::AtomicCommitKind::Scene,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
         ],
@@ -1031,8 +1031,8 @@ fn atomic_cursor_only_deferred_replacement_keeps_live_prior_image_until_retry() 
         vec![
             crate::drm::atomic::AtomicCommitKind::Scene,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
-            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
-            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            crate::drm::atomic::AtomicCommitKind::Scene,
+            crate::drm::atomic::AtomicCommitKind::Scene,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
         ],
@@ -1109,10 +1109,11 @@ fn atomic_cursor_only_scene_adapter_retains_deferred_initial_show() {
         fixture.backend.cursor_records[&cursor].version
     );
     assert!(
-        fixture
+        !fixture
             .backend
             .platform
-            .cursor_atomic_event_pending_for_output(0)
+            .cursor_atomic_event_pending_for_output(0),
+        "the accepted primary scene carries the cursor delta without queuing a cursor-only event",
     );
     fixture.retire_output(0, 3);
     assert!(fixture.backend.platform.cursor_plane_visible_for_output(0));
@@ -1166,11 +1167,7 @@ fn atomic_cursor_only_scene_adapter_retains_deferred_initial_show() {
                 }
             ),
             (
-                crate::drm::atomic::AtomicCommitKind::Scene,
-                crate::drm::atomic::tests_support::ScriptedResult::Ok
-            ),
-            (
-                crate::drm::atomic::AtomicCommitKind::CursorOnly,
+                crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
                 crate::drm::atomic::tests_support::ScriptedResult::Ok
             ),
             (
@@ -1402,8 +1399,8 @@ fn atomic_cursor_only_failed_sprite_write_preserves_prior_image() {
         vec![
             crate::drm::atomic::AtomicCommitKind::Scene,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
-            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
-            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            crate::drm::atomic::AtomicCommitKind::Scene,
+            crate::drm::atomic::AtomicCommitKind::Scene,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
         ],
@@ -1670,15 +1667,15 @@ fn atomic_cursor_only_live_pool_create_failure_preserves_applied_images() {
             crate::drm::atomic::AtomicCommitKind::Scene,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
-            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
-            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            crate::drm::atomic::AtomicCommitKind::Scene,
+            crate::drm::atomic::AtomicCommitKind::Scene,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
-            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            crate::drm::atomic::AtomicCommitKind::Scene,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
             crate::drm::atomic::AtomicCommitKind::Scene,
-            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            crate::drm::atomic::AtomicCommitKind::Scene,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
         ],
         "failed allocation adds no cursor commit and teardown reaches accepted detach",
@@ -1875,7 +1872,7 @@ fn atomic_cursor_only_hide_cancels_deferred_direct_cursor_retry() {
         vec![
             crate::drm::atomic::AtomicCommitKind::Scene,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
-            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            crate::drm::atomic::AtomicCommitKind::Scene,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
             crate::drm::atomic::AtomicCommitKind::Scene,
         ],
@@ -3433,9 +3430,9 @@ fn atomic_cursor_only_rejected_replacement_preserves_candidate_and_binding() {
         vec![
             crate::drm::atomic::AtomicCommitKind::Scene,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
-            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            crate::drm::atomic::AtomicCommitKind::Scene,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
-            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            crate::drm::atomic::AtomicCommitKind::Scene,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
             crate::drm::atomic::AtomicCommitKind::Scene,
         ],
@@ -3661,13 +3658,12 @@ fn atomic_cursor_only_motion_preserves_pending_detach_intent() {
             crate::drm::atomic::AtomicCommitKind::Scene,
             crate::drm::atomic::AtomicCommitKind::Scene,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
-            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            crate::drm::atomic::AtomicCommitKind::Scene,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
             crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
             crate::drm::atomic::AtomicCommitKind::Scene,
-            crate::drm::atomic::AtomicCommitKind::CursorOnly,
         ],
-        "failed gap detach remains pending during re-entry, then final teardown detaches",
+        "failed gap detach remains pending during re-entry, the primary scene carries accepted cursor motion, then final teardown detaches",
     );
     assert_eq!(
         fixture.recorders.atomic.records()[4].result,
@@ -3799,7 +3795,7 @@ fn atomic_cursor_only_shutdown_disables_before_scene_drain_and_drains_delayed_ev
         vec![
             crate::drm::atomic::AtomicCommitKind::Scene,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
-            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            crate::drm::atomic::AtomicCommitKind::Scene,
             crate::drm::atomic::AtomicCommitKind::Scene,
         ],
         "shutdown records the visible scene, attach, pending scene, then blocking disable",
@@ -4187,7 +4183,7 @@ fn atomic_cursor_only_motion_waits_for_scene_retirement_and_carries_latest_posit
     assert_eq!(records.len(), records_before + 4);
     assert_eq!(
         records[records_before + 2].kind,
-        crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+        crate::drm::atomic::AtomicCommitKind::Scene,
     );
     let cursor_move = &records[records_before + 3];
     assert_eq!(
@@ -4239,7 +4235,7 @@ fn atomic_cursor_only_motion_waits_for_scene_retirement_and_carries_latest_posit
         vec![
             crate::drm::atomic::AtomicCommitKind::Scene,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
-            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            crate::drm::atomic::AtomicCommitKind::Scene,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
         ],
@@ -4932,11 +4928,7 @@ fn atomic_cursor_only_eligibility_matrix() {
         if eligible {
             expected_scene_sequence.push(crate::drm::atomic::AtomicCommitKind::CursorOnly);
         }
-        expected_scene_sequence.push(if eligible {
-            crate::drm::atomic::AtomicCommitKind::SceneWithCursor
-        } else {
-            crate::drm::atomic::AtomicCommitKind::Scene
-        });
+        expected_scene_sequence.push(crate::drm::atomic::AtomicCommitKind::Scene);
         if eligible {
             expected_scene_sequence.push(crate::drm::atomic::AtomicCommitKind::CursorOnly);
         }

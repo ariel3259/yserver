@@ -26,9 +26,9 @@
 
 mod connectors;
 mod cursor;
-mod cursor_commit;
+pub(crate) mod cursor_commit;
 mod cursor_lifecycle;
-mod cursor_state;
+pub(crate) mod cursor_state;
 mod devices;
 pub(crate) mod flip_events;
 mod init;
@@ -220,13 +220,6 @@ pub(crate) struct KmsCursorState {
     /// Pointer-event timestamp paired with `pending_move` across an EBUSY
     /// retry. Atomic positions carry this timestamp directly.
     pending_move_timestamp: Option<Instant>,
-    /// Latest discovered atomic position for each cursor-visible CRTC. The
-    /// position remains available for every scene commit; the unsent copy is
-    /// consumed only after an accepted commit carries it.
-    atomic_positions:
-        HashMap<::drm::control::crtc::Handle, crate::drm::atomic::CursorPlanePosition>,
-    atomic_pending_moves:
-        HashMap<::drm::control::crtc::Handle, crate::drm::atomic::CursorPlanePosition>,
     /// Accepted cursor-only commits, keyed by CRTC. A cursor-only commit is
     /// in flight only after its atomic ioctl succeeded.
     atomic_cursor_commits_in_flight: HashMap<::drm::control::crtc::Handle, ()>,

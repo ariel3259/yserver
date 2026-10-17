@@ -1,6 +1,7 @@
 //! Accepted cursor-plane state and the ownership carried by its commits.
 
 use crate::{drm::atomic::AtomicPropertyUpdate, kms::cursor_plane::sprites::SpriteBufferLease};
+use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CursorBinding {
@@ -20,17 +21,28 @@ pub(crate) enum CursorIntent {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct CursorPlaneUpdate {
+pub(crate) struct CursorPropertyUpdate {
     pub(crate) object: ::drm::control::RawResourceHandle,
     pub(crate) property: ::drm::control::property::Handle,
     pub(crate) value: u64,
+}
+
+/// One CRTC's prepared full-state delta for a producer-owned atomic commit.
+/// The accepted `PreparedCursorCommit` is shared by cursor-only, scene, direct,
+/// and unflip commit paths so every owner settles the same framebuffer leases.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CursorPlaneUpdate {
+    pub(crate) device_key: crate::platform::drm::DrmDeviceKey,
+    pub(crate) crtc: ::drm::control::crtc::Handle,
+    pub(crate) prepared: PreparedCursorCommit,
+    pub(crate) motion_timestamp: Option<Instant>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PreparedCursorCommit {
     pub(crate) prior: Option<CursorBinding>,
     pub(crate) next: Option<CursorBinding>,
-    pub(crate) updates: Vec<CursorPlaneUpdate>,
+    pub(crate) updates: Vec<CursorPropertyUpdate>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -44,11 +56,14 @@ pub(crate) struct CursorCrtcState {
     /// the old per-CRTC events have been drained.
     pub(crate) lifecycle_pending: Option<CursorBinding>,
     pub(crate) intent: Option<CursorIntent>,
+    /// Pointer timestamp belongs to the current full-state intent and follows
+    /// it through any event-gated retry.
+    pub(crate) intent_motion_timestamp: Option<Instant>,
     /// A replacement keeps both leases owned until the corresponding event.
     pub(crate) in_flight: Option<PreparedCursorCommit>,
 }
 
-impl CursorPlaneUpdate {
+impl CursorPropertyUpdate {
     pub(crate) fn atomic_update(self) -> AtomicPropertyUpdate {
         AtomicPropertyUpdate {
             object: self.object,

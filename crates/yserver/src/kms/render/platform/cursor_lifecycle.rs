@@ -18,4 +18,5 @@ pub(crate) fn accept_blocking_detach(state: &mut super::cursor_state::CursorCrtc
     state.lifecycle_pending = prior;
     state.valid = true;
     state.intent = None;
+    state.intent_motion_timestamp = None;
 }

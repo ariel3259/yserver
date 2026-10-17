@@ -19,10 +19,7 @@ use drm::control::{
 
 use crate::drm::{
     Device,
-    atomic::{
-        AtomicCommitEvent, AtomicCommitKind, AtomicCommitRequest, AtomicCommitSink,
-        CursorPlanePosition,
-    },
+    atomic::{AtomicCommitEvent, AtomicCommitKind, AtomicCommitRequest, AtomicCommitSink},
     modeset::{Output, PropMap},
 };
 
@@ -178,7 +175,7 @@ pub fn submit_flip_with_fences(
 }
 
 /// Submit one scene flip through its owning device's recorder/timer and append
-/// any visible atomic cursor-plane positions for this output. The legacy
+/// any prepared atomic cursor-plane deltas for this output. The legacy
 /// non-rendering page-flip callers keep using `submit_flip_with_fences`.
 pub(crate) fn submit_scene_flip_with_fences(
     device: &Device,
@@ -187,7 +184,7 @@ pub(crate) fn submit_scene_flip_with_fences(
     fb_id: framebuffer::Handle,
     in_fence_fd: i32,
     out_fence_holder: &mut i32,
-    cursor_positions: &[CursorPlanePosition],
+    cursor_updates: &[crate::kms::render::platform::cursor_state::CursorPlaneUpdate],
     timing: crate::drm::async_flip::FlipTiming,
 ) -> io::Result<()> {
     submit_scene_flip_with_fences_tearing(
@@ -197,7 +194,7 @@ pub(crate) fn submit_scene_flip_with_fences(
         fb_id,
         in_fence_fd,
         out_fence_holder,
-        cursor_positions,
+        cursor_updates,
         timing,
         crate::drm::atomic::TearingCommitContext::NONE,
     )
@@ -210,12 +207,12 @@ pub(crate) fn submit_scene_flip_with_fences_tearing(
     fb_id: framebuffer::Handle,
     in_fence_fd: i32,
     out_fence_holder: &mut i32,
-    cursor_positions: &[CursorPlanePosition],
+    cursor_updates: &[crate::kms::render::platform::cursor_state::CursorPlaneUpdate],
     timing: crate::drm::async_flip::FlipTiming,
     tearing_context: crate::drm::atomic::TearingCommitContext,
 ) -> io::Result<()> {
-    let cursor_positions = match timing {
-        crate::drm::async_flip::FlipTiming::Vsync => cursor_positions,
+    let cursor_updates = match timing {
+        crate::drm::async_flip::FlipTiming::Vsync => cursor_updates,
         crate::drm::async_flip::FlipTiming::Async => &[],
     };
     let mut request = AtomicCommitRequest::new();
@@ -248,18 +245,19 @@ pub(crate) fn submit_scene_flip_with_fences_tearing(
         let out_fence_ptr = (out_fence_holder as *mut i32) as usize as u64;
         request.add_raw_property(output.crtc.into(), out_fence_prop, out_fence_ptr);
     }
-    for position in cursor_positions {
-        request.add_cursor_position(*position);
-    }
+    crate::kms::render::platform::cursor_commit::add_cursor_plane_updates(
+        &mut request,
+        cursor_updates,
+    );
     let event = AtomicCommitEvent {
         crtc: output.crtc,
-        motion_timestamp: cursor_positions
+        motion_timestamp: cursor_updates
             .iter()
-            .find(|position| position.crtc == output.crtc)
-            .and_then(|position| position.motion_timestamp),
+            .find(|update| update.crtc == output.crtc)
+            .and_then(|update| update.motion_timestamp),
     };
     let kind = match timing {
-        crate::drm::async_flip::FlipTiming::Vsync if cursor_positions.is_empty() => {
+        crate::drm::async_flip::FlipTiming::Vsync if cursor_updates.is_empty() => {
             AtomicCommitKind::Scene
         }
         crate::drm::async_flip::FlipTiming::Vsync => AtomicCommitKind::SceneWithCursor,

@@ -18,7 +18,7 @@ use crate::drm::{
     Device,
     atomic::{
         AtomicCommitEvent, AtomicCommitExecutor, AtomicCommitKind, AtomicCommitRequest,
-        AtomicCommitSink, CursorPlanePosition,
+        AtomicCommitSink,
     },
     io::ModeBlobIo,
 };
@@ -1559,7 +1559,7 @@ pub(crate) fn probe_direct_scanout_test_only(
     pitch: u32,
     atomic_commit_sink: &AtomicCommitSink,
     planes: &[DirectScanoutPlaneState<'_>],
-    cursor_positions: &[CursorPlanePosition],
+    cursor_updates: &[crate::kms::render::platform::cursor_state::CursorPlaneUpdate],
 ) -> io::Result<DirectScanoutTestResult> {
     if planes.is_empty() {
         return Err(io::Error::other("scanout M1: empty plane transaction"));
@@ -1622,7 +1622,7 @@ pub(crate) fn probe_direct_scanout_test_only(
         }
     };
 
-    match test_direct_scanout(&device, atomic_commit_sink, fb, planes, cursor_positions) {
+    match test_direct_scanout(&device, atomic_commit_sink, fb, planes, cursor_updates) {
         Ok(()) => Ok(DirectScanoutTestResult::Accepted(
             DirectScanoutProbeFramebuffer {
                 fb,
@@ -1649,30 +1649,30 @@ pub(crate) fn submit_direct_scanout(
     atomic_commit_sink: &AtomicCommitSink,
     fb: framebuffer::Handle,
     planes: &[DirectScanoutPlaneState<'_>],
-    cursor_positions: &[CursorPlanePosition],
+    cursor_updates: &[crate::kms::render::platform::cursor_state::CursorPlaneUpdate],
     timing: crate::drm::async_flip::FlipTiming,
     tearing_context: crate::drm::atomic::TearingCommitContext,
 ) -> io::Result<()> {
     if planes.is_empty() {
         return Err(io::Error::other("scanout M2: empty plane transaction"));
     }
-    let cursor_positions = match timing {
-        crate::drm::async_flip::FlipTiming::Vsync => cursor_positions,
+    let cursor_updates = match timing {
+        crate::drm::async_flip::FlipTiming::Vsync => cursor_updates,
         crate::drm::async_flip::FlipTiming::Async => &[],
     };
-    let request = direct_scanout_request(fb, planes, cursor_positions);
+    let request = direct_scanout_request(fb, planes, cursor_updates);
     let events: Vec<_> = planes
         .iter()
         .map(|state| AtomicCommitEvent {
             crtc: state.output.crtc,
-            motion_timestamp: cursor_positions
+            motion_timestamp: cursor_updates
                 .iter()
-                .find(|position| position.crtc == state.output.crtc)
-                .and_then(|position| position.motion_timestamp),
+                .find(|update| update.crtc == state.output.crtc)
+                .and_then(|update| update.motion_timestamp),
         })
         .collect();
     let kind = match timing {
-        crate::drm::async_flip::FlipTiming::Vsync => cursor_commit_kind(cursor_positions),
+        crate::drm::async_flip::FlipTiming::Vsync => cursor_commit_kind(cursor_updates),
         crate::drm::async_flip::FlipTiming::Async => AtomicCommitKind::Async,
     };
     let flags = AtomicCommitFlags::PAGE_FLIP_EVENT
@@ -1691,17 +1691,19 @@ pub(crate) fn test_direct_scanout(
     atomic_commit_sink: &AtomicCommitSink,
     fb: framebuffer::Handle,
     planes: &[DirectScanoutPlaneState<'_>],
-    cursor_positions: &[CursorPlanePosition],
+    cursor_updates: &[crate::kms::render::platform::cursor_state::CursorPlaneUpdate],
 ) -> io::Result<()> {
     atomic_commit_sink.test_only(
         device,
-        cursor_commit_kind(cursor_positions),
-        direct_scanout_request(fb, planes, cursor_positions),
+        cursor_commit_kind(cursor_updates),
+        direct_scanout_request(fb, planes, cursor_updates),
     )
 }
 
-fn cursor_commit_kind(cursor_positions: &[CursorPlanePosition]) -> AtomicCommitKind {
-    if cursor_positions.is_empty() {
+fn cursor_commit_kind(
+    cursor_updates: &[crate::kms::render::platform::cursor_state::CursorPlaneUpdate],
+) -> AtomicCommitKind {
+    if cursor_updates.is_empty() {
         AtomicCommitKind::Scene
     } else {
         AtomicCommitKind::SceneWithCursor
@@ -1711,7 +1713,7 @@ fn cursor_commit_kind(cursor_positions: &[CursorPlanePosition]) -> AtomicCommitK
 fn direct_scanout_request(
     fb: framebuffer::Handle,
     planes: &[DirectScanoutPlaneState<'_>],
-    cursor_positions: &[CursorPlanePosition],
+    cursor_updates: &[crate::kms::render::platform::cursor_state::CursorPlaneUpdate],
 ) -> AtomicCommitRequest {
     let mut request = AtomicCommitRequest::new();
     for state in planes {
@@ -1759,9 +1761,10 @@ fn direct_scanout_request(
             u64::from(state.src_h),
         );
     }
-    for position in cursor_positions {
-        request.add_cursor_position(*position);
-    }
+    crate::kms::render::platform::cursor_commit::add_cursor_plane_updates(
+        &mut request,
+        cursor_updates,
+    );
     request
 }
 
@@ -1773,7 +1776,7 @@ pub(crate) fn submit_composed_scanout(
     device: &Device,
     atomic_commit_sink: &AtomicCommitSink,
     planes: &[ComposedScanoutPlaneState<'_>],
-    cursor_positions: &[CursorPlanePosition],
+    cursor_updates: &[crate::kms::render::platform::cursor_state::CursorPlaneUpdate],
 ) -> io::Result<()> {
     if planes.is_empty() {
         return Err(io::Error::other("scanout M2: empty composed transaction"));
@@ -1816,20 +1819,21 @@ pub(crate) fn submit_composed_scanout(
             u64::from(output.mode.size().1),
         );
     }
-    for position in cursor_positions {
-        request.add_cursor_position(*position);
-    }
+    crate::kms::render::platform::cursor_commit::add_cursor_plane_updates(
+        &mut request,
+        cursor_updates,
+    );
     let events: Vec<_> = planes
         .iter()
         .map(|state| AtomicCommitEvent {
             crtc: state.output.crtc,
-            motion_timestamp: cursor_positions
+            motion_timestamp: cursor_updates
                 .iter()
-                .find(|position| position.crtc == state.output.crtc)
-                .and_then(|position| position.motion_timestamp),
+                .find(|update| update.crtc == state.output.crtc)
+                .and_then(|update| update.motion_timestamp),
         })
         .collect();
-    let kind = if cursor_positions.is_empty() {
+    let kind = if cursor_updates.is_empty() {
         AtomicCommitKind::Scene
     } else {
         AtomicCommitKind::SceneWithCursor

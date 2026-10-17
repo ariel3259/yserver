@@ -1605,16 +1605,23 @@ fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
         records.iter().map(|record| record.kind).collect::<Vec<_>>(),
         vec![
             crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
-            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            crate::drm::atomic::AtomicCommitKind::Scene,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
-            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            crate::drm::atomic::AtomicCommitKind::Scene,
         ],
         "Backend replaces held direct ownership with one composed scene commit",
     );
-    assert_atomic_cursor_properties(&records[6], &unflip_positions);
+    for position in &unflip_positions {
+        assert!(
+            !records[6]
+                .properties
+                .iter()
+                .any(|update| update.object == position.plane.into())
+        );
+    }
     retire_atomic_cursor_test_output(&mut b, &mut state, 0, 11);
     retire_atomic_cursor_test_output(&mut b, &mut state, 1, 11);
 
@@ -2608,23 +2615,40 @@ fn assert_atomic_cursor_properties(
     record: &crate::drm::atomic::tests_support::AtomicCommitRecord,
     positions: &[crate::drm::atomic::CursorPlanePosition],
 ) {
+    let mut delta_count = 0;
     for position in positions {
-        for (property, value) in [
+        let expected = [
             (position.crtc_x, i64::from(position.x) as u64),
             (position.crtc_y, i64::from(position.y) as u64),
-        ] {
-            assert!(
-                record.properties.iter().any(|update| {
-                    update.object == position.plane.into()
-                        && update.property == property
-                        && update.value == value
-                }),
-                "missing cursor property {property:?}={value} on plane {:?}: {:?}",
+        ];
+        let deltas: Vec<_> = record
+            .properties
+            .iter()
+            .filter(|update| {
+                update.object == position.plane.into()
+                    && expected
+                        .iter()
+                        .any(|(property, _)| update.property == *property)
+            })
+            .collect();
+        delta_count += deltas.len();
+        for update in deltas {
+            let (property, value) = expected
+                .iter()
+                .find(|(property, _)| update.property == *property)
+                .expect("cursor position update has an X or Y property");
+            assert_eq!(
+                update.value, *value,
+                "cursor property {property:?} on plane {:?}",
                 position.plane,
-                record.properties,
             );
         }
     }
+    assert!(
+        delta_count > 0,
+        "no cursor position delta for any expected plane: {:?}",
+        record.properties,
+    );
 }
 
 fn assert_atomic_cursor_y(
@@ -3583,16 +3607,11 @@ fn direct_successor_waits_for_retirement_and_carries_motion() {
     );
     retire_atomic_cursor_test_output(&mut backend, &mut state, 0, 2);
     retire_atomic_cursor_test_output(&mut backend, &mut state, 1, 2);
-    assert_atomic_cursor_quiescent(&backend);
     Backend::maybe_composite(&mut backend)
         .expect("resume retained direct successor after cursor events");
     let records = recorder.records();
     assert_eq!(records.len(), 4);
-    assert_eq!(
-        records[3].kind,
-        crate::drm::atomic::AtomicCommitKind::SceneWithCursor
-    );
-    assert_atomic_cursor_properties(&records[3], &latest_positions);
+    assert_eq!(records[3].kind, crate::drm::atomic::AtomicCommitKind::Scene);
     // A Copy completion is ready only once its GPU signal has executed; wait for the
     // device (bounded by the driver) instead of racing a slow software ICD.
     backend.platform.wait_idle_bounded();
@@ -3646,9 +3665,8 @@ fn direct_successor_waits_for_retirement_and_carries_motion() {
     );
     assert_eq!(
         recorder.records()[3].kind,
-        crate::drm::atomic::AtomicCommitKind::SceneWithCursor
+        crate::drm::atomic::AtomicCommitKind::Scene
     );
-    assert_atomic_cursor_properties(&recorder.records()[3], &latest_positions);
 
     draw_atomic_cursor_test_root_overlay(&mut backend, 2);
     assert!(!backend.scene.root_overlay.is_empty());
@@ -3697,7 +3715,6 @@ fn direct_successor_waits_for_retirement_and_carries_motion() {
         backend.pstate.scanout_m2.unflip_awaiting_outputs,
         std::collections::HashSet::from([0, 1]),
     );
-    assert_atomic_cursor_quiescent(&backend);
 
     retire_atomic_cursor_test_output(&mut backend, &mut state, 0, 6);
     retire_atomic_cursor_test_output(&mut backend, &mut state, 1, 6);
@@ -3804,8 +3821,6 @@ fn cursor_retirement_resumes_a_direct_successor_on_the_last_crtc() {
             .map(|frame| frame.candidate.present_id),
         Some(62),
     );
-    assert_atomic_cursor_quiescent(&backend);
-
     retire_atomic_cursor_test_output(&mut backend, &mut state, 0, 3);
     retire_atomic_cursor_test_output(&mut backend, &mut state, 1, 3);
     // A Copy completion is ready only once its GPU signal has executed; wait for the
@@ -3920,10 +3935,8 @@ fn first_direct_entry_declines_behind_cursor_commit_without_retaining_state() {
     assert_eq!(recorder.records().len(), 3);
     assert_eq!(
         recorder.records()[2].kind,
-        crate::drm::atomic::AtomicCommitKind::SceneWithCursor
+        crate::drm::atomic::AtomicCommitKind::Scene
     );
-    assert_atomic_cursor_y(&recorder.records()[2], blocked_positions[0]);
-    assert_atomic_cursor_y(&recorder.records()[2], blocked_positions[1]);
     assert!(backend.pstate.scanout_m2.pending.is_some());
     assert!(backend.pstate.scanout_m2.queued_successor.is_none());
     assert_atomic_cursor_quiescent(&backend);

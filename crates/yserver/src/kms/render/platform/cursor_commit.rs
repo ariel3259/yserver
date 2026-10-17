@@ -4,7 +4,9 @@ use crate::{
     drm::atomic::{AtomicCommitRequest, AtomicPropertyUpdate},
     kms::{
         cursor_plane::topology::CursorPlaneProperties,
-        render::platform::cursor_state::{CursorBinding, CursorPlaneUpdate, PreparedCursorCommit},
+        render::platform::cursor_state::{
+            CursorBinding, CursorPlaneUpdate, CursorPropertyUpdate, PreparedCursorCommit,
+        },
     },
 };
 
@@ -19,7 +21,7 @@ pub(crate) fn prepare_cursor_commit(
 ) -> PreparedCursorCommit {
     let mut updates = Vec::new();
     let mut add = |property, value| {
-        updates.push(CursorPlaneUpdate {
+        updates.push(CursorPropertyUpdate {
             object: properties.plane.into(),
             property,
             value,
@@ -92,5 +94,23 @@ pub(crate) fn request_for_cursor_commit(prepared: &PreparedCursorCommit) -> Atom
         } = update.atomic_update();
         request.add_cursor_property(object, property, value);
     }
+    request
+}
+
+pub(crate) fn add_cursor_plane_updates(
+    request: &mut AtomicCommitRequest,
+    updates: &[CursorPlaneUpdate],
+) {
+    for update in updates {
+        for property in &update.prepared.updates {
+            let atomic = (*property).atomic_update();
+            request.add_cursor_property(atomic.object, atomic.property, atomic.value);
+        }
+    }
+}
+
+pub(crate) fn request_for_cursor_updates(updates: &[CursorPlaneUpdate]) -> AtomicCommitRequest {
+    let mut request = AtomicCommitRequest::new();
+    add_cursor_plane_updates(&mut request, updates);
     request
 }

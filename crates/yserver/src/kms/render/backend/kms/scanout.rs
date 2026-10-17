@@ -563,18 +563,6 @@ impl KmsBackend {
             .and_then(ScanoutM1ProbeEntry::framebuffer)
             .map(crate::drm::modeset::DirectScanoutProbeFramebuffer::handle)
             .ok_or_else(|| io::Error::other("direct successor framebuffer disappeared"))?;
-        let plane_states: Vec<crate::drm::modeset::DirectScanoutPlaneState<'_>> = self
-            .platform
-            .outputs
-            .iter()
-            .map(|layout| crate::drm::modeset::DirectScanoutPlaneState {
-                output: &layout.output,
-                src_x: u32::try_from(layout.x).expect("M1 validated non-negative x"),
-                src_y: u32::try_from(layout.y).expect("M1 validated non-negative y"),
-                src_w: u32::from(layout.width),
-                src_h: u32::from(layout.height),
-            })
-            .collect();
         let (device, atomic_commit_sink) = self
             .platform
             .primary_device()
@@ -588,9 +576,29 @@ impl KmsBackend {
                 io::Error::other("direct scanout submitted without an opened KMS device")
             })?;
         let output_indices: Vec<_> = (0..self.platform.outputs.len()).collect();
-        let cursor_positions = self
+        // Async is a cursorless producer. Filter before preparation so an
+        // EINVAL fallback cannot settle a delta omitted from the Async ioctl.
+        let cursor_updates =
+            if timing == crate::drm::async_flip::FlipTiming::Async || self.pstate.tearing.is_on() {
+                Vec::new()
+            } else {
+                self.platform
+                    .cursor_plane_updates_for_primary_outputs(&output_indices)
+            };
+        self.platform
+            .reserve_cursor_plane_updates(&cursor_updates)?;
+        let plane_states: Vec<crate::drm::modeset::DirectScanoutPlaneState<'_>> = self
             .platform
-            .cursor_plane_atomic_positions_for_outputs(&output_indices);
+            .outputs
+            .iter()
+            .map(|layout| crate::drm::modeset::DirectScanoutPlaneState {
+                output: &layout.output,
+                src_x: u32::try_from(layout.x).expect("M1 validated non-negative x"),
+                src_y: u32::try_from(layout.y).expect("M1 validated non-negative y"),
+                src_w: u32::from(layout.width),
+                src_h: u32::from(layout.height),
+            })
+            .collect();
         let async_shape = if timing == crate::drm::async_flip::FlipTiming::Async {
             Some(
                 self.pstate
@@ -622,7 +630,7 @@ impl KmsBackend {
             atomic_commit_sink.as_ref(),
             fb,
             &plane_states,
-            &cursor_positions,
+            &cursor_updates,
             attempt_timing,
             crate::drm::atomic::TearingCommitContext::direct(
                 Some(frame.present_received_at),
@@ -650,7 +658,7 @@ impl KmsBackend {
                         atomic_commit_sink.as_ref(),
                         fb,
                         &plane_states,
-                        &cursor_positions,
+                        &cursor_updates,
                         crate::drm::async_flip::FlipTiming::Vsync,
                         crate::drm::atomic::TearingCommitContext::direct(
                             Some(frame.present_received_at),
@@ -673,18 +681,19 @@ impl KmsBackend {
         {
             let outcome = self
                 .platform
-                .reject_atomic_cursor_commit(&cursor_positions, &error.to_string());
+                .reject_atomic_cursor_commit(&cursor_updates, error);
             self.handle_cursor_move_outcome(outcome);
+        } else if result.is_err() {
+            self.platform
+                .reject_cursor_plane_update_reservations(&cursor_updates);
         }
         result?;
-        if attempt_timing == crate::drm::async_flip::FlipTiming::Vsync
-            || matches!(
-                async_outcome,
-                crate::drm::async_flip::AsyncOutcome::FellBack { .. }
-            )
+        if !cursor_updates.is_empty()
+            && let Err(error) = self
+                .platform
+                .cursor_plane_scene_commit_submitted(&cursor_updates)
         {
-            self.platform
-                .cursor_plane_scene_commit_submitted(&cursor_positions);
+            return Err(error);
         }
         frame.awaiting_outputs = (0..self.platform.outputs.len()).collect();
         frame.async_outcome = async_outcome;
@@ -1063,6 +1072,25 @@ impl KmsBackend {
             ));
         }
         self.materialize_direct_shadow_for_unflip()?;
+        let output_count = self.platform.outputs.len();
+        let (device, atomic_commit_sink) = self
+            .platform
+            .primary_device()
+            .map(|primary| {
+                (
+                    Rc::clone(&primary.device),
+                    Rc::clone(&primary.atomic_commit_sink),
+                )
+            })
+            .ok_or_else(|| {
+                io::Error::other("scanout M2: composed unflip requested without a KMS device")
+            })?;
+        let output_indices: Vec<_> = (0..output_count).collect();
+        let cursor_updates = self
+            .platform
+            .cursor_plane_updates_for_primary_outputs(&output_indices);
+        self.platform
+            .reserve_cursor_plane_updates(&cursor_updates)?;
         let planes: Vec<crate::drm::modeset::ComposedScanoutPlaneState<'_>> = self
             .platform
             .outputs
@@ -1083,40 +1111,26 @@ impl KmsBackend {
                 })
             })
             .collect::<io::Result<_>>()?;
-        let output_count = planes.len();
-        let (device, atomic_commit_sink) = self
-            .platform
-            .primary_device()
-            .map(|primary| {
-                (
-                    Rc::clone(&primary.device),
-                    Rc::clone(&primary.atomic_commit_sink),
-                )
-            })
-            .ok_or_else(|| {
-                io::Error::other("scanout M2: composed unflip requested without a KMS device")
-            })?;
-        let output_indices: Vec<_> = (0..planes.len()).collect();
-        let cursor_positions = self
-            .platform
-            .cursor_plane_atomic_positions_for_outputs(&output_indices);
         let result = crate::drm::modeset::submit_composed_scanout(
             &device,
             atomic_commit_sink.as_ref(),
             &planes,
-            &cursor_positions,
+            &cursor_updates,
         );
         if let Err(error) = &result
             && atomic_commit_sink.take_last_cursor_rejection()
         {
             let outcome = self
                 .platform
-                .reject_atomic_cursor_commit(&cursor_positions, &error.to_string());
+                .reject_atomic_cursor_commit(&cursor_updates, error);
             self.handle_cursor_move_outcome(outcome);
+        } else if result.is_err() {
+            self.platform
+                .reject_cursor_plane_update_reservations(&cursor_updates);
         }
         result?;
         self.platform
-            .cursor_plane_scene_commit_submitted(&cursor_positions);
+            .cursor_plane_scene_commit_submitted(&cursor_updates)?;
         self.pstate.scanout_m2.unflip_awaiting_outputs = (0..output_count).collect();
         let describe_frame = |frame: &DirectPresentFrame| {
             (
@@ -1531,9 +1545,9 @@ impl KmsBackend {
             return;
         };
         let output_indices: Vec<_> = (0..self.platform.outputs.len()).collect();
-        let cursor_positions = self
+        let cursor_updates = self
             .platform
-            .cursor_plane_atomic_positions_for_outputs(&output_indices);
+            .preview_cursor_plane_updates_for_outputs(&output_indices);
         let result = crate::drm::modeset::probe_direct_scanout_test_only(
             Rc::clone(&primary.device),
             fd.as_fd(),
@@ -1545,7 +1559,7 @@ impl KmsBackend {
             pitch,
             primary.atomic_commit_sink.as_ref(),
             &plane_states,
-            &cursor_positions,
+            &cursor_updates,
         );
         match result {
             Ok(crate::drm::modeset::DirectScanoutTestResult::Accepted(framebuffer)) => {
@@ -2142,7 +2156,8 @@ impl KmsBackend {
         (self.scene_wants_scene() && !cursor_compose_blocked)
             || (!cursor_compose_blocked
                 && !direct_transaction_waiting
-                && self.platform.has_eligible_atomic_cursor_move())
+                && !self.pstate.tearing.is_on()
+                && self.platform.has_eligible_atomic_cursor_intent())
     }
 
     #[cfg(test)]
@@ -2560,13 +2575,14 @@ impl KmsBackend {
                 // successor is retained, its grouped direct transaction gets
                 // every later position and no CRTC is extended by another
                 // cursor-only commit.
-                if self.pstate.scanout_m2.current.is_some()
+                if !self.pstate.tearing.is_on()
+                    && self.pstate.scanout_m2.current.is_some()
                     && self.pstate.scanout_m2.queued_successor.is_none()
                 {
                     for output_idx in 0..self.platform.outputs.len() {
                         match self
                             .platform
-                            .submit_atomic_cursor_move_for_output(output_idx)
+                            .submit_atomic_cursor_intent_for_output(output_idx)
                         {
                             Ok(outcome) => self.handle_cursor_move_outcome(outcome),
                             Err(error) => log::warn!(
@@ -2647,6 +2663,9 @@ impl KmsBackend {
         let cursor_outcome = self.platform.take_deferred_cursor_move_outcome();
         self.handle_cursor_move_outcome(cursor_outcome);
         for output_idx in 0..self.platform.outputs.len() {
+            if self.pstate.tearing.is_on() {
+                break;
+            }
             if scene_submitted_outputs.contains(&output_idx)
                 || self.scene.has_pending_page_flip(output_idx)
                 || self.scene.output_submit_retry_pending(output_idx)
@@ -2659,7 +2678,7 @@ impl KmsBackend {
             }
             match self
                 .platform
-                .submit_atomic_cursor_move_for_output(output_idx)
+                .submit_atomic_cursor_intent_for_output(output_idx)
             {
                 Ok(outcome) => self.handle_cursor_move_outcome(outcome),
                 Err(error) => log::warn!(

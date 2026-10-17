@@ -28,6 +28,19 @@ Earlier program docs are archived:
 Cross-cutting bugs and followups that don't fit a stage live in
 [`known-issues.md`](known-issues.md).
 
+- **2026-10-16 atomic-cursor-only A6 (implementation complete):** Cursor commits
+  prepare full-state deltas from last accepted per-CRTC state. Scene, direct,
+  copied, cursor-only and composed-unflip producers share reservation and
+  settlement; Async requests filter before cursor preparation. Default tests,
+  the complete ignored workspace suite and the ignored render-acceptance suite
+  pass under lavapipe. The five new ignored Backend-path tests each passed 20
+  repetitions under 16 CPU busy loops. Accepted-state, producer, and EBUSY
+  mutation probes failed as expected and were reverted. The four C1 Async
+  mutation variants were not individually injected: the On-route fixture has
+  no hardware cursor intent or lease to mutate, and seeding that internal state
+  would violate the Backend-path test rule. Hardware validation remains with
+  controller Task C11; no hardware was used here.
+
 The repository-wide code-quality and technical-debt review from 2026-07-26
 lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
