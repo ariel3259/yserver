@@ -209,11 +209,20 @@ impl BackendEntryObserver for NoopBackendEntryObserver {
 }
 
 #[cfg(test)]
+pub(crate) type RecordedDirectScanoutCursorDeltas = Vec<
+    Vec<(
+        ::drm::control::crtc::Handle,
+        Vec<crate::drm::atomic::AtomicPropertyUpdate>,
+    )>,
+>;
+
+#[cfg(test)]
 #[derive(Default)]
 pub(crate) struct RecordingDirectScanoutTestOnlyExecutor {
     results: std::cell::RefCell<
         std::collections::VecDeque<crate::drm::modeset::DirectScanoutTestResult>,
     >,
+    cursor_deltas: std::cell::RefCell<RecordedDirectScanoutCursorDeltas>,
     sources: std::cell::RefCell<
         std::collections::HashMap<crate::kms::render::store::DrawableId, DirectScanoutProbeSource>,
     >,
@@ -221,6 +230,10 @@ pub(crate) struct RecordingDirectScanoutTestOnlyExecutor {
 
 #[cfg(test)]
 impl RecordingDirectScanoutTestOnlyExecutor {
+    pub(crate) fn cursor_deltas(&self) -> RecordedDirectScanoutCursorDeltas {
+        self.cursor_deltas.borrow().clone()
+    }
+
     pub(crate) fn queue_source(
         &self,
         source_id: crate::kms::render::store::DrawableId,
@@ -265,8 +278,28 @@ impl DirectScanoutTestOnlyExecutor for RecordingDirectScanoutTestOnlyExecutor {
         _pitch: u32,
         _atomic_commit_sink: &crate::drm::atomic::AtomicCommitSink,
         _planes: &[crate::drm::modeset::DirectScanoutPlaneState<'_>],
-        _cursor_updates: &[crate::kms::render::platform::cursor_state::CursorPlaneUpdate],
+        cursor_updates: &[crate::kms::render::platform::cursor_state::CursorPlaneUpdate],
     ) -> std::io::Result<crate::drm::modeset::DirectScanoutTestResult> {
+        self.cursor_deltas.borrow_mut().push(
+            cursor_updates
+                .iter()
+                .map(|update| {
+                    (
+                        update.crtc,
+                        update
+                            .prepared
+                            .updates
+                            .iter()
+                            .map(|property| crate::drm::atomic::AtomicPropertyUpdate {
+                                object: property.object,
+                                property: property.property,
+                                value: property.value,
+                            })
+                            .collect(),
+                    )
+                })
+                .collect(),
+        );
         self.results.borrow_mut().pop_front().ok_or_else(|| {
             std::io::Error::other("recording direct-scanout TEST_ONLY result was not queued")
         })

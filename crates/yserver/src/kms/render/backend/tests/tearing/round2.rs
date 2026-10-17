@@ -790,8 +790,8 @@ fn atomic_cursor_only_c1_adapters_publish_only_accepted_bindings() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: allow an Async scene frame while a rejected tearing handoff detach remains bound.
-fn tearing_on_rejected_cursor_detach_stays_vsync_until_backend_retry() {
+// Mutations: detach during grouped-primary retirement, publish SW after a rejected detach, or submit Async while the rejected HW binding remains.
+fn tearing_on_rejected_cursor_detach_retains_hw_without_async() {
     use yserver_core::{
         backend::Backend, core_loop::input_inventory::InputInventory, server::ServerState,
     };
@@ -889,51 +889,129 @@ fn tearing_on_rejected_cursor_detach_stays_vsync_until_backend_retry() {
     );
     assert!(backend.pstate.tearing.is_on());
     assert!(backend.pstate.scanout_m2.unflip_requested);
-    recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
     retire_direct_present(&mut backend, &mut state, 70);
     assert!(backend.pstate.tearing.is_on());
-    assert!(!backend.platform.any_cursor_plane_visible());
-    assert!(backend.platform.any_cursor_commit_in_flight());
-    assert!(backend.scene.has_pending_page_flips());
-    let failed_detach = recorder
-        .records()
-        .into_iter()
-        .find(|record| {
-            matches!(
-                record.result,
-                crate::drm::atomic::tests_support::ScriptedResult::Error {
-                    raw_os_error: Some(libc::EIO),
-                    ..
-                }
-            )
-        })
-        .expect("grouped cursor detach rejected");
-    assert_eq!(failed_detach.kind, AtomicCommitKind::SceneWithCursor);
-    assert!(matches!(
-        failed_detach.result,
-        crate::drm::atomic::tests_support::ScriptedResult::Error {
-            raw_os_error: Some(libc::EIO),
-            ..
-        }
-    ));
+    assert!(backend.platform.any_cursor_plane_visible());
+    assert!(!backend.platform.any_cursor_commit_in_flight());
+    assert!(!backend.pstate.scanout_m2.unflip_awaiting_outputs.is_empty());
+    let grouped_unflip = recorder.records().last().unwrap().clone();
+    assert_eq!(grouped_unflip.kind, AtomicCommitKind::Scene);
+    assert_eq!(
+        grouped_unflip.result,
+        crate::drm::atomic::tests_support::ScriptedResult::Ok
+    );
+    assert!(
+        grouped_unflip
+            .events
+            .iter()
+            .any(|event| event.crtc == backend.platform.outputs[0].output.crtc)
+    );
+    assert!(backend.platform.any_cursor_plane_visible());
 
-    let before_handoff_event = recorder.records().len();
-    damage_root(&mut backend);
-    Backend::maybe_composite(&mut backend).expect("keep Async gated until cursor handoff retires");
-    assert_eq!(recorder.records().len(), before_handoff_event);
-    assert!(backend.platform.any_cursor_commit_in_flight());
-    assert!(backend.scene.has_pending_page_flips());
+    let before_unflip_retirement = recorder.records().len();
+    Backend::maybe_composite(&mut backend).expect("wait for grouped cursorless primary event");
+    assert_eq!(recorder.records().len(), before_unflip_retirement);
+    assert!(backend.platform.any_cursor_plane_visible());
     assert!(backend.pstate.tearing.is_on());
     retire_composed_frame(&mut backend, &mut state, 71);
-    assert!(!backend.platform.any_cursor_plane_visible());
+    assert!(backend.platform.any_cursor_plane_visible());
     assert!(!backend.platform.any_cursor_commit_in_flight());
+    assert!(backend.pstate.scanout_m2.current.is_none());
+    assert!(!backend.pstate.scanout_m2.unflip_requested);
+    assert!(backend.pstate.scanout_m2.unflip_awaiting_outputs.is_empty());
+    assert_eq!(
+        backend.scene.cursor_mode(),
+        crate::kms::render::scene::CursorPlaneMode::Hw,
+        "cursorless grouped retirement does not publish software pixels",
+    );
 
+    let rejected_start = recorder.records().len();
+    recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
     damage_root(&mut backend);
-    Backend::maybe_composite(&mut backend).expect("submit Async after detach retirement");
-    let resumed_async = recorder.records().last().cloned().unwrap();
-    assert_eq!(resumed_async.kind, AtomicCommitKind::Async);
+    Backend::maybe_composite(&mut backend).expect("reject grouped and per-output SW detach");
     assert!(backend.pstate.tearing.is_on());
-    retire_composed_frame(&mut backend, &mut state, 73);
+    assert!(backend.platform.any_cursor_plane_visible());
+    assert!(!backend.platform.any_cursor_commit_in_flight());
+    assert!(!backend.scene.has_pending_page_flips());
+    let rejected_records = recorder.records();
+    let rejected_detaches = rejected_records[rejected_start..]
+        .iter()
+        .filter(|record| {
+            record.kind == AtomicCommitKind::SceneWithCursor
+                && matches!(
+                    record.result,
+                    crate::drm::atomic::tests_support::ScriptedResult::Error {
+                        raw_os_error: Some(libc::EIO),
+                        ..
+                    }
+                )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rejected_detaches.len(),
+        1,
+        "the software-frame detach request rejects"
+    );
+    assert!(
+        rejected_records[rejected_start..].iter().any(|record| {
+            record.kind == AtomicCommitKind::SceneWithCursor
+                && record
+                    .flags
+                    .contains(::drm::control::AtomicCommitFlags::TEST_ONLY)
+                && record.events.is_empty()
+        }),
+        "cursor attribution probes do not create a detach obligation"
+    );
+    let cursor_properties = backend.platform.devices[0]
+        .cursor
+        .plane
+        .as_ref()
+        .unwrap()
+        .properties_for(backend.platform.outputs[0].output.crtc)
+        .unwrap();
+    assert!(
+        rejected_detaches.iter().all(|record| {
+            record.properties.iter().any(|update| {
+                update.object == cursor_properties.plane.into()
+                    && update.property == cursor_properties.fb_id
+                    && update.value == 0
+            })
+        }),
+        "each rejected software frame carried its own detach delta"
+    );
+    assert_eq!(
+        backend
+            .scene
+            .for_tests_cursor_commit_receipt(0)
+            .unwrap()
+            .mode,
+        crate::kms::render::scene::CursorAcceptedMode::Hardware,
+        "rejected SW frames publish no software receipt",
+    );
+    assert!(
+        rejected_records
+            .last()
+            .unwrap()
+            .properties
+            .iter()
+            .any(|update| {
+                update.object == cursor_properties.plane.into()
+                    && update.property == cursor_properties.fb_id
+                    && update.value == 0
+            })
+    );
+
+    assert!(backend.pstate.tearing.is_on());
+    assert!(backend.platform.any_cursor_plane_visible());
+    assert_eq!(
+        backend.scene.cursor_mode(),
+        crate::kms::render::scene::CursorPlaneMode::Hw
+    );
+    assert!(
+        recorder.records()[rejected_start..]
+            .iter()
+            .all(|record| record.kind != AtomicCommitKind::Async)
+    );
 
     Backend::finish_vt_release(&mut backend, &mut state, &InputInventory::default());
     assert_tearing_off(&backend);
@@ -954,17 +1032,15 @@ fn tearing_on_rejected_cursor_detach_stays_vsync_until_backend_retry() {
     assert_direct_queue_drained(&backend);
     assert!(backend.platform.async_ledger.for_tests_is_empty());
     let records = recorder.records();
-    let mut expected = vec![AtomicCommitKind::Scene; 8];
+    let mut expected = vec![AtomicCommitKind::Scene; 9];
     expected.extend([
         AtomicCommitKind::SceneWithCursor,
         AtomicCommitKind::SceneWithCursor,
-        AtomicCommitKind::SceneWithCursor,
-        AtomicCommitKind::Async,
     ]);
     assert_eq!(
         records.iter().map(|record| record.kind).collect::<Vec<_>>(),
         expected,
-        "rejected grouped detach falls back to per-output detach, which retires before Async resumes",
+        "cursorless grouped unflip precedes a rejected SW+detach request while HW ownership remains",
     );
     assert!(records.iter().any(|record| {
         record.kind == AtomicCommitKind::SceneWithCursor
@@ -976,9 +1052,9 @@ fn tearing_on_rejected_cursor_detach_stays_vsync_until_backend_retry() {
                 }
             )
     }));
-    assert!(records.iter().any(|record| {
-        record.kind == AtomicCommitKind::Async
-            && record
+    assert!(records.iter().all(|record| {
+        record.kind != AtomicCommitKind::Async
+            || !record
                 .flags
                 .contains(::drm::control::AtomicCommitFlags::PAGE_FLIP_ASYNC)
     }));

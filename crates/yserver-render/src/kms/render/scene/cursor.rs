@@ -140,52 +140,6 @@ impl SceneCompositor {
         })
     }
 
-    /// Retire the cursor half of a grouped external scene replacement.
-    ///
-    /// The direct-scanout handoff replaces every CRTC with a retained scene
-    /// framebuffer without creating normal per-output scene acknowledgements.
-    /// Apply the same cursorless HW→SW phase that a scene acknowledgement would
-    /// have applied at this retirement, so the following scene tick can reveal
-    /// the software cursor.
-    pub fn retire_external_cursor_handoff(
-        &mut self,
-        output_idx: usize,
-        sink: &mut dyn OutputSink,
-    ) -> bool {
-        let Some(inner) = self.inner.as_mut() else {
-            return false;
-        };
-        if output_idx >= inner.outputs.len() {
-            return false;
-        }
-
-        let transition = Some(CursorTransition::HideOnRetire {
-            reveal_sw_after: true,
-        });
-        let retained_mode = inner.outputs[output_idx].last_frame_cursor_mode;
-        let result = apply_cursor_transition_on_retire(inner, output_idx, sink, transition);
-        let desired_mode = OutputCursorMode::SwPending;
-        let resolution = resolve_retired_cursor_state(result, desired_mode, retained_mode);
-        let state = &mut inner.outputs[output_idx];
-        state.force_show_retry_version = update_force_show_retry_version(
-            state.force_show_retry_version,
-            transition,
-            result,
-            desired_mode,
-        );
-        state.last_frame_cursor_mode = resolution.actual_mode;
-        if resolution.commit_desired_metadata || resolution.clear_presented_metadata {
-            state.cursor_prev_pos = None;
-            state.last_present_cursor_rect = None;
-            state.last_present_cursor_version = None;
-        }
-        if resolution.force_repaint {
-            force_cursor_retry_repaint(state);
-            self.scene_structure_dirty = true;
-        }
-        true
-    }
-
     /// Put the pixels a software cursor covers back into `bytes`, a tight
     /// BGRA8 read of `read` from compose image `image` (`cursor_save`).
     pub fn restore_under_cursor(&self, image: vk::Image, read: vk::Rect2D, bytes: &mut [u8]) {

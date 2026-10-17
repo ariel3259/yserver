@@ -527,14 +527,14 @@ impl PlatformBackend {
         let plane = cursor.plane.as_ref()?;
         let properties = plane.properties_for(crtc)?;
         let state = cursor.crtc_states.get(&crtc)?;
-        if state.in_flight.is_some() {
+        if state.in_flight.is_some() && !primary_successor {
             return None;
         }
         let intent = state.intent?;
         if (cursor.permanently_disabled && matches!(intent, CursorIntent::Show(_)))
             || (cursor.cursor_hide_recovery.contains_key(&crtc)
                 && matches!(intent, CursorIntent::Show(_)))
-            || cursor.atomic_cursor_commits_in_flight.contains_key(&crtc)
+            || (!primary_successor && cursor.atomic_cursor_commits_in_flight.contains_key(&crtc))
         {
             return None;
         }
@@ -2425,63 +2425,6 @@ impl PlatformBackend {
         Ok(CursorMoveOutcome::default())
     }
 
-    /// True iff the set of CRTCs whose region the cursor footprint
-    /// intersects differs from the set the plane is currently bound on
-    /// (`is_visible_on`).
-    ///
-    /// The pointer fast path (`cursor_plane_move`) only *repositions*
-    /// the cursor on already-bound CRTCs — it never shows the plane on
-    /// a CRTC the pointer newly crosses into, nor hides it on one it
-    /// leaves. Cross-CRTC show/hide is decided by the scene's
-    /// `CursorAssignment` during compose. While an idle desktop
-    /// composited every frame (pre-#30) that reassignment happened for
-    /// free; now that idle desktops stop compositing, the fast path
-    /// must detect a boundary crossing and route it through one compose
-    /// tick. This predicate is that detector, using the same footprint
-    /// intersection rule as `cursor_footprint_rect` so its membership
-    /// decision matches the scene's exactly.
-    ///
-    /// `(x, y)` is the root-space cursor position, `(hot_x, hot_y)` the
-    /// sprite hotspot, `(cw, ch)` the sprite extent.
-    pub(crate) fn cursor_crtc_membership_dirty(
-        &self,
-        x: i32,
-        y: i32,
-        hot_x: u16,
-        hot_y: u16,
-        cw: i32,
-        ch: i32,
-    ) -> bool {
-        for l in &self.outputs {
-            let Some(device) = self.device_for_key(l.key.device_key) else {
-                continue;
-            };
-            if device.cursor.plane.is_none() {
-                continue;
-            }
-            let dx = x - i32::from(hot_x) - l.x;
-            let dy = y - i32::from(hot_y) - l.y;
-            let intersects = cursor_footprint_intersects_output(
-                dx,
-                dy,
-                cw,
-                ch,
-                i32::from(l.width),
-                i32::from(l.height),
-            );
-            if intersects
-                != device
-                    .cursor
-                    .crtc_states
-                    .get(&l.output.crtc)
-                    .is_some_and(|state| state.applied.is_some())
-            {
-                return true;
-            }
-        }
-        false
-    }
-
     /// Submit a per-CRTC atomic detach for output-local recovery. A rejected
     /// request retains the accepted binding and marks the hide as failed.
     ///
@@ -2888,8 +2831,8 @@ pub(super) fn cursor_root_to_crtc_local(
 /// Whether the cursor footprint `[dx, dx+cw) × [dy, dy+ch)` (in
 /// output-local coordinates) overlaps the output's `[0, w) × [0, h)`
 /// region. This is the boolean form of `cursor_footprint_rect`'s
-/// non-empty condition, kept in sync so `cursor_crtc_membership_dirty`
-/// decides on-output membership exactly as the scene does.
+/// non-empty condition used by the intent fanout and the scene's
+/// output-local cursor assignment.
 pub(super) fn cursor_footprint_intersects_output(
     dx: i32,
     dy: i32,

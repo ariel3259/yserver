@@ -94,6 +94,88 @@ impl AtomicCursorFixture {
         Self::from_live_backend(backend, Some(64), Some(64))
     }
 
+    pub(crate) fn new_with_cursor_mixed_three_output_layout() -> Result<Option<Self>, String> {
+        let mut backend = KmsBackend::for_tests_with_vk_dimensions(2450, 600)
+            .map_err(|error| error.to_string())?;
+        super::super::push_test_output(&mut backend, 2);
+        super::super::push_test_output(&mut backend, 3);
+        backend.platform.outputs[1].x = 800;
+        backend.platform.outputs[2].x = 1650;
+        backend.platform.outputs[2].y = 100;
+        backend.platform.outputs[2].height = 400;
+        backend.platform.outputs[2].output.picked.height = 400;
+        for mode in &mut backend.platform.outputs[2].output.modes {
+            mode.height = 400;
+        }
+
+        let second_key = crate::platform::drm::DrmDeviceKey {
+            major: 226,
+            minor: 1,
+        };
+        let recorders = Rc::clone(
+            backend
+                .platform
+                .services
+                .test_recorders
+                .as_ref()
+                .expect("for_tests selects recording KMS services"),
+        );
+        let dependency: Arc<dyn crate::drm::client_caps::DeviceControl + Send + Sync> =
+            crate::drm::client_caps::recording_control("atomic-cursor-mixed-output");
+        let device = Rc::new(
+            crate::drm::Device::for_tests_with_control(dependency)
+                .expect("open mixed-output recording DRM device"),
+        );
+        recorders.page_flip_events.register_device(&device);
+        let first = &backend.platform.devices[0];
+        backend
+            .platform
+            .devices
+            .push(crate::kms::render::platform::KmsDevice {
+                key: second_key,
+                device,
+                async_page_flip: false,
+                atomic_commit_sink: Rc::clone(&first.atomic_commit_sink),
+                page_flip_event_source: Rc::clone(&first.page_flip_event_source),
+                cursor_buffer_io: Rc::clone(&first.cursor_buffer_io),
+                legacy_cursor_io: Rc::clone(&first.legacy_cursor_io),
+                test_page_flip_event_source: Some(Rc::clone(&recorders.page_flip_events)),
+                cursor: crate::kms::render::platform::KmsCursorState::new(),
+            });
+        let route = backend
+            .platform
+            .scanout_route_for_kms(second_key)
+            .expect("mixed-output route has a sink device");
+        let output = &mut backend.platform.outputs[2];
+        output.key.device_key = second_key;
+        output.scanout_route = route;
+        backend
+            .pstate
+            .crtc_key_by_id
+            .insert(u32::from(output.output.crtc), output.key.clone());
+        backend.refresh_present_crtc_clock_epochs();
+
+        let Some(mut fixture) = Self::from_live_backend(backend, Some(64), Some(64))? else {
+            return Ok(None);
+        };
+        fixture
+            .backend
+            .platform
+            .devices
+            .iter_mut()
+            .find(|device| device.key == second_key)
+            .expect("software output sink device")
+            .cursor
+            .plane = None;
+        let layouts = fixture.backend.platform.scene_output_layouts();
+        fixture.backend.scene =
+            crate::kms::render::scene::SceneCompositor::new(&fixture.backend.platform, &layouts)
+                .expect(
+                    "rebuild mixed-output scene after construction-time cursor eligibility setup",
+                );
+        Ok(Some(fixture))
+    }
+
     pub(crate) fn new_with_two_outputs_and_cursor_lease_failure_after(
         boundary: crate::kms::cursor_plane::CursorLeaseBoundary,
         matching_calls_to_skip: usize,

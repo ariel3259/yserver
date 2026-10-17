@@ -35,10 +35,8 @@ fn cursor_with_pixel(
         .expect("cursor handle")
 }
 
-#[test]
-#[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: coalesce a newer framebuffer into pending Shows without its hotspot; both the blocked retry and later CRTC must retain one sprite identity.
-fn atomic_cursor_only_deferred_direct_replacement_reaches_later_crtcs() {
+pub(super) fn run_atomic_cursor_only_deferred_direct_replacement_reaches_later_crtcs() {
     use yserver_core::backend::Backend;
 
     let Some(mut fixture) =
@@ -237,6 +235,100 @@ fn atomic_cursor_only_deferred_direct_replacement_reaches_later_crtcs() {
         "a blocked per-output replacement is not published as bound on every CRTC",
     );
 
+    // Probe a fresh Present source while the replacement is still pending on
+    // CRTC zero. TEST_ONLY receives the same prepared cursor delta that the
+    // grouped direct successor will later carry, and it must not publish it.
+    let probe_source =
+        Backend::create_pixmap(&mut fixture.backend, None, 24, direct.width, direct.height)
+            .expect("create fresh direct-probe source through Backend");
+    let probe_source_id = fixture
+        .backend
+        .store
+        .lookup(probe_source.as_raw())
+        .expect("fresh direct-probe source is in the drawable store");
+    fixture.recorders.direct_scanout_test_only.queue_source(
+        probe_source_id,
+        yserver_render::kms::render::store::ImportedDmabufMetadata {
+            fourcc: u32::from_le_bytes(*b"XR24"),
+            vk_format: ash::vk::Format::B8G8R8A8_UNORM,
+            modifier: 0,
+            implicit_layout: false,
+            planes: vec![yserver_render::kms::render::store::ImportedDmabufPlane {
+                offset: 0,
+                pitch: u32::from(direct.width).saturating_mul(4),
+            }],
+            width: direct.width,
+            height: direct.height,
+            depth: 24,
+            bpp: 32,
+        },
+        std::fs::File::open("/dev/null")
+            .expect("open synthetic direct-probe fd")
+            .into(),
+    );
+    fixture
+        .recorders
+        .direct_scanout_test_only
+        .queue_accepted(0x8200);
+    let (mut probe_candidate, probe_event) = super::round_a::direct_present_for_id(&direct, 24_101);
+    probe_candidate.src_pixmap_xid = probe_source.as_raw();
+    probe_candidate.src_host_xid = probe_source.as_raw();
+    let mut probe_event = probe_event;
+    probe_event.host_xid = probe_source.as_raw();
+    let before_probe_cursor_state = [crtc0, crtc1].map(|crtc| {
+        let state = &fixture.backend.platform.devices[0].cursor.crtc_states[&crtc];
+        (state.applied, state.intent, state.in_flight.clone())
+    });
+    let before_probe_mode = fixture.backend.scene.cursor_mode();
+    let before_probe_count = fixture
+        .recorders
+        .direct_scanout_test_only
+        .cursor_deltas()
+        .len();
+    Backend::note_present_scanout_candidate(&mut fixture.backend, probe_candidate);
+    assert_eq!(
+        fixture
+            .recorders
+            .direct_scanout_test_only
+            .cursor_deltas()
+            .len(),
+        before_probe_count + 1,
+        "a fresh eligible source performs a TEST_ONLY probe",
+    );
+    assert_eq!(fixture.backend.scene.cursor_mode(), before_probe_mode);
+    let after_probe_cursor_state = [crtc0, crtc1].map(|crtc| {
+        let state = &fixture.backend.platform.devices[0].cursor.crtc_states[&crtc];
+        (state.applied, state.intent, state.in_flight.clone())
+    });
+    assert_eq!(after_probe_cursor_state, before_probe_cursor_state);
+    let probe_cursor_deltas = fixture
+        .recorders
+        .direct_scanout_test_only
+        .cursor_deltas()
+        .pop()
+        .expect("recorded TEST_ONLY cursor deltas");
+    assert!(
+        probe_cursor_deltas
+            .iter()
+            .any(|(_, updates)| !updates.is_empty()),
+        "probe includes the pending replacement cursor delta",
+    );
+    assert!(
+        Backend::try_present_direct(&mut fixture.backend, probe_candidate, probe_event)
+            .expect("retain probed direct successor behind cursor retirement")
+    );
+    assert_eq!(
+        fixture
+            .backend
+            .pstate
+            .scanout_m2
+            .queued_successor
+            .as_ref()
+            .map(|successor| successor.candidate.src_host_xid),
+        Some(probe_source.as_raw()),
+        "the probed source becomes the grouped successor",
+    );
+
     fixture.retire_output(1, 60);
     fixture.retire_output(0, 61);
     Backend::maybe_composite(&mut fixture.backend).expect("submit queued direct successor");
@@ -264,6 +356,28 @@ fn atomic_cursor_only_deferred_direct_replacement_reaches_later_crtcs() {
                 && update.property == properties.fb_id
                 && update.value == u64::from(binding.framebuffer)
         }));
+        let expected_probe_updates = probe_cursor_deltas
+            .iter()
+            .find(|(probe_crtc, _)| *probe_crtc == crtc)
+            .map(|(_, updates)| updates.as_slice())
+            .unwrap_or(&[]);
+        let actual_cursor_updates = direct_successor
+            .properties
+            .iter()
+            .copied()
+            .filter(|update| update.object == properties.plane.into())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual_cursor_updates.len(),
+            expected_probe_updates.len(),
+            "TEST_ONLY and accepted direct request carry the same cursor delta count for {crtc:?}: probe={expected_probe_updates:?}, actual={actual_cursor_updates:?}",
+        );
+        assert!(
+            expected_probe_updates
+                .iter()
+                .all(|expected| { actual_cursor_updates.contains(expected) }),
+            "TEST_ONLY and accepted direct request carry the same cursor delta for {crtc:?}"
+        );
         let receipt = fixture
             .backend
             .scene

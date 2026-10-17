@@ -1020,6 +1020,11 @@ impl KmsBackend {
                 "scanout M2: grouped unflip requires one DRM device and homogeneous refresh",
             ));
         }
+        if !self.scene.direct_scanout_primary_ready() {
+            return Err(io::Error::other(
+                "scanout M2: grouped unflip has no verified cursorless retained primary",
+            ));
+        }
         self.materialize_direct_shadow_for_unflip()?;
         let output_count = self.platform.outputs.len();
         let (device, atomic_commit_sink) = self
@@ -1035,9 +1040,17 @@ impl KmsBackend {
                 io::Error::other("scanout M2: composed unflip requested without a KMS device")
             })?;
         let output_indices: Vec<_> = (0..output_count).collect();
-        let cursor_updates = self
-            .platform
-            .cursor_plane_updates_for_primary_outputs(&output_indices);
+        let cursor_handoff = self.pstate.scanout_m2.unflip_reason == Some("tearing_cursor_handoff");
+        let cursor_updates = if cursor_handoff {
+            // Tearing entry changes the desired cursor ownership to software,
+            // but the retained primary is still cursorless. Keep an actually
+            // bound HW plane until the real SW scene frame can detach it in
+            // the same request that paints its pixels.
+            Vec::new()
+        } else {
+            self.platform
+                .cursor_plane_updates_for_primary_outputs(&output_indices)
+        };
         let framebuffers: Vec<_> = (0..output_count)
             .map(|output_idx| {
                 self.platform
@@ -1084,17 +1097,13 @@ impl KmsBackend {
         self.platform
             .cursor_plane_scene_commit_submitted(&cursor_updates)
             .expect("accepted composed unflip keeps its reserved cursor leases");
-        for update in &cursor_updates {
-            if let Some(output_idx) = self.platform.outputs.iter().position(|layout| {
-                layout.key.device_key == update.device_key && layout.output.crtc == update.crtc
-            }) {
-                self.scene.note_cursor_commit_accepted(
-                    output_idx,
-                    crate::kms::render::platform::accepted_cursor_only_receipt(
-                        update.prepared.next.is_some(),
-                    ),
-                );
-            }
+        for output_idx in 0..output_count {
+            self.scene.note_cursor_commit_accepted(
+                output_idx,
+                crate::kms::render::platform::accepted_cursor_only_receipt(
+                    self.platform.cursor_plane_visible_for_output(output_idx),
+                ),
+            );
         }
         self.pstate.scanout_m2.unflip_awaiting_outputs = (0..output_count).collect();
         let describe_frame = |frame: &DirectPresentFrame| {
@@ -1130,12 +1139,6 @@ impl KmsBackend {
             .remove(&output_idx)
         {
             let degraded = self.pstate.scanout_m2.degraded_composed_unflip;
-            let cursor_handoff =
-                !degraded && self.pstate.scanout_m2.unflip_reason == Some("tearing_cursor_handoff");
-            if cursor_handoff {
-                self.scene
-                    .retire_external_cursor_handoff(output_idx, &mut self.platform);
-            }
             if self.pstate.scanout_m2.unflip_awaiting_outputs.is_empty() {
                 self.stop_direct_after_scanout_replaced(if degraded {
                     "degraded composed unflip"
@@ -1986,7 +1989,8 @@ impl KmsBackend {
             self.scene.cursor_mode(),
             crate::kms::render::scene::CursorPlaneMode::Sw
         ) || (self.pstate.scanout_m2.unflip_reason == Some("tearing_cursor_handoff")
-            && !self.pstate.scanout_m2.unflip_awaiting_outputs.is_empty())
+            && !self.pstate.scanout_m2.unflip_awaiting_outputs.is_empty()
+            && self.scene.direct_scanout_primary_ready())
     }
 
     /// Earliest time a cursor-only software-scene wake may be composed while
@@ -2173,7 +2177,10 @@ impl KmsBackend {
                 || self.pstate.scanout_m2.queued_successor.is_some()
                 || self.pstate.scanout_m2.unflip_requested
                 || !self.pstate.scanout_m2.unflip_awaiting_outputs.is_empty();
-            if !grouped_direct_work_waiting {
+            let tearing_scene_owns_visible_cursor = self.pstate.tearing.is_on()
+                && self.scene_wants_scene()
+                && self.platform.cursor_plane_visible_for_output(output_idx);
+            if !grouped_direct_work_waiting && !tearing_scene_owns_visible_cursor {
                 match self.drain_pending_cursor_intent_for_output(output_idx) {
                     Ok(outcome) => {
                         self.handle_cursor_move_outcome(outcome);

@@ -14,9 +14,8 @@ use crate::kms::{
                 record_and_submit_render, stage_submitted_frame, vk_result_is_device_lost,
             },
             cursor::{
-                cursor_damage_for_frame, cursorless_hide_frame_required, derive_cursor_transition,
-                effective_cursor_prev_mode, force_cursor_retry_repaint, hw_cursor_allowed,
-                note_cursor_commit_accepted_inner,
+                cursor_damage_for_frame, derive_cursor_transition, effective_cursor_prev_mode,
+                force_cursor_retry_repaint, hw_cursor_allowed, note_cursor_commit_accepted_inner,
             },
             damage::{clip_rect_to_output_extent, fan_out_carried_damage},
             damage_audit::{
@@ -721,14 +720,6 @@ fn tick_one_output(
         built.cursor_assignment,
     );
     let shared_output = sink.route(output_idx) == OutputRoute::Shared;
-    if !shared_output && cursorless_hide_frame_required(prev_mode, built.cursor_assignment) {
-        // Two-phase Hw→Sw/Hidden handoff: the frame retired immediately
-        // before hide must contain no software cursor. If the hide ioctl
-        // fails, the old HW sprite remains the sole visible cursor; if it
-        // succeeds, retirement forces a later SW repaint.
-        built.omit_software_cursor_for_hide();
-    }
-
     // Idle free-run fix (cut 2b): record the sampled sources whose pending
     // damage this output PRESENTED, so `tick` can reconcile
     // `offscreen_no_draw` from the union across outputs. Recorded
