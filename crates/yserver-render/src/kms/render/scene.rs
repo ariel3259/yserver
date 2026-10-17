@@ -32,6 +32,7 @@
 mod build;
 mod compose;
 mod cursor;
+mod cursor_frame;
 mod damage;
 mod damage_audit;
 mod flip;
@@ -49,6 +50,7 @@ pub use build::*;
 use compose::*;
 #[cfg(test)]
 use cursor::*;
+pub use cursor_frame::*;
 #[cfg(test)]
 use damage::*;
 #[cfg(test)]
@@ -156,6 +158,12 @@ struct PendingAck {
     bo_idx: usize,
     generation: u64,
     stage: InFlightStage,
+    /// The exact scene cursor assignment that was handed to the output seam.
+    cursor_frame: CursorFramePlan,
+    /// Scene handoffs remain receipt-less until their primary commit succeeds.
+    cursor_receipt: Option<CursorCommitReceipt>,
+    /// Cursor pixels actually recorded into this frame's primary target.
+    rendered_primary_cursor: CursorPrimaryContent,
     /// Snapshots taken at tick entry, one per source drawable
     /// that contributed to the compose. Ack'd against the
     /// store's live presentation damage on flip retirement.
@@ -347,6 +355,9 @@ struct OutputSceneState {
     /// successful flip (transactional commit per codex round 2
     /// point 2).
     current_generation: u64,
+    /// Cursor-frame identity is independent of presentation generation, so a
+    /// failed handoff never lets a later request reuse its frame ID.
+    next_cursor_frame_id: u64,
     /// Scene-structure damage in output coords. Accumulated by
     /// `mark_scene_structure_damage(region)`; subtracted on
     /// retirement using the snapshot captured at submit time.
@@ -372,6 +383,8 @@ struct OutputSceneState {
     /// BO with SW pixels (multi-output double-cursor hazard);
     /// per-output mode + per-output `cursor_prev_pos` closes that.
     last_frame_cursor_mode: OutputCursorMode,
+    /// Latest cursor state accepted by an output sink.
+    cursor_commit_receipt: Option<CursorCommitReceipt>,
     /// Stage 5 Phase D — per-output SW cursor position carried so
     /// the next tick can damage the OLD rect. v3 of the plan moved
     /// this from `SceneCompositorInner.cursor_prev_pos`
@@ -999,6 +1012,8 @@ enum Repaint {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ComposeSubmit {
     descriptor_count: usize,
+    /// Cursor pixels recorded into this compose target.
+    pub primary_cursor: CursorPrimaryContent,
 }
 
 /// The root as a node of the walk: its place is its storage rect at the

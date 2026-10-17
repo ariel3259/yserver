@@ -4,7 +4,8 @@ use crate::kms::render::{
         RenderCompletion, SceneCompositor, SceneCompositorInner,
         cursor::{
             apply_cursor_transition_on_retire, force_cursor_retry_repaint,
-            resolve_retired_cursor_state, update_force_show_retry_version,
+            note_cursor_commit_accepted_inner, resolve_retired_cursor_state,
+            update_force_show_retry_version,
         },
         tick::tick_skip_log_enabled,
     },
@@ -312,10 +313,12 @@ pub(super) fn handle_scanout_render_completion_inner(
     }
 
     match sink.submit_copied(output_idx, bo_idx, fd) {
-        Ok(()) => {
+        Ok(receipt) => {
             if let Some(ack) = inner.outputs[output_idx].pending_acks.front_mut() {
                 ack.stage = InFlightStage::KmsFlipPending;
+                ack.cursor_receipt = Some(receipt);
             }
+            note_cursor_commit_accepted_inner(inner, output_idx, receipt);
             true
         }
         Err(error) => {

@@ -27,6 +27,7 @@
 mod connectors;
 mod cursor;
 pub(crate) mod cursor_commit;
+pub(crate) mod cursor_frames;
 mod cursor_lifecycle;
 pub(crate) mod cursor_state;
 mod devices;
@@ -505,6 +506,9 @@ pub struct PlatformBackend {
     /// `None` preserves the legacy test/caller override above; production sets
     /// every output on every pass, starting with Vsync.
     pub(crate) scene_flip_timings: Vec<Option<FlipTiming>>,
+    /// Cursor plans indexed by their reserved scanout slot until the primary
+    /// submit is accepted or the handoff is cancelled.
+    pub(crate) staged_cursor_frames: HashMap<(usize, usize), cursor_frames::StagedCursorFrame>,
     /// A scene retirement attempted to hide a hardware cursor and failed.
     /// The backend consumes this to keep tearing's fallback diagnostic once.
     pub(crate) scene_cursor_hide_failed: bool,

@@ -487,6 +487,13 @@ impl PlatformBackend {
     }
 
     pub(super) fn cancel_scanout_render_completions_for_output(&mut self, output_key: &OutputKey) {
+        if let Some(output_idx) = self
+            .outputs
+            .iter()
+            .position(|output| output.key == *output_key)
+        {
+            super::cursor_frames::cancel_cursor_frames_for_output(self, output_idx);
+        }
         let mut index = 0;
         while index < self.pending_scanout_render_completions.len() {
             if self.pending_scanout_render_completions[index].output_key != *output_key {
@@ -513,6 +520,7 @@ impl PlatformBackend {
                 log::warn!("scanout render completion teardown unregister failed: {error}");
             }
         }
+        super::cursor_frames::clear_cursor_frames(self);
     }
 
     /// Drain page-flip events that belong to the topology epoch just taken

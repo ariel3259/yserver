@@ -83,6 +83,7 @@ impl OutputSink for TestSink {
         &mut self,
         _output_idx: usize,
         _bo_idx: usize,
+        _cursor: CursorFramePlan,
         _record: &mut RecordFrame<'_>,
     ) -> FinishOutcome {
         FinishOutcome::Unavailable(FrameTargetError::NoSlot)
@@ -122,7 +123,7 @@ impl OutputSink for TestSink {
         _output_idx: usize,
         _bo_idx: usize,
         _fd: Option<std::os::fd::OwnedFd>,
-    ) -> io::Result<()> {
+    ) -> io::Result<CursorCommitReceipt> {
         Err(io::Error::other(
             "render completion targeted a shared output",
         ))

@@ -34,9 +34,10 @@ use crate::kms::{
         gpu::{FencePool, GpuCore},
         resize_fault,
         scene::{
-            CursorPlaneSink, CursorShowFailure, CursorUploadOutcome, FinishOutcome, FlipRetirement,
-            FrameTargetError, OffscreenTarget, OutputLayout, OutputRoute, OutputSink,
-            PreparedOutputs, RecordFrame, RenderCompletion, SceneCompositor, SlotToken,
+            CursorAcceptedMode, CursorFramePlan, CursorPlaneSink, CursorShowFailure,
+            CursorUploadOutcome, FinishOutcome, FlipRetirement, FrameHandoff, FrameTargetError,
+            OffscreenTarget, OutputLayout, OutputRoute, OutputSink, PreparedOutputs, RecordFrame,
+            RenderCompletion, SceneCompositor, SlotToken,
         },
     },
     vk::{
@@ -277,12 +278,30 @@ impl OutputSink for SurfacePlatform {
         &mut self,
         output_idx: usize,
         bo_idx: usize,
+        cursor: CursorFramePlan,
         record: &mut RecordFrame<'_>,
     ) -> FinishOutcome {
-        match self.outputs.get_mut(output_idx) {
-            Some(output) => output.finish_frame(bo_idx, record),
-            None => FinishOutcome::Unavailable(FrameTargetError::NoSlot),
+        let frame = cursor.frame;
+        let mut outcome = match self.outputs.get_mut(output_idx) {
+            Some(output) => output.finish_frame(bo_idx, cursor, record),
+            None => return FinishOutcome::Unavailable(FrameTargetError::NoSlot),
+        };
+        if let FinishOutcome::Finished {
+            result:
+                Ok(FrameHandoff::FlipPending {
+                    cursor: receipt, ..
+                }),
+            ..
+        } = &mut outcome
+        {
+            receipt.frame = Some(frame);
+            receipt.mode = if self.cursor.shown {
+                CursorAcceptedMode::Hardware
+            } else {
+                CursorAcceptedMode::Hidden
+            };
         }
+        outcome
     }
 
     fn invalidate_slot(&mut self, output_idx: usize, bo_idx: usize) {
@@ -334,7 +353,7 @@ impl OutputSink for SurfacePlatform {
         _output_idx: usize,
         _bo_idx: usize,
         _fd: Option<OwnedFd>,
-    ) -> io::Result<()> {
+    ) -> io::Result<crate::kms::render::scene::CursorCommitReceipt> {
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }
 }

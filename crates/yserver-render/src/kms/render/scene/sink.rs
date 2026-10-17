@@ -14,7 +14,10 @@ use ash::vk;
 use crate::kms::{
     render::{
         gpu::GpuCore,
-        scene::{ComposeRenderTarget, ComposeSubmit, SceneError},
+        scene::{
+            ComposeRenderTarget, ComposeSubmit, CursorCommitReceipt, CursorFramePlan,
+            CursorPrimaryContent, SceneError,
+        },
     },
     vk::compositor::PresentError,
 };
@@ -67,11 +70,17 @@ pub enum FrameTargetError {
 /// How a finished frame leaves the sink.
 pub enum FrameHandoff {
     /// Composed and flipped; retirement comes as a page flip.
-    FlipPending(ComposeSubmit),
+    FlipPending {
+        submit: ComposeSubmit,
+        cursor: CursorCommitReceipt,
+    },
     /// Composed into the copied route's source; the completion fd (`None` is
     /// the already-signalled payload) goes to
     /// [`OutputSink::register_render_completion`].
-    RenderCompletion(Option<OwnedFd>),
+    RenderCompletion {
+        completion: Option<OwnedFd>,
+        primary_cursor: CursorPrimaryContent,
+    },
 }
 
 /// The result of [`OutputSink::finish_frame`].
@@ -141,6 +150,7 @@ pub trait OutputSink {
         &mut self,
         output_idx: usize,
         bo_idx: usize,
+        cursor: CursorFramePlan,
         record: &mut RecordFrame<'_>,
     ) -> FinishOutcome;
     fn invalidate_slot(&mut self, output_idx: usize, bo_idx: usize);
@@ -178,7 +188,7 @@ pub trait OutputSink {
         output_idx: usize,
         bo_idx: usize,
         fd: Option<OwnedFd>,
-    ) -> io::Result<()>;
+    ) -> io::Result<CursorCommitReceipt>;
 }
 
 /// A cursor show that failed, and whether the old sprite is still visible.

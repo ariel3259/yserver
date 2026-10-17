@@ -1,9 +1,10 @@
 use crate::kms::render::{
     cursor_save::CursorSaveTarget,
     scene::{
-        CursorAssignment, CursorEntry, CursorPlaneMode, CursorRetireResolution, CursorTransition,
-        CursorTransitionResult, OutputCursorMode, OutputLayout, OutputSceneState, OutputSink,
-        SceneBuild, SceneCompositor, SceneCompositorInner,
+        CursorAssignment, CursorCommitReceipt, CursorEntry, CursorPlaneMode,
+        CursorRetireResolution, CursorTransition, CursorTransitionResult, OutputCursorMode,
+        OutputLayout, OutputSceneState, OutputSink, SceneBuild, SceneCompositor,
+        SceneCompositorInner,
     },
     store::RegionSet,
 };
@@ -74,6 +75,28 @@ impl SceneBuild {
 }
 
 impl SceneCompositor {
+    /// Publish a cursor state only after its owning output commit was accepted.
+    pub fn note_cursor_commit_accepted(&mut self, output_idx: usize, receipt: CursorCommitReceipt) {
+        if receipt.needs_recompose {
+            self.wake_for_cursor_damage();
+        }
+        if let Some(inner) = self.inner.as_mut() {
+            note_cursor_commit_accepted_inner(inner, output_idx, receipt);
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_tests_cursor_commit_receipt(
+        &self,
+        output_idx: usize,
+    ) -> Option<CursorCommitReceipt> {
+        self.inner
+            .as_ref()?
+            .outputs
+            .get(output_idx)?
+            .cursor_commit_receipt
+    }
+
     /// Whether any submitted, unretired frame still carries a cursor-plane
     /// action. Tearing entry waits for these actions to retire first.
     pub fn cursor_transition_pending(&self) -> bool {
@@ -278,6 +301,17 @@ impl SceneCompositor {
         self.note_structure_change();
         refreshes_hw_binding
     }
+}
+
+pub(super) fn note_cursor_commit_accepted_inner(
+    inner: &mut SceneCompositorInner,
+    output_idx: usize,
+    receipt: CursorCommitReceipt,
+) {
+    let Some(output) = inner.outputs.get_mut(output_idx) else {
+        return;
+    };
+    output.cursor_commit_receipt = Some(receipt);
 }
 
 // ────────────────────────────────────────────────────────────────

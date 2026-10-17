@@ -45,13 +45,15 @@ fn damage_audit_attribution_filters_to_episode_event_range() {
 fn damage_audit_partial_compose_is_detectable() {
     assert!(compose_submit_was_complete(
         ComposeSubmit {
-            descriptor_count: 4
+            descriptor_count: 4,
+            primary_cursor: CursorPrimaryContent::Cursorless,
         },
         4
     ));
     assert!(!compose_submit_was_complete(
         ComposeSubmit {
-            descriptor_count: 3
+            descriptor_count: 3,
+            primary_cursor: CursorPrimaryContent::Cursorless,
         },
         4
     ));

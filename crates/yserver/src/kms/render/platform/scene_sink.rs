@@ -8,7 +8,8 @@ use crate::kms::{
         gpu::GpuCore,
         platform::PlatformBackend,
         scene::{
-            ComposeRenderTarget, ComposeSubmit, CursorPlaneSink, CursorShowFailure,
+            ComposeRenderTarget, ComposeSubmit, CursorAcceptedMode, CursorCommitReceipt,
+            CursorFramePlan, CursorPlaneSink, CursorPrimaryContent, CursorShowFailure,
             CursorUploadOutcome, FinishOutcome, FlipRetirement, FrameHandoff, FrameTargetError,
             OutputRoute, OutputSink, RecordFrame, RenderCompletion, SlotToken,
         },
@@ -22,6 +23,20 @@ use ash::vk;
 use std::{io, os::fd::OwnedFd, rc::Rc};
 
 impl PlatformBackend {
+    fn accepted_cursor_mode(
+        &self,
+        output_idx: usize,
+        primary_cursor: CursorPrimaryContent,
+    ) -> CursorAcceptedMode {
+        if self.cursor_plane().visible(output_idx) {
+            CursorAcceptedMode::Hardware
+        } else if matches!(primary_cursor, CursorPrimaryContent::Software { .. }) {
+            CursorAcceptedMode::Software
+        } else {
+            CursorAcceptedMode::Hidden
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn for_tests_pending_scanout_render_completion_count(&self) -> usize {
         self.pending_scanout_render_completions.len()
@@ -99,6 +114,7 @@ impl OutputSink for PlatformBackend {
         &mut self,
         output_idx: usize,
         bo_idx: usize,
+        cursor: CursorFramePlan,
         record: &mut RecordFrame<'_>,
     ) -> FinishOutcome {
         let output_key = &self.outputs[output_idx].key;
@@ -143,6 +159,18 @@ impl OutputSink for PlatformBackend {
         if !target_slot_exists {
             return FinishOutcome::Unavailable(FrameTargetError::NoSlot);
         }
+        let frame = cursor.frame;
+        if let Err(error) =
+            super::cursor_frames::stage_cursor_frame(self, output_idx, bo_idx, cursor)
+        {
+            return FinishOutcome::Unavailable(FrameTargetError::NoDevice(error));
+        }
+        if let Err(error) =
+            super::cursor_frames::prepare_frame_cursor_commit(self, output_idx, bo_idx, frame)
+        {
+            super::cursor_frames::cancel_cursor_frame(self, output_idx, bo_idx, frame);
+            return FinishOutcome::Unavailable(FrameTargetError::NoDevice(error));
+        }
         // Async requests are cursorless by construction. Do not prepare or
         // reserve a cursor delta that an Async EINVAL fallback could later
         // accidentally settle as accepted.
@@ -153,6 +181,7 @@ impl OutputSink for PlatformBackend {
             Vec::new()
         };
         if let Err(error) = self.reserve_cursor_plane_updates(&cursor_updates) {
+            super::cursor_frames::cancel_cursor_frame(self, output_idx, bo_idx, frame);
             return FinishOutcome::Unavailable(FrameTargetError::NoDevice(error));
         }
         let async_ledger = &mut self.async_ledger;
@@ -169,7 +198,7 @@ impl OutputSink for PlatformBackend {
         let mut shared_cursor_commit_submitted = false;
         let mut cursor_rejection_error: Option<io::Error> = None;
         let mut async_outcome = None;
-        let outcome = match pool {
+        let mut outcome = match pool {
             OutputScanout::Shared(pool) => {
                 let allocation_plan = pool.allocation_plan;
                 let bo = pool
@@ -201,8 +230,15 @@ impl OutputSink for PlatformBackend {
                     shared_cursor_commit_submitted =
                         *result != crate::drm::async_flip::AsyncOutcome::Accepted;
                 }
-                let result =
-                    submitted.map(|(compose, _async_outcome)| FrameHandoff::FlipPending(compose));
+                let result = submitted.map(|(compose, _async_outcome)| FrameHandoff::FlipPending {
+                    cursor: CursorCommitReceipt {
+                        frame: Some(frame),
+                        mode: CursorAcceptedMode::Hidden,
+                        primary_cursor: compose.primary_cursor,
+                        needs_recompose: false,
+                    },
+                    submit: compose,
+                });
                 FinishOutcome::Finished {
                     result,
                     previous_gpu_ns: bo.last_gpu_render_ns.take(),
@@ -226,7 +262,12 @@ impl OutputSink for PlatformBackend {
                     .is_err_and(CopiedRenderSubmitError::requires_fail_stop);
                 FinishOutcome::Finished {
                     result: result
-                        .map(FrameHandoff::RenderCompletion)
+                        .map(
+                            |(completion, primary_cursor)| FrameHandoff::RenderCompletion {
+                                completion,
+                                primary_cursor,
+                            },
+                        )
                         .map_err(CopiedRenderSubmitError::into_present),
                     previous_gpu_ns: source.last_gpu_render_ns.take(),
                     fail_stop,
@@ -255,6 +296,48 @@ impl OutputSink for PlatformBackend {
         } else {
             self.reject_cursor_plane_update_reservations(&cursor_updates);
         }
+        match &mut outcome {
+            FinishOutcome::Finished {
+                result:
+                    Ok(FrameHandoff::FlipPending {
+                        submit,
+                        cursor: receipt,
+                    }),
+                ..
+            } => {
+                let mode = self.accepted_cursor_mode(output_idx, submit.primary_cursor);
+                let accepted = super::cursor_frames::accept_cursor_frame(
+                    self,
+                    output_idx,
+                    bo_idx,
+                    frame,
+                    mode,
+                    submit.primary_cursor,
+                );
+                *receipt = accepted;
+            }
+            FinishOutcome::Finished {
+                result: Ok(FrameHandoff::RenderCompletion { primary_cursor, .. }),
+                ..
+            } => {
+                if let Err(error) = super::cursor_frames::record_primary_cursor(
+                    self,
+                    output_idx,
+                    bo_idx,
+                    frame,
+                    *primary_cursor,
+                ) {
+                    log::error!("render copied scanout: could not retain cursor frame: {error}");
+                    super::cursor_frames::cancel_cursor_frame(self, output_idx, bo_idx, frame);
+                }
+            }
+            FinishOutcome::Finished { result: Err(_), .. } => {
+                super::cursor_frames::cancel_cursor_frame(self, output_idx, bo_idx, frame);
+            }
+            FinishOutcome::Unavailable(_) => {
+                super::cursor_frames::cancel_cursor_frame(self, output_idx, bo_idx, frame);
+            }
+        }
         outcome
     }
 
@@ -264,6 +347,7 @@ impl OutputSink for PlatformBackend {
 
     fn cancel_slot(&mut self, output_idx: usize, bo_idx: usize) {
         self.cancel_scanout_bo_recording(output_idx, bo_idx);
+        super::cursor_frames::cancel_cursor_frame_for_slot(self, output_idx, bo_idx);
     }
 
     fn recycle_failed_slot(&mut self, output_idx: usize, bo_idx: usize) -> io::Result<()> {
@@ -285,7 +369,13 @@ impl OutputSink for PlatformBackend {
         fd: Option<OwnedFd>,
     ) -> io::Result<u64> {
         let output_key = self.outputs[output_idx].key.clone();
-        self.register_scanout_render_completion(output_key, bo_idx, fd)
+        match self.register_scanout_render_completion(output_key, bo_idx, fd) {
+            Ok(job_id) => Ok(job_id),
+            Err(error) => {
+                super::cursor_frames::cancel_cursor_frame_for_slot(self, output_idx, bo_idx);
+                Err(error)
+            }
+        }
     }
 
     fn drain_render_completions(&mut self) -> Vec<RenderCompletion> {
@@ -306,6 +396,7 @@ impl OutputSink for PlatformBackend {
 
     fn clear_render_completions(&mut self) {
         self.clear_scanout_render_completions();
+        super::cursor_frames::clear_cursor_frames(self);
     }
 
     fn submit_copied(
@@ -313,8 +404,31 @@ impl OutputSink for PlatformBackend {
         output_idx: usize,
         bo_idx: usize,
         fd: Option<OwnedFd>,
-    ) -> io::Result<()> {
-        self.submit_copied_scanout(output_idx, bo_idx, fd)
+    ) -> io::Result<CursorCommitReceipt> {
+        let frame = super::cursor_frames::staged_cursor_frame_id(self, output_idx, bo_idx)
+            .ok_or_else(|| io::Error::other("copied cursor frame was not staged"))?;
+        let primary_cursor = self
+            .staged_cursor_frames
+            .get(&(output_idx, bo_idx))
+            .and_then(|staged| staged.primary_cursor)
+            .ok_or_else(|| io::Error::other("copied cursor frame has no recorded pixels"))?;
+        match self.submit_copied_scanout(output_idx, bo_idx, fd) {
+            Ok(()) => {
+                let mode = self.accepted_cursor_mode(output_idx, primary_cursor);
+                Ok(super::cursor_frames::accept_cursor_frame(
+                    self,
+                    output_idx,
+                    bo_idx,
+                    frame,
+                    mode,
+                    primary_cursor,
+                ))
+            }
+            Err(error) => {
+                super::cursor_frames::cancel_cursor_frame(self, output_idx, bo_idx, frame);
+                Err(error)
+            }
+        }
     }
 }
 
@@ -729,7 +843,7 @@ fn submit_copied_scanout_render(
     source: &mut CopiedRenderSource,
     destination_state: &mut BoState,
     record: &mut RecordFrame<'_>,
-) -> Result<Option<OwnedFd>, CopiedRenderSubmitError> {
+) -> Result<(Option<OwnedFd>, CursorPrimaryContent), CopiedRenderSubmitError> {
     if destination_state.phase != BoPhase::Free {
         return Err(CopiedRenderSubmitError::Present(PresentError::WrongPhase(
             destination_state.phase,
@@ -739,12 +853,13 @@ fn submit_copied_scanout_render(
         .prepare_renderer_acquire()
         .map_err(CopiedRenderSubmitError::RendererAcquire)?;
     destination_state.transition_to_recording();
-    record(source)
-        .map(|_| ())
-        .map_err(CopiedRenderSubmitError::Present)?;
-    source
+    let primary_cursor = record(source)
+        .map_err(CopiedRenderSubmitError::Present)?
+        .primary_cursor;
+    let completion = source
         .export_render_completion()
-        .map_err(|error| CopiedRenderSubmitError::Present(PresentError::Vk(error)))
+        .map_err(|error| CopiedRenderSubmitError::Present(PresentError::Vk(error)))?;
+    Ok((completion, primary_cursor))
 }
 
 #[cfg(test)]

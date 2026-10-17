@@ -218,12 +218,38 @@ fn atomic_cursor_only_copied_scene_routes_to_sink_device_via_backend() {
     Backend::warp_pointer_root(&mut fixture.backend, &mut fixture.state, 100, 90);
     damage_cursor_root(&mut fixture);
     Backend::maybe_composite(&mut fixture.backend).expect("submit copied scene frame");
+    let receipt_after_render = fixture.backend.scene.for_tests_cursor_commit_receipt(0);
+    let scene_commit_accepted = sink_atomic
+        .records()
+        .iter()
+        .any(|record| record.kind == crate::drm::atomic::AtomicCommitKind::Scene);
+    assert_eq!(
+        receipt_after_render.is_some(),
+        scene_commit_accepted,
+        "copied rendering publishes a receipt only after the final scene KMS submit",
+    );
 
     let mut copied_commit = false;
+    let mut copied_receipt = false;
     for frame in 1..8 {
         fixture.backend.platform.wait_idle_bounded();
         Backend::on_scanout_render_completion(&mut fixture.backend, &mut fixture.state);
         if fixture.backend.scene.has_pending_page_flips() {
+            let receipt = fixture
+                .backend
+                .scene
+                .for_tests_cursor_commit_receipt(0)
+                .expect("copied KMS submission accepts its cursor receipt");
+            assert_eq!(
+                receipt.frame,
+                Some(crate::kms::render::scene::CursorFrameId(1)),
+            );
+            assert_eq!(
+                receipt.primary_cursor,
+                crate::kms::render::scene::CursorPrimaryContent::Cursorless,
+                "hardware cursor ownership is separate from the copied primary pixels",
+            );
+            copied_receipt = true;
             fixture.retire_output(0, frame);
         }
         if !sink_atomic.records().is_empty() {
@@ -235,6 +261,10 @@ fn atomic_cursor_only_copied_scene_routes_to_sink_device_via_backend() {
     assert!(
         copied_commit,
         "copied scene submission must use the KMS sink device's atomic recorder",
+    );
+    assert!(
+        copied_receipt,
+        "copied receipt is published after its KMS commit"
     );
     assert_eq!(
         sink_atomic

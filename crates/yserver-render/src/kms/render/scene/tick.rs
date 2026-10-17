@@ -2,11 +2,11 @@ use crate::kms::{
     render::{
         region::Region,
         scene::{
-            CarriedDamage, ComposeRenderTarget, CursorAssignment, CursorTransition, FailedSubmitBo,
-            FinishOutcome, FrameHandoff, FullReason, InFlightStage, OutputRoute, OutputSceneState,
-            OutputSink, OutputWalkReport, PendingAck, Repaint, RepaintPlan, ScalePass,
-            SceneCompositor, SceneCompositorInner, SceneError, SceneInput, TickOutcome,
-            TickSkipReason, Visibility,
+            CarriedDamage, ComposeRenderTarget, CursorAssignment, CursorFrameAssignment,
+            CursorFramePlan, CursorPrimaryContent, CursorTransition, FailedSubmitBo, FinishOutcome,
+            FrameHandoff, FullReason, InFlightStage, OutputRoute, OutputSceneState, OutputSink,
+            OutputWalkReport, PendingAck, Repaint, RepaintPlan, ScalePass, SceneCompositor,
+            SceneCompositorInner, SceneError, SceneInput, TickOutcome, TickSkipReason, Visibility,
             build::build_scene_with,
             compose::{
                 compose_submit_was_complete, present_error_is_device_lost,
@@ -14,7 +14,7 @@ use crate::kms::{
             },
             cursor::{
                 cursor_damage_for_frame, cursorless_hide_frame_required, derive_cursor_transition,
-                effective_cursor_prev_mode, hw_cursor_allowed,
+                effective_cursor_prev_mode, hw_cursor_allowed, note_cursor_commit_accepted_inner,
             },
             damage::{clip_rect_to_output_extent, fan_out_carried_damage},
             damage_audit::{
@@ -1240,6 +1240,40 @@ fn tick_one_output(
             &[],
         )
     };
+    let frame = {
+        let state = inner.outputs.get_mut(output_idx).expect("range");
+        let frame = crate::kms::render::scene::CursorFrameId(state.next_cursor_frame_id);
+        state.next_cursor_frame_id = state
+            .next_cursor_frame_id
+            .checked_add(1)
+            .expect("cursor frame identity exhausted for output lifetime");
+        frame
+    };
+    let assignment = match built.cursor_assignment {
+        CursorAssignment::Hw { .. } => CursorFrameAssignment::Hardware,
+        CursorAssignment::Sw { pos } => CursorFrameAssignment::Software { pos },
+        CursorAssignment::Hidden => CursorFrameAssignment::Hidden,
+    };
+    let cursor_frame = CursorFramePlan {
+        frame,
+        assignment,
+        sprite: (!matches!(assignment, CursorFrameAssignment::Hidden))
+            .then(|| inner.cursor.clone())
+            .flatten(),
+    };
+    let primary_cursor = match (
+        built.software_cursor_tail,
+        built.cursor_assignment,
+        built.cursor_record_version,
+    ) {
+        (Some(_), CursorAssignment::Sw { pos }, Some(record_version)) => {
+            CursorPrimaryContent::Software {
+                pos,
+                record_version,
+            }
+        }
+        _ => CursorPrimaryContent::Cursorless,
+    };
     let mut record = |target: &mut dyn ComposeRenderTarget| {
         record_and_submit_render(
             &inner.vk,
@@ -1257,9 +1291,14 @@ fn tick_one_output(
             scale_pass.as_ref(),
             cursor_save,
         )
+        .map(|mut submit| {
+            submit.primary_cursor = primary_cursor;
+            submit
+        })
     };
+    let mut accepted_cursor_receipt = None;
     let (render_result, previous_gpu_ns, copied_prepare_failed) =
-        match sink.finish_frame(output_idx, token.bo_idx, &mut record) {
+        match sink.finish_frame(output_idx, token.bo_idx, cursor_frame.clone(), &mut record) {
             FinishOutcome::Unavailable(error) => return Err(error.into()),
             FinishOutcome::Finished {
                 result,
@@ -1267,12 +1306,13 @@ fn tick_one_output(
                 fail_stop,
             } => (
                 result.map(|handoff| match handoff {
-                    FrameHandoff::FlipPending(submitted) => {
+                    FrameHandoff::FlipPending { submit, cursor } => {
                         compose_complete =
-                            compose_submit_was_complete(submitted, render_scene.draws.len());
+                            compose_submit_was_complete(submit, render_scene.draws.len());
+                        accepted_cursor_receipt = Some(cursor);
                         None
                     }
-                    FrameHandoff::RenderCompletion(completion) => Some(completion),
+                    FrameHandoff::RenderCompletion { completion, .. } => Some(completion),
                 }),
                 previous_gpu_ns,
                 fail_stop,
@@ -1302,6 +1342,12 @@ fn tick_one_output(
         Ok(None) => Ok(InFlightStage::KmsFlipPending),
         Err(error) => Err(error),
     };
+    if let Ok(stage) = &compose_result
+        && *stage == InFlightStage::KmsFlipPending
+        && let Some(receipt) = accepted_cursor_receipt
+    {
+        note_cursor_commit_accepted_inner(inner, output_idx, receipt);
+    }
     let record_ns = u64::try_from(record_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
     telemetry.record_compose_cb_record_ns(record_ns);
     // GPU-render time from this paired target's PREVIOUS compose (timestamp
@@ -1329,6 +1375,9 @@ fn tick_one_output(
                 bo_idx: token.bo_idx,
                 generation: frame_gen,
                 stage,
+                cursor_frame: cursor_frame.clone(),
+                cursor_receipt: accepted_cursor_receipt,
+                rendered_primary_cursor: primary_cursor,
                 drawable_snapshots: built.snapshots,
                 ticket: Some(compose_ticket),
                 submitted_output_damage: output_damage,

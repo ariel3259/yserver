@@ -187,6 +187,7 @@ pub(super) fn record_and_submit_render<T: ComposeRenderTarget + ?Sized>(
     }
     Ok(ComposeSubmit {
         descriptor_count: descriptors.len(),
+        primary_cursor: crate::kms::render::scene::CursorPrimaryContent::Cursorless,
     })
 }
 

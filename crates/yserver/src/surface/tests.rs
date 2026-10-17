@@ -862,6 +862,24 @@ fn surface_shows_the_root_cursor_once_at_startup() {
     assert!(width > 0 && height > 0);
     f.frame(xid, 0x0000_FF00);
     f.retire();
+    let receipt =
+        f.b.scene
+            .for_tests_cursor_commit_receipt(0)
+            .expect("accepted surface frame cursor receipt");
+    assert_eq!(
+        receipt.frame,
+        Some(crate::kms::render::scene::CursorFrameId(2)),
+        "the receipt names the second accepted surface frame",
+    );
+    assert_eq!(
+        receipt.mode,
+        crate::kms::render::scene::CursorAcceptedMode::Hardware,
+        "the native host cursor is accepted separately from primary pixels",
+    );
+    assert_eq!(
+        receipt.primary_cursor,
+        crate::kms::render::scene::CursorPrimaryContent::Cursorless,
+    );
     assert!(ui.take().is_empty(), "an unchanged cursor is not re-sent");
 }
 

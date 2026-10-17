@@ -182,6 +182,7 @@ impl SceneCompositor {
             failed_submit_bos: VecDeque::with_capacity(4),
             damage_history: BufferAgeRing::new(bo_depth + 1),
             current_generation: 0,
+            next_cursor_frame_id: 1,
             scene_structure_damage: RegionSet::new(),
             pending_repaint_after_failed_submit: RegionSet::new(),
             output_extent: vk::Extent2D {
@@ -191,6 +192,7 @@ impl SceneCompositor {
             output_origin: (root_x, root_y),
             next_submit_retry_at: None,
             last_frame_cursor_mode: OutputCursorMode::Hidden,
+            cursor_commit_receipt: None,
             cursor_prev_pos: None,
             last_present_cursor_rect: None,
             last_present_cursor_version: None,

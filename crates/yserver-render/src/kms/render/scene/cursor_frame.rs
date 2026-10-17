@@ -1,0 +1,49 @@
+use super::CursorEntry;
+
+/// Monotonic identity of a cursor-bearing frame within one output lifetime.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct CursorFrameId(pub u64);
+
+/// The cursor ownership requested by a rendered scene frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CursorFrameAssignment {
+    Hardware,
+    Software { pos: (i32, i32) },
+    Hidden,
+}
+
+/// Cursor inputs captured when the scene builds one output frame.
+#[derive(Clone, Debug)]
+pub struct CursorFramePlan {
+    pub frame: CursorFrameId,
+    pub assignment: CursorFrameAssignment,
+    pub sprite: Option<CursorEntry>,
+}
+
+/// Cursor ownership the output accepted with a commit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CursorAcceptedMode {
+    Hardware,
+    Software,
+    Hidden,
+}
+
+/// Cursor pixels actually included in the accepted primary framebuffer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CursorPrimaryContent {
+    Cursorless,
+    Software {
+        pos: (i32, i32),
+        record_version: u64,
+    },
+}
+
+/// Receipt for the cursor state accepted with a primary or cursor-only commit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CursorCommitReceipt {
+    /// `None` means an external cursor update without a rendered frame.
+    pub frame: Option<CursorFrameId>,
+    pub mode: CursorAcceptedMode,
+    pub primary_cursor: CursorPrimaryContent,
+    pub needs_recompose: bool,
+}
