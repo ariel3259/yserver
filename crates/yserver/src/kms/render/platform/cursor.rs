@@ -1499,6 +1499,20 @@ impl PlatformBackend {
     }
 
     #[cfg(test)]
+    pub(crate) fn for_tests_cursor_retry_wait_pending(&self, output_idx: usize) -> bool {
+        let Some(layout) = self.outputs.get(output_idx) else {
+            return false;
+        };
+        self.device_for_key(layout.key.device_key)
+            .is_some_and(|device| {
+                device
+                    .cursor
+                    .cursor_retry_waits_for_flip
+                    .contains(&layout.output.crtc)
+            })
+    }
+
+    #[cfg(test)]
     pub(crate) fn for_tests_cursor_hide_intent_pending(&self, output_idx: usize) -> bool {
         let Ok((device_idx, crtc, _, _)) = self.cursor_output_route(output_idx) else {
             return false;

@@ -78,6 +78,20 @@ impl AtomicCursorFixture {
         Self::from_live_backend(backend, Some(64), Some(64))
     }
 
+    pub(crate) fn new_with_two_outputs_and_cursor_lease_failure_after(
+        boundary: crate::kms::cursor_plane::CursorLeaseBoundary,
+        matching_calls_to_skip: usize,
+    ) -> Result<Option<Self>, String> {
+        let mut backend = KmsBackend::for_tests_with_vk_dimensions(1600, 600)
+            .map_err(|error| error.to_string())?;
+        super::super::push_test_output(&mut backend, 2);
+        let Some(mut fixture) = Self::from_live_backend(backend, Some(64), Some(64))? else {
+            return Ok(None);
+        };
+        fixture.script_cursor_lease_failure(boundary, matching_calls_to_skip);
+        Ok(Some(fixture))
+    }
+
     pub(crate) fn new_with_overlapping_outputs() -> Result<Option<Self>, String> {
         let mut backend = KmsBackend::for_tests_with_vk_dimensions(800, 600)
             .map_err(|error| error.to_string())?;
