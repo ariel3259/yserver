@@ -95,17 +95,6 @@ pub trait Platform: OutputSink + Sized + 'static {
     fn direct_frames_shaped_off_root(_b: &XBackend<Self>) -> bool {
         false
     }
-    /// Rebind the current prepared cursor intent while a direct frame owns
-    /// the primary planes. The intent and its sprite lease are prepared by
-    /// the shared cursor scheduler.
-    fn refresh_direct_cursor(
-        _b: &mut XBackend<Self>,
-        _record: &std::sync::Arc<crate::kms::render::cursor::CursorRecord>,
-    ) -> bool {
-        false
-    }
-    /// Submit the current prepared hide intent while direct scanout is held.
-    fn hide_cursor_under_direct_scanout(_b: &mut XBackend<Self>) {}
     /// Reapply a hidden cursor policy after output resume, including stale
     /// plane bindings left by a failed best-effort suspend hide.
     fn recover_hidden_cursor_on_resume(_b: &mut XBackend<Self>) {}

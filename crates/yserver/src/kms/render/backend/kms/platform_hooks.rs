@@ -175,17 +175,6 @@ impl Platform for PlatformBackend {
         b.direct_frames_shaped_off_root()
     }
 
-    fn refresh_direct_cursor(
-        b: &mut KmsBackend,
-        record: &std::sync::Arc<crate::kms::render::cursor::CursorRecord>,
-    ) -> bool {
-        b.refresh_direct_cursor_on_all_outputs(record)
-    }
-
-    fn hide_cursor_under_direct_scanout(b: &mut KmsBackend) {
-        b.hide_cursor_under_direct_scanout();
-    }
-
     fn recover_hidden_cursor_on_resume(b: &mut KmsBackend) {
         b.platform.recover_hidden_cursor_on_resume();
     }

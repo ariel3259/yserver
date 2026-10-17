@@ -243,56 +243,41 @@ fn define_visible_cursor_rebinds_held_vsync_direct_scanout() {
     use yserver_core::backend::Backend;
 
     const WINDOW: u32 = 0x78b1;
-    let Some(mut backend) = direct_backend(1) else {
+    let Some((mut backend, recorder, mut state, show_executor, hide_executor)) =
+        super::round2::held_vsync_direct_scanout_with_transparent_cursor(WINDOW, 15_300, 1)
+    else {
         return;
     };
-    let recorder = recording_sink(&mut backend, 0);
-    let (show_executor, hide_executor) = install_cursor_plane_with_successful_show(&mut backend);
     let root = backend.core.window_id;
-
-    let transparent = create_bitmap_cursor_via_backend(&mut backend, false, false);
-    Backend::define_cursor(&mut backend, None, root, transparent.as_raw())
-        .expect("select transparent root cursor");
-    assert!(backend.effective_cursor_hidden());
-    assert_eq!(
-        backend.scene.cursor_mode(),
-        crate::kms::render::scene::CursorPlaneMode::Hidden
-    );
-
-    assert!(
-        try_direct_present_with_live_storage(&mut backend, 15_300, WINDOW, 800, 600, 0).is_some()
-    );
-    assert!(backend.pstate.scanout_m2.pending.is_some());
-    assert_eq!(recorder.records().len(), 1);
-    assert_eq!(recorder.records()[0].kind, AtomicCommitKind::Scene);
-    let mut state = yserver_core::server::ServerState::new();
-    retire_direct_present(&mut backend, &mut state, 70);
     assert!(backend.pstate.scanout_m2.active());
     assert!(backend.pstate.scanout_m2.hold_direct);
     assert!(!backend.platform.any_cursor_plane_visible());
 
     let visible = create_bitmap_cursor_via_backend(&mut backend, true, true);
+    let before_define = recorder.records().len();
     Backend::define_cursor(&mut backend, None, root, visible.as_raw())
         .expect("select opaque root cursor while direct scanout is held");
+    assert_eq!(
+        recorder.records().len(),
+        before_define,
+        "DefineCursor only queues the direct first-bind intent"
+    );
+    let before_show = recorder.records().len();
+    Backend::maybe_composite(&mut backend).expect("schedule the accepted cursor rebind");
+    assert_eq!(recorder.records().len(), before_show + 1);
+    assert_eq!(
+        recorder.records()[before_show].kind,
+        AtomicCommitKind::CursorOnly
+    );
     assert!(!backend.effective_cursor_hidden());
     assert!(show_executor.calls().is_empty());
     assert!(hide_executor.calls().is_empty());
-    assert_commit_sequence(
-        &recorder,
-        &[AtomicCommitKind::Scene, AtomicCommitKind::CursorOnly],
-    );
     assert!(backend.platform.any_cursor_plane_visible());
     assert!(backend.pstate.scanout_m2.active());
     assert!(backend.pstate.scanout_m2.hold_direct);
     assert!(!backend.pstate.scanout_m2.unflip_requested);
     assert!(backend.pstate.scanout_m2.unflip_awaiting_outputs.is_empty());
-    Backend::maybe_composite(&mut backend).expect("keep held direct scanout with rebound cursor");
-    assert_eq!(
-        recorder.records().last().unwrap().kind,
-        AtomicCommitKind::CursorOnly,
-        "the rebound cursor position is submitted atomically"
-    );
-    retire_direct_present(&mut backend, &mut state, 71);
+    retire_recorded_direct_flip(&mut backend, &mut state, 71);
 
     assert!(matches!(
         backend.pstate.tearing.state,
@@ -313,9 +298,13 @@ fn define_visible_cursor_rebinds_held_vsync_direct_scanout() {
     assert!(!backend.pstate.scanout_m2.unflip_requested);
     assert!(backend.pstate.scanout_m2.unflip_awaiting_outputs.is_empty());
     assert_direct_queue_drained(&backend);
-    assert_commit_sequence(
+    super::round2::finish_held_direct_cursor_test(
+        &mut backend,
+        &mut state,
         &recorder,
-        &[AtomicCommitKind::Scene, AtomicCommitKind::CursorOnly],
+        WINDOW,
+        90,
+        Some(0),
     );
     backend.platform.wait_idle_bounded();
 }

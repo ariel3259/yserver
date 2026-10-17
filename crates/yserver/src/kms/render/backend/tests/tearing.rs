@@ -48,6 +48,23 @@ fn recording_sink(
     recorder
 }
 
+fn prime_cursorless_scene_primary(backend: &mut KmsBackend) {
+    use yserver_core::server::ServerState;
+
+    let recorder = recording_sink(backend, 0);
+    let mut state = ServerState::new();
+    damage_root_and_composite(backend);
+    assert!(
+        backend.scene.has_pending_page_flips(),
+        "initial retained-primary scene did not submit: {}",
+        tearing_composite_diagnostics(backend, Some(recorder.records().len())),
+    );
+    retire_composed_frame(backend, &mut state, 1);
+    assert!(!backend.scene.has_pending_page_flips());
+    assert!(backend.scene.direct_scanout_primary_ready());
+    recorder.clear_records();
+}
+
 fn raw<T: ::drm::control::ResourceHandle>(value: u32) -> T {
     ::drm::control::from_u32(value).expect("nonzero test handle")
 }
@@ -320,48 +337,9 @@ fn retire_recorded_direct_flip(
 
 fn direct_backend(output_count: usize) -> Option<KmsBackend> {
     init_tearing_test_logger();
-    let mut backend = KmsBackend::for_tests_with_vk().expect("Vulkan test fixture");
-    if !skip_unless_vulkan_fed_scanout(&backend) {
-        return None;
-    }
-    if output_count == 2 {
-        backend.platform.fb_w = 1600;
-        let mut output_b = clone_test_drm_output(&backend.platform.outputs[0].output);
-        output_b.connector = raw(103);
-        output_b.encoder = raw(104);
-        output_b.crtc = raw(101);
-        output_b.plane = raw(102);
-        output_b.connector_name = "test-b".to_owned();
-        let route = backend.platform.outputs[0].scanout_route;
-        let active = crate::kms::backend::ActiveOutput::new(
-            route,
-            output_b,
-            crate::drm::Swapchain::empty_for_tests(),
-            800,
-            0,
-        );
-        let key = active.key.clone();
-        backend.platform.outputs.push(active);
-        backend.platform.outputs[1].x = 800;
-        backend.platform.fb_h = 600;
-        backend.pstate.crtc_key_by_id.insert(101, key);
-        backend.refresh_present_crtc_clock_epochs();
-    } else {
-        assert_eq!(output_count, 1);
-        backend.platform.fb_w = 800;
-        backend.platform.fb_h = 600;
-    }
-    for layout in &backend.platform.outputs {
-        backend
-            .pstate
-            .crtc_key_by_id
-            .insert(u32::from(layout.output.crtc), layout.key.clone());
-    }
-    backend.refresh_present_crtc_clock_epochs();
-    let layouts = backend.platform.scene_output_layouts();
-    backend.scene = crate::kms::render::scene::SceneCompositor::new(&backend.platform, &layouts)
-        .expect("construct direct test scene");
-    backend.scene.scene_structure_dirty = false;
+    let mut backend = scene_backend_with_recording_pools(output_count)
+        .unwrap_or_else(|error| panic!("direct test fixture unavailable: {error}"))?;
+    prime_cursorless_scene_primary(&mut backend);
     backend.pstate.scanout_m2.cursor_bound_all = true;
     backend.pstate.scanout_m2.eligible_root_streak =
         crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1;
@@ -2999,7 +2977,9 @@ fn async_ebusy_is_not_suspension() {
 }
 
 fn live_scene_backend() -> Option<KmsBackend> {
-    live_scene_backend_with_outputs(1)
+    let mut backend = live_scene_backend_with_outputs(1)?;
+    prime_cursorless_scene_primary(&mut backend);
+    Some(backend)
 }
 
 fn live_scene_backend_with_clock(
@@ -3790,7 +3770,7 @@ fn handoff_keeps_newest_copy_not_retained_direct_frame() {
         Ok(reply[32..36].try_into().expect("one BGRA pixel"))
     }
 
-    let Some(mut backend) = live_scene_backend() else {
+    let Some(mut backend) = live_scene_backend_with_outputs(1) else {
         return;
     };
     for device in &mut backend.platform.devices {

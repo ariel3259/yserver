@@ -262,6 +262,8 @@ pub(in crate::kms::render::backend) struct ScanoutM2State {
         Vec<yserver_core::backend::CompletedPresentEvent>,
     pub(in crate::kms::render::backend) idled: Vec<yserver_core::backend::CompletedPresentEvent>,
     pub(in crate::kms::render::backend) hold_direct: bool,
+    /// Advisory summary of settled accepted per-output bindings. Scheduling
+    /// never uses this as a guard; a newer queued attach must still run.
     pub(in crate::kms::render::backend) cursor_bound_all: bool,
     pub(in crate::kms::render::backend) unflip_requested: bool,
     /// First request in the current direct-to-composed transition. This is

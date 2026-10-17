@@ -417,10 +417,6 @@ impl<P: Platform> XBackend<P> {
             #[allow(clippy::cast_possible_truncation)]
             let pos = (self.core.cursor_x as i32, self.core.cursor_y as i32);
             P::queue_cursor_intent(self, None, false, pos);
-            if P::direct_scanout_owns_frame(self) {
-                self.queue_effective_cursor_intent();
-                P::hide_cursor_under_direct_scanout(self);
-            }
             return;
         };
         self.display_cursor_by_handle(xid);
@@ -539,10 +535,6 @@ impl<P: Platform> XBackend<P> {
                 .effective_cursor_xid
                 .and_then(|xid| self.cursor_records.get(&xid).cloned());
             P::queue_cursor_intent(self, record.as_deref(), false, pos);
-            if P::direct_scanout_owns_frame(self) {
-                self.queue_effective_cursor_intent();
-                P::hide_cursor_under_direct_scanout(self);
-            }
             return;
         }
         let Some(xid) = self.effective_cursor_xid else {
@@ -695,8 +687,9 @@ impl<P: Platform> XBackend<P> {
             }
             return;
         }
-        self.queue_effective_cursor_intent();
-        if !P::refresh_direct_cursor(self, record) {
+        #[allow(clippy::cast_possible_truncation)]
+        let pos = (self.core.cursor_x as i32, self.core.cursor_y as i32);
+        if !P::queue_cursor_intent(self, Some(record), true, pos) {
             P::request_direct_unflip(self, "cursor_show_failed");
         }
     }
@@ -733,10 +726,6 @@ impl<P: Platform> XBackend<P> {
                 self.scene.clear_cursor();
             } else {
                 self.scene.observe_cursor(None);
-            }
-            if P::direct_scanout_owns_frame(self) {
-                self.queue_effective_cursor_intent();
-                P::hide_cursor_under_direct_scanout(self);
             }
             return;
         }

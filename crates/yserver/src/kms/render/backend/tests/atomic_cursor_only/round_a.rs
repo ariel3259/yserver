@@ -1929,7 +1929,6 @@ fn atomic_cursor_only_hide_queues_detach_while_direct_is_held() {
             crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
             crate::drm::atomic::AtomicCommitKind::Scene,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
-            crate::drm::atomic::AtomicCommitKind::CursorOnly,
             crate::drm::atomic::AtomicCommitKind::Scene,
         ],
         "the initial frame binds HW, direct cursor work and hide stay cursor-only, and DPMS tears down",
@@ -4146,6 +4145,13 @@ fn atomic_cursor_only_direct_probe_uses_backend_recorded_sink() {
         .for_tests_accept_output_power_commits();
     let setup = setup_cursor_only_direct_present(&mut fixture);
 
+    damage_cursor_root(&mut fixture);
+    Backend::maybe_composite(&mut fixture.backend)
+        .expect("accept cursorless retained composition before direct admission");
+    assert!(fixture.backend.scene.has_pending_page_flip(0));
+    fixture.retire_output(0, 29);
+    assert!(fixture.backend.scene.direct_scanout_primary_ready());
+
     let mut entered_direct = false;
     for attempt in 0..16_u64 {
         let (candidate, event) = direct_present_for_id(&setup, 22_000 + attempt);
@@ -4198,6 +4204,7 @@ fn atomic_cursor_only_direct_probe_uses_backend_recorded_sink() {
             .map(|record| record.kind)
             .collect::<Vec<_>>(),
         vec![
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
             crate::drm::atomic::AtomicCommitKind::Scene,
             crate::drm::atomic::AtomicCommitKind::Scene,
         ],

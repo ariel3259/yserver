@@ -71,6 +71,14 @@ impl AtomicCursorFixture {
         Self::from_live_backend_with_hotspot_properties(backend, Some(64), Some(64))
     }
 
+    pub(crate) fn new_with_hotspot_properties_and_clock(
+        clock: Rc<dyn Fn() -> std::time::Instant>,
+    ) -> Result<Option<Self>, String> {
+        let backend =
+            KmsBackend::for_tests_with_vk_and_clock(clock).map_err(|error| error.to_string())?;
+        Self::from_live_backend_with_hotspot_properties(backend, Some(64), Some(64))
+    }
+
     pub(crate) fn new_with_cursor_capabilities(
         cursor_width: Option<u64>,
         cursor_height: Option<u64>,

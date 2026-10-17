@@ -1,7 +1,7 @@
 use super::*;
 use std::time::Duration;
 
-type HeldVsyncDirectCursor = (
+pub(super) type HeldVsyncDirectCursor = (
     KmsBackend,
     std::rc::Rc<RecordingAtomicCommitExecutor>,
     yserver_core::server::ServerState,
@@ -9,7 +9,7 @@ type HeldVsyncDirectCursor = (
     std::rc::Rc<RecordingCursorHideExecutor>,
 );
 
-fn held_vsync_direct_scanout_with_transparent_cursor(
+pub(super) fn held_vsync_direct_scanout_with_transparent_cursor(
     window: u32,
     present_id: u64,
     output_count: usize,
@@ -31,6 +31,10 @@ fn held_vsync_direct_scanout_with_transparent_cursor(
 
     let mut state = ServerState::new();
     Backend::warp_pointer_root(&mut backend, &mut state, 780, 100);
+    Backend::maybe_composite(&mut backend).expect("accept the retained cursorless primary");
+    assert!(backend.scene.has_pending_page_flips());
+    retire_composed_frame(&mut backend, &mut state, 79);
+    assert!(backend.scene.direct_scanout_primary_ready());
     backend.pstate.scanout_m2.eligible_root_streak =
         crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1;
     backend.platform.requested_flip_timing = crate::drm::async_flip::FlipTiming::Vsync;
@@ -39,10 +43,14 @@ fn held_vsync_direct_scanout_with_transparent_cursor(
         try_direct_present_with_live_storage(&mut backend, present_id, window, width, height, 0,)
             .is_some()
     );
-    assert_eq!(recorder.records().len(), 1);
-    assert_eq!(recorder.records()[0].kind, AtomicCommitKind::Scene);
+    let direct_start = output_count;
+    assert_eq!(recorder.records().len(), direct_start + 1);
+    assert_eq!(
+        recorder.records()[direct_start].kind,
+        AtomicCommitKind::Scene
+    );
     assert!(
-        !recorder.records()[0]
+        !recorder.records()[direct_start]
             .flags
             .contains(::drm::control::AtomicCommitFlags::PAGE_FLIP_ASYNC)
     );
@@ -159,7 +167,7 @@ fn move_held_direct_cursor(
     }
 }
 
-fn finish_held_direct_cursor_test(
+pub(super) fn finish_held_direct_cursor_test(
     backend: &mut KmsBackend,
     state: &mut yserver_core::server::ServerState,
     recorder: &std::rc::Rc<RecordingAtomicCommitExecutor>,
@@ -275,6 +283,14 @@ fn define_cursor_rebind_routes_motion_to_bound_plane_during_vsync_direct_scanout
     let root = backend.core.window_id;
     Backend::define_cursor(&mut backend, None, root, visible.as_raw())
         .expect("select opaque cursor while direct scanout is held");
+    let before_show = recorder.records().len();
+    Backend::maybe_composite(&mut backend).expect("schedule the accepted direct cursor rebind");
+    assert_eq!(recorder.records().len(), before_show + 2);
+    assert!(
+        recorder.records()[before_show..]
+            .iter()
+            .all(|record| record.kind == AtomicCommitKind::CursorOnly)
+    );
 
     assert!(!backend.effective_cursor_hidden());
     assert_eq!(
@@ -306,7 +322,8 @@ fn define_cursor_rebind_routes_motion_to_bound_plane_during_vsync_direct_scanout
     }
 
     finish_held_direct_cursor_test(&mut backend, &mut state, &recorder, WINDOW, 90, Some(1));
-    let mut expected = vec![AtomicCommitKind::Scene];
+    let mut expected = vec![AtomicCommitKind::SceneWithCursor; 2];
+    expected.push(AtomicCommitKind::Scene);
     expected.extend([AtomicCommitKind::CursorOnly; 12]);
     expected.push(AtomicCommitKind::Scene);
     expected.push(AtomicCommitKind::Scene);
@@ -348,6 +365,14 @@ fn xfixes_show_rebind_routes_motion_and_transparent_roundtrip_during_vsync_direc
     );
 
     Backend::set_cursor_hidden(&mut backend, false);
+    let before_show = recorder.records().len();
+    Backend::maybe_composite(&mut backend).expect("schedule the accepted XFIXES cursor rebind");
+    assert_eq!(recorder.records().len(), before_show + 2);
+    assert!(
+        recorder.records()[before_show..]
+            .iter()
+            .all(|record| record.kind == AtomicCommitKind::CursorOnly)
+    );
     assert!(!backend.effective_cursor_hidden());
     assert_eq!(
         backend.scene.cursor_mode(),
@@ -378,8 +403,12 @@ fn xfixes_show_rebind_routes_motion_and_transparent_roundtrip_during_vsync_direc
     }
 
     let transparent = create_bitmap_cursor_via_backend(&mut backend, false, false);
+    let before_hide = recorder.records().len();
     Backend::define_cursor(&mut backend, None, root, transparent.as_raw())
         .expect("switch back to a fully transparent cursor while held");
+    assert_eq!(recorder.records().len(), before_hide);
+    Backend::maybe_composite(&mut backend).expect("schedule accepted transparent cursor hides");
+    assert_eq!(recorder.records().len(), before_hide + 2);
     assert!(backend.effective_cursor_hidden());
     assert!(
         backend
@@ -405,7 +434,8 @@ fn xfixes_show_rebind_routes_motion_and_transparent_roundtrip_during_vsync_direc
     assert!(!backend.scene.has_pending_page_flips());
 
     finish_held_direct_cursor_test(&mut backend, &mut state, &recorder, WINDOW, 100, None);
-    let mut expected = vec![AtomicCommitKind::Scene];
+    let mut expected = vec![AtomicCommitKind::SceneWithCursor; 2];
+    expected.push(AtomicCommitKind::Scene);
     expected.extend([AtomicCommitKind::CursorOnly; 2]);
     expected.extend([AtomicCommitKind::CursorOnly; 10]);
     expected.extend([AtomicCommitKind::CursorOnly; 2]);
@@ -434,6 +464,13 @@ fn atomic_cursor_only_c1_adapters_publish_only_accepted_bindings() {
     let root = backend.core.window_id;
     Backend::define_cursor(&mut backend, None, root, visible.as_raw())
         .expect("define visible cursor while Vsync direct is held");
+    let before_show = recorder.records().len();
+    Backend::maybe_composite(&mut backend).expect("schedule the accepted cursor rebind");
+    assert_eq!(recorder.records().len(), before_show + 1);
+    assert_eq!(
+        recorder.records()[before_show].kind,
+        AtomicCommitKind::CursorOnly
+    );
     assert_eq!(
         backend.scene.cursor_mode(),
         crate::kms::render::scene::CursorPlaneMode::Hw
@@ -476,8 +513,11 @@ fn atomic_cursor_only_c1_adapters_publish_only_accepted_bindings() {
         .expect("create animation through Backend")
         .expect("two-frame animation handle");
     recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EBUSY)));
+    let records_before_animation = recorder.records().len();
     Backend::define_cursor(&mut backend, None, root, animation.as_raw())
         .expect("define animation through Backend");
+    assert_eq!(recorder.records().len(), records_before_animation);
+    Backend::maybe_composite(&mut backend).expect("schedule the rejected animation replacement");
     let rejected_animation_records = recorder.records();
     let rejected_animation = rejected_animation_records.last().unwrap();
     assert_eq!(rejected_animation.kind, AtomicCommitKind::CursorOnly);
@@ -594,6 +634,8 @@ fn atomic_cursor_only_c1_adapters_publish_only_accepted_bindings() {
 
     let records_before_hide = recorder.records().len();
     Backend::set_cursor_hidden(&mut backend, true);
+    assert_eq!(recorder.records().len(), records_before_hide);
+    Backend::maybe_composite(&mut backend).expect("schedule the accepted direct cursor hide");
     let hide_records = recorder.records();
     assert_eq!(hide_records.len(), records_before_hide + 1);
     assert_eq!(
@@ -655,6 +697,10 @@ fn atomic_cursor_only_c1_adapters_publish_only_accepted_bindings() {
             .map(|record| (record.kind, record.result))
             .collect::<Vec<_>>(),
         vec![
+            (
+                AtomicCommitKind::SceneWithCursor,
+                crate::drm::atomic::tests_support::ScriptedResult::Ok
+            ),
             (
                 AtomicCommitKind::Scene,
                 crate::drm::atomic::tests_support::ScriptedResult::Ok

@@ -178,8 +178,14 @@ fn atomic_cursor_only_deferred_direct_replacement_reaches_later_crtcs() {
 
     let root = fixture.backend.core.window_id;
     let replacement = cursor_with_pixel(&mut fixture, [0xa1, 0xb2, 0xc3, 0xff]);
+    let records_before_replacement = fixture.recorders.atomic.records().len();
     Backend::define_cursor(&mut fixture.backend, None, root, replacement.as_raw())
         .expect("replace cursor through Backend while output zero is busy");
+    assert_eq!(
+        fixture.recorders.atomic.records().len(),
+        records_before_replacement,
+        "the cursor producer queues the replacement behind the grouped direct successor",
+    );
 
     let device = fixture.backend.platform.device_for_key(device_key).unwrap();
     let state0 = &device.cursor.crtc_states[&crtc0];
@@ -193,18 +199,18 @@ fn atomic_cursor_only_deferred_direct_replacement_reaches_later_crtcs() {
             panic!("visible replacement is a show on CRTC zero")
         }
     };
-    let lease1 = state1
-        .applied
-        .expect("later CRTC accepts the replacement while CRTC zero waits")
-        .lease;
+    let lease1 = match state1
+        .intent
+        .expect("later CRTC also retains the replacement intent")
+    {
+        crate::kms::render::platform::cursor_state::CursorIntent::Show(binding) => binding.lease,
+        crate::kms::render::platform::cursor_state::CursorIntent::Hide => {
+            panic!("visible replacement is a show on CRTC one")
+        }
+    };
     assert_eq!(lease0, lease1, "both CRTCs use the staged sprite lease");
     assert_eq!(state0.applied.unwrap().lease, prior_leases[0]);
-    assert_ne!(lease1, prior_leases[1]);
-    assert_eq!(
-        state1.applied.unwrap().lease,
-        lease1,
-        "the later CRTC accepts the replacement while CRTC zero waits",
-    );
+    assert_eq!(state1.applied.unwrap().lease, prior_leases[1]);
     assert_eq!(
         (state0.intent.and_then(|intent| match intent {
             crate::kms::render::platform::cursor_state::CursorIntent::Show(binding) => {
@@ -216,11 +222,16 @@ fn atomic_cursor_only_deferred_direct_replacement_reaches_later_crtcs() {
         "the blocked replacement keeps its new hotspot with its staged sprite lease",
     );
     assert_eq!(
-        (state1.applied.unwrap().hot_x, state1.applied.unwrap().hot_y),
-        (0, 0),
-        "the later CRTC binds the replacement framebuffer with its own hotspot",
+        state1.intent.and_then(|intent| match intent {
+            crate::kms::render::platform::cursor_state::CursorIntent::Show(binding) => {
+                Some((binding.hot_x, binding.hot_y))
+            }
+            crate::kms::render::platform::cursor_state::CursorIntent::Hide => None,
+        }),
+        Some((0, 0)),
+        "the later CRTC retains the replacement hotspot with its staged lease",
     );
-    assert!(state1.intent.is_none());
+    assert!(state1.intent.is_some());
     assert!(
         !fixture.backend.pstate.scanout_m2.cursor_bound_all,
         "a blocked per-output replacement is not published as bound on every CRTC",
@@ -230,9 +241,53 @@ fn atomic_cursor_only_deferred_direct_replacement_reaches_later_crtcs() {
     fixture.retire_output(0, 61);
     Backend::maybe_composite(&mut fixture.backend).expect("submit queued direct successor");
     assert!(fixture.backend.pstate.scanout_m2.pending.is_some());
+    let direct_successor = fixture.recorders.atomic.records().last().unwrap().clone();
+    assert_eq!(
+        direct_successor.kind,
+        crate::drm::atomic::AtomicCommitKind::SceneWithCursor
+    );
+    for (output_idx, crtc) in [crtc0, crtc1].into_iter().enumerate() {
+        let properties = fixture.backend.platform.devices[0]
+            .cursor
+            .plane
+            .as_ref()
+            .unwrap()
+            .properties_for(crtc)
+            .unwrap();
+        let binding = fixture.backend.platform.devices[0].cursor.crtc_states[&crtc]
+            .applied
+            .expect("direct successor accepts the staged replacement");
+        assert_eq!(binding.lease, lease1);
+        assert_ne!(binding.lease, prior_leases[output_idx]);
+        assert!(direct_successor.properties.iter().any(|update| {
+            update.object == properties.plane.into()
+                && update.property == properties.fb_id
+                && update.value == u64::from(binding.framebuffer)
+        }));
+        let receipt = fixture
+            .backend
+            .scene
+            .for_tests_cursor_commit_receipt(output_idx)
+            .expect("accepted direct successor cursor receipt");
+        assert_eq!(
+            receipt.mode,
+            crate::kms::render::scene::CursorAcceptedMode::Hardware
+        );
+        assert_eq!(
+            receipt.primary_cursor,
+            crate::kms::render::scene::CursorPrimaryContent::Cursorless
+        );
+    }
     fixture.retire_output(0, 62);
     fixture.retire_output(1, 62);
-    Backend::maybe_composite(&mut fixture.backend).expect("retry first CRTC after direct event");
+    let before_replacement_commits = fixture.recorders.atomic.records().len();
+    Backend::maybe_composite(&mut fixture.backend)
+        .expect("schedule replacement after direct event");
+    assert_eq!(
+        fixture.recorders.atomic.records().len(),
+        before_replacement_commits,
+        "the direct successor already accepted both queued cursor replacements",
+    );
     for output_idx in 0..2 {
         if fixture
             .backend

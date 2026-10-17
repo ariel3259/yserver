@@ -632,6 +632,21 @@ fn atomic_cursor_only_frame_receipts_name_the_accepted_frame() {
         .for_tests_accept_output_power_commits();
 
     let setup = super::round_a::setup_cursor_only_direct_present(&mut fixture);
+    super::round_a::damage_cursor_root(&mut fixture);
+    Backend::maybe_composite(&mut fixture.backend)
+        .expect("accept a cursorless retained primary before direct admission");
+    assert!(fixture.backend.scene.has_pending_page_flip(0));
+    fixture.retire_output(0, 29);
+    let baseline_receipt = fixture
+        .backend
+        .scene
+        .for_tests_cursor_commit_receipt(0)
+        .expect("accepted cursorless primary receipt");
+    assert_eq!(
+        baseline_receipt.primary_cursor,
+        CursorPrimaryContent::Cursorless
+    );
+    assert!(fixture.backend.scene.direct_scanout_primary_ready());
     let (candidate, event) = super::round_a::direct_present_for_id(&setup, 20_900);
     let before_test_only = fixture.recorders.atomic.records().len();
     Backend::note_present_scanout_candidate(&mut fixture.backend, candidate);
@@ -642,7 +657,7 @@ fn atomic_cursor_only_frame_receipts_name_the_accepted_frame() {
     );
     assert_eq!(
         fixture.backend.scene.for_tests_cursor_commit_receipt(0),
-        None,
+        Some(baseline_receipt),
         "TEST_ONLY validation publishes no accepted cursor receipt"
     );
     assert_eq!(
@@ -670,7 +685,7 @@ fn atomic_cursor_only_frame_receipts_name_the_accepted_frame() {
 
     assert_eq!(
         fixture.backend.scene.for_tests_cursor_commit_receipt(0),
-        None,
+        Some(baseline_receipt),
         "no cursor receipt exists before the first accepted output frame"
     );
 
@@ -687,7 +702,7 @@ fn atomic_cursor_only_frame_receipts_name_the_accepted_frame() {
         .scene
         .for_tests_cursor_commit_receipt(0)
         .expect("accepted F0 cursor receipt");
-    assert_eq!(f0.frame, Some(CursorFrameId(1)));
+    assert_eq!(f0.frame, Some(CursorFrameId(2)));
     assert_eq!(f0.mode, CursorAcceptedMode::Software);
     let CursorPrimaryContent::Software {
         pos: f0_pos,
@@ -750,7 +765,7 @@ fn atomic_cursor_only_frame_receipts_name_the_accepted_frame() {
         .scene
         .for_tests_cursor_commit_receipt(0)
         .expect("accepted F1 cursor receipt");
-    assert_eq!(f1.frame, Some(CursorFrameId(3)));
+    assert_eq!(f1.frame, Some(CursorFrameId(4)));
     assert_eq!(f1.mode, CursorAcceptedMode::Software);
     let CursorPrimaryContent::Software {
         pos: f1_pos,
@@ -779,8 +794,8 @@ fn atomic_cursor_only_frame_receipts_name_the_accepted_frame() {
         .collect();
     assert_eq!(
         frame_records.len(),
-        3,
-        "F0, the rejection, and F1 have flip attempts"
+        4,
+        "the retained baseline, F0, the rejection, and F1 have flip attempts"
     );
     let frame_fb = |index: usize| {
         frame_records[index]
@@ -793,28 +808,28 @@ fn atomic_cursor_only_frame_receipts_name_the_accepted_frame() {
             .expect("the accepted frame records its primary framebuffer")
     };
     assert_eq!(
-        frame_fb(0),
+        frame_fb(1),
         u64::from(f0_fb),
         "F0 receipt accompanies its rendered FB: {frame_records:?}"
     );
     assert_eq!(
-        frame_fb(2),
+        frame_fb(3),
         u64::from(f1_fb),
         "F1 receipt accompanies its rendered FB: {frame_records:?}"
     );
     assert_eq!(
-        frame_records[0].result,
+        frame_records[1].result,
         crate::drm::atomic::tests_support::ScriptedResult::Ok
     );
     assert!(matches!(
-        frame_records[1].result,
+        frame_records[2].result,
         crate::drm::atomic::tests_support::ScriptedResult::Error {
             raw_os_error: Some(5),
             ..
         }
     ));
     assert_eq!(
-        frame_records[2].result,
+        frame_records[3].result,
         crate::drm::atomic::tests_support::ScriptedResult::Ok
     );
 
@@ -1586,15 +1601,15 @@ fn atomic_cursor_only_composed_unflip_reservation_failure_rolls_back_before_fall
         }
     }
     assert!(direct_entered, "Backend direct Presents enter held scanout");
-    Backend::unmap_subwindow(&mut fixture.backend, None, direct.window_xid)
-        .expect("request composed unflip through Backend");
-    assert!(fixture.backend.pstate.scanout_m2.unflip_requested);
-
     // A Hide/Show round trip leaves a real show lease pending behind the
     // accepted detach events. The grouped unflip inherits that pending bind
     // once the old events retire, and must return its reservations if submit
     // then fails.
     Backend::set_cursor_hidden(&mut fixture.backend, true);
+    let before_hide = fixture.recorders.atomic.records().len();
+    Backend::maybe_composite(&mut fixture.backend)
+        .expect("schedule the accepted held-direct detach before unflip");
+    assert_eq!(fixture.recorders.atomic.records().len(), before_hide + 2);
     assert!(!fixture.backend.platform.cursor_plane_visible_for_output(0));
     assert!(!fixture.backend.platform.cursor_plane_visible_for_output(1));
     assert!(
@@ -1603,6 +1618,9 @@ fn atomic_cursor_only_composed_unflip_reservation_failure_rolls_back_before_fall
             .platform
             .cursor_commit_in_flight_for_outputs(&[0, 1])
     );
+    Backend::unmap_subwindow(&mut fixture.backend, None, direct.window_xid)
+        .expect("request composed unflip through Backend");
+    assert!(fixture.backend.pstate.scanout_m2.unflip_requested);
     let replacement_source = Backend::create_pixmap(&mut fixture.backend, None, 64, 64, 1)
         .expect("create replacement cursor source through Backend");
     Backend::put_image(
@@ -1877,6 +1895,10 @@ fn atomic_cursor_only_composed_unflip_partial_reservation_failure_releases_prior
     assert!(fixture.backend.platform.cursor_plane_visible_for_output(0));
     assert!(fixture.backend.platform.cursor_plane_visible_for_output(1));
     Backend::set_cursor_hidden(&mut fixture.backend, true);
+    let before_hide = fixture.recorders.atomic.records().len();
+    Backend::maybe_composite(&mut fixture.backend)
+        .expect("schedule accepted hides while the held direct frame has no successor");
+    assert_eq!(fixture.recorders.atomic.records().len(), before_hide + 2);
     assert!(!fixture.backend.platform.cursor_plane_visible_for_output(0));
     assert!(!fixture.backend.platform.cursor_plane_visible_for_output(1));
     for output in &fixture.backend.platform.outputs {
@@ -1974,12 +1996,6 @@ fn atomic_cursor_only_composed_unflip_partial_reservation_failure_releases_prior
             .platform
             .for_tests_cursor_show_intent(output_idx)
             .is_some()
-    }));
-    assert!((0..2).all(|output_idx| {
-        fixture
-            .backend
-            .platform
-            .for_tests_cursor_retry_wait_pending(output_idx)
     }));
     assert!(
         fixture.backend.platform.devices[0]

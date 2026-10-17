@@ -101,26 +101,15 @@ fn atomic_cursor_only_stationary_replacement_survives_primary_successor() {
             .expect("submit an in-flight direct primary")
     );
     assert!(fixture.backend.pstate.scanout_m2.pending.is_some());
-    fixture
-        .recorders
-        .atomic
-        .script_result(Err(std::io::Error::from_raw_os_error(libc::EBUSY)));
     let replacement = create_cursor_with_pixel(&mut fixture, [0xde, 0xad, 0xbe, 0xff]);
     let root = fixture.backend.core.window_id;
+    let records_before_replacement = fixture.recorders.atomic.records().len();
     Backend::define_cursor(&mut fixture.backend, None, root, replacement.as_raw())
         .expect("queue stationary image replacement through Backend");
-
-    let records = fixture.recorders.atomic.records();
-    let busy = records
-        .last()
-        .expect("replacement attempted while direct is pending");
-    assert_eq!(busy.kind, crate::drm::atomic::AtomicCommitKind::CursorOnly);
     assert_eq!(
-        busy.result,
-        crate::drm::atomic::tests_support::ScriptedResult::Error {
-            kind: std::io::ErrorKind::ResourceBusy,
-            raw_os_error: Some(libc::EBUSY),
-        },
+        fixture.recorders.atomic.records().len(),
+        records_before_replacement,
+        "DefineCursor queues the replacement without an overlapping atomic commit",
     );
     let state = &fixture
         .backend
@@ -129,12 +118,13 @@ fn atomic_cursor_only_stationary_replacement_survives_primary_successor() {
         .unwrap()
         .cursor
         .crtc_states[&crtc];
-    let replacement_lease = match state.intent.expect("replacement stays pending") {
-        crate::kms::render::platform::cursor_state::CursorIntent::Show(binding) => binding.lease,
+    let replacement_binding = match state.intent.expect("replacement stays pending") {
+        crate::kms::render::platform::cursor_state::CursorIntent::Show(binding) => binding,
         crate::kms::render::platform::cursor_state::CursorIntent::Hide => {
             panic!("stationary image replacement remains a show")
         }
     };
+    let replacement_lease = replacement_binding.lease;
     assert_ne!(replacement_lease, prior.lease);
 
     assert!(!fixture.backend.pstate.scanout_m2.unflip_requested);
@@ -149,14 +139,15 @@ fn atomic_cursor_only_stationary_replacement_survives_primary_successor() {
         records_before_queue
     );
 
-    // The queued direct producer projects the accepted binding. Its empty
-    // delta must not consume a different, staged replacement lease.
+    // The queued direct producer carries the latest staged HardwareOnly image
+    // when that successor is built, without an intermediate cursor-only commit.
     fixture.retire_output(0, 50);
     Backend::maybe_composite(&mut fixture.backend).expect("submit queued direct successor");
     let after_successor = fixture.recorders.atomic.records();
-    assert_ne!(
-        after_successor.last().unwrap().kind,
-        crate::drm::atomic::AtomicCommitKind::CursorOnly
+    let successor = after_successor.last().unwrap();
+    assert_eq!(
+        successor.kind,
+        crate::drm::atomic::AtomicCommitKind::SceneWithCursor
     );
     let cursor_plane = fixture.backend.platform.devices[0]
         .cursor
@@ -167,13 +158,20 @@ fn atomic_cursor_only_stationary_replacement_survives_primary_successor() {
         .unwrap()
         .plane;
     assert!(
-        after_successor
-            .last()
-            .unwrap()
-            .properties
-            .iter()
-            .all(|update| update.object != cursor_plane.into()),
-        "direct successor projects the accepted binding and emits no cursor properties",
+        successor.properties.iter().any(|update| {
+            update.object == cursor_plane.into()
+                && update.property
+                    == fixture.backend.platform.devices[0]
+                        .cursor
+                        .plane
+                        .as_ref()
+                        .unwrap()
+                        .properties_for(crtc)
+                        .unwrap()
+                        .fb_id
+                && update.value == u64::from(replacement_binding.framebuffer)
+        }),
+        "the accepted direct successor carries the replacement framebuffer",
     );
     let state = &fixture
         .backend
@@ -183,46 +181,37 @@ fn atomic_cursor_only_stationary_replacement_survives_primary_successor() {
         .cursor
         .crtc_states[&crtc];
     assert!(
-        state.intent.is_some(),
-        "direct successor keeps replacement intent"
+        state.intent.is_none(),
+        "the accepted successor consumes its intent"
     );
     assert_eq!(
         state.applied.map(|binding| binding.lease),
-        Some(prior.lease)
+        Some(replacement_lease)
     );
     assert_eq!(
         state.applied.map(|binding| (binding.x, binding.y)),
-        Some((100, 90)),
-        "the primary successor keeps the accepted sprite at the pointer position using its accepted hotspot",
+        Some((92, 82)),
+        "the primary successor samples the current pointer using the replacement hotspot",
+    );
+    let receipt = fixture
+        .backend
+        .scene
+        .for_tests_cursor_commit_receipt(0)
+        .expect("accepted direct cursor receipt");
+    assert_eq!(
+        receipt.mode,
+        crate::kms::render::scene::CursorAcceptedMode::Hardware
+    );
+    assert_eq!(
+        receipt.primary_cursor,
+        crate::kms::render::scene::CursorPrimaryContent::Cursorless
     );
 
+    let after_successor_submit = after_successor.len();
     fixture.retire_output(0, 51);
     let after_successor_event = fixture.recorders.atomic.records();
-    assert_eq!(
-        after_successor_event.last().unwrap().kind,
-        crate::drm::atomic::AtomicCommitKind::CursorOnly,
-        "the direct successor event retries the retained image",
-    );
-    assert!(
-        after_successor_event
-            .last()
-            .unwrap()
-            .properties
-            .iter()
-            .any(|update| {
-                update.object
-                    == fixture.backend.platform.devices[0]
-                        .cursor
-                        .plane
-                        .as_ref()
-                        .unwrap()
-                        .properties_for(crtc)
-                        .unwrap()
-                        .plane
-                        .into()
-                    && update.value != u64::from(prior.framebuffer)
-            })
-    );
+    assert_eq!(after_successor_event.len(), after_successor_submit);
+    assert_eq!(after_successor_event.last().unwrap().kind, successor.kind);
     fixture.retire_output(0, 52);
 
     fixture

@@ -2973,8 +2973,7 @@ fn cursor_einval_rejection_keeps_prior_atomic_binding() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 // Mutation: leave cursor CRTCs out of pending_pageflip_crtcs during RANDR quiesce.
-fn randr_change_discards_an_inflight_cursor_flip_before_the_next_scene_flip() {
-    use std::os::fd::{AsFd as _, AsRawFd as _};
+fn randr_change_discards_cursor_flip_and_blocks_direct_until_primary_receipt() {
     use yserver_core::backend::Backend;
 
     let Some(mut backend) = atomic_cursor_hidden_scanout_backend() else {
@@ -3097,40 +3096,20 @@ fn randr_change_discards_an_inflight_cursor_flip_before_the_next_scene_flip() {
 
     let direct = prepare_atomic_cursor_direct_present_with_extent(&mut backend, 84, 800, 600);
     assert!(
-        Backend::try_present_direct(&mut backend, direct.candidate, direct.event,)
-            .expect("first post-RANDR scene transaction")
+        !Backend::try_present_direct(&mut backend, direct.candidate, direct.event,)
+            .expect("post-RandR direct admission without retained primary receipt"),
+        "RandR invalidates the receipt until a cursorless composed primary is accepted",
     );
-    assert_eq!(recorder.records().len(), 2);
+    assert!(!backend.scene.direct_scanout_primary_ready());
+    assert_eq!(recorder.records().len(), 1);
     assert_eq!(
-        recorder.records()[1].kind,
-        crate::drm::atomic::AtomicCommitKind::Scene,
-    );
-    assert!(
-        recorder.records()[1]
-            .properties
-            .iter()
-            .all(|update| update.object != position.plane.into()),
-        "topology discard must not resurrect cursor properties",
+        recorder.records()[0].kind,
+        crate::drm::atomic::AtomicCommitKind::CursorOnly,
     );
     assert_eq!(event_source.queued_flip_count(), 0);
-
-    event_source.register_device(&device);
-    let new_crtc = backend.platform.outputs[0].output.crtc;
-    event_source.queue_flip_for_device(&device, new_crtc, 52);
-    let drm_fd = backend.platform.devices[0].device.as_fd().as_raw_fd();
-    let mut state = yserver_core::server::ServerState::new();
-    Backend::on_page_flip_ready(&mut backend, &mut state, drm_fd);
     assert!(backend.pstate.scanout_m2.pending.is_none());
-    assert_eq!(
-        backend
-            .pstate
-            .scanout_m2
-            .current
-            .as_ref()
-            .map(|frame| frame.candidate.present_id),
-        Some(84),
-        "the new scene frame, rather than the old cursor flip, must retire",
-    );
+    assert!(backend.pstate.scanout_m2.current.is_none());
+    assert!(backend.pstate.scanout_m2.queued_successor.is_none());
     assert!(
         !backend
             .platform
@@ -3381,6 +3360,9 @@ fn showing_cursor_during_direct_scanout_rebinds_or_requests_unflip() {
             .is_empty(),
         "the hidden plane must not be rebound by the direct transaction"
     );
+    retire_atomic_cursor_direct_frame(&mut backend, &mut state, 30);
+    assert!(backend.pstate.scanout_m2.current.is_some());
+    assert!(backend.pstate.scanout_m2.pending.is_none());
 
     Backend::set_cursor_hidden(&mut backend, false);
     assert!(!backend.cursor_hidden);
@@ -3478,6 +3460,31 @@ fn retire_atomic_cursor_test_output(
     source.register_device(device);
     source.queue_flip_for_device(device, output.crtc, frame);
     let drm_fd = backend.platform.devices[0].device.as_fd().as_raw_fd();
+    Backend::on_page_flip_ready(backend, state, drm_fd);
+}
+
+fn retire_atomic_cursor_direct_frame(
+    backend: &mut KmsBackend,
+    state: &mut yserver_core::server::ServerState,
+    frame: u32,
+) {
+    use std::os::fd::{AsFd as _, AsRawFd as _};
+    use yserver_core::backend::Backend;
+
+    let device = &backend.platform.devices[0].device;
+    let source = backend.platform.devices[0]
+        .test_page_flip_event_source
+        .as_ref()
+        .expect("recording test page-flip source");
+    source.register_device(device);
+    for (index, output) in backend.platform.outputs.iter().enumerate() {
+        source.queue_flip_for_device(
+            device,
+            output.output.crtc,
+            frame.saturating_add(u32::try_from(index).expect("output index fits")),
+        );
+    }
+    let drm_fd = device.as_fd().as_raw_fd();
     Backend::on_page_flip_ready(backend, state, drm_fd);
 }
 
