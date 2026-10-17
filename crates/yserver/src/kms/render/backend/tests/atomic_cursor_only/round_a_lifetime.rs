@@ -1102,11 +1102,12 @@ fn atomic_cursor_only_pool_pressure_keeps_only_newest_animation() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: deduplicate a hotspot-only update by image version or pixel bytes and keep the old framebuffer bound.
+// Mutation: reuse the current framebuffer for equal pixels and keep it bound across a hotspot change.
 fn atomic_cursor_only_hotspot_only_switches_framebuffer() {
     use yserver_core::backend::Backend;
 
-    let Some(mut fixture) = AtomicCursorFixture::new().expect("build hotspot cursor fixture")
+    let Some(mut fixture) =
+        AtomicCursorFixture::new_with_hotspot_properties().expect("build hotspot cursor fixture")
     else {
         return;
     };
@@ -1121,7 +1122,6 @@ fn atomic_cursor_only_hotspot_only_switches_framebuffer() {
         .expect("define original cursor through Backend");
     let original_image = Backend::get_active_cursor_image(&fixture.backend)
         .expect("Backend reports active original cursor");
-    let original_version = u64::from(original_image.serial);
     Backend::warp_pointer_root(&mut fixture.backend, &mut fixture.state, 100, 90);
     damage_cursor_root(&mut fixture);
     Backend::maybe_composite(&mut fixture.backend).expect("submit initial cursor");
@@ -1130,20 +1130,14 @@ fn atomic_cursor_only_hotspot_only_switches_framebuffer() {
     let prior = cursor_binding(&fixture, 0);
     let prior_bytes = framebuffer_storage(&fixture, prior.framebuffer).2;
 
-    // This test-only version seam supplies an equal image identity through
-    // the Backend cursor creation path; production cursor records remain
-    // monotonically versioned.
-    fixture
-        .backend
-        .for_tests_set_next_cursor_version(original_version);
     let changed_hotspot = argb_cursor(&mut fixture, pixels, 1, 1);
     Backend::define_cursor(&mut fixture.backend, None, root, changed_hotspot.as_raw())
-        .expect("define equal-version hotspot change through Backend");
+        .expect("define byte-identical cursor with a changed hotspot through Backend");
     let changed_image = Backend::get_active_cursor_image(&fixture.backend)
         .expect("Backend reports active changed-hotspot cursor");
-    assert_eq!(
-        original_image.serial, changed_image.serial,
-        "the input differs only by hotspot while retaining one prepared image version",
+    assert!(
+        changed_image.serial > original_image.serial,
+        "Backend cursor creation gives the changed hotspot a new monotonic version",
     );
     assert_eq!(original_image.bgra_bytes, changed_image.bgra_bytes);
     assert_ne!(
@@ -1157,9 +1151,16 @@ fn atomic_cursor_only_hotspot_only_switches_framebuffer() {
     if fixture.backend.scene.has_pending_page_flip(0) {
         fixture.retire_output(0, 3);
     }
+    assert!(
+        fixture
+            .backend
+            .platform
+            .cursor_atomic_event_pending_for_output(0),
+        "accepted hotspot replacement awaits its retirement event",
+    );
 
     let next = cursor_binding(&fixture, 0);
-    assert_eq!(next.lease.version(), original_version);
+    assert_eq!(next.lease.version(), u64::from(changed_image.serial));
     assert_ne!(
         next.framebuffer, prior.framebuffer,
         "hotspot identity needs a distinct FB"
@@ -1173,6 +1174,21 @@ fn atomic_cursor_only_hotspot_only_switches_framebuffer() {
     assert_eq!(
         framebuffer_storage(&fixture, prior.framebuffer).2,
         prior_bytes
+    );
+    assert_eq!(
+        remove_fb_count(&fixture, prior.framebuffer),
+        0,
+        "the old framebuffer remains allocated while its replacement event is pending",
+    );
+    assert_eq!(
+        fixture.backend.platform.devices[0]
+            .cursor
+            .plane
+            .as_ref()
+            .expect("sprite pool")
+            .sprite_user_count(prior.lease),
+        Some(1),
+        "the accepted replacement retains the old framebuffer through retirement",
     );
     let records = fixture.recorders.atomic.records();
     let update = records[records_before..]
@@ -1197,19 +1213,42 @@ fn atomic_cursor_only_hotspot_only_switches_framebuffer() {
         }));
     }
     for (property, value) in [
-        (next.properties.hotspot_x, Some(next.hot_x)),
-        (next.properties.hotspot_y, Some(next.hot_y)),
+        (
+            next.properties
+                .hotspot_x
+                .expect("fixture HOTSPOT_X property"),
+            next.hot_x,
+        ),
+        (
+            next.properties
+                .hotspot_y
+                .expect("fixture HOTSPOT_Y property"),
+            next.hot_y,
+        ),
     ] {
-        if let Some(property) = property {
-            assert!(update.properties.iter().any(|field| {
-                field.object == next.properties.plane.into()
-                    && field.property == property
-                    && field.value == u64::from(value.expect("hotspot property value"))
-            }));
-        }
+        assert!(update.properties.iter().any(|field| {
+            field.object == next.properties.plane.into()
+                && field.property == property
+                && field.value == u64::from(value)
+        }));
     }
 
-    disable_and_drain(&mut fixture, 3);
+    fixture.retire_output(0, 4);
+    assert_eq!(
+        fixture.backend.platform.devices[0]
+            .cursor
+            .plane
+            .as_ref()
+            .expect("sprite pool")
+            .sprite_user_count(prior.lease),
+        Some(0),
+        "the replacing event releases the old framebuffer user",
+    );
+    assert_eq!(
+        framebuffer_storage(&fixture, prior.framebuffer).2,
+        prior_bytes
+    );
+    disable_and_drain(&mut fixture, 4);
     assert_eq!(
         cursor_framebuffer_trace(&fixture),
         vec![
@@ -1218,7 +1257,7 @@ fn atomic_cursor_only_hotspot_only_switches_framebuffer() {
             (1, 0),
             (1, 0)
         ],
-        "same-version hotspot replacement has a distinct framebuffer before detach",
+        "byte-identical hotspot replacement has a distinct framebuffer before detach",
     );
     let ledger = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
     drop(fixture);

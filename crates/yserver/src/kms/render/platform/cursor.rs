@@ -311,6 +311,33 @@ impl PlatformBackend {
         cursor_width: Option<u64>,
         cursor_height: Option<u64>,
     ) {
+        self.for_tests_initialize_cursor_planes_with_configuration(
+            cursor_width,
+            cursor_height,
+            false,
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_initialize_cursor_planes_with_hotspot_properties(
+        &mut self,
+        cursor_width: Option<u64>,
+        cursor_height: Option<u64>,
+    ) {
+        self.for_tests_initialize_cursor_planes_with_configuration(
+            cursor_width,
+            cursor_height,
+            true,
+        );
+    }
+
+    #[cfg(test)]
+    fn for_tests_initialize_cursor_planes_with_configuration(
+        &mut self,
+        cursor_width: Option<u64>,
+        cursor_height: Option<u64>,
+        hotspot_properties: bool,
+    ) {
         for device in &mut self.devices {
             let crtcs: Vec<_> = self
                 .outputs
@@ -319,14 +346,26 @@ impl PlatformBackend {
                 .map(|output| output.output.crtc)
                 .collect();
             if !crtcs.is_empty() {
-                match crate::kms::cursor_plane::CursorPlane::for_tests_with_capabilities(
-                    Rc::clone(&device.device),
-                    &crtcs,
-                    Rc::clone(&device.cursor_buffer_io),
-                    Rc::clone(&device.legacy_cursor_io),
-                    cursor_width,
-                    cursor_height,
-                ) {
+                let plane = if hotspot_properties {
+                    crate::kms::cursor_plane::CursorPlane::for_tests_with_hotspot_properties(
+                        Rc::clone(&device.device),
+                        &crtcs,
+                        Rc::clone(&device.cursor_buffer_io),
+                        Rc::clone(&device.legacy_cursor_io),
+                        cursor_width,
+                        cursor_height,
+                    )
+                } else {
+                    crate::kms::cursor_plane::CursorPlane::for_tests_with_capabilities(
+                        Rc::clone(&device.device),
+                        &crtcs,
+                        Rc::clone(&device.cursor_buffer_io),
+                        Rc::clone(&device.legacy_cursor_io),
+                        cursor_width,
+                        cursor_height,
+                    )
+                };
+                match plane {
                     Ok(plane) => {
                         install_cursor_plane_for_device(device, &crtcs, "Vk backend fixture", plane)
                     }

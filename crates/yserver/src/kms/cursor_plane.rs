@@ -631,6 +631,47 @@ impl CursorPlane {
         cursor_width: Option<u64>,
         cursor_height: Option<u64>,
     ) -> io::Result<Self> {
+        Self::for_tests_with_capabilities_and_hotspot_properties(
+            device,
+            crtcs,
+            buffer_io,
+            legacy_io,
+            cursor_width,
+            cursor_height,
+            false,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_with_hotspot_properties(
+        device: Rc<Device>,
+        crtcs: &[crtc::Handle],
+        buffer_io: Rc<dyn CursorBufferIo>,
+        legacy_io: Rc<dyn LegacyCursorIo>,
+        cursor_width: Option<u64>,
+        cursor_height: Option<u64>,
+    ) -> io::Result<Self> {
+        Self::for_tests_with_capabilities_and_hotspot_properties(
+            device,
+            crtcs,
+            buffer_io,
+            legacy_io,
+            cursor_width,
+            cursor_height,
+            true,
+        )
+    }
+
+    #[cfg(test)]
+    fn for_tests_with_capabilities_and_hotspot_properties(
+        device: Rc<Device>,
+        crtcs: &[crtc::Handle],
+        buffer_io: Rc<dyn CursorBufferIo>,
+        legacy_io: Rc<dyn LegacyCursorIo>,
+        cursor_width: Option<u64>,
+        cursor_height: Option<u64>,
+        hotspot_properties: bool,
+    ) -> io::Result<Self> {
         let planes = crtcs
             .iter()
             .enumerate()
@@ -638,10 +679,13 @@ impl CursorPlane {
                 let base = 0x8000_u32
                     .checked_add(u32::try_from(index).expect("test CRTC index fits") * 3)
                     .expect("test cursor handle fits");
-                let property_names = [
+                let mut property_names = vec![
                     "FB_ID", "CRTC_ID", "CRTC_X", "CRTC_Y", "CRTC_W", "CRTC_H", "SRC_X", "SRC_Y",
                     "SRC_W", "SRC_H",
                 ];
+                if hotspot_properties {
+                    property_names.extend(["HOTSPOT_X", "HOTSPOT_Y"]);
+                }
                 DiscoveredCursorPlane {
                     handle: ::drm::control::from_u32(base).expect("test plane handle"),
                     crtcs: HashSet::from([*crtc]),

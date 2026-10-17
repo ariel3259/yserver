@@ -78,9 +78,10 @@ Cross-cutting bugs and followups that don't fit a stage live in
   and retries it after the final old user releases without pointer motion.
   Backend tests withhold output B's recorded page-flip event while retiring A's
   events, keeping B's real scene commit in flight; no allocator seam was added.
-  Tests cover staggered shared-FB replacement, pool pressure, same-version
-  hotspot changes, and colliding synthetic KMS handles across device-backed
-  fixtures. The four new ignored tests passed 20/20 each under 16 CPU busy
+  Tests cover staggered shared-FB replacement, pool pressure, byte-identical
+  cursor definitions with distinct hotspots and monotonic versions, and
+  colliding synthetic KMS handles across device-backed fixtures. The four new
+  ignored tests passed 20/20 each under 16 CPU busy
   loops. The six requested ownership/pressure/hotspot mutations failed their
   intended assertions and were reverted. Default and whole ignored workspace
   suites, render-acceptance default/ignored, build, both Clippy gates, nightly
@@ -107,6 +108,20 @@ Cross-cutting bugs and followups that don't fit a stage live in
   rustfmt printed only its configured nightly-option notices. The lifetime
   test file is 1,226 lines, below its 6,000-line ceiling. No hardware was used;
   hardware validation remains with controller Task C11.
+
+- **2026-10-17 atomic-cursor-only A7 fix round 2:** Removed the test-only
+  `for_tests_set_next_cursor_version` seam and its mid-scenario cursor-state
+  write. The hotspot regression now creates two cursors through `Backend` with
+  identical bytes, distinct hotspots, and naturally increasing versions. Its
+  fixture enables `HOTSPOT_X/Y` during construction; the test checks the new
+  framebuffer, CRTC coordinates, hotspot properties, and the old framebuffer's
+  user count and bytes before and after the replacing event. Reusing the active
+  framebuffer for the byte-identical cursor failed the distinct-FB assertion.
+  The changed ignored test passed 20/20 runs under 16 CPU busy loops. Full
+  default and ignored workspace tests, render-acceptance default/ignored,
+  build, both Clippy gates, nightly/stable formatting, and layout passed. No
+  SYNC_FD capability skips or hardware validation occurred; Task C11 retains
+  hardware validation.
 
 The repository-wide code-quality and technical-debt review from 2026-07-26
 lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).

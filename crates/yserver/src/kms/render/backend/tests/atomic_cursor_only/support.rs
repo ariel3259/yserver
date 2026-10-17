@@ -14,6 +14,11 @@ impl AtomicCursorFixture {
         Self::from_live_backend(backend, Some(64), Some(64))
     }
 
+    pub(crate) fn new_with_hotspot_properties() -> Result<Option<Self>, String> {
+        let backend = KmsBackend::for_tests_with_vk().map_err(|error| error.to_string())?;
+        Self::from_live_backend_with_hotspot_properties(backend, Some(64), Some(64))
+    }
+
     pub(crate) fn new_with_cursor_capabilities(
         cursor_width: Option<u64>,
         cursor_height: Option<u64>,
@@ -103,9 +108,36 @@ impl AtomicCursorFixture {
     }
 
     fn from_live_backend(
+        backend: KmsBackend,
+        cursor_width: Option<u64>,
+        cursor_height: Option<u64>,
+    ) -> Result<Option<Self>, String> {
+        Self::from_live_backend_with_cursor_configuration(
+            backend,
+            cursor_width,
+            cursor_height,
+            false,
+        )
+    }
+
+    fn from_live_backend_with_hotspot_properties(
+        backend: KmsBackend,
+        cursor_width: Option<u64>,
+        cursor_height: Option<u64>,
+    ) -> Result<Option<Self>, String> {
+        Self::from_live_backend_with_cursor_configuration(
+            backend,
+            cursor_width,
+            cursor_height,
+            true,
+        )
+    }
+
+    fn from_live_backend_with_cursor_configuration(
         mut backend: KmsBackend,
         cursor_width: Option<u64>,
         cursor_height: Option<u64>,
+        hotspot_properties: bool,
     ) -> Result<Option<Self>, String> {
         install_recording_device_caps(&mut backend);
         let vk = Arc::clone(
@@ -122,9 +154,18 @@ impl AtomicCursorFixture {
             );
             return Ok(None);
         }
-        backend
-            .platform
-            .for_tests_initialize_cursor_planes_with_capabilities(cursor_width, cursor_height);
+        if hotspot_properties {
+            backend
+                .platform
+                .for_tests_initialize_cursor_planes_with_hotspot_properties(
+                    cursor_width,
+                    cursor_height,
+                );
+        } else {
+            backend
+                .platform
+                .for_tests_initialize_cursor_planes_with_capabilities(cursor_width, cursor_height);
+        }
         install_recording_scanout_pools(&mut backend, vk)?;
         let layouts = backend.platform.scene_output_layouts();
         backend.scene =
