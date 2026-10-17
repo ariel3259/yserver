@@ -990,6 +990,8 @@ pub(in crate::kms::render::backend::tests) fn run_task6_present_and_xtest_motion
     const WINDOW: ResourceId = ResourceId(0x0100_7d80);
     const PIXMAP: ResourceId = ResourceId(0x0100_7d81);
     const PIXMAP_ALTERNATE: ResourceId = ResourceId(0x0100_7d82);
+    const GC: ResourceId = ResourceId(0x0100_7d83);
+    const STRUCTURE_WINDOW: ResourceId = ResourceId(0x0100_7d84);
 
     type SharedFlips =
         Arc<Mutex<VecDeque<crate::kms::render::platform::flip_events::KernelPageFlip>>>;
@@ -997,6 +999,7 @@ pub(in crate::kms::render::backend::tests) fn run_task6_present_and_xtest_motion
     #[derive(Default)]
     struct CommitProgress {
         kinds: Vec<AtomicCommitKind>,
+        flip_obligations: usize,
         drained: usize,
     }
 
@@ -1065,6 +1068,7 @@ pub(in crate::kms::render::backend::tests) fn run_task6_present_and_xtest_motion
     struct RunCoreFlipSource {
         flips: SharedFlips,
         commits: Arc<SharedCommitRecorder>,
+        manual_events: Rc<crate::kms::render::platform::flip_events::RecordingPageFlipEventSource>,
     }
 
     impl crate::kms::render::platform::flip_events::PageFlipEventSource for RunCoreFlipSource {
@@ -1096,13 +1100,15 @@ pub(in crate::kms::render::backend::tests) fn run_task6_present_and_xtest_motion
                     break;
                 }
             }
-            let flips: Vec<_> = self.flips.lock().expect("flip queue").drain(..).collect();
+            let mut flips: Vec<_> = self.flips.lock().expect("flip queue").drain(..).collect();
+            let (manual_flips, sequences) = self.manual_events.drain_events(device)?;
+            flips.extend(manual_flips);
             if !flips.is_empty() {
                 let mut progress = self.commits.progress.lock().expect("commit progress");
                 progress.drained += flips.len();
                 self.commits.changed.notify_all();
             }
-            Ok((flips, Vec::new()))
+            Ok((flips, sequences))
         }
 
         fn drain_ready_events(
@@ -1114,10 +1120,11 @@ pub(in crate::kms::render::backend::tests) fn run_task6_present_and_xtest_motion
                 Vec<crate::kms::render::platform::flip_events::KernelCrtcSequence>,
             )>,
         > {
-            if self.flips.lock().expect("flip queue").is_empty() {
-                return Ok(None);
+            let queued = !self.flips.lock().expect("flip queue").is_empty();
+            if queued {
+                return self.drain_events(device).map(Some);
             }
-            self.drain_events(device).map(Some)
+            self.manual_events.drain_ready_events(device)
         }
     }
 
@@ -1130,10 +1137,11 @@ pub(in crate::kms::render::backend::tests) fn run_task6_present_and_xtest_motion
             _flags: ::drm::control::AtomicCommitFlags,
             kind: AtomicCommitKind,
             _request: crate::drm::atomic::AtomicCommitRequest,
-            _events: &[crate::drm::atomic::AtomicCommitEvent],
+            events: &[crate::drm::atomic::AtomicCommitEvent],
         ) -> io::Result<()> {
             let mut progress = self.0.progress.lock().expect("commit progress");
             progress.kinds.push(kind);
+            progress.flip_obligations += events.len();
             self.0.changed.notify_all();
             Ok(())
         }
@@ -1143,7 +1151,44 @@ pub(in crate::kms::render::backend::tests) fn run_task6_present_and_xtest_motion
     let Some(mut backend) = live_scene_backend_with_clock(scheduler_clock) else {
         return false;
     };
+    backend.platform.for_tests_accept_output_power_commits();
     let recorder = recording_sink(&mut backend, 0);
+    let recorders = Rc::clone(
+        backend
+            .platform
+            .services
+            .test_recorders
+            .as_ref()
+            .expect("recording KMS fixture"),
+    );
+    let (device_stream, event_peer) =
+        std::os::unix::net::UnixStream::pair().expect("DRM test socket");
+    device_stream
+        .set_nonblocking(true)
+        .expect("nonblocking test DRM endpoint");
+    let device = crate::drm::Device::from_inherited_kms_fd(
+        OwnedFd::from(device_stream),
+        "run_core tearing test DRM socket",
+    );
+    recorders.page_flip_events.register_device(&device);
+    backend.platform.devices[0].device = Rc::new(device);
+
+    let flips: SharedFlips = Arc::new(Mutex::new(VecDeque::new()));
+    let commits = Arc::new(SharedCommitRecorder {
+        progress: Mutex::new(CommitProgress::default()),
+        changed: Condvar::new(),
+    });
+    let allow_fake_flip_delivery =
+        Arc::new(AtomicBool::new(!delay_fake_flip_delivery_until_input_end));
+    backend.platform.devices[0].page_flip_event_source = Rc::new(RunCoreFlipSource {
+        flips: Arc::clone(&flips),
+        commits: Arc::clone(&commits),
+        manual_events: Rc::clone(&recorders.page_flip_events),
+    });
+    backend.platform.devices[0].atomic_commit_sink = Rc::new(AtomicCommitSink::new(Rc::new(
+        RunCoreCommitExecutor(Arc::clone(&commits)),
+    )));
+
     let (outputs, modes) = Backend::randr_outputs_and_modes(&mut backend);
     let (screen_width, screen_height) = Backend::fb_dimensions(&backend);
     let mut state = ServerState::with_randr_outputs_and_modes(
@@ -1222,6 +1267,12 @@ pub(in crate::kms::render::backend::tests) fn run_task6_present_and_xtest_motion
         crate::kms::render::scene::CursorPlaneMode::Sw
     );
     assert!(!backend.scene.has_pending_page_flips());
+    let on_entry_commit_index = commits
+        .progress
+        .lock()
+        .expect("On-entry commit progress")
+        .kinds
+        .len();
 
     let refresh_interval = backend
         .pstate
@@ -1234,40 +1285,12 @@ pub(in crate::kms::render::backend::tests) fn run_task6_present_and_xtest_motion
             .unwrap()
             .saturating_add(refresh_interval_ns / 2)
     });
-    let (device_stream, event_peer) =
-        std::os::unix::net::UnixStream::pair().expect("DRM test socket");
-    device_stream
-        .set_nonblocking(true)
-        .expect("nonblocking test DRM endpoint");
-    let device = crate::drm::Device::from_inherited_kms_fd(
-        OwnedFd::from(device_stream),
-        "run_core tearing test DRM socket",
-    );
-    backend.platform.devices[0].device = Rc::new(device);
-
-    let flips: SharedFlips = Arc::new(Mutex::new(VecDeque::new()));
-    let commits = Arc::new(SharedCommitRecorder {
-        progress: Mutex::new(CommitProgress::default()),
-        changed: Condvar::new(),
-    });
-    let allow_fake_flip_delivery =
-        Arc::new(AtomicBool::new(!delay_fake_flip_delivery_until_input_end));
-    backend.platform.devices[0].page_flip_event_source = Rc::new(RunCoreFlipSource {
-        flips: Arc::clone(&flips),
-        commits: Arc::clone(&commits),
-    });
-    backend.platform.devices[0].test_page_flip_event_source = None;
-
-    backend.platform.devices[0].atomic_commit_sink = Rc::new(AtomicCommitSink::new(Rc::new(
-        RunCoreCommitExecutor(Arc::clone(&commits)),
-    )));
     backend.platform.devices[0]
         .atomic_commit_sink
         .set_tearing_on(true);
     recorder.clear_records();
 
     scheduler_time_ns.store(initial_scheduler_time_ns, Ordering::SeqCst);
-    Backend::warp_pointer_root(&mut backend, &mut state, 172, 137);
     Backend::on_host_input(
         &mut backend,
         &mut state,
@@ -1282,26 +1305,32 @@ pub(in crate::kms::render::backend::tests) fn run_task6_present_and_xtest_motion
             motion_delta: None,
         },
     );
-    Backend::maybe_composite(&mut backend)
-        .expect("hold root and relative host motion to cursor cap");
+    Backend::maybe_composite(&mut backend).expect("hold relative host motion to cursor cap");
     let expected_pre_core = if last_cursor_compose.is_none() {
         vec![AtomicCommitKind::Async]
     } else {
         Vec::new()
     };
+    let pre_core_kinds = commits
+        .progress
+        .lock()
+        .expect("pre-core commit progress")
+        .kinds[on_entry_commit_index..]
+        .to_vec();
     assert_eq!(
-        commits
-            .progress
-            .lock()
-            .expect("pre-core commit progress")
-            .kinds,
-        expected_pre_core,
+        pre_core_kinds, expected_pre_core,
         "the initial unpaced compose is allowed only when On has no previous compose",
     );
     assert_eq!(
         backend.scene.has_pending_page_flips(),
         last_cursor_compose.is_none()
     );
+    let run_core_start_commit_index = commits
+        .progress
+        .lock()
+        .expect("On-entry commit progress")
+        .kinds
+        .len();
     if let Some(last_cursor_compose) = last_cursor_compose {
         assert!(backend.scene.cursor_only_wake_pending());
         assert_eq!(
@@ -1312,9 +1341,13 @@ pub(in crate::kms::render::backend::tests) fn run_task6_present_and_xtest_motion
 
     let mpv_peer = install_test_core_client(&mut state);
     let _xtest_peer = install_test_core_client_as(&mut state, ClientId(2));
+    let mut warp_peer = install_test_core_client_as(&mut state, ClientId(4));
+    warp_peer
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("bound WarpPointer query reply waits");
     let mut endstate_peer = install_test_core_client_as(&mut state, ClientId(3));
     endstate_peer
-        .set_read_timeout(Some(Duration::from_secs(10)))
+        .set_read_timeout(Some(Duration::from_secs(30)))
         .expect("bound core round-trip waits");
     state
         .clients
@@ -1392,6 +1425,18 @@ pub(in crate::kms::render::backend::tests) fn run_task6_present_and_xtest_motion
     let producer_allow_fake_flip_delivery = Arc::clone(&allow_fake_flip_delivery);
     let producer_reader_stop = Arc::clone(&reader_stop);
     let producer_client_sequence = Arc::clone(&client_sequence);
+    let root_window = yserver_core::resources::ROOT_WINDOW.0;
+    let window_origin = state.resources.window_absolute_position(WINDOW);
+    let expected_window_warp = (
+        window_origin
+            .0
+            .saturating_add(17)
+            .clamp(0, i32::from(screen_width.saturating_sub(1))),
+        window_origin
+            .1
+            .saturating_add(19)
+            .clamp(0, i32::from(screen_height.saturating_sub(1))),
+    );
     let motion_duration = refresh_interval * 7;
     let motion_duration_ns = u64::try_from(motion_duration.as_nanos()).unwrap();
     let motion_end_ns = initial_scheduler_time_ns.saturating_add(motion_duration_ns);
@@ -1407,9 +1452,11 @@ pub(in crate::kms::render::backend::tests) fn run_task6_present_and_xtest_motion
         };
         let client_id = ClientId(1);
         let xtest_client_id = ClientId(2);
+        let warp_client_id = ClientId(4);
         let present_interval_ns = 1_000_000_000_u64 / 130;
         let mut next_present_ns = initial_scheduler_time_ns;
         let mut xtest_sequence = 1_u16;
+        let mut warp_sequence = 1_u16;
         let mut barrier_sequence = 1_u16;
         let mut sent_motion = 0_usize;
         let mut sent_presents = 0_usize;
@@ -1437,7 +1484,7 @@ pub(in crate::kms::render::backend::tests) fn run_task6_present_and_xtest_motion
         };
         let wait_for_motion = |expected: usize| {
             let (count, changed) = &*producer_motion_progress;
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + Duration::from_secs(30);
             let mut count = count.lock().expect("MotionNotify progress");
             while *count < expected {
                 let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1450,6 +1497,219 @@ pub(in crate::kms::render::backend::tests) fn run_task6_present_and_xtest_motion
             }
         };
         let mut now_ns = initial_scheduler_time_ns;
+
+        // Exercise both real XWarpPointer request forms while the cursor
+        // compose cap is closed. The second destination is the nested test
+        // window, so run_core must resolve its window origin before calling
+        // Backend::warp_pointer_root.
+        for (destination, x, y, expected) in [
+            (root_window, 125_i16, 115_i16, (125_i16, 115_i16)),
+            (
+                WINDOW.0,
+                17,
+                19,
+                (
+                    i16::try_from(expected_window_warp.0).expect("window warp x fits"),
+                    i16::try_from(expected_window_warp.1).expect("window warp y fits"),
+                ),
+            ),
+        ] {
+            let mut body = vec![0_u8; 20];
+            body[4..8].copy_from_slice(&destination.to_le_bytes());
+            body[16..18].copy_from_slice(&x.to_le_bytes());
+            body[18..20].copy_from_slice(&y.to_le_bytes());
+            request_sender
+                .send(Message::Request {
+                    id: warp_client_id,
+                    sequence: SequenceNumber(warp_sequence),
+                    accepted_at: None,
+                    header: RequestHeader {
+                        opcode: 41,
+                        data: 0,
+                        length_units: 6,
+                    },
+                    body,
+                    attached_fd: None,
+                })
+                .expect("queue root/window WarpPointer request");
+            warp_sequence = warp_sequence.wrapping_add(1);
+            let mut query_body = vec![0_u8; 4];
+            query_body.copy_from_slice(&root_window.to_le_bytes());
+            request_sender
+                .send(Message::Request {
+                    id: warp_client_id,
+                    sequence: SequenceNumber(warp_sequence),
+                    accepted_at: None,
+                    header: RequestHeader {
+                        opcode: 38,
+                        data: 0,
+                        length_units: 2,
+                    },
+                    body: query_body,
+                    attached_fd: None,
+                })
+                .expect("queue QueryPointer after WarpPointer");
+            warp_sequence = warp_sequence.wrapping_add(1);
+            let mut query_reply = [0_u8; 32];
+            warp_peer
+                .read_exact(&mut query_reply)
+                .expect("read QueryPointer after WarpPointer");
+            assert_eq!(query_reply[0], 1, "QueryPointer returns its reply");
+            assert_eq!(
+                (
+                    i16::from_le_bytes([query_reply[16], query_reply[17]]),
+                    i16::from_le_bytes([query_reply[18], query_reply[19]]),
+                ),
+                expected,
+                "the {destination:#x} WarpPointer request moved the root pointer",
+            );
+        }
+        let before_capped_warps = producer_commits
+            .progress
+            .lock()
+            .expect("cursor cap progress")
+            .kinds
+            .len();
+        assert_eq!(
+            before_capped_warps, run_core_start_commit_index,
+            "root and window WarpPointer requests stay behind the cursor deadline",
+        );
+
+        // A CopyArea request and a structural ConfigureWindow request are
+        // client causes. Both must remain urgent while cursor-only motion is
+        // capped, and both travel through run_core's real X11 dispatcher.
+        let mut gc_body = vec![0_u8; 12];
+        gc_body[0..4].copy_from_slice(&GC.0.to_le_bytes());
+        gc_body[4..8].copy_from_slice(&WINDOW.0.to_le_bytes());
+        let mut client_sequence = producer_client_sequence
+            .lock()
+            .expect("client request sequence");
+        request_sender
+            .send(Message::Request {
+                id: client_id,
+                sequence: SequenceNumber(*client_sequence),
+                accepted_at: None,
+                header: RequestHeader {
+                    opcode: 55,
+                    data: 0,
+                    length_units: 4,
+                },
+                body: gc_body,
+                attached_fd: None,
+            })
+            .expect("queue CreateGC for CopyArea");
+        *client_sequence = client_sequence.wrapping_add(1);
+        let mut copy_body = vec![0_u8; 24];
+        copy_body[0..4].copy_from_slice(&PIXMAP.0.to_le_bytes());
+        copy_body[4..8].copy_from_slice(&WINDOW.0.to_le_bytes());
+        copy_body[8..12].copy_from_slice(&GC.0.to_le_bytes());
+        copy_body[16..18].copy_from_slice(&64_u16.to_le_bytes());
+        copy_body[18..20].copy_from_slice(&64_u16.to_le_bytes());
+        copy_body[20..22].copy_from_slice(&8_i16.to_le_bytes());
+        copy_body[22..24].copy_from_slice(&8_i16.to_le_bytes());
+        request_sender
+            .send(Message::Request {
+                id: client_id,
+                sequence: SequenceNumber(*client_sequence),
+                accepted_at: None,
+                header: RequestHeader {
+                    opcode: 62,
+                    data: 0,
+                    length_units: 7,
+                },
+                body: copy_body,
+                attached_fd: None,
+            })
+            .expect("queue client CopyArea while cursor cap is closed");
+        *client_sequence = client_sequence.wrapping_add(1);
+        drop(client_sequence);
+        core_barrier(&mut endstate_peer);
+
+        let before_structure = producer_commits
+            .progress
+            .lock()
+            .expect("cursor cap progress")
+            .kinds
+            .len();
+
+        let mut create_body = vec![0_u8; 28];
+        create_body[0..4].copy_from_slice(&STRUCTURE_WINDOW.0.to_le_bytes());
+        create_body[4..8].copy_from_slice(&WINDOW.0.to_le_bytes());
+        create_body[8..10].copy_from_slice(&10_i16.to_le_bytes());
+        create_body[10..12].copy_from_slice(&10_i16.to_le_bytes());
+        create_body[12..14].copy_from_slice(&100_u16.to_le_bytes());
+        create_body[14..16].copy_from_slice(&100_u16.to_le_bytes());
+        let mut client_sequence = producer_client_sequence
+            .lock()
+            .expect("client request sequence");
+        request_sender
+            .send(Message::Request {
+                id: client_id,
+                sequence: SequenceNumber(*client_sequence),
+                accepted_at: None,
+                header: RequestHeader {
+                    opcode: 1,
+                    data: 24,
+                    length_units: 8,
+                },
+                body: create_body,
+                attached_fd: None,
+            })
+            .expect("queue CreateWindow for structural damage");
+        *client_sequence = client_sequence.wrapping_add(1);
+        let mut map_body = vec![0_u8; 4];
+        map_body.copy_from_slice(&STRUCTURE_WINDOW.0.to_le_bytes());
+        request_sender
+            .send(Message::Request {
+                id: client_id,
+                sequence: SequenceNumber(*client_sequence),
+                accepted_at: None,
+                header: RequestHeader {
+                    opcode: 8,
+                    data: 0,
+                    length_units: 2,
+                },
+                body: map_body,
+                attached_fd: None,
+            })
+            .expect("queue MapWindow for structural damage");
+        *client_sequence = client_sequence.wrapping_add(1);
+        let mut configure_body = vec![0_u8; 16];
+        configure_body[0..4].copy_from_slice(&STRUCTURE_WINDOW.0.to_le_bytes());
+        configure_body[4..6].copy_from_slice(&3_u16.to_le_bytes());
+        configure_body[8..12].copy_from_slice(&23_i32.to_le_bytes());
+        configure_body[12..16].copy_from_slice(&29_i32.to_le_bytes());
+        request_sender
+            .send(Message::Request {
+                id: client_id,
+                sequence: SequenceNumber(*client_sequence),
+                accepted_at: None,
+                header: RequestHeader {
+                    opcode: 12,
+                    data: 0,
+                    length_units: 5,
+                },
+                body: configure_body,
+                attached_fd: None,
+            })
+            .expect("queue structural ConfigureWindow under cursor cap");
+        *client_sequence = client_sequence.wrapping_add(1);
+        drop(client_sequence);
+        core_barrier(&mut endstate_peer);
+        if !delay_fake_flip_delivery_until_input_end {
+            let structure_progress = wait_for_commit_progress(
+                &producer_commits,
+                Instant::now() + Duration::from_secs(30),
+                "structural CreateWindow/MapWindow/ConfigureWindow bypass",
+                |progress| progress.kinds.len() > before_structure,
+            );
+            drop(structure_progress);
+        }
+
+        if delay_fake_flip_delivery_until_input_end {
+            producer_allow_fake_flip_delivery.store(false, Ordering::SeqCst);
+        }
+
         while now_ns < motion_end_ns {
             producer_scheduler_time_ns.store(now_ns, Ordering::SeqCst);
             let step = i16::try_from(sent_motion).expect("test pointer step fits");
@@ -1525,13 +1785,14 @@ pub(in crate::kms::render::backend::tests) fn run_task6_present_and_xtest_motion
             producer_commits.changed.notify_all();
         }
 
+        wait_for_motion(sent_motion + 2);
         let observed_motion = expected_motion_notifications.load(Ordering::SeqCst);
 
         // Drain work from the input stream and observe two unchanged commit
         // snapshots before advancing the cursor deadline. These round-trips
         // settle earlier iteration tails before the post-deadline quiescence
         // barrier.
-        let settle_deadline = Instant::now() + Duration::from_secs(10);
+        let settle_deadline = Instant::now() + Duration::from_secs(30);
         let mut settled_commit_count = None;
         loop {
             assert!(
@@ -1546,7 +1807,7 @@ pub(in crate::kms::render::backend::tests) fn run_task6_present_and_xtest_motion
                 &producer_commits,
                 settle_deadline,
                 "pre-deadline fake flip retirements",
-                |progress| progress.drained >= progress.kinds.len(),
+                |progress| progress.drained >= progress.flip_obligations,
             );
             let accepted = progress.kinds.len();
             drop(progress);
@@ -1565,7 +1826,7 @@ pub(in crate::kms::render::backend::tests) fn run_task6_present_and_xtest_motion
             motion_end_ns.saturating_add(refresh_interval_ns * 2),
             Ordering::SeqCst,
         );
-        let quiescence_deadline = Instant::now() + Duration::from_secs(10);
+        let quiescence_deadline = Instant::now() + Duration::from_secs(30);
         let mut stable_commit_count = None;
         loop {
             core_barrier(&mut endstate_peer);
@@ -1574,16 +1835,21 @@ pub(in crate::kms::render::backend::tests) fn run_task6_present_and_xtest_motion
                 &producer_commits,
                 quiescence_deadline,
                 "post-deadline quiescence (all accepted fake flips drained)",
-                |progress| progress.drained == progress.kinds.len(),
+                |progress| progress.drained == progress.flip_obligations,
             );
             let accepted = progress.kinds.len();
+            let event_obligations = progress.flip_obligations;
             let drained = progress.drained;
             drop(progress);
             assert_eq!(
-                accepted, drained,
-                "every recorded commit's fake flip event is retired before Shutdown"
+                event_obligations, drained,
+                "every accepted page-flip event obligation is retired before Shutdown"
             );
             if stable_commit_count == Some(accepted) {
+                assert!(
+                    accepted > before_structure,
+                    "structural CreateWindow/MapWindow/ConfigureWindow damage eventually commits after held fake flips retire"
+                );
                 break;
             }
             stable_commit_count = Some(accepted);
@@ -1608,10 +1874,14 @@ pub(in crate::kms::render::backend::tests) fn run_task6_present_and_xtest_motion
     let event_thread = thread::spawn(move || {
         use std::io::Write;
         let mut peer = event_peer;
-        let mut sent_events = 0_usize;
+        let mut sent_events = event_commits
+            .progress
+            .lock()
+            .expect("initial commit progress")
+            .drained;
         loop {
             let mut progress = event_commits.progress.lock().expect("commit progress");
-            while (progress.kinds.len() == sent_events
+            while (progress.flip_obligations == sent_events
                 || !event_allow_fake_flip_delivery.load(Ordering::SeqCst))
                 && !event_stop_thread.load(Ordering::SeqCst)
             {
@@ -1621,11 +1891,12 @@ pub(in crate::kms::render::backend::tests) fn run_task6_present_and_xtest_motion
                     .expect("commit notification wait");
                 progress = next;
             }
-            if progress.kinds.len() == sent_events && event_stop_thread.load(Ordering::SeqCst) {
+            if progress.flip_obligations == sent_events && event_stop_thread.load(Ordering::SeqCst)
+            {
                 return;
             }
-            let newly_accepted = progress.kinds.len() - sent_events;
-            sent_events = progress.kinds.len();
+            let newly_accepted = progress.flip_obligations - sent_events;
+            sent_events = progress.flip_obligations;
             drop(progress);
             for index in 0..newly_accepted {
                 let frame = u32::try_from(sent_events - newly_accepted + index + 1)
@@ -1662,17 +1933,12 @@ pub(in crate::kms::render::backend::tests) fn run_task6_present_and_xtest_motion
     mpv_reader
         .join()
         .expect("MotionNotify client response thread");
-    {
-        let _progress = commits.progress.lock().expect("commit progress");
-        event_stop.store(true, Ordering::SeqCst);
-        commits.changed.notify_all();
-    }
-    event_thread.join().expect("fake DRM event producer");
     let (sent_motion, sent_presents, observed_motion, final_pointer_position, motion_elapsed) =
         producer_result.expect("mixed Present/motion producer");
 
     let progress = commits.progress.lock().expect("commit progress");
-    let accepted_kinds = progress.kinds.clone();
+    let accepted_kinds = progress.kinds[run_core_start_commit_index..].to_vec();
+    let total_flip_obligations = progress.flip_obligations;
     let drained = progress.drained;
     drop(progress);
     let build_calls = backend
@@ -1700,8 +1966,9 @@ pub(in crate::kms::render::backend::tests) fn run_task6_present_and_xtest_motion
         "the client must submit repeated PresentPixmap frames"
     );
     assert_eq!(
-        observed_motion, sent_motion,
-        "every XTEST motion reaches the fullscreen client"
+        observed_motion,
+        sent_motion + 2,
+        "every XTEST motion and both root/window WarpPointer requests reach the fullscreen client's PointerMotionMask"
     );
     assert_eq!(reactions.load(Ordering::SeqCst), observed_motion);
     assert_eq!(
@@ -1714,15 +1981,15 @@ pub(in crate::kms::render::backend::tests) fn run_task6_present_and_xtest_motion
         "client frames and pointer motion must compose"
     );
     assert!(
-        accepted_kinds.len() as u128 <= sent_presents as u128 + refresh_windows,
-        "{} async composed flips exceed {} client frames + {} virtual refresh intervals",
+        accepted_kinds.len() as u128 <= sent_presents as u128 + refresh_windows + 2,
+        "{} async composed flips exceed {} Present frames + {} virtual refresh intervals + Copy/structure",
         accepted_kinds.len(),
         sent_presents,
         refresh_windows
     );
     assert!(
-        build_calls as u128 <= sent_presents as u128 + refresh_windows,
-        "{build_calls} build_scene calls exceed {sent_presents} client frames + {refresh_windows} refresh intervals"
+        build_calls as u128 <= sent_presents as u128 + refresh_windows + 2,
+        "{build_calls} build_scene calls exceed {sent_presents} Present frames + {refresh_windows} refresh intervals + Copy/structure"
     );
     assert!(backend.pstate.tearing.is_on());
     // With scene and cursor wakes clear and no flip pending below, the last
@@ -1753,11 +2020,20 @@ pub(in crate::kms::render::backend::tests) fn run_task6_present_and_xtest_motion
         drained,
         flips.lock().expect("flip queue").len()
     );
-    assert_eq!(drained, accepted_kinds.len());
+    assert_eq!(drained, total_flip_obligations);
     assert!(
         flips.lock().expect("flip queue").is_empty(),
         "all accepted fake flip events are consumed before shutdown"
     );
+    assert_eq!(
+        state
+            .resources
+            .window(STRUCTURE_WINDOW)
+            .map(|window| (window.x, window.y)),
+        Some((23, 29)),
+        "ConfigureWindow ran through the real core request path",
+    );
+    assert!(state.resources.gc(GC).is_some(), "CreateGC was dispatched");
     assert!(
         (0..backend.platform.outputs.len()).all(|output_idx| backend
             .platform
@@ -1767,6 +2043,45 @@ pub(in crate::kms::render::backend::tests) fn run_task6_present_and_xtest_motion
     );
     assert!(backend.kms_outputs_active);
     assert!(backend.scanout_allowed());
+
+    // End through the public Backend lifecycle path after all fake events
+    // have drained. The event source and atomic sink were selected before On
+    // entry, so no dependency is swapped while cursor ownership is active.
+    Backend::set_cursor_hidden(&mut backend, true);
+    Backend::maybe_composite(&mut backend).expect("settle final detached cursor intent");
+    backend
+        .disable_output()
+        .expect("disable output through Backend");
+    assert!(
+        !backend.pstate.tearing.is_on(),
+        "Backend disable exits the tearing interval"
+    );
+    assert!(!backend.scene.has_pending_page_flips());
+    assert!(!backend.platform.any_cursor_commit_in_flight());
+    assert!(backend.pstate.scanout_m2.current.is_none());
+    assert!(backend.pstate.scanout_m2.pending.is_none());
+    assert!(backend.pstate.scanout_m2.queued_successor.is_none());
+    assert!(flips.lock().expect("flip queue").is_empty());
+    for device in &backend.platform.devices {
+        for state in device.cursor.crtc_states.values() {
+            assert!(
+                state.intent.is_none(),
+                "cursor intent remains after disable"
+            );
+            assert!(state.in_flight.is_none(), "cursor lease remains in flight");
+        }
+    }
+    {
+        let progress = commits.progress.lock().expect("final commit progress");
+        assert_eq!(progress.drained, progress.flip_obligations);
+        event_stop.store(true, Ordering::SeqCst);
+        commits.changed.notify_all();
+    }
+    event_thread.join().expect("fake DRM event producer");
+    assert!(flips.lock().expect("final flip queue").is_empty());
+    let ledger = Rc::clone(&recorders.cursor_buffer_ledger);
+    drop(backend);
+    assert_eq!(ledger.end_state(), (0, 0, 0));
     true
 }
 
@@ -1787,6 +2102,7 @@ pub(in crate::kms::render::backend::tests) fn run_task5_handoff_unflip_starts_cu
     let Some(mut backend) = live_scene_backend_with_clock(scheduler_clock) else {
         return false;
     };
+    backend.platform.for_tests_accept_output_power_commits();
     let recorder = recording_sink(&mut backend, 0);
     qualify_test_direct_async(&mut backend, &recorder, WINDOW, 15_050);
     let mut state = ServerState::new();
@@ -1882,6 +2198,32 @@ pub(in crate::kms::render::backend::tests) fn run_task5_handoff_unflip_starts_cu
         &recorder,
         &[AtomicCommitKind::Scene, AtomicCommitKind::Async],
     );
+
+    Backend::set_cursor_hidden(&mut backend, true);
+    Backend::maybe_composite(&mut backend).expect("hide cursor before handoff teardown");
+    if backend.scene.has_pending_page_flips() {
+        retire_composed_frame(&mut backend, &mut state, 77);
+    }
+    backend
+        .disable_output()
+        .expect("disable output after grouped handoff cap test");
+    assert!(!backend.scene.has_pending_page_flips());
+    assert!(!backend.platform.any_cursor_commit_in_flight());
+    assert!(backend.pstate.scanout_m2.current.is_none());
+    assert!(backend.pstate.scanout_m2.pending.is_none());
+    assert!(backend.pstate.scanout_m2.queued_successor.is_none());
+    assert_direct_queue_drained(&backend);
+    let recorders = Rc::clone(
+        backend
+            .platform
+            .services
+            .test_recorders
+            .as_ref()
+            .expect("recording KMS fixture"),
+    );
+    let ledger = Rc::clone(&recorders.cursor_buffer_ledger);
+    drop(backend);
+    assert_eq!(ledger.end_state(), (0, 0, 0));
     true
 }
 

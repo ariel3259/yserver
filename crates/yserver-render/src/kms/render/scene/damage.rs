@@ -44,6 +44,31 @@ impl SceneCompositor {
             .is_some_and(|output| output.last_frame_cursor_mode == super::OutputCursorMode::Hw)
     }
 
+    /// Whether a cursor-only HW update can attach or change this output's
+    /// plane without competing with a scene-owned HW/SW transition. Hidden
+    /// outputs with an accepted cursorless-primary receipt can accept a later
+    /// show while that primary remains unchanged. The initial Hidden enum
+    /// value alone cannot authorize work for a skipped first frame.
+    pub fn output_accepts_hardware_cursor_only_update(&self, output_idx: usize) -> bool {
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.outputs.get(output_idx))
+            .is_some_and(|output| {
+                let accepted_cursorless_hidden_primary =
+                    output.cursor_commit_receipt.is_some_and(|receipt| {
+                        receipt.mode == super::CursorAcceptedMode::Hidden
+                            && receipt.primary_cursor == super::CursorPrimaryContent::Cursorless
+                    });
+                (output.last_frame_cursor_mode == super::OutputCursorMode::Hw
+                    || (output.last_frame_cursor_mode == super::OutputCursorMode::Hidden
+                        && accepted_cursorless_hidden_primary))
+                    && !output
+                        .pending_acks
+                        .iter()
+                        .any(|ack| ack.cursor_transition.is_some())
+            })
+    }
+
     /// Whether a submitted frame still owns this output's cursor mode change.
     /// HW-only observations may be retained during a stable primary flip, but
     /// they must not compete with a frame that changes HW/SW ownership.

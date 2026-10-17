@@ -300,23 +300,31 @@ impl KmsBackend {
         let outcome = self
             .platform
             .submit_atomic_cursor_intent_for_output(output_idx)?;
+        self.note_cursor_only_acceptance(output_idx, was_in_flight);
+        Ok(outcome)
+    }
+
+    fn drain_pending_cursor_intent_for_output(
+        &mut self,
+        output_idx: usize,
+    ) -> io::Result<crate::kms::render::platform::CursorMoveOutcome> {
+        let was_in_flight = self.platform.cursor_commit_in_flight_for_output(output_idx);
+        let outcome = self
+            .platform
+            .cursor_plane_drain_pending_move_for_output(output_idx)?;
+        self.note_cursor_only_acceptance(output_idx, was_in_flight);
+        Ok(outcome)
+    }
+
+    fn note_cursor_only_acceptance(&mut self, output_idx: usize, was_in_flight: bool) {
         if !was_in_flight && self.platform.cursor_commit_in_flight_for_output(output_idx) {
-            let mode = if self.platform.cursor_plane_visible_for_output(output_idx) {
-                crate::kms::render::scene::CursorAcceptedMode::Hardware
-            } else {
-                crate::kms::render::scene::CursorAcceptedMode::Hidden
-            };
             self.scene.note_cursor_commit_accepted(
                 output_idx,
-                crate::kms::render::scene::CursorCommitReceipt {
-                    frame: None,
-                    mode,
-                    primary_cursor: crate::kms::render::scene::CursorPrimaryContent::Cursorless,
-                    needs_recompose: false,
-                },
+                crate::kms::render::platform::accepted_cursor_only_receipt(
+                    self.platform.cursor_plane_visible_for_output(output_idx),
+                ),
             );
         }
-        Ok(outcome)
     }
 
     /// Submit cursor intent already prepared by the shared queue while a
@@ -2203,10 +2211,7 @@ impl KmsBackend {
                 || self.pstate.scanout_m2.unflip_requested
                 || !self.pstate.scanout_m2.unflip_awaiting_outputs.is_empty();
             if !grouped_direct_work_waiting {
-                match self
-                    .platform
-                    .cursor_plane_drain_pending_move_for_output(output_idx)
-                {
+                match self.drain_pending_cursor_intent_for_output(output_idx) {
                     Ok(outcome) => {
                         self.handle_cursor_move_outcome(outcome);
                     }

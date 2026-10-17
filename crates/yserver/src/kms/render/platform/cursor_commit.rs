@@ -1,5 +1,9 @@
 //! Full-state cursor atomic request construction and submission.
 
+use yserver_render::kms::render::scene::{
+    CursorAcceptedMode, CursorCommitReceipt, CursorPrimaryContent,
+};
+
 use crate::{
     drm::atomic::{AtomicCommitRequest, AtomicPropertyUpdate},
     kms::{
@@ -9,6 +13,21 @@ use crate::{
         },
     },
 };
+
+/// Receipt for an accepted cursor-only delta. The primary remains cursorless;
+/// scene mode follows the hardware plane state only after the ioctl succeeds.
+pub(crate) fn accepted_cursor_only_receipt(visible: bool) -> CursorCommitReceipt {
+    CursorCommitReceipt {
+        frame: None,
+        mode: if visible {
+            CursorAcceptedMode::Hardware
+        } else {
+            CursorAcceptedMode::Hidden
+        },
+        primary_cursor: CursorPrimaryContent::Cursorless,
+        needs_recompose: false,
+    }
+}
 
 pub(crate) fn prepare_cursor_commit(
     properties: CursorPlaneProperties,

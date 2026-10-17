@@ -3645,10 +3645,6 @@ fn atomic_cursor_only_motion_preserves_pending_detach_intent() {
     assert!(!fixture.backend.platform.cursor_plane_visible_for_output(0));
     fixture.retire_output(0, 4);
     assert!(!fixture.backend.scene.has_pending_page_flip(0));
-    assert!(!fixture.backend.platform.cursor_plane_visible_for_output(0));
-    Backend::maybe_composite(&mut fixture.backend)
-        .expect("submit frame-owned rebind after Hidden became the accepted mode");
-    assert!(fixture.backend.scene.has_pending_page_flip(0));
     assert!(fixture.backend.platform.cursor_plane_visible_for_output(0));
     assert!(
         fixture
@@ -3656,7 +3652,13 @@ fn atomic_cursor_only_motion_preserves_pending_detach_intent() {
             .platform
             .cursor_commit_in_flight_for_output(0)
     );
+    assert_eq!(
+        fixture.recorders.atomic.records().last().unwrap().kind,
+        crate::drm::atomic::AtomicCommitKind::CursorOnly,
+        "the detach retirement retries the retained visible intent without a primary frame",
+    );
     fixture.retire_output(0, 5);
+    assert!(!fixture.backend.scene.has_pending_page_flip(0));
     assert!(
         !fixture
             .backend
@@ -3708,11 +3710,11 @@ fn atomic_cursor_only_motion_preserves_pending_detach_intent() {
             crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
             crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
-            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            crate::drm::atomic::AtomicCommitKind::CursorOnly,
             crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
             crate::drm::atomic::AtomicCommitKind::Scene,
         ],
-        "the accepted gap detach is cursor-only; reentry and hide remain frame-owned",
+        "the accepted gap detach and post-retirement reentry are cursor-only; later scene damage owns hide",
     );
     assert!(
         fixture

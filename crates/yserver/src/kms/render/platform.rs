@@ -27,6 +27,7 @@
 mod connectors;
 mod cursor;
 pub(crate) mod cursor_commit;
+pub(crate) use cursor_commit::accepted_cursor_only_receipt;
 pub(crate) mod cursor_frames;
 mod cursor_lifecycle;
 pub(crate) mod cursor_state;

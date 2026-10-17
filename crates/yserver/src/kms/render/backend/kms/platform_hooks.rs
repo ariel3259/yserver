@@ -18,6 +18,35 @@ use crate::kms::render::{
     store::DrawableId,
 };
 
+fn route_cursor_intent(
+    b: &mut KmsBackend,
+    record: Option<&crate::kms::render::cursor::CursorRecord>,
+    visible: bool,
+    pos: (i32, i32),
+) -> (bool, Vec<bool>) {
+    b.platform.cursor_pointer_root = pos;
+    let direct_owns_primary = b.pstate.scanout_m2.active();
+    let hardware_cursor_outputs: Vec<_> = (0..b.platform.outputs.len())
+        .map(|output_idx| {
+            direct_owns_primary
+                || b.scene
+                    .output_accepts_hardware_cursor_only_update(output_idx)
+        })
+        .collect();
+    let handled = b.platform.queue_cursor_intent(
+        record,
+        visible,
+        pos,
+        b.pstate.tearing.is_on(),
+        direct_owns_primary,
+        &hardware_cursor_outputs,
+    );
+    if direct_owns_primary {
+        b.refresh_direct_cursor_bound_state();
+    }
+    (handled, hardware_cursor_outputs)
+}
+
 impl Platform for PlatformBackend {
     type BackendState = KmsBackendState;
 
@@ -176,26 +205,7 @@ impl Platform for PlatformBackend {
         visible: bool,
         pos: (i32, i32),
     ) -> bool {
-        let direct_owns_primary = b.pstate.scanout_m2.active();
-        let hardware_cursor_outputs: Vec<_> = (0..b.platform.outputs.len())
-            .map(|output_idx| {
-                direct_owns_primary
-                    || (b.scene.output_uses_hardware_cursor(output_idx)
-                        && !b.scene.output_cursor_transition_pending(output_idx))
-            })
-            .collect();
-        let handled = b.platform.queue_cursor_intent(
-            record,
-            visible,
-            pos,
-            b.pstate.tearing.is_on(),
-            direct_owns_primary,
-            &hardware_cursor_outputs,
-        );
-        if direct_owns_primary {
-            b.refresh_direct_cursor_bound_state();
-        }
-        handled
+        route_cursor_intent(b, record, visible, pos).0
     }
 
     fn observe_cursor_intent(
@@ -204,26 +214,7 @@ impl Platform for PlatformBackend {
         visible: bool,
         pos: (i32, i32),
     ) -> bool {
-        b.platform.cursor_pointer_root = pos;
-        let direct_owns_primary = b.pstate.scanout_m2.active();
-        let hardware_cursor_outputs: Vec<_> = (0..b.platform.outputs.len())
-            .map(|output_idx| {
-                direct_owns_primary
-                    || (b.scene.output_uses_hardware_cursor(output_idx)
-                        && !b.scene.output_cursor_transition_pending(output_idx))
-            })
-            .collect();
-        let handled = b.platform.queue_cursor_intent(
-            record,
-            visible,
-            pos,
-            b.pstate.tearing.is_on(),
-            direct_owns_primary,
-            &hardware_cursor_outputs,
-        );
-        if direct_owns_primary {
-            b.refresh_direct_cursor_bound_state();
-        }
+        let (handled, hardware_cursor_outputs) = route_cursor_intent(b, record, visible, pos);
         let visible = visible && !b.pstate.tearing.is_on() && !b.platform.tearing_on;
         let Some(record) = record.filter(|_| visible) else {
             return handled;

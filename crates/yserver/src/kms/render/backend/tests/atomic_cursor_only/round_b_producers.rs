@@ -344,7 +344,7 @@ fn atomic_cursor_only_stationary_hw_image_and_animation_make_progress() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: make hotspot-only changes wait for scene damage or retain the old FB/hotspot after the cursor-only receipt.
+// Mutations: make hotspot-only changes wait for scene damage, skip event-retry acceptance receipts, or require an HW-visible primary before show-after-hide.
 fn atomic_cursor_only_hw_visibility_and_hotspot_need_no_scene_frame() {
     let Some(mut fixture) = AtomicCursorFixture::new_with_hotspot_properties()
         .expect("construct cursor fixture with hotspot properties")
@@ -405,15 +405,129 @@ fn atomic_cursor_only_hw_visibility_and_hotspot_need_no_scene_frame() {
                 && update.value == 2
         }));
     }
-    finish_hw_cursor(
-        fixture,
-        5,
-        &[
-            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
-            crate::drm::atomic::AtomicCommitKind::CursorOnly,
-            crate::drm::atomic::AtomicCommitKind::CursorOnly,
-        ],
+
+    // The hide is queued behind a real primary flip. Its event retries the
+    // cursor intent, and that accepted retry must publish Hidden bookkeeping.
+    damage_cursor_root(&mut fixture);
+    Backend::maybe_composite(&mut fixture.backend).expect("submit primary before hide");
+    assert!(fixture.backend.scene.has_pending_page_flips());
+    assert_eq!(
+        fixture.recorders.atomic.records().last().unwrap().kind,
+        crate::drm::atomic::AtomicCommitKind::Scene,
     );
+    Backend::set_cursor_hidden(&mut fixture.backend, true);
+    Backend::maybe_composite(&mut fixture.backend).expect("hold hide behind primary flip");
+    assert_eq!(fixture.recorders.atomic.records().len(), 4);
+    assert!(fixture.backend.platform.cursor_plane_visible_for_output(0));
+    fixture.retire_output(0, 5);
+    assert_eq!(
+        fixture.backend.scene.cursor_mode(),
+        crate::kms::render::scene::CursorPlaneMode::Hidden,
+        "the event-triggered accepted detach publishes its cursorless receipt",
+    );
+    assert_eq!(
+        fixture.recorders.atomic.records().last().unwrap().kind,
+        crate::drm::atomic::AtomicCommitKind::CursorOnly,
+    );
+    assert!(
+        fixture
+            .backend
+            .platform
+            .cursor_commit_in_flight_for_output(0)
+    );
+    fixture.retire_output(0, 6);
+    assert!(
+        !fixture
+            .backend
+            .platform
+            .cursor_commit_in_flight_for_output(0)
+    );
+
+    // A later show is HW-only even though the accepted primary is still
+    // cursorless. Then queue another hide behind that show's actual event.
+    Backend::set_cursor_hidden(&mut fixture.backend, false);
+    Backend::maybe_composite(&mut fixture.backend).expect("show from Hidden without a primary");
+    assert!(!fixture.backend.scene.has_pending_page_flips());
+    assert!(
+        fixture
+            .backend
+            .platform
+            .cursor_commit_in_flight_for_output(0)
+    );
+    assert_eq!(
+        fixture.recorders.atomic.records().last().unwrap().kind,
+        crate::drm::atomic::AtomicCommitKind::CursorOnly,
+    );
+    assert_eq!(
+        fixture.backend.scene.cursor_mode(),
+        crate::kms::render::scene::CursorPlaneMode::Hw,
+    );
+    Backend::set_cursor_hidden(&mut fixture.backend, true);
+    Backend::maybe_composite(&mut fixture.backend).expect("hold hide behind show event");
+    let before_show_retirement = fixture.recorders.atomic.records().len();
+    fixture.retire_output(0, 7);
+    assert_eq!(
+        fixture.recorders.atomic.records().len(),
+        before_show_retirement + 1
+    );
+    assert_eq!(
+        fixture.recorders.atomic.records().last().unwrap().kind,
+        crate::drm::atomic::AtomicCommitKind::CursorOnly,
+    );
+    assert_eq!(
+        fixture.backend.scene.cursor_mode(),
+        crate::kms::render::scene::CursorPlaneMode::Hidden,
+        "the show-event retry publishes the accepted hide",
+    );
+    fixture.retire_output(0, 8);
+    assert!(
+        !fixture
+            .backend
+            .platform
+            .cursor_commit_in_flight_for_output(0)
+    );
+
+    use crate::drm::atomic::AtomicCommitKind;
+    let expected = [
+        AtomicCommitKind::SceneWithCursor,
+        AtomicCommitKind::CursorOnly,
+        AtomicCommitKind::CursorOnly,
+        AtomicCommitKind::Scene,
+        AtomicCommitKind::CursorOnly,
+        AtomicCommitKind::CursorOnly,
+        AtomicCommitKind::CursorOnly,
+    ];
+    assert_eq!(
+        fixture
+            .recorders
+            .atomic
+            .records()
+            .iter()
+            .map(|record| record.kind)
+            .collect::<Vec<_>>(),
+        expected,
+        "every image, hotspot, hide, show, and retry has one accepted delta",
+    );
+    fixture
+        .backend
+        .disable_output()
+        .expect("disable output after cursor-only show/hide sequence");
+    fixture.assert_cursor_quiescent();
+    let mut expected_with_disable = expected.to_vec();
+    expected_with_disable.push(AtomicCommitKind::Scene);
+    assert_eq!(
+        fixture
+            .recorders
+            .atomic
+            .records()
+            .iter()
+            .map(|record| record.kind)
+            .collect::<Vec<_>>(),
+        expected_with_disable,
+    );
+    let ledger = Rc::clone(&fixture.recorders.cursor_buffer_ledger);
+    drop(fixture);
+    assert_eq!(ledger.end_state(), (0, 0, 0));
 }
 
 #[test]
@@ -516,14 +630,14 @@ fn atomic_cursor_only_effective_visibility_overrides_hw_intent() {
     Backend::define_cursor(&mut fixture.backend, None, root, mixed.as_raw())
         .expect("select mixed animation");
     assert!(!fixture.backend.effective_cursor_hidden());
-    Backend::maybe_composite(&mut fixture.backend).expect("submit visible mixed animation frame");
-    assert!(fixture.backend.scene.has_pending_page_flips());
+    Backend::maybe_composite(&mut fixture.backend).expect("attach visible mixed animation");
+    assert!(!fixture.backend.scene.has_pending_page_flips());
     assert_eq!(
         fixture.recorders.atomic.records().last().unwrap().kind,
-        crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
-        "a visible cursor selected from Hidden is attached by its scene frame",
+        crate::drm::atomic::AtomicCommitKind::CursorOnly,
+        "a visible cursor selected from a cursorless Hidden primary attaches without a scene frame",
     );
-    fixture.retire_output(0, 4);
+    retire_cursor_only(&mut fixture, 4);
     assert!(fixture.backend.platform.cursor_plane_visible_for_output(0));
 
     Backend::set_cursor_hidden(&mut fixture.backend, true);
@@ -531,13 +645,13 @@ fn atomic_cursor_only_effective_visibility_overrides_hw_intent() {
     retire_cursor_only(&mut fixture, 5);
     assert!(!fixture.backend.platform.cursor_plane_visible_for_output(0));
     Backend::set_cursor_hidden(&mut fixture.backend, false);
-    Backend::maybe_composite(&mut fixture.backend).expect("XFIXES show visible mixed cursor frame");
-    assert!(fixture.backend.scene.has_pending_page_flips());
+    Backend::maybe_composite(&mut fixture.backend).expect("XFIXES show visible mixed cursor");
+    assert!(!fixture.backend.scene.has_pending_page_flips());
     assert_eq!(
         fixture.recorders.atomic.records().last().unwrap().kind,
-        crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+        crate::drm::atomic::AtomicCommitKind::CursorOnly,
     );
-    fixture.retire_output(0, 6);
+    retire_cursor_only(&mut fixture, 6);
     assert!(fixture.backend.platform.cursor_plane_visible_for_output(0));
     finish_hw_cursor(
         fixture,
@@ -545,156 +659,141 @@ fn atomic_cursor_only_effective_visibility_overrides_hw_intent() {
         &[
             crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
-            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
-            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            crate::drm::atomic::AtomicCommitKind::CursorOnly,
+            crate::drm::atomic::AtomicCommitKind::CursorOnly,
         ],
     );
 }
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutations: use only cursor_hidden for effective visibility, route On motion to ordinary HW intent, turn cursor wakes into mark_dirty damage, reset the cap clock per observation, or cap client damage.
-fn atomic_cursor_only_tearing_cursor_cap_survives_all_motion_sources() {
-    // Exercise the accepted-HW-cursor On handoff and Backend host/root motion
-    // here; run_core adds XTEST, Presents, and generic wakes under its clock.
-    let now = Rc::new(Cell::new(Instant::now()));
-    let clock_now = Rc::clone(&now);
-    let clock: Rc<dyn Fn() -> Instant> = Rc::new(move || clock_now.get());
-    let Some(on_fixture) = super::super::tearing::enter_on_after_accepted_hw_cursor(clock) else {
+// Mutations: require a successor primary for a held-direct hotspot, hide, or show; or fail to retire each cursor-only event before cleanup.
+fn atomic_cursor_only_held_direct_hotspot_and_visibility_progress() {
+    use crate::drm::atomic::AtomicCommitKind;
+
+    let Some(mut fixture) = AtomicCursorFixture::new_with_hotspot_properties()
+        .expect("construct direct cursor fixture with hotspot properties")
+    else {
         return;
     };
-    let mut backend = on_fixture.backend;
-    let mut state = on_fixture.state;
-    let recorder = on_fixture.recorder;
-    let cursor_plane = on_fixture.cursor_plane.into();
-    let interval = backend
-        .pstate
-        .tearing
-        .cursor_compose_interval(&backend.platform);
-    let first_compose = backend.monotonic_now() + interval;
-    now.set(first_compose);
-    Backend::set_cursor_hidden(&mut backend, false);
-    Backend::on_host_input(
-        &mut backend,
-        &mut state,
-        yserver_core::core_loop::HostInputEvent::PointerMotion {
-            origin: yserver_core::core_loop::InputOrigin::NestedHost,
-            x: 110,
-            y: 100,
-            time: 1,
-            relative: false,
-            dx: 10,
-            dy: 10,
-            motion_delta: None,
-        },
-    );
-    Backend::maybe_composite(&mut backend).expect("compose first On cursor motion");
-    super::super::tearing::retire_composed_frame(&mut backend, &mut state, 21);
-    let last_compose = backend
-        .pstate
-        .tearing
-        .last_cursor_compose
-        .expect("first On cursor compose records its timestamp");
-    let before_deadline = recorder.records().len();
-    let deadline = last_compose + interval;
-    now.set(last_compose + interval / 2);
-    Backend::warp_pointer_root(&mut backend, &mut state, 140, 120);
-    // The X11 request handler resolves window coordinates through ServerState
-    // and calls this Backend root warp entry for both root and child targets.
-    Backend::warp_pointer_root(&mut backend, &mut state, 150, 130);
-    Backend::on_host_input(
-        &mut backend,
-        &mut state,
-        yserver_core::core_loop::HostInputEvent::PointerMotion {
-            origin: yserver_core::core_loop::InputOrigin::NestedHost,
-            x: 155,
-            y: 134,
-            time: 2,
-            relative: false,
-            dx: 5,
-            dy: 4,
-            motion_delta: None,
-        },
-    );
-    assert_eq!(backend.pstate.tearing.deferred_cursor_wake, Some(deadline),);
-    Backend::maybe_composite(&mut backend).expect("hold cursor-only compose to cap");
-    assert_eq!(recorder.records().len(), before_deadline);
-    assert!(!backend.scene.has_pending_page_flips());
+    fixture
+        .backend
+        .platform
+        .for_tests_accept_output_power_commits();
+    let direct = super::round_a::setup_cursor_only_direct_present(&mut fixture);
+    fixture.define_visible_cursor();
+    Backend::warp_pointer_root(&mut fixture.backend, &mut fixture.state, 100, 90);
+    damage_cursor_root(&mut fixture);
+    Backend::maybe_composite(&mut fixture.backend).expect("submit visible cursor primary");
+    fixture.retire_output(0, 1);
+    if fixture
+        .backend
+        .platform
+        .cursor_atomic_event_pending_for_output(0)
+    {
+        fixture.retire_output(0, 2);
+    }
 
-    now.set(deadline);
-    Backend::maybe_composite(&mut backend).expect("compose latest cursor at deadline");
-    assert_eq!(recorder.records().len(), before_deadline + 1);
-    assert_eq!(
-        recorder.records().last().unwrap().kind,
-        crate::drm::atomic::AtomicCommitKind::Async,
-    );
-    super::super::tearing::retire_composed_frame(&mut backend, &mut state, 22);
-    assert_eq!(
-        (backend.core.cursor_x as i32, backend.core.cursor_y as i32),
-        (155, 134),
-        "the deadline compose observes the newest host motion position",
-    );
-    assert_eq!(backend.pstate.tearing.deferred_cursor_wake, None);
-    assert!(backend.pstate.tearing.is_on());
-    assert!(!backend.platform.any_cursor_plane_visible());
-    let kinds: Vec<_> = recorder
-        .records()
-        .iter()
-        .map(|record| record.kind)
-        .collect();
-    assert_eq!(
-        kinds,
-        vec![
-            crate::drm::atomic::AtomicCommitKind::Async,
-            crate::drm::atomic::AtomicCommitKind::Async,
-        ]
-    );
-    assert!(recorder.records().iter().all(|record| {
-        !record
-            .properties
-            .iter()
-            .any(|update| update.object == cursor_plane)
-    }));
-    backend.platform.for_tests_accept_output_power_commits();
-    backend
-        .disable_output()
-        .expect("disable output after On cursor cap test");
-    assert!(!backend.scene.has_pending_page_flips());
-    assert!(!backend.platform.any_cursor_commit_in_flight());
-    for device in &backend.platform.devices {
-        for state in device.cursor.crtc_states.values() {
-            assert!(state.intent.is_none());
-            assert!(state.in_flight.is_none());
+    let mut direct_entered = false;
+    for attempt in 0..16_u64 {
+        let (candidate, event) = super::round_a::direct_present_for_id(&direct, 26_000 + attempt);
+        Backend::note_present_scanout_candidate(&mut fixture.backend, candidate);
+        if Backend::try_present_direct(&mut fixture.backend, candidate, event)
+            .expect("submit real direct Present through Backend")
+        {
+            fixture.retire_output(0, 20 + u32::try_from(attempt).expect("frame fits"));
+            Backend::maybe_composite(&mut fixture.backend).expect("settle direct Present");
+            if fixture.backend.pstate.scanout_m2.active() {
+                direct_entered = true;
+                break;
+            }
+        } else if fixture.backend.scene.has_pending_page_flips() {
+            fixture.retire_output(0, 40 + u32::try_from(attempt).expect("frame fits"));
+            Backend::maybe_composite(&mut fixture.backend)
+                .expect("settle composed direct-probation frame");
         }
     }
-    let expected = vec![
-        crate::drm::atomic::AtomicCommitKind::Async,
-        crate::drm::atomic::AtomicCommitKind::Async,
-    ];
+    assert!(direct_entered, "Backend Presents hold a Vsync direct frame");
+    assert!(fixture.backend.pstate.scanout_m2.active());
+    let before_intents = fixture.recorders.atomic.records().len();
+
+    let replacement = create_argb_cursor(&mut fixture.backend, [0x51, 0x62, 0x73, 0xff], 1, 2);
+    let root = fixture.backend.core.window_id;
+    Backend::define_cursor(&mut fixture.backend, None, root, replacement.as_raw())
+        .expect("replace the held-direct cursor and hotspot through Backend");
+    Backend::maybe_composite(&mut fixture.backend).expect("submit held-direct hotspot update");
+    assert!(!fixture.backend.scene.has_pending_page_flips());
     assert_eq!(
-        recorder
-            .records()
+        fixture.recorders.atomic.records().last().unwrap().kind,
+        AtomicCommitKind::CursorOnly,
+    );
+    fixture.retire_output(0, 60);
+
+    Backend::set_cursor_hidden(&mut fixture.backend, true);
+    Backend::maybe_composite(&mut fixture.backend).expect("hide cursor on held direct frame");
+    assert!(!fixture.backend.scene.has_pending_page_flips());
+    assert_eq!(
+        fixture.recorders.atomic.records().last().unwrap().kind,
+        AtomicCommitKind::CursorOnly,
+    );
+    assert!(!fixture.backend.platform.cursor_plane_visible_for_output(0));
+    fixture.retire_output(0, 61);
+
+    Backend::set_cursor_hidden(&mut fixture.backend, false);
+    Backend::maybe_composite(&mut fixture.backend).expect("show cursor on held direct frame");
+    assert!(!fixture.backend.scene.has_pending_page_flips());
+    assert_eq!(
+        fixture.recorders.atomic.records().last().unwrap().kind,
+        AtomicCommitKind::CursorOnly,
+    );
+    assert!(fixture.backend.platform.cursor_plane_visible_for_output(0));
+    fixture.retire_output(0, 62);
+
+    assert_eq!(
+        fixture.recorders.atomic.records()[before_intents..]
             .iter()
             .map(|record| record.kind)
             .collect::<Vec<_>>(),
-        expected,
-        "On motion is held to the deadline and disable drains exactly once",
+        vec![
+            AtomicCommitKind::CursorOnly,
+            AtomicCommitKind::CursorOnly,
+            AtomicCommitKind::CursorOnly,
+        ],
+        "held-direct image/hotspot, hide, and show each progress once",
     );
-    let recorders = Rc::clone(
-        backend
-            .platform
-            .services
-            .test_recorders
-            .as_ref()
-            .expect("recording KMS fixture"),
+
+    Backend::set_cursor_hidden(&mut fixture.backend, true);
+    Backend::maybe_composite(&mut fixture.backend).expect("detach before direct cleanup");
+    assert_eq!(
+        fixture.recorders.atomic.records().last().unwrap().kind,
+        AtomicCommitKind::CursorOnly,
     );
-    let ledger = Rc::clone(&recorders.cursor_buffer_ledger);
-    drop(backend);
+    fixture.retire_output(0, 63);
+    Backend::unmap_subwindow(&mut fixture.backend, None, direct.window_xid)
+        .expect("request held-direct unflip through Backend");
+    Backend::maybe_composite(&mut fixture.backend).expect("submit Backend direct unflip");
+    fixture.retire_output(0, 64);
+    assert!(!fixture.backend.pstate.scanout_m2.active());
+    fixture
+        .backend
+        .disable_output()
+        .expect("disable output after direct cursor handoff");
+    let _ = Backend::drain_completed_present_events(&mut fixture.backend);
+    let _ = Backend::drain_retired_present_idle_events(&mut fixture.backend);
+    fixture.assert_cursor_quiescent();
+    let ledger = Rc::clone(&fixture.recorders.cursor_buffer_ledger);
+    drop(fixture);
     assert_eq!(ledger.end_state(), (0, 0, 0));
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutations: use only cursor_hidden, turn cursor wakes into generic damage, reset the cap per observation, cap client damage, replace run_core WarpPointer with Backend warps, replace the sink after On entry, or omit final Backend cleanup.
+fn atomic_cursor_only_tearing_cursor_cap_survives_all_motion_sources() {
     assert!(
         super::super::tearing::round2::run_task6_present_and_xtest_motion_keep_cursor_compose_cap_under_run_core_load(false),
-        "run_core producer stream exercises Present, XTEST, and generic request wakes",
+        "run_core exercises root/window warp, XTEST, Present/Copy, structural damage, and generic wakes with construction-selected dependencies and full cleanup",
     );
     assert!(
         super::super::tearing::round2::run_task5_handoff_unflip_starts_cursor_compose_interval(),
