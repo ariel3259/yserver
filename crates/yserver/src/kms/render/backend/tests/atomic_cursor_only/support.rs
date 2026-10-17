@@ -34,19 +34,6 @@ impl AtomicCursorFixture {
         Self::new_with_cursor_lease_failure_after(boundary, 0)
     }
 
-    pub(crate) fn new_with_cursor_lease_failures(
-        boundary: crate::kms::cursor_plane::CursorLeaseBoundary,
-        count: usize,
-    ) -> Result<Option<Self>, String> {
-        let Some(mut fixture) = Self::new()? else {
-            return Ok(None);
-        };
-        for _ in 0..count {
-            fixture.script_cursor_lease_failure(boundary, 0);
-        }
-        Ok(Some(fixture))
-    }
-
     pub(crate) fn new_with_cursor_lease_failure_after(
         boundary: crate::kms::cursor_plane::CursorLeaseBoundary,
         matching_calls_to_skip: usize,
@@ -55,19 +42,6 @@ impl AtomicCursorFixture {
             return Ok(None);
         };
         fixture.script_cursor_lease_failure(boundary, matching_calls_to_skip);
-        Ok(Some(fixture))
-    }
-
-    pub(crate) fn new_with_two_outputs_cursor_lease_failures(
-        boundary: crate::kms::cursor_plane::CursorLeaseBoundary,
-        matching_calls_to_skip: impl IntoIterator<Item = usize>,
-    ) -> Result<Option<Self>, String> {
-        let Some(mut fixture) = Self::new_with_two_outputs()? else {
-            return Ok(None);
-        };
-        for skip in matching_calls_to_skip {
-            fixture.script_cursor_lease_failure(boundary, skip);
-        }
         Ok(Some(fixture))
     }
 

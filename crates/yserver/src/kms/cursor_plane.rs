@@ -1168,6 +1168,11 @@ impl CursorPlane {
         self.sprite_pool.all_users_zero()
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_tests_prepared_sprite_user_count(&self) -> usize {
+        self.sprite_pool.prepared_user_count()
+    }
+
     pub(crate) fn disarm_sprite_pool(&mut self) {
         self.sprite_pool.disarm();
     }

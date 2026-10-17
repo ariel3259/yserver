@@ -940,14 +940,12 @@ fn create_oversized_cursor(fixture: &mut AtomicCursorFixture, hot: (u16, u16)) -
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: omit pre-render reservation rollback or descriptor-slot release; retry cannot accept and teardown retains a lease.
-fn atomic_cursor_only_shared_reservation_failure_releases_slots_and_retries() {
-    use crate::kms::{cursor_plane::CursorLeaseBoundary, render::scene::CursorAcceptedMode};
+// Mutation: omit Shared submit-failure reservation rollback; the prepared lease remains owned after the rejected frame.
+fn atomic_cursor_only_shared_submit_failure_releases_reserved_lease_and_retries() {
+    use crate::kms::render::scene::CursorAcceptedMode;
     use yserver_core::backend::Backend;
 
-    let Some(mut fixture) =
-        AtomicCursorFixture::new_with_cursor_lease_failures(CursorLeaseBoundary::Reserve, 3)
-            .expect("build scripted Shared reservation fixture")
+    let Some(mut fixture) = AtomicCursorFixture::new().expect("build Shared rollback fixture")
     else {
         return;
     };
@@ -959,10 +957,57 @@ fn atomic_cursor_only_shared_reservation_failure_releases_slots_and_retries() {
     Backend::warp_pointer_root(&mut fixture.backend, &mut fixture.state, 140, 110);
     super::round_a::damage_cursor_root(&mut fixture);
 
-    Backend::maybe_composite(&mut fixture.backend).expect("failed reservation is retryable");
-    assert!(fixture.recorders.atomic.records().is_empty());
+    // The Shared producer reserves the cursor lease before reaching the
+    // recording atomic sink. Failing the sink therefore exercises rollback
+    // after a real successful reservation.
+    fixture
+        .recorders
+        .atomic
+        .script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
+    Backend::maybe_composite(&mut fixture.backend).expect("failed Shared submit is recoverable");
+    let failed_records = fixture.recorders.atomic.records();
+    let failed_frames: Vec<_> = failed_records
+        .iter()
+        .filter(|record| !record.events.is_empty())
+        .collect();
+    assert_eq!(
+        failed_frames.len(),
+        1,
+        "the Shared frame reached atomic submit"
+    );
+    assert_eq!(
+        failed_frames[0].kind,
+        crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+        "the rejected Shared request carries its cursor delta",
+    );
+    assert!(matches!(
+        failed_frames[0].result,
+        crate::drm::atomic::tests_support::ScriptedResult::Error {
+            raw_os_error: Some(libc::EIO),
+            ..
+        }
+    ));
+    let output = &fixture.backend.platform.outputs[0];
+    let plane_properties = fixture.backend.platform.devices[0]
+        .cursor
+        .plane
+        .as_ref()
+        .expect("cursor plane")
+        .properties_for(output.output.crtc)
+        .expect("cursor plane properties");
+    assert!(
+        failed_frames[0]
+            .properties
+            .iter()
+            .any(|update| update.object == plane_properties.plane.into())
+    );
     assert!(fixture.backend.platform.staged_cursor_frames.is_empty());
     assert!(!fixture.backend.scene.has_pending_page_flips());
+    assert_eq!(
+        fixture.backend.scene.for_tests_cursor_commit_receipt(0),
+        None,
+        "a failed Shared frame publishes no cursor receipt",
+    );
     assert!(
         fixture.backend.platform.devices[0]
             .cursor
@@ -973,24 +1018,22 @@ fn atomic_cursor_only_shared_reservation_failure_releases_slots_and_retries() {
         "a failed reservation leaves no prepared or accepted lease",
     );
 
-    for _ in 0..3 {
-        Backend::maybe_composite(&mut fixture.backend).expect("retry after reservation failure");
-        if fixture
-            .backend
-            .scene
-            .for_tests_cursor_commit_receipt(0)
-            .is_some()
-        {
-            break;
-        }
+    let retry_deadline = fixture
+        .backend
+        .scene
+        .earliest_retry_deadline()
+        .expect("failed Shared frame schedules its production retry");
+    while std::time::Instant::now() < retry_deadline {
+        std::hint::spin_loop();
     }
+    Backend::maybe_composite(&mut fixture.backend).expect("retry after Shared submit failure");
     assert!(
         fixture
             .backend
             .scene
             .for_tests_cursor_commit_receipt(0)
             .is_some(),
-        "Backend retry leaves the damaged shared frame pending"
+        "Backend retry submits the still-damaged Shared frame",
     );
     let receipt = fixture
         .backend
@@ -998,16 +1041,43 @@ fn atomic_cursor_only_shared_reservation_failure_releases_slots_and_retries() {
         .for_tests_cursor_commit_receipt(0)
         .expect("retry publishes the accepted frame receipt");
     assert_eq!(receipt.mode, CursorAcceptedMode::Hardware);
-    assert_eq!(
-        fixture.recorders.atomic.records()[0].kind,
-        crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
-    );
     fixture.retire_output(0, 1);
 
     Backend::set_cursor_hidden(&mut fixture.backend, true);
     super::round_a::damage_cursor_root(&mut fixture);
     Backend::maybe_composite(&mut fixture.backend).expect("submit cursorless scene frame");
     fixture.retire_output(0, 2);
+    let frame_records: Vec<_> = fixture
+        .recorders
+        .atomic
+        .records()
+        .into_iter()
+        .filter(|record| !record.events.is_empty())
+        .collect();
+    assert_eq!(
+        frame_records
+            .iter()
+            .map(|record| record.kind)
+            .collect::<Vec<_>>(),
+        [
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+        ],
+        "the frame commits are rejected handoff, accepted retry, then hide",
+    );
+    assert!(matches!(
+        frame_records[0].result,
+        crate::drm::atomic::tests_support::ScriptedResult::Error {
+            raw_os_error: Some(libc::EIO),
+            ..
+        }
+    ));
+    assert!(
+        frame_records[1..].iter().all(|record| {
+            record.result == crate::drm::atomic::tests_support::ScriptedResult::Ok
+        })
+    );
     fixture
         .backend
         .disable_output()
@@ -1071,15 +1141,13 @@ fn atomic_cursor_only_shared_settlement_failure_recovers_accepted_lease() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: skip the degraded composed-unflip fallback after cursor reservation fails; its accepted per-output trace and teardown assertions fail.
+// Mutation: omit composed-unflip reservation rollback after its atomic request fails; teardown retains a prepared lease.
 fn atomic_cursor_only_composed_unflip_reservation_failure_rolls_back_before_fallback() {
     use yserver_core::backend::{AnyHandle, Backend};
 
-    let Some(mut fixture) = AtomicCursorFixture::new_with_two_outputs_cursor_lease_failures(
-        crate::kms::cursor_plane::CursorLeaseBoundary::Reserve,
-        [2, 0],
-    )
-    .expect("build two-output reservation rollback fixture") else {
+    let Some(mut fixture) =
+        AtomicCursorFixture::new_with_two_outputs().expect("build two-output rollback fixture")
+    else {
         return;
     };
     fixture
@@ -1152,10 +1220,23 @@ fn atomic_cursor_only_composed_unflip_reservation_failure_rolls_back_before_fall
         }
     }
     assert!(direct_entered, "Backend direct Presents enter held scanout");
+    Backend::unmap_subwindow(&mut fixture.backend, None, direct.window_xid)
+        .expect("request composed unflip through Backend");
+    assert!(fixture.backend.pstate.scanout_m2.unflip_requested);
 
-    // The new lease spans both CRTCs. The fixture script allows both initial
-    // Shared attachments, then fails the direct sprite replacement and the
-    // composed-unflip retry at the same real reservation boundary.
+    // A Hide/Show round trip leaves a real show lease pending behind the
+    // accepted detach events. The grouped unflip inherits that pending bind
+    // once the old events retire, and must return its reservations if submit
+    // then fails.
+    Backend::set_cursor_hidden(&mut fixture.backend, true);
+    assert!(!fixture.backend.platform.cursor_plane_visible_for_output(0));
+    assert!(!fixture.backend.platform.cursor_plane_visible_for_output(1));
+    assert!(
+        fixture
+            .backend
+            .platform
+            .cursor_commit_in_flight_for_outputs(&[0, 1])
+    );
     let replacement_source = Backend::create_pixmap(&mut fixture.backend, None, 64, 64, 1)
         .expect("create replacement cursor source through Backend");
     Backend::put_image(
@@ -1185,29 +1266,64 @@ fn atomic_cursor_only_composed_unflip_reservation_failure_rolls_back_before_fall
             .expect("create replacement cursor through Backend")
             .expect("replacement cursor");
     Backend::define_cursor(&mut fixture.backend, None, root, replacement.as_raw())
-        .expect("define replacement cursor before unflip");
-    Backend::warp_pointer_root(&mut fixture.backend, &mut fixture.state, 801, 90);
+        .expect("define replacement cursor while detached");
+    Backend::set_cursor_hidden(&mut fixture.backend, false);
+    assert!(!fixture.backend.effective_cursor_hidden());
     assert!(
         fixture
             .backend
             .platform
-            .for_tests_cursor_show_intent(0)
-            .is_some()
+            .cursor_commit_in_flight_for_outputs(&[0, 1])
     );
     assert!(
-        fixture
-            .backend
-            .platform
-            .for_tests_cursor_show_intent(1)
-            .is_some()
+        (0..2).any(|output_idx| {
+            fixture
+                .backend
+                .platform
+                .for_tests_cursor_show_intent(output_idx)
+                .is_some()
+        }),
+        "the replacement cursor show lease remains pending behind detach events",
     );
     assert!(fixture.backend.pstate.scanout_m2.unflip_requested);
-    Backend::unmap_subwindow(&mut fixture.backend, None, direct.window_xid)
-        .expect("request composed unflip through Backend");
-    assert!(fixture.backend.pstate.scanout_m2.unflip_requested);
+    let before_wait = fixture.recorders.atomic.records().len();
+    Backend::maybe_composite(&mut fixture.backend).expect("grouped unflip waits for detach events");
+    assert_eq!(fixture.recorders.atomic.records().len(), before_wait);
+    fixture.retire_output(0, 60);
+    fixture.retire_output(1, 60);
+    assert!(
+        !fixture
+            .backend
+            .platform
+            .cursor_commit_in_flight_for_outputs(&[0, 1])
+    );
+    for output in &fixture.backend.platform.outputs {
+        assert!(
+            fixture
+                .backend
+                .platform
+                .device_for_key(output.key.device_key)
+                .and_then(|device| device.cursor.crtc_states.get(&output.output.crtc))
+                .is_some_and(|state| state.applied.is_none())
+        );
+    }
     let before_unflip = fixture.recorders.atomic.records().len();
+    fixture
+        .recorders
+        .atomic
+        .script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
     Backend::maybe_composite(&mut fixture.backend)
         .expect("reservation failure falls back to per-output scene commits");
+    assert_eq!(
+        fixture.backend.platform.devices[0]
+            .cursor
+            .plane
+            .as_ref()
+            .expect("cursor plane")
+            .for_tests_prepared_sprite_user_count(),
+        0,
+        "the rejected grouped submit releases its reserved cursor leases before fallback retires",
+    );
 
     assert!(fixture.backend.pstate.scanout_m2.degraded_composed_unflip);
     assert_eq!(
@@ -1219,16 +1335,61 @@ fn atomic_cursor_only_composed_unflip_reservation_failure_rolls_back_before_fall
     assert!(fixture.backend.platform.staged_cursor_frames.is_empty());
     assert!(fixture.backend.platform.cursor_plane_visible_for_output(0));
     assert!(fixture.backend.platform.cursor_plane_visible_for_output(1));
+    let all_records = fixture.recorders.atomic.records();
+    let unflip_records: Vec<_> = all_records[before_unflip..]
+        .iter()
+        .filter(|record| !record.events.is_empty())
+        .collect();
     assert_eq!(
-        fixture.recorders.atomic.records()[before_unflip..]
+        unflip_records
             .iter()
             .map(|record| record.kind)
             .collect::<Vec<_>>(),
         [
             crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
             crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
         ],
-        "failed grouped reservation submits only the two Backend scene fallbacks",
+        "the rejected grouped request is followed by both Backend scene fallbacks",
+    );
+    assert!(matches!(
+        unflip_records[0].result,
+        crate::drm::atomic::tests_support::ScriptedResult::Error {
+            raw_os_error: Some(libc::EIO),
+            ..
+        }
+    ));
+    assert_eq!(
+        unflip_records[0].events.len(),
+        2,
+        "the failed grouped request reached the atomic sink with both output events",
+    );
+    let cursor_plane_objects: Vec<_> = fixture
+        .backend
+        .platform
+        .outputs
+        .iter()
+        .filter_map(|output| {
+            fixture
+                .backend
+                .platform
+                .device_for_key(output.key.device_key)
+                .and_then(|device| device.cursor.plane.as_ref())
+                .and_then(|plane| plane.properties_for(output.output.crtc))
+                .map(|properties| properties.plane.into())
+        })
+        .collect();
+    assert!(
+        unflip_records[0]
+            .properties
+            .iter()
+            .any(|update| cursor_plane_objects.contains(&update.object)),
+        "the failed grouped request carries a cursor update reserved before submit",
+    );
+    assert!(
+        unflip_records[1..]
+            .iter()
+            .all(|record| record.result == crate::drm::atomic::tests_support::ScriptedResult::Ok)
     );
     fixture.retire_output(0, 61);
     fixture.retire_output(1, 61);

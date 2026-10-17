@@ -319,6 +319,14 @@ impl SpritePool {
     }
 
     #[cfg(test)]
+    pub(crate) fn prepared_user_count(&self) -> usize {
+        self.buffers
+            .iter()
+            .map(|buffer| buffer.prepared_users)
+            .sum()
+    }
+
+    #[cfg(test)]
     #[allow(
         dead_code,
         reason = "A4 Backend tests assert wanted-record retry after allocation failure"
