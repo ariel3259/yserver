@@ -853,13 +853,38 @@ fn shown(calls: &[UiCall]) -> Vec<Shown> {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn surface_shows_the_root_cursor_once_at_startup() {
-    let Some((mut f, ui, xid)) = cursor_or_skip() else {
+    let Some(mut f) = surface_or_skip() else {
         return;
     };
+    let ui = Arc::new(RecordingUi::default());
+    f.b.pstate.ui = Some(Arc::clone(&ui) as Arc<dyn ShellUi>);
+    let xid = create_window(&mut f.b);
+    f.frame(xid, 0x00FF_0000);
+    // Mutation: defer native cursor show until flip retirement; the first
+    // accepted frame must already report the host cursor as Hardware.
+    let first_receipt =
+        f.b.scene
+            .for_tests_cursor_commit_receipt(0)
+            .expect("first accepted surface frame cursor receipt");
+    assert_eq!(
+        first_receipt.frame,
+        Some(crate::kms::render::scene::CursorFrameId(1)),
+        "the receipt names the first accepted surface frame",
+    );
+    assert_eq!(
+        first_receipt.mode,
+        crate::kms::render::scene::CursorAcceptedMode::Hardware,
+        "the native host cursor is accepted before this frame retires",
+    );
+    assert_eq!(
+        first_receipt.primary_cursor,
+        crate::kms::render::scene::CursorPrimaryContent::Cursorless,
+    );
     let [(_, _, (width, height))] = shown(&ui.take())[..] else {
         panic!("one set_cursor for the first frame");
     };
     assert!(width > 0 && height > 0);
+    f.retire();
     f.frame(xid, 0x0000_FF00);
     f.retire();
     let receipt =

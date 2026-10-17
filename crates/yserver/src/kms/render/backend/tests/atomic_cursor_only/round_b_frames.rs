@@ -1,5 +1,240 @@
 use super::support::AtomicCursorFixture;
 
+fn install_copied_recording_route(
+    fixture: &mut AtomicCursorFixture,
+) -> std::rc::Rc<crate::drm::atomic::tests_support::RecordingAtomicCommitExecutor> {
+    fixture
+        .backend
+        .platform
+        .for_tests_accept_output_power_commits();
+    let sink_key = crate::platform::drm::DrmDeviceKey {
+        major: 226,
+        minor: 99,
+    };
+    let sink_device = std::rc::Rc::new(crate::drm::Device::for_tests().expect("sink DRM device"));
+    let sink_atomic = std::rc::Rc::new(
+        crate::drm::atomic::tests_support::RecordingAtomicCommitExecutor::default(),
+    );
+    let sink_executor: std::rc::Rc<dyn crate::drm::atomic::AtomicCommitExecutor> =
+        sink_atomic.clone();
+    let event_source = std::rc::Rc::clone(&fixture.recorders.page_flip_events);
+    event_source.register_device(&sink_device);
+    let source_device = &fixture.backend.platform.devices[0];
+    let cursor_buffer_io = std::rc::Rc::clone(&source_device.cursor_buffer_io);
+    let legacy_cursor_io = std::rc::Rc::clone(&source_device.legacy_cursor_io);
+    fixture
+        .backend
+        .platform
+        .devices
+        .push(crate::kms::render::platform::KmsDevice {
+            key: sink_key,
+            device: std::rc::Rc::clone(&sink_device),
+            async_page_flip: false,
+            atomic_commit_sink: std::rc::Rc::new(crate::drm::atomic::AtomicCommitSink::new(
+                sink_executor,
+            )),
+            page_flip_event_source: event_source.clone(),
+            cursor_buffer_io,
+            legacy_cursor_io,
+            test_page_flip_event_source: Some(event_source),
+            cursor: crate::kms::render::platform::KmsCursorState::new(),
+        });
+    let route = crate::kms::scanout_route::ScanoutRoute::new(
+        fixture.backend.platform.outputs[0]
+            .scanout_route
+            .render_device_id,
+        sink_key,
+        crate::kms::scanout_route::RenderKmsRelationship::Different,
+    );
+    let crtc = fixture.backend.platform.outputs[0].output.crtc;
+    fixture.backend.platform.outputs[0].key.device_key = sink_key;
+    fixture.backend.platform.outputs[0].scanout_route = route;
+    fixture.backend.pstate.crtc_key_by_id.insert(
+        u32::from(crtc),
+        fixture.backend.platform.outputs[0].key.clone(),
+    );
+    fixture.backend.refresh_present_crtc_clock_epochs();
+    fixture
+        .backend
+        .platform
+        .for_tests_initialize_cursor_planes_with_capabilities(Some(64), Some(64));
+    fixture
+        .install_copied_recording_route(route)
+        .expect("install lavapipe copied route");
+    let layouts = fixture.backend.platform.scene_output_layouts();
+    fixture.backend.scene =
+        crate::kms::render::scene::SceneCompositor::new(&fixture.backend.platform, &layouts)
+            .expect("rebuild scene with copied sink identity");
+    sink_atomic
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: publish a receipt when the copied handoff is unavailable; the empty receipt assertion fails.
+fn atomic_cursor_only_unavailable_handoff_publishes_no_receipt() {
+    use crate::kms::render::scene::{OutputRoute, OutputSink};
+    use yserver_core::backend::Backend;
+
+    let Some(mut fixture) = AtomicCursorFixture::new().expect("build unavailable cursor fixture")
+    else {
+        return;
+    };
+    let sink_atomic = install_copied_recording_route(&mut fixture);
+    // Construction-time setup: retain destination slots but remove their
+    // paired copied render sources. The Backend tick acquires a real slot and
+    // reaches the sink's `FinishOutcome::Unavailable` check before recording.
+    let Some(crate::kms::vk::scanout::OutputScanout::Copied(pool)) =
+        fixture.backend.platform.scanout_pools[0].as_mut()
+    else {
+        panic!("copied route is installed before the scenario");
+    };
+    pool.sources.clear();
+    assert_eq!(
+        OutputSink::route(&fixture.backend.platform, 0),
+        OutputRoute::Copied,
+    );
+    fixture.define_visible_cursor();
+    Backend::warp_pointer_root(&mut fixture.backend, &mut fixture.state, 100, 90);
+    super::round_a::damage_cursor_root(&mut fixture);
+    Backend::maybe_composite(&mut fixture.backend).expect("unavailable handoff is recoverable");
+
+    assert_eq!(
+        fixture.backend.scene.for_tests_cursor_commit_receipt(0),
+        None,
+        "an unavailable frame publishes no cursor receipt",
+    );
+    assert!(
+        !fixture.backend.scene.has_pending_page_flip(0),
+        "an unavailable frame creates no presentation obligation",
+    );
+    assert!(
+        fixture.backend.platform.staged_cursor_frames.is_empty(),
+        "an unavailable frame stages no cursor metadata",
+    );
+    assert!(
+        sink_atomic.records().is_empty(),
+        "an unavailable copied handoff emits no sink commit",
+    );
+    fixture
+        .backend
+        .disable_output()
+        .expect("disable and drain no-slot output through Backend");
+    fixture.assert_cursor_quiescent();
+    let ledger = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
+    drop(fixture);
+    assert_eq!(ledger.end_state(), (0, 0, 0));
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: retain staged cursor plans when Backend cancels copied completions; cleanup assertions fail.
+fn atomic_cursor_only_cancelled_copied_frame_publishes_no_receipt() {
+    use crate::kms::render::scene::{CursorPlaneMode, OutputRoute, OutputSink};
+    use yserver_core::backend::Backend;
+
+    let Some(mut fixture) = AtomicCursorFixture::new().expect("build copied cancellation fixture")
+    else {
+        return;
+    };
+    let sink_atomic = install_copied_recording_route(&mut fixture);
+    fixture
+        .backend
+        .platform
+        .for_tests_hold_scanout_render_completions();
+    assert_eq!(
+        OutputSink::route(&fixture.backend.platform, 0),
+        OutputRoute::Copied,
+    );
+    let cursor = create_oversized_cursor(&mut fixture, (2, 3));
+    let root = fixture.backend.core.window_id;
+    Backend::define_cursor(&mut fixture.backend, None, root, cursor)
+        .expect("define software cursor through Backend");
+    Backend::warp_pointer_root(&mut fixture.backend, &mut fixture.state, 100, 90);
+    super::round_a::damage_cursor_root(&mut fixture);
+    let accepted_mode_before = fixture.backend.scene.cursor_mode();
+    assert_eq!(accepted_mode_before, CursorPlaneMode::Hidden);
+    Backend::maybe_composite(&mut fixture.backend).expect("submit copied render");
+    assert_eq!(
+        fixture.backend.scene.for_tests_cursor_commit_receipt(0),
+        None
+    );
+    assert_eq!(fixture.backend.platform.staged_cursor_frames.len(), 1);
+    assert_eq!(
+        fixture
+            .backend
+            .platform
+            .for_tests_pending_scanout_render_completion_count(),
+        1,
+        "the actual Vulkan render completion remains pending before cancellation",
+    );
+    assert_eq!(
+        sink_atomic
+            .records()
+            .iter()
+            .map(|record| record.kind)
+            .collect::<Vec<_>>(),
+        [],
+        "the copied frame has not reached KMS",
+    );
+
+    fixture
+        .backend
+        .disable_output()
+        .expect("Backend shutdown cancels the copied frame before completion dispatch");
+    assert_eq!(
+        fixture.backend.scene.for_tests_cursor_commit_receipt(0),
+        None,
+        "cancellation publishes no receipt",
+    );
+    assert_eq!(
+        fixture.backend.scene.cursor_mode(),
+        accepted_mode_before,
+        "cancellation leaves the previously accepted cursor mode unchanged",
+    );
+    assert_eq!(
+        fixture
+            .backend
+            .platform
+            .for_tests_pending_scanout_render_completion_count(),
+        0,
+        "Backend shutdown removes the canceled completion entry",
+    );
+    assert!(
+        fixture.backend.platform.staged_cursor_frames.is_empty(),
+        "Backend shutdown releases the staged frame metadata",
+    );
+    assert!(
+        !fixture.backend.scene.has_pending_page_flips(),
+        "no scene event obligation survives cancellation and shutdown",
+    );
+    fixture.assert_cursor_quiescent();
+    assert_eq!(
+        sink_atomic
+            .records()
+            .iter()
+            .map(|record| record.kind)
+            .collect::<Vec<_>>(),
+        [],
+        "the canceled frame never reaches the copied KMS sink",
+    );
+    assert_eq!(
+        fixture
+            .recorders
+            .atomic
+            .records()
+            .iter()
+            .map(|record| record.kind)
+            .collect::<Vec<_>>(),
+        [crate::drm::atomic::AtomicCommitKind::Scene],
+        "shutdown detaches the output once and leaves no live event",
+    );
+    assert!(fixture.recorders.atomic.records()[0].events.is_empty());
+    assert!(fixture.recorders.legacy_cursor.records().is_empty());
+    let ledger = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
+    drop(fixture);
+    assert_eq!(ledger.end_state(), (0, 0, 0));
+}
+
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: reuse F0's cached frame id/content receipt for F1; the exact F1 assertions fail.

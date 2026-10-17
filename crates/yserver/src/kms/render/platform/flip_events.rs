@@ -17,6 +17,43 @@ use std::{
 };
 use yserver_core::backend::{BackendFdKind, PresentClockSample, PresentClockSource};
 
+pub(crate) trait ScanoutCompletionReadiness {
+    fn is_ready(&self, fd: Option<&OwnedFd>) -> bool;
+}
+
+pub(crate) struct PollScanoutCompletionReadiness;
+
+impl ScanoutCompletionReadiness for PollScanoutCompletionReadiness {
+    fn is_ready(&self, fd: Option<&OwnedFd>) -> bool {
+        use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+
+        let Some(fd) = fd else {
+            return true;
+        };
+        let mut fds = [PollFd::new(fd.as_fd(), PollFlags::POLLIN)];
+        match poll(&mut fds, PollTimeout::ZERO) {
+            Ok(0) => false,
+            Ok(_) => fds[0].revents().is_some_and(|events| {
+                events.intersects(PollFlags::POLLIN | PollFlags::POLLERR | PollFlags::POLLHUP)
+            }),
+            Err(error) => {
+                log::warn!("scanout render completion poll failed: {error}");
+                true
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct HoldScanoutCompletionReadiness;
+
+#[cfg(test)]
+impl ScanoutCompletionReadiness for HoldScanoutCompletionReadiness {
+    fn is_ready(&self, _fd: Option<&OwnedFd>) -> bool {
+        false
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct KernelPageFlip {
     pub(crate) crtc: ::drm::control::crtc::Handle,
@@ -373,6 +410,11 @@ impl PageFlipEventSource for RecordingPageFlipEventSource {
 }
 
 impl PlatformBackend {
+    #[cfg(test)]
+    pub(crate) fn for_tests_hold_scanout_render_completions(&mut self) {
+        self.scanout_completion_readiness = Rc::new(HoldScanoutCompletionReadiness);
+    }
+
     pub(super) fn prune_present_clocks_to_live_outputs(&mut self) {
         let live: HashSet<CrtcKey> = self.outputs.iter().map(CrtcKey::for_output).collect();
         self.ust_msc.retain(|key, _| live.contains(key));
@@ -438,30 +480,13 @@ impl PlatformBackend {
     /// Different outputs are independent, so readiness is not constrained by
     /// queue-front order.
     pub(crate) fn drain_scanout_render_completions(&mut self) -> Vec<ReadyScanoutRenderCompletion> {
-        use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
-
         let mut ready = Vec::new();
         let mut index = 0;
         while index < self.pending_scanout_render_completions.len() {
             let is_ready = {
                 let pending = &self.pending_scanout_render_completions[index];
-                if let Some(fd) = pending.fd.as_ref() {
-                    let mut fds = [PollFd::new(fd.as_fd(), PollFlags::POLLIN)];
-                    match poll(&mut fds, PollTimeout::ZERO) {
-                        Ok(0) => false,
-                        Ok(_) => fds[0].revents().is_some_and(|events| {
-                            events.intersects(
-                                PollFlags::POLLIN | PollFlags::POLLERR | PollFlags::POLLHUP,
-                            )
-                        }),
-                        Err(error) => {
-                            log::warn!("scanout render completion poll failed: {error}");
-                            true
-                        }
-                    }
-                } else {
-                    true
-                }
+                self.scanout_completion_readiness
+                    .is_ready(pending.fd.as_ref())
             };
             if !is_ready {
                 index += 1;

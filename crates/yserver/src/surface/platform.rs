@@ -34,10 +34,10 @@ use crate::kms::{
         gpu::{FencePool, GpuCore},
         resize_fault,
         scene::{
-            CursorAcceptedMode, CursorFramePlan, CursorPlaneSink, CursorShowFailure,
-            CursorUploadOutcome, FinishOutcome, FlipRetirement, FrameHandoff, FrameTargetError,
-            OffscreenTarget, OutputLayout, OutputRoute, OutputSink, PreparedOutputs, RecordFrame,
-            RenderCompletion, SceneCompositor, SlotToken,
+            CursorAcceptedMode, CursorFrameAssignment, CursorFramePlan, CursorPlaneSink,
+            CursorShowFailure, CursorUploadOutcome, FinishOutcome, FlipRetirement, FrameHandoff,
+            FrameTargetError, OffscreenTarget, OutputLayout, OutputRoute, OutputSink,
+            PreparedOutputs, RecordFrame, RenderCompletion, SceneCompositor, SlotToken,
         },
     },
     vk::{
@@ -283,7 +283,7 @@ impl OutputSink for SurfacePlatform {
     ) -> FinishOutcome {
         let frame = cursor.frame;
         let mut outcome = match self.outputs.get_mut(output_idx) {
-            Some(output) => output.finish_frame(bo_idx, cursor, record),
+            Some(output) => output.finish_frame(bo_idx, cursor.clone(), record),
             None => return FinishOutcome::Unavailable(FrameTargetError::NoSlot),
         };
         if let FinishOutcome::Finished {
@@ -295,11 +295,7 @@ impl OutputSink for SurfacePlatform {
         } = &mut outcome
         {
             receipt.frame = Some(frame);
-            receipt.mode = if self.cursor.shown {
-                CursorAcceptedMode::Hardware
-            } else {
-                CursorAcceptedMode::Hidden
-            };
+            receipt.mode = accept_cursor_frame(self, output_idx, &cursor);
         }
         outcome
     }
@@ -355,6 +351,79 @@ impl OutputSink for SurfacePlatform {
         _fd: Option<OwnedFd>,
     ) -> io::Result<crate::kms::render::scene::CursorCommitReceipt> {
         Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+}
+
+/// Settle this frame's captured native cursor operation only after its
+/// surface handoff succeeded, then report the state the host cursor kept.
+fn accept_cursor_frame(
+    platform: &mut SurfacePlatform,
+    output_idx: usize,
+    plan: &CursorFramePlan,
+) -> CursorAcceptedMode {
+    match plan.assignment {
+        CursorFrameAssignment::Hardware => {
+            let Some(sprite) = plan.sprite.as_ref() else {
+                let _ = platform.hide(output_idx);
+                return accepted_cursor_mode(platform);
+            };
+            let (hot_x, hot_y) = (
+                u16::try_from(sprite.hot_x.max(0)).unwrap_or(0),
+                u16::try_from(sprite.hot_y.max(0)).unwrap_or(0),
+            );
+            let uploaded =
+                if platform.uploaded_image_matches(output_idx, sprite.record_version, hot_x, hot_y)
+                {
+                    true
+                } else if let Some(bytes) = sprite.bgra_bytes.as_deref() {
+                    matches!(
+                        platform.upload(
+                            output_idx,
+                            sprite.record_version,
+                            hot_x,
+                            hot_y,
+                            sprite.extent.width,
+                            sprite.extent.height,
+                            bytes,
+                        ),
+                        Ok(CursorUploadOutcome::Ready)
+                    )
+                } else {
+                    false
+                };
+            if !uploaded {
+                let _ = platform.hide(output_idx);
+                return accepted_cursor_mode(platform);
+            }
+            if let Err(failure) = platform.show(output_idx, hot_x, hot_y, 0, 0) {
+                log::warn!("surface: native cursor show failed: {}", failure.error);
+            }
+            accepted_cursor_mode(platform)
+        }
+        CursorFrameAssignment::Software { .. } => {
+            if let Err(error) = platform.hide(output_idx) {
+                log::warn!("surface: native cursor hide failed: {error}");
+            }
+            if platform.cursor.shown {
+                CursorAcceptedMode::Hardware
+            } else {
+                CursorAcceptedMode::Software
+            }
+        }
+        CursorFrameAssignment::Hidden => {
+            if let Err(error) = platform.hide(output_idx) {
+                log::warn!("surface: native cursor hide failed: {error}");
+            }
+            accepted_cursor_mode(platform)
+        }
+    }
+}
+
+fn accepted_cursor_mode(platform: &SurfacePlatform) -> CursorAcceptedMode {
+    if platform.cursor.shown {
+        CursorAcceptedMode::Hardware
+    } else {
+        CursorAcceptedMode::Hidden
     }
 }
 

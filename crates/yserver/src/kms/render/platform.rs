@@ -532,6 +532,9 @@ pub struct PlatformBackend {
     /// Present completion poller: the two readiness streams have different
     /// ownership, cancellation, and delivery semantics.
     scanout_render_completion_epfd: crate::kms::render::completion_poller::CompletionPoller,
+    /// Readiness source for copied-render completion delivery. Tests may
+    /// select a holding source before a scenario to exercise cancellation.
+    pub(crate) scanout_completion_readiness: Rc<dyn flip_events::ScanoutCompletionReadiness>,
     pending_scanout_render_completions: std::collections::VecDeque<PendingScanoutRenderCompletion>,
     next_scanout_render_job_id: u64,
 
