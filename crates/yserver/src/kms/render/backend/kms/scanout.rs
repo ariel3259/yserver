@@ -493,8 +493,12 @@ impl KmsBackend {
                     log::debug!(
                         "scanout_m2: direct cursor replacement waits for output {output_idx} flip retirement"
                     );
-                    self.pstate.scanout_m2.cursor_bound_all = cursor_was_bound;
-                    return true;
+                    // Keep staging the same wanted sprite on later CRTCs.
+                    // The blocked CRTC retains its own full-state intent and
+                    // its event will retry it after retirement; returning here
+                    // would leave the remaining direct outputs on the old
+                    // sprite indefinitely.
+                    continue;
                 }
                 log::warn!(
                     "scanout_m2: direct cursor show failed on output {output_idx}: {error}; unflipping"

@@ -2363,7 +2363,7 @@ fn test_raw<T: ::drm::control::ResourceHandle>(value: u32) -> T {
 
 pub(super) struct CursorOnlyDirectPresentSetup {
     source_xid: u32,
-    window_xid: u32,
+    pub(super) window_xid: u32,
     width: u16,
     height: u16,
     crtc_id: u32,

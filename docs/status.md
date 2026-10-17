@@ -43,6 +43,20 @@ Cross-cutting bugs and followups that don't fit a stage live in
   copied/direct/unflip motion-delta assertions are not complete. See the
   appended Fix round 1 report; no hardware validation was run.
 
+- **2026-10-16 atomic-cursor-only A6 fix round 2:** Fixed deferred direct
+  cursor replacement fanout so a busy first CRTC no longer prevents later
+  outputs from staging the replacement. Added two-output Backend coverage,
+  direct-held and composed-unflip motion-delta checks, a Shared-scene accepted
+  state/EBUSY check, and an Async test that starts from an accepted hardware
+  cursor binding and checks detach, cursorless fallback and latest rebind. The
+  complete default and ignored workspace suites, ignored render-acceptance,
+  both clippy gates, formatting and layout passed under lavapipe. Remaining
+  evidence gaps are copied-route motion deltas; producer-specific reservation
+  failure injection/rollback mutations; the filtered-delta Async mutation (the
+  On-route Backend cursor operations are hardware no-ops); and a pre-scripted
+  accepted-binding EBUSY attempt. See Fix round 2 in the A6 report.
+  No hardware validation was run.
+
 - **2026-10-16 atomic-cursor-only A6 (implementation complete):** Cursor commits
   prepare full-state deltas from last accepted per-CRTC state. Scene, direct,
   copied, cursor-only and composed-unflip producers share reservation and
