@@ -296,13 +296,7 @@ impl PlatformBackend {
                                     })
                                 })
                         });
-                let (bo_idx, fb_id) = if let Some((bo_idx, fb_id)) = front {
-                    (Some(bo_idx), fb_id)
-                } else if let Some(fb_id) =
-                    self.output_power_executor.fallback_modeset_framebuffer()
-                {
-                    (None, fb_id)
-                } else {
+                let Some((bo_idx, fb_id)) = front else {
                     self.active_cursor_crtcs.remove(&cursor_key);
                     let error = io::Error::other(format!(
                         "dpms_set_outputs_active(true): no framebuffer for output {}; \
@@ -332,10 +326,7 @@ impl PlatformBackend {
                 } else {
                     modeset_crtcs.push(cursor_key);
                     self.active_cursor_crtcs.insert(cursor_key);
-                    if let (Some(bo_idx), Some(scanout)) = (
-                        bo_idx,
-                        self.scanout_pools.get_mut(i).and_then(Option::as_mut),
-                    ) {
+                    if let Some(scanout) = self.scanout_pools.get_mut(i).and_then(Option::as_mut) {
                         scanout.display_pool_mut().bos[bo_idx]
                             .state
                             .mark_on_screen_after_modeset();

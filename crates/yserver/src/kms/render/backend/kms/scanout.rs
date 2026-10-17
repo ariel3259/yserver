@@ -1354,77 +1354,18 @@ impl KmsBackend {
             return;
         }
 
-        // Backend fixtures inject the result of a completed M1 probe here,
-        // after direct-scanout eligibility and cache checks but before the
-        // fixture's synthetic output data reaches the DRM-only qualification
-        // path. Production always returns `None` and performs the full output
-        // tiling, dma-buf import, and atomic TEST_ONLY checks below.
-        if let Some(result) = self
-            .platform
-            .services
-            .scanout_probe_results
-            .take_result(source_id)
-        {
-            match result {
-                crate::drm::modeset::DirectScanoutTestResult::Accepted(framebuffer) => {
-                    let mut crtcs: Vec<_> = self
-                        .platform
-                        .outputs
-                        .iter()
-                        .map(|layout| layout.output.crtc)
-                        .collect();
-                    crtcs.sort_by_key(|crtc| u32::from(*crtc));
-                    let width = u32::from(candidate.src_width);
-                    let height = u32::from(candidate.src_height);
-                    self.pstate.scanout_m1.entries.insert(
-                        source_id,
-                        ScanoutM1ProbeEntry::accepted_with_shape(
-                            framebuffer,
-                            crate::drm::async_flip::AsyncShape {
-                                fourcc: 0x3432_5258,
-                                modifier: 0,
-                                pitch: width.saturating_mul(4),
-                                width,
-                                height,
-                                crtcs,
-                                direct: true,
-                            },
-                        ),
-                    );
-                    self.pstate.scanout_m0.m1_probe_pass =
-                        self.pstate.scanout_m0.m1_probe_pass.saturating_add(1);
-                }
-                crate::drm::modeset::DirectScanoutTestResult::Rejected(error) => {
-                    log::debug!(
-                        "scanout_m1: injected TEST_ONLY rejected source_id={}: {error}",
-                        source_id.as_u64(),
-                    );
-                    self.pstate
-                        .scanout_m1
-                        .entries
-                        .insert(source_id, ScanoutM1ProbeEntry::rejected());
-                    self.pstate.scanout_m0.m1_probe_reject =
-                        self.pstate.scanout_m0.m1_probe_reject.saturating_add(1);
-                }
-            }
-            return;
-        }
-
         let root = (u32::from(self.platform.fb_w), u32::from(self.platform.fb_h));
         let output_geometry: Vec<ScanoutM1OutputGeometry> = self
             .platform
             .outputs
             .iter()
-            .map(|layout| {
-                let (mode_width, mode_height) = layout.output.mode.size();
-                ScanoutM1OutputGeometry {
-                    x: layout.x,
-                    y: layout.y,
-                    width: u32::from(layout.width),
-                    height: u32::from(layout.height),
-                    mode_width: u32::from(mode_width),
-                    mode_height: u32::from(mode_height),
-                }
+            .map(|layout| ScanoutM1OutputGeometry {
+                x: layout.x,
+                y: layout.y,
+                width: u32::from(layout.width),
+                height: u32::from(layout.height),
+                mode_width: u32::from(layout.output.picked.width),
+                mode_height: u32::from(layout.output.picked.height),
             })
             .collect();
         if !scanout_m1_outputs_cover_root(root, &output_geometry) {
@@ -1443,51 +1384,37 @@ impl KmsBackend {
             return;
         }
 
-        let import = self.store.get(source_id).and_then(|drawable| {
-            let metadata = drawable.storage.imported_dmabuf.as_ref()?;
-            // An unresolved layout must never reach KMS. The client never
-            // named it (legacy `PixmapFromBuffer`), so `metadata.modifier`
-            // is our linear guess; scanning a tiled buffer out as linear
-            // puts garbage on the display, and `add_fb2` may well accept
-            // it. Refuse the direct path and let the ordinary composite
-            // handle the pixmap instead.
-            if metadata.implicit_layout {
-                return None;
+        let probe_source = match self
+            .platform
+            .services
+            .direct_scanout_test_only
+            .source(source_id, self.store.get(source_id))
+        {
+            Ok(Some(source)) => source,
+            Ok(None) => {
+                self.pstate.scanout_m0.m1_gate_reject_import = self
+                    .pstate
+                    .scanout_m0
+                    .m1_gate_reject_import
+                    .saturating_add(1);
+                return;
             }
-            let plane = metadata.planes.first()?;
-            let fd = drawable
-                .storage
-                .imported_drawable
-                .as_ref()?
-                .imported_dma_buf_fd()?;
-            Some((
-                metadata.fourcc,
-                metadata.vk_format,
-                metadata.modifier,
-                metadata.planes.len(),
-                plane.offset,
-                plane.pitch,
-                metadata.width,
-                metadata.height,
-                metadata.depth,
-                metadata.bpp,
-                fd.try_clone_to_owned(),
-            ))
-        });
-        let Some((
-            fourcc,
-            vk_format,
-            modifier,
-            plane_count,
-            offset,
-            pitch,
-            width,
-            height,
-            depth,
-            bpp,
-            fd_result,
-        )) = import
-        else {
+            Err(error) => {
+                log::warn!(
+                    "scanout_m1: source_id={} dma-buf source lookup failed: {error}",
+                    source_id.as_u64()
+                );
+                self.pstate
+                    .scanout_m1
+                    .entries
+                    .insert(source_id, ScanoutM1ProbeEntry::rejected());
+                self.pstate.scanout_m0.m1_probe_error =
+                    self.pstate.scanout_m0.m1_probe_error.saturating_add(1);
+                return;
+            }
+        };
+        let metadata = probe_source.metadata;
+        let Some(plane) = metadata.planes.first() else {
             self.pstate.scanout_m0.m1_gate_reject_import = self
                 .pstate
                 .scanout_m0
@@ -1495,6 +1422,16 @@ impl KmsBackend {
                 .saturating_add(1);
             return;
         };
+        let fourcc = metadata.fourcc;
+        let vk_format = metadata.vk_format;
+        let modifier = metadata.modifier;
+        let plane_count = metadata.planes.len();
+        let offset = plane.offset;
+        let pitch = plane.pitch;
+        let width = metadata.width;
+        let height = metadata.height;
+        let depth = metadata.depth;
+        let bpp = metadata.bpp;
         const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
         if fourcc != DRM_FORMAT_XRGB8888
             || vk_format != vk::Format::B8G8R8A8_UNORM
@@ -1525,22 +1462,7 @@ impl KmsBackend {
                 self.pstate.scanout_m0.m1_probe_reject.saturating_add(1);
             return;
         }
-        let fd = match fd_result {
-            Ok(fd) => fd,
-            Err(error) => {
-                log::warn!(
-                    "scanout_m1: source_id={} dma-buf dup failed: {error}",
-                    source_id.as_u64()
-                );
-                self.pstate
-                    .scanout_m1
-                    .entries
-                    .insert(source_id, ScanoutM1ProbeEntry::rejected());
-                self.pstate.scanout_m0.m1_probe_error =
-                    self.pstate.scanout_m0.m1_probe_error.saturating_add(1);
-                return;
-            }
-        };
+        let fd = probe_source.dma_buf;
         let plane_states: Vec<crate::drm::modeset::DirectScanoutPlaneState<'_>> = self
             .platform
             .outputs
@@ -1566,7 +1488,7 @@ impl KmsBackend {
         let cursor_updates = self
             .platform
             .preview_cursor_plane_updates_for_outputs(&output_indices);
-        let result = crate::drm::modeset::probe_direct_scanout_test_only(
+        let result = self.platform.services.direct_scanout_test_only.test_only(
             Rc::clone(&primary.device),
             fd.as_fd(),
             u32::from(width),

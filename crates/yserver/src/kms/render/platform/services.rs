@@ -1,6 +1,10 @@
 //! Construction-selected cursor, commit, and event operations for KMS.
 
-use std::{rc::Rc, time::Instant};
+use std::{
+    os::fd::{BorrowedFd, OwnedFd},
+    rc::Rc,
+    time::Instant,
+};
 
 use crate::{
     drm::{
@@ -25,23 +29,97 @@ use crate::{
     },
 };
 
-/// A probe result source keeps scanout qualification on the production path
-/// while allowing backend fixtures to supply the result of DRM `TEST_ONLY`.
-pub(crate) trait InjectedScanoutProbeResults {
-    fn take_result(
+/// The low-level DRM `TEST_ONLY` probe used after Backend validates the
+/// drawable metadata, output geometry, and cursor state. Tests replace only
+/// this device operation; probe eligibility and accepted-shape publication
+/// stay on the same Backend path.
+pub(crate) trait DirectScanoutTestOnlyExecutor {
+    fn source(
         &self,
         source_id: crate::kms::render::store::DrawableId,
-    ) -> Option<crate::drm::modeset::DirectScanoutTestResult>;
+        drawable: Option<&crate::kms::render::store::Drawable>,
+    ) -> std::io::Result<Option<DirectScanoutProbeSource>>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn test_only(
+        &self,
+        device: Rc<crate::drm::Device>,
+        dma_buf: BorrowedFd<'_>,
+        width: u32,
+        height: u32,
+        fourcc_code: u32,
+        modifier: u64,
+        offset: u64,
+        pitch: u32,
+        atomic_commit_sink: &crate::drm::atomic::AtomicCommitSink,
+        planes: &[crate::drm::modeset::DirectScanoutPlaneState<'_>],
+        cursor_updates: &[crate::kms::render::platform::cursor_state::CursorPlaneUpdate],
+    ) -> std::io::Result<crate::drm::modeset::DirectScanoutTestResult>;
 }
 
-pub(crate) struct NoInjectedScanoutProbeResults;
+pub(crate) struct DirectScanoutProbeSource {
+    pub(crate) metadata: yserver_render::kms::render::store::ImportedDmabufMetadata,
+    pub(crate) dma_buf: OwnedFd,
+}
 
-impl InjectedScanoutProbeResults for NoInjectedScanoutProbeResults {
-    fn take_result(
+pub(crate) struct DrmDirectScanoutTestOnlyExecutor;
+
+impl DirectScanoutTestOnlyExecutor for DrmDirectScanoutTestOnlyExecutor {
+    fn source(
         &self,
         _source_id: crate::kms::render::store::DrawableId,
-    ) -> Option<crate::drm::modeset::DirectScanoutTestResult> {
-        None
+        drawable: Option<&crate::kms::render::store::Drawable>,
+    ) -> std::io::Result<Option<DirectScanoutProbeSource>> {
+        let Some(drawable) = drawable else {
+            return Ok(None);
+        };
+        let Some(metadata) = drawable.storage.imported_dmabuf.as_ref() else {
+            return Ok(None);
+        };
+        if metadata.implicit_layout {
+            return Ok(None);
+        }
+        let Some(fd) = drawable
+            .storage
+            .imported_drawable
+            .as_ref()
+            .and_then(|image| image.imported_dma_buf_fd())
+        else {
+            return Ok(None);
+        };
+        Ok(Some(DirectScanoutProbeSource {
+            metadata: metadata.clone(),
+            dma_buf: fd.try_clone_to_owned()?,
+        }))
+    }
+
+    fn test_only(
+        &self,
+        device: Rc<crate::drm::Device>,
+        dma_buf: BorrowedFd<'_>,
+        width: u32,
+        height: u32,
+        fourcc_code: u32,
+        modifier: u64,
+        offset: u64,
+        pitch: u32,
+        atomic_commit_sink: &crate::drm::atomic::AtomicCommitSink,
+        planes: &[crate::drm::modeset::DirectScanoutPlaneState<'_>],
+        cursor_updates: &[crate::kms::render::platform::cursor_state::CursorPlaneUpdate],
+    ) -> std::io::Result<crate::drm::modeset::DirectScanoutTestResult> {
+        crate::drm::modeset::probe_direct_scanout_test_only(
+            device,
+            dma_buf,
+            width,
+            height,
+            fourcc_code,
+            modifier,
+            offset,
+            pitch,
+            atomic_commit_sink,
+            planes,
+            cursor_updates,
+        )
     }
 }
 
@@ -60,44 +138,66 @@ impl BackendEntryObserver for NoopBackendEntryObserver {
 
 #[cfg(test)]
 #[derive(Default)]
-pub(crate) struct RecordingScanoutProbeResults {
+pub(crate) struct RecordingDirectScanoutTestOnlyExecutor {
     results: std::cell::RefCell<
-        std::collections::HashMap<
-            crate::kms::render::store::DrawableId,
-            std::collections::VecDeque<crate::drm::modeset::DirectScanoutTestResult>,
-        >,
+        std::collections::VecDeque<crate::drm::modeset::DirectScanoutTestResult>,
+    >,
+    sources: std::cell::RefCell<
+        std::collections::HashMap<crate::kms::render::store::DrawableId, DirectScanoutProbeSource>,
     >,
 }
 
 #[cfg(test)]
-impl RecordingScanoutProbeResults {
-    pub(crate) fn queue_accepted(
+impl RecordingDirectScanoutTestOnlyExecutor {
+    pub(crate) fn queue_source(
         &self,
         source_id: crate::kms::render::store::DrawableId,
-        framebuffer: u32,
+        metadata: yserver_render::kms::render::store::ImportedDmabufMetadata,
+        dma_buf: OwnedFd,
     ) {
+        self.sources
+            .borrow_mut()
+            .insert(source_id, DirectScanoutProbeSource { metadata, dma_buf });
+    }
+
+    pub(crate) fn queue_accepted(&self, framebuffer: u32) {
         let framebuffer = ::drm::control::from_u32(framebuffer)
             .expect("synthetic direct-scanout FB handle is nonzero");
-        self.results
-            .borrow_mut()
-            .entry(source_id)
-            .or_default()
-            .push_back(crate::drm::modeset::DirectScanoutTestResult::Accepted(
+        self.results.borrow_mut().push_back(
+            crate::drm::modeset::DirectScanoutTestResult::Accepted(
                 crate::drm::modeset::DirectScanoutProbeFramebuffer::for_tests(framebuffer),
-            ));
+            ),
+        );
     }
 }
 
 #[cfg(test)]
-impl InjectedScanoutProbeResults for RecordingScanoutProbeResults {
-    fn take_result(
+impl DirectScanoutTestOnlyExecutor for RecordingDirectScanoutTestOnlyExecutor {
+    fn source(
         &self,
         source_id: crate::kms::render::store::DrawableId,
-    ) -> Option<crate::drm::modeset::DirectScanoutTestResult> {
-        self.results
-            .borrow_mut()
-            .get_mut(&source_id)
-            .and_then(std::collections::VecDeque::pop_front)
+        _drawable: Option<&crate::kms::render::store::Drawable>,
+    ) -> std::io::Result<Option<DirectScanoutProbeSource>> {
+        Ok(self.sources.borrow_mut().remove(&source_id))
+    }
+
+    fn test_only(
+        &self,
+        _device: Rc<crate::drm::Device>,
+        _dma_buf: BorrowedFd<'_>,
+        _width: u32,
+        _height: u32,
+        _fourcc_code: u32,
+        _modifier: u64,
+        _offset: u64,
+        _pitch: u32,
+        _atomic_commit_sink: &crate::drm::atomic::AtomicCommitSink,
+        _planes: &[crate::drm::modeset::DirectScanoutPlaneState<'_>],
+        _cursor_updates: &[crate::kms::render::platform::cursor_state::CursorPlaneUpdate],
+    ) -> std::io::Result<crate::drm::modeset::DirectScanoutTestResult> {
+        self.results.borrow_mut().pop_front().ok_or_else(|| {
+            std::io::Error::other("recording direct-scanout TEST_ONLY result was not queued")
+        })
     }
 }
 
@@ -136,7 +236,7 @@ pub struct KmsServices {
     pub(crate) hotplug: Rc<dyn DisplayHotplugSource>,
     pub(crate) connector_snapshot: Rc<dyn ConnectorSnapshotIo>,
     pub(crate) monotonic_clock: Rc<dyn Fn() -> Instant>,
-    pub(crate) scanout_probe_results: Rc<dyn InjectedScanoutProbeResults>,
+    pub(crate) direct_scanout_test_only: Rc<dyn DirectScanoutTestOnlyExecutor>,
     pub(crate) backend_entry_observer: Rc<dyn BackendEntryObserver>,
     pub(crate) test_recorders: Option<Rc<KmsTestRecorders>>,
 }
@@ -174,7 +274,7 @@ pub(crate) struct KmsTestRecorders {
     pub(crate) hotplug: Rc<RecordingDisplayHotplugSource>,
     pub(crate) connector_snapshot: Rc<RecordingConnectorSnapshotIo>,
     #[cfg(test)]
-    pub(crate) scanout_probe_results: Rc<RecordingScanoutProbeResults>,
+    pub(crate) direct_scanout_test_only: Rc<RecordingDirectScanoutTestOnlyExecutor>,
     #[cfg(test)]
     pub(crate) backend_entry_observer: Rc<RecordingBackendEntryObserver>,
 }
@@ -269,7 +369,7 @@ impl KmsServices {
             hotplug: Rc::new(DrmDisplayHotplugSource::new()),
             connector_snapshot: Rc::new(DrmConnectorSnapshotIo),
             monotonic_clock: Rc::new(Instant::now),
-            scanout_probe_results: Rc::new(NoInjectedScanoutProbeResults),
+            direct_scanout_test_only: Rc::new(DrmDirectScanoutTestOnlyExecutor),
             backend_entry_observer: Rc::new(NoopBackendEntryObserver),
             test_recorders: None,
         }
@@ -293,7 +393,7 @@ impl KmsServices {
         let hotplug =
             Rc::new(RecordingDisplayHotplugSource::new().expect("recording hotplug socket pair"));
         let connector_snapshot = Rc::new(RecordingConnectorSnapshotIo::new());
-        let scanout_probe_results = Rc::new(RecordingScanoutProbeResults::default());
+        let direct_scanout_test_only = Rc::new(RecordingDirectScanoutTestOnlyExecutor::default());
         let backend_entry_observer = Rc::new(RecordingBackendEntryObserver::default());
         let test_recorders = Rc::new(KmsTestRecorders {
             atomic: Rc::clone(&atomic),
@@ -307,7 +407,7 @@ impl KmsServices {
             page_flip_events: Rc::clone(&page_flip_events),
             hotplug: Rc::clone(&hotplug),
             connector_snapshot: Rc::clone(&connector_snapshot),
-            scanout_probe_results: Rc::clone(&scanout_probe_results),
+            direct_scanout_test_only: Rc::clone(&direct_scanout_test_only),
             backend_entry_observer: Rc::clone(&backend_entry_observer),
         });
         Self {
@@ -321,7 +421,7 @@ impl KmsServices {
             hotplug,
             connector_snapshot,
             monotonic_clock: Rc::new(Instant::now),
-            scanout_probe_results,
+            direct_scanout_test_only,
             backend_entry_observer,
             test_recorders: Some(test_recorders),
         }
@@ -351,7 +451,7 @@ impl KmsServices {
             hotplug,
             connector_snapshot: Rc::new(RecordingConnectorSnapshotIo::new()),
             monotonic_clock: Rc::new(Instant::now),
-            scanout_probe_results: Rc::new(NoInjectedScanoutProbeResults),
+            direct_scanout_test_only: Rc::new(DrmDirectScanoutTestOnlyExecutor),
             backend_entry_observer: Rc::new(NoopBackendEntryObserver),
             test_recorders: None,
         }

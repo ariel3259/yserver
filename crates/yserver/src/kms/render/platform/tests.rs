@@ -1946,7 +1946,7 @@ fn cursor_pending_move_starts_empty_and_unavailable_path_does_not_set_it() {
     let mut p = PlatformBackend::for_tests();
     assert_eq!(p.devices[0].cursor.pending_move, None);
     // Unavailable plane → Err return → pending stays None.
-    assert!(p.cursor_plane_move(100, 200, 0, 0).is_err());
+    assert!(p.cursor_plane_move(100, 200).is_err());
     assert_eq!(p.devices[0].cursor.pending_move, None);
     // Drain on empty slot is Ok(0) (early-exit before any
     // plane access). The path that returns Err is only the

@@ -3307,6 +3307,33 @@ fn hidden_cursor_allows_fullscreen_direct_scanout_without_unflip() {
 
     let direct = prepare_atomic_cursor_direct_present(&mut backend, 91);
     backend.pstate.scanout_m1.entries.remove(&direct.source_id);
+    backend
+        .platform
+        .services
+        .test_recorders
+        .as_ref()
+        .expect("fixture has recording direct-scanout service")
+        .direct_scanout_test_only
+        .queue_source(
+            direct.source_id,
+            yserver_render::kms::render::store::ImportedDmabufMetadata {
+                fourcc: u32::from_le_bytes(*b"XR24"),
+                vk_format: ash::vk::Format::B8G8R8A8_UNORM,
+                modifier: 0,
+                implicit_layout: false,
+                planes: vec![yserver_render::kms::render::store::ImportedDmabufPlane {
+                    offset: 0,
+                    pitch: 1600 * 4,
+                }],
+                width: 1599,
+                height: 600,
+                depth: 24,
+                bpp: 32,
+            },
+            std::fs::File::open("/dev/null")
+                .expect("open synthetic direct-scanout source fd")
+                .into(),
+        );
     Backend::note_present_scanout_candidate(&mut backend, direct.candidate);
     assert_eq!(
         backend.pstate.scanout_m0.m1_probe_reject, 1,

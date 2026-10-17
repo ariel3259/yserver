@@ -201,7 +201,7 @@ impl Platform for PlatformBackend {
             // Hardware and software cursor ownership may coexist on
             // arbitrary cards. Record/dispatch every visible HW plane
             // position and also repaint the SW outputs.
-            match b.platform.cursor_plane_move(cx, cy, hot_x, hot_y) {
+            match b.platform.cursor_plane_move(cx, cy) {
                 Ok(outcome) => {
                     b.handle_cursor_move_outcome(outcome);
                 }
@@ -226,7 +226,7 @@ impl Platform for PlatformBackend {
             // to (invisible on the screen it moved onto).
             b.scene.wake_for_damage();
         } else {
-            match b.platform.cursor_plane_move(cx, cy, hot_x, hot_y) {
+            match b.platform.cursor_plane_move(cx, cy) {
                 Ok(outcome) => {
                     b.handle_cursor_move_outcome(outcome);
                 }

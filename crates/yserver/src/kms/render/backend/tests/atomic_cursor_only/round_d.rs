@@ -6,18 +6,22 @@ fn create_cursor_with_pixel(
 ) -> yserver_core::backend::CursorHandle {
     use yserver_core::backend::{AnyHandle, Backend};
 
-    let source = Backend::create_pixmap(&mut fixture.backend, None, 32, 1, 1)
+    let source = Backend::create_pixmap(&mut fixture.backend, None, 32, 16, 16)
         .expect("create cursor source through Backend");
+    let mut pixels = Vec::with_capacity(16 * 16 * 4);
+    for _ in 0..16 * 16 {
+        pixels.extend_from_slice(&pixel);
+    }
     Backend::put_image(
         &mut fixture.backend,
         None,
         source.as_raw(),
         32,
-        1,
-        1,
+        16,
+        16,
         0,
         0,
-        &pixel,
+        &pixels,
     )
     .expect("write cursor source through Backend");
     let picture = Backend::render_create_picture(
@@ -30,14 +34,14 @@ fn create_cursor_with_pixel(
     )
     .expect("create cursor picture through Backend")
     .expect("cursor picture");
-    Backend::render_create_cursor(&mut fixture.backend, None, picture, 0, 0)
+    Backend::render_create_cursor(&mut fixture.backend, None, picture, 8, 8)
         .expect("create cursor through Backend")
         .expect("cursor handle")
 }
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: clear every empty primary-successor delta, including one projected from a pending image replacement.
+// Mutation: project replacement coordinates without converting them from the new hotspot to the accepted hotspot.
 fn atomic_cursor_only_stationary_replacement_survives_primary_successor() {
     use yserver_core::backend::Backend;
 
@@ -185,6 +189,11 @@ fn atomic_cursor_only_stationary_replacement_survives_primary_successor() {
     assert_eq!(
         state.applied.map(|binding| binding.lease),
         Some(prior.lease)
+    );
+    assert_eq!(
+        state.applied.map(|binding| (binding.x, binding.y)),
+        Some((100, 90)),
+        "the primary successor keeps the accepted sprite at the pointer position using its accepted hotspot",
     );
 
     fixture.retire_output(0, 51);

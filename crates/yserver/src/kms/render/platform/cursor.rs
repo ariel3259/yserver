@@ -550,8 +550,8 @@ impl PlatformBackend {
             && prior.lease != wanted.lease
         {
             next = Some(CursorBinding {
-                x: wanted.x,
-                y: wanted.y,
+                x: wanted.x + i32::from(wanted.hot_x) - i32::from(prior.hot_x),
+                y: wanted.y + i32::from(wanted.hot_y) - i32::from(prior.hot_y),
                 ..prior
             });
         }
@@ -1474,10 +1474,17 @@ impl PlatformBackend {
             .as_ref()
             .and_then(|plane| plane.candidate_sprite())
         {
+            // Upload acceptance switches the pixels and their hotspot as one
+            // identity. Preserve the pointer position while translating from
+            // the old hotspot used by this intent to the uploaded hotspot.
             for crtc_state in state.crtc_states.values_mut() {
                 if let Some(CursorIntent::Show(binding)) = crtc_state.intent.as_mut() {
+                    binding.x += i32::from(binding.hot_x) - i32::from(hot_x);
+                    binding.y += i32::from(binding.hot_y) - i32::from(hot_y);
                     binding.lease = lease;
                     binding.framebuffer = framebuffer;
+                    binding.hot_x = hot_x;
+                    binding.hot_y = hot_y;
                 }
             }
         }
@@ -1647,13 +1654,7 @@ impl PlatformBackend {
     /// # Errors
     /// `Err` only when the plane is unavailable; per-CRTC ioctl
     /// failures are logged + counted (EBUSY) or logged (other).
-    pub(crate) fn cursor_plane_move(
-        &mut self,
-        x: i32,
-        y: i32,
-        hot_x: u16,
-        hot_y: u16,
-    ) -> io::Result<CursorMoveOutcome> {
+    pub(crate) fn cursor_plane_move(&mut self, x: i32, y: i32) -> io::Result<CursorMoveOutcome> {
         let motion_timestamp = Instant::now();
         let mut aggregate = CursorMoveOutcome::default();
         let mut found = false;
@@ -1662,14 +1663,8 @@ impl PlatformBackend {
                 continue;
             }
             found = true;
-            let outcome = self.try_cursor_plane_move_for_device(
-                device_idx,
-                x,
-                y,
-                hot_x,
-                hot_y,
-                motion_timestamp,
-            )?;
+            let outcome =
+                self.try_cursor_plane_move_for_device(device_idx, x, y, motion_timestamp)?;
             aggregate.merge(outcome);
         }
         for device in &self.devices {
@@ -1729,8 +1724,6 @@ impl PlatformBackend {
         device_idx: usize,
         x: i32,
         y: i32,
-        hot_x: u16,
-        hot_y: u16,
         motion_timestamp: Instant,
     ) -> io::Result<CursorMoveOutcome> {
         let device_key = self.devices[device_idx].key;
@@ -1754,10 +1747,10 @@ impl PlatformBackend {
             let Some(crtc_state) = state.crtc_states.get(&crtc) else {
                 continue;
             };
-            // Motion updates the position of the newest show intent. In
-            // particular, keep its staged replacement lease instead of
-            // rebuilding it from the last accepted image. A pending detach
-            // also wins over motion and must remain a detach.
+            // Motion updates the position of the newest show intent. The
+            // binding's framebuffer and hotspot form one identity, so use
+            // that hotspot until an upload installs the matching replacement.
+            // Keep its staged lease; a pending detach also wins over motion.
             let binding = match crtc_state.intent {
                 Some(CursorIntent::Show(binding)) => binding,
                 Some(CursorIntent::Hide) => continue,
@@ -1775,13 +1768,12 @@ impl PlatformBackend {
             {
                 continue;
             }
-            let (cx, cy) = cursor_root_to_crtc_local(x, y, layout_x, layout_y, hot_x, hot_y);
+            let (cx, cy) =
+                cursor_root_to_crtc_local(x, y, layout_x, layout_y, binding.hot_x, binding.hot_y);
             if let Some(crtc_state) = state.crtc_states.get_mut(&crtc) {
                 crtc_state.intent = Some(CursorIntent::Show(CursorBinding {
                     x: cx,
                     y: cy,
-                    hot_x,
-                    hot_y,
                     ..binding
                 }));
                 crtc_state.intent_motion_timestamp = Some(motion_timestamp);

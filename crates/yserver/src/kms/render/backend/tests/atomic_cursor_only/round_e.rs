@@ -37,7 +37,7 @@ fn cursor_with_pixel(
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: return at the first blocked direct CRTC; the later CRTC must still stage and accept the replacement.
+// Mutation: coalesce a newer framebuffer into pending Shows without its hotspot; both the blocked retry and later CRTC must retain one sprite identity.
 fn atomic_cursor_only_deferred_direct_replacement_reaches_later_crtcs() {
     use yserver_core::backend::Backend;
 
@@ -204,6 +204,21 @@ fn atomic_cursor_only_deferred_direct_replacement_reaches_later_crtcs() {
         state1.applied.unwrap().lease,
         lease1,
         "the later CRTC accepts the replacement while CRTC zero waits",
+    );
+    assert_eq!(
+        (state0.intent.and_then(|intent| match intent {
+            crate::kms::render::platform::cursor_state::CursorIntent::Show(binding) => {
+                Some((binding.hot_x, binding.hot_y))
+            }
+            crate::kms::render::platform::cursor_state::CursorIntent::Hide => None,
+        })),
+        Some((0, 0)),
+        "the blocked replacement keeps its new hotspot with its staged sprite lease",
+    );
+    assert_eq!(
+        (state1.applied.unwrap().hot_x, state1.applied.unwrap().hot_y),
+        (0, 0),
+        "the later CRTC binds the replacement framebuffer with its own hotspot",
     );
     assert!(state1.intent.is_none());
     assert!(fixture.backend.pstate.scanout_m2.cursor_bound_all);

@@ -2362,12 +2362,12 @@ fn test_raw<T: ::drm::control::ResourceHandle>(value: u32) -> T {
 }
 
 pub(super) struct CursorOnlyDirectPresentSetup {
-    source_xid: u32,
+    pub(super) source_xid: u32,
     pub(super) window_xid: u32,
-    width: u16,
-    height: u16,
-    crtc_id: u32,
-    crtc_epoch: u64,
+    pub(super) width: u16,
+    pub(super) height: u16,
+    pub(super) crtc_id: u32,
+    pub(super) crtc_epoch: u64,
 }
 
 pub(super) fn setup_cursor_only_direct_present(
@@ -2440,6 +2440,7 @@ pub(super) fn setup_cursor_only_direct_present(
         .expect("Backend source pixmap is present in drawable store");
 
     let output = &mut fixture.backend.platform.outputs[0].output;
+    output.scanout_modifiers = vec![0];
     output.plane_fb_id_prop = test_raw(71);
     output.plane_crtc_id_prop = test_raw(72);
     output.plane_src_x_prop = test_raw(73);
@@ -2460,10 +2461,30 @@ pub(super) fn setup_cursor_only_direct_present(
     }
     fixture.backend.refresh_present_crtc_clock_epochs();
 
+    fixture.recorders.direct_scanout_test_only.queue_source(
+        source_id,
+        yserver_render::kms::render::store::ImportedDmabufMetadata {
+            fourcc: u32::from_le_bytes(*b"XR24"),
+            vk_format: ash::vk::Format::B8G8R8A8_UNORM,
+            modifier: 0,
+            implicit_layout: false,
+            planes: vec![yserver_render::kms::render::store::ImportedDmabufPlane {
+                offset: 0,
+                pitch: width.saturating_mul(4),
+            }],
+            width: u16::try_from(width).expect("test width fits metadata"),
+            height: u16::try_from(height).expect("test height fits metadata"),
+            depth: 24,
+            bpp: 32,
+        },
+        std::fs::File::open("/dev/null")
+            .expect("open synthetic probe fd")
+            .into(),
+    );
     fixture
         .recorders
-        .scanout_probe_results
-        .queue_accepted(source_id, 0x8100);
+        .direct_scanout_test_only
+        .queue_accepted(0x8100);
 
     let crtc_id = fixture
         .backend
@@ -5522,13 +5543,11 @@ fn atomic_cursor_only_headless_enable_disable_enable_retries_initialization() {
             .collect::<Vec<_>>(),
         vec![
             (true, output.connector, crtc, Some(synthetic_fb)),
-            (true, output.connector, crtc, Some(synthetic_fb)),
             (false, output.connector, crtc, None),
-            (true, output.connector, crtc, Some(synthetic_fb)),
             (true, output.connector, crtc, Some(synthetic_fb)),
             (false, output.connector, crtc, None),
         ],
-        "accepted modeset and DPMS commits must follow enable/disable/enable/disable order",
+        "each headless activation uses one connector modeset before its disable",
     );
     let atomic_records = fixture.recorders.atomic.records();
     let blocking_disables: Vec<_> = atomic_records
@@ -5554,8 +5573,8 @@ fn atomic_cursor_only_headless_enable_disable_enable_retries_initialization() {
         .collect();
     assert_eq!(
         mode_commits.len(),
-        4,
-        "each zero-output activation has a real modeset and relight"
+        2,
+        "each zero-output activation has one connector modeset"
     );
     let blobs: Vec<_> = fixture
         .recorders

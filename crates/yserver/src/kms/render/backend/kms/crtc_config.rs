@@ -1066,6 +1066,7 @@ impl KmsBackend {
         // the scene's `pending_acks` is fresh-empty for every output, so
         // the subsequent `wake_for_damage` tick is EBUSY-safe.
         let restore_old_on_failure = self.kms_outputs_active;
+        let had_outputs = !self.platform.outputs.is_empty();
         self.quiesce_before_topology_mutation("RANDR CRTC configuration changed")?;
 
         match mode {
@@ -1199,7 +1200,14 @@ impl KmsBackend {
             self.request_exit();
             return Err(relight.err().unwrap_or(error));
         }
-        self.relight_after_direct_teardown(desired_active, "RANDR CRTC configuration")?;
+        // Enabling the first connector from headless already modeset its
+        // framebuffer in `enable_connector`; there is no prior output set to
+        // restore. Other topology changes disabled existing routes first and
+        // must relight every surviving/new output from its scanout backing.
+        self.relight_after_direct_teardown(
+            desired_active && had_outputs,
+            "RANDR CRTC configuration",
+        )?;
         self.kms_outputs_active = desired_active;
 
         // Update input extent (cursor clamp) to reflect new fb size.
