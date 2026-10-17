@@ -119,6 +119,8 @@ VK_DRIVER_FILES=/home/ariel_santangelo/Projects/claude-scratch/yserver-pr1/lvp/l
 
 Expected: every command exits 0, clippy has no warnings, and ordinary/ignored suites have no failures; report capability skips explicitly. Check formatter changes and run the relevant targeted tests again only if formatting changed behavior-sensitive code. Stage only this task's named files and commit once with `git commit -m "feat: couple shared frame cursor handoffs to atomic submission"`. Do not batch this commit with the next task.
 
+- [ ] **Deferred from A6.** Add a fixture failure seam at the cursor-lease reservation boundary (scripted before the scenario) and Backend-driven regressions for Shared/composed-unflip reservation rollback and accepted-Shared-settlement failure; mutations: drop each rollback → leases/reservations do not return to zero.
+
 ## Task B3: Preserve copied-frame ownership across deferred submission
 
 **Files:**
@@ -148,6 +150,8 @@ VK_DRIVER_FILES=/home/ariel_santangelo/Projects/claude-scratch/yserver-pr1/lvp/l
 ```
 
 Expected: every command exits 0, clippy has no warnings, and ordinary/ignored suites have no failures; report capability skips explicitly. Check formatter changes and run the relevant targeted tests again only if formatting changed behavior-sensitive code. Stage only this task's named files and commit once with `git commit -m "feat: preserve copied frame cursor ownership until kms acceptance"`. Do not batch this commit with the next task.
+
+- [ ] **Deferred from A6.** Add a fixture hook delivering a second copied-render completion while the output is ready; assert the copied `SceneWithCursor` motion delta through Backend; mutation: omit the delta in `submit_copied_scanout`.
 
 ## Task B4: Route every HW-only producer into current intent
 
@@ -240,6 +244,8 @@ VK_DRIVER_FILES=/home/ariel_santangelo/Projects/claude-scratch/yserver-pr1/lvp/l
 ```
 
 Expected: every command exits 0, clippy has no warnings, and ordinary/ignored suites have no failures; report capability skips explicitly. Check formatter changes and run the relevant targeted tests again only if formatting changed behavior-sensitive code. Stage only this task's named files and commit once with `git commit -m "fix: retain cursor ownership across outputs and grouped commits"`. Do not batch this commit with the next task.
+
+- [ ] **Deferred from A6.** Assert the grouped direct-primary successor carries the motion delta; mutation: omit it in the direct successor producer.
 
 ## Task B7: Prove the #244 window-entry regression against master
 

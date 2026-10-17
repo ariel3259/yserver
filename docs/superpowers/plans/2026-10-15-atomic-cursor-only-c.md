@@ -335,6 +335,8 @@ VK_DRIVER_FILES=/home/ariel_santangelo/Projects/claude-scratch/yserver-pr1/lvp/l
 
 Expected: every command exits 0, clippy has no warnings, and ordinary/ignored suites have no failures; report capability skips explicitly. Check formatter changes and run the relevant targeted tests again only if formatting changed behavior-sensitive code. Stage only this task's named files and commit once with `git commit -m "refactor: remove legacy cursor ioctls and enforce atomic-only gate"`. Do not batch this commit with the next task.
 
+- [ ] **Deferred from A6.** Async audit: accepted-binding hidden-direct entry, and an accepted-binding EBUSY attempt with fault scripts preloaded before scenario entry; assert no cursor properties on Async and latest-intent rebind on exit.
+
 ## Task C11: Controller-led hardware validation with per-card user approval
 
 **Files:**
