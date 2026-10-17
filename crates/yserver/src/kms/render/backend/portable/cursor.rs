@@ -8,6 +8,11 @@ use yserver_core::backend::{
 };
 
 impl<P: Platform> XBackend<P> {
+    #[cfg(test)]
+    pub(crate) fn for_tests_set_next_cursor_version(&mut self, version: u64) {
+        self.next_cursor_version = version;
+    }
+
     /// Stage 3f.8: allocate the default cursor sprite (16×16 black
     /// triangle, hotspot (0,0)) as a Pixmap-kind Drawable + upload
     /// the pixel data via `engine.put_image`. Registers the result

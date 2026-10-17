@@ -1310,6 +1310,7 @@ pub(crate) mod tests_support {
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub(crate) struct AtomicCommitRecord {
+        pub(crate) device_fd: i32,
         pub(crate) flags: AtomicCommitFlags,
         pub(crate) kind: AtomicCommitKind,
         pub(crate) properties: Vec<AtomicPropertyUpdate>,
@@ -1347,18 +1348,21 @@ pub(crate) mod tests_support {
 
         fn atomic_commit(
             &self,
-            _device: &Device,
+            device: &Device,
             flags: AtomicCommitFlags,
             kind: AtomicCommitKind,
             request: AtomicCommitRequest,
             events: &[AtomicCommitEvent],
         ) -> io::Result<()> {
+            use std::os::fd::{AsFd as _, AsRawFd as _};
+
             let result = self
                 .scripted_results
                 .borrow_mut()
                 .pop_front()
                 .unwrap_or(ScriptedResult::Ok);
             self.records.borrow_mut().push(AtomicCommitRecord {
+                device_fd: device.as_fd().as_raw_fd(),
                 flags,
                 kind,
                 properties: request.properties,

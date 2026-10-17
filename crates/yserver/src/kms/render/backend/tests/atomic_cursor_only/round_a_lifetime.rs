@@ -63,6 +63,45 @@ fn framebuffer_storage(fixture: &AtomicCursorFixture, framebuffer: u32) -> (i32,
     (device_fd, handle, bytes)
 }
 
+fn framebuffer_storage_for_device(
+    fixture: &AtomicCursorFixture,
+    device_key: crate::platform::drm::DrmDeviceKey,
+    framebuffer: u32,
+) -> (i32, u32, Vec<u8>) {
+    use crate::kms::cursor_plane::ops::CursorBufferRecord;
+    use std::os::fd::{AsFd as _, AsRawFd as _};
+
+    let device_fd = fixture
+        .backend
+        .platform
+        .device_for_key(device_key)
+        .expect("output device")
+        .device
+        .as_fd()
+        .as_raw_fd();
+    let handle = fixture
+        .recorders
+        .cursor_buffer_ledger
+        .records()
+        .into_iter()
+        .find_map(|record| match record {
+            CursorBufferRecord::AddFb {
+                device_fd: recorded_fd,
+                handle,
+                fb,
+                ..
+            } if recorded_fd == device_fd && fb == framebuffer => Some(handle),
+            _ => None,
+        })
+        .expect("device-scoped cursor framebuffer has an AddFB2 record");
+    let bytes = fixture
+        .recorders
+        .cursor_buffer_ledger
+        .mapped_bytes(device_fd, handle)
+        .expect("device-scoped cursor framebuffer mapping remains live");
+    (device_fd, handle, bytes)
+}
+
 fn remove_fb_count(fixture: &AtomicCursorFixture, framebuffer: u32) -> usize {
     fixture
         .recorders
@@ -120,6 +159,63 @@ fn cursor_framebuffer_trace(fixture: &AtomicCursorFixture) -> Vec<(u32, u32)> {
         .collect()
 }
 
+fn cursor_framebuffer_trace_by_device(
+    fixture: &AtomicCursorFixture,
+) -> Vec<(crate::platform::drm::DrmDeviceKey, u32, u32)> {
+    use crate::drm::atomic::tests_support::ScriptedResult;
+    use std::os::fd::{AsFd as _, AsRawFd as _};
+
+    let targets: Vec<_> = fixture
+        .backend
+        .platform
+        .outputs
+        .iter()
+        .filter_map(|layout| {
+            let device = fixture
+                .backend
+                .platform
+                .device_for_key(layout.key.device_key)?;
+            let properties = device
+                .cursor
+                .plane
+                .as_ref()?
+                .properties_for(layout.output.crtc)?;
+            Some((
+                device.device.as_fd().as_raw_fd(),
+                layout.key.device_key,
+                properties.plane.into(),
+                properties.fb_id,
+                u32::from(layout.output.crtc),
+            ))
+        })
+        .collect();
+    fixture
+        .recorders
+        .atomic
+        .records()
+        .into_iter()
+        .filter(|record| record.result == ScriptedResult::Ok)
+        .flat_map(|record| {
+            let device_fd = record.device_fd;
+            let targets = &targets;
+            record.properties.into_iter().filter_map(move |update| {
+                targets
+                    .iter()
+                    .find(|(fd, _, plane, fb_id, _)| {
+                        *fd == device_fd && update.object == *plane && update.property == *fb_id
+                    })
+                    .map(|(_, device_key, _, _, crtc)| {
+                        (
+                            *device_key,
+                            *crtc,
+                            u32::try_from(update.value).expect("FB id fits u32"),
+                        )
+                    })
+            })
+        })
+        .collect()
+}
+
 fn cursor_binding(
     fixture: &AtomicCursorFixture,
     output_idx: usize,
@@ -153,17 +249,6 @@ fn settle_initial_two_output_cursor(fixture: &mut AtomicCursorFixture) {
     assert_eq!(fixture.backend.core.window_id, root);
 }
 
-fn settle_initial_single_output_cursor(fixture: &mut AtomicCursorFixture, first_frame: u32) {
-    use yserver_core::backend::Backend;
-
-    Backend::warp_pointer_root(&mut fixture.backend, &mut fixture.state, 100, 90);
-    damage_cursor_root(fixture);
-    Backend::maybe_composite(&mut fixture.backend).expect("submit initial cursor scene");
-    fixture.retire_output(0, first_frame);
-    fixture.retire_output(0, first_frame + 1);
-    assert!(fixture.backend.platform.cursor_plane_visible_for_output(0));
-}
-
 fn disable_and_drain(fixture: &mut AtomicCursorFixture, first_frame: u32) {
     use yserver_core::backend::Backend;
 
@@ -188,10 +273,12 @@ fn disable_and_drain(fixture: &mut AtomicCursorFixture, first_frame: u32) {
         }
         Backend::maybe_composite(&mut fixture.backend).expect("retry Backend cursor hide");
     }
-    fixture
-        .backend
-        .disable_output()
-        .expect("Backend lifecycle detach and output disable");
+    Backend::set_dpms_power(&mut fixture.backend, 3)
+        .expect("Backend DPMS entry disables outputs and detaches cursor planes");
+    assert!(
+        !fixture.backend.kms_outputs_active,
+        "Backend disabled outputs"
+    );
     fixture.assert_cursor_quiescent();
 }
 
@@ -419,51 +506,38 @@ fn atomic_cursor_only_shared_fb_survives_staggered_replacement() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: key a shared sprite lease by raw KMS handles without its DRM device.
+// Mutation: key shared sprite leases by raw KMS handles without their DRM device.
 fn atomic_cursor_only_identical_handles_are_scoped_to_each_device() {
     use yserver_core::backend::Backend;
 
-    let Some(mut first) = AtomicCursorFixture::new().expect("build first cursor device fixture")
+    let Some(mut fixture) = AtomicCursorFixture::new_with_colliding_device_handles()
+        .expect("build one two-device cursor backend with colliding handles")
     else {
         return;
     };
-    let Some(mut second) = AtomicCursorFixture::new().expect("build second cursor device fixture")
-    else {
-        return;
-    };
-    first
-        .backend
-        .platform
-        .for_tests_accept_output_power_commits();
-    second
+    fixture
         .backend
         .platform
         .for_tests_accept_output_power_commits();
 
     let first_pixels = [0x1a, 0x2b, 0x3c, 0xff];
-    let first_cursor = argb_cursor(&mut first, first_pixels, 0, 0);
-    let first_root = first.backend.core.window_id;
-    Backend::define_cursor(&mut first.backend, None, first_root, first_cursor.as_raw())
-        .expect("define first device cursor through Backend");
-    settle_initial_single_output_cursor(&mut first, 1);
+    let first_cursor = argb_cursor(&mut fixture, first_pixels, 0, 0);
+    let root = fixture.backend.core.window_id;
+    Backend::define_cursor(&mut fixture.backend, None, root, first_cursor.as_raw())
+        .expect("define cursor through Backend");
+    settle_initial_two_output_cursor(&mut fixture);
 
-    let second_pixels = [0x4d, 0x5e, 0x6f, 0xff];
-    let second_cursor = argb_cursor(&mut second, second_pixels, 0, 0);
-    let second_root = second.backend.core.window_id;
-    Backend::define_cursor(
-        &mut second.backend,
-        None,
-        second_root,
-        second_cursor.as_raw(),
-    )
-    .expect("define second device cursor through Backend");
-    settle_initial_single_output_cursor(&mut second, 1);
-
-    let first_binding = cursor_binding(&first, 0);
-    let second_binding = cursor_binding(&second, 0);
+    let first_binding = cursor_binding(&fixture, 0);
+    let second_binding = cursor_binding(&fixture, 1);
+    let first_key = fixture.backend.platform.outputs[0].key.device_key;
+    let second_key = fixture.backend.platform.outputs[1].key.device_key;
+    assert_ne!(
+        first_key, second_key,
+        "outputs belong to separate DRM devices"
+    );
     assert_eq!(
-        first.backend.platform.outputs[0].output.crtc,
-        second.backend.platform.outputs[0].output.crtc,
+        fixture.backend.platform.outputs[0].output.crtc,
+        fixture.backend.platform.outputs[1].output.crtc,
         "synthetic CRTC handles collide across the two DRM devices",
     );
     assert_eq!(
@@ -475,8 +549,23 @@ fn atomic_cursor_only_identical_handles_are_scoped_to_each_device() {
         "synthetic framebuffer handles collide across the two DRM devices",
     );
     assert_eq!(first_binding.lease, second_binding.lease);
-    let first_storage = framebuffer_storage(&first, first_binding.framebuffer);
-    let second_storage = framebuffer_storage(&second, second_binding.framebuffer);
+    for device_key in [first_key, second_key] {
+        let users = fixture
+            .backend
+            .platform
+            .device_for_key(device_key)
+            .expect("output device")
+            .cursor
+            .plane
+            .as_ref()
+            .expect("device cursor plane")
+            .sprite_user_count(first_binding.lease);
+        assert_eq!(users, Some(1), "each device owns its own F0 user");
+    }
+    let first_storage =
+        framebuffer_storage_for_device(&fixture, first_key, first_binding.framebuffer);
+    let second_storage =
+        framebuffer_storage_for_device(&fixture, second_key, second_binding.framebuffer);
     assert_ne!(
         first_storage.0, second_storage.0,
         "device fds remain distinct"
@@ -486,24 +575,131 @@ fn atomic_cursor_only_identical_handles_are_scoped_to_each_device() {
         "dumb-buffer handles collide"
     );
     assert_eq!(&first_storage.2[..4], &first_pixels);
-    assert_eq!(&second_storage.2[..4], &second_pixels);
+    assert_eq!(&second_storage.2[..4], &first_pixels);
 
-    disable_and_drain(&mut first, 5);
-    disable_and_drain(&mut second, 5);
-    assert_eq!(
-        cursor_framebuffer_trace(&first),
-        vec![(1, first_binding.framebuffer), (1, 0), (1, 0)],
+    // Let the first device accept F1 while the second keeps its scene event
+    // pending. The equal raw FB id must still name separate allocations.
+    damage_cursor_root(&mut fixture);
+    Backend::maybe_composite(&mut fixture.backend).expect("submit two-device predecessor");
+    fixture.retire_output(0, 5);
+    assert!(fixture.backend.scene.has_pending_page_flip(1));
+    let replacement_pixels = [0x4d, 0x5e, 0x6f, 0xff];
+    let replacement = argb_cursor(&mut fixture, replacement_pixels, 0, 0);
+    Backend::define_cursor(&mut fixture.backend, None, root, replacement.as_raw())
+        .expect("define replacement through Backend");
+    damage_cursor_root(&mut fixture);
+    Backend::maybe_composite(&mut fixture.backend).expect("submit first-device replacement");
+    fixture.retire_output(0, 6);
+    let first_replacement = cursor_binding(&fixture, 0);
+    assert_ne!(first_replacement.framebuffer, first_binding.framebuffer);
+    assert_eq!(cursor_binding(&fixture, 1), second_binding);
+    assert!(
+        fixture
+            .backend
+            .platform
+            .cursor_atomic_event_pending_for_output(0)
     );
     assert_eq!(
-        cursor_framebuffer_trace(&second),
-        vec![(1, second_binding.framebuffer), (1, 0), (1, 0)],
+        &framebuffer_storage_for_device(&fixture, first_key, first_replacement.framebuffer).2[..4],
+        &replacement_pixels,
     );
-    let first_ledger = std::rc::Rc::clone(&first.recorders.cursor_buffer_ledger);
-    let second_ledger = std::rc::Rc::clone(&second.recorders.cursor_buffer_ledger);
-    drop(first);
-    drop(second);
-    assert_eq!(first_ledger.end_state(), (0, 0, 0));
-    assert_eq!(second_ledger.end_state(), (0, 0, 0));
+    assert_eq!(
+        &framebuffer_storage_for_device(&fixture, second_key, first_replacement.framebuffer).2[..4],
+        &[0; 4],
+        "the second device's colliding FB id keeps its own untouched bytes",
+    );
+
+    fixture.retire_output(0, 7);
+    assert!(fixture.backend.scene.has_pending_page_flip(1));
+    assert_eq!(
+        fixture
+            .backend
+            .platform
+            .device_for_key(first_key)
+            .unwrap()
+            .cursor
+            .plane
+            .as_ref()
+            .unwrap()
+            .sprite_user_count(first_binding.lease),
+        Some(0),
+        "A's event retires only the first device's F0 user",
+    );
+    assert_eq!(
+        fixture
+            .backend
+            .platform
+            .device_for_key(second_key)
+            .unwrap()
+            .cursor
+            .plane
+            .as_ref()
+            .unwrap()
+            .sprite_user_count(second_binding.lease),
+        Some(1),
+        "B's old framebuffer user remains on the second device",
+    );
+
+    fixture.retire_output(1, 7);
+    let mut second_replacement_event = false;
+    for frame in 8..24 {
+        Backend::maybe_composite(&mut fixture.backend).expect("retry second-device replacement");
+        let binding = cursor_binding(&fixture, 1);
+        if binding.lease == first_replacement.lease
+            && fixture
+                .backend
+                .platform
+                .cursor_atomic_event_pending_for_output(1)
+        {
+            second_replacement_event = true;
+            break;
+        }
+        if fixture.backend.scene.has_pending_page_flip(1)
+            || fixture
+                .backend
+                .platform
+                .cursor_atomic_event_pending_for_output(1)
+        {
+            fixture.retire_output(1, frame);
+        }
+    }
+    assert!(
+        second_replacement_event,
+        "second device accepts its own replacement"
+    );
+    fixture.retire_output(1, 24);
+    assert_eq!(cursor_binding(&fixture, 1).lease, first_replacement.lease);
+
+    disable_and_drain(&mut fixture, 25);
+    assert_eq!(
+        cursor_framebuffer_trace_by_device(&fixture)
+            .into_iter()
+            .filter(|(key, _, _)| *key == first_key)
+            .map(|(_, crtc, fb)| (crtc, fb))
+            .collect::<Vec<_>>(),
+        vec![
+            (1, first_binding.framebuffer),
+            (1, first_replacement.framebuffer),
+            (1, 0),
+            (1, 0),
+        ],
+    );
+    assert_eq!(
+        cursor_framebuffer_trace_by_device(&fixture)
+            .into_iter()
+            .filter(|(key, _, _)| *key == second_key)
+            .map(|(_, crtc, fb)| (crtc, fb))
+            .collect::<Vec<_>>(),
+        vec![
+            (1, second_binding.framebuffer),
+            (1, first_replacement.framebuffer),
+            (1, 0),
+            (1, 0),
+        ],
+    );
+    let ledger = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
+    drop(fixture);
+    assert_eq!(ledger.end_state(), (0, 0, 0));
 }
 
 #[test]
@@ -530,6 +726,8 @@ fn atomic_cursor_only_pool_pressure_keeps_only_newest_animation() {
     settle_initial_two_output_cursor(&mut fixture);
     let f0_binding_a = cursor_binding(&fixture, 0);
     let f0_binding_b = cursor_binding(&fixture, 1);
+    let f0_bytes_initial = framebuffer_storage(&fixture, f0_binding_a.framebuffer).2;
+    assert_eq!(&f0_bytes_initial[..4], &f0_pixels);
     assert_eq!(f0_binding_a.lease, f0_binding_b.lease);
     assert_eq!(
         fixture
@@ -573,14 +771,9 @@ fn atomic_cursor_only_pool_pressure_keeps_only_newest_animation() {
     );
     fixture.retire_output(0, 7);
     assert_eq!(
-        fixture.backend.platform.devices[0]
-            .cursor
-            .plane
-            .as_ref()
-            .unwrap()
-            .sprite_user_count(f0_binding_a.lease),
-        Some(1),
-        "A retires first; only B's old F0 user remains",
+        framebuffer_storage(&fixture, f0_binding_a.framebuffer).2,
+        f0_bytes_initial,
+        "A's retirement does not rewrite F0 while B still displays it",
     );
     assert!(fixture.backend.scene.has_pending_page_flip(1));
 
@@ -632,18 +825,11 @@ fn atomic_cursor_only_pool_pressure_keeps_only_newest_animation() {
     );
     let f2_binding = cursor_binding(&fixture, 1);
     assert_ne!(f2_binding.lease, f1_binding.lease);
-    let plane = fixture.backend.platform.devices[0]
-        .cursor
-        .plane
-        .as_ref()
-        .expect("per-device sprite pool");
-    for lease in [f0_binding_a.lease, f1_binding.lease, f2_binding.lease] {
-        assert_eq!(
-            plane.sprite_user_count(lease),
-            Some(1),
-            "all three pool slots have a live user"
-        );
-    }
+    assert_eq!(
+        framebuffer_storage(&fixture, f0_binding_a.framebuffer).2,
+        f0_bytes_initial,
+        "B's accepted replacement still retains its old F0 bytes until the event",
+    );
     let initial_sprite_fbs: Vec<_> = fixture
         .recorders
         .cursor_buffer_ledger
@@ -673,7 +859,7 @@ fn atomic_cursor_only_pool_pressure_keeps_only_newest_animation() {
         "N=2 CRTCs cap the pool at max(2, N+1)=3 sprite buffers",
     );
 
-    let f0_before = framebuffer_storage(&fixture, f0_binding_a.framebuffer).2;
+    let f0_before = f0_bytes_initial;
     let f1_before = framebuffer_storage(&fixture, f1_binding.framebuffer).2;
     let f2_before = framebuffer_storage(&fixture, f2_binding.framebuffer).2;
     assert_eq!(&f0_before[..4], &f0_pixels);
@@ -702,19 +888,6 @@ fn atomic_cursor_only_pool_pressure_keeps_only_newest_animation() {
             .platform
             .cursor_atomic_event_pending_for_output(1)
     );
-    let plane = fixture.backend.platform.devices[0]
-        .cursor
-        .plane
-        .as_ref()
-        .unwrap();
-    for lease in [f0_binding_a.lease, f1_binding.lease, f2_binding.lease] {
-        assert!(
-            plane
-                .sprite_user_count(lease)
-                .is_some_and(|users| users > 0),
-            "each original slot remains in use while B's event is withheld",
-        );
-    }
     damage_cursor_root(&mut fixture);
     Backend::maybe_composite(&mut fixture.backend).expect("submit newest animation image attempt");
     let intermediate = drive_animation_to_next_frame(&mut fixture, animation.as_raw());
@@ -769,6 +942,11 @@ fn atomic_cursor_only_pool_pressure_keeps_only_newest_animation() {
         (f1_binding.lease, f1_binding.framebuffer, f1_before),
         (f2_binding.lease, f2_binding.framebuffer, f2_before),
     ] {
+        let actual = framebuffer_storage(&fixture, framebuffer).2;
+        assert_eq!(
+            actual, bytes,
+            "busy framebuffer is immutable under animation pressure"
+        );
         assert!(
             fixture.backend.platform.devices[0]
                 .cursor
@@ -779,11 +957,6 @@ fn atomic_cursor_only_pool_pressure_keeps_only_newest_animation() {
                 .is_some_and(|users| users > 0),
             "lease version {} stays user-owned through pressure",
             lease.version(),
-        );
-        let actual = framebuffer_storage(&fixture, framebuffer).2;
-        assert_eq!(
-            actual, bytes,
-            "busy framebuffer is immutable under animation pressure"
         );
     }
     assert_eq!(
@@ -944,35 +1117,11 @@ fn atomic_cursor_only_hotspot_only_switches_framebuffer() {
     let root = fixture.backend.core.window_id;
     let pixels = [0x5a, 0x6b, 0x7c, 0xff];
     let original = argb_cursor(&mut fixture, pixels, 0, 0);
-    let changed_hotspot = argb_cursor(&mut fixture, pixels, 1, 1);
-    let original_version = fixture.backend.cursor_records[&original.as_raw()].version;
-    let changed_record =
-        fixture.backend.cursor_records[&changed_hotspot.as_raw()].with_version(original_version);
-    fixture
-        .backend
-        .cursor_records
-        .insert(changed_hotspot.as_raw(), changed_record);
-    assert_eq!(
-        fixture.backend.cursor_records[&original.as_raw()].version,
-        fixture.backend.cursor_records[&changed_hotspot.as_raw()].version,
-        "the input differs only by hotspot while retaining one prepared image version",
-    );
-    assert_eq!(
-        fixture.backend.cursor_records[&original.as_raw()].bgra_bytes,
-        fixture.backend.cursor_records[&changed_hotspot.as_raw()].bgra_bytes,
-    );
-    assert_ne!(
-        (
-            fixture.backend.cursor_records[&original.as_raw()].hot_x,
-            fixture.backend.cursor_records[&original.as_raw()].hot_y,
-        ),
-        (
-            fixture.backend.cursor_records[&changed_hotspot.as_raw()].hot_x,
-            fixture.backend.cursor_records[&changed_hotspot.as_raw()].hot_y,
-        ),
-    );
     Backend::define_cursor(&mut fixture.backend, None, root, original.as_raw())
         .expect("define original cursor through Backend");
+    let original_image = Backend::get_active_cursor_image(&fixture.backend)
+        .expect("Backend reports active original cursor");
+    let original_version = u64::from(original_image.serial);
     Backend::warp_pointer_root(&mut fixture.backend, &mut fixture.state, 100, 90);
     damage_cursor_root(&mut fixture);
     Backend::maybe_composite(&mut fixture.backend).expect("submit initial cursor");
@@ -981,8 +1130,27 @@ fn atomic_cursor_only_hotspot_only_switches_framebuffer() {
     let prior = cursor_binding(&fixture, 0);
     let prior_bytes = framebuffer_storage(&fixture, prior.framebuffer).2;
 
+    // This test-only version seam supplies an equal image identity through
+    // the Backend cursor creation path; production cursor records remain
+    // monotonically versioned.
+    fixture
+        .backend
+        .for_tests_set_next_cursor_version(original_version);
+    let changed_hotspot = argb_cursor(&mut fixture, pixels, 1, 1);
     Backend::define_cursor(&mut fixture.backend, None, root, changed_hotspot.as_raw())
-        .expect("define hotspot-only cursor through Backend");
+        .expect("define equal-version hotspot change through Backend");
+    let changed_image = Backend::get_active_cursor_image(&fixture.backend)
+        .expect("Backend reports active changed-hotspot cursor");
+    assert_eq!(
+        original_image.serial, changed_image.serial,
+        "the input differs only by hotspot while retaining one prepared image version",
+    );
+    assert_eq!(original_image.bgra_bytes, changed_image.bgra_bytes);
+    assert_ne!(
+        (original_image.hot_x, original_image.hot_y),
+        (changed_image.hot_x, changed_image.hot_y),
+    );
+
     damage_cursor_root(&mut fixture);
     let records_before = fixture.recorders.atomic.records().len();
     Backend::maybe_composite(&mut fixture.backend).expect("submit hotspot-only replacement");

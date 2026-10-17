@@ -564,7 +564,7 @@ pub(crate) struct RecordingCursorBufferIo {
     ledger: Rc<CursorBufferLedger>,
     next_handle: RefCell<u32>,
     next_fb: RefCell<u32>,
-    framebuffer_devices: RefCell<HashMap<u32, i32>>,
+    framebuffer_devices: RefCell<HashSet<(i32, u32)>>,
     pitch_alignment: u32,
 }
 
@@ -577,11 +577,22 @@ impl RecordingCursorBufferIo {
                 ledger: Rc::clone(&ledger),
                 next_handle: RefCell::new(1),
                 next_fb: RefCell::new(100),
-                framebuffer_devices: RefCell::new(HashMap::new()),
+                framebuffer_devices: RefCell::new(HashSet::new()),
                 pitch_alignment: pitch_alignment.max(1),
             },
             ledger,
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_shared_ledger(ledger: Rc<CursorBufferLedger>, pitch_alignment: u32) -> Self {
+        Self {
+            ledger,
+            next_handle: RefCell::new(1),
+            next_fb: RefCell::new(100),
+            framebuffer_devices: RefCell::new(HashSet::new()),
+            pitch_alignment: pitch_alignment.max(1),
+        }
     }
 }
 
@@ -687,7 +698,7 @@ impl CursorBufferIo for RecordingCursorBufferIo {
             .live_framebuffers
             .borrow_mut()
             .insert((fd, raw_fb));
-        self.framebuffer_devices.borrow_mut().insert(raw_fb, fd);
+        self.framebuffer_devices.borrow_mut().insert((fd, raw_fb));
         self.ledger
             .records
             .borrow_mut()
@@ -729,7 +740,7 @@ impl CursorBufferIo for RecordingCursorBufferIo {
     fn remove_framebuffer(&self, device: &Device, fb: framebuffer::Handle) -> io::Result<()> {
         let fd = device.as_fd().as_raw_fd();
         let raw_fb = u32::from(fb);
-        if self.framebuffer_devices.borrow_mut().remove(&raw_fb) != Some(fd)
+        if !self.framebuffer_devices.borrow_mut().remove(&(fd, raw_fb))
             || !self
                 .ledger
                 .live_framebuffers

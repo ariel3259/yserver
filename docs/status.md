@@ -90,6 +90,24 @@ Cross-cutting bugs and followups that don't fit a stage live in
   file was also counted directly. Hardware validation remains with controller
   Task C11; no hardware was used here.
 
+- **2026-10-17 atomic-cursor-only A7 fix round 1:** Cleanup now enters through
+  `Backend` cursor hide/event handling and successful DPMS disable. The
+  colliding-handle scenario uses one two-device `KmsBackend`; its recorder
+  distinguishes device fds while both devices reuse CRTC, plane, framebuffer,
+  and dumb-buffer numbers, and checks per-device bytes, retirement, commit
+  traces, and zero allocations at teardown. The hotspot test creates equal
+  image versions through a test-only cursor-version seam and still changes the
+  binding through Backend entries. Removed the empty `round_f_lifetime.rs`;
+  `tools/check-layout.sh` now skips tracked paths deleted in the working tree,
+  so its gate remains usable before the controller commits the deletion. All
+  six requested mutations failed their byte/trace assertions and were reverted.
+  The four new tests passed 20/20 each under 16 CPU busy loops. Build, default
+  and complete ignored workspace suites, render-acceptance default/ignored,
+  both clippy gates, nightly/stable formatting, and layout passed. Stable
+  rustfmt printed only its configured nightly-option notices. The lifetime
+  test file is 1,226 lines, below its 6,000-line ceiling. No hardware was used;
+  hardware validation remains with controller Task C11.
+
 The repository-wide code-quality and technical-debt review from 2026-07-26
 lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
