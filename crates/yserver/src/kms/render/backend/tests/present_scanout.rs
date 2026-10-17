@@ -2972,7 +2972,7 @@ fn cursor_einval_rejection_keeps_prior_atomic_binding() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-// Mutation: leave cursor CRTCs out of pending_pageflip_crtcs during RANDR quiesce.
+// Mutation: omit the accepted post-RandR composed receipt.
 fn randr_change_discards_cursor_flip_and_blocks_direct_until_primary_receipt() {
     use yserver_core::backend::Backend;
 
@@ -2980,6 +2980,20 @@ fn randr_change_discards_cursor_flip_and_blocks_direct_until_primary_receipt() {
         return;
     };
     backend.platform.for_tests_accept_output_power_commits();
+    for (output_idx, layout) in backend.platform.outputs.iter_mut().enumerate() {
+        let base = 71 + u32::try_from(output_idx).expect("output index fits") * 16;
+        let property = |offset| atomic_cursor_raw(base + offset);
+        layout.output.plane_fb_id_prop = property(0);
+        layout.output.plane_crtc_id_prop = property(1);
+        layout.output.plane_src_x_prop = property(2);
+        layout.output.plane_src_y_prop = property(3);
+        layout.output.plane_src_w_prop = property(4);
+        layout.output.plane_src_h_prop = property(5);
+        layout.output.plane_crtc_x_prop = property(6);
+        layout.output.plane_crtc_y_prop = property(7);
+        layout.output.plane_crtc_w_prop = property(8);
+        layout.output.plane_crtc_h_prop = property(9);
+    }
     let recorder = atomic_cursor_recording_sink(&mut backend);
     let mut state = yserver_core::server::ServerState::new();
     Backend::set_cursor_hidden(&mut backend, false);
@@ -3071,10 +3085,6 @@ fn randr_change_discards_cursor_flip_and_blocks_direct_until_primary_receipt() {
         .find(|output| output.name == connector)
         .expect("second output in RandR projection")
         .output_id;
-    // Keep the topology dark through this test boundary. The fixture has no
-    // scanout framebuffer to re-light, and this test is about old-event
-    // ownership across the RandR transition.
-    backend.kms_outputs_active = false;
     assert!(
         Backend::apply_crtc_config(&mut backend, output_id, &connector, None, 0, 0,)
             .expect("disable second output through the topology entry point")
@@ -3092,35 +3102,115 @@ fn randr_change_discards_cursor_flip_and_blocks_direct_until_primary_receipt() {
             .platform
             .for_tests_atomic_cursor_commit_is_in_flight(position.device_key, position.crtc)
     );
-    backend.kms_outputs_active = true;
 
-    let direct = prepare_atomic_cursor_direct_present_with_extent(&mut backend, 84, 800, 600);
-    assert!(
-        !Backend::try_present_direct(&mut backend, direct.candidate, direct.event,)
-            .expect("post-RandR direct admission without retained primary receipt"),
-        "RandR invalidates the receipt until a cursorless composed primary is accepted",
-    );
-    assert!(!backend.scene.direct_scanout_primary_ready());
-    assert_eq!(recorder.records().len(), 1);
+    let before_post_randr_compose = recorder.records().len();
+    let root = backend.core.window_id;
+    Backend::clear_area(&mut backend, None, root, 0, None, 0, 0, 800, 600, (0, 0))
+        .expect("damage the retained output through Backend after RandR");
+    Backend::maybe_composite(&mut backend).expect("submit a fresh composed primary after RandR");
+    assert!(backend.scene.has_pending_page_flip(0));
+    let composed_receipt = backend
+        .scene
+        .for_tests_cursor_commit_receipt(0)
+        .expect("accepted post-RandR composed receipt");
+    assert!(composed_receipt.frame.is_some());
     assert_eq!(
-        recorder.records()[0].kind,
-        crate::drm::atomic::AtomicCommitKind::CursorOnly,
+        composed_receipt.primary_cursor,
+        crate::kms::render::scene::CursorPrimaryContent::Cursorless,
+        "the new retained primary is safe for direct scanout",
     );
+    assert_eq!(
+        recorder.records().len(),
+        before_post_randr_compose + 1,
+        "RandR recovery accepts exactly one fresh composed frame",
+    );
+    assert_eq!(
+        recorder.records()[before_post_randr_compose].kind,
+        crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+        "the fresh primary is accepted through the composed scene path",
+    );
+    for frame in 52..60 {
+        Backend::maybe_composite(&mut backend).expect("settle post-RandR cursor intent");
+        if !backend.scene.has_pending_page_flip(0)
+            && !backend.platform.cursor_atomic_event_pending_for_output(0)
+        {
+            break;
+        }
+        retire_atomic_cursor_test_output(&mut backend, &mut state, 0, frame);
+    }
+    assert!(!backend.scene.has_pending_page_flips());
+    assert!(backend.scene.direct_scanout_primary_ready());
+
+    let direct = prepare_atomic_cursor_direct_present_with_live_storage(&mut backend, 84, 800, 600);
+    let before_direct_submit = recorder.records().len();
+    assert!(
+        Backend::try_present_direct(&mut backend, direct.candidate, direct.event,)
+            .expect("post-RandR direct admission after a fresh retained primary receipt"),
+        "a fresh cursorless composed receipt restores direct admission",
+    );
+    assert!(backend.pstate.scanout_m2.pending.is_some());
+    assert!(backend.pstate.scanout_m2.active());
+    assert!(!backend.scene.has_pending_page_flips());
+    assert_eq!(recorder.records().len(), before_direct_submit + 1);
+    let direct_records = recorder.records();
+    let direct_record = direct_records.last().unwrap();
+    assert_eq!(
+        direct_record.kind,
+        crate::drm::atomic::AtomicCommitKind::Scene,
+        "direct admission submits the accepted source after the composed receipt",
+    );
+    let output = &backend.platform.outputs[0].output;
+    let primary_fb_property = output.plane_fb_id_prop;
+    assert!(
+        direct_record.properties.iter().any(|update| {
+            update.object == output.plane.into()
+                && update.property == primary_fb_property
+                && update.value == u64::from(0x8100_u32 + 84)
+        }),
+        "direct transaction omitted expected FB_ID 0x{:x}: {:?}",
+        0x8100_u32 + 84,
+        direct_record.properties
+    );
+
+    retire_atomic_cursor_direct_frame(&mut backend, &mut state, 53);
+    assert!(backend.pstate.scanout_m2.pending.is_none());
+    assert!(backend.pstate.scanout_m2.current.is_some());
+    assert!(backend.pstate.scanout_m2.hold_direct);
+    for frame in 54..60 {
+        if !backend.platform.cursor_atomic_event_pending_for_output(0) {
+            break;
+        }
+        retire_atomic_cursor_test_output(&mut backend, &mut state, 0, frame);
+    }
     assert_eq!(event_source.queued_flip_count(), 0);
+    assert!(!backend.scene.has_pending_page_flips());
+    assert!(!backend.platform.cursor_atomic_event_pending_for_output(0));
+    backend.platform.wait_idle_bounded();
+    let completed = Backend::drain_completed_present_events(&mut backend);
+    assert!(completed.iter().any(|event| event.present_id == 84));
+    let _ = Backend::drain_retired_present_idle_events(&mut backend);
+
+    Backend::set_dpms_power(&mut backend, 3).expect("Backend teardown drains direct scanout");
+    let _ = Backend::drain_completed_present_events(&mut backend);
+    let _ = Backend::drain_retired_present_idle_events(&mut backend);
+    assert!(!backend.pstate.scanout_m2.active());
     assert!(backend.pstate.scanout_m2.pending.is_none());
     assert!(backend.pstate.scanout_m2.current.is_none());
     assert!(backend.pstate.scanout_m2.queued_successor.is_none());
-    assert!(
-        !backend
+    assert!(!backend.scene.has_pending_page_flips());
+    assert_eq!(event_source.queued_flip_count(), 0);
+    assert_atomic_cursor_quiescent(&backend);
+    let ledger = std::rc::Rc::clone(
+        &backend
             .platform
-            .for_tests_atomic_cursor_commit_is_in_flight(position.device_key, position.crtc)
+            .services
+            .test_recorders
+            .as_ref()
+            .unwrap()
+            .cursor_buffer_ledger,
     );
-    assert!(
-        backend
-            .platform
-            .for_tests_atomic_cursor_pending_position(position.device_key, position.crtc)
-            .is_none()
-    );
+    drop(backend);
+    assert_eq!(ledger.end_state(), (0, 0, 0));
 }
 
 fn prepare_atomic_cursor_direct_present(
@@ -3136,7 +3226,16 @@ fn prepare_atomic_cursor_direct_present_with_extent(
     width: u16,
     height: u16,
 ) -> AtomicCursorDirectPresent {
-    prepare_atomic_cursor_direct_present_on_target(backend, present_id, width, height, None)
+    prepare_atomic_cursor_direct_present_on_target(backend, present_id, width, height, None, false)
+}
+
+fn prepare_atomic_cursor_direct_present_with_live_storage(
+    backend: &mut KmsBackend,
+    present_id: u64,
+    width: u16,
+    height: u16,
+) -> AtomicCursorDirectPresent {
+    prepare_atomic_cursor_direct_present_on_target(backend, present_id, width, height, None, true)
 }
 
 fn prepare_atomic_cursor_direct_present_for_target(
@@ -3144,7 +3243,14 @@ fn prepare_atomic_cursor_direct_present_for_target(
     present_id: u64,
     target_xid: u32,
 ) -> AtomicCursorDirectPresent {
-    prepare_atomic_cursor_direct_present_on_target(backend, present_id, 1600, 600, Some(target_xid))
+    prepare_atomic_cursor_direct_present_on_target(
+        backend,
+        present_id,
+        1600,
+        600,
+        Some(target_xid),
+        false,
+    )
 }
 
 fn prepare_atomic_cursor_direct_present_on_target(
@@ -3153,6 +3259,7 @@ fn prepare_atomic_cursor_direct_present_on_target(
     width: u16,
     height: u16,
     existing_target_xid: Option<u32>,
+    live_storage: bool,
 ) -> AtomicCursorDirectPresent {
     use ash::vk;
     use yserver_core::backend::{CompletedPresentEvent, PresentScanoutCandidate, PresentWake};
@@ -3167,6 +3274,38 @@ fn prepare_atomic_cursor_direct_present_on_target(
             .store
             .lookup(target_xid)
             .expect("preprepared fullscreen test target")
+    } else if live_storage {
+        let storage = backend
+            .platform
+            .gpu
+            .allocate_drawable_storage(width, height, 24)
+            .expect("allocate live direct target storage");
+        backend.windows.insert(
+            target_xid,
+            crate::kms::render::backend::WindowGeometry {
+                border_width: 0,
+                border_pixel: None,
+                border_pixmap: None,
+                x: 0,
+                y: 0,
+                width,
+                height,
+                depth: 24,
+                mapped: true,
+                viewable: true,
+                parent: None,
+                stack_rank: 0,
+                bg_pixel: None,
+                bg_pixmap: None,
+                cursor: None,
+            },
+        );
+        let target_id = backend
+            .store
+            .allocate(target_xid, DrawableKind::Window, 24, true, storage)
+            .expect("allocate live direct target drawable");
+        backend.core.top_level_order.push(target_xid);
+        target_id
     } else {
         let target_id = seed_window(backend, target_xid, None, 0, 0);
         {
@@ -3180,21 +3319,24 @@ fn prepare_atomic_cursor_direct_present_on_target(
         backend.core.top_level_order.push(target_xid);
         target_id
     };
+    let source_storage = if live_storage {
+        backend
+            .platform
+            .gpu
+            .allocate_drawable_storage(width, height, 24)
+            .expect("allocate live direct source storage")
+    } else {
+        Storage::for_tests_null(
+            vk::Extent2D {
+                width: u32::from(width),
+                height: u32::from(height),
+            },
+            vk::Format::B8G8R8A8_UNORM,
+        )
+    };
     let source_id = backend
         .store
-        .allocate(
-            source_xid,
-            DrawableKind::Pixmap,
-            24,
-            false,
-            Storage::for_tests_null(
-                vk::Extent2D {
-                    width: u32::from(width),
-                    height: u32::from(height),
-                },
-                vk::Format::B8G8R8A8_UNORM,
-            ),
-        )
+        .allocate(source_xid, DrawableKind::Pixmap, 24, false, source_storage)
         .expect("allocate fullscreen Present source");
     backend.pstate.scanout_m1.entries.insert(
         source_id,

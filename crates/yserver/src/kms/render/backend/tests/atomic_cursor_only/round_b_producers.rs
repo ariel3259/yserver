@@ -1504,6 +1504,274 @@ fn atomic_cursor_only_vsync_direct_rebind_receipt_routes_motion_to_hardware() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: publish a Hardware receipt for the rejected EINVAL attach.
+fn atomic_cursor_only_vsync_direct_einval_first_attach_runs_composed_fallback() {
+    use crate::{
+        drm::atomic::AtomicCommitKind,
+        kms::render::scene::{CursorAcceptedMode, CursorPrimaryContent},
+    };
+    use std::io;
+
+    let Some(mut fixture) = AtomicCursorFixture::new_with_two_outputs()
+        .expect("construct two-output EINVAL direct cursor fixture")
+    else {
+        return;
+    };
+    fixture
+        .backend
+        .platform
+        .for_tests_accept_output_power_commits();
+    let direct = super::round_a::setup_cursor_only_direct_present(&mut fixture);
+    let transparent = transparent_bitmap_cursor(&mut fixture.backend);
+    let root = fixture.backend.core.window_id;
+    Backend::define_cursor(&mut fixture.backend, None, root, transparent.as_raw())
+        .expect("select transparent cursor before direct admission");
+    Backend::warp_pointer_root(&mut fixture.backend, &mut fixture.state, 810, 90);
+    damage_cursor_root(&mut fixture);
+    Backend::maybe_composite(&mut fixture.backend)
+        .expect("submit initial cursorless primary on both outputs");
+    retire_scene_outputs(&mut fixture, 1);
+    assert!(fixture.backend.scene.direct_scanout_primary_ready());
+    let direct_present_id = admit_held_direct_cursorless(&mut fixture, &direct, 28_000, 20);
+    assert!(fixture.backend.pstate.scanout_m2.active());
+    assert!(fixture.backend.pstate.scanout_m2.hold_direct);
+    assert!(fixture.backend.pstate.scanout_m2.queued_successor.is_none());
+
+    let visible = create_argb_cursor(&mut fixture.backend, [0x57, 0x68, 0x79, 0xff], 1, 2);
+    Backend::define_cursor(&mut fixture.backend, None, root, visible.as_raw())
+        .expect("select opaque cursor while the direct frame is held");
+    let (candidate, event) = super::round_a::direct_present_for_id(&direct, direct_present_id + 1);
+    Backend::note_present_scanout_candidate(&mut fixture.backend, candidate);
+    fixture
+        .recorders
+        .atomic
+        .script_result(Err(io::Error::from_raw_os_error(libc::EINVAL)));
+    fixture
+        .recorders
+        .atomic
+        .script_result(Err(io::Error::from_raw_os_error(libc::EINVAL)));
+    fixture.recorders.atomic.script_result(Ok(()));
+    let before_attach = fixture.recorders.atomic.records().len();
+    let error = Backend::try_present_direct(&mut fixture.backend, candidate, event)
+        .expect_err("reject the direct first attach and request composed recovery");
+    assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+
+    let records = fixture.recorders.atomic.records();
+    assert_eq!(records.len(), before_attach + 3);
+    assert_eq!(
+        records[before_attach].kind,
+        AtomicCommitKind::SceneWithCursor
+    );
+    assert_eq!(
+        records[before_attach].result,
+        crate::drm::atomic::tests_support::ScriptedResult::Error {
+            kind: io::ErrorKind::InvalidInput,
+            raw_os_error: Some(libc::EINVAL),
+        },
+        "the grouped direct first attach is rejected with EINVAL",
+    );
+    assert_eq!(
+        records[before_attach].events.len(),
+        2,
+        "the direct transaction asks for both output events",
+    );
+    assert_eq!(
+        records[before_attach + 1].kind,
+        AtomicCommitKind::SceneWithCursor,
+        "TEST_ONLY reproduces the cursor rejection",
+    );
+    assert!(
+        records[before_attach + 1]
+            .flags
+            .contains(::drm::control::AtomicCommitFlags::TEST_ONLY)
+    );
+    assert_eq!(
+        records[before_attach + 1].result,
+        crate::drm::atomic::tests_support::ScriptedResult::Error {
+            kind: io::ErrorKind::InvalidInput,
+            raw_os_error: Some(libc::EINVAL),
+        },
+    );
+    assert_eq!(records[before_attach + 2].kind, AtomicCommitKind::Scene);
+    assert!(
+        records[before_attach + 2]
+            .flags
+            .contains(::drm::control::AtomicCommitFlags::TEST_ONLY)
+    );
+    assert_eq!(
+        records[before_attach + 2].result,
+        crate::drm::atomic::tests_support::ScriptedResult::Ok,
+        "the primary request without cursor fields passes TEST_ONLY",
+    );
+    for output_idx in 0..2 {
+        let receipt = fixture
+            .backend
+            .scene
+            .for_tests_cursor_commit_receipt(output_idx)
+            .expect("rejected direct attach leaves the prior accepted receipt");
+        assert_eq!(
+            receipt.mode,
+            CursorAcceptedMode::Hidden,
+            "output {output_idx}"
+        );
+        assert_eq!(
+            receipt.primary_cursor,
+            CursorPrimaryContent::Cursorless,
+            "output {output_idx} keeps the held direct primary cursorless",
+        );
+        assert!(
+            !fixture
+                .backend
+                .platform
+                .cursor_plane_visible_for_output(output_idx),
+            "output {output_idx} keeps its prior detached plane binding",
+        );
+    }
+    assert!(fixture.backend.pstate.scanout_m2.unflip_requested);
+    assert!(fixture.backend.pstate.scanout_m2.active());
+    assert!(fixture.backend.pstate.scanout_m2.pending.is_none());
+    assert!(fixture.backend.pstate.scanout_m2.queued_successor.is_none());
+
+    let before_unflip = fixture.recorders.atomic.records().len();
+    Backend::maybe_composite(&mut fixture.backend)
+        .expect("submit grouped composed recovery after rejected direct attach");
+    let unflip_records = fixture.recorders.atomic.records();
+    assert_eq!(unflip_records.len(), before_unflip + 1);
+    assert_eq!(
+        unflip_records[before_unflip].kind,
+        AtomicCommitKind::Scene,
+        "the fallback replaces the direct primary without cursor properties",
+    );
+    assert_eq!(unflip_records[before_unflip].events.len(), 2);
+    assert_eq!(
+        fixture.backend.pstate.scanout_m2.unflip_awaiting_outputs,
+        std::collections::HashSet::from([0, 1]),
+    );
+    for output_idx in 0..2 {
+        let output = &fixture.backend.platform.outputs[output_idx].output;
+        assert!(
+            unflip_records[before_unflip]
+                .properties
+                .iter()
+                .any(|update| {
+                    update.object == output.plane.into()
+                        && update.property == output.plane_fb_id_prop
+                        && update.value != 0x8100
+                }),
+            "output {output_idx} replaces the held direct FB with composed content"
+        );
+    }
+    fixture.retire_output(0, 60);
+    fixture.retire_output(1, 61);
+    assert!(!fixture.backend.pstate.scanout_m2.active());
+    assert!(fixture.backend.pstate.scanout_m2.current.is_none());
+    assert!(
+        fixture
+            .backend
+            .pstate
+            .scanout_m2
+            .unflip_awaiting_outputs
+            .is_empty()
+    );
+    assert!(!fixture.backend.scene.has_pending_page_flips());
+    for output_idx in 0..2 {
+        let receipt = fixture
+            .backend
+            .scene
+            .for_tests_cursor_commit_receipt(output_idx)
+            .expect("output retains its accepted per-output cursor receipt");
+        assert_eq!(
+            receipt.mode,
+            CursorAcceptedMode::Hidden,
+            "output {output_idx}"
+        );
+        assert_eq!(
+            receipt.primary_cursor,
+            CursorPrimaryContent::Cursorless,
+            "output {output_idx} does not invent software pixels in the direct primary",
+        );
+        assert!(
+            !fixture
+                .backend
+                .platform
+                .cursor_plane_visible_for_output(output_idx)
+        );
+    }
+
+    Backend::set_cursor_hidden(&mut fixture.backend, true);
+    for frame in 64..80 {
+        Backend::maybe_composite(&mut fixture.backend).expect("settle hidden fallback");
+        let mut retired = false;
+        for output_idx in 0..2 {
+            if fixture.backend.scene.has_pending_page_flip(output_idx)
+                || fixture
+                    .backend
+                    .platform
+                    .cursor_atomic_event_pending_for_output(output_idx)
+            {
+                fixture.retire_output(output_idx, frame + output_idx as u32);
+                retired = true;
+            }
+        }
+        if !retired
+            && !fixture.backend.scene.has_pending_page_flips()
+            && !fixture.backend.platform.any_cursor_commit_in_flight()
+            && !fixture.backend.for_tests_scene_wants_scene()
+        {
+            break;
+        }
+    }
+    for output_idx in 0..2 {
+        let receipt = fixture
+            .backend
+            .scene
+            .for_tests_cursor_commit_receipt(output_idx)
+            .expect("accepted cursorless teardown receipt");
+        assert_eq!(
+            receipt.mode,
+            CursorAcceptedMode::Hidden,
+            "output {output_idx}"
+        );
+        assert_eq!(
+            receipt.primary_cursor,
+            CursorPrimaryContent::Cursorless,
+            "output {output_idx} ends with cursorless composed content",
+        );
+    }
+
+    let sequence: Vec<_> = fixture
+        .recorders
+        .atomic
+        .records()
+        .iter()
+        .map(|record| record.kind)
+        .collect();
+    let mut expected = vec![AtomicCommitKind::SceneWithCursor; 2];
+    expected.push(AtomicCommitKind::Scene);
+    expected.extend([AtomicCommitKind::SceneWithCursor; 2]);
+    expected.extend([AtomicCommitKind::Scene; 4]);
+    assert_eq!(
+        sequence, expected,
+        "direct admission, cursor-attributed EINVAL, composed unflip, and cleanup have the exact trace",
+    );
+
+    Backend::set_dpms_power(&mut fixture.backend, 3)
+        .expect("Backend teardown drains direct scanout");
+    let _ = Backend::drain_completed_present_events(&mut fixture.backend);
+    let _ = Backend::drain_retired_present_idle_events(&mut fixture.backend);
+    assert!(!fixture.backend.pstate.scanout_m2.active());
+    assert!(fixture.backend.pstate.scanout_m2.pending.is_none());
+    assert!(fixture.backend.pstate.scanout_m2.current.is_none());
+    assert!(fixture.backend.pstate.scanout_m2.queued_successor.is_none());
+    fixture.assert_cursor_quiescent();
+    let ledger = Rc::clone(&fixture.recorders.cursor_buffer_ledger);
+    drop(fixture);
+    assert_eq!(ledger.end_state(), (0, 0, 0));
+    let _ = direct_present_id;
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutations: use only cursor_hidden, turn cursor wakes into generic damage, reset the cap per observation, cap XTEST deadline or CopyArea progress, replace run_core WarpPointer with Backend warps, replace the sink after On entry, or omit final Backend cleanup.
 fn atomic_cursor_only_tearing_cursor_cap_survives_all_motion_sources() {
     assert!(
