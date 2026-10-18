@@ -730,6 +730,7 @@ impl PlatformBackend {
             active_cursor_crtcs,
             fb_w,
             fb_h,
+            cursor_pointer_root: (i32::from(fb_w / 2), i32::from(fb_h / 2)),
             output_transforms: HashMap::new(),
             ust_msc: std::collections::HashMap::new(),
             completion_clocks: std::collections::HashMap::new(),
@@ -738,6 +739,7 @@ impl PlatformBackend {
             async_outcomes: HashMap::new(),
             requested_flip_timing: crate::drm::async_flip::FlipTiming::Vsync,
             scene_flip_timings: Vec::new(),
+            staged_cursor_frames: HashMap::new(),
             scene_cursor_hide_failed: false,
             input_ctx,
             present_completion_epfd,
@@ -762,6 +764,10 @@ impl PlatformBackend {
     /// existing shape from Stage 1b.
     #[doc(hidden)]
     pub(crate) fn for_tests() -> Self {
+        Self::for_tests_with_services(super::services::KmsServices::for_tests())
+    }
+
+    pub(crate) fn for_tests_with_services(services: super::services::KmsServices) -> Self {
         let wakeup_eventfd = nix::sys::eventfd::EventFd::from_value_and_flags(
             0,
             nix::sys::eventfd::EfdFlags::EFD_CLOEXEC | nix::sys::eventfd::EfdFlags::EFD_NONBLOCK,
@@ -776,7 +782,6 @@ impl PlatformBackend {
         let scanout_render_completion_epfd =
             crate::kms::render::completion_poller::CompletionPoller::new()
                 .expect("test scanout completion poller");
-        let services = super::services::KmsServices::for_tests();
         let device_key = crate::platform::drm::DrmDeviceKey { major: 0, minor: 0 };
         let test_route = ScanoutRoute::new(
             RenderDeviceId::UnverifiedFallback,
@@ -880,6 +885,7 @@ impl PlatformBackend {
             ]),
             fb_w: 800,
             fb_h: 600,
+            cursor_pointer_root: (400, 300),
             output_transforms: HashMap::new(),
             ust_msc: std::collections::HashMap::new(),
             completion_clocks: std::collections::HashMap::new(),
@@ -888,6 +894,7 @@ impl PlatformBackend {
             async_outcomes: HashMap::new(),
             requested_flip_timing: crate::drm::async_flip::FlipTiming::Vsync,
             scene_flip_timings: Vec::new(),
+            staged_cursor_frames: HashMap::new(),
             scene_cursor_hide_failed: false,
             input_ctx: None,
             present_completion_epfd,

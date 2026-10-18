@@ -14,8 +14,68 @@ impl AtomicCursorFixture {
         Self::from_live_backend(backend, Some(64), Some(64))
     }
 
+    pub(crate) fn new_with_clock(
+        clock: Rc<dyn Fn() -> std::time::Instant>,
+    ) -> Result<Option<Self>, String> {
+        let backend =
+            KmsBackend::for_tests_with_vk_and_clock(clock).map_err(|error| error.to_string())?;
+        Self::from_live_backend(backend, Some(64), Some(64))
+    }
+
+    pub(crate) fn new_with_scanout_acquisition_script(
+        unavailable: impl IntoIterator<Item = bool>,
+    ) -> Result<Option<Self>, String> {
+        let Some(mut fixture) = Self::new()? else {
+            return Ok(None);
+        };
+        let pool = fixture.backend.platform.scanout_pools[0]
+            .as_mut()
+            .expect("Vulkan fixture owns a shared scanout pool")
+            .display_pool_mut();
+        pool.for_tests_script_unavailable_acquisitions(unavailable);
+        Ok(Some(fixture))
+    }
+
+    pub(crate) fn new_with_cursor_lease_failure(
+        boundary: crate::kms::cursor_plane::CursorLeaseBoundary,
+    ) -> Result<Option<Self>, String> {
+        Self::new_with_cursor_lease_failure_after(boundary, 0)
+    }
+
+    pub(crate) fn new_with_cursor_lease_failure_after(
+        boundary: crate::kms::cursor_plane::CursorLeaseBoundary,
+        matching_calls_to_skip: usize,
+    ) -> Result<Option<Self>, String> {
+        let Some(mut fixture) = Self::new()? else {
+            return Ok(None);
+        };
+        fixture.script_cursor_lease_failure(boundary, matching_calls_to_skip);
+        Ok(Some(fixture))
+    }
+
+    fn script_cursor_lease_failure(
+        &mut self,
+        boundary: crate::kms::cursor_plane::CursorLeaseBoundary,
+        matching_calls_to_skip: usize,
+    ) {
+        self.backend.platform.devices[0]
+            .cursor
+            .plane
+            .as_mut()
+            .expect("fixture initializes an eligible cursor plane")
+            .for_tests_script_lease_failure_after(boundary, matching_calls_to_skip);
+    }
+
     pub(crate) fn new_with_hotspot_properties() -> Result<Option<Self>, String> {
         let backend = KmsBackend::for_tests_with_vk().map_err(|error| error.to_string())?;
+        Self::from_live_backend_with_hotspot_properties(backend, Some(64), Some(64))
+    }
+
+    pub(crate) fn new_with_hotspot_properties_and_clock(
+        clock: Rc<dyn Fn() -> std::time::Instant>,
+    ) -> Result<Option<Self>, String> {
+        let backend =
+            KmsBackend::for_tests_with_vk_and_clock(clock).map_err(|error| error.to_string())?;
         Self::from_live_backend_with_hotspot_properties(backend, Some(64), Some(64))
     }
 
@@ -34,8 +94,110 @@ impl AtomicCursorFixture {
         Self::from_live_backend(backend, Some(64), Some(64))
     }
 
+    pub(crate) fn new_with_cursor_mixed_three_output_layout() -> Result<Option<Self>, String> {
+        let mut backend = KmsBackend::for_tests_with_vk_dimensions(2450, 600)
+            .map_err(|error| error.to_string())?;
+        super::super::push_test_output(&mut backend, 2);
+        super::super::push_test_output(&mut backend, 3);
+        backend.platform.outputs[1].x = 800;
+        backend.platform.outputs[2].x = 1650;
+        backend.platform.outputs[2].y = 100;
+        backend.platform.outputs[2].height = 400;
+        backend.platform.outputs[2].output.picked.height = 400;
+        for mode in &mut backend.platform.outputs[2].output.modes {
+            mode.height = 400;
+        }
+
+        let second_key = crate::platform::drm::DrmDeviceKey {
+            major: 226,
+            minor: 1,
+        };
+        let recorders = Rc::clone(
+            backend
+                .platform
+                .services
+                .test_recorders
+                .as_ref()
+                .expect("for_tests selects recording KMS services"),
+        );
+        let dependency: Arc<dyn crate::drm::client_caps::DeviceControl + Send + Sync> =
+            crate::drm::client_caps::recording_control("atomic-cursor-mixed-output");
+        let device = Rc::new(
+            crate::drm::Device::for_tests_with_control(dependency)
+                .expect("open mixed-output recording DRM device"),
+        );
+        recorders.page_flip_events.register_device(&device);
+        let first = &backend.platform.devices[0];
+        backend
+            .platform
+            .devices
+            .push(crate::kms::render::platform::KmsDevice {
+                key: second_key,
+                device,
+                async_page_flip: false,
+                atomic_commit_sink: Rc::clone(&first.atomic_commit_sink),
+                page_flip_event_source: Rc::clone(&first.page_flip_event_source),
+                cursor_buffer_io: Rc::clone(&first.cursor_buffer_io),
+                legacy_cursor_io: Rc::clone(&first.legacy_cursor_io),
+                test_page_flip_event_source: Some(Rc::clone(&recorders.page_flip_events)),
+                cursor: crate::kms::render::platform::KmsCursorState::new(),
+            });
+        let route = backend
+            .platform
+            .scanout_route_for_kms(second_key)
+            .expect("mixed-output route has a sink device");
+        let output = &mut backend.platform.outputs[2];
+        output.key.device_key = second_key;
+        output.scanout_route = route;
+        backend
+            .pstate
+            .crtc_key_by_id
+            .insert(u32::from(output.output.crtc), output.key.clone());
+        backend.refresh_present_crtc_clock_epochs();
+
+        let Some(mut fixture) = Self::from_live_backend(backend, Some(64), Some(64))? else {
+            return Ok(None);
+        };
+        fixture
+            .backend
+            .platform
+            .devices
+            .iter_mut()
+            .find(|device| device.key == second_key)
+            .expect("software output sink device")
+            .cursor
+            .plane = None;
+        let layouts = fixture.backend.platform.scene_output_layouts();
+        fixture.backend.scene =
+            crate::kms::render::scene::SceneCompositor::new(&fixture.backend.platform, &layouts)
+                .expect(
+                    "rebuild mixed-output scene after construction-time cursor eligibility setup",
+                );
+        Ok(Some(fixture))
+    }
+
+    pub(crate) fn new_with_two_outputs_and_cursor_lease_failure_after(
+        boundary: crate::kms::cursor_plane::CursorLeaseBoundary,
+        matching_calls_to_skip: usize,
+    ) -> Result<Option<Self>, String> {
+        let mut backend = KmsBackend::for_tests_with_vk_dimensions(1600, 600)
+            .map_err(|error| error.to_string())?;
+        super::super::push_test_output(&mut backend, 2);
+        let Some(mut fixture) = Self::from_live_backend(backend, Some(64), Some(64))? else {
+            return Ok(None);
+        };
+        fixture.script_cursor_lease_failure(boundary, matching_calls_to_skip);
+        Ok(Some(fixture))
+    }
+
     pub(crate) fn new_with_overlapping_outputs() -> Result<Option<Self>, String> {
-        let mut backend = KmsBackend::for_tests_with_vk_dimensions(800, 600)
+        Self::new_with_overlapping_outputs_and_clock(Rc::new(std::time::Instant::now))
+    }
+
+    pub(crate) fn new_with_overlapping_outputs_and_clock(
+        clock: Rc<dyn Fn() -> std::time::Instant>,
+    ) -> Result<Option<Self>, String> {
+        let mut backend = KmsBackend::for_tests_with_vk_dimensions_and_clock(800, 600, clock)
             .map_err(|error| error.to_string())?;
         super::super::push_test_output(&mut backend, 2);
         backend.platform.outputs[1].x = 0;
@@ -384,7 +546,7 @@ impl AtomicCursorFixture {
                         && state.intent.is_none()
                         && state.in_flight.is_none()
                 }),
-                "cursor binding, lifecycle owner, intent, or event obligation remains for {:?}",
+                "cursor binding, lifecycle owner, intent, or event obligation remains for {:?}: {state:?}",
                 output.output.crtc,
             );
             assert!(
@@ -435,20 +597,36 @@ impl AtomicCursorFixture {
                 .as_ref()
                 .expect("Vulkan cursor fixture owns its Vk context"),
         );
-        let Some(Some(OutputScanout::Shared(mut destinations))) = self
-            .backend
-            .platform
-            .scanout_pools
-            .get_mut(0)
-            .map(Option::take)
-        else {
-            return Err("copied recording route requires the shared test destination pool".into());
-        };
-        destinations.route = route;
-        let copied =
-            crate::kms::vk::scanout::CopiedScanoutPool::for_tests_recording_pool(vk, destinations)
-                .map_err(|error| format!("allocate copied recording route: {error}"))?;
-        self.backend.platform.scanout_pools[0] = Some(OutputScanout::Copied(copied));
+        for output_idx in 0..self.backend.platform.scanout_pools.len() {
+            let Some(Some(OutputScanout::Shared(mut destinations))) = self
+                .backend
+                .platform
+                .scanout_pools
+                .get_mut(output_idx)
+                .map(Option::take)
+            else {
+                return Err(format!(
+                    "copied recording route requires shared destination pool for output {output_idx}"
+                ));
+            };
+            destinations.route = route;
+            let mut copied = crate::kms::vk::scanout::CopiedScanoutPool::for_tests_recording_pool(
+                Arc::clone(&vk),
+                destinations,
+            )
+            .map_err(|error| format!("allocate copied recording route: {error}"))?;
+            if let Some(front_idx) = copied
+                .destinations
+                .bos
+                .iter()
+                .position(|bo| bo.state.phase == crate::kms::vk::scanout::BoPhase::OnScreen)
+            {
+                copied
+                    .note_kms_modeset_installed(front_idx)
+                    .map_err(|error| format!("record copied fixture front ownership: {error}"))?;
+            }
+            self.backend.platform.scanout_pools[output_idx] = Some(OutputScanout::Copied(copied));
+        }
         Ok(())
     }
 }
@@ -534,6 +712,7 @@ fn install_recording_scanout_pools(
                 height,
                 image,
                 image_view,
+                None,
             )
             .map_err(|error| format!("create recording scene BO: {error}"))?;
             if bo_idx == 0 {

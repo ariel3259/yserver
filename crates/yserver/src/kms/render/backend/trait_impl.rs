@@ -141,6 +141,7 @@ impl<P: Platform> Backend for XBackend<P> {
     }
 
     fn on_host_input(&mut self, state: &mut ServerState, ev: HostInputEvent) {
+        P::note_scheduler_input(self);
         Self::backend_devices_on_host_input(self, state, ev)
     }
 
@@ -157,6 +158,7 @@ impl<P: Platform> Backend for XBackend<P> {
     }
 
     fn mark_dirty(&mut self) {
+        P::note_scheduler_input(self);
         // The core loop calls mark_dirty after every handled X request, even
         // when the request changed no scene state. During capped tearing that
         // generic wake must not turn XTest motion fan-out (and client replies
@@ -189,6 +191,7 @@ impl<P: Platform> Backend for XBackend<P> {
     }
 
     fn on_platform_event(&mut self, state: &mut ServerState) {
+        P::note_scheduler_input(self);
         P::on_platform_event(self, state);
     }
 

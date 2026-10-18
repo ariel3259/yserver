@@ -262,6 +262,8 @@ pub(in crate::kms::render::backend) struct ScanoutM2State {
         Vec<yserver_core::backend::CompletedPresentEvent>,
     pub(in crate::kms::render::backend) idled: Vec<yserver_core::backend::CompletedPresentEvent>,
     pub(in crate::kms::render::backend) hold_direct: bool,
+    /// Advisory summary of settled accepted per-output bindings. Scheduling
+    /// never uses this as a guard; a newer queued attach must still run.
     pub(in crate::kms::render::backend) cursor_bound_all: bool,
     pub(in crate::kms::render::backend) unflip_requested: bool,
     /// First request in the current direct-to-composed transition. This is
@@ -823,15 +825,14 @@ pub struct KmsBackendState {
     pub(in crate::kms::render::backend) scanout_m0: ScanoutM0Telemetry,
     pub(in crate::kms::render::backend) scanout_m1: ScanoutM1ProbeCache,
     pub(in crate::kms::render::backend) scanout_m2: ScanoutM2State,
-    /// Newest direct-scanout cursor record whose pool upload was deferred.
-    /// Retried only from Backend scheduling, while the direct frame remains
-    /// authoritative.
-    pub(in crate::kms::render::backend) deferred_direct_cursor:
-        Option<std::sync::Arc<crate::kms::render::cursor::CursorRecord>>,
     pub(in crate::kms::render::backend) tearing: Tearing,
     /// Monotonic clock for KMS cursor-composition pacing.
     pub(in crate::kms::render::backend) monotonic_clock:
         std::rc::Rc<dyn Fn() -> std::time::Instant>,
+    /// Prevents a no-progress scanout pass from scheduling itself again
+    /// immediately. External events advance the input epoch; successful
+    /// submissions or state changes mark the current pass as progress.
+    pub(in crate::kms::render::backend) immediate_wake_guard: ImmediateWakeGuard,
     pub(in crate::kms::render::backend) vt_resume_executor:
         std::rc::Rc<dyn super::session::VtResumeExecutor>,
 
@@ -1029,6 +1030,42 @@ pub struct KmsBackendState {
     /// Last `export holders` report, for change detection.
     pub(in crate::kms::render::backend) export_holders:
         crate::kms::render::export_holders::ExportHoldersReporter,
+}
+
+/// Wake-source-independent guard for immediate scanout scheduler deadlines.
+#[derive(Default)]
+pub(crate) struct ImmediateWakeGuard {
+    input_epoch: u64,
+    last_pass_input_epoch: u64,
+    pass_made_progress: bool,
+    last_pass_made_progress: bool,
+    has_run_pass: bool,
+}
+
+impl ImmediateWakeGuard {
+    pub(in crate::kms::render::backend) fn note_input(&mut self) {
+        self.input_epoch = self.input_epoch.wrapping_add(1);
+    }
+
+    pub(in crate::kms::render::backend) fn begin_pass(&mut self) {
+        self.pass_made_progress = false;
+    }
+
+    pub(in crate::kms::render::backend) fn note_progress(&mut self) {
+        self.pass_made_progress = true;
+    }
+
+    pub(in crate::kms::render::backend) fn finish_pass(&mut self) {
+        self.last_pass_input_epoch = self.input_epoch;
+        self.last_pass_made_progress = self.pass_made_progress;
+        self.has_run_pass = true;
+    }
+
+    pub(in crate::kms::render::backend) fn immediate_deadline_allowed(&self) -> bool {
+        !self.has_run_pass
+            || self.last_pass_made_progress
+            || self.input_epoch != self.last_pass_input_epoch
+    }
 }
 
 /// GLX-TFP export state for one drawable. See `exported_dmabufs`.

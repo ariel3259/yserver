@@ -33,6 +33,22 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-10-17 atomic-only cursor, sub-plan B (branch `feat/atomic-cursor-only`, plan
+  `plans/2026-10-15-atomic-cursor-only-b.md`):** HW↔SW cursor handoffs ride the frame commit that starts or
+  stops painting the software cursor (shared, copied and direct frames); retirement only settles receipts and
+  performs no cursor operation (`ShowOnRetire`/`HideOnRetire` removed). Every HW-only producer (motion, image,
+  animation, hotspot, crossing) feeds current intent, sampled at submission, never replayed from a scene request.
+  A held direct frame without a successor services cursor changes with cursor-only commits; any non-EBUSY
+  cursor-only rejection there falls back to the software cursor and unflips. Mixed mode keeps per-output
+  membership; a blocked output never holds another output's cursor-only commit; a cursor-only commit never
+  preempts an output's own damaged frame; an immediate re-schedule needs progress or new input (no spin while an
+  output waits on its frame). #244 jump proven against master `9524c80d`: window entry P0=(120,80) → motion
+  P1=(180,130) → retirement issues a legacy move to P0 (`(113,71)` with hotspot) on master; on this branch no
+  post-motion operation uses P0 (`atomic_cursor_only_window_enter_never_restores_p0`, `round_b_jump.rs`).
+  Rebased on master `2365e895`. Open for C11: CPU cost of the pre-compose damage classification walk; visual
+  straight-line motion across window edges. Next: sub-plan C (error recovery, plane reassignment, legacy deletion,
+  hardware).
+
 - **2026-10-17 atomic-only cursor, sub-plan A (branch `feat/atomic-cursor-only`, spec
   `specs/2026-10-15-atomic-cursor-only-design.md`, plan `plans/2026-10-15-atomic-cursor-only-a.md`):** the
   hardware cursor is driven only by atomic commits. KMS devices set UNIVERSAL_PLANES → ATOMIC →

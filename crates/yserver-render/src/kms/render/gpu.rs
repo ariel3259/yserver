@@ -77,6 +77,9 @@ struct FenceTicketInner {
     /// `vk::SUCCESS`. After this, `poll_signaled` short-circuits
     /// without calling the driver.
     signaled_cache: Cell<bool>,
+    /// The caller proved that no queue submission used this ticket. Such a
+    /// fence is safe to recycle even though Vulkan reports it unsignaled.
+    unsubmitted: Cell<bool>,
     /// Weak handle to the platform's fence pool. On `Drop`, if
     /// the fence is signaled AND the pool still exists, return
     /// the fence handle to the pool. If not signaled, leak the

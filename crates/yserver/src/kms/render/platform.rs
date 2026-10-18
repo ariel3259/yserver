@@ -27,6 +27,8 @@
 mod connectors;
 mod cursor;
 pub(crate) mod cursor_commit;
+pub(crate) use cursor_commit::accepted_cursor_only_receipt;
+pub(crate) mod cursor_frames;
 mod cursor_lifecycle;
 pub(crate) mod cursor_state;
 mod devices;
@@ -124,7 +126,9 @@ const WAKEUP_EVENTFD_TOKEN: u64 = u64::MAX;
 struct PendingScanoutRenderCompletion {
     job_id: u64,
     output_key: OutputKey,
+    crtc_key: CrtcKey,
     bo_idx: usize,
+    cursor_frame: yserver_render::kms::render::scene::CursorFrameId,
     /// `None` is Vulkan's valid already-signalled SYNC_FD payload (`fd=-1`).
     /// It bypasses readiness polling but remains a real synchronization
     /// payload that the sink imports as raw -1.
@@ -136,7 +140,9 @@ struct PendingScanoutRenderCompletion {
 pub(crate) struct ReadyScanoutRenderCompletion {
     pub(crate) job_id: u64,
     pub(crate) output_key: OutputKey,
+    pub(crate) crtc_key: CrtcKey,
     pub(crate) bo_idx: usize,
+    pub(crate) cursor_frame: yserver_render::kms::render::scene::CursorFrameId,
     pub(crate) fd: Option<OwnedFd>,
 }
 
@@ -457,6 +463,10 @@ pub struct PlatformBackend {
     pub(crate) active_cursor_crtcs: HashSet<CrtcKey>,
     pub(crate) fb_w: u16,
     pub(crate) fb_h: u16,
+    /// Latest authoritative root pointer position. Scene-owned HW bindings
+    /// sample this when their atomic request is prepared, even if the cursor
+    /// was software or hidden while the pointer moved.
+    pub(crate) cursor_pointer_root: (i32, i32),
     /// Non-identity current CRTC transforms (RANDR `SetCrtcTransform`),
     /// client-owned like the logical screen size, so keyed by output and
     /// kept across the `outputs` rebuilds of a topology change.
@@ -505,6 +515,9 @@ pub struct PlatformBackend {
     /// `None` preserves the legacy test/caller override above; production sets
     /// every output on every pass, starting with Vsync.
     pub(crate) scene_flip_timings: Vec<Option<FlipTiming>>,
+    /// Cursor plans indexed by their reserved scanout slot until the primary
+    /// submit is accepted or the handoff is cancelled.
+    pub(crate) staged_cursor_frames: HashMap<(usize, usize), cursor_frames::StagedCursorFrame>,
     /// A scene retirement attempted to hide a hardware cursor and failed.
     /// The backend consumes this to keep tearing's fallback diagnostic once.
     pub(crate) scene_cursor_hide_failed: bool,

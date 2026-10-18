@@ -8,7 +8,6 @@ use crate::kms::{
             BufferAgeRing, DeferredSceneRelease, FailedSubmitBo, OutputCursorMode, OutputLayout,
             OutputSceneState, OutputSink, PreparedOutputs, SceneCompositor, SceneCompositorInner,
             SceneError,
-            cursor::{reset_cursor_mode_for_lifecycle, reset_cursor_retry_for_lifecycle},
             damage_audit::build_output_damage_audit,
             output_transform,
             transform::{ensure_intermediates, release_intermediate},
@@ -182,6 +181,7 @@ impl SceneCompositor {
             failed_submit_bos: VecDeque::with_capacity(4),
             damage_history: BufferAgeRing::new(bo_depth + 1),
             current_generation: 0,
+            next_cursor_frame_id: 1,
             scene_structure_damage: RegionSet::new(),
             pending_repaint_after_failed_submit: RegionSet::new(),
             output_extent: vk::Extent2D {
@@ -191,10 +191,10 @@ impl SceneCompositor {
             output_origin: (root_x, root_y),
             next_submit_retry_at: None,
             last_frame_cursor_mode: OutputCursorMode::Hidden,
+            cursor_commit_receipt: None,
             cursor_prev_pos: None,
             last_present_cursor_rect: None,
             last_present_cursor_version: None,
-            force_show_retry_version: None,
             last_skip_reason: None,
             // Sized from the *current* pool, exactly as `bo_depth` above is.
             // `rebuild_outputs` replaces every `OutputSceneState`, so this is
@@ -461,14 +461,10 @@ impl SceneCompositor {
             // first compose re-decides via build_scene's
             // strategy. cursor_prev_pos is also cleared so the
             // next frame doesn't damage a stale trail rect.
-            reset_cursor_mode_for_lifecycle(&mut o.last_frame_cursor_mode);
+            o.last_frame_cursor_mode = OutputCursorMode::Hidden;
             o.cursor_prev_pos = None;
             o.last_present_cursor_rect = None;
             o.last_present_cursor_version = None;
-            reset_cursor_retry_for_lifecycle(&mut o.force_show_retry_version);
         }
-        // Hide the plane everywhere + invalidate uploaded_version.
-        // Best-effort; the platform hook logs per-CRTC failures.
-        let _ = sink.cursor_plane_mut().hide_all();
     }
 }

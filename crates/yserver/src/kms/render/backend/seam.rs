@@ -6,7 +6,7 @@
 //! defaults to the plain `Backend` default (no VT, no DPMS, no DRI3, one
 //! fixed output).
 
-use std::io;
+use std::{io, time::Instant};
 
 use yserver_core::{
     backend::{
@@ -34,6 +34,15 @@ pub trait Platform: OutputSink + Sized + 'static {
     fn fb_size(&self) -> (u16, u16);
     /// What the scene reads of every live output, in output order.
     fn output_layouts(&self) -> Vec<OutputLayout>;
+
+    /// Monotonic clock shared by portable deadlines and the platform's
+    /// scheduler. Platforms without an injected clock use the process clock.
+    fn monotonic_now(_b: &XBackend<Self>) -> Instant {
+        Instant::now()
+    }
+
+    /// Record an external event that can make an immediate scheduler pass useful.
+    fn note_scheduler_input(_b: &mut XBackend<Self>) {}
 
     /// Record entry into the portable Backend::put_image trait method.
     /// KMS uses a construction-selected observer; other platforms do nothing.
@@ -89,16 +98,6 @@ pub trait Platform: OutputSink + Sized + 'static {
     fn direct_frames_shaped_off_root(_b: &XBackend<Self>) -> bool {
         false
     }
-    /// Rebind the cursor planes to `record` under direct scanout; `false` on
-    /// failure.
-    fn refresh_direct_cursor(
-        _b: &mut XBackend<Self>,
-        _record: &std::sync::Arc<crate::kms::render::cursor::CursorRecord>,
-    ) -> bool {
-        false
-    }
-    /// XFIXES HideCursor while no compose runs: detach the cursor planes.
-    fn hide_cursor_under_direct_scanout(_b: &mut XBackend<Self>) {}
     /// Reapply a hidden cursor policy after output resume, including stale
     /// plane bindings left by a failed best-effort suspend hide.
     fn recover_hidden_cursor_on_resume(_b: &mut XBackend<Self>) {}
@@ -110,6 +109,45 @@ pub trait Platform: OutputSink + Sized + 'static {
         _hot_x: u16,
         _hot_y: u16,
     ) {
+    }
+    /// Record the final, confined root pointer position without causing
+    /// cursor attachment or scene damage. KMS samples it when building a
+    /// frame-owned HW cursor delta; host-window platforms need no cache.
+    fn note_cursor_pointer(_b: &mut XBackend<Self>, _pos: (i32, i32)) {}
+
+    /// Queue the latest effective sprite, visibility, and root position for
+    /// the platform-owned cursor path. Returns true when the platform can
+    /// represent this cursor without requiring a software-cursor frame.
+    fn queue_cursor_intent(
+        _b: &mut XBackend<Self>,
+        _record: Option<&crate::kms::render::cursor::CursorRecord>,
+        _visible: bool,
+        _pos: (i32, i32),
+    ) -> bool {
+        false
+    }
+    /// Retry the backend's current portable cursor observation after resources
+    /// become available. KMS may defer this per output when a scene frame owns
+    /// that output's cursor work; native-cursor platforms use normal queuing.
+    fn queue_effective_cursor_intent(
+        b: &mut XBackend<Self>,
+        record: Option<&crate::kms::render::cursor::CursorRecord>,
+        visible: bool,
+        pos: (i32, i32),
+    ) -> bool {
+        Self::queue_cursor_intent(b, record, visible, pos)
+    }
+    /// Record a portable cursor observation before software-sprite readiness
+    /// is checked. Platforms with a native cursor may apply it immediately;
+    /// KMS keeps it observational until the scene/cursor scheduler chooses an
+    /// owner for the next commit.
+    fn observe_cursor_intent(
+        b: &mut XBackend<Self>,
+        record: Option<&crate::kms::render::cursor::CursorRecord>,
+        visible: bool,
+        pos: (i32, i32),
+    ) -> bool {
+        Self::queue_cursor_intent(b, record, visible, pos)
     }
     /// `XWarpPointer` moved the X pointer to root `(x, y)`; a windowed
     /// platform moves the host pointer to match.

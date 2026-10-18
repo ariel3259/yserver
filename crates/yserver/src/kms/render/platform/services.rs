@@ -24,10 +24,82 @@ use crate::{
             connectors::{
                 ConnectorSnapshotIo, DrmConnectorSnapshotIo, RecordingConnectorSnapshotIo,
             },
-            flip_events::{DrmPageFlipEventSource, PageFlipEventSource},
+            flip_events::{
+                DrmPageFlipEventSource, PageFlipEventSource, PollRenderCompletionReadiness,
+                RenderCompletionReadiness,
+            },
         },
+        vk::scanout::CopiedScanoutPool,
     },
 };
+
+#[cfg(test)]
+use crate::kms::render::platform::flip_events::RecordingRenderCompletionReadiness;
+
+/// Submits the sink-side copy for a real copied-render completion. This
+/// construction-selected operation boundary lets tests inject a copy failure
+/// without replacing rendering, synchronization, or Backend completion flow.
+pub(crate) trait CopiedScanoutCopySubmitter {
+    fn submit_copy(
+        &self,
+        pool: &mut CopiedScanoutPool,
+        bo_idx: usize,
+        render_completion: Option<OwnedFd>,
+    ) -> std::io::Result<Option<OwnedFd>>;
+}
+
+pub(crate) struct VulkanCopiedScanoutCopySubmitter;
+
+impl CopiedScanoutCopySubmitter for VulkanCopiedScanoutCopySubmitter {
+    fn submit_copy(
+        &self,
+        pool: &mut CopiedScanoutPool,
+        bo_idx: usize,
+        render_completion: Option<OwnedFd>,
+    ) -> std::io::Result<Option<OwnedFd>> {
+        pool.submit_copy(bo_idx, render_completion)
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct RecordingCopiedScanoutCopySubmitter {
+    fail_next: std::cell::Cell<bool>,
+    attempts: std::cell::Cell<u64>,
+    failures: std::cell::Cell<u64>,
+}
+
+#[cfg(test)]
+impl RecordingCopiedScanoutCopySubmitter {
+    pub(crate) fn fail_next(&self) {
+        self.fail_next.set(true);
+    }
+
+    pub(crate) fn attempts(&self) -> u64 {
+        self.attempts.get()
+    }
+
+    pub(crate) fn failures(&self) -> u64 {
+        self.failures.get()
+    }
+}
+
+#[cfg(test)]
+impl CopiedScanoutCopySubmitter for RecordingCopiedScanoutCopySubmitter {
+    fn submit_copy(
+        &self,
+        pool: &mut CopiedScanoutPool,
+        bo_idx: usize,
+        render_completion: Option<OwnedFd>,
+    ) -> std::io::Result<Option<OwnedFd>> {
+        self.attempts.set(self.attempts.get().saturating_add(1));
+        if self.fail_next.replace(false) {
+            self.failures.set(self.failures.get().saturating_add(1));
+            return Err(std::io::Error::from_raw_os_error(libc::EIO));
+        }
+        pool.submit_copy(bo_idx, render_completion)
+    }
+}
 
 /// The low-level DRM `TEST_ONLY` probe used after Backend validates the
 /// drawable metadata, output geometry, and cursor state. Tests replace only
@@ -137,11 +209,20 @@ impl BackendEntryObserver for NoopBackendEntryObserver {
 }
 
 #[cfg(test)]
+pub(crate) type RecordedDirectScanoutCursorDeltas = Vec<
+    Vec<(
+        ::drm::control::crtc::Handle,
+        Vec<crate::drm::atomic::AtomicPropertyUpdate>,
+    )>,
+>;
+
+#[cfg(test)]
 #[derive(Default)]
 pub(crate) struct RecordingDirectScanoutTestOnlyExecutor {
     results: std::cell::RefCell<
         std::collections::VecDeque<crate::drm::modeset::DirectScanoutTestResult>,
     >,
+    cursor_deltas: std::cell::RefCell<RecordedDirectScanoutCursorDeltas>,
     sources: std::cell::RefCell<
         std::collections::HashMap<crate::kms::render::store::DrawableId, DirectScanoutProbeSource>,
     >,
@@ -149,6 +230,10 @@ pub(crate) struct RecordingDirectScanoutTestOnlyExecutor {
 
 #[cfg(test)]
 impl RecordingDirectScanoutTestOnlyExecutor {
+    pub(crate) fn cursor_deltas(&self) -> RecordedDirectScanoutCursorDeltas {
+        self.cursor_deltas.borrow().clone()
+    }
+
     pub(crate) fn queue_source(
         &self,
         source_id: crate::kms::render::store::DrawableId,
@@ -193,8 +278,28 @@ impl DirectScanoutTestOnlyExecutor for RecordingDirectScanoutTestOnlyExecutor {
         _pitch: u32,
         _atomic_commit_sink: &crate::drm::atomic::AtomicCommitSink,
         _planes: &[crate::drm::modeset::DirectScanoutPlaneState<'_>],
-        _cursor_updates: &[crate::kms::render::platform::cursor_state::CursorPlaneUpdate],
+        cursor_updates: &[crate::kms::render::platform::cursor_state::CursorPlaneUpdate],
     ) -> std::io::Result<crate::drm::modeset::DirectScanoutTestResult> {
+        self.cursor_deltas.borrow_mut().push(
+            cursor_updates
+                .iter()
+                .map(|update| {
+                    (
+                        update.crtc,
+                        update
+                            .prepared
+                            .updates
+                            .iter()
+                            .map(|property| crate::drm::atomic::AtomicPropertyUpdate {
+                                object: property.object,
+                                property: property.property,
+                                value: property.value,
+                            })
+                            .collect(),
+                    )
+                })
+                .collect(),
+        );
         self.results.borrow_mut().pop_front().ok_or_else(|| {
             std::io::Error::other("recording direct-scanout TEST_ONLY result was not queued")
         })
@@ -234,6 +339,8 @@ pub struct KmsServices {
     pub(crate) crtc_output_discovery: Rc<dyn CrtcOutputDiscovery>,
     pub(crate) atomic: Rc<dyn AtomicCommitExecutor>,
     pub(crate) page_flip_events: Rc<dyn PageFlipEventSource>,
+    pub(crate) render_completion_readiness: Rc<dyn RenderCompletionReadiness>,
+    pub(crate) copied_scanout_copy: Rc<dyn CopiedScanoutCopySubmitter>,
     pub(crate) hotplug: Rc<dyn DisplayHotplugSource>,
     pub(crate) connector_snapshot: Rc<dyn ConnectorSnapshotIo>,
     pub(crate) monotonic_clock: Rc<dyn Fn() -> Instant>,
@@ -274,6 +381,10 @@ pub(crate) struct KmsTestRecorders {
     pub(crate) gamma: Rc<RecordingGammaIo>,
     pub(crate) page_flip_events:
         Rc<crate::kms::render::platform::flip_events::RecordingPageFlipEventSource>,
+    #[cfg(test)]
+    pub(crate) render_completion_readiness: Rc<RecordingRenderCompletionReadiness>,
+    #[cfg(test)]
+    pub(crate) copied_scanout_copy: Rc<RecordingCopiedScanoutCopySubmitter>,
     pub(crate) hotplug: Rc<RecordingDisplayHotplugSource>,
     pub(crate) connector_snapshot: Rc<RecordingConnectorSnapshotIo>,
     #[cfg(test)]
@@ -471,6 +582,8 @@ impl KmsServices {
             crtc_output_discovery: Rc::new(DrmCrtcOutputDiscovery),
             atomic: Rc::new(DrmAtomicCommitExecutor),
             page_flip_events: Rc::new(DrmPageFlipEventSource),
+            render_completion_readiness: Rc::new(PollRenderCompletionReadiness),
+            copied_scanout_copy: Rc::new(VulkanCopiedScanoutCopySubmitter),
             hotplug: Rc::new(DrmDisplayHotplugSource::new()),
             connector_snapshot: Rc::new(DrmConnectorSnapshotIo),
             monotonic_clock: Rc::new(Instant::now),
@@ -482,6 +595,11 @@ impl KmsServices {
 
     #[cfg(test)]
     pub(crate) fn for_tests() -> Self {
+        Self::for_tests_with_clock(Rc::new(Instant::now))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_with_clock(monotonic_clock: Rc<dyn Fn() -> Instant>) -> Self {
         let atomic =
             Rc::new(crate::drm::atomic::tests_support::RecordingAtomicCommitExecutor::default());
         let crtc_output_discovery = Rc::new(RecordingCrtcOutputDiscovery::default());
@@ -496,6 +614,8 @@ impl KmsServices {
         let page_flip_events = Rc::new(
             crate::kms::render::platform::flip_events::RecordingPageFlipEventSource::default(),
         );
+        let render_completion_readiness = Rc::new(RecordingRenderCompletionReadiness::default());
+        let copied_scanout_copy = Rc::new(RecordingCopiedScanoutCopySubmitter::default());
         let hotplug =
             Rc::new(RecordingDisplayHotplugSource::new().expect("recording hotplug socket pair"));
         let connector_snapshot = Rc::new(RecordingConnectorSnapshotIo::new());
@@ -512,6 +632,8 @@ impl KmsServices {
             output_power,
             gamma: Rc::clone(&gamma),
             page_flip_events: Rc::clone(&page_flip_events),
+            render_completion_readiness: Rc::clone(&render_completion_readiness),
+            copied_scanout_copy: Rc::clone(&copied_scanout_copy),
             hotplug: Rc::clone(&hotplug),
             connector_snapshot: Rc::clone(&connector_snapshot),
             direct_scanout_test_only: Rc::clone(&direct_scanout_test_only),
@@ -526,9 +648,11 @@ impl KmsServices {
             crtc_output_discovery,
             atomic,
             page_flip_events,
+            render_completion_readiness,
+            copied_scanout_copy,
             hotplug,
             connector_snapshot,
-            monotonic_clock: Rc::new(Instant::now),
+            monotonic_clock,
             direct_scanout_test_only,
             backend_entry_observer,
             test_recorders: Some(test_recorders),
@@ -537,6 +661,11 @@ impl KmsServices {
 
     #[cfg(not(test))]
     pub(crate) fn for_tests() -> Self {
+        Self::for_tests_with_clock(Rc::new(Instant::now))
+    }
+
+    #[cfg(not(test))]
+    pub(crate) fn for_tests_with_clock(monotonic_clock: Rc<dyn Fn() -> Instant>) -> Self {
         let atomic =
             Rc::new(crate::drm::atomic::tests_support::RecordingAtomicCommitExecutor::default());
         let mode_blobs = Rc::new(RecordingModeBlobIo::default());
@@ -557,9 +686,11 @@ impl KmsServices {
             crtc_output_discovery: Rc::new(DrmCrtcOutputDiscovery),
             atomic,
             page_flip_events,
+            render_completion_readiness: Rc::new(PollRenderCompletionReadiness),
+            copied_scanout_copy: Rc::new(VulkanCopiedScanoutCopySubmitter),
             hotplug,
             connector_snapshot: Rc::new(RecordingConnectorSnapshotIo::new()),
-            monotonic_clock: Rc::new(Instant::now),
+            monotonic_clock,
             direct_scanout_test_only: Rc::new(DrmDirectScanoutTestOnlyExecutor),
             backend_entry_observer: Rc::new(NoopBackendEntryObserver),
             test_recorders: None,

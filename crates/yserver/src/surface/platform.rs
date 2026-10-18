@@ -34,7 +34,8 @@ use crate::kms::{
         gpu::{FencePool, GpuCore},
         resize_fault,
         scene::{
-            CursorPlaneSink, CursorShowFailure, CursorUploadOutcome, FinishOutcome, FlipRetirement,
+            CursorAcceptedMode, CursorFrameAssignment, CursorFramePlan, CursorPlaneSink,
+            CursorShowFailure, CursorUploadOutcome, FinishOutcome, FlipRetirement, FrameHandoff,
             FrameTargetError, OffscreenTarget, OutputLayout, OutputRoute, OutputSink,
             PreparedOutputs, RecordFrame, RenderCompletion, SceneCompositor, SlotToken,
         },
@@ -134,6 +135,49 @@ impl SurfacePlatform {
             outputs,
             cursor: HostCursor::default(),
         }
+    }
+
+    fn cursor_uploaded_image_matches(&self, version: u64, hot: (u16, u16)) -> bool {
+        self.cursor
+            .image
+            .as_ref()
+            .is_some_and(|image| image.version == version && image.hot == hot)
+    }
+
+    fn cursor_upload(
+        &mut self,
+        version: u64,
+        hot: (u16, u16),
+        width: u32,
+        height: u32,
+        bgra_bytes: &[u8],
+    ) -> io::Result<CursorUploadOutcome> {
+        self.cursor.image = Some(CursorImage {
+            version,
+            width,
+            height,
+            hot,
+            bgra: Arc::from(bgra_bytes),
+        });
+        Ok(CursorUploadOutcome::Ready)
+    }
+
+    fn cursor_show(&mut self, hot: (u16, u16)) -> Result<(), CursorShowFailure> {
+        let Some(image) = self.cursor.image.as_mut() else {
+            return Err(CursorShowFailure {
+                remains_visible: self.cursor.shown,
+                deferred: false,
+                error: "no cursor image uploaded".into(),
+            });
+        };
+        image.hot = hot;
+        self.cursor.shown = true;
+        Ok(())
+    }
+
+    fn cursor_hide(&mut self) -> io::Result<()> {
+        self.cursor.shown = false;
+        Ok(())
     }
 
     /// The largest output the window system shows unclamped; the mode list
@@ -277,12 +321,33 @@ impl OutputSink for SurfacePlatform {
         &mut self,
         output_idx: usize,
         bo_idx: usize,
+        cursor: CursorFramePlan,
         record: &mut RecordFrame<'_>,
     ) -> FinishOutcome {
-        match self.outputs.get_mut(output_idx) {
-            Some(output) => output.finish_frame(bo_idx, record),
-            None => FinishOutcome::Unavailable(FrameTargetError::NoSlot),
+        let frame = cursor.frame;
+        let mut outcome = match self.outputs.get_mut(output_idx) {
+            Some(output) => output.finish_frame(bo_idx, cursor.clone(), record),
+            None => return FinishOutcome::Unavailable(FrameTargetError::NoSlot),
+        };
+        if let FinishOutcome::Finished {
+            result:
+                Ok(FrameHandoff::FlipPending {
+                    cursor: receipt, ..
+                }),
+            ..
+        } = &mut outcome
+        {
+            receipt.frame = Some(frame);
+            receipt.mode = accept_cursor_frame(self, output_idx, &cursor);
+            if matches!(
+                receipt.mode,
+                CursorAcceptedMode::Hardware | CursorAcceptedMode::Hidden
+            ) {
+                receipt.primary_cursor =
+                    crate::kms::render::scene::CursorPrimaryContent::Cursorless;
+            }
         }
+        outcome
     }
 
     fn invalidate_slot(&mut self, output_idx: usize, bo_idx: usize) {
@@ -334,8 +399,84 @@ impl OutputSink for SurfacePlatform {
         _output_idx: usize,
         _bo_idx: usize,
         _fd: Option<OwnedFd>,
-    ) -> io::Result<()> {
+    ) -> io::Result<crate::kms::render::scene::CursorCommitReceipt> {
         Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+}
+
+/// Settle this frame's captured native cursor operation only after its
+/// surface handoff succeeded, then report the state the host cursor kept.
+fn accept_cursor_frame(
+    platform: &mut SurfacePlatform,
+    _output_idx: usize,
+    plan: &CursorFramePlan,
+) -> CursorAcceptedMode {
+    if plan.hardware_only {
+        // The native host cursor already owns visibility and sprite state. A
+        // primary frame carries cursorless content and must not hide it just
+        // because this frame did not capture a new sprite snapshot.
+        return accepted_cursor_mode(platform);
+    }
+    match plan.assignment {
+        CursorFrameAssignment::Hardware => {
+            let Some(sprite) = plan.sprite.as_ref() else {
+                let _ = platform.cursor_hide();
+                return accepted_cursor_mode(platform);
+            };
+            let (hot_x, hot_y) = (
+                u16::try_from(sprite.hot_x.max(0)).unwrap_or(0),
+                u16::try_from(sprite.hot_y.max(0)).unwrap_or(0),
+            );
+            let uploaded =
+                if platform.cursor_uploaded_image_matches(sprite.record_version, (hot_x, hot_y)) {
+                    true
+                } else if let Some(bytes) = sprite.bgra_bytes.as_deref() {
+                    matches!(
+                        platform.cursor_upload(
+                            sprite.record_version,
+                            (hot_x, hot_y),
+                            sprite.extent.width,
+                            sprite.extent.height,
+                            bytes,
+                        ),
+                        Ok(CursorUploadOutcome::Ready)
+                    )
+                } else {
+                    false
+                };
+            if !uploaded {
+                let _ = platform.cursor_hide();
+                return accepted_cursor_mode(platform);
+            }
+            if let Err(failure) = platform.cursor_show((hot_x, hot_y)) {
+                log::warn!("surface: native cursor show failed: {}", failure.error);
+            }
+            accepted_cursor_mode(platform)
+        }
+        CursorFrameAssignment::Software { .. } => {
+            if let Err(error) = platform.cursor_hide() {
+                log::warn!("surface: native cursor hide failed: {error}");
+            }
+            if platform.cursor.shown {
+                CursorAcceptedMode::Hardware
+            } else {
+                CursorAcceptedMode::Software
+            }
+        }
+        CursorFrameAssignment::Hidden => {
+            if let Err(error) = platform.cursor_hide() {
+                log::warn!("surface: native cursor hide failed: {error}");
+            }
+            accepted_cursor_mode(platform)
+        }
+    }
+}
+
+fn accepted_cursor_mode(platform: &SurfacePlatform) -> CursorAcceptedMode {
+    if platform.cursor.shown {
+        CursorAcceptedMode::Hardware
+    } else {
+        CursorAcceptedMode::Hidden
     }
 }
 
@@ -361,56 +502,6 @@ impl CursorPlaneSink for SurfacePlatform {
             .image
             .as_ref()
             .is_some_and(|image| image.version == version && image.hot == (hot_x, hot_y))
-    }
-
-    fn upload(
-        &mut self,
-        _output_idx: usize,
-        version: u64,
-        hot_x: u16,
-        hot_y: u16,
-        width: u32,
-        height: u32,
-        bgra_bytes: &[u8],
-    ) -> io::Result<CursorUploadOutcome> {
-        self.cursor.image = Some(CursorImage {
-            version,
-            width,
-            height,
-            hot: (hot_x, hot_y),
-            bgra: Arc::from(bgra_bytes),
-        });
-        Ok(CursorUploadOutcome::Ready)
-    }
-
-    fn show(
-        &mut self,
-        _output_idx: usize,
-        hot_x: u16,
-        hot_y: u16,
-        _x: i32,
-        _y: i32,
-    ) -> Result<(), CursorShowFailure> {
-        let Some(image) = self.cursor.image.as_mut() else {
-            return Err(CursorShowFailure {
-                remains_visible: self.cursor.shown,
-                deferred: false,
-                error: "no cursor image uploaded".into(),
-            });
-        };
-        image.hot = (hot_x, hot_y);
-        self.cursor.shown = true;
-        Ok(())
-    }
-
-    fn hide(&mut self, _output_idx: usize) -> io::Result<()> {
-        self.cursor.shown = false;
-        Ok(())
-    }
-
-    fn hide_all(&mut self) -> io::Result<()> {
-        self.cursor.shown = false;
-        Ok(())
     }
 
     fn note_composed_retirement(&mut self, _output_idx: usize) -> bool {
@@ -972,6 +1063,65 @@ impl Platform for SurfacePlatform {
         b.drain_paint_submit_telemetry();
         b.flush_host_cursor();
         Ok(())
+    }
+
+    fn note_cursor_pointer(_b: &mut XBackend<Self>, _pos: (i32, i32)) {}
+
+    fn queue_cursor_intent(
+        b: &mut XBackend<Self>,
+        record: Option<&crate::kms::render::cursor::CursorRecord>,
+        visible: bool,
+        _pos: (i32, i32),
+    ) -> bool {
+        let output_idx = 0;
+        let mut accepted_mode = CursorAcceptedMode::Hidden;
+        if let Some(record) = record {
+            let hot = (record.hot_x, record.hot_y);
+            let already_uploaded = b
+                .platform
+                .cursor
+                .image
+                .as_ref()
+                .is_some_and(|image| image.version == record.version && image.hot == hot);
+            let uploaded = already_uploaded
+                || matches!(
+                    b.platform.cursor_upload(
+                        record.version,
+                        hot,
+                        u32::from(record.width),
+                        u32::from(record.height),
+                        &record.bgra_bytes,
+                    ),
+                    Ok(CursorUploadOutcome::Ready)
+                );
+            if visible && uploaded {
+                if let Err(failure) = b.platform.cursor_show(hot) {
+                    log::warn!("surface: native cursor show failed: {}", failure.error);
+                } else {
+                    accepted_mode = CursorAcceptedMode::Hardware;
+                }
+            } else if !visible {
+                let _ = b.platform.cursor_hide();
+            }
+        } else {
+            let _ = b.platform.cursor_hide();
+        }
+        if b.platform.cursor.shown {
+            accepted_mode = CursorAcceptedMode::Hardware;
+        }
+        if !b.platform.outputs.is_empty() {
+            b.scene.note_cursor_commit_accepted(
+                output_idx,
+                crate::kms::render::scene::CursorCommitReceipt {
+                    frame: None,
+                    mode: accepted_mode,
+                    primary_cursor: crate::kms::render::scene::CursorPrimaryContent::Cursorless,
+                    needs_recompose: false,
+                },
+            );
+        }
+        b.flush_host_cursor();
+        true
     }
 
     /// The window system moves its cursor itself: nothing to compose.

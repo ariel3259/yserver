@@ -32,6 +32,7 @@
 mod build;
 mod compose;
 mod cursor;
+mod cursor_frame;
 mod damage;
 mod damage_audit;
 mod flip;
@@ -49,6 +50,7 @@ pub use build::*;
 use compose::*;
 #[cfg(test)]
 use cursor::*;
+pub use cursor_frame::*;
 #[cfg(test)]
 use damage::*;
 #[cfg(test)]
@@ -156,6 +158,10 @@ struct PendingAck {
     bo_idx: usize,
     generation: u64,
     stage: InFlightStage,
+    /// The exact scene cursor assignment that was handed to the output seam.
+    cursor_frame: CursorFramePlan,
+    /// Scene handoffs remain receipt-less until their primary commit succeeds.
+    cursor_receipt: Option<CursorCommitReceipt>,
     /// Snapshots taken at tick entry, one per source drawable
     /// that contributed to the compose. Ack'd against the
     /// store's live presentation damage on flip retirement.
@@ -177,24 +183,10 @@ struct PendingAck {
     submitted_participants: Vec<ScenePresence>,
     submitted_scene_structure_damage: RegionSet,
     submitted_failed_repaint: RegionSet,
-    /// Stage 5 Phase D — cursor-plane transition queued behind
-    /// this commit. Populated AFTER the compose + atomic commit
-    /// succeed (failed submit drops the transition; the next
-    /// frame re-decides). Consumed by `handle_page_flip_complete`
-    /// which applies the per-CRTC show/hide.
-    cursor_transition: Option<CursorTransition>,
-    /// Stage 5 Phase D — new value for the per-output cursor
-    /// prev-pos. Applied to `OutputSceneState.cursor_prev_pos`
-    /// only when this ack retires successfully (codex v4-pass
-    /// transactional rule). Failed submit → prev_pos for this
-    /// output is NOT advanced, and the next frame still damages
-    /// the OLD prev rect to clear the trail.
-    cursor_prev_pos_after_retire: Option<Option<(i32, i32)>>,
-    /// Stage 5 Phase D — `OutputSceneState.last_frame_cursor_mode`
-    /// value to install on successful retire. Captures what's
-    /// committed to the screen after this flip. Failed submit
-    /// → mode stays as-is.
-    cursor_mode_after_retire: OutputCursorMode,
+    /// Cursor mode accepted before this frame began. Together with its plan
+    /// or receipt, this lets C1 wait for a mode-changing scene commit to
+    /// retire without retaining a second cursor operation.
+    cursor_mode_before: CursorAcceptedMode,
     /// Cursor footprint that this output actually presented in the
     /// submitted frame. Applied only on retire so a failed submit
     /// leaves the old footprint in place for the next re-poke.
@@ -234,49 +226,22 @@ pub enum CursorAssignment {
     Hidden,
 }
 
-/// Stage 5 Phase D — transition queued on a `PendingAck` after the
-/// per-output commit succeeds. Consumed at retirement.
-#[derive(Debug, Clone, Copy)]
-enum CursorTransition {
-    /// Retire-time action: optionally upload (if `upload_version`
-    /// != `CursorPlane.uploaded_version`), then `show_on_crtc` to
-    /// bind the plane and reposition.
-    ShowOnRetire {
-        upload_version: u64,
-        hot_x: u16,
-        hot_y: u16,
-        x: i32,
-        y: i32,
-    },
-    /// Retire-time action: `hide_on_crtc`. The submitted frame is cursorless,
-    /// so a failed hide can leave only the old HW sprite visible. When
-    /// `reveal_sw_after` is true, a successful hide forces a second frame that
-    /// may finally composite the software cursor.
-    HideOnRetire { reveal_sw_after: bool },
-}
-
-/// Stage 5 Phase D — per-output cursor-plane mode tracked across
-/// frames. Drives the `Sw → Hw` / `Hw → Sw` transition matrix.
+/// Per-output cursor mode from the latest accepted receipt. Scene flip
+/// retirement updates only the primary-pixel footprint metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutputCursorMode {
     /// Last frame drew the cursor via the SW composite path on
     /// this output. `prev` is the SW position carried for trail
     /// elimination.
     Sw { prev: Option<(i32, i32)> },
-    /// The cursorless hide phase retired successfully and a software reveal
-    /// frame is still required. This votes SW/Mixed so direct scanout and the
-    /// pointer HW-only fast path cannot bypass phase two.
-    SwPending,
     /// Last frame's plane is bound on this CRTC and showing.
     Hw,
     /// Cursor is off-output or unregistered on this frame.
     Hidden,
 }
 
-/// Stage 5 Phase D — query result for the pointer fast path.
-/// `Hw` is only reached when EVERY active output has retired its
-/// transition to HW; mixed-state outputs return `Mixed`, which
-/// suppresses the fast path until every flip retires.
+/// Query result for the pointer fast path. A mode-changing receipt remains
+/// `Mixed` until its owning scene flip retires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CursorPlaneMode {
     /// Every active output is in HW mode + no transitions pending
@@ -285,8 +250,8 @@ pub enum CursorPlaneMode {
     /// Every active output has the cursor hidden and no transition is pending.
     /// Direct scanout is compatible and pointer motion has nothing to move.
     Hidden,
-    /// At least one output is currently SW or in transition. The
-    /// pointer fast path falls back to `scene.wake_for_damage`.
+    /// At least one output is SW, or has a mode-changing receipt in flight.
+    /// The pointer fast path falls back to `scene.wake_for_damage`.
     Mixed,
     /// At least one output needs software cursor composition.
     Sw,
@@ -347,6 +312,9 @@ struct OutputSceneState {
     /// successful flip (transactional commit per codex round 2
     /// point 2).
     current_generation: u64,
+    /// Cursor-frame identity is independent of presentation generation, so a
+    /// failed handoff never lets a later request reuse its frame ID.
+    next_cursor_frame_id: u64,
     /// Scene-structure damage in output coords. Accumulated by
     /// `mark_scene_structure_damage(region)`; subtracted on
     /// retirement using the snapshot captured at submit time.
@@ -365,21 +333,16 @@ struct OutputSceneState {
     /// commit can be retried once per core-loop iteration and flood
     /// KMS/RADV until the GPU context is lost.
     next_submit_retry_at: Option<std::time::Instant>,
-    /// Stage 5 Phase D — per-output last-frame cursor mode. Drives
-    /// the transition matrix in `tick_one_output`. v2's per-output
-    /// frame retirement means scene-global cursor state would let
-    /// output A's Sw→Hw fire while output B is still scanning the
-    /// BO with SW pixels (multi-output double-cursor hazard);
-    /// per-output mode + per-output `cursor_prev_pos` closes that.
+    /// Latest cursor mode accepted by a commit for this output.
     last_frame_cursor_mode: OutputCursorMode,
+    /// Latest cursor state accepted by an output sink.
+    cursor_commit_receipt: Option<CursorCommitReceipt>,
     /// Stage 5 Phase D — per-output SW cursor position carried so
     /// the next tick can damage the OLD rect. v3 of the plan moved
     /// this from `SceneCompositorInner.cursor_prev_pos`
     /// (scene-global) per the per-output isolation rule.
-    /// **Transactional**: advances ONLY when the matching
-    /// `PendingAck.cursor_prev_pos_after_retire` retires
-    /// successfully — a failed submit must leave the OLD prev rect
-    /// in place so the next frame still clears the trail.
+    /// Advances only when the matching primary frame retires, so a failed
+    /// submit leaves the old software footprint available to clear its trail.
     cursor_prev_pos: Option<(i32, i32)>,
     /// Cursor footprint from the last successfully presented frame
     /// on this output. Used to decide whether the current frame
@@ -389,10 +352,6 @@ struct OutputSceneState {
     /// frame on this output. Lets a stationary sprite swap damage
     /// once, then return to idle.
     last_present_cursor_version: Option<u64>,
-    /// A steady-HW sprite/hotspot rebind or a prior-binding show failed.
-    /// Force the next Hw→Hw composed retirement to carry ShowOnRetire; do not
-    /// claim the desired cursor metadata until that full rebind succeeds.
-    force_show_retry_version: Option<u64>,
     /// Diagnostic: last reason `tick_one_output` skipped a tick for
     /// this output. Logged at INFO on transition (skip→different-skip,
     /// no-skip→skip, skip→no-skip). Tracks the freeze-debug
@@ -899,36 +858,6 @@ impl From<crate::kms::vk::logic_fill_pipeline::LogicFillError> for SceneError {
     }
 }
 
-/// Stage 5 Phase D — apply a retired-ack's cursor transition via
-/// the platform's per-CRTC hooks, preserving upload-then-show and
-/// cursorless-hide-before-software ordering.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CursorTransitionResult {
-    Applied,
-    /// Sprite storage is temporarily unavailable. Preserve the current
-    /// applied mode and retry the newest wanted record on a later tick.
-    Deferred,
-    /// The requested HW show did not remain bound. The retired frame omitted
-    /// the SW sprite, so actual mode is Hidden until the forced repaint.
-    Hidden,
-    /// A cursorless Hw→Sw phase hid the hardware sprite successfully. Keep
-    /// actual mode Hidden and force the second frame that may draw software.
-    HiddenNeedsRepaint,
-    /// A hide or show rollback failed and a HW binding remains visible.
-    Visible,
-    /// The prior binding is still visible, but the desired full bind/hotspot
-    /// did not land. A later composed Hw→Hw frame must retry ShowOnRetire.
-    VisibleNeedsShowRetry,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CursorRetireResolution {
-    actual_mode: OutputCursorMode,
-    commit_desired_metadata: bool,
-    clear_presented_metadata: bool,
-    force_repaint: bool,
-}
-
 /// One output's contribution to this tick's dormancy decision.
 struct OutputWalkReport<'a> {
     /// `build_scene` ran for this output this tick.
@@ -999,6 +928,8 @@ enum Repaint {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ComposeSubmit {
     descriptor_count: usize,
+    /// Cursor pixels recorded into this compose target.
+    pub primary_cursor: CursorPrimaryContent,
 }
 
 /// The root as a node of the walk: its place is its storage rect at the

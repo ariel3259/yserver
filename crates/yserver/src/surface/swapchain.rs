@@ -19,8 +19,9 @@ use super::{
 };
 use crate::kms::{
     render::scene::{
-        ComposeRenderTarget, FinishOutcome, FlipRetirement, FrameHandoff, FrameTargetError,
-        OffscreenTarget, RecordFrame, SlotToken,
+        ComposeRenderTarget, CursorAcceptedMode, CursorCommitReceipt, CursorFramePlan,
+        FinishOutcome, FlipRetirement, FrameHandoff, FrameTargetError, OffscreenTarget,
+        RecordFrame, SlotToken,
     },
     vk::{
         compositor::PresentError,
@@ -289,6 +290,7 @@ impl SurfaceOutput {
     pub(crate) fn finish_frame(
         &mut self,
         bo_idx: usize,
+        cursor: CursorFramePlan,
         record: &mut RecordFrame<'_>,
     ) -> FinishOutcome {
         if !self.has_slot(bo_idx) || !self.slots.begin_recording(bo_idx) {
@@ -305,7 +307,15 @@ impl SurfaceOutput {
                 log::warn!("surface: present failed: {e:?}");
             }
             self.clock.arm_tick();
-            FrameHandoff::FlipPending(submitted)
+            FrameHandoff::FlipPending {
+                cursor: CursorCommitReceipt {
+                    frame: Some(cursor.frame),
+                    mode: CursorAcceptedMode::Hidden,
+                    primary_cursor: submitted.primary_cursor,
+                    needs_recompose: false,
+                },
+                submit: submitted,
+            }
         });
         let fail_stop = matches!(result, Err(PresentError::Vk(vk::Result::ERROR_DEVICE_LOST)));
         FinishOutcome::Finished {

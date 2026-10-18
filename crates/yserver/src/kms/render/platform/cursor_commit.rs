@@ -1,5 +1,9 @@
 //! Full-state cursor atomic request construction and submission.
 
+use yserver_render::kms::render::scene::{
+    CursorAcceptedMode, CursorCommitReceipt, CursorPrimaryContent,
+};
+
 use crate::{
     drm::atomic::{AtomicCommitRequest, AtomicPropertyUpdate},
     kms::{
@@ -9,6 +13,22 @@ use crate::{
         },
     },
 };
+
+/// Receipt for an accepted hardware-cursor delta. Cursor-only and direct
+/// commits both leave the primary cursorless; mode follows the plane state
+/// only after the atomic request succeeds.
+pub(crate) fn accepted_cursor_only_receipt(visible: bool) -> CursorCommitReceipt {
+    CursorCommitReceipt {
+        frame: None,
+        mode: if visible {
+            CursorAcceptedMode::Hardware
+        } else {
+            CursorAcceptedMode::Hidden
+        },
+        primary_cursor: CursorPrimaryContent::Cursorless,
+        needs_recompose: false,
+    }
+}
 
 pub(crate) fn prepare_cursor_commit(
     properties: CursorPlaneProperties,
@@ -107,6 +127,21 @@ pub(crate) fn add_cursor_plane_updates(
             request.add_cursor_property(atomic.object, atomic.property, atomic.value);
         }
     }
+}
+
+/// Append cursor deltas only to a Vsync scene request. Async scene requests
+/// are cursorless by contract, even when the frame was prepared with a shared
+/// route cursor plan.
+pub(crate) fn add_vsync_scene_cursor_updates(
+    request: &mut AtomicCommitRequest,
+    updates: &[CursorPlaneUpdate],
+    timing: crate::drm::async_flip::FlipTiming,
+) -> bool {
+    if timing != crate::drm::async_flip::FlipTiming::Vsync {
+        return false;
+    }
+    add_cursor_plane_updates(request, updates);
+    !updates.is_empty()
 }
 
 pub(crate) fn request_for_cursor_updates(updates: &[CursorPlaneUpdate]) -> AtomicCommitRequest {

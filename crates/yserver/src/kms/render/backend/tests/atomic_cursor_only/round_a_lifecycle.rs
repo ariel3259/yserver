@@ -342,7 +342,17 @@ fn enter_direct_scanout(fixture: &mut AtomicCursorFixture) {
                 .expect("settle composed direct-probe frame");
         }
     }
-    assert!(entered, "Backend direct Presents reach held direct scanout");
+    assert!(
+        entered,
+        "Backend direct Presents reach held direct scanout: mode={:?}, transition_pending={}, scene_flip={}, primary_ready={}, cursor_receipt={:?}, cursor_visible={}, scene_wants={}",
+        fixture.backend.scene.cursor_mode(),
+        fixture.backend.scene.cursor_transition_pending(),
+        fixture.backend.scene.has_pending_page_flips(),
+        fixture.backend.scene.direct_scanout_primary_ready(),
+        fixture.backend.scene.for_tests_cursor_commit_receipt(0),
+        fixture.backend.platform.cursor_plane_visible_for_output(0),
+        fixture.backend.for_tests_scene_wants_scene(),
+    );
 }
 
 #[test]

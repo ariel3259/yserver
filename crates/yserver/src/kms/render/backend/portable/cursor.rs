@@ -404,11 +404,28 @@ impl<P: Platform> XBackend<P> {
         // The sprite's reference moved: the cursor it showed may be gone.
         self.collect_released_cursors();
         let Some(xid) = new_xid else {
-            self.scene.clear_cursor();
-            P::hide_cursor_under_direct_scanout(self);
+            let repaint = matches!(
+                self.scene.cursor_mode(),
+                crate::kms::render::scene::CursorPlaneMode::Sw
+                    | crate::kms::render::scene::CursorPlaneMode::Mixed
+            );
+            if repaint {
+                self.scene.clear_cursor();
+            } else {
+                self.scene.observe_cursor(None);
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            let pos = (self.core.cursor_x as i32, self.core.cursor_y as i32);
+            P::queue_cursor_intent(self, None, false, pos);
             return;
         };
         self.display_cursor_by_handle(xid);
+        if P::tearing_active(self)
+            && self.tearing_cursor_wants_visible()
+            && P::direct_scanout_owns_frame(self)
+        {
+            P::request_direct_unflip(self, "tearing_cursor_handoff");
+        }
     }
 
     /// Whether the effective sprite is hidden after combining XFIXES state,
@@ -494,20 +511,30 @@ impl<P: Platform> XBackend<P> {
         P::cursor_intersects_outputs(self, cursor_x, cursor_y, hot_x, hot_y, width, height)
     }
 
-    /// XFIXES `HideCursor` / `ShowCursor` edge. Hiding drops the scene's
-    /// cursor entry (the scene then assigns `Hidden` on every output, which
-    /// detaches a bound HW plane on the next retire) and, while a direct
-    /// root scanout owns the planes, detaches the legacy cursor plane
-    /// right away since no compose will run. Showing re-displays the
-    /// current effective cursor through the ordinary path.
+    /// XFIXES `HideCursor` / `ShowCursor` edge. Hardware visibility becomes
+    /// cursor intent; software outputs still use a scene frame to repaint.
     pub(in crate::kms::render::backend) fn apply_cursor_hidden(&mut self, hidden: bool) {
         if self.cursor_hidden == hidden {
             return;
         }
         self.cursor_hidden = hidden;
         if self.effective_cursor_hidden() {
-            self.scene.clear_cursor();
-            P::hide_cursor_under_direct_scanout(self);
+            let repaint = matches!(
+                self.scene.cursor_mode(),
+                crate::kms::render::scene::CursorPlaneMode::Sw
+                    | crate::kms::render::scene::CursorPlaneMode::Mixed
+            );
+            if repaint {
+                self.scene.clear_cursor();
+            } else {
+                self.scene.observe_cursor(None);
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            let pos = (self.core.cursor_x as i32, self.core.cursor_y as i32);
+            let record = self
+                .effective_cursor_xid
+                .and_then(|xid| self.cursor_records.get(&xid).cloned());
+            P::queue_cursor_intent(self, record.as_deref(), false, pos);
             return;
         }
         let Some(xid) = self.effective_cursor_xid else {
@@ -547,7 +574,7 @@ impl<P: Platform> XBackend<P> {
         self.active_cursor_anim = Some(crate::kms::render::cursor::ActiveCursorAnim {
             handle: xid,
             frame: 0,
-            next_frame: std::time::Instant::now() + delay,
+            next_frame: P::monotonic_now(self) + delay,
         });
     }
 
@@ -559,7 +586,7 @@ impl<P: Platform> XBackend<P> {
         if !self.kms_outputs_active || !P::scanout_allowed(self) {
             return;
         }
-        let now = std::time::Instant::now();
+        let now = P::monotonic_now(self);
         let Some(st) = self.active_cursor_anim.as_ref() else {
             return;
         };
@@ -597,6 +624,23 @@ impl<P: Platform> XBackend<P> {
         self.active_cursor_anim.as_ref().map(|st| st.next_frame)
     }
 
+    /// Re-submit the newest portable observation to the platform after a
+    /// resource release. KMS uses this to retry a sprite retained under pool
+    /// pressure; surface platforms deduplicate the unchanged native image.
+    pub(crate) fn queue_effective_cursor_intent(&mut self) {
+        let record = self
+            .effective_cursor_xid
+            .and_then(|xid| self.cursor_records.get(&xid).cloned());
+        #[allow(clippy::cast_possible_truncation)]
+        let pos = (self.core.cursor_x as i32, self.core.cursor_y as i32);
+        P::queue_effective_cursor_intent(
+            self,
+            record.as_deref(),
+            !self.effective_cursor_hidden(),
+            pos,
+        );
+    }
+
     /// Re-point the canonical maps at an animation frame under a
     /// freshly-minted monotonic version. The byte clone is bounded
     /// by cursor size (≤16 KiB for HW-plane cursors).
@@ -627,35 +671,36 @@ impl<P: Platform> XBackend<P> {
         }
     }
 
-    /// Push `cursor_records[xid]` to the scene / HW plane — the
-    /// former tail of `refresh_effective_cursor`, shared with the
-    /// animation tick. Keeps the sample-view readiness guard
-    /// (Vk-less fixtures build records without sprite allocs).
-    fn display_cursor_by_handle(&mut self, xid: u32) {
-        // Hidden cursors (including empty images and animations whose frames
-        // are all empty) keep tracking their effective handle but draw nothing.
-        if self.effective_cursor_hidden() {
-            self.scene.clear_cursor();
-            P::hide_cursor_under_direct_scanout(self);
+    /// Push `cursor_records[xid]` to the scene and platform cursor intent.
+    /// Queue hardware bytes before checking for a scene sample view: a HW-only
+    /// update must not depend on the software sprite allocation succeeding.
+    fn route_direct_cursor_intent(
+        &mut self,
+        record: &std::sync::Arc<crate::kms::render::cursor::CursorRecord>,
+    ) {
+        if !P::direct_scanout_owns_frame(self) {
             return;
         }
+        if P::tearing_active(self) {
+            if self.tearing_cursor_wants_visible() {
+                P::request_direct_unflip(self, "tearing_cursor_handoff");
+            }
+            return;
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let pos = (self.core.cursor_x as i32, self.core.cursor_y as i32);
+        if !P::queue_cursor_intent(self, Some(record), true, pos) {
+            P::request_direct_unflip(self, "cursor_show_failed");
+        }
+    }
+
+    fn display_cursor_by_handle(&mut self, xid: u32) {
         let Some(record) = self.cursor_records.get(&xid).cloned() else {
             return;
         };
-        let Some(&pixmap_id) = self.cursor_pixmaps.get(&xid) else {
-            return;
-        };
-        // Sample-view readiness check — same gate as Stage 3f.8's
-        // boot path. A Vk-less fixture builds the record but skips
-        // the sprite alloc, so this short-circuits cleanly.
-        if self
-            .store
-            .get(pixmap_id)
-            .map(|d| d.storage.image_view == ash::vk::ImageView::null())
-            .unwrap_or(true)
-        {
-            return;
-        }
+        let visible = !self.effective_cursor_hidden();
+        #[allow(clippy::cast_possible_truncation)]
+        let pos = (self.core.cursor_x as i32, self.core.cursor_y as i32);
         // Parameter changes can make a previously-EINVAL cursor bind valid.
         // Notify every device even while all outputs are temporarily using SW;
         // record version/pixel-only animation changes intentionally do not
@@ -667,67 +712,58 @@ impl<P: Platform> XBackend<P> {
             record.hot_x,
             record.hot_y,
         );
-        self.scene
-            .register_cursor(crate::kms::render::scene::CursorEntry {
-                id: pixmap_id,
-                extent: ash::vk::Extent2D {
-                    width: u32::from(record.width),
-                    height: u32::from(record.height),
-                },
-                hot_x: i16::try_from(record.hot_x).unwrap_or(i16::MAX),
-                hot_y: i16::try_from(record.hot_y).unwrap_or(i16::MAX),
-                record_version: record.version,
-                bgra_bytes: Some(std::sync::Arc::new(record.bgra_bytes.clone())),
-            });
+        let handled_by_platform = P::observe_cursor_intent(self, Some(&record), visible, pos);
+        let repaint = self.scene.owes_repaint()
+            || matches!(
+                self.scene.cursor_mode(),
+                crate::kms::render::scene::CursorPlaneMode::Sw
+                    | crate::kms::render::scene::CursorPlaneMode::Mixed
+            )
+            || !handled_by_platform;
+
+        if !visible {
+            if repaint {
+                self.scene.clear_cursor();
+            } else {
+                self.scene.observe_cursor(None);
+            }
+            return;
+        }
+
+        let Some(&pixmap_id) = self.cursor_pixmaps.get(&xid) else {
+            self.route_direct_cursor_intent(&record);
+            return;
+        };
+        if self
+            .store
+            .get(pixmap_id)
+            .map(|d| d.storage.image_view == ash::vk::ImageView::null())
+            .unwrap_or(true)
+        {
+            self.route_direct_cursor_intent(&record);
+            return;
+        }
+        let entry = crate::kms::render::scene::CursorEntry {
+            id: pixmap_id,
+            extent: ash::vk::Extent2D {
+                width: u32::from(record.width),
+                height: u32::from(record.height),
+            },
+            hot_x: i16::try_from(record.hot_x).unwrap_or(i16::MAX),
+            hot_y: i16::try_from(record.hot_y).unwrap_or(i16::MAX),
+            record_version: record.version,
+            bgra_bytes: Some(std::sync::Arc::new(record.bgra_bytes.clone())),
+        };
+        if repaint {
+            self.scene.register_cursor(entry);
+        } else {
+            self.scene.observe_cursor(Some(entry));
+        }
 
         if P::tearing_active(self) {
-            if self.tearing_cursor_wants_visible() && P::direct_scanout_owns_frame(self) {
-                P::request_direct_unflip(self, "tearing_cursor_handoff");
-            }
             return;
         }
-        if P::direct_scanout_owns_frame(self) {
-            if !P::refresh_direct_cursor(self, &record) {
-                P::request_direct_unflip(self, "cursor_show_failed");
-            }
-            return;
-        }
-
-        // Stage 5 Phase D — steady-state HW sprite-change. When the
-        // plane is fully bound, the scene won't re-tick (v2's
-        // empty-damage fast path at scene.rs:840), so a record
-        // swap would starve the upload waiting for a compose
-        // event. Push the bytes synchronously through the scene's
-        // queueing path; if any output is transitioning, the
-        // bytes land in the deferred slot until the wait set
-        // drains.
-        let refreshes_visible_cursor = !P::tearing_active(self)
-            && match self.scene.cursor_mode() {
-                crate::kms::render::scene::CursorPlaneMode::Hw
-                | crate::kms::render::scene::CursorPlaneMode::Mixed => true,
-                crate::kms::render::scene::CursorPlaneMode::Hidden
-                | crate::kms::render::scene::CursorPlaneMode::Sw => false,
-            };
-        if refreshes_visible_cursor {
-            // Direct root scanout does not need a composed primary-plane
-            // retirement merely to replace cursor pixels. Update the legacy
-            // cursor planes in place; if any output rejects the operation,
-            // fall through to the scene state machine and unwind M2 so its
-            // ordinary per-output retry/fallback can retire safely.
-            if P::direct_scanout_owns_frame(self)
-                && !P::tearing_active(self)
-                && P::refresh_direct_cursor(self, &record)
-            {
-                return;
-            }
-            let refreshes_hw_binding = self.scene.queue_steady_state_cursor_upload(record.version);
-            if refreshes_hw_binding && P::direct_scanout_owns_frame(self) {
-                P::request_direct_unflip(self, "direct_cursor_refresh_failed");
-            }
-        }
-        // The scene blit ordering: register_cursor already marks
-        // scene_structure_dirty so the next tick repaints; no extra
-        // wake needed.
+        self.route_direct_cursor_intent(&record);
     }
 }
 

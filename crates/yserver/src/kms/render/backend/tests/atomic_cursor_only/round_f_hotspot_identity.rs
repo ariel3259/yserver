@@ -279,14 +279,26 @@ fn atomic_cursor_only_motion_keeps_pending_sprite_hotspot_identity() {
             panic!("visible cursor motion must retain a Show")
         }
     };
-    assert_eq!(pending.lease, prior.lease);
-    assert_eq!(pending.framebuffer, prior.framebuffer);
+    let candidate = fixture.backend.platform.devices[0]
+        .cursor
+        .plane
+        .as_ref()
+        .unwrap()
+        .candidate_sprite()
+        .expect("the replacement hotspot image is staged for hardware");
+    assert_eq!(pending.lease, candidate.0);
+    assert_eq!(pending.framebuffer, candidate.1);
     assert_eq!(
         (pending.hot_x, pending.hot_y),
-        (prior.hot_x, prior.hot_y),
-        "motion uses the accepted sprite's hotspot until the replacement framebuffer is ready",
+        (1, 1),
+        "the newest staged sprite identity and hotspot remain paired",
     );
-    assert_eq!((pending.x, pending.y), (110, 100));
+    assert_eq!((pending.x, pending.y), (109, 99));
+    assert_eq!(
+        state.applied,
+        Some(prior),
+        "staging does not publish acceptance"
+    );
 
     fixture
         .backend
@@ -298,8 +310,7 @@ fn atomic_cursor_only_motion_keeps_pending_sprite_hotspot_identity() {
     assert_eq!(
         atomic_kinds(&fixture),
         vec![
-            crate::drm::atomic::AtomicCommitKind::Scene,
-            crate::drm::atomic::AtomicCommitKind::CursorOnly,
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
             crate::drm::atomic::AtomicCommitKind::Scene,
         ],
         "motion and teardown preserve the recorded commit sequence",
@@ -311,7 +322,7 @@ fn atomic_cursor_only_motion_keeps_pending_sprite_hotspot_identity() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: omit upload-time hotspot and position updates for existing pending Show intents.
+// Mutation: omit accepted-frame hotspot and position updates for existing pending Show intents.
 fn atomic_cursor_only_upload_coalesces_pending_sprite_identity() {
     use yserver_core::backend::Backend;
 
@@ -392,8 +403,19 @@ fn atomic_cursor_only_upload_coalesces_pending_sprite_identity() {
     Backend::define_cursor(&mut fixture.backend, None, root, replacement.as_raw())
         .expect("define replacement boundary cursor through Backend");
     Backend::maybe_composite(&mut fixture.backend).expect("compose replacement cursor scene");
-    assert!(fixture.backend.scene.has_pending_page_flips());
-    fixture.retire_output(0, 5);
+    assert!(!fixture.backend.scene.has_pending_page_flips());
+    assert!(
+        fixture
+            .backend
+            .platform
+            .cursor_commit_in_flight_for_output(0)
+    );
+    assert!(
+        fixture
+            .backend
+            .platform
+            .cursor_commit_in_flight_for_output(1)
+    );
 
     let device_key = fixture.backend.platform.outputs[1].key.device_key;
     let crtc0 = fixture.backend.platform.outputs[0].output.crtc;
@@ -422,6 +444,14 @@ fn atomic_cursor_only_upload_coalesces_pending_sprite_identity() {
     assert_eq!(pending.framebuffer, output0_binding.framebuffer);
     assert_eq!((pending.hot_x, pending.hot_y), (40, 0));
     assert_eq!((pending.x, pending.y), (-38, 90));
+    assert!(
+        fixture
+            .backend
+            .platform
+            .cursor_commit_in_flight_for_output(0)
+    );
+    fixture.retire_output(0, 5);
+    assert!(!fixture.backend.scene.has_pending_page_flip(0));
 
     for frame in 6..18 {
         Backend::maybe_composite(&mut fixture.backend)
@@ -464,20 +494,17 @@ fn atomic_cursor_only_upload_coalesces_pending_sprite_identity() {
     assert_eq!(
         atomic_kinds(&fixture),
         vec![
-            crate::drm::atomic::AtomicCommitKind::Scene,
-            crate::drm::atomic::AtomicCommitKind::Scene,
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
-            crate::drm::atomic::AtomicCommitKind::CursorOnly,
-            crate::drm::atomic::AtomicCommitKind::CursorOnly,
-            crate::drm::atomic::AtomicCommitKind::Scene,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
             crate::drm::atomic::AtomicCommitKind::Scene,
             crate::drm::atomic::AtomicCommitKind::Scene,
         ],
-        "motion, upload, and teardown preserve the recorded commit sequence",
+        "motion and coalesced hotspot intent settle through cursor-only commits before teardown",
     );
     let ledger = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
     drop(fixture);

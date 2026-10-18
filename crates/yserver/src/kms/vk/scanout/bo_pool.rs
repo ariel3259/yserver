@@ -99,6 +99,18 @@ impl OutputScanout {
 }
 
 impl ScanoutBoPool {
+    pub(crate) fn permits_next_slot_acquisition(&mut self) -> bool {
+        !self.unavailable_acquisitions.pop_front().unwrap_or(false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_script_unavailable_acquisitions(
+        &mut self,
+        unavailable: impl IntoIterator<Item = bool>,
+    ) {
+        self.unavailable_acquisitions.extend(unavailable);
+    }
+
     /// Scanout pool for a live scene paired with a recording atomic sink.
     /// The BO images are ordinary Vulkan test targets and their framebuffer
     /// handles are synthetic, so this fixture never probes or opens DRM.
@@ -127,6 +139,7 @@ impl ScanoutBoPool {
         };
         Self {
             bos,
+            unavailable_acquisitions: std::collections::VecDeque::new(),
             width,
             height,
             route,
@@ -176,6 +189,7 @@ impl ScanoutBoPool {
 
         Self {
             bos: vec![bo],
+            unavailable_acquisitions: std::collections::VecDeque::new(),
             width,
             height,
             route,
@@ -546,6 +560,7 @@ impl ScanoutBoPool {
                 {
                     let partial_pool = Self {
                         bos,
+                        unavailable_acquisitions: std::collections::VecDeque::new(),
                         width,
                         height,
                         route,
@@ -564,6 +579,7 @@ impl ScanoutBoPool {
         }
         Ok(Self {
             bos,
+            unavailable_acquisitions: std::collections::VecDeque::new(),
             width,
             height,
             route,

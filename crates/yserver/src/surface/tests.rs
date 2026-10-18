@@ -952,20 +952,64 @@ fn shown(calls: &[UiCall]) -> Vec<Shown> {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn surface_shows_the_root_cursor_once_at_startup() {
-    let Some((mut f, ui, xid)) = cursor_or_skip() else {
+    let Some(mut f) = surface_or_skip() else {
         return;
     };
+    let ui = Arc::new(RecordingUi::default());
+    f.b.pstate.ui = Some(Arc::clone(&ui) as Arc<dyn ShellUi>);
+    let xid = create_window(&mut f.b);
+    f.frame(xid, 0x00FF_0000);
+    // Mutation: defer native cursor show until flip retirement; the first
+    // accepted frame must already report the host cursor as Hardware.
+    let first_receipt =
+        f.b.scene
+            .for_tests_cursor_commit_receipt(0)
+            .expect("first accepted surface frame cursor receipt");
+    assert_eq!(
+        first_receipt.frame,
+        Some(crate::kms::render::scene::CursorFrameId(1)),
+        "the receipt names the first accepted surface frame",
+    );
+    assert_eq!(
+        first_receipt.mode,
+        crate::kms::render::scene::CursorAcceptedMode::Hardware,
+        "the native host cursor is accepted before this frame retires",
+    );
+    assert_eq!(
+        first_receipt.primary_cursor,
+        crate::kms::render::scene::CursorPrimaryContent::Cursorless,
+    );
     let [(_, _, (width, height))] = shown(&ui.take())[..] else {
         panic!("one set_cursor for the first frame");
     };
     assert!(width > 0 && height > 0);
+    f.retire();
     f.frame(xid, 0x0000_FF00);
     f.retire();
+    let receipt =
+        f.b.scene
+            .for_tests_cursor_commit_receipt(0)
+            .expect("accepted surface frame cursor receipt");
+    assert_eq!(
+        receipt.frame,
+        Some(crate::kms::render::scene::CursorFrameId(2)),
+        "the receipt names the second accepted surface frame",
+    );
+    assert_eq!(
+        receipt.mode,
+        crate::kms::render::scene::CursorAcceptedMode::Hardware,
+        "the native host cursor is accepted separately from primary pixels",
+    );
+    assert_eq!(
+        receipt.primary_cursor,
+        crate::kms::render::scene::CursorPrimaryContent::Cursorless,
+    );
     assert!(ui.take().is_empty(), "an unchanged cursor is not re-sent");
 }
 
 #[test]
 #[ignore = "needs live Vulkan ICD"]
+// Mutation: route a native host cursor image change through primary scene composition.
 fn surface_define_cursor_sends_the_new_cursor_without_other_damage() {
     let Some((mut f, ui, _)) = cursor_or_skip() else {
         return;
@@ -977,8 +1021,23 @@ fn surface_define_cursor_sends_the_new_cursor_without_other_damage() {
     let root = f.root();
     f.b.define_cursor(None, root, cursor)
         .expect("define_cursor");
-    assert!(f.compose_due(), "a cursor change alone asks for a frame");
-    f.tick();
+    let receipt =
+        f.b.scene
+            .for_tests_cursor_commit_receipt(0)
+            .expect("native cursor update receipt");
+    assert_eq!(receipt.frame, None);
+    assert_eq!(
+        receipt.mode,
+        crate::kms::render::scene::CursorAcceptedMode::Hardware,
+    );
+    assert_eq!(
+        receipt.primary_cursor,
+        crate::kms::render::scene::CursorPrimaryContent::Cursorless,
+    );
+    assert!(
+        !f.compose_due(),
+        "the host cursor owns sprite changes without a primary frame"
+    );
     let [(version, hot, size)] = shown(&ui.take())[..] else {
         panic!("one set_cursor for the new cursor");
     };
@@ -988,6 +1047,7 @@ fn surface_define_cursor_sends_the_new_cursor_without_other_damage() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD"]
+// Mutation: repaint the primary scene for native host cursor visibility changes.
 fn surface_hide_cursor_hides_and_show_cursor_restores() {
     let Some((mut f, ui, _)) = cursor_or_skip() else {
         return;
@@ -996,16 +1056,156 @@ fn surface_hide_cursor_hides_and_show_cursor_restores() {
         panic!("the root cursor");
     };
     f.b.set_cursor_hidden(true);
-    assert!(f.compose_due(), "hiding asks for a frame");
-    f.tick();
+    let hidden_receipt =
+        f.b.scene
+            .for_tests_cursor_commit_receipt(0)
+            .expect("native cursor hide receipt");
+    assert_eq!(hidden_receipt.frame, None);
+    assert_eq!(
+        hidden_receipt.mode,
+        crate::kms::render::scene::CursorAcceptedMode::Hidden,
+    );
+    assert_eq!(
+        hidden_receipt.primary_cursor,
+        crate::kms::render::scene::CursorPrimaryContent::Cursorless,
+    );
+    assert!(
+        !f.compose_due(),
+        "native hide does not need a primary frame"
+    );
     assert_eq!(ui.take(), [UiCall::Cursor(None)]);
     f.b.set_cursor_hidden(false);
-    assert!(f.compose_due(), "showing asks for a frame");
-    f.tick();
+    let shown_receipt =
+        f.b.scene
+            .for_tests_cursor_commit_receipt(0)
+            .expect("native cursor show receipt");
+    assert_eq!(shown_receipt.frame, None);
+    assert_eq!(
+        shown_receipt.mode,
+        crate::kms::render::scene::CursorAcceptedMode::Hardware,
+    );
+    assert_eq!(
+        shown_receipt.primary_cursor,
+        crate::kms::render::scene::CursorPrimaryContent::Cursorless,
+    );
+    assert!(
+        !f.compose_due(),
+        "native show does not need a primary frame"
+    );
     let [(version, _, _)] = shown(&ui.take())[..] else {
         panic!("shown again");
     };
     assert_eq!(version, first, "the same cursor");
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutations: paint a software cursor into the primary or omit the native ShellUi notification; the cursorless receipt, unchanged frame count, or expected host cursor call must fail.
+fn atomic_cursor_only_surface_cursor_preserves_native_ownership() {
+    use crate::kms::render::scene::{CursorAcceptedMode, CursorPrimaryContent};
+
+    let Some((mut f, ui, _)) = cursor_or_skip() else {
+        return;
+    };
+    ui.take();
+    let root = f.root();
+    let frames_before = f.output().frames_presented();
+
+    let first_cursor = f.cursor((2, 3));
+    f.b.define_cursor(None, root, first_cursor)
+        .expect("define native cursor through Backend");
+    let first_receipt =
+        f.b.scene
+            .for_tests_cursor_commit_receipt(0)
+            .expect("native cursor definition receipt");
+    assert_eq!(first_receipt.frame, None);
+    assert_eq!(first_receipt.mode, CursorAcceptedMode::Hardware);
+    assert_eq!(
+        first_receipt.primary_cursor,
+        CursorPrimaryContent::Cursorless
+    );
+    let [(first_version, first_hot, first_size)] = shown(&ui.take())[..] else {
+        panic!("one native ShellUi cursor definition");
+    };
+    assert_eq!(first_hot, (2, 3));
+    assert_eq!(first_size, (16, 16));
+
+    let replacement = f.cursor((7, 9));
+    f.b.define_cursor(None, root, replacement)
+        .expect("replace native image and hotspot through Backend");
+    let image_receipt =
+        f.b.scene
+            .for_tests_cursor_commit_receipt(0)
+            .expect("replacement cursor receipt");
+    assert_eq!(image_receipt.frame, None);
+    assert_eq!(image_receipt.mode, CursorAcceptedMode::Hardware);
+    assert_eq!(
+        image_receipt.primary_cursor,
+        CursorPrimaryContent::Cursorless
+    );
+    let [(replacement_version, replacement_hot, replacement_size)] = shown(&ui.take())[..] else {
+        panic!("one native ShellUi cursor image update");
+    };
+    assert_ne!(replacement_version, first_version);
+    assert_eq!(replacement_hot, (7, 9));
+    assert_eq!(replacement_size, (16, 16));
+
+    f.b.set_cursor_hidden(true);
+    let hidden_receipt =
+        f.b.scene
+            .for_tests_cursor_commit_receipt(0)
+            .expect("native hide receipt");
+    assert_eq!(hidden_receipt.frame, None);
+    assert_eq!(hidden_receipt.mode, CursorAcceptedMode::Hidden);
+    assert_eq!(
+        hidden_receipt.primary_cursor,
+        CursorPrimaryContent::Cursorless
+    );
+    assert_eq!(ui.take(), [UiCall::Cursor(None)]);
+
+    f.b.set_cursor_hidden(false);
+    let show_receipt =
+        f.b.scene
+            .for_tests_cursor_commit_receipt(0)
+            .expect("native show receipt");
+    assert_eq!(show_receipt.frame, None);
+    assert_eq!(show_receipt.mode, CursorAcceptedMode::Hardware);
+    assert_eq!(
+        show_receipt.primary_cursor,
+        CursorPrimaryContent::Cursorless
+    );
+    assert_eq!(
+        shown(&ui.take()),
+        [(replacement_version, replacement_hot, replacement_size)],
+        "show restores the latest native image and hotspot",
+    );
+    assert!(
+        !f.compose_due(),
+        "native cursor entries do not wake composition"
+    );
+    f.b.maybe_composite()
+        .expect("drain any incidental platform work");
+    assert_eq!(f.output().frames_presented(), frames_before);
+
+    f.b.set_cursor_hidden(true);
+    let cleanup_receipt =
+        f.b.scene
+            .for_tests_cursor_commit_receipt(0)
+            .expect("cleanup leaves a hidden native cursor receipt");
+    assert_eq!(cleanup_receipt.mode, CursorAcceptedMode::Hidden);
+    assert_eq!(
+        cleanup_receipt.primary_cursor,
+        CursorPrimaryContent::Cursorless
+    );
+    assert_eq!(ui.take(), [UiCall::Cursor(None)]);
+    assert!(
+        !f.compose_due(),
+        "native hide does not schedule composition"
+    );
+    f.b.maybe_composite()
+        .expect("final native cursor cleanup has no pending scene work");
+    assert_eq!(f.output().frames_presented(), frames_before);
+    assert!(ui.take().is_empty(), "the settled hide is not resent");
 }
 
 #[test]

@@ -211,10 +211,6 @@ pub(crate) fn submit_scene_flip_with_fences_tearing(
     timing: crate::drm::async_flip::FlipTiming,
     tearing_context: crate::drm::atomic::TearingCommitContext,
 ) -> io::Result<()> {
-    let cursor_updates = match timing {
-        crate::drm::async_flip::FlipTiming::Vsync => cursor_updates,
-        crate::drm::async_flip::FlipTiming::Async => &[],
-    };
     let mut request = AtomicCommitRequest::new();
     request.add_raw_property(
         output.plane.into(),
@@ -245,21 +241,25 @@ pub(crate) fn submit_scene_flip_with_fences_tearing(
         let out_fence_ptr = (out_fence_holder as *mut i32) as usize as u64;
         request.add_raw_property(output.crtc.into(), out_fence_prop, out_fence_ptr);
     }
-    crate::kms::render::platform::cursor_commit::add_cursor_plane_updates(
-        &mut request,
-        cursor_updates,
-    );
+    let has_cursor_updates =
+        crate::kms::render::platform::cursor_commit::add_vsync_scene_cursor_updates(
+            &mut request,
+            cursor_updates,
+            timing,
+        );
     let event = AtomicCommitEvent {
         crtc: output.crtc,
-        motion_timestamp: cursor_updates
-            .iter()
-            .find(|update| update.crtc == output.crtc)
-            .and_then(|update| update.motion_timestamp),
+        motion_timestamp: has_cursor_updates
+            .then(|| {
+                cursor_updates
+                    .iter()
+                    .find(|update| update.crtc == output.crtc)
+                    .and_then(|update| update.motion_timestamp)
+            })
+            .flatten(),
     };
     let kind = match timing {
-        crate::drm::async_flip::FlipTiming::Vsync if cursor_updates.is_empty() => {
-            AtomicCommitKind::Scene
-        }
+        crate::drm::async_flip::FlipTiming::Vsync if !has_cursor_updates => AtomicCommitKind::Scene,
         crate::drm::async_flip::FlipTiming::Vsync => AtomicCommitKind::SceneWithCursor,
         crate::drm::async_flip::FlipTiming::Async => AtomicCommitKind::Async,
     };

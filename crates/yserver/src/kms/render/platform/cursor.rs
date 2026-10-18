@@ -1,9 +1,12 @@
 use crate::kms::{
     cursor_plane::CursorPlaneFactory,
-    render::platform::{
-        CrtcKey, CursorFailureDisposition, CursorMoveOutcome, KmsCursorState, KmsDevice,
-        PlatformBackend, TransientCursorFallback,
-        cursor_state::{CursorBinding, CursorIntent, CursorPlaneUpdate},
+    render::{
+        platform::{
+            CrtcKey, CursorFailureDisposition, CursorMoveOutcome, KmsCursorState, KmsDevice,
+            PlatformBackend, TransientCursorFallback,
+            cursor_state::{CursorBinding, CursorIntent, CursorPlaneUpdate},
+        },
+        scene::{CursorEntry, CursorFrameAssignment, CursorUploadOutcome},
     },
 };
 use std::{
@@ -101,6 +104,10 @@ impl KmsCursorState {
     }
 
     pub(super) fn note_einval(&mut self, crtc: ::drm::control::crtc::Handle) {
+        self.note_transient_fallback(crtc);
+    }
+
+    fn note_transient_fallback(&mut self, crtc: ::drm::control::crtc::Handle) {
         let retry = self
             .transient_fallback_crtcs
             .entry(crtc)
@@ -128,7 +135,7 @@ impl KmsCursorState {
         match disposition {
             CursorFailureDisposition::Unchanged => {}
             CursorFailureDisposition::Transient => {
-                self.note_einval(crtc);
+                self.note_transient_fallback(crtc);
                 // Once eligibility changes, the cursorless scene handoff owns
                 // recovery. A position-only retry must not race it or clear a
                 // failed bind/hotspot/upload observation.
@@ -524,14 +531,14 @@ impl PlatformBackend {
         let plane = cursor.plane.as_ref()?;
         let properties = plane.properties_for(crtc)?;
         let state = cursor.crtc_states.get(&crtc)?;
-        if state.in_flight.is_some() {
+        if state.in_flight.is_some() && !primary_successor {
             return None;
         }
         let intent = state.intent?;
         if (cursor.permanently_disabled && matches!(intent, CursorIntent::Show(_)))
             || (cursor.cursor_hide_recovery.contains_key(&crtc)
                 && matches!(intent, CursorIntent::Show(_)))
-            || cursor.atomic_cursor_commits_in_flight.contains_key(&crtc)
+            || (!primary_successor && cursor.atomic_cursor_commits_in_flight.contains_key(&crtc))
         {
             return None;
         }
@@ -565,11 +572,191 @@ impl PlatformBackend {
             plane.height(),
         );
         Some(CursorPlaneUpdate {
+            owner: super::cursor_frames::CursorCommitOwner::HardwareOnly,
             device_key: layout.key.device_key,
             crtc,
             motion_timestamp: prepared.next.and(state.intent_motion_timestamp),
             prepared,
         })
+    }
+
+    /// Prepare the cursor delta owned by one shared scene frame. The frame's
+    /// staged assignment is deliberately kept out of `CursorCrtcState.intent`,
+    /// which is read only by cursor-only scheduling.
+    pub(crate) fn prepare_scene_cursor_frame_update(
+        &mut self,
+        output_idx: usize,
+        frame: crate::kms::render::scene::CursorFrameId,
+        assignment: CursorFrameAssignment,
+        sprite: Option<&CursorEntry>,
+    ) -> io::Result<Option<CursorPlaneUpdate>> {
+        let (device_idx, crtc, layout_x, layout_y) = self.cursor_output_route(output_idx)?;
+        if !self.cursor_output_is_active(output_idx) {
+            return Err(io::Error::other("scene cursor output is not active"));
+        }
+
+        let next = match assignment {
+            CursorFrameAssignment::Hardware => {
+                let sprite = sprite.ok_or_else(|| {
+                    io::Error::other("hardware cursor frame has no staged sprite")
+                })?;
+                if !self.cursor_plane_available_for_output(output_idx)
+                    || !self.cursor_plane_fits_for_output(
+                        output_idx,
+                        sprite.extent.width,
+                        sprite.extent.height,
+                    )
+                {
+                    return Err(io::Error::other(
+                        "scene selected an unavailable hardware cursor plane",
+                    ));
+                }
+                let bytes = sprite
+                    .bgra_bytes
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("hardware cursor frame has no pixel data"))?;
+                if !self.cursor_plane_uploaded_image_matches_for_output(
+                    output_idx,
+                    sprite.record_version,
+                    u16::try_from(sprite.hot_x).unwrap_or(u16::MAX),
+                    u16::try_from(sprite.hot_y).unwrap_or(u16::MAX),
+                ) {
+                    match self.cursor_plane_upload_frame_image_for_output(
+                        output_idx,
+                        sprite.record_version,
+                        u16::try_from(sprite.hot_x).unwrap_or(u16::MAX),
+                        u16::try_from(sprite.hot_y).unwrap_or(u16::MAX),
+                        sprite.extent.width,
+                        sprite.extent.height,
+                        bytes.as_ref(),
+                    )? {
+                        CursorUploadOutcome::Ready => {}
+                        CursorUploadOutcome::Deferred => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::WouldBlock,
+                                "scene cursor sprite buffer is still in use",
+                            ));
+                        }
+                    }
+                }
+                let device = &self.devices[device_idx];
+                let plane = device
+                    .cursor
+                    .plane
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("scene cursor plane disappeared"))?;
+                let (lease, framebuffer) = plane
+                    .candidate_sprite()
+                    .ok_or_else(|| io::Error::other("scene cursor upload has no framebuffer"))?;
+                let properties = plane
+                    .properties_for(crtc)
+                    .ok_or_else(|| io::Error::other("scene cursor properties disappeared"))?;
+                let pointer = self.cursor_pointer_root;
+                let (x, y) = super::cursor::cursor_root_to_crtc_local(
+                    pointer.0,
+                    pointer.1,
+                    layout_x,
+                    layout_y,
+                    u16::try_from(sprite.hot_x).unwrap_or(u16::MAX),
+                    u16::try_from(sprite.hot_y).unwrap_or(u16::MAX),
+                );
+                Some(CursorBinding {
+                    properties,
+                    lease,
+                    framebuffer,
+                    x,
+                    y,
+                    hot_x: u16::try_from(sprite.hot_x).unwrap_or(u16::MAX),
+                    hot_y: u16::try_from(sprite.hot_y).unwrap_or(u16::MAX),
+                })
+            }
+            CursorFrameAssignment::Software { .. } | CursorFrameAssignment::Hidden => None,
+        };
+
+        let device = &self.devices[device_idx];
+        let state = device.cursor.crtc_states.get(&crtc);
+        if state.is_some_and(|state| state.in_flight.is_some()) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "scene cursor frame waits for the prior cursor event",
+            ));
+        }
+        let prior = state.and_then(|state| state.applied);
+        let valid = state.is_some_and(|state| state.valid);
+        let motion_timestamp = state.and_then(|state| state.intent_motion_timestamp);
+        let device_key = device.key;
+        let properties = next
+            .map(|binding| binding.properties)
+            .or_else(|| {
+                device
+                    .cursor
+                    .plane
+                    .as_ref()
+                    .and_then(|plane| plane.properties_for(crtc))
+            })
+            .or_else(|| prior.map(|binding| binding.properties));
+        let Some(properties) = properties else {
+            // There is no cursor plane to detach on a software/hidden frame.
+            return Ok(None);
+        };
+        let (width, height) = device
+            .cursor
+            .plane
+            .as_ref()
+            .map_or((0, 0), |plane| (plane.width(), plane.height()));
+        let prepared = super::cursor_commit::prepare_cursor_commit(
+            properties, crtc, prior, valid, next, width, height,
+        );
+        if let Some(state) = self.devices[device_idx].cursor.crtc_states.get_mut(&crtc) {
+            // The scene frame now owns this exact observation. A rejected or
+            // cancelled frame must leave retry to a later scene frame instead
+            // of publishing the same transition through cursor-only work.
+            state.intent = None;
+            state.intent_motion_timestamp = None;
+        }
+        if prepared.updates.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(CursorPlaneUpdate {
+            owner: super::cursor_frames::CursorCommitOwner::Scene(frame),
+            device_key,
+            crtc,
+            motion_timestamp,
+            prepared,
+        }))
+    }
+
+    /// Upload a frame-owned sprite candidate without changing any ordinary
+    /// cursor-only intent. The candidate becomes applied only with the scene
+    /// frame's atomic commit.
+    fn cursor_plane_upload_frame_image_for_output(
+        &mut self,
+        output_idx: usize,
+        version: u64,
+        hot_x: u16,
+        hot_y: u16,
+        width: u32,
+        height: u32,
+        bgra_bytes: &[u8],
+    ) -> io::Result<CursorUploadOutcome> {
+        let (device_idx, crtc, _, _) = self.cursor_output_route(output_idx)?;
+        let state = &mut self.devices[device_idx].cursor;
+        if !state.available_on(crtc) {
+            return Err(io::Error::other("cursor plane unavailable for scene frame"));
+        }
+        let result = state
+            .plane
+            .as_mut()
+            .expect("available scene cursor state has a plane")
+            .upload_image(version, hot_x, hot_y, width, height, bgra_bytes);
+        if let Err(error) = &result {
+            let failure = error.raw_os_error().map_or_else(
+                || io::Error::new(error.kind(), error.to_string()),
+                io::Error::from_raw_os_error,
+            );
+            apply_cursor_operation_result(state, crtc, &Err(failure));
+        }
+        result
     }
 
     /// Prepare full-state deltas for one or more producer-owned commits. An
@@ -702,6 +889,37 @@ impl PlatformBackend {
         })
     }
 
+    /// Whether a position-only pointer-motion intent can be accepted as a
+    /// cursor-only commit independently of scene work on another output.
+    pub(crate) fn has_eligible_atomic_cursor_position_intent(&self) -> bool {
+        self.devices.iter().any(|device| {
+            device.cursor.crtc_states.iter().any(|(crtc, state)| {
+                let position_only = match state.intent {
+                    Some(CursorIntent::Show(next)) => state.applied.is_some_and(|applied| {
+                        let mut moved = applied;
+                        moved.x = next.x;
+                        moved.y = next.y;
+                        moved == next && (applied.x != next.x || applied.y != next.y)
+                    }),
+                    Some(CursorIntent::Hide) | None => false,
+                };
+                position_only
+                    && state.intent_motion_timestamp.is_some()
+                    && !device.cursor.cursor_retry_waits_for_flip.contains(crtc)
+                    && self
+                        .outputs
+                        .iter()
+                        .position(|layout| {
+                            layout.key.device_key == device.key && layout.output.crtc == *crtc
+                        })
+                        .and_then(|output_idx| {
+                            self.prepare_cursor_update_for_output(output_idx, false)
+                        })
+                        .is_some_and(|update| !update.prepared.updates.is_empty())
+            })
+        })
+    }
+
     /// Only an accepted cursor-only commit owes a flip event. An EBUSY wait owes
     /// none of ours: the old-event drain fail-stops on a missing event, so it must
     /// not wait for one; the wait mark is cleared after the drain instead.
@@ -753,6 +971,32 @@ impl PlatformBackend {
         output_indices
             .iter()
             .any(|output_idx| self.cursor_commit_in_flight_for_output(*output_idx))
+    }
+
+    /// Whether every output has settled its newest cursor intent into the
+    /// accepted per-CRTC state. An in-flight accepted commit already counts;
+    /// an intent waiting behind EBUSY does not.
+    pub(crate) fn cursor_intents_settled_for_outputs(&self, output_indices: &[usize]) -> bool {
+        output_indices.iter().all(|output_idx| {
+            let Some(layout) = self.outputs.get(*output_idx) else {
+                return false;
+            };
+            self.device_for_key(layout.key.device_key)
+                .and_then(|device| {
+                    device
+                        .cursor
+                        .crtc_states
+                        .get(&layout.output.crtc)
+                        .map(|state| (device, state))
+                })
+                .is_some_and(|(device, state)| {
+                    state.intent.is_none()
+                        && !device
+                            .cursor
+                            .cursor_retry_waits_for_flip
+                            .contains(&layout.output.crtc)
+                })
+        })
     }
 
     pub(crate) fn any_cursor_commit_in_flight(&self) -> bool {
@@ -825,7 +1069,7 @@ impl PlatformBackend {
             request,
             &[event],
         ) {
-            let cursor_rejected = sink.take_last_cursor_rejection();
+            let _cursor_rejected = sink.take_last_cursor_rejection();
             if error.raw_os_error() == Some(libc::EBUSY) {
                 self.reject_cursor_plane_update_reservations(&updates);
                 self.devices[device_idx]
@@ -837,11 +1081,7 @@ impl PlatformBackend {
                     ..CursorMoveOutcome::default()
                 });
             }
-            if cursor_rejected {
-                let _ = self.reject_atomic_cursor_commit(&updates, &error);
-            } else {
-                self.reject_cursor_plane_update_reservations(&updates);
-            }
+            let _ = self.reject_atomic_cursor_only_commit(&updates, &error);
             return Err(error);
         }
         self.accept_cursor_plane_updates(&updates)?;
@@ -914,33 +1154,43 @@ impl PlatformBackend {
         &mut self,
         updates: &[CursorPlaneUpdate],
     ) -> io::Result<()> {
+        self.accept_cursor_plane_updates_with_validation(updates, true)
+    }
+
+    fn accept_cursor_plane_updates_with_validation(
+        &mut self,
+        updates: &[CursorPlaneUpdate],
+        validate_reservations: bool,
+    ) -> io::Result<()> {
         // Validate the complete transaction before transferring any lease.
         // A successful ioctl has already changed kernel state, so partial
         // acceptance would leave userspace unable to describe ownership.
-        for update in updates {
-            let Some(device) = self
-                .devices
-                .iter()
-                .find(|device| device.key == update.device_key)
-            else {
-                return Err(io::Error::other(
-                    "accepted cursor update device disappeared",
-                ));
-            };
-            if let Some(next) = update.prepared.next.filter(|next| {
-                update
-                    .prepared
-                    .prior
-                    .is_none_or(|prior| prior.lease != next.lease)
-            }) && !device
-                .cursor
-                .plane
-                .as_ref()
-                .is_some_and(|plane| plane.can_accept_reserved_sprite(next.lease))
-            {
-                return Err(io::Error::other(
-                    "accepted cursor commit lost its reserved framebuffer lease",
-                ));
+        if validate_reservations {
+            for update in updates {
+                let Some(device) = self
+                    .devices
+                    .iter()
+                    .find(|device| device.key == update.device_key)
+                else {
+                    return Err(io::Error::other(
+                        "accepted cursor update device disappeared",
+                    ));
+                };
+                if let Some(next) = update.prepared.next.filter(|next| {
+                    update
+                        .prepared
+                        .prior
+                        .is_none_or(|prior| prior.lease != next.lease)
+                }) && !device
+                    .cursor
+                    .plane
+                    .as_ref()
+                    .is_some_and(|plane| plane.can_accept_reserved_sprite(next.lease))
+                {
+                    return Err(io::Error::other(
+                        "accepted cursor commit lost its reserved framebuffer lease",
+                    ));
+                }
             }
         }
         for update in updates {
@@ -1044,6 +1294,23 @@ impl PlatformBackend {
         updates: &[CursorPlaneUpdate],
         error: &io::Error,
     ) -> CursorMoveOutcome {
+        self.reject_atomic_cursor_commit_inner(updates, error, false)
+    }
+
+    pub(crate) fn reject_atomic_cursor_only_commit(
+        &mut self,
+        updates: &[CursorPlaneUpdate],
+        error: &io::Error,
+    ) -> CursorMoveOutcome {
+        self.reject_atomic_cursor_commit_inner(updates, error, true)
+    }
+
+    fn reject_atomic_cursor_commit_inner(
+        &mut self,
+        updates: &[CursorPlaneUpdate],
+        error: &io::Error,
+        fail_closed: bool,
+    ) -> CursorMoveOutcome {
         self.reject_cursor_plane_update_reservations(updates);
         let mut outcome = CursorMoveOutcome::default();
         for update in updates {
@@ -1056,7 +1323,10 @@ impl PlatformBackend {
             };
             let crtc = update.crtc;
             device.cursor.cursor_retry_waits_for_flip.remove(&crtc);
-            device.cursor.note_cursor_failure_pair(crtc, error, None);
+            let disposition = device.cursor.note_cursor_failure_pair(crtc, error, None);
+            if fail_closed && disposition == CursorFailureDisposition::Unchanged {
+                device.cursor.note_transient_fallback(crtc);
+            }
             if let Some(state) = device.cursor.crtc_states.get_mut(&crtc) {
                 let rejected_intent = update
                     .prepared
@@ -1129,7 +1399,137 @@ impl PlatformBackend {
         &mut self,
         updates: &[CursorPlaneUpdate],
     ) -> io::Result<()> {
-        self.accept_cursor_plane_updates(updates)
+        if updates
+            .iter()
+            .any(|update| update.owner != super::cursor_frames::CursorCommitOwner::HardwareOnly)
+        {
+            return Err(io::Error::other(
+                "non-hardware cursor update submitted by a direct primary commit",
+            ));
+        }
+        self.accept_cursor_plane_updates(updates)?;
+        for update in updates {
+            let Some(state) = self
+                .devices
+                .iter_mut()
+                .find(|device| device.key == update.device_key)
+                .and_then(|device| device.cursor.crtc_states.get_mut(&update.crtc))
+            else {
+                continue;
+            };
+            let accepted_intent = update
+                .prepared
+                .next
+                .map_or(CursorIntent::Hide, CursorIntent::Show);
+            if state.intent == Some(accepted_intent) {
+                state.intent = None;
+                state.intent_motion_timestamp = None;
+            }
+        }
+        Ok(())
+    }
+
+    /// Requeue a failed scene-carried cursor delta only when it was an update
+    /// to an already accepted hardware binding. Ownership transitions remain
+    /// with their failed frame and cannot be stolen by the cursor-only path.
+    pub(crate) fn restore_failed_hardware_cursor_intents(&mut self, updates: &[CursorPlaneUpdate]) {
+        for update in updates {
+            if update.owner == super::cursor_frames::CursorCommitOwner::HardwareOnly {
+                continue;
+            }
+            let (Some(prior), Some(next)) = (update.prepared.prior, update.prepared.next) else {
+                continue;
+            };
+            let Some(state) = self
+                .devices
+                .iter_mut()
+                .find(|device| device.key == update.device_key)
+                .and_then(|device| device.cursor.crtc_states.get_mut(&update.crtc))
+            else {
+                continue;
+            };
+            if state.applied == Some(prior) && state.intent.is_none() {
+                state.intent = Some(CursorIntent::Show(next));
+                state.intent_motion_timestamp = update.motion_timestamp;
+            }
+        }
+    }
+
+    /// Settle the scene frame's cursor deltas and discard older cursor-only
+    /// intent for that CRTC. The frame plan is authoritative for this submit;
+    /// it is never inserted into the intent consumed by idle cursor-only work.
+    pub(crate) fn cursor_plane_scene_frame_submitted(
+        &mut self,
+        output_idx: usize,
+        frame: crate::kms::render::scene::CursorFrameId,
+        updates: &[CursorPlaneUpdate],
+    ) -> io::Result<()> {
+        if updates
+            .iter()
+            .any(|update| update.owner != super::cursor_frames::CursorCommitOwner::Scene(frame))
+        {
+            return Err(io::Error::other(
+                "hardware-only cursor intent submitted as a scene frame update",
+            ));
+        }
+        if let Err(error) = self.accept_cursor_plane_updates(updates) {
+            // The primary+cursor ioctl has already succeeded. Preserve its
+            // actual binding by consuming the reservation without repeating
+            // the preflight check that just failed; dropping it would let a
+            // later upload overwrite a framebuffer KMS is scanning out.
+            log::error!(
+                "accepted shared scene cursor settlement preflight failed ({error}); recovering the accepted lease"
+            );
+            self.accept_cursor_plane_updates_with_validation(updates, false)?;
+        }
+        let Some((device_key, crtc)) = self
+            .outputs
+            .get(output_idx)
+            .map(|layout| (layout.key.device_key, layout.output.crtc))
+        else {
+            return Ok(());
+        };
+        let accepted_sprite = updates
+            .iter()
+            .find(|update| update.device_key == device_key && update.crtc == crtc)
+            .and_then(|update| update.prepared.next);
+        if let Some(device) = self
+            .devices
+            .iter_mut()
+            .find(|device| device.key == device_key)
+        {
+            if let Some(binding) = accepted_sprite {
+                for (other_crtc, state) in &mut device.cursor.crtc_states {
+                    if *other_crtc == crtc
+                        || binding.lease.version()
+                            < match state.intent {
+                                Some(CursorIntent::Show(pending)) => pending.lease.version(),
+                                Some(CursorIntent::Hide) | None => continue,
+                            }
+                    {
+                        continue;
+                    }
+                    let Some(CursorIntent::Show(pending)) = state.intent.as_mut() else {
+                        continue;
+                    };
+                    // The accepted frame makes this sprite the newest
+                    // hardware image. Retarget already queued moves on the
+                    // other CRTCs without changing their output-local pointer
+                    // position or their own plane properties.
+                    pending.x += i32::from(pending.hot_x) - i32::from(binding.hot_x);
+                    pending.y += i32::from(pending.hot_y) - i32::from(binding.hot_y);
+                    pending.lease = binding.lease;
+                    pending.framebuffer = binding.framebuffer;
+                    pending.hot_x = binding.hot_x;
+                    pending.hot_y = binding.hot_y;
+                }
+            }
+            if let Some(state) = device.cursor.crtc_states.get_mut(&crtc) {
+                state.intent = None;
+                state.intent_motion_timestamp = None;
+            }
+        }
+        Ok(())
     }
 
     /// Construct a cursor position record for legacy tests without issuing a
@@ -1247,6 +1647,20 @@ impl PlatformBackend {
             }
             CursorIntent::Hide => None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_cursor_retry_wait_pending(&self, output_idx: usize) -> bool {
+        let Some(layout) = self.outputs.get(output_idx) else {
+            return false;
+        };
+        self.device_for_key(layout.key.device_key)
+            .is_some_and(|device| {
+                device
+                    .cursor
+                    .cursor_retry_waits_for_flip
+                    .contains(&layout.output.crtc)
+            })
     }
 
     #[cfg(test)]
@@ -1434,6 +1848,284 @@ impl PlatformBackend {
                 device.cursor.transient_fallback_crtcs.clear();
             }
         }
+    }
+
+    /// Retain the newest effective cursor observation as per-output atomic
+    /// intent. This deliberately does not publish a scene assignment: an
+    /// accepted HW binding, a hidden output, or a held direct frame can settle
+    /// independently of a primary scene frame.
+    pub(crate) fn queue_cursor_intent(
+        &mut self,
+        record: Option<&crate::kms::render::cursor::CursorRecord>,
+        visible: bool,
+        root: (i32, i32),
+        tearing: bool,
+        direct_scanout: bool,
+        hardware_cursor_outputs: &[bool],
+    ) -> bool {
+        self.cursor_pointer_root = root;
+        let tearing = tearing || self.tearing_on;
+        let visible = visible && !tearing;
+        let mut uploaded_devices = HashSet::new();
+        let mut ready_devices = HashSet::new();
+        let mut deferred_devices = HashSet::new();
+        let mut hardware_handles_visible_outputs = true;
+        let mut has_visible_footprint = false;
+        let intersects_by_output: Vec<_> = self
+            .outputs
+            .iter()
+            .enumerate()
+            .map(|(output_idx, layout)| {
+                let intersects = record.is_some_and(|record| {
+                    visible
+                        && cursor_footprint_intersects_output(
+                            root.0 - i32::from(record.hot_x) - layout.x,
+                            root.1 - i32::from(record.hot_y) - layout.y,
+                            i32::from(record.width),
+                            i32::from(record.height),
+                            i32::from(layout.width),
+                            i32::from(layout.height),
+                        )
+                });
+                let actionable = intersects || direct_scanout;
+                has_visible_footprint |= actionable;
+                if actionable
+                    && (!self.cursor_output_is_active(output_idx)
+                        || !self.cursor_plane_available_for_output(output_idx)
+                        || !hardware_cursor_outputs
+                            .get(output_idx)
+                            .copied()
+                            .unwrap_or(false))
+                {
+                    hardware_handles_visible_outputs = false;
+                }
+                intersects
+            })
+            .collect();
+
+        // Only prepare an image on devices where the visible cursor actually
+        // intersects an eligible hardware output. Hidden and off-screen
+        // observations keep their newest bytes in the portable record until
+        // a later position makes them actionable.
+        if let Some(record) = record {
+            for (output_idx, intersects) in intersects_by_output.iter().copied().enumerate() {
+                let Some(layout) = self.outputs.get(output_idx) else {
+                    continue;
+                };
+                let device_key = layout.key.device_key;
+                if (!intersects && !direct_scanout)
+                    || !self.cursor_output_is_active(output_idx)
+                    || !self.cursor_plane_available_for_output(output_idx)
+                    || !hardware_cursor_outputs
+                        .get(output_idx)
+                        .copied()
+                        .unwrap_or(false)
+                    || !uploaded_devices.insert(device_key)
+                {
+                    continue;
+                }
+                match self.cursor_plane_upload_image_for_output(
+                    output_idx,
+                    record.version,
+                    record.hot_x,
+                    record.hot_y,
+                    u32::from(record.width),
+                    u32::from(record.height),
+                    &record.bgra_bytes,
+                ) {
+                    Ok(CursorUploadOutcome::Ready) => {
+                        ready_devices.insert(device_key);
+                    }
+                    Ok(CursorUploadOutcome::Deferred) => {
+                        deferred_devices.insert(device_key);
+                        log::debug!(
+                            "render cursor: sprite {} waits for a free atomic framebuffer on device {device_key}",
+                            record.version
+                        );
+                    }
+                    Err(error) => {
+                        log::debug!(
+                            "render cursor: atomic sprite {} unavailable on device {device_key}: {error}",
+                            record.version
+                        );
+                        hardware_handles_visible_outputs = false;
+                    }
+                }
+            }
+        }
+
+        for (output_idx, intersects) in intersects_by_output.iter().copied().enumerate() {
+            let Some((device_key, crtc, layout_x, layout_y)) =
+                self.outputs.get(output_idx).map(|layout| {
+                    (
+                        layout.key.device_key,
+                        layout.output.crtc,
+                        layout.x,
+                        layout.y,
+                    )
+                })
+            else {
+                continue;
+            };
+            if !self.cursor_output_is_active(output_idx) {
+                continue;
+            }
+            let hardware_owner = hardware_cursor_outputs
+                .get(output_idx)
+                .copied()
+                .unwrap_or(false);
+            if !self.cursor_plane_available_for_output(output_idx) || !hardware_owner {
+                if intersects {
+                    hardware_handles_visible_outputs = false;
+                }
+                // An eligibility fallback blocks new attachments, but it
+                // cannot make an already accepted framebuffer disappear.
+                // Preserve an explicit hide for the next eligible primary or
+                // cursor transaction so the real plane owner is detached.
+                if !visible
+                    && hardware_owner
+                    && let Some(state) = self
+                        .devices
+                        .iter_mut()
+                        .find(|device| device.key == device_key)
+                        .and_then(|device| device.cursor.crtc_states.get_mut(&crtc))
+                    && (state.applied.is_some()
+                        || matches!(state.intent, Some(CursorIntent::Show(_)))
+                        || matches!(state.intent, Some(CursorIntent::Hide)))
+                {
+                    state.intent = Some(CursorIntent::Hide);
+                    state.intent_motion_timestamp = None;
+                }
+                continue;
+            }
+
+            let candidate = if visible && (intersects || direct_scanout) {
+                self.device_for_key(device_key)
+                    .filter(|_| ready_devices.contains(&device_key))
+                    .and_then(|device| {
+                        device
+                            .cursor
+                            .plane
+                            .as_ref()
+                            .and_then(|plane| plane.candidate_sprite())
+                    })
+            } else {
+                None
+            };
+            if visible && (intersects || direct_scanout) && candidate.is_none() {
+                if deferred_devices.contains(&device_key) {
+                    let current = self
+                        .devices
+                        .iter()
+                        .find(|device| device.key == device_key)
+                        .and_then(|device| device.cursor.crtc_states.get(&crtc))
+                        .and_then(|state| match state.intent {
+                            Some(CursorIntent::Show(binding)) => Some(binding),
+                            Some(CursorIntent::Hide) => None,
+                            None => state.applied,
+                        });
+                    if let Some(mut binding) = current {
+                        let (x, y) = cursor_root_to_crtc_local(
+                            root.0,
+                            root.1,
+                            layout_x,
+                            layout_y,
+                            binding.hot_x,
+                            binding.hot_y,
+                        );
+                        binding.x = x;
+                        binding.y = y;
+                        if let Some(state) = self
+                            .devices
+                            .iter_mut()
+                            .find(|device| device.key == device_key)
+                            .and_then(|device| device.cursor.crtc_states.get_mut(&crtc))
+                        {
+                            state.intent = Some(CursorIntent::Show(binding));
+                            state.intent_motion_timestamp = Some((self.services.monotonic_clock)());
+                        }
+                    }
+                } else {
+                    hardware_handles_visible_outputs = false;
+                    if let Some(state) = self
+                        .devices
+                        .iter_mut()
+                        .find(|device| device.key == device_key)
+                        .and_then(|device| device.cursor.crtc_states.get_mut(&crtc))
+                        && matches!(state.intent, Some(CursorIntent::Show(binding)) if state.applied.is_none_or(|applied| applied.lease != binding.lease))
+                    {
+                        state.intent = None;
+                        state.intent_motion_timestamp = None;
+                    }
+                }
+                continue;
+            }
+
+            let binding = candidate.and_then(|(lease, framebuffer)| {
+                let record = record?;
+                let (device_idx, _, _, _) = self.cursor_output_route(output_idx).ok()?;
+                let device = self.devices.get(device_idx)?;
+                let plane = device.cursor.plane.as_ref()?;
+                let properties = plane.properties_for(crtc)?;
+                let (x, y) = cursor_root_to_crtc_local(
+                    root.0,
+                    root.1,
+                    layout_x,
+                    layout_y,
+                    record.hot_x,
+                    record.hot_y,
+                );
+                Some(CursorBinding {
+                    properties,
+                    lease,
+                    framebuffer,
+                    x,
+                    y,
+                    hot_x: record.hot_x,
+                    hot_y: record.hot_y,
+                })
+            });
+            if visible && (intersects || direct_scanout) {
+                let Some(binding) = binding else {
+                    hardware_handles_visible_outputs = false;
+                    continue;
+                };
+                if let Some(state) = self
+                    .devices
+                    .iter_mut()
+                    .find(|device| device.key == device_key)
+                    .map(|device| device.cursor.crtc_states.entry(crtc).or_default())
+                {
+                    if state.applied == Some(binding) {
+                        state.intent = None;
+                        state.intent_motion_timestamp = None;
+                    } else {
+                        state.intent = Some(CursorIntent::Show(binding));
+                        state.intent_motion_timestamp = Some((self.services.monotonic_clock)());
+                    }
+                }
+            } else if let Some(state) = self
+                .devices
+                .iter_mut()
+                .find(|device| device.key == device_key)
+                .map(|device| device.cursor.crtc_states.entry(crtc).or_default())
+                && (state.applied.is_some() || matches!(state.intent, Some(CursorIntent::Show(_))))
+            {
+                state.intent = Some(CursorIntent::Hide);
+                state.intent_motion_timestamp = None;
+            } else if let Some(state) = self
+                .devices
+                .iter_mut()
+                .find(|device| device.key == device_key)
+                .and_then(|device| device.cursor.crtc_states.get_mut(&crtc))
+                && state.applied.is_none()
+            {
+                state.intent = None;
+                state.intent_motion_timestamp = None;
+            }
+        }
+
+        !visible || !has_visible_footprint || hardware_handles_visible_outputs
     }
 
     pub(crate) fn cursor_plane_upload_image_for_output(
@@ -1782,63 +2474,6 @@ impl PlatformBackend {
         state.pending_move = None;
         state.pending_move_timestamp = None;
         Ok(CursorMoveOutcome::default())
-    }
-
-    /// True iff the set of CRTCs whose region the cursor footprint
-    /// intersects differs from the set the plane is currently bound on
-    /// (`is_visible_on`).
-    ///
-    /// The pointer fast path (`cursor_plane_move`) only *repositions*
-    /// the cursor on already-bound CRTCs — it never shows the plane on
-    /// a CRTC the pointer newly crosses into, nor hides it on one it
-    /// leaves. Cross-CRTC show/hide is decided by the scene's
-    /// `CursorAssignment` during compose. While an idle desktop
-    /// composited every frame (pre-#30) that reassignment happened for
-    /// free; now that idle desktops stop compositing, the fast path
-    /// must detect a boundary crossing and route it through one compose
-    /// tick. This predicate is that detector, using the same footprint
-    /// intersection rule as `cursor_footprint_rect` so its membership
-    /// decision matches the scene's exactly.
-    ///
-    /// `(x, y)` is the root-space cursor position, `(hot_x, hot_y)` the
-    /// sprite hotspot, `(cw, ch)` the sprite extent.
-    pub(crate) fn cursor_crtc_membership_dirty(
-        &self,
-        x: i32,
-        y: i32,
-        hot_x: u16,
-        hot_y: u16,
-        cw: i32,
-        ch: i32,
-    ) -> bool {
-        for l in &self.outputs {
-            let Some(device) = self.device_for_key(l.key.device_key) else {
-                continue;
-            };
-            if device.cursor.plane.is_none() {
-                continue;
-            }
-            let dx = x - i32::from(hot_x) - l.x;
-            let dy = y - i32::from(hot_y) - l.y;
-            let intersects = cursor_footprint_intersects_output(
-                dx,
-                dy,
-                cw,
-                ch,
-                i32::from(l.width),
-                i32::from(l.height),
-            );
-            if intersects
-                != device
-                    .cursor
-                    .crtc_states
-                    .get(&l.output.crtc)
-                    .is_some_and(|state| state.applied.is_some())
-            {
-                return true;
-            }
-        }
-        false
     }
 
     /// Submit a per-CRTC atomic detach for output-local recovery. A rejected
@@ -2247,8 +2882,8 @@ pub(super) fn cursor_root_to_crtc_local(
 /// Whether the cursor footprint `[dx, dx+cw) × [dy, dy+ch)` (in
 /// output-local coordinates) overlaps the output's `[0, w) × [0, h)`
 /// region. This is the boolean form of `cursor_footprint_rect`'s
-/// non-empty condition, kept in sync so `cursor_crtc_membership_dirty`
-/// decides on-output membership exactly as the scene does.
+/// non-empty condition used by the intent fanout and the scene's
+/// output-local cursor assignment.
 pub(super) fn cursor_footprint_intersects_output(
     dx: i32,
     dy: i32,

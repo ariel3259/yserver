@@ -101,7 +101,7 @@ use probe::*;
 #[cfg(test)]
 mod tests;
 
-use std::{io, os::fd::OwnedFd, rc::Rc, sync::Arc, time::Duration};
+use std::{cell::RefCell, io, os::fd::OwnedFd, rc::Rc, sync::Arc, time::Duration};
 
 use ash::vk;
 use drm::{buffer::Handle as DrmBufferHandle, control::framebuffer};
@@ -232,6 +232,41 @@ pub struct ModesetReleased {
     pub release_fence: Option<i32>,
 }
 
+/// Shared constructor-injected one-shot error for the recording scene target.
+/// The successful-prepare count lets fixture setup submit its normal frames
+/// before a scenario reaches the failure boundary.
+pub(crate) struct ComposePrepareErrorScript {
+    successful_prepares_before_error: usize,
+    error: vk::Result,
+    fired: bool,
+}
+
+impl ComposePrepareErrorScript {
+    #[cfg(test)]
+    pub(crate) fn for_tests_after(
+        successful_prepares: usize,
+        error: vk::Result,
+    ) -> Rc<RefCell<Self>> {
+        Rc::new(RefCell::new(Self {
+            successful_prepares_before_error: successful_prepares,
+            error,
+            fired: false,
+        }))
+    }
+
+    pub(crate) fn take_error_if_due(&mut self) -> Option<vk::Result> {
+        if self.fired {
+            return None;
+        }
+        if self.successful_prepares_before_error > 0 {
+            self.successful_prepares_before_error -= 1;
+            return None;
+        }
+        self.fired = true;
+        Some(self.error)
+    }
+}
+
 /// One scanout buffer object: a Vulkan-allocated `VkImage` exported
 /// as a dma-buf and imported into the DRM device for KMS scanout.
 ///
@@ -241,6 +276,9 @@ pub struct ModesetReleased {
 #[allow(dead_code)] // most fields used by 4.1.2.5+ atomic-commit driver.
 pub struct ScanoutBo {
     pub state: BoState,
+    /// Optional constructor-injected failure in post-compose target preparation.
+    /// Production BO constructors leave this unset.
+    pub(crate) compose_prepare_error: Option<Rc<RefCell<ComposePrepareErrorScript>>>,
     pub width: u32,
     pub height: u32,
     /// `true` for client-imported alien BOs (Phase 4.2.4 Flip /
@@ -354,6 +392,10 @@ pub struct TransferResources {
 #[allow(dead_code)] // wired in via KmsBackend in a later commit.
 pub struct ScanoutBoPool {
     pub bos: Vec<ScanoutBo>,
+    /// Fixture-only acquisition schedule. Empty in production pools; entries
+    /// set before a test scenario can make the real allocator report a busy
+    /// pool without editing Backend state while the scenario is running.
+    pub(crate) unavailable_acquisitions: std::collections::VecDeque<bool>,
     pub width: u32,
     pub height: u32,
     /// Stable renderer and KMS endpoints this pool connects. Kept separately

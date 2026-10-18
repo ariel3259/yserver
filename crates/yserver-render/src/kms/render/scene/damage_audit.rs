@@ -544,7 +544,6 @@ pub(super) fn audit_sampled_pairs(
 /// software-cursor decision so the two scenes differ in visibility alone.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn audit_reference_scene(
-    production_has_sw_cursor: bool,
     input: &SceneInput,
     store: &mut DrawableStore,
     output_idx: usize,
@@ -557,7 +556,7 @@ pub(super) fn audit_reference_scene(
     if !damage_audit_enabled() {
         return None;
     }
-    let mut reference = build_scene(
+    let reference = build_scene(
         input,
         store,
         output_idx,
@@ -568,12 +567,6 @@ pub(super) fn audit_reference_scene(
         hw_strategy_active,
         Visibility::Off,
     );
-    if !production_has_sw_cursor {
-        // Either the production frame had no software cursor or the tick
-        // stripped it for a hide frame; either way the reference must not
-        // carry one.
-        reference.omit_software_cursor_for_hide();
-    }
     Some(reference)
 }
 

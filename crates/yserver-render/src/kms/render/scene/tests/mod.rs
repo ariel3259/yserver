@@ -83,6 +83,7 @@ impl OutputSink for TestSink {
         &mut self,
         _output_idx: usize,
         _bo_idx: usize,
+        _cursor: CursorFramePlan,
         _record: &mut RecordFrame<'_>,
     ) -> FinishOutcome {
         FinishOutcome::Unavailable(FrameTargetError::NoSlot)
@@ -122,7 +123,7 @@ impl OutputSink for TestSink {
         _output_idx: usize,
         _bo_idx: usize,
         _fd: Option<std::os::fd::OwnedFd>,
-    ) -> io::Result<()> {
+    ) -> io::Result<CursorCommitReceipt> {
         Err(io::Error::other(
             "render completion targeted a shared output",
         ))
@@ -146,44 +147,6 @@ impl CursorPlaneSink for TestSink {
         _hot_y: u16,
     ) -> bool {
         false
-    }
-
-    fn upload(
-        &mut self,
-        _output_idx: usize,
-        _version: u64,
-        _hot_x: u16,
-        _hot_y: u16,
-        _width: u32,
-        _height: u32,
-        _bgra_bytes: &[u8],
-    ) -> io::Result<CursorUploadOutcome> {
-        Err(io::Error::other("cursor plane unavailable for output"))
-    }
-
-    fn show(
-        &mut self,
-        _output_idx: usize,
-        _hot_x: u16,
-        _hot_y: u16,
-        _x: i32,
-        _y: i32,
-    ) -> Result<(), CursorShowFailure> {
-        Err(CursorShowFailure {
-            remains_visible: false,
-            deferred: false,
-            error: Box::new(io::Error::other(
-                "cursor remains unbound: cursor plane unavailable for output",
-            )),
-        })
-    }
-
-    fn hide(&mut self, _output_idx: usize) -> io::Result<()> {
-        Err(io::Error::other("cursor plane unavailable"))
-    }
-
-    fn hide_all(&mut self) -> io::Result<()> {
-        Err(io::Error::other("cursor plane unavailable"))
     }
 
     fn note_composed_retirement(&mut self, _output_idx: usize) -> bool {

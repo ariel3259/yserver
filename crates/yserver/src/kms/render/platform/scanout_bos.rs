@@ -9,6 +9,11 @@ use std::{
     rc::Rc,
 };
 
+pub(crate) struct CopiedScanoutSubmitError {
+    pub(crate) error: io::Error,
+    pub(crate) cursor_rejected: bool,
+}
+
 impl PlatformBackend {
     // ── I6b: scanout BO management ──────────────────────────────
 
@@ -34,6 +39,9 @@ impl PlatformBackend {
     pub(crate) fn acquire_scanout_bo(&mut self, output_idx: usize) -> Option<SlotToken> {
         self.debug_assert_scanout_pool_route(output_idx);
         let scanout = self.scanout_pools.get_mut(output_idx)?.as_mut()?;
+        if !scanout.display_pool_mut().permits_next_slot_acquisition() {
+            return None;
+        }
         let gens = self.bo_generations.get(output_idx)?;
         for (bo_idx, bo) in scanout.display_pool().bos.iter().enumerate() {
             if bo.state.phase == BoPhase::Free {
@@ -63,23 +71,32 @@ impl PlatformBackend {
         output_idx: usize,
         bo_idx: usize,
         render_completion: Option<OwnedFd>,
-    ) -> io::Result<()> {
+        cursor_updates: &[super::cursor_state::CursorPlaneUpdate],
+    ) -> Result<(), CopiedScanoutSubmitError> {
         self.debug_assert_scanout_pool_route(output_idx);
         let output_key = self
             .outputs
             .get(output_idx)
             .map(|output| output.key.clone())
-            .ok_or_else(|| io::Error::other("copied scanout output index out of range"))?;
+            .ok_or_else(|| CopiedScanoutSubmitError {
+                error: io::Error::other("copied scanout output index out of range"),
+                cursor_rejected: false,
+            })?;
         let device = self
             .device_for_output(&output_key)
             .map(|device| Rc::clone(&device.device))
-            .ok_or_else(|| io::Error::other("copied scanout KMS device disappeared"))?;
+            .ok_or_else(|| CopiedScanoutSubmitError {
+                error: io::Error::other("copied scanout KMS device disappeared"),
+                cursor_rejected: false,
+            })?;
         let atomic_commit_sink = self
             .device_for_output(&output_key)
             .map(|device| Rc::clone(&device.atomic_commit_sink))
-            .ok_or_else(|| io::Error::other("copied scanout atomic commit sink disappeared"))?;
-        let cursor_updates = self.cursor_plane_updates_for_primary_outputs(&[output_idx]);
-        self.reserve_cursor_plane_updates(&cursor_updates)?;
+            .ok_or_else(|| CopiedScanoutSubmitError {
+                error: io::Error::other("copied scanout atomic commit sink disappeared"),
+                cursor_rejected: false,
+            })?;
+        let copied_scanout_copy = Rc::clone(&self.services.copied_scanout_copy);
 
         let mut recovery_failed = false;
         let result = (|| {
@@ -105,7 +122,11 @@ impl PlatformBackend {
                 .fb_handle
                 .ok_or_else(|| io::Error::other("copied destination has no framebuffer"))?;
 
-            let copy_completion = match copied.submit_copy(bo_idx, render_completion) {
+            let copy_completion = match copied_scanout_copy.submit_copy(
+                copied,
+                bo_idx,
+                render_completion,
+            ) {
                 Ok(fd) => fd,
                 Err(error) => {
                     if let Err(recovery_error) = copied.recover_copy_failure(bo_idx) {
@@ -133,7 +154,7 @@ impl PlatformBackend {
                 framebuffer,
                 in_fence_fd,
                 &mut out_fence_fd,
-                &cursor_updates,
+                cursor_updates,
                 crate::drm::async_flip::FlipTiming::Vsync,
             ) {
                 Ok(()) => {
@@ -171,16 +192,7 @@ impl PlatformBackend {
             }
         })();
 
-        if result.is_ok() {
-            self.cursor_plane_scene_commit_submitted(&cursor_updates)
-                .expect("accepted copied commit keeps its reserved cursor leases");
-        } else if atomic_commit_sink.take_last_cursor_rejection() {
-            let error = result.as_ref().expect_err("checked copied submit error");
-            let rejected = self.reject_atomic_cursor_commit(&cursor_updates, error);
-            self.defer_cursor_move_outcome(rejected);
-        } else {
-            self.reject_cursor_plane_update_reservations(&cursor_updates);
-        }
+        let cursor_rejected = result.is_err() && atomic_commit_sink.take_last_cursor_rejection();
 
         if recovery_failed
             || result
@@ -191,7 +203,10 @@ impl PlatformBackend {
             // device.  Neither uncertain image state may be reused.
             self.gpu.renderer_failed = true;
         }
-        result
+        result.map_err(|error| CopiedScanoutSubmitError {
+            error,
+            cursor_rejected,
+        })
     }
 
     /// Framebuffer last presented by the scene compositor for this output.

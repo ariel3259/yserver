@@ -2,19 +2,20 @@ use crate::kms::{
     render::{
         region::Region,
         scene::{
-            CarriedDamage, ComposeRenderTarget, CursorAssignment, CursorTransition, FailedSubmitBo,
-            FinishOutcome, FrameHandoff, FullReason, InFlightStage, OutputRoute, OutputSceneState,
-            OutputSink, OutputWalkReport, PendingAck, Repaint, RepaintPlan, ScalePass,
-            SceneCompositor, SceneCompositorInner, SceneError, SceneInput, TickOutcome,
-            TickSkipReason, Visibility,
+            CarriedDamage, ComposeRenderTarget, CursorAssignment, CursorFrameAssignment,
+            CursorFramePlan, CursorPrimaryContent, FailedSubmitBo, FinishOutcome, FrameHandoff,
+            FullReason, InFlightStage, OutputCursorMode, OutputRoute, OutputSceneState, OutputSink,
+            OutputWalkReport, PendingAck, Repaint, RepaintPlan, ScalePass, SceneCompositor,
+            SceneCompositorInner, SceneError, SceneInput, TickOutcome, TickSkipReason, Visibility,
             build::build_scene_with,
             compose::{
                 compose_submit_was_complete, present_error_is_device_lost,
                 record_and_submit_render, stage_submitted_frame, vk_result_is_device_lost,
             },
             cursor::{
-                cursor_damage_for_frame, cursorless_hide_frame_required, derive_cursor_transition,
-                effective_cursor_prev_mode, hw_cursor_allowed,
+                accepted_mode_from_output_mode, assignment_changes_cursor_mode,
+                cursor_damage_for_frame, effective_cursor_prev_mode, force_cursor_retry_repaint,
+                hw_cursor_allowed, note_cursor_commit_accepted_inner,
             },
             damage::{clip_rect_to_output_extent, fan_out_carried_damage},
             damage_audit::{
@@ -136,6 +137,67 @@ impl SceneCompositor {
             .is_some_and(|deadline| std::time::Instant::now() < deadline)
     }
 
+    /// Whether this output has scene-frame work that a cursor-only commit
+    /// must not preempt. Armed client damage is projected through the current
+    /// scene walk, so damage on a peer output does not block this output's
+    /// independent cursor.
+    pub fn output_has_pending_frame_work(
+        &self,
+        output_idx: usize,
+        input: &SceneInput<'_>,
+        store: &mut DrawableStore,
+        sink: &dyn OutputSink,
+        cow_host_xid: Option<u32>,
+    ) -> bool {
+        let Some(inner) = self.inner.as_ref() else {
+            return false;
+        };
+        let Some(output) = inner.outputs.get(output_idx) else {
+            return false;
+        };
+        if output.current_generation == 0
+            || output.damage.owes_repaint()
+            || !output.scene_structure_damage.is_empty()
+            || !output.pending_repaint_after_failed_submit.is_empty()
+            || damage_audit_enabled()
+        {
+            return true;
+        }
+
+        let structure_dirty = self.scene_structure_dirty;
+        if store.armed_damaged_ids().is_empty() && !structure_dirty {
+            return false;
+        }
+        let elsewhere: std::collections::HashSet<crate::kms::render::store::DrawableId> = inner
+            .outputs
+            .iter()
+            .enumerate()
+            .filter(|(other_idx, _)| *other_idx != output_idx)
+            .flat_map(|(_, other)| other.last_pieces.iter().copied())
+            .collect();
+        let built = build_scene_with(
+            input,
+            store,
+            output_idx,
+            sink,
+            None,
+            None,
+            cow_host_xid,
+            false,
+            Visibility::On,
+            &elsewhere,
+        );
+        let output = &inner.outputs[output_idx];
+        !built.projected_damage.is_empty()
+            || built.stats.off_output_damage_forces_compose()
+            || !structural_damage(&output.prev_presented, &built.participants).is_empty()
+            || (structure_dirty
+                && !self
+                    .root_overlay
+                    .apply_list_for_output(input.outputs[output_idx].root_rect)
+                    .is_empty())
+    }
+
     /// True if any output's per-BO damage model owes a repaint that no producer
     /// is reporting — after an `invalidate`, or a submitted frame that never
     /// reached the screen. The backend's compose-wanted predicate must include
@@ -219,6 +281,7 @@ impl SceneCompositor {
         // presentation damage waiting (an O(drawables) scan with an early exit
         // — far cheaper than one walk, let alone one per output).
         let structure_dirty = *scene_structure_dirty;
+        let cursor_only_wake_requested = *cursor_only_wake;
         // Per output: can an armed, damaged drawable land here? Decided from
         // each output's retained `last_pieces` — see
         // `pending_presentation_for_output`. Computed for every output up
@@ -236,6 +299,43 @@ impl SceneCompositor {
         for (output_idx, &pending_presentation) in
             pending_presentation_per_output.iter().enumerate()
         {
+            // A footprint crossing can need a software repaint on one output
+            // while an overlapping hardware output only needs its plane
+            // position changed. Leave that accepted HW primary to the cursor
+            // scheduler instead of submitting an unchanged scene framebuffer.
+            // Scene transitions and ordinary damage still walk this output.
+            let output_state = &inner.outputs[output_idx];
+            let transition_pending = output_state
+                .pending_acks
+                .iter()
+                .any(super::cursor::pending_ack_changes_cursor_mode);
+            let accepted_cursorless = output_state
+                .cursor_commit_receipt
+                .is_some_and(|receipt| receipt.primary_cursor == CursorPrimaryContent::Cursorless);
+            let stable_hardware = output_state.last_frame_cursor_mode == OutputCursorMode::Hw
+                && output_state.cursor_commit_receipt.is_some_and(|receipt| {
+                    receipt.mode == crate::kms::render::scene::CursorAcceptedMode::Hardware
+                })
+                && accepted_cursorless;
+            let cursor_intersects_output = inner.cursor.as_ref().is_some_and(|cursor| {
+                let (x, y, width, height) = input.outputs[output_idx].root_rect;
+                let left = i64::from(input.cursor_x as i32) - i64::from(cursor.hot_x);
+                let top = i64::from(input.cursor_y as i32) - i64::from(cursor.hot_y);
+                left < i64::from(x) + i64::from(width)
+                    && left + i64::from(cursor.extent.width) > i64::from(x)
+                    && top < i64::from(y) + i64::from(height)
+                    && top + i64::from(cursor.extent.height) > i64::from(y)
+            });
+            let stable_hidden_off_output = output_state.last_frame_cursor_mode
+                == OutputCursorMode::Hidden
+                && output_state.cursor_commit_receipt.is_some_and(|receipt| {
+                    receipt.mode == crate::kms::render::scene::CursorAcceptedMode::Hidden
+                })
+                && accepted_cursorless
+                && !cursor_intersects_output;
+            let cursor_only_primary_skip = cursor_only_wake_requested
+                && !transition_pending
+                && (stable_hardware || stable_hidden_off_output);
             // The union of the OTHER outputs' retained pieces, read now rather
             // than before the loop so an output walked earlier in this same
             // iteration contributes its fresh set.
@@ -261,6 +361,7 @@ impl SceneCompositor {
                 &mut had_pieces,
                 &mut carried,
                 structure_dirty,
+                cursor_only_primary_skip,
                 pending_presentation,
             ) {
                 Ok(outcome) => {
@@ -582,6 +683,7 @@ fn tick_one_output(
     // Pre-walk predicate inputs read once per tick by `tick` — see
     // `walk_needed`.
     structure_dirty: bool,
+    cursor_only_primary_skip: bool,
     pending_presentation: bool,
 ) -> Result<TickOutcome, SceneError> {
     // 0. **Per-output flip-pending gate.** KMS only allows one
@@ -636,7 +738,7 @@ fn tick_one_output(
         //     announced by one of these inputs; if none is set, walking would
         //     only end in the `EmptyDamage` skip below at the cost of the walk.
         if !walk_needed(
-            structure_dirty,
+            structure_dirty && !cursor_only_primary_skip,
             pending_presentation,
             s.current_generation == 0,
             s.damage.owes_repaint(),
@@ -644,9 +746,14 @@ fn tick_one_output(
                 || !s.pending_repaint_after_failed_submit.is_empty(),
             damage_audit_enabled(),
         ) {
-            record_tick_skip(s, output_idx, TickSkipReason::NothingPending, 0);
+            let reason = if cursor_only_primary_skip {
+                TickSkipReason::EmptyDamage
+            } else {
+                TickSkipReason::NothingPending
+            };
+            record_tick_skip(s, output_idx, reason, 0);
             telemetry.record_tick_skip_nothing_pending();
-            return Ok(TickOutcome::Skipped(TickSkipReason::NothingPending));
+            return Ok(TickOutcome::Skipped(reason));
         }
     }
 
@@ -671,10 +778,8 @@ fn tick_one_output(
     };
 
     // 2. Build the scene + collect projected presentation damage.
-    //    Stage 5 Phase C: build_scene returns a pure
-    //    `CursorAssignment` decision; the actual transition queue +
-    //    `cursor_prev_pos` advance happens transactionally below
-    //    AFTER the per-output commit succeeds.
+    //    The accepted receipt owns mode changes; flip retirement owns only
+    //    software-pixel footprint metadata.
     let cursor_prev_pos_before = inner.outputs[output_idx].cursor_prev_pos;
     let last_present_cursor_rect = inner.outputs[output_idx].last_present_cursor_rect;
     let last_present_cursor_version = inner.outputs[output_idx].last_present_cursor_version;
@@ -718,14 +823,7 @@ fn tick_one_output(
         sink.cursor_plane().visible(output_idx),
         built.cursor_assignment,
     );
-    if cursorless_hide_frame_required(prev_mode, built.cursor_assignment) {
-        // Two-phase Hw→Sw/Hidden handoff: the frame retired immediately
-        // before hide must contain no software cursor. If the hide ioctl
-        // fails, the old HW sprite remains the sole visible cursor; if it
-        // succeeds, retirement forces a later SW repaint.
-        built.omit_software_cursor_for_hide();
-    }
-
+    let shared_output = sink.route(output_idx) == OutputRoute::Shared;
     // Idle free-run fix (cut 2b): record the sampled sources whose pending
     // damage this output PRESENTED, so `tick` can reconcile
     // `offscreen_no_draw` from the union across outputs. Recorded
@@ -737,29 +835,7 @@ fn tick_one_output(
     drawn.extend(built.presented_ids.iter().copied());
     had_pieces.extend(built.pieces_ids.iter().copied());
 
-    // Stage 5 Phase D — derive the per-output cursor transition
-    // and new prev_pos from `built.cursor_assignment` and the
-    // last-frame mode. Both are queued on the PendingAck below
-    // and applied transactionally on successful retirement.
-    let (mut cursor_transition_to_queue, cursor_prev_pos_after_retire, cursor_mode_after_retire) =
-        derive_cursor_transition(prev_mode, built.cursor_assignment);
-    if inner.outputs[output_idx].force_show_retry_version.is_some()
-        && let CursorAssignment::Hw {
-            x,
-            y,
-            record_version,
-            hot_x,
-            hot_y,
-        } = built.cursor_assignment
-    {
-        cursor_transition_to_queue = Some(CursorTransition::ShowOnRetire {
-            upload_version: record_version,
-            hot_x,
-            hot_y,
-            x,
-            y,
-        });
-    }
+    let cursor_mode_changed = assignment_changes_cursor_mode(prev_mode, built.cursor_assignment);
 
     let mut output_damage = built.projected_damage;
     output_damage.union_with(&cursor_damage_for_frame(
@@ -767,7 +843,7 @@ fn tick_one_output(
         last_present_cursor_version,
         built.new_cursor_rect,
         built.cursor_record_version,
-        cursor_transition_to_queue,
+        cursor_mode_changed,
     ));
     // Always-Full repaint makes stationary SW cursors safe even when
     // cursor_damage is empty and some unrelated damage triggers a
@@ -910,7 +986,6 @@ fn tick_one_output(
                 let (xor_pipeline, xor_layout) =
                     audit_overlay_pipeline(inner, !overlay_ops.is_empty())?;
                 let reference = audit_reference_scene(
-                    built.software_cursor_tail.is_some(),
                     input,
                     store,
                     output_idx,
@@ -966,7 +1041,6 @@ fn tick_one_output(
     // Shared outputs only: a copied (reverse-PRIME) output renders
     // `Repaint::Full` unconditionally and never consults this state, so it must
     // not accumulate any either.
-    let shared_output = sink.route(output_idx) == OutputRoute::Shared;
     // A transformed frame repaints the whole BO, so its damage (in
     // intermediate pixels) never enters the per-BO model.
     if shared_output && transform.is_none() {
@@ -1034,12 +1108,8 @@ fn tick_one_output(
 
     // A stationary software cursor lives only in the BO that last drew it, so it
     // must be repainted even on a frame triggered by unrelated damage. Keyed off
-    // the draw list rather than off the cursor assignment, which avoids two
-    // mistakes: `new_cursor_rect` is `Some` for a HW-plane cursor too (that rect
-    // is plane content, not BO content, and folding it would repaint a region on
-    // every cursor move on the very path that exists to avoid that), and
-    // `omit_software_cursor_for_hide` strips the SW draw for the Hw->Sw handoff
-    // frame after the assignment was computed.
+    // the draw list rather than off the cursor assignment: `new_cursor_rect` is
+    // also `Some` for a HW-plane cursor, where it describes plane content.
     if built.software_cursor_tail.is_some()
         && let Some(cursor_rect) = built.new_cursor_rect
     {
@@ -1112,7 +1182,6 @@ fn tick_one_output(
     let overlay_ops = root_overlay.apply_list_for_output(input.outputs[output_idx].root_rect);
     let (xor_pipeline, xor_layout) = audit_overlay_pipeline(inner, !overlay_ops.is_empty())?;
     let reference = audit_reference_scene(
-        built.software_cursor_tail.is_some(),
         input,
         store,
         output_idx,
@@ -1162,6 +1231,7 @@ fn tick_one_output(
         Ok(ticket) => ticket,
         Err(error) => {
             inner.outputs[output_idx].pool_ring.release(slot);
+            sink.cancel_slot(output_idx, token.bo_idx);
             if vk_result_is_device_lost(error) {
                 sink.gpu_mut().renderer_failed = true;
             }
@@ -1201,7 +1271,12 @@ fn tick_one_output(
             .cursor_saves
             .prepare(&inner.vk, image, cursor_rect)
     });
-    sink.check_frame_target(output_idx)?;
+    if let Err(error) = sink.check_frame_target(output_idx) {
+        compose_ticket.cancel_unsubmitted();
+        inner.outputs[output_idx].pool_ring.release(slot);
+        sink.cancel_slot(output_idx, token.bo_idx);
+        return Err(error.into());
+    }
     // Retained root-`IncludeInferiors` overlay: per-output apply list
     // (output-local XOR rects), computed against the SAME per-output
     // layout the compose uses. Empty in the common case (no active
@@ -1213,10 +1288,18 @@ fn tick_one_output(
     let (xor_pipeline, xor_layout) = if overlay_ops.is_empty() {
         (vk::Pipeline::null(), vk::PipelineLayout::null())
     } else {
-        let pl = inner.overlay_xor_cache.get(
+        let pl = match inner.overlay_xor_cache.get(
             yserver_protocol::x11::gc::GcFunction::Xor,
             crate::kms::vk::logic_fill_pipeline::LogicFillChannels::Color,
-        )?;
+        ) {
+            Ok(pl) => pl,
+            Err(error) => {
+                compose_ticket.cancel_unsubmitted();
+                inner.outputs[output_idx].pool_ring.release(slot);
+                sink.cancel_slot(output_idx, token.bo_idx);
+                return Err(error.into());
+            }
+        };
         (pl, inner.overlay_xor_cache.pipeline_layout())
     };
     let mut gpu_submitted = false;
@@ -1240,6 +1323,43 @@ fn tick_one_output(
             &[],
         )
     };
+    let frame = {
+        let state = inner.outputs.get_mut(output_idx).expect("range");
+        let frame = crate::kms::render::scene::CursorFrameId(state.next_cursor_frame_id);
+        state.next_cursor_frame_id = state
+            .next_cursor_frame_id
+            .checked_add(1)
+            .expect("cursor frame identity exhausted for output lifetime");
+        frame
+    };
+    let assignment = match built.cursor_assignment {
+        CursorAssignment::Hw { .. } => CursorFrameAssignment::Hardware,
+        CursorAssignment::Sw { pos } => CursorFrameAssignment::Software { pos },
+        CursorAssignment::Hidden => CursorFrameAssignment::Hidden,
+    };
+    let hardware_only = prev_mode == OutputCursorMode::Hw
+        && !matches!(assignment, CursorFrameAssignment::Software { .. });
+    let cursor_frame = CursorFramePlan {
+        frame,
+        assignment,
+        hardware_only,
+        sprite: (!hardware_only && !matches!(assignment, CursorFrameAssignment::Hidden))
+            .then(|| inner.cursor.clone())
+            .flatten(),
+    };
+    let primary_cursor = match (
+        built.software_cursor_tail,
+        built.cursor_assignment,
+        built.cursor_record_version,
+    ) {
+        (Some(_), CursorAssignment::Sw { pos }, Some(record_version)) => {
+            CursorPrimaryContent::Software {
+                pos,
+                record_version,
+            }
+        }
+        _ => CursorPrimaryContent::Cursorless,
+    };
     let mut record = |target: &mut dyn ComposeRenderTarget| {
         record_and_submit_render(
             &inner.vk,
@@ -1257,22 +1377,40 @@ fn tick_one_output(
             scale_pass.as_ref(),
             cursor_save,
         )
+        .map(|mut submit| {
+            submit.primary_cursor = primary_cursor;
+            submit
+        })
     };
+    let mut accepted_cursor_receipt = None;
     let (render_result, previous_gpu_ns, copied_prepare_failed) =
-        match sink.finish_frame(output_idx, token.bo_idx, &mut record) {
-            FinishOutcome::Unavailable(error) => return Err(error.into()),
+        match sink.finish_frame(output_idx, token.bo_idx, cursor_frame.clone(), &mut record) {
+            FinishOutcome::Unavailable(error) => {
+                // `finish_frame` may reject a scene-owned cursor plan before
+                // it invokes the render callback. Return the acquired scanout
+                // slot as well as the staged frame so a later Backend pass
+                // can retry the still-damaged scene.
+                sink.cancel_slot(output_idx, token.bo_idx);
+                inner.outputs[output_idx].pool_ring.release(slot);
+                compose_ticket.cancel_unsubmitted();
+                force_cursor_retry_repaint(
+                    inner.outputs.get_mut(output_idx).expect("checked output"),
+                );
+                return Err(error.into());
+            }
             FinishOutcome::Finished {
                 result,
                 previous_gpu_ns,
                 fail_stop,
             } => (
                 result.map(|handoff| match handoff {
-                    FrameHandoff::FlipPending(submitted) => {
+                    FrameHandoff::FlipPending { submit, cursor } => {
                         compose_complete =
-                            compose_submit_was_complete(submitted, render_scene.draws.len());
+                            compose_submit_was_complete(submit, render_scene.draws.len());
+                        accepted_cursor_receipt = Some(cursor);
                         None
                     }
-                    FrameHandoff::RenderCompletion(completion) => Some(completion),
+                    FrameHandoff::RenderCompletion { completion, .. } => Some(completion),
                 }),
                 previous_gpu_ns,
                 fail_stop,
@@ -1302,6 +1440,12 @@ fn tick_one_output(
         Ok(None) => Ok(InFlightStage::KmsFlipPending),
         Err(error) => Err(error),
     };
+    if let Ok(stage) = &compose_result
+        && *stage == InFlightStage::KmsFlipPending
+        && let Some(receipt) = accepted_cursor_receipt
+    {
+        note_cursor_commit_accepted_inner(inner, output_idx, receipt);
+    }
     let record_ns = u64::try_from(record_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
     telemetry.record_compose_cb_record_ns(record_ns);
     // GPU-render time from this paired target's PREVIOUS compose (timestamp
@@ -1329,15 +1473,15 @@ fn tick_one_output(
                 bo_idx: token.bo_idx,
                 generation: frame_gen,
                 stage,
+                cursor_frame: cursor_frame.clone(),
+                cursor_receipt: accepted_cursor_receipt,
                 drawable_snapshots: built.snapshots,
                 ticket: Some(compose_ticket),
                 submitted_output_damage: output_damage,
                 submitted_participants: built.participants,
                 submitted_scene_structure_damage: scene_structure_snap,
                 submitted_failed_repaint: failed_repaint_snap,
-                cursor_transition: cursor_transition_to_queue,
-                cursor_prev_pos_after_retire,
-                cursor_mode_after_retire,
+                cursor_mode_before: accepted_mode_from_output_mode(prev_mode),
                 last_present_cursor_rect_after_retire: built.new_cursor_rect,
                 last_present_cursor_version_after_retire: built.cursor_record_version,
             });
@@ -1419,6 +1563,7 @@ fn tick_one_output(
                     token.bo_idx,
                 );
             } else {
+                compose_ticket.cancel_unsubmitted();
                 log::warn!(
                     "render scene: compose record/queue submit failed for output \
                      {output_idx} (bo {}): {e}",

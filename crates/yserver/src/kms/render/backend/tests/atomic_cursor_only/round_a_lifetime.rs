@@ -282,29 +282,22 @@ fn disable_and_drain(fixture: &mut AtomicCursorFixture, first_frame: u32) {
     fixture.assert_cursor_quiescent();
 }
 
-fn drive_animation_to_next_frame(fixture: &mut AtomicCursorFixture, animation: u32) -> u64 {
+fn drive_animation_to_next_frame(
+    fixture: &mut AtomicCursorFixture,
+    animation: u32,
+    now: &std::cell::Cell<std::time::Instant>,
+) -> u64 {
     use yserver_core::backend::Backend;
 
     let prior = fixture.backend.cursor_records[&animation].version;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    let mut frame = 100;
-    while fixture.backend.cursor_records[&animation].version == prior {
-        damage_cursor_root(fixture);
-        Backend::maybe_composite(&mut fixture.backend).expect("tick animation through Backend");
-        if fixture.backend.scene.has_pending_page_flip(0)
-            && !fixture
-                .backend
-                .platform
-                .cursor_atomic_event_pending_for_output(0)
-        {
-            fixture.retire_output(0, frame);
-            frame += 1;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "Backend animation tick did not advance before the test deadline",
-        );
-    }
+    let deadline = Backend::next_wakeup(&fixture.backend).expect("animation deadline is scheduled");
+    now.set(deadline);
+    damage_cursor_root(fixture);
+    Backend::maybe_composite(&mut fixture.backend).expect("tick animation through Backend");
+    assert_ne!(
+        fixture.backend.cursor_records[&animation].version, prior,
+        "controlled Backend deadline advances the animation record",
+    );
     fixture.backend.cursor_records[&animation].version
 }
 
@@ -386,7 +379,6 @@ fn atomic_cursor_only_shared_fb_survives_staggered_replacement() {
     Backend::maybe_composite(&mut fixture.backend).expect("submit A replacement and skip B");
     assert!(fixture.backend.scene.has_pending_page_flip(0));
     assert!(fixture.backend.scene.has_pending_page_flip(1));
-    fixture.retire_output(0, 6);
 
     let replaced_a = cursor_binding(&fixture, 0);
     let held_b = cursor_binding(&fixture, 1);
@@ -395,7 +387,18 @@ fn atomic_cursor_only_shared_fb_survives_staggered_replacement() {
         "A accepts F1 at its real scene retirement",
     );
     assert_eq!(held_b.lease, first_b.lease, "B still scans out F0");
+    assert!(fixture.backend.scene.has_pending_page_flip(0));
     assert!(fixture.backend.scene.has_pending_page_flip(1));
+    assert_eq!(
+        fixture.backend.platform.devices[0].cursor.crtc_states
+            [&fixture.backend.platform.outputs[0].output.crtc]
+            .in_flight
+            .as_ref()
+            .and_then(|commit| commit.prior)
+            .map(|prior| prior.lease),
+        Some(first_a.lease),
+        "the accepted shared frame keeps A's prior binding through its event",
+    );
     let before_a_event = framebuffer_storage(&fixture, f0);
     assert_eq!(before_a_event.0, device_fd);
     assert_eq!(before_a_event.1, handle);
@@ -416,10 +419,10 @@ fn atomic_cursor_only_shared_fb_survives_staggered_replacement() {
             .expect("sprite pool")
             .sprite_user_count(first_a.lease),
         Some(2),
-        "the in-flight replacement and B both retain F0 until A's event",
+        "A's pending scene event and B's binding both retain F0",
     );
 
-    fixture.retire_output(0, 7);
+    fixture.retire_output(0, 6);
     assert!(fixture.backend.scene.has_pending_page_flip(1));
     assert_eq!(
         fixture.backend.platform.devices[0]
@@ -589,10 +592,10 @@ fn atomic_cursor_only_identical_handles_are_scoped_to_each_device() {
         .expect("define replacement through Backend");
     damage_cursor_root(&mut fixture);
     Backend::maybe_composite(&mut fixture.backend).expect("submit first-device replacement");
-    fixture.retire_output(0, 6);
     let first_replacement = cursor_binding(&fixture, 0);
     assert_ne!(first_replacement.framebuffer, first_binding.framebuffer);
     assert_eq!(cursor_binding(&fixture, 1), second_binding);
+    assert!(fixture.backend.scene.has_pending_page_flip(0));
     assert!(
         fixture
             .backend
@@ -605,11 +608,18 @@ fn atomic_cursor_only_identical_handles_are_scoped_to_each_device() {
     );
     assert_eq!(
         &framebuffer_storage_for_device(&fixture, second_key, first_replacement.framebuffer).2[..4],
-        &[0; 4],
-        "the second device's colliding FB id keeps its own untouched bytes",
+        &replacement_pixels,
+        "the colliding FB id names a separately staged replacement allocation on device B",
     );
 
-    fixture.retire_output(0, 7);
+    fixture.retire_output(0, 6);
+    assert!(!fixture.backend.scene.has_pending_page_flip(0));
+    assert!(
+        !fixture
+            .backend
+            .platform
+            .cursor_atomic_event_pending_for_output(0)
+    );
     assert!(fixture.backend.scene.has_pending_page_flip(1));
     assert_eq!(
         fixture
@@ -646,10 +656,11 @@ fn atomic_cursor_only_identical_handles_are_scoped_to_each_device() {
         Backend::maybe_composite(&mut fixture.backend).expect("retry second-device replacement");
         let binding = cursor_binding(&fixture, 1);
         if binding.lease == first_replacement.lease
-            && fixture
-                .backend
-                .platform
-                .cursor_atomic_event_pending_for_output(1)
+            && (fixture.backend.scene.has_pending_page_flip(1)
+                || fixture
+                    .backend
+                    .platform
+                    .cursor_atomic_event_pending_for_output(1))
         {
             second_replacement_event = true;
             break;
@@ -665,7 +676,7 @@ fn atomic_cursor_only_identical_handles_are_scoped_to_each_device() {
     }
     assert!(
         second_replacement_event,
-        "second device accepts its own replacement"
+        "second device accepts its own replacement after its prior event retires"
     );
     fixture.retire_output(1, 24);
     assert_eq!(cursor_binding(&fixture, 1).lease, first_replacement.lease);
@@ -707,9 +718,13 @@ fn atomic_cursor_only_identical_handles_are_scoped_to_each_device() {
 // Mutation: retain the oldest wanted cursor image after pool pressure instead of the latest animation frame.
 fn atomic_cursor_only_pool_pressure_keeps_only_newest_animation() {
     use crate::kms::cursor_plane::ops::CursorBufferRecord;
+    use std::{cell::Cell, rc::Rc, time::Instant};
     use yserver_core::backend::Backend;
 
-    let Some(mut fixture) = AtomicCursorFixture::new_with_overlapping_outputs()
+    let now = Rc::new(Cell::new(Instant::now()));
+    let clock_now = Rc::clone(&now);
+    let clock: Rc<dyn Fn() -> Instant> = Rc::new(move || clock_now.get());
+    let Some(mut fixture) = AtomicCursorFixture::new_with_overlapping_outputs_and_clock(clock)
         .expect("build two-output pressure fixture")
     else {
         return;
@@ -757,11 +772,16 @@ fn atomic_cursor_only_pool_pressure_keeps_only_newest_animation() {
     Backend::maybe_composite(&mut fixture.backend).expect("submit A's F1 replacement");
     assert!(fixture.backend.scene.has_pending_page_flip(0));
     assert!(fixture.backend.scene.has_pending_page_flip(1));
-    fixture.retire_output(0, 6);
     let f1_binding = cursor_binding(&fixture, 0);
     assert_eq!(
         f1_binding.lease.version(),
         fixture.backend.cursor_records[&f1_cursor.as_raw()].version
+    );
+    assert!(
+        fixture.backend.platform.devices[0].cursor.crtc_states
+            [&fixture.backend.platform.outputs[0].output.crtc]
+            .in_flight
+            .is_some()
     );
     assert!(
         fixture
@@ -769,6 +789,8 @@ fn atomic_cursor_only_pool_pressure_keeps_only_newest_animation() {
             .platform
             .cursor_atomic_event_pending_for_output(0)
     );
+    fixture.retire_output(0, 6);
+    assert!(!fixture.backend.scene.has_pending_page_flip(0));
     fixture.retire_output(0, 7);
     assert_eq!(
         framebuffer_storage(&fixture, f0_binding_a.framebuffer).2,
@@ -882,15 +904,14 @@ fn atomic_cursor_only_pool_pressure_keeps_only_newest_animation() {
     Backend::define_cursor(&mut fixture.backend, None, root, animation.as_raw())
         .expect("define animation through Backend while every slot is in use");
     fixture.retire_output(0, 30);
-    assert!(
-        fixture
-            .backend
-            .platform
-            .cursor_atomic_event_pending_for_output(1)
+    assert_eq!(
+        cursor_binding(&fixture, 1).lease,
+        f2_binding.lease,
+        "the applied B image remains F2 while animation staging is deferred",
     );
     damage_cursor_root(&mut fixture);
     Backend::maybe_composite(&mut fixture.backend).expect("submit newest animation image attempt");
-    let intermediate = drive_animation_to_next_frame(&mut fixture, animation.as_raw());
+    let intermediate = drive_animation_to_next_frame(&mut fixture, animation.as_raw(), &now);
     assert_eq!(
         fixture
             .recorders
@@ -907,7 +928,7 @@ fn atomic_cursor_only_pool_pressure_keeps_only_newest_animation() {
     damage_cursor_root(&mut fixture);
     Backend::maybe_composite(&mut fixture.backend)
         .expect("attempt intermediate frame through Backend");
-    let newest = drive_animation_to_next_frame(&mut fixture, animation.as_raw());
+    let newest = drive_animation_to_next_frame(&mut fixture, animation.as_raw(), &now);
     damage_cursor_root(&mut fixture);
     Backend::maybe_composite(&mut fixture.backend).expect("attempt newest frame through Backend");
     assert_ne!(intermediate, newest);
@@ -1079,6 +1100,8 @@ fn atomic_cursor_only_pool_pressure_keeps_only_newest_animation() {
     );
 
     disable_and_drain(&mut fixture, 64);
+    // B's held primary frame can finish its already-owned F2 binding on A;
+    // the coalesced newest animation image then supersedes it on both CRTCs.
     assert_eq!(
         cursor_framebuffer_trace(&fixture),
         vec![
@@ -1086,6 +1109,7 @@ fn atomic_cursor_only_pool_pressure_keeps_only_newest_animation() {
             (2, f0_binding_b.framebuffer),
             (1, f1_binding.framebuffer),
             (2, f2_binding.framebuffer),
+            (1, f2_binding.framebuffer),
             (1, newest_binding.framebuffer),
             (2, newest_binding.framebuffer),
             (1, 0),
@@ -1093,7 +1117,7 @@ fn atomic_cursor_only_pool_pressure_keeps_only_newest_animation() {
             (1, 0),
             (2, 0),
         ],
-        "the retained newest animation image is the only post-pressure frame committed",
+        "the held frame settles before the retained newest animation image replaces it",
     );
     let ledger = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
     drop(fixture);
@@ -1148,15 +1172,9 @@ fn atomic_cursor_only_hotspot_only_switches_framebuffer() {
     damage_cursor_root(&mut fixture);
     let records_before = fixture.recorders.atomic.records().len();
     Backend::maybe_composite(&mut fixture.backend).expect("submit hotspot-only replacement");
-    if fixture.backend.scene.has_pending_page_flip(0) {
-        fixture.retire_output(0, 3);
-    }
     assert!(
-        fixture
-            .backend
-            .platform
-            .cursor_atomic_event_pending_for_output(0),
-        "accepted hotspot replacement awaits its retirement event",
+        fixture.backend.scene.has_pending_page_flip(0),
+        "accepted hotspot replacement awaits its shared scene event",
     );
 
     let next = cursor_binding(&fixture, 0);
@@ -1189,6 +1207,13 @@ fn atomic_cursor_only_hotspot_only_switches_framebuffer() {
             .sprite_user_count(prior.lease),
         Some(1),
         "the accepted replacement retains the old framebuffer through retirement",
+    );
+    assert!(
+        fixture.backend.platform.devices[0].cursor.crtc_states
+            [&fixture.backend.platform.outputs[0].output.crtc]
+            .in_flight
+            .as_ref()
+            .is_some_and(|commit| commit.prior == Some(prior))
     );
     let records = fixture.recorders.atomic.records();
     let update = records[records_before..]

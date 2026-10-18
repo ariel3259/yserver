@@ -1,11 +1,8 @@
 use crate::kms::render::{
     scene::{
-        FailedSubmitBo, InFlightStage, OutputCursorMode, OutputSceneState, OutputSink,
-        RenderCompletion, SceneCompositor, SceneCompositorInner,
-        cursor::{
-            apply_cursor_transition_on_retire, force_cursor_retry_repaint,
-            resolve_retired_cursor_state, update_force_show_retry_version,
-        },
+        FailedSubmitBo, InFlightStage, OutputSceneState, OutputSink, RenderCompletion,
+        SceneCompositor, SceneCompositorInner,
+        cursor::{force_cursor_retry_repaint, note_cursor_commit_accepted_inner},
         tick::tick_skip_log_enabled,
     },
     store::DrawableStore,
@@ -190,58 +187,39 @@ impl SceneCompositor {
             // acquire).
             sink.commit_slot_present(output_idx, retire.presented_bo_idx, ack.generation);
 
-            // The KMS frame retired, but the cursor transition itself is a
-            // second transaction. Record what actually happened: never claim
-            // Hw after a rolled-back show and never claim Sw/Hidden while a
-            // failed hide or rollback left the hardware sprite visible.
-            let retained_mode = inner.outputs[output_idx].last_frame_cursor_mode;
-            let cursor_result =
-                apply_cursor_transition_on_retire(inner, output_idx, sink, ack.cursor_transition);
+            // Retirement releases this frame's resources and applies only the
+            // software cursor footprint that its accepted primary contained.
+            // Cursor ownership was published when the commit was accepted;
+            // retirement never issues a second cursor transaction or rewrites
+            // a newer accepted mode.
+            let frame_receipt = ack
+                .cursor_receipt
+                .filter(|receipt| receipt.frame == Some(ack.cursor_frame.frame));
             let state = inner
                 .outputs
                 .get_mut(output_idx)
                 .expect("range checked above");
-            let resolution = resolve_retired_cursor_state(
-                cursor_result,
-                ack.cursor_mode_after_retire,
-                retained_mode,
-            );
-            state.force_show_retry_version = update_force_show_retry_version(
-                state.force_show_retry_version,
-                ack.cursor_transition,
-                cursor_result,
-                ack.cursor_mode_after_retire,
-            );
-            state.last_frame_cursor_mode = resolution.actual_mode;
-            if resolution.commit_desired_metadata {
-                if let Some(new_prev) = ack.cursor_prev_pos_after_retire {
-                    state.cursor_prev_pos = new_prev;
+            if let Some(receipt) = frame_receipt {
+                match receipt.primary_cursor {
+                    crate::kms::render::scene::CursorPrimaryContent::Cursorless => {
+                        state.cursor_prev_pos = None;
+                        state.last_present_cursor_rect = None;
+                        state.last_present_cursor_version = None;
+                    }
+                    crate::kms::render::scene::CursorPrimaryContent::Software { pos, .. } => {
+                        state.cursor_prev_pos = Some(pos);
+                        state.last_present_cursor_rect = ack.last_present_cursor_rect_after_retire;
+                        state.last_present_cursor_version =
+                            ack.last_present_cursor_version_after_retire;
+                        if sink.cursor_plane_mut().note_composed_retirement(output_idx) {
+                            // Consume this output/device's own EINVAL backoff
+                            // one composed retirement at a time. The composed
+                            // primary remains the retry mechanism.
+                            force_cursor_retry_repaint(state);
+                            self.scene_structure_dirty = true;
+                        }
+                    }
                 }
-                state.last_present_cursor_rect = ack.last_present_cursor_rect_after_retire;
-                state.last_present_cursor_version = ack.last_present_cursor_version_after_retire;
-            } else {
-                state.cursor_prev_pos = None;
-                if resolution.clear_presented_metadata {
-                    state.last_present_cursor_rect = None;
-                    state.last_present_cursor_version = None;
-                }
-                // Otherwise preserve last-known metadata: the requested bind
-                // did not fully land, so claiming the desired rect/version
-                // could make later same-position damage incorrectly skip.
-            }
-            if resolution.force_repaint {
-                force_cursor_retry_repaint(state);
-                self.scene_structure_dirty = true;
-            }
-            let actually_sw_composed =
-                matches!(ack.cursor_mode_after_retire, OutputCursorMode::Sw { .. });
-            if actually_sw_composed && sink.cursor_plane_mut().note_composed_retirement(output_idx)
-            {
-                // Consume this output/device's own EINVAL backoff one
-                // composed retirement at a time. Damage keeps the sequence
-                // alive until the retry becomes eligible.
-                force_cursor_retry_repaint(state);
-                self.scene_structure_dirty = true;
             }
             true
         } else {
@@ -312,10 +290,12 @@ pub(super) fn handle_scanout_render_completion_inner(
     }
 
     match sink.submit_copied(output_idx, bo_idx, fd) {
-        Ok(()) => {
+        Ok(receipt) => {
             if let Some(ack) = inner.outputs[output_idx].pending_acks.front_mut() {
                 ack.stage = InFlightStage::KmsFlipPending;
+                ack.cursor_receipt = Some(receipt);
             }
+            note_cursor_commit_accepted_inner(inner, output_idx, receipt);
             true
         }
         Err(error) => {

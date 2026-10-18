@@ -12,10 +12,145 @@ use crate::kms::{
 use std::{
     collections::HashSet,
     io,
-    os::fd::{AsFd as _, AsRawFd as _, OwnedFd, RawFd},
+    os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd, RawFd},
     rc::Rc,
 };
 use yserver_core::backend::{BackendFdKind, PresentClockSample, PresentClockSource};
+
+pub(crate) trait RenderCompletionReadiness {
+    fn is_ready(&self, job_id: u64, fd: Option<BorrowedFd<'_>>) -> io::Result<bool>;
+}
+
+pub(crate) struct PollRenderCompletionReadiness;
+
+impl RenderCompletionReadiness for PollRenderCompletionReadiness {
+    fn is_ready(&self, _job_id: u64, fd: Option<BorrowedFd<'_>>) -> io::Result<bool> {
+        use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+
+        let Some(fd) = fd else {
+            return Ok(true);
+        };
+        let mut fds = [PollFd::new(fd, PollFlags::POLLIN)];
+        match poll(&mut fds, PollTimeout::ZERO) {
+            Ok(0) => Ok(false),
+            Ok(_) => Ok(fds[0].revents().is_some_and(|events| {
+                events.intersects(PollFlags::POLLIN | PollFlags::POLLERR | PollFlags::POLLHUP)
+            })),
+            Err(error) => Err(io::Error::from(error)),
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct RecordingRenderCompletionReadiness {
+    hold_ready: std::cell::Cell<bool>,
+    hold_without_polling: std::cell::Cell<bool>,
+    observed_ready: std::cell::RefCell<HashSet<u64>>,
+    released_ready: std::cell::RefCell<HashSet<u64>>,
+    captured_fds: std::cell::RefCell<std::collections::HashMap<u64, OwnedFd>>,
+}
+
+#[cfg(test)]
+impl RecordingRenderCompletionReadiness {
+    pub(crate) fn hold_ready_jobs(&self) {
+        self.hold_ready.set(true);
+        self.released_ready.borrow_mut().clear();
+    }
+
+    /// Retain copied jobs without polling their real GPU sync files. Tests use
+    /// this only to cancel in the same scheduling turn, then observe the
+    /// original fd signal after Backend has removed the job.
+    pub(crate) fn hold_jobs_without_polling(&self) {
+        self.hold_without_polling.set(true);
+        self.captured_fds.borrow_mut().clear();
+        self.observed_ready.borrow_mut().clear();
+    }
+
+    pub(crate) fn release_unpolled_jobs(&self) {
+        self.hold_without_polling.set(false);
+    }
+
+    pub(crate) fn captured_fd_is_signaled(&self, job_id: u64) -> io::Result<bool> {
+        let captured = self.captured_fds.borrow();
+        let fd = captured
+            .get(&job_id)
+            .ok_or_else(|| io::Error::other("copied completion has no captured sync fd"))?;
+        PollRenderCompletionReadiness.is_ready(job_id, Some(fd.as_fd()))
+    }
+
+    pub(crate) fn wait_for_captured_fd_signal(&self, job_id: u64) -> io::Result<()> {
+        let captured = self.captured_fds.borrow();
+        let fd = captured
+            .get(&job_id)
+            .ok_or_else(|| io::Error::other("copied completion has no captured sync fd"))?;
+        let mut poll_fd = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: this is one initialized pollfd and the duplicated SYNC_FD is
+        // kept alive by `captured` for the entire blocking poll.
+        let ready = unsafe { libc::poll(&mut poll_fd, 1, 10_000) };
+        if ready == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "copied render completion did not signal within ten seconds",
+            ));
+        }
+        if ready < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if poll_fd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) == 0 {
+            return Err(io::Error::other(format!(
+                "copied render completion fd returned poll flags 0x{:x}",
+                poll_fd.revents
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn captured_fd_exists(&self, job_id: u64) -> bool {
+        self.captured_fds.borrow().contains_key(&job_id)
+    }
+
+    pub(crate) fn release_ready_jobs(&self) {
+        self.hold_ready.set(false);
+    }
+
+    pub(crate) fn release_ready_job(&self, job_id: u64) {
+        self.released_ready.borrow_mut().insert(job_id);
+    }
+
+    pub(crate) fn observed_ready_job_count(&self) -> usize {
+        self.observed_ready.borrow().len()
+    }
+
+    pub(crate) fn observed_ready_jobs(&self) -> Vec<u64> {
+        self.observed_ready.borrow().iter().copied().collect()
+    }
+}
+
+#[cfg(test)]
+impl RenderCompletionReadiness for RecordingRenderCompletionReadiness {
+    fn is_ready(&self, job_id: u64, fd: Option<BorrowedFd<'_>>) -> io::Result<bool> {
+        if self.hold_without_polling.get() {
+            if let Some(fd) = fd
+                && !self.captured_fds.borrow().contains_key(&job_id)
+            {
+                self.captured_fds
+                    .borrow_mut()
+                    .insert(job_id, fd.try_clone_to_owned()?);
+            }
+            return Ok(false);
+        }
+        if !PollRenderCompletionReadiness.is_ready(job_id, fd)? {
+            return Ok(false);
+        }
+        self.observed_ready.borrow_mut().insert(job_id);
+        Ok(!self.hold_ready.get() || self.released_ready.borrow().contains(&job_id))
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct KernelPageFlip {
@@ -413,8 +548,15 @@ impl PlatformBackend {
         &mut self,
         output_key: OutputKey,
         bo_idx: usize,
+        cursor_frame: yserver_render::kms::render::scene::CursorFrameId,
         fd: Option<OwnedFd>,
     ) -> io::Result<u64> {
+        let output_idx = self
+            .outputs
+            .iter()
+            .position(|output| output.key == output_key)
+            .ok_or_else(|| io::Error::other("scanout completion output disappeared"))?;
+        let crtc_key = CrtcKey::for_output(&self.outputs[output_idx]);
         let job_id = self.next_scanout_render_job_id;
         self.next_scanout_render_job_id = self
             .next_scanout_render_job_id
@@ -428,7 +570,9 @@ impl PlatformBackend {
             .push_back(PendingScanoutRenderCompletion {
                 job_id,
                 output_key,
+                crtc_key,
                 bo_idx,
+                cursor_frame,
                 fd,
             });
         Ok(job_id)
@@ -438,28 +582,19 @@ impl PlatformBackend {
     /// Different outputs are independent, so readiness is not constrained by
     /// queue-front order.
     pub(crate) fn drain_scanout_render_completions(&mut self) -> Vec<ReadyScanoutRenderCompletion> {
-        use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
-
         let mut ready = Vec::new();
         let mut index = 0;
         while index < self.pending_scanout_render_completions.len() {
-            let is_ready = {
+            let readiness = {
                 let pending = &self.pending_scanout_render_completions[index];
-                if let Some(fd) = pending.fd.as_ref() {
-                    let mut fds = [PollFd::new(fd.as_fd(), PollFlags::POLLIN)];
-                    match poll(&mut fds, PollTimeout::ZERO) {
-                        Ok(0) => false,
-                        Ok(_) => fds[0].revents().is_some_and(|events| {
-                            events.intersects(
-                                PollFlags::POLLIN | PollFlags::POLLERR | PollFlags::POLLHUP,
-                            )
-                        }),
-                        Err(error) => {
-                            log::warn!("scanout render completion poll failed: {error}");
-                            true
-                        }
-                    }
-                } else {
+                self.services
+                    .render_completion_readiness
+                    .is_ready(pending.job_id, pending.fd.as_ref().map(|fd| fd.as_fd()))
+            };
+            let is_ready = match readiness {
+                Ok(is_ready) => is_ready,
+                Err(error) => {
+                    log::warn!("scanout render completion poll failed: {error}");
                     true
                 }
             };
@@ -479,7 +614,9 @@ impl PlatformBackend {
             ready.push(ReadyScanoutRenderCompletion {
                 job_id: pending.job_id,
                 output_key: pending.output_key,
+                crtc_key: pending.crtc_key,
                 bo_idx: pending.bo_idx,
+                cursor_frame: pending.cursor_frame,
                 fd: pending.fd,
             });
         }
@@ -503,6 +640,13 @@ impl PlatformBackend {
                 log::warn!("scanout render completion cancellation unregister failed: {error}");
             }
         }
+        if let Some(output_idx) = self
+            .outputs
+            .iter()
+            .position(|output| output.key == *output_key)
+        {
+            super::cursor_frames::cancel_cursor_frames_for_output(self, output_idx);
+        }
     }
 
     pub(crate) fn clear_scanout_render_completions(&mut self) {
@@ -513,6 +657,7 @@ impl PlatformBackend {
                 log::warn!("scanout render completion teardown unregister failed: {error}");
             }
         }
+        super::cursor_frames::clear_cursor_frames(self);
     }
 
     /// Drain page-flip events that belong to the topology epoch just taken

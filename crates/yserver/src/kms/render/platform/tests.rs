@@ -355,7 +355,12 @@ fn topology_reset_cancels_completion_for_a_surviving_output() {
             .expect("ready eventfd")
             .into();
     platform
-        .register_scanout_render_completion(output_key, 1, Some(ready))
+        .register_scanout_render_completion(
+            output_key,
+            1,
+            crate::kms::render::scene::CursorFrameId(7),
+            Some(ready),
+        )
         .expect("register pollable copied completion");
 
     platform
@@ -383,10 +388,20 @@ fn scanout_render_completion_drain_is_not_queue_front_blocked() {
             .expect("ready eventfd")
             .into();
     let first_job = platform
-        .register_scanout_render_completion(output_key.clone(), 0, Some(blocked))
+        .register_scanout_render_completion(
+            output_key.clone(),
+            0,
+            crate::kms::render::scene::CursorFrameId(8),
+            Some(blocked),
+        )
         .expect("register first job");
     let second_job = platform
-        .register_scanout_render_completion(output_key.clone(), 1, Some(ready))
+        .register_scanout_render_completion(
+            output_key.clone(),
+            1,
+            crate::kms::render::scene::CursorFrameId(9),
+            Some(ready),
+        )
         .expect("register second job");
 
     let completions = platform.drain_scanout_render_completions();
@@ -394,6 +409,10 @@ fn scanout_render_completion_drain_is_not_queue_front_blocked() {
     assert_eq!(completions[0].job_id, second_job);
     assert_eq!(completions[0].output_key, output_key);
     assert_eq!(completions[0].bo_idx, 1);
+    assert_eq!(
+        completions[0].cursor_frame,
+        crate::kms::render::scene::CursorFrameId(9),
+    );
     assert_eq!(
         platform.pending_scanout_render_completions[0].job_id, first_job,
         "an unreadable earlier job remains registered"
@@ -408,7 +427,12 @@ fn already_signalled_scanout_completion_is_immediately_ready_without_fd() {
     let mut platform = PlatformBackend::for_tests();
     let output_key = platform.outputs[0].key.clone();
     let job = platform
-        .register_scanout_render_completion(output_key.clone(), 2, None)
+        .register_scanout_render_completion(
+            output_key.clone(),
+            2,
+            crate::kms::render::scene::CursorFrameId(10),
+            None,
+        )
         .expect("register Vulkan fd=-1 completion");
 
     let completions = platform.drain_scanout_render_completions();
@@ -416,6 +440,10 @@ fn already_signalled_scanout_completion_is_immediately_ready_without_fd() {
     assert_eq!(completions[0].job_id, job);
     assert_eq!(completions[0].output_key, output_key);
     assert_eq!(completions[0].bo_idx, 2);
+    assert_eq!(
+        completions[0].cursor_frame,
+        crate::kms::render::scene::CursorFrameId(10),
+    );
     assert!(completions[0].fd.is_none());
     assert!(platform.pending_scanout_render_completions.is_empty());
 }

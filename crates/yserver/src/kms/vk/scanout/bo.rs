@@ -151,6 +151,9 @@ impl ScanoutBo {
         height: u32,
         image: vk::Image,
         image_view: vk::ImageView,
+        compose_prepare_error: Option<
+            Rc<std::cell::RefCell<crate::kms::vk::scanout::ComposePrepareErrorScript>>,
+        >,
     ) -> io::Result<Self> {
         let pitch = width
             .checked_mul(4)
@@ -169,6 +172,7 @@ impl ScanoutBo {
         };
         Ok(Self {
             state: BoState::default(),
+            compose_prepare_error,
             width,
             height,
             is_alien: false,
@@ -210,6 +214,7 @@ impl ScanoutBo {
                 phase: crate::kms::vk::scanout::BoPhase::OnScreen,
                 ..BoState::default()
             },
+            compose_prepare_error: None,
             width,
             height,
             is_alien: false,
@@ -511,6 +516,7 @@ impl ScanoutBo {
 
         Ok(Self {
             state: BoState::default(),
+            compose_prepare_error: None,
             width,
             height,
             is_alien: false,

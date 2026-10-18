@@ -17,7 +17,6 @@ pub(crate) struct SpriteBufferLease {
 }
 
 impl SpriteBufferLease {
-    #[cfg(test)]
     pub(crate) fn version(self) -> u64 {
         self.version
     }
@@ -317,6 +316,14 @@ impl SpritePool {
         self.buffers
             .iter()
             .all(|buffer| buffer.users == 0 && buffer.prepared_users == 0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepared_user_count(&self) -> usize {
+        self.buffers
+            .iter()
+            .map(|buffer| buffer.prepared_users)
+            .sum()
     }
 
     #[cfg(test)]

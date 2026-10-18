@@ -59,6 +59,7 @@ impl KmsBackend {
                 || self.unredirected_direct_scene_eligible(candidate.paint_dst_host_xid, root));
         let cursor_hw = !include_cursor_term || self.direct_cursor_eligible();
         !self.platform.any_output_transformed()
+            && (!include_cursor_term || self.scene.direct_scanout_primary_ready())
             && self.direct_present_crtc_eligible(candidate.crtc_id, candidate.crtc_epoch)
             && scanout_direct_eligible(
                 self.scanout_allowed(),

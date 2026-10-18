@@ -139,10 +139,11 @@ impl KmsBackend {
             scanout_m0: ScanoutM0Telemetry::default(),
             scanout_m1: ScanoutM1ProbeCache::new(),
             scanout_m2: ScanoutM2State::new(),
-            deferred_direct_cursor: None,
             tearing: Tearing::new(),
             vt_resume_executor: std::rc::Rc::new(DrmVtResumeExecutor),
             monotonic_clock: std::rc::Rc::clone(&platform.services.monotonic_clock),
+            immediate_wake_guard:
+                crate::kms::render::backend::kms::state::ImmediateWakeGuard::default(),
             armed_vblank_targets: std::collections::HashMap::new(),
             absolute_vblank_targets: std::collections::HashMap::new(),
             crtc_queue_sequence_unsupported_devices: HashSet::new(),
@@ -185,6 +186,7 @@ impl KmsBackend {
             export_holders: Default::default(),
         };
         let mut b = Self::assemble(core, platform, engine, scene, pstate, kms_outputs_active);
+        b.platform.cursor_pointer_root = (init_cx, init_cy);
         // Validate every route already committed during platform bring-up,
         // then apply Xorg's one-shot AutoBindGPU-shaped startup policy: every
         // opened KMS endpoint distinct from the selected renderer becomes an
@@ -1020,6 +1022,11 @@ impl KmsBackend {
                 None
             };
             let old_pending_pageflips = self.pending_pageflip_crtcs();
+            // Remove copied completions before the blocking renderer wait.
+            // A completion that has not reached readiness must lose its
+            // assignment/lease first; otherwise a later fd signal can race
+            // DPMS and publish a cursor receipt for a canceled frame.
+            self.platform.clear_scanout_render_completions();
             log::info!("kms: dpms sleep — wait_idle_bounded");
             self.platform.wait_idle_bounded();
             log::info!("kms: dpms sleep — disable_output per output");
