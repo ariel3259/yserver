@@ -5,7 +5,7 @@ use crate::{
             CopiedQualificationSink, CopiedScanoutError, CopyFreeScanoutError, ExactPlanReplay,
             PRIME_RENDER_PROBE_TIMEOUT_NS, PreparedCopiedScanoutPool, PreparedScanoutPool,
             QualifiedScanoutPlan, SCANOUT_POOL_DEPTH, ScanoutQualificationError,
-            TerminalDisposableProbeMarker,
+            TerminalDisposableProbeMarker, services::KmsModesetServices,
         },
         scanout_route::{RenderKmsRelationship, ScanoutRoute},
         vk::{
@@ -213,6 +213,7 @@ pub(crate) fn qualify_scanout_route_for_worker(
     height: u32,
     fence_timeout_ns: u64,
 ) -> Result<QualifiedScanoutPlan, ScanoutQualificationError> {
+    let services = KmsModesetServices::production();
     if !route_requires_copy_free_probe(route) {
         return Err(ScanoutQualificationError::Rejected(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -254,6 +255,7 @@ pub(crate) fn qualify_scanout_route_for_worker(
                     )
                 })?;
             qualify_copy_free_scanout_plan(
+                &services,
                 probe_vk,
                 Rc::clone(&scanout_device),
                 output,
@@ -323,6 +325,7 @@ pub(crate) fn qualify_scanout_route_for_worker(
             let destination_route =
                 ScanoutRoute::new(sink.id, route.kms_device_key, RenderKmsRelationship::Same);
             qualify_copied_scanout_plan(
+                &services,
                 probe_render_vk,
                 probe_sink_vk,
                 Rc::clone(&scanout_device),
@@ -344,12 +347,20 @@ fn test_scanout_pool(
     scanout_device: &drm::Device,
     output: &crate::platform::drm::Output,
     pool: &ScanoutBoPool,
+    services: &KmsModesetServices,
 ) -> io::Result<()> {
     for (index, bo) in pool.bos.iter().enumerate() {
         let framebuffer = bo.fb_handle.ok_or_else(|| {
             io::Error::other(format!("scanout pool BO {index} has no framebuffer"))
         })?;
-        crate::drm::modeset::test_modeset(scanout_device, output, framebuffer).map_err(|err| {
+        crate::drm::modeset::test_modeset_with_io(
+            scanout_device,
+            output,
+            framebuffer,
+            services.mode_blobs.as_ref(),
+            services.atomic.as_ref(),
+        )
+        .map_err(|err| {
             io::Error::new(
                 err.kind(),
                 format!("scanout pool BO {index} atomic TEST_ONLY failed: {err}"),
@@ -363,6 +374,7 @@ fn test_disposable_scanout_pool(
     scanout_device: &drm::Device,
     output: &crate::platform::drm::Output,
     pool: &ScanoutBoPool,
+    services: &KmsModesetServices,
 ) -> Result<(), DisposableProbeError> {
     for (index, bo) in pool.bos.iter().enumerate() {
         let framebuffer = bo.fb_handle.ok_or_else(|| {
@@ -370,9 +382,13 @@ fn test_disposable_scanout_pool(
                 "disposable scanout pool BO {index} has no framebuffer"
             )))
         })?;
-        if let Err(error) =
-            crate::drm::modeset::test_modeset_strict(scanout_device, output, framebuffer)
-        {
+        if let Err(error) = crate::drm::modeset::test_modeset_strict_with_io(
+            scanout_device,
+            output,
+            framebuffer,
+            services.mode_blobs.as_ref(),
+            services.atomic.as_ref(),
+        ) {
             let blob_cleanup_failed = error.blob_cleanup_failed();
             let source = error.into_io_error();
             let source = io::Error::new(
@@ -402,6 +418,7 @@ pub(super) fn copy_free_candidate_error(
 /// to a later live replay boundary.
 #[allow(clippy::too_many_arguments)]
 fn qualify_copy_free_scanout_plan(
+    services: &KmsModesetServices,
     probe_vk: Arc<VkContext>,
     scanout_device: Rc<drm::Device>,
     output: &crate::platform::drm::Output,
@@ -435,7 +452,8 @@ fn qualify_copy_free_scanout_plan(
             return Err(CopyFreeScanoutError::Candidates(failure));
         }
     };
-    if let Err(error) = test_disposable_scanout_pool(&scanout_device, output, &probe_pool) {
+    if let Err(error) = test_disposable_scanout_pool(&scanout_device, output, &probe_pool, services)
+    {
         let error = probe_pool
             .finish_disposable_probe(Err(error))
             .expect_err("failed TEST_ONLY cannot become a successful probe");
@@ -466,6 +484,7 @@ fn qualify_copy_free_scanout_plan(
 /// synchronous compatibility wrapper can preserve its established fallback.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn replay_copy_free_scanout_plan(
+    services: &KmsModesetServices,
     live_vk: Arc<VkContext>,
     scanout_device: Rc<drm::Device>,
     output: &crate::platform::drm::Output,
@@ -507,7 +526,7 @@ pub(super) fn replay_copy_free_scanout_plan(
             )));
         }
     };
-    if let Err(error) = test_scanout_pool(&scanout_device, output, &live_pool) {
+    if let Err(error) = test_scanout_pool(&scanout_device, output, &live_pool, services) {
         return Ok(ExactPlanReplay::Rejected(io::Error::new(
             error.kind(),
             copy_free_candidate_error(plan, "live TEST_ONLY", &error),
@@ -527,9 +546,13 @@ pub(super) fn replay_copy_free_scanout_plan(
                     plan.describe(),
                 )))
             })?;
-        if let Err(error) =
-            crate::drm::modeset::commit_modeset(&scanout_device, output, framebuffer)
-        {
+        if let Err(error) = crate::drm::modeset::commit_modeset_with_io(
+            &scanout_device,
+            output,
+            framebuffer,
+            services.mode_blobs.as_ref(),
+            services.atomic.as_ref(),
+        ) {
             return Ok(ExactPlanReplay::Rejected(io::Error::new(
                 error.kind(),
                 copy_free_candidate_error(plan, "live modeset", &error),
@@ -555,6 +578,7 @@ pub(super) fn replay_copy_free_scanout_plan(
 /// Preserve the synchronous candidate order while keeping disposable
 /// qualification and live exact-plan replay as separate operations.
 pub(super) fn allocate_copy_free_scanout_pool(
+    services: &KmsModesetServices,
     live_vk: Arc<VkContext>,
     scanout_device: Rc<drm::Device>,
     output: &crate::platform::drm::Output,
@@ -581,6 +605,7 @@ pub(super) fn allocate_copy_free_scanout_pool(
             }
         };
         let qualified = match qualify_copy_free_scanout_plan(
+            services,
             probe_vk,
             Rc::clone(&scanout_device),
             output,
@@ -614,6 +639,7 @@ pub(super) fn allocate_copy_free_scanout_pool(
         };
 
         match replay_copy_free_scanout_plan(
+            services,
             Arc::clone(&live_vk),
             Rc::clone(&scanout_device),
             output,
@@ -645,6 +671,7 @@ pub(super) fn allocate_copy_free_scanout_pool(
 /// The KMS destination passes TEST_ONLY before any submitted content probe.
 #[allow(clippy::too_many_arguments)]
 fn qualify_copied_scanout_plan(
+    services: &KmsModesetServices,
     probe_render_vk: Arc<VkContext>,
     probe_sink_vk: Arc<VkContext>,
     scanout_device: Rc<drm::Device>,
@@ -693,7 +720,7 @@ fn qualify_copied_scanout_plan(
         }
     };
     if let Err(error) =
-        test_disposable_scanout_pool(&scanout_device, output, &probe_pool.destinations)
+        test_disposable_scanout_pool(&scanout_device, output, &probe_pool.destinations, services)
     {
         let error = probe_pool
             .finish_disposable_probe(Err(error))
@@ -726,6 +753,7 @@ fn qualify_copied_scanout_plan(
 /// contexts, repeating TEST_ONLY before an optional first modeset.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn replay_copied_scanout_plan(
+    services: &KmsModesetServices,
     live_render_vk: Arc<VkContext>,
     live_sink_vk: Arc<VkContext>,
     scanout_device: Rc<drm::Device>,
@@ -780,7 +808,9 @@ pub(super) fn replay_copied_scanout_plan(
             )));
         }
     };
-    if let Err(error) = test_scanout_pool(&scanout_device, output, &live_pool.destinations) {
+    if let Err(error) =
+        test_scanout_pool(&scanout_device, output, &live_pool.destinations, services)
+    {
         return Ok(ExactPlanReplay::Rejected(io::Error::new(
             error.kind(),
             format!("{} live TEST_ONLY: {error}", plan.describe()),
@@ -801,9 +831,13 @@ pub(super) fn replay_copied_scanout_plan(
                     plan.describe()
                 )))
             })?;
-        if let Err(error) =
-            crate::drm::modeset::commit_modeset(&scanout_device, output, framebuffer)
-        {
+        if let Err(error) = crate::drm::modeset::commit_modeset_with_io(
+            &scanout_device,
+            output,
+            framebuffer,
+            services.mode_blobs.as_ref(),
+            services.atomic.as_ref(),
+        ) {
             return Ok(ExactPlanReplay::Rejected(io::Error::new(
                 error.kind(),
                 format!("{} live modeset: {error}", plan.describe()),
@@ -830,6 +864,7 @@ pub(super) fn replay_copied_scanout_plan(
 /// qualification and live exact-plan replay as separate operations.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn allocate_copied_scanout_pool(
+    services: &KmsModesetServices,
     live_render_vk: Arc<VkContext>,
     live_sink_vk: Arc<VkContext>,
     scanout_device: Rc<drm::Device>,
@@ -879,6 +914,7 @@ pub(super) fn allocate_copied_scanout_pool(
                 }
             };
         let qualified = match qualify_copied_scanout_plan(
+            services,
             probe_render_vk,
             probe_sink_vk,
             Rc::clone(&scanout_device),
@@ -912,6 +948,7 @@ pub(super) fn allocate_copied_scanout_pool(
         };
 
         match replay_copied_scanout_plan(
+            services,
             Arc::clone(&live_render_vk),
             Arc::clone(&live_sink_vk),
             Rc::clone(&scanout_device),

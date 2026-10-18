@@ -160,6 +160,24 @@ impl CopiedRenderSource {
         })
     }
 
+    /// Test fixture for exercising the copied OutputSink branch with a
+    /// recording KMS destination. The renderer and sink share lavapipe here;
+    /// this verifies the copy path itself, not cross-device eligibility.
+    #[cfg(test)]
+    pub(crate) fn for_tests_recording_source(
+        vk: Arc<VkContext>,
+        width: u32,
+        height: u32,
+    ) -> io::Result<Self> {
+        Self::allocate_exact(
+            Arc::clone(&vk),
+            vk,
+            width,
+            height,
+            CopiedSourcePlan::DrmModifier(crate::kms::vk::dri3::DRM_FORMAT_MOD_LINEAR),
+        )
+    }
+
     #[must_use]
     pub(crate) fn image(&self) -> vk::Image {
         self.render_target
@@ -639,6 +657,38 @@ impl Drop for CopiedRenderSource {
 }
 
 impl CopiedScanoutPool {
+    /// Pair real Vulkan copy sources with a recording destination pool so
+    /// backend tests can exercise `OutputScanout::Copied` without DRM access.
+    #[cfg(test)]
+    pub(crate) fn for_tests_recording_pool(
+        vk: Arc<VkContext>,
+        destinations: ScanoutBoPool,
+    ) -> io::Result<Self> {
+        let source_plan =
+            CopiedSourcePlan::DrmModifier(crate::kms::vk::dri3::DRM_FORMAT_MOD_LINEAR);
+        let count = destinations.bos.len();
+        let mut sources = Vec::with_capacity(count);
+        for _ in 0..count {
+            sources.push(CopiedRenderSource::for_tests_recording_source(
+                Arc::clone(&vk),
+                destinations.width,
+                destinations.height,
+            )?);
+        }
+        let plan = CopiedScanoutPlan {
+            source: source_plan,
+            destination: destinations.allocation_plan,
+        };
+        Ok(Self {
+            sources,
+            destination_ownership: vec![CopiedDestinationOwnership::LocalFirstUse; count],
+            route: destinations.route,
+            plan,
+            sink_vk: vk,
+            destinations,
+        })
+    }
+
     pub(crate) fn finish_disposable_probe(
         self,
         result: Result<(), DisposableProbeError>,

@@ -9,8 +9,7 @@ use drm::{
     buffer::{DrmFourcc, DrmModifier, Handle as DrmBufferHandle, PlanarBuffer},
     control::{
         AtomicCommitFlags, Device as ControlDevice, FbCmd2Flags, Mode as DrmMode, ModeTypeFlags,
-        PlaneType, ResourceHandles, atomic::AtomicModeReq, connector, crtc, encoder, framebuffer,
-        plane, property,
+        PlaneType, ResourceHandles, connector, crtc, encoder, framebuffer, plane, property,
     },
 };
 use yserver_core::backend::ModeSpec;
@@ -18,9 +17,10 @@ use yserver_core::backend::ModeSpec;
 use crate::drm::{
     Device,
     atomic::{
-        AtomicCommitEvent, AtomicCommitKind, AtomicCommitRequest, AtomicCommitSink,
-        CursorPlanePosition,
+        AtomicCommitEvent, AtomicCommitExecutor, AtomicCommitKind, AtomicCommitRequest,
+        AtomicCommitSink,
     },
+    io::{ModeBlobIo, ModesetObject},
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1135,19 +1135,79 @@ impl PropMap {
     }
 }
 
-pub fn disable_output(device: &Device, output: &Output) -> io::Result<()> {
+pub(crate) fn disable_output_with_executor(
+    device: &Device,
+    output: &Output,
+    executor: &dyn AtomicCommitExecutor,
+) -> io::Result<()> {
+    disable_output_with_cursor_executor(device, output, None, executor)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct DisableOutputPropertyHandles {
+    pub(crate) connector_crtc_id: property::Handle,
+    pub(crate) crtc_active: property::Handle,
+    pub(crate) crtc_mode_id: property::Handle,
+}
+
+#[cfg(test)]
+impl DisableOutputPropertyHandles {
+    pub(crate) fn for_tests() -> Self {
+        Self {
+            connector_crtc_id: ::drm::control::from_u32(0xD001).expect("test property handle"),
+            crtc_active: ::drm::control::from_u32(0xD002).expect("test property handle"),
+            crtc_mode_id: ::drm::control::from_u32(0xD003).expect("test property handle"),
+        }
+    }
+}
+
+pub(crate) fn disable_output_with_cursor_executor(
+    device: &Device,
+    output: &Output,
+    cursor_detach: Option<crate::drm::atomic::AtomicCursorPlaneDetach>,
+    executor: &dyn AtomicCommitExecutor,
+) -> io::Result<()> {
     let connector_props = PropMap::for_object(device, output.connector)?;
     let crtc_props = PropMap::for_object(device, output.crtc)?;
 
-    let mut req = AtomicModeReq::new();
+    disable_output_with_properties(
+        device,
+        output,
+        cursor_detach,
+        DisableOutputPropertyHandles {
+            connector_crtc_id: connector_props.id("CRTC_ID")?,
+            crtc_active: crtc_props.id("ACTIVE")?,
+            crtc_mode_id: crtc_props.id("MODE_ID")?,
+        },
+        executor,
+    )
+}
+
+pub(crate) fn disable_output_with_properties(
+    device: &Device,
+    output: &Output,
+    cursor_detach: Option<crate::drm::atomic::AtomicCursorPlaneDetach>,
+    properties: DisableOutputPropertyHandles,
+    executor: &dyn AtomicCommitExecutor,
+) -> io::Result<()> {
+    let mut req = AtomicCommitRequest::new();
+    if let Some(cursor_detach) = cursor_detach {
+        cursor_detach.add_to(&mut req);
+    }
     req.add_raw_property(output.plane.into(), output.plane_fb_id_prop, 0);
     req.add_raw_property(output.plane.into(), output.plane_crtc_id_prop, 0);
-    req.add_raw_property(output.crtc.into(), crtc_props.id("ACTIVE")?, 0);
-    req.add_raw_property(output.crtc.into(), crtc_props.id("MODE_ID")?, 0);
-    req.add_raw_property(output.connector.into(), connector_props.id("CRTC_ID")?, 0);
+    req.add_raw_property(output.crtc.into(), properties.crtc_active, 0);
+    req.add_raw_property(output.crtc.into(), properties.crtc_mode_id, 0);
+    req.add_raw_property(output.connector.into(), properties.connector_crtc_id, 0);
 
-    device
-        .atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req)
+    executor
+        .atomic_commit(
+            device,
+            AtomicCommitFlags::ALLOW_MODESET,
+            AtomicCommitKind::Scene,
+            req,
+            &[],
+        )
         .map_err(|err| {
             io::Error::new(
                 err.kind(),
@@ -1156,10 +1216,12 @@ pub fn disable_output(device: &Device, output: &Output) -> io::Result<()> {
         })
 }
 
-pub fn commit_modeset(
+pub(crate) fn commit_modeset_with_io(
     device: &Device,
     output: &Output,
     fb_id: framebuffer::Handle,
+    mode_blobs: &dyn ModeBlobIo,
+    executor: &dyn AtomicCommitExecutor,
 ) -> io::Result<()> {
     finish_best_effort_modeset(modeset_with_flags(
         device,
@@ -1167,15 +1229,19 @@ pub fn commit_modeset(
         fb_id,
         AtomicCommitFlags::ALLOW_MODESET,
         "atomic modeset commit",
+        mode_blobs,
+        executor,
     )?)
 }
 
 /// Validate a complete connector/CRTC/primary-plane modeset without changing
 /// the hardware state.
-pub(crate) fn test_modeset(
+pub(crate) fn test_modeset_with_io(
     device: &Device,
     output: &Output,
     fb_id: framebuffer::Handle,
+    mode_blobs: &dyn ModeBlobIo,
+    executor: &dyn AtomicCommitExecutor,
 ) -> io::Result<()> {
     finish_best_effort_modeset(modeset_with_flags(
         device,
@@ -1183,6 +1249,8 @@ pub(crate) fn test_modeset(
         fb_id,
         AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::TEST_ONLY,
         "atomic modeset TEST_ONLY",
+        mode_blobs,
+        executor,
     )?)
 }
 
@@ -1222,10 +1290,12 @@ impl std::error::Error for StrictTestModesetError {
 /// TEST_ONLY variant for disposable helpers. Unlike the live path, mode-blob
 /// cleanup is part of the authoritative result and overrides atomic success or
 /// rejection when it fails.
-pub(crate) fn test_modeset_strict(
+pub(crate) fn test_modeset_strict_with_io(
     device: &Device,
     output: &Output,
     fb_id: framebuffer::Handle,
+    mode_blobs: &dyn ModeBlobIo,
+    executor: &dyn AtomicCommitExecutor,
 ) -> Result<(), StrictTestModesetError> {
     let attempt = modeset_with_flags(
         device,
@@ -1233,6 +1303,8 @@ pub(crate) fn test_modeset_strict(
         fb_id,
         AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::TEST_ONLY,
         "atomic modeset TEST_ONLY",
+        mode_blobs,
+        executor,
     )
     .map_err(|source| StrictTestModesetError {
         source,
@@ -1252,31 +1324,33 @@ fn modeset_with_flags(
     fb_id: framebuffer::Handle,
     flags: AtomicCommitFlags,
     operation: &str,
+    mode_blobs: &dyn ModeBlobIo,
+    executor: &dyn AtomicCommitExecutor,
 ) -> io::Result<ModesetWithBlobResult> {
-    let connector_props = PropMap::for_object(device, output.connector)?;
-    let crtc_props = PropMap::for_object(device, output.crtc)?;
-    let plane_props = PropMap::for_object(device, output.plane)?;
-
     // Resolve every fallible property lookup before creating the mode blob.
     // Probe helpers share the parent's DRM file description, so an early `?`
     // after blob creation would otherwise leave that object attached to the
     // still-live parent fd even after the child exits.
-    let connector_crtc_id_prop = connector_props.id("CRTC_ID")?;
-    let crtc_mode_id_prop = crtc_props.id("MODE_ID")?;
-    let crtc_active_prop = crtc_props.id("ACTIVE")?;
-    let plane_fb_id_prop = plane_props.id("FB_ID")?;
-    let plane_crtc_id_prop = plane_props.id("CRTC_ID")?;
-    let plane_src_x_prop = plane_props.id("SRC_X")?;
-    let plane_src_y_prop = plane_props.id("SRC_Y")?;
-    let plane_src_w_prop = plane_props.id("SRC_W")?;
-    let plane_src_h_prop = plane_props.id("SRC_H")?;
-    let plane_crtc_x_prop = plane_props.id("CRTC_X")?;
-    let plane_crtc_y_prop = plane_props.id("CRTC_Y")?;
-    let plane_crtc_w_prop = plane_props.id("CRTC_W")?;
-    let plane_crtc_h_prop = plane_props.id("CRTC_H")?;
+    let connector_props =
+        mode_blobs.properties_for_object(device, ModesetObject::Connector(output.connector))?;
+    let crtc_props = mode_blobs.properties_for_object(device, ModesetObject::Crtc(output.crtc))?;
+    let plane_props =
+        mode_blobs.properties_for_object(device, ModesetObject::Plane(output.plane))?;
+    let connector_crtc_id_prop = modeset_property_id(&connector_props, "CRTC_ID")?;
+    let crtc_mode_id_prop = modeset_property_id(&crtc_props, "MODE_ID")?;
+    let crtc_active_prop = modeset_property_id(&crtc_props, "ACTIVE")?;
+    let plane_fb_id_prop = modeset_property_id(&plane_props, "FB_ID")?;
+    let plane_crtc_id_prop = modeset_property_id(&plane_props, "CRTC_ID")?;
+    let plane_src_x_prop = modeset_property_id(&plane_props, "SRC_X")?;
+    let plane_src_y_prop = modeset_property_id(&plane_props, "SRC_Y")?;
+    let plane_src_w_prop = modeset_property_id(&plane_props, "SRC_W")?;
+    let plane_src_h_prop = modeset_property_id(&plane_props, "SRC_H")?;
+    let plane_crtc_x_prop = modeset_property_id(&plane_props, "CRTC_X")?;
+    let plane_crtc_y_prop = modeset_property_id(&plane_props, "CRTC_Y")?;
+    let plane_crtc_w_prop = modeset_property_id(&plane_props, "CRTC_W")?;
+    let plane_crtc_h_prop = modeset_property_id(&plane_props, "CRTC_H")?;
 
-    let mode_blob = device.create_property_blob(&output.mode)?;
-    let mode_blob_raw: u64 = mode_blob.into();
+    let mode_blob_raw = mode_blobs.create_property_blob(device, &output.mode)?;
 
     let crtc_id_raw: u32 = output.crtc.into();
     let plane_crtc_raw: u32 = output.crtc.into();
@@ -1285,7 +1359,7 @@ fn modeset_with_flags(
     let src_w = u64::from(mode_w) << 16;
     let src_h = u64::from(mode_h) << 16;
 
-    let mut req = AtomicModeReq::new();
+    let mut req = AtomicCommitRequest::new();
     req.add_raw_property(
         output.connector.into(),
         connector_crtc_id_prop,
@@ -1308,25 +1382,39 @@ fn modeset_with_flags(
     req.add_raw_property(output.plane.into(), plane_crtc_w_prop, u64::from(mode_w));
     req.add_raw_property(output.plane.into(), plane_crtc_h_prop, u64::from(mode_h));
 
-    let atomic = device.atomic_commit(flags, req).map_err(|err| {
-        io::Error::new(
-            err.kind(),
-            format!(
-                "{operation} rejected (mode {}, {}x{}): {err}",
-                output.picked.name, output.picked.width, output.picked.height
-            ),
-        )
-    });
-    let blob_cleanup = device.destroy_property_blob(mode_blob_raw).map_err(|err| {
-        io::Error::new(
-            err.kind(),
-            format!("{operation} could not destroy mode blob {mode_blob_raw}: {err}"),
-        )
-    });
+    let atomic = executor
+        .atomic_commit(device, flags, AtomicCommitKind::Scene, req, &[])
+        .map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!(
+                    "{operation} rejected (mode {}, {}x{}): {err}",
+                    output.picked.name, output.picked.width, output.picked.height
+                ),
+            )
+        });
+    let blob_cleanup = mode_blobs
+        .destroy_property_blob(device, mode_blob_raw)
+        .map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!("{operation} could not destroy mode blob {mode_blob_raw}: {err}"),
+            )
+        });
     Ok(ModesetWithBlobResult {
         atomic,
         blob_cleanup,
     })
+}
+
+fn modeset_property_id(
+    properties: &HashMap<String, property::Handle>,
+    name: &str,
+) -> io::Result<property::Handle> {
+    properties
+        .get(name)
+        .copied()
+        .ok_or_else(|| io::Error::other(format!("property {name:?} not exposed")))
 }
 
 fn finish_best_effort_modeset(result: ModesetWithBlobResult) -> io::Result<()> {
@@ -1482,7 +1570,7 @@ pub(crate) fn probe_direct_scanout_test_only(
     pitch: u32,
     atomic_commit_sink: &AtomicCommitSink,
     planes: &[DirectScanoutPlaneState<'_>],
-    cursor_positions: &[CursorPlanePosition],
+    cursor_updates: &[crate::kms::render::platform::cursor_state::CursorPlaneUpdate],
 ) -> io::Result<DirectScanoutTestResult> {
     if planes.is_empty() {
         return Err(io::Error::other("scanout M1: empty plane transaction"));
@@ -1545,7 +1633,7 @@ pub(crate) fn probe_direct_scanout_test_only(
         }
     };
 
-    match test_direct_scanout(&device, atomic_commit_sink, fb, planes, cursor_positions) {
+    match test_direct_scanout(&device, atomic_commit_sink, fb, planes, cursor_updates) {
         Ok(()) => Ok(DirectScanoutTestResult::Accepted(
             DirectScanoutProbeFramebuffer {
                 fb,
@@ -1572,30 +1660,30 @@ pub(crate) fn submit_direct_scanout(
     atomic_commit_sink: &AtomicCommitSink,
     fb: framebuffer::Handle,
     planes: &[DirectScanoutPlaneState<'_>],
-    cursor_positions: &[CursorPlanePosition],
+    cursor_updates: &[crate::kms::render::platform::cursor_state::CursorPlaneUpdate],
     timing: crate::drm::async_flip::FlipTiming,
     tearing_context: crate::drm::atomic::TearingCommitContext,
 ) -> io::Result<()> {
     if planes.is_empty() {
         return Err(io::Error::other("scanout M2: empty plane transaction"));
     }
-    let cursor_positions = match timing {
-        crate::drm::async_flip::FlipTiming::Vsync => cursor_positions,
+    let cursor_updates = match timing {
+        crate::drm::async_flip::FlipTiming::Vsync => cursor_updates,
         crate::drm::async_flip::FlipTiming::Async => &[],
     };
-    let request = direct_scanout_request(fb, planes, cursor_positions);
+    let request = direct_scanout_request(fb, planes, cursor_updates);
     let events: Vec<_> = planes
         .iter()
         .map(|state| AtomicCommitEvent {
             crtc: state.output.crtc,
-            motion_timestamp: cursor_positions
+            motion_timestamp: cursor_updates
                 .iter()
-                .find(|position| position.crtc == state.output.crtc)
-                .and_then(|position| position.motion_timestamp),
+                .find(|update| update.crtc == state.output.crtc)
+                .and_then(|update| update.motion_timestamp),
         })
         .collect();
     let kind = match timing {
-        crate::drm::async_flip::FlipTiming::Vsync => cursor_commit_kind(cursor_positions),
+        crate::drm::async_flip::FlipTiming::Vsync => cursor_commit_kind(cursor_updates),
         crate::drm::async_flip::FlipTiming::Async => AtomicCommitKind::Async,
     };
     let flags = AtomicCommitFlags::PAGE_FLIP_EVENT
@@ -1614,17 +1702,19 @@ pub(crate) fn test_direct_scanout(
     atomic_commit_sink: &AtomicCommitSink,
     fb: framebuffer::Handle,
     planes: &[DirectScanoutPlaneState<'_>],
-    cursor_positions: &[CursorPlanePosition],
+    cursor_updates: &[crate::kms::render::platform::cursor_state::CursorPlaneUpdate],
 ) -> io::Result<()> {
     atomic_commit_sink.test_only(
         device,
-        cursor_commit_kind(cursor_positions),
-        direct_scanout_request(fb, planes, cursor_positions),
+        cursor_commit_kind(cursor_updates),
+        direct_scanout_request(fb, planes, cursor_updates),
     )
 }
 
-fn cursor_commit_kind(cursor_positions: &[CursorPlanePosition]) -> AtomicCommitKind {
-    if cursor_positions.is_empty() {
+fn cursor_commit_kind(
+    cursor_updates: &[crate::kms::render::platform::cursor_state::CursorPlaneUpdate],
+) -> AtomicCommitKind {
+    if cursor_updates.is_empty() {
         AtomicCommitKind::Scene
     } else {
         AtomicCommitKind::SceneWithCursor
@@ -1634,7 +1724,7 @@ fn cursor_commit_kind(cursor_positions: &[CursorPlanePosition]) -> AtomicCommitK
 fn direct_scanout_request(
     fb: framebuffer::Handle,
     planes: &[DirectScanoutPlaneState<'_>],
-    cursor_positions: &[CursorPlanePosition],
+    cursor_updates: &[crate::kms::render::platform::cursor_state::CursorPlaneUpdate],
 ) -> AtomicCommitRequest {
     let mut request = AtomicCommitRequest::new();
     for state in planes {
@@ -1682,9 +1772,10 @@ fn direct_scanout_request(
             u64::from(state.src_h),
         );
     }
-    for position in cursor_positions {
-        request.add_cursor_position(*position);
-    }
+    crate::kms::render::platform::cursor_commit::add_cursor_plane_updates(
+        &mut request,
+        cursor_updates,
+    );
     request
 }
 
@@ -1696,7 +1787,7 @@ pub(crate) fn submit_composed_scanout(
     device: &Device,
     atomic_commit_sink: &AtomicCommitSink,
     planes: &[ComposedScanoutPlaneState<'_>],
-    cursor_positions: &[CursorPlanePosition],
+    cursor_updates: &[crate::kms::render::platform::cursor_state::CursorPlaneUpdate],
 ) -> io::Result<()> {
     if planes.is_empty() {
         return Err(io::Error::other("scanout M2: empty composed transaction"));
@@ -1739,20 +1830,21 @@ pub(crate) fn submit_composed_scanout(
             u64::from(output.mode.size().1),
         );
     }
-    for position in cursor_positions {
-        request.add_cursor_position(*position);
-    }
+    crate::kms::render::platform::cursor_commit::add_cursor_plane_updates(
+        &mut request,
+        cursor_updates,
+    );
     let events: Vec<_> = planes
         .iter()
         .map(|state| AtomicCommitEvent {
             crtc: state.output.crtc,
-            motion_timestamp: cursor_positions
+            motion_timestamp: cursor_updates
                 .iter()
-                .find(|position| position.crtc == state.output.crtc)
-                .and_then(|position| position.motion_timestamp),
+                .find(|update| update.crtc == state.output.crtc)
+                .and_then(|update| update.motion_timestamp),
         })
         .collect();
-    let kind = if cursor_positions.is_empty() {
+    let kind = if cursor_updates.is_empty() {
         AtomicCommitKind::Scene
     } else {
         AtomicCommitKind::SceneWithCursor

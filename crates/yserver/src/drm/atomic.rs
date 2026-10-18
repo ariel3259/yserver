@@ -110,6 +110,20 @@ pub(crate) struct CursorPlanePosition {
     pub(crate) motion_timestamp: Option<Instant>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AtomicCursorPlaneDetach {
+    pub(crate) plane: plane::Handle,
+    pub(crate) fb_id: property::Handle,
+    pub(crate) crtc_id: property::Handle,
+}
+
+impl AtomicCursorPlaneDetach {
+    pub(crate) fn add_to(self, request: &mut AtomicCommitRequest) {
+        request.add_cursor_property(self.plane.into(), self.fb_id, 0);
+        request.add_cursor_property(self.plane.into(), self.crtc_id, 0);
+    }
+}
+
 impl CursorPlanePosition {
     /// Append this cursor's `CRTC_X` and `CRTC_Y` values to an atomic request.
     #[allow(dead_code)] // consumed by the scene commit path in Task 2
@@ -190,6 +204,21 @@ impl AtomicCommitRequest {
             position.crtc_y,
             i64::from(position.y) as u64,
         ));
+    }
+
+    pub(crate) fn add_cursor_property(
+        &mut self,
+        object: RawResourceHandle,
+        property: property::Handle,
+        value: u64,
+    ) {
+        self.request.add_raw_property(object, property, value);
+        self.cursor_properties.push((object, property));
+        self.record_property(AtomicPropertyUpdate {
+            object,
+            property,
+            value,
+        });
     }
 
     fn record_property(&mut self, update: AtomicPropertyUpdate) {
@@ -607,6 +636,7 @@ impl AtomicCommitSink {
 
     /// Record the legacy path's motion-to-return latency. Both telemetry
     /// latency measures intentionally use this same return time.
+    #[allow(dead_code)] // retained until Task B removes the legacy motion route
     pub(crate) fn record_legacy_move(&self, motion_timestamp: Instant, returned_at: Instant) {
         self.metrics
             .borrow_mut()
@@ -666,11 +696,6 @@ impl AtomicCommitSink {
     /// pins on the cursor. Other failures leave the cursor state untouched.
     pub(crate) fn take_last_cursor_rejection(&self) -> bool {
         self.last_rejection_was_cursor.replace(false)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_tests_motion_to_accept_sample_count(&self) -> usize {
-        self.metrics.borrow().motion_to_accept_us.len()
     }
 
     #[cfg(test)]
@@ -1104,6 +1129,7 @@ impl CommitWindow {
         self.reset_tearing_counters();
     }
 
+    #[allow(dead_code)] // retained until Task B removes the legacy motion route
     fn record_legacy_move(&mut self, motion_timestamp: Instant, returned_at: Instant) {
         let latency = elapsed_us(motion_timestamp, returned_at);
         self.motion_to_accept_us.push(latency);
@@ -1239,10 +1265,12 @@ fn flip_latency_percentiles(values: &[u64]) -> (String, String, String) {
     (p50.to_string(), p99.to_string(), max.to_string())
 }
 
-#[cfg(test)]
 #[allow(dead_code)]
 pub(crate) mod tests_support {
-    use super::*;
+    use super::{
+        AtomicCommitEvent, AtomicCommitExecutor, AtomicCommitFlags, AtomicCommitKind,
+        AtomicCommitRequest, AtomicPropertyUpdate, Device, RefCell, io,
+    };
     use std::collections::VecDeque;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1282,6 +1310,7 @@ pub(crate) mod tests_support {
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub(crate) struct AtomicCommitRecord {
+        pub(crate) device_fd: i32,
         pub(crate) flags: AtomicCommitFlags,
         pub(crate) kind: AtomicCommitKind,
         pub(crate) properties: Vec<AtomicPropertyUpdate>,
@@ -1319,18 +1348,21 @@ pub(crate) mod tests_support {
 
         fn atomic_commit(
             &self,
-            _device: &Device,
+            device: &Device,
             flags: AtomicCommitFlags,
             kind: AtomicCommitKind,
             request: AtomicCommitRequest,
             events: &[AtomicCommitEvent],
         ) -> io::Result<()> {
+            use std::os::fd::{AsFd as _, AsRawFd as _};
+
             let result = self
                 .scripted_results
                 .borrow_mut()
                 .pop_front()
                 .unwrap_or(ScriptedResult::Ok);
             self.records.borrow_mut().push(AtomicCommitRecord {
+                device_fd: device.as_fd().as_raw_fd(),
                 flags,
                 kind,
                 properties: request.properties,

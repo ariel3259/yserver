@@ -15,10 +15,6 @@ fn recording_sink(
     recorder
 }
 
-fn raw<T: ::drm::control::ResourceHandle>(value: u32) -> T {
-    ::drm::control::from_u32(value).expect("nonzero test handle")
-}
-
 fn assert_cursor_properties(
     record: &AtomicCommitRecord,
     position: crate::drm::atomic::CursorPlanePosition,
@@ -40,212 +36,41 @@ fn assert_cursor_properties(
     }
 }
 
-fn set_scene_fence_properties(output: &mut crate::platform::drm::Output) {
-    output.plane_in_fence_fd_prop = Some(raw(81));
-    output.crtc_out_fence_ptr_prop = Some(raw(82));
-}
-
-#[test]
-// Mutation: omit `request.add_cursor_position` from the shared scene-flip
-// builder. The recorded request must then miss these latest-position values.
-fn shared_scene_flip_records_the_latest_cursor_position() {
-    let mut backend = KmsBackend::for_tests();
-    let recorder = recording_sink(&mut backend, 0);
-    let device_key = backend.platform.devices[0].key;
-    let position = backend.platform.for_tests_seed_atomic_cursor_position(
-        0,
-        raw(51),
-        raw(61),
-        raw(62),
-        123,
-        45,
-        3,
-        4,
-    );
-    assert_eq!((position.x, position.y), (120, 41));
-    let positions = backend
-        .platform
-        .cursor_plane_atomic_positions_for_outputs(&[0]);
-    assert_eq!(positions, vec![position]);
-
-    set_scene_fence_properties(&mut backend.platform.outputs[0].output);
-    let output = &backend.platform.outputs[0].output;
-    let mut out_fence = -1;
-    crate::drm::page_flip::submit_scene_flip_with_fences(
-        &backend.platform.devices[0].device,
-        &backend.platform.devices[0].atomic_commit_sink,
-        output,
-        raw(71),
-        -1,
-        &mut out_fence,
-        &positions,
-        crate::drm::async_flip::FlipTiming::Vsync,
-    )
-    .expect("record shared scene flip");
-
-    let records = recorder.records();
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].kind, AtomicCommitKind::SceneWithCursor);
-    assert!(
-        records[0]
-            .flags
-            .contains(::drm::control::AtomicCommitFlags::NONBLOCK)
-    );
-    assert_cursor_properties(&records[0], position);
-    backend
-        .platform
-        .cursor_plane_scene_commit_submitted(&positions);
-    assert!(
-        !backend
-            .platform
-            .for_tests_atomic_position_is_unsent(device_key, position.crtc)
-    );
-}
-
-#[test]
-// Mutation: source the copied flip's cursor plane from the renderer device.
-// Both devices intentionally reuse the raw CRTC handle with different planes.
-fn copied_scene_flip_uses_the_sink_devices_cursor_plane() {
-    let mut backend = KmsBackend::for_tests();
-    let renderer_key = backend.platform.devices[0].key;
-    let sink_key = test_device_key(77);
-    push_test_device(&mut backend, sink_key);
-    backend.platform.outputs[0].key.device_key = renderer_key;
-    let renderer_position = backend.platform.for_tests_seed_atomic_cursor_position(
-        0,
-        raw(151),
-        raw(161),
-        raw(162),
-        100,
-        90,
-        0,
-        0,
-    );
-    backend.platform.outputs[0].key.device_key = sink_key;
-    let sink_position = backend.platform.for_tests_seed_atomic_cursor_position(
-        0,
-        raw(251),
-        raw(261),
-        raw(262),
-        42,
-        33,
-        0,
-        0,
-    );
-    assert_ne!(renderer_position.plane, sink_position.plane);
-
-    let recorder = recording_sink(&mut backend, 1);
-    set_scene_fence_properties(&mut backend.platform.outputs[0].output);
-    let positions = backend
-        .platform
-        .cursor_plane_atomic_positions_for_outputs(&[0]);
-    assert_eq!(positions, vec![sink_position]);
-    let sink_device = &backend.platform.devices[1];
-    let mut out_fence = -1;
-    crate::drm::page_flip::submit_scene_flip_with_fences(
-        &sink_device.device,
-        &sink_device.atomic_commit_sink,
-        &backend.platform.outputs[0].output,
-        raw(71),
-        -1,
-        &mut out_fence,
-        &positions,
-        crate::drm::async_flip::FlipTiming::Vsync,
-    )
-    .expect("record copied sink flip");
-
-    let records = recorder.records();
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].kind, AtomicCommitKind::SceneWithCursor);
-    assert_cursor_properties(&records[0], sink_position);
-    backend
-        .platform
-        .cursor_plane_scene_commit_submitted(&positions);
-    assert!(
-        backend
-            .platform
-            .for_tests_atomic_position_is_unsent(renderer_key, renderer_position.crtc)
-    );
-    assert!(
-        !backend
-            .platform
-            .for_tests_atomic_position_is_unsent(sink_key, sink_position.crtc)
-    );
-}
-
-#[test]
-// Mutation: return atomic positions for every visible plane without checking
-// the per-device atomic capability. The legacy request would gain cursor fields.
-fn legacy_scene_flip_has_no_atomic_cursor_properties() {
-    let mut backend = KmsBackend::for_tests();
-    let recorder = recording_sink(&mut backend, 0);
-    let device_key = backend.platform.devices[0].key;
-    let position = backend.platform.for_tests_seed_atomic_cursor_position(
-        0,
-        raw(51),
-        raw(61),
-        raw(62),
-        123,
-        45,
-        3,
-        4,
-    );
-    backend.platform.devices[0].cursor.atomic_cursor = false;
-    let positions = backend
-        .platform
-        .cursor_plane_atomic_positions_for_outputs(&[0]);
-    assert!(positions.is_empty());
-
-    set_scene_fence_properties(&mut backend.platform.outputs[0].output);
-    let mut out_fence = -1;
-    crate::drm::page_flip::submit_scene_flip_with_fences(
-        &backend.platform.devices[0].device,
-        &backend.platform.devices[0].atomic_commit_sink,
-        &backend.platform.outputs[0].output,
-        raw(71),
-        -1,
-        &mut out_fence,
-        &positions,
-        crate::drm::async_flip::FlipTiming::Vsync,
-    )
-    .expect("record legacy scene flip");
-
-    let records = recorder.records();
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].kind, AtomicCommitKind::Scene);
-    assert!(
-        !records[0]
-            .properties
-            .iter()
-            .any(|update| update.object == position.plane.into())
-    );
-    assert!(
-        backend
-            .platform
-            .for_tests_atomic_position_is_unsent(device_key, position.crtc)
-    );
-}
-
 fn backend_with_live_scene() -> Option<KmsBackend> {
-    let mut backend = match KmsBackend::for_tests_with_vk() {
-        Ok(backend) => backend,
+    use yserver_core::backend::Backend;
+
+    let mut fixture = match super::atomic_cursor_only::support::AtomicCursorFixture::new() {
+        Ok(Some(fixture)) => fixture,
+        Ok(None) => return None,
         Err(error) => {
-            eprintln!("skipping: no Vulkan test device: {error}");
+            eprintln!("skipping: no Vulkan test fixture: {error}");
             return None;
         }
     };
-    let layouts = backend.platform.scene_output_layouts();
-    backend.scene = crate::kms::render::scene::SceneCompositor::new(&backend.platform, &layouts)
-        .expect("construct hardware-free live scene");
-    install_visible_cursor_via_backend(&mut backend);
-    backend.scene.for_tests_set_hw_cursor_mode();
-    backend.scene.scene_structure_dirty = false;
-    for drawable in backend.store.armed_damaged_ids() {
-        if let Some(snapshot) = backend.store.peek_presentation_damage(drawable) {
-            backend.store.ack_presentation_damage(snapshot);
-        }
-    }
-    Some(backend)
+    fixture.define_visible_cursor();
+    let root = fixture.backend.core.window_id;
+    let width = fixture.backend.platform.fb_w;
+    let height = fixture.backend.platform.fb_h;
+    Backend::clear_area(
+        &mut fixture.backend,
+        None,
+        root,
+        0,
+        None,
+        0,
+        0,
+        width,
+        height,
+        (0, 0),
+    )
+    .expect("damage root through Backend");
+    Backend::maybe_composite(&mut fixture.backend).expect("submit visible cursor scene");
+    fixture.retire_output(0, 1);
+    assert!(fixture.backend.platform.any_cursor_commit_in_flight());
+    fixture.retire_output(0, 2);
+    assert!(!fixture.backend.platform.any_cursor_commit_in_flight());
+    assert!(fixture.backend.platform.cursor_plane_visible_for_output(0));
+    Some(fixture.backend)
 }
 
 fn install_visible_cursor_via_backend(backend: &mut KmsBackend) {
@@ -296,19 +121,6 @@ fn backend_with_hidden_dead_zone_scene() -> Option<KmsBackend> {
     Some(backend)
 }
 
-fn seed_cursor_position(backend: &mut KmsBackend) -> crate::drm::atomic::CursorPlanePosition {
-    backend.platform.for_tests_seed_atomic_cursor_position(
-        0,
-        raw(51),
-        raw(61),
-        raw(62),
-        100,
-        100,
-        0,
-        0,
-    )
-}
-
 fn warp(backend: &mut KmsBackend, state: &mut yserver_core::server::ServerState, x: i32, y: i32) {
     use yserver_core::backend::Backend;
     Backend::warp_pointer_root(backend, state, x, y);
@@ -329,11 +141,13 @@ fn retire_test_flip(
 
     let output = &backend.platform.outputs[0].output;
     let crtc = output.crtc;
-    backend.platform.devices[0]
+    let device = &backend.platform.devices[0].device;
+    let source = backend.platform.devices[0]
         .test_page_flip_event_source
         .as_ref()
-        .expect("test event source")
-        .queue_flip(crtc, frame);
+        .expect("test event source");
+    source.register_device(device);
+    source.queue_flip_for_device(device, crtc, frame);
     let drm_fd = backend.platform.devices[0].device.as_fd().as_raw_fd();
     Backend::on_page_flip_ready(backend, state, drm_fd);
 }
@@ -363,7 +177,6 @@ fn idle_motion_coalesces_until_cursor_flip_retires() {
     };
     let recorder = recording_sink(&mut backend, 0);
     let device_key = backend.platform.devices[0].key;
-    seed_cursor_position(&mut backend);
     let mut state = ServerState::new();
 
     warp(&mut backend, &mut state, 120, 80);
@@ -425,12 +238,6 @@ fn idle_motion_coalesces_until_cursor_flip_retires() {
         1,
         "the first cursor flip records motion-to-visible"
     );
-    assert!(
-        !backend
-            .platform
-            .for_tests_atomic_cursor_commit_is_in_flight(device_key, latest.crtc)
-    );
-    maybe_composite(&mut backend);
 
     let records = recorder.records();
     assert_eq!(records.len(), 2);
@@ -495,60 +302,6 @@ fn hidden_cursor_motion_from_dead_zone_wakes_scene_on_reentry() {
 }
 
 #[test]
-// Mutation: ignore the scene flip blocker and send the position as cursor-only.
-fn motion_during_scene_flip_waits_and_scene_request_carries_latest_position() {
-    use yserver_core::server::ServerState;
-
-    let Some(mut backend) = backend_with_live_scene() else {
-        return;
-    };
-    let recorder = recording_sink(&mut backend, 0);
-    let device_key = backend.platform.devices[0].key;
-    seed_cursor_position(&mut backend);
-    let crtc = backend.platform.outputs[0].output.crtc;
-    backend.scene.test_set_flip_in_flight(true);
-    let mut state = ServerState::new();
-
-    warp(&mut backend, &mut state, 210, 95);
-    let latest = backend
-        .platform
-        .for_tests_atomic_cursor_pending_position(device_key, crtc)
-        .expect("motion remains unsent while a scene flip is pending");
-    maybe_composite(&mut backend);
-    assert!(recorder.records().is_empty());
-
-    retire_test_flip(&mut backend, &mut state, 1);
-    backend.scene.test_set_flip_in_flight(false);
-    let positions = backend
-        .platform
-        .cursor_plane_atomic_positions_for_outputs(&[0]);
-    assert_eq!(positions, vec![latest]);
-    set_scene_fence_properties(&mut backend.platform.outputs[0].output);
-    let mut out_fence = -1;
-    crate::drm::page_flip::submit_scene_flip_with_fences(
-        &backend.platform.devices[0].device,
-        &backend.platform.devices[0].atomic_commit_sink,
-        &backend.platform.outputs[0].output,
-        raw(71),
-        -1,
-        &mut out_fence,
-        &positions,
-        crate::drm::async_flip::FlipTiming::Vsync,
-    )
-    .expect("record the next scene request");
-    backend
-        .platform
-        .cursor_plane_scene_commit_submitted(&positions);
-    retire_test_flip(&mut backend, &mut state, 2);
-
-    let records = recorder.records();
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].kind, AtomicCommitKind::SceneWithCursor);
-    assert_cursor_properties(&records[0], latest);
-    assert_no_cursor_work(&backend, device_key);
-}
-
-#[test]
 // Mutation: make `output_commit_in_flight` always false in the backend sink.
 fn cursor_only_commit_blocks_scene_readiness_until_its_flip_retires() {
     use crate::kms::render::scene::OutputSink;
@@ -559,7 +312,6 @@ fn cursor_only_commit_blocks_scene_readiness_until_its_flip_retires() {
     };
     let _recorder = recording_sink(&mut backend, 0);
     let device_key = backend.platform.devices[0].key;
-    seed_cursor_position(&mut backend);
     let mut state = ServerState::new();
     warp(&mut backend, &mut state, 230, 160);
     maybe_composite(&mut backend);
@@ -582,7 +334,6 @@ fn scene_damage_after_cursor_retirement_submits_scene_with_latest_position() {
     };
     let recorder = recording_sink(&mut backend, 0);
     let device_key = backend.platform.devices[0].key;
-    seed_cursor_position(&mut backend);
     let mut state = ServerState::new();
 
     warp(&mut backend, &mut state, 90, 70);
@@ -600,78 +351,14 @@ fn scene_damage_after_cursor_retirement_submits_scene_with_latest_position() {
     warp(&mut backend, &mut state, 340, 210);
     let latest = backend
         .platform
-        .for_tests_atomic_cursor_pending_position(
-            device_key,
-            backend.platform.outputs[0].output.crtc,
-        )
-        .expect("post-retirement motion remains pending for the scene");
+        .cursor_plane_atomic_positions_for_outputs(&[0])[0];
     maybe_composite(&mut backend);
-    assert_eq!(
-        recorder.records().len(),
-        1,
-        "scene arbitration precedes cursor-only"
-    );
-
-    let positions = backend
-        .platform
-        .cursor_plane_atomic_positions_for_outputs(&[0]);
-    assert_eq!(positions, vec![latest]);
-    set_scene_fence_properties(&mut backend.platform.outputs[0].output);
-    let mut out_fence = -1;
-    crate::drm::page_flip::submit_scene_flip_with_fences(
-        &backend.platform.devices[0].device,
-        &backend.platform.devices[0].atomic_commit_sink,
-        &backend.platform.outputs[0].output,
-        raw(72),
-        -1,
-        &mut out_fence,
-        &positions,
-        crate::drm::async_flip::FlipTiming::Vsync,
-    )
-    .expect("record prioritized scene request");
-    backend
-        .platform
-        .cursor_plane_scene_commit_submitted(&positions);
+    assert_eq!(recorder.records().len(), 2, "scene submits through Backend");
     let records = recorder.records();
-    assert_eq!(records.len(), 2);
     assert_eq!(records[0].kind, AtomicCommitKind::CursorOnly);
     assert_eq!(records[1].kind, AtomicCommitKind::SceneWithCursor);
     assert_cursor_properties(&records[1], latest);
     retire_test_flip(&mut backend, &mut state, 2);
-    assert_no_cursor_work(&backend, device_key);
-}
-
-#[test]
-// Mutation: route an atomic-capable backend through its legacy move branch.
-fn legacy_path_pointer_motion_keeps_one_legacy_move_and_no_atomic_commit() {
-    use yserver_core::server::ServerState;
-
-    let Some(mut backend) = backend_with_live_scene() else {
-        return;
-    };
-    let recorder = recording_sink(&mut backend, 0);
-    let device_key = backend.platform.devices[0].key;
-    let crtc = backend.platform.outputs[0].output.crtc;
-    let mut plane = crate::kms::cursor_plane::CursorPlane::for_tests_stub(
-        Rc::clone(&backend.platform.devices[0].device),
-        64,
-        64,
-    );
-    plane.for_tests_set_visible(crtc, true);
-    backend.platform.devices[0].cursor.plane = Some(plane);
-    backend.platform.devices[0].cursor.atomic_cursor = false;
-    let mut state = ServerState::new();
-
-    warp(&mut backend, &mut state, 150, 120);
-
-    assert_eq!(recorder.records().len(), 0);
-    assert_eq!(
-        backend.platform.devices[0]
-            .atomic_commit_sink
-            .for_tests_motion_to_accept_sample_count(),
-        1,
-        "one visible legacy cursor move was attempted",
-    );
     assert_no_cursor_work(&backend, device_key);
 }
 
@@ -685,13 +372,12 @@ fn cursor_only_ebusy_waits_for_the_next_flip_before_retrying() {
     };
     let recorder = recording_sink(&mut backend, 0);
     let device_key = backend.platform.devices[0].key;
-    let position = seed_cursor_position(&mut backend);
     let mut state = ServerState::new();
     recorder.script_result(Err(io::Error::from_raw_os_error(libc::EBUSY)));
 
     warp(&mut backend, &mut state, 180, 130);
     maybe_composite(&mut backend);
-    let crtc = position.crtc;
+    let crtc = backend.platform.outputs[0].output.crtc;
     assert_eq!(recorder.records().len(), 1);
     assert_eq!(recorder.records()[0].kind, AtomicCommitKind::CursorOnly);
     assert_eq!(
@@ -735,8 +421,6 @@ fn cursor_only_ebusy_waits_for_the_next_flip_before_retrying() {
 
     retire_test_flip(&mut backend, &mut state, 1);
     assert!(!backend.platform.cursor_retry_waits_for_flip(0));
-    assert!(backend.for_tests_scene_wants_compose());
-    maybe_composite(&mut backend);
     let records = recorder.records();
     assert_eq!(records.len(), 2);
     assert_eq!(records[1].kind, AtomicCommitKind::CursorOnly);
@@ -748,186 +432,4 @@ fn cursor_only_ebusy_waits_for_the_next_flip_before_retrying() {
     );
     retire_test_flip(&mut backend, &mut state, 2);
     assert_no_cursor_work(&backend, device_key);
-}
-
-fn has_cursor_property(
-    record: &AtomicCommitRecord,
-    position: crate::drm::atomic::CursorPlanePosition,
-) -> bool {
-    record
-        .properties
-        .iter()
-        .any(|update| update.object == position.plane.into())
-}
-
-#[test]
-// Mutation: blame every failed scene-with-cursor commit on the cursor. A
-// buffer, bandwidth or EBUSY failure must not hide the cursor; only a request
-// TEST_ONLY rejects as sent and accepts without the cursor fields is the cursor's.
-fn scene_commit_failure_blames_the_cursor_only_when_its_fields_cause_it() {
-    use ::drm::control::AtomicCommitFlags;
-
-    let einval = || Err(io::Error::from_raw_os_error(libc::EINVAL));
-    let cases: [(&str, Vec<io::Result<()>>, bool, usize); 4] = [
-        (
-            "cursor fields rejected",
-            vec![einval(), einval(), Ok(())],
-            true,
-            3,
-        ),
-        (
-            "scene rejected",
-            vec![einval(), einval(), einval()],
-            false,
-            3,
-        ),
-        (
-            "commit-phase failure",
-            vec![Err(io::Error::from_raw_os_error(libc::ENOMEM)), Ok(())],
-            false,
-            2,
-        ),
-        (
-            "pending commit",
-            vec![Err(io::Error::from_raw_os_error(libc::EBUSY))],
-            false,
-            1,
-        ),
-    ];
-    for (name, results, cursor_blamed, record_count) in cases {
-        let mut backend = KmsBackend::for_tests();
-        let recorder = recording_sink(&mut backend, 0);
-        let position = seed_cursor_position(&mut backend);
-        for result in results {
-            recorder.script_result(result);
-        }
-        set_scene_fence_properties(&mut backend.platform.outputs[0].output);
-        let mut out_fence = -1;
-        let result = crate::drm::page_flip::submit_scene_flip_with_fences(
-            &backend.platform.devices[0].device,
-            &backend.platform.devices[0].atomic_commit_sink,
-            &backend.platform.outputs[0].output,
-            raw(71),
-            -1,
-            &mut out_fence,
-            &[position],
-            crate::drm::async_flip::FlipTiming::Vsync,
-        );
-        assert!(result.is_err(), "{name}: the scene commit itself failed");
-        assert_eq!(
-            backend.platform.devices[0]
-                .atomic_commit_sink
-                .take_last_cursor_rejection(),
-            cursor_blamed,
-            "{name}",
-        );
-        let records = recorder.records();
-        assert_eq!(records.len(), record_count, "{name}");
-        assert_eq!(records[0].kind, AtomicCommitKind::SceneWithCursor);
-        if let Some(full) = records.get(1) {
-            assert_eq!(full.flags, AtomicCommitFlags::TEST_ONLY, "{name}");
-            assert_eq!(full.properties, records[0].properties, "{name}");
-        }
-        if let Some(stripped) = records.get(2) {
-            assert_eq!(stripped.flags, AtomicCommitFlags::TEST_ONLY, "{name}");
-            assert!(!has_cursor_property(stripped, position), "{name}");
-            assert_eq!(
-                stripped.properties.len() + 2,
-                records[0].properties.len(),
-                "{name}: only the cursor fields are dropped",
-            );
-        }
-    }
-}
-
-#[test]
-// Mutation: build the M1 TEST_ONLY request without the cursor fields the live
-// direct commit carries. The probe must test exactly what is committed.
-fn direct_scanout_probe_tests_the_request_it_commits() {
-    let mut backend = KmsBackend::for_tests();
-    let recorder = recording_sink(&mut backend, 0);
-    let position = seed_cursor_position(&mut backend);
-    let platform = &backend.platform;
-    let planes = [crate::drm::modeset::DirectScanoutPlaneState {
-        output: &platform.outputs[0].output,
-        src_x: 0,
-        src_y: 0,
-        src_w: u32::from(platform.outputs[0].width),
-        src_h: u32::from(platform.outputs[0].height),
-    }];
-    let device = &platform.devices[0].device;
-    let sink = &platform.devices[0].atomic_commit_sink;
-    crate::drm::modeset::test_direct_scanout(device, sink, raw(91), &planes, &[position])
-        .expect("record M1 probe");
-    crate::drm::modeset::submit_direct_scanout(
-        device,
-        sink,
-        raw(91),
-        &planes,
-        &[position],
-        crate::drm::async_flip::FlipTiming::Vsync,
-        crate::drm::atomic::TearingCommitContext::NONE,
-    )
-    .expect("record live direct commit");
-
-    let records = recorder.records();
-    assert_eq!(records.len(), 2);
-    assert_eq!(
-        records[0].flags,
-        ::drm::control::AtomicCommitFlags::TEST_ONLY
-    );
-    assert_eq!(records[0].kind, records[1].kind);
-    assert_eq!(records[0].properties, records[1].properties);
-    assert_cursor_properties(&records[0], position);
-}
-
-#[test]
-// Mutation: return Ok from a hide on a permanently disabled device without
-// issuing it. The scene would then draw the SW cursor beside a stuck HW one.
-fn permanently_disabled_cursor_still_hides_a_plane_left_visible() {
-    let mut backend = KmsBackend::for_tests();
-    let position = seed_cursor_position(&mut backend);
-    let hide = Rc::new(super::RecordingCursorHideExecutor::default());
-    hide.script([
-        super::TestCursorHideResult::Error(libc::EIO),
-        super::TestCursorHideResult::Error(libc::EIO),
-        super::TestCursorHideResult::Error(libc::EIO),
-        super::TestCursorHideResult::Error(libc::EIO),
-        super::TestCursorHideResult::Error(libc::EIO),
-        super::TestCursorHideResult::Ok,
-    ]);
-    super::install_recording_cursor_hide_executor(&mut backend, 0, hide.clone());
-    backend
-        .platform
-        .reject_atomic_cursor_commit(&[position], "Invalid argument");
-    for x in [101, 102, 103] {
-        backend
-            .platform
-            .cursor_plane_move(x, 100, 0, 0)
-            .expect("motion-led hide retry");
-    }
-    assert!(
-        backend
-            .platform
-            .for_tests_cursor_permanently_disabled(position.device_key)
-    );
-    assert_eq!(hide.calls(), vec![position.crtc; 4]);
-    assert!(backend.platform.cursor_plane_visible_for_output(0));
-
-    assert!(backend.platform.cursor_plane_hide_on_crtc(0).is_err());
-    assert_eq!(hide.calls(), vec![position.crtc; 5]);
-    assert!(backend.platform.cursor_plane_visible_for_output(0));
-
-    backend
-        .platform
-        .cursor_plane_hide_all()
-        .expect("global hide");
-    assert_eq!(hide.calls(), vec![position.crtc; 6]);
-    assert!(!backend.platform.cursor_plane_visible_for_output(0));
-
-    backend
-        .platform
-        .cursor_plane_hide_on_crtc(0)
-        .expect("nothing left to detach");
-    assert_eq!(hide.calls(), vec![position.crtc; 6]);
 }

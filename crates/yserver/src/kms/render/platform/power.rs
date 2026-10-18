@@ -2,10 +2,16 @@ use crate::{drm, kms::render::platform::PlatformBackend};
 use std::{io, rc::Rc};
 
 pub(in crate::kms::render) trait OutputPowerExecutor {
+    fn fallback_modeset_framebuffer(&self) -> Option<::drm::control::framebuffer::Handle> {
+        None
+    }
+
     fn disable(
         &self,
-        device: &drm::Device,
+        _device: &drm::Device,
         output: &crate::platform::drm::Output,
+        cursor_detach: Option<crate::drm::atomic::AtomicCursorPlaneDetach>,
+        services: &super::services::KmsServices,
     ) -> io::Result<()>;
 
     fn enable(
@@ -13,6 +19,7 @@ pub(in crate::kms::render) trait OutputPowerExecutor {
         device: &drm::Device,
         output: &crate::platform::drm::Output,
         framebuffer: ::drm::control::framebuffer::Handle,
+        services: &super::services::KmsServices,
     ) -> io::Result<()>;
 }
 
@@ -23,8 +30,15 @@ impl OutputPowerExecutor for DrmOutputPowerExecutor {
         &self,
         device: &drm::Device,
         output: &crate::platform::drm::Output,
+        cursor_detach: Option<crate::drm::atomic::AtomicCursorPlaneDetach>,
+        services: &super::services::KmsServices,
     ) -> io::Result<()> {
-        drm::modeset::disable_output(device, output)
+        drm::modeset::disable_output_with_cursor_executor(
+            device,
+            output,
+            cursor_detach,
+            services.atomic.as_ref(),
+        )
     }
 
     fn enable(
@@ -32,31 +46,88 @@ impl OutputPowerExecutor for DrmOutputPowerExecutor {
         device: &drm::Device,
         output: &crate::platform::drm::Output,
         framebuffer: ::drm::control::framebuffer::Handle,
+        services: &super::services::KmsServices,
     ) -> io::Result<()> {
-        drm::modeset::commit_modeset(device, output, framebuffer)
+        drm::modeset::commit_modeset_with_io(
+            device,
+            output,
+            framebuffer,
+            services.mode_blobs.as_ref(),
+            services.atomic.as_ref(),
+        )
     }
 }
 
 #[cfg(test)]
-struct AcceptingOutputPowerExecutor;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OutputPowerRecord {
+    pub(crate) enabled: bool,
+    pub(crate) connector: ::drm::control::connector::Handle,
+    pub(crate) crtc: ::drm::control::crtc::Handle,
+    pub(crate) framebuffer: Option<::drm::control::framebuffer::Handle>,
+}
 
 #[cfg(test)]
-impl OutputPowerExecutor for AcceptingOutputPowerExecutor {
+#[derive(Default)]
+pub(crate) struct RecordingOutputPowerExecutor {
+    records: std::cell::RefCell<Vec<OutputPowerRecord>>,
+}
+
+#[cfg(test)]
+impl RecordingOutputPowerExecutor {
+    pub(crate) fn records(&self) -> Vec<OutputPowerRecord> {
+        self.records.borrow().clone()
+    }
+}
+
+#[cfg(test)]
+impl OutputPowerExecutor for RecordingOutputPowerExecutor {
+    fn fallback_modeset_framebuffer(&self) -> Option<::drm::control::framebuffer::Handle> {
+        Some(::drm::control::from_u32(0xF001).expect("synthetic test framebuffer"))
+    }
+
     fn disable(
         &self,
         _device: &drm::Device,
-        _output: &crate::platform::drm::Output,
+        output: &crate::platform::drm::Output,
+        cursor_detach: Option<crate::drm::atomic::AtomicCursorPlaneDetach>,
+        services: &super::services::KmsServices,
     ) -> io::Result<()> {
-        Ok(())
+        self.records.borrow_mut().push(OutputPowerRecord {
+            enabled: false,
+            connector: output.connector,
+            crtc: output.crtc,
+            framebuffer: None,
+        });
+        drm::modeset::disable_output_with_properties(
+            _device,
+            output,
+            cursor_detach,
+            drm::modeset::DisableOutputPropertyHandles::for_tests(),
+            services.atomic.as_ref(),
+        )
     }
 
     fn enable(
         &self,
         _device: &drm::Device,
-        _output: &crate::platform::drm::Output,
-        _framebuffer: ::drm::control::framebuffer::Handle,
+        output: &crate::platform::drm::Output,
+        framebuffer: ::drm::control::framebuffer::Handle,
+        services: &super::services::KmsServices,
     ) -> io::Result<()> {
-        Ok(())
+        self.records.borrow_mut().push(OutputPowerRecord {
+            enabled: true,
+            connector: output.connector,
+            crtc: output.crtc,
+            framebuffer: Some(framebuffer),
+        });
+        drm::modeset::commit_modeset_with_io(
+            _device,
+            output,
+            framebuffer,
+            services.mode_blobs.as_ref(),
+            services.atomic.as_ref(),
+        )
     }
 }
 
@@ -123,22 +194,30 @@ impl PlatformBackend {
         }
 
         let mut first_err: Option<io::Error> = None;
-        for (i, layout) in self.outputs.iter().enumerate() {
+        for i in 0..self.outputs.len() {
+            let output_key = self.outputs[i].key.clone();
+            let connector_name = self.outputs[i].output.connector_name.clone();
             let Some(device) = self
-                .device_for_output(&layout.key)
+                .device_for_output(&output_key)
                 .map(|device| Rc::clone(&device.device))
             else {
                 log::warn!(
                     "render disable_output: no DRM device {} for {}",
-                    layout.key.device_key,
-                    layout.output.connector_name,
+                    output_key.device_key,
+                    connector_name,
                 );
                 continue;
             };
-            if let Err(e) = drm::modeset::disable_output(&device, &layout.output) {
+            let cursor_detach = self.cursor_plane_detach_for_output(i);
+            if let Err(e) = self.output_power_executor.disable(
+                &device,
+                &self.outputs[i].output,
+                cursor_detach,
+                &self.services,
+            ) {
                 log::warn!(
                     "render disable_output: failed for {} (output {i}): {e}",
-                    layout.output.connector_name,
+                    connector_name,
                 );
                 // Disarm the matching scanout pool so its Drop
                 // doesn't try to destroy framebuffers KMS may
@@ -146,9 +225,12 @@ impl PlatformBackend {
                 if let Some(pool) = self.scanout_pools.get_mut(i).and_then(|p| p.as_mut()) {
                     pool.disarm();
                 }
+                self.quarantine_cursor_output(i);
                 if first_err.is_none() {
                     first_err = Some(e);
                 }
+            } else {
+                self.accept_cursor_lifecycle_detach(i);
             }
         }
         match first_err {
@@ -172,14 +254,17 @@ impl PlatformBackend {
     pub(crate) fn dpms_set_outputs_active(&mut self, active: bool) -> io::Result<()> {
         let mut first_err: Option<io::Error> = None;
         if active {
+            let mut modeset_crtcs = Vec::new();
             // Re-commit modeset. Pick the OnScreen BO (last frame
             // before blank) or any registered fb — same selection
             // logic as `requery_outputs_and_modeset` at :2030.
             for (i, layout) in self.outputs.iter().enumerate() {
+                let cursor_key = crate::kms::render::platform::CrtcKey::for_output(layout);
                 let Some(device) = self
                     .device_for_output(&layout.key)
                     .map(|device| Rc::clone(&device.device))
                 else {
+                    self.active_cursor_crtcs.remove(&cursor_key);
                     let error = io::Error::new(
                         io::ErrorKind::NotFound,
                         format!(
@@ -212,6 +297,7 @@ impl PlatformBackend {
                                 })
                         });
                 let Some((bo_idx, fb_id)) = front else {
+                    self.active_cursor_crtcs.remove(&cursor_key);
                     let error = io::Error::other(format!(
                         "dpms_set_outputs_active(true): no framebuffer for output {}; \
                          an ordinary page flip cannot restore MODE_ID/ACTIVE",
@@ -223,10 +309,13 @@ impl PlatformBackend {
                     }
                     continue;
                 };
-                if let Err(e) = self
-                    .output_power_executor
-                    .enable(&device, &layout.output, fb_id)
-                {
+                if let Err(e) = self.output_power_executor.enable(
+                    &device,
+                    &layout.output,
+                    fb_id,
+                    &self.services,
+                ) {
+                    self.active_cursor_crtcs.remove(&cursor_key);
                     log::error!(
                         "dpms_set_outputs_active(true): commit_modeset for {} failed: {e}",
                         layout.output.connector_name,
@@ -234,34 +323,44 @@ impl PlatformBackend {
                     if first_err.is_none() {
                         first_err = Some(e);
                     }
-                } else if let Some(scanout) = self.scanout_pools.get_mut(i).and_then(Option::as_mut)
-                {
-                    scanout.display_pool_mut().bos[bo_idx]
-                        .state
-                        .mark_on_screen_after_modeset();
-                    if let Err(error) = scanout.note_kms_modeset_installed(bo_idx) {
-                        log::error!(
-                            "dpms_set_outputs_active(true): copied ownership ledger failed for \
-                             output {i} bo {bo_idx}: {error}"
-                        );
-                        self.gpu.renderer_failed = true;
-                        if first_err.is_none() {
-                            first_err = Some(error);
+                } else {
+                    modeset_crtcs.push(cursor_key);
+                    self.active_cursor_crtcs.insert(cursor_key);
+                    if let Some(scanout) = self.scanout_pools.get_mut(i).and_then(Option::as_mut) {
+                        scanout.display_pool_mut().bos[bo_idx]
+                            .state
+                            .mark_on_screen_after_modeset();
+                        if let Err(error) = scanout.note_kms_modeset_installed(bo_idx) {
+                            log::error!(
+                                "dpms_set_outputs_active(true): copied ownership ledger failed for \
+                                 output {i} bo {bo_idx}: {error}"
+                            );
+                            self.gpu.renderer_failed = true;
+                            if first_err.is_none() {
+                                first_err = Some(error);
+                            }
                         }
                     }
                 }
             }
+            for key in modeset_crtcs {
+                self.invalidate_cursor_applied(key);
+            }
         } else {
-            for layout in &self.outputs {
+            for output_idx in 0..self.outputs.len() {
+                let output_key = self.outputs[output_idx].key.clone();
+                let connector_name = self.outputs[output_idx].output.connector_name.clone();
+                let cursor_key =
+                    crate::kms::render::platform::CrtcKey::for_output(&self.outputs[output_idx]);
                 let Some(device) = self
-                    .device_for_output(&layout.key)
+                    .device_for_output(&output_key)
                     .map(|device| Rc::clone(&device.device))
                 else {
                     let error = io::Error::new(
                         io::ErrorKind::NotFound,
                         format!(
                             "dpms_set_outputs_active(false): no DRM device {} for {}",
-                            layout.key.device_key, layout.output.connector_name,
+                            output_key.device_key, connector_name,
                         ),
                     );
                     log::error!("{error}");
@@ -270,14 +369,24 @@ impl PlatformBackend {
                     }
                     continue;
                 };
-                if let Err(e) = self.output_power_executor.disable(&device, &layout.output) {
+                let cursor_detach = self.cursor_plane_detach_for_output(output_idx);
+                if let Err(e) = self.output_power_executor.disable(
+                    &device,
+                    &self.outputs[output_idx].output,
+                    cursor_detach,
+                    &self.services,
+                ) {
                     log::error!(
                         "dpms_set_outputs_active(false): disable_output for {} failed: {e}",
-                        layout.output.connector_name,
+                        connector_name,
                     );
                     if first_err.is_none() {
                         first_err = Some(e);
                     }
+                    self.quarantine_cursor_output(output_idx);
+                } else {
+                    self.accept_cursor_lifecycle_detach(output_idx);
+                    self.active_cursor_crtcs.remove(&cursor_key);
                 }
             }
         }
@@ -289,6 +398,23 @@ impl PlatformBackend {
 
     #[cfg(test)]
     pub(crate) fn for_tests_accept_output_power_commits(&mut self) {
-        self.output_power_executor = Rc::new(AcceptingOutputPowerExecutor);
+        let executor = self
+            .services
+            .test_recorders
+            .as_ref()
+            .map(|recorders| Rc::clone(&recorders.output_power))
+            .unwrap_or_else(|| Rc::new(RecordingOutputPowerExecutor::default()));
+        self.output_power_executor = executor;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_record_complete_output_power_commits(&mut self) {
+        let executor = self
+            .services
+            .test_recorders
+            .as_ref()
+            .map(|recorders| Rc::clone(&recorders.output_power))
+            .unwrap_or_else(|| Rc::new(RecordingOutputPowerExecutor::default()));
+        self.output_power_executor = executor;
     }
 }

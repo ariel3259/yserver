@@ -131,18 +131,83 @@ impl PageFlipEventSource for DrmPageFlipEventSource {
     }
 }
 
-#[cfg(test)]
 #[derive(Default)]
-pub(crate) struct RecordingPageFlipEventSource {
-    flips: std::cell::RefCell<std::collections::VecDeque<KernelPageFlip>>,
-    sequences: std::cell::RefCell<std::collections::VecDeque<KernelCrtcSequence>>,
-    delayed_ready_checks: std::cell::Cell<usize>,
+struct RecordingDeviceEvents {
+    flips: std::collections::VecDeque<KernelPageFlip>,
+    sequences: std::collections::VecDeque<KernelCrtcSequence>,
 }
 
-#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct RecordingPageFlipEventSource {
+    events: std::cell::RefCell<std::collections::HashMap<RawFd, RecordingDeviceEvents>>,
+    registered_devices: std::cell::RefCell<HashSet<RawFd>>,
+    legacy_device_fd: std::cell::Cell<Option<RawFd>>,
+    delayed_ready_checks: std::cell::Cell<usize>,
+    next_drain_error: std::cell::Cell<Option<i32>>,
+}
+
 impl RecordingPageFlipEventSource {
+    pub(crate) fn register_device(&self, device: &crate::drm::Device) {
+        let fd = device.as_fd().as_raw_fd();
+        let mut registered = self.registered_devices.borrow_mut();
+        if registered.insert(fd) {
+            self.legacy_device_fd
+                .set((registered.len() == 1).then_some(fd));
+        }
+        self.events.borrow_mut().entry(fd).or_default();
+    }
+
     pub(crate) fn queue_flip(&self, crtc: ::drm::control::crtc::Handle, frame: u32) {
         self.queue_flip_at(crtc, frame, std::time::Duration::ZERO);
+    }
+
+    pub(crate) fn queue_flip_for_device(
+        &self,
+        device: &crate::drm::Device,
+        crtc: ::drm::control::crtc::Handle,
+        frame: u32,
+    ) {
+        self.queue_flip_at_for_device(device, crtc, frame, std::time::Duration::ZERO);
+    }
+
+    pub(crate) fn queue_flip_at_for_device(
+        &self,
+        device: &crate::drm::Device,
+        crtc: ::drm::control::crtc::Handle,
+        frame: u32,
+        timestamp: std::time::Duration,
+    ) {
+        let fd = device.as_fd().as_raw_fd();
+        self.events
+            .borrow_mut()
+            .entry(fd)
+            .or_default()
+            .flips
+            .push_back(KernelPageFlip {
+                crtc,
+                frame,
+                ust: timestamp,
+                event_at_monotonic: Some(timestamp),
+                event_at_boottime: crate::drm::atomic::boottime_timestamp(),
+            });
+    }
+
+    pub(crate) fn queue_flip_with_timestamps_for_device(
+        &self,
+        device: &crate::drm::Device,
+        crtc: ::drm::control::crtc::Handle,
+        frame: u32,
+        ust: std::time::Duration,
+        event_at_monotonic: std::time::Duration,
+    ) {
+        self.queue_flip_with_clock_samples_for_device(
+            device,
+            crtc,
+            frame,
+            ust,
+            Some(event_at_monotonic),
+            crate::drm::atomic::boottime_timestamp(),
+        );
     }
 
     pub(crate) fn queue_flip_at(
@@ -161,7 +226,12 @@ impl RecordingPageFlipEventSource {
         ust: std::time::Duration,
         event_at_monotonic: std::time::Duration,
     ) {
-        self.queue_flip_with_clock_samples(
+        let fd = self
+            .legacy_device_fd
+            .get()
+            .expect("unqualified test page-flip events require one registered DRM device");
+        self.queue_flip_with_clock_samples_for_fd(
+            fd,
             crtc,
             frame,
             ust,
@@ -178,13 +248,56 @@ impl RecordingPageFlipEventSource {
         event_at_monotonic: Option<std::time::Duration>,
         event_at_boottime: Option<std::time::Duration>,
     ) {
-        self.flips.borrow_mut().push_back(KernelPageFlip {
+        self.queue_flip_with_clock_samples_for_fd(
+            self.legacy_device_fd(),
             crtc,
             frame,
             ust,
             event_at_monotonic,
             event_at_boottime,
-        });
+        );
+    }
+
+    pub(crate) fn queue_flip_with_clock_samples_for_device(
+        &self,
+        device: &crate::drm::Device,
+        crtc: ::drm::control::crtc::Handle,
+        frame: u32,
+        ust: std::time::Duration,
+        event_at_monotonic: Option<std::time::Duration>,
+        event_at_boottime: Option<std::time::Duration>,
+    ) {
+        self.queue_flip_with_clock_samples_for_fd(
+            device.as_fd().as_raw_fd(),
+            crtc,
+            frame,
+            ust,
+            event_at_monotonic,
+            event_at_boottime,
+        );
+    }
+
+    fn queue_flip_with_clock_samples_for_fd(
+        &self,
+        device_fd: RawFd,
+        crtc: ::drm::control::crtc::Handle,
+        frame: u32,
+        ust: std::time::Duration,
+        event_at_monotonic: Option<std::time::Duration>,
+        event_at_boottime: Option<std::time::Duration>,
+    ) {
+        self.events
+            .borrow_mut()
+            .entry(device_fd)
+            .or_default()
+            .flips
+            .push_back(KernelPageFlip {
+                crtc,
+                frame,
+                ust,
+                event_at_monotonic,
+                event_at_boottime,
+            });
     }
 
     #[cfg(test)]
@@ -193,20 +306,47 @@ impl RecordingPageFlipEventSource {
     }
 
     #[cfg(test)]
+    pub(crate) fn fail_next_drain(&self, raw_os_error: i32) {
+        self.next_drain_error.set(Some(raw_os_error));
+    }
+
+    #[cfg(test)]
     pub(crate) fn queued_flip_count(&self) -> usize {
-        self.flips.borrow().len()
+        self.events
+            .borrow()
+            .values()
+            .map(|events| events.flips.len())
+            .sum()
+    }
+
+    pub(crate) fn queued_flip_count_for_device(&self, device: &crate::drm::Device) -> usize {
+        self.events
+            .borrow()
+            .get(&device.as_fd().as_raw_fd())
+            .map_or(0, |events| events.flips.len())
+    }
+
+    fn legacy_device_fd(&self) -> RawFd {
+        self.legacy_device_fd
+            .get()
+            .expect("unqualified test page-flip events require one registered DRM device")
     }
 }
 
-#[cfg(test)]
 impl PageFlipEventSource for RecordingPageFlipEventSource {
     fn drain_events(
         &self,
-        _device: &crate::drm::Device,
+        device: &crate::drm::Device,
     ) -> io::Result<(Vec<KernelPageFlip>, Vec<KernelCrtcSequence>)> {
+        if let Some(raw_os_error) = self.next_drain_error.take() {
+            return Err(io::Error::from_raw_os_error(raw_os_error));
+        }
+        let fd = device.as_fd().as_raw_fd();
+        let mut events = self.events.borrow_mut();
+        let device_events = events.entry(fd).or_default();
         Ok((
-            self.flips.borrow_mut().drain(..).collect(),
-            self.sequences.borrow_mut().drain(..).collect(),
+            device_events.flips.drain(..).collect(),
+            device_events.sequences.drain(..).collect(),
         ))
     }
 
@@ -219,9 +359,15 @@ impl PageFlipEventSource for RecordingPageFlipEventSource {
             self.delayed_ready_checks.set(delay - 1);
             return Ok(None);
         }
-        if self.flips.borrow().is_empty() && self.sequences.borrow().is_empty() {
+        let fd = device.as_fd().as_raw_fd();
+        let events = self.events.borrow();
+        let Some(device_events) = events.get(&fd) else {
+            return Ok(None);
+        };
+        if device_events.flips.is_empty() && device_events.sequences.is_empty() {
             return Ok(None);
         }
+        drop(events);
         self.drain_events(device).map(Some)
     }
 }
@@ -242,9 +388,9 @@ impl PlatformBackend {
         for device in &self.devices {
             fds.push((device.device.as_fd().as_raw_fd(), BackendFdKind::Drm));
         }
-        #[cfg(target_os = "linux")]
-        if let Some(mon) = self.hotplug_monitor.as_ref() {
-            fds.push((mon.raw_fd(), BackendFdKind::DrmHotplug));
+        let hotplug_fd = self.services.hotplug.raw_fd();
+        if hotplug_fd >= 0 {
+            fds.push((hotplug_fd, BackendFdKind::DrmHotplug));
         }
         // Stage 5 Task 6.1: stable inner epfd for deferred PRESENT
         // completion. Always present.

@@ -109,9 +109,10 @@ impl SceneCompositor {
         let transition = Some(CursorTransition::HideOnRetire {
             reveal_sw_after: true,
         });
+        let retained_mode = inner.outputs[output_idx].last_frame_cursor_mode;
         let result = apply_cursor_transition_on_retire(inner, output_idx, sink, transition);
         let desired_mode = OutputCursorMode::SwPending;
-        let resolution = resolve_retired_cursor_state(result, desired_mode);
+        let resolution = resolve_retired_cursor_state(result, desired_mode, retained_mode);
         let state = &mut inner.outputs[output_idx];
         state.force_show_retry_version = update_force_show_retry_version(
             state.force_show_retry_version,
@@ -127,6 +128,7 @@ impl SceneCompositor {
         }
         if resolution.force_repaint {
             force_cursor_retry_repaint(state);
+            self.scene_structure_dirty = true;
         }
         true
     }
@@ -411,6 +413,7 @@ pub(super) fn derive_cursor_transition(
 pub(super) fn resolve_retired_cursor_state(
     result: CursorTransitionResult,
     desired_mode: OutputCursorMode,
+    retained_mode: OutputCursorMode,
 ) -> CursorRetireResolution {
     match result {
         CursorTransitionResult::Applied => CursorRetireResolution {
@@ -443,6 +446,12 @@ pub(super) fn resolve_retired_cursor_state(
             clear_presented_metadata: false,
             force_repaint: true,
         },
+        CursorTransitionResult::Deferred => CursorRetireResolution {
+            actual_mode: retained_mode,
+            commit_desired_metadata: false,
+            clear_presented_metadata: false,
+            force_repaint: true,
+        },
     }
 }
 
@@ -457,9 +466,10 @@ pub(super) fn update_force_show_retry_version(
         _ => None,
     };
     match (attempted, result) {
-        (Some(version), CursorTransitionResult::VisibleNeedsShowRetry) => {
-            Some(current.map_or(version, |pending| pending.max(version)))
-        }
+        (
+            Some(version),
+            CursorTransitionResult::VisibleNeedsShowRetry | CursorTransitionResult::Deferred,
+        ) => Some(current.map_or(version, |pending| pending.max(version))),
         (Some(version), CursorTransitionResult::Applied | CursorTransitionResult::Hidden)
             if current == Some(version) =>
         {
@@ -491,28 +501,6 @@ pub(super) fn reset_cursor_retry_for_lifecycle(retry: &mut Option<u64>) {
 
 pub(super) fn reset_cursor_mode_for_lifecycle(mode: &mut OutputCursorMode) {
     *mode = OutputCursorMode::Hidden;
-}
-
-pub(super) fn resolve_failed_cursor_upload(
-    output_idx: usize,
-    prior_visible: bool,
-    hide_live_binding: impl FnOnce() -> io::Result<()>,
-) -> CursorTransitionResult {
-    if !prior_visible {
-        // Hidden/Sw→Hw can fail before the plane has ever been bound. There
-        // is no rollback to perform; issuing set_cursor2(None) here can itself
-        // return EINVAL and falsely manufacture HW ownership.
-        return CursorTransitionResult::Hidden;
-    }
-    match hide_live_binding() {
-        Ok(()) => CursorTransitionResult::Hidden,
-        Err(error) => {
-            log::warn!(
-                "render cursor: upload failed and hide_on_crtc({output_idx}) rollback failed: {error}"
-            );
-            CursorTransitionResult::VisibleNeedsShowRetry
-        }
-    }
 }
 
 pub(super) fn resolve_cursor_hide_on_retire(
@@ -559,60 +547,67 @@ pub(super) fn apply_cursor_transition_on_retire(
             y,
         } => {
             let prior_visible = sink.cursor_plane().visible(output_idx);
-            // Upload if version doesn't match. `upload_image` is
-            // already idempotent-deduplicated by value inside
-            // `CursorPlane`, but skipping the FFI when we know the
-            // version matches is cheaper. Bytes come from the
+            // Stage the complete image identity, including its hotspot.
+            // A hotspot-only update may keep the same image version, so the
+            // backend owns the deduplication decision. Bytes come from the
             // scene's current `CursorEntry` (cloned-Arc, no copy)
             // when its version matches the transition's. A mismatch never
             // binds stale pixels: the old binding must be hidden successfully
             // or remain authoritative with a version-qualified Show retry.
-            let upload_ready = if sink.cursor_plane().uploaded_version(output_idx)
-                != Some(upload_version)
+            let upload_ready = if sink.cursor_plane().uploaded_image_matches(
+                output_idx,
+                upload_version,
+                hot_x,
+                hot_y,
+            ) {
+                true
+            } else if let Some(entry) = inner.cursor.as_ref()
+                && entry.record_version == upload_version
+                && let Some(bytes) = entry.bgra_bytes.as_ref()
             {
-                if let Some(entry) = inner.cursor.as_ref()
-                    && entry.record_version == upload_version
-                    && let Some(bytes) = entry.bgra_bytes.as_ref()
-                {
-                    match sink.cursor_plane_mut().upload(
-                        output_idx,
-                        upload_version,
-                        entry.extent.width,
-                        entry.extent.height,
-                        bytes.as_ref(),
-                    ) {
-                        Ok(()) => true,
-                        Err(e) => {
-                            log::warn!(
-                                "render cursor: retire-time upload (v{upload_version}) failed: {e}"
-                            );
-                            false
-                        }
+                match sink.cursor_plane_mut().upload(
+                    output_idx,
+                    upload_version,
+                    hot_x,
+                    hot_y,
+                    entry.extent.width,
+                    entry.extent.height,
+                    bytes.as_ref(),
+                ) {
+                    Ok(crate::kms::render::scene::CursorUploadOutcome::Ready) => true,
+                    Ok(crate::kms::render::scene::CursorUploadOutcome::Deferred) => {
+                        return CursorTransitionResult::Deferred;
                     }
-                } else {
-                    log::debug!(
-                        "render cursor: retire-time upload (v{upload_version}) — \
-                         no matching entry bytes; binding with current buffer"
-                    );
-                    false
+                    Err(e) => {
+                        log::warn!(
+                            "render cursor: retire-time upload (v{upload_version}) failed: {e}"
+                        );
+                        false
+                    }
                 }
             } else {
-                true
+                log::debug!(
+                    "render cursor: retire-time upload (v{upload_version}) — \
+                     no matching entry bytes; retaining the current binding for retry"
+                );
+                return CursorTransitionResult::Deferred;
             };
             if !upload_ready {
-                // A steady-HW rebind can fail its per-device upload while an
-                // old binding is live. Switch to SW only if detaching that old
-                // binding succeeds; otherwise retain actual HW ownership. A
-                // never-bound output has nothing to detach and resolves
-                // directly to Hidden without probing hide.
-                resolve_failed_cursor_upload(output_idx, prior_visible, || {
-                    sink.cursor_plane_mut().hide(output_idx)
-                })
+                // Keep the accepted image bound until the wanted replacement
+                // has a complete framebuffer. Allocation or mapping pressure
+                // cannot turn an image update into a speculative detach.
+                if prior_visible {
+                    CursorTransitionResult::VisibleNeedsShowRetry
+                } else {
+                    CursorTransitionResult::Hidden
+                }
             } else {
                 match sink.cursor_plane_mut().show(output_idx, hot_x, hot_y, x, y) {
                     Ok(()) => CursorTransitionResult::Applied,
                     Err(error) => {
-                        let actual = if error.remains_visible {
+                        let actual = if error.deferred {
+                            CursorTransitionResult::Deferred
+                        } else if error.remains_visible {
                             CursorTransitionResult::VisibleNeedsShowRetry
                         } else {
                             CursorTransitionResult::Hidden

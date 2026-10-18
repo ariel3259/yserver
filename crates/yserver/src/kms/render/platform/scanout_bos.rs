@@ -78,7 +78,8 @@ impl PlatformBackend {
             .device_for_output(&output_key)
             .map(|device| Rc::clone(&device.atomic_commit_sink))
             .ok_or_else(|| io::Error::other("copied scanout atomic commit sink disappeared"))?;
-        let cursor_positions = self.cursor_plane_atomic_positions_for_outputs(&[output_idx]);
+        let cursor_updates = self.cursor_plane_updates_for_primary_outputs(&[output_idx]);
+        self.reserve_cursor_plane_updates(&cursor_updates)?;
 
         let mut recovery_failed = false;
         let result = (|| {
@@ -132,7 +133,7 @@ impl PlatformBackend {
                 framebuffer,
                 in_fence_fd,
                 &mut out_fence_fd,
-                &cursor_positions,
+                &cursor_updates,
                 crate::drm::async_flip::FlipTiming::Vsync,
             ) {
                 Ok(()) => {
@@ -170,15 +171,15 @@ impl PlatformBackend {
             }
         })();
 
-        if atomic_commit_sink.take_last_cursor_rejection()
-            && let Err(error) = &result
-        {
-            let rejected = self.reject_atomic_cursor_commit(&cursor_positions, &error.to_string());
-            self.defer_cursor_move_outcome(rejected);
-        }
-
         if result.is_ok() {
-            self.cursor_plane_scene_commit_submitted(&cursor_positions);
+            self.cursor_plane_scene_commit_submitted(&cursor_updates)
+                .expect("accepted copied commit keeps its reserved cursor leases");
+        } else if atomic_commit_sink.take_last_cursor_rejection() {
+            let error = result.as_ref().expect_err("checked copied submit error");
+            let rejected = self.reject_atomic_cursor_commit(&cursor_updates, error);
+            self.defer_cursor_move_outcome(rejected);
+        } else {
+            self.reject_cursor_plane_update_reservations(&cursor_updates);
         }
 
         if recovery_failed

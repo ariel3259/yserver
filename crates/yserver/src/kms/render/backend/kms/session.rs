@@ -1,17 +1,14 @@
-use crate::{
-    drm,
-    kms::{
-        core::KmsCore,
-        render::{
-            backend::{
-                CrtcConfigProbeExecutor, KmsBackend, KmsBackendState, RandrIdAllocator,
-                ScanoutM0Telemetry, ScanoutM1ProbeCache, ScanoutM2State, Tearing,
-                kms::export::probe_dmabuf_export_support,
-            },
-            engine::RenderEngine,
-            platform::PlatformBackend,
-            scene::SceneCompositor,
+use crate::kms::{
+    core::KmsCore,
+    render::{
+        backend::{
+            CrtcConfigProbeExecutor, KmsBackend, KmsBackendState, RandrIdAllocator,
+            ScanoutM0Telemetry, ScanoutM1ProbeCache, ScanoutM2State, Tearing,
+            kms::export::probe_dmabuf_export_support,
         },
+        engine::RenderEngine,
+        platform::PlatformBackend,
+        scene::SceneCompositor,
     },
 };
 use std::{
@@ -94,32 +91,28 @@ impl KmsBackend {
     /// # Errors
     ///
     /// Propagates DRM / Vk / libinput init failures from
-    /// `PlatformBackend::open_with_commit`, plus FontLoader / XKB
+    /// `PlatformBackend::open_with_services`, plus FontLoader / XKB
     /// init failures from `KmsCore::new`.
     pub fn open(
         device_paths: &[std::path::PathBuf],
         console_guard: crate::kms::ConsoleGuardOpt,
         layout: Option<String>,
     ) -> io::Result<Self> {
-        Self::open_with_commit(
+        Self::open_with_services(
             device_paths,
             console_guard,
             layout,
-            drm::modeset::commit_modeset,
+            crate::kms::render::platform::services::KmsServices::production(),
         )
     }
 
-    fn open_with_commit(
+    pub fn open_with_services(
         device_paths: &[std::path::PathBuf],
         console_guard: crate::kms::ConsoleGuardOpt,
         layout: Option<String>,
-        commit: fn(
-            &crate::drm::Device,
-            &crate::platform::drm::Output,
-            ::drm::control::framebuffer::Handle,
-        ) -> io::Result<()>,
+        services: crate::kms::render::platform::services::KmsServices,
     ) -> io::Result<Self> {
-        let platform = PlatformBackend::open_with_commit(device_paths, commit)?;
+        let platform = PlatformBackend::open_with_services(device_paths, services)?;
         let (fb_w, fb_h) = (platform.fb_w, platform.fb_h);
         let mut core = KmsCore::new(fb_w, fb_h, layout)?;
         // Warp the pointer to the centre of the primary output at startup
@@ -146,10 +139,10 @@ impl KmsBackend {
             scanout_m0: ScanoutM0Telemetry::default(),
             scanout_m1: ScanoutM1ProbeCache::new(),
             scanout_m2: ScanoutM2State::new(),
+            deferred_direct_cursor: None,
             tearing: Tearing::new(),
-            direct_frame_submitter: KmsBackend::submit_direct_frame_live,
             vt_resume_executor: std::rc::Rc::new(DrmVtResumeExecutor),
-            monotonic_clock: std::rc::Rc::new(std::time::Instant::now),
+            monotonic_clock: std::rc::Rc::clone(&platform.services.monotonic_clock),
             armed_vblank_targets: std::collections::HashMap::new(),
             absolute_vblank_targets: std::collections::HashMap::new(),
             crtc_queue_sequence_unsupported_devices: HashSet::new(),
@@ -177,8 +170,6 @@ impl KmsBackend {
             next_crtc_config_token: 1,
             next_device_config_token: 1,
             crtc_config_topology_epoch: 0,
-            #[cfg(test)]
-            crtc_config_discovery_override: None,
             input_thread_control: None,
             randr_id_alloc: RandrIdAllocator::default(),
             provider_output_sources: HashMap::new(),
@@ -368,6 +359,7 @@ impl KmsBackend {
     /// failure; subsequent outputs still attempted.
     pub fn disable_output(&mut self) -> io::Result<()> {
         self.exit_tearing("shutdown");
+        let old_pending_pageflips = self.pending_pageflip_crtcs();
         // Stage 5 Task 6.1: explicitly flush open render batches
         // before drain_all walks the submitted queue. drain_all only
         // waits on already-submitted CBs; an open pending batch
@@ -390,6 +382,43 @@ impl KmsBackend {
         // Phase B.1 Task 21: drain close events emitted by shutdown.
         self.drain_frame_builder_telemetry();
         self.sync_descriptor_pool_telemetry();
+
+        // Take the complete event snapshot before scene teardown. Disabling
+        // the CRTCs first makes its blocking cursor detaches the final KMS
+        // cursor operations; `scene.drain_all` below can then only observe
+        // detached state and cannot create an obligation missing from this
+        // snapshot.
+        if let Err(error) = self.platform.disable_output() {
+            // A failed KMS disable must preserve cursor ownership, but it
+            // must not strand PRESENT completions already drained from the
+            // renderer. Keep those protocol events available to the caller
+            // even on this fail-stop path.
+            let completed = self.drain_completed_present_events_impl();
+            self.pending_completed_events_on_shutdown.extend(completed);
+            let completed = self.force_drain_all_present_batches();
+            self.pending_completed_events_on_shutdown.extend(completed);
+            return Err(error);
+        }
+        if let Err(error) = self.platform.discard_old_drm_events_after_all_off(
+            &old_pending_pageflips,
+            std::time::Duration::from_secs(1),
+        ) {
+            for device in &mut self.platform.devices {
+                if let Some(plane) = device.cursor.plane.as_mut() {
+                    plane.disarm_sprite_pool();
+                }
+            }
+            // A failed old-event drain keeps the cursor backing quarantined,
+            // but PRESENT completions are independent protocol obligations
+            // and still need to reach the shutdown caller.
+            let completed = self.drain_completed_present_events_impl();
+            self.pending_completed_events_on_shutdown.extend(completed);
+            let completed = self.force_drain_all_present_batches();
+            self.pending_completed_events_on_shutdown.extend(completed);
+            return Err(error);
+        }
+        self.platform
+            .clear_atomic_cursor_state_after_old_events_discard();
         self.scene.drain_all(&mut self.platform);
 
         // Stage 5 Task 6.1: drain the pending PRESENT batch queue
@@ -412,14 +441,11 @@ impl KmsBackend {
         // `BufWriter::Drop` would lose the buffered tail to a
         // subsequent power-cycle. See `submit_trace::SubmitTrace::flush`.
         self.telemetry.flush_submit_trace();
-        let result = self.platform.disable_output();
-        if result.is_ok() {
-            self.stop_direct_after_scanout_replaced("shutdown");
-            self.pending_completed_events_on_shutdown
-                .append(&mut self.pstate.scanout_m2.completed);
-            self.pstate.scanout_m1.clear("shutdown");
-        }
-        result
+        self.stop_direct_after_scanout_replaced("shutdown");
+        self.pending_completed_events_on_shutdown
+            .append(&mut self.pstate.scanout_m2.completed);
+        self.pstate.scanout_m1.clear("shutdown");
+        Ok(())
     }
 
     /// Suspend sequence — called by `drive_vt_event` when the state machine
@@ -469,21 +495,6 @@ impl KmsBackend {
 
         // 4. Wait for in-flight GPU work, bounded.
         self.platform.wait_idle_bounded();
-
-        // The primary plane is the only plane `disable_output` detaches.
-        // A hardware cursor is programmed through its own plane/ioctl, and
-        // some drivers (notably AMD Polaris) reject an atomic CRTC disable
-        // while that plane remains attached.  Normally `scene.drain_all`
-        // hides it, but that must happen *after* the all-off transaction so
-        // scene acknowledgements and BO phases are not discarded while KMS
-        // may still scan them out.  Hide cursor planes separately first.
-        //
-        // This is intentionally best-effort: a software cursor has no plane,
-        // and an already-detached cursor needs no recovery.  The following
-        // all-off atomic transaction remains the authoritative VT boundary.
-        if let Err(error) = self.platform.cursor_plane_hide_all() {
-            log::debug!("kms: VT suspend could not hide hardware cursor planes: {error}");
-        }
 
         // 4b. Take the complete old CRTC set off-screen before discarding any
         //     scene acknowledgement or BO phase. Otherwise a surviving CRTC
@@ -648,6 +659,7 @@ impl KmsBackend {
         // successful all-off quiesce cleared every arm already; prune remains
         // useful for metadata-only/no-direct transitions.
         self.prune_armed_targets_to_live_outputs();
+        self.platform.invalidate_live_cursor_applied();
 
         // 2a. Re-light every live output. The connector snapshot is read-only
         //     for surviving routes; on a VT/seat resume the kernel may have
@@ -851,6 +863,7 @@ impl KmsBackend {
         // until VT_RELDISP, so a stall here freezes the whole session).
         log::info!("kms: VT release — input paused; run_suspend");
         self.drive_vt_event(state, VtEventKind::Disable);
+        self.platform.invalidate_live_cursor_applied();
         log::info!("kms: VT release — suspended; drmDropMaster");
         for device in &self.platform.devices {
             if let Err(err) = self.pstate.vt_resume_executor.release_master(device) {
@@ -872,7 +885,7 @@ impl KmsBackend {
         state: &mut ServerState,
     ) {
         if let Some(deadline) = self.pstate.hotplug_rescan_deadline
-            && std::time::Instant::now() >= deadline
+            && self.monotonic_now() >= deadline
         {
             self.pstate.hotplug_rescan_deadline = None;
             self.run_display_rescan(state);
@@ -956,13 +969,9 @@ impl KmsBackend {
         );
 
         if want_active {
-            // ── Wake side. Mirrors KmsBackend::run_resume around the
-            //    modeset commit: commit_modeset, then re-arm the cursor
-            //    plane via legacy ioctl. Without rearm_cursor the cursor
-            //    plane stays bound to a CRTC that was disabled — the
-            //    first subsequent atomic page-flip then EINVALs because
-            //    the kernel sees a stale plane→CRTC reference. See
-            //    project_einval_atomic_commit_storm_wedge memory entry.
+            // ── Wake side. Re-light the CRTC, invalidate the cached cursor
+            //    comparison, then reconcile the accepted policy with atomic
+            //    cursor-plane state.
             //
             // ALWAYS run rearm_cursor + wake_for_damage regardless of
             // dpms_set_outputs_active's result. That helper is best-
@@ -975,6 +984,7 @@ impl KmsBackend {
             // failure, the next set_dpms_power(On) retry sees
             // kms_outputs_active=false and re-attempts (idempotent on
             // the outputs that already came up).
+            self.platform.invalidate_live_cursor_applied();
             let res = self.platform.dpms_set_outputs_active(true);
             self.reapply_gamma_for_live_outputs();
             let (hot_x, hot_y) = self
@@ -1096,6 +1106,8 @@ impl KmsBackend {
             self.request_exit();
             return;
         }
+
+        self.platform.invalidate_live_cursor_applied();
 
         log::info!("kms: VT acquire — master held={acquired}; run_resume");
         self.drive_vt_event(state, VtEventKind::Enable);

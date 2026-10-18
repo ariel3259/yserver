@@ -30,6 +30,13 @@ impl Platform for PlatformBackend {
         self.scene_output_layouts()
     }
 
+    fn note_backend_put_image_entry(b: &mut KmsBackend) {
+        b.platform
+            .services
+            .backend_entry_observer
+            .put_image_entered();
+    }
+
     fn note_drawable_retired(st: &mut KmsBackendState, id: DrawableId) {
         st.scanout_m1.remove(id);
     }
@@ -143,11 +150,10 @@ impl Platform for PlatformBackend {
     }
 
     fn hide_cursor_under_direct_scanout(b: &mut KmsBackend) {
-        if !b.pstate.scanout_m2.active() {
-            return;
-        }
+        b.pstate.deferred_direct_cursor = None;
+        let direct_scanout = b.pstate.scanout_m2.active();
         if !b.platform.any_cursor_plane_visible() {
-            if !b.sync_direct_cursor_scene_state() {
+            if direct_scanout && !b.sync_direct_cursor_scene_state() {
                 b.request_direct_unflip("cursor_scene_sync_failed");
             }
             return;
@@ -164,25 +170,19 @@ impl Platform for PlatformBackend {
                 failed = true;
             }
         }
-        if failed {
+        if direct_scanout && failed {
             b.request_direct_unflip("cursor_hide_failed");
         }
-        if !b.sync_direct_cursor_scene_state() {
+        if direct_scanout && !b.sync_direct_cursor_scene_state() {
             b.request_direct_unflip("cursor_scene_sync_failed");
+        }
+        if !direct_scanout {
+            b.scene.wake_for_damage();
         }
     }
 
     fn recover_hidden_cursor_on_resume(b: &mut KmsBackend) {
-        for output_idx in 0..b.platform.outputs.len() {
-            if !b.platform.cursor_plane_visible_for_output(output_idx) {
-                continue;
-            }
-            if let Err(error) = b.platform.cursor_plane_hide_on_crtc(output_idx) {
-                log::warn!(
-                    "render resume: hidden cursor plane detach failed on output {output_idx}: {error}"
-                );
-            }
-        }
+        b.platform.recover_hidden_cursor_on_resume();
     }
 
     fn note_cursor_sprite(b: &mut KmsBackend, width: u16, height: u16, hot_x: u16, hot_y: u16) {
@@ -201,7 +201,7 @@ impl Platform for PlatformBackend {
             // Hardware and software cursor ownership may coexist on
             // arbitrary cards. Record/dispatch every visible HW plane
             // position and also repaint the SW outputs.
-            match b.platform.cursor_plane_move(cx, cy, hot_x, hot_y) {
+            match b.platform.cursor_plane_move(cx, cy) {
                 Ok(outcome) => {
                     b.handle_cursor_move_outcome(outcome);
                 }
@@ -226,7 +226,7 @@ impl Platform for PlatformBackend {
             // to (invisible on the screen it moved onto).
             b.scene.wake_for_damage();
         } else {
-            match b.platform.cursor_plane_move(cx, cy, hot_x, hot_y) {
+            match b.platform.cursor_plane_move(cx, cy) {
                 Ok(outcome) => {
                     b.handle_cursor_move_outcome(outcome);
                 }

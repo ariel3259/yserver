@@ -240,13 +240,6 @@ pub(in crate::kms::render::backend) struct DirectPresentFrame {
     pub(in crate::kms::render::backend) async_outcome: crate::drm::async_flip::AsyncOutcome,
 }
 
-pub(in crate::kms::render::backend) type DirectFrameSubmitter =
-    fn(
-        &mut KmsBackend,
-        &mut DirectPresentFrame,
-        crate::drm::async_flip::FlipTiming,
-    ) -> io::Result<crate::drm::async_flip::AsyncOutcome>;
-
 /// Require a short stable run before entering direct ownership. Compositors
 /// such as E27 alternate full-root Presents with authoritative region-limited
 /// Presents; entering on every eligible member of that stream otherwise
@@ -830,11 +823,15 @@ pub struct KmsBackendState {
     pub(in crate::kms::render::backend) scanout_m0: ScanoutM0Telemetry,
     pub(in crate::kms::render::backend) scanout_m1: ScanoutM1ProbeCache,
     pub(in crate::kms::render::backend) scanout_m2: ScanoutM2State,
+    /// Newest direct-scanout cursor record whose pool upload was deferred.
+    /// Retried only from Backend scheduling, while the direct frame remains
+    /// authoritative.
+    pub(in crate::kms::render::backend) deferred_direct_cursor:
+        Option<std::sync::Arc<crate::kms::render::cursor::CursorRecord>>,
     pub(in crate::kms::render::backend) tearing: Tearing,
     /// Monotonic clock for KMS cursor-composition pacing.
     pub(in crate::kms::render::backend) monotonic_clock:
         std::rc::Rc<dyn Fn() -> std::time::Instant>,
-    pub(in crate::kms::render::backend) direct_frame_submitter: DirectFrameSubmitter,
     pub(in crate::kms::render::backend) vt_resume_executor:
         std::rc::Rc<dyn super::session::VtResumeExecutor>,
 
@@ -974,11 +971,6 @@ pub struct KmsBackendState {
     /// Invalidates results across any topology quiesce or VT event, including
     /// an ABA transition which happens to restore the same final layout.
     pub(in crate::kms::render::backend) crtc_config_topology_epoch: u64,
-    /// Test-only discovery result used to exercise the real `begin` hook with
-    /// the fd-less DRM fixture. Production always performs live discovery.
-    #[cfg(test)]
-    pub(in crate::kms::render::backend) crtc_config_discovery_override:
-        Option<crate::platform::drm::Output>,
     /// Direct-mode input-thread control channel. Used by VT release /
     /// acquire to pause and resume the dedicated input thread.
     pub(in crate::kms::render::backend) input_thread_control:

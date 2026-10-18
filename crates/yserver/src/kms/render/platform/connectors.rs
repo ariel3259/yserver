@@ -25,6 +25,65 @@ use std::{
     sync::Arc,
 };
 
+pub(crate) trait ConnectorSnapshotIo {
+    fn probe(&self, devices: &[KmsDevice]) -> io::Result<Vec<ConnectorSnapshot>>;
+}
+
+pub(crate) struct DrmConnectorSnapshotIo;
+
+impl ConnectorSnapshotIo for DrmConnectorSnapshotIo {
+    fn probe(&self, devices: &[KmsDevice]) -> io::Result<Vec<ConnectorSnapshot>> {
+        let mut snapshot = Vec::new();
+        for device in devices {
+            let probes = crate::platform::drm::probe_connector_snapshots(&device.device).map_err(
+                |error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!(
+                            "probe connector snapshot on DRM device {}: {error}",
+                            device.key
+                        ),
+                    )
+                },
+            )?;
+            snapshot.extend(
+                probes
+                    .iter()
+                    .map(|probe| ConnectorSnapshot::from_probe(device.key, probe)),
+            );
+        }
+        Ok(snapshot)
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) struct RecordingConnectorSnapshotIo {
+    queued: std::cell::RefCell<std::collections::VecDeque<io::Result<Vec<ConnectorSnapshot>>>>,
+}
+
+impl RecordingConnectorSnapshotIo {
+    #[allow(dead_code)]
+    pub(crate) fn new() -> Self {
+        Self {
+            queued: std::cell::RefCell::new(std::collections::VecDeque::new()),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn queue_snapshot(&self, snapshot: Vec<ConnectorSnapshot>) {
+        self.queued.borrow_mut().push_back(Ok(snapshot));
+    }
+}
+
+impl ConnectorSnapshotIo for RecordingConnectorSnapshotIo {
+    fn probe(&self, _devices: &[KmsDevice]) -> io::Result<Vec<ConnectorSnapshot>> {
+        self.queued
+            .borrow_mut()
+            .pop_front()
+            .unwrap_or_else(|| Err(io::Error::from_raw_os_error(libc::ENOTTY)))
+    }
+}
+
 pub(super) fn scanout_pool_needs_reallocation(
     existing: Option<&ActiveOutput>,
     existing_pool_route: Option<ScanoutRoute>,
@@ -169,26 +228,10 @@ impl PlatformBackend {
     /// quiesce GPU/page-flip/direct work only after every device probe has
     /// succeeded, and before applying removals.
     pub(crate) fn probe_connector_snapshot(&self) -> io::Result<Vec<ConnectorSnapshot>> {
-        let mut snapshot = Vec::new();
-        for device in &self.devices {
-            let probes = crate::platform::drm::probe_connector_snapshots(&device.device).map_err(
-                |error| {
-                    io::Error::new(
-                        error.kind(),
-                        format!(
-                            "probe connector snapshot on DRM device {}: {error}",
-                            device.key
-                        ),
-                    )
-                },
-            )?;
-            snapshot.extend(
-                probes
-                    .iter()
-                    .map(|probe| ConnectorSnapshot::from_probe(device.key, probe)),
-            );
+        if self.devices.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(snapshot)
+        self.services.connector_snapshot.probe(&self.devices)
     }
 
     /// Disable a single connector: issue a DRM `disable_output` for the
@@ -219,10 +262,19 @@ impl PlatformBackend {
         );
 
         // DRM disable (ALLOW_MODESET atomic commit zeroing the CRTC).
-        if let Err(e) = crate::drm::modeset::disable_output(&device, &self.outputs[idx].output) {
+        let cursor_detach = self.cursor_plane_detach_for_output(idx);
+        if let Err(e) = crate::drm::modeset::disable_output_with_cursor_executor(
+            &device,
+            &self.outputs[idx].output,
+            cursor_detach,
+            self.services.atomic.as_ref(),
+        ) {
             log::error!("render disable_connector: disable_output({connector}) failed: {e}");
+            self.quarantine_cursor_output(idx);
             return Err(e);
         }
+
+        self.accept_cursor_lifecycle_detach(idx);
 
         self.remove_connector_at(idx);
 
@@ -252,6 +304,10 @@ impl PlatformBackend {
 
     pub(super) fn remove_connector_at(&mut self, idx: usize) {
         let output_key = self.outputs[idx].key.clone();
+        self.active_cursor_crtcs
+            .remove(&crate::kms::render::platform::CrtcKey::for_output(
+                &self.outputs[idx],
+            ));
         let changed_device = self.outputs[idx].key.device_key;
         self.cancel_scanout_render_completions_for_output(&output_key);
         if let Err(error) = self.drain_scanout_pool_at(idx) {
@@ -423,13 +479,21 @@ impl PlatformBackend {
         x: i32,
         y: i32,
     ) -> io::Result<()> {
+        let cursor_factory = Rc::clone(&self.services.cursor_plane_factory);
         self.enable_connector_with_cursor_factory(
             output_key,
             output,
             mode_spec,
             x,
             y,
-            initialize_cursor_plane_for_device,
+            move |device, crtcs, boundary| {
+                initialize_cursor_plane_for_device(
+                    device,
+                    crtcs,
+                    boundary,
+                    cursor_factory.as_ref(),
+                );
+            },
         )
     }
 
@@ -498,6 +562,7 @@ impl PlatformBackend {
         let pool = match qualified {
             qualified @ QualifiedScanoutPlan::Shared(_) => {
                 match replay_copy_free_scanout_plan(
+                    &self.services.modeset(),
                     vk,
                     device,
                     &output,
@@ -540,6 +605,7 @@ impl PlatformBackend {
                     RenderKmsRelationship::Same,
                 );
                 match replay_copied_scanout_plan(
+                    &self.services.modeset(),
                     vk,
                     sink_vk,
                     device,
@@ -602,6 +668,7 @@ impl PlatformBackend {
             scanout_route,
             pool,
         } = prepared;
+        let cursor_factory = Rc::clone(&self.services.cursor_plane_factory);
         self.enable_connector_inner(
             &output_key,
             output,
@@ -609,7 +676,14 @@ impl PlatformBackend {
             x,
             y,
             Some((scanout_route, pool)),
-            initialize_cursor_plane_for_device,
+            move |device, crtcs, boundary| {
+                initialize_cursor_plane_for_device(
+                    device,
+                    crtcs,
+                    boundary,
+                    cursor_factory.as_ref(),
+                );
+            },
         )
     }
 
@@ -651,6 +725,8 @@ impl PlatformBackend {
             existing_idx,
             needs_pool_realloc,
         } = resolved;
+        let cursor_key =
+            crate::kms::render::platform::CrtcKey::new(output_key.device_key, output.crtc);
         let w = mode_spec.width;
         let h = mode_spec.height;
 
@@ -686,6 +762,7 @@ impl PlatformBackend {
                 let allocation: io::Result<OutputScanout> =
                     if route_requires_copy_free_probe(scanout_route) {
                         match allocate_copy_free_scanout_pool(
+                            &self.services.modeset(),
                             Arc::clone(&vk),
                             Rc::clone(&device),
                             &output,
@@ -717,6 +794,7 @@ impl PlatformBackend {
                                             RenderKmsRelationship::Same,
                                         );
                                         allocate_copied_scanout_pool(
+                                            &self.services.modeset(),
                                             Arc::clone(&vk),
                                             sink_vk,
                                             Rc::clone(&device),
@@ -824,6 +902,7 @@ impl PlatformBackend {
                         .and_then(|bo| bo.fb_handle)
                         .or_else(|| pool.bos.iter().find_map(|bo| bo.fb_handle))
                 })
+                .or_else(|| self.output_power_executor.fallback_modeset_framebuffer())
                 .ok_or_else(|| {
                     io::Error::other(format!(
                         "enable_connector {connector}: no fb handle available for initial modeset"
@@ -833,7 +912,9 @@ impl PlatformBackend {
 
         // Commit the modeset.  On failure, pool is freed (dropped below).
         if new_pool_committed_framebuffer.is_none()
-            && let Err(e) = crate::drm::modeset::commit_modeset(&device, &output, fb_for_commit)
+            && let Err(e) =
+                self.output_power_executor
+                    .enable(&device, &output, fb_for_commit, &self.services)
         {
             log::error!(
                 "render enable_connector: commit_modeset for {connector} ({}×{}@{}) at ({x},{y}) failed: {e}",
@@ -844,6 +925,8 @@ impl PlatformBackend {
             // new_pool dropped here (freed on stack unwind).
             return Err(e);
         }
+        self.invalidate_cursor_applied(cursor_key);
+        self.active_cursor_crtcs.insert(cursor_key);
 
         // A synchronous modeset has already latched this framebuffer; unlike
         // an ordinary page flip no completion event will promote it from
@@ -1094,7 +1177,7 @@ impl PlatformBackend {
         rescan.dropped_keys.sort();
         rescan.dropped_keys.dedup();
         rescan.dropped_old_indices.sort_unstable_by(|a, b| b.cmp(a));
-        let cursor_changed_devices: HashSet<_> = rescan
+        let mut cursor_changed_devices: HashSet<_> = rescan
             .dropped_old_indices
             .iter()
             .filter_map(|idx| self.outputs.get(*idx))
@@ -1102,6 +1185,10 @@ impl PlatformBackend {
             .collect();
         for idx in rescan.dropped_old_indices.iter().copied() {
             let dropped_key = self.outputs[idx].key.clone();
+            self.active_cursor_crtcs
+                .remove(&crate::kms::render::platform::CrtcKey::for_output(
+                    &self.outputs[idx],
+                ));
             rescan.dropped_layouts.push(DroppedRoute {
                 key: dropped_key.clone(),
                 x: self.outputs[idx].x,
@@ -1152,11 +1239,31 @@ impl PlatformBackend {
         // the expensive assignment/scanout allocation if a client enables it.
         rescan.added_count = rescan.added_keys.len();
 
-        if !rescan.dropped_old_indices.is_empty() {
+        for device in &self.devices {
+            let active_crtcs: HashSet<_> = self
+                .outputs
+                .iter()
+                .filter(|output| output.key.device_key == device.key)
+                .map(|output| output.output.crtc)
+                .collect();
+            if active_crtcs != device.cursor.cursor_topology_crtcs
+                || device
+                    .cursor
+                    .plane
+                    .as_ref()
+                    .is_some_and(crate::kms::cursor_plane::CursorPlane::has_pending_topology)
+            {
+                cursor_changed_devices.insert(device.key);
+            }
+        }
+
+        if !rescan.dropped_old_indices.is_empty() || !cursor_changed_devices.is_empty() {
             // Packing and the extent recompute deliberately do NOT happen
             // here. They are layout policy and run in the backend caller,
             // after it has decided which departed routes keep their slot.
-            self.prune_present_clocks_to_live_outputs();
+            if !rescan.dropped_old_indices.is_empty() {
+                self.prune_present_clocks_to_live_outputs();
+            }
             self.refresh_cursor_topology_for_devices(&cursor_changed_devices);
         }
         rescan

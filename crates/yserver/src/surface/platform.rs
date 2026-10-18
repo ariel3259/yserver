@@ -34,9 +34,9 @@ use crate::kms::{
         gpu::{FencePool, GpuCore},
         resize_fault,
         scene::{
-            CursorPlaneSink, CursorShowFailure, FinishOutcome, FlipRetirement, FrameTargetError,
-            OffscreenTarget, OutputLayout, OutputRoute, OutputSink, PreparedOutputs, RecordFrame,
-            RenderCompletion, SceneCompositor, SlotToken,
+            CursorPlaneSink, CursorShowFailure, CursorUploadOutcome, FinishOutcome, FlipRetirement,
+            FrameTargetError, OffscreenTarget, OutputLayout, OutputRoute, OutputSink,
+            PreparedOutputs, RecordFrame, RenderCompletion, SceneCompositor, SlotToken,
         },
     },
     vk::{
@@ -350,27 +350,37 @@ impl CursorPlaneSink for SurfacePlatform {
         self.cursor.shown
     }
 
-    fn uploaded_version(&self, _output_idx: usize) -> Option<u64> {
-        self.cursor.image.as_ref().map(|image| image.version)
+    fn uploaded_image_matches(
+        &self,
+        _output_idx: usize,
+        version: u64,
+        hot_x: u16,
+        hot_y: u16,
+    ) -> bool {
+        self.cursor
+            .image
+            .as_ref()
+            .is_some_and(|image| image.version == version && image.hot == (hot_x, hot_y))
     }
 
     fn upload(
         &mut self,
         _output_idx: usize,
         version: u64,
+        hot_x: u16,
+        hot_y: u16,
         width: u32,
         height: u32,
         bgra_bytes: &[u8],
-    ) -> io::Result<()> {
-        let hot = self.cursor.image.as_ref().map_or((0, 0), |image| image.hot);
+    ) -> io::Result<CursorUploadOutcome> {
         self.cursor.image = Some(CursorImage {
             version,
             width,
             height,
-            hot,
+            hot: (hot_x, hot_y),
             bgra: Arc::from(bgra_bytes),
         });
-        Ok(())
+        Ok(CursorUploadOutcome::Ready)
     }
 
     fn show(
@@ -384,6 +394,7 @@ impl CursorPlaneSink for SurfacePlatform {
         let Some(image) = self.cursor.image.as_mut() else {
             return Err(CursorShowFailure {
                 remains_visible: self.cursor.shown,
+                deferred: false,
                 error: "no cursor image uploaded".into(),
             });
         };

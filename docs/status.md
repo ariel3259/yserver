@@ -33,6 +33,21 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-10-17 atomic-only cursor, sub-plan A (branch `feat/atomic-cursor-only`, spec
+  `specs/2026-10-15-atomic-cursor-only-design.md`, plan `plans/2026-10-15-atomic-cursor-only-a.md`):** the
+  hardware cursor is driven only by atomic commits. KMS devices set UNIVERSAL_PLANES → ATOMIC →
+  CURSOR_PLANE_HOTSPOT; per-CRTC eligibility (virtual drivers need the hotspot cap plus `HOTSPOT_X/Y`, else
+  software cursor). Full-size ARGB sprite framebuffers live in a per-device user-counted pool (2 buffers, up to
+  CRTCs+1); a framebuffer is reused only after the event that replaces its last on-screen, in-flight or staged user,
+  and the hotspot is part of the sprite identity. Cursor state is a full-state intent diffed against accepted
+  state; every commit producer (direct successor, scene, unflip, cursor-only) carries the delta on the #244
+  per-CRTC stream, Async commits carry no cursor properties. Modesets, DPMS, VT/master loss and resume invalidate
+  the comparison state but keep real ownership until a blocking detach and event drain; the first output after
+  headless reapplies gamma. Tests: Backend-driven lavapipe fixtures with recording KMS services (raw cursor ops,
+  atomic commits, mode blobs, flip events). Deferred to sub-plan C hardware validation (C11): real mode-blob
+  growth across modesets, the re-exec qualification worker, hotplug rediscovery; A6 coverage gaps moved to
+  B2/B3/B6/C10. Next: sub-plan B (scene/copied/direct ownership), then C (legacy deletion, hardware).
+
 - **2026-10-15 macOS M3: window, scale, clipboard, bundle (branch `feat/macos-m0`, plan
   `plans/2026-10-14-macos-m3-window.md`):** the X screen follows the window. Resizes are coalesced per frame-clock
   tick (`surface/resize.rs` `ResizeCoalescer`); the root and the output size are separate, so RRSetScreenSize and a

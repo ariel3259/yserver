@@ -411,11 +411,6 @@ impl KmsBackend {
         output_device: &Rc<crate::drm::Device>,
         connector: &str,
     ) -> io::Result<crate::platform::drm::Output> {
-        #[cfg(test)]
-        if let Some(output) = self.pstate.crtc_config_discovery_override.take() {
-            return Ok(output);
-        }
-
         let reserved_routes: Vec<_> = self
             .platform
             .outputs
@@ -431,15 +426,14 @@ impl KmsBackend {
                 )
             })
             .collect();
-        crate::platform::drm::discover_output_for_connector(
-            output_device,
-            connector,
-            &reserved_routes,
-        )
-        .map_err(|error| {
-            log::error!("begin_crtc_config: target discovery for {connector} failed: {error}");
-            error
-        })
+        self.platform
+            .services
+            .crtc_output_discovery
+            .discover(output_device, connector, &reserved_routes)
+            .map_err(|error| {
+                log::error!("begin_crtc_config: target discovery for {connector} failed: {error}");
+                error
+            })
     }
 
     fn stale_crtc_config_probe_reason(&self, pending: &PendingCrtcConfigProbe) -> Option<String> {
@@ -1038,15 +1032,16 @@ impl KmsBackend {
                 })
                 .collect();
             Some(
-                crate::platform::drm::discover_output_for_connector(
-                    &output_device,
-                    connector,
-                    &reserved_routes,
-                )
-                .map_err(|e| {
-                    log::error!("apply_crtc_config: target discovery for {connector} failed: {e}");
-                    e
-                })?,
+                self.platform
+                    .services
+                    .crtc_output_discovery
+                    .discover(&output_device, connector, &reserved_routes)
+                    .map_err(|e| {
+                        log::error!(
+                            "apply_crtc_config: target discovery for {connector} failed: {e}"
+                        );
+                        e
+                    })?,
             )
         } else {
             None
@@ -1071,6 +1066,7 @@ impl KmsBackend {
         // the scene's `pending_acks` is fresh-empty for every output, so
         // the subsequent `wake_for_damage` tick is EBUSY-safe.
         let restore_old_on_failure = self.kms_outputs_active;
+        let had_outputs = !self.platform.outputs.is_empty();
         self.quiesce_before_topology_mutation("RANDR CRTC configuration changed")?;
 
         match mode {
@@ -1204,7 +1200,21 @@ impl KmsBackend {
             self.request_exit();
             return Err(relight.err().unwrap_or(error));
         }
-        self.relight_after_direct_teardown(desired_active, "RANDR CRTC configuration")?;
+        // Enabling the first connector from headless already modeset its
+        // framebuffer in `enable_connector`; there is no prior output set to
+        // restore. Other topology changes disabled existing routes first and
+        // must relight every surviving/new output from its scanout backing.
+        self.relight_after_direct_teardown(
+            desired_active && had_outputs,
+            "RANDR CRTC configuration",
+        )?;
+        if desired_active && !had_outputs {
+            // The connector's first-output modeset already restored scanout,
+            // so avoid a redundant DPMS/modeset cycle. That modeset may reset
+            // the hardware LUT, though; restore the cached RandR gamma state
+            // independently of the composed-output relight.
+            self.reapply_gamma_for_live_outputs();
+        }
         self.kms_outputs_active = desired_active;
 
         // Update input extent (cursor clamp) to reflect new fb size.

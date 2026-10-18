@@ -26,6 +26,9 @@
 
 mod connectors;
 mod cursor;
+pub(crate) mod cursor_commit;
+mod cursor_lifecycle;
+pub(crate) mod cursor_state;
 mod devices;
 pub(crate) mod flip_events;
 mod init;
@@ -33,11 +36,13 @@ mod power;
 mod qualify;
 mod scanout_bos;
 mod scene_sink;
+pub mod services;
 
 #[cfg(test)]
 use connectors::*;
 #[cfg(test)]
 use cursor::*;
+use cursor_state::CursorCrtcState;
 #[cfg(test)]
 use init::*;
 pub(crate) use qualify::*;
@@ -208,21 +213,16 @@ pub(super) struct CursorHideRecovery {
 /// ioctls are device-local, so none of these fields may live at platform scope.
 pub(crate) struct KmsCursorState {
     pub(crate) plane: Option<crate::kms::cursor_plane::CursorPlane>,
+    /// Per-CRTC accepted full cursor state. This is authoritative for
+    /// visibility and framebuffer ownership; legacy plane bookkeeping is not.
+    pub(crate) crtc_states: HashMap<::drm::control::crtc::Handle, CursorCrtcState>,
     pending_move: Option<(i32, i32, u16, u16)>,
     /// Pointer-event timestamp paired with `pending_move` across an EBUSY
     /// retry. Atomic positions carry this timestamp directly.
     pending_move_timestamp: Option<Instant>,
-    /// Latest discovered atomic position for each cursor-visible CRTC. The
-    /// position remains available for every scene commit; the unsent copy is
-    /// consumed only after an accepted commit carries it.
-    atomic_positions:
-        HashMap<::drm::control::crtc::Handle, crate::drm::atomic::CursorPlanePosition>,
-    atomic_pending_moves:
-        HashMap<::drm::control::crtc::Handle, crate::drm::atomic::CursorPlanePosition>,
     /// Accepted cursor-only commits, keyed by CRTC. A cursor-only commit is
     /// in flight only after its atomic ioctl succeeded.
-    atomic_cursor_commits_in_flight:
-        HashMap<::drm::control::crtc::Handle, crate::drm::atomic::CursorPlanePosition>,
+    atomic_cursor_commits_in_flight: HashMap<::drm::control::crtc::Handle, ()>,
     /// A cursor-only EBUSY proves another commit is pending on this CRTC.
     /// Keep the latest position unsent until that CRTC's next flip event.
     cursor_retry_waits_for_flip: HashSet<::drm::control::crtc::Handle>,
@@ -238,11 +238,10 @@ pub(crate) struct KmsCursorState {
     /// cursor-plane construction. Only a successful explicit RANDR enable may
     /// consume this state; connected-Off probes and ordinary frames cannot.
     headless_deferred: bool,
-    topology_blocked: bool,
     transient_fallback_crtcs: HashMap<::drm::control::crtc::Handle, TransientCursorFallback>,
-    /// Capability-selected atomic position path for this device's active
-    /// CRTC topology.
-    pub(crate) atomic_cursor: bool,
+    /// Epoch of the last actual cursor-plane or active-CRTC topology change.
+    pub(crate) cursor_topology_epoch: u64,
+    pub(super) cursor_topology_crtcs: HashSet<::drm::control::crtc::Handle>,
     sprite_signature: Option<(u16, u16, u16, u16)>,
 }
 
@@ -397,6 +396,8 @@ pub(crate) struct KmsDevice {
     pub(crate) async_page_flip: bool,
     pub(crate) atomic_commit_sink: Rc<crate::drm::atomic::AtomicCommitSink>,
     pub(crate) page_flip_event_source: Rc<dyn flip_events::PageFlipEventSource>,
+    pub(crate) cursor_buffer_io: Rc<dyn crate::kms::cursor_plane::ops::CursorBufferIo>,
+    pub(crate) legacy_cursor_io: Rc<dyn crate::kms::cursor_plane::ops::LegacyCursorIo>,
     #[cfg(test)]
     pub(crate) test_page_flip_event_source: Option<Rc<flip_events::RecordingPageFlipEventSource>>,
     pub(crate) cursor: KmsCursorState,
@@ -432,6 +433,7 @@ pub struct PlatformBackend {
     initial_scanout_rollback_armed: bool,
     // DRM / output side
     pub(crate) devices: Vec<KmsDevice>,
+    pub(crate) services: services::KmsServices,
     /// Shared tearing state used by per-device commit telemetry and the
     /// composed scene submit path.
     pub(crate) tearing_on: bool,
@@ -450,6 +452,9 @@ pub struct PlatformBackend {
     pub(crate) render_devices: Vec<RenderDevice>,
     pub(crate) selected_render_device: Option<RenderDeviceId>,
     pub(crate) outputs: Vec<ActiveOutput>,
+    /// CRTCs whose most recent blocking modeset/enable succeeded. Cursor
+    /// atomic submissions are rejected for routes whose wake failed.
+    pub(crate) active_cursor_crtcs: HashSet<CrtcKey>,
     pub(crate) fb_w: u16,
     pub(crate) fb_h: u16,
     /// Non-identity current CRTC transforms (RANDR `SetCrtcTransform`),
@@ -506,8 +511,6 @@ pub struct PlatformBackend {
 
     // Input side
     input_ctx: Option<crate::input::SendContext>,
-    #[cfg(target_os = "linux")]
-    pub(crate) hotplug_monitor: Option<crate::kms::hotplug::DrmHotplugMonitor>,
 
     /// Stage 5 Task 6.1: inner poll FD aggregating per-batch
     /// sync_file FDs for deferred PRESENT completion. Exposed via

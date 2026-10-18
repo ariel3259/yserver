@@ -527,6 +527,13 @@ fn test_kms_device(key: crate::platform::drm::DrmDeviceKey) -> KmsDevice {
             crate::drm::atomic::DrmAtomicCommitExecutor,
         ))),
         page_flip_event_source: Rc::new(flip_events::DrmPageFlipEventSource),
+        cursor_buffer_io: {
+            let (io, _) = crate::kms::cursor_plane::ops::RecordingCursorBufferIo::new(256);
+            Rc::new(io)
+        },
+        legacy_cursor_io: Rc::new(
+            crate::kms::cursor_plane::ops::RecordingLegacyCursorIo::default(),
+        ),
         test_page_flip_event_source: None,
         cursor: KmsCursorState::new(),
     }
@@ -673,8 +680,13 @@ fn install_test_cursor_plane(
     crtcs: &[::drm::control::crtc::Handle],
     boundary: &str,
 ) {
-    let plane =
-        crate::kms::cursor_plane::CursorPlane::for_tests_stub(Rc::clone(&device.device), 64, 64);
+    let plane = crate::kms::cursor_plane::CursorPlane::for_tests_with_ops(
+        Rc::clone(&device.device),
+        crtcs,
+        Rc::clone(&device.cursor_buffer_io),
+        Rc::clone(&device.legacy_cursor_io),
+    )
+    .expect("synthetic plane discovery and allocation");
     install_cursor_plane_for_device(device, crtcs, boundary, plane);
 }
 
@@ -1118,6 +1130,8 @@ fn cursor_route_qualifies_colliding_raw_crtcs_by_device() {
             crate::drm::atomic::DrmAtomicCommitExecutor,
         ))),
         page_flip_event_source: Rc::new(flip_events::DrmPageFlipEventSource),
+        cursor_buffer_io: Rc::new(crate::kms::cursor_plane::ops::DrmCursorBufferIo),
+        legacy_cursor_io: Rc::new(crate::kms::cursor_plane::ops::DrmLegacyCursorIo),
         test_page_flip_event_source: None,
         cursor: KmsCursorState::new(),
     });
@@ -1144,6 +1158,8 @@ fn drm_device_fd_lookup_distinguishes_same_kind_poll_sources() {
             crate::drm::atomic::DrmAtomicCommitExecutor,
         ))),
         page_flip_event_source: Rc::new(flip_events::DrmPageFlipEventSource),
+        cursor_buffer_io: Rc::new(crate::kms::cursor_plane::ops::DrmCursorBufferIo),
+        legacy_cursor_io: Rc::new(crate::kms::cursor_plane::ops::DrmLegacyCursorIo),
         test_page_flip_event_source: None,
         cursor: KmsCursorState::new(),
     });
@@ -1457,7 +1473,7 @@ fn primary_first_explicit_enable_initializes_and_exposes_fresh_upload_state() {
 
     let bytes = vec![0_u8; 16 * 16 * 4];
     platform
-        .cursor_plane_upload_image_for_output(0, 7, 16, 16, &bytes)
+        .cursor_plane_upload_image_for_output(0, 7, 0, 0, 16, 16, &bytes)
         .expect("fresh lazy plane accepts its first retire-time upload");
     assert_eq!(
         platform.cursor_plane_uploaded_version_for_output(0),
@@ -1624,7 +1640,7 @@ fn initialized_cursor_plane_persists_but_reuploads_across_last_disable_and_reena
         install_test_cursor_plane,
     ));
     platform
-        .cursor_plane_upload_image_for_output(0, 9, 16, 16, &[0_u8; 16 * 16 * 4])
+        .cursor_plane_upload_image_for_output(0, 9, 0, 0, 16, 16, &[0_u8; 16 * 16 * 4])
         .unwrap();
     assert_eq!(
         platform.devices[0]
@@ -1668,7 +1684,7 @@ fn initialized_cursor_plane_persists_but_reuploads_across_last_disable_and_reena
     assert!(platform.cursor_plane_available_for_output(0));
     assert_eq!(platform.cursor_plane_uploaded_version_for_output(0), None);
     platform
-        .cursor_plane_upload_image_for_output(0, 10, 16, 16, &[0_u8; 16 * 16 * 4])
+        .cursor_plane_upload_image_for_output(0, 10, 0, 0, 16, 16, &[0_u8; 16 * 16 * 4])
         .expect("first retirement after re-enable refreshes retained storage");
     assert_eq!(
         platform.cursor_plane_uploaded_version_for_output(0),
@@ -1720,33 +1736,6 @@ fn connected_off_probe_and_zero_card_do_not_run_deferred_factory() {
 fn cursor_capacity_is_evaluated_per_card() {
     assert!(cursor_dimensions_fit(128, 128, 96, 96));
     assert!(!cursor_dimensions_fit(64, 64, 96, 96));
-}
-
-#[test]
-fn cursor_plane_without_atomic_position_properties_keeps_the_legacy_path() {
-    let mut platform = PlatformBackend::for_tests();
-    let crtc = platform.outputs[0].output.crtc;
-    install_test_cursor_plane(&mut platform.devices[0], &[crtc], "legacy path test");
-
-    assert!(!platform.devices[0].cursor.atomic_cursor);
-    assert!(!platform.devices[0].cursor.topology_blocked);
-    assert!(platform.devices[0].cursor.plane.is_some());
-    assert!(platform.cursor_plane_available_for_output(0));
-
-    platform.devices[0]
-        .cursor
-        .plane
-        .as_mut()
-        .expect("installed cursor plane")
-        .for_tests_set_atomic_position_properties(
-            crtc,
-            ::drm::control::from_u32(21).unwrap(),
-            ::drm::control::from_u32(31).unwrap(),
-            ::drm::control::from_u32(32).unwrap(),
-        );
-    let device_key = platform.devices[0].key;
-    platform.refresh_cursor_topology_for_devices(&HashSet::from([device_key]));
-    assert!(platform.devices[0].cursor.atomic_cursor);
 }
 
 #[test]
@@ -1957,7 +1946,7 @@ fn cursor_pending_move_starts_empty_and_unavailable_path_does_not_set_it() {
     let mut p = PlatformBackend::for_tests();
     assert_eq!(p.devices[0].cursor.pending_move, None);
     // Unavailable plane → Err return → pending stays None.
-    assert!(p.cursor_plane_move(100, 200, 0, 0).is_err());
+    assert!(p.cursor_plane_move(100, 200).is_err());
     assert_eq!(p.devices[0].cursor.pending_move, None);
     // Drain on empty slot is Ok(0) (early-exit before any
     // plane access). The path that returns Err is only the

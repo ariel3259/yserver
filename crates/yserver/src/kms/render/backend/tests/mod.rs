@@ -1,4 +1,5 @@
 mod atomic_cursor;
+mod atomic_cursor_only;
 mod crossings;
 mod cursor;
 mod deadlines;
@@ -137,18 +138,6 @@ impl crate::kms::cursor_plane::CursorShowExecutor for RecordingCursorShowExecuto
     }
 }
 
-pub(crate) fn install_recording_cursor_hide_executor(
-    backend: &mut KmsBackend,
-    device_idx: usize,
-    executor: Rc<RecordingCursorHideExecutor>,
-) {
-    backend.platform.devices[device_idx]
-        .cursor
-        .plane
-        .as_mut()
-        .expect("test cursor plane is installed")
-        .for_tests_set_hide_executor(executor);
-}
 use yserver_core::{
     backend::{Backend, CrtcConfigApply, CrtcConfigToken, Dri3Caps, ModeSpec},
     core_loop::{CoreSender, Message},
@@ -195,6 +184,8 @@ fn push_test_device(backend: &mut KmsBackend, key: DrmDeviceKey) {
             page_flip_event_source: std::rc::Rc::new(
                 crate::kms::render::platform::flip_events::DrmPageFlipEventSource,
             ),
+            cursor_buffer_io: std::rc::Rc::new(crate::kms::cursor_plane::ops::DrmCursorBufferIo),
+            legacy_cursor_io: std::rc::Rc::new(crate::kms::cursor_plane::ops::DrmLegacyCursorIo),
             test_page_flip_event_source: None,
             cursor: crate::kms::render::platform::KmsCursorState::new(),
         });
@@ -1106,7 +1097,7 @@ pub(super) fn push_test_output(b: &mut crate::kms::render::backend::KmsBackend, 
         .platform
         .scanout_route_for_kms(device_key)
         .expect("test fixture has a scanout route");
-    b.platform.outputs.push(ActiveOutput::new(
+    let active = ActiveOutput::new(
         scanout_route,
         crate::platform::drm::Output {
             connector: ::drm::control::from_u32(crtc_id).unwrap(),
@@ -1153,7 +1144,11 @@ pub(super) fn push_test_output(b: &mut crate::kms::render::backend::KmsBackend, 
         crate::drm::Swapchain::empty_for_tests(),
         800,
         0,
-    ));
+    );
+    b.platform
+        .active_cursor_crtcs
+        .insert(crate::kms::render::platform::CrtcKey::for_output(&active));
+    b.platform.outputs.push(active);
 }
 
 pub(super) fn install_direct_frame_for_target_test(

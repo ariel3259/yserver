@@ -8,9 +8,9 @@ use crate::kms::{
         gpu::GpuCore,
         platform::PlatformBackend,
         scene::{
-            ComposeRenderTarget, ComposeSubmit, CursorPlaneSink, CursorShowFailure, FinishOutcome,
-            FlipRetirement, FrameHandoff, FrameTargetError, OutputRoute, OutputSink, RecordFrame,
-            RenderCompletion, SlotToken,
+            ComposeRenderTarget, ComposeSubmit, CursorPlaneSink, CursorShowFailure,
+            CursorUploadOutcome, FinishOutcome, FlipRetirement, FrameHandoff, FrameTargetError,
+            OutputRoute, OutputSink, RecordFrame, RenderCompletion, SlotToken,
         },
     },
     vk::{
@@ -20,6 +20,13 @@ use crate::kms::{
 };
 use ash::vk;
 use std::{io, os::fd::OwnedFd, rc::Rc};
+
+impl PlatformBackend {
+    #[cfg(test)]
+    pub(crate) fn for_tests_pending_scanout_render_completion_count(&self) -> usize {
+        self.pending_scanout_render_completions.len()
+    }
+}
 
 impl OutputSink for PlatformBackend {
     fn gpu(&self) -> &GpuCore {
@@ -111,35 +118,64 @@ impl OutputSink for PlatformBackend {
                 format!("no atomic commit sink for output {output_key:?}"),
             )));
         };
-        let cursor_positions = self.cursor_plane_atomic_positions_for_outputs(&[output_idx]);
         let timing = self
             .scene_flip_timings
             .get(output_idx)
             .copied()
             .flatten()
             .unwrap_or(self.requested_flip_timing);
+        let shared_route = self
+            .scanout_pools
+            .get(output_idx)
+            .and_then(Option::as_ref)
+            .is_some_and(|pool| matches!(pool, OutputScanout::Shared(_)));
+        let target_slot_exists = self
+            .scanout_pools
+            .get(output_idx)
+            .and_then(Option::as_ref)
+            .is_some_and(|pool| match pool {
+                OutputScanout::Shared(pool) => pool.bos.get(bo_idx).is_some(),
+                OutputScanout::Copied(pool) => {
+                    pool.sources.get(bo_idx).is_some()
+                        && pool.destinations.bos.get(bo_idx).is_some()
+                }
+            });
+        if !target_slot_exists {
+            return FinishOutcome::Unavailable(FrameTargetError::NoSlot);
+        }
+        // Async requests are cursorless by construction. Do not prepare or
+        // reserve a cursor delta that an Async EINVAL fallback could later
+        // accidentally settle as accepted.
+        let cursor_updates = if shared_route && timing == crate::drm::async_flip::FlipTiming::Vsync
+        {
+            self.cursor_plane_updates_for_primary_outputs(&[output_idx])
+        } else {
+            Vec::new()
+        };
+        if let Err(error) = self.reserve_cursor_plane_updates(&cursor_updates) {
+            return FinishOutcome::Unavailable(FrameTargetError::NoDevice(error));
+        }
         let async_ledger = &mut self.async_ledger;
         let tearing_context = crate::drm::atomic::TearingCommitContext::composed(
             self.tearing_copy_received_at,
             self.tearing_copy_received_monotonic,
         );
-        let Some(pool) = self
+        let pool = self
             .scanout_pools
             .get_mut(output_idx)
             .and_then(Option::as_mut)
-        else {
-            return FinishOutcome::Unavailable(FrameTargetError::NoSlot);
-        };
+            .expect("scanout pool was checked before cursor reservation");
         let output = &self.outputs[output_idx].output;
         let mut shared_cursor_commit_submitted = false;
-        let mut cursor_rejection_error = None;
+        let mut cursor_rejection_error: Option<io::Error> = None;
         let mut async_outcome = None;
         let outcome = match pool {
             OutputScanout::Shared(pool) => {
                 let allocation_plan = pool.allocation_plan;
-                let Some(bo) = pool.bos.get_mut(bo_idx) else {
-                    return FinishOutcome::Unavailable(FrameTargetError::NoSlot);
-                };
+                let bo = pool
+                    .bos
+                    .get_mut(bo_idx)
+                    .expect("shared scanout slot was checked before cursor reservation");
                 let submitted = submit_shared_scanout_frame(
                     &drm_device,
                     atomic_commit_sink.as_ref(),
@@ -147,7 +183,7 @@ impl OutputSink for PlatformBackend {
                     allocation_plan,
                     bo,
                     record,
-                    &cursor_positions,
+                    &cursor_updates,
                     async_ledger,
                     timing,
                     tearing_context,
@@ -155,7 +191,10 @@ impl OutputSink for PlatformBackend {
                 if let Err(error) = &submitted
                     && atomic_commit_sink.take_last_cursor_rejection()
                 {
-                    cursor_rejection_error = Some(error.to_string());
+                    cursor_rejection_error = Some(match error {
+                        PresentError::Io(error) => io::Error::new(error.kind(), error.to_string()),
+                        error => io::Error::other(error.to_string()),
+                    });
                 }
                 if let Ok((_, result)) = &submitted {
                     async_outcome = Some(*result);
@@ -172,12 +211,15 @@ impl OutputSink for PlatformBackend {
             }
             OutputScanout::Copied(pool) => {
                 debug_assert!(timing == crate::drm::async_flip::FlipTiming::Vsync);
-                let Some(source) = pool.sources.get_mut(bo_idx) else {
-                    return FinishOutcome::Unavailable(FrameTargetError::NoSlot);
-                };
-                let Some(destination) = pool.destinations.bos.get_mut(bo_idx) else {
-                    return FinishOutcome::Unavailable(FrameTargetError::NoSlot);
-                };
+                let source = pool
+                    .sources
+                    .get_mut(bo_idx)
+                    .expect("copied source slot was checked before cursor reservation");
+                let destination = pool
+                    .destinations
+                    .bos
+                    .get_mut(bo_idx)
+                    .expect("copied destination was checked before cursor reservation");
                 let result = submit_copied_scanout_render(source, &mut destination.state, record);
                 let fail_stop = result
                     .as_ref()
@@ -204,12 +246,14 @@ impl OutputSink for PlatformBackend {
                 self.tearing_copy_received_monotonic = None;
             }
         }
-        if shared_cursor_commit_submitted {
-            self.cursor_plane_scene_commit_submitted(&cursor_positions);
-        }
         if let Some(error) = cursor_rejection_error {
-            let rejected = self.reject_atomic_cursor_commit(&cursor_positions, &error);
+            let rejected = self.reject_atomic_cursor_commit(&cursor_updates, &error);
             self.defer_cursor_move_outcome(rejected);
+        } else if shared_cursor_commit_submitted {
+            self.cursor_plane_scene_commit_submitted(&cursor_updates)
+                .expect("accepted shared scene commit keeps its reserved cursor leases");
+        } else {
+            self.reject_cursor_plane_update_reservations(&cursor_updates);
         }
         outcome
     }
@@ -345,19 +389,29 @@ impl CursorPlaneSink for PlatformBackend {
         self.cursor_plane_visible_for_output(output_idx)
     }
 
-    fn uploaded_version(&self, output_idx: usize) -> Option<u64> {
-        self.cursor_plane_uploaded_version_for_output(output_idx)
+    fn uploaded_image_matches(
+        &self,
+        output_idx: usize,
+        version: u64,
+        hot_x: u16,
+        hot_y: u16,
+    ) -> bool {
+        self.cursor_plane_uploaded_image_matches_for_output(output_idx, version, hot_x, hot_y)
     }
 
     fn upload(
         &mut self,
         output_idx: usize,
         version: u64,
+        hot_x: u16,
+        hot_y: u16,
         width: u32,
         height: u32,
         bgra_bytes: &[u8],
-    ) -> io::Result<()> {
-        self.cursor_plane_upload_image_for_output(output_idx, version, width, height, bgra_bytes)
+    ) -> io::Result<CursorUploadOutcome> {
+        self.cursor_plane_upload_image_for_output(
+            output_idx, version, hot_x, hot_y, width, height, bgra_bytes,
+        )
     }
 
     fn show(
@@ -371,6 +425,7 @@ impl CursorPlaneSink for PlatformBackend {
         self.cursor_plane_show_on_crtc(output_idx, hot_x, hot_y, x, y)
             .map_err(|error| CursorShowFailure {
                 remains_visible: error.remains_visible(),
+                deferred: error.is_deferred(),
                 error: Box::new(error),
             })
     }
@@ -560,7 +615,7 @@ fn submit_shared_scanout_frame(
     allocation_plan: crate::kms::vk::scanout::ScanoutAllocationPlan,
     bo: &mut ScanoutBo,
     record: &mut RecordFrame<'_>,
-    cursor_positions: &[crate::drm::atomic::CursorPlanePosition],
+    cursor_updates: &[crate::kms::render::platform::cursor_state::CursorPlaneUpdate],
     async_ledger: &mut crate::drm::async_flip::AsyncFlipLedger,
     timing: crate::drm::async_flip::FlipTiming,
     tearing_context: crate::drm::atomic::TearingCommitContext,
@@ -600,7 +655,7 @@ fn submit_shared_scanout_frame(
         fb_handle,
         fd,
         &mut out_fence,
-        cursor_positions,
+        cursor_updates,
         attempt_timing,
         tearing_context,
     );
@@ -626,7 +681,7 @@ fn submit_shared_scanout_frame(
                     fb_handle,
                     retry_fd,
                     &mut out_fence,
-                    cursor_positions,
+                    cursor_updates,
                     crate::drm::async_flip::FlipTiming::Vsync,
                     crate::drm::atomic::TearingCommitContext {
                         async_fallback: true,
