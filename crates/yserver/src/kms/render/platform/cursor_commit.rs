@@ -30,6 +30,42 @@ pub(crate) fn accepted_cursor_only_receipt(visible: bool) -> CursorCommitReceipt
     }
 }
 
+/// Receipt for an accepted explicit detach that ends hardware ownership. The
+/// output now paints the software cursor, so the scene must recompose.
+pub(crate) fn accepted_detach_receipt() -> CursorCommitReceipt {
+    CursorCommitReceipt {
+        frame: None,
+        mode: CursorAcceptedMode::Software,
+        primary_cursor: CursorPrimaryContent::Cursorless,
+        needs_recompose: true,
+    }
+}
+
+/// The explicit detach, `FB_ID=0` and `CRTC_ID=0`, whatever the applied state:
+/// a refused attach leaves the kernel binding unknown to userspace.
+pub(crate) fn prepare_detach_commit(
+    properties: CursorPlaneProperties,
+    applied: Option<CursorBinding>,
+) -> PreparedCursorCommit {
+    let object = properties.plane.into();
+    PreparedCursorCommit {
+        prior: applied,
+        next: None,
+        updates: vec![
+            CursorPropertyUpdate {
+                object,
+                property: properties.fb_id,
+                value: 0,
+            },
+            CursorPropertyUpdate {
+                object,
+                property: properties.crtc_id,
+                value: 0,
+            },
+        ],
+    }
+}
+
 pub(crate) fn prepare_cursor_commit(
     properties: CursorPlaneProperties,
     crtc: ::drm::control::crtc::Handle,

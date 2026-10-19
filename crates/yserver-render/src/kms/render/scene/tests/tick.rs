@@ -70,9 +70,9 @@ fn copied_completion_requires_exact_job_and_paired_bo() {
 #[test]
 fn copied_frame_cannot_retire_before_sink_kms_submission() {
     let waiting = InFlightStage::WaitingForRenderCompletion { job_id: 7 };
-    assert!(!kms_retirement_matches(waiting, 1, 1));
+    assert!(!kms_retirement_matches(waiting, 1, 1, Some(9)));
     assert!(!copied_render_completion_matches(
-        InFlightStage::KmsFlipPending,
+        InFlightStage::KmsFlipPending { event_id: Some(9) },
         1,
         7,
         1,
@@ -81,8 +81,11 @@ fn copied_frame_cannot_retire_before_sink_kms_submission() {
 
 #[test]
 fn kms_retirement_requires_the_exact_paired_bo() {
-    assert!(kms_retirement_matches(InFlightStage::KmsFlipPending, 1, 1,));
-    assert!(!kms_retirement_matches(InFlightStage::KmsFlipPending, 1, 2,));
+    let pending = InFlightStage::KmsFlipPending { event_id: Some(9) };
+    assert!(kms_retirement_matches(pending, 1, 1, Some(9)));
+    assert!(!kms_retirement_matches(pending, 1, 1, Some(10)));
+    assert!(!kms_retirement_matches(pending, 1, 2, Some(9)));
+    assert!(!kms_retirement_matches(pending, 1, 1, None));
 }
 
 #[test]

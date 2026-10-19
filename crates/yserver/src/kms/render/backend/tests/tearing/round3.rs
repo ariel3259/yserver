@@ -16,6 +16,13 @@ fn tearing_on_render_failure_keeps_hw_until_teardown() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutations: accept SW pixels after both detach attempts reject, enable Async while HW remains bound, reuse SW metadata for the cursorless replacement, or keep drawing SW cursor pixels while marking the replacement cursorless.
+pub(super) fn tearing_direct_handoff_rejected_detach_keeps_cursorless_vsync() {
+    run_entry_with_rejected_detach_keeps_hw_cursorless_vsync();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: publish Software or detach while the grouped successor owns HW, or schedule another commit before each per-CRTC event retires.
 fn tearing_grouped_two_output_handoff_waits_for_each_event() {
     run_two_output_grouped_tearing_handoff_waits_for_each_event();
@@ -24,7 +31,7 @@ fn tearing_grouped_two_output_handoff_waits_for_each_event() {
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutations: classify by XFIXES only, or preserve the deferred cursor wake on tearing exit.
-fn transparent_cursor_is_hidden_for_direct_scanout_and_define_cursor_handoff() {
+pub(super) fn transparent_cursor_is_hidden_for_direct_scanout_and_define_cursor_handoff() {
     use yserver_core::{backend::Backend, server::ServerState};
 
     const WINDOW: u32 = 0x78a1;
@@ -33,7 +40,7 @@ fn transparent_cursor_is_hidden_for_direct_scanout_and_define_cursor_handoff() {
     };
     let recorder = recording_sink(&mut backend, 0);
     let mut state = ServerState::new();
-    let (show_executor, _) = install_cursor_plane_with_successful_show(&mut backend);
+    install_atomic_cursor_plane_stub(&mut backend);
     let root = backend.core.window_id;
     assert!(
         backend.effective_cursor_hidden(),
@@ -57,7 +64,6 @@ fn transparent_cursor_is_hidden_for_direct_scanout_and_define_cursor_handoff() {
         backend.scene.cursor_mode(),
         crate::kms::render::scene::CursorPlaneMode::Hidden
     );
-    assert!(show_executor.calls().is_empty());
     assert!(!backend.platform.any_cursor_plane_visible());
 
     // The visible one-pixel cursor remains a real cursor through CreateCursor.
@@ -112,7 +118,6 @@ fn transparent_cursor_is_hidden_for_direct_scanout_and_define_cursor_handoff() {
         backend.scene.cursor_mode(),
         crate::kms::render::scene::CursorPlaneMode::Hidden
     );
-    assert!(show_executor.calls().is_empty());
     assert!(!backend.platform.any_cursor_plane_visible());
 
     // The test cursor plane above checks the non-tearing path. Remove that test
@@ -264,7 +269,7 @@ fn define_visible_cursor_rebinds_held_vsync_direct_scanout() {
     use yserver_core::backend::Backend;
 
     const WINDOW: u32 = 0x78b1;
-    let Some((mut backend, recorder, mut state, show_executor, hide_executor)) =
+    let Some((mut backend, recorder, mut state)) =
         super::round2::held_vsync_direct_scanout_with_transparent_cursor(WINDOW, 15_300, 1)
     else {
         return;
@@ -291,8 +296,6 @@ fn define_visible_cursor_rebinds_held_vsync_direct_scanout() {
         AtomicCommitKind::CursorOnly
     );
     assert!(!backend.effective_cursor_hidden());
-    assert!(show_executor.calls().is_empty());
-    assert!(hide_executor.calls().is_empty());
     assert!(backend.platform.any_cursor_plane_visible());
     assert!(backend.pstate.scanout_m2.active());
     assert!(backend.pstate.scanout_m2.hold_direct);
@@ -392,11 +395,18 @@ pub(super) fn run_entry_with_render_failure_keeps_hw_until_teardown() {
     );
 }
 
+pub(super) fn run_entry_with_rejected_detach_keeps_hw_cursorless_vsync() {
+    run_entry_from_held_direct_with_visible_hw_cursor_handoff_inner(
+        HandoffFrameFailure::CursorDetachReject,
+    );
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HandoffFrameFailure {
     None,
     NoSceneSlot,
     RenderSubmit,
+    CursorDetachReject,
 }
 
 fn run_entry_from_held_direct_with_visible_hw_cursor_handoff_inner(
@@ -423,13 +433,28 @@ fn run_entry_from_held_direct_with_visible_hw_cursor_handoff_inner(
                 backend
             })
         }
-        HandoffFrameFailure::None => live_scene_backend_with_clock(clock).map(|mut backend| {
-            prime_cursorless_scene_primary(&mut backend);
-            backend
-        }),
+        HandoffFrameFailure::None | HandoffFrameFailure::CursorDetachReject => {
+            live_scene_backend_with_clock(clock).map(|mut backend| {
+                prime_cursorless_scene_primary(&mut backend);
+                backend
+            })
+        }
     };
     let Some(mut backend) = backend else {
         return;
+    };
+    let tearing_recovery_reporter = if frame_failure == HandoffFrameFailure::CursorDetachReject {
+        let reporter = std::rc::Rc::new(
+            crate::kms::render::platform::cursor_recovery::RecordingCursorRecoveryReporter::default(
+            ),
+        );
+        let reporter_trait: std::rc::Rc<
+            dyn crate::kms::render::platform::cursor_recovery::CursorRecoveryReporter,
+        > = reporter.clone();
+        backend.platform.services.cursor_recovery_reporter = reporter_trait;
+        Some(reporter)
+    } else {
+        None
     };
     for device in &mut backend.platform.devices {
         device.async_page_flip = true;
@@ -437,8 +462,16 @@ fn run_entry_from_held_direct_with_visible_hw_cursor_handoff_inner(
     let recorder = recording_sink(&mut backend, 0);
     let mut state = ServerState::new();
     let host_window = materialize_test_cow_stage(&mut backend, &mut state, ClientId(1), WINDOW);
-    let (_show_executor, _hide_executor) = install_cursor_plane_with_successful_show(&mut backend);
+    install_atomic_cursor_plane_stub(&mut backend);
     let cursor = define_visible_cursor_through_backend(&mut backend, &mut state);
+    Backend::recolor_cursor(
+        &mut backend,
+        None,
+        cursor,
+        (u16::MAX, 0, 0),
+        (0, u16::MAX, 0),
+    )
+    .expect("color the cursor so its software pixels differ from the primary");
     prepare_visible_hw_cursor(&mut backend, &mut state);
     assert_eq!(backend.effective_cursor_xid, Some(cursor));
     assert!(recorder.records().iter().any(|record| {
@@ -608,6 +641,335 @@ fn run_entry_from_held_direct_with_visible_hw_cursor_handoff_inner(
         crate::kms::render::scene::CursorPlaneMode::Hw,
         "the retained primary receipt does not publish SW before SW pixels exist",
     );
+
+    if frame_failure == HandoffFrameFailure::CursorDetachReject {
+        let (crtc, primary_plane, primary_fb_property) = {
+            let output = &backend.platform.outputs[0];
+            (
+                output.output.crtc,
+                output.output.plane,
+                output.output.plane_fb_id_prop,
+            )
+        };
+        let (
+            cursor_plane,
+            cursor_fb_id,
+            cursor_crtc_id,
+            cursor_crtc_x,
+            cursor_crtc_y,
+            cursor_crtc_w,
+            cursor_crtc_h,
+            cursor_src_x,
+            cursor_src_y,
+            cursor_src_w,
+            cursor_src_h,
+        ) = {
+            let properties = backend.platform.devices[0]
+                .cursor
+                .plane
+                .as_ref()
+                .expect("visible HW cursor plane")
+                .properties_for(crtc)
+                .expect("visible HW cursor properties");
+            (
+                properties.plane,
+                properties.fb_id,
+                properties.crtc_id,
+                properties.crtc_x,
+                properties.crtc_y,
+                properties.crtc_w,
+                properties.crtc_h,
+                properties.src_x,
+                properties.src_y,
+                properties.src_w,
+                properties.src_h,
+            )
+        };
+        let prior_binding = backend.platform.devices[0]
+            .cursor
+            .crtc_states
+            .get(&crtc)
+            .and_then(|state| state.applied)
+            .expect("grouped unflip retained applied cursor binding");
+        let before_under_cursor = crate::kms::render::backend::read_scanout_region(
+            &mut backend,
+            ash::vk::Rect2D {
+                offset: ash::vk::Offset2D { x: 100, y: 100 },
+                extent: ash::vk::Extent2D {
+                    width: 1,
+                    height: 1,
+                },
+            },
+            crate::kms::render::backend::ScanoutReadSelection::OnScreenOnly,
+        )
+        .expect("read prior cursorless primary pixel");
+        let reporter = tearing_recovery_reporter
+            .as_ref()
+            .expect("C3 fixture installs the recording reporter");
+        let before_rejection = recorder.records().len();
+        for result in [
+            Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+            Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+            Ok(()),
+            Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+            Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+            Ok(()),
+        ] {
+            recorder.script_result(result);
+        }
+        Backend::maybe_composite(&mut backend)
+            .expect("reject software frame and explicit-detach retry");
+        assert!(backend.pstate.tearing.is_on());
+        assert!(backend.platform.any_cursor_plane_visible());
+        assert!(!backend.scene.has_pending_page_flips());
+        assert!(!backend.platform.any_cursor_commit_in_flight());
+        assert_eq!(
+            reporter.calls(),
+            1,
+            "recovery reports the failed detach once"
+        );
+        assert_eq!(
+            backend
+                .scene
+                .for_tests_cursor_commit_receipt(0)
+                .unwrap()
+                .mode,
+            crate::kms::render::scene::CursorAcceptedMode::Hardware,
+            "neither rejected software frame is published",
+        );
+        assert!(!backend.scene.for_tests_cursor_footprint_was_presented(0));
+        assert_eq!(
+            backend.platform.devices[0]
+                .cursor
+                .crtc_states
+                .get(&crtc)
+                .and_then(|state| state.applied),
+            Some(prior_binding),
+            "both rejected attempts leave the previous HW binding applied",
+        );
+
+        let records_after_rejection = recorder.records();
+        let rejected: Vec<_> = records_after_rejection[before_rejection..]
+            .iter()
+            .filter(|record| {
+                !record
+                    .flags
+                    .contains(::drm::control::AtomicCommitFlags::TEST_ONLY)
+            })
+            .collect();
+        assert_eq!(
+            rejected.len(),
+            2,
+            "one failed hide plus one failed detach retry"
+        );
+        assert!(rejected.iter().all(|record| {
+            record.kind == AtomicCommitKind::SceneWithCursor
+                && matches!(
+                    record.result,
+                    crate::drm::atomic::tests_support::ScriptedResult::Error {
+                        raw_os_error: Some(libc::EINVAL),
+                        ..
+                    }
+                )
+        }));
+        assert!(
+            rejected[0].properties.iter().any(|update| {
+                update.object == primary_plane.into()
+                    && update.property == primary_fb_property
+                    && rejected[1].properties.iter().any(|retry| {
+                        retry.object == update.object
+                            && retry.property == update.property
+                            && retry.value == update.value
+                    })
+            }),
+            "explicit detach retries the identical primary framebuffer"
+        );
+        assert!(rejected[1].properties.iter().any(|update| {
+            update.object == cursor_plane.into()
+                && update.property == cursor_fb_id
+                && update.value == 0
+        }));
+        assert!(rejected[1].properties.iter().any(|update| {
+            update.object == cursor_plane.into()
+                && update.property == cursor_crtc_id
+                && update.value == 0
+        }));
+        assert!(
+            recorder.records()[before_rejection..].iter().all(|record| {
+                record.kind != AtomicCommitKind::Async
+                    && !record
+                        .flags
+                        .contains(::drm::control::AtomicCommitFlags::PAGE_FLIP_ASYNC)
+            }),
+            "Tearing stays Vsync while the actual HW binding remains applied"
+        );
+
+        let retained_state = backend.platform.devices[0]
+            .cursor
+            .crtc_states
+            .get(&crtc)
+            .expect("retained HW cursor state");
+        assert!(retained_state.intent.is_none());
+        assert!(retained_state.in_flight.is_none());
+
+        let before_replacement = recorder.records().len();
+        Backend::maybe_composite(&mut backend)
+            .expect("compose cursorless replacement under retained HW plane");
+        assert!(backend.scene.has_pending_page_flip(0));
+        let replacement = recorder
+            .records()
+            .last()
+            .cloned()
+            .expect("cursorless replacement");
+        assert_eq!(replacement.kind, AtomicCommitKind::Scene);
+        assert!(replacement.properties.iter().all(|update| {
+            !(update.object == cursor_plane.into()
+                && [
+                    cursor_fb_id,
+                    cursor_crtc_id,
+                    cursor_crtc_x,
+                    cursor_crtc_y,
+                    cursor_crtc_w,
+                    cursor_crtc_h,
+                    cursor_src_x,
+                    cursor_src_y,
+                    cursor_src_w,
+                    cursor_src_h,
+                ]
+                .contains(&update.property))
+        }));
+        let replacement_receipt = backend
+            .scene
+            .for_tests_cursor_commit_receipt(0)
+            .expect("accepted cursorless replacement receipt");
+        assert_eq!(
+            replacement_receipt.mode,
+            crate::kms::render::scene::CursorAcceptedMode::Hardware
+        );
+        assert_eq!(
+            replacement_receipt.primary_cursor,
+            crate::kms::render::scene::CursorPrimaryContent::Cursorless
+        );
+        let replacement_primary_fb = replacement
+            .properties
+            .iter()
+            .find(|update| {
+                update.object == primary_plane.into() && update.property == primary_fb_property
+            })
+            .expect("replacement primary framebuffer property")
+            .value;
+        assert_eq!(
+            backend.platform.devices[0]
+                .cursor
+                .crtc_states
+                .get(&crtc)
+                .expect("retained cursor state after replacement acceptance")
+                .fallback,
+            crate::kms::render::platform::cursor_state::CursorFallbackState::RetainHardware
+        );
+        assert!(!backend.scene.for_tests_cursor_footprint_was_presented(0));
+        assert_eq!(
+            backend.platform.devices[0]
+                .cursor
+                .crtc_states
+                .get(&crtc)
+                .and_then(|state| state.applied),
+            Some(prior_binding)
+        );
+        assert!(backend.platform.any_cursor_plane_visible());
+        assert!(
+            recorder.records()[before_replacement..]
+                .iter()
+                .all(|record| {
+                    record.kind != AtomicCommitKind::Async
+                        && !record
+                            .flags
+                            .contains(::drm::control::AtomicCommitFlags::PAGE_FLIP_ASYNC)
+                })
+        );
+        retire_composed_frame(&mut backend, &mut state, 11);
+        let pool = backend.platform.scanout_pools[0]
+            .as_ref()
+            .expect("replacement scanout pool")
+            .display_pool();
+        let on_screen_bo = pool
+            .bos
+            .iter()
+            .find(|bo| bo.state.phase == crate::kms::vk::scanout::BoPhase::OnScreen)
+            .expect("replacement framebuffer is now on screen");
+        assert_eq!(
+            replacement_primary_fb,
+            u64::from(u32::from(
+                on_screen_bo
+                    .fb_handle
+                    .expect("on-screen replacement framebuffer handle")
+            )),
+            "pixel oracle reads the framebuffer accepted for the replacement"
+        );
+        // OnScreenOnly restores saved pixels under software cursors. This
+        // diagnostic read inspects the replacement BO's actual presented bytes.
+        let after_under_cursor = crate::kms::render::backend::read_scanout_region(
+            &mut backend,
+            ash::vk::Rect2D {
+                offset: ash::vk::Offset2D { x: 100, y: 100 },
+                extent: ash::vk::Extent2D {
+                    width: 1,
+                    height: 1,
+                },
+            },
+            crate::kms::render::backend::ScanoutReadSelection::PermissiveDump,
+        )
+        .expect("read presented cursorless replacement pixel");
+        assert_eq!(before_under_cursor, after_under_cursor);
+        assert!(!backend.scene.has_pending_page_flips());
+        assert!(!backend.platform.any_cursor_commit_in_flight());
+        backend.platform.for_tests_accept_output_power_commits();
+        backend
+            .disable_output()
+            .expect("Backend teardown detaches and drains the retained HW cursor");
+        assert!(!backend.platform.any_cursor_plane_visible());
+        assert!(!backend.platform.any_cursor_commit_in_flight());
+        assert!(!backend.scene.has_pending_page_flips());
+        assert_direct_queue_drained(&backend);
+        let cursor_state = backend.platform.devices[0]
+            .cursor
+            .crtc_states
+            .get(&crtc)
+            .expect("torn down cursor state");
+        assert!(cursor_state.applied.is_none());
+        assert!(cursor_state.lifecycle_pending.is_none());
+        assert!(cursor_state.intent.is_none());
+        assert!(cursor_state.in_flight.is_none());
+        let mut expected_sequence = vec![AtomicCommitKind::Scene; 9];
+        expected_sequence.extend([AtomicCommitKind::SceneWithCursor; 2]);
+        expected_sequence.push(AtomicCommitKind::Scene);
+        let actual_sequence = recorder
+            .records()
+            .into_iter()
+            .filter(|record| {
+                !record
+                    .flags
+                    .contains(::drm::control::AtomicCommitFlags::TEST_ONLY)
+            })
+            .map(|record| record.kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual_sequence, expected_sequence,
+            "direct entry, rejected SW+detach frame, cursorless replacement, and teardown sequence",
+        );
+        let recorders = std::rc::Rc::clone(
+            backend
+                .platform
+                .services
+                .test_recorders
+                .as_ref()
+                .expect("recording test services"),
+        );
+        backend.platform.wait_idle_bounded();
+        drop(backend);
+        assert_eq!(recorders.cursor_buffer_ledger.end_state(), (0, 0, 0));
+        return;
+    }
 
     if frame_failure == HandoffFrameFailure::NoSceneSlot {
         let before_unavailable_frame = recorder.records().len();
@@ -905,14 +1267,8 @@ pub(super) fn run_two_output_grouped_tearing_handoff_waits_for_each_event() {
             .expect("two-output cursor device")
             .device,
     );
-    let show = std::rc::Rc::new(super::RecordingCursorShowExecutor::default());
-    let mut plane = crate::kms::cursor_plane::CursorPlane::for_tests_with_show_executor(
-        device, 64, 64, true, show,
-    );
+    let mut plane = crate::kms::cursor_plane::CursorPlane::for_tests_stub(device, 64, 64);
     install_test_atomic_cursor_properties(&backend, &mut plane, device_key);
-    let hide = std::rc::Rc::new(RecordingCursorHideExecutor::default());
-    hide.script([TestCursorHideResult::Ok; 8]);
-    plane.for_tests_set_hide_executor(hide);
     backend.platform.devices[0].cursor.plane = Some(plane);
 
     let pixmap = Backend::create_pixmap(&mut backend, None, 32, 64, 64)

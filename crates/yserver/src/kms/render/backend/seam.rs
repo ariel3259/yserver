@@ -101,7 +101,9 @@ pub trait Platform: OutputSink + Sized + 'static {
     /// Reapply a hidden cursor policy after output resume, including stale
     /// plane bindings left by a failed best-effort suspend hide.
     fn recover_hidden_cursor_on_resume(_b: &mut XBackend<Self>) {}
-    /// The cursor sprite's size or hotspot changed.
+    /// Observe the current cursor's qualification shape. Backends receive only
+    /// dimensions and hotspot, so image pixels and animation versions cannot
+    /// create a new hardware candidate.
     fn note_cursor_sprite(
         _b: &mut XBackend<Self>,
         _width: u16,
@@ -242,6 +244,8 @@ pub trait Platform: OutputSink + Sized + 'static {
     }
 
     fn before_block(_b: &mut XBackend<Self>) {}
+
+    fn set_request_backlog(_b: &mut XBackend<Self>, _pending: bool) {}
 
     fn flush_before_damage_notify(_b: &mut XBackend<Self>) {}
 
@@ -644,6 +648,11 @@ pub trait Platform: OutputSink + Sized + 'static {
 
     fn dpms_capable(_b: &XBackend<Self>) -> bool {
         false
+    }
+
+    /// Release platform-owned display resources after the core loop exits.
+    fn shutdown_outputs(_b: &mut XBackend<Self>) -> io::Result<()> {
+        Ok(())
     }
 
     fn set_dpms_power(_b: &mut XBackend<Self>, _level: u8) -> std::io::Result<()> {

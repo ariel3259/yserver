@@ -73,6 +73,9 @@ pub enum FrameHandoff {
     FlipPending {
         submit: ComposeSubmit,
         cursor: CursorCommitReceipt,
+        /// Identity of the accepted primary commit's retiring page-flip event.
+        /// Non-KMS sinks may leave this empty.
+        event_id: Option<u64>,
     },
     /// Composed into the copied route's source; the completion fd (`None` is
     /// the already-signalled payload) goes to
@@ -188,7 +191,7 @@ pub trait OutputSink {
         output_idx: usize,
         bo_idx: usize,
         fd: Option<OwnedFd>,
-    ) -> io::Result<CursorCommitReceipt>;
+    ) -> io::Result<(CursorCommitReceipt, Option<u64>)>;
 }
 
 /// A cursor show that failed, and whether the old sprite is still visible.
@@ -220,6 +223,16 @@ impl std::fmt::Display for CursorShowFailure {
 pub trait CursorPlaneSink {
     fn fits(&self, output_idx: usize, width: u32, height: u32) -> bool;
     fn visible(&self, output_idx: usize) -> bool;
+    /// Keep software cursor pixels out of a primary while this CRTC retains a
+    /// hardware binding after a rejected explicit detach.
+    fn software_cursor_suppressed(&self, _output_idx: usize) -> bool {
+        false
+    }
+    /// Consume the one-shot notification that a software-cursor frame was
+    /// discarded after both its hide and explicit-detach requests were refused.
+    fn take_discarded_software_frame(&mut self, _output_idx: usize) -> bool {
+        false
+    }
     fn uploaded_image_matches(
         &self,
         output_idx: usize,

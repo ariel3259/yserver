@@ -149,6 +149,7 @@ fn retire_test_flip(
     source.queue_flip_for_device(device, crtc, frame);
     let drm_fd = backend.platform.devices[0].device.as_fd().as_raw_fd();
     Backend::on_page_flip_ready(backend, state, drm_fd);
+    Backend::before_block(backend);
 }
 
 fn assert_no_cursor_work(backend: &KmsBackend, device_key: crate::platform::drm::DrmDeviceKey) {
@@ -338,7 +339,9 @@ fn scene_damage_after_cursor_retirement_submits_scene_with_latest_position() {
     warp(&mut backend, &mut state, 90, 70);
     maybe_composite(&mut backend);
     assert_eq!(recorder.records().len(), 1);
-    Backend::mark_dirty(&mut backend);
+    let root = backend.core.window_id;
+    Backend::clear_area(&mut backend, None, root, 0, None, 0, 0, 1, 1, (0, 0))
+        .expect("damage root through Backend");
     maybe_composite(&mut backend);
     assert_eq!(
         recorder.records().len(),
@@ -348,14 +351,15 @@ fn scene_damage_after_cursor_retirement_submits_scene_with_latest_position() {
 
     retire_test_flip(&mut backend, &mut state, 1);
     warp(&mut backend, &mut state, 340, 210);
-    let latest = backend
-        .platform
-        .cursor_plane_atomic_positions_for_outputs(&[0])[0];
     maybe_composite(&mut backend);
     assert_eq!(recorder.records().len(), 2, "scene submits through Backend");
     let records = recorder.records();
     assert_eq!(records[0].kind, AtomicCommitKind::CursorOnly);
     assert_eq!(records[1].kind, AtomicCommitKind::SceneWithCursor);
+    let latest = backend
+        .platform
+        .cursor_plane_atomic_positions_for_outputs(&[0])[0];
+    assert_eq!((latest.x, latest.y), (340, 210));
     assert_cursor_properties(&records[1], latest);
     retire_test_flip(&mut backend, &mut state, 2);
     assert_no_cursor_work(&backend, device_key);

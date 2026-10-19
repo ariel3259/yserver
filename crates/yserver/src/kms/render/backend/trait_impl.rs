@@ -157,6 +157,10 @@ impl<P: Platform> Backend for XBackend<P> {
         P::before_block(self)
     }
 
+    fn set_request_backlog(&mut self, pending: bool) {
+        P::set_request_backlog(self, pending)
+    }
+
     fn mark_dirty(&mut self) {
         P::note_scheduler_input(self);
         // The core loop calls mark_dirty after every handled X request, even
@@ -173,9 +177,11 @@ impl<P: Platform> Backend for XBackend<P> {
             return;
         }
 
-        // Outside the cursor-cap case, preserve the established generic
-        // request wake behavior without inventing full-output damage.
-        self.scene.wake_for_damage();
+        // Core calls this after generic requests and host input, including
+        // events that only update the hardware cursor. Keep this fallback wake
+        // cursor-only so a stable hardware cursor does not invent a scene
+        // frame; explicit damage and structural changes keep their own wakes.
+        self.scene.wake_for_cursor_damage();
     }
 
     fn flush_before_damage_notify(&mut self) {
@@ -1984,6 +1990,10 @@ impl<P: Platform> Backend for XBackend<P> {
 
     fn dpms_capable(&self) -> bool {
         P::dpms_capable(self)
+    }
+
+    fn shutdown_outputs(&mut self) -> std::io::Result<()> {
+        P::shutdown_outputs(self)
     }
 
     fn set_dpms_power(&mut self, level: u8) -> std::io::Result<()> {

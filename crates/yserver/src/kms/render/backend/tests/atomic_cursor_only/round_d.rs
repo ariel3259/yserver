@@ -268,59 +268,76 @@ fn atomic_cursor_only_permanent_failure_still_detaches_accepted_binding() {
     Backend::warp_pointer_root(&mut fixture.backend, &mut fixture.state, 101, 90);
     Backend::maybe_composite(&mut fixture.backend)
         .expect("record permanent cursor motion rejection through Backend");
+    // Detach first (spec §3): the permanently refused motion is followed by an
+    // explicit detach, which the driver accepts, so the output is software.
     assert!(
         fixture
             .backend
             .platform
             .for_tests_cursor_permanently_disabled(device_key)
     );
+    let live: Vec<_> = fixture
+        .recorders
+        .atomic
+        .records()
+        .into_iter()
+        .filter(|record| {
+            !record
+                .flags
+                .contains(::drm::control::AtomicCommitFlags::TEST_ONLY)
+        })
+        .collect();
+    let [.., refused, detach] = live.as_slice() else {
+        panic!("refused motion then explicit detach: {live:?}");
+    };
     assert_eq!(
+        refused.kind,
+        crate::drm::atomic::AtomicCommitKind::CursorOnly
+    );
+    assert_eq!(
+        detach.kind,
+        crate::drm::atomic::AtomicCommitKind::CursorOnly
+    );
+    assert_eq!(detach.properties.len(), 2, "FB_ID=0 and CRTC_ID=0 only");
+    assert_eq!(
+        detach.result,
+        crate::drm::atomic::tests_support::ScriptedResult::Ok
+    );
+    let plane_users = |fixture: &AtomicCursorFixture| {
         fixture
+            .backend
+            .platform
+            .device_for_key(device_key)
+            .and_then(|device| device.cursor.plane.as_ref())
+            .and_then(|plane| plane.sprite_user_count(accepted.lease))
+    };
+    assert_eq!(
+        plane_users(&fixture),
+        Some(1),
+        "the accepted framebuffer stays owned until the detach event",
+    );
+    {
+        let state = fixture
             .backend
             .platform
             .device_for_key(device_key)
             .unwrap()
             .cursor
-            .crtc_states[&crtc]
-            .applied,
-        Some(accepted),
-        "permanent rejection keeps the accepted on-screen binding until detach acceptance",
+            .crtc_states
+            .get(&crtc)
+            .unwrap();
+        assert_eq!(state.applied, None, "the accepted detach unbinds the plane");
+        assert!(state.in_flight.is_some(), "the detach owes its flip event");
+    }
+    fixture.retire_output(0, 3);
+    assert_eq!(
+        plane_users(&fixture),
+        Some(0),
+        "the detach event releases the accepted framebuffer",
     );
 
     Backend::set_cursor_hidden(&mut fixture.backend, true);
     damage_cursor_root(&mut fixture);
-    Backend::maybe_composite(&mut fixture.backend).expect("submit shared hardware detach");
-    let records = fixture.recorders.atomic.records();
-    let detach = records
-        .iter()
-        .rev()
-        .find(|record| {
-            record.kind == crate::drm::atomic::AtomicCommitKind::SceneWithCursor
-                && !record.events.is_empty()
-        })
-        .expect("permanent failure cleanup submits an atomic detach");
-    assert_eq!(
-        detach.kind,
-        crate::drm::atomic::AtomicCommitKind::SceneWithCursor
-    );
-    let properties = fixture.backend.platform.devices[0]
-        .cursor
-        .plane
-        .as_ref()
-        .unwrap()
-        .properties_for(crtc)
-        .unwrap();
-    assert!(detach.properties.iter().any(|update| {
-        update.object == properties.plane.into()
-            && update.property == properties.fb_id
-            && update.value == 0
-    }));
-    assert!(detach.properties.iter().any(|update| {
-        update.object == properties.plane.into()
-            && update.property == properties.crtc_id
-            && update.value == 0
-    }));
-    fixture.retire_output(0, 3);
     Backend::maybe_composite(&mut fixture.backend).expect("settle hidden software scene");
     if fixture.backend.scene.has_pending_page_flips() {
         fixture.retire_output(0, 4);

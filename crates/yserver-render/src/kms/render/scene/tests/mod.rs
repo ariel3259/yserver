@@ -123,7 +123,7 @@ impl OutputSink for TestSink {
         _output_idx: usize,
         _bo_idx: usize,
         _fd: Option<std::os::fd::OwnedFd>,
-    ) -> io::Result<CursorCommitReceipt> {
+    ) -> io::Result<(CursorCommitReceipt, Option<u64>)> {
         Err(io::Error::other(
             "render completion targeted a shared output",
         ))

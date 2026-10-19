@@ -315,6 +315,7 @@ impl SurfaceOutput {
                     needs_recompose: false,
                 },
                 submit: submitted,
+                event_id: None,
             }
         });
         let fail_stop = matches!(result, Err(PresentError::Vk(vk::Result::ERROR_DEVICE_LOST)));

@@ -60,7 +60,7 @@ impl KmsBackend {
                         .pstate
                         .scanout_m2
                         .unflip_awaiting_outputs
-                        .contains(output_idx)
+                        .contains_key(output_idx)
                     || self
                         .platform
                         .cursor_atomic_event_pending_for_output(*output_idx)
@@ -73,8 +73,7 @@ impl KmsBackend {
         &mut self,
         context: &'static str,
     ) -> io::Result<()> {
-        self.exit_tearing("topology_mutation");
-        self.bump_crtc_config_topology_epoch(context);
+        self.invalidate_topology_mutation(context);
         let old_pending_pageflips = self.pending_pageflip_crtcs();
         if self.pstate.scanout_m2.active() {
             if let Err(error) = self.teardown_direct_before_topology_requery(context) {
@@ -126,6 +125,13 @@ impl KmsBackend {
         }
         self.pstate.scanout_m1.clear(context);
         Ok(())
+    }
+
+    /// Retire topology-owned tearing and asynchronous CRTC configuration
+    /// before changing cursor-plane discovery while primary scanout stays on.
+    pub(super) fn invalidate_topology_mutation(&mut self, context: &'static str) {
+        self.exit_tearing("topology_mutation");
+        self.bump_crtc_config_topology_epoch(context);
     }
 
     fn recover_failed_crtc_config(
@@ -217,6 +223,8 @@ impl KmsBackend {
     ) {
         self.pstate.crtc_config_topology_epoch =
             self.pstate.crtc_config_topology_epoch.wrapping_add(1);
+        self.pstate.pending_cursor_decisions.clear();
+        self.pstate.cursor_decision_topology_epoch = self.pstate.crtc_config_topology_epoch;
 
         let mut tokens: Vec<_> = self
             .pstate

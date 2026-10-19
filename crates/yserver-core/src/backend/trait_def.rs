@@ -957,6 +957,11 @@ pub trait Backend {
     /// Reclamation must therefore ride the dispatch loop, not scanout.
     fn before_block(&mut self) {}
 
+    /// Report whether bounded request dispatch left client requests queued.
+    /// Called after event/request dispatch and before the iteration compose
+    /// tail. Default: no-op.
+    fn set_request_backlog(&mut self, _pending: bool) {}
+
     /// Drain libinput's INITIAL device enumeration and seed the XI2
     /// device registry (`state.xi_devices`) BEFORE the core serves any
     /// client — the Xorg model of probing input at startup.
@@ -1609,6 +1614,17 @@ pub trait Backend {
     /// idle timer never fires on a backend that can't act on it.
     fn dpms_capable(&self) -> bool {
         false
+    }
+
+    /// Tear down platform-owned display outputs after `core_loop::run_core`
+    /// has returned. Most backends have no post-loop KMS teardown to perform.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a platform output-disable failure when the backend owns
+    /// physical scanout resources.
+    fn shutdown_outputs(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 
     /// Drive the display to a DPMS power level (`0=On, 1=Standby,

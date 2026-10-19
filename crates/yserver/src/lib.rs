@@ -928,8 +928,8 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     }
 
     log::info!("yserver: shutting down, disabling output");
-    if let Err(e) = backend.disable_output() {
-        log::warn!("yserver: disable_output failed: {e}");
+    if let Err(e) = Backend::shutdown_outputs(&mut backend) {
+        log::warn!("yserver: shutdown_outputs failed: {e}");
     }
     // Stage 5 Task 6.1: fan out any PRESENT completions deferred past
     // shutdown drain — events must reach clients before we tear down

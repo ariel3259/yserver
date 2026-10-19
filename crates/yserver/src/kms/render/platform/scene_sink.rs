@@ -8,10 +8,9 @@ use crate::kms::{
         gpu::GpuCore,
         platform::PlatformBackend,
         scene::{
-            ComposeRenderTarget, ComposeSubmit, CursorAcceptedMode, CursorCommitReceipt,
-            CursorFramePlan, CursorPlaneSink, CursorPrimaryContent, FinishOutcome, FlipRetirement,
-            FrameHandoff, FrameTargetError, OutputRoute, OutputSink, RecordFrame, RenderCompletion,
-            SlotToken,
+            ComposeRenderTarget, CursorAcceptedMode, CursorCommitReceipt, CursorFramePlan,
+            CursorPlaneSink, CursorPrimaryContent, FinishOutcome, FlipRetirement, FrameHandoff,
+            FrameTargetError, OutputRoute, OutputSink, RecordFrame, RenderCompletion, SlotToken,
         },
     },
     vk::{
@@ -22,7 +21,109 @@ use crate::kms::{
 use ash::vk;
 use std::{io, os::fd::OwnedFd, rc::Rc};
 
+struct SharedScanoutAccepted {
+    compose: crate::kms::render::scene::ComposeSubmit,
+    event_id: u64,
+    async_outcome: crate::drm::async_flip::AsyncOutcome,
+    cursor_updates: Vec<super::cursor_state::CursorPlaneUpdate>,
+    detach_retry_accepted: bool,
+    cursorless_retry_accepted: bool,
+    hardware_only_retry_accepted: bool,
+    cursor_key_rejected: bool,
+}
+
+struct SharedScanoutRejected {
+    error: PresentError,
+    cursor_rejected: bool,
+    cursor_key_rejected: bool,
+    discard_software_frame: bool,
+}
+
 impl PlatformBackend {
+    /// A cursor-attributed HW-only update whose cursorless primary retry was
+    /// accepted leaves the applied binding unchanged. Carry the refusal into
+    /// the ordinary cursor-only detach lane, including an unbound attach, and
+    /// retain the key captured by the rejected request.
+    pub(crate) fn queue_rejected_hardware_cursor_detach(
+        &mut self,
+        updates: &[super::cursor_state::CursorPlaneUpdate],
+    ) {
+        self.reject_cursor_plane_update_reservations(updates);
+        for update in updates {
+            if update.prepared.prior.is_none() && update.prepared.next.is_none() {
+                continue;
+            }
+            let Some(device) = self
+                .devices
+                .iter_mut()
+                .find(|device| device.key == update.device_key)
+            else {
+                continue;
+            };
+            device.cursor.note_rejected_cursor_key(
+                update.crtc,
+                update.topology_epoch,
+                update.sprite_key,
+            );
+            let Some(state) = device.cursor.crtc_states.get_mut(&update.crtc) else {
+                continue;
+            };
+            if state.applied != update.prepared.prior {
+                continue;
+            }
+            state.fallback = super::cursor_state::CursorFallbackState::DetachPending {
+                rejected_key: update.sprite_key,
+            };
+            state.intent = Some(super::cursor_state::CursorIntent::Hide);
+            state.intent_scene_owned = false;
+            state.intent_motion_timestamp = None;
+            device
+                .cursor
+                .cursor_retry_waits_for_flip
+                .remove(&update.crtc);
+        }
+    }
+
+    fn reject_scene_cursor_show(&mut self, updates: &[super::cursor_state::CursorPlaneUpdate]) {
+        self.reject_cursor_plane_update_reservations(updates);
+        for update in updates {
+            if update.prepared.prior.is_some() || update.prepared.next.is_none() {
+                continue;
+            }
+            let Some(device) = self
+                .devices
+                .iter_mut()
+                .find(|device| device.key == update.device_key)
+            else {
+                continue;
+            };
+            device.cursor.note_rejected_cursor_key(
+                update.crtc,
+                update.topology_epoch,
+                update.sprite_key,
+            );
+            let fallback = super::cursor_recovery::software_for_rejected_sprite(update.sprite_key);
+            device
+                .cursor
+                .cursor_retry_waits_for_flip
+                .remove(&update.crtc);
+            if let Some(state) = device.cursor.crtc_states.get_mut(&update.crtc) {
+                let rejected_intent = super::cursor_state::CursorIntent::Show(
+                    update
+                        .prepared
+                        .next
+                        .expect("show update has a next binding"),
+                );
+                if state.intent == Some(rejected_intent) {
+                    state.intent = None;
+                    state.intent_scene_owned = false;
+                    state.intent_motion_timestamp = None;
+                }
+                state.fallback = fallback;
+            }
+        }
+    }
+
     fn accepted_cursor_mode(
         &self,
         output_idx: usize,
@@ -164,12 +265,23 @@ impl OutputSink for PlatformBackend {
                 format!("no atomic commit sink for output {output_key:?}"),
             )));
         };
-        let timing = self
+        let requested_timing = self
             .scene_flip_timings
             .get(output_idx)
             .copied()
             .flatten()
             .unwrap_or(self.requested_flip_timing);
+        let timing = if self.cursor_plane_visible_for_output(output_idx)
+            && matches!(
+                cursor.assignment,
+                crate::kms::render::scene::CursorFrameAssignment::Software { .. }
+                    | crate::kms::render::scene::CursorFrameAssignment::Hidden
+                    | crate::kms::render::scene::CursorFrameAssignment::CursorlessReplacement
+            ) {
+            crate::drm::async_flip::FlipTiming::Vsync
+        } else {
+            requested_timing
+        };
         let target_slot_exists = self
             .scanout_pools
             .get(output_idx)
@@ -185,6 +297,7 @@ impl OutputSink for PlatformBackend {
             return FinishOutcome::Unavailable(FrameTargetError::NoSlot);
         }
         let frame = cursor.frame;
+        let cursor_assignment = cursor.assignment;
         if let Err(error) =
             super::cursor_frames::stage_cursor_frame(self, output_idx, bo_idx, cursor)
         {
@@ -210,6 +323,14 @@ impl OutputSink for PlatformBackend {
             super::cursor_frames::cancel_cursor_frame(self, output_idx, bo_idx, frame);
             return FinishOutcome::Unavailable(FrameTargetError::NoDevice(error));
         }
+        let failure_context =
+            super::cursor_recovery::scene_frame_failure_context(cursor_assignment, &cursor_updates);
+        let detach_retry_updates =
+            if failure_context == super::cursor_recovery::CursorFailureContext::SceneToSoftware {
+                self.scene_detach_retry_updates(&cursor_updates)
+            } else {
+                Vec::new()
+            };
         if let Err(error) = super::cursor_frames::store_cursor_frame_updates(
             self,
             output_idx,
@@ -233,8 +354,15 @@ impl OutputSink for PlatformBackend {
             .and_then(Option::as_mut)
             .expect("scanout pool was checked before cursor reservation");
         let output = &self.outputs[output_idx].output;
+        let output_crtc = output.crtc;
         let mut shared_cursor_commit_submitted = false;
         let mut cursor_rejected = false;
+        let mut cursor_key_rejected = false;
+        let mut discarded_software_frame = false;
+        let mut accepted_cursor_updates = cursor_updates.clone();
+        let mut accepted_detach_retry = false;
+        let mut cursorless_retry_accepted = false;
+        let mut hardware_only_retry_accepted = false;
         let mut async_outcome = None;
         let mut outcome = match pool {
             OutputScanout::Shared(pool) => {
@@ -251,27 +379,40 @@ impl OutputSink for PlatformBackend {
                     bo,
                     record,
                     &cursor_updates,
+                    &detach_retry_updates,
+                    failure_context,
                     async_ledger,
                     timing,
                     tearing_context,
                 );
-                if submitted.is_err() && atomic_commit_sink.take_last_cursor_rejection() {
-                    cursor_rejected = true;
-                }
-                if let Ok((_, result)) = &submitted {
-                    async_outcome = Some(*result);
-                    shared_cursor_commit_submitted =
-                        *result != crate::drm::async_flip::AsyncOutcome::Accepted;
-                }
-                let result = submitted.map(|(compose, _async_outcome)| FrameHandoff::FlipPending {
-                    cursor: CursorCommitReceipt {
-                        frame: Some(frame),
-                        mode: CursorAcceptedMode::Hidden,
-                        primary_cursor: compose.primary_cursor,
-                        needs_recompose: false,
-                    },
-                    submit: compose,
-                });
+                let result = match submitted {
+                    Ok(accepted) => {
+                        async_outcome = Some(accepted.async_outcome);
+                        shared_cursor_commit_submitted = accepted.async_outcome
+                            != crate::drm::async_flip::AsyncOutcome::Accepted;
+                        accepted_cursor_updates = accepted.cursor_updates;
+                        accepted_detach_retry = accepted.detach_retry_accepted;
+                        cursorless_retry_accepted = accepted.cursorless_retry_accepted;
+                        hardware_only_retry_accepted = accepted.hardware_only_retry_accepted;
+                        cursor_key_rejected = accepted.cursor_key_rejected;
+                        Ok(FrameHandoff::FlipPending {
+                            cursor: CursorCommitReceipt {
+                                frame: Some(frame),
+                                mode: CursorAcceptedMode::Hidden,
+                                primary_cursor: accepted.compose.primary_cursor,
+                                needs_recompose: false,
+                            },
+                            submit: accepted.compose,
+                            event_id: Some(accepted.event_id),
+                        })
+                    }
+                    Err(rejected) => {
+                        cursor_rejected = rejected.cursor_rejected;
+                        cursor_key_rejected = rejected.cursor_key_rejected;
+                        discarded_software_frame = rejected.discard_software_frame;
+                        Err(rejected.error)
+                    }
+                };
                 FinishOutcome::Finished {
                     result,
                     previous_gpu_ns: bo.last_gpu_render_ns.take(),
@@ -307,9 +448,12 @@ impl OutputSink for PlatformBackend {
                 }
             }
         };
+        if cursor_key_rejected {
+            self.note_rejected_cursor_qualifications(&cursor_updates);
+        }
         if let Some(async_outcome) = async_outcome {
             self.async_outcomes.insert(
-                crate::drm::async_flip::AsyncStream::Composed(output.crtc),
+                crate::drm::async_flip::AsyncStream::Composed(output_crtc),
                 async_outcome,
             );
             // The receipt belongs to this damage once any commit for it is
@@ -327,7 +471,46 @@ impl OutputSink for PlatformBackend {
                 ..
             }
         );
-        if cursor_rejected {
+        if cursorless_retry_accepted {
+            if super::cursor_recovery::retry_requires_software_recompose(
+                super::cursor_recovery::CursorRecoveryAction::RetryFrameWithoutCursor,
+                failure_context,
+            ) {
+                self.reject_scene_cursor_show(&cursor_updates);
+            } else {
+                self.reject_cursor_plane_update_reservations(&cursor_updates);
+                self.restore_failed_hardware_cursor_intents(&cursor_updates);
+            }
+        }
+        if discarded_software_frame {
+            self.reject_cursor_plane_update_reservations(&cursor_updates);
+            let detach_error = match &outcome {
+                FinishOutcome::Finished {
+                    result: Err(PresentError::Io(error)),
+                    ..
+                } => Some(error.raw_os_error().map_or_else(
+                    || io::Error::new(error.kind(), error.to_string()),
+                    io::Error::from_raw_os_error,
+                )),
+                _ => None,
+            };
+            let device_idx = self
+                .devices
+                .iter()
+                .position(|device| device.key == self.outputs[output_idx].key.device_key)
+                .expect("scene output retains its DRM device");
+            if let Some(error) = detach_error {
+                self.retain_hardware_after_detach(
+                    device_idx,
+                    self.outputs[output_idx].output.crtc,
+                    &error,
+                );
+            }
+            self.mark_discarded_software_scene_frame(output_idx);
+            super::cursor_frames::mark_cursor_frame_updates_settled(
+                self, output_idx, bo_idx, frame,
+            );
+        } else if cursor_rejected {
             // A scene-owned cursor rejection abandons this frame with its old
             // primary and actual binding intact. Recovery may recompose; no
             // ownership transition is published from the rejected frame plan.
@@ -337,14 +520,20 @@ impl OutputSink for PlatformBackend {
                 self, output_idx, bo_idx, frame,
             );
         } else if shared_cursor_commit_submitted && scene_cursor_owner {
-            let settlement = if cursor_updates
+            if accepted_detach_retry {
+                self.prepare_scene_detach_retry(&accepted_cursor_updates);
+            }
+            let settlement = if accepted_cursor_updates
                 .iter()
                 .any(|update| update.owner == super::cursor_frames::CursorCommitOwner::HardwareOnly)
             {
-                self.cursor_plane_scene_commit_submitted(&cursor_updates)
+                self.cursor_plane_scene_commit_submitted(&accepted_cursor_updates)
             } else {
-                self.cursor_plane_scene_frame_submitted(output_idx, frame, &cursor_updates)
+                self.cursor_plane_scene_frame_submitted(output_idx, frame, &accepted_cursor_updates)
             };
+            if accepted_detach_retry {
+                self.accept_scene_detach_retry(&accepted_cursor_updates);
+            }
             if let Err(error) = settlement {
                 // The atomic request already changed the display. Stop future
                 // rendering and quarantine the sprite pool if even accepted-
@@ -375,11 +564,12 @@ impl OutputSink for PlatformBackend {
                     Ok(FrameHandoff::FlipPending {
                         submit,
                         cursor: receipt,
+                        ..
                     }),
                 ..
             } => {
                 let mode = self.accepted_cursor_mode(output_idx, submit.primary_cursor);
-                let accepted = super::cursor_frames::accept_cursor_frame(
+                let mut accepted = super::cursor_frames::accept_cursor_frame(
                     self,
                     output_idx,
                     bo_idx,
@@ -387,6 +577,15 @@ impl OutputSink for PlatformBackend {
                     mode,
                     submit.primary_cursor,
                 );
+                if cursorless_retry_accepted
+                    && super::cursor_recovery::retry_requires_software_recompose(
+                        super::cursor_recovery::CursorRecoveryAction::RetryFrameWithoutCursor,
+                        failure_context,
+                    )
+                {
+                    accepted.mode = CursorAcceptedMode::Software;
+                    accepted = accepted.with_recompose_after_acceptance();
+                }
                 *receipt = accepted;
             }
             FinishOutcome::Finished {
@@ -405,11 +604,15 @@ impl OutputSink for PlatformBackend {
                 }
             }
             FinishOutcome::Finished { result: Err(_), .. } => {
+                self.release_scene_cursor_retry_after_failed_submit(&cursor_updates);
                 super::cursor_frames::cancel_cursor_frame(self, output_idx, bo_idx, frame);
             }
             FinishOutcome::Unavailable(_) => {
                 super::cursor_frames::cancel_cursor_frame(self, output_idx, bo_idx, frame);
             }
+        }
+        if hardware_only_retry_accepted {
+            self.queue_rejected_hardware_cursor_detach(&cursor_updates);
         }
         outcome
     }
@@ -505,7 +708,7 @@ impl OutputSink for PlatformBackend {
         output_idx: usize,
         bo_idx: usize,
         fd: Option<OwnedFd>,
-    ) -> io::Result<CursorCommitReceipt> {
+    ) -> io::Result<(CursorCommitReceipt, Option<u64>)> {
         let frame = super::cursor_frames::staged_cursor_frame_id(self, output_idx, bo_idx)
             .ok_or_else(|| io::Error::other("copied cursor frame was not staged"))?;
         let primary_cursor = self
@@ -513,7 +716,12 @@ impl OutputSink for PlatformBackend {
             .get(&(output_idx, bo_idx))
             .and_then(|staged| staged.primary_cursor)
             .ok_or_else(|| io::Error::other("copied cursor frame has no recorded pixels"))?;
-        let cursor_updates = match super::cursor_frames::cursor_frame_updates_for_submit(
+        let cursor_assignment = self
+            .staged_cursor_frames
+            .get(&(output_idx, bo_idx))
+            .map(|staged| staged.plan.assignment)
+            .ok_or_else(|| io::Error::other("copied cursor frame plan was not staged"))?;
+        let mut cursor_updates = match super::cursor_frames::cursor_frame_updates_for_submit(
             self, output_idx, bo_idx, frame,
         ) {
             Ok(updates) => updates,
@@ -522,8 +730,38 @@ impl OutputSink for PlatformBackend {
                 return Err(error);
             }
         };
-        match self.submit_copied_scanout(output_idx, bo_idx, fd, &cursor_updates) {
-            Ok(()) => {
+        let failure_context =
+            super::cursor_recovery::scene_frame_failure_context(cursor_assignment, &cursor_updates);
+        match self.submit_copied_scanout(
+            output_idx,
+            bo_idx,
+            fd,
+            &mut cursor_updates,
+            failure_context,
+        ) {
+            Ok((recovery, event_id)) => {
+                let cursorless_retry_accepted =
+                    recovery == super::scanout_bos::CopiedScanoutRecovery::CursorlessRetry;
+                let hardware_only_retry_accepted =
+                    recovery == super::scanout_bos::CopiedScanoutRecovery::HardwareOnlyRetry;
+                let rejected_hardware_updates =
+                    hardware_only_retry_accepted.then(|| cursor_updates.clone());
+                let failed_show_retry = cursorless_retry_accepted
+                    && super::cursor_recovery::retry_requires_software_recompose(
+                        super::cursor_recovery::CursorRecoveryAction::RetryFrameWithoutCursor,
+                        failure_context,
+                    );
+                if cursorless_retry_accepted {
+                    if failed_show_retry {
+                        self.reject_scene_cursor_show(&cursor_updates);
+                    } else {
+                        self.reject_cursor_plane_update_reservations(&cursor_updates);
+                        self.restore_failed_hardware_cursor_intents(&cursor_updates);
+                    }
+                    cursor_updates.clear();
+                } else if hardware_only_retry_accepted {
+                    cursor_updates.clear();
+                }
                 let settlement = if cursor_updates.iter().any(|update| {
                     update.owner == super::cursor_frames::CursorCommitOwner::HardwareOnly
                 }) {
@@ -543,21 +781,44 @@ impl OutputSink for PlatformBackend {
                     super::cursor_frames::cancel_cursor_frame(self, output_idx, bo_idx, frame);
                     return Err(error);
                 }
+                if hardware_only_retry_accepted {
+                    self.queue_rejected_hardware_cursor_detach(
+                        rejected_hardware_updates
+                            .as_deref()
+                            .expect("hardware retry retains the rejected cursor updates"),
+                    );
+                }
+                if recovery == super::scanout_bos::CopiedScanoutRecovery::DetachRetry {
+                    self.accept_scene_detach_retry(&cursor_updates);
+                }
                 super::cursor_frames::mark_cursor_frame_updates_settled(
                     self, output_idx, bo_idx, frame,
                 );
-                let mode = self.accepted_cursor_mode(output_idx, primary_cursor);
-                Ok(super::cursor_frames::accept_cursor_frame(
+                let mode = if failed_show_retry {
+                    CursorAcceptedMode::Software
+                } else {
+                    self.accepted_cursor_mode(output_idx, primary_cursor)
+                };
+                let mut receipt = super::cursor_frames::accept_cursor_frame(
                     self,
                     output_idx,
                     bo_idx,
                     frame,
                     mode,
                     primary_cursor,
-                ))
+                );
+                if failed_show_retry {
+                    receipt = receipt.with_recompose_after_acceptance();
+                }
+                Ok((receipt, Some(event_id)))
             }
             Err(submit_error) => {
-                if submit_error.cursor_rejected {
+                self.release_scene_cursor_retry_after_failed_submit(&cursor_updates);
+                if submit_error.discard_software_frame {
+                    super::cursor_frames::mark_cursor_frame_updates_settled(
+                        self, output_idx, bo_idx, frame,
+                    );
+                } else if submit_error.cursor_rejected {
                     let outcome =
                         self.reject_atomic_cursor_commit(&cursor_updates, &submit_error.error);
                     self.defer_cursor_move_outcome(outcome);
@@ -644,6 +905,14 @@ impl CursorPlaneSink for PlatformBackend {
         self.cursor_plane_visible_for_output(output_idx)
     }
 
+    fn software_cursor_suppressed(&self, output_idx: usize) -> bool {
+        self.software_cursor_suppressed_for_output(output_idx)
+    }
+
+    fn take_discarded_software_frame(&mut self, output_idx: usize) -> bool {
+        self.take_discarded_software_scene_frame(output_idx)
+    }
+
     fn uploaded_image_matches(
         &self,
         output_idx: usize,
@@ -654,8 +923,8 @@ impl CursorPlaneSink for PlatformBackend {
         self.cursor_plane_uploaded_image_matches_for_output(output_idx, version, hot_x, hot_y)
     }
 
-    fn note_composed_retirement(&mut self, output_idx: usize) -> bool {
-        self.cursor_plane_note_composed_retirement(output_idx)
+    fn note_composed_retirement(&mut self, _output_idx: usize) -> bool {
+        false
     }
 }
 
@@ -831,22 +1100,46 @@ fn submit_shared_scanout_frame(
     bo: &mut ScanoutBo,
     record: &mut RecordFrame<'_>,
     cursor_updates: &[crate::kms::render::platform::cursor_state::CursorPlaneUpdate],
+    detach_retry_updates: &[crate::kms::render::platform::cursor_state::CursorPlaneUpdate],
+    failure_context: super::cursor_recovery::CursorFailureContext,
     async_ledger: &mut crate::drm::async_flip::AsyncFlipLedger,
     timing: crate::drm::async_flip::FlipTiming,
     tearing_context: crate::drm::atomic::TearingCommitContext,
-) -> Result<(ComposeSubmit, crate::drm::async_flip::AsyncOutcome), PresentError> {
+) -> Result<SharedScanoutAccepted, SharedScanoutRejected> {
     use std::os::fd::{FromRawFd, IntoRawFd};
 
     if bo.state.phase != BoPhase::Free {
-        return Err(PresentError::WrongPhase(bo.state.phase));
+        return Err(SharedScanoutRejected {
+            error: PresentError::WrongPhase(bo.state.phase),
+            cursor_rejected: false,
+            cursor_key_rejected: false,
+            discard_software_frame: false,
+        });
     }
-    let fb_handle = bo.fb_handle.ok_or(PresentError::NoFb)?;
+    let Some(fb_handle) = bo.fb_handle else {
+        return Err(SharedScanoutRejected {
+            error: PresentError::NoFb,
+            cursor_rejected: false,
+            cursor_key_rejected: false,
+            discard_software_frame: false,
+        });
+    };
     bo.state.transition_to_recording();
-    let submitted = record(bo)?;
+    let submitted = record(bo).map_err(|error| SharedScanoutRejected {
+        error,
+        cursor_rejected: false,
+        cursor_key_rejected: false,
+        discard_software_frame: false,
+    })?;
 
     let fd = bo
         .export_signaled_fd()
-        .map_err(PresentError::Vk)?
+        .map_err(|error| SharedScanoutRejected {
+            error: PresentError::Vk(error),
+            cursor_rejected: false,
+            cursor_key_rejected: false,
+            discard_software_frame: false,
+        })?
         .map_or(-1, IntoRawFd::into_raw_fd);
     bo.state.transition_to_submitted(fd);
 
@@ -876,9 +1169,9 @@ fn submit_shared_scanout_frame(
     );
     let async_outcome = if attempt_timing == crate::drm::async_flip::FlipTiming::Async {
         match submit_result {
-            Ok(()) => {
+            Ok(event_id) => {
                 async_ledger.note_accepted(stream, &shape);
-                submit_result = Ok(());
+                submit_result = Ok(event_id);
                 crate::drm::async_flip::AsyncOutcome::Accepted
             }
             Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {
@@ -914,14 +1207,117 @@ fn submit_shared_scanout_frame(
         crate::drm::async_flip::AsyncOutcome::NotRequested
     };
 
+    let initial_action = submit_result.as_ref().err().map(|error| {
+        super::cursor_recovery::classify_cursor_failure(
+            error,
+            atomic_commit_sink.take_last_cursor_rejection(),
+            failure_context,
+        )
+    });
+    let cursor_key_rejected = initial_action.is_some_and(|action| action.is_cursor_failure());
+    let mut accepted_cursor_updates = cursor_updates.to_vec();
+    let mut detach_retry_accepted = false;
+    let mut cursorless_retry_accepted = false;
+    let mut hardware_only_retry_accepted = false;
+    let mut cursor_rejected = initial_action.is_some_and(|action| action.is_cursor_failure());
+    let mut discard_software_frame = false;
+    if initial_action == Some(super::cursor_recovery::CursorRecoveryAction::RetryFrameWithDetach)
+        && !detach_retry_updates.is_empty()
+    {
+        let retry_fd = bo
+            .state
+            .transition_to_recording_after_atomic_reject()
+            .unwrap_or(-1);
+        bo.state.transition_to_submitted(retry_fd);
+        out_fence = -1;
+        submit_result = crate::drm::page_flip::submit_scene_flip_with_fences_tearing(
+            drm,
+            atomic_commit_sink,
+            output,
+            fb_handle,
+            retry_fd,
+            &mut out_fence,
+            detach_retry_updates,
+            crate::drm::async_flip::FlipTiming::Vsync,
+            tearing_context,
+        );
+        match &submit_result {
+            Ok(_) => {
+                accepted_cursor_updates = detach_retry_updates.to_vec();
+                detach_retry_accepted = true;
+                cursor_rejected = false;
+            }
+            Err(error) => {
+                let retry_action = super::cursor_recovery::classify_cursor_failure(
+                    error,
+                    atomic_commit_sink.take_last_cursor_rejection(),
+                    super::cursor_recovery::scene_failure_context(detach_retry_updates),
+                );
+                cursor_rejected = false;
+                discard_software_frame = retry_action.is_cursor_failure();
+            }
+        }
+    }
+    let hardware_only_retry = initial_action.is_some_and(|action| {
+        super::cursor_recovery::retry_riding_frame_without_cursor(
+            action,
+            failure_context,
+            cursor_updates,
+        )
+    });
+    let software_recompose_retry = !hardware_only_retry
+        && initial_action.is_some_and(|action| {
+            super::cursor_recovery::retry_requires_software_recompose(action, failure_context)
+        });
+    if hardware_only_retry || software_recompose_retry {
+        let retry_fd = bo
+            .state
+            .transition_to_recording_after_atomic_reject()
+            .unwrap_or(-1);
+        bo.state.transition_to_submitted(retry_fd);
+        out_fence = -1;
+        submit_result = crate::drm::page_flip::submit_scene_flip_with_fences_tearing(
+            drm,
+            atomic_commit_sink,
+            output,
+            fb_handle,
+            retry_fd,
+            &mut out_fence,
+            &[],
+            crate::drm::async_flip::FlipTiming::Vsync,
+            tearing_context,
+        );
+        match &submit_result {
+            Ok(_) => {
+                accepted_cursor_updates.clear();
+                hardware_only_retry_accepted = hardware_only_retry;
+                cursorless_retry_accepted = software_recompose_retry;
+                cursor_rejected = false;
+            }
+            Err(_) => {
+                // The retry contains only the original primary, so its
+                // failure belongs to the ordinary flip error path.
+                cursor_rejected = false;
+            }
+        }
+    }
     match submit_result {
-        Ok(()) => {
+        Ok(event_id) => {
             if let Some(reclaimed) = bo.state.transition_to_pending(out_fence) {
                 // SAFETY: this is the in-fence fd retained across any async
                 // EINVAL retry and returned after atomic acceptance.
                 drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(reclaimed) });
             }
-            Ok((submitted, async_outcome))
+            Ok(SharedScanoutAccepted {
+                compose: submitted,
+                event_id,
+                async_outcome,
+                cursor_updates: accepted_cursor_updates,
+                detach_retry_accepted,
+                cursorless_retry_accepted,
+                hardware_only_retry_accepted,
+                cursor_key_rejected,
+            })
         }
         Err(error) => {
             if let Some(reclaimed) = bo.state.transition_to_recording_after_atomic_reject() {
@@ -932,7 +1328,12 @@ fn submit_shared_scanout_frame(
                 // Defensive: OUT_FENCE_PTR should only be written on success.
                 drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(out_fence) });
             }
-            Err(PresentError::Io(error))
+            Err(SharedScanoutRejected {
+                error: PresentError::Io(error),
+                cursor_rejected,
+                cursor_key_rejected,
+                discard_software_frame,
+            })
         }
     }
 }

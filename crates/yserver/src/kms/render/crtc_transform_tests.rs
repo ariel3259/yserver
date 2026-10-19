@@ -618,7 +618,6 @@ fn direct_scanout_unflips_and_stays_off_while_another_output_is_transformed() {
         [CrtcTransform::identity(), CrtcTransform::identity()],
         (5120, 1440),
     );
-    b.pstate.scanout_m2.cursor_bound_all = true;
     let fallback = super::tests::seed_window(&mut b, 0x6a00, None, 0, 0);
     super::tests::install_direct_frame_for_target_test(&mut b, 0x6b00, fallback, true);
     b.pstate.scanout_m2.hold_direct = true;

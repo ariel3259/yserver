@@ -207,7 +207,6 @@ impl KmsBackend {
                     root_host_xid: self.core.window_id,
                 },
             };
-            self.pstate.scanout_m2.cursor_bound_all = false;
             self.pstate.tearing.hide_failed_logged = false;
             log::info!(
                 "kms: entering tearing for window=0x{:x} crtc_epoch={}",
@@ -342,7 +341,7 @@ impl KmsBackend {
             self.pstate
                 .scanout_m2
                 .unflip_awaiting_outputs
-                .contains(&output_idx),
+                .contains_key(&output_idx),
         )
     }
 
@@ -899,6 +898,7 @@ impl KmsBackend {
             event,
             completion_output_idx,
             completion_clock: None,
+            accepted_event_id: None,
             awaiting_outputs: HashSet::new(),
             async_outcome: crate::drm::async_flip::AsyncOutcome::NotRequested,
         };

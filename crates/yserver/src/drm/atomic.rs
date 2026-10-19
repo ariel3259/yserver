@@ -4,16 +4,114 @@ use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, VecDeque},
     io,
+    os::fd::{AsFd as _, AsRawFd as _, RawFd},
     rc::Rc,
     time::{Duration, Instant},
 };
 
-use drm::control::{
-    AtomicCommitFlags, Device as ControlDevice, RawResourceHandle, ResourceHandle,
-    atomic::AtomicModeReq, crtc, plane, property,
-};
+use drm::control::{AtomicCommitFlags, RawResourceHandle, ResourceHandle, crtc, plane, property};
 
-use crate::drm::Device;
+use crate::drm::{Device, page_flip::IoctlReq};
+
+/// `struct drm_mode_atomic` (drm.h). The drm crate's `atomic_commit` always
+/// submits `user_data == 0`, so the commit identity goes through this raw ioctl.
+#[allow(non_camel_case_types)]
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+struct drm_mode_atomic {
+    flags: u32,
+    count_objs: u32,
+    objs_ptr: u64,
+    count_props_ptr: u64,
+    props_ptr: u64,
+    prop_values_ptr: u64,
+    reserved: u64,
+    user_data: u64,
+}
+
+// `_IOWR('d', 0xBC, drm_mode_atomic)`: dir = 3 (RW), size = 56, type = 'd'.
+const DRM_IOCTL_MODE_ATOMIC: IoctlReq = ((3u32 << 30)
+    | ((std::mem::size_of::<drm_mode_atomic>() as u32) << 16)
+    | (0x64u32 << 8)
+    | 0xBC) as IoctlReq;
+
+/// The kernel-shaped property list of one atomic request. Objects stay sorted
+/// and each object's properties are sorted by id, the same layout and override
+/// rules as `drm::control::atomic::AtomicModeReq`, whose arrays are private.
+#[derive(Debug, Default)]
+pub(crate) struct RawAtomicModeReq {
+    objects: Vec<RawResourceHandle>,
+    count_props_per_object: Vec<u32>,
+    props: Vec<u32>,
+    values: Vec<u64>,
+}
+
+impl RawAtomicModeReq {
+    fn add_raw_property(
+        &mut self,
+        object: RawResourceHandle,
+        property: property::Handle,
+        value: u64,
+    ) {
+        let property = u32::from(property);
+        let (idx, prop_count) = match self.objects.binary_search(&object) {
+            Ok(idx) => (idx, self.count_props_per_object[idx]),
+            Err(new_idx) => {
+                self.objects.insert(new_idx, object);
+                self.count_props_per_object.insert(new_idx, 0);
+                (new_idx, 0)
+            }
+        };
+        let start = self.count_props_per_object[..idx].iter().sum::<u32>() as usize;
+        let end = start + prop_count as usize;
+        match self.props[start..end].binary_search(&property) {
+            Ok(prop_idx) => self.values[start + prop_idx] = value,
+            Err(prop_idx) => {
+                self.count_props_per_object[idx] += 1;
+                self.props.insert(start + prop_idx, property);
+                self.values.insert(start + prop_idx, value);
+            }
+        }
+    }
+
+    /// Submit with `user_data` as the kernel's event cookie for this commit.
+    fn submit(
+        &self,
+        fd: std::os::fd::BorrowedFd<'_>,
+        flags: AtomicCommitFlags,
+        user_data: u64,
+    ) -> io::Result<()> {
+        use std::os::fd::AsRawFd as _;
+
+        let count_objs = u32::try_from(self.objects.len())
+            .map_err(|_| io::Error::other("atomic request has too many objects"))?;
+        let mut atomic = drm_mode_atomic {
+            flags: flags.bits(),
+            count_objs,
+            objs_ptr: self.objects.as_ptr() as u64,
+            count_props_ptr: self.count_props_per_object.as_ptr() as u64,
+            props_ptr: self.props.as_ptr() as u64,
+            prop_values_ptr: self.values.as_ptr() as u64,
+            reserved: 0,
+            user_data,
+        };
+        // SAFETY: `atomic` is a fully initialised `drm_mode_atomic` whose
+        // pointers reference this request's vectors, alive and unmodified
+        // for the call; the kernel reads them (and writes only OUT_FENCE_PTR
+        // targets the caller already owns). The fd is borrowed for the call.
+        let rc = unsafe {
+            libc::ioctl(
+                fd.as_raw_fd(),
+                DRM_IOCTL_MODE_ATOMIC,
+                &raw mut atomic as *mut _,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(dead_code)] // the commit producers arrive in Tasks 2–3
@@ -127,7 +225,7 @@ impl AtomicCursorPlaneDetach {
 impl CursorPlanePosition {
     /// Append this cursor's `CRTC_X` and `CRTC_Y` values to an atomic request.
     #[allow(dead_code)] // consumed by the scene commit path in Task 2
-    pub(crate) fn add_to(&self, req: &mut AtomicModeReq) {
+    pub(crate) fn add_to(&self, req: &mut RawAtomicModeReq) {
         req.add_raw_property(self.plane.into(), self.crtc_x, i64::from(self.x) as u64);
         req.add_raw_property(self.plane.into(), self.crtc_y, i64::from(self.y) as u64);
     }
@@ -156,21 +254,25 @@ impl AtomicPropertyUpdate {
 }
 
 /// An atomic request paired with its flattened updates. The flattened form is
-/// retained for the test recorder; production submits the `AtomicModeReq`.
+/// retained for the test recorder; production submits it as a raw request.
 #[allow(dead_code)] // scene and direct submitters start using this in Task 2
 pub(crate) struct AtomicCommitRequest {
-    request: AtomicModeReq,
+    request: RawAtomicModeReq,
     properties: Vec<AtomicPropertyUpdate>,
     cursor_properties: Vec<(RawResourceHandle, property::Handle)>,
+    /// Kernel `user_data` for this commit; echoed in its PAGE_FLIP_EVENT so
+    /// the completion can be matched to the submission it belongs to.
+    user_data: u64,
 }
 
 #[allow(dead_code)] // request assembly starts in Task 2
 impl AtomicCommitRequest {
     pub(crate) fn new() -> Self {
         Self {
-            request: AtomicModeReq::new(),
+            request: RawAtomicModeReq::default(),
             properties: Vec::new(),
             cursor_properties: Vec::new(),
+            user_data: 0,
         }
     }
 
@@ -231,8 +333,10 @@ impl AtomicCommitRequest {
         }
     }
 
-    fn into_request(self) -> AtomicModeReq {
-        self.request
+    fn submit(&self, device: &Device, flags: AtomicCommitFlags) -> io::Result<()> {
+        use std::os::fd::AsFd as _;
+
+        self.request.submit(device.as_fd(), flags, self.user_data)
     }
 
     fn attribution_snapshot(&self) -> CommitAttributionSnapshot {
@@ -272,6 +376,12 @@ pub(crate) struct AtomicCommitEvent {
     pub(crate) motion_timestamp: Option<Instant>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct CrtcPageFlipKey {
+    device_fd: RawFd,
+    crtc: crtc::Handle,
+}
+
 /// Injectable executor. The production executor calls the device's
 /// `atomic_commit`; tests provide a recorder that accepts scripted results.
 pub(crate) trait AtomicCommitExecutor {
@@ -302,7 +412,7 @@ impl AtomicCommitExecutor for DrmAtomicCommitExecutor {
         request: AtomicCommitRequest,
         _events: &[AtomicCommitEvent],
     ) -> io::Result<()> {
-        device.atomic_commit(flags, request.into_request())
+        request.submit(device, flags)
     }
 }
 
@@ -369,8 +479,29 @@ impl AtomicCommitSink {
             events,
             TearingCommitContext::NONE,
         )
+        .map(|_| ())
     }
 
+    pub(crate) fn submit_with_commit_id(
+        &self,
+        device: &Device,
+        flags: AtomicCommitFlags,
+        kind: AtomicCommitKind,
+        request: AtomicCommitRequest,
+        events: &[AtomicCommitEvent],
+    ) -> io::Result<u64> {
+        self.submit_with_tearing_context(
+            device,
+            flags,
+            kind,
+            request,
+            events,
+            TearingCommitContext::NONE,
+        )?
+        .ok_or_else(|| io::Error::other("accepted page-flip commit has no event identity"))
+    }
+
+    #[allow(dead_code)] // kept for non-event tearing commits
     pub(crate) fn submit_tearing(
         &self,
         device: &Device,
@@ -381,9 +512,10 @@ impl AtomicCommitSink {
         context: TearingCommitContext,
     ) -> io::Result<()> {
         self.submit_with_tearing_context(device, flags, kind, request, events, context)
+            .map(|_| ())
     }
 
-    fn submit_with_tearing_context(
+    pub(crate) fn submit_tearing_with_commit_id(
         &self,
         device: &Device,
         flags: AtomicCommitFlags,
@@ -391,9 +523,28 @@ impl AtomicCommitSink {
         request: AtomicCommitRequest,
         events: &[AtomicCommitEvent],
         context: TearingCommitContext,
-    ) -> io::Result<()> {
+    ) -> io::Result<u64> {
+        self.submit_with_tearing_context(device, flags, kind, request, events, context)?
+            .ok_or_else(|| io::Error::other("accepted page-flip commit has no event identity"))
+    }
+
+    fn submit_with_tearing_context(
+        &self,
+        device: &Device,
+        flags: AtomicCommitFlags,
+        kind: AtomicCommitKind,
+        mut request: AtomicCommitRequest,
+        events: &[AtomicCommitEvent],
+        context: TearingCommitContext,
+    ) -> io::Result<Option<u64>> {
+        let device_fd = device.as_fd().as_raw_fd();
         let attribution =
             (kind == AtomicCommitKind::SceneWithCursor).then(|| request.attribution_snapshot());
+        // The identity is allocated before submission: the kernel echoes it in
+        // the page-flip event, which is how a late event is told apart.
+        let event_commit_id =
+            (!events.is_empty()).then(|| self.metrics.borrow_mut().allocate_commit_id());
+        request.user_data = event_commit_id.unwrap_or(0);
         let started = Instant::now();
         let result = self
             .executor
@@ -404,12 +555,17 @@ impl AtomicCommitSink {
             .flatten();
         let cursor_rejected = match (&result, attribution) {
             (Ok(()), _) => false,
-            (Err(_), None) => kind == AtomicCommitKind::CursorOnly,
+            // A cursor-only commit carries nothing but cursor fields, so any
+            // non-EBUSY rejection is the cursor's. EBUSY is a pending flip.
+            (Err(error), None) => {
+                kind == AtomicCommitKind::CursorOnly && error.raw_os_error() != Some(libc::EBUSY)
+            }
             (Err(error), Some(snapshot)) => self.cursor_caused_rejection(device, error, &snapshot),
         };
         self.last_rejection_was_cursor.set(cursor_rejected);
         let elapsed = finished.saturating_duration_since(started);
-        self.metrics.borrow_mut().record_commit(
+        let commit_id = self.metrics.borrow_mut().record_commit(
+            device_fd,
             kind,
             events,
             elapsed,
@@ -419,6 +575,7 @@ impl AtomicCommitSink {
             self.tearing_on.get(),
             self.tearing_generation.get(),
             finished_monotonic,
+            event_commit_id,
         );
 
         let result_text = result
@@ -443,7 +600,7 @@ impl AtomicCommitSink {
             );
         }
         self.emit_telemetry_if_due();
-        result
+        result.map(|()| commit_id)
     }
 
     pub(crate) fn set_tearing_on(&self, on: bool) {
@@ -465,18 +622,25 @@ impl AtomicCommitSink {
         self.metrics.borrow_mut().pending_page_flips.clear();
     }
 
+    /// Match one drained completion to its pending submission. `None` means
+    /// the completion retires nothing: its identity matched no pending entry.
     pub(crate) fn note_async_flip_event(
         &self,
+        device: &Device,
         crtc: crtc::Handle,
         timestamps: crate::kms::render::platform::FlipEventTimestamps,
-    ) {
+    ) -> Option<u64> {
         self.metrics.borrow_mut().record_page_flip_event(
-            crtc,
+            CrtcPageFlipKey {
+                device_fd: device.as_fd().as_raw_fd(),
+                crtc,
+            },
+            timestamps.commit_id,
             timestamps.received_at_monotonic,
             timestamps.completion_at_monotonic,
             self.tearing_on.get(),
             self.tearing_generation.get(),
-        );
+        )
     }
 
     pub(crate) fn note_skip_completion(&self) {
@@ -634,16 +798,6 @@ impl AtomicCommitSink {
         cursor_rejected
     }
 
-    /// Record the legacy path's motion-to-return latency. Both telemetry
-    /// latency measures intentionally use this same return time.
-    #[allow(dead_code)] // retained until Task B removes the legacy motion route
-    pub(crate) fn record_legacy_move(&self, motion_timestamp: Instant, returned_at: Instant) {
-        self.metrics
-            .borrow_mut()
-            .record_legacy_move(motion_timestamp, returned_at);
-        self.emit_telemetry_if_due();
-    }
-
     /// Complete motion-to-visible timing when the corresponding accepted
     /// commit's page-flip event retires.
     pub(crate) fn note_cursor_commit_retired(&self, crtc: crtc::Handle, retired_at: Instant) {
@@ -757,9 +911,28 @@ impl AtomicCommitSink {
         self.metrics
             .borrow()
             .pending_page_flips
-            .get(&crtc)?
+            .iter()
+            .find(|(key, _)| key.crtc == crtc)?
+            .1
             .front()?
             .direct_present_received_at
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_pending_page_flip_commit_ids(
+        &self,
+        device: &Device,
+        crtc: crtc::Handle,
+    ) -> Vec<u64> {
+        self.metrics
+            .borrow()
+            .pending_page_flips
+            .get(&CrtcPageFlipKey {
+                device_fd: device.as_fd().as_raw_fd(),
+                crtc,
+            })
+            .map(|pending| pending.iter().map(|flip| flip.commit_id).collect())
+            .unwrap_or_default()
     }
 
     #[cfg(test)]
@@ -831,7 +1004,7 @@ struct CommitWindow {
     present_latency_skip_completions: u64,
     present_latency_present_to_submit_us: Vec<u64>,
     present_latency_present_to_flip_event_us: Vec<u64>,
-    pending_page_flips: HashMap<crtc::Handle, VecDeque<PendingPageFlip>>,
+    pending_page_flips: HashMap<CrtcPageFlipKey, VecDeque<PendingPageFlip>>,
     next_commit_id: u64,
 }
 
@@ -876,8 +1049,15 @@ impl CommitWindow {
         }
     }
 
+    fn allocate_commit_id(&mut self) -> u64 {
+        let commit_id = self.next_commit_id;
+        self.next_commit_id = self.next_commit_id.saturating_add(1);
+        commit_id
+    }
+
     fn record_commit(
         &mut self,
+        device_fd: RawFd,
         kind: AtomicCommitKind,
         events: &[AtomicCommitEvent],
         elapsed: Duration,
@@ -887,7 +1067,9 @@ impl CommitWindow {
         tearing_on: bool,
         tearing_generation: u64,
         finished_monotonic: Option<Duration>,
-    ) {
+        event_commit_id: Option<u64>,
+    ) -> Option<u64> {
+        let mut accepted_commit_id = None;
         let ioctl_us = duration_us(elapsed);
         self.ioctl_us[kind.index()].push(ioctl_us);
         for event in events {
@@ -912,12 +1094,14 @@ impl CommitWindow {
                     .push(elapsed_us(received_at, finished));
             }
 
-            if !events.is_empty() {
-                let commit_id = self.next_commit_id;
-                self.next_commit_id = self.next_commit_id.saturating_add(1);
+            if let Some(commit_id) = event_commit_id {
+                accepted_commit_id = Some(commit_id);
                 for event in events {
                     self.pending_page_flips
-                        .entry(event.crtc)
+                        .entry(CrtcPageFlipKey {
+                            device_fd,
+                            crtc: event.crtc,
+                        })
                         .or_default()
                         .push_back(PendingPageFlip {
                             commit_id,
@@ -941,7 +1125,7 @@ impl CommitWindow {
         }
 
         if !tearing_on {
-            return;
+            return accepted_commit_id;
         }
         if kind == AtomicCommitKind::Async {
             match (error, context.path) {
@@ -983,30 +1167,60 @@ impl CommitWindow {
         {
             self.vsync_while_on = self.vsync_while_on.saturating_add(1);
         }
+        accepted_commit_id
     }
 
+    /// Retire the pending entry that `event_commit_id` names. A late or stale
+    /// identity matches nothing: it is logged and dropped, and nothing is
+    /// removed. `None` identity (legacy events) takes the oldest entry.
     fn record_page_flip_event(
         &mut self,
-        crtc: crtc::Handle,
+        key: CrtcPageFlipKey,
+        event_commit_id: Option<u64>,
         event_received_at_monotonic: Option<Duration>,
         completion_at_monotonic: Option<Duration>,
         tearing_on: bool,
         tearing_generation: u64,
-    ) {
-        let Some(queue) = self.pending_page_flips.get_mut(&crtc) else {
-            return;
+    ) -> Option<u64> {
+        let Some(queue) = self.pending_page_flips.get_mut(&key) else {
+            if event_commit_id.is_some() {
+                log::warn!(
+                    target: "yserver::drm::atomic",
+                    "page-flip event for commit {event_commit_id:?} crtc={:?} device_fd={} \
+                     has no pending entry; dropped",
+                    key.crtc,
+                    key.device_fd,
+                );
+            }
+            return None;
         };
-        let Some(pending) = queue.pop_front() else {
-            return;
+        let pending_idx = match event_commit_id {
+            Some(event_commit_id) => queue
+                .iter()
+                .position(|pending| pending.commit_id == event_commit_id),
+            None => Some(0),
         };
+        let Some(pending_idx) = pending_idx else {
+            log::warn!(
+                target: "yserver::drm::atomic",
+                "page-flip event for commit {event_commit_id:?} crtc={:?} device_fd={} \
+                 matches no pending entry; dropped",
+                key.crtc,
+                key.device_fd,
+            );
+            return None;
+        };
+        let pending = queue.remove(pending_idx)?;
         if queue.is_empty() {
-            self.pending_page_flips.remove(&crtc);
+            self.pending_page_flips.remove(&key);
         }
 
         log::trace!(
             target: "yserver::kms::render::backend::kms",
-            "pageflip telemetry matched commit={} crtc={crtc:?}",
+            "pageflip telemetry matched commit={} crtc={:?} device_fd={}",
             pending.commit_id,
+            key.crtc,
+            key.device_fd,
         );
         if let Some(present_received_at) = pending.direct_present_received_at {
             self.present_latency_direct_flips = self.present_latency_direct_flips.saturating_add(1);
@@ -1018,13 +1232,13 @@ impl CommitWindow {
             }
         }
         if !tearing_on {
-            return;
+            return Some(pending.commit_id);
         }
         if pending.tearing_generation != Some(tearing_generation) {
-            return;
+            return Some(pending.commit_id);
         }
         let Some(path) = pending.async_path else {
-            return;
+            return Some(pending.commit_id);
         };
         if let (Some(accepted_at), Some(event_received_at_monotonic)) =
             (pending.async_accepted_at, event_received_at_monotonic)
@@ -1050,6 +1264,7 @@ impl CommitWindow {
                 }
             }
         }
+        Some(pending.commit_id)
     }
 
     fn take_tearing_summary_if_due(
@@ -1127,13 +1342,6 @@ impl CommitWindow {
     fn reset_tearing_window(&mut self, now: Instant) {
         self.tearing_started = now;
         self.reset_tearing_counters();
-    }
-
-    #[allow(dead_code)] // retained until Task B removes the legacy motion route
-    fn record_legacy_move(&mut self, motion_timestamp: Instant, returned_at: Instant) {
-        let latency = elapsed_us(motion_timestamp, returned_at);
-        self.motion_to_accept_us.push(latency);
-        self.motion_to_visible_us.push(latency);
     }
 
     fn record_cursor_retirement(&mut self, crtc: crtc::Handle, retired_at: Instant) {
@@ -1269,7 +1477,7 @@ fn flip_latency_percentiles(values: &[u64]) -> (String, String, String) {
 pub(crate) mod tests_support {
     use super::{
         AtomicCommitEvent, AtomicCommitExecutor, AtomicCommitFlags, AtomicCommitKind,
-        AtomicCommitRequest, AtomicPropertyUpdate, Device, RefCell, io,
+        AtomicCommitRequest, AtomicPropertyUpdate, Device, RefCell, io, property,
     };
     use std::collections::VecDeque;
 
@@ -1313,6 +1521,7 @@ pub(crate) mod tests_support {
         pub(crate) device_fd: i32,
         pub(crate) flags: AtomicCommitFlags,
         pub(crate) kind: AtomicCommitKind,
+        pub(crate) user_data: u64,
         pub(crate) properties: Vec<AtomicPropertyUpdate>,
         pub(crate) events: Vec<AtomicCommitEvent>,
         pub(crate) result: ScriptedResult,
@@ -1322,11 +1531,25 @@ pub(crate) mod tests_support {
     pub(crate) struct RecordingAtomicCommitExecutor {
         records: RefCell<Vec<AtomicCommitRecord>>,
         scripted_results: RefCell<VecDeque<ScriptedResult>>,
+        rejected_properties: RefCell<Vec<property::Handle>>,
     }
 
     impl RecordingAtomicCommitExecutor {
         pub(crate) fn records(&self) -> Vec<AtomicCommitRecord> {
             self.records.borrow().clone()
+        }
+
+        /// Reject every request, live or `TEST_ONLY`, that carries one of
+        /// these properties with `EINVAL`, like the kernel does for an
+        /// invalid value. Scripted results are not consumed by these rejections.
+        pub(crate) fn reject_properties(&self, properties: &[property::Handle]) {
+            self.rejected_properties
+                .borrow_mut()
+                .extend_from_slice(properties);
+        }
+
+        pub(crate) fn clear_property_rejections(&self) {
+            self.rejected_properties.borrow_mut().clear();
         }
 
         pub(crate) fn clear_records(&self) {
@@ -1356,20 +1579,73 @@ pub(crate) mod tests_support {
         ) -> io::Result<()> {
             use std::os::fd::{AsFd as _, AsRawFd as _};
 
-            let result = self
-                .scripted_results
-                .borrow_mut()
-                .pop_front()
-                .unwrap_or(ScriptedResult::Ok);
+            let rejected_property = request
+                .properties
+                .iter()
+                .any(|update| self.rejected_properties.borrow().contains(&update.property));
+            let result = if rejected_property {
+                ScriptedResult::Error {
+                    kind: io::ErrorKind::InvalidInput,
+                    raw_os_error: Some(libc::EINVAL),
+                }
+            } else {
+                self.scripted_results
+                    .borrow_mut()
+                    .pop_front()
+                    .unwrap_or(ScriptedResult::Ok)
+            };
             self.records.borrow_mut().push(AtomicCommitRecord {
                 device_fd: device.as_fd().as_raw_fd(),
                 flags,
                 kind,
+                user_data: request.user_data,
                 properties: request.properties,
                 events: events.to_vec(),
                 result,
             });
             result.into_result()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use drm::control::{RawResourceHandle, from_u32, property};
+
+    use super::{DRM_IOCTL_MODE_ATOMIC, IoctlReq, RawAtomicModeReq, drm_mode_atomic};
+
+    fn prop(raw: u32) -> property::Handle {
+        from_u32(raw).expect("non-zero property id")
+    }
+
+    fn object(raw: u32) -> RawResourceHandle {
+        RawResourceHandle::new(raw).expect("non-zero object id")
+    }
+
+    #[test]
+    fn raw_atomic_request_groups_properties_per_object_in_kernel_order() {
+        let mut req = RawAtomicModeReq::default();
+        req.add_raw_property(object(20), prop(7), 70);
+        req.add_raw_property(object(10), prop(9), 90);
+        req.add_raw_property(object(10), prop(3), 30);
+        // The same (object, property) pair overrides its value.
+        req.add_raw_property(object(20), prop(7), 71);
+
+        let objects: Vec<u32> = req
+            .objects
+            .iter()
+            .map(|object| u32::from(*object))
+            .collect();
+        assert_eq!(objects, vec![10, 20]);
+        assert_eq!(req.count_props_per_object, vec![2, 1]);
+        assert_eq!(req.props, vec![3, 9, 7]);
+        assert_eq!(req.values, vec![30, 90, 71]);
+    }
+
+    #[test]
+    fn drm_mode_atomic_struct_and_ioctl_request_code() {
+        // drm.h: 4 + 4 + 6 * 8 = 56 bytes; _IOWR('d', 0xBC, 56 bytes).
+        assert_eq!(std::mem::size_of::<drm_mode_atomic>(), 56);
+        assert_eq!(DRM_IOCTL_MODE_ATOMIC, 0xC038_64BC_u32 as IoctlReq);
     }
 }

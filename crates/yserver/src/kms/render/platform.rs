@@ -27,9 +27,11 @@
 mod connectors;
 mod cursor;
 pub(crate) mod cursor_commit;
-pub(crate) use cursor_commit::accepted_cursor_only_receipt;
+pub(crate) use cursor_commit::{accepted_cursor_only_receipt, accepted_detach_receipt};
 pub(crate) mod cursor_frames;
 mod cursor_lifecycle;
+pub(crate) mod cursor_reassign;
+pub(crate) mod cursor_recovery;
 pub(crate) mod cursor_state;
 mod devices;
 pub(crate) mod flip_events;
@@ -177,6 +179,10 @@ pub(crate) struct SequenceCompletion {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FlipEventTimestamps {
+    /// Accepted atomic commit identity associated with this event. Production
+    /// DRM events are matched against the per-CRTC submission queue; recording
+    /// event sources may provide an explicit identity for stale-event tests.
+    pub(crate) commit_id: Option<u64>,
     /// CLOCK_MONOTONIC receipt time used by async ioctl-to-event turnaround.
     pub(crate) received_at_monotonic: Option<Duration>,
     /// Kernel completion time converted to CLOCK_MONOTONIC for Present latency.
@@ -197,17 +203,6 @@ type DrainedPageFlipEvents = (
 pub(crate) struct CrtcKey {
     pub(crate) device_key: crate::platform::drm::DrmDeviceKey,
     pub(crate) crtc: ::drm::control::crtc::Handle,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct TransientCursorFallback {
-    /// Number of successful software-composed retirements this CRTC must
-    /// observe before another hardware probe is allowed.
-    remaining_sw_retires: u8,
-    /// Consecutive EINVAL probes. Retained while a retry is eligible so a
-    /// driver that repeatedly rejects the same temporary state is backed off
-    /// exponentially rather than probed every frame.
-    failures: u8,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -244,7 +239,6 @@ pub(crate) struct KmsCursorState {
     /// cursor-plane construction. Only a successful explicit RANDR enable may
     /// consume this state; connected-Off probes and ordinary frames cannot.
     headless_deferred: bool,
-    transient_fallback_crtcs: HashMap<::drm::control::crtc::Handle, TransientCursorFallback>,
     /// Epoch of the last actual cursor-plane or active-CRTC topology change.
     pub(crate) cursor_topology_epoch: u64,
     pub(super) cursor_topology_crtcs: HashSet<::drm::control::crtc::Handle>,
@@ -258,6 +252,9 @@ pub(crate) struct KmsCursorState {
 pub(crate) struct CursorMoveOutcome {
     pub(crate) ebusy_count: u32,
     pub(crate) fallback_changed: bool,
+    /// The accepted commit was an explicit detach that ended hardware
+    /// ownership, so its receipt is Software and asks for a recompose.
+    pub(crate) accepted_detach: bool,
     /// A move failed and the hide rollback also failed, so the old HW cursor
     /// remains authoritative and needs another retirement boundary before its
     /// latest position/full ownership can be reconciled.
@@ -403,7 +400,6 @@ pub(crate) struct KmsDevice {
     pub(crate) atomic_commit_sink: Rc<crate::drm::atomic::AtomicCommitSink>,
     pub(crate) page_flip_event_source: Rc<dyn flip_events::PageFlipEventSource>,
     pub(crate) cursor_buffer_io: Rc<dyn crate::kms::cursor_plane::ops::CursorBufferIo>,
-    pub(crate) legacy_cursor_io: Rc<dyn crate::kms::cursor_plane::ops::LegacyCursorIo>,
     #[cfg(test)]
     pub(crate) test_page_flip_event_source: Option<Rc<flip_events::RecordingPageFlipEventSource>>,
     pub(crate) cursor: KmsCursorState,
@@ -619,19 +615,20 @@ impl PlatformBackend {
         }
     }
 
+    /// Match a drained completion to its pending submission. A completion
+    /// without a device to match against has no pending entry to retire.
     pub(crate) fn note_tearing_async_flip_event(
         &self,
         output_idx: usize,
         timestamps: FlipEventTimestamps,
-    ) {
-        let Some(output) = self.outputs.get(output_idx) else {
-            return;
-        };
-        if let Some(device) = self.device_for_output(&output.key) {
-            device
-                .atomic_commit_sink
-                .note_async_flip_event(output.output.crtc, timestamps);
-        }
+    ) -> Option<u64> {
+        let output = self.outputs.get(output_idx)?;
+        let device = self.device_for_output(&output.key)?;
+        device.atomic_commit_sink.note_async_flip_event(
+            &device.device,
+            output.output.crtc,
+            timestamps,
+        )
     }
 
     pub(crate) fn note_direct_present_received(&self, output_idx: usize) {

@@ -1,4 +1,7 @@
-use super::{round_a::damage_cursor_root, support::AtomicCursorFixture};
+use super::{
+    round_a::damage_cursor_root,
+    support::{AtomicCursorFixture, cursor_decision_deadline_clock},
+};
 
 fn argb_cursor(
     fixture: &mut AtomicCursorFixture,
@@ -317,6 +320,9 @@ fn atomic_cursor_only_shared_fb_survives_staggered_replacement() {
         .backend
         .platform
         .for_tests_accept_output_power_commits();
+    fixture
+        .backend
+        .for_tests_set_monotonic_clock(cursor_decision_deadline_clock());
 
     let root = fixture.backend.core.window_id;
     let first_pixels = [0x11, 0x22, 0x33, 0xff];
@@ -344,9 +350,7 @@ fn atomic_cursor_only_shared_fb_survives_staggered_replacement() {
             .cursor_buffer_ledger
             .records()
             .iter()
-            .filter(
-                |record| matches!(record, CursorBufferRecord::Create { handle, .. } if *handle != 1)
-            )
+            .filter(|record| matches!(record, CursorBufferRecord::Create { .. }))
             .count(),
         2,
         "the per-device sprite pool starts with two buffers",
@@ -442,9 +446,13 @@ fn atomic_cursor_only_shared_fb_survives_staggered_replacement() {
     );
 
     fixture.retire_output(1, 8);
+    Backend::maybe_composite(&mut fixture.backend)
+        .expect("run the composition tail after retirement");
+    Backend::before_block(&mut fixture.backend);
     let mut b_replacement_accepted = false;
     for frame in 9..24 {
         Backend::maybe_composite(&mut fixture.backend).expect("retry B after its withheld event");
+        Backend::before_block(&mut fixture.backend);
         let state = &fixture.backend.platform.devices[0].cursor.crtc_states
             [&fixture.backend.platform.outputs[1].output.crtc];
         if state
@@ -462,6 +470,9 @@ fn atomic_cursor_only_shared_fb_survives_staggered_replacement() {
                 .cursor_atomic_event_pending_for_output(1)
         {
             fixture.retire_output(1, frame);
+            Backend::maybe_composite(&mut fixture.backend)
+                .expect("retry B after its retirement composition pass");
+            Backend::before_block(&mut fixture.backend);
         }
     }
     assert!(
@@ -522,6 +533,9 @@ fn atomic_cursor_only_identical_handles_are_scoped_to_each_device() {
         .backend
         .platform
         .for_tests_accept_output_power_commits();
+    fixture
+        .backend
+        .for_tests_set_monotonic_clock(cursor_decision_deadline_clock());
 
     let first_pixels = [0x1a, 0x2b, 0x3c, 0xff];
     let first_cursor = argb_cursor(&mut fixture, first_pixels, 0, 0);
@@ -651,9 +665,13 @@ fn atomic_cursor_only_identical_handles_are_scoped_to_each_device() {
     );
 
     fixture.retire_output(1, 7);
+    Backend::maybe_composite(&mut fixture.backend)
+        .expect("run the composition tail after second-device retirement");
+    Backend::before_block(&mut fixture.backend);
     let mut second_replacement_event = false;
     for frame in 8..24 {
         Backend::maybe_composite(&mut fixture.backend).expect("retry second-device replacement");
+        Backend::before_block(&mut fixture.backend);
         let binding = cursor_binding(&fixture, 1);
         if binding.lease == first_replacement.lease
             && (fixture.backend.scene.has_pending_page_flip(1)
@@ -672,6 +690,9 @@ fn atomic_cursor_only_identical_handles_are_scoped_to_each_device() {
                 .cursor_atomic_event_pending_for_output(1)
         {
             fixture.retire_output(1, frame);
+            Backend::maybe_composite(&mut fixture.backend)
+                .expect("retry the second-device replacement after retirement");
+            Backend::before_block(&mut fixture.backend);
         }
     }
     assert!(
@@ -750,9 +771,7 @@ fn atomic_cursor_only_pool_pressure_keeps_only_newest_animation() {
             .cursor_buffer_ledger
             .records()
             .iter()
-            .filter(
-                |record| matches!(record, CursorBufferRecord::Create { handle, .. } if *handle != 1)
-            )
+            .filter(|record| matches!(record, CursorBufferRecord::Create { .. }))
             .count(),
         2,
         "N=2 starts with two sprite buffers before pool pressure",
@@ -858,7 +877,7 @@ fn atomic_cursor_only_pool_pressure_keeps_only_newest_animation() {
         .records()
         .into_iter()
         .filter_map(|record| match record {
-            CursorBufferRecord::AddFb { handle, fb, .. } if handle != 1 => Some(fb),
+            CursorBufferRecord::AddFb { fb, .. } => Some(fb),
             _ => None,
         })
         .collect();
@@ -873,9 +892,7 @@ fn atomic_cursor_only_pool_pressure_keeps_only_newest_animation() {
             .cursor_buffer_ledger
             .records()
             .iter()
-            .filter(|record| {
-                matches!(record, CursorBufferRecord::Create { handle, .. } if *handle != 1)
-            })
+            .filter(|record| { matches!(record, CursorBufferRecord::Create { .. }) })
             .count(),
         3,
         "N=2 CRTCs cap the pool at max(2, N+1)=3 sprite buffers",
@@ -918,9 +935,7 @@ fn atomic_cursor_only_pool_pressure_keeps_only_newest_animation() {
             .cursor_buffer_ledger
             .records()
             .iter()
-            .filter(|record| {
-                matches!(record, CursorBufferRecord::Create { handle, .. } if *handle != 1)
-            })
+            .filter(|record| { matches!(record, CursorBufferRecord::Create { .. }) })
             .count(),
         3,
         "pressure defers animation instead of growing past the bound",
@@ -996,9 +1011,7 @@ fn atomic_cursor_only_pool_pressure_keeps_only_newest_animation() {
             .cursor_buffer_ledger
             .records()
             .iter()
-            .filter(|record| {
-                matches!(record, CursorBufferRecord::Create { handle, .. } if *handle != 1)
-            })
+            .filter(|record| { matches!(record, CursorBufferRecord::Create { .. }) })
             .count(),
         3,
         "the full pool defers newest animation without growing beyond max(2, N+1)",
@@ -1078,9 +1091,7 @@ fn atomic_cursor_only_pool_pressure_keeps_only_newest_animation() {
             .cursor_buffer_ledger
             .records()
             .iter()
-            .filter(|record| {
-                matches!(record, CursorBufferRecord::Create { handle, .. } if *handle != 1)
-            })
+            .filter(|record| { matches!(record, CursorBufferRecord::Create { .. }) })
             .count(),
         3,
         "pressure reuses a released slot without growing past the pool bound",

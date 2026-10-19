@@ -176,7 +176,6 @@ fn atomic_cursor_only_window_enter_never_restores_p0() {
         }
 
         let atomic_start = sink_atomic.records().len();
-        let legacy_start = fixture.recorders.legacy_cursor.records().len();
         Backend::warp_pointer_root(&mut fixture.backend, &mut fixture.state, p1.0, p1.1);
         assert_eq!(
             (
@@ -189,11 +188,6 @@ fn atomic_cursor_only_window_enter_never_restores_p0() {
             sink_atomic.records().len(),
             atomic_start,
             "motion waits behind the accepted primary cursor obligation",
-        );
-        assert_eq!(
-            fixture.recorders.legacy_cursor.records().len(),
-            legacy_start,
-            "current-position intent emits no legacy cursor ioctl",
         );
         if motion_before_acceptance {
             complete_copied_frame(&mut fixture);
@@ -226,11 +220,16 @@ fn atomic_cursor_only_window_enter_never_restores_p0() {
         }
 
         fixture.retire_output(0, 2);
+        Backend::maybe_composite(&mut fixture.backend)
+            .expect("run the composition tail after direct retirement");
+        Backend::before_block(&mut fixture.backend);
         if fixture.backend.platform.any_cursor_commit_in_flight() {
             fixture.retire_output(0, 3);
+            Backend::maybe_composite(&mut fixture.backend)
+                .expect("run the composition tail after cursor retirement");
+            Backend::before_block(&mut fixture.backend);
         }
-        let position_after_motion =
-            cursor_position_trace(&fixture, &sink_atomic, atomic_start, legacy_start);
+        let position_after_motion = cursor_position_trace(&fixture, &sink_atomic, atomic_start);
         let layout = &fixture.backend.platform.outputs[0];
         let expected = (p1.0 - 7 - layout.x, p1.1 - 9 - layout.y);
         assert!(
@@ -257,8 +256,7 @@ fn atomic_cursor_only_window_enter_never_restores_p0() {
                     AtomicCommitKind::CursorOnly,
                 ]
             },
-            "complete accepted cursor operation sequence after entry: {final_records:#?}; legacy={:#?}",
-            fixture.recorders.legacy_cursor.records(),
+            "complete accepted cursor operation sequence after entry: {final_records:#?}",
         );
         assert!(
             final_records
@@ -266,7 +264,7 @@ fn atomic_cursor_only_window_enter_never_restores_p0() {
                 .all(|record| record.result == ScriptedResult::Ok)
         );
         assert_eq!(
-            cursor_position_trace(&fixture, &sink_atomic, atomic_start, legacy_start),
+            cursor_position_trace(&fixture, &sink_atomic, atomic_start),
             vec![(expected, true)],
             "every post-motion position operation is the accepted P1 position",
         );
@@ -302,7 +300,6 @@ fn atomic_cursor_only_window_enter_never_restores_p0() {
         assert!(drain.events.is_empty());
         assert!(drain.properties.iter().all(|update| update.value == 0));
         assert_eq!(drain.result, ScriptedResult::Ok);
-        assert!(fixture.recorders.legacy_cursor.records().is_empty());
         fixture.assert_cursor_quiescent();
         let ledger = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
         drop(fixture);
@@ -369,7 +366,6 @@ fn cursor_position_trace(
     fixture: &AtomicCursorFixture,
     sink_atomic: &crate::drm::atomic::tests_support::RecordingAtomicCommitExecutor,
     atomic_start: usize,
-    legacy_start: usize,
 ) -> Vec<((i32, i32), bool)> {
     use crate::drm::atomic::tests_support::ScriptedResult;
 
@@ -396,15 +392,6 @@ fn cursor_position_trace(
             positions.push(((x, y), record.result == ScriptedResult::Ok));
         }
     }
-    positions.extend(
-        fixture
-            .recorders
-            .legacy_cursor
-            .records()
-            .into_iter()
-            .skip(legacy_start)
-            .filter_map(|record| record.position.map(|position| (position, true))),
-    );
     positions
 }
 

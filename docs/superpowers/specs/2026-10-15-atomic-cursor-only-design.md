@@ -115,6 +115,45 @@ merged first (#249); this work adapts to it. C1's tearing spec (`2026-10-14-tear
 cursor plane is hidden at the unflip retirement. Under this design that detach is owned by the frame that starts
 painting the software cursor (§2.2), and this spec supersedes that wording.
 
+### 2.6 When a cursor-only commit is sent (C11 addendum)
+
+Found in C11 on amdgpu, where flip events arrive at vblank and only one commit per CRTC fits in a vblank. While the
+pointer moves over a 60 fps FIFO Vulkan client (mpv), the branch alternates `SceneWithCursor` and `CursorOnly`
+commits one per vblank, so the client drops to 30 fps. Master shows 60 `SceneWithCursor`. A µs probe on the AMD
+showed what happens after each scene flip event. The cursor-only commit is submitted at p50 19 µs (max 40) after the
+event. The client's next `PresentPixmap` is processed at p50 28 µs (max 64). The Present was already queued in the
+server when the event was handled: the flip-event handler sends the cursor-only commit before the core loop reads
+that iteration's client requests.
+
+Rules:
+
+- **One output-local gate.** After a flip retires on output O while O has eligible cursor intent, O is
+  *awaiting a frame*. While O is awaiting, no ordinary cursor-only commit for O is sent. The rule covers every lane:
+  the flip-event handler, the held-direct lane, independent peer-output updates and the post-compose fallback. A
+  scene or direct commit built for O in that time carries the intent (`SceneWithCursor`, or the direct successor's
+  cursor delta). The C11 r1–r3 exceptions keep going cursor-only at once:
+  - the recovery detach (§3);
+  - a failed scene submit, which releases its cursor intents;
+  - a retry that would otherwise park cursor intent.
+- **When the wait ends.** The wait ends at the first *decision point* where O has no scene or direct work, and the
+  core reports that its bounded dispatch (request count and time budget) left no request queued. It also ends when
+  2 ms have passed since the retired flip event. In both cases one cursor-only commit carries the intent.
+  - Decision points are the loop's composition tail and `before_block`.
+  - The core reports its backlog as one boolean, before composition, after each dispatch. It never says which
+    requests are queued, and the fairness budgets do not change.
+- **How the 2 ms bound is measured.** It is measured in loop time. The core loop does not preempt a request, and
+  the pointer motion itself is processed by the same loop. So an expired wait is serviced at the first decision
+  point after expiry, and the deadline counts towards the poll timeout. A request flood cannot starve the cursor
+  past the first decision point after the bound.
+- **Idle scene.** With no backlog and an idle scene, the cursor-only commit goes out in the iteration that
+  retired the flip, never a vblank later.
+- **Other drivers.** NVIDIA and other drivers that accept a scene commit and a cursor-only commit in the same vblank
+  keep working as today. This ordering must not reduce their cursor rate.
+
+Acceptance on AMD, with the pointer moving at 250 Hz over a windowed 60 fps FIFO client: scene commits ≈60/s, and
+cursor-only commits ≈0 while the scene runs every vblank. The motion→accept p99 must not regress beyond one dispatch
+iteration (tens of µs).
+
 ## 3. Errors
 
 - **Attribution.** As today, a rejected commit that carried cursor properties is tested with `TEST_ONLY` without
@@ -171,6 +210,23 @@ no pending intents, no in-flight obligations, no leaked framebuffers.
    frame shows two cursors. It also includes a SW→HW show failure (one cursorless
    frame, then a SW recompose), and repeated rejected animation frames (no retry loop: one retry per key per epoch).
 11. Gate: no `set_cursor2` / `move_cursor` left under `crates/`.
+12. Flip-time ordering (§2.6), through `run_core`. The model is vblank-locked: one commit per CRTC in flight, and the
+   event is delivered once per vblank. A Present client works like Mesa FIFO: it presents its next frame as soon as
+   it sees its COMPLETE, so that Present is already queued when the next flip event is handled. Continuous pointer
+   motion runs throughout. Over 30 vblanks, every vblank carries a scene commit with the cursor
+   (`SceneWithCursor` ≥ 28), and no vblank is spent on a cursor-only commit while the client has a frame queued.
+   With the client stopped, the cursor-only lane still moves the cursor every vblank. A third case queues the
+   PresentPixmap behind more requests than the dispatch budget allows: the decision waits for the backlog and the
+   cursor rides the scene. A fourth case keeps a backlog of unrelated requests queued for the whole run, with the
+   injected clock advancing during dispatch and across expiry: the cursor-only commit goes out at the first decision
+   point after 2 ms. A fifth case holds a direct (fullscreen) frame of a FIFO client: the held-direct lane honours
+   the gate, so the direct successor carries the cursor. Mutations:
+   - drain the cursor in the flip handler again → fails;
+   - evaluate scene work before the queued client requests → fails;
+   - delay the cursor-only commit to the next vblank when the scene is idle → fails the idle half;
+   - ignore the backlog report → fails the third case;
+   - drop the 2 ms bound → fails the fourth case;
+   - let the held-direct or post-compose lane bypass the gate → fails the fifth or third case.
 
 ## 5. Hardware validation (with the user's approval, per card)
 

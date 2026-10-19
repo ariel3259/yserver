@@ -1213,7 +1213,6 @@ fn grouped_direct_waits_all_outputs_and_uses_selected_reference_sample() {
 
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     push_test_output(&mut b, 2);
-    b.pstate.scanout_m2.cursor_bound_all = true;
 
     let crtc_id = 0x5400;
     bind_test_randr_crtc(&mut b, 0, crtc_id);
@@ -1267,6 +1266,7 @@ fn grouped_direct_waits_all_outputs_and_uses_selected_reference_sample() {
         event,
         completion_output_idx: 0,
         completion_clock: None,
+        accepted_event_id: Some(1),
         awaiting_outputs: std::collections::HashSet::from([0, 1]),
         async_outcome: crate::drm::async_flip::AsyncOutcome::NotRequested,
     });
@@ -1281,7 +1281,7 @@ fn grouped_direct_waits_all_outputs_and_uses_selected_reference_sample() {
         ust: 9_999,
         source: PresentClockSource::PageFlip,
     };
-    assert!(b.retire_direct_output(0, reference));
+    assert!(b.retire_direct_output(0, Some(1), reference));
     assert!(b.pstate.scanout_m2.completed.is_empty());
     assert!(b.pstate.scanout_m2.current.is_none());
     assert_eq!(
@@ -1294,7 +1294,7 @@ fn grouped_direct_waits_all_outputs_and_uses_selected_reference_sample() {
         "the selected CRTC sample is cached without completing early"
     );
 
-    assert!(b.retire_direct_output(1, other));
+    assert!(b.retire_direct_output(1, Some(1), other));
     assert_eq!(b.pstate.scanout_m2.completed.len(), 1);
     assert_eq!(
         b.pstate.scanout_m2.completed[0].completion_clock,
@@ -1305,7 +1305,7 @@ fn grouped_direct_waits_all_outputs_and_uses_selected_reference_sample() {
     assert!(b.pstate.scanout_m2.current.is_some());
     assert!(b.pstate.scanout_m2.idled.is_empty());
     assert!(
-        !b.retire_direct_output(1, other),
+        !b.retire_direct_output(1, Some(1), other),
         "a duplicate retirement cannot emit a second completion"
     );
     assert_eq!(b.pstate.scanout_m2.completed.len(), 1);
@@ -2385,6 +2385,8 @@ fn active_direct_scanout_unflips_on_cursor_output_fallback() {
     backend.handle_cursor_move_outcome(crate::kms::render::platform::CursorMoveOutcome {
         ebusy_count: 0,
         fallback_changed: true,
+
+        accepted_detach: false,
         retry_required: false,
     });
     assert!(backend.pstate.scanout_m2.unflip_requested);
@@ -2400,6 +2402,8 @@ fn active_direct_scanout_unflips_and_wakes_for_cursor_rollback_retry() {
     backend.handle_cursor_move_outcome(crate::kms::render::platform::CursorMoveOutcome {
         ebusy_count: 0,
         fallback_changed: false,
+
+        accepted_detach: false,
         retry_required: true,
     });
     assert!(backend.scene.scene_structure_dirty);
@@ -2870,12 +2874,15 @@ fn cursor_einval_rejection_keeps_prior_atomic_binding() {
         })
         .collect();
     Backend::warp_pointer_root(&mut backend, &mut state, 799, 141);
-    recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EINVAL)));
-    recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EINVAL)));
+    // Each refused motion is followed by its explicit detach (spec §3). Both
+    // detaches are refused too, so every output keeps its accepted binding.
+    for _ in 0..4 {
+        recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EINVAL)));
+    }
     Backend::maybe_composite(&mut backend).expect("submit rejected cursor moves");
 
     let rejected = recorder.records();
-    assert_eq!(rejected.len(), 2);
+    assert_eq!(rejected.len(), 4);
     assert!(rejected.iter().all(|record| {
         record.kind == crate::drm::atomic::AtomicCommitKind::CursorOnly
             && record.result
@@ -2885,17 +2892,6 @@ fn cursor_einval_rejection_keeps_prior_atomic_binding() {
                 }
     }));
     assert!(backend.platform.any_cursor_plane_visible());
-    assert!(
-        backend
-            .platform
-            .services
-            .test_recorders
-            .as_ref()
-            .expect("test recorders")
-            .legacy_cursor
-            .records()
-            .is_empty()
-    );
     for (output, previous) in backend.platform.outputs.iter().zip(prior) {
         let cursor = backend.platform.devices[0]
             .cursor
@@ -2917,56 +2913,53 @@ fn cursor_einval_rejection_keeps_prior_atomic_binding() {
         );
     }
 
+    // Both detaches were refused: the retained bindings stay bound, and their
+    // cursor-only work is suppressed until a successful lifecycle disable
+    // (spec §3). The Backend hide cannot retry the refused detach.
+    assert!(backend.platform.any_cursor_plane_visible());
     Backend::set_cursor_hidden(&mut backend, true);
     let root = backend.core.window_id;
     Backend::clear_area(&mut backend, None, root, 0, None, 0, 0, 1600, 600, (0, 0))
         .expect("damage root for Backend cursor hide");
-    for frame in 1..=8 {
-        Backend::maybe_composite(&mut backend).expect("schedule Backend cursor hide");
-        let mut retired = false;
-        for output_idx in 0..backend.platform.outputs.len() {
-            if backend.scene.has_pending_page_flip(output_idx)
-                || backend
-                    .platform
-                    .cursor_atomic_event_pending_for_output(output_idx)
-            {
-                retire_atomic_cursor_test_output(&mut backend, &mut state, output_idx, frame);
-                retired = true;
-            }
-        }
-        if !retired
-            && !backend.scene.has_pending_page_flips()
-            && !backend.platform.any_cursor_commit_in_flight()
+    Backend::maybe_composite(&mut backend).expect("schedule Backend cursor hide");
+    assert_eq!(
+        recorder
+            .records()
+            .iter()
+            .filter(|record| record.kind == crate::drm::atomic::AtomicCommitKind::CursorOnly)
+            .count(),
+        4,
+        "a suppressed hide sends no further cursor-only request",
+    );
+    assert!(backend.platform.any_cursor_plane_visible());
+    for (frame, output_idx) in (10_u32..).zip(0..backend.platform.outputs.len()) {
+        if backend.scene.has_pending_page_flip(output_idx)
+            || backend
+                .platform
+                .cursor_atomic_event_pending_for_output(output_idx)
         {
-            break;
+            retire_atomic_cursor_test_output(&mut backend, &mut state, output_idx, frame);
         }
     }
+    backend.platform.for_tests_accept_output_power_commits();
+    backend
+        .disable_output()
+        .expect("successful lifecycle disable detaches the retained bindings");
     assert!(!backend.platform.any_cursor_plane_visible());
     assert_atomic_cursor_quiescent(&backend);
-    assert!(
-        backend
-            .platform
-            .services
-            .test_recorders
-            .as_ref()
-            .expect("test recorders")
-            .legacy_cursor
-            .records()
-            .is_empty()
-    );
     assert_eq!(
         recorder
             .records()
             .iter()
             .map(|record| record.kind)
-            .collect::<Vec<_>>(),
-        vec![
+            .collect::<Vec<_>>()[..4],
+        [
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
-            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
-            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            crate::drm::atomic::AtomicCommitKind::CursorOnly,
+            crate::drm::atomic::AtomicCommitKind::CursorOnly,
         ],
-        "two rejected moves retain both bindings, then Backend hides detach them",
+        "two refused moves and their refused detaches retain both bindings",
     );
 }
 
@@ -3559,17 +3552,6 @@ fn showing_cursor_during_direct_scanout_rebinds_or_requests_unflip() {
     }
     assert!(!backend.platform.any_cursor_plane_visible());
     assert_atomic_cursor_quiescent(&backend);
-    assert!(
-        backend
-            .platform
-            .services
-            .test_recorders
-            .as_ref()
-            .expect("test recorders")
-            .legacy_cursor
-            .records()
-            .is_empty()
-    );
 }
 
 fn seed_two_atomic_cursor_positions(
@@ -3854,7 +3836,13 @@ fn direct_successor_waits_for_retirement_and_carries_motion() {
     );
     assert_atomic_cursor_properties(&records[4], &unflip_positions);
     assert_eq!(
-        backend.pstate.scanout_m2.unflip_awaiting_outputs,
+        backend
+            .pstate
+            .scanout_m2
+            .unflip_awaiting_outputs
+            .keys()
+            .copied()
+            .collect::<std::collections::HashSet<_>>(),
         std::collections::HashSet::from([0, 1]),
     );
 

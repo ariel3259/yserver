@@ -59,85 +59,6 @@ use std::{
     rc::Rc,
 };
 
-#[derive(Clone, Copy)]
-pub(crate) enum TestCursorHideResult {
-    Ok,
-    Error(i32),
-}
-
-#[derive(Default)]
-pub(crate) struct RecordingCursorHideExecutor {
-    calls: RefCell<Vec<::drm::control::crtc::Handle>>,
-    results: RefCell<VecDeque<TestCursorHideResult>>,
-}
-
-impl RecordingCursorHideExecutor {
-    pub(crate) fn script(&self, results: impl IntoIterator<Item = TestCursorHideResult>) {
-        self.results.borrow_mut().extend(results);
-    }
-
-    pub(crate) fn calls(&self) -> Vec<::drm::control::crtc::Handle> {
-        self.calls.borrow().clone()
-    }
-}
-
-impl crate::kms::cursor_plane::CursorHideExecutor for RecordingCursorHideExecutor {
-    fn hide(
-        &self,
-        _device: &crate::drm::Device,
-        crtc: ::drm::control::crtc::Handle,
-    ) -> io::Result<()> {
-        self.calls.borrow_mut().push(crtc);
-        match self
-            .results
-            .borrow_mut()
-            .pop_front()
-            .unwrap_or(TestCursorHideResult::Error(libc::ENOTTY))
-        {
-            TestCursorHideResult::Ok => Ok(()),
-            TestCursorHideResult::Error(errno) => Err(io::Error::from_raw_os_error(errno)),
-        }
-    }
-}
-
-type CursorShowCall = (::drm::control::crtc::Handle, (i32, i32), i32, i32);
-
-#[derive(Default)]
-pub(crate) struct RecordingCursorShowExecutor {
-    calls: RefCell<Vec<CursorShowCall>>,
-}
-
-impl RecordingCursorShowExecutor {
-    pub(crate) fn calls(&self) -> Vec<CursorShowCall> {
-        self.calls.borrow().clone()
-    }
-}
-
-impl crate::kms::cursor_plane::CursorShowExecutor for RecordingCursorShowExecutor {
-    fn show(
-        &self,
-        _device: &crate::drm::Device,
-        _buffer: &crate::kms::cursor_plane::CursorPlaneBuffer,
-        crtc: ::drm::control::crtc::Handle,
-        hotspot: (i32, i32),
-        img_x: i32,
-        img_y: i32,
-    ) -> io::Result<()> {
-        self.calls.borrow_mut().push((crtc, hotspot, img_x, img_y));
-        Ok(())
-    }
-
-    fn move_to(
-        &self,
-        _device: &crate::drm::Device,
-        _crtc: ::drm::control::crtc::Handle,
-        _img_x: i32,
-        _img_y: i32,
-    ) -> io::Result<()> {
-        Ok(())
-    }
-}
-
 use yserver_core::{
     backend::{Backend, CrtcConfigApply, CrtcConfigToken, Dri3Caps, ModeSpec},
     core_loop::{CoreSender, Message},
@@ -185,7 +106,6 @@ fn push_test_device(backend: &mut KmsBackend, key: DrmDeviceKey) {
                 crate::kms::render::platform::flip_events::DrmPageFlipEventSource,
             ),
             cursor_buffer_io: std::rc::Rc::new(crate::kms::cursor_plane::ops::DrmCursorBufferIo),
-            legacy_cursor_io: std::rc::Rc::new(crate::kms::cursor_plane::ops::DrmLegacyCursorIo),
             test_page_flip_event_source: None,
             cursor: crate::kms::render::platform::KmsCursorState::new(),
         });
@@ -1001,6 +921,7 @@ fn retain_direct_frame_from_source_test(
         },
         completion_output_idx: 0,
         completion_clock,
+        accepted_event_id: Some(1),
         awaiting_outputs: std::collections::HashSet::new(),
         async_outcome: crate::drm::async_flip::AsyncOutcome::NotRequested,
     });
@@ -1244,6 +1165,7 @@ pub(super) fn install_direct_frame_for_target_test(
         },
         completion_output_idx: 0,
         completion_clock,
+        accepted_event_id: Some(1),
         awaiting_outputs: if current {
             std::collections::HashSet::new()
         } else {

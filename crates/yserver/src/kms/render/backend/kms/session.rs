@@ -140,8 +140,12 @@ impl KmsBackend {
             scanout_m1: ScanoutM1ProbeCache::new(),
             scanout_m2: ScanoutM2State::new(),
             tearing: Tearing::new(),
+            pending_cursor_decisions: HashMap::new(),
+            cursor_decision_topology_epoch: 0,
+            request_backlog: false,
             vt_resume_executor: std::rc::Rc::new(DrmVtResumeExecutor),
             monotonic_clock: std::rc::Rc::clone(&platform.services.monotonic_clock),
+            cursor_decision_observer: std::rc::Rc::new(|_, _| {}),
             immediate_wake_guard:
                 crate::kms::render::backend::kms::state::ImmediateWakeGuard::default(),
             armed_vblank_targets: std::collections::HashMap::new(),

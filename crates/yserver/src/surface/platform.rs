@@ -399,7 +399,7 @@ impl OutputSink for SurfacePlatform {
         _output_idx: usize,
         _bo_idx: usize,
         _fd: Option<OwnedFd>,
-    ) -> io::Result<crate::kms::render::scene::CursorCommitReceipt> {
+    ) -> io::Result<(crate::kms::render::scene::CursorCommitReceipt, Option<u64>)> {
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }
 }
@@ -469,6 +469,7 @@ fn accept_cursor_frame(
             }
             accepted_cursor_mode(platform)
         }
+        CursorFrameAssignment::CursorlessReplacement => accepted_cursor_mode(platform),
     }
 }
 
@@ -537,9 +538,12 @@ impl XBackend<SurfacePlatform> {
                 }
             }
             if self.platform.outputs[idx].retirable()
-                && self
-                    .scene
-                    .handle_page_flip_complete(idx, &mut self.store, &mut self.platform)
+                && self.scene.handle_page_flip_complete(
+                    idx,
+                    None,
+                    &mut self.store,
+                    &mut self.platform,
+                )
             {
                 self.telemetry.record_frame_present();
                 retired_any = true;

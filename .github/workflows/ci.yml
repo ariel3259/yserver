@@ -67,8 +67,9 @@ jobs:
         # this leg would build the gated code but never execute it.
         run: cargo test --all-targets ${{ matrix.flags }} --locked
       - name: Check the source layout rules
-        # File-size ceilings, the backend/portable seam and yserver-render's
-        # dependencies (tools/check-layout.sh). Feature-independent; run once.
+        # File-size ceilings, the backend/portable seam, yserver-render's
+        # dependencies and the atomic-only cursor gate (tools/check-layout.sh).
+        # Feature-independent; run once.
         if: matrix.name == 'unix-only'
         run: sh tools/check-layout.sh
       - name: Lint the shell scripts

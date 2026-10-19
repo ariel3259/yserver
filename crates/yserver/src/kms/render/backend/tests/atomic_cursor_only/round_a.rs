@@ -1,7 +1,7 @@
-use super::support::AtomicCursorFixture;
+use super::{round_b_producers::retire_cursor_only, support::AtomicCursorFixture};
 
 #[test]
-// Mutation: rejecting valid sub-64 cursor caps or accepting zero/overflow query results breaks these allocations.
+// Mutations: rejecting valid sub-64 cursor caps or accepting zero/overflow query results breaks these plane dimensions; eagerly allocating the removed legacy cursor BO makes the no-allocation ledger assertion fail.
 fn atomic_cursor_only_cursor_cap_dimensions_use_valid_values_and_per_axis_fallbacks() {
     let rows = [
         (Some(32), Some(24), 32, 24),
@@ -15,35 +15,15 @@ fn atomic_cursor_only_cursor_cap_dimensions_use_valid_values_and_per_axis_fallba
         )
         .expect("build recording Backend cursor fixture");
         let records = fixture.recorders.cursor_buffer_ledger.records();
-        let creates: Vec<_> = records
-            .iter()
-            .filter_map(|record| match record {
-                crate::kms::cursor_plane::ops::CursorBufferRecord::Create {
-                    width, height, ..
-                } => Some((*width, *height)),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(creates, vec![(expected_width, expected_height)]);
-        let framebuffers: Vec<_> = records
-            .iter()
-            .filter_map(|record| match record {
-                crate::kms::cursor_plane::ops::CursorBufferRecord::AddFb {
-                    width,
-                    height,
-                    format,
-                    ..
-                } => Some((*width, *height, *format)),
-                _ => None,
-            })
-            .collect();
+        assert!(records.is_empty(), "cursor buffers are allocated on demand");
+        let plane = fixture.backend.platform.devices[0]
+            .cursor
+            .plane
+            .as_ref()
+            .expect("cursor topology plane");
         assert_eq!(
-            framebuffers,
-            vec![(
-                expected_width,
-                expected_height,
-                drm::buffer::DrmFourcc::Argb8888 as u32
-            )],
+            (plane.width(), plane.height()),
+            (expected_width, expected_height)
         );
         fixture.assert_cursor_quiescent();
         let ledger = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
@@ -149,17 +129,13 @@ fn atomic_cursor_only_initial_sprite_allocation_rolls_back_partial_acquisitions(
             "{label}: Deferred is not a successful upload",
         );
         assert!(
-            fixture.recorders.legacy_cursor.records().is_empty(),
-            "{label}: Deferred does not bind or replace the existing image",
-        );
-        assert!(
             !fixture.backend.platform.cursor_plane_visible_for_output(0),
             "{label}: Deferred leaves the current hardware binding unchanged",
         );
         assert_eq!(
             ledger.end_state(),
-            (1, 1, 1),
-            "{label}: only the pre-existing legacy backing remains live",
+            (0, 0, 0),
+            "{label}: failed initial staging rolls back every sprite resource",
         );
         let rollback: Vec<_> = ledger.records()[initial_records..].to_vec();
         match label {
@@ -382,7 +358,7 @@ fn atomic_cursor_only_permanent_sprite_allocation_errors_are_not_deferred() {
         );
         assert_eq!(
             ledger.end_state(),
-            (1, 1, 1),
+            (0, 0, 0),
             "{label}: rollback is complete"
         );
 
@@ -447,10 +423,7 @@ fn atomic_cursor_only_permanent_sprite_allocation_errors_are_not_deferred() {
             (0, 0, 0),
             "{label}: teardown releases resources"
         );
-        assert!(
-            initial_records > 0,
-            "{label}: fixture owns its legacy backing"
-        );
+        assert_eq!(initial_records, 0, "{label}: fixture allocates lazily");
     }
 }
 
@@ -478,8 +451,8 @@ fn atomic_cursor_only_full_buffer_argb_upload_and_cleanup() {
         })
         .count();
     assert_eq!(
-        initial_creates, 1,
-        "the legacy full-size cursor backing is initialized once"
+        initial_creates, 0,
+        "cursor sprite buffers are allocated on the first image stage"
     );
 
     let root = fixture.backend.core.window_id;
@@ -553,16 +526,29 @@ fn atomic_cursor_only_full_buffer_argb_upload_and_cleanup() {
         .filter_map(|record| match record {
             crate::kms::cursor_plane::ops::CursorBufferRecord::Create {
                 device_fd, handle, ..
-            } if handle != 1 => Some((device_fd, handle)),
+            } => Some((device_fd, handle)),
             _ => None,
         })
         .next()
         .expect("first full-size sprite allocation");
-    let first_storage = fixture
-        .recorders
-        .cursor_buffer_ledger
-        .mapped_bytes(first_create.0, first_create.1)
-        .expect("first sprite mapping remains owned by its pool");
+    let applied_sprite_bytes = |fixture: &AtomicCursorFixture| {
+        let output = &fixture.backend.platform.outputs[0];
+        let binding = fixture
+            .backend
+            .platform
+            .device_for_key(output.key.device_key)
+            .and_then(|device| device.cursor.crtc_states.get(&output.output.crtc))
+            .and_then(|state| state.applied)
+            .expect("accepted cursor binding owns the sprite");
+        fixture
+            .backend
+            .platform
+            .device_for_key(output.key.device_key)
+            .and_then(|device| device.cursor.plane.as_ref())
+            .and_then(|plane| plane.for_tests_sprite_bytes(binding.lease))
+            .expect("accepted sprite mapping remains owned by its pool")
+    };
+    let first_storage = applied_sprite_bytes(&fixture);
     assert_eq!(&first_storage[..8], &first_pixels[..8]);
     assert!(first_storage[8..256].iter().all(|byte| *byte == 0));
     assert_eq!(&first_storage[256..264], &first_pixels[8..]);
@@ -601,7 +587,7 @@ fn atomic_cursor_only_full_buffer_argb_upload_and_cleanup() {
                 handle,
                 width,
                 height,
-            } if handle != 1 => Some((device_fd, handle, width, height)),
+            } => Some((device_fd, handle, width, height)),
             _ => None,
         })
         .collect();
@@ -626,7 +612,7 @@ fn atomic_cursor_only_full_buffer_argb_upload_and_cleanup() {
                 height,
                 format,
                 ..
-            } if handle != 1 => Some((device_fd, handle, width, height, format)),
+            } => Some((device_fd, handle, width, height, format)),
             _ => None,
         })
         .collect();
@@ -640,11 +626,7 @@ fn atomic_cursor_only_full_buffer_argb_upload_and_cleanup() {
                 drm::buffer::DrmFourcc::Argb8888 as u32,
             )
     }));
-    let smaller_storage = fixture
-        .recorders
-        .cursor_buffer_ledger
-        .mapped_bytes(first_create.0, sprite_creates[1].1)
-        .expect("second full-size sprite mapping remains live");
+    let smaller_storage = applied_sprite_bytes(&fixture);
     assert_eq!(&smaller_storage[..4], &smaller_pixels);
     assert!(smaller_storage[4..].iter().all(|byte| *byte == 0));
 
@@ -666,11 +648,7 @@ fn atomic_cursor_only_full_buffer_argb_upload_and_cleanup() {
     Backend::maybe_composite(&mut fixture.backend).expect("submit reused cursor slot frame");
     fixture.retire_output(0, 5);
     fixture.retire_output(0, 6);
-    let reused_storage = fixture
-        .recorders
-        .cursor_buffer_ledger
-        .mapped_bytes(first_create.0, sprite_creates[0].1)
-        .expect("reused sprite mapping remains live");
+    let reused_storage = applied_sprite_bytes(&fixture);
     assert_eq!(&reused_storage[..4], &reused_pixels);
     assert!(
         reused_storage[4..].iter().all(|byte| *byte == 0),
@@ -768,7 +746,7 @@ fn atomic_cursor_only_full_buffer_argb_upload_and_cleanup() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: let a deferred replacement overwrite the legacy image or publish its candidate before the write completes.
+// Mutation: let a deferred replacement overwrite the applied sprite or publish its candidate before the write completes.
 fn atomic_cursor_only_deferred_replacement_keeps_live_prior_image_until_retry() {
     use crate::kms::cursor_plane::ops::CursorBufferOperation;
     use yserver_core::backend::{AnyHandle, Backend};
@@ -839,18 +817,13 @@ fn atomic_cursor_only_deferred_replacement_keeps_live_prior_image_until_retry() 
         .unwrap();
 
     let first_version = fixture.backend.cursor_records[&first_cursor.as_raw()].version;
-    let legacy_record = fixture.recorders.cursor_buffer_ledger.records()[0].clone();
-    let (device_fd, legacy_handle) = match legacy_record {
-        crate::kms::cursor_plane::ops::CursorBufferRecord::Create {
-            device_fd, handle, ..
-        } => (device_fd, handle),
-        _ => unreachable!("first cursor-buffer record allocates the legacy backing"),
-    };
-    let prior_bytes = fixture
-        .recorders
-        .cursor_buffer_ledger
-        .mapped_bytes(device_fd, legacy_handle)
-        .expect("legacy image mapping remains live");
+    let prior_bytes = fixture.backend.platform.devices[0]
+        .cursor
+        .plane
+        .as_ref()
+        .expect("cursor plane")
+        .for_tests_sprite_bytes(prior_binding.lease)
+        .expect("accepted sprite mapping remains live");
     assert_eq!(&prior_bytes[..4], &first_pixels);
     let prior_commits = fixture.recorders.atomic.records();
     assert!(prior_commits.iter().any(|record| {
@@ -867,6 +840,38 @@ fn atomic_cursor_only_deferred_replacement_keeps_live_prior_image_until_retry() 
     let replacement = create_cursor(&mut fixture, &replacement_pixels);
     Backend::define_cursor(&mut fixture.backend, None, root, replacement.as_raw())
         .expect("replace cursor through Backend");
+    let replacement_version = fixture.backend.cursor_records[&replacement.as_raw()].version;
+    assert_eq!(
+        fixture.backend.platform.devices[0]
+            .cursor
+            .crtc_states
+            .get(&fixture.backend.platform.outputs[0].output.crtc)
+            .unwrap()
+            .applied
+            .map(|binding| binding.lease.version()),
+        Some(first_version),
+        "the transient write failure leaves the prior binding accepted before retry",
+    );
+    assert_eq!(
+        fixture.backend.platform.devices[0]
+            .cursor
+            .plane
+            .as_ref()
+            .expect("cursor plane")
+            .uploaded_version(),
+        Some(first_version),
+        "a failed write does not publish the replacement image",
+    );
+    assert_eq!(
+        fixture.backend.platform.devices[0]
+            .cursor
+            .plane
+            .as_ref()
+            .expect("cursor plane")
+            .for_tests_sprite_pool_versions(),
+        (Some(replacement_version), Some(first_version)),
+        "the deferred replacement remains wanted while the accepted lease stays owned",
+    );
     Backend::clear_area(
         &mut fixture.backend,
         None,
@@ -883,7 +888,6 @@ fn atomic_cursor_only_deferred_replacement_keeps_live_prior_image_until_retry() 
     Backend::maybe_composite(&mut fixture.backend).expect("submit deferred replacement frame");
     fixture.retire_output(0, 3);
 
-    let replacement_version = fixture.backend.cursor_records[&replacement.as_raw()].version;
     assert_eq!(
         fixture.backend.platform.devices[0]
             .cursor
@@ -892,8 +896,8 @@ fn atomic_cursor_only_deferred_replacement_keeps_live_prior_image_until_retry() 
             .unwrap()
             .applied
             .map(|binding| binding.lease.version()),
-        Some(first_version),
-        "staging a replacement image does not publish it as the accepted binding",
+        Some(replacement_version),
+        "the next damage-owned scheduler pass retries and accepts the replacement",
     );
     assert_eq!(
         fixture.backend.platform.devices[0]
@@ -902,29 +906,34 @@ fn atomic_cursor_only_deferred_replacement_keeps_live_prior_image_until_retry() 
             .as_ref()
             .expect("cursor plane")
             .for_tests_sprite_pool_versions(),
-        (Some(replacement_version), Some(first_version)),
-        "the newest wanted image is kept while the prior candidate remains owned",
+        (Some(replacement_version), Some(replacement_version)),
+        "the successfully retried image is the current wanted and candidate version",
     );
+    let replacement_binding = fixture.backend.platform.devices[0]
+        .cursor
+        .crtc_states
+        .get(&fixture.backend.platform.outputs[0].output.crtc)
+        .unwrap()
+        .applied
+        .unwrap();
     assert!(fixture.backend.platform.cursor_plane_visible_for_output(0));
     assert_eq!(
-        fixture
-            .recorders
-            .cursor_buffer_ledger
-            .mapped_bytes(device_fd, legacy_handle)
-            .expect("legacy image mapping remains live"),
-        prior_bytes,
-        "failed replacement leaves the visible legacy pixels unchanged",
+        fixture.backend.platform.devices[0]
+            .cursor
+            .plane
+            .as_ref()
+            .expect("cursor plane")
+            .for_tests_sprite_bytes(replacement_binding.lease)
+            .expect("retried replacement sprite mapping remains live")[..4],
+        replacement_pixels,
+        "the accepted replacement contains the newest cursor pixels",
     );
-    assert!(fixture.recorders.legacy_cursor.records().is_empty());
     assert!(
         fixture.recorders.atomic.records()[prior_commits.len()..]
             .iter()
-            .all(|record| record.kind != crate::drm::atomic::AtomicCommitKind::CursorOnly),
-        "deferred replacement submits no atomic cursor commit",
+            .all(|record| record.kind == crate::drm::atomic::AtomicCommitKind::SceneWithCursor),
+        "the successful upload rides the damage-owned scene frame",
     );
-
-    Backend::maybe_composite(&mut fixture.backend).expect("Backend scheduler retries replacement");
-    fixture.retire_output(0, 4);
     assert_eq!(
         fixture.backend.platform.devices[0]
             .cursor
@@ -935,20 +944,13 @@ fn atomic_cursor_only_deferred_replacement_keeps_live_prior_image_until_retry() 
         Some(replacement_version),
         "successful retry publishes the replacement",
     );
-    let replacement_binding = fixture.backend.platform.devices[0]
-        .cursor
-        .crtc_states
-        .get(&fixture.backend.platform.outputs[0].output.crtc)
-        .unwrap()
-        .applied
-        .unwrap();
     assert_ne!(replacement_binding.lease, prior_binding.lease);
     assert_eq!(replacement_binding.hot_x, prior_binding.hot_x);
     assert_eq!(replacement_binding.hot_y, prior_binding.hot_y);
     let replacement_commit = fixture.recorders.atomic.records().last().unwrap().clone();
     assert_eq!(
         replacement_commit.kind,
-        crate::drm::atomic::AtomicCommitKind::CursorOnly
+        crate::drm::atomic::AtomicCommitKind::SceneWithCursor
     );
     assert!(replacement_commit.properties.iter().any(|update| {
         update.object == replacement_binding.properties.plane.into()
@@ -987,11 +989,13 @@ fn atomic_cursor_only_deferred_replacement_keeps_live_prior_image_until_retry() 
         );
     }
     assert_eq!(
-        &fixture
-            .recorders
-            .cursor_buffer_ledger
-            .mapped_bytes(device_fd, legacy_handle)
-            .expect("legacy mapping remains live")[..4],
+        &fixture.backend.platform.devices[0]
+            .cursor
+            .plane
+            .as_ref()
+            .expect("cursor plane")
+            .for_tests_sprite_bytes(replacement_binding.lease)
+            .expect("replacement applied sprite remains live")[..4],
         &replacement_pixels,
     );
 
@@ -1010,7 +1014,7 @@ fn atomic_cursor_only_deferred_replacement_keeps_live_prior_image_until_retry() 
     )
     .expect("damage root for cursor teardown");
     Backend::maybe_composite(&mut fixture.backend).expect("submit cursor hide");
-    fixture.retire_output(0, 5);
+    fixture.retire_output(0, 4);
     if fixture
         .backend
         .platform
@@ -1029,11 +1033,10 @@ fn atomic_cursor_only_deferred_replacement_keeps_live_prior_image_until_retry() 
             .collect::<Vec<_>>(),
         vec![
             crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
-            crate::drm::atomic::AtomicCommitKind::Scene,
-            crate::drm::atomic::AtomicCommitKind::CursorOnly,
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
             crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
         ],
-        "the initial attach and final hide are frame-owned around a cursor-only replacement retry",
+        "initial attach, replacement retry, and final hide are scene-owned",
     );
     let resources = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
     drop(fixture);
@@ -1240,19 +1243,17 @@ fn atomic_cursor_only_failed_sprite_write_preserves_prior_image() {
 
     let ledger = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
     let prior_version = fixture.backend.cursor_records[&prior_cursor.as_raw()].version;
-    let (device_fd, legacy_handle) = ledger
-        .records()
-        .iter()
-        .find_map(|record| match record {
-            CursorBufferRecord::Create {
-                device_fd, handle, ..
-            } => Some((*device_fd, *handle)),
-            _ => None,
-        })
-        .expect("legacy cursor backing is the first allocation");
-    let prior_mapping = ledger
-        .mapped_bytes(device_fd, legacy_handle)
-        .expect("prior cursor mapping is live");
+    let prior_binding = fixture.backend.platform.devices[0].cursor.crtc_states
+        [&fixture.backend.platform.outputs[0].output.crtc]
+        .applied
+        .expect("accepted prior cursor binding");
+    let prior_mapping = fixture.backend.platform.devices[0]
+        .cursor
+        .plane
+        .as_ref()
+        .expect("cursor plane")
+        .for_tests_sprite_bytes(prior_binding.lease)
+        .expect("prior applied sprite is live");
     assert_eq!(&prior_mapping[..4], &prior_pixels);
     let prior_commits = fixture.recorders.atomic.records();
     assert!(prior_commits.iter().any(|record| {
@@ -1276,6 +1277,49 @@ fn atomic_cursor_only_failed_sprite_write_preserves_prior_image() {
     let replacement = create_cursor(&mut fixture, &replacement_pixels);
     Backend::define_cursor(&mut fixture.backend, None, root, replacement.as_raw())
         .expect("define replacement cursor through Backend");
+    let replacement_version = fixture.backend.cursor_records[&replacement.as_raw()].version;
+    assert_eq!(
+        fixture.backend.platform.devices[0].cursor.crtc_states
+            [&fixture.backend.platform.outputs[0].output.crtc]
+            .applied
+            .map(|binding| binding.lease.version()),
+        Some(prior_version),
+        "the failed candidate write keeps the prior binding accepted until retry",
+    );
+    assert_eq!(
+        fixture
+            .backend
+            .platform
+            .cursor_plane_uploaded_version_for_output(0),
+        Some(prior_version),
+        "the failed candidate write does not publish the new image",
+    );
+    assert_eq!(
+        fixture.backend.platform.devices[0]
+            .cursor
+            .plane
+            .as_ref()
+            .expect("cursor plane")
+            .for_tests_sprite_pool_versions(),
+        (Some(replacement_version), Some(prior_version)),
+        "the failed upload retains the newest wanted version and prior candidate",
+    );
+    assert_eq!(
+        fixture.backend.platform.devices[0]
+            .cursor
+            .plane
+            .as_ref()
+            .expect("cursor plane")
+            .for_tests_sprite_bytes(prior_binding.lease),
+        Some(prior_mapping.clone()),
+        "the prior mapping remains byte-for-byte live until the retry is accepted",
+    );
+    assert_eq!(ledger.failures_taken(), vec![CursorBufferOperation::Write]);
+    assert_eq!(
+        &ledger.records()[failure_record_start..],
+        &[],
+        "the failed candidate write publishes no framebuffer before retry",
+    );
     Backend::clear_area(
         &mut fixture.backend,
         None,
@@ -1299,28 +1343,57 @@ fn atomic_cursor_only_failed_sprite_write_preserves_prior_image() {
             .unwrap()
             .applied
             .map(|binding| binding.lease.version()),
-        Some(prior_version),
-        "the cursorless primary may advance while the unavailable image leaves the prior binding accepted",
+        Some(replacement_version),
+        "the damage-owned scene retries the upload and accepts the newest cursor",
     );
+    assert!(
+        fixture
+            .backend
+            .platform
+            .cursor_atomic_event_pending_for_output(0),
+        "the accepted scene frame owns the cursor event obligation",
+    );
+    assert_eq!(
+        fixture
+            .backend
+            .platform
+            .cursor_plane_uploaded_version_for_output(0),
+        Some(replacement_version),
+        "the retry stages the newest version before scene acceptance",
+    );
+    let retry_commits = fixture.recorders.atomic.records()[prior_commits.len()..]
+        .iter()
+        .map(|record| (record.kind, record.result))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        retry_commits,
+        vec![(
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            crate::drm::atomic::tests_support::ScriptedResult::Ok,
+        )],
+        "the successful retry rides exactly one accepted scene commit",
+    );
+    fixture.retire_output(0, 3);
     assert!(
         !fixture
             .backend
             .platform
             .cursor_atomic_event_pending_for_output(0),
-        "a frame without an uploaded cursor candidate creates no cursor event obligation",
+        "scene retirement discharges the cursor event obligation",
     );
-    fixture.retire_output(0, 3);
 
-    let replacement_version = fixture.backend.cursor_records[&replacement.as_raw()].version;
     assert_eq!(
         ledger.failures_taken(),
         vec![CursorBufferOperation::Write],
         "the injected failure was consumed by candidate image staging",
     );
     assert_eq!(
-        &ledger.records()[failure_record_start..],
-        &[],
-        "failed staging does not publish a candidate framebuffer",
+        ledger.records()[failure_record_start..]
+            .iter()
+            .filter(|record| matches!(record, CursorBufferRecord::AddFb { .. }))
+            .count(),
+        0,
+        "the retry reuses the retained pool allocation without leaking a framebuffer",
     );
     assert_eq!(
         fixture.backend.platform.devices[0]
@@ -1329,44 +1402,25 @@ fn atomic_cursor_only_failed_sprite_write_preserves_prior_image() {
             .as_ref()
             .expect("cursor plane")
             .for_tests_sprite_pool_versions(),
-        (Some(replacement_version), Some(prior_version)),
-        "wanted replacement remains deferred while the live prior candidate is retained",
+        (Some(replacement_version), Some(replacement_version)),
+        "the retried replacement is the current wanted candidate",
     );
     assert_eq!(
         fixture
             .backend
             .platform
             .cursor_plane_uploaded_version_for_output(0),
-        Some(prior_version),
-        "allocation failure does not publish the replacement version",
+        Some(replacement_version),
+        "the retry publishes the replacement version",
     );
     assert!(fixture.backend.platform.cursor_plane_visible_for_output(0));
-    assert_eq!(
-        ledger.mapped_bytes(device_fd, legacy_handle),
-        Some(prior_mapping.clone()),
-        "the previously committed image remains bound and byte-for-byte unchanged",
-    );
-    assert!(fixture.recorders.legacy_cursor.records().is_empty());
     assert!(
         fixture.recorders.atomic.records()[prior_commits.len()..]
             .iter()
-            .all(|record| record.kind != crate::drm::atomic::AtomicCommitKind::CursorOnly),
-        "allocation failure issues no replacement atomic cursor commit",
+            .all(|record| record.kind == crate::drm::atomic::AtomicCommitKind::SceneWithCursor),
+        "the successful retry uses the damage-owned scene commit",
     );
-    assert_eq!(ledger.end_state(), (3, 3, 3));
-
-    Backend::maybe_composite(&mut fixture.backend).expect("Backend scheduler retries staging");
-    assert!(
-        fixture
-            .backend
-            .platform
-            .cursor_atomic_event_pending_for_output(0)
-    );
-    assert_eq!(
-        fixture.recorders.atomic.records().last().unwrap().kind,
-        crate::drm::atomic::AtomicCommitKind::CursorOnly,
-    );
-    fixture.retire_output(0, 4);
+    assert_eq!(ledger.end_state(), (2, 2, 2));
     assert_eq!(
         fixture
             .backend
@@ -1374,6 +1428,20 @@ fn atomic_cursor_only_failed_sprite_write_preserves_prior_image() {
             .cursor_plane_uploaded_version_for_output(0),
         Some(replacement_version),
         "Backend retry completes the replacement upload",
+    );
+    let replacement_binding = fixture.backend.platform.devices[0].cursor.crtc_states
+        [&fixture.backend.platform.outputs[0].output.crtc]
+        .applied
+        .expect("replacement cursor binding is accepted");
+    assert_eq!(
+        &fixture.backend.platform.devices[0]
+            .cursor
+            .plane
+            .as_ref()
+            .expect("cursor plane")
+            .for_tests_sprite_bytes(replacement_binding.lease)
+            .expect("applied replacement sprite is live")[..4],
+        &replacement_pixels,
     );
 
     Backend::set_cursor_hidden(&mut fixture.backend, true);
@@ -1391,7 +1459,7 @@ fn atomic_cursor_only_failed_sprite_write_preserves_prior_image() {
     )
     .expect("damage root for cursor teardown");
     Backend::maybe_composite(&mut fixture.backend).expect("submit cursor hide");
-    fixture.retire_output(0, 5);
+    fixture.retire_output(0, 4);
     if fixture
         .backend
         .platform
@@ -1410,11 +1478,10 @@ fn atomic_cursor_only_failed_sprite_write_preserves_prior_image() {
             .collect::<Vec<_>>(),
         vec![
             crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
-            crate::drm::atomic::AtomicCommitKind::Scene,
-            crate::drm::atomic::AtomicCommitKind::CursorOnly,
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
             crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
         ],
-        "the primary proceeds without the failed replacement; retry and hide use their owners",
+        "initial attach, replacement retry, and final hide are scene-owned",
     );
     let resources = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
     drop(fixture);
@@ -1560,8 +1627,8 @@ fn atomic_cursor_only_live_pool_create_failure_preserves_applied_images() {
         .filter(|record| matches!(record, CursorBufferRecord::Create { .. }))
         .count();
     assert_eq!(
-        create_count, 3,
-        "legacy storage plus both initial sprite buffers are allocated"
+        create_count, 2,
+        "the two initial sprite buffers are allocated on demand"
     );
 
     fixture.recorders.cursor_buffer_ledger.fail_after(
@@ -2042,20 +2109,10 @@ fn atomic_cursor_only_malformed_cursor_source_stops_at_request_validation() {
     let pixmap_id = ResourceId(0x1001);
     let gc_id = ResourceId(0x1002);
     let pool_records_before = fixture.recorders.cursor_buffer_ledger.records();
-    let legacy_record = pool_records_before
-        .iter()
-        .find_map(|record| match record {
-            crate::kms::cursor_plane::ops::CursorBufferRecord::Create {
-                device_fd, handle, ..
-            } => Some((*device_fd, *handle)),
-            _ => None,
-        })
-        .expect("legacy cursor backing exists");
-    let legacy_pixels_before = fixture
-        .recorders
-        .cursor_buffer_ledger
-        .mapped_bytes(legacy_record.0, legacy_record.1)
-        .expect("legacy cursor mapping is live");
+    assert!(
+        pool_records_before.is_empty(),
+        "sprite pool is lazy before a cursor is selected"
+    );
     assert_eq!(fixture.backend.effective_cursor_xid, None);
 
     let (transport, mut peer) = Transport::pair().expect("client socket pair");
@@ -2248,13 +2305,14 @@ fn atomic_cursor_only_malformed_cursor_source_stops_at_request_validation() {
         "validation cases do not allocate or stage a cursor sprite",
     );
     assert_eq!(
-        fixture
-            .recorders
-            .cursor_buffer_ledger
-            .mapped_bytes(legacy_record.0, legacy_record.1)
-            .expect("legacy cursor mapping remains live"),
-        legacy_pixels_before,
-        "validation cases do not write the legacy cursor backing",
+        fixture.backend.platform.devices[0]
+            .cursor
+            .plane
+            .as_ref()
+            .expect("cursor topology plane")
+            .for_tests_sprite_pool_versions(),
+        (None, None),
+        "validation cases do not stage an applied or candidate sprite",
     );
 
     let host_pixmap = fixture
@@ -2823,10 +2881,6 @@ fn atomic_cursor_only_atomic_binding_has_full_geometry_and_retirement() {
         "the scene request was accepted",
     );
     assert_eq!(first[0].events.len(), 1);
-    assert!(
-        recorders.legacy_cursor.records().is_empty(),
-        "eligible cursor work must not call the legacy cursor interface",
-    );
 
     let after_show = recorders.atomic.records();
     assert_eq!(
@@ -2847,7 +2901,6 @@ fn atomic_cursor_only_atomic_binding_has_full_geometry_and_retirement() {
             .contains(::drm::control::AtomicCommitFlags::PAGE_FLIP_EVENT)
     );
     assert_eq!(show.events.len(), 1);
-    assert!(recorders.legacy_cursor.records().is_empty());
     let output = &fixture.backend.platform.outputs[0];
     let crtc = output.output.crtc;
     let device_key = output.key.device_key;
@@ -3060,7 +3113,6 @@ fn atomic_cursor_only_atomic_binding_has_full_geometry_and_retirement() {
         ],
         "the accepted sequence is initial attach with frame, motion and hide through cursor-only commits",
     );
-    assert!(recorders.legacy_cursor.records().is_empty());
 
     let ledger = std::rc::Rc::clone(&recorders.cursor_buffer_ledger);
     drop(fixture);
@@ -3183,7 +3235,11 @@ fn atomic_cursor_only_rejected_attach_retains_candidate_until_backend_teardown()
             .filter(|record| !record.events.is_empty())
             .map(|record| record.kind)
             .collect::<Vec<_>>(),
-        vec![crate::drm::atomic::AtomicCommitKind::SceneWithCursor],
+        vec![
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            crate::drm::atomic::AtomicCommitKind::Scene,
+            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+        ],
         "rejected attach remains unbound through software teardown",
     );
     let resources = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
@@ -3193,233 +3249,8 @@ fn atomic_cursor_only_rejected_attach_retains_candidate_until_backend_teardown()
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutations: discard/publish a rejected candidate or report its accepted prior binding hidden.
-fn atomic_cursor_only_rejected_replacement_preserves_candidate_and_binding() {
-    use yserver_core::backend::Backend;
-
-    let Some(mut fixture) = AtomicCursorFixture::new().expect("build cursor fixture") else {
-        return;
-    };
-    fixture
-        .backend
-        .platform
-        .for_tests_accept_output_power_commits();
-    let root = fixture.backend.core.window_id;
-    let width = fixture.backend.platform.fb_w;
-    let height = fixture.backend.platform.fb_h;
-    let device_key = fixture.backend.platform.outputs[0].key.device_key;
-    let crtc = fixture.backend.platform.outputs[0].output.crtc;
-    fixture.define_visible_cursor();
-    Backend::warp_pointer_root(&mut fixture.backend, &mut fixture.state, 100, 90);
-    damage_cursor_root(&mut fixture);
-    Backend::maybe_composite(&mut fixture.backend).expect("submit initial cursor frame");
-    fixture.retire_output(0, 1);
-    fixture.retire_output(0, 2);
-    let old_binding = fixture
-        .backend
-        .platform
-        .device_for_key(device_key)
-        .unwrap()
-        .cursor
-        .crtc_states
-        .get(&crtc)
-        .unwrap()
-        .applied
-        .unwrap();
-
-    let moved_binding = old_binding;
-    let replacement_cursor = fixture.define_visible_cursor();
-    Backend::clear_area(
-        &mut fixture.backend,
-        None,
-        root,
-        0,
-        None,
-        0,
-        0,
-        width,
-        height,
-        (0, 0),
-    )
-    .expect("damage replacement through Backend");
-    fixture
-        .recorders
-        .atomic
-        .script_result(Err(std::io::Error::from_raw_os_error(libc::EINVAL)));
-    fixture
-        .recorders
-        .atomic
-        .script_result(Err(std::io::Error::from_raw_os_error(libc::EINVAL)));
-    fixture.recorders.atomic.script_result(Ok(()));
-    Backend::maybe_composite(&mut fixture.backend).expect("submit replacement frame");
-    let state_after_rejection = fixture
-        .backend
-        .platform
-        .device_for_key(device_key)
-        .unwrap()
-        .cursor
-        .crtc_states
-        .get(&crtc)
-        .unwrap();
-    let replacement_version = fixture.backend.cursor_records[&replacement_cursor].version;
-    let replacement_candidate = fixture
-        .backend
-        .platform
-        .device_for_key(device_key)
-        .unwrap()
-        .cursor
-        .plane
-        .as_ref()
-        .unwrap()
-        .candidate_sprite()
-        .unwrap();
-    assert_eq!(replacement_candidate.0.version(), replacement_version);
-
-    let rejected_applied = state_after_rejection.applied;
-    let replacement_in_flight_prior = state_after_rejection
-        .in_flight
-        .as_ref()
-        .and_then(|commit| commit.prior);
-    assert!(fixture.backend.platform.cursor_plane_visible_for_output(0));
-    let rejected = fixture
-        .recorders
-        .atomic
-        .records()
-        .into_iter()
-        .find(|record| {
-            record.result
-                == crate::drm::atomic::tests_support::ScriptedResult::Error {
-                    kind: std::io::ErrorKind::InvalidInput,
-                    raw_os_error: Some(libc::EINVAL),
-                }
-        })
-        .expect("scripted replacement rejection is recorded");
-    assert_eq!(
-        rejected.kind,
-        crate::drm::atomic::AtomicCommitKind::SceneWithCursor
-    );
-    assert_eq!(
-        rejected.result,
-        crate::drm::atomic::tests_support::ScriptedResult::Error {
-            kind: std::io::ErrorKind::InvalidInput,
-            raw_os_error: Some(libc::EINVAL),
-        }
-    );
-    assert_eq!(replacement_candidate.0.version(), replacement_version);
-    assert_eq!(
-        fixture.backend.scene.cursor_mode(),
-        crate::kms::render::scene::CursorPlaneMode::Hw,
-        "a rejected HW-only replacement leaves the accepted output mode unchanged",
-    );
-    assert_eq!(rejected_applied, Some(moved_binding));
-    assert!(replacement_in_flight_prior.is_none());
-    assert_eq!(
-        state_after_rejection.intent.map(|intent| match intent {
-            crate::kms::render::platform::cursor_state::CursorIntent::Show(binding) => {
-                binding.lease.version()
-            }
-            crate::kms::render::platform::cursor_state::CursorIntent::Hide => 0,
-        }),
-        Some(replacement_version),
-        "failed frame keeps the newest replacement actionable",
-    );
-    fixture.retire_output(0, 3);
-    let accepted_state = fixture
-        .backend
-        .platform
-        .device_for_key(device_key)
-        .unwrap()
-        .cursor
-        .crtc_states
-        .get(&crtc)
-        .unwrap();
-    let replacement_binding = accepted_state
-        .applied
-        .expect("replacement binding accepted");
-    assert_eq!(
-        replacement_binding.lease.version(),
-        replacement_version,
-        "candidate version {replacement_version}; applied {replacement_binding:?}; intent {:?}; records {:?}",
-        accepted_state.intent,
-        fixture
-            .recorders
-            .atomic
-            .records()
-            .iter()
-            .map(|record| (record.kind, record.result))
-            .collect::<Vec<_>>(),
-    );
-    assert_ne!(replacement_binding.lease, moved_binding.lease);
-    if accepted_state.in_flight.is_some() {
-        assert_eq!(
-            accepted_state
-                .in_flight
-                .as_ref()
-                .and_then(|commit| commit.prior),
-            Some(moved_binding),
-            "the accepted replacement event retains its previous lease until retirement",
-        );
-        fixture.retire_output(0, 4);
-    }
-    assert!(fixture.backend.platform.cursor_plane_visible_for_output(0));
-    let retired_state = fixture
-        .backend
-        .platform
-        .device_for_key(device_key)
-        .unwrap()
-        .cursor
-        .crtc_states
-        .get(&crtc)
-        .unwrap();
-    assert_eq!(retired_state.applied, Some(replacement_binding));
-    assert!(retired_state.in_flight.is_none());
-
-    fixture
-        .backend
-        .disable_output()
-        .expect("blocking lifecycle teardown detaches the retained prior binding");
-    assert!(!fixture.backend.platform.cursor_plane_visible_for_output(0));
-    let state = fixture
-        .backend
-        .platform
-        .device_for_key(device_key)
-        .unwrap()
-        .cursor
-        .crtc_states
-        .get(&crtc)
-        .unwrap();
-    assert!(state.applied.is_none());
-    assert!(state.in_flight.is_none());
-    assert!(state.intent.is_none());
-    fixture.assert_cursor_quiescent();
-    assert_eq!(
-        fixture
-            .recorders
-            .atomic
-            .records()
-            .iter()
-            .filter(|record| !record
-                .flags
-                .contains(::drm::control::AtomicCommitFlags::TEST_ONLY))
-            .map(|record| record.kind)
-            .collect::<Vec<_>>(),
-        vec![
-            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
-            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
-            crate::drm::atomic::AtomicCommitKind::CursorOnly,
-            crate::drm::atomic::AtomicCommitKind::Scene,
-        ],
-        "rejection retains the candidate; the cursor-only retry retires before teardown",
-    );
-    let resources = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
-    drop(fixture);
-    assert_eq!(resources.end_state(), (0, 0, 0));
-}
-
-#[test]
-#[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: update the applied binding or mark a rejected move in flight.
-fn atomic_cursor_only_rejected_motion_retains_applied_position() {
+fn atomic_cursor_only_rejected_motion_detaches_before_software() {
     use yserver_core::backend::Backend;
 
     let Some(mut fixture) = AtomicCursorFixture::new().expect("build cursor fixture") else {
@@ -3436,17 +3267,20 @@ fn atomic_cursor_only_rejected_motion_retains_applied_position() {
     Backend::maybe_composite(&mut fixture.backend).expect("submit initial cursor frame");
     fixture.retire_output(0, 1);
     fixture.retire_output(0, 2);
-    let applied = fixture
-        .backend
-        .platform
-        .device_for_key(device_key)
-        .unwrap()
-        .cursor
-        .crtc_states
-        .get(&crtc)
-        .unwrap()
-        .applied
-        .unwrap();
+    assert!(
+        fixture
+            .backend
+            .platform
+            .device_for_key(device_key)
+            .unwrap()
+            .cursor
+            .crtc_states
+            .get(&crtc)
+            .unwrap()
+            .applied
+            .is_some(),
+        "the initial hardware binding is accepted",
+    );
 
     fixture
         .recorders
@@ -3454,7 +3288,22 @@ fn atomic_cursor_only_rejected_motion_retains_applied_position() {
         .script_result(Err(std::io::Error::from_raw_os_error(libc::EINVAL)));
     Backend::warp_pointer_root(&mut fixture.backend, &mut fixture.state, 210, 115);
     Backend::maybe_composite(&mut fixture.backend).expect("submit rejected move through Backend");
-    let rejected = fixture.recorders.atomic.records().last().unwrap().clone();
+    // Detach first (spec §3): the rejected motion is followed by the explicit
+    // detach. Only the accepted detach makes the output software.
+    let live: Vec<_> = fixture
+        .recorders
+        .atomic
+        .records()
+        .into_iter()
+        .filter(|record| {
+            !record
+                .flags
+                .contains(::drm::control::AtomicCommitFlags::TEST_ONLY)
+        })
+        .collect();
+    let [.., rejected, detach] = live.as_slice() else {
+        panic!("rejected motion then explicit detach: {live:?}");
+    };
     assert_eq!(
         rejected.kind,
         crate::drm::atomic::AtomicCommitKind::CursorOnly
@@ -3466,6 +3315,15 @@ fn atomic_cursor_only_rejected_motion_retains_applied_position() {
             raw_os_error: Some(libc::EINVAL),
         }
     );
+    assert_eq!(
+        detach.kind,
+        crate::drm::atomic::AtomicCommitKind::CursorOnly
+    );
+    assert_eq!(detach.properties.len(), 2, "FB_ID=0 and CRTC_ID=0 only");
+    assert_eq!(
+        detach.result,
+        crate::drm::atomic::tests_support::ScriptedResult::Ok
+    );
     let state = fixture
         .backend
         .platform
@@ -3475,14 +3333,18 @@ fn atomic_cursor_only_rejected_motion_retains_applied_position() {
         .crtc_states
         .get(&crtc)
         .unwrap();
-    assert_eq!(state.applied, Some(applied));
-    assert!(state.in_flight.is_none());
+    assert_eq!(state.applied, None, "the accepted detach unbinds the plane");
+    assert!(state.in_flight.is_some(), "the detach owes its flip event");
     assert!(state.intent.is_none());
-    assert!(fixture.backend.platform.cursor_plane_visible_for_output(0));
-    assert_ne!(
+    assert!(!fixture.backend.platform.cursor_plane_visible_for_output(0));
+    retire_cursor_only(&mut fixture, 3);
+    damage_cursor_root(&mut fixture);
+    Backend::maybe_composite(&mut fixture.backend).expect("submit software recompose");
+    fixture.retire_output(0, 4);
+    assert_eq!(
         fixture.backend.scene.cursor_mode(),
         crate::kms::render::scene::CursorPlaneMode::Sw,
-        "rejected motion cannot reveal a software cursor beside retained HW",
+        "the accepted detach leaves the cursor visible in software",
     );
 
     Backend::set_cursor_hidden(&mut fixture.backend, true);
@@ -3564,9 +3426,11 @@ fn atomic_cursor_only_rejected_motion_retains_applied_position() {
         vec![
             crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
-            crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
+            crate::drm::atomic::AtomicCommitKind::CursorOnly,
+            crate::drm::atomic::AtomicCommitKind::Scene,
+            crate::drm::atomic::AtomicCommitKind::Scene,
         ],
-        "the shared frames carry attach and teardown while direct cursor motion stays cursor-only",
+        "the attach, the rejected motion, the explicit detach, then cursorless software frames",
     );
     let resources = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
     drop(fixture);
@@ -3643,6 +3507,9 @@ fn atomic_cursor_only_motion_preserves_pending_detach_intent() {
     );
     assert!(!fixture.backend.platform.cursor_plane_visible_for_output(0));
     fixture.retire_output(0, 4);
+    Backend::maybe_composite(&mut fixture.backend)
+        .expect("retry the retained intent after retirement");
+    Backend::before_block(&mut fixture.backend);
     assert!(!fixture.backend.scene.has_pending_page_flip(0));
     assert!(fixture.backend.platform.cursor_plane_visible_for_output(0));
     assert!(
@@ -3925,6 +3792,10 @@ fn atomic_cursor_only_vt_release_keeps_hidden_cursor_detached_after_resume() {
         .atomic
         .script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
     fixture.recorders.atomic.script_result(Ok(()));
+    fixture
+        .recorders
+        .atomic
+        .script_result(Err(std::io::Error::from_raw_os_error(libc::ENOMEM)));
     Backend::set_cursor_hidden(&mut fixture.backend, true);
     damage_cursor_root(&mut fixture);
     Backend::maybe_composite(&mut fixture.backend).expect("submit rejected shared hide frame");
@@ -3944,6 +3815,25 @@ fn atomic_cursor_only_vt_release_keeps_hidden_cursor_detached_after_resume() {
                 )
         })
         .expect("scripted shared hide rejection is recorded");
+    let failed_retry = fixture
+        .recorders
+        .atomic
+        .records()
+        .into_iter()
+        .find(|record| {
+            record.kind == crate::drm::atomic::AtomicCommitKind::Scene
+                && !record
+                    .flags
+                    .contains(::drm::control::AtomicCommitFlags::TEST_ONLY)
+                && record.result
+                    == (crate::drm::atomic::tests_support::ScriptedResult::Error {
+                        kind: std::io::ErrorKind::OutOfMemory,
+                        raw_os_error: Some(libc::ENOMEM),
+                    })
+        })
+        .expect("failed cursorless retry leaves the primary unsubmitted");
+    assert_eq!(failed_retry.events.len(), 1);
+    assert!(!fixture.backend.scene.has_pending_page_flip(0));
     assert_eq!(
         rejected_hide.kind,
         crate::drm::atomic::AtomicCommitKind::SceneWithCursor
@@ -4117,11 +4007,11 @@ fn atomic_cursor_only_vt_release_keeps_hidden_cursor_detached_after_resume() {
             crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
             crate::drm::atomic::AtomicCommitKind::Scene,
             crate::drm::atomic::AtomicCommitKind::Scene,
+            crate::drm::atomic::AtomicCommitKind::Scene,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
         ],
-        "VT sequence is attach, rejected hide, blocking detach, resume modeset, and hidden detach",
+        "VT sequence includes a failed cursorless hide retry before lifecycle detach",
     );
-    assert!(fixture.recorders.legacy_cursor.records().is_empty());
     assert_eq!(fixture.recorders.mode_blobs.live_count(), 0);
     let resources = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
     drop(fixture);
@@ -4131,7 +4021,7 @@ fn atomic_cursor_only_vt_release_keeps_hidden_cursor_detached_after_resume() {
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: inject FB 0x8101 while the recorded Backend commit expects 0x8100; the direct FB assertion must fail.
-fn atomic_cursor_only_direct_probe_uses_backend_recorded_sink() {
+pub(super) fn atomic_cursor_only_direct_probe_uses_backend_recorded_sink() {
     use yserver_core::backend::Backend;
 
     let Some(mut fixture) = AtomicCursorFixture::new_with_cursor_capabilities(Some(32), Some(24))
@@ -4210,7 +4100,6 @@ fn atomic_cursor_only_direct_probe_uses_backend_recorded_sink() {
         ],
         "accepted direct probe and Backend DPMS teardown are recorded exactly once",
     );
-    assert!(fixture.recorders.legacy_cursor.records().is_empty());
     let resources = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
     drop(fixture);
     assert_eq!(resources.end_state(), (0, 0, 0));
@@ -4279,6 +4168,9 @@ fn atomic_cursor_only_motion_waits_for_scene_retirement_and_carries_latest_posit
     );
 
     fixture.retire_output(0, 2);
+    Backend::maybe_composite(&mut fixture.backend)
+        .expect("run the composition tail after retirement");
+    Backend::before_block(&mut fixture.backend);
     let records = fixture.recorders.atomic.records();
     assert_eq!(records.len(), records_before + 3);
     assert_eq!(
@@ -4576,7 +4468,6 @@ fn atomic_cursor_only_flip_events_are_scoped_to_the_ready_device() {
             )),
             page_flip_event_source: source.clone(),
             cursor_buffer_io: std::rc::Rc::clone(&fixture.backend.platform.services.cursor_buffers),
-            legacy_cursor_io: std::rc::Rc::clone(&fixture.backend.platform.services.legacy_cursor),
             test_page_flip_event_source: Some(source.clone()),
             cursor: crate::kms::render::platform::KmsCursorState::new(),
         });
@@ -4668,7 +4559,7 @@ pub(super) fn schedule_rescan_clock(
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: omit software cursor drawing or eligible cursor-plane X/Y fields;
 // the accepted footprint and HW-scene assertions must fail.
-fn atomic_cursor_only_eligibility_matrix() {
+pub(super) fn atomic_cursor_only_eligibility_matrix() {
     use yserver_core::backend::Backend;
 
     let Some(mut fixture) = AtomicCursorFixture::new().expect("build cursor scene fixture") else {
@@ -5028,7 +4919,6 @@ fn atomic_cursor_only_eligibility_matrix() {
                     );
                 }
             }
-            assert!(fixture.recorders.legacy_cursor.records().is_empty());
             fixture.retire_output(0, first_frame + 2);
         } else {
             assert!(
@@ -5092,7 +4982,7 @@ fn atomic_cursor_only_eligibility_matrix() {
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutations: omit an ineligible output's software draw or add a draw on the eligible peer; raw scanout pixels must fail.
-fn atomic_cursor_only_composed_cursor_pixels_follow_output_local_eligibility() {
+pub(super) fn atomic_cursor_only_composed_cursor_pixels_follow_output_local_eligibility() {
     use std::time::Duration;
     use yserver_core::backend::Backend;
 
@@ -5322,7 +5212,6 @@ fn atomic_cursor_only_composed_cursor_pixels_follow_output_local_eligibility() {
         "eligible peer scanout omits the cursor pixel carried by its hardware plane",
     );
     assert!(fixture.backend.platform.cursor_plane_visible_for_output(1));
-    assert!(fixture.recorders.legacy_cursor.records().is_empty());
     assert!(
         fixture.recorders.atomic.records()[records_before..]
             .iter()
@@ -5730,7 +5619,6 @@ fn atomic_cursor_only_topology_rechecks_only_affected_device() {
             )),
             page_flip_event_source: events.clone(),
             cursor_buffer_io: std::rc::Rc::clone(&fixture.backend.platform.services.cursor_buffers),
-            legacy_cursor_io: std::rc::Rc::clone(&fixture.backend.platform.services.legacy_cursor),
             test_page_flip_event_source: Some(events),
             cursor: crate::kms::render::platform::KmsCursorState::new(),
         });

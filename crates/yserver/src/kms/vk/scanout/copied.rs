@@ -1613,6 +1613,24 @@ impl CopiedScanoutPool {
         Ok(())
     }
 
+    /// A copied destination whose KMS commit was rejected can be presented
+    /// again without another GPU copy after the sink queue has been quiesced.
+    /// The copy already released both images to FOREIGN; a successful retry
+    /// transfers the same destination from that release into KMS ownership.
+    pub(crate) fn note_atomic_retry_accepted(&mut self, bo_idx: usize) -> io::Result<()> {
+        let ownership = self
+            .destination_ownership
+            .get_mut(bo_idx)
+            .ok_or_else(|| io::Error::other("copied scanout ownership index out of range"))?;
+        if *ownership != CopiedDestinationOwnership::ReleasedButAtomicRejected {
+            return Err(io::Error::other(format!(
+                "copied atomic retry accepted from unexpected ownership {ownership:?}"
+            )));
+        }
+        *ownership = CopiedDestinationOwnership::ForeignPendingKmsFromSink;
+        Ok(())
+    }
+
     /// Quiesce a failed B submission before returning the pair to the free
     /// list. Other slots, including the one currently scanned out, retain
     /// their state.

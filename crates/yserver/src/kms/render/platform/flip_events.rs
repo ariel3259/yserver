@@ -156,6 +156,10 @@ impl RenderCompletionReadiness for RecordingRenderCompletionReadiness {
 pub(crate) struct KernelPageFlip {
     pub(crate) crtc: ::drm::control::crtc::Handle,
     pub(crate) frame: u32,
+    /// Accepted commit identity this completion belongs to. The live DRM
+    /// source takes it from the kernel `user_data` echo; `None` means the
+    /// event carries no identity and falls back to the oldest pending entry.
+    pub(crate) commit_id: Option<u64>,
     /// Kernel UST used by Present and kept in its original clock domain.
     pub(crate) ust: std::time::Duration,
     /// User-space CLOCK_MONOTONIC time when yserver received the event.
@@ -219,10 +223,14 @@ impl PageFlipEventSource for DrmPageFlipEventSource {
         let mut sequences = Vec::new();
         crate::drm::page_flip::drain_events(
             device,
-            |crtc, frame, duration| {
+            |crtc, frame, duration, user_data| {
                 flips.push(KernelPageFlip {
                     crtc,
                     frame,
+                    // The kernel echoes the submitting commit's identity. Zero
+                    // means no identity was set: the event keeps the legacy
+                    // oldest-entry attribution.
+                    commit_id: (user_data != 0).then_some(user_data),
                     ust: duration,
                     event_at_monotonic: crate::drm::atomic::monotonic_timestamp(),
                     event_at_boottime: crate::drm::atomic::boottime_timestamp(),
@@ -305,6 +313,29 @@ impl RecordingPageFlipEventSource {
         self.queue_flip_at_for_device(device, crtc, frame, std::time::Duration::ZERO);
     }
 
+    pub(crate) fn queue_flip_with_commit_id_for_device(
+        &self,
+        device: &crate::drm::Device,
+        crtc: ::drm::control::crtc::Handle,
+        frame: u32,
+        commit_id: u64,
+    ) {
+        let fd = device.as_fd().as_raw_fd();
+        self.events
+            .borrow_mut()
+            .entry(fd)
+            .or_default()
+            .flips
+            .push_back(KernelPageFlip {
+                crtc,
+                frame,
+                commit_id: Some(commit_id),
+                ust: std::time::Duration::ZERO,
+                event_at_monotonic: crate::drm::atomic::monotonic_timestamp(),
+                event_at_boottime: crate::drm::atomic::boottime_timestamp(),
+            });
+    }
+
     pub(crate) fn queue_flip_at_for_device(
         &self,
         device: &crate::drm::Device,
@@ -321,6 +352,7 @@ impl RecordingPageFlipEventSource {
             .push_back(KernelPageFlip {
                 crtc,
                 frame,
+                commit_id: None,
                 ust: timestamp,
                 event_at_monotonic: Some(timestamp),
                 event_at_boottime: crate::drm::atomic::boottime_timestamp(),
@@ -429,6 +461,7 @@ impl RecordingPageFlipEventSource {
             .push_back(KernelPageFlip {
                 crtc,
                 frame,
+                commit_id: None,
                 ust,
                 event_at_monotonic,
                 event_at_boottime,
@@ -672,6 +705,9 @@ impl PlatformBackend {
         expected_pageflips: &HashSet<CrtcKey>,
         timeout: std::time::Duration,
     ) -> io::Result<()> {
+        self.services
+            .old_event_drain_observer
+            .before_old_event_drain(self);
         // All CRTCs are already off at each caller. The event source below
         // retires old kernel events without delivering normal flip callbacks,
         // so their per-CRTC accepted-commit telemetry associations must be
@@ -869,6 +905,7 @@ impl PlatformBackend {
                 output_idx,
                 sample,
                 FlipEventTimestamps {
+                    commit_id: flip.commit_id,
                     received_at_monotonic: flip.event_at_monotonic,
                     completion_at_monotonic,
                 },

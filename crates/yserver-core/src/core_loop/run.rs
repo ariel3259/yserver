@@ -761,7 +761,6 @@ pub(crate) struct FairRequestQueue {
 }
 
 impl FairRequestQueue {
-    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -2940,6 +2939,7 @@ fn run_core_with_inventory(
             &mut reset_trigger,
         );
 
+        backend.set_request_backlog(!deferred_requests.is_empty());
         run_iteration_tail(state, backend);
         // The tail delivers deferred input and Present events too: settle
         // again so nothing it buffered waits without WRITABLE interest.

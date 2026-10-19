@@ -46,6 +46,7 @@ fn accepted_mode_from_frame_assignment(assignment: CursorFrameAssignment) -> Cur
         CursorFrameAssignment::Hardware => CursorAcceptedMode::Hardware,
         CursorFrameAssignment::Software { .. } => CursorAcceptedMode::Software,
         CursorFrameAssignment::Hidden => CursorAcceptedMode::Hidden,
+        CursorFrameAssignment::CursorlessReplacement => CursorAcceptedMode::Hardware,
     }
 }
 
@@ -73,6 +74,7 @@ pub(super) fn assignment_changes_cursor_mode(
         CursorAssignment::Hw { .. } => CursorAcceptedMode::Hardware,
         CursorAssignment::Sw { .. } => CursorAcceptedMode::Software,
         CursorAssignment::Hidden => CursorAcceptedMode::Hidden,
+        CursorAssignment::CursorlessReplacement => CursorAcceptedMode::Hardware,
     };
     accepted_mode_from_output_mode(previous) != next
 }
@@ -91,7 +93,9 @@ pub(super) fn effective_cursor_prev_mode(
         && !matches!(scene_prev, OutputCursorMode::Hw)
         && matches!(
             assignment,
-            CursorAssignment::Sw { .. } | CursorAssignment::Hidden
+            CursorAssignment::Sw { .. }
+                | CursorAssignment::Hidden
+                | CursorAssignment::CursorlessReplacement
         )
     {
         OutputCursorMode::Hw

@@ -701,10 +701,10 @@ impl<P: Platform> XBackend<P> {
         let visible = !self.effective_cursor_hidden();
         #[allow(clippy::cast_possible_truncation)]
         let pos = (self.core.cursor_x as i32, self.core.cursor_y as i32);
-        // Parameter changes can make a previously-EINVAL cursor bind valid.
-        // Notify every device even while all outputs are temporarily using SW;
-        // record version/pixel-only animation changes intentionally do not
-        // reset the per-CRTC backoff.
+        // Parameter changes can make a previously rejected cursor bind valid.
+        // Notify every device even while outputs are using SW. This neutral
+        // hook passes only qualification dimensions and hotspot; pixel and
+        // animation-version changes keep the same key.
         P::note_cursor_sprite(
             self,
             record.width,

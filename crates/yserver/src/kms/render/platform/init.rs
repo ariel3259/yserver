@@ -357,7 +357,6 @@ impl PlatformBackend {
                     )),
                     page_flip_event_source: Rc::clone(&services.page_flip_events),
                     cursor_buffer_io: Rc::clone(&services.cursor_buffers),
-                    legacy_cursor_io: Rc::clone(&services.legacy_cursor),
                     #[cfg(test)]
                     test_page_flip_event_source: None,
                     cursor,
@@ -815,7 +814,6 @@ impl PlatformBackend {
                 ))),
                 page_flip_event_source,
                 cursor_buffer_io: Rc::clone(&services.cursor_buffers),
-                legacy_cursor_io: Rc::clone(&services.legacy_cursor),
                 #[cfg(test)]
                 test_page_flip_event_source: Some(test_page_flip_event_source),
                 cursor: KmsCursorState::new(),

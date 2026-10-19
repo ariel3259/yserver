@@ -533,7 +533,6 @@ fn atomic_cursor_only_lifecycle_invalidates_and_drains() {
     let _ = Backend::drain_retired_present_idle_events(&mut fixture.backend);
 
     fixture.assert_cursor_quiescent();
-    assert!(fixture.recorders.legacy_cursor.records().is_empty());
     assert!(fixture.recorders.mode_blobs.live_count() == 0);
     let resources = Rc::clone(&fixture.recorders.cursor_buffer_ledger);
     drop(fixture);
@@ -759,7 +758,6 @@ fn atomic_cursor_only_partial_wake_reconciles_only_enabled_routes() {
     fixture.retire_output(1, 63);
     Backend::set_dpms_power(&mut fixture.backend, 3).expect("final all-off after partial wake");
     fixture.assert_cursor_quiescent();
-    assert!(fixture.recorders.legacy_cursor.records().is_empty());
     assert_eq!(fixture.recorders.mode_blobs.live_count(), 0);
     let resources = Rc::clone(&fixture.recorders.cursor_buffer_ledger);
     drop(fixture);
@@ -810,7 +808,6 @@ fn atomic_cursor_only_reprobe_removal_detaches_before_reclaim() {
     assert!(disable.properties.iter().all(|update| update.value == 0));
     assert_detached_ids(disable, cursor);
     fixture.assert_cursor_quiescent();
-    assert!(fixture.recorders.legacy_cursor.records().is_empty());
     let resources = Rc::clone(&fixture.recorders.cursor_buffer_ledger);
     drop(fixture);
     assert_eq!(resources.end_state(), (0, 0, 0));
@@ -1000,7 +997,6 @@ fn atomic_cursor_only_failed_disable_retains_users() {
     retire_cursor_event(&mut fixture, 54);
     Backend::set_dpms_power(&mut fixture.backend, 3).expect("final all-off teardown");
     fixture.assert_cursor_quiescent();
-    assert!(fixture.recorders.legacy_cursor.records().is_empty());
     assert!(fixture.backend.platform.device_for_key(key).is_some());
     let resources = Rc::clone(&fixture.recorders.cursor_buffer_ledger);
     drop(fixture);

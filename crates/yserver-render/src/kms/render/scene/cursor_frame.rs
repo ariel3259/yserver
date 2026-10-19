@@ -8,8 +8,13 @@ pub struct CursorFrameId(pub u64);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CursorFrameAssignment {
     Hardware,
-    Software { pos: (i32, i32) },
+    Software {
+        pos: (i32, i32),
+    },
     Hidden,
+    /// This primary must stay cursorless while an already accepted hardware
+    /// binding is retained after a refused detach.
+    CursorlessReplacement,
 }
 
 /// Cursor inputs captured when the scene builds one output frame.
@@ -50,4 +55,13 @@ pub struct CursorCommitReceipt {
     pub mode: CursorAcceptedMode,
     pub primary_cursor: CursorPrimaryContent,
     pub needs_recompose: bool,
+}
+
+impl CursorCommitReceipt {
+    /// Mark an accepted receipt whose primary must be replaced at the next
+    /// scene opportunity before its cursor ownership is fully presented.
+    pub const fn with_recompose_after_acceptance(mut self) -> Self {
+        self.needs_recompose = true;
+        self
+    }
 }

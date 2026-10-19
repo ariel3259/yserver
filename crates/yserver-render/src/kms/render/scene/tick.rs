@@ -175,22 +175,44 @@ impl SceneCompositor {
             .filter(|(other_idx, _)| *other_idx != output_idx)
             .flat_map(|(_, other)| other.last_pieces.iter().copied())
             .collect();
-        let built = build_scene_with(
+        let mut built = build_scene_with(
             input,
             store,
             output_idx,
             sink,
-            None,
-            None,
+            inner.cursor.clone(),
+            output.cursor_prev_pos,
             cow_host_xid,
-            false,
+            hw_cursor_allowed(input.outputs) && !input.hw_cursor_suppressed,
             Visibility::On,
             &elsewhere,
         );
+        if sink.cursor_plane().software_cursor_suppressed(output_idx) {
+            suppress_software_cursor_for_retained_hardware(&mut built);
+        }
         let output = &inner.outputs[output_idx];
+        let cursor_mode_before = effective_cursor_prev_mode(
+            output.last_frame_cursor_mode,
+            sink.cursor_plane().visible(output_idx),
+            built.cursor_assignment,
+        );
+        let cursor_mode_changed =
+            assignment_changes_cursor_mode(cursor_mode_before, built.cursor_assignment);
+        let software_cursor_repaint =
+            (matches!(output.last_frame_cursor_mode, OutputCursorMode::Sw { .. })
+                || built.software_cursor_tail.is_some())
+                && !cursor_damage_for_frame(
+                    output.last_present_cursor_rect,
+                    output.last_present_cursor_version,
+                    built.new_cursor_rect,
+                    built.cursor_record_version,
+                    cursor_mode_changed,
+                )
+                .is_empty();
         !built.projected_damage.is_empty()
             || built.stats.off_output_damage_forces_compose()
             || !structural_damage(&output.prev_presented, &built.participants).is_empty()
+            || software_cursor_repaint
             || (structure_dirty
                 && !self
                     .root_overlay
@@ -417,10 +439,6 @@ impl SceneCompositor {
                 }
             }
         }
-        if clear_dirty {
-            *scene_structure_dirty = false;
-            *cursor_only_wake = false;
-        }
         // Vulkan may export the already-signalled SYNC_FD sentinel (`fd=-1`).
         // Such a job has no pollable fd, so drain only after every composed
         // output installed its PendingAck; exact job/BO matching is then live
@@ -435,6 +453,21 @@ impl SceneCompositor {
             if sink.gpu().renderer_failed {
                 break;
             }
+        }
+        if inner.outputs.iter().any(|output| {
+            output.pending_acks.iter().any(|ack| {
+                ack.cursor_receipt.is_some_and(|receipt| {
+                    receipt.needs_recompose && receipt.frame == Some(ack.cursor_frame.frame)
+                })
+            })
+        }) {
+            // Keep the scene wake alive until the cursorless accepted primary
+            // retires and the next scheduling opportunity paints the cursor.
+            clear_dirty = false;
+        }
+        if clear_dirty {
+            *scene_structure_dirty = false;
+            *cursor_only_wake = false;
         }
         Ok(composed)
     }
@@ -652,6 +685,23 @@ pub(super) fn snapshots_carry_damage(snaps: &[DamageSnapshot]) -> bool {
     snaps.iter().any(|s| !s.region.is_empty())
 }
 
+fn suppress_software_cursor_for_retained_hardware(built: &mut super::SceneBuild) {
+    if let Some((draw_index, sampled_index)) = built.software_cursor_tail.take() {
+        debug_assert_eq!(draw_index + 1, built.scene.draws.len());
+        built.scene.draws.remove(draw_index);
+        let cursor_id = built.sampled_ids.remove(sampled_index);
+        if let Some(index) = built.presented_ids.iter().position(|id| *id == cursor_id) {
+            built.presented_ids.remove(index);
+        }
+        if let Some(index) = built.pieces_ids.iter().position(|id| *id == cursor_id) {
+            built.pieces_ids.remove(index);
+        }
+    }
+    built.cursor_assignment = CursorAssignment::CursorlessReplacement;
+    built.new_cursor_rect = None;
+    built.cursor_record_version = None;
+}
+
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
 fn tick_one_output(
@@ -807,6 +857,9 @@ fn tick_one_output(
         Visibility::On,
         elsewhere,
     );
+    if sink.cursor_plane().software_cursor_suppressed(output_idx) {
+        suppress_software_cursor_for_retained_hardware(&mut built);
+    }
     telemetry.record_build_scene_ns(
         u64::try_from(build_scene_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
     );
@@ -1336,9 +1389,13 @@ fn tick_one_output(
         CursorAssignment::Hw { .. } => CursorFrameAssignment::Hardware,
         CursorAssignment::Sw { pos } => CursorFrameAssignment::Software { pos },
         CursorAssignment::Hidden => CursorFrameAssignment::Hidden,
+        CursorAssignment::CursorlessReplacement => CursorFrameAssignment::CursorlessReplacement,
     };
     let hardware_only = prev_mode == OutputCursorMode::Hw
-        && !matches!(assignment, CursorFrameAssignment::Software { .. });
+        && !matches!(
+            assignment,
+            CursorFrameAssignment::Software { .. } | CursorFrameAssignment::CursorlessReplacement
+        );
     let cursor_frame = CursorFramePlan {
         frame,
         assignment,
@@ -1383,6 +1440,7 @@ fn tick_one_output(
         })
     };
     let mut accepted_cursor_receipt = None;
+    let mut accepted_flip_event_id = None;
     let (render_result, previous_gpu_ns, copied_prepare_failed) =
         match sink.finish_frame(output_idx, token.bo_idx, cursor_frame.clone(), &mut record) {
             FinishOutcome::Unavailable(error) => {
@@ -1404,10 +1462,15 @@ fn tick_one_output(
                 fail_stop,
             } => (
                 result.map(|handoff| match handoff {
-                    FrameHandoff::FlipPending { submit, cursor } => {
+                    FrameHandoff::FlipPending {
+                        submit,
+                        cursor,
+                        event_id,
+                    } => {
                         compose_complete =
                             compose_submit_was_complete(submit, render_scene.draws.len());
                         accepted_cursor_receipt = Some(cursor);
+                        accepted_flip_event_id = Some(event_id);
                         None
                     }
                     FrameHandoff::RenderCompletion { completion, .. } => Some(completion),
@@ -1437,11 +1500,14 @@ fn tick_one_output(
             .register_render_completion(output_idx, token.bo_idx, completion)
             .map(|job_id| InFlightStage::WaitingForRenderCompletion { job_id })
             .map_err(PresentError::Io),
-        Ok(None) => Ok(InFlightStage::KmsFlipPending),
+        Ok(None) => Ok(InFlightStage::KmsFlipPending {
+            event_id: accepted_flip_event_id
+                .expect("shared KMS handoff carries an accepted page-flip identity"),
+        }),
         Err(error) => Err(error),
     };
     if let Ok(stage) = &compose_result
-        && *stage == InFlightStage::KmsFlipPending
+        && matches!(stage, InFlightStage::KmsFlipPending { .. })
         && let Some(receipt) = accepted_cursor_receipt
     {
         note_cursor_commit_accepted_inner(inner, output_idx, receipt);
@@ -1540,6 +1606,9 @@ fn tick_one_output(
             Ok(TickOutcome::Composed)
         }
         Err(e) => {
+            let discarded_software_frame = sink
+                .cursor_plane_mut()
+                .take_discarded_software_frame(output_idx);
             if present_error_is_device_lost(&e) {
                 // The live source renderer submitted or recorded this frame.
                 // Neither shared nor copied source resources are reusable
@@ -1586,8 +1655,12 @@ fn tick_one_output(
             // storm). Should become a tunable + observable via
             // telemetry (e.g. `commit_retry_backoff_ms` counter) so
             // per-driver tuning is possible without code edits.
-            state.next_submit_retry_at =
-                Some(std::time::Instant::now() + std::time::Duration::from_millis(100));
+            state.next_submit_retry_at = if discarded_software_frame {
+                force_cursor_retry_repaint(state);
+                None
+            } else {
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(100))
+            };
             if let Some(br) = output_damage.bounding_rect() {
                 state.pending_repaint_after_failed_submit.add(br);
             }

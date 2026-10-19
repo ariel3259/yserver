@@ -1541,7 +1541,7 @@ impl KmsBackend {
         // output-index ledger. Metadata and inactive-connector changes leave
         // normal composition and direct scanout undisturbed.
         let mut quiesced = false;
-        if active_removed || !cursor_topology_changed.is_empty() {
+        if active_removed {
             match self.quiesce_before_topology_mutation("display hotplug rescan") {
                 Ok(()) => quiesced = true,
                 Err(error) => {
@@ -1549,6 +1549,11 @@ impl KmsBackend {
                     return;
                 }
             }
+        } else if !cursor_topology_changed.is_empty() {
+            // Cursor inventory can change while every primary route remains
+            // valid. End topology-owned tearing/probes before replacing the
+            // matching, but retain active scanout and its framebuffer owners.
+            self.invalidate_topology_mutation("cursor plane inventory changed");
         }
 
         // The five steps below are ordered so that clients never observe the
@@ -1614,7 +1619,8 @@ impl KmsBackend {
         // re-lights the topology we tore down, so a quiesce whose relight then
         // failed must still go through `fire_randr_changes` rather than
         // returning with every CRTC dark.
-        let should_publish = !registry_delta.is_empty() || quiesced || relit;
+        let should_publish =
+            !registry_delta.is_empty() || quiesced || relit || !cursor_topology_changed.is_empty();
         if !should_publish {
             log::debug!("kms: display rescan found no connector or active-topology change");
             return;

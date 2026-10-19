@@ -23,6 +23,14 @@ fn scanout_selection_phases(
     }
 }
 
+#[cfg(test)]
+const LATEST_COMPOSED_FRAME_PHASES: &[crate::kms::vk::scanout::BoPhase] = &[
+    crate::kms::vk::scanout::BoPhase::Pending,
+    crate::kms::vk::scanout::BoPhase::Recording,
+    crate::kms::vk::scanout::BoPhase::Submitted,
+    crate::kms::vk::scanout::BoPhase::OnScreen,
+];
+
 /// Rebase a root-absolute rect into the direct source drawable's own space.
 ///
 /// The flipped source is blitted so that its `(0, 0)` lands at
@@ -81,17 +89,30 @@ fn direct_scanout_route_for_rect(
     })
 }
 
+#[cfg(test)]
 pub(in crate::kms::render::backend) fn select_scanout_read_route(
     backend: &KmsBackend,
     rect: vk::Rect2D,
     selection: ScanoutReadSelection,
 ) -> io::Result<ScanoutReadRoute> {
+    select_scanout_read_route_with_phases(
+        backend,
+        rect,
+        selection,
+        scanout_selection_phases(selection),
+    )
+}
+
+fn select_scanout_read_route_with_phases(
+    backend: &KmsBackend,
+    rect: vk::Rect2D,
+    selection: ScanoutReadSelection,
+    phases: &[crate::kms::vk::scanout::BoPhase],
+) -> io::Result<ScanoutReadRoute> {
     let rx0 = i64::from(rect.offset.x);
     let ry0 = i64::from(rect.offset.y);
     let rx1 = rx0 + i64::from(rect.extent.width);
     let ry1 = ry0 + i64::from(rect.extent.height);
-    let phases = scanout_selection_phases(selection);
-
     for (pool_idx, layout) in backend.platform.outputs.iter().enumerate() {
         // Root reads of a transformed output come from its intermediate, in
         // root space; the dump still reads the scanout, in mode space.
@@ -184,6 +205,23 @@ pub(in crate::kms::render::backend) fn read_scanout_region(
     read_scanout_region_named(backend, rect, selection).map(|(bytes, _)| bytes)
 }
 
+/// Test oracle for an accepted frame whose event has not retired yet. It uses
+/// the same route and image-copy path as production readback, with pending
+/// composed buffers preferred over the previously on-screen buffer.
+#[cfg(test)]
+pub(in crate::kms::render::backend) fn read_latest_composed_region(
+    backend: &mut KmsBackend,
+    rect: vk::Rect2D,
+) -> io::Result<Vec<u8>> {
+    read_scanout_region_named_with_phases(
+        backend,
+        rect,
+        ScanoutReadSelection::PermissiveDump,
+        LATEST_COMPOSED_FRAME_PHASES,
+    )
+    .map(|(bytes, _)| bytes)
+}
+
 /// Read what is actually on screen under `rect`, and say which buffer it came
 /// from. Reads the directly-flipped client drawable when the covering CRTC is
 /// in direct scanout, and the composited BO otherwise.
@@ -192,11 +230,27 @@ fn read_scanout_region_named(
     rect: vk::Rect2D,
     selection: ScanoutReadSelection,
 ) -> io::Result<(Vec<u8>, ScanoutReadOrigin)> {
+    read_scanout_region_named_with_phases(
+        backend,
+        rect,
+        selection,
+        scanout_selection_phases(selection),
+    )
+}
+
+fn read_scanout_region_named_with_phases(
+    backend: &mut KmsBackend,
+    rect: vk::Rect2D,
+    selection: ScanoutReadSelection,
+    phases: &[crate::kms::vk::scanout::BoPhase],
+) -> io::Result<(Vec<u8>, ScanoutReadOrigin)> {
     if rect.extent.width == 0 || rect.extent.height == 0 {
         return Ok((Vec::new(), ScanoutReadOrigin::Empty));
     }
 
-    let (mut source, local_rect) = match select_scanout_read_route(backend, rect, selection)? {
+    let (mut source, local_rect) = match select_scanout_read_route_with_phases(
+        backend, rect, selection, phases,
+    )? {
         ScanoutReadRoute::Pool {
             pool_idx,
             bo_idx,
@@ -580,27 +634,33 @@ pub(in crate::kms::render::backend) fn do_dump_scanout(backend: &mut KmsBackend)
         wrote_any = true;
     }
 
-    // Diagnostic: also dump the HW cursor plane's dumb buffer (kernel-side
-    // view, before the display engine samples it). Compared against the
-    // on-screen cursor it isolates load_image stride bugs from display-
-    // engine stride misinterpretation.
+    // Diagnostic: dump each applied hardware cursor sprite, the exact buffer
+    // retained by its accepted CRTC binding. This keeps a rejected candidate
+    // from replacing the image shown in the diagnostic.
     for device in &backend.platform.devices {
-        if let Some(plane) = device.cursor.plane.as_ref() {
+        let Some(plane) = device.cursor.plane.as_ref() else {
+            continue;
+        };
+        for (&crtc, state) in &device.cursor.crtc_states {
+            let Some(binding) = state.applied else {
+                continue;
+            };
             let path = format!(
-                "./yserver-cursor-{run}-{}-{}.ppm",
-                device.key.major, device.key.minor
+                "./yserver-cursor-{run}-{}-{}-crtc{}.ppm",
+                device.key.major,
+                device.key.minor,
+                u32::from(crtc),
             );
-            if let Err(e) = plane.dump_to_ppm(&path) {
+            if let Err(e) = plane.dump_applied_sprite_to_ppm(binding.lease, &path) {
                 log::warn!(
-                    "render do_dump_scanout: cursor dump for device {} failed: {e}",
+                    "render do_dump_scanout: applied cursor dump for device {} CRTC {crtc:?} failed: {e}",
                     device.key
                 );
             }
         }
     }
-    // Also dump the source CursorRecord bytes (BEFORE load_image), so a
-    // diff between this and the dumb-buffer dump localises the bug to
-    // either upstream (engine.get_image / X11 wire) or load_image itself.
+    // Also dump source CursorRecord bytes so they can be compared with the
+    // applied sprite when diagnosing upload or acceptance problems.
     if let Some(xid) = backend.effective_cursor_xid
         && let Some(rec) = backend.cursor_records.get(&xid)
     {

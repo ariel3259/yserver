@@ -160,13 +160,6 @@ fn atomic_cursor_only_busy_stream_keeps_latest_intent() {
             .platform
             .cursor_commit_in_flight_for_output(0)
     );
-    assert_eq!(
-        fixture
-            .backend
-            .platform
-            .for_tests_cursor_fallback_remaining(device_key, crtc),
-        None,
-    );
     assert!(
         !fixture
             .backend
@@ -306,6 +299,9 @@ fn atomic_cursor_only_all_builders_use_accepted_deltas() {
         .expect("retain newer cursor motion behind scene retirement");
     assert_eq!(fixture.recorders.atomic.records().len(), 3);
     fixture.retire_output(0, 4);
+    Backend::maybe_composite(&mut fixture.backend)
+        .expect("run the composition tail after retirement");
+    Backend::before_block(&mut fixture.backend);
     assert_eq!(fixture.recorders.atomic.records().len(), 4);
     let newest = &fixture.recorders.atomic.records()[3];
     assert_eq!(

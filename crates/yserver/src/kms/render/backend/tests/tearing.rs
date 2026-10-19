@@ -38,7 +38,7 @@ fn vulkan_fed_scanout_requires_sync_fd_and_drm_format_modifier() {
     assert!(!supports_vulkan_fed_scanout(false, false));
 }
 
-fn recording_sink(
+pub(super) fn recording_sink(
     backend: &mut KmsBackend,
     device_idx: usize,
 ) -> std::rc::Rc<RecordingAtomicCommitExecutor> {
@@ -48,7 +48,7 @@ fn recording_sink(
     recorder
 }
 
-fn prime_cursorless_scene_primary(backend: &mut KmsBackend) {
+pub(super) fn prime_cursorless_scene_primary(backend: &mut KmsBackend) {
     use yserver_core::server::ServerState;
 
     let recorder = recording_sink(backend, 0);
@@ -124,7 +124,7 @@ fn prepare_direct_present_for_window(
     )
 }
 
-fn prepare_direct_present_for_ids(
+pub(super) fn prepare_direct_present_for_ids(
     backend: &mut KmsBackend,
     present_id: u64,
     protocol_window_xid: u32,
@@ -149,7 +149,7 @@ fn prepare_direct_present_for_ids(
     )
 }
 
-fn prepare_direct_present_for_ids_with_storage(
+pub(super) fn prepare_direct_present_for_ids_with_storage(
     backend: &mut KmsBackend,
     present_id: u64,
     protocol_window_xid: u32,
@@ -340,7 +340,6 @@ fn direct_backend(output_count: usize) -> Option<KmsBackend> {
     let mut backend = scene_backend_with_recording_pools(output_count)
         .unwrap_or_else(|error| panic!("direct test fixture unavailable: {error}"))?;
     prime_cursorless_scene_primary(&mut backend);
-    backend.pstate.scanout_m2.cursor_bound_all = true;
     backend.pstate.scanout_m2.eligible_root_streak =
         crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1;
     backend.platform.requested_flip_timing = crate::drm::async_flip::FlipTiming::Async;
@@ -359,7 +358,7 @@ fn set_direct_second_crtc(backend: &mut KmsBackend, crtc_id: u32) {
     backend.refresh_present_crtc_clock_epochs();
 }
 
-fn try_direct_present(
+pub(super) fn try_direct_present(
     backend: &mut KmsBackend,
     present_id: u64,
     width: u16,
@@ -465,7 +464,7 @@ fn try_direct_present_for_ids(
     submitted.then_some(shape)
 }
 
-fn try_direct_present_with_live_storage(
+pub(super) fn try_direct_present_with_live_storage(
     backend: &mut KmsBackend,
     present_id: u64,
     target_xid: u32,
@@ -483,7 +482,7 @@ fn try_direct_present_with_live_storage(
     submitted.then_some(shape)
 }
 
-fn try_live_direct_for_ids(
+pub(super) fn try_live_direct_for_ids(
     backend: &mut KmsBackend,
     present_id: u64,
     protocol_window_xid: u32,
@@ -507,7 +506,7 @@ fn try_live_direct_for_ids(
     submitted.then_some(shape)
 }
 
-fn retire_direct_present(
+pub(super) fn retire_direct_present(
     backend: &mut KmsBackend,
     state: &mut yserver_core::server::ServerState,
     frame: u32,
@@ -610,7 +609,7 @@ fn qualify_direct_async(
     }
 }
 
-fn enter_tearing_without_direct_scanout(
+pub(super) fn enter_tearing_without_direct_scanout(
     backend: &mut KmsBackend,
     window: u32,
     first_present: u64,
@@ -868,7 +867,7 @@ fn assert_commit_sequence(
     assert_eq!(actual, expected);
 }
 
-fn live_tearing_cursor_backend(
+pub(super) fn live_tearing_cursor_backend(
     window: u32,
     first_present: u64,
 ) -> Option<(
@@ -904,46 +903,14 @@ fn exit_tearing_with_copy_present(backend: &mut KmsBackend, window: u32, present
     assert!(try_direct_present_for_window(backend, present_id, window, width, height, 0).is_none());
 }
 
-fn install_hidden_cursor_plane(
-    backend: &mut KmsBackend,
-) -> std::rc::Rc<RecordingCursorHideExecutor> {
+pub(super) fn install_atomic_cursor_plane_stub(backend: &mut KmsBackend) {
     let (device_key, device_handle) = {
         let device = &backend.platform.devices[0];
         (device.key, std::rc::Rc::clone(&device.device))
     };
     let mut plane = crate::kms::cursor_plane::CursorPlane::for_tests_stub(device_handle, 64, 64);
     install_test_atomic_cursor_properties(backend, &mut plane, device_key);
-    let executor = std::rc::Rc::new(RecordingCursorHideExecutor::default());
-    executor.script([TestCursorHideResult::Ok; 8]);
-    plane.for_tests_set_hide_executor(executor.clone());
     backend.platform.devices[0].cursor.plane = Some(plane);
-    executor
-}
-
-fn install_cursor_plane_with_successful_show(
-    backend: &mut KmsBackend,
-) -> (
-    std::rc::Rc<super::RecordingCursorShowExecutor>,
-    std::rc::Rc<RecordingCursorHideExecutor>,
-) {
-    let (device_key, device_handle) = {
-        let device = &backend.platform.devices[0];
-        (device.key, std::rc::Rc::clone(&device.device))
-    };
-    let executor = std::rc::Rc::new(super::RecordingCursorShowExecutor::default());
-    let mut plane = crate::kms::cursor_plane::CursorPlane::for_tests_with_show_executor(
-        device_handle,
-        64,
-        64,
-        true,
-        executor.clone(),
-    );
-    install_test_atomic_cursor_properties(backend, &mut plane, device_key);
-    let hide_executor = std::rc::Rc::new(RecordingCursorHideExecutor::default());
-    hide_executor.script([TestCursorHideResult::Ok; 8]);
-    plane.for_tests_set_hide_executor(hide_executor.clone());
-    backend.platform.devices[0].cursor.plane = Some(plane);
-    (executor, hide_executor)
 }
 
 fn install_test_atomic_cursor_properties(
@@ -1021,7 +988,7 @@ fn retire_registered_cursor_in_dead_zone(
     );
 }
 
-fn materialize_test_cow_stage(
+pub(super) fn materialize_test_cow_stage(
     backend: &mut KmsBackend,
     state: &mut yserver_core::server::ServerState,
     client_id: yserver_protocol::x11::ClientId,
@@ -1095,7 +1062,7 @@ fn materialize_test_cow_stage(
     stage_handle.as_raw()
 }
 
-fn define_visible_cursor_through_backend(
+pub(super) fn define_visible_cursor_through_backend(
     backend: &mut KmsBackend,
     state: &mut yserver_core::server::ServerState,
 ) -> u32 {
@@ -1125,7 +1092,7 @@ fn define_visible_cursor_through_backend(
     cursor.as_raw()
 }
 
-fn create_bitmap_cursor_via_backend(
+pub(super) fn create_bitmap_cursor_via_backend(
     backend: &mut KmsBackend,
     source_bit: bool,
     mask_bit: bool,
@@ -1232,7 +1199,7 @@ fn present_until_direct_async(
     );
 }
 
-fn prepare_visible_hw_cursor(
+pub(super) fn prepare_visible_hw_cursor(
     backend: &mut KmsBackend,
     state: &mut yserver_core::server::ServerState,
 ) {
@@ -1474,6 +1441,17 @@ fn entry_waits_for_queued_show_on_retire() {
     let Some(mut backend) = live_scene_backend() else {
         return;
     };
+    let cursor_gate_expired = std::rc::Rc::new(std::cell::Cell::new(false));
+    let gate_flag = std::rc::Rc::clone(&cursor_gate_expired);
+    let gate_base = std::time::Instant::now();
+    backend.for_tests_set_monotonic_clock(std::rc::Rc::new(move || {
+        gate_base
+            + if gate_flag.get() {
+                std::time::Duration::from_millis(3)
+            } else {
+                std::time::Duration::ZERO
+            }
+    }));
     let recorder = recording_sink(&mut backend, 0);
     let mut state = ServerState::new();
     let cursor = create_bitmap_cursor_via_backend(&mut backend, true, true);
@@ -1521,7 +1499,7 @@ fn entry_waits_for_queued_show_on_retire() {
     ));
     assert_eq!(backend.pstate.tearing.probation, 7);
 
-    let (show_executor, hide_executor) = install_cursor_plane_with_successful_show(&mut backend);
+    install_atomic_cursor_plane_stub(&mut backend);
     damage_root_and_composite(&mut backend);
     assert!(
         backend.scene.has_pending_page_flips(),
@@ -1573,18 +1551,6 @@ fn entry_waits_for_queued_show_on_retire() {
         backend.scene.cursor_mode(),
         crate::kms::render::scene::CursorPlaneMode::Hw
     );
-    assert!(show_executor.calls().is_empty());
-    assert!(
-        backend
-            .platform
-            .services
-            .test_recorders
-            .as_ref()
-            .expect("test recorders")
-            .legacy_cursor
-            .records()
-            .is_empty()
-    );
     assert!(matches!(
         backend.pstate.tearing.state,
         crate::kms::render::backend::TearingState::Off
@@ -1608,7 +1574,6 @@ fn entry_waits_for_queued_show_on_retire() {
     ));
     assert_eq!(recorder.records().len(), before_entry);
     assert!(backend.platform.any_cursor_plane_visible());
-    assert!(show_executor.calls().is_empty());
     assert!(!backend.scene.cursor_transition_pending());
     for index in 0..7_u32 {
         let present_id = 1609 + u64::from(index);
@@ -1646,30 +1611,33 @@ fn entry_waits_for_queued_show_on_retire() {
         AtomicCommitKind::Scene
     );
     assert!(backend.pstate.scanout_m2.pending.is_some());
-    assert!(hide_executor.calls().is_empty());
     retire_direct_present(&mut backend, &mut state, 10);
     if backend.platform.any_cursor_commit_in_flight() {
         retire_composed_frame(&mut backend, &mut state, 11);
     }
+    Backend::maybe_composite(&mut backend)
+        .expect("run the composition tail after On entry retirement");
+    cursor_gate_expired.set(true);
+    Backend::before_block(&mut backend);
     assert!(matches!(
         backend.pstate.tearing.state,
         crate::kms::render::backend::TearingState::On { window: WINDOW, .. }
     ));
-    assert!(hide_executor.calls().is_empty());
     assert!(!backend.platform.any_cursor_plane_visible());
-    assert!(show_executor.calls().is_empty());
     assert!(backend.pstate.scanout_m2.pending.is_none());
     assert!(backend.pstate.scanout_m2.queued_successor.is_none());
 
-    assert!(hide_executor.calls().is_empty());
     assert!(!backend.platform.any_cursor_plane_visible());
-    assert!(show_executor.calls().is_empty());
     assert!(!backend.scene.cursor_transition_pending());
     assert!(backend.pstate.scanout_m2.pending.is_none());
     assert!(backend.pstate.scanout_m2.queued_successor.is_none());
     let mut expected = vec![AtomicCommitKind::Scene; 8];
     expected.push(AtomicCommitKind::SceneWithCursor);
-    expected.extend([AtomicCommitKind::Scene, AtomicCommitKind::CursorOnly]);
+    expected.extend([
+        AtomicCommitKind::Scene,
+        AtomicCommitKind::Scene,
+        AtomicCommitKind::CursorOnly,
+    ]);
     assert_commit_sequence(&recorder, &expected);
     assert_direct_queue_drained(&backend);
     backend.platform.wait_idle_bounded();
@@ -2002,7 +1970,7 @@ fn dead_zone_hidden_cursor_tears_like_xfixes_hidden() {
     let Some(mut backend) = live_scene_backend_with_dead_zone() else {
         return;
     };
-    install_hidden_cursor_plane(&mut backend);
+    install_atomic_cursor_plane_stub(&mut backend);
     let recorder = recording_sink(&mut backend, 0);
     let mut state = ServerState::new();
     retire_registered_cursor_in_dead_zone(&mut backend, &mut state);
@@ -2048,7 +2016,7 @@ fn hidden_entry_never_binds_plane_on_retirement_show_or_motion() {
     let Some(mut backend) = live_scene_backend_with_dead_zone() else {
         return;
     };
-    let (show_executor, hide_executor) = install_cursor_plane_with_successful_show(&mut backend);
+    install_atomic_cursor_plane_stub(&mut backend);
     let recorder = recording_sink(&mut backend, 0);
     let mut state = ServerState::new();
     retire_registered_cursor_in_dead_zone(&mut backend, &mut state);
@@ -2077,7 +2045,6 @@ fn hidden_entry_never_binds_plane_on_retirement_show_or_motion() {
     retire_direct_present(&mut backend, &mut state, 9);
     assert!(!backend.platform.any_cursor_plane_visible());
     assert!(!backend.platform.any_cursor_plane_visible());
-    assert_eq!(hide_executor.calls().len(), 0);
 
     Backend::warp_pointer_root(&mut backend, &mut state, 100, 100);
     assert!(!backend.platform.any_cursor_plane_visible());
@@ -2091,7 +2058,6 @@ fn hidden_entry_never_binds_plane_on_retirement_show_or_motion() {
         backend.pstate.scanout_m2.unflip_reason,
         Some("tearing_cursor_handoff")
     );
-    assert!(show_executor.calls().is_empty());
     Backend::maybe_composite(&mut backend).expect("compose visible cursor handoff");
     assert!(backend.pstate.scanout_m2.current.is_some());
     retire_composed_frame(&mut backend, &mut state, 11);
@@ -2131,7 +2097,7 @@ fn hidden_entry_never_binds_plane_on_retirement_show_or_motion() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: leave tearing active across DPMS off, or preserve its probation across DPMS on.
+// Mutation: preserve tearing's probation across DPMS off; the resumed first seven requests must fail the expected counters.
 fn dpms_off_exits_tearing_and_on_requires_fresh_probation() {
     use yserver_core::backend::Backend;
 
@@ -2184,6 +2150,22 @@ fn dpms_off_exits_tearing_and_on_requires_fresh_probation() {
         if result.is_some() {
             resumed_commit_count += 1;
             retire_direct_present(&mut backend, &mut state, index + 1);
+        }
+        if index < 7 {
+            assert!(matches!(
+                backend.pstate.tearing.state,
+                crate::kms::render::backend::TearingState::Off
+            ));
+            assert_eq!(u32::from(backend.pstate.tearing.probation), index + 1);
+            assert_eq!(backend.pstate.tearing.probation_owner, Some(WINDOW));
+            assert_eq!(recorder.records().len(), before);
+        } else {
+            assert!(matches!(
+                backend.pstate.tearing.state,
+                crate::kms::render::backend::TearingState::On { window: WINDOW, .. }
+            ));
+            assert_eq!(recorder.records().len(), before + 1);
+            assert_eq!(recorder.records()[before].kind, AtomicCommitKind::Scene);
         }
     }
     assert!(matches!(
@@ -2463,12 +2445,6 @@ fn async_direct_request_has_flag_no_out_fence_no_cursor() {
         3,
         4,
     );
-    backend.platform.devices[0]
-        .cursor
-        .plane
-        .as_mut()
-        .expect("seeded cursor plane")
-        .for_tests_set_visible(position.crtc, false);
     set_scene_fence_properties(&mut backend.platform.outputs[0].output);
     let shape = try_direct_present(&mut backend, 61, 800, 600);
 
@@ -2540,12 +2516,6 @@ fn async_scene_request_has_flag_no_out_fence_no_cursor() {
         3,
         4,
     );
-    backend.platform.devices[0]
-        .cursor
-        .plane
-        .as_mut()
-        .expect("seeded cursor plane")
-        .for_tests_set_visible(position.crtc, false);
     damage_root(&mut backend);
     Backend::maybe_composite(&mut backend).expect("submit composed Async while tearing is On");
 
@@ -2586,7 +2556,7 @@ fn async_einval_resubmits_same_frame_vsync() {
     };
     let recorder = recording_sink(&mut backend, 0);
     qualify_test_direct_async(&mut backend, &recorder, 0x7380, 3000);
-    let (_show, _hide) = install_cursor_plane_with_successful_show(&mut backend);
+    install_atomic_cursor_plane_stub(&mut backend);
     let crtc = backend.platform.outputs[0].output.crtc;
     let cursor_plane = backend.platform.devices[0]
         .cursor
@@ -2987,13 +2957,13 @@ fn async_ebusy_is_not_suspension() {
     );
 }
 
-fn live_scene_backend() -> Option<KmsBackend> {
+pub(super) fn live_scene_backend() -> Option<KmsBackend> {
     let mut backend = live_scene_backend_with_outputs(1)?;
     prime_cursorless_scene_primary(&mut backend);
     Some(backend)
 }
 
-fn live_scene_backend_with_clock(
+pub(super) fn live_scene_backend_with_clock(
     clock: std::rc::Rc<dyn Fn() -> std::time::Instant>,
 ) -> Option<KmsBackend> {
     scene_backend_with_recording_pools_and_dead_zone_and_clock(1, false, clock)
@@ -3190,13 +3160,13 @@ fn scene_backend_with_recording_pools_and_dead_zone_and_clock_and_compose_error(
     Ok(Some(backend))
 }
 
-fn damage_root_and_composite(backend: &mut KmsBackend) {
+pub(super) fn damage_root_and_composite(backend: &mut KmsBackend) {
     use yserver_core::backend::Backend;
     damage_root(backend);
     Backend::maybe_composite(backend).expect("Backend::maybe_composite");
 }
 
-fn damage_root(backend: &mut KmsBackend) {
+pub(super) fn damage_root(backend: &mut KmsBackend) {
     use yserver_core::backend::Backend;
     let root = backend.core.window_id;
     let width = backend.platform.fb_w;
@@ -3227,7 +3197,7 @@ pub(super) fn retire_composed_frame(
     Backend::on_page_flip_ready(backend, state, drm_fd);
 }
 
-fn assert_scene_async_vsync_pair(
+pub(super) fn assert_scene_async_vsync_pair(
     records: &[crate::drm::atomic::tests_support::AtomicCommitRecord],
     start: usize,
 ) {
@@ -3574,7 +3544,7 @@ fn handoff_keeps_newest_copy_not_retained_direct_frame() {
         BackendCapabilities::from_backend(&backend),
     );
     let stage_host = materialize_test_cow_stage(&mut backend, &mut state, ClientId(1), WINDOW);
-    let (_show_executor, hide_executor) = install_cursor_plane_with_successful_show(&mut backend);
+    install_atomic_cursor_plane_stub(&mut backend);
     define_visible_cursor_through_backend(&mut backend, &mut state);
     prepare_visible_hw_cursor(&mut backend, &mut state);
     assert!(backend.platform.any_cursor_plane_visible());
@@ -3782,7 +3752,7 @@ fn handoff_keeps_newest_copy_not_retained_direct_frame() {
             .pstate
             .scanout_m2
             .unflip_awaiting_outputs
-            .contains(&0)
+            .contains_key(&0)
     );
     assert!(backend.platform.any_cursor_plane_visible());
     assert_eq!(backend.pstate.scanout_m2.unflip_fallback_source, None);
@@ -3837,7 +3807,6 @@ fn handoff_keeps_newest_copy_not_retained_direct_frame() {
         backend.scene.cursor_mode(),
         crate::kms::render::scene::CursorPlaneMode::Sw
     );
-    assert!(hide_executor.calls().is_empty());
 
     let root = backend.core.window_id;
     let composed_pixel = root_pixel(&mut backend, root, 10, 10).expect("GetImage composed root");
@@ -4190,19 +4159,7 @@ fn show_cursor_does_not_rebind_plane_while_on() {
     retire_direct_present(&mut backend, &mut state, 68);
     assert!(backend.pstate.scanout_m2.current.is_some());
 
-    let device = &mut backend.platform.devices[0];
-    let show_executor = std::rc::Rc::new(super::RecordingCursorShowExecutor::default());
-    let mut plane = crate::kms::cursor_plane::CursorPlane::for_tests_with_show_executor(
-        std::rc::Rc::clone(&device.device),
-        64,
-        64,
-        false,
-        show_executor.clone(),
-    );
-    let hide_executor = std::rc::Rc::new(RecordingCursorHideExecutor::default());
-    hide_executor.script([TestCursorHideResult::Ok; 8]);
-    plane.for_tests_set_hide_executor(hide_executor);
-    device.cursor.plane = Some(plane);
+    install_atomic_cursor_plane_stub(&mut backend);
     assert!(backend.pstate.tearing.is_on());
 
     Backend::set_cursor_hidden(&mut backend, false);
@@ -4212,7 +4169,6 @@ fn show_cursor_does_not_rebind_plane_while_on() {
         Some("tearing_cursor_handoff")
     );
     assert!(backend.pstate.scanout_m2.current.is_some());
-    assert!(show_executor.calls().is_empty());
     assert!(!backend.platform.any_cursor_plane_visible());
 
     let source = Backend::create_pixmap(&mut backend, None, 1, 1, 1).expect("cursor source");
@@ -4242,7 +4198,6 @@ fn show_cursor_does_not_rebind_plane_while_on() {
     let root = backend.core.window_id;
     Backend::define_cursor(&mut backend, None, root, cursor.as_raw())
         .expect("change effective cursor sprite");
-    assert!(show_executor.calls().is_empty());
     assert!(!backend.platform.any_cursor_plane_visible());
 
     Backend::maybe_composite(&mut backend).expect("submit composed handoff");
@@ -4628,7 +4583,7 @@ fn composed_async_accept_keeps_cursor_move_unsent() {
     else {
         return;
     };
-    let (_show, _hide) = install_cursor_plane_with_successful_show(&mut backend);
+    install_atomic_cursor_plane_stub(&mut backend);
     let crtc = backend.platform.outputs[0].output.crtc;
     let cursor_plane = backend.platform.devices[0]
         .cursor
@@ -5263,7 +5218,6 @@ fn present_capabilities_follow_the_windows_output_device() {
                 crate::kms::render::platform::flip_events::DrmPageFlipEventSource,
             ),
             cursor_buffer_io: Rc::new(crate::kms::cursor_plane::ops::DrmCursorBufferIo),
-            legacy_cursor_io: Rc::new(crate::kms::cursor_plane::ops::DrmLegacyCursorIo),
             #[cfg(test)]
             test_page_flip_event_source: None,
             cursor: crate::kms::render::platform::KmsCursorState::new(),
@@ -5595,3 +5549,16 @@ fn task5_client_frame_is_never_deferred_by_cursor_cap() {
 pub(super) mod round2;
 mod round3;
 mod round4;
+
+pub(super) fn run_atomic_cursor_only_tearing_gate_cases() {
+    round2::tearing_on_rejected_cursor_detach_retains_hw_without_async();
+    round2::tearing_on_ebusy_cursor_detach_retains_hw_without_async();
+    round2::task5_client_frame_is_never_deferred_by_cursor_cap();
+    round3::tearing_direct_handoff_rejected_detach_keeps_cursorless_vsync();
+    round3::transparent_cursor_is_hidden_for_direct_scanout_and_define_cursor_handoff();
+    round3::run_two_output_grouped_tearing_handoff_waits_for_each_event();
+    round4::atomic_cursor_only_c1_hidden_direct_entry_detaches_accepted_binding();
+    round4::atomic_cursor_only_c1_hidden_direct_rejected_detach_keeps_lease_and_rebinds_latest();
+    round4::atomic_cursor_only_c1_async_filters_before_cursor_preparation();
+    round4::atomic_cursor_only_c1_hidden_direct_async_fallback_stays_cursorless();
+}

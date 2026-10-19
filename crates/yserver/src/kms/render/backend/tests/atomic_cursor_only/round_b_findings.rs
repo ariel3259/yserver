@@ -292,8 +292,10 @@ fn atomic_cursor_only_held_direct_enospc_attach_reveals_software_cursor() {
         .atomic
         .script_result(Err(io::Error::from_raw_os_error(libc::ENOSPC)));
     Backend::maybe_composite(&mut fixture.backend).expect("reject the cursor-only attach");
+    // Detach first: the refused attach is followed by the explicit detach,
+    // and only the detach's acceptance requests the unflip (spec §3).
     let rejected = fixture.recorders.atomic.records();
-    assert_eq!(rejected.len(), before_attach + 1);
+    assert_eq!(rejected.len(), before_attach + 2);
     assert_eq!(
         rejected[before_attach].kind,
         crate::drm::atomic::AtomicCommitKind::CursorOnly,
@@ -304,6 +306,19 @@ fn atomic_cursor_only_held_direct_enospc_attach_reveals_software_cursor() {
             kind: io::ErrorKind::StorageFull,
             raw_os_error: Some(libc::ENOSPC),
         },
+    );
+    assert_eq!(
+        rejected[before_attach + 1].kind,
+        crate::drm::atomic::AtomicCommitKind::CursorOnly
+    );
+    assert_eq!(
+        rejected[before_attach + 1].properties.len(),
+        2,
+        "FB_ID=0 and CRTC_ID=0 only"
+    );
+    assert_eq!(
+        rejected[before_attach + 1].result,
+        crate::drm::atomic::tests_support::ScriptedResult::Ok,
     );
     assert!(!fixture.backend.platform.cursor_plane_visible_for_output(0));
     assert!(fixture.backend.pstate.scanout_m2.unflip_requested);
@@ -318,7 +333,11 @@ fn atomic_cursor_only_held_direct_enospc_attach_reveals_software_cursor() {
                 .pstate
                 .scanout_m2
                 .unflip_awaiting_outputs
-                .contains(&0)
+                .contains_key(&0)
+            || fixture
+                .backend
+                .platform
+                .cursor_atomic_event_pending_for_output(0)
         {
             fixture.retire_output(0, frame);
         }
@@ -374,11 +393,11 @@ fn atomic_cursor_only_held_direct_enospc_attach_reveals_software_cursor() {
             .collect::<Vec<_>>(),
         vec![
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
-            crate::drm::atomic::AtomicCommitKind::Scene,
+            crate::drm::atomic::AtomicCommitKind::CursorOnly,
             crate::drm::atomic::AtomicCommitKind::Scene,
             crate::drm::atomic::AtomicCommitKind::Scene,
         ],
-        "rejected attach, SW fallback, and lifecycle disable have the exact trace",
+        "rejected attach, accepted explicit detach, one SW recompose that carries the Software receipt, and lifecycle disable have the exact trace",
     );
     let ledger = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
     drop(fixture);
@@ -434,6 +453,7 @@ fn atomic_cursor_only_hide_survives_pending_software_to_hardware_frame() {
     Backend::maybe_composite(&mut fixture.backend).expect("retain hide behind the scene event");
     assert_eq!(fixture.recorders.atomic.records().len(), before_queued_hide);
     fixture.retire_output(0, 2);
+    Backend::maybe_composite(&mut fixture.backend).expect("run the production composition tail");
 
     assert_eq!(
         fixture.recorders.atomic.records().len(),

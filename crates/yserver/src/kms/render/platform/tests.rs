@@ -559,9 +559,6 @@ fn test_kms_device(key: crate::platform::drm::DrmDeviceKey) -> KmsDevice {
             let (io, _) = crate::kms::cursor_plane::ops::RecordingCursorBufferIo::new(256);
             Rc::new(io)
         },
-        legacy_cursor_io: Rc::new(
-            crate::kms::cursor_plane::ops::RecordingLegacyCursorIo::default(),
-        ),
         test_page_flip_event_source: None,
         cursor: KmsCursorState::new(),
     }
@@ -712,7 +709,6 @@ fn install_test_cursor_plane(
         Rc::clone(&device.device),
         crtcs,
         Rc::clone(&device.cursor_buffer_io),
-        Rc::clone(&device.legacy_cursor_io),
     )
     .expect("synthetic plane discovery and allocation");
     install_cursor_plane_for_device(device, crtcs, boundary, plane);
@@ -1159,7 +1155,6 @@ fn cursor_route_qualifies_colliding_raw_crtcs_by_device() {
         ))),
         page_flip_event_source: Rc::new(flip_events::DrmPageFlipEventSource),
         cursor_buffer_io: Rc::new(crate::kms::cursor_plane::ops::DrmCursorBufferIo),
-        legacy_cursor_io: Rc::new(crate::kms::cursor_plane::ops::DrmLegacyCursorIo),
         test_page_flip_event_source: None,
         cursor: KmsCursorState::new(),
     });
@@ -1187,7 +1182,6 @@ fn drm_device_fd_lookup_distinguishes_same_kind_poll_sources() {
         ))),
         page_flip_event_source: Rc::new(flip_events::DrmPageFlipEventSource),
         cursor_buffer_io: Rc::new(crate::kms::cursor_plane::ops::DrmCursorBufferIo),
-        legacy_cursor_io: Rc::new(crate::kms::cursor_plane::ops::DrmLegacyCursorIo),
         test_page_flip_event_source: None,
         cursor: KmsCursorState::new(),
     });
@@ -1231,8 +1225,7 @@ fn zero_outputs_is_not_fatal() {
     assert!(check_scanout_liveness(0, 0, &[]).is_ok());
 }
 
-/// HW-cursor auto-fallback policy: an ioctl error that means the
-/// driver doesn't implement the (legacy) cursor ioctls must latch
+/// Atomic HW-cursor failures that show unsupported cursor commits must latch
 /// the strategy off so the scene falls back to the SW cursor.
 /// Apple's DCP driver (Asahi) returns `ENXIO`; some drivers return
 /// `ENODEV` / `EOPNOTSUPP`. Recoverable errors (`EBUSY`) must NOT
@@ -1241,7 +1234,7 @@ fn zero_outputs_is_not_fatal() {
 #[test]
 fn cursor_err_disables_hw_only_for_unsupported_errnos() {
     use std::io::Error;
-    // Asahi / Apple DCP: legacy cursor ioctl unimplemented.
+    // Asahi / Apple DCP does not support atomic cursor commits.
     assert!(cursor_err_disables_hw(&Error::from_raw_os_error(
         libc::ENXIO
     )));
@@ -1263,195 +1256,76 @@ fn cursor_err_disables_hw_only_for_unsupported_errnos() {
 }
 
 #[test]
-fn cursor_failure_pair_uses_permanent_precedence_and_clears_pending() {
-    let crtc = ::drm::control::from_u32(17).unwrap();
-
+fn cursor_failure_classification_clears_retry_after_einval() {
     let mut transient = KmsCursorState::new();
     transient.pending_move = Some((1, 2, 3, 4));
     assert_eq!(
-        transient.note_cursor_failure_pair(
-            crtc,
-            &io::Error::from_raw_os_error(libc::EINVAL),
-            Some(&io::Error::from_raw_os_error(libc::EIO)),
-        ),
+        transient.note_cursor_failure(&io::Error::from_raw_os_error(libc::EINVAL)),
         CursorFailureDisposition::Transient
     );
     assert!(!transient.permanently_disabled);
     assert_eq!(transient.pending_move, None);
-    assert_eq!(
-        transient.transient_fallback_crtcs[&crtc].remaining_sw_retires, 1,
-        "one operation+rollback pair records exactly one failure"
-    );
 
-    for (operation_errno, rollback_errno) in
-        [(libc::EINVAL, libc::ENODEV), (libc::ENODEV, libc::EINVAL)]
-    {
-        let mut permanent = KmsCursorState::new();
-        permanent.pending_move = Some((1, 2, 3, 4));
-        assert_eq!(
-            permanent.note_cursor_failure_pair(
-                crtc,
-                &io::Error::from_raw_os_error(operation_errno),
-                Some(&io::Error::from_raw_os_error(rollback_errno)),
-            ),
-            CursorFailureDisposition::Permanent
-        );
-        assert!(permanent.permanently_disabled);
-        assert_eq!(permanent.pending_move, None);
-        assert!(permanent.transient_fallback_crtcs.is_empty());
-    }
+    let mut permanent = KmsCursorState::new();
+    permanent.pending_move = Some((1, 2, 3, 4));
+    assert_eq!(
+        permanent.note_cursor_failure(&io::Error::from_raw_os_error(libc::ENODEV)),
+        CursorFailureDisposition::Permanent
+    );
+    assert!(permanent.permanently_disabled);
+    assert_eq!(permanent.pending_move, None);
 
     let mut unchanged = KmsCursorState::new();
     unchanged.pending_move = Some((1, 2, 3, 4));
     assert_eq!(
-        unchanged.note_cursor_failure_pair(
-            crtc,
-            &io::Error::from_raw_os_error(libc::EBUSY),
-            Some(&io::Error::from_raw_os_error(libc::EIO)),
-        ),
+        unchanged.note_cursor_failure(&io::Error::from_raw_os_error(libc::EBUSY)),
         CursorFailureDisposition::Unchanged
     );
     assert_eq!(unchanged.pending_move, Some((1, 2, 3, 4)));
-    assert!(unchanged.transient_fallback_crtcs.is_empty());
 }
 
 #[test]
-fn still_visible_show_failure_records_owning_fallback_without_stale_move() {
-    let crtc = ::drm::control::from_u32(18).unwrap();
-    let mut transient = KmsCursorState::new();
-    transient.pending_move = Some((1, 2, 3, 4));
-    let bind_einval = crate::kms::cursor_plane::CursorShowError::StillVisible {
-        operation_error: io::Error::from_raw_os_error(libc::EINVAL),
-        rollback_error: None,
-    };
-    assert_eq!(
-        apply_cursor_show_failure_state(&mut transient, crtc, &bind_einval, (10, 20, 5, 6),),
-        CursorFailureDisposition::Transient
-    );
-    assert_eq!(transient.pending_move, None);
-    assert_eq!(
-        transient.transient_fallback_crtcs[&crtc].remaining_sw_retires,
-        1
-    );
-
-    let mut unsupported = KmsCursorState::new();
-    let bind_enodev = crate::kms::cursor_plane::CursorShowError::StillVisible {
-        operation_error: io::Error::from_raw_os_error(libc::ENODEV),
-        rollback_error: None,
-    };
-    assert_eq!(
-        apply_cursor_show_failure_state(&mut unsupported, crtc, &bind_enodev, (10, 20, 5, 6),),
-        CursorFailureDisposition::Permanent
-    );
-    assert!(unsupported.permanently_disabled);
-
-    let mut rollback_wins = KmsCursorState::new();
-    let move_einval_hide_enodev = crate::kms::cursor_plane::CursorShowError::StillVisible {
-        operation_error: io::Error::from_raw_os_error(libc::EINVAL),
-        rollback_error: Some(io::Error::from_raw_os_error(libc::ENODEV)),
-    };
-    assert_eq!(
-        apply_cursor_show_failure_state(
-            &mut rollback_wins,
-            crtc,
-            &move_einval_hide_enodev,
-            (10, 20, 5, 6),
-        ),
-        CursorFailureDisposition::Permanent
-    );
-    assert!(rollback_wins.permanently_disabled);
-    assert!(rollback_wins.transient_fallback_crtcs.is_empty());
-    assert_eq!(rollback_wins.pending_move, None);
-}
-
-#[test]
-fn hide_failure_classification_is_bounded_and_success_does_not_clear_it() {
-    let crtc = ::drm::control::from_u32(19).unwrap();
+fn hide_failure_classification_preserves_busy_and_permanent_semantics() {
     let mut state = KmsCursorState::new();
-    let einval = Err(io::Error::from_raw_os_error(libc::EINVAL));
     assert_eq!(
-        apply_cursor_operation_result(&mut state, crtc, &einval),
+        state.note_cursor_failure(&io::Error::from_raw_os_error(libc::EINVAL)),
         CursorFailureDisposition::Transient
     );
     assert_eq!(
-        state.transient_fallback_crtcs[&crtc].remaining_sw_retires,
-        1
-    );
-    assert_eq!(
-        apply_cursor_operation_result(&mut state, crtc, &einval),
-        CursorFailureDisposition::Transient
-    );
-    assert_eq!(
-        state.transient_fallback_crtcs[&crtc].remaining_sw_retires,
-        2
-    );
-
-    assert_eq!(
-        apply_cursor_operation_result(&mut state, crtc, &Ok(())),
+        state.note_cursor_failure(&io::Error::from_raw_os_error(libc::EBUSY)),
         CursorFailureDisposition::Unchanged
     );
     assert_eq!(
-        state.transient_fallback_crtcs[&crtc].remaining_sw_retires, 2,
-        "a successful hide is not proof that a later full Show is valid"
-    );
-
-    let other_crtc = ::drm::control::from_u32(20).unwrap();
-    assert_eq!(
-        apply_cursor_operation_result(
-            &mut state,
-            other_crtc,
-            &Err(io::Error::from_raw_os_error(libc::EBUSY)),
-        ),
-        CursorFailureDisposition::Unchanged
-    );
-    assert!(!state.transient_fallback_crtcs.contains_key(&other_crtc));
-
-    assert_eq!(
-        apply_cursor_operation_result(
-            &mut state,
-            crtc,
-            &Err(io::Error::from_raw_os_error(libc::ENODEV)),
-        ),
+        state.note_cursor_failure(&io::Error::from_raw_os_error(libc::ENODEV)),
         CursorFailureDisposition::Permanent
     );
     assert!(state.permanently_disabled);
-    assert!(state.transient_fallback_crtcs.is_empty());
 }
 
 #[test]
-fn actual_upload_invalid_input_enters_one_bounded_local_fallback() {
-    let crtc = ::drm::control::from_u32(21).unwrap();
+fn actual_upload_invalid_input_is_transient_without_disabling_hardware() {
     let mut state = KmsCursorState::new();
-    let upload = Err(io::Error::new(
+    let upload = io::Error::new(
         io::ErrorKind::InvalidInput,
         "cursor bytes shorter than width*height*4",
-    ));
-    assert_eq!(
-        apply_cursor_operation_result(&mut state, crtc, &upload),
-        CursorFailureDisposition::Transient
     );
-    assert_eq!(state.transient_fallback_crtcs.len(), 1);
     assert_eq!(
-        state.transient_fallback_crtcs[&crtc].remaining_sw_retires,
-        1
+        state.note_cursor_failure(&upload),
+        CursorFailureDisposition::Transient
     );
     assert!(!state.permanently_disabled);
 }
 
 #[test]
 fn cursor_failure_classification_isolated_across_cards_with_same_raw_crtc() {
-    let crtc = ::drm::control::from_u32(22).unwrap();
     let mut card_a = KmsCursorState::new();
     let card_b = KmsCursorState::new();
-    card_a.note_cursor_failure_pair(crtc, &io::Error::from_raw_os_error(libc::EINVAL), None);
-    assert!(card_a.transient_fallback_crtcs.contains_key(&crtc));
-    assert!(card_b.transient_fallback_crtcs.is_empty());
+    card_a.note_cursor_failure(&io::Error::from_raw_os_error(libc::EINVAL));
+    assert!(!card_a.permanently_disabled);
     assert!(!card_b.permanently_disabled);
 
-    card_a.note_cursor_failure_pair(crtc, &io::Error::from_raw_os_error(libc::ENODEV), None);
+    card_a.note_cursor_failure(&io::Error::from_raw_os_error(libc::ENODEV));
     assert!(card_a.permanently_disabled);
-    assert!(card_a.transient_fallback_crtcs.is_empty());
-    assert!(card_b.transient_fallback_crtcs.is_empty());
     assert!(!card_b.permanently_disabled);
 }
 
@@ -1767,19 +1641,16 @@ fn cursor_capacity_is_evaluated_per_card() {
 }
 
 #[test]
-fn topology_refresh_on_card_b_preserves_card_a_cursor_retry_state() {
+fn topology_refresh_on_card_b_preserves_card_a_pending_motion() {
     let mut platform = PlatformBackend::for_tests();
     let card_a = platform.devices[0].key;
-    let raw_crtc = platform.outputs[0].output.crtc;
     let card_b = crate::platform::drm::DrmDeviceKey {
         major: 226,
         minor: 88,
     };
     platform.devices.push(test_kms_device(card_b));
     platform.devices[0].cursor.pending_move = Some((100, 200, 3, 4));
-    platform.devices[0].cursor.note_einval(raw_crtc);
     platform.devices[1].cursor.pending_move = Some((300, 400, 5, 6));
-    platform.devices[1].cursor.note_einval(raw_crtc);
 
     platform.refresh_cursor_topology_for_devices(&HashSet::from([card_b]));
 
@@ -1788,98 +1659,7 @@ fn topology_refresh_on_card_b_preserves_card_a_cursor_retry_state() {
         platform.devices[0].cursor.pending_move,
         Some((100, 200, 3, 4))
     );
-    assert_eq!(
-        platform.devices[0]
-            .cursor
-            .transient_fallback_crtcs
-            .get(&raw_crtc)
-            .map(|retry| retry.remaining_sw_retires),
-        Some(1)
-    );
     assert_eq!(platform.devices[1].cursor.pending_move, None);
-    assert!(
-        platform.devices[1]
-            .cursor
-            .transient_fallback_crtcs
-            .is_empty()
-    );
-}
-
-#[test]
-fn einval_backoff_advances_only_on_owning_output_retirements() {
-    let mut platform = PlatformBackend::for_tests();
-    let raw_crtc = platform.outputs[0].output.crtc;
-    let card_b = crate::platform::drm::DrmDeviceKey {
-        major: 226,
-        minor: 89,
-    };
-    platform.devices.push(test_kms_device(card_b));
-    platform.devices[0].cursor.note_einval(raw_crtc);
-    platform.devices[1].cursor.note_einval(raw_crtc);
-
-    assert!(platform.cursor_plane_note_composed_retirement(0));
-    assert_eq!(
-        platform.devices[0].cursor.transient_fallback_crtcs[&raw_crtc].remaining_sw_retires,
-        0
-    );
-    assert_eq!(
-        platform.devices[1].cursor.transient_fallback_crtcs[&raw_crtc].remaining_sw_retires,
-        1
-    );
-
-    platform.devices[0].cursor.note_einval(raw_crtc);
-    assert_eq!(
-        platform.devices[0].cursor.transient_fallback_crtcs[&raw_crtc].remaining_sw_retires, 2,
-        "a repeated EINVAL is rate-limited for two own-card SW retirements"
-    );
-}
-
-#[test]
-fn failed_move_hide_rollback_records_fallback_and_scene_owned_retry() {
-    let crtc = ::drm::control::from_u32(17).unwrap();
-    let mut state = KmsCursorState::new();
-    state.pending_move = Some((1, 2, 3, 4));
-    let mut outcome = CursorMoveOutcome::default();
-    let keep_pending = apply_cursor_move_rollback_result(
-        &mut state,
-        crtc,
-        &io::Error::from_raw_os_error(libc::EINVAL),
-        Err(io::Error::from_raw_os_error(libc::EIO)),
-        &mut outcome,
-    );
-
-    assert!(!keep_pending);
-    assert!(outcome.retry_required);
-    assert!(outcome.fallback_changed);
-    assert!(!state.permanently_disabled);
-    assert_eq!(state.pending_move, None);
-    assert_eq!(
-        state.transient_fallback_crtcs[&crtc].remaining_sw_retires,
-        1
-    );
-}
-
-#[test]
-fn failed_move_hide_rollback_uses_permanent_precedence() {
-    let crtc = ::drm::control::from_u32(23).unwrap();
-    for (move_errno, hide_errno) in [(libc::EINVAL, libc::ENODEV), (libc::ENODEV, libc::EINVAL)] {
-        let mut state = KmsCursorState::new();
-        state.pending_move = Some((1, 2, 3, 4));
-        let mut outcome = CursorMoveOutcome::default();
-        let keep_pending = apply_cursor_move_rollback_result(
-            &mut state,
-            crtc,
-            &io::Error::from_raw_os_error(move_errno),
-            Err(io::Error::from_raw_os_error(hide_errno)),
-            &mut outcome,
-        );
-        assert!(!keep_pending);
-        assert!(outcome.retry_required);
-        assert!(outcome.fallback_changed);
-        assert!(state.permanently_disabled);
-        assert_eq!(state.pending_move, None);
-        assert!(state.transient_fallback_crtcs.is_empty());
-    }
 }
 
 #[test]
@@ -1887,11 +1667,15 @@ fn cursor_move_outcome_merge_keeps_cross_device_retry_liveness() {
     let mut aggregate = CursorMoveOutcome {
         ebusy_count: 2,
         fallback_changed: false,
+
+        accepted_detach: false,
         retry_required: false,
     };
     aggregate.merge(CursorMoveOutcome {
         ebusy_count: 3,
         fallback_changed: true,
+
+        accepted_detach: false,
         retry_required: true,
     });
     assert_eq!(aggregate.ebusy_count, 5);

@@ -14,10 +14,7 @@ use crate::{
     kms::{
         cursor_plane::{
             CursorPlaneFactory, DrmCursorPlaneFactory,
-            ops::{
-                CursorBufferIo, DrmCursorBufferIo, DrmLegacyCursorIo, LegacyCursorIo,
-                RecordingCursorBufferIo, RecordingLegacyCursorIo,
-            },
+            ops::{CursorBufferIo, DrmCursorBufferIo, RecordingCursorBufferIo},
         },
         hotplug::{DisplayHotplugSource, DrmDisplayHotplugSource, RecordingDisplayHotplugSource},
         render::platform::{
@@ -334,7 +331,6 @@ pub struct KmsServices {
     pub(crate) mode_blobs: Rc<dyn ModeBlobIo>,
     pub(crate) gamma: Rc<dyn GammaIo>,
     pub(crate) cursor_buffers: Rc<dyn CursorBufferIo>,
-    pub(crate) legacy_cursor: Rc<dyn LegacyCursorIo>,
     pub(crate) cursor_plane_factory: Rc<dyn CursorPlaneFactory>,
     pub(crate) crtc_output_discovery: Rc<dyn CrtcOutputDiscovery>,
     pub(crate) atomic: Rc<dyn AtomicCommitExecutor>,
@@ -346,7 +342,46 @@ pub struct KmsServices {
     pub(crate) monotonic_clock: Rc<dyn Fn() -> Instant>,
     pub(crate) direct_scanout_test_only: Rc<dyn DirectScanoutTestOnlyExecutor>,
     pub(crate) backend_entry_observer: Rc<dyn BackendEntryObserver>,
+    /// Observer of cursor recovery decisions that keep hardware ownership.
+    pub(crate) cursor_recovery_reporter: Rc<dyn super::cursor_recovery::CursorRecoveryReporter>,
+    /// Observes cursor ownership immediately before old flip events are drained.
+    pub(crate) old_event_drain_observer: Rc<dyn OldEventDrainObserver>,
     pub(crate) test_recorders: Option<Rc<KmsTestRecorders>>,
+}
+
+pub(crate) trait OldEventDrainObserver {
+    fn before_old_event_drain(&self, platform: &super::PlatformBackend);
+}
+
+#[cfg(test)]
+type OldEventDrainCallback = Rc<dyn Fn(&super::PlatformBackend)>;
+
+pub(crate) struct NoopOldEventDrainObserver;
+
+impl OldEventDrainObserver for NoopOldEventDrainObserver {
+    fn before_old_event_drain(&self, _platform: &super::PlatformBackend) {}
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct RecordingOldEventDrainObserver {
+    observer: std::cell::RefCell<Option<OldEventDrainCallback>>,
+}
+
+#[cfg(test)]
+impl RecordingOldEventDrainObserver {
+    pub(crate) fn set(&self, observer: Rc<dyn Fn(&super::PlatformBackend)>) {
+        *self.observer.borrow_mut() = Some(observer);
+    }
+}
+
+#[cfg(test)]
+impl OldEventDrainObserver for RecordingOldEventDrainObserver {
+    fn before_old_event_drain(&self, platform: &super::PlatformBackend) {
+        if let Some(observer) = self.observer.borrow().as_ref().cloned() {
+            observer(platform);
+        }
+    }
 }
 
 /// The subset needed by isolated scanout qualification workers. Worker code
@@ -370,7 +405,7 @@ pub(crate) struct KmsTestRecorders {
     pub(crate) atomic: Rc<crate::drm::atomic::tests_support::RecordingAtomicCommitExecutor>,
     pub(crate) mode_blobs: Rc<RecordingModeBlobIo>,
     pub(crate) cursor_buffer_ledger: Rc<crate::kms::cursor_plane::ops::CursorBufferLedger>,
-    pub(crate) legacy_cursor: Rc<RecordingLegacyCursorIo>,
+    pub(crate) connector_scanout_pools: Rc<RecordingConnectorScanoutPools>,
     #[cfg(test)]
     pub(crate) cursor_plane_factory: Rc<crate::kms::cursor_plane::RecordingCursorPlaneFactory>,
     #[cfg(test)]
@@ -385,12 +420,66 @@ pub(crate) struct KmsTestRecorders {
     pub(crate) render_completion_readiness: Rc<RecordingRenderCompletionReadiness>,
     #[cfg(test)]
     pub(crate) copied_scanout_copy: Rc<RecordingCopiedScanoutCopySubmitter>,
+    #[cfg(test)]
+    pub(crate) old_event_drain_observer: Rc<RecordingOldEventDrainObserver>,
     pub(crate) hotplug: Rc<RecordingDisplayHotplugSource>,
     pub(crate) connector_snapshot: Rc<RecordingConnectorSnapshotIo>,
     #[cfg(test)]
     pub(crate) direct_scanout_test_only: Rc<RecordingDirectScanoutTestOnlyExecutor>,
     #[cfg(test)]
     pub(crate) backend_entry_observer: Rc<RecordingBackendEntryObserver>,
+}
+
+/// Test scanout pools installed through Backend CRTC enable calls.
+///
+/// The production backend has no `test_recorders`; this queue lets lifecycle
+/// fixtures exercise a real re-enable without exporting Vulkan BOs to `/dev/null`.
+pub(crate) struct RecordingConnectorScanoutPools {
+    queued: std::cell::RefCell<
+        std::collections::VecDeque<(
+            crate::kms::scanout_route::ScanoutRoute,
+            u32,
+            u32,
+            crate::kms::vk::scanout::OutputScanout,
+        )>,
+    >,
+}
+
+impl RecordingConnectorScanoutPools {
+    pub(crate) fn new() -> Self {
+        Self {
+            queued: std::cell::RefCell::new(std::collections::VecDeque::new()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queue(
+        &self,
+        route: crate::kms::scanout_route::ScanoutRoute,
+        width: u32,
+        height: u32,
+        pool: crate::kms::vk::scanout::OutputScanout,
+    ) {
+        self.queued
+            .borrow_mut()
+            .push_back((route, width, height, pool));
+    }
+
+    pub(crate) fn take(
+        &self,
+        route: crate::kms::scanout_route::ScanoutRoute,
+        width: u32,
+        height: u32,
+    ) -> Option<crate::kms::vk::scanout::OutputScanout> {
+        let mut queued = self.queued.borrow_mut();
+        let matches =
+            queued
+                .front()
+                .is_some_and(|(queued_route, queued_width, queued_height, _)| {
+                    *queued_route == route && *queued_width == width && *queued_height == height
+                });
+        matches.then(|| queued.pop_front().expect("front pool was checked").3)
+    }
 }
 
 pub(crate) trait CrtcOutputDiscovery {
@@ -577,7 +666,6 @@ impl KmsServices {
             mode_blobs: Rc::new(DrmModeBlobIo),
             gamma: Rc::new(DrmGammaIo),
             cursor_buffers: Rc::new(DrmCursorBufferIo),
-            legacy_cursor: Rc::new(DrmLegacyCursorIo),
             cursor_plane_factory: Rc::new(DrmCursorPlaneFactory),
             crtc_output_discovery: Rc::new(DrmCrtcOutputDiscovery),
             atomic: Rc::new(DrmAtomicCommitExecutor),
@@ -589,6 +677,8 @@ impl KmsServices {
             monotonic_clock: Rc::new(Instant::now),
             direct_scanout_test_only: Rc::new(DrmDirectScanoutTestOnlyExecutor),
             backend_entry_observer: Rc::new(NoopBackendEntryObserver),
+            cursor_recovery_reporter: Rc::new(super::cursor_recovery::LogCursorRecoveryReporter),
+            old_event_drain_observer: Rc::new(NoopOldEventDrainObserver),
             test_recorders: None,
         }
     }
@@ -608,7 +698,7 @@ impl KmsServices {
         let mode_blobs = Rc::new(RecordingModeBlobIo::default());
         let (cursor_buffers, cursor_buffer_ledger) = RecordingCursorBufferIo::new(256);
         let cursor_buffers = Rc::new(cursor_buffers);
-        let legacy_cursor = Rc::new(RecordingLegacyCursorIo::default());
+        let connector_scanout_pools = Rc::new(RecordingConnectorScanoutPools::new());
         let cursor_plane_factory =
             Rc::new(crate::kms::cursor_plane::RecordingCursorPlaneFactory::default());
         let page_flip_events = Rc::new(
@@ -616,6 +706,7 @@ impl KmsServices {
         );
         let render_completion_readiness = Rc::new(RecordingRenderCompletionReadiness::default());
         let copied_scanout_copy = Rc::new(RecordingCopiedScanoutCopySubmitter::default());
+        let old_event_drain_observer = Rc::new(RecordingOldEventDrainObserver::default());
         let hotplug =
             Rc::new(RecordingDisplayHotplugSource::new().expect("recording hotplug socket pair"));
         let connector_snapshot = Rc::new(RecordingConnectorSnapshotIo::new());
@@ -625,7 +716,7 @@ impl KmsServices {
             atomic: Rc::clone(&atomic),
             mode_blobs: Rc::clone(&mode_blobs),
             cursor_buffer_ledger,
-            legacy_cursor: Rc::clone(&legacy_cursor),
+            connector_scanout_pools: Rc::clone(&connector_scanout_pools),
             #[cfg(test)]
             cursor_plane_factory: Rc::clone(&cursor_plane_factory),
             crtc_output_discovery: Rc::clone(&crtc_output_discovery),
@@ -634,6 +725,7 @@ impl KmsServices {
             page_flip_events: Rc::clone(&page_flip_events),
             render_completion_readiness: Rc::clone(&render_completion_readiness),
             copied_scanout_copy: Rc::clone(&copied_scanout_copy),
+            old_event_drain_observer: Rc::clone(&old_event_drain_observer),
             hotplug: Rc::clone(&hotplug),
             connector_snapshot: Rc::clone(&connector_snapshot),
             direct_scanout_test_only: Rc::clone(&direct_scanout_test_only),
@@ -643,7 +735,8 @@ impl KmsServices {
             mode_blobs,
             gamma,
             cursor_buffers,
-            legacy_cursor,
+            // The queue is reachable only through the test-recorders service.
+            // A production KmsServices instance has no test recorders.
             cursor_plane_factory,
             crtc_output_discovery,
             atomic,
@@ -655,6 +748,8 @@ impl KmsServices {
             monotonic_clock,
             direct_scanout_test_only,
             backend_entry_observer,
+            cursor_recovery_reporter: Rc::new(super::cursor_recovery::LogCursorRecoveryReporter),
+            old_event_drain_observer,
             test_recorders: Some(test_recorders),
         }
     }
@@ -671,7 +766,6 @@ impl KmsServices {
         let mode_blobs = Rc::new(RecordingModeBlobIo::default());
         let (cursor_buffers, _) = RecordingCursorBufferIo::new(256);
         let cursor_buffers = Rc::new(cursor_buffers);
-        let legacy_cursor = Rc::new(RecordingLegacyCursorIo::default());
         let page_flip_events = Rc::new(
             crate::kms::render::platform::flip_events::RecordingPageFlipEventSource::default(),
         );
@@ -681,7 +775,6 @@ impl KmsServices {
             mode_blobs,
             gamma: Rc::new(DrmGammaIo),
             cursor_buffers,
-            legacy_cursor,
             cursor_plane_factory: Rc::new(DrmCursorPlaneFactory),
             crtc_output_discovery: Rc::new(DrmCrtcOutputDiscovery),
             atomic,
@@ -693,6 +786,8 @@ impl KmsServices {
             monotonic_clock,
             direct_scanout_test_only: Rc::new(DrmDirectScanoutTestOnlyExecutor),
             backend_entry_observer: Rc::new(NoopBackendEntryObserver),
+            cursor_recovery_reporter: Rc::new(super::cursor_recovery::LogCursorRecoveryReporter),
+            old_event_drain_observer: Rc::new(NoopOldEventDrainObserver),
             test_recorders: None,
         }
     }

@@ -230,10 +230,6 @@ pub(super) fn run_atomic_cursor_only_deferred_direct_replacement_reaches_later_c
         "the later CRTC retains the replacement hotspot with its staged lease",
     );
     assert!(state1.intent.is_some());
-    assert!(
-        !fixture.backend.pstate.scanout_m2.cursor_bound_all,
-        "a blocked per-output replacement is not published as bound on every CRTC",
-    );
 
     // Probe a fresh Present source while the replacement is still pending on
     // CRTC zero. TEST_ONLY receives the same prepared cursor delta that the
@@ -521,7 +517,14 @@ fn atomic_cursor_only_direct_and_unflip_carry_motion_deltas() {
         "composed unflip motion",
     );
     assert_eq!(
-        fixture.backend.pstate.scanout_m2.unflip_awaiting_outputs,
+        fixture
+            .backend
+            .pstate
+            .scanout_m2
+            .unflip_awaiting_outputs
+            .keys()
+            .copied()
+            .collect::<std::collections::HashSet<_>>(),
         [0].into()
     );
     fixture.retire_output(0, 61);
@@ -648,8 +651,8 @@ fn atomic_cursor_only_shared_scene_settlement_and_ebusy_through_backend() {
     let attempted = &failed[before_failure..];
     assert_eq!(
         attempted.len(),
-        1,
-        "EBUSY does not probe or retry the producer"
+        2,
+        "EBUSY does not retry the producer; the motion then uses the cursor-only lane: {attempted:?}"
     );
     assert_eq!(
         attempted[0].kind,
@@ -662,27 +665,40 @@ fn atomic_cursor_only_shared_scene_settlement_and_ebusy_through_backend() {
             ..
         }
     ));
-    let pending = fixture
+    assert_eq!(
+        attempted[1].kind,
+        crate::drm::atomic::AtomicCommitKind::CursorOnly
+    );
+    assert_eq!(
+        attempted[1].result,
+        crate::drm::atomic::tests_support::ScriptedResult::Ok
+    );
+    let state = &fixture
         .backend
         .platform
         .device_for_key(device_key)
         .unwrap()
         .cursor
         .crtc_states[&crtc]
-        .intent
-        .expect("rejected Shared motion remains pending");
-    let wanted = match pending {
-        crate::kms::render::platform::cursor_state::CursorIntent::Show(binding) => binding.lease,
-        crate::kms::render::platform::cursor_state::CursorIntent::Hide => {
-            panic!("cursor motion keeps the show intent")
-        }
-    };
-    assert_eq!(wanted, applied.lease);
+        .clone();
     assert!(
-        !fixture
+        state.intent.is_none(),
+        "accepted motion consumes the intent"
+    );
+    assert_eq!(
+        state.applied.map(|binding| binding.lease),
+        Some(applied.lease)
+    );
+    assert_eq!(
+        state.applied.map(|binding| (binding.x, binding.y)),
+        Some((125, 95))
+    );
+    assert!(
+        fixture
             .backend
             .platform
-            .cursor_atomic_event_pending_for_output(0)
+            .cursor_atomic_event_pending_for_output(0),
+        "an accepted cursor-only commit carries the event obligation"
     );
     assert!(
         fixture
@@ -693,7 +709,7 @@ fn atomic_cursor_only_shared_scene_settlement_and_ebusy_through_backend() {
             .cursor
             .crtc_states[&crtc]
             .in_flight
-            .is_none()
+            .is_some()
     );
 
     Backend::set_cursor_hidden(&mut fixture.backend, true);

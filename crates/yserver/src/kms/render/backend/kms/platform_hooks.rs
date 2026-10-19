@@ -18,6 +18,21 @@ use crate::kms::render::{
     store::DrawableId,
 };
 
+fn scene_owns_cursor_transition_for_output(b: &KmsBackend, output_idx: usize) -> bool {
+    if b.scene.has_pending_page_flip(output_idx)
+        || b.scene.output_cursor_transition_pending(output_idx)
+    {
+        return true;
+    }
+    if !b.scene_wants_scene() {
+        return false;
+    }
+    if b.scene.cursor_only_wake_pending() && b.scene.output_uses_hardware_cursor(output_idx) {
+        return false;
+    }
+    b.scene.output_ready_for_submit(output_idx, &b.platform)
+}
+
 fn route_cursor_intent(
     b: &mut KmsBackend,
     record: Option<&crate::kms::render::cursor::CursorRecord>,
@@ -27,19 +42,90 @@ fn route_cursor_intent(
 ) -> (bool, Vec<bool>) {
     b.platform.cursor_pointer_root = pos;
     let direct_owns_primary = b.pstate.scanout_m2.active();
-    let hardware_cursor_outputs: Vec<_> = (0..b.platform.outputs.len())
+    let cursor_routes: Vec<_> = (0..b.platform.outputs.len())
         .map(|output_idx| {
-            let cursor_only_update_allowed = b
+            let scene_owns_transition = scene_owns_cursor_transition_for_output(b, output_idx);
+            let device_key = b
+                .platform
+                .outputs
+                .get(output_idx)
+                .map(|layout| layout.key.device_key);
+            let peer_cursor_commit_in_flight = device_key.is_some_and(|device_key| {
+                b.platform
+                    .outputs
+                    .iter()
+                    .enumerate()
+                    .any(|(peer_idx, peer)| {
+                        peer.key.device_key == device_key
+                            && b.platform.cursor_commit_in_flight_for_output(peer_idx)
+                    })
+            });
+            let deferred_sprite_pending = record.is_some_and(|record| {
+                b.platform.cursor_plane_deferred_upload_for_output(
+                    output_idx,
+                    record.version,
+                    record.hot_x,
+                    record.hot_y,
+                )
+            });
+            let stable_hardware_scene_owner = effective_requeue
+                && visible
+                && !b.pstate.tearing.is_on()
+                && !b.platform.tearing_on
+                && b.scene.output_uses_hardware_cursor(output_idx);
+            let deferred_sprite_retry = stable_hardware_scene_owner
+                && deferred_sprite_pending
+                && !peer_cursor_commit_in_flight;
+            let output_accepts_cursor_only = b
+                .scene
+                .output_accepts_hardware_cursor_only_update(output_idx);
+            let cursor_intersects_output =
+                b.platform.outputs.get(output_idx).is_some_and(|layout| {
+                    record.is_some_and(|record| {
+                        visible
+                            && pos.0 - i32::from(record.hot_x) - layout.x < i32::from(layout.width)
+                            && pos.0 - i32::from(record.hot_x) - layout.x + i32::from(record.width)
+                                > 0
+                            && pos.1 - i32::from(record.hot_y) - layout.y < i32::from(layout.height)
+                            && pos.1 - i32::from(record.hot_y) - layout.y + i32::from(record.height)
+                                > 0
+                    })
+                });
+            let scene_owned_cursor_transition = scene_owns_transition
+                && ((!cursor_intersects_output
+                    && (b.scene.output_uses_hardware_cursor(output_idx)
+                        || b.scene.output_uses_software_cursor(output_idx)))
+                    || (cursor_intersects_output
+                        && !b.scene.output_uses_hardware_cursor(output_idx)));
+            let cursor_only_intent_allowed = b
                 .scene
                 .output_accepts_hardware_cursor_only_update(output_idx)
-                && (!effective_requeue || !b.scene_owns_cursor_transition_for_output(output_idx));
-            direct_owns_primary
-                || cursor_only_update_allowed
-                || (!effective_requeue
-                    && b.scene
-                        .output_cursor_transition_targets_hardware(output_idx))
+                && (!effective_requeue || !scene_owned_cursor_transition);
+            let cursor_only_intent_eligible =
+                output_accepts_cursor_only && !scene_owned_cursor_transition;
+            let cursor_intent_allowed = cursor_only_intent_allowed || deferred_sprite_retry;
+            let cursor_image_upload_allowed = output_accepts_cursor_only
+                && (!effective_requeue || !scene_owned_cursor_transition || deferred_sprite_retry);
+            let cursor_image_upload_allowed = cursor_image_upload_allowed
+                && (!deferred_sprite_pending || !peer_cursor_commit_in_flight);
+            (
+                direct_owns_primary
+                    || cursor_intent_allowed
+                    || (!effective_requeue
+                        && b.scene
+                            .output_cursor_transition_targets_hardware(output_idx)),
+                direct_owns_primary || cursor_only_intent_eligible,
+                direct_owns_primary
+                    || cursor_image_upload_allowed
+                    || (!effective_requeue
+                        && b.scene
+                            .output_cursor_transition_targets_hardware(output_idx)),
+            )
         })
         .collect();
+    let hardware_cursor_outputs: Vec<_> = cursor_routes.iter().map(|route| route.0).collect();
+    let cursor_only_intent_outputs: Vec<_> = cursor_routes.iter().map(|route| route.1).collect();
+    let cursor_image_upload_outputs: Vec<_> = cursor_routes.iter().map(|route| route.2).collect();
     let handled = b.platform.queue_cursor_intent(
         record,
         visible,
@@ -47,10 +133,10 @@ fn route_cursor_intent(
         b.pstate.tearing.is_on(),
         direct_owns_primary,
         &hardware_cursor_outputs,
+        &cursor_image_upload_outputs,
+        &cursor_only_intent_outputs,
+        effective_requeue,
     );
-    if direct_owns_primary {
-        b.refresh_direct_cursor_bound_state();
-    }
     (handled, hardware_cursor_outputs)
 }
 
@@ -356,8 +442,13 @@ impl Platform for PlatformBackend {
 
     fn before_block(b: &mut KmsBackend) {
         b.reclaim_retired_gpu_work();
+        b.backend_scanout_service_cursor_decisions_before_block();
         b.platform
             .emit_tearing_summary_if_due(b.pstate.tearing.is_on(), b.telemetry.avg_gpu_render_ns());
+    }
+
+    fn set_request_backlog(b: &mut KmsBackend, pending: bool) {
+        b.pstate.request_backlog = pending;
     }
 
     fn flush_before_damage_notify(b: &mut KmsBackend) {
@@ -779,6 +870,12 @@ impl Platform for PlatformBackend {
 
     fn dpms_capable(_b: &KmsBackend) -> bool {
         true
+    }
+
+    fn shutdown_outputs(b: &mut KmsBackend) -> std::io::Result<()> {
+        // Keep shutdown on the complete KMS sequence: engine completion,
+        // scene drain, all-off commits, old-event drain and source settlement.
+        b.disable_output()
     }
 
     fn set_dpms_power(b: &mut KmsBackend, level: u8) -> std::io::Result<()> {

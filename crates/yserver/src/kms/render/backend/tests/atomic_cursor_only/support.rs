@@ -1,4 +1,4 @@
-use std::{rc::Rc, sync::Arc};
+use std::{cell::Cell, rc::Rc, sync::Arc, time::Duration};
 
 use crate::kms::render::backend::KmsBackend;
 
@@ -8,7 +8,21 @@ pub(crate) struct AtomicCursorFixture {
     pub(crate) state: yserver_core::server::ServerState,
 }
 
+pub(crate) fn cursor_decision_deadline_clock() -> Rc<dyn Fn() -> std::time::Instant> {
+    let base = std::time::Instant::now();
+    let millis = Rc::new(Cell::new(0_u64));
+    Rc::new(move || {
+        let now = millis.get();
+        millis.set(now.saturating_add(3));
+        base + Duration::from_millis(now)
+    })
+}
+
 impl AtomicCursorFixture {
+    pub(crate) fn shutdown_drawables(&mut self) {
+        self.backend.shutdown_destroy_drawables();
+    }
+
     pub(crate) fn new() -> Result<Option<Self>, String> {
         let backend = KmsBackend::for_tests_with_vk().map_err(|error| error.to_string())?;
         Self::from_live_backend(backend, Some(64), Some(64))
@@ -19,6 +33,16 @@ impl AtomicCursorFixture {
     ) -> Result<Option<Self>, String> {
         let backend =
             KmsBackend::for_tests_with_vk_and_clock(clock).map_err(|error| error.to_string())?;
+        Self::from_live_backend(backend, Some(64), Some(64))
+    }
+
+    pub(in crate::kms::render::backend) fn new_with_clock_and_cursor_decision_observer(
+        clock: Rc<dyn Fn() -> std::time::Instant>,
+        observer: Rc<dyn Fn(crate::kms::render::backend::kms::state::CursorDecisionPoint, usize)>,
+    ) -> Result<Option<Self>, String> {
+        let backend =
+            KmsBackend::for_tests_with_vk_and_clock_and_cursor_decision_observer(clock, observer)
+                .map_err(|error| error.to_string())?;
         Self::from_live_backend(backend, Some(64), Some(64))
     }
 
@@ -79,6 +103,21 @@ impl AtomicCursorFixture {
         Self::from_live_backend_with_hotspot_properties(backend, Some(64), Some(64))
     }
 
+    /// Hotspot-capable fixture whose cursor recovery reports to `reporter`.
+    /// The counter is injected where production installs its logger.
+    pub(crate) fn new_with_hotspot_properties_and_reporter(
+        reporter: Rc<
+            crate::kms::render::platform::cursor_recovery::RecordingCursorRecoveryReporter,
+        >,
+    ) -> Result<Option<Self>, String> {
+        let mut backend = KmsBackend::for_tests_with_vk().map_err(|error| error.to_string())?;
+        let reporter: Rc<
+            dyn crate::kms::render::platform::cursor_recovery::CursorRecoveryReporter,
+        > = reporter;
+        backend.platform.services.cursor_recovery_reporter = reporter;
+        Self::from_live_backend_with_hotspot_properties(backend, Some(64), Some(64))
+    }
+
     pub(crate) fn new_with_cursor_capabilities(
         cursor_width: Option<u64>,
         cursor_height: Option<u64>,
@@ -88,10 +127,41 @@ impl AtomicCursorFixture {
     }
 
     pub(crate) fn new_with_two_outputs() -> Result<Option<Self>, String> {
-        let mut backend = KmsBackend::for_tests_with_vk_dimensions(1600, 600)
+        Self::new_with_two_outputs_and_cursor_capabilities(Some(64), Some(64))
+    }
+
+    pub(crate) fn new_with_two_outputs_and_clock(
+        clock: Rc<dyn Fn() -> std::time::Instant>,
+    ) -> Result<Option<Self>, String> {
+        let mut backend = KmsBackend::for_tests_with_vk_dimensions_and_clock(1600, 600, clock)
             .map_err(|error| error.to_string())?;
         super::super::push_test_output(&mut backend, 2);
         Self::from_live_backend(backend, Some(64), Some(64))
+    }
+
+    pub(crate) fn new_with_two_outputs_and_cursor_capabilities(
+        cursor_width: Option<u64>,
+        cursor_height: Option<u64>,
+    ) -> Result<Option<Self>, String> {
+        let mut backend = KmsBackend::for_tests_with_vk_dimensions(1600, 600)
+            .map_err(|error| error.to_string())?;
+        super::super::push_test_output(&mut backend, 2);
+        Self::from_live_backend(backend, cursor_width, cursor_height)
+    }
+
+    pub(crate) fn new_with_two_outputs_software_cursor() -> Result<Option<Self>, String> {
+        let Some(mut fixture) = Self::new_with_two_outputs()? else {
+            return Ok(None);
+        };
+        for device in &mut fixture.backend.platform.devices {
+            device.cursor.plane = None;
+            device.cursor.crtc_states.clear();
+        }
+        let layouts = fixture.backend.platform.scene_output_layouts();
+        fixture.backend.scene =
+            crate::kms::render::scene::SceneCompositor::new(&fixture.backend.platform, &layouts)
+                .map_err(|error| format!("rebuild software-cursor lifecycle scene: {error:?}"))?;
+        Ok(Some(fixture))
     }
 
     pub(crate) fn new_with_cursor_mixed_three_output_layout() -> Result<Option<Self>, String> {
@@ -138,7 +208,6 @@ impl AtomicCursorFixture {
                 atomic_commit_sink: Rc::clone(&first.atomic_commit_sink),
                 page_flip_event_source: Rc::clone(&first.page_flip_event_source),
                 cursor_buffer_io: Rc::clone(&first.cursor_buffer_io),
-                legacy_cursor_io: Rc::clone(&first.legacy_cursor_io),
                 test_page_flip_event_source: Some(Rc::clone(&recorders.page_flip_events)),
                 cursor: crate::kms::render::platform::KmsCursorState::new(),
             });
@@ -231,7 +300,6 @@ impl AtomicCursorFixture {
         recorders.page_flip_events.register_device(&device);
         let atomic_commit_sink = Rc::clone(&backend.platform.devices[0].atomic_commit_sink);
         let page_flip_event_source = Rc::clone(&backend.platform.devices[0].page_flip_event_source);
-        let legacy_cursor_io = Rc::clone(&backend.platform.devices[0].legacy_cursor_io);
         backend
             .platform
             .devices
@@ -247,7 +315,6 @@ impl AtomicCursorFixture {
                         256,
                     ),
                 ),
-                legacy_cursor_io,
                 test_page_flip_event_source: Some(Rc::clone(&recorders.page_flip_events)),
                 cursor: crate::kms::render::platform::KmsCursorState::new(),
             });
@@ -499,6 +566,35 @@ impl AtomicCursorFixture {
         Backend::on_page_flip_ready(&mut self.backend, &mut self.state, drm_fd);
     }
 
+    pub(crate) fn retire_output_with_commit_id(
+        &mut self,
+        output_idx: usize,
+        frame: u32,
+        commit_id: u64,
+    ) {
+        use std::os::fd::{AsFd as _, AsRawFd as _};
+        use yserver_core::backend::Backend;
+
+        let (crtc, device_key) = {
+            let output = &self.backend.platform.outputs[output_idx];
+            (output.output.crtc, output.key.device_key)
+        };
+        let device = Rc::clone(
+            &self
+                .backend
+                .platform
+                .device_for_key(device_key)
+                .expect("fixture output has a KMS device")
+                .device,
+        );
+        self.recorders.page_flip_events.register_device(&device);
+        self.recorders
+            .page_flip_events
+            .queue_flip_with_commit_id_for_device(&device, crtc, frame, commit_id);
+        let drm_fd = device.as_fd().as_raw_fd();
+        Backend::on_page_flip_ready(&mut self.backend, &mut self.state, drm_fd);
+    }
+
     pub(crate) fn assert_cursor_quiescent(&self) {
         assert!(
             !self.backend.scene.has_pending_page_flips(),
@@ -519,6 +615,13 @@ impl AtomicCursorFixture {
                 .pstate
                 .scanout_m2
                 .unflip_awaiting_outputs
+                .is_empty()
+        );
+        assert!(
+            self.backend
+                .pstate
+                .scanout_m2
+                .unflip_outputs_to_replace
                 .is_empty()
         );
         assert!(self.backend.pstate.scanout_m2.completed.is_empty());

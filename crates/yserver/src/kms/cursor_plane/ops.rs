@@ -12,7 +12,7 @@ use std::cell::RefCell;
 
 use drm::{
     buffer::{Buffer, DrmFourcc, DrmModifier, Handle as DrmBufferHandle, PlanarBuffer},
-    control::{Device as ControlDevice, FbCmd2Flags, crtc, dumbbuffer::DumbBuffer, framebuffer},
+    control::{Device as ControlDevice, FbCmd2Flags, dumbbuffer::DumbBuffer, framebuffer},
 };
 
 use crate::drm::Device;
@@ -40,10 +40,6 @@ impl CursorDumbBuffer {
     #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
         self.len
-    }
-
-    pub(crate) fn as_dumb(&self) -> Option<DumbBuffer> {
-        self.dumb
     }
 
     #[allow(dead_code, reason = "consumed by the A1 atomic cursor backend fixture")]
@@ -130,128 +126,6 @@ impl CursorFramebufferDescriptor {
             height,
             format: DrmFourcc::Argb8888,
         }
-    }
-}
-
-/// Legacy cursor operations retained until the atomic cursor submission path
-/// replaces them. This seam records the actual bind/move/hide requests.
-pub(crate) trait LegacyCursorIo {
-    fn bind(
-        &self,
-        device: &Device,
-        crtc: drm::control::crtc::Handle,
-        buffer: Option<&CursorBuffer>,
-        hotspot: (i32, i32),
-    ) -> io::Result<()>;
-    fn position(
-        &self,
-        device: &Device,
-        crtc: drm::control::crtc::Handle,
-        x: i32,
-        y: i32,
-    ) -> io::Result<()>;
-}
-
-#[derive(Default)]
-pub(crate) struct DrmLegacyCursorIo;
-
-impl LegacyCursorIo for DrmLegacyCursorIo {
-    #[allow(deprecated)]
-    fn bind(
-        &self,
-        device: &Device,
-        crtc: drm::control::crtc::Handle,
-        buffer: Option<&CursorBuffer>,
-        hotspot: (i32, i32),
-    ) -> io::Result<()> {
-        match buffer {
-            Some(buffer) => {
-                let dumb = buffer
-                    .dumb()
-                    .ok_or_else(|| io::Error::other("cursor buffer has no DRM dumb handle"))?;
-                device.set_cursor2(crtc, Some(&dumb), hotspot)
-            }
-            None => device.set_cursor2::<DumbBuffer>(crtc, None, (0, 0)),
-        }
-    }
-
-    #[allow(deprecated)]
-    fn position(
-        &self,
-        device: &Device,
-        crtc: drm::control::crtc::Handle,
-        x: i32,
-        y: i32,
-    ) -> io::Result<()> {
-        device.move_cursor(crtc, (x, y))
-    }
-}
-
-#[allow(dead_code, reason = "consumed by the A1 atomic cursor backend fixture")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum LegacyCursorOperation {
-    Bind,
-    Move,
-    Hide,
-}
-
-#[allow(dead_code, reason = "consumed by the A1 atomic cursor backend fixture")]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct LegacyCursorRecord {
-    pub(crate) device_fd: i32,
-    pub(crate) crtc: crtc::Handle,
-    pub(crate) operation: LegacyCursorOperation,
-    pub(crate) framebuffer: Option<u32>,
-    pub(crate) hotspot: (i32, i32),
-    pub(crate) position: Option<(i32, i32)>,
-}
-
-#[allow(dead_code, reason = "consumed by the A1 atomic cursor backend fixture")]
-#[derive(Default)]
-pub(crate) struct RecordingLegacyCursorIo {
-    records: RefCell<Vec<LegacyCursorRecord>>,
-}
-
-#[allow(dead_code, reason = "consumed by the A1 atomic cursor backend fixture")]
-impl RecordingLegacyCursorIo {
-    pub(crate) fn records(&self) -> Vec<LegacyCursorRecord> {
-        self.records.borrow().clone()
-    }
-}
-
-impl LegacyCursorIo for RecordingLegacyCursorIo {
-    fn bind(
-        &self,
-        device: &Device,
-        crtc: crtc::Handle,
-        buffer: Option<&CursorBuffer>,
-        hotspot: (i32, i32),
-    ) -> io::Result<()> {
-        self.records.borrow_mut().push(LegacyCursorRecord {
-            device_fd: device.as_fd().as_raw_fd(),
-            crtc,
-            operation: if buffer.is_some() {
-                LegacyCursorOperation::Bind
-            } else {
-                LegacyCursorOperation::Hide
-            },
-            framebuffer: buffer.map(|buffer| u32::from(buffer.fb_id())),
-            hotspot,
-            position: None,
-        });
-        Ok(())
-    }
-
-    fn position(&self, device: &Device, crtc: crtc::Handle, x: i32, y: i32) -> io::Result<()> {
-        self.records.borrow_mut().push(LegacyCursorRecord {
-            device_fd: device.as_fd().as_raw_fd(),
-            crtc,
-            operation: LegacyCursorOperation::Move,
-            framebuffer: None,
-            hotspot: (0, 0),
-            position: Some((x, y)),
-        });
-        Ok(())
     }
 }
 
@@ -896,27 +770,8 @@ impl CursorBuffer {
         self.fb.expect("cursor framebuffer is live")
     }
 
-    pub(crate) fn dumb(&self) -> Option<DumbBuffer> {
-        self.dumb
-            .as_ref()
-            .expect("cursor dumb buffer is live")
-            .as_dumb()
-    }
-
     pub(crate) fn ptr(&self) -> NonNull<u8> {
         self.mapping.as_ref().expect("cursor mapping is live").ptr()
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.len
-    }
-
-    pub(crate) fn stride(&self) -> u32 {
-        self.stride
-    }
-
-    pub(crate) fn io(&self) -> Rc<dyn CursorBufferIo> {
-        Rc::clone(&self.io)
     }
 
     pub(crate) fn write_image(
@@ -965,6 +820,32 @@ impl CursorBuffer {
     pub(crate) fn clear(&mut self) {
         // SAFETY: mapping remains live and covers `len` writable bytes.
         unsafe { std::ptr::write_bytes(self.ptr().as_ptr(), 0, self.len) };
+    }
+
+    pub(crate) fn dump_to_ppm(&self, path: &str) -> io::Result<()> {
+        use std::io::Write;
+
+        let mut file = std::fs::File::create(path)?;
+        file.write_all(format!("P6\n{} {}\n255\n", self.width, self.height).as_bytes())?;
+        let mut row = vec![0_u8; self.width as usize * 3];
+        for y in 0..self.height as usize {
+            let src_row = y * self.stride as usize;
+            for x in 0..self.width as usize {
+                let src = src_row + x * 4;
+                // ARGB8888 on little-endian DRM buffers is BGRA in memory.
+                row[x * 3] = unsafe { *self.ptr().as_ptr().add(src + 2) };
+                row[x * 3 + 1] = unsafe { *self.ptr().as_ptr().add(src + 1) };
+                row[x * 3 + 2] = unsafe { *self.ptr().as_ptr().add(src) };
+            }
+            file.write_all(&row)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_bytes(&self) -> Vec<u8> {
+        // SAFETY: the live mapping spans `len` readable bytes.
+        unsafe { std::slice::from_raw_parts(self.ptr().as_ptr(), self.len) }.to_vec()
     }
 }
 

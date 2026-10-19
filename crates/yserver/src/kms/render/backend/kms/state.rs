@@ -30,6 +30,13 @@ use crate::{
     platform::drm::ModeIdentity,
 };
 
+/// Production cursor-decision boundaries that a test fixture may record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::kms::render::backend) enum CursorDecisionPoint {
+    Composition,
+    BeforeBlock,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::kms::render::backend) enum ScanoutM0Target {
     Cow,
@@ -236,6 +243,9 @@ pub(in crate::kms::render::backend) struct DirectPresentFrame {
     /// from this reference sample rather than the last/max output.
     pub(in crate::kms::render::backend) completion_clock:
         Option<yserver_core::backend::PresentClockSample>,
+    /// Identity of the accepted grouped direct commit whose per-output events
+    /// retire this frame. `None` before its first live submit.
+    pub(in crate::kms::render::backend) accepted_event_id: Option<u64>,
     pub(in crate::kms::render::backend) awaiting_outputs: HashSet<usize>,
     pub(in crate::kms::render::backend) async_outcome: crate::drm::async_flip::AsyncOutcome,
 }
@@ -262,9 +272,6 @@ pub(in crate::kms::render::backend) struct ScanoutM2State {
         Vec<yserver_core::backend::CompletedPresentEvent>,
     pub(in crate::kms::render::backend) idled: Vec<yserver_core::backend::CompletedPresentEvent>,
     pub(in crate::kms::render::backend) hold_direct: bool,
-    /// Advisory summary of settled accepted per-output bindings. Scheduling
-    /// never uses this as a guard; a newer queued attach must still run.
-    pub(in crate::kms::render::backend) cursor_bound_all: bool,
     pub(in crate::kms::render::backend) unflip_requested: bool,
     /// First request in the current direct-to-composed transition. This is
     /// the causal trigger; later composite ticks must not overwrite it.
@@ -272,14 +279,21 @@ pub(in crate::kms::render::backend) struct ScanoutM2State {
     /// Most recent request before submission, useful for distinguishing the
     /// initiating event from the gate that finally drove the atomic unflip.
     pub(in crate::kms::render::backend) unflip_last_reason: Option<&'static str>,
-    pub(in crate::kms::render::backend) unflip_awaiting_outputs: HashSet<usize>,
+    /// Accepted primary replacement commit IDs by output, awaiting their
+    /// matching per-CRTC page-flip events. In the degraded scene path, an
+    /// output is inserted only after its replacement frame is accepted.
+    pub(in crate::kms::render::backend) unflip_awaiting_outputs: HashMap<usize, u64>,
+    /// Outputs that still scan the direct frame. This includes outputs whose
+    /// replacement has not been submitted and accepted outputs awaiting their
+    /// own page-flip event.
+    pub(in crate::kms::render::backend) unflip_outputs_to_replace: HashSet<usize>,
     pub(in crate::kms::render::backend) reentry_blocked_until_composed: bool,
     pub(in crate::kms::render::backend) eligible_root_streak: u8,
     pub(in crate::kms::render::backend) unflip_fallback_source: Option<DrawableId>,
     pub(in crate::kms::render::backend) unflip_shadow_ready: bool,
-    /// The synchronized composed unflip failed and was degraded to the
-    /// per-output scene compose path. Keep direct-frame pins held until those
-    /// composed flips replace every direct plane.
+    /// The grouped composed unflip was bypassed or failed and was degraded to
+    /// per-output scene composition. Keep direct-frame pins held until the
+    /// accepted composed frames replace every direct plane.
     pub(in crate::kms::render::backend) degraded_composed_unflip: bool,
 }
 
@@ -293,11 +307,11 @@ impl ScanoutM2State {
             deferred_successor_skips: Vec::new(),
             idled: Vec::new(),
             hold_direct: false,
-            cursor_bound_all: false,
             unflip_requested: false,
             unflip_reason: None,
             unflip_last_reason: None,
-            unflip_awaiting_outputs: HashSet::new(),
+            unflip_awaiting_outputs: HashMap::new(),
+            unflip_outputs_to_replace: HashSet::new(),
             reentry_blocked_until_composed: false,
             eligible_root_streak: 0,
             unflip_fallback_source: None,
@@ -826,9 +840,21 @@ pub struct KmsBackendState {
     pub(in crate::kms::render::backend) scanout_m1: ScanoutM1ProbeCache,
     pub(in crate::kms::render::backend) scanout_m2: ScanoutM2State,
     pub(in crate::kms::render::backend) tearing: Tearing,
+    /// Flip-retirement cursor decisions, keyed by stable output identity.
+    pub(in crate::kms::render::backend) pending_cursor_decisions:
+        HashMap<CrtcKey, std::time::Instant>,
+    /// Topology snapshot associated with `pending_cursor_decisions`.
+    pub(in crate::kms::render::backend) cursor_decision_topology_epoch: u64,
+    /// Whether the core left client requests behind its bounded dispatch.
+    pub(in crate::kms::render::backend) request_backlog: bool,
     /// Monotonic clock for KMS cursor-composition pacing.
     pub(in crate::kms::render::backend) monotonic_clock:
         std::rc::Rc<dyn Fn() -> std::time::Instant>,
+    /// Observer seam for the production cursor decision boundaries. The
+    /// production constructor installs a no-op; controlled fixtures inject a
+    /// recorder before entering the core loop.
+    pub(in crate::kms::render::backend) cursor_decision_observer:
+        std::rc::Rc<dyn Fn(CursorDecisionPoint, usize)>,
     /// Prevents a no-progress scanout pass from scheduling itself again
     /// immediately. External events advance the input epoch; successful
     /// submissions or state changes mark the current pass as progress.

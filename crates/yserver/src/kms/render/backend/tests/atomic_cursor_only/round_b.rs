@@ -165,7 +165,6 @@ fn atomic_cursor_only_copied_scene_routes_to_sink_device_via_backend() {
     event_source.register_device(&sink_device);
     let source_device = &fixture.backend.platform.devices[0];
     let cursor_buffer_io = std::rc::Rc::clone(&source_device.cursor_buffer_io);
-    let legacy_cursor_io = std::rc::Rc::clone(&source_device.legacy_cursor_io);
     fixture
         .backend
         .platform
@@ -179,7 +178,6 @@ fn atomic_cursor_only_copied_scene_routes_to_sink_device_via_backend() {
             )),
             page_flip_event_source: event_source.clone(),
             cursor_buffer_io,
-            legacy_cursor_io,
             test_page_flip_event_source: Some(event_source),
             cursor: crate::kms::render::platform::KmsCursorState::new(),
         });
@@ -357,7 +355,6 @@ fn atomic_cursor_only_copied_scene_routes_to_sink_device_via_backend() {
         fixture.recorders.atomic.records()[0].events.is_empty(),
         "lifecycle disable does not leave a page-flip event obligation",
     );
-    assert!(fixture.recorders.legacy_cursor.records().is_empty());
     let resources = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
     drop(fixture);
     assert_eq!(resources.end_state(), (0, 0, 0));

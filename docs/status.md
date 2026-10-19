@@ -33,6 +33,26 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-10-18 atomic-only cursor, sub-plan C (branch `feat/atomic-cursor-only`, plan
+  `plans/2026-10-15-atomic-cursor-only-c.md`):** error recovery, qualification, lifecycle and plane reassignment on
+  the atomic-only path; the legacy cursor ioctls are gone. A rejected full request is attributed with TEST_ONLY
+  (full, then cursor-stripped); a cursor-only EINVAL commits a detach (FB_ID=0, CRTC_ID=0) and goes software only
+  once that detach is accepted; EBUSY is never a cursor failure; a HW-only change riding a frame is recovered by a
+  cursorless primary retry, ordinary flip errors keep their path. Rejections are keyed by (width, height, hotspot)
+  per CRTC, always from the submitted sprite, recorded even when the cursorless retry fails, and cleared only when
+  the device's topology epoch changes (one new attempt per key, none for animation/version changes).
+  Disable/enable/removal/shutdown settle through the common sink (`Backend::shutdown_outputs`), a missing old event
+  fails stop while owners are kept. Plane reassignment never switches a bound plane: the accepted binding's plane is
+  detached by the frame that paints software, its event drained, then the new plane attaches in a later frame; no
+  output detaches a peer-owned plane, and losing eligibility with a held direct frame unflips. Page-flip events are
+  matched to their commit by id in the kernel `user_data` (raw `DRM_IOCTL_MODE_ATOMIC`; the drm crate sends 0), so a
+  late event retires nothing. `tools/check-layout.sh` rejects any legacy cursor ioctl/executor under `crates/`.
+  Rebased on master `aa21b67a`. Open for C11 (hardware, per card with the user): #244 benchmark (zero >8 ms core
+  stalls, EBUSY count, NONBLOCK p99), straight-line motion across window and output edges (the original jump
+  symptom), AMD direct+Plasma, virtio hotspot (VM), mode-blob growth, qualification worker, hotplug, live
+  `user_data` echo, CPU cost of the pre-compose damage walk; same-device plane reassignment needs two outputs on one
+  card.
+
 - **2026-10-17 atomic-only cursor, sub-plan B (branch `feat/atomic-cursor-only`, plan
   `plans/2026-10-15-atomic-cursor-only-b.md`):** HW↔SW cursor handoffs ride the frame commit that starts or
   stops painting the software cursor (shared, copied and direct frames); retirement only settles receipts and

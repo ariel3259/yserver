@@ -3,6 +3,14 @@ use super::support::AtomicCursorFixture;
 pub(super) fn install_copied_recording_route(
     fixture: &mut AtomicCursorFixture,
 ) -> std::rc::Rc<crate::drm::atomic::tests_support::RecordingAtomicCommitExecutor> {
+    install_copied_recording_route_with_hotspot(fixture, false)
+}
+
+/// Copied recording route whose sink plane carries `HOTSPOT_X/Y` when `hotspot` is set.
+pub(super) fn install_copied_recording_route_with_hotspot(
+    fixture: &mut AtomicCursorFixture,
+    hotspot: bool,
+) -> std::rc::Rc<crate::drm::atomic::tests_support::RecordingAtomicCommitExecutor> {
     fixture
         .backend
         .platform
@@ -21,7 +29,6 @@ pub(super) fn install_copied_recording_route(
     event_source.register_device(&sink_device);
     let source_device = &fixture.backend.platform.devices[0];
     let cursor_buffer_io = std::rc::Rc::clone(&source_device.cursor_buffer_io);
-    let legacy_cursor_io = std::rc::Rc::clone(&source_device.legacy_cursor_io);
     fixture
         .backend
         .platform
@@ -35,7 +42,6 @@ pub(super) fn install_copied_recording_route(
             )),
             page_flip_event_source: event_source.clone(),
             cursor_buffer_io,
-            legacy_cursor_io,
             test_page_flip_event_source: Some(event_source),
             cursor: crate::kms::render::platform::KmsCursorState::new(),
         });
@@ -65,10 +71,17 @@ pub(super) fn install_copied_recording_route(
             .insert(u32::from(crtc), output_key);
     }
     fixture.backend.refresh_present_crtc_clock_epochs();
-    fixture
-        .backend
-        .platform
-        .for_tests_initialize_cursor_planes_with_capabilities(Some(64), Some(64));
+    if hotspot {
+        fixture
+            .backend
+            .platform
+            .for_tests_initialize_cursor_planes_with_hotspot_properties(Some(64), Some(64));
+    } else {
+        fixture
+            .backend
+            .platform
+            .for_tests_initialize_cursor_planes_with_capabilities(Some(64), Some(64));
+    }
     fixture
         .install_copied_recording_route(route)
         .expect("install lavapipe copied route");
@@ -335,7 +348,6 @@ fn atomic_cursor_only_cancelled_copied_frame_publishes_no_receipt() {
             .iter()
             .all(|record| record.events.is_empty())
     );
-    assert!(fixture.recorders.legacy_cursor.records().is_empty());
     fixture.assert_cursor_quiescent();
     let ledger = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
     drop(fixture);
@@ -1715,7 +1727,14 @@ fn atomic_cursor_only_composed_unflip_reservation_failure_rolls_back_before_fall
 
     assert!(fixture.backend.pstate.scanout_m2.degraded_composed_unflip);
     assert_eq!(
-        fixture.backend.pstate.scanout_m2.unflip_awaiting_outputs,
+        fixture
+            .backend
+            .pstate
+            .scanout_m2
+            .unflip_awaiting_outputs
+            .keys()
+            .copied()
+            .collect::<std::collections::HashSet<_>>(),
         [0, 1].into(),
         "fallback waits for both composed output flips",
     );
@@ -1779,7 +1798,32 @@ fn atomic_cursor_only_composed_unflip_reservation_failure_rolls_back_before_fall
             .iter()
             .all(|record| record.result == crate::drm::atomic::tests_support::ScriptedResult::Ok)
     );
+    assert_eq!(
+        fixture.backend.pstate.scanout_m2.unflip_outputs_to_replace,
+        [0, 1].into(),
+        "both direct outputs remain pinned through their accepted scene events",
+    );
+    let source_pin = fixture
+        .backend
+        .pstate
+        .scanout_m2
+        .current
+        .as_ref()
+        .expect("direct frame remains held until both outputs retire")
+        .source_pin;
     fixture.retire_output(0, 61);
+    assert_eq!(
+        fixture.backend.pstate.scanout_m2.unflip_outputs_to_replace,
+        [1].into(),
+        "the first primary event retires only its own output",
+    );
+    assert!(fixture.backend.pstate.scanout_m2.current.is_some());
+    assert!(
+        fixture
+            .backend
+            .present_source_pins
+            .contains_key(&source_pin)
+    );
     fixture.retire_output(1, 61);
     assert!(!fixture.backend.pstate.scanout_m2.active());
     assert!(
@@ -2039,7 +2083,14 @@ fn atomic_cursor_only_composed_unflip_partial_reservation_failure_releases_prior
         &fixture.recorders.atomic.records()[before_partial_reservation..]
     );
     assert_eq!(
-        fixture.backend.pstate.scanout_m2.unflip_awaiting_outputs,
+        fixture
+            .backend
+            .pstate
+            .scanout_m2
+            .unflip_awaiting_outputs
+            .keys()
+            .copied()
+            .collect::<std::collections::HashSet<_>>(),
         [0, 1].into(),
         "fallback owns both output flips",
     );
@@ -3115,6 +3166,7 @@ fn atomic_cursor_only_retirement_is_cursor_operation_free() {
             );
 
             fixture.retire_output(0, 2);
+            Backend::before_block(&mut fixture.backend);
             let after_motion = fixture.recorders.atomic.records();
             assert_eq!(after_motion.len(), 3);
             assert_eq!(
@@ -3318,6 +3370,9 @@ fn atomic_cursor_only_newer_generation_queued_before_scene_retirement_survives()
     );
 
     fixture.retire_output(0, 2);
+    Backend::maybe_composite(&mut fixture.backend)
+        .expect("run the composition tail after scene retirement");
+    Backend::before_block(&mut fixture.backend);
     let records = fixture.recorders.atomic.records();
     assert_eq!(
         records.iter().map(|record| record.kind).collect::<Vec<_>>(),
@@ -3511,6 +3566,9 @@ fn atomic_cursor_only_newer_generation_queued_before_direct_retirement_survives(
     );
 
     fixture.retire_output(0, 20);
+    Backend::maybe_composite(&mut fixture.backend)
+        .expect("run the composition tail after direct retirement");
+    Backend::before_block(&mut fixture.backend);
     let records = fixture.recorders.atomic.records();
     assert_eq!(
         records.iter().map(|record| record.kind).collect::<Vec<_>>(),

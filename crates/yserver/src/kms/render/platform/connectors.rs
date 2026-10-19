@@ -752,8 +752,19 @@ impl PlatformBackend {
 
         // (Re)allocate the scanout pool if needed.
         let mut new_pool_committed_framebuffer = None;
+        let recorded_test_pool = if needs_pool_realloc {
+            self.services.test_recorders.as_ref().and_then(|recorders| {
+                recorders
+                    .connector_scanout_pools
+                    .take(scanout_route, u32::from(w), u32::from(h))
+            })
+        } else {
+            None
+        };
         let mut new_pool: Option<Option<OutputScanout>> = if needs_pool_realloc {
-            if let Some((_prepared_route, pool)) = prepared_pool {
+            if let Some(pool) = recorded_test_pool {
+                Some(Some(pool))
+            } else if let Some((_prepared_route, pool)) = prepared_pool {
                 // Exact replay and live TEST_ONLY already completed while the
                 // previous topology was still active. Keep this dark-window
                 // path to the KMS commit and ownership installation only.

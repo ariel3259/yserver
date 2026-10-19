@@ -14,8 +14,8 @@ impl InFlightStage {
         self == Self::WaitingForRenderCompletion { job_id }
     }
 
-    fn is_kms_flip_pending(self) -> bool {
-        self == Self::KmsFlipPending
+    fn matches_kms_event(self, event_id: Option<u64>) -> bool {
+        matches!(self, Self::KmsFlipPending { event_id: expected } if expected == event_id)
     }
 }
 
@@ -32,8 +32,9 @@ pub(super) fn kms_retirement_matches(
     stage: InFlightStage,
     pending_bo_idx: usize,
     presented_bo_idx: usize,
+    event_id: Option<u64>,
 ) -> bool {
-    pending_bo_idx == presented_bo_idx && stage.is_kms_flip_pending()
+    pending_bo_idx == presented_bo_idx && stage.matches_kms_event(event_id)
 }
 
 impl SceneCompositor {
@@ -65,6 +66,17 @@ impl SceneCompositor {
             .is_some_and(|output| !output.pending_acks.is_empty())
     }
 
+    /// Identity of the accepted scene primary commit awaiting retirement on
+    /// one output. A copied frame has no identity until its KMS submit accepts.
+    pub fn pending_page_flip_event_id(&self, output_idx: usize) -> Option<u64> {
+        let inner = self.inner.as_ref()?;
+        let output = inner.outputs.get(output_idx)?;
+        match output.pending_acks.front()?.stage {
+            InFlightStage::KmsFlipPending { event_id } => event_id,
+            InFlightStage::WaitingForRenderCompletion { .. } => None,
+        }
+    }
+
     /// Handle a DRM page-flip-complete event for `output_idx`.
     /// Pops the matching pending-ack, ack's its damage snapshots
     /// against the store, releases the descriptor-pool slot,
@@ -74,6 +86,7 @@ impl SceneCompositor {
     pub fn handle_page_flip_complete(
         &mut self,
         output_idx: usize,
+        event_id: Option<u64>,
         store: &mut DrawableStore,
         sink: &mut dyn OutputSink,
     ) -> bool {
@@ -85,6 +98,9 @@ impl SceneCompositor {
             .get(output_idx)
             .and_then(|state| state.pending_acks.front())
             .map(|ack| (ack.stage, ack.bo_idx));
+        if !expected.is_some_and(|(stage, _)| stage.matches_kms_event(event_id)) {
+            return false;
+        }
         let Some(retire) = sink.on_page_flip_complete(output_idx) else {
             return false;
         };
@@ -92,7 +108,7 @@ impl SceneCompositor {
             return false;
         };
         if !expected.is_some_and(|(stage, bo_idx)| {
-            kms_retirement_matches(stage, bo_idx, retire.presented_bo_idx)
+            kms_retirement_matches(stage, bo_idx, retire.presented_bo_idx, event_id)
         }) {
             log::warn!(
                 "render scene: page-flip-complete on output {output_idx} presented bo {} \
@@ -240,10 +256,24 @@ impl SceneCompositor {
         completion: RenderCompletion,
         sink: &mut dyn OutputSink,
     ) -> bool {
+        let output_idx = completion.output.as_ref().ok().copied();
         let Some(inner) = self.inner.as_mut() else {
             return false;
         };
-        handle_scanout_render_completion_inner(inner, completion, sink)
+        let accepted = handle_scanout_render_completion_inner(inner, completion, sink);
+        let needs_recompose = accepted
+            && output_idx
+                .and_then(|output_idx| inner.outputs.get(output_idx))
+                .and_then(|output| output.pending_acks.front())
+                .is_some_and(|ack| {
+                    ack.cursor_receipt.is_some_and(|receipt| {
+                        receipt.needs_recompose && receipt.frame == Some(ack.cursor_frame.frame)
+                    })
+                });
+        if needs_recompose {
+            self.wake_for_cursor_damage();
+        }
+        accepted
     }
 }
 
@@ -290,15 +320,18 @@ pub(super) fn handle_scanout_render_completion_inner(
     }
 
     match sink.submit_copied(output_idx, bo_idx, fd) {
-        Ok(receipt) => {
+        Ok((receipt, event_id)) => {
             if let Some(ack) = inner.outputs[output_idx].pending_acks.front_mut() {
-                ack.stage = InFlightStage::KmsFlipPending;
+                ack.stage = InFlightStage::KmsFlipPending { event_id };
                 ack.cursor_receipt = Some(receipt);
             }
             note_cursor_commit_accepted_inner(inner, output_idx, receipt);
             true
         }
         Err(error) => {
+            let discarded_software_frame = sink
+                .cursor_plane_mut()
+                .take_discarded_software_frame(output_idx);
             log::warn!(
                 "render copied scanout: sink copy/KMS submit failed for output \
                      {output_idx} bo {bo_idx}: {error}",
@@ -350,8 +383,13 @@ pub(super) fn handle_scanout_render_completion_inner(
                 );
                 sink.gpu_mut().renderer_failed = true;
             }
-            state.next_submit_retry_at =
-                Some(std::time::Instant::now() + std::time::Duration::from_millis(100));
+            if discarded_software_frame {
+                force_cursor_retry_repaint(state);
+                state.next_submit_retry_at = None;
+            } else {
+                state.next_submit_retry_at =
+                    Some(std::time::Instant::now() + std::time::Duration::from_millis(100));
+            }
             false
         }
     }

@@ -12,6 +12,15 @@ use std::{
 pub(crate) struct CopiedScanoutSubmitError {
     pub(crate) error: io::Error,
     pub(crate) cursor_rejected: bool,
+    pub(crate) discard_software_frame: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CopiedScanoutRecovery {
+    Accepted,
+    DetachRetry,
+    CursorlessRetry,
+    HardwareOnlyRetry,
 }
 
 impl PlatformBackend {
@@ -71,8 +80,9 @@ impl PlatformBackend {
         output_idx: usize,
         bo_idx: usize,
         render_completion: Option<OwnedFd>,
-        cursor_updates: &[super::cursor_state::CursorPlaneUpdate],
-    ) -> Result<(), CopiedScanoutSubmitError> {
+        cursor_updates: &mut Vec<super::cursor_state::CursorPlaneUpdate>,
+        failure_context: super::cursor_recovery::CursorFailureContext,
+    ) -> Result<(CopiedScanoutRecovery, u64), CopiedScanoutSubmitError> {
         self.debug_assert_scanout_pool_route(output_idx);
         let output_key = self
             .outputs
@@ -81,6 +91,7 @@ impl PlatformBackend {
             .ok_or_else(|| CopiedScanoutSubmitError {
                 error: io::Error::other("copied scanout output index out of range"),
                 cursor_rejected: false,
+                discard_software_frame: false,
             })?;
         let device = self
             .device_for_output(&output_key)
@@ -88,6 +99,7 @@ impl PlatformBackend {
             .ok_or_else(|| CopiedScanoutSubmitError {
                 error: io::Error::other("copied scanout KMS device disappeared"),
                 cursor_rejected: false,
+                discard_software_frame: false,
             })?;
         let atomic_commit_sink = self
             .device_for_output(&output_key)
@@ -95,6 +107,7 @@ impl PlatformBackend {
             .ok_or_else(|| CopiedScanoutSubmitError {
                 error: io::Error::other("copied scanout atomic commit sink disappeared"),
                 cursor_rejected: false,
+                discard_software_frame: false,
             })?;
         let copied_scanout_copy = Rc::clone(&self.services.copied_scanout_copy);
 
@@ -157,13 +170,13 @@ impl PlatformBackend {
                 cursor_updates,
                 crate::drm::async_flip::FlipTiming::Vsync,
             ) {
-                Ok(()) => {
+                Ok(event_id) => {
                     if let Some(fd) = destination.state.transition_to_pending(out_fence_fd) {
                         // SAFETY: transition_to_pending transfers the uniquely
                         // owned input-fence fd back to this caller.
                         unsafe { libc::close(fd) };
                     }
-                    Ok(())
+                    Ok(event_id)
                 }
                 Err(error) => {
                     if let Some(fd) = destination
@@ -192,10 +205,94 @@ impl PlatformBackend {
             }
         })();
 
-        let cursor_rejected = result.is_err() && atomic_commit_sink.take_last_cursor_rejection();
+        let mut cursor_rejected = false;
+        let mut discard_software_frame = false;
+        let mut recovery = CopiedScanoutRecovery::Accepted;
+        let mut final_result = result;
+        if let Err(error) = &final_result {
+            let attributed = atomic_commit_sink.take_last_cursor_rejection();
+            let action =
+                super::cursor_recovery::classify_cursor_failure(error, attributed, failure_context);
+            cursor_rejected = action.is_cursor_failure();
+            if cursor_rejected {
+                self.note_rejected_cursor_qualifications(cursor_updates);
+            }
+            if action == super::cursor_recovery::CursorRecoveryAction::RetryFrameWithDetach
+                && !recovery_failed
+            {
+                let detach_updates = self.prepare_scene_detach_retry(cursor_updates);
+                if !detach_updates.is_empty() {
+                    match self.submit_copied_detach_retry(output_idx, bo_idx, &detach_updates) {
+                        Ok(event_id) => {
+                            *cursor_updates = detach_updates;
+                            recovery = CopiedScanoutRecovery::DetachRetry;
+                            final_result = Ok(event_id);
+                        }
+                        Err((retry_error, retry_recovery_failed)) => {
+                            let retry_attributed = atomic_commit_sink.take_last_cursor_rejection();
+                            let retry_action = super::cursor_recovery::classify_cursor_failure(
+                                &retry_error,
+                                retry_attributed,
+                                super::cursor_recovery::scene_failure_context(&detach_updates),
+                            );
+                            cursor_rejected = false;
+                            if retry_action.is_cursor_failure() {
+                                self.reject_cursor_plane_update_reservations(cursor_updates);
+                                if let Some(device_idx) = self
+                                    .devices
+                                    .iter()
+                                    .position(|device| device.key == output_key.device_key)
+                                {
+                                    self.retain_hardware_after_detach(
+                                        device_idx,
+                                        self.outputs[output_idx].output.crtc,
+                                        &retry_error,
+                                    );
+                                    self.mark_discarded_software_scene_frame(output_idx);
+                                    discard_software_frame = true;
+                                }
+                            } else {
+                                self.cancel_scene_detach_retry(&detach_updates);
+                            }
+                            recovery_failed |= retry_recovery_failed;
+                            final_result = Err(retry_error);
+                        }
+                    }
+                }
+            }
+            let hardware_only_retry = super::cursor_recovery::retry_riding_frame_without_cursor(
+                action,
+                failure_context,
+                cursor_updates,
+            );
+            let software_recompose_retry = !hardware_only_retry
+                && super::cursor_recovery::retry_requires_software_recompose(
+                    action,
+                    failure_context,
+                );
+            if (hardware_only_retry || software_recompose_retry) && !recovery_failed {
+                match self.submit_copied_detach_retry(output_idx, bo_idx, &[]) {
+                    Ok(event_id) => {
+                        recovery = if hardware_only_retry {
+                            CopiedScanoutRecovery::HardwareOnlyRetry
+                        } else {
+                            CopiedScanoutRecovery::CursorlessRetry
+                        };
+                        cursor_rejected = false;
+                        final_result = Ok(event_id);
+                    }
+                    Err((retry_error, retry_recovery_failed)) => {
+                        let _ = atomic_commit_sink.take_last_cursor_rejection();
+                        cursor_rejected = false;
+                        recovery_failed |= retry_recovery_failed;
+                        final_result = Err(retry_error);
+                    }
+                }
+            }
+        }
 
         if recovery_failed
-            || result
+            || final_result
                 .as_ref()
                 .is_err_and(crate::kms::vk::scanout::scanout_error_is_device_lost)
         {
@@ -203,10 +300,113 @@ impl PlatformBackend {
             // device.  Neither uncertain image state may be reused.
             self.gpu.renderer_failed = true;
         }
-        result.map_err(|error| CopiedScanoutSubmitError {
-            error,
-            cursor_rejected,
-        })
+        match final_result {
+            Ok(event_id) => Ok((recovery, event_id)),
+            Err(error) => Err(CopiedScanoutSubmitError {
+                error,
+                cursor_rejected,
+                discard_software_frame,
+            }),
+        }
+    }
+
+    fn submit_copied_detach_retry(
+        &mut self,
+        output_idx: usize,
+        bo_idx: usize,
+        cursor_updates: &[super::cursor_state::CursorPlaneUpdate],
+    ) -> Result<u64, (io::Error, bool)> {
+        let output_key = self.outputs[output_idx].key.clone();
+        let device = self
+            .device_for_output(&output_key)
+            .map(|device| Rc::clone(&device.device))
+            .ok_or_else(|| {
+                (
+                    io::Error::other("copied retry KMS device disappeared"),
+                    false,
+                )
+            })?;
+        let atomic_commit_sink = self
+            .device_for_output(&output_key)
+            .map(|device| Rc::clone(&device.atomic_commit_sink))
+            .ok_or_else(|| {
+                (
+                    io::Error::other("copied retry atomic commit sink disappeared"),
+                    false,
+                )
+            })?;
+        let output = &self.outputs[output_idx].output;
+        let Some(OutputScanout::Copied(copied)) = self
+            .scanout_pools
+            .get_mut(output_idx)
+            .and_then(Option::as_mut)
+        else {
+            return Err((
+                io::Error::other("copied retry targeted a non-copied output"),
+                false,
+            ));
+        };
+        let Some(destination) = copied.destinations.bos.get_mut(bo_idx) else {
+            return Err((
+                io::Error::other("copied retry destination index out of range"),
+                false,
+            ));
+        };
+        let Some(framebuffer) = destination.fb_handle else {
+            return Err((
+                io::Error::other("copied retry destination has no framebuffer"),
+                false,
+            ));
+        };
+        destination.state.transition_to_submitted(-1);
+        let mut out_fence_fd = -1;
+        match crate::drm::page_flip::submit_scene_flip_with_fences(
+            &device,
+            atomic_commit_sink.as_ref(),
+            output,
+            framebuffer,
+            -1,
+            &mut out_fence_fd,
+            cursor_updates,
+            crate::drm::async_flip::FlipTiming::Vsync,
+        ) {
+            Ok(event_id) => {
+                if let Some(fd) = destination.state.transition_to_pending(out_fence_fd) {
+                    // SAFETY: the state machine returns the unique in-fence
+                    // descriptor after the accepted retry.
+                    unsafe { libc::close(fd) };
+                }
+                copied
+                    .note_atomic_retry_accepted(bo_idx)
+                    .map_err(|error| (error, true))?;
+                Ok(event_id)
+            }
+            Err(error) => {
+                if let Some(fd) = destination
+                    .state
+                    .transition_to_recording_after_atomic_reject()
+                    && fd >= 0
+                {
+                    // SAFETY: the rejected request left this descriptor owned
+                    // by userspace; this retry passed the already-signalled -1.
+                    unsafe { libc::close(fd) };
+                }
+                if out_fence_fd >= 0 {
+                    // SAFETY: a failed atomic commit does not transfer the
+                    // output-fence descriptor to KMS.
+                    unsafe { libc::close(out_fence_fd) };
+                }
+                match copied.recover_copy_failure(bo_idx) {
+                    Ok(()) => Err((error, false)),
+                    Err(recovery_error) => {
+                        log::error!(
+                            "copied explicit-detach retry failed ({error}) and the sink could not be quiesced: {recovery_error}"
+                        );
+                        Err((io::Error::new(recovery_error.kind(), recovery_error), true))
+                    }
+                }
+            }
+        }
     }
 
     /// Framebuffer last presented by the scene compositor for this output.

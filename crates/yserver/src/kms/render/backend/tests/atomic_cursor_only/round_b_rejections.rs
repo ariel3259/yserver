@@ -45,6 +45,10 @@ fn atomic_cursor_only_atomic_hide_preserves_ownership_on_reject() {
         .atomic
         .script_result(Err(std::io::Error::from_raw_os_error(libc::EINVAL)));
     fixture.recorders.atomic.script_result(Ok(()));
+    fixture
+        .recorders
+        .atomic
+        .script_result(Err(std::io::Error::from_raw_os_error(libc::ENOMEM)));
     Backend::set_cursor_hidden(&mut fixture.backend, true);
     damage_cursor_root(&mut fixture);
     Backend::maybe_composite(&mut fixture.backend).expect("submit rejected shared detach frame");
@@ -70,6 +74,23 @@ fn atomic_cursor_only_atomic_hide_preserves_ownership_on_reject() {
             raw_os_error: Some(libc::EINVAL),
         },
     );
+    let retry = rejected
+        .iter()
+        .find(|record| {
+            record.kind == crate::drm::atomic::AtomicCommitKind::Scene
+                && !record
+                    .flags
+                    .contains(::drm::control::AtomicCommitFlags::TEST_ONLY)
+        })
+        .expect("cursorless primary retry keeps the ordinary flip error");
+    assert_eq!(
+        retry.result,
+        crate::drm::atomic::tests_support::ScriptedResult::Error {
+            kind: std::io::ErrorKind::OutOfMemory,
+            raw_os_error: Some(libc::ENOMEM),
+        }
+    );
+    assert!(!fixture.backend.scene.has_pending_page_flip(0));
     assert_eq!(
         rejection.events.len(),
         1,
@@ -132,8 +153,9 @@ fn atomic_cursor_only_atomic_hide_preserves_ownership_on_reject() {
             crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
             crate::drm::atomic::AtomicCommitKind::SceneWithCursor,
             crate::drm::atomic::AtomicCommitKind::Scene,
+            crate::drm::atomic::AtomicCommitKind::Scene,
         ],
-        "the rejected shared detach preserves ownership until blocking lifecycle teardown",
+        "the failed cursorless retry preserves ownership until blocking lifecycle teardown",
     );
 
     let ledger = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);

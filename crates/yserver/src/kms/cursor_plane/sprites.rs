@@ -1,5 +1,5 @@
-//! Full-capacity cursor sprite framebuffers staged before A5 switches the
-//! atomic binding path over from the legacy cursor buffer.
+//! Full-capacity cursor sprite framebuffers retained for accepted atomic
+//! cursor bindings.
 
 use std::{io, rc::Rc};
 
@@ -12,6 +12,8 @@ use yserver_render::kms::render::scene::CursorUploadOutcome;
 pub(crate) struct SpriteBufferLease {
     slot: usize,
     version: u64,
+    width: u32,
+    height: u32,
     hot_x: u16,
     hot_y: u16,
 }
@@ -23,6 +25,15 @@ impl SpriteBufferLease {
 
     pub(crate) fn matches(self, version: u64, hot_x: u16, hot_y: u16) -> bool {
         self.version == version && self.hot_x == hot_x && self.hot_y == hot_y
+    }
+
+    pub(crate) fn sprite_key(self) -> Option<(u16, u16, u16, u16)> {
+        Some((
+            u16::try_from(self.width).ok()?,
+            u16::try_from(self.height).ok()?,
+            self.hot_x,
+            self.hot_y,
+        ))
     }
 }
 
@@ -71,6 +82,20 @@ impl SpritePool {
 
     pub(crate) fn set_active_crtc_count(&mut self, count: usize) {
         self.max_buffers = count.saturating_add(1).max(2);
+    }
+
+    pub(crate) fn full_with_live_users(&self) -> bool {
+        self.buffers.len() >= self.max_buffers
+            && self
+                .buffers
+                .iter()
+                .all(|buffer| buffer.users != 0 || buffer.prepared_users != 0)
+    }
+
+    pub(crate) fn has_available_buffer(&self) -> bool {
+        self.buffers
+            .iter()
+            .any(|buffer| buffer.users == 0 && buffer.prepared_users == 0)
     }
 
     pub(crate) fn disarm(&mut self) {
@@ -201,6 +226,8 @@ impl SpritePool {
                 self.candidate = Some(SpriteBufferLease {
                     slot,
                     version,
+                    width: wanted.width,
+                    height: wanted.height,
                     hot_x: wanted.hot_x,
                     hot_y: wanted.hot_y,
                 });
@@ -230,6 +257,19 @@ impl SpritePool {
             .get(lease.slot)
             .filter(|buffer| lease_matches(buffer, lease))
             .map(|buffer| u32::from(buffer.buffer.fb_id()))
+    }
+
+    pub(crate) fn dump_sprite_to_ppm(
+        &self,
+        lease: SpriteBufferLease,
+        path: &str,
+    ) -> io::Result<()> {
+        let buffer = self
+            .buffers
+            .get(lease.slot)
+            .filter(|buffer| lease_matches(buffer, lease))
+            .ok_or_else(|| io::Error::other("applied cursor sprite lease is no longer valid"))?;
+        buffer.buffer.dump_to_ppm(path)
     }
 
     pub(crate) fn reserve(&mut self, lease: SpriteBufferLease) -> bool {
@@ -342,6 +382,14 @@ impl SpritePool {
     )]
     pub(crate) fn candidate_version(&self) -> Option<u64> {
         self.candidate.map(|lease| lease.version)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_sprite_bytes(&self, lease: SpriteBufferLease) -> Option<Vec<u8>> {
+        self.buffers
+            .get(lease.slot)
+            .filter(|buffer| lease_matches(buffer, lease))
+            .map(|buffer| buffer.buffer.for_tests_bytes())
     }
 }
 

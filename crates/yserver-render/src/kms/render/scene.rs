@@ -151,7 +151,7 @@ fn output_transform(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InFlightStage {
     WaitingForRenderCompletion { job_id: u64 },
-    KmsFlipPending,
+    KmsFlipPending { event_id: Option<u64> },
 }
 
 struct PendingAck {
@@ -224,6 +224,9 @@ pub enum CursorAssignment {
     /// tick-level cursor-damage gating decides whether the last
     /// presented footprint needs clearing.
     Hidden,
+    /// Keep this primary cursorless while the already accepted hardware
+    /// binding is retained after a failed explicit detach.
+    CursorlessReplacement,
 }
 
 /// Per-output cursor mode from the latest accepted receipt. Scene flip

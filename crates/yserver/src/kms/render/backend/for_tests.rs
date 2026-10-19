@@ -297,6 +297,16 @@ impl KmsBackend {
         Self::for_tests_with_vk_dimensions_and_clock(800, 600, monotonic_clock)
     }
 
+    #[cfg(test)]
+    pub(in crate::kms::render::backend) fn for_tests_with_vk_and_clock_and_cursor_decision_observer(
+        monotonic_clock: Rc<dyn Fn() -> std::time::Instant>,
+        observer: Rc<dyn Fn(crate::kms::render::backend::kms::state::CursorDecisionPoint, usize)>,
+    ) -> Result<Self, io::Error> {
+        let mut backend = Self::for_tests_with_vk_and_clock(monotonic_clock)?;
+        backend.pstate.cursor_decision_observer = observer;
+        Ok(backend)
+    }
+
     /// Vk-backed fixture with a caller-selected virtual-screen size.
     /// Used by scene tests that install synthetic outputs without a DRM node.
     #[doc(hidden)]
@@ -601,10 +611,14 @@ impl KmsBackend {
             scanout_m1: ScanoutM1ProbeCache::new(),
             scanout_m2: ScanoutM2State::new(),
             tearing: Tearing::new(),
+            pending_cursor_decisions: HashMap::new(),
+            cursor_decision_topology_epoch: 0,
+            request_backlog: false,
             vt_resume_executor: std::rc::Rc::new(
                 crate::kms::render::backend::kms::session::DrmVtResumeExecutor,
             ),
             monotonic_clock,
+            cursor_decision_observer: std::rc::Rc::new(|_, _| {}),
             immediate_wake_guard:
                 crate::kms::render::backend::kms::state::ImmediateWakeGuard::default(),
             armed_vblank_targets: std::collections::HashMap::new(),
@@ -1404,7 +1418,8 @@ impl KmsBackend {
     /// Test-side page-flip completion path for live-scene fixtures.
     /// Mirrors the production `on_page_flip_ready` retire sequence
     /// without reading DRM events from the test fixture's `/dev/null`
-    /// device.
+    /// device. Each output completes with the accepted commit identity its
+    /// scene frame is waiting on, as the kernel echo would name it.
     ///
     /// Returns the number of outputs whose pending scene ack retired.
     pub fn simulate_scene_page_flip_complete_for_tests(
@@ -1413,10 +1428,13 @@ impl KmsBackend {
         self.simulate_page_flip_complete_for_tests()?;
         let mut retired = 0usize;
         for output_idx in 0..self.platform.outputs.len() {
-            if self
-                .scene
-                .handle_page_flip_complete(output_idx, &mut self.store, &mut self.platform)
-            {
+            let event_id = self.scene.pending_page_flip_event_id(output_idx);
+            if self.scene.handle_page_flip_complete(
+                output_idx,
+                event_id,
+                &mut self.store,
+                &mut self.platform,
+            ) {
                 retired += 1;
             }
         }

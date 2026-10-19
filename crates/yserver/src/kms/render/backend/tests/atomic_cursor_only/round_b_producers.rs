@@ -2,7 +2,7 @@ use super::{round_a::damage_cursor_root, support::AtomicCursorFixture};
 use std::{cell::Cell, rc::Rc, time::Instant};
 use yserver_core::backend::{AnyHandle, Backend, CursorHandle};
 
-fn create_argb_cursor(
+pub(super) fn create_argb_cursor(
     backend: &mut crate::kms::render::backend::KmsBackend,
     pixel: [u8; 4],
     hot_x: u16,
@@ -31,7 +31,7 @@ fn create_argb_cursor(
         .expect("cursor handle")
 }
 
-fn begin_hw_cursor(fixture: &mut AtomicCursorFixture) -> u32 {
+pub(super) fn begin_hw_cursor(fixture: &mut AtomicCursorFixture) -> u32 {
     fixture
         .backend
         .platform
@@ -54,7 +54,7 @@ fn begin_hw_cursor(fixture: &mut AtomicCursorFixture) -> u32 {
     cursor
 }
 
-fn retire_cursor_only(fixture: &mut AtomicCursorFixture, frame: u32) {
+pub(super) fn retire_cursor_only(fixture: &mut AtomicCursorFixture, frame: u32) {
     use crate::drm::atomic::AtomicCommitKind;
 
     let records = fixture.recorders.atomic.records();
@@ -144,7 +144,7 @@ fn transparent_bitmap_cursor(
     .expect("create transparent cursor")
 }
 
-fn create_argb_cursor_extent(
+pub(super) fn create_argb_cursor_extent(
     backend: &mut crate::kms::render::backend::KmsBackend,
     pixel: [u8; 4],
     width: u16,
@@ -535,6 +535,9 @@ fn atomic_cursor_only_hw_visibility_and_hotspot_need_no_scene_frame() {
     assert_eq!(fixture.recorders.atomic.records().len(), 4);
     assert!(fixture.backend.platform.cursor_plane_visible_for_output(0));
     fixture.retire_output(0, 5);
+    Backend::maybe_composite(&mut fixture.backend)
+        .expect("run the composition tail after retirement");
+    Backend::before_block(&mut fixture.backend);
     assert_eq!(
         fixture.backend.scene.cursor_mode(),
         crate::kms::render::scene::CursorPlaneMode::Hidden,
@@ -581,6 +584,9 @@ fn atomic_cursor_only_hw_visibility_and_hotspot_need_no_scene_frame() {
     Backend::maybe_composite(&mut fixture.backend).expect("hold hide behind show event");
     let before_show_retirement = fixture.recorders.atomic.records().len();
     fixture.retire_output(0, 7);
+    Backend::maybe_composite(&mut fixture.backend)
+        .expect("run the composition tail after show retirement");
+    Backend::before_block(&mut fixture.backend);
     assert_eq!(
         fixture.recorders.atomic.records().len(),
         before_show_retirement + 1
@@ -784,7 +790,7 @@ fn atomic_cursor_only_effective_visibility_overrides_hw_intent() {
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutations: rely on the next Present, bind at direct retirement, keep the visible-only guard, or omit the hide producer.
-fn atomic_cursor_only_held_direct_services_show_hide_animation_and_first_bind() {
+pub(super) fn atomic_cursor_only_held_direct_services_show_hide_animation_and_first_bind() {
     use crate::{
         drm::atomic::AtomicCommitKind,
         kms::render::scene::{CursorAcceptedMode, CursorCommitReceipt, CursorPrimaryContent},
@@ -1058,7 +1064,11 @@ fn atomic_cursor_only_held_direct_services_show_hide_animation_and_first_bind() 
     );
     let records = fixture.recorders.atomic.records();
     let unflip = records.last().unwrap();
-    assert_eq!(unflip.kind, AtomicCommitKind::SceneWithCursor);
+    assert_eq!(
+        unflip.kind,
+        AtomicCommitKind::Scene,
+        "the accepted hide detached the hardware cursor before this cursorless unflip",
+    );
     assert!(unflip.properties.iter().any(|update| {
         update.property == fixture.backend.platform.outputs[0].output.plane_fb_id_prop
             && update.value != 0x8100
@@ -1086,10 +1096,7 @@ fn atomic_cursor_only_held_direct_services_show_hide_animation_and_first_bind() 
         crate::kms::render::scene::CursorPlaneMode::Sw
     );
     assert!(!fixture.backend.pstate.scanout_m2.active());
-    expected.extend([
-        AtomicCommitKind::SceneWithCursor,
-        AtomicCommitKind::SceneWithCursor,
-    ]);
+    expected.extend([AtomicCommitKind::Scene, AtomicCommitKind::Scene]);
     let sequence: Vec<_> = fixture
         .recorders
         .atomic
@@ -1114,7 +1121,7 @@ fn atomic_cursor_only_held_direct_services_show_hide_animation_and_first_bind() 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutations: omit the external acceptance receipt, publish at intent, retain Hidden after accepted rebind, or guard first bind on existing visibility.
-fn atomic_cursor_only_vsync_direct_rebind_receipt_routes_motion_to_hardware() {
+pub(super) fn atomic_cursor_only_vsync_direct_rebind_receipt_routes_motion_to_hardware() {
     use crate::{
         drm::atomic::AtomicCommitKind,
         kms::render::scene::{CursorAcceptedMode, CursorPrimaryContent},
@@ -1541,16 +1548,18 @@ fn atomic_cursor_only_vsync_direct_einval_first_attach_runs_composed_fallback() 
     let before_attach = fixture.recorders.atomic.records().len();
     Backend::define_cursor(&mut fixture.backend, None, root, visible.as_raw())
         .expect("select opaque cursor while the direct frame is held");
+    // The refused attach, its explicit detach (spec §3), then the peer's attach.
     fixture
         .recorders
         .atomic
         .script_result(Err(io::Error::from_raw_os_error(libc::EINVAL)));
     fixture.recorders.atomic.script_result(Ok(()));
+    fixture.recorders.atomic.script_result(Ok(()));
     Backend::maybe_composite(&mut fixture.backend)
         .expect("submit first cursor-only attach while direct scanout is held");
 
     let records = fixture.recorders.atomic.records();
-    assert_eq!(records.len(), before_attach + 2);
+    assert_eq!(records.len(), before_attach + 3);
     assert_eq!(
         records[before_attach].kind,
         AtomicCommitKind::CursorOnly,
@@ -1572,10 +1581,20 @@ fn atomic_cursor_only_vsync_direct_einval_first_attach_runs_composed_fallback() 
     assert_eq!(
         records[before_attach + 1].kind,
         AtomicCommitKind::CursorOnly,
+        "the refused output detaches explicitly before its software fallback",
+    );
+    assert_eq!(
+        records[before_attach + 1].properties.len(),
+        2,
+        "the detach carries FB_ID=0 and CRTC_ID=0 only",
+    );
+    assert_eq!(
+        records[before_attach + 2].kind,
+        AtomicCommitKind::CursorOnly,
         "the independent peer accepts its own first attach",
     );
     assert_eq!(
-        records[before_attach + 1].result,
+        records[before_attach + 2].result,
         crate::drm::atomic::tests_support::ScriptedResult::Ok,
         "the peer's attach is accepted",
     );
@@ -1591,12 +1610,15 @@ fn atomic_cursor_only_vsync_direct_einval_first_attach_runs_composed_fallback() 
             );
         }
     }
+    // The refused attach is settled by its explicit detach, which publishes the
+    // Software receipt that asks the scene to recompose (spec §3).
     let rejected_receipt = fixture
         .backend
         .scene
         .for_tests_cursor_commit_receipt(0)
-        .expect("rejected first attach leaves the prior accepted receipt");
-    assert_eq!(rejected_receipt.mode, CursorAcceptedMode::Hidden);
+        .expect("accepted detach receipt after the refused first attach");
+    assert_eq!(rejected_receipt.mode, CursorAcceptedMode::Software);
+    assert!(rejected_receipt.needs_recompose);
     assert_eq!(
         rejected_receipt.primary_cursor,
         CursorPrimaryContent::Cursorless
@@ -1613,7 +1635,9 @@ fn atomic_cursor_only_vsync_direct_einval_first_attach_runs_composed_fallback() 
         CursorPrimaryContent::Cursorless
     );
     assert!(fixture.backend.platform.cursor_plane_visible_for_output(1));
-    assert_eq!(fixture.backend.scene.cursor_mode(), CursorPlaneMode::Hw);
+    // Output 0 detached to software; its hardware peer keeps the plane, so the
+    // aggregate is Mixed (spec §2.2).
+    assert_eq!(fixture.backend.scene.cursor_mode(), CursorPlaneMode::Mixed);
     assert!(fixture.backend.pstate.scanout_m2.active());
     assert!(fixture.backend.pstate.scanout_m2.pending.is_none());
     assert!(fixture.backend.pstate.scanout_m2.queued_successor.is_none());
@@ -1661,7 +1685,7 @@ fn atomic_cursor_only_vsync_direct_einval_first_attach_runs_composed_fallback() 
                     .pstate
                     .scanout_m2
                     .unflip_awaiting_outputs
-                    .contains(&output_idx)
+                    .contains_key(&output_idx)
             {
                 fixture.retire_output(output_idx, frame + output_idx as u32);
             }
@@ -1762,11 +1786,11 @@ fn atomic_cursor_only_vsync_direct_einval_first_attach_runs_composed_fallback() 
         &[
             AtomicCommitKind::CursorOnly,
             AtomicCommitKind::CursorOnly,
-            AtomicCommitKind::Scene,
+            AtomicCommitKind::CursorOnly,
             AtomicCommitKind::Scene,
             AtomicCommitKind::Scene,
         ],
-        "first attach, serialized composed unflip, and visible SW recovery have the exact commit trace",
+        "first attach, explicit detach, serialized composed unflip, and visible SW recovery have the exact commit trace",
     );
 
     Backend::set_dpms_power(&mut fixture.backend, 3)
@@ -1790,7 +1814,7 @@ fn atomic_cursor_only_vsync_direct_einval_first_attach_runs_composed_fallback() 
     expected_final_sequence.extend([
         AtomicCommitKind::CursorOnly,
         AtomicCommitKind::CursorOnly,
-        AtomicCommitKind::Scene,
+        AtomicCommitKind::CursorOnly,
         AtomicCommitKind::Scene,
         AtomicCommitKind::Scene,
         AtomicCommitKind::Scene,

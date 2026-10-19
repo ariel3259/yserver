@@ -68,5 +68,26 @@ if grep -rn 'target_os' "$portable"; then
     fail=1
 fi
 
+# 7. Cursor binding, motion and hide use the atomic request path only.
+check_no_match() {
+    label=$1
+    pattern=$2
+    if grep -rnE "$pattern" crates; then
+        echo "atomic cursor: $label (matches above)"
+        fail=1
+    else
+        status=$?
+        if [ "$status" -ne 1 ]; then
+            echo "atomic cursor: grep failed while checking $label (status $status)"
+            fail=1
+        fi
+    fi
+}
+
+check_no_match "legacy bind/move/hide executors" 'set_cursor2|move_cursor|ShowOnRetire|HideOnRetire'
+check_no_match "legacy cursor ioctls" 'DRM_IOCTL_MODE_CURSOR2?|DRM_IOCTL_MODE_MOVE_CURSOR'
+check_no_match "legacy cursor telemetry or recording adapters" 'LegacyCursorIo|legacy_cursor|record_legacy_move|legacy_move'
+check_no_match "optimistic non-atomic cursor state" 'record_external_cursor_plane_bindings|sync_direct_cursor_scene_state|retire_external_cursor_handoff|cursor_bound_all|refresh_direct_cursor_bound_state|bind_direct_cursor_on_all_outputs'
+
 [ "$fail" -eq 0 ] && echo "layout: ok"
 exit "$fail"

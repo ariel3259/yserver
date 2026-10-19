@@ -1,4 +1,7 @@
-use super::{round_a::damage_cursor_root, support::AtomicCursorFixture};
+use super::{
+    round_a::damage_cursor_root,
+    support::{AtomicCursorFixture, cursor_decision_deadline_clock},
+};
 
 fn atomic_kinds(fixture: &AtomicCursorFixture) -> Vec<crate::drm::atomic::AtomicCommitKind> {
     fixture
@@ -335,6 +338,9 @@ fn atomic_cursor_only_upload_coalesces_pending_sprite_identity() {
         .backend
         .platform
         .for_tests_accept_output_power_commits();
+    fixture
+        .backend
+        .for_tests_set_monotonic_clock(cursor_decision_deadline_clock());
     let original = argb_cursor_with_extent(&mut fixture, [0x11, 0x22, 0x33, 0xff], 64, 1, 32, 0);
     let root = fixture.backend.core.window_id;
     Backend::define_cursor(&mut fixture.backend, None, root, original.as_raw())
@@ -456,6 +462,7 @@ fn atomic_cursor_only_upload_coalesces_pending_sprite_identity() {
     for frame in 6..18 {
         Backend::maybe_composite(&mut fixture.backend)
             .expect("retry retained cursor lifecycle work");
+        Backend::before_block(&mut fixture.backend);
         for output_idx in 0..2 {
             if fixture.backend.scene.has_pending_page_flip(output_idx)
                 || fixture
@@ -464,6 +471,9 @@ fn atomic_cursor_only_upload_coalesces_pending_sprite_identity() {
                     .cursor_commit_in_flight_for_output(output_idx)
             {
                 fixture.retire_output(output_idx, frame);
+                Backend::maybe_composite(&mut fixture.backend)
+                    .expect("run the composition tail after output retirement");
+                Backend::before_block(&mut fixture.backend);
             }
         }
         if !fixture.backend.scene.has_pending_page_flips()
@@ -477,6 +487,9 @@ fn atomic_cursor_only_upload_coalesces_pending_sprite_identity() {
             break;
         }
     }
+    Backend::maybe_composite(&mut fixture.backend)
+        .expect("finish coalesced cursor work after the last event");
+    Backend::before_block(&mut fixture.backend);
     assert!(!fixture.backend.scene.has_pending_page_flips());
     assert!(!(0..2).any(|output_idx| {
         fixture
@@ -500,11 +513,10 @@ fn atomic_cursor_only_upload_coalesces_pending_sprite_identity() {
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
             crate::drm::atomic::AtomicCommitKind::CursorOnly,
-            crate::drm::atomic::AtomicCommitKind::CursorOnly,
             crate::drm::atomic::AtomicCommitKind::Scene,
             crate::drm::atomic::AtomicCommitKind::Scene,
         ],
-        "motion and coalesced hotspot intent settle through cursor-only commits before teardown",
+        "motion and coalesced hotspot intent settle before teardown",
     );
     let ledger = std::rc::Rc::clone(&fixture.recorders.cursor_buffer_ledger);
     drop(fixture);
