@@ -2,9 +2,9 @@ use crate::kms::{
     cpu_types::{Rectangle16, Repeat},
     render::{
         backend::{
-            LeafContent, WindowGeometry, XBackend,
+            LeafContent, SharedBackingMoveSource, WindowGeometry, XBackend,
             portable::{
-                clip::apply_subwindow_mode_clip,
+                clip::{apply_subwindow_mode_clip, intersect_rect_with_clip},
                 draw::{compute_copy_area_dst_rects, depth_for_visual},
             },
             seam::Platform,
@@ -1032,6 +1032,42 @@ impl<P: Platform> XBackend<P> {
         host_xid: u32,
         tile_origin: (i32, i32),
     ) -> io::Result<()> {
+        self.paint_window_border_within(host_xid, tile_origin, None)
+    }
+
+    /// `miPaintWindow(PW_BORDER)` over `region` (content-local) of the
+    /// ring: what core's `borderExposed` names (`mi/mivaltree.c:362-380`).
+    pub(in crate::kms::render::backend) fn backend_windows_paint_window_border_rects(
+        &mut self,
+        host_xid: u32,
+        region: &[xfixes::RegionRect],
+    ) -> io::Result<()> {
+        if region.is_empty() {
+            return Ok(());
+        }
+        let region: Vec<vk::Rect2D> = region
+            .iter()
+            .map(|r| vk::Rect2D {
+                offset: vk::Offset2D {
+                    x: i32::from(r.x),
+                    y: i32::from(r.y),
+                },
+                extent: vk::Extent2D {
+                    width: u32::from(r.width),
+                    height: u32::from(r.height),
+                },
+            })
+            .collect();
+        let tile_origin = self.border_tile_origin(host_xid);
+        self.paint_window_border_within(host_xid, tile_origin, Some(&region))
+    }
+
+    fn paint_window_border_within(
+        &mut self,
+        host_xid: u32,
+        tile_origin: (i32, i32),
+        region: Option<&[vk::Rect2D]>,
+    ) -> io::Result<()> {
         let Some(geom) = self.windows.get(&host_xid).copied() else {
             return Ok(());
         };
@@ -1091,7 +1127,27 @@ impl<P: Platform> XBackend<P> {
         // descendant painting into a redirected ancestor's backing can
         // have part of its ring off that backing, and clamping the
         // annulus's bounding box first would move the ring's edges.
-        let rects: Vec<vk::Rect2D> = border_ring_rects(outer, inner)
+        let ring = border_ring_rects(outer, inner);
+        let ring = match region {
+            Some(region) => {
+                let region: Vec<vk::Rect2D> = region
+                    .iter()
+                    .map(|r| vk::Rect2D {
+                        offset: vk::Offset2D {
+                            x: r.offset.x + cx,
+                            y: r.offset.y + cy,
+                        },
+                        extent: r.extent,
+                    })
+                    .collect();
+                ring.into_iter()
+                    .flat_map(|r| intersect_rect_with_clip(r, &region))
+                    .collect()
+            }
+            None => ring,
+        };
+        let ring = self.clip_ring_in_shared_backing(host_xid, &geom, &target, ring);
+        let rects: Vec<vk::Rect2D> = ring
             .into_iter()
             .map(|r| crate::kms::render::engine::clamp_rect(r, storage_extent))
             .filter(|r| r.extent.width != 0 && r.extent.height != 0)
@@ -1141,6 +1197,56 @@ impl<P: Platform> XBackend<P> {
         self.telemetry.record_paint_submit();
         self.scene.wake_for_damage();
         Ok(())
+    }
+
+    /// A ring painted into an ANCESTOR's backing is cut to the window's
+    /// `borderClip` there (`miComputeClips`): inside its parent's (and
+    /// every ancestor's) content (`mi/mivaltree.c:386`) and under no
+    /// higher sibling. Rings in the window's own storage are untouched.
+    fn clip_ring_in_shared_backing(
+        &self,
+        host_xid: u32,
+        geom: &WindowGeometry,
+        target: &PaintTarget,
+        ring: Vec<vk::Rect2D>,
+    ) -> Vec<vk::Rect2D> {
+        let backing = target.backing_id();
+        let own = self.store.lookup(host_xid);
+        if own == Some(backing)
+            || own.and_then(|id| self.store.redirected_target(id)) == Some(backing)
+        {
+            return ring;
+        }
+        let parent_bounds = geom
+            .parent
+            .and_then(|p| self.resolve_paint_target(p))
+            .filter(|t| t.backing_id() == backing)
+            .and_then(PaintTarget::content_bounds);
+        let ring: Vec<vk::Rect2D> = match parent_bounds {
+            Some(bounds) => ring
+                .into_iter()
+                .flat_map(|r| intersect_rect_with_clip(r, &[bounds]))
+                .collect(),
+            None => ring,
+        };
+        let (cx, cy) = target.offset();
+        let occluders: Vec<vk::Rect2D> = self
+            .copy_area_shared_backing_occluders(host_xid, target)
+            .into_iter()
+            .map(|o| vk::Rect2D {
+                offset: vk::Offset2D {
+                    x: o.offset.x + cx,
+                    y: o.offset.y + cy,
+                },
+                extent: o.extent,
+            })
+            .collect();
+        if occluders.is_empty() {
+            return ring;
+        }
+        ring.into_iter()
+            .flat_map(|r| compute_copy_area_dst_rects(r, &occluders))
+            .collect()
     }
 
     /// The ring's thickness in the frame `target` resolved to.
@@ -2025,6 +2131,67 @@ impl<P: Platform> XBackend<P> {
         host_xid: u32,
         config: HostSubwindowConfig,
     ) -> io::Result<()> {
+        let move_source = self.shared_backing_move_source(host_xid, &config);
+        self.configure_subwindow_geometry(host_xid, config, move_source)
+    }
+
+    /// Children moved by `win_gravity` after their parent's resize. With
+    /// `carry_from` (the parent's backing before a realloc) every source
+    /// is captured first, at the old positions, in that old backing; the
+    /// copies run after all moves, bottom to top, as `miResizeWindow`
+    /// copies each gravity group from `pOldPixmap` (mi/miwindow.c:543-575,
+    /// composite/compwindow.c:489-528).
+    pub(in crate::kms::render::backend) fn backend_windows_move_subwindows_for_gravity(
+        &mut self,
+        origin: Option<OriginContext>,
+        moves: &[(u32, i16, i16)],
+        carry_from: Option<PixmapHandle>,
+    ) -> io::Result<()> {
+        let config = |x: i16, y: i16| HostSubwindowConfig {
+            x: Some(x),
+            y: Some(y),
+            width: None,
+            height: None,
+            border_width: None,
+            sibling: None,
+            stack_mode: None,
+        };
+        let old = carry_from.and_then(|h| self.store.lookup(h.as_raw()));
+        let Some(old) = old else {
+            for &(host_xid, x, y) in moves {
+                self.backend_windows_configure_subwindow(origin, host_xid, config(x, y))?;
+            }
+            return Ok(());
+        };
+        let mut sources = Vec::with_capacity(moves.len());
+        for &(host_xid, x, y) in moves {
+            let source = self
+                .shared_backing_move_source(host_xid, &config(x, y))
+                .map(|src| {
+                    let new = src.target.backing_id();
+                    self.rebase_move_source(src, new, old)
+                });
+            sources.push((host_xid, source));
+        }
+        for &(host_xid, x, y) in moves {
+            self.configure_subwindow_geometry(host_xid, config(x, y), None)?;
+        }
+        sources.sort_by_key(|(xid, _)| self.windows.get(xid).map_or(0, |g| g.stack_rank));
+        for (host_xid, source) in sources {
+            if let Some(source) = source {
+                self.carry_shared_backing_pixels_on_move(host_xid, source);
+            }
+        }
+        self.scene.wake_for_damage();
+        Ok(())
+    }
+
+    fn configure_subwindow_geometry(
+        &mut self,
+        host_xid: u32,
+        config: HostSubwindowConfig,
+        move_source: Option<SharedBackingMoveSource>,
+    ) -> io::Result<()> {
         P::exit_tearing_for_window(self, host_xid, "window_configured");
         // The compositor's root-stage Present remains authoritative while an
         // unrelated client window moves. The updated desktop arrives in its
@@ -2034,7 +2201,6 @@ impl<P: Platform> XBackend<P> {
         if P::direct_frame_references_host_drawable(self, host_xid) {
             P::request_direct_unflip(self, "configure_direct_frame_drawable");
         }
-        let move_source = self.shared_backing_move_source(host_xid, &config);
         let Some(geom) = self.windows.get_mut(&host_xid) else {
             // Window not tracked — log + skip (e.g., configure
             // before register). v1 tolerates this.

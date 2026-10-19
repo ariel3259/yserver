@@ -222,6 +222,24 @@ impl<P: Platform> XBackend<P> {
     /// each window's leaf, not the about-to-be-installed route. Keep
     /// the per-window/stacking rules in sync with
     /// `scene::emit_window_subtree` (scene.rs:2406).
+    /// Whether a proper ancestor of `w_xid` paints into its own redirect
+    /// backing, which then holds `w_xid`'s subtree.
+    pub(super) fn has_redirected_ancestor(&self, w_xid: u32) -> bool {
+        let mut cur = self.windows.get(&w_xid).and_then(|g| g.parent);
+        while let Some(xid) = cur {
+            if self
+                .store
+                .lookup(xid)
+                .and_then(|id| self.store.redirected_target(id))
+                .is_some()
+            {
+                return true;
+            }
+            cur = self.windows.get(&xid).and_then(|g| g.parent);
+        }
+        false
+    }
+
     pub(super) fn overlay_backing_inferiors(
         &mut self,
         w_xid: u32,
@@ -232,6 +250,10 @@ impl<P: Platform> XBackend<P> {
             render::engine::{ResolvedSource, SourceDrawable},
             vk::ops::render::CompositeRect,
         };
+        debug_assert!(
+            !self.has_redirected_ancestor(w_xid),
+            "overlay_backing_inferiors(0x{w_xid:x}) under a redirected ancestor reads stale leaves",
+        );
         let plan = self.plan_backing_inferiors(w_xid, b_id);
         if plan.is_empty() {
             return;
@@ -856,7 +878,11 @@ impl<P: Platform> XBackend<P> {
             // parent base, so an already-painted window that won't
             // repaint (compositor handoff) keeps its content instead
             // of the wallpaper seed. MUST run before the route flip.
-            self.overlay_backing_inferiors(w_xid, b_id);
+            // Under a redirected ancestor the subtree's leaves are stale and
+            // the seed above already read the authoritative ancestor backing.
+            if !self.has_redirected_ancestor(w_xid) {
+                self.overlay_backing_inferiors(w_xid, b_id);
+            }
             // Now flip routing — after this, paint against W
             // resolves to B via `resolve_paint_target`. The w_id
             // lookup must still succeed; if not, the redirect
@@ -909,6 +935,73 @@ impl<P: Platform> XBackend<P> {
         // reasoning as the release path: schedule a tick so that damage is not
         // waiting on an unrelated event.
         self.scene.wake_for_damage();
+        Ok(backing)
+    }
+
+    /// `compReallocPixmap` (composite/compalloc.c:670-712): a new backing
+    /// seeded from the parent like `compNewPixmap`, with W's route and its
+    /// reason-1 hold moved off `old`. No leaf is read or rewritten: under
+    /// the redirect the old backing is authoritative and the caller copies
+    /// from it. On error nothing has changed.
+    pub(in crate::kms::render::backend) fn backend_redirect_reallocate_redirected_backing(
+        &mut self,
+        origin: Option<OriginContext>,
+        host_window: WindowHandle,
+        old: PixmapHandle,
+        width: u16,
+        height: u16,
+        depth: u8,
+    ) -> io::Result<PixmapHandle> {
+        let w_xid = host_window.as_raw();
+        if self.core.host_window_to_backing.get(&w_xid) != Some(&old) {
+            return Err(io::Error::other(format!(
+                "reallocate_redirected_backing(0x{w_xid:x}): 0x{:x} is not its backing",
+                old.as_raw()
+            )));
+        }
+        let Some(old_id) = self.store.lookup(old.as_raw()) else {
+            return Err(io::Error::other(format!(
+                "reallocate_redirected_backing(0x{w_xid:x}): old backing not in store"
+            )));
+        };
+        let backing = self.create_pixmap(origin, depth, width, height)?;
+        let Some(b_id) = self.store.lookup(backing.as_raw()) else {
+            let _ = self.free_pixmap(origin, backing.as_raw());
+            return Err(io::Error::other(format!(
+                "reallocate_redirected_backing(0x{w_xid:x}): new backing not in store"
+            )));
+        };
+        if let Some(d) = self.store.get(b_id) {
+            crate::kms::vk::mem_accounting::recategorise(
+                d.storage.memory,
+                crate::kms::vk::mem_accounting::MemCategory::RedirectBacking,
+            );
+        }
+        self.store
+            .set_content_offset(b_id, self.window_border_width(w_xid));
+        self.seed_backing_from_parent(w_xid, b_id);
+        if let Some(w_id) = self.store.lookup(w_xid) {
+            self.store.set_redirected_target(w_id, Some(b_id));
+        }
+        self.store.set_scene_participating(old_id, false);
+        if self.core.alias_registry.decref(old) {
+            self.free_pixmap(origin, old.as_raw())?;
+        }
+        self.core.alias_registry.insert(
+            backing,
+            crate::kms::core::AliasEntry {
+                refcount: 1,
+                width,
+                height,
+                depth,
+            },
+        );
+        self.core.host_window_to_backing.insert(w_xid, backing);
+        self.scene.wake_for_damage();
+        if self.store.lookup(w_xid).is_some() {
+            let tile_origin = self.border_tile_origin(w_xid);
+            let _ = self.paint_window_border(w_xid, tile_origin);
+        }
         Ok(backing)
     }
 

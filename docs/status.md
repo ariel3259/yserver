@@ -87,6 +87,25 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   - mode-blob counts and the CPU cost of the pre-compose frame-work walk: no telemetry;
   - the desktop visual session with C12.
 
+- **2026-10-18 redirected backing geometry (branch `fix/redirected-backing-geometry`, plan
+  `plans/2026-10-18-redirected-backing-geometry.md`):** a redirected window's backing now holds what Xorg's pixmap
+  holds. Oracle: `tools/vng-scenarios/redirected-backing-probe.c` (`redirected-backing`, `golden=live`), Xorg 21.1.24
+  vs yserver in vng. Fixed: **D** core draws/reads name the window, not its backing pixmap, so the backend applies the
+  content offset `bw` and ClipByChildren (PutImage, text, CopyPlane, fills, GetImage, SHM); Present completions still
+  fence on the backing (`present_completion_host`). **D2** damage reaches a parent at `x + bw`. **G**
+  `reallocate_redirected_backing` = `compReallocPixmap`: parent seed, no leaf release/restore round trip; the core
+  copies W's content NW from OLD, then `move_subwindows_for_gravity` carries gravity children out of OLD (sources
+  captured at the old positions, copied bottom to top); OLD is retained until then and a failed realloc keeps W on
+  OLD. **C/CF/U** `clip_list` computes `borderExposed` (`border_ring_clip`, `Exposure.border`) and every exposure
+  site paints it (`paint_window_border_rects`, `PW_BORDER`) before the window's exposures. **M/MB** rings painted into
+  an ancestor's backing are clipped to the parent's content and minus higher siblings. **N** a nested redirect seeds
+  from the ancestor backing only (no leaf overlay under a redirected ancestor; `debug_assert`). Measured, kept: a
+  resized redirected bordered window reports its ring once; Xorg twice (`borderExposed` + the `compRepaintBorder` work
+  proc). Out of scope / open: raw damage rect granularity (Xorg `extents ∩ clip` per op; the probe gates coverage,
+  raw rects in `damage-raw.log`); nested unredirect restores leaves, Xorg writes the parent pixmap; tiled or
+  ParentRelative borders of a moved+resized window are not exposed whole as Xorg does; UnmapGravity children are not
+  unmapped; ForgetGravity still copies W's own content. A border-damage probe A/B is byte-identical to master.
+
 - **2026-10-18 atomic-only cursor, sub-plan C (branch `feat/atomic-cursor-only`, plan
   `plans/2026-10-15-atomic-cursor-only-c.md`):** error recovery, qualification, lifecycle and plane reassignment on
   the atomic-only path; the legacy cursor ioctls are gone. A rejected full request is attributed with TEST_ONLY
