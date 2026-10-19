@@ -33,6 +33,60 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-10-19 atomic-only cursor, C11 hardware validation and C12 (branch `feat/atomic-cursor-only`, spec §2.6,
+  plan `plans/2026-10-18-atomic-cursor-only-c12.md`):** amdgpu delivers flip events at vblank, so one commit per CRTC
+  fits a vblank. Two scheduling defects showed up only there:
+  - **Starvation (C11 fix):** the flip-event cursor drain took every slot (`cursor_only=61/s scene=0` while moving;
+    mpv and window drags froze until motion stopped). A cursor-only commit now yields only to a scene commit that
+    is submitted this pass. A failed scene submit releases its cursor intents, retry backoff never parks cursor
+    intent, a deferred sprite upload stays retryable, and the recovery detach stays cursor-only (spec §3).
+  - **30 fps (C12):** a 60 fps FIFO client alternated `SceneWithCursor`/`CursorOnly` per vblank while the pointer
+    moved. A µs probe showed the cursor-only commit sent 19 µs after the flip event and the client's already-queued
+    PresentPixmap processed at 28 µs. Now:
+    - one output-local gate holds every ordinary cursor-only lane while the output awaits a frame;
+    - the decision is made after the iteration's dispatch, with the core's bounded dispatch reporting only a
+      backlog boolean;
+    - it waits at most 2 ms of loop time;
+    - a generic scheduler wake never composes a scene just to carry a hardware cursor.
+
+  Results with C12 (`tools/cursor-bench`, master `aa21b67a` for comparison):
+
+  | | AMD Raphael iGPU, HDMI | NVIDIA RTX 5060 Ti (615.71.09), HDMI |
+  |---|---|---|
+  | 60 fps FIFO video, cursor moving (windowed and direct) | `scene_with_cursor≈60`, `cursor_only=0` (master the same) | `scene_with_cursor≈60`, `cursor_only=0` (master the same) |
+  | pointer moving over a static screen | `cursor_only=60`, 0 composites (master composes 60/s) | `cursor_only≈250` (one per motion event), 0 composites (master composes 60/s) |
+  | drag | 60 scene/s | 60 scene/s |
+  | mpv drops / EBUSY / >8 ms motion stalls | 0 / 0 / 0 | 0 / 0 / 0 |
+  | motion→accept p99 | ~60 µs (master ~4 ms) | ~60–90 µs (master ~3.7 ms) |
+  | motion→visible p99 | ~16.7 ms (master ~20.6 ms) | — |
+
+  On NVIDIA, cursor-only flip events arrive within ~80 µs, so each motion event gets its own commit (ioctl p99
+  58 µs). RANDR and gamma stalls while moving equal master's or are fewer (modeset cost, not the cursor). With the
+  pre-C12 binary, both cards also passed:
+  - Firefox/Steam straight-line motion (the original jump) no longer jumps;
+  - RANDR 10× 720p↔native, and connector unplug/replug, relight;
+  - DPMS off/on ×2 and VT switch ×2 (one while moving) rearm the cursor;
+  - CS2 under tearing enters and leaves Async cleanly;
+  - yserver logs 0 WARN/ERROR/panic.
+
+  Display notes:
+  - A TV that resyncs slower than 2 s shows black during a 2 s RANDR loop while every modeset and first flip
+    completes.
+  - A Sony HDMI chain on NVIDIA flaps HPD; its rescans cost ~150 ms, not cursor-related.
+
+  virtio-gpu (QEMU 10.2.3, virglrenderer 1.2.0 Venus on the AMD, Fedora 44 guest, kernel 6.19, absolute tablet):
+  hardware cursor plane with hotspot, clicks land on the tip across shapes, and video keeps playing while moving.
+
+  CS2 with the final C12 binary (NVIDIA, i3, ~55 min): tearing flips up to 564/s, `ebusy=0`, motion→accept max
+  3.5 ms, no visible defect; yserver logs 0 ERROR/panic and no Xid.
+
+  Not covered:
+  - Intel: no machine available;
+  - KDE Plasma: not installed;
+  - same-device plane reassignment: one connected output per card;
+  - mode-blob counts and the CPU cost of the pre-compose frame-work walk: no telemetry;
+  - the desktop visual session with C12.
+
 - **2026-10-18 atomic-only cursor, sub-plan C (branch `feat/atomic-cursor-only`, plan
   `plans/2026-10-15-atomic-cursor-only-c.md`):** error recovery, qualification, lifecycle and plane reassignment on
   the atomic-only path; the legacy cursor ioctls are gone. A rejected full request is attributed with TEST_ONLY
