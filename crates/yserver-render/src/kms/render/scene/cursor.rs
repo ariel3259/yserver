@@ -3,7 +3,7 @@ use crate::kms::render::{
     scene::{
         CursorAssignment, CursorEntry, CursorPlaneMode, CursorRetireResolution, CursorTransition,
         CursorTransitionResult, OutputCursorMode, OutputLayout, OutputSceneState, OutputSink,
-        SceneBuild, SceneCompositor, SceneCompositorInner,
+        SceneBuild, SceneCompositor,
     },
     store::RegionSet,
 };
@@ -110,7 +110,8 @@ impl SceneCompositor {
             reveal_sw_after: true,
         });
         let retained_mode = inner.outputs[output_idx].last_frame_cursor_mode;
-        let result = apply_cursor_transition_on_retire(inner, output_idx, sink, transition);
+        let result =
+            apply_cursor_transition_on_retire(inner.cursor.as_ref(), output_idx, sink, transition);
         let desired_mode = OutputCursorMode::SwPending;
         let resolution = resolve_retired_cursor_state(result, desired_mode, retained_mode);
         let state = &mut inner.outputs[output_idx];
@@ -128,7 +129,7 @@ impl SceneCompositor {
         }
         if resolution.force_repaint {
             force_cursor_retry_repaint(state);
-            self.scene_structure_dirty = true;
+            mark_cursor_transition_structure_dirty(&mut self.scene_structure_dirty, result);
         }
         true
     }
@@ -484,6 +485,15 @@ pub(super) fn update_force_show_retry_version(
     }
 }
 
+pub(super) fn mark_cursor_transition_structure_dirty(
+    scene_structure_dirty: &mut bool,
+    result: CursorTransitionResult,
+) {
+    if matches!(result, CursorTransitionResult::Deferred) {
+        *scene_structure_dirty = true;
+    }
+}
+
 pub(super) fn force_cursor_retry_repaint(state: &mut OutputSceneState) {
     state.scene_structure_damage.add(vk::Rect2D {
         offset: vk::Offset2D { x: 0, y: 0 },
@@ -552,7 +562,7 @@ pub(super) fn resolve_cursor_hide_on_retire(
 }
 
 pub(super) fn apply_cursor_transition_on_retire(
-    inner: &mut SceneCompositorInner,
+    cursor_entry: Option<&CursorEntry>,
     output_idx: usize,
     sink: &mut dyn OutputSink,
     transition: Option<CursorTransition>,
@@ -583,7 +593,7 @@ pub(super) fn apply_cursor_transition_on_retire(
                 hot_y,
             ) {
                 true
-            } else if let Some(entry) = inner.cursor.as_ref()
+            } else if let Some(entry) = cursor_entry
                 && entry.record_version == upload_version
                 && let Some(bytes) = entry.bgra_bytes.as_ref()
             {
