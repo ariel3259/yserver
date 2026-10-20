@@ -364,6 +364,11 @@ impl SpritePool {
     }
 
     #[cfg(test)]
+    pub(crate) fn for_tests_buffer_count(&self) -> usize {
+        self.buffers.len()
+    }
+
+    #[cfg(test)]
     pub(crate) fn prepared_user_count(&self) -> usize {
         self.buffers
             .iter()

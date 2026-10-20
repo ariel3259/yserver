@@ -9,6 +9,7 @@ use std::{
 
 use super::client_caps::{
     CursorDeviceCaps, DeviceClientCapability, DeviceControl, DrmDeviceControl,
+    negotiate_cursor_caps,
 };
 use drm::Device as DrmDevice;
 
@@ -184,7 +185,7 @@ impl Device {
                  genuinely non-atomic and yserver/KMS won't work on this kernel."
             );
         }
-        // P2b Task 5 inserts cursor capability negotiation here, before the CRTC-event check.
+        self.cursor_caps = Some(negotiate_cursor_caps(self, control));
         require_crtc_in_vblank_event(&self.path, control.crtc_in_vblank_event(self))
     }
 

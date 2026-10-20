@@ -10,10 +10,6 @@ use crate::drm::Device;
 pub(crate) enum DeviceClientCapability {
     UniversalPlanes,
     Atomic,
-    #[allow(
-        dead_code,
-        reason = "P2b Task 5 adds cursor negotiation to the KMS open sequence."
-    )]
     CursorPlaneHotspot,
 }
 
@@ -25,10 +21,6 @@ pub struct CursorDeviceCaps {
 }
 
 impl CursorDeviceCaps {
-    #[allow(
-        dead_code,
-        reason = "P2b Task 5 caches the negotiated cursor capability facts."
-    )]
     pub(crate) fn new(hotspot_cap_accepted: bool, driver_name: Option<String>) -> Self {
         Self {
             hotspot_cap_accepted,
@@ -68,10 +60,6 @@ pub(crate) trait DeviceControl: Send + Sync {
         capability: DeviceClientCapability,
     ) -> io::Result<()>;
 
-    #[allow(
-        dead_code,
-        reason = "P2b Task 5 queries the driver name during KMS initialization."
-    )]
     fn driver_name(&self, device: &Device) -> io::Result<String>;
 
     fn crtc_in_vblank_event(&self, device: &Device) -> io::Result<u64>;
@@ -142,10 +130,6 @@ fn set_cursor_plane_hotspot_cap(device: &Device) -> io::Result<()> {
 }
 
 /// Negotiate cursor-specific capabilities and cache the driver name.
-#[allow(
-    dead_code,
-    reason = "P2b Task 5 adds cursor negotiation to the KMS open sequence."
-)]
 pub(crate) fn negotiate_cursor_caps(
     device: &Device,
     control: &dyn DeviceControl,
@@ -265,7 +249,7 @@ impl DeviceControl for RecordingDeviceControl {
 #[cfg(test)]
 pub(crate) fn recording_control(driver_name: &str) -> std::sync::Arc<RecordingDeviceControl> {
     std::sync::Arc::new(RecordingDeviceControl::new(
-        [Ok(()), Ok(())],
+        [Ok(()), Ok(()), Ok(())],
         Ok(driver_name.to_owned()),
         Ok(1),
     ))
@@ -284,8 +268,8 @@ mod tests {
     };
 
     #[test]
-    // Mutation: duplicate or reorder an open capability request, or retain the old negotiation path.
-    fn open_sequence_requests_universal_atomic_then_checks_crtc_events_once() {
+    // Mutation: duplicate or reorder the cursor step, or keep an extra Atomic capability request.
+    fn open_sequence_requests_universal_atomic_hotspot_name_then_checks_crtc_events_once() {
         let control = super::recording_control("amdgpu");
         let device = Device::for_tests_with_control(control.clone()).expect("configured device");
 
@@ -294,13 +278,18 @@ mod tests {
             vec![
                 DeviceControlCall::SetClientCapability(DeviceClientCapability::UniversalPlanes),
                 DeviceControlCall::SetClientCapability(DeviceClientCapability::Atomic),
+                DeviceControlCall::SetClientCapability(DeviceClientCapability::CursorPlaneHotspot),
+                DeviceControlCall::DriverName,
                 DeviceControlCall::CrtcInVBlankEvent,
             ]
         );
-        assert!(device.cursor_caps().is_none());
+        assert_eq!(
+            device.cursor_caps(),
+            Some(&CursorDeviceCaps::new(true, Some("amdgpu".to_owned())))
+        );
 
         let query_error = Arc::new(RecordingDeviceControl::new(
-            [Ok(()), Ok(())],
+            [Ok(()), Ok(()), Ok(())],
             Ok("amdgpu".to_owned()),
             Err(libc::EIO),
         ));
@@ -311,7 +300,7 @@ mod tests {
         assert!(error.to_string().contains("DRM_CAP_CRTC_IN_VBLANK_EVENT"));
 
         let zero_value = Arc::new(RecordingDeviceControl::new(
-            [Ok(()), Ok(())],
+            [Ok(()), Ok(()), Ok(())],
             Ok("amdgpu".to_owned()),
             Ok(0),
         ));
