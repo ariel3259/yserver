@@ -470,24 +470,22 @@ pub(super) fn update_force_show_retry_version(
         _ => None,
     };
     match (attempted, result) {
-        (
-            Some(version),
-            result @ (CursorTransitionResult::VisibleNeedsShowRetry
-            | CursorTransitionResult::Deferred),
-        ) => {
+        (Some(version), CursorTransitionResult::Deferred) => Some(super::CursorShowRetry {
+            version,
+            deferred: true,
+        }),
+        (Some(version), CursorTransitionResult::VisibleNeedsShowRetry) => {
             if current.is_some_and(|pending| pending.version > version) {
                 current
             } else {
                 Some(super::CursorShowRetry {
                     version,
-                    deferred: matches!(result, CursorTransitionResult::Deferred),
+                    deferred: false,
                 })
             }
         }
         (Some(version), CursorTransitionResult::Applied)
-            if current.is_some_and(|pending| {
-                pending.version == version || (pending.deferred && pending.version < version)
-            }) =>
+            if current.is_some_and(|pending| pending.version == version || pending.deferred) =>
         {
             None
         }

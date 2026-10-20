@@ -714,6 +714,23 @@ fn older_show_retirement_cannot_clear_newer_sprite_retry() {
         }),
         "an older legacy retry keeps master's generation-qualified behavior"
     );
+    // Mutation: make Deferred preserve a higher pending version; this named assertion must fail.
+    assert_eq!(
+        update_force_show_retry_version(
+            Some(CursorShowRetry {
+                version: 9,
+                deferred: true,
+            }),
+            old_show,
+            CursorTransitionResult::Deferred,
+            OutputCursorMode::Hw,
+        ),
+        Some(CursorShowRetry {
+            version: 8,
+            deferred: true,
+        }),
+        "the latest deferred attempt replaces a higher-version pending retry"
+    );
 }
 
 #[test]

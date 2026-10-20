@@ -1198,13 +1198,28 @@ fn p2_ebusy_show_defers_without_consuming_a_lease() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: keep A's deferred retry marker after B binds; the named retry-version assertion must fail.
+// Mutation: restore the pending.version < version check; B-created-first must fail the named retry-version assertion.
 fn p2_current_cursor_bind_clears_a_superseded_deferred_show_retry() {
+    p2_current_cursor_bind_clears_a_superseded_deferred_show_retry_scenario(false);
+    p2_current_cursor_bind_clears_a_superseded_deferred_show_retry_scenario(true);
+}
+
+fn p2_current_cursor_bind_clears_a_superseded_deferred_show_retry_scenario(
+    create_b_before_a: bool,
+) {
     let Some(mut fixture) =
         AtomicPathFixture::new(PathKind::Physical).expect("atomic cursor fixture construction")
     else {
         return;
     };
+    let cursor_b = create_b_before_a.then(|| {
+        create_argb_cursor(
+            &mut fixture.scene.events.backend,
+            (4, 4),
+            [32, 33, 34, 255],
+            (1, 2),
+        )
+    });
     let cursor_a = create_argb_cursor(
         &mut fixture.scene.events.backend,
         (4, 4),
@@ -1241,6 +1256,23 @@ fn p2_current_cursor_bind_clears_a_superseded_deferred_show_retry() {
         .scene
         .for_tests_cursor_retry_version(0)
         .expect("A's deferred show leaves a retry version");
+    let cursor_b = cursor_b.unwrap_or_else(|| {
+        create_argb_cursor(
+            &mut fixture.scene.events.backend,
+            (4, 4),
+            [32, 33, 34, 255],
+            (1, 2),
+        )
+    });
+    let cursor_b_xid = cursor_b.as_raw();
+    let version_a = fixture.scene.events.backend.cursor_records[&cursor_a_xid].version;
+    let version_b = fixture.scene.events.backend.cursor_records[&cursor_b_xid].version;
+    assert_eq!(retry_a, version_a, "the deferred retry belongs to A");
+    assert_eq!(
+        version_b < version_a,
+        create_b_before_a,
+        "B's cursor version reflects whether B was created before A"
+    );
     assert_eq!(
         fixture.scene.events.backend.scene.cursor_mode(),
         yserver_render::kms::render::scene::CursorPlaneMode::Mixed,
@@ -1257,13 +1289,6 @@ fn p2_current_cursor_bind_clears_a_superseded_deferred_show_retry() {
         "A's deferred show did not bind"
     );
 
-    let cursor_b = create_argb_cursor(
-        &mut fixture.scene.events.backend,
-        (4, 4),
-        [32, 33, 34, 255],
-        (1, 2),
-    );
-    let cursor_b_xid = cursor_b.as_raw();
     define_root_cursor(&mut fixture.scene.events.backend, cursor_b);
     assert_eq!(
         fixture.scene.events.backend.effective_cursor_xid,
