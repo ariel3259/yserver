@@ -1198,6 +1198,178 @@ fn p2_ebusy_show_defers_without_consuming_a_lease() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: keep A's deferred retry marker after B binds; the named retry-version assertion must fail.
+fn p2_current_cursor_bind_clears_a_superseded_deferred_show_retry() {
+    let Some(mut fixture) =
+        AtomicPathFixture::new(PathKind::Physical).expect("atomic cursor fixture construction")
+    else {
+        return;
+    };
+    let cursor_a = create_argb_cursor(
+        &mut fixture.scene.events.backend,
+        (4, 4),
+        [19, 20, 21, 255],
+        (1, 2),
+    );
+    let cursor_a_xid = cursor_a.as_raw();
+    define_root_cursor(&mut fixture.scene.events.backend, cursor_a);
+    Backend::warp_pointer_root(
+        &mut fixture.scene.events.backend,
+        &mut fixture.scene.events.state,
+        100,
+        90,
+    );
+    assert!(matches!(
+        fixture.scene.events.backend.scene.cursor_mode(),
+        yserver_render::kms::render::scene::CursorPlaneMode::Hidden
+            | yserver_render::kms::render::scene::CursorPlaneMode::Sw
+    ));
+    damage_root(&mut fixture);
+
+    let device_fd = fixture.scene.kms_fd(0);
+    let recorder = fixture.scene.events.recorders[&device_fd].clone();
+    Backend::maybe_composite(&mut fixture.scene.events.backend)
+        .expect("submit A's Hidden/Sw-to-Hw scene transition");
+    recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EBUSY)));
+    let mut delivered = HashSet::new();
+    retire_pending_output(&mut fixture.scene.events, &mut delivered, 0, 1);
+
+    let retry_a = fixture
+        .scene
+        .events
+        .backend
+        .scene
+        .for_tests_cursor_retry_version(0)
+        .expect("A's deferred show leaves a retry version");
+    assert_eq!(
+        fixture.scene.events.backend.scene.cursor_mode(),
+        yserver_render::kms::render::scene::CursorPlaneMode::Mixed,
+        "a deferred Hidden/Sw show keeps the scene out of steady Hw mode"
+    );
+    assert_eq!(
+        fixture.scene.events.backend.effective_cursor_xid,
+        Some(cursor_a_xid),
+        "A is current when its show is deferred"
+    );
+    assert_eq!(
+        applied_cursor_binding(&fixture.scene.events.backend, 0),
+        None,
+        "A's deferred show did not bind"
+    );
+
+    let cursor_b = create_argb_cursor(
+        &mut fixture.scene.events.backend,
+        (4, 4),
+        [32, 33, 34, 255],
+        (1, 2),
+    );
+    let cursor_b_xid = cursor_b.as_raw();
+    define_root_cursor(&mut fixture.scene.events.backend, cursor_b);
+    assert_eq!(
+        fixture.scene.events.backend.effective_cursor_xid,
+        Some(cursor_b_xid),
+        "select B before retrying A's deferred show"
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .events
+            .backend
+            .scene
+            .for_tests_cursor_retry_version(0),
+        Some(retry_a),
+        "B selection is still carrying A's superseded retry marker"
+    );
+
+    let offset = record_count(&fixture, device_fd);
+    damage_root(&mut fixture);
+    let properties = super::support::cursor_properties_for_output(&fixture.scene.events.backend, 0);
+    let bind_b = compose_until_cursor_commit_where(
+        &mut fixture,
+        &mut delivered,
+        0,
+        offset,
+        properties.fb_id,
+        |record| record_property(record, properties.fb_id).is_some_and(|fb_id| fb_id != 0),
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .events
+            .backend
+            .scene
+            .for_tests_cursor_retry_version(0),
+        None,
+        "successful B bind clears the superseded deferred retry version"
+    );
+    assert_eq!(
+        fixture.scene.events.backend.scene.cursor_mode(),
+        yserver_render::kms::render::scene::CursorPlaneMode::Hw,
+        "the scene leaves Mixed after current cursor B binds"
+    );
+    assert!(
+        fixture.scene.events.backend.direct_cursor_eligible(),
+        "a bound current cursor makes the direct cursor gate eligible"
+    );
+    assert_eq!(
+        applied_cursor_binding(&fixture.scene.events.backend, 0)
+            .map(|binding| binding.lease.version()),
+        Some(
+            fixture.scene.events.backend.platform.devices[0]
+                .cursor
+                .plane
+                .as_ref()
+                .unwrap()
+                .sprites()
+                .candidate_version()
+                .expect("B is the current sprite candidate")
+        ),
+        "the applied binding names the current B sprite"
+    );
+    retire_cursor_record(&mut fixture, &mut delivered, 0, &bind_b, 3);
+
+    let motion_offset = record_count(&fixture, device_fd);
+    Backend::warp_pointer_root(
+        &mut fixture.scene.events.backend,
+        &mut fixture.scene.events.state,
+        108,
+        96,
+    );
+    Backend::maybe_composite(&mut fixture.scene.events.backend)
+        .expect("process pointer motion after the deferred retry settles");
+    let motion_records: Vec<_> = recorder
+        .records()
+        .into_iter()
+        .skip(motion_offset)
+        .filter(|record| record.device_fd == device_fd && record.result == ScriptedResult::Ok)
+        .collect();
+    assert!(
+        motion_records.iter().all(|record| {
+            !matches!(
+                record.kind,
+                AtomicCommitKind::Scene | AtomicCommitKind::SceneWithCursor
+            )
+        }),
+        "pointer motion after B binds does not force a composed scene frame"
+    );
+    assert_eq!(
+        fixture.scene.events.backend.scene.cursor_mode(),
+        yserver_render::kms::render::scene::CursorPlaneMode::Hw
+    );
+
+    if let Some(motion) = motion_records
+        .iter()
+        .find(|record| record.kind == AtomicCommitKind::CursorOnly)
+    {
+        retire_cursor_record(&mut fixture, &mut delivered, 0, motion, 4);
+    }
+    let detach = accept_cursor_detach(&mut fixture, &mut delivered, 0);
+    retire_cursor_record(&mut fixture, &mut delivered, 0, &detach, 5);
+    super::support::finish_atomic_fixture(fixture, &mut delivered);
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: call a Legacy hide or keep the attach reservation after its cursor-only submit is rejected.
 fn p2_rejected_attach_rolls_back_without_touching_legacy() {
     let Some(mut fixture) =

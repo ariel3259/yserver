@@ -278,6 +278,16 @@ enum OutputCursorMode {
     Hidden,
 }
 
+/// A forced full-show repaint and the outcome that requested it. Deferred
+/// shows may be superseded by a newer cursor before the retry binds; a newer
+/// successful show clears that obsolete retry. Visible legacy retries retain
+/// their generation-qualified master behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CursorShowRetry {
+    version: u64,
+    deferred: bool,
+}
+
 /// Stage 5 Phase D — query result for the pointer fast path.
 /// `Hw` is only reached when EVERY active output has retired its
 /// transition to HW; mixed-state outputs return `Mixed`, which
@@ -397,7 +407,7 @@ struct OutputSceneState {
     /// A steady-HW sprite/hotspot rebind or a prior-binding show failed.
     /// Force the next Hw→Hw composed retirement to carry ShowOnRetire; do not
     /// claim the desired cursor metadata until that full rebind succeeds.
-    force_show_retry_version: Option<u64>,
+    force_show_retry_version: Option<CursorShowRetry>,
     /// Diagnostic: last reason `tick_one_output` skipped a tick for
     /// this output. Logged at INFO on transition (skip→different-skip,
     /// no-skip→skip, skip→no-skip). Tracks the freeze-debug

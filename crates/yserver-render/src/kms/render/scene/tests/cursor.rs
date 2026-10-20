@@ -73,7 +73,10 @@ fn deferred_transition_keeps_the_retained_mode_and_forces_a_show_retry() {
     assert!(resolution.force_repaint);
     assert_eq!(
         update_force_show_retry_version(None, transition, result, OutputCursorMode::Hw,),
-        Some(91)
+        Some(CursorShowRetry {
+            version: 91,
+            deferred: true,
+        })
     );
 
     sink.upload_response = TestUploadResponse::Ready;
@@ -608,19 +611,31 @@ fn failed_visible_rebind_forces_full_show_retry_without_claiming_version() {
         CursorTransitionResult::VisibleNeedsShowRetry,
         OutputCursorMode::Hw,
     );
-    assert_eq!(retry, Some(7));
+    assert_eq!(
+        retry,
+        Some(CursorShowRetry {
+            version: 7,
+            deferred: false,
+        })
+    );
 }
 
 #[test]
 fn unrelated_old_ack_cannot_clear_newer_show_retry() {
     assert_eq!(
         update_force_show_retry_version(
-            Some(8),
+            Some(CursorShowRetry {
+                version: 8,
+                deferred: false,
+            }),
             None,
             CursorTransitionResult::Applied,
             OutputCursorMode::Hw,
         ),
-        Some(8)
+        Some(CursorShowRetry {
+            version: 8,
+            deferred: false,
+        })
     );
 }
 
@@ -635,12 +650,69 @@ fn older_show_retirement_cannot_clear_newer_sprite_retry() {
     });
     assert_eq!(
         update_force_show_retry_version(
-            Some(9),
+            Some(CursorShowRetry {
+                version: 9,
+                deferred: false,
+            }),
             old_show,
             CursorTransitionResult::Applied,
             OutputCursorMode::Hw,
         ),
-        Some(9)
+        Some(CursorShowRetry {
+            version: 9,
+            deferred: false,
+        })
+    );
+    let newer_show = Some(CursorTransition::ShowOnRetire {
+        upload_version: 10,
+        hot_x: 0,
+        hot_y: 0,
+        x: 10,
+        y: 20,
+    });
+    assert_eq!(
+        update_force_show_retry_version(
+            Some(CursorShowRetry {
+                version: 9,
+                deferred: true,
+            }),
+            newer_show,
+            CursorTransitionResult::Applied,
+            OutputCursorMode::Hw,
+        ),
+        None
+    );
+    assert_eq!(
+        update_force_show_retry_version(
+            Some(CursorShowRetry {
+                version: 9,
+                deferred: true,
+            }),
+            newer_show,
+            CursorTransitionResult::Hidden,
+            OutputCursorMode::Hw,
+        ),
+        Some(CursorShowRetry {
+            version: 9,
+            deferred: true,
+        }),
+        "a Hidden result does not count as a successful newer bind"
+    );
+    assert_eq!(
+        update_force_show_retry_version(
+            Some(CursorShowRetry {
+                version: 9,
+                deferred: false,
+            }),
+            newer_show,
+            CursorTransitionResult::Applied,
+            OutputCursorMode::Hw,
+        ),
+        Some(CursorShowRetry {
+            version: 9,
+            deferred: false,
+        }),
+        "an older legacy retry keeps master's generation-qualified behavior"
     );
 }
 
@@ -655,7 +727,10 @@ fn matching_show_success_clears_only_its_retry_generation() {
     });
     assert_eq!(
         update_force_show_retry_version(
-            Some(9),
+            Some(CursorShowRetry {
+                version: 9,
+                deferred: false,
+            }),
             show,
             CursorTransitionResult::Applied,
             OutputCursorMode::Hw,
@@ -666,7 +741,10 @@ fn matching_show_success_clears_only_its_retry_generation() {
 
 #[test]
 fn lifecycle_reset_discards_stale_retry_before_fresh_hidden_show() {
-    let mut retry = Some(1);
+    let mut retry = Some(CursorShowRetry {
+        version: 1,
+        deferred: true,
+    });
     reset_cursor_retry_for_lifecycle(&mut retry);
     assert_eq!(retry, None);
     let mut mode = OutputCursorMode::SwPending;

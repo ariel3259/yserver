@@ -271,7 +271,10 @@ impl SceneCompositor {
                 output.last_frame_cursor_mode,
                 output.pending_acks.iter().map(|ack| ack.cursor_transition),
             ) {
-                output.force_show_retry_version = Some(version);
+                output.force_show_retry_version = Some(super::CursorShowRetry {
+                    version,
+                    deferred: false,
+                });
                 force_cursor_retry_repaint(output);
                 refreshes_hw_binding = true;
             }
@@ -457,11 +460,11 @@ pub(super) fn resolve_retired_cursor_state(
 }
 
 pub(super) fn update_force_show_retry_version(
-    current: Option<u64>,
+    current: Option<super::CursorShowRetry>,
     transition: Option<CursorTransition>,
     result: CursorTransitionResult,
     desired_mode: OutputCursorMode,
-) -> Option<u64> {
+) -> Option<super::CursorShowRetry> {
     let attempted = match transition {
         Some(CursorTransition::ShowOnRetire { upload_version, .. }) => Some(upload_version),
         _ => None,
@@ -469,10 +472,27 @@ pub(super) fn update_force_show_retry_version(
     match (attempted, result) {
         (
             Some(version),
-            CursorTransitionResult::VisibleNeedsShowRetry | CursorTransitionResult::Deferred,
-        ) => Some(current.map_or(version, |pending| pending.max(version))),
-        (Some(version), CursorTransitionResult::Applied | CursorTransitionResult::Hidden)
-            if current == Some(version) =>
+            result @ (CursorTransitionResult::VisibleNeedsShowRetry
+            | CursorTransitionResult::Deferred),
+        ) => {
+            if current.is_some_and(|pending| pending.version > version) {
+                current
+            } else {
+                Some(super::CursorShowRetry {
+                    version,
+                    deferred: matches!(result, CursorTransitionResult::Deferred),
+                })
+            }
+        }
+        (Some(version), CursorTransitionResult::Applied)
+            if current.is_some_and(|pending| {
+                pending.version == version || (pending.deferred && pending.version < version)
+            }) =>
+        {
+            None
+        }
+        (Some(version), CursorTransitionResult::Hidden)
+            if current.is_some_and(|pending| pending.version == version) =>
         {
             None
         }
@@ -501,7 +521,7 @@ pub(super) fn force_cursor_retry_repaint(state: &mut OutputSceneState) {
     });
 }
 
-pub(super) fn reset_cursor_retry_for_lifecycle(retry: &mut Option<u64>) {
+pub(super) fn reset_cursor_retry_for_lifecycle(retry: &mut Option<super::CursorShowRetry>) {
     // drain_all also resets the actual mode to Hidden and invalidates every
     // uploaded plane version. The first post-resume/DPMS frame therefore
     // derives a fresh Hidden→Hw Show using the current cursor record; an old
