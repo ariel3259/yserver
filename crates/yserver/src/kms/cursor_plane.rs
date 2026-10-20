@@ -135,6 +135,14 @@ impl CursorHideExecutor for DrmCursorHideExecutor {
 #[derive(Debug)]
 pub enum CursorShowError {
     Unbound(io::Error),
+    #[allow(
+        dead_code,
+        reason = "P2b Task 2 constructs deferred atomic cursor show results"
+    )]
+    Deferred {
+        remains_visible: bool,
+        reason: io::Error,
+    },
     StillVisible {
         operation_error: io::Error,
         rollback_error: Option<io::Error>,
@@ -144,13 +152,25 @@ pub enum CursorShowError {
 impl CursorShowError {
     #[must_use]
     pub fn remains_visible(&self) -> bool {
-        matches!(self, Self::StillVisible { .. })
+        match self {
+            Self::Unbound(_) => false,
+            Self::Deferred {
+                remains_visible, ..
+            } => *remains_visible,
+            Self::StillVisible { .. } => true,
+        }
+    }
+
+    #[must_use]
+    pub fn is_deferred(&self) -> bool {
+        matches!(self, Self::Deferred { .. })
     }
 
     #[must_use]
     pub fn operation_error(&self) -> &io::Error {
         match self {
             Self::Unbound(error) => error,
+            Self::Deferred { reason, .. } => reason,
             Self::StillVisible {
                 operation_error, ..
             } => operation_error,
@@ -160,7 +180,7 @@ impl CursorShowError {
     #[must_use]
     pub fn rollback_error(&self) -> Option<&io::Error> {
         match self {
-            Self::Unbound(_) => None,
+            Self::Unbound(_) | Self::Deferred { .. } => None,
             Self::StillVisible { rollback_error, .. } => rollback_error.as_ref(),
         }
     }
@@ -184,6 +204,7 @@ impl std::fmt::Display for CursorShowError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unbound(error) => write!(f, "cursor remains unbound: {error}"),
+            Self::Deferred { reason, .. } => write!(f, "cursor show deferred: {reason}"),
             Self::StillVisible {
                 operation_error,
                 rollback_error,
@@ -1356,13 +1377,13 @@ mod tests {
         let mut p = PlatformBackend::for_tests();
         assert!(!p.cursor_plane_available());
         assert!(
-            p.cursor_plane_upload_image_for_output(0, 1, 16, 16, &[0u8; 16 * 16 * 4])
+            p.cursor_plane_upload_image_for_output(0, 1, 0, 0, 16, 16, &[0u8; 16 * 16 * 4])
                 .is_err()
         );
         assert!(p.cursor_plane_show_on_crtc(0, 0, 0, 0, 0).is_err());
         assert!(p.cursor_plane_move(0, 0, 0, 0).is_err());
         assert!(p.cursor_plane_hide_on_crtc(0).is_err());
         assert!(p.cursor_plane_hide_all().is_err());
-        assert!(p.cursor_plane_uploaded_version_for_output(0).is_none());
+        assert!(!p.cursor_plane_uploaded_image_matches_for_output(0, 1, 0, 0));
     }
 }

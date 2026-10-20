@@ -955,10 +955,12 @@ impl PlatformBackend {
         &mut self,
         output_idx: usize,
         version: u64,
+        _hot_x: u16,
+        _hot_y: u16,
         width: u32,
         height: u32,
         bgra_bytes: &[u8],
-    ) -> io::Result<()> {
+    ) -> io::Result<crate::kms::render::scene::CursorUploadOutcome> {
         let (device_idx, crtc, _, _) = self.cursor_output_route(output_idx)?;
         let state = &mut self.devices[device_idx].cursor;
         if !state.available_on(crtc) {
@@ -973,20 +975,26 @@ impl PlatformBackend {
         // precheck above and scene-side version races are not driver
         // observations and must not extend this output's backoff.
         apply_cursor_operation_result(state, crtc, &result);
-        result
+        result.map(|()| crate::kms::render::scene::CursorUploadOutcome::Ready)
     }
 
     #[must_use]
-    pub(crate) fn cursor_plane_uploaded_version_for_output(
+    pub(crate) fn cursor_plane_uploaded_image_matches_for_output(
         &self,
         output_idx: usize,
-    ) -> Option<u64> {
-        let (device_idx, _, _, _) = self.cursor_output_route(output_idx).ok()?;
+        version: u64,
+        _hot_x: u16,
+        _hot_y: u16,
+    ) -> bool {
+        let Ok((device_idx, _, _, _)) = self.cursor_output_route(output_idx) else {
+            return false;
+        };
         self.devices[device_idx]
             .cursor
             .plane
             .as_ref()
             .and_then(|plane| plane.uploaded_version())
+            == Some(version)
     }
 
     /// Bind the plane on `output_idx`'s CRTC + position at `(x, y)`

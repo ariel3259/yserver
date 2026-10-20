@@ -1318,6 +1318,16 @@ fn still_visible_show_failure_records_owning_fallback_without_stale_move() {
     assert!(rollback_wins.permanently_disabled);
     assert!(rollback_wins.transient_fallback_crtcs.is_empty());
     assert_eq!(rollback_wins.pending_move, None);
+
+    let deferred = crate::kms::cursor_plane::CursorShowError::Deferred {
+        remains_visible: true,
+        reason: io::Error::from_raw_os_error(libc::EBUSY),
+    };
+    assert!(deferred.remains_visible());
+    assert!(deferred.is_deferred());
+    assert!(!deferred.needs_full_rebind());
+    assert!(deferred.rollback_error().is_none());
+    assert_eq!(deferred.operation_error().raw_os_error(), Some(libc::EBUSY));
 }
 
 #[test]
@@ -1453,16 +1463,13 @@ fn primary_first_explicit_enable_initializes_and_exposes_fresh_upload_state() {
     assert_eq!(calls.get(), 1);
     assert!(!platform.devices[0].cursor.headless_deferred);
     assert!(platform.cursor_plane_available_for_output(0));
-    assert_eq!(platform.cursor_plane_uploaded_version_for_output(0), None);
+    assert!(!platform.cursor_plane_uploaded_image_matches_for_output(0, 7, 0, 0));
 
     let bytes = vec![0_u8; 16 * 16 * 4];
     platform
-        .cursor_plane_upload_image_for_output(0, 7, 16, 16, &bytes)
+        .cursor_plane_upload_image_for_output(0, 7, 0, 0, 16, 16, &bytes)
         .expect("fresh lazy plane accepts its first retire-time upload");
-    assert_eq!(
-        platform.cursor_plane_uploaded_version_for_output(0),
-        Some(7)
-    );
+    assert!(platform.cursor_plane_uploaded_image_matches_for_output(0, 7, 9, 9));
 }
 
 #[test]
@@ -1925,7 +1932,7 @@ fn initialized_cursor_plane_persists_but_reuploads_across_last_disable_and_reena
         install_test_cursor_plane,
     ));
     platform
-        .cursor_plane_upload_image_for_output(0, 9, 16, 16, &[0_u8; 16 * 16 * 4])
+        .cursor_plane_upload_image_for_output(0, 9, 0, 0, 16, 16, &[0_u8; 16 * 16 * 4])
         .unwrap();
     assert_eq!(
         platform.devices[0]
@@ -1967,14 +1974,11 @@ fn initialized_cursor_plane_persists_but_reuploads_across_last_disable_and_reena
         .push(test_active_output_for(key, "reenabled", 1));
     platform.refresh_cursor_topology_for_devices(&HashSet::from([key]));
     assert!(platform.cursor_plane_available_for_output(0));
-    assert_eq!(platform.cursor_plane_uploaded_version_for_output(0), None);
+    assert!(!platform.cursor_plane_uploaded_image_matches_for_output(0, 10, 0, 0));
     platform
-        .cursor_plane_upload_image_for_output(0, 10, 16, 16, &[0_u8; 16 * 16 * 4])
+        .cursor_plane_upload_image_for_output(0, 10, 0, 0, 16, 16, &[0_u8; 16 * 16 * 4])
         .expect("first retirement after re-enable refreshes retained storage");
-    assert_eq!(
-        platform.cursor_plane_uploaded_version_for_output(0),
-        Some(10)
-    );
+    assert!(platform.cursor_plane_uploaded_image_matches_for_output(0, 10, 4, 5));
 }
 
 #[test]

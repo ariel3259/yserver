@@ -4,6 +4,7 @@ use crate::kms::render::{
         ScanoutM0Target, ScanoutM1OutputGeometry, ScanoutM1ProbeEntry, WindowsMap,
         kms::randr::effective_refresh_matches,
     },
+    scene::CursorUploadOutcome,
     store::DrawableId,
     target::Src,
 };
@@ -444,13 +445,20 @@ impl KmsBackend {
         let y = self.core.cursor_y as i32;
         let mut failed = false;
         for output_idx in 0..self.platform.outputs.len() {
-            if let Err(error) = self.platform.cursor_plane_upload_image_for_output(
+            let upload_failure = match self.platform.cursor_plane_upload_image_for_output(
                 output_idx,
                 record.version,
+                record.hot_x,
+                record.hot_y,
                 u32::from(record.width),
                 u32::from(record.height),
                 &record.bgra_bytes,
             ) {
+                Ok(CursorUploadOutcome::Ready) => None,
+                Ok(CursorUploadOutcome::Deferred) => Some(String::from("cursor upload deferred")),
+                Err(error) => Some(error.to_string()),
+            };
+            if let Some(error) = upload_failure {
                 log::warn!(
                     "scanout_m2: direct cursor upload failed on output {output_idx}: {error}; unflipping"
                 );

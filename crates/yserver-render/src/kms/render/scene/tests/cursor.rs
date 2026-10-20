@@ -1,6 +1,25 @@
 use super::*;
 use std::io;
 
+fn scene_with_test_cursor(sink: &mut TestSink, bytes: Option<Vec<u8>>) -> Option<SceneCompositor> {
+    let Some(gpu) = GpuCore::for_tests_with_vk() else {
+        eprintln!("skipping: no Vulkan test device");
+        return None;
+    };
+    sink.gpu = gpu;
+    let layouts = [layout_at((0, 0, 800, 600))];
+    let mut scene = SceneCompositor::new(sink, &layouts).expect("construct live test scene");
+    scene.inner.as_mut().expect("live scene inner").cursor = Some(CursorEntry {
+        id: crate::kms::render::store::DrawableId::for_tests(91),
+        extent: extent(16, 16),
+        hot_x: 0,
+        hot_y: 0,
+        record_version: 91,
+        bgra_bytes: bytes.map(std::sync::Arc::new),
+    });
+    Some(scene)
+}
+
 // Stage 5 Phase G — strategy decision unit tests. Verify the
 // pure `derive_cursor_transition` matrix without needing
 // build_scene or a live Vk fixture.
@@ -31,6 +50,121 @@ fn derive_sw_to_hw_queues_show_on_retire() {
     assert_eq!((x, y), (200, 150));
     assert_eq!(prev_pos, Some(None), "Sw→Hw clears prev_pos");
     assert_eq!(mode_after, OutputCursorMode::Hw);
+}
+
+// Mutation: map upload/show Deferred to Hidden or clear its retry version;
+// the result, retained-mode, repaint, and retry assertions must fail.
+#[test]
+fn deferred_transition_keeps_the_retained_mode_and_forces_a_show_retry() {
+    let mut sink = TestSink::new();
+    let Some(mut scene) = scene_with_test_cursor(&mut sink, Some(vec![0; 16 * 16 * 4])) else {
+        return;
+    };
+    sink.cursor_available = true;
+    sink.cursor_visible = true;
+    sink.upload_response = TestUploadResponse::Deferred;
+    let transition = Some(CursorTransition::ShowOnRetire {
+        upload_version: 91,
+        hot_x: 2,
+        hot_y: 3,
+        x: 40,
+        y: 50,
+    });
+    let result = apply_cursor_transition_on_retire(
+        scene.inner.as_mut().expect("live scene inner"),
+        0,
+        &mut sink,
+        transition,
+    );
+    assert_eq!(result, CursorTransitionResult::Deferred);
+
+    let retained = OutputCursorMode::Sw {
+        prev: Some((12, 13)),
+    };
+    let resolution = resolve_retired_cursor_state(result, OutputCursorMode::Hw, retained);
+    assert_eq!(resolution.actual_mode, retained);
+    assert!(!resolution.commit_desired_metadata);
+    assert!(!resolution.clear_presented_metadata);
+    assert!(resolution.force_repaint);
+    assert_eq!(
+        update_force_show_retry_version(None, transition, result, OutputCursorMode::Hw,),
+        Some(91)
+    );
+
+    sink.upload_response = TestUploadResponse::Ready;
+    sink.uploaded_version = None;
+    sink.show_failure = Some((true, true));
+    let show_result = apply_cursor_transition_on_retire(
+        scene.inner.as_mut().expect("live scene inner"),
+        0,
+        &mut sink,
+        transition,
+    );
+    assert_eq!(show_result, CursorTransitionResult::Deferred);
+    assert_eq!(sink.uploaded_hotspot, Some((2, 3)));
+}
+
+// Mutation: make the no-matching-entry-bytes branch Deferred; this legacy
+// resolution assertion must fail while the upload-error outcomes stay pinned.
+#[test]
+fn legacy_sink_resolutions_are_unchanged() {
+    let mut sink = TestSink::new();
+    let Some(mut scene) = scene_with_test_cursor(&mut sink, Some(vec![0; 16 * 16 * 4])) else {
+        return;
+    };
+    sink.cursor_available = true;
+    sink.upload_response = TestUploadResponse::Error;
+    sink.cursor_visible = true;
+    sink.hide_fails = true;
+    let transition = Some(CursorTransition::ShowOnRetire {
+        upload_version: 91,
+        hot_x: 0,
+        hot_y: 0,
+        x: 10,
+        y: 20,
+    });
+
+    let visible_retry = apply_cursor_transition_on_retire(
+        scene.inner.as_mut().expect("live scene inner"),
+        0,
+        &mut sink,
+        transition,
+    );
+    assert_eq!(visible_retry, CursorTransitionResult::VisibleNeedsShowRetry);
+    assert_eq!(sink.hide_calls, 1);
+
+    sink.uploaded_version = None;
+    sink.cursor_visible = false;
+    sink.hide_fails = false;
+    let hidden = apply_cursor_transition_on_retire(
+        scene.inner.as_mut().expect("live scene inner"),
+        0,
+        &mut sink,
+        transition,
+    );
+    assert_eq!(hidden, CursorTransitionResult::Hidden);
+    assert_eq!(sink.hide_calls, 1);
+
+    scene
+        .inner
+        .as_mut()
+        .expect("live scene inner")
+        .cursor
+        .as_mut()
+        .expect("test cursor")
+        .bgra_bytes = None;
+    sink.cursor_visible = true;
+    sink.hide_fails = true;
+    let upload_calls_before = sink.upload_calls;
+    let no_bytes = apply_cursor_transition_on_retire(
+        scene.inner.as_mut().expect("live scene inner"),
+        0,
+        &mut sink,
+        transition,
+    );
+    assert_eq!(no_bytes, CursorTransitionResult::VisibleNeedsShowRetry);
+    assert_eq!(sink.upload_calls, upload_calls_before);
+    assert_eq!(sink.hide_calls, 2);
 }
 
 #[test]
@@ -250,8 +384,11 @@ fn hw_to_sw_uses_cursorless_hide_then_one_frame_gap_progression() {
     assert_eq!(prev_pos, Some(None));
     assert_eq!(mode_after, OutputCursorMode::SwPending);
 
-    let pending =
-        resolve_retired_cursor_state(CursorTransitionResult::HiddenNeedsRepaint, mode_after);
+    let pending = resolve_retired_cursor_state(
+        CursorTransitionResult::HiddenNeedsRepaint,
+        mode_after,
+        mode_after,
+    );
     assert_eq!(pending.actual_mode, OutputCursorMode::SwPending);
     assert!(pending.commit_desired_metadata);
     assert!(pending.force_repaint);
@@ -316,8 +453,11 @@ fn cursorless_hide_phase_removes_sw_draw_sample_and_presented_metadata() {
 #[test]
 fn repeated_hide_failure_keeps_hw_over_cursorless_frames_and_retries() {
     let assignment = CursorAssignment::Sw { pos: (100, 100) };
-    let failed =
-        resolve_retired_cursor_state(CursorTransitionResult::Visible, OutputCursorMode::SwPending);
+    let failed = resolve_retired_cursor_state(
+        CursorTransitionResult::Visible,
+        OutputCursorMode::SwPending,
+        OutputCursorMode::Hw,
+    );
     assert_eq!(failed.actual_mode, OutputCursorMode::Hw);
     assert!(failed.force_repaint);
     assert!(cursorless_hide_frame_required(
@@ -437,8 +577,11 @@ fn pending_show_output_receives_later_sprite_retry() {
 
 #[test]
 fn failed_unbound_show_records_hidden_and_clears_claimed_metadata() {
-    let resolution =
-        resolve_retired_cursor_state(CursorTransitionResult::Hidden, OutputCursorMode::Hw);
+    let resolution = resolve_retired_cursor_state(
+        CursorTransitionResult::Hidden,
+        OutputCursorMode::Hw,
+        OutputCursorMode::Hidden,
+    );
     assert_eq!(resolution.actual_mode, OutputCursorMode::Hidden);
     assert!(!resolution.commit_desired_metadata);
     assert!(resolution.clear_presented_metadata);
@@ -451,6 +594,7 @@ fn failed_hide_retains_actual_hw_and_last_known_metadata() {
         OutputCursorMode::Sw {
             prev: Some((10, 20)),
         },
+        OutputCursorMode::Hw,
     );
     assert_eq!(resolution.actual_mode, OutputCursorMode::Hw);
     assert!(!resolution.commit_desired_metadata);
@@ -461,6 +605,7 @@ fn failed_hide_retains_actual_hw_and_last_known_metadata() {
 fn failed_visible_rebind_forces_full_show_retry_without_claiming_version() {
     let resolution = resolve_retired_cursor_state(
         CursorTransitionResult::VisibleNeedsShowRetry,
+        OutputCursorMode::Hw,
         OutputCursorMode::Hw,
     );
     assert_eq!(resolution.actual_mode, OutputCursorMode::Hw);
