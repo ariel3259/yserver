@@ -25,6 +25,8 @@
 //! haven't retired the transition yet (the multi-output double-cursor
 //! hazard).
 
+pub(crate) mod ops;
+
 use std::{
     collections::{HashMap, HashSet},
     io, mem,
