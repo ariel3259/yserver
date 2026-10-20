@@ -84,6 +84,11 @@ mod path_install_tests {
         let crtc = events.backend.platform.outputs[0].output.crtc;
         let state = &events.backend.platform.devices[0].cursor;
         assert_eq!(state.state_path(), expected_path);
+        // Mutation: disable the installed position-only atomic cursor gate.
+        assert!(
+            state.atomic_cursor,
+            "installation must enable position-only atomic cursor support"
+        );
         assert_eq!(
             state.plane.as_ref().unwrap().state_path().reason,
             expected_reason

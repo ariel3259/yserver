@@ -465,8 +465,6 @@ impl CursorPlane {
             height,
             Some(CursorPlaneBuffer::Dumb(dumb)),
             crtcs,
-            #[cfg(test)]
-            None,
         ))
     }
 
@@ -482,7 +480,6 @@ impl CursorPlane {
         height: u32,
         dumb: Option<CursorPlaneBuffer>,
         active_crtcs: &[crtc::Handle],
-        #[cfg(test)] test_backing: Option<Box<[u8]>>,
     ) -> Self {
         let (explicit_plane_assignment, atomic_positions) =
             cursor_plane_topology(&discovery.crtcs, &discovery.planes);
@@ -525,7 +522,7 @@ impl CursorPlane {
             properties_by_crtc,
             state_path,
             #[cfg(test)]
-            _test_backing: test_backing,
+            _test_backing: None,
         };
         if !plane.supports_crtcs(active_crtcs) {
             log::warn!(
@@ -556,7 +553,7 @@ impl CursorPlane {
         let stride = stub.stride;
         let test_backing = stub._test_backing.take();
         drop(stub);
-        Self::from_discovery_and_backing(
+        let mut plane = Self::from_discovery_and_backing(
             device,
             buffer_io,
             discovery,
@@ -568,8 +565,9 @@ impl CursorPlane {
             height,
             None,
             crtcs,
-            test_backing,
-        )
+        );
+        plane._test_backing = test_backing;
+        plane
     }
 
     /// Build an ioctl-free cursor plane for platform state-machine tests.
