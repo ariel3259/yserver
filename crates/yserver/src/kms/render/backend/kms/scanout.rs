@@ -2206,7 +2206,7 @@ impl KmsBackend {
                     if timestamps.commit_id.is_some() && matched_event_id.is_none() {
                         continue;
                     }
-                    self.record_atomic_cursor_commit_retirement(output_idx);
+                    self.record_atomic_cursor_commit_retirement(output_idx, matched_event_id);
                 }
                 for seq in sequences {
                     self.on_crtc_sequence_event(
@@ -2234,7 +2234,7 @@ impl KmsBackend {
             if timestamps.commit_id.is_some() && matched_event_id.is_none() {
                 continue;
             }
-            self.record_atomic_cursor_commit_retirement(output_idx);
+            self.record_atomic_cursor_commit_retirement(output_idx, matched_event_id);
             let direct_retired = self.retire_direct_output(output_idx, matched_event_id, clock);
             let scene_retired = !direct_retired
                 && self.scene.handle_page_flip_complete(
@@ -2295,9 +2295,13 @@ impl KmsBackend {
         }
     }
 
-    fn record_atomic_cursor_commit_retirement(&mut self, output_idx: usize) {
+    fn record_atomic_cursor_commit_retirement(
+        &mut self,
+        output_idx: usize,
+        matched_event_id: Option<u64>,
+    ) {
         self.platform
-            .retire_atomic_cursor_commit_for_output(output_idx);
+            .retire_atomic_cursor_commit_for_output(output_idx, matched_event_id);
         let Some(layout) = self.platform.outputs.get(output_idx) else {
             return;
         };

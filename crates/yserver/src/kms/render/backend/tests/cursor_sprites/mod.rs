@@ -138,16 +138,50 @@ mod path_install_tests {
     }
 
     #[test]
-    // Mutation: allocate or bind a sprite through the pool during install.
-    fn installing_a_complete_plane_computes_atomic_but_changes_no_behavior() {
+    // Mutation: read the legacy visible map on Atomic, making the false hw_bound_on assertion fail.
+    fn atomic_install_ignores_legacy_visible_map_until_applied_state_exists() {
         let mut events = AtomicEventFixture::new(1);
         let ledger = install(&mut events, snapshot(1, None, Some("amdgpu")));
-        verify_position_only_move(
-            &mut events,
-            CursorStatePath::Atomic,
-            CursorPathReason::Qualified,
-            &ledger,
+        let crtc = events.backend.platform.outputs[0].output.crtc;
+        let state = &events.backend.platform.devices[0].cursor;
+        assert_eq!(state.state_path(), CursorStatePath::Atomic);
+        assert_eq!(
+            state.plane.as_ref().unwrap().state_path().reason,
+            CursorPathReason::Qualified
         );
+        events.backend.platform.devices[0]
+            .cursor
+            .plane
+            .as_mut()
+            .unwrap()
+            .for_tests_set_visible(crtc, true);
+        assert!(!events.backend.platform.devices[0].cursor.hw_bound_on(crtc));
+        Backend::warp_pointer_root(&mut events.backend, &mut events.state, 120, 110);
+        assert!(
+            !events.backend.platform.has_eligible_atomic_cursor_move(),
+            "a legacy visible-map entry is not an applied Atomic binding"
+        );
+        Backend::maybe_composite(&mut events.backend).expect("no Atomic cursor move");
+
+        let fd = events.backend.platform.devices[0]
+            .device
+            .as_fd()
+            .as_raw_fd();
+        assert!(super::support::accepted_live_records(&events.recorders[&fd]).is_empty());
+        assert!(
+            !events
+                .backend
+                .platform
+                .for_tests_atomic_cursor_commit_is_in_flight(
+                    events.backend.platform.devices[0].key,
+                    crtc,
+                )
+        );
+        let mut delivered = HashSet::new();
+        finish_fixture(&mut events, &mut delivered);
+        assert_no_cursor_resources(&events.backend, Some(&ledger));
+        assert_eq!(ledger.records(), []);
+        assert_eq!(ledger.end_state(), (0, 0, 0));
     }
 
     #[test]

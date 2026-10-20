@@ -63,6 +63,7 @@ impl KmsCursorState {
             plane: None,
             pending_move: None,
             pending_move_timestamp: None,
+            crtc_states: HashMap::new(),
             atomic_positions: HashMap::new(),
             atomic_pending_moves: HashMap::new(),
             atomic_cursor_commits_in_flight: HashMap::new(),
@@ -75,6 +76,18 @@ impl KmsCursorState {
             transient_fallback_crtcs: HashMap::new(),
             atomic_cursor: false,
             sprite_signature: None,
+        }
+    }
+
+    pub(crate) fn hw_bound_on(&self, crtc: ::drm::control::crtc::Handle) -> bool {
+        if self.state_path() == crate::kms::cursor_plane::topology::CursorStatePath::Atomic {
+            self.crtc_states
+                .get(&crtc)
+                .is_some_and(|state| state.applied.is_some())
+        } else {
+            self.plane
+                .as_ref()
+                .is_some_and(|plane| plane.is_visible_on(crtc))
         }
     }
 
@@ -383,11 +396,7 @@ impl PlatformBackend {
             if !device.cursor.atomic_cursor
                 || device.cursor.permanently_disabled
                 || device.cursor.cursor_hide_recovery.contains_key(&crtc)
-                || !device
-                    .cursor
-                    .plane
-                    .as_ref()
-                    .is_some_and(|plane| plane.is_visible_on(crtc))
+                || !device.cursor.hw_bound_on(crtc)
             {
                 continue;
             }
@@ -410,11 +419,7 @@ impl PlatformBackend {
                         && !device.cursor.cursor_retry_waits_for_flip.contains(crtc)
                         && !device.cursor.cursor_hide_recovery.contains_key(crtc)
                         && device.cursor.available_on(*crtc)
-                        && device
-                            .cursor
-                            .plane
-                            .as_ref()
-                            .is_some_and(|plane| plane.is_visible_on(*crtc))
+                        && device.cursor.hw_bound_on(*crtc)
                 })
         })
     }
@@ -505,10 +510,7 @@ impl PlatformBackend {
             || cursor.cursor_retry_waits_for_flip.contains(&crtc)
             || cursor.cursor_hide_recovery.contains_key(&crtc)
             || !cursor.available_on(crtc)
-            || !cursor
-                .plane
-                .as_ref()
-                .is_some_and(|plane| plane.is_visible_on(crtc))
+            || !cursor.hw_bound_on(crtc)
         {
             return Ok(CursorMoveOutcome::default());
         }
@@ -560,15 +562,23 @@ impl PlatformBackend {
         {
             latest.motion_timestamp = None;
         }
-        cursor
-            .atomic_cursor_commits_in_flight
-            .insert(crtc, position);
+        cursor.atomic_cursor_commits_in_flight.insert(
+            crtc,
+            crate::kms::render::platform::cursor_state::InFlightCursorCommit {
+                commit_id: None,
+                prepared: None,
+            },
+        );
         Ok(CursorMoveOutcome::default())
     }
 
     /// Attribute a flip event to this CRTC's cursor-only commit, if present.
     /// The caller still records general scene-commit latency independently.
-    pub(crate) fn retire_atomic_cursor_commit_for_output(&mut self, output_idx: usize) -> bool {
+    pub(crate) fn retire_atomic_cursor_commit_for_output(
+        &mut self,
+        output_idx: usize,
+        event_id: Option<u64>,
+    ) -> bool {
         let Some(layout) = self.outputs.get(output_idx) else {
             return false;
         };
@@ -584,8 +594,11 @@ impl PlatformBackend {
         let retired = device
             .cursor
             .atomic_cursor_commits_in_flight
-            .remove(&crtc)
-            .is_some();
+            .get(&crtc)
+            .is_some_and(|commit| commit.commit_id.is_none() || commit.commit_id == event_id);
+        if retired {
+            device.cursor.atomic_cursor_commits_in_flight.remove(&crtc);
+        }
         let retry_reenabled = device.cursor.cursor_retry_waits_for_flip.remove(&crtc);
         retired || retry_reenabled
     }
@@ -1170,11 +1183,7 @@ impl PlatformBackend {
             if state.permanently_disabled {
                 break;
             }
-            if !state
-                .plane
-                .as_ref()
-                .is_some_and(|plane| plane.is_visible_on(crtc))
-            {
+            if !state.hw_bound_on(crtc) {
                 continue;
             }
             let (cx, cy) = cursor_root_to_crtc_local(x, y, layout_x, layout_y, hot_x, hot_y);
@@ -1269,7 +1278,7 @@ impl PlatformBackend {
 
     /// True iff the set of CRTCs whose region the cursor footprint
     /// intersects differs from the set the plane is currently bound on
-    /// (`is_visible_on`).
+    /// (`hw_bound_on`).
     ///
     /// The pointer fast path (`cursor_plane_move`) only *repositions*
     /// the cursor on already-bound CRTCs — it never shows the plane on
@@ -1298,9 +1307,9 @@ impl PlatformBackend {
             let Some(device) = self.device_for_key(l.key.device_key) else {
                 continue;
             };
-            let Some(plane) = device.cursor.plane.as_ref() else {
+            if device.cursor.plane.is_none() {
                 continue;
-            };
+            }
             let dx = x - i32::from(hot_x) - l.x;
             let dy = y - i32::from(hot_y) - l.y;
             let intersects = cursor_footprint_intersects_output(
@@ -1311,7 +1320,7 @@ impl PlatformBackend {
                 i32::from(l.width),
                 i32::from(l.height),
             );
-            if intersects != plane.is_visible_on(l.output.crtc) {
+            if intersects != device.cursor.hw_bound_on(l.output.crtc) {
                 return true;
             }
         }
@@ -1354,11 +1363,7 @@ impl PlatformBackend {
         let Ok((device_idx, crtc, _, _)) = self.cursor_output_route(output_idx) else {
             return false;
         };
-        self.devices[device_idx]
-            .cursor
-            .plane
-            .as_ref()
-            .is_some_and(|plane| plane.is_visible_on(crtc))
+        self.devices[device_idx].cursor.hw_bound_on(crtc)
     }
 
     /// Physical cursor-plane state across the current output inventory.
@@ -1562,7 +1567,7 @@ impl PlatformBackend {
             device.cursor.pending_move = None;
             device.cursor.pending_move_timestamp = None;
             let permanently_disabled = device.cursor.permanently_disabled;
-            let Some(plane) = device.cursor.plane.as_mut() else {
+            let Some(plane) = device.cursor.plane.as_ref() else {
                 continue;
             };
             found = true;
@@ -1577,8 +1582,16 @@ impl PlatformBackend {
                 }
             }
             if permanently_disabled {
-                crtcs.retain(|crtc| plane.is_visible_on(*crtc));
+                let bound_crtcs: HashSet<_> = crtcs
+                    .iter()
+                    .copied()
+                    .filter(|crtc| device.cursor.hw_bound_on(*crtc))
+                    .collect();
+                crtcs.retain(|crtc| bound_crtcs.contains(crtc));
             }
+            let Some(plane) = device.cursor.plane.as_mut() else {
+                continue;
+            };
             for crtc in crtcs {
                 if let Err(error) = plane.hide(crtc) {
                     if error.kind() == io::ErrorKind::PermissionDenied {
@@ -1619,12 +1632,11 @@ impl PlatformBackend {
             .enumerate()
             .filter_map(|(output_idx, layout)| {
                 let device = self.device_for_key(layout.key.device_key)?;
-                device
-                    .cursor
-                    .plane
-                    .as_ref()
-                    .is_some_and(|plane| plane.is_visible_on(layout.output.crtc))
-                    .then_some((output_idx, device.key, layout.output.crtc))
+                device.cursor.hw_bound_on(layout.output.crtc).then_some((
+                    output_idx,
+                    device.key,
+                    layout.output.crtc,
+                ))
             })
             .collect();
         log::info!(
