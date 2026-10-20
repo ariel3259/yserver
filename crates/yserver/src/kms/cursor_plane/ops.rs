@@ -174,9 +174,9 @@ impl CursorBufferIo for DrmCursorBufferIo {
             .dumb
             .as_mut()
             .ok_or_else(|| io::Error::other("recording cursor token used by DRM mapper"))?;
-        let mapping = device.map_dumb_buffer(raw_dumb)?;
+        let mut mapping = device.map_dumb_buffer(raw_dumb)?;
         let len = mapping.len();
-        let ptr = NonNull::new(mapping.as_ptr() as *mut u8)
+        let ptr = NonNull::new(mapping.as_mut_ptr())
             .ok_or_else(|| io::Error::other("non-null dumb mapping expected"))?;
         std::mem::forget(mapping);
         Ok(CursorMapping {
@@ -497,6 +497,17 @@ fn write_mapped_image(
     image_height: u32,
     bgra_bytes: &[u8],
 ) -> io::Result<()> {
+    if image_width == 0
+        || image_height == 0
+        || image_width > capacity_width
+        || image_height > capacity_height
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cursor image dimensions must be nonzero and fit the mapped framebuffer geometry",
+        ));
+    }
+
     let pitch = usize::try_from(stride)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "cursor pitch overflow"))?;
     let row_len = usize::try_from(image_width)
@@ -507,7 +518,20 @@ fn write_mapped_image(
         .ok()
         .and_then(|width| width.checked_mul(4))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "cursor width overflow"))?;
-    if row_len > pitch || capacity_row_len > pitch || image_height > capacity_height {
+    let image_len = row_len
+        .checked_mul(
+            usize::try_from(image_height).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "cursor height overflow")
+            })?,
+        )
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "cursor byte size overflow"))?;
+    if bgra_bytes.len() != image_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cursor bytes must equal width*height*4",
+        ));
+    }
+    if row_len > pitch || capacity_row_len > pitch {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "cursor image does not fit the mapped framebuffer geometry",
@@ -735,8 +759,8 @@ mod tests {
         assert_eq!(ledger.end_state(), (0, 0, 0));
     }
 
-    // Mutation: remove the capacity check or accept a short byte slice; every invalid request must
-    // remain InvalidInput and leave the complete mapping unchanged.
+    // Mutations: remove the capacity check, accept a short byte slice, or clear before validation;
+    // every invalid request must remain InvalidInput and leave the seeded mapping unchanged.
     #[test]
     fn cursor_buffer_rejects_oversize_and_wrong_length() {
         let device = test_device();
@@ -747,6 +771,10 @@ mod tests {
             "cursor buffer allocation should succeed"
         );
         let mut buffer = allocation.expect("checked cursor buffer allocation");
+        let initial_image = [0x5a; 2 * 2 * 4];
+        buffer
+            .write_image(2, 2, &initial_image)
+            .expect("seed mapping before invalid requests");
         let original = buffer.for_tests_bytes();
 
         let too_wide = vec![1; 71 * 64 * 4];
@@ -770,6 +798,61 @@ mod tests {
         }
 
         buffer.release().expect("cursor buffer release");
+        assert_eq!(ledger.end_state(), (0, 0, 0));
+    }
+
+    // Mutations: allow overlong input by weakening the exact-size check, or remove the image-width
+    // capacity guard; the raw I/O boundary must reject both before changing the mapping.
+    #[test]
+    fn cursor_buffer_io_write_rejects_invalid_images_before_mutation() {
+        let device = test_device();
+        let fd = device.as_fd().as_raw_fd();
+        let (buffer_io, ledger) = RecordingCursorBufferIo::new(256);
+        let mut dumb = buffer_io
+            .create_dumb(&device, CursorFramebufferDescriptor::argb8888(4, 4))
+            .expect("recording cursor dumb buffer");
+        let mapping = buffer_io
+            .map_dumb(&device, &mut dumb)
+            .expect("recording cursor mapping");
+
+        let initial_image = [0x6b; 2 * 2 * 4];
+        buffer_io
+            .write_image(&mapping, dumb.pitch(), 4, 4, 2, 2, &initial_image)
+            .expect("seed raw mapping before invalid requests");
+        let original = ledger
+            .mapped_bytes(fd, dumb.handle())
+            .expect("recorded mapped bytes");
+
+        let overlong = [0x7c; 2 * 2 * 4 + 1];
+        let too_wide = [0x8d; 5 * 2 * 4];
+        let too_tall = [0x9e; 2 * 5 * 4];
+        let short = [0xaf; 2 * 2 * 4 - 1];
+        for (width, height, bytes) in [
+            (2, 2, overlong.as_slice()),
+            (5, 2, too_wide.as_slice()),
+            (2, 5, too_tall.as_slice()),
+            (0, 2, &[]),
+            (2, 0, &[]),
+            (2, 2, short.as_slice()),
+        ] {
+            let result = buffer_io.write_image(&mapping, dumb.pitch(), 4, 4, width, height, bytes);
+            assert!(
+                result.is_err(),
+                "raw invalid cursor image {width}x{height} must be rejected"
+            );
+            let error = result.expect_err("checked raw invalid cursor image");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                ledger.mapped_bytes(fd, dumb.handle()),
+                Some(original.clone()),
+                "raw invalid cursor image {width}x{height} must not mutate the mapping"
+            );
+        }
+
+        buffer_io.unmap_dumb(&device, &dumb, mapping);
+        buffer_io
+            .destroy_dumb(&device, dumb)
+            .expect("destroy raw cursor dumb buffer");
         assert_eq!(ledger.end_state(), (0, 0, 0));
     }
 
