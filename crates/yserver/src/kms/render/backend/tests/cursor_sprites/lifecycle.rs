@@ -1,8 +1,8 @@
 use super::support::{
     AtomicPathFixture, CompletionKey, PathKind, accept_cursor_detach, accepted_live_records,
-    applied_cursor_binding, compose_until_cursor_commit_where, create_argb_cursor,
-    define_root_cursor, finish_atomic_fixture, has_unretired_accepted_event, record_count,
-    record_property, retire_cursor_record, retire_pending_output, sprite_users,
+    applied_cursor_binding, assert_no_cursor_resources, compose_until_cursor_commit_where,
+    create_argb_cursor, define_root_cursor, finish_atomic_fixture, has_unretired_accepted_event,
+    record_count, record_property, retire_cursor_record, retire_pending_output, sprite_users,
 };
 use crate::{
     drm::{
@@ -356,6 +356,14 @@ fn finish_and_check(fixture: AtomicPathFixture, delivered: &mut HashSet<Completi
 }
 
 fn finish_after_output_disable(fixture: AtomicPathFixture) {
+    finish_after_output_disable_inner(fixture, false);
+}
+
+fn finish_after_output_disable_and_check(fixture: AtomicPathFixture) {
+    finish_after_output_disable_inner(fixture, true);
+}
+
+fn finish_after_output_disable_inner(fixture: AtomicPathFixture, check_quiescence: bool) {
     let ledger = Rc::clone(&fixture.ledger);
     let mut scene = fixture.scene;
     let root = scene.events.backend.core.window_id;
@@ -381,6 +389,10 @@ fn finish_after_output_disable(fixture: AtomicPathFixture) {
     }
     for _ in 0..32 {
         Backend::before_block(&mut scene.events.backend);
+    }
+    if check_quiescence {
+        scene.assert_quiescent();
+        assert_no_cursor_resources(&scene.events.backend, None);
     }
     scene.finish();
     assert_eq!(ledger.end_state(), (0, 0, 0));
@@ -1357,7 +1369,7 @@ fn p2_discard_releases_the_prior_of_a_discarded_in_flight_commit() {
         .backend
         .disable_output()
         .expect("shutdown detaches the retained bindings after DPMS discard");
-    finish_after_output_disable(fixture);
+    finish_after_output_disable_and_check(fixture);
 }
 
 #[test]
