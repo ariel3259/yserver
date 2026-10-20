@@ -287,21 +287,7 @@ impl PlatformBackend {
             .get(&crtc)
             .and_then(|commit| commit.prepared.as_ref())
             .and_then(|prepared| prepared.prior);
-        let mut leases = Vec::with_capacity(2);
-        for binding in [applied, prior].into_iter().flatten() {
-            if !leases.contains(&binding.lease) {
-                leases.push(binding.lease);
-            }
-        }
-        if let Some(plane) = self.devices[device_idx].cursor.plane.as_mut() {
-            for lease in leases {
-                if !plane.sprites_mut().release_user(lease) {
-                    log::error!(
-                        "render cursor: all-off CRTC cleanup found no user for sprite lease"
-                    );
-                }
-            }
-        }
+        self.release_cursor_bindings_once(device_idx, [applied, prior], "all-off CRTC cleanup");
         let cursor = &mut self.devices[device_idx].cursor;
         cursor.crtc_states.remove(&crtc);
         cursor.atomic_cursor_commits_in_flight.remove(&crtc);
@@ -877,8 +863,8 @@ impl PlatformBackend {
     /// Drop atomic per-CRTC state only after the old-event drain has proved
     /// that no cursor-only flip can be attributed to the next topology epoch.
     pub(crate) fn clear_atomic_cursor_state_after_old_events_discard(&mut self) {
-        for device in &mut self.devices {
-            let discarded_priors: Vec<_> = device
+        for device_idx in 0..self.devices.len() {
+            let discarded_priors: Vec<_> = self.devices[device_idx]
                 .cursor
                 .atomic_cursor_commits_in_flight
                 .values()
@@ -888,23 +874,18 @@ impl PlatformBackend {
                         prepared.next.is_none_or(|next| next.lease != prior.lease)
                     })
                 })
-                .filter_map(|prepared| prepared.prior.map(|prior| prior.lease))
+                .map(|prepared| prepared.prior)
                 .collect();
-            if let Some(plane) = device.cursor.plane.as_mut() {
-                for lease in discarded_priors {
-                    if !plane.sprites_mut().release_user(lease) {
-                        log::error!(
-                            "render cursor: discarded old event found no user for prior sprite lease"
-                        );
-                    }
-                }
+            for prior in discarded_priors {
+                self.release_cursor_bindings_once(device_idx, [prior], "discarded old event");
             }
-            device.cursor.atomic_positions.clear();
-            device.cursor.atomic_pending_moves.clear();
-            device.cursor.atomic_cursor_commits_in_flight.clear();
-            device.cursor.cursor_retry_waits_for_flip.clear();
-            device.cursor.cursor_hide_recovery.clear();
-            device.cursor.transient_fallback_crtcs.clear();
+            let cursor = &mut self.devices[device_idx].cursor;
+            cursor.atomic_positions.clear();
+            cursor.atomic_pending_moves.clear();
+            cursor.atomic_cursor_commits_in_flight.clear();
+            cursor.cursor_retry_waits_for_flip.clear();
+            cursor.cursor_hide_recovery.clear();
+            cursor.transient_fallback_crtcs.clear();
         }
     }
 

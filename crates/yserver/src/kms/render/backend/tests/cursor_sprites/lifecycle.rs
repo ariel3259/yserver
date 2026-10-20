@@ -1215,20 +1215,26 @@ fn p2_shutdown_settles_an_unretired_hide_and_observes_successful_disable() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: discard the ID-tagged replacement record without releasing its
-// prior lease, or release that prior twice while preserving the applied B user.
+// Mutation: discard without releasing the prior, or release it twice; the
+// shared live CRTC user must remain at one after the discard.
 fn p2_discard_releases_the_prior_of_a_discarded_in_flight_commit() {
-    let Some(mut fixture) = fixture(1) else {
+    let Some(mut fixture) = fixture(2) else {
         return;
     };
     let mut delivered = HashSet::new();
-    let cursor_a = create_argb_cursor(
-        &mut fixture.scene.events.backend,
-        (4, 4),
-        [0x11, 0x22, 0x33, 0xff],
-        (1, 1),
+    let [binding_a, live_binding] = establish_two_overlapping_cursors(&mut fixture, &mut delivered);
+    assert_eq!(binding_a.lease, live_binding.lease);
+    assert_eq!(
+        fixture.scene.events.backend.platform.devices[0]
+            .cursor
+            .plane
+            .as_ref()
+            .unwrap()
+            .sprites()
+            .user_count(binding_a.lease),
+        Some(2),
+        "both CRTCs retain the shared prior sprite before replacement",
     );
-    super::support::establish_hardware_cursor(&mut fixture, &mut delivered, cursor_a, (140, 100));
     let binding_a = applied_cursor_binding(&fixture.scene.events.backend, 0).unwrap();
     let cursor_b = create_argb_cursor(
         &mut fixture.scene.events.backend,
@@ -1256,34 +1262,59 @@ fn p2_discard_releases_the_prior_of_a_discarded_in_flight_commit() {
     let binding_b = applied_cursor_binding(&fixture.scene.events.backend, 0).unwrap();
     assert_eq!(
         sprite_users(&fixture.scene.events.backend, 0, binding_a.lease),
-        Some(1)
+        Some(2),
+        "replacement keeps both the displaced and live CRTC owners until discard",
     );
     assert_eq!(
         sprite_users(&fixture.scene.events.backend, 0, binding_b.lease),
         Some(1)
     );
-    // DPMS-off tries once before disable and the post-disable scene drain tries
-    // again; both failures keep B applied while event discard owns A's release.
-    failed_detaches(&fixture, 2);
+    // DPMS all-off discards the unretired replacement. The second CRTC keeps
+    // A live, making a duplicate release of the discarded prior observable.
+    failed_detaches(&fixture, 4);
     fixture
         .scene
         .events
         .backend
         .platform
         .for_tests_accept_output_power_commits();
+    let crtc_a = fixture.scene.events.backend.platform.outputs[0].output.crtc;
     fixture.scene.events.queue_commit_completion(
         fd,
-        fixture.scene.events.backend.platform.outputs[0].output.crtc,
+        crtc_a,
         replacement_id,
         69,
         Duration::from_millis(69),
     );
-
+    let live_crtc = fixture.scene.events.backend.platform.outputs[1].output.crtc;
+    let live_event_id = accepted_live_records(&fixture.scene.events.recorders[&fd])
+        .into_iter()
+        .find_map(|record| {
+            let id =
+                crate::kms::render::backend::tests::commit_identity::support::accepted_event_id(
+                    &record,
+                )?;
+            (record.events.iter().any(|event| event.crtc == live_crtc)
+                && !delivered.contains(&CompletionKey {
+                    device_fd: fd,
+                    crtc: live_crtc,
+                    commit_id: id,
+                }))
+            .then_some(id)
+        })
+        .expect("live CRTC has its accepted scene event queued for the all-off drain");
+    fixture.scene.events.queue_commit_completion(
+        fd,
+        live_crtc,
+        live_event_id,
+        70,
+        Duration::from_millis(70),
+    );
     Backend::set_dpms_power(&mut fixture.scene.events.backend, 3)
-        .expect("all-off boundary succeeds after the failed detach");
+        .expect("all-off DPMS boundary succeeds after the failed detaches");
     delivered.insert(CompletionKey {
         device_fd: fd,
-        crtc: fixture.scene.events.backend.platform.outputs[0].output.crtc,
+        crtc: crtc_a,
         commit_id: replacement_id,
     });
 
@@ -1292,12 +1323,24 @@ fn p2_discard_releases_the_prior_of_a_discarded_in_flight_commit() {
         Some(binding_b)
     );
     assert_eq!(
-        sprite_users(&fixture.scene.events.backend, 0, binding_a.lease),
-        Some(0)
+        applied_cursor_binding(&fixture.scene.events.backend, 1),
+        Some(live_binding)
+    );
+    assert_eq!(
+        fixture.scene.events.backend.platform.devices[0]
+            .cursor
+            .plane
+            .as_ref()
+            .unwrap()
+            .sprites()
+            .user_count(binding_a.lease),
+        Some(1),
+        "discard releases the prior once and preserves the shared live CRTC user",
     );
     assert_eq!(
         sprite_users(&fixture.scene.events.backend, 0, binding_b.lease),
-        Some(1)
+        Some(1),
+        "discard preserves the replacement's applied user",
     );
     assert!(
         !fixture
@@ -1308,21 +1351,13 @@ fn p2_discard_releases_the_prior_of_a_discarded_in_flight_commit() {
             .cursor_commit_in_flight_for_output(0)
     );
 
-    Backend::set_dpms_power(&mut fixture.scene.events.backend, 0)
-        .expect("restore output before the normal Backend hide");
-    Backend::set_cursor_hidden(&mut fixture.scene.events.backend, true);
-    damage_root(&mut fixture.scene.events.backend);
-    let offset = record_count(&fixture, fd);
-    let hide = compose_until_cursor_commit_where(
-        &mut fixture,
-        &mut delivered,
-        0,
-        offset,
-        binding_b.properties.fb_id,
-        |record| record_property(record, binding_b.properties.fb_id) == Some(0),
-    );
-    retire_cursor_record(&mut fixture, &mut delivered, 0, &hide, 70);
-    finish_and_check(fixture, &mut delivered);
+    fixture
+        .scene
+        .events
+        .backend
+        .disable_output()
+        .expect("shutdown detaches the retained bindings after DPMS discard");
+    finish_after_output_disable(fixture);
 }
 
 #[test]

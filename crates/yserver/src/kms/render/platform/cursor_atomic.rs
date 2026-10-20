@@ -17,6 +17,30 @@ use crate::{
 };
 
 impl PlatformBackend {
+    /// Release the distinct sprite users carried by one ownership transition.
+    /// Several cursor records can refer to the same lease, but they represent
+    /// one owner for a CRTC and must only decrement the pool once.
+    pub(super) fn release_cursor_bindings_once(
+        &mut self,
+        device_idx: usize,
+        bindings: impl IntoIterator<Item = Option<CursorBinding>>,
+        owner: &str,
+    ) {
+        let mut leases: Vec<SpriteBufferLease> = Vec::new();
+        for binding in bindings.into_iter().flatten() {
+            if !leases.contains(&binding.lease) {
+                leases.push(binding.lease);
+            }
+        }
+        if let Some(plane) = self.devices[device_idx].cursor.plane.as_mut() {
+            for lease in leases {
+                if !plane.sprites_mut().release_user(lease) {
+                    log::error!("render cursor: {owner} found no user for sprite lease");
+                }
+            }
+        }
+    }
+
     pub(super) fn atomic_show(
         &mut self,
         output_idx: usize,
@@ -338,19 +362,7 @@ impl PlatformBackend {
             return Err(error);
         }
 
-        let mut release_leases: Vec<SpriteBufferLease> = Vec::new();
-        for binding in [applied, flight_prior].into_iter().flatten() {
-            if !release_leases.contains(&binding.lease) {
-                release_leases.push(binding.lease);
-            }
-        }
-        if let Some(plane) = self.devices[device_idx].cursor.plane.as_mut() {
-            for lease in release_leases {
-                if !plane.sprites_mut().release_user(lease) {
-                    log::error!("render cursor: blocking detach found no user for sprite lease");
-                }
-            }
-        }
+        self.release_cursor_bindings_once(device_idx, [applied, flight_prior], "blocking detach");
         if let Some(commit) = self.devices[device_idx]
             .cursor
             .atomic_cursor_commits_in_flight
