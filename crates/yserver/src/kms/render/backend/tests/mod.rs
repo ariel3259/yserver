@@ -1,7 +1,8 @@
 mod atomic_cursor;
-mod commit_identity;
+pub(super) mod commit_identity;
 mod crossings;
 mod cursor;
+mod cursor_sprites;
 mod deadlines;
 mod dri3;
 mod gc_draw;
