@@ -269,10 +269,6 @@ pub const HW_CURSOR_FALLBACK_H: u32 = 64;
 /// Sw→Hw transition before another.
 pub struct CursorPlane {
     device: Rc<Device>,
-    #[allow(dead_code, reason = "consumed by P2b Task 2 cursor-state assembly")]
-    caps: Option<CursorDeviceCaps>,
-    #[allow(dead_code, reason = "consumed by P2b Task 2 cursor-state assembly")]
-    discovery: CursorPlaneDiscovery,
     buffer_io: Rc<dyn CursorBufferIo>,
     sprites: SpritePool,
     hide_executor: Rc<dyn CursorHideExecutor>,
@@ -303,7 +299,6 @@ pub struct CursorPlane {
     /// Atomic position properties of each CRTC's assigned plane. This is
     /// topology discovery data and must survive `retain_crtcs`.
     atomic_positions: HashMap<crtc::Handle, (plane::Handle, property::Handle, property::Handle)>,
-    #[allow(dead_code, reason = "consumed by P2b Task 2 cursor-state assembly")]
     properties_by_crtc: HashMap<crtc::Handle, CursorPlaneProperties>,
     state_path: CursorPathDecision,
     /// In-memory storage for the ioctl-free test factory. Production cursor
@@ -524,8 +519,6 @@ impl CursorPlane {
         sprites.set_active_crtc_count(active_crtcs.len());
         let plane = Self {
             device,
-            caps,
-            discovery,
             buffer_io,
             sprites,
             hide_executor: Rc::new(DrmCursorHideExecutor),
@@ -614,8 +607,6 @@ impl CursorPlane {
         sprites.set_active_crtc_count(0);
         Self {
             device: Rc::clone(&device),
-            caps,
-            discovery,
             buffer_io: Rc::new(DrmCursorBufferIo),
             sprites,
             hide_executor: Rc::new(DrmCursorHideExecutor),
@@ -680,10 +671,6 @@ impl CursorPlane {
     }
 
     #[cfg(test)]
-    #[allow(
-        dead_code,
-        reason = "consumed by P2b Task 2 cursor-state submission tests"
-    )]
     pub(crate) fn for_tests_set_show_executor(&mut self, executor: Rc<dyn CursorShowExecutor>) {
         self.show_executor = executor;
     }
@@ -699,12 +686,10 @@ impl CursorPlane {
         self.state_path
     }
 
-    #[allow(dead_code, reason = "consumed by P2b Task 2 cursor-state assembly")]
     pub(crate) fn properties_for(&self, crtc: crtc::Handle) -> Option<CursorPlaneProperties> {
         self.properties_by_crtc.get(&crtc).copied()
     }
 
-    #[allow(dead_code, reason = "consumed by P2b Task 2 sprite-pool lifecycle")]
     pub(crate) fn sprites(&self) -> &SpritePool {
         &self.sprites
     }
@@ -713,7 +698,6 @@ impl CursorPlane {
         &mut self.sprites
     }
 
-    #[allow(dead_code, reason = "consumed by P2b Task 2 cursor buffer staging")]
     pub(crate) fn buffer_io(&self) -> Rc<dyn CursorBufferIo> {
         Rc::clone(&self.buffer_io)
     }
@@ -730,7 +714,6 @@ impl CursorPlane {
 
     /// Atomic plane and position properties for `crtc`, if its assigned
     /// cursor plane exposes both `CRTC_X` and `CRTC_Y`.
-    #[allow(dead_code)] // consumed by the scene commit path in Task 2
     #[must_use]
     pub(crate) fn atomic_position_properties(
         &self,

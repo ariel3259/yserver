@@ -125,12 +125,12 @@ impl KmsCursorState {
         }
     }
 
-    fn clear_atomic_position(&mut self, crtc: ::drm::control::crtc::Handle) {
+    pub(super) fn clear_atomic_position(&mut self, crtc: ::drm::control::crtc::Handle) {
         self.atomic_positions.remove(&crtc);
         self.atomic_pending_moves.remove(&crtc);
     }
 
-    fn available_on(&self, crtc: ::drm::control::crtc::Handle) -> bool {
+    pub(super) fn available_on(&self, crtc: ::drm::control::crtc::Handle) -> bool {
         self.plane.is_some()
             && !self.permanently_disabled
             && !self.topology_blocked
@@ -153,7 +153,7 @@ impl KmsCursorState {
         retry.remaining_sw_retires = 1_u8 << shift;
     }
 
-    fn note_cursor_success(&mut self, crtc: ::drm::control::crtc::Handle) {
+    pub(super) fn note_cursor_success(&mut self, crtc: ::drm::control::crtc::Handle) {
         self.transient_fallback_crtcs.remove(&crtc);
         self.cursor_hide_recovery.remove(&crtc);
     }
@@ -591,14 +591,23 @@ impl PlatformBackend {
         else {
             return false;
         };
-        let retired = device
+        let should_retire = device
             .cursor
             .atomic_cursor_commits_in_flight
             .get(&crtc)
             .is_some_and(|commit| commit.commit_id.is_none() || commit.commit_id == event_id);
-        if retired {
-            device.cursor.atomic_cursor_commits_in_flight.remove(&crtc);
+        let removed = should_retire
+            .then(|| device.cursor.atomic_cursor_commits_in_flight.remove(&crtc))
+            .flatten();
+        if let Some(prepared) = removed.as_ref().and_then(|commit| commit.prepared.as_ref())
+            && let Some(prior) = prepared.prior
+            && prepared.next.is_none_or(|next| prior.lease != next.lease)
+            && let Some(plane) = device.cursor.plane.as_mut()
+            && !plane.sprites_mut().release_user(prior.lease)
+        {
+            log::error!("render cursor: retired commit had no user for its prior sprite lease");
         }
+        let retired = removed.is_some();
         let retry_reenabled = device.cursor.cursor_retry_waits_for_flip.remove(&crtc);
         retired || retry_reenabled
     }
@@ -968,17 +977,50 @@ impl PlatformBackend {
         &mut self,
         output_idx: usize,
         version: u64,
-        _hot_x: u16,
-        _hot_y: u16,
+        hot_x: u16,
+        hot_y: u16,
         width: u32,
         height: u32,
         bgra_bytes: &[u8],
     ) -> io::Result<crate::kms::render::scene::CursorUploadOutcome> {
         let (device_idx, crtc, _, _) = self.cursor_output_route(output_idx)?;
-        let state = &mut self.devices[device_idx].cursor;
-        if !state.available_on(crtc) {
+        if !self.devices[device_idx].cursor.available_on(crtc) {
             return Err(io::Error::other("cursor plane unavailable for output"));
         }
+        if self.devices[device_idx].cursor.state_path()
+            == crate::kms::cursor_plane::topology::CursorStatePath::Atomic
+        {
+            let device = Rc::clone(&self.devices[device_idx].device);
+            let result = {
+                let plane = self.devices[device_idx]
+                    .cursor
+                    .plane
+                    .as_mut()
+                    .expect("available cursor state has a plane");
+                let buffer_io = plane.buffer_io();
+                plane.sprites_mut().prepare(
+                    device, buffer_io, version, hot_x, hot_y, width, height, bgra_bytes,
+                )
+            };
+            return match result {
+                Ok(crate::kms::cursor_plane::sprites::SpriteStage::Ready) => {
+                    Ok(crate::kms::render::scene::CursorUploadOutcome::Ready)
+                }
+                Ok(crate::kms::cursor_plane::sprites::SpriteStage::Deferred) => {
+                    Ok(crate::kms::render::scene::CursorUploadOutcome::Deferred)
+                }
+                Err(error) => {
+                    let classification_error = Err(io::Error::new(error.kind(), error.to_string()));
+                    apply_cursor_operation_result(
+                        &mut self.devices[device_idx].cursor,
+                        crtc,
+                        &classification_error,
+                    );
+                    Err(error)
+                }
+            };
+        }
+        let state = &mut self.devices[device_idx].cursor;
         let result = state
             .plane
             .as_mut()
@@ -996,18 +1038,23 @@ impl PlatformBackend {
         &self,
         output_idx: usize,
         version: u64,
-        _hot_x: u16,
-        _hot_y: u16,
+        hot_x: u16,
+        hot_y: u16,
     ) -> bool {
         let Ok((device_idx, _, _, _)) = self.cursor_output_route(output_idx) else {
             return false;
         };
-        self.devices[device_idx]
-            .cursor
-            .plane
-            .as_ref()
-            .and_then(|plane| plane.uploaded_version())
-            == Some(version)
+        let cursor = &self.devices[device_idx].cursor;
+        cursor.plane.as_ref().is_some_and(|plane| {
+            if cursor.state_path() == crate::kms::cursor_plane::topology::CursorStatePath::Atomic {
+                plane
+                    .sprites()
+                    .candidate_lease()
+                    .is_some_and(|lease| lease.matches(version, hot_x, hot_y))
+            } else {
+                plane.uploaded_version() == Some(version)
+            }
+        })
     }
 
     /// Bind the plane on `output_idx`'s CRTC + position at `(x, y)`
@@ -1025,6 +1072,16 @@ impl PlatformBackend {
         x: i32,
         y: i32,
     ) -> Result<(), crate::kms::cursor_plane::CursorShowError> {
+        if self
+            .cursor_output_route(output_idx)
+            .ok()
+            .is_some_and(|(device_idx, _, _, _)| {
+                self.devices[device_idx].cursor.state_path()
+                    == crate::kms::cursor_plane::topology::CursorStatePath::Atomic
+            })
+        {
+            return self.atomic_show(output_idx, hot_x, hot_y, x, y);
+        }
         let (device_idx, crtc, layout_x, layout_y) = self
             .cursor_output_route(output_idx)
             .map_err(crate::kms::cursor_plane::CursorShowError::Unbound)?;
@@ -1335,6 +1392,16 @@ impl PlatformBackend {
     /// `NotFound` if `output_idx` is out of range or plane is
     /// unavailable; `set_cursor2` ioctl failure otherwise.
     pub(crate) fn cursor_plane_hide_on_crtc(&mut self, output_idx: usize) -> io::Result<()> {
+        if self
+            .cursor_output_route(output_idx)
+            .ok()
+            .is_some_and(|(device_idx, _, _, _)| {
+                self.devices[device_idx].cursor.state_path()
+                    == crate::kms::cursor_plane::topology::CursorStatePath::Atomic
+            })
+        {
+            return self.atomic_hide(output_idx);
+        }
         let (device_idx, crtc, _, _) = self.cursor_output_route(output_idx)?;
         // A disabled device still owns a plane its failed hides left bound.
         if self.devices[device_idx].cursor.permanently_disabled

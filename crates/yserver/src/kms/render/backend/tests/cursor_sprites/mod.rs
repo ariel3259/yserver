@@ -1,3 +1,4 @@
+mod scene_attach;
 mod support;
 
 #[cfg(test)]

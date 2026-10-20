@@ -2,16 +2,36 @@ use crate::{
     drm::atomic::tests_support::{
         AtomicCommitRecord, RecordingAtomicCommitExecutor, ScriptedResult,
     },
-    kms::{cursor_plane::ops::recording::CursorBufferLedger, render::backend::KmsBackend},
+    kms::{
+        cursor_plane::{
+            CursorHideExecutor, CursorPlaneBuffer, CursorShowExecutor,
+            ops::{
+                CursorBufferIo,
+                recording::{CursorBufferLedger, RecordingCursorBufferIo},
+            },
+            sprites::SpriteBufferLease,
+            topology::{
+                CursorPlaneProperties, CursorPlaneTestPlane, CursorPlaneTestSnapshot,
+                CursorStatePath,
+            },
+        },
+        render::{backend::KmsBackend, platform::cursor_state::CursorBinding},
+    },
 };
 use std::{
+    cell::Cell,
     collections::HashSet,
+    io,
     os::fd::{AsFd as _, AsRawFd as _, RawFd},
+    rc::Rc,
     time::Duration,
 };
 use yserver_core::backend::{AnyHandle, Backend, CursorHandle};
 
-use super::super::commit_identity::support::{AtomicEventFixture, accepted_event_id};
+use super::super::commit_identity::{
+    recording_scene::{DirectPresentSetup, RecordingSceneFixture},
+    support::{AtomicEventFixture, accepted_event_id},
+};
 
 pub(crate) fn create_argb_cursor(
     backend: &mut KmsBackend,
@@ -38,9 +58,14 @@ pub(crate) fn create_argb_cursor(
         Backend::render_create_picture(backend, None, AnyHandle::Pixmap(source), 0, 0, &[])
             .expect("create ARGB cursor picture")
             .expect("picture handle");
-    Backend::render_create_cursor(backend, None, picture, hotspot.0, hotspot.1)
+    let cursor = Backend::render_create_cursor(backend, None, picture, hotspot.0, hotspot.1)
         .expect("create ARGB cursor")
-        .expect("cursor handle")
+        .expect("cursor handle");
+    Backend::render_free_picture(backend, None, picture.as_raw())
+        .expect("free ARGB cursor picture after cursor creation");
+    Backend::free_pixmap(backend, None, source.as_raw())
+        .expect("free ARGB cursor source pixmap after cursor creation");
+    cursor
 }
 
 pub(crate) fn create_bitmap_cursor(backend: &mut KmsBackend, visible: bool) -> CursorHandle {
@@ -56,7 +81,7 @@ pub(crate) fn create_bitmap_cursor(backend: &mut KmsBackend, visible: bool) -> C
             .expect("write transparent mask bit");
         Some(mask)
     };
-    Backend::create_cursor(
+    let cursor = Backend::create_cursor(
         backend,
         None,
         source,
@@ -66,12 +91,687 @@ pub(crate) fn create_bitmap_cursor(backend: &mut KmsBackend, visible: bool) -> C
         0,
         0,
     )
-    .expect("create bitmap cursor")
+    .expect("create bitmap cursor");
+    Backend::free_pixmap(backend, None, source.as_raw())
+        .expect("free bitmap cursor source pixmap after cursor creation");
+    if let Some(mask) = mask {
+        Backend::free_pixmap(backend, None, mask.as_raw())
+            .expect("free bitmap cursor mask pixmap after cursor creation");
+    }
+    cursor
 }
 
 pub(crate) fn define_root_cursor(backend: &mut KmsBackend, cursor: CursorHandle) {
     Backend::define_cursor(backend, None, backend.core.window_id, cursor.as_raw())
         .expect("define root cursor");
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PathKind {
+    Physical,
+    Paravirtualized,
+}
+
+#[derive(Default)]
+pub(crate) struct RecordingLegacyCursor {
+    pub(crate) show_calls: Cell<usize>,
+    pub(crate) move_calls: Cell<usize>,
+    pub(crate) hide_calls: Cell<usize>,
+}
+
+impl CursorShowExecutor for RecordingLegacyCursor {
+    fn show(
+        &self,
+        _device: &crate::drm::Device,
+        _buffer: &CursorPlaneBuffer,
+        _crtc: ::drm::control::crtc::Handle,
+        _hotspot: (i32, i32),
+        _img_x: i32,
+        _img_y: i32,
+    ) -> io::Result<()> {
+        self.show_calls.set(self.show_calls.get() + 1);
+        Ok(())
+    }
+
+    fn move_to(
+        &self,
+        _device: &crate::drm::Device,
+        _crtc: ::drm::control::crtc::Handle,
+        _img_x: i32,
+        _img_y: i32,
+    ) -> io::Result<()> {
+        self.move_calls.set(self.move_calls.get() + 1);
+        Ok(())
+    }
+}
+
+impl CursorHideExecutor for RecordingLegacyCursor {
+    fn hide(
+        &self,
+        _device: &crate::drm::Device,
+        _crtc: ::drm::control::crtc::Handle,
+    ) -> io::Result<()> {
+        self.hide_calls.set(self.hide_calls.get() + 1);
+        Ok(())
+    }
+}
+
+pub(crate) struct AtomicPathFixture {
+    pub(crate) scene: RecordingSceneFixture,
+    pub(crate) ledger: Rc<CursorBufferLedger>,
+    pub(crate) legacy: Rc<RecordingLegacyCursor>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HardwareCursor {
+    pub(crate) output_idx: usize,
+    pub(crate) device_fd: RawFd,
+    pub(crate) crtc: ::drm::control::crtc::Handle,
+    pub(crate) attach_commit_id: u64,
+}
+
+impl AtomicPathFixture {
+    pub(crate) fn new(kind: PathKind) -> Result<Option<Self>, String> {
+        let Some(mut scene) = RecordingSceneFixture::new(1)? else {
+            return Ok(None);
+        };
+        let (io, ledger) = RecordingCursorBufferIo::new(256);
+        let buffer_io: Rc<dyn CursorBufferIo> = Rc::new(io);
+        let legacy = Rc::new(RecordingLegacyCursor::default());
+        let property_names = [
+            "FB_ID", "CRTC_ID", "CRTC_X", "CRTC_Y", "CRTC_W", "CRTC_H", "SRC_X", "SRC_Y", "SRC_W",
+            "SRC_H",
+        ];
+        let mut property_names: Vec<_> = property_names.into_iter().map(str::to_owned).collect();
+        if kind == PathKind::Paravirtualized {
+            property_names.extend(["HOTSPOT_X".to_owned(), "HOTSPOT_Y".to_owned()]);
+        }
+        let (driver, hotspot_cap_accepted) = match kind {
+            PathKind::Physical => ("amdgpu", false),
+            PathKind::Paravirtualized => ("virtio_gpu", true),
+        };
+        for device_idx in 0..scene.events.backend.platform.devices.len() {
+            let key = scene.events.backend.platform.devices[device_idx].key;
+            let crtcs: Vec<_> = scene
+                .events
+                .backend
+                .platform
+                .outputs
+                .iter()
+                .filter(|output| output.key.device_key == key)
+                .map(|output| output.output.crtc)
+                .collect();
+            let snapshot = CursorPlaneTestSnapshot {
+                crtcs: crtcs.iter().map(|crtc| u32::from(*crtc)).collect(),
+                planes: crtcs
+                    .iter()
+                    .enumerate()
+                    .map(|(index, crtc)| CursorPlaneTestPlane {
+                        handle: u32::try_from(index + 21).expect("cursor plane handle fits u32"),
+                        possible_crtcs: vec![u32::from(*crtc)],
+                        property_names: property_names.clone(),
+                    })
+                    .collect(),
+                cursor_caps: Some(crate::drm::CursorDeviceCaps::new(
+                    hotspot_cap_accepted,
+                    Some(driver.to_owned()),
+                )),
+                has_buffer: true,
+            };
+            scene
+                .events
+                .backend
+                .platform
+                .for_tests_install_cursor_plane_from_snapshot(
+                    device_idx,
+                    snapshot,
+                    Rc::clone(&buffer_io),
+                    64,
+                    64,
+                );
+            let device = &mut scene.events.backend.platform.devices[device_idx];
+            assert_eq!(device.cursor.state_path(), CursorStatePath::Atomic);
+            let plane = device
+                .cursor
+                .plane
+                .as_mut()
+                .expect("installed cursor plane");
+            plane.for_tests_set_show_executor(legacy.clone());
+            plane.for_tests_set_hide_executor(legacy.clone());
+        }
+        Ok(Some(Self {
+            scene,
+            ledger,
+            legacy,
+        }))
+    }
+}
+
+pub(crate) fn establish_hardware_cursor(
+    fixture: &mut AtomicPathFixture,
+    delivered: &mut HashSet<CompletionKey>,
+    cursor: CursorHandle,
+    pointer: (i32, i32),
+) -> HardwareCursor {
+    let output_idx = 0;
+    {
+        let backend = &mut fixture.scene.events.backend;
+        define_root_cursor(backend, cursor);
+    }
+    Backend::warp_pointer_root(
+        &mut fixture.scene.events.backend,
+        &mut fixture.scene.events.state,
+        pointer.0,
+        pointer.1,
+    );
+    let root = fixture.scene.events.backend.core.window_id;
+    let width = fixture.scene.events.backend.platform.fb_w;
+    let height = fixture.scene.events.backend.platform.fb_h;
+    Backend::clear_area(
+        &mut fixture.scene.events.backend,
+        None,
+        root,
+        0,
+        None,
+        0,
+        0,
+        width,
+        height,
+        (0, 0),
+    )
+    .expect("damage root for cursor transition through Backend");
+
+    let layout = &fixture.scene.events.backend.platform.outputs[output_idx];
+    let crtc = layout.output.crtc;
+    let device_fd = fixture.scene.kms_fd(output_idx);
+    let properties = cursor_properties_for_output(&fixture.scene.events.backend, output_idx);
+    let recorder = &fixture.scene.events.recorders[&device_fd];
+    let start = accepted_live_records(recorder).len();
+    for frame in 1..=4 {
+        Backend::maybe_composite(&mut fixture.scene.events.backend)
+            .expect("compose cursor transition through Backend");
+        if has_unretired_accepted_event(&fixture.scene.events, delivered, output_idx) {
+            retire_pending_output(&mut fixture.scene.events, delivered, output_idx, frame);
+        }
+        let records = accepted_live_records(&fixture.scene.events.recorders[&device_fd]);
+        let sequence: Vec<_> = records
+            .iter()
+            .skip(start)
+            .filter(|record| record.events.iter().any(|event| event.crtc == crtc))
+            .map(|record| record.kind)
+            .collect();
+        if let Some(attach) = records.iter().find(|record| {
+            record.kind == crate::drm::atomic::AtomicCommitKind::CursorOnly
+                && record.events.iter().any(|event| event.crtc == crtc)
+                && record_property(record, properties.fb_id).is_some_and(|fb| fb != 0)
+        }) {
+            let applied = applied_cursor_binding(&fixture.scene.events.backend, output_idx);
+            let no_cursor_commit = !fixture
+                .scene
+                .events
+                .backend
+                .platform
+                .cursor_commit_in_flight_for_output(output_idx);
+            if applied.is_some() && no_cursor_commit {
+                assert_eq!(
+                    sequence,
+                    [
+                        crate::drm::atomic::AtomicCommitKind::Scene,
+                        crate::drm::atomic::AtomicCommitKind::CursorOnly,
+                    ],
+                    "cursor attach event sequence changed"
+                );
+                let attach_commit_id = accepted_event_id(attach)
+                    .expect("accepted cursor attach has a nonzero commit ID");
+                return HardwareCursor {
+                    output_idx,
+                    device_fd,
+                    crtc,
+                    attach_commit_id,
+                };
+            }
+        }
+    }
+    panic!("hardware cursor not established");
+}
+
+pub(crate) fn finish_atomic_fixture(
+    mut fixture: AtomicPathFixture,
+    delivered: &mut HashSet<CompletionKey>,
+) {
+    let root = fixture.scene.events.backend.core.window_id;
+    Backend::define_cursor(&mut fixture.scene.events.backend, None, root, 0x7f10)
+        .expect("restore the fixture's sticky root cursor through Backend");
+    let test_cursors: Vec<_> = fixture
+        .scene
+        .events
+        .backend
+        .cursor_records
+        .keys()
+        .copied()
+        .filter(|cursor| *cursor != 0x7f10)
+        .collect();
+    for cursor in test_cursors {
+        Backend::free_cursor(&mut fixture.scene.events.backend, None, cursor)
+            .expect("free test cursor through Backend after its plane was detached");
+    }
+    assert!(
+        fixture
+            .scene
+            .events
+            .backend
+            .cursor_records
+            .keys()
+            .all(|cursor| *cursor == 0x7f10),
+        "fixture cursor cleanup left a test cursor record",
+    );
+    assert!(
+        fixture
+            .scene
+            .events
+            .backend
+            .cursor_pixmaps
+            .keys()
+            .all(|cursor| *cursor == 0x7f10),
+        "fixture cursor cleanup left a test sprite pixmap",
+    );
+    finish_fixture(&mut fixture.scene.events, delivered);
+    let _ = Backend::drain_completed_present_events(&mut fixture.scene.events.backend);
+    let _ = Backend::drain_retired_present_idle_events(&mut fixture.scene.events.backend);
+    let ledger = Rc::clone(&fixture.ledger);
+    fixture.scene.finish_after_normal_drain();
+    assert_eq!(ledger.end_state(), (0, 0, 0));
+    assert!(
+        ledger.records().iter().any(|record| matches!(
+            record,
+            crate::kms::cursor_plane::ops::recording::CursorBufferRecord::RemoveFb { .. }
+        )),
+        "free cursor sprites are removed after the plane is dropped"
+    );
+}
+
+pub(crate) fn record_count(fixture: &AtomicPathFixture, device_fd: RawFd) -> usize {
+    fixture.scene.events.recorders[&device_fd].records().len()
+}
+
+pub(crate) fn compose_until_cursor_commit(
+    fixture: &mut AtomicPathFixture,
+    delivered: &mut HashSet<CompletionKey>,
+    output_idx: usize,
+    record_offset: usize,
+    property: ::drm::control::property::Handle,
+    value: u64,
+) -> AtomicCommitRecord {
+    compose_until_cursor_commit_where(
+        fixture,
+        delivered,
+        output_idx,
+        record_offset,
+        property,
+        |record| record_property(record, property) == Some(value),
+    )
+}
+
+pub(crate) fn compose_until_cursor_commit_where<F>(
+    fixture: &mut AtomicPathFixture,
+    delivered: &mut HashSet<CompletionKey>,
+    output_idx: usize,
+    record_offset: usize,
+    property: ::drm::control::property::Handle,
+    mut matches: F,
+) -> AtomicCommitRecord
+where
+    F: FnMut(&AtomicCommitRecord) -> bool,
+{
+    let device_fd = fixture.scene.kms_fd(output_idx);
+    let crtc = fixture.scene.events.backend.platform.outputs[output_idx]
+        .output
+        .crtc;
+    for frame in 1..=4 {
+        Backend::maybe_composite(&mut fixture.scene.events.backend)
+            .expect("compose cursor transition through Backend");
+        let matching = fixture.scene.events.recorders[&device_fd]
+            .records()
+            .into_iter()
+            .skip(record_offset)
+            .find(|record| {
+                record.device_fd == device_fd
+                    && record.result == ScriptedResult::Ok
+                    && !record
+                        .flags
+                        .contains(::drm::control::AtomicCommitFlags::TEST_ONLY)
+                    && record.kind == crate::drm::atomic::AtomicCommitKind::CursorOnly
+                    && accepted_event_id(record).is_some()
+                    && record.events.iter().any(|event| event.crtc == crtc)
+                    && record_property(record, property).is_some()
+                    && matches(record)
+            });
+        if let Some(record) = matching {
+            return record;
+        }
+        if has_unretired_accepted_event(&fixture.scene.events, delivered, output_idx) {
+            retire_pending_output(&mut fixture.scene.events, delivered, output_idx, frame);
+        }
+    }
+    panic!("cursor-only commit with property {property:?} not accepted");
+}
+
+pub(crate) fn accept_cursor_detach(
+    fixture: &mut AtomicPathFixture,
+    delivered: &mut HashSet<CompletionKey>,
+    output_idx: usize,
+) -> AtomicCommitRecord {
+    drain_unretired_output_events(fixture, delivered, output_idx);
+    Backend::set_cursor_hidden(&mut fixture.scene.events.backend, true);
+    let root = fixture.scene.events.backend.core.window_id;
+    let width = fixture.scene.events.backend.platform.fb_w;
+    let height = fixture.scene.events.backend.platform.fb_h;
+    Backend::clear_area(
+        &mut fixture.scene.events.backend,
+        None,
+        root,
+        0,
+        None,
+        0,
+        0,
+        width,
+        height,
+        (0, 0),
+    )
+    .expect("damage root for cursor hide through Backend");
+    let offset = record_count(fixture, fixture.scene.kms_fd(output_idx));
+    let properties = cursor_properties_for_output(&fixture.scene.events.backend, output_idx);
+    compose_until_cursor_commit(fixture, delivered, output_idx, offset, properties.fb_id, 0)
+}
+
+pub(crate) fn drain_unretired_output_events(
+    fixture: &mut AtomicPathFixture,
+    delivered: &mut HashSet<CompletionKey>,
+    output_idx: usize,
+) {
+    for frame in 20..28 {
+        if !has_unretired_accepted_event(&fixture.scene.events, delivered, output_idx) {
+            return;
+        }
+        retire_pending_output(&mut fixture.scene.events, delivered, output_idx, frame);
+    }
+    assert!(
+        !has_unretired_accepted_event(&fixture.scene.events, delivered, output_idx),
+        "accepted output events did not drain"
+    );
+}
+
+pub(crate) fn retire_cursor_record(
+    fixture: &mut AtomicPathFixture,
+    delivered: &mut HashSet<CompletionKey>,
+    output_idx: usize,
+    record: &AtomicCommitRecord,
+    frame: u32,
+) {
+    let id = accepted_event_id(record).expect("accepted cursor record has an ID");
+    assert_eq!(
+        retire_pending_output(&mut fixture.scene.events, delivered, output_idx, frame),
+        id,
+        "Backend must retire the matching cursor commit ID"
+    );
+}
+
+pub(crate) fn enter_held_direct(
+    fixture: &mut AtomicPathFixture,
+    delivered: &mut HashSet<CompletionKey>,
+    present_id: u64,
+) -> Result<DirectPresentSetup, String> {
+    let direct = fixture.scene.install_direct_present(present_id, 0);
+    // install_direct_present hides the scene cursor. Restore it before direct
+    // admission: the Atomic path must keep the already-applied plane visible.
+    Backend::set_cursor_hidden(&mut fixture.scene.events.backend, false);
+    assert!(!fixture.scene.events.backend.effective_cursor_hidden());
+    let applied = applied_cursor_binding(&fixture.scene.events.backend, 0)
+        .expect("cursor A remains applied after direct-present installation");
+    assert_eq!(
+        sprite_users(&fixture.scene.events.backend, 0, applied.lease),
+        Some(1)
+    );
+    let device_fd = fixture.scene.kms_fd(0);
+
+    // Restore the scene's retired cursor mode before testing direct admission.
+    // The hide/unhide around direct Present can leave the scene in a transition
+    // until a damaged scene frame retires, even though the plane still has A.
+    let crtc = fixture.scene.events.backend.platform.outputs[0].output.crtc;
+    let mut scene_mode = fixture.scene.events.backend.scene.cursor_mode();
+    for frame in 1..=4 {
+        let root = fixture.scene.events.backend.core.window_id;
+        let width = fixture.scene.events.backend.platform.fb_w;
+        let height = fixture.scene.events.backend.platform.fb_h;
+        Backend::clear_area(
+            &mut fixture.scene.events.backend,
+            None,
+            root,
+            0,
+            None,
+            0,
+            0,
+            width,
+            height,
+            (0, 0),
+        )
+        .expect("damage root before direct admission");
+        let record_offset = record_count(fixture, device_fd);
+        Backend::maybe_composite(&mut fixture.scene.events.backend)
+            .expect("compose scene frame before direct admission");
+        let scene_frame = fixture.scene.events.recorders[&device_fd]
+            .records()
+            .into_iter()
+            .skip(record_offset)
+            .find(|record| {
+                record.device_fd == device_fd
+                    && record.result == ScriptedResult::Ok
+                    && !record
+                        .flags
+                        .contains(::drm::control::AtomicCommitFlags::TEST_ONLY)
+                    && record
+                        .flags
+                        .contains(::drm::control::AtomicCommitFlags::PAGE_FLIP_EVENT)
+                    && matches!(
+                        record.kind,
+                        crate::drm::atomic::AtomicCommitKind::Scene
+                            | crate::drm::atomic::AtomicCommitKind::SceneWithCursor
+                    )
+                    && record.events.iter().any(|event| event.crtc == crtc)
+                    && accepted_event_id(record).is_some()
+            })
+            .ok_or_else(|| {
+                let backend = &fixture.scene.events.backend;
+                let accepted_kinds: Vec<_> = accepted_live_records(
+                    &fixture.scene.events.recorders[&device_fd],
+                )
+                .into_iter()
+                .map(|record| record.kind)
+                .collect();
+                format!(
+                    "direct admission transition frame {frame} was not accepted (cursor_mode={scene_mode:?}, scene_wants_scene={}, structure_dirty={}, output_ready={}, scene_flip_pending={}, cursor_transition_pending={}, cursor_commit_in_flight={}, direct_active={}, accepted_kinds={accepted_kinds:?})",
+                    backend.for_tests_scene_wants_scene(),
+                    backend.scene.scene_structure_dirty,
+                    backend.scene.output_ready_for_submit(0, &backend.platform),
+                    backend.scene.has_pending_page_flip(0),
+                    backend.scene.cursor_transition_pending(),
+                    backend.platform.cursor_commit_in_flight_for_output(0),
+                    backend.pstate.scanout_m2.active(),
+                )
+            })?;
+        let id = accepted_event_id(&scene_frame).expect("accepted scene frame has an ID");
+        fixture.scene.events.queue_commit_completion(
+            device_fd,
+            crtc,
+            id,
+            frame,
+            Duration::from_millis(10),
+        );
+        Backend::on_page_flip_ready(
+            &mut fixture.scene.events.backend,
+            &mut fixture.scene.events.state,
+            device_fd,
+        );
+        delivered.insert(CompletionKey {
+            device_fd,
+            crtc,
+            commit_id: id,
+        });
+        scene_mode = fixture.scene.events.backend.scene.cursor_mode();
+        if scene_mode == crate::kms::render::scene::CursorPlaneMode::Hw {
+            break;
+        }
+    }
+    if scene_mode != crate::kms::render::scene::CursorPlaneMode::Hw {
+        return Err(format!(
+            "direct admission cursor transition did not reach Hw (cursor_mode={scene_mode:?})"
+        ));
+    }
+
+    let record_offset = record_count(fixture, device_fd);
+    for attempt in 0..8 {
+        let accepted = Backend::try_present_direct(
+            &mut fixture.scene.events.backend,
+            direct.candidate,
+            direct.event.clone(),
+        )
+        .expect("direct candidate through Backend");
+        if accepted != (attempt == 7) {
+            return Err(format!(
+                "direct admission has seven probation rejections (attempt={attempt}, streak={}, hidden={}, visible={}, cursor_eligible={}, pending_cursor={})",
+                fixture
+                    .scene
+                    .events
+                    .backend
+                    .pstate
+                    .scanout_m2
+                    .eligible_root_streak,
+                fixture.scene.events.backend.effective_cursor_hidden(),
+                fixture
+                    .scene
+                    .events
+                    .backend
+                    .platform
+                    .any_cursor_plane_visible(),
+                fixture.scene.events.backend.direct_cursor_eligible(),
+                fixture
+                    .scene
+                    .events
+                    .backend
+                    .platform
+                    .any_cursor_commit_in_flight(),
+            ));
+        }
+    }
+    let direct_record = fixture.scene.events.recorders[&device_fd]
+        .records()
+        .into_iter()
+        .skip(record_offset)
+        .find(|record| {
+            record.device_fd == device_fd
+                && record.result == ScriptedResult::Ok
+                && accepted_event_id(record).is_some()
+                && record.kind != crate::drm::atomic::AtomicCommitKind::CursorOnly
+        })
+        .expect("accepted direct frame record");
+    let id = accepted_event_id(&direct_record).expect("direct frame has an accepted ID");
+    assert_eq!(direct_record.events.len(), 1);
+    fixture.scene.events.queue_commit_completion(
+        device_fd,
+        direct_record.events[0].crtc,
+        id,
+        1,
+        Duration::from_millis(10),
+    );
+    Backend::on_page_flip_ready(
+        &mut fixture.scene.events.backend,
+        &mut fixture.scene.events.state,
+        device_fd,
+    );
+    delivered.insert(CompletionKey {
+        device_fd,
+        crtc: direct_record.events[0].crtc,
+        commit_id: id,
+    });
+    assert!(fixture.scene.events.backend.pstate.scanout_m2.active());
+    Ok(direct)
+}
+
+pub(crate) fn cursor_properties_for_output(
+    backend: &KmsBackend,
+    output_idx: usize,
+) -> CursorPlaneProperties {
+    let layout = &backend.platform.outputs[output_idx];
+    let crtc = layout.output.crtc;
+    let device_idx = backend
+        .platform
+        .devices
+        .iter()
+        .position(|device| device.key == layout.key.device_key)
+        .expect("cursor output device");
+    backend.platform.devices[device_idx]
+        .cursor
+        .plane
+        .as_ref()
+        .and_then(|plane| plane.properties_for(crtc))
+        .expect("complete cursor properties")
+}
+
+pub(crate) fn applied_cursor_binding(
+    backend: &KmsBackend,
+    output_idx: usize,
+) -> Option<CursorBinding> {
+    let layout = &backend.platform.outputs[output_idx];
+    let crtc = layout.output.crtc;
+    let device_idx = backend
+        .platform
+        .devices
+        .iter()
+        .position(|device| device.key == layout.key.device_key)
+        .expect("cursor output device");
+    backend.platform.devices[device_idx]
+        .cursor
+        .crtc_states
+        .get(&crtc)
+        .and_then(|state| state.applied)
+}
+
+pub(crate) fn sprite_users(
+    backend: &KmsBackend,
+    output_idx: usize,
+    lease: SpriteBufferLease,
+) -> Option<usize> {
+    let layout = &backend.platform.outputs[output_idx];
+    let device_idx = backend
+        .platform
+        .devices
+        .iter()
+        .position(|device| device.key == layout.key.device_key)
+        .expect("cursor output device");
+    backend.platform.devices[device_idx]
+        .cursor
+        .plane
+        .as_ref()
+        .and_then(|plane| plane.sprites().user_count(lease))
+}
+
+pub(crate) fn sprite_bytes(
+    backend: &KmsBackend,
+    output_idx: usize,
+    lease: SpriteBufferLease,
+) -> Option<Vec<u8>> {
+    let layout = &backend.platform.outputs[output_idx];
+    let device_idx = backend
+        .platform
+        .devices
+        .iter()
+        .position(|device| device.key == layout.key.device_key)
+        .expect("cursor output device");
+    backend.platform.devices[device_idx]
+        .cursor
+        .plane
+        .as_ref()
+        .and_then(|plane| plane.sprites().for_tests_sprite_bytes(lease))
 }
 
 pub(crate) fn accepted_live_records(
@@ -303,21 +1003,15 @@ mod tests {
     // ignore `extent` and always construct a 4x4 ARGB cursor.
     #[ignore = "needs live Vulkan ICD (lavapipe)"]
     fn p2_fixture_cursor_helpers_control_the_effective_cursor() {
-        let mut backend = match crate::kms::render::backend::KmsBackend::for_tests_with_vk() {
-            Ok(backend) => backend,
-            Err(error)
-                if crate::kms::render::backend::tests::vulkan_absence_is_expected(&error) =>
-            {
-                eprintln!(
-                    "SKIP p2_fixture_cursor_helpers_control_the_effective_cursor: Vulkan unavailable"
-                );
-                return;
-            }
-            Err(error) => panic!("Vulkan cursor-helper fixture setup failed: {error}"),
+        let Some(mut fixture) = RecordingSceneFixture::new(1)
+            .expect("cursor-helper recording scene fixture construction")
+        else {
+            return;
         };
+        let backend = &mut fixture.events.backend;
 
-        let visible = super::create_bitmap_cursor(&mut backend, true);
-        super::define_root_cursor(&mut backend, visible);
+        let visible = super::create_bitmap_cursor(backend, true);
+        super::define_root_cursor(backend, visible);
         assert!(
             !backend.effective_cursor_hidden(),
             "visible cursor record: {:?}",
@@ -325,12 +1019,12 @@ mod tests {
         );
         assert_eq!(backend.effective_cursor_xid, Some(visible.as_raw()));
 
-        let invisible = super::create_bitmap_cursor(&mut backend, false);
-        super::define_root_cursor(&mut backend, invisible);
+        let invisible = super::create_bitmap_cursor(backend, false);
+        super::define_root_cursor(backend, invisible);
         assert!(backend.effective_cursor_hidden());
         assert_eq!(backend.effective_cursor_xid, Some(invisible.as_raw()));
 
-        let argb = super::create_argb_cursor(&mut backend, (6, 3), [1, 2, 3, 4], (1, 2));
+        let argb = super::create_argb_cursor(backend, (6, 3), [1, 2, 3, 4], (1, 2));
         let record = backend
             .cursor_records
             .get(&argb.as_raw())
@@ -339,6 +1033,22 @@ mod tests {
         assert_eq!(record.height, 3);
         assert_eq!(record.hot_x, 1);
         assert_eq!(record.hot_y, 2);
+
+        let root = backend.core.window_id;
+        Backend::define_cursor(backend, None, root, 0x7f10)
+            .expect("restore the fixture's sticky root cursor");
+        let test_cursors: Vec<_> = backend
+            .cursor_records
+            .keys()
+            .copied()
+            .filter(|cursor| *cursor != 0x7f10)
+            .collect();
+        for cursor in test_cursors {
+            Backend::free_cursor(backend, None, cursor).expect("free test cursor");
+        }
+        let mut delivered = HashSet::new();
+        super::finish_fixture(&mut fixture.events, &mut delivered);
+        fixture.finish_after_normal_drain();
     }
 
     #[test]

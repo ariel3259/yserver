@@ -8,7 +8,6 @@ use crate::drm::Device;
 
 /// A staged image/hotspot identity for the atomic binding phase.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code, reason = "consumed by P2b Task 2 sprite staging")]
 pub(crate) struct SpriteBufferLease {
     slot: usize,
     version: u64,
@@ -19,12 +18,10 @@ pub(crate) struct SpriteBufferLease {
 }
 
 impl SpriteBufferLease {
-    #[allow(dead_code, reason = "consumed by P2b Task 2 sprite staging")]
     pub(crate) fn version(self) -> u64 {
         self.version
     }
 
-    #[allow(dead_code, reason = "consumed by P2b Task 2 sprite staging")]
     pub(crate) fn matches(self, version: u64, hot_x: u16, hot_y: u16) -> bool {
         self.version == version && self.hot_x == hot_x && self.hot_y == hot_y
     }
@@ -32,7 +29,6 @@ impl SpriteBufferLease {
 
 /// Whether a requested cursor image is ready to bind or must be retried.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code, reason = "consumed by P2b Task 2 sprite staging")]
 pub(crate) enum SpriteStage {
     Ready,
     Deferred,
@@ -50,7 +46,6 @@ struct SpriteBuffer {
 /// A per-DRM-device pool. Every slot uses the full driver cursor capacity;
 /// each image occupies the top-left corner and every other mapped byte is
 /// cleared before a successful write.
-#[allow(dead_code, reason = "consumed by P2b Task 2 sprite staging")]
 pub(crate) struct SpritePool {
     width: u32,
     height: u32,
@@ -58,6 +53,7 @@ pub(crate) struct SpritePool {
     max_buffers: usize,
     wanted: Option<WantedSprite>,
     candidate: Option<SpriteBufferLease>,
+    last_prepare_outcome: Option<SpriteStage>,
 }
 
 struct WantedSprite {
@@ -70,7 +66,6 @@ struct WantedSprite {
 }
 
 impl SpritePool {
-    #[allow(dead_code, reason = "consumed by P2b Task 2 sprite staging")]
     pub(crate) fn new(width: u32, height: u32) -> Self {
         Self {
             width,
@@ -79,16 +74,40 @@ impl SpritePool {
             max_buffers: 2,
             wanted: None,
             candidate: None,
+            last_prepare_outcome: None,
         }
     }
 
-    #[allow(dead_code, reason = "consumed by P2b Task 2 sprite staging")]
     pub(crate) fn set_active_crtc_count(&mut self, count: usize) {
         self.max_buffers = count.saturating_add(1).max(2);
     }
 
-    #[allow(dead_code, reason = "consumed by P2b Task 2 sprite staging")]
     pub(crate) fn prepare(
+        &mut self,
+        device: Rc<Device>,
+        io: Rc<dyn CursorBufferIo>,
+        version: u64,
+        hot_x: u16,
+        hot_y: u16,
+        image_width: u32,
+        image_height: u32,
+        bgra_bytes: &[u8],
+    ) -> io::Result<SpriteStage> {
+        let outcome = self.prepare_inner(
+            device,
+            io,
+            version,
+            hot_x,
+            hot_y,
+            image_width,
+            image_height,
+            bgra_bytes,
+        )?;
+        self.last_prepare_outcome = Some(outcome);
+        Ok(outcome)
+    }
+
+    fn prepare_inner(
         &mut self,
         device: Rc<Device>,
         io: Rc<dyn CursorBufferIo>,
@@ -239,12 +258,10 @@ impl SpritePool {
         }
     }
 
-    #[allow(dead_code, reason = "consumed by P2b Task 2 sprite staging")]
     pub(crate) fn candidate_lease(&self) -> Option<SpriteBufferLease> {
         self.candidate
     }
 
-    #[allow(dead_code, reason = "consumed by P2b Task 2 sprite staging")]
     pub(crate) fn framebuffer_for_lease(&self, lease: SpriteBufferLease) -> Option<u32> {
         self.buffers
             .get(lease.slot)
@@ -252,7 +269,6 @@ impl SpritePool {
             .map(|buffer| u32::from(buffer.buffer.fb_id()))
     }
 
-    #[allow(dead_code, reason = "consumed by P2b Task 2 sprite staging")]
     pub(crate) fn reserve(&mut self, lease: SpriteBufferLease) -> bool {
         let Some(buffer) = self.buffers.get_mut(lease.slot) else {
             return false;
@@ -264,14 +280,12 @@ impl SpritePool {
         true
     }
 
-    #[allow(dead_code, reason = "consumed by P2b Task 2 sprite staging")]
     pub(crate) fn can_accept_reserved(&self, lease: SpriteBufferLease) -> bool {
         self.buffers
             .get(lease.slot)
             .is_some_and(|buffer| lease_matches(buffer, lease) && buffer.prepared_users > 0)
     }
 
-    #[allow(dead_code, reason = "consumed by P2b Task 2 sprite staging")]
     pub(crate) fn accept_reserved(&mut self, lease: SpriteBufferLease) -> bool {
         let Some(buffer) = self.buffers.get_mut(lease.slot) else {
             return false;
@@ -284,7 +298,6 @@ impl SpritePool {
         true
     }
 
-    #[allow(dead_code, reason = "consumed by P2b Task 2 sprite staging")]
     pub(crate) fn reject_reserved(&mut self, lease: SpriteBufferLease) -> bool {
         let Some(buffer) = self.buffers.get_mut(lease.slot) else {
             return false;
@@ -296,7 +309,6 @@ impl SpritePool {
         true
     }
 
-    #[allow(dead_code, reason = "consumed by P2b Task 2 sprite staging")]
     pub(crate) fn release_user(&mut self, lease: SpriteBufferLease) -> bool {
         let Some(buffer) = self.buffers.get_mut(lease.slot) else {
             return false;
@@ -362,6 +374,18 @@ impl SpritePool {
     #[cfg(test)]
     pub(crate) fn candidate_version(&self) -> Option<u64> {
         self.candidate.map(|lease| lease.version)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_last_prepare_outcome(&self) -> Option<SpriteStage> {
+        self.last_prepare_outcome
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_wanted_identity(&self) -> Option<(u64, u16, u16)> {
+        self.wanted
+            .as_ref()
+            .map(|wanted| (wanted.version, wanted.hot_x, wanted.hot_y))
     }
 
     #[cfg(test)]

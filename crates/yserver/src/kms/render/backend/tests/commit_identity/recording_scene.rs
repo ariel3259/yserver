@@ -379,6 +379,24 @@ impl RecordingSceneFixture {
     }
 
     pub(crate) fn drain_deferred_pool_releases(&mut self, timeout: Duration) {
+        if self
+            .events
+            .backend
+            .scene
+            .pending_pool_release_count_for_tests()
+            == 0
+            && self
+                .events
+                .backend
+                .platform
+                .for_tests_pending_scanout_render_job_ids()
+                .is_empty()
+            && !self.events.backend.store.has_pending_presentation_damage()
+            && !self.events.backend.scene.scene_structure_dirty
+            && !self.events.backend.scene.owes_repaint()
+        {
+            return;
+        }
         let deadline = Instant::now() + timeout;
         let unmatched_before: HashMap<RawFd, u64> = self
             .events
@@ -596,6 +614,10 @@ impl RecordingSceneFixture {
         }
         assert_eq!(self.events.backend.store.pending_retire_count(), 0);
         assert!(self.events.backend.store.lookup(root).is_none());
+        self.events
+            .backend
+            .scene
+            .drain_all(&mut self.events.backend.platform);
         self.finish();
     }
 }

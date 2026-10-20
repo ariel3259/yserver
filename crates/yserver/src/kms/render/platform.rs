@@ -26,6 +26,7 @@
 
 mod connectors;
 mod cursor;
+mod cursor_atomic;
 pub(crate) mod cursor_commit;
 pub(crate) mod cursor_state;
 mod devices;
