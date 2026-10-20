@@ -259,12 +259,6 @@ impl PlatformBackend {
                     ));
                 }
                 let _ = self.atomic_rollback(device_idx, crtc, &error);
-                let classification_error = Err(io::Error::new(error.kind(), error.to_string()));
-                super::cursor::apply_cursor_operation_result(
-                    &mut self.devices[device_idx].cursor,
-                    crtc,
-                    &classification_error,
-                );
                 return Err(error);
             }
         };
@@ -393,6 +387,11 @@ impl PlatformBackend {
             cursor.clear_atomic_position(crtc);
             cursor.cursor_retry_waits_for_flip.remove(&crtc);
         }
+        let disposition = super::cursor::apply_cursor_operation_error(
+            &mut self.devices[device_idx].cursor,
+            crtc,
+            error,
+        );
         let rollback = if had_applied {
             self.detach_cursor_blocking(device_idx, crtc)
         } else {
@@ -403,7 +402,10 @@ impl PlatformBackend {
             Ok(()) => {
                 let cursor = &mut self.devices[device_idx].cursor;
                 cursor.cursor_hide_recovery.remove(&crtc);
-                cursor.note_einval(crtc);
+                if disposition == crate::kms::render::platform::CursorFailureDisposition::Unchanged
+                {
+                    cursor.note_einval(crtc);
+                }
                 outcome.fallback_changed = true;
                 log::warn!(
                     "render cursor atomic commit: device {device_key} CRTC {crtc:?} rejected cursor fields ({error}); hid the plane and entered transient software fallback"

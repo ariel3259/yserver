@@ -15,27 +15,26 @@ use drm::{
 
 use crate::drm::Device;
 
-#[allow(dead_code, reason = "consumed by P2a Task 3 sprite pool")]
 pub(crate) struct CursorDumbBuffer {
     device_fd: i32,
     handle: u32,
     pitch: u32,
+    #[allow(dead_code, reason = "kept for the recording buffer descriptor")]
     len: usize,
     dumb: Option<DumbBuffer>,
 }
 
 impl CursorDumbBuffer {
-    #[allow(dead_code, reason = "consumed by P2a Task 3 sprite pool")]
+    #[allow(dead_code, reason = "used by the recording cursor buffer")]
     pub(crate) fn handle(&self) -> u32 {
         self.handle
     }
 
-    #[allow(dead_code, reason = "consumed by P2a Task 3 sprite pool")]
     pub(crate) fn pitch(&self) -> u32 {
         self.pitch
     }
 
-    #[allow(dead_code, reason = "consumed by P2a Task 3 sprite pool")]
+    #[allow(dead_code, reason = "kept for the recording buffer descriptor")]
     pub(crate) fn len(&self) -> usize {
         self.len
     }
@@ -52,7 +51,6 @@ impl CursorDumbBuffer {
     }
 }
 
-#[allow(dead_code, reason = "consumed by P2a Task 3 sprite pool")]
 pub(crate) struct CursorMapping {
     ptr: NonNull<u8>,
     len: usize,
@@ -61,12 +59,10 @@ pub(crate) struct CursorMapping {
 }
 
 impl CursorMapping {
-    #[allow(dead_code, reason = "consumed by P2a Task 3 sprite pool")]
     pub(crate) fn ptr(&self) -> NonNull<u8> {
         self.ptr
     }
 
-    #[allow(dead_code, reason = "consumed by P2a Task 3 sprite pool")]
     pub(crate) fn len(&self) -> usize {
         self.len
     }
@@ -85,7 +81,6 @@ impl CursorMapping {
     }
 }
 
-#[allow(dead_code, reason = "consumed by P2a Task 3 sprite pool")]
 pub(crate) trait CursorBufferIo {
     fn create_dumb(
         &self,
@@ -115,7 +110,6 @@ pub(crate) trait CursorBufferIo {
 }
 
 #[derive(Clone, Copy)]
-#[allow(dead_code, reason = "consumed by P2a Task 3 sprite pool")]
 pub(crate) struct CursorFramebufferDescriptor {
     width: u32,
     height: u32,
@@ -123,7 +117,6 @@ pub(crate) struct CursorFramebufferDescriptor {
 }
 
 impl CursorFramebufferDescriptor {
-    #[allow(dead_code, reason = "consumed by P2a Task 3 sprite pool")]
     fn argb8888(width: u32, height: u32) -> Self {
         Self {
             width,
@@ -134,7 +127,6 @@ impl CursorFramebufferDescriptor {
 }
 
 #[derive(Default)]
-#[allow(dead_code, reason = "consumed by P2a Task 3 sprite pool")]
 pub(crate) struct DrmCursorBufferIo;
 
 impl CursorBufferIo for DrmCursorBufferIo {
@@ -258,7 +250,6 @@ impl CursorBufferIo for DrmCursorBufferIo {
     }
 }
 
-#[allow(dead_code, reason = "consumed by P2a Task 3 sprite pool")]
 fn ensure_device(device: &Device, expected_fd: i32) -> io::Result<()> {
     if device.as_fd().as_raw_fd() == expected_fd {
         Ok(())
@@ -302,7 +293,6 @@ impl PlanarBuffer for CursorPlanarBuffer {
     }
 }
 
-#[allow(dead_code, reason = "consumed by P2a Task 3 sprite pool")]
 pub(crate) struct CursorBuffer {
     device: Rc<Device>,
     io: Rc<dyn CursorBufferIo>,
@@ -318,7 +308,6 @@ pub(crate) struct CursorBuffer {
 impl CursorBuffer {
     /// Shared production allocation algorithm. Rollback releases only
     /// successfully acquired resources, in reverse acquisition order.
-    #[allow(dead_code, reason = "consumed by P2a Task 3 sprite pool")]
     pub(crate) fn allocate(
         device: Rc<Device>,
         io: Rc<dyn CursorBufferIo>,
@@ -370,7 +359,6 @@ impl CursorBuffer {
         Ok(buffer)
     }
 
-    #[allow(dead_code, reason = "consumed by P2a Task 3 sprite pool")]
     pub(crate) fn release(mut self) -> io::Result<()> {
         self.release_resources()
     }
@@ -399,17 +387,14 @@ impl CursorBuffer {
         cleanup_error.map_or(Ok(()), Err)
     }
 
-    #[allow(dead_code, reason = "consumed by P2a Task 3 sprite pool")]
     pub(crate) fn fb_id(&self) -> framebuffer::Handle {
         self.fb.expect("cursor framebuffer is live")
     }
 
-    #[allow(dead_code, reason = "consumed by P2a Task 3 sprite pool")]
     pub(crate) fn ptr(&self) -> NonNull<u8> {
         self.mapping.as_ref().expect("cursor mapping is live").ptr()
     }
 
-    #[allow(dead_code, reason = "consumed by P2a Task 3 sprite pool")]
     pub(crate) fn write_image(
         &mut self,
         image_w: u32,
@@ -465,7 +450,6 @@ impl CursorBuffer {
     }
 }
 
-#[allow(dead_code, reason = "consumed by P2a Task 3 sprite pool")]
 fn write_mapped_image(
     mapping: &CursorMapping,
     stride: u32,
@@ -546,7 +530,6 @@ fn write_mapped_image(
     Ok(())
 }
 
-#[allow(dead_code, reason = "consumed by P2a Task 3 sprite pool")]
 fn allocation_cleanup_error(
     operation_error: io::Error,
     cleanup_context: String,

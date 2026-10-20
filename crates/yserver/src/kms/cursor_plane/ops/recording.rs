@@ -88,7 +88,6 @@ impl CursorBufferLedger {
         )
     }
 
-    #[allow(dead_code, reason = "consumed by P2a Task 3 sprite pool")]
     pub(crate) fn failures_taken(&self) -> Vec<CursorBufferOperation> {
         self.failures_taken.borrow().clone()
     }
@@ -106,7 +105,6 @@ impl CursorBufferLedger {
         });
     }
 
-    #[allow(dead_code, reason = "consumed by P2a Task 3 sprite pool")]
     pub(crate) fn mapped_bytes(&self, device_fd: i32, handle: u32) -> Option<Vec<u8>> {
         self.storage
             .borrow()

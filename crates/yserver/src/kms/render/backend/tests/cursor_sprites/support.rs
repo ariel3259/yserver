@@ -162,6 +162,12 @@ pub(crate) struct AtomicPathFixture {
     pub(crate) legacy: Rc<RecordingLegacyCursor>,
 }
 
+pub(crate) struct LegacyPathFixture {
+    pub(crate) scene: RecordingSceneFixture,
+    pub(crate) ledger: Rc<CursorBufferLedger>,
+    pub(crate) legacy: Rc<RecordingLegacyCursor>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HardwareCursor {
     pub(crate) output_idx: usize,
@@ -247,6 +253,79 @@ impl AtomicPathFixture {
     }
 }
 
+impl LegacyPathFixture {
+    pub(crate) fn new() -> Result<Option<Self>, String> {
+        let Some(mut scene) = RecordingSceneFixture::new(1)? else {
+            return Ok(None);
+        };
+        let (io, ledger) = RecordingCursorBufferIo::new(256);
+        let buffer_io: Rc<dyn CursorBufferIo> = Rc::new(io);
+        let legacy = Rc::new(RecordingLegacyCursor::default());
+        let property_names: Vec<String> = [
+            "FB_ID", "CRTC_ID", "CRTC_X", "CRTC_Y", "CRTC_W", "CRTC_H", "SRC_X", "SRC_Y", "SRC_W",
+            "SRC_H",
+        ]
+        .into_iter()
+        .filter(|name| *name != "SRC_H")
+        .map(str::to_owned)
+        .collect();
+        for device_idx in 0..scene.events.backend.platform.devices.len() {
+            let key = scene.events.backend.platform.devices[device_idx].key;
+            let crtcs: Vec<_> = scene
+                .events
+                .backend
+                .platform
+                .outputs
+                .iter()
+                .filter(|output| output.key.device_key == key)
+                .map(|output| output.output.crtc)
+                .collect();
+            let snapshot = CursorPlaneTestSnapshot {
+                crtcs: crtcs.iter().map(|crtc| u32::from(*crtc)).collect(),
+                planes: crtcs
+                    .iter()
+                    .enumerate()
+                    .map(|(index, crtc)| CursorPlaneTestPlane {
+                        handle: u32::try_from(index + 21).expect("cursor plane handle fits u32"),
+                        possible_crtcs: vec![u32::from(*crtc)],
+                        property_names: property_names.clone(),
+                    })
+                    .collect(),
+                cursor_caps: Some(crate::drm::CursorDeviceCaps::new(
+                    false,
+                    Some("amdgpu".to_owned()),
+                )),
+                has_buffer: true,
+            };
+            scene
+                .events
+                .backend
+                .platform
+                .for_tests_install_cursor_plane_from_snapshot(
+                    device_idx,
+                    snapshot,
+                    Rc::clone(&buffer_io),
+                    64,
+                    64,
+                );
+            let device = &mut scene.events.backend.platform.devices[device_idx];
+            assert_eq!(device.cursor.state_path(), CursorStatePath::Legacy);
+            let plane = device
+                .cursor
+                .plane
+                .as_mut()
+                .expect("installed cursor plane");
+            plane.for_tests_set_show_executor(legacy.clone());
+            plane.for_tests_set_hide_executor(legacy.clone());
+        }
+        Ok(Some(Self {
+            scene,
+            ledger,
+            legacy,
+        }))
+    }
+}
+
 pub(crate) fn establish_hardware_cursor(
     fixture: &mut AtomicPathFixture,
     delivered: &mut HashSet<CompletionKey>,
@@ -300,6 +379,14 @@ pub(crate) fn establish_hardware_cursor(
             .filter(|record| record.events.iter().any(|event| event.crtc == crtc))
             .map(|record| record.kind)
             .collect();
+        let expected_sequence = [
+            crate::drm::atomic::AtomicCommitKind::Scene,
+            crate::drm::atomic::AtomicCommitKind::CursorOnly,
+        ];
+        assert_eq!(
+            sequence, expected_sequence,
+            "Atomic cursor event sequence changed at frame {frame}"
+        );
         if let Some(attach) = records.iter().find(|record| {
             record.kind == crate::drm::atomic::AtomicCommitKind::CursorOnly
                 && record.events.iter().any(|event| event.crtc == crtc)
@@ -313,14 +400,6 @@ pub(crate) fn establish_hardware_cursor(
                 .platform
                 .cursor_commit_in_flight_for_output(output_idx);
             if applied.is_some() && no_cursor_commit {
-                assert_eq!(
-                    sequence,
-                    [
-                        crate::drm::atomic::AtomicCommitKind::Scene,
-                        crate::drm::atomic::AtomicCommitKind::CursorOnly,
-                    ],
-                    "cursor attach event sequence changed"
-                );
                 let attach_commit_id = accepted_event_id(attach)
                     .expect("accepted cursor attach has a nonzero commit ID");
                 return HardwareCursor {
@@ -381,13 +460,21 @@ pub(crate) fn finish_atomic_fixture(
     let ledger = Rc::clone(&fixture.ledger);
     fixture.scene.finish_after_normal_drain();
     assert_eq!(ledger.end_state(), (0, 0, 0));
-    assert!(
-        ledger.records().iter().any(|record| matches!(
+    let records = ledger.records();
+    if records.iter().any(|record| {
+        matches!(
             record,
-            crate::kms::cursor_plane::ops::recording::CursorBufferRecord::RemoveFb { .. }
-        )),
-        "free cursor sprites are removed after the plane is dropped"
-    );
+            crate::kms::cursor_plane::ops::recording::CursorBufferRecord::AddFb { .. }
+        )
+    }) {
+        assert!(
+            records.iter().any(|record| matches!(
+                record,
+                crate::kms::cursor_plane::ops::recording::CursorBufferRecord::RemoveFb { .. }
+            )),
+            "free cursor sprites are removed after the plane is dropped"
+        );
+    }
 }
 
 pub(crate) fn record_count(fixture: &AtomicPathFixture, device_fd: RawFd) -> usize {
@@ -904,7 +991,7 @@ pub(crate) fn assert_no_cursor_resources(
     }
 }
 
-fn has_unretired_accepted_event(
+pub(crate) fn has_unretired_accepted_event(
     events: &AtomicEventFixture,
     delivered: &HashSet<CompletionKey>,
     output_idx: usize,

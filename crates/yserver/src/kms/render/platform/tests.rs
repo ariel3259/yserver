@@ -1334,7 +1334,7 @@ fn still_visible_show_failure_records_owning_fallback_without_stale_move() {
 fn hide_failure_classification_is_bounded_and_success_does_not_clear_it() {
     let crtc = ::drm::control::from_u32(19).unwrap();
     let mut state = KmsCursorState::new();
-    let einval = Err(io::Error::from_raw_os_error(libc::EINVAL));
+    let einval: io::Result<()> = Err(io::Error::from_raw_os_error(libc::EINVAL));
     assert_eq!(
         apply_cursor_operation_result(&mut state, crtc, &einval),
         CursorFailureDisposition::Transient
@@ -1388,7 +1388,7 @@ fn hide_failure_classification_is_bounded_and_success_does_not_clear_it() {
 fn actual_upload_invalid_input_enters_one_bounded_local_fallback() {
     let crtc = ::drm::control::from_u32(21).unwrap();
     let mut state = KmsCursorState::new();
-    let upload = Err(io::Error::new(
+    let upload: io::Result<()> = Err(io::Error::new(
         io::ErrorKind::InvalidInput,
         "cursor bytes shorter than width*height*4",
     ));

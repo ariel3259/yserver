@@ -258,6 +258,14 @@ pub(super) fn apply_cursor_show_failure_state(
     disposition
 }
 
+pub(super) fn apply_cursor_operation_error(
+    state: &mut KmsCursorState,
+    crtc: ::drm::control::crtc::Handle,
+    error: &io::Error,
+) -> CursorFailureDisposition {
+    state.note_cursor_failure_pair(crtc, error, None)
+}
+
 pub(super) fn apply_cursor_operation_result(
     state: &mut KmsCursorState,
     crtc: ::drm::control::crtc::Handle,
@@ -267,7 +275,7 @@ pub(super) fn apply_cursor_operation_result(
         .as_ref()
         .err()
         .map_or(CursorFailureDisposition::Unchanged, |error| {
-            state.note_cursor_failure_pair(crtc, error, None)
+            apply_cursor_operation_error(state, crtc, error)
         })
 }
 
@@ -1010,11 +1018,10 @@ impl PlatformBackend {
                     Ok(crate::kms::render::scene::CursorUploadOutcome::Deferred)
                 }
                 Err(error) => {
-                    let classification_error = Err(io::Error::new(error.kind(), error.to_string()));
-                    apply_cursor_operation_result(
+                    apply_cursor_operation_error(
                         &mut self.devices[device_idx].cursor,
                         crtc,
-                        &classification_error,
+                        &error,
                     );
                     Err(error)
                 }
