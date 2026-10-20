@@ -264,6 +264,13 @@ pub(super) fn install_cursor_plane_for_device(
     boundary: &str,
     plane: crate::kms::cursor_plane::CursorPlane,
 ) {
+    let decision = plane.state_path();
+    log::info!(
+        "render cursor: device {} cursor_state_path={} reason={}",
+        kms_device.key,
+        decision.path,
+        decision.reason,
+    );
     kms_device.cursor.topology_blocked = !plane.supports_crtcs(crtcs);
     kms_device.cursor.atomic_cursor = plane.supports_atomic_positions(crtcs);
     kms_device.cursor.initialization_retryable = false;
@@ -896,6 +903,16 @@ impl PlatformBackend {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_tests_note_unbound_cursor_failure(
+        &mut self,
+        device_idx: usize,
+        crtc: ::drm::control::crtc::Handle,
+        error: &io::Error,
+    ) -> bool {
+        self.note_unbound_cursor_failure(device_idx, crtc, error)
+    }
+
     /// Diagnostic/test hook: whether one particular device is permanently
     /// latched to software cursor composition.
     #[must_use]
@@ -905,6 +922,14 @@ impl PlatformBackend {
     ) -> bool {
         self.device_for_key(key)
             .is_some_and(|device| device.cursor.permanently_disabled)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_hw_cursor_disabled_for_device(
+        &self,
+        key: crate::platform::drm::DrmDeviceKey,
+    ) -> bool {
+        self.hw_cursor_disabled_for_device(key)
     }
 
     /// A new sprite or hotspot invalidates EINVAL observations made against a
@@ -1402,6 +1427,7 @@ impl PlatformBackend {
                 factory(device, &crtcs, "lifecycle retry");
             }
             if let Some(plane) = device.cursor.plane.as_mut() {
+                plane.sprites_mut().set_active_crtc_count(crtcs.len());
                 plane.retain_crtcs(&crtcs.iter().copied().collect());
             }
             let blocked = device
@@ -1425,6 +1451,40 @@ impl PlatformBackend {
             }
             device.cursor.topology_blocked = blocked;
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_install_cursor_plane_from_snapshot(
+        &mut self,
+        device_idx: usize,
+        snapshot: crate::kms::cursor_plane::topology::CursorPlaneTestSnapshot,
+        buffer_io: Rc<dyn crate::kms::cursor_plane::ops::CursorBufferIo>,
+        width: u32,
+        height: u32,
+    ) {
+        let device = Rc::clone(
+            &self
+                .devices
+                .get(device_idx)
+                .expect("test cursor device index")
+                .device,
+        );
+        let device_key = self.devices[device_idx].key;
+        let crtcs: Vec<_> = self
+            .outputs
+            .iter()
+            .filter(|output| output.key.device_key == device_key)
+            .map(|output| output.output.crtc)
+            .collect();
+        let plane = crate::kms::cursor_plane::CursorPlane::for_tests_from_snapshot(
+            device, &crtcs, buffer_io, snapshot, width, height,
+        );
+        install_cursor_plane_for_device(
+            &mut self.devices[device_idx],
+            &crtcs,
+            "test snapshot",
+            plane,
+        );
     }
 
     /// Run the one-time first-output factory for an opened device that began

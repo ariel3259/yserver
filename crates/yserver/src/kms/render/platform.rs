@@ -249,6 +249,16 @@ pub(crate) struct KmsCursorState {
     sprite_signature: Option<(u16, u16, u16, u16)>,
 }
 
+impl KmsCursorState {
+    pub(crate) fn state_path(&self) -> crate::kms::cursor_plane::topology::CursorStatePath {
+        self.plane
+            .as_ref()
+            .map(crate::kms::cursor_plane::CursorPlane::state_path)
+            .map(|decision| decision.path)
+            .unwrap_or(crate::kms::cursor_plane::topology::CursorStatePath::Legacy)
+    }
+}
+
 /// Aggregate result of one pointer move fanout. A fallback change means a
 /// device/output changed HW eligibility and the scene must repaint its SW
 /// outputs even if the cursor aggregate mode still contains live HW planes.

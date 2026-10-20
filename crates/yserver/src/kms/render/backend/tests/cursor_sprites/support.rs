@@ -2,7 +2,7 @@ use crate::{
     drm::atomic::tests_support::{
         AtomicCommitRecord, RecordingAtomicCommitExecutor, ScriptedResult,
     },
-    kms::render::backend::KmsBackend,
+    kms::{cursor_plane::ops::recording::CursorBufferLedger, render::backend::KmsBackend},
 };
 use std::{
     collections::HashSet,
@@ -162,7 +162,10 @@ pub(crate) fn retire_pending_output(
     id
 }
 
-pub(crate) fn assert_no_cursor_resources(backend: &KmsBackend) {
+pub(crate) fn assert_no_cursor_resources(
+    backend: &KmsBackend,
+    ledger: Option<&CursorBufferLedger>,
+) {
     assert!(
         !backend.platform.any_cursor_commit_in_flight(),
         "cursor commit still in flight",
@@ -181,6 +184,22 @@ pub(crate) fn assert_no_cursor_resources(backend: &KmsBackend) {
         assert!(
             !backend.platform.cursor_retry_waits_for_flip(output_idx),
             "cursor retry still waiting for output {output_idx}",
+        );
+    }
+    for device in &backend.platform.devices {
+        if let Some(plane) = &device.cursor.plane {
+            assert!(
+                plane.sprites().all_users_zero(),
+                "cursor sprite pool still has users or reservations for device {}",
+                device.key,
+            );
+        }
+    }
+    if let Some(ledger) = ledger {
+        assert_eq!(
+            ledger.end_state(),
+            (0, 0, 0),
+            "cursor buffer ledger is not empty"
         );
     }
 }
@@ -243,7 +262,7 @@ pub(crate) fn finish_fixture(
         Backend::before_block(&mut events.backend);
     }
     events.assert_quiescent();
-    assert_no_cursor_resources(&events.backend);
+    assert_no_cursor_resources(&events.backend, None);
 }
 
 #[cfg(test)]
@@ -646,7 +665,7 @@ mod tests {
         Backend::warp_pointer_root(&mut events.backend, &mut events.state, 120, 110);
         Backend::maybe_composite(&mut events.backend).expect("submit cursor-only move");
         let assertion = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            super::assert_no_cursor_resources(&events.backend);
+            super::assert_no_cursor_resources(&events.backend, None);
         }));
         let mut delivered = HashSet::new();
         super::finish_fixture(&mut events, &mut delivered);
