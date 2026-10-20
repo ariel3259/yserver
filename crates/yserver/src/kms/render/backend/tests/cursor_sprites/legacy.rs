@@ -67,72 +67,38 @@ fn install_snapshot(
     ledger
 }
 
-#[test]
-#[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: allocate a Legacy sprite pool or issue AddFB2 on the Legacy path.
-fn p2_legacy_path_device_uses_masters_ioctls_and_allocates_no_sprites() {
-    use super::super::commit_identity::{
-        recording_scene::RecordingSceneFixture, support::AtomicEventFixture,
-    };
-
-    let mut headless = AtomicEventFixture::new(1);
-    let crtc = u32::from(headless.backend.platform.outputs[0].output.crtc);
-    let scenarios = [
-        (
-            Some("FB_ID"),
-            Some(CursorDeviceCaps::new(false, Some("amdgpu".to_owned()))),
-            CursorPathReason::MissingProperty("FB_ID"),
-        ),
-        (
-            None,
-            Some(CursorDeviceCaps::new(false, Some("virtio_gpu".to_owned()))),
-            CursorPathReason::HotspotSupportMissing,
-        ),
-        (None, None, CursorPathReason::NoDeviceCaps),
-    ];
-    let mut headless_ledgers = Vec::new();
-    for (missing_property, caps, reason) in scenarios {
-        let ledger = install_snapshot(&mut headless, snapshot(crtc, missing_property, caps));
-        let plane = headless.backend.platform.devices[0]
-            .cursor
-            .plane
-            .as_ref()
-            .expect("headless Legacy cursor plane");
-        assert_eq!(plane.state_path().path, CursorStatePath::Legacy);
-        assert_eq!(plane.state_path().reason, reason);
-        assert_eq!(plane.sprites().for_tests_buffer_count(), 0);
-        assert!(
-            ledger.records().is_empty(),
-            "Legacy install did not allocate a sprite"
-        );
-        assert_eq!(ledger.end_state(), (0, 0, 0));
-        headless_ledgers.push(ledger);
-    }
-    let mut headless_delivered = HashSet::new();
-    finish_fixture(&mut headless, &mut headless_delivered);
-    assert!(
-        headless_ledgers
-            .iter()
-            .all(|ledger| ledger.records().is_empty())
-    );
+fn exercise_legacy_backend_scenario(
+    scenario_name: &str,
+    missing_property: Option<&str>,
+    caps: Option<CursorDeviceCaps>,
+    reason: CursorPathReason,
+) -> bool {
+    use super::super::commit_identity::recording_scene::RecordingSceneFixture;
 
     let Some(mut scene) = RecordingSceneFixture::new(1).expect("Legacy scene fixture") else {
-        return;
+        return false;
     };
     let output = &scene.events.backend.platform.outputs[0];
     let crtc = output.output.crtc;
     let device_key = output.key.device_key;
     let ledger = install_snapshot(
         &mut scene.events,
-        snapshot(
-            u32::from(crtc),
-            Some("FB_ID"),
-            Some(CursorDeviceCaps::new(false, Some("amdgpu".to_owned()))),
-        ),
+        snapshot(u32::from(crtc), missing_property, caps),
     );
     let legacy = Rc::new(super::support::RecordingLegacyCursor::default());
     let device = &mut scene.events.backend.platform.devices[0];
     assert_eq!(device.cursor.state_path(), CursorStatePath::Legacy);
+    assert_eq!(
+        device
+            .cursor
+            .plane
+            .as_ref()
+            .expect("installed Legacy plane")
+            .state_path()
+            .reason,
+        reason,
+        "{scenario_name} snapshot keeps its expected Legacy reason",
+    );
     let plane = device
         .cursor
         .plane
@@ -176,9 +142,21 @@ fn p2_legacy_path_device_uses_masters_ioctls_and_allocates_no_sprites() {
     let mut delivered = HashSet::new();
     Backend::maybe_composite(&mut scene.events.backend).expect("compose the Legacy cursor scene");
     retire_pending_output(&mut scene.events, &mut delivered, 0, 1);
-    assert_eq!(legacy.show_calls.get(), 1);
-    assert_eq!(legacy.move_calls.get(), 1);
-    assert_eq!(legacy.hide_calls.get(), 0);
+    assert_eq!(
+        legacy.show_calls.get(),
+        1,
+        "{scenario_name} legacy show count"
+    );
+    assert_eq!(
+        legacy.move_calls.get(),
+        1,
+        "{scenario_name} legacy move count"
+    );
+    assert_eq!(
+        legacy.hide_calls.get(),
+        0,
+        "{scenario_name} legacy hide count"
+    );
 
     for frame in 2..=4 {
         Backend::maybe_composite(&mut scene.events.backend)
@@ -204,7 +182,7 @@ fn p2_legacy_path_device_uses_masters_ioctls_and_allocates_no_sprites() {
             .platform
             .for_tests_atomic_cursor_pending_position(device_key, crtc),
         None,
-        "Legacy position update settled after its accepted event",
+        "{scenario_name} Legacy position update settles after its accepted event",
     );
     let output_records: Vec<_> = accepted_live_records(&scene.events.recorders[&device_fd])
         .into_iter()
@@ -216,24 +194,43 @@ fn p2_legacy_path_device_uses_masters_ioctls_and_allocates_no_sprites() {
             .map(|record| record.kind)
             .collect::<Vec<_>>(),
         [AtomicCommitKind::Scene, AtomicCommitKind::CursorOnly],
-        "Legacy show stays on the ioctl path and only the pointer move uses an atomic commit",
+        "{scenario_name} Legacy show stays on the ioctl path and only pointer movement uses an atomic commit",
     );
     let position_records: Vec<_> = output_records
         .iter()
         .filter(|record| record.kind == AtomicCommitKind::CursorOnly)
         .collect();
-    assert!(!position_records.is_empty());
+    assert!(
+        !position_records.is_empty(),
+        "{scenario_name} position commit exists"
+    );
     for record in position_records {
         let properties: HashSet<_> = record
             .properties
             .iter()
             .map(|property| property.property)
             .collect();
-        assert_eq!(properties, HashSet::from([crtc_x, crtc_y]));
+        assert_eq!(
+            properties,
+            HashSet::from([crtc_x, crtc_y]),
+            "{scenario_name} cursor-only commit contains only CRTC_X and CRTC_Y",
+        );
     }
-    assert_eq!(legacy.show_calls.get(), 1);
-    assert_eq!(legacy.move_calls.get(), 1);
-    assert_eq!(legacy.hide_calls.get(), 0);
+    assert_eq!(
+        legacy.show_calls.get(),
+        1,
+        "{scenario_name} legacy show count"
+    );
+    assert_eq!(
+        legacy.move_calls.get(),
+        1,
+        "{scenario_name} legacy move count"
+    );
+    assert_eq!(
+        legacy.hide_calls.get(),
+        0,
+        "{scenario_name} legacy hide count"
+    );
     assert_eq!(
         scene.events.backend.platform.devices[0]
             .cursor
@@ -243,10 +240,11 @@ fn p2_legacy_path_device_uses_masters_ioctls_and_allocates_no_sprites() {
             .sprites()
             .for_tests_buffer_count(),
         0,
+        "{scenario_name} Legacy path never allocates sprites",
     );
     assert!(
         ledger.records().is_empty(),
-        "Legacy upload never AddFB2s a sprite"
+        "{scenario_name} Legacy upload never AddFB2s a sprite",
     );
 
     Backend::define_cursor(&mut scene.events.backend, None, root, 0x7f10)
@@ -259,10 +257,84 @@ fn p2_legacy_path_device_uses_masters_ioctls_and_allocates_no_sprites() {
             .atomic_commit_sink
             .for_tests_pending_page_flip_entry_count(),
         0,
+        "{scenario_name} leaves no pending page flip",
     );
     assert_eq!(ledger.records(), []);
     scene.finish_after_normal_drain();
-    assert_eq!(ledger.end_state(), (0, 0, 0));
+    assert_eq!(
+        ledger.end_state(),
+        (0, 0, 0),
+        "{scenario_name} ledger settles"
+    );
+    true
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: skip Legacy show for rejected-cap/no-caps snapshots, allocate a
+// Legacy sprite pool, or issue AddFB2.
+fn p2_legacy_path_device_uses_masters_ioctls_and_allocates_no_sprites() {
+    use super::super::commit_identity::support::AtomicEventFixture;
+
+    let mut headless = AtomicEventFixture::new(1);
+    let crtc = u32::from(headless.backend.platform.outputs[0].output.crtc);
+    let scenarios = [
+        (
+            "missing FB_ID",
+            Some("FB_ID"),
+            Some(CursorDeviceCaps::new(false, Some("amdgpu".to_owned()))),
+            CursorPathReason::MissingProperty("FB_ID"),
+        ),
+        (
+            "rejected virtio hotspot capability",
+            None,
+            Some(CursorDeviceCaps::new(false, Some("virtio_gpu".to_owned()))),
+            CursorPathReason::HotspotSupportMissing,
+        ),
+        (
+            "missing device caps",
+            None,
+            None,
+            CursorPathReason::NoDeviceCaps,
+        ),
+    ];
+    let mut headless_ledgers = Vec::new();
+    for (_, missing_property, caps, reason) in scenarios.iter().cloned() {
+        let ledger = install_snapshot(&mut headless, snapshot(crtc, missing_property, caps));
+        let plane = headless.backend.platform.devices[0]
+            .cursor
+            .plane
+            .as_ref()
+            .expect("headless Legacy cursor plane");
+        assert_eq!(plane.state_path().path, CursorStatePath::Legacy);
+        assert_eq!(plane.state_path().reason, reason);
+        assert_eq!(plane.sprites().for_tests_buffer_count(), 0);
+        assert!(
+            ledger.records().is_empty(),
+            "Legacy install did not allocate a sprite"
+        );
+        assert_eq!(ledger.end_state(), (0, 0, 0));
+        headless_ledgers.push(ledger);
+    }
+    let mut headless_delivered = HashSet::new();
+    finish_fixture(&mut headless, &mut headless_delivered);
+    assert!(
+        headless_ledgers
+            .iter()
+            .all(|ledger| ledger.records().is_empty())
+    );
+
+    for (scenario_index, (scenario_name, missing_property, caps, reason)) in
+        scenarios.iter().cloned().enumerate()
+    {
+        if !exercise_legacy_backend_scenario(scenario_name, missing_property, caps, reason) {
+            assert_eq!(
+                scenario_index, 0,
+                "Legacy scene fixture became unavailable after a scenario already ran",
+            );
+            return;
+        }
+    }
 }
 
 #[test]
