@@ -188,6 +188,12 @@ fn copied_atomic_fixture(test_name: &str) -> Option<AtomicPathFixture> {
 
 fn complete_copied_render(fixture: &mut AtomicPathFixture) {
     let job_ids = fixture.scene.pending_render_job_ids();
+    if !job_ids.is_empty() {
+        // The readiness fixture controls when Backend sees a render completion;
+        // it does not stand in for GPU completion. Settle the submitted work
+        // before releasing those completion notifications.
+        fixture.scene.events.wait_for_submitted_gpu_work();
+    }
     for job_id in job_ids {
         fixture
             .scene
@@ -201,6 +207,10 @@ fn complete_copied_render(fixture: &mut AtomicPathFixture) {
             &mut fixture.scene.events.backend,
             &mut fixture.scene.events.state,
         );
+        // The copied sink handoff may submit queue work while the source
+        // completion is consumed. The test injects flip events after this
+        // helper returns, so settle that handoff before permitting retirement.
+        fixture.scene.events.wait_for_submitted_gpu_work();
         if fixture.scene.pending_render_job_ids().is_empty() {
             return;
         }
@@ -309,6 +319,7 @@ fn finish_copied_fixture(
         }
     }
     assert!(applied_cursor_binding(&fixture.scene.events.backend, 0).is_none());
+    assert!(fixture.scene.pending_render_job_ids().is_empty());
     finish_atomic_fixture(fixture, delivered);
 }
 
@@ -642,6 +653,12 @@ fn p2_staged_replacement_hotspot_does_not_shift_the_applied_plane() {
         properties.fb_id,
         |record| record_property(record, properties.fb_id) != Some(binding_a.framebuffer.into()),
     );
+    assert_eq!(
+        record_property(&replacement, properties.crtc_x),
+        Some(132),
+        "replacement carries x after its hotspot changes the position from the scene value",
+    );
+    assert_eq!(record_property(&replacement, properties.crtc_y), Some(112));
     let binding_b = applied_cursor_binding(&fixture.scene.events.backend, 0)
         .expect("replacement binding accepted");
     assert_eq!((binding_b.hot_x, binding_b.hot_y), (8, 8));
@@ -668,7 +685,7 @@ fn p2_staged_replacement_hotspot_does_not_shift_the_applied_plane() {
 
 #[test]
 #[ignore = "requires the lavapipe GPU scene fixture"]
-// Mutation: skip updating `applied.x/y` after an accepted scene position.
+// Mutation: skip applied x/y upkeep after a scene position; the equal replacement must omit x/y.
 fn p2_accepted_scene_position_updates_the_applied_state() {
     let Some(mut fixture) = atomic_fixture("p2_accepted_scene_position_updates_the_applied_state")
     else {
@@ -677,6 +694,14 @@ fn p2_accepted_scene_position_updates_the_applied_state() {
     let mut delivered = HashSet::new();
     let hardware = establish(&mut fixture, &mut delivered, (0, 0));
     let properties = cursor_properties_for_output(&fixture.scene.events.backend, 0);
+    let binding_a = applied_cursor_binding(&fixture.scene.events.backend, 0).unwrap();
+    let cursor_b = create_argb_cursor(
+        &mut fixture.scene.events.backend,
+        (8, 8),
+        [0xff, 0x80, 0x80, 0xff],
+        (0, 0),
+    );
+    define_root_cursor(&mut fixture.scene.events.backend, cursor_b);
     let start = records(&fixture, hardware).len();
     Backend::warp_pointer_root(
         &mut fixture.scene.events.backend,
@@ -714,50 +739,84 @@ fn p2_accepted_scene_position_updates_the_applied_state() {
         .expect("accepted scene commit carries CRTC_X/Y");
     assert_position_only(&scene, properties, (130, 110));
     let applied = applied_cursor_binding(&fixture.scene.events.backend, 0).unwrap();
-    assert_eq!((applied.x, applied.y), (130, 110));
     retire_cursor_record(&mut fixture, &mut delivered, 0, &scene, 49);
 
-    let stable_count = records(&fixture, hardware).len();
-    Backend::warp_pointer_root(
-        &mut fixture.scene.events.backend,
-        &mut fixture.scene.events.state,
-        130,
-        110,
+    let equal_replacement = compose_until_cursor_commit_where(
+        &mut fixture,
+        &mut delivered,
+        0,
+        start,
+        properties.fb_id,
+        |record| record_property(record, properties.fb_id) != Some(binding_a.framebuffer.into()),
     );
-    assert!(
-        fixture
-            .scene
-            .events
-            .backend
-            .platform
-            .for_tests_atomic_cursor_pending_position(
-                fixture.scene.events.backend.platform.outputs[0]
-                    .key
-                    .device_key,
-                hardware.crtc,
-            )
-            .is_none()
-    );
-    Backend::maybe_composite(&mut fixture.scene.events.backend)
-        .expect("same applied position needs no cursor-only move");
-    assert_eq!(records(&fixture, hardware).len(), stable_count);
+    assert_eq!(record_property(&equal_replacement, properties.crtc_x), None);
+    assert_eq!(record_property(&equal_replacement, properties.crtc_y), None);
+    let binding_b = applied_cursor_binding(&fixture.scene.events.backend, 0).unwrap();
+    assert_eq!((binding_b.x, binding_b.y), (130, 110));
+    assert_eq!((applied.x, applied.y), (130, 110));
+    retire_cursor_record(&mut fixture, &mut delivered, 0, &equal_replacement, 50);
 
-    let move_start = records(&fixture, hardware).len();
+    let cursor_c = create_argb_cursor(
+        &mut fixture.scene.events.backend,
+        (8, 8),
+        [0x80, 0xff, 0x80, 0xff],
+        (8, 8),
+    );
+    define_root_cursor(&mut fixture.scene.events.backend, cursor_c);
     Backend::warp_pointer_root(
         &mut fixture.scene.events.backend,
         &mut fixture.scene.events.state,
         137,
         115,
     );
+    let root = fixture.scene.events.backend.core.window_id;
+    let width = fixture.scene.events.backend.platform.fb_w;
+    let height = fixture.scene.events.backend.platform.fb_h;
+    Backend::clear_area(
+        &mut fixture.scene.events.backend,
+        None,
+        root,
+        0,
+        None,
+        0,
+        0,
+        width,
+        height,
+        (0, 0),
+    )
+    .expect("damage root before changed-position replacement");
+    let changed_scene_start = records(&fixture, hardware).len();
     Backend::maybe_composite(&mut fixture.scene.events.backend)
-        .expect("submit a position absent from the previous scene commit");
-    let moved = records(&fixture, hardware)
+        .expect("submit a scene position before changed-position replacement");
+    let changed_scene = records(&fixture, hardware)
         .into_iter()
-        .skip(move_start)
-        .find(|record| record.kind == AtomicCommitKind::CursorOnly)
-        .expect("new position is sent after the accepted scene position");
-    assert_position_only(&moved, properties, (137, 115));
-    retire_cursor_record(&mut fixture, &mut delivered, 0, &moved, 50);
+        .skip(changed_scene_start)
+        .find(|record| {
+            matches!(
+                record.kind,
+                AtomicCommitKind::Scene | AtomicCommitKind::SceneWithCursor
+            ) && record_property(record, properties.crtc_x).is_some()
+        })
+        .expect("scene carries the position under the applied hotspot");
+    assert_position_only(&changed_scene, properties, (137, 115));
+    retire_cursor_record(&mut fixture, &mut delivered, 0, &changed_scene, 51);
+    let changed_replacement = compose_until_cursor_commit_where(
+        &mut fixture,
+        &mut delivered,
+        0,
+        changed_scene_start,
+        properties.fb_id,
+        |record| record_property(record, properties.fb_id) != Some(binding_b.framebuffer.into()),
+    );
+    assert_eq!(
+        record_property(&changed_replacement, properties.crtc_x),
+        Some(129)
+    );
+    assert_eq!(
+        record_property(&changed_replacement, properties.crtc_y),
+        Some(107)
+    );
+    retire_cursor_record(&mut fixture, &mut delivered, 0, &changed_replacement, 52);
     finish(fixture, &mut delivered, hardware);
 }
 
@@ -1178,7 +1237,7 @@ fn p2_motion_led_hide_recovery_settles_the_applied_state() {
 
 #[test]
 #[ignore = "requires the lavapipe GPU scene fixture"]
-// Mutation: retry EBUSY on every pass or send each intermediate pointer position.
+// Mutation: fail to re-enable the latest cursor-only retry after the next event.
 fn p2_busy_stream_keeps_latest_intent_and_waits_for_the_event() {
     let Some(mut fixture) =
         atomic_fixture("p2_busy_stream_keeps_latest_intent_and_waits_for_the_event")
@@ -1258,8 +1317,9 @@ fn p2_busy_stream_keeps_latest_intent_and_waits_for_the_event() {
             hardware.crtc,
         )
         .expect("latest position remains unsent after EBUSY");
-    // The next accepted scene event clears the wait and carries the one
-    // latest-position retry with its scene update.
+    // The scene carries the latest point at submission. Motion during that
+    // scene flight must remain pending and be sent by one cursor-only commit
+    // after its event clears the EBUSY wait.
     let root = fixture.scene.events.backend.core.window_id;
     let width = fixture.scene.events.backend.platform.fb_w;
     let height = fixture.scene.events.backend.platform.fb_h;
@@ -1288,10 +1348,14 @@ fn p2_busy_stream_keeps_latest_intent_and_waits_for_the_event() {
             )
         })
         .expect("scene commit accepted");
-    assert_position_only(
-        &scene,
-        cursor_properties_for_output(&fixture.scene.events.backend, hardware.output_idx),
-        (160, 140),
+    let properties =
+        cursor_properties_for_output(&fixture.scene.events.backend, hardware.output_idx);
+    assert_position_only(&scene, properties, (160, 140));
+    Backend::warp_pointer_root(
+        &mut fixture.scene.events.backend,
+        &mut fixture.scene.events.state,
+        170,
+        150,
     );
     retire_cursor_record(
         &mut fixture,
@@ -1299,6 +1363,33 @@ fn p2_busy_stream_keeps_latest_intent_and_waits_for_the_event() {
         hardware.output_idx,
         &scene,
         46,
+    );
+
+    let cursor_retry_start = records(&fixture, hardware).len();
+    Backend::before_block(&mut fixture.scene.events.backend);
+    Backend::maybe_composite(&mut fixture.scene.events.backend)
+        .expect("event retirement re-enables one cursor-only retry");
+    let cursor_retry = records(&fixture, hardware)
+        .into_iter()
+        .skip(cursor_retry_start)
+        .find(|record| record.kind == AtomicCommitKind::CursorOnly)
+        .expect("latest pending motion is retried as CursorOnly after the scene event");
+    assert_position_only(&cursor_retry, properties, (170, 150));
+    assert_eq!(
+        records(&fixture, hardware)
+            .into_iter()
+            .skip(cursor_retry_start)
+            .filter(|record| record.kind == AtomicCommitKind::CursorOnly)
+            .count(),
+        1,
+        "one post-event cursor-only retry carries the latest position",
+    );
+    retire_cursor_record(
+        &mut fixture,
+        &mut delivered,
+        hardware.output_idx,
+        &cursor_retry,
+        47,
     );
     assert!(
         fixture
@@ -1318,7 +1409,7 @@ fn p2_busy_stream_keeps_latest_intent_and_waits_for_the_event() {
     for _ in 0..3 {
         Backend::before_block(&mut fixture.scene.events.backend);
         Backend::maybe_composite(&mut fixture.scene.events.backend)
-            .expect("settled latest position does not submit again");
+            .expect("settled latest position is not submitted again");
         assert_eq!(records(&fixture, hardware).len(), settled);
     }
     finish(fixture, &mut delivered, hardware);

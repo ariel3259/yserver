@@ -421,6 +421,18 @@ pub(crate) fn finish_atomic_fixture(
     let root = fixture.scene.events.backend.core.window_id;
     Backend::define_cursor(&mut fixture.scene.events.backend, None, root, 0x7f10)
         .expect("restore the fixture's sticky root cursor through Backend");
+    if fixture.scene.readiness.is_some() {
+        // Mutation: free copied-route cursor sprites before the submitted GPU
+        // work settles. The bounded wait covers source and copied-sink queues;
+        // Backend completion polling retires any source-job bookkeeping first.
+        fixture.scene.events.wait_for_submitted_gpu_work();
+        Backend::on_scanout_render_completion(
+            &mut fixture.scene.events.backend,
+            &mut fixture.scene.events.state,
+        );
+        assert!(fixture.scene.pending_render_job_ids().is_empty());
+        fixture.scene.events.wait_for_submitted_gpu_work();
+    }
     let test_cursors: Vec<_> = fixture
         .scene
         .events

@@ -612,6 +612,15 @@ impl RecordingSceneFixture {
         for _ in 0..32 {
             Backend::before_block(&mut self.events.backend);
         }
+        if self.readiness.is_some() {
+            // Copied sink handoffs may enqueue queue work while the final
+            // Backend reclaim passes run. Fence every source/sink queue after
+            // those passes, then let Backend consume any completion notice.
+            self.events.wait_for_submitted_gpu_work();
+            Backend::on_scanout_render_completion(&mut self.events.backend, &mut self.events.state);
+            assert!(self.pending_render_job_ids().is_empty());
+            self.events.wait_for_submitted_gpu_work();
+        }
         assert_eq!(self.events.backend.store.pending_retire_count(), 0);
         assert!(self.events.backend.store.lookup(root).is_none());
         self.events

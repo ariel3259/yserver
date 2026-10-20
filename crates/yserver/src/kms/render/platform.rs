@@ -588,6 +588,20 @@ pub struct PlatformBackend {
 }
 
 impl PlatformBackend {
+    #[cfg(test)]
+    pub(crate) fn for_tests_gpu_contexts(&self) -> Vec<Arc<VkContext>> {
+        let mut contexts = Vec::new();
+        if let Some(vk) = self.gpu.vk.as_ref() {
+            contexts.push(Arc::clone(vk));
+        }
+        for vk in self.copy_vk_contexts.values() {
+            if !contexts.iter().any(|context| Arc::ptr_eq(context, vk)) {
+                contexts.push(Arc::clone(vk));
+            }
+        }
+        contexts
+    }
+
     pub(crate) fn set_tearing_on(&mut self, on: bool) {
         self.tearing_on = on;
         for device in &self.devices {

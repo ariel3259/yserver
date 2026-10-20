@@ -1271,6 +1271,54 @@ impl PlatformBackend {
         self.try_cursor_plane_move_for_device(device_idx, x, y, hot_x, hot_y, motion_timestamp)
     }
 
+    fn apply_cursor_motion_hide_recovery_result(
+        &mut self,
+        device_idx: usize,
+        crtc: ::drm::control::crtc::Handle,
+        recovery: CursorHideRecovery,
+        result: io::Result<()>,
+        operation: &str,
+    ) -> CursorMoveOutcome {
+        let device_key = self.devices[device_idx].key;
+        let mut outcome = CursorMoveOutcome::default();
+        match result {
+            Ok(()) => {
+                let state = &mut self.devices[device_idx].cursor;
+                state.cursor_hide_recovery.remove(&crtc);
+                state.clear_atomic_position(crtc);
+                state.note_einval(crtc);
+                outcome.fallback_changed = true;
+                log::warn!(
+                    "render cursor hide recovery: device {device_key} CRTC {crtc:?} {operation} succeeded on pointer motion; entering transient software fallback"
+                );
+            }
+            Err(error) => {
+                let attempts = recovery.attempts.saturating_add(1);
+                let state = &mut self.devices[device_idx].cursor;
+                state
+                    .cursor_hide_recovery
+                    .insert(crtc, CursorHideRecovery { attempts });
+                outcome.retry_required = true;
+                if attempts >= 3 {
+                    state.permanently_disabled = true;
+                    state.atomic_positions.clear();
+                    state.atomic_pending_moves.clear();
+                    state.cursor_retry_waits_for_flip.clear();
+                    state.cursor_hide_recovery.clear();
+                    outcome.fallback_changed = true;
+                    log::error!(
+                        "render cursor hide recovery: device {device_key} CRTC {crtc:?} {operation} failed 3 times ({error}); permanently disabling the hardware cursor"
+                    );
+                } else {
+                    log::warn!(
+                        "render cursor hide recovery: device {device_key} CRTC {crtc:?} {operation} retry {attempts}/3 failed ({error})"
+                    );
+                }
+            }
+        }
+        outcome
+    }
+
     /// Internal helper: per-CRTC `move_to` iteration that returns the
     /// number of CRTCs whose move ioctl returned `EBUSY`. Shared by
     /// `cursor_plane_move` (first-attempt path) and
@@ -1309,48 +1357,27 @@ impl PlatformBackend {
             if !self.devices[device_idx].cursor.hw_bound_on(crtc) {
                 continue;
             }
-            if atomic_path
-                && let Some(recovery) = self.devices[device_idx]
-                    .cursor
-                    .cursor_hide_recovery
-                    .get(&crtc)
-                    .copied()
-            {
-                match self.detach_cursor_blocking(device_idx, crtc) {
-                    Ok(()) => {
-                        let state = &mut self.devices[device_idx].cursor;
-                        state.cursor_hide_recovery.remove(&crtc);
-                        state.clear_atomic_position(crtc);
-                        state.note_einval(crtc);
-                        outcome.fallback_changed = true;
-                        log::warn!(
-                            "render cursor hide recovery: device {device_key} CRTC {crtc:?} atomic detach succeeded on pointer motion; entering transient software fallback"
-                        );
-                    }
-                    Err(error) => {
-                        let attempts = recovery.attempts.saturating_add(1);
-                        let state = &mut self.devices[device_idx].cursor;
-                        state
-                            .cursor_hide_recovery
-                            .insert(crtc, CursorHideRecovery { attempts });
-                        outcome.retry_required = true;
-                        if attempts >= 3 {
-                            state.permanently_disabled = true;
-                            state.atomic_positions.clear();
-                            state.atomic_pending_moves.clear();
-                            state.cursor_retry_waits_for_flip.clear();
-                            state.cursor_hide_recovery.clear();
-                            outcome.fallback_changed = true;
-                            log::error!(
-                                "render cursor hide recovery: device {device_key} CRTC {crtc:?} atomic detach failed 3 times ({error}); permanently disabling the hardware cursor"
-                            );
-                        } else {
-                            log::warn!(
-                                "render cursor hide recovery: device {device_key} CRTC {crtc:?} atomic detach retry {attempts}/3 failed ({error})"
-                            );
-                        }
-                    }
-                }
+            let recovery = self.devices[device_idx]
+                .cursor
+                .cursor_hide_recovery
+                .get(&crtc)
+                .copied()
+                .filter(|_| atomic_path || self.devices[device_idx].cursor.atomic_cursor);
+            if let Some(recovery) = recovery {
+                let result = if atomic_path {
+                    self.detach_cursor_blocking(device_idx, crtc)
+                } else {
+                    self.devices[device_idx]
+                        .cursor
+                        .plane
+                        .as_mut()
+                        .expect("checked cursor plane")
+                        .hide(crtc)
+                };
+                let operation = if atomic_path { "atomic detach" } else { "hide" };
+                outcome.merge(self.apply_cursor_motion_hide_recovery_result(
+                    device_idx, crtc, recovery, result, operation,
+                ));
                 continue;
             }
 
@@ -1368,47 +1395,6 @@ impl PlatformBackend {
             let (cx, cy) =
                 cursor_root_to_crtc_local(x, y, layout_x, layout_y, position_hot_x, position_hot_y);
             if state.atomic_cursor {
-                if let Some(recovery) = state.cursor_hide_recovery.get(&crtc).copied() {
-                    let hide_result = state
-                        .plane
-                        .as_mut()
-                        .expect("checked cursor plane")
-                        .hide(crtc);
-                    match hide_result {
-                        Ok(()) => {
-                            state.cursor_hide_recovery.remove(&crtc);
-                            state.clear_atomic_position(crtc);
-                            state.note_einval(crtc);
-                            outcome.fallback_changed = true;
-                            log::warn!(
-                                "render cursor hide recovery: device {device_key} CRTC {crtc:?} hide succeeded on pointer motion; entering transient software fallback"
-                            );
-                        }
-                        Err(error) => {
-                            let attempts = recovery.attempts.saturating_add(1);
-                            state
-                                .cursor_hide_recovery
-                                .insert(crtc, CursorHideRecovery { attempts });
-                            outcome.retry_required = true;
-                            if attempts >= 3 {
-                                state.permanently_disabled = true;
-                                state.atomic_positions.clear();
-                                state.atomic_pending_moves.clear();
-                                state.cursor_retry_waits_for_flip.clear();
-                                state.cursor_hide_recovery.clear();
-                                outcome.fallback_changed = true;
-                                log::error!(
-                                    "render cursor hide recovery: device {device_key} CRTC {crtc:?} hide failed 3 times ({error}); permanently disabling the hardware cursor"
-                                );
-                            } else {
-                                log::warn!(
-                                    "render cursor hide recovery: device {device_key} CRTC {crtc:?} hide retry {attempts}/3 failed ({error})"
-                                );
-                            }
-                        }
-                    }
-                    continue;
-                }
                 state.remember_atomic_position(device_key, crtc, cx, cy, Some(motion_timestamp));
                 if atomic_path
                     && state
