@@ -337,7 +337,7 @@ fn sprite_pool_allocation_failure_rolls_back_in_reverse_order() {
     )
     .expect("stage initial candidate");
     let previous = pool.candidate_lease().expect("initial candidate");
-    ledger.fail_after(CursorBufferOperation::Write, 0, 11);
+    ledger.fail_after(CursorBufferOperation::Write, 0, libc::EAGAIN);
     assert_eq!(
         prepare(
             &mut pool,
@@ -675,6 +675,75 @@ fn sprite_pool_never_rewrites_a_buffer_with_users_or_reservations() {
         "stale lease cannot reserve a rewritten slot"
     );
     assert!(pool.release_user(b));
+    assert!(pool.all_users_zero());
+    drop(pool);
+    assert_eq!(ledger.end_state(), (0, 0, 0));
+}
+
+#[test]
+fn sprite_pool_reservations_alone_prevent_rewrites() {
+    // Mutation: ignore prepared_users when choosing a writable slot; reserved bytes must remain untouched.
+    let (device, io, ledger, mut pool) = fixture();
+    prepare(
+        &mut pool,
+        &device,
+        &io,
+        1,
+        0,
+        0,
+        4,
+        4,
+        &image(4, 4, [1, 0, 0, 255]),
+    )
+    .expect("stage A");
+    let a = pool.candidate_lease().expect("A candidate");
+    assert!(pool.reserve(a));
+
+    prepare(
+        &mut pool,
+        &device,
+        &io,
+        2,
+        0,
+        0,
+        4,
+        4,
+        &image(4, 4, [2, 0, 0, 255]),
+    )
+    .expect("stage B");
+    let b = pool.candidate_lease().expect("B candidate");
+    assert!(pool.reserve(b));
+    assert_eq!(pool.prepared_user_count(), 2);
+    assert_eq!(pool.user_count(a), Some(0));
+    assert_eq!(pool.user_count(b), Some(0));
+
+    let bytes_a = pool.for_tests_sprite_bytes(a).expect("A bytes");
+    let bytes_b = pool.for_tests_sprite_bytes(b).expect("B bytes");
+    let records_before = ledger.records();
+    assert_eq!(
+        prepare(
+            &mut pool,
+            &device,
+            &io,
+            3,
+            0,
+            0,
+            4,
+            4,
+            &image(4, 4, [3, 0, 0, 255]),
+        )
+        .expect("pressure defers while both slots are reserved"),
+        SpriteStage::Deferred
+    );
+    assert_eq!(pool.wanted_version(), Some(3));
+    assert_eq!(pool.prepared_user_count(), 2);
+    assert_eq!(ledger.records(), records_before);
+    assert_eq!(pool.for_tests_sprite_bytes(a), Some(bytes_a));
+    assert_eq!(pool.for_tests_sprite_bytes(b), Some(bytes_b));
+
+    assert!(pool.reject_reserved(a));
+    assert!(pool.reject_reserved(b));
+    assert_eq!(pool.prepared_user_count(), 0);
     assert!(pool.all_users_zero());
     drop(pool);
     assert_eq!(ledger.end_state(), (0, 0, 0));
