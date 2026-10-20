@@ -1,3 +1,4 @@
+mod lifecycle;
 mod motion;
 mod scene_attach;
 mod support;

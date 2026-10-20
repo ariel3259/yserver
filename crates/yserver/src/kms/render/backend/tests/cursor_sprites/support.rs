@@ -178,7 +178,14 @@ pub(crate) struct HardwareCursor {
 
 impl AtomicPathFixture {
     pub(crate) fn new(kind: PathKind) -> Result<Option<Self>, String> {
-        let Some(mut scene) = RecordingSceneFixture::new(1)? else {
+        Self::with_output_count(kind, 1)
+    }
+
+    pub(crate) fn with_output_count(
+        kind: PathKind,
+        output_count: usize,
+    ) -> Result<Option<Self>, String> {
+        let Some(mut scene) = RecordingSceneFixture::new(output_count)? else {
             return Ok(None);
         };
         let (io, ledger) = RecordingCursorBufferIo::new(256);

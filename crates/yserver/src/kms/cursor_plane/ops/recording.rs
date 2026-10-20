@@ -56,6 +56,7 @@ pub(crate) struct CursorBufferLedger {
     storage: RefCell<CursorBufferStorageMap>,
     failures: RefCell<Vec<CursorBufferFailure>>,
     failures_taken: RefCell<Vec<CursorBufferOperation>>,
+    write_count: std::cell::Cell<usize>,
 }
 
 type CursorBufferStorageMap = HashMap<(i32, u32), Rc<RefCell<Box<[u8]>>>>;
@@ -90,6 +91,10 @@ impl CursorBufferLedger {
 
     pub(crate) fn failures_taken(&self) -> Vec<CursorBufferOperation> {
         self.failures_taken.borrow().clone()
+    }
+
+    pub(crate) fn write_count(&self) -> usize {
+        self.write_count.get()
     }
 
     pub(crate) fn fail_after(
@@ -294,6 +299,9 @@ impl CursorBufferIo for RecordingCursorBufferIo {
         if let Some(raw_os_error) = self.ledger.take_failure(CursorBufferOperation::Write) {
             return Err(io::Error::from_raw_os_error(raw_os_error));
         }
+        self.ledger
+            .write_count
+            .set(self.ledger.write_count.get().saturating_add(1));
         write_mapped_image(
             mapping,
             stride,
