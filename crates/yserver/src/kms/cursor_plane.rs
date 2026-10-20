@@ -26,6 +26,7 @@
 //! hazard).
 
 pub(crate) mod ops;
+pub(crate) mod sprites;
 
 use std::{
     collections::{HashMap, HashSet},
