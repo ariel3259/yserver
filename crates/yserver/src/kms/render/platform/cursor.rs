@@ -533,29 +533,48 @@ impl PlatformBackend {
             crtc,
             motion_timestamp: position.motion_timestamp,
         };
-        let result = commit_sink.submit(
-            &device,
-            AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK,
-            crate::drm::atomic::AtomicCommitKind::CursorOnly,
-            request,
-            &[event],
-        );
-        if let Err(error) = result {
-            let _ = commit_sink.take_last_cursor_rejection();
-            if error.raw_os_error() == Some(libc::EBUSY) {
-                self.devices[device_idx]
-                    .cursor
-                    .cursor_retry_waits_for_flip
-                    .insert(crtc);
-                return Ok(CursorMoveOutcome {
-                    ebusy_count: 1,
-                    ..CursorMoveOutcome::default()
-                });
+        let atomic_path =
+            cursor.state_path() == crate::kms::cursor_plane::topology::CursorStatePath::Atomic;
+        let result = if atomic_path {
+            commit_sink
+                .submit_with_commit_id(
+                    &device,
+                    AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK,
+                    crate::drm::atomic::AtomicCommitKind::CursorOnly,
+                    request,
+                    &[event],
+                )
+                .map(Some)
+        } else {
+            commit_sink
+                .submit(
+                    &device,
+                    AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK,
+                    crate::drm::atomic::AtomicCommitKind::CursorOnly,
+                    request,
+                    &[event],
+                )
+                .map(|()| None)
+        };
+        let commit_id = match result {
+            Ok(commit_id) => commit_id,
+            Err(error) => {
+                let _ = commit_sink.take_last_cursor_rejection();
+                if error.raw_os_error() == Some(libc::EBUSY) {
+                    self.devices[device_idx]
+                        .cursor
+                        .cursor_retry_waits_for_flip
+                        .insert(crtc);
+                    return Ok(CursorMoveOutcome {
+                        ebusy_count: 1,
+                        ..CursorMoveOutcome::default()
+                    });
+                }
+                let position = [position];
+                let outcome = self.reject_atomic_cursor_commit(&position, &error.to_string());
+                return Ok(outcome);
             }
-            let position = [position];
-            let outcome = self.reject_atomic_cursor_commit(&position, &error.to_string());
-            return Ok(outcome);
-        }
+        };
 
         let cursor = &mut self.devices[device_idx].cursor;
         if cursor
@@ -570,10 +589,24 @@ impl PlatformBackend {
         {
             latest.motion_timestamp = None;
         }
+        let matches_latest = cursor
+            .atomic_positions
+            .get(&crtc)
+            .is_some_and(|latest| latest.x == position.x && latest.y == position.y);
+        if matches_latest
+            && let Some(applied) = cursor
+                .crtc_states
+                .get_mut(&crtc)
+                .and_then(|state| state.applied.as_mut())
+            && applied.properties.plane == position.plane
+        {
+            applied.x = position.x;
+            applied.y = position.y;
+        }
         cursor.atomic_cursor_commits_in_flight.insert(
             crtc,
             crate::kms::render::platform::cursor_state::InFlightCursorCommit {
-                commit_id: None,
+                commit_id,
                 prepared: None,
             },
         );
@@ -621,9 +654,9 @@ impl PlatformBackend {
     }
 
     /// Apply master's rollback rule to every cursor CRTC in a rejected scene
-    /// transaction. A successful legacy hide enables transient software
-    /// fallback; a failed hide retains hardware ownership and arms motion-led
-    /// recovery. In both cases the rejected position is discarded.
+    /// transaction. Atomic-path devices detach their applied plane binding;
+    /// Legacy devices keep the legacy hide. In both cases the rejected
+    /// position is discarded.
     pub(crate) fn reject_atomic_cursor_commit(
         &mut self,
         positions: &[crate::drm::atomic::CursorPlanePosition],
@@ -631,39 +664,54 @@ impl PlatformBackend {
     ) -> CursorMoveOutcome {
         let mut outcome = CursorMoveOutcome::default();
         for position in positions {
-            let Some(device) = self
+            let Some(device_idx) = self
                 .devices
-                .iter_mut()
-                .find(|device| device.key == position.device_key)
+                .iter()
+                .position(|device| device.key == position.device_key)
             else {
                 continue;
             };
             let crtc = position.crtc;
-            device.cursor.clear_atomic_position(crtc);
-            device.cursor.cursor_retry_waits_for_flip.remove(&crtc);
-            let hide_result = device.cursor.plane.as_mut().map_or_else(
+            let atomic_path = self.devices[device_idx].cursor.state_path()
+                == crate::kms::cursor_plane::topology::CursorStatePath::Atomic;
+            {
+                let cursor = &mut self.devices[device_idx].cursor;
+                cursor.clear_atomic_position(crtc);
+                cursor.cursor_retry_waits_for_flip.remove(&crtc);
+            }
+            if atomic_path {
+                let rollback_error = io::Error::other(error.to_owned());
+                match self.atomic_rollback(device_idx, crtc, &rollback_error, false) {
+                    Ok(()) => outcome.fallback_changed = true,
+                    Err(_) => outcome.retry_required = true,
+                }
+                continue;
+            }
+            let device_key = self.devices[device_idx].key;
+            let hide_result = self.devices[device_idx].cursor.plane.as_mut().map_or_else(
                 || Err(io::Error::other("cursor plane unavailable during rollback")),
                 |plane| plane.hide(crtc),
             );
             match hide_result {
                 Ok(()) => {
-                    device.cursor.cursor_hide_recovery.remove(&crtc);
-                    device.cursor.note_einval(crtc);
+                    self.devices[device_idx]
+                        .cursor
+                        .cursor_hide_recovery
+                        .remove(&crtc);
+                    self.devices[device_idx].cursor.note_einval(crtc);
                     outcome.fallback_changed = true;
                     log::warn!(
-                        "render cursor atomic commit: device {} CRTC {crtc:?} rejected cursor fields ({error}); hid the plane and entered transient software fallback",
-                        device.key
+                        "render cursor atomic commit: device {device_key} CRTC {crtc:?} rejected cursor fields ({error}); hid the plane and entered transient software fallback"
                     );
                 }
                 Err(hide_error) => {
-                    device
+                    self.devices[device_idx]
                         .cursor
                         .cursor_hide_recovery
                         .insert(crtc, CursorHideRecovery::default());
                     outcome.retry_required = true;
                     log::warn!(
-                        "render cursor atomic commit: device {} CRTC {crtc:?} rejected cursor fields ({error}); hide failed ({hide_error}), retaining hardware ownership for motion recovery",
-                        device.key
+                        "render cursor atomic commit: device {device_key} CRTC {crtc:?} rejected cursor fields ({error}); hide failed ({hide_error}), retaining hardware ownership for motion recovery"
                     );
                 }
             }
@@ -711,6 +759,16 @@ impl PlatformBackend {
                     .is_some_and(|latest| latest == position);
                 if !matches_latest {
                     continue;
+                }
+                if let Some(applied) = device
+                    .cursor
+                    .crtc_states
+                    .get_mut(&position.crtc)
+                    .and_then(|state| state.applied.as_mut())
+                    && applied.properties.plane == position.plane
+                {
+                    applied.x = position.x;
+                    applied.y = position.y;
                 }
                 if device
                     .cursor
@@ -1234,23 +1292,81 @@ impl PlatformBackend {
             .filter(|layout| layout.key.device_key == device_key)
             .map(|l| (l.output.crtc, l.x, l.y))
             .collect();
-        let state = &mut self.devices[device_idx].cursor;
-        if state.plane.is_none() {
+        if self.devices[device_idx].cursor.plane.is_none() {
             return Err(io::Error::other("cursor plane unavailable"));
         }
-        if state.permanently_disabled {
+        if self.devices[device_idx].cursor.permanently_disabled {
             return Ok(CursorMoveOutcome::default());
         }
+        let atomic_path = self.devices[device_idx].cursor.state_path()
+            == crate::kms::cursor_plane::topology::CursorStatePath::Atomic;
         let mut outcome = CursorMoveOutcome::default();
         let mut keep_pending = false;
         for (crtc, layout_x, layout_y) in layouts {
-            if state.permanently_disabled {
+            if self.devices[device_idx].cursor.permanently_disabled {
                 break;
             }
-            if !state.hw_bound_on(crtc) {
+            if !self.devices[device_idx].cursor.hw_bound_on(crtc) {
                 continue;
             }
-            let (cx, cy) = cursor_root_to_crtc_local(x, y, layout_x, layout_y, hot_x, hot_y);
+            if atomic_path
+                && let Some(recovery) = self.devices[device_idx]
+                    .cursor
+                    .cursor_hide_recovery
+                    .get(&crtc)
+                    .copied()
+            {
+                match self.detach_cursor_blocking(device_idx, crtc) {
+                    Ok(()) => {
+                        let state = &mut self.devices[device_idx].cursor;
+                        state.cursor_hide_recovery.remove(&crtc);
+                        state.clear_atomic_position(crtc);
+                        state.note_einval(crtc);
+                        outcome.fallback_changed = true;
+                        log::warn!(
+                            "render cursor hide recovery: device {device_key} CRTC {crtc:?} atomic detach succeeded on pointer motion; entering transient software fallback"
+                        );
+                    }
+                    Err(error) => {
+                        let attempts = recovery.attempts.saturating_add(1);
+                        let state = &mut self.devices[device_idx].cursor;
+                        state
+                            .cursor_hide_recovery
+                            .insert(crtc, CursorHideRecovery { attempts });
+                        outcome.retry_required = true;
+                        if attempts >= 3 {
+                            state.permanently_disabled = true;
+                            state.atomic_positions.clear();
+                            state.atomic_pending_moves.clear();
+                            state.cursor_retry_waits_for_flip.clear();
+                            state.cursor_hide_recovery.clear();
+                            outcome.fallback_changed = true;
+                            log::error!(
+                                "render cursor hide recovery: device {device_key} CRTC {crtc:?} atomic detach failed 3 times ({error}); permanently disabling the hardware cursor"
+                            );
+                        } else {
+                            log::warn!(
+                                "render cursor hide recovery: device {device_key} CRTC {crtc:?} atomic detach retry {attempts}/3 failed ({error})"
+                            );
+                        }
+                    }
+                }
+                continue;
+            }
+
+            let state = &mut self.devices[device_idx].cursor;
+            let (position_hot_x, position_hot_y) = if atomic_path {
+                state
+                    .crtc_states
+                    .get(&crtc)
+                    .and_then(|crtc_state| crtc_state.applied)
+                    .map(|applied| (applied.hot_x, applied.hot_y))
+                    .unwrap_or((hot_x, hot_y))
+            } else {
+                (hot_x, hot_y)
+            };
+            let (cx, cy) =
+                cursor_root_to_crtc_local(x, y, layout_x, layout_y, position_hot_x, position_hot_y);
             if state.atomic_cursor {
                 if let Some(recovery) = state.cursor_hide_recovery.get(&crtc).copied() {
                     let hide_result = state
@@ -1294,6 +1410,15 @@ impl PlatformBackend {
                     continue;
                 }
                 state.remember_atomic_position(device_key, crtc, cx, cy, Some(motion_timestamp));
+                if atomic_path
+                    && state
+                        .crtc_states
+                        .get(&crtc)
+                        .and_then(|crtc_state| crtc_state.applied)
+                        .is_some_and(|applied| applied.x == cx && applied.y == cy)
+                {
+                    state.atomic_pending_moves.remove(&crtc);
+                }
                 continue;
             }
 
@@ -1335,6 +1460,7 @@ impl PlatformBackend {
             }
         }
         let keep_pending = keep_pending || outcome.ebusy_count > 0;
+        let state = &mut self.devices[device_idx].cursor;
         state.pending_move = keep_pending.then_some((x, y, hot_x, hot_y));
         state.pending_move_timestamp = keep_pending.then_some(motion_timestamp);
         Ok(outcome)

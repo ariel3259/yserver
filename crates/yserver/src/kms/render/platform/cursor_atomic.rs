@@ -135,7 +135,7 @@ impl PlatformBackend {
                         .insert(crtc);
                     return Err(deferred_show(&self.devices[device_idx].cursor, crtc));
                 }
-                let rollback = self.atomic_rollback(device_idx, crtc, &error);
+                let rollback = self.atomic_rollback(device_idx, crtc, &error, true);
                 return Err(match rollback {
                     Ok(()) => CursorShowError::Unbound(error),
                     Err(rollback_error) => CursorShowError::StillVisible {
@@ -258,7 +258,7 @@ impl PlatformBackend {
                         "cursor hide waits for the prior CRTC event",
                     ));
                 }
-                let _ = self.atomic_rollback(device_idx, crtc, &error);
+                let _ = self.atomic_rollback(device_idx, crtc, &error, true);
                 return Err(error);
             }
         };
@@ -370,11 +370,12 @@ impl PlatformBackend {
         Ok(())
     }
 
-    fn atomic_rollback(
+    pub(super) fn atomic_rollback(
         &mut self,
         device_idx: usize,
         crtc: ::drm::control::crtc::Handle,
         error: &io::Error,
+        defer_outcome: bool,
     ) -> io::Result<()> {
         let device_key = self.devices[device_idx].key;
         let had_applied = self.devices[device_idx]
@@ -408,7 +409,7 @@ impl PlatformBackend {
                 }
                 outcome.fallback_changed = true;
                 log::warn!(
-                    "render cursor atomic commit: device {device_key} CRTC {crtc:?} rejected cursor fields ({error}); hid the plane and entered transient software fallback"
+                    "render cursor atomic commit: device {device_key} CRTC {crtc:?} rejected cursor fields ({error}); detached the plane and entered transient software fallback"
                 );
             }
             Err(hide_error) => {
@@ -418,11 +419,13 @@ impl PlatformBackend {
                     .insert(crtc, CursorHideRecovery::default());
                 outcome.retry_required = true;
                 log::warn!(
-                    "render cursor atomic commit: device {device_key} CRTC {crtc:?} rejected cursor fields ({error}); hide failed ({hide_error}), retaining hardware ownership for motion recovery"
+                    "render cursor atomic commit: device {device_key} CRTC {crtc:?} rejected cursor fields ({error}); atomic detach failed ({hide_error}), retaining hardware ownership for motion recovery"
                 );
             }
         }
-        self.deferred_cursor_move_outcome.merge(outcome);
+        if defer_outcome {
+            self.deferred_cursor_move_outcome.merge(outcome);
+        }
         rollback
     }
 
