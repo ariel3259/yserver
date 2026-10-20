@@ -490,7 +490,62 @@ mod tests {
             crtc: crtc1,
             commit_id: id,
         }));
+
+        let completed = Backend::drain_completed_present_events(&mut fixture.events.backend);
+        assert_eq!(
+            completed
+                .iter()
+                .map(|event| event.present_id)
+                .collect::<Vec<_>>(),
+            [direct.candidate.present_id],
+        );
+        assert!(Backend::drain_retired_present_idle_events(&mut fixture.events.backend).is_empty());
+
+        let mut successor = direct.candidate;
+        successor.present_id += 1;
+        successor.valid_region_xid = 0x55;
+        let mut successor_event = direct.event.clone();
+        successor_event.present_id = successor.present_id;
+        successor_event.serial = successor_event.serial.wrapping_add(1);
+        assert!(
+            !Backend::try_present_direct(&mut fixture.events.backend, successor, successor_event,)
+                .expect("ineligible successor requests a composed unflip"),
+            "the successor must request a composed unflip",
+        );
+        assert!(fixture.events.backend.pstate.scanout_m2.unflip_requested);
+
+        let unflip_offset = fixture.events.recorders[&fd].records().len();
+        Backend::maybe_composite(&mut fixture.events.backend).expect("submit grouped unflip");
+        let unflip_record = fixture.events.recorders[&fd]
+            .records()
+            .into_iter()
+            .skip(unflip_offset)
+            .find(|record| record.events.len() == 2 && accepted_event_id(record).is_some())
+            .expect("accepted grouped unflip record");
+        let unflip_id = accepted_event_id(&unflip_record).expect("unflip has an accepted ID");
+        assert_ne!(unflip_id, id);
+        assert_eq!(
+            super::retire_pending_output(&mut fixture.events, &mut delivered, 0, 3),
+            unflip_id,
+        );
+        assert_eq!(
+            super::retire_pending_output(&mut fixture.events, &mut delivered, 1, 4),
+            unflip_id,
+        );
+        assert!(fixture.events.backend.pstate.scanout_m2.current.is_none());
+        assert!(fixture.events.backend.present_source_pins.is_empty());
+        assert!(Backend::drain_completed_present_events(&mut fixture.events.backend).is_empty());
+        let idled = Backend::drain_retired_present_idle_events(&mut fixture.events.backend);
+        assert_eq!(
+            idled
+                .iter()
+                .map(|event| event.present_id)
+                .collect::<Vec<_>>(),
+            [direct.candidate.present_id],
+        );
+
         super::finish_fixture(&mut fixture.events, &mut delivered);
+        fixture.finish_after_normal_drain();
     }
 
     #[test]
@@ -590,6 +645,13 @@ mod tests {
             .for_tests_seed_atomic_cursor_position(0, raw(51), raw(61), raw(62), 100, 100, 0, 0);
         Backend::warp_pointer_root(&mut events.backend, &mut events.state, 120, 110);
         Backend::maybe_composite(&mut events.backend).expect("submit cursor-only move");
-        super::assert_no_cursor_resources(&events.backend);
+        let assertion = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::assert_no_cursor_resources(&events.backend);
+        }));
+        let mut delivered = HashSet::new();
+        super::finish_fixture(&mut events, &mut delivered);
+        std::panic::resume_unwind(
+            assertion.expect_err("an unretired cursor commit must be rejected"),
+        );
     }
 }
