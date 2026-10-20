@@ -214,14 +214,13 @@ pub(crate) struct CursorPlaneTestPlane {
 pub(crate) struct CursorPlaneTestSnapshot {
     pub(crate) crtcs: Vec<u32>,
     pub(crate) planes: Vec<CursorPlaneTestPlane>,
-    pub(crate) driver_name: Option<String>,
-    pub(crate) hotspot_cap_accepted: bool,
+    pub(crate) cursor_caps: Option<CursorDeviceCaps>,
+    pub(crate) has_buffer: bool,
 }
 
 #[cfg(test)]
 impl CursorPlaneTestSnapshot {
-    pub(crate) fn into_discovery(self) -> (CursorPlaneDiscovery, CursorDeviceCaps) {
-        let caps = CursorDeviceCaps::new(self.hotspot_cap_accepted, self.driver_name);
+    pub(crate) fn into_discovery(self) -> (CursorPlaneDiscovery, Option<CursorDeviceCaps>, bool) {
         let discovery = CursorPlaneDiscovery {
             crtcs: self
                 .crtcs
@@ -254,7 +253,7 @@ impl CursorPlaneTestSnapshot {
                 })
                 .collect(),
         };
-        (discovery, caps)
+        (discovery, self.cursor_caps, self.has_buffer)
     }
 }
 

@@ -874,9 +874,5 @@ fn install_copied_route(backend: &mut KmsBackend, separate_sink: bool) -> Result
 }
 
 fn is_expected_vulkan_absence(error: &io::Error) -> bool {
-    let message = error.to_string().to_ascii_lowercase();
-    message.contains("loader")
-        || message.contains("no suitable physical device")
-        || message.contains("nosuitabledevice")
-        || message.contains("error_incompatible_driver")
+    crate::kms::render::backend::tests::vulkan_absence_is_expected(error)
 }

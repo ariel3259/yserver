@@ -1625,12 +1625,15 @@ fn deferred_init_failure_policy_is_device_local_and_retries_later_only() {
 // Mutation: recompute the path or plane matching at refresh, skip the sprite
 // capacity update, or let refreshing another device mutate this one.
 fn topology_refresh_never_changes_the_path_or_the_assignment() {
-    use crate::kms::cursor_plane::{
-        ops::{
-            CursorBufferIo,
-            recording::{CursorBufferLedger, RecordingCursorBufferIo},
+    use crate::{
+        drm::CursorDeviceCaps,
+        kms::cursor_plane::{
+            ops::{
+                CursorBufferIo,
+                recording::{CursorBufferLedger, RecordingCursorBufferIo},
+            },
+            topology::{CursorPlaneTestPlane, CursorPlaneTestSnapshot, CursorStatePath},
         },
-        topology::{CursorPlaneTestPlane, CursorPlaneTestSnapshot, CursorStatePath},
     };
     use std::rc::Rc;
 
@@ -1648,8 +1651,8 @@ fn topology_refresh_never_changes_the_path_or_the_assignment() {
                 .map(str::to_owned)
                 .collect(),
             }],
-            driver_name: Some("amdgpu".to_owned()),
-            hotspot_cap_accepted: false,
+            cursor_caps: Some(CursorDeviceCaps::new(false, Some("amdgpu".to_owned()))),
+            has_buffer: true,
         }
     }
 

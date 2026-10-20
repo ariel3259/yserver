@@ -453,31 +453,9 @@ impl CursorBuffer {
         )
     }
 
-    #[allow(dead_code, reason = "consumed by P2a Task 3 sprite pool")]
     pub(crate) fn clear(&mut self) {
         // SAFETY: mapping remains live and covers `len` writable bytes.
         unsafe { std::ptr::write_bytes(self.ptr().as_ptr(), 0, self.len) };
-    }
-
-    #[allow(dead_code, reason = "consumed by P2a Task 3 sprite pool")]
-    pub(crate) fn dump_to_ppm(&self, path: &str) -> io::Result<()> {
-        use std::io::Write;
-
-        let mut file = std::fs::File::create(path)?;
-        file.write_all(format!("P6\n{} {}\n255\n", self.width, self.height).as_bytes())?;
-        let mut row = vec![0_u8; self.width as usize * 3];
-        for y in 0..self.height as usize {
-            let src_row = y * self.stride as usize;
-            for x in 0..self.width as usize {
-                let src = src_row + x * 4;
-                // ARGB8888 on little-endian DRM buffers is BGRA in memory.
-                row[x * 3] = unsafe { *self.ptr().as_ptr().add(src + 2) };
-                row[x * 3 + 1] = unsafe { *self.ptr().as_ptr().add(src + 1) };
-                row[x * 3 + 2] = unsafe { *self.ptr().as_ptr().add(src) };
-            }
-            file.write_all(&row)?;
-        }
-        Ok(())
     }
 
     #[cfg(test)]

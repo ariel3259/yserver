@@ -563,7 +563,7 @@ impl CursorPlane {
         width: u32,
         height: u32,
     ) -> Self {
-        let (snapshot_discovery, caps) = snapshot.into_discovery();
+        let (snapshot_discovery, caps, has_buffer) = snapshot.into_discovery();
         let discovery_io = topology::RecordingCursorPlaneDiscovery::new(snapshot_discovery);
         let discovery = discovery_io
             .discover(&device)
@@ -578,13 +578,13 @@ impl CursorPlane {
             device,
             buffer_io,
             discovery,
-            Some(caps),
+            caps,
             ptr,
             len,
             stride,
             width,
             height,
-            None,
+            has_buffer.then_some(CursorPlaneBuffer::Test),
             crtcs,
         );
         plane._test_backing = test_backing;
@@ -1192,8 +1192,8 @@ mod tests {
                         .map(|name| (*name).to_owned())
                         .collect(),
                 }],
-                driver_name: Some("amdgpu".to_owned()),
-                hotspot_cap_accepted: false,
+                cursor_caps: Some(CursorDeviceCaps::new(false, Some("amdgpu".to_owned()))),
+                has_buffer: false,
             },
             64,
             64,
@@ -1227,6 +1227,110 @@ mod tests {
         assert!(plane.sprites().all_users_zero());
         assert!(ledger.records().is_empty());
         assert_eq!(ledger.end_state(), (0, 0, 0));
+    }
+
+    #[test]
+    // Mutation: discard snapshot caps or backing; Legacy show must still reach its injected executor.
+    fn snapshot_fixture_supports_missing_fb_id_and_missing_caps() {
+        use std::cell::Cell;
+
+        struct CountingShowExecutor(Cell<usize>);
+
+        impl CursorShowExecutor for CountingShowExecutor {
+            fn show(
+                &self,
+                _device: &Device,
+                _buffer: &CursorPlaneBuffer,
+                _crtc: crtc::Handle,
+                _hotspot: (i32, i32),
+                _img_x: i32,
+                _img_y: i32,
+            ) -> io::Result<()> {
+                self.0.set(self.0.get() + 1);
+                Ok(())
+            }
+
+            fn move_to(
+                &self,
+                _device: &Device,
+                _crtc: crtc::Handle,
+                _img_x: i32,
+                _img_y: i32,
+            ) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let complete_properties = [
+            "FB_ID", "CRTC_ID", "CRTC_X", "CRTC_Y", "CRTC_W", "CRTC_H", "SRC_X", "SRC_Y", "SRC_W",
+            "SRC_H",
+        ];
+        let snapshot =
+            |property_names: Vec<String>, cursor_caps| topology::CursorPlaneTestSnapshot {
+                crtcs: vec![11],
+                planes: vec![topology::CursorPlaneTestPlane {
+                    handle: 21,
+                    possible_crtcs: vec![11],
+                    property_names,
+                }],
+                cursor_caps,
+                has_buffer: true,
+            };
+        let device = Rc::new(Device::for_tests().expect("test DRM device"));
+        let crtc = test_crtc(11);
+
+        let missing_fb_id = snapshot(
+            complete_properties
+                .iter()
+                .filter(|name| **name != "FB_ID")
+                .map(|name| (*name).to_owned())
+                .collect(),
+            Some(CursorDeviceCaps::new(false, Some("amdgpu".to_owned()))),
+        );
+        let missing_fb_id_executor = Rc::new(CountingShowExecutor(Cell::new(0)));
+        let mut missing_fb_id_plane = CursorPlane::for_tests_from_snapshot(
+            Rc::clone(&device),
+            &[crtc],
+            Rc::new(DrmCursorBufferIo),
+            missing_fb_id,
+            64,
+            64,
+        );
+        missing_fb_id_plane.for_tests_set_show_executor(missing_fb_id_executor.clone());
+        assert_eq!(
+            missing_fb_id_plane.state_path().reason,
+            topology::CursorPathReason::MissingProperty("FB_ID")
+        );
+        missing_fb_id_plane
+            .show(crtc, (0, 0), 10, 10)
+            .expect("snapshot-backed legacy show reaches executor");
+        assert_eq!(missing_fb_id_executor.0.get(), 1);
+
+        let missing_caps = snapshot(
+            complete_properties
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect(),
+            None,
+        );
+        let missing_caps_executor = Rc::new(CountingShowExecutor(Cell::new(0)));
+        let mut missing_caps_plane = CursorPlane::for_tests_from_snapshot(
+            device,
+            &[crtc],
+            Rc::new(DrmCursorBufferIo),
+            missing_caps,
+            64,
+            64,
+        );
+        missing_caps_plane.for_tests_set_show_executor(missing_caps_executor.clone());
+        assert_eq!(
+            missing_caps_plane.state_path().reason,
+            topology::CursorPathReason::NoDeviceCaps
+        );
+        missing_caps_plane
+            .show(crtc, (0, 0), 10, 10)
+            .expect("snapshot-backed legacy show reaches executor");
+        assert_eq!(missing_caps_executor.0.get(), 1);
     }
 
     #[test]

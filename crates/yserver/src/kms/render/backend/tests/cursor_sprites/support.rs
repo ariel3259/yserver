@@ -305,10 +305,15 @@ mod tests {
     fn p2_fixture_cursor_helpers_control_the_effective_cursor() {
         let mut backend = match crate::kms::render::backend::KmsBackend::for_tests_with_vk() {
             Ok(backend) => backend,
-            Err(error) => {
-                eprintln!("skipping: no Vulkan test device: {error}");
+            Err(error)
+                if crate::kms::render::backend::tests::vulkan_absence_is_expected(&error) =>
+            {
+                eprintln!(
+                    "SKIP p2_fixture_cursor_helpers_control_the_effective_cursor: Vulkan unavailable"
+                );
                 return;
             }
+            Err(error) => panic!("Vulkan cursor-helper fixture setup failed: {error}"),
         };
 
         let visible = super::create_bitmap_cursor(&mut backend, true);

@@ -308,7 +308,7 @@ impl SpritePool {
         true
     }
 
-    #[allow(dead_code, reason = "consumed by P2b Task 2 sprite staging")]
+    #[cfg(test)]
     pub(crate) fn cancel_candidate(&mut self, lease: SpriteBufferLease) -> bool {
         if self.candidate != Some(lease) {
             return false;
@@ -326,28 +326,7 @@ impl SpritePool {
         true
     }
 
-    #[allow(dead_code, reason = "consumed by P2b Task 2 sprite staging")]
-    pub(crate) fn dump_sprite_to_ppm(
-        &self,
-        lease: SpriteBufferLease,
-        path: &str,
-    ) -> io::Result<()> {
-        let buffer = self
-            .buffers
-            .get(lease.slot)
-            .filter(|buffer| lease_matches(buffer, lease))
-            .ok_or_else(|| io::Error::other("applied cursor sprite lease is no longer valid"))?;
-        buffer.buffer.dump_to_ppm(path)
-    }
-
-    #[allow(dead_code, reason = "consumed by P2b Task 2 sprite staging")]
-    pub(crate) fn has_available_buffer(&self) -> bool {
-        self.buffers
-            .iter()
-            .any(|buffer| buffer.users == 0 && buffer.prepared_users == 0)
-    }
-
-    #[allow(dead_code, reason = "consumed by P2b Task 2 sprite staging")]
+    #[cfg(test)]
     pub(crate) fn wanted_version(&self) -> Option<u64> {
         self.wanted.as_ref().map(|wanted| wanted.version)
     }

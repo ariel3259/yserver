@@ -7,7 +7,7 @@ mod path_install_tests {
         support::{assert_no_cursor_resources, finish_fixture, retire_pending_output},
     };
     use crate::{
-        drm::atomic::AtomicCommitKind,
+        drm::{CursorDeviceCaps, atomic::AtomicCommitKind},
         kms::cursor_plane::{
             ops::{
                 CursorBufferIo,
@@ -57,8 +57,8 @@ mod path_install_tests {
                 possible_crtcs: vec![crtc],
                 property_names,
             }],
-            driver_name: driver_name.map(str::to_owned),
-            hotspot_cap_accepted: false,
+            cursor_caps: Some(CursorDeviceCaps::new(false, driver_name.map(str::to_owned))),
+            has_buffer: true,
         }
     }
 
@@ -180,8 +180,8 @@ mod path_install_tests {
                 CursorPlaneTestSnapshot {
                     crtcs: vec![1],
                     planes: Vec::new(),
-                    driver_name: Some("apple".to_owned()),
-                    hotspot_cap_accepted: false,
+                    cursor_caps: Some(CursorDeviceCaps::new(false, Some("apple".to_owned()))),
+                    has_buffer: true,
                 },
                 buffer_io,
                 64,
