@@ -477,15 +477,56 @@ fn already_signalled_scanout_completion_is_immediately_ready_without_fd() {
     assert!(platform.pending_scanout_render_completions.is_empty());
 }
 
-// pure boundary. Mutation: substitute the current generation at notification delivery or drop
-// the captured generation while copied work crosses pending, ready, and prepared handoffs.
+// pure boundary. Mutations: substitute the current generation or source-render fence at copied
+// preparation; leave a recycled prepared row available to a later ledger drain.
 #[test]
 fn platform_deferred_completion_keeps_captured_topology_generation() {
-    use crate::kms::render::scene::FrameSubmitMode;
+    use crate::kms::render::scene::{FrameSubmitMode, RenderJobIdentity};
     use nix::sys::eventfd::{EfdFlags, EventFd};
+    use std::os::fd::IntoRawFd;
+
+    let vk = match crate::kms::vk::device::VkContext::new() {
+        Ok(vk) => vk,
+        Err(error) if error.is_unavailable_for_tests() => {
+            eprintln!("skip: Vulkan ICD unavailable: {error}");
+            return;
+        }
+        Err(error) => panic!("unexpected Vulkan test setup failure: {error}"),
+    };
 
     let mut platform = PlatformBackend::for_tests();
     let output_key = platform.outputs[0].key.clone();
+    let sink_copy: OwnedFd =
+        EventFd::from_value_and_flags(1, EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK)
+            .expect("sink-copy dependency eventfd")
+            .into();
+    let sink_copy_fd = sink_copy.into_raw_fd();
+    let route = platform.outputs[0].scanout_route;
+    let drm = Rc::clone(
+        &platform
+            .device_for_key(output_key.device_key)
+            .expect("test output has a DRM device")
+            .device,
+    );
+    let mut bo = crate::kms::vk::scanout::ScanoutBo::for_tests_on_screen_framebuffer(
+        Arc::clone(&vk),
+        drm,
+        ::drm::control::from_u32(0x7100).expect("synthetic framebuffer handle"),
+        800,
+        600,
+    );
+    bo.state.phase = crate::kms::vk::scanout::BoPhase::Free;
+    bo.state.transition_to_recording();
+    bo.state.transition_to_submitted(sink_copy_fd);
+    let destinations =
+        crate::kms::vk::scanout::ScanoutBoPool::for_tests_recording_pool(route, 800, 600, vec![bo]);
+    let copied = crate::kms::vk::scanout::CopiedScanoutPool::for_tests_recording_pool(
+        Arc::clone(&vk),
+        destinations,
+    )
+    .expect("test copied-pool source setup");
+    platform.scanout_pools[0] = Some(crate::kms::vk::scanout::OutputScanout::Copied(copied));
+
     let ready: OwnedFd =
         EventFd::from_value_and_flags(1, EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK)
             .expect("ready eventfd")
@@ -501,12 +542,12 @@ fn platform_deferred_completion_keeps_captured_topology_generation() {
             &mut platform,
             FrameSubmitMode::DeferredUnflip,
         )
-        .expect("allocate second render identity before recording");
+        .expect("allocate the copied render identity before recording");
     let render_job_id = identity.render_job_id;
     platform
         .register_scanout_render_completion(
             output_key.clone(),
-            2,
+            0,
             identity,
             FrameSubmitMode::DeferredUnflip,
             false,
@@ -516,7 +557,7 @@ fn platform_deferred_completion_keeps_captured_topology_generation() {
 
     let pending = &platform.pending_scanout_render_completions[0];
     assert_eq!(pending.output_key, output_key);
-    assert_eq!(pending.bo_idx, 2);
+    assert_eq!(pending.bo_idx, 0);
     assert_eq!(pending.render_job_id, render_job_id);
     assert_eq!(pending.mode, FrameSubmitMode::DeferredUnflip);
     assert_eq!(pending.topology_generation, Some(71));
@@ -527,7 +568,7 @@ fn platform_deferred_completion_keeps_captured_topology_generation() {
     let completions = platform.drain_scanout_render_completions();
     assert_eq!(completions.len(), 1);
     assert_eq!(completions[0].output_key, output_key);
-    assert_eq!(completions[0].bo_idx, 2);
+    assert_eq!(completions[0].bo_idx, 0);
     assert_eq!(completions[0].render_job_id, render_job_id);
     assert_eq!(completions[0].mode, FrameSubmitMode::DeferredUnflip);
     assert_eq!(completions[0].topology_generation, Some(71));
@@ -540,7 +581,7 @@ fn platform_deferred_completion_keeps_captured_topology_generation() {
     platform
         .register_scanout_render_completion(
             output_key.clone(),
-            3,
+            0,
             notification_identity,
             FrameSubmitMode::DeferredUnflip,
             false,
@@ -556,20 +597,55 @@ fn platform_deferred_completion_keeps_captured_topology_generation() {
     };
     assert_eq!(notification.topology_generation, Some(71));
 
-    let sink_copy_fd = crate::kms::vk::scanout::copied_final_dependency(Some(17), Some(29));
-    let prepared = prepared_unflip_plane(
-        0,
-        output_key,
-        3,
-        notification.render_job_id,
-        notification.recording_complete,
-        notification
-            .topology_generation
-            .expect("deferred completion retains its captured generation"),
-        sink_copy_fd,
-    );
+    let source_render: OwnedFd =
+        EventFd::from_value_and_flags(1, EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK)
+            .expect("source-render dependency eventfd")
+            .into();
+    let prepared_source_fd = source_render.as_raw_fd();
+    let identity = RenderJobIdentity {
+        render_job_id: notification.render_job_id,
+        topology_generation: notification.topology_generation,
+    };
+    platform
+        .prepare_copied_unflip_plane(
+            0,
+            0,
+            identity,
+            notification.recording_complete,
+            notification.mode,
+            Some(prepared_source_fd),
+        )
+        .expect("prepare the copied plane from its sink-copy completion");
+    let [prepared] = platform.prepared_unflip_planes.as_slice() else {
+        panic!("copied handoff should produce one prepared row");
+    };
+    assert_eq!(prepared.render_job_id, notification.render_job_id);
+    assert!(!prepared.recording_complete);
     assert_eq!(prepared.topology_generation, 71);
-    assert_eq!(prepared.final_in_fence, Some(29));
+    assert_eq!(prepared.final_in_fence, Some(sink_copy_fd));
+    assert_ne!(prepared.final_in_fence, Some(prepared_source_fd));
+
+    let Some(crate::kms::vk::scanout::OutputScanout::Copied(mut copied)) =
+        platform.scanout_pools[0].take()
+    else {
+        panic!("copied test route should retain its destination pool");
+    };
+    let empty_destinations = crate::kms::vk::scanout::ScanoutBoPool::for_tests_recording_pool(
+        route,
+        800,
+        600,
+        Vec::new(),
+    );
+    let destinations = std::mem::replace(&mut copied.destinations, empty_destinations);
+    platform.scanout_pools[0] = Some(crate::kms::vk::scanout::OutputScanout::Shared(destinations));
+    drop(copied);
+    platform
+        .recycle_unflip_scanout_bo_after_dependency_safe(0, 0)
+        .expect("recycle the prepared target after dependency safety");
+    assert!(
+        platform.take_prepared_unflip_planes().is_empty(),
+        "dependency-safe recycling must discard the undrained prepared row"
+    );
 }
 
 // Mutation: omit the asynchronous wake when a quarantined sink queue fence

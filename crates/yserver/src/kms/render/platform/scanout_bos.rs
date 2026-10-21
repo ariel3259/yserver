@@ -185,6 +185,55 @@ impl PlatformBackend {
         Ok(())
     }
 
+    /// Record the copied route's final dependency after its sink queue submit.
+    /// The identity is captured before scene recording, so replacing the
+    /// installed batch context while the source render is pending cannot
+    /// retag this plane.
+    pub(crate) fn prepare_copied_unflip_plane(
+        &mut self,
+        output_idx: usize,
+        bo_idx: usize,
+        identity: crate::kms::render::scene::RenderJobIdentity,
+        recording_complete: bool,
+        mode: crate::kms::render::scene::FrameSubmitMode,
+        source_render_dependency: Option<RawFd>,
+    ) -> io::Result<()> {
+        if mode != crate::kms::render::scene::FrameSubmitMode::DeferredUnflip {
+            return Err(io::Error::other(
+                "copied unflip preparation requires deferred frame mode",
+            ));
+        }
+        let topology_generation = identity.topology_generation.ok_or_else(|| {
+            io::Error::other("copied unflip completion has no captured topology generation")
+        })?;
+        let sink_copy_dependency = self
+            .scanout_pools
+            .get(output_idx)
+            .and_then(Option::as_ref)
+            .and_then(OutputScanout::copied)
+            .and_then(|pool| pool.destinations.bos.get(bo_idx))
+            .filter(|bo| bo.state.phase == BoPhase::Submitted)
+            .map(|bo| bo.state.in_fence_fd.map(|fd| fd as RawFd))
+            .ok_or_else(|| io::Error::other("copied unflip destination is not submitted"))?;
+        let final_in_fence = crate::kms::vk::scanout::copied_final_dependency(
+            source_render_dependency,
+            sink_copy_dependency,
+        );
+        self.prepare_unflip_plane(
+            output_idx,
+            bo_idx,
+            identity.render_job_id,
+            recording_complete,
+            topology_generation,
+            final_in_fence,
+        )
+    }
+
+    fn discard_prepared_unflip_plane(&mut self, output_idx: usize, bo_idx: usize) {
+        self.prepared_unflip_planes
+            .retain(|plane| plane.output_idx != output_idx || plane.bo_idx != bo_idx);
+    }
+
     pub(crate) fn take_prepared_unflip_planes(&mut self) -> Vec<PreparedUnflipPlane> {
         std::mem::take(&mut self.prepared_unflip_planes)
     }
@@ -213,8 +262,7 @@ impl PlatformBackend {
             // userspace IN_FENCE_FD after the accepted atomic commit.
             drop(unsafe { OwnedFd::from_raw_fd(fd) });
         }
-        self.prepared_unflip_planes
-            .retain(|plane| plane.output_idx != output_idx || plane.bo_idx != bo_idx);
+        self.discard_prepared_unflip_plane(output_idx, bo_idx);
         Ok(())
     }
 
@@ -312,7 +360,7 @@ impl PlatformBackend {
 
         let mut recovery_failed = false;
         let mut quarantined_dependency = None;
-        let mut prepared_final_in_fence = None;
+        let mut prepared_copied_handoff = None;
         let result = (|| {
             // `Output` deliberately is not Clone: its DRM handles belong to
             // the owning open fd. Borrow the output and its independently
@@ -415,11 +463,7 @@ impl PlatformBackend {
             let in_fence_fd = copy_completion.map_or(-1, IntoRawFd::into_raw_fd);
             destination.state.transition_to_submitted(in_fence_fd);
             if mode == crate::kms::render::scene::FrameSubmitMode::DeferredUnflip {
-                let sink_copy_dependency = destination.state.in_fence_fd.map(|fd| fd as RawFd);
-                prepared_final_in_fence = Some(crate::kms::vk::scanout::copied_final_dependency(
-                    source_dependency,
-                    sink_copy_dependency,
-                ));
+                prepared_copied_handoff = Some(source_dependency);
                 return Ok(crate::kms::render::scene::CopiedSubmitOutcome::PreparedForGroup);
             }
             let mut out_fence_fd = -1;
@@ -509,16 +553,14 @@ impl PlatformBackend {
             // device.  Neither uncertain image state may be reused.
             self.gpu.renderer_failed = true;
         }
-        if let Some(final_in_fence) = prepared_final_in_fence {
-            let topology_generation = topology_generation
-                .expect("deferred copied completion has a captured topology generation");
-            self.prepare_unflip_plane(
+        if let Some(source_render_dependency) = prepared_copied_handoff {
+            self.prepare_copied_unflip_plane(
                 output_idx,
                 bo_idx,
-                render_job_id,
+                identity,
                 recording_complete,
-                topology_generation,
-                final_in_fence,
+                mode,
+                source_render_dependency,
             )?;
         }
         result
@@ -593,6 +635,7 @@ impl PlatformBackend {
                 destination_state.reset_after_dependency_safe();
             }
         }
+        self.discard_prepared_unflip_plane(output_idx, bo_idx);
         Ok(())
     }
 

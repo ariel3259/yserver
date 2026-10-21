@@ -24,7 +24,12 @@ pub(super) fn vk_result_is_device_lost(result: vk::Result) -> bool {
     result == vk::Result::ERROR_DEVICE_LOST
 }
 
-pub(super) fn compose_submit_was_complete(submitted: ComposeSubmit, draw_count: usize) -> bool {
+/// Keep recording completeness independent of fence readiness: descriptor
+/// pressure can submit a valid prefix, but an unflip must repaint every draw.
+pub(super) const fn compose_submit_was_complete(
+    submitted: ComposeSubmit,
+    draw_count: usize,
+) -> bool {
     submitted.descriptor_count == draw_count
 }
 
