@@ -512,10 +512,6 @@ impl KmsBackend {
         }
         self.platform
             .clear_atomic_cursor_state_after_old_events_discard();
-        if self.pstate.scanout_m2.active() {
-            self.stop_direct_after_scanout_replaced("VT suspend");
-        }
-
         // The old framebuffer references and events are gone. It is now safe
         // to discard the scene's ack ledger and reset every pool phase.
         self.scene.drain_all(&mut self.platform);
@@ -539,6 +535,7 @@ impl KmsBackend {
             self.request_exit();
             return;
         }
+        self.stop_direct_after_scanout_replaced("VT suspend");
 
         // M1 framebuffers are diagnostic-only and never active, but their GEM
         // registrations belong to this DRM-master/topology epoch.
@@ -1035,7 +1032,6 @@ impl KmsBackend {
             }
             self.platform
                 .clear_atomic_cursor_state_after_old_events_discard();
-            self.stop_direct_after_scanout_replaced("DPMS off");
             self.pstate.scanout_m1.clear("DPMS off");
             log::info!("kms: dpms sleep — scene.drain_all");
             self.scene.drain_all(&mut self.platform);
@@ -1049,6 +1045,7 @@ impl KmsBackend {
                 self.request_exit();
                 return Err(error);
             }
+            self.stop_direct_after_scanout_replaced("DPMS off");
             self.kms_outputs_active = false;
             if let Some(error) = direct_shadow_error {
                 log::error!("scanout_m2: DPMS-off lazy fallback Copy failed: {error}; exiting");

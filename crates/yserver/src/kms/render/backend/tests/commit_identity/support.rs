@@ -162,6 +162,9 @@ impl AtomicEventFixture {
         time_ns: i64,
         sequence: u64,
     ) {
+        // Inject the CRTC sequence's live `user_data` value. This is a
+        // separate event kind from a page-flip cookie and never retires a KMS
+        // commit by itself.
         self.event_sources
             .get(&device_fd)
             .expect("sequence device fd belongs to this fixture")

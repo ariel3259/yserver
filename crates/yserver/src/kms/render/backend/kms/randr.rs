@@ -1093,6 +1093,9 @@ impl KmsBackend {
         rebuild_scene: bool,
         relight_after_quiesce: bool,
     ) -> bool {
+        if rebuild_scene {
+            self.bump_unflip_topology_generation("RandR output topology changed");
+        }
         let previous_outputs: HashMap<u32, ProjectedRandrOutputState> = state
             .randr
             .outputs
@@ -1343,6 +1346,7 @@ impl KmsBackend {
 
         // ── 2. Root/COW storage and scene damage, shared with the surface ──
         self.commit_root_storage(prepared);
+        self.bump_unflip_topology_generation("virtual screen extent changed");
 
         Ok(())
     }
@@ -1808,6 +1812,9 @@ impl KmsBackend {
             })
             .collect();
         let transforms_changed = transforms != self.platform.output_transforms;
+        if root_changed || transforms_changed {
+            self.bump_unflip_topology_generation("RandR layout transform or extent changed");
+        }
         if transforms_changed {
             // No transformed CRTC is ever flipped directly (spec D5).
             self.request_direct_unflip("crtc_transform_changed");

@@ -132,6 +132,82 @@ fn next_wakeup_suppresses_scene_deadline_when_scanout_disallowed() {
     );
 }
 
+#[test]
+// Mutation: ignore a stale unflip topology generation in the shared compose and wake predicates.
+fn stale_unflip_topology_wakes_cancellation_but_notification_wait_does_not_spin() {
+    use crate::kms::render::backend::{ComposedUnflipBatch, ComposedUnflipPhase};
+    use std::collections::{HashMap, HashSet};
+
+    let mut b = KmsBackend::for_tests();
+    b.scene.scene_structure_dirty = false;
+    let now = std::time::Instant::now();
+    b.for_tests_set_monotonic_clock(std::rc::Rc::new(move || now));
+    let output_key = b.platform.outputs[0].key.clone();
+    b.pstate.scanout_m2.next_unflip_topology_generation = 2;
+    b.pstate.scanout_m2.composed_unflip = Some(ComposedUnflipBatch {
+        phase: ComposedUnflipPhase::Preparing,
+        topology_generation: 1,
+        expected_outputs: vec![output_key],
+        expected_planes: Vec::new(),
+        prepared_planes: HashMap::new(),
+        awaiting_outputs: HashSet::new(),
+        retry_at: None,
+        prepare_deadline: Some(now + std::time::Duration::from_secs(2)),
+        prepare_attempt: 1,
+        fallback_revision: 0,
+        timeout_error_logged: false,
+    });
+
+    assert!(
+        b.for_tests_scene_wants_compose(),
+        "a stale unsubmitted batch must be runnable so it can cancel before notification delivery"
+    );
+    assert_eq!(
+        b.next_wakeup(),
+        Some(now),
+        "stale topology cancellation is scheduled immediately"
+    );
+
+    let batch = b
+        .pstate
+        .scanout_m2
+        .composed_unflip
+        .as_mut()
+        .expect("preparation remains installed");
+    batch.topology_generation = 2;
+    let deadline = now + std::time::Duration::from_secs(2);
+    batch.prepare_deadline = Some(deadline);
+    assert!(
+        !b.for_tests_scene_wants_compose(),
+        "matching-generation preparation waits for its notification when no output is ready"
+    );
+    assert_eq!(
+        b.next_wakeup(),
+        Some(deadline),
+        "notification wait retains only its bounded deadline, not an immediate poll"
+    );
+
+    let cancelling_deadline = now + std::time::Duration::from_secs(3);
+    let batch = b
+        .pstate
+        .scanout_m2
+        .composed_unflip
+        .as_mut()
+        .expect("preparation remains installed");
+    batch.phase = ComposedUnflipPhase::Cancelling;
+    batch.topology_generation = 1;
+    batch.prepare_deadline = Some(cancelling_deadline);
+    assert!(
+        !b.for_tests_scene_wants_compose(),
+        "stale cancellation waits for its one-shot recheck instead of restarting every tick"
+    );
+    assert_eq!(
+        b.next_wakeup(),
+        Some(cancelling_deadline),
+        "stale cancellation does not replace its bounded deadline with an immediate wake"
+    );
+}
+
 /// #177: with the display dark — DPMS off, or the VT handed away — the
 /// paint frame clients keep drawing into must still close on its 16 ms
 /// timeout, and `next_wakeup` must still schedule that close. Closing a

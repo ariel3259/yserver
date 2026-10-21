@@ -331,7 +331,7 @@ impl KmsBackend {
         &self,
         output_idx: usize,
     ) -> bool {
-        phase_b_flip_in_flight_for_scheduler(
+        let scene_or_direct_flip = phase_b_flip_in_flight_for_scheduler(
             self.scene.has_pending_scene_frame(output_idx),
             self.pstate
                 .scanout_m2
@@ -342,7 +342,14 @@ impl KmsBackend {
                 .scanout_m2
                 .unflip_outputs_to_replace
                 .contains(&output_idx),
-        )
+        );
+        let grouped_unflip_visible = self
+            .pstate
+            .scanout_m2
+            .composed_unflip
+            .as_ref()
+            .is_some_and(|batch| batch.expected_outputs.get(output_idx).is_some());
+        scene_or_direct_flip || grouped_unflip_visible
     }
 
     /// Standalone CRTC sequence events may pace Pixmap completions only when

@@ -74,9 +74,11 @@ impl KmsBackend {
         context: &'static str,
     ) -> io::Result<()> {
         self.exit_tearing("topology_mutation");
+        self.bump_unflip_topology_generation(context);
         self.bump_crtc_config_topology_epoch(context);
+        let direct_was_active = self.pstate.scanout_m2.active();
         let old_pending_pageflips = self.pending_pageflip_crtcs();
-        if self.pstate.scanout_m2.active() {
+        if direct_was_active {
             if let Err(error) = self.teardown_direct_before_topology_requery(context) {
                 // This also covers failure to materialize the direct source's
                 // COW shadow. Consuming the topology event while retaining an
@@ -126,6 +128,13 @@ impl KmsBackend {
             );
             self.request_exit();
             return Err(error);
+        }
+        // The output set is dark, its old events are drained, and both the
+        // scene and platform pools have retired their writer/scanout ledgers.
+        // Only now may direct Present pins and accepted unflip identity be
+        // released before the caller mutates topology.
+        if direct_was_active {
+            self.stop_direct_after_scanout_replaced(context);
         }
         self.pstate.scanout_m1.clear(context);
         Ok(())

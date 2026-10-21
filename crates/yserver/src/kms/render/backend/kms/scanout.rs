@@ -905,10 +905,10 @@ impl KmsBackend {
         Ok(())
     }
 
-    /// Stop grouped direct scanout while the old output/CRTC routing is still
-    /// authoritative. A subsequent topology query is allowed to remove or
-    /// reassign those objects, so releasing the client framebuffer afterward
-    /// would be too late.
+    /// Disable grouped direct scanout while the old output/CRTC routing is
+    /// still authoritative. Keep direct pins until the caller drains old
+    /// events and scene/pool state; only then may a topology query remove or
+    /// reassign those objects.
     pub(super) fn teardown_direct_before_topology_requery(
         &mut self,
         context: &'static str,
@@ -927,8 +927,6 @@ impl KmsBackend {
             self.request_exit();
             return Err(error);
         }
-        self.stop_direct_after_scanout_replaced(context);
-        self.pstate.scanout_m1.clear(context);
         // Disabling every CRTC cancels queued sequence events. Retaining an
         // arm entry would make the next composed frame believe the cancelled
         // request was still pending forever.
@@ -1166,6 +1164,24 @@ impl KmsBackend {
         Ok(true)
     }
 
+    /// Advance the identity used to reject unsubmitted planes prepared for an
+    /// older output layout. The accepted batch retains its commit/event
+    /// ledger until normal retirement or a complete all-off drain.
+    pub(super) fn bump_unflip_topology_generation(&mut self, reason: &'static str) {
+        let Some(next_generation) = self
+            .pstate
+            .scanout_m2
+            .next_unflip_topology_generation
+            .checked_add(1)
+        else {
+            log::error!("scanout_m2: unflip topology generation overflow during {reason}");
+            self.request_exit();
+            return;
+        };
+        self.pstate.scanout_m2.next_unflip_topology_generation = next_generation;
+        log::debug!("scanout_m2: topology generation advanced to {next_generation}: {reason}");
+    }
+
     /// Refresh the scene and platform ledgers, then submit one all-output
     /// replacement when every exact acknowledgement and BO dependency is
     /// ready. This method never waits for GPU work.
@@ -1173,6 +1189,16 @@ impl KmsBackend {
         let Some(batch) = self.pstate.scanout_m2.composed_unflip.as_ref() else {
             return Ok(false);
         };
+        if !matches!(
+            batch.phase,
+            ComposedUnflipPhase::Accepted { .. }
+                | ComposedUnflipPhase::Cancelling
+                | ComposedUnflipPhase::Quarantined
+        ) && batch.topology_generation != self.pstate.scanout_m2.next_unflip_topology_generation
+        {
+            self.cancel_stale_unsubmitted_unflip()?;
+            return Ok(false);
+        }
         if batch.fallback_revision != self.pstate.scanout_m2.unflip_fallback_revision
             && !matches!(
                 batch.phase,
@@ -1607,6 +1633,20 @@ impl KmsBackend {
         self.finish_composed_unflip_cancellation()
     }
 
+    fn cancel_stale_unsubmitted_unflip(&mut self) -> io::Result<()> {
+        self.begin_composed_unflip_cancellation(false)?;
+        let recheck_deadline = self.monotonic_now() + std::time::Duration::from_secs(2);
+        if let Some(batch) = self.pstate.scanout_m2.composed_unflip.as_mut()
+            && matches!(
+                batch.phase,
+                ComposedUnflipPhase::Cancelling | ComposedUnflipPhase::Quarantined
+            )
+        {
+            batch.prepare_deadline.get_or_insert(recheck_deadline);
+        }
+        Ok(())
+    }
+
     fn finish_composed_unflip_cancellation(&mut self) -> io::Result<()> {
         let Some(batch) = self.pstate.scanout_m2.composed_unflip.as_ref() else {
             return Ok(());
@@ -1633,13 +1673,41 @@ impl KmsBackend {
         }
         let attempt = batch.prepare_attempt;
         if attempt >= 2 {
-            let relight = self
-                .teardown_direct_before_topology_requery("composed unflip preparation deadline")?;
+            let old_pending_pageflips = self.pending_pageflip_crtcs();
+            if let Err(error) =
+                self.teardown_direct_before_topology_requery("composed unflip preparation deadline")
+            {
+                self.request_exit();
+                return Err(error);
+            }
+            self.kms_outputs_active = false;
+            if let Err(error) = self.platform.discard_old_drm_events_after_all_off(
+                &old_pending_pageflips,
+                std::time::Duration::from_secs(1),
+            ) {
+                log::error!(
+                    "scanout_m2: preparation-timeout recovery could not drain old DRM events: {error}; exiting"
+                );
+                self.request_exit();
+                return Err(error);
+            }
+            self.platform
+                .clear_atomic_cursor_state_after_old_events_discard();
+            self.platform.invalidate_live_cursor_applied();
+            self.scene.drain_all(&mut self.platform);
+            self.stop_direct_after_scanout_replaced("composed unflip preparation deadline");
+            self.pstate
+                .scanout_m1
+                .clear("composed unflip preparation deadline");
             self.platform.clear_unflip_batch_context();
             self.pstate.scanout_m2.composed_unflip = None;
-            self.relight_after_direct_teardown(relight, "composed unflip preparation deadline")?;
             self.scene.invalidate_all_scanout_damage();
             self.scene.mark_scene_structure_dirty();
+            // The old pool may contain accepted commits whose events were
+            // discarded here. Keep the outputs dark and let orderly shutdown
+            // perform the full device quiescence before those pool phases can
+            // be reset or reused.
+            self.request_exit();
             return Ok(());
         }
 
@@ -2843,6 +2911,16 @@ impl KmsBackend {
 
     pub(super) fn scene_wants_compose(&self) -> bool {
         if let Some(batch) = self.pstate.scanout_m2.composed_unflip.as_ref() {
+            if !matches!(
+                batch.phase,
+                ComposedUnflipPhase::Accepted { .. }
+                    | ComposedUnflipPhase::Cancelling
+                    | ComposedUnflipPhase::Quarantined
+            ) && batch.topology_generation
+                != self.pstate.scanout_m2.next_unflip_topology_generation
+            {
+                return true;
+            }
             return match batch.phase {
                 ComposedUnflipPhase::Preparing => {
                     self.scene_wants_scene()
@@ -2921,6 +2999,27 @@ impl KmsBackend {
         &mut self,
         _state: &mut ServerState,
     ) {
+        let stale_unsubmitted_batch =
+            self.pstate
+                .scanout_m2
+                .composed_unflip
+                .as_ref()
+                .is_some_and(|batch| {
+                    !matches!(
+                        batch.phase,
+                        ComposedUnflipPhase::Accepted { .. }
+                            | ComposedUnflipPhase::Cancelling
+                            | ComposedUnflipPhase::Quarantined
+                    ) && batch.topology_generation
+                        != self.pstate.scanout_m2.next_unflip_topology_generation
+                });
+        if stale_unsubmitted_batch && let Err(error) = self.cancel_stale_unsubmitted_unflip() {
+            log::error!(
+                "scanout_m2: could not cancel stale topology preparation before draining render notifications: {error}"
+            );
+            self.platform.gpu.renderer_failed = true;
+            return;
+        }
         let notifications =
             crate::kms::render::scene::OutputSink::drain_render_notifications(&mut self.platform);
         if !self.scanout_allowed() {
@@ -3155,17 +3254,30 @@ impl KmsBackend {
             .scanout_m2
             .composed_unflip
             .as_ref()
-            .and_then(|batch| match batch.phase {
-                ComposedUnflipPhase::Preparing | ComposedUnflipPhase::Quarantined => {
-                    batch.prepare_deadline
+            .and_then(|batch| {
+                if !matches!(
+                    batch.phase,
+                    ComposedUnflipPhase::Accepted { .. }
+                        | ComposedUnflipPhase::Cancelling
+                        | ComposedUnflipPhase::Quarantined
+                ) && batch.topology_generation
+                    != self.pstate.scanout_m2.next_unflip_topology_generation
+                {
+                    return Some(now);
                 }
-                ComposedUnflipPhase::RetryWaiting => batch.retry_at,
-                ComposedUnflipPhase::Cancelling => batch.prepare_deadline,
-                ComposedUnflipPhase::Ready => {
-                    let outputs: Vec<_> = (0..self.platform.outputs.len()).collect();
-                    (!self.platform.cursor_commit_in_flight_for_outputs(&outputs)).then_some(now)
+                match batch.phase {
+                    ComposedUnflipPhase::Preparing | ComposedUnflipPhase::Quarantined => {
+                        batch.prepare_deadline
+                    }
+                    ComposedUnflipPhase::RetryWaiting => batch.retry_at,
+                    ComposedUnflipPhase::Cancelling => batch.prepare_deadline,
+                    ComposedUnflipPhase::Ready => {
+                        let outputs: Vec<_> = (0..self.platform.outputs.len()).collect();
+                        (!self.platform.cursor_commit_in_flight_for_outputs(&outputs))
+                            .then_some(now)
+                    }
+                    ComposedUnflipPhase::Idle | ComposedUnflipPhase::Accepted { .. } => None,
                 }
-                ComposedUnflipPhase::Idle | ComposedUnflipPhase::Accepted { .. } => None,
             });
         let scene_deadline = if allow_kms_timers {
             if self.scene_wants_compose() {

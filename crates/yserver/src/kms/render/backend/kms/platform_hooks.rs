@@ -426,6 +426,8 @@ impl Platform for PlatformBackend {
     }
 
     fn present_display_idle(b: &KmsBackend, crtc_id: u32) -> bool {
+        // The backend predicate keeps a partially retired grouped unflip
+        // visible until the final replacement CRTC retires.
         b.present_crtc_key(crtc_id)
             .is_some_and(|crtc_key| b.present_completion_is_idle_for(crtc_key))
     }
