@@ -8,8 +8,8 @@ use crate::kms::{
             AllocationCleanupPolicy, CopiedDestinationOwnership, CopiedDisposableProbeAttempt,
             CopiedProbeReadback, CopiedRenderSource, CopiedRenderTargetContents, CopiedScanoutPlan,
             CopiedScanoutPool, CopiedSourceOwnership, CopiedTransportPreparation,
-            DisposableProbeError, ExportSemaphoreReuseState, PendingProbeSubmissions, ProbeFence,
-            RetainedSyncFile, ScanoutBoPool, ScanoutOwnership,
+            DeferredCopiedSubmitError, DisposableProbeError, ExportSemaphoreReuseState,
+            PendingProbeSubmissions, ProbeFence, RetainedSyncFile, ScanoutBoPool, ScanoutOwnership,
             alloc_plan::{
                 assemble_copied_scanout_plans, exact_copied_source_plans,
                 validate_copied_route_pair,
@@ -719,6 +719,7 @@ impl CopiedScanoutPool {
             plan,
             sink_vk: vk,
             destinations,
+            deferred_submission_fences: vec![None; count],
         })
     }
 
@@ -901,6 +902,7 @@ impl CopiedScanoutPool {
                         plan,
                         sink_vk,
                         destination_ownership: vec![initial_destination_ownership; count],
+                        deferred_submission_fences: vec![None; count],
                     };
                     return Err(partial_pool
                         .finish_disposable_probe(Err(error))
@@ -917,6 +919,7 @@ impl CopiedScanoutPool {
             plan,
             sink_vk,
             destination_ownership: vec![initial_destination_ownership; count],
+            deferred_submission_fences: vec![None; count],
         })
     }
 
@@ -927,7 +930,115 @@ impl CopiedScanoutPool {
         bo_idx: usize,
         render_completion: Option<OwnedFd>,
     ) -> io::Result<Option<OwnedFd>> {
-        self.submit_copy_with_fence(bo_idx, render_completion, vk::Fence::null(), None)
+        let mut queue_submitted = false;
+        self.submit_copy_with_fence(
+            bo_idx,
+            render_completion,
+            vk::Fence::null(),
+            None,
+            &mut queue_submitted,
+        )
+    }
+
+    /// Submit a deferred sink copy with a Vulkan fence retained as a
+    /// nonblocking recovery signal if exporting the final sync-file fails.
+    /// The caller must register `quarantined_dependency` with the platform
+    /// before allowing another use of this BO.
+    pub(crate) fn submit_copy_deferred(
+        &mut self,
+        bo_idx: usize,
+        render_completion: Option<OwnedFd>,
+    ) -> Result<Option<OwnedFd>, DeferredCopiedSubmitError> {
+        let Some(pending_fence) = self.deferred_submission_fences.get(bo_idx) else {
+            return Err(DeferredCopiedSubmitError::BeforeSubmit(io::Error::other(
+                "copied destination index out of range",
+            )));
+        };
+        if pending_fence.is_some() {
+            return Err(DeferredCopiedSubmitError::PreviousSubmissionPending(
+                io::Error::other(
+                    "copied destination was reused before its prior sink fence retired",
+                ),
+            ));
+        }
+        let fence = unsafe {
+            self.sink_vk
+                .device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+        }
+        .map_err(|result| {
+            DeferredCopiedSubmitError::BeforeSubmit(scanout_vk_error(
+                "create deferred copied sink fence",
+                result,
+            ))
+        })?;
+        let mut queue_submitted = false;
+        match self.submit_copy_with_fence(
+            bo_idx,
+            render_completion,
+            fence,
+            None,
+            &mut queue_submitted,
+        ) {
+            Ok(completion) => {
+                // The queue fence cannot be destroyed while the submission
+                // is pending. Keep it until the corresponding KMS flip event
+                // proves the exported dependency has completed.
+                self.deferred_submission_fences[bo_idx] = Some(fence);
+                Ok(completion)
+            }
+            Err(error) if queue_submitted => {
+                self.deferred_submission_fences[bo_idx] = Some(fence);
+                Err(DeferredCopiedSubmitError::Submitted(error))
+            }
+            Err(error) => {
+                unsafe { self.sink_vk.device.destroy_fence(fence, None) };
+                Err(DeferredCopiedSubmitError::BeforeSubmit(error))
+            }
+        }
+    }
+
+    /// Vulkan identity retained for a submitted copy whose final dependency
+    /// could not be exported. Its queue fence is waited by a worker; the
+    /// scene only recycles the destination after that worker's notification.
+    pub(crate) fn quarantined_dependency(
+        &self,
+        bo_idx: usize,
+    ) -> Option<(Arc<VkContext>, vk::Fence)> {
+        Some((
+            Arc::clone(&self.sink_vk),
+            *self.deferred_submission_fences.get(bo_idx)?.as_ref()?,
+        ))
+    }
+
+    /// A KMS flip event for this BO proves that the grouped commit consumed
+    /// the exported dependency and the queue fence is no longer in use.
+    pub(crate) fn retire_deferred_submission_after_kms(&mut self, bo_idx: usize) -> io::Result<()> {
+        let Some(fence) = self
+            .deferred_submission_fences
+            .get_mut(bo_idx)
+            .ok_or_else(|| io::Error::other("copied destination index out of range"))?
+            .take()
+        else {
+            return Ok(());
+        };
+        unsafe { self.sink_vk.device.destroy_fence(fence, None) };
+        Ok(())
+    }
+
+    /// Resolve a deferred copied failure after its matching queue fence
+    /// signaled. No host wait is performed here.
+    pub(crate) fn recover_deferred_copy_after_dependency_safe(
+        &mut self,
+        bo_idx: usize,
+    ) -> io::Result<()> {
+        let Some(quarantine_fence) = self.deferred_submission_fences.get_mut(bo_idx) else {
+            return Err(io::Error::other("copied destination index out of range"));
+        };
+        if let Some(fence) = quarantine_fence.take() {
+            unsafe { self.sink_vk.device.destroy_fence(fence, None) };
+        }
+        self.recover_copy_failure_after_quiescence(bo_idx)
     }
 
     fn submit_copy_with_fence(
@@ -936,6 +1047,7 @@ impl CopiedScanoutPool {
         render_completion: Option<OwnedFd>,
         fence: vk::Fence,
         probe_readback: Option<CopiedProbeReadback<'_>>,
+        queue_submitted: &mut bool,
     ) -> io::Result<Option<OwnedFd>> {
         let source = self
             .sources
@@ -1193,6 +1305,7 @@ impl CopiedScanoutPool {
                 },
             )
             .map_err(|result| scanout_vk_error("submit copied sink transfer", result))?;
+            *queue_submitted = true;
         }
         source.note_sink_submit_succeeded();
         *destination_ownership = CopiedDestinationOwnership::ForeignPendingKmsFromSink;
@@ -1448,11 +1561,13 @@ impl CopiedScanoutPool {
                 // The sink helper may fail either side of its queue-submit
                 // call. A is already outstanding, so conservatively retain
                 // both fence handles and the aggregate attempt on any error.
+                let mut sink_queue_submitted = false;
                 let copy_completion = match self.submit_copy_with_fence(
                     bo_idx,
                     render_completion,
                     sink_fence.handle(),
                     Some(sink_readback),
+                    &mut sink_queue_submitted,
                 ) {
                     Ok(completion) => completion,
                     Err(error) => {
@@ -1670,12 +1785,7 @@ impl CopiedScanoutPool {
             .destination_ownership
             .get_mut(bo_idx)
             .ok_or_else(|| io::Error::other("copied scanout ownership index out of range"))?;
-        if *destination_ownership == CopiedDestinationOwnership::ForeignPendingKmsFromSink {
-            // B did release to FOREIGN, but KMS never accepted/acquired it.
-            // The next guaranteed-full copy discards from UNDEFINED rather
-            // than inventing a matching external release.
-            *destination_ownership = CopiedDestinationOwnership::ReleasedButAtomicRejected;
-        }
+        *destination_ownership = destination_ownership.after_dependency_safe_cancellation();
         if let Some(destination) = self.destinations.bos.get_mut(bo_idx) {
             destination
                 .rearm_export_semaphore_after_quiescence()
@@ -1693,6 +1803,13 @@ impl CopiedScanoutPool {
         copied_quiescence_result("quiesce copied scanout sink", unsafe {
             self.sink_vk.device.device_wait_idle()
         })?;
+        for fence in self
+            .deferred_submission_fences
+            .iter_mut()
+            .filter_map(Option::take)
+        {
+            unsafe { self.sink_vk.device.destroy_fence(fence, None) };
+        }
         if let Some(render_vk) = self
             .sources
             .first()
@@ -1751,7 +1868,11 @@ impl Drop for CopiedScanoutPool {
             .sources
             .iter()
             .any(|source| source.render_vk.requires_drop_device_idle());
-        if !self.sink_vk.requires_drop_device_idle() && !render_requires_idle {
+        let deferred_fence_pending = self.deferred_submission_fences.iter().any(Option::is_some);
+        if !self.sink_vk.requires_drop_device_idle()
+            && !render_requires_idle
+            && !deferred_fence_pending
+        {
             return;
         }
         if let Err(error) = self.drain_all_pending() {

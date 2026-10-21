@@ -133,6 +133,18 @@ struct PendingScanoutRenderCompletion {
     fd: Option<OwnedFd>,
 }
 
+/// A submitted copied sink job with no exportable final dependency. The
+/// worker waits on its Vulkan queue fence away from the core thread, then
+/// signals `fd` so normal backend dispatch can deliver the safe notification.
+struct PendingScanoutUnflipDependencySafe {
+    render_job_id: u64,
+    output_key: OutputKey,
+    bo_idx: usize,
+    fd: OwnedFd,
+    safe: Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
 /// A completed source-render job ready for the sink-side copied-scanout
 /// submission.
 pub(crate) struct ReadyScanoutRenderCompletion {
@@ -552,6 +564,8 @@ pub struct PlatformBackend {
     /// implementation only polls the original completion fd.
     pub(crate) render_completion_readiness: Rc<dyn flip_events::RenderCompletionReadiness>,
     pending_scanout_render_completions: std::collections::VecDeque<PendingScanoutRenderCompletion>,
+    pending_scanout_unflip_dependencies:
+        std::collections::VecDeque<PendingScanoutUnflipDependencySafe>,
     next_scanout_render_job_id: u64,
 
     /// Command buffer + fence reused by scanout reads, allocated from

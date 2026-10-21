@@ -114,6 +114,15 @@ pub enum FrameHandoff {
     },
 }
 
+/// Preserve the recorder's completeness and the preallocated identity when
+/// shared scanout is handed to the grouped-unflip path.
+pub fn deferred_unflip_handoff(render_job_id: u64, recorded: RecordedFrame) -> FrameHandoff {
+    FrameHandoff::DeferredUnflip {
+        render_job_id,
+        recording_complete: recorded.recording_complete,
+    }
+}
+
 /// The result of [`OutputSink::finish_frame`].
 pub enum FinishOutcome {
     /// The slot is gone; nothing ran.

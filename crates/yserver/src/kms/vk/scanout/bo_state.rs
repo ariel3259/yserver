@@ -4,7 +4,10 @@ use crate::kms::vk::scanout::{
     RetainedSyncFile, TransferResources,
 };
 use ash::vk;
-use std::{io, os::fd::OwnedFd};
+use std::{
+    io,
+    os::fd::{FromRawFd, OwnedFd},
+};
 
 impl CopiedProbeReadback<'_> {
     pub(super) fn destination_buffer(self, transfer: &TransferResources) -> vk::Buffer {
@@ -16,6 +19,17 @@ impl CopiedProbeReadback<'_> {
 }
 
 impl CopiedDestinationOwnership {
+    pub(super) fn after_dependency_safe_cancellation(self) -> Self {
+        if self == Self::ForeignPendingKmsFromSink {
+            // Sink B completed its write and released ownership, but grouped
+            // KMS never accepted/acquired this destination. The next copy is
+            // a full overwrite from UNDEFINED on B's local queue.
+            Self::ReleasedButAtomicRejected
+        } else {
+            self
+        }
+    }
+
     pub(super) fn foreign_acquire_layouts(self) -> Option<(vk::ImageLayout, vk::ImageLayout)> {
         match self {
             Self::ForeignImportedFirstUse => {
@@ -232,6 +246,20 @@ impl BoState {
         ModesetReleased {
             in_fence,
             release_fence,
+        }
+    }
+
+    /// Reset this slot after its last GPU dependency is known safe, closing
+    /// the raw fence descriptors owned by the state before the reset.
+    pub fn reset_after_dependency_safe(&mut self) {
+        let released = self.transition_to_free_after_modeset_reset();
+        for raw_fd in [released.in_fence, released.release_fence]
+            .into_iter()
+            .flatten()
+        {
+            // SAFETY: `BoState` uniquely owned these raw descriptors and the
+            // transition above removed them from the state.
+            drop(unsafe { OwnedFd::from_raw_fd(raw_fd) });
         }
     }
 

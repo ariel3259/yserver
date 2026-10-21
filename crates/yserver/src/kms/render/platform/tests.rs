@@ -506,6 +506,75 @@ fn platform_render_completion_preserves_unflip_identity() {
     assert!(!completions[0].recording_complete);
 }
 
+// Mutation: omit the asynchronous wake when a quarantined sink queue fence
+// signals, leaving deferred cancellation permanently pending.
+#[test]
+fn submitted_unflip_quarantine_wakes_the_render_completion_poller() {
+    let vk = match VkContext::new() {
+        Ok(vk) => vk,
+        Err(crate::kms::vk::device::VkInitError::NoSuitableDevice) => {
+            eprintln!("skipping: no suitable Vulkan physical device");
+            return;
+        }
+        Err(error) => panic!("unexpected Vulkan test setup failure: {error}"),
+    };
+    let mut platform = PlatformBackend::for_tests();
+    let output_key = platform.outputs[0].key.clone();
+    let render_job_id = 37;
+    let fence = unsafe {
+        vk.device
+            .create_fence(&vk::FenceCreateInfo::default(), None)
+    }
+    .expect("create safe-dependency test fence");
+    let submits = [vk::SubmitInfo2::default()];
+    // SAFETY: this empty queue submission only signals the fresh fence used
+    // by the safe-dependency worker; no command buffers or semaphores are
+    // referenced by the submission.
+    unsafe {
+        vk.device
+            .queue_submit2(vk.graphics_queue, &submits, fence)
+            .expect("signal test safe-dependency fence");
+    }
+    platform
+        .register_scanout_unflip_dependency_safe(
+            output_key,
+            2,
+            render_job_id,
+            Arc::clone(&vk),
+            fence,
+        )
+        .expect("register async safe-dependency waiter");
+
+    let mut poll_fd = libc::pollfd {
+        fd: platform.scanout_render_completion_epfd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `poll_fd` is one initialized record for this bounded readiness
+    // wait; the worker writes its socket after the Vulkan fence signals.
+    let ready = unsafe { libc::poll(&mut poll_fd, 1, 5_000) };
+    assert_eq!(ready, 1, "safe-dependency worker must wake backend polling");
+    assert_ne!(poll_fd.revents & libc::POLLIN, 0);
+
+    let notifications = platform.drain_scanout_unflip_dependency_safe();
+    let [
+        crate::kms::render::scene::RenderNotification::UnflipDependencySafe {
+            output,
+            bo_idx,
+            render_job_id: notified_job_id,
+        },
+    ] = notifications.as_slice()
+    else {
+        panic!("one dependency-safe notification should drain")
+    };
+    assert_eq!(output, &Ok(0));
+    assert_eq!(*bo_idx, 2);
+    assert_eq!(*notified_job_id, render_job_id);
+    assert!(platform.pending_scanout_unflip_dependencies.is_empty());
+    assert!(!platform.gpu.renderer_failed);
+    unsafe { vk.device.destroy_fence(fence, None) };
+}
+
 #[test]
 fn non_picked_mode_lookup_uses_the_carried_connector_handle() {
     let connector = ::drm::control::from_u32(17).expect("non-zero connector handle");

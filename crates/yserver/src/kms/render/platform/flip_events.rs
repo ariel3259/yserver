@@ -14,6 +14,10 @@ use std::{
     io,
     os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd, RawFd},
     rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use yserver_core::backend::{BackendFdKind, PresentClockSample, PresentClockSource};
 
@@ -400,6 +404,64 @@ impl PlatformBackend {
         Ok(())
     }
 
+    /// Track a submitted sink copy whose final sync-file could not be
+    /// exported. The copied pool retains the Vulkan fence; a worker waits on
+    /// it and signals a pollable socket so recovery stays off the core thread.
+    pub(crate) fn register_scanout_unflip_dependency_safe(
+        &mut self,
+        output_key: OutputKey,
+        bo_idx: usize,
+        render_job_id: u64,
+        vk: Arc<crate::kms::vk::device::VkContext>,
+        fence: ash::vk::Fence,
+    ) -> io::Result<()> {
+        use std::{
+            io::Write,
+            os::{fd::AsFd, unix::net::UnixStream},
+        };
+
+        let (reader, mut writer) = UnixStream::pair()?;
+        let fd: OwnedFd = reader.into();
+        self.scanout_render_completion_epfd
+            .register(fd.as_fd(), render_job_id)?;
+        let safe = Arc::new(AtomicBool::new(false));
+        let worker_safe = Arc::clone(&safe);
+        let worker = match std::thread::Builder::new()
+            .name(format!("scanout-safe-{render_job_id}"))
+            .spawn(move || {
+                // This wait belongs to a dedicated worker. The backend core
+                // only receives the socket notification after Vulkan reports
+                // that the submitted sink work has completed.
+                let completed =
+                    unsafe { vk.device.wait_for_fences(&[fence], true, u64::MAX) }.is_ok();
+                worker_safe.store(completed, Ordering::Release);
+                let _ = writer.write_all(&[1]);
+            }) {
+            Ok(worker) => worker,
+            Err(error) => {
+                if let Err(unregister_error) =
+                    self.scanout_render_completion_epfd.unregister(fd.as_fd())
+                {
+                    log::warn!(
+                        "scanout safe-dependency poll registration cleanup failed: {unregister_error}"
+                    );
+                }
+                return Err(error);
+            }
+        };
+        self.pending_scanout_unflip_dependencies.push_back(
+            crate::kms::render::platform::PendingScanoutUnflipDependencySafe {
+                render_job_id,
+                output_key,
+                bo_idx,
+                fd,
+                safe,
+                worker: Some(worker),
+            },
+        );
+        Ok(())
+    }
+
     /// Drain every currently readable copied-scanout render completion.
     /// Different outputs are independent, so readiness is not constrained by
     /// queue-front order.
@@ -445,6 +507,71 @@ impl PlatformBackend {
         ready
     }
 
+    /// Convert completed worker waits into safe-dependency notifications.
+    /// Failed waits fail-stop and keep their Vulkan fence quarantined for the
+    /// lifecycle's later device quiescence.
+    pub(crate) fn drain_scanout_unflip_dependency_safe(
+        &mut self,
+    ) -> Vec<crate::kms::render::scene::RenderNotification> {
+        let readiness = PollRenderCompletionReadiness;
+        let mut ready = Vec::new();
+        let mut index = 0;
+        while index < self.pending_scanout_unflip_dependencies.len() {
+            let is_ready = {
+                let pending = &self.pending_scanout_unflip_dependencies[index];
+                readiness
+                    .is_ready(pending.render_job_id, Some(pending.fd.as_fd()))
+                    .unwrap_or(true)
+            };
+            if !is_ready {
+                index += 1;
+                continue;
+            }
+            let mut pending = self
+                .pending_scanout_unflip_dependencies
+                .remove(index)
+                .expect("safe-dependency index was checked");
+            if let Err(error) = self
+                .scanout_render_completion_epfd
+                .unregister(pending.fd.as_fd())
+            {
+                log::warn!("scanout safe-dependency unregister failed: {error}");
+            }
+            if pending
+                .worker
+                .take()
+                .is_some_and(|worker| worker.join().is_err())
+            {
+                log::error!(
+                    "scanout safe-dependency worker panicked for job {}",
+                    pending.render_job_id
+                );
+                self.gpu.renderer_failed = true;
+                continue;
+            }
+            if !pending.safe.load(Ordering::Acquire) {
+                log::error!(
+                    "scanout safe-dependency wait failed for job {}; target remains quarantined",
+                    pending.render_job_id
+                );
+                self.gpu.renderer_failed = true;
+                continue;
+            }
+            ready.push(
+                crate::kms::render::scene::RenderNotification::UnflipDependencySafe {
+                    output: self
+                        .outputs
+                        .iter()
+                        .position(|output| output.key == pending.output_key)
+                        .ok_or_else(|| format!("{:?}", pending.output_key)),
+                    bo_idx: pending.bo_idx,
+                    render_job_id: pending.render_job_id,
+                },
+            );
+        }
+        ready
+    }
+
     pub(super) fn cancel_scanout_render_completions_for_output(&mut self, output_key: &OutputKey) {
         let mut index = 0;
         while index < self.pending_scanout_render_completions.len() {
@@ -462,6 +589,38 @@ impl PlatformBackend {
                 log::warn!("scanout render completion cancellation unregister failed: {error}");
             }
         }
+        self.cancel_scanout_unflip_dependencies_for_output(output_key);
+    }
+
+    fn cancel_scanout_unflip_dependencies_for_output(&mut self, output_key: &OutputKey) {
+        let mut index = 0;
+        while index < self.pending_scanout_unflip_dependencies.len() {
+            if self.pending_scanout_unflip_dependencies[index].output_key != *output_key {
+                index += 1;
+                continue;
+            }
+            let mut pending = self
+                .pending_scanout_unflip_dependencies
+                .remove(index)
+                .expect("safe-dependency index was checked");
+            if let Err(error) = self
+                .scanout_render_completion_epfd
+                .unregister(pending.fd.as_fd())
+            {
+                log::warn!("scanout safe-dependency cancellation unregister failed: {error}");
+            }
+            if pending
+                .worker
+                .take()
+                .is_some_and(|worker| worker.join().is_err())
+            {
+                self.gpu.renderer_failed = true;
+                log::error!(
+                    "scanout safe-dependency worker panicked while cancelling job {}",
+                    pending.render_job_id
+                );
+            }
+        }
     }
 
     pub(crate) fn clear_scanout_render_completions(&mut self) {
@@ -470,6 +629,25 @@ impl PlatformBackend {
                 && let Err(error) = self.scanout_render_completion_epfd.unregister(fd.as_fd())
             {
                 log::warn!("scanout render completion teardown unregister failed: {error}");
+            }
+        }
+        while let Some(mut pending) = self.pending_scanout_unflip_dependencies.pop_front() {
+            if let Err(error) = self
+                .scanout_render_completion_epfd
+                .unregister(pending.fd.as_fd())
+            {
+                log::warn!("scanout safe-dependency teardown unregister failed: {error}");
+            }
+            if pending
+                .worker
+                .take()
+                .is_some_and(|worker| worker.join().is_err())
+            {
+                self.gpu.renderer_failed = true;
+                log::error!(
+                    "scanout safe-dependency worker panicked during teardown for job {}",
+                    pending.render_job_id
+                );
             }
         }
     }
@@ -799,6 +977,12 @@ impl PlatformBackend {
         pool.bos[presented].state.transition_to_on_screen();
         let mut copied_ownership_failed = false;
         if let Some(copied) = scanout.copied_mut() {
+            if let Err(error) = copied.retire_deferred_submission_after_kms(presented) {
+                log::error!(
+                    "render on_page_flip_complete: copied deferred fence retirement failed for output {output_idx} BO {presented}: {error}"
+                );
+                copied_ownership_failed = true;
+            }
             if let Some(retired) = retired
                 && let Err(error) = copied.note_kms_retired(retired)
             {

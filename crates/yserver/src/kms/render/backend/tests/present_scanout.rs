@@ -1565,7 +1565,14 @@ fn phase_b_flip_visibility_includes_all_scanout_transactions() {
 
 #[test]
 fn present_flip_in_flight_mirrors_scene_state() {
-    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
+    let mut b = match crate::kms::render::backend::KmsBackend::for_tests_with_vk() {
+        Ok(backend) => backend,
+        Err(error) if error.to_string().contains("NoSuitableDevice") => {
+            eprintln!("skipping: no suitable Vulkan physical device");
+            return;
+        }
+        Err(error) => panic!("unexpected Vulkan test setup failure: {error}"),
+    };
     let crtc_id = 0x5000;
     bind_test_randr_crtc(&mut b, 0, crtc_id);
     assert!(
@@ -1573,6 +1580,11 @@ fn present_flip_in_flight_mirrors_scene_state() {
         "no flip queued at fixture init"
     );
 
+    b.scene = crate::kms::render::scene::SceneCompositor::new(
+        &b.platform,
+        &b.platform.scene_output_layouts(),
+    )
+    .expect("construct scene for the stub platform output");
     b.scene.test_set_flip_in_flight(true);
     assert_eq!(
         b.present_flip_in_flight(crtc_id),

@@ -442,6 +442,30 @@ pub(crate) struct CopiedScanoutPool {
     pub(crate) plan: CopiedScanoutPlan,
     sink_vk: Arc<VkContext>,
     destination_ownership: Vec<CopiedDestinationOwnership>,
+    /// Queue fences retained for deferred sink copies. Failed exports are
+    /// waited off the core thread before cancellation; successful exports
+    /// remain alive until KMS retirement proves the queue submission done.
+    deferred_submission_fences: Vec<Option<vk::Fence>>,
+}
+
+/// Failure while preparing the sink half of a deferred copied frame.
+#[derive(Debug)]
+pub(crate) enum DeferredCopiedSubmitError {
+    BeforeSubmit(io::Error),
+    Submitted(io::Error),
+    PreviousSubmissionPending(io::Error),
+}
+
+impl std::fmt::Display for DeferredCopiedSubmitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BeforeSubmit(error) => write!(f, "before sink submit: {error}"),
+            Self::Submitted(error) => write!(f, "after sink submit: {error}"),
+            Self::PreviousSubmissionPending(error) => {
+                write!(f, "previous sink submission still pending: {error}")
+            }
+        }
+    }
 }
 
 /// Result of observing one advertised prerequisite for a DMA-BUF path.

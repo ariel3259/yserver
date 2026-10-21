@@ -62,7 +62,7 @@ impl PlatformBackend {
         &mut self,
         output_idx: usize,
         bo_idx: usize,
-        _render_job_id: u64,
+        render_job_id: u64,
         _recording_complete: bool,
         mode: crate::kms::render::scene::FrameSubmitMode,
         render_completion: Option<OwnedFd>,
@@ -84,6 +84,7 @@ impl PlatformBackend {
         let cursor_positions = self.cursor_plane_atomic_positions_for_outputs(&[output_idx]);
 
         let mut recovery_failed = false;
+        let mut quarantined_dependency = None;
         let result = (|| {
             // `Output` deliberately is not Clone: its DRM handles belong to
             // the owning open fd. Borrow the output and its independently
@@ -107,17 +108,75 @@ impl PlatformBackend {
                 .fb_handle
                 .ok_or_else(|| io::Error::other("copied destination has no framebuffer"))?;
 
-            let copy_completion = match copied.submit_copy(bo_idx, render_completion) {
-                Ok(fd) => fd,
-                Err(error) => {
-                    if let Err(recovery_error) = copied.recover_copy_failure(bo_idx) {
-                        recovery_failed = true;
-                        log::error!(
-                            "copied scanout submission failed ({error}) and the sink could not be quiesced: {recovery_error}"
-                        );
-                        return Err(io::Error::new(recovery_error.kind(), recovery_error));
+            let copy_completion = match mode {
+                crate::kms::render::scene::FrameSubmitMode::Immediate => {
+                    match copied.submit_copy(bo_idx, render_completion) {
+                        Ok(fd) => fd,
+                        Err(error) => {
+                            if let Err(recovery_error) = copied.recover_copy_failure(bo_idx) {
+                                recovery_failed = true;
+                                log::error!(
+                                    "copied scanout submission failed ({error}) and the sink could not be quiesced: {recovery_error}"
+                                );
+                                return Err(io::Error::new(recovery_error.kind(), recovery_error));
+                            }
+                            return Err(error);
+                        }
                     }
-                    return Err(error);
+                }
+                crate::kms::render::scene::FrameSubmitMode::DeferredUnflip => {
+                    match copied.submit_copy_deferred(bo_idx, render_completion) {
+                        Ok(fd) => fd,
+                        Err(crate::kms::vk::scanout::DeferredCopiedSubmitError::BeforeSubmit(
+                            error,
+                        )) => {
+                            if let Err(recovery_error) =
+                                copied.recover_deferred_copy_after_dependency_safe(bo_idx)
+                            {
+                                recovery_failed = true;
+                                log::error!(
+                                    "deferred copied scanout failed before queue submit ({error}) and local recovery failed: {recovery_error}"
+                                );
+                                return Err(io::Error::new(recovery_error.kind(), recovery_error));
+                            }
+                            return Err(error);
+                        }
+                        Err(crate::kms::vk::scanout::DeferredCopiedSubmitError::Submitted(
+                            error,
+                        )) => {
+                            let destination = copied
+                                .destinations
+                                .bos
+                                .get_mut(bo_idx)
+                                .expect("copied destination was checked before submission");
+                            destination.state.transition_to_submitted(-1);
+                            let Some((sink_vk, fence)) = copied.quarantined_dependency(bo_idx)
+                            else {
+                                recovery_failed = true;
+                                log::error!(
+                                    "deferred copied scanout failed after submit ({error}) without its quarantine fence"
+                                );
+                                return Ok(crate::kms::render::scene::CopiedSubmitOutcome::QuarantinedWithoutFinalDependency);
+                            };
+                            quarantined_dependency = Some((output_key.clone(), sink_vk, fence));
+                            log::warn!(
+                                "deferred copied scanout job {} has no final dependency ({error}); waiting asynchronously before recycling",
+                                render_job_id
+                            );
+                            return Ok(crate::kms::render::scene::CopiedSubmitOutcome::QuarantinedWithoutFinalDependency);
+                        }
+                        Err(
+                            crate::kms::vk::scanout::DeferredCopiedSubmitError::PreviousSubmissionPending(
+                                error,
+                            ),
+                        ) => {
+                            recovery_failed = true;
+                            log::error!(
+                                "deferred copied scanout job {render_job_id} cannot reuse its target: {error}"
+                            );
+                            return Ok(crate::kms::render::scene::CopiedSubmitOutcome::QuarantinedWithoutFinalDependency);
+                        }
+                    }
                 }
             };
             let destination = copied
@@ -176,6 +235,21 @@ impl PlatformBackend {
             }
         })();
 
+        if let Some((output_key, sink_vk, fence)) = quarantined_dependency
+            && let Err(error) = self.register_scanout_unflip_dependency_safe(
+                output_key,
+                bo_idx,
+                render_job_id,
+                sink_vk,
+                fence,
+            )
+        {
+            log::error!(
+                "could not register asynchronous safe-dependency notification for output {output_idx} BO {bo_idx} job {render_job_id}: {error}; target remains quarantined"
+            );
+            self.gpu.renderer_failed = true;
+        }
+
         if mode == crate::kms::render::scene::FrameSubmitMode::Immediate
             && atomic_commit_sink.take_last_cursor_rejection()
             && let Err(error) = &result
@@ -204,8 +278,8 @@ impl PlatformBackend {
     }
 
     /// A deferred frame target may only be reused after its final render or
-    /// sink-copy dependency is safe. Validate the submitted phase before
-    /// running the shared recovery path so this cannot reset a pending KMS BO.
+    /// sink-copy dependency is safe. Resolve copied ownership and close the
+    /// retained in-fence before returning the BO to the free pool.
     pub(crate) fn recycle_unflip_scanout_bo_after_dependency_safe(
         &mut self,
         output_idx: usize,
@@ -220,13 +294,46 @@ impl PlatformBackend {
         let Some(bo) = scanout.display_pool().bos.get(bo_idx) else {
             return Err(io::Error::other("unflip BO index is out of range"));
         };
-        if !matches!(bo.state.phase, BoPhase::Recording | BoPhase::Submitted) {
+        if bo.state.phase != BoPhase::Submitted {
             return Err(io::Error::other(format!(
-                "unflip target output {output_idx} BO {bo_idx} is {:?}, expected Recording or Submitted",
+                "unflip target output {output_idx} BO {bo_idx} is {:?}, expected Submitted",
                 bo.state.phase
             )));
         }
-        self.recycle_failed_submit_bo(output_idx, bo_idx)
+        let scanout = self
+            .scanout_pools
+            .get_mut(output_idx)
+            .and_then(Option::as_mut)
+            .ok_or_else(|| io::Error::other("unflip output no longer has a scanout pool"))?;
+        match scanout {
+            OutputScanout::Shared(pool) => {
+                let bo = pool
+                    .bos
+                    .get_mut(bo_idx)
+                    .ok_or_else(|| io::Error::other("unflip BO index is out of range"))?;
+                bo.rearm_export_semaphore_after_quiescence()
+                    .map_err(|result| {
+                        io::Error::other(format!(
+                            "rearm shared scanout export semaphore after unflip cancellation: {result:?}"
+                        ))
+                    })?;
+                bo.state.reset_after_dependency_safe();
+            }
+            OutputScanout::Copied(pool) => {
+                pool.recover_deferred_copy_after_dependency_safe(bo_idx)?;
+                pool.sources
+                    .get_mut(bo_idx)
+                    .ok_or_else(|| io::Error::other("copied source index out of range"))?
+                    .recover_failed_cycle_after_renderer_quiescence()?;
+                pool.destinations
+                    .bos
+                    .get_mut(bo_idx)
+                    .ok_or_else(|| io::Error::other("copied destination index out of range"))?
+                    .state
+                    .reset_after_dependency_safe();
+            }
+        }
+        Ok(())
     }
 
     /// Framebuffer last presented by the scene compositor for this output.
@@ -290,7 +397,7 @@ impl PlatformBackend {
                             "rearm shared scanout export semaphore after failed handoff: {result:?}",
                         ))
                     })?;
-                bo.state = BoState::default();
+                bo.state.reset_after_dependency_safe();
             }
             OutputScanout::Copied(pool) => {
                 let source = pool
@@ -303,7 +410,7 @@ impl PlatformBackend {
                     .bos
                     .get_mut(bo_idx)
                     .ok_or_else(|| io::Error::other("copied destination index out of range"))?;
-                destination.state = BoState::default();
+                destination.state.reset_after_dependency_safe();
             }
         }
         Ok(())

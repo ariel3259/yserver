@@ -85,10 +85,6 @@ impl SceneCompositor {
     /// True while any scene acknowledgement is pending on one output,
     /// including copied readiness and deferred-unflip preparation.
     pub fn has_pending_scene_frame(&self, output_idx: usize) -> bool {
-        #[cfg(any(test, feature = "test-support"))]
-        if let Some(v) = self.test_flip_in_flight_override {
-            return v;
-        }
         self.inner
             .as_ref()
             .and_then(|inner| inner.outputs.get(output_idx))

@@ -21,6 +21,12 @@ use yserver_protocol::x11::xfixes;
 /// the headless `PlatformBackend::for_tests` answers on a fresh instance.
 struct TestSink {
     gpu: GpuCore,
+    frame_target: Option<DamageAuditTarget>,
+    frame_route: OutputRoute,
+    next_event_id: u64,
+    recorded_frame_override: Option<RecordedFrame>,
+    finished_render_jobs: Vec<(u64, FrameSubmitMode)>,
+    registered_render_jobs: Vec<(u64, FrameSubmitMode)>,
     commit_in_flight: HashSet<usize>,
     cursor_available: bool,
     cursor_visible: bool,
@@ -48,6 +54,12 @@ impl TestSink {
     fn new() -> Self {
         Self {
             gpu: GpuCore::for_tests(),
+            frame_target: None,
+            frame_route: OutputRoute::None,
+            next_event_id: 73,
+            recorded_frame_override: None,
+            finished_render_jobs: Vec::new(),
+            registered_render_jobs: Vec::new(),
             commit_in_flight: HashSet::new(),
             cursor_available: false,
             cursor_visible: false,
@@ -72,6 +84,30 @@ impl TestSink {
             self.commit_in_flight.remove(&output_idx);
         }
     }
+
+    fn enable_render_target(&mut self, route: OutputRoute) -> Result<(), String> {
+        let vk = self
+            .gpu
+            .vk
+            .as_ref()
+            .ok_or_else(|| "test sink has no live Vulkan context".to_owned())?;
+        self.frame_target = Some(
+            DamageAuditTarget::new(
+                std::sync::Arc::clone(vk),
+                vk::Extent2D {
+                    width: 800,
+                    height: 600,
+                },
+            )
+            .map_err(|error| format!("create test compose target: {error:?}"))?,
+        );
+        self.frame_route = route;
+        Ok(())
+    }
+
+    fn set_recorded_frame_for_tests(&mut self, recorded: RecordedFrame) {
+        self.recorded_frame_override = Some(recorded);
+    }
 }
 
 impl OutputSink for TestSink {
@@ -92,7 +128,7 @@ impl OutputSink for TestSink {
     }
 
     fn route(&self, _output_idx: usize) -> OutputRoute {
-        OutputRoute::None
+        self.frame_route
     }
 
     fn output_commit_in_flight(&self, output_idx: usize) -> bool {
@@ -100,30 +136,78 @@ impl OutputSink for TestSink {
     }
 
     fn slot_count(&self, _output_idx: usize) -> Option<usize> {
-        None
+        self.frame_target.as_ref().map(|_| 3)
     }
 
-    fn acquire_slot(&mut self, _output_idx: usize) -> Option<SlotToken> {
-        None
+    fn acquire_slot(&mut self, output_idx: usize) -> Option<SlotToken> {
+        let target = self.frame_target.as_ref()?;
+        Some(SlotToken {
+            output_idx,
+            bo_idx: 1,
+            extent: vk::Extent2D {
+                width: target.width(),
+                height: target.height(),
+            },
+            last_present_generation: None,
+            content_invalidated: true,
+        })
     }
 
     fn slot_image(&self, _output_idx: usize, _bo_idx: usize) -> Option<vk::Image> {
-        None
+        self.frame_target.as_ref().map(ComposeRenderTarget::image)
     }
 
     fn check_frame_target(&self, _output_idx: usize) -> Result<(), FrameTargetError> {
-        Err(FrameTargetError::NoSlot)
+        if self.frame_target.is_some() && self.frame_route != OutputRoute::None {
+            Ok(())
+        } else {
+            Err(FrameTargetError::NoSlot)
+        }
     }
 
     fn finish_frame(
         &mut self,
         _output_idx: usize,
         _bo_idx: usize,
-        _render_job_id: u64,
-        _mode: FrameSubmitMode,
-        _record: &mut RecordFrame<'_>,
+        render_job_id: u64,
+        mode: FrameSubmitMode,
+        record: &mut RecordFrame<'_>,
     ) -> FinishOutcome {
-        FinishOutcome::Unavailable(FrameTargetError::NoSlot)
+        self.finished_render_jobs.push((render_job_id, mode));
+        let Some(target) = self.frame_target.as_mut() else {
+            return FinishOutcome::Unavailable(FrameTargetError::NoSlot);
+        };
+        if self.frame_route == OutputRoute::None {
+            return FinishOutcome::Unavailable(FrameTargetError::NoSlot);
+        }
+        let result = record(target).map(|actual_recorded| {
+            let recorded = self
+                .recorded_frame_override
+                .take()
+                .unwrap_or(actual_recorded);
+            match self.frame_route {
+                OutputRoute::Shared => match mode {
+                    FrameSubmitMode::Immediate => {
+                        let event_id = self.next_event_id;
+                        self.next_event_id = self.next_event_id.saturating_add(1);
+                        FrameHandoff::FlipPending {
+                            recorded,
+                            event_id: Some(event_id),
+                        }
+                    }
+                    FrameSubmitMode::DeferredUnflip => {
+                        deferred_unflip_handoff(render_job_id, recorded)
+                    }
+                },
+                OutputRoute::Copied => FrameHandoff::RenderCompletion { recorded, fd: None },
+                OutputRoute::None => unreachable!("route checked above"),
+            }
+        });
+        FinishOutcome::Finished {
+            result,
+            previous_gpu_ns: None,
+            fail_stop: false,
+        }
     }
 
     fn invalidate_slot(&mut self, _output_idx: usize, _bo_idx: usize) {}
@@ -135,7 +219,12 @@ impl OutputSink for TestSink {
     }
 
     fn on_page_flip_complete(&mut self, _output_idx: usize) -> Option<FlipRetirement> {
-        None
+        self.frame_target.as_ref()?;
+        Some(FlipRetirement {
+            retired_bo_idx: None,
+            presented_bo_idx: 1,
+            generation: 1,
+        })
     }
 
     fn commit_slot_present(&mut self, _output_idx: usize, _bo_idx: usize, _generation: u64) {}
@@ -158,6 +247,7 @@ impl OutputSink for TestSink {
         recording_complete: bool,
         fd: Option<std::os::fd::OwnedFd>,
     ) -> io::Result<()> {
+        self.registered_render_jobs.push((render_job_id, mode));
         self.render_completions.push_back(RenderCompletion {
             render_job_id,
             output: Ok(output_idx),

@@ -524,6 +524,24 @@ fn destination_becomes_foreign_reusable_only_after_kms_retirement() {
     );
 }
 
+// Mutation: leave a safely cancelled copied destination ForeignPendingKmsFromSink.
+#[test]
+fn safe_unflip_cancellation_makes_copied_destination_reusable() {
+    let ownership =
+        CopiedDestinationOwnership::ForeignPendingKmsFromSink.after_dependency_safe_cancellation();
+
+    assert_eq!(
+        ownership,
+        CopiedDestinationOwnership::ReleasedButAtomicRejected
+    );
+    assert_eq!(
+        ownership
+            .local_copy_old_layout()
+            .expect("safe cancellation must allow the next full copy"),
+        vk::ImageLayout::UNDEFINED
+    );
+}
+
 #[test]
 fn modeset_retirement_preserves_uninitialized_vs_sink_general_provenance() {
     let fresh = CopiedDestinationOwnership::LocalFirstUse.after_kms_modeset();
@@ -1643,6 +1661,28 @@ fn fresh_bo_is_free() {
     assert_eq!(bo.phase, BoPhase::Free);
     assert!(bo.in_fence_fd.is_none());
     assert!(bo.release_fence_fd.is_none());
+}
+
+// Mutation: reset Submitted to Free without closing its retained input fence.
+#[test]
+fn dependency_safe_bo_reset_closes_retained_fence_descriptors() {
+    use std::os::fd::IntoRawFd;
+
+    let (read, _peer) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+    let raw_fd = read.into_raw_fd();
+    let mut bo = BoState::default();
+    bo.transition_to_recording();
+    bo.transition_to_submitted(raw_fd);
+
+    bo.reset_after_dependency_safe();
+
+    assert_eq!(bo.phase, BoPhase::Free);
+    assert!(bo.in_fence_fd.is_none());
+    assert!(bo.release_fence_fd.is_none());
+    // SAFETY: fcntl only inspects whether the uniquely transferred fd is
+    // still open; EBADF confirms the production reset closed it.
+    assert_eq!(unsafe { libc::fcntl(raw_fd, libc::F_GETFD) }, -1);
+    assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
 }
 
 #[test]

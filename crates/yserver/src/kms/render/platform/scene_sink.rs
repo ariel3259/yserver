@@ -11,7 +11,7 @@ use crate::kms::{
             ComposeRenderTarget, CopiedSubmitOutcome, CursorPlaneSink, CursorShowFailure,
             CursorUploadOutcome, FinishOutcome, FlipRetirement, FrameHandoff, FrameSubmitMode,
             FrameTargetError, OutputRoute, OutputSink, RecordFrame, RecordedFrame,
-            RenderCompletion, RenderNotification, SlotToken,
+            RenderCompletion, RenderNotification, SlotToken, deferred_unflip_handoff,
         },
     },
     vk::{
@@ -174,10 +174,9 @@ impl OutputSink for PlatformBackend {
                 }
                 let result = submitted.map(|(recorded, _, event_id)| match mode {
                     FrameSubmitMode::Immediate => FrameHandoff::FlipPending { recorded, event_id },
-                    FrameSubmitMode::DeferredUnflip => FrameHandoff::DeferredUnflip {
-                        render_job_id,
-                        recording_complete: recorded.recording_complete,
-                    },
+                    FrameSubmitMode::DeferredUnflip => {
+                        deferred_unflip_handoff(render_job_id, recorded)
+                    }
                 });
                 FinishOutcome::Finished {
                     result,
@@ -282,7 +281,8 @@ impl OutputSink for PlatformBackend {
     }
 
     fn drain_render_notifications(&mut self) -> Vec<RenderNotification> {
-        self.drain_scanout_render_completions()
+        let mut notifications: Vec<_> = self
+            .drain_scanout_render_completions()
             .into_iter()
             .map(|completion| {
                 RenderNotification::CopiedSourceReady(RenderCompletion {
@@ -298,7 +298,9 @@ impl OutputSink for PlatformBackend {
                     fd: completion.fd,
                 })
             })
-            .collect()
+            .collect();
+        notifications.extend(self.drain_scanout_unflip_dependency_safe());
+        notifications
     }
 
     fn clear_render_completions(&mut self) {

@@ -28,6 +28,8 @@ use crate::kms::render::scene::output_transform;
 #[cfg(any(test, feature = "test-support"))]
 use crate::kms::render::scene::repaint::draw_dst_rect_inward;
 #[cfg(any(test, feature = "test-support"))]
+use crate::kms::render::scene::{FrameSubmitMode, InFlightStage, OutputCursorMode, PendingAck};
+#[cfg(any(test, feature = "test-support"))]
 use crate::kms::render::store::DrawableStore;
 #[cfg(any(test, feature = "test-support"))]
 use ash::vk;
@@ -127,10 +129,52 @@ impl SceneCompositor {
     }
 
     /// Test-only: force [`has_pending_page_flips`](Self::has_pending_page_flips)
-    /// without a live output/`PendingAck` queue.
+    /// for headless scenes and install a matching acknowledgement when a
+    /// live output exists, so per-output readiness still reads production
+    /// scene state.
     #[cfg(any(test, feature = "test-support"))]
     pub fn test_set_flip_in_flight(&mut self, value: bool) {
         self.test_flip_in_flight_override = Some(value);
+        const TEST_ACK_ID: u64 = u64::MAX;
+        if let Some(output) = self
+            .inner
+            .as_mut()
+            .and_then(|inner| inner.outputs.first_mut())
+        {
+            if value {
+                if !output
+                    .pending_acks
+                    .iter()
+                    .any(|ack| ack.render_job_id == TEST_ACK_ID)
+                {
+                    output.pending_acks.push_back(PendingAck {
+                        bo_idx: 0,
+                        generation: output.current_generation.saturating_add(1),
+                        render_job_id: TEST_ACK_ID,
+                        mode: FrameSubmitMode::Immediate,
+                        recording_complete: true,
+                        stage: InFlightStage::KmsFlipPending {
+                            event_id: Some(TEST_ACK_ID),
+                        },
+                        drawable_snapshots: Vec::new(),
+                        ticket: None,
+                        submitted_output_damage: Default::default(),
+                        submitted_participants: Vec::new(),
+                        submitted_scene_structure_damage: Default::default(),
+                        submitted_failed_repaint: Default::default(),
+                        cursor_transition: None,
+                        cursor_prev_pos_after_retire: None,
+                        cursor_mode_after_retire: OutputCursorMode::Hidden,
+                        last_present_cursor_rect_after_retire: None,
+                        last_present_cursor_version_after_retire: None,
+                    });
+                }
+            } else {
+                output
+                    .pending_acks
+                    .retain(|ack| ack.render_job_id != TEST_ACK_ID);
+            }
+        }
     }
 }
 
