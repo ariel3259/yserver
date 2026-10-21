@@ -20,7 +20,7 @@ use ash::vk;
 use drm::control::Device as _;
 use std::{
     io,
-    os::fd::{AsFd as _, FromRawFd as _, OwnedFd},
+    os::fd::{AsFd as _, AsRawFd as _, FromRawFd as _, OwnedFd},
     rc::Rc,
     sync::Arc,
 };
@@ -672,8 +672,14 @@ impl ScanoutBo {
             .semaphore(self.vk_semaphore)
             .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
         let raw_fd = unsafe { ext.get_semaphore_fd(&info)? };
-        let completion =
+        let mut completion =
             crate::kms::vk::optional_sync_fd_from_vk(raw_fd, "vkGetSemaphoreFdKHR(SYNC_FD)")?;
+        if completion
+            .as_ref()
+            .is_some_and(|fd| scanout_sync_file_is_signalled(fd.as_raw_fd()))
+        {
+            completion = None;
+        }
         self.export_semaphore_reuse.finish_successful_export();
         Ok(completion)
     }
@@ -832,6 +838,31 @@ impl ScanoutBo {
         }
         unsafe { self.vk.device.destroy_semaphore(self.vk_semaphore, None) };
         destroy_transfer_resources(&self.vk, &mut self.vk_transfer);
+    }
+}
+
+/// A signalled sync file carries no remaining dependency. Collapse it to the
+/// same `None` representation Vulkan uses when exporting an already-signalled
+/// SYNC_FD payload, so callers can submit KMS's `-1` sentinel without retaining
+/// a redundant descriptor.
+fn scanout_sync_file_is_signalled(fd: std::os::fd::RawFd) -> bool {
+    let mut descriptor = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: poll observes the still-owned sync-file descriptor without
+        // waiting; the descriptor remains owned by `completion` here.
+        let result = unsafe { libc::poll(&mut descriptor, 1, 0) };
+        if result < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return false;
+        }
+        return result > 0
+            && descriptor.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0;
     }
 }
 

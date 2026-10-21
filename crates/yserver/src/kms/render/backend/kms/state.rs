@@ -7,6 +7,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     io,
     os::fd::OwnedFd,
+    time::Instant,
 };
 
 use ash::vk;
@@ -21,7 +22,7 @@ use crate::{
         backend::OutputKey,
         render::{
             backend::XBackend,
-            platform::{CrtcKey, PlatformBackend, QualifiedScanoutPlan},
+            platform::{CrtcKey, PlatformBackend, PreparedUnflipPlane, QualifiedScanoutPlan},
             store::DrawableId,
             target::PaintTarget,
         },
@@ -256,6 +257,31 @@ pub(in crate::kms::render::backend) type DirectFrameSubmitter =
 /// causes direct/composed atomic thrash.
 pub(in crate::kms::render::backend) const SCANOUT_M2_ELIGIBLE_ROOT_PROBATION: u8 = 8;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::kms::render::backend) enum ComposedUnflipPhase {
+    Idle,
+    Preparing,
+    Ready,
+    RetryWaiting,
+    Cancelling,
+    Quarantined,
+    Accepted { commit_id: u64 },
+}
+
+pub(in crate::kms::render::backend) struct ComposedUnflipBatch {
+    pub(in crate::kms::render::backend) phase: ComposedUnflipPhase,
+    pub(in crate::kms::render::backend) topology_generation: u64,
+    pub(in crate::kms::render::backend) expected_outputs: Vec<OutputKey>,
+    pub(in crate::kms::render::backend) expected_planes:
+        Vec<crate::kms::render::platform::ExpectedUnflipPlane>,
+    pub(in crate::kms::render::backend) prepared_planes: HashMap<OutputKey, PreparedUnflipPlane>,
+    pub(in crate::kms::render::backend) awaiting_outputs: HashSet<usize>,
+    pub(in crate::kms::render::backend) retry_at: Option<Instant>,
+    pub(in crate::kms::render::backend) prepare_deadline: Option<Instant>,
+    pub(in crate::kms::render::backend) prepare_attempt: u8,
+    pub(in crate::kms::render::backend) timeout_error_logged: bool,
+}
+
 pub(in crate::kms::render::backend) struct ScanoutM2State {
     pub(in crate::kms::render::backend) pending: Option<DirectPresentFrame>,
     /// One eligible direct successor, retained while `pending` owns the
@@ -274,6 +300,9 @@ pub(in crate::kms::render::backend) struct ScanoutM2State {
     pub(in crate::kms::render::backend) hold_direct: bool,
     pub(in crate::kms::render::backend) cursor_bound_all: bool,
     pub(in crate::kms::render::backend) unflip_requested: bool,
+    pub(in crate::kms::render::backend) unflip_exit_watchdog_at: Option<Instant>,
+    pub(in crate::kms::render::backend) composed_unflip: Option<ComposedUnflipBatch>,
+    pub(in crate::kms::render::backend) next_unflip_topology_generation: u64,
     /// First request in the current direct-to-composed transition. This is
     /// the causal trigger; later composite ticks must not overwrite it.
     pub(in crate::kms::render::backend) unflip_reason: Option<&'static str>,
@@ -311,6 +340,9 @@ impl ScanoutM2State {
             hold_direct: false,
             cursor_bound_all: false,
             unflip_requested: false,
+            unflip_exit_watchdog_at: None,
+            composed_unflip: None,
+            next_unflip_topology_generation: 0,
             unflip_reason: None,
             unflip_last_reason: None,
             unflip_outputs_to_replace: HashSet::new(),

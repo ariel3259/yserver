@@ -1,3 +1,4 @@
+use super::{ComposedUnflipBatch, ComposedUnflipPhase};
 use crate::kms::render::{
     backend::{
         DirectFrameSlot, DirectPresentFrame, KmsBackend, ScanoutM0Coverage, ScanoutM0Shape,
@@ -321,6 +322,8 @@ impl KmsBackend {
         }
         if !self.pstate.scanout_m2.unflip_requested {
             self.pstate.scanout_m2.unflip_reason = Some(reason);
+            self.pstate.scanout_m2.unflip_exit_watchdog_at =
+                Some(self.monotonic_now() + std::time::Duration::from_secs(2));
         }
         self.pstate.scanout_m2.unflip_requested = true;
         self.pstate.scanout_m2.unflip_last_reason = Some(reason);
@@ -859,6 +862,9 @@ impl KmsBackend {
         self.pstate.scanout_m2.hold_direct = false;
         self.pstate.scanout_m2.cursor_bound_all = false;
         self.pstate.scanout_m2.unflip_requested = false;
+        self.pstate.scanout_m2.unflip_exit_watchdog_at = None;
+        self.pstate.scanout_m2.composed_unflip = None;
+        self.platform.clear_unflip_batch_context();
         self.pstate.scanout_m2.unflip_reason = None;
         self.pstate.scanout_m2.unflip_last_reason = None;
         self.pstate.scanout_m2.unflip_outputs_to_replace.clear();
@@ -1093,16 +1099,13 @@ impl KmsBackend {
         Ok(())
     }
 
-    /// Replace the shared direct framebuffer with every output's retained
-    /// compositor framebuffer in one non-modesetting atomic transaction.
-    /// AMD rejects independent per-CRTC replacement with `ENOSPC`; replacing
-    /// the complete set together avoids both that intermediate state and the
-    /// visible blackout of a disable/re-enable cycle.
-    fn submit_composed_unflip(&mut self) -> io::Result<bool> {
-        let output_indices: Vec<_> = (0..self.platform.outputs.len()).collect();
-        if self
-            .platform
-            .cursor_commit_in_flight_for_outputs(&output_indices)
+    /// Begin the production full-scene render while the direct framebuffer
+    /// remains on screen. The grouped KMS replacement is advanced separately
+    /// once every output owns a complete final dependency.
+    fn start_composed_unflip(&mut self) -> io::Result<bool> {
+        if self.pstate.scanout_m2.composed_unflip.is_some()
+            || self.pstate.scanout_m2.current.is_none()
+            || !self.pstate.scanout_m2.unflip_requested
         {
             return Ok(false);
         }
@@ -1112,28 +1115,229 @@ impl KmsBackend {
             ));
         }
         self.materialize_direct_shadow_for_unflip()?;
-        let planes: Vec<crate::drm::modeset::ComposedScanoutPlaneState<'_>> = self
+        self.scene.invalidate_all_scanout_damage();
+        self.scene.mark_scene_structure_dirty();
+        let topology_generation = self
+            .pstate
+            .scanout_m2
+            .next_unflip_topology_generation
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("unflip topology generation overflow"))?;
+        self.pstate.scanout_m2.next_unflip_topology_generation = topology_generation;
+        let expected_outputs = self
             .platform
             .outputs
             .iter()
-            .enumerate()
-            .map(|(output_idx, layout)| {
-                let fb = self
-                    .platform
-                    .retained_composed_framebuffer(output_idx)
-                    .ok_or_else(|| {
-                        io::Error::other(format!(
-                            "scanout M2: output {output_idx} has no retained composed framebuffer"
-                        ))
-                    })?;
-                Ok(crate::drm::modeset::ComposedScanoutPlaneState {
-                    output: &layout.output,
-                    fb,
-                    in_fence_fd: None,
+            .map(|output| output.key.clone())
+            .collect();
+        self.platform
+            .install_unflip_batch_context(topology_generation);
+        self.pstate.scanout_m2.unflip_exit_watchdog_at = None;
+        self.pstate.scanout_m2.composed_unflip = Some(ComposedUnflipBatch {
+            phase: ComposedUnflipPhase::Idle,
+            topology_generation,
+            expected_outputs,
+            expected_planes: Vec::new(),
+            prepared_planes: HashMap::new(),
+            awaiting_outputs: HashSet::new(),
+            retry_at: None,
+            prepare_deadline: Some(self.monotonic_now() + std::time::Duration::from_secs(2)),
+            prepare_attempt: 1,
+            timeout_error_logged: false,
+        });
+        self.pstate
+            .scanout_m2
+            .composed_unflip
+            .as_mut()
+            .expect("new unflip batch")
+            .phase = ComposedUnflipPhase::Preparing;
+        let _ = self.compose_tick(crate::kms::render::scene::FrameSubmitMode::DeferredUnflip);
+        self.advance_composed_unflip()?;
+        Ok(true)
+    }
+
+    /// Refresh the scene and platform ledgers, then submit one all-output
+    /// replacement when every exact acknowledgement and BO dependency is
+    /// ready. This method never waits for GPU work.
+    fn advance_composed_unflip(&mut self) -> io::Result<bool> {
+        let Some(batch) = self.pstate.scanout_m2.composed_unflip.as_ref() else {
+            return Ok(false);
+        };
+        match batch.phase {
+            ComposedUnflipPhase::Accepted { .. } => return Ok(false),
+            ComposedUnflipPhase::Cancelling => {
+                self.finish_composed_unflip_cancellation()?;
+                return Ok(false);
+            }
+            ComposedUnflipPhase::Quarantined => {
+                if batch
+                    .prepare_deadline
+                    .is_some_and(|deadline| self.monotonic_now() >= deadline)
+                {
+                    self.handle_composed_unflip_prepare_timeout()?;
+                }
+                return Ok(false);
+            }
+            ComposedUnflipPhase::Idle
+            | ComposedUnflipPhase::Preparing
+            | ComposedUnflipPhase::Ready
+            | ComposedUnflipPhase::RetryWaiting => {}
+        }
+        let now = self.monotonic_now();
+        if batch.phase == ComposedUnflipPhase::RetryWaiting {
+            if batch.retry_at.is_some_and(|retry_at| now < retry_at) {
+                return Ok(false);
+            }
+            if let Some(batch) = self.pstate.scanout_m2.composed_unflip.as_mut() {
+                batch.phase = ComposedUnflipPhase::Ready;
+                batch.retry_at = None;
+            }
+        }
+
+        let current_keys: Vec<_> = self
+            .platform
+            .outputs
+            .iter()
+            .map(|output| output.key.clone())
+            .collect();
+        let stale_topology = self
+            .pstate
+            .scanout_m2
+            .composed_unflip
+            .as_ref()
+            .is_some_and(|batch| batch.expected_outputs != current_keys);
+        if stale_topology {
+            self.begin_composed_unflip_cancellation(false)?;
+            return Ok(false);
+        }
+
+        let prepared = self.platform.take_prepared_unflip_planes();
+        let identities = self.scene.pending_unflip_frame_identities();
+        let (
+            ready,
+            deadline_expired,
+            expected_outputs,
+            expected_planes,
+            prepared_planes,
+            generation,
+        ) = {
+            let batch = self
+                .pstate
+                .scanout_m2
+                .composed_unflip
+                .as_mut()
+                .expect("batch was present before ledger refresh");
+            for plane in prepared {
+                if plane.topology_generation == batch.topology_generation {
+                    batch
+                        .prepared_planes
+                        .insert(plane.output_key.clone(), plane);
+                }
+            }
+            batch.expected_planes = identities
+                .iter()
+                .filter_map(|identity| {
+                    let output_key = batch.expected_outputs.get(identity.output_idx)?.clone();
+                    Some(crate::kms::render::platform::ExpectedUnflipPlane {
+                        output_idx: identity.output_idx,
+                        output_key,
+                        bo_idx: identity.bo_idx,
+                        render_job_id: identity.render_job_id,
+                        recording_complete: identity.recording_complete,
+                        topology_generation: identity.topology_generation,
+                    })
                 })
+                .collect();
+            let prepared_rows: Vec<_> = batch.prepared_planes.values().cloned().collect();
+            let ready = crate::kms::render::platform::grouped_unflip_ready(
+                &batch.expected_outputs,
+                &batch.expected_planes,
+                &prepared_rows,
+            );
+            let deadline_expired = batch
+                .prepare_deadline
+                .is_some_and(|deadline| now >= deadline);
+            if ready {
+                batch.phase = ComposedUnflipPhase::Ready;
+                batch.prepare_deadline = None;
+            }
+            (
+                ready,
+                deadline_expired,
+                batch.expected_outputs.clone(),
+                batch.expected_planes.clone(),
+                batch.prepared_planes.clone(),
+                batch.topology_generation,
+            )
+        };
+        if expected_planes
+            .iter()
+            .any(|plane| !plane.recording_complete)
+        {
+            self.begin_composed_unflip_cancellation(false)?;
+            return Ok(false);
+        }
+        if !ready {
+            if deadline_expired {
+                self.handle_composed_unflip_prepare_timeout()?;
+            }
+            return Ok(false);
+        }
+
+        let output_indices: Vec<_> = (0..expected_outputs.len()).collect();
+        if self
+            .platform
+            .cursor_commit_in_flight_for_outputs(&output_indices)
+        {
+            return Ok(false);
+        }
+        if !self.direct_scanout_topology_eligible() {
+            self.begin_composed_unflip_cancellation(false)?;
+            return Ok(false);
+        }
+        if !self.scanout_allowed() || !self.kms_outputs_active {
+            return Ok(false);
+        }
+        let scene_identities = self.scene.pending_unflip_frame_identities();
+        self.scene
+            .validate_grouped_unflip(&scene_identities)
+            .map_err(|error| io::Error::other(format!("validate grouped unflip: {error}")))?;
+
+        let specs: Vec<_> = expected_planes
+            .iter()
+            .map(|expected| {
+                let prepared = prepared_planes
+                    .get(&expected.output_key)
+                    .ok_or_else(|| io::Error::other("ready unflip plane disappeared"))?;
+                if prepared.output_idx != expected.output_idx
+                    || prepared.bo_idx != expected.bo_idx
+                    || prepared.render_job_id != expected.render_job_id
+                    || !prepared.recording_complete
+                    || prepared.topology_generation != generation
+                {
+                    return Err(io::Error::other("prepared unflip identity changed"));
+                }
+                let bo = self
+                    .platform
+                    .scanout_pools
+                    .get(expected.output_idx)
+                    .and_then(Option::as_ref)
+                    .and_then(|pool| pool.display_pool().bos.get(expected.bo_idx))
+                    .ok_or_else(|| io::Error::other("prepared unflip BO disappeared"))?;
+                if bo.state.phase != crate::kms::vk::scanout::BoPhase::Submitted
+                    || bo.state.in_fence_fd != prepared.final_in_fence
+                {
+                    return Err(io::Error::other(format!(
+                        "prepared unflip output {} BO {} lost its submitted fence",
+                        expected.output_idx, expected.bo_idx
+                    )));
+                }
+                let fb = bo
+                    .fb_handle
+                    .ok_or_else(|| io::Error::other("prepared unflip BO has no framebuffer"))?;
+                Ok((expected.output_idx, fb, prepared.final_in_fence))
             })
             .collect::<io::Result<_>>()?;
-        let output_count = planes.len();
         let (device, atomic_commit_sink) = self
             .platform
             .primary_device()
@@ -1146,10 +1350,25 @@ impl KmsBackend {
             .ok_or_else(|| {
                 io::Error::other("scanout M2: composed unflip requested without a KMS device")
             })?;
-        let output_indices: Vec<_> = (0..planes.len()).collect();
+        let planes: Vec<crate::drm::modeset::ComposedScanoutPlaneState<'_>> = specs
+            .iter()
+            .map(
+                |(output_idx, fb, in_fence_fd)| crate::drm::modeset::ComposedScanoutPlaneState {
+                    output: &self.platform.outputs[*output_idx].output,
+                    fb: *fb,
+                    in_fence_fd: *in_fence_fd,
+                },
+            )
+            .collect();
         let cursor_positions = self
             .platform
             .cursor_plane_atomic_positions_for_outputs(&output_indices);
+        if self
+            .platform
+            .cursor_commit_in_flight_for_outputs(&output_indices)
+        {
+            return Ok(false);
+        }
         let result = crate::drm::modeset::submit_composed_scanout(
             &device,
             atomic_commit_sink.as_ref(),
@@ -1164,32 +1383,383 @@ impl KmsBackend {
                 .reject_atomic_cursor_commit(&cursor_positions, &error.to_string());
             self.handle_cursor_move_outcome(outcome);
         }
-        let accepted_event_id = result?;
+        let accepted_event_id = match result {
+            Ok(event_id) => event_id,
+            Err(error) if error.raw_os_error() == Some(libc::EBUSY) => {
+                let batch = self
+                    .pstate
+                    .scanout_m2
+                    .composed_unflip
+                    .as_mut()
+                    .expect("unflip batch remains installed after transient rejection");
+                batch.phase = ComposedUnflipPhase::RetryWaiting;
+                batch.retry_at = Some(now + std::time::Duration::from_millis(100));
+                log::debug!("scanout_m2: grouped unflip transiently rejected: {error}");
+                return Ok(false);
+            }
+            Err(error) => {
+                log::error!(
+                    "scanout_m2: grouped unflip rejected; cancelling prepared frames safely before degraded replacement: {error}"
+                );
+                self.begin_composed_unflip_cancellation(true)?;
+                return Ok(false);
+            }
+        };
+
+        for expected in &expected_planes {
+            self.platform
+                .accept_prepared_unflip_plane(expected.output_idx, expected.bo_idx)?;
+        }
+        self.scene
+            .accept_grouped_unflip(&scene_identities, accepted_event_id)
+            .map_err(|error| io::Error::other(format!("accept grouped unflip: {error}")))?;
         self.platform
             .cursor_plane_scene_commit_submitted(&cursor_positions);
+        let output_count = expected_outputs.len();
+        let batch = self
+            .pstate
+            .scanout_m2
+            .composed_unflip
+            .as_mut()
+            .expect("accepted unflip batch remains installed");
+        batch.phase = ComposedUnflipPhase::Accepted {
+            commit_id: accepted_event_id,
+        };
+        batch.awaiting_outputs = (0..output_count).collect();
+        batch.retry_at = None;
+        batch.prepare_deadline = None;
+        self.platform.clear_unflip_batch_context();
         self.pstate.scanout_m2.unflip_outputs_to_replace = (0..output_count).collect();
         self.pstate.scanout_m2.unflip_awaiting_outputs = (0..output_count)
             .map(|output_idx| (output_idx, accepted_event_id))
             .collect();
-        let describe_frame = |frame: &DirectPresentFrame| {
-            (
-                frame.source_id.as_u64(),
-                frame.candidate.present_id,
-                frame.candidate.paint_dst_host_xid,
-            )
-        };
         log::debug!(
-            "scanout_m2: submitted atomic composed unflip outputs={} reason={} last_reason={} pending={:?} current={:?}",
+            "scanout_m2: submitted atomic composed unflip outputs={} reason={} last_reason={} commit_id={accepted_event_id}",
             output_count,
             self.pstate.scanout_m2.unflip_reason.unwrap_or("unknown"),
             self.pstate
                 .scanout_m2
                 .unflip_last_reason
-                .unwrap_or("unknown"),
-            self.pstate.scanout_m2.pending.as_ref().map(describe_frame),
-            self.pstate.scanout_m2.current.as_ref().map(describe_frame)
+                .unwrap_or("unknown")
         );
         Ok(true)
+    }
+
+    fn begin_composed_unflip_cancellation(&mut self, degraded: bool) -> io::Result<()> {
+        let Some(batch) = self.pstate.scanout_m2.composed_unflip.as_mut() else {
+            return Ok(());
+        };
+        batch.phase = ComposedUnflipPhase::Cancelling;
+        batch.retry_at = None;
+        batch.prepare_deadline = None;
+        let topology_generation = batch.topology_generation;
+        if degraded {
+            self.pstate.scanout_m2.degraded_composed_unflip = true;
+            self.pstate.scanout_m2.unflip_outputs_to_replace =
+                (0..self.platform.outputs.len()).collect();
+            self.pstate.scanout_m2.unflip_awaiting_outputs.clear();
+        }
+        let identities = self.scene.pending_unflip_frame_identities();
+        let mut writer_pending = false;
+        let mut quarantined = false;
+        for identity in identities
+            .into_iter()
+            .filter(|identity| identity.topology_generation == topology_generation)
+        {
+            let Some(output_key) = self
+                .platform
+                .outputs
+                .get(identity.output_idx)
+                .map(|output| output.key.clone())
+            else {
+                quarantined = true;
+                continue;
+            };
+            if self.scene.unflip_frame_is_quarantined(
+                identity.output_idx,
+                identity.bo_idx,
+                identity.render_job_id,
+            ) {
+                quarantined = true;
+                continue;
+            }
+            let prepared = self
+                .pstate
+                .scanout_m2
+                .composed_unflip
+                .as_ref()
+                .and_then(|batch| batch.prepared_planes.get(&output_key))
+                .filter(|plane| {
+                    plane.bo_idx == identity.bo_idx
+                        && plane.render_job_id == identity.render_job_id
+                        && plane.topology_generation == topology_generation
+                })
+                .cloned();
+            let dependency_pending = if let Some(plane) = prepared {
+                match plane.final_in_fence {
+                    Some(fd) => match self.platform.register_scanout_unflip_sync_dependency_safe(
+                        output_key.clone(),
+                        identity.bo_idx,
+                        identity.render_job_id,
+                        topology_generation,
+                        fd,
+                    ) {
+                        Ok(()) => true,
+                        Err(error) => {
+                            log::error!(
+                                "scanout_m2: cannot register safe dependency for output {} BO {} job {}: {error}; target remains quarantined",
+                                identity.output_idx,
+                                identity.bo_idx,
+                                identity.render_job_id
+                            );
+                            quarantined = true;
+                            continue;
+                        }
+                    },
+                    None => false,
+                }
+            } else {
+                match self.platform.cancel_scanout_render_completion_for_unflip(
+                    &output_key,
+                    identity.bo_idx,
+                    identity.render_job_id,
+                    topology_generation,
+                )? {
+                    Some(pending) => pending,
+                    None => {
+                        quarantined = true;
+                        continue;
+                    }
+                }
+            };
+            if dependency_pending {
+                writer_pending = true;
+                continue;
+            }
+            self.platform
+                .recycle_unflip_scanout_bo_after_dependency_safe(
+                    identity.output_idx,
+                    identity.bo_idx,
+                )?;
+            self.platform
+                .invalidate_bo(identity.output_idx, identity.bo_idx);
+            self.scene
+                .cancel_prepared_unflip(
+                    identity.output_idx,
+                    identity.bo_idx,
+                    identity.render_job_id,
+                    &mut self.store,
+                )
+                .map_err(|error| io::Error::other(format!("cancel prepared unflip: {error}")))?;
+        }
+        if quarantined {
+            if let Some(batch) = self.pstate.scanout_m2.composed_unflip.as_mut() {
+                batch.phase = ComposedUnflipPhase::Quarantined;
+                batch.prepare_deadline = None;
+            }
+            return Ok(());
+        }
+        if writer_pending {
+            return Ok(());
+        }
+        self.finish_composed_unflip_cancellation()
+    }
+
+    fn finish_composed_unflip_cancellation(&mut self) -> io::Result<()> {
+        let Some(batch) = self.pstate.scanout_m2.composed_unflip.as_ref() else {
+            return Ok(());
+        };
+        let topology_generation = batch.topology_generation;
+        if self
+            .scene
+            .pending_unflip_frame_identities()
+            .iter()
+            .any(|identity| identity.topology_generation == topology_generation)
+        {
+            return Ok(());
+        }
+        if batch.phase == ComposedUnflipPhase::Quarantined {
+            return Ok(());
+        }
+        self.platform.clear_unflip_batch_context();
+        if self.pstate.scanout_m2.degraded_composed_unflip {
+            self.pstate.scanout_m2.composed_unflip = None;
+            self.platform.clear_unflip_batch_context();
+            self.scene.invalidate_all_scanout_damage();
+            self.scene.mark_scene_structure_dirty();
+            return Ok(());
+        }
+        let attempt = batch.prepare_attempt;
+        if attempt >= 2 {
+            let relight = self
+                .teardown_direct_before_topology_requery("composed unflip preparation deadline")?;
+            self.platform.clear_unflip_batch_context();
+            self.pstate.scanout_m2.composed_unflip = None;
+            self.relight_after_direct_teardown(relight, "composed unflip preparation deadline")?;
+            self.scene.invalidate_all_scanout_damage();
+            self.scene.mark_scene_structure_dirty();
+            return Ok(());
+        }
+
+        let topology_generation = self
+            .pstate
+            .scanout_m2
+            .next_unflip_topology_generation
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("unflip topology generation overflow"))?;
+        self.pstate.scanout_m2.next_unflip_topology_generation = topology_generation;
+        let expected_outputs = self
+            .platform
+            .outputs
+            .iter()
+            .map(|output| output.key.clone())
+            .collect();
+        let prepare_deadline = self.monotonic_now() + std::time::Duration::from_secs(2);
+        let batch = self
+            .pstate
+            .scanout_m2
+            .composed_unflip
+            .as_mut()
+            .expect("cancelling batch remains installed");
+        batch.phase = ComposedUnflipPhase::Preparing;
+        batch.topology_generation = topology_generation;
+        batch.expected_outputs = expected_outputs;
+        batch.expected_planes.clear();
+        batch.prepared_planes.clear();
+        batch.awaiting_outputs.clear();
+        batch.retry_at = None;
+        batch.prepare_deadline = Some(prepare_deadline);
+        batch.prepare_attempt = attempt.saturating_add(1);
+        self.platform
+            .install_unflip_batch_context(topology_generation);
+        self.scene.invalidate_all_scanout_damage();
+        self.scene.mark_scene_structure_dirty();
+        let _ = self.compose_tick(crate::kms::render::scene::FrameSubmitMode::DeferredUnflip);
+        self.advance_composed_unflip()?;
+        Ok(())
+    }
+
+    fn handle_composed_unflip_prepare_timeout(&mut self) -> io::Result<()> {
+        let Some(batch) = self.pstate.scanout_m2.composed_unflip.as_ref() else {
+            return Ok(());
+        };
+        if batch.prepare_attempt == 1 {
+            return self.begin_composed_unflip_cancellation(false);
+        }
+
+        let identities = self.scene.pending_unflip_frame_identities();
+        let all_dependencies_safe = {
+            let batch = self
+                .pstate
+                .scanout_m2
+                .composed_unflip
+                .as_ref()
+                .expect("unflip batch remains installed");
+            let mut fds = Vec::new();
+            let mut complete = true;
+            for identity in identities
+                .iter()
+                .filter(|identity| identity.topology_generation == batch.topology_generation)
+            {
+                let Some(output_key) = batch.expected_outputs.get(identity.output_idx) else {
+                    complete = false;
+                    break;
+                };
+                if self.scene.unflip_frame_is_quarantined(
+                    identity.output_idx,
+                    identity.bo_idx,
+                    identity.render_job_id,
+                ) {
+                    complete = false;
+                    break;
+                }
+                if let Some(plane) = batch.prepared_planes.get(output_key) {
+                    if plane.bo_idx != identity.bo_idx
+                        || plane.render_job_id != identity.render_job_id
+                    {
+                        complete = false;
+                        break;
+                    }
+                    if let Some(fd) = plane.final_in_fence {
+                        fds.push(fd);
+                    }
+                } else {
+                    match self.platform.unflip_render_completion_fd(
+                        output_key,
+                        identity.bo_idx,
+                        identity.render_job_id,
+                        batch.topology_generation,
+                    ) {
+                        Some(Some(fd)) => fds.push(fd),
+                        Some(None) => {}
+                        None => {
+                            complete = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if complete && !fds.is_empty() {
+                let mut remaining = std::time::Duration::from_secs(1);
+                let start = std::time::Instant::now();
+                let mut pending: Vec<_> = fds
+                    .into_iter()
+                    .map(|fd| libc::pollfd {
+                        fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    })
+                    .collect();
+                while !pending.is_empty() && !remaining.is_zero() {
+                    let timeout_ms = i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX);
+                    // SAFETY: poll only observes the BO-owned sync-file fds;
+                    // the caller retains those descriptors for this call.
+                    let result = unsafe {
+                        libc::poll(
+                            pending.as_mut_ptr(),
+                            pending.len() as libc::nfds_t,
+                            timeout_ms,
+                        )
+                    };
+                    if result < 0 {
+                        if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                        {
+                            remaining =
+                                std::time::Duration::from_secs(1).saturating_sub(start.elapsed());
+                            continue;
+                        }
+                        break;
+                    }
+                    pending.retain(|fd| {
+                        !((fd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP)) != 0)
+                    });
+                    remaining = std::time::Duration::from_secs(1).saturating_sub(start.elapsed());
+                }
+                complete && pending.is_empty()
+            } else {
+                complete
+            }
+        };
+
+        if all_dependencies_safe {
+            return self.begin_composed_unflip_cancellation(false);
+        }
+        let prepare_deadline = self.monotonic_now() + std::time::Duration::from_secs(2);
+        let batch = self
+            .pstate
+            .scanout_m2
+            .composed_unflip
+            .as_mut()
+            .expect("unflip batch remains installed");
+        if !batch.timeout_error_logged {
+            log::error!(
+                "scanout_m2: second composed-unflip prepare deadline expired; keeping writer-unsafe targets and direct pins quarantined"
+            );
+            batch.timeout_error_logged = true;
+        }
+        batch.phase = ComposedUnflipPhase::Quarantined;
+        batch.prepare_deadline = Some(prepare_deadline);
+        Ok(())
     }
 
     /// Install only accepted per-output scene commits as degraded-unflip
@@ -1335,6 +1905,53 @@ impl KmsBackend {
             // gate, submit at most one successor only after the kernel has
             // retired the preceding transaction.
             self.submit_queued_direct_successor();
+        }
+        true
+    }
+
+    pub(in crate::kms::render::backend) fn retire_composed_unflip_output(
+        &mut self,
+        output_idx: usize,
+        event_id: Option<u64>,
+        _clock: yserver_core::backend::PresentClockSample,
+    ) -> bool {
+        let Some(batch) = self.pstate.scanout_m2.composed_unflip.as_ref() else {
+            return false;
+        };
+        let ComposedUnflipPhase::Accepted { commit_id } = batch.phase else {
+            return false;
+        };
+        if event_id != Some(commit_id) || !batch.awaiting_outputs.contains(&output_idx) {
+            return false;
+        }
+        if !self.scene.handle_page_flip_complete(
+            output_idx,
+            event_id,
+            &mut self.store,
+            &mut self.platform,
+        ) {
+            return false;
+        }
+        if let Some(batch) = self.pstate.scanout_m2.composed_unflip.as_mut() {
+            batch.awaiting_outputs.remove(&output_idx);
+        }
+        self.pstate
+            .scanout_m2
+            .unflip_awaiting_outputs
+            .remove(&output_idx);
+        self.pstate
+            .scanout_m2
+            .unflip_outputs_to_replace
+            .remove(&output_idx);
+        if self
+            .pstate
+            .scanout_m2
+            .composed_unflip
+            .as_ref()
+            .is_some_and(|batch| batch.awaiting_outputs.is_empty())
+        {
+            self.stop_direct_after_scanout_replaced("atomic composed unflip");
+            log::debug!("scanout_m2: fresh composed unflip retired on all outputs");
         }
         true
     }
@@ -2151,6 +2768,29 @@ impl KmsBackend {
     }
 
     pub(super) fn scene_wants_compose(&self) -> bool {
+        if let Some(batch) = self.pstate.scanout_m2.composed_unflip.as_ref() {
+            return match batch.phase {
+                ComposedUnflipPhase::Preparing => {
+                    self.scene_wants_scene()
+                        && self.scene.has_output_ready_for_submit(
+                            &self.platform,
+                            crate::kms::render::scene::FrameSubmitMode::DeferredUnflip,
+                        )
+                }
+                ComposedUnflipPhase::Ready => !self.platform.cursor_commit_in_flight_for_outputs(
+                    &(0..self.platform.outputs.len()).collect::<Vec<_>>(),
+                ),
+                ComposedUnflipPhase::RetryWaiting => batch
+                    .retry_at
+                    .is_some_and(|deadline| self.monotonic_now() >= deadline),
+                ComposedUnflipPhase::Quarantined => batch
+                    .prepare_deadline
+                    .is_some_and(|deadline| self.monotonic_now() >= deadline),
+                ComposedUnflipPhase::Idle
+                | ComposedUnflipPhase::Cancelling
+                | ComposedUnflipPhase::Accepted { .. } => false,
+            };
+        }
         if self.pstate.scanout_m2.pending.is_some()
             || !self.pstate.scanout_m2.unflip_awaiting_outputs.is_empty()
         {
@@ -2235,6 +2875,19 @@ impl KmsBackend {
                 break;
             }
         }
+        if self.pstate.scanout_m2.composed_unflip.is_some()
+            && let Err(error) = self.advance_composed_unflip()
+        {
+            log::error!(
+                "scanout_m2: advancing composed unflip after render notification failed: {error}"
+            );
+            if let Err(cancel_error) = self.begin_composed_unflip_cancellation(true) {
+                log::error!(
+                    "scanout_m2: safe cancellation after render notification failed: {cancel_error}"
+                );
+                self.platform.gpu.renderer_failed = true;
+            }
+        }
     }
 
     pub(in crate::kms::render::backend) fn backend_scanout_on_page_flip_ready(
@@ -2288,8 +2941,19 @@ impl KmsBackend {
                 continue;
             }
             self.record_atomic_cursor_commit_retirement(output_idx, matched_event_id);
-            let direct_retired = self.retire_direct_output(output_idx, matched_event_id, clock);
-            let scene_retired = !direct_retired
+            let has_accepted_unflip = self
+                .pstate
+                .scanout_m2
+                .composed_unflip
+                .as_ref()
+                .is_some_and(|batch| matches!(batch.phase, ComposedUnflipPhase::Accepted { .. }));
+            let direct_retired = if has_accepted_unflip {
+                self.retire_composed_unflip_output(output_idx, matched_event_id, clock)
+            } else {
+                self.retire_direct_output(output_idx, matched_event_id, clock)
+            };
+            let scene_retired = !has_accepted_unflip
+                && !direct_retired
                 && self.scene.handle_page_flip_complete(
                     output_idx,
                     matched_event_id,
@@ -2407,11 +3071,37 @@ impl KmsBackend {
     ) -> Option<std::time::Instant> {
         let now = self.monotonic_now();
         let allow_kms_timers = self.scanout_allowed() && self.kms_outputs_active;
+        let deferred_unflip_active = self.pstate.scanout_m2.composed_unflip.is_some()
+            || (self.pstate.scanout_m2.current.is_some()
+                && self.pstate.scanout_m2.unflip_requested
+                && !self.pstate.scanout_m2.degraded_composed_unflip);
+        let batch_deadline = self
+            .pstate
+            .scanout_m2
+            .composed_unflip
+            .as_ref()
+            .and_then(|batch| match batch.phase {
+                ComposedUnflipPhase::Preparing | ComposedUnflipPhase::Quarantined => {
+                    batch.prepare_deadline
+                }
+                ComposedUnflipPhase::RetryWaiting => batch.retry_at,
+                ComposedUnflipPhase::Ready => {
+                    let outputs: Vec<_> = (0..self.platform.outputs.len()).collect();
+                    (!self.platform.cursor_commit_in_flight_for_outputs(&outputs)).then_some(now)
+                }
+                ComposedUnflipPhase::Idle
+                | ComposedUnflipPhase::Cancelling
+                | ComposedUnflipPhase::Accepted { .. } => None,
+            });
         let scene_deadline = if allow_kms_timers {
             if self.scene_wants_compose() {
                 if self.scene.has_output_ready_for_submit(
                     &self.platform,
-                    crate::kms::render::scene::FrameSubmitMode::Immediate,
+                    if deferred_unflip_active {
+                        crate::kms::render::scene::FrameSubmitMode::DeferredUnflip
+                    } else {
+                        crate::kms::render::scene::FrameSubmitMode::Immediate
+                    },
                 ) {
                     Some(now)
                 } else {
@@ -2441,6 +3131,13 @@ impl KmsBackend {
             .map(|until| if now >= until { now } else { until });
         scene_deadline
             .into_iter()
+            .chain(allow_kms_timers.then_some(batch_deadline).flatten())
+            .chain(
+                allow_kms_timers
+                    .then_some(self.pstate.scanout_m2.unflip_exit_watchdog_at)
+                    .flatten()
+                    .map(|deadline| if now >= deadline { now } else { deadline }),
+            )
             .chain(source_wait_deadline)
             .chain(rescan_deadline)
             // Not gated on `allow_kms_timers`: `maybe_composite` closes the
@@ -2527,6 +3224,14 @@ impl KmsBackend {
             self.drain_paint_submit_telemetry();
             return Ok(());
         }
+        if self
+            .pstate
+            .scanout_m2
+            .unflip_exit_watchdog_at
+            .is_some_and(|deadline| self.monotonic_now() >= deadline)
+        {
+            self.pstate.scanout_m2.unflip_exit_watchdog_at = None;
+        }
         if self.pstate.tearing.is_on()
             && self
                 .pstate
@@ -2604,43 +3309,41 @@ impl KmsBackend {
                 && self.pstate.scanout_m2.unflip_requested
                 && !self.pstate.scanout_m2.degraded_composed_unflip
             {
-                match self.submit_composed_unflip() {
-                    Ok(true) => {
-                        self.pstate
-                            .tearing
-                            .note_composed_submit(self.monotonic_now());
-                        // The atomic replacement itself is now pending on every
-                        // CRTC. Do not fall through into per-output scene flips in
-                        // this same tick: KMS correctly rejects those with EBUSY.
-                        self.drain_render_telemetry();
-                        self.telemetry.maybe_emit(self.engine.pending_count());
-                        return Ok(());
-                    }
-                    Ok(false) => {
-                        // A cursor-only commit still owns one of these CRTCs.
-                        // Keep direct scanout active and retry after retirement.
-                        self.drain_render_telemetry();
-                        self.telemetry.maybe_emit(self.engine.pending_count());
-                        return Ok(());
-                    }
+                let result = if self.pstate.scanout_m2.composed_unflip.is_some() {
+                    self.advance_composed_unflip()
+                } else {
+                    self.start_composed_unflip()
+                };
+                match result {
+                    Ok(true) => self
+                        .pstate
+                        .tearing
+                        .note_composed_submit(self.monotonic_now()),
+                    Ok(false) => {}
                     Err(error) => {
-                        log::error!(
-                            "scanout_m2: synchronized composed unflip failed: {error}; degrading to per-output composed flips"
-                        );
-                        // The atomic transaction never replaced the planes: the
-                        // kernel is still scanning the direct dma-buf, so the
-                        // direct frame's pins must stay held. Arm the composed-flip
-                        // retirement machinery and fall through into the per-output
-                        // scene compose path below — the scene flips replace the
-                        // planes this tick, and `retire_direct_output` releases the
-                        // direct frame only after every output has retired on the
-                        // composed framebuffer.
+                        log::error!("scanout_m2: fresh composed unflip could not advance: {error}");
+                        if self.pstate.scanout_m2.composed_unflip.is_some() {
+                            self.begin_composed_unflip_cancellation(true)?;
+                            self.drain_render_telemetry();
+                            self.telemetry.maybe_emit(self.engine.pending_count());
+                            return Ok(());
+                        }
                         self.pstate.scanout_m2.unflip_outputs_to_replace =
                             (0..self.platform.outputs.len()).collect();
                         self.pstate.scanout_m2.unflip_awaiting_outputs.clear();
                         self.pstate.scanout_m2.degraded_composed_unflip = true;
+                        self.scene.invalidate_all_scanout_damage();
                         self.scene.mark_scene_structure_dirty();
                     }
+                }
+                if self.pstate.scanout_m2.composed_unflip.is_some()
+                    || !self.pstate.scanout_m2.degraded_composed_unflip
+                {
+                    // A pending batch is driven by render, retry, or flip
+                    // notifications; do not submit per-output flips beside it.
+                    self.drain_render_telemetry();
+                    self.telemetry.maybe_emit(self.engine.pending_count());
+                    return Ok(());
                 }
             }
         }

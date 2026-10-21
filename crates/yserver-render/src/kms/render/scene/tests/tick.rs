@@ -193,6 +193,22 @@ fn unflip_recording_completeness_survives_copied_source_completion() {
             vec![0]
         );
         let identities = scene.pending_unflip_frame_identities();
+        if !complete {
+            assert!(
+                identities.is_empty(),
+                "an incomplete copied source is cancelled after its source dependency is safe"
+            );
+            assert!(
+                sink.copied_submissions.is_empty(),
+                "an incomplete source recording must not start the sink copy"
+            );
+            assert!(
+                scene.owes_repaint(),
+                "the cancelled frame restores repaint work"
+            );
+            assert!(!scene.has_pending_page_flip(0));
+            continue;
+        }
         let [identity] = identities.as_slice() else {
             panic!("copied render tick must retain one deferred acknowledgement")
         };

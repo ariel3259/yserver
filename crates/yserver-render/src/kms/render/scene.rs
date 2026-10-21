@@ -157,6 +157,11 @@ enum InFlightStage {
     UnflipPrepared {
         render_job_id: u64,
     },
+    /// A deferred copied sink submit succeeded without an exportable final
+    /// dependency. The pair remains owned until a lifecycle quiescence boundary.
+    UnflipQuarantined {
+        render_job_id: u64,
+    },
     /// Accepted by KMS. `event_id` is the accepted commit's event identity;
     /// non-KMS sinks have none.
     KmsFlipPending {
@@ -902,6 +907,8 @@ pub enum SceneError {
     Present(PresentError),
     #[error("output {0} is transformed but has no intermediate")]
     NoIntermediate(usize),
+    #[error("invalid grouped unflip acknowledgement: {0}")]
+    InvalidGroupedUnflip(String),
 }
 
 impl From<PresentError> for SceneError {

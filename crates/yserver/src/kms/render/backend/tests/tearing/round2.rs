@@ -319,7 +319,6 @@ fn define_cursor_rebind_routes_motion_to_bound_plane_during_vsync_direct_scanout
     let mut expected = vec![AtomicCommitKind::Scene];
     expected.extend([AtomicCommitKind::CursorOnly; 10]);
     expected.push(AtomicCommitKind::SceneWithCursor);
-    expected.extend([AtomicCommitKind::SceneWithCursor; 2]);
     assert_commit_sequence(&recorder, &expected);
     backend.platform.wait_idle_bounded();
 }
@@ -407,7 +406,6 @@ fn xfixes_show_rebind_routes_motion_and_transparent_roundtrip_during_vsync_direc
     let mut expected = vec![AtomicCommitKind::Scene];
     expected.extend([AtomicCommitKind::CursorOnly; 10]);
     expected.push(AtomicCommitKind::Scene);
-    expected.extend([AtomicCommitKind::Scene; 2]);
     assert_commit_sequence(&recorder, &expected);
     backend.platform.wait_idle_bounded();
 }

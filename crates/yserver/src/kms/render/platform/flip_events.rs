@@ -586,10 +586,114 @@ impl PlatformBackend {
                 bo_idx,
                 topology_generation,
                 fd,
-                safe,
+                safe: Some(safe),
             },
         );
         Ok(())
+    }
+
+    /// Register a copy of an exported final sync-file as an asynchronous
+    /// cancellation dependency. The BO keeps ownership of the original fd;
+    /// this duplicate only drives the safe-recycle notification.
+    pub(crate) fn register_scanout_unflip_sync_dependency_safe(
+        &mut self,
+        output_key: OutputKey,
+        bo_idx: usize,
+        render_job_id: u64,
+        topology_generation: u64,
+        raw_fd: RawFd,
+    ) -> io::Result<()> {
+        // SAFETY: `raw_fd` remains owned by the submitted scanout BO for the
+        // lifetime of this call; `try_clone_to_owned` duplicates that live fd.
+        let fd = unsafe { BorrowedFd::borrow_raw(raw_fd) }.try_clone_to_owned()?;
+        self.scanout_render_completion_epfd
+            .register(fd.as_fd(), render_job_id)?;
+        self.pending_scanout_unflip_dependencies.push_back(
+            crate::kms::render::platform::PendingScanoutUnflipDependencySafe {
+                render_job_id,
+                output_key,
+                bo_idx,
+                topology_generation,
+                fd,
+                safe: None,
+            },
+        );
+        Ok(())
+    }
+
+    /// Convert an unflip's pending source-render completion into a safe
+    /// cancellation notification instead of allowing it to submit a copied
+    /// sink frame. `Some(true)` means the completion is still pending,
+    /// `Some(false)` means its dependency was already signalled, and `None`
+    /// means the job is not in the platform completion ledger.
+    pub(crate) fn cancel_scanout_render_completion_for_unflip(
+        &mut self,
+        output_key: &OutputKey,
+        bo_idx: usize,
+        render_job_id: u64,
+        topology_generation: u64,
+    ) -> io::Result<Option<bool>> {
+        let Some(index) = self
+            .pending_scanout_render_completions
+            .iter()
+            .position(|pending| {
+                pending.output_key == *output_key
+                    && pending.bo_idx == bo_idx
+                    && pending.render_job_id == render_job_id
+                    && pending.topology_generation == Some(topology_generation)
+                    && pending.mode == FrameSubmitMode::DeferredUnflip
+            })
+        else {
+            return Ok(None);
+        };
+        let pending = self
+            .pending_scanout_render_completions
+            .remove(index)
+            .expect("pending render completion index was found");
+        let Some(fd) = pending.fd else {
+            return Ok(Some(false));
+        };
+        if sync_file_is_signalled(fd.as_raw_fd())? {
+            self.scanout_render_completion_epfd.unregister(fd.as_fd())?;
+            return Ok(Some(false));
+        }
+        // The completion poller already tracks this descriptor with the same
+        // unique job token. Move its ownership to the safe-notification queue
+        // without unregistering or duplicating it.
+        self.pending_scanout_unflip_dependencies.push_back(
+            crate::kms::render::platform::PendingScanoutUnflipDependencySafe {
+                render_job_id,
+                output_key: output_key.clone(),
+                bo_idx,
+                topology_generation,
+                fd,
+                safe: None,
+            },
+        );
+        Ok(Some(true))
+    }
+
+    /// The source-render dependency for an unflip acknowledgement that has
+    /// not yet reached the copied sink queue. `Some(None)` means the producer
+    /// exported no fence and is already safe; `None` means the identity is
+    /// absent from the completion ledger.
+    pub(crate) fn unflip_render_completion_fd(
+        &self,
+        output_key: &OutputKey,
+        bo_idx: usize,
+        render_job_id: u64,
+        topology_generation: u64,
+    ) -> Option<Option<RawFd>> {
+        self.pending_scanout_render_completions
+            .iter()
+            .find(|pending| {
+                pending.output_key == *output_key
+                    && pending.bo_idx == bo_idx
+                    && pending.render_job_id == render_job_id
+                    && pending.topology_generation == Some(topology_generation)
+                    && pending.mode == FrameSubmitMode::DeferredUnflip
+            })
+            .map(|pending| pending.fd.as_ref().map(|fd| fd.as_raw_fd()))
     }
 
     /// Drain every currently readable copied-scanout render completion.
@@ -649,7 +753,11 @@ impl PlatformBackend {
         while index < self.pending_scanout_unflip_dependencies.len() {
             let is_ready = {
                 let pending = &self.pending_scanout_unflip_dependencies[index];
-                if pending.safe.load(Ordering::Acquire) {
+                if pending
+                    .safe
+                    .as_ref()
+                    .is_some_and(|safe| safe.load(Ordering::Acquire))
+                {
                     true
                 } else {
                     match self
@@ -681,7 +789,11 @@ impl PlatformBackend {
             {
                 log::warn!("scanout safe-dependency unregister failed: {error}");
             }
-            if !pending.safe.load(Ordering::Acquire) {
+            if pending
+                .safe
+                .as_ref()
+                .is_some_and(|safe| !safe.load(Ordering::Acquire))
+            {
                 log::error!(
                     "scanout safe-dependency wait failed for job {}; target remains quarantined",
                     pending.render_job_id
@@ -1127,5 +1239,29 @@ impl PlatformBackend {
             presented_bo_idx: presented,
             generation: 0, // assigned by record_present; this is informational
         })
+    }
+}
+
+fn sync_file_is_signalled(fd: RawFd) -> io::Result<bool> {
+    let mut descriptor = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: poll observes the caller-owned sync-file descriptor without
+        // blocking; ownership remains with the pending completion row.
+        let result = unsafe { libc::poll(&mut descriptor, 1, 0) };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if descriptor.revents & libc::POLLNVAL != 0 {
+            return Err(io::Error::other("pending scanout sync-file fd is invalid"));
+        }
+        return Ok(descriptor.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0);
     }
 }

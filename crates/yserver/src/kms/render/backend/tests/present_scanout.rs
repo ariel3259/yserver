@@ -2465,6 +2465,91 @@ fn atomic_cursor_scanout_backend_with_hidden_cursor(hidden: bool) -> Option<KmsB
     Some(backend)
 }
 
+fn install_renderable_cursor_scanout_pools(backend: &mut KmsBackend) {
+    use crate::kms::vk::scanout::{BoPhase, OutputScanout, ScanoutBo, ScanoutBoPool};
+
+    let output_count = backend.platform.outputs.len();
+    backend
+        .platform
+        .scanout_pools
+        .resize_with(output_count, || None);
+    backend
+        .platform
+        .bo_generations
+        .resize_with(output_count, Vec::new);
+    let vk = std::sync::Arc::clone(
+        backend
+            .platform
+            .gpu
+            .vk
+            .as_ref()
+            .expect("renderable cursor fixture Vulkan context"),
+    );
+
+    for output_idx in 0..output_count {
+        let width = u32::from(backend.platform.outputs[output_idx].width);
+        let height = u32::from(backend.platform.outputs[output_idx].height);
+        let route = backend.platform.outputs[output_idx].scanout_route;
+        let key = backend.platform.outputs[output_idx].key.clone();
+        let drm = std::rc::Rc::clone(
+            &backend
+                .platform
+                .device_for_key(key.device_key)
+                .expect("cursor output KMS device")
+                .device,
+        );
+        let output = &mut backend.platform.outputs[output_idx].output;
+        super::commit_identity::recording_scene::set_scene_fence_properties(output);
+        super::commit_identity::recording_scene::set_unique_direct_plane_properties(output);
+
+        let mut bos = Vec::with_capacity(3);
+        for bo_idx in 0..3 {
+            let slot = u32::try_from(output_idx * 3 + bo_idx).expect("cursor BO slot fits");
+            let xid = 0x6e00 + slot;
+            let storage = backend
+                .platform
+                .gpu
+                .allocate_drawable_storage(
+                    u16::try_from(width).expect("cursor target width fits"),
+                    u16::try_from(height).expect("cursor target height fits"),
+                    32,
+                )
+                .expect("allocate cursor scene target storage");
+            let image = storage.image;
+            let image_view = storage.image_view;
+            backend
+                .store
+                .allocate(
+                    xid,
+                    crate::kms::render::store::DrawableKind::Pixmap,
+                    32,
+                    false,
+                    storage,
+                )
+                .expect("register cursor scene target storage");
+            let mut bo = ScanoutBo::for_tests_compose_target(
+                std::sync::Arc::clone(&vk),
+                std::rc::Rc::clone(&drm),
+                atomic_cursor_raw(0x6e20 + slot),
+                width,
+                height,
+                image,
+                image_view,
+            )
+            .expect("allocate cursor scene scanout target");
+            if bo_idx == 0 {
+                bo.state.phase = BoPhase::OnScreen;
+            }
+            bos.push(bo);
+        }
+        backend.platform.scanout_pools[output_idx] = Some(OutputScanout::Shared(
+            ScanoutBoPool::for_tests_recording_pool(route, width, height, bos),
+        ));
+        backend.platform.bo_generations[output_idx] =
+            vec![crate::kms::render::platform::BoGenerationEntry::default(); 2];
+    }
+}
+
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 // Mutation: mark a cursor-only commit in flight before its ioctl result.
@@ -2574,7 +2659,7 @@ fn assert_atomic_cursorless_scene_record(
 }
 
 #[test]
-#[ignore = "needs live Vulkan ICD"]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: keep the unsent position after EINVAL; separately, never retry a failed hide.
 fn cursor_einval_rolls_back_and_hide_recovery_is_motion_driven_and_bounded() {
     use std::io;
@@ -2800,36 +2885,7 @@ fn cursor_einval_rolls_back_and_hide_recovery_is_motion_driven_and_bounded() {
             .is_empty()
     );
 
-    recovered_backend
-        .platform
-        .scanout_pools
-        .resize_with(2, || None);
-    recovered_backend
-        .platform
-        .bo_generations
-        .resize_with(2, Vec::new);
-    let vk = std::sync::Arc::clone(
-        recovered_backend
-            .platform
-            .gpu
-            .vk
-            .as_ref()
-            .expect("test fixture Vulkan context"),
-    );
-    let kms_device = std::rc::Rc::clone(&recovered_backend.platform.devices[0].device);
-    for (output_idx, fb) in [(0, 0x8803), (1, 0x8804)] {
-        let layout = &recovered_backend.platform.outputs[output_idx];
-        let pool = crate::kms::vk::scanout::ScanoutBoPool::for_tests_on_screen_framebuffer(
-            std::sync::Arc::clone(&vk),
-            std::rc::Rc::clone(&kms_device),
-            layout.scanout_route,
-            u32::from(layout.width),
-            u32::from(layout.height),
-            atomic_cursor_raw(fb),
-        );
-        recovered_backend.platform.scanout_pools[output_idx] =
-            Some(crate::kms::vk::scanout::OutputScanout::Shared(pool));
-    }
+    install_renderable_cursor_scanout_pools(&mut recovered_backend);
     mark_active_fallback_ready_for_test(&mut recovered_backend);
     Backend::maybe_composite(&mut recovered_backend).expect("submit cursorless composed unflip");
     assert_eq!(recorder.records().len(), 3);
@@ -3382,7 +3438,7 @@ fn draw_atomic_cursor_test_root_overlay(backend: &mut KmsBackend, client_id: u32
 }
 
 #[test]
-#[ignore = "needs live Vulkan ICD"]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: allow cursor-only submission during a pending direct frame or
 // remove the grouped-unflip cursor blocker. Either sends an extra commit.
 fn direct_successor_waits_for_retirement_and_carries_motion() {
@@ -3490,30 +3546,7 @@ fn direct_successor_waits_for_retirement_and_carries_motion() {
     // Keep the same direct frame current and exercise the composed-unflip
     // blocker. Cursor motion while the unflip waits must be carried by the
     // grouped replacement instead of starting another cursor-only stream.
-    backend.platform.scanout_pools.resize_with(2, || None);
-    backend.platform.bo_generations.resize_with(2, Vec::new);
-    let vk = std::sync::Arc::clone(
-        backend
-            .platform
-            .gpu
-            .vk
-            .as_ref()
-            .expect("test fixture Vulkan context"),
-    );
-    let kms_device = std::rc::Rc::clone(&backend.platform.devices[0].device);
-    for (output_idx, fb) in [(0, 0x8801), (1, 0x8802)] {
-        let layout = &backend.platform.outputs[output_idx];
-        let pool = crate::kms::vk::scanout::ScanoutBoPool::for_tests_on_screen_framebuffer(
-            std::sync::Arc::clone(&vk),
-            std::rc::Rc::clone(&kms_device),
-            layout.scanout_route,
-            u32::from(layout.width),
-            u32::from(layout.height),
-            atomic_cursor_raw(fb),
-        );
-        backend.platform.scanout_pools[output_idx] =
-            Some(crate::kms::vk::scanout::OutputScanout::Shared(pool));
-    }
+    install_renderable_cursor_scanout_pools(&mut backend);
     Backend::warp_pointer_root(&mut backend, &mut state, 1160, 260);
     Backend::maybe_composite(&mut backend).expect("submit cursor-only commits on direct current");
     assert_eq!(recorder.records().len(), 4);
@@ -3929,7 +3962,7 @@ fn eligible_fullscreen_present_records_cursor_positions_for_both_outputs() {
 }
 
 #[test]
-#[ignore = "needs live Vulkan ICD"]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: `submit_composed_unflip` gathers an empty output list. The real
 // shape-triggered unflip must record each output's local cursor coordinates.
 fn shape_triggered_composed_unflip_records_cursor_positions_for_both_outputs() {
@@ -3985,28 +4018,10 @@ fn shape_triggered_composed_unflip_records_cursor_positions_for_both_outputs() {
     assert_eq!((positions[0].x, positions[0].y), (845, 130));
     assert_eq!((positions[1].x, positions[1].y), (45, 30));
 
-    let vk = std::sync::Arc::clone(
-        backend
-            .platform
-            .gpu
-            .vk
-            .as_ref()
-            .expect("test fixture Vulkan context"),
-    );
-    let kms_device = std::rc::Rc::clone(&backend.platform.devices[0].device);
-    for (output_idx, fb) in [(0, 701), (1, 702)] {
-        let layout = &backend.platform.outputs[output_idx];
-        let pool = crate::kms::vk::scanout::ScanoutBoPool::for_tests_on_screen_framebuffer(
-            std::sync::Arc::clone(&vk),
-            std::rc::Rc::clone(&kms_device),
-            layout.scanout_route,
-            u32::from(layout.width),
-            u32::from(layout.height),
-            atomic_cursor_raw(fb),
-        );
-        backend.platform.scanout_pools[output_idx] =
-            Some(crate::kms::vk::scanout::OutputScanout::Shared(pool));
-    }
+    install_renderable_cursor_scanout_pools(&mut backend);
+    let layouts = backend.platform.scene_output_layouts();
+    backend.scene = crate::kms::render::scene::SceneCompositor::new(&backend.platform, &layouts)
+        .expect("rebuild shape cursor scene against renderable scanout pools");
 
     let cow = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
     let (stage, source) = (0x6f00_0003, 0x6f00_0007);

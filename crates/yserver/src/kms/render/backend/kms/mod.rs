@@ -8,6 +8,8 @@ mod scanout;
 pub(in crate::kms::render::backend) mod session;
 pub(in crate::kms::render::backend) mod state;
 
+pub(in crate::kms::render::backend) use state::{ComposedUnflipBatch, ComposedUnflipPhase};
+
 #[cfg(test)]
 pub(super) use crtc_config::*;
 #[cfg(test)]

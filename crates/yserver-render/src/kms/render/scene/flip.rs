@@ -100,7 +100,8 @@ impl SceneCompositor {
         match output.pending_acks.front()?.stage {
             InFlightStage::KmsFlipPending { event_id } => event_id,
             InFlightStage::WaitingForRenderCompletion { .. }
-            | InFlightStage::UnflipPrepared { .. } => None,
+            | InFlightStage::UnflipPrepared { .. }
+            | InFlightStage::UnflipQuarantined { .. } => None,
         }
     }
 
@@ -116,24 +117,168 @@ impl SceneCompositor {
             .enumerate()
             .flat_map(|(output_idx, output)| {
                 output.pending_acks.iter().filter_map(move |ack| {
-                    (ack.mode == FrameSubmitMode::DeferredUnflip
-                        && matches!(
+                    if ack.mode != FrameSubmitMode::DeferredUnflip
+                        || !matches!(
                             ack.stage,
                             InFlightStage::WaitingForRenderCompletion { .. }
                                 | InFlightStage::UnflipPrepared { .. }
-                        ))
-                    .then_some(DeferredFrameIdentity {
+                                | InFlightStage::UnflipQuarantined { .. }
+                        )
+                    {
+                        return None;
+                    }
+                    Some(DeferredFrameIdentity {
                         output_idx,
                         bo_idx: ack.bo_idx,
                         render_job_id: ack.render_job_id,
                         recording_complete: ack.recording_complete,
-                        topology_generation: ack
-                            .topology_generation
-                            .expect("deferred unflip acknowledgement has a topology generation"),
+                        topology_generation: ack.topology_generation?,
                     })
                 })
             })
             .collect()
+    }
+
+    pub fn unflip_frame_is_quarantined(
+        &self,
+        output_idx: usize,
+        bo_idx: usize,
+        render_job_id: u64,
+    ) -> bool {
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.outputs.get(output_idx))
+            .and_then(|output| output.pending_acks.front())
+            .is_some_and(|ack| {
+                ack.mode == FrameSubmitMode::DeferredUnflip
+                    && ack.bo_idx == bo_idx
+                    && ack.render_job_id == render_job_id
+                    && ack.stage == (InFlightStage::UnflipQuarantined { render_job_id })
+            })
+    }
+
+    /// Validate every deferred scene acknowledgement before submitting one
+    /// all-output unflip transaction. Render readiness alone never creates a
+    /// KMS retirement obligation.
+    pub fn validate_grouped_unflip(
+        &self,
+        expected: &[DeferredFrameIdentity],
+    ) -> Result<(), super::SceneError> {
+        let Some(inner) = self.inner.as_ref() else {
+            return Err(super::SceneError::InvalidGroupedUnflip(
+                "scene is in stub mode".to_owned(),
+            ));
+        };
+        if expected.len() != inner.outputs.len() {
+            return Err(super::SceneError::InvalidGroupedUnflip(format!(
+                "expected {} outputs but received {} identities",
+                inner.outputs.len(),
+                expected.len()
+            )));
+        }
+        for (index, frame) in expected.iter().enumerate() {
+            if expected[..index]
+                .iter()
+                .any(|earlier| earlier.output_idx == frame.output_idx)
+            {
+                return Err(super::SceneError::InvalidGroupedUnflip(format!(
+                    "output {} appears more than once",
+                    frame.output_idx
+                )));
+            }
+            let ack = inner
+                .outputs
+                .get(frame.output_idx)
+                .and_then(|output| output.pending_acks.front())
+                .ok_or_else(|| {
+                    super::SceneError::InvalidGroupedUnflip(format!(
+                        "output {} has no pending acknowledgement",
+                        frame.output_idx
+                    ))
+                })?;
+            if ack.mode != FrameSubmitMode::DeferredUnflip
+                || ack.bo_idx != frame.bo_idx
+                || ack.render_job_id != frame.render_job_id
+                || ack.recording_complete != frame.recording_complete
+                || !ack.recording_complete
+                || ack.topology_generation != Some(frame.topology_generation)
+                || ack.stage
+                    != (InFlightStage::UnflipPrepared {
+                        render_job_id: frame.render_job_id,
+                    })
+            {
+                return Err(super::SceneError::InvalidGroupedUnflip(format!(
+                    "output {} acknowledgement does not match prepared frame {frame:?}",
+                    frame.output_idx
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Publish the accepted all-output commit identity into exactly the
+    /// acknowledgements validated before ioctl submission.
+    pub fn accept_grouped_unflip(
+        &mut self,
+        expected: &[DeferredFrameIdentity],
+        event_id: u64,
+    ) -> Result<(), super::SceneError> {
+        self.validate_grouped_unflip(expected)?;
+        let needs_post_unflip_cursor_repaint = self.inner.as_ref().is_some_and(|inner| {
+            expected.iter().any(|frame| {
+                inner.outputs[frame.output_idx]
+                    .pending_acks
+                    .front()
+                    .is_some_and(|ack| {
+                        matches!(
+                            ack.cursor_transition,
+                            Some(super::CursorTransition::HideOnRetire {
+                                reveal_sw_after: true
+                            })
+                        )
+                    })
+            })
+        });
+        let Some(inner) = self.inner.as_mut() else {
+            return Err(super::SceneError::InvalidGroupedUnflip(
+                "scene is in stub mode".to_owned(),
+            ));
+        };
+        for frame in expected {
+            let ack = inner.outputs[frame.output_idx]
+                .pending_acks
+                .front_mut()
+                .expect("grouped unflip validation checked the acknowledgement");
+            ack.stage = InFlightStage::KmsFlipPending {
+                event_id: Some(event_id),
+            };
+        }
+        if needs_post_unflip_cursor_repaint {
+            // The accepted fresh frame is deliberately cursorless during a
+            // HW→SW handoff. Keep the phase-two software-cursor frame queued
+            // until this grouped replacement retires.
+            self.scene_structure_dirty = true;
+        }
+        Ok(())
+    }
+
+    /// Remove one deferred acknowledgement after the backend proves its BO's
+    /// final writer dependency safe, preserving the work for a full repaint.
+    pub fn cancel_prepared_unflip(
+        &mut self,
+        output_idx: usize,
+        bo_idx: usize,
+        render_job_id: u64,
+        store: &mut DrawableStore,
+    ) -> Result<(), super::SceneError> {
+        let Some(inner) = self.inner.as_mut() else {
+            return Err(super::SceneError::InvalidGroupedUnflip(
+                "scene is in stub mode".to_owned(),
+            ));
+        };
+        cancel_prepared_unflip_inner(inner, output_idx, bo_idx, render_job_id, store)?;
+        self.scene_structure_dirty = true;
+        Ok(())
     }
 
     /// Handle a DRM page-flip-complete event for `output_idx`.
@@ -380,7 +525,7 @@ pub(super) fn handle_render_notification_inner(
 pub(super) fn handle_scanout_render_completion_inner(
     inner: &mut SceneCompositorInner,
     completion: RenderCompletion,
-    _store: &mut DrawableStore,
+    store: &mut DrawableStore,
     sink: &mut dyn OutputSink,
 ) -> bool {
     if sink.gpu().renderer_failed {
@@ -429,6 +574,27 @@ pub(super) fn handle_scanout_render_completion_inner(
         return false;
     }
 
+    if mode == FrameSubmitMode::DeferredUnflip && !recording_complete {
+        // The source render has completed, so its destination is safe to
+        // recycle. A truncated scene must never be copied or accepted as a
+        // replacement frame.
+        if let Err(error) = sink.recycle_unflip_target_after_dependency_safe(output_idx, bo_idx) {
+            log::error!(
+                "render unflip: incomplete copied output {output_idx} BO {bo_idx} job {render_job_id} could not be recycled: {error}"
+            );
+            sink.gpu_mut().renderer_failed = true;
+            return false;
+        }
+        if let Err(error) =
+            cancel_prepared_unflip_inner(inner, output_idx, bo_idx, render_job_id, store)
+        {
+            log::error!("render unflip: incomplete copied frame cancellation failed: {error}");
+            sink.gpu_mut().renderer_failed = true;
+            return false;
+        }
+        return true;
+    }
+
     match sink.submit_copied(
         output_idx,
         bo_idx,
@@ -461,6 +627,9 @@ pub(super) fn handle_scanout_render_completion_inner(
         {
             // Keep the exact render identity pending for a later safe
             // dependency notification, but do not advertise a prepared plane.
+            if let Some(ack) = inner.outputs[output_idx].pending_acks.front_mut() {
+                ack.stage = InFlightStage::UnflipQuarantined { render_job_id };
+            }
             true
         }
         Ok(outcome) => {
@@ -535,7 +704,7 @@ fn handle_unflip_dependency_safe_inner(
     bo_idx: usize,
     render_job_id: u64,
     topology_generation: u64,
-    _store: &mut DrawableStore,
+    store: &mut DrawableStore,
     sink: &mut dyn OutputSink,
 ) -> bool {
     let output_idx = match output {
@@ -577,29 +746,67 @@ fn handle_unflip_dependency_safe_inner(
         return false;
     }
     sink.invalidate_slot(output_idx, bo_idx);
-    let state = &mut inner.outputs[output_idx];
+    match cancel_prepared_unflip_inner(inner, output_idx, bo_idx, render_job_id, store) {
+        Ok(()) => true,
+        Err(error) => {
+            log::error!("render unflip: safe dependency cancellation failed: {error}");
+            sink.gpu_mut().renderer_failed = true;
+            false
+        }
+    }
+}
+
+fn cancel_prepared_unflip_inner(
+    inner: &mut SceneCompositorInner,
+    output_idx: usize,
+    bo_idx: usize,
+    render_job_id: u64,
+    _store: &mut DrawableStore,
+) -> Result<(), super::SceneError> {
+    let Some(state) = inner.outputs.get_mut(output_idx) else {
+        return Err(super::SceneError::InvalidGroupedUnflip(format!(
+            "output {output_idx} no longer exists"
+        )));
+    };
+    let matches = state.pending_acks.front().is_some_and(|ack| {
+        ack.mode == FrameSubmitMode::DeferredUnflip
+            && ack.bo_idx == bo_idx
+            && ack.render_job_id == render_job_id
+            && matches!(
+                ack.stage,
+                InFlightStage::WaitingForRenderCompletion { render_job_id: pending }
+                    | InFlightStage::UnflipPrepared { render_job_id: pending }
+                    if pending == render_job_id
+            )
+    });
+    if !matches {
+        return Err(super::SceneError::InvalidGroupedUnflip(format!(
+            "output {output_idx} has no deferred acknowledgement for BO {bo_idx} job {render_job_id}"
+        )));
+    }
     let ack = state
         .pending_acks
         .pop_front()
-        .expect("safe dependency identity matched the front acknowledgement");
-    state.current_generation = ack.generation.saturating_sub(1);
+        .expect("the matching deferred acknowledgement was checked");
     if let Some(rect) = ack.submitted_output_damage.bounding_rect() {
         state.pending_repaint_after_failed_submit.add(rect);
     }
-    if let Some(pool_slot) = state.pool_slots.pop_front() {
-        if let Some(ticket) = ack.ticket {
-            state.pending_pool_releases.push_back((pool_slot, ticket));
-        } else {
-            state.pool_ring.release(pool_slot);
+    state.current_generation = ack.generation.saturating_sub(1);
+    state.damage.invalidate();
+    state.cursor_prev_pos = None;
+    if let Some(slot) = state.pool_slots.pop_front() {
+        match ack.ticket {
+            None => state.pool_ring.release(slot),
+            Some(ticket) => state.pending_pool_releases.push_back((slot, ticket)),
         }
     } else {
-        log::error!(
-            "render unflip: missing descriptor slot for safe output {output_idx} bo {bo_idx}"
-        );
-        sink.gpu_mut().renderer_failed = true;
-        return false;
+        return Err(super::SceneError::InvalidGroupedUnflip(format!(
+            "output {output_idx} has no descriptor slot for cancelled BO {bo_idx}"
+        )));
     }
-    true
+    // Drawable snapshots are deliberately not acked on cancellation. Their
+    // damage remains in the store for the replacement full repaint.
+    Ok(())
 }
 
 pub(super) fn retire_failed_submit_bos(

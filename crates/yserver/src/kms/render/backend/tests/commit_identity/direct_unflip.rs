@@ -5,10 +5,15 @@ use super::{
     recording_scene::{DirectPresentSetup, P1SceneRoute, RecordingSceneFixture},
     support::accepted_event_id,
 };
-use crate::drm::atomic::tests_support::{AtomicCommitRecord, ScriptedResult};
+use crate::{
+    drm::atomic::tests_support::{AtomicCommitRecord, ScriptedResult},
+    kms::vk::scanout::BoPhase,
+};
 use std::{
+    cell::Cell,
     collections::{HashMap, HashSet},
     os::fd::RawFd,
+    rc::Rc,
     time::{Duration, Instant},
 };
 use yserver_core::backend::Backend;
@@ -161,6 +166,13 @@ fn drain_present_notifications(
         expected_completed,
         "direct Complete events must belong to the expected Presents"
     );
+    for event in &completed {
+        fixture
+            .present_notification_counts
+            .entry(event.present_id)
+            .or_default()
+            .0 += 1;
+    }
     let idled = Backend::drain_retired_present_idle_events(&mut fixture.events.backend);
     assert_eq!(
         idled.len(),
@@ -174,6 +186,60 @@ fn drain_present_notifications(
             .collect::<Vec<_>>(),
         expected_idled,
         "direct Idle events must belong to the expected Presents"
+    );
+    for event in &idled {
+        fixture
+            .present_notification_counts
+            .entry(event.present_id)
+            .or_default()
+            .1 += 1;
+    }
+}
+
+fn assert_issue281_unflip_end_state(fixture: &RecordingSceneFixture, present_id: u64) {
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .composed_unflip
+            .is_none(),
+        "no composed-unflip batch remains"
+    );
+    assert!(
+        fixture.pending_render_job_ids().is_empty(),
+        "no copied source render job remains"
+    );
+    assert!(
+        fixture
+            .events
+            .backend
+            .platform
+            .for_tests_pending_scanout_render_job_ids()
+            .is_empty(),
+        "no render-completion or safe-dependency notification remains"
+    );
+    fixture.assert_quiescent();
+    assert_eq!(
+        fixture.present_notification_counts.get(&present_id),
+        Some(&(1, 1)),
+        "the direct Present has exactly one Complete and one Idle"
+    );
+    assert!(
+        fixture
+            .events
+            .backend
+            .platform
+            .scanout_pools
+            .iter()
+            .filter_map(Option::as_ref)
+            .flat_map(|scanout| scanout.display_pool().bos.iter())
+            .all(|bo| {
+                matches!(bo.state.phase, BoPhase::Free | BoPhase::OnScreen)
+                    && bo.state.in_fence_fd.is_none()
+            }),
+        "every scanout BO is Free or OnScreen with no owned in-fence fd"
     );
 }
 
@@ -212,6 +278,627 @@ fn grouped_unflip_record(
         .into_iter()
         .find(|record| record.events.len() == output_count && accepted_event_id(record).is_some())
         .expect("grouped composed replacement accepted")
+}
+
+fn primary_fb_value(record: &AtomicCommitRecord, output: &crate::drm::modeset::Output) -> u32 {
+    let value = record
+        .properties
+        .iter()
+        .find(|update| {
+            update.object == output.plane.into() && update.property == output.plane_fb_id_prop
+        })
+        .expect("recorded primary plane FB_ID")
+        .value;
+    u32::try_from(value).expect("primary FB_ID fits u32")
+}
+
+fn primary_in_fence_value(
+    record: &AtomicCommitRecord,
+    output: &crate::drm::modeset::Output,
+) -> u64 {
+    record
+        .properties
+        .iter()
+        .find(|update| {
+            update.object == output.plane.into()
+                && Some(update.property) == output.plane_in_fence_fd_prop
+        })
+        .expect("recorded primary-plane IN_FENCE_FD")
+        .value
+}
+
+fn paint_solid_pixmap(fixture: &mut RecordingSceneFixture, xid: u32, pixel: [u8; 4]) {
+    let backend = &mut fixture.events.backend;
+    let width = usize::from(backend.platform.fb_w);
+    let height = usize::from(backend.platform.fb_h);
+    let width_u16 = backend.platform.fb_w;
+    let height_u16 = backend.platform.fb_h;
+    let mut bytes = Vec::with_capacity(width * height * pixel.len());
+    for _ in 0..width * height {
+        bytes.extend_from_slice(&pixel);
+    }
+    Backend::put_image(backend, None, xid, 24, width_u16, height_u16, 0, 0, &bytes)
+        .expect("paint a solid scene pixmap through Backend");
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: select the retained OnScreen BO for the replacement; the fresh-target assertion must fail.
+fn issue281_fullscreen_exit_flips_fresh_scene() {
+    let Some((mut fixture, direct)) = direct_fixture(1, P1SceneRoute::Shared, 281, 0) else {
+        println!("SKIP issue281_fullscreen_exit_flips_fresh_scene: no Vulkan test device");
+        return;
+    };
+    let device_fd = fd(&fixture);
+    let scene_a = [0x11, 0x37, 0x5b, 0xff];
+    let scene_b = [0x72, 0x24, 0x19, 0xff];
+    assert_ne!(scene_a, scene_b);
+    paint_solid_pixmap(&mut fixture, direct.target_xid, scene_a);
+    let scene_a_offset = record_count(&fixture, device_fd);
+    let scene_a_frame = scene_completion_for_output(&mut fixture, 0, device_fd, scene_a_offset);
+    let scene_a_id = accepted_event_id(&scene_a_frame).expect("scene A commit accepted");
+    complete_recorded_attempt(&mut fixture, device_fd, &scene_a_frame, scene_a_id, 280);
+    let old_on_screen_idx = fixture.events.backend.platform.scanout_pools[0]
+        .as_ref()
+        .expect("scanout pool")
+        .display_pool()
+        .bos
+        .iter()
+        .position(|bo| bo.state.phase == BoPhase::OnScreen)
+        .expect("scene A is on screen");
+    let old_scene_backing = fixture
+        .events
+        .backend
+        .store
+        .lookup(0x6a00 + u32::try_from(old_on_screen_idx).expect("BO index fits"))
+        .expect("scene A scanout backing");
+    let old_scene_pixels = fixture.backing_pixels_for_id(old_scene_backing);
+    paint_solid_pixmap(&mut fixture, direct.candidate.src_pixmap_xid, scene_b);
+    let initial_attempts = submit_direct(&mut fixture, &direct, device_fd);
+    let initial = accepted_records(&initial_attempts).remove(0);
+    let direct_id = accepted_event_id(&initial).expect("direct Present accepted");
+    complete_direct_initial(&mut fixture, &initial, direct_id, device_fd);
+    drain_present_notifications(&mut fixture, &[direct.candidate.present_id], &[]);
+    request_unflip(&mut fixture, &direct);
+
+    let retained_fb = fixture.events.backend.platform.scanout_pools[0]
+        .as_ref()
+        .expect("scanout pool")
+        .display_pool()
+        .bos
+        .iter()
+        .find(|bo| bo.state.phase == BoPhase::OnScreen)
+        .and_then(|bo| bo.fb_handle)
+        .map(u32::from)
+        .expect("retained OnScreen framebuffer");
+    let offset = record_count(&fixture, device_fd);
+    let replacement = grouped_unflip_record(&mut fixture, device_fd, offset, 1);
+    let replacement_fb = primary_fb_value(
+        &replacement,
+        &fixture.events.backend.platform.outputs[0].output,
+    );
+
+    assert_ne!(
+        replacement_fb, retained_fb,
+        "fresh unflip must render into a Free BO while preserving the old OnScreen BO"
+    );
+    let target_bo_idx = fixture.events.backend.platform.scanout_pools[0]
+        .as_ref()
+        .expect("scanout pool")
+        .display_pool()
+        .bos
+        .iter()
+        .position(|bo| {
+            bo.fb_handle
+                .is_some_and(|fb| u32::from(fb) == replacement_fb)
+        })
+        .expect("grouped FB_ID names a pool BO");
+    let target = fixture.events.backend.platform.scanout_pools[0]
+        .as_ref()
+        .expect("scanout pool")
+        .display_pool()
+        .bos
+        .iter()
+        .find(|bo| {
+            bo.fb_handle
+                .is_some_and(|fb| u32::from(fb) == replacement_fb)
+        })
+        .expect("grouped FB_ID names a pool BO");
+    assert_eq!(target.state.phase, BoPhase::Pending);
+    let fresh_scene_pixels = fixture.backing_pixels_for_id(
+        fixture
+            .events
+            .backend
+            .store
+            .lookup(0x6a00 + u32::try_from(target_bo_idx).expect("BO index fits"))
+            .expect("fresh scanout backing"),
+    );
+    assert_ne!(
+        old_scene_pixels, fresh_scene_pixels,
+        "the replacement contains scene B instead of the retained scene A pixels"
+    );
+    let fallback_pixels = fixture.backing_pixels_for_id(
+        fixture
+            .events
+            .backend
+            .store
+            .lookup(direct.target_xid)
+            .expect("materialized fallback backing"),
+    );
+    let source_pixels = fixture.backing_pixels_for_id(direct.source_id);
+    assert_eq!(
+        fresh_scene_pixels, fallback_pixels,
+        "the fresh primary framebuffer contains the materialized full scene B"
+    );
+    assert_eq!(
+        fallback_pixels, source_pixels,
+        "scene B was fully materialized"
+    );
+    assert_ne!(
+        fallback_pixels, old_scene_pixels,
+        "scene B differs from composed scene A"
+    );
+    assert!(
+        fixture.events.backend.platform.scanout_pools[0]
+            .as_ref()
+            .unwrap()
+            .display_pool()
+            .bos
+            .iter()
+            .any(
+                |bo| bo.fb_handle.is_some_and(|fb| u32::from(fb) == retained_fb)
+                    && bo.state.phase == BoPhase::OnScreen
+            )
+    );
+
+    let replacement_id = accepted_event_id(&replacement).expect("grouped replacement accepted");
+    complete_recorded_attempt(&mut fixture, device_fd, &replacement, replacement_id, 281);
+    drain_present_notifications(&mut fixture, &[], &[direct.candidate.present_id]);
+    assert_issue281_unflip_end_state(&fixture, direct.candidate.present_id);
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: remove the direct-exit watchdog deadline; this test must fail to wake without scene or Present input.
+fn issue281_direct_exit_watchdog_prevents_96s_freeze() {
+    let Some((mut fixture, direct)) = direct_fixture(2, P1SceneRoute::Shared, 282, 0) else {
+        println!("SKIP issue281_direct_exit_watchdog_prevents_96s_freeze: no Vulkan test device");
+        return;
+    };
+    let device_fd = fd(&fixture);
+    let clock = Rc::new(Cell::new(Instant::now()));
+    let test_clock = Rc::clone(&clock);
+    fixture
+        .events
+        .backend
+        .for_tests_set_monotonic_clock(Rc::new(move || test_clock.get()));
+
+    let scene_offset = record_count(&fixture, device_fd);
+    let root = fixture.events.backend.core.window_id;
+    let width = fixture.events.backend.platform.fb_w;
+    let height = fixture.events.backend.platform.fb_h;
+    Backend::clear_area(
+        &mut fixture.events.backend,
+        None,
+        root,
+        0,
+        None,
+        0,
+        0,
+        width,
+        height,
+        (0, 0),
+    )
+    .expect("damage root before entering direct mode");
+    Backend::maybe_composite(&mut fixture.events.backend).expect("compose the initial scene");
+    let initial_scene = accepted_records(&records_since(&fixture, device_fd, scene_offset));
+    assert_eq!(
+        initial_scene.len(),
+        2,
+        "both outputs start on a composed scene"
+    );
+    for (index, record) in initial_scene.iter().enumerate() {
+        complete_recorded_attempt(
+            &mut fixture,
+            device_fd,
+            record,
+            accepted_event_id(record).expect("initial scene commit accepted"),
+            40 + u32::try_from(index).expect("output index fits"),
+        );
+    }
+
+    let direct_attempts = submit_direct(&mut fixture, &direct, device_fd);
+    let direct_record = accepted_records(&direct_attempts).remove(0);
+    let direct_id = accepted_event_id(&direct_record).expect("direct Present accepted");
+    complete_direct_initial(&mut fixture, &direct_record, direct_id, device_fd);
+    drain_present_notifications(&mut fixture, &[direct.candidate.present_id], &[]);
+    request_unflip(&mut fixture, &direct);
+
+    let watchdog = clock.get() + Duration::from_secs(2);
+    assert_eq!(
+        Backend::next_wakeup(&fixture.events.backend),
+        Some(watchdog),
+        "the exit request installs one two-second deadline"
+    );
+    clock.set(watchdog);
+    assert_eq!(
+        Backend::next_wakeup(&fixture.events.backend),
+        Some(watchdog),
+        "the expired watchdog is due immediately"
+    );
+    let offset = record_count(&fixture, device_fd);
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("watchdog starts the fresh-frame unflip without unrelated input");
+    let replacement = grouped_unflip_record(&mut fixture, device_fd, offset, 2);
+    let replacement_id = accepted_event_id(&replacement).expect("grouped replacement accepted");
+    complete_recorded_attempt(&mut fixture, device_fd, &replacement, replacement_id, 282);
+    drain_present_notifications(&mut fixture, &[], &[direct.candidate.present_id]);
+    assert_issue281_unflip_end_state(&fixture, direct.candidate.present_id);
+    fixture.events.wait_for_submitted_gpu_work();
+    fixture.finish();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: restore the Composite Overlay Window identity guard for CowDescendant fallbacks.
+fn issue281_cow_descendant_unflip_does_not_exit_server() {
+    let Some((mut fixture, direct)) = direct_fixture(1, P1SceneRoute::Shared, 284, 0) else {
+        println!("SKIP issue281_cow_descendant_unflip_does_not_exit_server: no Vulkan test device");
+        return;
+    };
+    let device_fd = fd(&fixture);
+    let overlay_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+    fixture.track_extra_drawable(overlay_xid);
+    Backend::get_overlay_window(&mut fixture.events.backend, None)
+        .expect("create the Composite Overlay Window through Backend");
+    fixture
+        .events
+        .backend
+        .windows
+        .get_mut(&direct.target_xid)
+        .expect("direct fallback target")
+        .parent = Some(overlay_xid);
+    let fallback_id = fixture
+        .events
+        .backend
+        .store
+        .lookup(direct.target_xid)
+        .expect("pinned direct fallback backing");
+    assert_ne!(
+        fallback_id,
+        fixture
+            .events
+            .backend
+            .cow_id
+            .expect("overlay backing is live"),
+        "CowDescendant fallback is a distinct drawable from the overlay backing"
+    );
+    paint_solid_pixmap(
+        &mut fixture,
+        direct.candidate.src_pixmap_xid,
+        [0x4a, 0x7c, 0x13, 0xff],
+    );
+
+    let initial = accepted_records(&submit_direct(&mut fixture, &direct, device_fd))
+        .into_iter()
+        .next()
+        .expect("direct root frame accepted");
+    let direct_id = accepted_event_id(&initial).expect("accepted direct frame has an ID");
+    complete_direct_initial(&mut fixture, &initial, direct_id, device_fd);
+    drain_present_notifications(&mut fixture, &[direct.candidate.present_id], &[]);
+    request_unflip(&mut fixture, &direct);
+
+    let offset = record_count(&fixture, device_fd);
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("materialize and compose the CowDescendant fallback");
+    let replacement = grouped_unflip_record(&mut fixture, device_fd, offset, 1);
+    let replacement_fb = primary_fb_value(
+        &replacement,
+        &fixture.events.backend.platform.outputs[0].output,
+    );
+    let replacement_idx = fixture.events.backend.platform.scanout_pools[0]
+        .as_ref()
+        .expect("scanout pool")
+        .display_pool()
+        .bos
+        .iter()
+        .position(|bo| {
+            bo.fb_handle
+                .is_some_and(|fb| u32::from(fb) == replacement_fb)
+        })
+        .expect("grouped FB_ID names its prepared scanout BO");
+    let replacement_id = fixture
+        .events
+        .backend
+        .store
+        .lookup(0x6a00 + u32::try_from(replacement_idx).expect("BO index fits"))
+        .expect("fresh scanout backing");
+    let source_pixels = fixture.backing_pixels_for_id(direct.source_id);
+    assert_eq!(
+        fixture.backing_pixels_for_id(fallback_id),
+        source_pixels,
+        "materialization writes the exact pinned non-overlay fallback"
+    );
+    assert_eq!(
+        fixture.backing_pixels_for_id(replacement_id),
+        source_pixels,
+        "the grouped primary FB contains the fresh CowDescendant scene"
+    );
+
+    let replacement_commit = accepted_event_id(&replacement).expect("group accepted");
+    complete_recorded_attempt(
+        &mut fixture,
+        device_fd,
+        &replacement,
+        replacement_commit,
+        284,
+    );
+    drain_present_notifications(&mut fixture, &[], &[direct.candidate.present_id]);
+    assert_issue281_unflip_end_state(&fixture, direct.candidate.present_id);
+    fixture.events.wait_for_submitted_gpu_work();
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: treat a signalled None dependency as missing and leave UnflipPrepared blocking fallback.
+fn issue281_cancellation_with_none_dependency_recycles_inline() {
+    let Some((mut fixture, direct)) = direct_fixture(1, P1SceneRoute::Shared, 285, 0) else {
+        println!(
+            "SKIP issue281_cancellation_with_none_dependency_recycles_inline: no Vulkan test device"
+        );
+        return;
+    };
+    let device_fd = fd(&fixture);
+    let initial = accepted_records(&submit_direct(&mut fixture, &direct, device_fd))
+        .into_iter()
+        .next()
+        .expect("direct root frame accepted");
+    let direct_id = accepted_event_id(&initial).expect("accepted direct frame has an ID");
+    complete_direct_initial(&mut fixture, &initial, direct_id, device_fd);
+    drain_present_notifications(&mut fixture, &[direct.candidate.present_id], &[]);
+    request_unflip(&mut fixture, &direct);
+    let offset = record_count(&fixture, device_fd);
+    fixture.events.recorders[&device_fd]
+        .script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
+    fixture.events.recorders[&device_fd].script_result(Ok(()));
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("reject the group and submit the safe per-output fallback");
+    let attempts = records_since(&fixture, device_fd, offset);
+    let rejected = attempts
+        .iter()
+        .find(|record| record.events.len() == 1 && record.result != ScriptedResult::Ok)
+        .expect("grouped replacement rejected with EIO");
+    assert!(accepted_event_id(rejected).is_none());
+    assert_eq!(
+        primary_in_fence_value(rejected, &fixture.events.backend.platform.outputs[0].output,),
+        u64::MAX,
+        "a None dependency is submitted as the sign-extended -1 sentinel"
+    );
+    let fallback = attempts
+        .iter()
+        .find(|record| record.events.len() == 1 && accepted_event_id(record).is_some())
+        .expect("safe None cancellation lets the ordinary scene fallback proceed inline");
+    assert!(
+        fixture
+            .events
+            .backend
+            .scene
+            .pending_unflip_frame_identities()
+            .is_empty(),
+        "the deferred acknowledgement was removed before fallback submission"
+    );
+    assert!(
+        fixture
+            .events
+            .backend
+            .platform
+            .for_tests_pending_scanout_render_job_ids()
+            .is_empty(),
+        "an already-signalled None dependency does not arm a notification wait"
+    );
+    let fallback_id = accepted_event_id(fallback).expect("accepted fallback has an ID");
+    complete_recorded_attempt(&mut fixture, device_fd, fallback, fallback_id, 285);
+    drain_present_notifications(&mut fixture, &[], &[direct.candidate.present_id]);
+    assert_issue281_unflip_end_state(&fixture, direct.candidate.present_id);
+    fixture.events.wait_for_submitted_gpu_work();
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutations: treat EBUSY as persistent; retire direct ownership on the first CRTC; invalidate the fresh scene after final retirement.
+fn issue281_group_waits_for_every_render_and_retires_once() {
+    let Some((mut fixture, direct)) = direct_fixture(2, P1SceneRoute::Shared, 283, 0) else {
+        println!(
+            "SKIP issue281_group_waits_for_every_render_and_retires_once: no Vulkan test device"
+        );
+        return;
+    };
+    let device_fd = fd(&fixture);
+    let clock = Rc::new(Cell::new(Instant::now()));
+    let test_clock = Rc::clone(&clock);
+    fixture
+        .events
+        .backend
+        .for_tests_set_monotonic_clock(Rc::new(move || test_clock.get()));
+    let initial_attempts = submit_direct(&mut fixture, &direct, device_fd);
+    let initial = accepted_records(&initial_attempts).remove(0);
+    let direct_id = accepted_event_id(&initial).expect("direct Present accepted");
+    complete_direct_initial(&mut fixture, &initial, direct_id, device_fd);
+    drain_present_notifications(&mut fixture, &[direct.candidate.present_id], &[]);
+    request_unflip(&mut fixture, &direct);
+
+    let offset = record_count(&fixture, device_fd);
+    fixture.events.recorders[&device_fd]
+        .script_result(Err(std::io::Error::from_raw_os_error(libc::EBUSY)));
+    fixture.events.recorders[&device_fd].script_result(Ok(()));
+    Backend::maybe_composite(&mut fixture.events.backend).expect("prepare EBUSY retry");
+    let rejected = records_since(&fixture, device_fd, offset)
+        .into_iter()
+        .find(|record| record.events.len() == 2 && record.result != ScriptedResult::Ok)
+        .expect("first grouped attempt is transiently rejected");
+    assert!(accepted_event_id(&rejected).is_none());
+    let mut retained_fences = Vec::new();
+    for (output_idx, layout) in fixture.events.backend.platform.outputs.iter().enumerate() {
+        let fb = primary_fb_value(&rejected, &layout.output);
+        let bo = fixture.events.backend.platform.scanout_pools[output_idx]
+            .as_ref()
+            .expect("scanout pool")
+            .display_pool()
+            .bos
+            .iter()
+            .find(|bo| {
+                bo.fb_handle
+                    .is_some_and(|fb_handle| u32::from(fb_handle) == fb)
+            })
+            .expect("transient attempt keeps its fresh target");
+        assert_eq!(bo.state.phase, BoPhase::Submitted);
+        let raw_fd = bo.state.in_fence_fd.map_or(u64::MAX, |fd| {
+            u64::try_from(fd).expect("in-fence fd is nonnegative")
+        });
+        assert_eq!(
+            primary_in_fence_value(&rejected, &layout.output),
+            raw_fd,
+            "the ioctl's per-plane fence is the BO-owned dependency"
+        );
+        retained_fences.push((fb, raw_fd));
+    }
+    assert!(matches!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .composed_unflip
+            .as_ref()
+            .unwrap()
+            .phase,
+        crate::kms::render::backend::ComposedUnflipPhase::RetryWaiting
+    ));
+    clock.set(clock.get() + Duration::from_millis(100));
+    Backend::maybe_composite(&mut fixture.events.backend).expect("retry the same prepared batch");
+    let replacement = records_since(&fixture, device_fd, offset)
+        .into_iter()
+        .find(|record| record.events.len() == 2 && accepted_event_id(record).is_some())
+        .expect("bounded retry accepts one grouped replacement");
+    for layout in &fixture.events.backend.platform.outputs {
+        let fb = primary_fb_value(&replacement, &layout.output);
+        let fence = primary_in_fence_value(&replacement, &layout.output);
+        assert!(
+            retained_fences.contains(&(fb, fence)),
+            "retry reuses the same prepared FB and final fence"
+        );
+    }
+    let replacement_id = accepted_event_id(&replacement).expect("grouped replacement accepted");
+    assert!(
+        replacement
+            .flags
+            .contains(::drm::control::AtomicCommitFlags::PAGE_FLIP_EVENT)
+    );
+    assert!(
+        replacement
+            .flags
+            .contains(::drm::control::AtomicCommitFlags::NONBLOCK)
+    );
+    assert!(
+        !replacement
+            .flags
+            .contains(::drm::control::AtomicCommitFlags::PAGE_FLIP_ASYNC)
+    );
+    assert_eq!(
+        replacement.events.len(),
+        2,
+        "both CRTCs use one atomic replacement"
+    );
+
+    inject_output(
+        &mut fixture,
+        device_fd,
+        &replacement,
+        0,
+        replacement_id.wrapping_add(1),
+        60,
+        Duration::from_millis(600),
+    );
+    inject_output(
+        &mut fixture,
+        device_fd,
+        &replacement,
+        0,
+        direct_id,
+        61,
+        Duration::from_millis(610),
+    );
+    assert!(fixture.events.backend.pstate.scanout_m2.current.is_some());
+    assert_eq!(direct_source_pins(&fixture, direct.source_id), 1);
+
+    inject_output(
+        &mut fixture,
+        device_fd,
+        &replacement,
+        0,
+        replacement_id,
+        62,
+        Duration::from_millis(620),
+    );
+    assert!(fixture.events.backend.pstate.scanout_m2.current.is_some());
+    assert_eq!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .unflip_awaiting_outputs,
+        HashMap::from([(1, replacement_id)]),
+        "one correct event retires only its own output"
+    );
+    inject_output(
+        &mut fixture,
+        device_fd,
+        &replacement,
+        0,
+        replacement_id,
+        63,
+        Duration::from_millis(630),
+    );
+    assert!(fixture.events.backend.pstate.scanout_m2.current.is_some());
+    inject_output(
+        &mut fixture,
+        device_fd,
+        &replacement,
+        1,
+        direct_id,
+        64,
+        Duration::from_millis(640),
+    );
+    assert!(fixture.events.backend.pstate.scanout_m2.current.is_some());
+
+    inject_output(
+        &mut fixture,
+        device_fd,
+        &replacement,
+        1,
+        replacement_id,
+        65,
+        Duration::from_millis(650),
+    );
+    assert!(fixture.events.backend.pstate.scanout_m2.current.is_none());
+    assert!(fixture.events.backend.present_source_pins.is_empty());
+    assert!(!fixture.events.backend.scene.owes_repaint());
+    let accepted_count = record_count(&fixture, device_fd);
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("a clean scene does not need another replacement");
+    assert_eq!(
+        record_count(&fixture, device_fd),
+        accepted_count,
+        "normal retirement does not cause unsolicited compose or a second replacement"
+    );
+    drain_present_notifications(&mut fixture, &[], &[direct.candidate.present_id]);
+    assert_issue281_unflip_end_state(&fixture, direct.candidate.present_id);
+    fixture.events.wait_for_submitted_gpu_work();
+    fixture.finish();
 }
 
 fn scene_completion_for_output(
@@ -1329,11 +2016,20 @@ fn p1_degraded_shared_unflip_waits_for_accepted_replacements() {
     recorder.script_result(Ok(()));
     recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
     Backend::maybe_composite(&mut fixture.events.backend).expect("degrade grouped unflip");
-    let attempts = records_since(&fixture, device_fd, offset);
-    let failed_group = attempts
+    let rejected_group = records_since(&fixture, device_fd, offset);
+    let failed_group = rejected_group
         .iter()
         .find(|record| record.events.len() == 2 && record.result != ScriptedResult::Ok)
         .expect("grouped unflip rejected");
+    assert!(
+        accepted_event_id(failed_group).is_none(),
+        "a rejected group publishes no accepted identity"
+    );
+    fixture.events.wait_for_submitted_gpu_work();
+    Backend::on_scanout_render_completion(&mut fixture.events.backend, &mut fixture.events.state);
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("submit degraded replacements after safe notifications");
+    let attempts = records_since(&fixture, device_fd, offset);
     let accepted_scene: Vec<_> = accepted_records(&attempts)
         .into_iter()
         .filter(|record| record.events.len() == 1)
@@ -1521,6 +2217,20 @@ fn p1_degraded_shared_unflip_waits_for_accepted_replacements() {
     assert!(fixture.events.backend.present_source_pins.is_empty());
     drain_present_notifications(&mut fixture, &[], &[direct.candidate.present_id]);
 
+    let pre_drain_offset = record_count(&fixture, device_fd);
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("repair full scene after degraded unflip");
+    let repair_frames = accepted_records(&records_since(&fixture, device_fd, pre_drain_offset));
+    for (index, record) in repair_frames.iter().enumerate() {
+        let repair_id = accepted_event_id(record).expect("full-scene repair accepted");
+        complete_recorded_attempt(
+            &mut fixture,
+            device_fd,
+            record,
+            repair_id,
+            104 + u32::try_from(index).expect("repair frame index fits"),
+        );
+    }
     fixture.drain_deferred_pool_releases(Duration::from_secs(5));
     assert!(
         !fixture
@@ -1531,44 +2241,7 @@ fn p1_degraded_shared_unflip_waits_for_accepted_replacements() {
             .reentry_blocked_until_composed,
         "normal composed fallback reopens direct admission after every replacement retires"
     );
-    let admitted_reentry_id = direct.candidate.present_id + 10_001;
-    let admitted_start = record_count(&fixture, device_fd);
-    for attempt in 0..DIRECT_PROBATION {
-        let present_id = admitted_reentry_id + u64::try_from(attempt).unwrap();
-        let mut candidate = direct.candidate;
-        candidate.present_id = present_id;
-        let mut event = direct.event.clone();
-        event.present_id = present_id;
-        event.serial = event.serial.wrapping_add(u32::try_from(attempt).unwrap());
-        let accepted = Backend::try_present_direct(&mut fixture.events.backend, candidate, event)
-            .expect("eligible Present after all unflip requirements retire");
-        assert_eq!(
-            accepted,
-            attempt + 1 == DIRECT_PROBATION,
-            "direct admission resumes only after the existing probation"
-        );
-    }
-    let reentered = accepted_records(&records_since(&fixture, device_fd, admitted_start));
-    assert_eq!(reentered.len(), 1, "the admitted Present submits once");
-    let reentered_id = accepted_event_id(&reentered[0]).unwrap();
-    complete_recorded_attempt(&mut fixture, device_fd, &reentered[0], reentered_id, 104);
-    drain_present_notifications(
-        &mut fixture,
-        &[admitted_reentry_id + (DIRECT_PROBATION as u64 - 1)],
-        &[],
-    );
-
-    request_unflip(&mut fixture, &direct);
-    let cleanup_offset = record_count(&fixture, device_fd);
-    let cleanup = grouped_unflip_record(&mut fixture, device_fd, cleanup_offset, 2);
-    let cleanup_id = accepted_event_id(&cleanup).unwrap();
-    complete_recorded_attempt(&mut fixture, device_fd, &cleanup, cleanup_id, 105);
-    assert!(fixture.events.backend.present_source_pins.is_empty());
-    drain_present_notifications(
-        &mut fixture,
-        &[],
-        &[admitted_reentry_id + (DIRECT_PROBATION as u64 - 1)],
-    );
+    assert_issue281_unflip_end_state(&fixture, direct.candidate.present_id);
     fixture.finish_after_normal_drain();
 }
 
@@ -1580,6 +2253,7 @@ fn p1_degraded_copied_unflip_registers_immediately_accepted_replacement() {
     else {
         return;
     };
+    fixture.readiness.as_ref().unwrap().hold_ready_jobs();
     let device_fd = fd(&fixture);
     let initial_attempts = submit_direct(&mut fixture, &direct, device_fd);
     let initial = accepted_records(&initial_attempts).remove(0);
@@ -1589,57 +2263,44 @@ fn p1_degraded_copied_unflip_registers_immediately_accepted_replacement() {
     request_unflip(&mut fixture, &direct);
     fixture.events.recorders[&device_fd]
         .script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
-    Backend::maybe_composite(&mut fixture.events.backend)
-        .expect("degrade copied grouped unflip and tick scene");
+    let unflip_offset = record_count(&fixture, device_fd);
+    Backend::maybe_composite(&mut fixture.events.backend).expect("prepare copied unflip");
+    let source_job = fixture
+        .pending_render_job_ids()
+        .last()
+        .copied()
+        .unwrap_or_else(|| compose_copied_job(&mut fixture));
+    deliver_copied_job(&mut fixture, source_job);
+    let rejected_group = records_since(&fixture, device_fd, unflip_offset)
+        .into_iter()
+        .find(|record| record.result != ScriptedResult::Ok)
+        .expect("the grouped copied replacement is rejected");
+    assert!(accepted_event_id(&rejected_group).is_none());
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .unflip_awaiting_outputs
+            .is_empty()
+    );
+    assert_eq!(direct_source_pins(&fixture, direct.source_id), 1);
 
-    let deadline = Instant::now() + WAIT_DEADLINE;
-    let replacement = loop {
-        let Some(replacement) = records_since(&fixture, device_fd, 0)
-            .into_iter()
-            .rev()
-            .find(|record| {
-                record.events.len() == 1
-                    && record.device_fd == device_fd
-                    && accepted_event_id(record).is_some()
-                    && record.kind != crate::drm::atomic::AtomicCommitKind::Async
-            })
-            .filter(|record| record.user_data != direct_id)
-        else {
-            assert!(
-                Instant::now() < deadline,
-                "scene tick did not accept a copied replacement"
-            );
-            Backend::before_block(&mut fixture.events.backend);
-            let root = fixture.events.backend.core.window_id;
-            let width = fixture.events.backend.platform.fb_w;
-            let height = fixture.events.backend.platform.fb_h;
-            Backend::clear_area(
-                &mut fixture.events.backend,
-                None,
-                root,
-                0,
-                None,
-                0,
-                0,
-                width,
-                height,
-                (0, 0),
-            )
-            .expect("damage copied replacement through Backend");
-            Backend::maybe_composite(&mut fixture.events.backend)
-                .expect("tick copied replacement through Backend");
-            continue;
-        };
-        if replacement.events[0].crtc == fixture.events.backend.platform.outputs[0].output.crtc
-            && replacement.user_data != direct_id
-        {
-            break replacement;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "copied replacement event targeted another CRTC"
-        );
-    };
+    fixture.events.wait_for_submitted_gpu_work();
+    Backend::on_scanout_render_completion(&mut fixture.events.backend, &mut fixture.events.state);
+    let fallback_job = compose_copied_job(&mut fixture);
+    let fallback_start = record_count(&fixture, device_fd);
+    deliver_copied_job(&mut fixture, fallback_job);
+    let replacement = records_since(&fixture, device_fd, fallback_start)
+        .into_iter()
+        .find(|record| {
+            record.events.len() == 1
+                && record.device_fd == device_fd
+                && accepted_event_id(record).is_some()
+                && record.kind != crate::drm::atomic::AtomicCommitKind::Async
+        })
+        .expect("later degraded copied sink commit is accepted");
     let replacement_id = accepted_event_id(&replacement).unwrap();
     assert_eq!(
         fixture
@@ -1706,6 +2367,8 @@ fn p1_degraded_copied_unflip_registers_immediately_accepted_replacement() {
             .all(|row| { !(row.contains("phase=Free") && row.contains("ForeignPendingKms")) })
     );
     drain_present_notifications(&mut fixture, &[], &[direct.candidate.present_id]);
+    fixture.drain_deferred_pool_releases(Duration::from_secs(5));
+    assert_issue281_unflip_end_state(&fixture, direct.candidate.present_id);
     fixture.finish_after_normal_drain();
 }
 
@@ -1729,7 +2392,7 @@ fn p1_degraded_copied_unflip_has_no_id_before_sink_acceptance() {
     let recorder = fixture.events.recorders[&device_fd].clone();
     recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
     let start = record_count(&fixture, device_fd);
-    Backend::maybe_composite(&mut fixture.events.backend).expect("degrade grouped copied unflip");
+    Backend::maybe_composite(&mut fixture.events.backend).expect("prepare copied unflip");
     let job_id = fixture
         .pending_render_job_ids()
         .last()
@@ -1745,14 +2408,14 @@ fn p1_degraded_copied_unflip_has_no_id_before_sink_acceptance() {
             .is_empty(),
         "source render readiness must not create an accepted sink identity"
     );
-    assert_eq!(
+    assert!(
         fixture
             .events
             .backend
             .pstate
             .scanout_m2
-            .unflip_outputs_to_replace,
-        HashSet::from([0])
+            .unflip_outputs_to_replace
+            .is_empty()
     );
     assert_eq!(
         fixture.events.backend.scene.pending_page_flip_event_id(0),
@@ -1766,19 +2429,29 @@ fn p1_degraded_copied_unflip_has_no_id_before_sink_acceptance() {
             .all(|record| accepted_event_id(record).is_none())
     );
 
-    recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EINVAL)));
-    let sink_start = record_count(&fixture, device_fd);
     deliver_copied_job(&mut fixture, job_id);
-    let sink_attempts = records_since(&fixture, device_fd, sink_start);
+    let sink_attempts = records_since(&fixture, device_fd, start);
+    let rejected_group = sink_attempts
+        .iter()
+        .find(|record| record.result != ScriptedResult::Ok)
+        .expect("the ready grouped copied replacement is rejected with EIO");
     assert_eq!(
-        sink_attempts.len(),
+        rejected_group.events.len(),
         1,
-        "the selector begins immediately before the rejected sink submission"
+        "the grouped rejection covers this output"
     );
-    let rejected = sink_attempts
-        .into_iter()
-        .find(|record| record.events.len() == 1 && record.result != ScriptedResult::Ok)
-        .expect("sink acceptance rejected");
+    assert_eq!(rejected_group.events.len(), 1);
+    assert!(accepted_records(&sink_attempts).is_empty());
+    assert_eq!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .unflip_outputs_to_replace,
+        HashSet::from([0]),
+        "EIO begins degraded handling only after the source is ready and sink copy is submitted"
+    );
     assert!(
         fixture
             .events
@@ -1788,29 +2461,19 @@ fn p1_degraded_copied_unflip_has_no_id_before_sink_acceptance() {
             .unflip_awaiting_outputs
             .is_empty()
     );
-    assert_eq!(
-        fixture
-            .events
-            .backend
-            .pstate
-            .scanout_m2
-            .unflip_outputs_to_replace,
-        HashSet::from([0])
-    );
-    assert_eq!(
-        fixture.events.backend.scene.pending_page_flip_event_id(0),
-        None
-    );
+    assert_eq!(direct_source_pins(&fixture, direct.source_id), 1);
+    assert_eq!(fixture.events.backend.present_source_pins.len(), 2);
 
-    let accepted_start = record_count(&fixture, device_fd);
-    let next_job = compose_copied_job(&mut fixture);
-    deliver_copied_job(&mut fixture, next_job);
-    let accepted = records_since(&fixture, device_fd, accepted_start)
+    fixture.events.wait_for_submitted_gpu_work();
+    Backend::on_scanout_render_completion(&mut fixture.events.backend, &mut fixture.events.state);
+    let fallback_job = compose_copied_job(&mut fixture);
+    let fallback_start = record_count(&fixture, device_fd);
+    deliver_copied_job(&mut fixture, fallback_job);
+    let accepted = records_since(&fixture, device_fd, fallback_start)
         .into_iter()
-        .find(|record| accepted_event_id(record).is_some())
-        .expect("later copied sink request accepted");
+        .find(|record| record.events.len() == 1 && accepted_event_id(record).is_some())
+        .expect("safe cancellation permits the per-output copied replacement");
     let accepted_id = accepted_event_id(&accepted).unwrap();
-    assert_ne!(accepted_id, rejected.user_data);
     assert_eq!(
         fixture
             .events
@@ -1825,28 +2488,7 @@ fn p1_degraded_copied_unflip_has_no_id_before_sink_acceptance() {
         Some(accepted_id)
     );
 
-    fixture.events.queue_commit_completion(
-        device_fd,
-        accepted.events[0].crtc,
-        direct_id,
-        120,
-        Duration::from_millis(12_000),
-    );
-    Backend::on_page_flip_ready(
-        &mut fixture.events.backend,
-        &mut fixture.events.state,
-        device_fd,
-    );
-    assert_eq!(
-        fixture
-            .events
-            .backend
-            .pstate
-            .scanout_m2
-            .unflip_awaiting_outputs,
-        HashMap::from([(0, accepted_id)])
-    );
-    complete_recorded_attempt(&mut fixture, device_fd, &accepted, accepted_id, 121);
+    complete_recorded_attempt(&mut fixture, device_fd, &accepted, accepted_id, 120);
     assert!(!fixture.events.backend.scene.has_pending_page_flips());
     assert!(
         fixture
@@ -1875,5 +2517,7 @@ fn p1_degraded_copied_unflip_has_no_id_before_sink_acceptance() {
             .all(|row| { !(row.contains("phase=Free") && row.contains("ForeignPendingKms")) })
     );
     drain_present_notifications(&mut fixture, &[], &[direct.candidate.present_id]);
+    fixture.drain_deferred_pool_releases(Duration::from_secs(5));
+    assert_issue281_unflip_end_state(&fixture, direct.candidate.present_id);
     fixture.finish_after_normal_drain();
 }

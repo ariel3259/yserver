@@ -1877,7 +1877,10 @@ fn non_async_authoritative_present_resets_probation_during_reentry_barrier() {
             .is_empty()
     );
     retire_composed_frame(&mut backend, &mut state, 9);
-    assert!(backend.pstate.scanout_m2.reentry_blocked_until_composed);
+    assert!(
+        !backend.pstate.scanout_m2.reentry_blocked_until_composed,
+        "the accepted fresh unflip frame already composes the scene"
+    );
     assert!(backend.pstate.scanout_m2.current.is_none());
     assert_tearing_off(&backend);
 
@@ -1888,7 +1891,7 @@ fn non_async_authoritative_present_resets_probation_during_reentry_barrier() {
     assert!(try_direct_present_for_window(&mut backend, 848, WINDOW, width, height, 0).is_none());
     assert_eq!(backend.pstate.tearing.probation, 0);
     assert_eq!(backend.pstate.tearing.probation_owner, None);
-    assert!(backend.pstate.scanout_m2.reentry_blocked_until_composed);
+    assert!(!backend.pstate.scanout_m2.reentry_blocked_until_composed);
     assert_tearing_off(&backend);
     damage_root_and_composite(&mut backend);
     retire_composed_frame(&mut backend, &mut state, 10);
@@ -3370,16 +3373,8 @@ fn show_cursor_during_held_direct_hidden_tearing_makes_cursor_visible() {
     retire_composed_frame(&mut backend, &mut state, 43);
     assert!(backend.pstate.scanout_m2.current.is_none());
 
-    damage_root(&mut backend);
-    Backend::maybe_composite(&mut backend).expect("compose visible software cursor");
-    assert!(
-        backend.scene.has_pending_page_flips(),
-        "expected a pending scene page flip: {}",
-        tearing_composite_diagnostics(&backend, None),
-    );
     assert!(!backend.platform.any_cursor_plane_visible());
     assert!(backend.pstate.tearing.is_on());
-    retire_composed_frame(&mut backend, &mut state, 44);
     assert_eq!(
         backend.scene.cursor_mode(),
         crate::kms::render::scene::CursorPlaneMode::Sw
@@ -3388,23 +3383,15 @@ fn show_cursor_during_held_direct_hidden_tearing_makes_cursor_visible() {
     assert!(backend.effective_cursor_xid.is_some());
     assert!(!backend.platform.any_cursor_plane_visible());
     assert!(!backend.scene.has_pending_page_flips());
-    assert_commit_sequence(
-        &recorder,
-        &[
-            AtomicCommitKind::Async,
-            AtomicCommitKind::Scene,
-            AtomicCommitKind::Async,
-        ],
-    );
     assert!(
         backend.scene.for_tests_cursor_footprint_was_presented(0),
-        "the retired software scene frame includes the visible cursor footprint"
+        "the fresh grouped unflip frame includes the visible cursor footprint"
     );
 }
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutations: submit composed Async before the successful cursor-plane hide retires, or skip the entry unflip request.
+// Mutations: submit Async before hide retirement, skip the entry unflip, or fail to wake the post-hide software-cursor repaint.
 fn entry_from_held_direct_with_visible_hw_cursor_runs_handoff() {
     use yserver_core::{backend::Backend, server::ServerState};
     use yserver_protocol::x11::{ClientId, ResourceId};
@@ -3552,16 +3539,13 @@ fn entry_from_held_direct_with_visible_hw_cursor_runs_handoff() {
     Backend::maybe_composite(&mut backend).expect("compose software cursor after hide");
     assert!(
         backend.scene.has_pending_page_flips(),
-        "expected a pending scene page flip: {}",
-        tearing_composite_diagnostics(&backend, None),
+        "the software cursor frame follows the cursorless hide frame"
     );
-    assert!(!backend.scene.cursor_transition_pending());
-    assert_eq!(
-        recorder.records().last().unwrap().kind,
-        AtomicCommitKind::Async
-    );
-    assert!(!backend.platform.any_cursor_plane_visible());
     retire_composed_frame(&mut backend, &mut state, 11);
+    assert!(backend.scene.for_tests_cursor_footprint_was_presented(0));
+
+    assert!(!backend.scene.cursor_transition_pending());
+    assert!(!backend.platform.any_cursor_plane_visible());
     assert_eq!(
         backend.scene.cursor_mode(),
         crate::kms::render::scene::CursorPlaneMode::Sw
@@ -4007,25 +3991,11 @@ fn dead_zone_motion_during_tearing_requests_cursor_handoff() {
         crate::kms::render::scene::CursorPlaneMode::Sw
     );
 
-    Backend::maybe_composite(&mut backend).expect("draw cursor after dead-zone handoff");
-    assert!(
-        backend.scene.has_pending_page_flips(),
-        "expected a pending scene page flip: {}",
-        tearing_composite_diagnostics(&backend, None),
-    );
-    assert_eq!(
-        recorder.records().last().unwrap().kind,
-        AtomicCommitKind::Async
-    );
-    retire_composed_frame(&mut backend, &mut state, 49);
     assert!(backend.scene.for_tests_cursor_footprint_was_presented(0));
     assert!(!backend.scene.for_tests_cursor_footprint_was_presented(1));
     assert_direct_queue_drained(&backend);
     let outputs = backend.platform.outputs.len();
-    let mut expected = vec![AtomicCommitKind::Scene; outputs * 8 + 2];
-    for _ in 0..outputs {
-        expected.push(AtomicCommitKind::Async);
-    }
+    let expected = vec![AtomicCommitKind::Scene; outputs * 8 + 2];
     assert_commit_sequence(&recorder, &expected);
 }
 

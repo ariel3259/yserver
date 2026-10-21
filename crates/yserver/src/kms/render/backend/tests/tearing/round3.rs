@@ -119,14 +119,6 @@ fn transparent_cursor_is_hidden_for_direct_scanout_and_define_cursor_handoff() {
     retire_composed_frame(&mut backend, &mut state, 52);
     assert!(!backend.pstate.scanout_m2.active());
     assert!(!backend.pstate.scanout_m2.unflip_requested);
-    damage_root(&mut backend);
-    Backend::maybe_composite(&mut backend).expect("compose visible one-pixel cursor");
-    assert!(
-        backend.scene.has_pending_page_flips(),
-        "expected a pending scene page flip: {}",
-        tearing_composite_diagnostics(&backend, None),
-    );
-    retire_composed_frame(&mut backend, &mut state, 53);
     assert_eq!(
         backend.scene.cursor_mode(),
         crate::kms::render::scene::CursorPlaneMode::Sw
@@ -176,7 +168,6 @@ fn transparent_cursor_is_hidden_for_direct_scanout_and_define_cursor_handoff() {
             AtomicCommitKind::Scene,
             AtomicCommitKind::Async,
             AtomicCommitKind::Scene,
-            AtomicCommitKind::Async,
             AtomicCommitKind::Async,
             AtomicCommitKind::Async,
         ],
@@ -240,7 +231,6 @@ fn transparent_cursor_is_hidden_for_direct_scanout_and_define_cursor_handoff() {
             AtomicCommitKind::Scene,
             AtomicCommitKind::Async,
             AtomicCommitKind::Scene,
-            AtomicCommitKind::Async,
             AtomicCommitKind::Async,
             AtomicCommitKind::Async,
             AtomicCommitKind::Scene,

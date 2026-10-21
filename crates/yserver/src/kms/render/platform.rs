@@ -46,9 +46,9 @@ use init::*;
 #[cfg(test)]
 pub(in crate::kms::render) use power::OutputPowerExecutor;
 pub(crate) use qualify::*;
-pub(crate) use scanout_bos::PreparedUnflipPlane;
 #[cfg(test)]
 use scanout_bos::*;
+pub(crate) use scanout_bos::{ExpectedUnflipPlane, PreparedUnflipPlane, grouped_unflip_ready};
 
 #[cfg(test)]
 mod tests;
@@ -144,7 +144,7 @@ struct PendingScanoutUnflipDependencySafe {
     output_key: OutputKey,
     bo_idx: usize,
     fd: OwnedFd,
-    safe: Arc<std::sync::atomic::AtomicBool>,
+    safe: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// A completed source-render job ready for the sink-side copied-scanout

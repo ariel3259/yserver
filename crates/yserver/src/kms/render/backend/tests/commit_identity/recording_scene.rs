@@ -43,6 +43,7 @@ pub(crate) struct RecordingSceneFixture {
     pub(crate) events: AtomicEventFixture,
     /// Copied routes only: withholds delivery of real source completions.
     pub(crate) readiness: Option<Rc<RecordingRenderCompletionReadiness>>,
+    pub(crate) present_notification_counts: HashMap<u64, (usize, usize)>,
     extra_drawables: Vec<u32>,
 }
 
@@ -64,9 +65,6 @@ impl RecordingSceneFixture {
         };
         let mut readiness = None;
         if route != P1SceneRoute::Shared {
-            if output_count != 1 {
-                return Err("copied P1 scene routes use one output".to_owned());
-            }
             install_copied_route(&mut backend, route == P1SceneRoute::CopiedSeparateDevice)?;
             let observer = Rc::new(RecordingRenderCompletionReadiness::default());
             backend
@@ -77,6 +75,7 @@ impl RecordingSceneFixture {
         Ok(Some(Self {
             events: AtomicEventFixture::from_backend(backend),
             readiness,
+            present_notification_counts: HashMap::new(),
             extra_drawables: Vec::new(),
         }))
     }
@@ -86,6 +85,7 @@ impl RecordingSceneFixture {
         Ok(backend.map(|backend| Self {
             events: AtomicEventFixture::from_backend(backend),
             readiness: None,
+            present_notification_counts: HashMap::new(),
             extra_drawables: Vec::new(),
         }))
     }
@@ -328,6 +328,10 @@ impl RecordingSceneFixture {
         assert!(!direct.hold_direct, "direct ownership remains held");
         assert!(!direct.unflip_requested, "an unflip is still required");
         assert!(
+            direct.composed_unflip.is_none(),
+            "a composed-unflip batch remains active"
+        );
+        assert!(
             direct.unflip_outputs_to_replace.is_empty(),
             "outputs still await an unflip replacement"
         );
@@ -354,6 +358,10 @@ impl RecordingSceneFixture {
         assert!(
             backend.pstate.pending_present_source_waits.is_empty(),
             "Present source waits remain pending"
+        );
+        assert!(
+            backend.platform.for_tests_unflip_ready_state_is_empty(),
+            "platform retains an unflip batch context or prepared plane"
         );
         assert_eq!(
             backend.scene.pending_pool_release_count_for_tests(),

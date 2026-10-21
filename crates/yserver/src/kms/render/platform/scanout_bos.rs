@@ -238,6 +238,11 @@ impl PlatformBackend {
         std::mem::take(&mut self.prepared_unflip_planes)
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_tests_unflip_ready_state_is_empty(&self) -> bool {
+        self.unflip_batch_context.is_none() && self.prepared_unflip_planes.is_empty()
+    }
+
     /// Called after grouped atomic acceptance; only now may the userspace
     /// input-fence descriptor be closed and the BO become flip-pending.
     pub(crate) fn accept_prepared_unflip_plane(
@@ -323,7 +328,7 @@ impl PlatformBackend {
         mode: crate::kms::render::scene::FrameSubmitMode,
         render_completion: Option<OwnedFd>,
     ) -> io::Result<crate::kms::render::scene::CopiedSubmitOutcome> {
-        let topology_generation = match mode {
+        let _topology_generation = match mode {
             crate::kms::render::scene::FrameSubmitMode::Immediate
                 if identity.topology_generation.is_none() =>
             {
@@ -512,21 +517,14 @@ impl PlatformBackend {
             }
         })();
 
-        if let Some((output_key, sink_vk, fence)) = quarantined_dependency
-            && let Some(topology_generation) = topology_generation
-            && let Err(error) = self.register_scanout_unflip_dependency_safe(
-                output_key,
-                bo_idx,
-                render_job_id,
-                topology_generation,
-                sink_vk,
-                fence,
-            )
-        {
+        if let Some((_output_key, _sink_vk, _fence)) = quarantined_dependency {
+            // A successful queue submit with no exportable final dependency
+            // cannot be represented as render readiness. Keep the copied pair
+            // quarantined until the existing full lifecycle/device quiescence
+            // boundary; never synthesize an UnflipDependencySafe event here.
             log::error!(
-                "could not register asynchronous safe-dependency notification for output {output_idx} BO {bo_idx} job {render_job_id}: {error}; target remains quarantined"
+                "deferred copied scanout job {render_job_id} remains quarantined without a final dependency"
             );
-            self.gpu.renderer_failed = true;
         }
 
         if mode == crate::kms::render::scene::FrameSubmitMode::Immediate
