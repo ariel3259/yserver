@@ -59,11 +59,98 @@ impl RenderCompletionReadiness for PollRenderCompletionReadiness {
     }
 }
 
+pub(crate) trait ScanoutDependencyWaiter: Send + Sync {
+    fn wait_for_safe(
+        &self,
+        render_job_id: u64,
+        vk: &crate::kms::vk::device::VkContext,
+        fence: ash::vk::Fence,
+    ) -> bool;
+}
+
+pub(crate) struct VulkanScanoutDependencyWaiter;
+
+impl ScanoutDependencyWaiter for VulkanScanoutDependencyWaiter {
+    fn wait_for_safe(
+        &self,
+        _render_job_id: u64,
+        vk: &crate::kms::vk::device::VkContext,
+        fence: ash::vk::Fence,
+    ) -> bool {
+        // This potentially unbounded wait always runs on the detached worker,
+        // never on Backend's event-loop thread.
+        unsafe { vk.device.wait_for_fences(&[fence], true, u64::MAX) }.is_ok()
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct RecordingScanoutDependencyWaiter {
+    state: std::sync::Mutex<RecordingScanoutDependencyWaiterState>,
+    changed: std::sync::Condvar,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct RecordingScanoutDependencyWaiterState {
+    waiting: HashSet<u64>,
+    released: HashSet<u64>,
+}
+
+#[cfg(test)]
+impl RecordingScanoutDependencyWaiter {
+    pub(crate) fn wait_until_blocked(&self, render_job_id: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut state = self.state.lock().expect("waiter state lock");
+        while !state.waiting.contains(&render_job_id) {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!remaining.is_zero(), "worker never entered its fence wait");
+            let (next, timeout) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .expect("waiter state lock");
+            state = next;
+            assert!(
+                !timeout.timed_out() || state.waiting.contains(&render_job_id),
+                "worker never entered its fence wait"
+            );
+        }
+    }
+
+    pub(crate) fn release(&self, render_job_id: u64) {
+        self.state
+            .lock()
+            .expect("waiter state lock")
+            .released
+            .insert(render_job_id);
+        self.changed.notify_all();
+    }
+}
+
+#[cfg(test)]
+impl ScanoutDependencyWaiter for RecordingScanoutDependencyWaiter {
+    fn wait_for_safe(
+        &self,
+        render_job_id: u64,
+        _vk: &crate::kms::vk::device::VkContext,
+        _fence: ash::vk::Fence,
+    ) -> bool {
+        let mut state = self.state.lock().expect("waiter state lock");
+        state.waiting.insert(render_job_id);
+        self.changed.notify_all();
+        while !state.released.contains(&render_job_id) {
+            state = self.changed.wait(state).expect("waiter state lock");
+        }
+        true
+    }
+}
+
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct RecordingRenderCompletionReadiness {
     hold_ready: std::cell::Cell<bool>,
     released_ready: std::cell::RefCell<HashSet<u64>>,
+    fail_next_ready_check: std::cell::RefCell<HashSet<u64>>,
 }
 
 #[cfg(test)]
@@ -82,11 +169,24 @@ impl RecordingRenderCompletionReadiness {
     pub(crate) fn release_ready_job(&self, render_job_id: u64) {
         self.released_ready.borrow_mut().insert(render_job_id);
     }
+
+    pub(crate) fn fail_next_ready_check(&self, render_job_id: u64) {
+        self.fail_next_ready_check
+            .borrow_mut()
+            .insert(render_job_id);
+    }
 }
 
 #[cfg(test)]
 impl RenderCompletionReadiness for RecordingRenderCompletionReadiness {
     fn is_ready(&self, render_job_id: u64, fd: Option<BorrowedFd<'_>>) -> io::Result<bool> {
+        if self
+            .fail_next_ready_check
+            .borrow_mut()
+            .remove(&render_job_id)
+        {
+            return Err(io::Error::other("injected render readiness failure"));
+        }
         if !PollRenderCompletionReadiness.is_ready(render_job_id, fd)? {
             return Ok(false);
         }
@@ -327,11 +427,27 @@ impl PlatformBackend {
     }
 
     #[cfg(test)]
+    pub(crate) fn for_tests_pending_scanout_unflip_dependency_job_ids(&self) -> Vec<u64> {
+        self.pending_scanout_unflip_dependencies
+            .iter()
+            .map(|pending| pending.render_job_id)
+            .collect()
+    }
+
+    #[cfg(test)]
     pub(crate) fn for_tests_set_render_completion_readiness(
         &mut self,
         readiness: Rc<RecordingRenderCompletionReadiness>,
     ) {
         self.render_completion_readiness = readiness;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_set_scanout_dependency_waiter(
+        &mut self,
+        waiter: Arc<dyn ScanoutDependencyWaiter>,
+    ) {
+        self.scanout_dependency_waiter = waiter;
     }
 
     pub(super) fn prune_present_clocks_to_live_outputs(&mut self) {
@@ -426,14 +542,14 @@ impl PlatformBackend {
             .register(fd.as_fd(), render_job_id)?;
         let safe = Arc::new(AtomicBool::new(false));
         let worker_safe = Arc::clone(&safe);
+        let worker_waiter = Arc::clone(&self.scanout_dependency_waiter);
         let worker = match std::thread::Builder::new()
             .name(format!("scanout-safe-{render_job_id}"))
             .spawn(move || {
                 // This wait belongs to a dedicated worker. The backend core
                 // only receives the socket notification after Vulkan reports
                 // that the submitted sink work has completed.
-                let completed =
-                    unsafe { vk.device.wait_for_fences(&[fence], true, u64::MAX) }.is_ok();
+                let completed = worker_waiter.wait_for_safe(render_job_id, &vk, fence);
                 worker_safe.store(completed, Ordering::Release);
                 let _ = writer.write_all(&[1]);
             }) {
@@ -449,6 +565,10 @@ impl PlatformBackend {
                 return Err(error);
             }
         };
+        // Dropping a JoinHandle detaches the worker. Its socket notification
+        // and atomic result are the completion contract; core, cancellation,
+        // and teardown paths must never wait for this GPU fence on the CPU.
+        drop(worker);
         self.pending_scanout_unflip_dependencies.push_back(
             crate::kms::render::platform::PendingScanoutUnflipDependencySafe {
                 render_job_id,
@@ -456,7 +576,6 @@ impl PlatformBackend {
                 bo_idx,
                 fd,
                 safe,
-                worker: Some(worker),
             },
         );
         Ok(())
@@ -513,21 +632,34 @@ impl PlatformBackend {
     pub(crate) fn drain_scanout_unflip_dependency_safe(
         &mut self,
     ) -> Vec<crate::kms::render::scene::RenderNotification> {
-        let readiness = PollRenderCompletionReadiness;
         let mut ready = Vec::new();
         let mut index = 0;
         while index < self.pending_scanout_unflip_dependencies.len() {
             let is_ready = {
                 let pending = &self.pending_scanout_unflip_dependencies[index];
-                readiness
-                    .is_ready(pending.render_job_id, Some(pending.fd.as_fd()))
-                    .unwrap_or(true)
+                if pending.safe.load(Ordering::Acquire) {
+                    true
+                } else {
+                    match self
+                        .render_completion_readiness
+                        .is_ready(pending.render_job_id, Some(pending.fd.as_fd()))
+                    {
+                        Ok(is_ready) => is_ready,
+                        Err(error) => {
+                            log::warn!(
+                                "scanout safe-dependency readiness check failed for job {}; retaining quarantine until its worker notification: {error}",
+                                pending.render_job_id,
+                            );
+                            false
+                        }
+                    }
+                }
             };
             if !is_ready {
                 index += 1;
                 continue;
             }
-            let mut pending = self
+            let pending = self
                 .pending_scanout_unflip_dependencies
                 .remove(index)
                 .expect("safe-dependency index was checked");
@@ -536,18 +668,6 @@ impl PlatformBackend {
                 .unregister(pending.fd.as_fd())
             {
                 log::warn!("scanout safe-dependency unregister failed: {error}");
-            }
-            if pending
-                .worker
-                .take()
-                .is_some_and(|worker| worker.join().is_err())
-            {
-                log::error!(
-                    "scanout safe-dependency worker panicked for job {}",
-                    pending.render_job_id
-                );
-                self.gpu.renderer_failed = true;
-                continue;
             }
             if !pending.safe.load(Ordering::Acquire) {
                 log::error!(
@@ -599,7 +719,7 @@ impl PlatformBackend {
                 index += 1;
                 continue;
             }
-            let mut pending = self
+            let pending = self
                 .pending_scanout_unflip_dependencies
                 .remove(index)
                 .expect("safe-dependency index was checked");
@@ -608,17 +728,6 @@ impl PlatformBackend {
                 .unregister(pending.fd.as_fd())
             {
                 log::warn!("scanout safe-dependency cancellation unregister failed: {error}");
-            }
-            if pending
-                .worker
-                .take()
-                .is_some_and(|worker| worker.join().is_err())
-            {
-                self.gpu.renderer_failed = true;
-                log::error!(
-                    "scanout safe-dependency worker panicked while cancelling job {}",
-                    pending.render_job_id
-                );
             }
         }
     }
@@ -631,23 +740,12 @@ impl PlatformBackend {
                 log::warn!("scanout render completion teardown unregister failed: {error}");
             }
         }
-        while let Some(mut pending) = self.pending_scanout_unflip_dependencies.pop_front() {
+        while let Some(pending) = self.pending_scanout_unflip_dependencies.pop_front() {
             if let Err(error) = self
                 .scanout_render_completion_epfd
                 .unregister(pending.fd.as_fd())
             {
                 log::warn!("scanout safe-dependency teardown unregister failed: {error}");
-            }
-            if pending
-                .worker
-                .take()
-                .is_some_and(|worker| worker.join().is_err())
-            {
-                self.gpu.renderer_failed = true;
-                log::error!(
-                    "scanout safe-dependency worker panicked during teardown for job {}",
-                    pending.render_job_id
-                );
             }
         }
     }

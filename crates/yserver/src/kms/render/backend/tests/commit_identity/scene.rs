@@ -9,7 +9,7 @@ use super::{
         assert_pending_bo_phases, complete_recorded_attempt, pending_ids, submit_damaged_frame,
     },
     recording_scene::{P1SceneRoute, RecordingSceneFixture},
-    support::accepted_event_id,
+    support::{AtomicEventFixture, accepted_event_id},
 };
 use crate::{
     drm::atomic::tests_support::{AtomicCommitRecord, ScriptedResult},
@@ -17,6 +17,8 @@ use crate::{
 };
 use std::{
     os::fd::RawFd,
+    rc::Rc,
+    sync::{Arc, mpsc},
     time::{Duration, Instant},
 };
 use yserver_core::backend::Backend;
@@ -132,6 +134,158 @@ fn accept_copied_frame(fixture: &mut RecordingSceneFixture) -> (u64, AtomicCommi
         .expect("the sink device accepted the copied frame");
     let id = accepted_event_id(&accepted).expect("accepted copied frame has an identity");
     (id, accepted)
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: treat a readiness error as ready and join the fence waiter; the Backend callback must return before the test releases that waiter.
+fn p1_unflip_dependency_readiness_error_does_not_block_backend() {
+    let mut fixture = AtomicEventFixture::new(1);
+    let vk = match crate::kms::vk::device::VkContext::new() {
+        Ok(vk) => vk,
+        Err(crate::kms::vk::device::VkInitError::NoSuitableDevice) => {
+            eprintln!("skipping: no suitable Vulkan physical device");
+            return;
+        }
+        Err(error) => panic!("unexpected Vulkan test setup failure: {error}"),
+    };
+    let readiness = Rc::new(
+        crate::kms::render::platform::flip_events::RecordingRenderCompletionReadiness::default(),
+    );
+    fixture
+        .backend
+        .platform
+        .for_tests_set_render_completion_readiness(Rc::clone(&readiness));
+    let fence = unsafe {
+        vk.device
+            .create_fence(&ash::vk::FenceCreateInfo::default(), None)
+    }
+    .expect("create unsignalled safe-dependency test fence");
+    let render_job_id = fixture
+        .backend
+        .platform
+        .allocate_scanout_render_job_id()
+        .expect("allocate safe-dependency render job id");
+    let output_key = fixture.backend.platform.outputs[0].key.clone();
+    readiness.fail_next_ready_check(render_job_id);
+    let waiter = Arc::new(
+        crate::kms::render::platform::flip_events::RecordingScanoutDependencyWaiter::default(),
+    );
+    fixture
+        .backend
+        .platform
+        .for_tests_set_scanout_dependency_waiter(waiter.clone());
+    fixture
+        .backend
+        .platform
+        .register_scanout_unflip_dependency_safe(
+            output_key,
+            2,
+            render_job_id,
+            Arc::clone(&vk),
+            fence,
+        )
+        .expect("register safe-dependency waiter");
+    waiter.wait_until_blocked(render_job_id);
+
+    // A watchdog releases the deliberately blocked waiter only if the
+    // Backend callback fails to return. This keeps a regression bounded while
+    // making a blocking join observable to the assertion below.
+    let (callback_returned_tx, callback_returned_rx) = mpsc::channel();
+    let (watchdog_result_tx, watchdog_result_rx) = mpsc::channel();
+    let watchdog_waiter = Arc::clone(&waiter);
+    let watchdog = std::thread::spawn(move || {
+        let blocked = callback_returned_rx
+            .recv_timeout(Duration::from_secs(1))
+            .is_err();
+        if blocked {
+            watchdog_waiter.release(render_job_id);
+        }
+        watchdog_result_tx
+            .send(blocked)
+            .expect("test callback receives watchdog result");
+    });
+
+    Backend::on_scanout_render_completion(&mut fixture.backend, &mut fixture.state);
+    let _ = callback_returned_tx.send(());
+    let watchdog_fired = watchdog_result_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("readiness watchdog completes");
+    watchdog.join().expect("readiness watchdog thread");
+    let retained_after_error = fixture
+        .backend
+        .platform
+        .for_tests_pending_scanout_unflip_dependency_job_ids()
+        == [render_job_id];
+
+    if !watchdog_fired {
+        waiter.release(render_job_id);
+        let completion_fd = fixture
+            .backend
+            .platform
+            .poll_fds()
+            .into_iter()
+            .find_map(|(fd, kind)| {
+                matches!(
+                    kind,
+                    yserver_core::backend::BackendFdKind::ScanoutRenderCompletion
+                )
+                .then_some(fd)
+            })
+            .expect("scanout completion poll fd is registered");
+        let mut poll_fd = libc::pollfd {
+            fd: completion_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: this bounded wait observes the worker's registered socket
+        // through the same completion-poller fd used by Backend dispatch.
+        let ready = unsafe { libc::poll(&mut poll_fd, 1, 5_000) };
+        assert_eq!(ready, 1, "safe-dependency worker signals Backend polling");
+        assert_ne!(poll_fd.revents & libc::POLLIN, 0);
+        Backend::on_scanout_render_completion(&mut fixture.backend, &mut fixture.state);
+    }
+
+    let pending_after_completion = fixture
+        .backend
+        .platform
+        .for_tests_pending_scanout_unflip_dependency_job_ids();
+    let renderer_failed = fixture.backend.platform.gpu.renderer_failed;
+    fixture.assert_quiescent();
+    assert!(!fixture.backend.scene.has_pending_page_flips());
+    assert!(fixture.backend.present_source_pins.is_empty());
+    assert!(
+        fixture
+            .backend
+            .pstate
+            .scanout_m2
+            .unflip_outputs_to_replace
+            .is_empty()
+    );
+    assert!(
+        fixture
+            .backend
+            .pstate
+            .scanout_m2
+            .unflip_awaiting_outputs
+            .is_empty()
+    );
+    unsafe { vk.device.destroy_fence(fence, None) };
+    drop(fixture);
+
+    assert!(
+        !watchdog_fired,
+        "Backend completion callback must not wait for the deferred GPU fence"
+    );
+    assert!(
+        retained_after_error,
+        "readiness failure must retain the quarantined target until worker completion"
+    );
+    assert!(pending_after_completion.is_empty());
+    assert!(
+        !renderer_failed,
+        "successful async fence completion is recoverable"
+    );
 }
 
 /// Tearing entry that retires its initial frame with the accepted explicit

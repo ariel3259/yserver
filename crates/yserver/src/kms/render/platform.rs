@@ -142,7 +142,6 @@ struct PendingScanoutUnflipDependencySafe {
     bo_idx: usize,
     fd: OwnedFd,
     safe: Arc<std::sync::atomic::AtomicBool>,
-    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 /// A completed source-render job ready for the sink-side copied-scanout
@@ -563,6 +562,8 @@ pub struct PlatformBackend {
     /// Readiness observer for copied-scanout render completions. The live
     /// implementation only polls the original completion fd.
     pub(crate) render_completion_readiness: Rc<dyn flip_events::RenderCompletionReadiness>,
+    /// Worker-side wait for final copied-scanout dependencies.
+    pub(crate) scanout_dependency_waiter: Arc<dyn flip_events::ScanoutDependencyWaiter>,
     pending_scanout_render_completions: std::collections::VecDeque<PendingScanoutRenderCompletion>,
     pending_scanout_unflip_dependencies:
         std::collections::VecDeque<PendingScanoutUnflipDependencySafe>,
