@@ -866,7 +866,7 @@ impl KmsBackend {
         self.pstate.scanout_m2.reentry_blocked_until_composed = false;
         self.pstate.scanout_m2.reset_eligible_root_probation();
         self.pstate.scanout_m2.unflip_fallback_source = None;
-        self.pstate.scanout_m2.unflip_shadow_ready = false;
+        self.pstate.scanout_m2.unflip_shadow_ready_targets.clear();
         self.pstate.scanout_m2.degraded_composed_unflip = false;
         self.finish_deferred_cow_release();
         log::debug!("scanout_m2: stopped after scanout replacement: {reason}");
@@ -973,9 +973,6 @@ impl KmsBackend {
         &mut self,
         requested_target: Option<DrawableId>,
     ) -> io::Result<()> {
-        if self.pstate.scanout_m2.unflip_shadow_ready {
-            return Ok(());
-        }
         let matches_requested_target = |frame: &&DirectPresentFrame| {
             requested_target.is_none_or(|target| frame.fallback_target.backing_id() == target)
         };
@@ -996,6 +993,15 @@ impl KmsBackend {
         let source_id = current.source_id;
         let candidate = current.candidate;
         let target = current.fallback_target;
+        let target_id = target.backing_id();
+        if self
+            .pstate
+            .scanout_m2
+            .unflip_shadow_ready_targets
+            .contains(&target_id)
+        {
+            return Ok(());
+        }
         // `CowDescendant` describes scene participation, not identity with
         // the Composite Overlay Window. In particular, Cinnamon can Present
         // a root descendant whose nearest redirected ancestor has its own
@@ -1075,7 +1081,10 @@ impl KmsBackend {
                 crate::kms::render::submit_group::FlushReason::PresentCompletionSignal,
             )
             .map_err(|error| io::Error::other(format!("scanout M2 lazy COW submit: {error:?}")))?;
-        self.pstate.scanout_m2.unflip_shadow_ready = true;
+        self.pstate
+            .scanout_m2
+            .unflip_shadow_ready_targets
+            .insert(target_id);
         log::debug!(
             "scanout_m2: lazily materialized direct source_id={} into fallback_target={} for unflip",
             source_id.as_u64(),

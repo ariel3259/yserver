@@ -289,7 +289,10 @@ pub(in crate::kms::render::backend) struct ScanoutM2State {
     pub(in crate::kms::render::backend) reentry_blocked_until_composed: bool,
     pub(in crate::kms::render::backend) eligible_root_streak: u8,
     pub(in crate::kms::render::backend) unflip_fallback_source: Option<DrawableId>,
-    pub(in crate::kms::render::backend) unflip_shadow_ready: bool,
+    /// Fallback backing identities containing the newest pixels needed by
+    /// the pending unflip, whether copied by Present or materialized from a
+    /// direct source. Current and pending frames can pin distinct targets.
+    pub(in crate::kms::render::backend) unflip_shadow_ready_targets: HashSet<DrawableId>,
     /// The synchronized composed unflip failed and was degraded to the
     /// per-output scene compose path. Keep direct-frame pins held until those
     /// composed flips replace every direct plane.
@@ -315,7 +318,7 @@ impl ScanoutM2State {
             reentry_blocked_until_composed: false,
             eligible_root_streak: 0,
             unflip_fallback_source: None,
-            unflip_shadow_ready: false,
+            unflip_shadow_ready_targets: HashSet::new(),
             degraded_composed_unflip: false,
         }
     }

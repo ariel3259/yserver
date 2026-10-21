@@ -235,7 +235,7 @@ impl KmsBackend {
             )
         {
             self.pstate.scanout_m2.unflip_fallback_source = source_id;
-            self.pstate.scanout_m2.unflip_shadow_ready = false;
+            self.pstate.scanout_m2.unflip_shadow_ready_targets.clear();
         }
     }
 
@@ -762,7 +762,12 @@ impl KmsBackend {
                 .is_some_and(|source| Some(source) == self.pstate.scanout_m2.unflip_fallback_source)
         {
             self.pstate.scanout_m2.unflip_fallback_source = None;
-            self.pstate.scanout_m2.unflip_shadow_ready = true;
+            if let Some(target) = self.resolve_paint_target(dst_window_xid) {
+                self.pstate
+                    .scanout_m2
+                    .unflip_shadow_ready_targets
+                    .insert(target.backing_id());
+            }
             log::debug!(
                 "scanout_m2: normal Present Copy prepared composed fallback source=0x{src_pixmap_xid:x}"
             );
@@ -828,7 +833,7 @@ impl KmsBackend {
                 self.request_direct_unflip("ineligible_authoritative_root_present");
                 if self.pstate.scanout_m2.active() {
                     self.pstate.scanout_m2.unflip_fallback_source = source_id;
-                    self.pstate.scanout_m2.unflip_shadow_ready = false;
+                    self.pstate.scanout_m2.unflip_shadow_ready_targets.clear();
                 }
             }
             return Ok(false);
@@ -911,7 +916,7 @@ impl KmsBackend {
         if self.scene.has_pending_page_flips() {
             self.request_direct_unflip("eligible_direct_successor_scene_flip_pending");
             self.pstate.scanout_m2.unflip_fallback_source = Some(source_id);
-            self.pstate.scanout_m2.unflip_shadow_ready = false;
+            self.pstate.scanout_m2.unflip_shadow_ready_targets.clear();
             <Self as Backend>::release_present_source(self, source_pin);
             <Self as Backend>::release_present_source(self, fallback_target_pin);
             return Ok(false);
@@ -937,7 +942,7 @@ impl KmsBackend {
             // state for the cursor retirement to discover later.
             self.request_direct_unflip("eligible_direct_present_cursor_commit_pending");
             self.pstate.scanout_m2.unflip_fallback_source = Some(source_id);
-            self.pstate.scanout_m2.unflip_shadow_ready = false;
+            self.pstate.scanout_m2.unflip_shadow_ready_targets.clear();
             <Self as Backend>::release_present_source(self, source_pin);
             <Self as Backend>::release_present_source(self, fallback_target_pin);
             return Ok(false);
@@ -962,7 +967,7 @@ impl KmsBackend {
         self.pstate.scanout_m2.unflip_reason = None;
         self.pstate.scanout_m2.unflip_last_reason = None;
         self.pstate.scanout_m2.unflip_fallback_source = None;
-        self.pstate.scanout_m2.unflip_shadow_ready = false;
+        self.pstate.scanout_m2.unflip_shadow_ready_targets.clear();
         log::debug!(
             "scanout_m2: live direct submit source_id={} present_id={} outputs={}",
             source_id.as_u64(),

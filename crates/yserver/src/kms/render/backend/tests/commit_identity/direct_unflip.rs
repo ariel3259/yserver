@@ -627,6 +627,193 @@ fn issue281_configure_border_change_migrates_materialized_direct_pixels() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: let any ready fallback satisfy every target; the pending fallback's source-pixel assertion must fail.
+fn issue281_configure_migrations_materialize_current_and_pending_fallbacks_independently() {
+    use yserver_core::{backend::Backend, host_x11::HostSubwindowConfig};
+
+    let Some((mut fixture, current)) = direct_fixture(1, P1SceneRoute::Shared, 303, 0) else {
+        return;
+    };
+    let (current_old_id, current_pixels) =
+        configure_migration_fixture(&mut fixture, &current, false);
+    let device_fd = fd(&fixture);
+    let current_record = accepted_records(&submit_direct(&mut fixture, &current, device_fd));
+    assert_eq!(current_record.len(), 1, "current direct frame is accepted");
+    let current_id = accepted_event_id(&current_record[0]).expect("current direct id");
+    complete_direct_initial(&mut fixture, &current_record[0], current_id, device_fd);
+    drain_present_notifications(&mut fixture, &[current.candidate.present_id], &[]);
+
+    let pending = fixture.install_direct_present(304, 0);
+    let (pending_old_id, _) = configure_migration_fixture(&mut fixture, &pending, true);
+    let pending_source_color = 0x0000_55ee;
+    let width = fixture.events.backend.platform.fb_w;
+    let height = fixture.events.backend.platform.fb_h;
+    Backend::fill_rectangle(
+        &mut fixture.events.backend,
+        None,
+        pending.candidate.src_host_xid,
+        pending_source_color,
+        0,
+        0,
+        width,
+        height,
+    )
+    .expect("seed distinct pending direct source through Backend");
+    let pending_pixels = fixture
+        .events
+        .backend
+        .backing_pixels_for_tests(pending.candidate.src_host_xid)
+        .expect("read pending direct source")
+        .2;
+    let pending_offset = record_count(&fixture, device_fd);
+    assert!(
+        Backend::try_present_direct(
+            &mut fixture.events.backend,
+            pending.candidate,
+            pending.event.clone(),
+        )
+        .expect("pending direct successor through Backend"),
+        "active direct ownership admits the pending frame immediately"
+    );
+    let pending_record = accepted_records(&records_since(&fixture, device_fd, pending_offset));
+    assert_eq!(pending_record.len(), 1, "pending direct frame is accepted");
+    let pending_id = accepted_event_id(&pending_record[0]).expect("pending direct id");
+
+    assert_ne!(current_old_id, pending_old_id);
+    assert_eq!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .current
+            .as_ref()
+            .expect("current direct frame remains held")
+            .fallback_target
+            .backing_id(),
+        current_old_id
+    );
+    assert_eq!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .pending
+            .as_ref()
+            .expect("pending direct frame remains held")
+            .fallback_target
+            .backing_id(),
+        pending_old_id
+    );
+
+    Backend::configure_subwindow(
+        &mut fixture.events.backend,
+        None,
+        current.target_xid,
+        HostSubwindowConfig {
+            width: Some(width + 1),
+            height: Some(height + 1),
+            ..HostSubwindowConfig::default()
+        },
+    )
+    .expect("migrate current fallback through a real no-background resize");
+    Backend::configure_subwindow(
+        &mut fixture.events.backend,
+        None,
+        pending.target_xid,
+        HostSubwindowConfig {
+            border_width: Some(1),
+            ..HostSubwindowConfig::default()
+        },
+    )
+    .expect("migrate pending non-overlay fallback through border relayout");
+
+    let current_fallback = fixture.backing_pixels_for_id(current_old_id);
+    let pending_fallback = fixture.backing_pixels_for_id(pending_old_id);
+    let current_replacement = fixture
+        .events
+        .backend
+        .backing_pixels_for_tests(current.target_xid)
+        .expect("read resized current backing");
+    let pending_replacement = fixture
+        .events
+        .backend
+        .backing_pixels_for_tests(pending.target_xid)
+        .expect("read bordered pending backing");
+    let pixel_count = usize::from(width)
+        .checked_mul(usize::from(height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .expect("pixel byte count fits usize");
+    let expected_current = current_pixels[..pixel_count].to_vec();
+    let expected_pending = pending_pixels[..pixel_count].to_vec();
+    let current_migrated = super::support::bgra_region(
+        &current_replacement.2,
+        current_replacement.0,
+        0,
+        0,
+        u32::from(width),
+        u32::from(height),
+    );
+    let pending_migrated = super::support::bgra_region(
+        &pending_replacement.2,
+        pending_replacement.0,
+        1,
+        1,
+        u32::from(width),
+        u32::from(height),
+    );
+    let pixel_assertions = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert!(
+            current_fallback == expected_current,
+            "the current frame's exact fallback is materialized before resize migration; first actual/expected: {:?}/{:?}",
+            &current_fallback[..4],
+            &expected_current[..4]
+        );
+        assert!(
+            current_migrated == expected_current,
+            "the current replacement backing preserves its direct pixels; first actual/expected: {:?}/{:?}",
+            &current_migrated[..4],
+            &expected_current[..4]
+        );
+        assert!(
+            pending_fallback == expected_pending,
+            "the pending frame's distinct fallback is materialized before border migration; first actual/expected: {:?}/{:?}",
+            &pending_fallback[..4],
+            &expected_pending[..4]
+        );
+        assert!(
+            pending_migrated == expected_pending,
+            "the pending replacement backing preserves its own direct pixels; first actual/expected: {:?}/{:?}",
+            &pending_migrated[..4],
+            &expected_pending[..4]
+        );
+    }));
+
+    complete_direct_initial(&mut fixture, &pending_record[0], pending_id, device_fd);
+    drain_present_notifications(
+        &mut fixture,
+        &[pending.candidate.present_id],
+        &[current.candidate.present_id],
+    );
+    let offset = record_count(&fixture, device_fd);
+    let replacement = grouped_unflip_record(&mut fixture, device_fd, offset, 1);
+    let replacement_id = accepted_event_id(&replacement).expect("accepted unflip replacement");
+    complete_recorded_attempt(&mut fixture, device_fd, &replacement, replacement_id, 96);
+    assert!(
+        fixture.events.backend.present_source_pins.is_empty(),
+        "both direct source and fallback pins release after normal unflip retirement"
+    );
+    drain_present_notifications(&mut fixture, &[], &[pending.candidate.present_id]);
+    fixture.finish_after_normal_drain();
+
+    if let Err(payload) = pixel_assertions {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: overwrite the selected reference-output clock when a later output retires.
 fn p1_grouped_direct_awaits_accepted_id_on_every_output() {
     let Some((mut fixture, direct)) = direct_fixture(2, P1SceneRoute::Shared, 201, 0) else {

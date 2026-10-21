@@ -3507,7 +3507,21 @@ fn entry_from_held_direct_with_visible_hw_cursor_runs_handoff() {
             .unflip_outputs_to_replace
             .is_empty()
     );
-    assert!(backend.pstate.scanout_m2.unflip_shadow_ready);
+    let fallback_id = backend
+        .pstate
+        .scanout_m2
+        .current
+        .as_ref()
+        .expect("direct frame fallback remains pinned")
+        .fallback_target
+        .backing_id();
+    assert!(
+        backend
+            .pstate
+            .scanout_m2
+            .unflip_shadow_ready_targets
+            .contains(&fallback_id)
+    );
     assert!(backend.platform.any_cursor_plane_visible());
     assert_eq!(
         recorder.records().last().unwrap().kind,
@@ -3564,7 +3578,13 @@ fn entry_from_held_direct_with_visible_hw_cursor_runs_handoff() {
             .unflip_outputs_to_replace
             .is_empty()
     );
-    assert!(!backend.pstate.scanout_m2.unflip_shadow_ready);
+    assert!(
+        backend
+            .pstate
+            .scanout_m2
+            .unflip_shadow_ready_targets
+            .is_empty()
+    );
     assert!(!backend.scene.has_pending_page_flips());
     assert_direct_queue_drained(&backend);
     let mut expected = vec![AtomicCommitKind::Scene; 9];
@@ -3621,11 +3641,24 @@ fn cursor_handoff_copy_fallback_state_is_replaced() {
             .expect("handoff owner Present uses Copy fallback")
     );
     assert_eq!(backend.pstate.scanout_m2.unflip_fallback_source, Some(f1));
-    assert!(!backend.pstate.scanout_m2.unflip_shadow_ready);
+    assert!(
+        backend
+            .pstate
+            .scanout_m2
+            .unflip_shadow_ready_targets
+            .is_empty()
+    );
 
+    let fallback_id = backend
+        .resolve_paint_target(WINDOW)
+        .expect("Present Copy destination resolves to its backing")
+        .backing_id();
     Backend::note_present_pixmap(&mut backend, candidate.src_pixmap_xid, WINDOW);
     assert_eq!(backend.pstate.scanout_m2.unflip_fallback_source, None);
-    assert!(backend.pstate.scanout_m2.unflip_shadow_ready);
+    assert_eq!(
+        backend.pstate.scanout_m2.unflip_shadow_ready_targets,
+        std::collections::HashSet::from([fallback_id])
+    );
     Backend::maybe_composite(&mut backend).expect("replace direct frame using F1 shadow");
     assert!(backend.pstate.scanout_m2.current.is_some());
     retire_composed_frame(&mut backend, &mut state, 62);
@@ -3913,7 +3946,13 @@ fn handoff_keeps_newest_copy_not_retained_direct_frame() {
             .unflip_outputs_to_replace
             .is_empty()
     );
-    assert!(!backend.pstate.scanout_m2.unflip_shadow_ready);
+    assert!(
+        backend
+            .pstate
+            .scanout_m2
+            .unflip_shadow_ready_targets
+            .is_empty()
+    );
     assert!(!backend.platform.any_cursor_plane_visible());
     assert!(!backend.scene.has_pending_page_flips());
     assert_direct_queue_drained(&backend);
@@ -4698,7 +4737,13 @@ fn copies_keep_copy_completion_with_composed_async() {
     assert!(backend.pstate.tearing.is_on());
     assert!(!backend.pstate.scanout_m2.active());
     assert!(!backend.pstate.scanout_m2.unflip_requested);
-    assert!(!backend.pstate.scanout_m2.unflip_shadow_ready);
+    assert!(
+        backend
+            .pstate
+            .scanout_m2
+            .unflip_shadow_ready_targets
+            .is_empty()
+    );
     assert_direct_queue_drained(&backend);
     assert_commit_sequence(
         &recorder,

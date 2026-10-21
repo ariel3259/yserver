@@ -1,5 +1,22 @@
 use super::*;
 
+fn mark_active_fallback_ready_for_test(backend: &mut KmsBackend) {
+    let target = backend
+        .pstate
+        .scanout_m2
+        .pending
+        .as_ref()
+        .or(backend.pstate.scanout_m2.current.as_ref())
+        .expect("direct frame for fallback readiness")
+        .fallback_target
+        .backing_id();
+    backend
+        .pstate
+        .scanout_m2
+        .unflip_shadow_ready_targets
+        .insert(target);
+}
+
 fn output_crtc_key(backend: &KmsBackend, output_idx: usize) -> CrtcKey {
     CrtcKey::for_output(&backend.platform.outputs[output_idx])
 }
@@ -870,7 +887,7 @@ fn final_cow_release_defers_storage_until_direct_replacement() {
     // The production path may already have prepared the lazy COW shadow
     // before the protocol release reaches us. Keep this unit test free of
     // Vulkan while exercising the ownership/deferral transition itself.
-    b.pstate.scanout_m2.unflip_shadow_ready = true;
+    mark_active_fallback_ready_for_test(&mut b);
 
     let final_release = b.release_overlay_window(None).expect("final COW release");
 
@@ -935,7 +952,7 @@ fn get_cow_during_deferred_release_reuses_backend_identity() {
     b.get_overlay_window(None).expect("materialize COW");
     let cow_id = b.cow_id.expect("COW id");
     let _ = install_direct_frame_for_target_test(&mut b, target_xid, cow_id, true);
-    b.pstate.scanout_m2.unflip_shadow_ready = true;
+    mark_active_fallback_ready_for_test(&mut b);
     assert!(b.release_overlay_window(None).expect("final release"));
 
     let rematerialized = b.get_overlay_window(None).expect("reclaim deferred COW");
@@ -1119,7 +1136,7 @@ fn logical_resize_keeps_old_cow_pinned_until_direct_replacement() {
     let old_cow_id = b.cow_id.expect("old COW id");
     let (source_id, _, source_pin, cow_pin) =
         install_direct_frame_for_target_test(&mut b, target_xid, old_cow_id, true);
-    b.pstate.scanout_m2.unflip_shadow_ready = true;
+    mark_active_fallback_ready_for_test(&mut b);
     let new_w = b.platform.fb_w.saturating_add(1);
     let new_h = b.platform.fb_h.saturating_add(1);
 
@@ -2803,7 +2820,7 @@ fn cursor_einval_rolls_back_and_hide_recovery_is_motion_driven_and_bounded() {
         recovered_backend.platform.scanout_pools[output_idx] =
             Some(crate::kms::vk::scanout::OutputScanout::Shared(pool));
     }
-    recovered_backend.pstate.scanout_m2.unflip_shadow_ready = true;
+    mark_active_fallback_ready_for_test(&mut recovered_backend);
     Backend::maybe_composite(&mut recovered_backend).expect("submit cursorless composed unflip");
     assert_eq!(recorder.records().len(), 3);
     assert_atomic_cursorless_scene_record(&recorder.records()[2], position);
@@ -3501,7 +3518,7 @@ fn direct_successor_waits_for_retirement_and_carries_motion() {
 
     draw_atomic_cursor_test_root_overlay(&mut backend, 2);
     assert!(!backend.scene.root_overlay.is_empty());
-    backend.pstate.scanout_m2.unflip_shadow_ready = true;
+    mark_active_fallback_ready_for_test(&mut backend);
     Backend::warp_pointer_root(&mut backend, &mut state, 1320, 330);
     let unflip_positions = backend
         .platform
@@ -3987,7 +4004,7 @@ fn shape_triggered_composed_unflip_records_cursor_positions_for_both_outputs() {
         u16::try_from(width).expect("test root width"),
         u16::try_from(height).expect("test root height"),
     );
-    backend.pstate.scanout_m2.unflip_shadow_ready = true;
+    mark_active_fallback_ready_for_test(&mut backend);
 
     Backend::set_shape_rectangles(&mut backend, None, cow, 0, Some(&[]))
         .expect("empty COW bounding shape");

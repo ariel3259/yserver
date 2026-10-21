@@ -340,7 +340,10 @@ impl RecordingSceneFixture {
             direct.unflip_fallback_source.is_none(),
             "an unflip fallback source remains held"
         );
-        assert!(!direct.unflip_shadow_ready, "unflip shadow remains armed");
+        assert!(
+            direct.unflip_shadow_ready_targets.is_empty(),
+            "unflip shadow targets remain armed"
+        );
         assert!(
             !direct.degraded_composed_unflip,
             "degraded composed unflip remains active"
