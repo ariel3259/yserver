@@ -1,6 +1,6 @@
 # Cursor frame handoff (P3)
 
-Date: 2026-10-20; revision 2 2026-10-21. Branch `feat/cursor-frame-handoff`, based on master `02e1a3af` (P2, PR #276, merged as one commit whose tree is identical to the reviewed P2 branch head `d5d04aae`) and merged P1 DRM commit identity. Resolves issue #279.
+Date: 2026-10-20; revision 2 2026-10-21. Branch `feat/cursor-frame-handoff`, based on master `8e71c788`: P2 (PR #276, merged as `02e1a3af`, tree identical to the reviewed P2 branch head `d5d04aae`) plus the #273 monitor-disconnect and device-wide clear fixes that amend P2 R23, and merged P1 DRM commit identity. Resolves issue #279.
 
 This is the third extraction from the read-only reference tree `/home/ariel_santangelo/Projects/yserver-cursor`, HEAD `9023da14`. The split inventory at `/home/ariel_santangelo/Projects/claude-scratch/atomic-cursor-split/inventory.md` is a map; both worktrees were checked, and source at the stated revisions is authoritative. This spec depends on the behavioral rules in [P2](2026-10-19-cursor-sprite-state-design.md) and [P1](2026-10-19-drm-commit-identity-design.md), not on their private implementation names.
 
@@ -44,7 +44,7 @@ P3 depends on the P2 behavior in the table below and the P1 accepted-commit iden
 | R20 | Provided; needs change — P3 supersedes position-only primary deltas. |
 | R21 | Provided; needs change — P3 retains complete image/show/hide/hotspot/motion intent. |
 | R22 | Provided — successful blocking detach settles distinct applied/prior users, including an in-flight hide. |
-| R23 | Provided for existing owners; needs change — staged frames must also be canceled during invalidation, discard, removal and disabled-CRTC cleanup. |
+| R23 | Provided for existing owners (as amended on master for #273); needs change — staged frames must also be canceled during invalidation, discard, removal, disabled-CRTC cleanup and the shutdown device-wide clear, which settles every CRTC of a cleared device without a per-output detach. A physically disconnected output keeps its route, CRTC and cursor ownership, so its frames and cursor intent continue under the normal rules; only a connected connector with no usable mode is removed. The VT-resume device-wide clear settles nothing. |
 | R24 | Provided — assignment remains fixed; reassignment remains P5. |
 | R25 | Provided; needs change — P3 retains a safe Legacy handoff adapter until its replacement is designed. |
 
@@ -208,5 +208,5 @@ This spec uses original prose and contains no copied or paraphrased copyleft exc
 
 ## Revision 2 changes (2026-10-21)
 
-- Rebased onto master `02e1a3af` after P2 (#276) merged; the merged tree equals the reviewed P2 head, so no P2 dependency changed.
+- Rebased onto master `8e71c788`: P2 (#276) merged with a tree equal to the reviewed P2 head, followed by the #273 fixes (disconnect keeps the CRTC lit; VT resume and shutdown clear the whole device; shutdown settles every CRTC of a cleared device). P2 R23 dependency row updated accordingly: staged frames are also canceled at the shutdown device-wide clear, and disconnected outputs keep their cursor ownership.
 - Issue #279: problem statement with cause and the P2 validation gap; new R14 (a newer cursor image never makes a visible hardware cursor disappear — Atomic already covered by R1–R5, Legacy adapter binds the newest live image instead of hiding on a superseded show); R5 Legacy clause points to R14; B row R14 with the restore-hide mutation; C adds native-delay theme animations on AMD and NVIDIA, reproduction on P2 first, dual-output and Legacy hardware recorded as uncovered.
