@@ -1187,6 +1187,13 @@ impl KmsBackend {
         match batch.phase {
             ComposedUnflipPhase::Accepted { .. } => return Ok(false),
             ComposedUnflipPhase::Cancelling => {
+                if batch
+                    .prepare_deadline
+                    .is_some_and(|deadline| self.monotonic_now() >= deadline)
+                {
+                    self.handle_composed_unflip_prepare_timeout()?;
+                    return Ok(false);
+                }
                 self.finish_composed_unflip_cancellation()?;
                 return Ok(false);
             }
@@ -1680,7 +1687,22 @@ impl KmsBackend {
             return Ok(());
         };
         if batch.prepare_attempt == 1 {
-            return self.begin_composed_unflip_cancellation(false);
+            let first_deadline = batch.phase == ComposedUnflipPhase::Preparing;
+            if first_deadline {
+                self.begin_composed_unflip_cancellation(false)?;
+                let cancellation_deadline =
+                    self.monotonic_now() + std::time::Duration::from_secs(2);
+                if let Some(batch) = self.pstate.scanout_m2.composed_unflip.as_mut()
+                    && batch.phase == ComposedUnflipPhase::Cancelling
+                {
+                    // A cancelled writer can still own its target. Give its
+                    // safe-dependency notification a bounded chance to arrive;
+                    // the one-shot deadline below performs the bounded fence
+                    // recheck if that notification is lost.
+                    batch.prepare_deadline = Some(cancellation_deadline);
+                }
+                return Ok(());
+            }
         }
 
         let identities = self.scene.pending_unflip_frame_identities();
@@ -1778,6 +1800,28 @@ impl KmsBackend {
         };
 
         if all_dependencies_safe {
+            if self
+                .pstate
+                .scanout_m2
+                .composed_unflip
+                .as_ref()
+                .is_some_and(|batch| batch.phase == ComposedUnflipPhase::Cancelling)
+            {
+                let notifications =
+                    crate::kms::render::scene::OutputSink::drain_render_notifications(
+                        &mut self.platform,
+                    );
+                for notification in notifications {
+                    if !self.scene.handle_render_notification(
+                        notification,
+                        &mut self.store,
+                        &mut self.platform,
+                    ) {
+                        self.telemetry.record_missed_pageflip();
+                    }
+                }
+                return self.finish_composed_unflip_cancellation();
+            }
             return self.begin_composed_unflip_cancellation(false);
         }
         let prepare_deadline = self.monotonic_now() + std::time::Duration::from_secs(2);
@@ -1793,7 +1837,7 @@ impl KmsBackend {
             );
             batch.timeout_error_logged = true;
         }
-        batch.phase = ComposedUnflipPhase::Quarantined;
+        batch.phase = ComposedUnflipPhase::Cancelling;
         batch.prepare_deadline = Some(prepare_deadline);
         Ok(())
     }
@@ -1845,12 +1889,6 @@ impl KmsBackend {
                 .unflip_outputs_to_replace
                 .remove(&output_idx);
             let degraded = self.pstate.scanout_m2.degraded_composed_unflip;
-            let cursor_handoff =
-                !degraded && self.pstate.scanout_m2.unflip_reason == Some("tearing_cursor_handoff");
-            if cursor_handoff {
-                self.scene
-                    .retire_external_cursor_handoff(output_idx, &mut self.platform);
-            }
             if self.pstate.scanout_m2.unflip_outputs_to_replace.is_empty() {
                 self.stop_direct_after_scanout_replaced(if degraded {
                     "degraded composed unflip"
@@ -2822,9 +2860,10 @@ impl KmsBackend {
                 ComposedUnflipPhase::Quarantined => batch
                     .prepare_deadline
                     .is_some_and(|deadline| self.monotonic_now() >= deadline),
-                ComposedUnflipPhase::Idle
-                | ComposedUnflipPhase::Cancelling
-                | ComposedUnflipPhase::Accepted { .. } => false,
+                ComposedUnflipPhase::Cancelling => batch
+                    .prepare_deadline
+                    .is_some_and(|deadline| self.monotonic_now() >= deadline),
+                ComposedUnflipPhase::Idle | ComposedUnflipPhase::Accepted { .. } => false,
             };
         }
         if self.pstate.scanout_m2.pending.is_some()
@@ -3121,13 +3160,12 @@ impl KmsBackend {
                     batch.prepare_deadline
                 }
                 ComposedUnflipPhase::RetryWaiting => batch.retry_at,
+                ComposedUnflipPhase::Cancelling => batch.prepare_deadline,
                 ComposedUnflipPhase::Ready => {
                     let outputs: Vec<_> = (0..self.platform.outputs.len()).collect();
                     (!self.platform.cursor_commit_in_flight_for_outputs(&outputs)).then_some(now)
                 }
-                ComposedUnflipPhase::Idle
-                | ComposedUnflipPhase::Cancelling
-                | ComposedUnflipPhase::Accepted { .. } => None,
+                ComposedUnflipPhase::Idle | ComposedUnflipPhase::Accepted { .. } => None,
             });
         let scene_deadline = if allow_kms_timers {
             if self.scene_wants_compose() {
@@ -3345,6 +3383,25 @@ impl KmsBackend {
                 && self.pstate.scanout_m2.unflip_requested
                 && !self.pstate.scanout_m2.degraded_composed_unflip
             {
+                if self
+                    .pstate
+                    .scanout_m2
+                    .composed_unflip
+                    .as_ref()
+                    .is_some_and(|batch| batch.phase == ComposedUnflipPhase::Preparing)
+                    && self.scene_wants_scene()
+                    && self.scene.has_output_ready_for_submit(
+                        &self.platform,
+                        crate::kms::render::scene::FrameSubmitMode::DeferredUnflip,
+                    )
+                {
+                    // A pending acknowledgement or retry deadline may have
+                    // skipped one output during the previous deferred tick.
+                    // Re-enter the production scene tick when that output is
+                    // runnable so the batch can make progress without waiting
+                    // for unrelated scene input.
+                    self.compose_tick(crate::kms::render::scene::FrameSubmitMode::DeferredUnflip);
+                }
                 let result = if self.pstate.scanout_m2.composed_unflip.is_some() {
                     self.advance_composed_unflip()
                 } else {

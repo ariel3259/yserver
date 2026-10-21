@@ -165,7 +165,7 @@ fn request_unflip(fixture: &mut RecordingSceneFixture, direct: &DirectPresentSet
     );
 }
 
-fn drain_present_notifications(
+pub(crate) fn drain_present_notifications(
     fixture: &mut RecordingSceneFixture,
     expected_completed: &[u64],
     expected_idled: &[u64],
@@ -214,9 +214,40 @@ fn drain_present_notifications(
     }
 }
 
-fn assert_issue281_unflip_end_state(fixture: &RecordingSceneFixture, present_id: u64) {
+pub(crate) fn assert_issue281_unflip_end_state(fixture: &RecordingSceneFixture, present_id: u64) {
     let after_all_off = fixture.events.backend.pstate.vt_state != crate::vt::state::VtState::Active;
     assert_issue281_unflip_end_state_with_lifecycle(fixture, present_id, after_all_off);
+}
+
+pub(crate) fn assert_issue281_unflip_backend_end_state(
+    backend: &crate::kms::render::backend::KmsBackend,
+) {
+    assert!(backend.pstate.scanout_m2.composed_unflip.is_none());
+    assert!(backend.pstate.scanout_m2.pending.is_none());
+    assert!(backend.pstate.scanout_m2.current.is_none());
+    assert!(backend.pstate.scanout_m2.queued_successor.is_none());
+    assert!(backend.pstate.scanout_m2.unflip_awaiting_outputs.is_empty());
+    assert!(backend.scene.pending_unflip_frame_identities().is_empty());
+    assert!(!backend.scene.has_pending_page_flips());
+    assert!(
+        backend
+            .platform
+            .for_tests_pending_scanout_render_job_ids()
+            .is_empty()
+    );
+    assert_eq!(backend.platform.for_tests_unflip_owned_fd_count(), 0);
+    assert!(
+        backend
+            .platform
+            .scanout_pools
+            .iter()
+            .filter_map(Option::as_ref)
+            .flat_map(|scanout| scanout.display_pool().bos.iter())
+            .all(|bo| {
+                matches!(bo.state.phase, BoPhase::Free | BoPhase::OnScreen)
+                    && bo.state.in_fence_fd.is_none()
+            })
+    );
 }
 
 fn assert_issue281_unflip_end_state_after_all_off(
@@ -231,6 +262,7 @@ fn assert_issue281_unflip_end_state_with_lifecycle(
     present_id: u64,
     after_all_off: bool,
 ) {
+    assert_issue281_unflip_backend_end_state(&fixture.events.backend);
     assert!(
         fixture
             .events
@@ -253,6 +285,15 @@ fn assert_issue281_unflip_end_state_with_lifecycle(
             .for_tests_pending_scanout_render_job_ids()
             .is_empty(),
         "no render-completion or safe-dependency notification remains"
+    );
+    assert_eq!(
+        fixture
+            .events
+            .backend
+            .platform
+            .for_tests_unflip_owned_fd_count(),
+        0,
+        "no scanout fence fd remains owned by an unflip ledger or BO"
     );
     if after_all_off {
         fixture.assert_quiescent_after_all_off();
@@ -318,7 +359,10 @@ fn grouped_unflip_record(
         .expect("grouped composed replacement accepted")
 }
 
-fn primary_fb_value(record: &AtomicCommitRecord, output: &crate::drm::modeset::Output) -> u32 {
+pub(crate) fn primary_fb_value(
+    record: &AtomicCommitRecord,
+    output: &crate::drm::modeset::Output,
+) -> u32 {
     let value = record
         .properties
         .iter()
@@ -1549,8 +1593,8 @@ fn issue281_copied_only_unflip_uses_sink_dependency_and_signalled_sentinel() {
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Boundary test: the shared subcase releases a held platform row only at its
 // deadline; the copied subcase replaces readiness with an unsignalled eventfd
-// after the first safe retry. Mutation: route the second deadline through
-// wait_idle_bounded or treat its timeout as writer safety.
+// after the first safe retry. Mutations: omit the cancellation deadline, route
+// the second deadline through wait_idle_bounded, or treat its timeout as writer safety.
 fn issue281_unflip_prepare_timeout_recovers_lost_and_cancelled_readiness() {
     let Some((mut lost, lost_direct)) = direct_fixture(1, P1SceneRoute::Shared, 290, 0) else {
         return;
@@ -1666,9 +1710,72 @@ fn issue281_unflip_prepare_timeout_recovers_lost_and_cancelled_readiness() {
         .as_ref()
         .and_then(|batch| batch.prepare_deadline)
         .expect("first copied prepare deadline is armed");
+    // Complete the real render first, then replace its completion descriptor
+    // with a test eventfd. This withholds only notification delivery: the BO
+    // is already writer-safe, while cancellation must retain its one-shot
+    // deadline instead of becoming dormant.
+    cancelled.events.wait_for_submitted_gpu_work();
+    let cancelled_eventfd: std::os::fd::OwnedFd = nix::sys::eventfd::EventFd::from_value_and_flags(
+        0,
+        nix::sys::eventfd::EfdFlags::EFD_CLOEXEC | nix::sys::eventfd::EfdFlags::EFD_NONBLOCK,
+    )
+    .expect("create first-attempt cancellation notification gate")
+    .into();
+    let cancelled_witness = cancelled_eventfd
+        .try_clone()
+        .expect("retain the first-attempt cancellation gate");
+    let replaced = cancelled
+        .events
+        .backend
+        .platform
+        .for_tests_replace_pending_render_completion_fd(first_job, cancelled_eventfd)
+        .expect("replace the completed source fence with its notification gate");
+    drop(replaced);
     cancelled_clock.set(first_deadline);
     Backend::maybe_composite(&mut cancelled.events.backend)
-        .expect("cancel only dependency-safe first attempt work");
+        .expect("cancel first attempt without losing its recovery deadline");
+    let cancellation_deadline = cancelled
+        .events
+        .backend
+        .pstate
+        .scanout_m2
+        .composed_unflip
+        .as_ref()
+        .and_then(|batch| batch.prepare_deadline)
+        .expect("pending cancellation retains a one-shot deadline");
+    assert!(cancellation_deadline > first_deadline);
+    assert_eq!(
+        Backend::next_wakeup(&cancelled.events.backend),
+        Some(cancellation_deadline),
+        "the core loop is scheduled to recheck a lost safe-dependency notification"
+    );
+    assert!(matches!(
+        cancelled
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .composed_unflip
+            .as_ref()
+            .expect("cancellation remains active")
+            .phase,
+        crate::kms::render::backend::ComposedUnflipPhase::Cancelling
+    ));
+    let one = 1u64;
+    // SAFETY: the witness keeps the eventfd live and write consumes one u64.
+    let written = unsafe {
+        libc::write(
+            std::os::fd::AsRawFd::as_raw_fd(&cancelled_witness),
+            (&one as *const u64).cast(),
+            std::mem::size_of_val(&one),
+        )
+    };
+    assert_eq!(written, std::mem::size_of_val(&one) as isize);
+    source_readiness.release_ready_job(first_job);
+    Backend::on_scanout_render_completion(
+        &mut cancelled.events.backend,
+        &mut cancelled.events.state,
+    );
 
     let retry_job = cancelled
         .pending_render_job_ids()
@@ -1744,7 +1851,7 @@ fn issue281_unflip_prepare_timeout_recovers_lost_and_cancelled_readiness() {
             .as_ref()
             .expect("writer-unsafe batch remains active")
             .phase,
-        crate::kms::render::backend::ComposedUnflipPhase::Quarantined
+        crate::kms::render::backend::ComposedUnflipPhase::Cancelling
     ));
     assert_eq!(
         direct_source_pins(&cancelled, cancelled_direct.source_id),
@@ -3487,7 +3594,7 @@ fn p1_degraded_copied_unflip_registers_immediately_accepted_replacement() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutations: record source-render readiness as a sink ID; select the grouped rejection instead of the rejected sink submit.
+// Mutations: recycle before the final dependency is safe, choose another BO for fallback, or publish source readiness as a sink ID.
 fn p1_degraded_copied_unflip_has_no_id_before_sink_acceptance() {
     let Some((mut fixture, direct)) = direct_fixture(1, P1SceneRoute::CopiedSameDevice, 207, 0)
     else {
@@ -3553,7 +3660,47 @@ fn p1_degraded_copied_unflip_has_no_id_before_sink_acceptance() {
         1,
         "the grouped rejection covers this output"
     );
-    assert_eq!(rejected_group.events.len(), 1);
+    let rejected_fb = primary_fb_value(
+        rejected_group,
+        &fixture.events.backend.platform.outputs[0].output,
+    );
+    let rejected_bo_idx = fixture.events.backend.platform.scanout_pools[0]
+        .as_ref()
+        .expect("copied scanout pool")
+        .display_pool()
+        .bos
+        .iter()
+        .position(|bo| bo.fb_handle.is_some_and(|fb| u32::from(fb) == rejected_fb))
+        .expect("rejected grouped FB names its copied destination");
+    let rejected_bo = &fixture.events.backend.platform.scanout_pools[0]
+        .as_ref()
+        .unwrap()
+        .display_pool()
+        .bos[rejected_bo_idx];
+    assert!(matches!(
+        rejected_bo.state.phase,
+        BoPhase::Free | BoPhase::Submitted
+    ));
+    if rejected_bo.state.phase == BoPhase::Submitted {
+        assert!(
+            rejected_bo.state.in_fence_fd.is_some(),
+            "an unsignalled final dependency keeps the copied destination reserved"
+        );
+    } else {
+        assert_eq!(
+            primary_in_fence_value(
+                rejected_group,
+                &fixture.events.backend.platform.outputs[0].output,
+            ),
+            u64::MAX,
+            "a signalled None dependency permits inline cancellation"
+        );
+    }
+    assert_eq!(
+        fixture.events.backend.scene.pending_page_flip_event_id(0),
+        None,
+        "a rejected grouped request publishes no KMS identity"
+    );
     assert!(accepted_records(&sink_attempts).is_empty());
     assert_eq!(
         fixture
@@ -3586,6 +3733,14 @@ fn p1_degraded_copied_unflip_has_no_id_before_sink_acceptance() {
         .into_iter()
         .find(|record| record.events.len() == 1 && accepted_event_id(record).is_some())
         .expect("safe cancellation permits the per-output copied replacement");
+    assert_eq!(
+        primary_fb_value(
+            &accepted,
+            &fixture.events.backend.platform.outputs[0].output
+        ),
+        rejected_fb,
+        "the degraded path reuses the dependency-safe copied BO"
+    );
     let accepted_id = accepted_event_id(&accepted).unwrap();
     assert_eq!(
         fixture

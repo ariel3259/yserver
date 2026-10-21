@@ -302,6 +302,30 @@ impl RecordingSceneFixture {
             .expect("read drawable backing pixels")
     }
 
+    /// Read the drawable allocation backing the exact scanout BO selected by
+    /// an atomic FB_ID. This keeps acceptance checks on the committed BO and
+    /// avoids root readback, which could render a different image.
+    pub(crate) fn scanout_pixels_named_by_fb(&mut self, output_idx: usize, fb_id: u32) -> Vec<u8> {
+        let bo_idx = self.events.backend.platform.scanout_pools[output_idx]
+            .as_ref()
+            .expect("scanout output pool")
+            .display_pool()
+            .bos
+            .iter()
+            .position(|bo| bo.fb_handle.is_some_and(|fb| u32::from(fb) == fb_id))
+            .expect("recorded FB_ID names a scanout BO");
+        let xid = 0x6a00
+            + u32::try_from(output_idx).expect("output index fits") * 0x10
+            + u32::try_from(bo_idx).expect("BO index fits");
+        let id = self
+            .events
+            .backend
+            .store
+            .lookup(xid)
+            .expect("scanout BO drawable backing remains live");
+        self.backing_pixels_for_id(id)
+    }
+
     pub(crate) fn track_extra_drawable(&mut self, xid: u32) {
         self.extra_drawables.push(xid);
     }
@@ -377,6 +401,11 @@ impl RecordingSceneFixture {
         assert!(
             backend.platform.for_tests_unflip_ready_state_is_empty(),
             "platform retains an unflip batch context or prepared plane"
+        );
+        assert_eq!(
+            backend.platform.for_tests_unflip_owned_fd_count(),
+            0,
+            "no scanout fence fd remains owned by an unflip ledger or BO"
         );
         assert_eq!(
             backend.scene.pending_pool_release_count_for_tests(),

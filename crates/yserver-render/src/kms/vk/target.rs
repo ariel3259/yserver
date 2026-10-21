@@ -25,6 +25,17 @@ use ash::vk;
 
 use super::device::VkContext;
 
+fn image_usage_allows_view(usage: vk::ImageUsageFlags) -> bool {
+    usage.intersects(
+        vk::ImageUsageFlags::SAMPLED
+            | vk::ImageUsageFlags::STORAGE
+            | vk::ImageUsageFlags::COLOR_ATTACHMENT
+            | vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+            | vk::ImageUsageFlags::TRANSIENT_ATTACHMENT
+            | vk::ImageUsageFlags::INPUT_ATTACHMENT,
+    )
+}
+
 /// Per-drawable Vulkan image. Lives as long as the X drawable does;
 /// dropped when the client calls `DestroyWindow` / `FreePixmap`.
 pub struct DrawableImage {
@@ -579,25 +590,32 @@ impl DrawableImage {
             return Err(e.into());
         }
 
-        let view_info = vk::ImageViewCreateInfo::default()
-            .image(image)
-            .view_type(vk::ImageViewType::TYPE_2D)
-            .format(format)
-            .subresource_range(
-                vk::ImageSubresourceRange::default()
-                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                    .level_count(1)
-                    .layer_count(1),
-            );
-        let view = match unsafe { vk.device.create_image_view(&view_info, None) } {
-            Ok(v) => v,
-            Err(e) => {
-                unsafe {
-                    crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
-                    vk.device.destroy_image(image, None);
+        let view = if image_usage_allows_view(usage) {
+            let view_info = vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(format)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                );
+            match unsafe { vk.device.create_image_view(&view_info, None) } {
+                Ok(v) => v,
+                Err(e) => {
+                    unsafe {
+                        crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
+                        vk.device.destroy_image(image, None);
+                    }
+                    return Err(e.into());
                 }
-                return Err(e.into());
             }
+        } else {
+            // A transfer-only DMA-BUF alias is used as a copy source and
+            // cannot legally have a VkImageView. Keep the null handle in the
+            // drawable record; that path never binds the alias for sampling.
+            vk::ImageView::null()
         };
 
         Ok(Self {
@@ -800,6 +818,9 @@ impl DrawableImage {
     /// without knowing the underlying format. Built once per
     /// mirror; reused for every Composite that uses it as mask.
     pub fn mask_image_view(&mut self) -> Result<vk::ImageView, vk::Result> {
+        if self.vk_image_view == vk::ImageView::null() {
+            return Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED);
+        }
         if self.format == vk::Format::B8G8R8A8_UNORM {
             return Ok(self.vk_image_view);
         }
@@ -1200,7 +1221,9 @@ impl Drop for DrawableImage {
             if let Some(v) = self.no_alpha_src_view.take() {
                 self.vk.device.destroy_image_view(v, None);
             }
-            self.vk.device.destroy_image_view(self.vk_image_view, None);
+            if self.vk_image_view != vk::ImageView::null() {
+                self.vk.device.destroy_image_view(self.vk_image_view, None);
+            }
             self.vk.device.destroy_image(self.vk_image, None);
             match &self.backing {
                 ImageBacking::ServerOwned { vk_memory }
@@ -1863,6 +1886,15 @@ fn _compile_check_from_dmabuf(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    // Mutation: treat TRANSFER_SRC as view-compatible and attempt the invalid view creation.
+    fn transfer_only_imports_do_not_create_an_image_view() {
+        assert!(!image_usage_allows_view(vk::ImageUsageFlags::TRANSFER_SRC));
+        assert!(image_usage_allows_view(
+            vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::SAMPLED
+        ));
+    }
 
     fn nvidia_probe_memory_properties() -> vk::PhysicalDeviceMemoryProperties {
         let types = [

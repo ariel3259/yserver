@@ -846,7 +846,7 @@ fn p2_accepted_scene_position_updates_the_applied_state() {
 
 #[test]
 #[ignore = "requires the lavapipe GPU scene fixture"]
-// Mutation: append FB_ID to a position carrier or use the staged image hotspot.
+// Mutations: select the retained BO, repaint only a partial scene, append FB_ID, or use the staged hotspot.
 fn p2_scene_direct_copied_and_unflip_commits_carry_only_the_applied_position() {
     {
         let Some(mut fixture) = atomic_fixture(
@@ -896,6 +896,27 @@ fn p2_scene_direct_copied_and_unflip_commits_carry_only_the_applied_position() {
         let start = records(&fixture, hardware).len();
         let direct = enter_held_direct(&mut fixture, &mut delivered, 7)
             .expect("admit direct scanout through Backend");
+        let fresh_pixel = [0x31, 0x51, 0xa1, 0xff];
+        let mut fresh_source = Vec::with_capacity(
+            usize::from(direct.candidate.src_width) * usize::from(direct.candidate.src_height) * 4,
+        );
+        for _ in
+            0..usize::from(direct.candidate.src_width) * usize::from(direct.candidate.src_height)
+        {
+            fresh_source.extend_from_slice(&fresh_pixel);
+        }
+        Backend::put_image(
+            &mut fixture.scene.events.backend,
+            None,
+            direct.candidate.src_pixmap_xid,
+            24,
+            direct.candidate.src_width,
+            direct.candidate.src_height,
+            0,
+            0,
+            &fresh_source,
+        )
+        .expect("paint fresh direct source pixels through Backend");
         let direct_record = records(&fixture, hardware)
             .into_iter()
             .skip(start)
@@ -939,11 +960,54 @@ fn p2_scene_direct_copied_and_unflip_commits_carry_only_the_applied_position() {
             })
             .expect("composed unflip carries the applied cursor position");
         assert_position_only(&unflip, properties, (binding.x, binding.y));
+        fixture.scene.events.wait_for_submitted_gpu_work();
+        let replacement_pixels = fixture.scene.scanout_pixels_named_by_fb(
+            0,
+            super::super::commit_identity::direct_unflip::primary_fb_value(
+                &unflip,
+                &fixture.scene.events.backend.platform.outputs[0].output,
+            ),
+        );
+        let fallback_id = fixture
+            .scene
+            .events
+            .backend
+            .store
+            .lookup(direct.target_xid)
+            .expect("ineligible Present Copy leaves its fallback backing live");
+        let fallback_pixels = fixture.scene.backing_pixels_for_id(fallback_id);
+        let output = &fixture.scene.events.backend.platform.outputs[0];
+        let sample_x = usize::from(output.width / 2);
+        let sample_y = usize::from(output.height / 2);
+        let scanout_offset = (sample_y * usize::from(output.width) + sample_x) * 4;
+        let fallback_offset =
+            (sample_y * usize::from(fixture.scene.events.backend.platform.fb_w) + sample_x) * 4;
+        assert!(scanout_offset + 4 <= replacement_pixels.len());
+        assert!(fallback_offset + 4 <= fallback_pixels.len());
+        assert_ne!(
+            &fallback_pixels[fallback_offset..fallback_offset + 3],
+            &[0, 0, 0],
+            "the ordinary Present Copy produced pixels distinct from the retained blank scene"
+        );
+        assert_eq!(
+            &replacement_pixels[scanout_offset..scanout_offset + 3],
+            &fallback_pixels[fallback_offset..fallback_offset + 3],
+            "the grouped primary FB carries current fallback pixels at the output center"
+        );
         assert_eq!(
             sprite_users(&fixture.scene.events.backend, 0, binding.lease),
             users
         );
         retire_cursor_record(&mut fixture, &mut delivered, 0, &unflip, 52);
+        super::super::commit_identity::direct_unflip::drain_present_notifications(
+            &mut fixture.scene,
+            &[direct.candidate.present_id],
+            &[direct.candidate.present_id],
+        );
+        super::super::commit_identity::direct_unflip::assert_issue281_unflip_end_state(
+            &fixture.scene,
+            direct.candidate.present_id,
+        );
         finish(fixture, &mut delivered, hardware);
     }
 

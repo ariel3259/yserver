@@ -3370,8 +3370,8 @@ fn initial_sw_cursor_enters_tearing() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: trigger the handoff from cursor_mode() instead of desired visibility.
-fn show_cursor_during_held_direct_hidden_tearing_makes_cursor_visible() {
+// Mutation: use the ineligible-Present reason instead of the tearing handoff; the reason assertion must fail.
+fn p2_tearing_cursor_handoff_transitions_cursor_once() {
     use yserver_core::{backend::Backend, server::ServerState};
 
     const WINDOW: u32 = 0x7802;
@@ -3400,19 +3400,71 @@ fn show_cursor_during_held_direct_hidden_tearing_makes_cursor_visible() {
             .allows(crate::drm::async_flip::AsyncStream::Direct, &shape,)
     );
 
+    let (show_executor, hide_executor) = install_cursor_plane_with_successful_show(&mut backend);
+    let crtc = backend.platform.outputs[0].output.crtc;
     Backend::set_cursor_hidden(&mut backend, false);
+    backend.platform.devices[0]
+        .cursor
+        .plane
+        .as_mut()
+        .expect("test cursor plane")
+        .for_tests_set_visible(crtc, true);
+    assert!(backend.platform.any_cursor_plane_visible());
+    let unflip_start = recorder.records().len();
+    Backend::maybe_composite(&mut backend).expect("prepare visible cursor handoff");
     assert!(backend.pstate.scanout_m2.unflip_requested);
     assert_eq!(
         backend.pstate.scanout_m2.unflip_reason,
         Some("tearing_cursor_handoff")
     );
     assert!(backend.pstate.scanout_m2.current.is_some());
-    Backend::maybe_composite(&mut backend).expect("submit grouped cursor handoff");
-    assert!(!recorder.records().is_empty());
+    let unflip_records: Vec<_> = recorder
+        .records()
+        .into_iter()
+        .skip(unflip_start)
+        .filter(|record| {
+            record.kind != AtomicCommitKind::CursorOnly
+                && record.result == crate::drm::atomic::tests_support::ScriptedResult::Ok
+        })
+        .collect();
+    assert_eq!(
+        unflip_records.len(),
+        1,
+        "handoff uses one grouped replacement"
+    );
+    assert_eq!(
+        unflip_records[0].events.len(),
+        backend.platform.outputs.len()
+    );
+    assert!(
+        !unflip_records[0]
+            .flags
+            .contains(::drm::control::AtomicCommitFlags::PAGE_FLIP_ASYNC)
+    );
+    assert_eq!(
+        backend.pstate.scanout_m2.unflip_reason,
+        Some("tearing_cursor_handoff")
+    );
+    assert!(
+        backend.scene.cursor_transition_pending(),
+        "fresh unflip ack must own the cursor transition (hidden={}, effective={:?}, mode={:?}, hw_visible={})",
+        backend.cursor_hidden,
+        backend.effective_cursor_xid,
+        backend.scene.cursor_mode(),
+        backend.platform.any_cursor_plane_visible(),
+    );
     assert!(backend.pstate.scanout_m2.current.is_some());
     retire_composed_frame(&mut backend, &mut state, 43);
     assert!(backend.pstate.scanout_m2.current.is_none());
-
+    assert!(
+        !backend.scene.cursor_transition_pending(),
+        "scene retirement applied the queued cursor transition once"
+    );
+    assert_eq!(
+        hide_executor.calls(),
+        vec![backend.platform.outputs[0].output.crtc],
+        "scene retirement hides the applied cursor once"
+    );
     assert!(!backend.platform.any_cursor_plane_visible());
     assert!(backend.pstate.tearing.is_on());
     assert_eq!(
@@ -3423,10 +3475,21 @@ fn show_cursor_during_held_direct_hidden_tearing_makes_cursor_visible() {
     assert!(backend.effective_cursor_xid.is_some());
     assert!(!backend.platform.any_cursor_plane_visible());
     assert!(!backend.scene.has_pending_page_flips());
-    assert!(
-        backend.scene.for_tests_cursor_footprint_was_presented(0),
-        "the fresh grouped unflip frame includes the visible cursor footprint"
+    Backend::maybe_composite(&mut backend).expect("compose software cursor after handoff");
+    assert!(backend.scene.has_pending_page_flips());
+    retire_composed_frame(&mut backend, &mut state, 44);
+    assert!(backend.scene.for_tests_cursor_footprint_was_presented(0));
+    assert!(!backend.scene.cursor_transition_pending());
+    assert_eq!(
+        hide_executor.calls(),
+        vec![backend.platform.outputs[0].output.crtc],
+        "scene retirement applies the cursor hide exactly once"
     );
+    assert!(
+        show_executor.calls().is_empty(),
+        "the fresh grouped scene hides the applied cursor without an external show"
+    );
+    super::commit_identity::direct_unflip::assert_issue281_unflip_backend_end_state(&backend);
 }
 
 #[test]

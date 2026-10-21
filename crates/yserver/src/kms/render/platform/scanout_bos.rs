@@ -302,6 +302,32 @@ impl PlatformBackend {
         self.unflip_batch_context.is_none() && self.prepared_unflip_planes.is_empty()
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_tests_unflip_owned_fd_count(&self) -> usize {
+        let prepared = self
+            .prepared_unflip_planes
+            .iter()
+            .filter(|plane| plane.final_in_fence.is_some())
+            .count();
+        let render_completions = self
+            .pending_scanout_render_completions
+            .iter()
+            .filter(|pending| {
+                pending.mode == crate::kms::render::scene::FrameSubmitMode::DeferredUnflip
+            })
+            .filter(|pending| pending.fd.is_some())
+            .count();
+        let safe_dependencies = self.pending_scanout_unflip_dependencies.len();
+        let bo_fences = self
+            .scanout_pools
+            .iter()
+            .filter_map(Option::as_ref)
+            .flat_map(|pool| pool.display_pool().bos.iter())
+            .filter(|bo| bo.state.in_fence_fd.is_some())
+            .count();
+        prepared + render_completions + safe_dependencies + bo_fences
+    }
+
     /// Called after grouped atomic acceptance; only now may the userspace
     /// input-fence descriptor be closed and the BO become flip-pending.
     pub(crate) fn accept_prepared_unflip_plane(

@@ -2902,6 +2902,9 @@ fn cursor_einval_rolls_back_and_hide_recovery_is_motion_driven_and_bounded() {
     retire_atomic_cursor_test_output(&mut recovered_backend, &mut recovered_state, 1, 2);
     assert!(!recovered_backend.pstate.scanout_m2.active());
     assert_atomic_cursor_quiescent(&recovered_backend);
+    super::commit_identity::direct_unflip::assert_issue281_unflip_backend_end_state(
+        &recovered_backend,
+    );
 
     // Three failed motion-led retries permanently disable the cursor. Later
     // motion must not issue a fifth legacy hide or restore an atomic field, but
@@ -3592,6 +3595,7 @@ fn direct_successor_waits_for_retirement_and_carries_motion() {
     assert!(!backend.pstate.scanout_m2.active());
     Backend::client_disconnected(&mut backend, yserver_protocol::x11::ClientId(2));
     assert_atomic_cursor_quiescent(&backend);
+    super::commit_identity::direct_unflip::assert_issue281_unflip_backend_end_state(&backend);
 }
 
 #[test]
@@ -3966,7 +3970,7 @@ fn eligible_fullscreen_present_records_cursor_positions_for_both_outputs() {
 // Mutation: `submit_composed_unflip` gathers an empty output list. The real
 // shape-triggered unflip must record each output's local cursor coordinates.
 fn shape_triggered_composed_unflip_records_cursor_positions_for_both_outputs() {
-    use yserver_core::backend::Backend;
+    use yserver_core::{backend::Backend, server::ServerState};
 
     let mut backend = match KmsBackend::for_tests_with_vk() {
         Ok(backend) => backend,
@@ -4062,4 +4066,8 @@ fn shape_triggered_composed_unflip_records_cursor_positions_for_both_outputs() {
             .platform
             .for_tests_atomic_position_is_unsent(position.device_key, position.crtc)
     }));
+    let mut state = ServerState::new();
+    retire_atomic_cursor_test_output(&mut backend, &mut state, 0, 1);
+    retire_atomic_cursor_test_output(&mut backend, &mut state, 1, 1);
+    super::commit_identity::direct_unflip::assert_issue281_unflip_backend_end_state(&backend);
 }
