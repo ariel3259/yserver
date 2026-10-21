@@ -1357,6 +1357,24 @@ mod tests {
             "the successor must request a composed unflip",
         );
         assert!(fixture.events.backend.pstate.scanout_m2.unflip_requested);
+        Backend::copy_area(
+            &mut fixture.events.backend,
+            None,
+            successor.src_host_xid,
+            successor.paint_dst_host_xid,
+            0,
+            0,
+            successor.x_off,
+            successor.y_off,
+            successor.src_width,
+            successor.src_height,
+        )
+        .expect("ordinary Present Copy fallback after direct rejection");
+        Backend::note_present_pixmap(
+            &mut fixture.events.backend,
+            successor.src_pixmap_xid,
+            successor.dst_window_xid,
+        );
 
         let unflip_offset = fixture.events.recorders[&fd].records().len();
         Backend::maybe_composite(&mut fixture.events.backend).expect("submit grouped unflip");

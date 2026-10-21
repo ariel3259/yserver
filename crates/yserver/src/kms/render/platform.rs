@@ -47,6 +47,8 @@ use init::*;
 pub(in crate::kms::render) use power::OutputPowerExecutor;
 pub(crate) use qualify::*;
 #[cfg(test)]
+pub(crate) use scanout_bos::RecordingPreparedUnflipReadiness;
+#[cfg(test)]
 use scanout_bos::*;
 pub(crate) use scanout_bos::{ExpectedUnflipPlane, PreparedUnflipPlane, grouped_unflip_ready};
 
@@ -574,6 +576,9 @@ pub struct PlatformBackend {
     next_scanout_render_job_id: u64,
     pub(crate) unflip_batch_context: Option<scanout_bos::UnflipBatchContext>,
     pub(crate) prepared_unflip_planes: Vec<PreparedUnflipPlane>,
+    /// Production publishes prepared planes immediately. Tests can inject a
+    /// controlled readiness boundary while keeping Backend submission live.
+    pub(crate) prepared_unflip_readiness: Rc<dyn scanout_bos::PreparedUnflipReadiness>,
 
     /// Command buffer + fence reused by scanout reads, allocated from
     /// `gpu.ops_command_pool`. `Drop` resets it first; it is also declared

@@ -151,6 +151,8 @@ pub(crate) struct RecordingRenderCompletionReadiness {
     hold_ready: std::cell::Cell<bool>,
     released_ready: std::cell::RefCell<HashSet<u64>>,
     fail_next_ready_check: std::cell::RefCell<HashSet<u64>>,
+    capture_fence_jobs: std::cell::RefCell<HashSet<u64>>,
+    captured_fences: std::cell::RefCell<std::collections::HashMap<u64, OwnedFd>>,
 }
 
 #[cfg(test)]
@@ -175,11 +177,27 @@ impl RecordingRenderCompletionReadiness {
             .borrow_mut()
             .insert(render_job_id);
     }
+
+    pub(crate) fn capture_completion_fence(&self, render_job_id: u64) {
+        self.capture_fence_jobs.borrow_mut().insert(render_job_id);
+    }
+
+    pub(crate) fn take_captured_completion_fence(&self, render_job_id: u64) -> Option<OwnedFd> {
+        self.captured_fences.borrow_mut().remove(&render_job_id)
+    }
 }
 
 #[cfg(test)]
 impl RenderCompletionReadiness for RecordingRenderCompletionReadiness {
     fn is_ready(&self, render_job_id: u64, fd: Option<BorrowedFd<'_>>) -> io::Result<bool> {
+        if self.capture_fence_jobs.borrow().contains(&render_job_id)
+            && !self.captured_fences.borrow().contains_key(&render_job_id)
+            && let Some(fd) = fd
+        {
+            self.captured_fences
+                .borrow_mut()
+                .insert(render_job_id, fd.try_clone_to_owned()?);
+        }
         if self
             .fail_next_ready_check
             .borrow_mut()
@@ -440,6 +458,29 @@ impl PlatformBackend {
         readiness: Rc<RecordingRenderCompletionReadiness>,
     ) {
         self.render_completion_readiness = readiness;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_replace_pending_render_completion_fd(
+        &mut self,
+        render_job_id: u64,
+        replacement: OwnedFd,
+    ) -> io::Result<OwnedFd> {
+        let pending = self
+            .pending_scanout_render_completions
+            .iter_mut()
+            .find(|pending| pending.render_job_id == render_job_id)
+            .ok_or_else(|| io::Error::other("pending render completion job was not found"))?;
+        let previous = pending
+            .fd
+            .take()
+            .ok_or_else(|| io::Error::other("pending render completion has no fd"))?;
+        self.scanout_render_completion_epfd
+            .unregister(previous.as_fd())?;
+        self.scanout_render_completion_epfd
+            .register(replacement.as_fd(), render_job_id)?;
+        pending.fd = Some(replacement);
+        Ok(previous)
     }
 
     #[cfg(test)]

@@ -112,6 +112,30 @@ fn damage_root(fixture: &mut RecordingSceneFixture) {
     .expect("damage root through Backend");
 }
 
+fn copy_rejected_present(
+    fixture: &mut RecordingSceneFixture,
+    candidate: yserver_core::backend::PresentScanoutCandidate,
+) {
+    Backend::copy_area(
+        &mut fixture.events.backend,
+        None,
+        candidate.src_host_xid,
+        candidate.paint_dst_host_xid,
+        0,
+        0,
+        candidate.x_off,
+        candidate.y_off,
+        candidate.src_width,
+        candidate.src_height,
+    )
+    .expect("ordinary Present Copy fallback after direct rejection");
+    Backend::note_present_pixmap(
+        &mut fixture.events.backend,
+        candidate.src_pixmap_xid,
+        candidate.dst_window_xid,
+    );
+}
+
 fn copied_atomic_fixture(test_name: &str) -> Option<AtomicPathFixture> {
     use crate::kms::cursor_plane::{
         ops::{CursorBufferIo, recording::RecordingCursorBufferIo},
@@ -901,6 +925,7 @@ fn p2_scene_direct_copied_and_unflip_commits_carry_only_the_applied_position() {
             )
             .expect("ineligible Present asks for composed unflip"),
         );
+        copy_rejected_present(&mut fixture.scene, successor);
         let unflip_start = records(&fixture, hardware).len();
         Backend::maybe_composite(&mut fixture.scene.events.backend)
             .expect("submit composed unflip through Backend");

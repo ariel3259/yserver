@@ -762,6 +762,12 @@ impl KmsBackend {
                 .is_some_and(|source| Some(source) == self.pstate.scanout_m2.unflip_fallback_source)
         {
             self.pstate.scanout_m2.unflip_fallback_source = None;
+            self.pstate.scanout_m2.unflip_fallback_revision = self
+                .pstate
+                .scanout_m2
+                .unflip_fallback_revision
+                .checked_add(1)
+                .expect("unflip fallback revision overflow");
             if let Some(target) = self.resolve_paint_target(dst_window_xid) {
                 self.pstate
                     .scanout_m2

@@ -145,6 +145,24 @@ fn request_unflip(fixture: &mut RecordingSceneFixture, direct: &DirectPresentSet
         "the successor must request a composed unflip"
     );
     assert!(fixture.events.backend.pstate.scanout_m2.unflip_requested);
+    Backend::copy_area(
+        &mut fixture.events.backend,
+        None,
+        successor.src_host_xid,
+        successor.paint_dst_host_xid,
+        0,
+        0,
+        successor.x_off,
+        successor.y_off,
+        successor.src_width,
+        successor.src_height,
+    )
+    .expect("ordinary Present Copy fallback after direct rejection");
+    Backend::note_present_pixmap(
+        &mut fixture.events.backend,
+        successor.src_pixmap_xid,
+        successor.dst_window_xid,
+    );
 }
 
 fn drain_present_notifications(
@@ -197,6 +215,22 @@ fn drain_present_notifications(
 }
 
 fn assert_issue281_unflip_end_state(fixture: &RecordingSceneFixture, present_id: u64) {
+    let after_all_off = fixture.events.backend.pstate.vt_state != crate::vt::state::VtState::Active;
+    assert_issue281_unflip_end_state_with_lifecycle(fixture, present_id, after_all_off);
+}
+
+fn assert_issue281_unflip_end_state_after_all_off(
+    fixture: &RecordingSceneFixture,
+    present_id: u64,
+) {
+    assert_issue281_unflip_end_state_with_lifecycle(fixture, present_id, true);
+}
+
+fn assert_issue281_unflip_end_state_with_lifecycle(
+    fixture: &RecordingSceneFixture,
+    present_id: u64,
+    after_all_off: bool,
+) {
     assert!(
         fixture
             .events
@@ -220,7 +254,11 @@ fn assert_issue281_unflip_end_state(fixture: &RecordingSceneFixture, present_id:
             .is_empty(),
         "no render-completion or safe-dependency notification remains"
     );
-    fixture.assert_quiescent();
+    if after_all_off {
+        fixture.assert_quiescent_after_all_off();
+    } else {
+        fixture.assert_quiescent();
+    }
     assert_eq!(
         fixture.present_notification_counts.get(&present_id),
         Some(&(1, 1)),
@@ -460,6 +498,259 @@ fn issue281_fullscreen_exit_flips_fresh_scene() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Production Present::Pixmap Copy through run_core writes C to the pinned fallback.
+// Mutation: ignore unflip_shadow_ready and rematerialize the old direct scene B.
+fn issue281_present_copy_preserves_newer_fallback_pixels() {
+    use yserver_core::{
+        backend::{Backend, WindowHandle},
+        resources::{ROOT_VISUAL, ROOT_WINDOW},
+        server::{BackendCapabilities, ServerState, XFixesRegion},
+    };
+    use yserver_protocol::x11::{
+        ClientId, CreatePixmapRequest, CreateWindowRequest, ResourceId, xfixes::RegionRect,
+    };
+
+    let Some((mut fixture, direct)) = direct_fixture(1, P1SceneRoute::Shared, 292, 0) else {
+        return;
+    };
+    fixture.events.use_raw_event_source_for_device(0);
+    let device_fd = fd(&fixture);
+    let scene_b = [0x23, 0x4b, 0x68, 0xff];
+    let scene_c = [0x91, 0x37, 0x4a, 0xff];
+    assert_ne!(scene_b, scene_c);
+    paint_solid_pixmap(&mut fixture, direct.candidate.src_pixmap_xid, scene_b);
+    let initial = accepted_records(&submit_direct(&mut fixture, &direct, device_fd)).remove(0);
+    let direct_id = accepted_event_id(&initial).expect("direct Present accepted");
+    complete_direct_initial(&mut fixture, &initial, direct_id, device_fd);
+    drain_present_notifications(&mut fixture, &[direct.candidate.present_id], &[]);
+
+    let (outputs, modes) = Backend::randr_outputs_and_modes(&mut fixture.events.backend);
+    let (screen_width, screen_height) = Backend::fb_dimensions(&fixture.events.backend);
+    fixture.events.state = ServerState::with_randr_outputs_and_modes(
+        screen_width,
+        screen_height,
+        outputs,
+        modes,
+        BackendCapabilities::from_backend(&fixture.events.backend),
+    );
+    fixture
+        .events
+        .state
+        .resources
+        .window_mut(ROOT_WINDOW)
+        .expect("core root")
+        .host_xid = WindowHandle::from_raw(fixture.events.backend.window_id());
+    let target = ResourceId(direct.target_xid);
+    let width = fixture.events.backend.platform.fb_w;
+    let height = fixture.events.backend.platform.fb_h;
+    fixture.events.state.resources.create_window(
+        ClientId(1),
+        CreateWindowRequest {
+            depth: 24,
+            window: target,
+            parent: ROOT_WINDOW,
+            x: 0,
+            y: 0,
+            width,
+            height,
+            class: 1,
+            visual: ROOT_VISUAL,
+            ..Default::default()
+        },
+    );
+    fixture
+        .events
+        .state
+        .resources
+        .window_mut(target)
+        .expect("authoritative root-sized Present window")
+        .host_xid = WindowHandle::from_raw(direct.target_xid);
+    let _ = fixture.events.state.resources.map_window(target);
+    let root_host_xid = fixture.events.backend.core.window_id;
+    fixture
+        .events
+        .backend
+        .windows
+        .get_mut(&direct.target_xid)
+        .expect("recording scene window for the Present destination")
+        .parent = Some(root_host_xid);
+
+    const PRESENT_PIXMAP: u32 = 0x0100_9201;
+    let pixmap = Backend::create_pixmap(&mut fixture.events.backend, None, 24, width, height)
+        .expect("allocate production Present source pixmap");
+    paint_solid_pixmap(&mut fixture, pixmap.as_raw(), scene_c);
+    let present_source_id = fixture
+        .events
+        .backend
+        .store
+        .lookup(pixmap.as_raw())
+        .expect("production Present pixmap backing");
+    let present_source_pixels = fixture.backing_pixels_for_id(present_source_id);
+    assert!(
+        present_source_pixels
+            .chunks_exact(4)
+            .all(|pixel| pixel == scene_c),
+        "the source pixmap starts as distinct scene C; first pixel={:?}",
+        present_source_pixels.get(..4)
+    );
+    fixture.events.state.resources.create_pixmap(
+        ClientId(1),
+        CreatePixmapRequest {
+            depth: 24,
+            pixmap: ResourceId(PRESENT_PIXMAP),
+            drawable: target,
+            width,
+            height,
+        },
+    );
+    assert!(
+        fixture
+            .events
+            .state
+            .resources
+            .set_pixmap_host_xid(ResourceId(PRESENT_PIXMAP), pixmap)
+    );
+    const VALID_REGION: u32 = 0x0100_9202;
+    fixture.events.state.xfixes_regions.insert(
+        VALID_REGION,
+        XFixesRegion {
+            owner: ClientId(1),
+            rects: vec![RegionRect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            }],
+        },
+    );
+
+    let fallback_id = fixture
+        .events
+        .backend
+        .resolve_paint_target(direct.target_xid)
+        .expect("the direct frame's pinned fallback target")
+        .backing_id();
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .composed_unflip
+            .is_none()
+    );
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .unflip_fallback_source
+            .is_none()
+    );
+    let offset = record_count(&fixture, device_fd);
+    let copy_calls_before = fixture.events.backend.engine_copy_area_calls;
+    let peer = super::super::tearing::install_test_core_client(&mut fixture.events.state);
+    let (peer, _, _) = super::super::tearing::run_core_present_pixmap_with_valid_region(
+        &mut fixture.events.state,
+        &mut fixture.events.backend,
+        peer,
+        1,
+        direct.target_xid,
+        PRESENT_PIXMAP,
+        0,
+        VALID_REGION,
+        None,
+    );
+    drop(peer);
+    assert!(
+        fixture.events.backend.engine_copy_area_calls > copy_calls_before,
+        "the production Present::Pixmap path executed a GPU CopyArea"
+    );
+    assert_eq!(
+        fixture.events.backend.recent_present_pixmaps.back(),
+        Some(&(pixmap.as_raw(), direct.target_xid)),
+        "the real core Present request records the C source and pinned destination"
+    );
+    assert!(fixture.events.backend.pstate.scanout_m2.unflip_requested);
+    assert_eq!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .unflip_fallback_source,
+        None,
+        "the actual Present Copy callback clears its matching fallback source"
+    );
+    assert_eq!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .unflip_shadow_ready_targets,
+        HashSet::from([fallback_id]),
+        "the production note_present_pixmap callback marks the pinned backing ready"
+    );
+    assert!(
+        fixture.events.state.present_pending_exec.is_empty(),
+        "the core Present Copy executed instead of remaining source-deferred"
+    );
+    let replacement = grouped_unflip_record(&mut fixture, device_fd, offset, 1);
+    fixture.events.wait_for_submitted_gpu_work();
+    let fallback_pixels = fixture.backing_pixels_for_id(fallback_id);
+    assert!(
+        fallback_pixels
+            .chunks_exact(4)
+            .all(|pixel| pixel == scene_c),
+        "the flushed production Present::Pixmap Copy writes scene C; first pixel={:?}",
+        fallback_pixels.get(..4)
+    );
+    let replacement_fb = primary_fb_value(
+        &replacement,
+        &fixture.events.backend.platform.outputs[0].output,
+    );
+    let replacement_idx = fixture.events.backend.platform.scanout_pools[0]
+        .as_ref()
+        .expect("scanout pool")
+        .display_pool()
+        .bos
+        .iter()
+        .position(|bo| {
+            bo.fb_handle
+                .is_some_and(|fb| u32::from(fb) == replacement_fb)
+        })
+        .expect("grouped primary FB names its fresh target");
+    let replacement_id = fixture
+        .events
+        .backend
+        .store
+        .lookup(0x6a00 + u32::try_from(replacement_idx).expect("BO index fits"))
+        .expect("fresh scanout backing");
+    let replacement_pixels = fixture.backing_pixels_for_id(replacement_id);
+    assert!(
+        replacement_pixels
+            .chunks_exact(4)
+            .all(|pixel| pixel == scene_c),
+        "the FB named by grouped primary FB_ID also contains newer scene C; first pixel={:?}",
+        replacement_pixels.get(..4)
+    );
+    let replacement_commit = accepted_event_id(&replacement).expect("group accepted");
+    complete_recorded_attempt(
+        &mut fixture,
+        device_fd,
+        &replacement,
+        replacement_commit,
+        75,
+    );
+    drain_present_notifications(&mut fixture, &[], &[direct.candidate.present_id]);
+    assert_issue281_unflip_end_state(&fixture, direct.candidate.present_id);
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: remove the direct-exit watchdog deadline; this test must fail to wake without scene or Present input.
 fn issue281_direct_exit_watchdog_prevents_96s_freeze() {
     let Some((mut fixture, direct)) = direct_fixture(2, P1SceneRoute::Shared, 282, 0) else {
@@ -513,7 +804,29 @@ fn issue281_direct_exit_watchdog_prevents_96s_freeze() {
     let direct_id = accepted_event_id(&direct_record).expect("direct Present accepted");
     complete_direct_initial(&mut fixture, &direct_record, direct_id, device_fd);
     drain_present_notifications(&mut fixture, &[direct.candidate.present_id], &[]);
-    request_unflip(&mut fixture, &direct);
+    let mut exit_candidate = direct.candidate;
+    exit_candidate.present_id += 1;
+    exit_candidate.src_pixmap_xid = 0x0100_9280;
+    exit_candidate.src_host_xid = 0x0100_9280;
+    let mut exit_event = direct.event.clone();
+    exit_event.present_id = exit_candidate.present_id;
+    exit_event.serial = exit_event.serial.wrapping_add(1);
+    assert!(
+        !Backend::try_present_direct(&mut fixture.events.backend, exit_candidate, exit_event)
+            .expect("fullscreen-exit successor without a source requests an unflip"),
+        "the exit request is not admitted as another direct frame"
+    );
+    assert!(fixture.events.backend.pstate.scanout_m2.unflip_requested);
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .unflip_fallback_source
+            .is_none(),
+        "fullscreen exit has no pending Present Copy to delay its watchdog"
+    );
 
     let watchdog = clock.get() + Duration::from_secs(2);
     assert_eq!(
@@ -899,6 +1212,806 @@ fn issue281_group_waits_for_every_render_and_retires_once() {
     assert_issue281_unflip_end_state(&fixture, direct.candidate.present_id);
     fixture.events.wait_for_submitted_gpu_work();
     fixture.finish();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Boundary test: delay one platform prepared-plane readiness row while all
+// scene work still uses the real Backend and recording atomic executor.
+// Mutation: submit a group before every output's prepared row is ready.
+fn issue281_shared_unflip_waits_for_every_output_readiness_boundary() {
+    let Some((mut fixture, direct)) = direct_fixture(2, P1SceneRoute::Shared, 286, 0) else {
+        return;
+    };
+    let device_fd = fd(&fixture);
+    let gate = Rc::new(crate::kms::render::platform::RecordingPreparedUnflipReadiness::default());
+    gate.hold_output(1);
+    fixture
+        .events
+        .backend
+        .platform
+        .for_tests_set_prepared_unflip_readiness(gate.clone());
+    let initial = accepted_records(&submit_direct(&mut fixture, &direct, device_fd)).remove(0);
+    let direct_id = accepted_event_id(&initial).expect("direct Present accepted");
+    complete_direct_initial(&mut fixture, &initial, direct_id, device_fd);
+    drain_present_notifications(&mut fixture, &[direct.candidate.present_id], &[]);
+    request_unflip(&mut fixture, &direct);
+
+    let offset = record_count(&fixture, device_fd);
+    Backend::maybe_composite(&mut fixture.events.backend).expect("prepare both shared outputs");
+    assert!(
+        records_since(&fixture, device_fd, offset)
+            .iter()
+            .all(|record| record.events.len() != 2 || accepted_event_id(record).is_none()),
+        "one ready output cannot cause an early grouped replacement"
+    );
+    let submitted: Vec<_> = fixture.events.backend.platform.scanout_pools[..2]
+        .iter()
+        .enumerate()
+        .map(|(output_idx, pool)| {
+            let pool = pool.as_ref().expect("live scanout pool").display_pool();
+            let (bo_idx, bo) = pool
+                .bos
+                .iter()
+                .enumerate()
+                .find(|(_, bo)| bo.state.phase == BoPhase::Submitted)
+                .expect("unflip target remains submitted while readiness is held");
+            assert_ne!(bo_idx, 0, "the retained OnScreen BO is not a render target");
+            (
+                output_idx,
+                bo.fb_handle.expect("submitted BO has a framebuffer"),
+                bo.state.in_fence_fd.map_or(u64::MAX, |raw| {
+                    u64::try_from(raw).expect("owned in-fence descriptor is nonnegative")
+                }),
+            )
+        })
+        .collect();
+    assert_eq!(submitted.len(), 2);
+
+    gate.release_output(1);
+    Backend::maybe_composite(&mut fixture.events.backend).expect("publish held readiness row");
+    let group = records_since(&fixture, device_fd, offset)
+        .into_iter()
+        .find(|record| record.events.len() == 2 && accepted_event_id(record).is_some())
+        .expect("one all-output group follows both readiness rows");
+    for (output_idx, fb, fence) in &submitted {
+        let output = &fixture.events.backend.platform.outputs[*output_idx].output;
+        assert_eq!(primary_fb_value(&group, output), u32::from(*fb));
+        assert_eq!(primary_in_fence_value(&group, output), *fence);
+    }
+    fixture.events.wait_for_submitted_gpu_work();
+    let group_id = accepted_event_id(&group).expect("accepted grouped replacement");
+    for output_idx in 0..2 {
+        inject_output(
+            &mut fixture,
+            device_fd,
+            &group,
+            output_idx,
+            group_id,
+            70 + u32::try_from(output_idx).expect("output index fits"),
+            Duration::from_millis(700 + output_idx as u64 * 10),
+        );
+    }
+    drain_present_notifications(&mut fixture, &[], &[direct.candidate.present_id]);
+    assert_issue281_unflip_end_state(&fixture, direct.candidate.present_id);
+    fixture.events.wait_for_submitted_gpu_work();
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Boundary test: hold copied source readiness, then hold the sink's prepared
+// row at the platform boundary; mixed route still groups only after both.
+// Mutation: use the source-render completion as the copied plane's final fence.
+fn issue281_mixed_shared_copied_unflip_waits_for_readiness_and_uses_sink_fence() {
+    let Some((mut fixture, direct)) = direct_fixture(2, P1SceneRoute::MixedSharedCopied, 287, 0)
+    else {
+        return;
+    };
+    let device_fd = fd(&fixture);
+    let source_readiness = Rc::clone(fixture.readiness.as_ref().expect("copied route readiness"));
+    source_readiness.hold_ready_jobs();
+    let gate = Rc::new(crate::kms::render::platform::RecordingPreparedUnflipReadiness::default());
+    gate.hold_output(1);
+    fixture
+        .events
+        .backend
+        .platform
+        .for_tests_set_prepared_unflip_readiness(gate.clone());
+    let initial = accepted_records(&submit_direct(&mut fixture, &direct, device_fd)).remove(0);
+    let direct_id = accepted_event_id(&initial).expect("direct Present accepted");
+    complete_direct_initial(&mut fixture, &initial, direct_id, device_fd);
+    drain_present_notifications(&mut fixture, &[direct.candidate.present_id], &[]);
+    request_unflip(&mut fixture, &direct);
+
+    let offset = record_count(&fixture, device_fd);
+    Backend::maybe_composite(&mut fixture.events.backend).expect("start mixed preparation");
+    let job_id = fixture
+        .pending_render_job_ids()
+        .last()
+        .copied()
+        .expect("copied output registered source-render readiness");
+    assert!(
+        records_since(&fixture, device_fd, offset)
+            .iter()
+            .all(|record| record.events.len() != 2 || accepted_event_id(record).is_none()),
+        "mixed group waits for copied source readiness"
+    );
+    source_readiness.capture_completion_fence(job_id);
+    deliver_copied_job(&mut fixture, job_id);
+    assert!(
+        records_since(&fixture, device_fd, offset)
+            .iter()
+            .all(|record| record.events.len() != 2 || accepted_event_id(record).is_none()),
+        "sink preparation still waits for the copied output's held readiness row"
+    );
+    let copied_pool = fixture.events.backend.platform.scanout_pools[1]
+        .as_ref()
+        .expect("copied output")
+        .display_pool();
+    let (copied_bo_idx, copied_bo) = copied_pool
+        .bos
+        .iter()
+        .enumerate()
+        .find(|(_, bo)| bo.state.phase == BoPhase::Submitted)
+        .expect("sink copy retains its submitted destination");
+    let sink_fence = copied_bo.state.in_fence_fd;
+    let source_fence = source_readiness
+        .take_captured_completion_fence(job_id)
+        .expect("capture source fence while its original fd is live");
+    let source_fence_raw = std::os::fd::AsRawFd::as_raw_fd(&source_fence);
+    assert_ne!(
+        source_fence_raw, -1,
+        "source completion has its own live fd"
+    );
+    let copied_fb = u32::from(copied_bo.fb_handle.expect("sink BO has FB_ID"));
+
+    gate.release_output(1);
+    Backend::maybe_composite(&mut fixture.events.backend).expect("publish copied sink readiness");
+    let group = records_since(&fixture, device_fd, offset)
+        .into_iter()
+        .find(|record| record.events.len() == 2 && accepted_event_id(record).is_some())
+        .expect("mixed outputs submit in one accepted group");
+    let copied_output = &fixture.events.backend.platform.outputs[1].output;
+    assert_eq!(primary_fb_value(&group, copied_output), copied_fb);
+    let recorded_sink_fence = primary_in_fence_value(&group, copied_output);
+    match sink_fence {
+        Some(sink_fence) => {
+            assert_ne!(
+                source_fence_raw, sink_fence,
+                "the source completion descriptor remains live while the sink fence is exported"
+            );
+            assert_eq!(
+                recorded_sink_fence,
+                u64::try_from(sink_fence).expect("sink fence descriptor is nonnegative"),
+                "the grouped copied plane carries the sink-copy completion"
+            );
+        }
+        None => assert_eq!(
+            recorded_sink_fence,
+            u64::MAX,
+            "an already-signalled sink copy is encoded as sign-extended -1, never the source fd"
+        ),
+    }
+    assert_ne!(copied_bo_idx, 0, "the retained destination is not selected");
+    fixture.events.wait_for_submitted_gpu_work();
+    let group_id = accepted_event_id(&group).expect("accepted grouped replacement");
+    for output_idx in 0..2 {
+        inject_output(
+            &mut fixture,
+            device_fd,
+            &group,
+            output_idx,
+            group_id,
+            72 + u32::try_from(output_idx).expect("output index fits"),
+            Duration::from_millis(720 + output_idx as u64 * 10),
+        );
+    }
+    drain_present_notifications(&mut fixture, &[], &[direct.candidate.present_id]);
+    assert_issue281_unflip_end_state(&fixture, direct.candidate.present_id);
+    fixture.events.wait_for_submitted_gpu_work();
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Boundary test: hold the copied source notification and then the sink plane
+// readiness row; retain source and sink fence handles only while descriptors
+// are live. Mutation: submit the copied destination before sink readiness.
+fn issue281_copied_only_unflip_uses_sink_dependency_and_signalled_sentinel() {
+    let Some((mut fixture, direct)) = direct_fixture(1, P1SceneRoute::CopiedSameDevice, 289, 0)
+    else {
+        return;
+    };
+    let device_fd = fd(&fixture);
+    let source_readiness = Rc::clone(fixture.readiness.as_ref().expect("copied readiness"));
+    source_readiness.hold_ready_jobs();
+    let gate = Rc::new(crate::kms::render::platform::RecordingPreparedUnflipReadiness::default());
+    gate.hold_output(0);
+    fixture
+        .events
+        .backend
+        .platform
+        .for_tests_set_prepared_unflip_readiness(gate.clone());
+    let initial = accepted_records(&submit_direct(&mut fixture, &direct, device_fd)).remove(0);
+    let direct_id = accepted_event_id(&initial).expect("direct Present accepted");
+    complete_direct_initial(&mut fixture, &initial, direct_id, device_fd);
+    drain_present_notifications(&mut fixture, &[direct.candidate.present_id], &[]);
+    request_unflip(&mut fixture, &direct);
+
+    let offset = record_count(&fixture, device_fd);
+    Backend::maybe_composite(&mut fixture.events.backend).expect("start copied preparation");
+    let job_id = fixture
+        .pending_render_job_ids()
+        .last()
+        .copied()
+        .expect("copied source render is pending");
+    assert!(
+        records_since(&fixture, device_fd, offset)
+            .iter()
+            .all(|record| record.events.is_empty()),
+        "a copied source-render handoff has no flip obligation"
+    );
+    source_readiness.capture_completion_fence(job_id);
+    deliver_copied_job(&mut fixture, job_id);
+    let source_fence = source_readiness
+        .take_captured_completion_fence(job_id)
+        .expect("duplicate source fence while its original descriptor is live");
+    let source_fence_raw = std::os::fd::AsRawFd::as_raw_fd(&source_fence);
+    let mut source_poll = libc::pollfd {
+        fd: source_fence_raw,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: the duplicated source sync-file remains owned by `source_fence`.
+    assert_eq!(unsafe { libc::poll(&mut source_poll, 1, 0) }, 1);
+    assert_ne!(
+        source_poll.revents & libc::POLLIN,
+        0,
+        "source render is ready"
+    );
+    assert!(
+        records_since(&fixture, device_fd, offset)
+            .iter()
+            .all(|record| accepted_event_id(record).is_none()),
+        "source readiness alone does not submit the copied destination"
+    );
+    let (bo_idx, bo) = fixture.events.backend.platform.scanout_pools[0]
+        .as_ref()
+        .expect("copied output")
+        .display_pool()
+        .bos
+        .iter()
+        .enumerate()
+        .find(|(_, bo)| bo.state.phase == BoPhase::Submitted)
+        .expect("sink copy destination remains submitted at the readiness boundary");
+    let sink_fence = bo.state.in_fence_fd;
+    let fb = u32::from(bo.fb_handle.expect("copied destination has FB_ID"));
+    let retained_sink_fence = sink_fence.map(|raw| {
+        // SAFETY: the Submitted BO owns this final fence until group acceptance.
+        unsafe { std::os::fd::BorrowedFd::borrow_raw(raw) }
+            .try_clone_to_owned()
+            .expect("duplicate sink fence while its original descriptor is live")
+    });
+
+    gate.release_output(0);
+    Backend::maybe_composite(&mut fixture.events.backend).expect("publish copied sink readiness");
+    let group = records_since(&fixture, device_fd, offset)
+        .into_iter()
+        .find(|record| record.events.len() == 1 && accepted_event_id(record).is_some())
+        .expect("copied-only replacement is accepted after sink readiness");
+    let output = &fixture.events.backend.platform.outputs[0].output;
+    assert_eq!(primary_fb_value(&group, output), fb);
+    match (sink_fence, retained_sink_fence.as_ref()) {
+        (Some(raw), Some(_duplicate)) => {
+            assert_ne!(source_fence_raw, raw);
+            assert_eq!(
+                primary_in_fence_value(&group, output),
+                u64::try_from(raw).expect("sink dependency fd is nonnegative"),
+                "the primary plane receives the sink-copy dependency"
+            );
+        }
+        (None, None) => assert_eq!(
+            primary_in_fence_value(&group, output),
+            u64::MAX,
+            "None is already signalled and uses sign-extended -1"
+        ),
+        _ => panic!("sink fence duplicate must match the live BO-owned dependency"),
+    }
+    assert_ne!(bo_idx, 0, "the retained destination is not selected");
+    fixture.events.wait_for_submitted_gpu_work();
+    if let Some(duplicate) = retained_sink_fence.as_ref() {
+        let mut sink_poll = libc::pollfd {
+            fd: std::os::fd::AsRawFd::as_raw_fd(duplicate),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: the retained duplicate stays owned through the readiness check.
+        assert_eq!(unsafe { libc::poll(&mut sink_poll, 1, 0) }, 1);
+        assert_ne!(sink_poll.revents & libc::POLLIN, 0, "sink copy is complete");
+    }
+    let group_id = accepted_event_id(&group).expect("accepted copied replacement");
+    inject_output(
+        &mut fixture,
+        device_fd,
+        &group,
+        0,
+        group_id,
+        73,
+        Duration::from_millis(730),
+    );
+    drain_present_notifications(&mut fixture, &[], &[direct.candidate.present_id]);
+    assert_issue281_unflip_end_state(&fixture, direct.candidate.present_id);
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Boundary test: the shared subcase releases a held platform row only at its
+// deadline; the copied subcase replaces readiness with an unsignalled eventfd
+// after the first safe retry. Mutation: route the second deadline through
+// wait_idle_bounded or treat its timeout as writer safety.
+fn issue281_unflip_prepare_timeout_recovers_lost_and_cancelled_readiness() {
+    let Some((mut lost, lost_direct)) = direct_fixture(1, P1SceneRoute::Shared, 290, 0) else {
+        return;
+    };
+    let lost_fd = fd(&lost);
+    let lost_clock = Rc::new(Cell::new(Instant::now()));
+    let test_clock = Rc::clone(&lost_clock);
+    lost.events
+        .backend
+        .for_tests_set_monotonic_clock(Rc::new(move || test_clock.get()));
+    let gate = Rc::new(crate::kms::render::platform::RecordingPreparedUnflipReadiness::default());
+    gate.hold_output(0);
+    lost.events
+        .backend
+        .platform
+        .for_tests_set_prepared_unflip_readiness(gate.clone());
+    let initial = accepted_records(&submit_direct(&mut lost, &lost_direct, lost_fd)).remove(0);
+    let direct_id = accepted_event_id(&initial).expect("direct Present accepted");
+    complete_direct_initial(&mut lost, &initial, direct_id, lost_fd);
+    drain_present_notifications(&mut lost, &[lost_direct.candidate.present_id], &[]);
+    request_unflip(&mut lost, &lost_direct);
+    let offset = record_count(&lost, lost_fd);
+    Backend::maybe_composite(&mut lost.events.backend).expect("prepare shared lost notification");
+    let lost_deadline = lost
+        .events
+        .backend
+        .pstate
+        .scanout_m2
+        .composed_unflip
+        .as_ref()
+        .and_then(|batch| batch.prepare_deadline)
+        .expect("first prepare deadline is armed");
+    assert_eq!(
+        Backend::next_wakeup(&lost.events.backend),
+        Some(lost_deadline)
+    );
+    gate.release_output(0);
+    lost_clock.set(lost_deadline);
+    Backend::maybe_composite(&mut lost.events.backend).expect("recheck the prepared-plane ledger");
+    let lost_group = records_since(&lost, lost_fd, offset)
+        .into_iter()
+        .find(|record| record.events.len() == 1 && accepted_event_id(record).is_some())
+        .expect("one deadline recheck submits the already-complete exact plane");
+    assert_eq!(
+        records_since(&lost, lost_fd, offset)
+            .iter()
+            .filter(|record| record.events.len() == 1 && accepted_event_id(record).is_some())
+            .count(),
+        1,
+        "the timeout recheck does not duplicate rendering or grouped submission"
+    );
+    let lost_group_id = accepted_event_id(&lost_group).expect("accepted deadline group");
+    lost.events.wait_for_submitted_gpu_work();
+    inject_output(
+        &mut lost,
+        lost_fd,
+        &lost_group,
+        0,
+        lost_group_id,
+        74,
+        Duration::from_millis(740),
+    );
+    drain_present_notifications(&mut lost, &[], &[lost_direct.candidate.present_id]);
+    assert_issue281_unflip_end_state(&lost, lost_direct.candidate.present_id);
+    lost.finish_after_normal_drain();
+
+    let Some((mut cancelled, cancelled_direct)) =
+        direct_fixture(1, P1SceneRoute::CopiedSameDevice, 291, 0)
+    else {
+        return;
+    };
+    let cancelled_fd = fd(&cancelled);
+    let cancelled_clock = Rc::new(Cell::new(Instant::now()));
+    let test_clock = Rc::clone(&cancelled_clock);
+    cancelled
+        .events
+        .backend
+        .for_tests_set_monotonic_clock(Rc::new(move || test_clock.get()));
+    let source_readiness = Rc::clone(
+        cancelled
+            .readiness
+            .as_ref()
+            .expect("copied route readiness"),
+    );
+    source_readiness.hold_ready_jobs();
+    let initial = accepted_records(&submit_direct(
+        &mut cancelled,
+        &cancelled_direct,
+        cancelled_fd,
+    ))
+    .remove(0);
+    let cancelled_direct_id = accepted_event_id(&initial).expect("direct Present accepted");
+    complete_direct_initial(&mut cancelled, &initial, cancelled_direct_id, cancelled_fd);
+    drain_present_notifications(
+        &mut cancelled,
+        &[cancelled_direct.candidate.present_id],
+        &[],
+    );
+    request_unflip(&mut cancelled, &cancelled_direct);
+    Backend::maybe_composite(&mut cancelled.events.backend)
+        .expect("start first copied prepare attempt");
+    let first_job = cancelled
+        .pending_render_job_ids()
+        .last()
+        .copied()
+        .expect("first copied prepare attempt has a source job");
+    let first_deadline = cancelled
+        .events
+        .backend
+        .pstate
+        .scanout_m2
+        .composed_unflip
+        .as_ref()
+        .and_then(|batch| batch.prepare_deadline)
+        .expect("first copied prepare deadline is armed");
+    cancelled_clock.set(first_deadline);
+    Backend::maybe_composite(&mut cancelled.events.backend)
+        .expect("cancel only dependency-safe first attempt work");
+
+    let retry_job = cancelled
+        .pending_render_job_ids()
+        .last()
+        .copied()
+        .expect("one full-repaint retry starts after safe cancellation");
+    assert_ne!(
+        retry_job, first_job,
+        "retry receives a new render job identity"
+    );
+    assert_eq!(
+        cancelled
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .composed_unflip
+            .as_ref()
+            .expect("retry batch remains active")
+            .prepare_attempt,
+        2,
+        "there is one bounded retry"
+    );
+
+    let eventfd: std::os::fd::OwnedFd = nix::sys::eventfd::EventFd::from_value_and_flags(
+        0,
+        nix::sys::eventfd::EfdFlags::EFD_CLOEXEC | nix::sys::eventfd::EfdFlags::EFD_NONBLOCK,
+    )
+    .expect("create test-controlled unsignalled readiness source")
+    .into();
+    let witness = eventfd
+        .try_clone()
+        .expect("retain a live handle to the test readiness source");
+    let replaced = cancelled
+        .events
+        .backend
+        .platform
+        .for_tests_replace_pending_render_completion_fd(retry_job, eventfd)
+        .expect("replace the pending source fd at the platform readiness boundary");
+    drop(replaced);
+    let mut witness_poll = libc::pollfd {
+        fd: std::os::fd::AsRawFd::as_raw_fd(&witness),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `witness` keeps the test-controlled readiness source live.
+    assert_eq!(unsafe { libc::poll(&mut witness_poll, 1, 0) }, 0);
+
+    let second_deadline = cancelled
+        .events
+        .backend
+        .pstate
+        .scanout_m2
+        .composed_unflip
+        .as_ref()
+        .and_then(|batch| batch.prepare_deadline)
+        .expect("second prepare deadline is armed");
+    cancelled_clock.set(second_deadline);
+    let second_elapsed = Instant::now();
+    Backend::maybe_composite(&mut cancelled.events.backend)
+        .expect("second timeout polls only the batch-owned readiness source");
+    assert!(
+        second_elapsed.elapsed() <= Duration::from_millis(1500),
+        "second deadline returns after its at-most-one-second dependency poll"
+    );
+    assert!(matches!(
+        cancelled
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .composed_unflip
+            .as_ref()
+            .expect("writer-unsafe batch remains active")
+            .phase,
+        crate::kms::render::backend::ComposedUnflipPhase::Quarantined
+    ));
+    assert_eq!(
+        direct_source_pins(&cancelled, cancelled_direct.source_id),
+        1
+    );
+    assert_eq!(cancelled.events.backend.present_source_pins.len(), 2);
+    let quarantined_wakeup = Backend::next_wakeup(&cancelled.events.backend)
+        .expect("quarantine rearms one deadline without polling");
+    assert!(quarantined_wakeup > cancelled_clock.get());
+    let responsive_elapsed = Instant::now();
+    Backend::maybe_composite(&mut cancelled.events.backend)
+        .expect("quarantined Backend entry returns before its one-shot deadline");
+    assert!(responsive_elapsed.elapsed() < Duration::from_millis(250));
+    assert_eq!(
+        direct_source_pins(&cancelled, cancelled_direct.source_id),
+        1
+    );
+
+    // The old topology's complete all-off and device-quiescence boundary
+    // safely reclaims the quarantined target and releases direct ownership.
+    cancelled.events.wait_for_submitted_gpu_work();
+    cancelled
+        .events
+        .backend
+        .platform
+        .for_tests_accept_output_power_commits();
+    cancelled.events.backend.drive_vt_event(
+        &mut cancelled.events.state,
+        crate::vt::state::VtEventKind::Disable,
+    );
+    drain_present_notifications(
+        &mut cancelled,
+        &[],
+        &[cancelled_direct.candidate.present_id],
+    );
+    assert_issue281_unflip_end_state(&cancelled, cancelled_direct.candidate.present_id);
+    cancelled.finish();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: recover a deferred copied submit synchronously or publish a fake
+// final-fence notification after export fails.
+fn issue281_copied_sink_export_failure_quarantines_without_wait() {
+    let Some((mut fixture, direct)) = direct_fixture(1, P1SceneRoute::CopiedSameDevice, 288, 0)
+    else {
+        return;
+    };
+    let device_fd = fd(&fixture);
+    let readiness = Rc::clone(fixture.readiness.as_ref().expect("copied route readiness"));
+    readiness.hold_ready_jobs();
+    let initial = accepted_records(&submit_direct(&mut fixture, &direct, device_fd)).remove(0);
+    let direct_id = accepted_event_id(&initial).expect("direct Present accepted");
+    complete_direct_initial(&mut fixture, &initial, direct_id, device_fd);
+    drain_present_notifications(&mut fixture, &[direct.candidate.present_id], &[]);
+    request_unflip(&mut fixture, &direct);
+    let offset = record_count(&fixture, device_fd);
+    Backend::maybe_composite(&mut fixture.events.backend).expect("submit copied source render");
+    let job_id = fixture
+        .pending_render_job_ids()
+        .last()
+        .copied()
+        .expect("copied unflip source render is pending");
+    readiness.release_ready_job(job_id);
+    let export_failure =
+        std::sync::Arc::new(crate::kms::vk::scanout::RecordingSyncFileExporter::default());
+    export_failure.fail_next_export();
+    let Some(crate::kms::vk::scanout::OutputScanout::Copied(copied)) =
+        fixture.events.backend.platform.scanout_pools[0].as_mut()
+    else {
+        panic!("the fixture output must use the copied route");
+    };
+    for bo in &mut copied.destinations.bos {
+        bo.sync_file_exporter = export_failure.clone();
+    }
+    let began = Instant::now();
+    Backend::on_scanout_render_completion(&mut fixture.events.backend, &mut fixture.events.state);
+    assert_eq!(
+        export_failure.failure_count(),
+        1,
+        "the injected descriptor-exhaustion result occurs at final sync-file export"
+    );
+    assert!(
+        began.elapsed() < Duration::from_secs(2),
+        "the Backend returns after queue submission and failed final-fence export"
+    );
+    assert!(
+        records_since(&fixture, device_fd, offset)
+            .iter()
+            .all(|record| accepted_event_id(record).is_none()),
+        "no group or per-output commit is attempted without a final dependency"
+    );
+    assert!(matches!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .composed_unflip
+            .as_ref()
+            .expect("quarantined batch remains active")
+            .phase,
+        crate::kms::render::backend::ComposedUnflipPhase::Quarantined
+    ));
+    let identity = fixture
+        .events
+        .backend
+        .scene
+        .pending_unflip_frame_identities()
+        .into_iter()
+        .next()
+        .expect("quarantined scene frame remains pending");
+    assert!(fixture.events.backend.scene.unflip_frame_is_quarantined(
+        identity.output_idx,
+        identity.bo_idx,
+        identity.render_job_id,
+    ));
+    let pool = fixture.events.backend.platform.scanout_pools[0]
+        .as_ref()
+        .expect("copied output")
+        .display_pool();
+    assert_eq!(
+        pool.bos[identity.bo_idx].state.phase,
+        BoPhase::Submitted,
+        "the possibly-writing destination stays unavailable"
+    );
+    assert_eq!(direct_source_pins(&fixture, direct.source_id), 1);
+    assert_eq!(fixture.events.backend.present_source_pins.len(), 2);
+
+    // The production VT boundary performs all-output disable, event drain,
+    // scene cancellation, and device quiescence before releasing quarantined
+    // copied resources and direct pins.
+    fixture.events.wait_for_submitted_gpu_work();
+    fixture
+        .events
+        .backend
+        .platform
+        .for_tests_accept_output_power_commits();
+    fixture.events.backend.drive_vt_event(
+        &mut fixture.events.state,
+        crate::vt::state::VtEventKind::Disable,
+    );
+    drain_present_notifications(&mut fixture, &[], &[direct.candidate.present_id]);
+    assert_issue281_unflip_end_state(&fixture, direct.candidate.present_id);
+    fixture.finish();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Boundary test: keep preparation readiness held while each production lifecycle boundary quiesces it.
+// Mutation: allow a prepared unflip row or direct pin to survive a VT, DPMS, or RandR all-off transition.
+fn issue281_unflip_lifecycle_quiesces_vt_dpms_and_randr() {
+    use yserver_core::backend::Backend;
+
+    #[derive(Clone, Copy)]
+    enum Lifecycle {
+        Vt,
+        Dpms,
+        Randr,
+    }
+
+    for lifecycle in [Lifecycle::Vt, Lifecycle::Dpms, Lifecycle::Randr] {
+        let output_count = if matches!(lifecycle, Lifecycle::Randr) {
+            2
+        } else {
+            1
+        };
+        let present_id = match lifecycle {
+            Lifecycle::Vt => 293,
+            Lifecycle::Dpms => 294,
+            Lifecycle::Randr => 295,
+        };
+        let Some((mut fixture, direct)) =
+            direct_fixture(output_count, P1SceneRoute::Shared, present_id, 0)
+        else {
+            println!(
+                "SKIP issue281_unflip_lifecycle_quiesces_vt_dpms_and_randr: no Vulkan test device"
+            );
+            return;
+        };
+        let device_fd = fd(&fixture);
+        let gate =
+            Rc::new(crate::kms::render::platform::RecordingPreparedUnflipReadiness::default());
+        for output_idx in 0..output_count {
+            gate.hold_output(output_idx);
+        }
+        fixture
+            .events
+            .backend
+            .platform
+            .for_tests_set_prepared_unflip_readiness(gate.clone());
+        let initial = accepted_records(&submit_direct(&mut fixture, &direct, device_fd)).remove(0);
+        let direct_id = accepted_event_id(&initial).expect("direct Present accepted");
+        complete_direct_initial(&mut fixture, &initial, direct_id, device_fd);
+        drain_present_notifications(&mut fixture, &[direct.candidate.present_id], &[]);
+        request_unflip(&mut fixture, &direct);
+        Backend::maybe_composite(&mut fixture.events.backend)
+            .expect("start held unflip preparation before lifecycle transition");
+        assert!(
+            fixture
+                .events
+                .backend
+                .pstate
+                .scanout_m2
+                .composed_unflip
+                .is_some(),
+            "the lifecycle begins with an active held preparation"
+        );
+        match lifecycle {
+            Lifecycle::Vt => {
+                fixture
+                    .events
+                    .backend
+                    .platform
+                    .for_tests_accept_output_power_commits();
+                fixture.events.backend.drive_vt_event(
+                    &mut fixture.events.state,
+                    crate::vt::state::VtEventKind::Disable,
+                );
+            }
+            Lifecycle::Dpms => {
+                fixture
+                    .events
+                    .backend
+                    .platform
+                    .for_tests_accept_output_power_commits();
+                Backend::set_dpms_power(&mut fixture.events.backend, 3)
+                    .expect("DPMS off quiesces held unflip preparation");
+            }
+            Lifecycle::Randr => {
+                let (outputs, modes) =
+                    Backend::randr_outputs_and_modes(&mut fixture.events.backend);
+                let (screen_width, screen_height) = Backend::fb_dimensions(&fixture.events.backend);
+                fixture.events.state =
+                    yserver_core::server::ServerState::with_randr_outputs_and_modes(
+                        screen_width,
+                        screen_height,
+                        outputs.clone(),
+                        modes,
+                        yserver_core::server::BackendCapabilities::from_backend(
+                            &fixture.events.backend,
+                        ),
+                    );
+                let output = outputs.first().expect("RandR output exists");
+                fixture
+                    .events
+                    .backend
+                    .platform
+                    .for_tests_accept_output_power_commits();
+                fixture.events.backend.kms_outputs_active = false;
+                assert!(
+                    Backend::apply_crtc_config(
+                        &mut fixture.events.backend,
+                        output.output_id,
+                        &output.name,
+                        None,
+                        0,
+                        0,
+                    )
+                    .expect("RandR disable quiesces held unflip preparation")
+                );
+            }
+        }
+        drain_present_notifications(&mut fixture, &[], &[direct.candidate.present_id]);
+        assert_issue281_unflip_end_state_after_all_off(&fixture, direct.candidate.present_id);
+        fixture.finish();
+    }
 }
 
 fn scene_completion_for_output(

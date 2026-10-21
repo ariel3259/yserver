@@ -40,6 +40,56 @@ pub(crate) struct PreparedUnflipPlane {
     pub(crate) final_in_fence: Option<RawFd>,
 }
 
+/// Readiness boundary for prepared planes. The production implementation
+/// publishes every row immediately; recording fixtures can delay publication
+/// without changing the BO submission or the Backend path.
+pub(crate) trait PreparedUnflipReadiness {
+    fn take_ready(&self, prepared: &mut Vec<PreparedUnflipPlane>) -> Vec<PreparedUnflipPlane>;
+}
+
+pub(crate) struct ImmediatePreparedUnflipReadiness;
+
+impl PreparedUnflipReadiness for ImmediatePreparedUnflipReadiness {
+    fn take_ready(&self, prepared: &mut Vec<PreparedUnflipPlane>) -> Vec<PreparedUnflipPlane> {
+        std::mem::take(prepared)
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct RecordingPreparedUnflipReadiness {
+    held_outputs: std::cell::RefCell<std::collections::HashSet<usize>>,
+}
+
+#[cfg(test)]
+impl RecordingPreparedUnflipReadiness {
+    pub(crate) fn hold_output(&self, output_idx: usize) {
+        self.held_outputs.borrow_mut().insert(output_idx);
+    }
+
+    pub(crate) fn release_output(&self, output_idx: usize) {
+        self.held_outputs.borrow_mut().remove(&output_idx);
+    }
+}
+
+#[cfg(test)]
+impl PreparedUnflipReadiness for RecordingPreparedUnflipReadiness {
+    fn take_ready(&self, prepared: &mut Vec<PreparedUnflipPlane>) -> Vec<PreparedUnflipPlane> {
+        let held = self.held_outputs.borrow();
+        let mut ready = Vec::new();
+        let mut retained = Vec::new();
+        for plane in prepared.drain(..) {
+            if held.contains(&plane.output_idx) {
+                retained.push(plane);
+            } else {
+                ready.push(plane);
+            }
+        }
+        *prepared = retained;
+        ready
+    }
+}
+
 pub(crate) fn prepared_unflip_plane(
     output_idx: usize,
     output_key: crate::kms::backend::OutputKey,
@@ -122,6 +172,14 @@ pub(crate) fn grouped_unflip_ready(
 }
 
 impl PlatformBackend {
+    #[cfg(test)]
+    pub(crate) fn for_tests_set_prepared_unflip_readiness(
+        &mut self,
+        readiness: Rc<dyn PreparedUnflipReadiness>,
+    ) {
+        self.prepared_unflip_readiness = readiness;
+    }
+
     pub(crate) fn install_unflip_batch_context(&mut self, topology_generation: u64) {
         self.unflip_batch_context = Some(UnflipBatchContext {
             topology_generation,
@@ -235,7 +293,8 @@ impl PlatformBackend {
     }
 
     pub(crate) fn take_prepared_unflip_planes(&mut self) -> Vec<PreparedUnflipPlane> {
-        std::mem::take(&mut self.prepared_unflip_planes)
+        self.prepared_unflip_readiness
+            .take_ready(&mut self.prepared_unflip_planes)
     }
 
     #[cfg(test)]
@@ -753,6 +812,11 @@ impl PlatformBackend {
     /// only Vulkan idle + fence-fd close).
     pub(crate) fn reset_scanout_bos_for_suspend(&mut self) -> io::Result<()> {
         self.clear_scanout_render_completions();
+        // Lifecycle callers reach this point only after every old output is
+        // disabled and its DRM events are drained. Prepared rows can therefore
+        // be discarded before the pool reset closes their BO-owned fences.
+        self.unflip_batch_context = None;
+        self.prepared_unflip_planes.clear();
         let mut first_error = None;
         for output_idx in 0..self.scanout_pools.len() {
             if let Err(error) = self.drain_scanout_pool_at(output_idx) {

@@ -178,6 +178,7 @@ impl ScanoutBo {
             vk_memory: vk::DeviceMemory::null(),
             vk_image_view: image_view,
             vk_semaphore,
+            sync_file_exporter: Arc::new(crate::kms::vk::scanout::VulkanSyncFileExporter),
             export_semaphore_reuse: ExportSemaphoreReuseState::Reusable,
             fb_handle: Some(framebuffer),
             gem_handle: None,
@@ -219,6 +220,7 @@ impl ScanoutBo {
             vk_memory: vk::DeviceMemory::null(),
             vk_image_view: vk::ImageView::null(),
             vk_semaphore: vk::Semaphore::null(),
+            sync_file_exporter: Arc::new(crate::kms::vk::scanout::VulkanSyncFileExporter),
             export_semaphore_reuse: ExportSemaphoreReuseState::Reusable,
             fb_handle: Some(framebuffer),
             gem_handle: None,
@@ -520,6 +522,7 @@ impl ScanoutBo {
             vk_memory: memory,
             vk_image_view: image_view.expect("completed allocation has an image view"),
             vk_semaphore: semaphore.expect("completed allocation has a semaphore"),
+            sync_file_exporter: Arc::new(crate::kms::vk::scanout::VulkanSyncFileExporter),
             export_semaphore_reuse: ExportSemaphoreReuseState::Reusable,
             fb_handle: framebuffer,
             gem_handle: gem,
@@ -667,11 +670,9 @@ impl ScanoutBo {
     #[allow(dead_code)] // wired in by Task 2.5 (atomic-commit fence path).
     pub fn export_signaled_fd(&mut self) -> Result<Option<OwnedFd>, vk::Result> {
         self.export_semaphore_reuse.begin_post_submit_export();
-        let ext = self.vk.semaphore_fd_ext()?.clone();
-        let info = vk::SemaphoreGetFdInfoKHR::default()
-            .semaphore(self.vk_semaphore)
-            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
-        let raw_fd = unsafe { ext.get_semaphore_fd(&info)? };
+        let raw_fd = self
+            .sync_file_exporter
+            .export(&self.vk, self.vk_semaphore)?;
         let mut completion =
             crate::kms::vk::optional_sync_fd_from_vk(raw_fd, "vkGetSemaphoreFdKHR(SYNC_FD)")?;
         if completion

@@ -752,6 +752,9 @@ impl PlatformBackend {
             next_scanout_render_job_id: 1,
             unflip_batch_context: None,
             prepared_unflip_planes: Vec::new(),
+            prepared_unflip_readiness: Rc::new(
+                super::scanout_bos::ImmediatePreparedUnflipReadiness,
+            ),
             scanout_readback_op: None,
             gpu: GpuCore::new(vk, ops_command_pool, fence_pool, pixmap_pool),
             scanout_readback: None,
@@ -894,6 +897,9 @@ impl PlatformBackend {
             next_scanout_render_job_id: 1,
             unflip_batch_context: None,
             prepared_unflip_planes: Vec::new(),
+            prepared_unflip_readiness: Rc::new(
+                super::scanout_bos::ImmediatePreparedUnflipReadiness,
+            ),
             scanout_readback_op: None,
             gpu: GpuCore::for_tests(),
             scanout_readback: None,

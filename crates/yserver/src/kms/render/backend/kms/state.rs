@@ -279,6 +279,7 @@ pub(in crate::kms::render::backend) struct ComposedUnflipBatch {
     pub(in crate::kms::render::backend) retry_at: Option<Instant>,
     pub(in crate::kms::render::backend) prepare_deadline: Option<Instant>,
     pub(in crate::kms::render::backend) prepare_attempt: u8,
+    pub(in crate::kms::render::backend) fallback_revision: u64,
     pub(in crate::kms::render::backend) timeout_error_logged: bool,
 }
 
@@ -318,6 +319,10 @@ pub(in crate::kms::render::backend) struct ScanoutM2State {
     pub(in crate::kms::render::backend) reentry_blocked_until_composed: bool,
     pub(in crate::kms::render::backend) eligible_root_streak: u8,
     pub(in crate::kms::render::backend) unflip_fallback_source: Option<DrawableId>,
+    /// Increments when a real Present Copy updates a pinned direct fallback.
+    /// A preparation batch snapshots it so late copies can safely invalidate
+    /// an older in-flight render before grouped acceptance.
+    pub(in crate::kms::render::backend) unflip_fallback_revision: u64,
     /// Fallback backing identities containing the newest pixels needed by
     /// the pending unflip, whether copied by Present or materialized from a
     /// direct source. Current and pending frames can pin distinct targets.
@@ -350,6 +355,7 @@ impl ScanoutM2State {
             reentry_blocked_until_composed: false,
             eligible_root_streak: 0,
             unflip_fallback_source: None,
+            unflip_fallback_revision: 0,
             unflip_shadow_ready_targets: HashSet::new(),
             degraded_composed_unflip: false,
         }

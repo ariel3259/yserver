@@ -276,6 +276,7 @@ pub struct ScanoutBo {
     /// Object reused for the bo's whole lifetime; only the fd
     /// payload churns.
     pub vk_semaphore: vk::Semaphore,
+    pub(crate) sync_file_exporter: Arc<dyn SyncFileExporter>,
     export_semaphore_reuse: ExportSemaphoreReuseState,
     /// DRM framebuffer registered against this bo's GEM handle.
     /// `Option` so Drop can take it.
@@ -324,6 +325,60 @@ pub struct ScanoutBo {
     /// those handles without treating the synthetic framebuffer as a DRM FB.
     #[cfg(test)]
     test_compose_target: bool,
+}
+
+/// Export a scanout semaphore's current payload as a SYNC_FD. Keeping this
+/// operation behind the BO boundary lets recording fixtures model fd-export
+/// failure after a successful queue submission without changing submit flow.
+pub(crate) trait SyncFileExporter: Send + Sync {
+    fn export(&self, vk: &VkContext, semaphore: vk::Semaphore) -> Result<i32, vk::Result>;
+}
+
+pub(crate) struct VulkanSyncFileExporter;
+
+impl SyncFileExporter for VulkanSyncFileExporter {
+    fn export(&self, vk: &VkContext, semaphore: vk::Semaphore) -> Result<i32, vk::Result> {
+        let ext = vk.semaphore_fd_ext()?.clone();
+        let info = vk::SemaphoreGetFdInfoKHR::default()
+            .semaphore(semaphore)
+            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+        unsafe { ext.get_semaphore_fd(&info) }
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct RecordingSyncFileExporter {
+    fail_next: std::sync::atomic::AtomicBool,
+    failure_count: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl RecordingSyncFileExporter {
+    pub(crate) fn fail_next_export(&self) {
+        self.fail_next
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn failure_count(&self) -> usize {
+        self.failure_count
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+impl SyncFileExporter for RecordingSyncFileExporter {
+    fn export(&self, vk: &VkContext, semaphore: vk::Semaphore) -> Result<i32, vk::Result> {
+        if self
+            .fail_next
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.failure_count
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            return Err(vk::Result::ERROR_TOO_MANY_OBJECTS);
+        }
+        VulkanSyncFileExporter.export(vk, semaphore)
+    }
 }
 
 /// Per-bo transfer-side resources (command pool/buffer + staging

@@ -1109,6 +1109,15 @@ impl KmsBackend {
         {
             return Ok(false);
         }
+        // An authoritative-root Present has selected a newer source for its
+        // ordinary Copy fallback, but that Copy may still be waiting on the
+        // source/destination sync-file notification. Keep the direct frame on
+        // screen until note_present_pixmap marks the captured fallback ready;
+        // otherwise this eager materialization can snapshot B before the
+        // queued Copy writes C and the deferred scene render will preserve B.
+        if self.pstate.scanout_m2.unflip_fallback_source.is_some() {
+            return Ok(false);
+        }
         if !self.direct_scanout_topology_eligible() {
             return Err(io::Error::other(
                 "scanout M2: grouped unflip requires one DRM device and homogeneous refresh",
@@ -1143,6 +1152,7 @@ impl KmsBackend {
             retry_at: None,
             prepare_deadline: Some(self.monotonic_now() + std::time::Duration::from_secs(2)),
             prepare_attempt: 1,
+            fallback_revision: self.pstate.scanout_m2.unflip_fallback_revision,
             timeout_error_logged: false,
         });
         self.pstate
@@ -1163,6 +1173,17 @@ impl KmsBackend {
         let Some(batch) = self.pstate.scanout_m2.composed_unflip.as_ref() else {
             return Ok(false);
         };
+        if batch.fallback_revision != self.pstate.scanout_m2.unflip_fallback_revision
+            && !matches!(
+                batch.phase,
+                ComposedUnflipPhase::Cancelling
+                    | ComposedUnflipPhase::Quarantined
+                    | ComposedUnflipPhase::Accepted { .. }
+            )
+        {
+            self.begin_composed_unflip_cancellation(false)?;
+            return Ok(false);
+        }
         match batch.phase {
             ComposedUnflipPhase::Accepted { .. } => return Ok(false),
             ComposedUnflipPhase::Cancelling => {
@@ -1270,6 +1291,20 @@ impl KmsBackend {
                 batch.topology_generation,
             )
         };
+        if identities.iter().any(|identity| {
+            self.scene.unflip_frame_is_quarantined(
+                identity.output_idx,
+                identity.bo_idx,
+                identity.render_job_id,
+            )
+        }) {
+            if let Some(batch) = self.pstate.scanout_m2.composed_unflip.as_mut() {
+                batch.phase = ComposedUnflipPhase::Quarantined;
+                batch.retry_at = None;
+                batch.prepare_deadline = None;
+            }
+            return Ok(false);
+        }
         if expected_planes
             .iter()
             .any(|plane| !plane.recording_complete)
@@ -1630,6 +1665,7 @@ impl KmsBackend {
         batch.retry_at = None;
         batch.prepare_deadline = Some(prepare_deadline);
         batch.prepare_attempt = attempt.saturating_add(1);
+        batch.fallback_revision = self.pstate.scanout_m2.unflip_fallback_revision;
         self.platform
             .install_unflip_batch_context(topology_generation);
         self.scene.invalidate_all_scanout_damage();

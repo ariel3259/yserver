@@ -37,6 +37,9 @@ pub(crate) enum P1SceneRoute {
     CopiedSameDevice,
     /// As above, but the sink's KMS device is a different DRM fd.
     CopiedSeparateDevice,
+    /// One output renders directly to its scanout BO; the other renders to a
+    /// copied source and completes through the same sink DRM device.
+    MixedSharedCopied,
 }
 
 pub(crate) struct RecordingSceneFixture {
@@ -65,7 +68,11 @@ impl RecordingSceneFixture {
         };
         let mut readiness = None;
         if route != P1SceneRoute::Shared {
-            install_copied_route(&mut backend, route == P1SceneRoute::CopiedSeparateDevice)?;
+            if route == P1SceneRoute::MixedSharedCopied {
+                install_mixed_copied_route(&mut backend)?;
+            } else {
+                install_copied_route(&mut backend, route == P1SceneRoute::CopiedSeparateDevice)?;
+            }
             let observer = Rc::new(RecordingRenderCompletionReadiness::default());
             backend
                 .platform
@@ -300,6 +307,14 @@ impl RecordingSceneFixture {
     }
 
     pub(crate) fn assert_quiescent(&self) {
+        self.assert_quiescent_with_pending_scene_damage(false);
+    }
+
+    pub(crate) fn assert_quiescent_after_all_off(&self) {
+        self.assert_quiescent_with_pending_scene_damage(true);
+    }
+
+    fn assert_quiescent_with_pending_scene_damage(&self, allow_pending_scene_damage: bool) {
         self.events.assert_quiescent();
         let backend = &self.events.backend;
         let direct = &backend.pstate.scanout_m2;
@@ -372,10 +387,13 @@ impl RecordingSceneFixture {
             !backend.scene.has_pending_page_flips(),
             "recording scene has pending page-flip acknowledgements"
         );
-        assert!(
-            !backend.store.has_pending_presentation_damage(),
-            "live drawable presentation damage remains after normal completion"
-        );
+        // A lifecycle all-off keeps repaint damage for production resume.
+        if !allow_pending_scene_damage {
+            assert!(
+                !backend.store.has_pending_presentation_damage(),
+                "live drawable presentation damage remains after normal completion"
+            );
+        }
         for row in self.copy_ownership_observation() {
             assert!(
                 !(row.contains("phase=Free") && row.contains("ForeignPendingKms")),
@@ -394,9 +412,14 @@ impl RecordingSceneFixture {
             );
             let awaiting_renderer = row.contains("source=Some(ForeignAwaitingRenderer)");
             let first_use = row.contains("source=Some(RendererFirstUse)");
+            let lifecycle_reclaimed = allow_pending_scene_damage
+                && row.contains("ownership=Some(ReleasedButAtomicRejected)")
+                && row.contains("source=Some(RendererDiscard)")
+                && row.contains("return=none");
             assert!(
-                (awaiting_renderer
-                    && (row.contains("return=fd") || row.contains("return=already-signalled")))
+                lifecycle_reclaimed
+                    || (awaiting_renderer
+                        && (row.contains("return=fd") || row.contains("return=already-signalled")))
                     || (first_use && row.contains("return=none")),
                 "a copied source slot is mid-handoff or its return completion is inconsistent: {row}"
             );
@@ -950,5 +973,55 @@ fn install_copied_route(backend: &mut KmsBackend, separate_sink: bool) -> Result
     let layouts = backend.platform.scene_output_layouts();
     backend.scene = SceneCompositor::new(&backend.platform, &layouts)
         .map_err(|error| format!("rebuild copied route scene: {error:?}"))?;
+    Ok(())
+}
+
+fn install_mixed_copied_route(backend: &mut KmsBackend) -> Result<(), String> {
+    if backend.platform.outputs.len() != 2 {
+        return Err("mixed copied route requires two outputs".to_owned());
+    }
+    let bystander_key = super::super::test_device_key(1);
+    super::super::push_test_device(backend, bystander_key);
+    let render_device_id = backend.platform.outputs[1].scanout_route.render_device_id;
+    let sink_key = backend.platform.outputs[1].key.device_key;
+    let route = crate::kms::scanout_route::ScanoutRoute::new(
+        render_device_id,
+        sink_key,
+        crate::kms::scanout_route::RenderKmsRelationship::Different,
+    );
+    backend.platform.outputs[1].scanout_route = route;
+    let vk = Arc::clone(
+        backend
+            .platform
+            .gpu
+            .vk
+            .as_ref()
+            .expect("Vk-backed test fixture has a context"),
+    );
+    let Some(Some(OutputScanout::Shared(mut destinations))) =
+        backend.platform.scanout_pools.get_mut(1).map(Option::take)
+    else {
+        return Err("mixed route requires a shared destination pool".to_owned());
+    };
+    destinations.route = route;
+    let mut copied = crate::kms::vk::scanout::CopiedScanoutPool::for_tests_recording_pool(
+        Arc::clone(&vk),
+        destinations,
+    )
+    .map_err(|error| format!("allocate mixed copied recording route: {error}"))?;
+    if let Some(front_idx) = copied
+        .destinations
+        .bos
+        .iter()
+        .position(|bo| bo.state.phase == BoPhase::OnScreen)
+    {
+        copied
+            .note_kms_modeset_installed(front_idx)
+            .map_err(|error| format!("record mixed copied front ownership: {error}"))?;
+    }
+    backend.platform.scanout_pools[1] = Some(OutputScanout::Copied(copied));
+    let layouts = backend.platform.scene_output_layouts();
+    backend.scene = SceneCompositor::new(&backend.platform, &layouts)
+        .map_err(|error| format!("rebuild mixed scene route: {error:?}"))?;
     Ok(())
 }

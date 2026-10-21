@@ -492,6 +492,46 @@ fn try_live_direct_for_ids(
     submitted.then_some(shape)
 }
 
+fn try_live_direct_with_copy_fallback_for_ids(
+    backend: &mut KmsBackend,
+    present_id: u64,
+    protocol_window_xid: u32,
+    host_window_xid: u32,
+    options: u32,
+) -> Option<crate::drm::async_flip::AsyncShape> {
+    use yserver_core::backend::Backend;
+
+    let (candidate, event, shape) = prepare_direct_present_for_ids_with_storage(
+        backend,
+        present_id,
+        protocol_window_xid,
+        host_window_xid,
+        800,
+        600,
+        options,
+        true,
+    );
+    let submitted = Backend::try_present_direct(backend, candidate, event)
+        .unwrap_or_else(|error| panic!("live direct Present {present_id}: {error}"));
+    if !submitted {
+        Backend::copy_area(
+            backend,
+            None,
+            candidate.src_host_xid,
+            candidate.paint_dst_host_xid,
+            0,
+            0,
+            candidate.x_off,
+            candidate.y_off,
+            candidate.src_width,
+            candidate.src_height,
+        )
+        .expect("ordinary Present Copy fallback after direct rejection");
+        Backend::note_present_pixmap(backend, candidate.src_pixmap_xid, candidate.dst_window_xid);
+    }
+    submitted.then_some(shape)
+}
+
 fn retire_direct_present(
     backend: &mut KmsBackend,
     state: &mut yserver_core::server::ServerState,
@@ -3459,7 +3499,7 @@ fn entry_from_held_direct_with_visible_hw_cursor_runs_handoff() {
     }
 
     assert!(
-        try_live_direct_for_ids(
+        try_live_direct_with_copy_fallback_for_ids(
             &mut backend,
             12_665,
             WINDOW.0,
@@ -5076,7 +5116,7 @@ fn pollable_test_device() -> (
     (std::rc::Rc::new(device), peer)
 }
 
-fn install_test_core_client(
+pub(super) fn install_test_core_client(
     state: &mut yserver_core::server::ServerState,
 ) -> std::os::unix::net::UnixStream {
     install_test_core_client_as(state, yserver_protocol::x11::ClientId(1))
@@ -5124,9 +5164,9 @@ fn install_test_core_client_as(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TestPresentCompletion {
-    serial: u32,
-    mode: u8,
+pub(super) struct TestPresentCompletion {
+    pub(super) serial: u32,
+    pub(super) mode: u8,
 }
 
 fn select_test_present_complete_events(state: &mut yserver_core::server::ServerState, window: u32) {
@@ -5140,7 +5180,7 @@ fn select_test_present_complete_events(state: &mut yserver_core::server::ServerS
     );
 }
 
-fn run_core_present_pixmap(
+pub(super) fn run_core_present_pixmap(
     state: &mut yserver_core::server::ServerState,
     backend: &mut KmsBackend,
     peer: std::os::unix::net::UnixStream,
@@ -5148,6 +5188,34 @@ fn run_core_present_pixmap(
     window: u32,
     pixmap: u32,
     options: u32,
+    expected_serial: Option<u32>,
+) -> (
+    std::os::unix::net::UnixStream,
+    u16,
+    Vec<TestPresentCompletion>,
+) {
+    run_core_present_pixmap_with_valid_region(
+        state,
+        backend,
+        peer,
+        sequence,
+        window,
+        pixmap,
+        options,
+        0,
+        expected_serial,
+    )
+}
+
+pub(super) fn run_core_present_pixmap_with_valid_region(
+    state: &mut yserver_core::server::ServerState,
+    backend: &mut KmsBackend,
+    peer: std::os::unix::net::UnixStream,
+    sequence: u16,
+    window: u32,
+    pixmap: u32,
+    options: u32,
+    valid_region: u32,
     expected_serial: Option<u32>,
 ) -> (
     std::os::unix::net::UnixStream,
@@ -5177,6 +5245,7 @@ fn run_core_present_pixmap(
         present_body[0..4].copy_from_slice(&window.to_le_bytes());
         present_body[4..8].copy_from_slice(&pixmap.to_le_bytes());
         present_body[8..12].copy_from_slice(&u32::from(sequence).to_le_bytes());
+        present_body[12..16].copy_from_slice(&valid_region.to_le_bytes());
         present_body[36..40].copy_from_slice(&options.to_le_bytes());
         request_sender
             .send(Message::Request {
