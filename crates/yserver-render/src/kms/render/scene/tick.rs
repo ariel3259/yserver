@@ -3,14 +3,14 @@ use crate::kms::{
         region::Region,
         scene::{
             CarriedDamage, ComposeRenderTarget, CursorAssignment, CursorTransition, FailedSubmitBo,
-            FinishOutcome, FrameHandoff, FullReason, InFlightStage, OutputRoute, OutputSceneState,
-            OutputSink, OutputWalkReport, PendingAck, Repaint, RepaintPlan, ScalePass,
-            SceneCompositor, SceneCompositorInner, SceneError, SceneInput, TickOutcome,
-            TickSkipReason, Visibility,
+            FinishOutcome, FrameHandoff, FrameSubmitMode, FullReason, InFlightStage, OutputRoute,
+            OutputSceneState, OutputSink, OutputWalkReport, PendingAck, RecordedFrame, Repaint,
+            RepaintPlan, ScalePass, SceneCompositor, SceneCompositorInner, SceneError, SceneInput,
+            TickOutcome, TickSkipReason, Visibility,
             build::build_scene_with,
             compose::{
-                compose_submit_was_complete, present_error_is_device_lost,
-                record_and_submit_render, stage_submitted_frame, vk_result_is_device_lost,
+                present_error_is_device_lost, record_and_submit_render, recorded_frame,
+                stage_submitted_frame, vk_result_is_device_lost,
             },
             cursor::{
                 cursor_damage_for_frame, cursorless_hide_frame_required, derive_cursor_transition,
@@ -22,10 +22,7 @@ use crate::kms::{
                 audit_reference_scene, audit_sampled_pairs, damage_audit_enabled,
                 emit_damage_audit_heartbeat, run_damage_audit,
             },
-            flip::{
-                drain_pending_pool_releases, handle_scanout_render_completion_inner,
-                retire_failed_submit_bos,
-            },
+            flip::{drain_pending_pool_releases, retire_failed_submit_bos},
             output_transform,
             repaint::{
                 cull_scene_to_region, draw_dst_rect_inward, opaque_cover_exists, plan_repaint,
@@ -86,7 +83,11 @@ impl SceneCompositor {
     /// commit-retry backoff, flushing paint would create GPU submit
     /// traffic that cannot be scanned out yet and would fragment COW
     /// batching under compositor drag workloads.
-    pub fn has_output_ready_for_submit(&self, sink: &dyn OutputSink) -> bool {
+    pub fn has_output_ready_for_submit(
+        &self,
+        sink: &dyn OutputSink,
+        mode: FrameSubmitMode,
+    ) -> bool {
         let Some(inner) = self.inner.as_ref() else {
             return true;
         };
@@ -97,8 +98,9 @@ impl SceneCompositor {
             .enumerate()
             .any(|(output_idx, output)| {
                 output_is_ready_for_submit(
-                    !self.has_pending_page_flip(output_idx),
+                    !self.has_pending_scene_frame(output_idx),
                     sink.output_commit_in_flight(output_idx),
+                    mode,
                     output.next_submit_retry_at,
                     now,
                 )
@@ -106,7 +108,12 @@ impl SceneCompositor {
     }
 
     /// Whether one output can accept a scene frame now.
-    pub fn output_ready_for_submit(&self, output_idx: usize, sink: &dyn OutputSink) -> bool {
+    pub fn output_ready_for_submit(
+        &self,
+        output_idx: usize,
+        sink: &dyn OutputSink,
+        mode: FrameSubmitMode,
+    ) -> bool {
         let Some(output) = self
             .inner
             .as_ref()
@@ -115,8 +122,9 @@ impl SceneCompositor {
             return false;
         };
         output_is_ready_for_submit(
-            !self.has_pending_page_flip(output_idx),
+            !self.has_pending_scene_frame(output_idx),
             sink.output_commit_in_flight(output_idx),
+            mode,
             output.next_submit_retry_at,
             std::time::Instant::now(),
         )
@@ -163,6 +171,7 @@ impl SceneCompositor {
         sink: &mut dyn OutputSink,
         telemetry: &mut Telemetry,
         cow_host_xid: Option<u32>,
+        mode: FrameSubmitMode,
     ) -> Result<Vec<usize>, SceneError> {
         // Destructure so `inner` (mutable) and `root_overlay` (shared)
         // are borrowed as disjoint fields: `tick_one_output` needs
@@ -255,6 +264,7 @@ impl SceneCompositor {
                 telemetry,
                 hw_cursor,
                 cow_host_xid,
+                mode,
                 root_overlay,
                 &elsewhere,
                 &mut drawn,
@@ -323,12 +333,13 @@ impl SceneCompositor {
         // Vulkan may export the already-signalled SYNC_FD sentinel (`fd=-1`).
         // Such a job has no pollable fd, so drain only after every composed
         // output installed its PendingAck; exact job/BO matching is then live
-        // before the immediate B submission runs.
-        for completion in sink.drain_render_completions() {
+        // before the copied sink submission runs.
+        let notifications = sink.drain_render_notifications();
+        for notification in notifications {
             if sink.gpu().renderer_failed {
                 break;
             }
-            if !handle_scanout_render_completion_inner(inner, completion, sink) {
+            if !self.handle_render_notification(notification, store, sink) {
                 telemetry.record_missed_pageflip();
             }
             if sink.gpu().renderer_failed {
@@ -341,18 +352,29 @@ impl SceneCompositor {
 
 /// What the sink did with a finished frame, as the tick consumes it.
 enum Handoff {
-    Flipped(Option<u64>),
-    Render(Option<std::os::fd::OwnedFd>),
+    Flipped {
+        recorded: RecordedFrame,
+        event_id: Option<u64>,
+    },
+    Render {
+        recorded: RecordedFrame,
+        fd: Option<std::os::fd::OwnedFd>,
+    },
+    DeferredUnflip {
+        render_job_id: u64,
+        recording_complete: bool,
+    },
 }
 
 pub(super) fn output_is_ready_for_submit(
-    pending_acks_empty: bool,
+    pending_scene_frames_empty: bool,
     output_commit_in_flight: bool,
+    mode: FrameSubmitMode,
     retry_at: Option<std::time::Instant>,
     now: std::time::Instant,
 ) -> bool {
-    pending_acks_empty
-        && !output_commit_in_flight
+    pending_scene_frames_empty
+        && (mode == FrameSubmitMode::DeferredUnflip || !output_commit_in_flight)
         && retry_at.is_none_or(|deadline| now >= deadline)
 }
 
@@ -568,6 +590,7 @@ fn tick_one_output(
     telemetry: &mut Telemetry,
     hw_strategy_enabled: bool,
     cow_host_xid: Option<u32>,
+    mode: FrameSubmitMode,
     root_overlay: &crate::kms::render::root_overlay::RootOverlay,
     // Idle free-run fix (cut 2b): accumulator for the sampled-source
     // ids `build_scene` actually drew on this output, unioned across
@@ -626,6 +649,7 @@ fn tick_one_output(
         if !output_is_ready_for_submit(
             true,
             sink.output_commit_in_flight(output_idx),
+            mode,
             None,
             std::time::Instant::now(),
         ) {
@@ -1163,6 +1187,16 @@ fn tick_one_output(
     };
     let descriptor_pool = state.pool_ring.pool_at(slot);
 
+    // One stable identity follows this compose through copied readiness and
+    // any deferred grouped-unflip handoff. Registration never replaces it.
+    let render_job_id = match sink.allocate_render_job_id() {
+        Ok(render_job_id) => render_job_id,
+        Err(error) => {
+            inner.outputs[output_idx].pool_ring.release(slot);
+            return Err(PresentError::Io(error).into());
+        }
+    };
+
     // 7. Record + submit + flip via the v2 clipped compose path.
     let compose_ticket = match sink.gpu().acquire_fence_ticket() {
         Ok(ticket) => ticket,
@@ -1231,7 +1265,6 @@ fn tick_one_output(
     // only the allocated prefix; on the clipped path a frame that painted less
     // than it claims must not be staged as `painted`. The copied route renders
     // Full and re-clears every frame, so only the shared path reports it.
-    let mut compose_complete = true;
     let record_start = std::time::Instant::now();
     // The copied route renders Full into the whole source.
     let (record_repaint, record_scissors): (Repaint, &[vk::Rect2D]) = if shared_output {
@@ -1247,7 +1280,7 @@ fn tick_one_output(
         )
     };
     let mut record = |target: &mut dyn ComposeRenderTarget| {
-        record_and_submit_render(
+        let submit = record_and_submit_render(
             &inner.vk,
             target,
             &inner.pipeline,
@@ -1262,10 +1295,11 @@ fn tick_one_output(
             xor_layout,
             scale_pass.as_ref(),
             cursor_save,
-        )
+        )?;
+        Ok(recorded_frame(submit, render_scene.draws.len()))
     };
     let (render_result, previous_gpu_ns, copied_prepare_failed) =
-        match sink.finish_frame(output_idx, token.bo_idx, &mut record) {
+        match sink.finish_frame(output_idx, token.bo_idx, render_job_id, mode, &mut record) {
             FinishOutcome::Unavailable(error) => return Err(error.into()),
             FinishOutcome::Finished {
                 result,
@@ -1273,12 +1307,19 @@ fn tick_one_output(
                 fail_stop,
             } => (
                 result.map(|handoff| match handoff {
-                    FrameHandoff::FlipPending { submit, event_id } => {
-                        compose_complete =
-                            compose_submit_was_complete(submit, render_scene.draws.len());
-                        Handoff::Flipped(event_id)
+                    FrameHandoff::FlipPending { recorded, event_id } => {
+                        Handoff::Flipped { recorded, event_id }
                     }
-                    FrameHandoff::RenderCompletion(completion) => Handoff::Render(completion),
+                    FrameHandoff::RenderCompletion { recorded, fd } => {
+                        Handoff::Render { recorded, fd }
+                    }
+                    FrameHandoff::DeferredUnflip {
+                        render_job_id,
+                        recording_complete,
+                    } => Handoff::DeferredUnflip {
+                        render_job_id,
+                        recording_complete,
+                    },
                 }),
                 previous_gpu_ns,
                 fail_stop,
@@ -1301,11 +1342,39 @@ fn tick_one_output(
         sink.gpu_mut().renderer_failed = true;
     }
     let compose_result = match render_result {
-        Ok(Handoff::Render(completion)) => sink
-            .register_render_completion(output_idx, token.bo_idx, completion)
-            .map(|job_id| InFlightStage::WaitingForRenderCompletion { job_id })
+        Ok(Handoff::Render { recorded, fd }) => sink
+            .register_render_completion(
+                output_idx,
+                token.bo_idx,
+                render_job_id,
+                mode,
+                recorded.recording_complete,
+                fd,
+            )
+            .map(|()| {
+                (
+                    InFlightStage::WaitingForRenderCompletion { render_job_id },
+                    recorded.recording_complete,
+                )
+            })
             .map_err(PresentError::Io),
-        Ok(Handoff::Flipped(event_id)) => Ok(InFlightStage::KmsFlipPending { event_id }),
+        Ok(Handoff::Flipped { recorded, event_id }) => Ok((
+            InFlightStage::KmsFlipPending { event_id },
+            recorded.recording_complete,
+        )),
+        Ok(Handoff::DeferredUnflip {
+            render_job_id: handoff_job_id,
+            recording_complete,
+        }) if handoff_job_id == render_job_id => Ok((
+            InFlightStage::UnflipPrepared { render_job_id },
+            recording_complete,
+        )),
+        Ok(Handoff::DeferredUnflip { .. }) => {
+            sink.gpu_mut().renderer_failed = true;
+            Err(PresentError::Io(std::io::Error::other(
+                "deferred unflip handoff changed its render job identity",
+            )))
+        }
         Err(error) => Err(error),
     };
     let record_ns = u64::try_from(record_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -1320,7 +1389,8 @@ fn tick_one_output(
 
     let state = inner.outputs.get_mut(output_idx).expect("range");
     match compose_result {
-        Ok(stage) => {
+        Ok((stage, recording_complete)) => {
+            let compose_complete = recording_complete;
             state.next_submit_retry_at = None;
             if let Some(intermediate) = state.intermediate.as_mut() {
                 intermediate.has_content = true;
@@ -1334,6 +1404,9 @@ fn tick_one_output(
             state.pending_acks.push_back(PendingAck {
                 bo_idx: token.bo_idx,
                 generation: frame_gen,
+                render_job_id,
+                mode,
+                recording_complete,
                 stage,
                 drawable_snapshots: built.snapshots,
                 ticket: Some(compose_ticket),

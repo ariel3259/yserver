@@ -64,11 +64,36 @@ pub enum FrameTargetError {
     NoSlot,
 }
 
+/// Whether a composed scene frame submits to KMS immediately or is retained
+/// for the shared all-output unflip commit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FrameSubmitMode {
+    Immediate,
+    DeferredUnflip,
+}
+
+/// What the compose recorder produced and whether it recorded every scene
+/// draw. A signalled fence does not imply a complete recording.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecordedFrame {
+    pub submit: ComposeSubmit,
+    pub recording_complete: bool,
+}
+
+/// What happened when a copied destination was prepared after its source
+/// render completed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CopiedSubmitOutcome {
+    FlipAccepted { event_id: u64 },
+    PreparedForGroup,
+    QuarantinedWithoutFinalDependency,
+}
+
 /// How a finished frame leaves the sink.
 pub enum FrameHandoff {
     /// Composed and flipped; retirement comes as a page flip.
     FlipPending {
-        submit: ComposeSubmit,
+        recorded: RecordedFrame,
         /// Identity of the accepted commit's retiring page-flip event.
         /// Non-KMS sinks leave this empty.
         event_id: Option<u64>,
@@ -76,7 +101,17 @@ pub enum FrameHandoff {
     /// Composed into the copied route's source; the completion fd (`None` is
     /// the already-signalled payload) goes to
     /// [`OutputSink::register_render_completion`].
-    RenderCompletion(Option<OwnedFd>),
+    RenderCompletion {
+        recorded: RecordedFrame,
+        fd: Option<OwnedFd>,
+    },
+    /// Composed into a shared scanout BO without acquiring a per-output KMS
+    /// obligation. The BO owns its exported final dependency until grouped
+    /// submission or safe cancellation.
+    DeferredUnflip {
+        render_job_id: u64,
+        recording_complete: bool,
+    },
 }
 
 /// The result of [`OutputSink::finish_frame`].
@@ -105,19 +140,32 @@ impl From<FrameTargetError> for SceneError {
 
 /// A copied-route render completion that became ready.
 pub struct RenderCompletion {
-    pub job_id: u64,
+    pub render_job_id: u64,
     /// The output it belongs to, or the removed output's identity formatted
     /// for the log.
     pub output: Result<usize, String>,
     pub bo_idx: usize,
+    pub mode: FrameSubmitMode,
+    pub recording_complete: bool,
     /// `None` is the already-signalled payload.
     pub fd: Option<OwnedFd>,
 }
 
 /// The record step of [`OutputSink::finish_frame`]: compose and submit into
-/// the lent target.
+/// the lent target, including whether every requested draw was recorded.
 pub type RecordFrame<'a> =
-    dyn FnMut(&mut dyn ComposeRenderTarget) -> Result<ComposeSubmit, PresentError> + 'a;
+    dyn FnMut(&mut dyn ComposeRenderTarget) -> Result<RecordedFrame, PresentError> + 'a;
+
+/// A notification that advances a render handoff or makes its target safe to
+/// recycle after cancellation.
+pub enum RenderNotification {
+    CopiedSourceReady(RenderCompletion),
+    UnflipDependencySafe {
+        output: Result<usize, String>,
+        bo_idx: usize,
+        render_job_id: u64,
+    },
+}
 
 /// Frame slots, presentation and retirement of the outputs the scene draws.
 pub trait OutputSink {
@@ -146,6 +194,8 @@ pub trait OutputSink {
         &mut self,
         output_idx: usize,
         bo_idx: usize,
+        render_job_id: u64,
+        mode: FrameSubmitMode,
         record: &mut RecordFrame<'_>,
     ) -> FinishOutcome;
     fn invalidate_slot(&mut self, output_idx: usize, bo_idx: usize);
@@ -157,8 +207,22 @@ pub trait OutputSink {
     /// Recovery of the slot failed.
     fn recycle_failed_slot(&mut self, output_idx: usize, bo_idx: usize) -> io::Result<()>;
 
+    /// Recycle a deferred-unflip target only after its final dependency is
+    /// known safe. Non-KMS sinks use their ordinary failed-slot recovery.
+    fn recycle_unflip_target_after_dependency_safe(
+        &mut self,
+        output_idx: usize,
+        bo_idx: usize,
+    ) -> io::Result<()> {
+        self.recycle_failed_slot(output_idx, bo_idx)
+    }
+
     fn on_page_flip_complete(&mut self, output_idx: usize) -> Option<FlipRetirement>;
     fn commit_slot_present(&mut self, output_idx: usize, bo_idx: usize, generation: u64);
+
+    /// Allocate the one render identity used from recording through any
+    /// copied readiness delivery. Registration must preserve this ID.
+    fn allocate_render_job_id(&mut self) -> io::Result<u64>;
 
     /// Copied route: register a source render completion.
     ///
@@ -169,9 +233,12 @@ pub trait OutputSink {
         &mut self,
         output_idx: usize,
         bo_idx: usize,
+        render_job_id: u64,
+        mode: FrameSubmitMode,
+        recording_complete: bool,
         fd: Option<OwnedFd>,
-    ) -> io::Result<u64>;
-    fn drain_render_completions(&mut self) -> Vec<RenderCompletion>;
+    ) -> io::Result<()>;
+    fn drain_render_notifications(&mut self) -> Vec<RenderNotification>;
     fn clear_render_completions(&mut self);
     /// Copied route: copy the completed source and present it.
     ///
@@ -182,8 +249,11 @@ pub trait OutputSink {
         &mut self,
         output_idx: usize,
         bo_idx: usize,
+        render_job_id: u64,
+        recording_complete: bool,
+        mode: FrameSubmitMode,
         fd: Option<OwnedFd>,
-    ) -> io::Result<Option<u64>>;
+    ) -> io::Result<CopiedSubmitOutcome>;
 }
 
 /// A cursor show that failed, and whether the old sprite is still visible.

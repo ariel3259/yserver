@@ -2154,27 +2154,28 @@ impl KmsBackend {
         &mut self,
         _state: &mut ServerState,
     ) {
-        let completions =
-            crate::kms::render::scene::OutputSink::drain_render_completions(&mut self.platform);
+        let notifications =
+            crate::kms::render::scene::OutputSink::drain_render_notifications(&mut self.platform);
         if !self.scanout_allowed() {
             // Draining avoids a readable aggregator spinning the core loop.
             // The suspend/topology lifecycle subsequently waits A, cancels
             // the ledger, and drains both pool devices before any allocation
             // can be reset or dropped.
             log::debug!(
-                "render copied scanout: discarded {} completion(s) while scanout is inactive",
-                completions.len(),
+                "render scanout: discarded {} notification(s) while scanout is inactive",
+                notifications.len(),
             );
             return;
         }
-        for completion in completions {
+        for notification in notifications {
             if self.platform.gpu.renderer_failed {
                 break;
             }
-            if !self
-                .scene
-                .handle_scanout_render_completion(completion, &mut self.platform)
-            {
+            if !self.scene.handle_render_notification(
+                notification,
+                &mut self.store,
+                &mut self.platform,
+            ) {
                 self.telemetry.record_missed_pageflip();
             }
             self.record_accepted_degraded_unflip_replacements();
@@ -2356,7 +2357,10 @@ impl KmsBackend {
         let allow_kms_timers = self.scanout_allowed() && self.kms_outputs_active;
         let scene_deadline = if allow_kms_timers {
             if self.scene_wants_compose() {
-                if self.scene.has_output_ready_for_submit(&self.platform) {
+                if self.scene.has_output_ready_for_submit(
+                    &self.platform,
+                    crate::kms::render::scene::FrameSubmitMode::Immediate,
+                ) {
                     Some(now)
                 } else {
                     self.scene.earliest_retry_deadline()
@@ -2603,7 +2607,7 @@ impl KmsBackend {
         {
             None
         } else {
-            self.compose_tick()
+            self.compose_tick(crate::kms::render::scene::FrameSubmitMode::Immediate)
         };
         // `scene.tick` drains already-signalled copied completions itself,
         // without entering backend_scanout_on_scanout_render_completion.
@@ -2629,12 +2633,14 @@ impl KmsBackend {
         self.handle_cursor_move_outcome(cursor_outcome);
         for output_idx in 0..self.platform.outputs.len() {
             if scene_submitted_outputs.contains(&output_idx)
-                || self.scene.has_pending_page_flip(output_idx)
+                || self.scene.has_pending_scene_frame(output_idx)
                 || self.scene.output_submit_retry_pending(output_idx)
                 || (self.scene_wants_scene()
-                    && self
-                        .scene
-                        .output_ready_for_submit(output_idx, &self.platform))
+                    && self.scene.output_ready_for_submit(
+                        output_idx,
+                        &self.platform,
+                        crate::kms::render::scene::FrameSubmitMode::Immediate,
+                    ))
             {
                 continue;
             }

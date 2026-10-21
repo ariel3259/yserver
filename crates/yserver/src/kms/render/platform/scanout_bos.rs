@@ -62,8 +62,11 @@ impl PlatformBackend {
         &mut self,
         output_idx: usize,
         bo_idx: usize,
+        _render_job_id: u64,
+        _recording_complete: bool,
+        mode: crate::kms::render::scene::FrameSubmitMode,
         render_completion: Option<OwnedFd>,
-    ) -> io::Result<u64> {
+    ) -> io::Result<crate::kms::render::scene::CopiedSubmitOutcome> {
         self.debug_assert_scanout_pool_route(output_idx);
         let output_key = self
             .outputs
@@ -124,6 +127,9 @@ impl PlatformBackend {
                 .expect("copied destination was checked before copy submission");
             let in_fence_fd = copy_completion.map_or(-1, IntoRawFd::into_raw_fd);
             destination.state.transition_to_submitted(in_fence_fd);
+            if mode == crate::kms::render::scene::FrameSubmitMode::DeferredUnflip {
+                return Ok(crate::kms::render::scene::CopiedSubmitOutcome::PreparedForGroup);
+            }
             let mut out_fence_fd = -1;
             match crate::drm::page_flip::submit_scene_flip_with_fences(
                 &device,
@@ -141,7 +147,7 @@ impl PlatformBackend {
                         // owned input-fence fd back to this caller.
                         unsafe { libc::close(fd) };
                     }
-                    Ok(event_id)
+                    Ok(crate::kms::render::scene::CopiedSubmitOutcome::FlipAccepted { event_id })
                 }
                 Err(error) => {
                     if let Some(fd) = destination
@@ -170,14 +176,18 @@ impl PlatformBackend {
             }
         })();
 
-        if atomic_commit_sink.take_last_cursor_rejection()
+        if mode == crate::kms::render::scene::FrameSubmitMode::Immediate
+            && atomic_commit_sink.take_last_cursor_rejection()
             && let Err(error) = &result
         {
             let rejected = self.reject_atomic_cursor_commit(&cursor_positions, &error.to_string());
             self.defer_cursor_move_outcome(rejected);
         }
 
-        if result.is_ok() {
+        if matches!(
+            result,
+            Ok(crate::kms::render::scene::CopiedSubmitOutcome::FlipAccepted { .. })
+        ) {
             self.cursor_plane_scene_commit_submitted(&cursor_positions);
         }
 
@@ -191,6 +201,32 @@ impl PlatformBackend {
             self.gpu.renderer_failed = true;
         }
         result
+    }
+
+    /// A deferred frame target may only be reused after its final render or
+    /// sink-copy dependency is safe. Validate the submitted phase before
+    /// running the shared recovery path so this cannot reset a pending KMS BO.
+    pub(crate) fn recycle_unflip_scanout_bo_after_dependency_safe(
+        &mut self,
+        output_idx: usize,
+        bo_idx: usize,
+    ) -> io::Result<()> {
+        self.debug_assert_scanout_pool_route(output_idx);
+        let Some(scanout) = self.scanout_pools.get(output_idx).and_then(Option::as_ref) else {
+            return Err(io::Error::other(
+                "unflip output no longer has a scanout pool",
+            ));
+        };
+        let Some(bo) = scanout.display_pool().bos.get(bo_idx) else {
+            return Err(io::Error::other("unflip BO index is out of range"));
+        };
+        if !matches!(bo.state.phase, BoPhase::Recording | BoPhase::Submitted) {
+            return Err(io::Error::other(format!(
+                "unflip target output {output_idx} BO {bo_idx} is {:?}, expected Recording or Submitted",
+                bo.state.phase
+            )));
+        }
+        self.recycle_failed_submit_bo(output_idx, bo_idx)
     }
 
     /// Framebuffer last presented by the scene compositor for this output.

@@ -32,13 +32,13 @@ pub(crate) struct KernelPageFlip {
 }
 
 pub(crate) trait RenderCompletionReadiness {
-    fn is_ready(&self, job_id: u64, fd: Option<BorrowedFd<'_>>) -> io::Result<bool>;
+    fn is_ready(&self, render_job_id: u64, fd: Option<BorrowedFd<'_>>) -> io::Result<bool>;
 }
 
 pub(crate) struct PollRenderCompletionReadiness;
 
 impl RenderCompletionReadiness for PollRenderCompletionReadiness {
-    fn is_ready(&self, _job_id: u64, fd: Option<BorrowedFd<'_>>) -> io::Result<bool> {
+    fn is_ready(&self, _render_job_id: u64, fd: Option<BorrowedFd<'_>>) -> io::Result<bool> {
         use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
         let Some(fd) = fd else {
@@ -75,18 +75,18 @@ impl RecordingRenderCompletionReadiness {
         self.hold_ready.set(false);
     }
 
-    pub(crate) fn release_ready_job(&self, job_id: u64) {
-        self.released_ready.borrow_mut().insert(job_id);
+    pub(crate) fn release_ready_job(&self, render_job_id: u64) {
+        self.released_ready.borrow_mut().insert(render_job_id);
     }
 }
 
 #[cfg(test)]
 impl RenderCompletionReadiness for RecordingRenderCompletionReadiness {
-    fn is_ready(&self, job_id: u64, fd: Option<BorrowedFd<'_>>) -> io::Result<bool> {
-        if !PollRenderCompletionReadiness.is_ready(job_id, fd)? {
+    fn is_ready(&self, render_job_id: u64, fd: Option<BorrowedFd<'_>>) -> io::Result<bool> {
+        if !PollRenderCompletionReadiness.is_ready(render_job_id, fd)? {
             return Ok(false);
         }
-        Ok(!self.hold_ready.get() || self.released_ready.borrow().contains(&job_id))
+        Ok(!self.hold_ready.get() || self.released_ready.borrow().contains(&render_job_id))
     }
 }
 
@@ -318,7 +318,7 @@ impl PlatformBackend {
     pub(crate) fn for_tests_pending_scanout_render_job_ids(&self) -> Vec<u64> {
         self.pending_scanout_render_completions
             .iter()
-            .map(|pending| pending.job_id)
+            .map(|pending| pending.render_job_id)
             .collect()
     }
 
@@ -362,33 +362,42 @@ impl PlatformBackend {
         fds
     }
 
-    /// Register one source-renderer completion with the stable copied-scanout
-    /// readiness set.  The returned job id is never derived from the fd and is
-    /// paired with a device-qualified output identity so output-vector
-    /// reordering cannot retarget a completion.
-    pub(crate) fn register_scanout_render_completion(
-        &mut self,
-        output_key: OutputKey,
-        bo_idx: usize,
-        fd: Option<OwnedFd>,
-    ) -> io::Result<u64> {
-        let job_id = self.next_scanout_render_job_id;
+    /// Allocate the stable identity before any scene recording starts.
+    pub(crate) fn allocate_scanout_render_job_id(&mut self) -> io::Result<u64> {
+        let render_job_id = self.next_scanout_render_job_id;
         self.next_scanout_render_job_id = self
             .next_scanout_render_job_id
             .checked_add(1)
             .ok_or_else(|| io::Error::other("scanout render job id overflow"))?;
+        Ok(render_job_id)
+    }
+
+    /// Register one source-renderer completion with the stable copied-scanout
+    /// readiness set. The caller allocated `render_job_id` before recording;
+    /// registration preserves that identity unchanged.
+    pub(crate) fn register_scanout_render_completion(
+        &mut self,
+        output_key: OutputKey,
+        bo_idx: usize,
+        render_job_id: u64,
+        mode: crate::kms::render::scene::FrameSubmitMode,
+        recording_complete: bool,
+        fd: Option<OwnedFd>,
+    ) -> io::Result<()> {
         if let Some(fd) = fd.as_ref() {
             self.scanout_render_completion_epfd
-                .register(fd.as_fd(), job_id)?;
+                .register(fd.as_fd(), render_job_id)?;
         }
         self.pending_scanout_render_completions
             .push_back(PendingScanoutRenderCompletion {
-                job_id,
+                render_job_id,
                 output_key,
                 bo_idx,
+                mode,
+                recording_complete,
                 fd,
             });
-        Ok(job_id)
+        Ok(())
     }
 
     /// Drain every currently readable copied-scanout render completion.
@@ -400,10 +409,10 @@ impl PlatformBackend {
         while index < self.pending_scanout_render_completions.len() {
             let is_ready = {
                 let pending = &self.pending_scanout_render_completions[index];
-                match self
-                    .render_completion_readiness
-                    .is_ready(pending.job_id, pending.fd.as_ref().map(|fd| fd.as_fd()))
-                {
+                match self.render_completion_readiness.is_ready(
+                    pending.render_job_id,
+                    pending.fd.as_ref().map(|fd| fd.as_fd()),
+                ) {
                     Ok(is_ready) => is_ready,
                     Err(error) => {
                         log::warn!("scanout render completion poll failed: {error}");
@@ -425,9 +434,11 @@ impl PlatformBackend {
                 log::warn!("scanout render completion unregister failed: {error}");
             }
             ready.push(ReadyScanoutRenderCompletion {
-                job_id: pending.job_id,
+                render_job_id: pending.render_job_id,
                 output_key: pending.output_key,
                 bo_idx: pending.bo_idx,
+                mode: pending.mode,
+                recording_complete: pending.recording_complete,
                 fd: pending.fd,
             });
         }

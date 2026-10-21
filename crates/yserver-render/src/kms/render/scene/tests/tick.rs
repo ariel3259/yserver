@@ -57,9 +57,290 @@ fn damage_audit_partial_compose_is_detectable() {
     ));
 }
 
+fn scene_with_one_live_output() -> Option<(TestSink, SceneCompositor)> {
+    let mut sink = TestSink::new();
+    sink.gpu = GpuCore::for_tests_with_vk()?;
+    let layouts = [OutputLayout {
+        root_rect: (0, 0, 800, 600),
+        mode: (800, 600),
+        transform: None,
+    }];
+    let scene = SceneCompositor::new(&sink, &layouts).expect("construct live test scene");
+    Some((sink, scene))
+}
+
+fn pending_ack_for_test(
+    bo_idx: usize,
+    render_job_id: u64,
+    mode: FrameSubmitMode,
+    recording_complete: bool,
+    stage: InFlightStage,
+) -> PendingAck {
+    PendingAck {
+        bo_idx,
+        generation: 1,
+        render_job_id,
+        mode,
+        recording_complete,
+        stage,
+        drawable_snapshots: Vec::new(),
+        ticket: None,
+        submitted_output_damage: Default::default(),
+        submitted_participants: Vec::new(),
+        submitted_scene_structure_damage: Default::default(),
+        submitted_failed_repaint: Default::default(),
+        cursor_transition: None,
+        cursor_prev_pos_after_retire: None,
+        cursor_mode_after_retire: OutputCursorMode::Hidden,
+        last_present_cursor_rect_after_retire: None,
+        last_present_cursor_version_after_retire: None,
+    }
+}
+
+// pure boundary. Mutation: infer completeness from Repaint::Full or an exported
+// fence, and mark a truncated recording complete or accepted as a flip.
+#[test]
+fn unflip_recording_completeness_survives_shared_handoff() {
+    let Some((_, mut scene)) = scene_with_one_live_output() else {
+        eprintln!("skipping: lavapipe Vulkan test device unavailable");
+        return;
+    };
+
+    for (render_job_id, descriptor_count, expected_complete) in [(41, 4, true), (42, 3, false)] {
+        let recorded = recorded_frame(ComposeSubmit { descriptor_count }, 4);
+        let handoff = FrameHandoff::DeferredUnflip {
+            render_job_id,
+            recording_complete: recorded.recording_complete,
+        };
+        let FrameHandoff::DeferredUnflip {
+            render_job_id: handed_job_id,
+            recording_complete,
+        } = handoff
+        else {
+            unreachable!("deferred shared frame must use the deferred handoff")
+        };
+        assert_eq!(recorded.recording_complete, expected_complete);
+        assert_eq!(recording_complete, expected_complete);
+        assert_eq!(handed_job_id, render_job_id);
+
+        scene.inner.as_mut().unwrap().outputs[0]
+            .pending_acks
+            .push_back(pending_ack_for_test(
+                2,
+                render_job_id,
+                FrameSubmitMode::DeferredUnflip,
+                recording_complete,
+                InFlightStage::UnflipPrepared { render_job_id },
+            ));
+        assert_eq!(
+            scene.pending_unflip_frame_identities(),
+            vec![DeferredFrameIdentity {
+                output_idx: 0,
+                bo_idx: 2,
+                render_job_id,
+                recording_complete: expected_complete,
+            }]
+        );
+        assert!(!scene.has_pending_page_flip(0));
+        assert_eq!(scene.pending_page_flip_event_id(0), None);
+        scene.inner.as_mut().unwrap().outputs[0]
+            .pending_acks
+            .clear();
+    }
+}
+
+// pure boundary. Mutation: drop recording completeness from copied completion
+// registration or reconstruct it from the source fence.
+#[test]
+fn unflip_recording_completeness_survives_copied_source_completion() {
+    let mut sink = TestSink::new();
+    for (job_id, descriptor_count, complete) in [(51, 5, true), (52, 4, false)] {
+        let recording_complete =
+            recorded_frame(ComposeSubmit { descriptor_count }, 5).recording_complete;
+        assert_eq!(recording_complete, complete);
+        sink.register_render_completion(
+            3,
+            1,
+            job_id,
+            FrameSubmitMode::DeferredUnflip,
+            recording_complete,
+            None,
+        )
+        .expect("register copied source completion");
+        let notifications = sink.drain_render_notifications();
+        let [RenderNotification::CopiedSourceReady(completion)] = notifications.as_slice() else {
+            panic!("one registered completion should drain as copied-source readiness")
+        };
+        assert_eq!(completion.output, Ok(3));
+        assert_eq!(completion.bo_idx, 1);
+        assert_eq!(completion.render_job_id, job_id);
+        assert_eq!(completion.mode, FrameSubmitMode::DeferredUnflip);
+        assert_eq!(completion.recording_complete, complete);
+        assert_eq!(
+            sink.submit_copied(
+                3,
+                1,
+                job_id,
+                completion.recording_complete,
+                completion.mode,
+                None,
+            )
+            .expect("sink-copy readiness handoff"),
+            CopiedSubmitOutcome::PreparedForGroup,
+        );
+        assert_eq!(
+            sink.copied_submissions.last(),
+            Some(&(3, 1, job_id, complete, FrameSubmitMode::DeferredUnflip)),
+        );
+    }
+}
+
+// pure boundary. Mutation: allocate the ID during registration, lose mode or
+// completeness, or retarget the copied completion to another output or BO.
+#[test]
+fn unflip_render_job_mode_and_identity_survive_copied_delivery() {
+    let mut sink = TestSink::new();
+    let render_job_id = sink
+        .allocate_render_job_id()
+        .expect("allocate render job ID");
+    sink.register_render_completion(
+        2,
+        1,
+        render_job_id,
+        FrameSubmitMode::DeferredUnflip,
+        true,
+        None,
+    )
+    .expect("register deferred copied completion");
+    let notifications = sink.drain_render_notifications();
+    let [RenderNotification::CopiedSourceReady(completion)] = notifications.as_slice() else {
+        panic!("registered completion should be ready")
+    };
+    assert_eq!(completion.output, Ok(2));
+    assert_eq!(completion.bo_idx, 1);
+    assert_eq!(completion.render_job_id, render_job_id);
+    assert_eq!(completion.mode, FrameSubmitMode::DeferredUnflip);
+    assert!(completion.recording_complete);
+
+    let outcome = sink
+        .submit_copied(
+            2,
+            1,
+            render_job_id,
+            completion.recording_complete,
+            completion.mode,
+            None,
+        )
+        .expect("submit copied destination for grouped commit");
+    assert_eq!(outcome, CopiedSubmitOutcome::PreparedForGroup);
+    assert_eq!(
+        sink.copied_submissions,
+        vec![(2, 1, render_job_id, true, FrameSubmitMode::DeferredUnflip)]
+    );
+}
+
+// pure boundary. Mutation: treat a deferred render handoff as accepted KMS work
+// or change the event-ID/BO retirement match.
+#[test]
+fn immediate_scene_handoffs_keep_existing_retirement_identity() {
+    let Some((_, mut scene)) = scene_with_one_live_output() else {
+        eprintln!("skipping: lavapipe Vulkan test device unavailable");
+        return;
+    };
+    let accepted = InFlightStage::KmsFlipPending { event_id: Some(73) };
+    assert!(kms_retirement_matches(accepted, 1, 1, Some(73)));
+    assert!(!kms_retirement_matches(accepted, 1, 2, Some(73)));
+    assert!(!kms_retirement_matches(accepted, 1, 1, Some(72)));
+
+    let deferred = InFlightStage::UnflipPrepared { render_job_id: 73 };
+    assert!(!kms_retirement_matches(deferred, 1, 1, Some(73)));
+    scene.inner.as_mut().unwrap().outputs[0]
+        .pending_acks
+        .push_back(pending_ack_for_test(
+            1,
+            73,
+            FrameSubmitMode::Immediate,
+            true,
+            accepted,
+        ));
+    assert!(scene.has_pending_page_flip(0));
+    assert_eq!(scene.pending_page_flip_event_id(0), Some(73));
+}
+
+// pure boundary. Mutation: use accepted-only page-flip status for admission,
+// allowing a second Immediate frame while copied readiness is still pending.
+#[test]
+fn immediate_copied_frame_stays_admission_blocked_until_source_completion() {
+    let Some((mut sink, mut scene)) = scene_with_one_live_output() else {
+        eprintln!("skipping: lavapipe Vulkan test device unavailable");
+        return;
+    };
+    scene.inner.as_mut().unwrap().outputs[0]
+        .pending_acks
+        .push_back(pending_ack_for_test(
+            1,
+            84,
+            FrameSubmitMode::Immediate,
+            true,
+            InFlightStage::WaitingForRenderCompletion { render_job_id: 84 },
+        ));
+
+    assert!(!scene.has_pending_page_flip(0));
+    assert_eq!(scene.pending_page_flip_event_id(0), None);
+    assert!(scene.has_pending_scene_frame(0));
+    assert!(!scene.has_output_ready_for_submit(&sink, FrameSubmitMode::Immediate));
+    assert!(!scene.output_ready_for_submit(0, &sink, FrameSubmitMode::Immediate));
+
+    let mut store = DrawableStore::new();
+    assert!(scene.handle_render_notification(
+        RenderNotification::CopiedSourceReady(RenderCompletion {
+            render_job_id: 84,
+            output: Ok(0),
+            bo_idx: 1,
+            mode: FrameSubmitMode::Immediate,
+            recording_complete: true,
+            fd: None,
+        }),
+        &mut store,
+        &mut sink,
+    ));
+    assert!(scene.has_pending_page_flip(0));
+    assert_eq!(scene.pending_page_flip_event_id(0), Some(1));
+    assert!(!scene.output_ready_for_submit(0, &sink, FrameSubmitMode::Immediate));
+}
+
+// pure boundary. Mutation: retain the cursor-only commit gate for deferred
+// preparation, or let DeferredUnflip bypass a pending scene acknowledgement.
+#[test]
+fn deferred_unflip_admission_bypasses_only_cursor_commit() {
+    let Some((mut sink, mut scene)) = scene_with_one_live_output() else {
+        eprintln!("skipping: lavapipe Vulkan test device unavailable");
+        return;
+    };
+    sink.set_commit_in_flight(0, true);
+    assert!(!scene.has_output_ready_for_submit(&sink, FrameSubmitMode::Immediate));
+    assert!(scene.has_output_ready_for_submit(&sink, FrameSubmitMode::DeferredUnflip));
+    assert!(!scene.output_ready_for_submit(0, &sink, FrameSubmitMode::Immediate));
+    assert!(scene.output_ready_for_submit(0, &sink, FrameSubmitMode::DeferredUnflip));
+
+    scene.inner.as_mut().unwrap().outputs[0]
+        .pending_acks
+        .push_back(pending_ack_for_test(
+            0,
+            91,
+            FrameSubmitMode::DeferredUnflip,
+            true,
+            InFlightStage::UnflipPrepared { render_job_id: 91 },
+        ));
+    assert!(!scene.has_output_ready_for_submit(&sink, FrameSubmitMode::Immediate));
+    assert!(!scene.has_output_ready_for_submit(&sink, FrameSubmitMode::DeferredUnflip));
+    assert!(!scene.output_ready_for_submit(0, &sink, FrameSubmitMode::Immediate));
+    assert!(!scene.output_ready_for_submit(0, &sink, FrameSubmitMode::DeferredUnflip));
+}
+
 #[test]
 fn copied_completion_requires_exact_job_and_paired_bo() {
-    let waiting = InFlightStage::WaitingForRenderCompletion { job_id: 41 };
+    let waiting = InFlightStage::WaitingForRenderCompletion { render_job_id: 41 };
     assert!(copied_render_completion_matches(waiting, 2, 41, 2));
     assert!(!copied_render_completion_matches(waiting, 2, 42, 2));
     assert!(!copied_render_completion_matches(waiting, 2, 41, 1));
@@ -67,7 +348,7 @@ fn copied_completion_requires_exact_job_and_paired_bo() {
 
 #[test]
 fn copied_frame_cannot_retire_before_sink_kms_submission() {
-    let waiting = InFlightStage::WaitingForRenderCompletion { job_id: 7 };
+    let waiting = InFlightStage::WaitingForRenderCompletion { render_job_id: 7 };
     assert!(!kms_retirement_matches(waiting, 1, 1, Some(5)));
     assert!(!kms_retirement_matches(waiting, 1, 1, None));
     assert!(!copied_render_completion_matches(
@@ -92,7 +373,7 @@ fn kms_retirement_requires_the_exact_paired_bo() {
     assert!(kms_retirement_matches(identityless, 1, 1, None));
     assert!(!kms_retirement_matches(identityless, 1, 1, Some(9)));
     assert!(!kms_retirement_matches(identityless, 1, 2, None));
-    let waiting = InFlightStage::WaitingForRenderCompletion { job_id: 9 };
+    let waiting = InFlightStage::WaitingForRenderCompletion { render_job_id: 9 };
     assert!(!kms_retirement_matches(waiting, 1, 1, Some(9)));
     assert!(!kms_retirement_matches(waiting, 1, 1, None));
 }
@@ -356,6 +637,7 @@ fn stub_scene_is_not_live_and_declines_tick() {
             &mut sink,
             &mut telemetry,
             None,
+            FrameSubmitMode::Immediate,
         )
         .expect_err("stub must reject tick");
     assert!(matches!(err, SceneError::NoVk));
@@ -369,6 +651,7 @@ fn scene_submit_gate_waits_for_external_output_commit() {
     assert!(super::super::tick::output_is_ready_for_submit(
         true,
         sink.output_commit_in_flight(0),
+        FrameSubmitMode::Immediate,
         None,
         now,
     ));
@@ -378,6 +661,7 @@ fn scene_submit_gate_waits_for_external_output_commit() {
     assert!(!super::super::tick::output_is_ready_for_submit(
         true,
         sink.output_commit_in_flight(0),
+        FrameSubmitMode::Immediate,
         None,
         now,
     ));
@@ -387,6 +671,7 @@ fn scene_submit_gate_waits_for_external_output_commit() {
     assert!(super::super::tick::output_is_ready_for_submit(
         true,
         sink.output_commit_in_flight(0),
+        FrameSubmitMode::Immediate,
         None,
         now,
     ));

@@ -332,7 +332,7 @@ impl KmsBackend {
         output_idx: usize,
     ) -> bool {
         phase_b_flip_in_flight_for_scheduler(
-            self.scene.has_pending_page_flip(output_idx),
+            self.scene.has_pending_scene_frame(output_idx),
             self.pstate
                 .scanout_m2
                 .pending

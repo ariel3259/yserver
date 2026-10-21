@@ -313,14 +313,14 @@ impl SurfaceOutput {
         let target = &mut self.targets[bo_idx];
         let result = record(target);
         let previous_gpu_ns = target.take_last_gpu_render_ns();
-        let result = result.map(|submitted| {
+        let result = result.map(|recorded| {
             self.slots.composed(bo_idx);
             if let Err(e) = self.present_pending() {
                 log::warn!("surface: present failed: {e:?}");
             }
             self.clock.arm_tick();
             FrameHandoff::FlipPending {
-                submit: submitted,
+                recorded,
                 event_id: None,
             }
         });

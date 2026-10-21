@@ -1,7 +1,8 @@
 use crate::kms::render::{
     scene::{
-        FailedSubmitBo, InFlightStage, OutputCursorMode, OutputSceneState, OutputSink,
-        RenderCompletion, SceneCompositor, SceneCompositorInner,
+        CopiedSubmitOutcome, FailedSubmitBo, FrameSubmitMode, InFlightStage, OutputCursorMode,
+        OutputSceneState, OutputSink, RenderCompletion, RenderNotification, SceneCompositor,
+        SceneCompositorInner,
         cursor::{
             apply_cursor_transition_on_retire, force_cursor_retry_repaint,
             mark_cursor_transition_structure_dirty, resolve_retired_cursor_state,
@@ -13,9 +14,18 @@ use crate::kms::render::{
 };
 use std::collections::VecDeque;
 
+/// Exact scene-side identity of a deferred unflip output frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeferredFrameIdentity {
+    pub output_idx: usize,
+    pub bo_idx: usize,
+    pub render_job_id: u64,
+    pub recording_complete: bool,
+}
+
 impl InFlightStage {
-    fn matches_render_completion(self, job_id: u64) -> bool {
-        self == Self::WaitingForRenderCompletion { job_id }
+    fn matches_render_completion(self, render_job_id: u64) -> bool {
+        self == Self::WaitingForRenderCompletion { render_job_id }
     }
 
     fn matches_kms_event(self, event_id: Option<u64>) -> bool {
@@ -26,10 +36,10 @@ impl InFlightStage {
 pub(super) fn copied_render_completion_matches(
     stage: InFlightStage,
     pending_bo_idx: usize,
-    completion_job_id: u64,
+    completion_render_job_id: u64,
     completion_bo_idx: usize,
 ) -> bool {
-    pending_bo_idx == completion_bo_idx && stage.matches_render_completion(completion_job_id)
+    pending_bo_idx == completion_bo_idx && stage.matches_render_completion(completion_render_job_id)
 }
 
 pub(super) fn kms_retirement_matches(
@@ -42,9 +52,8 @@ pub(super) fn kms_retirement_matches(
 }
 
 impl SceneCompositor {
-    /// True while any output has an atomic pageflip awaiting retirement.
-    /// Present completion pacing uses this with pending compose damage to
-    /// decide whether a standalone CRTC sequence is a genuine idle fallback.
+    /// True while any scene frame awaits either copied readiness or KMS
+    /// retirement. Present completion pacing treats all such work as visible.
     pub fn has_pending_page_flips(&self) -> bool {
         #[cfg(any(test, feature = "test-support"))]
         if let Some(v) = self.test_flip_in_flight_override {
@@ -55,11 +64,27 @@ impl SceneCompositor {
             .is_some_and(|inner| inner.outputs.iter().any(|o| !o.pending_acks.is_empty()))
     }
 
-    /// True while one specific output has an atomic pageflip awaiting
-    /// retirement. Present scheduling is CRTC-domain-specific: activity on a
-    /// different card/output must not change the selected output's immediate
-    /// target rule.
+    /// True while an accepted scene KMS commit awaits retirement on one
+    /// output. Render-only handoffs are not page-flip obligations.
     pub fn has_pending_page_flip(&self, output_idx: usize) -> bool {
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(v) = self.test_flip_in_flight_override {
+            return v;
+        }
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.outputs.get(output_idx))
+            .is_some_and(|output| {
+                output
+                    .pending_acks
+                    .iter()
+                    .any(|ack| matches!(ack.stage, InFlightStage::KmsFlipPending { .. }))
+            })
+    }
+
+    /// True while any scene acknowledgement is pending on one output,
+    /// including copied readiness and deferred-unflip preparation.
+    pub fn has_pending_scene_frame(&self, output_idx: usize) -> bool {
         #[cfg(any(test, feature = "test-support"))]
         if let Some(v) = self.test_flip_in_flight_override {
             return v;
@@ -77,8 +102,38 @@ impl SceneCompositor {
         let output = inner.outputs.get(output_idx)?;
         match output.pending_acks.front()?.stage {
             InFlightStage::KmsFlipPending { event_id } => event_id,
-            InFlightStage::WaitingForRenderCompletion { .. } => None,
+            InFlightStage::WaitingForRenderCompletion { .. }
+            | InFlightStage::UnflipPrepared { .. } => None,
         }
+    }
+
+    /// Deferred render handoffs that still own a scene acknowledgement,
+    /// including copied outputs waiting for their source completion.
+    pub fn pending_unflip_frame_identities(&self) -> Vec<DeferredFrameIdentity> {
+        let Some(inner) = self.inner.as_ref() else {
+            return Vec::new();
+        };
+        inner
+            .outputs
+            .iter()
+            .enumerate()
+            .flat_map(|(output_idx, output)| {
+                output.pending_acks.iter().filter_map(move |ack| {
+                    (ack.mode == FrameSubmitMode::DeferredUnflip
+                        && matches!(
+                            ack.stage,
+                            InFlightStage::WaitingForRenderCompletion { .. }
+                                | InFlightStage::UnflipPrepared { .. }
+                        ))
+                    .then_some(DeferredFrameIdentity {
+                        output_idx,
+                        bo_idx: ack.bo_idx,
+                        render_job_id: ack.render_job_id,
+                        recording_complete: ack.recording_complete,
+                    })
+                })
+            })
+            .collect()
     }
 
     /// Handle a DRM page-flip-complete event for `output_idx`.
@@ -280,41 +335,61 @@ impl SceneCompositor {
         }
     }
 
-    /// Advance one copied frame from source-render completion on renderer A
-    /// to the copy + KMS submission on sink renderer B. Stable output identity,
-    /// monotonic job id, and the paired BO index must all match the ledger; a
-    /// stale notification never retargets a rebuilt output vector.
-    pub fn handle_scanout_render_completion(
+    /// Advance a copied source completion or safely cancel a deferred unflip
+    /// target. Stale identities never retarget a rebuilt output vector.
+    pub fn handle_render_notification(
         &mut self,
-        completion: RenderCompletion,
+        notification: RenderNotification,
+        store: &mut DrawableStore,
         sink: &mut dyn OutputSink,
     ) -> bool {
         let Some(inner) = self.inner.as_mut() else {
             return false;
         };
-        handle_scanout_render_completion_inner(inner, completion, sink)
+        handle_render_notification_inner(inner, notification, store, sink)
+    }
+}
+
+pub(super) fn handle_render_notification_inner(
+    inner: &mut SceneCompositorInner,
+    notification: RenderNotification,
+    store: &mut DrawableStore,
+    sink: &mut dyn OutputSink,
+) -> bool {
+    match notification {
+        RenderNotification::CopiedSourceReady(completion) => {
+            handle_scanout_render_completion_inner(inner, completion, store, sink)
+        }
+        RenderNotification::UnflipDependencySafe {
+            output,
+            bo_idx,
+            render_job_id,
+        } => handle_unflip_dependency_safe_inner(inner, output, bo_idx, render_job_id, store, sink),
     }
 }
 
 pub(super) fn handle_scanout_render_completion_inner(
     inner: &mut SceneCompositorInner,
     completion: RenderCompletion,
+    _store: &mut DrawableStore,
     sink: &mut dyn OutputSink,
 ) -> bool {
     if sink.gpu().renderer_failed {
         return false;
     }
     let RenderCompletion {
-        job_id,
+        render_job_id,
         output,
         bo_idx,
+        mode,
+        recording_complete,
         fd,
     } = completion;
     let output_idx = match output {
         Ok(output_idx) => output_idx,
         Err(output_key) => {
             log::debug!(
-                "render copied scanout: completion job {job_id} targeted removed output \
+                "render copied scanout: completion job {render_job_id} targeted removed output \
                      {output_key}",
             );
             return false;
@@ -324,10 +399,15 @@ pub(super) fn handle_scanout_render_completion_inner(
         .outputs
         .get(output_idx)
         .and_then(|state| state.pending_acks.front())
-        .is_some_and(|ack| copied_render_completion_matches(ack.stage, ack.bo_idx, job_id, bo_idx));
+        .is_some_and(|ack| {
+            copied_render_completion_matches(ack.stage, ack.bo_idx, render_job_id, bo_idx)
+                && ack.render_job_id == render_job_id
+                && ack.mode == mode
+                && ack.recording_complete == recording_complete
+        });
     if !expected {
         log::warn!(
-            "render copied scanout: stale completion job {job_id} for output \
+            "render copied scanout: stale completion job {render_job_id} for output \
                  {output_idx} bo {bo_idx}",
         );
         // A live output retaining a different ledger entry means the
@@ -338,12 +418,43 @@ pub(super) fn handle_scanout_render_completion_inner(
         return false;
     }
 
-    match sink.submit_copied(output_idx, bo_idx, fd) {
-        Ok(event_id) => {
+    match sink.submit_copied(
+        output_idx,
+        bo_idx,
+        render_job_id,
+        recording_complete,
+        mode,
+        fd,
+    ) {
+        Ok(CopiedSubmitOutcome::FlipAccepted { event_id })
+            if mode == FrameSubmitMode::Immediate =>
+        {
             if let Some(ack) = inner.outputs[output_idx].pending_acks.front_mut() {
-                ack.stage = InFlightStage::KmsFlipPending { event_id };
+                ack.stage = InFlightStage::KmsFlipPending {
+                    event_id: Some(event_id),
+                };
             }
             true
+        }
+        Ok(CopiedSubmitOutcome::PreparedForGroup) if mode == FrameSubmitMode::DeferredUnflip => {
+            if let Some(ack) = inner.outputs[output_idx].pending_acks.front_mut() {
+                ack.stage = InFlightStage::UnflipPrepared { render_job_id };
+            }
+            true
+        }
+        Ok(CopiedSubmitOutcome::QuarantinedWithoutFinalDependency)
+            if mode == FrameSubmitMode::DeferredUnflip =>
+        {
+            // Keep the exact render identity pending for a later safe
+            // dependency notification, but do not advertise a prepared plane.
+            true
+        }
+        Ok(outcome) => {
+            log::error!(
+                "render copied scanout: invalid {mode:?} submit outcome {outcome:?} for output {output_idx} bo {bo_idx}"
+            );
+            sink.gpu_mut().renderer_failed = true;
+            false
         }
         Err(error) => {
             log::warn!(
@@ -402,6 +513,77 @@ pub(super) fn handle_scanout_render_completion_inner(
             false
         }
     }
+}
+
+fn handle_unflip_dependency_safe_inner(
+    inner: &mut SceneCompositorInner,
+    output: Result<usize, String>,
+    bo_idx: usize,
+    render_job_id: u64,
+    _store: &mut DrawableStore,
+    sink: &mut dyn OutputSink,
+) -> bool {
+    let output_idx = match output {
+        Ok(output_idx) => output_idx,
+        Err(output_key) => {
+            log::debug!(
+                "render unflip: safe-dependency notification for removed output {output_key} job {render_job_id}"
+            );
+            return false;
+        }
+    };
+    let matches = inner
+        .outputs
+        .get(output_idx)
+        .and_then(|state| state.pending_acks.front())
+        .is_some_and(|ack| {
+            ack.mode == FrameSubmitMode::DeferredUnflip
+                && ack.bo_idx == bo_idx
+                && ack.render_job_id == render_job_id
+                && matches!(
+                    ack.stage,
+                    InFlightStage::WaitingForRenderCompletion { render_job_id: pending }
+                        | InFlightStage::UnflipPrepared { render_job_id: pending }
+                        if pending == render_job_id
+                )
+        });
+    if !matches {
+        log::warn!(
+            "render unflip: stale safe-dependency notification job {render_job_id} for output {output_idx} bo {bo_idx}"
+        );
+        return false;
+    }
+    if let Err(error) = sink.recycle_unflip_target_after_dependency_safe(output_idx, bo_idx) {
+        log::error!(
+            "render unflip: failed to recycle safe output {output_idx} bo {bo_idx}: {error}"
+        );
+        sink.gpu_mut().renderer_failed = true;
+        return false;
+    }
+    sink.invalidate_slot(output_idx, bo_idx);
+    let state = &mut inner.outputs[output_idx];
+    let ack = state
+        .pending_acks
+        .pop_front()
+        .expect("safe dependency identity matched the front acknowledgement");
+    state.current_generation = ack.generation.saturating_sub(1);
+    if let Some(rect) = ack.submitted_output_damage.bounding_rect() {
+        state.pending_repaint_after_failed_submit.add(rect);
+    }
+    if let Some(pool_slot) = state.pool_slots.pop_front() {
+        if let Some(ticket) = ack.ticket {
+            state.pending_pool_releases.push_back((pool_slot, ticket));
+        } else {
+            state.pool_ring.release(pool_slot);
+        }
+    } else {
+        log::error!(
+            "render unflip: missing descriptor slot for safe output {output_idx} bo {bo_idx}"
+        );
+        sink.gpu_mut().renderer_failed = true;
+        return false;
+    }
+    true
 }
 
 pub(super) fn retire_failed_submit_bos(

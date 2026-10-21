@@ -4,9 +4,9 @@ use crate::kms::{
         region::Region,
         scanout_damage::ScanoutDamage,
         scene::{
-            ComposeRenderTarget, ComposeSubmit, Repaint, ScalePass, cursor::record_cursor_save,
-            damage_audit::rects_intersect, repaint::draw_dst_rect_inward,
-            transform::record_scale_pass,
+            ComposeRenderTarget, ComposeSubmit, RecordedFrame, Repaint, ScalePass,
+            cursor::record_cursor_save, damage_audit::rects_intersect,
+            repaint::draw_dst_rect_inward, transform::record_scale_pass,
         },
     },
     vk::{
@@ -26,6 +26,13 @@ pub(super) fn vk_result_is_device_lost(result: vk::Result) -> bool {
 
 pub(super) fn compose_submit_was_complete(submitted: ComposeSubmit, draw_count: usize) -> bool {
     submitted.descriptor_count == draw_count
+}
+
+pub(super) fn recorded_frame(submit: ComposeSubmit, draw_count: usize) -> RecordedFrame {
+    RecordedFrame {
+        recording_complete: compose_submit_was_complete(submit, draw_count),
+        submit,
+    }
 }
 
 /// Step 3's staging, gated on the submit having recorded every draw.

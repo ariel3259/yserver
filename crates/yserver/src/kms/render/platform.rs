@@ -122,9 +122,11 @@ const WAKEUP_EVENTFD_TOKEN: u64 = u64::MAX;
 /// id remain authoritative across output-vector rebuilds; raw fds and vector
 /// indices are deliberately not identities.
 struct PendingScanoutRenderCompletion {
-    job_id: u64,
+    render_job_id: u64,
     output_key: OutputKey,
     bo_idx: usize,
+    mode: crate::kms::render::scene::FrameSubmitMode,
+    recording_complete: bool,
     /// `None` is Vulkan's valid already-signalled SYNC_FD payload (`fd=-1`).
     /// It bypasses readiness polling but remains a real synchronization
     /// payload that the sink imports as raw -1.
@@ -134,9 +136,11 @@ struct PendingScanoutRenderCompletion {
 /// A completed source-render job ready for the sink-side copied-scanout
 /// submission.
 pub(crate) struct ReadyScanoutRenderCompletion {
-    pub(crate) job_id: u64,
+    pub(crate) render_job_id: u64,
     pub(crate) output_key: OutputKey,
     pub(crate) bo_idx: usize,
+    pub(crate) mode: crate::kms::render::scene::FrameSubmitMode,
+    pub(crate) recording_complete: bool,
     pub(crate) fd: Option<OwnedFd>,
 }
 

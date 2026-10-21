@@ -8,9 +8,10 @@ use crate::kms::{
         gpu::GpuCore,
         platform::PlatformBackend,
         scene::{
-            ComposeRenderTarget, ComposeSubmit, CursorPlaneSink, CursorShowFailure,
-            CursorUploadOutcome, FinishOutcome, FlipRetirement, FrameHandoff, FrameTargetError,
-            OutputRoute, OutputSink, RecordFrame, RenderCompletion, SlotToken,
+            ComposeRenderTarget, CopiedSubmitOutcome, CursorPlaneSink, CursorShowFailure,
+            CursorUploadOutcome, FinishOutcome, FlipRetirement, FrameHandoff, FrameSubmitMode,
+            FrameTargetError, OutputRoute, OutputSink, RecordFrame, RecordedFrame,
+            RenderCompletion, RenderNotification, SlotToken,
         },
     },
     vk::{
@@ -92,6 +93,8 @@ impl OutputSink for PlatformBackend {
         &mut self,
         output_idx: usize,
         bo_idx: usize,
+        render_job_id: u64,
+        mode: FrameSubmitMode,
         record: &mut RecordFrame<'_>,
     ) -> FinishOutcome {
         let output_key = &self.outputs[output_idx].key;
@@ -140,35 +143,42 @@ impl OutputSink for PlatformBackend {
                 let Some(bo) = pool.bos.get_mut(bo_idx) else {
                     return FinishOutcome::Unavailable(FrameTargetError::NoSlot);
                 };
-                let submitted = submit_shared_scanout_frame(
-                    &drm_device,
-                    atomic_commit_sink.as_ref(),
-                    output,
-                    allocation_plan,
-                    bo,
-                    record,
-                    &cursor_positions,
-                    async_ledger,
-                    timing,
-                    tearing_context,
-                );
+                let submitted = match mode {
+                    FrameSubmitMode::Immediate => submit_shared_scanout_frame(
+                        &drm_device,
+                        atomic_commit_sink.as_ref(),
+                        output,
+                        allocation_plan,
+                        bo,
+                        record,
+                        &cursor_positions,
+                        async_ledger,
+                        timing,
+                        tearing_context,
+                    )
+                    .map(|(recorded, async_outcome, event_id)| {
+                        (recorded, Some(async_outcome), Some(event_id))
+                    }),
+                    FrameSubmitMode::DeferredUnflip => submit_shared_scanout_render(bo, record)
+                        .map(|recorded| (recorded, None, None)),
+                };
                 if let Err(error) = &submitted
                     && atomic_commit_sink.take_last_cursor_rejection()
                 {
                     cursor_rejection_error = Some(error.to_string());
                 }
-                if let Ok((_, result, _)) = &submitted {
+                if let Ok((_, Some(result), _)) = &submitted {
                     async_outcome = Some(*result);
                     shared_cursor_commit_submitted =
                         *result != crate::drm::async_flip::AsyncOutcome::Accepted;
                 }
-                let result =
-                    submitted.map(
-                        |(submit, _async_outcome, event_id)| FrameHandoff::FlipPending {
-                            submit,
-                            event_id: Some(event_id),
-                        },
-                    );
+                let result = submitted.map(|(recorded, _, event_id)| match mode {
+                    FrameSubmitMode::Immediate => FrameHandoff::FlipPending { recorded, event_id },
+                    FrameSubmitMode::DeferredUnflip => FrameHandoff::DeferredUnflip {
+                        render_job_id,
+                        recording_complete: recorded.recording_complete,
+                    },
+                });
                 FinishOutcome::Finished {
                     result,
                     previous_gpu_ns: bo.last_gpu_render_ns.take(),
@@ -189,7 +199,7 @@ impl OutputSink for PlatformBackend {
                     .is_err_and(CopiedRenderSubmitError::requires_fail_stop);
                 FinishOutcome::Finished {
                     result: result
-                        .map(FrameHandoff::RenderCompletion)
+                        .map(|(recorded, fd)| FrameHandoff::RenderCompletion { recorded, fd })
                         .map_err(CopiedRenderSubmitError::into_present),
                     previous_gpu_ns: source.last_gpu_render_ns.take(),
                     fail_stop,
@@ -231,6 +241,14 @@ impl OutputSink for PlatformBackend {
         self.recycle_failed_submit_bo(output_idx, bo_idx)
     }
 
+    fn recycle_unflip_target_after_dependency_safe(
+        &mut self,
+        output_idx: usize,
+        bo_idx: usize,
+    ) -> io::Result<()> {
+        self.recycle_unflip_scanout_bo_after_dependency_safe(output_idx, bo_idx)
+    }
+
     fn on_page_flip_complete(&mut self, output_idx: usize) -> Option<FlipRetirement> {
         PlatformBackend::on_page_flip_complete(self, output_idx)
     }
@@ -239,28 +257,46 @@ impl OutputSink for PlatformBackend {
         self.commit_bo_present(output_idx, bo_idx, generation);
     }
 
+    fn allocate_render_job_id(&mut self) -> io::Result<u64> {
+        self.allocate_scanout_render_job_id()
+    }
+
     fn register_render_completion(
         &mut self,
         output_idx: usize,
         bo_idx: usize,
+        render_job_id: u64,
+        mode: FrameSubmitMode,
+        recording_complete: bool,
         fd: Option<OwnedFd>,
-    ) -> io::Result<u64> {
+    ) -> io::Result<()> {
         let output_key = self.outputs[output_idx].key.clone();
-        self.register_scanout_render_completion(output_key, bo_idx, fd)
+        self.register_scanout_render_completion(
+            output_key,
+            bo_idx,
+            render_job_id,
+            mode,
+            recording_complete,
+            fd,
+        )
     }
 
-    fn drain_render_completions(&mut self) -> Vec<RenderCompletion> {
+    fn drain_render_notifications(&mut self) -> Vec<RenderNotification> {
         self.drain_scanout_render_completions()
             .into_iter()
-            .map(|completion| RenderCompletion {
-                job_id: completion.job_id,
-                output: self
-                    .outputs
-                    .iter()
-                    .position(|output| output.key == completion.output_key)
-                    .ok_or_else(|| format!("{:?}", completion.output_key)),
-                bo_idx: completion.bo_idx,
-                fd: completion.fd,
+            .map(|completion| {
+                RenderNotification::CopiedSourceReady(RenderCompletion {
+                    render_job_id: completion.render_job_id,
+                    output: self
+                        .outputs
+                        .iter()
+                        .position(|output| output.key == completion.output_key)
+                        .ok_or_else(|| format!("{:?}", completion.output_key)),
+                    bo_idx: completion.bo_idx,
+                    mode: completion.mode,
+                    recording_complete: completion.recording_complete,
+                    fd: completion.fd,
+                })
             })
             .collect()
     }
@@ -273,9 +309,19 @@ impl OutputSink for PlatformBackend {
         &mut self,
         output_idx: usize,
         bo_idx: usize,
+        render_job_id: u64,
+        recording_complete: bool,
+        mode: FrameSubmitMode,
         fd: Option<OwnedFd>,
-    ) -> io::Result<Option<u64>> {
-        self.submit_copied_scanout(output_idx, bo_idx, fd).map(Some)
+    ) -> io::Result<CopiedSubmitOutcome> {
+        self.submit_copied_scanout(
+            output_idx,
+            bo_idx,
+            render_job_id,
+            recording_complete,
+            mode,
+            fd,
+        )
     }
 }
 
@@ -568,6 +614,27 @@ impl ComposeRenderTarget for CopiedRenderSource {
     }
 }
 
+/// Render directly into the KMS framebuffer and retain its dependency without
+/// creating an individual flip obligation.
+fn submit_shared_scanout_render(
+    bo: &mut ScanoutBo,
+    record: &mut RecordFrame<'_>,
+) -> Result<RecordedFrame, PresentError> {
+    use std::os::fd::IntoRawFd;
+
+    if bo.state.phase != BoPhase::Free {
+        return Err(PresentError::WrongPhase(bo.state.phase));
+    }
+    bo.state.transition_to_recording();
+    let recorded = record(bo)?;
+    let fd = bo
+        .export_signaled_fd()
+        .map_err(PresentError::Vk)?
+        .map_or(-1, IntoRawFd::into_raw_fd);
+    bo.state.transition_to_submitted(fd);
+    Ok(recorded)
+}
+
 /// Render directly into the KMS framebuffer and immediately queue its flip.
 fn submit_shared_scanout_frame(
     drm: &crate::drm::Device,
@@ -580,7 +647,7 @@ fn submit_shared_scanout_frame(
     async_ledger: &mut crate::drm::async_flip::AsyncFlipLedger,
     timing: crate::drm::async_flip::FlipTiming,
     tearing_context: crate::drm::atomic::TearingCommitContext,
-) -> Result<(ComposeSubmit, crate::drm::async_flip::AsyncOutcome, u64), PresentError> {
+) -> Result<(RecordedFrame, crate::drm::async_flip::AsyncOutcome, u64), PresentError> {
     use std::os::fd::{FromRawFd, IntoRawFd};
 
     if bo.state.phase != BoPhase::Free {
@@ -588,7 +655,7 @@ fn submit_shared_scanout_frame(
     }
     let fb_handle = bo.fb_handle.ok_or(PresentError::NoFb)?;
     bo.state.transition_to_recording();
-    let submitted = record(bo)?;
+    let recorded = record(bo)?;
 
     let fd = bo
         .export_signaled_fd()
@@ -667,7 +734,7 @@ fn submit_shared_scanout_frame(
                 // EINVAL retry and returned after atomic acceptance.
                 drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(reclaimed) });
             }
-            Ok((submitted, async_outcome, event_id))
+            Ok((recorded, async_outcome, event_id))
         }
         Err(error) => {
             if let Some(reclaimed) = bo.state.transition_to_recording_after_atomic_reject() {
@@ -690,7 +757,7 @@ fn submit_copied_scanout_render(
     source: &mut CopiedRenderSource,
     destination_state: &mut BoState,
     record: &mut RecordFrame<'_>,
-) -> Result<Option<OwnedFd>, CopiedRenderSubmitError> {
+) -> Result<(RecordedFrame, Option<OwnedFd>), CopiedRenderSubmitError> {
     if destination_state.phase != BoPhase::Free {
         return Err(CopiedRenderSubmitError::Present(PresentError::WrongPhase(
             destination_state.phase,
@@ -700,12 +767,11 @@ fn submit_copied_scanout_render(
         .prepare_renderer_acquire()
         .map_err(CopiedRenderSubmitError::RendererAcquire)?;
     destination_state.transition_to_recording();
-    record(source)
-        .map(|_| ())
-        .map_err(CopiedRenderSubmitError::Present)?;
-    source
+    let recorded = record(source).map_err(CopiedRenderSubmitError::Present)?;
+    let fd = source
         .export_render_completion()
-        .map_err(|error| CopiedRenderSubmitError::Present(PresentError::Vk(error)))
+        .map_err(|error| CopiedRenderSubmitError::Present(PresentError::Vk(error)))?;
+    Ok((recorded, fd))
 }
 
 #[cfg(test)]

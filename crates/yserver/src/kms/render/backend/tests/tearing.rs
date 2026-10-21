@@ -719,7 +719,10 @@ fn tearing_composite_diagnostics(backend: &KmsBackend, recorder_count: Option<us
     let now = backend.monotonic_now();
     let deadline = backend.for_tests_tearing_cursor_compose_deadline_at(now);
     let scene_wants_scene = backend.for_tests_scene_wants_scene();
-    let has_output_ready_for_submit = backend.scene.has_output_ready_for_submit(&backend.platform);
+    let has_output_ready_for_submit = backend.scene.has_output_ready_for_submit(
+        &backend.platform,
+        crate::kms::render::scene::FrameSubmitMode::Immediate,
+    );
     let submit_retry_state: Vec<_> = backend
         .scene
         .submit_retry_state_for_tests()
@@ -745,7 +748,11 @@ fn tearing_composite_diagnostics(backend: &KmsBackend, recorder_count: Option<us
         .map(|output_idx| {
             format!(
                 "output[{output_idx}]: scene_wants_scene={scene_wants_scene}, output_ready_for_submit={}",
-                backend.scene.output_ready_for_submit(output_idx, &backend.platform),
+                backend.scene.output_ready_for_submit(
+                    output_idx,
+                    &backend.platform,
+                    crate::kms::render::scene::FrameSubmitMode::Immediate,
+                ),
             )
         })
         .collect();

@@ -11,7 +11,10 @@ use crate::kms::render::{
     scene_diff::{ParticipantId, SceneRole},
     store::DrawableStore,
 };
-use std::{collections::HashSet, io};
+use std::{
+    collections::{HashSet, VecDeque},
+    io,
+};
 use yserver_protocol::x11::xfixes;
 
 /// An output sink with no frame slots, no cursor plane and no Vulkan: what
@@ -29,6 +32,9 @@ struct TestSink {
     show_calls: usize,
     hide_fails: bool,
     hide_calls: usize,
+    next_render_job_id: u64,
+    render_completions: VecDeque<RenderCompletion>,
+    copied_submissions: Vec<(usize, usize, u64, bool, FrameSubmitMode)>,
 }
 
 #[derive(Clone, Copy)]
@@ -53,6 +59,9 @@ impl TestSink {
             show_calls: 0,
             hide_fails: false,
             hide_calls: 0,
+            next_render_job_id: 1,
+            render_completions: VecDeque::new(),
+            copied_submissions: Vec::new(),
         }
     }
 
@@ -110,6 +119,8 @@ impl OutputSink for TestSink {
         &mut self,
         _output_idx: usize,
         _bo_idx: usize,
+        _render_job_id: u64,
+        _mode: FrameSubmitMode,
         _record: &mut RecordFrame<'_>,
     ) -> FinishOutcome {
         FinishOutcome::Unavailable(FrameTargetError::NoSlot)
@@ -129,30 +140,59 @@ impl OutputSink for TestSink {
 
     fn commit_slot_present(&mut self, _output_idx: usize, _bo_idx: usize, _generation: u64) {}
 
-    fn register_render_completion(
-        &mut self,
-        _output_idx: usize,
-        _bo_idx: usize,
-        _fd: Option<std::os::fd::OwnedFd>,
-    ) -> io::Result<u64> {
-        Ok(1)
+    fn allocate_render_job_id(&mut self) -> io::Result<u64> {
+        let job_id = self.next_render_job_id;
+        self.next_render_job_id = self
+            .next_render_job_id
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("test render job id overflow"))?;
+        Ok(job_id)
     }
 
-    fn drain_render_completions(&mut self) -> Vec<RenderCompletion> {
-        Vec::new()
+    fn register_render_completion(
+        &mut self,
+        output_idx: usize,
+        bo_idx: usize,
+        render_job_id: u64,
+        mode: FrameSubmitMode,
+        recording_complete: bool,
+        fd: Option<std::os::fd::OwnedFd>,
+    ) -> io::Result<()> {
+        self.render_completions.push_back(RenderCompletion {
+            render_job_id,
+            output: Ok(output_idx),
+            bo_idx,
+            mode,
+            recording_complete,
+            fd,
+        });
+        Ok(())
+    }
+
+    fn drain_render_notifications(&mut self) -> Vec<RenderNotification> {
+        self.render_completions
+            .drain(..)
+            .map(RenderNotification::CopiedSourceReady)
+            .collect()
     }
 
     fn clear_render_completions(&mut self) {}
 
     fn submit_copied(
         &mut self,
-        _output_idx: usize,
-        _bo_idx: usize,
+        output_idx: usize,
+        bo_idx: usize,
+        render_job_id: u64,
+        recording_complete: bool,
+        mode: FrameSubmitMode,
         _fd: Option<std::os::fd::OwnedFd>,
-    ) -> io::Result<Option<u64>> {
-        Err(io::Error::other(
-            "render completion targeted a shared output",
-        ))
+    ) -> io::Result<CopiedSubmitOutcome> {
+        self.copied_submissions
+            .push((output_idx, bo_idx, render_job_id, recording_complete, mode));
+        Ok(match mode {
+            FrameSubmitMode::Immediate => CopiedSubmitOutcome::FlipAccepted { event_id: 1 },
+            FrameSubmitMode::DeferredUnflip => CopiedSubmitOutcome::PreparedForGroup,
+        })
     }
 }
 

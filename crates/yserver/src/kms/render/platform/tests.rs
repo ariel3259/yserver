@@ -346,6 +346,7 @@ fn copied_scanout_rejects_sink_without_explicit_dmabuf_layout_import() {
 
 #[test]
 fn topology_reset_cancels_completion_for_a_surviving_output() {
+    use crate::kms::render::scene::FrameSubmitMode;
     use nix::sys::eventfd::{EfdFlags, EventFd};
 
     let mut platform = PlatformBackend::for_tests();
@@ -354,8 +355,18 @@ fn topology_reset_cancels_completion_for_a_surviving_output() {
         EventFd::from_value_and_flags(1, EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK)
             .expect("ready eventfd")
             .into();
+    let render_job_id = platform
+        .allocate_scanout_render_job_id()
+        .expect("allocate render job ID");
     platform
-        .register_scanout_render_completion(output_key, 1, Some(ready))
+        .register_scanout_render_completion(
+            output_key,
+            1,
+            render_job_id,
+            FrameSubmitMode::Immediate,
+            true,
+            Some(ready),
+        )
         .expect("register pollable copied completion");
 
     platform
@@ -370,6 +381,7 @@ fn topology_reset_cancels_completion_for_a_surviving_output() {
 
 #[test]
 fn scanout_render_completion_drain_is_not_queue_front_blocked() {
+    use crate::kms::render::scene::FrameSubmitMode;
     use nix::sys::eventfd::{EfdFlags, EventFd};
 
     let mut platform = PlatformBackend::for_tests();
@@ -383,19 +395,39 @@ fn scanout_render_completion_drain_is_not_queue_front_blocked() {
             .expect("ready eventfd")
             .into();
     let first_job = platform
-        .register_scanout_render_completion(output_key.clone(), 0, Some(blocked))
+        .allocate_scanout_render_job_id()
+        .expect("allocate first job");
+    platform
+        .register_scanout_render_completion(
+            output_key.clone(),
+            0,
+            first_job,
+            FrameSubmitMode::Immediate,
+            true,
+            Some(blocked),
+        )
         .expect("register first job");
     let second_job = platform
-        .register_scanout_render_completion(output_key.clone(), 1, Some(ready))
+        .allocate_scanout_render_job_id()
+        .expect("allocate second job");
+    platform
+        .register_scanout_render_completion(
+            output_key.clone(),
+            1,
+            second_job,
+            FrameSubmitMode::Immediate,
+            true,
+            Some(ready),
+        )
         .expect("register second job");
 
     let completions = platform.drain_scanout_render_completions();
     assert_eq!(completions.len(), 1);
-    assert_eq!(completions[0].job_id, second_job);
+    assert_eq!(completions[0].render_job_id, second_job);
     assert_eq!(completions[0].output_key, output_key);
     assert_eq!(completions[0].bo_idx, 1);
     assert_eq!(
-        platform.pending_scanout_render_completions[0].job_id, first_job,
+        platform.pending_scanout_render_completions[0].render_job_id, first_job,
         "an unreadable earlier job remains registered"
     );
 
@@ -405,19 +437,73 @@ fn scanout_render_completion_drain_is_not_queue_front_blocked() {
 
 #[test]
 fn already_signalled_scanout_completion_is_immediately_ready_without_fd() {
+    use crate::kms::render::scene::FrameSubmitMode;
     let mut platform = PlatformBackend::for_tests();
     let output_key = platform.outputs[0].key.clone();
     let job = platform
-        .register_scanout_render_completion(output_key.clone(), 2, None)
+        .allocate_scanout_render_job_id()
+        .expect("allocate render job ID");
+    platform
+        .register_scanout_render_completion(
+            output_key.clone(),
+            2,
+            job,
+            FrameSubmitMode::Immediate,
+            true,
+            None,
+        )
         .expect("register Vulkan fd=-1 completion");
 
     let completions = platform.drain_scanout_render_completions();
     assert_eq!(completions.len(), 1);
-    assert_eq!(completions[0].job_id, job);
+    assert_eq!(completions[0].render_job_id, job);
     assert_eq!(completions[0].output_key, output_key);
     assert_eq!(completions[0].bo_idx, 2);
     assert!(completions[0].fd.is_none());
     assert!(platform.pending_scanout_render_completions.is_empty());
+}
+
+// pure boundary. Mutation: allocate a replacement ID during registration or
+// drop stable output, BO, mode, or completeness fields from pending/ready transport.
+#[test]
+fn platform_render_completion_preserves_unflip_identity() {
+    use crate::kms::render::scene::FrameSubmitMode;
+    use nix::sys::eventfd::{EfdFlags, EventFd};
+
+    let mut platform = PlatformBackend::for_tests();
+    let output_key = platform.outputs[0].key.clone();
+    let ready: OwnedFd =
+        EventFd::from_value_and_flags(1, EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK)
+            .expect("ready eventfd")
+            .into();
+    let render_job_id = platform
+        .allocate_scanout_render_job_id()
+        .expect("allocate render job ID before recording");
+    platform
+        .register_scanout_render_completion(
+            output_key.clone(),
+            2,
+            render_job_id,
+            FrameSubmitMode::DeferredUnflip,
+            false,
+            Some(ready),
+        )
+        .expect("register deferred copied completion");
+
+    let pending = &platform.pending_scanout_render_completions[0];
+    assert_eq!(pending.output_key, output_key);
+    assert_eq!(pending.bo_idx, 2);
+    assert_eq!(pending.render_job_id, render_job_id);
+    assert_eq!(pending.mode, FrameSubmitMode::DeferredUnflip);
+    assert!(!pending.recording_complete);
+
+    let completions = platform.drain_scanout_render_completions();
+    assert_eq!(completions.len(), 1);
+    assert_eq!(completions[0].output_key, output_key);
+    assert_eq!(completions[0].bo_idx, 2);
+    assert_eq!(completions[0].render_job_id, render_job_id);
+    assert_eq!(completions[0].mode, FrameSubmitMode::DeferredUnflip);
+    assert!(!completions[0].recording_complete);
 }
 
 #[test]

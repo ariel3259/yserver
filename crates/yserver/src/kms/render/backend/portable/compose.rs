@@ -30,14 +30,17 @@ impl<P: Platform> XBackend<P> {
     /// One compose pass: a new frame id, the paint flushes the compose
     /// samples after, `scene.tick` and its telemetry. Returns the outputs
     /// that submitted a frame, `None` when no tick ran or it failed.
-    pub(crate) fn compose_tick(&mut self) -> Option<Vec<usize>> {
+    pub(crate) fn compose_tick(
+        &mut self,
+        mode: crate::kms::render::scene::FrameSubmitMode,
+    ) -> Option<Vec<usize>> {
         // One main-loop tick = one frame_id. Submit events
         // recorded between calls share the surrounding tick's
         // id; the scene_compose event of this tick (if it
         // submits) also carries this id.
         self.telemetry.advance_frame();
-        let can_submit_scene =
-            self.scene_wants_scene() && self.scene.has_output_ready_for_submit(&self.platform);
+        let can_submit_scene = self.scene_wants_scene()
+            && self.scene.has_output_ready_for_submit(&self.platform, mode);
         // #214 telemetry: did this tick's compose close submit paint, and
         // did the tick then compose anything?
         let mut legacy_close_submitted = false;
@@ -105,6 +108,7 @@ impl<P: Platform> XBackend<P> {
                 &mut self.platform,
                 &mut self.telemetry,
                 cow_host_xid,
+                mode,
             ) {
                 Ok(composed_outputs) => {
                     if legacy_close_submitted {

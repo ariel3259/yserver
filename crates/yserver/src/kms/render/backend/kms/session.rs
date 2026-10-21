@@ -349,6 +349,7 @@ impl KmsBackend {
             &mut self.platform,
             &mut self.telemetry,
             cow_host_xid,
+            crate::kms::render::scene::FrameSubmitMode::Immediate,
         );
         self.record_accepted_degraded_unflip_replacements();
         match result {

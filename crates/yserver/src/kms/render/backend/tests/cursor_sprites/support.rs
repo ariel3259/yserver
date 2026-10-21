@@ -698,7 +698,11 @@ pub(crate) fn enter_held_direct(
                     "direct admission transition frame {frame} was not accepted (cursor_mode={scene_mode:?}, scene_wants_scene={}, structure_dirty={}, output_ready={}, scene_flip_pending={}, cursor_transition_pending={}, cursor_commit_in_flight={}, direct_active={}, accepted_kinds={accepted_kinds:?})",
                     backend.for_tests_scene_wants_scene(),
                     backend.scene.scene_structure_dirty,
-                    backend.scene.output_ready_for_submit(0, &backend.platform),
+                    backend.scene.output_ready_for_submit(
+                        0,
+                        &backend.platform,
+                        crate::kms::render::scene::FrameSubmitMode::Immediate,
+                    ),
                     backend.scene.has_pending_page_flip(0),
                     backend.scene.cursor_transition_pending(),
                     backend.platform.cursor_commit_in_flight_for_output(0),

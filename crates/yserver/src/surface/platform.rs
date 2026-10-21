@@ -35,9 +35,10 @@ use crate::kms::{
         gpu::{FencePool, GpuCore},
         resize_fault,
         scene::{
-            CursorPlaneSink, CursorShowFailure, CursorUploadOutcome, FinishOutcome, FlipRetirement,
-            FrameTargetError, OffscreenTarget, OutputLayout, OutputRoute, OutputSink,
-            PreparedOutputs, RecordFrame, RenderCompletion, SceneCompositor, SlotToken,
+            CopiedSubmitOutcome, CursorPlaneSink, CursorShowFailure, CursorUploadOutcome,
+            FinishOutcome, FlipRetirement, FrameSubmitMode, FrameTargetError, OffscreenTarget,
+            OutputLayout, OutputRoute, OutputSink, PreparedOutputs, RecordFrame,
+            RenderNotification, SceneCompositor, SlotToken,
         },
     },
     vk::{
@@ -64,6 +65,7 @@ pub(crate) struct SurfacePlatform {
     /// The largest screen side the GPU takes (`RRGetScreenSizeRange`).
     max_screen: u16,
     pub(crate) outputs: Vec<SurfaceOutput>,
+    next_render_job_id: u64,
     cursor: HostCursor,
     /// Present's clock without outputs (rootless).
     clock: Option<Arc<FrameClock>>,
@@ -137,6 +139,7 @@ impl SurfacePlatform {
             output_mm: (0, 0),
             max_screen,
             outputs,
+            next_render_job_id: 1,
             cursor: HostCursor::default(),
             clock: None,
         }
@@ -297,6 +300,8 @@ impl OutputSink for SurfacePlatform {
         &mut self,
         output_idx: usize,
         bo_idx: usize,
+        _render_job_id: u64,
+        _mode: FrameSubmitMode,
         record: &mut RecordFrame<'_>,
     ) -> FinishOutcome {
         match self.outputs.get_mut(output_idx) {
@@ -334,16 +339,28 @@ impl OutputSink for SurfacePlatform {
         }
     }
 
+    fn allocate_render_job_id(&mut self) -> io::Result<u64> {
+        let render_job_id = self.next_render_job_id;
+        self.next_render_job_id = self
+            .next_render_job_id
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("surface render job id overflow"))?;
+        Ok(render_job_id)
+    }
+
     fn register_render_completion(
         &mut self,
         _output_idx: usize,
         _bo_idx: usize,
+        _render_job_id: u64,
+        _mode: FrameSubmitMode,
+        _recording_complete: bool,
         _fd: Option<OwnedFd>,
-    ) -> io::Result<u64> {
+    ) -> io::Result<()> {
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }
 
-    fn drain_render_completions(&mut self) -> Vec<RenderCompletion> {
+    fn drain_render_notifications(&mut self) -> Vec<RenderNotification> {
         Vec::new()
     }
 
@@ -353,8 +370,11 @@ impl OutputSink for SurfacePlatform {
         &mut self,
         _output_idx: usize,
         _bo_idx: usize,
+        _render_job_id: u64,
+        _recording_complete: bool,
+        _mode: FrameSubmitMode,
         _fd: Option<OwnedFd>,
-    ) -> io::Result<Option<u64>> {
+    ) -> io::Result<CopiedSubmitOutcome> {
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }
 }
@@ -931,7 +951,9 @@ impl Platform for SurfacePlatform {
         let now = std::time::Instant::now();
         let scene = (b.any_surface_visible() && b.scene_wants_scene())
             .then(|| {
-                if b.scene.has_output_ready_for_submit(&b.platform) {
+                if b.scene
+                    .has_output_ready_for_submit(&b.platform, FrameSubmitMode::Immediate)
+                {
                     Some(now)
                 } else {
                     b.scene.earliest_retry_deadline()
@@ -1050,7 +1072,7 @@ impl Platform for SurfacePlatform {
             log::warn!("surface maybe_composite: timeout close failed: {e:?}");
         }
         b.tick_cursor_animation();
-        b.compose_tick();
+        b.compose_tick(FrameSubmitMode::Immediate);
         b.rootless_tick();
         b.drain_paint_submit_telemetry();
         b.flush_host_cursor();

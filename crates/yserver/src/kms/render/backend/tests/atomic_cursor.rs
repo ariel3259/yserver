@@ -565,10 +565,16 @@ fn cursor_only_commit_blocks_scene_readiness_until_its_flip_retires() {
     maybe_composite(&mut backend);
 
     assert!(OutputSink::output_commit_in_flight(&backend.platform, 0));
-    assert!(!backend.scene.has_output_ready_for_submit(&backend.platform));
+    assert!(!backend.scene.has_output_ready_for_submit(
+        &backend.platform,
+        crate::kms::render::scene::FrameSubmitMode::Immediate,
+    ));
     retire_test_flip(&mut backend, &mut state, 1);
     assert!(!OutputSink::output_commit_in_flight(&backend.platform, 0));
-    assert!(backend.scene.has_output_ready_for_submit(&backend.platform));
+    assert!(backend.scene.has_output_ready_for_submit(
+        &backend.platform,
+        crate::kms::render::scene::FrameSubmitMode::Immediate,
+    ));
     assert_no_cursor_work(&backend, device_key);
 }
 

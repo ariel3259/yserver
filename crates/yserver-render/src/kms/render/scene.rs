@@ -53,6 +53,7 @@ use cursor::*;
 use damage::*;
 #[cfg(test)]
 use damage_audit::*;
+pub use flip::DeferredFrameIdentity;
 #[cfg(test)]
 use flip::*;
 #[cfg(test)]
@@ -149,7 +150,12 @@ fn output_transform(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InFlightStage {
     WaitingForRenderCompletion {
-        job_id: u64,
+        render_job_id: u64,
+    },
+    /// A deferred unflip render awaiting grouped acceptance or safe
+    /// cancellation; it has no page-flip obligation yet.
+    UnflipPrepared {
+        render_job_id: u64,
     },
     /// Accepted by KMS. `event_id` is the accepted commit's event identity;
     /// non-KMS sinks have none.
@@ -161,6 +167,9 @@ enum InFlightStage {
 struct PendingAck {
     bo_idx: usize,
     generation: u64,
+    render_job_id: u64,
+    mode: FrameSubmitMode,
+    recording_complete: bool,
     stage: InFlightStage,
     /// Snapshots taken at tick entry, one per source drawable
     /// that contributed to the compose. Ack'd against the
