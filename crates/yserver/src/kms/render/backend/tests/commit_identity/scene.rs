@@ -143,8 +143,8 @@ fn p1_unflip_dependency_readiness_error_does_not_block_backend() {
     let mut fixture = AtomicEventFixture::new(1);
     let vk = match crate::kms::vk::device::VkContext::new() {
         Ok(vk) => vk,
-        Err(crate::kms::vk::device::VkInitError::NoSuitableDevice) => {
-            eprintln!("skipping: no suitable Vulkan physical device");
+        Err(error) if error.is_unavailable_for_tests() => {
+            eprintln!("skipping: Vulkan unavailable: {error}");
             return;
         }
         Err(error) => panic!("unexpected Vulkan test setup failure: {error}"),

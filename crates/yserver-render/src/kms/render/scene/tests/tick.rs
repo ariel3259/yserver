@@ -62,7 +62,10 @@ fn scene_with_one_live_output(
 ) -> Result<Option<(TestSink, SceneCompositor)>, String> {
     let vk = match crate::kms::vk::device::VkContext::new() {
         Ok(vk) => vk,
-        Err(crate::kms::vk::device::VkInitError::NoSuitableDevice) => return Ok(None),
+        Err(error) if error.is_unavailable_for_tests() => {
+            eprintln!("skipping: Vulkan unavailable: {error}");
+            return Ok(None);
+        }
         Err(error) => return Err(format!("initialize test Vulkan context: {error}")),
     };
     let ops = crate::kms::vk::ops::OpsCommandPool::new(std::sync::Arc::clone(&vk))
@@ -86,14 +89,7 @@ fn scene_with_one_live_output(
 }
 
 fn live_scene_or_skip(route: OutputRoute) -> Option<(TestSink, SceneCompositor)> {
-    match scene_with_one_live_output(route).expect("unexpected Vulkan scene fixture setup failure")
-    {
-        Some(scene) => Some(scene),
-        None => {
-            eprintln!("skipping: no suitable Vulkan physical device");
-            None
-        }
-    }
+    scene_with_one_live_output(route).expect("unexpected Vulkan scene fixture setup failure")
 }
 
 fn tick_live_scene(

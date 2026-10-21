@@ -512,8 +512,8 @@ fn platform_render_completion_preserves_unflip_identity() {
 fn submitted_unflip_quarantine_wakes_the_render_completion_poller() {
     let vk = match VkContext::new() {
         Ok(vk) => vk,
-        Err(crate::kms::vk::device::VkInitError::NoSuitableDevice) => {
-            eprintln!("skipping: no suitable Vulkan physical device");
+        Err(error) if error.is_unavailable_for_tests() => {
+            eprintln!("skipping: Vulkan unavailable: {error}");
             return;
         }
         Err(error) => panic!("unexpected Vulkan test setup failure: {error}"),

@@ -13,7 +13,6 @@ use crate::{
 };
 use std::{
     collections::HashMap,
-    io,
     os::fd::RawFd,
     rc::Rc,
     sync::Arc,
@@ -738,11 +737,16 @@ pub(in crate::kms::render::backend::tests) fn build_recording_scene_backend(
     };
     let mut backend = match KmsBackend::for_tests_with_vk_dimensions(screen_width, 600) {
         Ok(backend) => backend,
-        Err(error) if is_expected_vulkan_absence(&error) => {
-            eprintln!("SKIP recording_scene: Vulkan ICD unavailable ({error})");
-            return Ok(None);
+        Err(error) => {
+            if let Some(vk_error) =
+                crate::kms::render::backend::tests::vk_init_error_from_io_error(&error)
+                    .filter(|error| error.is_unavailable_for_tests())
+            {
+                eprintln!("skipping: Vulkan unavailable: {vk_error}");
+                return Ok(None);
+            }
+            return Err(format!("Vulkan fixture unavailable: {error}"));
         }
-        Err(error) => return Err(format!("Vulkan fixture unavailable: {error}")),
     };
     if !skip_unless_vulkan_fed_scanout(&backend) {
         return Ok(None);
@@ -939,8 +943,4 @@ fn install_copied_route(backend: &mut KmsBackend, separate_sink: bool) -> Result
     backend.scene = SceneCompositor::new(&backend.platform, &layouts)
         .map_err(|error| format!("rebuild copied route scene: {error:?}"))?;
     Ok(())
-}
-
-fn is_expected_vulkan_absence(error: &io::Error) -> bool {
-    crate::kms::render::backend::tests::vulkan_absence_is_expected(error)
 }

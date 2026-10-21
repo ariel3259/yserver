@@ -1163,6 +1163,22 @@ pub enum VkInitError {
     },
 }
 
+#[cfg(any(test, feature = "test-support"))]
+impl VkInitError {
+    /// Whether Vulkan is unavailable as a test prerequisite on this host.
+    #[must_use]
+    pub fn is_unavailable_for_tests(&self) -> bool {
+        matches!(
+            self,
+            Self::Loader(_)
+                | Self::NoSuitableDevice
+                | Self::Vk(
+                    vk::Result::ERROR_INCOMPATIBLE_DRIVER | vk::Result::ERROR_INITIALIZATION_FAILED
+                )
+        )
+    }
+}
+
 impl From<vk::Result> for VkInitError {
     fn from(r: vk::Result) -> Self {
         VkInitError::Vk(r)
@@ -1800,6 +1816,34 @@ mod tests {
         VulkanDeviceSelector {
             device_uuid: [seed; vk::UUID_SIZE],
             driver_uuid: [seed.wrapping_add(0x40); vk::UUID_SIZE],
+        }
+    }
+
+    #[test]
+    // Mutation: omit ERROR_INITIALIZATION_FAILED from expected Vulkan-unavailable results.
+    fn vk_init_error_classifies_only_missing_vulkan_prerequisites() {
+        let loader_error = match unsafe {
+            ash::Entry::load_from("/__yserver_missing_vulkan_loader_for_test__.so")
+        } {
+            Err(error) => error,
+            Ok(_) => panic!("the test loader path does not exist"),
+        };
+        let unavailable = [
+            VkInitError::Loader(loader_error),
+            VkInitError::NoSuitableDevice,
+            VkInitError::Vk(vk::Result::ERROR_INCOMPATIBLE_DRIVER),
+            VkInitError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED),
+        ];
+        for error in unavailable {
+            assert!(error.is_unavailable_for_tests(), "{error}");
+        }
+
+        let unexpected = [
+            VkInitError::Vk(vk::Result::ERROR_OUT_OF_HOST_MEMORY),
+            VkInitError::MissingRequiredFeature("logicOp"),
+        ];
+        for error in unexpected {
+            assert!(!error.is_unavailable_for_tests(), "{error}");
         }
     }
 

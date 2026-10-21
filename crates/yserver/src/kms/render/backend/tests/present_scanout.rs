@@ -1584,11 +1584,16 @@ fn phase_b_flip_visibility_includes_all_scanout_transactions() {
 fn present_flip_in_flight_mirrors_scene_state() {
     let mut b = match crate::kms::render::backend::KmsBackend::for_tests_with_vk() {
         Ok(backend) => backend,
-        Err(error) if error.to_string().contains("NoSuitableDevice") => {
-            eprintln!("skipping: no suitable Vulkan physical device");
-            return;
+        Err(error) => {
+            if let Some(vk_error) =
+                crate::kms::render::backend::tests::vk_init_error_from_io_error(&error)
+                    .filter(|error| error.is_unavailable_for_tests())
+            {
+                eprintln!("skipping: Vulkan unavailable: {vk_error}");
+                return;
+            }
+            panic!("unexpected Vulkan test setup failure: {error}");
         }
-        Err(error) => panic!("unexpected Vulkan test setup failure: {error}"),
     };
     let crtc_id = 0x5000;
     bind_test_randr_crtc(&mut b, 0, crtc_id);
