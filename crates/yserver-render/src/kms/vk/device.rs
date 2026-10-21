@@ -1173,7 +1173,10 @@ impl VkInitError {
             Self::Loader(_)
                 | Self::NoSuitableDevice
                 | Self::Vk(
-                    vk::Result::ERROR_INCOMPATIBLE_DRIVER | vk::Result::ERROR_INITIALIZATION_FAILED
+                    vk::Result::ERROR_INCOMPATIBLE_DRIVER
+                        | vk::Result::ERROR_INITIALIZATION_FAILED
+                        | vk::Result::ERROR_EXTENSION_NOT_PRESENT
+                        | vk::Result::ERROR_FEATURE_NOT_PRESENT
                 )
         )
     }

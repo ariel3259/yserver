@@ -78,6 +78,8 @@ mod bo_state;
 mod copied;
 mod dmabuf_metadata;
 mod errors;
+#[cfg(test)]
+pub(crate) use errors::scanout_error_is_unavailable_for_tests;
 mod image_alloc;
 mod modifiers;
 mod probe;

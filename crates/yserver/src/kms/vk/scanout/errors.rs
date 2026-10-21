@@ -66,3 +66,51 @@ pub(crate) fn scanout_error_is_device_lost(error: &io::Error) -> bool {
 
     contains_device_lost(error)
 }
+
+/// Whether a typed scanout Vulkan result represents a missing test prerequisite.
+#[cfg(test)]
+pub(crate) fn scanout_error_is_unavailable_for_tests(error: &io::Error) -> bool {
+    fn scanout_vk_result(error: &(dyn std::error::Error + 'static)) -> Option<vk::Result> {
+        if let Some(error) = error.downcast_ref::<ScanoutVkOperationError>() {
+            return Some(error.result);
+        }
+
+        if let Some(io_error) = error.downcast_ref::<io::Error>()
+            && let Some(inner) = io_error.get_ref()
+        {
+            return scanout_vk_result(inner);
+        }
+
+        error.source().and_then(scanout_vk_result)
+    }
+
+    scanout_vk_result(error).is_some_and(|result| {
+        crate::kms::vk::device::VkInitError::Vk(result).is_unavailable_for_tests()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Mutation: omit either missing-capability VkResult from the shared test classifier.
+    #[test]
+    fn typed_scanout_missing_capabilities_are_unavailable_for_tests() {
+        for result in [
+            vk::Result::ERROR_EXTENSION_NOT_PRESENT,
+            vk::Result::ERROR_FEATURE_NOT_PRESENT,
+        ] {
+            let error = scanout_vk_error("allocate exact copied source", result);
+            assert!(
+                scanout_error_is_unavailable_for_tests(&error),
+                "typed scanout prerequisite error was not classified: {error}"
+            );
+        }
+
+        let unexpected = scanout_vk_error(
+            "allocate exact copied source",
+            vk::Result::ERROR_OUT_OF_HOST_MEMORY,
+        );
+        assert!(!scanout_error_is_unavailable_for_tests(&unexpected));
+    }
+}

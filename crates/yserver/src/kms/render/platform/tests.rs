@@ -520,11 +520,17 @@ fn platform_deferred_completion_keeps_captured_topology_generation() {
     bo.state.transition_to_submitted(sink_copy_fd);
     let destinations =
         crate::kms::vk::scanout::ScanoutBoPool::for_tests_recording_pool(route, 800, 600, vec![bo]);
-    let copied = crate::kms::vk::scanout::CopiedScanoutPool::for_tests_recording_pool(
+    let copied = match crate::kms::vk::scanout::CopiedScanoutPool::for_tests_recording_pool(
         Arc::clone(&vk),
         destinations,
-    )
-    .expect("test copied-pool source setup");
+    ) {
+        Ok(copied) => copied,
+        Err(error) if crate::kms::vk::scanout::scanout_error_is_unavailable_for_tests(&error) => {
+            eprintln!("skipping: Vulkan unavailable: {error}");
+            return;
+        }
+        Err(error) => panic!("test copied-pool source setup: {error:?}"),
+    };
     platform.scanout_pools[0] = Some(crate::kms::vk::scanout::OutputScanout::Copied(copied));
 
     let ready: OwnedFd =
