@@ -1,0 +1,406 @@
+# Fresh Composed Frame on Direct-Scanout Unflip Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:executing-plans` to implement this plan task by task. The implementer is Codex gpt-6-luna and receives one task brief at a time. Implement inline without subagents. Steps use checkbox syntax. Each task has one commit, after its gate passes.
+
+**Goal:** Replace direct scanout with one synchronized, all-output atomic commit of freshly composed scene frames, while preserving scene retirement, direct Present ownership, and lifecycle safety.
+
+**Architecture:** Keep the shared and copied routes on the production `SceneCompositor::tick` path. Carry recording completeness and each output's final sync-file dependency through deferred handoffs into a prepared-plane ledger; only after all planes are complete and ready does the backend submit one grouped replacement and install its accepted P1 ID in every scene acknowledgement. Continue through normal `SceneCompositor::handle_page_flip_complete` retirement, and release direct ownership only after every output retires.
+
+**Tech Stack:** Rust workspace; `yserver-render` scene/sink interfaces; KMS backend and DRM atomic commits; Vulkan scanout BOs and sync-file dependencies; `RecordingSceneFixture` with the recording atomic executor.
+
+**Spec:** [docs/superpowers/specs/2026-10-21-unflip-fresh-frame-design.md](../specs/2026-10-21-unflip-fresh-frame-design.md)
+
+## Global Constraints
+
+- Implement only approved spec rules R1–R12 and the listed test requirements; do not add scope.
+- “Use one asynchronous prepare → readiness → grouped-submit flow for every unflip, including shared and copied outputs.”
+- “The core never blocks for rendering.”
+- “Grouped readiness requires a complete recording for every output.”
+- “The grouped atomic request carries each output's final sync-file dependency as its primary-plane `IN_FENCE_FD`.”
+- “`None` means the work is already signalled and must be encoded as the signalled/no-fence sentinel (`-1`), not treated as missing readiness.”
+- “Submit every output's freshly rendered primary FB in one all-outputs atomic commit”; retain the single-device and homogeneous-refresh eligibility restriction and omit `PAGE_FLIP_ASYNC`.
+- “Only successful grouped atomic submission assigns the P1 accepted commit ID to every output's pending scene acknowledgement and event association. Rejection publishes no accepted ID.”
+- “Each output then retires through `SceneCompositor::handle_page_flip_complete` exactly once”; do not invalidate the successful fresh-frame route after retirement.
+- Preserve direct framebuffer/source/fallback pins until every accepted replacement retires; emit exactly one direct Idle and no second CompleteNotify.
+- Recheck the in-flight cursor-commit gate before group submission; carry only the applied-binding position, including an unchanged cached carrier, and acknowledge it only after acceptance.
+- During preparation, VT release, DPMS-off, and RANDR/topology changes cancel or quiesce safely; never free a BO while GPU work may still write it.
+- “Readiness waits use completion/event notifications and rechecks; they must not poll, block for GPU completion, or arm busy wakes.” Keep compose-wanted and next-wakeup predicates aligned; transient rejection gets a bounded retry deadline.
+- “Do not change the persistent grouped-failure policy in this issue”; keep its existing per-output fallback behavior.
+- Use production backend/event-loop routes for integration tests. Boundary-only tests must be labeled **pure boundary**. Do not add a test-only production route.
+- Keep DRM/GBM/KMS types out of `yserver-render`; add no production `cfg(test)` branches or `YSERVER_*` behavior switches; stay within `tools/check-layout.sh` ceilings.
+- Before each task commit, run its complete software gate. Prefix Cargo tests and GPU-backed software-fixture verification with the lavapipe environment command shown below; Task 6 hardware checks use the physical NVIDIA/AMD drivers and must not use the lavapipe prefix. Run the repository-mandated default-feature Clippy command exactly as written in the gate.
+- Repeat deterministic backend cases 5× under 16 busy-loop workers; repeat GPU-waiting cases 20×. An expected missing prerequisite gets one single-line skip naming that prerequisite; unexpected setup, recording, or runtime errors fail.
+
+## Per-Task Gate
+
+Run every command below for Tasks 1–5, and again after Task 6 updates the validation record. The environment prefix is deliberate: tests without it would use real NVIDIA/AMD drivers.
+
+```bash
+source /home/ariel_santangelo/Projects/claude-scratch/atomic-cursor-split/sdd-p1/lvp-env.sh && cargo +nightly fmt --all
+cargo clippy --all-targets -- -D warnings
+source /home/ariel_santangelo/Projects/claude-scratch/atomic-cursor-split/sdd-p1/lvp-env.sh && cargo test --workspace --locked --features xdmcp
+source /home/ariel_santangelo/Projects/claude-scratch/atomic-cursor-split/sdd-p1/lvp-env.sh && cargo test --workspace --locked --features xdmcp --no-fail-fast -- --ignored
+source /home/ariel_santangelo/Projects/claude-scratch/atomic-cursor-split/sdd-p1/lvp-env.sh && tools/check-layout.sh
+```
+
+Run this cross-target lint once at the end of Task 6 and record its result. The hardware task changes only the validation document; no Rust code changes after Task 5.
+
+```bash
+source /home/ariel_santangelo/Projects/claude-scratch/freebsd-sysroot/env.sh && cargo clippy --target x86_64-unknown-freebsd --workspace --all-targets --locked -- -D warnings
+```
+
+## Review Focus
+
+- Direct pixels can be lost if either the no-background resize or border-width `ConfigureWindow` backing migration reads fallback storage before direct-source materialization. Pin the order and resulting pixels in Task 3's resize and border-change cases.
+- A source-render fence is not the copied output's final dependency. Assert sink-copy fence provenance and the `None` → sign-extended `-1` encoding in Task 3, `issue281_copied_unflip_fences_sink_copy`.
+- A render job's output/BO/`render_job_id`, mode, and completeness must survive allocation, registration, readiness delivery, and sink copy; a full repaint request or exported fence must not mask truncation, and drained partial entries must be retained. Assert this transport and retry path in Tasks 1–3, especially `issue281_group_waits_for_every_render_and_retires_once`.
+- P2 cursor state can be accidentally duplicated, staged, or omitted when the applied position did not change. Assert the commit gate and cached applied-position carrier in Task 3's cursor regressions.
+- Preparation and accepted replacement have different lifecycle ownership and wake behavior. Pin cancellation, event draining, notification-only progress, and bounded retry in Task 4, `issue281_pending_unflip_survives_rejection_and_lifecycle`.
+
+---
+
+## Task 1: Deferred Scene Handoff Carries Recording Completeness
+
+**Files:**
+
+- Modify: `crates/yserver-render/src/kms/render/scene/sink.rs`
+- Modify: `crates/yserver-render/src/kms/render/scene.rs`
+- Modify: `crates/yserver-render/src/kms/render/scene/compose.rs`
+- Modify: `crates/yserver-render/src/kms/render/scene/tick.rs`
+- Modify: `crates/yserver-render/src/kms/render/scene/flip.rs`
+- Modify: `crates/yserver-render/src/kms/render/scene/tests/mod.rs`
+- Modify: `crates/yserver-render/src/kms/render/scene/tests/tick.rs`
+- Modify: `crates/yserver/src/kms/render/platform/scene_sink.rs`
+- Modify: `crates/yserver/src/kms/render/platform/scanout_bos.rs`
+- Modify: `crates/yserver/src/kms/render/platform/tests.rs` (migrate render-completion registrations and renamed identity assertions)
+- Modify: `crates/yserver/src/kms/render/platform.rs`
+- Modify: `crates/yserver/src/kms/render/platform/flip_events.rs`
+- Modify: `crates/yserver/src/kms/render/backend/portable/compose.rs`
+- Modify: `crates/yserver/src/kms/render/backend/kms/session.rs`
+- Modify: `crates/yserver/src/kms/render/backend/kms/scanout.rs` (any-stage scene-frame admission used by cursor scheduling)
+- Modify: `crates/yserver/src/kms/render/backend/kms/present.rs` (visible in-flight Present pacing)
+- Modify: `crates/yserver/src/surface/platform.rs`
+- Modify: `crates/yserver/src/surface/swapchain/mod.rs`
+
+**Interfaces:**
+
+- Consumes: `ComposeSubmit { descriptor_count }`; `compose_submit_was_complete(submitted, draw_count)`; `FrameHandoff::{FlipPending, RenderCompletion}`; `OutputSink::finish_frame`, `register_render_completion`, and `submit_copied`; `SceneCompositor::tick` and `handle_scanout_render_completion_inner`.
+- Produces in `scene/sink.rs`:
+  - `pub enum FrameSubmitMode { Immediate, DeferredUnflip }`, `pub struct RecordedFrame { pub submit: ComposeSubmit, pub recording_complete: bool }`, and `pub enum CopiedSubmitOutcome { FlipAccepted { event_id: u64 }, PreparedForGroup }`. Keep these public types re-exported from `scene.rs` by its production `pub use sink::*`; public record fields let sibling scene code construct the record and `yserver` consume it.
+  - Change `RecordFrame<'a>` to return `Result<RecordedFrame, PresentError>`. The scene closure computes completeness from `descriptor_count == render_scene.draws.len()`.
+  - Standardize the cross-module identity name as `render_job_id`: use it in copied `RenderCompletion`, pending/ready platform records, `InFlightStage::WaitingForRenderCompletion`, deferred handoffs, and every matching/completion API. Add `mode`, `recording_complete`, and the captured `topology_generation` to copied completion records; add `FrameHandoff::DeferredUnflip { render_job_id: u64, recording_complete: bool }` for the shared route. The matching scanout BO state owns its exported final dependency.
+  - Add `RenderNotification::{CopiedSourceReady(RenderCompletion), UnflipDependencySafe { output: Result<usize, String>, bo_idx: usize, render_job_id: u64, topology_generation: u64 }}` and change `OutputSink::drain_render_completions` to `drain_render_notifications() -> Vec<RenderNotification>`. Add `SceneCompositor::handle_render_notification(&mut self, notification: RenderNotification, store: &mut DrawableStore, sink: &mut dyn OutputSink) -> bool`; both the backend event callback and inline scene-tick drain call it, and it passes `store` through copied completion handling and cancellation. Only `CopiedSourceReady` may enter copied source handling, while `UnflipDependencySafe` dispatches matching cancellation/recycling.
+  - Allocate exactly one render job ID before recording with `OutputSink::allocate_render_job_id(&mut self) -> io::Result<u64>`; implement it through the platform's monotonic `next_scanout_render_job_id`. Pass that ID into `finish_frame`, completion registration, readiness delivery, and copied submission unchanged. Registration must not allocate a replacement ID after rendering.
+  - Change `SceneCompositor::tick(&mut self, input: &SceneInput, store: &mut DrawableStore, sink: &mut dyn OutputSink, telemetry: &mut Telemetry, cow_host_xid: Option<u32>, mode: FrameSubmitMode) -> Result<Vec<usize>, SceneError>` and `OutputSink::finish_frame(&mut self, output_idx: usize, bo_idx: usize, render_job_id: u64, mode: FrameSubmitMode, record: &mut RecordFrame<'_>) -> FinishOutcome`.
+  - Change `OutputSink::register_render_completion(&mut self, output_idx: usize, bo_idx: usize, render_job_id: u64, mode: FrameSubmitMode, recording_complete: bool, fd: Option<OwnedFd>) -> io::Result<()>` and `OutputSink::submit_copied(&mut self, output_idx: usize, bo_idx: usize, render_job_id: u64, recording_complete: bool, mode: FrameSubmitMode, topology_generation: Option<u64>, fd: Option<OwnedFd>) -> io::Result<CopiedSubmitOutcome>`. `Immediate` carries `None`; deferred copied completion forwards its captured `Some(generation)` unchanged.
+  - Add `OutputSink::recycle_unflip_target_after_dependency_safe(&mut self, output_idx: usize, bo_idx: usize) -> io::Result<()>`; provide a default through the existing failed-slot recycle path for non-KMS sinks, and override it in KMS to validate/recycle the matching unflip target.
+  - Keep `PendingScanoutRenderCompletion` and `ReadyScanoutRenderCompletion` keyed by `OutputKey` and carrying the same `bo_idx`, `render_job_id`, `mode`, and `recording_complete`; `submit_copied(..., DeferredUnflip)` performs the sink copy and returns `PreparedForGroup`, while `Immediate` preserves the accepted-event result.
+- Update `platform/tests.rs` in this identity migration: pass the caller-allocated `render_job_id` to every render-completion registration and assert `.render_job_id` on pending/ready records; do not rely on registration allocating and returning a replacement ID.
+- Produces in `scene.rs` (the current `InFlightStage` declaration) and `scene/flip.rs`: add `InFlightStage::UnflipPrepared { render_job_id: u64 }` for a render handoff that has not acquired a KMS obligation. Keep `WaitingForRenderCompletion { render_job_id }` for copied source readiness and `KmsFlipPending { event_id }` for accepted KMS work. `has_pending_page_flip` and `pending_page_flip_event_id` report only accepted KMS stages. Add `has_pending_scene_frame(output_idx)` for every pending acknowledgement stage; preserve `has_pending_page_flips()`'s current all-pending-frame meaning for global Present pacing, and use `has_pending_scene_frame` in both submit-readiness helpers, `present_flip_in_flight_for_output`, and the scanout cursor-scheduling guard.
+- Produces in `scene/flip.rs`: add public `DeferredFrameIdentity { pub output_idx: usize, pub bo_idx: usize, pub render_job_id: u64, pub recording_complete: bool }` and `SceneCompositor::pending_unflip_frame_identities(&self) -> Vec<DeferredFrameIdentity>` sourced from every exact `DeferredUnflip` acknowledgement, including copied rows still at `WaitingForRenderCompletion`. Re-export it in `scene.rs` with `pub use flip::DeferredFrameIdentity` for the backend caller.
+- Produces in the scene acknowledgement: preserve `output_idx`, `bo_idx`, `render_job_id`, `mode`, and `recording_complete` from the shared or copied recording until grouped acceptance or safe cancellation. The acknowledgement is the authority for the expected frame identity later compared with the platform's prepared plane. Completeness is `descriptor_count == render_scene.draws.len()`; neither `Repaint::Full` nor an exported fd can set it true.
+- Produces in `scene_sink.rs` / `scanout_bos.rs`: `DeferredUnflip` records a shared output's final render dependency without issuing a per-output KMS flip. A copied source completion still uses the existing source readiness and source-fence import; `submit_copied(..., DeferredUnflip)` performs the sink copy and retains its completion for grouped submission, returning `PreparedForGroup`. `Immediate` preserves existing behavior. Update every production `SceneCompositor::tick` caller and `OutputSink` implementation, including `SurfacePlatform` and its swapchain `RecordFrame` consumer; ordinary surface frames remain `Immediate`.
+
+- [ ] **Step 1: Establish the feature branch, then add red pure-boundary tests.** Before changing files, create or verify feature branch `fix/281-unflip-fresh-frame` from master `8e71c788`; keep all issue implementation commits on that branch. Label pure-boundary tests as such and do not drive a test-only production route.
+
+| Test | Drives and asserts | Mutation that must fail it |
+| --- | --- | --- |
+| `unflip_recording_completeness_survives_shared_handoff` | A shared recording with `descriptor_count == draw_count` and one with `descriptor_count == draw_count - 1`; assert `recording_complete` is respectively `true` and `false` in the deferred handoff/scene acknowledgement, and the prepared frame has no event ID and does not satisfy `has_pending_page_flip`. | Infer completeness from `Repaint::Full` or the presence of an exported fence; turn an incomplete recording into a flip obligation. |
+| `unflip_recording_completeness_survives_copied_source_completion` | A copied recording with the same complete/truncated descriptor counts; register and drain its source completion, then assert the same boolean remains associated with its output, BO, and job ID until sink-copy readiness. | Drop completeness in `register_render_completion` or reconstruct it from the source fence. |
+| `unflip_render_job_mode_and_identity_survive_copied_delivery` | Allocate the job ID before `finish_frame`, register a deferred copied source, drain its ready completion, and pass it to `submit_copied`; assert the same output key/index, BO, job ID, `DeferredUnflip` mode, and completeness arrive at `PreparedForGroup`. | Allocate the ID during registration, lose mode/completeness in either completion record, or retarget the completion to another BO/output. |
+| `immediate_scene_handoffs_keep_existing_retirement_identity` | `FrameSubmitMode::Immediate` through the existing scene test sink; assert accepted `event_id` and the existing `KmsFlipPending` retirement matching remain unchanged. | Route ordinary frames through deferred acceptance or change event-ID matching. |
+| `immediate_copied_frame_stays_admission_blocked_until_source_completion` | Hold an ordinary `Immediate` copied frame at `WaitingForRenderCompletion`; assert `has_pending_page_flip` and its event ID do not claim KMS acceptance, while `has_pending_scene_frame`, `has_output_ready_for_submit`, and `output_ready_for_submit` keep that output blocked until the matching source completion arrives. | Make accepted-only page-flip status admit another frame while the copied acknowledgement still blocks `tick_one_output`, producing repeated no-progress readiness. |
+
+- [ ] **Step 2: Run the new pure-boundary tests red.**
+
+```bash
+source /home/ariel_santangelo/Projects/claude-scratch/atomic-cursor-split/sdd-p1/lvp-env.sh && cargo test -p yserver-render --locked unflip_recording_completeness
+source /home/ariel_santangelo/Projects/claude-scratch/atomic-cursor-split/sdd-p1/lvp-env.sh && cargo test -p yserver-render --locked unflip_render_job_mode_and_identity_survive_copied_delivery
+source /home/ariel_santangelo/Projects/claude-scratch/atomic-cursor-split/sdd-p1/lvp-env.sh && cargo test -p yserver-render --locked immediate_scene_handoffs_keep_existing_retirement_identity
+source /home/ariel_santangelo/Projects/claude-scratch/atomic-cursor-split/sdd-p1/lvp-env.sh && cargo test -p yserver-render --locked immediate_copied_frame_stays_admission_blocked_until_source_completion
+```
+
+- [ ] **Step 3: Implement the listed handoff fields and signatures.** In `tick_one_output`, allocate one ID before `finish_frame`, calculate completeness from `ComposeSubmit` and the actual draw count, and retain ID/mode/completeness through shared handoffs and copied pending/ready records. Update `platform/tests.rs` registrations to accept the caller-allocated ID and its assertions to read `.render_job_id`, along with the platform and scene test sinks and every production tick caller in this task; pass `Immediate` from session and ordinary compose paths. Do not put prepared render work in KMS event retirement accounting.
+- [ ] **Step 4: Run the five pure-boundary tests and the full per-task gate.** All five tests pass; existing immediate shared and copied scene behavior remains unchanged, including admission while an ordinary copied source completion is withheld.
+- [ ] **Step 5: Commit.** `git add` only the Task 1 files; subject: `refactor(render): carry recording completeness through deferred scanout handoffs`.
+
+## Task 2: Prepared-Plane Ledger and Grouped Fence Readiness
+
+**Files:**
+
+- Modify: `crates/yserver/src/kms/render/platform/scanout_bos.rs`
+- Modify: `crates/yserver/src/kms/vk/scanout/copied.rs` (dependency-safe copied source/destination recovery)
+- Modify: `crates/yserver/src/kms/render/platform/scene_sink.rs`
+- Modify: `crates/yserver/src/kms/render/platform.rs`
+- Modify: `crates/yserver/src/kms/render/platform/init.rs` (initialize the prepared ledger and batch context in both PlatformBackend constructors)
+- Modify: `crates/yserver/src/drm/modeset.rs`
+- Modify: `crates/yserver/src/kms/render/backend/kms/scanout.rs` (keep the existing retained-framebuffer initializer buildable with `in_fence_fd: None` until Task 3 replaces it)
+- Modify: pure-boundary tests beside the grouped scanout/modeset helpers
+
+**Interfaces:**
+
+- Consumes: Task 1's `FrameSubmitMode`, `CopiedSubmitOutcome`, recording completeness, and `InFlightStage::UnflipPrepared`; `OutputKey`; `ScanoutBo`/`BoPhase`; `Output::plane_in_fence_fd_prop`.
+- Produces in `platform/scanout_bos.rs`:
+  - `pub(crate) struct ExpectedUnflipPlane { output_idx: usize, output_key: OutputKey, bo_idx: usize, render_job_id: u64, recording_complete: bool, topology_generation: u64 }`, built from scene acknowledgements plus the current output snapshot.
+  - `pub(crate) struct PreparedUnflipPlane { output_idx: usize, output_key: OutputKey, bo_idx: usize, render_job_id: u64, recording_complete: bool, topology_generation: u64, final_in_fence: Option<std::os::fd::RawFd> }`. Its existence means a final dependency was produced; `None` specifically means that dependency is already signalled.
+  - Declare the identity/dependency fields `pub(crate)` so the sibling backend can compare and submit them; keep the descriptor owner exclusively in the associated BO's `BoState`. Re-export both types from `platform.rs` with `pub(crate) use scanout_bos::{ExpectedUnflipPlane, PreparedUnflipPlane};`.
+  - Add `UnflipBatchContext { topology_generation: u64 }`, stored as `Option<UnflipBatchContext>` on `PlatformBackend`, with `install_unflip_batch_context(topology_generation)` and `clear_unflip_batch_context()`. Initialize that field and the prepared-plane ledger in both constructors in `platform/init.rs`.
+  - Capture the installed generation when each `DeferredUnflip` render job starts and carry that captured value through its pending/ready completion records and `RenderCompletion`; do not substitute the current generation when a notification arrives. The copied completion forwards that same value as `topology_generation` to `submit_copied`. The shared `finish_frame(..., DeferredUnflip)` path calls `prepare_unflip_plane` after its final render dependency is captured. The copied `submit_copied(..., DeferredUnflip)` path calls it after the sink copy has been submitted and the sink-copy dependency is captured. Both insert the exact output/BO/job/completeness/generation/fence row into the prepared ledger.
+  - `PlatformBackend::prepare_unflip_plane(&mut self, output_idx: usize, bo_idx: usize, render_job_id: u64, recording_complete: bool, topology_generation: u64, final_in_fence: Option<std::os::fd::RawFd>) -> io::Result<()>` validates output/BO identity and `BoPhase::Submitted`, checks `final_in_fence` against the BO-owned state, and retains the dependency value until acceptance/rejection.
+  - `PlatformBackend::take_prepared_unflip_planes(&mut self) -> Vec<PreparedUnflipPlane>` transfers only new entries; Task 3's batch retains them across later notifications/retries instead of discarding a partial set.
+  - `pub(crate) fn grouped_unflip_ready(expected_outputs: &[OutputKey], expected: &[ExpectedUnflipPlane], prepared: &[PreparedUnflipPlane]) -> bool` is a pure decision requiring one authoritative expected frame and exactly one prepared plane for every expected output key, with equality of output index/key, BO index, render-job ID, completeness, and topology generation. `None` is an available, already-signalled dependency; an unsignalled fd owned by the associated BO is also available.
+  - `PlatformBackend::accept_prepared_unflip_plane(output_idx: usize, bo_idx: usize) -> io::Result<()>` runs only after atomic acceptance: transition the BO `Submitted → Pending` with no out-fence and close the returned userspace in-fence fd. A rejected grouped request leaves each BO `Submitted` and retains its owned dependency for retry.
+  - `PlatformBackend::recycle_unflip_target_after_dependency_safe(output_idx: usize, bo_idx: usize) -> io::Result<()>` uses a dedicated dependency-safe path for a `Recording` or `Submitted` target only after the matching source/final dependency is observed safe. Take and close the BO-owned `BoState::in_fence_fd` exactly once before resetting `BoState`; do not overwrite the raw fd first or release a possible GPU writer early.
+- In `vk/scanout/copied.rs`, provide a copied-pool recovery entry point for this already-proven-safe boundary. It must resolve `CopiedSourceOwnership` and change `ForeignPendingKmsFromSink` destination ownership to `ReleasedButAtomicRejected`, then rearm the relevant semaphores without calling `recover_copy_failure()` or any device/queue-wide wait. Call it only after the matching source or final sink-copy dependency is safe; do not route deferred cancellation through the synchronous `device_wait_idle` wrapper.
+- Produces in `drm/modeset.rs`: extend `ComposedScanoutPlaneState<'a>` with `in_fence_fd: Option<std::os::fd::RawFd>`. `submit_composed_scanout(device: &Device, atomic_commit_sink: &AtomicCommitSink, planes: &[ComposedScanoutPlaneState<'_>], cursor_positions: &[CursorPlanePosition]) -> io::Result<u64>` adds every primary plane's `IN_FENCE_FD`; `None` is encoded as signed `-1` (`u64::MAX` in the atomic property value). The associated scanout BO remains the sole fd owner until acceptance or rejection. If the plane property is unavailable, do not silently drop a required dependency or the `-1` sentinel.
+- Invariants: one expected output key exactly once; every prepared entry matches its acknowledgement-authoritative output/index, BO, job, completeness, and current topology identity; incomplete recordings cannot pass readiness; one prepared entry means a final dependency exists, and `None` means that dependency is already signalled. The associated scanout BO state is the sole fd owner through acceptance or rejection; the prepared ledger retains only its `RawFd` value.
+
+- [ ] **Step 1: Add red pure-boundary tests.** Name the tests and module comments with “pure boundary”; backend integration remains in Task 3.
+
+| Test | Drives and asserts | Mutation that must fail it |
+| --- | --- | --- |
+| `grouped_unflip_readiness_requires_every_complete_current_output` | Pass two expected output keys, then build `expected` rows from acknowledgement-authoritative output/BO/job/completeness/topology snapshots. Assert false for an absent expected frame or prepared row, duplicate output, wrong output index/key, BO/job, completeness, or generation; true only with one exact complete entry per expected output. Run both `Some(unsignalled_fd)` and `None` final dependencies. | Accept the first ready output, ignore identity/generation, or treat incomplete recording as complete. |
+| `composed_unflip_encodes_none_dependency_as_sign_extended_minus_one` | Submit one recorded atomic request containing two primary planes, one with an fd and one with `None`; assert one commit contains both planes, flags are `PAGE_FLIP_EVENT | NONBLOCK` without `PAGE_FLIP_ASYNC`, each plane has its own `IN_FENCE_FD`, the `None` property's raw `u64` is `u64::MAX`, and the other value is that plane's raw fd. | Split the replacement, add `PAGE_FLIP_ASYNC`, omit `IN_FENCE_FD`, encode `None` as `0`, or reuse one output's dependency for another. |
+| `prepared_copied_plane_retains_sink_copy_dependency` | Exercise the copied preparation boundary with distinct source and sink completion fds; assert the prepared plane retains the sink-copy fd. | Store the source-render fd as the final dependency. |
+
+- [ ] **Step 2: Run the pure-boundary tests red.**
+
+```bash
+source /home/ariel_santangelo/Projects/claude-scratch/atomic-cursor-split/sdd-p1/lvp-env.sh && cargo test -p yserver --locked --features xdmcp grouped_unflip_readiness
+source /home/ariel_santangelo/Projects/claude-scratch/atomic-cursor-split/sdd-p1/lvp-env.sh && cargo test -p yserver --locked --features xdmcp composed_unflip_encodes_none_dependency
+source /home/ariel_santangelo/Projects/claude-scratch/atomic-cursor-split/sdd-p1/lvp-env.sh && cargo test -p yserver --locked --features xdmcp prepared_copied_plane_retains_sink_copy_dependency
+```
+
+- [ ] **Step 3: Implement prepared-plane validation, BO acceptance/recycling, and fence encoding.** Keep descriptor ownership in the associated scanout BO state across transient atomic rejection and retry; only accepted submission transitions BOs to `Pending` and closes userspace in-fence descriptors. After cancellation, use the dedicated dependency-safe recycler: close the retained in-fence exactly once before resetting state, and recover copied source/destination ownership through the no-wait quiescent helper in `vk/scanout/copied.rs`. Do not call the existing synchronous recovery wrapper. Do not let `None` block readiness; encode it only at the atomic-property boundary as `-1`.
+- [ ] **Step 4: Run the three tests and the full per-task gate.** Confirm `yserver-render` has no DRM/GBM/KMS type dependency and `tools/check-layout.sh` remains within its ceilings.
+- [ ] **Step 5: Commit.** `git add` only the Task 2 files; subject: `feat(kms): retain per-output unflip readiness and input fences`.
+
+## Task 3: Fresh-Frame Unflip State Machine, Acceptance, and Retirement
+
+**Files:**
+
+- Modify: `crates/yserver/src/kms/render/backend/kms/state.rs`
+- Modify: `crates/yserver/src/kms/render/backend/kms/mod.rs` (backend-scoped re-exports of the batch API)
+- Modify: `crates/yserver/src/kms/render/backend/kms/scanout.rs`
+- Modify: `crates/yserver/src/kms/render/backend/kms/platform_hooks.rs`
+- Modify: `crates/yserver/src/kms/render/backend/seam.rs`
+- Modify: `crates/yserver/src/kms/render/backend/portable/compose.rs`
+- Modify: `crates/yserver/src/kms/render/backend/portable/windows.rs`
+- Modify: `crates/yserver/src/surface/platform.rs` (pass `Immediate` from its compose caller)
+- Modify: `crates/yserver/src/kms/render/platform.rs`
+- Modify: `crates/yserver/src/kms/render/platform/scanout_bos.rs`
+- Modify: `crates/yserver/src/kms/render/platform/flip_events.rs` (safe-recycle notifications and test-only fence provenance observation)
+- Modify: `crates/yserver-render/src/kms/render/scene/flip.rs`
+- Modify: `crates/yserver/src/kms/render/backend/tests/commit_identity/{direct_unflip.rs,recording_scene.rs,support.rs}`
+- Modify: `crates/yserver/src/kms/render/backend/tests/cursor_sprites/` tests that cover the named P2 regressions
+
+**Interfaces:**
+
+- Consumes: Task 1 handoffs and Task 2 `PreparedUnflipPlane`, `grouped_unflip_ready`, and per-plane `IN_FENCE_FD` submission.
+- In `platform.rs`, re-export `grouped_unflip_ready` from the private `scanout_bos` module alongside this task's first production consumer; Task 2's pure-boundary tests call the helper in its defining module.
+- Produces in `kms/state.rs`: `pub(in crate::kms::render::backend) enum ComposedUnflipPhase { Idle, Preparing, Ready, RetryWaiting, Cancelling, Accepted { commit_id: u64 } }` and `pub(in crate::kms::render::backend) struct ComposedUnflipBatch { pub(in crate::kms::render::backend) phase: ComposedUnflipPhase, pub(in crate::kms::render::backend) topology_generation: u64, pub(in crate::kms::render::backend) expected_outputs: Vec<OutputKey>, pub(in crate::kms::render::backend) expected_planes: Vec<ExpectedUnflipPlane>, pub(in crate::kms::render::backend) prepared_planes: HashMap<OutputKey, PreparedUnflipPlane>, pub(in crate::kms::render::backend) awaiting_outputs: HashSet<usize>, pub(in crate::kms::render::backend) retry_at: Option<std::time::Instant> }`, held by `ScanoutM2State`. Re-export `ComposedUnflipBatch` and `ComposedUnflipPhase` from `kms/mod.rs` within `pub(in crate::kms::render::backend)` scope. Keep these types and fields scoped to the backend; prepared render work is never stored as a page-flip/event cookie. `expected_outputs` is the full topology snapshot; `expected_planes` comes only from matching scene acknowledgements, not prepared rows. The batch compares both sets and retains partial `prepared_planes` across notifications, retries, and atomic rejection.
+- Produces in `kms/scanout.rs`:
+  - `start_composed_unflip(&mut self) -> io::Result<bool>` materializes direct content if needed, invalidates/marks the scene for full repaint, establishes the current output/topology snapshot, installs that snapshot's generation in `PlatformBackend::install_unflip_batch_context`, and starts the normal production scene tick in `DeferredUnflip` mode. Clear the context only after acceptance or safe cancellation; replace it with a new generation when a stale batch is safely rebuilt.
+  - `advance_composed_unflip(&mut self) -> io::Result<bool>` refreshes acknowledgement identities using the scene-native `DeferredFrameIdentity` accessor, joins each to the current `OutputKey` and captured topology generation to build `ExpectedUnflipPlane`, merges newly drained prepared rows into `prepared_planes`, retains partial rows, and calls the re-exported `grouped_unflip_ready(expected_outputs, expected_planes, prepared_planes)` only when every output has an authoritative frame. Recheck topology and cursor commit gates before submit; wait by notification/recheck without blocking.
+  - `retire_composed_unflip_output(&mut self, output_idx: usize, event_id: Option<u64>, clock: yserver_core::backend::PresentClockSample) -> bool` matches the accepted group ID, calls `SceneCompositor::handle_page_flip_complete(output_idx, event_id, ...)` once for that output, then retires the direct-output obligation. Direct pins are released only after the last valid output retirement.
+- Produces in `portable/compose.rs`: `XBackend<P>::compose_tick(&mut self, mode: FrameSubmitMode) -> Option<Vec<usize>>`; update its `backend/kms/scanout.rs` and `surface/platform.rs` callers in this task. Ordinary KMS and surface paths pass `Immediate`; only the active unflip path passes `DeferredUnflip`. Preserve the existing paint-flush → `SceneCompositor::tick` ordering.
+- Produces in `scene/flip.rs`: `SceneCompositor::validate_grouped_unflip(&self, expected: &[DeferredFrameIdentity]) -> Result<(), SceneError>` checks every pending acknowledgement before ioctl submission; `accept_grouped_unflip(&mut self, expected: &[DeferredFrameIdentity], event_id: u64)` changes only those exact acknowledgements to `KmsFlipPending { event_id: Some(event_id) }`. Keep the yserver-render scene API free of platform/KMS types. The backend validates all scene acknowledgements and BO identities before ioctl submission. After grouped ioctl acceptance, call `PlatformBackend::accept_prepared_unflip_plane` for each BO to transition `Submitted → Pending` and close each userspace in-fence fd, then install the accepted P1 ID in every acknowledgement/event association. A rejection publishes no ID and leaves BO/fence ownership intact.
+- Produces in `scene/flip.rs`: `SceneCompositor::cancel_prepared_unflip(&mut self, output_idx: usize, bo_idx: usize, render_job_id: u64, store: &mut DrawableStore) -> Result<(), SceneError>` removes only the matching deferred acknowledgement and restores its damage/cursor obligations for a full repaint. Both notification drains pass `store` to the common dispatcher and cancellation path. After its final dependency is safe, the backend first calls `PlatformBackend::recycle_unflip_target_after_dependency_safe`, then removes the scene acknowledgement; never discard a live writer or leave a deferred acknowledgement blocking the degraded path.
+- Persistent grouped rejection follows the existing degraded per-output replacement policy: transition the batch to `Cancelling`/degraded handling, fence-safely unwind deferred acknowledgements that cannot be submitted, and use the existing per-output composed-flip path. Install only accepted per-output IDs; do not leave `UnflipPrepared` acknowledgements blocking ordinary scene ticks. Transient rejection keeps the same prepared batch and BO-owned dependencies for the bounded retry.
+- Classify grouped `EBUSY` as transient and retain/retry the same prepared batch; route other grouped-submit failures through the existing degraded fallback (exercise that path with `EIO`).
+- Define and dispatch notification kinds explicitly. `CopiedSourceReady` retains the source-render job identity and routes to copied handling only for a matching `WaitingForRenderCompletion`; if it is a deferred incomplete recording, skip the sink copy and cancel/recycle its source and destination after this source dependency signals. `UnflipDependencySafe` carries output, BO, `render_job_id`, and captured topology generation; register it for an incomplete shared recording and for every unsignalled final dependency that must be abandoned during EIO, lifecycle, or topology cancellation. Keep the BO-owned dependency until this notification proves it safe, then cancel/recycle/invalidate and retry full repaint with a new job ID in the same async state. A `None` dependency is already safe and takes this cancellation/recycle path inline without registering a notification. Neither notification kind may enter the other's handler; both the event-loop drain and inline `SceneCompositor::tick` drain use the same typed dispatcher, with `DrawableStore` available for acknowledgement cancellation. Never poll or wait synchronously.
+- Preserve the accepted replacement mode: one all-output transaction, `PAGE_FLIP_EVENT | NONBLOCK`, no `PAGE_FLIP_ASYNC`. Keep current single-device and homogeneous-refresh eligibility. Recheck `cursor_commit_in_flight_for_outputs` immediately before submission; include only `cursor_plane_atomic_positions_for_outputs`, including the applied cached position carrier; call `cursor_plane_scene_commit_submitted` only after acceptance. Scene retirement owns cursor transition processing; remove the old external handoff on this successful fresh-frame route.
+- On successful retirement, do not call `invalidate_all_scanout_damage` again. Continue to hold `DirectPresentFrame`, its source pin, fallback-target pin, and release bookkeeping until all grouped outputs retire. Emit its one Idle, never a second CompleteNotify.
+- Change `backend_scanout_on_page_flip_ready` in `kms/scanout.rs`, where accepted page-flip cookies are actually retired: match the accepted group ID, call `SceneCompositor::handle_page_flip_complete` exactly once, and only then remove that output from the direct-unflip awaiting set. `backend_scanout_on_scanout_render_completion` receives render-completion notifications and has no accepted page-flip cookie to retire.
+- Add `Platform::materialize_direct_source_before_storage_migration(&mut XBackend<Self>, host_xid: u32) -> io::Result<()>` in `backend/seam.rs` with a no-op default; implement it in `kms/platform_hooks.rs` by queueing `materialize_direct_shadow_for_unflip` when the active direct frame references `host_xid`. In `portable/windows.rs`, call this fallible hook before both content-preserving `ConfigureWindow` migration branches: the border-width path that enters `LeafContent::Migrate` and the no-background resize path that enters `LeafContent::Migrate`. Propagate failure before storage mutation and rely on the existing ordered engine queue so each migration copy follows materialization. Keep DRM/KMS types out of the portable module and preserve Present-Copy fallback behavior.
+
+The backend test fixture supplies a bounded real-GPU gate, separate from `RecordingRenderCompletionReadiness`: `RecordingSceneFixture::arm_gpu_completion_gate(output_idx, stage) -> GpuCompletionGate` holds the actual scene-render or sink-copy GPU submission behind a test-owned Vulkan semaphore dependency; `GpuCompletionGate::wait_until_exported(timeout)` proves the final fence exists and remains unsignalled, and `release_and_wait(timeout)` unblocks it. Both waits have a five-second deadline. `RecordingRenderCompletionReadiness` remains only a completion-delivery gate. Duplicate a borrowed fence while its original descriptor is live to retain a handle to the same sync-file object; never assume the duplicate has the original descriptor number. Immediately before the recorded ioctl, snapshot each BO-owned raw in-fence number and the atomic property's raw value and assert they match at that boundary. Use the held duplicates only for live provenance/readiness checks under the controlled gates, so later close or descriptor-number reuse cannot invalidate the check.
+
+Add `assert_issue281_unflip_end_state` to `tests/commit_identity/direct_unflip.rs` and call it from every Task 3–4 backend scenario after production retirement/drain. It checks no active unflip batch, render jobs, scene acknowledgements (including `UnflipPrepared`), event cookies, direct pins, or fd leaks; every scanout BO is `Free` or `OnScreen`; and the direct Present has exactly one Idle and no second CompleteNotify. Extend `RecordingSceneFixture::assert_quiescent` for the new batch/ack states; do not let `finish_after_normal_drain` hide a failure by cleaning up before this assertion.
+
+- [ ] **Step 1: Add red backend-driven acceptance tests.** Drive requests, composition, readiness, group submission, and retirement only through Backend entry points or `core_loop::run_core`, using `RecordingSceneFixture`, the recording atomic executor, and P1 `queue_commit_completion`. Inspect the BO named by the recorded primary `FB_ID`, never root readback. Make fixture FB IDs unique across outputs and all three BO slots.
+
+Mark each lavapipe-dependent backend case `#[ignore = "needs live Vulkan ICD (lavapipe)"]`; the focused commands below deliberately use `-- --ignored`.
+
+| Test | Drives and asserts | Mutation that must fail it |
+| --- | --- | --- |
+| `issue281_fullscreen_exit_flips_fresh_scene` | Compose scene A, direct-present visibly distinct scene B, request unflip through fullscreen exit, and drive production ticks/events. Inspect all pixels including uncovered areas in each BO named by grouped primary `FB_ID`; assert the complete current scene B. Also issue an actual `ConfigureWindow` storage replacement on a no-background window while B is direct; assert materialized fallback, migrated replacement backing, and grouped FB contain B. Assert each target is acquired from `Free` and, after render submission, retained as `Submitted` through readiness until acceptance or dependency-safe cancellation; keep the prior composed `OnScreen` BO reserved through retirement. Finish with the shared Task A end-state helper. | Select retained A; migrate before materialization; omit materialization; render a partial repaint; render preparation into the prior `OnScreen` BO. |
+| `issue281_configure_border_change_migrates_materialized_direct_pixels` | While scene B is the active direct source, drive an actual `ConfigureWindow` border-width change through the non-redirected `LeafContent::Migrate` branch; assert fallback materialization precedes the migration, inspect the migrated backing pixels, and assert the grouped primary `FB_ID` names a BO containing fresh scene B. Finish with the shared Task A end-state helper. | Enter border-width migration before materialization or assert only the later framebuffer while missing stale migrated backing pixels. |
+| `issue281_group_waits_for_every_render_and_retires_once` | Two shared outputs with distinct source crops. Arm the fixture's bounded GPU submission gate so both final fences exist but are unsignalled; assert no early/per-CRTC replacement, then exactly one grouped commit carrying each BO's matching `IN_FENCE_FD` while the gate is still closed. Immediately before ioctl, compare each BO-owned raw in-fence number with the recorded property's raw value; retain a duplicate only to check the same sync-file object's readiness under the gate, without relying on the duplicate's number. Release the gate and wait for its bounded completion before injecting valid page-flip cookies; inject wrong, old, duplicate, and partial cookies while direct ownership is held. Force descriptor exhaustion; assert incomplete full recording cannot enter the group or get an accepted ID/page-flip obligation; retain its dependency and BO until safe, invalidate the target, then retry. After the last correct retirement and before cleanup, assert normal scene retirement, `scene.owes_repaint() == false`, and that a no-damage `maybe_composite` produces no new `SceneCompose` or unflip replacement commit. Then assert one direct Idle, no second CompleteNotify, no pending jobs/acks/cookies/pins, only `Free`/`OnScreen` BOs, and no fd leaks. | Submit before every output has a final dependency; accept truncated recording; release an incomplete target before its writer is safe; swallow scene retirement; release direct ownership on first CRTC; restore post-retirement full invalidation and compose unsolicited work. |
+| `issue281_copied_unflip_fences_sink_copy` | Drive copied readiness through Backend. Hold source-completion delivery with `RecordingRenderCompletionReadiness`, then use the fixture's bounded GPU submission gate on the sink queue so the sink-copy fence remains unsignalled; assert the grouped primary FB is the fresh copied destination and its `IN_FENCE_FD` is the sink-copy completion, not source-render completion. Duplicate source and sink fences while their original descriptors are live; under the gates, verify source readiness is complete while the sink-copy dependency remains unsignalled, and compare the BO-owned sink-fence number with the recorded property immediately before ioctl. Do not compare duplicate fd numbers or inspect a raw descriptor after close. Release the sink gate and wait for its bounded completion before injecting valid page-flip cookies. Cover shared-only, copied-only, and eligible mixed shared/copied outputs on one DRM device with homogeneous refresh; extend `RecordingSceneFixture` beyond its current single-output copied readiness. Assert an already-signalled `None` is recorded as sign-extended `-1`; force descriptor exhaustion on the copied source and retain its target/dependency until safe before invalidating and retrying the incomplete recording. Finish with the shared Task A end-state helper. | Submit before source readiness; use source fence for unfinished sink work; accept a truncated source recording; reuse its target before safe; select retained destination; encode `None` as `0`. |
+| `issue281_persistent_group_rejection_uses_degraded_path` | Hold final GPU work behind the bounded completion gate, inject a non-transient grouped ioctl rejection (`EIO`), and prove no BO is recycled and no deferred acknowledgement is removed before the matching `UnflipDependencySafe` notification. Include a copied-only subcase: after that notification, recover source/destination ownership without a device-wide wait, then drive Backend entries to reuse the same copied BO in the existing per-output composed-flip fallback. Prove deferred acknowledgements are safely transitioned into that fallback, each accepted output receives only its own accepted ID, and normal production retirement releases direct ownership after every output. Finish with the shared Task A end-state helper. | Recycle while final GPU work is blocked; call the synchronous copied-recovery wrapper; wait on an unrelated notification; keep deferred acknowledgements blocking the scene tick after safety; reuse a different BO instead of the recovered one; invent an ID for the rejected group; or release direct ownership before every per-output replacement retires. |
+| `issue281_cancellation_with_none_dependency_recycles_inline` | On a deferred frame whose final dependency is `None`, trigger the existing non-transient cancellation path and assert that the matching deferred acknowledgement and target are safely cancelled inline, without registering or awaiting a render notification; then complete through the existing fallback and production retirement. | Treat `None` as missing readiness, arm a notification wait, or leave an `UnflipPrepared` acknowledgement blocking fallback. |
+| `p2_direct_hook_treats_deferred_as_failure_and_unflips` | Extend the production backend regression with fresh pixels and assert the hook remains a failure until the grouped unflip replaces the direct FB. Finish with the shared Task A end-state helper. | Treat deferred as accepted, or show an old FB. |
+| `p2_scene_direct_copied_and_unflip_commits_carry_only_the_applied_position` | Extend the production backend regression with fresh pixels; keep the final cursor-commit gate and assert unflip carries only the applied binding's current position, including an unchanged cached position carrier, with no cursor FB/hotspot/geometry. Finish with the shared Task A end-state helper. | Omit unchanged carrier; use staged hotspot; add cursor FB_ID; run a second external cursor handoff. |
+
+- [ ] **Step 2: Run the new tests red.**
+
+```bash
+source /home/ariel_santangelo/Projects/claude-scratch/atomic-cursor-split/sdd-p1/lvp-env.sh && cargo test -p yserver --locked --features xdmcp issue281_fullscreen_exit_flips_fresh_scene -- --ignored
+source /home/ariel_santangelo/Projects/claude-scratch/atomic-cursor-split/sdd-p1/lvp-env.sh && cargo test -p yserver --locked --features xdmcp issue281_configure_border_change_migrates_materialized_direct_pixels -- --ignored
+source /home/ariel_santangelo/Projects/claude-scratch/atomic-cursor-split/sdd-p1/lvp-env.sh && cargo test -p yserver --locked --features xdmcp issue281_group_waits_for_every_render_and_retires_once -- --ignored
+source /home/ariel_santangelo/Projects/claude-scratch/atomic-cursor-split/sdd-p1/lvp-env.sh && cargo test -p yserver --locked --features xdmcp issue281_copied_unflip_fences_sink_copy -- --ignored
+source /home/ariel_santangelo/Projects/claude-scratch/atomic-cursor-split/sdd-p1/lvp-env.sh && cargo test -p yserver --locked --features xdmcp issue281_persistent_group_rejection_uses_degraded_path -- --ignored
+source /home/ariel_santangelo/Projects/claude-scratch/atomic-cursor-split/sdd-p1/lvp-env.sh && cargo test -p yserver --locked --features xdmcp issue281_cancellation_with_none_dependency_recycles_inline -- --ignored
+source /home/ariel_santangelo/Projects/claude-scratch/atomic-cursor-split/sdd-p1/lvp-env.sh && cargo test -p yserver --locked --features xdmcp p2_direct_hook_treats_deferred_as_failure_and_unflips -- --ignored
+source /home/ariel_santangelo/Projects/claude-scratch/atomic-cursor-split/sdd-p1/lvp-env.sh && cargo test -p yserver --locked --features xdmcp p2_scene_direct_copied_and_unflip_commits_carry_only_the_applied_position -- --ignored
+```
+
+Each focused command must report a nonzero execution count (one matching test); a filtered `0 tests` result is a failed gate. Only the one-line expected-prerequisite skip policy may skip an executed test. Inject `EBUSY` for the bounded transient retry case and `EIO` for the persistent fallback case.
+
+- [ ] **Step 3: Implement fallback materialization ordering and full-scene invalidation.** Include preceding paint through `compose_tick`'s production flush order; require `Repaint::Full` on every unflip output; preserve Present-Copy behavior. Invoke the fallible migration hook before both border-width and no-background-resize `LeafContent::Migrate` branches.
+- [ ] **Step 4: Implement prepare/readiness/group-submit and scene acceptance.** Acquire each target from `Free`; once rendering is submitted, retain it as `Submitted` through readiness and grouped rejection until acceptance or dependency-safe cancellation. Preserve the old `OnScreen` BO through preparation and until that output's grouped replacement retires. A render-only or copied source-render handoff is never a flip obligation. Install the single P1 ID in every output acknowledgement and event association only after atomic acceptance.
+- [ ] **Step 5: Implement normal scene retirement and direct release.** Match each event to the accepted ID, invoke `SceneCompositor::handle_page_flip_complete` exactly once, and release direct state only once every output has retired.
+- [ ] **Step 6: Run the tests in the table and the full per-task gate.** Repeat deterministic backend cases 5× under 16 busy-loop workers; repeat GPU-waiting cases 20×. Keep expected-prerequisite skips to one line.
+- [ ] **Step 7: Commit.** `git add` only the Task 3 files; subject: `fix(kms): compose a fresh frame before direct-scanout unflip`.
+
+## Task 4: VT, DPMS, RANDR Lifecycle and Notification-Driven Pacing
+
+**Files:**
+
+- Modify: `crates/yserver/src/kms/render/backend/kms/scanout.rs`
+- Modify: `crates/yserver/src/kms/render/backend/kms/session.rs`
+- Modify: `crates/yserver/src/kms/render/backend/kms/crtc_config.rs`
+- Modify: `crates/yserver/src/kms/render/backend/kms/randr.rs`
+- Modify: `crates/yserver/src/kms/render/backend/kms/present.rs`
+- Modify: `crates/yserver/src/kms/render/backend/kms/platform_hooks.rs`
+- Modify: `crates/yserver/src/kms/render/backend/tests/commit_identity/{direct_unflip.rs,recording_scene.rs}`
+- Modify: `crates/yserver/src/kms/render/backend/tests/commit_identity/support.rs` for the explicit idle-sequence injection seam
+- Modify: `crates/yserver/src/kms/render/backend/tests/deadlines.rs` where the shared wake predicate is covered
+
+**Interfaces:**
+
+- Consumes: Task 3 `ComposedUnflipPhase`, `ComposedUnflipBatch`, `start_composed_unflip`, `advance_composed_unflip`, and accepted-ID retirement; production entries `on_scanout_render_completion`, `next_wakeup`, `maybe_composite`, VT, DPMS, CRTC config, and RANDR.
+- Produces: a topology-generation bump on any output-layout change; stale unsubmitted plane sets are fence-safely discarded and rebuilt. Keep the batch in `Cancelling` while render/copy dependencies can still write; after a matching completion notification (or the existing lifecycle quiescence boundary), call `recycle_unflip_target_after_dependency_safe` before `SceneCompositor::cancel_prepared_unflip`, clear the old expected/prepared rows, and rebuild under the new generation. Prepared BOs and direct pins remain retained until safe. Accepted commits and event cookies remain tracked until normal retirement, or until the complete old topology is disabled and its events are drained before reset.
+- Keep `scene_wants_compose`/`next_wakeup` aligned. Notification-waiting preparation is runnable from its matching completion event but has no immediate wake. It does not poll or block. A transient grouped rejection with render notifications drained sets a bounded retry deadline that advances without unrelated input. Pending unflip composition counts as visible scanout work for Present idle pacing.
+- Keep an idle CRTC sequence distinct from scene or grouped acceptance. Later paint stays pending for the next frame and does not repeatedly restart the active preparation.
+
+- [ ] **Step 1: Add the red lifecycle/pacing integration test.** This is a backend-driven test using `RecordingSceneFixture`, the recording atomic executor, P1 `queue_commit_completion`, and its explicit sequence-event injection only. Use `AtomicEventFixture::queue_sequence_completion(device_fd, user_data, time_ns, sequence)` with the live CRTC sequence user-data; do not treat that event as a page-flip cookie.
+
+| Test | Drives and asserts | Mutation that must fail it |
+| --- | --- | --- |
+| `issue281_pending_unflip_survives_rejection_and_lifecycle` | Inject one grouped `EBUSY`, then prove the bounded retry deadline submits the same retained batch without unrelated input and publishes no ID before acceptance. Cover VT release, DPMS-off, and RANDR changes both during preparation and after acceptance. During a notification wait, call `maybe_composite` and assert no GPU wait; assert `next_wakeup` arms no immediate busy wake and only the matching notification resumes progress. Inject idle CRTC sequence events with `queue_sequence_completion` during preparation and partial retirement; assert no pending Present completes. Also hold an ordinary `Immediate` copied frame at source-render completion and prove its pending scene frame blocks another scene/cursor admission and idle-sequence Present completion until its matching source notification. Add later paint; assert the Present remains pending and the active batch is not repeatedly restarted. For each cancellation, prove no stale resubmission, premature BO reuse, or lost direct ownership, then drive production all-off and old-topology event drain before the shared Task A end-state helper. | Treat preparation or idle sequence as acceptance/completion; admit scene/cursor work or complete Present while an ordinary copied frame is still pending; discard a BO while GPU work may write it; reuse an obsolete topology job; retry only on unrelated input; omit bounded retry wake; preserve a phantom event wait or restart every tick. |
+
+- [ ] **Step 2: Run the test red.**
+
+```bash
+source /home/ariel_santangelo/Projects/claude-scratch/atomic-cursor-split/sdd-p1/lvp-env.sh && cargo test -p yserver --locked --features xdmcp issue281_pending_unflip_survives_rejection_and_lifecycle -- --ignored
+```
+
+Expected result: one matching test executes; fail the gate if Cargo reports zero tests.
+
+- [ ] **Step 3: Wire lifecycle changes to batch cancellation/quiescence.** Recheck VT, DPMS, and topology immediately before grouped submission. During preparation, retain `Cancelling` state, dependencies, and direct pins until matching completion readiness or the established lifecycle quiescence boundary makes cancellation safe; then recycle the platform target before removing the matching scene acknowledgement, invalidate for a full repaint, and discard the old topology rows. After acceptance, retain the commit/event ledger until retirement or complete old-topology disable plus event drain.
+- [ ] **Step 4: Wire notification progress and pacing.** Make the unflip state part of the same compose-wanted/next-wakeup decision; no busy wake during a notification wait, and a bounded deadline after transient rejection. Include pending unflip in Present idle pacing from preparation through accepted replacement retirement.
+- [ ] **Step 5: Run the test and full per-task gate.** Repeat as deterministic 5× under 16 busy-loop workers; repeat any GPU-waiting path 20×. Record only one-line skips for expected missing prerequisites.
+- [ ] **Step 6: Commit.** `git add` only the Task 4 files; subject: `fix(kms): quiesce and pace pending composed unflips`.
+
+## Task 5: Status Entry and Software Validation Record
+
+**Files:**
+
+- Modify: `docs/status.md`
+- Create: `docs/superpowers/plans/2026-10-21-unflip-fresh-frame-validation.md`
+
+**Interfaces:**
+
+- Consumes: completed implementation and per-task gate evidence from Tasks 1–4.
+- Produces: a dated `docs/status.md` entry that describes the fresh full-frame grouped unflip, per-plane render/sink-copy fences, normal scene retirement, lifecycle behavior, test coverage, and remaining hardware coverage without claiming unrun results.
+- Produces: a validation record with sections for the exact per-task gate results, FreeBSD cross-clippy result, repeat protocol and skips, the eight Task 3 backend scenarios plus the Task 4 lifecycle scenario and their end-state evidence, NVIDIA single-output check, AMD grouped-output check, master `8e71c788` comparison, and uncovered items. Mark hardware fields pending until Task 6 is authorized and performed.
+
+- [ ] **Step 1: Add the dated status entry and validation record.** Do not state tests or hardware as passed unless the command/run has completed; leave Task 6 and final FreeBSD cross-clippy results pending.
+- [ ] **Step 2: Review the records against the approved spec and Task 1–4 outputs.** Each claimed behavior must link to its decisive test or validation evidence; preserve the explicit uncovered outcome if AMD direct scanout is unreachable.
+- [ ] **Step 3: Run the complete per-task gate above and record exact outcomes.** Task 6 changes only the validation record; run the FreeBSD cross-clippy at the very end of Task 6.
+- [ ] **Step 4: Commit.** `git add docs/status.md docs/superpowers/plans/2026-10-21-unflip-fresh-frame-validation.md`; subject: `docs(kms): record fresh-frame unflip implementation and validation`.
+
+## Task 6: Coordinator Hardware Validation (Requires User Presence and Authorization)
+
+**Files:**
+
+- Modify: `docs/superpowers/plans/2026-10-21-unflip-fresh-frame-validation.md`
+- No implementation files.
+
+**Interfaces:**
+
+- Consumes: Task 5 validation record and working fix on `fix/281-unflip-fresh-frame` based on master `8e71c788`.
+- Produces: observed hardware results, logs, master-versus-fix comparison, and any explicit uncovered coverage in the validation record. Do not infer a pass from fixture tests.
+
+- [ ] **Step 1: At execution time, obtain the user's presence and authorization before accessing hardware.** This task must pause if the user is not present or has not authorized the hardware session.
+- [ ] **Step 2: NVIDIA single-output reproduction and comparison.** On a Cinnamon-like session, run the same fullscreen `mpv` direct-scanout → leave-fullscreen reproduction on master `8e71c788` and the fix. Capture the fix's debug log line `submitted atomic composed unflip`; the user observes whether any flash occurs. Record build/revision, exact steps, observation, and logs for both revisions.
+- [ ] **Step 3: AMD grouped-output validation and comparison.** Compare master `8e71c788` with the fix on the AMD grouped-output setup; validate the fresh all-output replacement and completion behavior. If direct scanout is unreachable on AMD, record AMD direct-scanout coverage as **uncovered** and include why; do not claim validation.
+- [ ] **Step 4: Run the software gate after the validation-record edit.** Prefix Cargo tests and GPU-backed software-fixture verification with the lavapipe environment line in the gate; run `cargo clippy --all-targets -- -D warnings` exactly as written. Run the NVIDIA and AMD hardware reproductions on their physical driver stacks, without the lavapipe environment.
+- [ ] **Step 5: Run the FreeBSD cross-clippy command above as the final code-quality check and record its exact result.** No Rust code changes follow.
+- [ ] **Step 6: Commit.** `git add docs/superpowers/plans/2026-10-21-unflip-fresh-frame-validation.md`; subject: `docs(kms): record unflip hardware validation`.
+
+## Production-Caller Audit
+
+Before changing a trait or completion signature, run this exact repository-wide search; rerun after integration and account for every production caller in the table. The search can still return `tests.rs` and inline `#[cfg(test)]` matches despite its path filters, so inspect each match's cfg/context and exclude test-only hits when adjudicating production callers.
+
+```bash
+rg -n -g '*.rs' -g '!**/tests/**' -g '!**/for_tests.rs' '(SceneCompositor::tick|compose_tick\(|\.tick\(|allocate_render_job_id\(|finish_frame\(|register_render_completion\(|drain_render_notifications\(|submit_copied\(|submit_composed_scanout\(|handle_page_flip_complete\(|has_pending_page_flips?\(|has_pending_scene_frame\(|on_scanout_render_completion|backend_scanout_on_page_flip_ready|on_page_flip_ready|on_crtc_sequence_event|next_wakeup|maybe_composite|request_direct_unflip|materialize_direct_source_before_storage_migration|retire_direct_output|materialize_direct_shadow_for_unflip|invalidate_all_scanout_damage|mark_scene_structure_dirty)' crates
+```
+
+| Production seam/caller | Current production location | Plan owner and required audit result |
+| --- | --- | --- |
+| Scene ticking, job allocation, and `OutputSink` surface | `backend/portable/compose.rs::compose_tick`; `backend/kms/session.rs`; `backend/kms/present.rs::present_flip_in_flight_for_output`; `backend/kms/scanout.rs` cursor scheduling; `yserver-render/.../scene/{tick,sink}.rs`; `platform/scene_sink.rs`; `platform/flip_events.rs`; `surface/platform.rs`; `surface/swapchain/mod.rs` | Task 1: update KMS and surface production tick callers, all production/test sink implementations, the surface `RecordFrame` consumer, the pre-record `render_job_id` allocator, and any-stage admission/pacing gates in the owning commits; pass `Immediate` except during the active unflip. |
+| Copied render completion, safe-recycle notifications, and sink copy | `scene/flip.rs::handle_scanout_render_completion_inner`; `platform.rs::{PendingScanoutRenderCompletion, ReadyScanoutRenderCompletion}`; `platform/scene_sink.rs::register_render_completion` / `submit_copied`; `platform/scanout_bos.rs::submit_copied_scanout`; backend callback and inline tick notification drains | Tasks 1–3: preserve output key/index, BO, `render_job_id`, mode, completeness, captured generation, source readiness/import, notification kind, and final sink-copy fence. Dispatch copied-source and final-dependency-safe notifications separately through both drains. |
+| Grouped primary-plane submission | `backend/kms/scanout.rs::submit_composed_unflip`; `drm/modeset.rs::submit_composed_scanout` | Tasks 2–3: one current prepared plane per output, per-plane `IN_FENCE_FD`, one accepted P1 ID. |
+| Event and scene retirement | `backend/kms/scanout.rs::backend_scanout_on_page_flip_ready` / `retire_direct_output`; `scene/flip.rs::SceneCompositor::handle_page_flip_complete`; render notification remains in `backend_scanout_on_scanout_render_completion` | Task 3: only a matched page-flip cookie enters scene retirement; each output scene retires once before direct accounting, and direct release waits for all. |
+| Unflip triggers and direct materialization | `backend/kms/{present,scanout,platform_hooks,randr}.rs`; `backend/seam.rs`; `backend/portable/{cursor,windows,paint_target}.rs`; `backend/kms/readback.rs` | Task 3: all triggers converge on the same batch; the fallible portable hook queues direct-source materialization before ConfigureWindow migration; preserve Present-Copy behavior. |
+| Lifecycle cancellation and scheduling | `backend/kms/{session,crtc_config,randr,present,scanout}.rs`; `backend/kms/platform_hooks.rs`; `backend/portable/compose.rs` | Tasks 3–4: update every VT/DPMS/RANDR and `maybe_composite`/`next_wakeup` caller; register unsignalled final dependencies before cancellation and retain accepted events until drained before reset. |
+
+## Coverage Table
+
+| Spec rule / constraint | Task and decisive test |
+| --- | --- |
+| R1 current full scene, direct materialization before no-background resize and border-width `ConfigureWindow` backing migration, preserve Present-Copy, acquire target from `Free` and retain it as `Submitted` through acceptance/safe cancellation, prior `OnScreen` reservation | Task 3 `issue281_fullscreen_exit_flips_fresh_scene`, `issue281_configure_border_change_migrates_materialized_direct_pixels` |
+| R2 one async flow for shared/copied/mixed; output, BO, `render_job_id`, completeness, topology identity; copied Immediate readiness remains blocked through source completion | Tasks 1–3 `unflip_recording_completeness_survives_*`, `immediate_copied_frame_stays_admission_blocked_until_source_completion`, `grouped_unflip_readiness_requires_every_complete_current_output`, `issue281_group_waits_for_every_render_and_retires_once`, `issue281_copied_unflip_fences_sink_copy` |
+| R3 materialize/paint → scene render → optional sink copy → grouped scanout | Task 3 `issue281_fullscreen_exit_flips_fresh_scene`, `issue281_copied_unflip_fences_sink_copy` |
+| R4 per-output final `IN_FENCE_FD`, fd ownership, None → `-1` | Task 2 `composed_unflip_encodes_none_dependency_as_sign_extended_minus_one`; Task 3 `issue281_copied_unflip_fences_sink_copy` |
+| R5 completeness through shared and copied handoff; truncated recording retries with no page-flip obligation or ID | Tasks 1 and 3 `unflip_recording_completeness_survives_*`, `issue281_group_waits_for_every_render_and_retires_once`, `issue281_copied_unflip_fences_sink_copy` |
+| R6 one all-output synchronized commit, topology eligibility, no async page-flip flag | Task 2 atomic request boundary test; Task 3 `issue281_group_waits_for_every_render_and_retires_once` |
+| R7 one normal scene retirement per output; no redundant full invalidation | Task 3 `issue281_group_waits_for_every_render_and_retires_once` |
+| R8 pins until all valid replacements; one Idle, no second CompleteNotify; wrong/old/duplicate/partial events rejected | Task 3 `issue281_group_waits_for_every_render_and_retires_once` |
+| R9 P2 gate and applied cached position only | Task 3 `p2_direct_hook_treats_deferred_as_failure_and_unflips`, `p2_scene_direct_copied_and_unflip_commits_carry_only_the_applied_position` |
+| R10 VT/DPMS/RANDR safe cancellation, typed dependency notifications, inline `None`, old-topology event drain | Task 3 cancellation/EIO cases; Task 4 `issue281_pending_unflip_survives_rejection_and_lifecycle` |
+| R11 notification waits, no busy wake/block/poll, Present pacing, bounded retry deadline | Task 4 `issue281_pending_unflip_survives_rejection_and_lifecycle` |
+| R12 transient retry with no accepted ID; persistent grouped-failure policy unchanged | Task 4 `issue281_pending_unflip_survives_rejection_and_lifecycle`; Task 3 `issue281_persistent_group_rejection_uses_degraded_path` adapts deferred acknowledgements into the existing per-output fallback |
+| A end-state and resource leaks | Every Task 3–4 backend scenario calls `assert_issue281_unflip_end_state` after production retirement/drain; it checks no jobs/acks/cookies/pins/fd leaks, legal BO phases, and exactly one direct Idle |
+| B production route and pixel inspection | Tasks 3–4 use `RecordingSceneFixture`, recording atomic executor, bounded GPU completion gates, BO-owned fd/property equality sampled at ioctl time, and held duplicate descriptors for readiness/provenance checks tolerant of fd reuse; they also use P1 `queue_commit_completion`, Backend/core-loop entry points, recorded primary-FB pixels, and pure-boundary labels only where stated. Focused ignored GPU commands must execute a nonzero number of tests. |
+| C hardware validation and master comparison | Task 6; AMD direct coverage is explicitly uncovered if the path is unreachable |
+| F repetition and skip policy | Tasks 3–4 repetition protocol; one-line expected-prerequisite skips only |
+| Production boundaries, no behavior env switches, layout ceilings, `docs/status.md` | Tasks 1–5 gates and status entry; production-caller audit above |
+
+## Self-Review
+
+- **Spec coverage:** R1–R12, A/B/C/F, implementation boundaries, status update, layout check, FreeBSD cross-clippy, and both hardware outcomes are mapped in the coverage table.
+- **Step scan:** Tasks name concrete files, interfaces, tests, assertions, mutations, commands, and commit subjects. No implementation bodies are prescribed.
+- **Type consistency:** Task 1 publicly re-exports `DeferredFrameIdentity` and sink handoffs from `yserver-render`, exposes `RecordedFrame` fields, standardizes `render_job_id` across production and platform-test callers, and separates accepted KMS status from any-stage frame admission; Task 2 re-exports `ExpectedUnflipPlane` and `PreparedUnflipPlane` within yserver and captures batch generation at render start; Task 3 re-exports `grouped_unflip_ready` alongside its production consumer, keeps the crate APIs separate, dispatches typed notifications, records partial prepared rows, accepts BOs/acks only after KMS acceptance, and retires each accepted ID through the page-flip callback.
+- **Review Focus:** All five risks have a decisive test in their owning task, including both content-preserving ConfigureWindow migration routes and ordinary copied-frame admission.
+- **Proportion:** The plan specifies interfaces and proof points while leaving implementation bodies to the task implementer; it does not reproduce the spec's algorithms.
+
+## Open Questions and Handoff
+
+No design questions remain. Task 6 requires the user's presence and authorization when the hardware session is reached. If AMD direct scanout is unreachable, the validation record must state that coverage is uncovered.
+
+## Revision 1 changes
+
+- Keep Tasks 1–3 buildable by updating each changed trait, implementation, caller, and `ComposedScanoutPlaneState` initializer in its owning task; allocate one render job ID before recording and carry mode/completeness/identity through platform pending and ready records.
+- Compare prepared planes against scene-acknowledgement identities and the full expected output set; retain partial rows in the batch across notifications and retries.
+- Define BO transitions on acceptance, transient rejection, safe cancellation/recycling, and persistent rejection into the existing per-output fallback; test both transient retry and persistent fallback.
+- Retire accepted replacements from `backend_scanout_on_page_flip_ready`; add the fallible portable materialization hook before ConfigureWindow backing migration.
+- Add bounded real-GPU gates and live fence-provenance checks, plus an R7 assertion that retirement causes no unsolicited repaint; run the A end-state assertions in every backend scenario.
+- Specify production re-exports and field visibility, the exact default-feature Clippy command and feature branch, focused ignored-test execution counts, and Task 4 sequence-event injection.
+
+## Revision 2 changes
+
+- Added the surface `OutputSink`, swapchain record consumer, and compose caller to the migration; made `RecordedFrame` fields public and re-exported `grouped_unflip_ready`.
+- Split accepted-flip status from any-stage frame admission, added the ordinary copied-frame regression, and captured topology generation through shared recording and copied sink submission.
+- Defined typed notification dispatch and safe cancellation for `None` and unsignalled final dependencies, including the `EIO` path.
+- Added border-width migration ordering and pixel coverage; clarified lavapipe applies to software gates and the caller audit filters test-only hits.
+- Standardized cross-module identity as `render_job_id` and identified `scene.rs` as the `InFlightStage` declaration site.
+
+## Revision 3 changes
+
+- Added `platform/tests.rs` identity migration and moved the readiness-helper re-export to Task 3 with its production consumer.
+- Replaced copied cancellation recycling with dependency-safe fd closure and copied-ownership recovery that avoids device-wide waits; added same-BO Backend reuse coverage after copied EIO.
+- Corrected BO phase wording, live fence checks for descriptor reuse, and the `ReadyScanoutRenderCompletion` declaration location.
