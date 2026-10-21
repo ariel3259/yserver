@@ -37,7 +37,7 @@ use crate::kms::{
         scene::{
             CopiedSubmitOutcome, CursorPlaneSink, CursorShowFailure, CursorUploadOutcome,
             FinishOutcome, FlipRetirement, FrameSubmitMode, FrameTargetError, OffscreenTarget,
-            OutputLayout, OutputRoute, OutputSink, PreparedOutputs, RecordFrame,
+            OutputLayout, OutputRoute, OutputSink, PreparedOutputs, RecordFrame, RenderJobIdentity,
             RenderNotification, SceneCompositor, SlotToken,
         },
     },
@@ -300,7 +300,7 @@ impl OutputSink for SurfacePlatform {
         &mut self,
         output_idx: usize,
         bo_idx: usize,
-        _render_job_id: u64,
+        _identity: RenderJobIdentity,
         _mode: FrameSubmitMode,
         record: &mut RecordFrame<'_>,
     ) -> FinishOutcome {
@@ -339,20 +339,29 @@ impl OutputSink for SurfacePlatform {
         }
     }
 
-    fn allocate_render_job_id(&mut self) -> io::Result<u64> {
+    fn allocate_render_job_identity(
+        &mut self,
+        mode: FrameSubmitMode,
+    ) -> io::Result<RenderJobIdentity> {
+        if mode == FrameSubmitMode::DeferredUnflip {
+            return Err(io::Error::from(io::ErrorKind::Unsupported));
+        }
         let render_job_id = self.next_render_job_id;
         self.next_render_job_id = self
             .next_render_job_id
             .checked_add(1)
             .ok_or_else(|| io::Error::other("surface render job id overflow"))?;
-        Ok(render_job_id)
+        Ok(RenderJobIdentity {
+            render_job_id,
+            topology_generation: None,
+        })
     }
 
     fn register_render_completion(
         &mut self,
         _output_idx: usize,
         _bo_idx: usize,
-        _render_job_id: u64,
+        _identity: RenderJobIdentity,
         _mode: FrameSubmitMode,
         _recording_complete: bool,
         _fd: Option<OwnedFd>,
@@ -370,7 +379,7 @@ impl OutputSink for SurfacePlatform {
         &mut self,
         _output_idx: usize,
         _bo_idx: usize,
-        _render_job_id: u64,
+        _identity: RenderJobIdentity,
         _recording_complete: bool,
         _mode: FrameSubmitMode,
         _fd: Option<OwnedFd>,

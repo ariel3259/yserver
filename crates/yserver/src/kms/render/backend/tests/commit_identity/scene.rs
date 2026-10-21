@@ -182,6 +182,7 @@ fn p1_unflip_dependency_readiness_error_does_not_block_backend() {
             output_key,
             2,
             render_job_id,
+            1,
             Arc::clone(&vk),
             fence,
         )

@@ -151,6 +151,7 @@ impl SceneCompositor {
                         bo_idx: 0,
                         generation: output.current_generation.saturating_add(1),
                         render_job_id: TEST_ACK_ID,
+                        topology_generation: None,
                         mode: FrameSubmitMode::Immediate,
                         recording_complete: true,
                         stage: InFlightStage::KmsFlipPending {

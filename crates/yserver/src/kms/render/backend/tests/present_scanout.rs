@@ -2435,6 +2435,11 @@ fn atomic_cursor_scanout_backend_with_hidden_cursor(hidden: bool) -> Option<KmsB
     backend.platform.fb_h = 600;
     backend.platform.outputs[1].x = 800;
     backend.platform.outputs[1].y = 0;
+    for (output_idx, output) in backend.platform.outputs.iter_mut().enumerate() {
+        output.output.plane_in_fence_fd_prop = Some(atomic_cursor_raw(
+            200 + u32::try_from(output_idx).expect("test output index fits"),
+        ));
+    }
     let layouts = backend.platform.scene_output_layouts();
     backend.scene = crate::kms::render::scene::SceneCompositor::new(&backend.platform, &layouts)
         .expect("construct live two-output scene");
@@ -3938,6 +3943,11 @@ fn shape_triggered_composed_unflip_records_cursor_positions_for_both_outputs() {
         }
     };
     push_test_output(&mut backend, 0x5300);
+    for (output_idx, output) in backend.platform.outputs.iter_mut().enumerate() {
+        output.output.plane_in_fence_fd_prop = Some(atomic_cursor_raw(
+            220 + u32::try_from(output_idx).expect("test output index fits"),
+        ));
+    }
     backend.platform.outputs[1].x = 800;
     backend.platform.outputs[1].y = 100;
     let output_count = backend.platform.outputs.len();

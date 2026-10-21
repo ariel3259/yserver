@@ -86,6 +86,7 @@ mod probe;
 use alloc_plan::*;
 #[cfg(test)]
 use bo::*;
+pub(crate) use copied::copied_final_dependency;
 #[cfg(test)]
 use copied::*;
 #[cfg(test)]

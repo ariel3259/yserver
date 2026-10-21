@@ -21,6 +21,7 @@ pub struct DeferredFrameIdentity {
     pub bo_idx: usize,
     pub render_job_id: u64,
     pub recording_complete: bool,
+    pub topology_generation: u64,
 }
 
 impl InFlightStage {
@@ -126,6 +127,9 @@ impl SceneCompositor {
                         bo_idx: ack.bo_idx,
                         render_job_id: ack.render_job_id,
                         recording_complete: ack.recording_complete,
+                        topology_generation: ack
+                            .topology_generation
+                            .expect("deferred unflip acknowledgement has a topology generation"),
                     })
                 })
             })
@@ -360,7 +364,16 @@ pub(super) fn handle_render_notification_inner(
             output,
             bo_idx,
             render_job_id,
-        } => handle_unflip_dependency_safe_inner(inner, output, bo_idx, render_job_id, store, sink),
+            topology_generation,
+        } => handle_unflip_dependency_safe_inner(
+            inner,
+            output,
+            bo_idx,
+            render_job_id,
+            topology_generation,
+            store,
+            sink,
+        ),
     }
 }
 
@@ -379,6 +392,7 @@ pub(super) fn handle_scanout_render_completion_inner(
         bo_idx,
         mode,
         recording_complete,
+        topology_generation,
         fd,
     } = completion;
     let output_idx = match output {
@@ -400,6 +414,7 @@ pub(super) fn handle_scanout_render_completion_inner(
                 && ack.render_job_id == render_job_id
                 && ack.mode == mode
                 && ack.recording_complete == recording_complete
+                && ack.topology_generation == topology_generation
         });
     if !expected {
         log::warn!(
@@ -417,7 +432,10 @@ pub(super) fn handle_scanout_render_completion_inner(
     match sink.submit_copied(
         output_idx,
         bo_idx,
-        render_job_id,
+        crate::kms::render::scene::RenderJobIdentity {
+            render_job_id,
+            topology_generation,
+        },
         recording_complete,
         mode,
         fd,
@@ -516,6 +534,7 @@ fn handle_unflip_dependency_safe_inner(
     output: Result<usize, String>,
     bo_idx: usize,
     render_job_id: u64,
+    topology_generation: u64,
     _store: &mut DrawableStore,
     sink: &mut dyn OutputSink,
 ) -> bool {
@@ -536,6 +555,7 @@ fn handle_unflip_dependency_safe_inner(
             ack.mode == FrameSubmitMode::DeferredUnflip
                 && ack.bo_idx == bo_idx
                 && ack.render_job_id == render_job_id
+                && ack.topology_generation == Some(topology_generation)
                 && matches!(
                     ack.stage,
                     InFlightStage::WaitingForRenderCompletion { render_job_id: pending }

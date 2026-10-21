@@ -72,6 +72,14 @@ pub enum FrameSubmitMode {
     DeferredUnflip,
 }
 
+/// Stable render-job identity captured before recording starts. Deferred
+/// unflip jobs also capture the topology generation they belong to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RenderJobIdentity {
+    pub render_job_id: u64,
+    pub topology_generation: Option<u64>,
+}
+
 /// What the compose recorder produced and whether it recorded every scene
 /// draw. A signalled fence does not imply a complete recording.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -111,15 +119,23 @@ pub enum FrameHandoff {
     DeferredUnflip {
         render_job_id: u64,
         recording_complete: bool,
+        topology_generation: u64,
     },
 }
 
 /// Preserve the recorder's completeness and the preallocated identity when
 /// shared scanout is handed to the grouped-unflip path.
-pub fn deferred_unflip_handoff(render_job_id: u64, recorded: RecordedFrame) -> FrameHandoff {
+pub fn deferred_unflip_handoff(
+    identity: RenderJobIdentity,
+    recorded: RecordedFrame,
+) -> FrameHandoff {
+    let topology_generation = identity
+        .topology_generation
+        .expect("deferred unflip identity must capture its topology generation");
     FrameHandoff::DeferredUnflip {
-        render_job_id,
+        render_job_id: identity.render_job_id,
         recording_complete: recorded.recording_complete,
+        topology_generation,
     }
 }
 
@@ -150,6 +166,7 @@ impl From<FrameTargetError> for SceneError {
 /// A copied-route render completion that became ready.
 pub struct RenderCompletion {
     pub render_job_id: u64,
+    pub topology_generation: Option<u64>,
     /// The output it belongs to, or the removed output's identity formatted
     /// for the log.
     pub output: Result<usize, String>,
@@ -173,6 +190,7 @@ pub enum RenderNotification {
         output: Result<usize, String>,
         bo_idx: usize,
         render_job_id: u64,
+        topology_generation: u64,
     },
 }
 
@@ -203,7 +221,7 @@ pub trait OutputSink {
         &mut self,
         output_idx: usize,
         bo_idx: usize,
-        render_job_id: u64,
+        identity: RenderJobIdentity,
         mode: FrameSubmitMode,
         record: &mut RecordFrame<'_>,
     ) -> FinishOutcome;
@@ -231,7 +249,10 @@ pub trait OutputSink {
 
     /// Allocate the one render identity used from recording through any
     /// copied readiness delivery. Registration must preserve this ID.
-    fn allocate_render_job_id(&mut self) -> io::Result<u64>;
+    fn allocate_render_job_identity(
+        &mut self,
+        mode: FrameSubmitMode,
+    ) -> io::Result<RenderJobIdentity>;
 
     /// Copied route: register a source render completion.
     ///
@@ -242,7 +263,7 @@ pub trait OutputSink {
         &mut self,
         output_idx: usize,
         bo_idx: usize,
-        render_job_id: u64,
+        identity: RenderJobIdentity,
         mode: FrameSubmitMode,
         recording_complete: bool,
         fd: Option<OwnedFd>,
@@ -258,7 +279,7 @@ pub trait OutputSink {
         &mut self,
         output_idx: usize,
         bo_idx: usize,
-        render_job_id: u64,
+        identity: RenderJobIdentity,
         recording_complete: bool,
         mode: FrameSubmitMode,
         fd: Option<OwnedFd>,

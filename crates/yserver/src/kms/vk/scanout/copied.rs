@@ -59,6 +59,15 @@ pub(super) const COPIED_SINK_IMPORT_USAGE: vk::ImageUsageFlags = vk::ImageUsageF
 /// the strictest known linear import alignment (RADV GFX9+).
 const COPIED_TRANSPORT_WIDTH_ALIGNMENT_PIXELS: u32 = 64;
 
+/// A copied plane's final dependency is the sink transfer's completion. The
+/// source-render completion is only the sink submission's input dependency.
+pub(crate) fn copied_final_dependency(
+    _source_render_dependency: Option<std::os::fd::RawFd>,
+    sink_copy_dependency: Option<std::os::fd::RawFd>,
+) -> Option<std::os::fd::RawFd> {
+    sink_copy_dependency
+}
+
 fn copied_transport_width(logical_width: u32) -> u32 {
     let alignment = u64::from(COPIED_TRANSPORT_WIDTH_ALIGNMENT_PIXELS);
     let padded = u64::from(logical_width).div_ceil(alignment) * alignment;

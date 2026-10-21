@@ -1468,6 +1468,7 @@ pub(crate) struct DirectScanoutPlaneState<'a> {
 pub(crate) struct ComposedScanoutPlaneState<'a> {
     pub(crate) output: &'a Output,
     pub(crate) fb: framebuffer::Handle,
+    pub(crate) in_fence_fd: Option<std::os::fd::RawFd>,
 }
 
 /// Successfully imported framebuffer retained after an accepted M1 probe.
@@ -1798,10 +1799,21 @@ pub(crate) fn submit_composed_scanout(
     let mut request = AtomicCommitRequest::new();
     for state in planes {
         let output = state.output;
+        let in_fence_fd_prop = output.plane_in_fence_fd_prop.ok_or_else(|| {
+            io::Error::other(format!(
+                "primary plane {} has no IN_FENCE_FD property",
+                u32::from(output.plane)
+            ))
+        })?;
         request.add_raw_property(
             output.plane.into(),
             output.plane_fb_id_prop,
             u64::from(u32::from(state.fb)),
+        );
+        request.add_raw_property(
+            output.plane.into(),
+            in_fence_fd_prop,
+            state.in_fence_fd.map_or(-1_i64, i64::from) as u64,
         );
         request.add_raw_property(
             output.plane.into(),
@@ -1860,9 +1872,130 @@ pub(crate) fn submit_composed_scanout(
     )
 }
 
+/// Includes pure boundary tests for composed unflip atomic-property encoding.
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn raw_handle<H: ::drm::control::ResourceHandle>(value: u32) -> H {
+        ::drm::control::from_u32(value).expect("non-zero synthetic DRM handle")
+    }
+
+    fn composed_test_output(index: u32, has_in_fence: bool) -> Output {
+        let base = index * 20;
+        Output {
+            connector: raw_handle(base + 1),
+            connector_name: format!("DP-{index}"),
+            encoder: raw_handle(base + 2),
+            crtc: raw_handle(base + 3),
+            plane: raw_handle(base + 4),
+            // SAFETY: this synthetic mode is only carried through a recording
+            // atomic executor and is never passed to DRM.
+            mode: unsafe { std::mem::zeroed() },
+            picked: Mode {
+                name: "800x600".to_owned(),
+                width: 800,
+                height: 600,
+                vrefresh: 60,
+                preferred: true,
+                ..Default::default()
+            },
+            plane_fb_id_prop: raw_handle(base + 5),
+            plane_crtc_id_prop: raw_handle(base + 6),
+            plane_src_x_prop: raw_handle(base + 7),
+            plane_src_y_prop: raw_handle(base + 8),
+            plane_src_w_prop: raw_handle(base + 9),
+            plane_src_h_prop: raw_handle(base + 10),
+            plane_crtc_x_prop: raw_handle(base + 11),
+            plane_crtc_y_prop: raw_handle(base + 12),
+            plane_crtc_w_prop: raw_handle(base + 13),
+            plane_crtc_h_prop: raw_handle(base + 14),
+            plane_in_fence_fd_prop: has_in_fence.then(|| raw_handle(base + 15)),
+            crtc_out_fence_ptr_prop: None,
+            scanout_modifiers: Vec::new(),
+            mm_width: 0,
+            mm_height: 0,
+            edid: Vec::new(),
+            connector_type: "unknown".to_owned(),
+            modes: Vec::new(),
+        }
+    }
+
+    // pure boundary. Mutation: split the replacement, add PAGE_FLIP_ASYNC,
+    // omit IN_FENCE_FD, encode None as zero, or reuse another plane's fence.
+    #[test]
+    fn composed_unflip_encodes_none_dependency_as_sign_extended_minus_one() {
+        use crate::drm::atomic::tests_support::RecordingAtomicCommitExecutor;
+        use std::os::{fd::OwnedFd, unix::net::UnixStream};
+
+        let (server, _peer) = UnixStream::pair().expect("test DRM socket pair");
+        let device = Device::from_inherited_kms_fd(OwnedFd::from(server), "<recording-drm>");
+        let recorder = Rc::new(RecordingAtomicCommitExecutor::default());
+        let executor: Rc<dyn crate::drm::atomic::AtomicCommitExecutor> = recorder.clone();
+        let sink = AtomicCommitSink::new(executor);
+        let outputs = [composed_test_output(1, true), composed_test_output(2, true)];
+        let framebuffers = [raw_handle(301), raw_handle(302)];
+        let planes = [
+            ComposedScanoutPlaneState {
+                output: &outputs[0],
+                fb: framebuffers[0],
+                in_fence_fd: Some(47),
+            },
+            ComposedScanoutPlaneState {
+                output: &outputs[1],
+                fb: framebuffers[1],
+                in_fence_fd: None,
+            },
+        ];
+
+        submit_composed_scanout(&device, &sink, &planes, &[])
+            .expect("submit one recorded grouped composed replacement");
+
+        let records = recorder.records();
+        let [record] = records.as_slice() else {
+            panic!("all output planes must be recorded in one atomic commit")
+        };
+        assert_eq!(
+            record.flags,
+            AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK
+        );
+        assert!(!record.flags.contains(AtomicCommitFlags::PAGE_FLIP_ASYNC));
+        assert_eq!(record.events.len(), 2);
+        let property_value = |output_idx: usize, property: property::Handle| {
+            let object = outputs[output_idx].plane.into();
+            record
+                .properties
+                .iter()
+                .find(|update| update.object == object && update.property == property)
+                .map(|update| update.value)
+                .expect("per-plane atomic property")
+        };
+        assert_eq!(
+            property_value(0, outputs[0].plane_fb_id_prop),
+            u64::from(u32::from(framebuffers[0]))
+        );
+        assert_eq!(
+            property_value(1, outputs[1].plane_fb_id_prop),
+            u64::from(u32::from(framebuffers[1]))
+        );
+        assert_eq!(
+            property_value(0, outputs[0].plane_in_fence_fd_prop.unwrap()),
+            47
+        );
+        assert_eq!(
+            property_value(1, outputs[1].plane_in_fence_fd_prop.unwrap()),
+            u64::MAX
+        );
+
+        let missing_property = composed_test_output(3, false);
+        let missing_plane = [ComposedScanoutPlaneState {
+            output: &missing_property,
+            fb: raw_handle(303),
+            in_fence_fd: None,
+        }];
+        assert!(submit_composed_scanout(&device, &sink, &missing_plane, &[]).is_err());
+        assert_eq!(recorder.records().len(), 1);
+    }
 
     #[test]
     fn direct_scanout_addfb_legacy_retry_is_linear_einval_only() {

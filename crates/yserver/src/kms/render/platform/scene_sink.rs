@@ -11,7 +11,8 @@ use crate::kms::{
             ComposeRenderTarget, CopiedSubmitOutcome, CursorPlaneSink, CursorShowFailure,
             CursorUploadOutcome, FinishOutcome, FlipRetirement, FrameHandoff, FrameSubmitMode,
             FrameTargetError, OutputRoute, OutputSink, RecordFrame, RecordedFrame,
-            RenderCompletion, RenderNotification, SlotToken, deferred_unflip_handoff,
+            RenderCompletion, RenderJobIdentity, RenderNotification, SlotToken,
+            deferred_unflip_handoff,
         },
     },
     vk::{
@@ -93,10 +94,21 @@ impl OutputSink for PlatformBackend {
         &mut self,
         output_idx: usize,
         bo_idx: usize,
-        render_job_id: u64,
+        identity: RenderJobIdentity,
         mode: FrameSubmitMode,
         record: &mut RecordFrame<'_>,
     ) -> FinishOutcome {
+        if (mode == FrameSubmitMode::Immediate && identity.topology_generation.is_some())
+            || (mode == FrameSubmitMode::DeferredUnflip && identity.topology_generation.is_none())
+        {
+            return FinishOutcome::Finished {
+                result: Err(PresentError::Io(io::Error::other(
+                    "render-job topology generation does not match frame mode",
+                ))),
+                previous_gpu_ns: None,
+                fail_stop: false,
+            };
+        }
         let output_key = &self.outputs[output_idx].key;
         let Some(drm_device) = self
             .device_for_output(output_key)
@@ -133,6 +145,7 @@ impl OutputSink for PlatformBackend {
         else {
             return FinishOutcome::Unavailable(FrameTargetError::NoSlot);
         };
+        let mut deferred_prepare = None;
         let output = &self.outputs[output_idx].output;
         let mut shared_cursor_commit_submitted = false;
         let mut cursor_rejection_error = None;
@@ -160,7 +173,13 @@ impl OutputSink for PlatformBackend {
                         (recorded, Some(async_outcome), Some(event_id))
                     }),
                     FrameSubmitMode::DeferredUnflip => submit_shared_scanout_render(bo, record)
-                        .map(|recorded| (recorded, None, None)),
+                        .map(|recorded| {
+                            deferred_prepare = Some((
+                                recorded.recording_complete,
+                                bo.state.in_fence_fd.map(|fd| fd as std::os::fd::RawFd),
+                            ));
+                            (recorded, None, None)
+                        }),
                 };
                 if let Err(error) = &submitted
                     && atomic_commit_sink.take_last_cursor_rejection()
@@ -174,9 +193,7 @@ impl OutputSink for PlatformBackend {
                 }
                 let result = submitted.map(|(recorded, _, event_id)| match mode {
                     FrameSubmitMode::Immediate => FrameHandoff::FlipPending { recorded, event_id },
-                    FrameSubmitMode::DeferredUnflip => {
-                        deferred_unflip_handoff(render_job_id, recorded)
-                    }
+                    FrameSubmitMode::DeferredUnflip => deferred_unflip_handoff(identity, recorded),
                 });
                 FinishOutcome::Finished {
                     result,
@@ -225,6 +242,30 @@ impl OutputSink for PlatformBackend {
             let rejected = self.reject_atomic_cursor_commit(&cursor_positions, &error);
             self.defer_cursor_move_outcome(rejected);
         }
+        if let Some((recording_complete, final_in_fence)) = deferred_prepare {
+            let topology_generation = identity
+                .topology_generation
+                .expect("deferred frame identity was checked above");
+            if let Err(error) = self.prepare_unflip_plane(
+                output_idx,
+                bo_idx,
+                identity.render_job_id,
+                recording_complete,
+                topology_generation,
+                final_in_fence,
+            ) {
+                return match outcome {
+                    FinishOutcome::Finished {
+                        previous_gpu_ns, ..
+                    } => FinishOutcome::Finished {
+                        result: Err(PresentError::Io(error)),
+                        previous_gpu_ns,
+                        fail_stop: true,
+                    },
+                    unavailable => unavailable,
+                };
+            }
+        }
         outcome
     }
 
@@ -256,15 +297,32 @@ impl OutputSink for PlatformBackend {
         self.commit_bo_present(output_idx, bo_idx, generation);
     }
 
-    fn allocate_render_job_id(&mut self) -> io::Result<u64> {
-        self.allocate_scanout_render_job_id()
+    fn allocate_render_job_identity(
+        &mut self,
+        mode: FrameSubmitMode,
+    ) -> io::Result<RenderJobIdentity> {
+        let topology_generation = match mode {
+            FrameSubmitMode::Immediate => None,
+            FrameSubmitMode::DeferredUnflip => Some(
+                self.unflip_batch_context
+                    .ok_or_else(|| {
+                        io::Error::other("deferred unflip has no installed batch context")
+                    })?
+                    .topology_generation,
+            ),
+        };
+        let render_job_id = self.allocate_scanout_render_job_id()?;
+        Ok(RenderJobIdentity {
+            render_job_id,
+            topology_generation,
+        })
     }
 
     fn register_render_completion(
         &mut self,
         output_idx: usize,
         bo_idx: usize,
-        render_job_id: u64,
+        identity: RenderJobIdentity,
         mode: FrameSubmitMode,
         recording_complete: bool,
         fd: Option<OwnedFd>,
@@ -273,7 +331,7 @@ impl OutputSink for PlatformBackend {
         self.register_scanout_render_completion(
             output_key,
             bo_idx,
-            render_job_id,
+            identity,
             mode,
             recording_complete,
             fd,
@@ -287,6 +345,7 @@ impl OutputSink for PlatformBackend {
             .map(|completion| {
                 RenderNotification::CopiedSourceReady(RenderCompletion {
                     render_job_id: completion.render_job_id,
+                    topology_generation: completion.topology_generation,
                     output: self
                         .outputs
                         .iter()
@@ -311,19 +370,12 @@ impl OutputSink for PlatformBackend {
         &mut self,
         output_idx: usize,
         bo_idx: usize,
-        render_job_id: u64,
+        identity: RenderJobIdentity,
         recording_complete: bool,
         mode: FrameSubmitMode,
         fd: Option<OwnedFd>,
     ) -> io::Result<CopiedSubmitOutcome> {
-        self.submit_copied_scanout(
-            output_idx,
-            bo_idx,
-            render_job_id,
-            recording_complete,
-            mode,
-            fd,
-        )
+        self.submit_copied_scanout(output_idx, bo_idx, identity, recording_complete, mode, fd)
     }
 }
 

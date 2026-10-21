@@ -1,3 +1,5 @@
+//! Platform tests include pure boundary checks for captured unflip generations.
+
 use super::*;
 use crate::kms::{
     backend::PlatformInitOutput, scanout_route::RenderKmsRelationship,
@@ -346,7 +348,7 @@ fn copied_scanout_rejects_sink_without_explicit_dmabuf_layout_import() {
 
 #[test]
 fn topology_reset_cancels_completion_for_a_surviving_output() {
-    use crate::kms::render::scene::FrameSubmitMode;
+    use crate::kms::render::scene::{FrameSubmitMode, RenderJobIdentity};
     use nix::sys::eventfd::{EfdFlags, EventFd};
 
     let mut platform = PlatformBackend::for_tests();
@@ -362,7 +364,10 @@ fn topology_reset_cancels_completion_for_a_surviving_output() {
         .register_scanout_render_completion(
             output_key,
             1,
-            render_job_id,
+            RenderJobIdentity {
+                render_job_id,
+                topology_generation: None,
+            },
             FrameSubmitMode::Immediate,
             true,
             Some(ready),
@@ -381,7 +386,7 @@ fn topology_reset_cancels_completion_for_a_surviving_output() {
 
 #[test]
 fn scanout_render_completion_drain_is_not_queue_front_blocked() {
-    use crate::kms::render::scene::FrameSubmitMode;
+    use crate::kms::render::scene::{FrameSubmitMode, RenderJobIdentity};
     use nix::sys::eventfd::{EfdFlags, EventFd};
 
     let mut platform = PlatformBackend::for_tests();
@@ -401,7 +406,10 @@ fn scanout_render_completion_drain_is_not_queue_front_blocked() {
         .register_scanout_render_completion(
             output_key.clone(),
             0,
-            first_job,
+            RenderJobIdentity {
+                render_job_id: first_job,
+                topology_generation: None,
+            },
             FrameSubmitMode::Immediate,
             true,
             Some(blocked),
@@ -414,7 +422,10 @@ fn scanout_render_completion_drain_is_not_queue_front_blocked() {
         .register_scanout_render_completion(
             output_key.clone(),
             1,
-            second_job,
+            RenderJobIdentity {
+                render_job_id: second_job,
+                topology_generation: None,
+            },
             FrameSubmitMode::Immediate,
             true,
             Some(ready),
@@ -437,7 +448,7 @@ fn scanout_render_completion_drain_is_not_queue_front_blocked() {
 
 #[test]
 fn already_signalled_scanout_completion_is_immediately_ready_without_fd() {
-    use crate::kms::render::scene::FrameSubmitMode;
+    use crate::kms::render::scene::{FrameSubmitMode, RenderJobIdentity};
     let mut platform = PlatformBackend::for_tests();
     let output_key = platform.outputs[0].key.clone();
     let job = platform
@@ -447,7 +458,10 @@ fn already_signalled_scanout_completion_is_immediately_ready_without_fd() {
         .register_scanout_render_completion(
             output_key.clone(),
             2,
-            job,
+            RenderJobIdentity {
+                render_job_id: job,
+                topology_generation: None,
+            },
             FrameSubmitMode::Immediate,
             true,
             None,
@@ -463,10 +477,10 @@ fn already_signalled_scanout_completion_is_immediately_ready_without_fd() {
     assert!(platform.pending_scanout_render_completions.is_empty());
 }
 
-// pure boundary. Mutation: allocate a replacement ID during registration or
-// drop stable output, BO, mode, or completeness fields from pending/ready transport.
+// pure boundary. Mutation: substitute the current generation at notification delivery or drop
+// the captured generation while copied work crosses pending, ready, and prepared handoffs.
 #[test]
-fn platform_render_completion_preserves_unflip_identity() {
+fn platform_deferred_completion_keeps_captured_topology_generation() {
     use crate::kms::render::scene::FrameSubmitMode;
     use nix::sys::eventfd::{EfdFlags, EventFd};
 
@@ -476,14 +490,24 @@ fn platform_render_completion_preserves_unflip_identity() {
         EventFd::from_value_and_flags(1, EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK)
             .expect("ready eventfd")
             .into();
-    let render_job_id = platform
-        .allocate_scanout_render_job_id()
-        .expect("allocate render job ID before recording");
+    platform.install_unflip_batch_context(71);
+    let identity = crate::kms::render::scene::OutputSink::allocate_render_job_identity(
+        &mut platform,
+        FrameSubmitMode::DeferredUnflip,
+    )
+    .expect("allocate render job identity before recording");
+    let notification_identity =
+        crate::kms::render::scene::OutputSink::allocate_render_job_identity(
+            &mut platform,
+            FrameSubmitMode::DeferredUnflip,
+        )
+        .expect("allocate second render identity before recording");
+    let render_job_id = identity.render_job_id;
     platform
         .register_scanout_render_completion(
             output_key.clone(),
             2,
-            render_job_id,
+            identity,
             FrameSubmitMode::DeferredUnflip,
             false,
             Some(ready),
@@ -495,7 +519,10 @@ fn platform_render_completion_preserves_unflip_identity() {
     assert_eq!(pending.bo_idx, 2);
     assert_eq!(pending.render_job_id, render_job_id);
     assert_eq!(pending.mode, FrameSubmitMode::DeferredUnflip);
+    assert_eq!(pending.topology_generation, Some(71));
     assert!(!pending.recording_complete);
+
+    platform.install_unflip_batch_context(72);
 
     let completions = platform.drain_scanout_render_completions();
     assert_eq!(completions.len(), 1);
@@ -503,7 +530,46 @@ fn platform_render_completion_preserves_unflip_identity() {
     assert_eq!(completions[0].bo_idx, 2);
     assert_eq!(completions[0].render_job_id, render_job_id);
     assert_eq!(completions[0].mode, FrameSubmitMode::DeferredUnflip);
+    assert_eq!(completions[0].topology_generation, Some(71));
     assert!(!completions[0].recording_complete);
+
+    let notification_ready: OwnedFd =
+        EventFd::from_value_and_flags(1, EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK)
+            .expect("ready notification eventfd")
+            .into();
+    platform
+        .register_scanout_render_completion(
+            output_key.clone(),
+            3,
+            notification_identity,
+            FrameSubmitMode::DeferredUnflip,
+            false,
+            Some(notification_ready),
+        )
+        .expect("preserve the second job's captured generation after context replacement");
+    let notifications =
+        crate::kms::render::scene::OutputSink::drain_render_notifications(&mut platform);
+    let [crate::kms::render::scene::RenderNotification::CopiedSourceReady(notification)] =
+        notifications.as_slice()
+    else {
+        panic!("one copied-source notification should carry the second render job")
+    };
+    assert_eq!(notification.topology_generation, Some(71));
+
+    let sink_copy_fd = crate::kms::vk::scanout::copied_final_dependency(Some(17), Some(29));
+    let prepared = prepared_unflip_plane(
+        0,
+        output_key,
+        3,
+        notification.render_job_id,
+        notification.recording_complete,
+        notification
+            .topology_generation
+            .expect("deferred completion retains its captured generation"),
+        sink_copy_fd,
+    );
+    assert_eq!(prepared.topology_generation, 71);
+    assert_eq!(prepared.final_in_fence, Some(29));
 }
 
 // Mutation: omit the asynchronous wake when a quarantined sink queue fence
@@ -540,6 +606,7 @@ fn submitted_unflip_quarantine_wakes_the_render_completion_poller() {
             output_key,
             2,
             render_job_id,
+            9,
             Arc::clone(&vk),
             fence,
         )
@@ -562,6 +629,7 @@ fn submitted_unflip_quarantine_wakes_the_render_completion_poller() {
             output,
             bo_idx,
             render_job_id: notified_job_id,
+            topology_generation,
         },
     ] = notifications.as_slice()
     else {
@@ -570,6 +638,7 @@ fn submitted_unflip_quarantine_wakes_the_render_completion_poller() {
     assert_eq!(output, &Ok(0));
     assert_eq!(*bo_idx, 2);
     assert_eq!(*notified_job_id, render_job_id);
+    assert_eq!(*topology_generation, 9);
     assert!(platform.pending_scanout_unflip_dependencies.is_empty());
     assert!(!platform.gpu.renderer_failed);
     unsafe { vk.device.destroy_fence(fence, None) };

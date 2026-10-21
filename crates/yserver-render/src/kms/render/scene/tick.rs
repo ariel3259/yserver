@@ -363,6 +363,7 @@ enum Handoff {
     DeferredUnflip {
         render_job_id: u64,
         recording_complete: bool,
+        topology_generation: u64,
     },
 }
 
@@ -1189,13 +1190,14 @@ fn tick_one_output(
 
     // One stable identity follows this compose through copied readiness and
     // any deferred grouped-unflip handoff. Registration never replaces it.
-    let render_job_id = match sink.allocate_render_job_id() {
-        Ok(render_job_id) => render_job_id,
+    let identity = match sink.allocate_render_job_identity(mode) {
+        Ok(identity) => identity,
         Err(error) => {
             inner.outputs[output_idx].pool_ring.release(slot);
             return Err(PresentError::Io(error).into());
         }
     };
+    let render_job_id = identity.render_job_id;
 
     // 7. Record + submit + flip via the v2 clipped compose path.
     let compose_ticket = match sink.gpu().acquire_fence_ticket() {
@@ -1299,7 +1301,7 @@ fn tick_one_output(
         Ok(recorded_frame(submit, render_scene.draws.len()))
     };
     let (render_result, previous_gpu_ns, copied_prepare_failed) =
-        match sink.finish_frame(output_idx, token.bo_idx, render_job_id, mode, &mut record) {
+        match sink.finish_frame(output_idx, token.bo_idx, identity, mode, &mut record) {
             FinishOutcome::Unavailable(error) => return Err(error.into()),
             FinishOutcome::Finished {
                 result,
@@ -1316,9 +1318,11 @@ fn tick_one_output(
                     FrameHandoff::DeferredUnflip {
                         render_job_id,
                         recording_complete,
+                        topology_generation,
                     } => Handoff::DeferredUnflip {
                         render_job_id,
                         recording_complete,
+                        topology_generation,
                     },
                 }),
                 previous_gpu_ns,
@@ -1346,7 +1350,7 @@ fn tick_one_output(
             .register_render_completion(
                 output_idx,
                 token.bo_idx,
-                render_job_id,
+                identity,
                 mode,
                 recorded.recording_complete,
                 fd,
@@ -1365,10 +1369,15 @@ fn tick_one_output(
         Ok(Handoff::DeferredUnflip {
             render_job_id: handoff_job_id,
             recording_complete,
-        }) if handoff_job_id == render_job_id => Ok((
-            InFlightStage::UnflipPrepared { render_job_id },
-            recording_complete,
-        )),
+            topology_generation,
+        }) if handoff_job_id == render_job_id
+            && Some(topology_generation) == identity.topology_generation =>
+        {
+            Ok((
+                InFlightStage::UnflipPrepared { render_job_id },
+                recording_complete,
+            ))
+        }
         Ok(Handoff::DeferredUnflip { .. }) => {
             sink.gpu_mut().renderer_failed = true;
             Err(PresentError::Io(std::io::Error::other(
@@ -1405,6 +1414,7 @@ fn tick_one_output(
                 bo_idx: token.bo_idx,
                 generation: frame_gen,
                 render_job_id,
+                topology_generation: identity.topology_generation,
                 mode,
                 recording_complete,
                 stage,

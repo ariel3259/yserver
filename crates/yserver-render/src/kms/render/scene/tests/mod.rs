@@ -39,6 +39,7 @@ struct TestSink {
     hide_fails: bool,
     hide_calls: usize,
     next_render_job_id: u64,
+    deferred_topology_generation: Option<u64>,
     render_completions: VecDeque<RenderCompletion>,
     copied_submissions: Vec<(usize, usize, u64, bool, FrameSubmitMode)>,
 }
@@ -72,6 +73,7 @@ impl TestSink {
             hide_fails: false,
             hide_calls: 0,
             next_render_job_id: 1,
+            deferred_topology_generation: Some(1),
             render_completions: VecDeque::new(),
             copied_submissions: Vec::new(),
         }
@@ -169,11 +171,12 @@ impl OutputSink for TestSink {
         &mut self,
         _output_idx: usize,
         _bo_idx: usize,
-        render_job_id: u64,
+        identity: RenderJobIdentity,
         mode: FrameSubmitMode,
         record: &mut RecordFrame<'_>,
     ) -> FinishOutcome {
-        self.finished_render_jobs.push((render_job_id, mode));
+        self.finished_render_jobs
+            .push((identity.render_job_id, mode));
         let Some(target) = self.frame_target.as_mut() else {
             return FinishOutcome::Unavailable(FrameTargetError::NoSlot);
         };
@@ -195,9 +198,7 @@ impl OutputSink for TestSink {
                             event_id: Some(event_id),
                         }
                     }
-                    FrameSubmitMode::DeferredUnflip => {
-                        deferred_unflip_handoff(render_job_id, recorded)
-                    }
+                    FrameSubmitMode::DeferredUnflip => deferred_unflip_handoff(identity, recorded),
                 },
                 OutputRoute::Copied => FrameHandoff::RenderCompletion { recorded, fd: None },
                 OutputRoute::None => unreachable!("route checked above"),
@@ -229,27 +230,44 @@ impl OutputSink for TestSink {
 
     fn commit_slot_present(&mut self, _output_idx: usize, _bo_idx: usize, _generation: u64) {}
 
-    fn allocate_render_job_id(&mut self) -> io::Result<u64> {
+    fn allocate_render_job_identity(
+        &mut self,
+        mode: FrameSubmitMode,
+    ) -> io::Result<RenderJobIdentity> {
         let job_id = self.next_render_job_id;
         self.next_render_job_id = self
             .next_render_job_id
             .checked_add(1)
             .ok_or_else(|| io::Error::other("test render job id overflow"))?;
-        Ok(job_id)
+        let topology_generation = match mode {
+            FrameSubmitMode::Immediate => None,
+            FrameSubmitMode::DeferredUnflip => self.deferred_topology_generation,
+        };
+        if mode == FrameSubmitMode::DeferredUnflip && topology_generation.is_none() {
+            return Err(io::Error::other(
+                "test sink has no deferred topology generation",
+            ));
+        }
+        Ok(RenderJobIdentity {
+            render_job_id: job_id,
+            topology_generation,
+        })
     }
 
     fn register_render_completion(
         &mut self,
         output_idx: usize,
         bo_idx: usize,
-        render_job_id: u64,
+        identity: RenderJobIdentity,
         mode: FrameSubmitMode,
         recording_complete: bool,
         fd: Option<std::os::fd::OwnedFd>,
     ) -> io::Result<()> {
-        self.registered_render_jobs.push((render_job_id, mode));
+        self.registered_render_jobs
+            .push((identity.render_job_id, mode));
         self.render_completions.push_back(RenderCompletion {
-            render_job_id,
+            render_job_id: identity.render_job_id,
+            topology_generation: identity.topology_generation,
             output: Ok(output_idx),
             bo_idx,
             mode,
@@ -272,13 +290,18 @@ impl OutputSink for TestSink {
         &mut self,
         output_idx: usize,
         bo_idx: usize,
-        render_job_id: u64,
+        identity: RenderJobIdentity,
         recording_complete: bool,
         mode: FrameSubmitMode,
         _fd: Option<std::os::fd::OwnedFd>,
     ) -> io::Result<CopiedSubmitOutcome> {
-        self.copied_submissions
-            .push((output_idx, bo_idx, render_job_id, recording_complete, mode));
+        self.copied_submissions.push((
+            output_idx,
+            bo_idx,
+            identity.render_job_id,
+            recording_complete,
+            mode,
+        ));
         Ok(match mode {
             FrameSubmitMode::Immediate => CopiedSubmitOutcome::FlipAccepted { event_id: 1 },
             FrameSubmitMode::DeferredUnflip => CopiedSubmitOutcome::PreparedForGroup,

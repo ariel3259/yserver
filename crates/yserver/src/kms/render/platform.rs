@@ -46,6 +46,7 @@ use init::*;
 #[cfg(test)]
 pub(in crate::kms::render) use power::OutputPowerExecutor;
 pub(crate) use qualify::*;
+pub(crate) use scanout_bos::PreparedUnflipPlane;
 #[cfg(test)]
 use scanout_bos::*;
 
@@ -126,6 +127,7 @@ struct PendingScanoutRenderCompletion {
     output_key: OutputKey,
     bo_idx: usize,
     mode: crate::kms::render::scene::FrameSubmitMode,
+    topology_generation: Option<u64>,
     recording_complete: bool,
     /// `None` is Vulkan's valid already-signalled SYNC_FD payload (`fd=-1`).
     /// It bypasses readiness polling but remains a real synchronization
@@ -138,6 +140,7 @@ struct PendingScanoutRenderCompletion {
 /// signals `fd` so normal backend dispatch can deliver the safe notification.
 struct PendingScanoutUnflipDependencySafe {
     render_job_id: u64,
+    topology_generation: u64,
     output_key: OutputKey,
     bo_idx: usize,
     fd: OwnedFd,
@@ -151,6 +154,7 @@ pub(crate) struct ReadyScanoutRenderCompletion {
     pub(crate) output_key: OutputKey,
     pub(crate) bo_idx: usize,
     pub(crate) mode: crate::kms::render::scene::FrameSubmitMode,
+    pub(crate) topology_generation: Option<u64>,
     pub(crate) recording_complete: bool,
     pub(crate) fd: Option<OwnedFd>,
 }
@@ -568,6 +572,8 @@ pub struct PlatformBackend {
     pending_scanout_unflip_dependencies:
         std::collections::VecDeque<PendingScanoutUnflipDependencySafe>,
     next_scanout_render_job_id: u64,
+    pub(crate) unflip_batch_context: Option<scanout_bos::UnflipBatchContext>,
+    pub(crate) prepared_unflip_planes: Vec<PreparedUnflipPlane>,
 
     /// Command buffer + fence reused by scanout reads, allocated from
     /// `gpu.ops_command_pool`. `Drop` resets it first; it is also declared

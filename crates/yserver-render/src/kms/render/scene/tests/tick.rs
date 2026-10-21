@@ -116,6 +116,7 @@ fn pending_ack_for_test(
         bo_idx,
         generation: 1,
         render_job_id,
+        topology_generation: (mode == FrameSubmitMode::DeferredUnflip).then_some(1),
         mode,
         recording_complete,
         stage,
@@ -312,6 +313,7 @@ fn immediate_copied_frame_stays_admission_blocked_until_source_completion() {
     assert!(scene.handle_render_notification(
         RenderNotification::CopiedSourceReady(RenderCompletion {
             render_job_id: 84,
+            topology_generation: None,
             output: Ok(0),
             bo_idx: 1,
             mode: FrameSubmitMode::Immediate,

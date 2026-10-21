@@ -5,11 +5,219 @@ use crate::kms::{
 use ash::vk;
 use std::{
     io,
-    os::fd::{IntoRawFd, OwnedFd},
+    os::fd::{AsRawFd as _, FromRawFd, IntoRawFd, OwnedFd, RawFd},
     rc::Rc,
 };
 
+/// The topology identity captured when one deferred-unflip render batch
+/// starts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct UnflipBatchContext {
+    pub(crate) topology_generation: u64,
+}
+
+/// A scene acknowledgement paired with its current output snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExpectedUnflipPlane {
+    pub(crate) output_idx: usize,
+    pub(crate) output_key: crate::kms::backend::OutputKey,
+    pub(crate) bo_idx: usize,
+    pub(crate) render_job_id: u64,
+    pub(crate) recording_complete: bool,
+    pub(crate) topology_generation: u64,
+}
+
+/// A scanout BO whose final render or sink-copy dependency is available for a
+/// grouped atomic replacement. The descriptor remains owned by `BoState`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PreparedUnflipPlane {
+    pub(crate) output_idx: usize,
+    pub(crate) output_key: crate::kms::backend::OutputKey,
+    pub(crate) bo_idx: usize,
+    pub(crate) render_job_id: u64,
+    pub(crate) recording_complete: bool,
+    pub(crate) topology_generation: u64,
+    pub(crate) final_in_fence: Option<RawFd>,
+}
+
+pub(crate) fn prepared_unflip_plane(
+    output_idx: usize,
+    output_key: crate::kms::backend::OutputKey,
+    bo_idx: usize,
+    render_job_id: u64,
+    recording_complete: bool,
+    topology_generation: u64,
+    final_in_fence: Option<RawFd>,
+) -> PreparedUnflipPlane {
+    PreparedUnflipPlane {
+        output_idx,
+        output_key,
+        bo_idx,
+        render_job_id,
+        recording_complete,
+        topology_generation,
+        final_in_fence,
+    }
+}
+
+/// Pure readiness decision for one complete all-output replacement.
+pub(crate) fn grouped_unflip_ready(
+    expected_outputs: &[crate::kms::backend::OutputKey],
+    expected: &[ExpectedUnflipPlane],
+    prepared: &[PreparedUnflipPlane],
+) -> bool {
+    if expected_outputs.is_empty()
+        || expected.len() != expected_outputs.len()
+        || prepared.len() != expected_outputs.len()
+        || expected
+            .iter()
+            .any(|plane| plane.topology_generation != expected[0].topology_generation)
+    {
+        return false;
+    }
+
+    for (output_idx, output_key) in expected_outputs.iter().enumerate() {
+        if expected_outputs[..output_idx].contains(output_key) {
+            return false;
+        }
+        let mut expected_matches = expected
+            .iter()
+            .filter(|plane| plane.output_key == *output_key);
+        let Some(authoritative) = expected_matches.next() else {
+            return false;
+        };
+        if expected_matches.next().is_some()
+            || authoritative.output_idx != output_idx
+            || !authoritative.recording_complete
+        {
+            return false;
+        }
+        let mut prepared_matches = prepared
+            .iter()
+            .filter(|plane| plane.output_key == *output_key);
+        let Some(plane) = prepared_matches.next() else {
+            return false;
+        };
+        if prepared_matches.next().is_some()
+            || plane.output_idx != authoritative.output_idx
+            || plane.bo_idx != authoritative.bo_idx
+            || plane.render_job_id != authoritative.render_job_id
+            || !plane.recording_complete
+            || plane.recording_complete != authoritative.recording_complete
+            || plane.topology_generation != authoritative.topology_generation
+        {
+            return false;
+        }
+    }
+
+    expected.iter().all(|plane| {
+        expected_outputs
+            .get(plane.output_idx)
+            .is_some_and(|output_key| output_key == &plane.output_key)
+    }) && prepared.iter().all(|plane| {
+        expected_outputs
+            .get(plane.output_idx)
+            .is_some_and(|output_key| output_key == &plane.output_key)
+    })
+}
+
 impl PlatformBackend {
+    pub(crate) fn install_unflip_batch_context(&mut self, topology_generation: u64) {
+        self.unflip_batch_context = Some(UnflipBatchContext {
+            topology_generation,
+        });
+    }
+
+    pub(crate) fn clear_unflip_batch_context(&mut self) {
+        self.unflip_batch_context = None;
+    }
+
+    pub(crate) fn prepare_unflip_plane(
+        &mut self,
+        output_idx: usize,
+        bo_idx: usize,
+        render_job_id: u64,
+        recording_complete: bool,
+        topology_generation: u64,
+        final_in_fence: Option<RawFd>,
+    ) -> io::Result<()> {
+        self.debug_assert_scanout_pool_route(output_idx);
+        let output_key = self
+            .outputs
+            .get(output_idx)
+            .map(|output| output.key.clone())
+            .ok_or_else(|| io::Error::other("unflip output index is out of range"))?;
+        let bo = self
+            .scanout_pools
+            .get(output_idx)
+            .and_then(Option::as_ref)
+            .and_then(|pool| pool.display_pool().bos.get(bo_idx))
+            .ok_or_else(|| io::Error::other("unflip scanout BO index is out of range"))?;
+        if bo.state.phase != BoPhase::Submitted {
+            return Err(io::Error::other(format!(
+                "unflip output {output_idx} BO {bo_idx} is {:?}, expected Submitted",
+                bo.state.phase
+            )));
+        }
+        if bo.state.in_fence_fd.map(|fd| fd as RawFd) != final_in_fence {
+            return Err(io::Error::other(format!(
+                "unflip output {output_idx} BO {bo_idx} final dependency does not match its owned fence"
+            )));
+        }
+        if self.prepared_unflip_planes.iter().any(|prepared| {
+            prepared.output_idx == output_idx
+                && prepared.bo_idx == bo_idx
+                && prepared.render_job_id == render_job_id
+        }) {
+            return Err(io::Error::other(format!(
+                "unflip output {output_idx} BO {bo_idx} job {render_job_id} was prepared twice"
+            )));
+        }
+        self.prepared_unflip_planes.push(prepared_unflip_plane(
+            output_idx,
+            output_key,
+            bo_idx,
+            render_job_id,
+            recording_complete,
+            topology_generation,
+            final_in_fence,
+        ));
+        Ok(())
+    }
+
+    pub(crate) fn take_prepared_unflip_planes(&mut self) -> Vec<PreparedUnflipPlane> {
+        std::mem::take(&mut self.prepared_unflip_planes)
+    }
+
+    /// Called after grouped atomic acceptance; only now may the userspace
+    /// input-fence descriptor be closed and the BO become flip-pending.
+    pub(crate) fn accept_prepared_unflip_plane(
+        &mut self,
+        output_idx: usize,
+        bo_idx: usize,
+    ) -> io::Result<()> {
+        let bo = self
+            .scanout_pools
+            .get_mut(output_idx)
+            .and_then(Option::as_mut)
+            .and_then(|pool| pool.display_pool_mut().bos.get_mut(bo_idx))
+            .ok_or_else(|| io::Error::other("accepted unflip scanout BO disappeared"))?;
+        if bo.state.phase != BoPhase::Submitted {
+            return Err(io::Error::other(format!(
+                "accepted unflip output {output_idx} BO {bo_idx} is {:?}, expected Submitted",
+                bo.state.phase
+            )));
+        }
+        if let Some(fd) = bo.state.transition_to_pending(-1) {
+            // SAFETY: transition_to_pending transferred the BO-owned
+            // userspace IN_FENCE_FD after the accepted atomic commit.
+            drop(unsafe { OwnedFd::from_raw_fd(fd) });
+        }
+        self.prepared_unflip_planes
+            .retain(|plane| plane.output_idx != output_idx || plane.bo_idx != bo_idx);
+        Ok(())
+    }
+
     // ── I6b: scanout BO management ──────────────────────────────
 
     pub(super) fn debug_assert_scanout_pool_route(&self, output_idx: usize) {
@@ -62,11 +270,30 @@ impl PlatformBackend {
         &mut self,
         output_idx: usize,
         bo_idx: usize,
-        render_job_id: u64,
-        _recording_complete: bool,
+        identity: crate::kms::render::scene::RenderJobIdentity,
+        recording_complete: bool,
         mode: crate::kms::render::scene::FrameSubmitMode,
         render_completion: Option<OwnedFd>,
     ) -> io::Result<crate::kms::render::scene::CopiedSubmitOutcome> {
+        let topology_generation = match mode {
+            crate::kms::render::scene::FrameSubmitMode::Immediate
+                if identity.topology_generation.is_none() =>
+            {
+                None
+            }
+            crate::kms::render::scene::FrameSubmitMode::DeferredUnflip
+                if identity.topology_generation.is_some() =>
+            {
+                identity.topology_generation
+            }
+            _ => {
+                return Err(io::Error::other(
+                    "copied completion topology generation does not match frame mode",
+                ));
+            }
+        };
+        let render_job_id = identity.render_job_id;
+        let source_dependency = render_completion.as_ref().map(|fd| fd.as_raw_fd());
         self.debug_assert_scanout_pool_route(output_idx);
         let output_key = self
             .outputs
@@ -85,6 +312,7 @@ impl PlatformBackend {
 
         let mut recovery_failed = false;
         let mut quarantined_dependency = None;
+        let mut prepared_final_in_fence = None;
         let result = (|| {
             // `Output` deliberately is not Clone: its DRM handles belong to
             // the owning open fd. Borrow the output and its independently
@@ -187,6 +415,11 @@ impl PlatformBackend {
             let in_fence_fd = copy_completion.map_or(-1, IntoRawFd::into_raw_fd);
             destination.state.transition_to_submitted(in_fence_fd);
             if mode == crate::kms::render::scene::FrameSubmitMode::DeferredUnflip {
+                let sink_copy_dependency = destination.state.in_fence_fd.map(|fd| fd as RawFd);
+                prepared_final_in_fence = Some(crate::kms::vk::scanout::copied_final_dependency(
+                    source_dependency,
+                    sink_copy_dependency,
+                ));
                 return Ok(crate::kms::render::scene::CopiedSubmitOutcome::PreparedForGroup);
             }
             let mut out_fence_fd = -1;
@@ -236,10 +469,12 @@ impl PlatformBackend {
         })();
 
         if let Some((output_key, sink_vk, fence)) = quarantined_dependency
+            && let Some(topology_generation) = topology_generation
             && let Err(error) = self.register_scanout_unflip_dependency_safe(
                 output_key,
                 bo_idx,
                 render_job_id,
+                topology_generation,
                 sink_vk,
                 fence,
             )
@@ -274,6 +509,18 @@ impl PlatformBackend {
             // device.  Neither uncertain image state may be reused.
             self.gpu.renderer_failed = true;
         }
+        if let Some(final_in_fence) = prepared_final_in_fence {
+            let topology_generation = topology_generation
+                .expect("deferred copied completion has a captured topology generation");
+            self.prepare_unflip_plane(
+                output_idx,
+                bo_idx,
+                render_job_id,
+                recording_complete,
+                topology_generation,
+                final_in_fence,
+            )?;
+        }
         result
     }
 
@@ -294,9 +541,9 @@ impl PlatformBackend {
         let Some(bo) = scanout.display_pool().bos.get(bo_idx) else {
             return Err(io::Error::other("unflip BO index is out of range"));
         };
-        if bo.state.phase != BoPhase::Submitted {
+        if !matches!(bo.state.phase, BoPhase::Recording | BoPhase::Submitted) {
             return Err(io::Error::other(format!(
-                "unflip target output {output_idx} BO {bo_idx} is {:?}, expected Submitted",
+                "unflip target output {output_idx} BO {bo_idx} is {:?}, expected Recording or Submitted",
                 bo.state.phase
             )));
         }
@@ -317,6 +564,12 @@ impl PlatformBackend {
                             "rearm shared scanout export semaphore after unflip cancellation: {result:?}"
                         ))
                     })?;
+                if let Some(fd) = bo.state.in_fence_fd.take() {
+                    // SAFETY: the dependency-safe notification proves this
+                    // BO's uniquely-owned final input fence is no longer in
+                    // use, and `take` prevents a second close on reset.
+                    drop(unsafe { OwnedFd::from_raw_fd(fd) });
+                }
                 bo.state.reset_after_dependency_safe();
             }
             OutputScanout::Copied(pool) => {
@@ -325,12 +578,19 @@ impl PlatformBackend {
                     .get_mut(bo_idx)
                     .ok_or_else(|| io::Error::other("copied source index out of range"))?
                     .recover_failed_cycle_after_renderer_quiescence()?;
-                pool.destinations
+                let destination_state = &mut pool
+                    .destinations
                     .bos
                     .get_mut(bo_idx)
                     .ok_or_else(|| io::Error::other("copied destination index out of range"))?
-                    .state
-                    .reset_after_dependency_safe();
+                    .state;
+                if let Some(fd) = destination_state.in_fence_fd.take() {
+                    // SAFETY: the notification proves the copied sink
+                    // dependency completed, so the BO-owned fd is safe to
+                    // close before resetting the state.
+                    drop(unsafe { OwnedFd::from_raw_fd(fd) });
+                }
+                destination_state.reset_after_dependency_safe();
             }
         }
         Ok(())
@@ -545,4 +805,142 @@ pub(super) fn check_scanout_liveness(
         ));
     }
     Ok(())
+}
+
+/// pure boundary tests for grouped unflip readiness and dependency provenance.
+#[cfg(test)]
+mod pure_boundary_tests {
+    use super::*;
+    use crate::kms::backend::OutputKey;
+
+    fn output_key(name: &str) -> OutputKey {
+        OutputKey::new(
+            crate::platform::drm::DrmDeviceKey {
+                major: 226,
+                minor: 0,
+            },
+            name,
+        )
+    }
+
+    fn expected(
+        output_idx: usize,
+        output_key: OutputKey,
+        bo_idx: usize,
+        job: u64,
+    ) -> ExpectedUnflipPlane {
+        ExpectedUnflipPlane {
+            output_idx,
+            output_key,
+            bo_idx,
+            render_job_id: job,
+            recording_complete: true,
+            topology_generation: 31,
+        }
+    }
+
+    fn prepared(
+        expected: &ExpectedUnflipPlane,
+        final_in_fence: Option<RawFd>,
+    ) -> PreparedUnflipPlane {
+        prepared_unflip_plane(
+            expected.output_idx,
+            expected.output_key.clone(),
+            expected.bo_idx,
+            expected.render_job_id,
+            expected.recording_complete,
+            expected.topology_generation,
+            final_in_fence,
+        )
+    }
+
+    // pure boundary. Mutation: accept the first ready output, ignore frame identity/generation,
+    // or let an incomplete recording count as complete.
+    #[test]
+    fn grouped_unflip_readiness_requires_every_complete_current_output() {
+        let keys = [output_key("DP-1"), output_key("HDMI-1")];
+        let expected_rows = [
+            expected(0, keys[0].clone(), 2, 51),
+            expected(1, keys[1].clone(), 1, 52),
+        ];
+        let prepared_rows = [
+            prepared(&expected_rows[0], Some(71)),
+            prepared(&expected_rows[1], None),
+        ];
+
+        assert!(grouped_unflip_ready(&keys, &expected_rows, &prepared_rows));
+        assert!(grouped_unflip_ready(
+            &keys,
+            &expected_rows,
+            &[
+                prepared(&expected_rows[0], None),
+                prepared(&expected_rows[1], Some(83))
+            ],
+        ));
+        assert!(!grouped_unflip_ready(
+            &keys,
+            &expected_rows[..1],
+            &prepared_rows
+        ));
+        assert!(!grouped_unflip_ready(
+            &keys,
+            &expected_rows,
+            &prepared_rows[..1]
+        ));
+        assert!(!grouped_unflip_ready(
+            &keys,
+            &[expected_rows[0].clone(), expected_rows[0].clone()],
+            &prepared_rows,
+        ));
+        assert!(!grouped_unflip_ready(
+            &keys,
+            &expected_rows,
+            &[prepared_rows[0].clone(), prepared_rows[0].clone()],
+        ));
+
+        let mut mismatches = Vec::new();
+        let mut wrong_index = expected_rows[1].clone();
+        wrong_index.output_idx = 0;
+        mismatches.push((wrong_index, prepared_rows[1].clone()));
+        let mut wrong_key = expected_rows[1].clone();
+        wrong_key.output_key = keys[0].clone();
+        mismatches.push((wrong_key, prepared_rows[1].clone()));
+        let mut wrong_bo = expected_rows[1].clone();
+        wrong_bo.bo_idx += 1;
+        mismatches.push((expected_rows[1].clone(), prepared(&wrong_bo, None)));
+        let mut wrong_job = expected_rows[1].clone();
+        wrong_job.render_job_id += 1;
+        mismatches.push((expected_rows[1].clone(), prepared(&wrong_job, None)));
+        let mut incomplete_expected = expected_rows[1].clone();
+        incomplete_expected.recording_complete = false;
+        mismatches.push((incomplete_expected, prepared_rows[1].clone()));
+        let mut incomplete_prepared = prepared_rows[1].clone();
+        incomplete_prepared.recording_complete = false;
+        mismatches.push((expected_rows[1].clone(), incomplete_prepared));
+        let mut wrong_generation = expected_rows[1].clone();
+        wrong_generation.topology_generation += 1;
+        mismatches.push((expected_rows[1].clone(), prepared(&wrong_generation, None)));
+
+        for (mutated_expected, mutated_prepared) in mismatches {
+            let mut expected_rows = expected_rows.clone();
+            let mut prepared_rows = prepared_rows.clone();
+            expected_rows[1] = mutated_expected;
+            prepared_rows[1] = mutated_prepared;
+            assert!(!grouped_unflip_ready(&keys, &expected_rows, &prepared_rows));
+        }
+
+        let mut incomplete = expected_rows.clone();
+        incomplete[1].recording_complete = false;
+        assert!(!grouped_unflip_ready(&keys, &incomplete, &prepared_rows));
+    }
+
+    // pure boundary. Mutation: retain the source-render dependency instead of the final
+    // sink-copy dependency on a prepared copied plane.
+    #[test]
+    fn prepared_copied_plane_retains_sink_copy_dependency() {
+        let key = output_key("DP-1");
+        let final_fd = crate::kms::vk::scanout::copied_final_dependency(Some(41), Some(73));
+        let prepared = prepared_unflip_plane(0, key, 2, 9, true, 31, final_fd);
+        assert_eq!(prepared.final_in_fence, Some(73));
+    }
 }

@@ -5,7 +5,7 @@ use crate::kms::{
             CrtcKey, DrainedPageFlipEvents, FlipEventTimestamps, PendingScanoutRenderCompletion,
             PlatformBackend, ReadyScanoutRenderCompletion, SequenceCompletion,
         },
-        scene::FlipRetirement,
+        scene::{FlipRetirement, FrameSubmitMode, RenderJobIdentity},
     },
     vk::scanout::BoPhase,
 };
@@ -499,11 +499,19 @@ impl PlatformBackend {
         &mut self,
         output_key: OutputKey,
         bo_idx: usize,
-        render_job_id: u64,
-        mode: crate::kms::render::scene::FrameSubmitMode,
+        identity: RenderJobIdentity,
+        mode: FrameSubmitMode,
         recording_complete: bool,
         fd: Option<OwnedFd>,
     ) -> io::Result<()> {
+        if (mode == FrameSubmitMode::Immediate && identity.topology_generation.is_some())
+            || (mode == FrameSubmitMode::DeferredUnflip && identity.topology_generation.is_none())
+        {
+            return Err(io::Error::other(
+                "render completion topology generation does not match frame mode",
+            ));
+        }
+        let render_job_id = identity.render_job_id;
         if let Some(fd) = fd.as_ref() {
             self.scanout_render_completion_epfd
                 .register(fd.as_fd(), render_job_id)?;
@@ -514,6 +522,7 @@ impl PlatformBackend {
                 output_key,
                 bo_idx,
                 mode,
+                topology_generation: identity.topology_generation,
                 recording_complete,
                 fd,
             });
@@ -528,6 +537,7 @@ impl PlatformBackend {
         output_key: OutputKey,
         bo_idx: usize,
         render_job_id: u64,
+        topology_generation: u64,
         vk: Arc<crate::kms::vk::device::VkContext>,
         fence: ash::vk::Fence,
     ) -> io::Result<()> {
@@ -574,6 +584,7 @@ impl PlatformBackend {
                 render_job_id,
                 output_key,
                 bo_idx,
+                topology_generation,
                 fd,
                 safe,
             },
@@ -619,6 +630,7 @@ impl PlatformBackend {
                 output_key: pending.output_key,
                 bo_idx: pending.bo_idx,
                 mode: pending.mode,
+                topology_generation: pending.topology_generation,
                 recording_complete: pending.recording_complete,
                 fd: pending.fd,
             });
@@ -686,6 +698,7 @@ impl PlatformBackend {
                         .ok_or_else(|| format!("{:?}", pending.output_key)),
                     bo_idx: pending.bo_idx,
                     render_job_id: pending.render_job_id,
+                    topology_generation: pending.topology_generation,
                 },
             );
         }

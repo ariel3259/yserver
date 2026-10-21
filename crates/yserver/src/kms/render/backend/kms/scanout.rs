@@ -1129,6 +1129,7 @@ impl KmsBackend {
                 Ok(crate::drm::modeset::ComposedScanoutPlaneState {
                     output: &layout.output,
                     fb,
+                    in_fence_fd: None,
                 })
             })
             .collect::<io::Result<_>>()?;

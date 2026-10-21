@@ -168,6 +168,7 @@ struct PendingAck {
     bo_idx: usize,
     generation: u64,
     render_job_id: u64,
+    topology_generation: Option<u64>,
     mode: FrameSubmitMode,
     recording_complete: bool,
     stage: InFlightStage,
