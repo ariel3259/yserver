@@ -266,6 +266,40 @@ impl RecordingSceneFixture {
             .for_tests_pending_scanout_render_job_ids()
     }
 
+    /// Read a retained drawable allocation by identity, including storage
+    /// whose XID mapping was detached during a content-preserving migration.
+    pub(crate) fn backing_pixels_for_id(
+        &mut self,
+        id: crate::kms::render::store::DrawableId,
+    ) -> Vec<u8> {
+        let (depth, extent) = self
+            .events
+            .backend
+            .store
+            .get(id)
+            .map(|drawable| (drawable.depth, drawable.storage.extent))
+            .expect("drawable backing remains live");
+        let rect = ash::vk::Rect2D {
+            offset: ash::vk::Offset2D::default(),
+            extent,
+        };
+        self.events
+            .backend
+            .engine
+            .get_image(
+                &mut self.events.backend.store,
+                &mut self.events.backend.platform.gpu,
+                crate::kms::render::target::Src::server_internal(id),
+                rect,
+                depth,
+            )
+            .expect("read drawable backing pixels")
+    }
+
+    pub(crate) fn track_extra_drawable(&mut self, xid: u32) {
+        self.extra_drawables.push(xid);
+    }
+
     pub(crate) fn assert_quiescent(&self) {
         self.events.assert_quiescent();
         let backend = &self.events.backend;

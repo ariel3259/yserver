@@ -131,6 +131,13 @@ impl Platform for PlatformBackend {
         b.direct_frame_references_host_drawable(host_xid)
     }
 
+    fn materialize_direct_source_before_storage_migration(
+        b: &mut KmsBackend,
+        host_xid: u32,
+    ) -> io::Result<()> {
+        b.materialize_direct_source_before_storage_migration(host_xid)
+    }
+
     fn direct_frames_shaped_off_root(b: &KmsBackend) -> bool {
         b.direct_frames_shaped_off_root()
     }

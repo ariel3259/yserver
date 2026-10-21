@@ -375,9 +375,9 @@ impl<P: Platform> XBackend<P> {
     pub(in crate::kms::render::backend) fn relayout_window_leaf_storage_for_border_change(
         &mut self,
         host_xid: u32,
-    ) {
+    ) -> io::Result<()> {
         let Some(old_id) = self.store.lookup(host_xid) else {
-            return;
+            return Ok(());
         };
         // 6.3 — damage `old outer ∪ new outer`. Both rects are taken at
         // once by the documented coarse fallback for a configure
@@ -397,8 +397,9 @@ impl<P: Platform> XBackend<P> {
             // Both of `Migrate`'s paths — reallocate-and-copy, and
             // relocate-in-place — repaint the ring themselves, after
             // the content has moved.
+            P::materialize_direct_source_before_storage_migration(self, host_xid)?;
             self.sync_window_leaf_storage(host_xid, LeafContent::Migrate);
-            return;
+            return Ok(());
         }
         // A redirected window keeps step 4's behaviour: repaint the ring
         // for the CURRENT allocation, whose content offset the backing
@@ -408,6 +409,7 @@ impl<P: Platform> XBackend<P> {
         // `PW_BORDER` (`mi/miwindow.c:216-224`).
         let tile_origin = self.border_tile_origin(host_xid);
         let _ = self.paint_window_border(host_xid, tile_origin);
+        Ok(())
     }
 
     pub(in crate::kms::render::backend) fn sync_window_leaf_storage(
@@ -2248,7 +2250,7 @@ impl<P: Platform> XBackend<P> {
         // position inside the storage moved; a resize preserves it only
         // for a window with no background, per the #143 block below.
         if border_width_changed {
-            self.relayout_window_leaf_storage_for_border_change(host_xid);
+            self.relayout_window_leaf_storage_for_border_change(host_xid)?;
         } else if size_changed
             && let Some(old_id) = self.store.lookup(host_xid)
             && self.store.redirected_target(old_id).is_none()
@@ -2295,6 +2297,9 @@ impl<P: Platform> XBackend<P> {
             } else {
                 LeafContent::Discard
             };
+            if content == LeafContent::Migrate {
+                P::materialize_direct_source_before_storage_migration(self, host_xid)?;
+            }
             self.sync_window_leaf_storage(host_xid, content);
         }
         if let Some(stack_mode) = config.stack_mode {

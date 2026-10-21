@@ -81,6 +81,14 @@ pub trait Platform: OutputSink + Sized + 'static {
     fn direct_frame_references_host_drawable(_b: &XBackend<Self>, _host_xid: u32) -> bool {
         false
     }
+    /// Materialize the direct frame's pinned fallback before a window-storage
+    /// migration reads that backing.
+    fn materialize_direct_source_before_storage_migration(
+        _b: &mut XBackend<Self>,
+        _host_xid: u32,
+    ) -> io::Result<()> {
+        Ok(())
+    }
     /// Whether a SHAPE now clips a direct frame off the root.
     fn direct_frames_shaped_off_root(_b: &XBackend<Self>) -> bool {
         false

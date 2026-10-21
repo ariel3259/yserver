@@ -292,6 +292,42 @@ pub(crate) fn accepted_event_id(record: &AtomicCommitRecord) -> Option<u64> {
         .then_some(record.user_data)
 }
 
+pub(crate) fn bgra_region(
+    pixels: &[u8],
+    storage_width: u32,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) -> Vec<u8> {
+    let stride = usize::try_from(storage_width)
+        .expect("storage width fits usize")
+        .checked_mul(4)
+        .expect("BGRA row size fits usize");
+    let x = usize::try_from(x).expect("region x fits usize");
+    let y = usize::try_from(y).expect("region y fits usize");
+    let width = usize::try_from(width).expect("region width fits usize");
+    let height = usize::try_from(height).expect("region height fits usize");
+    let x_bytes = x.checked_mul(4).expect("region byte offset fits usize");
+    let width_bytes = width.checked_mul(4).expect("region row size fits usize");
+    let mut result = Vec::with_capacity(
+        width_bytes
+            .checked_mul(height)
+            .expect("region byte size fits usize"),
+    );
+    for row in y..y + height {
+        let start = row
+            .checked_mul(stride)
+            .and_then(|offset| offset.checked_add(x_bytes))
+            .expect("region row offset fits usize");
+        let end = start
+            .checked_add(width_bytes)
+            .expect("region row end fits usize");
+        result.extend_from_slice(&pixels[start..end]);
+    }
+    result
+}
+
 fn raw<H: ::drm::control::ResourceHandle>(value: u32) -> H {
     ::drm::control::from_u32(value).expect("nonzero test handle")
 }

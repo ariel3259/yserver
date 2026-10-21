@@ -357,6 +357,31 @@ impl KmsBackend {
                 .is_some_and(references)
     }
 
+    /// Before a content-preserving window-storage migration reads its old
+    /// backing, materialize direct pixels only when the live frame pinned that
+    /// exact allocation as its fallback target. The fallible unflip helper
+    /// flushes and submits the copy before the portable migration records its
+    /// read; its Present-Copy-ready check keeps a newer fallback authoritative.
+    pub(in crate::kms::render::backend) fn materialize_direct_source_before_storage_migration(
+        &mut self,
+        host_xid: u32,
+    ) -> io::Result<()> {
+        let Some(migrating_id) = self.store.lookup(host_xid) else {
+            return Ok(());
+        };
+        let fallback_participates = [
+            self.pstate.scanout_m2.pending.as_ref(),
+            self.pstate.scanout_m2.current.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|frame| frame.fallback_target.backing_id() == migrating_id);
+        if fallback_participates {
+            self.materialize_direct_shadow_for_unflip_target(Some(migrating_id))?;
+        }
+        Ok(())
+    }
+
     /// Keep the scene's per-output cursor mode aligned with cursor planes
     /// changed outside a composed scene retirement.
     pub(super) fn sync_direct_cursor_scene_state(&mut self) -> bool {
@@ -941,15 +966,32 @@ impl KmsBackend {
     pub(in crate::kms::render::backend) fn materialize_direct_shadow_for_unflip(
         &mut self,
     ) -> io::Result<()> {
+        self.materialize_direct_shadow_for_unflip_target(None)
+    }
+
+    fn materialize_direct_shadow_for_unflip_target(
+        &mut self,
+        requested_target: Option<DrawableId>,
+    ) -> io::Result<()> {
         if self.pstate.scanout_m2.unflip_shadow_ready {
             return Ok(());
         }
+        let matches_requested_target = |frame: &&DirectPresentFrame| {
+            requested_target.is_none_or(|target| frame.fallback_target.backing_id() == target)
+        };
         let current = self
             .pstate
             .scanout_m2
             .pending
             .as_ref()
-            .or(self.pstate.scanout_m2.current.as_ref())
+            .filter(matches_requested_target)
+            .or_else(|| {
+                self.pstate
+                    .scanout_m2
+                    .current
+                    .as_ref()
+                    .filter(matches_requested_target)
+            })
             .ok_or_else(|| io::Error::other("scanout M2: no direct frame for fallback"))?;
         let source_id = current.source_id;
         let candidate = current.candidate;

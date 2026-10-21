@@ -329,6 +329,302 @@ fn direct_source_pins(
         .count()
 }
 
+fn configure_migration_fixture(
+    fixture: &mut RecordingSceneFixture,
+    direct: &DirectPresentSetup,
+    cow_descendant: bool,
+) -> (crate::kms::render::store::DrawableId, Vec<u8>) {
+    use yserver_core::backend::Backend;
+
+    if cow_descendant {
+        fixture.track_extra_drawable(yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0);
+    }
+    let backend = &mut fixture.events.backend;
+    let target_id = backend
+        .store
+        .lookup(direct.target_xid)
+        .expect("direct fallback window has a backing");
+    if cow_descendant {
+        Backend::get_overlay_window(backend, None).expect("materialize Composite Overlay Window");
+        let overlay_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+        backend
+            .windows
+            .get_mut(&direct.target_xid)
+            .expect("direct target geometry")
+            .parent = Some(overlay_xid);
+        let target = backend
+            .resolve_paint_target(direct.target_xid)
+            .expect("CowDescendant resolves a direct fallback target");
+        assert_eq!(target.backing_id(), target_id);
+        assert_ne!(
+            target.backing_id(),
+            backend.cow_id.expect("overlay backing is live"),
+            "the pinned fallback is not the Composite Overlay Window"
+        );
+    }
+
+    let width = backend.platform.fb_w;
+    let height = backend.platform.fb_h;
+    Backend::fill_rectangle(
+        backend,
+        None,
+        direct.target_xid,
+        0x0000_11aa,
+        0,
+        0,
+        width,
+        height,
+    )
+    .expect("seed old backing with pixels A through Backend");
+    Backend::fill_rectangle(
+        backend,
+        None,
+        direct.candidate.src_host_xid,
+        0x0000_33cc,
+        0,
+        0,
+        width,
+        height,
+    )
+    .expect("seed direct source with pixels B through Backend");
+    let source_pixels = backend
+        .backing_pixels_for_tests(direct.candidate.src_host_xid)
+        .expect("read direct source backing")
+        .2;
+    (target_id, source_pixels)
+}
+
+fn finish_configure_migration(
+    mut fixture: RecordingSceneFixture,
+    direct: &DirectPresentSetup,
+    device_fd: RawFd,
+) {
+    let offset = record_count(&fixture, device_fd);
+    let replacement = grouped_unflip_record(&mut fixture, device_fd, offset, 1);
+    let replacement_id = accepted_event_id(&replacement).expect("accepted unflip replacement");
+    complete_recorded_attempt(&mut fixture, device_fd, &replacement, replacement_id, 95);
+    assert!(
+        fixture.events.backend.present_source_pins.is_empty(),
+        "direct source and fallback pins release after the replacement retires"
+    );
+    drain_present_notifications(&mut fixture, &[], &[direct.candidate.present_id]);
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: omit or move the materialization hook after migration; both saved pixel comparisons must fail.
+fn issue281_configure_no_background_resize_migrates_materialized_direct_pixels() {
+    use yserver_core::{backend::Backend, host_x11::HostSubwindowConfig};
+
+    let Some((mut fixture, direct)) = direct_fixture(1, P1SceneRoute::Shared, 301, 0) else {
+        return;
+    };
+    let (old_id, source_pixels) = configure_migration_fixture(&mut fixture, &direct, false);
+    let device_fd = fd(&fixture);
+    let initial = accepted_records(&submit_direct(&mut fixture, &direct, device_fd));
+    assert_eq!(initial.len(), 1, "one direct frame is accepted");
+    let direct_id = accepted_event_id(&initial[0]).expect("direct frame accepted");
+    complete_direct_initial(&mut fixture, &initial[0], direct_id, device_fd);
+    drain_present_notifications(&mut fixture, &[direct.candidate.present_id], &[]);
+    assert_eq!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .current
+            .as_ref()
+            .expect("direct frame is on screen")
+            .fallback_target
+            .backing_id(),
+        old_id
+    );
+
+    let width = fixture.events.backend.platform.fb_w;
+    let height = fixture.events.backend.platform.fb_h;
+    Backend::configure_subwindow(
+        &mut fixture.events.backend,
+        None,
+        direct.target_xid,
+        HostSubwindowConfig {
+            width: Some(width + 1),
+            height: Some(height + 1),
+            ..HostSubwindowConfig::default()
+        },
+    )
+    .expect("real ConfigureWindow resize through Backend");
+    assert!(fixture.events.backend.pstate.scanout_m2.unflip_requested);
+
+    let pinned_fallback = fixture.backing_pixels_for_id(old_id);
+    let replacement_id = fixture
+        .events
+        .backend
+        .store
+        .lookup(direct.target_xid)
+        .expect("replacement leaf backing");
+    assert_ne!(
+        replacement_id, old_id,
+        "resize reallocates the leaf backing"
+    );
+    let (replacement_width, replacement_height, replacement_pixels) = fixture
+        .events
+        .backend
+        .backing_pixels_for_tests(direct.target_xid)
+        .expect("replacement backing pixels");
+    let expected_size = usize::from(width)
+        .checked_mul(usize::from(height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .expect("pixel byte count fits usize");
+    let expected_source = source_pixels[..expected_size].to_vec();
+    let migrated_region = super::support::bgra_region(
+        &replacement_pixels,
+        replacement_width,
+        0,
+        0,
+        u32::from(width),
+        u32::from(height),
+    );
+    assert_eq!(
+        (replacement_width, replacement_height),
+        (u32::from(width + 1), u32::from(height + 1))
+    );
+
+    let pixel_assertions = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert!(
+            pinned_fallback == expected_source,
+            "the exact pinned fallback receives direct pixels B; first actual/expected: {:?}/{:?}",
+            &pinned_fallback[..4],
+            &expected_source[..4]
+        );
+        assert!(
+            migrated_region == expected_source,
+            "the replacement backing is seeded from direct pixels B; first actual/expected: {:?}/{:?}",
+            &migrated_region[..4],
+            &expected_source[..4]
+        );
+    }));
+
+    finish_configure_migration(fixture, &direct, device_fd);
+    if let Err(payload) = pixel_assertions {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: restore the overlay/COW identity guard, defer materialization, or abort on a non-overlay pinned fallback.
+fn issue281_configure_border_change_migrates_materialized_direct_pixels() {
+    use yserver_core::{backend::Backend, host_x11::HostSubwindowConfig};
+
+    let Some((mut fixture, direct)) = direct_fixture(1, P1SceneRoute::Shared, 302, 0) else {
+        return;
+    };
+    let (old_id, source_pixels) = configure_migration_fixture(&mut fixture, &direct, true);
+    let device_fd = fd(&fixture);
+    let initial = accepted_records(&submit_direct(&mut fixture, &direct, device_fd));
+    assert_eq!(
+        initial.len(),
+        1,
+        "one CowDescendant direct frame is accepted"
+    );
+    let direct_id = accepted_event_id(&initial[0]).expect("direct frame accepted");
+    complete_direct_initial(&mut fixture, &initial[0], direct_id, device_fd);
+    drain_present_notifications(&mut fixture, &[direct.candidate.present_id], &[]);
+    let frame = fixture
+        .events
+        .backend
+        .pstate
+        .scanout_m2
+        .current
+        .as_ref()
+        .expect("direct frame is on screen");
+    assert_eq!(frame.fallback_target.backing_id(), old_id);
+    assert_ne!(
+        frame.fallback_target.backing_id(),
+        fixture.events.backend.cow_id.unwrap()
+    );
+
+    let configure_error = Backend::configure_subwindow(
+        &mut fixture.events.backend,
+        None,
+        direct.target_xid,
+        HostSubwindowConfig {
+            border_width: Some(1),
+            ..HostSubwindowConfig::default()
+        },
+    )
+    .err()
+    .map(|error| error.to_string());
+    assert!(fixture.events.backend.pstate.scanout_m2.unflip_requested);
+
+    let pinned_fallback = fixture.backing_pixels_for_id(old_id);
+    let replacement_id = fixture
+        .events
+        .backend
+        .store
+        .lookup(direct.target_xid)
+        .expect("replacement leaf backing");
+    let (replacement_width, replacement_height, replacement_pixels) = fixture
+        .events
+        .backend
+        .backing_pixels_for_tests(direct.target_xid)
+        .expect("replacement backing pixels");
+    let expected_size = usize::from(fixture.events.backend.platform.fb_w)
+        .checked_mul(usize::from(fixture.events.backend.platform.fb_h))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .expect("pixel byte count fits usize");
+    let expected_source = source_pixels[..expected_size].to_vec();
+    let migrated_region = (replacement_id != old_id).then(|| {
+        super::support::bgra_region(
+            &replacement_pixels,
+            replacement_width,
+            1,
+            1,
+            u32::from(fixture.events.backend.platform.fb_w),
+            u32::from(fixture.events.backend.platform.fb_h),
+        )
+    });
+    let replacement_shape_matches = (replacement_width, replacement_height)
+        == (
+            u32::from(fixture.events.backend.platform.fb_w) + 2,
+            u32::from(fixture.events.backend.platform.fb_h) + 2,
+        );
+
+    let migrated_sample = migrated_region.as_deref().unwrap_or_default();
+    let migration_assertions = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert!(
+            configure_error.is_none(),
+            "ConfigureWindow must migrate a non-overlay fallback target; error: {configure_error:?}"
+        );
+        assert!(
+            replacement_id != old_id,
+            "border change reallocates leaf backing"
+        );
+        assert!(
+            replacement_shape_matches,
+            "border replacement storage has the new extent"
+        );
+        assert!(
+            pinned_fallback == expected_source,
+            "the exact pinned non-overlay fallback receives direct pixels B; first actual/expected: {:?}/{:?}",
+            &pinned_fallback[..4],
+            &expected_source[..4]
+        );
+        assert!(
+            migrated_region.as_deref() == Some(expected_source.as_slice()),
+            "the replacement backing is seeded from direct pixels B; first actual/expected: {:?}/{:?}",
+            &migrated_sample[..migrated_sample.len().min(4)],
+            &expected_source[..4]
+        );
+    }));
+
+    finish_configure_migration(fixture, &direct, device_fd);
+    if let Err(payload) = migration_assertions {
+        std::panic::resume_unwind(payload);
+    }
+}
+
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: overwrite the selected reference-output clock when a later output retires.
