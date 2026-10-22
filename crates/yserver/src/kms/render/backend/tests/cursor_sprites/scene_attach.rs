@@ -1,5 +1,5 @@
 use super::{
-    super::commit_identity::recording_scene::P1SceneRoute,
+    super::commit_identity::{recording_scene::P1SceneRoute, support::accepted_event_id},
     support::{
         AtomicPathFixture, LegacyPathFixture, PathKind, accept_cursor_detach,
         accepted_live_records, applied_cursor_binding, compose_until_cursor_commit,
@@ -11,9 +11,15 @@ use super::{
 };
 use crate::{
     drm::atomic::{AtomicCommitKind, tests_support::ScriptedResult},
-    kms::cursor_plane::ops::recording::CursorBufferOperation,
+    kms::{
+        cursor_plane::ops::recording::CursorBufferOperation, render::platform::ConnectorSnapshot,
+    },
 };
-use std::{collections::HashSet, rc::Rc, time::Instant};
+use std::{
+    collections::HashSet,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 use yserver_core::backend::Backend;
 
 #[test]
@@ -2141,6 +2147,235 @@ fn direct_cursor_real_error_still_unflips() {
         unflipped_on_error,
         "real cursor show errors must keep the unflip fallback"
     );
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: omit pending-refresh cleanup from direct teardown; the Backend-driven unflip assertion must fail.
+fn direct_pending_refresh_cleared_on_unflip_or_output_removal() {
+    {
+        let Some((mut fixture, mut delivered, hardware, direct)) = held_direct_with_cursor(705)
+        else {
+            eprintln!(
+                "SKIP direct_pending_refresh_cleared_on_unflip_or_output_removal: Vulkan fixture unavailable"
+            );
+            return;
+        };
+        let recorder = Rc::clone(&fixture.scene.events.recorders[&hardware.device_fd]);
+        let replacement =
+            accept_direct_cursor_replacement(&mut fixture, hardware, [55, 56, 57, 255]);
+        let cursor_c = create_argb_cursor(
+            &mut fixture.scene.events.backend,
+            (4, 4),
+            [58, 59, 60, 255],
+            (1, 2),
+        );
+        define_root_cursor(&mut fixture.scene.events.backend, cursor_c);
+        assert_eq!(
+            fixture.scene.events.backend.platform.devices[0]
+                .cursor
+                .plane
+                .as_ref()
+                .unwrap()
+                .sprites()
+                .for_tests_last_prepare_outcome(),
+            Some(crate::kms::cursor_plane::sprites::SpriteStage::Deferred),
+            "the second live image causes a real deferred refresh"
+        );
+        assert!(
+            fixture
+                .scene
+                .events
+                .backend
+                .pstate
+                .scanout_m2
+                .direct_cursor_refresh_pending
+                .contains(&0)
+        );
+
+        // An ineligible Present uses the normal Backend path to request an
+        // unflip while the cursor commit still owns its CRTC.
+        let mut successor = direct.candidate;
+        successor.present_id += 1;
+        successor.valid_region_xid = 0x55;
+        let mut successor_event = direct.event.clone();
+        successor_event.present_id = successor.present_id;
+        successor_event.serial = successor_event.serial.wrapping_add(1);
+        assert!(
+            !Backend::try_present_direct(
+                &mut fixture.scene.events.backend,
+                successor,
+                successor_event,
+            )
+            .expect("ineligible successor asks Backend to unflip")
+        );
+        assert!(
+            fixture
+                .scene
+                .events
+                .backend
+                .pstate
+                .scanout_m2
+                .unflip_requested
+        );
+        retire_cursor_record(&mut fixture, &mut delivered, 0, &replacement, 30);
+        assert!(
+            fixture
+                .scene
+                .events
+                .backend
+                .pstate
+                .scanout_m2
+                .unflip_requested
+        );
+        assert!(
+            fixture
+                .scene
+                .events
+                .backend
+                .pstate
+                .scanout_m2
+                .direct_cursor_refresh_pending
+                .contains(&0)
+        );
+
+        let unflip_start = record_count(&fixture, hardware.device_fd);
+        Backend::maybe_composite(&mut fixture.scene.events.backend)
+            .expect("submit the composed unflip through Backend");
+        assert!(
+            accepted_live_records(&recorder)
+                .into_iter()
+                .skip(unflip_start)
+                .any(|record| record.kind != AtomicCommitKind::CursorOnly),
+            "the Backend path accepts the composed unflip"
+        );
+        retire_pending_output(&mut fixture.scene.events, &mut delivered, 0, 31);
+        assert!(!fixture.scene.events.backend.pstate.scanout_m2.active());
+        assert!(
+            fixture
+                .scene
+                .events
+                .backend
+                .pstate
+                .scanout_m2
+                .direct_cursor_refresh_pending
+                .is_empty(),
+            "retiring the Backend unflip clears pending cursor retries"
+        );
+        assert!(
+            !fixture
+                .scene
+                .events
+                .backend
+                .platform
+                .any_cursor_commit_in_flight()
+        );
+
+        let detach = accept_cursor_detach(&mut fixture, &mut delivered, 0);
+        retire_cursor_record(&mut fixture, &mut delivered, 0, &detach, 32);
+        super::support::finish_atomic_fixture(fixture, &mut delivered);
+    }
+
+    {
+        let Some((mut fixture, mut delivered, hardware, _direct)) = held_direct_with_cursor(706)
+        else {
+            eprintln!(
+                "SKIP direct_pending_refresh_cleared_on_unflip_or_output_removal: Vulkan fixture unavailable"
+            );
+            return;
+        };
+        let replacement =
+            accept_direct_cursor_replacement(&mut fixture, hardware, [61, 62, 63, 255]);
+        let cursor_c = create_argb_cursor(
+            &mut fixture.scene.events.backend,
+            (4, 4),
+            [64, 65, 66, 255],
+            (1, 2),
+        );
+        define_root_cursor(&mut fixture.scene.events.backend, cursor_c);
+        assert_eq!(
+            fixture.scene.events.backend.platform.devices[0]
+                .cursor
+                .plane
+                .as_ref()
+                .unwrap()
+                .sprites()
+                .for_tests_last_prepare_outcome(),
+            Some(crate::kms::cursor_plane::sprites::SpriteStage::Deferred),
+            "the output-removal case starts from a real deferred refresh"
+        );
+        assert!(
+            fixture
+                .scene
+                .events
+                .backend
+                .pstate
+                .scanout_m2
+                .direct_cursor_refresh_pending
+                .contains(&0)
+        );
+        fixture.scene.events.queue_commit_completion(
+            hardware.device_fd,
+            hardware.crtc,
+            accepted_event_id(&replacement).expect("replacement has an accepted event ID"),
+            33,
+            Duration::from_millis(33),
+        );
+
+        let mut snapshots: Vec<_> = fixture
+            .scene
+            .events
+            .backend
+            .platform
+            .outputs
+            .iter()
+            .map(|output| ConnectorSnapshot {
+                key: output.key.clone(),
+                modes: vec![output.output.picked.clone()],
+                mm_width: output.output.mm_width,
+                mm_height: output.output.mm_height,
+                edid: output.output.edid.clone(),
+                connector_type: output.output.connector_type.clone(),
+            })
+            .collect();
+        snapshots[0].modes.clear();
+        super::lifecycle::install_logical_topology(&mut fixture.scene.events.backend, snapshots);
+        fixture
+            .scene
+            .events
+            .backend
+            .platform
+            .for_tests_accept_output_power_commits();
+        fixture.scene.events.backend.pstate.hotplug_rescan_deadline =
+            Some(Instant::now() - Duration::from_millis(1));
+        Backend::poll_deferred_input(
+            &mut fixture.scene.events.backend,
+            &mut fixture.scene.events.state,
+        );
+
+        assert!(fixture.scene.events.backend.platform.outputs.is_empty());
+        assert!(!fixture.scene.events.backend.pstate.scanout_m2.active());
+        assert!(
+            fixture
+                .scene
+                .events
+                .backend
+                .pstate
+                .scanout_m2
+                .direct_cursor_refresh_pending
+                .is_empty(),
+            "the Backend hotplug removal clears pending cursor retries before output compaction"
+        );
+        assert!(
+            !fixture
+                .scene
+                .events
+                .backend
+                .platform
+                .any_cursor_commit_in_flight()
+        );
+        super::support::finish_atomic_fixture(fixture, &mut delivered);
+    }
 }
 
 #[test]

@@ -1459,59 +1459,6 @@ fn a_hotplug_that_shrank_the_extent_leaves_root_storage_alone() {
     );
 }
 
-#[test]
-// Mutation: retain the pending retry through direct teardown or output removal; this assertion must fail.
-fn direct_pending_refresh_cleared_on_unflip_or_output_removal() {
-    let mut backend = KmsBackend::for_tests();
-    backend
-        .pstate
-        .scanout_m2
-        .direct_cursor_refresh_pending
-        .insert(0);
-    backend.stop_direct_after_scanout_replaced("test unflip");
-    assert!(
-        backend
-            .pstate
-            .scanout_m2
-            .direct_cursor_refresh_pending
-            .is_empty(),
-        "finishing the direct unflip clears pending cursor retries"
-    );
-
-    let removed_key = backend.platform.outputs[0].key.clone();
-    backend
-        .pstate
-        .scanout_m2
-        .direct_cursor_refresh_pending
-        .insert(0);
-    let (outputs, modes) = backend.randr_outputs_and_modes();
-    let mut state = yserver_core::server::ServerState::with_randr_outputs_and_modes(
-        backend.platform.fb_w,
-        backend.platform.fb_h,
-        outputs,
-        modes,
-        yserver_core::server::BackendCapabilities::from_backend(&backend),
-    );
-    backend.platform.outputs.clear();
-    backend.platform.scanout_pools.clear();
-    backend.platform.bo_generations.clear();
-    backend.platform.first_pageflip_logged.clear();
-    let rescan = crate::kms::render::platform::RescanResult {
-        dropped_keys: vec![removed_key],
-        dropped_old_indices: vec![0],
-        ..Default::default()
-    };
-    assert!(backend.fire_randr_changes(&mut state, rescan, &[], false, false, false));
-    assert!(
-        backend
-            .pstate
-            .scanout_m2
-            .direct_cursor_refresh_pending
-            .is_empty(),
-        "output removal clears retry indices before they can refer to another output"
-    );
-}
-
 /// The newly covered region carries the ROOT BACKGROUND, not recycled GPU
 /// content: the shared helper fills the whole reallocated root storage
 /// with `core.bg_pixel`. Needs real Vk -- the headless fixture cannot
