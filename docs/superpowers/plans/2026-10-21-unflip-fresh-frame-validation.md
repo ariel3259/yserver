@@ -53,7 +53,7 @@ Task 6 also ran the brief's workspace-wide FreeBSD variant: `source "${FREEBSD_S
 ### Task 3 — prepared-plane ledger and grouped fence readiness
 
 - `cargo +nightly fmt --all`, `cargo build --bin yserver`: pass.
-- Regular workspace tests: 4,236 passed, 0 failed, 573 ignored.
+- Regular workspace tests: 4,234 passed, 0 failed, 573 ignored. The Task 3 report corrects its earlier 4,236 aggregate because two yserver-render doctests were ignored.
 - Whole ignored workspace suite: 573 passed, 0 failed.
 - Ignored render acceptance: 206 passed, 0 failed.
 - Xdmcp workspace all-target Clippy and default-feature all-target Clippy: pass with `-D warnings`.
@@ -81,7 +81,7 @@ Task 6 also ran the brief's workspace-wide FreeBSD variant: `source "${FREEBSD_S
 - Xdmcp workspace all-target Clippy and default-feature all-target Clippy: pass with `-D warnings`.
 - `tools/check-layout.sh`: `layout: ok`.
 - FreeBSD all-target Clippy: pass; compile/lint only.
-- Count note: the Task 5 prose report says 4,234 regular tests passed, but its listed output rows sum to 4,237 when the transport and other passing target rows are included. This record preserves the exact per-target output rows rather than repeating that inconsistent aggregate.
+- Count note: Task 5's final fix-round output rows sum to 4,237 (yserver 1,280; yserver-core 1,868; transport 2; yserver-protocol 494; yserver-render 593). The Task 5 source report records these per-target rows but does not state a 4,234 aggregate; this record uses the final rows rather than an inferred earlier aggregate.
 
 ### Task 6 — documentation and fresh gate
 
@@ -102,16 +102,17 @@ Task 6 FreeBSD ruling: the implementation rules require the cross-check before r
 
 - GPU-backed software tests were invoked only after sourcing the supplied lavapipe environment. No hardware or DRM card node was used.
 - Task 1: six live-scene handoff/admission tests ×5 and two other handoff tests ×5 under 16 busy-loop workers (40/40); one asynchronous quarantine test ×20 (20/20). No prerequisite skip.
+- Task 1 final fix round: `p1_unflip_dependency_readiness_error_does_not_block_backend` ×20 (20/20); no prerequisite skip. The Task 1 report records this readiness-error regression and its mutation evidence.
 - Task 2: the three `issue281_configure_` GPU migration tests ×20 each under 16 busy-loop workers (60/60). No prerequisite skip.
 - Task 3: its four added pure-boundary cases did not require the 5× backend or 20× GPU repetition protocol; no busy-loop workers were started and no prerequisite skip was emitted.
 - Task 4 part 2: nine held-readiness cases ×20 (180/180) and thirteen deterministic cases ×5 (65/65), under 16 busy-loop workers; zero skips. The final Task 4 fix round additionally recorded eight deterministic backend cases ×5 (40/40) and two lavapipe scene cases ×20 (40/40); zero skips.
-- Task 5: `issue281_randr_quiescence_drains_deferred_copied_source` ×20, `issue281_pending_unflip_survives_rejection_and_lifecycle` ×20, and the pure-boundary wake predicate test ×5, under 16 temporary workers; zero skips. The final Task 5 fix round also recorded the P1 readiness-error regression ×20 and the three ConfigureWindow migrations ×20 each.
+- Task 5: `issue281_randr_quiescence_drains_deferred_copied_source` ×20, `issue281_pending_unflip_survives_rejection_and_lifecycle` ×20, and the pure-boundary wake predicate test ×5, under 16 temporary workers; zero skips. The final Task 5 fix round also recorded the three ConfigureWindow migrations ×20 each.
 - Task 6: no new behavior tests or repeated backend fixtures were added; its gate ran each required suite once. No prerequisite skips.
 - Worker scripts used cleanup traps and waited for their workers. Task reports record no surviving test workers. The non-fatal Mesa loader warnings are not skip lines.
 
 ## Test index
 
-Repeat command template used for individual ignored backend filters: `source "${LAVAPIPE_ENV_SCRIPT:?set to the local lavapipe environment script}" && cargo test -p yserver --lib --locked --features xdmcp TEST_FILTER -- --ignored --quiet`. Each row gives the exact filter and repetition result. A later full ignored suite also exercised the final tree once.
+Reproduction command template for individual ignored backend filters (not claimed as the exact historical invocation): `source "${LAVAPIPE_ENV_SCRIPT:?set to the local lavapipe environment script}" && cargo test -p yserver --lib --locked --features xdmcp TEST_FILTER -- --ignored --quiet`. The exact command in the Task 4 final fix-round repeat script was `source /home/ariel_santangelo/Projects/claude-scratch/atomic-cursor-split/sdd-p1/lvp-env.sh && cargo test -p yserver --locked --features xdmcp TEST_FILTER -- --ignored`, with `TEST_FILTER` replaced by the named test. It ran each deterministic backend case five times under 16 busy-loop workers; the script cleaned up its workers on exit. It did not include `--lib` or `--quiet`. Other task repetitions and their counts are recorded from their source reports. A later full ignored suite also exercised the final tree once.
 
 | Named scenario/test | Command filter and recorded runs | Skip | End-state evidence or limit |
 | --- | --- | --- | --- |
@@ -139,10 +140,13 @@ Repeat command template used for individual ignored backend filters: `source "${
 | `p2_direct_hook_treats_deferred_as_failure_and_unflips` | Same repeat template; ×5 deterministic and ×20 GPU-backed in final Task 4 fix round | None | Fresh-pixel check, final in-flight cursor gate, then one normal grouped retirement; end-state helper confirms no pending ownership. GPU work runs on lavapipe but does not hold a real exported fence unsignalled. |
 | `p2_scene_direct_copied_and_unflip_commits_carry_only_the_applied_position` | Same repeat template; ×5 deterministic and ×20 GPU-backed in final Task 4 fix round | None | Fresh copied pixels and only the applied position carrier are checked; scene cursor transition occurs once and normal retirement drains. |
 | `p2_tearing_cursor_handoff_transitions_cursor_once` | Same repeat template; filter of this name ×5 in final Task 4 fix round | None | Exact tearing reason, applied position only, one scene-owned cursor transition, and normal end-state cleanup. |
+| `cursor_einval_rolls_back_and_hide_recovery_is_motion_driven_and_bounded` | Exact Task 4 repeat command above; filter of this name ×5 | None | EINVAL rollback and bounded hide recovery remain asserted; the subsequent cursorless grouped unflip retires on both outputs and `assert_issue281_unflip_backend_end_state` verifies no pending batch, acknowledgements, jobs, BO ownership, or tracked unflip descriptors. |
+| `direct_successor_waits_for_retirement_and_carries_motion` | Exact Task 4 repeat command above; filter of this name ×5 | None | Successor waits for both direct retirements and carries latest cursor motion; the grouped composed unflip retires on both outputs and the shared backend end-state helper verifies drained ownership. |
+| `shape_triggered_composed_unflip_records_cursor_positions_for_both_outputs` | Exact Task 4 repeat command above; filter of this name ×5 | None | Shape-triggered grouped unflip records both outputs' local cursor positions; both outputs retire normally and the shared backend end-state helper verifies drained ownership. |
 | `issue281_randr_quiescence_drains_deferred_copied_source` | Same repeat template; filter of this name ×20 in Task 5 | None | Production all-off/event/render drain clears ack and source-completion row before topology mutation; discarded work never reaches sink-copy submission. |
 | `issue281_pending_unflip_survives_rejection_and_lifecycle` | Same repeat template; filter of this name ×20 in Task 5 | None | Bounded EBUSY retry, VT/DPMS/RANDR cancellation/quiescence, idle sequence separation, no stale resubmit or unsafe BO reuse; finishes through production drains. |
 | `stale_unflip_topology_wakes_cancellation_but_notification_wait_does_not_spin` | Same repeat template; filter of this name ×5; explicitly **pure boundary** | None | Predicate check confirms cancellation has a deadline while a notification wait has no immediate busy wake; not an end-to-end backend scenario. |
-| `p1_unflip_dependency_readiness_error_does_not_block_backend` | Same repeat template; filter of this name ×20 in Task 5 final fix round | None | Readiness error leaves the dependency and BO quarantined; later worker notification drains safely, with no pending scene/pin/cookie state. |
+| `p1_unflip_dependency_readiness_error_does_not_block_backend` | Same repeat template; filter of this name ×20 in Task 1 final fix round | None | Readiness error leaves the dependency and BO quarantined; later worker notification drains safely, with no pending scene/pin/cookie state. |
 
 ## Hardware validation — pending Task 7
 
@@ -163,7 +167,7 @@ Repeat command template used for individual ignored backend filters: `source "${
 
 ## Task 6 RED/GREEN and mutation record
 
-Task 6 changes documentation only, so it introduced no behavioral test, RED run, GREEN run, or mutation. The Task 6 RED/GREEN status is not applicable; the gates above provide software validation of the final branch. Tasks 1–5 mutation evidence remains in their source reports. The decisive evidence includes: Task 1 completeness/identity mutations failed their handoff assertions; Task 2 materialization/readiness mutation failed the expected fallback pixel check; Task 3 pure-boundary mutations exercised captured generation, copied sink-fence choice, and cancellation-row cleanup; Task 4 mutations killed readiness bypass, wrong copied fence, timeout cancellation, export-failure recycling/publication, fallback overwrite, lifecycle stale rows, EBUSY classification, and premature direct release; Task 5 mutations killed retry-budget, unresolved-writer cancellation, idle-sequence completion, pending copied-frame admission, sink-copy observer, stale-row cleanup, and blocking readiness-error changes. The exact failure assertions and revert results are in the linked task reports.
+Task 6 changes documentation only, so it introduced no behavioral test, RED run, GREEN run, or mutation. The Task 6 RED/GREEN status is not applicable; the gates above provide software validation of the final branch. Tasks 1–5 mutation evidence remains in their source reports. The decisive evidence includes: Task 1 completeness/identity mutations and the readiness-error mutation failed their handoff and Backend nonblocking assertions; Task 2 materialization/readiness mutation failed the expected fallback pixel check; Task 3 pure-boundary mutations exercised captured generation, copied sink-fence choice, and cancellation-row cleanup; Task 4 mutations killed readiness bypass, wrong copied fence, timeout cancellation, export-failure recycling/publication, fallback overwrite, lifecycle stale rows, EBUSY classification, and premature direct release; Task 5 mutations killed retry-budget, unresolved-writer cancellation, idle-sequence completion, pending copied-frame admission, sink-copy observer, and stale-row cleanup. The exact failure assertions and revert results are in the linked task reports.
 
 ## Self-review
 
