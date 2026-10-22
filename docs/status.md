@@ -8348,3 +8348,15 @@ panel either got fixed or moved out of reach on its own.
 3. `feat/cow-structural` is unmerged and touches `release_redirected_backing`
    and `activate_redirect_backing_for`; the restore will need reconciling
    when that lands.
+
+## Direct-scanout unflip stale frame (#281, 2026-10-21)
+
+The composed unflip now prepares a fresh full scene into each output's Free scanout BO while the direct framebuffer remains visible and the prior composed OnScreen BO stays reserved. Shared planes carry their scene-render dependency; copied planes carry the sink-copy completion dependency. The asynchronous readiness path keeps the core responsive, waits for complete recordings for every output, and submits one synchronized all-output primary-plane replacement with the per-plane fences.
+
+Only grouped atomic acceptance assigns its accepted commit ID to the scene acknowledgements. Each output retires through normal scene page-flip completion once. Direct framebuffer/source/fallback ownership remains pinned until every accepted replacement retires, then the direct Present receives its single Idle with no second CompleteNotify. Preparation also preserves the lifecycle quiescence, bounded retry, no-busy-wake, and direct-exit watchdog paths. Persistent grouped-failure fallback policy is unchanged.
+
+Backend regressions cover fresh fullscreen-exit pixels, copied and mixed fence provenance, `None` as signalled `-1`, event identity/retirement, backing migration, cancellation, watchdog pacing, and VT/DPMS/RANDR cleanup. Task 4 held-readiness tests use a platform boundary because lavapipe could not safely hold a real exported GPU completion fence unsignalled. Descriptor-exhaustion recovery and the held-dependency persistent-EIO matrix are still incomplete.
+
+Software gates through Task 6 pass, including workspace tests, the ignored suite, render acceptance, Clippy, layout, and compile-only FreeBSD Clippy. Hardware validation remains pending: two-output NVIDIA RTX 5060 Ti reproduction, the maintainer-attributed two-output AMD RX 6800 grouped replacement, and comparison against master `8e71c788`. No local hardware result is claimed.
+
+See the [issue #281 software validation record](superpowers/plans/2026-10-21-unflip-fresh-frame-validation.md) for exact per-task gate outputs, named test index, repeat/skip counts, mutation notes, and remaining subcoverage.
