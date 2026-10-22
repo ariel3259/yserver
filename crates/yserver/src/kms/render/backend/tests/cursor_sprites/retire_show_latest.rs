@@ -1,8 +1,8 @@
 use super::support::{
     AtomicPathFixture, PathKind, accept_cursor_detach, accepted_live_records,
-    applied_cursor_binding, assert_no_cursor_resources, create_argb_cursor, define_root_cursor,
-    finish_atomic_fixture, has_unretired_accepted_event, record_property, retire_cursor_record,
-    retire_pending_output, sprite_bytes,
+    applied_cursor_binding, assert_no_cursor_resources, create_argb_cursor, damage_root,
+    define_root_cursor, finish_atomic_fixture, has_unretired_accepted_event, record_property,
+    retire_cursor_record, retire_pending_output, sprite_bytes,
 };
 use crate::drm::atomic::AtomicCommitKind;
 use std::{
@@ -10,15 +10,6 @@ use std::{
     time::{Duration, Instant},
 };
 use yserver_core::backend::{Backend, CursorHandle};
-
-fn damage_root(fixture: &mut AtomicPathFixture) {
-    let backend = &mut fixture.scene.events.backend;
-    let root = backend.core.window_id;
-    let width = backend.platform.fb_w;
-    let height = backend.platform.fb_h;
-    Backend::clear_area(backend, None, root, 0, None, 0, 0, width, height, (0, 0))
-        .expect("damage root through Backend");
-}
 
 fn create_animation(
     backend: &mut crate::kms::render::backend::KmsBackend,

@@ -106,6 +106,15 @@ pub(crate) fn define_root_cursor(backend: &mut KmsBackend, cursor: CursorHandle)
         .expect("define root cursor");
 }
 
+pub(crate) fn damage_root(fixture: &mut AtomicPathFixture) {
+    let backend = &mut fixture.scene.events.backend;
+    let root = backend.core.window_id;
+    let width = backend.platform.fb_w;
+    let height = backend.platform.fb_h;
+    Backend::clear_area(backend, None, root, 0, None, 0, 0, width, height, (0, 0))
+        .expect("damage root through Backend");
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PathKind {
     Physical,

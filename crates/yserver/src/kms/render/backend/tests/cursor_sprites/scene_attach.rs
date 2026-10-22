@@ -3,7 +3,7 @@ use super::{
     support::{
         AtomicPathFixture, LegacyPathFixture, PathKind, accept_cursor_detach,
         accepted_live_records, applied_cursor_binding, compose_until_cursor_commit,
-        compose_until_cursor_commit_where, create_argb_cursor, define_root_cursor,
+        compose_until_cursor_commit_where, create_argb_cursor, damage_root, define_root_cursor,
         deliver_render_completion, drain_unretired_output_events, enter_held_direct,
         establish_hardware_cursor, has_unretired_accepted_event, record_count, record_property,
         retire_cursor_record, retire_pending_output, sprite_bytes, sprite_users,
@@ -15,15 +15,6 @@ use crate::{
 };
 use std::{collections::HashSet, rc::Rc, time::Instant};
 use yserver_core::backend::Backend;
-
-fn damage_root(fixture: &mut AtomicPathFixture) {
-    let backend = &mut fixture.scene.events.backend;
-    let root = backend.core.window_id;
-    let width = backend.platform.fb_w;
-    let height = backend.platform.fb_h;
-    Backend::clear_area(backend, None, root, 0, None, 0, 0, width, height, (0, 0))
-        .expect("damage root through Backend");
-}
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
