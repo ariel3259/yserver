@@ -464,64 +464,9 @@ impl KmsBackend {
         let y = self.core.cursor_y as i32;
         let mut failed = false;
         for output_idx in 0..self.platform.outputs.len() {
-            let upload = self.platform.cursor_plane_upload_image_for_output(
-                output_idx,
-                record.version,
-                record.hot_x,
-                record.hot_y,
-                u32::from(record.width),
-                u32::from(record.height),
-                &record.bgra_bytes,
-            );
-            match upload {
-                Ok(CursorUploadOutcome::Ready) => {}
-                Ok(CursorUploadOutcome::Deferred) => {
-                    self.pstate
-                        .scanout_m2
-                        .direct_cursor_refresh_pending
-                        .insert(output_idx);
-                    log::debug!(
-                        "scanout_m2: direct cursor upload deferred on output {output_idx}; retrying on CRTC event"
-                    );
-                    continue;
-                }
-                Err(error) => {
-                    log::warn!(
-                        "scanout_m2: direct cursor upload failed on output {output_idx}: {error}; unflipping"
-                    );
-                    failed = true;
-                    break;
-                }
-            }
-            match self.platform.cursor_plane_show_on_crtc(
-                output_idx,
-                record.hot_x,
-                record.hot_y,
-                x,
-                y,
-            ) {
-                Ok(()) => {
-                    self.pstate
-                        .scanout_m2
-                        .direct_cursor_refresh_pending
-                        .remove(&output_idx);
-                }
-                Err(error) if error.is_deferred() => {
-                    self.pstate
-                        .scanout_m2
-                        .direct_cursor_refresh_pending
-                        .insert(output_idx);
-                    log::debug!(
-                        "scanout_m2: direct cursor show deferred on output {output_idx}; retrying on CRTC event"
-                    );
-                }
-                Err(error) => {
-                    log::warn!(
-                        "scanout_m2: direct cursor show failed on output {output_idx}: {error}; unflipping"
-                    );
-                    failed = true;
-                    break;
-                }
+            if !self.refresh_direct_cursor_on_output(output_idx, record, x, y) {
+                failed = true;
+                break;
             }
         }
         let scene_synced = self.sync_direct_cursor_scene_state();
@@ -529,31 +474,143 @@ impl KmsBackend {
         !failed && scene_synced
     }
 
-    fn retry_pending_direct_cursor_refresh(&mut self) {
-        if self
+    fn refresh_direct_cursor_on_output(
+        &mut self,
+        output_idx: usize,
+        record: &crate::kms::render::cursor::CursorRecord,
+        x: i32,
+        y: i32,
+    ) -> bool {
+        match self.platform.cursor_plane_upload_image_for_output(
+            output_idx,
+            record.version,
+            record.hot_x,
+            record.hot_y,
+            u32::from(record.width),
+            u32::from(record.height),
+            &record.bgra_bytes,
+        ) {
+            Ok(CursorUploadOutcome::Ready) => {}
+            Ok(CursorUploadOutcome::Deferred) => {
+                self.pstate
+                    .scanout_m2
+                    .direct_cursor_refresh_pending
+                    .insert(output_idx);
+                log::debug!(
+                    "scanout_m2: direct cursor upload deferred on output {output_idx}; retrying on CRTC event"
+                );
+                return true;
+            }
+            Err(error) => {
+                log::warn!(
+                    "scanout_m2: direct cursor upload failed on output {output_idx}: {error}; unflipping"
+                );
+                return false;
+            }
+        }
+        match self
+            .platform
+            .cursor_plane_show_on_crtc(output_idx, record.hot_x, record.hot_y, x, y)
+        {
+            Ok(()) => {
+                self.pstate
+                    .scanout_m2
+                    .direct_cursor_refresh_pending
+                    .remove(&output_idx);
+            }
+            Err(error) if error.is_deferred() => {
+                self.pstate
+                    .scanout_m2
+                    .direct_cursor_refresh_pending
+                    .insert(output_idx);
+                log::debug!(
+                    "scanout_m2: direct cursor show deferred on output {output_idx}; retrying on CRTC event"
+                );
+            }
+            Err(error) => {
+                log::warn!(
+                    "scanout_m2: direct cursor show failed on output {output_idx}: {error}; unflipping"
+                );
+                return false;
+            }
+        }
+        true
+    }
+
+    fn retry_pending_direct_cursor_refresh(
+        &mut self,
+        output_idx: usize,
+        direct_frame_retired: bool,
+    ) {
+        if !self
             .pstate
             .scanout_m2
             .direct_cursor_refresh_pending
-            .is_empty()
+            .contains(&output_idx)
             || !self.pstate.scanout_m2.active()
             || self.pstate.scanout_m2.unflip_requested
         {
             return;
         }
-        if self.pstate.tearing.is_on() || self.effective_cursor_hidden() {
+        if self.pstate.tearing.is_on() {
             self.pstate.scanout_m2.direct_cursor_refresh_pending.clear();
             return;
         }
+        // A grouped direct successor has priority over cursor-only work on
+        // every output. Retry when that output's later event arrives.
+        if self.pstate.scanout_m2.queued_successor.is_some()
+            || (self.pstate.scanout_m2.pending.is_some() && !direct_frame_retired)
+        {
+            return;
+        }
+        if self.effective_cursor_hidden() {
+            match self.platform.cursor_plane_hide_on_crtc(output_idx) {
+                Ok(()) => {
+                    self.pstate
+                        .scanout_m2
+                        .direct_cursor_refresh_pending
+                        .remove(&output_idx);
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    log::debug!(
+                        "scanout_m2: direct cursor hide deferred on output {output_idx}; retrying on CRTC event"
+                    );
+                    return;
+                }
+                Err(error) => {
+                    log::warn!(
+                        "scanout_m2: direct cursor hide failed on output {output_idx}: {error}; unflipping"
+                    );
+                    self.request_direct_unflip("cursor_hide_failed");
+                    return;
+                }
+            }
+            if !self.sync_direct_cursor_scene_state() {
+                self.request_direct_unflip("cursor_scene_sync_failed");
+            }
+            return;
+        }
         let Some(xid) = self.effective_cursor_xid else {
-            self.pstate.scanout_m2.direct_cursor_refresh_pending.clear();
+            self.pstate
+                .scanout_m2
+                .direct_cursor_refresh_pending
+                .remove(&output_idx);
             return;
         };
         let Some(record) = self.cursor_records.get(&xid).cloned() else {
             self.request_direct_unflip("cursor_show_failed");
             return;
         };
-        if !self.refresh_direct_cursor_on_all_outputs(&record) {
+        #[allow(clippy::cast_possible_truncation)]
+        let x = self.core.cursor_x as i32;
+        #[allow(clippy::cast_possible_truncation)]
+        let y = self.core.cursor_y as i32;
+        if !self.refresh_direct_cursor_on_output(output_idx, &record, x, y) {
             self.request_direct_unflip("cursor_show_failed");
+            return;
+        }
+        if !self.sync_direct_cursor_scene_state() {
+            self.request_direct_unflip("cursor_scene_sync_failed");
         }
     }
 
@@ -1531,14 +1588,16 @@ impl KmsBackend {
                     .as_ref()
                     .map_or(0, |frame| frame.source_id.as_u64())
             );
-            self.bind_direct_cursor_on_all_outputs();
-            // Retry deferred cursor work before the queued successor can
-            // occupy the cursor-only commit slot on any CRTC.
-            self.retry_pending_direct_cursor_refresh();
             // Like Xorg's present_flip_try_ready and wlroots' frame_pending
-            // gate, submit at most one successor only after the kernel has
-            // retired the preceding transaction.
+            // gate, submit a queued successor as soon as the prior grouped
+            // transaction retires. Cursor-only retries run after this event
+            // handling so they cannot occupy a CRTC ahead of that successor.
             self.submit_queued_direct_successor();
+            if self.pstate.scanout_m2.queued_successor.is_none()
+                && self.pstate.scanout_m2.pending.is_none()
+            {
+                self.bind_direct_cursor_on_all_outputs();
+            }
         }
         true
     }
@@ -2492,6 +2551,7 @@ impl KmsBackend {
             }
         };
         for (output_idx, clock, timestamps) in flipped {
+            let queued_successor_before_event = self.pstate.scanout_m2.queued_successor.is_some();
             let matched_event_id = self
                 .platform
                 .note_tearing_async_flip_event(output_idx, timestamps);
@@ -2500,16 +2560,25 @@ impl KmsBackend {
             }
             let cursor_commit_retired =
                 self.record_atomic_cursor_commit_retirement(output_idx, matched_event_id);
-            if cursor_commit_retired
-                && self
+            if cursor_commit_retired {
+                if self.pstate.scanout_m2.pending.is_none()
+                    && self.pstate.scanout_m2.queued_successor.is_some()
+                {
+                    self.submit_queued_direct_successor();
+                }
+                if self
                     .pstate
                     .scanout_m2
                     .direct_cursor_refresh_pending
                     .contains(&output_idx)
-            {
-                self.retry_pending_direct_cursor_refresh();
+                {
+                    self.retry_pending_direct_cursor_refresh(output_idx, false);
+                }
             }
             let direct_retired = self.retire_direct_output(output_idx, matched_event_id, clock);
+            if direct_retired && !queued_successor_before_event {
+                self.retry_pending_direct_cursor_refresh(output_idx, true);
+            }
             let scene_retired = !direct_retired
                 && self.scene.handle_page_flip_complete(
                     output_idx,

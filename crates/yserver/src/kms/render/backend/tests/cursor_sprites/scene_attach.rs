@@ -2698,3 +2698,741 @@ fn p2_direct_hook_keeps_scanout_until_deferred_refresh_retries() {
     retire_cursor_record(&mut fixture, &mut delivered, 0, &detach, 11);
     super::support::finish_atomic_fixture(fixture, &mut delivered);
 }
+
+fn held_direct_with_two_outputs(
+    present_id: u64,
+) -> Option<(
+    AtomicPathFixture,
+    HashSet<super::support::CompletionKey>,
+    super::support::HardwareCursor,
+    super::super::commit_identity::recording_scene::DirectPresentSetup,
+)> {
+    let mut fixture = AtomicPathFixture::with_output_count(PathKind::Physical, 2)
+        .expect("two-output atomic direct cursor fixture construction")?;
+    let cursor = create_argb_cursor(
+        &mut fixture.scene.events.backend,
+        (4, 4),
+        [71, 72, 73, 255],
+        (1, 2),
+    );
+    let mut delivered = HashSet::new();
+    let hardware = establish_hardware_cursor(&mut fixture, &mut delivered, cursor, (100, 90));
+    drain_unretired_output_events(&mut fixture, &mut delivered, 1);
+    let direct = enter_held_direct(&mut fixture, &mut delivered, present_id)
+        .expect("enter two-output direct scanout through Backend");
+    for output_idx in 0..2 {
+        drain_unretired_output_events(&mut fixture, &mut delivered, output_idx);
+    }
+    assert!(fixture.scene.events.backend.pstate.scanout_m2.active());
+    assert!(
+        (0..2).all(|output_idx| fixture
+            .scene
+            .events
+            .backend
+            .platform
+            .cursor_plane_visible_for_output(output_idx)),
+        "the direct cursor is bound on both outputs"
+    );
+    Some((fixture, delivered, hardware, direct))
+}
+
+fn count_cursor_commits_for_output(fixture: &AtomicPathFixture, output_idx: usize) -> usize {
+    let device_fd = fixture.scene.kms_fd(output_idx);
+    let crtc = fixture.scene.events.backend.platform.outputs[output_idx]
+        .output
+        .crtc;
+    accepted_live_records(&fixture.scene.events.recorders[&device_fd])
+        .into_iter()
+        .filter(|record| {
+            record.kind == AtomicCommitKind::CursorOnly
+                && record.events.iter().any(|event| event.crtc == crtc)
+        })
+        .count()
+}
+
+fn finish_direct_fixture(
+    mut fixture: AtomicPathFixture,
+    delivered: &mut HashSet<super::support::CompletionKey>,
+) {
+    if fixture.scene.events.backend.pstate.scanout_m2.active() {
+        fixture
+            .scene
+            .events
+            .backend
+            .stop_direct_after_scanout_replaced("test teardown");
+    }
+    for output_idx in 0..fixture.scene.events.backend.platform.outputs.len() {
+        drain_unretired_output_events(&mut fixture, delivered, output_idx);
+    }
+    for output_idx in 0..fixture.scene.events.backend.platform.outputs.len() {
+        if fixture
+            .scene
+            .events
+            .backend
+            .platform
+            .cursor_plane_visible_for_output(output_idx)
+        {
+            fixture
+                .scene
+                .events
+                .backend
+                .platform
+                .cursor_plane_hide_on_crtc(output_idx)
+                .expect("detach test cursor during teardown");
+        }
+    }
+    for output_idx in 0..fixture.scene.events.backend.platform.outputs.len() {
+        drain_unretired_output_events(&mut fixture, delivered, output_idx);
+    }
+    super::support::finish_atomic_fixture(fixture, delivered);
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: retry through all outputs; the output-1 cursor-commit count must stay unchanged.
+fn direct_cursor_retry_on_crtc_event_touches_only_its_pending_output() {
+    let Some((mut fixture, mut delivered, hardware, _direct)) = held_direct_with_two_outputs(707)
+    else {
+        eprintln!(
+            "SKIP direct_cursor_retry_on_crtc_event_touches_only_its_pending_output: Vulkan fixture unavailable"
+        );
+        return;
+    };
+    let device_fd = hardware.device_fd;
+    let properties0 =
+        super::support::cursor_properties_for_output(&fixture.scene.events.backend, 0);
+    let properties1 =
+        super::support::cursor_properties_for_output(&fixture.scene.events.backend, 1);
+    let start = accepted_live_records(&fixture.scene.events.recorders[&device_fd]).len();
+
+    Backend::warp_pointer_root(
+        &mut fixture.scene.events.backend,
+        &mut fixture.scene.events.state,
+        140,
+        120,
+    );
+    Backend::maybe_composite(&mut fixture.scene.events.backend)
+        .expect("submit cursor positions on both direct outputs");
+    let position0 = accepted_live_records(&fixture.scene.events.recorders[&device_fd])
+        .into_iter()
+        .skip(start)
+        .find(|record| {
+            record.kind == AtomicCommitKind::CursorOnly
+                && record_property(record, properties0.crtc_x).is_some()
+                && record_property(record, properties0.fb_id).is_none()
+                && record.events.iter().any(|event| {
+                    event.crtc == fixture.scene.events.backend.platform.outputs[0].output.crtc
+                })
+        })
+        .expect("output 0 accepted a position-only cursor commit");
+    let position1 = accepted_live_records(&fixture.scene.events.recorders[&device_fd])
+        .into_iter()
+        .skip(start)
+        .find(|record| {
+            record.kind == AtomicCommitKind::CursorOnly
+                && record_property(record, properties1.crtc_x).is_some()
+                && record_property(record, properties1.fb_id).is_none()
+                && record.events.iter().any(|event| {
+                    event.crtc == fixture.scene.events.backend.platform.outputs[1].output.crtc
+                })
+        })
+        .expect("output 1 accepted a position-only cursor commit");
+    retire_cursor_record(&mut fixture, &mut delivered, 1, &position1, 40);
+
+    let cursor_b = create_argb_cursor(
+        &mut fixture.scene.events.backend,
+        (4, 4),
+        [74, 75, 76, 255],
+        (1, 2),
+    );
+    define_root_cursor(&mut fixture.scene.events.backend, cursor_b);
+    assert_eq!(
+        fixture
+            .scene
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .direct_cursor_refresh_pending,
+        HashSet::from([0]),
+        "only output 0's in-flight position defers its cursor show"
+    );
+    let before_output1_event = count_cursor_commits_for_output(&fixture, 1);
+    let output1_show = accepted_live_records(&fixture.scene.events.recorders[&device_fd])
+        .into_iter()
+        .rev()
+        .find(|record| {
+            record.kind == AtomicCommitKind::CursorOnly
+                && record_property(record, properties1.fb_id).is_some_and(|fb| fb != 0)
+                && record.events.iter().any(|event| {
+                    event.crtc == fixture.scene.events.backend.platform.outputs[1].output.crtc
+                })
+        })
+        .expect("output 1 accepted the new cursor image");
+    retire_cursor_record(&mut fixture, &mut delivered, 1, &output1_show, 41);
+    let output1_event_did_not_retry_output0 =
+        count_cursor_commits_for_output(&fixture, 1) == before_output1_event;
+    let output0_remained_pending_after_output1_event = fixture
+        .scene
+        .events
+        .backend
+        .pstate
+        .scanout_m2
+        .direct_cursor_refresh_pending
+        .contains(&0);
+
+    Backend::warp_pointer_root(
+        &mut fixture.scene.events.backend,
+        &mut fixture.scene.events.state,
+        160,
+        140,
+    );
+    let output0_before_retry = count_cursor_commits_for_output(&fixture, 0);
+    let output1_before_retry = count_cursor_commits_for_output(&fixture, 1);
+    retire_cursor_record(&mut fixture, &mut delivered, 0, &position0, 42);
+    let output0_retry_count = count_cursor_commits_for_output(&fixture, 0) - output0_before_retry;
+    let output1_retry_count = count_cursor_commits_for_output(&fixture, 1) - output1_before_retry;
+    let pending_cleared_after_retry = fixture
+        .scene
+        .events
+        .backend
+        .pstate
+        .scanout_m2
+        .direct_cursor_refresh_pending
+        .is_empty();
+    let retry = accepted_live_records(&fixture.scene.events.recorders[&device_fd])
+        .into_iter()
+        .rev()
+        .find(|record| {
+            record.kind == AtomicCommitKind::CursorOnly
+                && record_property(record, properties0.fb_id).is_some_and(|fb| fb != 0)
+                && record.events.iter().any(|event| {
+                    event.crtc == fixture.scene.events.backend.platform.outputs[0].output.crtc
+                })
+        });
+    let remained_direct = fixture.scene.events.backend.pstate.scanout_m2.active()
+        && !fixture
+            .scene
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .unflip_requested;
+    finish_direct_fixture(fixture, &mut delivered);
+    assert!(
+        output1_event_did_not_retry_output0,
+        "output 1's CRTC event cannot retry output 0's pending cursor"
+    );
+    assert!(
+        output0_remained_pending_after_output1_event,
+        "output 0 remains pending until its own CRTC event"
+    );
+    assert_eq!(output0_retry_count, 1, "output 0 retries exactly once");
+    assert_eq!(output1_retry_count, 0, "output 0 does not touch output 1");
+    assert!(pending_cleared_after_retry);
+    assert!(retry.is_some(), "output 0 accepts its deferred show");
+    assert!(
+        remained_direct,
+        "cursor refresh deferral keeps direct scanout"
+    );
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: allow a cursor-only retry while a direct successor is queued; the first CRTC event must fail.
+fn direct_cursor_retries_do_not_delay_direct_successors() {
+    let Some((mut fixture, mut delivered, hardware, direct)) = held_direct_with_two_outputs(708)
+    else {
+        eprintln!(
+            "SKIP direct_cursor_retries_do_not_delay_direct_successors: Vulkan fixture unavailable"
+        );
+        return;
+    };
+    let device_fd = hardware.device_fd;
+    let start = accepted_live_records(&fixture.scene.events.recorders[&device_fd]).len();
+
+    Backend::warp_pointer_root(
+        &mut fixture.scene.events.backend,
+        &mut fixture.scene.events.state,
+        150,
+        130,
+    );
+    Backend::maybe_composite(&mut fixture.scene.events.backend)
+        .expect("submit cursor position commits on each output");
+    let positions: Vec<_> = (0..2)
+        .map(|output_idx| {
+            let properties = super::support::cursor_properties_for_output(
+                &fixture.scene.events.backend,
+                output_idx,
+            );
+            let crtc = fixture.scene.events.backend.platform.outputs[output_idx]
+                .output
+                .crtc;
+            accepted_live_records(&fixture.scene.events.recorders[&device_fd])
+                .into_iter()
+                .skip(start)
+                .find(|record| {
+                    record.kind == AtomicCommitKind::CursorOnly
+                        && record_property(record, properties.crtc_x).is_some()
+                        && record_property(record, properties.fb_id).is_none()
+                        && record.events.iter().any(|event| event.crtc == crtc)
+                })
+                .expect("output accepted its cursor position commit")
+        })
+        .collect();
+
+    let cursor_b = create_argb_cursor(
+        &mut fixture.scene.events.backend,
+        (4, 4),
+        [77, 78, 79, 255],
+        (1, 2),
+    );
+    define_root_cursor(&mut fixture.scene.events.backend, cursor_b);
+    assert_eq!(
+        fixture
+            .scene
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .direct_cursor_refresh_pending,
+        HashSet::from([0, 1]),
+        "both in-flight positions defer their replacement shows"
+    );
+
+    let mut successor = direct.candidate;
+    successor.present_id += 1;
+    let mut successor_event = direct.event.clone();
+    successor_event.present_id = successor.present_id;
+    successor_event.serial = successor_event.serial.wrapping_add(1);
+    assert!(
+        Backend::try_present_direct(
+            &mut fixture.scene.events.backend,
+            successor,
+            successor_event,
+        )
+        .expect("queue direct successor through Backend")
+    );
+    assert!(
+        fixture
+            .scene
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .queued_successor
+            .is_some()
+    );
+    Backend::warp_pointer_root(
+        &mut fixture.scene.events.backend,
+        &mut fixture.scene.events.state,
+        180,
+        160,
+    );
+
+    let before_first_event = [
+        count_cursor_commits_for_output(&fixture, 0),
+        count_cursor_commits_for_output(&fixture, 1),
+    ];
+    let mut first_event_did_not_submit_cursor_retry = true;
+    for (output_idx, position) in positions.iter().enumerate() {
+        retire_cursor_record(
+            &mut fixture,
+            &mut delivered,
+            output_idx,
+            position,
+            50 + output_idx as u32,
+        );
+        if output_idx == 0 {
+            first_event_did_not_submit_cursor_retry = [
+                count_cursor_commits_for_output(&fixture, 0),
+                count_cursor_commits_for_output(&fixture, 1),
+            ] == before_first_event;
+        }
+    }
+    let records_after_cursor_events =
+        accepted_live_records(&fixture.scene.events.recorders[&device_fd]);
+    let direct_successor_record = records_after_cursor_events
+        .iter()
+        .skip(start)
+        .rev()
+        .find(|record| record.kind != AtomicCommitKind::CursorOnly);
+    let Some(direct_successor_record) = direct_successor_record else {
+        finish_direct_fixture(fixture, &mut delivered);
+        panic!("queued direct successor is submitted before deferred cursor retries");
+    };
+    assert_eq!(direct_successor_record.events.len(), 2);
+    assert_eq!(
+        [
+            count_cursor_commits_for_output(&fixture, 0),
+            count_cursor_commits_for_output(&fixture, 1),
+        ],
+        before_first_event,
+        "the direct successor event is not preceded by cursor-only retry commits"
+    );
+    let direct_id = accepted_event_id(direct_successor_record)
+        .expect("direct successor carries its accepted commit ID");
+
+    let before_direct_events = [
+        count_cursor_commits_for_output(&fixture, 0),
+        count_cursor_commits_for_output(&fixture, 1),
+    ];
+    assert_eq!(
+        retire_pending_output(&mut fixture.scene.events, &mut delivered, 0, 52),
+        direct_id
+    );
+    assert_eq!(
+        count_cursor_commits_for_output(&fixture, 0) - before_direct_events[0],
+        1
+    );
+    assert_eq!(
+        count_cursor_commits_for_output(&fixture, 1) - before_direct_events[1],
+        0
+    );
+    let output0_retry = accepted_live_records(&fixture.scene.events.recorders[&device_fd])
+        .into_iter()
+        .rev()
+        .find(|record| {
+            record.kind == AtomicCommitKind::CursorOnly
+                && record.events.iter().any(|event| {
+                    event.crtc == fixture.scene.events.backend.platform.outputs[0].output.crtc
+                })
+                && accepted_event_id(record).is_some_and(|id| id != direct_id)
+        })
+        .expect("direct output 0 event retries only its pending cursor");
+    assert!(
+        fixture
+            .scene
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .direct_cursor_refresh_pending
+            .contains(&1)
+    );
+
+    let before_output1_event = [
+        count_cursor_commits_for_output(&fixture, 0),
+        count_cursor_commits_for_output(&fixture, 1),
+    ];
+    assert_eq!(
+        retire_pending_output(&mut fixture.scene.events, &mut delivered, 1, 53),
+        direct_id
+    );
+    assert_eq!(
+        count_cursor_commits_for_output(&fixture, 0) - before_output1_event[0],
+        0
+    );
+    assert_eq!(
+        count_cursor_commits_for_output(&fixture, 1) - before_output1_event[1],
+        1
+    );
+    assert!(
+        fixture
+            .scene
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .direct_cursor_refresh_pending
+            .is_empty()
+    );
+    for (output_idx, retry) in [
+        (0, output0_retry),
+        (
+            1,
+            accepted_live_records(&fixture.scene.events.recorders[&device_fd])
+                .into_iter()
+                .rev()
+                .find(|record| {
+                    record.kind == AtomicCommitKind::CursorOnly
+                        && record.events.iter().any(|event| {
+                            event.crtc
+                                == fixture.scene.events.backend.platform.outputs[1].output.crtc
+                        })
+                        && accepted_event_id(record).is_some_and(|id| id != direct_id)
+                })
+                .expect("direct output 1 event retries only its pending cursor"),
+        ),
+    ] {
+        retire_cursor_record(
+            &mut fixture,
+            &mut delivered,
+            output_idx,
+            &retry,
+            54 + output_idx as u32,
+        );
+    }
+    let still_direct = fixture.scene.events.backend.pstate.scanout_m2.active()
+        && !fixture
+            .scene
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .unflip_requested;
+    finish_direct_fixture(fixture, &mut delivered);
+    assert!(
+        first_event_did_not_submit_cursor_retry,
+        "a queued direct successor prevents cursor-only retries on both CRTCs"
+    );
+    assert!(still_direct);
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: treat a deferred direct hide as a failure; active direct scanout must remain set.
+fn direct_deferred_cursor_hide_keeps_direct_and_retries_on_event() {
+    let Some((mut fixture, mut delivered, hardware, _direct)) = held_direct_with_cursor(709) else {
+        eprintln!(
+            "SKIP direct_deferred_cursor_hide_keeps_direct_and_retries_on_event: Vulkan fixture unavailable"
+        );
+        return;
+    };
+    let device_fd = hardware.device_fd;
+    let properties = super::support::cursor_properties_for_output(&fixture.scene.events.backend, 0);
+    let start = record_count(&fixture, device_fd);
+    Backend::warp_pointer_root(
+        &mut fixture.scene.events.backend,
+        &mut fixture.scene.events.state,
+        140,
+        120,
+    );
+    Backend::maybe_composite(&mut fixture.scene.events.backend)
+        .expect("submit the in-flight cursor position");
+    let position = accepted_live_records(&fixture.scene.events.recorders[&device_fd])
+        .into_iter()
+        .skip(start)
+        .find(|record| {
+            record.kind == AtomicCommitKind::CursorOnly
+                && record_property(record, properties.crtc_x).is_some()
+                && record_property(record, properties.fb_id).is_none()
+        })
+        .expect("direct scanout accepted a cursor position commit");
+
+    let before_hide = count_cursor_commits_for_output(&fixture, 0);
+    Backend::set_cursor_hidden(&mut fixture.scene.events.backend, true);
+    let deferred_hide_kept_direct = fixture.scene.events.backend.pstate.scanout_m2.active()
+        && !fixture
+            .scene
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .unflip_requested;
+    let deferred_hide_is_pending = fixture
+        .scene
+        .events
+        .backend
+        .pstate
+        .scanout_m2
+        .direct_cursor_refresh_pending
+        == HashSet::from([0]);
+    let hide_deferred_without_second_commit =
+        count_cursor_commits_for_output(&fixture, 0) == before_hide;
+
+    retire_cursor_record(&mut fixture, &mut delivered, 0, &position, 60);
+    let hide = accepted_live_records(&fixture.scene.events.recorders[&device_fd])
+        .into_iter()
+        .rev()
+        .find(|record| {
+            record.kind == AtomicCommitKind::CursorOnly
+                && record_property(record, properties.fb_id) == Some(0)
+        });
+    if let Some(hide) = &hide {
+        retire_cursor_record(&mut fixture, &mut delivered, 0, hide, 61);
+    }
+    let hide_retry_succeeded = hide.is_some()
+        && fixture.scene.events.backend.pstate.scanout_m2.active()
+        && !fixture
+            .scene
+            .events
+            .backend
+            .platform
+            .cursor_plane_visible_for_output(0)
+        && !fixture
+            .scene
+            .events
+            .backend
+            .platform
+            .any_cursor_commit_in_flight()
+        && !fixture
+            .scene
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .unflip_requested
+        && fixture
+            .scene
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .direct_cursor_refresh_pending
+            .is_empty();
+    finish_direct_fixture(fixture, &mut delivered);
+    assert!(
+        deferred_hide_kept_direct,
+        "a deferred hide keeps direct scanout"
+    );
+    assert!(
+        deferred_hide_is_pending,
+        "the deferred hide is retried on its CRTC event"
+    );
+    assert!(hide_deferred_without_second_commit);
+    assert!(
+        hide_retry_succeeded,
+        "the CRTC event applies and retires the hide"
+    );
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: replay the deferred hide instead of the current shown intent; the cursor must remain visible.
+fn direct_deferred_hide_then_show_applies_newest_intent() {
+    let Some((mut fixture, mut delivered, hardware, _direct)) = held_direct_with_cursor(710) else {
+        eprintln!(
+            "SKIP direct_deferred_hide_then_show_applies_newest_intent: Vulkan fixture unavailable"
+        );
+        return;
+    };
+    let device_fd = hardware.device_fd;
+    let properties = super::support::cursor_properties_for_output(&fixture.scene.events.backend, 0);
+    let start = record_count(&fixture, device_fd);
+    Backend::warp_pointer_root(
+        &mut fixture.scene.events.backend,
+        &mut fixture.scene.events.state,
+        140,
+        120,
+    );
+    Backend::maybe_composite(&mut fixture.scene.events.backend)
+        .expect("submit the in-flight cursor position");
+    let position = accepted_live_records(&fixture.scene.events.recorders[&device_fd])
+        .into_iter()
+        .skip(start)
+        .find(|record| {
+            record.kind == AtomicCommitKind::CursorOnly
+                && record_property(record, properties.crtc_x).is_some()
+                && record_property(record, properties.fb_id).is_none()
+        })
+        .expect("direct scanout accepted a cursor position commit");
+
+    Backend::set_cursor_hidden(&mut fixture.scene.events.backend, true);
+    let hide_deferred = fixture
+        .scene
+        .events
+        .backend
+        .pstate
+        .scanout_m2
+        .direct_cursor_refresh_pending
+        .contains(&0);
+    Backend::set_cursor_hidden(&mut fixture.scene.events.backend, false);
+    let shown_intent_is_current = !fixture.scene.events.backend.effective_cursor_hidden()
+        && !fixture
+            .scene
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .unflip_requested;
+
+    let before_retry = count_cursor_commits_for_output(&fixture, 0);
+    let retry_start = record_count(&fixture, device_fd);
+    retire_cursor_record(&mut fixture, &mut delivered, 0, &position, 62);
+    let retry_commits = count_cursor_commits_for_output(&fixture, 0) - before_retry;
+    let pending_cleared = fixture
+        .scene
+        .events
+        .backend
+        .pstate
+        .scanout_m2
+        .direct_cursor_refresh_pending
+        .is_empty();
+    let cursor_remained_visible = fixture
+        .scene
+        .events
+        .backend
+        .platform
+        .cursor_plane_visible_for_output(0);
+    let stale_hide_submitted = accepted_live_records(&fixture.scene.events.recorders[&device_fd])
+        .into_iter()
+        .skip(retry_start)
+        .any(|record| {
+            record.kind == AtomicCommitKind::CursorOnly
+                && record_property(&record, properties.fb_id) == Some(0)
+        });
+    let still_direct = fixture.scene.events.backend.pstate.scanout_m2.active()
+        && !fixture
+            .scene
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .unflip_requested;
+    finish_direct_fixture(fixture, &mut delivered);
+    assert!(hide_deferred);
+    assert!(shown_intent_is_current);
+    assert_eq!(
+        retry_commits, 0,
+        "the already-visible show needs no cursor commit"
+    );
+    assert!(pending_cleared);
+    assert!(cursor_remained_visible);
+    assert!(
+        !stale_hide_submitted,
+        "the event does not apply the stale hide"
+    );
+    assert!(still_direct);
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: treat a real hide error as deferred; the unflip request must fail.
+fn direct_cursor_hide_real_error_still_unflips() {
+    let Some((mut fixture, mut delivered, hardware, _direct)) = held_direct_with_cursor(711) else {
+        eprintln!("SKIP direct_cursor_hide_real_error_still_unflips: Vulkan fixture unavailable");
+        return;
+    };
+    let device_fd = hardware.device_fd;
+    let recorder = Rc::clone(&fixture.scene.events.recorders[&device_fd]);
+    let start = record_count(&fixture, device_fd);
+    recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
+    Backend::set_cursor_hidden(&mut fixture.scene.events.backend, true);
+    let real_error = recorder.records().into_iter().skip(start).any(|record| {
+        record.kind == AtomicCommitKind::CursorOnly
+            && matches!(
+                record.result,
+                ScriptedResult::Error {
+                    raw_os_error: Some(errno),
+                    ..
+                } if errno == libc::EIO
+            )
+    });
+    let still_requested_unflip = fixture.scene.events.backend.pstate.scanout_m2.active()
+        && fixture
+            .scene
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .unflip_requested;
+    let no_deferred_retry = fixture
+        .scene
+        .events
+        .backend
+        .pstate
+        .scanout_m2
+        .direct_cursor_refresh_pending
+        .is_empty();
+    finish_direct_fixture(fixture, &mut delivered);
+    assert!(
+        real_error,
+        "the scripted EIO reached the atomic cursor hide"
+    );
+    assert!(
+        still_requested_unflip,
+        "a real cursor hide error still requests unflip"
+    );
+    assert!(no_deferred_retry, "a real error is not treated as deferred");
+}

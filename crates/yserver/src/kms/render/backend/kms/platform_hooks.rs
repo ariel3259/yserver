@@ -151,6 +151,7 @@ impl Platform for PlatformBackend {
             return;
         }
         if !b.platform.any_cursor_plane_visible() {
+            b.pstate.scanout_m2.direct_cursor_refresh_pending.clear();
             if !b.sync_direct_cursor_scene_state() {
                 b.request_direct_unflip("cursor_scene_sync_failed");
             }
@@ -159,13 +160,34 @@ impl Platform for PlatformBackend {
         let mut failed = false;
         for output_idx in 0..b.platform.outputs.len() {
             if !b.platform.cursor_plane_visible_for_output(output_idx) {
+                b.pstate
+                    .scanout_m2
+                    .direct_cursor_refresh_pending
+                    .remove(&output_idx);
                 continue;
             }
-            if let Err(error) = b.platform.cursor_plane_hide_on_crtc(output_idx) {
-                log::warn!(
-                    "scanout_m2: cursor hide failed on output {output_idx}: {error}; unflipping"
-                );
-                failed = true;
+            match b.platform.cursor_plane_hide_on_crtc(output_idx) {
+                Ok(()) => {
+                    b.pstate
+                        .scanout_m2
+                        .direct_cursor_refresh_pending
+                        .remove(&output_idx);
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    b.pstate
+                        .scanout_m2
+                        .direct_cursor_refresh_pending
+                        .insert(output_idx);
+                    log::debug!(
+                        "scanout_m2: direct cursor hide deferred on output {output_idx}; retrying on CRTC event"
+                    );
+                }
+                Err(error) => {
+                    log::warn!(
+                        "scanout_m2: cursor hide failed on output {output_idx}: {error}; unflipping"
+                    );
+                    failed = true;
+                }
             }
         }
         if failed {
