@@ -37,6 +37,15 @@ pub(crate) struct KernelPageFlip {
 
 pub(crate) trait RenderCompletionReadiness {
     fn is_ready(&self, render_job_id: u64, fd: Option<BorrowedFd<'_>>) -> io::Result<bool>;
+
+    fn note_sink_copy_submitted(
+        &self,
+        _output_idx: usize,
+        _bo_idx: usize,
+        _render_job_id: u64,
+        _mode: FrameSubmitMode,
+    ) {
+    }
 }
 
 pub(crate) struct PollRenderCompletionReadiness;
@@ -153,6 +162,16 @@ pub(crate) struct RecordingRenderCompletionReadiness {
     fail_next_ready_check: std::cell::RefCell<HashSet<u64>>,
     capture_fence_jobs: std::cell::RefCell<HashSet<u64>>,
     captured_fences: std::cell::RefCell<std::collections::HashMap<u64, OwnedFd>>,
+    sink_copy_submissions: std::cell::RefCell<Vec<SinkCopySubmission>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SinkCopySubmission {
+    pub(crate) output_idx: usize,
+    pub(crate) bo_idx: usize,
+    pub(crate) render_job_id: u64,
+    pub(crate) mode: FrameSubmitMode,
 }
 
 #[cfg(test)]
@@ -185,6 +204,10 @@ impl RecordingRenderCompletionReadiness {
     pub(crate) fn take_captured_completion_fence(&self, render_job_id: u64) -> Option<OwnedFd> {
         self.captured_fences.borrow_mut().remove(&render_job_id)
     }
+
+    pub(crate) fn sink_copy_submissions(&self) -> Vec<SinkCopySubmission> {
+        self.sink_copy_submissions.borrow().clone()
+    }
 }
 
 #[cfg(test)]
@@ -209,6 +232,23 @@ impl RenderCompletionReadiness for RecordingRenderCompletionReadiness {
             return Ok(false);
         }
         Ok(!self.hold_ready.get() || self.released_ready.borrow().contains(&render_job_id))
+    }
+
+    fn note_sink_copy_submitted(
+        &self,
+        output_idx: usize,
+        bo_idx: usize,
+        render_job_id: u64,
+        mode: FrameSubmitMode,
+    ) {
+        self.sink_copy_submissions
+            .borrow_mut()
+            .push(SinkCopySubmission {
+                output_idx,
+                bo_idx,
+                render_job_id,
+                mode,
+            });
     }
 }
 

@@ -1149,6 +1149,7 @@ impl KmsBackend {
             awaiting_outputs: HashSet::new(),
             retry_at: None,
             prepare_deadline: Some(self.monotonic_now() + std::time::Duration::from_secs(2)),
+            retry_after_cancellation: false,
             prepare_attempt: 1,
             fallback_revision: self.pstate.scanout_m2.unflip_fallback_revision,
             timeout_error_logged: false,
@@ -1672,7 +1673,8 @@ impl KmsBackend {
             return Ok(());
         }
         let attempt = batch.prepare_attempt;
-        if attempt >= 2 {
+        let retry_after_cancellation = batch.retry_after_cancellation;
+        if retry_after_cancellation && attempt >= 2 {
             let old_pending_pageflips = self.pending_pageflip_crtcs();
             if let Err(error) =
                 self.teardown_direct_before_topology_requery("composed unflip preparation deadline")
@@ -1739,7 +1741,12 @@ impl KmsBackend {
         batch.awaiting_outputs.clear();
         batch.retry_at = None;
         batch.prepare_deadline = Some(prepare_deadline);
-        batch.prepare_attempt = attempt.saturating_add(1);
+        batch.retry_after_cancellation = false;
+        batch.prepare_attempt = if retry_after_cancellation {
+            attempt.saturating_add(1)
+        } else {
+            attempt
+        };
         batch.fallback_revision = self.pstate.scanout_m2.unflip_fallback_revision;
         self.platform
             .install_unflip_batch_context(topology_generation);
@@ -1757,6 +1764,9 @@ impl KmsBackend {
         if batch.prepare_attempt == 1 {
             let first_deadline = batch.phase == ComposedUnflipPhase::Preparing;
             if first_deadline {
+                if let Some(batch) = self.pstate.scanout_m2.composed_unflip.as_mut() {
+                    batch.retry_after_cancellation = true;
+                }
                 self.begin_composed_unflip_cancellation(false)?;
                 let cancellation_deadline =
                     self.monotonic_now() + std::time::Duration::from_secs(2);

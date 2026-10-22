@@ -2123,7 +2123,7 @@ fn issue281_unflip_lifecycle_quiesces_vt_dpms_and_randr() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: let apply_crtc_config return without advancing the unflip topology generation or draining the deferred copied-source row.
+// Mutation: allow a quiesced deferred source row to survive and submit its sink copy on a later notification.
 fn issue281_randr_quiescence_drains_deferred_copied_source() {
     use yserver_core::backend::Backend;
 
@@ -2166,6 +2166,10 @@ fn issue281_randr_quiescence_drains_deferred_copied_source() {
         .find(|identity| identity.render_job_id == pending_job)
         .expect("the held source job belongs to a prepared scene acknowledgement");
     assert!(identity.recording_complete);
+    assert!(
+        fixture.sink_copy_submissions().is_empty(),
+        "the held source completion has not submitted its sink copy"
+    );
     assert!(
         fixture
             .events
@@ -2270,7 +2274,12 @@ fn issue281_randr_quiescence_drains_deferred_copied_source() {
         "held copied source work never reaches a sink-copy or grouped KMS submit"
     );
 
+    readiness.release_ready_job(pending_job);
     Backend::on_scanout_render_completion(&mut fixture.events.backend, &mut fixture.events.state);
+    assert!(
+        fixture.sink_copy_submissions().is_empty(),
+        "quiescence removes the source row before it can submit a sink copy"
+    );
     assert!(
         !fixture.pending_render_job_ids().contains(&pending_job),
         "no stale source render can resume after the topology mutation"
@@ -2306,9 +2315,60 @@ fn queue_live_idle_sequence(fixture: &mut RecordingSceneFixture, output_idx: usi
     );
 }
 
+fn queue_pending_notify_msc(
+    fixture: &mut RecordingSceneFixture,
+    output_idx: usize,
+    serial: u32,
+    target_msc: u64,
+) {
+    let output = &fixture.events.backend.platform.outputs[output_idx];
+    let crtc_id = u32::from(output.output.crtc);
+    let crtc_epoch = fixture.events.backend.present_crtc_clock_epoch(crtc_id);
+    fixture
+        .events
+        .state
+        .present_pending_msc
+        .push(yserver_core::server::PendingNotifyMsc {
+            owner: yserver_protocol::x11::ClientId(1),
+            window: 0x7a00 + u32::try_from(output_idx).expect("output index fits"),
+            crtc_id,
+            crtc_epoch,
+            msc_offset: 0,
+            serial,
+            target_msc,
+            divisor: 0,
+            remainder: 0,
+            byte_order: yserver_protocol::x11::ClientByteOrder::LittleEndian,
+        });
+}
+
+fn unsignalled_eventfd() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+    let fd: std::os::fd::OwnedFd = nix::sys::eventfd::EventFd::from_value_and_flags(
+        0,
+        nix::sys::eventfd::EfdFlags::EFD_CLOEXEC | nix::sys::eventfd::EfdFlags::EFD_NONBLOCK,
+    )
+    .expect("create an unsignalled dependency eventfd")
+    .into();
+    let witness = fd.try_clone().expect("retain a dependency eventfd witness");
+    (fd, witness)
+}
+
+fn signal_eventfd(witness: &std::os::fd::OwnedFd) {
+    let one = 1u64;
+    // SAFETY: the owned witness keeps the eventfd live; write consumes one u64.
+    let written = unsafe {
+        libc::write(
+            std::os::fd::AsRawFd::as_raw_fd(witness),
+            (&one as *const u64).cast(),
+            std::mem::size_of_val(&one),
+        )
+    };
+    assert_eq!(written, std::mem::size_of_val(&one) as isize);
+}
+
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: treat an idle CRTC sequence on one retired output as completion while its grouped unflip still awaits another output.
+// Mutation: treat an idle CRTC sequence as Present completion, admit competing work before source readiness, or spend the timeout retry on topology rebuilds.
 fn issue281_pending_unflip_survives_rejection_and_lifecycle() {
     use yserver_core::backend::{Backend, PresentClockSource};
 
@@ -2425,6 +2485,7 @@ fn issue281_pending_unflip_survives_rejection_and_lifecycle() {
             &fixture.events.backend.platform.outputs[0]
         )
     ));
+    queue_pending_notify_msc(&mut fixture, 0, 1, 501);
     queue_live_idle_sequence(&mut fixture, 0, 501);
     assert_ne!(
         fixture
@@ -2437,6 +2498,11 @@ fn issue281_pending_unflip_survives_rejection_and_lifecycle() {
             .source,
         PresentClockSource::IdleSequence,
         "a sequence during preparation cannot complete a pending Present"
+    );
+    assert_eq!(
+        fixture.events.state.present_pending_msc.len(),
+        1,
+        "the pending NotifyMSC remains parked while preparation is visible work"
     );
 
     clock.set(retry_at);
@@ -2465,6 +2531,7 @@ fn issue281_pending_unflip_survives_rejection_and_lifecycle() {
             .composed_unflip
             .is_some()
     );
+    queue_pending_notify_msc(&mut fixture, 0, 2, 503);
     queue_live_idle_sequence(&mut fixture, 0, 503);
     let first_key = crate::kms::render::platform::CrtcKey::for_output(
         &fixture.events.backend.platform.outputs[0],
@@ -2485,6 +2552,11 @@ fn issue281_pending_unflip_survives_rejection_and_lifecycle() {
             .source,
         PresentClockSource::IdleSequence,
         "idle CRTC sequence cannot complete Present during partial group retirement"
+    );
+    assert_eq!(
+        fixture.events.state.present_pending_msc.len(),
+        2,
+        "pending NotifyMSC requests remain parked during partial retirement"
     );
     let second_crtc = fixture.events.backend.platform.outputs[1].output.crtc;
     fixture.events.queue_commit_completion(
@@ -2543,7 +2615,6 @@ fn issue281_pending_unflip_survives_rejection_and_lifecycle() {
     let waiting_offset = record_count(&waiting, waiting_fd);
     Backend::maybe_composite(&mut waiting.events.backend)
         .expect("start copied unflip and wait for its source notification");
-    waiting.events.wait_for_submitted_gpu_work();
     let waiting_identity = waiting
         .events
         .backend
@@ -2552,15 +2623,27 @@ fn issue281_pending_unflip_survives_rejection_and_lifecycle() {
         .into_iter()
         .next()
         .expect("copied unflip is waiting for its source notification");
-    let old_topology_generation = waiting
+    // Mutation: free a stale target or clear its acknowledgement before the
+    // unsignalled cancellation dependency reports safe completion.
+    let (first_dependency, first_witness) = unsignalled_eventfd();
+    let mut first_witness_poll = libc::pollfd {
+        fd: std::os::fd::AsRawFd::as_raw_fd(&first_witness),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `first_witness` keeps the injected completion dependency live.
+    assert_eq!(unsafe { libc::poll(&mut first_witness_poll, 1, 0) }, 0);
+    let _first_source_fence = waiting
         .events
         .backend
-        .pstate
-        .scanout_m2
-        .composed_unflip
-        .as_ref()
-        .expect("copied preparation remains active")
-        .topology_generation;
+        .platform
+        .for_tests_replace_pending_render_completion_fd(
+            waiting_identity.render_job_id,
+            first_dependency,
+        )
+        .expect("install an unsignalled dependency for the active source job");
+    let (_poll, sender, receiver) = yserver_core::core_loop::channel().expect("input channel");
+    Backend::set_input_sender(&mut waiting.events.backend, sender);
     let prepare_deadline = waiting
         .events
         .backend
@@ -2598,17 +2681,57 @@ fn issue281_pending_unflip_survives_rejection_and_lifecycle() {
         "stale prepared planes arm immediate cancellation after a layout change"
     );
     Backend::maybe_composite(&mut waiting.events.backend)
-        .expect("discard old prepared rows and rebuild for the new layout");
-    let rebuilt_identity = waiting
+        .expect("enter notification-driven cancellation for the changed layout");
+    let cancelling = waiting
+        .events
+        .backend
+        .pstate
+        .scanout_m2
+        .composed_unflip
+        .as_ref()
+        .expect("stale topology remains installed while its writer is unresolved");
+    assert_eq!(
+        cancelling.phase,
+        crate::kms::render::backend::ComposedUnflipPhase::Cancelling
+    );
+    assert!(
+        waiting
+            .events
+            .backend
+            .scene
+            .pending_unflip_frame_identities()
+            .contains(&waiting_identity),
+        "the matching scene acknowledgement remains until safe completion"
+    );
+    assert_ne!(
+        waiting.scanout_bo_phase(waiting_identity.output_idx, waiting_identity.bo_idx),
+        BoPhase::Free,
+        "the render target remains owned while its dependency is unsignalled"
+    );
+    assert!(
+        waiting
+            .events
+            .backend
+            .platform
+            .for_tests_pending_scanout_unflip_dependency_job_ids()
+            .contains(&waiting_identity.render_job_id)
+    );
+    let cancellation_generation = cancelling.topology_generation;
+    let cancellation_attempt = cancelling.prepare_attempt;
+    waiting.events.wait_for_submitted_gpu_work();
+    signal_eventfd(&first_witness);
+    readiness.release_ready_job(waiting_identity.render_job_id);
+    Backend::on_scanout_render_completion(&mut waiting.events.backend, &mut waiting.events.state);
+    let first_rebuild_identity = waiting
         .events
         .backend
         .scene
         .pending_unflip_frame_identities()
         .into_iter()
         .next()
-        .expect("new topology owns a fresh unflip render job");
+        .expect("safe cancellation rebuilds for the first layout");
     assert_ne!(
-        rebuilt_identity.render_job_id,
+        first_rebuild_identity.render_job_id,
         waiting_identity.render_job_id
     );
     assert_ne!(
@@ -2621,13 +2744,112 @@ fn issue281_pending_unflip_survives_rejection_and_lifecycle() {
             .as_ref()
             .expect("rebuilt batch remains active")
             .topology_generation,
-        old_topology_generation,
+        cancellation_generation,
         "layout changes rebuild under a new topology generation"
+    );
+    assert_eq!(
+        waiting
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .composed_unflip
+            .as_ref()
+            .expect("rebuilt batch remains active")
+            .prepare_attempt,
+        cancellation_attempt,
+        "topology rebuilds do not consume the preparation-timeout retry"
     );
     assert!(
         records_since(&waiting, waiting_fd, waiting_offset)
             .iter()
             .all(|record| accepted_event_id(record).is_none())
+    );
+
+    // Mutation: count topology cancellation as the R13 timeout retry; the
+    // second layout rebuild must still leave the process running.
+    let (second_dependency, second_witness) = unsignalled_eventfd();
+    let mut second_witness_poll = libc::pollfd {
+        fd: std::os::fd::AsRawFd::as_raw_fd(&second_witness),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `second_witness` keeps the injected completion dependency live.
+    assert_eq!(unsafe { libc::poll(&mut second_witness_poll, 1, 0) }, 0);
+    let _second_source_fence = waiting
+        .events
+        .backend
+        .platform
+        .for_tests_replace_pending_render_completion_fd(
+            first_rebuild_identity.render_job_id,
+            second_dependency,
+        )
+        .expect("install an unsignalled dependency for the second topology job");
+    Backend::set_logical_screen_size(&mut waiting.events.backend, 802, 601)
+        .expect("second logical extent change invalidates the rebuilt topology");
+    Backend::maybe_composite(&mut waiting.events.backend)
+        .expect("second topology change waits for its matching safe notification");
+    let second_cancelling = waiting
+        .events
+        .backend
+        .pstate
+        .scanout_m2
+        .composed_unflip
+        .as_ref()
+        .expect("second stale topology remains installed while its writer is unresolved");
+    assert_eq!(
+        second_cancelling.phase,
+        crate::kms::render::backend::ComposedUnflipPhase::Cancelling
+    );
+    assert!(
+        waiting
+            .events
+            .backend
+            .scene
+            .pending_unflip_frame_identities()
+            .contains(&first_rebuild_identity),
+        "second layout change retains its matching acknowledgement until safe"
+    );
+    assert_ne!(
+        waiting.scanout_bo_phase(
+            first_rebuild_identity.output_idx,
+            first_rebuild_identity.bo_idx,
+        ),
+        BoPhase::Free,
+        "second topology change cannot reuse the unresolved render target"
+    );
+    waiting.events.wait_for_submitted_gpu_work();
+    signal_eventfd(&second_witness);
+    readiness.release_ready_job(first_rebuild_identity.render_job_id);
+    Backend::on_scanout_render_completion(&mut waiting.events.backend, &mut waiting.events.state);
+    assert!(
+        receiver.try_recv_all().next().is_none(),
+        "topology changes do not request process shutdown"
+    );
+    let rebuilt_identity = waiting
+        .events
+        .backend
+        .scene
+        .pending_unflip_frame_identities()
+        .into_iter()
+        .next()
+        .expect("second safe cancellation rebuilds for the second layout");
+    assert_ne!(
+        rebuilt_identity.render_job_id,
+        first_rebuild_identity.render_job_id
+    );
+    assert_eq!(
+        waiting
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .composed_unflip
+            .as_ref()
+            .expect("second rebuilt batch remains active")
+            .prepare_attempt,
+        cancellation_attempt,
+        "successive topology rebuilds preserve the timeout attempt count"
     );
     readiness.release_ready_job(rebuilt_identity.render_job_id);
     Backend::on_scanout_render_completion(&mut waiting.events.backend, &mut waiting.events.state);
@@ -2700,6 +2922,7 @@ fn issue281_pending_unflip_survives_rejection_and_lifecycle() {
             .backend
             .present_completion_is_idle_for(immediate_key)
     );
+    queue_pending_notify_msc(&mut immediate, 0, 3, 521);
     queue_live_idle_sequence(&mut immediate, 0, 521);
     assert_ne!(
         immediate
@@ -2711,6 +2934,47 @@ fn issue281_pending_unflip_survives_rejection_and_lifecycle() {
         PresentClockSource::IdleSequence,
         "an idle sequence cannot complete Present while the copied scene frame is pending"
     );
+    assert_eq!(
+        immediate.events.state.present_pending_msc.len(),
+        1,
+        "the pending NotifyMSC remains parked while an ordinary copied frame awaits its source event"
+    );
+    Backend::clear_area(
+        &mut immediate.events.backend,
+        None,
+        root,
+        0,
+        None,
+        0,
+        0,
+        root_width,
+        root_height,
+        (0, 0),
+    )
+    .expect("queue later scene paint while the copied frame awaits readiness");
+    let _cursor_position = immediate
+        .events
+        .backend
+        .platform
+        .for_tests_seed_atomic_cursor_position(
+            0,
+            super::recording_scene::raw(0x9200),
+            super::recording_scene::raw(0x9201),
+            super::recording_scene::raw(0x9202),
+            32,
+            32,
+            0,
+            0,
+        );
+    let cursor_key = immediate.events.backend.platform.outputs[0].key.device_key;
+    let cursor_crtc = immediate.events.backend.platform.outputs[0].output.crtc;
+    assert!(
+        immediate
+            .events
+            .backend
+            .platform
+            .for_tests_atomic_position_is_unsent(cursor_key, cursor_crtc)
+    );
     Backend::maybe_composite(&mut immediate.events.backend)
         .expect("a pending copied scene frame blocks scene and cursor admission");
     assert_eq!(
@@ -2720,6 +2984,13 @@ fn issue281_pending_unflip_survives_rejection_and_lifecycle() {
             .count(),
         0,
         "no scene or cursor commit is admitted before source readiness"
+    );
+    assert!(
+        immediate
+            .events
+            .backend
+            .platform
+            .for_tests_atomic_position_is_unsent(cursor_key, cursor_crtc)
     );
     immediate_readiness.release_ready_job(immediate_job);
     Backend::on_scanout_render_completion(
@@ -2731,6 +3002,23 @@ fn issue281_pending_unflip_survives_rejection_and_lifecycle() {
         .find(|record| accepted_event_id(record).is_some())
         .expect("the matching source notification submits the immediate copied frame");
     let immediate_id = accepted_event_id(&immediate_flip).expect("accepted immediate frame ID");
+    // Mutation: omit the copied-sink submission record after the source notification.
+    assert!(
+        immediate
+            .sink_copy_submissions()
+            .iter()
+            .any(|submission| submission.render_job_id == immediate_job)
+    );
+    Backend::maybe_composite(&mut immediate.events.backend)
+        .expect("later scene and cursor work remains behind the accepted copied frame");
+    assert_eq!(
+        records_since(&immediate, immediate_fd, immediate_offset)
+            .iter()
+            .filter(|record| accepted_event_id(record).is_some())
+            .count(),
+        1,
+        "source readiness admits only the held copied frame, not competing work"
+    );
     complete_recorded_attempt(
         &mut immediate,
         immediate_fd,

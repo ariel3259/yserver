@@ -432,6 +432,7 @@ impl PlatformBackend {
         };
         let render_job_id = identity.render_job_id;
         let source_dependency = render_completion.as_ref().map(|fd| fd.as_raw_fd());
+        let readiness_observer = Rc::clone(&self.render_completion_readiness);
         self.debug_assert_scanout_pool_route(output_idx);
         let output_key = self
             .outputs
@@ -510,6 +511,12 @@ impl PlatformBackend {
                         Err(crate::kms::vk::scanout::DeferredCopiedSubmitError::Submitted(
                             error,
                         )) => {
+                            readiness_observer.note_sink_copy_submitted(
+                                output_idx,
+                                bo_idx,
+                                render_job_id,
+                                mode,
+                            );
                             let destination = copied
                                 .destinations
                                 .bos
@@ -545,6 +552,7 @@ impl PlatformBackend {
                     }
                 }
             };
+            readiness_observer.note_sink_copy_submitted(output_idx, bo_idx, render_job_id, mode);
             let destination = copied
                 .destinations
                 .bos

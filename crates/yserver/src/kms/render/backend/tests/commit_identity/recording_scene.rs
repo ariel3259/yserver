@@ -272,6 +272,27 @@ impl RecordingSceneFixture {
             .for_tests_pending_scanout_render_job_ids()
     }
 
+    /// Direct history of copied sink submissions; accepted KMS commit records
+    /// alone cannot prove that a deferred sink GPU copy was never queued.
+    pub(crate) fn sink_copy_submissions(
+        &self,
+    ) -> Vec<crate::kms::render::platform::flip_events::SinkCopySubmission> {
+        self.readiness
+            .as_ref()
+            .map(|readiness| readiness.sink_copy_submissions())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn scanout_bo_phase(&self, output_idx: usize, bo_idx: usize) -> BoPhase {
+        self.events.backend.platform.scanout_pools[output_idx]
+            .as_ref()
+            .expect("scanout output pool")
+            .display_pool()
+            .bos[bo_idx]
+            .state
+            .phase
+    }
+
     /// Read a retained drawable allocation by identity, including storage
     /// whose XID mapping was detached during a content-preserving migration.
     pub(crate) fn backing_pixels_for_id(

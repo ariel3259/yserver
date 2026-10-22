@@ -278,6 +278,10 @@ pub(in crate::kms::render::backend) struct ComposedUnflipBatch {
     pub(in crate::kms::render::backend) awaiting_outputs: HashSet<usize>,
     pub(in crate::kms::render::backend) retry_at: Option<Instant>,
     pub(in crate::kms::render::backend) prepare_deadline: Option<Instant>,
+    /// True only when cancellation is resolving the one full-repaint retry
+    /// granted after a preparation deadline. Topology rebuilds do not spend
+    /// that timeout budget.
+    pub(in crate::kms::render::backend) retry_after_cancellation: bool,
     pub(in crate::kms::render::backend) prepare_attempt: u8,
     pub(in crate::kms::render::backend) fallback_revision: u64,
     pub(in crate::kms::render::backend) timeout_error_logged: bool,

@@ -133,6 +133,7 @@ fn next_wakeup_suppresses_scene_deadline_when_scanout_disallowed() {
 }
 
 #[test]
+// **pure boundary**: construct batch state directly to cover the shared compose and wake predicates.
 // Mutation: ignore a stale unflip topology generation in the shared compose and wake predicates.
 fn stale_unflip_topology_wakes_cancellation_but_notification_wait_does_not_spin() {
     use crate::kms::render::backend::{ComposedUnflipBatch, ComposedUnflipPhase};
@@ -153,6 +154,7 @@ fn stale_unflip_topology_wakes_cancellation_but_notification_wait_does_not_spin(
         awaiting_outputs: HashSet::new(),
         retry_at: None,
         prepare_deadline: Some(now + std::time::Duration::from_secs(2)),
+        retry_after_cancellation: false,
         prepare_attempt: 1,
         fallback_revision: 0,
         timeout_error_logged: false,
