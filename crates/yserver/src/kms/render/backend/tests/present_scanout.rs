@@ -2435,8 +2435,13 @@ fn atomic_cursor_scanout_backend_with_hidden_cursor(hidden: bool) -> Option<KmsB
     let mut backend = match KmsBackend::for_tests_with_vk() {
         Ok(backend) => backend,
         Err(error) => {
-            eprintln!("skipping: no Vulkan test device: {error}");
-            return None;
+            if let Some(vk_error) = super::vk_init_error_from_io_error(&error)
+                .filter(|error| error.is_unavailable_for_tests())
+            {
+                eprintln!("SKIP present_scanout: Vulkan unavailable: {vk_error}");
+                return None;
+            }
+            panic!("unexpected Vulkan test setup failure: {error}");
         }
     };
     push_test_output(&mut backend, 0x5401);
@@ -2474,8 +2479,12 @@ fn atomic_cursor_scanout_backend_with_hidden_cursor(hidden: bool) -> Option<KmsB
     Some(backend)
 }
 
-fn install_renderable_cursor_scanout_pools(backend: &mut KmsBackend) {
+fn install_renderable_cursor_scanout_pools(backend: &mut KmsBackend) -> bool {
     use crate::kms::vk::scanout::{BoPhase, OutputScanout, ScanoutBo, ScanoutBoPool};
+
+    if !super::commit_identity::recording_scene::skip_unless_vulkan_fed_scanout(backend) {
+        return false;
+    }
 
     let output_count = backend.platform.outputs.len();
     backend
@@ -2557,6 +2566,7 @@ fn install_renderable_cursor_scanout_pools(backend: &mut KmsBackend) {
         backend.platform.bo_generations[output_idx] =
             vec![crate::kms::render::platform::BoGenerationEntry::default(); 2];
     }
+    true
 }
 
 #[test]
@@ -2894,7 +2904,9 @@ fn cursor_einval_rolls_back_and_hide_recovery_is_motion_driven_and_bounded() {
             .is_empty()
     );
 
-    install_renderable_cursor_scanout_pools(&mut recovered_backend);
+    if !install_renderable_cursor_scanout_pools(&mut recovered_backend) {
+        return;
+    }
     mark_active_fallback_ready_for_test(&mut recovered_backend);
     let readiness_gate =
         std::rc::Rc::new(crate::kms::render::platform::RecordingPreparedUnflipReadiness::default());
@@ -3571,7 +3583,9 @@ fn direct_successor_waits_for_retirement_and_carries_motion() {
     // Keep the same direct frame current and exercise the composed-unflip
     // blocker. Cursor motion while the unflip waits must be carried by the
     // grouped replacement instead of starting another cursor-only stream.
-    install_renderable_cursor_scanout_pools(&mut backend);
+    if !install_renderable_cursor_scanout_pools(&mut backend) {
+        return;
+    }
     Backend::warp_pointer_root(&mut backend, &mut state, 1160, 260);
     Backend::maybe_composite(&mut backend).expect("submit cursor-only commits on direct current");
     assert_eq!(recorder.records().len(), 4);
@@ -3591,8 +3605,8 @@ fn direct_successor_waits_for_retirement_and_carries_motion() {
     let unflip_positions = backend
         .platform
         .cursor_plane_atomic_positions_for_outputs(&[0, 1]);
-    assert_no_immediate_cursor_wakeup(&backend);
     Backend::maybe_composite(&mut backend).expect("unflip waits for both cursor commits");
+    assert_no_immediate_cursor_wakeup(&backend);
     assert_eq!(recorder.records().len(), 4);
     retire_atomic_cursor_test_output(&mut backend, &mut state, 0, 3);
     Backend::maybe_composite(&mut backend).expect("unflip still waits for the second CRTC");
@@ -3998,8 +4012,13 @@ fn shape_triggered_composed_unflip_records_cursor_positions_for_both_outputs() {
     let mut backend = match KmsBackend::for_tests_with_vk() {
         Ok(backend) => backend,
         Err(error) => {
-            eprintln!("skipping: no Vulkan device: {error}");
-            return;
+            if let Some(vk_error) = super::vk_init_error_from_io_error(&error)
+                .filter(|error| error.is_unavailable_for_tests())
+            {
+                eprintln!("SKIP present_scanout: Vulkan unavailable: {vk_error}");
+                return;
+            }
+            panic!("unexpected Vulkan test setup failure: {error}");
         }
     };
     push_test_output(&mut backend, 0x5300);
@@ -4045,7 +4064,9 @@ fn shape_triggered_composed_unflip_records_cursor_positions_for_both_outputs() {
     assert_eq!((positions[0].x, positions[0].y), (845, 130));
     assert_eq!((positions[1].x, positions[1].y), (45, 30));
 
-    install_renderable_cursor_scanout_pools(&mut backend);
+    if !install_renderable_cursor_scanout_pools(&mut backend) {
+        return;
+    }
     let layouts = backend.platform.scene_output_layouts();
     backend.scene = crate::kms::render::scene::SceneCompositor::new(&backend.platform, &layouts)
         .expect("rebuild shape cursor scene against renderable scanout pools");

@@ -772,7 +772,7 @@ pub(in crate::kms::render::backend::tests) fn skip_unless_vulkan_fed_scanout(
     });
     if !supported {
         eprintln!(
-            "SKIP recording_scene: Vulkan device lacks SYNC_FD export or DRM format modifier support"
+            "SKIP: Vulkan device lacks SYNC_FD export or DRM format modifier support for Vulkan-fed scanout"
         );
     }
     supported
