@@ -22,6 +22,8 @@ use yserver_core::{
 };
 use yserver_protocol::x11::xfixes;
 
+const DIRECT_CURSOR_RETRY_AFTER_SUCCESSOR_EVENTS: u8 = 2;
+
 pub(in crate::kms::render::backend) fn scanout_m2_is_authoritative_root(
     target: ScanoutM0Target,
     root_coverage: bool,
@@ -271,7 +273,21 @@ impl KmsBackend {
     /// portable.
     pub(in crate::kms::render::backend) fn direct_cursor_eligible(&self) -> bool {
         if self.effective_cursor_hidden() {
-            return !self.platform.any_cursor_plane_visible();
+            return !self.platform.any_cursor_plane_visible()
+                || (self.pstate.scanout_m2.active()
+                    && self
+                        .platform
+                        .outputs
+                        .iter()
+                        .enumerate()
+                        .all(|(output_idx, _)| {
+                            !self.platform.cursor_plane_visible_for_output(output_idx)
+                                || self
+                                    .pstate
+                                    .scanout_m2
+                                    .direct_cursor_refresh_pending
+                                    .contains(&output_idx)
+                        }));
         }
         matches!(
             self.scene.cursor_mode(),
@@ -392,7 +408,9 @@ impl KmsBackend {
             if failed || !scene_synced {
                 self.request_direct_unflip("cursor_hide_failed");
             } else {
-                self.pstate.scanout_m2.direct_cursor_refresh_pending.clear();
+                self.pstate
+                    .scanout_m2
+                    .clear_all_direct_cursor_refresh_pending();
                 self.pstate.scanout_m2.cursor_bound_all = true;
             }
             return;
@@ -414,14 +432,12 @@ impl KmsBackend {
                 Ok(()) => {
                     self.pstate
                         .scanout_m2
-                        .direct_cursor_refresh_pending
-                        .remove(&output_idx);
+                        .clear_direct_cursor_refresh_pending(output_idx);
                 }
                 Err(error) if error.is_deferred() => {
                     self.pstate
                         .scanout_m2
-                        .direct_cursor_refresh_pending
-                        .insert(output_idx);
+                        .mark_direct_cursor_refresh_pending(output_idx);
                     log::debug!(
                         "scanout_m2: direct cursor bind deferred on output {output_idx}; retrying on CRTC event"
                     );
@@ -494,8 +510,7 @@ impl KmsBackend {
             Ok(CursorUploadOutcome::Deferred) => {
                 self.pstate
                     .scanout_m2
-                    .direct_cursor_refresh_pending
-                    .insert(output_idx);
+                    .mark_direct_cursor_refresh_pending(output_idx);
                 log::debug!(
                     "scanout_m2: direct cursor upload deferred on output {output_idx}; retrying on CRTC event"
                 );
@@ -515,14 +530,12 @@ impl KmsBackend {
             Ok(()) => {
                 self.pstate
                     .scanout_m2
-                    .direct_cursor_refresh_pending
-                    .remove(&output_idx);
+                    .clear_direct_cursor_refresh_pending(output_idx);
             }
             Err(error) if error.is_deferred() => {
                 self.pstate
                     .scanout_m2
-                    .direct_cursor_refresh_pending
-                    .insert(output_idx);
+                    .mark_direct_cursor_refresh_pending(output_idx);
                 log::debug!(
                     "scanout_m2: direct cursor show deferred on output {output_idx}; retrying on CRTC event"
                 );
@@ -535,6 +548,26 @@ impl KmsBackend {
             }
         }
         true
+    }
+
+    fn retry_due_direct_cursor_refreshes_before_successor(&mut self) {
+        let due_outputs: Vec<_> = self
+            .pstate
+            .scanout_m2
+            .direct_cursor_refresh_pending
+            .iter()
+            .copied()
+            .filter(|output_idx| {
+                self.pstate
+                    .scanout_m2
+                    .direct_cursor_refresh_successor_deferrals
+                    .get(output_idx)
+                    .is_some_and(|count| *count >= DIRECT_CURSOR_RETRY_AFTER_SUCCESSOR_EVENTS)
+            })
+            .collect();
+        for output_idx in due_outputs {
+            self.retry_pending_direct_cursor_refresh(output_idx, true);
+        }
     }
 
     fn retry_pending_direct_cursor_refresh(
@@ -553,12 +586,23 @@ impl KmsBackend {
             return;
         }
         if self.pstate.tearing.is_on() {
-            self.pstate.scanout_m2.direct_cursor_refresh_pending.clear();
+            self.pstate
+                .scanout_m2
+                .clear_all_direct_cursor_refresh_pending();
             return;
         }
-        // A grouped direct successor has priority over cursor-only work on
-        // every output. Retry when that output's later event arrives.
-        if self.pstate.scanout_m2.queued_successor.is_some()
+        // Keep direct frames first for the first two successor events. Once
+        // the per-output bound is reached, retry before submitting that
+        // successor so the cursor commit gets one CRTC event to retire.
+        let successor_deferrals = self
+            .pstate
+            .scanout_m2
+            .direct_cursor_refresh_successor_deferrals
+            .get(&output_idx)
+            .copied()
+            .unwrap_or(0);
+        if (self.pstate.scanout_m2.queued_successor.is_some()
+            && successor_deferrals < DIRECT_CURSOR_RETRY_AFTER_SUCCESSOR_EVENTS)
             || (self.pstate.scanout_m2.pending.is_some() && !direct_frame_retired)
         {
             return;
@@ -568,8 +612,7 @@ impl KmsBackend {
                 Ok(()) => {
                     self.pstate
                         .scanout_m2
-                        .direct_cursor_refresh_pending
-                        .remove(&output_idx);
+                        .clear_direct_cursor_refresh_pending(output_idx);
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     log::debug!(
@@ -593,8 +636,7 @@ impl KmsBackend {
         let Some(xid) = self.effective_cursor_xid else {
             self.pstate
                 .scanout_m2
-                .direct_cursor_refresh_pending
-                .remove(&output_idx);
+                .clear_direct_cursor_refresh_pending(output_idx);
             return;
         };
         let Some(record) = self.cursor_records.get(&xid).cloned() else {
@@ -963,7 +1005,9 @@ impl KmsBackend {
         }
         self.pstate.scanout_m2.hold_direct = false;
         self.pstate.scanout_m2.cursor_bound_all = false;
-        self.pstate.scanout_m2.direct_cursor_refresh_pending.clear();
+        self.pstate
+            .scanout_m2
+            .clear_all_direct_cursor_refresh_pending();
         self.pstate.scanout_m2.unflip_requested = false;
         self.pstate.scanout_m2.unflip_reason = None;
         self.pstate.scanout_m2.unflip_last_reason = None;
@@ -1588,10 +1632,11 @@ impl KmsBackend {
                     .as_ref()
                     .map_or(0, |frame| frame.source_id.as_u64())
             );
+            self.retry_due_direct_cursor_refreshes_before_successor();
             // Like Xorg's present_flip_try_ready and wlroots' frame_pending
             // gate, submit a queued successor as soon as the prior grouped
-            // transaction retires. Cursor-only retries run after this event
-            // handling so they cannot occupy a CRTC ahead of that successor.
+            // transaction retires unless a bounded cursor retry just won a
+            // CRTC event.
             self.submit_queued_direct_successor();
             if self.pstate.scanout_m2.queued_successor.is_none()
                 && self.pstate.scanout_m2.pending.is_none()
@@ -2558,12 +2603,30 @@ impl KmsBackend {
             if timestamps.commit_id.is_some() && matched_event_id.is_none() {
                 continue;
             }
+            if queued_successor_before_event
+                && self
+                    .pstate
+                    .scanout_m2
+                    .direct_cursor_refresh_pending
+                    .contains(&output_idx)
+            {
+                let count = self
+                    .pstate
+                    .scanout_m2
+                    .direct_cursor_refresh_successor_deferrals
+                    .entry(output_idx)
+                    .or_default();
+                *count = count
+                    .saturating_add(1)
+                    .min(DIRECT_CURSOR_RETRY_AFTER_SUCCESSOR_EVENTS);
+            }
             let cursor_commit_retired =
                 self.record_atomic_cursor_commit_retirement(output_idx, matched_event_id);
             if cursor_commit_retired {
                 if self.pstate.scanout_m2.pending.is_none()
                     && self.pstate.scanout_m2.queued_successor.is_some()
                 {
+                    self.retry_due_direct_cursor_refreshes_before_successor();
                     self.submit_queued_direct_successor();
                 }
                 if self

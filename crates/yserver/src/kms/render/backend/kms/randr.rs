@@ -1140,7 +1140,9 @@ impl KmsBackend {
         if !rescan.dropped_old_indices.is_empty() {
             // Output indices are compacted during topology changes, so a
             // pending direct-cursor retry keyed by the old index is stale.
-            self.pstate.scanout_m2.direct_cursor_refresh_pending.clear();
+            self.pstate
+                .scanout_m2
+                .clear_all_direct_cursor_refresh_pending();
         }
 
         // Any active-output removal was quiesced against the old authoritative

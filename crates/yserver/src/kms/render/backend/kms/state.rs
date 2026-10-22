@@ -276,6 +276,9 @@ pub(in crate::kms::render::backend) struct ScanoutM2State {
     /// Output indices whose direct cursor image/show must be retried after
     /// that CRTC releases its current cursor commit.
     pub(in crate::kms::render::backend) direct_cursor_refresh_pending: HashSet<usize>,
+    /// Successor events that have deferred each pending direct cursor retry.
+    pub(in crate::kms::render::backend) direct_cursor_refresh_successor_deferrals:
+        HashMap<usize, u8>,
     pub(in crate::kms::render::backend) unflip_requested: bool,
     /// First request in the current direct-to-composed transition. This is
     /// the causal trigger; later composite ticks must not overwrite it.
@@ -314,6 +317,7 @@ impl ScanoutM2State {
             hold_direct: false,
             cursor_bound_all: false,
             direct_cursor_refresh_pending: HashSet::new(),
+            direct_cursor_refresh_successor_deferrals: HashMap::new(),
             unflip_requested: false,
             unflip_reason: None,
             unflip_last_reason: None,
@@ -330,6 +334,30 @@ impl ScanoutM2State {
 
     pub(in crate::kms::render::backend) fn active(&self) -> bool {
         self.pending.is_some() || self.queued_successor.is_some() || self.current.is_some()
+    }
+
+    pub(in crate::kms::render::backend) fn mark_direct_cursor_refresh_pending(
+        &mut self,
+        output_idx: usize,
+    ) {
+        if self.direct_cursor_refresh_pending.insert(output_idx) {
+            self.direct_cursor_refresh_successor_deferrals
+                .remove(&output_idx);
+        }
+    }
+
+    pub(in crate::kms::render::backend) fn clear_direct_cursor_refresh_pending(
+        &mut self,
+        output_idx: usize,
+    ) {
+        self.direct_cursor_refresh_pending.remove(&output_idx);
+        self.direct_cursor_refresh_successor_deferrals
+            .remove(&output_idx);
+    }
+
+    pub(in crate::kms::render::backend) fn clear_all_direct_cursor_refresh_pending(&mut self) {
+        self.direct_cursor_refresh_pending.clear();
+        self.direct_cursor_refresh_successor_deferrals.clear();
     }
 
     pub(in crate::kms::render::backend) fn admit_eligible_root(&mut self) -> bool {
