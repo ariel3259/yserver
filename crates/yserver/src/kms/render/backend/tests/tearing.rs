@@ -1908,6 +1908,7 @@ fn non_async_authoritative_present_resets_probation_during_reentry_barrier() {
         .expect("toggle root overlay while direct scanout is active");
     assert!(!backend.scene.root_overlay.is_empty());
     Backend::maybe_composite(&mut backend).expect("submit grouped composed unflip");
+    drive_pending_unflip_to_submission(&mut backend, &mut state);
     assert!(backend.pstate.scanout_m2.unflip_requested);
     assert!(
         !backend
@@ -3202,7 +3203,13 @@ fn retire_composed_frame(
     use std::os::fd::{AsFd as _, AsRawFd as _};
     use yserver_core::backend::Backend;
 
-    backend.platform.wait_idle_bounded();
+    if backend.pstate.scanout_m2.unflip_requested
+        || backend.pstate.scanout_m2.composed_unflip.is_some()
+    {
+        drive_pending_unflip_to_submission(backend, state);
+    } else {
+        backend.platform.wait_idle_bounded();
+    }
     for output in &backend.platform.outputs {
         backend.platform.devices[0]
             .test_page_flip_event_source
@@ -3212,6 +3219,51 @@ fn retire_composed_frame(
     }
     let drm_fd = backend.platform.devices[0].device.as_fd().as_raw_fd();
     Backend::on_page_flip_ready(backend, state, drm_fd);
+}
+
+fn drive_pending_unflip_to_submission(
+    backend: &mut KmsBackend,
+    state: &mut yserver_core::server::ServerState,
+) {
+    use yserver_core::backend::Backend;
+
+    if !backend.pstate.scanout_m2.unflip_requested
+        && backend.pstate.scanout_m2.composed_unflip.is_none()
+    {
+        return;
+    }
+    for _ in 0..3 {
+        if !backend
+            .pstate
+            .scanout_m2
+            .unflip_outputs_to_replace
+            .is_empty()
+        {
+            return;
+        }
+        if backend.pstate.scanout_m2.composed_unflip.is_none() {
+            Backend::maybe_composite(backend).expect("start composed unflip");
+        }
+        if !backend
+            .pstate
+            .scanout_m2
+            .unflip_outputs_to_replace
+            .is_empty()
+        {
+            return;
+        }
+        backend.platform.wait_idle_bounded();
+        Backend::on_scanout_render_completion(backend, state);
+        Backend::maybe_composite(backend).expect("submit ready composed unflip");
+    }
+    assert!(
+        !backend
+            .pstate
+            .scanout_m2
+            .unflip_outputs_to_replace
+            .is_empty(),
+        "render readiness must reach an accepted unflip before page-flip events are injected"
+    );
 }
 
 fn assert_scene_async_vsync_pair(
@@ -3412,6 +3464,7 @@ fn p2_tearing_cursor_handoff_transitions_cursor_once() {
     assert!(backend.platform.any_cursor_plane_visible());
     let unflip_start = recorder.records().len();
     Backend::maybe_composite(&mut backend).expect("prepare visible cursor handoff");
+    drive_pending_unflip_to_submission(&mut backend, &mut state);
     assert!(backend.pstate.scanout_m2.unflip_requested);
     assert_eq!(
         backend.pstate.scanout_m2.unflip_reason,
@@ -3589,6 +3642,7 @@ fn entry_from_held_direct_with_visible_hw_cursor_runs_handoff() {
     );
 
     Backend::maybe_composite(&mut backend).expect("submit grouped cursor handoff");
+    drive_pending_unflip_to_submission(&mut backend, &mut state);
     assert!(backend.pstate.scanout_m2.current.is_some());
     assert!(
         !backend
@@ -3962,6 +4016,7 @@ fn handoff_keeps_newest_copy_not_retained_direct_frame() {
     peer = next_peer;
     observed_completions.extend(completions);
     let _keep_client_alive = peer;
+    drive_pending_unflip_to_submission(&mut backend, &mut state);
     let ordered_direct_events: Vec<_> = observed_completions
         .iter()
         .filter(|event| event.serial >= direct_start_serial)

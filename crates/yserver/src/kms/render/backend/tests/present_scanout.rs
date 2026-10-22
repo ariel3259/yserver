@@ -17,6 +17,15 @@ fn mark_active_fallback_ready_for_test(backend: &mut KmsBackend) {
         .insert(target);
 }
 
+fn drain_unflip_render_readiness(
+    backend: &mut KmsBackend,
+    state: &mut yserver_core::server::ServerState,
+) {
+    backend.platform.wait_idle_bounded();
+    yserver_core::backend::Backend::on_scanout_render_completion(backend, state);
+    yserver_core::backend::Backend::maybe_composite(backend).expect("submit ready composed unflip");
+}
+
 fn output_crtc_key(backend: &KmsBackend, output_idx: usize) -> CrtcKey {
     CrtcKey::for_output(&backend.platform.outputs[output_idx])
 }
@@ -2887,7 +2896,20 @@ fn cursor_einval_rolls_back_and_hide_recovery_is_motion_driven_and_bounded() {
 
     install_renderable_cursor_scanout_pools(&mut recovered_backend);
     mark_active_fallback_ready_for_test(&mut recovered_backend);
+    let readiness_gate =
+        std::rc::Rc::new(crate::kms::render::platform::RecordingPreparedUnflipReadiness::default());
+    readiness_gate.hold_output(1);
+    recovered_backend
+        .platform
+        .for_tests_set_prepared_unflip_readiness(readiness_gate.clone());
     Backend::maybe_composite(&mut recovered_backend).expect("submit cursorless composed unflip");
+    assert_eq!(
+        recorder.records().len(),
+        2,
+        "the grouped replacement waits while one output's prepared readiness is held",
+    );
+    readiness_gate.release_output(1);
+    drain_unflip_render_readiness(&mut recovered_backend, &mut recovered_state);
     assert_eq!(recorder.records().len(), 3);
     assert_atomic_cursorless_scene_record(&recorder.records()[2], position);
     assert_eq!(
@@ -3577,6 +3599,7 @@ fn direct_successor_waits_for_retirement_and_carries_motion() {
     assert_eq!(recorder.records().len(), 4);
     retire_atomic_cursor_test_output(&mut backend, &mut state, 1, 3);
     Backend::maybe_composite(&mut backend).expect("submit grouped composed unflip");
+    drain_unflip_render_readiness(&mut backend, &mut state);
     let records = recorder.records();
     assert_eq!(records.len(), 5);
     assert_eq!(
@@ -4048,7 +4071,9 @@ fn shape_triggered_composed_unflip_records_cursor_positions_for_both_outputs() {
         Some("shape_clips_direct_frame")
     );
 
-    Backend::maybe_composite(&mut backend).expect("submit composed unflip");
+    Backend::maybe_composite(&mut backend).expect("prepare composed unflip");
+    let mut state = ServerState::new();
+    drain_unflip_render_readiness(&mut backend, &mut state);
 
     let records = recorder.records();
     assert_eq!(records.len(), 1);
@@ -4066,7 +4091,6 @@ fn shape_triggered_composed_unflip_records_cursor_positions_for_both_outputs() {
             .platform
             .for_tests_atomic_position_is_unsent(position.device_key, position.crtc)
     }));
-    let mut state = ServerState::new();
     retire_atomic_cursor_test_output(&mut backend, &mut state, 0, 1);
     retire_atomic_cursor_test_output(&mut backend, &mut state, 1, 1);
     super::commit_identity::direct_unflip::assert_issue281_unflip_backend_end_state(&backend);

@@ -192,7 +192,8 @@ fn finish_held_direct_cursor_test(
     assert!(backend.pstate.scanout_m2.unflip_requested);
     assert!(!backend.pstate.scanout_m2.hold_direct);
     let before_unflip = recorder.records().len();
-    Backend::maybe_composite(backend).expect("submit composed replacement for direct scanout");
+    Backend::maybe_composite(backend).expect("prepare composed replacement for direct scanout");
+    drive_pending_unflip_to_submission(backend, state);
     let records = recorder.records();
     assert_eq!(records.len(), before_unflip + 1);
     assert_eq!(
@@ -1222,7 +1223,8 @@ fn task5_handoff_unflip_starts_cursor_compose_interval() {
         backend.pstate.scanout_m2.unflip_reason,
         Some("tearing_cursor_handoff")
     );
-    Backend::maybe_composite(&mut backend).expect("submit grouped cursor handoff");
+    Backend::maybe_composite(&mut backend).expect("prepare grouped cursor handoff");
+    drive_pending_unflip_to_submission(&mut backend, &mut state);
     assert_eq!(recorder.records().len(), 1);
     assert_eq!(recorder.records()[0].kind, AtomicCommitKind::Scene);
     assert!(backend.pstate.scanout_m2.current.is_some());

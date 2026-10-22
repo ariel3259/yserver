@@ -352,7 +352,10 @@ fn grouped_unflip_record(
     offset: usize,
     output_count: usize,
 ) -> AtomicCommitRecord {
-    Backend::maybe_composite(&mut fixture.events.backend).expect("submit grouped unflip");
+    Backend::maybe_composite(&mut fixture.events.backend).expect("prepare grouped unflip");
+    fixture.events.wait_for_submitted_gpu_work();
+    Backend::on_scanout_render_completion(&mut fixture.events.backend, &mut fixture.events.state);
+    Backend::maybe_composite(&mut fixture.events.backend).expect("advance ready grouped unflip");
     records_since(fixture, device_fd, offset)
         .into_iter()
         .find(|record| record.events.len() == output_count && accepted_event_id(record).is_some())
@@ -1021,7 +1024,11 @@ fn issue281_cancellation_with_none_dependency_recycles_inline() {
         .script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
     fixture.events.recorders[&device_fd].script_result(Ok(()));
     Backend::maybe_composite(&mut fixture.events.backend)
-        .expect("reject the group and submit the safe per-output fallback");
+        .expect("prepare the group before its rejection");
+    fixture.events.wait_for_submitted_gpu_work();
+    Backend::on_scanout_render_completion(&mut fixture.events.backend, &mut fixture.events.state);
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("submit the safe per-output fallback after render readiness");
     let attempts = records_since(&fixture, device_fd, offset);
     let rejected = attempts
         .iter()
@@ -1092,6 +1099,9 @@ fn issue281_group_waits_for_every_render_and_retires_once() {
         .script_result(Err(std::io::Error::from_raw_os_error(libc::EBUSY)));
     fixture.events.recorders[&device_fd].script_result(Ok(()));
     Backend::maybe_composite(&mut fixture.events.backend).expect("prepare EBUSY retry");
+    fixture.events.wait_for_submitted_gpu_work();
+    Backend::on_scanout_render_completion(&mut fixture.events.backend, &mut fixture.events.state);
+    Backend::maybe_composite(&mut fixture.events.backend).expect("submit the ready EBUSY attempt");
     let rejected = records_since(&fixture, device_fd, offset)
         .into_iter()
         .find(|record| record.events.len() == 2 && record.result != ScriptedResult::Ok)
@@ -2396,7 +2406,11 @@ fn issue281_pending_unflip_survives_rejection_and_lifecycle() {
         .script_result(Err(std::io::Error::from_raw_os_error(libc::EBUSY)));
     fixture.events.recorders[&device_fd].script_result(Ok(()));
     Backend::maybe_composite(&mut fixture.events.backend)
-        .expect("prepare and observe one transient grouped rejection");
+        .expect("prepare the transient grouped attempt");
+    fixture.events.wait_for_submitted_gpu_work();
+    Backend::on_scanout_render_completion(&mut fixture.events.backend, &mut fixture.events.state);
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("observe the transient rejection after render readiness");
     let rejected = records_since(&fixture, device_fd, record_offset)
         .into_iter()
         .find(|record| record.events.len() == 2 && record.result != ScriptedResult::Ok)
@@ -3047,7 +3061,14 @@ fn issue281_pending_unflip_survives_rejection_and_lifecycle() {
         request_unflip(&mut fixture, &direct);
         let group_offset = record_count(&fixture, device_fd);
         Backend::maybe_composite(&mut fixture.events.backend)
-            .expect("accept fresh unflip before lifecycle quiescence");
+            .expect("prepare fresh unflip before lifecycle quiescence");
+        fixture.events.wait_for_submitted_gpu_work();
+        Backend::on_scanout_render_completion(
+            &mut fixture.events.backend,
+            &mut fixture.events.state,
+        );
+        Backend::maybe_composite(&mut fixture.events.backend)
+            .expect("accept fresh unflip after render readiness");
         let group = records_since(&fixture, device_fd, group_offset)
             .into_iter()
             .find(|record| accepted_event_id(record).is_some())
@@ -4261,7 +4282,10 @@ fn p1_degraded_shared_unflip_waits_for_accepted_replacements() {
     recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
     recorder.script_result(Ok(()));
     recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
-    Backend::maybe_composite(&mut fixture.events.backend).expect("degrade grouped unflip");
+    Backend::maybe_composite(&mut fixture.events.backend).expect("prepare grouped unflip");
+    fixture.events.wait_for_submitted_gpu_work();
+    Backend::on_scanout_render_completion(&mut fixture.events.backend, &mut fixture.events.state);
+    Backend::maybe_composite(&mut fixture.events.backend).expect("degrade ready grouped unflip");
     let rejected_group = records_since(&fixture, device_fd, offset);
     let failed_group = rejected_group
         .iter()
