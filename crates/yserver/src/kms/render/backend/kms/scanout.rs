@@ -392,6 +392,7 @@ impl KmsBackend {
             if failed || !scene_synced {
                 self.request_direct_unflip("cursor_hide_failed");
             } else {
+                self.pstate.scanout_m2.direct_cursor_refresh_pending.clear();
                 self.pstate.scanout_m2.cursor_bound_all = true;
             }
             return;
@@ -406,14 +407,31 @@ impl KmsBackend {
         let y = self.core.cursor_y as i32;
         let mut failed = false;
         for output_idx in 0..self.platform.outputs.len() {
-            if let Err(error) = self
+            match self
                 .platform
                 .cursor_plane_show_on_crtc(output_idx, hot_x, hot_y, x, y)
             {
-                failed = true;
-                log::warn!(
-                    "scanout_m2: cursor bind failed on output {output_idx}: {error}; unflipping"
-                );
+                Ok(()) => {
+                    self.pstate
+                        .scanout_m2
+                        .direct_cursor_refresh_pending
+                        .remove(&output_idx);
+                }
+                Err(error) if error.is_deferred() => {
+                    self.pstate
+                        .scanout_m2
+                        .direct_cursor_refresh_pending
+                        .insert(output_idx);
+                    log::debug!(
+                        "scanout_m2: direct cursor bind deferred on output {output_idx}; retrying on CRTC event"
+                    );
+                }
+                Err(error) => {
+                    failed = true;
+                    log::warn!(
+                        "scanout_m2: cursor bind failed on output {output_idx}: {error}; unflipping"
+                    );
+                }
             }
         }
         let scene_synced = self.sync_direct_cursor_scene_state();
@@ -446,7 +464,7 @@ impl KmsBackend {
         let y = self.core.cursor_y as i32;
         let mut failed = false;
         for output_idx in 0..self.platform.outputs.len() {
-            let upload_failure = match self.platform.cursor_plane_upload_image_for_output(
+            let upload = self.platform.cursor_plane_upload_image_for_output(
                 output_idx,
                 record.version,
                 record.hot_x,
@@ -454,35 +472,89 @@ impl KmsBackend {
                 u32::from(record.width),
                 u32::from(record.height),
                 &record.bgra_bytes,
-            ) {
-                Ok(CursorUploadOutcome::Ready) => None,
-                Ok(CursorUploadOutcome::Deferred) => Some(String::from("cursor upload deferred")),
-                Err(error) => Some(error.to_string()),
-            };
-            if let Some(error) = upload_failure {
-                log::warn!(
-                    "scanout_m2: direct cursor upload failed on output {output_idx}: {error}; unflipping"
-                );
-                failed = true;
-                break;
+            );
+            match upload {
+                Ok(CursorUploadOutcome::Ready) => {}
+                Ok(CursorUploadOutcome::Deferred) => {
+                    self.pstate
+                        .scanout_m2
+                        .direct_cursor_refresh_pending
+                        .insert(output_idx);
+                    log::debug!(
+                        "scanout_m2: direct cursor upload deferred on output {output_idx}; retrying on CRTC event"
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    log::warn!(
+                        "scanout_m2: direct cursor upload failed on output {output_idx}: {error}; unflipping"
+                    );
+                    failed = true;
+                    break;
+                }
             }
-            if let Err(error) = self.platform.cursor_plane_show_on_crtc(
+            match self.platform.cursor_plane_show_on_crtc(
                 output_idx,
                 record.hot_x,
                 record.hot_y,
                 x,
                 y,
             ) {
-                log::warn!(
-                    "scanout_m2: direct cursor show failed on output {output_idx}: {error}; unflipping"
-                );
-                failed = true;
-                break;
+                Ok(()) => {
+                    self.pstate
+                        .scanout_m2
+                        .direct_cursor_refresh_pending
+                        .remove(&output_idx);
+                }
+                Err(error) if error.is_deferred() => {
+                    self.pstate
+                        .scanout_m2
+                        .direct_cursor_refresh_pending
+                        .insert(output_idx);
+                    log::debug!(
+                        "scanout_m2: direct cursor show deferred on output {output_idx}; retrying on CRTC event"
+                    );
+                }
+                Err(error) => {
+                    log::warn!(
+                        "scanout_m2: direct cursor show failed on output {output_idx}: {error}; unflipping"
+                    );
+                    failed = true;
+                    break;
+                }
             }
         }
         let scene_synced = self.sync_direct_cursor_scene_state();
         self.pstate.scanout_m2.cursor_bound_all = !failed && scene_synced;
         !failed && scene_synced
+    }
+
+    fn retry_pending_direct_cursor_refresh(&mut self) {
+        if self
+            .pstate
+            .scanout_m2
+            .direct_cursor_refresh_pending
+            .is_empty()
+            || !self.pstate.scanout_m2.active()
+            || self.pstate.scanout_m2.unflip_requested
+        {
+            return;
+        }
+        if self.pstate.tearing.is_on() || self.effective_cursor_hidden() {
+            self.pstate.scanout_m2.direct_cursor_refresh_pending.clear();
+            return;
+        }
+        let Some(xid) = self.effective_cursor_xid else {
+            self.pstate.scanout_m2.direct_cursor_refresh_pending.clear();
+            return;
+        };
+        let Some(record) = self.cursor_records.get(&xid).cloned() else {
+            self.request_direct_unflip("cursor_show_failed");
+            return;
+        };
+        if !self.refresh_direct_cursor_on_all_outputs(&record) {
+            self.request_direct_unflip("cursor_show_failed");
+        }
     }
 
     fn pin_present_wake_for_direct(
@@ -834,6 +906,7 @@ impl KmsBackend {
         }
         self.pstate.scanout_m2.hold_direct = false;
         self.pstate.scanout_m2.cursor_bound_all = false;
+        self.pstate.scanout_m2.direct_cursor_refresh_pending.clear();
         self.pstate.scanout_m2.unflip_requested = false;
         self.pstate.scanout_m2.unflip_reason = None;
         self.pstate.scanout_m2.unflip_last_reason = None;
@@ -1459,6 +1532,9 @@ impl KmsBackend {
                     .map_or(0, |frame| frame.source_id.as_u64())
             );
             self.bind_direct_cursor_on_all_outputs();
+            // Retry deferred cursor work before the queued successor can
+            // occupy the cursor-only commit slot on any CRTC.
+            self.retry_pending_direct_cursor_refresh();
             // Like Xorg's present_flip_try_ready and wlroots' frame_pending
             // gate, submit at most one successor only after the kernel has
             // retired the preceding transaction.
@@ -2422,7 +2498,17 @@ impl KmsBackend {
             if timestamps.commit_id.is_some() && matched_event_id.is_none() {
                 continue;
             }
-            self.record_atomic_cursor_commit_retirement(output_idx, matched_event_id);
+            let cursor_commit_retired =
+                self.record_atomic_cursor_commit_retirement(output_idx, matched_event_id);
+            if cursor_commit_retired
+                && self
+                    .pstate
+                    .scanout_m2
+                    .direct_cursor_refresh_pending
+                    .contains(&output_idx)
+            {
+                self.retry_pending_direct_cursor_refresh();
+            }
             let direct_retired = self.retire_direct_output(output_idx, matched_event_id, clock);
             let scene_retired = !direct_retired
                 && self.scene.handle_page_flip_complete(
@@ -2497,17 +2583,19 @@ impl KmsBackend {
         &mut self,
         output_idx: usize,
         matched_event_id: Option<u64>,
-    ) {
-        self.platform
+    ) -> bool {
+        let retired = self
+            .platform
             .retire_atomic_cursor_commit_for_output(output_idx, matched_event_id);
         let Some(layout) = self.platform.outputs.get(output_idx) else {
-            return;
+            return retired;
         };
         if let Some(device) = self.platform.device_for_output(&layout.key) {
             device
                 .atomic_commit_sink
                 .note_cursor_commit_retired(layout.output.crtc, std::time::Instant::now());
         }
+        retired
     }
 
     fn prepare_tearing_scene_pass(&mut self) {

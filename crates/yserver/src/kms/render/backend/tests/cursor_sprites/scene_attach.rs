@@ -1980,44 +1980,178 @@ fn accept_direct_cursor_replacement(
     record
 }
 
-fn drive_requested_unflip(
-    fixture: &mut AtomicPathFixture,
-    delivered: &mut HashSet<super::support::CompletionKey>,
-) {
-    for _ in 0..8 {
-        Backend::before_block(&mut fixture.scene.events.backend);
-        damage_root(fixture);
-        Backend::maybe_composite(&mut fixture.scene.events.backend)
-            .expect("drive held-direct unflip through Backend");
-        drain_unretired_output_events(fixture, delivered, 0);
-        if !fixture.scene.events.backend.pstate.scanout_m2.active()
-            && !fixture
-                .scene
-                .events
-                .backend
-                .pstate
-                .scanout_m2
-                .unflip_requested
-            && !fixture
-                .scene
-                .events
-                .backend
-                .platform
-                .any_cursor_commit_in_flight()
-        {
-            return;
-        }
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: request an unflip for CursorShowError::Deferred; the direct-state assertion must fail.
+fn direct_deferred_cursor_show_keeps_direct_and_retries_on_event() {
+    let Some((mut fixture, mut delivered, hardware, _direct)) = held_direct_with_cursor(703) else {
+        return;
+    };
+    let recorder = Rc::clone(&fixture.scene.events.recorders[&hardware.device_fd]);
+    let properties = super::support::cursor_properties_for_output(&fixture.scene.events.backend, 0);
+
+    Backend::warp_pointer_root(
+        &mut fixture.scene.events.backend,
+        &mut fixture.scene.events.state,
+        140,
+        120,
+    );
+    let move_start = record_count(&fixture, hardware.device_fd);
+    Backend::maybe_composite(&mut fixture.scene.events.backend)
+        .expect("submit the direct cursor position commit");
+    let position = accepted_live_records(&recorder)
+        .into_iter()
+        .skip(move_start)
+        .find(|record| {
+            record.kind == AtomicCommitKind::CursorOnly
+                && record_property(record, properties.crtc_x).is_some()
+                && record_property(record, properties.fb_id).is_none()
+        })
+        .expect("direct scanout accepts a position-only cursor commit");
+
+    let cursor_b = create_argb_cursor(
+        &mut fixture.scene.events.backend,
+        (4, 4),
+        [49, 50, 51, 255],
+        (1, 2),
+    );
+    let cursor_b_id = cursor_b.as_raw();
+    define_root_cursor(&mut fixture.scene.events.backend, cursor_b);
+    let version_b = fixture.scene.events.backend.cursor_records[&cursor_b_id].version;
+    assert_eq!(
+        fixture.scene.events.backend.platform.devices[0]
+            .cursor
+            .plane
+            .as_ref()
+            .unwrap()
+            .sprites()
+            .for_tests_last_prepare_outcome(),
+        Some(crate::kms::cursor_plane::sprites::SpriteStage::Ready),
+        "the image is prepared before the in-flight show is deferred"
+    );
+
+    Backend::warp_pointer_root(
+        &mut fixture.scene.events.backend,
+        &mut fixture.scene.events.state,
+        220,
+        170,
+    );
+    let stayed_direct = fixture.scene.events.backend.pstate.scanout_m2.active()
+        && !fixture
+            .scene
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .unflip_requested;
+
+    let retry_start = record_count(&fixture, hardware.device_fd);
+    retire_cursor_record(&mut fixture, &mut delivered, 0, &position, 11);
+    let refreshed = accepted_live_records(&recorder)
+        .into_iter()
+        .skip(retry_start)
+        .rev()
+        .find(|record| {
+            record.kind == AtomicCommitKind::CursorOnly
+                && record_property(record, properties.fb_id).is_some_and(|fb| fb != 0)
+                && record_property(record, properties.crtc_x).is_some()
+        });
+    let retried_latest = refreshed.as_ref().is_some_and(|record| {
+        applied_cursor_binding(&fixture.scene.events.backend, 0)
+            .is_some_and(|binding| binding.lease.version() == version_b)
+            && record_property(record, properties.crtc_x) == Some(219)
+            && record_property(record, properties.crtc_y) == Some(168)
+    });
+    if let Some(refreshed) = refreshed.as_ref() {
+        retire_cursor_record(&mut fixture, &mut delivered, 0, refreshed, 12);
     }
-    panic!("held-direct cursor refresh did not complete its requested unflip");
+    if fixture.scene.events.backend.pstate.scanout_m2.active() {
+        fixture
+            .scene
+            .events
+            .backend
+            .stop_direct_after_scanout_replaced("test teardown");
+    }
+
+    let detach = accept_cursor_detach(&mut fixture, &mut delivered, 0);
+    retire_cursor_record(&mut fixture, &mut delivered, 0, &detach, 13);
+    super::support::finish_atomic_fixture(fixture, &mut delivered);
+    assert!(
+        stayed_direct,
+        "a deferred cursor show must keep direct scanout active"
+    );
+    assert!(
+        retried_latest,
+        "the matching CRTC event retries the live image at the current pointer"
+    );
 }
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutations: gate staging behind the cursor-commit retry or overwrite a live sprite slot under pool pressure.
+// Mutation: treat a real atomic cursor show error as Deferred; this unflip assertion must fail.
+fn direct_cursor_real_error_still_unflips() {
+    let Some((mut fixture, mut delivered, hardware, _direct)) = held_direct_with_cursor(704) else {
+        return;
+    };
+    let recorder = Rc::clone(&fixture.scene.events.recorders[&hardware.device_fd]);
+    let properties = super::support::cursor_properties_for_output(&fixture.scene.events.backend, 0);
+    let record_start = record_count(&fixture, hardware.device_fd);
+    recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
+
+    let cursor_b = create_argb_cursor(
+        &mut fixture.scene.events.backend,
+        (4, 4),
+        [52, 53, 54, 255],
+        (1, 2),
+    );
+    define_root_cursor(&mut fixture.scene.events.backend, cursor_b);
+    let unflipped_on_error = fixture.scene.events.backend.pstate.scanout_m2.active()
+        && fixture
+            .scene
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .unflip_requested
+        && recorder
+            .records()
+            .into_iter()
+            .skip(record_start)
+            .any(|record| {
+                record.kind == AtomicCommitKind::CursorOnly
+                    && record_property(&record, properties.fb_id).is_some_and(|fb| fb != 0)
+                    && matches!(
+                        record.result,
+                        ScriptedResult::Error {
+                            raw_os_error: Some(errno),
+                            ..
+                        } if errno == libc::EIO
+                    )
+            });
+
+    if fixture.scene.events.backend.pstate.scanout_m2.active() {
+        fixture
+            .scene
+            .events
+            .backend
+            .stop_direct_after_scanout_replaced("test teardown");
+    }
+    super::support::finish_atomic_fixture(fixture, &mut delivered);
+    assert!(
+        unflipped_on_error,
+        "real cursor show errors must keep the unflip fallback"
+    );
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutations: skip the CRTC-event retry or overwrite a live sprite slot under pool pressure.
 fn p2_direct_refresh_reaches_pool_pressure_and_keeps_only_the_newest_wanted_image() {
     let Some((mut fixture, mut delivered, hardware, _direct)) = held_direct_with_cursor(701) else {
         return;
     };
+    let recorder = Rc::clone(&fixture.scene.events.recorders[&hardware.device_fd]);
+    let properties = super::support::cursor_properties_for_output(&fixture.scene.events.backend, 0);
     let binding_a = applied_cursor_binding(&fixture.scene.events.backend, 0).unwrap();
     let replacement = accept_direct_cursor_replacement(&mut fixture, hardware, [34, 35, 36, 255]);
     let binding_b = applied_cursor_binding(&fixture.scene.events.backend, 0).unwrap();
@@ -2077,13 +2211,23 @@ fn p2_direct_refresh_reaches_pool_pressure_and_keeps_only_the_newest_wanted_imag
         ))
     );
     assert!(
-        fixture
+        !fixture
             .scene
             .events
             .backend
             .pstate
             .scanout_m2
             .unflip_requested
+    );
+    assert!(
+        fixture
+            .scene
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .direct_cursor_refresh_pending
+            .contains(&0)
     );
     assert_eq!(
         sprite_users(&fixture.scene.events.backend, 0, binding_a.lease),
@@ -2154,24 +2298,67 @@ fn p2_direct_refresh_reaches_pool_pressure_and_keeps_only_the_newest_wanted_imag
         Some(bytes_b)
     );
 
+    let retry_start = record_count(&fixture, hardware.device_fd);
     retire_cursor_record(&mut fixture, &mut delivered, 0, &replacement, 9);
-    assert_eq!(
-        sprite_users(&fixture.scene.events.backend, 0, binding_a.lease),
-        Some(0)
+    assert!(
+        sprite_users(&fixture.scene.events.backend, 0, binding_a.lease)
+            .is_none_or(|users| users == 0)
     );
-    drive_requested_unflip(&mut fixture, &mut delivered);
+    let refreshed = accepted_live_records(&recorder)
+        .into_iter()
+        .skip(retry_start)
+        .find(|record| {
+            record.kind == AtomicCommitKind::CursorOnly
+                && record_property(record, properties.fb_id).is_some_and(|fb| fb != 0)
+        })
+        .expect("the matching CRTC event retries the newest deferred image");
+    assert_eq!(
+        applied_cursor_binding(&fixture.scene.events.backend, 0)
+            .expect("deferred image is applied after the old commit retires")
+            .lease
+            .version(),
+        fixture.scene.events.backend.cursor_records[&cursor_d_id].version
+    );
+    assert!(fixture.scene.events.backend.pstate.scanout_m2.active());
+    assert!(
+        !fixture
+            .scene
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .unflip_requested
+    );
+    assert!(
+        fixture
+            .scene
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .direct_cursor_refresh_pending
+            .is_empty()
+    );
+    retire_cursor_record(&mut fixture, &mut delivered, 0, &refreshed, 10);
+    fixture
+        .scene
+        .events
+        .backend
+        .stop_direct_after_scanout_replaced("test teardown");
     let detach = accept_cursor_detach(&mut fixture, &mut delivered, 0);
-    retire_cursor_record(&mut fixture, &mut delivered, 0, &detach, 10);
+    retire_cursor_record(&mut fixture, &mut delivered, 0, &detach, 11);
     super::support::finish_atomic_fixture(fixture, &mut delivered);
 }
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: report Deferred as direct-refresh success so unflip_requested is never set.
-fn p2_direct_hook_treats_deferred_as_failure_and_unflips() {
+// Mutation: keep Deferred as a direct-refresh failure; the state and retry assertions must fail.
+fn p2_direct_hook_keeps_scanout_until_deferred_refresh_retries() {
     let Some((mut fixture, mut delivered, hardware, _direct)) = held_direct_with_cursor(702) else {
         return;
     };
+    let recorder = Rc::clone(&fixture.scene.events.recorders[&hardware.device_fd]);
+    let properties = super::support::cursor_properties_for_output(&fixture.scene.events.backend, 0);
     let binding_a = applied_cursor_binding(&fixture.scene.events.backend, 0).unwrap();
     let replacement = accept_direct_cursor_replacement(&mut fixture, hardware, [43, 44, 45, 255]);
     let binding_b = applied_cursor_binding(&fixture.scene.events.backend, 0).unwrap();
@@ -2183,6 +2370,7 @@ fn p2_direct_hook_treats_deferred_as_failure_and_unflips() {
         [46, 47, 48, 255],
         (1, 2),
     );
+    let cursor_c_id = cursor_c.as_raw();
     define_root_cursor(&mut fixture.scene.events.backend, cursor_c);
     assert_eq!(
         fixture.scene.events.backend.platform.devices[0]
@@ -2195,13 +2383,23 @@ fn p2_direct_hook_treats_deferred_as_failure_and_unflips() {
         Some(crate::kms::cursor_plane::sprites::SpriteStage::Deferred)
     );
     assert!(
-        fixture
+        !fixture
             .scene
             .events
             .backend
             .pstate
             .scanout_m2
             .unflip_requested
+    );
+    assert!(
+        fixture
+            .scene
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .direct_cursor_refresh_pending
+            .contains(&0)
     );
     assert!(
         fixture
@@ -2228,9 +2426,40 @@ fn p2_direct_hook_treats_deferred_as_failure_and_unflips() {
         Some(bytes_b)
     );
 
+    let retry_start = record_count(&fixture, hardware.device_fd);
     retire_cursor_record(&mut fixture, &mut delivered, 0, &replacement, 9);
-    drive_requested_unflip(&mut fixture, &mut delivered);
+    let refreshed = accepted_live_records(&recorder)
+        .into_iter()
+        .skip(retry_start)
+        .find(|record| {
+            record.kind == AtomicCommitKind::CursorOnly
+                && record_property(record, properties.fb_id).is_some_and(|fb| fb != 0)
+        })
+        .expect("the matching CRTC event retries the deferred cursor image");
+    assert_eq!(
+        applied_cursor_binding(&fixture.scene.events.backend, 0)
+            .expect("cursor refresh is applied")
+            .lease
+            .version(),
+        fixture.scene.events.backend.cursor_records[&cursor_c_id].version
+    );
+    assert!(fixture.scene.events.backend.pstate.scanout_m2.active());
+    assert!(
+        !fixture
+            .scene
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .unflip_requested
+    );
+    retire_cursor_record(&mut fixture, &mut delivered, 0, &refreshed, 10);
+    fixture
+        .scene
+        .events
+        .backend
+        .stop_direct_after_scanout_replaced("test teardown");
     let detach = accept_cursor_detach(&mut fixture, &mut delivered, 0);
-    retire_cursor_record(&mut fixture, &mut delivered, 0, &detach, 10);
+    retire_cursor_record(&mut fixture, &mut delivered, 0, &detach, 11);
     super::support::finish_atomic_fixture(fixture, &mut delivered);
 }

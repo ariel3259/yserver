@@ -273,6 +273,9 @@ pub(in crate::kms::render::backend) struct ScanoutM2State {
     pub(in crate::kms::render::backend) idled: Vec<yserver_core::backend::CompletedPresentEvent>,
     pub(in crate::kms::render::backend) hold_direct: bool,
     pub(in crate::kms::render::backend) cursor_bound_all: bool,
+    /// Output indices whose direct cursor image/show must be retried after
+    /// that CRTC releases its current cursor commit.
+    pub(in crate::kms::render::backend) direct_cursor_refresh_pending: HashSet<usize>,
     pub(in crate::kms::render::backend) unflip_requested: bool,
     /// First request in the current direct-to-composed transition. This is
     /// the causal trigger; later composite ticks must not overwrite it.
@@ -310,6 +313,7 @@ impl ScanoutM2State {
             idled: Vec::new(),
             hold_direct: false,
             cursor_bound_all: false,
+            direct_cursor_refresh_pending: HashSet::new(),
             unflip_requested: false,
             unflip_reason: None,
             unflip_last_reason: None,
