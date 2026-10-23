@@ -28,8 +28,12 @@ Control: the same run with `DISPLAY` unset for the server only. The helper opens
 
 ## Change
 
-- The helper `Command` gets `.env_remove("DISPLAY")`. The rest of the environment is kept, because the Vulkan loader
-  may depend on it (`VK_ICD_FILENAMES`, `LD_LIBRARY_PATH`, …); `env_clear()` is ruled out for that reason.
+- The helper `Command` gets `.env_remove("DISPLAY")`. The rest of the environment is kept: the helper must select the
+  server's exact Vulkan device by its device and driver UUIDs (`NoMatchingDeviceUuid` otherwise,
+  `yserver-render/src/kms/vk/device.rs:1436-1444`), and the loader's device set depends on the environment
+  (`VK_DRIVER_FILES`, `LD_LIBRARY_PATH`, the `XDG_*`/`HOME` manifest search paths). Measured with `vulkaninfo`: the
+  lavapipe test environment lists only llvmpipe, `env -i` lists NVIDIA and RADV instead, and without `LD_LIBRARY_PATH`
+  no driver is found. `env_clear()` is ruled out for that reason.
 - The `Command` construction moves into one small function so a test can inspect it; the code stays the same.
 - The note in `specs/2026-07-14-reverse-prime-copy-design.md` says the helper runs without `DISPLAY`. The same note
   says that "continuing to service … other clients" does not hold under a `GrabServer`.
