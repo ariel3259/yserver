@@ -1,13 +1,22 @@
 use super::support::{AtomicEventFixture, accepted_event_id};
 use crate::{
     drm::atomic::{
-        AtomicCommitKind,
+        AtomicCommitKind, AtomicCommitSink,
         tests_support::{AtomicCommitRecord, RecordingAtomicCommitExecutor, ScriptedResult},
     },
-    kms::render::backend::KmsBackend,
+    kms::render::{backend::KmsBackend, platform::CrtcKey},
 };
-use std::{io, os::fd::RawFd, rc::Rc, time::Duration};
-use yserver_core::backend::{Backend, ModeSpec};
+use std::{
+    io,
+    os::fd::RawFd,
+    rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
+use yserver_core::backend::{Backend, ModeSpec, PresentClockSample, PresentClockSource};
 
 fn handle<H: ::drm::control::ResourceHandle>(value: u32) -> H {
     ::drm::control::from_u32(value).expect("nonzero gamma test handle")
@@ -35,6 +44,57 @@ fn enable_gamma(
     backend.pstate.crtc_key_by_id.insert(crtc_xid, output_key);
     recorder.set_gamma_size_for_tests(gamma_size);
     (crtc_xid, crtc)
+}
+
+fn gamma_backend_with_recorder() -> (
+    KmsBackend,
+    Rc<RecordingAtomicCommitExecutor>,
+    u32,
+    ::drm::control::crtc::Handle,
+) {
+    let mut backend = KmsBackend::for_tests();
+    let recorder = Rc::new(RecordingAtomicCommitExecutor::default());
+    backend.platform.devices[0].atomic_commit_sink =
+        Rc::new(AtomicCommitSink::new(recorder.clone()));
+    let (crtc_xid, crtc) = enable_gamma(&mut backend, &recorder, 0, 4);
+    backend.scene.scene_structure_dirty = false;
+    (backend, recorder, crtc_xid, crtc)
+}
+
+fn seed_recent_gamma_page_flip(backend: &mut KmsBackend, output_idx: usize) {
+    let key = CrtcKey::for_output(&backend.platform.outputs[output_idx]);
+    let ust = crate::drm::atomic::monotonic_timestamp()
+        .expect("CLOCK_MONOTONIC is available in the test environment")
+        .as_micros();
+    backend.platform.completion_clocks.insert(
+        key,
+        PresentClockSample {
+            msc: 1,
+            ust: u64::try_from(ust).expect("monotonic microseconds fit u64"),
+            source: PresentClockSource::PageFlip,
+        },
+    );
+}
+
+fn install_controlled_gamma_clock(backend: &mut KmsBackend) -> (Instant, Arc<AtomicU64>) {
+    let base = Instant::now();
+    let elapsed_ns = Arc::new(AtomicU64::new(0));
+    let clock_elapsed_ns = Arc::clone(&elapsed_ns);
+    backend.for_tests_set_monotonic_clock(Rc::new(move || {
+        base + Duration::from_nanos(clock_elapsed_ns.load(Ordering::SeqCst))
+    }));
+    (base, elapsed_ns)
+}
+
+fn set_test_gamma(backend: &mut KmsBackend, crtc_xid: u32, value: u16) {
+    Backend::set_crtc_gamma(
+        backend,
+        crtc_xid,
+        &[value; 4],
+        &[value.wrapping_add(1); 4],
+        &[value.wrapping_add(2); 4],
+    )
+    .expect("set RandR gamma through Backend");
 }
 
 fn contains_crtc_property(
@@ -633,6 +693,108 @@ fn p1_gamma_async_flip_defers_lut_to_the_next_vsync_commit() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: retry GammaOnly as soon as an async flip retires, before its deadline.
+fn p1_gamma_active_async_flips_do_not_carry_or_advance_the_lut_deadline() {
+    let Some(fixture) = super::recording_scene::RecordingSceneFixture::new(1)
+        .expect("recording scene fixture construction")
+    else {
+        eprintln!("skip: no Vulkan scene fixture available");
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    let (crtc_xid, crtc, fd, recorder) = enable_recording_scene_gamma(&mut fixture);
+    super::super::tearing::enter_tearing_without_direct_scanout(
+        &mut fixture.events.backend,
+        0x7a03,
+        17_003,
+    );
+    recorder.clear_records();
+    let first_attempts = super::atomic_events::submit_damaged_frame(&mut fixture);
+    let first_async = first_attempts
+        .iter()
+        .map(|(_, record)| record)
+        .find(|record| record.kind == AtomicCommitKind::Async)
+        .expect("Backend submits async scene frame while tearing is active")
+        .clone();
+    seed_recent_gamma_page_flip(&mut fixture.events.backend, 0);
+    let (base, elapsed_ns) = install_controlled_gamma_clock(&mut fixture.events.backend);
+
+    set_test_gamma(&mut fixture.events.backend, crtc_xid, 0x6666);
+    let records = recorder.records();
+    assert_eq!(
+        records.len(),
+        1,
+        "gamma adds no commit while async is in flight"
+    );
+    assert_eq!(records[0].kind, AtomicCommitKind::Async);
+    assert!(!contains_crtc_property(&records[0], crtc, handle(70)));
+    assert_eq!(
+        Backend::next_wakeup(&fixture.events.backend),
+        Some(base + Duration::from_nanos(16_666_666))
+    );
+    let root = fixture.events.backend.core.window_id;
+    let (width, height) = (
+        fixture.events.backend.platform.fb_w,
+        fixture.events.backend.platform.fb_h,
+    );
+    Backend::clear_area(
+        &mut fixture.events.backend,
+        None,
+        root,
+        0,
+        None,
+        0,
+        0,
+        width,
+        height,
+        (0, 0),
+    )
+    .expect("queue scene damage while gamma waits");
+    complete_recorded_attempt(&mut fixture.events, fd, &first_async, 1);
+
+    let second_attempts = super::atomic_events::submit_damaged_frame(&mut fixture);
+    let second_async = second_attempts
+        .iter()
+        .map(|(_, record)| record)
+        .find(|record| record.kind == AtomicCommitKind::Async)
+        .expect("Backend submits another async scene frame")
+        .clone();
+    assert!(!contains_crtc_property(&second_async, crtc, handle(70)));
+    complete_recorded_attempt(&mut fixture.events, fd, &second_async, 2);
+    assert_eq!(
+        recorder.records().len(),
+        2,
+        "async retirement before the deadline must not submit GammaOnly"
+    );
+    assert!(
+        fixture.events.backend.platform.outputs[0]
+            .output
+            .pending_gamma_lut
+            .borrow()
+            .is_some()
+    );
+
+    elapsed_ns.store(16_666_667, Ordering::SeqCst);
+    Backend::maybe_composite(&mut fixture.events.backend).expect("expired gamma deadline ticks");
+    let gamma = recorder
+        .records()
+        .into_iter()
+        .find(|record| record.kind == AtomicCommitKind::GammaOnly)
+        .expect("deadline submits gamma after async work retires");
+    assert!(contains_crtc_property(&gamma, crtc, handle(70)));
+    assert!(
+        fixture.events.backend.platform.outputs[0]
+            .output
+            .pending_gamma_lut
+            .borrow()
+            .is_none()
+    );
+    complete_recorded_attempt(&mut fixture.events, fd, &gamma, 3);
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: make the shared gamma reapply helper a no-op after modeset and VT acquire.
 fn p1_gamma_reapplies_after_modeset_and_vt_resume() {
     let Some(fixture) = super::recording_scene::RecordingSceneFixture::new(1)
@@ -794,5 +956,252 @@ fn p1_gamma_reapplies_after_modeset_and_vt_resume() {
     );
     complete_recorded_attempt(&mut fixture.events, fd, &accepted_resumed_scene.1, 6);
     assert_eq!(fixture.events.backend.platform.outputs[0].key, output_key);
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+// Mutations: submit immediately for active gamma, or omit its deadline from next_wakeup.
+fn gamma_active_crtc_exposes_deadline_and_submits_once_when_no_frame_arrives() {
+    let (mut backend, recorder, crtc_xid, _) = gamma_backend_with_recorder();
+    let (base, elapsed_ns) = install_controlled_gamma_clock(&mut backend);
+    seed_recent_gamma_page_flip(&mut backend, 0);
+
+    set_test_gamma(&mut backend, crtc_xid, 0x1111);
+    assert!(
+        recorder.records().is_empty(),
+        "active gamma waits for a frame"
+    );
+
+    let deadline = Backend::next_wakeup(&backend).expect("gamma deadline wakes scanout");
+    assert_eq!(
+        deadline,
+        base + Duration::from_nanos(16_666_666),
+        "60 Hz gamma deadline is one refresh period after the request"
+    );
+
+    elapsed_ns.store(16_666_667, Ordering::SeqCst);
+    Backend::maybe_composite(&mut backend).expect("expired gamma deadline submits");
+    let records = recorder.records();
+    assert_eq!(records.len(), 1, "one expired request yields one commit");
+    assert_eq!(records[0].kind, AtomicCommitKind::GammaOnly);
+    assert_eq!(
+        recorder.created_property_blobs().len(),
+        1,
+        "the standalone commit carries exactly one LUT blob"
+    );
+    assert!(
+        backend.platform.outputs[0]
+            .output
+            .pending_gamma_lut
+            .borrow()
+            .is_none(),
+        "accepted standalone commit consumes the pending LUT"
+    );
+    assert!(backend.next_wakeup().is_none(), "deadline is consumed once");
+}
+
+#[test]
+// Mutations: push the deadline on each update, or treat vrefresh 0 as zero Hz.
+fn gamma_replacement_keeps_first_deadline_and_submits_the_second_ramp() {
+    let (mut backend, recorder, crtc_xid, _) = gamma_backend_with_recorder();
+    backend.platform.outputs[0].output.picked.vrefresh = 0;
+    let (base, elapsed_ns) = install_controlled_gamma_clock(&mut backend);
+    seed_recent_gamma_page_flip(&mut backend, 0);
+
+    set_test_gamma(&mut backend, crtc_xid, 0x1111);
+    let first_deadline = Backend::next_wakeup(&backend).expect("first gamma deadline");
+    assert_eq!(
+        first_deadline,
+        base + Duration::from_nanos(16_666_666),
+        "unknown refresh uses the 60 Hz period"
+    );
+
+    elapsed_ns.store(8_000_000, Ordering::SeqCst);
+    set_test_gamma(&mut backend, crtc_xid, 0x4444);
+    assert_eq!(
+        Backend::next_wakeup(&backend),
+        Some(first_deadline),
+        "replacing the LUT must retain the first deadline"
+    );
+    assert!(recorder.records().is_empty());
+
+    elapsed_ns.store(16_666_667, Ordering::SeqCst);
+    Backend::maybe_composite(&mut backend).expect("first deadline submits replacement");
+    let records = recorder.records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].kind, AtomicCommitKind::GammaOnly);
+    let blobs = recorder.created_property_blobs();
+    assert_eq!(blobs.len(), 1);
+    assert_eq!(
+        &blobs[0].1[..8],
+        &[0x44, 0x44, 0x45, 0x44, 0x46, 0x44, 0, 0],
+        "the first deadline submits the latest ramp"
+    );
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: omit the pending GAMMA_LUT from the next active scene flip.
+fn p1_gamma_active_scene_carries_lut_on_its_next_vsync_flip() {
+    let Some(fixture) = super::recording_scene::RecordingSceneFixture::new(1)
+        .expect("recording scene fixture construction")
+    else {
+        eprintln!("skip: no Vulkan scene fixture available");
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    let (crtc_xid, crtc, fd, recorder) = enable_recording_scene_gamma(&mut fixture);
+    let initial = super::atomic_events::submit_damaged_frame(&mut fixture);
+    let initial_scene = initial
+        .iter()
+        .find(|(_, record)| {
+            record.kind == AtomicCommitKind::Scene && accepted_event_id(record).is_some()
+        })
+        .expect("initial Backend scene frame is accepted")
+        .1
+        .clone();
+    complete_recorded_attempt(&mut fixture.events, fd, &initial_scene, 1);
+    seed_recent_gamma_page_flip(&mut fixture.events.backend, 0);
+    recorder.clear_records();
+
+    set_test_gamma(&mut fixture.events.backend, crtc_xid, 0x3333);
+    assert!(
+        recorder.records().is_empty(),
+        "active scene gamma waits for vsync"
+    );
+    let root = fixture.events.backend.core.window_id;
+    let (width, height) = (
+        fixture.events.backend.platform.fb_w,
+        fixture.events.backend.platform.fb_h,
+    );
+    Backend::clear_area(
+        &mut fixture.events.backend,
+        None,
+        root,
+        0,
+        None,
+        0,
+        0,
+        width,
+        height,
+        (0, 0),
+    )
+    .expect("queue scene damage through Backend");
+    let attempts = super::atomic_events::submit_damaged_frame(&mut fixture);
+    let scene = attempts
+        .iter()
+        .map(|(_, record)| record)
+        .find(|record| {
+            record.kind == AtomicCommitKind::Scene && accepted_event_id(record).is_some()
+        })
+        .expect("next Backend scene flip is accepted");
+    assert!(contains_crtc_property(scene, crtc, handle(70)));
+    assert!(
+        recorder
+            .records()
+            .iter()
+            .all(|record| record.kind != AtomicCommitKind::GammaOnly),
+        "the active scene flip carries gamma without a gamma-only commit"
+    );
+    complete_recorded_attempt(&mut fixture.events, fd, scene, 2);
+    assert!(
+        fixture.events.backend.platform.outputs[0]
+            .output
+            .pending_gamma_lut
+            .borrow()
+            .is_none()
+    );
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: omit the pending GAMMA_LUT from the next direct scanout frame.
+fn p1_gamma_active_direct_frame_carries_lut_without_gamma_only_commit() {
+    let Some((fixture, mut direct)) = super::direct_unflip::direct_fixture(
+        2,
+        super::recording_scene::P1SceneRoute::Shared,
+        17_004,
+        0,
+    ) else {
+        eprintln!("skip: no Vulkan scene fixture available");
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    let fd = super::direct_unflip::fd(&fixture);
+    let recorder = fixture.events.recorders[&fd].clone();
+    let (crtc_xid, crtc) = enable_gamma(&mut fixture.events.backend, &recorder, 0, 4);
+    let initial = super::direct_unflip::submit_direct(&mut fixture, &direct, fd);
+    let initial = initial
+        .iter()
+        .find(|record| accepted_event_id(record).is_some())
+        .expect("initial direct Backend frame is accepted")
+        .clone();
+    let initial_id = accepted_event_id(&initial).expect("accepted direct frame has an ID");
+    super::direct_unflip::complete_direct_initial(&mut fixture, &initial, initial_id, fd);
+    super::direct_unflip::drain_present_notifications(
+        &mut fixture,
+        &[direct.candidate.present_id],
+        &[],
+    );
+    seed_recent_gamma_page_flip(&mut fixture.events.backend, 0);
+    recorder.clear_records();
+
+    set_test_gamma(&mut fixture.events.backend, crtc_xid, 0x5555);
+    assert!(
+        recorder.records().is_empty(),
+        "active direct gamma waits for a frame"
+    );
+
+    let previous_present_id = direct.candidate.present_id;
+    let mut next_candidate = direct.candidate;
+    next_candidate.present_id = next_candidate.present_id.wrapping_add(1);
+    let mut next_event = direct.event.clone();
+    next_event.present_id = next_candidate.present_id;
+    next_event.serial = next_event.serial.wrapping_add(1);
+    direct.candidate = next_candidate;
+    direct.event = next_event.clone();
+    let mut accepted = false;
+    for _ in 0..8 {
+        accepted = Backend::try_present_direct(
+            &mut fixture.events.backend,
+            next_candidate,
+            next_event.clone(),
+        )
+        .expect("next direct frame through Backend");
+        if accepted {
+            break;
+        }
+    }
+    assert!(accepted, "next direct frame reaches scanout");
+    let direct_record = recorder
+        .records()
+        .into_iter()
+        .find(|record| accepted_event_id(record).is_some())
+        .expect("accepted direct frame has a recorded atomic commit");
+    assert!(contains_crtc_property(&direct_record, crtc, handle(70)));
+    assert!(
+        recorder
+            .records()
+            .iter()
+            .all(|record| record.kind != AtomicCommitKind::GammaOnly),
+        "the direct frame carries gamma without a gamma-only commit"
+    );
+    let direct_id = accepted_event_id(&direct_record).expect("direct commit carries an ID");
+    super::direct_unflip::complete_direct_initial(&mut fixture, &direct_record, direct_id, fd);
+    super::direct_unflip::drain_present_notifications(
+        &mut fixture,
+        &[next_candidate.present_id],
+        &[previous_present_id],
+    );
+    super::direct_unflip::request_unflip(&mut fixture, &direct);
+    let unflip_offset = recorder.records().len();
+    let unflip = super::direct_unflip::grouped_unflip_record(&mut fixture, fd, unflip_offset, 2);
+    complete_recorded_attempt(&mut fixture.events, fd, &unflip, 3);
+    super::direct_unflip::drain_present_notifications(
+        &mut fixture,
+        &[],
+        &[next_candidate.present_id],
+    );
     fixture.finish_after_normal_drain();
 }

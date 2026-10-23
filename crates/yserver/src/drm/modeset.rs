@@ -217,6 +217,9 @@ pub struct Output {
     /// Output because scene, direct-scanout, and composed submits all receive
     /// the output record and must retain the ramp after rejected commits.
     pub(crate) pending_gamma_lut: RefCell<Option<GammaRamp>>,
+    /// First standalone-submit deadline for a gamma ramp deferred on an
+    /// active CRTC. Accepted or capability-rejected gamma commits clear it.
+    pub(crate) pending_gamma_deadline: Cell<Option<std::time::Instant>>,
     /// Per-CRTC EINVAL capability latch: stop attaching the rejected
     /// `GAMMA_LUT` property for the remainder of this output lifetime.
     pub(crate) gamma_lut_disabled: Cell<bool>,
@@ -311,6 +314,7 @@ pub(crate) fn finish_pending_gamma_lut(
     match commit_result {
         Ok(_) => {
             output.pending_gamma_lut.borrow_mut().take();
+            output.pending_gamma_deadline.set(None);
         }
         Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {
             if !output.gamma_lut_disabled.replace(true) {
@@ -322,6 +326,7 @@ pub(crate) fn finish_pending_gamma_lut(
             // The RandR cache remains intact; this CRTC will no longer try to
             // submit its unsupported atomic property.
             output.pending_gamma_lut.borrow_mut().take();
+            output.pending_gamma_deadline.set(None);
         }
         Err(_) => {}
     }
@@ -1001,6 +1006,7 @@ fn finalize_output_with_mode(
         crtc_degamma_lut_prop,
         crtc_ctm_prop,
         pending_gamma_lut: RefCell::new(None),
+        pending_gamma_deadline: Cell::new(None),
         gamma_lut_disabled: Cell::new(false),
         scanout_modifiers,
         mm_width,

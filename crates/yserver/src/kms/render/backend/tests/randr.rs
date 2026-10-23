@@ -109,6 +109,7 @@ pub(super) fn clone_test_drm_output(
         crtc_degamma_lut_prop: output.crtc_degamma_lut_prop,
         crtc_ctm_prop: output.crtc_ctm_prop,
         pending_gamma_lut: std::cell::RefCell::new(None),
+        pending_gamma_deadline: std::cell::Cell::new(None),
         gamma_lut_disabled: std::cell::Cell::new(false),
         scanout_modifiers: output.scanout_modifiers.clone(),
         mm_width: output.mm_width,
@@ -716,7 +717,7 @@ fn kms_gamma_off_connector_set_roundtrips_cached_values() {
 
 #[test]
 fn kms_gamma_backend_uses_atomic_lut_for_idle_crtc() {
-    // Mutation: route a supported ramp through the legacy ioctl.
+    // Mutations: route a supported ramp through the legacy ioctl, or always defer idle gamma.
     use crate::drm::atomic::{
         AtomicCommitKind, AtomicCommitSink, tests_support::RecordingAtomicCommitExecutor,
     };
