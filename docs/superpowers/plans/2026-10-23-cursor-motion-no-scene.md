@@ -40,3 +40,5 @@ NVIDIA RTX 5060 Ti, release builds, master `afd064e5` vs this branch:
 - **Pointer motion over a static screen:** 232 scene frames → 0, with 188 cursor-only commits; yserver CPU 2.3 % → 1.7 %.
 - **Windowed 60 fps mpv with an animated cursor over it:** unchanged, with 1133 scene and 66 cursor-only commits and 0 dropped frames; CPU 4.3 % → 3.5 %.
 - **Idle:** 0 % on both.
+
+AMD Raphael, same builds: pointer motion 192 scene frames → 0 (190 cursor-only commits), CPU unchanged within noise (1.3 % / 1.5 %; the saving there is GPU composition and flips, not measured); windowed mpv unchanged, 0 dropped frames.
