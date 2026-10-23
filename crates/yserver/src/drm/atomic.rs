@@ -1601,6 +1601,10 @@ pub(crate) mod tests_support {
                 .borrow_mut()
                 .push_back(ScriptedResult::from_result(result));
         }
+
+        pub(crate) fn clear_scripted_results(&self) {
+            self.scripted_results.borrow_mut().clear();
+        }
     }
 
     impl AtomicCommitExecutor for RecordingAtomicCommitExecutor {

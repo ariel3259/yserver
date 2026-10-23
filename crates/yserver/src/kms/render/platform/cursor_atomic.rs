@@ -160,7 +160,14 @@ impl PlatformBackend {
                     return Err(deferred_show(&self.devices[device_idx].cursor, crtc));
                 }
                 if !cursor_rejected {
-                    return Err(CursorShowError::Unbound(error));
+                    return Err(if prior.is_some() {
+                        CursorShowError::StillVisible {
+                            operation_error: error,
+                            rollback_error: None,
+                        }
+                    } else {
+                        CursorShowError::Unbound(error)
+                    });
                 }
                 let rollback = self.atomic_rollback(device_idx, crtc, &error, true);
                 return Err(match rollback {

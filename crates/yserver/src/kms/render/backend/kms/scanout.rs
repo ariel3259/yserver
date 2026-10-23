@@ -565,22 +565,10 @@ impl KmsBackend {
                 return true;
             }
             Err(error) => {
-                if !error
-                    .raw_os_error()
-                    .is_some_and(|errno| errno == libc::ENOMEM || errno == libc::EIO)
-                {
-                    log::warn!(
-                        "scanout_m2: direct cursor upload failed on output {output_idx}: {error}; unflipping"
-                    );
-                    return false;
-                }
-                self.pstate
-                    .scanout_m2
-                    .mark_direct_cursor_refresh_pending(output_idx);
                 log::warn!(
-                    "scanout_m2: direct cursor upload failed on output {output_idx}: {error}; retrying on CRTC event"
+                    "scanout_m2: direct cursor upload failed on output {output_idx}: {error}; unflipping"
                 );
-                return true;
+                return false;
             }
         }
         let atomic_path = self

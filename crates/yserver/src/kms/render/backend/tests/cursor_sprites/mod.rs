@@ -3,7 +3,7 @@ mod lifecycle;
 mod motion;
 mod retire_show_latest;
 mod scene_attach;
-mod support;
+pub(super) mod support;
 
 #[cfg(test)]
 mod path_install_tests {
