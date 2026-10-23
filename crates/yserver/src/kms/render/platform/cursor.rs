@@ -569,29 +569,15 @@ impl PlatformBackend {
             crtc,
             motion_timestamp: position.motion_timestamp,
         };
-        let atomic_path =
-            cursor.state_path() == crate::kms::cursor_plane::topology::CursorStatePath::Atomic;
-        let result = if atomic_path {
-            commit_sink
-                .submit_with_commit_id(
-                    &device,
-                    AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK,
-                    crate::drm::atomic::AtomicCommitKind::CursorOnly,
-                    request,
-                    &[event],
-                )
-                .map(Some)
-        } else {
-            commit_sink
-                .submit(
-                    &device,
-                    AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK,
-                    crate::drm::atomic::AtomicCommitKind::CursorOnly,
-                    request,
-                    &[event],
-                )
-                .map(|()| None)
-        };
+        let result = commit_sink
+            .submit_with_commit_id(
+                &device,
+                AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK,
+                crate::drm::atomic::AtomicCommitKind::CursorOnly,
+                request,
+                &[event],
+            )
+            .map(Some);
         let commit_id = match result {
             Ok(commit_id) => commit_id,
             Err(error) => {

@@ -460,7 +460,7 @@ impl KmsBackend {
                             "scanout_m2: cursor hide deferred on output {output_idx}; retrying on CRTC event"
                         );
                     }
-                    Err(error) if !atomic_path || error.raw_os_error() == Some(libc::EINVAL) => {
+                    Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {
                         failed = true;
                         log::warn!(
                             "scanout_m2: cursor hide failed on output {output_idx}: {error}; unflipping"
@@ -504,13 +504,6 @@ impl KmsBackend {
         let y = self.core.cursor_y as i32;
         let mut failed = false;
         for output_idx in 0..self.platform.outputs.len() {
-            let atomic_path = self
-                .platform
-                .device_for_output(&self.platform.outputs[output_idx].key)
-                .is_some_and(|device| {
-                    device.cursor.state_path()
-                        == crate::kms::cursor_plane::topology::CursorStatePath::Atomic
-                });
             match self
                 .platform
                 .cursor_plane_show_on_crtc(output_idx, hot_x, hot_y, x, y)
@@ -534,8 +527,7 @@ impl KmsBackend {
                     );
                 }
                 Err(error) => {
-                    if !atomic_path || error.operation_error().raw_os_error() == Some(libc::EINVAL)
-                    {
+                    if error.operation_error().raw_os_error() == Some(libc::EINVAL) {
                         failed = true;
                         log::warn!(
                             "scanout_m2: cursor bind failed on output {output_idx}: {error}; unflipping"
@@ -627,13 +619,6 @@ impl KmsBackend {
                 return false;
             }
         }
-        let atomic_path = self
-            .platform
-            .device_for_output(&self.platform.outputs[output_idx].key)
-            .is_some_and(|device| {
-                device.cursor.state_path()
-                    == crate::kms::cursor_plane::topology::CursorStatePath::Atomic
-            });
         match self
             .platform
             .cursor_plane_show_on_crtc(output_idx, record.hot_x, record.hot_y, x, y)
@@ -657,7 +642,7 @@ impl KmsBackend {
                 );
             }
             Err(error) => {
-                if !atomic_path || error.operation_error().raw_os_error() == Some(libc::EINVAL) {
+                if error.operation_error().raw_os_error() == Some(libc::EINVAL) {
                     log::warn!(
                         "scanout_m2: direct cursor show failed on output {output_idx}: {error}; unflipping"
                     );
@@ -767,13 +752,6 @@ impl KmsBackend {
             return;
         }
         if self.effective_cursor_hidden() {
-            let atomic_path = self
-                .platform
-                .device_for_output(&self.platform.outputs[output_idx].key)
-                .is_some_and(|device| {
-                    device.cursor.state_path()
-                        == crate::kms::cursor_plane::topology::CursorStatePath::Atomic
-                });
             match self.platform.cursor_plane_hide_on_crtc(output_idx) {
                 Ok(()) => {
                     self.platform.clear_direct_cursor_retry(output_idx);
@@ -792,8 +770,7 @@ impl KmsBackend {
                     return;
                 }
                 Err(error) => {
-                    if !atomic_path
-                        || error.raw_os_error() == Some(libc::EINVAL)
+                    if error.raw_os_error() == Some(libc::EINVAL)
                         || error.raw_os_error() == Some(libc::EBUSY)
                     {
                         log::warn!(

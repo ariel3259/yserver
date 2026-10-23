@@ -176,8 +176,8 @@ fn copied_scene_flip_uses_the_sink_devices_cursor_plane() {
 
 #[test]
 // Mutation: return atomic positions for every visible plane without checking
-// the per-device atomic capability. The legacy request would gain cursor fields.
-fn legacy_scene_flip_has_no_atomic_cursor_properties() {
+// the per-device atomic capability. The scene flip would gain cursor fields.
+fn scene_flip_without_atomic_cursor_capability_has_no_cursor_properties() {
     let mut backend = KmsBackend::for_tests();
     let recorder = recording_sink(&mut backend, 0);
     let device_key = backend.platform.devices[0].key;
