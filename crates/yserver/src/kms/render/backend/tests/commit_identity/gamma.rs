@@ -66,7 +66,7 @@ fn seed_recent_gamma_page_flip(backend: &mut KmsBackend, output_idx: usize) {
     let ust = crate::drm::atomic::monotonic_timestamp()
         .expect("CLOCK_MONOTONIC is available in the test environment")
         .as_micros();
-    backend.platform.completion_clocks.insert(
+    backend.platform.record_completion_clock(
         key,
         PresentClockSample {
             msc: 1,
@@ -998,6 +998,58 @@ fn gamma_active_crtc_exposes_deadline_and_submits_once_when_no_frame_arrives() {
         "accepted standalone commit consumes the pending LUT"
     );
     assert!(backend.next_wakeup().is_none(), "deadline is consumed once");
+}
+
+#[test]
+// Mutation: discard the pageflip timestamp when a newer idle sequence replaces the completion clock.
+fn gamma_activity_survives_a_newer_idle_sequence_sample() {
+    let (mut backend, recorder, crtc_xid, crtc) = gamma_backend_with_recorder();
+    install_controlled_gamma_clock(&mut backend);
+    seed_recent_gamma_page_flip(&mut backend, 0);
+
+    let key = CrtcKey::for_output(&backend.platform.outputs[0]);
+    let last_page_flip = backend
+        .platform
+        .present_get_last_page_flip_clock(key)
+        .expect("seeded pageflip retirement is retained");
+    let sequence_time_ns = i64::try_from(
+        last_page_flip
+            .ust
+            .saturating_mul(1_000)
+            .saturating_add(10_000_000),
+    )
+    .expect("test sequence timestamp fits i64");
+    let device_key = backend
+        .platform
+        .primary_device()
+        .expect("gamma backend has a primary DRM device")
+        .key;
+    backend.on_crtc_sequence_event(
+        device_key,
+        u64::from(u32::from(crtc)),
+        sequence_time_ns,
+        last_page_flip.msc + 1,
+    );
+    assert_eq!(
+        backend.platform.present_get_completion_clock(key).source,
+        PresentClockSource::IdleSequence,
+        "the newer sequence replaces the completion-eligible sample"
+    );
+
+    set_test_gamma(&mut backend, crtc_xid, 0x2222);
+
+    assert!(
+        recorder.records().is_empty(),
+        "a pageflip within two refresh periods keeps gamma active after a sequence event"
+    );
+    assert!(
+        backend.platform.outputs[0]
+            .output
+            .pending_gamma_deadline
+            .get()
+            .is_some(),
+        "active gamma retains its one-refresh deadline"
+    );
 }
 
 #[test]

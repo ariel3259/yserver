@@ -3086,29 +3086,18 @@ impl KmsBackend {
             return Ok(());
         }
         let now = self.monotonic_now();
-        let expired_gamma_outputs = self
-            .platform
-            .outputs
-            .iter()
-            .enumerate()
-            .filter_map(|(output_idx, layout)| {
-                (layout.output.pending_gamma_lut.borrow().is_some()
-                    && layout
-                        .output
+        for output_idx in 0..self.platform.outputs.len() {
+            let deadline_expired = {
+                let output = &self.platform.outputs[output_idx].output;
+                output.pending_gamma_lut.borrow().is_some()
+                    && output
                         .pending_gamma_deadline
                         .get()
-                        .is_some_and(|deadline| now >= deadline))
-                .then_some(output_idx)
-            })
-            .collect::<Vec<_>>();
-        for output_idx in expired_gamma_outputs {
-            let output = &self.platform.outputs[output_idx].output;
-            output.pending_gamma_deadline.set(None);
-            if let Err(error) = self.platform.submit_pending_gamma_for_output(output_idx) {
-                log::warn!(
-                    "kms gamma: deadline submit for CRTC {:?} failed: {error}",
-                    output.crtc
-                );
+                        .is_some_and(|deadline| now >= deadline)
+            };
+            if deadline_expired {
+                self.platform
+                    .retry_pending_gamma_after_flip(output_idx, now);
             }
         }
         if self.pstate.tearing.is_on()

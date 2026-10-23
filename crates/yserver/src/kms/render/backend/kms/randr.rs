@@ -1590,11 +1590,11 @@ impl KmsBackend {
                 let refresh_period =
                     std::time::Duration::from_nanos(1_000_000_000 / u64::from(refresh_hz));
                 let crtc_key = crate::kms::render::platform::CrtcKey::new(device_key, crtc);
-                let completion = self.platform.present_get_completion_clock(crtc_key);
-                let last_page_flip = (completion.source
-                    == yserver_core::backend::PresentClockSource::PageFlip
-                    && completion.ust != 0)
-                    .then(|| std::time::Duration::from_micros(completion.ust));
+                let last_page_flip = self
+                    .platform
+                    .present_get_last_page_flip_clock(crtc_key)
+                    .filter(|sample| sample.ust != 0)
+                    .map(|sample| std::time::Duration::from_micros(sample.ust));
                 let active = last_page_flip.is_some_and(|last_page_flip| {
                     let age = [
                         crate::drm::atomic::monotonic_timestamp(),
