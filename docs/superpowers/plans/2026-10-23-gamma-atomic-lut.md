@@ -23,9 +23,11 @@ DCP has no gamma. Every one predates its driver's Vulkan 1.2 support, or arrived
 **No legacy fallback.** The legacy ioctl is removed. No target driver has legacy-only gamma: nvidia-drm gained the legacy
 gamma size and `GAMMA_LUT` in the same release (545.23.06), so on older drivers, including 470, the newest branch for
 Kepler and yserver's minimum recommended NVIDIA driver, `SETGAMMA` already had nothing to act on (gamma size 0); msm the
-same in v7.0; the non-atomic drivers that do have their own legacy `gamma_set` (radeon, amdgpu without DC) cannot run
-yserver, which requires atomic KMS (`drm/device.rs:180`). A CRTC without `GAMMA_LUT` reports gamma size 0, as a CRTC
-without gamma does today.
+same in v7.0. The drivers that do have their own legacy `gamma_set` cannot run yserver: radeon and amdgpu without DC
+are not atomic (yserver requires atomic KMS, `drm/device.rs:180`), and vmwgfx, atomic but legacy-only (its `gamma_set`
+writes the SVGA palette), has no hardware Vulkan. The other paravirtualized drivers (virtio-gpu, qxl, bochs,
+cirrus-qemu, hyperv, xen) have no gamma at all, and vboxvideo reports a legacy size with no `gamma_set`, so `SETGAMMA`
+did nothing there. A CRTC without `GAMMA_LUT` reports gamma size 0, as a CRTC without gamma does today.
 
 ## Out of scope
 
