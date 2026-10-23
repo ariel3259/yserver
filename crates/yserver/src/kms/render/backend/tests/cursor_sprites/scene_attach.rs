@@ -1820,6 +1820,79 @@ fn p2_rejected_replace_detaches_the_applied_plane_and_releases_after_it() {
     run(Some(libc::EIO));
 }
 
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: apply a cursor-only EINVAL by raw CRTC to every card with that
+// handle; card B must keep its independent Atomic cursor qualification.
+fn cursor_failure_classification_isolated_across_cards_with_same_raw_crtc() {
+    let Some(mut fixture) =
+        AtomicPathFixture::with_identical_crtcs_on_two_devices(PathKind::Physical)
+            .expect("identical-CRTC atomic cursor fixture")
+    else {
+        return;
+    };
+    let backend = &mut fixture.scene.events.backend;
+    assert_eq!(backend.platform.outputs.len(), 2);
+    let key_a = backend.platform.outputs[0].key.device_key;
+    let key_b = backend.platform.outputs[1].key.device_key;
+    let crtc_a = backend.platform.outputs[0].output.crtc;
+    let crtc_b = backend.platform.outputs[1].output.crtc;
+    assert_ne!(key_a, key_b);
+    assert_eq!(crtc_a, crtc_b, "the two cards reuse the raw CRTC handle");
+
+    let mut delivered = HashSet::new();
+    let cursor_a = create_argb_cursor(backend, (4, 4), [0x11, 0x22, 0x33, 0xff], (1, 1));
+    let hardware_a = establish_hardware_cursor(&mut fixture, &mut delivered, cursor_a, (120, 90));
+    for output_idx in 0..2 {
+        drain_unretired_output_events(&mut fixture, &mut delivered, output_idx);
+    }
+
+    let recorder_a = fixture.scene.events.recorders[&hardware_a.device_fd].clone();
+    recorder_a.script_result(Err(std::io::Error::from_raw_os_error(libc::EINVAL)));
+    Backend::warp_pointer_root(
+        &mut fixture.scene.events.backend,
+        &mut fixture.scene.events.state,
+        121,
+        91,
+    );
+    Backend::maybe_composite(&mut fixture.scene.events.backend)
+        .expect("process the rejected cursor move through Backend");
+    let saw_attributed_einval = recorder_a.records().iter().any(|record| {
+        record.kind == crate::drm::atomic::AtomicCommitKind::CursorOnly
+            && matches!(
+                record.result,
+                crate::drm::atomic::tests_support::ScriptedResult::Error {
+                    raw_os_error: Some(libc::EINVAL),
+                    ..
+                }
+            )
+    });
+    let fallback_a = fixture
+        .scene
+        .events
+        .backend
+        .platform
+        .for_tests_cursor_fallback_remaining(key_a, crtc_a);
+    let fallback_b_after_a = fixture
+        .scene
+        .events
+        .backend
+        .platform
+        .for_tests_cursor_fallback_remaining(key_b, crtc_b);
+
+    super::support::finish_atomic_fixture(fixture, &mut delivered);
+
+    assert!(
+        saw_attributed_einval,
+        "card A recorded the scripted cursor EINVAL"
+    );
+    assert_eq!(fallback_a, Some(1), "EINVAL changes card A's matching CRTC");
+    assert_eq!(
+        fallback_b_after_a, None,
+        "card B's same-numbered CRTC has no fallback entry"
+    );
+}
+
 fn held_direct_with_cursor(
     present_id: u64,
 ) -> Option<(

@@ -148,6 +148,181 @@ fn vt_suspend_clears_physical_source_keys_and_buttons_via_guarded_cleanup() {
 }
 
 #[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: skip the hidden-cursor detach on VT resume; the accepted resume
+// record must detach the plane after its hide failed during suspension.
+fn hidden_cursor_while_vt_suspended_retries_failed_plane_hide_on_resume() {
+    use std::rc::Rc;
+    use yserver_core::{backend::Backend, core_loop::input_inventory::InputInventory};
+
+    struct LogicalVtResume;
+
+    impl crate::kms::render::backend::kms::session::VtResumeExecutor for LogicalVtResume {
+        fn acquire_master(
+            &self,
+            _device: &crate::kms::render::platform::KmsDevice,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn release_master(
+            &self,
+            _device: &crate::kms::render::platform::KmsDevice,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn probe_connector_snapshot(
+            &self,
+            platform: &crate::kms::render::platform::PlatformBackend,
+        ) -> std::io::Result<Vec<crate::kms::render::platform::ConnectorSnapshot>> {
+            Ok(platform
+                .outputs
+                .iter()
+                .map(|output| crate::kms::render::platform::ConnectorSnapshot {
+                    key: output.key.clone(),
+                    modes: vec![output.output.picked.clone()],
+                    mm_width: 0,
+                    mm_height: 0,
+                    edid: Vec::new(),
+                    connector_type: "test".to_owned(),
+                })
+                .collect())
+        }
+    }
+
+    use super::cursor_sprites::support::{
+        AtomicPathFixture, PathKind, accept_cursor_detach, applied_cursor_binding,
+        create_argb_cursor, cursor_properties_for_output, drain_unretired_output_events,
+        establish_hardware_cursor, finish_atomic_fixture, record_property, retire_cursor_record,
+    };
+
+    let Some(mut fixture) =
+        AtomicPathFixture::new(PathKind::Physical).expect("atomic cursor VT fixture construction")
+    else {
+        return;
+    };
+    let mut delivered = std::collections::HashSet::new();
+    let cursor = create_argb_cursor(
+        &mut fixture.scene.events.backend,
+        (5, 4),
+        [0x12, 0x34, 0x56, 0xff],
+        (2, 1),
+    );
+    let hardware = establish_hardware_cursor(&mut fixture, &mut delivered, cursor, (120, 100));
+    drain_unretired_output_events(&mut fixture, &mut delivered, hardware.output_idx);
+    fixture
+        .scene
+        .events
+        .backend
+        .for_tests_set_vt_resume_executor(Rc::new(LogicalVtResume));
+    fixture
+        .scene
+        .events
+        .backend
+        .platform
+        .for_tests_accept_output_power_commits();
+    let recorder = Rc::clone(&fixture.scene.events.recorders[&hardware.device_fd]);
+    for _ in 0..3 {
+        recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
+    }
+
+    Backend::begin_vt_release(&mut fixture.scene.events.backend);
+    Backend::finish_vt_release(
+        &mut fixture.scene.events.backend,
+        &mut fixture.scene.events.state,
+        &InputInventory::default(),
+    );
+    let suspend_retained_cursor = fixture
+        .scene
+        .events
+        .backend
+        .platform
+        .any_cursor_plane_visible();
+    let failed_suspend_hide_recorded = recorder.records().iter().any(|record| {
+        record.kind == crate::drm::atomic::AtomicCommitKind::CursorOnly
+            && matches!(
+                record.result,
+                crate::drm::atomic::tests_support::ScriptedResult::Error {
+                    raw_os_error: Some(libc::EIO),
+                    ..
+                }
+            )
+    });
+
+    Backend::set_cursor_hidden(&mut fixture.scene.events.backend, true);
+    let hidden_during_suspend = fixture.scene.events.backend.effective_cursor_hidden();
+    let resume_record_offset = recorder.records().len();
+    let properties =
+        cursor_properties_for_output(&fixture.scene.events.backend, hardware.output_idx);
+
+    Backend::on_vt_acquire(
+        &mut fixture.scene.events.backend,
+        &mut fixture.scene.events.state,
+    );
+    let records = recorder.records();
+    let resume_detach_accepted = records[resume_record_offset..].iter().any(|record| {
+        record.kind == crate::drm::atomic::AtomicCommitKind::CursorOnly
+            && record.result == crate::drm::atomic::tests_support::ScriptedResult::Ok
+            && record_property(record, properties.fb_id) == Some(0)
+            && record_property(record, properties.crtc_id) == Some(0)
+    });
+    let cursor_hidden_after_resume = !fixture
+        .scene
+        .events
+        .backend
+        .platform
+        .any_cursor_plane_visible();
+    let binding_cleared_after_resume =
+        applied_cursor_binding(&fixture.scene.events.backend, hardware.output_idx).is_none();
+    let vt_active_after_resume =
+        fixture.scene.events.backend.pstate.vt_state == crate::vt::state::VtState::Active;
+    if fixture
+        .scene
+        .events
+        .backend
+        .platform
+        .any_cursor_plane_visible()
+    {
+        let detach = accept_cursor_detach(&mut fixture, &mut delivered, hardware.output_idx);
+        retire_cursor_record(
+            &mut fixture,
+            &mut delivered,
+            hardware.output_idx,
+            &detach,
+            9,
+        );
+    }
+    finish_atomic_fixture(fixture, &mut delivered);
+
+    assert!(
+        suspend_retained_cursor,
+        "failed suspend hide retains the applied hardware cursor"
+    );
+    assert!(
+        failed_suspend_hide_recorded,
+        "suspend records the failed plane hide"
+    );
+    assert!(
+        hidden_during_suspend,
+        "cursor intent changes while VT is suspended"
+    );
+    assert!(
+        resume_detach_accepted,
+        "resume retries a plane detach for the cursor hidden during suspension"
+    );
+    assert!(
+        cursor_hidden_after_resume,
+        "resume leaves the hardware plane hidden"
+    );
+    assert!(
+        binding_cleared_after_resume,
+        "resume clears the applied cursor binding"
+    );
+    assert!(vt_active_after_resume, "VT acquire returns to Active");
+}
+
+#[test]
 fn xi_dynamic_reset_retires_kms_input_and_replays_inventory_on_the_runner_boundary() {
     use std::{
         collections::{HashMap, HashSet},

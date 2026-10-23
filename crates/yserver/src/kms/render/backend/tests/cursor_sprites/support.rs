@@ -148,10 +148,27 @@ impl AtomicPathFixture {
         output_count: usize,
         route: P1SceneRoute,
     ) -> Result<Option<Self>, String> {
-        let Some(mut scene) = RecordingSceneFixture::with_route(output_count, route)? else {
+        let Some(scene) = RecordingSceneFixture::with_route(output_count, route)? else {
             return Ok(None);
         };
-        if route != P1SceneRoute::Shared {
+        Self::from_scene(kind, scene, route != P1SceneRoute::Shared)
+    }
+
+    pub(crate) fn with_identical_crtcs_on_two_devices(
+        kind: PathKind,
+    ) -> Result<Option<Self>, String> {
+        let Some(scene) = RecordingSceneFixture::new_with_identical_crtcs_on_two_devices()? else {
+            return Ok(None);
+        };
+        Self::from_scene(kind, scene, false)
+    }
+
+    fn from_scene(
+        kind: PathKind,
+        mut scene: RecordingSceneFixture,
+        hold_copied_readiness: bool,
+    ) -> Result<Option<Self>, String> {
+        if hold_copied_readiness {
             scene
                 .readiness
                 .as_ref()

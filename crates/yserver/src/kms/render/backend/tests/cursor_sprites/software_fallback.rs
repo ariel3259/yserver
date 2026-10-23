@@ -35,8 +35,9 @@ const CURSOR_PROPERTIES: [&str; 12] = [
 
 #[test]
 #[ignore = "needs lavapipe Vulkan scene composition"]
-// Mutation: route a non-qualified snapshot to a hardware cursor path; the
-// static path, permanent latch, and zero hardware cursor-commit assertions fail.
+// Mutations: route a non-qualified snapshot to a hardware cursor path, or omit
+// the software cursor from scene composition; the path and primary-BO pixel
+// assertions fail.
 fn non_atomic_device_snapshots_use_software_cursor_without_changing_x_state() {
     use super::super::commit_identity::recording_scene::RecordingSceneFixture;
 
@@ -134,7 +135,7 @@ fn non_atomic_device_snapshots_use_software_cursor_without_changing_x_state() {
             finish_fixture(events, &mut delivered);
             assert_no_cursor_resources(&events.backend, Some(&ledger));
             scene.finish_after_normal_drain();
-            results.push((name, path_ok, latch_ok, false, false, false));
+            results.push((name, path_ok, latch_ok, false, false, false, false));
             continue;
         }
         let no_hardware_plane = !events.backend.platform.cursor_plane_available()
@@ -189,6 +190,36 @@ fn non_atomic_device_snapshots_use_software_cursor_without_changing_x_state() {
         let scene_composed = records
             .iter()
             .any(|record| record.kind == AtomicCommitKind::Scene);
+        let scene_record = records
+            .iter()
+            .rev()
+            .find(|record| record.kind == AtomicCommitKind::Scene)
+            .expect("software cursor frame has a recorded scene commit");
+        let output = &events.backend.platform.outputs[0].output;
+        let primary_fb = scene_record
+            .properties
+            .iter()
+            .find(|update| {
+                update.object == output.plane.into() && update.property == output.plane_fb_id_prop
+            })
+            .map(|update| update.value)
+            .expect("scene commit records the primary FB_ID");
+        let primary_bo_idx = match events.backend.platform.scanout_pools[0]
+            .as_ref()
+            .expect("recording scene has a scanout pool")
+        {
+            crate::kms::vk::scanout::OutputScanout::Shared(pool) => pool
+                .bos
+                .iter()
+                .position(|bo| {
+                    bo.fb_handle
+                        .is_some_and(|handle| u64::from(u32::from(handle)) == primary_fb)
+                })
+                .expect("primary FB_ID names one scanout BO"),
+            crate::kms::vk::scanout::OutputScanout::Copied(_) => {
+                panic!("software fallback fixture uses shared scanout BOs")
+            }
+        };
         let no_hardware_cursor_commits = records
             .iter()
             .all(|record| record.kind != AtomicCommitKind::CursorOnly);
@@ -212,6 +243,25 @@ fn non_atomic_device_snapshots_use_software_cursor_without_changing_x_state() {
             0,
             u32::try_from(scenario_index + 1).expect("test frame fits u32"),
         );
+        let cursor_pixel_x = expected_image.x
+            - i16::try_from(expected_image.hot_x).expect("cursor hotspot x fits i16");
+        let cursor_pixel_y = expected_image.y
+            - i16::try_from(expected_image.hot_y).expect("cursor hotspot y fits i16");
+        let primary_bo_pixmap = 0x6a00 + u32::try_from(primary_bo_idx).expect("BO index fits");
+        let primary_pixel = events
+            .backend
+            .get_image_pixels_for_tests(
+                primary_bo_pixmap,
+                2,
+                cursor_pixel_x,
+                cursor_pixel_y,
+                1,
+                1,
+                !0,
+            )
+            .expect("read the recorded primary BO pixmap directly")
+            .expect("primary BO pixel bytes");
+        let primary_bo_contains_cursor = primary_pixel == expected_image.bgra_bytes[..4];
         Backend::define_cursor(&mut events.backend, None, root, 0x7f10)
             .expect("restore fixture root cursor");
         Backend::free_cursor(&mut events.backend, None, cursor_xid)
@@ -226,10 +276,20 @@ fn non_atomic_device_snapshots_use_software_cursor_without_changing_x_state() {
             no_hardware_plane,
             initial_x_state_ok && hide_ok && show_ok && cursor_image_unchanged,
             scene_composed && no_hardware_cursor_commits && no_cursor_buffers,
+            primary_bo_contains_cursor,
         ));
     }
 
-    for (name, path_ok, latch_ok, no_hardware_plane, x_state_ok, software_scene_ok) in results {
+    for (
+        name,
+        path_ok,
+        latch_ok,
+        no_hardware_plane,
+        x_state_ok,
+        software_scene_ok,
+        primary_bo_contains_cursor,
+    ) in results
+    {
         assert!(path_ok, "{name}: static path and reason");
         assert!(
             latch_ok,
@@ -246,6 +306,10 @@ fn non_atomic_device_snapshots_use_software_cursor_without_changing_x_state() {
         assert!(
             software_scene_ok,
             "{name}: visible cursor composes without cursor commits or cursor buffers"
+        );
+        assert!(
+            primary_bo_contains_cursor,
+            "{name}: recorded primary FB_ID's BO contains the software cursor pixel"
         );
     }
 }
