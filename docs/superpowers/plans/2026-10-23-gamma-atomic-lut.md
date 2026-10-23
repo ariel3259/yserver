@@ -94,7 +94,39 @@ gammastep (or redshift) changing gamma while mpv plays fullscreen in direct scan
 `--vulkan-device`; by default it picks the first Vulkan device and a cross-GPU buffer never reaches direct scanout) and while idle; strace from server start: `SETGAMMA` count (0 on the branch), commits carrying
 `GAMMA_LUT`, mpv dropped frames, and that the colour visibly changes and survives a VT switch.
 
-### Task 2: docs
+### Task 2: on an active CRTC, gamma waits for the next frame
+
+**Measured on Task 1 (AMD Raphael, mpv fullscreen 60 fps in direct scanout, 10 gamma changes):** every change cost mpv
+one frame, on master (legacy `SETGAMMA`, 8 drops) and on Task 1 (8–9 drops). All 13 Task 1 gamma commits were
+standalone `gamma-only`, none rode a direct commit: at 60 fps the CRTC is usually free between frames when
+`SetCrtcGamma` arrives, so "nothing in flight" sent the LUT in its own event commit, which takes the vblank and holds
+the next direct frame.
+
+**Change (user decision 2026-10-23).** "Nothing in flight" is no longer enough for the standalone commit:
+
+- **Active CRTC** (a page flip retired on it within the last two refresh periods, from the existing per-CRTC
+  retirement clock `completion_clocks` / `ust_msc`, `kms/render/platform.rs:482-492`, and the mode's `vrefresh`): the
+  pending LUT waits for the next vsync scene/direct/composed commit, which already carries it (Task 1). If none is
+  submitted within **one refresh period** of the request, the standalone commit goes out at that deadline.
+- **Idle CRTC:** the standalone commit goes out immediately, as in Task 1.
+- The deadline is exposed through the existing `next_wakeup` (`backend_scanout_next_wakeup`, `scanout.rs:2773`); no
+  new timer. A later `SetCrtcGamma` before the deadline replaces the pending LUT and keeps the first deadline (it does
+  not push it out). Async flips still carry nothing; the deadline still applies.
+
+**Tests** (Backend-driven, rule B; end state, rule A):
+- active CRTC in direct scanout: `SetCrtcGamma`, then a direct frame inside one refresh period: the direct commit
+  carries `GAMMA_LUT`, 0 `gamma-only` commits. Mutation: submit standalone immediately (Task 1 behaviour).
+- active CRTC, no frame arrives: `next_wakeup` returns the deadline; one tick after it, exactly one `gamma-only`
+  commit. Mutation: no deadline (the LUT waits forever).
+- idle CRTC (no retirement in two periods): standalone commit at once. Mutation: always defer.
+- two `SetCrtcGamma` before the deadline: one commit carrying the second LUT, at the first deadline.
+- active scene (composed, windowed) output: the next scene flip carries it.
+
+**Hardware:** the Task 1 run (`gamma-hw.sh`) on AMD, master vs branch: mpv drops per gamma change (target 0), the
+count of `gamma-only` commits during playback (target 0), kernel LUT readback unchanged; plus windowed mpv. NVIDIA the
+same when the monitor is on it.
+
+### Task 3: docs
 
 `docs/status.md` entry; the #47 spec gets a note pointing to this plan for the transport decision.
 
