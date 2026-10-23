@@ -39,6 +39,12 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   watchdog (measured, RTX 5060 Ti + Raphael). The helper now runs without `DISPLAY`: the same run enables HDMI-1 in
   0.83 s with no X connection from the helper (master: 30 s, watchdog, `Configure crtc failed`). Plan:
   [`plans/2026-10-23-probe-helper-no-display.md`](superpowers/plans/2026-10-23-probe-helper-no-display.md).
+- **2026-10-23 gamma through atomic `GAMMA_LUT` (branch `feat/gamma-atomic-lut`, planned):** the gamma LUT moves from
+  the legacy `SETGAMMA` ioctl (a blocking atomic commit the kernel builds itself, which also clears `DEGAMMA_LUT`/`CTM`)
+  to a `GAMMA_LUT` blob of the legacy size on the CRTC's next vsync commit, or its own nonblocking commit when nothing is
+  in flight. CRTCs without `GAMMA_LUT` keep `SETGAMMA`. The RANDR gamma size does not change (#263 territory). Revises
+  the transport decision of `specs/2026-06-18-randr-gamma-design.md`. Plan:
+  [`plans/2026-10-23-gamma-atomic-lut.md`](superpowers/plans/2026-10-23-gamma-atomic-lut.md).
 
 - **2026-10-23 macOS Settings window (branch `feat/macos-settings`, spec
   `specs/2026-10-23-macos-settings-design.md`):** app menu with About, Settings… (Cmd-,), Hide/Hide Others/Show All,
