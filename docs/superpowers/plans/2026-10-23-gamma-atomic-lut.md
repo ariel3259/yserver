@@ -144,6 +144,21 @@ domain, and the `BOOTTIME` comparison goes away. Present keeps the kernel UST as
 - Hardware: the NVIDIA run again (fullscreen, windowed, strace), target 0 `gamma-only` commits during playback; AMD
   rerun to confirm no change there.
 
+**Measured on NVIDIA with two outputs (HDMI-2 + DP-3 on card1, mpv fullscreen on HDMI-2, DP-3 idle):** none of the 10
+changes made during playback reached DP-3's CRTC (kernel readback stayed at identity until the final reset); master
+applied all of them on both CRTCs. The standalone commit waits while any scanout work is queued, and that check
+(`gamma_output_has_queued_scanout`) includes scene-wide state (repaint owed, presentation damage, direct scanout
+pending or queued) that the other output keeps busy. A held LUT is retried only on its own CRTC's page-flip event or
+at the deadline, and an idle CRTC has neither.
+
+**Fix (user decision 2026-10-23).** When the standalone commit cannot go out at request time, the one-refresh deadline
+is set for idle CRTCs too, so the existing expiry path (`next_wakeup` → `retry_pending_gamma_after_flip`) sends it.
+The LUT is never held longer than one refresh period.
+
+- Test: two outputs, scene work queued for output 0, output 1 idle: `SetCrtcGamma` on output 1 gives exactly one
+  `gamma-only` commit on output 1's CRTC at the deadline, none before it. Mutation: set the deadline only for active
+  CRTCs.
+
 ### Task 3: docs
 
 `docs/status.md` entry; the #47 spec gets a note pointing to this plan for the transport decision.
