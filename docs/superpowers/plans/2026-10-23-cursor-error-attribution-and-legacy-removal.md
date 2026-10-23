@@ -14,7 +14,7 @@ Short plan (no spec: nothing new is built; one rule is narrowed and an unused pa
 
 **Who used Legacy:**
 
-- paravirtualized drivers (`virtio_gpu`, `vmwgfx`, `qxl`, `vboxvideo`) on guests older than Linux 6.6. `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` exists for atomic-capable virtualized drivers since 6.6;
+- paravirtualized drivers (`virtio_gpu`, `vmwgfx`, `qxl`, `vboxvideo`) on guests older than Linux 6.8. `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` exists since Linux 6.8 (commit 9724ed6c1b12);
 - a failed driver-name query;
 - a cursor plane missing a required property;
 - no cursor plane at all (Apple DCP). It reached the software cursor through the legacy probe's unsupported-ioctl latch.
