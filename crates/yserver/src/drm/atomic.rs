@@ -561,7 +561,9 @@ impl AtomicCommitSink {
             .flatten();
         let cursor_rejected = match (&result, attribution) {
             (Ok(()), _) => false,
-            (Err(_), None) => kind == AtomicCommitKind::CursorOnly,
+            (Err(error), None) => {
+                kind == AtomicCommitKind::CursorOnly && error.raw_os_error() == Some(libc::EINVAL)
+            }
             (Err(error), Some(snapshot)) => self.cursor_caused_rejection(device, error, &snapshot),
         };
         self.last_rejection_was_cursor.set(cursor_rejected);
@@ -770,16 +772,15 @@ impl AtomicCommitSink {
     }
 
     /// A failed scene request carrying cursor fields is the cursor's fault only
-    /// if `TEST_ONLY` rejects it as sent and accepts it without those fields.
-    /// EBUSY, or a failure `TEST_ONLY` does not reproduce, is a commit-phase
-    /// error of the scene producer.
+    /// for EINVAL, and only if `TEST_ONLY` rejects it as sent and accepts it
+    /// without those fields. Other errors belong to the scene producer.
     fn cursor_caused_rejection(
         &self,
         device: &Device,
         error: &io::Error,
         snapshot: &CommitAttributionSnapshot,
     ) -> bool {
-        let cursor_rejected = error.raw_os_error() != Some(libc::EBUSY)
+        let cursor_rejected = error.raw_os_error() == Some(libc::EINVAL)
             && self
                 .test_only(
                     device,
@@ -854,9 +855,9 @@ impl AtomicCommitSink {
         );
     }
 
-    /// Whether the most recent rejected ioctl was caused by its cursor fields:
-    /// any cursor-only failure, or a scene failure `cursor_caused_rejection`
-    /// pins on the cursor. Other failures leave the cursor state untouched.
+    /// Whether the most recent rejected ioctl was caused by cursor fields:
+    /// cursor-only EINVAL, or a scene EINVAL confirmed by `cursor_caused_rejection`.
+    /// Other failures leave the cursor state untouched.
     pub(crate) fn take_last_cursor_rejection(&self) -> bool {
         self.last_rejection_was_cursor.replace(false)
     }

@@ -533,7 +533,8 @@ fn p2_atomic_cursor_upload_preserves_unsupported_driver_errno() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutations: reconstruct the hide error (permanent latch fails), or classify EINVAL twice (fallback remaining is 2).
+// Mutation: route non-EINVAL hide errors through rollback. EOPNOTSUPP must
+// retain the binding without changing qualification; EINVAL still detaches.
 fn p2_rejected_hide_preserves_errno_and_advances_fallback_once() {
     let run = |error_number: i32| {
         let mut fixture =
@@ -546,6 +547,8 @@ fn p2_rejected_hide_preserves_errno_and_advances_fallback_once() {
         );
         let mut delivered = HashSet::new();
         let hardware = establish_hardware_cursor(&mut fixture, &mut delivered, cursor, (100, 90));
+        let binding = applied_cursor_binding(&fixture.scene.events.backend, hardware.output_idx)
+            .expect("applied cursor before hide");
         let device_key = fixture.scene.events.backend.platform.outputs[0]
             .key
             .device_key;
@@ -577,12 +580,60 @@ fn p2_rejected_hide_preserves_errno_and_advances_fallback_once() {
         let fallback = state
             .platform
             .for_tests_cursor_fallback_remaining(device_key, hardware.crtc);
-        assert_eq!(
-            applied_cursor_binding(state, hardware.output_idx),
-            None,
-            "successful blocking rollback clears the applied binding"
-        );
+        if error_number == libc::EINVAL {
+            assert_eq!(
+                applied_cursor_binding(state, hardware.output_idx),
+                None,
+                "attributed EINVAL rollback clears the applied binding"
+            );
+            assert_eq!(
+                sprite_users(state, hardware.output_idx, binding.lease),
+                Some(0),
+                "attributed EINVAL releases the applied lease",
+            );
+        } else {
+            assert_eq!(
+                applied_cursor_binding(state, hardware.output_idx),
+                Some(binding),
+                "a generic hide error keeps the applied binding"
+            );
+            assert_eq!(
+                sprite_users(state, hardware.output_idx, binding.lease),
+                Some(1),
+                "a generic hide error keeps the applied lease",
+            );
+        }
         assert_eq!(fixture.legacy.hide_calls.get(), 0);
+        if applied_cursor_binding(state, hardware.output_idx).is_some() {
+            let cleanup_start = record_count(&fixture, hardware.device_fd);
+            fixture
+                .scene
+                .events
+                .backend
+                .platform
+                .cursor_plane_hide_on_crtc(hardware.output_idx)
+                .expect("teardown retry hides the still-applied cursor");
+            let cleanup = recorder
+                .records()
+                .into_iter()
+                .skip(cleanup_start)
+                .find(|record| {
+                    record.kind == AtomicCommitKind::CursorOnly
+                        && record
+                            .events
+                            .iter()
+                            .any(|event| event.crtc == hardware.crtc)
+                        && record.result == ScriptedResult::Ok
+                })
+                .expect("accepted teardown hide");
+            retire_cursor_record(
+                &mut fixture,
+                &mut delivered,
+                hardware.output_idx,
+                &cleanup,
+                3,
+            );
+        }
         Backend::set_cursor_hidden(&mut fixture.scene.events.backend, true);
         damage_root(&mut fixture);
         let ledger = Rc::clone(&fixture.ledger);
@@ -595,8 +646,8 @@ fn p2_rejected_hide_preserves_errno_and_advances_fallback_once() {
         return;
     };
     assert!(
-        permanent,
-        "the original EOPNOTSUPP errno must latch the cursor path"
+        !permanent,
+        "a generic hide error does not change qualification"
     );
     assert_eq!(permanent_fallback, None);
 
@@ -2094,14 +2145,17 @@ fn direct_deferred_cursor_show_keeps_direct_and_retries_on_event() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: treat a real atomic cursor show error as Deferred; this unflip assertion must fail.
-fn direct_cursor_real_error_still_unflips() {
+// Mutation: request an unflip for a generic cursor-show error. EIO must keep
+// direct scanout active and retain the previous cursor lease.
+fn direct_cursor_generic_error_keeps_direct_scanout() {
     let Some((mut fixture, mut delivered, hardware, _direct)) = held_direct_with_cursor(704) else {
         return;
     };
     let recorder = Rc::clone(&fixture.scene.events.recorders[&hardware.device_fd]);
     let properties = super::support::cursor_properties_for_output(&fixture.scene.events.backend, 0);
     let record_start = record_count(&fixture, hardware.device_fd);
+    let old_binding = applied_cursor_binding(&fixture.scene.events.backend, 0)
+        .expect("existing direct cursor binding");
     recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
 
     let cursor_b = create_argb_cursor(
@@ -2111,8 +2165,8 @@ fn direct_cursor_real_error_still_unflips() {
         (1, 2),
     );
     define_root_cursor(&mut fixture.scene.events.backend, cursor_b);
-    let unflipped_on_error = fixture.scene.events.backend.pstate.scanout_m2.active()
-        && fixture
+    let still_direct = fixture.scene.events.backend.pstate.scanout_m2.active()
+        && !fixture
             .scene
             .events
             .backend
@@ -2134,6 +2188,16 @@ fn direct_cursor_real_error_still_unflips() {
                         } if errno == libc::EIO
                     )
             });
+    let retry_pending = fixture
+        .scene
+        .events
+        .backend
+        .pstate
+        .scanout_m2
+        .direct_cursor_refresh_pending
+        .contains(&0);
+    let old_lease_retained =
+        sprite_users(&fixture.scene.events.backend, 0, old_binding.lease) == Some(1);
 
     if fixture.scene.events.backend.pstate.scanout_m2.active() {
         fixture
@@ -2142,11 +2206,41 @@ fn direct_cursor_real_error_still_unflips() {
             .backend
             .stop_direct_after_scanout_replaced("test teardown");
     }
+    let cleanup_start = record_count(&fixture, hardware.device_fd);
+    fixture
+        .scene
+        .events
+        .backend
+        .platform
+        .cursor_plane_hide_on_crtc(hardware.output_idx)
+        .expect("teardown hide for the retained cursor binding");
+    let cleanup = recorder
+        .records()
+        .into_iter()
+        .skip(cleanup_start)
+        .find(|record| {
+            record.kind == AtomicCommitKind::CursorOnly
+                && record
+                    .events
+                    .iter()
+                    .any(|event| event.crtc == hardware.crtc)
+                && record.result == ScriptedResult::Ok
+        })
+        .expect("accepted teardown hide");
+    retire_cursor_record(
+        &mut fixture,
+        &mut delivered,
+        hardware.output_idx,
+        &cleanup,
+        14,
+    );
     super::support::finish_atomic_fixture(fixture, &mut delivered);
     assert!(
-        unflipped_on_error,
-        "real cursor show errors must keep the unflip fallback"
+        still_direct,
+        "generic cursor errors preserve direct scanout"
     );
+    assert!(retry_pending, "the existing CRTC retry remains armed");
+    assert!(old_lease_retained, "the old cursor lease remains owned");
 }
 
 #[test]
@@ -3787,11 +3881,14 @@ fn direct_deferred_hide_then_show_applies_newest_intent() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: treat a real hide error as deferred; output 0 must request unflip while output 1 hides.
-fn direct_cursor_hide_real_error_still_unflips() {
+// Mutation: unflip on every hide error. A generic EIO keeps direct scanout
+// active and leaves the existing CRTC retry pending on output 0.
+fn direct_cursor_hide_generic_error_keeps_direct_scanout() {
     let Some((mut fixture, mut delivered, hardware, _direct)) = held_direct_with_two_outputs(711)
     else {
-        eprintln!("SKIP direct_cursor_hide_real_error_still_unflips: Vulkan fixture unavailable");
+        eprintln!(
+            "SKIP direct_cursor_hide_generic_error_keeps_direct_scanout: Vulkan fixture unavailable"
+        );
         return;
     };
     let device_fd = hardware.device_fd;
@@ -3814,22 +3911,22 @@ fn direct_cursor_hide_real_error_still_unflips() {
                 } if errno == libc::EIO
             )
     });
-    let still_requested_unflip = fixture.scene.events.backend.pstate.scanout_m2.active()
-        && fixture
+    let still_direct = fixture.scene.events.backend.pstate.scanout_m2.active()
+        && !fixture
             .scene
             .events
             .backend
             .pstate
             .scanout_m2
             .unflip_requested;
-    let no_deferred_retry = fixture
+    let retry_pending = fixture
         .scene
         .events
         .backend
         .pstate
         .scanout_m2
         .direct_cursor_refresh_pending
-        .is_empty();
+        .contains(&0);
     let output1_hide_succeeded = recorder.records().into_iter().skip(start).any(|record| {
         record.kind == AtomicCommitKind::CursorOnly
             && record_property(&record, properties1.fb_id) == Some(0)
@@ -3844,16 +3941,38 @@ fn direct_cursor_hide_real_error_still_unflips() {
         .backend
         .platform
         .cursor_plane_visible_for_output(1);
+    let cleanup_start = record_count(&fixture, device_fd);
+    fixture
+        .scene
+        .events
+        .backend
+        .platform
+        .cursor_plane_hide_on_crtc(0)
+        .expect("teardown hide for the retained output 0 cursor");
+    let cleanup = recorder
+        .records()
+        .into_iter()
+        .skip(cleanup_start)
+        .find(|record| {
+            record.kind == AtomicCommitKind::CursorOnly
+                && record_property(record, properties0.fb_id) == Some(0)
+                && record.events.iter().any(|event| {
+                    event.crtc == fixture.scene.events.backend.platform.outputs[0].output.crtc
+                })
+                && record.result == ScriptedResult::Ok
+        })
+        .expect("accepted output 0 teardown hide");
+    retire_cursor_record(&mut fixture, &mut delivered, 0, &cleanup, 12);
     finish_direct_fixture(fixture, &mut delivered);
     assert!(
         real_error,
         "the scripted EIO reached the atomic cursor hide"
     );
     assert!(
-        still_requested_unflip,
-        "a real cursor hide error still requests unflip"
+        still_direct,
+        "generic cursor hide errors preserve direct scanout"
     );
-    assert!(no_deferred_retry, "a real error is not treated as deferred");
+    assert!(retry_pending, "the existing CRTC retry remains armed");
     assert!(output1_hide_succeeded, "output 1 still accepts its hide");
     assert!(output1_is_hidden, "output 1's accepted hide is reflected");
 }

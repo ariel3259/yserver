@@ -309,6 +309,103 @@ fn seed_cursor_position(backend: &mut KmsBackend) -> crate::drm::atomic::CursorP
     )
 }
 
+fn install_applied_atomic_cursor_for_test(
+    backend: &mut KmsBackend,
+) -> (
+    crate::drm::atomic::CursorPlanePosition,
+    crate::kms::cursor_plane::sprites::SpriteBufferLease,
+) {
+    use crate::kms::cursor_plane::{
+        ops::{CursorBufferIo, recording::RecordingCursorBufferIo},
+        sprites::SpriteStage,
+        topology::{CursorPlaneTestPlane, CursorPlaneTestSnapshot},
+    };
+
+    const CURSOR_PROPERTIES: [&str; 12] = [
+        "FB_ID",
+        "CRTC_ID",
+        "CRTC_X",
+        "CRTC_Y",
+        "CRTC_W",
+        "CRTC_H",
+        "SRC_X",
+        "SRC_Y",
+        "SRC_W",
+        "SRC_H",
+        "HOTSPOT_X",
+        "HOTSPOT_Y",
+    ];
+
+    let crtc = backend.platform.outputs[0].output.crtc;
+    let raw_crtc = u32::from(crtc);
+    let snapshot = CursorPlaneTestSnapshot {
+        crtcs: vec![raw_crtc],
+        planes: vec![CursorPlaneTestPlane {
+            handle: 21,
+            possible_crtcs: vec![raw_crtc],
+            property_names: CURSOR_PROPERTIES.into_iter().map(str::to_owned).collect(),
+        }],
+        cursor_caps: Some(crate::drm::CursorDeviceCaps::new(
+            false,
+            Some("amdgpu".to_owned()),
+        )),
+        has_buffer: true,
+    };
+    let (io, _) = RecordingCursorBufferIo::new(1);
+    let io: Rc<dyn CursorBufferIo> = Rc::new(io);
+    backend
+        .platform
+        .for_tests_install_cursor_plane_from_snapshot(0, snapshot, io, 64, 64);
+
+    let device = Rc::clone(&backend.platform.devices[0].device);
+    let cursor = &mut backend.platform.devices[0].cursor;
+    let plane = cursor.plane.as_mut().expect("installed cursor plane");
+    let properties = plane
+        .properties_for(crtc)
+        .expect("complete cursor properties");
+    let buffer_io = plane.buffer_io();
+    let sprites = plane.sprites_mut();
+    assert_eq!(
+        sprites
+            .prepare(device, buffer_io, 1, 0, 0, 1, 1, &[0xff, 0xff, 0xff, 0xff],)
+            .expect("prepare test cursor sprite"),
+        SpriteStage::Ready,
+    );
+    let lease = sprites.candidate_lease().expect("prepared test lease");
+    let framebuffer = sprites
+        .framebuffer_for_lease(lease)
+        .expect("prepared framebuffer");
+    assert!(sprites.reserve(lease));
+    assert!(sprites.accept_reserved(lease));
+    cursor.crtc_states.insert(
+        crtc,
+        crate::kms::render::platform::cursor_state::CursorCrtcState {
+            applied: Some(crate::kms::render::platform::cursor_state::CursorBinding {
+                properties,
+                lease,
+                framebuffer,
+                x: 100,
+                y: 100,
+                hot_x: 0,
+                hot_y: 0,
+            }),
+            valid: true,
+            resume_visible: false,
+        },
+    );
+    let position = backend.platform.for_tests_seed_atomic_cursor_position(
+        0,
+        properties.plane,
+        properties.crtc_x,
+        properties.crtc_y,
+        100,
+        100,
+        0,
+        0,
+    );
+    (position, lease)
+}
+
 fn warp(backend: &mut KmsBackend, state: &mut yserver_core::server::ServerState, x: i32, y: i32) {
     use yserver_core::backend::Backend;
     Backend::warp_pointer_root(backend, state, x, y);
@@ -761,19 +858,18 @@ fn has_cursor_property(
 }
 
 #[test]
-// Mutation: blame every failed scene-with-cursor commit on the cursor. A
-// buffer, bandwidth or EBUSY failure must not hide the cursor; only a request
-// TEST_ONLY rejects as sent and accepts without the cursor fields is the cursor's.
+// Mutation: restore “non-EBUSY means cursor.” ENOMEM/EIO must remain generic
+// commit errors, even when full TEST_ONLY fails and stripped TEST_ONLY succeeds.
 fn scene_commit_failure_blames_the_cursor_only_when_its_fields_cause_it() {
     use ::drm::control::AtomicCommitFlags;
 
     let einval = || Err(io::Error::from_raw_os_error(libc::EINVAL));
-    let cases: [(&str, Vec<io::Result<()>>, bool, usize); 4] = [
+    let cases: [(&str, Vec<io::Result<()>>, bool, usize); 6] = [
         (
             "cursor fields rejected",
             vec![einval(), einval(), Ok(())],
             true,
-            3,
+            4,
         ),
         (
             "scene rejected",
@@ -782,10 +878,30 @@ fn scene_commit_failure_blames_the_cursor_only_when_its_fields_cause_it() {
             3,
         ),
         (
-            "commit-phase failure",
+            "ENOMEM commit-phase failure",
             vec![Err(io::Error::from_raw_os_error(libc::ENOMEM)), Ok(())],
             false,
-            2,
+            1,
+        ),
+        (
+            "EIO with cursor-only TEST_ONLY difference",
+            vec![
+                Err(io::Error::from_raw_os_error(libc::EIO)),
+                einval(),
+                Ok(()),
+            ],
+            false,
+            1,
+        ),
+        (
+            "ENOMEM with cursor-only TEST_ONLY difference",
+            vec![
+                Err(io::Error::from_raw_os_error(libc::ENOMEM)),
+                einval(),
+                Ok(()),
+            ],
+            false,
+            1,
         ),
         (
             "pending commit",
@@ -797,7 +913,8 @@ fn scene_commit_failure_blames_the_cursor_only_when_its_fields_cause_it() {
     for (name, results, cursor_blamed, record_count) in cases {
         let mut backend = KmsBackend::for_tests();
         let recorder = recording_sink(&mut backend, 0);
-        let position = seed_cursor_position(&mut backend);
+        let (position, lease) = install_applied_atomic_cursor_for_test(&mut backend);
+        let device_key = backend.platform.devices[0].key;
         for result in results {
             recorder.script_result(result);
         }
@@ -814,13 +931,16 @@ fn scene_commit_failure_blames_the_cursor_only_when_its_fields_cause_it() {
             crate::drm::async_flip::FlipTiming::Vsync,
         );
         assert!(result.is_err(), "{name}: the scene commit itself failed");
-        assert_eq!(
-            backend.platform.devices[0]
-                .atomic_commit_sink
-                .take_last_cursor_rejection(),
-            cursor_blamed,
-            "{name}",
-        );
+        let attributed = backend.platform.devices[0]
+            .atomic_commit_sink
+            .take_last_cursor_rejection();
+        assert_eq!(attributed, cursor_blamed, "{name}");
+        if attributed {
+            backend.platform.reject_atomic_cursor_commit(
+                &[position],
+                &result.expect_err("scene failed").to_string(),
+            );
+        }
         let records = recorder.records();
         assert_eq!(records.len(), record_count, "{name}");
         assert_eq!(records[0].kind, AtomicCommitKind::SceneWithCursor);
@@ -837,6 +957,321 @@ fn scene_commit_failure_blames_the_cursor_only_when_its_fields_cause_it() {
                 "{name}: only the cursor fields are dropped",
             );
         }
+        let state = &backend.platform.devices[0].cursor;
+        if cursor_blamed {
+            assert!(
+                state.crtc_states[&position.crtc].applied.is_none(),
+                "{name}"
+            );
+            assert_eq!(
+                state.plane.as_ref().unwrap().sprites().user_count(lease),
+                Some(0),
+                "{name}: attributed EINVAL releases the applied lease",
+            );
+            assert_eq!(
+                backend
+                    .platform
+                    .for_tests_cursor_fallback_remaining(device_key, position.crtc),
+                Some(1),
+                "{name}: attributed EINVAL changes cursor qualification",
+            );
+        } else {
+            assert!(
+                state.crtc_states[&position.crtc].applied.is_some(),
+                "{name}"
+            );
+            assert_eq!(
+                state.plane.as_ref().unwrap().sprites().user_count(lease),
+                Some(1),
+                "{name}: generic scene error retains the applied lease",
+            );
+            assert_eq!(
+                backend
+                    .platform
+                    .for_tests_cursor_fallback_remaining(device_key, position.crtc),
+                None,
+                "{name}: generic scene error does not change qualification",
+            );
+        }
+    }
+}
+
+#[test]
+// Mutation: restore “non-EBUSY means cursor” in the cursor-only caller. ENOMEM
+// and EIO must preserve the applied binding and its sprite user on all retries.
+fn cursor_only_enomem_and_eio_do_not_detach_the_applied_cursor() {
+    use yserver_core::server::ServerState;
+
+    let Some(mut backend) = backend_with_live_scene() else {
+        return;
+    };
+    let recorder = recording_sink(&mut backend, 0);
+    let (initial, lease) = install_applied_atomic_cursor_for_test(&mut backend);
+    let device_key = backend.platform.devices[0].key;
+    let crtc = initial.crtc;
+    let mut state = ServerState::new();
+
+    for (index, errno) in [
+        libc::ENOMEM,
+        libc::EIO,
+        libc::ENOMEM,
+        libc::EIO,
+        libc::ENOMEM,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        recorder.script_result(Err(io::Error::from_raw_os_error(errno)));
+        warp(
+            &mut backend,
+            &mut state,
+            120 + i32::try_from(index).expect("test iteration fits"),
+            110,
+        );
+        maybe_composite(&mut backend);
+
+        let records = recorder.records();
+        assert_eq!(records.len(), index + 1, "failed move has no detach");
+        assert_eq!(records[index].kind, AtomicCommitKind::CursorOnly);
+        assert!(matches!(
+            records[index].result,
+            crate::drm::atomic::tests_support::ScriptedResult::Error {
+                raw_os_error: Some(found),
+                ..
+            } if found == errno
+        ));
+        assert!(
+            backend.platform.devices[0].cursor.crtc_states[&crtc]
+                .applied
+                .is_some()
+        );
+        assert_eq!(
+            backend.platform.devices[0]
+                .cursor
+                .plane
+                .as_ref()
+                .unwrap()
+                .sprites()
+                .user_count(lease),
+            Some(1),
+            "the applied sprite lease stays owned",
+        );
+        assert_eq!(
+            backend
+                .platform
+                .for_tests_cursor_fallback_remaining(device_key, crtc),
+            None,
+            "a generic I/O failure does not change cursor qualification",
+        );
+        assert_eq!(
+            backend
+                .platform
+                .for_tests_cursor_hide_recovery_attempts(device_key, crtc),
+            None,
+        );
+    }
+}
+
+#[test]
+// Mutation: suppress cursor recovery for EINVAL. The existing detach and
+// transient qualification path must still run for an attributed rejection.
+fn cursor_only_einval_still_detaches_and_releases_the_applied_lease() {
+    use yserver_core::server::ServerState;
+
+    let Some(mut backend) = backend_with_live_scene() else {
+        return;
+    };
+    let recorder = recording_sink(&mut backend, 0);
+    let (initial, lease) = install_applied_atomic_cursor_for_test(&mut backend);
+    let device_key = backend.platform.devices[0].key;
+    let crtc = initial.crtc;
+    recorder.script_result(Err(io::Error::from_raw_os_error(libc::EINVAL)));
+    let mut state = ServerState::new();
+
+    warp(&mut backend, &mut state, 120, 110);
+    maybe_composite(&mut backend);
+
+    let records = recorder.records();
+    assert_eq!(records.len(), 2, "recovery issues a blocking detach");
+    assert_eq!(records[0].kind, AtomicCommitKind::CursorOnly);
+    assert!(matches!(
+        records[0].result,
+        crate::drm::atomic::tests_support::ScriptedResult::Error {
+            raw_os_error: Some(libc::EINVAL),
+            ..
+        }
+    ));
+    assert!(
+        backend.platform.devices[0].cursor.crtc_states[&crtc]
+            .applied
+            .is_none()
+    );
+    assert_eq!(
+        backend.platform.devices[0]
+            .cursor
+            .plane
+            .as_ref()
+            .unwrap()
+            .sprites()
+            .user_count(lease),
+        Some(0),
+        "successful EINVAL recovery releases the applied sprite user",
+    );
+    assert_eq!(
+        backend
+            .platform
+            .for_tests_cursor_fallback_remaining(device_key, crtc),
+        Some(1),
+        "EINVAL retains the existing transient fallback qualification",
+    );
+}
+
+#[test]
+// Mutation: keep rollback for every non-EBUSY Atomic show error. ENOMEM/EIO
+// must reject only the staged sprite and retain the currently applied lease.
+fn atomic_show_enomem_and_eio_keep_the_prior_cursor_binding() {
+    let mut backend = KmsBackend::for_tests();
+    let recorder = recording_sink(&mut backend, 0);
+    let (position, prior_lease) = install_applied_atomic_cursor_for_test(&mut backend);
+    let device = Rc::clone(&backend.platform.devices[0].device);
+
+    for (index, errno) in [
+        libc::ENOMEM,
+        libc::EIO,
+        libc::ENOMEM,
+        libc::EIO,
+        libc::ENOMEM,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let candidate = {
+            let plane = backend.platform.devices[0]
+                .cursor
+                .plane
+                .as_mut()
+                .expect("installed cursor plane");
+            let buffer_io = plane.buffer_io();
+            let sprites = plane.sprites_mut();
+            assert_eq!(
+                sprites
+                    .prepare(
+                        Rc::clone(&device),
+                        buffer_io,
+                        u64::try_from(index + 2).expect("test version fits"),
+                        0,
+                        0,
+                        1,
+                        1,
+                        &[0xff, 0, 0, 0xff],
+                    )
+                    .expect("prepare replacement sprite"),
+                crate::kms::cursor_plane::sprites::SpriteStage::Ready,
+            );
+            sprites.candidate_lease().expect("replacement lease")
+        };
+        recorder.script_result(Err(io::Error::from_raw_os_error(errno)));
+        let error = backend
+            .platform
+            .cursor_plane_show_on_crtc(0, 0, 0, 120, 110)
+            .expect_err("scripted cursor-only show failure");
+        assert_eq!(error.operation_error().raw_os_error(), Some(errno));
+
+        let records = recorder.records();
+        assert_eq!(
+            records.len(),
+            index + 1,
+            "failed show has no blocking detach"
+        );
+        assert_eq!(records[index].kind, AtomicCommitKind::CursorOnly);
+        let cursor = &backend.platform.devices[0].cursor;
+        assert!(cursor.crtc_states[&position.crtc].applied.is_some());
+        assert_eq!(
+            cursor
+                .plane
+                .as_ref()
+                .unwrap()
+                .sprites()
+                .user_count(prior_lease),
+            Some(1),
+            "the prior binding remains leased",
+        );
+        assert_eq!(
+            cursor
+                .plane
+                .as_ref()
+                .unwrap()
+                .sprites()
+                .user_count(candidate),
+            Some(0),
+            "the rejected candidate does not become a user",
+        );
+        assert_eq!(
+            cursor
+                .plane
+                .as_ref()
+                .unwrap()
+                .sprites()
+                .prepared_user_count(),
+            0,
+            "the rejected reservation is cleaned up",
+        );
+        assert_eq!(
+            backend.platform.for_tests_cursor_fallback_remaining(
+                backend.platform.devices[0].key,
+                position.crtc,
+            ),
+            None,
+        );
+    }
+}
+
+#[test]
+// Mutation: keep rollback for every non-EBUSY Atomic hide error. ENOMEM/EIO
+// must leave the applied binding and lease in place for generic error handling.
+fn atomic_hide_enomem_and_eio_keep_the_applied_cursor_binding() {
+    let mut backend = KmsBackend::for_tests();
+    let recorder = recording_sink(&mut backend, 0);
+    let (position, lease) = install_applied_atomic_cursor_for_test(&mut backend);
+    let device_key = backend.platform.devices[0].key;
+
+    for (index, errno) in [
+        libc::ENOMEM,
+        libc::EIO,
+        libc::ENOMEM,
+        libc::EIO,
+        libc::ENOMEM,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        recorder.script_result(Err(io::Error::from_raw_os_error(errno)));
+        assert!(backend.platform.cursor_plane_hide_on_crtc(0).is_err());
+
+        let records = recorder.records();
+        assert_eq!(records.len(), index + 1, "failed hide has no extra detach");
+        assert_eq!(records[index].kind, AtomicCommitKind::CursorOnly);
+        assert!(
+            backend.platform.devices[0].cursor.crtc_states[&position.crtc]
+                .applied
+                .is_some()
+        );
+        assert_eq!(
+            backend.platform.devices[0]
+                .cursor
+                .plane
+                .as_ref()
+                .unwrap()
+                .sprites()
+                .user_count(lease),
+            Some(1),
+        );
+        assert_eq!(
+            backend
+                .platform
+                .for_tests_cursor_fallback_remaining(device_key, position.crtc),
+            None,
+        );
     }
 }
 

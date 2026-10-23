@@ -710,7 +710,7 @@ impl PlatformBackend {
         let commit_id = match result {
             Ok(commit_id) => commit_id,
             Err(error) => {
-                let _ = commit_sink.take_last_cursor_rejection();
+                let cursor_rejected = commit_sink.take_last_cursor_rejection();
                 if error.raw_os_error() == Some(libc::EBUSY) {
                     self.devices[device_idx]
                         .cursor
@@ -720,6 +720,9 @@ impl PlatformBackend {
                         ebusy_count: 1,
                         ..CursorMoveOutcome::default()
                     });
+                }
+                if !cursor_rejected {
+                    return Err(error);
                 }
                 let position = [position];
                 let outcome = self.reject_atomic_cursor_commit(&position, &error.to_string());

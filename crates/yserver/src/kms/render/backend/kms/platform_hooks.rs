@@ -167,6 +167,13 @@ impl Platform for PlatformBackend {
                     .clear_direct_cursor_refresh_pending(output_idx);
                 continue;
             }
+            let atomic_path = b
+                .platform
+                .device_for_output(&b.platform.outputs[output_idx].key)
+                .is_some_and(|device| {
+                    device.cursor.state_path()
+                        == crate::kms::cursor_plane::topology::CursorStatePath::Atomic
+                });
             match b.platform.cursor_plane_hide_on_crtc(output_idx) {
                 Ok(()) => {
                     b.pstate
@@ -179,6 +186,18 @@ impl Platform for PlatformBackend {
                         .mark_direct_cursor_refresh_pending(output_idx);
                     log::debug!(
                         "scanout_m2: direct cursor hide deferred on output {output_idx}; retrying on CRTC event"
+                    );
+                }
+                Err(error)
+                    if atomic_path
+                        && error.raw_os_error() != Some(libc::EINVAL)
+                        && error.raw_os_error() != Some(libc::EBUSY) =>
+                {
+                    b.pstate
+                        .scanout_m2
+                        .mark_direct_cursor_refresh_pending(output_idx);
+                    log::warn!(
+                        "scanout_m2: cursor hide failed on output {output_idx}: {error}; retrying on CRTC event"
                     );
                 }
                 Err(error) => {
