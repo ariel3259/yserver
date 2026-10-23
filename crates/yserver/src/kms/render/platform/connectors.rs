@@ -704,6 +704,9 @@ impl PlatformBackend {
                 .set(existing.output.gamma_lut_disabled.get());
             *output.pending_gamma_lut.borrow_mut() =
                 existing.output.pending_gamma_lut.borrow().clone();
+            output
+                .pending_gamma_deadline
+                .set(existing.output.pending_gamma_deadline.get());
         }
 
         if let Some((prepared_route, prepared)) = prepared_pool.as_ref() {

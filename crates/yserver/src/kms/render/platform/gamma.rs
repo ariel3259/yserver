@@ -66,13 +66,24 @@ impl PlatformBackend {
     /// Submit retained gamma after a page-flip event has freed this CRTC.
     /// Pending gamma from an EBUSY rejection and gamma held behind an async
     /// flip both use the same event-driven path.
-    pub(crate) fn retry_pending_gamma_after_flip(&self, output_idx: usize) {
+    pub(crate) fn retry_pending_gamma_after_flip(
+        &self,
+        output_idx: usize,
+        now: std::time::Instant,
+    ) {
         let Some(output) = self.outputs.get(output_idx).map(|layout| &layout.output) else {
             return;
         };
-        if output.pending_gamma_lut.borrow().is_some()
-            && let Err(error) = self.submit_pending_gamma_for_output(output_idx)
-        {
+        if output.pending_gamma_lut.borrow().is_none() {
+            return;
+        }
+        if let Some(deadline) = output.pending_gamma_deadline.get() {
+            if now < deadline {
+                return;
+            }
+            output.pending_gamma_deadline.set(None);
+        }
+        if let Err(error) = self.submit_pending_gamma_for_output(output_idx) {
             log::warn!(
                 "kms gamma: retry for CRTC {:?} failed: {error}",
                 output.crtc

@@ -2829,7 +2829,8 @@ impl KmsBackend {
                 continue;
             }
             if !self.gamma_output_has_queued_scanout(output_idx) {
-                self.platform.retry_pending_gamma_after_flip(output_idx);
+                self.platform
+                    .retry_pending_gamma_after_flip(output_idx, self.monotonic_now());
             }
         }
         // Idle vblank arming: clear the arm + advance the Present clock for
@@ -2966,6 +2967,19 @@ impl KmsBackend {
         } else {
             None
         };
+        let gamma_deadline = allow_kms_timers
+            .then(|| {
+                self.platform
+                    .outputs
+                    .iter()
+                    .filter_map(|layout| {
+                        (layout.output.pending_gamma_lut.borrow().is_some())
+                            .then_some(layout.output.pending_gamma_deadline.get())
+                            .flatten()
+                    })
+                    .min()
+            })
+            .flatten();
         let needs_source_wait_poll =
             self.pstate
                 .pending_present_source_waits
@@ -2984,6 +2998,7 @@ impl KmsBackend {
         scene_deadline
             .into_iter()
             .chain(direct_cursor_retry_deadline)
+            .chain(gamma_deadline)
             .chain(source_wait_deadline)
             .chain(rescan_deadline)
             // Not gated on `allow_kms_timers`: `maybe_composite` closes the
@@ -3069,6 +3084,32 @@ impl KmsBackend {
         if !self.kms_outputs_active {
             self.drain_paint_submit_telemetry();
             return Ok(());
+        }
+        let now = self.monotonic_now();
+        let expired_gamma_outputs = self
+            .platform
+            .outputs
+            .iter()
+            .enumerate()
+            .filter_map(|(output_idx, layout)| {
+                (layout.output.pending_gamma_lut.borrow().is_some()
+                    && layout
+                        .output
+                        .pending_gamma_deadline
+                        .get()
+                        .is_some_and(|deadline| now >= deadline))
+                .then_some(output_idx)
+            })
+            .collect::<Vec<_>>();
+        for output_idx in expired_gamma_outputs {
+            let output = &self.platform.outputs[output_idx].output;
+            output.pending_gamma_deadline.set(None);
+            if let Err(error) = self.platform.submit_pending_gamma_for_output(output_idx) {
+                log::warn!(
+                    "kms gamma: deadline submit for CRTC {:?} failed: {error}",
+                    output.crtc
+                );
+            }
         }
         if self.pstate.tearing.is_on()
             && self

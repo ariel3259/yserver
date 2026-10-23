@@ -3866,6 +3866,7 @@ fn clone_test_drm_output(output: &crate::platform::drm::Output) -> crate::platfo
         crtc_degamma_lut_prop: output.crtc_degamma_lut_prop,
         crtc_ctm_prop: output.crtc_ctm_prop,
         pending_gamma_lut: std::cell::RefCell::new(None),
+        pending_gamma_deadline: std::cell::Cell::new(None),
         gamma_lut_disabled: std::cell::Cell::new(false),
         scanout_modifiers: output.scanout_modifiers.clone(),
         mm_width: output.mm_width,

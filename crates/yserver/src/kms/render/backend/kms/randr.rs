@@ -1581,14 +1581,49 @@ impl KmsBackend {
             return Ok(());
         };
         if output.crtc_gamma_lut_prop.is_some() && !output.gamma_lut_disabled.get() {
+            let now = self.monotonic_now();
+            if output.pending_gamma_lut.borrow().is_none() {
+                let refresh_hz = match output.picked.vrefresh {
+                    0 => 60,
+                    refresh_hz => refresh_hz,
+                };
+                let refresh_period =
+                    std::time::Duration::from_nanos(1_000_000_000 / u64::from(refresh_hz));
+                let crtc_key = crate::kms::render::platform::CrtcKey::new(device_key, crtc);
+                let completion = self.platform.present_get_completion_clock(crtc_key);
+                let last_page_flip = (completion.source
+                    == yserver_core::backend::PresentClockSource::PageFlip
+                    && completion.ust != 0)
+                    .then(|| std::time::Duration::from_micros(completion.ust));
+                let active = last_page_flip.is_some_and(|last_page_flip| {
+                    let age = [
+                        crate::drm::atomic::monotonic_timestamp(),
+                        crate::drm::atomic::boottime_timestamp(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|now| now.checked_sub(last_page_flip))
+                    .min();
+                    age.is_some_and(|age| age <= refresh_period.saturating_mul(2))
+                });
+                output
+                    .pending_gamma_deadline
+                    .set(active.then(|| now + refresh_period));
+            }
             *output.pending_gamma_lut.borrow_mut() =
                 Some((lut.red.clone(), lut.green.clone(), lut.blue.clone()));
-            if self.scanout_allowed()
+            let deadline_elapsed = output
+                .pending_gamma_deadline
+                .get()
+                .is_none_or(|deadline| now >= deadline);
+            if deadline_elapsed
+                && self.scanout_allowed()
                 && !self.gamma_output_has_queued_scanout(output_idx)
                 && !device
                     .atomic_commit_sink
                     .page_flip_commit_in_flight(&device.device, crtc)
             {
+                output.pending_gamma_deadline.set(None);
                 self.platform.submit_pending_gamma_for_output(output_idx)?;
             }
             return Ok(());

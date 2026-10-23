@@ -855,6 +855,7 @@ impl PlatformBackend {
                     crtc_degamma_lut_prop: None,
                     crtc_ctm_prop: None,
                     pending_gamma_lut: std::cell::RefCell::new(None),
+                    pending_gamma_deadline: std::cell::Cell::new(None),
                     gamma_lut_disabled: std::cell::Cell::new(false),
                     scanout_modifiers: Vec::new(),
                     mm_width: 0,
