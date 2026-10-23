@@ -18,6 +18,18 @@ pub(crate) struct SpriteBufferLease {
 }
 
 impl SpriteBufferLease {
+    #[cfg(test)]
+    pub(crate) fn for_tests(version: u64, hot_x: u16, hot_y: u16) -> Self {
+        Self {
+            slot: 0,
+            version,
+            width: 1,
+            height: 1,
+            hot_x,
+            hot_y,
+        }
+    }
+
     pub(crate) fn version(self) -> u64 {
         self.version
     }
@@ -361,11 +373,6 @@ impl SpritePool {
     #[cfg(test)]
     pub(crate) fn for_tests_max_buffer_count(&self) -> usize {
         self.max_buffers
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_tests_buffer_count(&self) -> usize {
-        self.buffers.len()
     }
 
     #[cfg(test)]

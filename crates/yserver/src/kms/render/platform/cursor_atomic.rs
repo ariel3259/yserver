@@ -151,13 +151,23 @@ impl PlatformBackend {
                 {
                     plane.sprites_mut().reject_reserved(candidate);
                 }
-                let _ = sink.take_last_cursor_rejection();
+                let cursor_rejected = sink.take_last_cursor_rejection();
                 if error.raw_os_error() == Some(libc::EBUSY) {
                     self.devices[device_idx]
                         .cursor
                         .cursor_retry_waits_for_flip
                         .insert(crtc);
                     return Err(deferred_show(&self.devices[device_idx].cursor, crtc));
+                }
+                if !cursor_rejected {
+                    return Err(if prior.is_some() {
+                        CursorShowError::StillVisible {
+                            operation_error: error,
+                            rollback_error: None,
+                        }
+                    } else {
+                        CursorShowError::Unbound(error)
+                    });
                 }
                 let rollback = self.atomic_rollback(device_idx, crtc, &error, true);
                 return Err(match rollback {
@@ -271,7 +281,7 @@ impl PlatformBackend {
         let commit_id = match submit {
             Ok(commit_id) => commit_id,
             Err(error) => {
-                let _ = sink.take_last_cursor_rejection();
+                let cursor_rejected = sink.take_last_cursor_rejection();
                 if error.raw_os_error() == Some(libc::EBUSY) {
                     self.devices[device_idx]
                         .cursor
@@ -282,7 +292,9 @@ impl PlatformBackend {
                         "cursor hide waits for the prior CRTC event",
                     ));
                 }
-                let _ = self.atomic_rollback(device_idx, crtc, &error, true);
+                if cursor_rejected {
+                    let _ = self.atomic_rollback(device_idx, crtc, &error, true);
+                }
                 return Err(error);
             }
         };

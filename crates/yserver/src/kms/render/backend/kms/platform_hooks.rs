@@ -151,6 +151,9 @@ impl Platform for PlatformBackend {
             return;
         }
         if !b.platform.any_cursor_plane_visible() {
+            for output_idx in 0..b.platform.outputs.len() {
+                b.platform.clear_direct_cursor_retry(output_idx);
+            }
             b.pstate
                 .scanout_m2
                 .clear_all_direct_cursor_refresh_pending();
@@ -162,24 +165,51 @@ impl Platform for PlatformBackend {
         let mut failed = false;
         for output_idx in 0..b.platform.outputs.len() {
             if !b.platform.cursor_plane_visible_for_output(output_idx) {
+                b.platform.clear_direct_cursor_retry(output_idx);
                 b.pstate
                     .scanout_m2
                     .clear_direct_cursor_refresh_pending(output_idx);
                 continue;
             }
+            let atomic_path = b
+                .platform
+                .device_for_output(&b.platform.outputs[output_idx].key)
+                .is_some_and(|device| {
+                    device.cursor.state_path()
+                        == crate::kms::cursor_plane::topology::CursorStatePath::Atomic
+                });
             match b.platform.cursor_plane_hide_on_crtc(output_idx) {
                 Ok(()) => {
+                    b.platform.clear_direct_cursor_retry(output_idx);
                     b.pstate
                         .scanout_m2
                         .clear_direct_cursor_refresh_pending(output_idx);
                 }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock
+                        || error.raw_os_error() == Some(libc::EBUSY) =>
+                {
+                    b.platform.clear_direct_cursor_retry(output_idx);
                     b.pstate
                         .scanout_m2
                         .mark_direct_cursor_refresh_pending(output_idx);
                     log::debug!(
                         "scanout_m2: direct cursor hide deferred on output {output_idx}; retrying on CRTC event"
                     );
+                }
+                Err(error)
+                    if atomic_path
+                        && error.raw_os_error() != Some(libc::EINVAL)
+                        && error.raw_os_error() != Some(libc::EBUSY) =>
+                {
+                    if !b.schedule_direct_cursor_retry(
+                        output_idx,
+                        "hide",
+                        &error,
+                        "cursor_hide_failed",
+                    ) {
+                        failed = true;
+                    }
                 }
                 Err(error) => {
                     log::warn!(

@@ -4,6 +4,7 @@ use crate::drm::atomic::{
     AtomicCommitKind, AtomicCommitSink,
     tests_support::{AtomicCommitRecord, RecordingAtomicCommitExecutor},
 };
+use std::collections::HashSet;
 
 fn recording_sink(
     backend: &mut KmsBackend,
@@ -175,8 +176,8 @@ fn copied_scene_flip_uses_the_sink_devices_cursor_plane() {
 
 #[test]
 // Mutation: return atomic positions for every visible plane without checking
-// the per-device atomic capability. The legacy request would gain cursor fields.
-fn legacy_scene_flip_has_no_atomic_cursor_properties() {
+// the per-device atomic capability. The scene flip would gain cursor fields.
+fn scene_flip_without_atomic_cursor_capability_has_no_cursor_properties() {
     let mut backend = KmsBackend::for_tests();
     let recorder = recording_sink(&mut backend, 0);
     let device_key = backend.platform.devices[0].key;
@@ -640,41 +641,6 @@ fn scene_damage_after_cursor_retirement_submits_scene_with_latest_position() {
     retire_test_flip(&mut backend, &mut state, 2);
     assert_no_cursor_work(&backend, device_key);
 }
-
-#[test]
-// Mutation: route an atomic-capable backend through its legacy move branch.
-fn legacy_path_pointer_motion_keeps_one_legacy_move_and_no_atomic_commit() {
-    use yserver_core::server::ServerState;
-
-    let Some(mut backend) = backend_with_live_scene() else {
-        return;
-    };
-    let recorder = recording_sink(&mut backend, 0);
-    let device_key = backend.platform.devices[0].key;
-    let crtc = backend.platform.outputs[0].output.crtc;
-    let mut plane = crate::kms::cursor_plane::CursorPlane::for_tests_stub(
-        Rc::clone(&backend.platform.devices[0].device),
-        64,
-        64,
-    );
-    plane.for_tests_set_visible(crtc, true);
-    backend.platform.devices[0].cursor.plane = Some(plane);
-    backend.platform.devices[0].cursor.atomic_cursor = false;
-    let mut state = ServerState::new();
-
-    warp(&mut backend, &mut state, 150, 120);
-
-    assert_eq!(recorder.records().len(), 0);
-    assert_eq!(
-        backend.platform.devices[0]
-            .atomic_commit_sink
-            .for_tests_motion_to_accept_sample_count(),
-        1,
-        "one visible legacy cursor move was attempted",
-    );
-    assert_no_cursor_work(&backend, device_key);
-}
-
 #[test]
 // Mutation: do not set `cursor_retry_waits_for_flip` after a cursor-only EBUSY.
 fn cursor_only_ebusy_waits_for_the_next_flip_before_retrying() {
@@ -760,84 +726,499 @@ fn has_cursor_property(
         .any(|update| update.object == position.plane.into())
 }
 
-#[test]
-// Mutation: blame every failed scene-with-cursor commit on the cursor. A
-// buffer, bandwidth or EBUSY failure must not hide the cursor; only a request
-// TEST_ONLY rejects as sent and accepts without the cursor fields is the cursor's.
-fn scene_commit_failure_blames_the_cursor_only_when_its_fields_cause_it() {
-    use ::drm::control::AtomicCommitFlags;
-
-    let einval = || Err(io::Error::from_raw_os_error(libc::EINVAL));
-    let cases: [(&str, Vec<io::Result<()>>, bool, usize); 4] = [
-        (
-            "cursor fields rejected",
-            vec![einval(), einval(), Ok(())],
-            true,
-            3,
-        ),
-        (
-            "scene rejected",
-            vec![einval(), einval(), einval()],
-            false,
-            3,
-        ),
-        (
-            "commit-phase failure",
-            vec![Err(io::Error::from_raw_os_error(libc::ENOMEM)), Ok(())],
-            false,
-            2,
-        ),
-        (
-            "pending commit",
-            vec![Err(io::Error::from_raw_os_error(libc::EBUSY))],
-            false,
-            1,
-        ),
-    ];
-    for (name, results, cursor_blamed, record_count) in cases {
-        let mut backend = KmsBackend::for_tests();
-        let recorder = recording_sink(&mut backend, 0);
-        let position = seed_cursor_position(&mut backend);
-        for result in results {
-            recorder.script_result(result);
-        }
-        set_scene_fence_properties(&mut backend.platform.outputs[0].output);
-        let mut out_fence = -1;
-        let result = crate::drm::page_flip::submit_scene_flip_with_fences(
-            &backend.platform.devices[0].device,
-            &backend.platform.devices[0].atomic_commit_sink,
-            &backend.platform.outputs[0].output,
-            raw(71),
-            -1,
-            &mut out_fence,
-            &[position],
-            crate::drm::async_flip::FlipTiming::Vsync,
-        );
-        assert!(result.is_err(), "{name}: the scene commit itself failed");
-        assert_eq!(
-            backend.platform.devices[0]
-                .atomic_commit_sink
-                .take_last_cursor_rejection(),
-            cursor_blamed,
-            "{name}",
-        );
-        let records = recorder.records();
-        assert_eq!(records.len(), record_count, "{name}");
-        assert_eq!(records[0].kind, AtomicCommitKind::SceneWithCursor);
-        if let Some(full) = records.get(1) {
-            assert_eq!(full.flags, AtomicCommitFlags::TEST_ONLY, "{name}");
-            assert_eq!(full.properties, records[0].properties, "{name}");
-        }
-        if let Some(stripped) = records.get(2) {
-            assert_eq!(stripped.flags, AtomicCommitFlags::TEST_ONLY, "{name}");
-            assert!(!has_cursor_property(stripped, position), "{name}");
-            assert_eq!(
-                stripped.properties.len() + 2,
-                records[0].properties.len(),
-                "{name}: only the cursor fields are dropped",
-            );
-        }
+fn atomic_cursor_fixture(
+    test_name: &str,
+) -> Option<super::cursor_sprites::support::AtomicPathFixture> {
+    let fixture = super::cursor_sprites::support::AtomicPathFixture::new(
+        super::cursor_sprites::support::PathKind::Physical,
+    )
+    .expect("Atomic cursor scene fixture construction");
+    if fixture.is_none() {
+        println!("SKIP {test_name}: no Vulkan test device");
     }
+    fixture
+}
+
+fn establish_test_cursor(
+    fixture: &mut super::cursor_sprites::support::AtomicPathFixture,
+    delivered: &mut HashSet<super::cursor_sprites::support::CompletionKey>,
+) -> super::cursor_sprites::support::HardwareCursor {
+    let cursor = super::cursor_sprites::support::create_argb_cursor(
+        &mut fixture.scene.events.backend,
+        (8, 8),
+        [0xff, 0xff, 0xff, 0xff],
+        (0, 0),
+    );
+    super::cursor_sprites::support::establish_hardware_cursor(
+        fixture,
+        delivered,
+        cursor,
+        (120, 100),
+    )
+}
+
+#[test]
+#[ignore = "requires the lavapipe Vulkan scene fixture"]
+// Mutation: restore non-EBUSY scene attribution. Each generic failure carries
+// a scripted failed full TEST_ONLY and successful stripped TEST_ONLY; that
+// must never detach or release the applied cursor through Backend.
+fn scene_enomem_and_eio_do_not_recover_the_position_carrying_cursor() {
+    use super::cursor_sprites::support as cursor_support;
+    use yserver_core::backend::Backend;
+
+    for errno in [libc::ENOMEM, libc::EIO] {
+        let Some(mut fixture) = atomic_cursor_fixture(
+            "scene_enomem_and_eio_do_not_recover_the_position_carrying_cursor",
+        ) else {
+            return;
+        };
+        let mut delivered = HashSet::new();
+        let hardware = establish_test_cursor(&mut fixture, &mut delivered);
+        let backend = &fixture.scene.events.backend;
+        let binding = cursor_support::applied_cursor_binding(backend, hardware.output_idx)
+            .expect("Backend established an applied hardware cursor");
+        let device_key = backend.platform.outputs[hardware.output_idx].key.device_key;
+        let position = backend
+            .platform
+            .cursor_plane_atomic_positions_for_outputs(&[0])[0];
+        let recorder = Rc::clone(&fixture.scene.events.recorders[&hardware.device_fd]);
+        let start = cursor_support::record_count(&fixture, hardware.device_fd);
+        cursor_support::damage_root(&mut fixture);
+        recorder.script_result(Err(io::Error::from_raw_os_error(errno)));
+        recorder.script_result(Err(io::Error::from_raw_os_error(libc::EINVAL)));
+        recorder.script_result(Ok(()));
+
+        Backend::maybe_composite(&mut fixture.scene.events.backend)
+            .expect("submit the position-carrying scene through Backend");
+
+        let records = recorder.records();
+        assert_eq!(
+            records.len(),
+            start + 1,
+            "generic scene failure has no cursor probes or detach"
+        );
+        let failed = &records[start];
+        assert_eq!(failed.kind, AtomicCommitKind::SceneWithCursor);
+        assert!(has_cursor_property(failed, position));
+        assert!(matches!(
+            failed.result,
+            crate::drm::atomic::tests_support::ScriptedResult::Error {
+                raw_os_error: Some(found),
+                ..
+            } if found == errno
+        ));
+        assert_eq!(
+            cursor_support::applied_cursor_binding(
+                &fixture.scene.events.backend,
+                hardware.output_idx,
+            ),
+            Some(binding),
+            "generic scene failure retains the applied binding",
+        );
+        assert_eq!(
+            cursor_support::sprite_users(
+                &fixture.scene.events.backend,
+                hardware.output_idx,
+                binding.lease,
+            ),
+            Some(1),
+            "generic scene failure retains the lease user",
+        );
+        assert_eq!(
+            fixture
+                .scene
+                .events
+                .backend
+                .platform
+                .for_tests_cursor_fallback_remaining(device_key, hardware.crtc),
+            None,
+            "generic scene failure does not change cursor qualification",
+        );
+
+        recorder.clear_scripted_results();
+        let cleanup_start = cursor_support::record_count(&fixture, hardware.device_fd);
+        fixture
+            .scene
+            .events
+            .backend
+            .platform
+            .cursor_plane_hide_on_crtc(hardware.output_idx)
+            .expect("teardown detaches the retained test cursor after failed scene submit");
+        let detach = recorder
+            .records()
+            .into_iter()
+            .skip(cleanup_start)
+            .find(|record| {
+                record.kind == AtomicCommitKind::CursorOnly
+                    && record.result == crate::drm::atomic::tests_support::ScriptedResult::Ok
+            })
+            .expect("teardown hide was recorded");
+        cursor_support::retire_cursor_record(
+            &mut fixture,
+            &mut delivered,
+            hardware.output_idx,
+            &detach,
+            99,
+        );
+        cursor_support::finish_atomic_fixture(fixture, &mut delivered);
+    }
+}
+
+#[test]
+#[ignore = "requires the lavapipe Vulkan scene fixture"]
+// Mutation: restore non-EBUSY cursor-only attribution. ENOMEM/EIO must retain
+// the applied binding and lease without a Backend-triggered detach.
+fn cursor_only_enomem_and_eio_do_not_detach_the_applied_cursor() {
+    use super::cursor_sprites::support as cursor_support;
+
+    let Some(mut fixture) =
+        atomic_cursor_fixture("cursor_only_enomem_and_eio_do_not_detach_the_applied_cursor")
+    else {
+        return;
+    };
+    let mut delivered = HashSet::new();
+    let hardware = establish_test_cursor(&mut fixture, &mut delivered);
+    let backend = &fixture.scene.events.backend;
+    let binding = cursor_support::applied_cursor_binding(backend, hardware.output_idx)
+        .expect("Backend established an applied hardware cursor");
+    let device_key = backend.platform.outputs[hardware.output_idx].key.device_key;
+    let recorder = Rc::clone(&fixture.scene.events.recorders[&hardware.device_fd]);
+    cursor_support::drain_unretired_output_events(
+        &mut fixture,
+        &mut delivered,
+        hardware.output_idx,
+    );
+    let start = cursor_support::record_count(&fixture, hardware.device_fd);
+
+    for (index, errno) in [
+        libc::ENOMEM,
+        libc::EIO,
+        libc::ENOMEM,
+        libc::EIO,
+        libc::ENOMEM,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        recorder.script_result(Err(io::Error::from_raw_os_error(errno)));
+        warp(
+            &mut fixture.scene.events.backend,
+            &mut fixture.scene.events.state,
+            120 + i32::try_from(index).expect("test iteration fits"),
+            110,
+        );
+        maybe_composite(&mut fixture.scene.events.backend);
+
+        let records = recorder.records();
+        assert_eq!(
+            records.len(),
+            start + index + 1,
+            "a failed move adds only one atomic submission",
+        );
+        let failed = &records[start + index];
+        assert_eq!(failed.kind, AtomicCommitKind::CursorOnly);
+        assert!(matches!(
+            failed.result,
+            crate::drm::atomic::tests_support::ScriptedResult::Error {
+                raw_os_error: Some(found),
+                ..
+            } if found == errno
+        ));
+        assert!(
+            cursor_support::applied_cursor_binding(
+                &fixture.scene.events.backend,
+                hardware.output_idx,
+            ) == Some(binding)
+        );
+        assert_eq!(
+            cursor_support::sprite_users(
+                &fixture.scene.events.backend,
+                hardware.output_idx,
+                binding.lease,
+            ),
+            Some(1),
+            "the applied sprite lease stays owned",
+        );
+        assert_eq!(
+            fixture
+                .scene
+                .events
+                .backend
+                .platform
+                .for_tests_cursor_fallback_remaining(device_key, hardware.crtc),
+            None,
+            "a generic I/O failure does not change cursor qualification",
+        );
+        assert_eq!(
+            fixture
+                .scene
+                .events
+                .backend
+                .platform
+                .for_tests_cursor_hide_recovery_attempts(device_key, hardware.crtc),
+            None,
+        );
+    }
+
+    let detach =
+        cursor_support::accept_cursor_detach(&mut fixture, &mut delivered, hardware.output_idx);
+    cursor_support::retire_cursor_record(
+        &mut fixture,
+        &mut delivered,
+        hardware.output_idx,
+        &detach,
+        99,
+    );
+    cursor_support::finish_atomic_fixture(fixture, &mut delivered);
+}
+
+#[test]
+#[ignore = "requires the lavapipe Vulkan scene fixture"]
+// Mutation: suppress cursor recovery for EINVAL. Backend must still issue the
+// existing detach and transient qualification update for an attributed error.
+fn cursor_only_einval_still_detaches_and_releases_the_applied_lease() {
+    use super::cursor_sprites::support as cursor_support;
+
+    let Some(mut fixture) =
+        atomic_cursor_fixture("cursor_only_einval_still_detaches_and_releases_the_applied_lease")
+    else {
+        return;
+    };
+    let mut delivered = HashSet::new();
+    let hardware = establish_test_cursor(&mut fixture, &mut delivered);
+    let binding =
+        cursor_support::applied_cursor_binding(&fixture.scene.events.backend, hardware.output_idx)
+            .expect("Backend established an applied hardware cursor");
+    let device_key = fixture.scene.events.backend.platform.outputs[hardware.output_idx]
+        .key
+        .device_key;
+    let recorder = Rc::clone(&fixture.scene.events.recorders[&hardware.device_fd]);
+    let start = cursor_support::record_count(&fixture, hardware.device_fd);
+    recorder.script_result(Err(io::Error::from_raw_os_error(libc::EINVAL)));
+
+    warp(
+        &mut fixture.scene.events.backend,
+        &mut fixture.scene.events.state,
+        120,
+        110,
+    );
+    maybe_composite(&mut fixture.scene.events.backend);
+
+    let records = recorder.records();
+    assert_eq!(
+        records.len(),
+        start + 2,
+        "recovery issues a blocking detach"
+    );
+    assert_eq!(records[start].kind, AtomicCommitKind::CursorOnly);
+    assert!(matches!(
+        records[start].result,
+        crate::drm::atomic::tests_support::ScriptedResult::Error {
+            raw_os_error: Some(libc::EINVAL),
+            ..
+        }
+    ));
+    assert!(
+        cursor_support::applied_cursor_binding(&fixture.scene.events.backend, hardware.output_idx,)
+            .is_none()
+    );
+    assert_eq!(
+        cursor_support::sprite_users(
+            &fixture.scene.events.backend,
+            hardware.output_idx,
+            binding.lease,
+        ),
+        Some(0),
+        "successful EINVAL recovery releases the applied sprite user",
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .events
+            .backend
+            .platform
+            .for_tests_cursor_fallback_remaining(device_key, hardware.crtc),
+        Some(1),
+        "EINVAL retains the existing transient fallback qualification",
+    );
+    cursor_support::finish_atomic_fixture(fixture, &mut delivered);
+}
+
+#[test]
+#[ignore = "requires the lavapipe Vulkan scene fixture"]
+// Mutation: return Unbound on generic Atomic show errors despite an applied
+// binding. The Backend scene must keep the hardware cursor visible for retry.
+fn atomic_show_eio_keeps_the_prior_cursor_visible_through_backend() {
+    use super::cursor_sprites::support as cursor_support;
+    use yserver_core::backend::Backend;
+
+    let Some(mut fixture) =
+        atomic_cursor_fixture("atomic_show_eio_keeps_the_prior_cursor_visible_through_backend")
+    else {
+        return;
+    };
+    let mut delivered = HashSet::new();
+    let hardware = establish_test_cursor(&mut fixture, &mut delivered);
+    let prior =
+        cursor_support::applied_cursor_binding(&fixture.scene.events.backend, hardware.output_idx)
+            .expect("Backend established the prior hardware cursor");
+    let recorder = Rc::clone(&fixture.scene.events.recorders[&hardware.device_fd]);
+    let start = cursor_support::record_count(&fixture, hardware.device_fd);
+    let replacement = cursor_support::create_argb_cursor(
+        &mut fixture.scene.events.backend,
+        (4, 4),
+        [0x23, 0x45, 0x67, 0xff],
+        (1, 2),
+    );
+    cursor_support::define_root_cursor(&mut fixture.scene.events.backend, replacement);
+    cursor_support::damage_root(&mut fixture);
+    Backend::maybe_composite(&mut fixture.scene.events.backend)
+        .expect("submit replacement scene through Backend");
+    recorder.script_result(Err(io::Error::from_raw_os_error(libc::EIO)));
+    cursor_support::retire_pending_output(
+        &mut fixture.scene.events,
+        &mut delivered,
+        hardware.output_idx,
+        99,
+    );
+
+    let records = recorder.records();
+    assert_eq!(
+        records.len(),
+        start + 2,
+        "failed show has no blocking detach"
+    );
+    assert_eq!(records[start].kind, AtomicCommitKind::SceneWithCursor);
+    assert_eq!(records[start + 1].kind, AtomicCommitKind::CursorOnly);
+    assert!(matches!(
+        records[start + 1].result,
+        crate::drm::atomic::tests_support::ScriptedResult::Error {
+            raw_os_error: Some(libc::EIO),
+            ..
+        }
+    ));
+    assert_eq!(
+        cursor_support::applied_cursor_binding(&fixture.scene.events.backend, hardware.output_idx,),
+        Some(prior),
+        "the old hardware binding remains applied",
+    );
+    assert_eq!(
+        cursor_support::sprite_users(
+            &fixture.scene.events.backend,
+            hardware.output_idx,
+            prior.lease,
+        ),
+        Some(1),
+        "the old hardware lease remains owned",
+    );
+    assert_eq!(
+        fixture.scene.events.backend.scene.cursor_mode(),
+        crate::kms::render::scene::CursorPlaneMode::Mixed,
+        "Backend retains visible hardware ownership while scheduling a show retry",
+    );
+
+    let detach =
+        cursor_support::accept_cursor_detach(&mut fixture, &mut delivered, hardware.output_idx);
+    cursor_support::retire_cursor_record(
+        &mut fixture,
+        &mut delivered,
+        hardware.output_idx,
+        &detach,
+        100,
+    );
+    cursor_support::finish_atomic_fixture(fixture, &mut delivered);
+}
+
+#[test]
+#[ignore = "requires the lavapipe Vulkan scene fixture"]
+// Mutation: roll back every non-EBUSY Atomic hide error. Backend must leave
+// the failed frame generic while retaining the applied binding and lease.
+fn atomic_hide_eio_keeps_the_applied_cursor_through_backend() {
+    use super::cursor_sprites::support as cursor_support;
+    use yserver_core::backend::Backend;
+
+    let Some(mut fixture) =
+        atomic_cursor_fixture("atomic_hide_eio_keeps_the_applied_cursor_through_backend")
+    else {
+        return;
+    };
+    let mut delivered = HashSet::new();
+    let hardware = establish_test_cursor(&mut fixture, &mut delivered);
+    let prior =
+        cursor_support::applied_cursor_binding(&fixture.scene.events.backend, hardware.output_idx)
+            .expect("Backend established the prior hardware cursor");
+    let device_key = fixture.scene.events.backend.platform.outputs[hardware.output_idx]
+        .key
+        .device_key;
+    let properties = cursor_support::cursor_properties_for_output(
+        &fixture.scene.events.backend,
+        hardware.output_idx,
+    );
+    let recorder = Rc::clone(&fixture.scene.events.recorders[&hardware.device_fd]);
+    let start = cursor_support::record_count(&fixture, hardware.device_fd);
+    Backend::set_cursor_hidden(&mut fixture.scene.events.backend, true);
+    cursor_support::damage_root(&mut fixture);
+    Backend::maybe_composite(&mut fixture.scene.events.backend)
+        .expect("submit hide scene through Backend");
+    recorder.script_result(Err(io::Error::from_raw_os_error(libc::EIO)));
+    cursor_support::retire_pending_output(
+        &mut fixture.scene.events,
+        &mut delivered,
+        hardware.output_idx,
+        99,
+    );
+
+    let records = recorder.records();
+    assert_eq!(records.len(), start + 2, "failed hide has no extra detach");
+    assert_eq!(records[start].kind, AtomicCommitKind::SceneWithCursor);
+    assert_eq!(records[start + 1].kind, AtomicCommitKind::CursorOnly);
+    assert!(matches!(
+        records[start + 1].result,
+        crate::drm::atomic::tests_support::ScriptedResult::Error {
+            raw_os_error: Some(libc::EIO),
+            ..
+        }
+    ));
+    assert_eq!(
+        cursor_support::applied_cursor_binding(&fixture.scene.events.backend, hardware.output_idx,),
+        Some(prior),
+        "generic hide failure retains the applied binding",
+    );
+    assert_eq!(
+        cursor_support::sprite_users(
+            &fixture.scene.events.backend,
+            hardware.output_idx,
+            prior.lease,
+        ),
+        Some(1),
+        "generic hide failure retains the lease user",
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .events
+            .backend
+            .platform
+            .for_tests_cursor_fallback_remaining(device_key, hardware.crtc),
+        None,
+        "generic hide failure does not change cursor qualification",
+    );
+    assert_eq!(
+        cursor_support::record_property(&records[start + 1], properties.fb_id),
+        Some(0),
+        "the failed Backend request was the cursor detach",
+    );
+
+    let detach =
+        cursor_support::accept_cursor_detach(&mut fixture, &mut delivered, hardware.output_idx);
+    cursor_support::retire_cursor_record(
+        &mut fixture,
+        &mut delivered,
+        hardware.output_idx,
+        &detach,
+        100,
+    );
+    cursor_support::finish_atomic_fixture(fixture, &mut delivered);
 }
 
 #[test]
@@ -879,55 +1260,4 @@ fn direct_scanout_probe_tests_the_request_it_commits() {
     assert_eq!(records[0].kind, records[1].kind);
     assert_eq!(records[0].properties, records[1].properties);
     assert_cursor_properties(&records[0], position);
-}
-
-#[test]
-// Mutation: return Ok from a hide on a permanently disabled device without
-// issuing it. The scene would then draw the SW cursor beside a stuck HW one.
-fn permanently_disabled_cursor_still_hides_a_plane_left_visible() {
-    let mut backend = KmsBackend::for_tests();
-    let position = seed_cursor_position(&mut backend);
-    let hide = Rc::new(super::RecordingCursorHideExecutor::default());
-    hide.script([
-        super::TestCursorHideResult::Error(libc::EIO),
-        super::TestCursorHideResult::Error(libc::EIO),
-        super::TestCursorHideResult::Error(libc::EIO),
-        super::TestCursorHideResult::Error(libc::EIO),
-        super::TestCursorHideResult::Error(libc::EIO),
-        super::TestCursorHideResult::Ok,
-    ]);
-    super::install_recording_cursor_hide_executor(&mut backend, 0, hide.clone());
-    backend
-        .platform
-        .reject_atomic_cursor_commit(&[position], "Invalid argument");
-    for x in [101, 102, 103] {
-        backend
-            .platform
-            .cursor_plane_move(x, 100, 0, 0)
-            .expect("motion-led hide retry");
-    }
-    assert!(
-        backend
-            .platform
-            .for_tests_cursor_permanently_disabled(position.device_key)
-    );
-    assert_eq!(hide.calls(), vec![position.crtc; 4]);
-    assert!(backend.platform.cursor_plane_visible_for_output(0));
-
-    assert!(backend.platform.cursor_plane_hide_on_crtc(0).is_err());
-    assert_eq!(hide.calls(), vec![position.crtc; 5]);
-    assert!(backend.platform.cursor_plane_visible_for_output(0));
-
-    backend
-        .platform
-        .cursor_plane_hide_all()
-        .expect("global hide");
-    assert_eq!(hide.calls(), vec![position.crtc; 6]);
-    assert!(!backend.platform.cursor_plane_visible_for_output(0));
-
-    backend
-        .platform
-        .cursor_plane_hide_on_crtc(0)
-        .expect("nothing left to detach");
-    assert_eq!(hide.calls(), vec![position.crtc; 6]);
 }

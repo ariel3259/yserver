@@ -561,7 +561,9 @@ impl AtomicCommitSink {
             .flatten();
         let cursor_rejected = match (&result, attribution) {
             (Ok(()), _) => false,
-            (Err(_), None) => kind == AtomicCommitKind::CursorOnly,
+            (Err(error), None) => {
+                kind == AtomicCommitKind::CursorOnly && error.raw_os_error() == Some(libc::EINVAL)
+            }
             (Err(error), Some(snapshot)) => self.cursor_caused_rejection(device, error, &snapshot),
         };
         self.last_rejection_was_cursor.set(cursor_rejected);
@@ -770,16 +772,15 @@ impl AtomicCommitSink {
     }
 
     /// A failed scene request carrying cursor fields is the cursor's fault only
-    /// if `TEST_ONLY` rejects it as sent and accepts it without those fields.
-    /// EBUSY, or a failure `TEST_ONLY` does not reproduce, is a commit-phase
-    /// error of the scene producer.
+    /// for EINVAL, and only if `TEST_ONLY` rejects it as sent and accepts it
+    /// without those fields. Other errors belong to the scene producer.
     fn cursor_caused_rejection(
         &self,
         device: &Device,
         error: &io::Error,
         snapshot: &CommitAttributionSnapshot,
     ) -> bool {
-        let cursor_rejected = error.raw_os_error() != Some(libc::EBUSY)
+        let cursor_rejected = error.raw_os_error() == Some(libc::EINVAL)
             && self
                 .test_only(
                     device,
@@ -796,15 +797,6 @@ impl AtomicCommitSink {
             if cursor_rejected { "the cursor" } else { "the scene" },
         );
         cursor_rejected
-    }
-
-    /// Record the legacy path's motion-to-return latency. Both telemetry
-    /// latency measures intentionally use this same return time.
-    pub(crate) fn record_legacy_move(&self, motion_timestamp: Instant, returned_at: Instant) {
-        self.metrics
-            .borrow_mut()
-            .record_legacy_move(motion_timestamp, returned_at);
-        self.emit_telemetry_if_due();
     }
 
     /// Complete motion-to-visible timing when the corresponding accepted
@@ -854,16 +846,11 @@ impl AtomicCommitSink {
         );
     }
 
-    /// Whether the most recent rejected ioctl was caused by its cursor fields:
-    /// any cursor-only failure, or a scene failure `cursor_caused_rejection`
-    /// pins on the cursor. Other failures leave the cursor state untouched.
+    /// Whether the most recent rejected ioctl was caused by cursor fields:
+    /// cursor-only EINVAL, or a scene EINVAL confirmed by `cursor_caused_rejection`.
+    /// Other failures leave the cursor state untouched.
     pub(crate) fn take_last_cursor_rejection(&self) -> bool {
         self.last_rejection_was_cursor.replace(false)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_tests_motion_to_accept_sample_count(&self) -> usize {
-        self.metrics.borrow().motion_to_accept_us.len()
     }
 
     #[cfg(test)]
@@ -1393,12 +1380,6 @@ impl CommitWindow {
         self.reset_tearing_counters();
     }
 
-    fn record_legacy_move(&mut self, motion_timestamp: Instant, returned_at: Instant) {
-        let latency = elapsed_us(motion_timestamp, returned_at);
-        self.motion_to_accept_us.push(latency);
-        self.motion_to_visible_us.push(latency);
-    }
-
     fn record_cursor_retirement(&mut self, crtc: crtc::Handle, retired_at: Instant) {
         if let Some(motion_timestamp) = self.pending_motion_to_visible.remove(&crtc) {
             self.motion_to_visible_us
@@ -1599,6 +1580,10 @@ pub(crate) mod tests_support {
             self.scripted_results
                 .borrow_mut()
                 .push_back(ScriptedResult::from_result(result));
+        }
+
+        pub(crate) fn clear_scripted_results(&self) {
+            self.scripted_results.borrow_mut().clear();
         }
     }
 

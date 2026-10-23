@@ -53,6 +53,18 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   restart rootless→window on the same display, restart with `--scale 2` drops it, restart confirm/cancel with an
   xterm connected. Not run: launch at login across a logout, the requires-approval state.
 
+- **2026-10-23 cursor error attribution and legacy cursor removal (branch `fix/cursor-error-attribution`):** only EINVAL
+  is attributed to the cursor (ENOMEM/EIO no longer trigger cursor recovery; EBUSY unchanged). The legacy cursor
+  executors (`set_cursor2`/`move_cursor`, shared legacy buffer, probe, telemetry) are removed; every device whose
+  static path decision is not Atomic uses the software cursor through the existing `permanently_disabled` latch, and
+  partial plane coverage stays with the refresh-recomputed `topology_blocked`. Review follow-up: a non-EINVAL
+  direct-scanout cursor hide/show failure retries on a 50 ms `next_wakeup` deadline through the existing
+  `CursorHideRecovery` record (no new frame or CRTC event needed) and unflips after 3 failed attempts; EBUSY keeps
+  the event-driven retry. The former Legacy-fixture policy tests run on atomic fixtures, and the software fallback
+  is checked by pixels. Production +650/−1567, tests +2782/−4366. NVIDIA RTX 5060 Ti and AMD Raphael:
+  `atomic reason=qualified`, 0 legacy cursor ioctls under strace.
+  Plan: [`plans/2026-10-23-cursor-error-attribution-and-legacy-removal.md`](superpowers/plans/2026-10-23-cursor-error-attribution-and-legacy-removal.md).
+
 - **2026-10-20 monitor disconnect = Xorg modesetting (branch `fix/273-monitor-disconnect`, issue #273):** a
   physical disconnect issues no KMS commit and runs no global quiesce. The output keeps its `platform.outputs` row,
   scanout pool and CRTC (still scanning out); RANDR reports it Disconnected with an empty mode list and no EDID, while

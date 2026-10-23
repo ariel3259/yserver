@@ -476,7 +476,7 @@ impl KmsBackend {
         self.platform.wait_idle_bounded();
 
         // The primary plane is the only plane `disable_output` detaches.
-        // A hardware cursor is programmed through its own plane/ioctl, and
+        // An atomic hardware cursor is programmed through its own plane, and
         // some drivers (notably AMD Polaris) reject an atomic CRTC disable
         // while that plane remains attached.  Normally `scene.drain_all`
         // hides it, but that must happen *after* the all-off transaction so
@@ -959,7 +959,7 @@ impl KmsBackend {
         if want_active {
             // ── Wake side. Mirrors KmsBackend::run_resume around the
             //    modeset commit: commit_modeset, then re-arm the cursor
-            //    plane via legacy ioctl. Without rearm_cursor the cursor
+            //    plane with an atomic cursor commit. Without rearm_cursor the cursor
             //    plane stays bound to a CRTC that was disabled — the
             //    first subsequent atomic page-flip then EINVALs because
             //    the kernel sees a stale plane→CRTC reference. See

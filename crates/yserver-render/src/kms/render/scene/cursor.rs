@@ -537,9 +537,8 @@ pub(super) fn resolve_failed_cursor_upload(
     hide_live_binding: impl FnOnce() -> io::Result<()>,
 ) -> CursorTransitionResult {
     if !prior_visible {
-        // Hidden/Sw→Hw can fail before the plane has ever been bound. There
-        // is no rollback to perform; issuing set_cursor2(None) here can itself
-        // return EINVAL and falsely manufacture HW ownership.
+        // The output had no live cursor-plane binding, so there is nothing to
+        // detach as a rollback.
         return CursorTransitionResult::Hidden;
     }
     match hide_live_binding() {

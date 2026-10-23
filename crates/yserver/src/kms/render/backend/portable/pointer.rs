@@ -610,12 +610,11 @@ impl<P: Platform> XBackend<P> {
             // is fully bound on every output AND no transition is
             // pending, route motion through `cursor_plane_move`.
             // Atomic-capable devices record the latest position for
-            // the scheduling pass; devices without atomic position
-            // properties keep the legacy move ioctl. Neither path
-            // does GPU work. The Mixed state (any output still has
-            // a Sw→Hw or Hw→Sw transition pending) also wakes the
-            // scene so the SW cursor stays in sync with the eventual
-            // plane bind.
+            // the scheduling pass. Devices without a qualified atomic
+            // cursor plane keep the software cursor in the scene. The
+            // Mixed state (an output still has a software/hardware
+            // transition pending) also wakes the scene so the software
+            // cursor stays in sync with the eventual plane bind.
             let cursor_mode = self.scene.cursor_mode();
             if self.effective_cursor_hidden() {
                 // The effective cursor has no visible pixels, so pointer

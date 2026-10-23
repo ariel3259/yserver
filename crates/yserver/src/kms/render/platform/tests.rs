@@ -673,8 +673,7 @@ fn install_test_cursor_plane(
     crtcs: &[::drm::control::crtc::Handle],
     boundary: &str,
 ) {
-    let plane =
-        crate::kms::cursor_plane::CursorPlane::for_tests_stub(Rc::clone(&device.device), 64, 64);
+    let plane = crate::kms::cursor_plane::CursorPlane::for_tests_stub(64, 64);
     install_cursor_plane_for_device(device, crtcs, boundary, plane);
 }
 
@@ -1143,238 +1142,31 @@ fn zero_outputs_is_not_fatal() {
     assert!(check_scanout_liveness(0, 0, &[]).is_ok());
 }
 
-/// HW-cursor auto-fallback policy: an ioctl error that means the
-/// driver doesn't implement the (legacy) cursor ioctls must latch
-/// the strategy off so the scene falls back to the SW cursor.
-/// Apple's DCP driver (Asahi) returns `ENXIO`; some drivers return
-/// `ENODEV` / `EOPNOTSUPP`. Recoverable errors (`EBUSY`) must NOT
-/// latch — those are transient and latching would needlessly kill
-/// the HW cursor on drivers that DO support it (e.g. amdgpu).
 #[test]
-fn cursor_err_disables_hw_only_for_unsupported_errnos() {
-    use std::io::Error;
-    // Asahi / Apple DCP: legacy cursor ioctl unimplemented.
-    assert!(cursor_err_disables_hw(&Error::from_raw_os_error(
-        libc::ENXIO
-    )));
-    assert!(cursor_err_disables_hw(&Error::from_raw_os_error(
-        libc::ENODEV
-    )));
-    assert!(cursor_err_disables_hw(&Error::from_raw_os_error(
-        libc::EOPNOTSUPP
-    )));
-    // Transient / recoverable: must keep the HW path alive.
-    assert!(!cursor_err_disables_hw(&Error::from_raw_os_error(
-        libc::EBUSY
-    )));
-    // Generic / ambiguous: don't latch on these either.
-    assert!(!cursor_err_disables_hw(&Error::from_raw_os_error(
-        libc::EINVAL
-    )));
-    assert!(!cursor_err_disables_hw(&Error::other("not an os error")));
-}
-
-#[test]
-fn cursor_failure_pair_uses_permanent_precedence_and_clears_pending() {
+// Mutation: classify a non-EINVAL OS error as a cursor fallback; the unchanged assertion must fail.
+fn cursor_failure_attribution_is_einval_only() {
     let crtc = ::drm::control::from_u32(17).unwrap();
+    let mut state = KmsCursorState::new();
 
-    let mut transient = KmsCursorState::new();
-    transient.pending_move = Some((1, 2, 3, 4));
     assert_eq!(
-        transient.note_cursor_failure_pair(
+        apply_cursor_operation_error(
+            &mut state,
             crtc,
             &io::Error::from_raw_os_error(libc::EINVAL),
-            Some(&io::Error::from_raw_os_error(libc::EIO)),
         ),
         CursorFailureDisposition::Transient
     );
-    assert!(!transient.permanently_disabled);
-    assert_eq!(transient.pending_move, None);
-    assert_eq!(
-        transient.transient_fallback_crtcs[&crtc].remaining_sw_retires, 1,
-        "one operation+rollback pair records exactly one failure"
-    );
+    assert!(state.transient_fallback_crtcs.contains_key(&crtc));
 
-    for (operation_errno, rollback_errno) in
-        [(libc::EINVAL, libc::ENODEV), (libc::ENODEV, libc::EINVAL)]
-    {
-        let mut permanent = KmsCursorState::new();
-        permanent.pending_move = Some((1, 2, 3, 4));
+    for errno in [libc::ENODEV, libc::EOPNOTSUPP, libc::EBUSY] {
+        let mut state = KmsCursorState::new();
         assert_eq!(
-            permanent.note_cursor_failure_pair(
-                crtc,
-                &io::Error::from_raw_os_error(operation_errno),
-                Some(&io::Error::from_raw_os_error(rollback_errno)),
-            ),
-            CursorFailureDisposition::Permanent
+            apply_cursor_operation_error(&mut state, crtc, &io::Error::from_raw_os_error(errno),),
+            CursorFailureDisposition::Unchanged
         );
-        assert!(permanent.permanently_disabled);
-        assert_eq!(permanent.pending_move, None);
-        assert!(permanent.transient_fallback_crtcs.is_empty());
+        assert!(state.transient_fallback_crtcs.is_empty());
+        assert!(!state.permanently_disabled);
     }
-
-    let mut unchanged = KmsCursorState::new();
-    unchanged.pending_move = Some((1, 2, 3, 4));
-    assert_eq!(
-        unchanged.note_cursor_failure_pair(
-            crtc,
-            &io::Error::from_raw_os_error(libc::EBUSY),
-            Some(&io::Error::from_raw_os_error(libc::EIO)),
-        ),
-        CursorFailureDisposition::Unchanged
-    );
-    assert_eq!(unchanged.pending_move, Some((1, 2, 3, 4)));
-    assert!(unchanged.transient_fallback_crtcs.is_empty());
-}
-
-#[test]
-fn still_visible_show_failure_records_owning_fallback_without_stale_move() {
-    let crtc = ::drm::control::from_u32(18).unwrap();
-    let mut transient = KmsCursorState::new();
-    transient.pending_move = Some((1, 2, 3, 4));
-    let bind_einval = crate::kms::cursor_plane::CursorShowError::StillVisible {
-        operation_error: io::Error::from_raw_os_error(libc::EINVAL),
-        rollback_error: None,
-    };
-    assert_eq!(
-        apply_cursor_show_failure_state(&mut transient, crtc, &bind_einval, (10, 20, 5, 6),),
-        CursorFailureDisposition::Transient
-    );
-    assert_eq!(transient.pending_move, None);
-    assert_eq!(
-        transient.transient_fallback_crtcs[&crtc].remaining_sw_retires,
-        1
-    );
-
-    let mut unsupported = KmsCursorState::new();
-    let bind_enodev = crate::kms::cursor_plane::CursorShowError::StillVisible {
-        operation_error: io::Error::from_raw_os_error(libc::ENODEV),
-        rollback_error: None,
-    };
-    assert_eq!(
-        apply_cursor_show_failure_state(&mut unsupported, crtc, &bind_enodev, (10, 20, 5, 6),),
-        CursorFailureDisposition::Permanent
-    );
-    assert!(unsupported.permanently_disabled);
-
-    let mut rollback_wins = KmsCursorState::new();
-    let move_einval_hide_enodev = crate::kms::cursor_plane::CursorShowError::StillVisible {
-        operation_error: io::Error::from_raw_os_error(libc::EINVAL),
-        rollback_error: Some(io::Error::from_raw_os_error(libc::ENODEV)),
-    };
-    assert_eq!(
-        apply_cursor_show_failure_state(
-            &mut rollback_wins,
-            crtc,
-            &move_einval_hide_enodev,
-            (10, 20, 5, 6),
-        ),
-        CursorFailureDisposition::Permanent
-    );
-    assert!(rollback_wins.permanently_disabled);
-    assert!(rollback_wins.transient_fallback_crtcs.is_empty());
-    assert_eq!(rollback_wins.pending_move, None);
-
-    let deferred = crate::kms::cursor_plane::CursorShowError::Deferred {
-        remains_visible: true,
-        reason: io::Error::from_raw_os_error(libc::EBUSY),
-    };
-    assert!(deferred.remains_visible());
-    assert!(deferred.is_deferred());
-    assert!(!deferred.needs_full_rebind());
-    assert!(deferred.rollback_error().is_none());
-    assert_eq!(deferred.operation_error().raw_os_error(), Some(libc::EBUSY));
-}
-
-#[test]
-fn hide_failure_classification_is_bounded_and_success_does_not_clear_it() {
-    let crtc = ::drm::control::from_u32(19).unwrap();
-    let mut state = KmsCursorState::new();
-    let einval: io::Result<()> = Err(io::Error::from_raw_os_error(libc::EINVAL));
-    assert_eq!(
-        apply_cursor_operation_result(&mut state, crtc, &einval),
-        CursorFailureDisposition::Transient
-    );
-    assert_eq!(
-        state.transient_fallback_crtcs[&crtc].remaining_sw_retires,
-        1
-    );
-    assert_eq!(
-        apply_cursor_operation_result(&mut state, crtc, &einval),
-        CursorFailureDisposition::Transient
-    );
-    assert_eq!(
-        state.transient_fallback_crtcs[&crtc].remaining_sw_retires,
-        2
-    );
-
-    assert_eq!(
-        apply_cursor_operation_result(&mut state, crtc, &Ok(())),
-        CursorFailureDisposition::Unchanged
-    );
-    assert_eq!(
-        state.transient_fallback_crtcs[&crtc].remaining_sw_retires, 2,
-        "a successful hide is not proof that a later full Show is valid"
-    );
-
-    let other_crtc = ::drm::control::from_u32(20).unwrap();
-    assert_eq!(
-        apply_cursor_operation_result(
-            &mut state,
-            other_crtc,
-            &Err(io::Error::from_raw_os_error(libc::EBUSY)),
-        ),
-        CursorFailureDisposition::Unchanged
-    );
-    assert!(!state.transient_fallback_crtcs.contains_key(&other_crtc));
-
-    assert_eq!(
-        apply_cursor_operation_result(
-            &mut state,
-            crtc,
-            &Err(io::Error::from_raw_os_error(libc::ENODEV)),
-        ),
-        CursorFailureDisposition::Permanent
-    );
-    assert!(state.permanently_disabled);
-    assert!(state.transient_fallback_crtcs.is_empty());
-}
-
-#[test]
-fn actual_upload_invalid_input_enters_one_bounded_local_fallback() {
-    let crtc = ::drm::control::from_u32(21).unwrap();
-    let mut state = KmsCursorState::new();
-    let upload: io::Result<()> = Err(io::Error::new(
-        io::ErrorKind::InvalidInput,
-        "cursor bytes shorter than width*height*4",
-    ));
-    assert_eq!(
-        apply_cursor_operation_result(&mut state, crtc, &upload),
-        CursorFailureDisposition::Transient
-    );
-    assert_eq!(state.transient_fallback_crtcs.len(), 1);
-    assert_eq!(
-        state.transient_fallback_crtcs[&crtc].remaining_sw_retires,
-        1
-    );
-    assert!(!state.permanently_disabled);
-}
-
-#[test]
-fn cursor_failure_classification_isolated_across_cards_with_same_raw_crtc() {
-    let crtc = ::drm::control::from_u32(22).unwrap();
-    let mut card_a = KmsCursorState::new();
-    let card_b = KmsCursorState::new();
-    card_a.note_cursor_failure_pair(crtc, &io::Error::from_raw_os_error(libc::EINVAL), None);
-    assert!(card_a.transient_fallback_crtcs.contains_key(&crtc));
-    assert!(card_b.transient_fallback_crtcs.is_empty());
-    assert!(!card_b.permanently_disabled);
-
-    card_a.note_cursor_failure_pair(crtc, &io::Error::from_raw_os_error(libc::ENODEV), None);
-    assert!(card_a.permanently_disabled);
-    assert!(card_a.transient_fallback_crtcs.is_empty());
-    assert!(card_b.transient_fallback_crtcs.is_empty());
-    assert!(!card_b.permanently_disabled);
 }
 
 #[test]
@@ -1386,19 +1178,19 @@ fn active_startup_transient_init_retries_only_at_explicit_active_boundary() {
     );
     assert!(state.should_initialize_headless_deferred(true));
 
-    state.note_initialization_failure(&io::Error::from_raw_os_error(libc::ENOMEM));
+    state.note_initialization_failure();
     assert!(!state.headless_deferred);
     assert!(!state.permanently_disabled);
     assert!(!state.should_retry_initialization(false));
     assert!(state.should_retry_initialization(true));
 
-    state.note_initialization_failure(&io::Error::from_raw_os_error(libc::ENODEV));
-    assert!(state.permanently_disabled);
-    assert!(!state.should_retry_initialization(true));
+    state.note_initialization_failure();
+    assert!(!state.permanently_disabled);
+    assert!(state.should_retry_initialization(true));
 }
 
 #[test]
-fn primary_first_explicit_enable_initializes_and_exposes_fresh_upload_state() {
+fn primary_first_explicit_enable_initializes_software_for_an_unqualified_plane() {
     let mut platform = PlatformBackend::for_tests();
     let key = platform.devices[0].key;
     let crtc = platform.outputs[0].output.crtc;
@@ -1418,18 +1210,23 @@ fn primary_first_explicit_enable_initializes_and_exposes_fresh_upload_state() {
     ));
     assert_eq!(calls.get(), 1);
     assert!(!platform.devices[0].cursor.headless_deferred);
-    assert!(platform.cursor_plane_available_for_output(0));
+    assert_eq!(
+        platform.devices[0].cursor.state_path(),
+        crate::kms::cursor_plane::topology::CursorStatePath::Software
+    );
+    assert!(!platform.cursor_plane_available_for_output(0));
     assert!(!platform.cursor_plane_uploaded_image_matches_for_output(0, 7, 0, 0));
 
     let bytes = vec![0_u8; 16 * 16 * 4];
-    platform
-        .cursor_plane_upload_image_for_output(0, 7, 0, 0, 16, 16, &bytes)
-        .expect("fresh lazy plane accepts its first retire-time upload");
-    assert!(platform.cursor_plane_uploaded_image_matches_for_output(0, 7, 9, 9));
+    assert!(
+        platform
+            .cursor_plane_upload_image_for_output(0, 7, 0, 0, 16, 16, &bytes)
+            .is_err()
+    );
 }
 
 #[test]
-fn secondary_first_enable_uses_owning_device_despite_raw_crtc_collision() {
+fn secondary_first_enable_uses_owning_device_and_software_for_an_unqualified_plane() {
     let mut platform = PlatformBackend::for_tests();
     let primary_key = platform.devices[0].key;
     let raw_crtc = platform.outputs[0].output.crtc;
@@ -1465,7 +1262,11 @@ fn secondary_first_enable_uses_owning_device_despite_raw_crtc_collision() {
     assert!(platform.devices[0].cursor.plane.is_none());
     assert!(platform.devices[0].cursor.headless_deferred);
     assert!(platform.devices[1].cursor.plane.is_some());
-    assert!(platform.cursor_plane_available_for_output(1));
+    assert_eq!(
+        platform.devices[1].cursor.state_path(),
+        crate::kms::cursor_plane::topology::CursorStatePath::Software
+    );
+    assert!(!platform.cursor_plane_available_for_output(1));
     assert!(!platform.cursor_plane_available_for_output(0));
 }
 
@@ -1519,9 +1320,7 @@ fn deferred_init_failure_policy_is_device_local_and_retries_later_only() {
         "first explicit enable",
         |device, _crtcs, _boundary| {
             first_calls.set(first_calls.get() + 1);
-            device
-                .cursor
-                .note_initialization_failure(&io::Error::from_raw_os_error(libc::ENOMEM));
+            device.cursor.note_initialization_failure();
         },
     ));
     assert_eq!(first_calls.get(), 1);
@@ -1551,7 +1350,8 @@ fn deferred_init_failure_policy_is_device_local_and_retries_later_only() {
     assert!(platform.devices[0].cursor.headless_deferred);
     assert!(!platform.devices[0].cursor.permanently_disabled);
 
-    // A separate card's permanent failure latches only that owner.
+    // A separate card's failed initialization stays retryable and leaves the
+    // secondary card's static software-cursor latch unchanged.
     let tertiary_key = crate::platform::drm::DrmDeviceKey {
         major: 226,
         minor: 95,
@@ -1564,16 +1364,14 @@ fn deferred_init_failure_policy_is_device_local_and_retries_later_only() {
         tertiary_key,
         "first explicit enable",
         |device, _crtcs, _boundary| {
-            device
-                .cursor
-                .note_initialization_failure(&io::Error::from_raw_os_error(libc::ENODEV));
+            device.cursor.note_initialization_failure();
         },
     ));
-    assert!(platform.devices[2].cursor.permanently_disabled);
-    assert!(!platform.devices[2].cursor.initialization_retryable);
+    assert!(!platform.devices[2].cursor.permanently_disabled);
+    assert!(platform.devices[2].cursor.initialization_retryable);
     assert!(platform.devices[2].cursor.plane.is_none());
     assert!(platform.devices[1].cursor.plane.is_some());
-    assert!(!platform.devices[1].cursor.permanently_disabled);
+    assert!(platform.devices[1].cursor.permanently_disabled);
     assert_eq!(platform.devices[0].key, primary_key);
 }
 
@@ -1608,7 +1406,6 @@ fn topology_refresh_never_changes_the_path_or_the_assignment() {
                 .collect(),
             }],
             cursor_caps: Some(CursorDeviceCaps::new(false, Some("amdgpu".to_owned()))),
-            has_buffer: true,
         }
     }
 
@@ -1880,66 +1677,6 @@ fn topology_refresh_never_changes_the_path_or_the_assignment() {
     assert_eq!(ledger.end_state(), (0, 0, 0));
     assert_eq!(other_ledger.end_state(), (0, 0, 0));
 }
-
-#[test]
-fn initialized_cursor_plane_persists_but_reuploads_across_last_disable_and_reenable() {
-    let mut platform = PlatformBackend::for_tests();
-    let key = platform.devices[0].key;
-    assert!(platform.initialize_headless_cursor_for_device_with(
-        key,
-        "first explicit enable",
-        install_test_cursor_plane,
-    ));
-    platform
-        .cursor_plane_upload_image_for_output(0, 9, 0, 0, 16, 16, &[0_u8; 16 * 16 * 4])
-        .unwrap();
-    assert_eq!(
-        platform.devices[0]
-            .cursor
-            .plane
-            .as_ref()
-            .and_then(crate::kms::cursor_plane::CursorPlane::uploaded_version),
-        Some(9)
-    );
-
-    platform
-        .cursor_plane_hide_all()
-        .expect("topology quiesce retains the plane while invalidating its upload");
-    assert_eq!(
-        platform.devices[0]
-            .cursor
-            .plane
-            .as_ref()
-            .and_then(crate::kms::cursor_plane::CursorPlane::uploaded_version),
-        None
-    );
-
-    platform.remove_connector_at(0);
-    assert!(platform.outputs.is_empty());
-    assert!(platform.devices[0].cursor.plane.is_some());
-    assert!(!platform.devices[0].cursor.headless_deferred);
-    assert_eq!(
-        platform.devices[0]
-            .cursor
-            .plane
-            .as_ref()
-            .and_then(crate::kms::cursor_plane::CursorPlane::uploaded_version),
-        None,
-        "last-output removal retains the allocation, not stale pixels"
-    );
-
-    platform
-        .outputs
-        .push(test_active_output_for(key, "reenabled", 1));
-    platform.refresh_cursor_topology_for_devices(&HashSet::from([key]));
-    assert!(platform.cursor_plane_available_for_output(0));
-    assert!(!platform.cursor_plane_uploaded_image_matches_for_output(0, 10, 0, 0));
-    platform
-        .cursor_plane_upload_image_for_output(0, 10, 0, 0, 16, 16, &[0_u8; 16 * 16 * 4])
-        .expect("first retirement after re-enable refreshes retained storage");
-    assert!(platform.cursor_plane_uploaded_image_matches_for_output(0, 10, 4, 5));
-}
-
 #[test]
 fn connected_off_probe_and_zero_card_do_not_run_deferred_factory() {
     let mut platform = PlatformBackend::for_tests();
@@ -1987,30 +1724,23 @@ fn cursor_capacity_is_evaluated_per_card() {
 }
 
 #[test]
-fn cursor_plane_without_atomic_position_properties_keeps_the_legacy_path() {
+fn cursor_plane_without_atomic_position_properties_uses_software_cursor() {
     let mut platform = PlatformBackend::for_tests();
-    let crtc = platform.outputs[0].output.crtc;
-    install_test_cursor_plane(&mut platform.devices[0], &[crtc], "legacy path test");
+    let crtcs: Vec<_> = platform
+        .outputs
+        .iter()
+        .map(|output| output.output.crtc)
+        .collect();
+    install_test_cursor_plane(&mut platform.devices[0], &crtcs, "software path test");
 
     assert!(!platform.devices[0].cursor.atomic_cursor);
-    assert!(!platform.devices[0].cursor.topology_blocked);
+    assert!(platform.devices[0].cursor.topology_blocked);
+    assert_eq!(
+        platform.devices[0].cursor.state_path(),
+        crate::kms::cursor_plane::topology::CursorStatePath::Software
+    );
     assert!(platform.devices[0].cursor.plane.is_some());
-    assert!(platform.cursor_plane_available_for_output(0));
-
-    platform.devices[0]
-        .cursor
-        .plane
-        .as_mut()
-        .expect("installed cursor plane")
-        .for_tests_set_atomic_position_properties(
-            crtc,
-            ::drm::control::from_u32(21).unwrap(),
-            ::drm::control::from_u32(31).unwrap(),
-            ::drm::control::from_u32(32).unwrap(),
-        );
-    let device_key = platform.devices[0].key;
-    platform.refresh_cursor_topology_for_devices(&HashSet::from([device_key]));
-    assert!(platform.devices[0].cursor.atomic_cursor);
+    assert!(!platform.cursor_plane_available_for_output(0));
 }
 
 #[test]
@@ -2023,18 +1753,12 @@ fn topology_refresh_on_card_b_preserves_card_a_cursor_retry_state() {
         minor: 88,
     };
     platform.devices.push(test_kms_device(card_b));
-    platform.devices[0].cursor.pending_move = Some((100, 200, 3, 4));
     platform.devices[0].cursor.note_einval(raw_crtc);
-    platform.devices[1].cursor.pending_move = Some((300, 400, 5, 6));
     platform.devices[1].cursor.note_einval(raw_crtc);
 
     platform.refresh_cursor_topology_for_devices(&HashSet::from([card_b]));
 
     assert_eq!(platform.devices[0].key, card_a);
-    assert_eq!(
-        platform.devices[0].cursor.pending_move,
-        Some((100, 200, 3, 4))
-    );
     assert_eq!(
         platform.devices[0]
             .cursor
@@ -2043,7 +1767,6 @@ fn topology_refresh_on_card_b_preserves_card_a_cursor_retry_state() {
             .map(|retry| retry.remaining_sw_retires),
         Some(1)
     );
-    assert_eq!(platform.devices[1].cursor.pending_move, None);
     assert!(
         platform.devices[1]
             .cursor
@@ -2080,55 +1803,6 @@ fn einval_backoff_advances_only_on_owning_output_retirements() {
         "a repeated EINVAL is rate-limited for two own-card SW retirements"
     );
 }
-
-#[test]
-fn failed_move_hide_rollback_records_fallback_and_scene_owned_retry() {
-    let crtc = ::drm::control::from_u32(17).unwrap();
-    let mut state = KmsCursorState::new();
-    state.pending_move = Some((1, 2, 3, 4));
-    let mut outcome = CursorMoveOutcome::default();
-    let keep_pending = apply_cursor_move_rollback_result(
-        &mut state,
-        crtc,
-        &io::Error::from_raw_os_error(libc::EINVAL),
-        Err(io::Error::from_raw_os_error(libc::EIO)),
-        &mut outcome,
-    );
-
-    assert!(!keep_pending);
-    assert!(outcome.retry_required);
-    assert!(outcome.fallback_changed);
-    assert!(!state.permanently_disabled);
-    assert_eq!(state.pending_move, None);
-    assert_eq!(
-        state.transient_fallback_crtcs[&crtc].remaining_sw_retires,
-        1
-    );
-}
-
-#[test]
-fn failed_move_hide_rollback_uses_permanent_precedence() {
-    let crtc = ::drm::control::from_u32(23).unwrap();
-    for (move_errno, hide_errno) in [(libc::EINVAL, libc::ENODEV), (libc::ENODEV, libc::EINVAL)] {
-        let mut state = KmsCursorState::new();
-        state.pending_move = Some((1, 2, 3, 4));
-        let mut outcome = CursorMoveOutcome::default();
-        let keep_pending = apply_cursor_move_rollback_result(
-            &mut state,
-            crtc,
-            &io::Error::from_raw_os_error(move_errno),
-            Err(io::Error::from_raw_os_error(hide_errno)),
-            &mut outcome,
-        );
-        assert!(!keep_pending);
-        assert!(outcome.retry_required);
-        assert!(outcome.fallback_changed);
-        assert!(state.permanently_disabled);
-        assert_eq!(state.pending_move, None);
-        assert!(state.transient_fallback_crtcs.is_empty());
-    }
-}
-
 #[test]
 fn cursor_move_outcome_merge_keeps_cross_device_retry_liveness() {
     let mut aggregate = CursorMoveOutcome {
@@ -2145,32 +1819,6 @@ fn cursor_move_outcome_merge_keeps_cross_device_retry_liveness() {
     assert!(aggregate.fallback_changed);
     assert!(aggregate.retry_required);
 }
-
-/// Once a show/bind fails with an unsupported errno, the plane is
-/// no longer reported available, so `tick_one_output`'s `hw_can_run`
-/// gate closes and `build_scene` collapses every assignment to SW.
-/// The latch is sticky across subsequent queries.
-#[test]
-fn unsupported_cursor_failure_latches_plane_unavailable() {
-    let mut p = PlatformBackend::for_tests();
-    let key = p.devices[0].key;
-    let crtc = p.outputs[0].output.crtc;
-    assert!(!p.hw_cursor_disabled_for_device(key));
-    assert!(p.note_unbound_cursor_failure(
-        0,
-        crtc,
-        &std::io::Error::from_raw_os_error(libc::ENXIO)
-    ));
-    assert!(p.hw_cursor_disabled_for_device(key));
-    assert!(!p.cursor_plane_available());
-    assert!(!p.note_unbound_cursor_failure(
-        0,
-        crtc,
-        &std::io::Error::from_raw_os_error(libc::EBUSY)
-    ));
-    assert!(p.hw_cursor_disabled_for_device(key));
-}
-
 /// Test fixture works at all: open `for_tests`, query
 /// dimensions, query poll_fds, no Vk required.
 #[test]
@@ -2211,59 +1859,6 @@ fn for_tests_scanout_acquire_returns_none() {
     let mut p = PlatformBackend::for_tests();
     assert!(p.acquire_scanout_bo(0).is_none());
 }
-
-/// Pending-move slot is None on a fresh backend and stays None
-/// when the cursor plane is unavailable (the for_tests fixture
-/// has no real DRM device, so `cursor_plane_move` returns Err
-/// and never touches the slot).
-#[test]
-fn cursor_pending_move_starts_empty_and_unavailable_path_does_not_set_it() {
-    let mut p = PlatformBackend::for_tests();
-    assert_eq!(p.devices[0].cursor.pending_move, None);
-    // Unavailable plane → Err return → pending stays None.
-    assert!(p.cursor_plane_move(100, 200, 0, 0).is_err());
-    assert_eq!(p.devices[0].cursor.pending_move, None);
-    // Drain on empty slot is Ok(0) (early-exit before any
-    // plane access). The path that returns Err is only the
-    // populated-slot retry that hits the unavailable plane —
-    // tested separately in `cursor_pending_move_is_latest_wins`.
-    assert_eq!(
-        p.cursor_plane_drain_pending_move_for_output(0).ok(),
-        Some(CursorMoveOutcome::default())
-    );
-    assert_eq!(p.devices[0].cursor.pending_move, None);
-}
-
-/// Hide-all clears any pending move (VT-leave invariant).
-#[test]
-fn cursor_plane_hide_all_clears_pending_move() {
-    let mut p = PlatformBackend::for_tests();
-    p.devices[0].cursor.pending_move = Some((123, 456, 7, 9));
-    // hide_all returns Err on the unavailable fixture, but the
-    // pending-clear MUST happen before the early-return so a
-    // hide-failure mid-recovery leaves no stale pending.
-    let _ = p.cursor_plane_hide_all();
-    assert_eq!(p.devices[0].cursor.pending_move, None);
-}
-
-/// Latest-wins: explicitly setting pending then overwriting
-/// reflects the latest position. This is the same in-place mutation
-/// that `cursor_plane_move` does internally on EBUSY — by exercising
-/// it directly (since we can't drive a real EBUSY without a kernel),
-/// we lock in the "old pending is discarded" invariant.
-#[test]
-fn cursor_pending_move_is_latest_wins() {
-    let mut p = PlatformBackend::for_tests();
-    p.devices[0].cursor.pending_move = Some((100, 100, 1, 2));
-    p.devices[0].cursor.pending_move = Some((200, 250, 7, 9));
-    assert_eq!(p.devices[0].cursor.pending_move, Some((200, 250, 7, 9)));
-    // Drain consumes; on the unavailable fixture this errors but
-    // the test's invariant is the slot mechanics, not the drain.
-    let _ = p.cursor_plane_drain_pending_move_for_output(0);
-    // Slot still holds because drain Err'd before clearing.
-    assert_eq!(p.devices[0].cursor.pending_move, Some((200, 250, 7, 9)));
-}
-
 #[test]
 fn cursor_root_to_crtc_local_subtracts_hotspot() {
     assert_eq!(
