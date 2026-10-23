@@ -424,50 +424,58 @@ fn flip_for(flips: &[(u32, u64)], crtc: u32) -> u64 {
 }
 
 /// The kernel has the flip's completion ready on the DRM fd.
-fn queue_completion(fixture: &mut RecordingSceneFixture, crtc: u32, id: u64, frame: u32) {
-    fixture.events.wait_for_submitted_gpu_work();
-    let fd = device_fd(fixture);
-    fixture.events.queue_commit_completion(
-        fd,
-        ::drm::control::from_u32(crtc).expect("nonzero CRTC"),
-        id,
-        frame,
-        Duration::from_millis(u64::from(frame) * 10),
-    );
-}
-
-/// Deliver a flip completion through the core loop's DRM handler.
-fn retire(fixture: &mut RecordingSceneFixture, crtc: u32, id: u64, frame: u32) {
-    queue_completion(fixture, crtc, id, frame);
-    let fd = device_fd(fixture);
-    Backend::on_page_flip_ready(&mut fixture.events.backend, &mut fixture.events.state, fd);
-}
-
-fn retire_all(fixture: &mut RecordingSceneFixture, flips: &[(u32, u64)], frame: u32) {
-    for &(crtc, id) in flips {
-        retire(fixture, crtc, id, frame);
-    }
-}
-
-fn retire_all_at(
+fn queue_completion(
     fixture: &mut RecordingSceneFixture,
-    flips: &[(u32, u64)],
+    crtc: u32,
+    id: u64,
     frame: u32,
-    received_at: Duration,
+    received_at: Option<Duration>,
 ) {
     fixture.events.wait_for_submitted_gpu_work();
     let fd = device_fd(fixture);
-    for &(crtc, id) in flips {
-        fixture.events.queue_commit_completion_at(
-            fd,
-            ::drm::control::from_u32(crtc).expect("nonzero CRTC"),
-            id,
-            frame,
-            Duration::from_millis(u64::from(frame) * 10),
-            received_at,
-        );
+    let crtc = ::drm::control::from_u32(crtc).expect("nonzero CRTC");
+    let ust = Duration::from_millis(u64::from(frame) * 10);
+    if let Some(received_at) = received_at {
+        fixture
+            .events
+            .queue_commit_completion_at(fd, crtc, id, frame, ust, received_at);
+    } else {
+        fixture
+            .events
+            .queue_commit_completion(fd, crtc, id, frame, ust);
     }
+}
+
+/// Deliver a flip completion through the core loop's DRM handler.
+fn retire(
+    fixture: &mut RecordingSceneFixture,
+    crtc: u32,
+    id: u64,
+    frame: u32,
+    received_at: Option<Duration>,
+) {
+    queue_completion(fixture, crtc, id, frame, received_at);
+    let fd = device_fd(fixture);
     Backend::on_page_flip_ready(&mut fixture.events.backend, &mut fixture.events.state, fd);
+}
+
+fn retire_all(
+    fixture: &mut RecordingSceneFixture,
+    flips: &[(u32, u64)],
+    frame: u32,
+    received_at: Option<Duration>,
+) {
+    if let Some(received_at) = received_at {
+        for &(crtc, id) in flips {
+            queue_completion(fixture, crtc, id, frame, Some(received_at));
+        }
+        let fd = device_fd(fixture);
+        Backend::on_page_flip_ready(&mut fixture.events.backend, &mut fixture.events.state, fd);
+    } else {
+        for &(crtc, id) in flips {
+            retire(fixture, crtc, id, frame, None);
+        }
+    }
 }
 
 /// Completions queued on the DRM fd and not yet delivered.
@@ -513,7 +521,7 @@ fn mode_change_modesets_only_its_crtc_while_the_other_keeps_presenting() {
         return;
     };
     let steady = submit_frame(&mut fixture);
-    retire_all(&mut fixture, &steady, 1);
+    retire_all(&mut fixture, &steady, 1, None);
     let (crtc0, crtc1) = (
         crtc(&fixture.events.backend, 0),
         crtc(&fixture.events.backend, 1),
@@ -522,7 +530,7 @@ fn mode_change_modesets_only_its_crtc_while_the_other_keeps_presenting() {
     let (flip0, flip1) = (flip_for(&in_flight, crtc0), flip_for(&in_flight, crtc1));
     // CRTC 1's flip completes while the change waits for it; CRTC 0's stays
     // in flight across the whole change.
-    queue_completion(&mut fixture, crtc1, flip1, 2);
+    queue_completion(&mut fixture, crtc1, flip1, 2, None);
 
     let backend = &mut fixture.events.backend;
     let key1 = backend.platform.outputs[1].key.clone();
@@ -564,7 +572,7 @@ fn mode_change_modesets_only_its_crtc_while_the_other_keeps_presenting() {
     assert_eq!(count(&bo_phases(backend, 0), BoPhase::Pending), 1);
     assert!(!backend.scene.has_pending_page_flip(1));
 
-    retire(&mut fixture, crtc0, flip0, 2);
+    retire(&mut fixture, crtc0, flip0, 2, None);
     let backend = &fixture.events.backend;
     assert!(!backend.scene.has_pending_page_flip(0));
     assert_eq!(count(&bo_phases(backend, 0), BoPhase::Pending), 0);
@@ -572,7 +580,7 @@ fn mode_change_modesets_only_its_crtc_while_the_other_keeps_presenting() {
     let next = submit_frame(&mut fixture);
     flip_for(&next, crtc0);
     flip_for(&next, crtc1);
-    retire_all(&mut fixture, &next, 3);
+    retire_all(&mut fixture, &next, 3, None);
     fixture.adopt_drawables(0x6b00..0x6b03);
     fixture.finish_after_normal_drain();
 }
@@ -587,14 +595,14 @@ fn turning_one_output_off_migrates_the_survivors_in_flight_frame() {
         return;
     };
     let steady = submit_frame(&mut fixture);
-    retire_all(&mut fixture, &steady, 1);
+    retire_all(&mut fixture, &steady, 1, None);
     let (crtc0, crtc1) = (
         crtc(&fixture.events.backend, 0),
         crtc(&fixture.events.backend, 1),
     );
     let in_flight = submit_frame(&mut fixture);
     let (flip0, flip1) = (flip_for(&in_flight, crtc0), flip_for(&in_flight, crtc1));
-    queue_completion(&mut fixture, crtc0, flip0, 2);
+    queue_completion(&mut fixture, crtc0, flip0, 2, None);
 
     let backend = &mut fixture.events.backend;
     let name = connector(backend, 0);
@@ -621,7 +629,7 @@ fn turning_one_output_off_migrates_the_survivors_in_flight_frame() {
     );
     assert_eq!(count(&bo_phases(backend, 0), BoPhase::Pending), 1);
 
-    retire(&mut fixture, crtc1, flip1, 2);
+    retire(&mut fixture, crtc1, flip1, 2, None);
     let backend = &fixture.events.backend;
     assert!(!backend.scene.has_pending_page_flip(0));
     let phases = bo_phases(backend, 0);
@@ -635,7 +643,7 @@ fn turning_one_output_off_migrates_the_survivors_in_flight_frame() {
     let next = submit_frame(&mut fixture);
     assert_eq!(next.len(), 1, "{next:?}");
     flip_for(&next, crtc1);
-    retire_all(&mut fixture, &next, 3);
+    retire_all(&mut fixture, &next, 3, None);
     fixture.finish_after_normal_drain();
 }
 
@@ -648,7 +656,7 @@ fn enabling_an_off_output_modesets_only_its_crtc() {
         return;
     };
     let steady = submit_frame(&mut fixture);
-    retire_all(&mut fixture, &steady, 1);
+    retire_all(&mut fixture, &steady, 1, None);
     let backend = &mut fixture.events.backend;
     let (crtc0, crtc1) = (crtc(backend, 0), crtc(backend, 1));
     let key1 = backend.platform.outputs[1].key.clone();
@@ -678,7 +686,7 @@ fn enabling_an_off_output_modesets_only_its_crtc() {
     let next = submit_frame(&mut fixture);
     flip_for(&next, crtc0);
     flip_for(&next, crtc1);
-    retire_all(&mut fixture, &next, 2);
+    retire_all(&mut fixture, &next, 2, None);
     fixture.adopt_drawables(0x6b00..0x6b03);
     fixture.finish_after_normal_drain();
 }
@@ -696,7 +704,7 @@ fn standalone_gamma_event_retires_before_disable_and_reenable() {
         .expect("CLOCK_MONOTONIC is available in the test environment")
         .checked_sub(Duration::from_secs(3))
         .expect("test CLOCK_MONOTONIC age is available");
-    retire_all_at(&mut fixture, &initial, 90, stale_receipt);
+    retire_all(&mut fixture, &initial, 90, Some(stale_receipt));
     let output_idx = 1;
     let device_fd = device_fd(&fixture);
     let recorder = fixture.events.recorders[&device_fd].clone();
@@ -837,7 +845,7 @@ fn standalone_gamma_event_retires_before_disable_and_reenable() {
             if pending.is_empty() {
                 break;
             }
-            retire_all(&mut fixture, &pending, 100 + pass);
+            retire_all(&mut fixture, &pending, 100 + pass, None);
         }
         flips = submit_frame(&mut fixture);
     }
@@ -846,14 +854,14 @@ fn standalone_gamma_event_retires_before_disable_and_reenable() {
         let gamma_event_id = accepted_event_id(&gamma_after_enable)
             .expect("re-enabled CRTC gamma request owns an event");
         if gamma_after_enable.kind == crate::drm::atomic::AtomicCommitKind::GammaOnly {
-            retire(&mut fixture, crtc, gamma_event_id, 92);
+            retire(&mut fixture, crtc, gamma_event_id, 92, None);
             let next = submit_frame(&mut fixture);
             let frame_accepted = next.iter().any(|(flipped_crtc, _)| *flipped_crtc == crtc);
             if !next.is_empty() {
-                retire_all(&mut fixture, &next, 93);
+                retire_all(&mut fixture, &next, 93, None);
             }
             if !flips.is_empty() {
-                retire_all(&mut fixture, &flips, 94);
+                retire_all(&mut fixture, &flips, 94, None);
             }
             frame_accepted
         } else {
@@ -861,7 +869,7 @@ fn standalone_gamma_event_retires_before_disable_and_reenable() {
                 .iter()
                 .any(|(flipped_crtc, id)| *flipped_crtc == crtc && *id == gamma_event_id);
             if !flips.is_empty() {
-                retire_all(&mut fixture, &flips, 92);
+                retire_all(&mut fixture, &flips, 92, None);
             }
             frame_accepted
         }

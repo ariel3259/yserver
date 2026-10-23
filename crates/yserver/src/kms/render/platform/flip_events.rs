@@ -259,6 +259,7 @@ impl RecordingPageFlipEventSource {
         self.queue_flip_with_clock_samples(
             crtc,
             frame,
+            0,
             ust,
             Some(event_at_monotonic),
             crate::drm::atomic::boottime_timestamp(),
@@ -269,6 +270,7 @@ impl RecordingPageFlipEventSource {
         &self,
         crtc: ::drm::control::crtc::Handle,
         frame: u32,
+        commit_id: u64,
         ust: std::time::Duration,
         event_at_monotonic: Option<std::time::Duration>,
         event_at_boottime: Option<std::time::Duration>,
@@ -276,7 +278,7 @@ impl RecordingPageFlipEventSource {
         self.flips.borrow_mut().push_back(KernelPageFlip {
             crtc,
             frame,
-            commit_id: 0,
+            commit_id,
             ust,
             event_at_monotonic,
             event_at_boottime,
@@ -290,14 +292,14 @@ impl RecordingPageFlipEventSource {
         commit_id: u64,
         ust: std::time::Duration,
     ) {
-        self.flips.borrow_mut().push_back(KernelPageFlip {
+        self.queue_flip_with_clock_samples(
             crtc,
             frame,
             commit_id,
             ust,
-            event_at_monotonic: crate::drm::atomic::monotonic_timestamp(),
-            event_at_boottime: crate::drm::atomic::boottime_timestamp(),
-        });
+            crate::drm::atomic::monotonic_timestamp(),
+            crate::drm::atomic::boottime_timestamp(),
+        );
     }
 
     pub(crate) fn queue_flip_with_cookie_at(
@@ -308,14 +310,14 @@ impl RecordingPageFlipEventSource {
         ust: std::time::Duration,
         event_at_monotonic: std::time::Duration,
     ) {
-        self.flips.borrow_mut().push_back(KernelPageFlip {
+        self.queue_flip_with_clock_samples(
             crtc,
             frame,
             commit_id,
             ust,
-            event_at_monotonic: Some(event_at_monotonic),
-            event_at_boottime: crate::drm::atomic::boottime_timestamp(),
-        });
+            Some(event_at_monotonic),
+            crate::drm::atomic::boottime_timestamp(),
+        );
     }
 
     pub(crate) fn queue_sequence_for_tests(&self, user_data: u64, time_ns: i64, sequence: u64) {
