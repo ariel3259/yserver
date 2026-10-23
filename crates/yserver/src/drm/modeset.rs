@@ -1954,8 +1954,6 @@ pub(crate) fn submit_composed_scanout(
         return Err(io::Error::other("scanout M2: empty composed transaction"));
     }
     let mut request = AtomicCommitRequest::new();
-    let mut gamma_blobs = Vec::new();
-    let mut request_without_gamma = None;
     for state in planes {
         let output = state.output;
         request.add_raw_property(
@@ -1998,21 +1996,24 @@ pub(crate) fn submit_composed_scanout(
                 .ok_or_else(|| io::Error::other("scanout M2: plane has no IN_FENCE_FD"))?;
             request.add_raw_property(output.plane.into(), prop, fd as i64 as u64);
         }
-        if output.crtc_gamma_lut_prop.is_some()
-            && !output.gamma_lut_disabled.get()
-            && output.pending_gamma_lut.borrow().is_some()
-            && request_without_gamma.is_none()
-        {
-            request_without_gamma = Some(request.clone());
-        }
-        if let Some(blob) =
-            append_pending_gamma_lut(device, atomic_commit_sink, output, &mut request)
-        {
-            gamma_blobs.push((output, blob));
-        }
     }
     for position in cursor_positions {
         request.add_cursor_position(*position);
+    }
+    let has_pending_gamma = planes.iter().any(|state| {
+        let output = state.output;
+        output.crtc_gamma_lut_prop.is_some()
+            && !output.gamma_lut_disabled.get()
+            && output.pending_gamma_lut.borrow().is_some()
+    });
+    let request_without_gamma = has_pending_gamma.then(|| request.clone());
+    let mut gamma_blobs = Vec::new();
+    for state in planes {
+        if let Some(blob) =
+            append_pending_gamma_lut(device, atomic_commit_sink, state.output, &mut request)
+        {
+            gamma_blobs.push((state.output, blob));
+        }
     }
     let events: Vec<_> = planes
         .iter()

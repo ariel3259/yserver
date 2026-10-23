@@ -664,6 +664,211 @@ fn enabling_an_off_output_modesets_only_its_crtc() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: omit standalone gamma commits from the topology event-wait predicate.
+fn standalone_gamma_event_retires_before_disable_and_reenable() {
+    let Some((fixture, log, route)) = live_two_heads() else {
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    let initial = submit_frame(&mut fixture);
+    retire_all(&mut fixture, &initial, 90);
+    let output_idx = 1;
+    let device_fd = device_fd(&fixture);
+    let recorder = fixture.events.recorders[&device_fd].clone();
+    let (output_key, connector_name, output_id, crtc_id, crtc, saved, x, y) = {
+        let backend = &mut fixture.events.backend;
+        let connector_name = connector(backend, output_idx);
+        let output_id = output_id(backend, &connector_name);
+        let crtc = crtc(backend, output_idx);
+        let crtc_id = Backend::randr_outputs_and_modes(backend)
+            .0
+            .into_iter()
+            .find(|output| output.name == connector_name)
+            .expect("output has a RandR CRTC id")
+            .crtc_id;
+        let layout = &mut backend.platform.outputs[output_idx];
+        layout.output.crtc_gamma_lut_prop = Some(handle(90));
+        layout.output.crtc_degamma_lut_prop = Some(handle(91));
+        layout.output.crtc_ctm_prop = Some(handle(92));
+        let output_key = layout.key.clone();
+        let saved = clone_test_drm_output(&layout.output);
+        (
+            output_key,
+            connector_name,
+            output_id,
+            crtc_id,
+            crtc,
+            saved,
+            layout.x,
+            layout.y,
+        )
+    };
+    recorder.set_gamma_size_for_tests(4);
+    Backend::set_crtc_gamma(
+        &mut fixture.events.backend,
+        crtc_id,
+        &[0x1111; 4],
+        &[0x2222; 4],
+        &[0x3333; 4],
+    )
+    .expect("submit standalone gamma through Backend");
+    let gamma = recorder
+        .records()
+        .into_iter()
+        .find(|record| record.kind == crate::drm::atomic::AtomicCommitKind::GammaOnly)
+        .expect("idle CRTC owns a standalone gamma event");
+    let gamma_id = accepted_event_id(&gamma).expect("standalone gamma commit is accepted");
+    fixture.events.wait_for_submitted_gpu_work();
+    fixture.events.queue_commit_completion(
+        device_fd,
+        handle(crtc),
+        gamma_id,
+        91,
+        Duration::from_millis(910),
+    );
+
+    assert!(
+        Backend::apply_crtc_config(
+            &mut fixture.events.backend,
+            output_id,
+            &connector_name,
+            None,
+            0,
+            0,
+        )
+        .expect("disable the output after its standalone gamma commit")
+    );
+    // If topology setup failed to wait, this drains the old CRTC event after
+    // the output mapping has already disappeared, matching the event loss path.
+    let events = fixture.events_mut();
+    Backend::on_page_flip_ready(&mut events.backend, &mut events.state, device_fd);
+    let event_retired_before_disable = {
+        let device = &fixture.events.backend.platform.devices[0];
+        device
+            .atomic_commit_sink
+            .for_tests_pending_page_flip_commit_ids(&device.device, handle(crtc))
+            .is_empty()
+    };
+
+    let discovered = saved;
+    let pool = recording_scanout_pool(
+        &mut fixture.events.backend,
+        &output_key,
+        route,
+        (800, 600),
+        0x6b00,
+        0x5300,
+    )
+    .expect("replacement scanout pool for re-enabled output");
+    fixture.events.backend.pstate.crtc_config_discovery_override = Some(discovered);
+    fixture.events.backend.pstate.crtc_config_discovery_pool = Some((route, pool));
+    let frame_offset = recorder.records().len();
+    let enabled = Backend::apply_crtc_config(
+        &mut fixture.events.backend,
+        output_id,
+        &connector_name,
+        Some(MODE_800),
+        x,
+        y,
+    )
+    .expect("re-enable the same output after gamma event retirement");
+
+    let gamma_crtc = handle::<::drm::control::crtc::Handle>(crtc);
+    let mut flips = submit_frame(&mut fixture);
+    let pending_output_events = |fixture: &RecordingSceneFixture| {
+        let device = &fixture.events.backend.platform.devices[0];
+        fixture
+            .events
+            .backend
+            .platform
+            .outputs
+            .iter()
+            .flat_map(|output| {
+                device
+                    .atomic_commit_sink
+                    .for_tests_pending_page_flip_commit_ids(&device.device, output.output.crtc)
+                    .into_iter()
+                    .map(move |id| (u32::from(output.output.crtc), id))
+            })
+            .collect::<Vec<_>>()
+    };
+    let accepted_gamma = || {
+        recorder
+            .records()
+            .into_iter()
+            .skip(frame_offset)
+            .find(|record| {
+                record.properties.iter().any(|update| {
+                    update.object == gamma_crtc.into() && update.property == handle(90)
+                }) && accepted_event_id(record).is_some()
+            })
+    };
+    if accepted_gamma().is_none() {
+        // On the broken path, the event was drained while the CRTC mapping
+        // was absent. Retire any remaining identities after restoring the
+        // output so the assertion below runs after fixture cleanup can finish.
+        for pass in 0..4u32 {
+            let pending = pending_output_events(&fixture);
+            if pending.is_empty() {
+                break;
+            }
+            retire_all(&mut fixture, &pending, 100 + pass);
+        }
+        flips = submit_frame(&mut fixture);
+    }
+    let gamma_after_enable = accepted_gamma();
+    let gamma_was_applied = if let Some(gamma_after_enable) = gamma_after_enable {
+        let gamma_event_id = accepted_event_id(&gamma_after_enable)
+            .expect("re-enabled CRTC gamma request owns an event");
+        if gamma_after_enable.kind == crate::drm::atomic::AtomicCommitKind::GammaOnly {
+            retire(&mut fixture, crtc, gamma_event_id, 92);
+            let next = submit_frame(&mut fixture);
+            let frame_accepted = next.iter().any(|(flipped_crtc, _)| *flipped_crtc == crtc);
+            if !next.is_empty() {
+                retire_all(&mut fixture, &next, 93);
+            }
+            if !flips.is_empty() {
+                retire_all(&mut fixture, &flips, 94);
+            }
+            frame_accepted
+        } else {
+            let frame_accepted = flips
+                .iter()
+                .any(|(flipped_crtc, id)| *flipped_crtc == crtc && *id == gamma_event_id);
+            if !flips.is_empty() {
+                retire_all(&mut fixture, &flips, 92);
+            }
+            frame_accepted
+        }
+    } else {
+        false
+    };
+    let no_pending_gamma_event = pending_output_events(&fixture).is_empty();
+    let topology_changes_applied = log.entries() == vec![("off", crtc), ("on", crtc)]
+        && fixture.events.backend.platform.outputs.len() == 2
+        && enabled;
+    fixture.adopt_drawables(0x6b00..0x6b03);
+    fixture.finish_after_normal_drain();
+    assert!(
+        event_retired_before_disable,
+        "gamma event retires before CRTC removal"
+    );
+    assert!(
+        topology_changes_applied,
+        "the CRTC disables and re-enables through Backend"
+    );
+    assert!(
+        gamma_was_applied,
+        "the cached LUT reaches the re-enabled CRTC"
+    );
+    assert!(
+        no_pending_gamma_event,
+        "the re-enabled CRTC has no stale event identity"
+    );
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: drop the `OutputScanout::Shared` check from
 // per_crtc_fallback_reason (a same-device copied pool is moved per CRTC).
 fn same_device_copied_route_takes_the_global_quiesce() {

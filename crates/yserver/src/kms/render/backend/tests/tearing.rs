@@ -595,7 +595,7 @@ fn qualify_direct_async(
     }
 }
 
-fn enter_tearing_without_direct_scanout(
+pub(super) fn enter_tearing_without_direct_scanout(
     backend: &mut KmsBackend,
     window: u32,
     first_present: u64,

@@ -6,12 +6,7 @@ use crate::{
     },
     kms::render::backend::KmsBackend,
 };
-use std::{
-    io,
-    os::fd::{AsFd as _, AsRawFd as _, RawFd},
-    rc::Rc,
-    time::Duration,
-};
+use std::{io, os::fd::RawFd, rc::Rc, time::Duration};
 use yserver_core::backend::{Backend, ModeSpec};
 
 fn handle<H: ::drm::control::ResourceHandle>(value: u32) -> H {
@@ -40,36 +35,6 @@ fn enable_gamma(
     backend.pstate.crtc_key_by_id.insert(crtc_xid, output_key);
     recorder.set_gamma_size_for_tests(gamma_size);
     (crtc_xid, crtc)
-}
-
-fn submit_scene_flip(
-    backend: &KmsBackend,
-    timing: crate::drm::async_flip::FlipTiming,
-) -> io::Result<u64> {
-    let layout = &backend.platform.outputs[0];
-    let device = backend
-        .platform
-        .device_for_output(&layout.key)
-        .expect("test output has a KMS device");
-    let mut out_fence = -1;
-    crate::drm::page_flip::submit_scene_flip_with_fences(
-        &device.device,
-        &device.atomic_commit_sink,
-        &layout.output,
-        handle(0x900),
-        -1,
-        &mut out_fence,
-        &[],
-        timing,
-    )
-}
-
-fn record_for_id(records: &[AtomicCommitRecord], id: u64) -> AtomicCommitRecord {
-    records
-        .iter()
-        .find(|record| record.user_data == id)
-        .expect("commit identity belongs to a recorded request")
-        .clone()
 }
 
 fn contains_crtc_property(
@@ -102,33 +67,29 @@ fn complete_recorded_attempt(
     Backend::on_page_flip_ready(&mut fixture.backend, &mut fixture.state, fd);
 }
 
-fn configure_atomic_event_gamma(
-    fixture: &mut AtomicEventFixture,
-) -> (
-    u32,
-    ::drm::control::crtc::Handle,
-    RawFd,
-    Rc<RecordingAtomicCommitExecutor>,
-) {
-    let fd = fixture.backend.platform.devices[0]
-        .device
-        .as_fd()
-        .as_raw_fd();
-    let recorder = fixture.recorders[&fd].clone();
-    let (crtc_xid, crtc) = enable_gamma(&mut fixture.backend, &recorder, 0, 4);
-    (crtc_xid, crtc, fd, recorder)
-}
-
 #[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: drop the pending LUT when the standalone GammaOnly commit returns EBUSY.
 fn gamma_standalone_ebusy_retries_after_the_next_crtc_event() {
-    let mut fixture = AtomicEventFixture::new(1);
-    let (crtc_xid, crtc, fd, recorder) = configure_atomic_event_gamma(&mut fixture);
-    recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EBUSY)));
+    let Some(fixture) = super::recording_scene::RecordingSceneFixture::new(1)
+        .expect("recording scene fixture construction")
+    else {
+        eprintln!("skip: no Vulkan scene fixture available");
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    let (crtc_xid, crtc, fd, recorder) = enable_recording_scene_gamma(&mut fixture);
+    super::super::tearing::enter_tearing_without_direct_scanout(
+        &mut fixture.events.backend,
+        0x7a01,
+        17_001,
+    );
+    recorder.clear_records();
+    recorder.script_result(Err(io::Error::from_raw_os_error(libc::EBUSY)));
     let red = vec![0x1111; 4];
     let green = vec![0x2222; 4];
     let blue = vec![0x3333; 4];
-    Backend::set_crtc_gamma(&mut fixture.backend, crtc_xid, &red, &green, &blue)
+    Backend::set_crtc_gamma(&mut fixture.events.backend, crtc_xid, &red, &green, &blue)
         .expect("EBUSY leaves the cached gamma pending");
     assert_eq!(
         recorder.records()[0].kind,
@@ -143,21 +104,25 @@ fn gamma_standalone_ebusy_retries_after_the_next_crtc_event() {
         } if error == libc::EBUSY
     ));
     assert!(
-        fixture.backend.platform.outputs[0]
+        fixture.events.backend.platform.outputs[0]
             .output
             .pending_gamma_lut
             .borrow()
             .is_some()
     );
 
-    // An async frame cannot carry the pending CRTC property; its event frees
-    // the stream and triggers the retained standalone gamma retry.
-    let async_id = submit_scene_flip(&fixture.backend, crate::drm::async_flip::FlipTiming::Async)
-        .expect("submit async frame after rejected standalone attempt");
-    let async_record = record_for_id(&recorder.records(), async_id);
+    // Submit an async frame through Backend while tearing is active. Its
+    // event frees the stream and triggers the retained standalone retry.
+    let async_attempts = super::atomic_events::submit_damaged_frame(&mut fixture);
+    let async_record = async_attempts
+        .iter()
+        .map(|(_, record)| record)
+        .find(|record| record.kind == AtomicCommitKind::Async)
+        .expect("Backend submits an async frame while tearing is active")
+        .clone();
     assert_eq!(async_record.kind, AtomicCommitKind::Async);
     assert!(!contains_crtc_property(&async_record, crtc, handle(70)));
-    complete_recorded_attempt(&mut fixture, fd, &async_record, 1);
+    complete_recorded_attempt(&mut fixture.events, fd, &async_record, 1);
 
     let records = recorder.records();
     assert_eq!(
@@ -171,79 +136,277 @@ fn gamma_standalone_ebusy_retries_after_the_next_crtc_event() {
     assert!(contains_crtc_property(retry, crtc, handle(70)));
     assert!(!contains_crtc_property(&records[1], crtc, handle(70)));
     assert!(
-        fixture.backend.platform.outputs[0]
+        fixture.events.backend.platform.outputs[0]
             .output
             .pending_gamma_lut
             .borrow()
             .is_none()
     );
-    assert_eq!(fixture.backend.get_crtc_gamma(crtc_xid), (red, green, blue));
+    assert_eq!(
+        fixture.events.backend.get_crtc_gamma(crtc_xid),
+        (red, green, blue)
+    );
+    complete_recorded_attempt(&mut fixture.events, fd, retry, 2);
+    fixture.finish_after_normal_drain();
 }
 
 #[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: drop the per-CRTC GAMMA_LUT disable latch after EINVAL.
 fn gamma_einval_latches_crtc_off_and_resubmits_the_frame() {
-    let mut fixture = AtomicEventFixture::new(1);
-    let (crtc_xid, crtc, fd, recorder) = configure_atomic_event_gamma(&mut fixture);
-    recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EBUSY)));
+    let Some(fixture) = super::recording_scene::RecordingSceneFixture::new(1)
+        .expect("recording scene fixture construction")
+    else {
+        eprintln!("skip: no Vulkan scene fixture available");
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    let (crtc_xid, crtc, fd, recorder) = enable_recording_scene_gamma(&mut fixture);
+    let initial = super::atomic_events::submit_damaged_frame(&mut fixture);
+    let initial_scene = initial
+        .iter()
+        .find(|(_, record)| {
+            record.kind == AtomicCommitKind::Scene && accepted_event_id(record).is_some()
+        })
+        .expect("initial Backend scene frame is accepted")
+        .1
+        .clone();
     let red = vec![0x1010; 4];
     let green = vec![0x2020; 4];
     let blue = vec![0x3030; 4];
-    Backend::set_crtc_gamma(&mut fixture.backend, crtc_xid, &red, &green, &blue)
-        .expect("script the gamma ramp as pending behind EBUSY");
+    Backend::set_crtc_gamma(&mut fixture.events.backend, crtc_xid, &red, &green, &blue)
+        .expect("cache gamma while the Backend scene commit is in flight");
+    let root = fixture.events.backend.core.window_id;
+    let (width, height) = (
+        fixture.events.backend.platform.fb_w,
+        fixture.events.backend.platform.fb_h,
+    );
+    Backend::clear_area(
+        &mut fixture.events.backend,
+        None,
+        root,
+        0,
+        None,
+        0,
+        0,
+        width,
+        height,
+        (0, 0),
+    )
+    .expect("queue the retry frame before the first event retires");
+    complete_recorded_attempt(&mut fixture.events, fd, &initial_scene, 1);
     recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EINVAL)));
     recorder.script_result(Ok(()));
 
-    let frame_id = submit_scene_flip(&fixture.backend, crate::drm::async_flip::FlipTiming::Vsync)
-        .expect("the frame is accepted after retry without GAMMA_LUT");
-    let records = recorder.records();
-    assert_eq!(records.len(), 3);
-    assert_eq!(records[1].kind, AtomicCommitKind::Scene);
-    assert_ne!(records[1].result, ScriptedResult::Ok);
-    assert!(contains_crtc_property(&records[1], crtc, handle(70)));
-    let accepted = record_for_id(&records, frame_id);
+    let scene_attempts = super::atomic_events::submit_damaged_frame(&mut fixture);
+    let rejected = scene_attempts
+        .iter()
+        .map(|(_, record)| record)
+        .find(|record| record.result != ScriptedResult::Ok)
+        .expect("Backend scene request carrying gamma is rejected with EINVAL");
+    assert_eq!(rejected.kind, AtomicCommitKind::Scene);
+    assert!(contains_crtc_property(rejected, crtc, handle(70)));
+    let accepted = scene_attempts
+        .iter()
+        .map(|(_, record)| record)
+        .find(|record| record.result == ScriptedResult::Ok)
+        .expect("Backend retries the scene without gamma and accepts the frame")
+        .clone();
     assert_eq!(accepted.kind, AtomicCommitKind::Scene);
-    assert_eq!(accepted.result, ScriptedResult::Ok);
     assert!(!contains_crtc_property(&accepted, crtc, handle(70)));
     assert!(accepted.properties.iter().any(|update| {
-        update.object == fixture.backend.platform.outputs[0].output.plane.into()
-            && update.property == fixture.backend.platform.outputs[0].output.plane_fb_id_prop
+        update.object
+            == fixture.events.backend.platform.outputs[0]
+                .output
+                .plane
+                .into()
+            && update.property
+                == fixture.events.backend.platform.outputs[0]
+                    .output
+                    .plane_fb_id_prop
     }));
-    assert_eq!(accepted_event_id(&accepted), Some(frame_id));
+    let frame_id = accepted_event_id(&accepted).expect("accepted scene has an event identity");
     assert_eq!(
-        fixture.backend.platform.devices[0]
+        fixture.events.backend.platform.devices[0]
             .atomic_commit_sink
             .for_tests_pending_page_flip_commit_ids(
-                &fixture.backend.platform.devices[0].device,
+                &fixture.events.backend.platform.devices[0].device,
                 crtc,
             ),
         [frame_id],
         "the retried frame owns its normal CRTC event association"
     );
     assert!(
-        fixture.backend.platform.outputs[0]
+        fixture.events.backend.platform.outputs[0]
             .output
             .gamma_lut_disabled
             .get()
     );
     assert!(
-        fixture.backend.platform.outputs[0]
+        fixture.events.backend.platform.outputs[0]
             .output
             .pending_gamma_lut
             .borrow()
             .is_none()
     );
     assert_eq!(
-        fixture.backend.get_crtc_gamma(crtc_xid),
+        fixture.events.backend.get_crtc_gamma(crtc_xid),
         (red.clone(), green.clone(), blue.clone())
     );
 
     let before = recorder.records().len();
-    Backend::set_crtc_gamma(&mut fixture.backend, crtc_xid, &red, &green, &blue)
+    Backend::set_crtc_gamma(&mut fixture.events.backend, crtc_xid, &red, &green, &blue)
         .expect("RandR cache stays writable after the per-CRTC capability latch");
     assert_eq!(recorder.records().len(), before);
 
-    complete_recorded_attempt(&mut fixture, fd, &accepted, 2);
+    complete_recorded_attempt(&mut fixture.events, fd, &accepted, 2);
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: snapshot the composed gamma retry before later plane and cursor updates are added.
+fn gamma_composed_einval_retry_preserves_every_plane_cursor_and_event() {
+    let Some((fixture, direct)) = super::direct_unflip::direct_fixture(
+        2,
+        super::recording_scene::P1SceneRoute::Shared,
+        17_003,
+        0,
+    ) else {
+        eprintln!("skip: no Vulkan scene fixture available");
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    let device_fd = super::direct_unflip::fd(&fixture);
+    let recorder = fixture.events.recorders[&device_fd].clone();
+    let (crtc_xid, gamma_crtc) = enable_gamma(&mut fixture.events.backend, &recorder, 0, 4);
+    let direct_attempts = super::direct_unflip::submit_direct(&mut fixture, &direct, device_fd);
+    let direct_record = direct_attempts
+        .iter()
+        .find(|record| accepted_event_id(record).is_some())
+        .expect("direct frame is accepted through Backend");
+    let direct_id = accepted_event_id(direct_record).expect("accepted direct frame has an ID");
+    super::direct_unflip::complete_direct_initial(
+        &mut fixture,
+        direct_record,
+        direct_id,
+        device_fd,
+    );
+    for output_idx in 0..2usize {
+        let output_handle_idx = u32::try_from(output_idx).expect("output index fits");
+        fixture
+            .events
+            .backend
+            .platform
+            .for_tests_seed_atomic_cursor_position(
+                output_idx,
+                handle(90 + output_handle_idx),
+                handle(92 + output_handle_idx),
+                handle(94 + output_handle_idx),
+                100 + i32::try_from(output_idx).expect("cursor x index fits") * 800,
+                100,
+                0,
+                0,
+            );
+    }
+    super::direct_unflip::drain_present_notifications(
+        &mut fixture,
+        &[direct.candidate.present_id],
+        &[],
+    );
+
+    recorder.script_result(Err(io::Error::from_raw_os_error(libc::EBUSY)));
+    Backend::set_crtc_gamma(
+        &mut fixture.events.backend,
+        crtc_xid,
+        &[0x1111; 4],
+        &[0x2222; 4],
+        &[0x3333; 4],
+    )
+    .expect("retain gamma after the standalone attempt returns EBUSY");
+    assert!(
+        fixture.events.backend.platform.outputs[0]
+            .output
+            .pending_gamma_lut
+            .borrow()
+            .is_some()
+    );
+
+    super::direct_unflip::request_unflip(&mut fixture, &direct);
+    recorder.script_result(Err(io::Error::from_raw_os_error(libc::EINVAL)));
+    recorder.script_result(Ok(()));
+    let offset = recorder.records().len();
+    let accepted = super::direct_unflip::grouped_unflip_record(&mut fixture, device_fd, offset, 2);
+    let attempts = recorder
+        .records()
+        .into_iter()
+        .skip(offset)
+        .collect::<Vec<_>>();
+    let rejected = attempts
+        .iter()
+        .find(|record| record.result != ScriptedResult::Ok)
+        .expect("gamma-bearing composed Backend request is rejected with EINVAL");
+    let rejected_has_gamma = contains_crtc_property(rejected, gamma_crtc, handle(70));
+    let accepted_kind = accepted.kind;
+    let accepted_has_gamma = contains_crtc_property(&accepted, gamma_crtc, handle(70));
+    let all_primary_planes_present = fixture
+        .events
+        .backend
+        .platform
+        .outputs
+        .iter()
+        .all(|output| {
+            accepted.properties.iter().any(|update| {
+                update.object == output.output.plane.into()
+                    && update.property == output.output.plane_fb_id_prop
+            })
+        });
+    let cursors_present = (0..2u32).all(|output_idx| {
+        let cursor_plane = handle::<::drm::control::plane::Handle>(90 + output_idx);
+        accepted.properties.iter().any(|update| {
+            update.object == cursor_plane.into() && update.property == handle(92 + output_idx)
+        }) && accepted.properties.iter().any(|update| {
+            update.object == cursor_plane.into() && update.property == handle(94 + output_idx)
+        })
+    });
+    let accepted_id = accepted_event_id(&accepted).expect("fallback owns a grouped event ID");
+    let pending_ids_match = accepted.events.iter().all(|event| {
+        let device = &fixture.events.backend.platform.devices[0];
+        device
+            .atomic_commit_sink
+            .for_tests_pending_page_flip_commit_ids(&device.device, event.crtc)
+            == [accepted_id]
+    });
+    complete_recorded_attempt(&mut fixture.events, device_fd, &accepted, 2);
+    let events_retired = accepted.events.iter().all(|event| {
+        let device = &fixture.events.backend.platform.devices[0];
+        device
+            .atomic_commit_sink
+            .for_tests_pending_page_flip_commit_ids(&device.device, event.crtc)
+            .is_empty()
+    });
+    super::direct_unflip::drain_present_notifications(
+        &mut fixture,
+        &[],
+        &[direct.candidate.present_id],
+    );
+    fixture.finish_after_normal_drain();
+    assert!(rejected_has_gamma, "rejected request carried GAMMA_LUT");
+    assert_eq!(accepted_kind, AtomicCommitKind::SceneWithCursor);
+    assert!(!accepted_has_gamma, "accepted retry omits the rejected LUT");
+    assert!(
+        all_primary_planes_present,
+        "retry retains every primary plane update"
+    );
+    assert!(
+        cursors_present,
+        "retry retains every cursor position update"
+    );
+    assert!(
+        pending_ids_match,
+        "each CRTC tracks the accepted retry identity"
+    );
+    assert!(events_retired, "each CRTC retires the accepted retry event");
 }
 
 fn enable_recording_scene_gamma(
@@ -294,12 +457,13 @@ impl crate::kms::render::backend::kms::session::VtResumeExecutor for LogicalVtRe
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: let a scene flip through while the standalone GAMMA_LUT event is pending.
 fn p1_gamma_standalone_serializes_scene_until_its_event() {
-    let Some(mut fixture) = super::recording_scene::RecordingSceneFixture::new(1)
+    let Some(fixture) = super::recording_scene::RecordingSceneFixture::new(1)
         .expect("recording scene fixture construction")
     else {
         eprintln!("skip: no Vulkan scene fixture available");
         return;
     };
+    let mut fixture = fixture.cleanup_guard();
     let (crtc_xid, crtc, fd, recorder) = enable_recording_scene_gamma(&mut fixture);
     let initial = super::atomic_events::submit_damaged_frame(&mut fixture);
     complete_recorded_attempt(&mut fixture.events, fd, &initial[0].1, 0);
@@ -353,7 +517,8 @@ fn p1_gamma_standalone_serializes_scene_until_its_event() {
     fixture
         .events
         .queue_commit_completion(fd, crtc, gamma_id, 1, Duration::from_millis(10));
-    Backend::on_page_flip_ready(&mut fixture.events.backend, &mut fixture.events.state, fd);
+    let events = fixture.events_mut();
+    Backend::on_page_flip_ready(&mut events.backend, &mut events.state, fd);
     let scene_attempts = super::atomic_events::submit_damaged_frame(&mut fixture);
     let scene = scene_attempts
         .iter()
@@ -370,20 +535,28 @@ fn p1_gamma_standalone_serializes_scene_until_its_event() {
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: append the pending CRTC property to an async frame instead of waiting for vsync.
 fn p1_gamma_async_flip_defers_lut_to_the_next_vsync_commit() {
-    let Some(mut fixture) = super::recording_scene::RecordingSceneFixture::new(1)
+    let Some(fixture) = super::recording_scene::RecordingSceneFixture::new(1)
         .expect("recording scene fixture construction")
     else {
         eprintln!("skip: no Vulkan scene fixture available");
         return;
     };
+    let mut fixture = fixture.cleanup_guard();
     let (crtc_xid, crtc, fd, recorder) = enable_recording_scene_gamma(&mut fixture);
-    let first_async_id = submit_scene_flip(
-        &fixture.events.backend,
-        crate::drm::async_flip::FlipTiming::Async,
-    )
-    .expect("submit first async frame");
-    let first_async = record_for_id(&recorder.records(), first_async_id);
-    assert_eq!(first_async.kind, AtomicCommitKind::Async);
+    super::super::tearing::enter_tearing_without_direct_scanout(
+        &mut fixture.events.backend,
+        0x7a02,
+        17_002,
+    );
+    recorder.clear_records();
+    let first_attempts = super::atomic_events::submit_damaged_frame(&mut fixture);
+    let first_async = first_attempts
+        .iter()
+        .map(|(_, record)| record)
+        .find(|record| record.kind == AtomicCommitKind::Async)
+        .expect("Backend submits async scene frame while tearing is active")
+        .clone();
+    assert!(accepted_event_id(&first_async).is_some());
 
     let red = vec![0x1111; 4];
     let green = vec![0x2222; 4];
@@ -422,33 +595,31 @@ fn p1_gamma_async_flip_defers_lut_to_the_next_vsync_commit() {
         "async retirement does not add a CRTC commit while scene work is queued"
     );
 
-    let async_id = submit_scene_flip(
-        &fixture.events.backend,
-        crate::drm::async_flip::FlipTiming::Async,
-    )
-    .expect("submit the next async frame");
-    let async_record = record_for_id(&recorder.records(), async_id);
+    let async_attempts = super::atomic_events::submit_damaged_frame(&mut fixture);
+    let async_record = async_attempts
+        .iter()
+        .map(|(_, record)| record)
+        .find(|record| record.kind == AtomicCommitKind::Async)
+        .expect("Backend submits the next async scene frame")
+        .clone();
     assert_eq!(async_record.kind, AtomicCommitKind::Async);
     assert!(!contains_crtc_property(&async_record, crtc, handle(70)));
+    assert!(accepted_event_id(&async_record).is_some());
     complete_recorded_attempt(&mut fixture.events, fd, &async_record, 2);
-    assert!(
-        fixture.events.backend.platform.outputs[0]
-            .output
-            .pending_gamma_lut
-            .borrow()
-            .is_some()
-    );
 
-    let vsync_id = submit_scene_flip(
-        &fixture.events.backend,
-        crate::drm::async_flip::FlipTiming::Vsync,
-    )
-    .expect("submit the next vsync frame with gamma");
-    let vsync = record_for_id(&recorder.records(), vsync_id);
-    assert_eq!(vsync.kind, AtomicCommitKind::Scene);
-    assert!(contains_crtc_property(&vsync, crtc, handle(70)));
-    assert!(contains_crtc_property(&vsync, crtc, handle(71)));
-    assert!(contains_crtc_property(&vsync, crtc, handle(72)));
+    let gamma_commit = recorder
+        .records()
+        .into_iter()
+        .find(|record| record.kind == AtomicCommitKind::GammaOnly)
+        .expect("retiring async work submits the deferred synchronous gamma commit");
+    assert!(contains_crtc_property(&gamma_commit, crtc, handle(70)));
+    assert!(contains_crtc_property(&gamma_commit, crtc, handle(71)));
+    assert!(contains_crtc_property(&gamma_commit, crtc, handle(72)));
+    assert!(
+        !gamma_commit
+            .flags
+            .contains(::drm::control::AtomicCommitFlags::PAGE_FLIP_ASYNC)
+    );
     assert!(
         fixture.events.backend.platform.outputs[0]
             .output
@@ -456,15 +627,7 @@ fn p1_gamma_async_flip_defers_lut_to_the_next_vsync_commit() {
             .borrow()
             .is_none()
     );
-    complete_recorded_attempt(&mut fixture.events, fd, &vsync, 3);
-    let scene_attempts = super::atomic_events::submit_damaged_frame(&mut fixture);
-    let scene = scene_attempts
-        .iter()
-        .find(|(_, record)| {
-            record.kind == AtomicCommitKind::Scene && accepted_event_id(record).is_some()
-        })
-        .expect("queued scene damage submits after the gamma-carrying vsync");
-    complete_recorded_attempt(&mut fixture.events, fd, &scene.1, 4);
+    complete_recorded_attempt(&mut fixture.events, fd, &gamma_commit, 3);
     fixture.finish_after_normal_drain();
 }
 
@@ -472,12 +635,13 @@ fn p1_gamma_async_flip_defers_lut_to_the_next_vsync_commit() {
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: make the shared gamma reapply helper a no-op after modeset and VT acquire.
 fn p1_gamma_reapplies_after_modeset_and_vt_resume() {
-    let Some(mut fixture) = super::recording_scene::RecordingSceneFixture::new(1)
+    let Some(fixture) = super::recording_scene::RecordingSceneFixture::new(1)
         .expect("recording scene fixture construction")
     else {
         eprintln!("skip: no Vulkan scene fixture available");
         return;
     };
+    let mut fixture = fixture.cleanup_guard();
     fixture
         .events
         .backend
@@ -584,13 +748,15 @@ fn p1_gamma_reapplies_after_modeset_and_vt_resume() {
     complete_recorded_attempt(&mut fixture.events, fd, &accepted_mode_scene.1, 4);
 
     let _ = Backend::begin_vt_release(&mut fixture.events.backend);
+    let events = fixture.events_mut();
     Backend::finish_vt_release(
-        &mut fixture.events.backend,
-        &mut fixture.events.state,
+        &mut events.backend,
+        &mut events.state,
         &yserver_core::core_loop::input_inventory::InputInventory::default(),
     );
     let resume_offset = recorder.records().len();
-    Backend::on_vt_acquire(&mut fixture.events.backend, &mut fixture.events.state);
+    let events = fixture.events_mut();
+    Backend::on_vt_acquire(&mut events.backend, &mut events.state);
     let resume_records = recorder.records();
     let resume_gamma = resume_records
         .iter()

@@ -1083,13 +1083,13 @@ impl PlatformBackend {
     }
 
     /// Whether output `idx` still owes a page-flip event: a scene flip held
-    /// by its scanout pool or an accepted cursor-only commit on its CRTC.
+    /// by its scanout pool or an accepted CRTC commit such as cursor or gamma.
     pub(crate) fn output_owes_kms_event(&self, idx: usize) -> bool {
         self.scanout_pools
             .get(idx)
             .and_then(Option::as_ref)
             .is_some_and(|pool| pool.display_pool().has_pending_pageflip())
-            || self.cursor_atomic_event_pending_for_output(idx)
+            || self.scanout_commit_in_flight_for_output(idx)
     }
 
     /// Distrust every buffer-age record of output `idx` after a modeset, as
