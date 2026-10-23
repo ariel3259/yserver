@@ -838,9 +838,7 @@ impl PlatformBackend {
             .expect("test output has an owning KMS device");
         if device.cursor.plane.is_none() {
             device.cursor.plane = Some(crate::kms::cursor_plane::CursorPlane::for_tests_stub(
-                Rc::clone(&device.device),
-                64,
-                64,
+                64, 64,
             ));
         }
         let plane = device

@@ -673,8 +673,7 @@ fn install_test_cursor_plane(
     crtcs: &[::drm::control::crtc::Handle],
     boundary: &str,
 ) {
-    let plane =
-        crate::kms::cursor_plane::CursorPlane::for_tests_stub(Rc::clone(&device.device), 64, 64);
+    let plane = crate::kms::cursor_plane::CursorPlane::for_tests_stub(64, 64);
     install_cursor_plane_for_device(device, crtcs, boundary, plane);
 }
 

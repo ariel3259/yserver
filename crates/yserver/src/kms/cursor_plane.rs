@@ -312,8 +312,7 @@ impl CursorPlane {
                     .map(|properties| (*crtc, properties))
             })
             .collect();
-        let state_path =
-            decide_cursor_state_path(&assigned, &discovery.planes, caps.as_ref(), active_crtcs);
+        let state_path = decide_cursor_state_path(&assigned, &discovery.planes, caps.as_ref());
         let mut sprites = SpritePool::new(width, height);
         sprites.set_active_crtc_count(active_crtcs.len());
         let plane = Self {
@@ -354,15 +353,14 @@ impl CursorPlane {
 
     /// Build an ioctl-free cursor plane for platform state-machine tests.
     #[cfg(test)]
-    pub(crate) fn for_tests_stub(device: Rc<Device>, width: u32, height: u32) -> Self {
-        let _ = device;
+    pub(crate) fn for_tests_stub(width: u32, height: u32) -> Self {
         let discovery = CursorPlaneDiscovery {
             crtcs: Vec::new(),
             planes: Vec::new(),
         };
         let caps = None;
         let state_path =
-            decide_cursor_state_path(&HashMap::new(), &discovery.planes, caps.as_ref(), &[]);
+            decide_cursor_state_path(&HashMap::new(), &discovery.planes, caps.as_ref());
         let mut sprites = SpritePool::new(width, height);
         sprites.set_active_crtc_count(0);
         Self {
@@ -566,7 +564,6 @@ mod tests {
                 false,
                 Some("amdgpu".to_owned()),
             )),
-            &[a, b],
         );
         assert_eq!(decision.path, CursorStatePath::Software);
         assert_eq!(decision.reason, CursorPathReason::MissingProperty("FB_ID"));
@@ -588,8 +585,7 @@ mod tests {
     fn cursor_plane_assignment_leaves_an_uncovered_crtc_unassigned() {
         let a = test_crtc(11);
         let b = test_crtc(12);
-        let device = Rc::new(crate::drm::Device::for_tests().expect("test DRM device"));
-        let mut plane = CursorPlane::for_tests_stub(device, 64, 64);
+        let mut plane = CursorPlane::for_tests_stub(64, 64);
         let shared_only = [discovered(21, &[a, b], true)];
         let (assignment, atomic_positions) = cursor_plane_topology(&[a, b], &shared_only);
         plane.explicit_plane_assignment = assignment;

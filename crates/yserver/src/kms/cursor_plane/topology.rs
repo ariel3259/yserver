@@ -156,17 +156,12 @@ pub(super) fn decide_cursor_state_path(
     assignment: &HashMap<crtc::Handle, plane::Handle>,
     planes: &[DiscoveredCursorPlane],
     caps: Option<&CursorDeviceCaps>,
-    active_crtcs: &[crtc::Handle],
 ) -> CursorPathDecision {
     let software = |reason| CursorPathDecision {
         path: CursorStatePath::Software,
         reason,
     };
-    if assignment.is_empty()
-        || active_crtcs
-            .iter()
-            .any(|crtc| !assignment.contains_key(crtc))
-    {
+    if assignment.is_empty() {
         return software(CursorPathReason::NoCursorPlane);
     }
     let Some(caps) = caps else {
@@ -314,7 +309,7 @@ mod tests {
             .map(|plane| HashMap::from([(raw(11), plane.handle)]))
             .unwrap_or_default();
         let planes: Vec<_> = plane.cloned().into_iter().collect();
-        decide_cursor_state_path(&assignment, &planes, caps, &[raw(11)])
+        decide_cursor_state_path(&assignment, &planes, caps)
     }
 
     fn caps(driver_name: Option<&str>, accepted: bool) -> CursorDeviceCaps {
