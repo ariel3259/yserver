@@ -692,6 +692,20 @@ impl PlatformBackend {
         let w = mode_spec.width;
         let h = mode_spec.height;
 
+        // The property cache is refreshed when a modeset replaces the
+        // Output record, but EINVAL is a per-CRTC capability latch and must
+        // survive that replacement when the kernel CRTC handle is unchanged.
+        if let Some(existing) = existing_idx
+            .and_then(|idx| self.outputs.get(idx))
+            .filter(|existing| existing.output.crtc == output.crtc)
+        {
+            output
+                .gamma_lut_disabled
+                .set(existing.output.gamma_lut_disabled.get());
+            *output.pending_gamma_lut.borrow_mut() =
+                existing.output.pending_gamma_lut.borrow().clone();
+        }
+
         if let Some((prepared_route, prepared)) = prepared_pool.as_ref() {
             if !needs_pool_realloc {
                 return Err(io::Error::new(

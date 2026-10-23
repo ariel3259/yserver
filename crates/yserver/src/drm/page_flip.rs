@@ -19,7 +19,7 @@ use crate::drm::{
         AtomicCommitEvent, AtomicCommitKind, AtomicCommitRequest, AtomicCommitSink,
         CursorPlanePosition,
     },
-    modeset::{Output, PropMap},
+    modeset::{Output, PropMap, append_pending_gamma_lut, finish_pending_gamma_lut},
 };
 
 #[cfg(target_os = "linux")]
@@ -285,14 +285,46 @@ pub(crate) fn submit_scene_flip_with_fences_tearing(
             crate::drm::async_flip::FlipTiming::Vsync => AtomicCommitFlags::empty(),
             crate::drm::async_flip::FlipTiming::Async => AtomicCommitFlags::PAGE_FLIP_ASYNC,
         };
-    atomic_commit_sink.submit_tearing_with_commit_id(
+    let mut request_without_gamma = None;
+    let gamma_blob = if timing == crate::drm::async_flip::FlipTiming::Vsync
+        && output.crtc_gamma_lut_prop.is_some()
+        && !output.gamma_lut_disabled.get()
+        && output.pending_gamma_lut.borrow().is_some()
+    {
+        request_without_gamma = Some(request.clone());
+        append_pending_gamma_lut(device, atomic_commit_sink, output, &mut request)
+    } else {
+        None
+    };
+    let mut result = atomic_commit_sink.submit_tearing_with_commit_id(
         device,
         flags,
         kind,
         request,
         &[event],
         tearing_context,
-    )
+    );
+    if let Some(blob) = gamma_blob {
+        finish_pending_gamma_lut(device, atomic_commit_sink, output, blob, &result);
+        if result
+            .as_ref()
+            .is_err_and(|error| error.raw_os_error() == Some(libc::EINVAL))
+            && let Some(request) = request_without_gamma
+        {
+            // The unsupported property rejected this frame. Gamma is now
+            // latched off for this CRTC, so retry the same frame request
+            // without it and preserve the ordinary flip path.
+            result = atomic_commit_sink.submit_tearing_with_commit_id(
+                device,
+                flags,
+                kind,
+                request,
+                &[event],
+                tearing_context,
+            );
+        }
+    }
+    result
 }
 
 fn submit_flip_inner(

@@ -105,6 +105,11 @@ pub(super) fn clone_test_drm_output(
         plane_crtc_h_prop: output.plane_crtc_h_prop,
         plane_in_fence_fd_prop: output.plane_in_fence_fd_prop,
         crtc_out_fence_ptr_prop: output.crtc_out_fence_ptr_prop,
+        crtc_gamma_lut_prop: output.crtc_gamma_lut_prop,
+        crtc_degamma_lut_prop: output.crtc_degamma_lut_prop,
+        crtc_ctm_prop: output.crtc_ctm_prop,
+        pending_gamma_lut: std::cell::RefCell::new(None),
+        gamma_lut_disabled: std::cell::Cell::new(false),
         scanout_modifiers: output.scanout_modifiers.clone(),
         mm_width: output.mm_width,
         mm_height: output.mm_height,
@@ -707,6 +712,138 @@ fn kms_gamma_off_connector_set_roundtrips_cached_values() {
     b.set_crtc_gamma(crtc, &red, &green, &blue)
         .expect("set gamma cache");
     assert_eq!(b.get_crtc_gamma(crtc), (red, green, blue));
+}
+
+#[test]
+fn kms_gamma_backend_uses_atomic_lut_for_idle_crtc() {
+    // Mutation: route a supported ramp through the legacy ioctl.
+    use crate::drm::atomic::{
+        AtomicCommitKind, AtomicCommitSink, tests_support::RecordingAtomicCommitExecutor,
+    };
+    use std::{
+        os::fd::{AsFd as _, AsRawFd as _},
+        rc::Rc,
+    };
+    use yserver_core::backend::Backend;
+
+    let mut backend = KmsBackend::for_tests();
+    let gamma_size = 256;
+    let crtc_xid = 0x4000;
+    let (crtc, output_key) = {
+        let output = &mut backend.platform.outputs[0];
+        output.output.crtc_gamma_lut_prop = Some(::drm::control::from_u32(70).unwrap());
+        output.output.crtc_degamma_lut_prop = Some(::drm::control::from_u32(71).unwrap());
+        output.output.crtc_ctm_prop = Some(::drm::control::from_u32(72).unwrap());
+        (output.output.crtc, output.key.clone())
+    };
+    backend
+        .pstate
+        .crtc_key_by_id
+        .insert(crtc_xid, output_key.clone());
+
+    let device_fd = backend
+        .platform
+        .device_for_key(output_key.device_key)
+        .unwrap()
+        .device
+        .as_fd()
+        .as_raw_fd();
+    let recorder = Rc::new(RecordingAtomicCommitExecutor::default());
+    recorder.set_gamma_size_for_tests(gamma_size);
+    backend.platform.devices[0].atomic_commit_sink =
+        Rc::new(AtomicCommitSink::new(recorder.clone()));
+
+    let red = vec![0x1111; usize::from(gamma_size)];
+    let green = vec![0x2222; usize::from(gamma_size)];
+    let blue = vec![0x3333; usize::from(gamma_size)];
+    Backend::set_crtc_gamma(&mut backend, crtc_xid, &red, &green, &blue)
+        .expect("set CRTC gamma through Backend");
+
+    let records = recorder.records();
+    let [commit] = records.as_slice() else {
+        panic!("idle gamma update must submit exactly one standalone commit");
+    };
+    assert_eq!(commit.kind, AtomicCommitKind::GammaOnly);
+    assert!(
+        commit
+            .flags
+            .contains(::drm::control::AtomicCommitFlags::PAGE_FLIP_EVENT)
+    );
+    assert!(
+        commit
+            .flags
+            .contains(::drm::control::AtomicCommitFlags::NONBLOCK)
+    );
+    assert_eq!(commit.events.len(), 1);
+    assert_eq!(commit.events[0].crtc, crtc);
+
+    let blobs = recorder.created_property_blobs();
+    let [(blob_id, blob)] = blobs.as_slice() else {
+        panic!("gamma commit must create exactly one property blob");
+    };
+    assert_eq!(blob.len(), usize::from(gamma_size) * 8);
+    assert_eq!(&blob[..8], &[0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0, 0]);
+    assert!(commit.properties.iter().any(|update| {
+        update.object == crtc.into()
+            && update.property == ::drm::control::from_u32(70).unwrap()
+            && update.value == *blob_id
+    }));
+    assert!(commit.properties.iter().any(|update| {
+        update.object == crtc.into()
+            && update.property == ::drm::control::from_u32(71).unwrap()
+            && update.value == 0
+    }));
+    assert!(commit.properties.iter().any(|update| {
+        update.object == crtc.into()
+            && update.property == ::drm::control::from_u32(72).unwrap()
+            && update.value == 0
+    }));
+    assert_eq!(recorder.destroyed_property_blobs(), vec![*blob_id]);
+    assert!(
+        backend.platform.outputs[0]
+            .output
+            .pending_gamma_lut
+            .borrow()
+            .is_none()
+    );
+    assert_eq!(backend.crtc_gamma_size(crtc_xid), gamma_size);
+    assert!(records.iter().all(|record| record.device_fd == device_fd));
+}
+
+#[test]
+// Mutation: report the synthetic legacy gamma length without a GAMMA_LUT property.
+fn kms_gamma_atomic_crtc_without_lut_reports_zero_and_submits_nothing() {
+    use crate::drm::atomic::{AtomicCommitSink, tests_support::RecordingAtomicCommitExecutor};
+    use std::rc::Rc;
+    use yserver_core::backend::Backend;
+
+    let mut backend = KmsBackend::for_tests();
+    let crtc_xid = 0x4000;
+    let output_key = backend.platform.outputs[0].key.clone();
+    backend.pstate.crtc_key_by_id.insert(crtc_xid, output_key);
+    let recorder = Rc::new(RecordingAtomicCommitExecutor::default());
+    recorder.set_gamma_size_for_tests(256);
+    backend.platform.devices[0].atomic_commit_sink =
+        Rc::new(AtomicCommitSink::new(recorder.clone()));
+
+    assert_eq!(backend.crtc_gamma_size(crtc_xid), 0);
+    Backend::set_crtc_gamma(&mut backend, crtc_xid, &[], &[], &[])
+        .expect("zero-sized gamma ramp is accepted for a CRTC without GAMMA_LUT");
+
+    assert!(recorder.records().is_empty());
+    assert_eq!(
+        backend.get_crtc_gamma(crtc_xid),
+        (Vec::new(), Vec::new(), Vec::new())
+    );
+    assert!(backend.platform.outputs.iter().all(|layout| {
+        layout.output.crtc_gamma_lut_prop.is_none()
+            && layout.output.pending_gamma_lut.borrow().is_none()
+    }));
+    assert_eq!(
+        recorder.created_property_blobs(),
+        Vec::new(),
+        "no property blob is created without gamma capability"
+    );
 }
 
 #[test]

@@ -1,4 +1,4 @@
-//! Atomic commit request assembly, timing, and cursor latency telemetry.
+//! Atomic commit request assembly, timing, and CRTC-local commit telemetry.
 
 use std::{
     cell::{Cell, RefCell},
@@ -14,7 +14,7 @@ use drm::control::{AtomicCommitFlags, RawResourceHandle, ResourceHandle, crtc, p
 use crate::drm::Device;
 
 /// Kernel-shaped property arrays for `DRM_IOCTL_MODE_ATOMIC`.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct RawAtomicModeReq {
     objects: Vec<RawResourceHandle>,
     count_props_per_object: Vec<u32>,
@@ -118,6 +118,7 @@ impl RawAtomicModeReq {
 #[allow(dead_code)] // the commit producers arrive in Tasks 2–3
 pub(crate) enum AtomicCommitKind {
     CursorOnly,
+    GammaOnly,
     SceneWithCursor,
     Scene,
     Async,
@@ -176,6 +177,7 @@ impl AtomicCommitKind {
     const fn name(self) -> &'static str {
         match self {
             Self::CursorOnly => "cursor-only",
+            Self::GammaOnly => "gamma-only",
             Self::SceneWithCursor => "scene-with-cursor",
             Self::Scene => "scene",
             Self::Async => "async",
@@ -184,7 +186,7 @@ impl AtomicCommitKind {
 
     const fn ebusy_log_level(self) -> log::Level {
         match self {
-            Self::CursorOnly => log::Level::Debug,
+            Self::CursorOnly | Self::GammaOnly => log::Level::Debug,
             Self::SceneWithCursor | Self::Scene | Self::Async => log::Level::Warn,
         }
     }
@@ -192,9 +194,10 @@ impl AtomicCommitKind {
     const fn index(self) -> usize {
         match self {
             Self::CursorOnly => 0,
-            Self::SceneWithCursor => 1,
-            Self::Scene => 2,
-            Self::Async => 3,
+            Self::GammaOnly => 1,
+            Self::SceneWithCursor => 2,
+            Self::Scene => 3,
+            Self::Async => 4,
         }
     }
 }
@@ -249,6 +252,7 @@ impl AtomicPropertyUpdate {
 
 /// An atomic request paired with its flattened updates for the test recorder.
 #[allow(dead_code)] // scene and direct submitters start using this in Task 2
+#[derive(Clone)]
 pub(crate) struct AtomicCommitRequest {
     request: RawAtomicModeReq,
     properties: Vec<AtomicPropertyUpdate>,
@@ -382,6 +386,26 @@ pub(crate) trait AtomicCommitExecutor {
         events: &[AtomicCommitEvent],
     ) -> io::Result<()>;
 
+    fn crtc_gamma_size(&self, device: &Device, crtc: crtc::Handle) -> io::Result<u16> {
+        use ::drm::control::Device as ControlDevice;
+
+        let info = device.get_crtc(crtc)?;
+        Ok(u16::try_from(info.gamma_length()).unwrap_or(u16::MAX))
+    }
+
+    fn create_property_blob(&self, device: &Device, data: &[u8]) -> io::Result<u64> {
+        use ::drm::control::Device as ControlDevice;
+
+        let blob: u64 = device.create_property_blob(data)?.into();
+        Ok(blob)
+    }
+
+    fn destroy_property_blob(&self, device: &Device, blob: u64) -> io::Result<()> {
+        use ::drm::control::Device as ControlDevice;
+
+        device.destroy_property_blob(blob)
+    }
+
     #[cfg(test)]
     fn for_tests_record_count(&self) -> Option<usize> {
         None
@@ -425,6 +449,30 @@ impl AtomicCommitSink {
     #[cfg(test)]
     pub(crate) fn for_tests_record_count(&self) -> Option<usize> {
         self.executor.for_tests_record_count()
+    }
+
+    pub(crate) fn crtc_gamma_size(&self, device: &Device, crtc: crtc::Handle) -> io::Result<u16> {
+        self.executor.crtc_gamma_size(device, crtc)
+    }
+
+    pub(crate) fn create_property_blob(&self, device: &Device, data: &[u8]) -> io::Result<u64> {
+        self.executor.create_property_blob(device, data)
+    }
+
+    pub(crate) fn destroy_property_blob(&self, device: &Device, blob: u64) -> io::Result<()> {
+        self.executor.destroy_property_blob(device, blob)
+    }
+
+    pub(crate) fn page_flip_commit_in_flight(&self, device: &Device, crtc: crtc::Handle) -> bool {
+        let key = CrtcPageFlipKey {
+            device_fd: device.as_fd().as_raw_fd(),
+            crtc,
+        };
+        self.metrics
+            .borrow()
+            .pending_page_flips
+            .get(&key)
+            .is_some_and(|pending| !pending.is_empty())
     }
 
     #[cfg(test)]
@@ -825,11 +873,12 @@ impl AtomicCommitSink {
         let visible = percentile(&snapshot.motion_to_visible_us);
         log::info!(
             target: "yserver::kms::render::backend::kms",
-            "atomic commits/s cursor_only={} scene_with_cursor={} scene={} async={} ebusy={} ioctl_us_max/p99 cursor_only={}/{} scene_with_cursor={}/{} scene={}/{} async={}/{} motion_to_accept_us_max/p99={}/{} motion_to_visible_us_max/p99={}/{}",
+            "atomic commits/s cursor_only={} gamma_only={} scene_with_cursor={} scene={} async={} ebusy={} ioctl_us_max/p99 cursor_only={}/{} gamma_only={}/{} scene_with_cursor={}/{} scene={}/{} async={}/{} motion_to_accept_us_max/p99={}/{} motion_to_visible_us_max/p99={}/{}",
             counts[0],
             counts[1],
             counts[2],
             counts[3],
+            counts[4],
             snapshot.ebusy,
             summaries[0].0,
             summaries[0].1,
@@ -839,6 +888,8 @@ impl AtomicCommitSink {
             summaries[2].1,
             summaries[3].0,
             summaries[3].1,
+            summaries[4].0,
+            summaries[4].1,
             accept.0,
             accept.1,
             visible.0,
@@ -1016,7 +1067,7 @@ struct CommitWindow {
     started: Instant,
     tearing_started: Instant,
     present_latency_started: Instant,
-    ioctl_us: [Vec<u64>; 4],
+    ioctl_us: [Vec<u64>; 5],
     ebusy: u64,
     motion_to_accept_us: Vec<u64>,
     motion_to_visible_us: Vec<u64>,
@@ -1049,7 +1100,7 @@ struct CommitWindow {
 }
 
 struct CommitWindowSnapshot {
-    ioctl_us: [Vec<u64>; 4],
+    ioctl_us: [Vec<u64>; 5],
     ebusy: u64,
     motion_to_accept_us: Vec<u64>,
     motion_to_visible_us: Vec<u64>,
@@ -1565,6 +1616,10 @@ pub(crate) mod tests_support {
     pub(crate) struct RecordingAtomicCommitExecutor {
         records: RefCell<Vec<AtomicCommitRecord>>,
         scripted_results: RefCell<VecDeque<ScriptedResult>>,
+        gamma_size: Cell<Option<u16>>,
+        created_property_blobs: RefCell<Vec<(u64, Vec<u8>)>>,
+        destroyed_property_blobs: RefCell<Vec<u64>>,
+        next_property_blob_id: Cell<u64>,
     }
 
     impl RecordingAtomicCommitExecutor {
@@ -1574,6 +1629,18 @@ pub(crate) mod tests_support {
 
         pub(crate) fn clear_records(&self) {
             self.records.borrow_mut().clear();
+        }
+
+        pub(crate) fn set_gamma_size_for_tests(&self, size: u16) {
+            self.gamma_size.set(Some(size));
+        }
+
+        pub(crate) fn created_property_blobs(&self) -> Vec<(u64, Vec<u8>)> {
+            self.created_property_blobs.borrow().clone()
+        }
+
+        pub(crate) fn destroyed_property_blobs(&self) -> Vec<u64> {
+            self.destroyed_property_blobs.borrow().clone()
         }
 
         pub(crate) fn script_result(&self, result: io::Result<()>) {
@@ -1616,6 +1683,30 @@ pub(crate) mod tests_support {
                 user_data: request.user_data,
             });
             result.into_result()
+        }
+
+        fn crtc_gamma_size(&self, device: &Device, crtc: crtc::Handle) -> io::Result<u16> {
+            if let Some(size) = self.gamma_size.get() {
+                return Ok(size);
+            }
+            use ::drm::control::Device as ControlDevice;
+
+            let info = device.get_crtc(crtc)?;
+            Ok(u16::try_from(info.gamma_length()).unwrap_or(u16::MAX))
+        }
+
+        fn create_property_blob(&self, _device: &Device, data: &[u8]) -> io::Result<u64> {
+            let blob_id = self.next_property_blob_id.get().saturating_add(1);
+            self.next_property_blob_id.set(blob_id);
+            self.created_property_blobs
+                .borrow_mut()
+                .push((blob_id, data.to_vec()));
+            Ok(blob_id)
+        }
+
+        fn destroy_property_blob(&self, _device: &Device, blob: u64) -> io::Result<()> {
+            self.destroyed_property_blobs.borrow_mut().push(blob);
+            Ok(())
         }
     }
 }
