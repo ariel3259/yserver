@@ -659,6 +659,7 @@ fn p1_gamma_async_flip_defers_lut_to_the_next_vsync_commit() {
     let red = vec![0x1111; 4];
     let green = vec![0x2222; 4];
     let blue = vec![0x3333; 4];
+    let (base, elapsed_ns) = install_controlled_gamma_clock(&mut fixture.events.backend);
     Backend::set_crtc_gamma(&mut fixture.events.backend, crtc_xid, &red, &green, &blue)
         .expect("retain gamma while the async frame is in flight");
     assert!(
@@ -704,6 +705,25 @@ fn p1_gamma_async_flip_defers_lut_to_the_next_vsync_commit() {
     assert!(!contains_crtc_property(&async_record, crtc, handle(70)));
     assert!(accepted_event_id(&async_record).is_some());
     complete_recorded_attempt(&mut fixture.events, fd, &async_record, 2);
+
+    assert!(
+        recorder
+            .records()
+            .iter()
+            .all(|record| record.kind != AtomicCommitKind::GammaOnly),
+        "async retirement keeps gamma held before its one-refresh deadline"
+    );
+    assert_eq!(
+        fixture.events.backend.platform.outputs[0]
+            .output
+            .pending_gamma_deadline
+            .get(),
+        Some(base + Duration::from_nanos(16_666_666)),
+        "async gamma keeps the first one-refresh deadline"
+    );
+    elapsed_ns.store(16_666_667, Ordering::SeqCst);
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("expired async gamma deadline submits the synchronous commit");
 
     let gamma_commit = recorder
         .records()
@@ -1140,6 +1160,158 @@ fn gamma_replacement_keeps_first_deadline_and_submits_the_second_ramp() {
         &blobs[0].1[..8],
         &[0x44, 0x44, 0x45, 0x44, 0x46, 0x44, 0, 0],
         "the first deadline submits the latest ramp"
+    );
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: set the deadline only for active CRTCs.
+fn gamma_held_on_idle_crtc_by_other_output_gets_one_refresh_deadline() {
+    let Some((fixture, direct)) = super::direct_unflip::direct_fixture(
+        2,
+        super::recording_scene::P1SceneRoute::Shared,
+        17_005,
+        0,
+    ) else {
+        eprintln!("skip: no Vulkan scene fixture available");
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    let fd = super::direct_unflip::fd(&fixture);
+    let recorder = fixture.events.recorders[&fd].clone();
+    let (crtc_xid, crtc) = enable_gamma(&mut fixture.events.backend, &recorder, 1, 4);
+    let busy_crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    assert_ne!(crtc, busy_crtc, "the outputs use distinct CRTCs");
+
+    let idle_output = fixture.events.backend.platform.outputs.remove(1);
+    let direct_records = super::direct_unflip::submit_direct(&mut fixture, &direct, fd);
+    fixture.events.backend.platform.outputs.push(idle_output);
+    let direct_record = direct_records
+        .into_iter()
+        .find(|record| accepted_event_id(record).is_some())
+        .expect("output 0 direct frame is accepted through Backend");
+    assert_eq!(
+        direct_record.events.len(),
+        1,
+        "only output 0 owns the direct flip"
+    );
+    assert_eq!(direct_record.events[0].crtc, busy_crtc);
+    let direct_id = accepted_event_id(&direct_record).expect("direct frame has a P1 commit ID");
+    assert_eq!(
+        fixture.events.backend.platform.devices[0]
+            .atomic_commit_sink
+            .for_tests_pending_page_flip_commit_ids(
+                &fixture.events.backend.platform.devices[0].device,
+                busy_crtc,
+            ),
+        [direct_id],
+        "output 0's accepted direct flip remains in flight"
+    );
+    assert!(fixture.events.backend.pstate.scanout_m2.pending.is_some());
+    assert!(
+        !fixture.events.backend.platform.devices[0]
+            .atomic_commit_sink
+            .page_flip_commit_in_flight(&fixture.events.backend.platform.devices[0].device, crtc,),
+        "output 1's CRTC is idle"
+    );
+    recorder.clear_records();
+
+    let (base, elapsed_ns) = install_controlled_gamma_clock(&mut fixture.events.backend);
+    set_test_gamma(&mut fixture.events.backend, crtc_xid, 0x6666);
+    assert!(
+        recorder.records().is_empty(),
+        "queued output 0 work holds gamma"
+    );
+    assert!(
+        fixture.events.backend.platform.outputs[1]
+            .output
+            .pending_gamma_lut
+            .borrow()
+            .is_some(),
+        "the held LUT remains pending on output 1"
+    );
+    let deadline = base + Duration::from_nanos(16_666_666);
+    let observed_deadline = fixture.events.backend.platform.outputs[1]
+        .output
+        .pending_gamma_deadline
+        .get();
+    let had_scheduled_wakeup = Backend::next_wakeup(&fixture.events.backend).is_some();
+
+    elapsed_ns.store(16_666_665, Ordering::SeqCst);
+    Backend::maybe_composite(&mut fixture.events.backend).expect("pre-deadline backend tick");
+    let no_gamma_before_deadline = recorder.records().is_empty();
+    let scheduled_no_later_than_deadline =
+        Backend::next_wakeup(&fixture.events.backend).is_some_and(|wakeup| wakeup <= deadline);
+
+    elapsed_ns.store(16_666_667, Ordering::SeqCst);
+    Backend::maybe_composite(&mut fixture.events.backend).expect("expired gamma deadline tick");
+    let records = recorder.records();
+    let gamma_records: Vec<_> = records
+        .iter()
+        .filter(|record| record.kind == AtomicCommitKind::GammaOnly)
+        .collect();
+    let gamma_count = gamma_records.len();
+    let gamma = gamma_records.first().copied().cloned();
+    let gamma_targets_idle_crtc = gamma.as_ref().is_some_and(|gamma| {
+        gamma.events.len() == 1
+            && gamma.events[0].crtc == crtc
+            && contains_crtc_property(gamma, crtc, handle(70))
+            && accepted_event_id(gamma).is_some()
+    });
+    let pending_lut_cleared_after_deadline = fixture.events.backend.platform.outputs[1]
+        .output
+        .pending_gamma_lut
+        .borrow()
+        .is_none();
+
+    if let Some(gamma) = &gamma {
+        complete_recorded_attempt(&mut fixture.events, fd, gamma, 2);
+    }
+    super::direct_unflip::complete_direct_initial(&mut fixture, &direct_record, direct_id, fd);
+    super::direct_unflip::drain_present_notifications(
+        &mut fixture,
+        &[direct.candidate.present_id],
+        &[],
+    );
+    super::direct_unflip::request_unflip(&mut fixture, &direct);
+    let unflip_offset = recorder.records().len();
+    let unflip = super::direct_unflip::grouped_unflip_record(&mut fixture, fd, unflip_offset, 2);
+    complete_recorded_attempt(&mut fixture.events, fd, &unflip, 3);
+    super::direct_unflip::drain_present_notifications(
+        &mut fixture,
+        &[],
+        &[direct.candidate.present_id],
+    );
+    fixture.finish_after_normal_drain();
+
+    assert_eq!(
+        observed_deadline,
+        Some(deadline),
+        "the idle CRTC's held LUT gets one refresh deadline"
+    );
+    assert!(
+        had_scheduled_wakeup,
+        "the Backend has a scheduled wake for pending work"
+    );
+    assert!(
+        no_gamma_before_deadline,
+        "no gamma-only commit goes out before the deadline"
+    );
+    assert!(
+        scheduled_no_later_than_deadline,
+        "the Backend remains scheduled no later than the gamma deadline"
+    );
+    assert_eq!(
+        gamma_count, 1,
+        "the deadline submits exactly one gamma-only commit"
+    );
+    assert!(
+        gamma_targets_idle_crtc,
+        "gamma-only targets output 1's CRTC with a P1 ID"
+    );
+    assert!(
+        pending_lut_cleared_after_deadline,
+        "accepted standalone commit consumes the pending LUT"
     );
 }
 

@@ -1582,13 +1582,13 @@ impl KmsBackend {
         };
         if output.crtc_gamma_lut_prop.is_some() && !output.gamma_lut_disabled.get() {
             let now = self.monotonic_now();
+            let refresh_hz = match output.picked.vrefresh {
+                0 => 60,
+                refresh_hz => refresh_hz,
+            };
+            let refresh_period =
+                std::time::Duration::from_nanos(1_000_000_000 / u64::from(refresh_hz));
             if output.pending_gamma_lut.borrow().is_none() {
-                let refresh_hz = match output.picked.vrefresh {
-                    0 => 60,
-                    refresh_hz => refresh_hz,
-                };
-                let refresh_period =
-                    std::time::Duration::from_nanos(1_000_000_000 / u64::from(refresh_hz));
                 let crtc_key = crate::kms::render::platform::CrtcKey::new(device_key, crtc);
                 let activity_now = crate::drm::atomic::monotonic_timestamp();
                 let last_page_flip = self
@@ -1617,6 +1617,10 @@ impl KmsBackend {
             {
                 output.pending_gamma_deadline.set(None);
                 self.platform.submit_pending_gamma_for_output(output_idx)?;
+            } else if output.pending_gamma_deadline.get().is_none() {
+                output
+                    .pending_gamma_deadline
+                    .set(Some(now + refresh_period));
             }
             return Ok(());
         }
