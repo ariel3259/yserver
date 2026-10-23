@@ -413,6 +413,240 @@ fn p2_idle_pointer_motion_wakes_the_scheduler_and_sends_one_cursor_only_move() {
 
 #[test]
 #[ignore = "requires the lavapipe GPU scene fixture"]
+// Mutation: remove the steady Hardware→Hardware position-only damage suppression.
+fn hw_cursor_motion_over_static_screen_submits_cursor_only() {
+    let Some(mut fixture) =
+        atomic_fixture("hw_cursor_motion_over_static_screen_submits_cursor_only")
+    else {
+        return;
+    };
+    let mut delivered = HashSet::new();
+    let hardware = establish(&mut fixture, &mut delivered, (0, 0));
+    let properties =
+        cursor_properties_for_output(&fixture.scene.events.backend, hardware.output_idx);
+    let start = records(&fixture, hardware).len();
+
+    for (x, y) in [(128, 106), (137, 116), (151, 132)] {
+        Backend::warp_pointer_root(
+            &mut fixture.scene.events.backend,
+            &mut fixture.scene.events.state,
+            x,
+            y,
+        );
+        Backend::mark_dirty(&mut fixture.scene.events.backend);
+    }
+    Backend::before_block(&mut fixture.scene.events.backend);
+    Backend::maybe_composite(&mut fixture.scene.events.backend)
+        .expect("submit static-screen hardware cursor motion through Backend");
+
+    let submitted: Vec<_> = records(&fixture, hardware)
+        .into_iter()
+        .skip(start)
+        .collect();
+    super::support::drain_unretired_output_events(
+        &mut fixture,
+        &mut delivered,
+        hardware.output_idx,
+    );
+    finish(fixture, &mut delivered, hardware);
+
+    assert_eq!(
+        submitted.len(),
+        1,
+        "static-screen motion submits one commit and no scene frame"
+    );
+    assert_eq!(submitted[0].kind, AtomicCommitKind::CursorOnly);
+    assert_position_only(&submitted[0], properties, (151, 132));
+}
+
+#[test]
+#[ignore = "requires the lavapipe GPU scene fixture"]
+// Mutation: discard window damage together with steady hardware cursor damage.
+fn hw_cursor_motion_with_window_damage_still_composes() {
+    let Some(mut fixture) = atomic_fixture("hw_cursor_motion_with_window_damage_still_composes")
+    else {
+        return;
+    };
+    let mut delivered = HashSet::new();
+    let hardware = establish(&mut fixture, &mut delivered, (0, 0));
+    let start = records(&fixture, hardware).len();
+
+    Backend::warp_pointer_root(
+        &mut fixture.scene.events.backend,
+        &mut fixture.scene.events.state,
+        137,
+        116,
+    );
+    Backend::mark_dirty(&mut fixture.scene.events.backend);
+    let root = fixture.scene.events.backend.core.window_id;
+    Backend::fill_rectangle(
+        &mut fixture.scene.events.backend,
+        None,
+        root,
+        0x00ff_0000,
+        20,
+        20,
+        32,
+        24,
+    )
+    .expect("paint the root window through Backend");
+    Backend::before_block(&mut fixture.scene.events.backend);
+    Backend::maybe_composite(&mut fixture.scene.events.backend)
+        .expect("compose real window damage with hardware cursor motion");
+
+    let submitted: Vec<_> = records(&fixture, hardware)
+        .into_iter()
+        .skip(start)
+        .collect();
+    super::support::drain_unretired_output_events(
+        &mut fixture,
+        &mut delivered,
+        hardware.output_idx,
+    );
+    finish(fixture, &mut delivered, hardware);
+
+    assert!(
+        submitted.iter().any(|record| matches!(
+            record.kind,
+            AtomicCommitKind::Scene | AtomicCommitKind::SceneWithCursor
+        )),
+        "window paint damage still submits a composed scene frame"
+    );
+}
+
+#[test]
+#[ignore = "requires the lavapipe GPU scene fixture"]
+// Mutation: classify a Software cursor footprint as position-only hardware motion.
+fn sw_cursor_motion_still_repaints() {
+    let Some(mut fixture) = atomic_fixture("sw_cursor_motion_still_repaints") else {
+        return;
+    };
+    let mut delivered = HashSet::new();
+    let cursor = create_argb_cursor(
+        &mut fixture.scene.events.backend,
+        (65, 65),
+        [0xff, 0xff, 0xff, 0xff],
+        (0, 0),
+    );
+    define_root_cursor(&mut fixture.scene.events.backend, cursor);
+    Backend::warp_pointer_root(
+        &mut fixture.scene.events.backend,
+        &mut fixture.scene.events.state,
+        120,
+        100,
+    );
+    damage_root(&mut fixture.scene);
+    let device_fd = fixture.scene.kms_fd(0);
+    let start = accepted_live_records(&fixture.scene.events.recorders[&device_fd]).len();
+    Backend::maybe_composite(&mut fixture.scene.events.backend)
+        .expect("compose initial Software cursor frame");
+    let initial_records = accepted_live_records(&fixture.scene.events.recorders[&device_fd]);
+    let initial_has_scene_frame = initial_records.iter().skip(start).any(|record| {
+        matches!(
+            record.kind,
+            AtomicCommitKind::Scene | AtomicCommitKind::SceneWithCursor
+        )
+    });
+    super::support::drain_unretired_output_events(&mut fixture, &mut delivered, 0);
+    let established_sw_mode = matches!(
+        fixture.scene.events.backend.scene.cursor_mode(),
+        crate::kms::render::scene::CursorPlaneMode::Sw
+    );
+    let motion_start = accepted_live_records(&fixture.scene.events.recorders[&device_fd]).len();
+
+    Backend::warp_pointer_root(
+        &mut fixture.scene.events.backend,
+        &mut fixture.scene.events.state,
+        137,
+        116,
+    );
+    Backend::mark_dirty(&mut fixture.scene.events.backend);
+    Backend::before_block(&mut fixture.scene.events.backend);
+    Backend::maybe_composite(&mut fixture.scene.events.backend)
+        .expect("repaint Software cursor motion through Backend");
+    let motion_records = accepted_live_records(&fixture.scene.events.recorders[&device_fd]);
+    let submitted: Vec<_> = motion_records.into_iter().skip(motion_start).collect();
+    super::support::drain_unretired_output_events(&mut fixture, &mut delivered, 0);
+    super::support::finish_atomic_fixture(fixture, &mut delivered);
+
+    assert!(
+        initial_has_scene_frame,
+        "Software cursor is first presented in a scene frame"
+    );
+    assert!(
+        established_sw_mode,
+        "the oversized cursor remains in Software mode"
+    );
+    assert!(
+        submitted.iter().any(|record| matches!(
+            record.kind,
+            AtomicCommitKind::Scene | AtomicCommitKind::SceneWithCursor
+        )),
+        "Software cursor motion damages a composed scene frame"
+    );
+}
+
+#[test]
+#[ignore = "requires the lavapipe GPU scene fixture"]
+// Mutation: drop cursor and retry damage for a changed hardware image during motion.
+fn hw_cursor_image_change_still_handled() {
+    let Some(mut fixture) = atomic_fixture("hw_cursor_image_change_still_handled") else {
+        return;
+    };
+    let mut delivered = HashSet::new();
+    let hardware = establish(&mut fixture, &mut delivered, (0, 0));
+    let start = records(&fixture, hardware).len();
+
+    let replacement = create_argb_cursor(
+        &mut fixture.scene.events.backend,
+        (8, 8),
+        [0x20, 0x80, 0xff, 0xff],
+        (1, 2),
+    );
+    define_root_cursor(&mut fixture.scene.events.backend, replacement);
+    Backend::warp_pointer_root(
+        &mut fixture.scene.events.backend,
+        &mut fixture.scene.events.state,
+        137,
+        116,
+    );
+    Backend::mark_dirty(&mut fixture.scene.events.backend);
+    assert!(
+        fixture
+            .scene
+            .events
+            .backend
+            .scene
+            .for_tests_cursor_retry_version(hardware.output_idx)
+            .is_some(),
+        "the changed image queues a full hardware cursor show retry"
+    );
+    Backend::before_block(&mut fixture.scene.events.backend);
+    Backend::maybe_composite(&mut fixture.scene.events.backend)
+        .expect("compose the changed hardware cursor image");
+
+    let submitted: Vec<_> = records(&fixture, hardware)
+        .into_iter()
+        .skip(start)
+        .collect();
+    super::support::drain_unretired_output_events(
+        &mut fixture,
+        &mut delivered,
+        hardware.output_idx,
+    );
+    finish(fixture, &mut delivered, hardware);
+
+    assert!(
+        submitted.iter().any(|record| matches!(
+            record.kind,
+            AtomicCommitKind::Scene | AtomicCommitKind::SceneWithCursor
+        )),
+        "image replacement still submits through the composed cursor path"
+    );
+}
+
+#[test]
+#[ignore = "requires the lavapipe GPU scene fixture"]
 // Mutation: restore is_visible_on in cursor_crtc_membership_dirty.
 fn p2_motion_inside_one_output_does_not_set_membership_dirty() {
     let Some(mut fixture) =

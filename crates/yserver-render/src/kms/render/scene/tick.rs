@@ -3,9 +3,9 @@ use crate::kms::{
         region::Region,
         scene::{
             CarriedDamage, ComposeRenderTarget, CursorAssignment, CursorTransition, FailedSubmitBo,
-            FinishOutcome, FrameHandoff, FullReason, InFlightStage, OutputRoute, OutputSceneState,
-            OutputSink, OutputWalkReport, PendingAck, Repaint, RepaintPlan, ScalePass,
-            SceneCompositor, SceneCompositorInner, SceneError, SceneInput, TickOutcome,
+            FinishOutcome, FrameHandoff, FullReason, InFlightStage, OutputCursorMode, OutputRoute,
+            OutputSceneState, OutputSink, OutputWalkReport, PendingAck, Repaint, RepaintPlan,
+            ScalePass, SceneCompositor, SceneCompositorInner, SceneError, SceneInput, TickOutcome,
             TickSkipReason, Visibility,
             build::build_scene_with,
             compose::{
@@ -767,14 +767,21 @@ fn tick_one_output(
         });
     }
 
+    let steady_hw_position_only = matches!(prev_mode, OutputCursorMode::Hw)
+        && matches!(built.cursor_assignment, CursorAssignment::Hw { .. })
+        && last_present_cursor_version == built.cursor_record_version
+        && inner.outputs[output_idx].force_show_retry_version.is_none()
+        && cursor_transition_to_queue.is_none();
     let mut output_damage = built.projected_damage;
-    output_damage.union_with(&cursor_damage_for_frame(
-        last_present_cursor_rect,
-        last_present_cursor_version,
-        built.new_cursor_rect,
-        built.cursor_record_version,
-        cursor_transition_to_queue,
-    ));
+    if !steady_hw_position_only {
+        output_damage.union_with(&cursor_damage_for_frame(
+            last_present_cursor_rect,
+            last_present_cursor_version,
+            built.new_cursor_rect,
+            built.cursor_record_version,
+            cursor_transition_to_queue,
+        ));
+    }
     // Always-Full repaint makes stationary SW cursors safe even when
     // cursor_damage is empty and some unrelated damage triggers a
     // frame. If `Repaint::Clipped` is ever re-enabled, the current SW
