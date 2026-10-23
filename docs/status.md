@@ -39,14 +39,17 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   watchdog (measured, RTX 5060 Ti + Raphael). The helper now runs without `DISPLAY`: the same run enables HDMI-1 in
   0.83 s with no X connection from the helper (master: 30 s, watchdog, `Configure crtc failed`). Plan:
   [`plans/2026-10-23-probe-helper-no-display.md`](superpowers/plans/2026-10-23-probe-helper-no-display.md).
-- **2026-10-23 gamma through atomic `GAMMA_LUT` (branch `feat/gamma-atomic-lut`, planned):** the gamma LUT moves from
-  the legacy `SETGAMMA` ioctl (a blocking atomic commit the kernel builds itself, which also clears `DEGAMMA_LUT`/`CTM`)
-  to a `GAMMA_LUT` blob of the legacy size on the CRTC's next vsync commit, or its own nonblocking commit when nothing is
+- **2026-10-23 gamma through atomic `GAMMA_LUT` (branch `feat/gamma-atomic-lut`):** the gamma LUT moves from the
+  legacy `SETGAMMA` ioctl (a blocking atomic commit the kernel builds itself, which also clears `DEGAMMA_LUT`/`CTM`) to
+  a `GAMMA_LUT` blob of the legacy size on the CRTC's next vsync commit, or its own nonblocking commit when nothing is
   in flight. `SETGAMMA` is removed (no target driver has legacy-only gamma; nvidia-drm got both in 545); a CRTC without
-  `GAMMA_LUT` reports gamma size 0. On an active CRTC the LUT waits up to one refresh period for the next frame
-  commit (a standalone commit there cost a direct-scanout client one frame per change on AMD, as `SETGAMMA` does on
-  master). The RANDR gamma size does not change (#263 territory). Revises
-  the transport decision of `specs/2026-06-18-randr-gamma-design.md`. Plan:
+  `GAMMA_LUT` reports gamma size 0. On an active CRTC (a page-flip event received within two refresh periods; the
+  receipt time, because nvidia-drm 615's flip UST is ~0.97 s behind `CLOCK_MONOTONIC`) the LUT waits up to one
+  refresh period for the next frame commit; a LUT that cannot go out at once gets the same deadline on an idle CRTC.
+  The RANDR gamma size does not change (#263 territory). Measured, mpv 60 fps, 10 changes, master vs branch: NVIDIA
+  RTX 5060 Ti direct scanout 7 → 0 dropped frames, AMD Raphael direct 8 → 0, AMD two outputs 16/19 → 0; 0 `SETGAMMA`;
+  kernel LUT readback correct on every CRTC; colour and VT switch checked by eye on both cards. Revises the transport
+  decision of `specs/2026-06-18-randr-gamma-design.md`. Plan:
   [`plans/2026-10-23-gamma-atomic-lut.md`](superpowers/plans/2026-10-23-gamma-atomic-lut.md).
 
 - **2026-10-23 macOS Settings window (branch `feat/macos-settings`, spec
