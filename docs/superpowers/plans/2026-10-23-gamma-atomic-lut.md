@@ -126,6 +126,24 @@ the next direct frame.
 count of `gamma-only` commits during playback (target 0), kernel LUT readback unchanged; plus windowed mpv. NVIDIA the
 same when the monitor is on it.
 
+**Measured on NVIDIA (RTX 5060 Ti, nvidia-drm 615.78.08, 1080p60, mpv fullscreen in direct scanout):** master drops 7
+frames for the 10 changes, Task 2 drops 0, but all 10 changes went out as standalone `gamma-only` commits: the CRTC
+was never seen as active. The page-flip event timestamp (UST) on this driver is about 0.97 s behind
+`CLOCK_MONOTONIC` at receipt (326 flips: min 0.966 s, median 0.966 s, max 0.984 s), so the last retirement always
+looked older than two refresh periods. On AMD the UST is aligned with `CLOCK_MONOTONIC`, which is why Task 2 worked
+there.
+
+**Fix (user decision 2026-10-23).** Activity is measured from when the page-flip event was received
+(`event_at_monotonic`, already captured for every flip), not from the kernel UST. No dependency on the driver's clock
+domain, and the `BOOTTIME` comparison goes away. Present keeps the kernel UST as today.
+
+- Test: a CRTC whose last page-flip event was received within two refresh periods but whose UST is 1 s older is
+  active; the direct frame carries the LUT, 0 `gamma-only` commits. Mutation: decide from the UST again.
+- Test: a CRTC whose last event was received more than two periods ago is idle even when its UST looks recent:
+  standalone at once. Mutation: decide from the UST again.
+- Hardware: the NVIDIA run again (fullscreen, windowed, strace), target 0 `gamma-only` commits during playback; AMD
+  rerun to confirm no change there.
+
 ### Task 3: docs
 
 `docs/status.md` entry; the #47 spec gets a note pointing to this plan for the transport decision.
