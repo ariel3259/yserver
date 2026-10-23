@@ -31,12 +31,18 @@ Short plan (no spec: nothing new is built; one rule is narrowed and an unused pa
 - **Partial plane coverage** (an active CRTC without a cursor plane) keeps the existing `topology_blocked` handling. It is recomputed on every topology refresh, so the hardware cursor comes back when the topology is covered again.
 - **Deleted:** the Legacy cursor executors, the shared legacy buffer and its show/move/upload, the legacy probe, Legacy-only state and telemetry, and Legacy-only tests.
 
-**Size.** Production code +431 / −1527 and tests +1341 / −4377 for both items together. Most added production lines are re-flow of code that kept only its atomic branch.
+**Size.** Production code +650 / −1567 and tests +2782 / −4366 for the whole branch, review follow-up included. Most added production lines are re-flow of code that kept only its atomic branch.
 
 **Tests.**
 
 - Each former Legacy device class shows the software cursor and issues no legacy cursor ioctl. Mutation: route a non-qualified device back to a hardware path.
 - Two CRTCs with one cursor plane: the device is blocked while that topology is active and gets the atomic cursor back after a refresh to a covered layout. Mutation: make the coverage check part of the static decision.
+
+## 3. Review follow-up
+
+- **Live, bounded recovery for non-EINVAL direct failures.** A direct-scanout cursor hide/show that fails with an error other than EINVAL or EBUSY is retried on a 50 ms deadline exposed through `next_wakeup`, so an idle held direct frame recovers without another frame or CRTC event. It reuses the per-CRTC `CursorHideRecovery` record and the existing direct-cursor-pending set; after 3 failed attempts (the bound shared with motion recovery) the output unflips. EBUSY keeps the event-driven retry. Test: two outputs, EIO on output 0's hide while output 1's hide retires, further ticks with no frame: output 0 recovers once the error clears; a persistent error unflips after the bound.
+- **Policy tests ported to atomic fixtures:** held-direct entry with a visible cursor, entry waiting for a queued show-on-retire, handoff keeping the newest copy, VT-suspended hide retried on resume, failure classification isolated across cards with the same raw CRTC. The software fallback test now checks scanout pixels.
+- **Cleanup:** unreachable non-atomic arms in scanout and the non-commit-id submit branch removed, a stale `set_cursor2` comment fixed, a legacy-named test renamed.
 
 ## Finding 4 (layout guard) not done
 
