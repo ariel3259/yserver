@@ -31,6 +31,7 @@ pub(crate) mod cursor_commit;
 pub(crate) mod cursor_state;
 mod devices;
 pub(crate) mod flip_events;
+mod gamma;
 mod init;
 pub(in crate::kms::render) mod power;
 mod qualify;
