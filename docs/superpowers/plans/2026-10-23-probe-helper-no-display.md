@@ -49,3 +49,10 @@ the helper became a client), `WAYLAND_DISPLAY` (no measured failure), the watchd
 The copied route above, with the server started **with** `DISPLAY` set to its own display. Master: fails after 30 s
 (`watchdog expired`). Branch: `xrandr --output HDMI-1 --auto` succeeds in under 1 s, HDMI-1 lights, and the helper
 opens 0 X connections in `strace -ff`.
+
+Result (release builds, server started with `DISPLAY=:5`, two runs on the branch):
+
+| | xrandr | HDMI-1 | helper X connections | watchdog |
+|---|---|---|---|---|
+| master 7b74b7b1 | 30.06 s, `Configure crtc 4 failed` | no mode | 2 (abstract refused, path connected) | expired |
+| branch | 0.84 s, 0.83 s | 1920x1080+0+0 | 0 | — |
