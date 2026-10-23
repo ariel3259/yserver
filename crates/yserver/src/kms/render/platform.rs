@@ -149,7 +149,6 @@ pub(crate) struct ReadyScanoutRenderCompletion {
 enum CursorFailureDisposition {
     Unchanged,
     Transient,
-    Permanent,
 }
 
 /// Returned by `drain_page_flip_events` per `DRM_CRTC_SEQUENCE` event.
@@ -212,15 +211,11 @@ pub(super) struct CursorHideRecovery {
     attempts: u8,
 }
 
-/// Per-DRM-device hardware cursor state. Raw CRTC handles and legacy cursor
-/// ioctls are device-local, so none of these fields may live at platform scope.
+/// Per-DRM-device hardware cursor state. Raw CRTC handles are device-local,
+/// so none of these fields may live at platform scope.
 pub(crate) struct KmsCursorState {
     pub(crate) plane: Option<crate::kms::cursor_plane::CursorPlane>,
     pub(crate) crtc_states: HashMap<::drm::control::crtc::Handle, cursor_state::CursorCrtcState>,
-    pending_move: Option<(i32, i32, u16, u16)>,
-    /// Pointer-event timestamp paired with `pending_move` across an EBUSY
-    /// retry. Atomic positions carry this timestamp directly.
-    pending_move_timestamp: Option<Instant>,
     /// Latest discovered atomic position for each cursor-visible CRTC. The
     /// position remains available for every scene commit; the unsent copy is
     /// consumed only after an accepted commit carries it.
@@ -235,8 +230,8 @@ pub(crate) struct KmsCursorState {
     /// A cursor-only EBUSY proves another commit is pending on this CRTC.
     /// Keep the latest position unsent until that CRTC's next flip event.
     cursor_retry_waits_for_flip: HashSet<::drm::control::crtc::Handle>,
-    /// A rejected cursor request whose legacy hide failed. Pointer motion
-    /// retries this hide, with a device-wide terminal failure after 3 tries.
+    /// A rejected cursor request whose atomic detach failed. Pointer motion
+    /// retries this detach, with a device-wide terminal failure after 3 tries.
     cursor_hide_recovery: HashMap<::drm::control::crtc::Handle, CursorHideRecovery>,
     permanently_disabled: bool,
     /// CursorPlane::new was attempted for an active startup topology and
@@ -261,7 +256,7 @@ impl KmsCursorState {
             .as_ref()
             .map(crate::kms::cursor_plane::CursorPlane::state_path)
             .map(|decision| decision.path)
-            .unwrap_or(crate::kms::cursor_plane::topology::CursorStatePath::Legacy)
+            .unwrap_or(crate::kms::cursor_plane::topology::CursorStatePath::Software)
     }
 }
 
@@ -272,7 +267,7 @@ impl KmsCursorState {
 pub(crate) struct CursorMoveOutcome {
     pub(crate) ebusy_count: u32,
     pub(crate) fallback_changed: bool,
-    /// A move failed and the hide rollback also failed, so the old HW cursor
+    /// An atomic detach failed, so the old HW cursor
     /// remains authoritative and needs another retirement boundary before its
     /// latest position/full ownership can be reconciled.
     pub(crate) retry_required: bool,

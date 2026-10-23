@@ -641,41 +641,6 @@ fn scene_damage_after_cursor_retirement_submits_scene_with_latest_position() {
     retire_test_flip(&mut backend, &mut state, 2);
     assert_no_cursor_work(&backend, device_key);
 }
-
-#[test]
-// Mutation: route an atomic-capable backend through its legacy move branch.
-fn legacy_path_pointer_motion_keeps_one_legacy_move_and_no_atomic_commit() {
-    use yserver_core::server::ServerState;
-
-    let Some(mut backend) = backend_with_live_scene() else {
-        return;
-    };
-    let recorder = recording_sink(&mut backend, 0);
-    let device_key = backend.platform.devices[0].key;
-    let crtc = backend.platform.outputs[0].output.crtc;
-    let mut plane = crate::kms::cursor_plane::CursorPlane::for_tests_stub(
-        Rc::clone(&backend.platform.devices[0].device),
-        64,
-        64,
-    );
-    plane.for_tests_set_visible(crtc, true);
-    backend.platform.devices[0].cursor.plane = Some(plane);
-    backend.platform.devices[0].cursor.atomic_cursor = false;
-    let mut state = ServerState::new();
-
-    warp(&mut backend, &mut state, 150, 120);
-
-    assert_eq!(recorder.records().len(), 0);
-    assert_eq!(
-        backend.platform.devices[0]
-            .atomic_commit_sink
-            .for_tests_motion_to_accept_sample_count(),
-        1,
-        "one visible legacy cursor move was attempted",
-    );
-    assert_no_cursor_work(&backend, device_key);
-}
-
 #[test]
 // Mutation: do not set `cursor_retry_waits_for_flip` after a cursor-only EBUSY.
 fn cursor_only_ebusy_waits_for_the_next_flip_before_retrying() {
@@ -1295,55 +1260,4 @@ fn direct_scanout_probe_tests_the_request_it_commits() {
     assert_eq!(records[0].kind, records[1].kind);
     assert_eq!(records[0].properties, records[1].properties);
     assert_cursor_properties(&records[0], position);
-}
-
-#[test]
-// Mutation: return Ok from a hide on a permanently disabled device without
-// issuing it. The scene would then draw the SW cursor beside a stuck HW one.
-fn permanently_disabled_cursor_still_hides_a_plane_left_visible() {
-    let mut backend = KmsBackend::for_tests();
-    let position = seed_cursor_position(&mut backend);
-    let hide = Rc::new(super::RecordingCursorHideExecutor::default());
-    hide.script([
-        super::TestCursorHideResult::Error(libc::EIO),
-        super::TestCursorHideResult::Error(libc::EIO),
-        super::TestCursorHideResult::Error(libc::EIO),
-        super::TestCursorHideResult::Error(libc::EIO),
-        super::TestCursorHideResult::Error(libc::EIO),
-        super::TestCursorHideResult::Ok,
-    ]);
-    super::install_recording_cursor_hide_executor(&mut backend, 0, hide.clone());
-    backend
-        .platform
-        .reject_atomic_cursor_commit(&[position], "Invalid argument");
-    for x in [101, 102, 103] {
-        backend
-            .platform
-            .cursor_plane_move(x, 100, 0, 0)
-            .expect("motion-led hide retry");
-    }
-    assert!(
-        backend
-            .platform
-            .for_tests_cursor_permanently_disabled(position.device_key)
-    );
-    assert_eq!(hide.calls(), vec![position.crtc; 4]);
-    assert!(backend.platform.cursor_plane_visible_for_output(0));
-
-    assert!(backend.platform.cursor_plane_hide_on_crtc(0).is_err());
-    assert_eq!(hide.calls(), vec![position.crtc; 5]);
-    assert!(backend.platform.cursor_plane_visible_for_output(0));
-
-    backend
-        .platform
-        .cursor_plane_hide_all()
-        .expect("global hide");
-    assert_eq!(hide.calls(), vec![position.crtc; 6]);
-    assert!(!backend.platform.cursor_plane_visible_for_output(0));
-
-    backend
-        .platform
-        .cursor_plane_hide_on_crtc(0)
-        .expect("nothing left to detach");
-    assert_eq!(hide.calls(), vec![position.crtc; 6]);
 }

@@ -1,12 +1,11 @@
 use super::{
     super::commit_identity::{recording_scene::P1SceneRoute, support::accepted_event_id},
     support::{
-        AtomicPathFixture, LegacyPathFixture, PathKind, accept_cursor_detach,
-        accepted_live_records, applied_cursor_binding, compose_until_cursor_commit,
-        compose_until_cursor_commit_where, create_argb_cursor, damage_root, define_root_cursor,
-        deliver_render_completion, drain_unretired_output_events, enter_held_direct,
-        establish_hardware_cursor, has_unretired_accepted_event, record_count, record_property,
-        retire_cursor_record, retire_pending_output, sprite_bytes, sprite_users,
+        AtomicPathFixture, PathKind, accept_cursor_detach, accepted_live_records,
+        applied_cursor_binding, compose_until_cursor_commit, compose_until_cursor_commit_where,
+        create_argb_cursor, damage_root, define_root_cursor, deliver_render_completion,
+        drain_unretired_output_events, enter_held_direct, establish_hardware_cursor, record_count,
+        record_property, retire_cursor_record, retire_pending_output, sprite_bytes, sprite_users,
     },
 };
 use crate::{
@@ -306,184 +305,10 @@ fn retire_show_uses_output_local_pointer_coordinates() {
         .expect("compose output cursor detach through Backend");
     super::support::finish_atomic_fixture(fixture, &mut delivered);
 }
-
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: skip the Atomic CursorOnly submit after show; the per-step kind assertion loses CursorOnly.
-fn p2_cursor_establishment_sequence_matches_legacy_baseline() {
-    let (legacy_after_scene_retire, legacy_sequence, legacy_show_calls) = {
-        let Some(mut fixture) = LegacyPathFixture::new().expect("legacy baseline fixture") else {
-            return;
-        };
-        let cursor = create_argb_cursor(
-            &mut fixture.scene.events.backend,
-            (4, 4),
-            [0x12, 0x34, 0x56, 0xff],
-            (1, 2),
-        );
-        let cursor_id = cursor.as_raw();
-        define_root_cursor(&mut fixture.scene.events.backend, cursor);
-        Backend::warp_pointer_root(
-            &mut fixture.scene.events.backend,
-            &mut fixture.scene.events.state,
-            100,
-            90,
-        );
-        let root = fixture.scene.events.backend.core.window_id;
-        let width = fixture.scene.events.backend.platform.fb_w;
-        let height = fixture.scene.events.backend.platform.fb_h;
-        Backend::clear_area(
-            &mut fixture.scene.events.backend,
-            None,
-            root,
-            0,
-            None,
-            0,
-            0,
-            width,
-            height,
-            (0, 0),
-        )
-        .expect("damage Legacy baseline scene through Backend");
-        let device_fd = fixture.scene.kms_fd(0);
-        let crtc = fixture.scene.events.backend.platform.outputs[0].output.crtc;
-        let device_key = fixture.scene.events.backend.platform.outputs[0]
-            .key
-            .device_key;
-        let mut delivered = HashSet::new();
-        Backend::maybe_composite(&mut fixture.scene.events.backend)
-            .expect("compose Legacy baseline cursor scene");
-        retire_pending_output(&mut fixture.scene.events, &mut delivered, 0, 1);
-        let legacy_after_scene_retire: Vec<_> =
-            accepted_live_records(&fixture.scene.events.recorders[&device_fd])
-                .into_iter()
-                .filter(|record| record.events.iter().any(|event| event.crtc == crtc))
-                .map(|record| record.kind)
-                .collect();
-        assert_eq!(legacy_after_scene_retire, [AtomicCommitKind::Scene]);
-        for frame in 2..=4 {
-            Backend::maybe_composite(&mut fixture.scene.events.backend)
-                .expect("compose any Legacy-path position update");
-            if has_unretired_accepted_event(&fixture.scene.events, &delivered, 0) {
-                retire_pending_output(&mut fixture.scene.events, &mut delivered, 0, frame);
-            }
-            if fixture
-                .scene
-                .events
-                .backend
-                .platform
-                .for_tests_atomic_cursor_pending_position(device_key, crtc)
-                .is_none()
-                && !has_unretired_accepted_event(&fixture.scene.events, &delivered, 0)
-            {
-                break;
-            }
-        }
-        assert_eq!(
-            fixture
-                .scene
-                .events
-                .backend
-                .platform
-                .for_tests_atomic_cursor_pending_position(device_key, crtc),
-            None,
-            "Legacy baseline must settle its position-only cursor update"
-        );
-        let legacy_sequence: Vec<_> =
-            accepted_live_records(&fixture.scene.events.recorders[&device_fd])
-                .into_iter()
-                .filter(|record| record.events.iter().any(|event| event.crtc == crtc))
-                .map(|record| record.kind)
-                .collect();
-        assert_eq!(
-            legacy_sequence,
-            [AtomicCommitKind::Scene, AtomicCommitKind::CursorOnly]
-        );
-        let legacy_show_calls = fixture.legacy.show_calls.get();
-        assert_eq!(legacy_show_calls, 1);
-
-        Backend::define_cursor(&mut fixture.scene.events.backend, None, root, 0x7f10)
-            .expect("restore sticky default cursor in Legacy baseline");
-        Backend::free_cursor(&mut fixture.scene.events.backend, None, cursor_id)
-            .expect("free Legacy baseline cursor");
-        super::support::finish_fixture(&mut fixture.scene.events, &mut delivered);
-        for device in &fixture.scene.events.backend.platform.devices {
-            assert_eq!(
-                device
-                    .atomic_commit_sink
-                    .for_tests_pending_page_flip_entry_count(),
-                0
-            );
-        }
-        let ledger = Rc::clone(&fixture.ledger);
-        fixture.scene.finish_after_normal_drain();
-        assert_eq!(ledger.end_state(), (0, 0, 0));
-        (
-            legacy_after_scene_retire,
-            legacy_sequence,
-            legacy_show_calls,
-        )
-    };
-    assert_eq!(
-        legacy_after_scene_retire,
-        [AtomicCommitKind::Scene],
-        "Legacy show does not add a cursor commit during the scene retirement step"
-    );
-    assert_eq!(
-        legacy_sequence,
-        [AtomicCommitKind::Scene, AtomicCommitKind::CursorOnly]
-    );
-    assert_eq!(legacy_show_calls, 1);
-
-    let Some(mut fixture) =
-        AtomicPathFixture::new(PathKind::Physical).expect("Atomic sequence fixture")
-    else {
-        return;
-    };
-    let cursor = create_argb_cursor(
-        &mut fixture.scene.events.backend,
-        (4, 4),
-        [0x12, 0x34, 0x56, 0xff],
-        (1, 2),
-    );
-    let mut delivered = HashSet::new();
-    let hardware = establish_hardware_cursor(&mut fixture, &mut delivered, cursor, (100, 90));
-    let atomic_sequence: Vec<_> =
-        accepted_live_records(&fixture.scene.events.recorders[&hardware.device_fd])
-            .into_iter()
-            .filter(|record| {
-                record
-                    .events
-                    .iter()
-                    .any(|event| event.crtc == hardware.crtc)
-            })
-            .map(|record| record.kind)
-            .collect();
-    assert_eq!(
-        atomic_sequence,
-        [AtomicCommitKind::Scene, AtomicCommitKind::CursorOnly],
-        "Atomic helper sequence must add one ID-tagged cursor-only commit after the Legacy baseline"
-    );
-    assert_eq!(
-        &atomic_sequence[..legacy_sequence.len()],
-        legacy_sequence.as_slice(),
-        "Atomic scene sequence must retain the Legacy scene event"
-    );
-    let detach = accept_cursor_detach(&mut fixture, &mut delivered, hardware.output_idx);
-    retire_cursor_record(
-        &mut fixture,
-        &mut delivered,
-        hardware.output_idx,
-        &detach,
-        3,
-    );
-    super::support::finish_atomic_fixture(fixture, &mut delivered);
-}
-
-#[test]
-#[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: reconstruct the upload error from its kind and message; the unsupported-driver latch assertion fails.
-fn p2_atomic_cursor_upload_preserves_unsupported_driver_errno() {
+// Mutation: classify ENODEV from sprite allocation as transient fallback; the unchanged Atomic path assertions must fail.
+fn p2_atomic_cursor_upload_enodev_does_not_demote_the_atomic_path() {
     let Some(mut fixture) =
         AtomicPathFixture::new(PathKind::Physical).expect("Atomic upload fixture")
     else {
@@ -513,14 +338,33 @@ fn p2_atomic_cursor_upload_preserves_unsupported_driver_errno() {
     let device_key = fixture.scene.events.backend.platform.outputs[0]
         .key
         .device_key;
+    assert_eq!(
+        fixture.scene.events.backend.platform.devices[0]
+            .cursor
+            .state_path(),
+        crate::kms::cursor_plane::topology::CursorStatePath::Atomic,
+        "ENODEV from sprite allocation does not demote the static Atomic path"
+    );
     assert!(
+        !fixture
+            .scene
+            .events
+            .backend
+            .platform
+            .for_tests_cursor_permanently_disabled(device_key)
+    );
+    assert_eq!(
         fixture
             .scene
             .events
             .backend
             .platform
-            .for_tests_cursor_permanently_disabled(device_key),
-        "ENODEV from sprite allocation must permanently disable the cursor path"
+            .for_tests_cursor_fallback_remaining(
+                device_key,
+                fixture.scene.events.backend.platform.outputs[0].output.crtc
+            ),
+        None,
+        "only EINVAL attributes the failure to the cursor"
     );
     assert_eq!(
         fixture.ledger.failures_taken(),
@@ -603,7 +447,6 @@ fn p2_rejected_hide_preserves_errno_and_advances_fallback_once() {
                 "a generic hide error keeps the applied lease",
             );
         }
-        assert_eq!(fixture.legacy.hide_calls.get(), 0);
         if applied_cursor_binding(state, hardware.output_idx).is_some() {
             let cleanup_start = record_count(&fixture, hardware.device_fd);
             fixture
@@ -737,9 +580,6 @@ fn p2_first_hardware_cursor_attaches_with_full_state_and_retires_by_id() {
         assert_eq!(record_property(&attach, hotspot_y), None);
     }
     assert_eq!(attach.properties.len(), 10);
-    assert_eq!(fixture.legacy.show_calls.get(), 0);
-    assert_eq!(fixture.legacy.move_calls.get(), 0);
-    assert_eq!(fixture.legacy.hide_calls.get(), 0);
     assert!(
         fixture
             .scene
@@ -1732,8 +1572,8 @@ fn p2_current_cursor_bind_clears_a_superseded_deferred_show_retry_scenario(
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: call a Legacy hide or keep the attach reservation after its cursor-only submit is rejected.
-fn p2_rejected_attach_rolls_back_without_touching_legacy() {
+// Mutation: retain an attach reservation after its cursor-only submit is rejected.
+fn p2_rejected_attach_rolls_back_without_retaining_reservation() {
     let Some(mut fixture) =
         AtomicPathFixture::new(PathKind::Physical).expect("atomic cursor fixture construction")
     else {
@@ -1799,9 +1639,6 @@ fn p2_rejected_attach_rolls_back_without_touching_legacy() {
     assert!(records.iter().skip(start).all(|record| {
         record.flags != ::drm::control::AtomicCommitFlags::empty() || !record.events.is_empty()
     }));
-    assert_eq!(fixture.legacy.show_calls.get(), 0);
-    assert_eq!(fixture.legacy.move_calls.get(), 0);
-    assert_eq!(fixture.legacy.hide_calls.get(), 0);
     assert_eq!(
         fixture
             .scene
@@ -1820,7 +1657,7 @@ fn p2_rejected_attach_rolls_back_without_touching_legacy() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: roll back a rejected replacement through Legacy hide or release the applied lease before blocking detach succeeds.
+// Mutation: release the applied lease before blocking detach succeeds after replacement rejection.
 fn p2_rejected_replace_detaches_the_applied_plane_and_releases_after_it() {
     let run = |blocking_error: Option<i32>| {
         let Some(mut fixture) =
@@ -1882,9 +1719,6 @@ fn p2_rejected_replace_detaches_the_applied_plane_and_releases_after_it() {
             .key
             .device_key;
         let crtc = fixture.scene.events.backend.platform.outputs[0].output.crtc;
-        assert_eq!(fixture.legacy.hide_calls.get(), 0);
-        assert_eq!(fixture.legacy.show_calls.get(), 0);
-        assert_eq!(fixture.legacy.move_calls.get(), 0);
         if blocking_error.is_some() {
             let blocking_detach = blocking_detach.expect("failed blocking Atomic rollback record");
             assert_ne!(blocking_detach.result, ScriptedResult::Ok);

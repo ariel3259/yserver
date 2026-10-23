@@ -580,27 +580,7 @@ pub(in crate::kms::render::backend) fn do_dump_scanout(backend: &mut KmsBackend)
         wrote_any = true;
     }
 
-    // Diagnostic: also dump the HW cursor plane's dumb buffer (kernel-side
-    // view, before the display engine samples it). Compared against the
-    // on-screen cursor it isolates load_image stride bugs from display-
-    // engine stride misinterpretation.
-    for device in &backend.platform.devices {
-        if let Some(plane) = device.cursor.plane.as_ref() {
-            let path = format!(
-                "./yserver-cursor-{run}-{}-{}.ppm",
-                device.key.major, device.key.minor
-            );
-            if let Err(e) = plane.dump_to_ppm(&path) {
-                log::warn!(
-                    "render do_dump_scanout: cursor dump for device {} failed: {e}",
-                    device.key
-                );
-            }
-        }
-    }
-    // Also dump the source CursorRecord bytes (BEFORE load_image), so a
-    // diff between this and the dumb-buffer dump localises the bug to
-    // either upstream (engine.get_image / X11 wire) or load_image itself.
+    // Dump the source CursorRecord bytes to inspect the X11-to-renderer path.
     if let Some(xid) = backend.effective_cursor_xid
         && let Some(rec) = backend.cursor_records.get(&xid)
     {

@@ -109,14 +109,14 @@ impl DiscoveredCursorPlane {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CursorStatePath {
     Atomic,
-    Legacy,
+    Software,
 }
 
 impl std::fmt::Display for CursorStatePath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Atomic => f.write_str("atomic"),
-            Self::Legacy => f.write_str("legacy"),
+            Self::Software => f.write_str("software"),
         }
     }
 }
@@ -156,16 +156,21 @@ pub(super) fn decide_cursor_state_path(
     assignment: &HashMap<crtc::Handle, plane::Handle>,
     planes: &[DiscoveredCursorPlane],
     caps: Option<&CursorDeviceCaps>,
+    active_crtcs: &[crtc::Handle],
 ) -> CursorPathDecision {
-    let legacy = |reason| CursorPathDecision {
-        path: CursorStatePath::Legacy,
+    let software = |reason| CursorPathDecision {
+        path: CursorStatePath::Software,
         reason,
     };
-    if assignment.is_empty() {
-        return legacy(CursorPathReason::NoCursorPlane);
+    if assignment.is_empty()
+        || active_crtcs
+            .iter()
+            .any(|crtc| !assignment.contains_key(crtc))
+    {
+        return software(CursorPathReason::NoCursorPlane);
     }
     let Some(caps) = caps else {
-        return legacy(CursorPathReason::NoDeviceCaps);
+        return software(CursorPathReason::NoDeviceCaps);
     };
 
     for discovered in planes {
@@ -177,7 +182,7 @@ pub(super) fn decide_cursor_state_path(
         }
         for name in REQUIRED_PROPERTIES {
             if !discovered.properties.contains_key(name) {
-                return legacy(CursorPathReason::MissingProperty(name));
+                return software(CursorPathReason::MissingProperty(name));
             }
         }
     }
@@ -194,7 +199,7 @@ pub(super) fn decide_cursor_state_path(
                     })
             }))
     {
-        return legacy(CursorPathReason::HotspotSupportMissing);
+        return software(CursorPathReason::HotspotSupportMissing);
     }
 
     CursorPathDecision {
@@ -215,12 +220,11 @@ pub(crate) struct CursorPlaneTestSnapshot {
     pub(crate) crtcs: Vec<u32>,
     pub(crate) planes: Vec<CursorPlaneTestPlane>,
     pub(crate) cursor_caps: Option<CursorDeviceCaps>,
-    pub(crate) has_buffer: bool,
 }
 
 #[cfg(test)]
 impl CursorPlaneTestSnapshot {
-    pub(crate) fn into_discovery(self) -> (CursorPlaneDiscovery, Option<CursorDeviceCaps>, bool) {
+    pub(crate) fn into_discovery(self) -> (CursorPlaneDiscovery, Option<CursorDeviceCaps>) {
         let discovery = CursorPlaneDiscovery {
             crtcs: self
                 .crtcs
@@ -253,7 +257,7 @@ impl CursorPlaneTestSnapshot {
                 })
                 .collect(),
         };
-        (discovery, self.cursor_caps, self.has_buffer)
+        (discovery, self.cursor_caps)
     }
 }
 
@@ -310,7 +314,7 @@ mod tests {
             .map(|plane| HashMap::from([(raw(11), plane.handle)]))
             .unwrap_or_default();
         let planes: Vec<_> = plane.cloned().into_iter().collect();
-        decide_cursor_state_path(&assignment, &planes, caps)
+        decide_cursor_state_path(&assignment, &planes, caps, &[raw(11)])
     }
 
     fn caps(driver_name: Option<&str>, accepted: bool) -> CursorDeviceCaps {
@@ -333,7 +337,7 @@ mod tests {
     fn cursor_path_decision_table() {
         assert_decision(
             decide(None, None),
-            CursorStatePath::Legacy,
+            CursorStatePath::Software,
             CursorPathReason::NoCursorPlane,
         );
 
@@ -341,7 +345,7 @@ mod tests {
         let complete = discovered(21, &complete_names);
         assert_decision(
             decide(Some(&complete), None),
-            CursorStatePath::Legacy,
+            CursorStatePath::Software,
             CursorPathReason::NoDeviceCaps,
         );
 
@@ -356,7 +360,7 @@ mod tests {
                     Some(&discovered(21, &names)),
                     Some(&caps(Some("amdgpu"), false)),
                 ),
-                CursorStatePath::Legacy,
+                CursorStatePath::Software,
                 CursorPathReason::MissingProperty(name),
             );
         }
@@ -375,7 +379,7 @@ mod tests {
             );
             assert_decision(
                 decide(Some(&complete), Some(&caps(Some(driver), false))),
-                CursorStatePath::Legacy,
+                CursorStatePath::Software,
                 CursorPathReason::HotspotSupportMissing,
             );
         }
@@ -387,12 +391,12 @@ mod tests {
                 Some(&hotspot_y_missing),
                 Some(&caps(Some("virtio_gpu"), true)),
             ),
-            CursorStatePath::Legacy,
+            CursorStatePath::Software,
             CursorPathReason::HotspotSupportMissing,
         );
         assert_decision(
             decide(Some(&complete), Some(&caps(None, false))),
-            CursorStatePath::Legacy,
+            CursorStatePath::Software,
             CursorPathReason::HotspotSupportMissing,
         );
 
@@ -416,7 +420,7 @@ mod tests {
             );
         }
         assert_eq!(CursorStatePath::Atomic.to_string(), "atomic");
-        assert_eq!(CursorStatePath::Legacy.to_string(), "legacy");
+        assert_eq!(CursorStatePath::Software.to_string(), "software");
         assert_eq!(
             CursorPathReason::NoCursorPlane.to_string(),
             "no-cursor-plane"

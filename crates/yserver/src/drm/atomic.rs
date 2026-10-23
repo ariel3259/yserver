@@ -799,15 +799,6 @@ impl AtomicCommitSink {
         cursor_rejected
     }
 
-    /// Record the legacy path's motion-to-return latency. Both telemetry
-    /// latency measures intentionally use this same return time.
-    pub(crate) fn record_legacy_move(&self, motion_timestamp: Instant, returned_at: Instant) {
-        self.metrics
-            .borrow_mut()
-            .record_legacy_move(motion_timestamp, returned_at);
-        self.emit_telemetry_if_due();
-    }
-
     /// Complete motion-to-visible timing when the corresponding accepted
     /// commit's page-flip event retires.
     pub(crate) fn note_cursor_commit_retired(&self, crtc: crtc::Handle, retired_at: Instant) {
@@ -860,11 +851,6 @@ impl AtomicCommitSink {
     /// Other failures leave the cursor state untouched.
     pub(crate) fn take_last_cursor_rejection(&self) -> bool {
         self.last_rejection_was_cursor.replace(false)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_tests_motion_to_accept_sample_count(&self) -> usize {
-        self.metrics.borrow().motion_to_accept_us.len()
     }
 
     #[cfg(test)]
@@ -1392,12 +1378,6 @@ impl CommitWindow {
     fn reset_tearing_window(&mut self, now: Instant) {
         self.tearing_started = now;
         self.reset_tearing_counters();
-    }
-
-    fn record_legacy_move(&mut self, motion_timestamp: Instant, returned_at: Instant) {
-        let latency = elapsed_us(motion_timestamp, returned_at);
-        self.motion_to_accept_us.push(latency);
-        self.motion_to_visible_us.push(latency);
     }
 
     fn record_cursor_retirement(&mut self, crtc: crtc::Handle, retired_at: Instant) {

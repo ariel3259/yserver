@@ -4,7 +4,6 @@ use crate::kms::render::{
         ScanoutM0Target, ScanoutM1OutputGeometry, ScanoutM1ProbeEntry, WindowsMap,
         kms::randr::effective_refresh_matches,
     },
-    platform::CrtcKey,
     scene::CursorUploadOutcome,
     store::DrawableId,
     target::Src,
@@ -2731,28 +2730,6 @@ impl KmsBackend {
                 );
             if direct_retired || scene_retired {
                 self.telemetry.record_frame_present();
-            }
-            // A CRTC waiting for a per-CRTC modeset takes no new cursor-only
-            // commit; the pending move is applied after the modeset.
-            if self.pstate.crtc_config_gated_crtc.is_some_and(|gated| {
-                self.platform
-                    .outputs
-                    .get(output_idx)
-                    .is_some_and(|output| CrtcKey::for_output(output) == gated)
-            }) {
-                continue;
-            }
-            // Retry only the cursor state owned by the card whose output just
-            // retired. A page flip on card A must not consume card B's EBUSY
-            // slot or EINVAL backoff.
-            match self
-                .platform
-                .cursor_plane_drain_pending_move_for_output(output_idx)
-            {
-                Ok(outcome) => {
-                    self.handle_cursor_move_outcome(outcome);
-                }
-                Err(e) => log::debug!("render cursor drain on page-flip retire: {e}"),
             }
         }
         // Idle vblank arming: clear the arm + advance the Present clock for

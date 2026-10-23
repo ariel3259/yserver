@@ -10,6 +10,7 @@ fail=0
 #    Exceptions: "path max-lines" lines in tools/layout-size-exceptions.txt.
 exceptions=tools/layout-size-exceptions.txt
 for f in $(git ls-files 'crates/*.rs'); do
+    [ -f "$f" ] || continue
     lines=$(wc -l < "$f")
     case "$f" in
         */tests/* | */tests.rs | *_tests.rs) limit=6000 ;;

@@ -4,7 +4,6 @@ use crate::{
     },
     kms::{
         cursor_plane::{
-            CursorHideExecutor, CursorPlaneBuffer, CursorShowExecutor,
             ops::{
                 CursorBufferIo,
                 recording::{CursorBufferLedger, RecordingCursorBufferIo},
@@ -19,9 +18,7 @@ use crate::{
     },
 };
 use std::{
-    cell::Cell,
     collections::HashSet,
-    io,
     os::fd::{AsFd as _, AsRawFd as _, RawFd},
     rc::Rc,
     time::Duration,
@@ -121,60 +118,9 @@ pub(crate) enum PathKind {
     Paravirtualized,
 }
 
-#[derive(Default)]
-pub(crate) struct RecordingLegacyCursor {
-    pub(crate) show_calls: Cell<usize>,
-    pub(crate) move_calls: Cell<usize>,
-    pub(crate) hide_calls: Cell<usize>,
-}
-
-impl CursorShowExecutor for RecordingLegacyCursor {
-    fn show(
-        &self,
-        _device: &crate::drm::Device,
-        _buffer: &CursorPlaneBuffer,
-        _crtc: ::drm::control::crtc::Handle,
-        _hotspot: (i32, i32),
-        _img_x: i32,
-        _img_y: i32,
-    ) -> io::Result<()> {
-        self.show_calls.set(self.show_calls.get() + 1);
-        Ok(())
-    }
-
-    fn move_to(
-        &self,
-        _device: &crate::drm::Device,
-        _crtc: ::drm::control::crtc::Handle,
-        _img_x: i32,
-        _img_y: i32,
-    ) -> io::Result<()> {
-        self.move_calls.set(self.move_calls.get() + 1);
-        Ok(())
-    }
-}
-
-impl CursorHideExecutor for RecordingLegacyCursor {
-    fn hide(
-        &self,
-        _device: &crate::drm::Device,
-        _crtc: ::drm::control::crtc::Handle,
-    ) -> io::Result<()> {
-        self.hide_calls.set(self.hide_calls.get() + 1);
-        Ok(())
-    }
-}
-
 pub(crate) struct AtomicPathFixture {
     pub(crate) scene: RecordingSceneFixture,
     pub(crate) ledger: Rc<CursorBufferLedger>,
-    pub(crate) legacy: Rc<RecordingLegacyCursor>,
-}
-
-pub(crate) struct LegacyPathFixture {
-    pub(crate) scene: RecordingSceneFixture,
-    pub(crate) ledger: Rc<CursorBufferLedger>,
-    pub(crate) legacy: Rc<RecordingLegacyCursor>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -214,7 +160,6 @@ impl AtomicPathFixture {
         }
         let (io, ledger) = RecordingCursorBufferIo::new(256);
         let buffer_io: Rc<dyn CursorBufferIo> = Rc::new(io);
-        let legacy = Rc::new(RecordingLegacyCursor::default());
         let property_names = [
             "FB_ID", "CRTC_ID", "CRTC_X", "CRTC_Y", "CRTC_W", "CRTC_H", "SRC_X", "SRC_Y", "SRC_W",
             "SRC_H",
@@ -256,7 +201,6 @@ impl AtomicPathFixture {
                     hotspot_cap_accepted,
                     Some(driver.to_owned()),
                 )),
-                has_buffer: true,
             };
             scene
                 .events
@@ -271,92 +215,9 @@ impl AtomicPathFixture {
                 );
             let device = &mut scene.events.backend.platform.devices[device_idx];
             assert_eq!(device.cursor.state_path(), CursorStatePath::Atomic);
-            let plane = device
-                .cursor
-                .plane
-                .as_mut()
-                .expect("installed cursor plane");
-            plane.for_tests_set_show_executor(legacy.clone());
-            plane.for_tests_set_hide_executor(legacy.clone());
+            assert!(device.cursor.plane.is_some());
         }
-        Ok(Some(Self {
-            scene,
-            ledger,
-            legacy,
-        }))
-    }
-}
-
-impl LegacyPathFixture {
-    pub(crate) fn new() -> Result<Option<Self>, String> {
-        let Some(mut scene) = RecordingSceneFixture::new(1)? else {
-            return Ok(None);
-        };
-        let (io, ledger) = RecordingCursorBufferIo::new(256);
-        let buffer_io: Rc<dyn CursorBufferIo> = Rc::new(io);
-        let legacy = Rc::new(RecordingLegacyCursor::default());
-        let property_names: Vec<String> = [
-            "FB_ID", "CRTC_ID", "CRTC_X", "CRTC_Y", "CRTC_W", "CRTC_H", "SRC_X", "SRC_Y", "SRC_W",
-            "SRC_H",
-        ]
-        .into_iter()
-        .filter(|name| *name != "SRC_H")
-        .map(str::to_owned)
-        .collect();
-        for device_idx in 0..scene.events.backend.platform.devices.len() {
-            let key = scene.events.backend.platform.devices[device_idx].key;
-            let crtcs: Vec<_> = scene
-                .events
-                .backend
-                .platform
-                .outputs
-                .iter()
-                .filter(|output| output.key.device_key == key)
-                .map(|output| output.output.crtc)
-                .collect();
-            let snapshot = CursorPlaneTestSnapshot {
-                crtcs: crtcs.iter().map(|crtc| u32::from(*crtc)).collect(),
-                planes: crtcs
-                    .iter()
-                    .enumerate()
-                    .map(|(index, crtc)| CursorPlaneTestPlane {
-                        handle: u32::try_from(index + 21).expect("cursor plane handle fits u32"),
-                        possible_crtcs: vec![u32::from(*crtc)],
-                        property_names: property_names.clone(),
-                    })
-                    .collect(),
-                cursor_caps: Some(crate::drm::CursorDeviceCaps::new(
-                    false,
-                    Some("amdgpu".to_owned()),
-                )),
-                has_buffer: true,
-            };
-            scene
-                .events
-                .backend
-                .platform
-                .for_tests_install_cursor_plane_from_snapshot(
-                    device_idx,
-                    snapshot,
-                    Rc::clone(&buffer_io),
-                    64,
-                    64,
-                );
-            let device = &mut scene.events.backend.platform.devices[device_idx];
-            assert_eq!(device.cursor.state_path(), CursorStatePath::Legacy);
-            let plane = device
-                .cursor
-                .plane
-                .as_mut()
-                .expect("installed cursor plane");
-            plane.for_tests_set_show_executor(legacy.clone());
-            plane.for_tests_set_hide_executor(legacy.clone());
-        }
-        Ok(Some(Self {
-            scene,
-            ledger,
-            legacy,
-        }))
+        Ok(Some(Self { scene, ledger }))
     }
 }
 
@@ -1507,19 +1368,27 @@ mod tests {
                 .contains(::drm::control::AtomicCommitFlags::TEST_ONLY)
         }));
         let accepted = super::accepted_live_records(&recorder);
-        assert_eq!(accepted.len(), 1);
-        assert_eq!(accepted[0].kind, AtomicCommitKind::CursorOnly);
-        assert_eq!(accepted[0].result, ScriptedResult::Ok);
+        assert_eq!(
+            accepted.len(),
+            2,
+            "the rejected move is followed by its detach and the other card's position commit"
+        );
         let crtc_x = raw(63);
-        let x_value = accepted[0]
+        let position = accepted
+            .iter()
+            .find(|record| super::record_property(record, crtc_x).is_some())
+            .expect("accepted record carries the other card's CRTC_X");
+        assert_eq!(position.kind, AtomicCommitKind::CursorOnly);
+        assert_eq!(position.result, ScriptedResult::Ok);
+        let x_value = position
             .properties
             .iter()
             .find(|update| update.property == crtc_x)
             .expect("accepted record carries CRTC_X")
             .value;
-        assert_eq!(super::record_property(&accepted[0], crtc_x), Some(x_value));
+        assert_eq!(super::record_property(position, crtc_x), Some(x_value));
         assert_eq!(
-            super::record_property(&accepted[0], raw(52)),
+            super::record_property(position, raw(52)),
             None,
             "plane object handle is not a property handle",
         );

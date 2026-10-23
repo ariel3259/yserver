@@ -507,8 +507,8 @@ impl<P: Platform> XBackend<P> {
 
     /// XFIXES `HideCursor` / `ShowCursor` edge. Hiding drops the scene's
     /// cursor entry (the scene then assigns `Hidden` on every output, which
-    /// detaches a bound HW plane on the next retire) and, while a direct
-    /// root scanout owns the planes, detaches the legacy cursor plane
+    /// detaches a bound atomic plane on the next retire) and, while a direct
+    /// root scanout owns the planes, detaches the atomic cursor plane
     /// right away since no compose will run. Showing re-displays the
     /// current effective cursor through the ordinary path.
     pub(in crate::kms::render::backend) fn apply_cursor_hidden(&mut self, hidden: bool) {
@@ -721,7 +721,7 @@ impl<P: Platform> XBackend<P> {
             };
         if refreshes_visible_cursor {
             // Direct root scanout does not need a composed primary-plane
-            // retirement merely to replace cursor pixels. Update the legacy
+            // retirement merely to replace cursor pixels. Update the atomic
             // cursor planes in place; if any output rejects the operation,
             // fall through to the scene state machine and unwind M2 so its
             // ordinary per-output retry/fallback can retire safely.

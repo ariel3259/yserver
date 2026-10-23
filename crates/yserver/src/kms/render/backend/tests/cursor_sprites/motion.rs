@@ -1,9 +1,8 @@
 use super::support::{
     AtomicPathFixture, PathKind, accept_cursor_detach, accepted_live_records,
-    applied_cursor_binding, assert_no_cursor_resources, compose_until_cursor_commit_where,
-    create_argb_cursor, create_bitmap_cursor, cursor_properties_for_output, define_root_cursor,
-    enter_held_direct, establish_hardware_cursor, finish_atomic_fixture, record_count,
-    record_property, retire_cursor_record, sprite_users,
+    applied_cursor_binding, compose_until_cursor_commit_where, create_argb_cursor,
+    cursor_properties_for_output, define_root_cursor, enter_held_direct, establish_hardware_cursor,
+    finish_atomic_fixture, record_count, record_property, retire_cursor_record, sprite_users,
 };
 use crate::{
     drm::atomic::{AtomicCommitKind, tests_support::AtomicCommitRecord},
@@ -159,31 +158,18 @@ fn copied_atomic_fixture(test_name: &str) -> Option<AtomicPathFixture> {
                     false,
                     Some("amdgpu".to_owned()),
                 )),
-                has_buffer: true,
             },
             buffer_io,
             64,
             64,
         );
-    let legacy = Rc::new(super::support::RecordingLegacyCursor::default());
-    let plane = scene.events.backend.platform.devices[device_idx]
-        .cursor
-        .plane
-        .as_mut()
-        .expect("installed copied-route cursor plane");
-    plane.for_tests_set_show_executor(legacy.clone());
-    plane.for_tests_set_hide_executor(legacy.clone());
     assert_eq!(
         scene.events.backend.platform.devices[device_idx]
             .cursor
             .state_path(),
         crate::kms::cursor_plane::topology::CursorStatePath::Atomic
     );
-    Some(AtomicPathFixture {
-        scene,
-        ledger,
-        legacy,
-    })
+    Some(AtomicPathFixture { scene, ledger })
 }
 
 fn complete_copied_render(fixture: &mut AtomicPathFixture) {
@@ -366,7 +352,7 @@ fn reject_position_carrying_scene(
 
 #[test]
 #[ignore = "requires the lavapipe GPU scene fixture"]
-// Mutation: restore plane.is_visible_on in the scheduler or submit gate.
+// Mutation: stop scheduling unsent Atomic cursor positions after pointer motion.
 fn p2_idle_pointer_motion_wakes_the_scheduler_and_sends_one_cursor_only_move() {
     let Some(mut fixture) =
         atomic_fixture("p2_idle_pointer_motion_wakes_the_scheduler_and_sends_one_cursor_only_move")
@@ -413,7 +399,7 @@ fn p2_idle_pointer_motion_wakes_the_scheduler_and_sends_one_cursor_only_move() {
 
 #[test]
 #[ignore = "requires the lavapipe GPU scene fixture"]
-// Mutation: restore is_visible_on in cursor_crtc_membership_dirty.
+// Mutation: mark cursor membership dirty for motion that stays within one output.
 fn p2_motion_inside_one_output_does_not_set_membership_dirty() {
     let Some(mut fixture) =
         atomic_fixture("p2_motion_inside_one_output_does_not_set_membership_dirty")
@@ -961,7 +947,7 @@ fn p2_scene_direct_copied_and_unflip_commits_carry_only_the_applied_position() {
 
 #[test]
 #[ignore = "requires the lavapipe GPU scene fixture"]
-// Mutation: use the legacy hide or release the binding before blocking detach succeeds.
+// Mutation: release the applied binding before the blocking Atomic detach succeeds.
 fn p2_rollback_detaches_the_applied_plane_not_crtc_cursor() {
     for blocking_error in [None, Some(libc::EIO)] {
         let Some(mut fixture) =
@@ -993,7 +979,6 @@ fn p2_rollback_detaches_the_applied_plane_not_crtc_cursor() {
         );
         assert_eq!(record_property(&detach, properties.fb_id), Some(0));
         assert_eq!(record_property(&detach, properties.crtc_id), Some(0));
-        assert_eq!(fixture.legacy.hide_calls.get(), 0);
         if blocking_error.is_some() {
             assert_ne!(
                 detach.result,
@@ -1413,108 +1398,4 @@ fn p2_busy_stream_keeps_latest_intent_and_waits_for_the_event() {
         assert_eq!(records(&fixture, hardware).len(), settled);
     }
     finish(fixture, &mut delivered, hardware);
-}
-
-#[test]
-// Mutation: route a Legacy device through Atomic position handling.
-fn p2_legacy_motion_is_unchanged_on_a_legacy_path_device() {
-    use super::super::commit_identity::support::AtomicEventFixture;
-    use crate::kms::cursor_plane::topology::{
-        CursorPlaneTestPlane, CursorPlaneTestSnapshot, CursorStatePath,
-    };
-    use std::rc::Rc;
-
-    let mut backend = match crate::kms::render::backend::KmsBackend::for_tests_with_vk() {
-        Ok(backend) => backend,
-        Err(error) => {
-            println!(
-                "SKIP p2_legacy_motion_is_unchanged_on_a_legacy_path_device: no Vulkan test device ({error})"
-            );
-            return;
-        }
-    };
-    let layouts = backend.platform.scene_output_layouts();
-    backend.scene = crate::kms::render::scene::SceneCompositor::new(&backend.platform, &layouts)
-        .expect("construct hardware-free live scene");
-    let mut events = AtomicEventFixture::from_backend(backend);
-    let crtc = events.backend.platform.outputs[0].output.crtc;
-    let properties = [
-        "FB_ID", "CRTC_ID", "CRTC_Y", "CRTC_W", "CRTC_H", "SRC_X", "SRC_Y", "SRC_W", "SRC_H",
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .collect();
-    let (io, ledger) = crate::kms::cursor_plane::ops::recording::RecordingCursorBufferIo::new(1);
-    let legacy = Rc::new(super::support::RecordingLegacyCursor::default());
-    events
-        .backend
-        .platform
-        .for_tests_install_cursor_plane_from_snapshot(
-            0,
-            CursorPlaneTestSnapshot {
-                crtcs: vec![u32::from(crtc)],
-                planes: vec![CursorPlaneTestPlane {
-                    handle: 21,
-                    possible_crtcs: vec![u32::from(crtc)],
-                    property_names: properties,
-                }],
-                cursor_caps: Some(crate::drm::CursorDeviceCaps::new(
-                    false,
-                    Some("amdgpu".to_owned()),
-                )),
-                has_buffer: true,
-            },
-            Rc::new(io),
-            64,
-            64,
-        );
-    let device = &mut events.backend.platform.devices[0];
-    assert_eq!(device.cursor.state_path(), CursorStatePath::Legacy);
-    let plane = device.cursor.plane.as_mut().expect("legacy path plane");
-    plane.for_tests_set_visible(crtc, true);
-    plane.for_tests_set_show_executor(legacy.clone());
-    plane.for_tests_set_hide_executor(legacy.clone());
-
-    let cursor = create_bitmap_cursor(&mut events.backend, true);
-    define_root_cursor(&mut events.backend, cursor);
-    events.backend.scene.for_tests_set_hw_cursor_mode();
-    events.backend.scene.scene_structure_dirty = false;
-    events.backend.platform.devices[0]
-        .cursor
-        .plane
-        .as_mut()
-        .expect("legacy path plane remains installed")
-        .for_tests_set_visible(crtc, true);
-    assert_eq!(events.backend.effective_cursor_xid, Some(cursor.as_raw()));
-    assert!(!events.backend.effective_cursor_hidden());
-    assert_eq!(
-        events.backend.scene.cursor_mode(),
-        crate::kms::render::scene::CursorPlaneMode::Hw,
-    );
-    assert_ne!(
-        (events.backend.core.cursor_x, events.backend.core.cursor_y),
-        (130.0, 110.0),
-    );
-    Backend::warp_pointer_root(&mut events.backend, &mut events.state, 130, 110);
-    assert_eq!(
-        events.backend.platform.devices[0]
-            .atomic_commit_sink
-            .for_tests_motion_to_accept_sample_count(),
-        1,
-        "one Legacy-path move attempt is recorded by the existing motion telemetry",
-    );
-    assert!(events.recorders.values().all(|recorder| {
-        !accepted_live_records(recorder)
-            .iter()
-            .any(|record| record.kind == AtomicCommitKind::CursorOnly)
-    }));
-    let mut delivered = HashSet::new();
-    Backend::set_cursor_hidden(&mut events.backend, true);
-    let root = events.backend.core.window_id;
-    Backend::define_cursor(&mut events.backend, None, root, 0x7f10)
-        .expect("restore the fixture's sticky root cursor");
-    Backend::free_cursor(&mut events.backend, None, cursor.as_raw())
-        .expect("free legacy motion test cursor");
-    super::support::finish_fixture(&mut events, &mut delivered);
-    assert_no_cursor_resources(&events.backend, Some(&ledger));
 }

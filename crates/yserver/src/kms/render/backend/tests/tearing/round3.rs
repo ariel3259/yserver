@@ -12,7 +12,6 @@ fn transparent_cursor_is_hidden_for_direct_scanout_and_define_cursor_handoff() {
     };
     let recorder = recording_sink(&mut backend, 0);
     let mut state = ServerState::new();
-    let (show_executor, _) = install_cursor_plane_with_successful_show(&mut backend);
     let root = backend.core.window_id;
     assert!(
         backend.effective_cursor_hidden(),
@@ -36,7 +35,6 @@ fn transparent_cursor_is_hidden_for_direct_scanout_and_define_cursor_handoff() {
         backend.scene.cursor_mode(),
         crate::kms::render::scene::CursorPlaneMode::Hidden
     );
-    assert!(show_executor.calls().is_empty());
     assert!(!backend.platform.any_cursor_plane_visible());
 
     // The visible one-pixel cursor remains a real cursor through CreateCursor.
@@ -91,7 +89,6 @@ fn transparent_cursor_is_hidden_for_direct_scanout_and_define_cursor_handoff() {
         backend.scene.cursor_mode(),
         crate::kms::render::scene::CursorPlaneMode::Hidden
     );
-    assert!(show_executor.calls().is_empty());
     assert!(!backend.platform.any_cursor_plane_visible());
 
     // The test cursor plane above checks the non-tearing path. Remove that test
@@ -246,87 +243,4 @@ fn transparent_cursor_is_hidden_for_direct_scanout_and_define_cursor_handoff() {
             AtomicCommitKind::Scene,
         ],
     );
-}
-
-#[test]
-#[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: omit the direct cursor rebind from DefineCursor; the held Vsync frame must keep a visible sprite.
-fn define_visible_cursor_rebinds_held_vsync_direct_scanout() {
-    use yserver_core::backend::Backend;
-
-    const WINDOW: u32 = 0x78b1;
-    let Some(mut backend) = direct_backend(1) else {
-        return;
-    };
-    let recorder = recording_sink(&mut backend, 0);
-    let (show_executor, hide_executor) = install_cursor_plane_with_successful_show(&mut backend);
-    let root = backend.core.window_id;
-
-    let transparent = create_bitmap_cursor_via_backend(&mut backend, false, false);
-    Backend::define_cursor(&mut backend, None, root, transparent.as_raw())
-        .expect("select transparent root cursor");
-    assert!(backend.effective_cursor_hidden());
-    assert_eq!(
-        backend.scene.cursor_mode(),
-        crate::kms::render::scene::CursorPlaneMode::Hidden
-    );
-
-    assert!(
-        try_direct_present_with_live_storage(&mut backend, 15_300, WINDOW, 800, 600, 0).is_some()
-    );
-    assert!(backend.pstate.scanout_m2.pending.is_some());
-    assert_eq!(recorder.records().len(), 1);
-    assert_eq!(recorder.records()[0].kind, AtomicCommitKind::Scene);
-    let mut state = yserver_core::server::ServerState::new();
-    retire_direct_present(&mut backend, &mut state, 70);
-    assert!(backend.pstate.scanout_m2.active());
-    assert!(backend.pstate.scanout_m2.hold_direct);
-    assert!(!backend.platform.any_cursor_plane_visible());
-
-    let visible = create_bitmap_cursor_via_backend(&mut backend, true, true);
-    Backend::define_cursor(&mut backend, None, root, visible.as_raw())
-        .expect("select opaque root cursor while direct scanout is held");
-    assert!(!backend.effective_cursor_hidden());
-    assert_eq!(show_executor.calls().len(), 1);
-    assert_eq!(hide_executor.calls().len(), 0);
-    assert!(backend.platform.any_cursor_plane_visible());
-    assert!(backend.pstate.scanout_m2.active());
-    assert!(backend.pstate.scanout_m2.hold_direct);
-    assert!(!backend.pstate.scanout_m2.unflip_requested);
-    assert!(
-        backend
-            .pstate
-            .scanout_m2
-            .unflip_outputs_to_replace
-            .is_empty()
-    );
-    Backend::maybe_composite(&mut backend).expect("keep held direct scanout with rebound cursor");
-
-    assert!(matches!(
-        backend.pstate.tearing.state,
-        crate::kms::render::backend::TearingState::Off
-    ));
-    assert_eq!(backend.pstate.tearing.deferred_cursor_wake, None);
-    assert!(backend.platform.async_ledger.for_tests_is_empty());
-    assert_eq!(
-        backend.scene.cursor_mode(),
-        crate::kms::render::scene::CursorPlaneMode::Hw,
-        "the scene records the hardware plane rebound during direct scanout"
-    );
-    assert!(!backend.scene.has_pending_page_flips());
-    assert!(!backend.scene.cursor_transition_pending());
-    assert!(backend.platform.any_cursor_plane_visible());
-    assert!(backend.pstate.scanout_m2.active());
-    assert!(backend.pstate.scanout_m2.hold_direct);
-    assert!(!backend.pstate.scanout_m2.unflip_requested);
-    assert!(
-        backend
-            .pstate
-            .scanout_m2
-            .unflip_outputs_to_replace
-            .is_empty()
-    );
-    assert_direct_queue_drained(&backend);
-    assert_commit_sequence(&recorder, &[AtomicCommitKind::Scene]);
-    backend.platform.wait_idle_bounded();
 }

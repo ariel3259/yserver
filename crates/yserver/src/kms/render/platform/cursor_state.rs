@@ -120,7 +120,6 @@ mod tests {
                     .collect(),
             }],
             cursor_caps: Some(CursorDeviceCaps::new(false, Some("amdgpu".to_owned()))),
-            has_buffer: true,
         };
         CursorPlane::for_tests_from_snapshot(device, &[crtc], buffer_io, snapshot, 64, 32)
     }
@@ -147,36 +146,17 @@ mod tests {
     }
 
     #[test]
-    // Mutation: make both paths read the legacy visibility map or both read applied state.
-    fn hw_bound_on_reads_the_path_specific_state() {
+    // Mutation: report Software cursor state as hardware-bound; the first assertion must fail.
+    fn hw_bound_on_requires_an_applied_atomic_binding() {
         let crtc = from_u32(11).expect("nonzero CRTC handle");
 
-        let mut legacy = test_state(crtc, Some("FB_ID"));
-        assert_eq!(legacy.state_path(), CursorStatePath::Legacy);
-        legacy
-            .plane
-            .as_mut()
-            .unwrap()
-            .for_tests_set_visible(crtc, true);
-        assert!(legacy.hw_bound_on(crtc));
-        legacy
-            .plane
-            .as_mut()
-            .unwrap()
-            .for_tests_set_visible(crtc, false);
-        assert!(!legacy.hw_bound_on(crtc));
+        let software = test_state(crtc, Some("FB_ID"));
+        assert_eq!(software.state_path(), CursorStatePath::Software);
+        assert!(!software.hw_bound_on(crtc));
 
         let mut atomic = test_state(crtc, None);
         assert_eq!(atomic.state_path(), CursorStatePath::Atomic);
-        atomic
-            .plane
-            .as_mut()
-            .unwrap()
-            .for_tests_set_visible(crtc, true);
-        assert!(
-            !atomic.hw_bound_on(crtc),
-            "legacy visibility is ignored on Atomic"
-        );
+        assert!(!atomic.hw_bound_on(crtc));
         atomic.crtc_states.insert(
             crtc,
             CursorCrtcState {
@@ -184,11 +164,6 @@ mod tests {
                 ..CursorCrtcState::default()
             },
         );
-        atomic
-            .plane
-            .as_mut()
-            .unwrap()
-            .for_tests_set_visible(crtc, false);
         assert!(
             atomic.hw_bound_on(crtc),
             "applied state is authoritative on Atomic"
@@ -198,7 +173,7 @@ mod tests {
     }
 
     #[test]
-    // Mutation: retire an ID-tagged cursor commit on any CRTC event or keep a legacy None record for an ID event.
+    // Mutation: retire an ID-tagged cursor commit on any CRTC event or retain it across its matching event.
     fn retire_keeps_an_id_tagged_record_on_a_different_event_id() {
         let mut platform = PlatformBackend::for_tests();
         let crtc = platform.outputs[0].output.crtc;
