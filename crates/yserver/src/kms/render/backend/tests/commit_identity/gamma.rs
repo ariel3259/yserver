@@ -8,7 +8,7 @@ use crate::{
 };
 use std::{
     io,
-    os::fd::RawFd,
+    os::fd::{AsFd as _, AsRawFd as _, RawFd},
     rc::Rc,
     sync::{
         Arc,
@@ -61,11 +61,41 @@ fn gamma_backend_with_recorder() -> (
     (backend, recorder, crtc_xid, crtc)
 }
 
+fn gamma_event_fixture() -> (
+    AtomicEventFixture,
+    Rc<RecordingAtomicCommitExecutor>,
+    u32,
+    ::drm::control::crtc::Handle,
+    RawFd,
+) {
+    let mut events = AtomicEventFixture::from_backend(KmsBackend::for_tests());
+    let fd = events.backend.platform.devices[0]
+        .device
+        .as_fd()
+        .as_raw_fd();
+    let recorder = events.recorders[&fd].clone();
+    let (crtc_xid, crtc) = enable_gamma(&mut events.backend, &recorder, 0, 4);
+    events.backend.scene.scene_structure_dirty = false;
+    (events, recorder, crtc_xid, crtc, fd)
+}
+
+fn receive_gamma_flip_at(
+    events: &mut AtomicEventFixture,
+    fd: RawFd,
+    crtc: ::drm::control::crtc::Handle,
+    frame: u32,
+    ust: Duration,
+    received_at: Duration,
+) {
+    events.event_sources[&fd].queue_flip_with_timestamps(crtc, frame, ust, received_at);
+    Backend::on_page_flip_ready(&mut events.backend, &mut events.state, fd);
+}
+
 fn seed_recent_gamma_page_flip(backend: &mut KmsBackend, output_idx: usize) {
     let key = CrtcKey::for_output(&backend.platform.outputs[output_idx]);
-    let ust = crate::drm::atomic::monotonic_timestamp()
-        .expect("CLOCK_MONOTONIC is available in the test environment")
-        .as_micros();
+    let received_at = crate::drm::atomic::monotonic_timestamp()
+        .expect("CLOCK_MONOTONIC is available in the test environment");
+    let ust = received_at.as_micros();
     backend.platform.record_completion_clock(
         key,
         PresentClockSample {
@@ -73,6 +103,7 @@ fn seed_recent_gamma_page_flip(backend: &mut KmsBackend, output_idx: usize) {
             ust: u64::try_from(ust).expect("monotonic microseconds fit u64"),
             source: PresentClockSource::PageFlip,
         },
+        Some(received_at),
     );
 }
 
@@ -122,6 +153,27 @@ fn complete_recorded_attempt(
             id,
             frame,
             Duration::from_millis(u64::from(frame) * 10),
+        );
+    }
+    Backend::on_page_flip_ready(&mut fixture.backend, &mut fixture.state, fd);
+}
+
+fn complete_recorded_attempt_at(
+    fixture: &mut AtomicEventFixture,
+    fd: RawFd,
+    record: &AtomicCommitRecord,
+    frame: u32,
+    received_at: Duration,
+) {
+    let id = accepted_event_id(record).expect("accepted request carries a commit identity");
+    for event in &record.events {
+        fixture.queue_commit_completion_at(
+            fd,
+            event.crtc,
+            id,
+            frame,
+            Duration::from_millis(u64::from(frame) * 10),
+            received_at,
         );
     }
     Backend::on_page_flip_ready(&mut fixture.backend, &mut fixture.state, fd);
@@ -526,7 +578,11 @@ fn p1_gamma_standalone_serializes_scene_until_its_event() {
     let mut fixture = fixture.cleanup_guard();
     let (crtc_xid, crtc, fd, recorder) = enable_recording_scene_gamma(&mut fixture);
     let initial = super::atomic_events::submit_damaged_frame(&mut fixture);
-    complete_recorded_attempt(&mut fixture.events, fd, &initial[0].1, 0);
+    let stale_receipt = crate::drm::atomic::monotonic_timestamp()
+        .expect("CLOCK_MONOTONIC is available in the test environment")
+        .checked_sub(Duration::from_secs(3))
+        .expect("test CLOCK_MONOTONIC age is available");
+    complete_recorded_attempt_at(&mut fixture.events, fd, &initial[0].1, 0, stale_receipt);
     recorder.clear_records();
     Backend::set_crtc_gamma(
         &mut fixture.events.backend,
@@ -822,7 +878,11 @@ fn p1_gamma_reapplies_after_modeset_and_vt_resume() {
             record.kind == AtomicCommitKind::Scene && accepted_event_id(record).is_some()
         })
         .expect("initial scene frame is accepted");
-    complete_recorded_attempt(&mut fixture.events, fd, &initial_scene.1, 1);
+    let stale_receipt = crate::drm::atomic::monotonic_timestamp()
+        .expect("CLOCK_MONOTONIC is available in the test environment")
+        .checked_sub(Duration::from_secs(3))
+        .expect("test CLOCK_MONOTONIC age is available");
+    complete_recorded_attempt_at(&mut fixture.events, fd, &initial_scene.1, 1, stale_receipt);
     recorder.clear_records();
 
     let red = vec![0x1111; 4];
@@ -835,7 +895,11 @@ fn p1_gamma_reapplies_after_modeset_and_vt_resume() {
         .into_iter()
         .find(|record| record.kind == AtomicCommitKind::GammaOnly)
         .expect("idle gamma is applied through the standalone commit");
-    complete_recorded_attempt(&mut fixture.events, fd, &gamma, 2);
+    let stale_gamma_receipt = crate::drm::atomic::monotonic_timestamp()
+        .expect("CLOCK_MONOTONIC is available in the test environment")
+        .checked_sub(Duration::from_secs(3))
+        .expect("test CLOCK_MONOTONIC age is available");
+    complete_recorded_attempt_at(&mut fixture.events, fd, &gamma, 2, stale_gamma_receipt);
 
     let (mode, connector, output_id, output_key, x, y) = {
         let backend = &mut fixture.events.backend;
@@ -1008,14 +1072,13 @@ fn gamma_activity_survives_a_newer_idle_sequence_sample() {
     seed_recent_gamma_page_flip(&mut backend, 0);
 
     let key = CrtcKey::for_output(&backend.platform.outputs[0]);
-    let last_page_flip = backend
+    let last_page_flip_received_at = backend
         .platform
-        .present_get_last_page_flip_clock(key)
+        .present_get_last_page_flip_received_at(key)
         .expect("seeded pageflip retirement is retained");
     let sequence_time_ns = i64::try_from(
-        last_page_flip
-            .ust
-            .saturating_mul(1_000)
+        last_page_flip_received_at
+            .as_nanos()
             .saturating_add(10_000_000),
     )
     .expect("test sequence timestamp fits i64");
@@ -1024,12 +1087,7 @@ fn gamma_activity_survives_a_newer_idle_sequence_sample() {
         .primary_device()
         .expect("gamma backend has a primary DRM device")
         .key;
-    backend.on_crtc_sequence_event(
-        device_key,
-        u64::from(u32::from(crtc)),
-        sequence_time_ns,
-        last_page_flip.msc + 1,
-    );
+    backend.on_crtc_sequence_event(device_key, u64::from(u32::from(crtc)), sequence_time_ns, 2);
     assert_eq!(
         backend.platform.present_get_completion_clock(key).source,
         PresentClockSource::IdleSequence,
@@ -1168,7 +1226,7 @@ fn p1_gamma_active_scene_carries_lut_on_its_next_vsync_flip() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: omit the pending GAMMA_LUT from the next direct scanout frame.
+// Mutations: decide activity from kernel UST again; omit GAMMA_LUT from the next direct frame.
 fn p1_gamma_active_direct_frame_carries_lut_without_gamma_only_commit() {
     let Some((fixture, mut direct)) = super::direct_unflip::direct_fixture(
         2,
@@ -1196,10 +1254,54 @@ fn p1_gamma_active_direct_frame_carries_lut_without_gamma_only_commit() {
         &[direct.candidate.present_id],
         &[],
     );
-    seed_recent_gamma_page_flip(&mut fixture.events.backend, 0);
+    let received_at = crate::drm::atomic::monotonic_timestamp()
+        .expect("CLOCK_MONOTONIC is available in the test environment");
+    let ust = received_at
+        .checked_sub(Duration::from_secs(1))
+        .expect("test receipt is more than one second into CLOCK_MONOTONIC");
+    let recording_source = fixture.events.event_sources[&fd].clone();
+    let original_source = std::mem::replace(
+        &mut fixture.events.backend.platform.devices[0].page_flip_event_source,
+        recording_source,
+    );
+    receive_gamma_flip_at(&mut fixture.events, fd, crtc, 100, ust, received_at);
+    fixture.events.backend.platform.devices[0].page_flip_event_source = original_source;
+    let events = &mut fixture.events;
+    let received_at = events
+        .backend
+        .platform
+        .present_get_last_page_flip_received_at(CrtcKey::for_output(
+            &events.backend.platform.outputs[0],
+        ))
+        .expect("injected direct page-flip receipt is recorded");
+    let receipt_age = crate::drm::atomic::monotonic_timestamp()
+        .expect("CLOCK_MONOTONIC is available in the test environment")
+        .checked_sub(received_at)
+        .expect("event receipt is not in the future");
+    assert!(
+        receipt_age <= Duration::from_millis(100),
+        "event receipt falls inside the last 100ms"
+    );
+    assert_eq!(
+        events
+            .backend
+            .platform
+            .present_get_completion_clock(CrtcKey::for_output(&events.backend.platform.outputs[0],))
+            .ust,
+        u64::try_from(ust.as_micros()).expect("test UST fits u64"),
+        "Present retains the original kernel UST"
+    );
     recorder.clear_records();
 
     set_test_gamma(&mut fixture.events.backend, crtc_xid, 0x5555);
+    assert!(
+        fixture.events.backend.platform.outputs[0]
+            .output
+            .pending_gamma_deadline
+            .get()
+            .is_some(),
+        "fresh event receipt keeps the CRTC active despite its older UST"
+    );
     assert!(
         recorder.records().is_empty(),
         "active direct gamma waits for a frame"
@@ -1256,4 +1358,38 @@ fn p1_gamma_active_direct_frame_carries_lut_without_gamma_only_commit() {
         &[next_candidate.present_id],
     );
     fixture.finish_after_normal_drain();
+}
+
+#[test]
+// Mutation: decide CRTC activity from the recent kernel UST again.
+fn gamma_idle_crtc_uses_old_receipt_even_when_kernel_ust_is_recent() {
+    let (mut events, recorder, crtc_xid, crtc, fd) = gamma_event_fixture();
+    let now = crate::drm::atomic::monotonic_timestamp()
+        .expect("CLOCK_MONOTONIC is available in the test environment");
+    let received_at = now
+        .checked_sub(Duration::from_secs(3))
+        .expect("test CLOCK_MONOTONIC age is available");
+    let ust = now
+        .checked_sub(Duration::from_millis(10))
+        .expect("test CLOCK_MONOTONIC has a recent UST");
+    receive_gamma_flip_at(&mut events, fd, crtc, 100, ust, received_at);
+
+    set_test_gamma(&mut events.backend, crtc_xid, 0x4444);
+
+    let records = recorder.records();
+    assert_eq!(
+        records.len(),
+        1,
+        "idle gamma submits its standalone commit at once"
+    );
+    assert_eq!(records[0].kind, AtomicCommitKind::GammaOnly);
+    assert!(contains_crtc_property(&records[0], crtc, handle(70)));
+    assert!(
+        events.backend.platform.outputs[0]
+            .output
+            .pending_gamma_lut
+            .borrow()
+            .is_none(),
+        "accepted idle commit consumes the pending LUT"
+    );
 }

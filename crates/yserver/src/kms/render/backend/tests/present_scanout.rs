@@ -166,6 +166,7 @@ fn completion_clock_prefers_pageflip_at_equal_msc_and_never_regresses() {
             ust: 2_000,
             source: PresentClockSource::IdleSequence,
         },
+        None,
     );
     b.platform.record_completion_clock(
         crtc_key,
@@ -174,6 +175,7 @@ fn completion_clock_prefers_pageflip_at_equal_msc_and_never_regresses() {
             ust: 2_001,
             source: PresentClockSource::PageFlip,
         },
+        None,
     );
     b.platform.record_completion_clock(
         crtc_key,
@@ -182,6 +184,7 @@ fn completion_clock_prefers_pageflip_at_equal_msc_and_never_regresses() {
             ust: 1_900,
             source: PresentClockSource::IdleSequence,
         },
+        None,
     );
 
     assert_eq!(

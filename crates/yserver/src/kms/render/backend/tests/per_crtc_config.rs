@@ -449,6 +449,27 @@ fn retire_all(fixture: &mut RecordingSceneFixture, flips: &[(u32, u64)], frame: 
     }
 }
 
+fn retire_all_at(
+    fixture: &mut RecordingSceneFixture,
+    flips: &[(u32, u64)],
+    frame: u32,
+    received_at: Duration,
+) {
+    fixture.events.wait_for_submitted_gpu_work();
+    let fd = device_fd(fixture);
+    for &(crtc, id) in flips {
+        fixture.events.queue_commit_completion_at(
+            fd,
+            ::drm::control::from_u32(crtc).expect("nonzero CRTC"),
+            id,
+            frame,
+            Duration::from_millis(u64::from(frame) * 10),
+            received_at,
+        );
+    }
+    Backend::on_page_flip_ready(&mut fixture.events.backend, &mut fixture.events.state, fd);
+}
+
 /// Completions queued on the DRM fd and not yet delivered.
 fn undelivered(fixture: &RecordingSceneFixture) -> usize {
     fixture.events.event_sources[&device_fd(fixture)].queued_flip_count()
@@ -671,7 +692,11 @@ fn standalone_gamma_event_retires_before_disable_and_reenable() {
     };
     let mut fixture = fixture.cleanup_guard();
     let initial = submit_frame(&mut fixture);
-    retire_all(&mut fixture, &initial, 90);
+    let stale_receipt = crate::drm::atomic::monotonic_timestamp()
+        .expect("CLOCK_MONOTONIC is available in the test environment")
+        .checked_sub(Duration::from_secs(3))
+        .expect("test CLOCK_MONOTONIC age is available");
+    retire_all_at(&mut fixture, &initial, 90, stale_receipt);
     let output_idx = 1;
     let device_fd = device_fd(&fixture);
     let recorder = fixture.events.recorders[&device_fd].clone();
