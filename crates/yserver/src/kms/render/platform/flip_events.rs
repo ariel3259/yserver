@@ -380,6 +380,8 @@ impl PlatformBackend {
         let live: HashSet<CrtcKey> = self.outputs.iter().map(CrtcKey::for_output).collect();
         self.ust_msc.retain(|key, _| live.contains(key));
         self.completion_clocks.retain(|key, _| live.contains(key));
+        self.last_page_flip_clocks
+            .retain(|key, _| live.contains(key));
         self.software_msc.retain(|key, _| live.contains(key));
     }
 
@@ -747,6 +749,15 @@ impl PlatformBackend {
             })
     }
 
+    /// Latest pageflip retirement for one CRTC, independent of newer
+    /// completion-eligible sequence samples.
+    pub(crate) fn present_get_last_page_flip_clock(
+        &self,
+        crtc_key: CrtcKey,
+    ) -> Option<PresentClockSample> {
+        self.last_page_flip_clocks.get(&crtc_key).copied()
+    }
+
     /// Record a general vblank sample without allowing late events to move
     /// this CRTC domain's Present clock backwards.
     pub(crate) fn record_vblank_clock(&mut self, crtc_key: CrtcKey, msc: u64, ust: u64) {
@@ -766,6 +777,16 @@ impl PlatformBackend {
         crtc_key: CrtcKey,
         sample: PresentClockSample,
     ) {
+        if sample.source == PresentClockSource::PageFlip {
+            let replace_last_page_flip =
+                self.last_page_flip_clocks.get(&crtc_key).is_none_or(|old| {
+                    yserver_core::present_scheduler::msc_is_after(sample.msc, old.msc)
+                        || sample.msc == old.msc
+                });
+            if replace_last_page_flip {
+                self.last_page_flip_clocks.insert(crtc_key, sample);
+            }
+        }
         let replace = self.completion_clocks.get(&crtc_key).is_none_or(|old| {
             yserver_core::present_scheduler::msc_is_after(sample.msc, old.msc)
                 || (sample.msc == old.msc
