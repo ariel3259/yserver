@@ -491,10 +491,10 @@ pub struct PlatformBackend {
     /// completion. Pageflip retirements always qualify; standalone sequence
     /// events are inserted by `KmsBackend` only when the display is idle.
     pub(crate) completion_clocks: std::collections::HashMap<CrtcKey, PresentClockSample>,
-    /// Latest pageflip retirement per CRTC, retained when a newer sequence
-    /// event replaces its completion-eligible sample. Gamma activity needs
-    /// the retirement time, while Present completion uses `completion_clocks`.
-    pub(crate) last_page_flip_clocks: std::collections::HashMap<CrtcKey, PresentClockSample>,
+    /// Latest CLOCK_MONOTONIC receipt time of a page-flip event per CRTC.
+    /// Gamma activity uses event receipt because kernel UST may be in another
+    /// clock domain; Present completion continues to use `completion_clocks`.
+    pub(crate) last_page_flip_received_at: std::collections::HashMap<CrtcKey, std::time::Duration>,
 
     /// Per-output software MSC fallback. Some KMS drivers (notably
     /// apple_drm on Asahi) report `frame == 0` in every page-flip

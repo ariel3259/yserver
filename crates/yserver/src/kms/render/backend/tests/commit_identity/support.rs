@@ -155,6 +155,25 @@ impl AtomicEventFixture {
         }
     }
 
+    pub(crate) fn queue_commit_completion_at(
+        &self,
+        device_fd: RawFd,
+        crtc: ::drm::control::crtc::Handle,
+        commit_id: u64,
+        frame: u32,
+        ust: Duration,
+        event_at_monotonic: Duration,
+    ) {
+        assert!(
+            !self.raw_event_writers.borrow().contains_key(&device_fd),
+            "explicit event receipt timestamps require the recording event source"
+        );
+        self.event_sources
+            .get(&device_fd)
+            .expect("completion device fd belongs to this fixture")
+            .queue_flip_with_cookie_at(crtc, frame, commit_id, ust, event_at_monotonic);
+    }
+
     pub(crate) fn queue_sequence_completion(
         &self,
         device_fd: RawFd,

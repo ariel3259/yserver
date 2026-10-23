@@ -495,6 +495,7 @@ impl KmsBackend {
                     ust,
                     source: yserver_core::backend::PresentClockSource::IdleSequence,
                 },
+                None,
             );
         }
         log::debug!(
