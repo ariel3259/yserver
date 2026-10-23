@@ -177,7 +177,9 @@ impl crate::kms::render::backend::kms::session::VtResumeExecutor for LogicalVtRe
     }
 }
 
-fn install_recording_vt_io(fixture: &mut RecordingSceneFixture) {
+pub(in crate::kms::render::backend::tests) fn install_recording_vt_io(
+    fixture: &mut RecordingSceneFixture,
+) {
     fixture
         .events
         .backend

@@ -1914,7 +1914,7 @@ fn held_direct_with_cursor(
     let binding_before_direct =
         applied_cursor_binding(&fixture.scene.events.backend, hardware.output_idx)
             .expect("A is applied before direct scanout");
-    let direct = match enter_held_direct(&mut fixture, &mut delivered, present_id) {
+    let direct = match enter_held_direct(&mut fixture, &mut delivered, present_id, None) {
         Ok(direct) => direct,
         Err(gate_values) => {
             let detach = accept_cursor_detach(&mut fixture, &mut delivered, hardware.output_idx);
@@ -2790,7 +2790,7 @@ fn held_direct_with_two_outputs(
     let mut delivered = HashSet::new();
     let hardware = establish_hardware_cursor(&mut fixture, &mut delivered, cursor, (100, 90));
     drain_unretired_output_events(&mut fixture, &mut delivered, 1);
-    let direct = enter_held_direct(&mut fixture, &mut delivered, present_id)
+    let direct = enter_held_direct(&mut fixture, &mut delivered, present_id, None)
         .expect("enter two-output direct scanout through Backend");
     for output_idx in 0..2 {
         drain_unretired_output_events(&mut fixture, &mut delivered, output_idx);
@@ -3277,8 +3277,13 @@ fn direct_cursor_retry_lands_under_continuous_successor_stream() {
             (1, 2),
         );
         let hardware = establish_hardware_cursor(&mut fixture, &mut delivered, cursor, (100, 90));
-        let direct = enter_held_direct(&mut fixture, &mut delivered, if hide { 713 } else { 712 })
-            .expect("enter one-output direct scanout through Backend");
+        let direct = enter_held_direct(
+            &mut fixture,
+            &mut delivered,
+            if hide { 713 } else { 712 },
+            None,
+        )
+        .expect("enter one-output direct scanout through Backend");
         drain_unretired_output_events(&mut fixture, &mut delivered, 0);
         let device_fd = hardware.device_fd;
         let properties =

@@ -449,13 +449,13 @@ fn entry_waits_for_queued_show_on_retire() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutations: submit the composed handoff before direct retirement, or skip the
-// tearing-entry unflip request; the hardware cursor must retire before SW draw.
+// Mutations: accept the entry Present directly while still requesting handoff,
+// submit the handoff before direct retirement, or skip the tearing-entry unflip.
 fn entry_from_held_direct_with_visible_hw_cursor_runs_handoff() {
     use super::super::cursor_sprites::support::{
-        AtomicPathFixture, PathKind, create_argb_cursor, damage_root,
+        AtomicPathFixture, PathKind, accept_cursor_detach, create_argb_cursor, damage_root,
         drain_unretired_output_events, enter_held_direct, establish_hardware_cursor,
-        finish_atomic_fixture, retire_pending_output,
+        finish_atomic_fixture, retire_cursor_record, retire_pending_output,
     };
     use crate::drm::atomic::AtomicCommitKind;
     use yserver_core::{backend::Backend, core_loop::input_inventory::InputInventory};
@@ -477,7 +477,7 @@ fn entry_from_held_direct_with_visible_hw_cursor_runs_handoff() {
     );
     let hardware = establish_hardware_cursor(&mut fixture, &mut delivered, cursor, (120, 100));
     drain_unretired_output_events(&mut fixture, &mut delivered, 0);
-    let direct = enter_held_direct(&mut fixture, &mut delivered, 70)
+    let direct = enter_held_direct(&mut fixture, &mut delivered, 70, None)
         .expect("enter held direct scanout with the applied cursor");
     assert!(
         fixture
@@ -583,17 +583,24 @@ fn entry_from_held_direct_with_visible_hw_cursor_runs_handoff() {
         if entry_present_accepted_direct {
             drain_unretired_output_events(&mut fixture, &mut delivered, 0);
         }
-        fixture
-            .scene
-            .events
-            .backend
-            .platform
-            .for_tests_accept_output_power_commits();
+        super::super::commit_identity::install_recording_vt_io(&mut fixture.scene);
         Backend::begin_vt_release(&mut fixture.scene.events.backend);
         Backend::finish_vt_release(
             &mut fixture.scene.events.backend,
             &mut fixture.scene.events.state,
             &InputInventory::default(),
+        );
+        Backend::on_vt_acquire(
+            &mut fixture.scene.events.backend,
+            &mut fixture.scene.events.state,
+        );
+        let detach = accept_cursor_detach(&mut fixture, &mut delivered, hardware.output_idx);
+        retire_cursor_record(
+            &mut fixture,
+            &mut delivered,
+            hardware.output_idx,
+            &detach,
+            74,
         );
         fixture.scene.events.wait_for_submitted_gpu_work();
         Backend::free_pixmap(
@@ -602,8 +609,12 @@ fn entry_from_held_direct_with_visible_hw_cursor_runs_handoff() {
             candidate.src_pixmap_xid,
         )
         .expect("free the entry Present source after VT cleanup");
-        fixture.scene.finish();
+        finish_atomic_fixture(fixture, &mut delivered);
         assert!(tearing_started, "entry Present starts tearing");
+        assert!(
+            !entry_present_accepted_direct,
+            "entry Present must not be accepted as direct while a cursor handoff is needed"
+        );
         assert!(
             handoff_requested,
             "visible hardware cursor requests the direct unflip"
@@ -628,8 +639,33 @@ fn entry_from_held_direct_with_visible_hw_cursor_runs_handoff() {
             ) && !record.events.is_empty()
         });
     if !one_handoff_commit_before_retire {
+        super::super::commit_identity::install_recording_vt_io(&mut fixture.scene);
+        Backend::begin_vt_release(&mut fixture.scene.events.backend);
+        Backend::finish_vt_release(
+            &mut fixture.scene.events.backend,
+            &mut fixture.scene.events.state,
+            &InputInventory::default(),
+        );
+        Backend::on_vt_acquire(
+            &mut fixture.scene.events.backend,
+            &mut fixture.scene.events.state,
+        );
+        let detach = accept_cursor_detach(&mut fixture, &mut delivered, hardware.output_idx);
+        retire_cursor_record(
+            &mut fixture,
+            &mut delivered,
+            hardware.output_idx,
+            &detach,
+            75,
+        );
         fixture.scene.events.wait_for_submitted_gpu_work();
-        fixture.scene.finish();
+        Backend::free_pixmap(
+            &mut fixture.scene.events.backend,
+            None,
+            candidate.src_pixmap_xid,
+        )
+        .expect("free the entry Present source after VT cleanup");
+        finish_atomic_fixture(fixture, &mut delivered);
         assert!(
             one_handoff_commit_before_retire,
             "the next composed frame waits for direct handoff retirement"
@@ -762,7 +798,7 @@ fn handoff_keeps_newest_copy_not_retained_direct_frame() {
     use super::super::cursor_sprites::support::{
         AtomicPathFixture, PathKind, create_argb_cursor, damage_root,
         drain_unretired_output_events, enter_held_direct, establish_hardware_cursor,
-        finish_atomic_fixture, retire_pending_output,
+        finish_atomic_fixture, primary_bo_index_for_record, retire_pending_output,
     };
     use crate::drm::atomic::AtomicCommitKind;
     use yserver_core::{backend::Backend, core_loop::input_inventory::InputInventory};
@@ -784,7 +820,7 @@ fn handoff_keeps_newest_copy_not_retained_direct_frame() {
     );
     let hardware = establish_hardware_cursor(&mut fixture, &mut delivered, cursor, (120, 100));
     drain_unretired_output_events(&mut fixture, &mut delivered, 0);
-    let direct = enter_held_direct(&mut fixture, &mut delivered, 80)
+    let direct = enter_held_direct(&mut fixture, &mut delivered, 80, Some(F0_RED))
         .expect("enter direct scanout with F0 as the held frame");
     let target = direct.target_xid;
     Backend::fill_rectangle(
@@ -961,7 +997,21 @@ fn handoff_keeps_newest_copy_not_retained_direct_frame() {
                 super::tearing_composite_diagnostics(&fixture.scene.events.backend, None,),
             )
         });
-    let _unflip_replacement = scene_record;
+    let primary_bo = primary_bo_index_for_record(
+        &fixture.scene.events.backend.platform,
+        hardware.output_idx,
+        &scene_record,
+    );
+    fixture.scene.events.wait_for_submitted_gpu_work();
+    let primary_bo_pixmap = 0x6a00 + u32::try_from(primary_bo).expect("BO index fits");
+    let primary_pixel = fixture
+        .scene
+        .events
+        .backend
+        .get_image_pixels_for_tests(primary_bo_pixmap, 2, 10, 10, 1, 1, !0)
+        .expect("read the first handoff's primary BO directly")
+        .expect("primary BO pixel bytes");
+    let primary_pixel_is_newest_copy = primary_pixel == [0, 0xff, 0, 0xff];
     retire_pending_output(&mut fixture.scene.events, &mut delivered, 0, 82);
     drain_unretired_output_events(&mut fixture, &mut delivered, 0);
     let direct_retired = fixture
@@ -973,54 +1023,9 @@ fn handoff_keeps_newest_copy_not_retained_direct_frame() {
         .current
         .is_none();
 
-    let before_async = recorder.records().len();
     damage_root(&mut fixture);
     Backend::maybe_composite(&mut fixture.scene.events.backend)
         .expect("compose newest copy after direct retirement");
-    let composed_record = recorder
-        .records()
-        .into_iter()
-        .skip(before_async)
-        .find(|record| {
-            record.kind == AtomicCommitKind::Async
-                && record.result == crate::drm::atomic::tests_support::ScriptedResult::Ok
-        })
-        .expect("retired handoff has a composed Async frame");
-    let output = &fixture.scene.events.backend.platform.outputs[0].output;
-    let primary_fb = composed_record
-        .properties
-        .iter()
-        .find(|update| {
-            update.object == output.plane.into() && update.property == output.plane_fb_id_prop
-        })
-        .map(|update| update.value)
-        .expect("composed Async commit names its primary FB_ID");
-    let primary_bo = match fixture.scene.events.backend.platform.scanout_pools[0]
-        .as_ref()
-        .expect("recording scene has a scanout pool")
-    {
-        crate::kms::vk::scanout::OutputScanout::Shared(pool) => pool
-            .bos
-            .iter()
-            .position(|bo| {
-                bo.fb_handle
-                    .is_some_and(|handle| u64::from(u32::from(handle)) == primary_fb)
-            })
-            .expect("recorded primary FB_ID names a scanout BO"),
-        crate::kms::vk::scanout::OutputScanout::Copied(_) => {
-            panic!("fixture uses a shared scanout pool")
-        }
-    };
-    fixture.scene.events.wait_for_submitted_gpu_work();
-    let primary_bo_pixmap = 0x6a00 + u32::try_from(primary_bo).expect("BO index fits");
-    let primary_pixel = fixture
-        .scene
-        .events
-        .backend
-        .get_image_pixels_for_tests(primary_bo_pixmap, 2, 10, 10, 1, 1, !0)
-        .expect("read the recorded primary BO directly")
-        .expect("primary BO pixel bytes");
-    let primary_pixel_is_newest_copy = primary_pixel == [0, 0xff, 0, 0xff];
     retire_pending_output(&mut fixture.scene.events, &mut delivered, 0, 83);
     let direct_cleared_after_async = fixture
         .scene
@@ -1063,7 +1068,8 @@ fn handoff_keeps_newest_copy_not_retained_direct_frame() {
     );
     assert!(
         primary_pixel_is_newest_copy,
-        "the primary FB_ID BO contains F1, never retained direct frame F0"
+        "the primary FB_ID BO contains F1, never retained direct frame F0: kind={:?}, events={:?}, pixel={primary_pixel:?}",
+        scene_record.kind, scene_record.events,
     );
     assert!(
         unflip_cleared,

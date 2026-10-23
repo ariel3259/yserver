@@ -131,6 +131,38 @@ pub(crate) struct HardwareCursor {
     pub(crate) attach_commit_id: u64,
 }
 
+pub(crate) fn primary_bo_index_for_record(
+    platform: &crate::kms::render::platform::PlatformBackend,
+    output_idx: usize,
+    record: &AtomicCommitRecord,
+) -> usize {
+    let output = &platform.outputs[output_idx].output;
+    let primary_fb = record
+        .properties
+        .iter()
+        .find(|update| {
+            update.object == output.plane.into() && update.property == output.plane_fb_id_prop
+        })
+        .map(|update| update.value)
+        .expect("recorded commit contains the primary FB_ID");
+    match platform.scanout_pools[output_idx]
+        .as_ref()
+        .expect("output has a scanout pool")
+    {
+        crate::kms::vk::scanout::OutputScanout::Shared(pool) => pool
+            .bos
+            .iter()
+            .position(|bo| {
+                bo.fb_handle
+                    .is_some_and(|handle| u64::from(u32::from(handle)) == primary_fb)
+            })
+            .expect("recorded primary FB_ID names a scanout BO"),
+        crate::kms::vk::scanout::OutputScanout::Copied(_) => {
+            panic!("fixture uses a shared scanout pool")
+        }
+    }
+}
+
 impl AtomicPathFixture {
     pub(crate) fn new(kind: PathKind) -> Result<Option<Self>, String> {
         Self::with_output_count(kind, 1)
@@ -550,8 +582,37 @@ pub(crate) fn enter_held_direct(
     fixture: &mut AtomicPathFixture,
     delivered: &mut HashSet<CompletionKey>,
     present_id: u64,
+    initial_frame_pixel: Option<u32>,
 ) -> Result<DirectPresentSetup, String> {
     let direct = fixture.scene.install_direct_present(present_id, 0);
+    if let Some(pixel) = initial_frame_pixel {
+        let width = direct.candidate.src_width;
+        let height = direct.candidate.src_height;
+        Backend::fill_rectangle(
+            &mut fixture.scene.events.backend,
+            None,
+            direct.candidate.src_host_xid,
+            pixel,
+            0,
+            0,
+            width,
+            height,
+        )
+        .expect("paint the initial direct source frame");
+        Backend::copy_area(
+            &mut fixture.scene.events.backend,
+            None,
+            direct.candidate.src_host_xid,
+            direct.target_xid,
+            0,
+            0,
+            0,
+            0,
+            width,
+            height,
+        )
+        .expect("paint the initial composed fallback frame");
+    }
     // install_direct_present hides the scene cursor. Restore it before direct
     // admission: the Atomic path must keep the already-applied plane visible.
     Backend::set_cursor_hidden(&mut fixture.scene.events.backend, false);

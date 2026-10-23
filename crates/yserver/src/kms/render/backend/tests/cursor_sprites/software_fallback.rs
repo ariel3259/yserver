@@ -1,6 +1,6 @@
 use super::support::{
     accepted_live_records, assert_no_cursor_resources, create_argb_cursor, finish_fixture,
-    retire_pending_output,
+    primary_bo_index_for_record, retire_pending_output,
 };
 use crate::{
     drm::{CursorDeviceCaps, atomic::AtomicCommitKind},
@@ -195,31 +195,7 @@ fn non_atomic_device_snapshots_use_software_cursor_without_changing_x_state() {
             .rev()
             .find(|record| record.kind == AtomicCommitKind::Scene)
             .expect("software cursor frame has a recorded scene commit");
-        let output = &events.backend.platform.outputs[0].output;
-        let primary_fb = scene_record
-            .properties
-            .iter()
-            .find(|update| {
-                update.object == output.plane.into() && update.property == output.plane_fb_id_prop
-            })
-            .map(|update| update.value)
-            .expect("scene commit records the primary FB_ID");
-        let primary_bo_idx = match events.backend.platform.scanout_pools[0]
-            .as_ref()
-            .expect("recording scene has a scanout pool")
-        {
-            crate::kms::vk::scanout::OutputScanout::Shared(pool) => pool
-                .bos
-                .iter()
-                .position(|bo| {
-                    bo.fb_handle
-                        .is_some_and(|handle| u64::from(u32::from(handle)) == primary_fb)
-                })
-                .expect("primary FB_ID names one scanout BO"),
-            crate::kms::vk::scanout::OutputScanout::Copied(_) => {
-                panic!("software fallback fixture uses shared scanout BOs")
-            }
-        };
+        let primary_bo_idx = primary_bo_index_for_record(&events.backend.platform, 0, scene_record);
         let no_hardware_cursor_commits = records
             .iter()
             .all(|record| record.kind != AtomicCommitKind::CursorOnly);

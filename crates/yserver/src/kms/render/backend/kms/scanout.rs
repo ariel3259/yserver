@@ -1511,9 +1511,12 @@ impl KmsBackend {
         use crate::kms::render::scene::{OutputRoute, OutputSink};
 
         let outputs: Vec<_> = (0..self.platform.outputs.len()).collect();
+        let tearing_cursor_handoff =
+            self.pstate.scanout_m2.unflip_reason == Some("tearing_cursor_handoff");
         !outputs.is_empty()
-            && !self.pstate.tearing.is_on()
-            && self.pstate.scanout_m2.unflip_reason != Some("tearing_cursor_handoff")
+            // This handoff needs a fresh scene frame so the newest Present
+            // Copy replaces the retained direct frame in the same commit.
+            && (!self.pstate.tearing.is_on() || tearing_cursor_handoff)
             && self.direct_scanout_topology_eligible()
             && !self.platform.cursor_commit_in_flight_for_outputs(&outputs)
             && outputs.iter().all(|&output_idx| {

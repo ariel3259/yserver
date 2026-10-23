@@ -856,7 +856,7 @@ fn p2_scene_direct_copied_and_unflip_commits_carry_only_the_applied_position() {
         let binding = applied_cursor_binding(&fixture.scene.events.backend, 0).unwrap();
         let users = sprite_users(&fixture.scene.events.backend, 0, binding.lease);
         let start = records(&fixture, hardware).len();
-        let direct = enter_held_direct(&mut fixture, &mut delivered, 7)
+        let direct = enter_held_direct(&mut fixture, &mut delivered, 7, None)
             .expect("admit direct scanout through Backend");
         let direct_record = records(&fixture, hardware)
             .into_iter()

@@ -152,44 +152,7 @@ fn vt_suspend_clears_physical_source_keys_and_buttons_via_guarded_cleanup() {
 // Mutation: skip the hidden-cursor detach on VT resume; the accepted resume
 // record must detach the plane after its hide failed during suspension.
 fn hidden_cursor_while_vt_suspended_retries_failed_plane_hide_on_resume() {
-    use std::rc::Rc;
     use yserver_core::{backend::Backend, core_loop::input_inventory::InputInventory};
-
-    struct LogicalVtResume;
-
-    impl crate::kms::render::backend::kms::session::VtResumeExecutor for LogicalVtResume {
-        fn acquire_master(
-            &self,
-            _device: &crate::kms::render::platform::KmsDevice,
-        ) -> std::io::Result<()> {
-            Ok(())
-        }
-
-        fn release_master(
-            &self,
-            _device: &crate::kms::render::platform::KmsDevice,
-        ) -> std::io::Result<()> {
-            Ok(())
-        }
-
-        fn probe_connector_snapshot(
-            &self,
-            platform: &crate::kms::render::platform::PlatformBackend,
-        ) -> std::io::Result<Vec<crate::kms::render::platform::ConnectorSnapshot>> {
-            Ok(platform
-                .outputs
-                .iter()
-                .map(|output| crate::kms::render::platform::ConnectorSnapshot {
-                    key: output.key.clone(),
-                    modes: vec![output.output.picked.clone()],
-                    mm_width: 0,
-                    mm_height: 0,
-                    edid: Vec::new(),
-                    connector_type: "test".to_owned(),
-                })
-                .collect())
-        }
-    }
 
     use super::cursor_sprites::support::{
         AtomicPathFixture, PathKind, accept_cursor_detach, applied_cursor_binding,
@@ -211,17 +174,7 @@ fn hidden_cursor_while_vt_suspended_retries_failed_plane_hide_on_resume() {
     );
     let hardware = establish_hardware_cursor(&mut fixture, &mut delivered, cursor, (120, 100));
     drain_unretired_output_events(&mut fixture, &mut delivered, hardware.output_idx);
-    fixture
-        .scene
-        .events
-        .backend
-        .for_tests_set_vt_resume_executor(Rc::new(LogicalVtResume));
-    fixture
-        .scene
-        .events
-        .backend
-        .platform
-        .for_tests_accept_output_power_commits();
+    super::commit_identity::install_recording_vt_io(&mut fixture.scene);
     let recorder = Rc::clone(&fixture.scene.events.recorders[&hardware.device_fd]);
     for _ in 0..3 {
         recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
