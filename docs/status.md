@@ -33,6 +33,14 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-10-23 hardware cursor motion without scene frames (branch `feat/cursor-motion-no-scene`):** with a
+  hardware cursor over a static screen, a position-only move no longer damages the cursor footprint, so it reaches
+  the plane through the existing cursor-only commit instead of a composed scene frame. Software/mixed cursors, image
+  or hotspot changes, handoffs, forced shows and real window damage keep the previous path. NVIDIA RTX 5060 Ti:
+  200 moves gave 232 scene frames on master `afd064e5` and 0 here (188 cursor-only commits), CPU 2.3 % → 1.7 %;
+  windowed mpv with an animated cursor unchanged (0 dropped frames). Plan:
+  [`plans/2026-10-23-cursor-motion-no-scene.md`](superpowers/plans/2026-10-23-cursor-motion-no-scene.md).
+
 - **2026-10-20 monitor disconnect = Xorg modesetting (branch `fix/273-monitor-disconnect`, issue #273):** a
   physical disconnect issues no KMS commit and runs no global quiesce. The output keeps its `platform.outputs` row,
   scanout pool and CRTC (still scanning out); RANDR reports it Disconnected with an empty mode list and no EDID, while
