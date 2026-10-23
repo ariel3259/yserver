@@ -42,7 +42,8 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 - **2026-10-23 gamma through atomic `GAMMA_LUT` (branch `feat/gamma-atomic-lut`, planned):** the gamma LUT moves from
   the legacy `SETGAMMA` ioctl (a blocking atomic commit the kernel builds itself, which also clears `DEGAMMA_LUT`/`CTM`)
   to a `GAMMA_LUT` blob of the legacy size on the CRTC's next vsync commit, or its own nonblocking commit when nothing is
-  in flight. CRTCs without `GAMMA_LUT` keep `SETGAMMA`. The RANDR gamma size does not change (#263 territory). Revises
+  in flight. `SETGAMMA` is removed (no target driver has legacy-only gamma; nvidia-drm got both in 545); a CRTC without
+  `GAMMA_LUT` reports gamma size 0. The RANDR gamma size does not change (#263 territory). Revises
   the transport decision of `specs/2026-06-18-randr-gamma-design.md`. Plan:
   [`plans/2026-10-23-gamma-atomic-lut.md`](superpowers/plans/2026-10-23-gamma-atomic-lut.md).
 
