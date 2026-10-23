@@ -1,4 +1,4 @@
-# Gamma through atomic `GAMMA_LUT`, legacy `SETGAMMA` as capability fallback
+# Gamma through atomic `GAMMA_LUT`; remove the legacy `SETGAMMA` ioctl
 
 Short plan (no spec: the gamma cache, sizes and reapply points stay; only the last step, how the LUT reaches the CRTC, changes).
 It revises one decision of `specs/2026-06-18-randr-gamma-design.md` (#47), which chose the legacy ioctl and listed atomic
@@ -20,7 +20,12 @@ Driver history (when each driver gained `GAMMA_LUT`): i915 v4.7 (2016), amdgpu D
 nvidia-drm 545.23.06 (2023, legacy and atomic in the same release), msm dpu v7.0 (2025, both in the same release); Apple
 DCP has no gamma. Every one predates its driver's Vulkan 1.2 support, or arrived together with legacy gamma.
 
-**Legacy stays as a capability fallback:** a CRTC with a legacy gamma size but no `GAMMA_LUT` property keeps `SETGAMMA`.
+**No legacy fallback.** The legacy ioctl is removed. No target driver has legacy-only gamma: nvidia-drm gained the legacy
+gamma size and `GAMMA_LUT` in the same release (545.23.06), so on older drivers, including 470, the newest branch for
+Kepler and yserver's minimum recommended NVIDIA driver, `SETGAMMA` already had nothing to act on (gamma size 0); msm the
+same in v7.0; the non-atomic drivers that do have their own legacy `gamma_set` (radeon, amdgpu without DC) cannot run
+yserver, which requires atomic KMS (`drm/device.rs:180`). A CRTC without `GAMMA_LUT` reports gamma size 0, as a CRTC
+without gamma does today.
 
 ## Out of scope
 
@@ -42,14 +47,16 @@ DCP has no gamma. Every one predates its driver's Vulkan 1.2 support, or arrived
 - **Nothing in flight:** when no commit is pending or queued for that CRTC, the LUT goes in its own nonblocking commit
   with a page-flip event, through the same per-CRTC stream and commit identity as the other commits, so the scheduler
   sees the CRTC busy until its event, and EBUSY retries on the CRTC's next event.
-- **Failure:** EINVAL on a commit carrying `GAMMA_LUT` latches that CRTC to the legacy fallback and reapplies through
-  `SETGAMMA`; frame handling is otherwise unchanged. Other errors keep the LUT pending.
+- **Size:** `GetCrtcGammaSize` is the legacy `gamma_length` when the CRTC has `GAMMA_LUT`, otherwise 0.
+- **Failure:** EINVAL on a commit carrying `GAMMA_LUT` latches gamma off for that CRTC (warn once, the LUT stays cached,
+  the frame is resubmitted without it); frame handling is otherwise unchanged. Other errors keep the LUT pending.
+- **Removed:** the `set_gamma` call in `apply_gamma_to_live_output` and any helper left without a caller.
 
 ## Reuse inventory
 
 - **Property lookup and caching:** `PropMap::for_object(..).id(..)` (`drm/modeset.rs:1130`) and the cached optional
   properties on `Output` (`plane_in_fence_fd_prop` / `crtc_out_fence_ptr_prop`, `drm/modeset.rs:203-209`): add
-  `crtc_gamma_lut_prop`, `crtc_degamma_lut_prop` and `crtc_ctm_prop` the same way. `None` for `GAMMA_LUT` = legacy fallback.
+  `crtc_gamma_lut_prop`, `crtc_degamma_lut_prop` and `crtc_ctm_prop` the same way. `None` for `GAMMA_LUT` = no gamma.
 - **Blob lifecycle:** `create_property_blob` / `destroy_property_blob` as the mode blob (`drm/modeset.rs:1365-1414`); the
   user handle is destroyed after submit, the kernel keeps its reference in the CRTC state.
 - **The LUT itself:** the per-output cache `gamma_luts`, `cached_gamma_for_current_size`, `resample_channel` and the size
@@ -66,7 +73,7 @@ DCP has no gamma. Every one predates its driver's Vulkan 1.2 support, or arrived
 ### Task 1: atomic gamma transport
 
 Capability on `Output`, pending LUT per output, the LUT riding vsync scene/direct/composed commits, the standalone
-commit when nothing is in flight, the EINVAL latch, legacy fallback.
+commit when nothing is in flight, the EINVAL latch, removal of the `SETGAMMA` call.
 
 Tests (Backend-driven, rule B; end state checked, rule A):
 - a CRTC with `GAMMA_LUT`: `SetCrtcGamma` issues 0 `SETGAMMA`, the next vsync commit carries `GAMMA_LUT` with a blob of the
@@ -76,10 +83,11 @@ Tests (Backend-driven, rule B; end state checked, rule A):
   submitted before that event is held until it. Mutation: submit the scene flip immediately.
 - async (tearing) flip: carries no CRTC property; the LUT goes on the next vsync commit. Mutation: add it to the async flip.
 - EBUSY on the standalone commit: retried on the CRTC's next event, not dropped.
-- a CRTC without `GAMMA_LUT` but with a legacy size: `SETGAMMA`, as today. EINVAL on a gamma-carrying commit: that CRTC
-  latches to `SETGAMMA`. Mutation: drop the latch.
+- a CRTC without `GAMMA_LUT` (even with a legacy size): `GetCrtcGammaSize` = 0, no ioctl, no commit. EINVAL on a
+  gamma-carrying commit: gamma latches off for that CRTC, the frame still goes out. Mutation: drop the latch.
+- no `SETGAMMA` anywhere: grep in the gate (`set_gamma(` absent under `crates/yserver/src/drm` and `kms`).
 - reapply after a modeset and after VT resume still reaches the hardware (now through the commit).
-- `GetCrtcGammaSize` unchanged (legacy size).
+- `GetCrtcGammaSize` with `GAMMA_LUT`: the legacy size, unchanged.
 
 Hardware (rule C), NVIDIA and AMD, release build, baseline on master first (this is also #47's pending smoke):
 gammastep (or redshift) changing gamma while mpv plays fullscreen in direct scanout (mpv rendering on the same GPU via
