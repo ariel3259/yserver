@@ -209,7 +209,13 @@ struct TransientCursorFallback {
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct CursorHideRecovery {
     attempts: u8,
+    /// A direct-scanout cursor retry is paced by a deadline and replays the
+    /// current show/hide intent; failed-detach recovery remains motion-driven.
+    direct_scanout_retry: bool,
+    retry_deadline: Option<std::time::Instant>,
 }
+
+pub(crate) const CURSOR_HIDE_RECOVERY_MAX_ATTEMPTS: u8 = 3;
 
 /// Per-DRM-device hardware cursor state. Raw CRTC handles are device-local,
 /// so none of these fields may live at platform scope.

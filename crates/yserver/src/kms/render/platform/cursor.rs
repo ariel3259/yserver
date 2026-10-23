@@ -1102,6 +1102,58 @@ impl PlatformBackend {
         })
     }
 
+    /// Count a failed non-EINVAL direct cursor refresh and arm its next retry.
+    /// The existing per-CRTC hide-recovery slot also gates position-only
+    /// commits while the current show/hide intent is being retried.
+    pub(crate) fn note_direct_cursor_retry_failure(
+        &mut self,
+        output_idx: usize,
+        retry_deadline: Instant,
+    ) -> Option<u8> {
+        let (device_idx, crtc, _, _) = self.cursor_output_route(output_idx).ok()?;
+        let recovery = self.devices[device_idx]
+            .cursor
+            .cursor_hide_recovery
+            .entry(crtc)
+            .or_default();
+        if !recovery.direct_scanout_retry {
+            recovery.attempts = 0;
+        }
+        recovery.direct_scanout_retry = true;
+        recovery.attempts = recovery.attempts.saturating_add(1);
+        recovery.retry_deadline = Some(retry_deadline);
+        Some(recovery.attempts)
+    }
+
+    /// Deadline for a direct cursor retry on this output, if its last failure
+    /// was a generic atomic error rather than an event-gated EBUSY.
+    #[must_use]
+    pub(crate) fn direct_cursor_retry_deadline(&self, output_idx: usize) -> Option<Instant> {
+        let (device_idx, crtc, _, _) = self.cursor_output_route(output_idx).ok()?;
+        self.devices[device_idx]
+            .cursor
+            .cursor_hide_recovery
+            .get(&crtc)
+            .filter(|recovery| recovery.direct_scanout_retry)
+            .and_then(|recovery| recovery.retry_deadline)
+    }
+
+    /// Clear only direct-scanout retry bookkeeping; a separate failed
+    /// blocking-detach recovery still belongs to pointer-motion handling.
+    pub(crate) fn clear_direct_cursor_retry(&mut self, output_idx: usize) {
+        let Ok((device_idx, crtc, _, _)) = self.cursor_output_route(output_idx) else {
+            return;
+        };
+        let cursor = &mut self.devices[device_idx].cursor;
+        if cursor
+            .cursor_hide_recovery
+            .get(&crtc)
+            .is_some_and(|recovery| recovery.direct_scanout_retry)
+        {
+            cursor.cursor_hide_recovery.remove(&crtc);
+        }
+    }
+
     /// Bind the atomic cursor plane on `output_idx` at `(x, y)` in root space.
     ///
     /// # Errors
@@ -1185,11 +1237,15 @@ impl PlatformBackend {
             Err(error) => {
                 let attempts = recovery.attempts.saturating_add(1);
                 let state = &mut self.devices[device_idx].cursor;
-                state
-                    .cursor_hide_recovery
-                    .insert(crtc, CursorHideRecovery { attempts });
+                state.cursor_hide_recovery.insert(
+                    crtc,
+                    CursorHideRecovery {
+                        attempts,
+                        ..CursorHideRecovery::default()
+                    },
+                );
                 outcome.retry_required = true;
-                if attempts >= 3 {
+                if attempts >= crate::kms::render::platform::CURSOR_HIDE_RECOVERY_MAX_ATTEMPTS {
                     state.permanently_disabled = true;
                     state.atomic_positions.clear();
                     state.atomic_pending_moves.clear();
@@ -1197,11 +1253,13 @@ impl PlatformBackend {
                     state.cursor_hide_recovery.clear();
                     outcome.fallback_changed = true;
                     log::error!(
-                        "render cursor hide recovery: device {device_key} CRTC {crtc:?} {operation} failed 3 times ({error}); permanently disabling the hardware cursor"
+                        "render cursor hide recovery: device {device_key} CRTC {crtc:?} {operation} failed {attempts} times ({error}); permanently disabling the hardware cursor"
                     );
                 } else {
                     log::warn!(
-                        "render cursor hide recovery: device {device_key} CRTC {crtc:?} {operation} retry {attempts}/3 failed ({error})"
+                        "render cursor hide recovery: device {device_key} CRTC {crtc:?} {operation} retry {attempts}/{max_attempts} failed ({error})",
+                        max_attempts =
+                            crate::kms::render::platform::CURSOR_HIDE_RECOVERY_MAX_ATTEMPTS,
                     );
                 }
             }
@@ -1246,6 +1304,9 @@ impl PlatformBackend {
                 .get(&crtc)
                 .copied();
             if let Some(recovery) = recovery {
+                if recovery.direct_scanout_retry {
+                    continue;
+                }
                 let result = self.detach_cursor_blocking(device_idx, crtc);
                 outcome.merge(self.apply_cursor_motion_hide_recovery_result(
                     device_idx,

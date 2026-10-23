@@ -17,9 +17,48 @@ use crate::{
 use std::{
     collections::HashSet,
     rc::Rc,
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 use yserver_core::backend::Backend;
+
+fn install_direct_retry_clock(
+    backend: &mut crate::kms::render::backend::KmsBackend,
+) -> (std::sync::Arc<AtomicU64>, Instant) {
+    let base = Instant::now();
+    let elapsed_ns = std::sync::Arc::new(AtomicU64::new(0));
+    let clock_elapsed_ns = std::sync::Arc::clone(&elapsed_ns);
+    backend.for_tests_set_monotonic_clock(Rc::new(move || {
+        base + Duration::from_nanos(clock_elapsed_ns.load(Ordering::SeqCst))
+    }));
+    (elapsed_ns, base)
+}
+
+fn advance_direct_retry_clock(elapsed_ns: &AtomicU64, duration: Duration) {
+    elapsed_ns.fetch_add(
+        u64::try_from(duration.as_nanos()).expect("retry duration fits u64 nanoseconds"),
+        Ordering::SeqCst,
+    );
+}
+
+fn cursor_hide_attempts_for_output(fixture: &AtomicPathFixture, output_idx: usize) -> usize {
+    let fb_id =
+        super::support::cursor_properties_for_output(&fixture.scene.events.backend, output_idx)
+            .fb_id;
+    let device_fd = fixture.scene.kms_fd(output_idx);
+    let crtc = fixture.scene.events.backend.platform.outputs[output_idx]
+        .output
+        .crtc;
+    fixture.scene.events.recorders[&device_fd]
+        .records()
+        .into_iter()
+        .filter(|record| {
+            record.kind == AtomicCommitKind::CursorOnly
+                && record_property(record, fb_id) == Some(0)
+                && record.events.iter().any(|event| event.crtc == crtc)
+        })
+        .count()
+}
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
@@ -1979,12 +2018,15 @@ fn direct_deferred_cursor_show_keeps_direct_and_retries_on_event() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: request an unflip for a generic cursor-show error. EIO must keep
-// direct scanout active and retain the previous cursor lease.
+// Mutation: omit the scheduled direct-show retry. EIO must recover without a new CRTC event.
 fn direct_cursor_generic_error_keeps_direct_scanout() {
     let Some((mut fixture, mut delivered, hardware, _direct)) = held_direct_with_cursor(704) else {
+        eprintln!(
+            "SKIP direct_cursor_generic_error_keeps_direct_scanout: Vulkan fixture unavailable"
+        );
         return;
     };
+    let (elapsed_ns, base) = install_direct_retry_clock(&mut fixture.scene.events.backend);
     let recorder = Rc::clone(&fixture.scene.events.recorders[&hardware.device_fd]);
     let properties = super::support::cursor_properties_for_output(&fixture.scene.events.backend, 0);
     let record_start = record_count(&fixture, hardware.device_fd);
@@ -2022,6 +2064,10 @@ fn direct_cursor_generic_error_keeps_direct_scanout() {
                         } if errno == libc::EIO
                     )
             });
+    assert!(
+        still_direct,
+        "the initial generic show error keeps direct scanout"
+    );
     let retry_pending = fixture
         .scene
         .events
@@ -2032,49 +2078,74 @@ fn direct_cursor_generic_error_keeps_direct_scanout() {
         .contains(&0);
     let old_lease_retained =
         sprite_users(&fixture.scene.events.backend, 0, old_binding.lease) == Some(1);
-
-    if fixture.scene.events.backend.pstate.scanout_m2.active() {
+    let retry_deadline = base + Duration::from_millis(50);
+    assert_eq!(
         fixture
             .scene
             .events
             .backend
-            .stop_direct_after_scanout_replaced("test teardown");
+            .platform
+            .direct_cursor_retry_deadline(0),
+        Some(retry_deadline),
+        "a generic direct-show error stores the scheduled retry deadline",
+    );
+    assert!(
+        Backend::next_wakeup(&fixture.scene.events.backend)
+            .is_some_and(|wakeup| wakeup <= retry_deadline),
+        "a generic direct-show error makes its retry deadline wake the Backend",
+    );
+    for _ in 0..3 {
+        Backend::maybe_composite(&mut fixture.scene.events.backend)
+            .expect("an early direct tick must not retry before its deadline");
     }
-    let cleanup_start = record_count(&fixture, hardware.device_fd);
-    fixture
-        .scene
-        .events
-        .backend
-        .platform
-        .cursor_plane_hide_on_crtc(hardware.output_idx)
-        .expect("teardown hide for the retained cursor binding");
-    let cleanup = recorder
-        .records()
+    assert_eq!(
+        record_count(&fixture, hardware.device_fd),
+        record_start + 1,
+        "no CRTC event or new frame is needed before the retry deadline",
+    );
+    advance_direct_retry_clock(&elapsed_ns, Duration::from_millis(50));
+    Backend::maybe_composite(&mut fixture.scene.events.backend)
+        .expect("the scheduled direct-show retry runs through Backend");
+    let retry = accepted_live_records(&recorder)
         .into_iter()
-        .skip(cleanup_start)
+        .skip(record_start)
         .find(|record| {
             record.kind == AtomicCommitKind::CursorOnly
+                && record_property(record, properties.fb_id).is_some_and(|fb| fb != 0)
                 && record
                     .events
                     .iter()
                     .any(|event| event.crtc == hardware.crtc)
-                && record.result == ScriptedResult::Ok
         })
-        .expect("accepted teardown hide");
-    retire_cursor_record(
-        &mut fixture,
-        &mut delivered,
-        hardware.output_idx,
-        &cleanup,
-        14,
-    );
-    super::support::finish_atomic_fixture(fixture, &mut delivered);
+        .expect("the retry accepts the current cursor image");
+    retire_cursor_record(&mut fixture, &mut delivered, 0, &retry, 14);
+    let pending_cleared = fixture
+        .scene
+        .events
+        .backend
+        .pstate
+        .scanout_m2
+        .direct_cursor_refresh_pending
+        .is_empty();
+    let still_direct = fixture.scene.events.backend.pstate.scanout_m2.active()
+        && !fixture
+            .scene
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .unflip_requested;
+    finish_direct_fixture(fixture, &mut delivered);
     assert!(
         still_direct,
         "generic cursor errors preserve direct scanout"
     );
     assert!(retry_pending, "the existing CRTC retry remains armed");
     assert!(old_lease_retained, "the old cursor lease remains owned");
+    assert!(
+        pending_cleared,
+        "the accepted retry clears the pending state"
+    );
 }
 
 #[test]
@@ -2682,6 +2753,11 @@ fn finish_direct_fixture(
     mut fixture: AtomicPathFixture,
     delivered: &mut HashSet<super::support::CompletionKey>,
 ) {
+    fixture
+        .scene
+        .events
+        .backend
+        .for_tests_set_monotonic_clock(Rc::new(Instant::now));
     if fixture.scene.events.backend.pstate.scanout_m2.active() {
         fixture
             .scene
@@ -3715,8 +3791,7 @@ fn direct_deferred_hide_then_show_applies_newest_intent() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: unflip on every hide error. A generic EIO keeps direct scanout
-// active and leaves the existing CRTC retry pending on output 0.
+// Mutation: retry only on a CRTC event. The idle output 0 hide must recover from its scheduled wake.
 fn direct_cursor_hide_generic_error_keeps_direct_scanout() {
     let Some((mut fixture, mut delivered, hardware, _direct)) = held_direct_with_two_outputs(711)
     else {
@@ -3731,12 +3806,17 @@ fn direct_cursor_hide_generic_error_keeps_direct_scanout() {
     let properties1 =
         super::support::cursor_properties_for_output(&fixture.scene.events.backend, 1);
     let recorder = Rc::clone(&fixture.scene.events.recorders[&device_fd]);
+    let (elapsed_ns, base) = install_direct_retry_clock(&mut fixture.scene.events.backend);
     let start = record_count(&fixture, device_fd);
+    let output0_attempts_before = cursor_hide_attempts_for_output(&fixture, 0);
     recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
     Backend::set_cursor_hidden(&mut fixture.scene.events.backend, true);
     let real_error = recorder.records().into_iter().skip(start).any(|record| {
         record.kind == AtomicCommitKind::CursorOnly
             && record_property(&record, properties0.fb_id) == Some(0)
+            && record.events.iter().any(|event| {
+                event.crtc == fixture.scene.events.backend.platform.outputs[0].output.crtc
+            })
             && matches!(
                 record.result,
                 ScriptedResult::Error {
@@ -3775,18 +3855,43 @@ fn direct_cursor_hide_generic_error_keeps_direct_scanout() {
         .backend
         .platform
         .cursor_plane_visible_for_output(1);
-    let cleanup_start = record_count(&fixture, device_fd);
-    fixture
+    let output1_hide = recorder
+        .records()
+        .into_iter()
+        .skip(start)
+        .find(|record| {
+            record.kind == AtomicCommitKind::CursorOnly
+                && record_property(record, properties1.fb_id) == Some(0)
+                && record.events.iter().any(|event| {
+                    event.crtc == fixture.scene.events.backend.platform.outputs[1].output.crtc
+                })
+                && record.result == ScriptedResult::Ok
+        })
+        .expect("output 1's hide succeeds and owns its CRTC event");
+    retire_cursor_record(&mut fixture, &mut delivered, 1, &output1_hide, 12);
+    let output0_attempts_after_output1_event = cursor_hide_attempts_for_output(&fixture, 0);
+    for _ in 0..2 {
+        Backend::maybe_composite(&mut fixture.scene.events.backend)
+            .expect("idle direct ticks wait for the scheduled retry deadline");
+    }
+    let output0_attempts_before_deadline = cursor_hide_attempts_for_output(&fixture, 0);
+    let retry_deadline = base + Duration::from_millis(50);
+    let wake_after_failure = Backend::next_wakeup(&fixture.scene.events.backend);
+    let retry_deadline_is_armed = fixture
         .scene
         .events
         .backend
         .platform
-        .cursor_plane_hide_on_crtc(0)
-        .expect("teardown hide for the retained output 0 cursor");
-    let cleanup = recorder
-        .records()
+        .direct_cursor_retry_deadline(0)
+        == Some(retry_deadline);
+    advance_direct_retry_clock(&elapsed_ns, Duration::from_millis(50));
+    let due_wakeup = Backend::next_wakeup(&fixture.scene.events.backend);
+    Backend::maybe_composite(&mut fixture.scene.events.backend)
+        .expect("the scheduled wake retries output 0 without a new frame");
+    let output0_retry = accepted_live_records(&recorder)
         .into_iter()
-        .skip(cleanup_start)
+        .skip(start)
+        .rev()
         .find(|record| {
             record.kind == AtomicCommitKind::CursorOnly
                 && record_property(record, properties0.fb_id) == Some(0)
@@ -3795,8 +3900,41 @@ fn direct_cursor_hide_generic_error_keeps_direct_scanout() {
                 })
                 && record.result == ScriptedResult::Ok
         })
-        .expect("accepted output 0 teardown hide");
-    retire_cursor_record(&mut fixture, &mut delivered, 0, &cleanup, 12);
+        .expect("output 0 accepts its hide after the injected error clears");
+    retire_cursor_record(&mut fixture, &mut delivered, 0, &output0_retry, 13);
+    let pending_cleared = fixture
+        .scene
+        .events
+        .backend
+        .pstate
+        .scanout_m2
+        .direct_cursor_refresh_pending
+        .is_empty();
+    let output0_is_hidden = !fixture
+        .scene
+        .events
+        .backend
+        .platform
+        .cursor_plane_visible_for_output(0);
+    let no_new_frame = !recorder
+        .records()
+        .into_iter()
+        .skip(start)
+        .any(|record| record.kind != AtomicCommitKind::CursorOnly);
+    assert!(
+        still_direct,
+        "the initial generic hide error keeps direct scanout"
+    );
+    assert!(retry_pending, "the initial direct hide remains pending");
+    let still_direct = fixture.scene.events.backend.pstate.scanout_m2.active()
+        && !fixture
+            .scene
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .unflip_requested;
+    let output0_attempts_after_retry = cursor_hide_attempts_for_output(&fixture, 0);
     finish_direct_fixture(fixture, &mut delivered);
     assert!(
         real_error,
@@ -3806,7 +3944,161 @@ fn direct_cursor_hide_generic_error_keeps_direct_scanout() {
         still_direct,
         "generic cursor hide errors preserve direct scanout"
     );
-    assert!(retry_pending, "the existing CRTC retry remains armed");
+    assert_eq!(
+        output0_attempts_after_output1_event,
+        output0_attempts_before + 1
+    );
+    assert_eq!(
+        output0_attempts_before_deadline,
+        output0_attempts_after_output1_event
+    );
+    assert!(retry_deadline_is_armed);
+    assert!(wake_after_failure.is_some_and(|wakeup| wakeup <= retry_deadline));
+    assert!(due_wakeup.is_some_and(|wakeup| wakeup <= retry_deadline));
+    assert_eq!(
+        output0_attempts_after_retry,
+        output0_attempts_after_output1_event + 1,
+        "the idle retry is bounded to one successful retry",
+    );
+    assert!(
+        pending_cleared,
+        "the accepted retry clears the pending state"
+    );
+    assert!(output0_is_hidden, "output 0 is hidden after its retry");
+    assert!(
+        no_new_frame,
+        "the recovery submits no direct successor frame"
+    );
     assert!(output1_hide_succeeded, "output 1 still accepts its hide");
     assert!(output1_is_hidden, "output 1's accepted hide is reflected");
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: remove the three-attempt bound. Persistent EIO must request unflip after three failures.
+fn direct_cursor_hide_persistent_error_unflips_after_recovery_bound() {
+    let Some((mut fixture, mut delivered, hardware, _direct)) = held_direct_with_two_outputs(714)
+    else {
+        eprintln!(
+            "SKIP direct_cursor_hide_persistent_error_unflips_after_recovery_bound: Vulkan fixture unavailable"
+        );
+        return;
+    };
+    let device_fd = hardware.device_fd;
+    let properties1 =
+        super::support::cursor_properties_for_output(&fixture.scene.events.backend, 1);
+    let recorder = Rc::clone(&fixture.scene.events.recorders[&device_fd]);
+    let (elapsed_ns, _) = install_direct_retry_clock(&mut fixture.scene.events.backend);
+    let start = record_count(&fixture, device_fd);
+    let attempts_before = cursor_hide_attempts_for_output(&fixture, 0);
+    recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
+    Backend::set_cursor_hidden(&mut fixture.scene.events.backend, true);
+    let output1_hide = recorder
+        .records()
+        .into_iter()
+        .skip(start)
+        .find(|record| {
+            record.kind == AtomicCommitKind::CursorOnly
+                && record_property(record, properties1.fb_id) == Some(0)
+                && record.events.iter().any(|event| {
+                    event.crtc == fixture.scene.events.backend.platform.outputs[1].output.crtc
+                })
+                && record.result == ScriptedResult::Ok
+        })
+        .expect("output 1 hide succeeds while output 0 fails");
+    retire_cursor_record(&mut fixture, &mut delivered, 1, &output1_hide, 20);
+    assert_eq!(
+        cursor_hide_attempts_for_output(&fixture, 0),
+        attempts_before + 1,
+        "the initial output 0 failure is the first bounded attempt",
+    );
+    assert!(
+        !fixture
+            .scene
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .unflip_requested,
+        "the first failure keeps direct scanout active",
+    );
+
+    for attempt in 2..=3 {
+        recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
+        for _ in 0..2 {
+            Backend::maybe_composite(&mut fixture.scene.events.backend)
+                .expect("busy direct ticks do not retry before the deadline");
+        }
+        assert_eq!(
+            cursor_hide_attempts_for_output(&fixture, 0),
+            attempts_before + attempt - 1,
+            "non-due ticks do not create a per-vblank cursor error storm",
+        );
+        advance_direct_retry_clock(&elapsed_ns, Duration::from_millis(50));
+        Backend::maybe_composite(&mut fixture.scene.events.backend)
+            .expect("a due direct cursor retry runs through Backend");
+        assert_eq!(
+            cursor_hide_attempts_for_output(&fixture, 0),
+            attempts_before + attempt,
+            "each scheduled failure consumes one bounded recovery attempt",
+        );
+        if attempt < 3 {
+            assert!(
+                !fixture
+                    .scene
+                    .events
+                    .backend
+                    .pstate
+                    .scanout_m2
+                    .unflip_requested,
+                "direct scanout remains active before the bound",
+            );
+        }
+    }
+
+    let unflip_after_bound = fixture
+        .scene
+        .events
+        .backend
+        .pstate
+        .scanout_m2
+        .unflip_requested;
+    let failed_attempts = cursor_hide_attempts_for_output(&fixture, 0);
+    for _ in 0..3 {
+        Backend::maybe_composite(&mut fixture.scene.events.backend)
+            .expect("the requested unflip is not followed by cursor retry spam");
+    }
+    let attempts_after_unflip = cursor_hide_attempts_for_output(&fixture, 0);
+    let unflip = accepted_live_records(&recorder)
+        .into_iter()
+        .skip(start)
+        .find(|record| record.kind != AtomicCommitKind::CursorOnly)
+        .expect("bounded cursor recovery submits a composed unflip");
+    let unflip_id = accepted_event_id(&unflip).expect("accepted composed unflip has an ID");
+    assert_eq!(
+        unflip.events.len(),
+        2,
+        "the unflip replaces both direct outputs"
+    );
+    for (output_idx, frame) in [(0, 30), (1, 31)] {
+        assert_eq!(
+            retire_pending_output(&mut fixture.scene.events, &mut delivered, output_idx, frame),
+            unflip_id,
+            "the composed unflip retires on output {output_idx}",
+        );
+    }
+    assert!(
+        !fixture.scene.events.backend.pstate.scanout_m2.active(),
+        "retiring the composed unflip releases direct scanout",
+    );
+    finish_direct_fixture(fixture, &mut delivered);
+    assert!(
+        unflip_after_bound,
+        "three failed direct cursor attempts request unflip",
+    );
+    assert_eq!(failed_attempts, attempts_before + 3);
+    assert_eq!(
+        attempts_after_unflip, failed_attempts,
+        "no further per-vblank cursor attempts occur after unflip",
+    );
 }

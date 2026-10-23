@@ -22,6 +22,7 @@ use yserver_core::{
 use yserver_protocol::x11::xfixes;
 
 const DIRECT_CURSOR_RETRY_AFTER_SUCCESSOR_EVENTS: u8 = 2;
+const DIRECT_CURSOR_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
 pub(in crate::kms::render::backend) fn scanout_m2_is_authoritative_root(
     target: ScanoutM0Target,
@@ -267,6 +268,38 @@ impl KmsBackend {
         (self.pstate.monotonic_clock)()
     }
 
+    /// Keep generic atomic cursor failures pending, but pace retries through
+    /// the backend deadline and cap them with the existing per-CRTC recovery.
+    pub(super) fn schedule_direct_cursor_retry(
+        &mut self,
+        output_idx: usize,
+        operation: &str,
+        error: &io::Error,
+        unflip_reason: &'static str,
+    ) -> bool {
+        self.pstate
+            .scanout_m2
+            .mark_direct_cursor_refresh_pending(output_idx);
+        let deadline = self.monotonic_now() + DIRECT_CURSOR_RETRY_DELAY;
+        let attempts = self
+            .platform
+            .note_direct_cursor_retry_failure(output_idx, deadline)
+            .unwrap_or(crate::kms::render::platform::CURSOR_HIDE_RECOVERY_MAX_ATTEMPTS);
+        let max_attempts = crate::kms::render::platform::CURSOR_HIDE_RECOVERY_MAX_ATTEMPTS;
+        if attempts >= max_attempts {
+            log::warn!(
+                "scanout_m2: direct cursor {operation} failed {attempts}/{max_attempts} times ({error}); unflipping"
+            );
+            self.request_direct_unflip(unflip_reason);
+            false
+        } else {
+            log::warn!(
+                "scanout_m2: direct cursor {operation} failed ({error}); retry {attempts}/{max_attempts} at {deadline:?}"
+            );
+            true
+        }
+    }
+
     /// The direct scanout cursor gate depends on KMS plane visibility, so it
     /// stays with the KMS implementation while cursor image policy remains
     /// portable.
@@ -394,6 +427,10 @@ impl KmsBackend {
             let mut failed = false;
             for output_idx in 0..self.platform.outputs.len() {
                 if !self.platform.cursor_plane_visible_for_output(output_idx) {
+                    self.platform.clear_direct_cursor_retry(output_idx);
+                    self.pstate
+                        .scanout_m2
+                        .clear_direct_cursor_refresh_pending(output_idx);
                     continue;
                 }
                 let atomic_path = self
@@ -404,28 +441,40 @@ impl KmsBackend {
                             == crate::kms::cursor_plane::topology::CursorStatePath::Atomic
                     });
                 match self.platform.cursor_plane_hide_on_crtc(output_idx) {
-                    Ok(()) => self
-                        .pstate
-                        .scanout_m2
-                        .clear_direct_cursor_refresh_pending(output_idx),
+                    Ok(()) => {
+                        self.platform.clear_direct_cursor_retry(output_idx);
+                        self.pstate
+                            .scanout_m2
+                            .clear_direct_cursor_refresh_pending(output_idx);
+                    }
                     Err(error)
-                        if !atomic_path
-                            || error.raw_os_error() == Some(libc::EINVAL)
-                            || error.raw_os_error() == Some(libc::EBUSY)
-                            || error.kind() == io::ErrorKind::WouldBlock =>
+                        if atomic_path
+                            && (error.kind() == io::ErrorKind::WouldBlock
+                                || error.raw_os_error() == Some(libc::EBUSY)) =>
                     {
+                        self.platform.clear_direct_cursor_retry(output_idx);
+                        self.pstate
+                            .scanout_m2
+                            .mark_direct_cursor_refresh_pending(output_idx);
+                        log::debug!(
+                            "scanout_m2: cursor hide deferred on output {output_idx}; retrying on CRTC event"
+                        );
+                    }
+                    Err(error) if !atomic_path || error.raw_os_error() == Some(libc::EINVAL) => {
                         failed = true;
                         log::warn!(
                             "scanout_m2: cursor hide failed on output {output_idx}: {error}; unflipping"
                         );
                     }
                     Err(error) => {
-                        self.pstate
-                            .scanout_m2
-                            .mark_direct_cursor_refresh_pending(output_idx);
-                        log::warn!(
-                            "scanout_m2: cursor hide failed on output {output_idx}: {error}; retrying on CRTC event"
-                        );
+                        if !self.schedule_direct_cursor_retry(
+                            output_idx,
+                            "hide",
+                            &error,
+                            "cursor_hide_failed",
+                        ) {
+                            failed = true;
+                        }
                     }
                 }
             }
@@ -467,11 +516,16 @@ impl KmsBackend {
                 .cursor_plane_show_on_crtc(output_idx, hot_x, hot_y, x, y)
             {
                 Ok(()) => {
+                    self.platform.clear_direct_cursor_retry(output_idx);
                     self.pstate
                         .scanout_m2
                         .clear_direct_cursor_refresh_pending(output_idx);
                 }
-                Err(error) if error.is_deferred() => {
+                Err(error)
+                    if error.is_deferred()
+                        || error.operation_error().raw_os_error() == Some(libc::EBUSY) =>
+                {
+                    self.platform.clear_direct_cursor_retry(output_idx);
                     self.pstate
                         .scanout_m2
                         .mark_direct_cursor_refresh_pending(output_idx);
@@ -487,12 +541,14 @@ impl KmsBackend {
                             "scanout_m2: cursor bind failed on output {output_idx}: {error}; unflipping"
                         );
                     } else {
-                        self.pstate
-                            .scanout_m2
-                            .mark_direct_cursor_refresh_pending(output_idx);
-                        log::warn!(
-                            "scanout_m2: cursor bind failed on output {output_idx}: {error}; retrying on CRTC event"
-                        );
+                        if !self.schedule_direct_cursor_retry(
+                            output_idx,
+                            "show",
+                            error.operation_error(),
+                            "cursor_bind_failed",
+                        ) {
+                            failed = true;
+                        }
                     }
                 }
             }
@@ -555,6 +611,7 @@ impl KmsBackend {
         ) {
             Ok(CursorUploadOutcome::Ready) => {}
             Ok(CursorUploadOutcome::Deferred) => {
+                self.platform.clear_direct_cursor_retry(output_idx);
                 self.pstate
                     .scanout_m2
                     .mark_direct_cursor_refresh_pending(output_idx);
@@ -582,11 +639,16 @@ impl KmsBackend {
             .cursor_plane_show_on_crtc(output_idx, record.hot_x, record.hot_y, x, y)
         {
             Ok(()) => {
+                self.platform.clear_direct_cursor_retry(output_idx);
                 self.pstate
                     .scanout_m2
                     .clear_direct_cursor_refresh_pending(output_idx);
             }
-            Err(error) if error.is_deferred() => {
+            Err(error)
+                if error.is_deferred()
+                    || error.operation_error().raw_os_error() == Some(libc::EBUSY) =>
+            {
+                self.platform.clear_direct_cursor_retry(output_idx);
                 self.pstate
                     .scanout_m2
                     .mark_direct_cursor_refresh_pending(output_idx);
@@ -601,13 +663,12 @@ impl KmsBackend {
                     );
                     return false;
                 }
-                self.pstate
-                    .scanout_m2
-                    .mark_direct_cursor_refresh_pending(output_idx);
-                log::warn!(
-                    "scanout_m2: direct cursor show failed on output {output_idx}: {error}; retrying on CRTC event"
+                return self.schedule_direct_cursor_retry(
+                    output_idx,
+                    "show",
+                    error.operation_error(),
+                    "cursor_show_failed",
                 );
-                return true;
             }
         }
         true
@@ -633,6 +694,31 @@ impl KmsBackend {
         }
     }
 
+    fn retry_due_direct_cursor_refreshes_on_timer(&mut self) {
+        if self.pstate.scanout_m2.pending.is_some()
+            || self.pstate.scanout_m2.queued_successor.is_some()
+            || self.pstate.scanout_m2.unflip_requested
+        {
+            return;
+        }
+        let now = self.monotonic_now();
+        let due_outputs: Vec<_> = self
+            .pstate
+            .scanout_m2
+            .direct_cursor_refresh_pending
+            .iter()
+            .copied()
+            .filter(|output_idx| {
+                self.platform
+                    .direct_cursor_retry_deadline(*output_idx)
+                    .is_some_and(|deadline| deadline <= now)
+            })
+            .collect();
+        for output_idx in due_outputs {
+            self.retry_pending_direct_cursor_refresh(output_idx, false);
+        }
+    }
+
     fn retry_pending_direct_cursor_refresh(
         &mut self,
         output_idx: usize,
@@ -648,7 +734,17 @@ impl KmsBackend {
         {
             return;
         }
+        if self
+            .platform
+            .direct_cursor_retry_deadline(output_idx)
+            .is_some_and(|deadline| self.monotonic_now() < deadline)
+        {
+            return;
+        }
         if self.pstate.tearing.is_on() {
+            for output_idx in 0..self.platform.outputs.len() {
+                self.platform.clear_direct_cursor_retry(output_idx);
+            }
             self.pstate
                 .scanout_m2
                 .clear_all_direct_cursor_refresh_pending();
@@ -680,11 +776,16 @@ impl KmsBackend {
                 });
             match self.platform.cursor_plane_hide_on_crtc(output_idx) {
                 Ok(()) => {
+                    self.platform.clear_direct_cursor_retry(output_idx);
                     self.pstate
                         .scanout_m2
                         .clear_direct_cursor_refresh_pending(output_idx);
                 }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock
+                        || error.raw_os_error() == Some(libc::EBUSY) =>
+                {
+                    self.platform.clear_direct_cursor_retry(output_idx);
                     log::debug!(
                         "scanout_m2: direct cursor hide deferred on output {output_idx}; retrying on CRTC event"
                     );
@@ -700,8 +801,11 @@ impl KmsBackend {
                         );
                         self.request_direct_unflip("cursor_hide_failed");
                     } else {
-                        log::warn!(
-                            "scanout_m2: direct cursor hide failed on output {output_idx}: {error}; retrying on CRTC event"
+                        self.schedule_direct_cursor_retry(
+                            output_idx,
+                            "hide",
+                            &error,
+                            "cursor_hide_failed",
                         );
                     }
                     return;
@@ -713,6 +817,7 @@ impl KmsBackend {
             return;
         }
         let Some(xid) = self.effective_cursor_xid else {
+            self.platform.clear_direct_cursor_retry(output_idx);
             self.pstate
                 .scanout_m2
                 .clear_direct_cursor_refresh_pending(output_idx);
@@ -1084,6 +1189,9 @@ impl KmsBackend {
         }
         self.pstate.scanout_m2.hold_direct = false;
         self.pstate.scanout_m2.cursor_bound_all = false;
+        for output_idx in 0..self.platform.outputs.len() {
+            self.platform.clear_direct_cursor_retry(output_idx);
+        }
         self.pstate
             .scanout_m2
             .clear_all_direct_cursor_refresh_pending();
@@ -2829,7 +2937,30 @@ impl KmsBackend {
     ) -> Option<std::time::Instant> {
         let now = self.monotonic_now();
         let allow_kms_timers = self.scanout_allowed() && self.kms_outputs_active;
-        let scene_deadline = if allow_kms_timers {
+        let direct_hold_waits_for_cursor_or_frame = self.pstate.scanout_m2.hold_direct
+            && self.pstate.scanout_m2.current.is_some()
+            && self.pstate.scanout_m2.pending.is_none()
+            && self.pstate.scanout_m2.queued_successor.is_none()
+            && !self.pstate.scanout_m2.unflip_requested;
+        let direct_cursor_retry_deadline = if allow_kms_timers
+            && self.pstate.scanout_m2.pending.is_none()
+            && self.pstate.scanout_m2.queued_successor.is_none()
+            && !self.pstate.scanout_m2.unflip_requested
+        {
+            self.pstate
+                .scanout_m2
+                .direct_cursor_refresh_pending
+                .iter()
+                .filter_map(|output_idx| self.platform.direct_cursor_retry_deadline(*output_idx))
+                .min()
+        } else {
+            None
+        };
+        let scene_deadline = if allow_kms_timers && direct_hold_waits_for_cursor_or_frame {
+            self.platform
+                .has_eligible_atomic_cursor_move()
+                .then_some(now)
+        } else if allow_kms_timers {
             if self.scene_wants_compose() {
                 if self.scene.has_output_ready_for_submit(&self.platform) {
                     Some(now)
@@ -2860,6 +2991,7 @@ impl KmsBackend {
             .map(|until| if now >= until { now } else { until });
         scene_deadline
             .into_iter()
+            .chain(direct_cursor_retry_deadline)
             .chain(source_wait_deadline)
             .chain(rescan_deadline)
             // Not gated on `allow_kms_timers`: `maybe_composite` closes the
@@ -2961,6 +3093,7 @@ impl KmsBackend {
         // Animated-cursor frame advance — after both gates above so
         // DPMS-off / VT-away never uploads (spec "DPMS / VT gating").
         self.tick_cursor_animation();
+        self.retry_due_direct_cursor_refreshes_on_timer();
         // Check visibility and current scene ownership before the held-direct
         // return below. Pointer motion from a dead zone wakes this pass.
         self.prepare_tearing_scene_pass();

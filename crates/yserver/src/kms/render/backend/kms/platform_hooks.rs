@@ -151,6 +151,9 @@ impl Platform for PlatformBackend {
             return;
         }
         if !b.platform.any_cursor_plane_visible() {
+            for output_idx in 0..b.platform.outputs.len() {
+                b.platform.clear_direct_cursor_retry(output_idx);
+            }
             b.pstate
                 .scanout_m2
                 .clear_all_direct_cursor_refresh_pending();
@@ -162,6 +165,7 @@ impl Platform for PlatformBackend {
         let mut failed = false;
         for output_idx in 0..b.platform.outputs.len() {
             if !b.platform.cursor_plane_visible_for_output(output_idx) {
+                b.platform.clear_direct_cursor_retry(output_idx);
                 b.pstate
                     .scanout_m2
                     .clear_direct_cursor_refresh_pending(output_idx);
@@ -176,11 +180,16 @@ impl Platform for PlatformBackend {
                 });
             match b.platform.cursor_plane_hide_on_crtc(output_idx) {
                 Ok(()) => {
+                    b.platform.clear_direct_cursor_retry(output_idx);
                     b.pstate
                         .scanout_m2
                         .clear_direct_cursor_refresh_pending(output_idx);
                 }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock
+                        || error.raw_os_error() == Some(libc::EBUSY) =>
+                {
+                    b.platform.clear_direct_cursor_retry(output_idx);
                     b.pstate
                         .scanout_m2
                         .mark_direct_cursor_refresh_pending(output_idx);
@@ -193,12 +202,14 @@ impl Platform for PlatformBackend {
                         && error.raw_os_error() != Some(libc::EINVAL)
                         && error.raw_os_error() != Some(libc::EBUSY) =>
                 {
-                    b.pstate
-                        .scanout_m2
-                        .mark_direct_cursor_refresh_pending(output_idx);
-                    log::warn!(
-                        "scanout_m2: cursor hide failed on output {output_idx}: {error}; retrying on CRTC event"
-                    );
+                    if !b.schedule_direct_cursor_retry(
+                        output_idx,
+                        "hide",
+                        &error,
+                        "cursor_hide_failed",
+                    ) {
+                        failed = true;
+                    }
                 }
                 Err(error) => {
                     log::warn!(
