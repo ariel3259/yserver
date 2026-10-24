@@ -1,6 +1,6 @@
 # Variable refresh rate (VRR / adaptive sync) — design
 
-**Date:** 2026-10-23 · **Status:** approved by the user (2026-10-23), reviewed once (sol); plan waits for the gamma PR (#293) verdict · **Scope:** KMS backend,
+**Date:** 2026-10-23 · **Status:** approved by the user (2026-10-23), reviewed once (sol); gamma (#293) merged as 6d83dcb9; plan `docs/superpowers/plans/2026-10-24-vrr.md` · **Scope:** KMS backend,
 one output covered by a client window in direct scanout; cursor behaviour while VRR is active.
 
 ## Why
