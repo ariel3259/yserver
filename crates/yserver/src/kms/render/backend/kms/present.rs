@@ -495,6 +495,7 @@ impl KmsBackend {
                     ust,
                     source: yserver_core::backend::PresentClockSource::IdleSequence,
                 },
+                None,
             );
         }
         log::debug!(
@@ -919,7 +920,7 @@ impl KmsBackend {
         let direct_outputs: Vec<_> = (0..self.platform.outputs.len()).collect();
         if self
             .platform
-            .cursor_commit_in_flight_for_outputs(&direct_outputs)
+            .scanout_commit_in_flight_for_outputs(&direct_outputs)
         {
             if self.pstate.scanout_m2.current.is_some() {
                 // A fully-retired direct frame owns the current slot. Keep

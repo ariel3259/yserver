@@ -1066,7 +1066,7 @@ impl KmsBackend {
         let direct_outputs: Vec<_> = (0..self.platform.outputs.len()).collect();
         if self
             .platform
-            .cursor_commit_in_flight_for_outputs(&direct_outputs)
+            .scanout_commit_in_flight_for_outputs(&direct_outputs)
         {
             return;
         }
@@ -1391,7 +1391,7 @@ impl KmsBackend {
         let output_indices: Vec<_> = (0..self.platform.outputs.len()).collect();
         if self
             .platform
-            .cursor_commit_in_flight_for_outputs(&output_indices)
+            .scanout_commit_in_flight_for_outputs(&output_indices)
         {
             return Ok(false);
         }
@@ -1495,7 +1495,7 @@ impl KmsBackend {
             // Copy replaces the retained direct frame in the same commit.
             && (!self.pstate.tearing.is_on() || tearing_cursor_handoff)
             && self.direct_scanout_topology_eligible()
-            && !self.platform.cursor_commit_in_flight_for_outputs(&outputs)
+            && !self.platform.scanout_commit_in_flight_for_outputs(&outputs)
             && outputs.iter().all(|&output_idx| {
                 self.platform.route(output_idx) == OutputRoute::Shared
                     && self.platform.outputs[output_idx]
@@ -2641,7 +2641,7 @@ impl KmsBackend {
             && !self.pstate.scanout_m2.unflip_outputs_to_replace.is_empty();
         let unflip_waiting_for_cursor = self.pstate.scanout_m2.current.is_some()
             && self.pstate.scanout_m2.unflip_requested
-            && self.platform.cursor_commit_in_flight_for_outputs(&outputs);
+            && self.platform.scanout_commit_in_flight_for_outputs(&outputs);
         if unflip_waiting_for_cursor {
             // The cursor flip event is the next progress source. Re-arming an
             // immediate scene wake here would spin while the grouped unflip is
@@ -2819,6 +2819,19 @@ impl KmsBackend {
             if direct_retired || scene_retired {
                 self.telemetry.record_frame_present();
             }
+            // A CRTC waiting for a per-CRTC modeset takes no new gamma-only
+            // commit; the pending LUT is applied after the modeset.
+            if self.pstate.crtc_config_gated_crtc.is_some_and(|gated| {
+                self.platform.outputs.get(output_idx).is_some_and(|output| {
+                    crate::kms::render::platform::CrtcKey::for_output(output) == gated
+                })
+            }) {
+                continue;
+            }
+            if !self.gamma_output_has_queued_scanout(output_idx) {
+                self.platform
+                    .retry_pending_gamma_after_flip(output_idx, self.monotonic_now());
+            }
         }
         // Idle vblank arming: clear the arm + advance the Present clock for
         // each CRTC sequence the kernel delivered. The run loop reads the
@@ -2954,6 +2967,19 @@ impl KmsBackend {
         } else {
             None
         };
+        let gamma_deadline = allow_kms_timers
+            .then(|| {
+                self.platform
+                    .outputs
+                    .iter()
+                    .filter_map(|layout| {
+                        (layout.output.pending_gamma_lut.borrow().is_some())
+                            .then_some(layout.output.pending_gamma_deadline.get())
+                            .flatten()
+                    })
+                    .min()
+            })
+            .flatten();
         let needs_source_wait_poll =
             self.pstate
                 .pending_present_source_waits
@@ -2972,6 +2998,7 @@ impl KmsBackend {
         scene_deadline
             .into_iter()
             .chain(direct_cursor_retry_deadline)
+            .chain(gamma_deadline)
             .chain(source_wait_deadline)
             .chain(rescan_deadline)
             // Not gated on `allow_kms_timers`: `maybe_composite` closes the
@@ -3057,6 +3084,21 @@ impl KmsBackend {
         if !self.kms_outputs_active {
             self.drain_paint_submit_telemetry();
             return Ok(());
+        }
+        let now = self.monotonic_now();
+        for output_idx in 0..self.platform.outputs.len() {
+            let deadline_expired = {
+                let output = &self.platform.outputs[output_idx].output;
+                output.pending_gamma_lut.borrow().is_some()
+                    && output
+                        .pending_gamma_deadline
+                        .get()
+                        .is_some_and(|deadline| now >= deadline)
+            };
+            if deadline_expired {
+                self.platform
+                    .retry_pending_gamma_after_flip(output_idx, now);
+            }
         }
         if self.pstate.tearing.is_on()
             && self

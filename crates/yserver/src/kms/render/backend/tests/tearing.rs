@@ -595,7 +595,7 @@ fn qualify_direct_async(
     }
 }
 
-fn enter_tearing_without_direct_scanout(
+pub(super) fn enter_tearing_without_direct_scanout(
     backend: &mut KmsBackend,
     window: u32,
     first_present: u64,
@@ -3862,6 +3862,13 @@ fn clone_test_drm_output(output: &crate::platform::drm::Output) -> crate::platfo
         plane_crtc_h_prop: output.plane_crtc_h_prop,
         plane_in_fence_fd_prop: output.plane_in_fence_fd_prop,
         crtc_out_fence_ptr_prop: output.crtc_out_fence_ptr_prop,
+        crtc_gamma_lut_prop: output.crtc_gamma_lut_prop,
+        crtc_gamma_lut_size: output.crtc_gamma_lut_size,
+        crtc_degamma_lut_prop: output.crtc_degamma_lut_prop,
+        crtc_ctm_prop: output.crtc_ctm_prop,
+        pending_gamma_lut: std::cell::RefCell::new(None),
+        pending_gamma_deadline: std::cell::Cell::new(None),
+        gamma_lut_disabled: std::cell::Cell::new(false),
         scanout_modifiers: output.scanout_modifiers.clone(),
         mm_width: output.mm_width,
         mm_height: output.mm_height,

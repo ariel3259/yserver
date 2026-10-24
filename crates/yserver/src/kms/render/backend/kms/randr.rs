@@ -1484,8 +1484,6 @@ impl KmsBackend {
             u16,
         )>,
     > {
-        use ::drm::control::Device as ControlDevice;
-
         let Some(layout) = self
             .platform
             .outputs
@@ -1498,12 +1496,27 @@ impl KmsBackend {
         let Some(device) = self.platform.device_for_output(&layout.key) else {
             return Ok(None);
         };
-        let info = device.device.get_crtc(crtc).map_err(|e| {
-            io::Error::other(format!(
-                "get_crtc gamma size for {output_key:?} failed: {e}"
-            ))
-        })?;
-        let size = u16::try_from(info.gamma_length()).unwrap_or(u16::MAX);
+        let size = if layout.output.crtc_gamma_lut_prop.is_some() {
+            let legacy_size = device
+                .atomic_commit_sink
+                .crtc_gamma_size(&device.device, crtc)
+                .map_err(|e| {
+                    io::Error::other(format!(
+                        "get_crtc gamma size for {output_key:?} failed: {e}"
+                    ))
+                })?;
+            if legacy_size == 0 {
+                layout
+                    .output
+                    .crtc_gamma_lut_size
+                    .map(|size| u16::try_from(size).unwrap_or(u16::MAX))
+                    .unwrap_or(0)
+            } else {
+                legacy_size
+            }
+        } else {
+            0
+        };
         Ok(Some((layout.key.device_key, crtc, size)))
     }
 
@@ -1555,8 +1568,6 @@ impl KmsBackend {
     }
 
     fn apply_gamma_to_live_output(&self, output_key: &OutputKey) -> io::Result<()> {
-        use ::drm::control::Device as ControlDevice;
-
         let Some((device_key, crtc, gamma_size)) = self.live_crtc_and_gamma_size(output_key)?
         else {
             return Ok(());
@@ -1568,10 +1579,75 @@ impl KmsBackend {
         let Some(device) = self.platform.device_for_key(device_key) else {
             return Ok(());
         };
-        device
-            .device
-            .set_gamma(crtc, &lut.red, &lut.green, &lut.blue)
-            .map_err(|e| io::Error::other(format!("set_gamma for {output_key:?} failed: {e}")))
+        let Some((output_idx, output)) = self
+            .platform
+            .outputs
+            .iter()
+            .enumerate()
+            .find(|(_, layout)| layout.key == *output_key)
+            .map(|(idx, layout)| (idx, &layout.output))
+        else {
+            return Ok(());
+        };
+        if output.crtc_gamma_lut_prop.is_some() && !output.gamma_lut_disabled.get() {
+            let now = self.monotonic_now();
+            let refresh_hz = match output.picked.vrefresh {
+                0 => 60,
+                refresh_hz => refresh_hz,
+            };
+            let refresh_period =
+                std::time::Duration::from_nanos(1_000_000_000 / u64::from(refresh_hz));
+            if output.pending_gamma_lut.borrow().is_none() {
+                let crtc_key = crate::kms::render::platform::CrtcKey::new(device_key, crtc);
+                let activity_now = crate::drm::atomic::monotonic_timestamp();
+                let last_page_flip = self
+                    .platform
+                    .present_get_last_page_flip_received_at(crtc_key);
+                let active = last_page_flip
+                    .zip(activity_now)
+                    .and_then(|(received_at, now)| now.checked_sub(received_at))
+                    .is_some_and(|age| age <= refresh_period.saturating_mul(2));
+                output
+                    .pending_gamma_deadline
+                    .set(active.then(|| now + refresh_period));
+            }
+            *output.pending_gamma_lut.borrow_mut() =
+                Some((lut.red.clone(), lut.green.clone(), lut.blue.clone()));
+            let deadline_elapsed = output
+                .pending_gamma_deadline
+                .get()
+                .is_none_or(|deadline| now >= deadline);
+            if deadline_elapsed
+                && self.scanout_allowed()
+                && self.kms_outputs_active
+                && !self.gamma_output_has_queued_scanout(output_idx)
+                && !device
+                    .atomic_commit_sink
+                    .page_flip_commit_in_flight(&device.device, crtc)
+            {
+                output.pending_gamma_deadline.set(None);
+                self.platform.submit_pending_gamma_for_output(output_idx)?;
+            } else if output.pending_gamma_deadline.get().is_none() {
+                output
+                    .pending_gamma_deadline
+                    .set(Some(now + refresh_period));
+            }
+            return Ok(());
+        }
+        Ok(())
+    }
+
+    /// A standalone LUT commit must leave queued scene and direct work first.
+    /// The output scheduler owns the detailed scene state; the CRTC's atomic
+    /// sink only reports commits that have already been accepted.
+    pub(super) fn gamma_output_has_queued_scanout(&self, output_idx: usize) -> bool {
+        self.scene.has_pending_page_flip(output_idx)
+            || self.scene.output_submit_retry_pending(output_idx)
+            || self.scene.owes_repaint()
+            || self.store.has_pending_presentation_damage()
+            || self.pstate.scanout_m2.pending.is_some()
+            || self.pstate.scanout_m2.queued_successor.is_some()
+            || self.pstate.scanout_m2.unflip_requested
     }
 
     pub(super) fn reapply_gamma_for_output(&self, output_key: &OutputKey) {

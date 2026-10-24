@@ -47,7 +47,63 @@ pub(crate) struct RecordingSceneFixture {
     extra_drawables: Vec<u32>,
 }
 
+/// Preserve the fixture's explicit Vulkan drop order while a test is unwinding.
+/// Mutation checks intentionally fail assertions; dropping the raw fixture in
+/// that path reports live Vulkan children before their device is destroyed.
+pub(crate) struct RecordingSceneFixtureGuard(Option<RecordingSceneFixture>);
+
+impl RecordingSceneFixtureGuard {
+    pub(crate) fn new(fixture: RecordingSceneFixture) -> Self {
+        Self(Some(fixture))
+    }
+
+    pub(crate) fn finish_after_normal_drain(mut self) {
+        self.0
+            .take()
+            .expect("recording scene fixture guard owns its fixture")
+            .finish_after_normal_drain();
+    }
+
+    pub(crate) fn events_mut(&mut self) -> &mut super::support::AtomicEventFixture {
+        &mut self
+            .0
+            .as_mut()
+            .expect("recording scene fixture guard owns its fixture")
+            .events
+    }
+}
+
+impl std::ops::Deref for RecordingSceneFixtureGuard {
+    type Target = RecordingSceneFixture;
+
+    fn deref(&self) -> &Self::Target {
+        self.0
+            .as_ref()
+            .expect("recording scene fixture guard owns its fixture")
+    }
+}
+
+impl std::ops::DerefMut for RecordingSceneFixtureGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0
+            .as_mut()
+            .expect("recording scene fixture guard owns its fixture")
+    }
+}
+
+impl Drop for RecordingSceneFixtureGuard {
+    fn drop(&mut self) {
+        if let Some(fixture) = self.0.take() {
+            fixture.finish();
+        }
+    }
+}
+
 impl RecordingSceneFixture {
+    pub(crate) fn cleanup_guard(self) -> RecordingSceneFixtureGuard {
+        RecordingSceneFixtureGuard::new(self)
+    }
+
     pub(crate) fn new(output_count: usize) -> Result<Option<Self>, String> {
         Self::with_route(output_count, P1SceneRoute::Shared)
     }
@@ -573,7 +629,28 @@ impl RecordingSceneFixture {
         self.extra_drawables.extend(xids);
     }
 
-    pub(crate) fn finish(self) {
+    fn release_test_cursor_for_drop(&mut self) {
+        if self.events.backend.cursor_records.contains_key(&0x7f10) {
+            // `finish_after_normal_drain` first verifies Master keeps its root
+            // cursor as the sticky default. The fixture teardown then clears
+            // that test-only root reference so the cursor's Vulkan image is
+            // destroyed before its device.
+            self.events.backend.core.active_cursor = None;
+            self.events.backend.refresh_effective_cursor();
+            let _ = Backend::free_cursor(&mut self.events.backend, None, 0x7f10);
+            Backend::before_block(&mut self.events.backend);
+        }
+    }
+
+    pub(crate) fn finish(mut self) {
+        self.release_test_cursor_for_drop();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.events.wait_for_submitted_gpu_work();
+        }));
+        self.events
+            .backend
+            .scene
+            .drain_all(&mut self.events.backend.platform);
         let super::support::AtomicEventFixture { mut backend, .. } = self.events;
         // XBackend drops PlatformBackend before SceneCompositor. Hold the
         // Vulkan owner until the scene's child handles have dropped too.
@@ -623,6 +700,7 @@ impl RecordingSceneFixture {
                 "master keeps the root's cursor as the sticky default"
             );
             assert!(self.events.backend.cursor_records.contains_key(&0x7f10));
+            self.release_test_cursor_for_drop();
         }
         // Wait for the GPU work the normal drains observed as retired before
         // any drawable it referenced is freed.

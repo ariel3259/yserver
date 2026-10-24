@@ -1,4 +1,5 @@
 use std::{
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     io,
     os::fd::BorrowedFd,
@@ -207,6 +208,24 @@ pub struct Output {
     /// Cached explicit-sync CRTC property. See
     /// [`Self::plane_in_fence_fd_prop`].
     pub crtc_out_fence_ptr_prop: Option<property::Handle>,
+    /// Cached atomic gamma properties. A missing `GAMMA_LUT` property means
+    /// this CRTC does not expose gamma correction.
+    pub crtc_gamma_lut_prop: Option<property::Handle>,
+    /// Raw `GAMMA_LUT_SIZE` property value. Used only when the legacy CRTC
+    /// gamma length is zero.
+    pub crtc_gamma_lut_size: Option<u64>,
+    pub crtc_degamma_lut_prop: Option<property::Handle>,
+    pub crtc_ctm_prop: Option<property::Handle>,
+    /// Newest gamma ramp waiting for a vsync commit. This handoff lives on
+    /// Output because scene, direct-scanout, and composed submits all receive
+    /// the output record and must retain the ramp after rejected commits.
+    pub(crate) pending_gamma_lut: RefCell<Option<GammaRamp>>,
+    /// First standalone-submit deadline for a gamma ramp deferred on an
+    /// active CRTC. Accepted or capability-rejected gamma commits clear it.
+    pub(crate) pending_gamma_deadline: Cell<Option<std::time::Instant>>,
+    /// Per-CRTC EINVAL capability latch: stop attaching the rejected
+    /// `GAMMA_LUT` property for the remainder of this output lifetime.
+    pub(crate) gamma_lut_disabled: Cell<bool>,
     /// DRM modifiers accepted by the primary plane for XRGB8888
     /// scanout, parsed from the optional IN_FORMATS property. Empty
     /// means the driver did not expose IN_FORMATS or parsing failed;
@@ -235,6 +254,136 @@ pub struct Output {
     /// selectable mode set (`GetOutputInfo` / `GetScreenResources`) and
     /// by `apply_crtc_config` to resolve a client-requested mode.
     pub modes: Vec<Mode>,
+}
+
+pub(crate) type GammaRamp = (Vec<u16>, Vec<u16>, Vec<u16>);
+
+impl Output {
+    pub(crate) fn cache_crtc_gamma_properties(&mut self, properties: Option<&PropMap>) {
+        self.crtc_gamma_lut_prop = properties.and_then(|props| props.id("GAMMA_LUT").ok());
+        self.crtc_gamma_lut_size = properties.and_then(|props| props.value("GAMMA_LUT_SIZE"));
+    }
+}
+
+/// Add the output's retained gamma ramp to a vsync request. The blob handle is
+/// returned for destruction after submit; accepted commits take their own
+/// kernel reference.
+pub(crate) fn append_pending_gamma_lut(
+    device: &Device,
+    sink: &AtomicCommitSink,
+    output: &Output,
+    request: &mut AtomicCommitRequest,
+) -> Option<u64> {
+    let gamma_prop = output.crtc_gamma_lut_prop?;
+    if output.gamma_lut_disabled.get() {
+        return None;
+    }
+    let pending = output.pending_gamma_lut.borrow().clone()?;
+    let Some(blob_bytes) = gamma_lut_blob_bytes(&pending) else {
+        log::error!(
+            "kms gamma: invalid pending LUT lengths on CRTC {:?}",
+            output.crtc
+        );
+        return None;
+    };
+    let blob = match sink.create_property_blob(device, &blob_bytes) {
+        Ok(blob) => blob,
+        Err(error) => {
+            log::warn!(
+                "kms gamma: could not create GAMMA_LUT blob for CRTC {:?}: {error}",
+                output.crtc
+            );
+            return None;
+        }
+    };
+    request.add_raw_property(output.crtc.into(), gamma_prop, blob);
+    if let Some(property) = output.crtc_degamma_lut_prop {
+        request.add_raw_property(output.crtc.into(), property, 0);
+    }
+    if let Some(property) = output.crtc_ctm_prop {
+        request.add_raw_property(output.crtc.into(), property, 0);
+    }
+    Some(blob)
+}
+
+/// Retire the userspace blob and update the pending/capability state after a
+/// commit attempt that included this output's gamma property. `latch_einval`
+/// is true for a gamma-only submit or when a frame's no-LUT retry succeeded.
+pub(crate) fn finish_pending_gamma_lut(
+    device: &Device,
+    sink: &AtomicCommitSink,
+    output: &Output,
+    blob: u64,
+    commit_result: &io::Result<u64>,
+    latch_einval: bool,
+) {
+    if let Err(error) = sink.destroy_property_blob(device, blob) {
+        log::warn!(
+            "kms gamma: could not destroy GAMMA_LUT blob {blob} for CRTC {:?}: {error}",
+            output.crtc
+        );
+    }
+    match commit_result {
+        Ok(_) => {
+            output.pending_gamma_lut.borrow_mut().take();
+            output.pending_gamma_deadline.set(None);
+        }
+        Err(error) if latch_einval && error.raw_os_error() == Some(libc::EINVAL) => {
+            if !output.gamma_lut_disabled.replace(true) {
+                log::warn!(
+                    "kms gamma: CRTC {:?} rejected GAMMA_LUT; disabling gamma for this CRTC",
+                    output.crtc
+                );
+            }
+            // The RandR cache remains intact; this CRTC will no longer try to
+            // submit its unsupported atomic property.
+            output.pending_gamma_lut.borrow_mut().take();
+            output.pending_gamma_deadline.set(None);
+        }
+        Err(_) => {}
+    }
+}
+
+/// Submit one frame with its pending LUT and retry that same frame without the
+/// LUT only when the first request returns EINVAL. Gamma is disabled only
+/// when the no-LUT retry succeeds; otherwise the pending ramp remains intact.
+pub(crate) fn submit_frame_with_pending_gamma_lut(
+    device: &Device,
+    sink: &AtomicCommitSink,
+    request: AtomicCommitRequest,
+    request_without_gamma: Option<AtomicCommitRequest>,
+    gamma_blobs: Vec<(&Output, u64)>,
+    mut submit: impl FnMut(AtomicCommitRequest) -> io::Result<u64>,
+) -> io::Result<u64> {
+    let result = submit(request);
+    let rejected_gamma = !gamma_blobs.is_empty()
+        && result
+            .as_ref()
+            .is_err_and(|error| error.raw_os_error() == Some(libc::EINVAL));
+    let retry_result = if rejected_gamma {
+        request_without_gamma.map(submit)
+    } else {
+        None
+    };
+    let latch_einval = retry_result.as_ref().is_some_and(Result::is_ok);
+    for (output, blob) in gamma_blobs {
+        finish_pending_gamma_lut(device, sink, output, blob, &result, latch_einval);
+    }
+    retry_result.unwrap_or(result)
+}
+
+fn gamma_lut_blob_bytes(pending: &GammaRamp) -> Option<Vec<u8>> {
+    let (red, green, blue) = pending;
+    if red.len() != green.len() || red.len() != blue.len() {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(red.len().checked_mul(8)?);
+    for ((red, green), blue) in red.iter().zip(green).zip(blue) {
+        for component in [*red, *green, *blue, 0] {
+            bytes.extend_from_slice(&component.to_ne_bytes());
+        }
+    }
+    Some(bytes)
 }
 
 /// Lightweight connector state used by RANDR's forced
@@ -836,9 +985,14 @@ fn finalize_output_with_mode(
     let plane_crtc_w_prop = plane_props_map.id("CRTC_W")?;
     let plane_crtc_h_prop = plane_props_map.id("CRTC_H")?;
     let plane_in_fence_fd_prop = plane_props_map.id("IN_FENCE_FD").ok();
-    let crtc_out_fence_ptr_prop = PropMap::for_object(device, asg.crtc)
-        .and_then(|props| props.id("OUT_FENCE_PTR"))
-        .ok();
+    let crtc_props = PropMap::for_object(device, asg.crtc).ok();
+    let crtc_out_fence_ptr_prop = crtc_props
+        .as_ref()
+        .and_then(|props| props.id("OUT_FENCE_PTR").ok());
+    let crtc_degamma_lut_prop = crtc_props
+        .as_ref()
+        .and_then(|props| props.id("DEGAMMA_LUT").ok());
+    let crtc_ctm_prop = crtc_props.as_ref().and_then(|props| props.id("CTM").ok());
     let scanout_modifiers = plane_scanout_modifiers(device, asg.plane)?;
 
     log::info!(
@@ -865,7 +1019,7 @@ fn finalize_output_with_mode(
     modes.sort_by_key(|m| !m.preferred);
     let modes = collapse_duplicate_modes(modes);
 
-    Ok(Output {
+    let mut output = Output {
         connector: asg.connector,
         connector_name: asg.connector_name,
         encoder: asg.encoder,
@@ -885,13 +1039,22 @@ fn finalize_output_with_mode(
         plane_crtc_h_prop,
         plane_in_fence_fd_prop,
         crtc_out_fence_ptr_prop,
+        crtc_gamma_lut_prop: None,
+        crtc_gamma_lut_size: None,
+        crtc_degamma_lut_prop,
+        crtc_ctm_prop,
+        pending_gamma_lut: RefCell::new(None),
+        pending_gamma_deadline: Cell::new(None),
+        gamma_lut_disabled: Cell::new(false),
         scanout_modifiers,
         mm_width,
         mm_height,
         edid,
         connector_type,
         modes,
-    })
+    };
+    output.cache_crtc_gamma_properties(crtc_props.as_ref());
+    Ok(output)
 }
 
 /// Name a connector exactly like Xorg's modesetting driver:
@@ -1113,7 +1276,7 @@ where
 }
 
 pub(crate) struct PropMap {
-    handles: HashMap<String, property::Info>,
+    properties: HashMap<String, (property::Handle, u64)>,
 }
 
 impl PropMap {
@@ -1122,16 +1285,38 @@ impl PropMap {
         H: drm::control::ResourceHandle,
     {
         let props = device.get_properties(handle)?;
-        Ok(Self {
-            handles: props.as_hashmap(device)?,
-        })
+        let mut properties = Vec::new();
+        for (property_handle, raw_value) in props.iter() {
+            let info = device.get_property(*property_handle)?;
+            properties.push((
+                info.name().to_str().unwrap().to_owned(),
+                info.handle(),
+                *raw_value,
+            ));
+        }
+        Ok(Self::from_discovered_properties(properties))
+    }
+
+    pub(crate) fn from_discovered_properties(
+        properties: impl IntoIterator<Item = (String, property::Handle, u64)>,
+    ) -> Self {
+        Self {
+            properties: properties
+                .into_iter()
+                .map(|(name, handle, value)| (name, (handle, value)))
+                .collect(),
+        }
     }
 
     pub(crate) fn id(&self, name: &str) -> io::Result<property::Handle> {
-        self.handles
+        self.properties
             .get(name)
-            .map(|info| info.handle())
+            .map(|(handle, _)| *handle)
             .ok_or_else(|| io::Error::other(format!("property {name:?} not exposed")))
+    }
+
+    pub(crate) fn value(&self, name: &str) -> Option<u64> {
+        self.properties.get(name).map(|(_, value)| *value)
     }
 }
 
@@ -1673,7 +1858,25 @@ pub(crate) fn submit_direct_scanout(
         crate::drm::async_flip::FlipTiming::Vsync => cursor_positions,
         crate::drm::async_flip::FlipTiming::Async => &[],
     };
-    let request = direct_scanout_request(fb, planes, cursor_positions);
+    let mut request = direct_scanout_request(fb, planes, cursor_positions);
+    let mut gamma_blobs = Vec::new();
+    let mut request_without_gamma = None;
+    if timing == crate::drm::async_flip::FlipTiming::Vsync {
+        for state in planes {
+            if state.output.crtc_gamma_lut_prop.is_some()
+                && !state.output.gamma_lut_disabled.get()
+                && state.output.pending_gamma_lut.borrow().is_some()
+                && request_without_gamma.is_none()
+            {
+                request_without_gamma = Some(request.clone());
+            }
+            if let Some(blob) =
+                append_pending_gamma_lut(device, atomic_commit_sink, state.output, &mut request)
+            {
+                gamma_blobs.push((state.output, blob));
+            }
+        }
+    }
     let events: Vec<_> = planes
         .iter()
         .map(|state| AtomicCommitEvent {
@@ -1694,13 +1897,22 @@ pub(crate) fn submit_direct_scanout(
             crate::drm::async_flip::FlipTiming::Vsync => AtomicCommitFlags::empty(),
             crate::drm::async_flip::FlipTiming::Async => AtomicCommitFlags::PAGE_FLIP_ASYNC,
         };
-    atomic_commit_sink.submit_tearing_with_commit_id(
+    submit_frame_with_pending_gamma_lut(
         device,
-        flags,
-        kind,
+        atomic_commit_sink,
         request,
-        &events,
-        tearing_context,
+        request_without_gamma,
+        gamma_blobs,
+        |request| {
+            atomic_commit_sink.submit_tearing_with_commit_id(
+                device,
+                flags,
+                kind,
+                request,
+                &events,
+                tearing_context,
+            )
+        },
     )
 }
 
@@ -1845,6 +2057,21 @@ pub(crate) fn submit_composed_scanout(
     for position in cursor_positions {
         request.add_cursor_position(*position);
     }
+    let has_pending_gamma = planes.iter().any(|state| {
+        let output = state.output;
+        output.crtc_gamma_lut_prop.is_some()
+            && !output.gamma_lut_disabled.get()
+            && output.pending_gamma_lut.borrow().is_some()
+    });
+    let request_without_gamma = has_pending_gamma.then(|| request.clone());
+    let mut gamma_blobs = Vec::new();
+    for state in planes {
+        if let Some(blob) =
+            append_pending_gamma_lut(device, atomic_commit_sink, state.output, &mut request)
+        {
+            gamma_blobs.push((state.output, blob));
+        }
+    }
     let events: Vec<_> = planes
         .iter()
         .map(|state| AtomicCommitEvent {
@@ -1860,12 +2087,21 @@ pub(crate) fn submit_composed_scanout(
     } else {
         AtomicCommitKind::SceneWithCursor
     };
-    atomic_commit_sink.submit_with_commit_id(
+    submit_frame_with_pending_gamma_lut(
         device,
-        AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK,
-        kind,
+        atomic_commit_sink,
         request,
-        &events,
+        request_without_gamma,
+        gamma_blobs,
+        |request| {
+            atomic_commit_sink.submit_with_commit_id(
+                device,
+                AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK,
+                kind,
+                request,
+                &events,
+            )
+        },
     )
 }
 

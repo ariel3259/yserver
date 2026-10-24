@@ -155,6 +155,25 @@ impl AtomicEventFixture {
         }
     }
 
+    pub(crate) fn queue_commit_completion_at(
+        &self,
+        device_fd: RawFd,
+        crtc: ::drm::control::crtc::Handle,
+        commit_id: u64,
+        frame: u32,
+        ust: Duration,
+        event_at_monotonic: Duration,
+    ) {
+        assert!(
+            !self.raw_event_writers.borrow().contains_key(&device_fd),
+            "explicit event receipt timestamps require the recording event source"
+        );
+        self.event_sources
+            .get(&device_fd)
+            .expect("completion device fd belongs to this fixture")
+            .queue_flip_with_cookie_at(crtc, frame, commit_id, ust, event_at_monotonic);
+    }
+
     pub(crate) fn queue_sequence_completion(
         &self,
         device_fd: RawFd,
@@ -325,6 +344,13 @@ pub(super) fn test_output(connector_name: String) -> crate::platform::drm::Outpu
         plane_crtc_h_prop: raw(1),
         plane_in_fence_fd_prop: None,
         crtc_out_fence_ptr_prop: None,
+        crtc_gamma_lut_prop: None,
+        crtc_gamma_lut_size: None,
+        crtc_degamma_lut_prop: None,
+        crtc_ctm_prop: None,
+        pending_gamma_lut: std::cell::RefCell::new(None),
+        pending_gamma_deadline: std::cell::Cell::new(None),
+        gamma_lut_disabled: std::cell::Cell::new(false),
         scanout_modifiers: Vec::new(),
         mm_width: 0,
         mm_height: 0,

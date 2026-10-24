@@ -39,6 +39,30 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   watchdog (measured, RTX 5060 Ti + Raphael). The helper now runs without `DISPLAY`: the same run enables HDMI-1 in
   0.83 s with no X connection from the helper (master: 30 s, watchdog, `Configure crtc failed`). Plan:
   [`plans/2026-10-23-probe-helper-no-display.md`](superpowers/plans/2026-10-23-probe-helper-no-display.md).
+- **2026-10-23 gamma through atomic `GAMMA_LUT` (branch `feat/gamma-atomic-lut`):** the gamma LUT moves from the
+  legacy `SETGAMMA` ioctl (a blocking atomic commit the kernel builds itself, which also clears `DEGAMMA_LUT`/`CTM`) to
+  a `GAMMA_LUT` blob of the legacy size on the CRTC's next vsync commit, or its own nonblocking commit when nothing is
+  in flight. `SETGAMMA` is removed (no target driver has legacy-only gamma; nvidia-drm got both in 545); a CRTC without
+  `GAMMA_LUT` reports gamma size 0. On an active CRTC (a page-flip event received within two refresh periods; the
+  receipt time, because nvidia-drm 615's flip UST is ~0.97 s behind `CLOCK_MONOTONIC`) the LUT waits up to one
+  refresh period for the next frame commit; a LUT that cannot go out at once gets the same deadline on an idle CRTC.
+  The RANDR gamma size does not change (#263 territory). Review round (#293): while DPMS is off a LUT only stays
+  pending and goes out on wake; `EINVAL` disables gamma on a CRTC only when the same frame then succeeds without the
+  LUT; a CRTC whose legacy gamma size is 0 uses `GAMMA_LUT_SIZE`. Measured, 30 gamma changes ~45 ms apart, mpv
+  60 fps, one output, skipped vblanks from flip events: NVIDIA RTX 5060 Ti master 33 → branch 0; AMD Raphael 34 → 23 (on
+  kernel 7.2.11 amdgpu delivers the event of a frame with a colour change one refresh late, on direct and composed
+  alike, and a standalone LUT commit holds the CRTC as long; a kernel-version matter, not bisected: the candidates
+  move DCN flip events to VUPDATE_NO_LOCK and hold them while the flip is pending, mainline 7.2, stable 7.1.6/7.1.8).
+  Known stall, amdgpu with two or more outputs on one device: a commit that changes the colour state takes a global
+  lock that waits, inside the ioctl and even with NONBLOCK, for the last commit of every CRTC to be done and flipped.
+  LUT commit ioctl p50 on Raphael, two outputs: 15 ms idle, 12 ms with mpv, max 34 ms (one output 0.6 ms; commits
+  without a colour change 0.02 ms); NVIDIA 0.07 ms. The server loop pays it once per LUT commit. A device-wide gate
+  (a LUT only while no other CRTC is in flight) took it to 0.58 ms but was dropped in review: with two outputs whose
+  commits alternate, the LUT can wait indefinitely; revisit only if normal use shows the stall matters. 0 `SETGAMMA`;
+  kernel LUT readback correct on every CRTC; colour and VT switch checked by eye on both cards.
+  (The earlier "8 → 0" for AMD came from mpv's drop counter, which counts only a late vo thread.) Revises the transport
+  decision of `specs/2026-06-18-randr-gamma-design.md`. Plan:
+  [`plans/2026-10-23-gamma-atomic-lut.md`](superpowers/plans/2026-10-23-gamma-atomic-lut.md).
 
 - **2026-10-23 macOS Settings window (branch `feat/macos-settings`, spec
   `specs/2026-10-23-macos-settings-design.md`):** app menu with About, Settings… (Cmd-,), Hide/Hide Others/Show All,

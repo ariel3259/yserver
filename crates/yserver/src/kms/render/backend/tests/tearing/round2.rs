@@ -2242,6 +2242,7 @@ fn deliver_clock_test_flip(
         .queue_flip_with_clock_samples(
             crtc,
             frame,
+            0,
             kernel_ust,
             Some(received_at_monotonic),
             Some(received_at_boottime),

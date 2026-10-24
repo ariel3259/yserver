@@ -96,6 +96,10 @@ const FLIP_TIMESTAMP_PLAUSIBLE_WINDOW: std::time::Duration = std::time::Duration
 /// Present still receives the original UST. Prefer monotonic when it is a
 /// plausible timestamp; NVIDIA's suspend-inclusive BOOTTIME-like UST can be
 /// recognized when it is ahead of monotonic but close to BOOTTIME at receipt.
+/// nvidia-drm 615.78.08 was also measured with UST ~0.97 s behind monotonic
+/// and BOOTTIME equal to monotonic (no suspend): not BOOTTIME, and inside the
+/// plausible window, so telemetry keeps that offset. Gamma activity uses the
+/// event's receipt time for this reason.
 fn completion_timestamp_monotonic(
     ust: std::time::Duration,
     received_monotonic: Option<std::time::Duration>,
@@ -259,6 +263,7 @@ impl RecordingPageFlipEventSource {
         self.queue_flip_with_clock_samples(
             crtc,
             frame,
+            0,
             ust,
             Some(event_at_monotonic),
             crate::drm::atomic::boottime_timestamp(),
@@ -269,6 +274,7 @@ impl RecordingPageFlipEventSource {
         &self,
         crtc: ::drm::control::crtc::Handle,
         frame: u32,
+        commit_id: u64,
         ust: std::time::Duration,
         event_at_monotonic: Option<std::time::Duration>,
         event_at_boottime: Option<std::time::Duration>,
@@ -276,7 +282,7 @@ impl RecordingPageFlipEventSource {
         self.flips.borrow_mut().push_back(KernelPageFlip {
             crtc,
             frame,
-            commit_id: 0,
+            commit_id,
             ust,
             event_at_monotonic,
             event_at_boottime,
@@ -290,14 +296,32 @@ impl RecordingPageFlipEventSource {
         commit_id: u64,
         ust: std::time::Duration,
     ) {
-        self.flips.borrow_mut().push_back(KernelPageFlip {
+        self.queue_flip_with_clock_samples(
             crtc,
             frame,
             commit_id,
             ust,
-            event_at_monotonic: crate::drm::atomic::monotonic_timestamp(),
-            event_at_boottime: crate::drm::atomic::boottime_timestamp(),
-        });
+            crate::drm::atomic::monotonic_timestamp(),
+            crate::drm::atomic::boottime_timestamp(),
+        );
+    }
+
+    pub(crate) fn queue_flip_with_cookie_at(
+        &self,
+        crtc: ::drm::control::crtc::Handle,
+        frame: u32,
+        commit_id: u64,
+        ust: std::time::Duration,
+        event_at_monotonic: std::time::Duration,
+    ) {
+        self.queue_flip_with_clock_samples(
+            crtc,
+            frame,
+            commit_id,
+            ust,
+            Some(event_at_monotonic),
+            crate::drm::atomic::boottime_timestamp(),
+        );
     }
 
     pub(crate) fn queue_sequence_for_tests(&self, user_data: u64, time_ns: i64, sequence: u64) {
@@ -380,6 +404,8 @@ impl PlatformBackend {
         let live: HashSet<CrtcKey> = self.outputs.iter().map(CrtcKey::for_output).collect();
         self.ust_msc.retain(|key, _| live.contains(key));
         self.completion_clocks.retain(|key, _| live.contains(key));
+        self.last_page_flip_received_at
+            .retain(|key, _| live.contains(key));
         self.software_msc.retain(|key, _| live.contains(key));
     }
 
@@ -704,7 +730,7 @@ impl PlatformBackend {
                 ust,
                 source: PresentClockSource::PageFlip,
             };
-            self.record_completion_clock(crtc_key, sample);
+            self.record_completion_clock(crtc_key, sample, flip.event_at_monotonic);
             log::debug!(
                 target: "present_pace",
                 "present_clock sample source=pageflip output={output_idx} msc={msc} ust={ust}"
@@ -747,6 +773,15 @@ impl PlatformBackend {
             })
     }
 
+    /// Latest page-flip event receipt for one CRTC, independent of newer
+    /// completion-eligible sequence samples.
+    pub(crate) fn present_get_last_page_flip_received_at(
+        &self,
+        crtc_key: CrtcKey,
+    ) -> Option<std::time::Duration> {
+        self.last_page_flip_received_at.get(&crtc_key).copied()
+    }
+
     /// Record a general vblank sample without allowing late events to move
     /// this CRTC domain's Present clock backwards.
     pub(crate) fn record_vblank_clock(&mut self, crtc_key: CrtcKey, msc: u64, ust: u64) {
@@ -760,12 +795,26 @@ impl PlatformBackend {
 
     /// Record a completion-eligible clock sample. At equal MSC, prefer a
     /// pageflip sample over an idle-sequence sample so provenance reflects
-    /// the stronger event if both arrive for the same field.
+    /// the stronger event if both arrive for the same field. A page-flip
+    /// receipt time is CLOCK_MONOTONIC and stays separate from kernel UST.
     pub(crate) fn record_completion_clock(
         &mut self,
         crtc_key: CrtcKey,
         sample: PresentClockSample,
+        page_flip_received_at: Option<std::time::Duration>,
     ) {
+        if let (PresentClockSource::PageFlip, Some(received_at)) =
+            (sample.source, page_flip_received_at)
+        {
+            let replace_last_page_flip = self
+                .last_page_flip_received_at
+                .get(&crtc_key)
+                .is_none_or(|old| received_at >= *old);
+            if replace_last_page_flip {
+                self.last_page_flip_received_at
+                    .insert(crtc_key, received_at);
+            }
+        }
         let replace = self.completion_clocks.get(&crtc_key).is_none_or(|old| {
             yserver_core::present_scheduler::msc_is_after(sample.msc, old.msc)
                 || (sample.msc == old.msc

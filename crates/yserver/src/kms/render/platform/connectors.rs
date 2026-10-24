@@ -692,6 +692,23 @@ impl PlatformBackend {
         let w = mode_spec.width;
         let h = mode_spec.height;
 
+        // The property cache is refreshed when a modeset replaces the
+        // Output record, but EINVAL is a per-CRTC capability latch and must
+        // survive that replacement when the kernel CRTC handle is unchanged.
+        if let Some(existing) = existing_idx
+            .and_then(|idx| self.outputs.get(idx))
+            .filter(|existing| existing.output.crtc == output.crtc)
+        {
+            output
+                .gamma_lut_disabled
+                .set(existing.output.gamma_lut_disabled.get());
+            *output.pending_gamma_lut.borrow_mut() =
+                existing.output.pending_gamma_lut.borrow().clone();
+            output
+                .pending_gamma_deadline
+                .set(existing.output.pending_gamma_deadline.get());
+        }
+
         if let Some((prepared_route, prepared)) = prepared_pool.as_ref() {
             if !needs_pool_realloc {
                 return Err(io::Error::new(
@@ -1069,13 +1086,13 @@ impl PlatformBackend {
     }
 
     /// Whether output `idx` still owes a page-flip event: a scene flip held
-    /// by its scanout pool or an accepted cursor-only commit on its CRTC.
+    /// by its scanout pool or an accepted CRTC commit such as cursor or gamma.
     pub(crate) fn output_owes_kms_event(&self, idx: usize) -> bool {
         self.scanout_pools
             .get(idx)
             .and_then(Option::as_ref)
             .is_some_and(|pool| pool.display_pool().has_pending_pageflip())
-            || self.cursor_atomic_event_pending_for_output(idx)
+            || self.scanout_commit_in_flight_for_output(idx)
     }
 
     /// Distrust every buffer-age record of output `idx` after a modeset, as

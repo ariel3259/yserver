@@ -19,7 +19,7 @@ use crate::drm::{
         AtomicCommitEvent, AtomicCommitKind, AtomicCommitRequest, AtomicCommitSink,
         CursorPlanePosition,
     },
-    modeset::{Output, PropMap},
+    modeset::{Output, PropMap, append_pending_gamma_lut, submit_frame_with_pending_gamma_lut},
 };
 
 #[cfg(target_os = "linux")]
@@ -285,13 +285,35 @@ pub(crate) fn submit_scene_flip_with_fences_tearing(
             crate::drm::async_flip::FlipTiming::Vsync => AtomicCommitFlags::empty(),
             crate::drm::async_flip::FlipTiming::Async => AtomicCommitFlags::PAGE_FLIP_ASYNC,
         };
-    atomic_commit_sink.submit_tearing_with_commit_id(
+    let mut request_without_gamma = None;
+    let gamma_blob = if timing == crate::drm::async_flip::FlipTiming::Vsync
+        && output.crtc_gamma_lut_prop.is_some()
+        && !output.gamma_lut_disabled.get()
+        && output.pending_gamma_lut.borrow().is_some()
+    {
+        request_without_gamma = Some(request.clone());
+        append_pending_gamma_lut(device, atomic_commit_sink, output, &mut request)
+    } else {
+        None
+    };
+    submit_frame_with_pending_gamma_lut(
         device,
-        flags,
-        kind,
+        atomic_commit_sink,
         request,
-        &[event],
-        tearing_context,
+        request_without_gamma,
+        gamma_blob
+            .map(|blob| vec![(output, blob)])
+            .unwrap_or_default(),
+        |request| {
+            atomic_commit_sink.submit_tearing_with_commit_id(
+                device,
+                flags,
+                kind,
+                request,
+                &[event],
+                tearing_context,
+            )
+        },
     )
 }
 
