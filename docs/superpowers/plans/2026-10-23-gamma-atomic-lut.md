@@ -240,6 +240,27 @@ one refresh of gamma latency.
 - Hardware: the same four runs (one/two outputs, idle/mpv) on AMD; target: LUT commits near the one-output cost with
   two outputs.
 
+### Task 7b: the device gate has no time bypass
+
+Measured after Task 7 on AMD (same four runs): two outputs still p50 15 ms idle and 12.7 ms with mpv. A traced burst
+shows the cause: a LUT that arrives while its own CRTC's previous commit is in flight is held with the one-refresh
+deadline, the deadline is spent waiting on that CRTC, and when its event finally arrives the expired deadline bypasses
+the device gate while the other CRTC is in flight; the ioctl then blocks 27 ms. With two outputs that are not in phase
+this happens almost every time.
+
+**Fix.** The device gate has no deadline exception: while another CRTC of the device has a commit in flight the LUT
+is not added, whatever its deadline. It goes out at the first frame, standalone attempt or device-wide flip-event
+retry at which no other CRTC is in flight; the wait is bounded by that CRTC's event (every in-flight commit has one).
+A frame is never held. An active CRTC keeps the Task 2 wait before its deadline. An expired deadline on a LUT held by
+the gate must not make the event loop wake immediately in a loop.
+
+- Test: output 0's LUT held past its deadline by its own commit, output 1 in flight when output 0's event arrives: no
+  LUT until output 1's event, then exactly one. Mutation: restore the deadline exception.
+- Test: the device stays busy past the deadline: the LUT does not go out at the deadline (replaces the Task 7 test).
+- Test: no immediate-timeout spin with a gate-held, expired deadline. Mutation: keep reporting the expired deadline.
+- Hardware: the four runs on AMD again; target: two-output LUT commits near the one-output cost (~0.6 ms), no frame
+  drops in mpv, gamma still applied on every CRTC (kernel readback).
+
 ### Task 8: docs
 
 The NVIDIA note: measured on nvidia-drm 615.78.08, the flip UST is about 0.97 s behind `CLOCK_MONOTONIC`, with
