@@ -292,7 +292,14 @@ pub(crate) fn submit_scene_flip_with_fences_tearing(
         && output.pending_gamma_lut.borrow().is_some()
     {
         request_without_gamma = Some(request.clone());
-        append_pending_gamma_lut(device, atomic_commit_sink, output, &mut request)
+        append_pending_gamma_lut(
+            device,
+            atomic_commit_sink,
+            output,
+            std::time::Instant::now(),
+            false,
+            &mut request,
+        )
     } else {
         None
     };

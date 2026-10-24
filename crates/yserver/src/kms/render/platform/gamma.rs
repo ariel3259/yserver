@@ -1,13 +1,21 @@
 use super::PlatformBackend;
-use crate::drm::{
-    atomic::{AtomicCommitEvent, AtomicCommitKind, AtomicCommitRequest},
-    modeset::{append_pending_gamma_lut, finish_pending_gamma_lut},
+use crate::{
+    drm::{
+        atomic::{AtomicCommitEvent, AtomicCommitKind, AtomicCommitRequest},
+        modeset::{append_pending_gamma_lut, finish_pending_gamma_lut},
+    },
+    kms::render::platform::CrtcKey,
 };
 
 impl PlatformBackend {
     /// Submit an idle output's pending ramp as an event-producing CRTC commit.
     /// An EBUSY rejection retains the ramp and waits for that CRTC's next event.
-    pub(crate) fn submit_pending_gamma_for_output(&self, output_idx: usize) -> std::io::Result<()> {
+    pub(crate) fn submit_pending_gamma_for_output(
+        &self,
+        output_idx: usize,
+        now: std::time::Instant,
+        force_other_crtc_busy: bool,
+    ) -> std::io::Result<()> {
         let Some(layout) = self.outputs.get(output_idx) else {
             return Ok(());
         };
@@ -28,6 +36,8 @@ impl PlatformBackend {
             &device.device,
             &device.atomic_commit_sink,
             output,
+            now,
+            force_other_crtc_busy,
             &mut request,
         ) else {
             return Ok(());
@@ -64,7 +74,7 @@ impl PlatformBackend {
         }
     }
 
-    /// Submit retained gamma after a page-flip event has freed this CRTC.
+    /// Retry retained gamma after a page-flip event frees a CRTC on its device.
     /// Pending gamma from an EBUSY rejection and gamma held behind an async
     /// flip both use the same event-driven path.
     pub(crate) fn retry_pending_gamma_after_flip(
@@ -78,18 +88,41 @@ impl PlatformBackend {
         if output.pending_gamma_lut.borrow().is_none() {
             return;
         }
-        if let Some(deadline) = output.pending_gamma_deadline.get() {
-            if now < deadline {
-                return;
-            }
-            output.pending_gamma_deadline.set(None);
+        let deadline_elapsed = output
+            .pending_gamma_deadline
+            .get()
+            .is_some_and(|deadline| now >= deadline);
+        if let Some(deadline) = output.pending_gamma_deadline.get()
+            && now < deadline
+            && self.gamma_output_is_active(output_idx)
+        {
+            return;
         }
-        if let Err(error) = self.submit_pending_gamma_for_output(output_idx) {
+        if let Err(error) = self.submit_pending_gamma_for_output(output_idx, now, deadline_elapsed)
+        {
             log::warn!(
                 "kms gamma: retry for CRTC {:?} failed: {error}",
                 output.crtc
             );
         }
+    }
+
+    /// Keep Task 2's one-refresh wait consistent between request-time
+    /// submission and retries triggered by another CRTC's page-flip event.
+    pub(crate) fn gamma_output_is_active(&self, output_idx: usize) -> bool {
+        let Some(layout) = self.outputs.get(output_idx) else {
+            return false;
+        };
+        let refresh_hz = match layout.output.picked.vrefresh {
+            0 => 60,
+            refresh_hz => refresh_hz,
+        };
+        let refresh_period = std::time::Duration::from_nanos(1_000_000_000 / u64::from(refresh_hz));
+        let activity_now = crate::drm::atomic::monotonic_timestamp();
+        self.present_get_last_page_flip_received_at(CrtcKey::for_output(layout))
+            .zip(activity_now)
+            .and_then(|(received_at, now)| now.checked_sub(received_at))
+            .is_some_and(|age| age <= refresh_period.saturating_mul(2))
     }
 
     /// Scene, direct-scanout, and composed scheduling share this gate so an

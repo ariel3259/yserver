@@ -2819,18 +2819,32 @@ impl KmsBackend {
             if direct_retired || scene_retired {
                 self.telemetry.record_frame_present();
             }
-            // A CRTC waiting for a per-CRTC modeset takes no new gamma-only
-            // commit; the pending LUT is applied after the modeset.
-            if self.pstate.crtc_config_gated_crtc.is_some_and(|gated| {
-                self.platform.outputs.get(output_idx).is_some_and(|output| {
-                    crate::kms::render::platform::CrtcKey::for_output(output) == gated
-                })
-            }) {
-                continue;
-            }
-            if !self.gamma_output_has_queued_scanout(output_idx) {
-                self.platform
-                    .retry_pending_gamma_after_flip(output_idx, self.monotonic_now());
+            // A page-flip event can free another CRTC's device-wide gamma
+            // hold. Retry pending ramps on this device, while keeping each
+            // target's queued scanout and per-CRTC modeset gate intact.
+            let event_device_key = self.platform.outputs[output_idx].key.device_key;
+            let now = self.monotonic_now();
+            for retry_output_idx in 0..self.platform.outputs.len() {
+                let same_device = self
+                    .platform
+                    .outputs
+                    .get(retry_output_idx)
+                    .is_some_and(|output| output.key.device_key == event_device_key);
+                if !same_device {
+                    continue;
+                }
+                let modeset_gated = self.pstate.crtc_config_gated_crtc.is_some_and(|gated| {
+                    self.platform
+                        .outputs
+                        .get(retry_output_idx)
+                        .is_some_and(|output| {
+                            crate::kms::render::platform::CrtcKey::for_output(output) == gated
+                        })
+                });
+                if !modeset_gated && !self.gamma_output_has_queued_scanout(retry_output_idx) {
+                    self.platform
+                        .retry_pending_gamma_after_flip(retry_output_idx, now);
+                }
             }
         }
         // Idle vblank arming: clear the arm + advance the Present clock for

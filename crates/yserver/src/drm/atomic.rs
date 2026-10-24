@@ -475,6 +475,21 @@ impl AtomicCommitSink {
             .is_some_and(|pending| !pending.is_empty())
     }
 
+    pub(crate) fn other_crtc_page_flip_commit_in_flight(
+        &self,
+        device: &Device,
+        crtc: crtc::Handle,
+    ) -> bool {
+        let device_fd = device.as_fd().as_raw_fd();
+        self.metrics
+            .borrow()
+            .pending_page_flips
+            .iter()
+            .any(|(key, pending)| {
+                key.device_fd == device_fd && key.crtc != crtc && !pending.is_empty()
+            })
+    }
+
     #[cfg(test)]
     pub(crate) fn new_with_monotonic_clock(
         executor: Rc<dyn AtomicCommitExecutor>,
