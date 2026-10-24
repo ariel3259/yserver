@@ -170,3 +170,78 @@ The LUT is never held longer than one refresh period.
 
 Gate (every task): fmt, `cargo build --bin yserver`, workspace + lavapipe ignored suite, clippy `-D warnings`,
 `tools/check-layout.sh`, FreeBSD cross-clippy; load runs per rule F.
+
+## Review round (#293, maintainer review 2026-10-24)
+
+Four defects, fixed as Tasks 4–7; one note corrected in Task 8. Each task: one implementation, one review, at most
+one fix round.
+
+### Task 4: gamma while DPMS is off only marks the LUT pending
+
+With DPMS off every CRTC has `ACTIVE=0`, and the kernel rejects a commit that requests an event on an inactive CRTC.
+`apply_gamma_to_live_output` sent the standalone `gamma-only` commit without checking the DPMS state, so a
+`SetCrtcGamma` from a night-light tool on a blanked screen got EINVAL, latched gamma off for good (the latch survives
+the modeset), and the DPMS-on reapply did nothing. The deadline paths are already gated on the outputs being on;
+the request path was not.
+
+**Fix.** While the outputs are off, `SetCrtcGamma` only stores the LUT as pending, with no commit. The DPMS-on path
+already marks the LUT pending again, and the next commit on the CRTC carries it.
+
+- Test: DPMS off, `SetCrtcGamma`: no atomic commit, gamma not latched off; DPMS on: the LUT reaches the CRTC and a
+  later `SetCrtcGamma` still applies. Mutation: drop the DPMS check.
+
+### Task 5: EINVAL latches gamma off only when the same frame succeeds without the LUT
+
+On the scene, direct-scanout and composed paths, any EINVAL on a commit carrying the LUT turned gamma off for that
+CRTC, even when a plane, the cursor or a modeset race caused it. The three paths already retry the frame without the
+LUT after an EINVAL.
+
+**Fix.** One helper shared by the three paths: submit with the LUT; on EINVAL, retry without it; latch gamma off only
+when that retry succeeds. When the retry fails too, the LUT stays pending and the retry's error is returned to the
+caller as today. The standalone `gamma-only` commit carries only colour properties and keeps its direct latch.
+
+- Test: a plane makes every commit fail with EINVAL while a LUT rides the frame: gamma stays enabled and the LUT stays
+  pending. Mutation: latch before the retry.
+- Test: only the commit carrying the LUT fails with EINVAL: the frame goes out without it, gamma is latched off once.
+  Mutation: never latch.
+
+### Task 6: gamma size from `GAMMA_LUT_SIZE` when the legacy size is 0
+
+A driver can expose `GAMMA_LUT` and `GAMMA_LUT_SIZE` without setting a legacy gamma size; the size then read 0 and
+RandR reported no gamma although the hardware has a LUT. New drivers are likely to look like that.
+
+**Fix.** When the legacy `gamma_length` is 0 and the CRTC has `GAMMA_LUT`, the size (RandR and blob) is
+`GAMMA_LUT_SIZE`. Where the legacy size is non-zero nothing changes.
+
+- Test: a CRTC with `GAMMA_LUT`, `GAMMA_LUT_SIZE` = 4096 and legacy size 0 reports 4096 to RandR and its blob has
+  4096 entries. Mutation: drop the fallback.
+- Test: legacy size 256 and `GAMMA_LUT_SIZE` 4096 still reports 256. Mutation: prefer `GAMMA_LUT_SIZE`.
+
+### Task 7: a LUT commit waits until no other CRTC of the device has a commit in flight
+
+Measured on AMD Raphael (two outputs, 30 gamma steps 30 ms apart, `strace -T`): commits carrying a LUT took p50 15 ms
+with an idle desktop and 12 ms with mpv on one output (gamma-only 27 ms), max 34 ms; with one output, 0.6 ms. Commits
+without a colour change took 0.02 ms. amdgpu takes a global lock for a commit that changes the colour state, and that
+lock waits for the last commit of every CRTC on the device to be done and flipped, inside the ioctl, even with
+NONBLOCK. With two outputs each CRTC's LUT waits for the other CRTC's flip. One LUT per CRTC per frame (newest wins)
+already held, so coalescing alone does not help.
+
+**Fix.** A pending LUT is added to a commit only when no other CRTC on the same device has a commit in flight;
+otherwise it stays pending. It is retried on the page-flip events of every CRTC of the device, and the existing
+one-refresh deadline still applies: at the deadline the LUT goes out even if the device is busy (the stall is then
+paid, as today), so it is never held longer. Frames without a LUT are unchanged. On other drivers the cost is at most
+one refresh of gamma latency.
+
+- Test: two outputs on one device, output 1 has a commit in flight: `SetCrtcGamma` on output 0 adds no LUT to any
+  commit until output 1's event, then exactly one commit carries it. Mutation: check only the LUT's own CRTC.
+- Test: the device stays busy past the deadline: the LUT goes out at the deadline. Mutation: drop the deadline
+  fallback for a busy device.
+- Hardware: the same four runs (one/two outputs, idle/mpv) on AMD; target: LUT commits near the one-output cost with
+  two outputs.
+
+### Task 8: docs
+
+The NVIDIA note: measured on nvidia-drm 615.78.08, the flip UST is about 0.97 s behind `CLOCK_MONOTONIC`, with
+`CLOCK_BOOTTIME` equal to `CLOCK_MONOTONIC` (no suspend since boot), so it is not BOOTTIME. The comment in
+`flip_events.rs` describing a suspend-inclusive UST ahead of monotonic stays; it gets one line for the offset behind
+it. `docs/status.md` entry for the review round.
