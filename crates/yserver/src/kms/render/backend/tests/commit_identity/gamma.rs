@@ -2823,22 +2823,119 @@ fn p1_gamma_busy_device_holds_lut_past_deadline_until_other_event() {
 }
 
 #[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: restore the deadline exception in append_pending_gamma_lut.
 fn p1_gamma_deadline_gate_waits_for_sibling_after_own_commit_event() {
-    let mut fixture = AtomicEventFixture::from_backend(KmsBackend::for_tests());
-    super::super::push_test_output(&mut fixture.backend, 2);
-    let fd = fixture.backend.platform.devices[0]
-        .device
-        .as_fd()
-        .as_raw_fd();
-    let recorder = fixture.recorders[&fd].clone();
-    let (output0_xid, crtc0) = enable_gamma(&mut fixture.backend, &recorder, 0, 4);
-    let (output1_xid, crtc1) = enable_gamma(&mut fixture.backend, &recorder, 1, 4);
+    let mut fixture = super::recording_scene::RecordingSceneFixture::new(2)
+        .expect("two-output recording scene fixture construction")
+        .expect("two-output recording scene fixture is available under lavapipe")
+        .cleanup_guard();
+    let fd = fixture.kms_fd(0);
+    let recorder = fixture.events.recorders[&fd].clone();
+    let (output0_xid, crtc0) = enable_gamma(&mut fixture.events.backend, &recorder, 0, 4);
+    let (output1_xid, crtc1) = enable_gamma(&mut fixture.events.backend, &recorder, 1, 4);
     assert_ne!(crtc0, crtc1);
-    fixture.backend.scene.scene_structure_dirty = false;
-    let (base, elapsed_ns) = install_controlled_gamma_clock(&mut fixture.backend, Duration::ZERO);
+    assert_eq!(
+        fixture.events.backend.platform.outputs[0].key.device_key,
+        fixture.events.backend.platform.outputs[1].key.device_key,
+        "both CRTCs belong to one recording device"
+    );
+    let initial_frames = super::atomic_events::submit_damaged_frame(&mut fixture);
+    let accepted_initial_frames: Vec<_> = initial_frames
+        .into_iter()
+        .filter_map(|(_, record)| {
+            (record.kind == AtomicCommitKind::Scene && accepted_event_id(&record).is_some())
+                .then_some(record)
+        })
+        .collect();
+    assert!(
+        !accepted_initial_frames.is_empty(),
+        "initial Backend scene frames are accepted"
+    );
+    for (index, initial_frame) in accepted_initial_frames.iter().enumerate() {
+        super::atomic_events::complete_recorded_attempt(
+            &mut fixture,
+            fd,
+            initial_frame,
+            accepted_event_id(initial_frame).expect("accepted initial frame has an ID"),
+            u32::try_from(index + 1).expect("initial frame count fits u32"),
+        );
+    }
+    let (base, elapsed_ns) =
+        install_controlled_gamma_clock(&mut fixture.events.backend, Duration::ZERO);
 
-    set_test_gamma(&mut fixture.backend, output1_xid, 0x9999);
+    let root = fixture.events.backend.core.window_id;
+    let frame_offset = recorder.records().len();
+    Backend::clear_area(
+        &mut fixture.events.backend,
+        None,
+        root,
+        0,
+        None,
+        0,
+        0,
+        800,
+        600,
+        (0, 0),
+    )
+    .expect("damage output 0 through Backend");
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("submit output 0 frame through Backend");
+    let output0_initial_frame = recorder
+        .records()
+        .into_iter()
+        .skip(frame_offset)
+        .find(|record| {
+            record.kind == AtomicCommitKind::Scene
+                && record.events.iter().any(|event| event.crtc == crtc0)
+                && accepted_event_id(record).is_some()
+        })
+        .expect("output 0's accepted Backend frame remains in flight");
+
+    set_test_gamma(&mut fixture.events.backend, output0_xid, 0xaaaa);
+    let deadline = fixture.events.backend.platform.outputs[0]
+        .output
+        .pending_gamma_deadline
+        .get()
+        .expect("output 0's in-flight Backend frame gives its LUT a deadline");
+    let device = Rc::clone(&fixture.events.backend.platform.devices[0].device);
+    let sink = Rc::clone(&fixture.events.backend.platform.devices[0].atomic_commit_sink);
+    let output0_frame_in_flight = sink.page_flip_commit_in_flight(&device, crtc0);
+    let output0_pending_before_event = fixture.events.backend.platform.outputs[0]
+        .output
+        .pending_gamma_lut
+        .borrow()
+        .is_some();
+    let no_output0_lut_before_event = !recorder
+        .records()
+        .iter()
+        .any(|record| contains_crtc_property(record, crtc0, handle(70)));
+
+    super::atomic_events::complete_recorded_attempt(
+        &mut fixture,
+        fd,
+        &output0_initial_frame,
+        accepted_event_id(&output0_initial_frame).expect("accepted initial frame has an ID"),
+        1,
+    );
+    let output0_pending_after_initial_event = fixture.events.backend.platform.outputs[0]
+        .output
+        .pending_gamma_lut
+        .borrow()
+        .is_some();
+    let output0_deadline_after_initial_event = fixture.events.backend.platform.outputs[0]
+        .output
+        .pending_gamma_deadline
+        .get();
+
+    let output1_key = CrtcKey::for_output(&fixture.events.backend.platform.outputs[1]);
+    fixture
+        .events
+        .backend
+        .platform
+        .last_page_flip_received_at
+        .insert(output1_key, Duration::ZERO);
+    set_test_gamma(&mut fixture.events.backend, output1_xid, 0x9999);
     let output1_gamma = recorder
         .records()
         .into_iter()
@@ -2849,71 +2946,67 @@ fn p1_gamma_deadline_gate_waits_for_sibling_after_own_commit_event() {
         })
         .expect("output 1 gamma-only commit is accepted and remains in flight");
 
-    let device = Rc::clone(&fixture.backend.platform.devices[0].device);
-    let sink = Rc::clone(&fixture.backend.platform.devices[0].atomic_commit_sink);
-    sink.submit_with_commit_id(
-        &device,
-        ::drm::control::AtomicCommitFlags::PAGE_FLIP_EVENT
-            | ::drm::control::AtomicCommitFlags::NONBLOCK,
-        AtomicCommitKind::Scene,
-        AtomicCommitRequest::new(),
-        &[AtomicCommitEvent {
-            crtc: crtc0,
-            motion_timestamp: None,
-        }],
+    let frame_offset = recorder.records().len();
+    Backend::clear_area(
+        &mut fixture.events.backend,
+        None,
+        root,
+        0,
+        None,
+        0,
+        0,
+        800,
+        600,
+        (0, 0),
     )
-    .expect("output 0's frame commit is accepted while output 1 is in flight");
+    .expect("damage output 0 again through Backend");
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("submit output 0 frame while output 1 is in flight");
     let output0_frame = recorder
         .records()
         .into_iter()
+        .skip(frame_offset)
         .find(|record| {
             record.kind == AtomicCommitKind::Scene
                 && record.events.iter().any(|event| event.crtc == crtc0)
                 && accepted_event_id(record).is_some()
         })
-        .expect("output 0's accepted frame remains in flight");
-
-    set_test_gamma(&mut fixture.backend, output0_xid, 0xaaaa);
-    let deadline = fixture.backend.platform.outputs[0]
-        .output
-        .pending_gamma_deadline
-        .get()
-        .expect("output 0's in-flight frame gives its LUT a deadline");
-    let output0_pending_before_event = fixture.backend.platform.outputs[0]
-        .output
-        .pending_gamma_lut
-        .borrow()
-        .is_some();
-    let no_output0_lut_before_event = !recorder
-        .records()
-        .iter()
-        .any(|record| contains_crtc_property(record, crtc0, handle(70)));
+        .expect("output 0's frame is accepted while output 1 is in flight");
+    let output0_frame_omits_lut = !contains_crtc_property(&output0_frame, crtc0, handle(70));
+    let output1_still_busy_before_deadline = sink.page_flip_commit_in_flight(&device, crtc1);
 
     elapsed_ns.store(16_666_667, Ordering::SeqCst);
-    complete_recorded_attempt(&mut fixture, fd, &output0_frame, 1);
+    super::atomic_events::complete_recorded_attempt(
+        &mut fixture,
+        fd,
+        &output0_frame,
+        accepted_event_id(&output0_frame).expect("accepted frame has an ID"),
+        2,
+    );
     let output0_lut_while_output1_busy = recorder
         .records()
         .iter()
         .filter(|record| contains_crtc_property(record, crtc0, handle(70)))
         .count();
-    let output0_pending_after_own_event = fixture.backend.platform.outputs[0]
+    let output0_pending_after_own_event = fixture.events.backend.platform.outputs[0]
         .output
         .pending_gamma_lut
         .borrow()
         .is_some();
-    let now = fixture.backend.monotonic_now();
+    let output1_still_busy_after_own_event = sink.page_flip_commit_in_flight(&device, crtc1);
+    let now = fixture.events.backend.monotonic_now();
     let no_expired_gamma_wakeup =
-        Backend::next_wakeup(&fixture.backend).is_none_or(|wakeup| wakeup > now);
+        Backend::next_wakeup(&fixture.events.backend).is_none_or(|wakeup| wakeup > now);
     if let Some(output0_gamma) = recorder.records().into_iter().find(|record| {
         record.kind == AtomicCommitKind::GammaOnly
             && contains_crtc_property(record, crtc0, handle(70))
             && accepted_event_id(record).is_some()
     }) {
-        complete_recorded_attempt(&mut fixture, fd, &output0_gamma, 2);
+        complete_recorded_attempt(&mut fixture.events, fd, &output0_gamma, 3);
     }
 
     let sibling_event_record_offset = recorder.records().len();
-    complete_recorded_attempt(&mut fixture, fd, &output1_gamma, 2);
+    complete_recorded_attempt(&mut fixture.events, fd, &output1_gamma, 3);
     let output0_gamma_after_sibling_event: Vec<_> = recorder
         .records()
         .into_iter()
@@ -2924,20 +3017,43 @@ fn p1_gamma_deadline_gate_waits_for_sibling_after_own_commit_event() {
                 && accepted_event_id(record).is_some()
         })
         .collect();
-    let output0_pending_after_sibling_event = fixture.backend.platform.outputs[0]
+    let output0_pending_after_sibling_event = fixture.events.backend.platform.outputs[0]
         .output
         .pending_gamma_lut
         .borrow()
         .is_some();
     if let Some(output0_gamma) = output0_gamma_after_sibling_event.first() {
-        complete_recorded_attempt(&mut fixture, fd, output0_gamma, 3);
+        complete_recorded_attempt(&mut fixture.events, fd, output0_gamma, 4);
     }
+
+    fixture.finish_after_normal_drain();
 
     assert_eq!(deadline, base + Duration::from_nanos(16_666_666));
     assert!(output0_pending_before_event, "output 0's LUT is pending");
     assert!(
+        output0_frame_in_flight,
+        "output 0's accepted Backend frame is in flight when its LUT gets a deadline"
+    );
+    assert!(
         no_output0_lut_before_event,
-        "output 0's frame carries no LUT while output 1 is in flight"
+        "output 0's initial frame carries no LUT"
+    );
+    assert!(
+        output0_pending_after_initial_event,
+        "output 0 keeps its LUT pending when its own event arrives before the deadline"
+    );
+    assert_eq!(
+        output0_deadline_after_initial_event,
+        Some(deadline),
+        "output 0's own event preserves its original deadline"
+    );
+    assert!(
+        output0_frame_omits_lut,
+        "output 0's frame is accepted without GAMMA_LUT while output 1 is in flight"
+    );
+    assert!(
+        output1_still_busy_before_deadline,
+        "output 1's gamma-only commit remains in flight"
     );
     assert_eq!(
         output0_lut_while_output1_busy, 0,
@@ -2946,6 +3062,10 @@ fn p1_gamma_deadline_gate_waits_for_sibling_after_own_commit_event() {
     assert!(
         output0_pending_after_own_event,
         "output 0 keeps its LUT pending after its own event"
+    );
+    assert!(
+        output1_still_busy_after_own_event,
+        "output 1 remains in flight when output 0's event retries the LUT"
     );
     assert!(
         no_expired_gamma_wakeup,
