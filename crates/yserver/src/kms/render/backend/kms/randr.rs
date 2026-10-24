@@ -1610,6 +1610,7 @@ impl KmsBackend {
                 .is_none_or(|deadline| now >= deadline);
             if deadline_elapsed
                 && self.scanout_allowed()
+                && self.kms_outputs_active
                 && !self.gamma_output_has_queued_scanout(output_idx)
                 && !device
                     .atomic_commit_sink

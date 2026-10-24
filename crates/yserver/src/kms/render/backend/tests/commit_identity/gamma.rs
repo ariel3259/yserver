@@ -1079,6 +1079,266 @@ fn gamma_active_crtc_exposes_deadline_and_submits_once_when_no_frame_arrives() {
 }
 
 #[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: remove the kms_outputs_active condition from immediate GammaOnly
+// submission; the zero-commit assertion while DPMS is off must fail.
+fn p1_gamma_set_while_dpms_off_stays_pending_and_applies_after_wake() {
+    let context_backend = match KmsBackend::for_tests_with_vk() {
+        Ok(backend) => backend,
+        Err(error) if crate::kms::render::backend::tests::vulkan_absence_is_expected(&error) => {
+            eprintln!(
+                "SKIP p1_gamma_set_while_dpms_off_stays_pending_and_applies_after_wake: Vulkan ICD unavailable ({error})"
+            );
+            return;
+        }
+        Err(error) => panic!("unexpected Vulkan fixture setup error: {error}"),
+    };
+    let vk = Arc::clone(
+        context_backend
+            .platform
+            .gpu
+            .vk
+            .as_ref()
+            .expect("recording scene fixture provides a Vulkan context"),
+    );
+    let mut backend = KmsBackend::for_tests();
+    let layout = &backend.platform.outputs[0];
+    let scanout_pool = crate::kms::vk::scanout::ScanoutBoPool::for_tests_on_screen_framebuffer(
+        vk,
+        Rc::clone(&backend.platform.devices[0].device),
+        layout.scanout_route,
+        u32::from(layout.width),
+        u32::from(layout.height),
+        handle(0x8801),
+    );
+    backend.platform.scanout_pools[0] =
+        Some(crate::kms::vk::scanout::OutputScanout::Shared(scanout_pool));
+    backend.platform.for_tests_accept_output_power_commits();
+    let mut fixture = AtomicEventFixture::from_backend(backend);
+    let fd = fixture.backend.platform.devices[0]
+        .device
+        .as_fd()
+        .as_raw_fd();
+    let recorder = fixture.recorders[&fd].clone();
+    let (crtc_xid, crtc) = enable_gamma(&mut fixture.backend, &recorder, 0, 4);
+    fixture.backend.scene.scene_structure_dirty = false;
+    let (base, elapsed_ns) = install_controlled_gamma_clock(&mut fixture.backend);
+
+    Backend::set_dpms_power(&mut fixture.backend, 3).expect("DPMS off through Backend");
+    assert!(
+        !fixture.backend.kms_outputs_active,
+        "DPMS turns outputs off"
+    );
+    let crtc_key = CrtcKey::for_output(&fixture.backend.platform.outputs[0]);
+    fixture
+        .backend
+        .platform
+        .last_page_flip_received_at
+        .remove(&crtc_key);
+    assert!(!fixture.backend.scene.has_pending_page_flip(0));
+    assert!(!fixture.backend.scene.output_submit_retry_pending(0));
+    assert!(!fixture.backend.scene.owes_repaint());
+    assert!(!fixture.backend.store.has_pending_presentation_damage());
+    assert!(fixture.backend.pstate.scanout_m2.pending.is_none());
+    assert!(fixture.backend.pstate.scanout_m2.queued_successor.is_none());
+    let off_request_record_count = recorder.records().len();
+
+    let red = vec![0x1111; 4];
+    let green = vec![0x2222; 4];
+    let blue = vec![0x3333; 4];
+    Backend::set_crtc_gamma(&mut fixture.backend, crtc_xid, &red, &green, &blue)
+        .expect("set CRTC gamma while DPMS is off");
+
+    assert_eq!(
+        recorder.records().len(),
+        off_request_record_count,
+        "SetCrtcGamma while DPMS is off submits no atomic commit"
+    );
+    assert!(
+        !fixture.backend.platform.outputs[0]
+            .output
+            .gamma_lut_disabled
+            .get(),
+        "DPMS-off gamma does not latch GAMMA_LUT off"
+    );
+    assert_eq!(
+        fixture.backend.platform.outputs[0]
+            .output
+            .pending_gamma_lut
+            .borrow()
+            .as_ref(),
+        Some(&(red.clone(), green.clone(), blue.clone())),
+        "DPMS-off gamma remains pending"
+    );
+    let first_deadline = fixture.backend.platform.outputs[0]
+        .output
+        .pending_gamma_deadline
+        .get()
+        .expect("DPMS-off gamma keeps the existing refresh deadline");
+    assert_eq!(
+        first_deadline,
+        base + Duration::from_nanos(16_666_666),
+        "DPMS-off gamma retains its one-refresh deadline"
+    );
+
+    Backend::set_dpms_power(&mut fixture.backend, 0).expect("DPMS on through Backend");
+    assert!(fixture.backend.kms_outputs_active, "DPMS turns outputs on");
+    assert!(
+        fixture.backend.platform.outputs[0]
+            .output
+            .pending_gamma_lut
+            .borrow()
+            .is_some(),
+        "DPMS-on reapply retains the pending LUT until the existing wake path sends it"
+    );
+    assert_eq!(
+        fixture.backend.platform.outputs[0]
+            .output
+            .pending_gamma_deadline
+            .get(),
+        Some(first_deadline),
+        "DPMS-on reapply preserves the pending deadline"
+    );
+    assert!(
+        recorder.records()[off_request_record_count..]
+            .iter()
+            .all(|record| record.kind != AtomicCommitKind::GammaOnly),
+        "DPMS-on reapply does not submit before the existing deadline"
+    );
+
+    elapsed_ns.store(16_666_667, Ordering::SeqCst);
+    Backend::maybe_composite(&mut fixture.backend)
+        .expect("expired post-wake gamma deadline submits");
+    let first_gamma = recorder
+        .records()
+        .into_iter()
+        .find(|record| {
+            record.kind == AtomicCommitKind::GammaOnly
+                && contains_crtc_property(record, crtc, handle(70))
+        })
+        .expect("post-wake GammaOnly commit carries GAMMA_LUT");
+    assert!(
+        accepted_event_id(&first_gamma).is_some(),
+        "post-wake GAMMA_LUT commit has an injected P1 commit ID"
+    );
+    let first_blob_id = first_gamma
+        .properties
+        .iter()
+        .find(|update| update.object == crtc.into() && update.property == handle(70))
+        .expect("post-wake commit updates this CRTC's GAMMA_LUT")
+        .value;
+    let first_blob = recorder
+        .created_property_blobs()
+        .into_iter()
+        .find(|(id, _)| *id == first_blob_id)
+        .expect("post-wake commit's GAMMA_LUT blob was recorded")
+        .1;
+    let expected_first_blob: Vec<u8> = red
+        .iter()
+        .zip(&green)
+        .zip(&blue)
+        .flat_map(|((&red, &green), &blue)| {
+            [red, green, blue, 0].into_iter().flat_map(u16::to_ne_bytes)
+        })
+        .collect();
+    assert_eq!(
+        first_blob, expected_first_blob,
+        "stored ramp reaches the CRTC"
+    );
+    assert!(
+        !fixture.backend.platform.outputs[0]
+            .output
+            .gamma_lut_disabled
+            .get(),
+        "successful post-wake LUT keeps gamma enabled"
+    );
+    assert!(
+        fixture.backend.platform.outputs[0]
+            .output
+            .pending_gamma_lut
+            .borrow()
+            .is_none(),
+        "successful post-wake commit consumes the pending LUT"
+    );
+    complete_recorded_attempt(&mut fixture, fd, &first_gamma, 1);
+
+    let later_red = vec![0x4444; 4];
+    let later_green = vec![0x5555; 4];
+    let later_blue = vec![0x6666; 4];
+    let later_request_record_count = recorder.records().len();
+    Backend::set_crtc_gamma(
+        &mut fixture.backend,
+        crtc_xid,
+        &later_red,
+        &later_green,
+        &later_blue,
+    )
+    .expect("later SetCrtcGamma still updates the CRTC");
+    assert_eq!(recorder.records().len(), later_request_record_count);
+    assert_eq!(
+        fixture.backend.platform.outputs[0]
+            .output
+            .pending_gamma_lut
+            .borrow()
+            .as_ref(),
+        Some(&(later_red.clone(), later_green.clone(), later_blue.clone())),
+        "later SetCrtcGamma remains pending behind the recent flip"
+    );
+
+    elapsed_ns.store(33_333_334, Ordering::SeqCst);
+    Backend::maybe_composite(&mut fixture.backend).expect("later gamma deadline submits");
+    let later_gamma = recorder
+        .records()
+        .into_iter()
+        .skip(later_request_record_count)
+        .find(|record| {
+            record.kind == AtomicCommitKind::GammaOnly
+                && contains_crtc_property(record, crtc, handle(70))
+        })
+        .expect("later GammaOnly commit still carries GAMMA_LUT");
+    assert!(accepted_event_id(&later_gamma).is_some());
+    let later_blob_id = later_gamma
+        .properties
+        .iter()
+        .find(|update| update.object == crtc.into() && update.property == handle(70))
+        .expect("later commit updates this CRTC's GAMMA_LUT")
+        .value;
+    let later_blob = recorder
+        .created_property_blobs()
+        .into_iter()
+        .find(|(id, _)| *id == later_blob_id)
+        .expect("later GAMMA_LUT blob was recorded")
+        .1;
+    let expected_later_blob: Vec<u8> = later_red
+        .iter()
+        .zip(&later_green)
+        .zip(&later_blue)
+        .flat_map(|((&red, &green), &blue)| {
+            [red, green, blue, 0].into_iter().flat_map(u16::to_ne_bytes)
+        })
+        .collect();
+    assert_eq!(
+        later_blob, expected_later_blob,
+        "later ramp reaches the CRTC"
+    );
+    assert!(
+        !fixture.backend.platform.outputs[0]
+            .output
+            .gamma_lut_disabled
+            .get()
+    );
+    assert!(
+        fixture.backend.platform.outputs[0]
+            .output
+            .pending_gamma_lut
+            .borrow()
+            .is_none()
+    );
+    complete_recorded_attempt(&mut fixture, fd, &later_gamma, 2);
+    fixture.assert_quiescent();
+}
+
+#[test]
 // Mutation: discard the pageflip timestamp when a newer idle sequence replaces the completion clock.
 fn gamma_activity_survives_a_newer_idle_sequence_sample() {
     let (mut backend, recorder, crtc_xid, crtc) = gamma_backend_with_recorder();
