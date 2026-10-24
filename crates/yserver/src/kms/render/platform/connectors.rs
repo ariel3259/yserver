@@ -705,6 +705,9 @@ impl PlatformBackend {
                 .set(existing.output.vrr_committed.get());
             output.vrr_disabled.set(existing.output.vrr_disabled.get());
             output
+                .vrr_clear_retry_used
+                .set(existing.output.vrr_clear_retry_used.get());
+            output
                 .gamma_lut_disabled
                 .set(existing.output.gamma_lut_disabled.get());
             *output.pending_gamma_lut.borrow_mut() =

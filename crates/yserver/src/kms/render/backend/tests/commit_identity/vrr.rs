@@ -16,6 +16,13 @@ use yserver_core::backend::{Backend, ModeSpec};
 
 const VRR_PROP_ID: u32 = 90;
 
+type PropertySignature = (String, String, u64);
+type CommitSignature = (
+    AtomicCommitKind,
+    ::drm::control::AtomicCommitFlags,
+    Vec<PropertySignature>,
+);
+
 fn handle<H: ::drm::control::ResourceHandle>(value: u32) -> H {
     ::drm::control::from_u32(value).expect("nonzero VRR test handle")
 }
@@ -39,6 +46,7 @@ fn vrr_backend() -> KmsBackend {
     output.connector_vrr_capable = true;
     output.vrr_committed.set(false);
     output.vrr_disabled.set(false);
+    output.vrr_clear_retry_used.set(false);
     backend.scene.scene_structure_dirty = false;
     backend
         .initialize_provider_output_sources()
@@ -96,7 +104,7 @@ fn apply_modeset_replacement(backend: &mut KmsBackend, mode_vrefresh: u32, crtc:
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: drop the same-CRTC VRR state carry-over in connector replacement.
+// Mutation: drop same-CRTC VRR state carry-over, including the bounded-clear marker.
 fn vrr_state_survives_output_replacement_on_same_crtc() {
     let Some(fixture) = super::recording_scene::RecordingSceneFixture::new(1)
         .expect("recording scene fixture construction")
@@ -113,39 +121,52 @@ fn vrr_state_survives_output_replacement_on_same_crtc() {
     let crtc = u32::from(backend.platform.outputs[0].output.crtc);
     backend.platform.outputs[0].output.vrr_committed.set(true);
     backend.platform.outputs[0].output.vrr_disabled.set(true);
+    backend.platform.outputs[0]
+        .output
+        .vrr_clear_retry_used
+        .set(true);
 
     apply_modeset_replacement(backend, 59, crtc);
 
     let output = &backend.platform.outputs[0].output;
-    assert_eq!(
+    let same_crtc_state = (
         u32::from(output.crtc),
-        crtc,
-        "the replacement keeps its CRTC"
-    );
-    assert!(
         output.vrr_committed.get(),
-        "the kernel-held value carries over"
+        output.vrr_disabled.get(),
+        output.vrr_clear_retry_used.get(),
     );
-    assert!(output.vrr_disabled.get(), "the EINVAL latch carries over");
 
     output.vrr_committed.set(true);
     output.vrr_disabled.set(true);
+    output.vrr_clear_retry_used.set(true);
     apply_modeset_replacement(backend, 58, crtc + 1);
     let output = &backend.platform.outputs[0].output;
-    assert_eq!(
+    let new_crtc_state = (
         u32::from(output.crtc),
+        output.vrr_committed.get(),
+        output.vrr_disabled.get(),
+        output.vrr_clear_retry_used.get(),
+    );
+    fixture.finish_after_normal_drain();
+
+    assert_eq!(same_crtc_state.0, crtc, "the replacement keeps its CRTC");
+    assert!(same_crtc_state.1, "the kernel-held value carries over");
+    assert!(same_crtc_state.2, "the EINVAL latch carries over");
+    assert!(same_crtc_state.3, "the bounded-clear marker carries over");
+    assert_eq!(
+        new_crtc_state.0,
         crtc + 1,
         "the replacement uses a new CRTC"
     );
+    assert!(!new_crtc_state.1, "a new CRTC starts with kernel state 0");
     assert!(
-        !output.vrr_committed.get(),
-        "a new CRTC starts with kernel state 0"
-    );
-    assert!(
-        !output.vrr_disabled.get(),
+        !new_crtc_state.2,
         "a new CRTC starts without an EINVAL latch"
     );
-    fixture.finish_after_normal_drain();
+    assert!(
+        !new_crtc_state.3,
+        "a new CRTC starts with a fresh clear budget"
+    );
 }
 
 struct VrrSnapshot(Vec<ConnectorSnapshot>);
@@ -204,6 +225,7 @@ fn set_vrr_capable(fixture: &mut super::recording_scene::RecordingSceneFixture) 
     output.connector_vrr_capable = true;
     output.vrr_committed.set(false);
     output.vrr_disabled.set(false);
+    output.vrr_clear_retry_used.set(false);
 }
 
 fn contains_vrr_property(
@@ -459,7 +481,7 @@ fn vrr_cow_owner_never_enables() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutations: write VRR_ENABLED = 0 unconditionally, or add one extra frame commit.
+// Mutations: write zero unconditionally, add a frame, alter property values, or change flags.
 fn vrr_not_capable_stream_unchanged() {
     let cases = [
         (
@@ -474,61 +496,45 @@ fn vrr_not_capable_stream_unchanged() {
         ),
         ("CRTC has no VRR_ENABLED", true, None),
     ];
-    let expected: Vec<(AtomicCommitKind, Vec<(String, String)>)> = vec![
+    let flags = ::drm::control::AtomicCommitFlags::PAGE_FLIP_EVENT
+        | ::drm::control::AtomicCommitFlags::NONBLOCK;
+    let prop = |id, value| ("1".to_owned(), format!("property::Handle({id})"), value);
+    let direct_properties = vec![
+        prop(71, 51028),
+        prop(72, 1),
+        prop(73, 0),
+        prop(74, 0),
+        prop(75, 52428800),
+        prop(76, 39321600),
+        prop(77, 0),
+        prop(78, 0),
+        prop(79, 800),
+        prop(80, 600),
+    ];
+    let expected: Vec<CommitSignature> = vec![
+        (AtomicCommitKind::Scene, flags, direct_properties.clone()),
+        (AtomicCommitKind::Scene, flags, direct_properties),
         (
             AtomicCommitKind::Scene,
+            flags,
             vec![
-                ("1".to_owned(), "property::Handle(71)".to_owned()),
-                ("1".to_owned(), "property::Handle(72)".to_owned()),
-                ("1".to_owned(), "property::Handle(73)".to_owned()),
-                ("1".to_owned(), "property::Handle(74)".to_owned()),
-                ("1".to_owned(), "property::Handle(75)".to_owned()),
-                ("1".to_owned(), "property::Handle(76)".to_owned()),
-                ("1".to_owned(), "property::Handle(77)".to_owned()),
-                ("1".to_owned(), "property::Handle(78)".to_owned()),
-                ("1".to_owned(), "property::Handle(79)".to_owned()),
-                ("1".to_owned(), "property::Handle(80)".to_owned()),
+                prop(71, 20993),
+                prop(72, 1),
+                prop(73, 0),
+                prop(74, 0),
+                prop(75, 0),
+                prop(76, 0),
+                prop(77, 0),
+                prop(78, 0),
+                prop(79, 0),
+                prop(80, 0),
+                prop(81, 0),
             ],
         ),
         (
             AtomicCommitKind::Scene,
-            vec![
-                ("1".to_owned(), "property::Handle(71)".to_owned()),
-                ("1".to_owned(), "property::Handle(72)".to_owned()),
-                ("1".to_owned(), "property::Handle(73)".to_owned()),
-                ("1".to_owned(), "property::Handle(74)".to_owned()),
-                ("1".to_owned(), "property::Handle(75)".to_owned()),
-                ("1".to_owned(), "property::Handle(76)".to_owned()),
-                ("1".to_owned(), "property::Handle(77)".to_owned()),
-                ("1".to_owned(), "property::Handle(78)".to_owned()),
-                ("1".to_owned(), "property::Handle(79)".to_owned()),
-                ("1".to_owned(), "property::Handle(80)".to_owned()),
-            ],
-        ),
-        (
-            AtomicCommitKind::Scene,
-            vec![
-                ("1".to_owned(), "property::Handle(71)".to_owned()),
-                ("1".to_owned(), "property::Handle(72)".to_owned()),
-                ("1".to_owned(), "property::Handle(73)".to_owned()),
-                ("1".to_owned(), "property::Handle(74)".to_owned()),
-                ("1".to_owned(), "property::Handle(75)".to_owned()),
-                ("1".to_owned(), "property::Handle(76)".to_owned()),
-                ("1".to_owned(), "property::Handle(77)".to_owned()),
-                ("1".to_owned(), "property::Handle(78)".to_owned()),
-                ("1".to_owned(), "property::Handle(79)".to_owned()),
-                ("1".to_owned(), "property::Handle(80)".to_owned()),
-                ("1".to_owned(), "property::Handle(81)".to_owned()),
-            ],
-        ),
-        (
-            AtomicCommitKind::Scene,
-            vec![
-                ("1".to_owned(), "property::Handle(71)".to_owned()),
-                ("1".to_owned(), "property::Handle(72)".to_owned()),
-                ("1".to_owned(), "property::Handle(81)".to_owned()),
-                ("1".to_owned(), "property::Handle(82)".to_owned()),
-            ],
+            flags,
+            vec![prop(71, 20992), prop(72, 1), prop(81, 0), prop(82, 0)],
         ),
     ];
     for (label, connector_capable, property) in cases {
@@ -542,6 +548,7 @@ fn vrr_not_capable_stream_unchanged() {
         output.connector_vrr_capable = connector_capable;
         output.vrr_committed.set(false);
         output.vrr_disabled.set(false);
+        output.vrr_clear_retry_used.set(false);
         let fd = super::direct_unflip::fd(&fixture);
         let recorder = fixture.events.recorders[&fd].clone();
         recorder.clear_records();
@@ -592,20 +599,13 @@ fn vrr_not_capable_stream_unchanged() {
             .expect("scene frame accepted")
             .1
             .clone();
-        assert!(
-            recorder.records().iter().all(|record| {
-                !record.properties.iter().any(|update| {
-                    update.object == crtc.into() && update.property == handle(VRR_PROP_ID)
-                })
-            }),
-            "{label} emits no VRR property"
-        );
-        let signature: Vec<_> = recorder
-            .records()
-            .into_iter()
+        let records = recorder.records();
+        let signature: Vec<_> = records
+            .iter()
             .map(|record| {
                 (
                     record.kind,
+                    record.flags,
                     record
                         .properties
                         .iter()
@@ -613,16 +613,17 @@ fn vrr_not_capable_stream_unchanged() {
                             (
                                 format!("{:?}", update.object),
                                 format!("{:?}", update.property),
+                                if matches!(u32::from(update.property), 81 | 82) {
+                                    0
+                                } else {
+                                    update.value
+                                },
                             )
                         })
                         .collect(),
                 )
             })
             .collect();
-        assert_eq!(
-            signature, expected,
-            "{label} changes the pre-VRR commit stream"
-        );
         super::atomic_events::complete_recorded_attempt(
             &mut fixture,
             fd,
@@ -631,6 +632,18 @@ fn vrr_not_capable_stream_unchanged() {
             62,
         );
         fixture.finish_after_normal_drain();
+        assert!(
+            records.iter().all(|record| {
+                !record.properties.iter().any(|update| {
+                    update.object == crtc.into() && update.property == handle(VRR_PROP_ID)
+                })
+            }),
+            "{label} emits no VRR property"
+        );
+        assert_eq!(
+            signature, expected,
+            "{label} changes the pre-VRR commit stream"
+        );
     }
 }
 
@@ -759,6 +772,241 @@ fn vrr_einval_latches_and_frame_goes_out() {
     );
     finish_direct_scanout(&mut fixture, &direct, fd);
     fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: keep appending VRR_ENABLED = 0 after the bounded retry also gets EINVAL.
+fn vrr_rejected_clear_is_bounded() {
+    let Some((fixture, mut direct)) = direct_fixture(18_008, 0) else {
+        eprintln!("skip: no Vulkan scene fixture available");
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    set_vrr_capable(&mut fixture);
+    let fd = super::direct_unflip::fd(&fixture);
+    let recorder = fixture.events.recorders[&fd].clone();
+    let initial = accepted_direct_record(&mut fixture, &direct, fd);
+    let initial_id = super::support::accepted_event_id(&initial).expect("direct event ID");
+    super::direct_unflip::complete_direct_initial(&mut fixture, &initial, initial_id, fd);
+    super::direct_unflip::drain_present_notifications(
+        &mut fixture,
+        &[direct.candidate.present_id],
+        &[],
+    );
+    let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+
+    recorder.script_result(Err(io::Error::from_raw_os_error(libc::EINVAL)));
+    super::direct_unflip::request_unflip(&mut fixture, &direct);
+    let unflip_offset = super::direct_unflip::record_count(&fixture, fd);
+    let unflip = super::direct_unflip::grouped_unflip_record(&mut fixture, fd, unflip_offset, 1);
+    let unflip_attempts = super::direct_unflip::records_since(&fixture, fd, unflip_offset);
+    let unflip_id = super::support::accepted_event_id(&unflip).expect("unflip retry event ID");
+    let committed_after_unflip = fixture.events.backend.platform.outputs[0]
+        .output
+        .vrr_committed
+        .get();
+    super::atomic_events::complete_recorded_attempt(&mut fixture, fd, &unflip, unflip_id, 81);
+    super::direct_unflip::drain_present_notifications(
+        &mut fixture,
+        &[],
+        &[direct.candidate.present_id],
+    );
+
+    recorder.script_result(Err(io::Error::from_raw_os_error(libc::EINVAL)));
+    let scene_offset = super::direct_unflip::record_count(&fixture, fd);
+    let scene_attempts = super::atomic_events::submit_damaged_frame(&mut fixture);
+    let scene = scene_attempts
+        .iter()
+        .find(|(_, record)| super::support::accepted_event_id(record).is_some())
+        .expect("scene frame accepted by the no-property retry")
+        .1
+        .clone();
+    let scene_records = super::direct_unflip::records_since(&fixture, fd, scene_offset);
+    let committed_after_scene = fixture.events.backend.platform.outputs[0]
+        .output
+        .vrr_committed
+        .get();
+    let disabled_after_scene = fixture.events.backend.platform.outputs[0]
+        .output
+        .vrr_disabled
+        .get();
+    let scene_id = super::support::accepted_event_id(&scene).expect("scene retry event ID");
+    super::atomic_events::complete_recorded_attempt(&mut fixture, fd, &scene, scene_id, 82);
+
+    let mut later_candidate = direct.candidate;
+    later_candidate.present_id = later_candidate.present_id.wrapping_add(2);
+    let mut later_event = direct.event.clone();
+    later_event.present_id = later_candidate.present_id;
+    later_event.serial = later_event.serial.wrapping_add(2);
+    let later_offset = super::direct_unflip::record_count(&fixture, fd);
+    let mut later_admitted = false;
+    for _ in 0..8 {
+        later_admitted = Backend::try_present_direct(
+            &mut fixture.events.backend,
+            later_candidate,
+            later_event.clone(),
+        )
+        .expect("later direct Present through Backend");
+        if later_admitted {
+            break;
+        }
+    }
+    assert!(later_admitted, "later direct Present passes admission");
+    let later = super::direct_unflip::records_since(&fixture, fd, later_offset)
+        .into_iter()
+        .find(|record| super::support::accepted_event_id(record).is_some())
+        .expect("later direct frame accepted");
+    let later_has_vrr = has_vrr_property(&later, crtc);
+    let later_id = super::support::accepted_event_id(&later).expect("later scene event ID");
+    super::direct_unflip::complete_direct_initial(&mut fixture, &later, later_id, fd);
+    super::direct_unflip::drain_present_notifications(
+        &mut fixture,
+        &[later_candidate.present_id],
+        &[],
+    );
+    direct.candidate = later_candidate;
+    direct.event = later_event;
+    finish_direct_scanout(&mut fixture, &direct, fd);
+    fixture.finish_after_normal_drain();
+
+    assert_eq!(unflip_attempts.len(), 2, "one clear request and its retry");
+    assert!(contains_vrr_property(&unflip_attempts[0], crtc, 0));
+    assert!(!has_vrr_property(&unflip_attempts[1], crtc));
+    assert!(
+        committed_after_unflip,
+        "rejected zero does not change kernel state"
+    );
+    assert_eq!(
+        scene_records.len(),
+        2,
+        "one bounded clear request and its retry"
+    );
+    assert!(contains_vrr_property(&scene_records[0], crtc, 0));
+    assert!(!has_vrr_property(&scene_records[1], crtc));
+    assert!(
+        committed_after_scene,
+        "rejected zero does not falsify committed state"
+    );
+    assert!(disabled_after_scene, "EINVAL latches VRR off for this CRTC");
+    assert!(
+        !later_has_vrr,
+        "the failed bounded clear is not repeated forever"
+    );
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: hard-code `reason=inherited` for a scene clear deferred by gamma.
+fn vrr_deferred_scene_clear_logs_the_direct_exit_reason() {
+    let Some((fixture, direct)) = direct_fixture(18_009, 0) else {
+        eprintln!("skip: no Vulkan scene fixture available");
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    set_vrr_capable(&mut fixture);
+    let fd = super::direct_unflip::fd(&fixture);
+    let recorder = fixture.events.recorders[&fd].clone();
+    recorder.set_gamma_size_for_tests(4);
+    let initial = accepted_direct_record(&mut fixture, &direct, fd);
+    let initial_id = super::support::accepted_event_id(&initial).expect("direct event ID");
+    super::direct_unflip::complete_direct_initial(&mut fixture, &initial, initial_id, fd);
+    super::direct_unflip::drain_present_notifications(
+        &mut fixture,
+        &[direct.candidate.present_id],
+        &[],
+    );
+    super::recording_scene::clear_vrr_test_logs();
+    let output_name = "vrr-deferred-exit-test";
+    fixture.events.backend.platform.outputs[0]
+        .key
+        .connector_name = output_name.to_owned();
+    fixture.events.backend.platform.outputs[0]
+        .output
+        .connector_name = output_name.to_owned();
+
+    {
+        let output = &mut fixture.events.backend.platform.outputs[0].output;
+        output.crtc_gamma_lut_prop = Some(handle(70));
+        output.crtc_degamma_lut_prop = Some(handle(71));
+        output.crtc_ctm_prop = Some(handle(72));
+        output.crtc_gamma_lut_size = Some(4);
+    }
+    let output_key = fixture.events.backend.platform.outputs[0].key.clone();
+    let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    fixture
+        .events
+        .backend
+        .pstate
+        .crtc_key_by_id
+        .insert(u32::from(crtc), output_key);
+    Backend::set_crtc_gamma(
+        &mut fixture.events.backend,
+        u32::from(crtc),
+        &[0x1111; 4],
+        &[0x2222; 4],
+        &[0x3333; 4],
+    )
+    .expect("queue gamma before unflip");
+
+    super::direct_unflip::request_unflip(&mut fixture, &direct);
+    let unflip_offset = super::direct_unflip::record_count(&fixture, fd);
+    let unflip = super::direct_unflip::grouped_unflip_record(&mut fixture, fd, unflip_offset, 1);
+    let unflip_has_gamma = unflip
+        .properties
+        .iter()
+        .any(|update| update.object == crtc.into() && update.property == handle(70));
+    let unflip_has_vrr = has_vrr_property(&unflip, crtc);
+    let unflip_id = super::support::accepted_event_id(&unflip).expect("unflip event ID");
+    super::atomic_events::complete_recorded_attempt(&mut fixture, fd, &unflip, unflip_id, 84);
+    super::direct_unflip::drain_present_notifications(
+        &mut fixture,
+        &[],
+        &[direct.candidate.present_id],
+    );
+    let reason_retained = fixture.events.backend.pstate.scanout_m2.unflip_last_reason
+        == Some("ineligible_authoritative_root_present");
+    let committed_after_gamma_unflip = fixture.events.backend.platform.outputs[0]
+        .output
+        .vrr_committed
+        .get();
+
+    let scene_attempts = super::atomic_events::submit_damaged_frame(&mut fixture);
+    let scene = scene_attempts
+        .iter()
+        .find(|(_, record)| super::support::accepted_event_id(record).is_some())
+        .expect("scene frame accepted after gamma")
+        .1
+        .clone();
+    let scene_has_vrr_clear = contains_vrr_property(&scene, crtc, 0);
+    let scene_id = super::support::accepted_event_id(&scene).expect("scene event ID");
+    super::atomic_events::complete_recorded_attempt(&mut fixture, fd, &scene, scene_id, 85);
+    let logs = super::recording_scene::vrr_test_logs();
+    fixture.finish_after_normal_drain();
+
+    assert!(unflip_has_gamma, "the unflip carries the pending gamma LUT");
+    assert!(!unflip_has_vrr, "gamma has priority over the VRR clear");
+    assert!(
+        committed_after_gamma_unflip,
+        "the deferred clear remains committed"
+    );
+    assert!(
+        reason_retained,
+        "the direct exit reason survives until the clear"
+    );
+    assert!(
+        scene_has_vrr_clear,
+        "the next scene carries VRR_ENABLED = 0"
+    );
+    assert!(
+        logs.lines().any(|line| {
+            line == format!(
+                "kms: vrr off output={output_name} crtc={} reason=ineligible_authoritative_root_present",
+                u32::from(crtc)
+            )
+        }),
+        "scene transition log must use the retained direct exit reason; logs={logs:?}"
+    );
 }
 
 #[test]

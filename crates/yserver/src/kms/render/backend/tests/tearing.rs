@@ -3869,6 +3869,7 @@ fn clone_test_drm_output(output: &crate::platform::drm::Output) -> crate::platfo
         connector_vrr_capable: output.connector_vrr_capable,
         vrr_committed: std::cell::Cell::new(false),
         vrr_disabled: std::cell::Cell::new(false),
+        vrr_clear_retry_used: std::cell::Cell::new(false),
         crtc_degamma_lut_prop: output.crtc_degamma_lut_prop,
         crtc_ctm_prop: output.crtc_ctm_prop,
         pending_gamma_lut: std::cell::RefCell::new(None),

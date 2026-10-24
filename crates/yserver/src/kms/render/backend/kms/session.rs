@@ -346,6 +346,7 @@ impl KmsBackend {
             self.platform.fb_dimensions(),
             self.pstate.tearing.is_on(),
         );
+        let vrr_before = self.vrr_committed_snapshot();
         let result = self.scene.tick(
             &input,
             &mut self.store,
@@ -353,6 +354,7 @@ impl KmsBackend {
             &mut self.telemetry,
             cow_host_xid,
         );
+        self.log_vrr_committed_changes(&vrr_before, None, "inherited");
         self.record_accepted_degraded_unflip_replacements();
         match result {
             Ok(_) => Ok(()),

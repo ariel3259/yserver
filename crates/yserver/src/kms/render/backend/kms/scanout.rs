@@ -1020,7 +1020,7 @@ impl KmsBackend {
         Ok(async_outcome)
     }
 
-    fn vrr_committed_snapshot(&self) -> Vec<bool> {
+    pub(in crate::kms::render::backend) fn vrr_committed_snapshot(&self) -> Vec<bool> {
         self.platform
             .outputs
             .iter()
@@ -1028,7 +1028,7 @@ impl KmsBackend {
             .collect()
     }
 
-    fn log_vrr_committed_changes(
+    pub(in crate::kms::render::backend) fn log_vrr_committed_changes(
         &self,
         before: &[bool],
         owner_window: Option<u32>,
@@ -3300,6 +3300,7 @@ impl KmsBackend {
             // its normal readiness and retry gates still control submission.
             self.scene.mark_scene_structure_dirty();
         }
+        let vrr_before = self.vrr_committed_snapshot();
         let composed_outputs = if self
             .tearing_cursor_compose_deadline(self.monotonic_now())
             .is_some()
@@ -3308,6 +3309,7 @@ impl KmsBackend {
         } else {
             self.compose_tick()
         };
+        self.log_vrr_committed_changes(&vrr_before, None, "inherited");
         // `scene.tick` drains already-signalled copied completions itself,
         // without entering backend_scanout_on_scanout_render_completion.
         self.record_accepted_degraded_unflip_replacements();

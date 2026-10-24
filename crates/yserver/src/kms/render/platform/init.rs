@@ -858,6 +858,7 @@ impl PlatformBackend {
                     connector_vrr_capable: false,
                     vrr_committed: std::cell::Cell::new(false),
                     vrr_disabled: std::cell::Cell::new(false),
+                    vrr_clear_retry_used: std::cell::Cell::new(false),
                     crtc_degamma_lut_prop: None,
                     crtc_ctm_prop: None,
                     pending_gamma_lut: std::cell::RefCell::new(None),

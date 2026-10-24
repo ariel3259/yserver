@@ -14,9 +14,10 @@ use crate::{
 use std::{
     collections::HashMap,
     io,
+    io::Write as _,
     os::fd::RawFd,
     rc::Rc,
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 use yserver_core::backend::Backend;
@@ -737,12 +738,52 @@ impl RecordingSceneFixture {
 }
 
 pub(in crate::kms::render::backend::tests) fn init_tearing_test_logger() {
+    let captured = VRR_TEST_LOGS.get_or_init(|| Arc::new(Mutex::new(String::new())));
     let _ = env_logger::Builder::new()
         .is_test(true)
-        .filter_level(log::LevelFilter::Error)
-        .filter_module("yserver", log::LevelFilter::Warn)
-        .filter_module("yserver_render", log::LevelFilter::Warn)
+        .filter_level(log::LevelFilter::Info)
+        .format(|buffer, record| {
+            if record.args().to_string().starts_with("kms: vrr ") {
+                writeln!(buffer, "{}", record.args())
+            } else {
+                Ok(())
+            }
+        })
+        .target(env_logger::Target::Pipe(Box::new(VrrTestLogWriter(
+            Arc::clone(captured),
+        ))))
         .try_init();
+}
+
+static VRR_TEST_LOGS: OnceLock<Arc<Mutex<String>>> = OnceLock::new();
+
+struct VrrTestLogWriter(Arc<Mutex<String>>);
+
+impl io::Write for VrrTestLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .expect("VRR test log buffer lock")
+            .push_str(&String::from_utf8_lossy(bytes));
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+pub(crate) fn clear_vrr_test_logs() {
+    if let Some(logs) = VRR_TEST_LOGS.get() {
+        logs.lock().expect("VRR test log buffer lock").clear();
+    }
+}
+
+pub(crate) fn vrr_test_logs() -> String {
+    VRR_TEST_LOGS
+        .get()
+        .map(|logs| logs.lock().expect("VRR test log buffer lock").clone())
+        .unwrap_or_default()
 }
 
 pub(in crate::kms::render::backend::tests) fn supports_vulkan_fed_scanout(
