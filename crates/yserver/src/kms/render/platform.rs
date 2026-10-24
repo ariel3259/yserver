@@ -524,10 +524,10 @@ pub struct PlatformBackend {
     /// The submit timing selected by the caller. Production initializes this
     /// to Vsync; the later Present policy may request Async for eligible work.
     pub(crate) requested_flip_timing: FlipTiming,
-    /// Scene flip timing and submission time are selected per output for one
-    /// `maybe_composite` pass. `None` preserves the legacy test/caller override
-    /// above; production sets every output on every pass, starting with Vsync.
-    pub(crate) scene_flip_timings: Vec<Option<(FlipTiming, std::time::Instant)>>,
+    /// Scene timing is selected per output for one `maybe_composite` pass.
+    /// `None` preserves the legacy test/caller override above; production sets
+    /// every output on every pass, starting with Vsync.
+    pub(crate) scene_flip_timings: Vec<Option<FlipTiming>>,
     /// A scene retirement attempted to hide a hardware cursor and failed.
     /// The backend consumes this to keep tearing's fallback diagnostic once.
     pub(crate) scene_cursor_hide_failed: bool,

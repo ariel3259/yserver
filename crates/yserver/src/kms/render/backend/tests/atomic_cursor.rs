@@ -1248,7 +1248,6 @@ fn direct_scanout_probe_tests_the_request_it_commits() {
         &[position],
         crate::drm::async_flip::FlipTiming::Vsync,
         crate::drm::atomic::TearingCommitContext::NONE,
-        std::time::Instant::now(),
     )
     .expect("record live direct commit");
 

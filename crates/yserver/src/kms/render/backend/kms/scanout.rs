@@ -937,7 +937,6 @@ impl KmsBackend {
         } else {
             crate::drm::async_flip::FlipTiming::Vsync
         };
-        let submit_at = self.monotonic_now();
         let mut result = crate::drm::modeset::submit_direct_scanout(
             &device,
             atomic_commit_sink.as_ref(),
@@ -950,7 +949,6 @@ impl KmsBackend {
                 frame.present_received_monotonic,
                 false,
             ),
-            submit_at,
         );
         let async_outcome = if attempt_timing == crate::drm::async_flip::FlipTiming::Async {
             match result {
@@ -978,7 +976,6 @@ impl KmsBackend {
                             frame.present_received_monotonic,
                             true,
                         ),
-                        submit_at,
                     );
                     crate::drm::async_flip::AsyncOutcome::FellBack { suspended }
                 }
@@ -1447,7 +1444,6 @@ impl KmsBackend {
             atomic_commit_sink.as_ref(),
             &planes,
             &cursor_positions,
-            self.monotonic_now(),
         );
         if let Err(error) = &result
             && atomic_commit_sink.take_last_cursor_rejection()
@@ -1649,7 +1645,6 @@ impl KmsBackend {
             atomic_commit_sink.as_ref(),
             &planes,
             &cursor_positions,
-            self.monotonic_now(),
         );
         if let Err(error) = &result
             && atomic_commit_sink.take_last_cursor_rejection()
@@ -2824,32 +2819,18 @@ impl KmsBackend {
             if direct_retired || scene_retired {
                 self.telemetry.record_frame_present();
             }
-            // A page-flip event can free another CRTC's device-wide gamma
-            // hold. Retry pending ramps on this device, while keeping each
-            // target's queued scanout and per-CRTC modeset gate intact.
-            let event_device_key = self.platform.outputs[output_idx].key.device_key;
-            let now = self.monotonic_now();
-            for retry_output_idx in 0..self.platform.outputs.len() {
-                let same_device = self
-                    .platform
-                    .outputs
-                    .get(retry_output_idx)
-                    .is_some_and(|output| output.key.device_key == event_device_key);
-                if !same_device {
-                    continue;
-                }
-                let modeset_gated = self.pstate.crtc_config_gated_crtc.is_some_and(|gated| {
-                    self.platform
-                        .outputs
-                        .get(retry_output_idx)
-                        .is_some_and(|output| {
-                            crate::kms::render::platform::CrtcKey::for_output(output) == gated
-                        })
-                });
-                if !modeset_gated && !self.gamma_output_has_queued_scanout(retry_output_idx) {
-                    self.platform
-                        .retry_pending_gamma_after_flip(retry_output_idx, now);
-                }
+            // A CRTC waiting for a per-CRTC modeset takes no new gamma-only
+            // commit; the pending LUT is applied after the modeset.
+            if self.pstate.crtc_config_gated_crtc.is_some_and(|gated| {
+                self.platform.outputs.get(output_idx).is_some_and(|output| {
+                    crate::kms::render::platform::CrtcKey::for_output(output) == gated
+                })
+            }) {
+                continue;
+            }
+            if !self.gamma_output_has_queued_scanout(output_idx) {
+                self.platform
+                    .retry_pending_gamma_after_flip(output_idx, self.monotonic_now());
             }
         }
         // Idle vblank arming: clear the arm + advance the Present clock for
@@ -2930,7 +2911,6 @@ impl KmsBackend {
         if self.platform.any_cursor_plane_visible() {
             return;
         }
-        let submit_at = self.monotonic_now();
         for output_idx in 0..self.platform.outputs.len() {
             let Some(shape) = self.platform.scene_async_shape(output_idx) else {
                 continue;
@@ -2939,11 +2919,8 @@ impl KmsBackend {
                 self.platform.outputs[output_idx].output.crtc,
             );
             if self.platform.async_ledger.allows(stream, &shape) {
-                self.platform.set_scene_flip_timing(
-                    output_idx,
-                    crate::drm::async_flip::FlipTiming::Async,
-                    submit_at,
-                );
+                self.platform
+                    .set_scene_flip_timing(output_idx, crate::drm::async_flip::FlipTiming::Async);
             }
         }
     }
@@ -2996,18 +2973,9 @@ impl KmsBackend {
                     .outputs
                     .iter()
                     .filter_map(|layout| {
-                        if layout.output.pending_gamma_lut.borrow().is_none() {
-                            return None;
-                        }
-                        let deadline = layout.output.pending_gamma_deadline.get()?;
-                        let device = self.platform.device_for_key(layout.key.device_key)?;
-                        let device_gate_held = device
-                            .atomic_commit_sink
-                            .other_crtc_page_flip_commit_in_flight(
-                                &device.device,
-                                layout.output.crtc,
-                            );
-                        (deadline > now || !device_gate_held).then_some(deadline)
+                        (layout.output.pending_gamma_lut.borrow().is_some())
+                            .then_some(layout.output.pending_gamma_deadline.get())
+                            .flatten()
                     })
                     .min()
             })
@@ -3052,13 +3020,9 @@ impl KmsBackend {
     pub(in crate::kms::render::backend) fn backend_scanout_maybe_composite(
         &mut self,
     ) -> io::Result<()> {
-        let scene_submit_at = self.monotonic_now();
         for output_idx in 0..self.platform.outputs.len() {
-            self.platform.set_scene_flip_timing(
-                output_idx,
-                crate::drm::async_flip::FlipTiming::Vsync,
-                scene_submit_at,
-            );
+            self.platform
+                .set_scene_flip_timing(output_idx, crate::drm::async_flip::FlipTiming::Vsync);
         }
         // GPU-reset recovery: once the renderer has observed a lost
         // device (a submit returned `ERROR_DEVICE_LOST` → `abort_flush`
@@ -3267,19 +3231,6 @@ impl KmsBackend {
             // eligible until every direct output has an accepted replacement;
             // its normal readiness and retry gates still control submission.
             self.scene.mark_scene_structure_dirty();
-        }
-        let scene_submit_at = self.monotonic_now();
-        for output_idx in 0..self.platform.outputs.len() {
-            let timing = self
-                .platform
-                .scene_flip_timings
-                .get(output_idx)
-                .copied()
-                .flatten()
-                .map(|(timing, _)| timing)
-                .unwrap_or(crate::drm::async_flip::FlipTiming::Vsync);
-            self.platform
-                .set_scene_flip_timing(output_idx, timing, scene_submit_at);
         }
         let composed_outputs = if self
             .tearing_cursor_compose_deadline(self.monotonic_now())

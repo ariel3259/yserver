@@ -220,9 +220,8 @@ pub struct Output {
     /// Output because scene, direct-scanout, and composed submits all receive
     /// the output record and must retain the ramp after rejected commits.
     pub(crate) pending_gamma_lut: RefCell<Option<GammaRamp>>,
-    /// First standalone-submit deadline for a gamma ramp deferred by CRTC
-    /// activity or another CRTC's in-flight commit. Accepted or
-    /// capability-rejected gamma commits clear it.
+    /// First standalone-submit deadline for a gamma ramp deferred on an
+    /// active CRTC. Accepted or capability-rejected gamma commits clear it.
     pub(crate) pending_gamma_deadline: Cell<Option<std::time::Instant>>,
     /// Per-CRTC EINVAL capability latch: stop attaching the rejected
     /// `GAMMA_LUT` property for the remainder of this output lifetime.
@@ -273,7 +272,6 @@ pub(crate) fn append_pending_gamma_lut(
     device: &Device,
     sink: &AtomicCommitSink,
     output: &Output,
-    now: std::time::Instant,
     request: &mut AtomicCommitRequest,
 ) -> Option<u64> {
     let gamma_prop = output.crtc_gamma_lut_prop?;
@@ -281,20 +279,6 @@ pub(crate) fn append_pending_gamma_lut(
         return None;
     }
     let pending = output.pending_gamma_lut.borrow().clone()?;
-    if sink.other_crtc_page_flip_commit_in_flight(device, output.crtc) {
-        if output.pending_gamma_deadline.get().is_none() {
-            let refresh_hz = match output.picked.vrefresh {
-                0 => 60,
-                refresh_hz => refresh_hz,
-            };
-            let refresh_period =
-                std::time::Duration::from_nanos(1_000_000_000 / u64::from(refresh_hz));
-            output
-                .pending_gamma_deadline
-                .set(Some(now + refresh_period));
-        }
-        return None;
-    }
     let Some(blob_bytes) = gamma_lut_blob_bytes(&pending) else {
         log::error!(
             "kms gamma: invalid pending LUT lengths on CRTC {:?}",
@@ -1866,7 +1850,6 @@ pub(crate) fn submit_direct_scanout(
     cursor_positions: &[CursorPlanePosition],
     timing: crate::drm::async_flip::FlipTiming,
     tearing_context: crate::drm::atomic::TearingCommitContext,
-    now: std::time::Instant,
 ) -> io::Result<u64> {
     if planes.is_empty() {
         return Err(io::Error::other("scanout M2: empty plane transaction"));
@@ -1887,13 +1870,9 @@ pub(crate) fn submit_direct_scanout(
             {
                 request_without_gamma = Some(request.clone());
             }
-            if let Some(blob) = append_pending_gamma_lut(
-                device,
-                atomic_commit_sink,
-                state.output,
-                now,
-                &mut request,
-            ) {
+            if let Some(blob) =
+                append_pending_gamma_lut(device, atomic_commit_sink, state.output, &mut request)
+            {
                 gamma_blobs.push((state.output, blob));
             }
         }
@@ -2027,7 +2006,6 @@ pub(crate) fn submit_composed_scanout(
     atomic_commit_sink: &AtomicCommitSink,
     planes: &[ComposedScanoutPlaneState<'_>],
     cursor_positions: &[CursorPlanePosition],
-    now: std::time::Instant,
 ) -> io::Result<u64> {
     if planes.is_empty() {
         return Err(io::Error::other("scanout M2: empty composed transaction"));
@@ -2089,7 +2067,7 @@ pub(crate) fn submit_composed_scanout(
     let mut gamma_blobs = Vec::new();
     for state in planes {
         if let Some(blob) =
-            append_pending_gamma_lut(device, atomic_commit_sink, state.output, now, &mut request)
+            append_pending_gamma_lut(device, atomic_commit_sink, state.output, &mut request)
         {
             gamma_blobs.push((state.output, blob));
         }

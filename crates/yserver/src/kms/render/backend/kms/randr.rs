@@ -1598,7 +1598,15 @@ impl KmsBackend {
             let refresh_period =
                 std::time::Duration::from_nanos(1_000_000_000 / u64::from(refresh_hz));
             if output.pending_gamma_lut.borrow().is_none() {
-                let active = self.platform.gamma_output_is_active(output_idx);
+                let crtc_key = crate::kms::render::platform::CrtcKey::new(device_key, crtc);
+                let activity_now = crate::drm::atomic::monotonic_timestamp();
+                let last_page_flip = self
+                    .platform
+                    .present_get_last_page_flip_received_at(crtc_key);
+                let active = last_page_flip
+                    .zip(activity_now)
+                    .and_then(|(received_at, now)| now.checked_sub(received_at))
+                    .is_some_and(|age| age <= refresh_period.saturating_mul(2));
                 output
                     .pending_gamma_deadline
                     .set(active.then(|| now + refresh_period));
@@ -1617,8 +1625,8 @@ impl KmsBackend {
                     .atomic_commit_sink
                     .page_flip_commit_in_flight(&device.device, crtc)
             {
-                self.platform
-                    .submit_pending_gamma_for_output(output_idx, now)?;
+                output.pending_gamma_deadline.set(None);
+                self.platform.submit_pending_gamma_for_output(output_idx)?;
             } else if output.pending_gamma_deadline.get().is_none() {
                 output
                     .pending_gamma_deadline
