@@ -73,7 +73,10 @@ fn admit_direct(fixture: &mut RecordingSceneFixture, direct: &DirectPresentSetup
     }
 }
 
-fn enter_async_tearing(fixture: &mut RecordingSceneFixture, direct: &DirectPresentSetup) {
+pub(super) fn enter_async_tearing(
+    fixture: &mut RecordingSceneFixture,
+    direct: &DirectPresentSetup,
+) {
     let device = &mut fixture.events.backend.platform.devices[0];
     device.async_page_flip = true;
     let start = record_count(fixture, fd(fixture));

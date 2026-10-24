@@ -19,7 +19,10 @@ use crate::drm::{
         AtomicCommitEvent, AtomicCommitKind, AtomicCommitRequest, AtomicCommitSink,
         CursorPlanePosition,
     },
-    modeset::{Output, PropMap, append_pending_gamma_lut, submit_frame_with_pending_gamma_lut},
+    modeset::{
+        Output, PropMap, append_pending_gamma_lut, append_vrr_change,
+        submit_frame_with_pending_crtc_properties,
+    },
 };
 
 #[cfg(target_os = "linux")]
@@ -285,25 +288,38 @@ pub(crate) fn submit_scene_flip_with_fences_tearing(
             crate::drm::async_flip::FlipTiming::Vsync => AtomicCommitFlags::empty(),
             crate::drm::async_flip::FlipTiming::Async => AtomicCommitFlags::PAGE_FLIP_ASYNC,
         };
-    let mut request_without_gamma = None;
+    let mut request_without_crtc_properties = None;
     let gamma_blob = if timing == crate::drm::async_flip::FlipTiming::Vsync
         && output.crtc_gamma_lut_prop.is_some()
         && !output.gamma_lut_disabled.get()
         && output.pending_gamma_lut.borrow().is_some()
     {
-        request_without_gamma = Some(request.clone());
+        request_without_crtc_properties = Some(request.clone());
         append_pending_gamma_lut(device, atomic_commit_sink, output, &mut request)
     } else {
         None
     };
-    submit_frame_with_pending_gamma_lut(
+    let mut vrr_changes = Vec::new();
+    if timing == crate::drm::async_flip::FlipTiming::Vsync && gamma_blob.is_none() {
+        let mut request_with_vrr = request.clone();
+        if let Some(value) = append_vrr_change(output, false, &mut request_with_vrr) {
+            if request_without_crtc_properties.is_none() {
+                request_without_crtc_properties = Some(request.clone());
+            }
+            request = request_with_vrr;
+            vrr_changes.push((output, value));
+        }
+    }
+    let was_vrr_committed = output.vrr_committed.get();
+    let result = submit_frame_with_pending_crtc_properties(
         device,
         atomic_commit_sink,
         request,
-        request_without_gamma,
+        request_without_crtc_properties,
         gamma_blob
             .map(|blob| vec![(output, blob)])
             .unwrap_or_default(),
+        vrr_changes,
         |request| {
             atomic_commit_sink.submit_tearing_with_commit_id(
                 device,
@@ -314,7 +330,15 @@ pub(crate) fn submit_scene_flip_with_fences_tearing(
                 tearing_context,
             )
         },
-    )
+    );
+    if result.is_ok() && was_vrr_committed != output.vrr_committed.get() {
+        log::info!(
+            "kms: vrr off output={} crtc={} reason=inherited",
+            output.connector_name,
+            u32::from(output.crtc)
+        );
+    }
+    result
 }
 
 fn submit_flip_inner(

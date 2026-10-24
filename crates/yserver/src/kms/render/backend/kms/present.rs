@@ -893,6 +893,7 @@ impl KmsBackend {
             fallback_target_pin,
             source_id,
             candidate,
+            target,
             present_received_at,
             present_received_monotonic,
             fallback_target,

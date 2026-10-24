@@ -365,6 +365,22 @@ pub(crate) fn append_pending_gamma_lut(
     Some(blob)
 }
 
+/// Add a changed VRR_ENABLED value to a frame request. Callers append the
+/// gamma LUT first and skip VRR on that output when a LUT was added.
+pub(crate) fn append_vrr_change(
+    output: &Output,
+    wanted: bool,
+    request: &mut AtomicCommitRequest,
+) -> Option<bool> {
+    let property = output.crtc_vrr_enabled_prop?;
+    let value = wanted && output.vrr_capable();
+    if output.vrr_committed.get() == value {
+        return None;
+    }
+    request.add_raw_property(output.crtc.into(), property, u64::from(value));
+    Some(value)
+}
+
 /// Retire the userspace blob and update the pending/capability state after a
 /// commit attempt that included this output's gamma property. `latch_einval`
 /// is true for a gamma-only submit or when a frame's no-LUT retry succeeded.
@@ -403,30 +419,53 @@ pub(crate) fn finish_pending_gamma_lut(
     }
 }
 
-/// Submit one frame with its pending LUT and retry that same frame without the
-/// LUT only when the first request returns EINVAL. Gamma is disabled only
-/// when the no-LUT retry succeeds; otherwise the pending ramp remains intact.
-pub(crate) fn submit_frame_with_pending_gamma_lut(
+fn finish_pending_vrr_change(
+    output: &Output,
+    value: bool,
+    commit_result: &io::Result<u64>,
+    retry_accepted: bool,
+) {
+    match commit_result {
+        Ok(_) => output.vrr_committed.set(value),
+        Err(error) if retry_accepted && error.raw_os_error() == Some(libc::EINVAL) => {
+            if !output.vrr_disabled.replace(true) {
+                log::warn!(
+                    "kms: vrr rejected by CRTC {}; disabling VRR for this CRTC",
+                    u32::from(output.crtc)
+                );
+            }
+        }
+        Err(_) => {}
+    }
+}
+
+/// Submit one frame with pending CRTC properties and retry that same frame
+/// without them only when the first request returns EINVAL.
+pub(crate) fn submit_frame_with_pending_crtc_properties(
     device: &Device,
     sink: &AtomicCommitSink,
     request: AtomicCommitRequest,
-    request_without_gamma: Option<AtomicCommitRequest>,
+    request_without_crtc_properties: Option<AtomicCommitRequest>,
     gamma_blobs: Vec<(&Output, u64)>,
+    vrr_changes: Vec<(&Output, bool)>,
     mut submit: impl FnMut(AtomicCommitRequest) -> io::Result<u64>,
 ) -> io::Result<u64> {
     let result = submit(request);
-    let rejected_gamma = !gamma_blobs.is_empty()
+    let rejected_crtc_property = (!gamma_blobs.is_empty() || !vrr_changes.is_empty())
         && result
             .as_ref()
             .is_err_and(|error| error.raw_os_error() == Some(libc::EINVAL));
-    let retry_result = if rejected_gamma {
-        request_without_gamma.map(submit)
+    let retry_result = if rejected_crtc_property {
+        request_without_crtc_properties.map(submit)
     } else {
         None
     };
-    let latch_einval = retry_result.as_ref().is_some_and(Result::is_ok);
+    let retry_accepted = retry_result.as_ref().is_some_and(Result::is_ok);
     for (output, blob) in gamma_blobs {
-        finish_pending_gamma_lut(device, sink, output, blob, &result, latch_einval);
+        finish_pending_gamma_lut(device, sink, output, blob, &result, retry_accepted);
+    }
+    for (output, value) in vrr_changes {
+        finish_pending_vrr_change(output, value, &result, retry_accepted);
     }
     retry_result.unwrap_or(result)
 }
@@ -1931,6 +1970,7 @@ pub(crate) fn submit_direct_scanout(
     fb: framebuffer::Handle,
     planes: &[DirectScanoutPlaneState<'_>],
     cursor_positions: &[CursorPlanePosition],
+    vrr_wanted: bool,
     timing: crate::drm::async_flip::FlipTiming,
     tearing_context: crate::drm::atomic::TearingCommitContext,
 ) -> io::Result<u64> {
@@ -1943,20 +1983,32 @@ pub(crate) fn submit_direct_scanout(
     };
     let mut request = direct_scanout_request(fb, planes, cursor_positions);
     let mut gamma_blobs = Vec::new();
-    let mut request_without_gamma = None;
+    let mut vrr_changes = Vec::new();
+    let mut request_without_crtc_properties = None;
     if timing == crate::drm::async_flip::FlipTiming::Vsync {
         for state in planes {
             if state.output.crtc_gamma_lut_prop.is_some()
                 && !state.output.gamma_lut_disabled.get()
                 && state.output.pending_gamma_lut.borrow().is_some()
-                && request_without_gamma.is_none()
+                && request_without_crtc_properties.is_none()
             {
-                request_without_gamma = Some(request.clone());
+                request_without_crtc_properties = Some(request.clone());
             }
             if let Some(blob) =
                 append_pending_gamma_lut(device, atomic_commit_sink, state.output, &mut request)
             {
                 gamma_blobs.push((state.output, blob));
+            } else {
+                let mut request_with_vrr = request.clone();
+                if let Some(value) =
+                    append_vrr_change(state.output, vrr_wanted, &mut request_with_vrr)
+                {
+                    if request_without_crtc_properties.is_none() {
+                        request_without_crtc_properties = Some(request.clone());
+                    }
+                    request = request_with_vrr;
+                    vrr_changes.push((state.output, value));
+                }
             }
         }
     }
@@ -1980,12 +2032,13 @@ pub(crate) fn submit_direct_scanout(
             crate::drm::async_flip::FlipTiming::Vsync => AtomicCommitFlags::empty(),
             crate::drm::async_flip::FlipTiming::Async => AtomicCommitFlags::PAGE_FLIP_ASYNC,
         };
-    submit_frame_with_pending_gamma_lut(
+    submit_frame_with_pending_crtc_properties(
         device,
         atomic_commit_sink,
         request,
-        request_without_gamma,
+        request_without_crtc_properties,
         gamma_blobs,
+        vrr_changes,
         |request| {
             atomic_commit_sink.submit_tearing_with_commit_id(
                 device,
@@ -2140,19 +2193,31 @@ pub(crate) fn submit_composed_scanout(
     for position in cursor_positions {
         request.add_cursor_position(*position);
     }
-    let has_pending_gamma = planes.iter().any(|state| {
+    let mut request_without_crtc_properties = None;
+    let mut gamma_blobs = Vec::new();
+    let mut vrr_changes = Vec::new();
+    for state in planes {
         let output = state.output;
-        output.crtc_gamma_lut_prop.is_some()
+        if output.crtc_gamma_lut_prop.is_some()
             && !output.gamma_lut_disabled.get()
             && output.pending_gamma_lut.borrow().is_some()
-    });
-    let request_without_gamma = has_pending_gamma.then(|| request.clone());
-    let mut gamma_blobs = Vec::new();
-    for state in planes {
-        if let Some(blob) =
-            append_pending_gamma_lut(device, atomic_commit_sink, state.output, &mut request)
+            && request_without_crtc_properties.is_none()
         {
-            gamma_blobs.push((state.output, blob));
+            request_without_crtc_properties = Some(request.clone());
+        }
+        if let Some(blob) =
+            append_pending_gamma_lut(device, atomic_commit_sink, output, &mut request)
+        {
+            gamma_blobs.push((output, blob));
+        } else {
+            let mut request_with_vrr = request.clone();
+            if let Some(value) = append_vrr_change(output, false, &mut request_with_vrr) {
+                if request_without_crtc_properties.is_none() {
+                    request_without_crtc_properties = Some(request.clone());
+                }
+                request = request_with_vrr;
+                vrr_changes.push((output, value));
+            }
         }
     }
     let events: Vec<_> = planes
@@ -2170,12 +2235,13 @@ pub(crate) fn submit_composed_scanout(
     } else {
         AtomicCommitKind::SceneWithCursor
     };
-    submit_frame_with_pending_gamma_lut(
+    submit_frame_with_pending_crtc_properties(
         device,
         atomic_commit_sink,
         request,
-        request_without_gamma,
+        request_without_crtc_properties,
         gamma_blobs,
+        vrr_changes,
         |request| {
             atomic_commit_sink.submit_with_commit_id(
                 device,

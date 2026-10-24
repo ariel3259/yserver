@@ -911,6 +911,7 @@ impl KmsBackend {
         let cursor_positions = self
             .platform
             .cursor_plane_atomic_positions_for_outputs(&output_indices);
+        let vrr_before = self.vrr_committed_snapshot();
         let async_shape = if timing == crate::drm::async_flip::FlipTiming::Async {
             Some(
                 self.pstate
@@ -943,6 +944,7 @@ impl KmsBackend {
             fb,
             &plane_states,
             &cursor_positions,
+            frame.target == ScanoutM0Target::Unredirected,
             attempt_timing,
             crate::drm::atomic::TearingCommitContext::direct(
                 Some(frame.present_received_at),
@@ -970,6 +972,7 @@ impl KmsBackend {
                         fb,
                         &plane_states,
                         &cursor_positions,
+                        frame.target == ScanoutM0Target::Unredirected,
                         crate::drm::async_flip::FlipTiming::Vsync,
                         crate::drm::atomic::TearingCommitContext::direct(
                             Some(frame.present_received_at),
@@ -996,6 +999,12 @@ impl KmsBackend {
             self.handle_cursor_move_outcome(outcome);
         }
         let accepted_event_id = result?;
+        self.log_vrr_committed_changes(
+            &vrr_before,
+            (frame.target == ScanoutM0Target::Unredirected)
+                .then_some(frame.candidate.dst_window_xid),
+            "inherited",
+        );
         if attempt_timing == crate::drm::async_flip::FlipTiming::Vsync
             || matches!(
                 async_outcome,
@@ -1009,6 +1018,49 @@ impl KmsBackend {
         frame.accepted_event_id = Some(accepted_event_id);
         frame.async_outcome = async_outcome;
         Ok(async_outcome)
+    }
+
+    fn vrr_committed_snapshot(&self) -> Vec<bool> {
+        self.platform
+            .outputs
+            .iter()
+            .map(|output| output.output.vrr_committed.get())
+            .collect()
+    }
+
+    fn log_vrr_committed_changes(
+        &self,
+        before: &[bool],
+        owner_window: Option<u32>,
+        fallback_off_reason: &'static str,
+    ) {
+        let off_reason = self
+            .pstate
+            .scanout_m2
+            .unflip_last_reason
+            .unwrap_or(fallback_off_reason);
+        for (index, layout) in self.platform.outputs.iter().enumerate() {
+            let was_enabled = before.get(index).copied().unwrap_or(false);
+            let enabled = layout.output.vrr_committed.get();
+            if was_enabled == enabled {
+                continue;
+            }
+            if enabled {
+                if let Some(window) = owner_window {
+                    log::info!(
+                        "kms: vrr on output={} crtc={} window=0x{window:x}",
+                        layout.key.connector_name,
+                        u32::from(layout.output.crtc)
+                    );
+                }
+            } else {
+                log::info!(
+                    "kms: vrr off output={} crtc={} reason={off_reason}",
+                    layout.key.connector_name,
+                    u32::from(layout.output.crtc)
+                );
+            }
+        }
     }
 
     #[cfg(test)]
@@ -1147,6 +1199,19 @@ impl KmsBackend {
         &mut self,
         reason: &'static str,
     ) {
+        let vrr_committed = self
+            .platform
+            .outputs
+            .iter()
+            .any(|output| output.output.vrr_committed.get());
+        if vrr_committed {
+            self.pstate
+                .scanout_m2
+                .unflip_last_reason
+                .get_or_insert(reason);
+        } else {
+            self.pstate.scanout_m2.unflip_last_reason = None;
+        }
         if let Some(mut pending) = self.pstate.scanout_m2.pending.take() {
             pending.event.completion_mode = yserver_protocol::x11::present::COMPLETE_MODE_COPY;
             pending.event.emit_idle = true;
@@ -1174,7 +1239,6 @@ impl KmsBackend {
             .clear_all_direct_cursor_refresh_pending();
         self.pstate.scanout_m2.unflip_requested = false;
         self.pstate.scanout_m2.unflip_reason = None;
-        self.pstate.scanout_m2.unflip_last_reason = None;
         self.pstate.scanout_m2.unflip_outputs_to_replace.clear();
         self.pstate.scanout_m2.unflip_awaiting_outputs.clear();
         self.pstate.scanout_m2.reentry_blocked_until_composed = false;
@@ -1439,6 +1503,7 @@ impl KmsBackend {
         let cursor_positions = self
             .platform
             .cursor_plane_atomic_positions_for_outputs(&output_indices);
+        let vrr_before = self.vrr_committed_snapshot();
         let result = crate::drm::modeset::submit_composed_scanout(
             &device,
             atomic_commit_sink.as_ref(),
@@ -1454,6 +1519,7 @@ impl KmsBackend {
             self.handle_cursor_move_outcome(outcome);
         }
         let accepted_event_id = result?;
+        self.log_vrr_committed_changes(&vrr_before, None, "inherited");
         self.platform
             .cursor_plane_scene_commit_submitted(&cursor_positions);
         self.pstate.scanout_m2.unflip_outputs_to_replace = (0..output_count).collect();
@@ -1640,6 +1706,7 @@ impl KmsBackend {
         let cursor_positions = self
             .platform
             .cursor_plane_atomic_positions_for_outputs(&output_indices);
+        let vrr_before = self.vrr_committed_snapshot();
         let result = crate::drm::modeset::submit_composed_scanout(
             &device,
             atomic_commit_sink.as_ref(),
@@ -1655,6 +1722,7 @@ impl KmsBackend {
             self.handle_cursor_move_outcome(outcome);
         }
         let accepted_event_id = result?;
+        self.log_vrr_committed_changes(&vrr_before, None, "inherited");
         self.platform
             .cursor_plane_scene_commit_submitted(&cursor_positions);
         Ok(accepted_event_id)

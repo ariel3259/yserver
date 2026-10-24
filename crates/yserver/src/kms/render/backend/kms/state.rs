@@ -222,6 +222,8 @@ pub(in crate::kms::render::backend) struct DirectPresentFrame {
     pub(in crate::kms::render::backend) fallback_target_pin: u64,
     pub(in crate::kms::render::backend) source_id: DrawableId,
     pub(in crate::kms::render::backend) candidate: PresentScanoutCandidate,
+    /// M0 ownership classification for the transaction being submitted.
+    pub(in crate::kms::render::backend) target: ScanoutM0Target,
     /// Backend receipt time retained across the latest-wins direct successor
     /// slot until its atomic submit.
     pub(in crate::kms::render::backend) present_received_at: std::time::Instant,

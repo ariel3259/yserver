@@ -1246,6 +1246,7 @@ fn direct_scanout_probe_tests_the_request_it_commits() {
         raw(91),
         &planes,
         &[position],
+        false,
         crate::drm::async_flip::FlipTiming::Vsync,
         crate::drm::atomic::TearingCommitContext::NONE,
     )

@@ -927,6 +927,7 @@ fn retain_direct_frame_from_source_test(
         source_pin,
         fallback_target_pin,
         source_id,
+        target: crate::kms::render::backend::ScanoutM0Target::Unredirected,
         candidate: PresentScanoutCandidate {
             client_id: 1,
             present_id: 3,
@@ -1194,6 +1195,7 @@ pub(super) fn install_direct_frame_for_target_test(
         fallback_target_pin,
         source_id,
         candidate,
+        target: crate::kms::render::backend::ScanoutM0Target::Unredirected,
         present_received_at: std::time::Instant::now(),
         present_received_monotonic: None,
         fallback_target: PaintTarget::new(fallback_id, (0, 0), None, 24),
