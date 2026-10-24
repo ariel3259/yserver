@@ -96,6 +96,10 @@ const FLIP_TIMESTAMP_PLAUSIBLE_WINDOW: std::time::Duration = std::time::Duration
 /// Present still receives the original UST. Prefer monotonic when it is a
 /// plausible timestamp; NVIDIA's suspend-inclusive BOOTTIME-like UST can be
 /// recognized when it is ahead of monotonic but close to BOOTTIME at receipt.
+/// nvidia-drm 615.78.08 was also measured with UST ~0.97 s behind monotonic
+/// and BOOTTIME equal to monotonic (no suspend): not BOOTTIME, and inside the
+/// plausible window, so telemetry keeps that offset. Gamma activity uses the
+/// event's receipt time for this reason.
 fn completion_timestamp_monotonic(
     ust: std::time::Duration,
     received_monotonic: Option<std::time::Duration>,

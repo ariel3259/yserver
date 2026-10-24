@@ -46,9 +46,17 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   `GAMMA_LUT` reports gamma size 0. On an active CRTC (a page-flip event received within two refresh periods; the
   receipt time, because nvidia-drm 615's flip UST is ~0.97 s behind `CLOCK_MONOTONIC`) the LUT waits up to one
   refresh period for the next frame commit; a LUT that cannot go out at once gets the same deadline on an idle CRTC.
-  The RANDR gamma size does not change (#263 territory). Measured, mpv 60 fps, 10 changes, master vs branch: NVIDIA
-  RTX 5060 Ti direct scanout 7 → 0 dropped frames, AMD Raphael direct 8 → 0, AMD two outputs 16/19 → 0; 0 `SETGAMMA`;
-  kernel LUT readback correct on every CRTC; colour and VT switch checked by eye on both cards. Revises the transport
+  The RANDR gamma size does not change (#263 territory). Review round (#293): while DPMS is off a LUT only stays
+  pending and goes out on wake; `EINVAL` disables gamma on a CRTC only when the same frame then succeeds without the
+  LUT; a CRTC whose legacy gamma size is 0 uses `GAMMA_LUT_SIZE`; a LUT goes out only when no other CRTC of the device
+  has a commit in flight (frames never wait; retried on every flip event of the device), because amdgpu's colour-change
+  commit waits inside the ioctl for the last flip of every CRTC. Measured, 30 gamma changes ~45 ms apart, mpv 60 fps,
+  one output, skipped vblanks from flip events: NVIDIA RTX 5060 Ti master 33 → branch 0; AMD Raphael 34 → 23 (on
+  kernel 7.2.11 amdgpu delivers the event of a frame with a colour change one refresh late, on direct and composed
+  alike, and a standalone LUT commit holds the CRTC as long; a kernel-version matter, not bisected: the candidates
+  move DCN flip events to VUPDATE_NO_LOCK and hold them while the flip is pending, mainline 7.2, stable 7.1.6/7.1.8). LUT commit ioctl p50, two outputs: AMD 15 ms → 0.58 ms, NVIDIA
+  0.07 ms. 0 `SETGAMMA`; kernel LUT readback correct on every CRTC; colour and VT switch checked by eye on both cards.
+  (The earlier "8 → 0" for AMD came from mpv's drop counter, which counts only a late vo thread.) Revises the transport
   decision of `specs/2026-06-18-randr-gamma-design.md`. Plan:
   [`plans/2026-10-23-gamma-atomic-lut.md`](superpowers/plans/2026-10-23-gamma-atomic-lut.md).
 
