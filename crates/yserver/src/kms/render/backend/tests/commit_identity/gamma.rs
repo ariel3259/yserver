@@ -283,6 +283,7 @@ fn gamma_einval_latches_crtc_off_and_resubmits_the_frame() {
     )
     .expect("queue the retry frame before the first event retires");
     complete_recorded_attempt(&mut fixture.events, fd, &initial_scene, 1);
+    let blob_offset = recorder.created_property_blobs().len();
     recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EINVAL)));
     recorder.script_result(Ok(()));
 
@@ -341,12 +342,242 @@ fn gamma_einval_latches_crtc_off_and_resubmits_the_frame() {
         fixture.events.backend.get_crtc_gamma(crtc_xid),
         (red.clone(), green.clone(), blue.clone())
     );
+    let created: Vec<_> = recorder
+        .created_property_blobs()
+        .into_iter()
+        .skip(blob_offset)
+        .map(|(blob, _)| blob)
+        .collect();
+    let destroyed: Vec<_> = recorder
+        .destroyed_property_blobs()
+        .into_iter()
+        .filter(|blob| created.contains(blob))
+        .collect();
+    assert_eq!(created.len(), 1, "the rejected scene creates one LUT blob");
+    assert_eq!(
+        destroyed, created,
+        "the rejected LUT blob is destroyed once"
+    );
 
     let before = recorder.records().len();
     Backend::set_crtc_gamma(&mut fixture.events.backend, crtc_xid, &red, &green, &blue)
         .expect("RandR cache stays writable after the per-CRTC capability latch");
     assert_eq!(recorder.records().len(), before);
 
+    complete_recorded_attempt(&mut fixture.events, fd, &accepted, 2);
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: latch gamma before the no-LUT retry.
+fn p1_gamma_scene_retry_eio_keeps_lut_pending() {
+    let Some(fixture) = super::recording_scene::RecordingSceneFixture::new(1)
+        .expect("recording scene fixture construction")
+    else {
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    let (crtc_xid, crtc, fd, recorder) = enable_recording_scene_gamma(&mut fixture);
+    let gamma_prop = handle(170);
+    fixture.events.backend.platform.outputs[0]
+        .output
+        .crtc_gamma_lut_prop = Some(gamma_prop);
+    fixture.events.backend.platform.outputs[0]
+        .output
+        .crtc_degamma_lut_prop = Some(handle(171));
+    fixture.events.backend.platform.outputs[0]
+        .output
+        .crtc_ctm_prop = Some(handle(172));
+    let initial = super::atomic_events::submit_damaged_frame(&mut fixture);
+    let initial_scene = initial
+        .iter()
+        .map(|(_, record)| record)
+        .find(|record| {
+            record.kind == AtomicCommitKind::Scene && accepted_event_id(record).is_some()
+        })
+        .expect("initial Backend scene frame is accepted")
+        .clone();
+    complete_recorded_attempt(&mut fixture.events, fd, &initial_scene, 1);
+
+    install_controlled_gamma_clock(&mut fixture.events.backend);
+    set_test_gamma(&mut fixture.events.backend, crtc_xid, 0x4567);
+    assert!(
+        recorder
+            .records()
+            .iter()
+            .all(|record| { record.kind != AtomicCommitKind::GammaOnly })
+    );
+    assert!(
+        fixture.events.backend.platform.outputs[0]
+            .output
+            .pending_gamma_lut
+            .borrow()
+            .is_some()
+    );
+    assert!(
+        !fixture.events.backend.platform.outputs[0]
+            .output
+            .gamma_lut_disabled
+            .get()
+    );
+
+    let record_offset = recorder.records().len();
+    let blob_offset = recorder.created_property_blobs().len();
+    recorder.script_result(Err(io::Error::from_raw_os_error(libc::EINVAL)));
+    recorder.script_result(Err(io::Error::from_raw_os_error(libc::EIO)));
+    let root = fixture.events.backend.core.window_id;
+    let (width, height) = (
+        fixture.events.backend.platform.fb_w,
+        fixture.events.backend.platform.fb_h,
+    );
+    Backend::clear_area(
+        &mut fixture.events.backend,
+        None,
+        root,
+        0,
+        None,
+        0,
+        0,
+        width,
+        height,
+        (0, 0),
+    )
+    .expect("damage root through Backend");
+    Backend::maybe_composite(&mut fixture.events.backend).expect("compose through Backend");
+    let failed_attempts: Vec<_> = recorder
+        .records()
+        .into_iter()
+        .skip(record_offset)
+        .filter(|record| record.kind == AtomicCommitKind::Scene)
+        .collect();
+    assert_eq!(failed_attempts.len(), 2, "the frame is submitted twice");
+    assert!(contains_crtc_property(
+        &failed_attempts[0],
+        crtc,
+        gamma_prop
+    ));
+    assert!(!contains_crtc_property(
+        &failed_attempts[1],
+        crtc,
+        gamma_prop
+    ));
+    let output = &fixture.events.backend.platform.outputs[0].output;
+    let fb_id = |record: &AtomicCommitRecord| {
+        record
+            .properties
+            .iter()
+            .find(|update| {
+                update.object == output.plane.into() && update.property == output.plane_fb_id_prop
+            })
+            .map(|update| update.value)
+    };
+    let first_fb_id = fb_id(&failed_attempts[0]);
+    let retry_fb_id = fb_id(&failed_attempts[1]);
+    assert!(first_fb_id.is_some(), "the frame updates its primary plane");
+    assert_eq!(
+        first_fb_id, retry_fb_id,
+        "the no-LUT retry keeps the same scene framebuffer"
+    );
+    assert!(matches!(
+        failed_attempts[0].result,
+        ScriptedResult::Error { raw_os_error: Some(error), .. } if error == libc::EINVAL
+    ));
+    assert!(matches!(
+        failed_attempts[1].result,
+        ScriptedResult::Error { raw_os_error: Some(error), .. } if error == libc::EIO
+    ));
+    assert!(
+        !fixture.events.backend.platform.outputs[0]
+            .output
+            .gamma_lut_disabled
+            .get(),
+        "unrelated EIO does not latch gamma off"
+    );
+    assert!(
+        fixture.events.backend.platform.outputs[0]
+            .output
+            .pending_gamma_lut
+            .borrow()
+            .is_some(),
+        "the LUT remains pending"
+    );
+    let created: Vec<_> = recorder
+        .created_property_blobs()
+        .into_iter()
+        .skip(blob_offset)
+        .map(|(blob, _)| blob)
+        .collect();
+    let destroyed: Vec<_> = recorder
+        .destroyed_property_blobs()
+        .into_iter()
+        .filter(|blob| created.contains(blob))
+        .collect();
+    assert_eq!(created.len(), 1, "the rejected frame creates one LUT blob");
+    assert_eq!(
+        destroyed, created,
+        "the rejected LUT blob is destroyed once"
+    );
+    assert_eq!(
+        recorder.records().len() - record_offset,
+        2,
+        "both failing attempts reach the recording executor"
+    );
+    assert_eq!(
+        fixture.events.backend.platform.devices[0]
+            .atomic_commit_sink
+            .for_tests_pending_page_flip_entry_count(),
+        0,
+        "failed scene attempts install no flip obligation"
+    );
+    assert!(!fixture.events.backend.scene.has_pending_page_flips());
+    assert_eq!(
+        fixture.events.backend.scene.pending_page_flip_event_id(0),
+        None
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let accepted = loop {
+        let before = recorder.records().len();
+        Backend::before_block(&mut fixture.events.backend);
+        Backend::clear_area(
+            &mut fixture.events.backend,
+            None,
+            root,
+            0,
+            None,
+            0,
+            0,
+            width,
+            height,
+            (0, 0),
+        )
+        .expect("damage root after failed scene submit");
+        Backend::maybe_composite(&mut fixture.events.backend)
+            .expect("compose after failed scene submit");
+        if let Some(record) = recorder.records().into_iter().skip(before).find(|record| {
+            record.kind == AtomicCommitKind::Scene && accepted_event_id(record).is_some()
+        }) {
+            break record;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the pending LUT is retried on the next scene frame"
+        );
+    };
+    assert!(contains_crtc_property(&accepted, crtc, gamma_prop));
+    assert!(
+        !fixture.events.backend.platform.outputs[0]
+            .output
+            .gamma_lut_disabled
+            .get()
+    );
+    assert!(
+        fixture.events.backend.platform.outputs[0]
+            .output
+            .pending_gamma_lut
+            .borrow()
+            .is_none()
+    );
     complete_recorded_attempt(&mut fixture.events, fd, &accepted, 2);
     fixture.finish_after_normal_drain();
 }
@@ -419,7 +650,6 @@ fn gamma_composed_einval_retry_preserves_every_plane_cursor_and_event() {
             .borrow()
             .is_some()
     );
-
     super::direct_unflip::request_unflip(&mut fixture, &direct);
     recorder.script_result(Err(io::Error::from_raw_os_error(libc::EINVAL)));
     recorder.script_result(Ok(()));
@@ -477,6 +707,21 @@ fn gamma_composed_einval_retry_preserves_every_plane_cursor_and_event() {
         &mut fixture,
         &[],
         &[direct.candidate.present_id],
+    );
+    assert!(
+        fixture.events.backend.platform.outputs[0]
+            .output
+            .gamma_lut_disabled
+            .get(),
+        "successful composed retry confirms GAMMA_LUT caused EINVAL"
+    );
+    assert!(
+        fixture.events.backend.platform.outputs[0]
+            .output
+            .pending_gamma_lut
+            .borrow()
+            .is_none(),
+        "successful composed retry consumes the pending LUT"
     );
     fixture.finish_after_normal_drain();
     assert!(rejected_has_gamma, "rejected request carried GAMMA_LUT");
@@ -1782,6 +2027,219 @@ fn p1_gamma_active_direct_frame_carries_lut_without_gamma_only_commit() {
         &mut fixture,
         &[],
         &[next_candidate.present_id],
+    );
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutations: latch gamma before the no-LUT retry; return the first EINVAL instead of retry EIO.
+fn p1_gamma_direct_retry_eio_keeps_lut_pending_and_returns_retry_error() {
+    let Some((fixture, direct)) = super::direct_unflip::direct_fixture(
+        2,
+        super::recording_scene::P1SceneRoute::Shared,
+        17_006,
+        0,
+    ) else {
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    let fd = super::direct_unflip::fd(&fixture);
+    let recorder = fixture.events.recorders[&fd].clone();
+    let (crtc_xid, crtc) = enable_gamma(&mut fixture.events.backend, &recorder, 0, 4);
+    let gamma_prop = handle(170);
+    fixture.events.backend.platform.outputs[0]
+        .output
+        .crtc_gamma_lut_prop = Some(gamma_prop);
+    fixture.events.backend.platform.outputs[0]
+        .output
+        .crtc_degamma_lut_prop = Some(handle(171));
+    fixture.events.backend.platform.outputs[0]
+        .output
+        .crtc_ctm_prop = Some(handle(172));
+    let initial = super::direct_unflip::submit_direct(&mut fixture, &direct, fd)
+        .into_iter()
+        .find(|record| accepted_event_id(record).is_some())
+        .expect("initial direct Backend frame is accepted");
+    super::direct_unflip::complete_direct_initial(
+        &mut fixture,
+        &initial,
+        accepted_event_id(&initial).expect("initial direct frame has a commit ID"),
+        fd,
+    );
+    super::direct_unflip::drain_present_notifications(
+        &mut fixture,
+        &[direct.candidate.present_id],
+        &[],
+    );
+
+    install_controlled_gamma_clock(&mut fixture.events.backend);
+    set_test_gamma(&mut fixture.events.backend, crtc_xid, 0x6789);
+    assert!(
+        recorder
+            .records()
+            .iter()
+            .all(|record| { record.kind != AtomicCommitKind::GammaOnly })
+    );
+    assert!(
+        fixture.events.backend.platform.outputs[0]
+            .output
+            .pending_gamma_lut
+            .borrow()
+            .is_some()
+    );
+    assert!(
+        !fixture.events.backend.platform.outputs[0]
+            .output
+            .gamma_lut_disabled
+            .get()
+    );
+
+    let record_offset = recorder.records().len();
+    let blob_offset = recorder.created_property_blobs().len();
+    recorder.script_result(Err(io::Error::from_raw_os_error(libc::EINVAL)));
+    recorder.script_result(Err(io::Error::from_raw_os_error(libc::EIO)));
+    let mut next_candidate = direct.candidate;
+    next_candidate.present_id = next_candidate.present_id.wrapping_add(1);
+    let mut next_event = direct.event.clone();
+    next_event.present_id = next_candidate.present_id;
+    next_event.serial = next_event.serial.wrapping_add(1);
+    let mut submit_error = None;
+    for _ in 0..8 {
+        match Backend::try_present_direct(
+            &mut fixture.events.backend,
+            next_candidate,
+            next_event.clone(),
+        ) {
+            Ok(false) => {}
+            Ok(true) => panic!("the scripted direct frame must fail before acceptance"),
+            Err(error) => {
+                submit_error = Some(error);
+                break;
+            }
+        }
+    }
+    let submit_error = submit_error.expect("the direct path reaches the scripted submits");
+    assert_eq!(
+        submit_error.raw_os_error(),
+        Some(libc::EIO),
+        "the low-level direct submit returns the no-LUT retry error"
+    );
+    let failed_attempts: Vec<_> = recorder.records().into_iter().skip(record_offset).collect();
+    assert_eq!(
+        failed_attempts.len(),
+        2,
+        "the direct frame is submitted twice"
+    );
+    assert!(contains_crtc_property(
+        &failed_attempts[0],
+        crtc,
+        gamma_prop
+    ));
+    assert!(!contains_crtc_property(
+        &failed_attempts[1],
+        crtc,
+        gamma_prop
+    ));
+    for layout in &fixture.events.backend.platform.outputs {
+        let fb_id = |record: &AtomicCommitRecord| {
+            record
+                .properties
+                .iter()
+                .find(|update| {
+                    update.object == layout.output.plane.into()
+                        && update.property == layout.output.plane_fb_id_prop
+                })
+                .map(|update| update.value)
+        };
+        let first_fb_id = fb_id(&failed_attempts[0]);
+        let retry_fb_id = fb_id(&failed_attempts[1]);
+        assert!(first_fb_id.is_some(), "the direct frame updates each plane");
+        assert_eq!(
+            first_fb_id, retry_fb_id,
+            "the no-LUT retry keeps each direct framebuffer"
+        );
+    }
+    assert!(matches!(
+        failed_attempts[0].result,
+        ScriptedResult::Error { raw_os_error: Some(error), .. } if error == libc::EINVAL
+    ));
+    assert!(matches!(
+        failed_attempts[1].result,
+        ScriptedResult::Error { raw_os_error: Some(error), .. } if error == libc::EIO
+    ));
+    assert!(
+        !fixture.events.backend.platform.outputs[0]
+            .output
+            .gamma_lut_disabled
+            .get()
+    );
+    assert!(
+        fixture.events.backend.platform.outputs[0]
+            .output
+            .pending_gamma_lut
+            .borrow()
+            .is_some()
+    );
+    assert!(fixture.events.backend.pstate.scanout_m2.pending.is_none());
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .queued_successor
+            .is_none()
+    );
+    assert_eq!(
+        fixture.events.backend.platform.devices[0]
+            .atomic_commit_sink
+            .for_tests_pending_page_flip_entry_count(),
+        0,
+        "failed direct attempts install no flip obligation"
+    );
+    let created: Vec<_> = recorder
+        .created_property_blobs()
+        .into_iter()
+        .skip(blob_offset)
+        .map(|(blob, _)| blob)
+        .collect();
+    let destroyed: Vec<_> = recorder
+        .destroyed_property_blobs()
+        .into_iter()
+        .filter(|blob| created.contains(blob))
+        .collect();
+    assert_eq!(
+        created.len(),
+        1,
+        "the rejected direct frame creates one LUT blob"
+    );
+    assert_eq!(
+        destroyed, created,
+        "the rejected LUT blob is destroyed once"
+    );
+
+    let unflip_offset = recorder.records().len();
+    let unflip = super::direct_unflip::grouped_unflip_record(&mut fixture, fd, unflip_offset, 2);
+    assert!(contains_crtc_property(&unflip, crtc, gamma_prop));
+    assert!(
+        !fixture.events.backend.platform.outputs[0]
+            .output
+            .gamma_lut_disabled
+            .get()
+    );
+    assert!(
+        fixture.events.backend.platform.outputs[0]
+            .output
+            .pending_gamma_lut
+            .borrow()
+            .is_none()
+    );
+    complete_recorded_attempt(&mut fixture.events, fd, &unflip, 2);
+    super::direct_unflip::drain_present_notifications(
+        &mut fixture,
+        &[],
+        &[direct.candidate.present_id],
     );
     fixture.finish_after_normal_drain();
 }

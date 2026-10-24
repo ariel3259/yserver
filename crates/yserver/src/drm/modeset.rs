@@ -297,13 +297,15 @@ pub(crate) fn append_pending_gamma_lut(
 }
 
 /// Retire the userspace blob and update the pending/capability state after a
-/// commit attempt that included this output's gamma property.
+/// commit attempt that included this output's gamma property. `latch_einval`
+/// is true for a gamma-only submit or when a frame's no-LUT retry succeeded.
 pub(crate) fn finish_pending_gamma_lut(
     device: &Device,
     sink: &AtomicCommitSink,
     output: &Output,
     blob: u64,
     commit_result: &io::Result<u64>,
+    latch_einval: bool,
 ) {
     if let Err(error) = sink.destroy_property_blob(device, blob) {
         log::warn!(
@@ -316,7 +318,7 @@ pub(crate) fn finish_pending_gamma_lut(
             output.pending_gamma_lut.borrow_mut().take();
             output.pending_gamma_deadline.set(None);
         }
-        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {
+        Err(error) if latch_einval && error.raw_os_error() == Some(libc::EINVAL) => {
             if !output.gamma_lut_disabled.replace(true) {
                 log::warn!(
                     "kms gamma: CRTC {:?} rejected GAMMA_LUT; disabling gamma for this CRTC",
@@ -330,6 +332,34 @@ pub(crate) fn finish_pending_gamma_lut(
         }
         Err(_) => {}
     }
+}
+
+/// Submit one frame with its pending LUT and retry that same frame without the
+/// LUT only when the first request returns EINVAL. Gamma is disabled only
+/// when the no-LUT retry succeeds; otherwise the pending ramp remains intact.
+pub(crate) fn submit_frame_with_pending_gamma_lut(
+    device: &Device,
+    sink: &AtomicCommitSink,
+    request: AtomicCommitRequest,
+    request_without_gamma: Option<AtomicCommitRequest>,
+    gamma_blobs: Vec<(&Output, u64)>,
+    mut submit: impl FnMut(AtomicCommitRequest) -> io::Result<u64>,
+) -> io::Result<u64> {
+    let result = submit(request);
+    let rejected_gamma = !gamma_blobs.is_empty()
+        && result
+            .as_ref()
+            .is_err_and(|error| error.raw_os_error() == Some(libc::EINVAL));
+    let retry_result = if rejected_gamma {
+        request_without_gamma.map(submit)
+    } else {
+        None
+    };
+    let latch_einval = retry_result.as_ref().is_some_and(Result::is_ok);
+    for (output, blob) in gamma_blobs {
+        finish_pending_gamma_lut(device, sink, output, blob, &result, latch_einval);
+    }
+    retry_result.unwrap_or(result)
 }
 
 fn gamma_lut_blob_bytes(pending: &GammaRamp) -> Option<Vec<u8>> {
@@ -1835,34 +1865,23 @@ pub(crate) fn submit_direct_scanout(
             crate::drm::async_flip::FlipTiming::Vsync => AtomicCommitFlags::empty(),
             crate::drm::async_flip::FlipTiming::Async => AtomicCommitFlags::PAGE_FLIP_ASYNC,
         };
-    let mut result = atomic_commit_sink.submit_tearing_with_commit_id(
+    submit_frame_with_pending_gamma_lut(
         device,
-        flags,
-        kind,
+        atomic_commit_sink,
         request,
-        &events,
-        tearing_context,
-    );
-    let had_gamma = !gamma_blobs.is_empty();
-    for (output, blob) in gamma_blobs {
-        finish_pending_gamma_lut(device, atomic_commit_sink, output, blob, &result);
-    }
-    if had_gamma
-        && result
-            .as_ref()
-            .is_err_and(|error| error.raw_os_error() == Some(libc::EINVAL))
-        && let Some(request) = request_without_gamma
-    {
-        result = atomic_commit_sink.submit_tearing_with_commit_id(
-            device,
-            flags,
-            kind,
-            request,
-            &events,
-            tearing_context,
-        );
-    }
-    result
+        request_without_gamma,
+        gamma_blobs,
+        |request| {
+            atomic_commit_sink.submit_tearing_with_commit_id(
+                device,
+                flags,
+                kind,
+                request,
+                &events,
+                tearing_context,
+            )
+        },
+    )
 }
 
 /// `TEST_ONLY` the exact request `submit_direct_scanout` would commit, cursor
@@ -2036,32 +2055,22 @@ pub(crate) fn submit_composed_scanout(
     } else {
         AtomicCommitKind::SceneWithCursor
     };
-    let mut result = atomic_commit_sink.submit_with_commit_id(
+    submit_frame_with_pending_gamma_lut(
         device,
-        AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK,
-        kind,
+        atomic_commit_sink,
         request,
-        &events,
-    );
-    let had_gamma = !gamma_blobs.is_empty();
-    for (output, blob) in gamma_blobs {
-        finish_pending_gamma_lut(device, atomic_commit_sink, output, blob, &result);
-    }
-    if had_gamma
-        && result
-            .as_ref()
-            .is_err_and(|error| error.raw_os_error() == Some(libc::EINVAL))
-        && let Some(request) = request_without_gamma
-    {
-        result = atomic_commit_sink.submit_with_commit_id(
-            device,
-            AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK,
-            kind,
-            request,
-            &events,
-        );
-    }
-    result
+        request_without_gamma,
+        gamma_blobs,
+        |request| {
+            atomic_commit_sink.submit_with_commit_id(
+                device,
+                AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK,
+                kind,
+                request,
+                &events,
+            )
+        },
+    )
 }
 
 #[cfg(test)]

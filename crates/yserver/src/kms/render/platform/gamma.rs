@@ -49,6 +49,7 @@ impl PlatformBackend {
             output,
             blob,
             &result,
+            true,
         );
         match result {
             Ok(_) => Ok(()),

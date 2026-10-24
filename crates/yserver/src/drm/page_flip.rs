@@ -19,7 +19,7 @@ use crate::drm::{
         AtomicCommitEvent, AtomicCommitKind, AtomicCommitRequest, AtomicCommitSink,
         CursorPlanePosition,
     },
-    modeset::{Output, PropMap, append_pending_gamma_lut, finish_pending_gamma_lut},
+    modeset::{Output, PropMap, append_pending_gamma_lut, submit_frame_with_pending_gamma_lut},
 };
 
 #[cfg(target_os = "linux")]
@@ -296,35 +296,25 @@ pub(crate) fn submit_scene_flip_with_fences_tearing(
     } else {
         None
     };
-    let mut result = atomic_commit_sink.submit_tearing_with_commit_id(
+    submit_frame_with_pending_gamma_lut(
         device,
-        flags,
-        kind,
+        atomic_commit_sink,
         request,
-        &[event],
-        tearing_context,
-    );
-    if let Some(blob) = gamma_blob {
-        finish_pending_gamma_lut(device, atomic_commit_sink, output, blob, &result);
-        if result
-            .as_ref()
-            .is_err_and(|error| error.raw_os_error() == Some(libc::EINVAL))
-            && let Some(request) = request_without_gamma
-        {
-            // The unsupported property rejected this frame. Gamma is now
-            // latched off for this CRTC, so retry the same frame request
-            // without it and preserve the ordinary flip path.
-            result = atomic_commit_sink.submit_tearing_with_commit_id(
+        request_without_gamma,
+        gamma_blob
+            .map(|blob| vec![(output, blob)])
+            .unwrap_or_default(),
+        |request| {
+            atomic_commit_sink.submit_tearing_with_commit_id(
                 device,
                 flags,
                 kind,
                 request,
                 &[event],
                 tearing_context,
-            );
-        }
-    }
-    result
+            )
+        },
+    )
 }
 
 fn submit_flip_inner(
