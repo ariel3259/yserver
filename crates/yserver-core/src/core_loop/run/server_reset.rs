@@ -398,7 +398,8 @@ fn a_reset_with_clients_connected_reports_none() {
     wait_until("SIGHUP to reset", || {
         server.generation() == generation_after(1)
     });
-    assert_eq!(server.client_count(), 0);
+    // The generation bumps before the clients are destroyed.
+    wait_until("the count to drop to 0", || server.client_count() == 0);
     drop(peer);
     server.shutdown().expect("clean shutdown");
 }
