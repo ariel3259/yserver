@@ -1786,6 +1786,7 @@ fn vt_release_exits_tearing_and_resume_needs_probation() {
                     mm_height: 0,
                     edid: Vec::new(),
                     connector_type: "test".to_owned(),
+                    vrr_capable: false,
                 })
                 .collect())
         }
@@ -3864,6 +3865,10 @@ fn clone_test_drm_output(output: &crate::platform::drm::Output) -> crate::platfo
         crtc_out_fence_ptr_prop: output.crtc_out_fence_ptr_prop,
         crtc_gamma_lut_prop: output.crtc_gamma_lut_prop,
         crtc_gamma_lut_size: output.crtc_gamma_lut_size,
+        crtc_vrr_enabled_prop: output.crtc_vrr_enabled_prop,
+        connector_vrr_capable: output.connector_vrr_capable,
+        vrr_committed: std::cell::Cell::new(false),
+        vrr_disabled: std::cell::Cell::new(false),
         crtc_degamma_lut_prop: output.crtc_degamma_lut_prop,
         crtc_ctm_prop: output.crtc_ctm_prop,
         pending_gamma_lut: std::cell::RefCell::new(None),

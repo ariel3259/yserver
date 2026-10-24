@@ -64,6 +64,7 @@ impl ConnectorSnapshot {
             mm_height: probe.mm_height,
             edid: probe.edid.clone(),
             connector_type: probe.connector_type.clone(),
+            vrr_capable: probe.vrr_capable,
         }
     }
 
@@ -700,6 +701,10 @@ impl PlatformBackend {
             .filter(|existing| existing.output.crtc == output.crtc)
         {
             output
+                .vrr_committed
+                .set(existing.output.vrr_committed.get());
+            output.vrr_disabled.set(existing.output.vrr_disabled.get());
+            output
                 .gamma_lut_disabled
                 .set(existing.output.gamma_lut_disabled.get());
             *output.pending_gamma_lut.borrow_mut() =
@@ -1236,6 +1241,7 @@ impl PlatformBackend {
                 layout.output.mm_width = snapshot.mm_width;
                 layout.output.mm_height = snapshot.mm_height;
                 layout.output.edid.clone_from(&snapshot.edid);
+                layout.output.connector_vrr_capable = snapshot.vrr_capable;
                 layout
                     .output
                     .connector_type

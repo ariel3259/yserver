@@ -211,6 +211,16 @@ pub struct Output {
     /// Cached atomic gamma properties. A missing `GAMMA_LUT` property means
     /// this CRTC does not expose gamma correction.
     pub crtc_gamma_lut_prop: Option<property::Handle>,
+    /// Cached atomic adaptive-sync property. `None` means this CRTC does not
+    /// expose `VRR_ENABLED`.
+    pub crtc_vrr_enabled_prop: Option<property::Handle>,
+    /// Whether the connector's current `vrr_capable` property is exactly 1.
+    /// Refreshed from the physical connector snapshot on rescan.
+    pub connector_vrr_capable: bool,
+    /// Value currently held by the kernel for this CRTC's `VRR_ENABLED`.
+    pub(crate) vrr_committed: Cell<bool>,
+    /// Per-CRTC EINVAL capability latch for `VRR_ENABLED`.
+    pub(crate) vrr_disabled: Cell<bool>,
     /// Raw `GAMMA_LUT_SIZE` property value. Used only when the legacy CRTC
     /// gamma length is zero.
     pub crtc_gamma_lut_size: Option<u64>,
@@ -262,6 +272,55 @@ impl Output {
     pub(crate) fn cache_crtc_gamma_properties(&mut self, properties: Option<&PropMap>) {
         self.crtc_gamma_lut_prop = properties.and_then(|props| props.id("GAMMA_LUT").ok());
         self.crtc_gamma_lut_size = properties.and_then(|props| props.value("GAMMA_LUT_SIZE"));
+    }
+
+    pub(crate) fn cache_crtc_vrr_properties(
+        &mut self,
+        properties: Option<&PropMap>,
+        connector_vrr_capable: Option<u64>,
+    ) {
+        self.crtc_vrr_enabled_prop = properties.and_then(|props| props.id("VRR_ENABLED").ok());
+        self.connector_vrr_capable = connector_vrr_capable == Some(1);
+        self.vrr_committed.set(
+            properties
+                .and_then(|props| props.value("VRR_ENABLED"))
+                .is_some_and(|value| value != 0),
+        );
+    }
+
+    pub(crate) fn vrr_capable(&self) -> bool {
+        self.crtc_vrr_enabled_prop.is_some()
+            && self.connector_vrr_capable
+            && !self.vrr_disabled.get()
+    }
+
+    /// Refresh the committed value after regaining DRM master, when another
+    /// master may have changed `VRR_ENABLED` while this server was away.
+    #[allow(dead_code, reason = "VT acquire invokes this in VRR task 3")]
+    pub(crate) fn refresh_vrr_committed_from_kernel(&self, device: &Device) {
+        let Some(property) = self.crtc_vrr_enabled_prop else {
+            self.vrr_committed.set(false);
+            return;
+        };
+        let properties = match device.get_properties(self.crtc) {
+            Ok(properties) => properties,
+            Err(error) => {
+                log::warn!(
+                    "kms: could not refresh VRR_ENABLED for CRTC {:?}: {error}",
+                    self.crtc
+                );
+                return;
+            }
+        };
+        if let Some((_, value)) = properties.iter().find(|(id, _)| **id == property) {
+            self.vrr_committed.set(*value != 0);
+        } else {
+            log::warn!(
+                "kms: CRTC {:?} no longer exposes cached VRR_ENABLED property {:?}",
+                self.crtc,
+                property
+            );
+        }
     }
 }
 
@@ -410,6 +469,7 @@ pub(crate) struct ConnectorSnapshotProbe {
     pub(crate) mm_height: u32,
     pub(crate) edid: Vec<u8>,
     pub(crate) connector_type: String,
+    pub(crate) vrr_capable: bool,
 }
 
 /// Whether the kernel marks a connector as unsuitable for a desktop layout.
@@ -482,13 +542,15 @@ pub(crate) fn probe_connector_snapshots(
         let connector_name = xorg_output_name(info.interface(), info.interface_id());
         let modes = probe_modes(&info);
         let (mm_width, mm_height) = info.size().unwrap_or((0, 0));
+        let (edid, vrr_capable) = connector_metadata(device, handle);
         probes.push(ConnectorSnapshotProbe {
             connector_type: randr_connector_type_name(&connector_name),
             connector_name,
             modes,
             mm_width,
             mm_height,
-            edid: connector_edid_blob(device, handle),
+            edid,
+            vrr_capable: vrr_capable == Some(1),
         });
     }
     Ok(probes)
@@ -986,6 +1048,7 @@ fn finalize_output_with_mode(
     let plane_crtc_h_prop = plane_props_map.id("CRTC_H")?;
     let plane_in_fence_fd_prop = plane_props_map.id("IN_FENCE_FD").ok();
     let crtc_props = PropMap::for_object(device, asg.crtc).ok();
+    let (edid, connector_vrr_capable_value) = connector_metadata(device, asg.connector);
     let crtc_out_fence_ptr_prop = crtc_props
         .as_ref()
         .and_then(|props| props.id("OUT_FENCE_PTR").ok());
@@ -1008,7 +1071,6 @@ fn finalize_output_with_mode(
     );
 
     let (mm_width, mm_height) = connector_info.size().unwrap_or((0, 0));
-    let edid = connector_edid_blob(device, asg.connector);
     let connector_type = randr_connector_type_name(&asg.connector_name);
 
     // Full advertised mode list, sorted preferred-first (matching Xorg
@@ -1041,6 +1103,10 @@ fn finalize_output_with_mode(
         crtc_out_fence_ptr_prop,
         crtc_gamma_lut_prop: None,
         crtc_gamma_lut_size: None,
+        crtc_vrr_enabled_prop: None,
+        connector_vrr_capable: false,
+        vrr_committed: Cell::new(false),
+        vrr_disabled: Cell::new(false),
         crtc_degamma_lut_prop,
         crtc_ctm_prop,
         pending_gamma_lut: RefCell::new(None),
@@ -1054,6 +1120,18 @@ fn finalize_output_with_mode(
         modes,
     };
     output.cache_crtc_gamma_properties(crtc_props.as_ref());
+    output.cache_crtc_vrr_properties(crtc_props.as_ref(), connector_vrr_capable_value);
+    log::info!(
+        "kms: vrr capable={} (vrr_capable={}, VRR_ENABLED={}) output={}",
+        output.vrr_capable(),
+        connector_vrr_capable_value.map_or_else(|| "absent".to_string(), |value| value.to_string()),
+        if output.crtc_vrr_enabled_prop.is_some() {
+            "present"
+        } else {
+            "absent"
+        },
+        output.connector_name
+    );
     Ok(output)
 }
 
@@ -1093,24 +1171,29 @@ fn xorg_output_name(interface: connector::Interface, interface_id: u32) -> Strin
     format!("{base}-{interface_id}")
 }
 
-/// Read the connector's raw `EDID` property blob (empty if absent).
-fn connector_edid_blob(device: &Device, connector: connector::Handle) -> Vec<u8> {
+/// Read connector-owned blob and adaptive-sync metadata from the same
+/// property snapshot. Missing properties are represented as empty/absent.
+fn connector_metadata(device: &Device, connector: connector::Handle) -> (Vec<u8>, Option<u64>) {
     let Ok(props) = device.get_properties(connector) else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
+    let mut edid = Vec::new();
+    let mut vrr_capable = None;
     for (prop_handle, raw_value) in &props {
         let Ok(info) = device.get_property(*prop_handle) else {
             continue;
         };
-        if info.name().to_bytes() != b"EDID" {
-            continue;
+        match info.name().to_bytes() {
+            b"EDID" => {
+                if *raw_value != 0 {
+                    edid = device.get_property_blob(*raw_value).unwrap_or_default();
+                }
+            }
+            b"vrr_capable" => vrr_capable = Some(*raw_value),
+            _ => {}
         }
-        if *raw_value == 0 {
-            return Vec::new();
-        }
-        return device.get_property_blob(*raw_value).unwrap_or_default();
     }
-    Vec::new()
+    (edid, vrr_capable)
 }
 
 /// Map a DRM connector name (e.g. `"HDMI-A-1"`, `"DP-2"`, `"eDP-1"`) to

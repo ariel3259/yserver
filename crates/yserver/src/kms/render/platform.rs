@@ -712,4 +712,5 @@ pub(crate) struct ConnectorSnapshot {
     pub(crate) mm_height: u32,
     pub(crate) edid: Vec<u8>,
     pub(crate) connector_type: String,
+    pub(crate) vrr_capable: bool,
 }

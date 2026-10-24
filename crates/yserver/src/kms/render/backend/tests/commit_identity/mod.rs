@@ -5,5 +5,6 @@ mod gamma;
 pub(super) mod recording_scene;
 mod scene;
 pub(super) mod support;
+mod vrr;
 
 pub(super) use atomic_events::install_recording_vt_io;

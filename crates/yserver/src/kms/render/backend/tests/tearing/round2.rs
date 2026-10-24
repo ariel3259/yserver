@@ -2470,6 +2470,7 @@ fn discarded_vt_flip_events_do_not_shift_the_next_async_turnaround_match() {
                     mm_height: 0,
                     edid: Vec::new(),
                     connector_type: "test".to_owned(),
+                    vrr_capable: false,
                 })
                 .collect())
         }

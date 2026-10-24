@@ -2408,6 +2408,7 @@ fn direct_pending_refresh_cleared_on_unflip_or_output_removal() {
                 mm_height: output.output.mm_height,
                 edid: output.output.edid.clone(),
                 connector_type: output.output.connector_type.clone(),
+                vrr_capable: output.output.connector_vrr_capable,
             })
             .collect();
         snapshots[0].modes.clear();
