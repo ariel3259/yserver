@@ -282,22 +282,18 @@ pub(crate) fn append_pending_gamma_lut(
     }
     let pending = output.pending_gamma_lut.borrow().clone()?;
     if sink.other_crtc_page_flip_commit_in_flight(device, output.crtc) {
-        match output.pending_gamma_deadline.get() {
-            Some(deadline) if deadline <= now => {}
-            Some(_) => return None,
-            None => {
-                let refresh_hz = match output.picked.vrefresh {
-                    0 => 60,
-                    refresh_hz => refresh_hz,
-                };
-                let refresh_period =
-                    std::time::Duration::from_nanos(1_000_000_000 / u64::from(refresh_hz));
-                output
-                    .pending_gamma_deadline
-                    .set(Some(now + refresh_period));
-                return None;
-            }
+        if output.pending_gamma_deadline.get().is_none() {
+            let refresh_hz = match output.picked.vrefresh {
+                0 => 60,
+                refresh_hz => refresh_hz,
+            };
+            let refresh_period =
+                std::time::Duration::from_nanos(1_000_000_000 / u64::from(refresh_hz));
+            output
+                .pending_gamma_deadline
+                .set(Some(now + refresh_period));
         }
+        return None;
     }
     let Some(blob_bytes) = gamma_lut_blob_bytes(&pending) else {
         log::error!(

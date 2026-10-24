@@ -1662,7 +1662,7 @@ fn gamma_replacement_keeps_first_deadline_and_submits_the_second_ramp() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: set the deadline only for active CRTCs.
+// Mutation: restore the deadline exception in append_pending_gamma_lut.
 fn gamma_held_on_idle_crtc_by_other_output_gets_one_refresh_deadline() {
     let Some((fixture, direct)) = super::direct_unflip::direct_fixture(
         2,
@@ -1743,29 +1743,50 @@ fn gamma_held_on_idle_crtc_by_other_output_gets_one_refresh_deadline() {
 
     elapsed_ns.store(16_666_667, Ordering::SeqCst);
     Backend::maybe_composite(&mut fixture.events.backend).expect("expired gamma deadline tick");
-    let records = recorder.records();
-    let gamma_records: Vec<_> = records
+    let records_at_deadline = recorder.records();
+    let gamma_records_at_deadline: Vec<_> = records_at_deadline
         .iter()
         .filter(|record| record.kind == AtomicCommitKind::GammaOnly)
         .collect();
-    let gamma_count = gamma_records.len();
-    let gamma = gamma_records.first().copied().cloned();
+    let gamma_count_at_deadline = gamma_records_at_deadline.len();
+    let gamma_at_deadline = gamma_records_at_deadline.first().copied().cloned();
+    let pending_lut_retained_at_deadline = fixture.events.backend.platform.outputs[1]
+        .output
+        .pending_gamma_lut
+        .borrow()
+        .is_some();
+    let no_expired_gamma_wakeup = Backend::next_wakeup(&fixture.events.backend) != Some(deadline);
+
+    if let Some(gamma) = &gamma_at_deadline {
+        complete_recorded_attempt(&mut fixture.events, fd, gamma, 2);
+    }
+    let sibling_event_record_offset = recorder.records().len();
+    super::direct_unflip::complete_direct_initial(&mut fixture, &direct_record, direct_id, fd);
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("retry the expired LUT after the sibling CRTC retires");
+    let gamma_after_sibling_event: Vec<_> = recorder
+        .records()
+        .into_iter()
+        .skip(sibling_event_record_offset)
+        .filter(|record| record.kind == AtomicCommitKind::GammaOnly)
+        .collect();
+    let gamma_count_after_sibling_event = gamma_after_sibling_event.len();
+    let gamma = gamma_after_sibling_event.first().cloned();
     let gamma_targets_idle_crtc = gamma.as_ref().is_some_and(|gamma| {
         gamma.events.len() == 1
             && gamma.events[0].crtc == crtc
             && contains_crtc_property(gamma, crtc, handle(70))
             && accepted_event_id(gamma).is_some()
     });
-    let pending_lut_cleared_after_deadline = fixture.events.backend.platform.outputs[1]
+    let pending_lut_cleared_after_sibling_event = fixture.events.backend.platform.outputs[1]
         .output
         .pending_gamma_lut
         .borrow()
         .is_none();
 
     if let Some(gamma) = &gamma {
-        complete_recorded_attempt(&mut fixture.events, fd, gamma, 2);
+        complete_recorded_attempt(&mut fixture.events, fd, gamma, 3);
     }
-    super::direct_unflip::complete_direct_initial(&mut fixture, &direct_record, direct_id, fd);
     super::direct_unflip::drain_present_notifications(
         &mut fixture,
         &[direct.candidate.present_id],
@@ -1800,16 +1821,28 @@ fn gamma_held_on_idle_crtc_by_other_output_gets_one_refresh_deadline() {
         "the Backend remains scheduled no later than the gamma deadline"
     );
     assert_eq!(
-        gamma_count, 1,
-        "the deadline submits exactly one gamma-only commit"
+        gamma_count_at_deadline, 0,
+        "the deadline does not submit gamma while another CRTC is in flight"
+    );
+    assert!(
+        pending_lut_retained_at_deadline,
+        "the pending LUT stays retained at its expired deadline"
+    );
+    assert!(
+        no_expired_gamma_wakeup,
+        "the held expired deadline does not cause an immediate timeout loop"
+    );
+    assert_eq!(
+        gamma_count_after_sibling_event, 1,
+        "the other CRTC's event submits exactly one gamma-only commit"
     );
     assert!(
         gamma_targets_idle_crtc,
         "gamma-only targets output 1's CRTC with a P1 ID"
     );
     assert!(
-        pending_lut_cleared_after_deadline,
-        "accepted standalone commit consumes the pending LUT"
+        pending_lut_cleared_after_sibling_event,
+        "accepted event retry consumes the pending LUT"
     );
 }
 
@@ -2673,8 +2706,8 @@ fn p1_gamma_other_crtc_event_keeps_active_output_on_task2_deadline() {
 }
 
 #[test]
-// Mutation: omit deadline fallback while another CRTC of the device is busy.
-fn p1_gamma_busy_device_still_sends_lut_at_its_deadline() {
+// Mutation: restore the deadline exception in append_pending_gamma_lut.
+fn p1_gamma_busy_device_holds_lut_past_deadline_until_other_event() {
     let mut fixture = AtomicEventFixture::from_backend(KmsBackend::for_tests());
     super::super::push_test_output(&mut fixture.backend, 2);
     let fd = fixture.backend.platform.devices[0]
@@ -2738,7 +2771,25 @@ fn p1_gamma_busy_device_still_sends_lut_at_its_deadline() {
     if let Some(output0_gamma) = output0_gamma_at_deadline.as_ref() {
         complete_recorded_attempt(&mut fixture, fd, output0_gamma, 3);
     }
+    let sibling_event_record_offset = recorder.records().len();
     complete_recorded_attempt(&mut fixture, fd, &output1_gamma, 2);
+    let output0_gamma_after_other_event = recorder
+        .records()
+        .into_iter()
+        .skip(sibling_event_record_offset)
+        .find(|record| {
+            record.kind == AtomicCommitKind::GammaOnly
+                && contains_crtc_property(record, crtc0, handle(70))
+                && accepted_event_id(record).is_some()
+        });
+    let output0_pending_after_other_event = fixture.backend.platform.outputs[0]
+        .output
+        .pending_gamma_lut
+        .borrow()
+        .is_some();
+    if let Some(output0_gamma) = output0_gamma_after_other_event.as_ref() {
+        complete_recorded_attempt(&mut fixture, fd, output0_gamma, 4);
+    }
 
     assert_eq!(deadline, Some(base + Duration::from_nanos(16_666_666)));
     assert!(
@@ -2750,15 +2801,230 @@ fn p1_gamma_busy_device_still_sends_lut_at_its_deadline() {
         "output 1 remains busy at output 0's deadline"
     );
     assert!(
-        output0_gamma_at_deadline.is_some(),
-        "output 0's LUT is submitted when its deadline expires despite output 1 being busy"
+        output0_gamma_at_deadline.is_none(),
+        "output 0's LUT stays held when its deadline expires while output 1 is busy"
     );
     assert!(
-        !output0_pending_after_deadline,
-        "the accepted deadline commit consumes output 0's pending LUT"
+        output0_pending_after_deadline,
+        "output 0 retains its pending LUT while output 1 is busy"
     );
     assert!(
         output1_still_busy_after_deadline,
-        "output 0's deadline commit does not retire output 1's in-flight commit"
+        "output 1 remains busy after output 0's deadline"
+    );
+    assert!(
+        output0_gamma_after_other_event.is_some(),
+        "output 1's event submits output 0's pending LUT"
+    );
+    assert!(
+        !output0_pending_after_other_event,
+        "the accepted retry consumes output 0's pending LUT"
+    );
+}
+
+#[test]
+// Mutation: restore the deadline exception in append_pending_gamma_lut.
+fn p1_gamma_deadline_gate_waits_for_sibling_after_own_commit_event() {
+    let mut fixture = AtomicEventFixture::from_backend(KmsBackend::for_tests());
+    super::super::push_test_output(&mut fixture.backend, 2);
+    let fd = fixture.backend.platform.devices[0]
+        .device
+        .as_fd()
+        .as_raw_fd();
+    let recorder = fixture.recorders[&fd].clone();
+    let (output0_xid, crtc0) = enable_gamma(&mut fixture.backend, &recorder, 0, 4);
+    let (output1_xid, crtc1) = enable_gamma(&mut fixture.backend, &recorder, 1, 4);
+    assert_ne!(crtc0, crtc1);
+    fixture.backend.scene.scene_structure_dirty = false;
+    let (base, elapsed_ns) = install_controlled_gamma_clock(&mut fixture.backend, Duration::ZERO);
+
+    set_test_gamma(&mut fixture.backend, output1_xid, 0x9999);
+    let output1_gamma = recorder
+        .records()
+        .into_iter()
+        .find(|record| {
+            record.kind == AtomicCommitKind::GammaOnly
+                && contains_crtc_property(record, crtc1, handle(70))
+                && accepted_event_id(record).is_some()
+        })
+        .expect("output 1 gamma-only commit is accepted and remains in flight");
+
+    let device = Rc::clone(&fixture.backend.platform.devices[0].device);
+    let sink = Rc::clone(&fixture.backend.platform.devices[0].atomic_commit_sink);
+    sink.submit_with_commit_id(
+        &device,
+        ::drm::control::AtomicCommitFlags::PAGE_FLIP_EVENT
+            | ::drm::control::AtomicCommitFlags::NONBLOCK,
+        AtomicCommitKind::Scene,
+        AtomicCommitRequest::new(),
+        &[AtomicCommitEvent {
+            crtc: crtc0,
+            motion_timestamp: None,
+        }],
+    )
+    .expect("output 0's frame commit is accepted while output 1 is in flight");
+    let output0_frame = recorder
+        .records()
+        .into_iter()
+        .find(|record| {
+            record.kind == AtomicCommitKind::Scene
+                && record.events.iter().any(|event| event.crtc == crtc0)
+                && accepted_event_id(record).is_some()
+        })
+        .expect("output 0's accepted frame remains in flight");
+
+    set_test_gamma(&mut fixture.backend, output0_xid, 0xaaaa);
+    let deadline = fixture.backend.platform.outputs[0]
+        .output
+        .pending_gamma_deadline
+        .get()
+        .expect("output 0's in-flight frame gives its LUT a deadline");
+    let output0_pending_before_event = fixture.backend.platform.outputs[0]
+        .output
+        .pending_gamma_lut
+        .borrow()
+        .is_some();
+    let no_output0_lut_before_event = !recorder
+        .records()
+        .iter()
+        .any(|record| contains_crtc_property(record, crtc0, handle(70)));
+
+    elapsed_ns.store(16_666_667, Ordering::SeqCst);
+    complete_recorded_attempt(&mut fixture, fd, &output0_frame, 1);
+    let output0_lut_while_output1_busy = recorder
+        .records()
+        .iter()
+        .filter(|record| contains_crtc_property(record, crtc0, handle(70)))
+        .count();
+    let output0_pending_after_own_event = fixture.backend.platform.outputs[0]
+        .output
+        .pending_gamma_lut
+        .borrow()
+        .is_some();
+    let now = fixture.backend.monotonic_now();
+    let no_expired_gamma_wakeup =
+        Backend::next_wakeup(&fixture.backend).is_none_or(|wakeup| wakeup > now);
+    if let Some(output0_gamma) = recorder.records().into_iter().find(|record| {
+        record.kind == AtomicCommitKind::GammaOnly
+            && contains_crtc_property(record, crtc0, handle(70))
+            && accepted_event_id(record).is_some()
+    }) {
+        complete_recorded_attempt(&mut fixture, fd, &output0_gamma, 2);
+    }
+
+    let sibling_event_record_offset = recorder.records().len();
+    complete_recorded_attempt(&mut fixture, fd, &output1_gamma, 2);
+    let output0_gamma_after_sibling_event: Vec<_> = recorder
+        .records()
+        .into_iter()
+        .skip(sibling_event_record_offset)
+        .filter(|record| {
+            record.kind == AtomicCommitKind::GammaOnly
+                && contains_crtc_property(record, crtc0, handle(70))
+                && accepted_event_id(record).is_some()
+        })
+        .collect();
+    let output0_pending_after_sibling_event = fixture.backend.platform.outputs[0]
+        .output
+        .pending_gamma_lut
+        .borrow()
+        .is_some();
+    if let Some(output0_gamma) = output0_gamma_after_sibling_event.first() {
+        complete_recorded_attempt(&mut fixture, fd, output0_gamma, 3);
+    }
+
+    assert_eq!(deadline, base + Duration::from_nanos(16_666_666));
+    assert!(output0_pending_before_event, "output 0's LUT is pending");
+    assert!(
+        no_output0_lut_before_event,
+        "output 0's frame carries no LUT while output 1 is in flight"
+    );
+    assert_eq!(
+        output0_lut_while_output1_busy, 0,
+        "output 0's own event does not bypass the gate while output 1 is busy"
+    );
+    assert!(
+        output0_pending_after_own_event,
+        "output 0 keeps its LUT pending after its own event"
+    );
+    assert!(
+        no_expired_gamma_wakeup,
+        "a device-gated expired LUT does not schedule an immediate timeout"
+    );
+    assert_eq!(
+        output0_gamma_after_sibling_event.len(),
+        1,
+        "output 1's event submits exactly one output 0 LUT commit"
+    );
+    assert!(
+        !output0_pending_after_sibling_event,
+        "the accepted output 0 commit consumes its pending LUT"
+    );
+}
+
+#[test]
+// Mutation: keep reporting the expired deadline for a LUT held by the device gate.
+fn p1_gamma_device_gate_does_not_report_an_expired_event_loop_deadline() {
+    let mut fixture = AtomicEventFixture::from_backend(KmsBackend::for_tests());
+    super::super::push_test_output(&mut fixture.backend, 2);
+    let fd = fixture.backend.platform.devices[0]
+        .device
+        .as_fd()
+        .as_raw_fd();
+    let recorder = fixture.recorders[&fd].clone();
+    let (output0_xid, crtc0) = enable_gamma(&mut fixture.backend, &recorder, 0, 4);
+    let (output1_xid, crtc1) = enable_gamma(&mut fixture.backend, &recorder, 1, 4);
+    assert_ne!(crtc0, crtc1);
+    fixture.backend.scene.scene_structure_dirty = false;
+    let (base, elapsed_ns) = install_controlled_gamma_clock(&mut fixture.backend, Duration::ZERO);
+
+    set_test_gamma(&mut fixture.backend, output1_xid, 0xbbbb);
+    let output1_gamma = recorder
+        .records()
+        .into_iter()
+        .find(|record| {
+            record.kind == AtomicCommitKind::GammaOnly
+                && contains_crtc_property(record, crtc1, handle(70))
+                && accepted_event_id(record).is_some()
+        })
+        .expect("output 1 gamma-only commit is accepted and remains in flight");
+    set_test_gamma(&mut fixture.backend, output0_xid, 0xcccc);
+    let deadline = fixture.backend.platform.outputs[0]
+        .output
+        .pending_gamma_deadline
+        .get()
+        .expect("device-gated output 0 gamma has a refresh deadline");
+
+    elapsed_ns.store(16_666_667, Ordering::SeqCst);
+    let now = fixture.backend.monotonic_now();
+    let next_wakeup = Backend::next_wakeup(&fixture.backend);
+
+    complete_recorded_attempt(&mut fixture, fd, &output1_gamma, 1);
+    let output0_gamma = recorder.records().into_iter().find(|record| {
+        record.kind == AtomicCommitKind::GammaOnly
+            && contains_crtc_property(record, crtc0, handle(70))
+            && accepted_event_id(record).is_some()
+    });
+    let output0_pending_after_sibling_event = fixture.backend.platform.outputs[0]
+        .output
+        .pending_gamma_lut
+        .borrow()
+        .is_some();
+    if let Some(output0_gamma) = output0_gamma.as_ref() {
+        complete_recorded_attempt(&mut fixture, fd, output0_gamma, 2);
+    }
+
+    assert_eq!(deadline, base + Duration::from_nanos(16_666_666));
+    assert!(
+        next_wakeup.is_none_or(|wakeup| wakeup > now),
+        "the core timeout calculation omits the expired deadline while another CRTC is in flight"
+    );
+    assert!(
+        output0_gamma.is_some(),
+        "output 1's event submits output 0's pending LUT"
+    );
+    assert!(
+        !output0_pending_after_sibling_event,
+        "the accepted retry consumes output 0's pending LUT"
     );
 }

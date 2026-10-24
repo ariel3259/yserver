@@ -2996,9 +2996,18 @@ impl KmsBackend {
                     .outputs
                     .iter()
                     .filter_map(|layout| {
-                        (layout.output.pending_gamma_lut.borrow().is_some())
-                            .then_some(layout.output.pending_gamma_deadline.get())
-                            .flatten()
+                        if layout.output.pending_gamma_lut.borrow().is_none() {
+                            return None;
+                        }
+                        let deadline = layout.output.pending_gamma_deadline.get()?;
+                        let device = self.platform.device_for_key(layout.key.device_key)?;
+                        let device_gate_held = device
+                            .atomic_commit_sink
+                            .other_crtc_page_flip_commit_in_flight(
+                                &device.device,
+                                layout.output.crtc,
+                            );
+                        (deadline > now || !device_gate_held).then_some(deadline)
                     })
                     .min()
             })
