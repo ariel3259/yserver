@@ -184,7 +184,8 @@ With DPMS off every CRTC has `ACTIVE=0`, and the kernel rejects a commit that re
 the modeset), and the DPMS-on reapply did nothing. The deadline paths are already gated on the outputs being on;
 the request path was not.
 
-**Fix.** While the outputs are off, `SetCrtcGamma` only stores the LUT as pending, with no commit. The DPMS-on path
+**Fix.** While the outputs are off, `SetCrtcGamma` sends no commit: the immediate submission is skipped and the LUT
+stays pending with its deadline (the deadline paths already wait for the outputs to be on). The DPMS-on path
 already marks the LUT pending again, and the next commit on the CRTC carries it.
 
 - Test: DPMS off, `SetCrtcGamma`: no atomic commit, gamma not latched off; DPMS on: the LUT reaches the CRTC and a
@@ -229,7 +230,7 @@ already held, so coalescing alone does not help.
 **Fix.** A pending LUT is added to a commit only when no other CRTC on the same device has a commit in flight;
 otherwise it stays pending. It is retried on the page-flip events of every CRTC of the device, and the existing
 one-refresh deadline still applies: at the deadline the LUT goes out even if the device is busy (the stall is then
-paid, as today), so it is never held longer. Frames without a LUT are unchanged. On other drivers the cost is at most
+paid, as today), so it is never held longer. A frame is never held by this rule: it goes out without the LUT. An active CRTC keeps the Task 2 wait. On other drivers the cost is at most
 one refresh of gamma latency.
 
 - Test: two outputs on one device, output 1 has a commit in flight: `SetCrtcGamma` on output 0 adds no LUT to any
