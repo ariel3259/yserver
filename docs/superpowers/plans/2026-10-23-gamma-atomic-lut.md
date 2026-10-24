@@ -261,6 +261,11 @@ the gate must not make the event loop wake immediately in a loop.
 - Hardware: the four runs on AMD again; target: two-output LUT commits near the one-output cost (~0.6 ms), no frame
   drops in mpv, gamma still applied on every CRTC (kernel readback).
 
+**Tasks 7 and 7b reverted (review of #293).** The gate makes LUT submission depend on the other CRTCs: on a
+Radeon 680M with two outputs, each running a fullscreen mpv, the CRTCs committed strictly alternately and the first LUT
+waited 40 frames; with identical pixel clocks the gap may never open. Bounded recovery is out of proportion for this
+change. The submission path is the Task 6 one again; the amdgpu multi-output stall is documented in `docs/status.md`.
+
 ### Task 8: docs
 
 The NVIDIA note: measured on nvidia-drm 615.78.08, the flip UST is about 0.97 s behind `CLOCK_MONOTONIC`, with
