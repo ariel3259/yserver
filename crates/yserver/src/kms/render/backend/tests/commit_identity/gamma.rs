@@ -95,8 +95,13 @@ fn seed_recent_gamma_page_flip(backend: &mut KmsBackend, output_idx: usize) {
     );
 }
 
-fn install_controlled_gamma_clock(backend: &mut KmsBackend) -> (Instant, Arc<AtomicU64>) {
-    let base = Instant::now();
+fn install_controlled_gamma_clock(
+    backend: &mut KmsBackend,
+    wall_clock_lag: Duration,
+) -> (Instant, Arc<AtomicU64>) {
+    let base = Instant::now()
+        .checked_sub(wall_clock_lag)
+        .expect("test CLOCK_MONOTONIC age is available");
     let elapsed_ns = Arc::new(AtomicU64::new(0));
     let clock_elapsed_ns = Arc::clone(&elapsed_ns);
     backend.for_tests_set_monotonic_clock(Rc::new(move || {
@@ -400,7 +405,7 @@ fn p1_gamma_scene_retry_eio_keeps_lut_pending() {
         .clone();
     complete_recorded_attempt(&mut fixture.events, fd, &initial_scene, 1);
 
-    install_controlled_gamma_clock(&mut fixture.events.backend);
+    install_controlled_gamma_clock(&mut fixture.events.backend, Duration::ZERO);
     set_test_gamma(&mut fixture.events.backend, crtc_xid, 0x4567);
     assert!(
         recorder
@@ -889,7 +894,8 @@ fn p1_gamma_async_flip_defers_lut_to_the_next_vsync_commit() {
     let red = vec![0x1111; 4];
     let green = vec![0x2222; 4];
     let blue = vec![0x3333; 4];
-    let (base, elapsed_ns) = install_controlled_gamma_clock(&mut fixture.events.backend);
+    let (base, elapsed_ns) =
+        install_controlled_gamma_clock(&mut fixture.events.backend, Duration::ZERO);
     Backend::set_crtc_gamma(&mut fixture.events.backend, crtc_xid, &red, &green, &blue)
         .expect("retain gamma while the async frame is in flight");
     assert!(
@@ -1005,7 +1011,8 @@ fn p1_gamma_active_async_flips_do_not_carry_or_advance_the_lut_deadline() {
         .expect("Backend submits async scene frame while tearing is active")
         .clone();
     seed_recent_gamma_page_flip(&mut fixture.events.backend, 0);
-    let (base, elapsed_ns) = install_controlled_gamma_clock(&mut fixture.events.backend);
+    let (base, elapsed_ns) =
+        install_controlled_gamma_clock(&mut fixture.events.backend, Duration::ZERO);
 
     set_test_gamma(&mut fixture.events.backend, crtc_xid, 0x6666);
     let records = recorder.records();
@@ -1271,7 +1278,7 @@ fn p1_gamma_reapplies_after_modeset_and_vt_resume() {
 // Mutations: submit immediately for active gamma, or omit its deadline from next_wakeup.
 fn gamma_active_crtc_exposes_deadline_and_submits_once_when_no_frame_arrives() {
     let (mut backend, recorder, crtc_xid, _) = gamma_backend_with_recorder();
-    let (base, elapsed_ns) = install_controlled_gamma_clock(&mut backend);
+    let (base, elapsed_ns) = install_controlled_gamma_clock(&mut backend, Duration::ZERO);
     seed_recent_gamma_page_flip(&mut backend, 0);
 
     set_test_gamma(&mut backend, crtc_xid, 0x1111);
@@ -1352,7 +1359,7 @@ fn p1_gamma_set_while_dpms_off_stays_pending_and_applies_after_wake() {
     let recorder = fixture.recorders[&fd].clone();
     let (crtc_xid, crtc) = enable_gamma(&mut fixture.backend, &recorder, 0, 4);
     fixture.backend.scene.scene_structure_dirty = false;
-    let (base, elapsed_ns) = install_controlled_gamma_clock(&mut fixture.backend);
+    let (base, elapsed_ns) = install_controlled_gamma_clock(&mut fixture.backend, Duration::ZERO);
 
     Backend::set_dpms_power(&mut fixture.backend, 3).expect("DPMS off through Backend");
     assert!(
@@ -1572,7 +1579,7 @@ fn p1_gamma_set_while_dpms_off_stays_pending_and_applies_after_wake() {
 // Mutation: discard the pageflip timestamp when a newer idle sequence replaces the completion clock.
 fn gamma_activity_survives_a_newer_idle_sequence_sample() {
     let (mut backend, recorder, crtc_xid, crtc) = gamma_backend_with_recorder();
-    install_controlled_gamma_clock(&mut backend);
+    install_controlled_gamma_clock(&mut backend, Duration::ZERO);
     seed_recent_gamma_page_flip(&mut backend, 0);
 
     let key = CrtcKey::for_output(&backend.platform.outputs[0]);
@@ -1619,7 +1626,7 @@ fn gamma_activity_survives_a_newer_idle_sequence_sample() {
 fn gamma_replacement_keeps_first_deadline_and_submits_the_second_ramp() {
     let (mut backend, recorder, crtc_xid, _) = gamma_backend_with_recorder();
     backend.platform.outputs[0].output.picked.vrefresh = 0;
-    let (base, elapsed_ns) = install_controlled_gamma_clock(&mut backend);
+    let (base, elapsed_ns) = install_controlled_gamma_clock(&mut backend, Duration::ZERO);
     seed_recent_gamma_page_flip(&mut backend, 0);
 
     set_test_gamma(&mut backend, crtc_xid, 0x1111);
@@ -1706,7 +1713,8 @@ fn gamma_held_on_idle_crtc_by_other_output_gets_one_refresh_deadline() {
     );
     recorder.clear_records();
 
-    let (base, elapsed_ns) = install_controlled_gamma_clock(&mut fixture.events.backend);
+    let (base, elapsed_ns) =
+        install_controlled_gamma_clock(&mut fixture.events.backend, Duration::ZERO);
     set_test_gamma(&mut fixture.events.backend, crtc_xid, 0x6666);
     assert!(
         recorder.records().is_empty(),
@@ -2058,7 +2066,7 @@ fn p1_gamma_direct_retry_eio_keeps_lut_pending_and_returns_retry_error() {
         &[],
     );
 
-    install_controlled_gamma_clock(&mut fixture.events.backend);
+    install_controlled_gamma_clock(&mut fixture.events.backend, Duration::ZERO);
     set_test_gamma(&mut fixture.events.backend, crtc_xid, 0x6789);
     assert!(
         recorder
@@ -2281,6 +2289,7 @@ fn gamma_idle_crtc_uses_old_receipt_even_when_kernel_ust_is_recent() {
 // Mutation: check only the LUT's own CRTC.
 fn p1_gamma_idle_lut_retries_on_another_crtcs_event() {
     let mut fixture = AtomicEventFixture::from_backend(KmsBackend::for_tests());
+    let (base, _) = install_controlled_gamma_clock(&mut fixture.backend, Duration::ZERO);
     super::super::push_test_output(&mut fixture.backend, 2);
     let fd = fixture.backend.platform.devices[0]
         .device
@@ -2335,6 +2344,10 @@ fn p1_gamma_idle_lut_retries_on_another_crtcs_event() {
         .output
         .pending_gamma_deadline
         .get();
+    assert!(
+        output0_deadline.is_some_and(|deadline| base < deadline),
+        "the sibling event is handled before output 0's controlled deadline"
+    );
     let output0_pending_before_event = fixture.backend.platform.outputs[0]
         .output
         .pending_gamma_lut
@@ -2384,15 +2397,13 @@ fn p1_gamma_idle_lut_retries_on_another_crtcs_event() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: gate the whole frame instead of the LUT.
+// Mutations: gate the whole frame instead of the LUT; sample frame append time
+// independently of backend time.
 fn p1_gamma_device_gate_keeps_scene_frame_without_lut() {
-    let Some(fixture) = super::recording_scene::RecordingSceneFixture::new(2)
+    let mut fixture = super::recording_scene::RecordingSceneFixture::new(2)
         .expect("two-output recording scene fixture construction")
-    else {
-        eprintln!("skip: no Vulkan scene fixture available");
-        return;
-    };
-    let mut fixture = fixture.cleanup_guard();
+        .expect("two-output recording scene fixture is available under lavapipe")
+        .cleanup_guard();
     let fd = fixture.kms_fd(0);
     let recorder = fixture.events.recorders[&fd].clone();
     let (output0_xid, crtc0) = enable_gamma(&mut fixture.events.backend, &recorder, 0, 4);
@@ -2444,7 +2455,8 @@ fn p1_gamma_device_gate_keeps_scene_frame_without_lut() {
         .into_iter()
         .find(|record| accepted_event_id(record).is_some())
         .expect("output 1's P1 commit is recorded");
-    let (base, elapsed_ns) = install_controlled_gamma_clock(&mut fixture.events.backend);
+    let (base, elapsed_ns) =
+        install_controlled_gamma_clock(&mut fixture.events.backend, Duration::from_secs(1));
     set_test_gamma(&mut fixture.events.backend, output0_xid, 0x4444);
     let expected_deadline = base + Duration::from_nanos(16_666_666);
     let deadline = fixture.events.backend.platform.outputs[0]
@@ -2594,7 +2606,7 @@ fn p1_gamma_other_crtc_event_keeps_active_output_on_task2_deadline() {
     assert_ne!(crtc0, crtc1);
     fixture.backend.scene.scene_structure_dirty = false;
     seed_recent_gamma_page_flip(&mut fixture.backend, 0);
-    let (base, elapsed_ns) = install_controlled_gamma_clock(&mut fixture.backend);
+    let (base, elapsed_ns) = install_controlled_gamma_clock(&mut fixture.backend, Duration::ZERO);
 
     set_test_gamma(&mut fixture.backend, output0_xid, 0x5555);
     let first_deadline = fixture.backend.platform.outputs[0]
@@ -2685,7 +2697,7 @@ fn p1_gamma_busy_device_still_sends_lut_at_its_deadline() {
                 && accepted_event_id(record).is_some()
         })
         .expect("output 1 gamma-only commit is accepted and remains in flight");
-    let (base, elapsed_ns) = install_controlled_gamma_clock(&mut fixture.backend);
+    let (base, elapsed_ns) = install_controlled_gamma_clock(&mut fixture.backend, Duration::ZERO);
     set_test_gamma(&mut fixture.backend, output0_xid, 0x8888);
     let deadline = fixture.backend.platform.outputs[0]
         .output

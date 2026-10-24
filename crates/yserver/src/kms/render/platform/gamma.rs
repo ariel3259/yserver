@@ -14,7 +14,6 @@ impl PlatformBackend {
         &self,
         output_idx: usize,
         now: std::time::Instant,
-        force_other_crtc_busy: bool,
     ) -> std::io::Result<()> {
         let Some(layout) = self.outputs.get(output_idx) else {
             return Ok(());
@@ -37,7 +36,6 @@ impl PlatformBackend {
             &device.atomic_commit_sink,
             output,
             now,
-            force_other_crtc_busy,
             &mut request,
         ) else {
             return Ok(());
@@ -88,18 +86,13 @@ impl PlatformBackend {
         if output.pending_gamma_lut.borrow().is_none() {
             return;
         }
-        let deadline_elapsed = output
-            .pending_gamma_deadline
-            .get()
-            .is_some_and(|deadline| now >= deadline);
         if let Some(deadline) = output.pending_gamma_deadline.get()
             && now < deadline
             && self.gamma_output_is_active(output_idx)
         {
             return;
         }
-        if let Err(error) = self.submit_pending_gamma_for_output(output_idx, now, deadline_elapsed)
-        {
+        if let Err(error) = self.submit_pending_gamma_for_output(output_idx, now) {
             log::warn!(
                 "kms gamma: retry for CRTC {:?} failed: {error}",
                 output.crtc

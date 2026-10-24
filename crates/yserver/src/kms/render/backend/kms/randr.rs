@@ -1609,10 +1609,6 @@ impl KmsBackend {
                 .pending_gamma_deadline
                 .get()
                 .is_none_or(|deadline| now >= deadline);
-            let deadline_expired = output
-                .pending_gamma_deadline
-                .get()
-                .is_some_and(|deadline| now >= deadline);
             if deadline_elapsed
                 && self.scanout_allowed()
                 && self.kms_outputs_active
@@ -1622,7 +1618,7 @@ impl KmsBackend {
                     .page_flip_commit_in_flight(&device.device, crtc)
             {
                 self.platform
-                    .submit_pending_gamma_for_output(output_idx, now, deadline_expired)?;
+                    .submit_pending_gamma_for_output(output_idx, now)?;
             } else if output.pending_gamma_deadline.get().is_none() {
                 output
                     .pending_gamma_deadline

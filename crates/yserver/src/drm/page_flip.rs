@@ -213,6 +213,7 @@ pub(crate) fn submit_scene_flip_with_fences(
         out_fence_holder,
         cursor_positions,
         timing,
+        std::time::Instant::now(),
         crate::drm::atomic::TearingCommitContext::NONE,
     )
 }
@@ -226,6 +227,7 @@ pub(crate) fn submit_scene_flip_with_fences_tearing(
     out_fence_holder: &mut i32,
     cursor_positions: &[CursorPlanePosition],
     timing: crate::drm::async_flip::FlipTiming,
+    now: std::time::Instant,
     tearing_context: crate::drm::atomic::TearingCommitContext,
 ) -> io::Result<u64> {
     let cursor_positions = match timing {
@@ -292,14 +294,7 @@ pub(crate) fn submit_scene_flip_with_fences_tearing(
         && output.pending_gamma_lut.borrow().is_some()
     {
         request_without_gamma = Some(request.clone());
-        append_pending_gamma_lut(
-            device,
-            atomic_commit_sink,
-            output,
-            std::time::Instant::now(),
-            false,
-            &mut request,
-        )
+        append_pending_gamma_lut(device, atomic_commit_sink, output, now, &mut request)
     } else {
         None
     };

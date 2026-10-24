@@ -937,6 +937,7 @@ impl KmsBackend {
         } else {
             crate::drm::async_flip::FlipTiming::Vsync
         };
+        let submit_at = self.monotonic_now();
         let mut result = crate::drm::modeset::submit_direct_scanout(
             &device,
             atomic_commit_sink.as_ref(),
@@ -949,6 +950,7 @@ impl KmsBackend {
                 frame.present_received_monotonic,
                 false,
             ),
+            submit_at,
         );
         let async_outcome = if attempt_timing == crate::drm::async_flip::FlipTiming::Async {
             match result {
@@ -976,6 +978,7 @@ impl KmsBackend {
                             frame.present_received_monotonic,
                             true,
                         ),
+                        submit_at,
                     );
                     crate::drm::async_flip::AsyncOutcome::FellBack { suspended }
                 }
@@ -1444,6 +1447,7 @@ impl KmsBackend {
             atomic_commit_sink.as_ref(),
             &planes,
             &cursor_positions,
+            self.monotonic_now(),
         );
         if let Err(error) = &result
             && atomic_commit_sink.take_last_cursor_rejection()
@@ -1645,6 +1649,7 @@ impl KmsBackend {
             atomic_commit_sink.as_ref(),
             &planes,
             &cursor_positions,
+            self.monotonic_now(),
         );
         if let Err(error) = &result
             && atomic_commit_sink.take_last_cursor_rejection()
@@ -2925,6 +2930,7 @@ impl KmsBackend {
         if self.platform.any_cursor_plane_visible() {
             return;
         }
+        let submit_at = self.monotonic_now();
         for output_idx in 0..self.platform.outputs.len() {
             let Some(shape) = self.platform.scene_async_shape(output_idx) else {
                 continue;
@@ -2933,8 +2939,11 @@ impl KmsBackend {
                 self.platform.outputs[output_idx].output.crtc,
             );
             if self.platform.async_ledger.allows(stream, &shape) {
-                self.platform
-                    .set_scene_flip_timing(output_idx, crate::drm::async_flip::FlipTiming::Async);
+                self.platform.set_scene_flip_timing(
+                    output_idx,
+                    crate::drm::async_flip::FlipTiming::Async,
+                    submit_at,
+                );
             }
         }
     }
@@ -3034,9 +3043,13 @@ impl KmsBackend {
     pub(in crate::kms::render::backend) fn backend_scanout_maybe_composite(
         &mut self,
     ) -> io::Result<()> {
+        let scene_submit_at = self.monotonic_now();
         for output_idx in 0..self.platform.outputs.len() {
-            self.platform
-                .set_scene_flip_timing(output_idx, crate::drm::async_flip::FlipTiming::Vsync);
+            self.platform.set_scene_flip_timing(
+                output_idx,
+                crate::drm::async_flip::FlipTiming::Vsync,
+                scene_submit_at,
+            );
         }
         // GPU-reset recovery: once the renderer has observed a lost
         // device (a submit returned `ERROR_DEVICE_LOST` → `abort_flush`
@@ -3245,6 +3258,19 @@ impl KmsBackend {
             // eligible until every direct output has an accepted replacement;
             // its normal readiness and retry gates still control submission.
             self.scene.mark_scene_structure_dirty();
+        }
+        let scene_submit_at = self.monotonic_now();
+        for output_idx in 0..self.platform.outputs.len() {
+            let timing = self
+                .platform
+                .scene_flip_timings
+                .get(output_idx)
+                .copied()
+                .flatten()
+                .map(|(timing, _)| timing)
+                .unwrap_or(crate::drm::async_flip::FlipTiming::Vsync);
+            self.platform
+                .set_scene_flip_timing(output_idx, timing, scene_submit_at);
         }
         let composed_outputs = if self
             .tearing_cursor_compose_deadline(self.monotonic_now())

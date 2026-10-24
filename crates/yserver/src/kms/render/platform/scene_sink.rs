@@ -112,12 +112,12 @@ impl OutputSink for PlatformBackend {
             )));
         };
         let cursor_positions = self.cursor_plane_atomic_positions_for_outputs(&[output_idx]);
-        let timing = self
+        let (timing, submit_at) = self
             .scene_flip_timings
             .get(output_idx)
             .copied()
             .flatten()
-            .unwrap_or(self.requested_flip_timing);
+            .unwrap_or((self.requested_flip_timing, std::time::Instant::now()));
         let async_ledger = &mut self.async_ledger;
         let tearing_context = crate::drm::atomic::TearingCommitContext::composed(
             self.tearing_copy_received_at,
@@ -170,6 +170,7 @@ impl OutputSink for PlatformBackend {
                     &cursor_positions,
                     async_ledger,
                     timing,
+                    submit_at,
                     tearing_context,
                 );
                 if let Err(error) = &submitted
@@ -307,11 +308,12 @@ impl PlatformBackend {
         &mut self,
         output_idx: usize,
         timing: crate::drm::async_flip::FlipTiming,
+        submit_at: std::time::Instant,
     ) {
         if self.scene_flip_timings.len() <= output_idx {
             self.scene_flip_timings.resize(output_idx + 1, None);
         }
-        self.scene_flip_timings[output_idx] = Some(timing);
+        self.scene_flip_timings[output_idx] = Some((timing, submit_at));
     }
 
     /// Return the exact shape used by the shared composed-flip submission
@@ -623,6 +625,7 @@ fn submit_shared_scanout_frame(
     cursor_positions: &[crate::drm::atomic::CursorPlanePosition],
     async_ledger: &mut crate::drm::async_flip::AsyncFlipLedger,
     timing: crate::drm::async_flip::FlipTiming,
+    now: std::time::Instant,
     tearing_context: crate::drm::atomic::TearingCommitContext,
 ) -> Result<(ComposeSubmit, crate::drm::async_flip::AsyncOutcome, u64), PresentError> {
     use std::os::fd::FromRawFd;
@@ -651,6 +654,7 @@ fn submit_shared_scanout_frame(
         &mut out_fence,
         cursor_positions,
         attempt_timing,
+        now,
         tearing_context,
     );
     let async_outcome = if attempt_timing == crate::drm::async_flip::FlipTiming::Async {
@@ -677,6 +681,7 @@ fn submit_shared_scanout_frame(
                     &mut out_fence,
                     cursor_positions,
                     crate::drm::async_flip::FlipTiming::Vsync,
+                    now,
                     crate::drm::atomic::TearingCommitContext {
                         async_fallback: true,
                         ..tearing_context

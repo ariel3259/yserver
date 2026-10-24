@@ -274,7 +274,6 @@ pub(crate) fn append_pending_gamma_lut(
     sink: &AtomicCommitSink,
     output: &Output,
     now: std::time::Instant,
-    force_other_crtc_busy: bool,
     request: &mut AtomicCommitRequest,
 ) -> Option<u64> {
     let gamma_prop = output.crtc_gamma_lut_prop?;
@@ -282,7 +281,7 @@ pub(crate) fn append_pending_gamma_lut(
         return None;
     }
     let pending = output.pending_gamma_lut.borrow().clone()?;
-    if !force_other_crtc_busy && sink.other_crtc_page_flip_commit_in_flight(device, output.crtc) {
+    if sink.other_crtc_page_flip_commit_in_flight(device, output.crtc) {
         match output.pending_gamma_deadline.get() {
             Some(deadline) if deadline <= now => {}
             Some(_) => return None,
@@ -1871,6 +1870,7 @@ pub(crate) fn submit_direct_scanout(
     cursor_positions: &[CursorPlanePosition],
     timing: crate::drm::async_flip::FlipTiming,
     tearing_context: crate::drm::atomic::TearingCommitContext,
+    now: std::time::Instant,
 ) -> io::Result<u64> {
     if planes.is_empty() {
         return Err(io::Error::other("scanout M2: empty plane transaction"));
@@ -1895,8 +1895,7 @@ pub(crate) fn submit_direct_scanout(
                 device,
                 atomic_commit_sink,
                 state.output,
-                std::time::Instant::now(),
-                false,
+                now,
                 &mut request,
             ) {
                 gamma_blobs.push((state.output, blob));
@@ -2032,6 +2031,7 @@ pub(crate) fn submit_composed_scanout(
     atomic_commit_sink: &AtomicCommitSink,
     planes: &[ComposedScanoutPlaneState<'_>],
     cursor_positions: &[CursorPlanePosition],
+    now: std::time::Instant,
 ) -> io::Result<u64> {
     if planes.is_empty() {
         return Err(io::Error::other("scanout M2: empty composed transaction"));
@@ -2092,14 +2092,9 @@ pub(crate) fn submit_composed_scanout(
     let request_without_gamma = has_pending_gamma.then(|| request.clone());
     let mut gamma_blobs = Vec::new();
     for state in planes {
-        if let Some(blob) = append_pending_gamma_lut(
-            device,
-            atomic_commit_sink,
-            state.output,
-            std::time::Instant::now(),
-            false,
-            &mut request,
-        ) {
+        if let Some(blob) =
+            append_pending_gamma_lut(device, atomic_commit_sink, state.output, now, &mut request)
+        {
             gamma_blobs.push((state.output, blob));
         }
     }
