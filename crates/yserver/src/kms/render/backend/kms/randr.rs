@@ -1497,14 +1497,23 @@ impl KmsBackend {
             return Ok(None);
         };
         let size = if layout.output.crtc_gamma_lut_prop.is_some() {
-            device
+            let legacy_size = device
                 .atomic_commit_sink
                 .crtc_gamma_size(&device.device, crtc)
                 .map_err(|e| {
                     io::Error::other(format!(
                         "get_crtc gamma size for {output_key:?} failed: {e}"
                     ))
-                })?
+                })?;
+            if legacy_size == 0 {
+                layout
+                    .output
+                    .crtc_gamma_lut_size
+                    .map(|size| u16::try_from(size).unwrap_or(u16::MAX))
+                    .unwrap_or(0)
+            } else {
+                legacy_size
+            }
         } else {
             0
         };

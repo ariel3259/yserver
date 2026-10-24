@@ -853,6 +853,7 @@ impl PlatformBackend {
                     plane_in_fence_fd_prop: None,
                     crtc_out_fence_ptr_prop: None,
                     crtc_gamma_lut_prop: None,
+                    crtc_gamma_lut_size: None,
                     crtc_degamma_lut_prop: None,
                     crtc_ctm_prop: None,
                     pending_gamma_lut: std::cell::RefCell::new(None),

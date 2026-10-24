@@ -211,6 +211,9 @@ pub struct Output {
     /// Cached atomic gamma properties. A missing `GAMMA_LUT` property means
     /// this CRTC does not expose gamma correction.
     pub crtc_gamma_lut_prop: Option<property::Handle>,
+    /// Raw `GAMMA_LUT_SIZE` property value. Used only when the legacy CRTC
+    /// gamma length is zero.
+    pub crtc_gamma_lut_size: Option<u64>,
     pub crtc_degamma_lut_prop: Option<property::Handle>,
     pub crtc_ctm_prop: Option<property::Handle>,
     /// Newest gamma ramp waiting for a vsync commit. This handoff lives on
@@ -982,6 +985,9 @@ fn finalize_output_with_mode(
     let crtc_gamma_lut_prop = crtc_props
         .as_ref()
         .and_then(|props| props.id("GAMMA_LUT").ok());
+    let crtc_gamma_lut_size = crtc_props
+        .as_ref()
+        .and_then(|props| props.value("GAMMA_LUT_SIZE"));
     let crtc_degamma_lut_prop = crtc_props
         .as_ref()
         .and_then(|props| props.id("DEGAMMA_LUT").ok());
@@ -1033,6 +1039,7 @@ fn finalize_output_with_mode(
         plane_in_fence_fd_prop,
         crtc_out_fence_ptr_prop,
         crtc_gamma_lut_prop,
+        crtc_gamma_lut_size,
         crtc_degamma_lut_prop,
         crtc_ctm_prop,
         pending_gamma_lut: RefCell::new(None),
@@ -1266,7 +1273,7 @@ where
 }
 
 pub(crate) struct PropMap {
-    handles: HashMap<String, property::Info>,
+    properties: HashMap<String, (property::Info, u64)>,
 }
 
 impl PropMap {
@@ -1275,16 +1282,23 @@ impl PropMap {
         H: drm::control::ResourceHandle,
     {
         let props = device.get_properties(handle)?;
-        Ok(Self {
-            handles: props.as_hashmap(device)?,
-        })
+        let mut properties = HashMap::new();
+        for (property_handle, raw_value) in props.iter() {
+            let info = device.get_property(*property_handle)?;
+            properties.insert(info.name().to_str().unwrap().to_owned(), (info, *raw_value));
+        }
+        Ok(Self { properties })
     }
 
     pub(crate) fn id(&self, name: &str) -> io::Result<property::Handle> {
-        self.handles
+        self.properties
             .get(name)
-            .map(|info| info.handle())
+            .map(|(info, _)| info.handle())
             .ok_or_else(|| io::Error::other(format!("property {name:?} not exposed")))
+    }
+
+    pub(crate) fn value(&self, name: &str) -> Option<u64> {
+        self.properties.get(name).map(|(_, value)| *value)
     }
 }
 

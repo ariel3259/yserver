@@ -106,6 +106,7 @@ pub(super) fn clone_test_drm_output(
         plane_in_fence_fd_prop: output.plane_in_fence_fd_prop,
         crtc_out_fence_ptr_prop: output.crtc_out_fence_ptr_prop,
         crtc_gamma_lut_prop: output.crtc_gamma_lut_prop,
+        crtc_gamma_lut_size: output.crtc_gamma_lut_size,
         crtc_degamma_lut_prop: output.crtc_degamma_lut_prop,
         crtc_ctm_prop: output.crtc_ctm_prop,
         pending_gamma_lut: std::cell::RefCell::new(None),
@@ -685,6 +686,63 @@ fn mode_timing_passes_kernel_timing_and_masks_drm_only_flags() {
 }
 
 #[test]
+// Mutation: drop the GAMMA_LUT_SIZE fallback when the legacy size is zero.
+fn kms_gamma_size_falls_back_to_cached_lut_size() {
+    use crate::drm::atomic::{AtomicCommitSink, tests_support::RecordingAtomicCommitExecutor};
+    use std::rc::Rc;
+    use yserver_core::backend::Backend;
+
+    let mut backend = KmsBackend::for_tests();
+    let gamma_size = 4096_u16;
+    let crtc_xid = 0x4000;
+    let output_key = backend.platform.outputs[0].key.clone();
+    backend.platform.outputs[0].output.crtc_gamma_lut_prop =
+        Some(::drm::control::from_u32(70).unwrap());
+    backend.platform.outputs[0].output.crtc_gamma_lut_size = Some(u64::from(gamma_size));
+    backend.pstate.crtc_key_by_id.insert(crtc_xid, output_key);
+
+    let recorder = Rc::new(RecordingAtomicCommitExecutor::default());
+    recorder.set_gamma_size_for_tests(0);
+    backend.platform.devices[0].atomic_commit_sink =
+        Rc::new(AtomicCommitSink::new(recorder.clone()));
+
+    assert_eq!(backend.crtc_gamma_size(crtc_xid), gamma_size);
+
+    let red = vec![0x1111; usize::from(gamma_size)];
+    let green = vec![0x2222; usize::from(gamma_size)];
+    let blue = vec![0x3333; usize::from(gamma_size)];
+    Backend::set_crtc_gamma(&mut backend, crtc_xid, &red, &green, &blue)
+        .expect("set CRTC gamma through Backend");
+
+    let blobs = recorder.created_property_blobs();
+    let [(_, blob)] = blobs.as_slice() else {
+        panic!("gamma commit must create exactly one property blob");
+    };
+    assert_eq!(blob.len(), usize::from(gamma_size) * 8);
+}
+
+#[test]
+// Mutation: truncate rather than clamp a large GAMMA_LUT_SIZE to the RANDR u16 size.
+fn kms_gamma_size_clamps_cached_lut_size_to_u16() {
+    use crate::drm::atomic::{AtomicCommitSink, tests_support::RecordingAtomicCommitExecutor};
+    use std::rc::Rc;
+
+    let mut backend = KmsBackend::for_tests();
+    let crtc_xid = 0x4000;
+    let output_key = backend.platform.outputs[0].key.clone();
+    backend.platform.outputs[0].output.crtc_gamma_lut_prop =
+        Some(::drm::control::from_u32(70).unwrap());
+    backend.platform.outputs[0].output.crtc_gamma_lut_size = Some(u64::from(u16::MAX) + 1);
+    backend.pstate.crtc_key_by_id.insert(crtc_xid, output_key);
+
+    let recorder = Rc::new(RecordingAtomicCommitExecutor::default());
+    recorder.set_gamma_size_for_tests(0);
+    backend.platform.devices[0].atomic_commit_sink = Rc::new(AtomicCommitSink::new(recorder));
+
+    assert_eq!(backend.crtc_gamma_size(crtc_xid), u16::MAX);
+}
+
+#[test]
 fn kms_gamma_off_connector_seeds_identity_ramp_at_256() {
     let mut b = KmsBackend::for_tests();
     let crtc = 0x4000;
@@ -716,8 +774,9 @@ fn kms_gamma_off_connector_set_roundtrips_cached_values() {
 }
 
 #[test]
+// Mutations: route a supported ramp through the legacy ioctl, always defer idle gamma, or prefer
+// GAMMA_LUT_SIZE over a nonzero legacy size.
 fn kms_gamma_backend_uses_atomic_lut_for_idle_crtc() {
-    // Mutations: route a supported ramp through the legacy ioctl, or always defer idle gamma.
     use crate::drm::atomic::{
         AtomicCommitKind, AtomicCommitSink, tests_support::RecordingAtomicCommitExecutor,
     };
@@ -733,6 +792,7 @@ fn kms_gamma_backend_uses_atomic_lut_for_idle_crtc() {
     let (crtc, output_key) = {
         let output = &mut backend.platform.outputs[0];
         output.output.crtc_gamma_lut_prop = Some(::drm::control::from_u32(70).unwrap());
+        output.output.crtc_gamma_lut_size = Some(4096);
         output.output.crtc_degamma_lut_prop = Some(::drm::control::from_u32(71).unwrap());
         output.output.crtc_ctm_prop = Some(::drm::control::from_u32(72).unwrap());
         (output.output.crtc, output.key.clone())
@@ -757,6 +817,7 @@ fn kms_gamma_backend_uses_atomic_lut_for_idle_crtc() {
     let red = vec![0x1111; usize::from(gamma_size)];
     let green = vec![0x2222; usize::from(gamma_size)];
     let blue = vec![0x3333; usize::from(gamma_size)];
+    assert_eq!(backend.crtc_gamma_size(crtc_xid), gamma_size);
     Backend::set_crtc_gamma(&mut backend, crtc_xid, &red, &green, &blue)
         .expect("set CRTC gamma through Backend");
 
@@ -807,7 +868,6 @@ fn kms_gamma_backend_uses_atomic_lut_for_idle_crtc() {
             .borrow()
             .is_none()
     );
-    assert_eq!(backend.crtc_gamma_size(crtc_xid), gamma_size);
     assert!(records.iter().all(|record| record.device_fd == device_fd));
 }
 

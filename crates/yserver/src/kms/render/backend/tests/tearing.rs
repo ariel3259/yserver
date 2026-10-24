@@ -3863,6 +3863,7 @@ fn clone_test_drm_output(output: &crate::platform::drm::Output) -> crate::platfo
         plane_in_fence_fd_prop: output.plane_in_fence_fd_prop,
         crtc_out_fence_ptr_prop: output.crtc_out_fence_ptr_prop,
         crtc_gamma_lut_prop: output.crtc_gamma_lut_prop,
+        crtc_gamma_lut_size: output.crtc_gamma_lut_size,
         crtc_degamma_lut_prop: output.crtc_degamma_lut_prop,
         crtc_ctm_prop: output.crtc_ctm_prop,
         pending_gamma_lut: std::cell::RefCell::new(None),
