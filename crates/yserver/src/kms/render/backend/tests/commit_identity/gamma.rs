@@ -431,25 +431,10 @@ fn p1_gamma_scene_retry_eio_keeps_lut_pending() {
         fixture.events.backend.platform.fb_w,
         fixture.events.backend.platform.fb_h,
     );
-    Backend::clear_area(
-        &mut fixture.events.backend,
-        None,
-        root,
-        0,
-        None,
-        0,
-        0,
-        width,
-        height,
-        (0, 0),
-    )
-    .expect("damage root through Backend");
-    Backend::maybe_composite(&mut fixture.events.backend).expect("compose through Backend");
-    let failed_attempts: Vec<_> = recorder
-        .records()
+    let failed_attempts: Vec<_> = super::atomic_events::submit_damaged_frame(&mut fixture)
         .into_iter()
-        .skip(record_offset)
-        .filter(|record| record.kind == AtomicCommitKind::Scene)
+        .filter(|(attempt_fd, record)| *attempt_fd == fd && record.kind == AtomicCommitKind::Scene)
+        .map(|(_, record)| record)
         .collect();
     assert_eq!(failed_attempts.len(), 2, "the frame is submitted twice");
     assert!(contains_crtc_property(
