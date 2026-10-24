@@ -686,9 +686,12 @@ fn mode_timing_passes_kernel_timing_and_masks_drm_only_flags() {
 }
 
 #[test]
-// Mutation: drop the GAMMA_LUT_SIZE fallback when the legacy size is zero.
+// Mutation: omit the discovered GAMMA_LUT_SIZE value when caching CRTC properties on Output.
 fn kms_gamma_size_falls_back_to_cached_lut_size() {
-    use crate::drm::atomic::{AtomicCommitSink, tests_support::RecordingAtomicCommitExecutor};
+    use crate::drm::{
+        atomic::{AtomicCommitSink, tests_support::RecordingAtomicCommitExecutor},
+        modeset::PropMap,
+    };
     use std::rc::Rc;
     use yserver_core::backend::Backend;
 
@@ -696,9 +699,21 @@ fn kms_gamma_size_falls_back_to_cached_lut_size() {
     let gamma_size = 4096_u16;
     let crtc_xid = 0x4000;
     let output_key = backend.platform.outputs[0].key.clone();
-    backend.platform.outputs[0].output.crtc_gamma_lut_prop =
-        Some(::drm::control::from_u32(70).unwrap());
-    backend.platform.outputs[0].output.crtc_gamma_lut_size = Some(u64::from(gamma_size));
+    let discovered_crtc_properties = PropMap::from_discovered_properties([
+        (
+            "GAMMA_LUT".to_owned(),
+            ::drm::control::from_u32(70).unwrap(),
+            0,
+        ),
+        (
+            "GAMMA_LUT_SIZE".to_owned(),
+            ::drm::control::from_u32(71).unwrap(),
+            u64::from(gamma_size),
+        ),
+    ]);
+    backend.platform.outputs[0]
+        .output
+        .cache_crtc_gamma_properties(Some(&discovered_crtc_properties));
     backend.pstate.crtc_key_by_id.insert(crtc_xid, output_key);
 
     let recorder = Rc::new(RecordingAtomicCommitExecutor::default());

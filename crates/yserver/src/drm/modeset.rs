@@ -258,6 +258,13 @@ pub struct Output {
 
 pub(crate) type GammaRamp = (Vec<u16>, Vec<u16>, Vec<u16>);
 
+impl Output {
+    pub(crate) fn cache_crtc_gamma_properties(&mut self, properties: Option<&PropMap>) {
+        self.crtc_gamma_lut_prop = properties.and_then(|props| props.id("GAMMA_LUT").ok());
+        self.crtc_gamma_lut_size = properties.and_then(|props| props.value("GAMMA_LUT_SIZE"));
+    }
+}
+
 /// Add the output's retained gamma ramp to a vsync request. The blob handle is
 /// returned for destruction after submit; accepted commits take their own
 /// kernel reference.
@@ -982,12 +989,6 @@ fn finalize_output_with_mode(
     let crtc_out_fence_ptr_prop = crtc_props
         .as_ref()
         .and_then(|props| props.id("OUT_FENCE_PTR").ok());
-    let crtc_gamma_lut_prop = crtc_props
-        .as_ref()
-        .and_then(|props| props.id("GAMMA_LUT").ok());
-    let crtc_gamma_lut_size = crtc_props
-        .as_ref()
-        .and_then(|props| props.value("GAMMA_LUT_SIZE"));
     let crtc_degamma_lut_prop = crtc_props
         .as_ref()
         .and_then(|props| props.id("DEGAMMA_LUT").ok());
@@ -1018,7 +1019,7 @@ fn finalize_output_with_mode(
     modes.sort_by_key(|m| !m.preferred);
     let modes = collapse_duplicate_modes(modes);
 
-    Ok(Output {
+    let mut output = Output {
         connector: asg.connector,
         connector_name: asg.connector_name,
         encoder: asg.encoder,
@@ -1038,8 +1039,8 @@ fn finalize_output_with_mode(
         plane_crtc_h_prop,
         plane_in_fence_fd_prop,
         crtc_out_fence_ptr_prop,
-        crtc_gamma_lut_prop,
-        crtc_gamma_lut_size,
+        crtc_gamma_lut_prop: None,
+        crtc_gamma_lut_size: None,
         crtc_degamma_lut_prop,
         crtc_ctm_prop,
         pending_gamma_lut: RefCell::new(None),
@@ -1051,7 +1052,9 @@ fn finalize_output_with_mode(
         edid,
         connector_type,
         modes,
-    })
+    };
+    output.cache_crtc_gamma_properties(crtc_props.as_ref());
+    Ok(output)
 }
 
 /// Name a connector exactly like Xorg's modesetting driver:
@@ -1273,7 +1276,7 @@ where
 }
 
 pub(crate) struct PropMap {
-    properties: HashMap<String, (property::Info, u64)>,
+    properties: HashMap<String, (property::Handle, u64)>,
 }
 
 impl PropMap {
@@ -1282,18 +1285,33 @@ impl PropMap {
         H: drm::control::ResourceHandle,
     {
         let props = device.get_properties(handle)?;
-        let mut properties = HashMap::new();
+        let mut properties = Vec::new();
         for (property_handle, raw_value) in props.iter() {
             let info = device.get_property(*property_handle)?;
-            properties.insert(info.name().to_str().unwrap().to_owned(), (info, *raw_value));
+            properties.push((
+                info.name().to_str().unwrap().to_owned(),
+                info.handle(),
+                *raw_value,
+            ));
         }
-        Ok(Self { properties })
+        Ok(Self::from_discovered_properties(properties))
+    }
+
+    pub(crate) fn from_discovered_properties(
+        properties: impl IntoIterator<Item = (String, property::Handle, u64)>,
+    ) -> Self {
+        Self {
+            properties: properties
+                .into_iter()
+                .map(|(name, handle, value)| (name, (handle, value)))
+                .collect(),
+        }
     }
 
     pub(crate) fn id(&self, name: &str) -> io::Result<property::Handle> {
         self.properties
             .get(name)
-            .map(|(info, _)| info.handle())
+            .map(|(handle, _)| *handle)
             .ok_or_else(|| io::Error::other(format!("property {name:?} not exposed")))
     }
 
