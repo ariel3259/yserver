@@ -1,6 +1,6 @@
 # Variable refresh rate (VRR / adaptive sync) — design
 
-**Date:** 2026-10-23 · **Status:** draft, decisions approved in conversation, pending review · **Scope:** KMS backend,
+**Date:** 2026-10-23 · **Status:** draft, decisions approved in conversation, reviewed once (sol) · **Scope:** KMS backend,
 one output covered by a client window in direct scanout; cursor behaviour while VRR is active.
 
 ## Why
@@ -25,9 +25,10 @@ game while the others keep their own fixed rate. This document covers the first 
    ready, with at most one flip in flight and one queued successor. With VRR that flip ends the front porch, so no new
    frame clock is needed. This goal is "keep it that way": nothing in this design may make a direct Present wait for a
    fixed vblank boundary while VRR is on.
-3. **The cursor does not drive the refresh rate.** While VRR is on for a CRTC, cursor state (position and image) rides
-   the client's next frame commit on that CRTC. If no frame commit arrives within **33 ms** of the first cursor change
-   that is still unsent, the cursor goes out in its own commit.
+3. **Cursor motion does not drive the refresh rate.** While VRR is on for a CRTC, a new cursor position rides the
+   client's next frame commit on that CRTC. If no frame commit arrives within **33 ms** of the first position that is
+   still unsent, the position goes out in its own commit. Cursor image changes keep today's path (see The cursor while
+   VRR is on).
 4. **On by default.** No configuration switch and no environment variable (`YSERVER_*` variables that change behaviour
    are not allowed).
 5. **Logs that let a tester confirm it works** (see Logging).
@@ -50,7 +51,9 @@ game while the others keep their own fixed rate. This document covers the first 
 2. **No change without VRR.** On an output whose connector lacks `vrr_capable`, or with no client window in direct
    scanout, yserver behaves exactly as before: same commits, same cursor commits, same timing.
 3. **Turning VRR on or off is invisible:** no black frame and no full modeset.
-4. **The cursor never pushes the monitor to its maximum refresh** while a client controls the refresh rate.
+4. **Cursor motion never holds the monitor at its maximum refresh** while a client controls the refresh rate. A single
+   cursor commit sent at the 33 ms deadline may happen to precede a client frame closely; what must not happen is a
+   sustained stream of cursor-driven refreshes.
 
 ## Decisions (approved in conversation, 2026-10-23)
 
@@ -94,15 +97,22 @@ and every standalone cursor commit on an active VRR CRTC is a refresh on both dr
 
 Per output, two facts and one decision:
 
-- **capable:** the connector exposes `vrr_capable` with value 1 and the CRTC exposes `VRR_ENABLED`. Read where the
-  other optional properties are cached when an output is built (the pattern of `crtc_gamma_lut_prop`,
-  `plane_in_fence_fd_prop`, `crtc_out_fence_ptr_prop` on `Output`). It is refreshed whenever the output is rebuilt
-  (hotplug, topology change). A missing property means not capable.
-- **wanted:** direct scanout of this output is owned by a client window (`Unredirected`).
-- **committed:** the `VRR_ENABLED` value last accepted by the kernel for this CRTC.
+- **capable:** the connector exposes `vrr_capable` with value 1 and the CRTC exposes `VRR_ENABLED`. The property ids
+  are cached where the other optional properties are cached when an output is built (the pattern of
+  `crtc_gamma_lut_prop`, `plane_in_fence_fd_prop`, `crtc_out_fence_ptr_prop` on `Output`). The `vrr_capable` value must
+  also be refreshed on the connector rescan path, which keeps the live `Output` across a disconnect/reconnect and only
+  updates connector metadata (`platform/connectors.rs`, rescan); a monitor swap on the same connector must not keep a
+  stale value. A missing property means not capable.
+- **wanted:** the direct transaction being submitted for this output is owned by a client window (`Unredirected`). It
+  follows the owner of the transaction being submitted, not the retained direct record: first entry submits before the
+  pending record is installed, and the previous direct record survives until a composed replacement retires.
+- **committed:** the `VRR_ENABLED` value the kernel holds for this CRTC. It starts from the kernel's current value, read
+  when the output is built, and is updated when a commit carrying the property is accepted.
 
-`VRR_ENABLED` is written only when *capable* and *wanted* differ from *committed*, so outputs that never qualify never
-receive the property (anti-goal 2).
+`VRR_ENABLED` is written only on a CRTC that exposes it, and only when the wanted value (*capable* and *wanted*) differs
+from *committed*. An output whose kernel value is already 0 and that never qualifies never receives the property
+(anti-goal 2). A value of 1 inherited from a previous DRM master (at startup or on VT acquire) differs from the wanted
+0 and is cleared by the next vsync commit of that CRTC, so the desktop does not run in VRR (anti-goal 1).
 
 ### Turning VRR on and off
 
@@ -115,16 +125,20 @@ receive the property (anti-goal 2).
   (`feat/gamma-atomic-lut`): scene flip, direct submit or composed commit. Async (tearing) flips cannot carry CRTC
   properties, so the value waits for the next vsync commit. The pending-CRTC-property mechanism added for gamma is
   generalized to carry this value too, rather than duplicated.
-- **Before giving up the device** (VT release, shutdown), *committed* is brought back to 0 so the next DRM master
-  (fbcon or another server) does not inherit VRR. If no vsync commit is due at that point, a standalone commit carries
-  it, as the gamma-only commit does.
-- **Failure:** if a commit carrying `VRR_ENABLED` = 1 is rejected with EINVAL, VRR is latched off for that CRTC until the
-  output is rebuilt (warn once), and the frame is resubmitted without the property. Other errors keep the change pending.
-  This is the gamma EINVAL latch, reused.
+- **Before giving up the device** (VT release, shutdown), a CRTC whose *committed* value is 1 gets one commit with
+  `VRR_ENABLED` = 0 so the next DRM master (fbcon or another server) does not inherit VRR. If no vsync commit is due at
+  that point, a standalone commit carries it, as the gamma-only commit does. This is one attempt: if it fails, the
+  failure is logged (warn) and the release proceeds; the VT switch or shutdown never waits on it.
+- **Failure:** if a commit carrying `VRR_ENABLED` = 1 is rejected with EINVAL, VRR is latched off for that CRTC (warn
+  once) and the frame is resubmitted without the property. Other errors keep the change pending. This is the gamma
+  EINVAL latch, reused with gamma's lifetime: it survives an `Output` replacement on the same kernel CRTC
+  (`platform/connectors.rs`, where gamma's latch and pending state are carried over) and ends with that CRTC.
 
-Whether VRR on/off needs the primary plane in the same commit (amdgpu applies it on a primary flip) is satisfied
-naturally on the on path, because the change rides a direct frame; the builder must check the off path that may not
-carry a primary flip (for example an unflip to a composed frame or the VT-release commit).
+Whether VRR on/off needs the primary plane in the same commit (amdgpu applies it on a primary flip) is satisfied by
+every frame path: the on change rides a direct frame, and a composed unflip carries a primary-plane replacement
+(`drm/modeset.rs`, composed commit). The one commit that may carry no primary flip is the standalone clear before
+releasing the device; the builder must check on amdgpu that it takes effect, and if it does not, include the current
+primary framebuffer in that commit.
 
 ### The cursor while VRR is on
 
@@ -134,14 +148,20 @@ no queued direct successor). With VRR on, each of those commits is a refresh (dr
 
 While VRR is on for a CRTC:
 
-- A cursor change (motion or image) is recorded as pending, as today, but no standalone `cursor-only` commit is sent for
-  that CRTC. The pending state rides the client's next direct commit, which already carries every pending position
-  ("its grouped direct transaction gets every later position").
-- The first unsent cursor change starts a **33 ms** deadline. The deadline is exposed through the existing
+- A cursor **position** is recorded as pending, as today, but no standalone `cursor-only` commit is sent for that CRTC.
+  The pending position rides the client's next direct commit, which already carries every pending position ("its
+  grouped direct transaction gets every later position").
+- A cursor **image** change (shape change, animation frame, show/hide) keeps today's path: a full cursor-state commit
+  that can go out immediately. Direct frames carry position deltas, not image bindings, so batching images would need
+  a new mechanism that moves sprite ownership into the direct transaction. Image changes are far less frequent than
+  motion (an animated cursor changes a few times per second), so each one costing a refresh is accepted for this step.
+- The first unsent position starts a **33 ms** deadline. The deadline is exposed through the existing
   `next_wakeup` (`backend_scanout_next_wakeup`), as the gamma deadline and the tearing `deferred_cursor_wake` already
   are; no new timer. A later change before the deadline does not move it.
 - When the deadline expires with the change still unsent, the existing standalone `cursor-only` path sends it. A client
-  frame that carries it first cancels the deadline.
+  frame that carries it first cancels the deadline. The tearing `deferred_cursor_wake` serves a different purpose (it
+  caps software-cursor composition while tearing, with its own reset rules) and must keep its semantics if any
+  representation is shared.
 - With VRR off nothing changes.
 
 Reuse: prefer one deadline shape shared with gamma's pending deadline over a third copy; the builder decides whether
@@ -179,10 +199,12 @@ Unit and backend tests, driven through the Backend paths (no direct calls into i
 - VT release and shutdown with VRR on: a commit with `VRR_ENABLED` = 0 is accepted before the device is released.
 - EINVAL on a commit carrying `VRR_ENABLED` = 1: latched off for that CRTC, the frame still goes out.
 - cursor with VRR on: motion with a direct frame inside 33 ms rides that frame (0 `cursor-only` commits); motion with no
-  frame gives exactly one `cursor-only` commit at the deadline, driven through `next_wakeup`; an image change follows
-  the same rule. Mutation: send cursor-only immediately (today's behaviour). With VRR off, cursor-only commits are
+  frame gives exactly one `cursor-only` commit at the deadline, driven through `next_wakeup`. Mutation: send cursor-only
+  immediately (today's behaviour). An image change still commits as today. With VRR off, cursor-only commits are
   unchanged.
-- capable state follows output rebuilds (hotplug to a non-capable monitor turns it off).
+- capable state follows the connector rescan: reconnecting a non-capable monitor on the same connector turns VRR off.
+- inherited `VRR_ENABLED` = 1 at startup with no client window: the next vsync commit carries 0.
+- the release-time clear failing: logged, and the VT release still completes.
 
 The usual gate applies: workspace tests, the lavapipe ignored suite, `render_acceptance`, clippy, `tools/check-layout.sh`,
 the FreeBSD cross-check, and the affected suites under CPU load.
@@ -200,8 +222,6 @@ Hardware (the user validates with a game and logs):
 - Whether the off path needs an explicit primary-plane flip on amdgpu (see Transport).
 - Whether gamma's pending-property and pending-deadline pieces can be shared as-is for `VRR_ENABLED` and the cursor
   deadline, or need a small generalization (reuse first; justify any new piece).
-- Whether `vrr_capable` can change without an output rebuild (some drivers update it on EDID re-read); if so, where to
-  refresh it with existing code.
 - Interaction with gamma's active-CRTC rule: with VRR the CRTC may flip slower than two fixed refresh periods, so a
   gamma change can go out standalone and trigger a refresh. Gamma changes are rare; note, do not tune, unless trivial.
 
