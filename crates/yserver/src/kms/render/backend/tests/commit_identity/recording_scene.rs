@@ -18,6 +18,7 @@ use std::{
     os::fd::RawFd,
     rc::Rc,
     sync::{Arc, Mutex, OnceLock},
+    thread::ThreadId,
     time::{Duration, Instant},
 };
 use yserver_core::backend::Backend;
@@ -739,7 +740,7 @@ impl RecordingSceneFixture {
 }
 
 pub(in crate::kms::render::backend::tests) fn init_tearing_test_logger() {
-    let captured = VRR_TEST_LOGS.get_or_init(|| Arc::new(Mutex::new(String::new())));
+    let captured = VRR_TEST_LOGS.get_or_init(|| Arc::new(Mutex::new(HashMap::new())));
     let _ = env_logger::Builder::new()
         .is_test(true)
         .filter_level(log::LevelFilter::Info)
@@ -757,15 +758,20 @@ pub(in crate::kms::render::backend::tests) fn init_tearing_test_logger() {
         .try_init();
 }
 
-static VRR_TEST_LOGS: OnceLock<Arc<Mutex<String>>> = OnceLock::new();
+/// Captured lines per test thread: the harness runs tests in parallel, so a
+/// shared buffer let one test clear or read another test's lines. The backend
+/// logs from the calling thread, which is the test's own.
+static VRR_TEST_LOGS: OnceLock<Arc<Mutex<HashMap<ThreadId, String>>>> = OnceLock::new();
 
-struct VrrTestLogWriter(Arc<Mutex<String>>);
+struct VrrTestLogWriter(Arc<Mutex<HashMap<ThreadId, String>>>);
 
 impl io::Write for VrrTestLogWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         self.0
             .lock()
             .expect("VRR test log buffer lock")
+            .entry(std::thread::current().id())
+            .or_default()
             .push_str(&String::from_utf8_lossy(bytes));
         Ok(bytes.len())
     }
@@ -777,14 +783,21 @@ impl io::Write for VrrTestLogWriter {
 
 pub(crate) fn clear_vrr_test_logs() {
     if let Some(logs) = VRR_TEST_LOGS.get() {
-        logs.lock().expect("VRR test log buffer lock").clear();
+        logs.lock()
+            .expect("VRR test log buffer lock")
+            .remove(&std::thread::current().id());
     }
 }
 
 pub(crate) fn vrr_test_logs() -> String {
     VRR_TEST_LOGS
         .get()
-        .map(|logs| logs.lock().expect("VRR test log buffer lock").clone())
+        .and_then(|logs| {
+            logs.lock()
+                .expect("VRR test log buffer lock")
+                .get(&std::thread::current().id())
+                .cloned()
+        })
         .unwrap_or_default()
 }
 
