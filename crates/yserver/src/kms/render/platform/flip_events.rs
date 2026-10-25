@@ -94,8 +94,10 @@ const FLIP_TIMESTAMP_PLAUSIBLE_WINDOW: std::time::Duration = std::time::Duration
 
 /// Convert the kernel completion timestamp to CLOCK_MONOTONIC for telemetry.
 /// Present still receives the original UST. Prefer monotonic when it is a
-/// plausible timestamp; NVIDIA's suspend-inclusive BOOTTIME-like UST can be
-/// recognized when it is ahead of monotonic but close to BOOTTIME at receipt.
+/// plausible timestamp within the window on either side of receipt; the kernel
+/// may timestamp the flip after userspace receives its event. NVIDIA's
+/// suspend-inclusive BOOTTIME-like UST can be recognized when it is ahead of
+/// monotonic but close to BOOTTIME at receipt.
 /// nvidia-drm 615.78.08 was also measured with UST ~0.97 s behind monotonic
 /// and BOOTTIME equal to monotonic (no suspend): not BOOTTIME, and inside the
 /// plausible window, so telemetry keeps that offset. Gamma activity uses the
@@ -106,9 +108,12 @@ fn completion_timestamp_monotonic(
     received_boottime: Option<std::time::Duration>,
 ) -> Option<std::time::Duration> {
     if let Some(received_monotonic) = received_monotonic
-        && received_monotonic
+        && (received_monotonic
             .checked_sub(ust)
             .is_some_and(|age| age <= FLIP_TIMESTAMP_PLAUSIBLE_WINDOW)
+            || ust
+                .checked_sub(received_monotonic)
+                .is_some_and(|lead| lead <= FLIP_TIMESTAMP_PLAUSIBLE_WINDOW))
     {
         return Some(ust);
     }

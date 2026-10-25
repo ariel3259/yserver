@@ -2429,6 +2429,50 @@ fn implausible_flip_timestamp_is_reported_as_unavailable() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: drop the one-second monotonic plausibility-window bound.
+fn monotonic_flip_timestamp_far_ahead_is_unavailable() {
+    use yserver_core::server::ServerState;
+
+    const WINDOW: u32 = 0x7c8c;
+    let Some(mut backend) = live_scene_backend() else {
+        eprintln!(
+            "SKIP monotonic_flip_timestamp_far_ahead_is_unavailable: no Vulkan scene fixture available"
+        );
+        return;
+    };
+    let recorder = recording_sink(&mut backend, 0);
+    qualify_test_direct_async(&mut backend, &recorder, WINDOW, 16_600);
+    let mut state = ServerState::new();
+    let (sink, accepted_at, crtc) =
+        submit_direct_async_for_clock_test(&mut backend, recorder.clone(), WINDOW, 16_700);
+
+    let received_at_monotonic = accepted_at + Duration::from_millis(20);
+    let kernel_ust = received_at_monotonic + Duration::from_millis(1_500);
+    deliver_clock_test_flip(
+        &mut backend,
+        &mut state,
+        crtc,
+        98,
+        kernel_ust,
+        received_at_monotonic,
+        received_at_monotonic,
+    );
+
+    assert_eq!(sink.for_tests_direct_turnaround_samples(), [20_000]);
+    assert!(
+        sink.for_tests_direct_present_to_flip_samples().is_empty(),
+        "a UST 1.5 s ahead of receipt and BOOTTIME has no completion sample"
+    );
+    assert_eq!(
+        sink.for_tests_direct_present_to_flip_summary(),
+        ("n/a".to_owned(), "n/a".to_owned(), "n/a".to_owned())
+    );
+    assert!(!backend.scene.has_pending_page_flips());
+    finish_clock_test_direct_async(&mut backend, &recorder, &mut state, WINDOW, 16_701);
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: keep a per-CRTC accepted-commit telemetry entry after discarding its old DRM event.
 fn discarded_vt_flip_events_do_not_shift_the_next_async_turnaround_match() {
     use std::{

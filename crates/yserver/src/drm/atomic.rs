@@ -1058,6 +1058,23 @@ impl AtomicCommitSink {
             metrics.present_latency_present_to_flip_event_us.clone(),
         )
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_take_vrr_summary_snapshot(&self) -> Option<(u32, u64, u64, u64, u64)> {
+        let now = Instant::now() + Duration::from_secs(1);
+        let snapshot = self
+            .metrics
+            .borrow_mut()
+            .take_present_latency_summary_if_due(now)?;
+        let vrr = snapshot.vrr_crtcs.into_iter().next()?;
+        Some((
+            u32::from(vrr.crtc),
+            vrr.flip_interval_us_min,
+            vrr.flip_interval_us_p50,
+            vrr.flip_interval_us_max,
+            vrr.cursor_deadline_commits,
+        ))
+    }
 }
 
 #[cfg(test)]

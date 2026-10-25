@@ -2293,6 +2293,63 @@ fn vrr_off_cursor_only_unchanged() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: restore the receipt-or-earlier-only monotonic timestamp check.
+fn vrr_summary_intervals_with_completion_after_receipt() {
+    let Some(mut harness) = vrr_cursor_harness(18_032, true) else {
+        eprintln!(
+            "SKIP vrr_summary_intervals_with_completion_after_receipt: no Vulkan scene fixture available"
+        );
+        return;
+    };
+    let output_crtc = harness.scene.events.backend.platform.outputs[0].output.crtc;
+    let device_fd = harness.device_fd;
+    let sink = Rc::clone(&harness.scene.events.backend.platform.devices[0].atomic_commit_sink);
+    let mut direct = harness.direct.take().expect("direct scanout is active");
+
+    for (frame, time_ms) in [(10_u32, 10_u64), (20, 20), (30, 30)] {
+        let previous_present = direct.candidate.present_id;
+        let record = submit_direct_successor(&mut harness.scene, &mut direct, device_fd);
+        assert_eq!(record.events.len(), 1, "direct frame targets the VRR CRTC");
+        let commit_id = super::support::accepted_event_id(&record)
+            .expect("direct frame has an accepted commit ID");
+        let ust = Duration::from_millis(time_ms) + Duration::from_micros(300);
+        let received = Duration::from_millis(time_ms);
+        {
+            let fixture = &mut harness.scene;
+            fixture.events.wait_for_submitted_gpu_work();
+            fixture.events.queue_commit_completion_at(
+                device_fd,
+                output_crtc,
+                commit_id,
+                frame,
+                ust,
+                received,
+            );
+            Backend::on_page_flip_ready(
+                &mut fixture.events.backend,
+                &mut fixture.events.state,
+                device_fd,
+            );
+        }
+        harness.note_direct_frame_retired(output_crtc, commit_id);
+        super::direct_unflip::drain_present_notifications(
+            &mut harness.scene,
+            &[direct.candidate.present_id],
+            &[previous_present],
+        );
+    }
+    harness.direct = Some(direct);
+
+    assert_eq!(
+        sink.for_tests_take_vrr_summary_snapshot(),
+        Some((u32::from(output_crtc), 10_000, 10_000, 10_000, 0)),
+        "the VRR summary snapshot retains 10 ms intervals for completions 300 us after receipt"
+    );
+    harness.finish();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: record intervals for every CRTC, including CRTCs whose vrr_committed is false.
 fn vrr_summary_reports_intervals_and_deadline_commits() {
     let Some(mut harness) = vrr_cursor_harness(18_030, true) else {
