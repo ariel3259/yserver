@@ -1626,7 +1626,11 @@ impl KmsBackend {
                     .page_flip_commit_in_flight(&device.device, crtc)
             {
                 output.pending_gamma_deadline.set(None);
-                self.platform.submit_pending_gamma_for_output(output_idx)?;
+                self.platform.submit_pending_crtc_property_for_output(
+                    output_idx,
+                    self.live_direct_vrr_wanted(),
+                    now,
+                )?;
             } else if output.pending_gamma_deadline.get().is_none() {
                 output
                     .pending_gamma_deadline

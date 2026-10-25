@@ -223,6 +223,10 @@ pub struct Output {
     pub(crate) vrr_disabled: Cell<bool>,
     /// Whether the one follow-up clear was also rejected after VRR latched off.
     pub(crate) vrr_clear_retry_used: Cell<bool>,
+    /// Deadline for retrying a standalone clear rejected by a non-EINVAL error.
+    pub(crate) vrr_clear_retry_deadline: Cell<Option<std::time::Instant>>,
+    /// EBUSY means the clear waits for the CRTC's next flip event.
+    pub(crate) vrr_clear_waiting_for_flip: Cell<bool>,
     /// Raw `GAMMA_LUT_SIZE` property value. Used only when the legacy CRTC
     /// gamma length is zero.
     pub crtc_gamma_lut_size: Option<u64>,
@@ -289,6 +293,8 @@ impl Output {
                 .is_some_and(|value| value != 0),
         );
         self.vrr_clear_retry_used.set(false);
+        self.vrr_clear_retry_deadline.set(None);
+        self.vrr_clear_waiting_for_flip.set(false);
     }
 
     pub(crate) fn vrr_capable(&self) -> bool {
@@ -320,6 +326,8 @@ impl Output {
         if let Some(value) = value {
             self.vrr_committed.set(value != 0);
             self.vrr_clear_retry_used.set(false);
+            self.vrr_clear_retry_deadline.set(None);
+            self.vrr_clear_waiting_for_flip.set(false);
         } else {
             log::warn!(
                 "kms: CRTC {:?} no longer exposes cached VRR_ENABLED property {:?}",
@@ -510,6 +518,8 @@ fn finish_pending_vrr_change(
             output.vrr_committed.set(value);
             if !value {
                 output.vrr_clear_retry_used.set(false);
+                output.vrr_clear_retry_deadline.set(None);
+                output.vrr_clear_waiting_for_flip.set(false);
             }
         }
         Err(error) if retry_accepted && error.raw_os_error() == Some(libc::EINVAL) => {
@@ -1236,6 +1246,8 @@ fn finalize_output_with_mode(
         vrr_committed: Cell::new(false),
         vrr_disabled: Cell::new(false),
         vrr_clear_retry_used: Cell::new(false),
+        vrr_clear_retry_deadline: Cell::new(None),
+        vrr_clear_waiting_for_flip: Cell::new(false),
         crtc_degamma_lut_prop,
         crtc_ctm_prop,
         pending_gamma_lut: RefCell::new(None),
@@ -1575,6 +1587,8 @@ pub(crate) fn disable_output_with_properties(
         Ok(()) => {
             if vrr_property.is_some() {
                 output.vrr_committed.set(false);
+                output.vrr_clear_retry_deadline.set(None);
+                output.vrr_clear_waiting_for_flip.set(false);
             }
             Ok(())
         }

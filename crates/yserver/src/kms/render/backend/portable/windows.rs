@@ -1875,8 +1875,9 @@ impl<P: Platform> XBackend<P> {
     // `on_window_became_top_level` overrides called
     // `apply_top_level_stack_hint`, an independent z-order authority that
     // drifted from core (and `_NET_WM_STATE_FOCUSED → raise-to-top` was a
-    // prime suspect for the wrong-raise bug). Both now fall back to the
-    // trait's default no-op; top-level order is a pure projection of core
+    // prime suspect for the wrong-raise bug). The KMS property hook now only
+    // handles `_VARIABLE_REFRESH`; it still does not apply EWMH stack hints.
+    // The top-level hook remains a no-op; order is a pure projection of core
     // children via `sync_top_level_order`.
     pub(in crate::kms::render::backend) fn backend_windows_sync_top_level_order(
         &mut self,

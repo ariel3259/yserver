@@ -1086,9 +1086,8 @@ pub trait Backend {
         false
     }
 
-    /// Notify the backend that a window property changed or was
-    /// deleted. KMS uses this to re-evaluate EWMH stack hints
-    /// (`_NET_WM_WINDOW_TYPE`, `_NET_WM_STATE`, `WM_TRANSIENT_FOR`).
+    /// Notify the backend that a window property changed or was deleted.
+    /// Platforms may use it to refresh policy tied to a live window.
     /// Default no-op.
     fn on_window_property_changed(
         &mut self,

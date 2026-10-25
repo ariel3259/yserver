@@ -708,6 +708,12 @@ impl PlatformBackend {
                 .vrr_clear_retry_used
                 .set(existing.output.vrr_clear_retry_used.get());
             output
+                .vrr_clear_retry_deadline
+                .set(existing.output.vrr_clear_retry_deadline.get());
+            output
+                .vrr_clear_waiting_for_flip
+                .set(existing.output.vrr_clear_waiting_for_flip.get());
+            output
                 .gamma_lut_disabled
                 .set(existing.output.gamma_lut_disabled.get());
             *output.pending_gamma_lut.borrow_mut() =

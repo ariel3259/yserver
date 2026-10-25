@@ -144,6 +144,15 @@ impl<P: Platform> Backend for XBackend<P> {
         Self::backend_devices_on_host_input(self, state, ev)
     }
 
+    fn on_window_property_changed(
+        &mut self,
+        state: &ServerState,
+        host_xid: u32,
+        property: yserver_protocol::x11::AtomId,
+    ) {
+        P::on_window_property_changed(self, state, host_xid, property)
+    }
+
     fn on_scanout_render_completion(&mut self, state: &mut ServerState) {
         P::on_scanout_render_completion(self, state)
     }

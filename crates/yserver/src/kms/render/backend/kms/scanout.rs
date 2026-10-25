@@ -911,12 +911,7 @@ impl KmsBackend {
         let cursor_positions = self
             .platform
             .cursor_plane_atomic_positions_for_outputs(&output_indices);
-        let vrr_wanted = frame.target == ScanoutM0Target::Unredirected
-            && match self.pstate.vrr_mode {
-                crate::launch::VrrMode::Off => false,
-                crate::launch::VrrMode::Property => frame.candidate.variable_refresh,
-                crate::launch::VrrMode::All => true,
-            };
+        let vrr_wanted = self.direct_frame_wants_vrr(frame);
         let vrr_before = self.vrr_committed_snapshot();
         let async_shape = if timing == crate::drm::async_flip::FlipTiming::Async {
             Some(
@@ -1032,6 +1027,142 @@ impl KmsBackend {
             .iter()
             .map(|output| output.output.vrr_committed.get())
             .collect()
+    }
+
+    fn direct_frame_wants_vrr(&self, frame: &DirectPresentFrame) -> bool {
+        frame.target == ScanoutM0Target::Unredirected
+            && match self.pstate.vrr_mode {
+                crate::launch::VrrMode::Off => false,
+                crate::launch::VrrMode::Property => frame.candidate.variable_refresh,
+                crate::launch::VrrMode::All => true,
+            }
+    }
+
+    pub(in crate::kms::render::backend) fn live_direct_vrr_wanted(&self) -> bool {
+        self.pstate
+            .scanout_m2
+            .queued_successor
+            .as_ref()
+            .or(self.pstate.scanout_m2.pending.as_ref())
+            .or(self.pstate.scanout_m2.current.as_ref())
+            .is_some_and(|frame| self.direct_frame_wants_vrr(frame))
+    }
+
+    pub(in crate::kms::render::backend) fn backend_scanout_on_window_property_changed(
+        &mut self,
+        state: &yserver_core::server::ServerState,
+        host_xid: u32,
+        property: yserver_protocol::x11::AtomId,
+    ) {
+        if self.pstate.vrr_mode != crate::launch::VrrMode::Property || host_xid == 0 {
+            return;
+        }
+        let Some(vrr_atom) = state.atoms.id_for("_VARIABLE_REFRESH") else {
+            return;
+        };
+        if property != vrr_atom {
+            return;
+        }
+        let matches_host = |candidate: &yserver_core::backend::PresentScanoutCandidate| {
+            state
+                .resources
+                .window(yserver_protocol::x11::ResourceId(candidate.dst_window_xid))
+                .and_then(|window| window.host_xid)
+                .is_some_and(|window| window.as_raw() == host_xid)
+        };
+        let changed_owner = self
+            .pstate
+            .scanout_m2
+            .current
+            .iter()
+            .chain(self.pstate.scanout_m2.pending.iter())
+            .chain(self.pstate.scanout_m2.queued_successor.iter())
+            .find(|frame| matches_host(&frame.candidate))
+            .map(|frame| (frame.candidate.dst_window_xid, frame.candidate.crtc_id));
+        let allowed = changed_owner
+            .and_then(|(window, _)| {
+                state
+                    .resources
+                    .window_property(yserver_protocol::x11::ResourceId(window), vrr_atom)
+            })
+            .is_some_and(|value| {
+                value.r#type == yserver_core::xinput::XA_CARDINAL
+                    && value.format == yserver_core::properties::PropertyFormat::F32
+                    && value.data.get(..4).is_some_and(|bytes| {
+                        <[u8; 4]>::try_from(bytes).is_ok_and(|bytes| u32::from_le_bytes(bytes) == 1)
+                    })
+            });
+        let mut matched = false;
+        {
+            let scanout = &mut self.pstate.scanout_m2;
+            let (current, pending, queued_successor) = (
+                &mut scanout.current,
+                &mut scanout.pending,
+                &mut scanout.queued_successor,
+            );
+            for frame in current
+                .iter_mut()
+                .chain(pending.iter_mut())
+                .chain(queued_successor.iter_mut())
+            {
+                if matches_host(&frame.candidate) {
+                    frame.candidate.variable_refresh = allowed;
+                    matched = true;
+                }
+            }
+        }
+        if !matched {
+            return;
+        }
+        let Some((_, direct_crtc_id)) = changed_owner else {
+            return;
+        };
+
+        if allowed {
+            for layout in self
+                .platform
+                .outputs
+                .iter()
+                .filter(|layout| u32::from(layout.output.crtc) == direct_crtc_id)
+            {
+                layout.output.vrr_clear_retry_deadline.set(None);
+                layout.output.vrr_clear_waiting_for_flip.set(false);
+            }
+            return;
+        }
+        if self.pstate.scanout_m2.queued_successor.is_some()
+            || self.live_direct_vrr_wanted()
+            || !self.scanout_allowed()
+            || !self.kms_outputs_active
+        {
+            return;
+        }
+
+        let now = self.monotonic_now();
+        for output_idx in 0..self.platform.outputs.len() {
+            let output = &self.platform.outputs[output_idx].output;
+            if u32::from(output.crtc) != direct_crtc_id || !output.vrr_committed.get() {
+                continue;
+            }
+            if self.pstate.scanout_m2.pending.is_some()
+                || self
+                    .platform
+                    .scanout_commit_in_flight_for_output(output_idx)
+            {
+                output.vrr_clear_retry_deadline.set(None);
+                output.vrr_clear_waiting_for_flip.set(true);
+                continue;
+            }
+            if let Err(error) = self
+                .platform
+                .submit_pending_crtc_property_for_output(output_idx, false, now)
+            {
+                log::warn!(
+                    "kms: standalone VRR clear for CRTC {:?} failed: {error}",
+                    output.crtc
+                );
+            }
+        }
     }
 
     pub(in crate::kms::render::backend) fn log_vrr_committed_changes(
@@ -2904,9 +3035,21 @@ impl KmsBackend {
             }) {
                 continue;
             }
-            if !self.gamma_output_has_queued_scanout(output_idx) {
-                self.platform
-                    .retry_pending_gamma_after_flip(output_idx, self.monotonic_now());
+            let vrr_clear_waiting_for_flip = self
+                .platform
+                .outputs
+                .get(output_idx)
+                .is_some_and(|layout| layout.output.vrr_clear_waiting_for_flip.get());
+            let direct_successor_owns_next_frame = self.pstate.scanout_m2.pending.is_some()
+                || self.pstate.scanout_m2.queued_successor.is_some();
+            if !self.gamma_output_has_queued_scanout(output_idx)
+                || (vrr_clear_waiting_for_flip && !direct_successor_owns_next_frame)
+            {
+                self.platform.retry_pending_crtc_property_after_flip(
+                    output_idx,
+                    self.monotonic_now(),
+                    self.live_direct_vrr_wanted(),
+                );
             }
         }
         // Idle vblank arming: clear the arm + advance the Present clock for
@@ -3056,6 +3199,19 @@ impl KmsBackend {
                     .min()
             })
             .flatten();
+        let vrr_clear_deadline = allow_kms_timers
+            .then(|| {
+                self.platform
+                    .outputs
+                    .iter()
+                    .filter_map(|layout| {
+                        (!layout.output.vrr_clear_waiting_for_flip.get())
+                            .then_some(layout.output.vrr_clear_retry_deadline.get())
+                            .flatten()
+                    })
+                    .min()
+            })
+            .flatten();
         let vrr_cursor_deadline = allow_kms_timers
             .then(|| self.platform.vrr_cursor_deadline())
             .flatten();
@@ -3078,6 +3234,7 @@ impl KmsBackend {
             .into_iter()
             .chain(direct_cursor_retry_deadline)
             .chain(gamma_deadline)
+            .chain(vrr_clear_deadline)
             .chain(vrr_cursor_deadline)
             .chain(source_wait_deadline)
             .chain(rescan_deadline)
@@ -3167,17 +3324,25 @@ impl KmsBackend {
         }
         let now = self.monotonic_now();
         for output_idx in 0..self.platform.outputs.len() {
-            let deadline_expired = {
+            let property_retry_due = {
                 let output = &self.platform.outputs[output_idx].output;
-                output.pending_gamma_lut.borrow().is_some()
+                (output.pending_gamma_lut.borrow().is_some()
                     && output
                         .pending_gamma_deadline
                         .get()
-                        .is_some_and(|deadline| now >= deadline)
+                        .is_some_and(|deadline| now >= deadline))
+                    || (!output.vrr_clear_waiting_for_flip.get()
+                        && output
+                            .vrr_clear_retry_deadline
+                            .get()
+                            .is_some_and(|deadline| now >= deadline))
             };
-            if deadline_expired {
-                self.platform
-                    .retry_pending_gamma_after_flip(output_idx, now);
+            if property_retry_due {
+                self.platform.retry_pending_crtc_property_after_flip(
+                    output_idx,
+                    now,
+                    self.live_direct_vrr_wanted(),
+                );
             }
         }
         if self.pstate.tearing.is_on()

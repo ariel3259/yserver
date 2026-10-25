@@ -796,13 +796,51 @@ fn submit_direct_successor(
             break;
         }
     }
-    assert!(accepted, "eligible direct successor reaches scanout");
+    assert!(
+        accepted,
+        "eligible direct successor {} reaches scanout (current={}, pending={}, queued={}, unflip={}, probation={})",
+        candidate.present_id,
+        fixture.events.backend.pstate.scanout_m2.current.is_some(),
+        fixture.events.backend.pstate.scanout_m2.pending.is_some(),
+        fixture
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .queued_successor
+            .is_some(),
+        fixture.events.backend.pstate.scanout_m2.unflip_requested,
+        fixture
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .eligible_root_streak,
+    );
     direct.candidate = candidate;
     direct.event = event;
     super::direct_unflip::records_since(fixture, fd, offset)
         .into_iter()
         .find(|record| super::support::accepted_event_id(record).is_some())
         .expect("Backend accepts the direct successor")
+}
+
+fn queue_direct_successor(
+    fixture: &mut super::recording_scene::RecordingSceneFixture,
+    direct: &mut super::recording_scene::DirectPresentSetup,
+) {
+    let mut candidate = direct.candidate;
+    candidate.present_id = candidate.present_id.wrapping_add(1);
+    let mut event = direct.event.clone();
+    event.present_id = candidate.present_id;
+    event.serial = event.serial.wrapping_add(1);
+    assert!(
+        Backend::try_present_direct(&mut fixture.events.backend, candidate, event.clone())
+            .expect("queued successor Present through Backend"),
+        "eligible direct successor remains queued behind its predecessor"
+    );
+    direct.candidate = candidate;
+    direct.event = event;
 }
 
 fn finish_direct_scanout(
@@ -1050,6 +1088,175 @@ fn request_present(
     .expect("Present request");
 }
 
+fn prepare_property_present_source(
+    fixture: &mut super::recording_scene::RecordingSceneFixture,
+    direct: &super::recording_scene::DirectPresentSetup,
+) {
+    Backend::note_present_scanout_candidate(&mut fixture.events.backend, direct.candidate);
+    let width = direct.candidate.src_width;
+    let height = direct.candidate.src_height;
+    let shape = crate::drm::async_flip::AsyncShape {
+        fourcc: 0x3432_5258,
+        modifier: 0,
+        pitch: u32::from(width) * 4,
+        width: u32::from(width),
+        height: u32::from(height),
+        crtcs: vec![handle(direct.candidate.crtc_id)],
+        direct: true,
+    };
+    fixture.events.backend.pstate.scanout_m1.entries.insert(
+        direct.source_id,
+        crate::kms::render::backend::ScanoutM1ProbeEntry::accepted_with_shape(
+            crate::drm::modeset::DirectScanoutProbeFramebuffer::for_tests(
+                super::recording_scene::raw(0x8130),
+            ),
+            shape,
+        ),
+    );
+}
+
+fn start_property_direct(
+    fixture: &mut super::recording_scene::RecordingSceneFixture,
+    direct: &super::recording_scene::DirectPresentSetup,
+    variable_refresh: bool,
+) -> (yserver_core::server::ServerState, u32, AtomicCommitRecord) {
+    let fd = super::direct_unflip::fd(fixture);
+    let mut state = present_request_state(direct);
+    let window = direct.target_xid;
+    let pixmap = direct.candidate.src_pixmap_xid;
+    let property = state.atoms.intern("_VARIABLE_REFRESH", false).0;
+    prepare_property_present_source(fixture, direct);
+    if variable_refresh {
+        request_vrr_property(
+            &mut state,
+            &mut fixture.events.backend,
+            window,
+            property,
+            yserver_core::xinput::XA_CARDINAL.0,
+            32,
+            &[1],
+            1,
+        );
+    }
+    fixture
+        .events
+        .backend
+        .pstate
+        .scanout_m2
+        .eligible_root_streak = crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1;
+    let offset = super::direct_unflip::record_count(fixture, fd);
+    request_present(
+        &mut state,
+        &mut fixture.events.backend,
+        window,
+        pixmap,
+        u32::try_from(direct.candidate.present_id).expect("Present serial fits"),
+        2,
+    );
+    let initial = super::direct_unflip::records_since(fixture, fd, offset)
+        .into_iter()
+        .find(|record| super::support::accepted_event_id(record).is_some())
+        .expect("property-controlled initial Present is accepted");
+    (state, property, initial)
+}
+
+fn submit_property_present(
+    fixture: &mut super::recording_scene::RecordingSceneFixture,
+    state: &mut yserver_core::server::ServerState,
+    direct: &super::recording_scene::DirectPresentSetup,
+    serial: u32,
+    sequence: u16,
+) -> Vec<AtomicCommitRecord> {
+    let fd = super::direct_unflip::fd(fixture);
+    let offset = super::direct_unflip::record_count(fixture, fd);
+    request_present(
+        state,
+        &mut fixture.events.backend,
+        direct.target_xid,
+        direct.candidate.src_pixmap_xid,
+        serial,
+        sequence,
+    );
+    super::direct_unflip::records_since(fixture, fd, offset)
+}
+
+fn finish_property_direct_scanout(
+    fixture: &mut super::recording_scene::RecordingSceneFixtureGuard,
+    fd: std::os::fd::RawFd,
+) {
+    let current = fixture
+        .events
+        .backend
+        .pstate
+        .scanout_m2
+        .current
+        .as_ref()
+        .expect("property direct frame remains current");
+    let direct = super::recording_scene::DirectPresentSetup {
+        candidate: current.candidate,
+        event: current.event.clone(),
+        source_id: current.source_id,
+        target_xid: current.candidate.dst_window_xid,
+    };
+    super::direct_unflip::request_unflip(fixture, &direct);
+    let offset = super::direct_unflip::record_count(fixture, fd);
+    let unflip = super::direct_unflip::grouped_unflip_record(fixture, fd, offset, 1);
+    super::atomic_events::complete_recorded_attempt(
+        fixture,
+        fd,
+        &unflip,
+        super::support::accepted_event_id(&unflip).expect("unflip event ID"),
+        89,
+    );
+    let completed = Backend::drain_completed_present_events(&mut fixture.events.backend);
+    let idled = Backend::drain_retired_present_idle_events(&mut fixture.events.backend);
+    assert!(
+        completed.len() <= 1,
+        "unflip retires at most one direct frame"
+    );
+    assert!(idled.len() <= 1, "unflip idles at most one direct frame");
+}
+
+fn add_property_window(state: &mut yserver_core::server::ServerState, window: u32, host_xid: u32) {
+    use yserver_core::resources::ROOT_WINDOW;
+    use yserver_protocol::x11::{ClientId, CreateWindowRequest, ResourceId};
+
+    state.resources.create_window(
+        ClientId(1),
+        CreateWindowRequest {
+            depth: 24,
+            window: ResourceId(window),
+            parent: ROOT_WINDOW,
+            width: 800,
+            height: 600,
+            class: 1,
+            visual: yserver_core::resources::ROOT_VISUAL,
+            ..Default::default()
+        },
+    );
+    state
+        .resources
+        .window_mut(ResourceId(window))
+        .expect("unrelated test window")
+        .host_xid = yserver_core::backend::WindowHandle::from_raw(host_xid);
+}
+
+fn complete_direct_and_drain_present(
+    fixture: &mut super::recording_scene::RecordingSceneFixture,
+    record: &AtomicCommitRecord,
+    present_id: u64,
+    previous_present_id: Option<u64>,
+) {
+    let fd = super::direct_unflip::fd(fixture);
+    let id = super::support::accepted_event_id(record).expect("direct frame event ID");
+    super::direct_unflip::complete_direct_initial(fixture, record, id, fd);
+    super::direct_unflip::drain_present_notifications(
+        fixture,
+        &[present_id],
+        &previous_present_id.into_iter().collect::<Vec<_>>(),
+    );
+}
+
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: default VRR mode to All; no direct commit may enable it by default.
@@ -1239,6 +1446,7 @@ fn vrr_property_mode_requires_cardinal_one() {
     for (case_index, (property_type, format, values)) in
         invalid_property_values.into_iter().enumerate()
     {
+        let property_change_offset = super::direct_unflip::record_count(&fixture, fd);
         request_vrr_property(
             &mut state,
             &mut fixture.events.backend,
@@ -1249,6 +1457,21 @@ fn vrr_property_mode_requires_cardinal_one() {
             &values,
             sequence,
         );
+        if case_index == 0 {
+            let clear = super::direct_unflip::records_since(&fixture, fd, property_change_offset)
+                .into_iter()
+                .find(|record| super::support::accepted_event_id(record).is_some())
+                .expect("property change clears committed VRR while the CRTC is idle");
+            assert_eq!(clear.kind, AtomicCommitKind::GammaOnly);
+            assert!(contains_vrr_property(&clear, crtc, 0));
+            assert_eq!(
+                clear.properties.len(),
+                1,
+                "property clear carries no plane state"
+            );
+            let clear_id = super::support::accepted_event_id(&clear).expect("clear event ID");
+            super::atomic_events::complete_recorded_attempt(&mut fixture, fd, &clear, clear_id, 71);
+        }
         let request_serial = previous_request_serial + 1;
         let present_id = previous_present_id + 1;
         let offset = super::direct_unflip::record_count(&fixture, fd);
@@ -1268,12 +1491,6 @@ fn vrr_property_mode_requires_cardinal_one() {
             !contains_vrr_property(&record, crtc, 1),
             "property case {case_index} must not set VRR_ENABLED"
         );
-        if case_index == 0 {
-            assert!(
-                contains_vrr_property(&record, crtc, 0),
-                "changing from CARDINAL/32 value 1 to value 0 clears the committed VRR value"
-            );
-        }
         let event_id = super::support::accepted_event_id(&record).expect("successor event ID");
         super::direct_unflip::complete_direct_initial(&mut fixture, &record, event_id, fd);
         super::direct_unflip::drain_present_notifications(
@@ -3151,4 +3368,506 @@ fn vrr_summary_reports_intervals_and_deadline_commits() {
     );
     finish_direct_scanout(&mut off_fixture, &off_direct, off_fd);
     off_fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: omit the _VARIABLE_REFRESH KMS hook; deleting the property would wait for another frame.
+fn vrr_property_deleted_clears_without_frame() {
+    let Some((mut fixture, direct)) =
+        direct_fixture_with_vrr_mode(18_040, 0, crate::launch::VrrMode::Property)
+    else {
+        eprintln!(
+            "SKIP vrr_property_deleted_clears_without_frame: no Vulkan scene fixture available"
+        );
+        return;
+    };
+    set_vrr_capable(&mut fixture);
+    let mut fixture = fixture.cleanup_guard();
+    let fd = super::direct_unflip::fd(&fixture);
+    let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    let (mut state, property, initial) = start_property_direct(&mut fixture, &direct, true);
+    assert!(contains_vrr_property(&initial, crtc, 1));
+    complete_direct_and_drain_present(&mut fixture, &initial, 1, None);
+    let recorder = fixture.events.recorders[&fd].clone();
+    let offset = super::direct_unflip::record_count(&fixture, fd);
+
+    delete_vrr_property(
+        &mut state,
+        &mut fixture.events.backend,
+        direct.target_xid,
+        property,
+        3,
+    );
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("idle property clear scheduling pass");
+    let clear = super::direct_unflip::records_since(&fixture, fd, offset)
+        .into_iter()
+        .find(|record| super::support::accepted_event_id(record).is_some())
+        .expect("idle deletion submits one standalone clear");
+    assert_eq!(clear.kind, AtomicCommitKind::GammaOnly);
+    assert!(contains_vrr_property(&clear, crtc, 0));
+    assert_eq!(
+        clear.properties.len(),
+        1,
+        "standalone clear changes no plane"
+    );
+    assert!(
+        !fixture.events.backend.platform.outputs[0]
+            .output
+            .vrr_committed
+            .get()
+    );
+    assert_eq!(
+        recorder
+            .records()
+            .iter()
+            .skip(offset)
+            .filter(|record| super::support::accepted_event_id(record).is_some())
+            .count(),
+        1,
+        "one accepted standalone clear is enough"
+    );
+    let clear_id = super::support::accepted_event_id(&clear).expect("clear event ID");
+    super::atomic_events::complete_recorded_attempt(&mut fixture, fd, &clear, clear_id, 84);
+
+    let later = submit_property_present(&mut fixture, &mut state, &direct, 18_041, 4)
+        .into_iter()
+        .find(|record| super::support::accepted_event_id(record).is_some())
+        .expect("later Present reaches direct scanout");
+    assert!(
+        !has_vrr_property(&later, crtc),
+        "a fresh Present without the property does not write VRR_ENABLED"
+    );
+    complete_direct_and_drain_present(&mut fixture, &later, 2, Some(1));
+    finish_property_direct_scanout(&mut fixture, fd);
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: retry the property clear before the direct flip retires, or omit its event retry.
+fn vrr_property_deleted_during_flip_clears_at_event() {
+    let Some((mut fixture, direct)) =
+        direct_fixture_with_vrr_mode(18_042, 0, crate::launch::VrrMode::Property)
+    else {
+        eprintln!(
+            "SKIP vrr_property_deleted_during_flip_clears_at_event: no Vulkan scene fixture available"
+        );
+        return;
+    };
+    set_vrr_capable(&mut fixture);
+    let mut fixture = fixture.cleanup_guard();
+    let fd = super::direct_unflip::fd(&fixture);
+    let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    let (mut state, property, initial) = start_property_direct(&mut fixture, &direct, true);
+    complete_direct_and_drain_present(&mut fixture, &initial, 1, None);
+    let pending = submit_property_present(&mut fixture, &mut state, &direct, 18_043, 3)
+        .into_iter()
+        .find(|record| super::support::accepted_event_id(record).is_some())
+        .expect("direct successor flip is in flight");
+    let offset = super::direct_unflip::record_count(&fixture, fd);
+
+    delete_vrr_property(
+        &mut state,
+        &mut fixture.events.backend,
+        direct.target_xid,
+        property,
+        4,
+    );
+    assert!(
+        super::direct_unflip::records_since(&fixture, fd, offset)
+            .iter()
+            .all(|record| !contains_vrr_property(record, crtc, 0)),
+        "the clear waits while the CRTC flip is in flight"
+    );
+    assert!(
+        fixture.events.backend.platform.outputs[0]
+            .output
+            .vrr_committed
+            .get()
+    );
+
+    super::atomic_events::complete_recorded_attempt(
+        &mut fixture,
+        fd,
+        &pending,
+        super::support::accepted_event_id(&pending).expect("pending event ID"),
+        85,
+    );
+    super::direct_unflip::drain_present_notifications(&mut fixture, &[2], &[1]);
+    let clear = super::direct_unflip::records_since(&fixture, fd, offset)
+        .into_iter()
+        .find(|record| super::support::accepted_event_id(record).is_some())
+        .expect("flip event releases the standalone clear");
+    assert_eq!(clear.kind, AtomicCommitKind::GammaOnly);
+    assert!(contains_vrr_property(&clear, crtc, 0));
+    assert_eq!(clear.properties.len(), 1, "clear carries no plane state");
+    assert!(
+        !fixture.events.backend.platform.outputs[0]
+            .output
+            .vrr_committed
+            .get()
+    );
+    let clear_id = super::support::accepted_event_id(&clear).expect("clear event ID");
+    super::atomic_events::complete_recorded_attempt(&mut fixture, fd, &clear, clear_id, 86);
+
+    finish_property_direct_scanout(&mut fixture, fd);
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: issue a standalone VRR enable on property set; enabling must ride the next direct frame.
+fn vrr_property_set_enables_on_next_frame() {
+    let Some((mut fixture, direct)) =
+        direct_fixture_with_vrr_mode(18_044, 0, crate::launch::VrrMode::Property)
+    else {
+        eprintln!("SKIP vrr_property_set_enables_on_next_frame: no Vulkan scene fixture available");
+        return;
+    };
+    set_vrr_capable(&mut fixture);
+    let mut fixture = fixture.cleanup_guard();
+    let fd = super::direct_unflip::fd(&fixture);
+    let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    let (mut state, property, initial) = start_property_direct(&mut fixture, &direct, false);
+    assert!(!has_vrr_property(&initial, crtc));
+    complete_direct_and_drain_present(&mut fixture, &initial, 1, None);
+    let offset = super::direct_unflip::record_count(&fixture, fd);
+
+    request_vrr_property(
+        &mut state,
+        &mut fixture.events.backend,
+        direct.target_xid,
+        property,
+        yserver_core::xinput::XA_CARDINAL.0,
+        32,
+        &[1],
+        3,
+    );
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("property set waits for a direct frame");
+    assert!(
+        super::direct_unflip::records_since(&fixture, fd, offset).is_empty(),
+        "setting the property does not make a standalone commit"
+    );
+    assert!(
+        !fixture.events.backend.platform.outputs[0]
+            .output
+            .vrr_committed
+            .get()
+    );
+
+    let next = submit_property_present(&mut fixture, &mut state, &direct, 18_045, 4)
+        .into_iter()
+        .find(|record| super::support::accepted_event_id(record).is_some())
+        .expect("next Present reaches direct scanout");
+    assert!(contains_vrr_property(&next, crtc, 1));
+    assert!(
+        fixture.events.backend.platform.outputs[0]
+            .output
+            .vrr_committed
+            .get()
+    );
+    complete_direct_and_drain_present(&mut fixture, &next, 2, Some(1));
+    finish_property_direct_scanout(&mut fixture, fd);
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: apply another window's property value to the direct owner and emit an unrelated clear.
+fn vrr_property_change_other_window_ignored() {
+    let Some((mut fixture, direct)) =
+        direct_fixture_with_vrr_mode(18_046, 0, crate::launch::VrrMode::Property)
+    else {
+        eprintln!(
+            "SKIP vrr_property_change_other_window_ignored: no Vulkan scene fixture available"
+        );
+        return;
+    };
+    set_vrr_capable(&mut fixture);
+    let mut fixture = fixture.cleanup_guard();
+    let fd = super::direct_unflip::fd(&fixture);
+    let (mut state, property, initial) = start_property_direct(&mut fixture, &direct, true);
+    complete_direct_and_drain_present(&mut fixture, &initial, 1, None);
+    let other_window = direct.target_xid.wrapping_add(0x100);
+    add_property_window(&mut state, other_window, other_window.wrapping_add(0x1000));
+    let recorder = fixture.events.recorders[&fd].clone();
+    let offset = super::direct_unflip::record_count(&fixture, fd);
+
+    request_vrr_property(
+        &mut state,
+        &mut fixture.events.backend,
+        other_window,
+        property,
+        yserver_core::xinput::XA_CARDINAL.0,
+        32,
+        &[0],
+        3,
+    );
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("unrelated property notification is ignored");
+    assert!(
+        super::direct_unflip::records_since(&fixture, fd, offset).is_empty(),
+        "an unrelated window never submits a CRTC property commit"
+    );
+    assert!(
+        fixture.events.backend.platform.outputs[0]
+            .output
+            .vrr_committed
+            .get()
+    );
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .current
+            .as_ref()
+            .unwrap()
+            .candidate
+            .variable_refresh,
+        "the direct owner's stored permission remains enabled"
+    );
+    assert_eq!(recorder.records().len(), offset);
+    finish_property_direct_scanout(&mut fixture, fd);
+    fixture.finish_after_normal_drain();
+}
+
+fn queued_property_change_case(initial: bool, changed: bool, present_id: u64) {
+    let Some((mut fixture, mut direct)) =
+        direct_fixture_with_vrr_mode(present_id, 0, crate::launch::VrrMode::Property)
+    else {
+        eprintln!(
+            "SKIP vrr_property_change_reaches_queued_successor: no Vulkan scene fixture available"
+        );
+        return;
+    };
+    set_vrr_capable(&mut fixture);
+    let mut fixture = fixture.cleanup_guard();
+    let fd = super::direct_unflip::fd(&fixture);
+    let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    let mut state = present_request_state(&direct);
+    let property = state.atoms.intern("_VARIABLE_REFRESH", false).0;
+    prepare_property_present_source(&mut fixture, &direct);
+    if initial {
+        request_vrr_property(
+            &mut state,
+            &mut fixture.events.backend,
+            direct.target_xid,
+            property,
+            yserver_core::xinput::XA_CARDINAL.0,
+            32,
+            &[1],
+            1,
+        );
+    }
+    direct.candidate.variable_refresh = initial;
+    let first = accepted_direct_record(&mut fixture, &direct, fd);
+    assert_eq!(has_vrr_property(&first, crtc), initial);
+    complete_direct_and_drain_present(&mut fixture, &first, direct.candidate.present_id, None);
+
+    let pending = submit_direct_successor(&mut fixture, &mut direct, fd);
+    let pending_present_id = direct.candidate.present_id;
+    queue_direct_successor(&mut fixture, &mut direct);
+    let queued_present_id = direct.candidate.present_id;
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .queued_successor
+            .is_some()
+    );
+    let change_sequence = 5;
+    if changed {
+        request_vrr_property(
+            &mut state,
+            &mut fixture.events.backend,
+            direct.target_xid,
+            property,
+            yserver_core::xinput::XA_CARDINAL.0,
+            32,
+            &[1],
+            change_sequence,
+        );
+    } else {
+        delete_vrr_property(
+            &mut state,
+            &mut fixture.events.backend,
+            direct.target_xid,
+            property,
+            change_sequence,
+        );
+    }
+    for frame in [
+        fixture.events.backend.pstate.scanout_m2.current.as_ref(),
+        fixture.events.backend.pstate.scanout_m2.pending.as_ref(),
+        fixture
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .queued_successor
+            .as_ref(),
+    ] {
+        assert_eq!(
+            frame
+                .expect("all three direct records remain live")
+                .candidate
+                .variable_refresh,
+            changed,
+            "property change updates current, pending, and queued direct records"
+        );
+    }
+
+    let offset = super::direct_unflip::record_count(&fixture, fd);
+    super::atomic_events::complete_recorded_attempt(
+        &mut fixture,
+        fd,
+        &pending,
+        super::support::accepted_event_id(&pending).expect("pending event ID"),
+        87,
+    );
+    super::direct_unflip::drain_present_notifications(
+        &mut fixture,
+        &[pending_present_id],
+        &[pending_present_id - 1],
+    );
+    let successor = super::direct_unflip::records_since(&fixture, fd, offset)
+        .into_iter()
+        .find(|record| super::support::accepted_event_id(record).is_some())
+        .expect("queued successor submits after predecessor retirement");
+    assert_eq!(
+        has_vrr_property(&successor, crtc),
+        initial != changed,
+        "queued successor carries the new value only when it differs from committed state"
+    );
+    if initial != changed {
+        assert!(contains_vrr_property(&successor, crtc, u64::from(changed)));
+    }
+    let successor_id = super::support::accepted_event_id(&successor).expect("successor event ID");
+    super::direct_unflip::complete_direct_initial(&mut fixture, &successor, successor_id, fd);
+    super::direct_unflip::drain_present_notifications(
+        &mut fixture,
+        &[queued_present_id],
+        &[pending_present_id],
+    );
+    finish_property_direct_scanout(&mut fixture, fd);
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: update only current; a property change must also reach the queued successor.
+fn vrr_property_change_reaches_queued_successor() {
+    queued_property_change_case(false, true, 18_047);
+    queued_property_change_case(true, false, 18_048);
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: drop the standalone clear retry deadline; ENOMEM must retry once after one refresh period.
+fn vrr_standalone_clear_retried_after_error() {
+    let Some((mut fixture, direct)) =
+        direct_fixture_with_vrr_mode(18_049, 0, crate::launch::VrrMode::Property)
+    else {
+        eprintln!(
+            "SKIP vrr_standalone_clear_retried_after_error: no Vulkan scene fixture available"
+        );
+        return;
+    };
+    set_vrr_capable(&mut fixture);
+    let mut fixture = fixture.cleanup_guard();
+    let fd = super::direct_unflip::fd(&fixture);
+    let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    let (mut state, property, initial) = start_property_direct(&mut fixture, &direct, true);
+    complete_direct_and_drain_present(&mut fixture, &initial, 1, None);
+    fixture.events.backend.platform.clear_direct_cursor_retry(0);
+    fixture
+        .events
+        .backend
+        .pstate
+        .scanout_m2
+        .clear_all_direct_cursor_refresh_pending();
+    fixture.events.wait_for_submitted_gpu_work();
+    Backend::before_block(&mut fixture.events.backend);
+    let recorder = fixture.events.recorders[&fd].clone();
+    let (base, elapsed_ns) = super::support::install_controlled_clock(&mut fixture.events.backend);
+    let refresh_period = Duration::from_nanos(1_000_000_000 / 60);
+    let offset = super::direct_unflip::record_count(&fixture, fd);
+    recorder.script_result(Err(io::Error::from_raw_os_error(libc::ENOMEM)));
+
+    delete_vrr_property(
+        &mut state,
+        &mut fixture.events.backend,
+        direct.target_xid,
+        property,
+        3,
+    );
+    let failed = super::direct_unflip::records_since(&fixture, fd, offset);
+    assert_eq!(failed.len(), 1, "the standalone clear is attempted once");
+    assert!(contains_vrr_property(&failed[0], crtc, 0));
+    assert!(matches!(
+        failed[0].result,
+        ScriptedResult::Error {
+            raw_os_error: Some(error),
+            ..
+        } if error == libc::ENOMEM
+    ));
+    let deadline = fixture.events.backend.platform.outputs[0]
+        .output
+        .vrr_clear_retry_deadline
+        .get();
+    assert_eq!(
+        deadline,
+        Some(base + refresh_period),
+        "the retry deadline is one output refresh period after ENOMEM"
+    );
+    assert!(
+        Backend::next_wakeup(&fixture.events.backend)
+            .is_some_and(|wake| wake <= base + refresh_period),
+        "next_wakeup exposes the retry deadline, or an earlier pending backend wake"
+    );
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("do not retry the failed standalone clear early");
+    assert_eq!(
+        super::direct_unflip::record_count(&fixture, fd) - offset,
+        1,
+        "no immediate retry spins while waiting for the deadline"
+    );
+
+    advance_vrr_cursor_clock(&elapsed_ns, refresh_period - Duration::from_nanos(1));
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("stay idle just before the retry deadline");
+    assert_eq!(
+        super::direct_unflip::record_count(&fixture, fd) - offset,
+        1,
+        "one nanosecond before the deadline still submits nothing"
+    );
+    advance_vrr_cursor_clock(&elapsed_ns, Duration::from_nanos(1));
+    Backend::maybe_composite(&mut fixture.events.backend).expect("retry clear at its deadline");
+    let attempts = super::direct_unflip::records_since(&fixture, fd, offset);
+    assert_eq!(attempts.len(), 2, "the failed clear is retried once");
+    assert_eq!(attempts[1].result, ScriptedResult::Ok);
+    assert_eq!(attempts[1].kind, AtomicCommitKind::GammaOnly);
+    assert!(contains_vrr_property(&attempts[1], crtc, 0));
+    assert_eq!(
+        attempts[1].properties.len(),
+        1,
+        "retry carries no plane state"
+    );
+    assert!(
+        !fixture.events.backend.platform.outputs[0]
+            .output
+            .vrr_committed
+            .get()
+    );
+    let retry_id = super::support::accepted_event_id(&attempts[1]).expect("retry event ID");
+    super::atomic_events::complete_recorded_attempt(&mut fixture, fd, &attempts[1], retry_id, 88);
+    finish_property_direct_scanout(&mut fixture, fd);
+    fixture.finish_after_normal_drain();
 }
