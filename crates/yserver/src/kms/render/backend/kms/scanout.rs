@@ -1034,7 +1034,6 @@ impl KmsBackend {
             && match self.pstate.vrr_mode {
                 crate::launch::VrrMode::Off => false,
                 crate::launch::VrrMode::Property => frame.candidate.variable_refresh,
-                crate::launch::VrrMode::All => true,
             }
     }
 

@@ -120,7 +120,6 @@ impl KmsBackend {
             match vrr_mode {
                 crate::launch::VrrMode::Off => "off",
                 crate::launch::VrrMode::Property => "property",
-                crate::launch::VrrMode::All => "all",
             }
         );
         Self::open_with_commit(

@@ -231,7 +231,7 @@ impl RecordingSceneFixture {
             crtc_epoch,
             src_pixmap_xid: source_xid,
             dst_window_xid: target_xid,
-            variable_refresh: false,
+            variable_refresh: true,
             src_host_xid: source_xid,
             paint_dst_host_xid: target_xid,
             completion_dst_host_xid: target_xid,

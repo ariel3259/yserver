@@ -1259,7 +1259,7 @@ fn complete_direct_and_drain_present(
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: default VRR mode to All; no direct commit may enable it by default.
+// Mutation: default VRR mode to Property; no direct commit may enable it by default.
 fn vrr_off_mode_never_enables() {
     let Some((fixture, direct)) =
         direct_fixture_with_vrr_mode(18_101, 0, crate::launch::VrrMode::default())
@@ -1539,43 +1539,6 @@ fn vrr_property_mode_requires_cardinal_one() {
     direct.candidate.present_id = present_id;
     direct.event.present_id = present_id;
     direct.event.serial = request_serial;
-    finish_direct_scanout(&mut fixture, &direct, fd);
-    fixture.finish_after_normal_drain();
-}
-
-#[test]
-#[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: honor the property in All mode; a property-less direct frame must still enable VRR.
-fn vrr_all_mode_ignores_property() {
-    let Some((fixture, direct)) =
-        direct_fixture_with_vrr_mode(18_104, 0, crate::launch::VrrMode::All)
-    else {
-        eprintln!("SKIP vrr_all_mode_ignores_property: no Vulkan scene fixture available");
-        return;
-    };
-    let mut fixture = fixture.cleanup_guard();
-    set_vrr_capable(&mut fixture);
-    let fd = super::direct_unflip::fd(&fixture);
-    let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
-    let direct_record = accepted_direct_record(&mut fixture, &direct, fd);
-
-    assert!(
-        contains_vrr_property(&direct_record, crtc, 1),
-        "All mode enables VRR when the candidate has no property permission"
-    );
-    assert!(
-        fixture.events.backend.platform.outputs[0]
-            .output
-            .vrr_committed
-            .get()
-    );
-    let id = super::support::accepted_event_id(&direct_record).expect("direct event ID");
-    super::direct_unflip::complete_direct_initial(&mut fixture, &direct_record, id, fd);
-    super::direct_unflip::drain_present_notifications(
-        &mut fixture,
-        &[direct.candidate.present_id],
-        &[],
-    );
     finish_direct_scanout(&mut fixture, &direct, fd);
     fixture.finish_after_normal_drain();
 }

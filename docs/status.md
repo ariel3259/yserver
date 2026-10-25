@@ -33,7 +33,7 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
-- **2026-10-24 VRR adaptive sync (branch `feat/vrr`, Tasks 5–9):** off by default; `--vrr` honors `_VARIABLE_REFRESH` CARDINAL/32 value 1 and `--vrr all` ignores it for client-owned direct scanout on one capable output. Animated cursors can still force a composed unflip once per animation frame; cursor moves otherwise wait for a direct frame or the 33 ms deadline. Hardware validation remains for Task 6.
+- **2026-10-24 VRR adaptive sync (branch `feat/vrr`, Tasks 5–9):** off by default; `--vrr` honors `_VARIABLE_REFRESH` CARDINAL/32 value 1 for client-owned direct scanout on one capable output. NVIDIA clients get no VRR yet; support is a follow-up. Animated cursors can still force a composed unflip once per animation frame; cursor moves otherwise wait for a direct frame or the 33 ms deadline. Hardware validation remains for Task 6.
 
 - **2026-10-23 PRIME probe helper without `DISPLAY` (branch `fix/probe-helper-display`):** the disposable
   probe helper inherited the server's `DISPLAY`. The NVIDIA Vulkan ICD connects to it, so a server started with
