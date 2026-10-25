@@ -458,59 +458,45 @@ impl PlatformBackend {
         positions
     }
 
-    /// Whether a cursor-only position can make the scheduling pass runnable.
-    pub(crate) fn has_eligible_atomic_cursor_move(&self, now: Instant) -> bool {
-        self.devices.iter().any(|device| {
-            device.cursor.atomic_cursor
-                && device
-                    .cursor
-                    .atomic_pending_moves
-                    .iter()
-                    .any(|(crtc, pending)| {
-                        !device
+    fn eligible_atomic_cursor_moves(&self) -> impl Iterator<Item = (Option<Instant>, bool)> + '_ {
+        self.devices.iter().flat_map(move |device| {
+            device
+                .cursor
+                .atomic_pending_moves
+                .iter()
+                .filter_map(move |(crtc, pending)| {
+                    let output_is_vrr_on = self.outputs.iter().any(|layout| {
+                        layout.key.device_key == device.key
+                            && layout.output.crtc == *crtc
+                            && layout.output.vrr_committed.get()
+                    });
+                    (device.cursor.atomic_cursor
+                        && !device
                             .cursor
                             .atomic_cursor_commits_in_flight
                             .contains_key(crtc)
-                            && !device.cursor.cursor_retry_waits_for_flip.contains(crtc)
-                            && !device.cursor.cursor_hide_recovery.contains_key(crtc)
-                            && device.cursor.available_on(*crtc)
-                            && device.cursor.hw_bound_on(*crtc)
-                            && (!self.outputs.iter().any(|layout| {
-                                layout.key.device_key == device.key
-                                    && layout.output.crtc == *crtc
-                                    && layout.output.vrr_committed.get()
-                            }) || pending.deadline.is_none_or(|deadline| now >= deadline))
-                    })
+                        && !device.cursor.cursor_retry_waits_for_flip.contains(crtc)
+                        && !device.cursor.cursor_hide_recovery.contains_key(crtc)
+                        && device.cursor.available_on(*crtc)
+                        && device.cursor.hw_bound_on(*crtc))
+                    .then_some((pending.deadline, output_is_vrr_on))
+                })
         })
+    }
+
+    /// Whether a cursor-only position can make the scheduling pass runnable.
+    pub(crate) fn has_eligible_atomic_cursor_move(&self, now: Instant) -> bool {
+        self.eligible_atomic_cursor_moves()
+            .any(|(deadline, output_is_vrr_on)| {
+                !output_is_vrr_on || deadline.is_none_or(|deadline| now >= deadline)
+            })
     }
 
     /// Earliest held VRR cursor position that is eligible to wake scanout.
     pub(crate) fn vrr_cursor_deadline(&self) -> Option<Instant> {
-        self.devices
-            .iter()
-            .flat_map(|device| {
-                device
-                    .cursor
-                    .atomic_pending_moves
-                    .iter()
-                    .filter_map(move |(crtc, pending)| {
-                        let output_is_vrr_on = self.outputs.iter().any(|layout| {
-                            layout.key.device_key == device.key
-                                && layout.output.crtc == *crtc
-                                && layout.output.vrr_committed.get()
-                        });
-                        (output_is_vrr_on
-                            && !device
-                                .cursor
-                                .atomic_cursor_commits_in_flight
-                                .contains_key(crtc)
-                            && !device.cursor.cursor_retry_waits_for_flip.contains(crtc)
-                            && !device.cursor.cursor_hide_recovery.contains_key(crtc)
-                            && device.cursor.available_on(*crtc)
-                            && device.cursor.hw_bound_on(*crtc))
-                        .then_some(pending.deadline)
-                        .flatten()
-                    })
+        self.eligible_atomic_cursor_moves()
+            .filter_map(|(deadline, output_is_vrr_on)| {
+                output_is_vrr_on.then_some(deadline).flatten()
             })
             .min()
     }

@@ -1,7 +1,7 @@
 use crate::{
     drm::{
         atomic::{
-            AtomicCommitKind, AtomicCommitSink,
+            AtomicCommitKind, AtomicCommitSink, AtomicPropertyUpdate,
             tests_support::{AtomicCommitRecord, RecordingAtomicCommitExecutor, ScriptedResult},
         },
         modeset::PropMap,
@@ -21,11 +21,8 @@ use std::{
     collections::HashSet,
     io,
     rc::Rc,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::{Duration, Instant},
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
 };
 use yserver_core::backend::{Backend, ModeSpec};
 
@@ -36,6 +33,11 @@ type CommitSignature = (
     AtomicCommitKind,
     ::drm::control::AtomicCommitFlags,
     Vec<PropertySignature>,
+);
+type RequestSignature = (
+    AtomicCommitKind,
+    ::drm::control::AtomicCommitFlags,
+    Vec<AtomicPropertyUpdate>,
 );
 
 fn handle<H: ::drm::control::ResourceHandle>(value: u32) -> H {
@@ -1851,16 +1853,6 @@ fn vrr_cursor_harness(present_id: u64, capable: bool) -> Option<VrrCursorHarness
     Some(harness)
 }
 
-fn install_controlled_vrr_cursor_clock(backend: &mut KmsBackend) -> (Instant, Arc<AtomicU64>) {
-    let base = Instant::now();
-    let elapsed_ns = Arc::new(AtomicU64::new(0));
-    let clock_elapsed_ns = Arc::clone(&elapsed_ns);
-    backend.for_tests_set_monotonic_clock(Rc::new(move || {
-        base + Duration::from_nanos(clock_elapsed_ns.load(Ordering::SeqCst))
-    }));
-    (base, elapsed_ns)
-}
-
 fn advance_vrr_cursor_clock(elapsed_ns: &AtomicU64, duration: Duration) {
     elapsed_ns.fetch_add(
         u64::try_from(duration.as_nanos()).expect("cursor deadline fits nanoseconds"),
@@ -1874,6 +1866,13 @@ fn vrr_cursor_records_since(harness: &VrrCursorHarness, offset: usize) -> Vec<At
         .into_iter()
         .skip(offset)
         .filter(|record| record.device_fd == harness.device_fd)
+        .collect()
+}
+
+fn request_signatures(records: &[AtomicCommitRecord]) -> Vec<RequestSignature> {
+    records
+        .iter()
+        .map(|record| (record.kind, record.flags, record.properties.clone()))
         .collect()
 }
 
@@ -1906,7 +1905,8 @@ fn vrr_cursor_motion_rides_direct_frame() {
         eprintln!("SKIP vrr_cursor_motion_rides_direct_frame: no Vulkan scene fixture available");
         return;
     };
-    let (base, elapsed_ns) = install_controlled_vrr_cursor_clock(&mut harness.scene.events.backend);
+    let (base, elapsed_ns) =
+        super::support::install_controlled_clock(&mut harness.scene.events.backend);
     let offset = super::direct_unflip::record_count(&harness.scene, harness.device_fd);
     let mut direct = harness.direct.take().expect("direct scanout is active");
     harness.warp_pointer(180, 130);
@@ -1961,7 +1961,8 @@ fn vrr_cursor_motion_without_frame_commits_once_at_deadline() {
         );
         return;
     };
-    let (base, elapsed_ns) = install_controlled_vrr_cursor_clock(&mut harness.scene.events.backend);
+    let (base, elapsed_ns) =
+        super::support::install_controlled_clock(&mut harness.scene.events.backend);
     let offset = super::direct_unflip::record_count(&harness.scene, harness.device_fd);
     harness.warp_pointer(180, 130);
     Backend::maybe_composite(&mut harness.scene.events.backend)
@@ -2008,7 +2009,8 @@ fn vrr_cursor_later_motion_keeps_deadline() {
         eprintln!("SKIP vrr_cursor_later_motion_keeps_deadline: no Vulkan scene fixture available");
         return;
     };
-    let (base, elapsed_ns) = install_controlled_vrr_cursor_clock(&mut harness.scene.events.backend);
+    let (base, elapsed_ns) =
+        super::support::install_controlled_clock(&mut harness.scene.events.backend);
     let offset = super::direct_unflip::record_count(&harness.scene, harness.device_fd);
     harness.warp_pointer(180, 130);
     Backend::maybe_composite(&mut harness.scene.events.backend)
@@ -2045,7 +2047,8 @@ fn vrr_cursor_new_move_after_carried_move_gets_fresh_deadline() {
         );
         return;
     };
-    let (base, elapsed_ns) = install_controlled_vrr_cursor_clock(&mut harness.scene.events.backend);
+    let (base, elapsed_ns) =
+        super::support::install_controlled_clock(&mut harness.scene.events.backend);
     let offset = super::direct_unflip::record_count(&harness.scene, harness.device_fd);
     let mut direct = harness.direct.take().expect("direct scanout is active");
     harness.warp_pointer(180, 130);
@@ -2111,7 +2114,8 @@ fn vrr_cursor_deadline_ebusy_waits_for_flip() {
         );
         return;
     };
-    let (base, elapsed_ns) = install_controlled_vrr_cursor_clock(&mut harness.scene.events.backend);
+    let (base, elapsed_ns) =
+        super::support::install_controlled_clock(&mut harness.scene.events.backend);
     let recorder = Rc::clone(&harness.scene.events.recorders[&harness.device_fd]);
     let offset = super::direct_unflip::record_count(&harness.scene, harness.device_fd);
     let crtc = harness.scene.events.backend.platform.outputs[0].output.crtc;
@@ -2184,7 +2188,7 @@ fn vrr_cursor_image_change_commits_immediately() {
         );
         return;
     };
-    let _ = install_controlled_vrr_cursor_clock(&mut harness.scene.events.backend);
+    let _ = super::support::install_controlled_clock(&mut harness.scene.events.backend);
     let position_offset = super::direct_unflip::record_count(&harness.scene, harness.device_fd);
     harness.warp_pointer(180, 130);
     Backend::maybe_composite(&mut harness.scene.events.backend)
@@ -2235,20 +2239,22 @@ fn vrr_cursor_image_change_commits_immediately() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: apply the VRR cursor delay when the output's committed VRR value is false.
+// Mutation: change a VRR-off request or insert another request into its recorded stream.
 fn vrr_off_cursor_only_unchanged() {
     let Some(mut harness) = vrr_cursor_harness(18_026, false) else {
         eprintln!("SKIP vrr_off_cursor_only_unchanged: no Vulkan scene fixture available");
         return;
     };
-    let (base, _) = install_controlled_vrr_cursor_clock(&mut harness.scene.events.backend);
+    let (base, _) = super::support::install_controlled_clock(&mut harness.scene.events.backend);
     let offset = super::direct_unflip::record_count(&harness.scene, harness.device_fd);
     harness.warp_pointer(180, 130);
     Backend::maybe_composite(&mut harness.scene.events.backend)
         .expect("submit ordinary cursor motion with VRR off");
-    let attempts: Vec<_> = vrr_cursor_records_since(&harness, offset)
-        .into_iter()
+    let records = vrr_cursor_records_since(&harness, offset);
+    let attempts: Vec<_> = records
+        .iter()
         .filter(|record| record.kind == AtomicCommitKind::CursorOnly)
+        .cloned()
         .collect();
     assert_eq!(
         attempts.len(),
@@ -2261,6 +2267,26 @@ fn vrr_off_cursor_only_unchanged() {
         Backend::next_wakeup(&harness.scene.events.backend).is_none_or(|wakeup| wakeup <= base),
         "VRR-off motion does not add a 33 ms deadline"
     );
+    assert_eq!(records.len(), 1, "motion records one complete request");
+
+    let Some(mut baseline) = vrr_cursor_harness(18_027, false) else {
+        eprintln!("SKIP vrr_off_cursor_only_unchanged: no Vulkan baseline fixture available");
+        return;
+    };
+    baseline.scene.events.backend.platform.outputs[0]
+        .output
+        .crtc_vrr_enabled_prop = None;
+    let baseline_offset = super::direct_unflip::record_count(&baseline.scene, baseline.device_fd);
+    baseline.warp_pointer(180, 130);
+    Backend::maybe_composite(&mut baseline.scene.events.backend)
+        .expect("submit baseline cursor motion without a VRR property");
+    let baseline_records = vrr_cursor_records_since(&baseline, baseline_offset);
+    assert_eq!(
+        request_signatures(&records),
+        request_signatures(&baseline_records),
+        "VRR-off motion preserves the complete atomic request stream without VRR support"
+    );
     harness.retire_cursor_move(99);
     harness.finish();
+    baseline.finish();
 }

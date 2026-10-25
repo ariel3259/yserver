@@ -18,9 +18,23 @@ use std::{
     io::Write as _,
     os::fd::{AsFd as _, AsRawFd as _, RawFd},
     rc::Rc,
-    time::Duration,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
 };
 use yserver_core::{backend::Backend, server::ServerState};
+
+pub(crate) fn install_controlled_clock(backend: &mut KmsBackend) -> (Instant, Arc<AtomicU64>) {
+    let base = Instant::now();
+    let elapsed_ns = Arc::new(AtomicU64::new(0));
+    let clock_elapsed_ns = Arc::clone(&elapsed_ns);
+    backend.for_tests_set_monotonic_clock(Rc::new(move || {
+        base + Duration::from_nanos(clock_elapsed_ns.load(Ordering::SeqCst))
+    }));
+    (base, elapsed_ns)
+}
 
 pub(crate) struct AtomicEventFixture {
     pub(crate) backend: KmsBackend,
