@@ -217,8 +217,9 @@ direct-scanout-eligible client that presents with
 `PresentOptionAsync` is flipped asynchronously and may tear, as
 under Xorg's modesetting driver (yserver advertises
 `PresentCapabilityAsync`, not `PresentCapabilityAsyncMayTear`).
-VRR and color management / HDR are valid future directions but not
-yet implemented.
+VRR is enabled per output while a fullscreen client window is in
+direct scanout. Color management / HDR is a valid future direction
+but not yet implemented.
 
 ## What's not in this document
 
