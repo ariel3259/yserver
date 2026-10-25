@@ -16,7 +16,17 @@ use crate::{
         scanout_route::{RenderKmsRelationship, ScanoutRoute},
     },
 };
-use std::{cell::RefCell, io, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::HashSet,
+    io,
+    rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
 use yserver_core::backend::{Backend, ModeSpec};
 
 const VRR_PROP_ID: u32 = 90;
@@ -408,10 +418,6 @@ fn install_recording_power(
         }));
 }
 
-fn new_power_recorder() -> Rc<RecordingAtomicCommitExecutor> {
-    Rc::new(RecordingAtomicCommitExecutor::default())
-}
-
 fn backend_snapshot(backend: &KmsBackend) -> Vec<ConnectorSnapshot> {
     backend
         .platform
@@ -471,7 +477,7 @@ fn vrr_vt_release_clears_before_drop_master() {
     let crtc = backend.platform.outputs[0].output.crtc;
     backend.platform.outputs[0].output.vrr_committed.set(true);
     let events = Rc::new(RefCell::new(Vec::new()));
-    let recorder = new_power_recorder();
+    let recorder = Rc::new(RecordingAtomicCommitExecutor::default());
     install_recording_power(&mut backend, Rc::clone(&recorder), 1, Rc::clone(&events));
     backend.for_tests_set_vt_resume_executor(Rc::new(KernelVrrVtResume {
         snapshots: backend_snapshot(&backend),
@@ -518,7 +524,7 @@ fn vrr_shutdown_clears() {
     let crtc = backend.platform.outputs[0].output.crtc;
     backend.platform.outputs[0].output.vrr_committed.set(true);
     let events = Rc::new(RefCell::new(Vec::new()));
-    let recorder = new_power_recorder();
+    let recorder = Rc::new(RecordingAtomicCommitExecutor::default());
     install_recording_power(&mut backend, Rc::clone(&recorder), 1, events);
 
     backend
@@ -547,7 +553,7 @@ fn vrr_clear_rejected_release_completes() {
     let crtc = backend.platform.outputs[0].output.crtc;
     backend.platform.outputs[0].output.vrr_committed.set(true);
     let events = Rc::new(RefCell::new(Vec::new()));
-    let recorder = new_power_recorder();
+    let recorder = Rc::new(RecordingAtomicCommitExecutor::default());
     install_recording_power(&mut backend, Rc::clone(&recorder), 1, Rc::clone(&events));
     recorder.script_result(Err(io::Error::from_raw_os_error(libc::EIO)));
     backend.for_tests_set_vt_resume_executor(Rc::new(KernelVrrVtResume {
@@ -687,7 +693,7 @@ fn vrr_dpms_off_clears_and_direct_frame_reenables() {
 fn vrr_vt_acquire_reads_value_left_by_other_master() {
     let mut backend = vrr_backend();
     let events = Rc::new(RefCell::new(Vec::new()));
-    let recorder = new_power_recorder();
+    let recorder = Rc::new(RecordingAtomicCommitExecutor::default());
     install_recording_power(&mut backend, Rc::clone(&recorder), 1, Rc::clone(&events));
     backend.for_tests_set_vt_resume_executor(Rc::new(KernelVrrVtResume {
         snapshots: backend_snapshot(&backend),
@@ -1657,4 +1663,604 @@ fn vrr_inherited_on_is_cleared() {
     let id = super::support::accepted_event_id(&frame).expect("scene event ID");
     super::atomic_events::complete_recorded_attempt(&mut fixture, frame.device_fd, &frame, id, 71);
     fixture.finish_after_normal_drain();
+}
+
+struct VrrCursorHarness {
+    fixture: Option<super::super::cursor_sprites::support::AtomicPathFixture>,
+    direct: Option<super::recording_scene::DirectPresentSetup>,
+    delivered: HashSet<super::super::cursor_sprites::support::CompletionKey>,
+    device_fd: std::os::fd::RawFd,
+}
+
+impl std::ops::Deref for VrrCursorHarness {
+    type Target = super::super::cursor_sprites::support::AtomicPathFixture;
+
+    fn deref(&self) -> &Self::Target {
+        self.fixture.as_ref().expect("cursor fixture is live")
+    }
+}
+
+impl std::ops::DerefMut for VrrCursorHarness {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.fixture.as_mut().expect("cursor fixture is live")
+    }
+}
+
+impl VrrCursorHarness {
+    fn warp_pointer(&mut self, x: i32, y: i32) {
+        let events = &mut self
+            .fixture
+            .as_mut()
+            .expect("cursor fixture is live")
+            .scene
+            .events;
+        Backend::warp_pointer_root(&mut events.backend, &mut events.state, x, y);
+    }
+
+    fn retire_cursor_move(&mut self, frame: u32) {
+        let (fixture, delivered) = (&mut self.fixture, &mut self.delivered);
+        super::super::cursor_sprites::support::retire_pending_output(
+            &mut fixture
+                .as_mut()
+                .expect("cursor fixture is live")
+                .scene
+                .events,
+            delivered,
+            0,
+            frame,
+        );
+    }
+
+    fn inject_crtc_flip(&mut self, crtc: ::drm::control::crtc::Handle, id: u64, frame: u32) {
+        let fixture = self.fixture.as_mut().expect("cursor fixture is live");
+        fixture.scene.events.queue_commit_completion(
+            self.device_fd,
+            crtc,
+            id,
+            frame,
+            Duration::from_millis(u64::from(frame) * 10),
+        );
+        Backend::on_page_flip_ready(
+            &mut fixture.scene.events.backend,
+            &mut fixture.scene.events.state,
+            self.device_fd,
+        );
+    }
+
+    fn note_direct_frame_retired(&mut self, crtc: ::drm::control::crtc::Handle, commit_id: u64) {
+        self.delivered
+            .insert(super::super::cursor_sprites::support::CompletionKey {
+                device_fd: self.device_fd,
+                crtc,
+                commit_id,
+            });
+    }
+
+    fn finish(mut self) {
+        use super::super::cursor_sprites::support as cursor_support;
+
+        let mut fixture = self.fixture.take().expect("cursor fixture is live");
+        let direct = self.direct.take().expect("direct scanout is active");
+        cursor_support::drain_unretired_output_events(&mut fixture, &mut self.delivered, 0);
+        super::direct_unflip::request_unflip(&mut fixture.scene, &direct);
+        let offset = super::direct_unflip::record_count(&fixture.scene, self.device_fd);
+        let unflip = super::direct_unflip::grouped_unflip_record(
+            &mut fixture.scene,
+            self.device_fd,
+            offset,
+            1,
+        );
+        let id = super::support::accepted_event_id(&unflip).expect("unflip event ID");
+        super::atomic_events::complete_recorded_attempt(
+            &mut fixture.scene,
+            self.device_fd,
+            &unflip,
+            id,
+            92,
+        );
+        super::direct_unflip::drain_present_notifications(
+            &mut fixture.scene,
+            &[],
+            &[direct.candidate.present_id],
+        );
+        Backend::set_grab_cursor(&mut fixture.scene.events.backend, None, None)
+            .expect("clear the cursor-image test override");
+        Backend::define_cursor(
+            &mut fixture.scene.events.backend,
+            None,
+            direct.target_xid,
+            0x7f10,
+        )
+        .expect("restore the fixture cursor on the direct target");
+        let detach = cursor_support::accept_cursor_detach(&mut fixture, &mut self.delivered, 0);
+        cursor_support::retire_cursor_record(&mut fixture, &mut self.delivered, 0, &detach, 100);
+        cursor_support::finish_atomic_fixture(fixture, &mut self.delivered);
+    }
+}
+
+impl Drop for VrrCursorHarness {
+    fn drop(&mut self) {
+        if let Some(fixture) = self.fixture.take() {
+            fixture.scene.finish();
+        }
+    }
+}
+
+fn vrr_cursor_harness(present_id: u64, capable: bool) -> Option<VrrCursorHarness> {
+    use super::super::cursor_sprites::support::{
+        AtomicPathFixture, PathKind, create_argb_cursor, drain_unretired_output_events,
+        enter_held_direct, establish_hardware_cursor,
+    };
+
+    let fixture = AtomicPathFixture::new(PathKind::Physical)
+        .expect("VRR cursor scene fixture construction")?;
+    let device_fd = super::direct_unflip::fd(&fixture.scene);
+    let mut harness = VrrCursorHarness {
+        fixture: Some(fixture),
+        direct: None,
+        delivered: HashSet::new(),
+        device_fd,
+    };
+    let cursor = create_argb_cursor(
+        &mut harness.scene.events.backend,
+        (8, 8),
+        [0xff, 0xff, 0xff, 0xff],
+        (0, 0),
+    );
+    let hardware = establish_hardware_cursor(
+        harness.fixture.as_mut().expect("cursor fixture is live"),
+        &mut harness.delivered,
+        cursor,
+        (120, 100),
+    );
+    assert_eq!(hardware.device_fd, device_fd);
+    drain_unretired_output_events(
+        harness.fixture.as_mut().expect("cursor fixture is live"),
+        &mut harness.delivered,
+        0,
+    );
+    {
+        let output = &mut harness.scene.events.backend.platform.outputs[0].output;
+        output.crtc_vrr_enabled_prop = Some(handle(VRR_PROP_ID));
+        output.connector_vrr_capable = capable;
+        output.vrr_committed.set(false);
+        output.vrr_disabled.set(false);
+        output.vrr_clear_retry_used.set(false);
+    }
+    let direct = enter_held_direct(
+        harness.fixture.as_mut().expect("cursor fixture is live"),
+        &mut harness.delivered,
+        present_id,
+        None,
+    )
+    .expect("enter held direct scanout through Backend");
+    assert_eq!(
+        harness.scene.events.backend.platform.outputs[0]
+            .output
+            .vrr_committed
+            .get(),
+        capable,
+        "direct frame establishes the requested VRR state"
+    );
+    super::direct_unflip::drain_present_notifications(
+        &mut harness.scene,
+        &[direct.candidate.present_id],
+        &[],
+    );
+    harness.direct = Some(direct);
+    Some(harness)
+}
+
+fn install_controlled_vrr_cursor_clock(backend: &mut KmsBackend) -> (Instant, Arc<AtomicU64>) {
+    let base = Instant::now();
+    let elapsed_ns = Arc::new(AtomicU64::new(0));
+    let clock_elapsed_ns = Arc::clone(&elapsed_ns);
+    backend.for_tests_set_monotonic_clock(Rc::new(move || {
+        base + Duration::from_nanos(clock_elapsed_ns.load(Ordering::SeqCst))
+    }));
+    (base, elapsed_ns)
+}
+
+fn advance_vrr_cursor_clock(elapsed_ns: &AtomicU64, duration: Duration) {
+    elapsed_ns.fetch_add(
+        u64::try_from(duration.as_nanos()).expect("cursor deadline fits nanoseconds"),
+        Ordering::SeqCst,
+    );
+}
+
+fn vrr_cursor_records_since(harness: &VrrCursorHarness, offset: usize) -> Vec<AtomicCommitRecord> {
+    harness.scene.events.recorders[&harness.device_fd]
+        .records()
+        .into_iter()
+        .skip(offset)
+        .filter(|record| record.device_fd == harness.device_fd)
+        .collect()
+}
+
+fn assert_record_cursor_position(
+    harness: &VrrCursorHarness,
+    record: &AtomicCommitRecord,
+    expected: (i32, i32),
+) {
+    let properties = super::super::cursor_sprites::support::cursor_properties_for_output(
+        &harness.scene.events.backend,
+        0,
+    );
+    assert!(record.properties.iter().any(|update| {
+        update.object == properties.plane.into()
+            && update.property == properties.crtc_x
+            && update.value == i64::from(expected.0) as u64
+    }));
+    assert!(record.properties.iter().any(|update| {
+        update.object == properties.plane.into()
+            && update.property == properties.crtc_y
+            && update.value == i64::from(expected.1) as u64
+    }));
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: send a cursor-only position commit immediately while VRR is committed on.
+fn vrr_cursor_motion_rides_direct_frame() {
+    let Some(mut harness) = vrr_cursor_harness(18_020, true) else {
+        eprintln!("SKIP vrr_cursor_motion_rides_direct_frame: no Vulkan scene fixture available");
+        return;
+    };
+    let (base, elapsed_ns) = install_controlled_vrr_cursor_clock(&mut harness.scene.events.backend);
+    let offset = super::direct_unflip::record_count(&harness.scene, harness.device_fd);
+    let mut direct = harness.direct.take().expect("direct scanout is active");
+    harness.warp_pointer(180, 130);
+    Backend::maybe_composite(&mut harness.scene.events.backend)
+        .expect("hold cursor motion for the next direct frame");
+    assert_eq!(
+        vrr_cursor_records_since(&harness, offset)
+            .iter()
+            .filter(|record| record.kind == AtomicCommitKind::CursorOnly)
+            .count(),
+        0,
+        "VRR position motion is held instead of committed immediately"
+    );
+    advance_vrr_cursor_clock(&elapsed_ns, Duration::from_millis(10));
+    let previous_present = direct.candidate.present_id;
+    let fd = harness.device_fd;
+    let frame = submit_direct_successor(&mut harness.scene, &mut direct, fd);
+    assert_eq!(
+        vrr_cursor_records_since(&harness, offset)
+            .iter()
+            .filter(|record| record.kind == AtomicCommitKind::CursorOnly)
+            .count(),
+        0,
+        "direct frame inside the deadline prevents every standalone cursor commit"
+    );
+    assert_record_cursor_position(&harness, &frame, (180, 130));
+    let frame_id = super::support::accepted_event_id(&frame).expect("direct frame ID");
+    let crtc = harness.scene.events.backend.platform.outputs[0].output.crtc;
+    super::direct_unflip::complete_direct_initial(&mut harness.scene, &frame, frame_id, fd);
+    harness.note_direct_frame_retired(crtc, frame_id);
+    super::direct_unflip::drain_present_notifications(
+        &mut harness.scene,
+        &[direct.candidate.present_id],
+        &[previous_present],
+    );
+    harness.direct = Some(direct);
+    assert!(
+        Backend::next_wakeup(&harness.scene.events.backend)
+            .is_none_or(|wakeup| wakeup > base + Duration::from_millis(33)),
+        "the direct frame consumes the pending cursor deadline"
+    );
+    harness.finish();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: omit the cursor deadline wake or submit before the deadline expires.
+fn vrr_cursor_motion_without_frame_commits_once_at_deadline() {
+    let Some(mut harness) = vrr_cursor_harness(18_021, true) else {
+        eprintln!(
+            "SKIP vrr_cursor_motion_without_frame_commits_once_at_deadline: no Vulkan scene fixture available"
+        );
+        return;
+    };
+    let (base, elapsed_ns) = install_controlled_vrr_cursor_clock(&mut harness.scene.events.backend);
+    let offset = super::direct_unflip::record_count(&harness.scene, harness.device_fd);
+    harness.warp_pointer(180, 130);
+    Backend::maybe_composite(&mut harness.scene.events.backend)
+        .expect("record pending cursor motion");
+    assert_eq!(
+        Backend::next_wakeup(&harness.scene.events.backend),
+        Some(base + Duration::from_millis(33)),
+        "next_wakeup exposes the 33 ms cursor deadline"
+    );
+    advance_vrr_cursor_clock(&elapsed_ns, Duration::from_millis(32));
+    Backend::maybe_composite(&mut harness.scene.events.backend)
+        .expect("do not send cursor motion before deadline");
+    assert!(
+        vrr_cursor_records_since(&harness, offset)
+            .iter()
+            .all(|record| record.kind != AtomicCommitKind::CursorOnly),
+        "no cursor-only request is submitted before the deadline"
+    );
+    advance_vrr_cursor_clock(&elapsed_ns, Duration::from_millis(1));
+    Backend::maybe_composite(&mut harness.scene.events.backend)
+        .expect("send cursor motion when deadline expires");
+    Backend::maybe_composite(&mut harness.scene.events.backend)
+        .expect("in-flight cursor move is not resubmitted");
+    let attempts: Vec<_> = vrr_cursor_records_since(&harness, offset)
+        .into_iter()
+        .filter(|record| record.kind == AtomicCommitKind::CursorOnly)
+        .collect();
+    assert_eq!(
+        attempts.len(),
+        1,
+        "one cursor-only request is sent at deadline"
+    );
+    assert_eq!(attempts[0].result, ScriptedResult::Ok);
+    assert_record_cursor_position(&harness, &attempts[0], (180, 130));
+    harness.retire_cursor_move(93);
+    harness.finish();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: replace a pending move's original deadline when a later position arrives.
+fn vrr_cursor_later_motion_keeps_deadline() {
+    let Some(mut harness) = vrr_cursor_harness(18_022, true) else {
+        eprintln!("SKIP vrr_cursor_later_motion_keeps_deadline: no Vulkan scene fixture available");
+        return;
+    };
+    let (base, elapsed_ns) = install_controlled_vrr_cursor_clock(&mut harness.scene.events.backend);
+    let offset = super::direct_unflip::record_count(&harness.scene, harness.device_fd);
+    harness.warp_pointer(180, 130);
+    Backend::maybe_composite(&mut harness.scene.events.backend)
+        .expect("start the first cursor deadline");
+    advance_vrr_cursor_clock(&elapsed_ns, Duration::from_millis(20));
+    harness.warp_pointer(190, 140);
+    Backend::maybe_composite(&mut harness.scene.events.backend)
+        .expect("later motion replaces the held position");
+    assert_eq!(
+        Backend::next_wakeup(&harness.scene.events.backend),
+        Some(base + Duration::from_millis(33)),
+        "later motion keeps the first position's deadline"
+    );
+    advance_vrr_cursor_clock(&elapsed_ns, Duration::from_millis(13));
+    Backend::maybe_composite(&mut harness.scene.events.backend)
+        .expect("latest position sends at the original deadline");
+    let attempt = vrr_cursor_records_since(&harness, offset)
+        .into_iter()
+        .find(|record| record.kind == AtomicCommitKind::CursorOnly)
+        .expect("deadline sends one cursor-only request");
+    assert_eq!(attempt.result, ScriptedResult::Ok);
+    assert_record_cursor_position(&harness, &attempt, (190, 140));
+    harness.retire_cursor_move(94);
+    harness.finish();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: leave an expired deadline attached after a direct frame carried its move.
+fn vrr_cursor_new_move_after_carried_move_gets_fresh_deadline() {
+    let Some(mut harness) = vrr_cursor_harness(18_023, true) else {
+        eprintln!(
+            "SKIP vrr_cursor_new_move_after_carried_move_gets_fresh_deadline: no Vulkan scene fixture available"
+        );
+        return;
+    };
+    let (base, elapsed_ns) = install_controlled_vrr_cursor_clock(&mut harness.scene.events.backend);
+    let offset = super::direct_unflip::record_count(&harness.scene, harness.device_fd);
+    let mut direct = harness.direct.take().expect("direct scanout is active");
+    harness.warp_pointer(180, 130);
+    Backend::maybe_composite(&mut harness.scene.events.backend)
+        .expect("hold first cursor position");
+    advance_vrr_cursor_clock(&elapsed_ns, Duration::from_millis(10));
+    let previous_present = direct.candidate.present_id;
+    let fd = harness.device_fd;
+    let frame = submit_direct_successor(&mut harness.scene, &mut direct, fd);
+    assert_record_cursor_position(&harness, &frame, (180, 130));
+    let frame_id = super::support::accepted_event_id(&frame).expect("direct frame ID");
+    let crtc = harness.scene.events.backend.platform.outputs[0].output.crtc;
+    super::direct_unflip::complete_direct_initial(&mut harness.scene, &frame, frame_id, fd);
+    harness.note_direct_frame_retired(crtc, frame_id);
+    super::direct_unflip::drain_present_notifications(
+        &mut harness.scene,
+        &[direct.candidate.present_id],
+        &[previous_present],
+    );
+    advance_vrr_cursor_clock(&elapsed_ns, Duration::from_millis(40));
+    harness.warp_pointer(220, 160);
+    Backend::maybe_composite(&mut harness.scene.events.backend)
+        .expect("a post-frame move starts a fresh deadline");
+    assert!(
+        vrr_cursor_records_since(&harness, offset)
+            .iter()
+            .all(|record| record.kind != AtomicCommitKind::CursorOnly),
+        "the new move does not inherit the carried move's expired deadline"
+    );
+    assert_eq!(
+        Backend::next_wakeup(&harness.scene.events.backend),
+        Some(base + Duration::from_millis(83)),
+        "new movement starts a fresh 33 ms deadline at +50 ms"
+    );
+    advance_vrr_cursor_clock(&elapsed_ns, Duration::from_millis(32));
+    Backend::maybe_composite(&mut harness.scene.events.backend)
+        .expect("new move remains held before its deadline");
+    assert!(
+        vrr_cursor_records_since(&harness, offset)
+            .iter()
+            .all(|record| record.kind != AtomicCommitKind::CursorOnly)
+    );
+    advance_vrr_cursor_clock(&elapsed_ns, Duration::from_millis(1));
+    Backend::maybe_composite(&mut harness.scene.events.backend)
+        .expect("new move sends at its fresh deadline");
+    let attempt = vrr_cursor_records_since(&harness, offset)
+        .into_iter()
+        .find(|record| record.kind == AtomicCommitKind::CursorOnly)
+        .expect("fresh deadline sends the pending move");
+    assert_record_cursor_position(&harness, &attempt, (220, 160));
+    harness.retire_cursor_move(95);
+    harness.direct = Some(direct);
+    harness.finish();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: compute vrr_cursor_deadline across moves blocked by cursor_retry_waits_for_flip.
+fn vrr_cursor_deadline_ebusy_waits_for_flip() {
+    let Some(mut harness) = vrr_cursor_harness(18_024, true) else {
+        eprintln!(
+            "SKIP vrr_cursor_deadline_ebusy_waits_for_flip: no Vulkan scene fixture available"
+        );
+        return;
+    };
+    let (base, elapsed_ns) = install_controlled_vrr_cursor_clock(&mut harness.scene.events.backend);
+    let recorder = Rc::clone(&harness.scene.events.recorders[&harness.device_fd]);
+    let offset = super::direct_unflip::record_count(&harness.scene, harness.device_fd);
+    let crtc = harness.scene.events.backend.platform.outputs[0].output.crtc;
+    harness.warp_pointer(180, 130);
+    Backend::maybe_composite(&mut harness.scene.events.backend)
+        .expect("start cursor move deadline");
+    recorder.script_result(Err(io::Error::from_raw_os_error(libc::EBUSY)));
+    advance_vrr_cursor_clock(&elapsed_ns, Duration::from_millis(33));
+    Backend::maybe_composite(&mut harness.scene.events.backend)
+        .expect("record cursor-only EBUSY for retry-after-flip");
+    let first = vrr_cursor_records_since(&harness, offset)
+        .into_iter()
+        .find(|record| record.kind == AtomicCommitKind::CursorOnly)
+        .expect("deadline cursor request reaches the recorder");
+    assert!(matches!(
+        first.result,
+        ScriptedResult::Error {
+            raw_os_error: Some(error),
+            ..
+        } if error == libc::EBUSY
+    ));
+    assert!(
+        harness
+            .scene
+            .events
+            .backend
+            .platform
+            .cursor_retry_waits_for_flip(0)
+    );
+    let wake = Backend::next_wakeup(&harness.scene.events.backend);
+    assert!(
+        wake.is_none_or(|wakeup| wakeup > base + Duration::from_millis(33)),
+        "an EBUSY-held move does not expose an immediate retry wake"
+    );
+    harness.inject_crtc_flip(crtc, 0, 96);
+    assert!(
+        !harness
+            .scene
+            .events
+            .backend
+            .platform
+            .cursor_retry_waits_for_flip(0)
+    );
+    assert!(
+        Backend::next_wakeup(&harness.scene.events.backend)
+            .is_some_and(|wakeup| wakeup <= base + Duration::from_millis(33))
+    );
+    Backend::maybe_composite(&mut harness.scene.events.backend)
+        .expect("the matching flip makes the expired move runnable");
+    let attempts: Vec<_> = vrr_cursor_records_since(&harness, offset)
+        .into_iter()
+        .filter(|record| record.kind == AtomicCommitKind::CursorOnly)
+        .collect();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[1].result, ScriptedResult::Ok);
+    assert_record_cursor_position(&harness, &attempts[1], (180, 130));
+    harness.retire_cursor_move(97);
+    harness.finish();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: hold cursor image changes behind the VRR position deadline.
+fn vrr_cursor_image_change_commits_immediately() {
+    use super::super::cursor_sprites::support::create_argb_cursor;
+
+    let Some(mut harness) = vrr_cursor_harness(18_025, true) else {
+        eprintln!(
+            "SKIP vrr_cursor_image_change_commits_immediately: no Vulkan scene fixture available"
+        );
+        return;
+    };
+    let _ = install_controlled_vrr_cursor_clock(&mut harness.scene.events.backend);
+    let position_offset = super::direct_unflip::record_count(&harness.scene, harness.device_fd);
+    harness.warp_pointer(180, 130);
+    Backend::maybe_composite(&mut harness.scene.events.backend)
+        .expect("hold the changed position while the image update is prepared");
+    assert!(
+        vrr_cursor_records_since(&harness, position_offset)
+            .iter()
+            .all(|record| record.kind != AtomicCommitKind::CursorOnly),
+        "position motion remains held while VRR is on"
+    );
+    let offset = super::direct_unflip::record_count(&harness.scene, harness.device_fd);
+    let new_cursor = create_argb_cursor(
+        &mut harness.scene.events.backend,
+        (12, 12),
+        [0x31, 0x72, 0xb4, 0xff],
+        (0, 0),
+    );
+    let prior_framebuffer = super::super::cursor_sprites::support::applied_cursor_binding(
+        &harness.scene.events.backend,
+        0,
+    )
+    .expect("visible cursor binding before shape change")
+    .framebuffer;
+    Backend::set_grab_cursor(
+        &mut harness.scene.events.backend,
+        None,
+        Some(new_cursor.as_raw()),
+    )
+    .expect("change cursor image through the grab-cursor Backend path");
+    Backend::maybe_composite(&mut harness.scene.events.backend)
+        .expect("submit cursor image change through Backend");
+    let attempt = vrr_cursor_records_since(&harness, offset)
+        .into_iter()
+        .find(|record| record.kind == AtomicCommitKind::CursorOnly)
+        .expect("cursor image change retains the immediate cursor-only path");
+    assert_eq!(attempt.result, ScriptedResult::Ok);
+    let properties = super::super::cursor_sprites::support::cursor_properties_for_output(
+        &harness.scene.events.backend,
+        0,
+    );
+    let image_framebuffer =
+        super::super::cursor_sprites::support::record_property(&attempt, properties.fb_id)
+            .expect("image replacement writes FB_ID");
+    assert_ne!(image_framebuffer, u64::from(prior_framebuffer));
+    harness.retire_cursor_move(98);
+    harness.finish();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: apply the VRR cursor delay when the output's committed VRR value is false.
+fn vrr_off_cursor_only_unchanged() {
+    let Some(mut harness) = vrr_cursor_harness(18_026, false) else {
+        eprintln!("SKIP vrr_off_cursor_only_unchanged: no Vulkan scene fixture available");
+        return;
+    };
+    let (base, _) = install_controlled_vrr_cursor_clock(&mut harness.scene.events.backend);
+    let offset = super::direct_unflip::record_count(&harness.scene, harness.device_fd);
+    harness.warp_pointer(180, 130);
+    Backend::maybe_composite(&mut harness.scene.events.backend)
+        .expect("submit ordinary cursor motion with VRR off");
+    let attempts: Vec<_> = vrr_cursor_records_since(&harness, offset)
+        .into_iter()
+        .filter(|record| record.kind == AtomicCommitKind::CursorOnly)
+        .collect();
+    assert_eq!(
+        attempts.len(),
+        1,
+        "VRR-off motion keeps its immediate request"
+    );
+    assert_eq!(attempts[0].result, ScriptedResult::Ok);
+    assert_record_cursor_position(&harness, &attempts[0], (180, 130));
+    assert!(
+        Backend::next_wakeup(&harness.scene.events.backend).is_none_or(|wakeup| wakeup <= base),
+        "VRR-off motion does not add a 33 ms deadline"
+    );
+    harness.retire_cursor_move(99);
+    harness.finish();
 }

@@ -216,6 +216,12 @@ pub(super) struct CursorHideRecovery {
     retry_deadline: Option<std::time::Instant>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PendingAtomicCursorMove {
+    position: crate::drm::atomic::CursorPlanePosition,
+    deadline: Option<Instant>,
+}
+
 pub(crate) const CURSOR_HIDE_RECOVERY_MAX_ATTEMPTS: u8 = 3;
 
 /// Per-DRM-device hardware cursor state. Raw CRTC handles are device-local,
@@ -228,8 +234,7 @@ pub(crate) struct KmsCursorState {
     /// consumed only after an accepted commit carries it.
     atomic_positions:
         HashMap<::drm::control::crtc::Handle, crate::drm::atomic::CursorPlanePosition>,
-    atomic_pending_moves:
-        HashMap<::drm::control::crtc::Handle, crate::drm::atomic::CursorPlanePosition>,
+    atomic_pending_moves: HashMap<::drm::control::crtc::Handle, PendingAtomicCursorMove>,
     /// Accepted cursor-only commits, keyed by CRTC. A cursor-only commit is
     /// in flight only after its atomic ioctl succeeded.
     atomic_cursor_commits_in_flight:

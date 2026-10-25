@@ -378,7 +378,11 @@ fn idle_motion_coalesces_until_cursor_flip_retires() {
         recorder.records().is_empty(),
         "motion must not submit directly"
     );
-    assert!(backend.platform.has_eligible_atomic_cursor_move());
+    assert!(
+        backend
+            .platform
+            .has_eligible_atomic_cursor_move(std::time::Instant::now())
+    );
     assert!(backend.scanout_allowed());
     assert!(backend.kms_outputs_active);
     maybe_composite(&mut backend);

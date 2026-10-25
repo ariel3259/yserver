@@ -2722,7 +2722,9 @@ impl KmsBackend {
         ((self.scene_wants_scene() || degraded_replacement_needs_submit) && !cursor_compose_blocked)
             || (!cursor_compose_blocked
                 && !direct_transaction_waiting
-                && self.platform.has_eligible_atomic_cursor_move())
+                && self
+                    .platform
+                    .has_eligible_atomic_cursor_move(self.monotonic_now()))
     }
 
     #[cfg(test)]
@@ -3019,7 +3021,7 @@ impl KmsBackend {
         };
         let scene_deadline = if allow_kms_timers && direct_hold_waits_for_cursor_or_frame {
             self.platform
-                .has_eligible_atomic_cursor_move()
+                .has_eligible_atomic_cursor_move(now)
                 .then_some(now)
         } else if allow_kms_timers {
             if self.scene_wants_compose() {
@@ -3048,6 +3050,9 @@ impl KmsBackend {
                     .min()
             })
             .flatten();
+        let vrr_cursor_deadline = allow_kms_timers
+            .then(|| self.platform.vrr_cursor_deadline())
+            .flatten();
         let needs_source_wait_poll =
             self.pstate
                 .pending_present_source_waits
@@ -3067,6 +3072,7 @@ impl KmsBackend {
             .into_iter()
             .chain(direct_cursor_retry_deadline)
             .chain(gamma_deadline)
+            .chain(vrr_cursor_deadline)
             .chain(source_wait_deadline)
             .chain(rescan_deadline)
             // Not gated on `allow_kms_timers`: `maybe_composite` closes the
@@ -3229,7 +3235,7 @@ impl KmsBackend {
                     for output_idx in 0..self.platform.outputs.len() {
                         match self
                             .platform
-                            .submit_atomic_cursor_move_for_output(output_idx)
+                            .submit_atomic_cursor_move_for_output(output_idx, self.monotonic_now())
                         {
                             Ok(outcome) => self.handle_cursor_move_outcome(outcome),
                             Err(error) => log::warn!(
@@ -3345,7 +3351,7 @@ impl KmsBackend {
             }
             match self
                 .platform
-                .submit_atomic_cursor_move_for_output(output_idx)
+                .submit_atomic_cursor_move_for_output(output_idx, self.monotonic_now())
             {
                 Ok(outcome) => self.handle_cursor_move_outcome(outcome),
                 Err(error) => log::warn!(
