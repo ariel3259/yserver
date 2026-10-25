@@ -1206,9 +1206,13 @@ impl KmsBackend {
         now: std::time::Instant,
     ) -> io::Result<()> {
         let before = self.vrr_committed_snapshot();
-        let result = self
-            .platform
-            .submit_pending_crtc_property_for_output(output_idx, vrr_wanted, now);
+        let current_primary_framebuffer = self.current_primary_framebuffer_for_output(output_idx);
+        let result = self.platform.submit_pending_crtc_property_for_output(
+            output_idx,
+            vrr_wanted,
+            now,
+            current_primary_framebuffer,
+        );
         self.log_vrr_committed_changes(&before, None, "property");
         result
     }
@@ -1220,9 +1224,30 @@ impl KmsBackend {
     ) {
         let before = self.vrr_committed_snapshot();
         let vrr_wanted = self.live_direct_vrr_wanted();
-        self.platform
-            .retry_pending_crtc_property_after_flip(output_idx, now, vrr_wanted);
+        let current_primary_framebuffer = self.current_primary_framebuffer_for_output(output_idx);
+        self.platform.retry_pending_crtc_property_after_flip(
+            output_idx,
+            now,
+            vrr_wanted,
+            current_primary_framebuffer,
+        );
         self.log_vrr_committed_changes(&before, None, "property");
+    }
+
+    fn current_primary_framebuffer_for_output(
+        &self,
+        output_idx: usize,
+    ) -> Option<::drm::control::framebuffer::Handle> {
+        if let Some(frame) = self.direct_scanout_frame_for_output(output_idx) {
+            return self
+                .pstate
+                .scanout_m1
+                .entries
+                .get(&frame.source_id)
+                .and_then(ScanoutM1ProbeEntry::framebuffer)
+                .map(crate::drm::modeset::DirectScanoutProbeFramebuffer::handle);
+        }
+        self.platform.retained_composed_framebuffer(output_idx)
     }
 
     #[cfg(test)]

@@ -1259,6 +1259,384 @@ fn complete_direct_and_drain_present(
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: omit the primary-plane FB_ID from a standalone VRR clear.
+fn vrr_standalone_clear_carries_current_primary_fb() {
+    let Some((mut fixture, direct)) =
+        direct_fixture_with_vrr_mode(18_047, 0, crate::launch::VrrMode::Property)
+    else {
+        eprintln!(
+            "SKIP vrr_standalone_clear_carries_current_primary_fb: no Vulkan scene fixture available"
+        );
+        return;
+    };
+    set_vrr_capable(&mut fixture);
+    let mut fixture = fixture.cleanup_guard();
+    let fd = super::direct_unflip::fd(&fixture);
+    let output = &fixture.events.backend.platform.outputs[0].output;
+    let crtc = output.crtc;
+    let plane = output.plane;
+    let fb_id_property = output.plane_fb_id_prop;
+    let (mut state, property, initial) = start_property_direct(&mut fixture, &direct, true);
+    let direct_framebuffer = initial
+        .properties
+        .iter()
+        .find(|update| update.object == plane.into() && update.property == fb_id_property)
+        .map(|update| update.value)
+        .expect("accepted direct frame sets the primary FB_ID");
+    complete_direct_and_drain_present(&mut fixture, &initial, 1, None);
+
+    let offset = super::direct_unflip::record_count(&fixture, fd);
+    delete_vrr_property(
+        &mut state,
+        &mut fixture.events.backend,
+        direct.target_xid,
+        property,
+        4,
+    );
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("idle property clear scheduling pass");
+    let clear = super::direct_unflip::records_since(&fixture, fd, offset)
+        .into_iter()
+        .find(|record| super::support::accepted_event_id(record).is_some())
+        .expect("idle deletion submits one standalone clear");
+    assert_eq!(clear.kind, AtomicCommitKind::GammaOnly);
+    assert!(
+        clear.properties.iter().any(|update| {
+            update.object == crtc.into()
+                && update.property == handle(VRR_PROP_ID)
+                && update.value == 0
+        }),
+        "standalone clear sets VRR_ENABLED to zero"
+    );
+    let primary_plane_updates: Vec<_> = clear
+        .properties
+        .iter()
+        .filter(|update| update.property == fb_id_property)
+        .map(|update| (update.property, update.value))
+        .collect();
+    assert_eq!(
+        primary_plane_updates,
+        vec![(fb_id_property, direct_framebuffer)],
+        "standalone clear changes only FB_ID, keeping the current direct framebuffer"
+    );
+    assert_eq!(
+        clear.properties.len(),
+        2,
+        "standalone clear carries only VRR_ENABLED and the primary FB_ID"
+    );
+    assert_eq!(
+        super::direct_unflip::records_since(&fixture, fd, offset)
+            .iter()
+            .filter(|record| super::support::accepted_event_id(record).is_some())
+            .count(),
+        1,
+        "property deletion submits one accepted standalone clear"
+    );
+
+    let clear_id = super::support::accepted_event_id(&clear).expect("clear event ID");
+    super::atomic_events::complete_recorded_attempt(&mut fixture, fd, &clear, clear_id, 90);
+    finish_property_direct_scanout(&mut fixture, fd);
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: route the standalone clear's event through direct-frame retirement.
+fn vrr_standalone_clear_event_retires_nothing() {
+    let Some((mut fixture, direct)) =
+        direct_fixture_with_vrr_mode(18_048, 0, crate::launch::VrrMode::Property)
+    else {
+        eprintln!(
+            "SKIP vrr_standalone_clear_event_retires_nothing: no Vulkan scene fixture available"
+        );
+        return;
+    };
+    set_vrr_capable(&mut fixture);
+    let mut fixture = fixture.cleanup_guard();
+    let fd = super::direct_unflip::fd(&fixture);
+    let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    let (mut state, property, initial) = start_property_direct(&mut fixture, &direct, true);
+    let direct_id = super::support::accepted_event_id(&initial).expect("direct event ID");
+    super::direct_unflip::complete_direct_initial(&mut fixture, &initial, direct_id, fd);
+
+    let current_before = fixture
+        .events
+        .backend
+        .pstate
+        .scanout_m2
+        .current
+        .as_ref()
+        .map(|frame| {
+            (
+                frame.candidate.present_id,
+                frame.source_id,
+                frame.source_pin,
+                frame.fallback_target_pin,
+                frame.accepted_event_id,
+            )
+        })
+        .expect("the direct frame remains current after its own flip event");
+    let direct_framebuffer_before = fixture
+        .events
+        .backend
+        .pstate
+        .scanout_m1
+        .entries
+        .get(&current_before.1)
+        .and_then(crate::kms::render::backend::ScanoutM1ProbeEntry::framebuffer)
+        .map(crate::drm::modeset::DirectScanoutProbeFramebuffer::handle)
+        .expect("current direct frame retains its framebuffer");
+    let pins_before = fixture.events.backend.present_source_pins.clone();
+    let completed_before: Vec<_> = fixture
+        .events
+        .backend
+        .pstate
+        .scanout_m2
+        .completed
+        .iter()
+        .map(|event| event.present_id)
+        .collect();
+    let idled_before: Vec<_> = fixture
+        .events
+        .backend
+        .pstate
+        .scanout_m2
+        .idled
+        .iter()
+        .map(|event| event.present_id)
+        .collect();
+    let expected_present_id = fixture
+        .events
+        .backend
+        .pstate
+        .scanout_m2
+        .current
+        .as_ref()
+        .expect("current direct frame is retained")
+        .event
+        .present_id;
+    assert_eq!(completed_before, vec![expected_present_id]);
+
+    let offset = super::direct_unflip::record_count(&fixture, fd);
+    delete_vrr_property(
+        &mut state,
+        &mut fixture.events.backend,
+        direct.target_xid,
+        property,
+        4,
+    );
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("idle property clear scheduling pass");
+    let clear = super::direct_unflip::records_since(&fixture, fd, offset)
+        .into_iter()
+        .find(|record| super::support::accepted_event_id(record).is_some())
+        .expect("idle deletion submits one standalone clear");
+    assert_eq!(clear.kind, AtomicCommitKind::GammaOnly);
+    assert!(contains_vrr_property(&clear, crtc, 0));
+
+    let clear_id = super::support::accepted_event_id(&clear).expect("clear event ID");
+    super::atomic_events::complete_recorded_attempt(&mut fixture, fd, &clear, clear_id, 91);
+    let current_after = fixture
+        .events
+        .backend
+        .pstate
+        .scanout_m2
+        .current
+        .as_ref()
+        .map(|frame| {
+            (
+                frame.candidate.present_id,
+                frame.source_id,
+                frame.source_pin,
+                frame.fallback_target_pin,
+                frame.accepted_event_id,
+            )
+        })
+        .expect("standalone clear event leaves the direct frame current");
+    assert_eq!(current_after, current_before);
+    let direct_framebuffer_after = fixture
+        .events
+        .backend
+        .pstate
+        .scanout_m1
+        .entries
+        .get(&current_after.1)
+        .and_then(crate::kms::render::backend::ScanoutM1ProbeEntry::framebuffer)
+        .map(crate::drm::modeset::DirectScanoutProbeFramebuffer::handle)
+        .expect("standalone clear event retains the direct framebuffer");
+    assert_eq!(direct_framebuffer_after, direct_framebuffer_before);
+    assert_eq!(
+        fixture.events.backend.present_source_pins, pins_before,
+        "standalone clear event releases none of the direct frame's buffer pins"
+    );
+    assert_eq!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .completed
+            .iter()
+            .map(|event| event.present_id)
+            .collect::<Vec<_>>(),
+        completed_before,
+        "standalone clear event neither adds nor consumes a Present completion"
+    );
+    assert_eq!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .idled
+            .iter()
+            .map(|event| event.present_id)
+            .collect::<Vec<_>>(),
+        idled_before,
+        "standalone clear event does not retire a Present buffer"
+    );
+    let completed = Backend::drain_completed_present_events(&mut fixture.events.backend);
+    assert_eq!(
+        completed
+            .iter()
+            .map(|event| event.present_id)
+            .collect::<Vec<_>>(),
+        vec![expected_present_id],
+        "only the direct frame's original completion is pending"
+    );
+    assert!(Backend::drain_retired_present_idle_events(&mut fixture.events.backend).is_empty());
+
+    finish_property_direct_scanout(&mut fixture, fd);
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: omit the retained scene framebuffer from a standalone VRR clear.
+fn vrr_standalone_clear_carries_scene_front_buffer() {
+    let Some(fixture) = super::recording_scene::RecordingSceneFixture::new(1)
+        .expect("recording scene fixture construction")
+    else {
+        eprintln!(
+            "SKIP vrr_standalone_clear_carries_scene_front_buffer: no Vulkan scene fixture available"
+        );
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    let (base, elapsed_ns) = super::support::install_controlled_clock(&mut fixture.events.backend);
+    set_vrr_capable(&mut fixture);
+    let fd = super::direct_unflip::fd(&fixture);
+    let recorder = fixture.events.recorders[&fd].clone();
+    let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    let fb_id_property = fixture.events.backend.platform.outputs[0]
+        .output
+        .plane_fb_id_prop;
+    let initial = super::atomic_events::submit_damaged_frame(&mut fixture)
+        .into_iter()
+        .find(|(record_fd, record)| {
+            *record_fd == fd && super::support::accepted_event_id(record).is_some()
+        })
+        .map(|(_, record)| record)
+        .expect("scene path accepts an initial composed frame");
+    let initial_id = super::support::accepted_event_id(&initial).expect("scene event ID");
+    super::atomic_events::complete_recorded_attempt(&mut fixture, fd, &initial, initial_id, 92);
+    let scene_front_buffer = fixture
+        .events
+        .backend
+        .platform
+        .retained_composed_framebuffer(0)
+        .expect("retired scene frame remains the current composed framebuffer");
+    fixture.events.backend.platform.outputs[0]
+        .output
+        .vrr_committed
+        .set(true);
+    {
+        let output = &mut fixture.events.backend.platform.outputs[0].output;
+        output.crtc_gamma_lut_prop = Some(handle(110));
+        output.crtc_gamma_lut_size = Some(4);
+    }
+    recorder.set_gamma_size_for_tests(4);
+    let before = recorder.records().len();
+    Backend::set_crtc_gamma(
+        &mut fixture.events.backend,
+        u32::from(crtc),
+        &[0x1111; 4],
+        &[0x2222; 4],
+        &[0x3333; 4],
+    )
+    .expect("gamma change schedules the due inherited VRR clear");
+    let gamma_deadline = fixture.events.backend.platform.outputs[0]
+        .output
+        .pending_gamma_deadline
+        .get()
+        .expect("recent scene activity defers gamma for one refresh");
+    let elapsed = gamma_deadline
+        .checked_duration_since(base)
+        .expect("gamma retry deadline follows the controlled clock base");
+    elapsed_ns.store(
+        u64::try_from(elapsed.as_nanos()).expect("controlled test time fits u64 nanoseconds"),
+        Ordering::SeqCst,
+    );
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("controlled gamma deadline drives the standalone CRTC-property path");
+
+    let clear = recorder
+        .records()
+        .into_iter()
+        .skip(before)
+        .find(|record| super::support::accepted_event_id(record).is_some())
+        .expect("composed output submits a standalone VRR clear");
+    assert_eq!(clear.kind, AtomicCommitKind::GammaOnly);
+    assert!(contains_vrr_property(&clear, crtc, 0));
+    assert_eq!(
+        clear
+            .properties
+            .iter()
+            .filter(|update| update.property == fb_id_property)
+            .map(|update| update.value)
+            .collect::<Vec<_>>(),
+        vec![u64::from(u32::from(scene_front_buffer))],
+        "standalone clear carries the composed scene's retained front buffer"
+    );
+    assert_eq!(
+        clear.properties.len(),
+        2,
+        "VRR clear takes priority over gamma"
+    );
+    assert!(
+        fixture.events.backend.platform.outputs[0]
+            .output
+            .pending_gamma_lut
+            .borrow()
+            .is_some(),
+        "the standalone VRR clear leaves gamma pending for its own request"
+    );
+    let clear_id = super::support::accepted_event_id(&clear).expect("clear event ID");
+    super::atomic_events::complete_recorded_attempt(&mut fixture, fd, &clear, clear_id, 93);
+    let gamma = recorder
+        .records()
+        .into_iter()
+        .skip(before)
+        .find(|record| {
+            super::support::accepted_event_id(record).is_some()
+                && !contains_vrr_property(record, crtc, 0)
+        })
+        .expect("event retry submits the waiting gamma request separately");
+    assert_eq!(gamma.kind, AtomicCommitKind::GammaOnly);
+    assert!(
+        gamma
+            .properties
+            .iter()
+            .all(|update| update.property != fb_id_property),
+        "gamma-only standalone commit does not touch the primary plane"
+    );
+    let gamma_id = super::support::accepted_event_id(&gamma).expect("gamma event ID");
+    super::atomic_events::complete_recorded_attempt(&mut fixture, fd, &gamma, gamma_id, 94);
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: default VRR mode to Property; no direct commit may enable it by default.
 fn vrr_off_mode_never_enables() {
     let Some((fixture, direct)) =
@@ -1422,6 +1800,15 @@ fn vrr_property_mode_requires_cardinal_one() {
         contains_vrr_property(&enabled, crtc, 1),
         "the first direct commit from a CARDINAL/32 value 1 Present enables VRR"
     );
+    let fb_id_property = fixture.events.backend.platform.outputs[0]
+        .output
+        .plane_fb_id_prop;
+    let direct_framebuffer = enabled
+        .properties
+        .iter()
+        .find(|update| update.property == fb_id_property)
+        .map(|update| update.value)
+        .expect("accepted direct frame sets the primary FB_ID");
     assert!(
         fixture.events.backend.platform.outputs[0]
             .output
@@ -1465,10 +1852,16 @@ fn vrr_property_mode_requires_cardinal_one() {
             assert_eq!(clear.kind, AtomicCommitKind::GammaOnly);
             assert!(contains_vrr_property(&clear, crtc, 0));
             assert_eq!(
-                clear.properties.len(),
-                1,
-                "property clear carries no plane state"
+                clear
+                    .properties
+                    .iter()
+                    .filter(|update| update.property == fb_id_property)
+                    .map(|update| update.value)
+                    .collect::<Vec<_>>(),
+                vec![direct_framebuffer],
+                "property clear carries the current primary framebuffer"
             );
+            assert_eq!(clear.properties.len(), 2);
             let clear_id = super::support::accepted_event_id(&clear).expect("clear event ID");
             super::atomic_events::complete_recorded_attempt(&mut fixture, fd, &clear, clear_id, 71);
         }
@@ -3395,6 +3788,15 @@ fn vrr_property_deleted_clears_without_frame_distinct_crtc_ids() {
         .clone();
     let (mut state, property, initial) = start_property_direct(&mut fixture, &direct, true);
     assert!(contains_vrr_property(&initial, crtc, 1));
+    let fb_id_property = fixture.events.backend.platform.outputs[output_idx]
+        .output
+        .plane_fb_id_prop;
+    let direct_framebuffer = initial
+        .properties
+        .iter()
+        .find(|update| update.property == fb_id_property)
+        .map(|update| update.value)
+        .expect("accepted direct frame sets the primary FB_ID");
     complete_direct_and_drain_present(&mut fixture, &initial, 1, None);
     assert!(fixture.events.backend.pstate.scanout_m2.pending.is_none());
     assert!(
@@ -3434,10 +3836,16 @@ fn vrr_property_deleted_clears_without_frame_distinct_crtc_ids() {
     assert_eq!(clear.kind, AtomicCommitKind::GammaOnly);
     assert!(contains_vrr_property(&clear, crtc, 0));
     assert_eq!(
-        clear.properties.len(),
-        1,
-        "standalone clear changes no plane"
+        clear
+            .properties
+            .iter()
+            .filter(|update| update.property == fb_id_property)
+            .map(|update| update.value)
+            .collect::<Vec<_>>(),
+        vec![direct_framebuffer],
+        "standalone clear carries the current primary framebuffer"
     );
+    assert_eq!(clear.properties.len(), 2);
     assert!(
         !fixture.events.backend.platform.outputs[0]
             .output
@@ -3506,6 +3914,15 @@ fn vrr_property_deleted_during_flip_clears_at_event() {
         .into_iter()
         .find(|record| super::support::accepted_event_id(record).is_some())
         .expect("direct successor flip is in flight");
+    let fb_id_property = fixture.events.backend.platform.outputs[0]
+        .output
+        .plane_fb_id_prop;
+    let current_direct_framebuffer = pending
+        .properties
+        .iter()
+        .find(|update| update.property == fb_id_property)
+        .map(|update| update.value)
+        .expect("accepted direct successor sets the primary FB_ID");
     let offset = super::direct_unflip::record_count(&fixture, fd);
     super::recording_scene::clear_vrr_test_logs();
 
@@ -3543,7 +3960,17 @@ fn vrr_property_deleted_during_flip_clears_at_event() {
         .expect("flip event releases the standalone clear");
     assert_eq!(clear.kind, AtomicCommitKind::GammaOnly);
     assert!(contains_vrr_property(&clear, crtc, 0));
-    assert_eq!(clear.properties.len(), 1, "clear carries no plane state");
+    assert_eq!(
+        clear
+            .properties
+            .iter()
+            .filter(|update| update.property == fb_id_property)
+            .map(|update| update.value)
+            .collect::<Vec<_>>(),
+        vec![current_direct_framebuffer],
+        "event-driven clear carries the current direct framebuffer"
+    );
+    assert_eq!(clear.properties.len(), 2);
     assert!(
         !fixture.events.backend.platform.outputs[0]
             .output
@@ -3948,6 +4375,15 @@ fn vrr_standalone_clear_retried_after_error() {
         .connector_name
         .clone();
     let (mut state, property, initial) = start_property_direct(&mut fixture, &direct, true);
+    let fb_id_property = fixture.events.backend.platform.outputs[0]
+        .output
+        .plane_fb_id_prop;
+    let direct_framebuffer = initial
+        .properties
+        .iter()
+        .find(|update| update.property == fb_id_property)
+        .map(|update| update.value)
+        .expect("accepted direct frame sets the primary FB_ID");
     complete_direct_and_drain_present(&mut fixture, &initial, 1, None);
     fixture.events.backend.platform.clear_direct_cursor_retry(0);
     fixture
@@ -4021,10 +4457,16 @@ fn vrr_standalone_clear_retried_after_error() {
     assert_eq!(attempts[1].kind, AtomicCommitKind::GammaOnly);
     assert!(contains_vrr_property(&attempts[1], crtc, 0));
     assert_eq!(
-        attempts[1].properties.len(),
-        1,
-        "retry carries no plane state"
+        attempts[1]
+            .properties
+            .iter()
+            .filter(|update| update.property == fb_id_property)
+            .map(|update| update.value)
+            .collect::<Vec<_>>(),
+        vec![direct_framebuffer],
+        "timed retry carries the current direct framebuffer"
     );
+    assert_eq!(attempts[1].properties.len(), 2);
     assert!(
         !fixture.events.backend.platform.outputs[0]
             .output

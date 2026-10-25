@@ -15,6 +15,7 @@ impl PlatformBackend {
         output_idx: usize,
         vrr_wanted: bool,
         now: std::time::Instant,
+        current_primary_framebuffer: Option<::drm::control::framebuffer::Handle>,
     ) -> std::io::Result<()> {
         let Some(layout) = self.outputs.get(output_idx) else {
             return Ok(());
@@ -50,6 +51,13 @@ impl PlatformBackend {
             return Ok(());
         }
         let carries_vrr_clear = changes.vrr_changes.iter().any(|(_, value)| !*value);
+        if carries_vrr_clear && let Some(framebuffer) = current_primary_framebuffer {
+            request.add_raw_property(
+                output.plane.into(),
+                output.plane_fb_id_prop,
+                u64::from(u32::from(framebuffer)),
+            );
+        }
         if carries_vrr_clear {
             output.vrr_clear_retry_deadline.set(None);
             output.vrr_clear_waiting_for_flip.set(false);
@@ -137,6 +145,7 @@ impl PlatformBackend {
         output_idx: usize,
         now: std::time::Instant,
         vrr_wanted: bool,
+        current_primary_framebuffer: Option<::drm::control::framebuffer::Handle>,
     ) {
         let Some(output) = self.outputs.get(output_idx).map(|layout| &layout.output) else {
             return;
@@ -168,9 +177,12 @@ impl PlatformBackend {
             output.vrr_clear_retry_deadline.set(None);
             output.vrr_clear_waiting_for_flip.set(false);
         }
-        if let Err(error) =
-            self.submit_pending_crtc_property_for_output(output_idx, vrr_wanted, now)
-        {
+        if let Err(error) = self.submit_pending_crtc_property_for_output(
+            output_idx,
+            vrr_wanted,
+            now,
+            current_primary_framebuffer,
+        ) {
             log::warn!(
                 "kms: standalone CRTC property retry for CRTC {:?} failed: {error}",
                 output.crtc
