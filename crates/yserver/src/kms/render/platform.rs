@@ -674,6 +674,7 @@ impl PlatformBackend {
             return device.atomic_commit_sink.note_async_flip_event(
                 &device.device,
                 output.output.crtc,
+                output.output.vrr_committed.get(),
                 timestamps,
             );
         }

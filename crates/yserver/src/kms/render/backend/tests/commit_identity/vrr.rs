@@ -2290,3 +2290,197 @@ fn vrr_off_cursor_only_unchanged() {
     harness.finish();
     baseline.finish();
 }
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: record intervals for every CRTC, including CRTCs whose vrr_committed is false.
+fn vrr_summary_reports_intervals_and_deadline_commits() {
+    let Some(mut harness) = vrr_cursor_harness(18_030, true) else {
+        eprintln!(
+            "SKIP vrr_summary_reports_intervals_and_deadline_commits: no Vulkan scene fixture available"
+        );
+        return;
+    };
+    let output_crtc = harness.scene.events.backend.platform.outputs[0].output.crtc;
+    assert!(
+        harness.scene.events.backend.platform.outputs[0]
+            .output
+            .vrr_committed
+            .get()
+    );
+    super::recording_scene::clear_vrr_test_logs();
+
+    let mut direct = harness.direct.take().expect("direct scanout is active");
+    for (frame, time_ms) in [(10_u32, 10_u64), (25, 25), (45, 45)] {
+        let previous_present = direct.candidate.present_id;
+        let record = submit_direct_successor(
+            &mut harness
+                .fixture
+                .as_mut()
+                .expect("cursor fixture is live")
+                .scene,
+            &mut direct,
+            harness.device_fd,
+        );
+        assert_eq!(record.events.len(), 1, "direct frame targets the VRR CRTC");
+        let commit_id = super::support::accepted_event_id(&record)
+            .expect("direct frame has an accepted commit ID");
+        let retired_crtcs: Vec<_> = record.events.iter().map(|event| event.crtc).collect();
+        let ust = Duration::from_millis(time_ms);
+        let received = Duration::from_millis(time_ms + 1);
+        {
+            let fixture = harness.fixture.as_mut().expect("cursor fixture is live");
+            fixture.scene.events.wait_for_submitted_gpu_work();
+            for event in &record.events {
+                fixture.scene.events.queue_commit_completion_at(
+                    harness.device_fd,
+                    event.crtc,
+                    commit_id,
+                    frame,
+                    ust,
+                    received,
+                );
+            }
+            Backend::on_page_flip_ready(
+                &mut fixture.scene.events.backend,
+                &mut fixture.scene.events.state,
+                harness.device_fd,
+            );
+        }
+        for crtc in retired_crtcs {
+            harness.note_direct_frame_retired(crtc, commit_id);
+        }
+        super::direct_unflip::drain_present_notifications(
+            &mut harness
+                .fixture
+                .as_mut()
+                .expect("cursor fixture is live")
+                .scene,
+            &[direct.candidate.present_id],
+            &[previous_present],
+        );
+    }
+    harness.direct = Some(direct);
+
+    let (base, elapsed_ns) =
+        super::support::install_controlled_clock(&mut harness.scene.events.backend);
+    advance_vrr_cursor_clock(&elapsed_ns, Duration::from_millis(45));
+    let cursor_offset = super::direct_unflip::record_count(&harness.scene, harness.device_fd);
+    harness.warp_pointer(180, 130);
+    Backend::maybe_composite(&mut harness.scene.events.backend)
+        .expect("hold VRR cursor motion until its deadline");
+    assert_eq!(
+        Backend::next_wakeup(&harness.scene.events.backend),
+        Some(base + Duration::from_millis(78)),
+        "the cursor move gets a fresh 33 ms deadline after the 45 ms flip"
+    );
+    advance_vrr_cursor_clock(&elapsed_ns, Duration::from_millis(33));
+    Backend::maybe_composite(&mut harness.scene.events.backend)
+        .expect("submit the deadline-expired cursor move");
+    let deadline_commits: Vec<_> = vrr_cursor_records_since(&harness, cursor_offset)
+        .into_iter()
+        .filter(|record| {
+            record.kind == AtomicCommitKind::CursorOnly
+                && record.events.iter().any(|event| event.crtc == output_crtc)
+        })
+        .collect();
+    assert_eq!(
+        deadline_commits.len(),
+        1,
+        "the VRR output sends exactly one cursor-only commit at the deadline"
+    );
+    assert_eq!(deadline_commits[0].result, ScriptedResult::Ok);
+    assert!(
+        super::support::accepted_event_id(&deadline_commits[0]).is_some(),
+        "the deadline cursor request was accepted"
+    );
+
+    let summary_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let vrr_summary = loop {
+        Backend::before_block(&mut harness.scene.events.backend);
+        if let Some(line) = super::recording_scene::vrr_test_logs()
+            .lines()
+            .find(|line| line.starts_with("present_latency_summary "))
+        {
+            break line.to_owned();
+        }
+        assert!(
+            std::time::Instant::now() < summary_deadline,
+            "present latency summary did not become due"
+        );
+        std::thread::yield_now();
+    };
+    let expected_vrr_section = format!(
+        "vrr crtc={} flip_interval_us_min/p50/max=15000/15000/20000 cursor_deadline_commits=1",
+        u32::from(output_crtc)
+    );
+    assert!(
+        vrr_summary.contains(&expected_vrr_section),
+        "the VRR summary reports exact retired-flip intervals and one deadline commit; line={vrr_summary}"
+    );
+    assert_eq!(
+        vrr_summary.matches(" vrr crtc=").count(),
+        1,
+        "the VRR summary omits the fixed-refresh CRTC"
+    );
+    harness.finish();
+
+    let Some((off_fixture, off_direct)) = super::direct_unflip::direct_fixture(
+        1,
+        super::recording_scene::P1SceneRoute::Shared,
+        18_031,
+        0,
+    ) else {
+        eprintln!(
+            "SKIP vrr_summary_reports_intervals_and_deadline_commits: no VRR-off Vulkan fixture available"
+        );
+        return;
+    };
+    let mut off_fixture = off_fixture.cleanup_guard();
+    super::recording_scene::clear_vrr_test_logs();
+    let off_fd = super::direct_unflip::fd(&off_fixture);
+    let off_record = accepted_direct_record(&mut off_fixture, &off_direct, off_fd);
+    let off_id = super::support::accepted_event_id(&off_record)
+        .expect("VRR-off direct frame has an accepted event ID");
+    off_fixture.events.wait_for_submitted_gpu_work();
+    for event in &off_record.events {
+        off_fixture.events.queue_commit_completion_at(
+            off_fd,
+            event.crtc,
+            off_id,
+            60,
+            Duration::from_millis(60),
+            Duration::from_millis(61),
+        );
+    }
+    {
+        let events = &mut off_fixture.events;
+        Backend::on_page_flip_ready(&mut events.backend, &mut events.state, off_fd);
+    }
+    super::direct_unflip::drain_present_notifications(
+        &mut off_fixture,
+        &[off_direct.candidate.present_id],
+        &[],
+    );
+    let off_summary_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let off_summary = loop {
+        Backend::before_block(&mut off_fixture.events.backend);
+        if let Some(line) = super::recording_scene::vrr_test_logs()
+            .lines()
+            .find(|line| line.starts_with("present_latency_summary "))
+        {
+            break line.to_owned();
+        }
+        assert!(
+            std::time::Instant::now() < off_summary_deadline,
+            "VRR-off present latency summary did not become due"
+        );
+        std::thread::yield_now();
+    };
+    assert!(
+        !off_summary.contains(" vrr crtc="),
+        "the VRR-off snapshot has no VRR section; line={off_summary}"
+    );
+    finish_direct_scanout(&mut off_fixture, &off_direct, off_fd);
+    off_fixture.finish_after_normal_drain();
+}

@@ -598,14 +598,17 @@ impl PlatformBackend {
         let Some(pending) = cursor.atomic_pending_moves.get_mut(&crtc) else {
             return Ok(CursorMoveOutcome::default());
         };
-        if vrr_committed {
+        let deadline_expired = if vrr_committed {
             let deadline = *pending
                 .deadline
                 .get_or_insert_with(|| now + VRR_CURSOR_DEADLINE);
             if now < deadline {
                 return Ok(CursorMoveOutcome::default());
             }
-        }
+            true
+        } else {
+            false
+        };
         let position = pending.position;
         let mut request = crate::drm::atomic::AtomicCommitRequest::new();
         request.add_cursor_position(position);
@@ -644,6 +647,10 @@ impl PlatformBackend {
                 return Ok(outcome);
             }
         };
+
+        if deadline_expired {
+            commit_sink.note_vrr_cursor_deadline_commit(crtc);
+        }
 
         let cursor = &mut self.devices[device_idx].cursor;
         if cursor

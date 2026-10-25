@@ -743,7 +743,8 @@ pub(in crate::kms::render::backend::tests) fn init_tearing_test_logger() {
         .is_test(true)
         .filter_level(log::LevelFilter::Info)
         .format(|buffer, record| {
-            if record.args().to_string().starts_with("kms: vrr ") {
+            let message = record.args().to_string();
+            if message.starts_with("kms: vrr ") || message.starts_with("present_latency_summary ") {
                 writeln!(buffer, "{}", record.args())
             } else {
                 Ok(())

@@ -683,24 +683,34 @@ impl AtomicCommitSink {
     /// Forget accepted-commit associations when the owning CRTC event stream
     /// is explicitly discarded at an all-off lifecycle boundary.
     pub(crate) fn discard_pending_page_flip_telemetry(&self) {
-        self.metrics.borrow_mut().pending_page_flips.clear();
+        let mut metrics = self.metrics.borrow_mut();
+        metrics.pending_page_flips.clear();
+        metrics.reset_vrr_flip_origins();
     }
 
     pub(crate) fn note_async_flip_event(
         &self,
         device: &Device,
         crtc: crtc::Handle,
+        vrr_committed: bool,
         timestamps: crate::kms::render::platform::FlipEventTimestamps,
     ) -> Option<u64> {
         self.metrics.borrow_mut().record_page_flip_event(
             device.as_fd().as_raw_fd(),
             crtc,
+            vrr_committed,
             timestamps.commit_id,
             timestamps.received_at_monotonic,
             timestamps.completion_at_monotonic,
             self.tearing_on.get(),
             self.tearing_generation.get(),
         )
+    }
+
+    pub(crate) fn note_vrr_cursor_deadline_commit(&self, crtc: crtc::Handle) {
+        self.metrics
+            .borrow_mut()
+            .record_vrr_cursor_deadline_commit(crtc);
     }
 
     pub(crate) fn note_skip_completion(&self) {
@@ -798,11 +808,31 @@ impl AtomicCommitSink {
         else {
             return;
         };
+        let vrr_sections = snapshot
+            .vrr_crtcs
+            .iter()
+            .map(|vrr| {
+                format!(
+                    "vrr crtc={} flip_interval_us_min/p50/max={}/{}/{} cursor_deadline_commits={}",
+                    u32::from(vrr.crtc),
+                    vrr.flip_interval_us_min,
+                    vrr.flip_interval_us_p50,
+                    vrr.flip_interval_us_max,
+                    vrr.cursor_deadline_commits,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let vrr_sections = if vrr_sections.is_empty() {
+            String::new()
+        } else {
+            format!(" {vrr_sections}")
+        };
         log::info!(
             target: "yserver::kms::render::backend::kms",
             "present_latency_summary device={}:{} eligible_presents/s={} flips/s={} \
              skip_completions/s={} present_to_submit_us_p50/p99/max={}/{}/{} \
-             present_to_flip_event_us_p50/p99/max={}/{}/{}",
+             present_to_flip_event_us_p50/p99/max={}/{}/{}{}",
             device_key.major,
             device_key.minor,
             snapshot.direct_presents,
@@ -814,6 +844,7 @@ impl AtomicCommitSink {
             flip_latency_percentiles(&snapshot.present_to_flip_event_us).0,
             flip_latency_percentiles(&snapshot.present_to_flip_event_us).1,
             flip_latency_percentiles(&snapshot.present_to_flip_event_us).2,
+            vrr_sections,
         );
     }
 
@@ -1104,9 +1135,18 @@ struct CommitWindow {
     present_latency_skip_completions: u64,
     present_latency_present_to_submit_us: Vec<u64>,
     present_latency_present_to_flip_event_us: Vec<u64>,
+    vrr_crtcs: HashMap<crtc::Handle, VrrCrtcWindowMetrics>,
     unmatched_page_flip_events: u64,
     pending_page_flips: HashMap<CrtcPageFlipKey, VecDeque<PendingPageFlip>>,
     next_commit_id: Option<u64>,
+}
+
+#[derive(Default)]
+struct VrrCrtcWindowMetrics {
+    last_retired_flip_at_monotonic: Option<Duration>,
+    flip_intervals_us: Vec<u64>,
+    cursor_deadline_commits: u64,
+    observed_this_window: bool,
 }
 
 struct CommitWindowSnapshot {
@@ -1145,6 +1185,7 @@ impl CommitWindow {
             present_latency_skip_completions: 0,
             present_latency_present_to_submit_us: Vec::new(),
             present_latency_present_to_flip_event_us: Vec::new(),
+            vrr_crtcs: HashMap::new(),
             unmatched_page_flip_events: 0,
             pending_page_flips: HashMap::new(),
             next_commit_id: Some(1),
@@ -1278,6 +1319,7 @@ impl CommitWindow {
         &mut self,
         device_fd: RawFd,
         crtc: crtc::Handle,
+        vrr_committed: bool,
         event_id: Option<u64>,
         event_received_at_monotonic: Option<Duration>,
         completion_at_monotonic: Option<Duration>,
@@ -1300,6 +1342,8 @@ impl CommitWindow {
         if queue.is_empty() {
             self.pending_page_flips.remove(&key);
         }
+
+        self.record_vrr_flip_retirement(crtc, completion_at_monotonic, vrr_committed);
 
         log::trace!(
             target: "yserver::kms::render::backend::kms",
@@ -1349,6 +1393,45 @@ impl CommitWindow {
             }
         }
         Some(pending.commit_id)
+    }
+
+    fn record_vrr_flip_retirement(
+        &mut self,
+        crtc: crtc::Handle,
+        retired_at_monotonic: Option<Duration>,
+        vrr_committed: bool,
+    ) {
+        if !vrr_committed {
+            if let Some(metrics) = self.vrr_crtcs.get_mut(&crtc) {
+                metrics.last_retired_flip_at_monotonic = None;
+            }
+            return;
+        }
+
+        let metrics = self.vrr_crtcs.entry(crtc).or_default();
+        metrics.observed_this_window = true;
+        if let Some(retired_at_monotonic) = retired_at_monotonic {
+            if let Some(previous) = metrics.last_retired_flip_at_monotonic {
+                metrics
+                    .flip_intervals_us
+                    .push(duration_us(retired_at_monotonic.saturating_sub(previous)));
+            }
+            metrics.last_retired_flip_at_monotonic = Some(retired_at_monotonic);
+        } else {
+            metrics.last_retired_flip_at_monotonic = None;
+        }
+    }
+
+    fn record_vrr_cursor_deadline_commit(&mut self, crtc: crtc::Handle) {
+        let metrics = self.vrr_crtcs.entry(crtc).or_default();
+        metrics.cursor_deadline_commits = metrics.cursor_deadline_commits.saturating_add(1);
+        metrics.observed_this_window = true;
+    }
+
+    fn reset_vrr_flip_origins(&mut self) {
+        for metrics in self.vrr_crtcs.values_mut() {
+            metrics.last_retired_flip_at_monotonic = None;
+        }
     }
 
     fn record_unmatched_page_flip_identity(
@@ -1407,6 +1490,28 @@ impl CommitWindow {
             return None;
         }
         self.present_latency_started = now;
+        let mut vrr_crtcs: Vec<_> = self
+            .vrr_crtcs
+            .iter_mut()
+            .filter_map(|(&crtc, metrics)| {
+                if !metrics.observed_this_window {
+                    return None;
+                }
+                metrics.observed_this_window = false;
+                let cursor_deadline_commits = std::mem::take(&mut metrics.cursor_deadline_commits);
+                let (flip_interval_us_min, flip_interval_us_p50, flip_interval_us_max) =
+                    flip_interval_min_p50_max(&metrics.flip_intervals_us);
+                metrics.flip_intervals_us.clear();
+                Some(VrrCrtcSummarySnapshot {
+                    crtc,
+                    flip_interval_us_min,
+                    flip_interval_us_p50,
+                    flip_interval_us_max,
+                    cursor_deadline_commits,
+                })
+            })
+            .collect();
+        vrr_crtcs.sort_unstable_by_key(|vrr| u32::from(vrr.crtc));
         let snapshot = PresentLatencySummarySnapshot {
             direct_presents: std::mem::take(&mut self.present_latency_direct_presents),
             direct_flips: std::mem::take(&mut self.present_latency_direct_flips),
@@ -1415,9 +1520,13 @@ impl CommitWindow {
             present_to_flip_event_us: std::mem::take(
                 &mut self.present_latency_present_to_flip_event_us,
             ),
+            vrr_crtcs,
         };
-        (snapshot.direct_presents > 0 || snapshot.direct_flips > 0 || snapshot.skip_completions > 0)
-            .then_some(snapshot)
+        (snapshot.direct_presents > 0
+            || snapshot.direct_flips > 0
+            || snapshot.skip_completions > 0
+            || !snapshot.vrr_crtcs.is_empty())
+        .then_some(snapshot)
     }
 
     fn reset_tearing_counters(&mut self) {
@@ -1488,6 +1597,15 @@ struct PresentLatencySummarySnapshot {
     skip_completions: u64,
     present_to_submit_us: Vec<u64>,
     present_to_flip_event_us: Vec<u64>,
+    vrr_crtcs: Vec<VrrCrtcSummarySnapshot>,
+}
+
+struct VrrCrtcSummarySnapshot {
+    crtc: crtc::Handle,
+    flip_interval_us_min: u64,
+    flip_interval_us_p50: u64,
+    flip_interval_us_max: u64,
+    cursor_deadline_commits: u64,
 }
 
 pub(crate) fn monotonic_timestamp() -> Option<Duration> {
@@ -1560,6 +1678,16 @@ fn latency_percentiles(values: &[u64]) -> (u64, u64, u64) {
         sorted[p99_index],
         sorted.last().copied().unwrap_or(0),
     )
+}
+
+fn flip_interval_min_p50_max(values: &[u64]) -> (u64, u64, u64) {
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let Some(min) = sorted.first().copied() else {
+        return (0, 0, 0);
+    };
+    let p50_index = sorted.len().div_ceil(2).saturating_sub(1);
+    (min, sorted[p50_index], sorted.last().copied().unwrap_or(0))
 }
 
 fn flip_latency_percentiles(values: &[u64]) -> (String, String, String) {
