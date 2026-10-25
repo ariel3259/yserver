@@ -1117,17 +1117,14 @@ impl KmsBackend {
         let Some((_, direct_crtc_id)) = changed_owner else {
             return;
         };
+        let Some((direct_output_idx, _)) = self.present_crtc_output(direct_crtc_id) else {
+            return;
+        };
 
         if allowed {
-            for layout in self
-                .platform
-                .outputs
-                .iter()
-                .filter(|layout| u32::from(layout.output.crtc) == direct_crtc_id)
-            {
-                layout.output.vrr_clear_retry_deadline.set(None);
-                layout.output.vrr_clear_waiting_for_flip.set(false);
-            }
+            let output = &self.platform.outputs[direct_output_idx].output;
+            output.vrr_clear_retry_deadline.set(None);
+            output.vrr_clear_waiting_for_flip.set(false);
             return;
         }
         if self.pstate.scanout_m2.queued_successor.is_some()
@@ -1139,27 +1136,26 @@ impl KmsBackend {
         }
 
         let now = self.monotonic_now();
-        for output_idx in 0..self.platform.outputs.len() {
-            let output = &self.platform.outputs[output_idx].output;
-            if u32::from(output.crtc) != direct_crtc_id || !output.vrr_committed.get() {
-                continue;
-            }
-            if self.pstate.scanout_m2.pending.is_some()
-                || self
-                    .platform
-                    .scanout_commit_in_flight_for_output(output_idx)
-            {
-                output.vrr_clear_retry_deadline.set(None);
-                output.vrr_clear_waiting_for_flip.set(true);
-                continue;
-            }
-            if let Err(error) = self.submit_pending_crtc_property_for_output(output_idx, false, now)
-            {
-                log::warn!(
-                    "kms: standalone VRR clear for CRTC {:?} failed: {error}",
-                    output.crtc
-                );
-            }
+        let output = &self.platform.outputs[direct_output_idx].output;
+        if !output.vrr_committed.get() {
+            return;
+        }
+        if self.pstate.scanout_m2.pending.is_some()
+            || self
+                .platform
+                .scanout_commit_in_flight_for_output(direct_output_idx)
+        {
+            output.vrr_clear_retry_deadline.set(None);
+            output.vrr_clear_waiting_for_flip.set(true);
+            return;
+        }
+        if let Err(error) =
+            self.submit_pending_crtc_property_for_output(direct_output_idx, false, now)
+        {
+            log::warn!(
+                "kms: standalone VRR clear for CRTC {:?} failed: {error}",
+                output.crtc
+            );
         }
     }
 

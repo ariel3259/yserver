@@ -3354,20 +3354,41 @@ fn vrr_summary_reports_intervals_and_deadline_commits() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: report inherited instead of property when deletion clears VRR in Property mode.
-fn vrr_property_clear_logs_property_reason() {
-    let Some((mut fixture, direct)) =
+// Mutations: compare the RANDR candidate CRTC XID to output.crtc, or report inherited instead of property.
+fn vrr_property_deleted_clears_without_frame_distinct_crtc_ids() {
+    let Some((mut fixture, mut direct)) =
         direct_fixture_with_vrr_mode(18_040, 0, crate::launch::VrrMode::Property)
     else {
         eprintln!(
-            "SKIP vrr_property_clear_logs_property_reason: no Vulkan scene fixture available"
+            "SKIP vrr_property_deleted_clears_without_frame_distinct_crtc_ids: no Vulkan scene fixture available"
         );
         return;
     };
     set_vrr_capable(&mut fixture);
     let mut fixture = fixture.cleanup_guard();
     let fd = super::direct_unflip::fd(&fixture);
-    let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    let output_idx = 0;
+    let crtc = fixture.events.backend.platform.outputs[output_idx]
+        .output
+        .crtc;
+    let randr_crtc_xid = direct.candidate.crtc_id.wrapping_add(0x10000);
+    assert_ne!(randr_crtc_xid, u32::from(crtc));
+    let output_key = fixture.events.backend.platform.outputs[output_idx]
+        .key
+        .clone();
+    fixture
+        .events
+        .backend
+        .pstate
+        .crtc_key_by_id
+        .insert(randr_crtc_xid, output_key);
+    fixture.events.backend.refresh_present_crtc_clock_epochs();
+    direct.candidate.crtc_id = randr_crtc_xid;
+    direct.candidate.crtc_epoch = fixture
+        .events
+        .backend
+        .present_crtc_clock_epoch(randr_crtc_xid);
+    assert_ne!(direct.candidate.crtc_id, u32::from(crtc));
     let output_name = fixture.events.backend.platform.outputs[0]
         .key
         .connector_name
@@ -3375,6 +3396,24 @@ fn vrr_property_clear_logs_property_reason() {
     let (mut state, property, initial) = start_property_direct(&mut fixture, &direct, true);
     assert!(contains_vrr_property(&initial, crtc, 1));
     complete_direct_and_drain_present(&mut fixture, &initial, 1, None);
+    assert!(fixture.events.backend.pstate.scanout_m2.pending.is_none());
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .queued_successor
+            .is_none()
+    );
+    assert!(
+        !fixture
+            .events
+            .backend
+            .platform
+            .scanout_commit_in_flight_for_output(output_idx),
+        "the initial direct frame is retired before deleting the property"
+    );
     let recorder = fixture.events.recorders[&fd].clone();
     let offset = super::direct_unflip::record_count(&fixture, fd);
     super::recording_scene::clear_vrr_test_logs();
