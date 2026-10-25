@@ -176,6 +176,8 @@ pub(crate) struct FlipEventTimestamps {
     pub(crate) commit_id: Option<u64>,
     /// CLOCK_MONOTONIC receipt time used by async ioctl-to-event turnaround.
     pub(crate) received_at_monotonic: Option<Duration>,
+    /// Raw kernel UST used for intervals between retired flips on one CRTC.
+    pub(crate) kernel_ust: Duration,
     /// Kernel completion time converted to CLOCK_MONOTONIC for Present latency.
     pub(crate) completion_at_monotonic: Option<Duration>,
 }

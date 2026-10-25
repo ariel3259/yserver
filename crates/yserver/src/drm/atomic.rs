@@ -701,6 +701,7 @@ impl AtomicCommitSink {
             vrr_committed,
             timestamps.commit_id,
             timestamps.received_at_monotonic,
+            timestamps.kernel_ust,
             timestamps.completion_at_monotonic,
             self.tearing_on.get(),
             self.tearing_generation.get(),
@@ -1160,7 +1161,7 @@ struct CommitWindow {
 
 #[derive(Default)]
 struct VrrCrtcWindowMetrics {
-    last_retired_flip_at_monotonic: Option<Duration>,
+    last_retired_flip_ust: Option<Duration>,
     flip_intervals_us: Vec<u64>,
     cursor_deadline_commits: u64,
     observed_this_window: bool,
@@ -1339,6 +1340,7 @@ impl CommitWindow {
         vrr_committed: bool,
         event_id: Option<u64>,
         event_received_at_monotonic: Option<Duration>,
+        kernel_ust: Duration,
         completion_at_monotonic: Option<Duration>,
         tearing_on: bool,
         tearing_generation: u64,
@@ -1360,7 +1362,7 @@ impl CommitWindow {
             self.pending_page_flips.remove(&key);
         }
 
-        self.record_vrr_flip_retirement(crtc, completion_at_monotonic, vrr_committed);
+        self.record_vrr_flip_retirement(crtc, kernel_ust, vrr_committed);
 
         log::trace!(
             target: "yserver::kms::render::backend::kms",
@@ -1415,28 +1417,27 @@ impl CommitWindow {
     fn record_vrr_flip_retirement(
         &mut self,
         crtc: crtc::Handle,
-        retired_at_monotonic: Option<Duration>,
+        kernel_ust: Duration,
         vrr_committed: bool,
     ) {
         if !vrr_committed {
             if let Some(metrics) = self.vrr_crtcs.get_mut(&crtc) {
-                metrics.last_retired_flip_at_monotonic = None;
+                metrics.last_retired_flip_ust = None;
             }
             return;
         }
 
         let metrics = self.vrr_crtcs.entry(crtc).or_default();
         metrics.observed_this_window = true;
-        if let Some(retired_at_monotonic) = retired_at_monotonic {
-            if let Some(previous) = metrics.last_retired_flip_at_monotonic {
-                metrics
-                    .flip_intervals_us
-                    .push(duration_us(retired_at_monotonic.saturating_sub(previous)));
+        if let Some(previous) = metrics.last_retired_flip_ust {
+            if kernel_ust <= previous {
+                return;
             }
-            metrics.last_retired_flip_at_monotonic = Some(retired_at_monotonic);
-        } else {
-            metrics.last_retired_flip_at_monotonic = None;
+            metrics
+                .flip_intervals_us
+                .push(duration_us(kernel_ust - previous));
         }
+        metrics.last_retired_flip_ust = Some(kernel_ust);
     }
 
     fn record_vrr_cursor_deadline_commit(&mut self, crtc: crtc::Handle) {
@@ -1447,7 +1448,7 @@ impl CommitWindow {
 
     fn reset_vrr_flip_origins(&mut self) {
         for metrics in self.vrr_crtcs.values_mut() {
-            metrics.last_retired_flip_at_monotonic = None;
+            metrics.last_retired_flip_ust = None;
         }
     }
 

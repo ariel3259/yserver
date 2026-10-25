@@ -3084,59 +3084,77 @@ fn vrr_off_cursor_only_unchanged() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: restore the receipt-or-earlier-only monotonic timestamp check.
-fn vrr_summary_intervals_with_completion_after_receipt() {
-    let Some(mut harness) = vrr_cursor_harness(18_032, true) else {
-        eprintln!(
-            "SKIP vrr_summary_intervals_with_completion_after_receipt: no Vulkan scene fixture available"
-        );
-        return;
-    };
-    let output_crtc = harness.scene.events.backend.platform.outputs[0].output.crtc;
-    let device_fd = harness.device_fd;
-    let sink = Rc::clone(&harness.scene.events.backend.platform.devices[0].atomic_commit_sink);
-    let mut direct = harness.direct.take().expect("direct scanout is active");
+// Mutation: use completion_at_monotonic for VRR intervals; both 2-second offsets must still count.
+fn vrr_summary_intervals_use_raw_ust() {
+    for (ust_start, received_start, expected_max_us, offset_name) in [
+        (
+            Duration::from_micros(10_001),
+            Duration::from_micros(2_010_001),
+            10_000,
+            "2 seconds behind receipt",
+        ),
+        (
+            Duration::from_micros(2_010_001),
+            Duration::from_micros(10_001),
+            2_010_000,
+            "2 seconds ahead of receipt",
+        ),
+    ] {
+        let Some(mut harness) = vrr_cursor_harness(18_032, true) else {
+            eprintln!("SKIP vrr_summary_intervals_use_raw_ust: no Vulkan scene fixture available");
+            return;
+        };
+        let output_crtc = harness.scene.events.backend.platform.outputs[0].output.crtc;
+        let device_fd = harness.device_fd;
+        let sink = Rc::clone(&harness.scene.events.backend.platform.devices[0].atomic_commit_sink);
+        let mut direct = harness.direct.take().expect("direct scanout is active");
 
-    for (frame, time_ms) in [(10_u32, 10_u64), (20, 20), (30, 30)] {
-        let previous_present = direct.candidate.present_id;
-        let record = submit_direct_successor(&mut harness.scene, &mut direct, device_fd);
-        assert_eq!(record.events.len(), 1, "direct frame targets the VRR CRTC");
-        let commit_id = super::support::accepted_event_id(&record)
-            .expect("direct frame has an accepted commit ID");
-        let ust = Duration::from_millis(time_ms) + Duration::from_micros(300);
-        let received = Duration::from_millis(time_ms);
-        {
-            let fixture = &mut harness.scene;
-            fixture.events.wait_for_submitted_gpu_work();
-            fixture.events.queue_commit_completion_at(
-                device_fd,
-                output_crtc,
-                commit_id,
-                frame,
-                ust,
-                received,
-            );
-            Backend::on_page_flip_ready(
-                &mut fixture.events.backend,
-                &mut fixture.events.state,
-                device_fd,
+        for (frame, ust_step_us, received_step_ms) in [
+            (10_u32, 0_u64, 0_u64),
+            (20, 10_000, 10),
+            (30, 5_000, 20),
+            (40, 20_000, 30),
+        ] {
+            let previous_present = direct.candidate.present_id;
+            let record = submit_direct_successor(&mut harness.scene, &mut direct, device_fd);
+            assert_eq!(record.events.len(), 1, "direct frame targets the VRR CRTC");
+            let commit_id = super::support::accepted_event_id(&record)
+                .expect("direct frame has an accepted commit ID");
+            let ust = ust_start + Duration::from_micros(ust_step_us);
+            let received = received_start + Duration::from_millis(received_step_ms);
+            {
+                let fixture = &mut harness.scene;
+                fixture.events.wait_for_submitted_gpu_work();
+                fixture.events.queue_commit_completion_at(
+                    device_fd,
+                    output_crtc,
+                    commit_id,
+                    frame,
+                    ust,
+                    received,
+                );
+                Backend::on_page_flip_ready(
+                    &mut fixture.events.backend,
+                    &mut fixture.events.state,
+                    device_fd,
+                );
+            }
+            harness.note_direct_frame_retired(output_crtc, commit_id);
+            super::direct_unflip::drain_present_notifications(
+                &mut harness.scene,
+                &[direct.candidate.present_id],
+                &[previous_present],
             );
         }
-        harness.note_direct_frame_retired(output_crtc, commit_id);
-        super::direct_unflip::drain_present_notifications(
-            &mut harness.scene,
-            &[direct.candidate.present_id],
-            &[previous_present],
-        );
-    }
-    harness.direct = Some(direct);
+        harness.direct = Some(direct);
 
-    assert_eq!(
-        sink.for_tests_take_vrr_summary_snapshot(),
-        Some((u32::from(output_crtc), 10_000, 10_000, 10_000, 0)),
-        "the VRR summary snapshot retains 10 ms intervals for completions 300 us after receipt"
-    );
-    harness.finish();
+        assert_eq!(
+            sink.for_tests_take_vrr_summary_snapshot(),
+            Some((u32::from(output_crtc), 10_000, 10_000, expected_max_us, 0,)),
+            "the VRR summary uses raw UST for completions {offset_name}; the fixture's initial flip contributes its expected interval"
+        );
+        harness.finish();
+    }
 }
 
 #[test]
@@ -3258,8 +3276,9 @@ fn vrr_summary_reports_intervals_and_deadline_commits() {
         );
         std::thread::yield_now();
     };
+    // The setup direct flip retires at UST 1 us before these 10/25/45 ms samples.
     let expected_vrr_section = format!(
-        "vrr crtc={} flip_interval_us_min/p50/max=15000/15000/20000 cursor_deadline_commits=1",
+        "vrr crtc={} flip_interval_us_min/p50/max=9999/15000/20000 cursor_deadline_commits=1",
         u32::from(output_crtc)
     );
     assert!(
@@ -3335,13 +3354,13 @@ fn vrr_summary_reports_intervals_and_deadline_commits() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutations: omit the property hook so deletion waits for a frame, or omit the post-clear log.
-fn vrr_property_deleted_clears_without_frame() {
+// Mutation: report inherited instead of property when deletion clears VRR in Property mode.
+fn vrr_property_clear_logs_property_reason() {
     let Some((mut fixture, direct)) =
         direct_fixture_with_vrr_mode(18_040, 0, crate::launch::VrrMode::Property)
     else {
         eprintln!(
-            "SKIP vrr_property_deleted_clears_without_frame: no Vulkan scene fixture available"
+            "SKIP vrr_property_clear_logs_property_reason: no Vulkan scene fixture available"
         );
         return;
     };
@@ -3400,7 +3419,7 @@ fn vrr_property_deleted_clears_without_frame() {
     assert!(
         logs.lines().any(|line| {
             line == format!(
-                "kms: vrr off output={output_name} crtc={} reason=property_changed",
+                "kms: vrr off output={output_name} crtc={} reason=property",
                 u32::from(crtc)
             )
         }),
@@ -3496,7 +3515,7 @@ fn vrr_property_deleted_during_flip_clears_at_event() {
     assert!(
         logs.lines().any(|line| {
             line == format!(
-                "kms: vrr off output={output_name} crtc={} reason=property_changed",
+                "kms: vrr off output={output_name} crtc={} reason=property",
                 u32::from(crtc)
             )
         }),
@@ -3869,7 +3888,7 @@ fn vrr_standalone_clear_retried_after_error() {
     assert!(
         logs.lines().any(|line| {
             line == format!(
-                "kms: vrr off output={output_name} crtc={} reason=property_changed",
+                "kms: vrr off output={output_name} crtc={} reason=property",
                 u32::from(crtc)
             )
         }),

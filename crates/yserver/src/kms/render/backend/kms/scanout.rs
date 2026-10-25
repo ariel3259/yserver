@@ -1161,11 +1161,14 @@ impl KmsBackend {
         owner_window: Option<u32>,
         fallback_off_reason: &'static str,
     ) {
-        let off_reason = self
-            .pstate
-            .scanout_m2
-            .unflip_last_reason
-            .unwrap_or(fallback_off_reason);
+        let off_reason = if fallback_off_reason == "property" {
+            fallback_off_reason
+        } else {
+            self.pstate
+                .scanout_m2
+                .unflip_last_reason
+                .unwrap_or(fallback_off_reason)
+        };
         for (index, layout) in self.platform.outputs.iter().enumerate() {
             let was_enabled = before.get(index).copied().unwrap_or(false);
             let enabled = layout.output.vrr_committed.get();
@@ -1202,7 +1205,7 @@ impl KmsBackend {
         let result = self
             .platform
             .submit_pending_crtc_property_for_output(output_idx, vrr_wanted, now);
-        self.log_vrr_committed_changes(&before, None, "property_changed");
+        self.log_vrr_committed_changes(&before, None, "property");
         result
     }
 
@@ -1215,7 +1218,7 @@ impl KmsBackend {
         let vrr_wanted = self.live_direct_vrr_wanted();
         self.platform
             .retry_pending_crtc_property_after_flip(output_idx, now, vrr_wanted);
-        self.log_vrr_committed_changes(&before, None, "property_changed");
+        self.log_vrr_committed_changes(&before, None, "property");
     }
 
     #[cfg(test)]

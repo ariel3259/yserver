@@ -751,6 +751,7 @@ impl PlatformBackend {
                 FlipEventTimestamps {
                     commit_id: (flip.commit_id != 0).then_some(flip.commit_id),
                     received_at_monotonic: flip.event_at_monotonic,
+                    kernel_ust: flip.ust,
                     completion_at_monotonic,
                 },
             ));
