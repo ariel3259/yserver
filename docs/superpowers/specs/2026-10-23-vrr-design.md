@@ -1,6 +1,8 @@
 # Variable refresh rate (VRR / adaptive sync) — design
 
-**Date:** 2026-10-23 · **Status:** approved by the user (2026-10-23), reviewed once (sol); gamma (#293) merged as 6d83dcb9; plan `docs/superpowers/plans/2026-10-24-vrr.md` · **Scope:** KMS backend,
+**Date:** 2026-10-23 · **Status:** revision 2 (2026-10-25, maintainer review of draft PR #294: trigger, default, clear priority, gamma/VRR
+attribution, animated cursors; see Revision history); revision 1 approved by the user (2026-10-23), reviewed once (sol);
+plan `docs/superpowers/plans/2026-10-24-vrr.md` · **Scope:** KMS backend,
 one output covered by a client window in direct scanout; cursor behaviour while VRR is active.
 
 ## Why
@@ -18,9 +20,9 @@ game while the others keep their own fixed rate. This document covers the first 
 
 ## Goals
 
-1. **VRR on the output a client window covers.** While the direct-scanout owner of an output is a client window, and
-   that output's connector reports `vrr_capable` = 1, the output's CRTC runs with `VRR_ENABLED` = 1. Otherwise it runs
-   with `VRR_ENABLED` = 0.
+1. **VRR on the output a client window covers.** While VRR is enabled on the command line, the direct-scanout owner of
+   an output is a client window that allows VRR (see Decisions), and that output's connector reports
+   `vrr_capable` = 1, the output's CRTC runs with `VRR_ENABLED` = 1. Otherwise it runs with `VRR_ENABLED` = 0.
 2. **Frames reach KMS when they are ready.** In direct scanout a client Present is already submitted when the buffer is
    ready, with at most one flip in flight and one queued successor. With VRR that flip ends the front porch, so no new
    frame clock is needed. This goal is "keep it that way": nothing in this design may make a direct Present wait for a
@@ -29,8 +31,9 @@ game while the others keep their own fixed rate. This document covers the first 
    client's next frame commit on that CRTC. If no frame commit arrives within **33 ms** of the first position that is
    still unsent, the position goes out in its own commit. Cursor image changes keep today's path (see The cursor while
    VRR is on).
-4. **On by default.** No configuration switch and no environment variable (`YSERVER_*` variables that change behaviour
-   are not allowed).
+4. **Off by default, one command-line flag.** Without the flag yserver never writes `VRR_ENABLED` = 1. `-vrr` enables
+   VRR for windows that set `_VARIABLE_REFRESH` = 1; `-vrr all` enables it for every client window in direct scanout.
+   No environment variable (`YSERVER_*` variables that change behaviour are not allowed).
 5. **Logs that let a tester confirm it works** (see Logging).
 
 ## Non-goals
@@ -38,7 +41,6 @@ game while the others keep their own fixed rate. This document covers the first 
 - Several outputs: VRR on an output composed by the per-output scene path (backlog step 3), and per-output direct
   scanout (backlog step 4). Direct scanout today requires the window to cover the whole root, so with several monitors
   this design does not activate VRR unless one window covers all of them.
-- Reading `_VARIABLE_REFRESH` or any other window property (decided, see below).
 - HDR, colour management, `CTM` / `DEGAMMA_LUT`.
 - Changing Present's MSC/UST semantics. MSC still counts flips/vblanks as today; UST still comes from the flip event.
 - Window rules or per-application exceptions.
@@ -58,18 +60,27 @@ game while the others keep their own fixed rate. This document covers the first 
 ## Decisions (approved in conversation, 2026-10-23)
 
 - **Activation model: a client window that covers the output** (the behaviour KWin uses for fullscreen windows; see
-  Provenance). Mesa and NVIDIA clients take the same single route.
-- **`_VARIABLE_REFRESH` is not read.** The property is a convention between Mesa and Xorg's drivers, not part of any
-  X11 protocol, and the server never answers it. Mesa's Vulkan WSI sets it to 1 when `drirc` allows adaptive sync and
-  otherwise deletes it (it never sets 0). NVIDIA's userspace libraries never set it. Reading it would add a second
-  input that, in practice, only ever repeats "covers the output". Cost accepted: an application that Mesa's `drirc`
-  excludes (a browser playing fullscreen video, for example) also gets VRR while it covers the output, as under KWin.
+  Provenance), narrowed in `-vrr` mode by the window's `_VARIABLE_REFRESH` (below).
+- **`_VARIABLE_REFRESH` is honoured in `-vrr` mode** (revision 2; revision 1 did not read it). Mesa sets the
+  property to 1 on the presented window unless its driconf denylist (`adaptive_sync=false`: browsers, compositors,
+  shells) excludes the application, in which case it deletes it; it never sets 0. Clients depend on that denylist, so
+  yserver follows Xorg modesetting here. The property is read when direct scanout of the window starts, and a change
+  while the window is in direct scanout (set, deleted, value changed) re-evaluates *wanted* at once.
+- **`-vrr all` exists for NVIDIA.** The NVIDIA proprietary client never sets `_VARIABLE_REFRESH` (the string is absent
+  from `libGLX_nvidia.so.615.78.08`). It decides per application (`__GL_VRR_ALLOWED`, profile key `GLVRRAllowed`, with
+  its own denylist of compositors and shells) and passes that decision to `nvidia_drv.so` over NV-GLX, which yserver
+  does not implement. In `-vrr` mode NVIDIA clients therefore never get VRR. `-vrr all` ignores the property. Cost
+  accepted and documented: in that mode no application can be excluded; a compositor's image is still excluded (next
+  decision).
 - **"Client window", not the compositor's image.** Only a direct-scanout owner classified as `ScanoutM0Target::Unredirected`
   activates VRR. `Cow` and `CowDescendant` (a compositing manager's overlay window and its children, such as Muffin's
   stage) never do: that buffer is the whole desktop. With a compositing manager, VRR therefore follows whether the
   manager unredirects the fullscreen game.
 - **Cursor deadline 33 ms.** NVIDIA's own cursor path in NVKMS and KWin both use 1000/30 ms for the same problem.
-- **On by default.**
+- **Off by default** (revision 2, maintainer request; revision 1 was on by default). Some panels flicker at low or
+  changing frame rates, and every fullscreen video player would otherwise run with variable refresh.
+- **Argument form.** `-vrr` takes an optional value: the next argument is consumed only if it is exactly `all`.
+  Repeating the flag: the last one wins, as for `-listen`/`-nolisten`.
 
 ## Kernel and driver behaviour this design relies on
 
@@ -103,7 +114,9 @@ Per output, two facts and one decision:
   also be refreshed on the connector rescan path, which keeps the live `Output` across a disconnect/reconnect and only
   updates connector metadata (`platform/connectors.rs`, rescan); a monitor swap on the same connector must not keep a
   stale value. A missing property means not capable.
-- **wanted:** the direct transaction being submitted for this output is owned by a client window (`Unredirected`). It
+- **wanted:** VRR is enabled on the command line and the direct transaction being submitted for this output is owned
+  by a client window (`Unredirected`) that allows VRR: in `-vrr all` mode always, in `-vrr` mode when the window's
+  `_VARIABLE_REFRESH` is a CARDINAL with value 1 (absent or any other value: not allowed). It
   follows the owner of the transaction being submitted, not the retained direct record: first entry submits before the
   pending record is installed, and the previous direct record survives until a composed replacement retires.
 - **committed:** the `VRR_ENABLED` value the kernel holds for this CRTC. It starts from the kernel's current value, read
@@ -120,11 +133,24 @@ from *committed*. An output whose kernel value is already 0 and that never quali
   no second probation), *wanted* becomes true.
 - **Off:** *wanted* becomes false when direct scanout of that output ends for any reason (unflip, owner changes to the
   compositor's image, the window is unmapped/destroyed/reconfigured, topology change, per-CRTC RandR config, DPMS off,
-  VT release, shutdown), or when the output is no longer capable.
+  VT release, shutdown), when the output is no longer capable, or in `-vrr` mode when the owner's `_VARIABLE_REFRESH`
+  stops allowing VRR. A property change that turns *wanted* on rides the window's next direct frame as usual.
 - **Transport:** the new value rides the next vsync commit of that CRTC, the same way a pending gamma LUT does
   (`feat/gamma-atomic-lut`): scene flip, direct submit or composed commit. Async (tearing) flips cannot carry CRTC
   properties, so the value waits for the next vsync commit. The pending-CRTC-property mechanism added for gamma is
   generalized to carry this value too, rather than duplicated.
+- **One feature class per request** (revision 2). A frame request carries pending gamma LUTs or VRR changes, never both,
+  so an EINVAL and its stripped retry are attributed to one class only: a VRR rejection never latches off gamma on
+  another output, and the reverse.
+  - A VRR **clear** (wanted 0, committed 1) never waits: it goes into the frame that needs it, and every pending gamma
+    LUT of that request waits for the next frame (gamma's pending deadline already schedules one).
+  - A VRR **enable** may wait: while any output in the request has a pending gamma LUT, the enable stays wanted and
+    rides the next frame without gamma.
+  - The `VRR_ENABLED` = 0 that the device-release disable carries is not a frame request and keeps its own retry.
+- **Off without a frame.** When *wanted* turns false and no frame of that CRTC is due (for example a `-vrr` property
+  change on a window whose direct scanout continues without new frames, or a composed replacement that is already
+  idle), the clear must not wait for a later unrelated frame: the next pass submits it in a standalone commit, as the
+  gamma-only commit does.
 - **Before giving up the device** (VT release, shutdown), a CRTC whose *committed* value is 1 gets one commit with
   `VRR_ENABLED` = 0 so the next DRM master (fbcon or another server) does not inherit VRR. If no vsync commit is due at
   that point, a standalone commit carries it, as the gamma-only commit does. This is one attempt: if it fails, the
@@ -153,8 +179,10 @@ While VRR is on for a CRTC:
   grouped direct transaction gets every later position").
 - A cursor **image** change (shape change, animation frame, show/hide) keeps today's path: a full cursor-state commit
   that can go out immediately. Direct frames carry position deltas, not image bindings, so batching images would need
-  a new mechanism that moves sprite ownership into the direct transaction. Image changes are far less frequent than
-  motion (an animated cursor changes a few times per second), so each one costing a refresh is accepted for this step.
+  a new mechanism that moves sprite ownership into the direct transaction. **Known limitation of this step:** an
+  animated cursor (Adwaita's watch changes about 60 times per second) costs one refresh per image while it is over a
+  VRR output, so it can hold the panel near that rate. Motion is the common case and is covered; image batching is a
+  later step.
 - The first unsent position starts a **33 ms** deadline. The deadline is exposed through the existing
   `next_wakeup` (`backend_scanout_next_wakeup`), as the gamma deadline and the tearing `deferred_cursor_wake` already
   are; no new timer. A later change before the deadline does not move it.
@@ -198,6 +226,13 @@ Unit and backend tests, driven through the Backend paths (no direct calls into i
 - async (tearing) flip while a change is pending: the flip carries no CRTC property; the next vsync commit does.
 - VT release and shutdown with VRR on: a commit with `VRR_ENABLED` = 0 is accepted before the device is released.
 - EINVAL on a commit carrying `VRR_ENABLED` = 1: latched off for that CRTC, the frame still goes out.
+- without the flag: a capable output with a client window in direct scanout never receives `VRR_ENABLED` = 1. `-vrr`:
+  a window without `_VARIABLE_REFRESH`, or with value 0, gets none; with 1 it gets VRR; deleting the property while in
+  direct scanout clears VRR without waiting for a client frame. `-vrr all`: the property is ignored. Argument parsing:
+  `-vrr`, `-vrr all`, `-vrr :5` (the display is not consumed), last flag wins.
+- gamma pending while VRR is cleared: the clear goes out in that frame and the gamma LUT in the next. Gamma pending
+  while VRR is enabled: the enable waits. A grouped request never carries both; an EINVAL on a VRR change never
+  latches gamma, and the reverse. Mutation: append both classes to one request.
 - cursor with VRR on: motion with a direct frame inside 33 ms rides that frame (0 `cursor-only` commits); motion with no
   frame gives exactly one `cursor-only` commit at the deadline, driven through `next_wakeup`. Mutation: send cursor-only
   immediately (today's behaviour). An image change still commits as today. With VRR off, cursor-only commits are
@@ -216,6 +251,9 @@ Hardware (the user validates with a game and logs):
 - Check while entering and leaving VRR: no black frame, no modeset, nothing visible on the panel.
 - Check that the desktop (no fullscreen client, and a compositing manager's image) never logs `vrr on`.
 - Check cursor motion over a game capped below the panel maximum: the flip intervals keep following the game.
+- Check the 33 ms motion wait and the animated-cursor limitation: Adwaita's watch cursor over a fullscreen video,
+  recording what the OSD shows.
+- Check `-vrr` with a Mesa client (mpv on AMD) and `-vrr all` with an NVIDIA client; without the flag no `vrr on`.
 
 ## Open items for the builder
 
@@ -224,6 +262,13 @@ Hardware (the user validates with a game and logs):
   deadline, or need a small generalization (reuse first; justify any new piece).
 - Interaction with gamma's active-CRTC rule: with VRR the CRTC may flip slower than two fixed refresh periods, so a
   gamma change can go out standalone and trigger a refresh. Gamma changes are rare; note, do not tune, unless trivial.
+
+## Revision history
+
+- **Revision 2 (2026-10-25),** from the maintainer's review of draft PR #294: off by default behind `-vrr`; honour
+  `_VARIABLE_REFRESH` including live changes, with `-vrr all` for NVIDIA clients (user decision); a VRR clear takes
+  priority over a pending gamma LUT and never waits for an unrelated frame; one feature class per request so EINVAL
+  attribution stays separate; animated cursors documented as a limitation and added to the hardware runs.
 
 ## Provenance
 
@@ -237,7 +282,10 @@ Sources consulted, by static read only, for behaviour:
 - NVIDIA open kernel modules 615.78.08 (GPL/MIT dual): nvidia-drm connector and CRTC, NVKMS kapi, modeset, flip and
   VRR code.
 - Xorg server modesetting driver (MIT): `driver.c` and `present.c`, for the `VariableRefresh` option and the
-  `_VARIABLE_REFRESH` handling.
+  `_VARIABLE_REFRESH` handling, including the live property change while flipped.
+- Mesa main (MIT): `src/util/00-mesa-defaults.conf`, the `adaptive_sync` denylist.
+- NVIDIA driver 615.78.08 documentation (README section "G-SYNC", application profile file and key documentation):
+  `__GL_VRR_ALLOWED`, `GLVRRAllowed`, the "No VRR/OSD" profile; a string search of `libGLX_nvidia.so.615.78.08`.
 - Mesa main (MIT): Vulkan WSI X11 (`wsi_common_x11.c`), for how `_VARIABLE_REFRESH` is set or deleted.
 - wlroots (MIT): output cursor and frame scheduling, which has no VRR-specific cursor rule.
 - KWin 6.7.5 (GPL-2.0): only its observable behaviour is used: a fullscreen window enables adaptive sync on its output,
