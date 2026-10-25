@@ -728,6 +728,135 @@ fn enable_recording_scene_gamma(
     (crtc_xid, crtc, fd, recorder)
 }
 
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: append gamma and VRR changes to one grouped request.
+fn vrr_clear_and_gamma_never_share_a_request() {
+    let Some((fixture, direct)) = super::direct_unflip::direct_fixture(
+        2,
+        super::recording_scene::P1SceneRoute::Shared,
+        18_012,
+        0,
+    ) else {
+        eprintln!("skip: no Vulkan scene fixture available");
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    let fd = super::direct_unflip::fd(&fixture);
+    let recorder = fixture.events.recorders[&fd].clone();
+    let (crtc_a_xid, crtc_a) = enable_gamma(&mut fixture.events.backend, &recorder, 0, 4);
+    let crtc_b = fixture.events.backend.platform.outputs[1].output.crtc;
+    {
+        let output = &mut fixture.events.backend.platform.outputs[1].output;
+        output.crtc_vrr_enabled_prop = Some(handle(90));
+        output.connector_vrr_capable = true;
+        output.vrr_committed.set(false);
+    }
+
+    let initial = super::direct_unflip::submit_direct(&mut fixture, &direct, fd)
+        .into_iter()
+        .find(|record| accepted_event_id(record).is_some())
+        .expect("initial grouped direct Backend frame is accepted");
+    assert!(contains_crtc_property(&initial, crtc_b, handle(90)));
+    super::direct_unflip::complete_direct_initial(
+        &mut fixture,
+        &initial,
+        accepted_event_id(&initial).expect("initial direct frame has an event ID"),
+        fd,
+    );
+    super::direct_unflip::drain_present_notifications(
+        &mut fixture,
+        &[direct.candidate.present_id],
+        &[],
+    );
+    let _ = install_controlled_clock(&mut fixture.events.backend);
+
+    set_test_gamma(&mut fixture.events.backend, crtc_a_xid, 0x4567);
+    assert!(
+        fixture.events.backend.platform.outputs[0]
+            .output
+            .pending_gamma_lut
+            .borrow()
+            .is_some(),
+        "RandR leaves output A's gamma LUT pending during direct scanout"
+    );
+    assert!(
+        recorder
+            .records()
+            .iter()
+            .all(|record| record.kind != AtomicCommitKind::GammaOnly),
+        "gamma does not submit a standalone request while direct scanout owns output A"
+    );
+
+    super::direct_unflip::request_unflip(&mut fixture, &direct);
+    let unflip_offset = recorder.records().len();
+    recorder.script_result(Err(io::Error::from_raw_os_error(libc::EINVAL)));
+    recorder.script_result(Ok(()));
+    let accepted_retry =
+        super::direct_unflip::grouped_unflip_record(&mut fixture, fd, unflip_offset, 2);
+    let attempts = super::direct_unflip::records_since(&fixture, fd, unflip_offset);
+    assert_eq!(
+        attempts.len(),
+        2,
+        "the request is retried once without CRTC properties"
+    );
+    assert!(
+        fixture.events.backend.platform.outputs[1]
+            .output
+            .vrr_disabled
+            .get(),
+        "the accepted stripped retry attributes EINVAL to VRR on output B"
+    );
+    assert!(
+        !fixture.events.backend.platform.outputs[0]
+            .output
+            .gamma_lut_disabled
+            .get(),
+        "a VRR EINVAL never latches GAMMA_LUT off on output A"
+    );
+    assert!(
+        matches!(
+            attempts[0].result,
+            ScriptedResult::Error {
+                raw_os_error: Some(error),
+                ..
+            } if error == libc::EINVAL
+        ),
+        "the property-bearing request is rejected with EINVAL"
+    );
+    assert!(contains_crtc_property(&attempts[0], crtc_b, handle(90)));
+    assert!(
+        !contains_crtc_property(&attempts[0], crtc_a, handle(70)),
+        "the VRR clear request does not carry output A's GAMMA_LUT"
+    );
+    assert!(
+        !contains_crtc_property(&attempts[0], crtc_a, handle(90)),
+        "the request changes only output B's VRR property"
+    );
+    assert_eq!(attempts[1].result, ScriptedResult::Ok);
+    assert!(accepted_event_id(&attempts[1]).is_some());
+    assert!(
+        !contains_crtc_property(&attempts[1], crtc_a, handle(70))
+            && !contains_crtc_property(&attempts[1], crtc_b, handle(90)),
+        "the stripped retry removes all optional CRTC changes"
+    );
+    assert!(
+        fixture.events.backend.platform.outputs[1]
+            .output
+            .vrr_committed
+            .get(),
+        "the accepted stripped retry leaves output B's kernel VRR value unchanged"
+    );
+
+    complete_recorded_attempt(&mut fixture.events, fd, &accepted_retry, 84);
+    super::direct_unflip::drain_present_notifications(
+        &mut fixture,
+        &[],
+        &[direct.candidate.present_id],
+    );
+    fixture.finish_after_normal_drain();
+}
+
 struct LogicalVtResume;
 
 impl crate::kms::render::backend::kms::session::VtResumeExecutor for LogicalVtResume {

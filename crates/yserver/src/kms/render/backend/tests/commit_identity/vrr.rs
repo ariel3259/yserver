@@ -1412,8 +1412,8 @@ fn vrr_rejected_clear_is_bounded() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: hard-code `reason=inherited` for a scene clear deferred by gamma.
-fn vrr_deferred_scene_clear_logs_the_direct_exit_reason() {
+// Mutation: keep gamma first when a VRR clear is due in the same request.
+fn vrr_clear_goes_before_pending_gamma() {
     let Some((fixture, direct)) = direct_fixture(18_009, 0) else {
         eprintln!("skip: no Vulkan scene fixture available");
         return;
@@ -1431,6 +1431,7 @@ fn vrr_deferred_scene_clear_logs_the_direct_exit_reason() {
         &[direct.candidate.present_id],
         &[],
     );
+    let _ = super::support::install_controlled_clock(&mut fixture.events.backend);
     super::recording_scene::clear_vrr_test_logs();
     let output_name = "vrr-deferred-exit-test";
     fixture.events.backend.platform.outputs[0]
@@ -1463,6 +1464,16 @@ fn vrr_deferred_scene_clear_logs_the_direct_exit_reason() {
         &[0x3333; 4],
     )
     .expect("queue gamma before unflip");
+    let gamma_pending_before_unflip = fixture.events.backend.platform.outputs[0]
+        .output
+        .pending_gamma_lut
+        .borrow()
+        .is_some();
+    let gamma_deadline_before_unflip = fixture.events.backend.platform.outputs[0]
+        .output
+        .pending_gamma_deadline
+        .get()
+        .is_some();
 
     super::direct_unflip::request_unflip(&mut fixture, &direct);
     let unflip_offset = super::direct_unflip::record_count(&fixture, fd);
@@ -1471,47 +1482,105 @@ fn vrr_deferred_scene_clear_logs_the_direct_exit_reason() {
         .properties
         .iter()
         .any(|update| update.object == crtc.into() && update.property == handle(70));
-    let unflip_has_vrr = has_vrr_property(&unflip, crtc);
+    let unflip_has_vrr_clear = contains_vrr_property(&unflip, crtc, 0);
+    assert!(
+        gamma_pending_before_unflip,
+        "RandR gamma is pending before unflip"
+    );
+    assert!(
+        gamma_deadline_before_unflip,
+        "the held LUT has a refresh deadline"
+    );
+    assert!(unflip_has_vrr_clear, "the unflip carries VRR_ENABLED = 0");
+    assert!(!unflip_has_gamma, "the clear request carries no GAMMA_LUT");
     let unflip_id = super::support::accepted_event_id(&unflip).expect("unflip event ID");
+    let gamma_record_offset = recorder.records().len();
     super::atomic_events::complete_recorded_attempt(&mut fixture, fd, &unflip, unflip_id, 84);
     super::direct_unflip::drain_present_notifications(
         &mut fixture,
         &[],
         &[direct.candidate.present_id],
     );
-    let reason_retained = fixture.events.backend.pstate.scanout_m2.unflip_last_reason
-        == Some("ineligible_authoritative_root_present");
-    let committed_after_gamma_unflip = fixture.events.backend.platform.outputs[0]
+    let committed_after_clear = fixture.events.backend.platform.outputs[0]
         .output
         .vrr_committed
         .get();
+    let gamma_pending_after_clear = fixture.events.backend.platform.outputs[0]
+        .output
+        .pending_gamma_lut
+        .borrow()
+        .is_some();
+    let gamma_deadline_after_clear = fixture.events.backend.platform.outputs[0]
+        .output
+        .pending_gamma_deadline
+        .get()
+        .is_some();
 
-    let scene_attempts = super::atomic_events::submit_damaged_frame(&mut fixture);
-    let scene = scene_attempts
+    let mut next_crtc_commit = recorder
+        .records()
+        .into_iter()
+        .skip(gamma_record_offset)
+        .find(|record| {
+            super::support::accepted_event_id(record).is_some()
+                && record.events.iter().any(|event| event.crtc == crtc)
+        });
+    if next_crtc_commit.is_none() {
+        let scene_attempts = super::atomic_events::submit_damaged_frame(&mut fixture);
+        next_crtc_commit = scene_attempts
+            .into_iter()
+            .map(|(_, record)| record)
+            .find(|record| {
+                super::support::accepted_event_id(record).is_some()
+                    && record.events.iter().any(|event| event.crtc == crtc)
+            });
+    }
+    let next_crtc_commit =
+        next_crtc_commit.expect("the next CRTC commit is recorded after the clear");
+    let next_crtc_id =
+        super::support::accepted_event_id(&next_crtc_commit).expect("next commit event ID");
+    let next_commit_has_gamma = next_crtc_commit
+        .properties
         .iter()
-        .find(|(_, record)| super::support::accepted_event_id(record).is_some())
-        .expect("scene frame accepted after gamma")
-        .1
-        .clone();
-    let scene_has_vrr_clear = contains_vrr_property(&scene, crtc, 0);
-    let scene_id = super::support::accepted_event_id(&scene).expect("scene event ID");
-    super::atomic_events::complete_recorded_attempt(&mut fixture, fd, &scene, scene_id, 85);
+        .any(|update| update.object == crtc.into() && update.property == handle(70));
+    let next_commit_has_vrr = has_vrr_property(&next_crtc_commit, crtc);
+    super::atomic_events::complete_recorded_attempt(
+        &mut fixture,
+        fd,
+        &next_crtc_commit,
+        next_crtc_id,
+        85,
+    );
+    let gamma_pending_after_next_commit = fixture.events.backend.platform.outputs[0]
+        .output
+        .pending_gamma_lut
+        .borrow()
+        .is_some();
     let logs = super::recording_scene::vrr_test_logs();
     fixture.finish_after_normal_drain();
 
-    assert!(unflip_has_gamma, "the unflip carries the pending gamma LUT");
-    assert!(!unflip_has_vrr, "gamma has priority over the VRR clear");
     assert!(
-        committed_after_gamma_unflip,
-        "the deferred clear remains committed"
+        !committed_after_clear,
+        "the accepted clear updates the committed VRR state"
     );
     assert!(
-        reason_retained,
-        "the direct exit reason survives until the clear"
+        gamma_pending_after_clear,
+        "the clear leaves the LUT pending"
     );
     assert!(
-        scene_has_vrr_clear,
-        "the next scene carries VRR_ENABLED = 0"
+        gamma_deadline_after_clear,
+        "the held LUT keeps its deadline"
+    );
+    assert!(
+        next_commit_has_gamma,
+        "the next commit for this CRTC carries GAMMA_LUT"
+    );
+    assert!(
+        !next_commit_has_vrr,
+        "the gamma commit does not repeat VRR_ENABLED"
+    );
+    assert!(
+        !gamma_pending_after_next_commit,
+        "the accepted gamma commit consumes the pending LUT"
     );
     assert!(
         logs.lines().any(|line| {
@@ -1526,8 +1595,8 @@ fn vrr_deferred_scene_clear_logs_the_direct_exit_reason() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: append VRR_ENABLED in the same frame that carries a pending GAMMA_LUT.
-fn vrr_waits_behind_pending_gamma() {
+// Mutation: append VRR_ENABLED in the same request that carries GAMMA_LUT.
+fn vrr_enable_waits_behind_pending_gamma() {
     let Some((fixture, mut direct)) = direct_fixture(18_007, 0) else {
         eprintln!("skip: no Vulkan scene fixture available");
         return;
@@ -1556,6 +1625,7 @@ fn vrr_waits_behind_pending_gamma() {
     super::direct_unflip::complete_direct_initial(&mut fixture, &first, first_id, fd);
     let first_present_id = direct.candidate.present_id;
     super::direct_unflip::drain_present_notifications(&mut fixture, &[first_present_id], &[]);
+    let _ = super::support::install_controlled_clock(&mut fixture.events.backend);
 
     let vrr_output = &mut fixture.events.backend.platform.outputs[0].output;
     vrr_output.crtc_vrr_enabled_prop = Some(handle(VRR_PROP_ID));
@@ -1621,6 +1691,14 @@ fn vrr_waits_behind_pending_gamma() {
             .output
             .vrr_committed
             .get()
+    );
+    assert!(
+        fixture.events.backend.platform.outputs[0]
+            .output
+            .pending_gamma_lut
+            .borrow()
+            .is_none(),
+        "the gamma frame consumes its pending LUT"
     );
     let vrr_id = super::support::accepted_event_id(&vrr_frame).expect("VRR frame event ID");
     super::direct_unflip::complete_direct_initial(&mut fixture, &vrr_frame, vrr_id, fd);

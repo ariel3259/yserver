@@ -371,8 +371,8 @@ pub(crate) fn append_pending_gamma_lut(
     Some(blob)
 }
 
-/// Add a changed VRR_ENABLED value to a frame request. Callers append the
-/// gamma LUT first and skip VRR on that output when a LUT was added.
+/// Add a changed VRR_ENABLED value to a frame request. The shared assembler
+/// chooses the VRR property class before calling this helper.
 pub(crate) fn append_vrr_change(
     output: &Output,
     wanted: bool,
@@ -395,9 +395,10 @@ fn changed_vrr_value(output: &Output, wanted: bool) -> Option<bool> {
     Some(value)
 }
 
-/// Pending optional CRTC changes assembled for one frame. The fallback is the
-/// same frame without any optional CRTC properties, preserving gamma's single
-/// EINVAL attribution path while letting all frame builders share assembly.
+/// Pending optional CRTC changes assembled for one frame. The shared assembler
+/// populates only one property class per request. The fallback is the same
+/// frame without optional CRTC properties, preserving the single EINVAL
+/// attribution path while letting all frame builders share assembly.
 pub(crate) struct PendingCrtcProperties<'output> {
     pub(crate) request_without_crtc_properties: Option<AtomicCommitRequest>,
     pub(crate) gamma_blobs: Vec<(&'output Output, u64)>,
@@ -414,9 +415,11 @@ impl PendingCrtcProperties<'_> {
     }
 }
 
-/// Append pending gamma first, then an eligible VRR transition for each
-/// output. The helper owns the common fallback snapshot and change tracking so
-/// direct, composed and scene frames use the same retry rules.
+/// Select one optional CRTC property class for the entire request, then append
+/// its changes. A due VRR clear selects VRR changes even when gamma is pending;
+/// otherwise pending gamma selects gamma changes and defers VRR enables. The
+/// helper owns the common fallback snapshot and change tracking so direct,
+/// composed and scene frames use the same retry rules.
 pub(crate) fn append_pending_crtc_properties<'output>(
     device: &Device,
     sink: &AtomicCommitSink,
@@ -424,24 +427,32 @@ pub(crate) fn append_pending_crtc_properties<'output>(
     outputs: impl IntoIterator<Item = (&'output Output, bool)>,
 ) -> PendingCrtcProperties<'output> {
     let mut changes = PendingCrtcProperties::empty();
-    for (output, wanted) in outputs {
-        let gamma_pending = output.crtc_gamma_lut_prop.is_some()
+    let outputs: Vec<_> = outputs.into_iter().collect();
+    let vrr_clear_due = outputs
+        .iter()
+        .any(|(output, wanted)| changed_vrr_value(output, *wanted) == Some(false));
+    let gamma_pending = outputs.iter().any(|(output, _)| {
+        output.crtc_gamma_lut_prop.is_some()
             && !output.gamma_lut_disabled.get()
-            && output.pending_gamma_lut.borrow().is_some();
-        let request_before_gamma = gamma_pending.then(|| request.clone());
-        if let Some(blob) = append_pending_gamma_lut(device, sink, output, request) {
-            changes
-                .request_without_crtc_properties
-                .get_or_insert_with(|| {
-                    request_before_gamma.expect("pending gamma has a fallback snapshot")
-                });
-            changes.gamma_blobs.push((output, blob));
+            && output.pending_gamma_lut.borrow().is_some()
+    });
+    let append_gamma = !vrr_clear_due && gamma_pending;
+
+    for (output, wanted) in outputs {
+        if append_gamma {
+            let request_before_gamma = request.clone();
+            if let Some(blob) = append_pending_gamma_lut(device, sink, output, request) {
+                changes
+                    .request_without_crtc_properties
+                    .get_or_insert(request_before_gamma);
+                changes.gamma_blobs.push((output, blob));
+            }
             continue;
         }
         if let Some(value) = changed_vrr_value(output, wanted) {
             changes
                 .request_without_crtc_properties
-                .get_or_insert_with(|| request_before_gamma.unwrap_or_else(|| request.clone()));
+                .get_or_insert_with(|| request.clone());
             append_vrr_change(output, wanted, request)
                 .expect("the VRR property remains available after checking its change");
             changes.vrr_changes.push((output, value));
