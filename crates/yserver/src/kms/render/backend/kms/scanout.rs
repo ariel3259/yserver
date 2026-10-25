@@ -1000,11 +1000,19 @@ impl KmsBackend {
             self.handle_cursor_move_outcome(outcome);
         }
         let accepted_event_id = result?;
+        let vrr_off_reason = if frame.target == ScanoutM0Target::Unredirected
+            && self.pstate.vrr_mode == crate::launch::VrrMode::Property
+            && !frame.candidate.variable_refresh
+        {
+            "property"
+        } else {
+            "inherited"
+        };
         self.log_vrr_committed_changes(
             &vrr_before,
             (frame.target == ScanoutM0Target::Unredirected)
                 .then_some(frame.candidate.dst_window_xid),
-            "inherited",
+            vrr_off_reason,
         );
         if attempt_timing == crate::drm::async_flip::FlipTiming::Vsync
             || matches!(

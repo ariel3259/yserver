@@ -3530,6 +3530,114 @@ fn vrr_property_deleted_during_flip_clears_at_event() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: keep the direct-frame clear fallback as inherited; queued property deletion must log property.
+fn vrr_queued_property_delete_clear_logs_property_reason() {
+    let Some((mut fixture, mut direct)) =
+        direct_fixture_with_vrr_mode(18_046, 0, crate::launch::VrrMode::Property)
+    else {
+        eprintln!(
+            "SKIP vrr_queued_property_delete_clear_logs_property_reason: no Vulkan scene fixture available"
+        );
+        return;
+    };
+    set_vrr_capable(&mut fixture);
+    let mut fixture = fixture.cleanup_guard();
+    let fd = super::direct_unflip::fd(&fixture);
+    let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    let output_name = fixture.events.backend.platform.outputs[0]
+        .key
+        .connector_name
+        .clone();
+    let mut state = present_request_state(&direct);
+    let property = state.atoms.intern("_VARIABLE_REFRESH", false).0;
+    prepare_property_present_source(&mut fixture, &direct);
+    request_vrr_property(
+        &mut state,
+        &mut fixture.events.backend,
+        direct.target_xid,
+        property,
+        yserver_core::xinput::XA_CARDINAL.0,
+        32,
+        &[1],
+        1,
+    );
+    direct.candidate.variable_refresh = true;
+    let initial = accepted_direct_record(&mut fixture, &direct, fd);
+    assert!(contains_vrr_property(&initial, crtc, 1));
+    complete_direct_and_drain_present(&mut fixture, &initial, direct.candidate.present_id, None);
+
+    let pending = submit_direct_successor(&mut fixture, &mut direct, fd);
+    let pending_present_id = direct.candidate.present_id;
+    queue_direct_successor(&mut fixture, &mut direct);
+    let queued_present_id = direct.candidate.present_id;
+    let offset = super::direct_unflip::record_count(&fixture, fd);
+    super::recording_scene::clear_vrr_test_logs();
+
+    delete_vrr_property(
+        &mut state,
+        &mut fixture.events.backend,
+        direct.target_xid,
+        property,
+        4,
+    );
+    assert!(
+        super::direct_unflip::records_since(&fixture, fd, offset).is_empty(),
+        "property deletion waits for the queued successor instead of a standalone clear"
+    );
+    assert!(
+        fixture.events.backend.platform.outputs[0]
+            .output
+            .vrr_committed
+            .get()
+    );
+
+    super::atomic_events::complete_recorded_attempt(
+        &mut fixture,
+        fd,
+        &pending,
+        super::support::accepted_event_id(&pending).expect("pending event ID"),
+        87,
+    );
+    super::direct_unflip::drain_present_notifications(
+        &mut fixture,
+        &[pending_present_id],
+        &[pending_present_id - 1],
+    );
+    let successor = super::direct_unflip::records_since(&fixture, fd, offset)
+        .into_iter()
+        .find(|record| super::support::accepted_event_id(record).is_some())
+        .expect("queued successor submits after predecessor retirement");
+    assert!(contains_vrr_property(&successor, crtc, 0));
+    assert!(
+        !fixture.events.backend.platform.outputs[0]
+            .output
+            .vrr_committed
+            .get(),
+        "accepted queued successor clears VRR_ENABLED"
+    );
+    let logs = super::recording_scene::vrr_test_logs();
+    assert!(
+        logs.lines().any(|line| {
+            line == format!(
+                "kms: vrr off output={output_name} crtc={} reason=property",
+                u32::from(crtc)
+            )
+        }),
+        "the queued property clear logs its cause; logs={logs:?}"
+    );
+
+    complete_direct_and_drain_present(
+        &mut fixture,
+        &successor,
+        queued_present_id,
+        Some(pending_present_id),
+    );
+    finish_property_direct_scanout(&mut fixture, fd);
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: issue a standalone VRR enable on property set; enabling must ride the next direct frame.
 fn vrr_property_set_enables_on_next_frame() {
     let Some((mut fixture, direct)) =
