@@ -24,6 +24,19 @@ use yserver_core::{backend::Backend as _, server::ServerState};
 pub(in crate::kms::render::backend) trait VtResumeExecutor {
     fn acquire_master(&self, device: &crate::kms::render::platform::KmsDevice) -> io::Result<()>;
     fn release_master(&self, device: &crate::kms::render::platform::KmsDevice) -> io::Result<()>;
+    fn crtc_vrr_enabled_value(
+        &self,
+        device: &crate::kms::render::platform::KmsDevice,
+        crtc: ::drm::control::crtc::Handle,
+        property: ::drm::control::property::Handle,
+    ) -> io::Result<Option<u64>> {
+        use ::drm::control::Device as _;
+        let properties = device.device.get_properties(crtc)?;
+        Ok(properties
+            .iter()
+            .find(|(id, _)| **id == property)
+            .map(|(_, value)| *value))
+    }
     fn probe_connector_snapshot(
         &self,
         platform: &PlatformBackend,
@@ -613,6 +626,21 @@ impl KmsBackend {
         // drmmode_display.c:3765-3770). A refused device-wide disable is
         // logged; the per-output commits below still run.
         let _ = self.platform.disable_all_devices("VT resume");
+
+        // Another DRM master may have left VRR enabled while this VT was
+        // away. Refresh after the all-device disable attempt so the next
+        // frame compares its wanted state with what the kernel now holds.
+        for layout in &self.platform.outputs {
+            let Some(device) = self.platform.device_for_output(&layout.key) else {
+                continue;
+            };
+            let crtc = layout.output.crtc;
+            layout.output.refresh_vrr_committed_from_kernel(|property| {
+                self.pstate
+                    .vt_resume_executor
+                    .crtc_vrr_enabled_value(device, crtc, property)
+            });
+        }
 
         // A retained direct framebuffer must be released against the old
         // routes even when the connector set is unchanged. Any active removal

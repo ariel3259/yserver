@@ -1,6 +1,7 @@
 //! KMS output bring-up: output identity, the active-output inventory and the
 //! initial modeset that `PlatformBackend::open_with_commit` delegates into.
 
+use ::drm::control::Device as _;
 use std::{
     io,
     path::{Path, PathBuf},
@@ -248,7 +249,14 @@ fn activate_initial_scanout_outputs(
     }
     if let Some(err) = bring_up_err {
         for done in layouts.iter_mut().rev() {
-            if let Err(disable_err) = drm::modeset::disable_output(device, &done.output) {
+            if let Err(disable_err) =
+                drm::modeset::disable_output(device, &done.output, |request| {
+                    device.atomic_commit(
+                        ::drm::control::AtomicCommitFlags::ALLOW_MODESET,
+                        request.into_atomic_mode_req(),
+                    )
+                })
+            {
                 log::warn!(
                     "initial scanout rollback: failed to disable {}: {disable_err}; \
                      leaving its buffers for DRM-fd close",

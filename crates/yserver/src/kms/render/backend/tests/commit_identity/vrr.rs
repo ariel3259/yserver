@@ -1,17 +1,22 @@
 use crate::{
-    drm::atomic::{
-        AtomicCommitKind, AtomicCommitSink,
-        tests_support::{AtomicCommitRecord, RecordingAtomicCommitExecutor},
+    drm::{
+        atomic::{
+            AtomicCommitKind, AtomicCommitSink,
+            tests_support::{AtomicCommitRecord, RecordingAtomicCommitExecutor, ScriptedResult},
+        },
+        modeset::PropMap,
     },
     kms::{
         render::{
             backend::KmsBackend,
-            platform::{ConnectorSnapshot, KmsDevice, PlatformBackend, RenderDeviceId},
+            platform::{
+                ConnectorSnapshot, KmsDevice, OutputPowerExecutor, PlatformBackend, RenderDeviceId,
+            },
         },
         scanout_route::{RenderKmsRelationship, ScanoutRoute},
     },
 };
-use std::{io, rc::Rc};
+use std::{cell::RefCell, io, rc::Rc};
 use yserver_core::backend::{Backend, ModeSpec};
 
 const VRR_PROP_ID: u32 = 90;
@@ -245,6 +250,508 @@ fn has_vrr_property(record: &AtomicCommitRecord, crtc: ::drm::control::crtc::Han
         .properties
         .iter()
         .any(|update| update.object == crtc.into() && update.property == handle(VRR_PROP_ID))
+}
+
+type PropertyRow = (String, ::drm::control::property::Handle, u64);
+
+#[derive(Clone)]
+struct ObjectPropertyRows(Vec<PropertyRow>);
+
+impl ObjectPropertyRows {
+    fn map(&self) -> PropMap {
+        PropMap::from_discovered_properties(self.0.clone())
+    }
+}
+
+#[derive(Clone)]
+struct DevicePropertyRows {
+    planes: Vec<(::drm::control::plane::Handle, ObjectPropertyRows)>,
+    crtcs: Vec<(::drm::control::crtc::Handle, ObjectPropertyRows)>,
+    connectors: Vec<(::drm::control::connector::Handle, ObjectPropertyRows)>,
+}
+
+struct DevicePropertyMaps {
+    planes: Vec<(::drm::control::plane::Handle, PropMap)>,
+    crtcs: Vec<(::drm::control::crtc::Handle, PropMap)>,
+    connectors: Vec<(::drm::control::connector::Handle, PropMap)>,
+}
+
+impl DevicePropertyRows {
+    fn for_output(output: &crate::drm::modeset::Output, kernel_vrr: u64) -> Self {
+        let mut crtc_rows = vec![
+            ("ACTIVE".to_owned(), handle(91), 1),
+            ("MODE_ID".to_owned(), handle(92), 1),
+        ];
+        if let Some(vrr) = output.crtc_vrr_enabled_prop {
+            crtc_rows.push(("VRR_ENABLED".to_owned(), vrr, kernel_vrr));
+        }
+        Self {
+            planes: vec![(
+                output.plane,
+                ObjectPropertyRows(vec![
+                    ("FB_ID".to_owned(), output.plane_fb_id_prop, 1),
+                    (
+                        "CRTC_ID".to_owned(),
+                        output.plane_crtc_id_prop,
+                        u64::from(u32::from(output.crtc)),
+                    ),
+                ]),
+            )],
+            crtcs: vec![(output.crtc, ObjectPropertyRows(crtc_rows))],
+            connectors: vec![(
+                output.connector,
+                ObjectPropertyRows(vec![(
+                    "CRTC_ID".to_owned(),
+                    handle(93),
+                    u64::from(u32::from(output.crtc)),
+                )]),
+            )],
+        }
+    }
+
+    fn maps(&self) -> DevicePropertyMaps {
+        DevicePropertyMaps {
+            planes: self
+                .planes
+                .iter()
+                .map(|(handle, properties)| (*handle, properties.map()))
+                .collect(),
+            crtcs: self
+                .crtcs
+                .iter()
+                .map(|(handle, properties)| (*handle, properties.map()))
+                .collect(),
+            connectors: self
+                .connectors
+                .iter()
+                .map(|(handle, properties)| (*handle, properties.map()))
+                .collect(),
+        }
+    }
+}
+
+struct RecordingOutputPower {
+    sink: Rc<AtomicCommitSink>,
+    device_properties: DevicePropertyRows,
+    events: Rc<RefCell<Vec<&'static str>>>,
+}
+
+impl RecordingOutputPower {
+    fn submit(
+        &self,
+        device: &crate::drm::Device,
+        request: crate::drm::atomic::AtomicCommitRequest,
+    ) -> io::Result<()> {
+        let result = self.sink.submit(
+            device,
+            ::drm::control::AtomicCommitFlags::ALLOW_MODESET,
+            AtomicCommitKind::Scene,
+            request,
+            &[],
+        );
+        self.events.borrow_mut().push("atomic_submit");
+        result
+    }
+}
+
+impl OutputPowerExecutor for RecordingOutputPower {
+    fn disable(
+        &self,
+        device: &crate::drm::Device,
+        output: &crate::drm::modeset::Output,
+    ) -> io::Result<()> {
+        let properties = DevicePropertyRows::for_output(output, 0);
+        let connector = properties.connectors[0].1.map();
+        let crtc = properties.crtcs[0].1.map();
+        crate::drm::modeset::disable_output_with_properties(output, &connector, &crtc, |request| {
+            self.submit(device, request)
+        })
+    }
+
+    fn enable(
+        &self,
+        _device: &crate::drm::Device,
+        _output: &crate::drm::modeset::Output,
+        _framebuffer: ::drm::control::framebuffer::Handle,
+    ) -> io::Result<()> {
+        self.events.borrow_mut().push("enable");
+        Ok(())
+    }
+
+    fn disable_device(&self, device: &crate::drm::Device) -> io::Result<()> {
+        let maps = self.device_properties.maps();
+        crate::drm::modeset::disable_all_outputs_with_properties(
+            maps.planes,
+            maps.crtcs,
+            maps.connectors,
+            |request| self.submit(device, request),
+        )
+    }
+}
+
+fn install_recording_power(
+    backend: &mut KmsBackend,
+    recorder: Rc<RecordingAtomicCommitExecutor>,
+    kernel_vrr: u64,
+    events: Rc<RefCell<Vec<&'static str>>>,
+) {
+    let sink = Rc::new(AtomicCommitSink::new(recorder));
+    backend.platform.devices[0].atomic_commit_sink = Rc::clone(&sink);
+    let properties =
+        DevicePropertyRows::for_output(&backend.platform.outputs[0].output, kernel_vrr);
+    backend
+        .platform
+        .for_tests_set_output_power_executor(Rc::new(RecordingOutputPower {
+            sink,
+            device_properties: properties,
+            events,
+        }));
+}
+
+fn new_power_recorder() -> Rc<RecordingAtomicCommitExecutor> {
+    Rc::new(RecordingAtomicCommitExecutor::default())
+}
+
+fn backend_snapshot(backend: &KmsBackend) -> Vec<ConnectorSnapshot> {
+    backend
+        .platform
+        .outputs
+        .iter()
+        .map(|layout| ConnectorSnapshot {
+            key: layout.key.clone(),
+            modes: vec![layout.output.picked.clone()],
+            mm_width: layout.output.mm_width,
+            mm_height: layout.output.mm_height,
+            edid: layout.output.edid.clone(),
+            connector_type: layout.output.connector_type.clone(),
+            vrr_capable: layout.output.connector_vrr_capable,
+        })
+        .collect()
+}
+
+struct KernelVrrVtResume {
+    snapshots: Vec<ConnectorSnapshot>,
+    kernel_vrr: u64,
+    events: Rc<RefCell<Vec<&'static str>>>,
+}
+
+impl crate::kms::render::backend::kms::session::VtResumeExecutor for KernelVrrVtResume {
+    fn acquire_master(&self, _device: &KmsDevice) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn release_master(&self, _device: &KmsDevice) -> io::Result<()> {
+        self.events.borrow_mut().push("release_master");
+        Ok(())
+    }
+
+    fn crtc_vrr_enabled_value(
+        &self,
+        _device: &KmsDevice,
+        _crtc: ::drm::control::crtc::Handle,
+        property: ::drm::control::property::Handle,
+    ) -> io::Result<Option<u64>> {
+        assert_eq!(property, handle(VRR_PROP_ID));
+        self.events.borrow_mut().push("read_vrr_enabled");
+        Ok(Some(self.kernel_vrr))
+    }
+
+    fn probe_connector_snapshot(
+        &self,
+        _platform: &PlatformBackend,
+    ) -> io::Result<Vec<ConnectorSnapshot>> {
+        Ok(self.snapshots.clone())
+    }
+}
+
+#[test]
+// Mutation: omit VRR_ENABLED = 0 from disable_output; the recorded VT off commit must fail this assertion.
+fn vrr_vt_release_clears_before_drop_master() {
+    let mut backend = vrr_backend();
+    let crtc = backend.platform.outputs[0].output.crtc;
+    backend.platform.outputs[0].output.vrr_committed.set(true);
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let recorder = new_power_recorder();
+    install_recording_power(&mut backend, Rc::clone(&recorder), 1, Rc::clone(&events));
+    backend.for_tests_set_vt_resume_executor(Rc::new(KernelVrrVtResume {
+        snapshots: backend_snapshot(&backend),
+        kernel_vrr: 1,
+        events: Rc::clone(&events),
+    }));
+    let mut state = yserver_core::server::ServerState::new();
+
+    Backend::begin_vt_release(&mut backend);
+    Backend::finish_vt_release(
+        &mut backend,
+        &mut state,
+        &yserver_core::core_loop::input_inventory::InputInventory::default(),
+    );
+
+    let off = recorder
+        .records()
+        .into_iter()
+        .find(|record| has_vrr_property(record, crtc))
+        .expect("VT release sends the production-built output disable");
+    assert!(contains_vrr_property(&off, crtc, 0));
+    assert_eq!(off.result, ScriptedResult::Ok);
+    assert!(
+        !backend.platform.outputs[0].output.vrr_committed.get(),
+        "accepted off commit updates the cached kernel-held value"
+    );
+    let events = events.borrow();
+    assert!(
+        events.iter().position(|event| *event == "atomic_submit")
+            < events.iter().position(|event| *event == "release_master"),
+        "the all-off commit is submitted before DRM master is released"
+    );
+    assert_eq!(
+        backend.pstate.vt_state,
+        crate::vt::state::VtState::Suspended,
+        "the VT release reaches its suspended end state"
+    );
+}
+
+#[test]
+// Mutation: omit VRR_ENABLED = 0 from disable_all_outputs_on_device; shutdown's device commit must fail this assertion.
+fn vrr_shutdown_clears() {
+    let mut backend = vrr_backend();
+    let crtc = backend.platform.outputs[0].output.crtc;
+    backend.platform.outputs[0].output.vrr_committed.set(true);
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let recorder = new_power_recorder();
+    install_recording_power(&mut backend, Rc::clone(&recorder), 1, events);
+
+    backend
+        .disable_output()
+        .expect("shutdown disables the device");
+
+    let clear = recorder
+        .records()
+        .into_iter()
+        .find(|record| has_vrr_property(record, crtc))
+        .expect("device-wide shutdown commit carries the inherited VRR property");
+    assert!(contains_vrr_property(&clear, crtc, 0));
+    assert_eq!(clear.result, ScriptedResult::Ok);
+    assert!(
+        backend.platform.shutting_down,
+        "Backend completed shutdown teardown"
+    );
+}
+
+#[test]
+// Mutation: skip the one stripped retry after a rejected VRR clear; release must still reach its suspended end state.
+fn vrr_clear_rejected_release_completes() {
+    super::recording_scene::init_tearing_test_logger();
+    super::recording_scene::clear_vrr_test_logs();
+    let mut backend = vrr_backend();
+    let crtc = backend.platform.outputs[0].output.crtc;
+    backend.platform.outputs[0].output.vrr_committed.set(true);
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let recorder = new_power_recorder();
+    install_recording_power(&mut backend, Rc::clone(&recorder), 1, Rc::clone(&events));
+    recorder.script_result(Err(io::Error::from_raw_os_error(libc::EIO)));
+    backend.for_tests_set_vt_resume_executor(Rc::new(KernelVrrVtResume {
+        snapshots: backend_snapshot(&backend),
+        kernel_vrr: 1,
+        events: Rc::clone(&events),
+    }));
+    let mut state = yserver_core::server::ServerState::new();
+
+    Backend::begin_vt_release(&mut backend);
+    Backend::finish_vt_release(
+        &mut backend,
+        &mut state,
+        &yserver_core::core_loop::input_inventory::InputInventory::default(),
+    );
+
+    let records = recorder.records();
+    let attempts: Vec<_> = records
+        .iter()
+        .filter(|record| record.kind == AtomicCommitKind::Scene)
+        .collect();
+    assert_eq!(attempts.len(), 2, "the rejected clear gets one retry");
+    assert!(contains_vrr_property(attempts[0], crtc, 0));
+    assert!(matches!(
+        attempts[0].result,
+        ScriptedResult::Error {
+            raw_os_error: Some(error),
+            ..
+        } if error == libc::EIO
+    ));
+    assert!(!has_vrr_property(attempts[1], crtc));
+    assert_eq!(attempts[1].result, ScriptedResult::Ok);
+    assert!(
+        backend.platform.outputs[0].output.vrr_committed.get(),
+        "a successful retry without VRR leaves the cached value unchanged"
+    );
+    assert_eq!(
+        backend.pstate.vt_state,
+        crate::vt::state::VtState::Suspended,
+        "the failed clear and stripped retry do not block VT release"
+    );
+    let events = events.borrow();
+    let release = events
+        .iter()
+        .position(|event| *event == "release_master")
+        .expect("VT release drops DRM master");
+    assert!(
+        events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| **event == "atomic_submit")
+            .all(|(index, _)| index < release),
+        "both clear attempts precede release_master"
+    );
+    assert!(
+        super::recording_scene::vrr_test_logs().contains(&format!(
+            "kms: vrr clear rejected on CRTC {}:",
+            u32::from(crtc)
+        )),
+        "the rejected release clear is logged"
+    );
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: leave vrr_committed true after an accepted DPMS clear; the output end-state assertion must fail.
+fn vrr_dpms_off_clears_and_direct_frame_reenables() {
+    let Some((fixture, direct)) = direct_fixture(18_010, 0) else {
+        eprintln!(
+            "SKIP vrr_dpms_off_clears_and_direct_frame_reenables: no Vulkan scene fixture available"
+        );
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    set_vrr_capable(&mut fixture);
+    let fd = super::direct_unflip::fd(&fixture);
+    let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    let recorder = fixture.events.recorders[&fd].clone();
+    let events = Rc::new(RefCell::new(Vec::new()));
+    install_recording_power(&mut fixture.events.backend, Rc::clone(&recorder), 0, events);
+
+    let initial = accepted_direct_record(&mut fixture, &direct, fd);
+    let initial_id = super::support::accepted_event_id(&initial).expect("initial direct event ID");
+    super::direct_unflip::complete_direct_initial(&mut fixture, &initial, initial_id, fd);
+    super::direct_unflip::drain_present_notifications(
+        &mut fixture,
+        &[direct.candidate.present_id],
+        &[],
+    );
+
+    let dpms_offset = recorder.records().len();
+    Backend::set_dpms_power(&mut fixture.events.backend, 3).expect("DPMS off through Backend");
+    let dpms_clear = recorder.records()[dpms_offset..]
+        .iter()
+        .find(|record| contains_vrr_property(record, crtc, 0))
+        .cloned()
+        .expect("DPMS off commit clears VRR_ENABLED");
+    assert_eq!(dpms_clear.result, ScriptedResult::Ok);
+    assert!(
+        !fixture.events.backend.platform.outputs[0]
+            .output
+            .vrr_committed
+            .get(),
+        "accepted DPMS off commit records VRR as disabled"
+    );
+    super::direct_unflip::drain_present_notifications(
+        &mut fixture,
+        &[],
+        &[direct.candidate.present_id],
+    );
+
+    Backend::set_dpms_power(&mut fixture.events.backend, 0).expect("DPMS on through Backend");
+    let resumed_direct = fixture.install_direct_present(18_011, 0);
+    let direct_frame = accepted_direct_record(&mut fixture, &resumed_direct, fd);
+    assert!(contains_vrr_property(&direct_frame, crtc, 1));
+    assert!(
+        fixture.events.backend.platform.outputs[0]
+            .output
+            .vrr_committed
+            .get(),
+        "the next direct frame restores the committed VRR state"
+    );
+    let resumed_id = super::support::accepted_event_id(&direct_frame)
+        .expect("post-DPMS direct commit has an event ID");
+    super::direct_unflip::complete_direct_initial(&mut fixture, &direct_frame, resumed_id, fd);
+    super::direct_unflip::drain_present_notifications(
+        &mut fixture,
+        &[resumed_direct.candidate.present_id],
+        &[],
+    );
+    finish_direct_scanout(&mut fixture, &resumed_direct, fd);
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+// Mutation: skip refresh_vrr_committed_from_kernel after device-wide disable; the inherited value must be observed.
+fn vrr_vt_acquire_reads_value_left_by_other_master() {
+    let mut backend = vrr_backend();
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let recorder = new_power_recorder();
+    install_recording_power(&mut backend, Rc::clone(&recorder), 1, Rc::clone(&events));
+    backend.for_tests_set_vt_resume_executor(Rc::new(KernelVrrVtResume {
+        snapshots: backend_snapshot(&backend),
+        kernel_vrr: 1,
+        events: Rc::clone(&events),
+    }));
+    let mut state = yserver_core::server::ServerState::new();
+
+    // Enter the suspended state through Backend before modeling a value left
+    // by the other master; on_vt_acquire is a no-op while already Active.
+    Backend::begin_vt_release(&mut backend);
+    Backend::finish_vt_release(
+        &mut backend,
+        &mut state,
+        &yserver_core::core_loop::input_inventory::InputInventory::default(),
+    );
+    backend.platform.outputs[0].output.vrr_committed.set(false);
+    recorder.clear_records();
+    events.borrow_mut().clear();
+    recorder.script_result(Err(io::Error::from_raw_os_error(libc::EIO)));
+    recorder.script_result(Err(io::Error::from_raw_os_error(libc::EIO)));
+
+    Backend::on_vt_acquire(&mut backend, &mut state);
+
+    let crtc = backend.platform.outputs[0].output.crtc;
+    let attempts: Vec<_> = recorder
+        .records()
+        .into_iter()
+        .filter(|record| record.kind == AtomicCommitKind::Scene)
+        .collect();
+    assert_eq!(attempts.len(), 2, "the refused device clear gets one retry");
+    assert!(contains_vrr_property(&attempts[0], crtc, 0));
+    assert!(matches!(
+        attempts[0].result,
+        ScriptedResult::Error {
+            raw_os_error: Some(error),
+            ..
+        } if error == libc::EIO
+    ));
+    assert!(!has_vrr_property(&attempts[1], crtc));
+    assert!(matches!(
+        attempts[1].result,
+        ScriptedResult::Error {
+            raw_os_error: Some(error),
+            ..
+        } if error == libc::EIO
+    ));
+    assert!(
+        backend.platform.outputs[0].output.vrr_committed.get(),
+        "VT acquire refreshes the value left by the previous DRM master"
+    );
+    let events = events.borrow();
+    let read = events
+        .iter()
+        .position(|event| *event == "read_vrr_enabled")
+        .expect("VT acquire reads VRR_ENABLED from the CRTC");
+    assert!(
+        events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| **event == "atomic_submit")
+            .all(|(index, _)| index < read),
+        "the refresh follows the device-wide clear attempt"
+    );
 }
 
 fn accepted_direct_record(

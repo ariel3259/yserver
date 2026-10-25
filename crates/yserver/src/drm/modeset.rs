@@ -299,14 +299,16 @@ impl Output {
 
     /// Refresh the committed value after regaining DRM master, when another
     /// master may have changed `VRR_ENABLED` while this server was away.
-    #[allow(dead_code, reason = "VT acquire invokes this in VRR task 3")]
-    pub(crate) fn refresh_vrr_committed_from_kernel(&self, device: &Device) {
+    pub(crate) fn refresh_vrr_committed_from_kernel(
+        &self,
+        read_property: impl FnOnce(property::Handle) -> io::Result<Option<u64>>,
+    ) {
         let Some(property) = self.crtc_vrr_enabled_prop else {
             self.vrr_committed.set(false);
             return;
         };
-        let properties = match device.get_properties(self.crtc) {
-            Ok(properties) => properties,
+        let value = match read_property(property) {
+            Ok(value) => value,
             Err(error) => {
                 log::warn!(
                     "kms: could not refresh VRR_ENABLED for CRTC {:?}: {error}",
@@ -315,8 +317,8 @@ impl Output {
                 return;
             }
         };
-        if let Some((_, value)) = properties.iter().find(|(id, _)| **id == property) {
-            self.vrr_committed.set(*value != 0);
+        if let Some(value) = value {
+            self.vrr_committed.set(value != 0);
             self.vrr_clear_retry_used.set(false);
         } else {
             log::warn!(
@@ -1519,25 +1521,61 @@ impl PropMap {
     }
 }
 
-pub fn disable_output(device: &Device, output: &Output) -> io::Result<()> {
+pub(crate) fn disable_output(
+    device: &Device,
+    output: &Output,
+    submit: impl FnMut(AtomicCommitRequest) -> io::Result<()>,
+) -> io::Result<()> {
     let connector_props = PropMap::for_object(device, output.connector)?;
     let crtc_props = PropMap::for_object(device, output.crtc)?;
+    disable_output_with_properties(output, &connector_props, &crtc_props, submit).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("disable_output atomic commit rejected: {err}"),
+        )
+    })
+}
 
-    let mut req = AtomicModeReq::new();
-    req.add_raw_property(output.plane.into(), output.plane_fb_id_prop, 0);
-    req.add_raw_property(output.plane.into(), output.plane_crtc_id_prop, 0);
-    req.add_raw_property(output.crtc.into(), crtc_props.id("ACTIVE")?, 0);
-    req.add_raw_property(output.crtc.into(), crtc_props.id("MODE_ID")?, 0);
-    req.add_raw_property(output.connector.into(), connector_props.id("CRTC_ID")?, 0);
-
-    device
-        .atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req)
-        .map_err(|err| {
-            io::Error::new(
-                err.kind(),
-                format!("disable_output atomic commit rejected: {err}"),
-            )
-        })
+/// Build the per-output all-off request from discovered property maps. The
+/// production wrapper supplies maps read from the device; backend tests pass
+/// maps from their fixture and record this same production-built request.
+pub(crate) fn disable_output_with_properties(
+    output: &Output,
+    connector_props: &PropMap,
+    crtc_props: &PropMap,
+    mut submit: impl FnMut(AtomicCommitRequest) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut request = AtomicCommitRequest::new();
+    request.add_raw_property(output.plane.into(), output.plane_fb_id_prop, 0);
+    request.add_raw_property(output.plane.into(), output.plane_crtc_id_prop, 0);
+    request.add_raw_property(output.crtc.into(), crtc_props.id("ACTIVE")?, 0);
+    request.add_raw_property(output.crtc.into(), crtc_props.id("MODE_ID")?, 0);
+    request.add_raw_property(output.connector.into(), connector_props.id("CRTC_ID")?, 0);
+    let vrr_property = output
+        .vrr_committed
+        .get()
+        .then_some(output.crtc_vrr_enabled_prop)
+        .flatten();
+    let request_without_vrr = vrr_property.map(|_| request.clone());
+    if let Some(property) = vrr_property {
+        request.add_raw_property(output.crtc.into(), property, 0);
+    }
+    match submit(request) {
+        Ok(()) => {
+            if vrr_property.is_some() {
+                output.vrr_committed.set(false);
+            }
+            Ok(())
+        }
+        Err(error) if let Some(request_without_vrr) = request_without_vrr => {
+            log::warn!(
+                "kms: vrr clear rejected on CRTC {}: {error}",
+                u32::from(output.crtc)
+            );
+            submit(request_without_vrr)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Turn every CRTC, connector and plane of `device` off in one
@@ -1552,31 +1590,82 @@ pub fn disable_output(device: &Device, output: &Output) -> io::Result<()> {
 /// hw/xfree86/drivers/modesetting/drmmode_display.c:3765-3770) and sets the
 /// used ones from scratch; clearing the whole device first gives the
 /// per-output commits that clean state.
-pub fn disable_all_outputs_on_device(device: &Device) -> io::Result<()> {
+pub(crate) fn disable_all_outputs_on_device(
+    device: &Device,
+    submit: impl FnMut(AtomicCommitRequest) -> io::Result<()>,
+) -> io::Result<()> {
     let resources = device.resource_handles()?;
-    let mut req = AtomicModeReq::new();
-    for plane in device.plane_handles()? {
-        let props = PropMap::for_object(device, plane)?;
-        req.add_raw_property(plane.into(), props.id("FB_ID")?, 0);
-        req.add_raw_property(plane.into(), props.id("CRTC_ID")?, 0);
+    let planes = device
+        .plane_handles()?
+        .into_iter()
+        .map(|plane| Ok((plane, PropMap::for_object(device, plane)?)))
+        .collect::<io::Result<Vec<_>>>()?;
+    let crtcs = resources
+        .crtcs()
+        .iter()
+        .copied()
+        .map(|crtc| Ok((crtc, PropMap::for_object(device, crtc)?)))
+        .collect::<io::Result<Vec<_>>>()?;
+    let connectors = resources
+        .connectors()
+        .iter()
+        .copied()
+        .map(|connector| Ok((connector, PropMap::for_object(device, connector)?)))
+        .collect::<io::Result<Vec<_>>>()?;
+    disable_all_outputs_with_properties(planes, crtcs, connectors, submit).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("device-wide disable atomic commit rejected: {err}"),
+        )
+    })
+}
+
+/// Build the device-wide all-off request from discovered property maps. This
+/// is shared with the production wrapper so tests can record requests without
+/// asking a real KMS device for its object properties.
+pub(crate) fn disable_all_outputs_with_properties(
+    planes: Vec<(plane::Handle, PropMap)>,
+    crtcs: Vec<(crtc::Handle, PropMap)>,
+    connectors: Vec<(connector::Handle, PropMap)>,
+    mut submit: impl FnMut(AtomicCommitRequest) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut request = AtomicCommitRequest::new();
+    for (plane, props) in planes {
+        request.add_raw_property(plane.into(), props.id("FB_ID")?, 0);
+        request.add_raw_property(plane.into(), props.id("CRTC_ID")?, 0);
     }
-    for &crtc in resources.crtcs() {
-        let props = PropMap::for_object(device, crtc)?;
-        req.add_raw_property(crtc.into(), props.id("ACTIVE")?, 0);
-        req.add_raw_property(crtc.into(), props.id("MODE_ID")?, 0);
+    for (crtc, props) in &crtcs {
+        request.add_raw_property((*crtc).into(), props.id("ACTIVE")?, 0);
+        request.add_raw_property((*crtc).into(), props.id("MODE_ID")?, 0);
     }
-    for &connector in resources.connectors() {
-        let props = PropMap::for_object(device, connector)?;
-        req.add_raw_property(connector.into(), props.id("CRTC_ID")?, 0);
+    for (connector, props) in connectors {
+        request.add_raw_property(connector.into(), props.id("CRTC_ID")?, 0);
     }
-    device
-        .atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req)
-        .map_err(|err| {
-            io::Error::new(
-                err.kind(),
-                format!("device-wide disable atomic commit rejected: {err}"),
-            )
-        })
+    let request_without_vrr = request.clone();
+    let mut vrr_crtcs = Vec::new();
+    for (crtc, props) in &crtcs {
+        if props.value("VRR_ENABLED") == Some(1)
+            && let Ok(property) = props.id("VRR_ENABLED")
+        {
+            request.add_raw_property((*crtc).into(), property, 0);
+            vrr_crtcs.push(*crtc);
+        }
+    }
+    if vrr_crtcs.is_empty() {
+        return submit(request);
+    }
+    match submit(request) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            for crtc in vrr_crtcs {
+                log::warn!(
+                    "kms: vrr clear rejected on CRTC {}: {error}",
+                    u32::from(crtc)
+                );
+            }
+            submit(request_without_vrr)
+        }
+    }
 }
 
 /// Log what the kernel currently holds on `device` (every CRTC, connector

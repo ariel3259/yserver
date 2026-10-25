@@ -328,6 +328,16 @@ impl AtomicCommitRequest {
         self.request.submit(device.as_fd(), flags, self.user_data)
     }
 
+    /// Convert the recorded updates to the drm crate's request so operations
+    /// with a small submit seam can still use `Device::atomic_commit`.
+    pub(crate) fn into_atomic_mode_req(self) -> drm::control::atomic::AtomicModeReq {
+        let mut request = drm::control::atomic::AtomicModeReq::new();
+        for update in self.properties {
+            request.add_raw_property(update.object, update.property, update.value);
+        }
+        request
+    }
+
     fn attribution_snapshot(&self) -> CommitAttributionSnapshot {
         CommitAttributionSnapshot {
             properties: self.properties.clone(),
