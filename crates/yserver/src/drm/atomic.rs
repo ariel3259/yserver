@@ -1681,13 +1681,9 @@ fn latency_percentiles(values: &[u64]) -> (u64, u64, u64) {
 }
 
 fn flip_interval_min_p50_max(values: &[u64]) -> (u64, u64, u64) {
-    let mut sorted = values.to_vec();
-    sorted.sort_unstable();
-    let Some(min) = sorted.first().copied() else {
-        return (0, 0, 0);
-    };
-    let p50_index = sorted.len().div_ceil(2).saturating_sub(1);
-    (min, sorted[p50_index], sorted.last().copied().unwrap_or(0))
+    let min = values.iter().copied().min().unwrap_or(0);
+    let (p50, _, max) = latency_percentiles(values);
+    (min, p50, max)
 }
 
 fn flip_latency_percentiles(values: &[u64]) -> (String, String, String) {
