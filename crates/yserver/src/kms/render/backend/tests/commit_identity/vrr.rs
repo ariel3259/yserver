@@ -18,10 +18,13 @@ use crate::{
 };
 use std::{
     cell::RefCell,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io,
     rc::Rc,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU16, AtomicU64, Ordering},
+    },
     time::Duration,
 };
 use yserver_core::backend::{Backend, ModeSpec};
@@ -843,6 +846,210 @@ fn direct_fixture_with_vrr_mode(
     Some((fixture, direct))
 }
 
+fn present_request_state(
+    direct: &super::recording_scene::DirectPresentSetup,
+) -> yserver_core::server::ServerState {
+    use yserver_core::{
+        backend::{PixmapHandle, WindowHandle},
+        randr::{RR_ROTATE_0, RandrOutput, RandrState},
+        resources::{ROOT_VISUAL, ROOT_WINDOW},
+        server::{ClientState, ServerState},
+        transport::Transport,
+    };
+    use yserver_protocol::x11::{
+        ClientByteOrder, ClientId, CreatePixmapRequest, CreateWindowRequest, ResourceId,
+    };
+
+    let mut state = ServerState::new();
+    let (writer, _peer) = Transport::pair().expect("test X11 transport");
+    state.clients.insert(
+        1,
+        ClientState {
+            writer: Arc::new(Mutex::new(writer)),
+            is_local: true,
+            fd_passing: true,
+            internal: false,
+            byte_order: ClientByteOrder::LittleEndian,
+            last_sequence: Arc::new(AtomicU16::new(0)),
+            resource_id_base: 0,
+            resource_id_mask: u32::MAX,
+            event_masks: HashMap::new(),
+            save_set: HashSet::new(),
+            big_requests_enabled: false,
+            xi2_masks: HashMap::new(),
+            xi1_event_classes: HashSet::new(),
+            xi1_window_event_classes: HashMap::new(),
+            outbound: Default::default(),
+            watching_writable: false,
+            write_failed: false,
+            focused_window: ROOT_WINDOW,
+            reader_control: None,
+        },
+    );
+    let window = direct.target_xid;
+    let pixmap = direct.candidate.src_pixmap_xid;
+    let width = direct.candidate.src_width;
+    let height = direct.candidate.src_height;
+    state.resources.create_window(
+        ClientId(1),
+        CreateWindowRequest {
+            depth: 24,
+            window: ResourceId(window),
+            parent: ROOT_WINDOW,
+            width,
+            height,
+            class: 1,
+            visual: ROOT_VISUAL,
+            ..Default::default()
+        },
+    );
+    let _ = state.resources.map_window(ResourceId(window));
+    state
+        .resources
+        .window_mut(ResourceId(window))
+        .expect("direct destination window")
+        .host_xid = WindowHandle::from_raw(window);
+    state.resources.create_pixmap(
+        ClientId(1),
+        CreatePixmapRequest {
+            depth: 24,
+            pixmap: ResourceId(pixmap),
+            drawable: ResourceId(window),
+            width,
+            height,
+        },
+    );
+    assert!(state.resources.set_pixmap_host_xid(
+        ResourceId(pixmap),
+        PixmapHandle::from_raw(pixmap).expect("direct source pixmap host xid"),
+    ));
+    let crtc_id = direct.candidate.crtc_id;
+    let output = RandrOutput {
+        name: "test-vrr".to_owned(),
+        output_id: 1,
+        crtc_id,
+        mode_id: crtc_id.wrapping_add(0x1000),
+        connected: true,
+        x: 0,
+        y: 0,
+        width,
+        height,
+        vrefresh: 60,
+        timing: None,
+        mm_width: 0,
+        mm_height: 0,
+        mode_ids: vec![crtc_id.wrapping_add(0x1000)],
+        num_preferred: 1,
+        pending_transform: Default::default(),
+        current_transform: Default::default(),
+        rotation: RR_ROTATE_0,
+    };
+    state.randr = RandrState::from_outputs(1, vec![output]);
+    state.randr.primary_output = 1;
+    state
+}
+
+fn request_vrr_property(
+    state: &mut yserver_core::server::ServerState,
+    backend: &mut KmsBackend,
+    window: u32,
+    property: u32,
+    property_type: u32,
+    format: u8,
+    items: &[u32],
+    sequence: u16,
+) {
+    use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
+
+    let mut body = vec![0_u8; 20];
+    body[0..4].copy_from_slice(&window.to_le_bytes());
+    body[4..8].copy_from_slice(&property.to_le_bytes());
+    body[8..12].copy_from_slice(&property_type.to_le_bytes());
+    body[12] = format;
+    body[16..20].copy_from_slice(&u32::try_from(items.len()).unwrap().to_le_bytes());
+    for item in items {
+        match format {
+            8 => body.push(u8::try_from(*item).unwrap()),
+            _ => body.extend_from_slice(&item.to_le_bytes()),
+        }
+    }
+    while !body.len().is_multiple_of(4) {
+        body.push(0);
+    }
+    yserver_core::core_loop::process_request::process_request(
+        state,
+        backend,
+        ClientId(1),
+        SequenceNumber(sequence),
+        RequestHeader {
+            opcode: 18,
+            data: 0,
+            length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+        },
+        &body,
+        None,
+    )
+    .expect("ChangeProperty request");
+}
+
+fn delete_vrr_property(
+    state: &mut yserver_core::server::ServerState,
+    backend: &mut KmsBackend,
+    window: u32,
+    property: u32,
+    sequence: u16,
+) {
+    use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
+
+    let mut body = Vec::with_capacity(8);
+    body.extend_from_slice(&window.to_le_bytes());
+    body.extend_from_slice(&property.to_le_bytes());
+    yserver_core::core_loop::process_request::process_request(
+        state,
+        backend,
+        ClientId(1),
+        SequenceNumber(sequence),
+        RequestHeader {
+            opcode: 19,
+            data: 0,
+            length_units: 3,
+        },
+        &body,
+        None,
+    )
+    .expect("DeleteProperty request");
+}
+
+fn request_present(
+    state: &mut yserver_core::server::ServerState,
+    backend: &mut KmsBackend,
+    window: u32,
+    pixmap: u32,
+    serial: u32,
+    sequence: u16,
+) {
+    use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber, present as x11present};
+
+    let mut body = vec![0_u8; 68];
+    body[0..4].copy_from_slice(&window.to_le_bytes());
+    body[4..8].copy_from_slice(&pixmap.to_le_bytes());
+    body[8..12].copy_from_slice(&serial.to_le_bytes());
+    yserver_core::core_loop::process_request::process_request(
+        state,
+        backend,
+        ClientId(1),
+        SequenceNumber(sequence),
+        RequestHeader {
+            opcode: 145,
+            data: x11present::PIXMAP,
+            length_units: 18,
+        },
+        &body,
+        None,
+    )
+    .expect("Present request");
+}
+
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: default VRR mode to All; no direct commit may enable it by default.
@@ -930,7 +1137,7 @@ fn vrr_off_mode_still_clears_inherited() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: ignore variable_refresh in Property mode; the allowed direct frame must enable VRR.
+// Mutation: ignore variable_refresh in Property mode; the allowed first direct frame must enable VRR.
 fn vrr_property_mode_requires_cardinal_one() {
     let Some((fixture, mut direct)) =
         direct_fixture_with_vrr_mode(18_103, 0, crate::launch::VrrMode::Property)
@@ -944,35 +1151,69 @@ fn vrr_property_mode_requires_cardinal_one() {
     set_vrr_capable(&mut fixture);
     let fd = super::direct_unflip::fd(&fixture);
     let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    let mut state = present_request_state(&direct);
+    let window = direct.target_xid;
+    let pixmap = direct.candidate.src_pixmap_xid;
+    let property = state.atoms.intern("_VARIABLE_REFRESH", false).0;
+    Backend::note_present_scanout_candidate(&mut fixture.events.backend, direct.candidate);
+    let width = direct.candidate.src_width;
+    let height = direct.candidate.src_height;
+    let crtc_handle = handle(direct.candidate.crtc_id);
+    let shape = crate::drm::async_flip::AsyncShape {
+        fourcc: 0x3432_5258,
+        modifier: 0,
+        pitch: u32::from(width) * 4,
+        width: u32::from(width),
+        height: u32::from(height),
+        crtcs: vec![crtc_handle],
+        direct: true,
+    };
+    fixture.events.backend.pstate.scanout_m1.entries.insert(
+        direct.source_id,
+        crate::kms::render::backend::ScanoutM1ProbeEntry::accepted_with_shape(
+            crate::drm::modeset::DirectScanoutProbeFramebuffer::for_tests(
+                super::recording_scene::raw(0x8130),
+            ),
+            shape,
+        ),
+    );
+    request_vrr_property(
+        &mut state,
+        &mut fixture.events.backend,
+        window,
+        property,
+        yserver_core::xinput::XA_CARDINAL.0,
+        32,
+        &[1],
+        1,
+    );
 
-    let no_property = accepted_direct_record(&mut fixture, &direct, fd);
-    assert!(
-        !contains_vrr_property(&no_property, crtc, 1),
-        "a direct Present without _VARIABLE_REFRESH does not enable VRR"
+    // The permission comes from the same ChangeProperty -> Present request
+    // path used by clients. The first direct frame accepted after the
+    // existing probation must carry VRR_ENABLED=1.
+    let first_request_serial = u32::try_from(direct.candidate.present_id).unwrap();
+    fixture
+        .events
+        .backend
+        .pstate
+        .scanout_m2
+        .eligible_root_streak = crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1;
+    let start = super::direct_unflip::record_count(&fixture, fd);
+    request_present(
+        &mut state,
+        &mut fixture.events.backend,
+        window,
+        pixmap,
+        first_request_serial,
+        2,
     );
-    assert!(
-        !fixture.events.backend.platform.outputs[0]
-            .output
-            .vrr_committed
-            .get(),
-        "the rejected-property cases keep the committed value off"
-    );
-    let id = super::support::accepted_event_id(&no_property).expect("first direct event ID");
-    super::direct_unflip::complete_direct_initial(&mut fixture, &no_property, id, fd);
-    super::direct_unflip::drain_present_notifications(
-        &mut fixture,
-        &[direct.candidate.present_id],
-        &[],
-    );
-
-    // The core request-path test covers ChangeProperty values 0, 2, wrong
-    // type, wrong format, and CARDINAL/32 value 1. Feed that final allowed
-    // candidate into KMS through Backend::try_present_direct here.
-    direct.candidate.variable_refresh = true;
-    let enabled = submit_direct_successor(&mut fixture, &mut direct, fd);
+    let enabled = super::direct_unflip::records_since(&fixture, fd, start)
+        .into_iter()
+        .find(|record| super::support::accepted_event_id(record).is_some())
+        .expect("first direct Present request is accepted through Backend");
     assert!(
         contains_vrr_property(&enabled, crtc, 1),
-        "CARDINAL/32 value 1 enables VRR on its direct commit"
+        "the first direct commit from a CARDINAL/32 value 1 Present enables VRR"
     );
     assert!(
         fixture.events.backend.platform.outputs[0]
@@ -983,12 +1224,104 @@ fn vrr_property_mode_requires_cardinal_one() {
     );
     let id = super::support::accepted_event_id(&enabled).expect("enabled direct event ID");
     super::direct_unflip::complete_direct_initial(&mut fixture, &enabled, id, fd);
-    let previous_present_id = direct.candidate.present_id - 1;
+    super::direct_unflip::drain_present_notifications(&mut fixture, &[1], &[]);
+
+    let invalid_property_values = [
+        (yserver_core::xinput::XA_CARDINAL.0, 32, vec![0]),
+        (yserver_core::xinput::XA_CARDINAL.0, 32, vec![]),
+        (yserver_core::xinput::XA_CARDINAL.0, 32, vec![2]),
+        (yserver_core::xinput::XA_INTEGER.0, 32, vec![1]),
+        (yserver_core::xinput::XA_CARDINAL.0, 8, vec![1]),
+    ];
+    let mut previous_present_id = 1_u64;
+    let mut previous_request_serial = first_request_serial;
+    let mut sequence = 10_u16;
+    for (case_index, (property_type, format, values)) in
+        invalid_property_values.into_iter().enumerate()
+    {
+        request_vrr_property(
+            &mut state,
+            &mut fixture.events.backend,
+            window,
+            property,
+            property_type,
+            format,
+            &values,
+            sequence,
+        );
+        let request_serial = previous_request_serial + 1;
+        let present_id = previous_present_id + 1;
+        let offset = super::direct_unflip::record_count(&fixture, fd);
+        request_present(
+            &mut state,
+            &mut fixture.events.backend,
+            window,
+            pixmap,
+            request_serial,
+            sequence + 1,
+        );
+        let record = super::direct_unflip::records_since(&fixture, fd, offset)
+            .into_iter()
+            .find(|record| super::support::accepted_event_id(record).is_some())
+            .expect("request-driven direct successor is accepted");
+        assert!(
+            !contains_vrr_property(&record, crtc, 1),
+            "property case {case_index} must not set VRR_ENABLED"
+        );
+        if case_index == 0 {
+            assert!(
+                contains_vrr_property(&record, crtc, 0),
+                "changing from CARDINAL/32 value 1 to value 0 clears the committed VRR value"
+            );
+        }
+        let event_id = super::support::accepted_event_id(&record).expect("successor event ID");
+        super::direct_unflip::complete_direct_initial(&mut fixture, &record, event_id, fd);
+        super::direct_unflip::drain_present_notifications(
+            &mut fixture,
+            &[present_id],
+            &[previous_present_id],
+        );
+        previous_present_id = present_id;
+        previous_request_serial = request_serial;
+        sequence += 2;
+    }
+
+    delete_vrr_property(
+        &mut state,
+        &mut fixture.events.backend,
+        window,
+        property,
+        sequence,
+    );
+    let request_serial = previous_request_serial + 1;
+    let present_id = previous_present_id + 1;
+    let offset = super::direct_unflip::record_count(&fixture, fd);
+    request_present(
+        &mut state,
+        &mut fixture.events.backend,
+        window,
+        pixmap,
+        request_serial,
+        sequence + 1,
+    );
+    let no_property = super::direct_unflip::records_since(&fixture, fd, offset)
+        .into_iter()
+        .find(|record| super::support::accepted_event_id(record).is_some())
+        .expect("property-less request-driven direct successor is accepted");
+    assert!(
+        !contains_vrr_property(&no_property, crtc, 1),
+        "a missing _VARIABLE_REFRESH property must not set VRR_ENABLED"
+    );
+    let event_id = super::support::accepted_event_id(&no_property).expect("successor event ID");
+    super::direct_unflip::complete_direct_initial(&mut fixture, &no_property, event_id, fd);
     super::direct_unflip::drain_present_notifications(
         &mut fixture,
-        &[direct.candidate.present_id],
+        &[present_id],
         &[previous_present_id],
     );
+    direct.candidate.present_id = present_id;
+    direct.event.present_id = present_id;
+    direct.event.serial = request_serial;
     finish_direct_scanout(&mut fixture, &direct, fd);
     fixture.finish_after_normal_drain();
 }

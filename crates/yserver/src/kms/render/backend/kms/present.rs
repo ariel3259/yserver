@@ -894,7 +894,6 @@ impl KmsBackend {
             source_id,
             candidate,
             target,
-            variable_refresh: candidate.variable_refresh,
             present_received_at,
             present_received_monotonic,
             fallback_target,

@@ -941,7 +941,7 @@ pub(super) fn execute_present_pixmap_copy(
             value.r#type == crate::xinput::XA_CARDINAL
                 && value.format == crate::properties::PropertyFormat::F32
                 && value.data.get(..4).is_some_and(|bytes| {
-                    <[u8; 4]>::try_from(bytes).is_ok_and(|bytes| u32::from_ne_bytes(bytes) == 1)
+                    <[u8; 4]>::try_from(bytes).is_ok_and(|bytes| u32::from_le_bytes(bytes) == 1)
                 })
         });
 

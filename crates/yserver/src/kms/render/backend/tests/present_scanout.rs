@@ -1263,7 +1263,6 @@ fn grouped_direct_waits_all_outputs_and_uses_selected_reference_sample() {
         source_id,
         candidate,
         target: crate::kms::render::backend::ScanoutM0Target::Unredirected,
-        variable_refresh: false,
         present_received_at: std::time::Instant::now(),
         present_received_monotonic: None,
         fallback_target: PaintTarget::new(fallback_id, (0, 0), None, 24),

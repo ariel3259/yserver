@@ -914,7 +914,7 @@ impl KmsBackend {
         let vrr_wanted = frame.target == ScanoutM0Target::Unredirected
             && match self.pstate.vrr_mode {
                 crate::launch::VrrMode::Off => false,
-                crate::launch::VrrMode::Property => frame.variable_refresh,
+                crate::launch::VrrMode::Property => frame.candidate.variable_refresh,
                 crate::launch::VrrMode::All => true,
             };
         let vrr_before = self.vrr_committed_snapshot();

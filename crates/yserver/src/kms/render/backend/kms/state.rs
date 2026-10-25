@@ -224,8 +224,6 @@ pub(in crate::kms::render::backend) struct DirectPresentFrame {
     pub(in crate::kms::render::backend) candidate: PresentScanoutCandidate,
     /// M0 ownership classification for the transaction being submitted.
     pub(in crate::kms::render::backend) target: ScanoutM0Target,
-    /// Whether the client's `_VARIABLE_REFRESH` property allows VRR.
-    pub(in crate::kms::render::backend) variable_refresh: bool,
     /// Backend receipt time retained across the latest-wins direct successor
     /// slot until its atomic submit.
     pub(in crate::kms::render::backend) present_received_at: std::time::Instant,

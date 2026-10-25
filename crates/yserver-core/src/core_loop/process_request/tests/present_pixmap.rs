@@ -5162,7 +5162,7 @@ fn present_to_unviewable_window_skips_copy_and_damage_but_completes() {
 }
 
 #[test]
-// Mutation: ignore the property when building PresentScanoutCandidate, or accept a non-CARDINAL/32 value.
+// Mutation: grant a missing property, decode its bytes as big-endian, or accept a non-CARDINAL/32 value.
 fn present_candidate_reports_variable_refresh_property() {
     use crate::backend::recording::RecordingBackend;
     use yserver_protocol::x11::{CreatePixmapRequest, CreateWindowRequest, present as x11present};
@@ -5282,6 +5282,14 @@ fn present_candidate_reports_variable_refresh_property() {
         state.atoms.id_for(PROPERTY_NAME),
         None,
         "Present does not intern the property atom"
+    );
+    assert!(
+        !backend
+            .present_direct_candidates
+            .first()
+            .expect("initial Present reaches Backend")
+            .variable_refresh,
+        "a missing _VARIABLE_REFRESH property does not grant permission"
     );
     let property = state.atoms.intern(PROPERTY_NAME, false).0;
     for (sequence, property_type, format, values, expected) in [
