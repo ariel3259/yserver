@@ -830,6 +830,206 @@ fn direct_fixture(
     )
 }
 
+fn direct_fixture_with_vrr_mode(
+    present_id: u64,
+    options: u32,
+    mode: crate::launch::VrrMode,
+) -> Option<(
+    super::recording_scene::RecordingSceneFixture,
+    super::recording_scene::DirectPresentSetup,
+)> {
+    let (mut fixture, direct) = direct_fixture(present_id, options)?;
+    fixture.events.backend.pstate.vrr_mode = mode;
+    Some((fixture, direct))
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: default VRR mode to All; no direct commit may enable it by default.
+fn vrr_off_mode_never_enables() {
+    let Some((fixture, direct)) =
+        direct_fixture_with_vrr_mode(18_101, 0, crate::launch::VrrMode::default())
+    else {
+        eprintln!("SKIP vrr_off_mode_never_enables: no Vulkan scene fixture available");
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    set_vrr_capable(&mut fixture);
+    let fd = super::direct_unflip::fd(&fixture);
+    let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+
+    let _direct = accepted_direct_record(&mut fixture, &direct, fd);
+    let records = fixture.events.recorders[&fd].records();
+
+    assert!(
+        records
+            .iter()
+            .all(|record| !contains_vrr_property(record, crtc, 1)),
+        "default Off mode never enables VRR on any commit"
+    );
+    assert!(
+        !fixture.events.backend.platform.outputs[0]
+            .output
+            .vrr_committed
+            .get(),
+        "the kernel-held VRR state remains off"
+    );
+    let id = super::support::accepted_event_id(&_direct).expect("direct event ID");
+    super::direct_unflip::complete_direct_initial(&mut fixture, &_direct, id, fd);
+    super::direct_unflip::drain_present_notifications(
+        &mut fixture,
+        &[direct.candidate.present_id],
+        &[],
+    );
+    finish_direct_scanout(&mut fixture, &direct, fd);
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: skip the clear when mode is Off; an inherited 1 must still be cleared.
+fn vrr_off_mode_still_clears_inherited() {
+    let Some((fixture, direct)) =
+        direct_fixture_with_vrr_mode(18_102, 0, crate::launch::VrrMode::Off)
+    else {
+        eprintln!("SKIP vrr_off_mode_still_clears_inherited: no Vulkan scene fixture available");
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    set_vrr_capable(&mut fixture);
+    fixture.events.backend.platform.outputs[0]
+        .output
+        .vrr_committed
+        .set(true);
+    let fd = super::direct_unflip::fd(&fixture);
+    let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+
+    let direct_record = accepted_direct_record(&mut fixture, &direct, fd);
+
+    assert!(
+        contains_vrr_property(&direct_record, crtc, 0),
+        "the next direct commit clears the inherited value in default Off mode"
+    );
+    assert!(
+        !fixture.events.backend.platform.outputs[0]
+            .output
+            .vrr_committed
+            .get(),
+        "the accepted clear updates the recorded kernel-held value"
+    );
+    let id = super::support::accepted_event_id(&direct_record).expect("direct event ID");
+    super::direct_unflip::complete_direct_initial(&mut fixture, &direct_record, id, fd);
+    super::direct_unflip::drain_present_notifications(
+        &mut fixture,
+        &[direct.candidate.present_id],
+        &[],
+    );
+    finish_direct_scanout(&mut fixture, &direct, fd);
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: ignore variable_refresh in Property mode; the allowed direct frame must enable VRR.
+fn vrr_property_mode_requires_cardinal_one() {
+    let Some((fixture, mut direct)) =
+        direct_fixture_with_vrr_mode(18_103, 0, crate::launch::VrrMode::Property)
+    else {
+        eprintln!(
+            "SKIP vrr_property_mode_requires_cardinal_one: no Vulkan scene fixture available"
+        );
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    set_vrr_capable(&mut fixture);
+    let fd = super::direct_unflip::fd(&fixture);
+    let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+
+    let no_property = accepted_direct_record(&mut fixture, &direct, fd);
+    assert!(
+        !contains_vrr_property(&no_property, crtc, 1),
+        "a direct Present without _VARIABLE_REFRESH does not enable VRR"
+    );
+    assert!(
+        !fixture.events.backend.platform.outputs[0]
+            .output
+            .vrr_committed
+            .get(),
+        "the rejected-property cases keep the committed value off"
+    );
+    let id = super::support::accepted_event_id(&no_property).expect("first direct event ID");
+    super::direct_unflip::complete_direct_initial(&mut fixture, &no_property, id, fd);
+    super::direct_unflip::drain_present_notifications(
+        &mut fixture,
+        &[direct.candidate.present_id],
+        &[],
+    );
+
+    // The core request-path test covers ChangeProperty values 0, 2, wrong
+    // type, wrong format, and CARDINAL/32 value 1. Feed that final allowed
+    // candidate into KMS through Backend::try_present_direct here.
+    direct.candidate.variable_refresh = true;
+    let enabled = submit_direct_successor(&mut fixture, &mut direct, fd);
+    assert!(
+        contains_vrr_property(&enabled, crtc, 1),
+        "CARDINAL/32 value 1 enables VRR on its direct commit"
+    );
+    assert!(
+        fixture.events.backend.platform.outputs[0]
+            .output
+            .vrr_committed
+            .get(),
+        "the accepted request records VRR as committed"
+    );
+    let id = super::support::accepted_event_id(&enabled).expect("enabled direct event ID");
+    super::direct_unflip::complete_direct_initial(&mut fixture, &enabled, id, fd);
+    let previous_present_id = direct.candidate.present_id - 1;
+    super::direct_unflip::drain_present_notifications(
+        &mut fixture,
+        &[direct.candidate.present_id],
+        &[previous_present_id],
+    );
+    finish_direct_scanout(&mut fixture, &direct, fd);
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: honor the property in All mode; a property-less direct frame must still enable VRR.
+fn vrr_all_mode_ignores_property() {
+    let Some((fixture, direct)) =
+        direct_fixture_with_vrr_mode(18_104, 0, crate::launch::VrrMode::All)
+    else {
+        eprintln!("SKIP vrr_all_mode_ignores_property: no Vulkan scene fixture available");
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    set_vrr_capable(&mut fixture);
+    let fd = super::direct_unflip::fd(&fixture);
+    let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    let direct_record = accepted_direct_record(&mut fixture, &direct, fd);
+
+    assert!(
+        contains_vrr_property(&direct_record, crtc, 1),
+        "All mode enables VRR when the candidate has no property permission"
+    );
+    assert!(
+        fixture.events.backend.platform.outputs[0]
+            .output
+            .vrr_committed
+            .get()
+    );
+    let id = super::support::accepted_event_id(&direct_record).expect("direct event ID");
+    super::direct_unflip::complete_direct_initial(&mut fixture, &direct_record, id, fd);
+    super::direct_unflip::drain_present_notifications(
+        &mut fixture,
+        &[direct.candidate.present_id],
+        &[],
+    );
+    finish_direct_scanout(&mut fixture, &direct, fd);
+    fixture.finish_after_normal_drain();
+}
+
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: never append VRR_ENABLED to an eligible direct frame.

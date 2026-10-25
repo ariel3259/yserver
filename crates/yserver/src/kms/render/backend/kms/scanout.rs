@@ -911,6 +911,12 @@ impl KmsBackend {
         let cursor_positions = self
             .platform
             .cursor_plane_atomic_positions_for_outputs(&output_indices);
+        let vrr_wanted = frame.target == ScanoutM0Target::Unredirected
+            && match self.pstate.vrr_mode {
+                crate::launch::VrrMode::Off => false,
+                crate::launch::VrrMode::Property => frame.variable_refresh,
+                crate::launch::VrrMode::All => true,
+            };
         let vrr_before = self.vrr_committed_snapshot();
         let async_shape = if timing == crate::drm::async_flip::FlipTiming::Async {
             Some(
@@ -944,7 +950,7 @@ impl KmsBackend {
             fb,
             &plane_states,
             &cursor_positions,
-            frame.target == ScanoutM0Target::Unredirected,
+            vrr_wanted,
             attempt_timing,
             crate::drm::atomic::TearingCommitContext::direct(
                 Some(frame.present_received_at),
@@ -972,7 +978,7 @@ impl KmsBackend {
                         fb,
                         &plane_states,
                         &cursor_positions,
-                        frame.target == ScanoutM0Target::Unredirected,
+                        vrr_wanted,
                         crate::drm::async_flip::FlipTiming::Vsync,
                         crate::drm::atomic::TearingCommitContext::direct(
                             Some(frame.present_received_at),

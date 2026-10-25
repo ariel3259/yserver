@@ -113,11 +113,21 @@ impl KmsBackend {
         device_paths: &[std::path::PathBuf],
         console_guard: crate::kms::ConsoleGuardOpt,
         layout: Option<String>,
+        vrr_mode: crate::launch::VrrMode,
     ) -> io::Result<Self> {
+        log::info!(
+            "kms: vrr mode={}",
+            match vrr_mode {
+                crate::launch::VrrMode::Off => "off",
+                crate::launch::VrrMode::Property => "property",
+                crate::launch::VrrMode::All => "all",
+            }
+        );
         Self::open_with_commit(
             device_paths,
             console_guard,
             layout,
+            vrr_mode,
             drm::modeset::commit_modeset,
         )
     }
@@ -126,6 +136,7 @@ impl KmsBackend {
         device_paths: &[std::path::PathBuf],
         console_guard: crate::kms::ConsoleGuardOpt,
         layout: Option<String>,
+        vrr_mode: crate::launch::VrrMode,
         commit: fn(
             &crate::drm::Device,
             &crate::platform::drm::Output,
@@ -156,6 +167,7 @@ impl KmsBackend {
         ));
         let kms_outputs_active = !platform.outputs.is_empty();
         let pstate = KmsBackendState {
+            vrr_mode,
             scanout_m0: ScanoutM0Telemetry::default(),
             scanout_m1: ScanoutM1ProbeCache::new(),
             scanout_m2: ScanoutM2State::new(),

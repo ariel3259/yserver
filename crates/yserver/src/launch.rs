@@ -122,6 +122,9 @@ pub struct LaunchOptions {
     pub show_version: bool,
     /// `-layout NAME` — XKB layout for the startup keymap (Xorg-style).
     pub layout: Option<String>,
+    /// VRR policy for direct scanout: disabled, property-controlled, or all
+    /// client-window direct frames.
+    pub vrr: VrrMode,
     /// What happens when the last established client disconnects:
     /// `-noreset` (the default), `-reset` or `-terminate`. Ordered and
     /// last-wins, like `-listen`/`-nolisten`.
@@ -161,6 +164,18 @@ pub struct LaunchOptions {
     /// ([`has_argv_overrides`]), which a restart from the Settings window
     /// does not keep.
     pub argv_overrides: bool,
+}
+
+/// Command-line policy for adaptive sync on direct-scanned client windows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VrrMode {
+    /// VRR is disabled (the default), but inherited kernel state is cleared.
+    #[default]
+    Off,
+    /// Enable VRR only when `_VARIABLE_REFRESH` is CARDINAL/32 value 1.
+    Property,
+    /// Enable VRR for every client-window direct frame.
+    All,
 }
 
 /// Whether `parsed` (straight from [`parse_args`]) differs from a launch
@@ -265,7 +280,7 @@ fn next_value(it: &mut impl Iterator<Item = String>, flag: &str) -> Result<Strin
 /// for known value-taking flags.
 pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchOptions, String> {
     let mut o = LaunchOptions::default();
-    let mut it = args.into_iter();
+    let mut it = args.into_iter().peekable();
     // XDMCP fields build up alongside `o` as local state, and are only
     // assembled into `o.xdmcp` at the end of the loop: `XdmcpOptions`
     // exists at all only if one of the three query-mode options was
@@ -350,6 +365,13 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchOption
         } else if arg == "--scale" {
             o.scale = parse_scale(&next_value(&mut it, "--scale")?)?;
             o.set_by_argv.scale = true;
+        } else if arg == "--vrr" {
+            o.vrr = if it.peek().is_some_and(|next| next == "all") {
+                let _ = it.next();
+                VrrMode::All
+            } else {
+                VrrMode::Property
+            };
         } else if matches!(arg.as_str(), "--version" | "-version") {
             // Print-and-exit; the binary acts on this before `run()`.
             // Keep scanning so it works regardless of position.
@@ -1537,6 +1559,22 @@ mod tests {
             assert!(parse(&["--scale", bad]).is_err(), "{bad:?}");
         }
         assert!(parse(&["--scale"]).is_err(), "missing value");
+    }
+
+    #[test]
+    // Mutation: default VrrMode to All; parsing no flag must remain Off.
+    fn launch_vrr_flag_forms() {
+        assert_eq!(parse(&[]).unwrap().vrr, VrrMode::Off);
+        assert_eq!(parse(&["--vrr"]).unwrap().vrr, VrrMode::Property);
+        assert_eq!(parse(&["--vrr", "all"]).unwrap().vrr, VrrMode::All);
+        let property_before_display = parse(&["--vrr", ":5"]).unwrap();
+        assert_eq!(property_before_display.vrr, VrrMode::Property);
+        assert_eq!(property_before_display.display, Some(5));
+        assert_eq!(
+            parse(&["--vrr", "all", "--vrr"]).unwrap().vrr,
+            VrrMode::Property
+        );
+        assert_eq!(parse(&["--vrr", "--vrr", "all"]).unwrap().vrr, VrrMode::All);
     }
 
     #[test]

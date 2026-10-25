@@ -5162,6 +5162,160 @@ fn present_to_unviewable_window_skips_copy_and_damage_but_completes() {
 }
 
 #[test]
+// Mutation: ignore the property when building PresentScanoutCandidate, or accept a non-CARDINAL/32 value.
+fn present_candidate_reports_variable_refresh_property() {
+    use crate::backend::recording::RecordingBackend;
+    use yserver_protocol::x11::{CreatePixmapRequest, CreateWindowRequest, present as x11present};
+
+    const WINDOW: u32 = 0x0002_1021;
+    const WINDOW_HOST: u32 = 0x0040_1021;
+    const PIXMAP: u32 = 0x0002_1022;
+    const PIXMAP_HOST: u32 = 0x0040_1022;
+    const PROPERTY_NAME: &str = "_VARIABLE_REFRESH";
+    const CARDINAL: u32 = 6;
+    const INTEGER: u32 = 19;
+
+    let mut state = ServerState::new();
+    let _peer = install_client(&mut state, 1);
+    let mut backend = RecordingBackend::new();
+    backend.present_direct_result = true;
+    state.randr = crate::randr::RandrState::from_outputs(
+        1,
+        vec![present_test_output(1, 11, 0, 0, 100, 100, true)],
+    );
+    state.randr.primary_output = 1;
+    state.resources.create_window(
+        ClientId(1),
+        CreateWindowRequest {
+            depth: 24,
+            window: ResourceId(WINDOW),
+            parent: ROOT_WINDOW,
+            width: 100,
+            height: 100,
+            class: 1,
+            visual: crate::resources::ROOT_VISUAL,
+            ..Default::default()
+        },
+    );
+    let _ = state.resources.map_window(ResourceId(WINDOW));
+    state
+        .resources
+        .window_mut(ResourceId(WINDOW))
+        .expect("destination window")
+        .host_xid = crate::backend::WindowHandle::from_raw(WINDOW_HOST);
+    state.resources.create_pixmap(
+        ClientId(1),
+        CreatePixmapRequest {
+            depth: 24,
+            pixmap: ResourceId(PIXMAP),
+            drawable: ResourceId(WINDOW),
+            width: 100,
+            height: 100,
+        },
+    );
+    assert!(state.resources.set_pixmap_host_xid(
+        ResourceId(PIXMAP),
+        crate::backend::PixmapHandle::from_raw(PIXMAP_HOST).expect("test pixmap host xid"),
+    ));
+
+    fn present(state: &mut ServerState, backend: &mut RecordingBackend, serial: u32) {
+        let mut body = pixmap_body(WINDOW, PIXMAP);
+        body[8..12].copy_from_slice(&serial.to_le_bytes());
+        process_request(
+            state,
+            backend,
+            ClientId(1),
+            SequenceNumber(u16::try_from(serial).unwrap()),
+            RequestHeader {
+                opcode: 145,
+                data: x11present::PIXMAP,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            &body,
+            None,
+        )
+        .expect("Present request");
+    }
+
+    fn change_property(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        property: u32,
+        property_type: u32,
+        format: u8,
+        items: &[u32],
+        sequence: u16,
+    ) {
+        let mut body = vec![0_u8; 20];
+        body[0..4].copy_from_slice(&WINDOW.to_le_bytes());
+        body[4..8].copy_from_slice(&property.to_le_bytes());
+        body[8..12].copy_from_slice(&property_type.to_le_bytes());
+        body[12] = format;
+        body[16..20].copy_from_slice(&u32::try_from(items.len()).unwrap().to_le_bytes());
+        for item in items {
+            match format {
+                8 => body.push(u8::try_from(*item).unwrap()),
+                _ => body.extend_from_slice(&item.to_le_bytes()),
+            }
+        }
+        while !body.len().is_multiple_of(4) {
+            body.push(0);
+        }
+        process_request(
+            state,
+            backend,
+            ClientId(1),
+            SequenceNumber(sequence),
+            RequestHeader {
+                opcode: 18,
+                data: 0,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            &body,
+            None,
+        )
+        .expect("ChangeProperty request");
+    }
+
+    present(&mut state, &mut backend, 1);
+    assert_eq!(
+        state.atoms.id_for(PROPERTY_NAME),
+        None,
+        "Present does not intern the property atom"
+    );
+    let property = state.atoms.intern(PROPERTY_NAME, false).0;
+    for (sequence, property_type, format, values, expected) in [
+        (2, CARDINAL, 32, vec![], false),
+        (3, CARDINAL, 32, vec![0], false),
+        (4, CARDINAL, 32, vec![2], false),
+        (5, INTEGER, 32, vec![1], false),
+        (6, CARDINAL, 8, vec![1], false),
+        (7, CARDINAL, 32, vec![1], true),
+    ] {
+        change_property(
+            &mut state,
+            &mut backend,
+            property,
+            property_type,
+            format,
+            &values,
+            sequence,
+        );
+        present(&mut state, &mut backend, u32::from(sequence) + 10);
+        assert_eq!(
+            backend
+                .present_direct_candidates
+                .last()
+                .expect("Present reaches Backend")
+                .variable_refresh,
+            expected,
+            "type={property_type} format={format} value={values:?}"
+        );
+    }
+    assert_eq!(backend.present_direct_candidates.len(), 7);
+}
+
+#[test]
 fn present_async_may_tear_bit_is_0x10() {
     // presenttokens.h: PresentOptionAsyncMayTear = (1 << 4).
     assert_eq!(0x10u32, 1u32 << 4);

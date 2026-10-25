@@ -933,6 +933,18 @@ pub(super) fn execute_present_pixmap_copy(
         ),
     };
 
+    let variable_refresh = state
+        .atoms
+        .id_for("_VARIABLE_REFRESH")
+        .and_then(|atom| state.resources.window_property(ResourceId(window), atom))
+        .is_some_and(|value| {
+            value.r#type == crate::xinput::XA_CARDINAL
+                && value.format == crate::properties::PropertyFormat::F32
+                && value.data.get(..4).is_some_and(|bytes| {
+                    <[u8; 4]>::try_from(bytes).is_ok_and(|bytes| u32::from_ne_bytes(bytes) == 1)
+                })
+        });
+
     let candidate = crate::backend::PresentScanoutCandidate {
         client_id: client_id.0,
         present_id,
@@ -940,6 +952,7 @@ pub(super) fn execute_present_pixmap_copy(
         crtc_epoch,
         src_pixmap_xid: pixmap,
         dst_window_xid: window,
+        variable_refresh,
         src_host_xid,
         paint_dst_host_xid,
         completion_dst_host_xid,

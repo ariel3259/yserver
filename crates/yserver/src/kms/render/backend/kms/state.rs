@@ -224,6 +224,8 @@ pub(in crate::kms::render::backend) struct DirectPresentFrame {
     pub(in crate::kms::render::backend) candidate: PresentScanoutCandidate,
     /// M0 ownership classification for the transaction being submitted.
     pub(in crate::kms::render::backend) target: ScanoutM0Target,
+    /// Whether the client's `_VARIABLE_REFRESH` property allows VRR.
+    pub(in crate::kms::render::backend) variable_refresh: bool,
     /// Backend receipt time retained across the latest-wins direct successor
     /// slot until its atomic submit.
     pub(in crate::kms::render::backend) present_received_at: std::time::Instant,
@@ -795,6 +797,8 @@ pub type KmsBackend = XBackend<PlatformBackend>;
 /// Backend state owned by the KMS platform: direct scanout, vblank arming,
 /// VT/session, RANDR/CRTC config, DRI3 fences and dma-buf export.
 pub struct KmsBackendState {
+    /// Startup policy used when a client-window direct frame is submitted.
+    pub(in crate::kms::render::backend) vrr_mode: crate::launch::VrrMode,
     /// M0 direct-scanout telemetry. Purely observational: it never owns a
     /// drawable pin, submits DRM work, or affects Present capabilities.
     pub(in crate::kms::render::backend) scanout_m0: ScanoutM0Telemetry,

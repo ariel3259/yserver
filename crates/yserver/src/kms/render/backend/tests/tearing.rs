@@ -230,6 +230,7 @@ fn prepare_direct_present_for_ids_with_storage(
         crtc_epoch,
         src_pixmap_xid: source_xid,
         dst_window_xid: protocol_window_xid,
+        variable_refresh: false,
         src_host_xid: source_xid,
         paint_dst_host_xid: host_window_xid,
         completion_dst_host_xid: host_window_xid,

@@ -121,6 +121,9 @@ pub struct PresentScanoutCandidate {
     pub crtc_epoch: u64,
     pub src_pixmap_xid: u32,
     pub dst_window_xid: u32,
+    /// The presented window has `_VARIABLE_REFRESH` as CARDINAL/32 with
+    /// at least one item and a first value of 1.
+    pub variable_refresh: bool,
     pub src_host_xid: u32,
     pub paint_dst_host_xid: u32,
     pub completion_dst_host_xid: u32,
