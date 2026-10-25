@@ -1591,12 +1591,7 @@ impl KmsBackend {
         };
         if output.crtc_gamma_lut_prop.is_some() && !output.gamma_lut_disabled.get() {
             let now = self.monotonic_now();
-            let refresh_hz = match output.picked.vrefresh {
-                0 => 60,
-                refresh_hz => refresh_hz,
-            };
-            let refresh_period =
-                std::time::Duration::from_nanos(1_000_000_000 / u64::from(refresh_hz));
+            let refresh_period = crate::drm::modeset::output_refresh_period(output);
             if output.pending_gamma_lut.borrow().is_none() {
                 let crtc_key = crate::kms::render::platform::CrtcKey::new(device_key, crtc);
                 let activity_now = crate::drm::atomic::monotonic_timestamp();
@@ -1626,7 +1621,7 @@ impl KmsBackend {
                     .page_flip_commit_in_flight(&device.device, crtc)
             {
                 output.pending_gamma_deadline.set(None);
-                self.platform.submit_pending_crtc_property_for_output(
+                self.submit_pending_crtc_property_for_output(
                     output_idx,
                     self.live_direct_vrr_wanted(),
                     now,

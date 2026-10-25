@@ -274,6 +274,15 @@ pub struct Output {
 
 pub(crate) type GammaRamp = (Vec<u16>, Vec<u16>, Vec<u16>);
 
+/// Refresh period shared by standalone CRTC-property retry paths.
+pub(crate) fn output_refresh_period(output: &Output) -> std::time::Duration {
+    let refresh_hz = match output.picked.vrefresh {
+        0 => 60,
+        refresh_hz => refresh_hz,
+    };
+    std::time::Duration::from_nanos(1_000_000_000 / u64::from(refresh_hz))
+}
+
 impl Output {
     pub(crate) fn cache_crtc_gamma_properties(&mut self, properties: Option<&PropMap>) {
         self.crtc_gamma_lut_prop = properties.and_then(|props| props.id("GAMMA_LUT").ok());
@@ -507,11 +516,11 @@ pub(crate) fn finish_pending_gamma_lut(
     }
 }
 
-fn finish_pending_vrr_change(
+pub(crate) fn finish_pending_vrr_change(
     output: &Output,
     value: bool,
     commit_result: &io::Result<u64>,
-    retry_accepted: bool,
+    latch_einval: bool,
 ) {
     match commit_result {
         Ok(_) => {
@@ -522,7 +531,7 @@ fn finish_pending_vrr_change(
                 output.vrr_clear_waiting_for_flip.set(false);
             }
         }
-        Err(error) if retry_accepted && error.raw_os_error() == Some(libc::EINVAL) => {
+        Err(error) if latch_einval && error.raw_os_error() == Some(libc::EINVAL) => {
             let was_disabled = output.vrr_disabled.replace(true);
             if !value && was_disabled {
                 output.vrr_clear_retry_used.set(true);

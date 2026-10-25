@@ -2,8 +2,7 @@ use super::PlatformBackend;
 use crate::drm::{
     atomic::{AtomicCommitEvent, AtomicCommitKind, AtomicCommitRequest},
     modeset::{
-        append_pending_crtc_properties, finish_pending_gamma_lut,
-        submit_frame_with_pending_crtc_properties,
+        append_pending_crtc_properties, finish_pending_gamma_lut, finish_pending_vrr_change,
     },
 };
 
@@ -81,24 +80,19 @@ impl PlatformBackend {
             );
             result.map(|_| ())
         } else {
-            submit_frame_with_pending_crtc_properties(
+            let result = device.atomic_commit_sink.submit_with_commit_id(
                 &device.device,
-                &device.atomic_commit_sink,
+                flags,
+                AtomicCommitKind::GammaOnly,
                 request,
-                changes.request_without_crtc_properties,
-                changes.gamma_blobs,
-                changes.vrr_changes,
-                |request| {
-                    device.atomic_commit_sink.submit_with_commit_id(
-                        &device.device,
-                        flags,
-                        AtomicCommitKind::GammaOnly,
-                        request,
-                        &events,
-                    )
-                },
-            )
-            .map(|_| ())
+                &events,
+            );
+            for (vrr_output, value) in &changes.vrr_changes {
+                // A standalone clear has no frame request to retry without
+                // CRTC properties; finalize EINVAL through the VRR latch.
+                finish_pending_vrr_change(vrr_output, *value, &result, true);
+            }
+            result.map(|_| ())
         };
 
         match result {
@@ -114,9 +108,9 @@ impl PlatformBackend {
                     && error.raw_os_error() != Some(libc::EBUSY) =>
             {
                 output.vrr_clear_waiting_for_flip.set(false);
-                output
-                    .vrr_clear_retry_deadline
-                    .set(Some(now + output_refresh_period(output)));
+                output.vrr_clear_retry_deadline.set(Some(
+                    now + crate::drm::modeset::output_refresh_period(output),
+                ));
                 Err(error)
             }
             Err(error) if error.raw_os_error() == Some(libc::EINVAL) && carries_vrr_clear => {
@@ -206,12 +200,4 @@ impl PlatformBackend {
             .iter()
             .any(|output_idx| self.scanout_commit_in_flight_for_output(*output_idx))
     }
-}
-
-fn output_refresh_period(output: &crate::drm::modeset::Output) -> std::time::Duration {
-    let refresh_hz = match output.picked.vrefresh {
-        0 => 60,
-        refresh_hz => refresh_hz,
-    };
-    std::time::Duration::from_nanos(1_000_000_000 / u64::from(refresh_hz))
 }

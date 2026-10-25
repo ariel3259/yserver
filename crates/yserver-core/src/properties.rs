@@ -9,6 +9,20 @@ pub struct PropertyValue {
     pub data: Vec<u8>,
 }
 
+/// Whether an `_VARIABLE_REFRESH` property value has the X11 CARDINAL/32
+/// representation and value 1. Both Present admission and live KMS property
+/// changes must use this same predicate.
+#[must_use]
+pub fn variable_refresh_property_enabled(value: Option<&PropertyValue>) -> bool {
+    value.is_some_and(|value| {
+        value.r#type == crate::xinput::XA_CARDINAL
+            && value.format == PropertyFormat::F32
+            && value.data.get(..4).is_some_and(|bytes| {
+                <[u8; 4]>::try_from(bytes).is_ok_and(|bytes| u32::from_le_bytes(bytes) == 1)
+            })
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PropertyFormat {
     F8,

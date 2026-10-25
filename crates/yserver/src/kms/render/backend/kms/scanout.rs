@@ -1079,19 +1079,12 @@ impl KmsBackend {
             .chain(self.pstate.scanout_m2.queued_successor.iter())
             .find(|frame| matches_host(&frame.candidate))
             .map(|frame| (frame.candidate.dst_window_xid, frame.candidate.crtc_id));
-        let allowed = changed_owner
-            .and_then(|(window, _)| {
-                state
-                    .resources
-                    .window_property(yserver_protocol::x11::ResourceId(window), vrr_atom)
-            })
-            .is_some_and(|value| {
-                value.r#type == yserver_core::xinput::XA_CARDINAL
-                    && value.format == yserver_core::properties::PropertyFormat::F32
-                    && value.data.get(..4).is_some_and(|bytes| {
-                        <[u8; 4]>::try_from(bytes).is_ok_and(|bytes| u32::from_le_bytes(bytes) == 1)
-                    })
-            });
+        let allowed = changed_owner.and_then(|(window, _)| {
+            state
+                .resources
+                .window_property(yserver_protocol::x11::ResourceId(window), vrr_atom)
+        });
+        let allowed = yserver_core::properties::variable_refresh_property_enabled(allowed);
         let mut matched = false;
         {
             let scanout = &mut self.pstate.scanout_m2;
@@ -1153,9 +1146,7 @@ impl KmsBackend {
                 output.vrr_clear_waiting_for_flip.set(true);
                 continue;
             }
-            if let Err(error) = self
-                .platform
-                .submit_pending_crtc_property_for_output(output_idx, false, now)
+            if let Err(error) = self.submit_pending_crtc_property_for_output(output_idx, false, now)
             {
                 log::warn!(
                     "kms: standalone VRR clear for CRTC {:?} failed: {error}",
@@ -1198,6 +1189,34 @@ impl KmsBackend {
                 );
             }
         }
+    }
+
+    /// Submit a standalone optional CRTC property and report any accepted VRR
+    /// transition through the same logger used by frame commits.
+    pub(in crate::kms::render::backend) fn submit_pending_crtc_property_for_output(
+        &self,
+        output_idx: usize,
+        vrr_wanted: bool,
+        now: std::time::Instant,
+    ) -> io::Result<()> {
+        let before = self.vrr_committed_snapshot();
+        let result = self
+            .platform
+            .submit_pending_crtc_property_for_output(output_idx, vrr_wanted, now);
+        self.log_vrr_committed_changes(&before, None, "property_changed");
+        result
+    }
+
+    fn retry_pending_crtc_property_after_flip(
+        &mut self,
+        output_idx: usize,
+        now: std::time::Instant,
+    ) {
+        let before = self.vrr_committed_snapshot();
+        let vrr_wanted = self.live_direct_vrr_wanted();
+        self.platform
+            .retry_pending_crtc_property_after_flip(output_idx, now, vrr_wanted);
+        self.log_vrr_committed_changes(&before, None, "property_changed");
     }
 
     #[cfg(test)]
@@ -3045,11 +3064,7 @@ impl KmsBackend {
             if !self.gamma_output_has_queued_scanout(output_idx)
                 || (vrr_clear_waiting_for_flip && !direct_successor_owns_next_frame)
             {
-                self.platform.retry_pending_crtc_property_after_flip(
-                    output_idx,
-                    self.monotonic_now(),
-                    self.live_direct_vrr_wanted(),
-                );
+                self.retry_pending_crtc_property_after_flip(output_idx, self.monotonic_now());
             }
         }
         // Idle vblank arming: clear the arm + advance the Present clock for
@@ -3338,11 +3353,7 @@ impl KmsBackend {
                             .is_some_and(|deadline| now >= deadline))
             };
             if property_retry_due {
-                self.platform.retry_pending_crtc_property_after_flip(
-                    output_idx,
-                    now,
-                    self.live_direct_vrr_wanted(),
-                );
+                self.retry_pending_crtc_property_after_flip(output_idx, now);
             }
         }
         if self.pstate.tearing.is_on()

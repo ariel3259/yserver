@@ -3372,7 +3372,7 @@ fn vrr_summary_reports_intervals_and_deadline_commits() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: omit the _VARIABLE_REFRESH KMS hook; deleting the property would wait for another frame.
+// Mutations: omit the property hook so deletion waits for a frame, or omit the post-clear log.
 fn vrr_property_deleted_clears_without_frame() {
     let Some((mut fixture, direct)) =
         direct_fixture_with_vrr_mode(18_040, 0, crate::launch::VrrMode::Property)
@@ -3386,11 +3386,16 @@ fn vrr_property_deleted_clears_without_frame() {
     let mut fixture = fixture.cleanup_guard();
     let fd = super::direct_unflip::fd(&fixture);
     let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    let output_name = fixture.events.backend.platform.outputs[0]
+        .key
+        .connector_name
+        .clone();
     let (mut state, property, initial) = start_property_direct(&mut fixture, &direct, true);
     assert!(contains_vrr_property(&initial, crtc, 1));
     complete_direct_and_drain_present(&mut fixture, &initial, 1, None);
     let recorder = fixture.events.recorders[&fd].clone();
     let offset = super::direct_unflip::record_count(&fixture, fd);
+    super::recording_scene::clear_vrr_test_logs();
 
     delete_vrr_property(
         &mut state,
@@ -3428,6 +3433,16 @@ fn vrr_property_deleted_clears_without_frame() {
         1,
         "one accepted standalone clear is enough"
     );
+    let logs = super::recording_scene::vrr_test_logs();
+    assert!(
+        logs.lines().any(|line| {
+            line == format!(
+                "kms: vrr off output={output_name} crtc={} reason=property_changed",
+                u32::from(crtc)
+            )
+        }),
+        "the immediate standalone clear logs its accepted VRR transition; logs={logs:?}"
+    );
     let clear_id = super::support::accepted_event_id(&clear).expect("clear event ID");
     super::atomic_events::complete_recorded_attempt(&mut fixture, fd, &clear, clear_id, 84);
 
@@ -3446,7 +3461,7 @@ fn vrr_property_deleted_clears_without_frame() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: retry the property clear before the direct flip retires, or omit its event retry.
+// Mutations: retry before flip retirement, omit the event retry, or omit its accepted-clear log.
 fn vrr_property_deleted_during_flip_clears_at_event() {
     let Some((mut fixture, direct)) =
         direct_fixture_with_vrr_mode(18_042, 0, crate::launch::VrrMode::Property)
@@ -3460,6 +3475,10 @@ fn vrr_property_deleted_during_flip_clears_at_event() {
     let mut fixture = fixture.cleanup_guard();
     let fd = super::direct_unflip::fd(&fixture);
     let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    let output_name = fixture.events.backend.platform.outputs[0]
+        .key
+        .connector_name
+        .clone();
     let (mut state, property, initial) = start_property_direct(&mut fixture, &direct, true);
     complete_direct_and_drain_present(&mut fixture, &initial, 1, None);
     let pending = submit_property_present(&mut fixture, &mut state, &direct, 18_043, 3)
@@ -3467,6 +3486,7 @@ fn vrr_property_deleted_during_flip_clears_at_event() {
         .find(|record| super::support::accepted_event_id(record).is_some())
         .expect("direct successor flip is in flight");
     let offset = super::direct_unflip::record_count(&fixture, fd);
+    super::recording_scene::clear_vrr_test_logs();
 
     delete_vrr_property(
         &mut state,
@@ -3508,6 +3528,16 @@ fn vrr_property_deleted_during_flip_clears_at_event() {
             .output
             .vrr_committed
             .get()
+    );
+    let logs = super::recording_scene::vrr_test_logs();
+    assert!(
+        logs.lines().any(|line| {
+            line == format!(
+                "kms: vrr off output={output_name} crtc={} reason=property_changed",
+                u32::from(crtc)
+            )
+        }),
+        "the event-driven standalone clear logs its accepted VRR transition; logs={logs:?}"
     );
     let clear_id = super::support::accepted_event_id(&clear).expect("clear event ID");
     super::atomic_events::complete_recorded_attempt(&mut fixture, fd, &clear, clear_id, 86);
@@ -3770,7 +3800,7 @@ fn vrr_property_change_reaches_queued_successor() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: drop the standalone clear retry deadline; ENOMEM must retry once after one refresh period.
+// Mutations: drop the retry deadline or its next_wakeup wiring, or omit the timed clear log.
 fn vrr_standalone_clear_retried_after_error() {
     let Some((mut fixture, direct)) =
         direct_fixture_with_vrr_mode(18_049, 0, crate::launch::VrrMode::Property)
@@ -3784,6 +3814,10 @@ fn vrr_standalone_clear_retried_after_error() {
     let mut fixture = fixture.cleanup_guard();
     let fd = super::direct_unflip::fd(&fixture);
     let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    let output_name = fixture.events.backend.platform.outputs[0]
+        .key
+        .connector_name
+        .clone();
     let (mut state, property, initial) = start_property_direct(&mut fixture, &direct, true);
     complete_direct_and_drain_present(&mut fixture, &initial, 1, None);
     fixture.events.backend.platform.clear_direct_cursor_retry(0);
@@ -3793,8 +3827,10 @@ fn vrr_standalone_clear_retried_after_error() {
         .pstate
         .scanout_m2
         .clear_all_direct_cursor_refresh_pending();
+    Backend::flush_before_damage_notify(&mut fixture.events.backend);
     fixture.events.wait_for_submitted_gpu_work();
     Backend::before_block(&mut fixture.events.backend);
+    fixture.events.backend.pstate.hotplug_rescan_deadline = None;
     let recorder = fixture.events.recorders[&fd].clone();
     let (base, elapsed_ns) = super::support::install_controlled_clock(&mut fixture.events.backend);
     let refresh_period = Duration::from_nanos(1_000_000_000 / 60);
@@ -3827,10 +3863,10 @@ fn vrr_standalone_clear_retried_after_error() {
         Some(base + refresh_period),
         "the retry deadline is one output refresh period after ENOMEM"
     );
-    assert!(
-        Backend::next_wakeup(&fixture.events.backend)
-            .is_some_and(|wake| wake <= base + refresh_period),
-        "next_wakeup exposes the retry deadline, or an earlier pending backend wake"
+    assert_eq!(
+        Backend::next_wakeup(&fixture.events.backend),
+        Some(base + refresh_period),
+        "with unrelated KMS timers drained, next_wakeup is the standalone-clear retry deadline"
     );
     Backend::maybe_composite(&mut fixture.events.backend)
         .expect("do not retry the failed standalone clear early");
@@ -3866,8 +3902,83 @@ fn vrr_standalone_clear_retried_after_error() {
             .vrr_committed
             .get()
     );
+    let logs = super::recording_scene::vrr_test_logs();
+    assert!(
+        logs.lines().any(|line| {
+            line == format!(
+                "kms: vrr off output={output_name} crtc={} reason=property_changed",
+                u32::from(crtc)
+            )
+        }),
+        "the timed standalone clear logs its accepted VRR transition; logs={logs:?}"
+    );
     let retry_id = super::support::accepted_event_id(&attempts[1]).expect("retry event ID");
     super::atomic_events::complete_recorded_attempt(&mut fixture, fd, &attempts[1], retry_id, 88);
+    finish_property_direct_scanout(&mut fixture, fd);
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: route a standalone VRR clear through an empty stripped retry; EINVAL must latch directly without that retry.
+fn vrr_standalone_clear_einval_latches_without_empty_retry() {
+    let Some((mut fixture, direct)) =
+        direct_fixture_with_vrr_mode(18_050, 0, crate::launch::VrrMode::Property)
+    else {
+        eprintln!(
+            "SKIP vrr_standalone_clear_einval_latches_without_empty_retry: no Vulkan scene fixture available"
+        );
+        return;
+    };
+    set_vrr_capable(&mut fixture);
+    let mut fixture = fixture.cleanup_guard();
+    let fd = super::direct_unflip::fd(&fixture);
+    let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    let (mut state, property, initial) = start_property_direct(&mut fixture, &direct, true);
+    complete_direct_and_drain_present(&mut fixture, &initial, 1, None);
+    let recorder = fixture.events.recorders[&fd].clone();
+    let offset = super::direct_unflip::record_count(&fixture, fd);
+    recorder.script_result(Err(io::Error::from_raw_os_error(libc::EINVAL)));
+
+    delete_vrr_property(
+        &mut state,
+        &mut fixture.events.backend,
+        direct.target_xid,
+        property,
+        3,
+    );
+    let attempts = super::direct_unflip::records_since(&fixture, fd, offset);
+    assert_eq!(
+        attempts.len(),
+        1,
+        "standalone EINVAL does not submit an empty fallback request"
+    );
+    assert!(contains_vrr_property(&attempts[0], crtc, 0));
+    assert!(matches!(
+        attempts[0].result,
+        ScriptedResult::Error {
+            raw_os_error: Some(error),
+            ..
+        } if error == libc::EINVAL
+    ));
+    let output = &fixture.events.backend.platform.outputs[0].output;
+    assert!(
+        output.vrr_disabled.get(),
+        "standalone EINVAL latches VRR off"
+    );
+    assert!(
+        output.vrr_committed.get(),
+        "the rejected clear is not recorded as committed"
+    );
+    assert_eq!(output.vrr_clear_retry_deadline.get(), None);
+
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("latched standalone EINVAL does not spin or submit an empty request");
+    assert_eq!(
+        super::direct_unflip::record_count(&fixture, fd) - offset,
+        1,
+        "no empty fallback or immediate retry follows standalone EINVAL"
+    );
     finish_property_direct_scanout(&mut fixture, fd);
     fixture.finish_after_normal_drain();
 }
