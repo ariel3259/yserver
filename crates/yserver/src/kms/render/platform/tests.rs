@@ -834,6 +834,7 @@ fn connector_snapshot_refreshes_live_metadata_without_changing_its_route() {
         mm_height: 290,
         edid: vec![1, 2, 3, 4],
         connector_type: "DisplayPort".into(),
+        vrr_capable: false,
     };
     let known_connected = HashSet::from([key]);
 
@@ -864,6 +865,7 @@ fn metadata_only_snapshot_preserves_active_layout_and_extent() {
         mm_height: 290,
         edid: vec![1, 2, 3, 4],
         connector_type: "DisplayPort".into(),
+        vrr_capable: false,
     };
 
     let rescan = platform.apply_connector_snapshot(vec![snapshot], &HashSet::from([key]));
@@ -937,6 +939,7 @@ fn connector_snapshot_drops_an_unusable_route_and_leaves_layout_to_the_caller() 
         mm_height: 0,
         edid: Vec::new(),
         connector_type: "unknown".to_string(),
+        vrr_capable: false,
     };
     let rescan = platform.apply_connector_snapshot(vec![no_modes], &HashSet::from([key.clone()]));
 
@@ -998,6 +1001,7 @@ fn connector_snapshot_preserves_a_live_route_across_mode_list_replacement() {
         mm_height: 290,
         edid: vec![1, 2, 3, 4],
         connector_type: "DisplayPort".into(),
+        vrr_capable: false,
     };
 
     let rescan = platform.apply_connector_snapshot(vec![snapshot], &HashSet::from([key.clone()]));
@@ -1699,6 +1703,7 @@ fn connected_off_probe_and_zero_card_do_not_run_deferred_factory() {
         mm_height: 290,
         edid: vec![1, 2, 3, 4],
         connector_type: "DisplayPort".into(),
+        vrr_capable: false,
     };
 
     let rescan = platform.apply_connector_snapshot(vec![snapshot], &HashSet::new());

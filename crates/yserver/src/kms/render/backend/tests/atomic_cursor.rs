@@ -378,7 +378,10 @@ fn idle_motion_coalesces_until_cursor_flip_retires() {
         recorder.records().is_empty(),
         "motion must not submit directly"
     );
-    assert!(backend.platform.has_eligible_atomic_cursor_move());
+    assert!(
+        yserver_core::backend::Backend::next_wakeup(&backend)
+            .is_some_and(|wakeup| wakeup <= std::time::Instant::now())
+    );
     assert!(backend.scanout_allowed());
     assert!(backend.kms_outputs_active);
     maybe_composite(&mut backend);
@@ -1246,6 +1249,7 @@ fn direct_scanout_probe_tests_the_request_it_commits() {
         raw(91),
         &planes,
         &[position],
+        false,
         crate::drm::async_flip::FlipTiming::Vsync,
         crate::drm::atomic::TearingCommitContext::NONE,
     )

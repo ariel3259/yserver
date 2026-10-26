@@ -911,6 +911,8 @@ impl KmsBackend {
         let cursor_positions = self
             .platform
             .cursor_plane_atomic_positions_for_outputs(&output_indices);
+        let vrr_wanted = self.direct_frame_wants_vrr(frame);
+        let vrr_before = self.vrr_committed_snapshot();
         let async_shape = if timing == crate::drm::async_flip::FlipTiming::Async {
             Some(
                 self.pstate
@@ -943,6 +945,7 @@ impl KmsBackend {
             fb,
             &plane_states,
             &cursor_positions,
+            vrr_wanted,
             attempt_timing,
             crate::drm::atomic::TearingCommitContext::direct(
                 Some(frame.present_received_at),
@@ -970,6 +973,7 @@ impl KmsBackend {
                         fb,
                         &plane_states,
                         &cursor_positions,
+                        vrr_wanted,
                         crate::drm::async_flip::FlipTiming::Vsync,
                         crate::drm::atomic::TearingCommitContext::direct(
                             Some(frame.present_received_at),
@@ -996,6 +1000,20 @@ impl KmsBackend {
             self.handle_cursor_move_outcome(outcome);
         }
         let accepted_event_id = result?;
+        let vrr_off_reason = if frame.target == ScanoutM0Target::Unredirected
+            && self.pstate.vrr_mode == crate::launch::VrrMode::Property
+            && !frame.candidate.variable_refresh
+        {
+            "property"
+        } else {
+            "inherited"
+        };
+        self.log_vrr_committed_changes(
+            &vrr_before,
+            (frame.target == ScanoutM0Target::Unredirected)
+                .then_some(frame.candidate.dst_window_xid),
+            vrr_off_reason,
+        );
         if attempt_timing == crate::drm::async_flip::FlipTiming::Vsync
             || matches!(
                 async_outcome,
@@ -1009,6 +1027,245 @@ impl KmsBackend {
         frame.accepted_event_id = Some(accepted_event_id);
         frame.async_outcome = async_outcome;
         Ok(async_outcome)
+    }
+
+    pub(in crate::kms::render::backend) fn vrr_committed_snapshot(&self) -> Vec<bool> {
+        self.platform
+            .outputs
+            .iter()
+            .map(|output| output.output.vrr_committed.get())
+            .collect()
+    }
+
+    fn direct_frame_wants_vrr(&self, frame: &DirectPresentFrame) -> bool {
+        frame.target == ScanoutM0Target::Unredirected
+            && match self.pstate.vrr_mode {
+                crate::launch::VrrMode::Off => false,
+                crate::launch::VrrMode::Property => frame.candidate.variable_refresh,
+            }
+    }
+
+    pub(in crate::kms::render::backend) fn live_direct_vrr_wanted(&self) -> bool {
+        self.pstate
+            .scanout_m2
+            .queued_successor
+            .as_ref()
+            .or(self.pstate.scanout_m2.pending.as_ref())
+            .or(self.pstate.scanout_m2.current.as_ref())
+            .is_some_and(|frame| self.direct_frame_wants_vrr(frame))
+    }
+
+    fn live_direct_vrr_wanted_by_output(&self) -> Vec<bool> {
+        (0..self.platform.outputs.len())
+            .map(|output_idx| {
+                let Some(output_frame) = self.direct_scanout_frame_for_output(output_idx) else {
+                    return false;
+                };
+                let frame = self
+                    .pstate
+                    .scanout_m2
+                    .queued_successor
+                    .as_ref()
+                    .or(self.pstate.scanout_m2.pending.as_ref())
+                    .unwrap_or(output_frame);
+                self.direct_frame_wants_vrr(frame)
+            })
+            .collect()
+    }
+
+    pub(in crate::kms::render::backend) fn backend_scanout_on_window_property_changed(
+        &mut self,
+        state: &yserver_core::server::ServerState,
+        host_xid: u32,
+        property: yserver_protocol::x11::AtomId,
+    ) {
+        if self.pstate.vrr_mode != crate::launch::VrrMode::Property || host_xid == 0 {
+            return;
+        }
+        let Some(vrr_atom) = state.atoms.id_for("_VARIABLE_REFRESH") else {
+            return;
+        };
+        if property != vrr_atom {
+            return;
+        }
+        let matches_host = |candidate: &yserver_core::backend::PresentScanoutCandidate| {
+            state
+                .resources
+                .window(yserver_protocol::x11::ResourceId(candidate.dst_window_xid))
+                .and_then(|window| window.host_xid)
+                .is_some_and(|window| window.as_raw() == host_xid)
+        };
+        let changed_owner = self
+            .pstate
+            .scanout_m2
+            .current
+            .iter()
+            .chain(self.pstate.scanout_m2.pending.iter())
+            .chain(self.pstate.scanout_m2.queued_successor.iter())
+            .find(|frame| matches_host(&frame.candidate))
+            .map(|frame| (frame.candidate.dst_window_xid, frame.candidate.crtc_id));
+        let allowed = changed_owner.and_then(|(window, _)| {
+            state
+                .resources
+                .window_property(yserver_protocol::x11::ResourceId(window), vrr_atom)
+        });
+        let allowed = yserver_core::properties::variable_refresh_property_enabled(allowed);
+        let mut matched = false;
+        {
+            let scanout = &mut self.pstate.scanout_m2;
+            let (current, pending, queued_successor) = (
+                &mut scanout.current,
+                &mut scanout.pending,
+                &mut scanout.queued_successor,
+            );
+            for frame in current
+                .iter_mut()
+                .chain(pending.iter_mut())
+                .chain(queued_successor.iter_mut())
+            {
+                if matches_host(&frame.candidate) {
+                    frame.candidate.variable_refresh = allowed;
+                    matched = true;
+                }
+            }
+        }
+        if !matched {
+            return;
+        }
+        let Some((_, direct_crtc_id)) = changed_owner else {
+            return;
+        };
+        let Some((direct_output_idx, _)) = self.present_crtc_output(direct_crtc_id) else {
+            return;
+        };
+
+        if allowed {
+            let output = &self.platform.outputs[direct_output_idx].output;
+            output.vrr_clear_retry_deadline.set(None);
+            output.vrr_clear_waiting_for_flip.set(false);
+            return;
+        }
+        if self.pstate.scanout_m2.queued_successor.is_some()
+            || self.live_direct_vrr_wanted()
+            || !self.scanout_allowed()
+            || !self.kms_outputs_active
+        {
+            return;
+        }
+
+        let now = self.monotonic_now();
+        let output = &self.platform.outputs[direct_output_idx].output;
+        if !output.vrr_committed.get() {
+            return;
+        }
+        if self.pstate.scanout_m2.pending.is_some()
+            || self
+                .platform
+                .scanout_commit_in_flight_for_output(direct_output_idx)
+        {
+            output.vrr_clear_retry_deadline.set(None);
+            output.vrr_clear_waiting_for_flip.set(true);
+            return;
+        }
+        if let Err(error) =
+            self.submit_pending_crtc_property_for_output(direct_output_idx, false, now)
+        {
+            log::warn!(
+                "kms: standalone VRR clear for CRTC {:?} failed: {error}",
+                output.crtc
+            );
+        }
+    }
+
+    pub(in crate::kms::render::backend) fn log_vrr_committed_changes(
+        &self,
+        before: &[bool],
+        owner_window: Option<u32>,
+        fallback_off_reason: &'static str,
+    ) {
+        let off_reason = if fallback_off_reason == "property" {
+            fallback_off_reason
+        } else {
+            self.pstate
+                .scanout_m2
+                .unflip_last_reason
+                .unwrap_or(fallback_off_reason)
+        };
+        for (index, layout) in self.platform.outputs.iter().enumerate() {
+            let was_enabled = before.get(index).copied().unwrap_or(false);
+            let enabled = layout.output.vrr_committed.get();
+            if was_enabled == enabled {
+                continue;
+            }
+            if enabled {
+                if let Some(window) = owner_window {
+                    log::info!(
+                        "kms: vrr on output={} crtc={} window=0x{window:x}",
+                        layout.key.connector_name,
+                        u32::from(layout.output.crtc)
+                    );
+                }
+            } else {
+                log::info!(
+                    "kms: vrr off output={} crtc={} reason={off_reason}",
+                    layout.key.connector_name,
+                    u32::from(layout.output.crtc)
+                );
+            }
+        }
+    }
+
+    /// Submit a standalone optional CRTC property and report any accepted VRR
+    /// transition through the same logger used by frame commits.
+    pub(in crate::kms::render::backend) fn submit_pending_crtc_property_for_output(
+        &self,
+        output_idx: usize,
+        vrr_wanted: bool,
+        now: std::time::Instant,
+    ) -> io::Result<()> {
+        let before = self.vrr_committed_snapshot();
+        let current_primary_framebuffer = self.current_primary_framebuffer_for_output(output_idx);
+        let result = self.platform.submit_pending_crtc_property_for_output(
+            output_idx,
+            vrr_wanted,
+            now,
+            current_primary_framebuffer,
+        );
+        self.log_vrr_committed_changes(&before, None, "property");
+        result
+    }
+
+    fn retry_pending_crtc_property_after_flip(
+        &mut self,
+        output_idx: usize,
+        now: std::time::Instant,
+    ) {
+        let before = self.vrr_committed_snapshot();
+        let vrr_wanted = self.live_direct_vrr_wanted();
+        let current_primary_framebuffer = self.current_primary_framebuffer_for_output(output_idx);
+        self.platform.retry_pending_crtc_property_after_flip(
+            output_idx,
+            now,
+            vrr_wanted,
+            current_primary_framebuffer,
+        );
+        self.log_vrr_committed_changes(&before, None, "property");
+    }
+
+    fn current_primary_framebuffer_for_output(
+        &self,
+        output_idx: usize,
+    ) -> Option<::drm::control::framebuffer::Handle> {
+        if let Some(frame) = self.direct_scanout_frame_for_output(output_idx) {
+            return self
+                .pstate
+                .scanout_m1
+                .entries
+                .get(&frame.source_id)
+                .and_then(ScanoutM1ProbeEntry::framebuffer)
+                .map(crate::drm::modeset::DirectScanoutProbeFramebuffer::handle);
+        }
+        None
     }
 
     #[cfg(test)]
@@ -1147,6 +1404,19 @@ impl KmsBackend {
         &mut self,
         reason: &'static str,
     ) {
+        let vrr_committed = self
+            .platform
+            .outputs
+            .iter()
+            .any(|output| output.output.vrr_committed.get());
+        if vrr_committed {
+            self.pstate
+                .scanout_m2
+                .unflip_last_reason
+                .get_or_insert(reason);
+        } else {
+            self.pstate.scanout_m2.unflip_last_reason = None;
+        }
         if let Some(mut pending) = self.pstate.scanout_m2.pending.take() {
             pending.event.completion_mode = yserver_protocol::x11::present::COMPLETE_MODE_COPY;
             pending.event.emit_idle = true;
@@ -1174,7 +1444,6 @@ impl KmsBackend {
             .clear_all_direct_cursor_refresh_pending();
         self.pstate.scanout_m2.unflip_requested = false;
         self.pstate.scanout_m2.unflip_reason = None;
-        self.pstate.scanout_m2.unflip_last_reason = None;
         self.pstate.scanout_m2.unflip_outputs_to_replace.clear();
         self.pstate.scanout_m2.unflip_awaiting_outputs.clear();
         self.pstate.scanout_m2.reentry_blocked_until_composed = false;
@@ -1439,6 +1708,7 @@ impl KmsBackend {
         let cursor_positions = self
             .platform
             .cursor_plane_atomic_positions_for_outputs(&output_indices);
+        let vrr_before = self.vrr_committed_snapshot();
         let result = crate::drm::modeset::submit_composed_scanout(
             &device,
             atomic_commit_sink.as_ref(),
@@ -1454,6 +1724,7 @@ impl KmsBackend {
             self.handle_cursor_move_outcome(outcome);
         }
         let accepted_event_id = result?;
+        self.log_vrr_committed_changes(&vrr_before, None, "inherited");
         self.platform
             .cursor_plane_scene_commit_submitted(&cursor_positions);
         self.pstate.scanout_m2.unflip_outputs_to_replace = (0..output_count).collect();
@@ -1640,6 +1911,7 @@ impl KmsBackend {
         let cursor_positions = self
             .platform
             .cursor_plane_atomic_positions_for_outputs(&output_indices);
+        let vrr_before = self.vrr_committed_snapshot();
         let result = crate::drm::modeset::submit_composed_scanout(
             &device,
             atomic_commit_sink.as_ref(),
@@ -1655,6 +1927,7 @@ impl KmsBackend {
             self.handle_cursor_move_outcome(outcome);
         }
         let accepted_event_id = result?;
+        self.log_vrr_committed_changes(&vrr_before, None, "inherited");
         self.platform
             .cursor_plane_scene_commit_submitted(&cursor_positions);
         Ok(accepted_event_id)
@@ -2651,10 +2924,13 @@ impl KmsBackend {
         let cursor_compose_blocked = self
             .tearing_cursor_compose_deadline(self.monotonic_now())
             .is_some();
+        let live_direct_vrr_wanted = self.live_direct_vrr_wanted_by_output();
         ((self.scene_wants_scene() || degraded_replacement_needs_submit) && !cursor_compose_blocked)
             || (!cursor_compose_blocked
                 && !direct_transaction_waiting
-                && self.platform.has_eligible_atomic_cursor_move())
+                && self
+                    .platform
+                    .has_eligible_atomic_cursor_move(self.monotonic_now(), &live_direct_vrr_wanted))
     }
 
     #[cfg(test)]
@@ -2828,9 +3104,17 @@ impl KmsBackend {
             }) {
                 continue;
             }
-            if !self.gamma_output_has_queued_scanout(output_idx) {
-                self.platform
-                    .retry_pending_gamma_after_flip(output_idx, self.monotonic_now());
+            let vrr_clear_waiting_for_flip = self
+                .platform
+                .outputs
+                .get(output_idx)
+                .is_some_and(|layout| layout.output.vrr_clear_waiting_for_flip.get());
+            let direct_successor_owns_next_frame = self.pstate.scanout_m2.pending.is_some()
+                || self.pstate.scanout_m2.queued_successor.is_some();
+            if !self.gamma_output_has_queued_scanout(output_idx)
+                || (vrr_clear_waiting_for_flip && !direct_successor_owns_next_frame)
+            {
+                self.retry_pending_crtc_property_after_flip(output_idx, self.monotonic_now());
             }
         }
         // Idle vblank arming: clear the arm + advance the Present clock for
@@ -2929,6 +3213,7 @@ impl KmsBackend {
         &self,
     ) -> Option<std::time::Instant> {
         let now = self.monotonic_now();
+        let live_direct_vrr_wanted = self.live_direct_vrr_wanted_by_output();
         let allow_kms_timers = self.scanout_allowed() && self.kms_outputs_active;
         let direct_hold_waits_for_cursor_or_frame = self.pstate.scanout_m2.hold_direct
             && self.pstate.scanout_m2.current.is_some()
@@ -2951,7 +3236,7 @@ impl KmsBackend {
         };
         let scene_deadline = if allow_kms_timers && direct_hold_waits_for_cursor_or_frame {
             self.platform
-                .has_eligible_atomic_cursor_move()
+                .has_eligible_atomic_cursor_move(now, &live_direct_vrr_wanted)
                 .then_some(now)
         } else if allow_kms_timers {
             if self.scene_wants_compose() {
@@ -2980,6 +3265,22 @@ impl KmsBackend {
                     .min()
             })
             .flatten();
+        let vrr_clear_deadline = allow_kms_timers
+            .then(|| {
+                self.platform
+                    .outputs
+                    .iter()
+                    .filter_map(|layout| {
+                        (!layout.output.vrr_clear_waiting_for_flip.get())
+                            .then_some(layout.output.vrr_clear_retry_deadline.get())
+                            .flatten()
+                    })
+                    .min()
+            })
+            .flatten();
+        let vrr_cursor_deadline = allow_kms_timers
+            .then(|| self.platform.vrr_cursor_deadline(&live_direct_vrr_wanted))
+            .flatten();
         let needs_source_wait_poll =
             self.pstate
                 .pending_present_source_waits
@@ -2999,6 +3300,8 @@ impl KmsBackend {
             .into_iter()
             .chain(direct_cursor_retry_deadline)
             .chain(gamma_deadline)
+            .chain(vrr_clear_deadline)
+            .chain(vrr_cursor_deadline)
             .chain(source_wait_deadline)
             .chain(rescan_deadline)
             // Not gated on `allow_kms_timers`: `maybe_composite` closes the
@@ -3087,17 +3390,21 @@ impl KmsBackend {
         }
         let now = self.monotonic_now();
         for output_idx in 0..self.platform.outputs.len() {
-            let deadline_expired = {
+            let property_retry_due = {
                 let output = &self.platform.outputs[output_idx].output;
-                output.pending_gamma_lut.borrow().is_some()
+                (output.pending_gamma_lut.borrow().is_some()
                     && output
                         .pending_gamma_deadline
                         .get()
-                        .is_some_and(|deadline| now >= deadline)
+                        .is_some_and(|deadline| now >= deadline))
+                    || (!output.vrr_clear_waiting_for_flip.get()
+                        && output
+                            .vrr_clear_retry_deadline
+                            .get()
+                            .is_some_and(|deadline| now >= deadline))
             };
-            if deadline_expired {
-                self.platform
-                    .retry_pending_gamma_after_flip(output_idx, now);
+            if property_retry_due {
+                self.retry_pending_crtc_property_after_flip(output_idx, now);
             }
         }
         if self.pstate.tearing.is_on()
@@ -3158,11 +3465,16 @@ impl KmsBackend {
                 if self.pstate.scanout_m2.current.is_some()
                     && self.pstate.scanout_m2.queued_successor.is_none()
                 {
+                    let live_direct_vrr_wanted = self.live_direct_vrr_wanted_by_output();
                     for output_idx in 0..self.platform.outputs.len() {
-                        match self
-                            .platform
-                            .submit_atomic_cursor_move_for_output(output_idx)
-                        {
+                        match self.platform.submit_atomic_cursor_move_for_output(
+                            output_idx,
+                            self.monotonic_now(),
+                            live_direct_vrr_wanted
+                                .get(output_idx)
+                                .copied()
+                                .unwrap_or(false),
+                        ) {
                             Ok(outcome) => self.handle_cursor_move_outcome(outcome),
                             Err(error) => log::warn!(
                                 "render maybe_composite: cursor-only atomic commit failed for output {output_idx}: {error}"
@@ -3232,6 +3544,7 @@ impl KmsBackend {
             // its normal readiness and retry gates still control submission.
             self.scene.mark_scene_structure_dirty();
         }
+        let vrr_before = self.vrr_committed_snapshot();
         let composed_outputs = if self
             .tearing_cursor_compose_deadline(self.monotonic_now())
             .is_some()
@@ -3240,6 +3553,7 @@ impl KmsBackend {
         } else {
             self.compose_tick()
         };
+        self.log_vrr_committed_changes(&vrr_before, None, "inherited");
         // `scene.tick` drains already-signalled copied completions itself,
         // without entering backend_scanout_on_scanout_render_completion.
         self.record_accepted_degraded_unflip_replacements();
@@ -3262,6 +3576,7 @@ impl KmsBackend {
             composed_outputs.into_iter().flatten().collect();
         let cursor_outcome = self.platform.take_deferred_cursor_move_outcome();
         self.handle_cursor_move_outcome(cursor_outcome);
+        let live_direct_vrr_wanted = self.live_direct_vrr_wanted_by_output();
         for output_idx in 0..self.platform.outputs.len() {
             if scene_submitted_outputs.contains(&output_idx)
                 || self.scene.has_pending_page_flip(output_idx)
@@ -3273,10 +3588,14 @@ impl KmsBackend {
             {
                 continue;
             }
-            match self
-                .platform
-                .submit_atomic_cursor_move_for_output(output_idx)
-            {
+            match self.platform.submit_atomic_cursor_move_for_output(
+                output_idx,
+                self.monotonic_now(),
+                live_direct_vrr_wanted
+                    .get(output_idx)
+                    .copied()
+                    .unwrap_or(false),
+            ) {
                 Ok(outcome) => self.handle_cursor_move_outcome(outcome),
                 Err(error) => log::warn!(
                     "render maybe_composite: cursor-only atomic commit failed for output {output_idx}: {error}"

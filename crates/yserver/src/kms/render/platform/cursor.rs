@@ -1,6 +1,6 @@
 use crate::kms::render::platform::{
     CursorFailureDisposition, CursorHideRecovery, CursorMoveOutcome, KmsCursorState, KmsDevice,
-    PlatformBackend, TransientCursorFallback,
+    PendingAtomicCursorMove, PlatformBackend, TransientCursorFallback,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -8,6 +8,8 @@ use std::{
     rc::Rc,
     time::Instant,
 };
+
+pub(crate) const VRR_CURSOR_DEADLINE: std::time::Duration = std::time::Duration::from_millis(33);
 
 fn cursor_error_is_transient_fallback(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::InvalidInput
@@ -90,7 +92,12 @@ impl KmsCursorState {
         };
         self.atomic_positions.insert(crtc, position);
         if !self.cursor_hide_recovery.contains_key(&crtc) {
-            self.atomic_pending_moves.insert(crtc, position);
+            let deadline = self
+                .atomic_pending_moves
+                .get(&crtc)
+                .and_then(|pending| pending.deadline);
+            self.atomic_pending_moves
+                .insert(crtc, PendingAtomicCursorMove { position, deadline });
         }
     }
 
@@ -451,21 +458,69 @@ impl PlatformBackend {
         positions
     }
 
-    /// Whether a cursor-only position can make the scheduling pass runnable.
-    pub(crate) fn has_eligible_atomic_cursor_move(&self) -> bool {
-        self.devices.iter().any(|device| {
-            device.cursor.atomic_cursor
-                && device.cursor.atomic_pending_moves.iter().any(|(crtc, _)| {
-                    !device
-                        .cursor
-                        .atomic_cursor_commits_in_flight
-                        .contains_key(crtc)
+    fn vrr_cursor_hold_applies(&self, output_idx: usize, live_direct_vrr_wanted: bool) -> bool {
+        live_direct_vrr_wanted
+            && self
+                .outputs
+                .get(output_idx)
+                .is_some_and(|layout| layout.output.vrr_committed.get())
+    }
+
+    fn eligible_atomic_cursor_moves<'a>(
+        &'a self,
+        live_direct_vrr_wanted: &'a [bool],
+    ) -> impl Iterator<Item = (Option<Instant>, bool)> + 'a {
+        self.devices.iter().flat_map(move |device| {
+            device
+                .cursor
+                .atomic_pending_moves
+                .iter()
+                .filter_map(move |(crtc, pending)| {
+                    let output_is_vrr_on =
+                        self.outputs.iter().enumerate().any(|(output_idx, layout)| {
+                            layout.key.device_key == device.key
+                                && layout.output.crtc == *crtc
+                                && self.vrr_cursor_hold_applies(
+                                    output_idx,
+                                    live_direct_vrr_wanted
+                                        .get(output_idx)
+                                        .copied()
+                                        .unwrap_or(false),
+                                )
+                        });
+                    (device.cursor.atomic_cursor
+                        && !device
+                            .cursor
+                            .atomic_cursor_commits_in_flight
+                            .contains_key(crtc)
                         && !device.cursor.cursor_retry_waits_for_flip.contains(crtc)
                         && !device.cursor.cursor_hide_recovery.contains_key(crtc)
                         && device.cursor.available_on(*crtc)
-                        && device.cursor.hw_bound_on(*crtc)
+                        && device.cursor.hw_bound_on(*crtc))
+                    .then_some((pending.deadline, output_is_vrr_on))
                 })
         })
+    }
+
+    /// Whether a cursor-only position can make the scheduling pass runnable.
+    pub(crate) fn has_eligible_atomic_cursor_move(
+        &self,
+        now: Instant,
+        live_direct_vrr_wanted: &[bool],
+    ) -> bool {
+        self.eligible_atomic_cursor_moves(live_direct_vrr_wanted)
+            .any(|(deadline, output_is_vrr_on)| {
+                !output_is_vrr_on || deadline.is_none_or(|deadline| now >= deadline)
+            })
+    }
+
+    /// Earliest held VRR cursor position that is eligible to wake scanout.
+    pub(crate) fn vrr_cursor_deadline(&self, live_direct_vrr_wanted: &[bool]) -> Option<Instant> {
+        self.eligible_atomic_cursor_moves(live_direct_vrr_wanted)
+            .filter_map(|(deadline, output_is_vrr_on)| {
+                output_is_vrr_on.then_some(deadline).flatten()
+            })
+            .min()
     }
 
     /// Only an accepted cursor-only commit owes a flip event. An EBUSY wait owes
@@ -533,6 +588,8 @@ impl PlatformBackend {
     pub(crate) fn submit_atomic_cursor_move_for_output(
         &mut self,
         output_idx: usize,
+        now: Instant,
+        live_direct_vrr_wanted: bool,
     ) -> io::Result<CursorMoveOutcome> {
         use ::drm::control::AtomicCommitFlags;
 
@@ -541,6 +598,7 @@ impl PlatformBackend {
         };
         let device_key = layout.key.device_key;
         let crtc = layout.output.crtc;
+        let vrr_cursor_hold = self.vrr_cursor_hold_applies(output_idx, live_direct_vrr_wanted);
         let Some(device_idx) = self
             .devices
             .iter()
@@ -548,7 +606,9 @@ impl PlatformBackend {
         else {
             return Ok(CursorMoveOutcome::default());
         };
-        let cursor = &self.devices[device_idx].cursor;
+        let device = Rc::clone(&self.devices[device_idx].device);
+        let commit_sink = Rc::clone(&self.devices[device_idx].atomic_commit_sink);
+        let cursor = &mut self.devices[device_idx].cursor;
         if !cursor.atomic_cursor
             || cursor.atomic_cursor_commits_in_flight.contains_key(&crtc)
             || cursor.cursor_retry_waits_for_flip.contains(&crtc)
@@ -558,11 +618,18 @@ impl PlatformBackend {
         {
             return Ok(CursorMoveOutcome::default());
         }
-        let Some(position) = cursor.atomic_pending_moves.get(&crtc).copied() else {
+        let Some(pending) = cursor.atomic_pending_moves.get_mut(&crtc) else {
             return Ok(CursorMoveOutcome::default());
         };
-        let device = Rc::clone(&self.devices[device_idx].device);
-        let commit_sink = Rc::clone(&self.devices[device_idx].atomic_commit_sink);
+        if vrr_cursor_hold {
+            let deadline = *pending
+                .deadline
+                .get_or_insert_with(|| now + VRR_CURSOR_DEADLINE);
+            if now < deadline {
+                return Ok(CursorMoveOutcome::default());
+            }
+        }
+        let position = pending.position;
         let mut request = crate::drm::atomic::AtomicCommitRequest::new();
         request.add_cursor_position(position);
         let event = crate::drm::atomic::AtomicCommitEvent {
@@ -601,11 +668,15 @@ impl PlatformBackend {
             }
         };
 
+        if vrr_cursor_hold {
+            commit_sink.note_vrr_cursor_deadline_commit(crtc);
+        }
+
         let cursor = &mut self.devices[device_idx].cursor;
         if cursor
             .atomic_pending_moves
             .get(&crtc)
-            .is_some_and(|pending| *pending == position)
+            .is_some_and(|pending| pending.position == position)
         {
             cursor.atomic_pending_moves.remove(&crtc);
         }
@@ -786,7 +857,7 @@ impl PlatformBackend {
                     .cursor
                     .atomic_pending_moves
                     .get(&position.crtc)
-                    .is_some_and(|unsent| unsent == position)
+                    .is_some_and(|unsent| unsent.position == *position)
                 {
                     device.cursor.atomic_pending_moves.remove(&position.crtc);
                 }
@@ -927,6 +998,7 @@ impl PlatformBackend {
             .iter()
             .find(|device| device.key == device_key)
             .and_then(|device| device.cursor.atomic_pending_moves.get(&crtc).copied())
+            .map(|pending| pending.position)
     }
 
     #[cfg(test)]

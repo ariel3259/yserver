@@ -176,6 +176,8 @@ pub(crate) struct FlipEventTimestamps {
     pub(crate) commit_id: Option<u64>,
     /// CLOCK_MONOTONIC receipt time used by async ioctl-to-event turnaround.
     pub(crate) received_at_monotonic: Option<Duration>,
+    /// Raw kernel UST used for intervals between retired flips on one CRTC.
+    pub(crate) kernel_ust: Duration,
     /// Kernel completion time converted to CLOCK_MONOTONIC for Present latency.
     pub(crate) completion_at_monotonic: Option<Duration>,
 }
@@ -216,6 +218,12 @@ pub(super) struct CursorHideRecovery {
     retry_deadline: Option<std::time::Instant>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PendingAtomicCursorMove {
+    position: crate::drm::atomic::CursorPlanePosition,
+    deadline: Option<Instant>,
+}
+
 pub(crate) const CURSOR_HIDE_RECOVERY_MAX_ATTEMPTS: u8 = 3;
 
 /// Per-DRM-device hardware cursor state. Raw CRTC handles are device-local,
@@ -228,8 +236,7 @@ pub(crate) struct KmsCursorState {
     /// consumed only after an accepted commit carries it.
     atomic_positions:
         HashMap<::drm::control::crtc::Handle, crate::drm::atomic::CursorPlanePosition>,
-    atomic_pending_moves:
-        HashMap<::drm::control::crtc::Handle, crate::drm::atomic::CursorPlanePosition>,
+    atomic_pending_moves: HashMap<::drm::control::crtc::Handle, PendingAtomicCursorMove>,
     /// Accepted cursor-only commits, keyed by CRTC. A cursor-only commit is
     /// in flight only after its atomic ioctl succeeded.
     atomic_cursor_commits_in_flight:
@@ -669,6 +676,7 @@ impl PlatformBackend {
             return device.atomic_commit_sink.note_async_flip_event(
                 &device.device,
                 output.output.crtc,
+                output.output.vrr_committed.get(),
                 timestamps,
             );
         }
@@ -712,4 +720,5 @@ pub(crate) struct ConnectorSnapshot {
     pub(crate) mm_height: u32,
     pub(crate) edid: Vec<u8>,
     pub(crate) connector_type: String,
+    pub(crate) vrr_capable: bool,
 }

@@ -107,6 +107,13 @@ pub(super) fn clone_test_drm_output(
         crtc_out_fence_ptr_prop: output.crtc_out_fence_ptr_prop,
         crtc_gamma_lut_prop: output.crtc_gamma_lut_prop,
         crtc_gamma_lut_size: output.crtc_gamma_lut_size,
+        crtc_vrr_enabled_prop: output.crtc_vrr_enabled_prop,
+        connector_vrr_capable: output.connector_vrr_capable,
+        vrr_committed: std::cell::Cell::new(false),
+        vrr_disabled: std::cell::Cell::new(false),
+        vrr_clear_retry_used: std::cell::Cell::new(false),
+        vrr_clear_retry_deadline: std::cell::Cell::new(None),
+        vrr_clear_waiting_for_flip: std::cell::Cell::new(false),
         crtc_degamma_lut_prop: output.crtc_degamma_lut_prop,
         crtc_ctm_prop: output.crtc_ctm_prop,
         pending_gamma_lut: std::cell::RefCell::new(None),
@@ -1385,6 +1392,7 @@ fn randr_rebuild_restores_the_stable_provider_projection() {
                     mm_height: 0,
                     edid: Vec::new(),
                     connector_type: "unknown".to_string(),
+                    vrr_capable: false,
                 }],
                 &[]
             )
@@ -1506,6 +1514,7 @@ fn explicit_detach_survives_rebuild_disconnect_and_reconnect() {
                     mm_height: 0,
                     edid: Vec::new(),
                     connector_type: "DisplayPort".to_string(),
+                    vrr_capable: false,
                 }],
                 &[]
             )
@@ -1596,6 +1605,7 @@ fn explicit_detach_survives_rebuild_disconnect_and_reconnect() {
                     mm_height: 0,
                     edid: Vec::new(),
                     connector_type: "DisplayPort".to_string(),
+                    vrr_capable: false,
                 }],
                 &[]
             )
@@ -2148,6 +2158,7 @@ fn relight_test_snapshot(
         mm_height: 0,
         edid: Vec::new(),
         connector_type: "unknown".to_string(),
+        vrr_capable: false,
     }
 }
 
@@ -2223,6 +2234,7 @@ fn startup_inventory_reserves_xids_but_heavy_snapshot_owns_identity_and_state() 
         mm_width: 203,
         mm_height: 271,
         connector_type: "HDMI".into(),
+        vrr_capable: false,
     };
 
     backend.pstate.randr_id_alloc = RandrIdAllocator::default();
@@ -2341,6 +2353,7 @@ fn connector_registry_detects_edid_only_replacement_and_keeps_xids() {
         mm_width: 600,
         mm_height: 340,
         connector_type: "HDMI".to_string(),
+        vrr_capable: false,
     };
     let replacement = ConnectorSnapshot {
         edid: vec![0x03, 0x04],
@@ -2388,6 +2401,7 @@ fn live_randr_projection_uses_heavy_registry_identity() {
         mm_width: 203,
         mm_height: 271,
         connector_type: "HDMI".to_string(),
+        vrr_capable: false,
     };
 
     assert!(
@@ -2424,6 +2438,7 @@ fn connected_off_output_exposes_identity_and_disconnect_clears_it() {
         mm_width: 203,
         mm_height: 271,
         connector_type: "HDMI".to_string(),
+        vrr_capable: false,
     };
     assert!(
         !backend
@@ -2674,6 +2689,7 @@ fn light_mode_change_then_heavy_connected_route_retirement_is_not_a_second_confi
         mm_width: entry.mm_width,
         mm_height: entry.mm_height,
         connector_type: entry.connector_type.clone(),
+        vrr_capable: false,
     };
     let heavy_delta = backend
         .reconcile_connector_registry(std::slice::from_ref(&snapshot), std::slice::from_ref(&key));
@@ -2801,6 +2817,7 @@ fn same_signature_monitor_replacement_keeps_exact_timings_distinct() {
         mm_width: 211,
         mm_height: 158,
         connector_type: "HDMI".to_string(),
+        vrr_capable: false,
     };
 
     assert!(

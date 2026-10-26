@@ -615,6 +615,7 @@ impl KmsBackend {
     /// happens after the Vk context is attached.
     fn for_tests_seed() -> Self {
         let pstate = KmsBackendState {
+            vrr_mode: crate::launch::VrrMode::Property,
             scanout_m0: ScanoutM0Telemetry::default(),
             scanout_m1: ScanoutM1ProbeCache::new(),
             scanout_m2: ScanoutM2State::new(),

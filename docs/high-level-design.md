@@ -217,8 +217,7 @@ direct-scanout-eligible client that presents with
 `PresentOptionAsync` is flipped asynchronously and may tear, as
 under Xorg's modesetting driver (yserver advertises
 `PresentCapabilityAsync`, not `PresentCapabilityAsyncMayTear`).
-VRR and color management / HDR are valid future directions but not
-yet implemented.
+VRR is off by default; `--vrr` honors `_VARIABLE_REFRESH` CARDINAL/32 value 1 for client-owned direct scanout. NVIDIA clients get no VRR yet; support is a follow-up. Color management / HDR is a valid future direction but not yet implemented.
 
 ## What's not in this document
 

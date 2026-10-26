@@ -25,6 +25,7 @@ use crate::{
         },
     },
 };
+use ::drm::control::Device as _;
 use std::{collections::HashMap, io, os::fd::AsFd as _, path::PathBuf, rc::Rc, sync::Arc};
 
 fn retain_live_vk_contexts_after_terminal_probe(
@@ -280,11 +281,14 @@ impl Drop for PlatformBackend {
         if !self.initial_scanout_rollback_armed {
             return;
         }
-        rollback_initial_scanout_with(
-            &self.devices,
-            &mut self.outputs,
-            &mut drm::modeset::disable_output,
-        );
+        rollback_initial_scanout_with(&self.devices, &mut self.outputs, &mut |device, output| {
+            drm::modeset::disable_output(device, output, |request| {
+                device.atomic_commit(
+                    ::drm::control::AtomicCommitFlags::ALLOW_MODESET,
+                    request.into_atomic_mode_req(),
+                )
+            })
+        });
         self.initial_scanout_rollback_armed = false;
     }
 }
@@ -383,11 +387,15 @@ impl PlatformBackend {
             initialize_cursor_plane_for_device(kms_device, &crtcs, "active startup");
         }
 
-        let mut initial_scanout_rollback = InitialScanoutRollbackGuard::new_with(
-            &devices,
-            &mut layouts,
-            drm::modeset::disable_output,
-        );
+        let mut initial_scanout_rollback =
+            InitialScanoutRollbackGuard::new_with(&devices, &mut layouts, |device, output| {
+                drm::modeset::disable_output(device, output, |request| {
+                    device.atomic_commit(
+                        ::drm::control::AtomicCommitFlags::ALLOW_MODESET,
+                        request.into_atomic_mode_req(),
+                    )
+                })
+            });
 
         let requested_render_node = render_node.as_ref().map(|node| node.key());
         let vk_result = devices.first().map_or_else(VkContext::new, |display| {
@@ -854,6 +862,13 @@ impl PlatformBackend {
                     crtc_out_fence_ptr_prop: None,
                     crtc_gamma_lut_prop: None,
                     crtc_gamma_lut_size: None,
+                    crtc_vrr_enabled_prop: None,
+                    connector_vrr_capable: false,
+                    vrr_committed: std::cell::Cell::new(false),
+                    vrr_disabled: std::cell::Cell::new(false),
+                    vrr_clear_retry_used: std::cell::Cell::new(false),
+                    vrr_clear_retry_deadline: std::cell::Cell::new(None),
+                    vrr_clear_waiting_for_flip: std::cell::Cell::new(false),
                     crtc_degamma_lut_prop: None,
                     crtc_ctm_prop: None,
                     pending_gamma_lut: std::cell::RefCell::new(None),

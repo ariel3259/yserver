@@ -19,7 +19,10 @@ use crate::drm::{
         AtomicCommitEvent, AtomicCommitKind, AtomicCommitRequest, AtomicCommitSink,
         CursorPlanePosition,
     },
-    modeset::{Output, PropMap, append_pending_gamma_lut, submit_frame_with_pending_gamma_lut},
+    modeset::{
+        Output, PendingCrtcProperties, PropMap, append_pending_crtc_properties,
+        submit_frame_with_pending_crtc_properties,
+    },
 };
 
 #[cfg(target_os = "linux")]
@@ -285,25 +288,23 @@ pub(crate) fn submit_scene_flip_with_fences_tearing(
             crate::drm::async_flip::FlipTiming::Vsync => AtomicCommitFlags::empty(),
             crate::drm::async_flip::FlipTiming::Async => AtomicCommitFlags::PAGE_FLIP_ASYNC,
         };
-    let mut request_without_gamma = None;
-    let gamma_blob = if timing == crate::drm::async_flip::FlipTiming::Vsync
-        && output.crtc_gamma_lut_prop.is_some()
-        && !output.gamma_lut_disabled.get()
-        && output.pending_gamma_lut.borrow().is_some()
-    {
-        request_without_gamma = Some(request.clone());
-        append_pending_gamma_lut(device, atomic_commit_sink, output, &mut request)
+    let crtc_properties = if timing == crate::drm::async_flip::FlipTiming::Vsync {
+        append_pending_crtc_properties(
+            device,
+            atomic_commit_sink,
+            &mut request,
+            std::iter::once((output, false)),
+        )
     } else {
-        None
+        PendingCrtcProperties::empty()
     };
-    submit_frame_with_pending_gamma_lut(
+    submit_frame_with_pending_crtc_properties(
         device,
         atomic_commit_sink,
         request,
-        request_without_gamma,
-        gamma_blob
-            .map(|blob| vec![(output, blob)])
-            .unwrap_or_default(),
+        crtc_properties.request_without_crtc_properties,
+        crtc_properties.gamma_blobs,
+        crtc_properties.vrr_changes,
         |request| {
             atomic_commit_sink.submit_tearing_with_commit_id(
                 device,

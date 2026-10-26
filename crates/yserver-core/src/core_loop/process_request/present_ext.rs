@@ -933,6 +933,13 @@ pub(super) fn execute_present_pixmap_copy(
         ),
     };
 
+    let variable_refresh = crate::properties::variable_refresh_property_enabled(
+        state
+            .atoms
+            .id_for("_VARIABLE_REFRESH")
+            .and_then(|atom| state.resources.window_property(ResourceId(window), atom)),
+    );
+
     let candidate = crate::backend::PresentScanoutCandidate {
         client_id: client_id.0,
         present_id,
@@ -940,6 +947,7 @@ pub(super) fn execute_present_pixmap_copy(
         crtc_epoch,
         src_pixmap_xid: pixmap,
         dst_window_xid: window,
+        variable_refresh,
         src_host_xid,
         paint_dst_host_xid,
         completion_dst_host_xid,

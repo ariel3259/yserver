@@ -211,6 +211,22 @@ pub struct Output {
     /// Cached atomic gamma properties. A missing `GAMMA_LUT` property means
     /// this CRTC does not expose gamma correction.
     pub crtc_gamma_lut_prop: Option<property::Handle>,
+    /// Cached atomic adaptive-sync property. `None` means this CRTC does not
+    /// expose `VRR_ENABLED`.
+    pub crtc_vrr_enabled_prop: Option<property::Handle>,
+    /// Whether the connector's current `vrr_capable` property is exactly 1.
+    /// Refreshed from the physical connector snapshot on rescan.
+    pub connector_vrr_capable: bool,
+    /// Value currently held by the kernel for this CRTC's `VRR_ENABLED`.
+    pub(crate) vrr_committed: Cell<bool>,
+    /// Per-CRTC EINVAL capability latch for `VRR_ENABLED`.
+    pub(crate) vrr_disabled: Cell<bool>,
+    /// Whether the one follow-up clear was also rejected after VRR latched off.
+    pub(crate) vrr_clear_retry_used: Cell<bool>,
+    /// Deadline for retrying a standalone clear rejected by a non-EINVAL error.
+    pub(crate) vrr_clear_retry_deadline: Cell<Option<std::time::Instant>>,
+    /// EBUSY means the clear waits for the CRTC's next flip event.
+    pub(crate) vrr_clear_waiting_for_flip: Cell<bool>,
     /// Raw `GAMMA_LUT_SIZE` property value. Used only when the legacy CRTC
     /// gamma length is zero.
     pub crtc_gamma_lut_size: Option<u64>,
@@ -258,10 +274,76 @@ pub struct Output {
 
 pub(crate) type GammaRamp = (Vec<u16>, Vec<u16>, Vec<u16>);
 
+/// Refresh period shared by standalone CRTC-property retry paths.
+pub(crate) fn output_refresh_period(output: &Output) -> std::time::Duration {
+    let refresh_hz = match output.picked.vrefresh {
+        0 => 60,
+        refresh_hz => refresh_hz,
+    };
+    std::time::Duration::from_nanos(1_000_000_000 / u64::from(refresh_hz))
+}
+
 impl Output {
     pub(crate) fn cache_crtc_gamma_properties(&mut self, properties: Option<&PropMap>) {
         self.crtc_gamma_lut_prop = properties.and_then(|props| props.id("GAMMA_LUT").ok());
         self.crtc_gamma_lut_size = properties.and_then(|props| props.value("GAMMA_LUT_SIZE"));
+    }
+
+    pub(crate) fn cache_crtc_vrr_properties(
+        &mut self,
+        properties: Option<&PropMap>,
+        connector_vrr_capable: Option<u64>,
+    ) {
+        self.crtc_vrr_enabled_prop = properties.and_then(|props| props.id("VRR_ENABLED").ok());
+        self.connector_vrr_capable = connector_vrr_capable == Some(1);
+        self.vrr_committed.set(
+            properties
+                .and_then(|props| props.value("VRR_ENABLED"))
+                .is_some_and(|value| value != 0),
+        );
+        self.vrr_clear_retry_used.set(false);
+        self.vrr_clear_retry_deadline.set(None);
+        self.vrr_clear_waiting_for_flip.set(false);
+    }
+
+    pub(crate) fn vrr_capable(&self) -> bool {
+        self.crtc_vrr_enabled_prop.is_some()
+            && self.connector_vrr_capable
+            && !self.vrr_disabled.get()
+    }
+
+    /// Refresh the committed value after regaining DRM master, when another
+    /// master may have changed `VRR_ENABLED` while this server was away.
+    pub(crate) fn refresh_vrr_committed_from_kernel(
+        &self,
+        read_property: impl FnOnce(property::Handle) -> io::Result<Option<u64>>,
+    ) {
+        let Some(property) = self.crtc_vrr_enabled_prop else {
+            self.vrr_committed.set(false);
+            return;
+        };
+        let value = match read_property(property) {
+            Ok(value) => value,
+            Err(error) => {
+                log::warn!(
+                    "kms: could not refresh VRR_ENABLED for CRTC {:?}: {error}",
+                    self.crtc
+                );
+                return;
+            }
+        };
+        if let Some(value) = value {
+            self.vrr_committed.set(value != 0);
+            self.vrr_clear_retry_used.set(false);
+            self.vrr_clear_retry_deadline.set(None);
+            self.vrr_clear_waiting_for_flip.set(false);
+        } else {
+            log::warn!(
+                "kms: CRTC {:?} no longer exposes cached VRR_ENABLED property {:?}",
+                self.crtc,
+                property
+            );
+        }
     }
 }
 
@@ -306,6 +388,96 @@ pub(crate) fn append_pending_gamma_lut(
     Some(blob)
 }
 
+/// Add a changed VRR_ENABLED value to a frame request. The shared assembler
+/// chooses the VRR property class before calling this helper.
+pub(crate) fn append_vrr_change(
+    output: &Output,
+    wanted: bool,
+    request: &mut AtomicCommitRequest,
+) -> Option<bool> {
+    let property = output.crtc_vrr_enabled_prop?;
+    let value = changed_vrr_value(output, wanted)?;
+    request.add_raw_property(output.crtc.into(), property, u64::from(value));
+    Some(value)
+}
+
+fn changed_vrr_value(output: &Output, wanted: bool) -> Option<bool> {
+    output.crtc_vrr_enabled_prop?;
+    let value = wanted && output.vrr_capable();
+    if output.vrr_committed.get() == value
+        || (!value && output.vrr_disabled.get() && output.vrr_clear_retry_used.get())
+    {
+        return None;
+    }
+    Some(value)
+}
+
+/// Pending optional CRTC changes assembled for one frame. The shared assembler
+/// populates only one property class per request. The fallback is the same
+/// frame without optional CRTC properties, preserving the single EINVAL
+/// attribution path while letting all frame builders share assembly.
+pub(crate) struct PendingCrtcProperties<'output> {
+    pub(crate) request_without_crtc_properties: Option<AtomicCommitRequest>,
+    pub(crate) gamma_blobs: Vec<(&'output Output, u64)>,
+    pub(crate) vrr_changes: Vec<(&'output Output, bool)>,
+}
+
+impl PendingCrtcProperties<'_> {
+    pub(crate) fn empty() -> Self {
+        Self {
+            request_without_crtc_properties: None,
+            gamma_blobs: Vec::new(),
+            vrr_changes: Vec::new(),
+        }
+    }
+}
+
+/// Select one optional CRTC property class for the entire request, then append
+/// its changes. A due VRR clear selects VRR changes even when gamma is pending;
+/// otherwise pending gamma selects gamma changes and defers VRR enables. The
+/// helper owns the common fallback snapshot and change tracking so direct,
+/// composed and scene frames use the same retry rules.
+pub(crate) fn append_pending_crtc_properties<'output>(
+    device: &Device,
+    sink: &AtomicCommitSink,
+    request: &mut AtomicCommitRequest,
+    outputs: impl IntoIterator<Item = (&'output Output, bool)>,
+) -> PendingCrtcProperties<'output> {
+    let mut changes = PendingCrtcProperties::empty();
+    let outputs: Vec<_> = outputs.into_iter().collect();
+    let vrr_clear_due = outputs
+        .iter()
+        .any(|(output, wanted)| changed_vrr_value(output, *wanted) == Some(false));
+    let gamma_pending = outputs.iter().any(|(output, _)| {
+        output.crtc_gamma_lut_prop.is_some()
+            && !output.gamma_lut_disabled.get()
+            && output.pending_gamma_lut.borrow().is_some()
+    });
+    let append_gamma = !vrr_clear_due && gamma_pending;
+
+    for (output, wanted) in outputs {
+        if append_gamma {
+            let request_before_gamma = request.clone();
+            if let Some(blob) = append_pending_gamma_lut(device, sink, output, request) {
+                changes
+                    .request_without_crtc_properties
+                    .get_or_insert(request_before_gamma);
+                changes.gamma_blobs.push((output, blob));
+            }
+            continue;
+        }
+        if let Some(value) = changed_vrr_value(output, wanted) {
+            changes
+                .request_without_crtc_properties
+                .get_or_insert_with(|| request.clone());
+            append_vrr_change(output, wanted, request)
+                .expect("the VRR property remains available after checking its change");
+            changes.vrr_changes.push((output, value));
+        }
+    }
+    changes
+}
+
 /// Retire the userspace blob and update the pending/capability state after a
 /// commit attempt that included this output's gamma property. `latch_einval`
 /// is true for a gamma-only submit or when a frame's no-LUT retry succeeded.
@@ -344,30 +516,64 @@ pub(crate) fn finish_pending_gamma_lut(
     }
 }
 
-/// Submit one frame with its pending LUT and retry that same frame without the
-/// LUT only when the first request returns EINVAL. Gamma is disabled only
-/// when the no-LUT retry succeeds; otherwise the pending ramp remains intact.
-pub(crate) fn submit_frame_with_pending_gamma_lut(
+pub(crate) fn finish_pending_vrr_change(
+    output: &Output,
+    value: bool,
+    commit_result: &io::Result<u64>,
+    latch_einval: bool,
+) {
+    match commit_result {
+        Ok(_) => {
+            output.vrr_committed.set(value);
+            if !value {
+                output.vrr_clear_retry_used.set(false);
+                output.vrr_clear_retry_deadline.set(None);
+                output.vrr_clear_waiting_for_flip.set(false);
+            }
+        }
+        Err(error) if latch_einval && error.raw_os_error() == Some(libc::EINVAL) => {
+            let was_disabled = output.vrr_disabled.replace(true);
+            if !value && was_disabled {
+                output.vrr_clear_retry_used.set(true);
+            }
+            if !was_disabled {
+                log::warn!(
+                    "kms: vrr rejected by CRTC {}; disabling VRR for this CRTC",
+                    u32::from(output.crtc)
+                );
+            }
+        }
+        Err(_) => {}
+    }
+}
+
+/// Submit one frame with pending CRTC properties and retry that same frame
+/// without them only when the first request returns EINVAL.
+pub(crate) fn submit_frame_with_pending_crtc_properties(
     device: &Device,
     sink: &AtomicCommitSink,
     request: AtomicCommitRequest,
-    request_without_gamma: Option<AtomicCommitRequest>,
+    request_without_crtc_properties: Option<AtomicCommitRequest>,
     gamma_blobs: Vec<(&Output, u64)>,
+    vrr_changes: Vec<(&Output, bool)>,
     mut submit: impl FnMut(AtomicCommitRequest) -> io::Result<u64>,
 ) -> io::Result<u64> {
     let result = submit(request);
-    let rejected_gamma = !gamma_blobs.is_empty()
+    let rejected_crtc_property = (!gamma_blobs.is_empty() || !vrr_changes.is_empty())
         && result
             .as_ref()
             .is_err_and(|error| error.raw_os_error() == Some(libc::EINVAL));
-    let retry_result = if rejected_gamma {
-        request_without_gamma.map(submit)
+    let retry_result = if rejected_crtc_property {
+        request_without_crtc_properties.map(submit)
     } else {
         None
     };
-    let latch_einval = retry_result.as_ref().is_some_and(Result::is_ok);
+    let retry_accepted = retry_result.as_ref().is_some_and(Result::is_ok);
     for (output, blob) in gamma_blobs {
-        finish_pending_gamma_lut(device, sink, output, blob, &result, latch_einval);
+        finish_pending_gamma_lut(device, sink, output, blob, &result, retry_accepted);
+    }
+    for (output, value) in vrr_changes {
+        finish_pending_vrr_change(output, value, &result, retry_accepted);
     }
     retry_result.unwrap_or(result)
 }
@@ -410,6 +616,7 @@ pub(crate) struct ConnectorSnapshotProbe {
     pub(crate) mm_height: u32,
     pub(crate) edid: Vec<u8>,
     pub(crate) connector_type: String,
+    pub(crate) vrr_capable: bool,
 }
 
 /// Whether the kernel marks a connector as unsuitable for a desktop layout.
@@ -482,13 +689,15 @@ pub(crate) fn probe_connector_snapshots(
         let connector_name = xorg_output_name(info.interface(), info.interface_id());
         let modes = probe_modes(&info);
         let (mm_width, mm_height) = info.size().unwrap_or((0, 0));
+        let (edid, vrr_capable) = connector_metadata(device, handle);
         probes.push(ConnectorSnapshotProbe {
             connector_type: randr_connector_type_name(&connector_name),
             connector_name,
             modes,
             mm_width,
             mm_height,
-            edid: connector_edid_blob(device, handle),
+            edid,
+            vrr_capable: vrr_capable == Some(1),
         });
     }
     Ok(probes)
@@ -986,6 +1195,7 @@ fn finalize_output_with_mode(
     let plane_crtc_h_prop = plane_props_map.id("CRTC_H")?;
     let plane_in_fence_fd_prop = plane_props_map.id("IN_FENCE_FD").ok();
     let crtc_props = PropMap::for_object(device, asg.crtc).ok();
+    let (edid, connector_vrr_capable_value) = connector_metadata(device, asg.connector);
     let crtc_out_fence_ptr_prop = crtc_props
         .as_ref()
         .and_then(|props| props.id("OUT_FENCE_PTR").ok());
@@ -1008,7 +1218,6 @@ fn finalize_output_with_mode(
     );
 
     let (mm_width, mm_height) = connector_info.size().unwrap_or((0, 0));
-    let edid = connector_edid_blob(device, asg.connector);
     let connector_type = randr_connector_type_name(&asg.connector_name);
 
     // Full advertised mode list, sorted preferred-first (matching Xorg
@@ -1041,6 +1250,13 @@ fn finalize_output_with_mode(
         crtc_out_fence_ptr_prop,
         crtc_gamma_lut_prop: None,
         crtc_gamma_lut_size: None,
+        crtc_vrr_enabled_prop: None,
+        connector_vrr_capable: false,
+        vrr_committed: Cell::new(false),
+        vrr_disabled: Cell::new(false),
+        vrr_clear_retry_used: Cell::new(false),
+        vrr_clear_retry_deadline: Cell::new(None),
+        vrr_clear_waiting_for_flip: Cell::new(false),
         crtc_degamma_lut_prop,
         crtc_ctm_prop,
         pending_gamma_lut: RefCell::new(None),
@@ -1054,6 +1270,18 @@ fn finalize_output_with_mode(
         modes,
     };
     output.cache_crtc_gamma_properties(crtc_props.as_ref());
+    output.cache_crtc_vrr_properties(crtc_props.as_ref(), connector_vrr_capable_value);
+    log::info!(
+        "kms: vrr capable={} (vrr_capable={}, VRR_ENABLED={}) output={}",
+        output.vrr_capable(),
+        connector_vrr_capable_value.map_or_else(|| "absent".to_string(), |value| value.to_string()),
+        if output.crtc_vrr_enabled_prop.is_some() {
+            "present"
+        } else {
+            "absent"
+        },
+        output.connector_name
+    );
     Ok(output)
 }
 
@@ -1093,24 +1321,29 @@ fn xorg_output_name(interface: connector::Interface, interface_id: u32) -> Strin
     format!("{base}-{interface_id}")
 }
 
-/// Read the connector's raw `EDID` property blob (empty if absent).
-fn connector_edid_blob(device: &Device, connector: connector::Handle) -> Vec<u8> {
+/// Read connector-owned blob and adaptive-sync metadata from the same
+/// property snapshot. Missing properties are represented as empty/absent.
+fn connector_metadata(device: &Device, connector: connector::Handle) -> (Vec<u8>, Option<u64>) {
     let Ok(props) = device.get_properties(connector) else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
+    let mut edid = Vec::new();
+    let mut vrr_capable = None;
     for (prop_handle, raw_value) in &props {
         let Ok(info) = device.get_property(*prop_handle) else {
             continue;
         };
-        if info.name().to_bytes() != b"EDID" {
-            continue;
+        match info.name().to_bytes() {
+            b"EDID" => {
+                if *raw_value != 0 {
+                    edid = device.get_property_blob(*raw_value).unwrap_or_default();
+                }
+            }
+            b"vrr_capable" => vrr_capable = Some(*raw_value),
+            _ => {}
         }
-        if *raw_value == 0 {
-            return Vec::new();
-        }
-        return device.get_property_blob(*raw_value).unwrap_or_default();
     }
-    Vec::new()
+    (edid, vrr_capable)
 }
 
 /// Map a DRM connector name (e.g. `"HDMI-A-1"`, `"DP-2"`, `"eDP-1"`) to
@@ -1320,25 +1553,63 @@ impl PropMap {
     }
 }
 
-pub fn disable_output(device: &Device, output: &Output) -> io::Result<()> {
+pub(crate) fn disable_output(
+    device: &Device,
+    output: &Output,
+    submit: impl FnMut(AtomicCommitRequest) -> io::Result<()>,
+) -> io::Result<()> {
     let connector_props = PropMap::for_object(device, output.connector)?;
     let crtc_props = PropMap::for_object(device, output.crtc)?;
+    disable_output_with_properties(output, &connector_props, &crtc_props, submit).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("disable_output atomic commit rejected: {err}"),
+        )
+    })
+}
 
-    let mut req = AtomicModeReq::new();
-    req.add_raw_property(output.plane.into(), output.plane_fb_id_prop, 0);
-    req.add_raw_property(output.plane.into(), output.plane_crtc_id_prop, 0);
-    req.add_raw_property(output.crtc.into(), crtc_props.id("ACTIVE")?, 0);
-    req.add_raw_property(output.crtc.into(), crtc_props.id("MODE_ID")?, 0);
-    req.add_raw_property(output.connector.into(), connector_props.id("CRTC_ID")?, 0);
-
-    device
-        .atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req)
-        .map_err(|err| {
-            io::Error::new(
-                err.kind(),
-                format!("disable_output atomic commit rejected: {err}"),
-            )
-        })
+/// Build the per-output all-off request from discovered property maps. The
+/// production wrapper supplies maps read from the device; backend tests pass
+/// maps from their fixture and record this same production-built request.
+pub(crate) fn disable_output_with_properties(
+    output: &Output,
+    connector_props: &PropMap,
+    crtc_props: &PropMap,
+    mut submit: impl FnMut(AtomicCommitRequest) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut request = AtomicCommitRequest::new();
+    request.add_raw_property(output.plane.into(), output.plane_fb_id_prop, 0);
+    request.add_raw_property(output.plane.into(), output.plane_crtc_id_prop, 0);
+    request.add_raw_property(output.crtc.into(), crtc_props.id("ACTIVE")?, 0);
+    request.add_raw_property(output.crtc.into(), crtc_props.id("MODE_ID")?, 0);
+    request.add_raw_property(output.connector.into(), connector_props.id("CRTC_ID")?, 0);
+    let vrr_property = output
+        .vrr_committed
+        .get()
+        .then_some(output.crtc_vrr_enabled_prop)
+        .flatten();
+    let request_without_vrr = vrr_property.map(|_| request.clone());
+    if let Some(property) = vrr_property {
+        request.add_raw_property(output.crtc.into(), property, 0);
+    }
+    match submit(request) {
+        Ok(()) => {
+            if vrr_property.is_some() {
+                output.vrr_committed.set(false);
+                output.vrr_clear_retry_deadline.set(None);
+                output.vrr_clear_waiting_for_flip.set(false);
+            }
+            Ok(())
+        }
+        Err(error) if let Some(request_without_vrr) = request_without_vrr => {
+            log::warn!(
+                "kms: vrr clear rejected on CRTC {}: {error}",
+                u32::from(output.crtc)
+            );
+            submit(request_without_vrr)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Turn every CRTC, connector and plane of `device` off in one
@@ -1353,31 +1624,82 @@ pub fn disable_output(device: &Device, output: &Output) -> io::Result<()> {
 /// hw/xfree86/drivers/modesetting/drmmode_display.c:3765-3770) and sets the
 /// used ones from scratch; clearing the whole device first gives the
 /// per-output commits that clean state.
-pub fn disable_all_outputs_on_device(device: &Device) -> io::Result<()> {
+pub(crate) fn disable_all_outputs_on_device(
+    device: &Device,
+    submit: impl FnMut(AtomicCommitRequest) -> io::Result<()>,
+) -> io::Result<()> {
     let resources = device.resource_handles()?;
-    let mut req = AtomicModeReq::new();
-    for plane in device.plane_handles()? {
-        let props = PropMap::for_object(device, plane)?;
-        req.add_raw_property(plane.into(), props.id("FB_ID")?, 0);
-        req.add_raw_property(plane.into(), props.id("CRTC_ID")?, 0);
+    let planes = device
+        .plane_handles()?
+        .into_iter()
+        .map(|plane| Ok((plane, PropMap::for_object(device, plane)?)))
+        .collect::<io::Result<Vec<_>>>()?;
+    let crtcs = resources
+        .crtcs()
+        .iter()
+        .copied()
+        .map(|crtc| Ok((crtc, PropMap::for_object(device, crtc)?)))
+        .collect::<io::Result<Vec<_>>>()?;
+    let connectors = resources
+        .connectors()
+        .iter()
+        .copied()
+        .map(|connector| Ok((connector, PropMap::for_object(device, connector)?)))
+        .collect::<io::Result<Vec<_>>>()?;
+    disable_all_outputs_with_properties(planes, crtcs, connectors, submit).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("device-wide disable atomic commit rejected: {err}"),
+        )
+    })
+}
+
+/// Build the device-wide all-off request from discovered property maps. This
+/// is shared with the production wrapper so tests can record requests without
+/// asking a real KMS device for its object properties.
+pub(crate) fn disable_all_outputs_with_properties(
+    planes: Vec<(plane::Handle, PropMap)>,
+    crtcs: Vec<(crtc::Handle, PropMap)>,
+    connectors: Vec<(connector::Handle, PropMap)>,
+    mut submit: impl FnMut(AtomicCommitRequest) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut request = AtomicCommitRequest::new();
+    for (plane, props) in planes {
+        request.add_raw_property(plane.into(), props.id("FB_ID")?, 0);
+        request.add_raw_property(plane.into(), props.id("CRTC_ID")?, 0);
     }
-    for &crtc in resources.crtcs() {
-        let props = PropMap::for_object(device, crtc)?;
-        req.add_raw_property(crtc.into(), props.id("ACTIVE")?, 0);
-        req.add_raw_property(crtc.into(), props.id("MODE_ID")?, 0);
+    for (crtc, props) in &crtcs {
+        request.add_raw_property((*crtc).into(), props.id("ACTIVE")?, 0);
+        request.add_raw_property((*crtc).into(), props.id("MODE_ID")?, 0);
     }
-    for &connector in resources.connectors() {
-        let props = PropMap::for_object(device, connector)?;
-        req.add_raw_property(connector.into(), props.id("CRTC_ID")?, 0);
+    for (connector, props) in connectors {
+        request.add_raw_property(connector.into(), props.id("CRTC_ID")?, 0);
     }
-    device
-        .atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req)
-        .map_err(|err| {
-            io::Error::new(
-                err.kind(),
-                format!("device-wide disable atomic commit rejected: {err}"),
-            )
-        })
+    let request_without_vrr = request.clone();
+    let mut vrr_crtcs = Vec::new();
+    for (crtc, props) in &crtcs {
+        if props.value("VRR_ENABLED") == Some(1)
+            && let Ok(property) = props.id("VRR_ENABLED")
+        {
+            request.add_raw_property((*crtc).into(), property, 0);
+            vrr_crtcs.push(*crtc);
+        }
+    }
+    if vrr_crtcs.is_empty() {
+        return submit(request);
+    }
+    match submit(request) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            for crtc in vrr_crtcs {
+                log::warn!(
+                    "kms: vrr clear rejected on CRTC {}: {error}",
+                    u32::from(crtc)
+                );
+            }
+            submit(request_without_vrr)
+        }
+    }
 }
 
 /// Log what the kernel currently holds on `device` (every CRTC, connector
@@ -1848,6 +2170,7 @@ pub(crate) fn submit_direct_scanout(
     fb: framebuffer::Handle,
     planes: &[DirectScanoutPlaneState<'_>],
     cursor_positions: &[CursorPlanePosition],
+    vrr_wanted: bool,
     timing: crate::drm::async_flip::FlipTiming,
     tearing_context: crate::drm::atomic::TearingCommitContext,
 ) -> io::Result<u64> {
@@ -1859,24 +2182,16 @@ pub(crate) fn submit_direct_scanout(
         crate::drm::async_flip::FlipTiming::Async => &[],
     };
     let mut request = direct_scanout_request(fb, planes, cursor_positions);
-    let mut gamma_blobs = Vec::new();
-    let mut request_without_gamma = None;
-    if timing == crate::drm::async_flip::FlipTiming::Vsync {
-        for state in planes {
-            if state.output.crtc_gamma_lut_prop.is_some()
-                && !state.output.gamma_lut_disabled.get()
-                && state.output.pending_gamma_lut.borrow().is_some()
-                && request_without_gamma.is_none()
-            {
-                request_without_gamma = Some(request.clone());
-            }
-            if let Some(blob) =
-                append_pending_gamma_lut(device, atomic_commit_sink, state.output, &mut request)
-            {
-                gamma_blobs.push((state.output, blob));
-            }
-        }
-    }
+    let crtc_properties = if timing == crate::drm::async_flip::FlipTiming::Vsync {
+        append_pending_crtc_properties(
+            device,
+            atomic_commit_sink,
+            &mut request,
+            planes.iter().map(|state| (state.output, vrr_wanted)),
+        )
+    } else {
+        PendingCrtcProperties::empty()
+    };
     let events: Vec<_> = planes
         .iter()
         .map(|state| AtomicCommitEvent {
@@ -1897,12 +2212,13 @@ pub(crate) fn submit_direct_scanout(
             crate::drm::async_flip::FlipTiming::Vsync => AtomicCommitFlags::empty(),
             crate::drm::async_flip::FlipTiming::Async => AtomicCommitFlags::PAGE_FLIP_ASYNC,
         };
-    submit_frame_with_pending_gamma_lut(
+    submit_frame_with_pending_crtc_properties(
         device,
         atomic_commit_sink,
         request,
-        request_without_gamma,
-        gamma_blobs,
+        crtc_properties.request_without_crtc_properties,
+        crtc_properties.gamma_blobs,
+        crtc_properties.vrr_changes,
         |request| {
             atomic_commit_sink.submit_tearing_with_commit_id(
                 device,
@@ -2057,21 +2373,12 @@ pub(crate) fn submit_composed_scanout(
     for position in cursor_positions {
         request.add_cursor_position(*position);
     }
-    let has_pending_gamma = planes.iter().any(|state| {
-        let output = state.output;
-        output.crtc_gamma_lut_prop.is_some()
-            && !output.gamma_lut_disabled.get()
-            && output.pending_gamma_lut.borrow().is_some()
-    });
-    let request_without_gamma = has_pending_gamma.then(|| request.clone());
-    let mut gamma_blobs = Vec::new();
-    for state in planes {
-        if let Some(blob) =
-            append_pending_gamma_lut(device, atomic_commit_sink, state.output, &mut request)
-        {
-            gamma_blobs.push((state.output, blob));
-        }
-    }
+    let crtc_properties = append_pending_crtc_properties(
+        device,
+        atomic_commit_sink,
+        &mut request,
+        planes.iter().map(|state| (state.output, false)),
+    );
     let events: Vec<_> = planes
         .iter()
         .map(|state| AtomicCommitEvent {
@@ -2087,12 +2394,13 @@ pub(crate) fn submit_composed_scanout(
     } else {
         AtomicCommitKind::SceneWithCursor
     };
-    submit_frame_with_pending_gamma_lut(
+    submit_frame_with_pending_crtc_properties(
         device,
         atomic_commit_sink,
         request,
-        request_without_gamma,
-        gamma_blobs,
+        crtc_properties.request_without_crtc_properties,
+        crtc_properties.gamma_blobs,
+        crtc_properties.vrr_changes,
         |request| {
             atomic_commit_sink.submit_with_commit_id(
                 device,

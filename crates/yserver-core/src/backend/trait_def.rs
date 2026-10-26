@@ -121,6 +121,9 @@ pub struct PresentScanoutCandidate {
     pub crtc_epoch: u64,
     pub src_pixmap_xid: u32,
     pub dst_window_xid: u32,
+    /// The presented window has `_VARIABLE_REFRESH` as CARDINAL/32 with
+    /// at least one item and a first value of 1.
+    pub variable_refresh: bool,
     pub src_host_xid: u32,
     pub paint_dst_host_xid: u32,
     pub completion_dst_host_xid: u32,
@@ -1083,9 +1086,8 @@ pub trait Backend {
         false
     }
 
-    /// Notify the backend that a window property changed or was
-    /// deleted. KMS uses this to re-evaluate EWMH stack hints
-    /// (`_NET_WM_WINDOW_TYPE`, `_NET_WM_STATE`, `WM_TRANSIENT_FOR`).
+    /// Notify the backend that a window property changed or was deleted.
+    /// Platforms may use it to refresh policy tied to a live window.
     /// Default no-op.
     fn on_window_property_changed(
         &mut self,

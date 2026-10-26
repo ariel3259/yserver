@@ -33,6 +33,8 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-10-25 VRR adaptive sync (branch `feat/vrr`):** off by default; `--vrr` honors `_VARIABLE_REFRESH` CARDINAL/32 value 1 for client-owned direct scanout on one capable output, including live changes (a clear without a client frame re-flips the current primary framebuffer; NVIDIA needs the plane flip). NVIDIA proprietary clients never set the property, so they get no VRR yet; `--vrr all` is a follow-up. Animated cursors commit each image change, which starts a refresh (Adwaita's watch over a 100 fps video: 100–240 Hz); cursor moves otherwise wait for a direct frame or the 33 ms deadline. Hardware-validated on AMD Raphael and NVIDIA RTX 5060 Ti (48–240 Hz panel). `starty` passes arguments after `--` to the server. **Pending docs:** `--vrr` in `yserver(1)` and the `-- server_args` form in `starty(1)` move to the man pages in the next PR.
+
 - **2026-10-23 PRIME probe helper without `DISPLAY` (branch `fix/probe-helper-display`):** the disposable
   probe helper inherited the server's `DISPLAY`. The NVIDIA Vulkan ICD connects to it, so a server started with
   `DISPLAY` set to itself deadlocked a copied-route `RRSetCrtcConfig` under xrandr's `GrabServer` until the 30 s

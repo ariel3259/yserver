@@ -14,9 +14,11 @@ use crate::{
 use std::{
     collections::HashMap,
     io,
+    io::Write as _,
     os::fd::RawFd,
     rc::Rc,
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock},
+    thread::ThreadId,
     time::{Duration, Instant},
 };
 use yserver_core::backend::Backend;
@@ -230,6 +232,7 @@ impl RecordingSceneFixture {
             crtc_epoch,
             src_pixmap_xid: source_xid,
             dst_window_xid: target_xid,
+            variable_refresh: true,
             src_host_xid: source_xid,
             paint_dst_host_xid: target_xid,
             completion_dst_host_xid: target_xid,
@@ -737,12 +740,68 @@ impl RecordingSceneFixture {
 }
 
 pub(in crate::kms::render::backend::tests) fn init_tearing_test_logger() {
+    let captured = VRR_TEST_LOGS.get_or_init(|| Arc::new(Mutex::new(HashMap::new())));
     let _ = env_logger::Builder::new()
         .is_test(true)
-        .filter_level(log::LevelFilter::Error)
-        .filter_module("yserver", log::LevelFilter::Warn)
-        .filter_module("yserver_render", log::LevelFilter::Warn)
+        .filter_level(log::LevelFilter::Debug)
+        .format(|buffer, record| {
+            let message = record.args().to_string();
+            if message.starts_with("kms: vrr ")
+                || message.starts_with("kms: standalone VRR clear skipped output=")
+                || message.starts_with("present_latency_summary ")
+            {
+                writeln!(buffer, "{}", record.args())
+            } else {
+                Ok(())
+            }
+        })
+        .target(env_logger::Target::Pipe(Box::new(VrrTestLogWriter(
+            Arc::clone(captured),
+        ))))
         .try_init();
+}
+
+/// Captured lines per test thread: the harness runs tests in parallel, so a
+/// shared buffer let one test clear or read another test's lines. The backend
+/// logs from the calling thread, which is the test's own.
+static VRR_TEST_LOGS: OnceLock<Arc<Mutex<HashMap<ThreadId, String>>>> = OnceLock::new();
+
+struct VrrTestLogWriter(Arc<Mutex<HashMap<ThreadId, String>>>);
+
+impl io::Write for VrrTestLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .expect("VRR test log buffer lock")
+            .entry(std::thread::current().id())
+            .or_default()
+            .push_str(&String::from_utf8_lossy(bytes));
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+pub(crate) fn clear_vrr_test_logs() {
+    if let Some(logs) = VRR_TEST_LOGS.get() {
+        logs.lock()
+            .expect("VRR test log buffer lock")
+            .remove(&std::thread::current().id());
+    }
+}
+
+pub(crate) fn vrr_test_logs() -> String {
+    VRR_TEST_LOGS
+        .get()
+        .and_then(|logs| {
+            logs.lock()
+                .expect("VRR test log buffer lock")
+                .get(&std::thread::current().id())
+                .cloned()
+        })
+        .unwrap_or_default()
 }
 
 pub(in crate::kms::render::backend::tests) fn supports_vulkan_fed_scanout(

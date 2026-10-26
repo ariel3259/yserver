@@ -742,7 +742,8 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // Always Direct (self-managed DRM master + VT_PROCESS): open DRM +
     // libinput directly, arming VT_PROCESS when a controlling console is
     // present.
-    let mut backend = build_kms_backend(&device_paths, console_guard, opts.layout.clone())?;
+    let mut backend =
+        build_kms_backend(&device_paths, console_guard, opts.layout.clone(), opts.vrr)?;
     // One snapshot of everything `ServerState` needs from the live
     // backend — screen extent, RandR outputs/modes/providers, backend
     // capabilities. The server-reset boundary re-derives a generation
@@ -1104,8 +1105,9 @@ fn build_kms_backend(
     device_paths: &[std::path::PathBuf],
     console_guard: crate::kms::ConsoleGuardOpt,
     layout: Option<String>,
+    vrr_mode: crate::launch::VrrMode,
 ) -> io::Result<crate::kms::render::KmsBackend> {
-    crate::kms::render::KmsBackend::open(device_paths, console_guard, layout)
+    crate::kms::render::KmsBackend::open(device_paths, console_guard, layout, vrr_mode)
 }
 
 /// Map a delivered signal to the core-loop message it requests, plus a

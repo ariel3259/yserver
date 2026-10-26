@@ -109,6 +109,14 @@ pub trait Platform: OutputSink + Sized + 'static {
         _hot_y: u16,
     ) {
     }
+    /// Re-read a KMS window property whose value affects live scanout policy.
+    fn on_window_property_changed(
+        _b: &mut XBackend<Self>,
+        _state: &ServerState,
+        _host_xid: u32,
+        _property: yserver_protocol::x11::AtomId,
+    ) {
+    }
     /// `XWarpPointer` moved the X pointer to root `(x, y)`; a windowed
     /// platform moves the host pointer to match.
     fn host_pointer_warped(_b: &mut XBackend<Self>, _x: i32, _y: i32) {}

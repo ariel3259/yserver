@@ -24,6 +24,19 @@ use yserver_core::{backend::Backend as _, server::ServerState};
 pub(in crate::kms::render::backend) trait VtResumeExecutor {
     fn acquire_master(&self, device: &crate::kms::render::platform::KmsDevice) -> io::Result<()>;
     fn release_master(&self, device: &crate::kms::render::platform::KmsDevice) -> io::Result<()>;
+    fn crtc_vrr_enabled_value(
+        &self,
+        device: &crate::kms::render::platform::KmsDevice,
+        crtc: ::drm::control::crtc::Handle,
+        property: ::drm::control::property::Handle,
+    ) -> io::Result<Option<u64>> {
+        use ::drm::control::Device as _;
+        let properties = device.device.get_properties(crtc)?;
+        Ok(properties
+            .iter()
+            .find(|(id, _)| **id == property)
+            .map(|(_, value)| *value))
+    }
     fn probe_connector_snapshot(
         &self,
         platform: &PlatformBackend,
@@ -100,11 +113,20 @@ impl KmsBackend {
         device_paths: &[std::path::PathBuf],
         console_guard: crate::kms::ConsoleGuardOpt,
         layout: Option<String>,
+        vrr_mode: crate::launch::VrrMode,
     ) -> io::Result<Self> {
+        log::info!(
+            "kms: vrr mode={}",
+            match vrr_mode {
+                crate::launch::VrrMode::Off => "off",
+                crate::launch::VrrMode::Property => "property",
+            }
+        );
         Self::open_with_commit(
             device_paths,
             console_guard,
             layout,
+            vrr_mode,
             drm::modeset::commit_modeset,
         )
     }
@@ -113,6 +135,7 @@ impl KmsBackend {
         device_paths: &[std::path::PathBuf],
         console_guard: crate::kms::ConsoleGuardOpt,
         layout: Option<String>,
+        vrr_mode: crate::launch::VrrMode,
         commit: fn(
             &crate::drm::Device,
             &crate::platform::drm::Output,
@@ -143,6 +166,7 @@ impl KmsBackend {
         ));
         let kms_outputs_active = !platform.outputs.is_empty();
         let pstate = KmsBackendState {
+            vrr_mode,
             scanout_m0: ScanoutM0Telemetry::default(),
             scanout_m1: ScanoutM1ProbeCache::new(),
             scanout_m2: ScanoutM2State::new(),
@@ -346,6 +370,7 @@ impl KmsBackend {
             self.platform.fb_dimensions(),
             self.pstate.tearing.is_on(),
         );
+        let vrr_before = self.vrr_committed_snapshot();
         let result = self.scene.tick(
             &input,
             &mut self.store,
@@ -353,6 +378,7 @@ impl KmsBackend {
             &mut self.telemetry,
             cow_host_xid,
         );
+        self.log_vrr_committed_changes(&vrr_before, None, "inherited");
         self.record_accepted_degraded_unflip_replacements();
         match result {
             Ok(_) => Ok(()),
@@ -611,6 +637,21 @@ impl KmsBackend {
         // drmmode_display.c:3765-3770). A refused device-wide disable is
         // logged; the per-output commits below still run.
         let _ = self.platform.disable_all_devices("VT resume");
+
+        // Another DRM master may have left VRR enabled while this VT was
+        // away. Refresh after the all-device disable attempt so the next
+        // frame compares its wanted state with what the kernel now holds.
+        for layout in &self.platform.outputs {
+            let Some(device) = self.platform.device_for_output(&layout.key) else {
+                continue;
+            };
+            let crtc = layout.output.crtc;
+            layout.output.refresh_vrr_committed_from_kernel(|property| {
+                self.pstate
+                    .vt_resume_executor
+                    .crtc_vrr_enabled_value(device, crtc, property)
+            });
+        }
 
         // A retained direct framebuffer must be released against the old
         // routes even when the connector set is unchanged. Any active removal

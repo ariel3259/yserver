@@ -1,4 +1,5 @@
 use crate::{drm, kms::render::platform::PlatformBackend};
+use ::drm::control::Device as _;
 use std::{collections::HashSet, io, rc::Rc};
 
 pub(in crate::kms::render) trait OutputPowerExecutor {
@@ -28,7 +29,12 @@ impl OutputPowerExecutor for DrmOutputPowerExecutor {
         device: &drm::Device,
         output: &crate::platform::drm::Output,
     ) -> io::Result<()> {
-        drm::modeset::disable_output(device, output)
+        drm::modeset::disable_output(device, output, |request| {
+            device.atomic_commit(
+                ::drm::control::AtomicCommitFlags::ALLOW_MODESET,
+                request.into_atomic_mode_req(),
+            )
+        })
     }
 
     fn enable(
@@ -45,7 +51,12 @@ impl OutputPowerExecutor for DrmOutputPowerExecutor {
     }
 
     fn disable_device(&self, device: &drm::Device) -> io::Result<()> {
-        drm::modeset::disable_all_outputs_on_device(device)
+        drm::modeset::disable_all_outputs_on_device(device, |request| {
+            device.atomic_commit(
+                ::drm::control::AtomicCommitFlags::ALLOW_MODESET,
+                request.into_atomic_mode_req(),
+            )
+        })
     }
 }
 

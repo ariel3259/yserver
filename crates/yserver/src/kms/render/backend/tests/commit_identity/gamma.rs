@@ -1,4 +1,4 @@
-use super::support::{AtomicEventFixture, accepted_event_id};
+use super::support::{AtomicEventFixture, accepted_event_id, install_controlled_clock};
 use crate::{
     drm::atomic::{
         AtomicCommitKind, AtomicCommitSink,
@@ -10,10 +10,7 @@ use std::{
     io,
     os::fd::{AsFd as _, AsRawFd as _, RawFd},
     rc::Rc,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, atomic::Ordering},
     time::{Duration, Instant},
 };
 use yserver_core::backend::{Backend, ModeSpec, PresentClockSample, PresentClockSource};
@@ -93,16 +90,6 @@ fn seed_recent_gamma_page_flip(backend: &mut KmsBackend, output_idx: usize) {
         },
         Some(received_at),
     );
-}
-
-fn install_controlled_gamma_clock(backend: &mut KmsBackend) -> (Instant, Arc<AtomicU64>) {
-    let base = Instant::now();
-    let elapsed_ns = Arc::new(AtomicU64::new(0));
-    let clock_elapsed_ns = Arc::clone(&elapsed_ns);
-    backend.for_tests_set_monotonic_clock(Rc::new(move || {
-        base + Duration::from_nanos(clock_elapsed_ns.load(Ordering::SeqCst))
-    }));
-    (base, elapsed_ns)
 }
 
 fn set_test_gamma(backend: &mut KmsBackend, crtc_xid: u32, value: u16) {
@@ -400,7 +387,7 @@ fn p1_gamma_scene_retry_eio_keeps_lut_pending() {
         .clone();
     complete_recorded_attempt(&mut fixture.events, fd, &initial_scene, 1);
 
-    install_controlled_gamma_clock(&mut fixture.events.backend);
+    install_controlled_clock(&mut fixture.events.backend);
     set_test_gamma(&mut fixture.events.backend, crtc_xid, 0x4567);
     assert!(
         recorder
@@ -741,6 +728,135 @@ fn enable_recording_scene_gamma(
     (crtc_xid, crtc, fd, recorder)
 }
 
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: append gamma and VRR changes to one grouped request.
+fn vrr_clear_and_gamma_never_share_a_request() {
+    let Some((fixture, direct)) = super::direct_unflip::direct_fixture(
+        2,
+        super::recording_scene::P1SceneRoute::Shared,
+        18_012,
+        0,
+    ) else {
+        eprintln!("skip: no Vulkan scene fixture available");
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    let fd = super::direct_unflip::fd(&fixture);
+    let recorder = fixture.events.recorders[&fd].clone();
+    let (crtc_a_xid, crtc_a) = enable_gamma(&mut fixture.events.backend, &recorder, 0, 4);
+    let crtc_b = fixture.events.backend.platform.outputs[1].output.crtc;
+    {
+        let output = &mut fixture.events.backend.platform.outputs[1].output;
+        output.crtc_vrr_enabled_prop = Some(handle(90));
+        output.connector_vrr_capable = true;
+        output.vrr_committed.set(false);
+    }
+
+    let initial = super::direct_unflip::submit_direct(&mut fixture, &direct, fd)
+        .into_iter()
+        .find(|record| accepted_event_id(record).is_some())
+        .expect("initial grouped direct Backend frame is accepted");
+    assert!(contains_crtc_property(&initial, crtc_b, handle(90)));
+    super::direct_unflip::complete_direct_initial(
+        &mut fixture,
+        &initial,
+        accepted_event_id(&initial).expect("initial direct frame has an event ID"),
+        fd,
+    );
+    super::direct_unflip::drain_present_notifications(
+        &mut fixture,
+        &[direct.candidate.present_id],
+        &[],
+    );
+    let _ = install_controlled_clock(&mut fixture.events.backend);
+
+    set_test_gamma(&mut fixture.events.backend, crtc_a_xid, 0x4567);
+    assert!(
+        fixture.events.backend.platform.outputs[0]
+            .output
+            .pending_gamma_lut
+            .borrow()
+            .is_some(),
+        "RandR leaves output A's gamma LUT pending during direct scanout"
+    );
+    assert!(
+        recorder
+            .records()
+            .iter()
+            .all(|record| record.kind != AtomicCommitKind::GammaOnly),
+        "gamma does not submit a standalone request while direct scanout owns output A"
+    );
+
+    super::direct_unflip::request_unflip(&mut fixture, &direct);
+    let unflip_offset = recorder.records().len();
+    recorder.script_result(Err(io::Error::from_raw_os_error(libc::EINVAL)));
+    recorder.script_result(Ok(()));
+    let accepted_retry =
+        super::direct_unflip::grouped_unflip_record(&mut fixture, fd, unflip_offset, 2);
+    let attempts = super::direct_unflip::records_since(&fixture, fd, unflip_offset);
+    assert_eq!(
+        attempts.len(),
+        2,
+        "the request is retried once without CRTC properties"
+    );
+    assert!(
+        fixture.events.backend.platform.outputs[1]
+            .output
+            .vrr_disabled
+            .get(),
+        "the accepted stripped retry attributes EINVAL to VRR on output B"
+    );
+    assert!(
+        !fixture.events.backend.platform.outputs[0]
+            .output
+            .gamma_lut_disabled
+            .get(),
+        "a VRR EINVAL never latches GAMMA_LUT off on output A"
+    );
+    assert!(
+        matches!(
+            attempts[0].result,
+            ScriptedResult::Error {
+                raw_os_error: Some(error),
+                ..
+            } if error == libc::EINVAL
+        ),
+        "the property-bearing request is rejected with EINVAL"
+    );
+    assert!(contains_crtc_property(&attempts[0], crtc_b, handle(90)));
+    assert!(
+        !contains_crtc_property(&attempts[0], crtc_a, handle(70)),
+        "the VRR clear request does not carry output A's GAMMA_LUT"
+    );
+    assert!(
+        !contains_crtc_property(&attempts[0], crtc_a, handle(90)),
+        "the request changes only output B's VRR property"
+    );
+    assert_eq!(attempts[1].result, ScriptedResult::Ok);
+    assert!(accepted_event_id(&attempts[1]).is_some());
+    assert!(
+        !contains_crtc_property(&attempts[1], crtc_a, handle(70))
+            && !contains_crtc_property(&attempts[1], crtc_b, handle(90)),
+        "the stripped retry removes all optional CRTC changes"
+    );
+    assert!(
+        fixture.events.backend.platform.outputs[1]
+            .output
+            .vrr_committed
+            .get(),
+        "the accepted stripped retry leaves output B's kernel VRR value unchanged"
+    );
+
+    complete_recorded_attempt(&mut fixture.events, fd, &accepted_retry, 84);
+    super::direct_unflip::drain_present_notifications(
+        &mut fixture,
+        &[],
+        &[direct.candidate.present_id],
+    );
+    fixture.finish_after_normal_drain();
+}
+
 struct LogicalVtResume;
 
 impl crate::kms::render::backend::kms::session::VtResumeExecutor for LogicalVtResume {
@@ -766,6 +882,7 @@ impl crate::kms::render::backend::kms::session::VtResumeExecutor for LogicalVtRe
                 mm_height: output.output.mm_height,
                 edid: output.output.edid.clone(),
                 connector_type: output.output.connector_type.clone(),
+                vrr_capable: output.output.connector_vrr_capable,
             })
             .collect())
     }
@@ -889,7 +1006,7 @@ fn p1_gamma_async_flip_defers_lut_to_the_next_vsync_commit() {
     let red = vec![0x1111; 4];
     let green = vec![0x2222; 4];
     let blue = vec![0x3333; 4];
-    let (base, elapsed_ns) = install_controlled_gamma_clock(&mut fixture.events.backend);
+    let (base, elapsed_ns) = install_controlled_clock(&mut fixture.events.backend);
     Backend::set_crtc_gamma(&mut fixture.events.backend, crtc_xid, &red, &green, &blue)
         .expect("retain gamma while the async frame is in flight");
     assert!(
@@ -1005,7 +1122,7 @@ fn p1_gamma_active_async_flips_do_not_carry_or_advance_the_lut_deadline() {
         .expect("Backend submits async scene frame while tearing is active")
         .clone();
     seed_recent_gamma_page_flip(&mut fixture.events.backend, 0);
-    let (base, elapsed_ns) = install_controlled_gamma_clock(&mut fixture.events.backend);
+    let (base, elapsed_ns) = install_controlled_clock(&mut fixture.events.backend);
 
     set_test_gamma(&mut fixture.events.backend, crtc_xid, 0x6666);
     let records = recorder.records();
@@ -1271,7 +1388,7 @@ fn p1_gamma_reapplies_after_modeset_and_vt_resume() {
 // Mutations: submit immediately for active gamma, or omit its deadline from next_wakeup.
 fn gamma_active_crtc_exposes_deadline_and_submits_once_when_no_frame_arrives() {
     let (mut backend, recorder, crtc_xid, _) = gamma_backend_with_recorder();
-    let (base, elapsed_ns) = install_controlled_gamma_clock(&mut backend);
+    let (base, elapsed_ns) = install_controlled_clock(&mut backend);
     seed_recent_gamma_page_flip(&mut backend, 0);
 
     set_test_gamma(&mut backend, crtc_xid, 0x1111);
@@ -1352,7 +1469,7 @@ fn p1_gamma_set_while_dpms_off_stays_pending_and_applies_after_wake() {
     let recorder = fixture.recorders[&fd].clone();
     let (crtc_xid, crtc) = enable_gamma(&mut fixture.backend, &recorder, 0, 4);
     fixture.backend.scene.scene_structure_dirty = false;
-    let (base, elapsed_ns) = install_controlled_gamma_clock(&mut fixture.backend);
+    let (base, elapsed_ns) = install_controlled_clock(&mut fixture.backend);
 
     Backend::set_dpms_power(&mut fixture.backend, 3).expect("DPMS off through Backend");
     assert!(
@@ -1572,7 +1689,7 @@ fn p1_gamma_set_while_dpms_off_stays_pending_and_applies_after_wake() {
 // Mutation: discard the pageflip timestamp when a newer idle sequence replaces the completion clock.
 fn gamma_activity_survives_a_newer_idle_sequence_sample() {
     let (mut backend, recorder, crtc_xid, crtc) = gamma_backend_with_recorder();
-    install_controlled_gamma_clock(&mut backend);
+    install_controlled_clock(&mut backend);
     seed_recent_gamma_page_flip(&mut backend, 0);
 
     let key = CrtcKey::for_output(&backend.platform.outputs[0]);
@@ -1619,7 +1736,7 @@ fn gamma_activity_survives_a_newer_idle_sequence_sample() {
 fn gamma_replacement_keeps_first_deadline_and_submits_the_second_ramp() {
     let (mut backend, recorder, crtc_xid, _) = gamma_backend_with_recorder();
     backend.platform.outputs[0].output.picked.vrefresh = 0;
-    let (base, elapsed_ns) = install_controlled_gamma_clock(&mut backend);
+    let (base, elapsed_ns) = install_controlled_clock(&mut backend);
     seed_recent_gamma_page_flip(&mut backend, 0);
 
     set_test_gamma(&mut backend, crtc_xid, 0x1111);
@@ -1706,7 +1823,7 @@ fn gamma_held_on_idle_crtc_by_other_output_gets_one_refresh_deadline() {
     );
     recorder.clear_records();
 
-    let (base, elapsed_ns) = install_controlled_gamma_clock(&mut fixture.events.backend);
+    let (base, elapsed_ns) = install_controlled_clock(&mut fixture.events.backend);
     set_test_gamma(&mut fixture.events.backend, crtc_xid, 0x6666);
     assert!(
         recorder.records().is_empty(),
@@ -2058,7 +2175,7 @@ fn p1_gamma_direct_retry_eio_keeps_lut_pending_and_returns_retry_error() {
         &[],
     );
 
-    install_controlled_gamma_clock(&mut fixture.events.backend);
+    install_controlled_clock(&mut fixture.events.backend);
     set_test_gamma(&mut fixture.events.backend, crtc_xid, 0x6789);
     assert!(
         recorder

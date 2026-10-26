@@ -123,6 +123,15 @@ impl Platform for PlatformBackend {
         b.exit_tearing_for_window(host_xid, reason);
     }
 
+    fn on_window_property_changed(
+        b: &mut KmsBackend,
+        state: &ServerState,
+        host_xid: u32,
+        property: yserver_protocol::x11::AtomId,
+    ) {
+        b.backend_scanout_on_window_property_changed(state, host_xid, property);
+    }
+
     fn request_direct_unflip(b: &mut KmsBackend, reason: &'static str) {
         b.request_direct_unflip(reason);
     }

@@ -215,7 +215,14 @@ console and run:
 starty                 # runs ~/.xinitrc (or /etc/X11/xinit/xinitrc)
 starty bspwm           # ...or a WM resolved via PATH, no xinitrc needed
 starty bspwm -c ~/rc   # ...with arguments
+starty -- --vrr        # pass --vrr to yserver with the xinitrc session
+starty bspwm -- --vrr  # pass --vrr to yserver with bspwm
 ```
+
+Server arguments go after `--`; arguments before it remain the client and its
+arguments. `--vrr` is off by default. It enables VRR for windows that set
+`_VARIABLE_REFRESH`, on outputs whose monitor reports VRR support. NVIDIA
+proprietary clients do not set `_VARIABLE_REFRESH`.
 
 It picks the lowest free display, mints a per-session
 MIT-MAGIC-COOKIE-1 (a server copy plus an entry in `~/.Xauthority`),

@@ -14,6 +14,7 @@
 #   starty                 # run ~/.xinitrc (/etc/X11/xinit/xinitrc fallback)
 #   starty bspwm           # run a WM/client resolved via PATH (no xinitrc)
 #   starty bspwm --foo bar # ...with client args
+#   starty -- --vrr        # ...with server args
 #
 # Runs STANDALONE from a bare TTY (yserver drives KMS directly, no seat
 # manager): refuses pty / SSH / graphical-terminal callers via a console
@@ -32,10 +33,14 @@ set -eu
 
 usage() {
     cat <<'EOF'
-usage: starty [client [client_args...]]
+usage: starty [client [client_args...]] [-- server_args...]
 
   With no client, runs ~/.xinitrc (or /etc/X11/xinit/xinitrc fallback).
   With a client, resolves it via PATH and runs it with the given args.
+  Arguments after -- are passed to yserver.
+
+Example:
+  starty -- --vrr
 
 Environment:
   RUST_LOG   yserver log level (default: warn)
@@ -65,7 +70,7 @@ esac
 # --- Resolve the client command (or fall back to xinitrc). --------------
 have_client=0
 client_bin=""
-if [ $# -gt 0 ]; then
+if [ $# -gt 0 ] && [ "$1" != "--" ]; then
     have_client=1
     client_bin=$(command -v "$1" 2>/dev/null) || {
         echo "starty: client not found: $1" >&2; exit 127; }
@@ -116,9 +121,21 @@ echo "starty: DISPLAY=:$display (server auth $authfile; cookie added to $useraut
 # --- Bring up the server. -----------------------------------------------
 # Inherit the TTY login's XDG_RUNTIME_DIR — a real VT has the real
 # /run/user/UID + systemd --user instance, which is what makes agent/UI/keyring reached from ~/.xinitrc work.
-RUST_LOG="${RUST_LOG:-warn}" RUST_BACKTRACE=1 \
-    yserver "$display" -auth "$authfile" >"$server_log" 2>&1 &
-yserver_pid=$!
+launch_yserver() {
+    # Consume client arguments through the first separator; only the tail is
+    # appended to yserver. With no separator the tail is empty.
+    while [ "$#" -gt 0 ]; do
+        if [ "$1" = "--" ]; then
+            shift
+            break
+        fi
+        shift
+    done
+    RUST_LOG="${RUST_LOG:-warn}" RUST_BACKTRACE=1 \
+        yserver "$display" -auth "$authfile" "$@" >"$server_log" 2>&1 &
+    yserver_pid=$!
+}
+launch_yserver "$@"
 
 # Wait for the socket (cap at ~30 s like the recipe).
 waited=0
@@ -141,8 +158,23 @@ unset WAYLAND_DISPLAY WAYLAND_SOCKET
 export XDG_SESSION_TYPE=x11
 export XAUTHORITY="$userauth"
 export DISPLAY=":$display"
+run_client() {
+    session_bin=$1
+    shift
+    # Keep the arguments before the first "--"; the rest went to yserver.
+    remaining=$#
+    seen_separator=0
+    while [ "$remaining" -gt 0 ]; do
+        arg=$1
+        shift
+        remaining=$((remaining - 1))
+        [ "$arg" = "--" ] && seen_separator=1
+        [ "$seen_separator" -eq 1 ] || set -- "$@" "$arg"
+    done
+    "$session_bin" "$@" >"$session_log" 2>&1
+}
 if [ "$have_client" -eq 1 ]; then
-    "$client_bin" "$@" >"$session_log" 2>&1
+    run_client "$client_bin" "$@"
 else
     sh "$xinitrc" >"$session_log" 2>&1
 fi
