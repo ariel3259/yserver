@@ -41,6 +41,17 @@ impl KmsBackend {
                         u32::from(candidate.src_height),
                     ) == root
             });
+        if root_coverage
+            && matches!(
+                target,
+                ScanoutM0Target::Cow | ScanoutM0Target::CowDescendant
+            )
+            && self.direct_shape_chain_hides_root(candidate.paint_dst_host_xid, root)
+        {
+            // Muffin empties the COW while a fullscreen client is unredirected;
+            // Xorg shows nothing of the shaped-away stage Present.
+            return false;
+        }
         scanout_m2_is_authoritative_root(target, root_coverage)
     }
 
