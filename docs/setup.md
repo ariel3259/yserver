@@ -22,7 +22,7 @@ the example configs referenced below.
   Alpine and AUR ones deliberately do not, since the right one is
   hardware-specific — install it yourself there (`mesa-vulkan-ati` or
   `mesa-vulkan-intel` on Alpine, `vulkan-radeon` or `vulkan-intel` on Arch).
-- Linux with atomic KMS/DRM, or FreeBSD.
+- Linux with atomic KMS/DRM, FreeBSD, or OpenBSD.
 - Access to `/dev/dri/*` and `/dev/input/event*` — see
   [Device access](#device-access).
 
@@ -67,6 +67,22 @@ module as described in the
 [FreeBSD graphics guide](https://docs.freebsd.org/en/books/handbook/x11/).
 `mesa-libs` alone does not provide the Vulkan GPU driver. Use the appropriate
 NVIDIA driver packages for NVIDIA hardware instead.
+
+### OpenBSD
+
+Install the X sets (Mesa's Vulkan drivers, libgbm, fontconfig and
+libxshmfence come from there), then as root:
+
+```sh
+pkg_add rust git just shaderc vulkan-loader libinput-openbsd libudev-openbsd \
+  libxkbcommon scdoc
+```
+
+rustc needs more memory than the default data size limit allows. Raise
+`datasize-cur` (and `datasize-max` if it is lower) for your login class in
+`/etc/login.conf`, e.g. `:datasize-cur=8G:` under `staff`, and log in
+again. Run `cap_mkdb /etc/login.conf` first if `/etc/login.conf.db`
+exists.
 
 Then build and install:
 
@@ -118,8 +134,9 @@ adjusting.
 them, run the `cargo build` above in place of the plain one, then
 `just man` and `just install` as shown earlier.
 
-To run a session you also need `xauth` and `mcookie` at runtime —
-`xorg-xauth` and `util-linux` respectively.
+To run a session you also need `xauth` at runtime (`xorg-xauth`).
+`starty` uses `mcookie` (`util-linux`) when present and reads
+`/dev/urandom` otherwise.
 
 Packagers: see [Packaging](#packaging).
 
@@ -154,6 +171,20 @@ conventionally `video` and `operator`; check with `ls -l` as above. The
 Console takeover is implemented on FreeBSD `vt(4)` consoles too, so
 `Ctrl-C` in an X client is shielded from the kernel's console signal
 handling the same way it is on Linux VTs.
+
+### OpenBSD
+
+Log in on the first console, `ttyC0`: the default `/etc/fbtab` hands the
+keyboard, the mouse and the first GPU (`/dev/dri/card0`,
+`/dev/dri/renderD128`) to whoever logs in there. With more than one GPU,
+add the other cards' nodes to that line.
+
+Alternatively make the devices group-accessible to `wheel` (your user must
+be a member):
+
+```sh
+chmod 660 /dev/wskbd* /dev/wsmouse* /dev/dri/*
+```
 
 ## The X11 socket directory
 
@@ -197,6 +228,10 @@ sudo install -m644 /usr/local/share/doc/yserver/examples/lightdm-99-yserver.conf
     /etc/lightdm/lightdm.conf.d/99-yserver.conf
 sudo systemctl restart lightdm
 ```
+
+On FreeBSD the drop-in goes in `/usr/local/etc/lightdm/lightdm.conf.d/`
+and lightdm restarts with `service lightdm restart`. OpenBSD has no
+lightdm package; its display manager is xenodm.
 
 The greeter appears, you log in, and lightdm's PAM stack unlocks the login
 keyring as usual.
@@ -439,7 +474,7 @@ in the ELF headers:
 | Vulkan loader | `libvulkan.so.1` is dlopened at runtime                       | `vulkan-icd-loader`, `vulkan-loader`                                         |
 | A Vulkan ICD  | runtime driver, not linked                                    | `mesa-vulkan-drivers` — _recommends_, since the NVIDIA driver also qualifies |
 | `xauth`       | `starty` execs it                                             | `xorg-xauth`, `xauth`                                                        |
-| `mcookie`     | `starty` execs it                                             | `util-linux`                                                                 |
+| `mcookie`     | `starty` execs it if present (else reads `/dev/urandom`)      | `util-linux` — _recommends_                                                  |
 | XKB data      | keymap rules read at runtime                                  | `xkeyboard-config`                                                           |
 | X core fonts  | _recommends_ only — a fontless system falls back to built-ins | `xorg-fonts-misc`, `xfonts-base`                                             |
 
