@@ -1722,14 +1722,12 @@ fn vrr_off_mode_still_clears_inherited() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: ignore variable_refresh in Property mode; the allowed first direct frame must enable VRR.
-fn vrr_property_mode_requires_cardinal_one() {
+// Mutation: restore the CARDINAL type check or the `== 1` check; INTEGER/1 and CARDINAL/2 must enable VRR.
+fn vrr_property_mode_reads_like_xorg() {
     let Some((fixture, mut direct)) =
         direct_fixture_with_vrr_mode(18_103, 0, crate::launch::VrrMode::Property)
     else {
-        eprintln!(
-            "SKIP vrr_property_mode_requires_cardinal_one: no Vulkan scene fixture available"
-        );
+        eprintln!("SKIP vrr_property_mode_reads_like_xorg: no Vulkan scene fixture available");
         return;
     };
     let mut fixture = fixture.cleanup_guard();
@@ -1767,7 +1765,7 @@ fn vrr_property_mode_requires_cardinal_one() {
         &mut fixture.events.backend,
         window,
         property,
-        yserver_core::xinput::XA_CARDINAL.0,
+        yserver_core::xinput::XA_INTEGER.0,
         32,
         &[1],
         1,
@@ -1798,7 +1796,7 @@ fn vrr_property_mode_requires_cardinal_one() {
         .expect("first direct Present request is accepted through Backend");
     assert!(
         contains_vrr_property(&enabled, crtc, 1),
-        "the first direct commit from a CARDINAL/32 value 1 Present enables VRR"
+        "the first direct commit from an INTEGER/32 value 1 Present enables VRR"
     );
     let fb_id_property = fixture.events.backend.platform.outputs[0]
         .output
@@ -1820,19 +1818,20 @@ fn vrr_property_mode_requires_cardinal_one() {
     super::direct_unflip::complete_direct_initial(&mut fixture, &enabled, id, fd);
     super::direct_unflip::drain_present_notifications(&mut fixture, &[1], &[]);
 
-    let invalid_property_values = [
-        (yserver_core::xinput::XA_CARDINAL.0, 32, vec![0]),
-        (yserver_core::xinput::XA_CARDINAL.0, 32, vec![]),
-        (yserver_core::xinput::XA_CARDINAL.0, 32, vec![2]),
-        (yserver_core::xinput::XA_INTEGER.0, 32, vec![1]),
-        (yserver_core::xinput::XA_CARDINAL.0, 8, vec![1]),
+    let property_cases = [
+        (yserver_core::xinput::XA_CARDINAL.0, 32, vec![0], false),
+        (yserver_core::xinput::XA_CARDINAL.0, 32, vec![2], true),
+        (yserver_core::xinput::XA_CARDINAL.0, 8, vec![1], false),
+        (yserver_core::xinput::XA_CARDINAL.0, 32, vec![1, 2], false),
     ];
     let mut previous_present_id = 1_u64;
     let mut previous_request_serial = first_request_serial;
     let mut sequence = 10_u16;
-    for (case_index, (property_type, format, values)) in
-        invalid_property_values.into_iter().enumerate()
-    {
+    for (property_type, format, values, expected_enabled) in property_cases {
+        let was_committed = fixture.events.backend.platform.outputs[0]
+            .output
+            .vrr_committed
+            .get();
         let property_change_offset = super::direct_unflip::record_count(&fixture, fd);
         request_vrr_property(
             &mut state,
@@ -1844,7 +1843,7 @@ fn vrr_property_mode_requires_cardinal_one() {
             &values,
             sequence,
         );
-        if case_index == 0 {
+        if was_committed && !expected_enabled {
             let clear = super::direct_unflip::records_since(&fixture, fd, property_change_offset)
                 .into_iter()
                 .find(|record| super::support::accepted_event_id(record).is_some())
@@ -1880,10 +1879,25 @@ fn vrr_property_mode_requires_cardinal_one() {
             .into_iter()
             .find(|record| super::support::accepted_event_id(record).is_some())
             .expect("request-driven direct successor is accepted");
-        assert!(
-            !contains_vrr_property(&record, crtc, 1),
-            "property case {case_index} must not set VRR_ENABLED"
+        assert_eq!(
+            fixture.events.backend.platform.outputs[0]
+                .output
+                .vrr_committed
+                .get(),
+            expected_enabled,
+            "CARDINAL/{format} {values:?} records the expected VRR end state"
         );
+        if expected_enabled && !was_committed {
+            assert!(
+                contains_vrr_property(&record, crtc, 1),
+                "CARDINAL/32 value 2 enables VRR on the next direct Present"
+            );
+        } else if !expected_enabled {
+            assert!(
+                !contains_vrr_property(&record, crtc, 1),
+                "CARDINAL/{format} {values:?} must not set VRR_ENABLED"
+            );
+        }
         let event_id = super::support::accepted_event_id(&record).expect("successor event ID");
         super::direct_unflip::complete_direct_initial(&mut fixture, &record, event_id, fd);
         super::direct_unflip::drain_present_notifications(
@@ -1921,6 +1935,13 @@ fn vrr_property_mode_requires_cardinal_one() {
     assert!(
         !contains_vrr_property(&no_property, crtc, 1),
         "a missing _VARIABLE_REFRESH property must not set VRR_ENABLED"
+    );
+    assert!(
+        !fixture.events.backend.platform.outputs[0]
+            .output
+            .vrr_committed
+            .get(),
+        "a missing property leaves the committed VRR state off"
     );
     let event_id = super::support::accepted_event_id(&no_property).expect("successor event ID");
     super::direct_unflip::complete_direct_initial(&mut fixture, &no_property, event_id, fd);

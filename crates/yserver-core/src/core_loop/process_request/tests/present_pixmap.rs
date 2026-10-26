@@ -5162,7 +5162,7 @@ fn present_to_unviewable_window_skips_copy_and_damage_but_completes() {
 }
 
 #[test]
-// Mutation: grant a missing property, decode its bytes as big-endian, or accept a non-CARDINAL/32 value.
+// Mutation: restore the CARDINAL type check or exact-one check; INTEGER/1 and CARDINAL/2 must grant permission.
 fn present_candidate_reports_variable_refresh_property() {
     use crate::backend::recording::RecordingBackend;
     use yserver_protocol::x11::{CreatePixmapRequest, CreateWindowRequest, present as x11present};
@@ -5295,10 +5295,11 @@ fn present_candidate_reports_variable_refresh_property() {
     for (sequence, property_type, format, values, expected) in [
         (2, CARDINAL, 32, vec![], false),
         (3, CARDINAL, 32, vec![0], false),
-        (4, CARDINAL, 32, vec![2], false),
-        (5, INTEGER, 32, vec![1], false),
+        (4, CARDINAL, 32, vec![2], true),
+        (5, INTEGER, 32, vec![1], true),
         (6, CARDINAL, 8, vec![1], false),
-        (7, CARDINAL, 32, vec![1], true),
+        (7, CARDINAL, 32, vec![1, 2], false),
+        (8, CARDINAL, 32, vec![1], true),
     ] {
         change_property(
             &mut state,
@@ -5320,7 +5321,7 @@ fn present_candidate_reports_variable_refresh_property() {
             "type={property_type} format={format} value={values:?}"
         );
     }
-    assert_eq!(backend.present_direct_candidates.len(), 7);
+    assert_eq!(backend.present_direct_candidates.len(), 8);
 }
 
 #[test]

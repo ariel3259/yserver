@@ -171,7 +171,7 @@ pub enum VrrMode {
     /// VRR is disabled (the default), but inherited kernel state is cleared.
     #[default]
     Off,
-    /// Enable VRR only when `_VARIABLE_REFRESH` is CARDINAL/32 value 1.
+    /// Enable VRR only when `_VARIABLE_REFRESH` has format 32, one item, and a nonzero value.
     Property,
 }
 
