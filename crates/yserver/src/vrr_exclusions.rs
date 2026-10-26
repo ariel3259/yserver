@@ -354,7 +354,14 @@ fn read_process_name(process_dir: &Path) -> Option<String> {
 }
 
 fn parse_driconf(contents: &str) -> Option<HashMap<String, bool>> {
-    let document = roxmltree::Document::parse(contents).ok()?;
+    let document = roxmltree::Document::parse_with_options(
+        contents,
+        roxmltree::ParsingOptions {
+            allow_dtd: true,
+            ..roxmltree::ParsingOptions::default()
+        },
+    )
+    .ok()?;
     let mut settings = HashMap::new();
     for application in document
         .descendants()
@@ -469,6 +476,33 @@ mod tests {
 
         assert_eq!(
             VrrExclusions::load(&roots).excluded(21, &proc_root),
+            Some(VrrExclusionSource::MesaDriconf)
+        );
+    }
+
+    #[test]
+    // Mutation: revert to Document::parse, which rejects driconf internal DTDs.
+    fn vrr_exclusions_mesa_entry_with_internal_dtd_excludes() {
+        let tree = TempTree::new();
+        let roots = roots(&tree);
+        let proc_root = tree.path().join("proc");
+        write(
+            roots.mesa_system_dir.join("10-firefox.conf"),
+            r#"<?xml version="1.0" standalone="yes"?>
+<!DOCTYPE driconf [
+  <!ELEMENT driconf (device+)>
+  <!ELEMENT device (application+)>
+  <!ELEMENT application (option+)>
+  <!ATTLIST application executable CDATA #REQUIRED>
+  <!ELEMENT option EMPTY>
+  <!ATTLIST option name CDATA #REQUIRED value CDATA #REQUIRED>
+]>
+<driconf><device><application executable="firefox"><option name="adaptive_sync" value="false"/></application></device></driconf>"#,
+        );
+        process(&proc_root, 41, "/usr/lib/firefox", "/usr/lib/firefox", &[]);
+
+        assert_eq!(
+            VrrExclusions::load(&roots).excluded(41, &proc_root),
             Some(VrrExclusionSource::MesaDriconf)
         );
     }
