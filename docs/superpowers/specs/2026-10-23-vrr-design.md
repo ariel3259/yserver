@@ -1,6 +1,6 @@
 # Variable refresh rate (VRR / adaptive sync) — design
 
-**Date:** 2026-10-23 · **Status:** revision 2 (2026-10-25; `--vrr all` moved to a follow-up PR the same day, see Revision history), from the maintainer review of draft PR #294: trigger, default, clear priority, gamma/VRR
+**Date:** 2026-10-23 · **Status:** revision 2.1 (2026-10-26, maintainer review of PR #294: cursor hold scope, Xorg's `_VARIABLE_REFRESH` reading, standalone clear framebuffer); revision 2 (2026-10-25; `--vrr all` moved to a follow-up PR the same day, see Revision history), from the maintainer review of draft PR #294: trigger, default, clear priority, gamma/VRR
 attribution, animated cursors; see Revision history); revision 1 approved by the user (2026-10-23), reviewed once (sol);
 plan `docs/superpowers/plans/2026-10-24-vrr.md` · **Scope:** KMS backend,
 one output covered by a client window in direct scanout; cursor behaviour while VRR is active.
@@ -115,7 +115,10 @@ Per output, two facts and one decision:
   stale value. A missing property means not capable.
 - **wanted:** VRR is enabled on the command line and the direct transaction being submitted for this output is owned
   by a client window (`Unredirected`) that allows VRR: when the window's
-  `_VARIABLE_REFRESH` is a CARDINAL with value 1 (absent or any other value: not allowed). It
+  `_VARIABLE_REFRESH` reads as Xorg modesetting reads it (revision 2.1): format 32, exactly one item, any type, any
+  nonzero value (absent, another format or item count, or 0: not allowed). Xorg ignores a non-matching change and
+  keeps the previous state; yserver evaluates the stored value, so such a change turns VRR off (no client depends on
+  the difference). It
   follows the owner of the transaction being submitted, not the retained direct record: first entry submits before the
   pending record is installed, and the previous direct record survives until a composed replacement retires.
 - **committed:** the `VRR_ENABLED` value the kernel holds for this CRTC. It starts from the kernel's current value, read
@@ -163,7 +166,9 @@ Whether VRR on/off needs the primary plane in the same commit (amdgpu applies it
 every frame path: the on change rides a direct frame, and a composed unflip carries a primary-plane replacement
 (`drm/modeset.rs`, composed commit). The one commit that may carry no primary flip is the standalone clear before
 releasing the device; the builder must check on amdgpu that it takes effect, and if it does not, include the current
-primary framebuffer in that commit.
+primary framebuffer in that commit. The standalone clear while a client is idle carries the primary framebuffer of
+the live direct frame only (revision 2.1): with no live direct frame it is not submitted and a debug line says so,
+so no path can flip back to a stale composed frame. A VRR-only standalone commit has its own commit kind, not gamma's.
 
 ### The cursor while VRR is on
 
@@ -171,7 +176,9 @@ Today a cursor change between frames goes out as its own `cursor-only` commit as
 flight; in held direct scanout this is explicit (`scanout.rs`, the branch that sends cursor-only commits while there is
 no queued direct successor). With VRR on, each of those commits is a refresh (driver behaviour 2 and 3).
 
-While VRR is on for a CRTC:
+While VRR is on for a CRTC (revision 2.1: the kernel holds `VRR_ENABLED` = 1 **and** the live direct frame on that
+output wants VRR; a value the kernel keeps after a rejected clear, or inherits at startup, never holds the cursor on
+the composed desktop):
 
 - A cursor **position** is recorded as pending, as today, but no standalone `cursor-only` commit is sent for that CRTC.
   The pending position rides the client's next direct commit, which already carries every pending position ("its
@@ -264,6 +271,10 @@ Hardware (the user validates with a game and logs):
   gamma change can go out standalone and trigger a refresh. Gamma changes are rare; note, do not tune, unless trivial.
 
 ## Revision history
+
+- **Revision 2.1 (2026-10-26),** maintainer review of PR #294: the 33 ms cursor hold requires a live direct frame that
+  wants VRR, not only the kernel value; `_VARIABLE_REFRESH` is read as Xorg reads it (format 32, one item, nonzero);
+  the standalone clear attaches only the live direct frame's framebuffer and has its own commit kind.
 
 - **Split (2026-10-25),** user decision: this PR ships `--vrr` only. `--vrr all`, with exclusions taken from the
   NVIDIA application profiles and Mesa driconf, moves to its own branch and PR.
