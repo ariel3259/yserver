@@ -2926,7 +2926,18 @@ impl VrrCursorHarness {
         use super::super::cursor_sprites::support as cursor_support;
 
         let mut fixture = self.fixture.take().expect("cursor fixture is live");
-        let direct = self.direct.take().expect("direct scanout is active");
+        let Some(direct) = self.direct.take() else {
+            let detach = cursor_support::accept_cursor_detach(&mut fixture, &mut self.delivered, 0);
+            cursor_support::retire_cursor_record(
+                &mut fixture,
+                &mut self.delivered,
+                0,
+                &detach,
+                100,
+            );
+            cursor_support::finish_atomic_fixture(fixture, &mut self.delivered);
+            return;
+        };
         cursor_support::drain_unretired_output_events(&mut fixture, &mut self.delivered, 0);
         super::direct_unflip::request_unflip(&mut fixture.scene, &direct);
         let offset = super::direct_unflip::record_count(&fixture.scene, self.device_fd);
@@ -2962,6 +2973,41 @@ impl VrrCursorHarness {
         cursor_support::retire_cursor_record(&mut fixture, &mut self.delivered, 0, &detach, 100);
         cursor_support::finish_atomic_fixture(fixture, &mut self.delivered);
     }
+}
+
+fn vrr_composed_cursor_harness() -> Option<VrrCursorHarness> {
+    use super::super::cursor_sprites::support::{
+        AtomicPathFixture, PathKind, create_argb_cursor, drain_unretired_output_events,
+        establish_hardware_cursor,
+    };
+
+    let fixture = AtomicPathFixture::new(PathKind::Physical)
+        .expect("VRR composed cursor scene fixture construction")?;
+    let device_fd = super::direct_unflip::fd(&fixture.scene);
+    let mut harness = VrrCursorHarness {
+        fixture: Some(fixture),
+        direct: None,
+        delivered: HashSet::new(),
+        device_fd,
+    };
+    let cursor = create_argb_cursor(
+        &mut harness.scene.events.backend,
+        (8, 8),
+        [0xff, 0xff, 0xff, 0xff],
+        (0, 0),
+    );
+    establish_hardware_cursor(
+        harness.fixture.as_mut().expect("cursor fixture is live"),
+        &mut harness.delivered,
+        cursor,
+        (120, 100),
+    );
+    drain_unretired_output_events(
+        harness.fixture.as_mut().expect("cursor fixture is live"),
+        &mut harness.delivered,
+        0,
+    );
+    Some(harness)
 }
 
 impl Drop for VrrCursorHarness {
@@ -3218,6 +3264,327 @@ fn vrr_cursor_later_motion_keeps_deadline() {
     assert_eq!(attempt.result, ScriptedResult::Ok);
     assert_record_cursor_position(&harness, &attempt, (190, 140));
     harness.retire_cursor_move(94);
+    harness.finish();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: key the cursor hold on vrr_committed alone after direct scanout has ended.
+fn vrr_cursor_not_held_after_rejected_clear() {
+    let Some(mut harness) = vrr_cursor_harness(18_052, true) else {
+        eprintln!(
+            "SKIP vrr_cursor_not_held_after_rejected_clear: no Vulkan scene fixture available"
+        );
+        return;
+    };
+    let direct = harness.direct.take().expect("direct scanout is active");
+    let device_fd = harness.device_fd;
+    let recorder = Rc::clone(&harness.scene.events.recorders[&device_fd]);
+    let crtc = harness.scene.events.backend.platform.outputs[0].output.crtc;
+    let mut state = present_request_state(&direct);
+    let property = state.atoms.intern("_VARIABLE_REFRESH", false).0;
+    request_vrr_property(
+        &mut state,
+        &mut harness.scene.events.backend,
+        direct.target_xid,
+        property,
+        yserver_core::xinput::XA_CARDINAL.0,
+        32,
+        &[1],
+        1,
+    );
+    let clear_offset = super::direct_unflip::record_count(&harness.scene, device_fd);
+    recorder.script_result(Err(io::Error::from_raw_os_error(libc::EINVAL)));
+    delete_vrr_property(
+        &mut state,
+        &mut harness.scene.events.backend,
+        direct.target_xid,
+        property,
+        2,
+    );
+    Backend::maybe_composite(&mut harness.scene.events.backend)
+        .expect("try the direct owner's property-deleted clear");
+    let standalone_clear =
+        super::direct_unflip::records_since(&harness.scene, device_fd, clear_offset);
+    assert_eq!(
+        standalone_clear
+            .iter()
+            .filter(|record| {
+                contains_vrr_property(record, crtc, 0)
+                    && matches!(
+                        record.result,
+                        ScriptedResult::Error {
+                            raw_os_error: Some(error),
+                            ..
+                        } if error == libc::EINVAL
+                    )
+            })
+            .count(),
+        1,
+        "the direct owner's first clear is rejected once: {standalone_clear:?}"
+    );
+
+    recorder.script_result(Err(io::Error::from_raw_os_error(libc::EINVAL)));
+    super::direct_unflip::request_unflip(&mut harness.scene, &direct);
+    let unflip_offset = super::direct_unflip::record_count(&harness.scene, device_fd);
+    let unflip = super::direct_unflip::grouped_unflip_record(
+        &mut harness.scene,
+        device_fd,
+        unflip_offset,
+        1,
+    );
+    let unflip_attempts =
+        super::direct_unflip::records_since(&harness.scene, device_fd, unflip_offset);
+    let rejected_clears = unflip_attempts
+        .iter()
+        .filter(|record| {
+            contains_vrr_property(record, crtc, 0)
+                && matches!(
+                    record.result,
+                    ScriptedResult::Error {
+                        raw_os_error: Some(error),
+                        ..
+                    } if error == libc::EINVAL
+                )
+        })
+        .count();
+    assert_eq!(
+        rejected_clears, 1,
+        "the owner-leave clear is rejected once: {unflip_attempts:?}"
+    );
+    assert!(
+        unflip_attempts
+            .iter()
+            .any(|record| !has_vrr_property(record, crtc) && record.result == ScriptedResult::Ok)
+    );
+    let unflip_id = super::support::accepted_event_id(&unflip).expect("accepted unflip ID");
+    super::atomic_events::complete_recorded_attempt(
+        &mut harness.scene,
+        device_fd,
+        &unflip,
+        unflip_id,
+        101,
+    );
+    harness
+        .delivered
+        .insert(super::super::cursor_sprites::support::CompletionKey {
+            device_fd,
+            crtc,
+            commit_id: unflip_id,
+        });
+    super::direct_unflip::drain_present_notifications(
+        &mut harness.scene,
+        &[],
+        &[direct.candidate.present_id],
+    );
+
+    assert!(
+        harness
+            .scene
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .current
+            .is_none()
+    );
+    let output = &harness.scene.events.backend.platform.outputs[0].output;
+    assert!(
+        output.vrr_committed.get(),
+        "both rejected clears preserve kernel state"
+    );
+    assert!(
+        output.vrr_disabled.get(),
+        "the first EINVAL latches VRR off"
+    );
+    assert!(
+        output.vrr_clear_retry_used.get(),
+        "the second EINVAL bounds future clears"
+    );
+    harness.direct = None;
+
+    let root = harness.scene.events.backend.core.window_id;
+    let width = harness.scene.events.backend.platform.fb_w;
+    let height = harness.scene.events.backend.platform.fb_h;
+    let mut settled_scene = None;
+    for _ in 0..8 {
+        let settle_offset = super::direct_unflip::record_count(&harness.scene, device_fd);
+        Backend::clear_area(
+            &mut harness.scene.events.backend,
+            None,
+            root,
+            0,
+            None,
+            0,
+            0,
+            width,
+            height,
+            (0, 0),
+        )
+        .expect("damage composed desktop through Backend");
+        Backend::maybe_composite(&mut harness.scene.events.backend)
+            .expect("compose the desktop after direct unflip");
+        settled_scene =
+            super::direct_unflip::records_since(&harness.scene, device_fd, settle_offset)
+                .into_iter()
+                .find(|record| {
+                    record.events.iter().any(|event| event.crtc == crtc)
+                        && matches!(
+                            record.kind,
+                            AtomicCommitKind::Scene | AtomicCommitKind::SceneWithCursor
+                        )
+                        && super::support::accepted_event_id(record).is_some()
+                });
+        if settled_scene.is_some() {
+            break;
+        }
+        harness.scene.events.wait_for_submitted_gpu_work();
+        let events = &mut harness.scene.events;
+        Backend::on_scanout_render_completion(&mut events.backend, &mut events.state);
+    }
+    let settled_scene = settled_scene.expect("composed desktop accepts its settling scene frame");
+    assert!(
+        matches!(
+            settled_scene.kind,
+            AtomicCommitKind::Scene | AtomicCommitKind::SceneWithCursor
+        ),
+        "the desktop settles with a composed scene request"
+    );
+    let settled_scene_id =
+        super::support::accepted_event_id(&settled_scene).expect("settling scene event ID");
+    super::atomic_events::complete_recorded_attempt(
+        &mut harness.scene,
+        device_fd,
+        &settled_scene,
+        settled_scene_id,
+        102,
+    );
+    harness
+        .delivered
+        .insert(super::super::cursor_sprites::support::CompletionKey {
+            device_fd,
+            crtc,
+            commit_id: settled_scene_id,
+        });
+
+    super::recording_scene::clear_vrr_test_logs();
+    let (base, _) = super::support::install_controlled_clock(&mut harness.scene.events.backend);
+    let cursor_offset = super::direct_unflip::record_count(&harness.scene, harness.device_fd);
+    harness.warp_pointer(180, 130);
+    Backend::maybe_composite(&mut harness.scene.events.backend)
+        .expect("submit composed-desktop cursor motion immediately");
+    let cursor_records = vrr_cursor_records_since(&harness, cursor_offset);
+    let cursor_commits: Vec<_> = cursor_records
+        .iter()
+        .filter(|record| record.kind == AtomicCommitKind::CursorOnly)
+        .collect();
+    assert_eq!(
+        cursor_commits.len(),
+        1,
+        "composed desktop sends one cursor-only commit"
+    );
+    assert_eq!(cursor_commits[0].result, ScriptedResult::Ok);
+    assert_record_cursor_position(&harness, cursor_commits[0], (180, 130));
+    assert!(
+        Backend::next_wakeup(&harness.scene.events.backend).is_none_or(|wakeup| wakeup <= base),
+        "the composed cursor has no 33 ms deadline"
+    );
+    harness.retire_cursor_move(103);
+
+    let summary_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let summary = loop {
+        Backend::before_block(&mut harness.scene.events.backend);
+        if let Some(line) = super::recording_scene::vrr_test_logs()
+            .lines()
+            .find(|line| line.starts_with("present_latency_summary "))
+        {
+            break line.to_owned();
+        }
+        assert!(
+            std::time::Instant::now() < summary_deadline,
+            "VRR summary did not become due"
+        );
+        std::thread::yield_now();
+    };
+    assert!(summary.contains(&format!("vrr crtc={} ", u32::from(crtc))));
+    assert!(summary.contains("cursor_deadline_commits=0"), "{summary}");
+    harness.finish();
+    drop(direct);
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: key the cursor hold on inherited vrr_committed before any direct frame exists.
+fn vrr_cursor_not_held_with_inherited_vrr() {
+    let Some(mut harness) = vrr_composed_cursor_harness() else {
+        eprintln!("SKIP vrr_cursor_not_held_with_inherited_vrr: no Vulkan scene fixture available");
+        return;
+    };
+    let output = &mut harness.scene.events.backend.platform.outputs[0].output;
+    output.crtc_vrr_enabled_prop = Some(handle(VRR_PROP_ID));
+    output.connector_vrr_capable = true;
+    output.vrr_committed.set(true);
+    harness.scene.events.backend.pstate.vrr_mode = crate::launch::VrrMode::Off;
+    assert!(
+        harness
+            .scene
+            .events
+            .backend
+            .pstate
+            .scanout_m2
+            .current
+            .is_none()
+    );
+
+    super::recording_scene::clear_vrr_test_logs();
+    let (base, _) = super::support::install_controlled_clock(&mut harness.scene.events.backend);
+    let cursor_offset = super::direct_unflip::record_count(&harness.scene, harness.device_fd);
+    harness.warp_pointer(180, 130);
+    Backend::maybe_composite(&mut harness.scene.events.backend)
+        .expect("submit cursor motion on composed startup desktop");
+    let cursor_records = vrr_cursor_records_since(&harness, cursor_offset);
+    let cursor_commits: Vec<_> = cursor_records
+        .iter()
+        .filter(|record| record.kind == AtomicCommitKind::CursorOnly)
+        .collect();
+    assert_eq!(
+        cursor_commits.len(),
+        1,
+        "inherited VRR does not delay cursor motion"
+    );
+    assert_eq!(cursor_commits[0].result, ScriptedResult::Ok);
+    assert_record_cursor_position(&harness, cursor_commits[0], (180, 130));
+    assert!(
+        Backend::next_wakeup(&harness.scene.events.backend).is_none_or(|wakeup| wakeup <= base),
+        "startup cursor has no 33 ms deadline"
+    );
+    assert!(
+        harness.scene.events.backend.platform.outputs[0]
+            .output
+            .vrr_committed
+            .get(),
+        "no composed commit has retired to clear the inherited value"
+    );
+    harness.retire_cursor_move(104);
+
+    let crtc = harness.scene.events.backend.platform.outputs[0].output.crtc;
+    let summary_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let summary = loop {
+        Backend::before_block(&mut harness.scene.events.backend);
+        if let Some(line) = super::recording_scene::vrr_test_logs()
+            .lines()
+            .find(|line| line.starts_with("present_latency_summary "))
+        {
+            break line.to_owned();
+        }
+        assert!(
+            std::time::Instant::now() < summary_deadline,
+            "VRR summary did not become due"
+        );
+        std::thread::yield_now();
+    };
+    assert!(summary.contains(&format!("vrr crtc={} ", u32::from(crtc))));
+    assert!(summary.contains("cursor_deadline_commits=0"), "{summary}");
     harness.finish();
 }
 

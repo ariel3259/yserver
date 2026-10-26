@@ -1055,6 +1055,15 @@ impl KmsBackend {
             .is_some_and(|frame| self.direct_frame_wants_vrr(frame))
     }
 
+    fn live_direct_vrr_wanted_by_output(&self) -> Vec<bool> {
+        (0..self.platform.outputs.len())
+            .map(|output_idx| {
+                self.direct_scanout_frame_for_output(output_idx)
+                    .is_some_and(|frame| self.direct_frame_wants_vrr(frame))
+            })
+            .collect()
+    }
+
     pub(in crate::kms::render::backend) fn backend_scanout_on_window_property_changed(
         &mut self,
         state: &yserver_core::server::ServerState,
@@ -2906,12 +2915,13 @@ impl KmsBackend {
         let cursor_compose_blocked = self
             .tearing_cursor_compose_deadline(self.monotonic_now())
             .is_some();
+        let live_direct_vrr_wanted = self.live_direct_vrr_wanted_by_output();
         ((self.scene_wants_scene() || degraded_replacement_needs_submit) && !cursor_compose_blocked)
             || (!cursor_compose_blocked
                 && !direct_transaction_waiting
                 && self
                     .platform
-                    .has_eligible_atomic_cursor_move(self.monotonic_now()))
+                    .has_eligible_atomic_cursor_move(self.monotonic_now(), &live_direct_vrr_wanted))
     }
 
     #[cfg(test)]
@@ -3194,6 +3204,7 @@ impl KmsBackend {
         &self,
     ) -> Option<std::time::Instant> {
         let now = self.monotonic_now();
+        let live_direct_vrr_wanted = self.live_direct_vrr_wanted_by_output();
         let allow_kms_timers = self.scanout_allowed() && self.kms_outputs_active;
         let direct_hold_waits_for_cursor_or_frame = self.pstate.scanout_m2.hold_direct
             && self.pstate.scanout_m2.current.is_some()
@@ -3216,7 +3227,7 @@ impl KmsBackend {
         };
         let scene_deadline = if allow_kms_timers && direct_hold_waits_for_cursor_or_frame {
             self.platform
-                .has_eligible_atomic_cursor_move(now)
+                .has_eligible_atomic_cursor_move(now, &live_direct_vrr_wanted)
                 .then_some(now)
         } else if allow_kms_timers {
             if self.scene_wants_compose() {
@@ -3259,7 +3270,7 @@ impl KmsBackend {
             })
             .flatten();
         let vrr_cursor_deadline = allow_kms_timers
-            .then(|| self.platform.vrr_cursor_deadline())
+            .then(|| self.platform.vrr_cursor_deadline(&live_direct_vrr_wanted))
             .flatten();
         let needs_source_wait_poll =
             self.pstate
@@ -3445,11 +3456,16 @@ impl KmsBackend {
                 if self.pstate.scanout_m2.current.is_some()
                     && self.pstate.scanout_m2.queued_successor.is_none()
                 {
+                    let live_direct_vrr_wanted = self.live_direct_vrr_wanted_by_output();
                     for output_idx in 0..self.platform.outputs.len() {
-                        match self
-                            .platform
-                            .submit_atomic_cursor_move_for_output(output_idx, self.monotonic_now())
-                        {
+                        match self.platform.submit_atomic_cursor_move_for_output(
+                            output_idx,
+                            self.monotonic_now(),
+                            live_direct_vrr_wanted
+                                .get(output_idx)
+                                .copied()
+                                .unwrap_or(false),
+                        ) {
                             Ok(outcome) => self.handle_cursor_move_outcome(outcome),
                             Err(error) => log::warn!(
                                 "render maybe_composite: cursor-only atomic commit failed for output {output_idx}: {error}"
@@ -3551,6 +3567,7 @@ impl KmsBackend {
             composed_outputs.into_iter().flatten().collect();
         let cursor_outcome = self.platform.take_deferred_cursor_move_outcome();
         self.handle_cursor_move_outcome(cursor_outcome);
+        let live_direct_vrr_wanted = self.live_direct_vrr_wanted_by_output();
         for output_idx in 0..self.platform.outputs.len() {
             if scene_submitted_outputs.contains(&output_idx)
                 || self.scene.has_pending_page_flip(output_idx)
@@ -3562,10 +3579,14 @@ impl KmsBackend {
             {
                 continue;
             }
-            match self
-                .platform
-                .submit_atomic_cursor_move_for_output(output_idx, self.monotonic_now())
-            {
+            match self.platform.submit_atomic_cursor_move_for_output(
+                output_idx,
+                self.monotonic_now(),
+                live_direct_vrr_wanted
+                    .get(output_idx)
+                    .copied()
+                    .unwrap_or(false),
+            ) {
                 Ok(outcome) => self.handle_cursor_move_outcome(outcome),
                 Err(error) => log::warn!(
                     "render maybe_composite: cursor-only atomic commit failed for output {output_idx}: {error}"

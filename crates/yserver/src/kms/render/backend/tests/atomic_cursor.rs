@@ -379,9 +379,8 @@ fn idle_motion_coalesces_until_cursor_flip_retires() {
         "motion must not submit directly"
     );
     assert!(
-        backend
-            .platform
-            .has_eligible_atomic_cursor_move(std::time::Instant::now())
+        yserver_core::backend::Backend::next_wakeup(&backend)
+            .is_some_and(|wakeup| wakeup <= std::time::Instant::now())
     );
     assert!(backend.scanout_allowed());
     assert!(backend.kms_outputs_active);
