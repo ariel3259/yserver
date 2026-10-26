@@ -3099,6 +3099,29 @@ fn vrr_cursor_records_since(harness: &VrrCursorHarness, offset: usize) -> Vec<At
         .collect()
 }
 
+fn assert_zero_vrr_cursor_deadline_summary(
+    harness: &mut VrrCursorHarness,
+    crtc: ::drm::control::crtc::Handle,
+) {
+    let summary_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let summary = loop {
+        Backend::before_block(&mut harness.scene.events.backend);
+        if let Some(line) = super::recording_scene::vrr_test_logs()
+            .lines()
+            .find(|line| line.starts_with("present_latency_summary "))
+        {
+            break line.to_owned();
+        }
+        assert!(
+            std::time::Instant::now() < summary_deadline,
+            "VRR summary did not become due"
+        );
+        std::thread::yield_now();
+    };
+    assert!(summary.contains(&format!("vrr crtc={} ", u32::from(crtc))));
+    assert!(summary.contains("cursor_deadline_commits=0"), "{summary}");
+}
+
 fn request_signatures(records: &[AtomicCommitRecord]) -> Vec<RequestSignature> {
     records
         .iter()
@@ -3490,24 +3513,7 @@ fn vrr_cursor_not_held_after_rejected_clear() {
         "the composed cursor has no 33 ms deadline"
     );
     harness.retire_cursor_move(103);
-
-    let summary_deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let summary = loop {
-        Backend::before_block(&mut harness.scene.events.backend);
-        if let Some(line) = super::recording_scene::vrr_test_logs()
-            .lines()
-            .find(|line| line.starts_with("present_latency_summary "))
-        {
-            break line.to_owned();
-        }
-        assert!(
-            std::time::Instant::now() < summary_deadline,
-            "VRR summary did not become due"
-        );
-        std::thread::yield_now();
-    };
-    assert!(summary.contains(&format!("vrr crtc={} ", u32::from(crtc))));
-    assert!(summary.contains("cursor_deadline_commits=0"), "{summary}");
+    assert_zero_vrr_cursor_deadline_summary(&mut harness, crtc);
     harness.finish();
     drop(direct);
 }
@@ -3568,23 +3574,7 @@ fn vrr_cursor_not_held_with_inherited_vrr() {
     harness.retire_cursor_move(104);
 
     let crtc = harness.scene.events.backend.platform.outputs[0].output.crtc;
-    let summary_deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let summary = loop {
-        Backend::before_block(&mut harness.scene.events.backend);
-        if let Some(line) = super::recording_scene::vrr_test_logs()
-            .lines()
-            .find(|line| line.starts_with("present_latency_summary "))
-        {
-            break line.to_owned();
-        }
-        assert!(
-            std::time::Instant::now() < summary_deadline,
-            "VRR summary did not become due"
-        );
-        std::thread::yield_now();
-    };
-    assert!(summary.contains(&format!("vrr crtc={} ", u32::from(crtc))));
-    assert!(summary.contains("cursor_deadline_commits=0"), "{summary}");
+    assert_zero_vrr_cursor_deadline_summary(&mut harness, crtc);
     harness.finish();
 }
 

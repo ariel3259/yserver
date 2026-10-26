@@ -1058,8 +1058,17 @@ impl KmsBackend {
     fn live_direct_vrr_wanted_by_output(&self) -> Vec<bool> {
         (0..self.platform.outputs.len())
             .map(|output_idx| {
-                self.direct_scanout_frame_for_output(output_idx)
-                    .is_some_and(|frame| self.direct_frame_wants_vrr(frame))
+                let Some(output_frame) = self.direct_scanout_frame_for_output(output_idx) else {
+                    return false;
+                };
+                let frame = self
+                    .pstate
+                    .scanout_m2
+                    .queued_successor
+                    .as_ref()
+                    .or(self.pstate.scanout_m2.pending.as_ref())
+                    .unwrap_or(output_frame);
+                self.direct_frame_wants_vrr(frame)
             })
             .collect()
     }
