@@ -51,6 +51,13 @@ impl PlatformBackend {
             return Ok(());
         }
         let carries_vrr_clear = changes.vrr_changes.iter().any(|(_, value)| !*value);
+        if carries_vrr_clear && current_primary_framebuffer.is_none() {
+            log::debug!(
+                "kms: standalone VRR clear skipped output={} because no live direct framebuffer is available",
+                layout.key.connector_name
+            );
+            return Ok(());
+        }
         if carries_vrr_clear && let Some(framebuffer) = current_primary_framebuffer {
             request.add_raw_property(
                 output.plane.into(),
@@ -91,7 +98,7 @@ impl PlatformBackend {
             let result = device.atomic_commit_sink.submit_with_commit_id(
                 &device.device,
                 flags,
-                AtomicCommitKind::GammaOnly,
+                AtomicCommitKind::VrrOnly,
                 request,
                 &events,
             );

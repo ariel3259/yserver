@@ -1265,7 +1265,7 @@ impl KmsBackend {
                 .and_then(ScanoutM1ProbeEntry::framebuffer)
                 .map(crate::drm::modeset::DirectScanoutProbeFramebuffer::handle);
         }
-        self.platform.retained_composed_framebuffer(output_idx)
+        None
     }
 
     #[cfg(test)]

@@ -119,6 +119,7 @@ impl RawAtomicModeReq {
 pub(crate) enum AtomicCommitKind {
     CursorOnly,
     GammaOnly,
+    VrrOnly,
     SceneWithCursor,
     Scene,
     Async,
@@ -178,6 +179,7 @@ impl AtomicCommitKind {
         match self {
             Self::CursorOnly => "cursor-only",
             Self::GammaOnly => "gamma-only",
+            Self::VrrOnly => "vrr-only",
             Self::SceneWithCursor => "scene-with-cursor",
             Self::Scene => "scene",
             Self::Async => "async",
@@ -186,7 +188,7 @@ impl AtomicCommitKind {
 
     const fn ebusy_log_level(self) -> log::Level {
         match self {
-            Self::CursorOnly | Self::GammaOnly => log::Level::Debug,
+            Self::CursorOnly | Self::GammaOnly | Self::VrrOnly => log::Level::Debug,
             Self::SceneWithCursor | Self::Scene | Self::Async => log::Level::Warn,
         }
     }
@@ -195,9 +197,10 @@ impl AtomicCommitKind {
         match self {
             Self::CursorOnly => 0,
             Self::GammaOnly => 1,
-            Self::SceneWithCursor => 2,
-            Self::Scene => 3,
-            Self::Async => 4,
+            Self::VrrOnly => 2,
+            Self::SceneWithCursor => 3,
+            Self::Scene => 4,
+            Self::Async => 5,
         }
     }
 }
@@ -915,12 +918,13 @@ impl AtomicCommitSink {
         let visible = percentile(&snapshot.motion_to_visible_us);
         log::info!(
             target: "yserver::kms::render::backend::kms",
-            "atomic commits/s cursor_only={} gamma_only={} scene_with_cursor={} scene={} async={} ebusy={} ioctl_us_max/p99 cursor_only={}/{} gamma_only={}/{} scene_with_cursor={}/{} scene={}/{} async={}/{} motion_to_accept_us_max/p99={}/{} motion_to_visible_us_max/p99={}/{}",
+            "atomic commits/s cursor_only={} gamma_only={} vrr_only={} scene_with_cursor={} scene={} async={} ebusy={} ioctl_us_max/p99 cursor_only={}/{} gamma_only={}/{} vrr_only={}/{} scene_with_cursor={}/{} scene={}/{} async={}/{} motion_to_accept_us_max/p99={}/{} motion_to_visible_us_max/p99={}/{}",
             counts[0],
             counts[1],
             counts[2],
             counts[3],
             counts[4],
+            counts[5],
             snapshot.ebusy,
             summaries[0].0,
             summaries[0].1,
@@ -932,6 +936,8 @@ impl AtomicCommitSink {
             summaries[3].1,
             summaries[4].0,
             summaries[4].1,
+            summaries[5].0,
+            summaries[5].1,
             accept.0,
             accept.1,
             visible.0,
@@ -1126,7 +1132,7 @@ struct CommitWindow {
     started: Instant,
     tearing_started: Instant,
     present_latency_started: Instant,
-    ioctl_us: [Vec<u64>; 5],
+    ioctl_us: [Vec<u64>; 6],
     ebusy: u64,
     motion_to_accept_us: Vec<u64>,
     motion_to_visible_us: Vec<u64>,
@@ -1168,7 +1174,7 @@ struct VrrCrtcWindowMetrics {
 }
 
 struct CommitWindowSnapshot {
-    ioctl_us: [Vec<u64>; 5],
+    ioctl_us: [Vec<u64>; 6],
     ebusy: u64,
     motion_to_accept_us: Vec<u64>,
     motion_to_visible_us: Vec<u64>,

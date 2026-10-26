@@ -4,7 +4,8 @@ import re
 import sys
 
 PAT = re.compile(
-    r"atomic commits/s cursor_only=(\d+) scene_with_cursor=(\d+) scene=(\d+) ebusy=(\d+) .*"
+    r"atomic commits/s cursor_only=(\d+) gamma_only=(\d+) vrr_only=(\d+) "
+    r"scene_with_cursor=(\d+) scene=(\d+) async=(\d+) ebusy=(\d+) .*"
     r"motion_to_accept_us_max/p99=(\d+)/(\d+) motion_to_visible_us_max/p99=(\d+)/(\d+)"
 )
 
@@ -12,13 +13,13 @@ for path in sys.argv[1:]:
     rows = [tuple(map(int, m.groups())) for m in map(PAT.search, open(path, errors="replace")) if m]
     if not rows:
         continue  # master binaries print no such line
-    ebusy = sum(r[3] for r in rows)
-    moving = [r for r in rows if r[7] > 0]
+    ebusy = sum(r[6] for r in rows)
+    moving = [r for r in rows if r[10] > 0]
     if not moving:
         print(f"{path}: ebusy={ebusy}, no motion samples")
         continue
-    acc = sorted(r[5] for r in moving)
-    vis = sorted(r[7] for r in moving)
+    acc = sorted(r[8] for r in moving)
+    vis = sorted(r[10] for r in moving)
     mid = lambda v: v[len(v) // 2] / 1000
     print(
         f"{path}: ebusy={ebusy} motion-seconds={len(moving)} "

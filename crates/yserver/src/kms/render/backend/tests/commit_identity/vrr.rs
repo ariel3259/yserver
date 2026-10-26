@@ -1299,7 +1299,7 @@ fn vrr_standalone_clear_carries_current_primary_fb() {
         .into_iter()
         .find(|record| super::support::accepted_event_id(record).is_some())
         .expect("idle deletion submits one standalone clear");
-    assert_eq!(clear.kind, AtomicCommitKind::GammaOnly);
+    assert_eq!(clear.kind, AtomicCommitKind::VrrOnly);
     assert!(
         clear.properties.iter().any(|update| {
             update.object == crtc.into()
@@ -1431,7 +1431,7 @@ fn vrr_standalone_clear_event_retires_nothing() {
         .into_iter()
         .find(|record| super::support::accepted_event_id(record).is_some())
         .expect("idle deletion submits one standalone clear");
-    assert_eq!(clear.kind, AtomicCommitKind::GammaOnly);
+    assert_eq!(clear.kind, AtomicCommitKind::VrrOnly);
     assert!(contains_vrr_property(&clear, crtc, 0));
 
     let clear_id = super::support::accepted_event_id(&clear).expect("clear event ID");
@@ -1512,25 +1512,26 @@ fn vrr_standalone_clear_event_retires_nothing() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: omit the retained scene framebuffer from a standalone VRR clear.
-fn vrr_standalone_clear_carries_scene_front_buffer() {
+// Mutation: restore the retained-composed-framebuffer fallback for standalone VRR clears.
+fn vrr_standalone_clear_without_direct_frame_is_not_submitted() {
     let Some(fixture) = super::recording_scene::RecordingSceneFixture::new(1)
         .expect("recording scene fixture construction")
     else {
         eprintln!(
-            "SKIP vrr_standalone_clear_carries_scene_front_buffer: no Vulkan scene fixture available"
+            "SKIP vrr_standalone_clear_without_direct_frame_is_not_submitted: no Vulkan scene fixture available"
         );
         return;
     };
     let mut fixture = fixture.cleanup_guard();
-    let (base, elapsed_ns) = super::support::install_controlled_clock(&mut fixture.events.backend);
+    let (base, _elapsed_ns) = super::support::install_controlled_clock(&mut fixture.events.backend);
     set_vrr_capable(&mut fixture);
     let fd = super::direct_unflip::fd(&fixture);
     let recorder = fixture.events.recorders[&fd].clone();
     let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
-    let fb_id_property = fixture.events.backend.platform.outputs[0]
-        .output
-        .plane_fb_id_prop;
+    let output_name = fixture.events.backend.platform.outputs[0]
+        .key
+        .connector_name
+        .clone();
     let initial = super::atomic_events::submit_damaged_frame(&mut fixture)
         .into_iter()
         .find(|(record_fd, record)| {
@@ -1540,98 +1541,66 @@ fn vrr_standalone_clear_carries_scene_front_buffer() {
         .expect("scene path accepts an initial composed frame");
     let initial_id = super::support::accepted_event_id(&initial).expect("scene event ID");
     super::atomic_events::complete_recorded_attempt(&mut fixture, fd, &initial, initial_id, 92);
-    let scene_front_buffer = fixture
-        .events
-        .backend
-        .platform
-        .retained_composed_framebuffer(0)
-        .expect("retired scene frame remains the current composed framebuffer");
-    fixture.events.backend.platform.outputs[0]
-        .output
-        .vrr_committed
-        .set(true);
-    {
-        let output = &mut fixture.events.backend.platform.outputs[0].output;
-        output.crtc_gamma_lut_prop = Some(handle(110));
-        output.crtc_gamma_lut_size = Some(4);
-    }
-    recorder.set_gamma_size_for_tests(4);
+    assert!(
+        fixture.events.backend.pstate.scanout_m2.current.is_none(),
+        "there is no live direct frame on the output"
+    );
+    assert!(
+        fixture
+            .events
+            .backend
+            .platform
+            .retained_composed_framebuffer(0)
+            .is_some(),
+        "the preexisting composed framebuffer is retained"
+    );
+    let output = &fixture.events.backend.platform.outputs[0].output;
+    output.vrr_committed.set(true);
+    output.vrr_clear_retry_deadline.set(Some(base));
     let before = recorder.records().len();
-    Backend::set_crtc_gamma(
-        &mut fixture.events.backend,
-        u32::from(crtc),
-        &[0x1111; 4],
-        &[0x2222; 4],
-        &[0x3333; 4],
-    )
-    .expect("gamma change schedules the due inherited VRR clear");
-    let gamma_deadline = fixture.events.backend.platform.outputs[0]
-        .output
-        .pending_gamma_deadline
-        .get()
-        .expect("recent scene activity defers gamma for one refresh");
-    let elapsed = gamma_deadline
-        .checked_duration_since(base)
-        .expect("gamma retry deadline follows the controlled clock base");
-    elapsed_ns.store(
-        u64::try_from(elapsed.as_nanos()).expect("controlled test time fits u64 nanoseconds"),
-        Ordering::SeqCst,
-    );
+    super::recording_scene::clear_vrr_test_logs();
     Backend::maybe_composite(&mut fixture.events.backend)
-        .expect("controlled gamma deadline drives the standalone CRTC-property path");
-
-    let clear = recorder
-        .records()
-        .into_iter()
-        .skip(before)
-        .find(|record| super::support::accepted_event_id(record).is_some())
-        .expect("composed output submits a standalone VRR clear");
-    assert_eq!(clear.kind, AtomicCommitKind::GammaOnly);
-    assert!(contains_vrr_property(&clear, crtc, 0));
+        .expect("due standalone clear scheduling pass");
     assert_eq!(
-        clear
-            .properties
-            .iter()
-            .filter(|update| update.property == fb_id_property)
-            .map(|update| update.value)
-            .collect::<Vec<_>>(),
-        vec![u64::from(u32::from(scene_front_buffer))],
-        "standalone clear carries the composed scene's retained front buffer"
-    );
-    assert_eq!(
-        clear.properties.len(),
-        2,
-        "VRR clear takes priority over gamma"
+        recorder.records().len(),
+        before,
+        "no standalone VRR request is submitted without a live direct frame"
     );
     assert!(
         fixture.events.backend.platform.outputs[0]
             .output
-            .pending_gamma_lut
-            .borrow()
-            .is_some(),
-        "the standalone VRR clear leaves gamma pending for its own request"
+            .vrr_committed
+            .get(),
+        "the unsent VRR clear remains pending"
     );
-    let clear_id = super::support::accepted_event_id(&clear).expect("clear event ID");
-    super::atomic_events::complete_recorded_attempt(&mut fixture, fd, &clear, clear_id, 93);
-    let gamma = recorder
-        .records()
-        .into_iter()
-        .skip(before)
-        .find(|record| {
-            super::support::accepted_event_id(record).is_some()
-                && !contains_vrr_property(record, crtc, 0)
-        })
-        .expect("event retry submits the waiting gamma request separately");
-    assert_eq!(gamma.kind, AtomicCommitKind::GammaOnly);
+    let logs = super::recording_scene::vrr_test_logs();
     assert!(
-        gamma
-            .properties
-            .iter()
-            .all(|update| update.property != fb_id_property),
-        "gamma-only standalone commit does not touch the primary plane"
+        logs.lines()
+            .any(|line| { line.contains("standalone VRR clear") && line.contains(&output_name) }),
+        "skipped standalone clear debug log names the output; logs={logs:?}"
     );
-    let gamma_id = super::support::accepted_event_id(&gamma).expect("gamma event ID");
-    super::atomic_events::complete_recorded_attempt(&mut fixture, fd, &gamma, gamma_id, 94);
+
+    let composed = super::atomic_events::submit_damaged_frame(&mut fixture)
+        .into_iter()
+        .find(|(record_fd, record)| {
+            *record_fd == fd && super::support::accepted_event_id(record).is_some()
+        })
+        .map(|(_, record)| record)
+        .expect("next composed frame is accepted");
+    assert_eq!(composed.kind, AtomicCommitKind::Scene);
+    assert!(
+        contains_vrr_property(&composed, crtc, 0),
+        "next composed commit carries the pending VRR clear"
+    );
+    assert!(
+        !fixture.events.backend.platform.outputs[0]
+            .output
+            .vrr_committed
+            .get(),
+        "accepted composed commit records the clear"
+    );
+    let composed_id = super::support::accepted_event_id(&composed).expect("scene event ID");
+    super::atomic_events::complete_recorded_attempt(&mut fixture, fd, &composed, composed_id, 93);
     fixture.finish_after_normal_drain();
 }
 
@@ -1848,7 +1817,7 @@ fn vrr_property_mode_reads_like_xorg() {
                 .into_iter()
                 .find(|record| super::support::accepted_event_id(record).is_some())
                 .expect("property change clears committed VRR while the CRTC is idle");
-            assert_eq!(clear.kind, AtomicCommitKind::GammaOnly);
+            assert_eq!(clear.kind, AtomicCommitKind::VrrOnly);
             assert!(contains_vrr_property(&clear, crtc, 0));
             assert_eq!(
                 clear
@@ -4211,7 +4180,7 @@ fn vrr_property_deleted_clears_without_frame_distinct_crtc_ids() {
         .into_iter()
         .find(|record| super::support::accepted_event_id(record).is_some())
         .expect("idle deletion submits one standalone clear");
-    assert_eq!(clear.kind, AtomicCommitKind::GammaOnly);
+    assert_eq!(clear.kind, AtomicCommitKind::VrrOnly);
     assert!(contains_vrr_property(&clear, crtc, 0));
     assert_eq!(
         clear
@@ -4336,7 +4305,7 @@ fn vrr_property_deleted_during_flip_clears_at_event() {
         .into_iter()
         .find(|record| super::support::accepted_event_id(record).is_some())
         .expect("flip event releases the standalone clear");
-    assert_eq!(clear.kind, AtomicCommitKind::GammaOnly);
+    assert_eq!(clear.kind, AtomicCommitKind::VrrOnly);
     assert!(contains_vrr_property(&clear, crtc, 0));
     assert_eq!(
         clear
@@ -4832,7 +4801,7 @@ fn vrr_standalone_clear_retried_after_error() {
     let attempts = super::direct_unflip::records_since(&fixture, fd, offset);
     assert_eq!(attempts.len(), 2, "the failed clear is retried once");
     assert_eq!(attempts[1].result, ScriptedResult::Ok);
-    assert_eq!(attempts[1].kind, AtomicCommitKind::GammaOnly);
+    assert_eq!(attempts[1].kind, AtomicCommitKind::VrrOnly);
     assert!(contains_vrr_property(&attempts[1], crtc, 0));
     assert_eq!(
         attempts[1]

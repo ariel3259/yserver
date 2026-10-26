@@ -743,10 +743,13 @@ pub(in crate::kms::render::backend::tests) fn init_tearing_test_logger() {
     let captured = VRR_TEST_LOGS.get_or_init(|| Arc::new(Mutex::new(HashMap::new())));
     let _ = env_logger::Builder::new()
         .is_test(true)
-        .filter_level(log::LevelFilter::Info)
+        .filter_level(log::LevelFilter::Debug)
         .format(|buffer, record| {
             let message = record.args().to_string();
-            if message.starts_with("kms: vrr ") || message.starts_with("present_latency_summary ") {
+            if message.starts_with("kms: vrr ")
+                || message.starts_with("kms: standalone VRR clear skipped output=")
+                || message.starts_with("present_latency_summary ")
+            {
                 writeln!(buffer, "{}", record.args())
             } else {
                 Ok(())
