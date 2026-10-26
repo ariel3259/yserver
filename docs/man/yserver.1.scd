@@ -59,13 +59,13 @@ entries say so. *--version* reports what this binary was built with.
 
 *--vrr*
 	Enable adaptive sync for a client window in direct scanout when its
-	_VARIABLE_REFRESH_ property has format 32, exactly one item and a
+	*\_VARIABLE_REFRESH* property has format 32, exactly one item and a
 	nonzero value. VRR is off by default.
 
 *--vrr all*
 	Enable adaptive sync for direct-scanned client windows without requiring
-	_VARIABLE_REFRESH_. On *nvidia-drm*, NVIDIA application profiles,
-	Mesa driconf and the client's *__GL_VRR_ALLOWED* or *adaptive_sync*
+	*\_VARIABLE_REFRESH*. On *nvidia-drm*, NVIDIA application profiles,
+	Mesa driconf and the client's *\_\_GL_VRR_ALLOWED* or *adaptive_sync*
 	environment setting can exclude a process. On other drivers this behaves
 	like *--vrr* and uses the window property.
 
