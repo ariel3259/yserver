@@ -15,12 +15,16 @@ use crate::{
         },
         scanout_route::{RenderKmsRelationship, ScanoutRoute},
     },
+    vrr_exclusions::test_support::{
+        TempTree as VrrTestTree, process as write_fake_process_fixture, roots as vrr_test_roots,
+        write as write_vrr_test_file,
+    },
 };
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
     io,
-    path::{Path, PathBuf},
+    path::Path,
     rc::Rc,
     sync::{
         Arc, Mutex,
@@ -4906,58 +4910,9 @@ fn vrr_standalone_clear_einval_latches_without_empty_retry() {
     fixture.finish_after_normal_drain();
 }
 
-struct VrrTestTree(PathBuf);
-
-impl VrrTestTree {
-    fn new() -> Self {
-        let id = NEXT_VRR_TEST_ROOT.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("yserver-vrr-backend-{}-{id}", std::process::id()));
-        std::fs::create_dir_all(&path).expect("create VRR backend test root");
-        Self(path)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for VrrTestTree {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-static NEXT_VRR_TEST_ROOT: AtomicU64 = AtomicU64::new(0);
-
-fn vrr_test_roots(tree: &VrrTestTree) -> crate::vrr_exclusions::VrrListRoots {
-    crate::vrr_exclusions::VrrListRoots {
-        nvidia_driver_dir: tree.path().join("usr/share/nvidia"),
-        nvidia_etc_dir: tree.path().join("etc/nvidia"),
-        mesa_system_dir: tree.path().join("usr/share/drirc.d"),
-        mesa_etc_file: tree.path().join("etc/drirc"),
-        home: tree.path().join("home/user"),
-    }
-}
-
-fn write_vrr_test_file(path: impl AsRef<Path>, contents: &str) {
-    let path = path.as_ref();
-    std::fs::create_dir_all(path.parent().expect("VRR fixture file has parent"))
-        .expect("create VRR fixture parent");
-    std::fs::write(path, contents).expect("write VRR fixture file");
-}
-
 fn write_fake_process(proc_root: &Path, pid: u32, name: &str) {
-    use std::os::unix::fs::symlink;
-
-    let process_dir = proc_root.join(pid.to_string());
-    let _ = std::fs::remove_dir_all(&process_dir);
-    std::fs::create_dir_all(&process_dir).expect("create fake process directory");
-    symlink(format!("/usr/bin/{name}"), process_dir.join("exe"))
-        .expect("create fake executable symlink");
-    std::fs::write(process_dir.join("cmdline"), format!("/usr/bin/{name}\0"))
-        .expect("write fake command line");
-    std::fs::write(process_dir.join("environ"), "\0").expect("write fake environment");
+    let executable = format!("/usr/bin/{name}");
+    write_fake_process_fixture(proc_root, pid, &executable, &executable, &[]);
 }
 
 fn accepted_vrr_direct(
@@ -5201,9 +5156,12 @@ fn vrr_all_mode_excluded_client_never_enables() {
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: treat a missing peer PID as an exclusion instead of the property-free All behavior.
+// Mutation: omit the missing-PID debug diagnostic.
 fn vrr_all_mode_client_without_pid_enables() {
+    super::recording_scene::init_tearing_test_logger();
+    super::recording_scene::clear_vrr_test_logs();
     let tree = VrrTestTree::new();
-    let Some((mut fixture, direct)) = direct_fixture(19_020, 0) else {
+    let Some((mut fixture, mut direct)) = direct_fixture(19_020, 0) else {
         eprintln!(
             "SKIP vrr_all_mode_client_without_pid_enables: no Vulkan scene fixture available"
         );
@@ -5224,7 +5182,28 @@ fn vrr_all_mode_client_without_pid_enables() {
         "a connection without a peer PID is not excluded"
     );
     complete_direct_and_drain_present(&mut fixture, &record, direct.candidate.present_id, None);
+
     let fd = super::direct_unflip::fd(&fixture);
+    let previous_present_id = direct.candidate.present_id;
+    let successor = submit_direct_successor(&mut fixture, &mut direct, fd);
+    assert!(
+        super::support::accepted_event_id(&successor).is_some(),
+        "the next Present remains accepted"
+    );
+    let no_pid_logs = super::recording_scene::vrr_test_logs()
+        .lines()
+        .filter(|line| line.starts_with("kms: vrr exclusion skipped client=1 reason=no-pid"))
+        .count();
+    assert_eq!(
+        no_pid_logs, 1,
+        "a missing peer PID is diagnosed once per connected client"
+    );
+    complete_direct_and_drain_present(
+        &mut fixture,
+        &successor,
+        direct.candidate.present_id,
+        Some(previous_present_id),
+    );
     finish_direct_scanout(&mut fixture, &direct, fd);
     fixture.finish_after_normal_drain();
 }

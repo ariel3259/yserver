@@ -51,7 +51,7 @@ pub(crate) struct VrrExclusionDecision {
 impl VrrExclusions {
     #[must_use]
     pub fn load(roots: &VrrListRoots) -> Self {
-        let mut nvidia = HashMap::new();
+        let mut nvidia_documents = Vec::new();
         let user_nvidia = roots.home.join(".nv");
         let mut nvidia_paths = vec![user_nvidia.join("nvidia-application-profiles-rc")];
         nvidia_paths.extend(files_in_dir(
@@ -68,12 +68,8 @@ impl VrrExclusions {
         }));
         for path in nvidia_paths {
             if let Some(contents) = read_optional(&path, "NVIDIA application profile") {
-                if let Some(entries) = parse_nvidia_profiles(&contents) {
-                    for (name, allowed) in entries {
-                        // NVIDIA searches user, system, then driver profiles;
-                        // earlier files and rules have higher precedence.
-                        nvidia.entry(name).or_insert(allowed);
-                    }
+                if let Some(document) = parse_nvidia_document(&contents) {
+                    nvidia_documents.push(document);
                 } else {
                     log::warn!(
                         "kms: skipping malformed NVIDIA application profile {}",
@@ -82,6 +78,7 @@ impl VrrExclusions {
                 }
             }
         }
+        let nvidia = parse_nvidia_profiles(&nvidia_documents);
 
         let mut mesa = HashMap::new();
         let mesa_system_paths = files_named(&roots.mesa_system_dir, |name| name.ends_with(".conf"));
@@ -188,53 +185,60 @@ fn read_optional(path: &Path, description: &str) -> Option<String> {
     }
 }
 
-fn parse_nvidia_profiles(contents: &str) -> Option<HashMap<String, bool>> {
+fn parse_nvidia_document(contents: &str) -> Option<Value> {
     let json = drop_hash_comment_lines(contents);
     let document: Value = serde_json::from_str(&json).ok()?;
-    let root = document.as_object()?;
+    document.as_object()?;
+    Some(document)
+}
+
+fn parse_nvidia_profiles(documents: &[Value]) -> HashMap<String, bool> {
     let mut profiles: HashMap<&str, &Value> = HashMap::new();
-    if let Some(items) = root.get("profiles").and_then(Value::as_array) {
+    for document in documents {
+        let Some(items) = document.get("profiles").and_then(Value::as_array) else {
+            continue;
+        };
         for item in items {
             if let (Some(name), Some(profile)) = (
                 item.get("name").and_then(Value::as_str),
                 item.get("settings"),
             ) {
-                profiles.insert(name, profile);
+                profiles.entry(name).or_insert(profile);
             }
-        }
-    } else if let Some(items) = root.get("profiles").and_then(Value::as_object) {
-        for (name, profile) in items {
-            let settings = profile.get("settings").unwrap_or(profile);
-            profiles.insert(name, settings);
         }
     }
 
     let mut settings_by_process = HashMap::new();
-    let rules = root.get("rules")?.as_array()?;
-    for rule in rules {
-        let Some(process_name) = rule.get("pattern").and_then(procname_pattern) else {
+    for document in documents {
+        let Some(rules) = document.get("rules").and_then(Value::as_array) else {
             continue;
         };
-        let Some(profile) = rule.get("profile") else {
-            continue;
-        };
-        let settings = match profile {
-            Value::String(name) => profiles.get(name.as_str()).copied(),
-            Value::Object(object) => object.get("settings"),
-            settings @ Value::Array(_) => Some(settings),
-            _ => None,
-        };
-        let Some(allowed) = settings.and_then(|settings| setting_bool(settings, "GLVRRAllowed"))
-        else {
-            continue;
-        };
-        // NVIDIA applies earlier matching rules before later ones. The first
-        // value for this profile key therefore wins within the same file.
-        settings_by_process
-            .entry(process_name.to_owned())
-            .or_insert(allowed);
+        for rule in rules {
+            let Some(process_name) = rule.get("pattern").and_then(procname_pattern) else {
+                continue;
+            };
+            let Some(profile) = rule.get("profile") else {
+                continue;
+            };
+            let settings = match profile {
+                Value::String(name) => profiles.get(name.as_str()).copied(),
+                Value::Object(object) => object.get("settings"),
+                settings @ Value::Array(_) => Some(settings),
+                _ => None,
+            };
+            let Some(allowed) =
+                settings.and_then(|settings| setting_bool(settings, "GLVRRAllowed"))
+            else {
+                continue;
+            };
+            // NVIDIA applies earlier matching rules before later ones. The
+            // first value for this key therefore wins across files and rules.
+            settings_by_process
+                .entry(process_name.to_owned())
+                .or_insert(allowed);
+        }
     }
-    Some(settings_by_process)
+    settings_by_process
 }
 
 fn procname_pattern(pattern: &Value) -> Option<&str> {
@@ -251,7 +255,6 @@ fn procname_pattern(pattern: &Value) -> Option<&str> {
 
 fn setting_bool(settings: &Value, key: &str) -> Option<bool> {
     match settings {
-        Value::Object(settings) => settings.get(key).and_then(value_bool),
         Value::Array(entries) => {
             if entries.iter().any(Value::is_object) {
                 entries.iter().find_map(|entry| {
@@ -328,7 +331,6 @@ fn read_process_name(process_dir: &Path) -> Option<String> {
     let cmdline = fs::read(process_dir.join("cmdline")).ok()?;
     let argv0 = cmdline.split(|byte| *byte == 0).next()?;
     let argv0 = std::str::from_utf8(argv0).ok()?;
-    let argv0 = argv0.split_ascii_whitespace().next()?;
     let argv_name = Path::new(argv0)
         .file_name()
         .and_then(|name| name.to_str())
@@ -376,8 +378,8 @@ fn parse_driconf(contents: &str) -> Option<HashMap<String, bool>> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{VrrExclusionSource, VrrExclusions, VrrListRoots};
+pub(crate) mod test_support {
+    use super::VrrListRoots;
     use std::{
         fs,
         path::{Path, PathBuf},
@@ -386,20 +388,18 @@ mod tests {
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
-    struct TempTree(PathBuf);
+    pub(crate) struct TempTree(PathBuf);
 
     impl TempTree {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "yserver-vrr-exclusions-{}-{id}",
-                std::process::id()
-            ));
+            let path =
+                std::env::temp_dir().join(format!("yserver-vrr-test-{}-{id}", std::process::id()));
             fs::create_dir_all(&path).expect("create temp fixture root");
             Self(path)
         }
 
-        fn path(&self) -> &Path {
+        pub(crate) fn path(&self) -> &Path {
             &self.0
         }
     }
@@ -410,7 +410,7 @@ mod tests {
         }
     }
 
-    fn roots(tree: &TempTree) -> VrrListRoots {
+    pub(crate) fn roots(tree: &TempTree) -> VrrListRoots {
         VrrListRoots {
             nvidia_driver_dir: tree.path().join("usr/share/nvidia"),
             nvidia_etc_dir: tree.path().join("etc/nvidia"),
@@ -420,17 +420,24 @@ mod tests {
         }
     }
 
-    fn write(path: impl AsRef<Path>, contents: &str) {
+    pub(crate) fn write(path: impl AsRef<Path>, contents: &str) {
         let path = path.as_ref();
         fs::create_dir_all(path.parent().expect("fixture path has parent"))
             .expect("create fixture parent");
         fs::write(path, contents).expect("write fixture file");
     }
 
-    fn process(proc_root: &Path, pid: u32, executable: &str, argv0: &str, environ: &[&str]) {
+    pub(crate) fn process(
+        proc_root: &Path,
+        pid: u32,
+        executable: &str,
+        argv0: &str,
+        environ: &[&str],
+    ) {
         use std::os::unix::fs::symlink;
 
         let process_dir = proc_root.join(pid.to_string());
+        let _ = fs::remove_dir_all(&process_dir);
         fs::create_dir_all(&process_dir).expect("create fake process directory");
         symlink(executable, process_dir.join("exe")).expect("create fake executable symlink");
         let mut cmdline = argv0.as_bytes().to_vec();
@@ -439,6 +446,14 @@ mod tests {
         fs::write(process_dir.join("environ"), environ.join("\0") + "\0")
             .expect("write fake environment");
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        VrrExclusionSource, VrrExclusions,
+        test_support::{TempTree, process, roots, write},
+    };
 
     #[test]
     // Mutation: ignore Mesa adaptive_sync=false entries.
@@ -536,6 +551,57 @@ mod tests {
     }
 
     #[test]
+    // Mutation: skip profiles defined in later NVIDIA files.
+    fn vrr_exclusions_nvidia_named_profile_cross_file() {
+        let tree = TempTree::new();
+        let roots = roots(&tree);
+        let proc_root = tree.path().join("proc");
+        write(
+            roots.home.join(".nv/nvidia-application-profiles-rc"),
+            r#"{"rules":[{"pattern":"firefox","profile":"deny"}]}"#,
+        );
+        write(
+            roots
+                .nvidia_driver_dir
+                .join("nvidia-application-profiles-580-rc"),
+            r#"{"profiles":[{"name":"deny","settings":["GLVRRAllowed",false]}]}"#,
+        );
+        process(&proc_root, 37, "/usr/lib/firefox", "/usr/lib/firefox", &[]);
+
+        assert_eq!(
+            VrrExclusions::load(&roots).excluded(37, &proc_root),
+            Some(VrrExclusionSource::NvidiaProfiles)
+        );
+    }
+
+    #[test]
+    // Mutation: let a lower-precedence NVIDIA rule override a user rule referencing a later profile.
+    fn vrr_exclusions_nvidia_named_profile_user_override() {
+        let tree = TempTree::new();
+        let roots = roots(&tree);
+        let proc_root = tree.path().join("proc");
+        write(
+            roots.home.join(".nv/nvidia-application-profiles-rc"),
+            r#"{"rules":[{"pattern":"firefox","profile":"allow"}]}"#,
+        );
+        write(
+            roots
+                .nvidia_driver_dir
+                .join("nvidia-application-profiles-580-rc"),
+            r#"{"profiles":[{"name":"allow","settings":["GLVRRAllowed",true]}]}"#,
+        );
+        write(
+            roots
+                .nvidia_driver_dir
+                .join("nvidia-application-profiles-580.1-rc"),
+            r#"{"rules":[{"pattern":"firefox","profile":["GLVRRAllowed",false]}]}"#,
+        );
+        process(&proc_root, 38, "/usr/lib/firefox", "/usr/lib/firefox", &[]);
+
+        assert_eq!(VrrExclusions::load(&roots).excluded(38, &proc_root), None);
+    }
+
+    #[test]
     // Mutation: let NVIDIA file entries override environment values.
     fn vrr_exclusions_environment_wins() {
         let tree = TempTree::new();
@@ -593,17 +659,11 @@ mod tests {
     }
 
     #[test]
-    // Mutation: always use argv[0]'s basename and ignore the executable symlink prefix rule.
+    // Mutation: split argv[0] on whitespace before applying the executable prefix rule.
     fn vrr_exclusions_process_name_like_mesa() {
         let tree = TempTree::new();
         let roots = roots(&tree);
         let proc_root = tree.path().join("proc");
-        write(
-            roots
-                .nvidia_driver_dir
-                .join("nvidia-application-profiles-580-rc"),
-            r#"{"rules":[{"pattern":"firefox","profile":["GLVRRAllowed",false]},{"pattern":"steam","profile":["GLVRRAllowed",false]},{"pattern":"unrelated","profile":["GLVRRAllowed",false]}]}"#,
-        );
         process(
             &proc_root,
             30,
@@ -626,6 +686,13 @@ mod tests {
             "/opt/x/firefox-wrapper",
             &[],
         );
+        process(&proc_root, 37, "/opt/My Game", "/opt/My Game --flag", &[]);
+        write(
+            roots
+                .nvidia_driver_dir
+                .join("nvidia-application-profiles-580-rc"),
+            r#"{"rules":[{"pattern":"firefox","profile":["GLVRRAllowed",false]},{"pattern":"steam","profile":["GLVRRAllowed",false]},{"pattern":"unrelated","profile":["GLVRRAllowed",false]},{"pattern":"My Game","profile":["GLVRRAllowed",false]}]}"#,
+        );
         let exclusions = VrrExclusions::load(&roots);
 
         assert_eq!(
@@ -642,6 +709,10 @@ mod tests {
         );
         assert_eq!(
             exclusions.excluded(36, &proc_root),
+            Some(VrrExclusionSource::NvidiaProfiles)
+        );
+        assert_eq!(
+            exclusions.excluded(37, &proc_root),
             Some(VrrExclusionSource::NvidiaProfiles)
         );
     }

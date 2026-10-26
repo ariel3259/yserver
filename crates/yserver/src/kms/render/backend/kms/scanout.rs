@@ -1123,6 +1123,16 @@ impl KmsBackend {
 
         let decision = match (self.pstate.vrr_exclusions.as_ref(), candidate.client_pid) {
             (Some(exclusions), Some(pid)) => exclusions.evaluate(pid, &self.pstate.vrr_proc_root),
+            (_, None) => {
+                log::debug!(
+                    "kms: vrr exclusion skipped client={} reason=no-pid",
+                    candidate.client_id
+                );
+                crate::vrr_exclusions::VrrExclusionDecision {
+                    process_name: None,
+                    source: None,
+                }
+            }
             _ => crate::vrr_exclusions::VrrExclusionDecision {
                 process_name: None,
                 source: None,
