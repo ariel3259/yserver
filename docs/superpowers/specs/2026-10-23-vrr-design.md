@@ -1,6 +1,6 @@
 # Variable refresh rate (VRR / adaptive sync) — design
 
-**Date:** 2026-10-23 · **Status:** revision 5 (2026-10-26, `--vrr all` is `--vrr` on every driver but `nvidia-drm`; follow-up PR to #294, rebased on revision 2.1); revision 4 (2026-10-25, the NVIDIA list applies only on `nvidia-drm`); revision 3 (2026-10-25, `--vrr all` honours the drivers' application lists); revision 2.1 (2026-10-26, maintainer review of PR #294: cursor hold scope, Xorg's `_VARIABLE_REFRESH` reading, standalone clear framebuffer); revision 2 (2026-10-25; `--vrr all` moved to a follow-up PR the same day, see Revision history), from the maintainer review of draft PR #294: trigger, default, clear priority, gamma/VRR
+**Date:** 2026-10-23 · **Status:** revision 5.1 (2026-10-26, Mesa is a requirement of `--vrr all` on NVIDIA; standard parsers only); revision 5 (2026-10-26, `--vrr all` is `--vrr` on every driver but `nvidia-drm`; follow-up PR to #294, rebased on revision 2.1); revision 4 (2026-10-25, the NVIDIA list applies only on `nvidia-drm`); revision 3 (2026-10-25, `--vrr all` honours the drivers' application lists); revision 2.1 (2026-10-26, maintainer review of PR #294: cursor hold scope, Xorg's `_VARIABLE_REFRESH` reading, standalone clear framebuffer); revision 2 (2026-10-25; `--vrr all` moved to a follow-up PR the same day, see Revision history), from the maintainer review of draft PR #294: trigger, default, clear priority, gamma/VRR
 attribution, animated cursors; see Revision history); revision 1 approved by the user (2026-10-23), reviewed once (sol);
 plan `docs/superpowers/plans/2026-10-24-vrr.md` · **Scope:** KMS backend,
 one output covered by a client window in direct scanout; cursor behaviour while VRR is active.
@@ -202,7 +202,14 @@ driver's list (Mesa deletes the property for an excluded application), and the p
   property, driconf forms yserver does not evaluate).
 - **Which lists apply on `nvidia-drm`.** Both: the NVIDIA list (profiles and `__GL_VRR_ALLOWED`) for NVIDIA clients,
   and the Mesa list for Mesa clients presenting there, since an excluded Mesa client sets no property and cannot be
-  told apart from an NVIDIA client otherwise.
+  told apart from an NVIDIA client otherwise. The Mesa list complements the NVIDIA one, which names no browser or
+  video player (revision 5.1, user decision).
+- **Mesa is a requirement of `--vrr all` on NVIDIA** (revision 5.1, user decision). The Mesa list is
+  `/usr/share/drirc.d/00-mesa-defaults.conf`, installed by Mesa (Arch and Alpine `mesa`, Debian and Ubuntu
+  `libgl1-mesa-dri`, Fedora `mesa-dri-drivers`, FreeBSD `mesa-dri`, Gentoo `media-libs/mesa`); yserver neither ships
+  nor copies it. `docs/setup.md` lists it under Requirements. When `--vrr all` runs on `nvidia-drm` and no
+  `/usr/share/drirc.d/*.conf` file exists, one startup warning names the missing file and the package; the NVIDIA
+  list still applies.
 - **The client's environment wins over the files.** From `/proc/<pid>/environ`: `__GL_VRR_ALLOWED` (NVIDIA) or `adaptive_sync` (Mesa's driconf override by environment) set to `0`/`false` excludes;
   set to `1`/`true` allows even a listed application, unless the other variable excludes. An unreadable environment
   counts as no override.
@@ -212,13 +219,16 @@ driver's list (Mesa deletes the property for an excluded application), and the p
   server's user). A profile excludes when it sets `GLVRRAllowed` to false (the key every 580+ profile file uses; the
   older `GLGSYNCAllowed` is not read); a rule maps a process name to a profile
   with `"feature": "procname"` or the string-pattern shorthand. Other rule features (`dso`, `findfile`, compound
-  patterns) are not evaluated. The format is JSON with `#` comment lines. A user profile that sets `GLVRRAllowed`
+  patterns) are not evaluated. The format is JSON with `#` comment lines; the comment lines are dropped and the rest is parsed with
+  `serde_json`. A user profile that sets `GLVRRAllowed`
   to true for a name lifts a lower file's exclusion. The exact precedence between rules inside one file follows the
   NVIDIA README chapter on application profiles (builder verifies).
 - **Mesa driconf.** Files, in the order Mesa reads them, later wins: `/usr/share/drirc.d/*.conf` (sorted), `/etc/drirc`,
   `$HOME/.drirc`. An `<application executable="…">` holding `<option name="adaptive_sync" value="false"/>` excludes
   that name; a later `true` for the same name lifts it. `executable_regexp`, `sha1` and device/driver scoping are not
-  evaluated (the installed `adaptive_sync` entries use none of them).
+  evaluated (the installed `adaptive_sync` entries use none of them). Parsed with `roxmltree`.
+- **Standard parsers only** (revision 5.1, user decision): JSON and XML go through maintained crates (`serde_json`,
+  `roxmltree`); yserver carries no parser of its own for either format.
 - **Union.** Where both lists apply, a process is excluded if either excludes it. Both describe the same thing
   (applications whose frame rate must not drive the panel), and the server cannot know which GL vendor a client uses.
 - **When it is read.** The files once, at startup, only in `--vrr all` mode. A missing file is an empty list; a file
@@ -341,6 +351,9 @@ Hardware (the user validates with a game and logs):
   gamma change can go out standalone and trigger a refresh. Gamma changes are rare; note, do not tune, unless trivial.
 
 ## Revision history
+
+- **Revision 5.1 (2026-10-26),** user decisions: Mesa becomes a documented requirement of `--vrr all` on NVIDIA, its
+  list complements the NVIDIA one, and the list files are read with standard crates only (`serde_json`, `roxmltree`).
 
 - **Revision 5 (2026-10-26),** user decision: on any driver other than `nvidia-drm`, `--vrr all` is `--vrr` (Mesa
   clients already apply Mesa's list); the lists are read only on `nvidia-drm`, both of them there.
