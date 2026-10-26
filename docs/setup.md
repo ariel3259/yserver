@@ -25,6 +25,11 @@ the example configs referenced below.
 - Linux with atomic KMS/DRM, FreeBSD, or OpenBSD.
 - Access to `/dev/dri/*` and `/dev/input/event*` — see
   [Device access](#device-access).
+- For `--vrr all` on NVIDIA, Mesa's
+  `/usr/share/drirc.d/00-mesa-defaults.conf` application list is required:
+  install `mesa` on Arch/Alpine, `libgl1-mesa-dri` on Debian/Ubuntu,
+  `mesa-dri-drivers` on Fedora, `mesa-dri` on FreeBSD, or `media-libs/mesa`
+  on Gentoo.
 
 ## Build from source
 

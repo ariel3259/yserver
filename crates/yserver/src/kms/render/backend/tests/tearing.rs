@@ -225,6 +225,7 @@ fn prepare_direct_present_for_ids_with_storage(
     let crtc_epoch = backend.present_crtc_clock_epoch(crtc_id);
     let candidate = PresentScanoutCandidate {
         client_id: 1,
+        client_pid: None,
         present_id,
         crtc_id,
         crtc_epoch,

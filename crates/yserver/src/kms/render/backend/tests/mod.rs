@@ -933,6 +933,7 @@ fn retain_direct_frame_from_source_test(
         target: crate::kms::render::backend::ScanoutM0Target::Unredirected,
         candidate: PresentScanoutCandidate {
             client_id: 1,
+            client_pid: None,
             present_id: 3,
             crtc_id: 0,
             crtc_epoch: 0,
@@ -1180,6 +1181,7 @@ pub(super) fn install_direct_frame_for_target_test(
     });
     let candidate = PresentScanoutCandidate {
         client_id: 1,
+        client_pid: None,
         present_id: 77,
         crtc_id: 0,
         crtc_epoch: 0,

@@ -19,6 +19,13 @@ use crate::kms::render::{
 };
 
 impl Platform for PlatformBackend {
+    fn client_disconnected(
+        state: &mut KmsBackendState,
+        client_id: yserver_protocol::x11::ClientId,
+    ) {
+        state.vrr_exclusion_cache.borrow_mut().remove(&client_id.0);
+    }
+
     type BackendState = KmsBackendState;
 
     #[inline]

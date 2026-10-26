@@ -628,6 +628,7 @@ impl<P: Platform> Backend for XBackend<P> {
 
     fn client_disconnected(&mut self, client_id: yserver_protocol::x11::ClientId) {
         self.scene.root_overlay_on_disconnect(client_id);
+        P::client_disconnected(&mut self.pstate, client_id);
     }
 
     fn reset_input_session(&mut self, old_state: &mut ServerState) {

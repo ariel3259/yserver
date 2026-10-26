@@ -21,6 +21,24 @@ use std::{
 };
 use yserver_core::{backend::Backend as _, server::ServerState};
 
+pub(in crate::kms::render::backend) fn resolve_vrr_startup(
+    requested: crate::launch::VrrMode,
+    driver_name: Option<&str>,
+    roots: &crate::vrr_exclusions::VrrListRoots,
+) -> (
+    crate::launch::VrrMode,
+    Option<crate::vrr_exclusions::VrrExclusions>,
+) {
+    match requested {
+        crate::launch::VrrMode::All if driver_name == Some("nvidia-drm") => (
+            crate::launch::VrrMode::All,
+            Some(crate::vrr_exclusions::VrrExclusions::load(roots)),
+        ),
+        crate::launch::VrrMode::All => (crate::launch::VrrMode::Property, None),
+        mode => (mode, None),
+    }
+}
+
 pub(in crate::kms::render::backend) trait VtResumeExecutor {
     fn acquire_master(&self, device: &crate::kms::render::platform::KmsDevice) -> io::Result<()>;
     fn release_master(&self, device: &crate::kms::render::platform::KmsDevice) -> io::Result<()>;
@@ -115,13 +133,6 @@ impl KmsBackend {
         layout: Option<String>,
         vrr_mode: crate::launch::VrrMode,
     ) -> io::Result<Self> {
-        log::info!(
-            "kms: vrr mode={}",
-            match vrr_mode {
-                crate::launch::VrrMode::Off => "off",
-                crate::launch::VrrMode::Property => "property",
-            }
-        );
         Self::open_with_commit(
             device_paths,
             console_guard,
@@ -143,6 +154,37 @@ impl KmsBackend {
         ) -> io::Result<()>,
     ) -> io::Result<Self> {
         let platform = PlatformBackend::open_with_commit(device_paths, commit)?;
+        let driver_name = platform.primary_device().and_then(|device| {
+            device
+                .device
+                .cursor_caps()
+                .and_then(crate::drm::CursorDeviceCaps::driver_name)
+        });
+        let requested_vrr_mode = vrr_mode;
+        let (vrr_mode, vrr_exclusions) = resolve_vrr_startup(
+            requested_vrr_mode,
+            driver_name,
+            &crate::vrr_exclusions::VrrListRoots::system(),
+        );
+        match (requested_vrr_mode, vrr_mode) {
+            (crate::launch::VrrMode::All, crate::launch::VrrMode::All) => {
+                log::info!("kms: vrr mode=all");
+            }
+            (crate::launch::VrrMode::All, crate::launch::VrrMode::Property) => {
+                log::info!(
+                    "kms: vrr all behaves as --vrr (driver={})",
+                    driver_name.unwrap_or("unknown")
+                );
+            }
+            (mode, _) => log::info!(
+                "kms: vrr mode={}",
+                match mode {
+                    crate::launch::VrrMode::Off => "off",
+                    crate::launch::VrrMode::Property => "property",
+                    crate::launch::VrrMode::All => "all",
+                }
+            ),
+        }
         let (fb_w, fb_h) = (platform.fb_w, platform.fb_h);
         let mut core = KmsCore::new(fb_w, fb_h, layout)?;
         // Warp the pointer to the centre of the primary output at startup
@@ -167,6 +209,9 @@ impl KmsBackend {
         let kms_outputs_active = !platform.outputs.is_empty();
         let pstate = KmsBackendState {
             vrr_mode,
+            vrr_exclusions,
+            vrr_exclusion_cache: RefCell::new(HashMap::new()),
+            vrr_proc_root: std::path::PathBuf::from("/proc"),
             scanout_m0: ScanoutM0Telemetry::default(),
             scanout_m1: ScanoutM1ProbeCache::new(),
             scanout_m2: ScanoutM2State::new(),

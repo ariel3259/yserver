@@ -28,6 +28,9 @@ pub mod version;
 #[cfg(kms)]
 mod vt;
 
+#[cfg(kms)]
+pub mod vrr_exclusions;
+
 // `crate::vk_count!` call sites outside the render crate resolve through this.
 pub use yserver_render::vk_count;
 

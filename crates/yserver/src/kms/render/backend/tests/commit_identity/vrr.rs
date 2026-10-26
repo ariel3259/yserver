@@ -20,6 +20,7 @@ use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
     io,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::{
         Arc, Mutex,
@@ -4902,5 +4903,453 @@ fn vrr_standalone_clear_einval_latches_without_empty_retry() {
         "no empty fallback or immediate retry follows standalone EINVAL"
     );
     finish_property_direct_scanout(&mut fixture, fd);
+    fixture.finish_after_normal_drain();
+}
+
+struct VrrTestTree(PathBuf);
+
+impl VrrTestTree {
+    fn new() -> Self {
+        let id = NEXT_VRR_TEST_ROOT.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("yserver-vrr-backend-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&path).expect("create VRR backend test root");
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for VrrTestTree {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+static NEXT_VRR_TEST_ROOT: AtomicU64 = AtomicU64::new(0);
+
+fn vrr_test_roots(tree: &VrrTestTree) -> crate::vrr_exclusions::VrrListRoots {
+    crate::vrr_exclusions::VrrListRoots {
+        nvidia_driver_dir: tree.path().join("usr/share/nvidia"),
+        nvidia_etc_dir: tree.path().join("etc/nvidia"),
+        mesa_system_dir: tree.path().join("usr/share/drirc.d"),
+        mesa_etc_file: tree.path().join("etc/drirc"),
+        home: tree.path().join("home/user"),
+    }
+}
+
+fn write_vrr_test_file(path: impl AsRef<Path>, contents: &str) {
+    let path = path.as_ref();
+    std::fs::create_dir_all(path.parent().expect("VRR fixture file has parent"))
+        .expect("create VRR fixture parent");
+    std::fs::write(path, contents).expect("write VRR fixture file");
+}
+
+fn write_fake_process(proc_root: &Path, pid: u32, name: &str) {
+    use std::os::unix::fs::symlink;
+
+    let process_dir = proc_root.join(pid.to_string());
+    let _ = std::fs::remove_dir_all(&process_dir);
+    std::fs::create_dir_all(&process_dir).expect("create fake process directory");
+    symlink(format!("/usr/bin/{name}"), process_dir.join("exe"))
+        .expect("create fake executable symlink");
+    std::fs::write(process_dir.join("cmdline"), format!("/usr/bin/{name}\0"))
+        .expect("write fake command line");
+    std::fs::write(process_dir.join("environ"), "\0").expect("write fake environment");
+}
+
+fn accepted_vrr_direct(
+    fixture: &mut super::recording_scene::RecordingSceneFixtureGuard,
+    direct: &super::recording_scene::DirectPresentSetup,
+) -> AtomicCommitRecord {
+    let fd = super::direct_unflip::fd(fixture);
+    super::direct_unflip::submit_direct(fixture, direct, fd)
+        .into_iter()
+        .find(|record| super::support::accepted_event_id(record).is_some())
+        .expect("Backend accepts the Present direct frame")
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: remove the non-NVIDIA fallback and always treat `All` as list mode.
+fn vrr_all_mode_is_property_mode_outside_nvidia() {
+    let tree = VrrTestTree::new();
+    let roots = vrr_test_roots(&tree);
+    let proc_root = tree.path().join("proc");
+
+    let Some((mut fixture, mut direct)) = direct_fixture(19_001, 0) else {
+        eprintln!(
+            "SKIP vrr_all_mode_is_property_mode_outside_nvidia: no Vulkan scene fixture available"
+        );
+        return;
+    };
+    fixture.events.backend.for_tests_configure_vrr_mode(
+        crate::launch::VrrMode::All,
+        "amdgpu",
+        roots.clone(),
+        proc_root.clone(),
+    );
+    direct.candidate.variable_refresh = false;
+    set_vrr_capable(&mut fixture);
+    let mut fixture = fixture.cleanup_guard();
+    let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    let without_property = accepted_vrr_direct(&mut fixture, &direct);
+    assert!(
+        !contains_vrr_property(&without_property, crtc, 1),
+        "outside NVIDIA, a direct window without _VARIABLE_REFRESH remains off"
+    );
+    assert!(
+        fixture.events.backend.pstate.vrr_exclusions.is_none(),
+        "non-NVIDIA startup does not load either exclusion list"
+    );
+    complete_direct_and_drain_present(
+        &mut fixture,
+        &without_property,
+        direct.candidate.present_id,
+        None,
+    );
+    let fd = super::direct_unflip::fd(&fixture);
+    finish_direct_scanout(&mut fixture, &direct, fd);
+    fixture.finish_after_normal_drain();
+
+    let Some((mut fixture, mut direct)) = direct_fixture(19_002, 0) else {
+        eprintln!(
+            "SKIP vrr_all_mode_is_property_mode_outside_nvidia: no Vulkan scene fixture available for property case"
+        );
+        return;
+    };
+    fixture.events.backend.for_tests_configure_vrr_mode(
+        crate::launch::VrrMode::All,
+        "amdgpu",
+        roots.clone(),
+        proc_root.clone(),
+    );
+    direct.candidate.variable_refresh = true;
+    set_vrr_capable(&mut fixture);
+    let mut fixture = fixture.cleanup_guard();
+    let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    let with_property = accepted_vrr_direct(&mut fixture, &direct);
+    assert!(
+        contains_vrr_property(&with_property, crtc, 1),
+        "outside NVIDIA, a direct window with _VARIABLE_REFRESH enables VRR"
+    );
+    complete_direct_and_drain_present(
+        &mut fixture,
+        &with_property,
+        direct.candidate.present_id,
+        None,
+    );
+    let fd = super::direct_unflip::fd(&fixture);
+    finish_direct_scanout(&mut fixture, &direct, fd);
+    fixture.finish_after_normal_drain();
+
+    let Some((mut fixture, mut direct)) = direct_fixture(19_003, 0) else {
+        eprintln!(
+            "SKIP vrr_all_mode_is_property_mode_outside_nvidia: no Vulkan scene fixture available for NVIDIA case"
+        );
+        return;
+    };
+    fixture.events.backend.for_tests_configure_vrr_mode(
+        crate::launch::VrrMode::All,
+        "nvidia-drm",
+        roots,
+        proc_root,
+    );
+    direct.candidate.variable_refresh = false;
+    set_vrr_capable(&mut fixture);
+    let mut fixture = fixture.cleanup_guard();
+    let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    let nvidia_without_property = accepted_vrr_direct(&mut fixture, &direct);
+    assert!(
+        contains_vrr_property(&nvidia_without_property, crtc, 1),
+        "NVIDIA All mode ignores _VARIABLE_REFRESH"
+    );
+    complete_direct_and_drain_present(
+        &mut fixture,
+        &nvidia_without_property,
+        direct.candidate.present_id,
+        None,
+    );
+    let fd = super::direct_unflip::fd(&fixture);
+    finish_direct_scanout(&mut fixture, &direct, fd);
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutations: omit the missing Mesa-list warning or startup exclusion counts while loading NVIDIA profiles.
+fn vrr_exclusions_without_mesa_files_warns() {
+    super::recording_scene::init_tearing_test_logger();
+    super::recording_scene::clear_vrr_test_logs();
+    let tree = VrrTestTree::new();
+    let roots = vrr_test_roots(&tree);
+    let proc_root = tree.path().join("proc");
+    write_vrr_test_file(
+        roots
+            .nvidia_driver_dir
+            .join("nvidia-application-profiles-580-rc"),
+        r#"{"rules":[{"pattern":"listed","profile":["GLVRRAllowed",false]}]}"#,
+    );
+    write_fake_process(&proc_root, 51, "listed");
+
+    let Some((mut fixture, mut direct)) = direct_fixture(19_005, 0) else {
+        eprintln!(
+            "SKIP vrr_exclusions_without_mesa_files_warns: no Vulkan scene fixture available"
+        );
+        return;
+    };
+    fixture.events.backend.for_tests_configure_vrr_mode(
+        crate::launch::VrrMode::All,
+        "nvidia-drm",
+        roots.clone(),
+        proc_root,
+    );
+    direct.candidate.client_pid = Some(51);
+    set_vrr_capable(&mut fixture);
+    let mut fixture = fixture.cleanup_guard();
+    let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    let record = accepted_vrr_direct(&mut fixture, &direct);
+    assert!(
+        !contains_vrr_property(&record, crtc, 1),
+        "the NVIDIA list continues to exclude its listed process without Mesa files"
+    );
+    complete_direct_and_drain_present(&mut fixture, &record, direct.candidate.present_id, None);
+    let logs = super::recording_scene::vrr_test_logs();
+    let warnings: Vec<_> = logs
+        .lines()
+        .filter(|line| line.contains("requires Mesa") && line.contains("00-mesa-defaults.conf"))
+        .collect();
+    assert_eq!(
+        warnings.len(),
+        1,
+        "one startup warning names the missing Mesa file"
+    );
+    assert!(
+        warnings[0].contains("mesa-dri-drivers"),
+        "the warning names the Fedora package for the missing Mesa file"
+    );
+    assert!(
+        logs.contains("kms: vrr exclusions nvidia=1 mesa=0"),
+        "startup reports the loaded NVIDIA and Mesa exclusion counts"
+    );
+    let fd = super::direct_unflip::fd(&fixture);
+    finish_direct_scanout(&mut fixture, &direct, fd);
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: skip the cached client exclusion lookup before building the direct request.
+fn vrr_all_mode_excluded_client_never_enables() {
+    let tree = VrrTestTree::new();
+    let roots = vrr_test_roots(&tree);
+    let proc_root = tree.path().join("proc");
+    write_vrr_test_file(
+        roots
+            .nvidia_driver_dir
+            .join("nvidia-application-profiles-580-rc"),
+        r#"{"rules":[{"pattern":"blocked","profile":["GLVRRAllowed",false]}]}"#,
+    );
+    write_fake_process(&proc_root, 61, "blocked");
+    write_fake_process(&proc_root, 62, "allowed");
+
+    let Some((mut fixture, mut direct)) = direct_fixture(19_010, 0) else {
+        eprintln!(
+            "SKIP vrr_all_mode_excluded_client_never_enables: no Vulkan scene fixture available"
+        );
+        return;
+    };
+    fixture.events.backend.for_tests_configure_vrr_mode(
+        crate::launch::VrrMode::All,
+        "nvidia-drm",
+        roots,
+        proc_root,
+    );
+    set_vrr_capable(&mut fixture);
+    let mut fixture = fixture.cleanup_guard();
+    let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    direct.candidate.client_pid = Some(61);
+    let excluded = accepted_vrr_direct(&mut fixture, &direct);
+    assert!(
+        !contains_vrr_property(&excluded, crtc, 1),
+        "a client whose process is in the NVIDIA list never enables VRR"
+    );
+    complete_direct_and_drain_present(&mut fixture, &excluded, direct.candidate.present_id, None);
+    let mut unlisted = direct;
+    unlisted.candidate.client_id = 2;
+    unlisted.candidate.client_pid = Some(62);
+    unlisted.event.client_id = yserver_protocol::x11::ClientId(2);
+    let fd = super::direct_unflip::fd(&fixture);
+    let previous_present_id = unlisted.candidate.present_id;
+    let allowed = submit_direct_successor(&mut fixture, &mut unlisted, fd);
+    assert!(
+        contains_vrr_property(&allowed, crtc, 1),
+        "an unlisted client's direct frame enables VRR"
+    );
+    complete_direct_and_drain_present(
+        &mut fixture,
+        &allowed,
+        unlisted.candidate.present_id,
+        Some(previous_present_id),
+    );
+    finish_direct_scanout(&mut fixture, &unlisted, fd);
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: treat a missing peer PID as an exclusion instead of the property-free All behavior.
+fn vrr_all_mode_client_without_pid_enables() {
+    let tree = VrrTestTree::new();
+    let Some((mut fixture, direct)) = direct_fixture(19_020, 0) else {
+        eprintln!(
+            "SKIP vrr_all_mode_client_without_pid_enables: no Vulkan scene fixture available"
+        );
+        return;
+    };
+    fixture.events.backend.for_tests_configure_vrr_mode(
+        crate::launch::VrrMode::All,
+        "nvidia-drm",
+        vrr_test_roots(&tree),
+        tree.path().join("proc"),
+    );
+    set_vrr_capable(&mut fixture);
+    let mut fixture = fixture.cleanup_guard();
+    let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    let record = accepted_vrr_direct(&mut fixture, &direct);
+    assert!(
+        contains_vrr_property(&record, crtc, 1),
+        "a connection without a peer PID is not excluded"
+    );
+    complete_direct_and_drain_present(&mut fixture, &record, direct.candidate.present_id, None);
+    let fd = super::direct_unflip::fd(&fixture);
+    finish_direct_scanout(&mut fixture, &direct, fd);
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: apply All-mode file exclusions while the requested mode is Property.
+fn vrr_property_mode_ignores_lists() {
+    let tree = VrrTestTree::new();
+    let roots = vrr_test_roots(&tree);
+    let proc_root = tree.path().join("proc");
+    write_vrr_test_file(
+        roots
+            .nvidia_driver_dir
+            .join("nvidia-application-profiles-580-rc"),
+        r#"{"rules":[{"pattern":"listed","profile":["GLVRRAllowed",false]}]}"#,
+    );
+    write_fake_process(&proc_root, 71, "listed");
+    let Some((mut fixture, mut direct)) = direct_fixture(19_030, 0) else {
+        eprintln!("SKIP vrr_property_mode_ignores_lists: no Vulkan scene fixture available");
+        return;
+    };
+    fixture.events.backend.for_tests_configure_vrr_mode(
+        crate::launch::VrrMode::Property,
+        "nvidia-drm",
+        roots,
+        proc_root,
+    );
+    direct.candidate.client_pid = Some(71);
+    direct.candidate.variable_refresh = true;
+    set_vrr_capable(&mut fixture);
+    let mut fixture = fixture.cleanup_guard();
+    let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    let record = accepted_vrr_direct(&mut fixture, &direct);
+    assert!(
+        contains_vrr_property(&record, crtc, 1),
+        "Property mode follows _VARIABLE_REFRESH despite a listed process name"
+    );
+    assert!(
+        fixture.events.backend.pstate.vrr_exclusions.is_none(),
+        "Property mode does not load NVIDIA or Mesa lists"
+    );
+    complete_direct_and_drain_present(&mut fixture, &record, direct.candidate.present_id, None);
+    let fd = super::direct_unflip::fd(&fixture);
+    finish_direct_scanout(&mut fixture, &direct, fd);
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: repeat the proc lookup for every Present or retain a cache entry after disconnect.
+// Mutation: log a cached exclusion again on the next Present.
+fn vrr_exclusion_computed_once_per_client() {
+    super::recording_scene::init_tearing_test_logger();
+    super::recording_scene::clear_vrr_test_logs();
+    let tree = VrrTestTree::new();
+    let roots = vrr_test_roots(&tree);
+    let proc_root = tree.path().join("proc");
+    write_vrr_test_file(
+        roots
+            .nvidia_driver_dir
+            .join("nvidia-application-profiles-580-rc"),
+        r#"{"rules":[{"pattern":"blocked","profile":["GLVRRAllowed",false]}]}"#,
+    );
+    write_fake_process(&proc_root, 81, "blocked");
+    let Some((mut fixture, mut direct)) = direct_fixture(19_040, 0) else {
+        eprintln!("SKIP vrr_exclusion_computed_once_per_client: no Vulkan scene fixture available");
+        return;
+    };
+    fixture.events.backend.for_tests_configure_vrr_mode(
+        crate::launch::VrrMode::All,
+        "nvidia-drm",
+        roots,
+        proc_root.clone(),
+    );
+    set_vrr_capable(&mut fixture);
+    let mut fixture = fixture.cleanup_guard();
+    let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    direct.candidate.client_pid = Some(81);
+    let first = accepted_vrr_direct(&mut fixture, &direct);
+    assert!(
+        !contains_vrr_property(&first, crtc, 1),
+        "the first excluded Present carries no VRR enable"
+    );
+    complete_direct_and_drain_present(&mut fixture, &first, direct.candidate.present_id, None);
+
+    write_fake_process(&proc_root, 81, "allowed");
+    let fd = super::direct_unflip::fd(&fixture);
+    let previous_present_id = direct.candidate.present_id;
+    let second = submit_direct_successor(&mut fixture, &mut direct, fd);
+    assert!(
+        !contains_vrr_property(&second, crtc, 1),
+        "the cached exclusion remains in force for the same connected client"
+    );
+    let exclusion_logs = super::recording_scene::vrr_test_logs()
+        .lines()
+        .filter(|line| line.starts_with("kms: vrr excluded client=1 pid=81"))
+        .count();
+    assert_eq!(
+        exclusion_logs, 1,
+        "a cached excluded client is logged only once across Presents"
+    );
+    complete_direct_and_drain_present(
+        &mut fixture,
+        &second,
+        direct.candidate.present_id,
+        Some(previous_present_id),
+    );
+
+    Backend::client_disconnected(
+        &mut fixture.events.backend,
+        yserver_protocol::x11::ClientId(1),
+    );
+    let previous_present_id = direct.candidate.present_id;
+    let third = submit_direct_successor(&mut fixture, &mut direct, fd);
+    assert!(
+        contains_vrr_property(&third, crtc, 1),
+        "disconnect clears the decision so a later connection with the same id is read again"
+    );
+    complete_direct_and_drain_present(
+        &mut fixture,
+        &third,
+        direct.candidate.present_id,
+        Some(previous_present_id),
+    );
+    finish_direct_scanout(&mut fixture, &direct, fd);
     fixture.finish_after_normal_drain();
 }

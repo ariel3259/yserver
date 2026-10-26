@@ -1098,11 +1098,54 @@ impl KmsBackend {
     }
 
     fn direct_frame_wants_vrr(&self, frame: &DirectPresentFrame) -> bool {
-        frame.target == ScanoutM0Target::Unredirected
-            && match self.pstate.vrr_mode {
-                crate::launch::VrrMode::Off => false,
-                crate::launch::VrrMode::Property => frame.candidate.variable_refresh,
-            }
+        if frame.target != ScanoutM0Target::Unredirected {
+            return false;
+        }
+        match self.pstate.vrr_mode {
+            crate::launch::VrrMode::Off => false,
+            crate::launch::VrrMode::Property => frame.candidate.variable_refresh,
+            crate::launch::VrrMode::All => !self.vrr_client_excluded(&frame.candidate),
+        }
+    }
+
+    fn vrr_client_excluded(
+        &self,
+        candidate: &yserver_core::backend::PresentScanoutCandidate,
+    ) -> bool {
+        if let Some(source) = self
+            .pstate
+            .vrr_exclusion_cache
+            .borrow()
+            .get(&candidate.client_id)
+        {
+            return source.is_some();
+        }
+
+        let decision = match (self.pstate.vrr_exclusions.as_ref(), candidate.client_pid) {
+            (Some(exclusions), Some(pid)) => exclusions.evaluate(pid, &self.pstate.vrr_proc_root),
+            _ => crate::vrr_exclusions::VrrExclusionDecision {
+                process_name: None,
+                source: None,
+            },
+        };
+        if let (Some(pid), Some(source)) = (candidate.client_pid, decision.source) {
+            let source_name = match source {
+                crate::vrr_exclusions::VrrExclusionSource::Environment => "environment",
+                crate::vrr_exclusions::VrrExclusionSource::NvidiaProfiles => "nvidia-profiles",
+                crate::vrr_exclusions::VrrExclusionSource::MesaDriconf => "mesa-driconf",
+            };
+            log::info!(
+                "kms: vrr excluded client={} pid={} process={} source={source_name}",
+                candidate.client_id,
+                pid,
+                decision.process_name.as_deref().unwrap_or("unknown")
+            );
+        }
+        self.pstate
+            .vrr_exclusion_cache
+            .borrow_mut()
+            .insert(candidate.client_id, decision.source);
+        decision.source.is_some()
     }
 
     pub(in crate::kms::render::backend) fn live_direct_vrr_wanted(&self) -> bool {

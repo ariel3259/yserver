@@ -114,6 +114,8 @@ pub enum PresentSourceWait {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct PresentScanoutCandidate {
     pub client_id: u32,
+    /// Local peer PID for the Presenting X client, when the platform exposes it.
+    pub client_pid: Option<u32>,
     pub present_id: u64,
     /// RANDR CRTC XID selected for this Present. `0` is the synthetic
     /// headless domain used when no output is enabled.
