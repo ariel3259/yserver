@@ -3750,51 +3750,129 @@ fn direct_owners_follow_output_count_on_topology_change() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: the RANDR topology stop-all path stops only the root slot.
+// Mutation: prevent Output owners from entering through Presents before topology teardown.
 fn randr_topology_teardown_stops_every_output_owner() {
-    let Some((backend, _state, _kms)) = simulated_kms_dual_head() else {
-        return;
-    };
-    let mut events = super::commit_identity::support::AtomicEventFixture::from_backend(backend);
-    events
-        .backend
-        .rebuild_randr_state(&mut events.state, None, true);
-    let cow_id = seed_window(&mut events.backend, 0x7a20, None, 0, 0);
+    use std::time::Duration;
+    use yserver_core::backend::Backend;
 
-    for (output_idx, target_xid, present_id) in [(0, 0x7a30, 701), (1, 0x7a40, 702)] {
-        let _ = install_direct_frame_for_target_test(&mut events.backend, target_xid, cow_id, true);
-        let mut frame = events
-            .backend
-            .pstate
-            .direct
-            .root_mut()
-            .current
-            .take()
-            .expect("seeded current direct frame");
-        frame.candidate.present_id = present_id;
-        frame.event.present_id = present_id;
-        frame.event.serial = u32::try_from(present_id).expect("test serial fits");
-        frame.completion_output_idx = output_idx;
-        let owner = &mut events.backend.pstate.direct.outputs[output_idx];
-        owner.completed.push(frame.event.clone());
-        owner.current = Some(frame);
-        owner.hold_direct = true;
-        owner.unflip_shadow_ready = true;
+    let mut fixture =
+        match super::commit_identity::recording_scene::RecordingSceneFixture::with_output_geometry(
+            (1600, 600),
+            &[(0, 0, 800, 600, 60), (800, 0, 800, 600, 60)],
+        ) {
+            Ok(Some(fixture)) => fixture,
+            Ok(None) => {
+                eprintln!(
+                    "SKIP randr_topology_teardown_stops_every_output_owner: Vulkan fixture unavailable"
+                );
+                return;
+            }
+            Err(error) => panic!("RANDR recording scene fixture construction failed: {error}"),
+        };
+    let snapshots = fixture
+        .events
+        .backend
+        .platform
+        .outputs
+        .iter()
+        .map(|output| relight_test_snapshot(&output.key, vec![output.output.picked.clone()]))
+        .collect();
+    fixture
+        .events
+        .backend
+        .for_tests_set_vt_resume_executor(std::rc::Rc::new(ScriptedConnectorProbe(
+            std::cell::RefCell::new(snapshots),
+        )));
+    let kms = std::rc::Rc::new(SimulatedKms::default());
+    for output in &fixture.events.backend.platform.outputs {
+        kms.bound.borrow_mut().insert(
+            raw_handle(output.output.connector),
+            raw_handle(output.output.crtc),
+        );
+        kms.active
+            .borrow_mut()
+            .insert(raw_handle(output.output.crtc));
     }
+    fixture
+        .events
+        .backend
+        .platform
+        .for_tests_set_output_power_executor(kms);
+    fixture
+        .events
+        .backend
+        .rebuild_randr_state(&mut fixture.events.state, None, true);
+    fixture
+        .events
+        .backend
+        .for_tests_set_scanout_m1_prober(super::present_scanout::record_scanout_m1_probe);
+
+    let probation = usize::from(crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION);
+    let mut direct_commits = Vec::new();
+    for (output_idx, present_id) in [(0, 701), (1, 702)] {
+        let mut direct = fixture.install_direct_output_present(output_idx, present_id, 0);
+        let selected_crtc = fixture.events.state.randr.outputs[output_idx].crtc_id;
+        direct.candidate.crtc_id = selected_crtc;
+        direct.candidate.crtc_epoch = fixture
+            .events
+            .backend
+            .present_crtc_clock_epoch(selected_crtc);
+        direct.event.crtc_id = selected_crtc;
+        direct.event.crtc_epoch = direct.candidate.crtc_epoch;
+        Backend::note_present_scanout_candidate(&mut fixture.events.backend, direct.candidate);
+        let output = &fixture.events.backend.platform.outputs[output_idx].output;
+        let crtc = output.crtc;
+        let fd = fixture.kms_fd(output_idx);
+        let start = fixture.events.recorders[&fd].records().len();
+        for attempt in 0..probation {
+            let entered = Backend::try_present_direct(
+                &mut fixture.events.backend,
+                direct.candidate,
+                direct.event.clone(),
+            )
+            .expect("Output Present through Backend before RANDR teardown");
+            assert_eq!(entered, attempt + 1 == probation);
+        }
+        let direct_record = fixture.events.recorders[&fd]
+            .records()
+            .into_iter()
+            .skip(start)
+            .find(|record| {
+                super::commit_identity::support::accepted_event_id(record).is_some()
+                    && record.events.len() == 1
+                    && record.events[0].crtc == crtc
+            })
+            .expect("Output Present produced a direct CRTC commit");
+        let commit_id = super::commit_identity::support::accepted_event_id(&direct_record)
+            .expect("accepted Output commit carries an event identity");
+        direct_commits.push((fd, crtc, commit_id));
+    }
+
     assert_eq!(
-        events.backend.pstate.direct.active_scopes(),
+        fixture.events.backend.pstate.direct.active_scopes(),
         [
             crate::kms::render::backend::DirectScope::Output(0),
             crate::kms::render::backend::DirectScope::Output(1),
         ]
     );
-    assert_eq!(events.backend.present_source_pins.len(), 4);
+    assert_eq!(fixture.events.backend.present_source_pins.len(), 4);
 
-    let (outputs, _) = events.backend.randr_outputs_and_modes();
+    for (index, &(fd, crtc, commit_id)) in direct_commits.iter().enumerate() {
+        fixture.events.queue_commit_completion(
+            fd,
+            crtc,
+            commit_id,
+            701 + u32::try_from(index).expect("output index fits"),
+            Duration::from_millis(1_600 + u64::try_from(index).expect("output index fits")),
+        );
+        Backend::on_page_flip_ready(&mut fixture.events.backend, &mut fixture.events.state, fd);
+    }
+
+    let (outputs, _) = fixture.events.backend.randr_outputs_and_modes();
     let removed = &outputs[1];
     assert!(
         Backend::apply_crtc_config(
-            &mut events.backend,
+            &mut fixture.events.backend,
             removed.output_id,
             &removed.name,
             None,
@@ -3804,24 +3882,33 @@ fn randr_topology_teardown_stops_every_output_owner() {
         .expect("RANDR disable simulated second output")
     );
 
-    assert!(events.backend.pstate.direct.active_scopes().is_empty());
-    assert_eq!(events.backend.platform.outputs.len(), 1);
-    assert_eq!(events.backend.pstate.direct.outputs.len(), 1);
-    assert!(events.backend.present_source_pins.is_empty());
-    let mut completed = Backend::drain_completed_present_events(&mut events.backend)
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .active_scopes()
+            .is_empty()
+    );
+    assert_eq!(fixture.events.backend.platform.outputs.len(), 1);
+    assert_eq!(fixture.events.backend.pstate.direct.outputs.len(), 1);
+    assert!(fixture.events.backend.present_source_pins.is_empty());
+    let mut completed = Backend::drain_completed_present_events(&mut fixture.events.backend)
         .into_iter()
         .map(|event| event.present_id)
         .collect::<Vec<_>>();
     completed.sort_unstable();
     assert_eq!(completed, [701, 702]);
-    assert!(Backend::drain_completed_present_events(&mut events.backend).is_empty());
-    let mut idled = Backend::drain_retired_present_idle_events(&mut events.backend)
+    assert!(Backend::drain_completed_present_events(&mut fixture.events.backend).is_empty());
+    let mut idled = Backend::drain_retired_present_idle_events(&mut fixture.events.backend)
         .into_iter()
         .map(|event| event.present_id)
         .collect::<Vec<_>>();
     idled.sort_unstable();
     assert_eq!(idled, [701, 702]);
-    assert!(Backend::drain_retired_present_idle_events(&mut events.backend).is_empty());
+    assert!(Backend::drain_retired_present_idle_events(&mut fixture.events.backend).is_empty());
+    fixture.finish_after_normal_drain();
 }
 
 #[test]
