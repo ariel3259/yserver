@@ -105,6 +105,46 @@ impl SceneCompositor {
             })
     }
 
+    /// Whether one output has its own retained or presentation damage to
+    /// compose. A direct owner can keep another output's damage pending while
+    /// the scheduler continues to visit this output.
+    pub fn output_wants_compose(&self, output_idx: usize, store: &DrawableStore) -> bool {
+        let Some(inner) = self.inner.as_ref() else {
+            return true;
+        };
+        let Some(output) = inner.outputs.get(output_idx) else {
+            return false;
+        };
+        if self.scene_structure_dirty {
+            return true;
+        }
+        let armed = store.armed_damaged_ids();
+        let all: Vec<&std::collections::HashSet<crate::kms::render::store::DrawableId>> = inner
+            .outputs
+            .iter()
+            .map(|state| &state.last_pieces)
+            .collect();
+        output.damage.owes_repaint()
+            || !output.scene_structure_damage.is_empty()
+            || !output.pending_repaint_after_failed_submit.is_empty()
+            || pending_presentation_for_output(&armed, &output.last_pieces, &all)
+    }
+
+    /// Earliest retry among outputs that a caller can currently compose.
+    pub fn earliest_retry_deadline_for_outputs(
+        &self,
+        skip_outputs: &[bool],
+    ) -> Option<std::time::Instant> {
+        self.inner
+            .as_ref()?
+            .outputs
+            .iter()
+            .enumerate()
+            .filter(|(output_idx, _)| !skip_outputs.get(*output_idx).copied().unwrap_or(true))
+            .filter_map(|(_, output)| output.next_submit_retry_at)
+            .min()
+    }
+
     /// Whether one output can accept a scene frame now.
     pub fn output_ready_for_submit(&self, output_idx: usize, sink: &dyn OutputSink) -> bool {
         let Some(output) = self
@@ -162,6 +202,7 @@ impl SceneCompositor {
         store: &mut DrawableStore,
         sink: &mut dyn OutputSink,
         telemetry: &mut Telemetry,
+        skip_outputs: &[bool],
         cow_host_xid: Option<u32>,
     ) -> Result<Vec<usize>, SceneError> {
         // Destructure so `inner` (mutable) and `root_overlay` (shared)
@@ -186,6 +227,11 @@ impl SceneCompositor {
             inner.outputs.len(),
             input.outputs.len(),
             "scene/platform output vectors must stay in lockstep",
+        );
+        debug_assert_eq!(
+            skip_outputs.len(),
+            inner.outputs.len(),
+            "scene output skip mask must stay in lockstep with outputs",
         );
         let mut composed = Vec::new();
         let mut clear_dirty = true;
@@ -236,6 +282,9 @@ impl SceneCompositor {
         for (output_idx, &pending_presentation) in
             pending_presentation_per_output.iter().enumerate()
         {
+            if skip_outputs[output_idx] {
+                continue;
+            }
             // The union of the OTHER outputs' retained pieces, read now rather
             // than before the loop so an output walked earlier in this same
             // iteration contributes its fresh set.
