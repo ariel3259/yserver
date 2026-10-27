@@ -4,8 +4,8 @@ use crate::{
         core::KmsCore,
         render::{
             backend::{
-                CrtcConfigProbeExecutor, KmsBackend, KmsBackendState, RandrIdAllocator,
-                ScanoutM0Telemetry, ScanoutM1ProbeCache, ScanoutM2State, Tearing,
+                CrtcConfigProbeExecutor, DirectOwners, KmsBackend, KmsBackendState,
+                RandrIdAllocator, ScanoutM0Telemetry, ScanoutM1ProbeCache, Tearing,
                 kms::export::probe_dmabuf_export_support,
             },
             engine::RenderEngine,
@@ -207,6 +207,8 @@ impl KmsBackend {
             crate::kms::render::probe_executor::ProcessProbeExecutor::new()?,
         ));
         let kms_outputs_active = !platform.outputs.is_empty();
+        let mut direct = DirectOwners::default();
+        direct.sync_output_count(platform.outputs.len());
         let pstate = KmsBackendState {
             vrr_mode,
             vrr_exclusions,
@@ -214,7 +216,7 @@ impl KmsBackend {
             vrr_proc_root: std::path::PathBuf::from("/proc"),
             scanout_m0: ScanoutM0Telemetry::default(),
             scanout_m1: ScanoutM1ProbeCache::new(),
-            scanout_m2: ScanoutM2State::new(),
+            direct,
             tearing: Tearing::new(),
             direct_frame_submitter: KmsBackend::submit_direct_frame_live,
             vt_resume_executor: std::rc::Rc::new(DrmVtResumeExecutor),
@@ -492,7 +494,7 @@ impl KmsBackend {
         if result.is_ok() {
             self.stop_direct_after_scanout_replaced("shutdown");
             self.pending_completed_events_on_shutdown
-                .append(&mut self.pstate.scanout_m2.completed);
+                .append(&mut self.pstate.direct.root_mut().completed);
             self.pstate.scanout_m1.clear("shutdown");
         }
         result
@@ -535,7 +537,7 @@ impl KmsBackend {
         state.dpms.power_level = 0;
         state.dpms.last_activity = std::time::Instant::now();
 
-        let direct_shadow_error = if self.pstate.scanout_m2.active() {
+        let direct_shadow_error = if self.pstate.direct.root().active() {
             self.materialize_direct_shadow_for_unflip().err()
         } else {
             None
@@ -585,7 +587,7 @@ impl KmsBackend {
         }
         self.platform
             .clear_atomic_cursor_state_after_old_events_discard();
-        if self.pstate.scanout_m2.active() {
+        if self.pstate.direct.root().active() {
             self.stop_direct_after_scanout_replaced("VT suspend");
         }
 
@@ -615,7 +617,7 @@ impl KmsBackend {
 
         // M1 framebuffers are diagnostic-only and never active, but their GEM
         // registrations belong to this DRM-master/topology epoch.
-        if !self.pstate.scanout_m2.active() {
+        if !self.pstate.direct.root().active() {
             self.pstate.scanout_m1.clear("VT suspend");
         }
 
@@ -701,7 +703,7 @@ impl KmsBackend {
         // A retained direct framebuffer must be released against the old
         // routes even when the connector set is unchanged. Any active removal
         // likewise requires all old CRTCs to be disabled before pools drop.
-        let topology_quiesced = self.pstate.scanout_m2.active() || active_removed;
+        let topology_quiesced = self.pstate.direct.root().active() || active_removed;
         if topology_quiesced
             && let Err(error) = self.quiesce_before_topology_mutation("VT resume topology apply")
         {
@@ -714,6 +716,9 @@ impl KmsBackend {
         let rescan = self
             .platform
             .apply_connector_snapshot(snapshot, &known_connected);
+        self.pstate
+            .direct
+            .sync_output_count(self.platform.outputs.len());
         let registry_delta =
             self.reconcile_connector_registry(&rescan.connected, &rescan.dropped_keys);
         let active_topology_changed = !rescan.dropped_old_indices.is_empty();
@@ -1092,7 +1097,7 @@ impl KmsBackend {
             //    its queued flip events consumed before scene acknowledgements
             //    or BO phases are reset. Otherwise a live front buffer can be
             //    reused, or a stale event can retire a fresh post-wake flip.
-            let direct_shadow_error = if self.pstate.scanout_m2.active() {
+            let direct_shadow_error = if self.pstate.direct.root().active() {
                 self.materialize_direct_shadow_for_unflip().err()
             } else {
                 None

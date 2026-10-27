@@ -1838,6 +1838,10 @@ fn headless_selected_renderer_is_the_only_provider() {
     let mut backend = KmsBackend::for_tests();
     backend.platform.devices.clear();
     backend.platform.outputs.clear();
+    backend
+        .pstate
+        .direct
+        .sync_output_count(backend.platform.outputs.len());
     backend.pstate.randr_id_alloc = RandrIdAllocator::default();
     let render_id = RenderDeviceId::DrmRender(test_device_key(128));
     backend.platform.render_devices = vec![test_render_device(render_id, None)];
@@ -1954,6 +1958,10 @@ fn unverified_selected_renderer_has_a_tagged_stable_provider() {
     let mut backend = KmsBackend::for_tests();
     backend.platform.devices.clear();
     backend.platform.outputs.clear();
+    backend
+        .pstate
+        .direct
+        .sync_output_count(backend.platform.outputs.len());
     backend.pstate.randr_id_alloc = RandrIdAllocator::default();
     let render_id = RenderDeviceId::UnverifiedFallback;
     backend.platform.render_devices = vec![test_render_device(render_id, None)];
@@ -1985,6 +1993,10 @@ fn no_kms_and_no_selected_renderer_has_no_providers() {
     let mut backend = KmsBackend::for_tests();
     backend.platform.devices.clear();
     backend.platform.outputs.clear();
+    backend
+        .pstate
+        .direct
+        .sync_output_count(backend.platform.outputs.len());
     backend.platform.render_devices.clear();
     backend.platform.selected_render_device = None;
     backend.pstate.randr_id_alloc = RandrIdAllocator::default();
@@ -2603,6 +2615,10 @@ fn lightweight_active_disconnect_retains_crtc_then_heavy_detach_publishes_off() 
     // registry's Off config prevents a stale platform row from reviving
     // it; clearing the row is the production apply's corresponding side.
     backend.platform.outputs.clear();
+    backend
+        .pstate
+        .direct
+        .sync_output_count(backend.platform.outputs.len());
     backend.rebuild_randr_state(&mut state, None, false);
     assert_eq!(state.randr.timestamp, 41);
     assert_eq!(state.randr.config_timestamp, light_config_timestamp);
@@ -2703,6 +2719,10 @@ fn light_mode_change_then_heavy_connected_route_retirement_is_not_a_second_confi
     );
 
     backend.platform.outputs.clear();
+    backend
+        .pstate
+        .direct
+        .sync_output_count(backend.platform.outputs.len());
     backend.rebuild_randr_state(&mut state, None, heavy_delta.config_changed);
     assert_eq!(
         (state.randr.timestamp, state.randr.config_timestamp),
@@ -3564,6 +3584,100 @@ fn simulated_kms_dual_head() -> Option<(KmsBackend, ServerState, std::rc::Rc<Sim
     let mut state = ServerState::new();
     backend.rebuild_randr_state(&mut state, None, true);
     Some((backend, state, kms))
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: omit sync_output_count after the RANDR topology shrinks.
+fn direct_owners_follow_output_count_on_topology_change() {
+    let Some((backend, _state, kms)) = simulated_kms_dual_head() else {
+        eprintln!(
+            "SKIP direct_owners_follow_output_count_on_topology_change: Vulkan fixture unavailable"
+        );
+        return;
+    };
+    let mut events = super::commit_identity::support::AtomicEventFixture::from_backend(backend);
+    events
+        .backend
+        .rebuild_randr_state(&mut events.state, None, true);
+    assert_eq!(events.backend.platform.outputs.len(), 2);
+    assert_eq!(events.backend.pstate.direct.outputs.len(), 2);
+
+    let target_xid = 0x7a10;
+    let fallback_id = seed_window(&mut events.backend, target_xid, None, 0, 0);
+    let (_source_id, _, source_pin, fallback_pin) =
+        install_direct_frame_for_target_test(&mut events.backend, target_xid, fallback_id, false);
+    events.backend.pstate.direct.root_mut().unflip_shadow_ready = true;
+    assert!(events.backend.pstate.direct.root().active());
+    assert_eq!(events.backend.present_source_pins.len(), 2);
+
+    let fd = *events
+        .event_sources
+        .keys()
+        .next()
+        .expect("dual-head fixture has a recording event source");
+    let crtc = events.backend.platform.outputs[0].output.crtc;
+    events.event_sources[&fd].queue_flip(crtc, 52);
+    Backend::on_page_flip_ready(&mut events.backend, &mut events.state, fd);
+    assert!(events.backend.pstate.direct.root().pending.is_none());
+    assert!(events.backend.pstate.direct.root().current.is_some());
+    assert_eq!(events.backend.pstate.direct.root().completed.len(), 1);
+
+    let (outputs, _) = events.backend.randr_outputs_and_modes();
+    let removed = &outputs[1];
+    let first_connector = events.backend.platform.outputs[0]
+        .output
+        .connector_name
+        .clone();
+    let removed_connector = events.backend.platform.outputs[1]
+        .output
+        .connector_name
+        .clone();
+    assert!(
+        Backend::apply_crtc_config(
+            &mut events.backend,
+            removed.output_id,
+            &removed.name,
+            None,
+            0,
+            0,
+        )
+        .expect("RANDR disable simulated second output"),
+        "the second output must be removed"
+    );
+
+    assert_eq!(events.backend.platform.outputs.len(), 1);
+    assert_eq!(events.backend.pstate.direct.outputs.len(), 1);
+    assert!(!events.backend.pstate.direct.root().active());
+    assert!(events.backend.pstate.direct.root().current.is_none());
+    assert!(!events.backend.present_source_pins.contains_key(&source_pin));
+    assert!(
+        !events
+            .backend
+            .present_source_pins
+            .contains_key(&fallback_pin)
+    );
+    assert!(events.backend.present_source_pins.is_empty());
+    assert_eq!(
+        events.backend.pstate.direct.root().completed.len(),
+        1,
+        "topology teardown queues one completion for the root owner"
+    );
+
+    let completed = Backend::drain_completed_present_events(&mut events.backend);
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].present_id, 77);
+    assert!(Backend::drain_completed_present_events(&mut events.backend).is_empty());
+    assert_eq!(
+        *kms.log.borrow(),
+        vec![
+            format!("off {first_connector}"),
+            format!("off {removed_connector}"),
+            format!("on {first_connector}"),
+        ],
+        "RANDR tears down both old CRTCs before relighting the survivor"
+    );
+    assert!(kms.is_consistent());
 }
 
 #[test]

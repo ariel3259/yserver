@@ -843,6 +843,7 @@ fn xi_dynamic_reset_retires_kms_input_and_replays_inventory_on_the_runner_bounda
 fn make_vt_fixture_headless(b: &mut KmsBackend) {
     b.platform.devices.clear();
     b.platform.outputs.clear();
+    b.pstate.direct.sync_output_count(b.platform.outputs.len());
     b.platform.scanout_pools.clear();
     b.platform.bo_generations.clear();
     b.platform.first_pageflip_logged.clear();

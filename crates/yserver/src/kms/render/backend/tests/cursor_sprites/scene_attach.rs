@@ -1929,7 +1929,7 @@ fn held_direct_with_cursor(
             panic!("{gate_values}");
         }
     };
-    assert!(fixture.scene.events.backend.pstate.scanout_m2.active());
+    assert!(fixture.scene.events.backend.pstate.direct.root().active());
     let applied = applied_cursor_binding(&fixture.scene.events.backend, hardware.output_idx)
         .expect("A is shown on the held-direct path");
     assert_eq!(applied, binding_before_direct);
@@ -2039,13 +2039,14 @@ fn direct_deferred_cursor_show_keeps_direct_and_retries_on_event() {
         220,
         170,
     );
-    let stayed_direct = fixture.scene.events.backend.pstate.scanout_m2.active()
+    let stayed_direct = fixture.scene.events.backend.pstate.direct.root().active()
         && !fixture
             .scene
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_requested;
 
     let retry_start = record_count(&fixture, hardware.device_fd);
@@ -2068,7 +2069,7 @@ fn direct_deferred_cursor_show_keeps_direct_and_retries_on_event() {
     if let Some(refreshed) = refreshed.as_ref() {
         retire_cursor_record(&mut fixture, &mut delivered, 0, refreshed, 12);
     }
-    if fixture.scene.events.backend.pstate.scanout_m2.active() {
+    if fixture.scene.events.backend.pstate.direct.root().active() {
         fixture
             .scene
             .events
@@ -2114,13 +2115,14 @@ fn direct_cursor_generic_error_keeps_direct_scanout() {
         (1, 2),
     );
     define_root_cursor(&mut fixture.scene.events.backend, cursor_b);
-    let still_direct = fixture.scene.events.backend.pstate.scanout_m2.active()
+    let still_direct = fixture.scene.events.backend.pstate.direct.root().active()
         && !fixture
             .scene
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_requested
         && recorder
             .records()
@@ -2146,7 +2148,8 @@ fn direct_cursor_generic_error_keeps_direct_scanout() {
         .events
         .backend
         .pstate
-        .scanout_m2
+        .direct
+        .root()
         .direct_cursor_refresh_pending
         .contains(&0);
     let old_lease_retained =
@@ -2197,16 +2200,18 @@ fn direct_cursor_generic_error_keeps_direct_scanout() {
         .events
         .backend
         .pstate
-        .scanout_m2
+        .direct
+        .root()
         .direct_cursor_refresh_pending
         .is_empty();
-    let still_direct = fixture.scene.events.backend.pstate.scanout_m2.active()
+    let still_direct = fixture.scene.events.backend.pstate.direct.root().active()
         && !fixture
             .scene
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_requested;
     finish_direct_fixture(fixture, &mut delivered);
     assert!(
@@ -2260,7 +2265,8 @@ fn direct_pending_refresh_cleared_on_unflip_or_output_removal() {
                 .events
                 .backend
                 .pstate
-                .scanout_m2
+                .direct
+                .root()
                 .direct_cursor_refresh_pending
                 .contains(&0)
         );
@@ -2287,7 +2293,8 @@ fn direct_pending_refresh_cleared_on_unflip_or_output_removal() {
                 .events
                 .backend
                 .pstate
-                .scanout_m2
+                .direct
+                .root()
                 .unflip_requested
         );
         retire_cursor_record(&mut fixture, &mut delivered, 0, &replacement, 30);
@@ -2297,7 +2304,8 @@ fn direct_pending_refresh_cleared_on_unflip_or_output_removal() {
                 .events
                 .backend
                 .pstate
-                .scanout_m2
+                .direct
+                .root()
                 .unflip_requested
         );
         assert!(
@@ -2306,7 +2314,8 @@ fn direct_pending_refresh_cleared_on_unflip_or_output_removal() {
                 .events
                 .backend
                 .pstate
-                .scanout_m2
+                .direct
+                .root()
                 .direct_cursor_refresh_pending
                 .contains(&0)
         );
@@ -2322,14 +2331,15 @@ fn direct_pending_refresh_cleared_on_unflip_or_output_removal() {
             "the Backend path accepts the composed unflip"
         );
         retire_pending_output(&mut fixture.scene.events, &mut delivered, 0, 31);
-        assert!(!fixture.scene.events.backend.pstate.scanout_m2.active());
+        assert!(!fixture.scene.events.backend.pstate.direct.root().active());
         assert!(
             fixture
                 .scene
                 .events
                 .backend
                 .pstate
-                .scanout_m2
+                .direct
+                .root()
                 .direct_cursor_refresh_pending
                 .is_empty(),
             "retiring the Backend unflip clears pending cursor retries"
@@ -2382,7 +2392,8 @@ fn direct_pending_refresh_cleared_on_unflip_or_output_removal() {
                 .events
                 .backend
                 .pstate
-                .scanout_m2
+                .direct
+                .root()
                 .direct_cursor_refresh_pending
                 .contains(&0)
         );
@@ -2427,14 +2438,15 @@ fn direct_pending_refresh_cleared_on_unflip_or_output_removal() {
         );
 
         assert!(fixture.scene.events.backend.platform.outputs.is_empty());
-        assert!(!fixture.scene.events.backend.pstate.scanout_m2.active());
+        assert!(!fixture.scene.events.backend.pstate.direct.root().active());
         assert!(
             fixture
                 .scene
                 .events
                 .backend
                 .pstate
-                .scanout_m2
+                .direct
+                .root()
                 .direct_cursor_refresh_pending
                 .is_empty(),
             "the Backend hotplug removal clears pending cursor retries before output compaction"
@@ -2524,7 +2536,8 @@ fn p2_direct_refresh_reaches_pool_pressure_and_keeps_only_the_newest_wanted_imag
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_requested
     );
     assert!(
@@ -2533,7 +2546,8 @@ fn p2_direct_refresh_reaches_pool_pressure_and_keeps_only_the_newest_wanted_imag
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .direct_cursor_refresh_pending
             .contains(&0)
     );
@@ -2580,7 +2594,7 @@ fn p2_direct_refresh_reaches_pool_pressure_and_keeps_only_the_newest_wanted_imag
             2
         ))
     );
-    assert!(fixture.scene.events.backend.pstate.scanout_m2.active());
+    assert!(fixture.scene.events.backend.pstate.direct.root().active());
     assert!(
         fixture
             .scene
@@ -2627,14 +2641,15 @@ fn p2_direct_refresh_reaches_pool_pressure_and_keeps_only_the_newest_wanted_imag
             .version(),
         fixture.scene.events.backend.cursor_records[&cursor_d_id].version
     );
-    assert!(fixture.scene.events.backend.pstate.scanout_m2.active());
+    assert!(fixture.scene.events.backend.pstate.direct.root().active());
     assert!(
         !fixture
             .scene
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_requested
     );
     assert!(
@@ -2643,7 +2658,8 @@ fn p2_direct_refresh_reaches_pool_pressure_and_keeps_only_the_newest_wanted_imag
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .direct_cursor_refresh_pending
             .is_empty()
     );
@@ -2696,7 +2712,8 @@ fn p2_direct_hook_keeps_scanout_until_deferred_refresh_retries() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_requested
     );
     assert!(
@@ -2705,7 +2722,8 @@ fn p2_direct_hook_keeps_scanout_until_deferred_refresh_retries() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .direct_cursor_refresh_pending
             .contains(&0)
     );
@@ -2751,14 +2769,15 @@ fn p2_direct_hook_keeps_scanout_until_deferred_refresh_retries() {
             .version(),
         fixture.scene.events.backend.cursor_records[&cursor_c_id].version
     );
-    assert!(fixture.scene.events.backend.pstate.scanout_m2.active());
+    assert!(fixture.scene.events.backend.pstate.direct.root().active());
     assert!(
         !fixture
             .scene
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_requested
     );
     retire_cursor_record(&mut fixture, &mut delivered, 0, &refreshed, 10);
@@ -2796,7 +2815,7 @@ fn held_direct_with_two_outputs(
     for output_idx in 0..2 {
         drain_unretired_output_events(&mut fixture, &mut delivered, output_idx);
     }
-    assert!(fixture.scene.events.backend.pstate.scanout_m2.active());
+    assert!(fixture.scene.events.backend.pstate.direct.root().active());
     assert!(
         (0..2).all(|output_idx| fixture
             .scene
@@ -2832,7 +2851,7 @@ fn finish_direct_fixture(
         .events
         .backend
         .for_tests_set_monotonic_clock(Rc::new(Instant::now));
-    if fixture.scene.events.backend.pstate.scanout_m2.active() {
+    if fixture.scene.events.backend.pstate.direct.root().active() {
         fixture
             .scene
             .events
@@ -2930,7 +2949,8 @@ fn direct_cursor_retry_on_crtc_event_touches_only_its_pending_output() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .direct_cursor_refresh_pending,
         HashSet::from([0]),
         "only output 0's in-flight position defers its cursor show"
@@ -2955,7 +2975,8 @@ fn direct_cursor_retry_on_crtc_event_touches_only_its_pending_output() {
         .events
         .backend
         .pstate
-        .scanout_m2
+        .direct
+        .root()
         .direct_cursor_refresh_pending
         .contains(&0);
 
@@ -2975,7 +2996,8 @@ fn direct_cursor_retry_on_crtc_event_touches_only_its_pending_output() {
         .events
         .backend
         .pstate
-        .scanout_m2
+        .direct
+        .root()
         .direct_cursor_refresh_pending
         .is_empty();
     let retry = accepted_live_records(&fixture.scene.events.recorders[&device_fd])
@@ -2988,13 +3010,14 @@ fn direct_cursor_retry_on_crtc_event_touches_only_its_pending_output() {
                     event.crtc == fixture.scene.events.backend.platform.outputs[0].output.crtc
                 })
         });
-    let remained_direct = fixture.scene.events.backend.pstate.scanout_m2.active()
+    let remained_direct = fixture.scene.events.backend.pstate.direct.root().active()
         && !fixture
             .scene
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_requested;
     finish_direct_fixture(fixture, &mut delivered);
     assert!(
@@ -3072,7 +3095,8 @@ fn direct_cursor_retries_do_not_delay_direct_successors() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .direct_cursor_refresh_pending,
         HashSet::from([0, 1]),
         "both in-flight positions defer their replacement shows"
@@ -3097,7 +3121,8 @@ fn direct_cursor_retries_do_not_delay_direct_successors() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .queued_successor
             .is_some()
     );
@@ -3184,7 +3209,8 @@ fn direct_cursor_retries_do_not_delay_direct_successors() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .direct_cursor_refresh_pending
             .contains(&1)
     );
@@ -3211,7 +3237,8 @@ fn direct_cursor_retries_do_not_delay_direct_successors() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .direct_cursor_refresh_pending
             .is_empty()
     );
@@ -3241,13 +3268,14 @@ fn direct_cursor_retries_do_not_delay_direct_successors() {
             54 + output_idx as u32,
         );
     }
-    let still_direct = fixture.scene.events.backend.pstate.scanout_m2.active()
+    let still_direct = fixture.scene.events.backend.pstate.direct.root().active()
         && !fixture
             .scene
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_requested;
     finish_direct_fixture(fixture, &mut delivered);
     assert!(
@@ -3327,7 +3355,8 @@ fn direct_cursor_retry_lands_under_continuous_successor_stream() {
                 .events
                 .backend
                 .pstate
-                .scanout_m2
+                .direct
+                .root()
                 .direct_cursor_refresh_pending
                 .contains(&0)
         );
@@ -3337,7 +3366,8 @@ fn direct_cursor_retry_lands_under_continuous_successor_stream() {
                 .events
                 .backend
                 .pstate
-                .scanout_m2
+                .direct
+                .root()
                 .unflip_requested
         );
 
@@ -3358,7 +3388,8 @@ fn direct_cursor_retry_lands_under_continuous_successor_stream() {
                     .events
                     .backend
                     .pstate
-                    .scanout_m2
+                    .direct
+                    .root()
                     .queued_successor
                     .is_some()
             );
@@ -3378,7 +3409,8 @@ fn direct_cursor_retry_lands_under_continuous_successor_stream() {
                 .events
                 .backend
                 .pstate
-                .scanout_m2
+                .direct
+                .root()
                 .queued_successor
                 .is_none()
             {
@@ -3391,7 +3423,8 @@ fn direct_cursor_retry_lands_under_continuous_successor_stream() {
                     .events
                     .backend
                     .pstate
-                    .scanout_m2
+                    .direct
+                    .root()
                     .queued_successor
                     .is_some()
             );
@@ -3408,7 +3441,8 @@ fn direct_cursor_retry_lands_under_continuous_successor_stream() {
                         .events
                         .backend
                         .pstate
-                        .scanout_m2
+                        .direct
+                        .root()
                         .queued_successor
                         .is_some(),
                 "event {event_idx} advances a successor or the bounded cursor retry"
@@ -3425,7 +3459,8 @@ fn direct_cursor_retry_lands_under_continuous_successor_stream() {
                         .events
                         .backend
                         .pstate
-                        .scanout_m2
+                        .direct
+                        .root()
                         .direct_cursor_refresh_pending
                         .contains(&0)
                 );
@@ -3442,7 +3477,8 @@ fn direct_cursor_retry_lands_under_continuous_successor_stream() {
                         .events
                         .backend
                         .pstate
-                        .scanout_m2
+                        .direct
+                        .root()
                         .direct_cursor_refresh_pending
                         .is_empty()
                 );
@@ -3462,14 +3498,15 @@ fn direct_cursor_retry_lands_under_continuous_successor_stream() {
                 assert!(new_direct > 0, "successors continue after the cursor retry");
             }
         }
-        assert!(fixture.scene.events.backend.pstate.scanout_m2.active());
+        assert!(fixture.scene.events.backend.pstate.direct.root().active());
         assert!(
             !fixture
                 .scene
                 .events
                 .backend
                 .pstate
-                .scanout_m2
+                .direct
+                .root()
                 .unflip_requested
         );
 
@@ -3501,7 +3538,8 @@ fn direct_cursor_retry_lands_under_continuous_successor_stream() {
                 .events
                 .backend
                 .pstate
-                .scanout_m2
+                .direct
+                .root()
                 .direct_cursor_refresh_pending
                 .is_empty()
         );
@@ -3511,7 +3549,8 @@ fn direct_cursor_retry_lands_under_continuous_successor_stream() {
                 .events
                 .backend
                 .pstate
-                .scanout_m2
+                .direct
+                .root()
                 .direct_cursor_refresh_successor_deferrals
                 .is_empty()
         );
@@ -3570,20 +3609,22 @@ fn direct_deferred_cursor_hide_keeps_direct_and_retries_on_event() {
         count_cursor_commits_for_output(&fixture, 1),
     ];
     Backend::set_cursor_hidden(&mut fixture.scene.events.backend, true);
-    let deferred_hide_kept_direct = fixture.scene.events.backend.pstate.scanout_m2.active()
+    let deferred_hide_kept_direct = fixture.scene.events.backend.pstate.direct.root().active()
         && !fixture
             .scene
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_requested;
     let pending_after_hide = fixture
         .scene
         .events
         .backend
         .pstate
-        .scanout_m2
+        .direct
+        .root()
         .direct_cursor_refresh_pending
         .clone();
     let hide_deferred_without_second_commit = [
@@ -3614,7 +3655,8 @@ fn direct_deferred_cursor_hide_keeps_direct_and_retries_on_event() {
         .events
         .backend
         .pstate
-        .scanout_m2
+        .direct
+        .root()
         .direct_cursor_refresh_pending
         .clone();
     let visibility_after_output0_event = [
@@ -3659,7 +3701,8 @@ fn direct_deferred_cursor_hide_keeps_direct_and_retries_on_event() {
         .events
         .backend
         .pstate
-        .scanout_m2
+        .direct
+        .root()
         .direct_cursor_refresh_pending
         .clone();
     let hidden_after_both_events = (0..2).all(|output_idx| {
@@ -3679,13 +3722,14 @@ fn direct_deferred_cursor_hide_keeps_direct_and_retries_on_event() {
     let hide_retries_are_scoped = counts_after_output1_event[0] - counts_after_output0_event[0]
         == 0
         && counts_after_output1_event[1] - counts_after_output0_event[1] == 1;
-    let still_direct = fixture.scene.events.backend.pstate.scanout_m2.active()
+    let still_direct = fixture.scene.events.backend.pstate.direct.root().active()
         && !fixture
             .scene
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_requested;
     finish_direct_fixture(fixture, &mut delivered);
     assert!(
@@ -3768,7 +3812,8 @@ fn direct_deferred_hide_then_show_applies_newest_intent() {
         .events
         .backend
         .pstate
-        .scanout_m2
+        .direct
+        .root()
         .direct_cursor_refresh_pending
         == HashSet::from([0, 1]);
     Backend::set_cursor_hidden(&mut fixture.scene.events.backend, false);
@@ -3778,7 +3823,8 @@ fn direct_deferred_hide_then_show_applies_newest_intent() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_requested;
 
     let before_retry = [
@@ -3796,7 +3842,8 @@ fn direct_deferred_hide_then_show_applies_newest_intent() {
         .events
         .backend
         .pstate
-        .scanout_m2
+        .direct
+        .root()
         .direct_cursor_refresh_pending
         .clone();
     retire_cursor_record(&mut fixture, &mut delivered, 1, &positions[1], 63);
@@ -3809,7 +3856,8 @@ fn direct_deferred_hide_then_show_applies_newest_intent() {
         .events
         .backend
         .pstate
-        .scanout_m2
+        .direct
+        .root()
         .direct_cursor_refresh_pending
         .clone();
     let cursor_remained_visible = (0..2).all(|output_idx| {
@@ -3837,13 +3885,14 @@ fn direct_deferred_hide_then_show_applies_newest_intent() {
         .backend
         .platform
         .any_cursor_commit_in_flight();
-    let still_direct = fixture.scene.events.backend.pstate.scanout_m2.active()
+    let still_direct = fixture.scene.events.backend.pstate.direct.root().active()
         && !fixture
             .scene
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_requested;
     finish_direct_fixture(fixture, &mut delivered);
     assert!(hide_deferred_on_both);
@@ -3904,20 +3953,22 @@ fn direct_cursor_hide_generic_error_keeps_direct_scanout() {
                 } if errno == libc::EIO
             )
     });
-    let still_direct = fixture.scene.events.backend.pstate.scanout_m2.active()
+    let still_direct = fixture.scene.events.backend.pstate.direct.root().active()
         && !fixture
             .scene
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_requested;
     let retry_pending = fixture
         .scene
         .events
         .backend
         .pstate
-        .scanout_m2
+        .direct
+        .root()
         .direct_cursor_refresh_pending
         .contains(&0);
     let output1_hide_succeeded = recorder.records().into_iter().skip(start).any(|record| {
@@ -3986,7 +4037,8 @@ fn direct_cursor_hide_generic_error_keeps_direct_scanout() {
         .events
         .backend
         .pstate
-        .scanout_m2
+        .direct
+        .root()
         .direct_cursor_refresh_pending
         .is_empty();
     let output0_is_hidden = !fixture
@@ -4005,13 +4057,14 @@ fn direct_cursor_hide_generic_error_keeps_direct_scanout() {
         "the initial generic hide error keeps direct scanout"
     );
     assert!(retry_pending, "the initial direct hide remains pending");
-    let still_direct = fixture.scene.events.backend.pstate.scanout_m2.active()
+    let still_direct = fixture.scene.events.backend.pstate.direct.root().active()
         && !fixture
             .scene
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_requested;
     let output0_attempts_after_retry = cursor_hide_attempts_for_output(&fixture, 0);
     finish_direct_fixture(fixture, &mut delivered);
@@ -4097,7 +4150,8 @@ fn direct_cursor_hide_persistent_error_unflips_after_recovery_bound() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_requested,
         "the first failure keeps direct scanout active",
     );
@@ -4128,7 +4182,8 @@ fn direct_cursor_hide_persistent_error_unflips_after_recovery_bound() {
                     .events
                     .backend
                     .pstate
-                    .scanout_m2
+                    .direct
+                    .root()
                     .unflip_requested,
                 "direct scanout remains active before the bound",
             );
@@ -4140,7 +4195,8 @@ fn direct_cursor_hide_persistent_error_unflips_after_recovery_bound() {
         .events
         .backend
         .pstate
-        .scanout_m2
+        .direct
+        .root()
         .unflip_requested;
     let failed_attempts = cursor_hide_attempts_for_output(&fixture, 0);
     for _ in 0..3 {
@@ -4167,7 +4223,7 @@ fn direct_cursor_hide_persistent_error_unflips_after_recovery_bound() {
         );
     }
     assert!(
-        !fixture.scene.events.backend.pstate.scanout_m2.active(),
+        !fixture.scene.events.backend.pstate.direct.root().active(),
         "retiring the composed unflip releases direct scanout",
     );
     finish_direct_fixture(fixture, &mut delivered);

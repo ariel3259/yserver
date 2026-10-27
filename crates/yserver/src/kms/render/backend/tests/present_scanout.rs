@@ -361,10 +361,12 @@ fn present_clock_epoch_changes_on_route_removal_and_readd() {
     assert_eq!(b.present_crtc_clock_epoch(crtc_id), first);
 
     let output = b.platform.outputs.pop().expect("fixture output");
+    b.pstate.direct.sync_output_count(b.platform.outputs.len());
     b.refresh_present_crtc_clock_epochs();
     assert_eq!(b.present_crtc_clock_epoch(crtc_id), 0);
 
     b.platform.outputs.push(output);
+    b.pstate.direct.sync_output_count(b.platform.outputs.len());
     b.refresh_present_crtc_clock_epochs();
     let second = b.present_crtc_clock_epoch(crtc_id);
     assert_ne!(second, 0);
@@ -761,9 +763,9 @@ fn destroy_subwindow_without_direct_frame_does_not_request_unflip() {
     b.destroy_subwindow(None, target_xid)
         .expect("destroy inactive target");
 
-    assert!(!b.pstate.scanout_m2.active());
-    assert!(!b.pstate.scanout_m2.unflip_requested);
-    assert!(!b.pstate.scanout_m2.hold_direct);
+    assert!(!b.pstate.direct.root().active());
+    assert!(!b.pstate.direct.root().unflip_requested);
+    assert!(!b.pstate.direct.root().hold_direct);
     assert!(!b.windows.contains_key(&target_xid));
     assert!(b.store.get(target_id).is_none());
 }
@@ -785,8 +787,8 @@ fn destroy_unrelated_subwindow_keeps_direct_scanout_active() {
 
     assert!(!b.windows.contains_key(&unrelated_xid));
     assert!(b.store.get(unrelated_id).is_none());
-    assert!(!b.pstate.scanout_m2.unflip_requested);
-    assert!(b.pstate.scanout_m2.hold_direct);
+    assert!(!b.pstate.direct.root().unflip_requested);
+    assert!(b.pstate.direct.root().hold_direct);
     assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
     assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
 }
@@ -804,12 +806,12 @@ fn destroy_subwindow_requests_pending_direct_unflip_without_releasing_pins() {
     b.destroy_subwindow(None, target_xid)
         .expect("destroy pending direct target");
 
-    assert!(b.pstate.scanout_m2.unflip_requested);
-    assert!(!b.pstate.scanout_m2.hold_direct);
-    assert!(b.pstate.scanout_m2.pending.is_some());
-    assert!(b.pstate.scanout_m2.current.is_none());
-    assert!(b.pstate.scanout_m2.completed.is_empty());
-    assert!(b.pstate.scanout_m2.idled.is_empty());
+    assert!(b.pstate.direct.root().unflip_requested);
+    assert!(!b.pstate.direct.root().hold_direct);
+    assert!(b.pstate.direct.root().pending.is_some());
+    assert!(b.pstate.direct.root().current.is_none());
+    assert!(b.pstate.direct.root().completed.is_empty());
+    assert!(b.pstate.direct.root().idled.is_empty());
     assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
     assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
     assert_eq!(b.store.get(source_id).map(|d| d.refcount), Some(2));
@@ -837,10 +839,10 @@ fn destroy_subwindow_retires_current_direct_idle_once_after_replacement() {
     b.destroy_subwindow(None, target_xid)
         .expect("destroy current direct target");
 
-    assert!(b.pstate.scanout_m2.unflip_requested);
-    assert!(!b.pstate.scanout_m2.hold_direct);
-    assert!(b.pstate.scanout_m2.current.is_some());
-    assert!(b.pstate.scanout_m2.idled.is_empty());
+    assert!(b.pstate.direct.root().unflip_requested);
+    assert!(!b.pstate.direct.root().hold_direct);
+    assert!(b.pstate.direct.root().current.is_some());
+    assert!(b.pstate.direct.root().idled.is_empty());
     assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
     assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
     assert_eq!(b.store.get(source_id).map(|d| d.refcount), Some(2));
@@ -873,7 +875,7 @@ fn final_cow_release_defers_storage_until_direct_replacement() {
     // The production path may already have prepared the lazy COW shadow
     // before the protocol release reaches us. Keep this unit test free of
     // Vulkan while exercising the ownership/deferral transition itself.
-    b.pstate.scanout_m2.unflip_shadow_ready = true;
+    b.pstate.direct.root_mut().unflip_shadow_ready = true;
 
     let final_release = b.prepare_overlay_release(None).expect("final COW release");
     b.retire_overlay_window(None);
@@ -882,9 +884,9 @@ fn final_cow_release_defers_storage_until_direct_replacement() {
     assert!(b.deferred_cow_release);
     assert_eq!(b.cow_id, Some(cow_id));
     assert!(b.windows.contains_key(&cow_xid));
-    assert!(b.pstate.scanout_m2.current.is_some());
-    assert!(b.pstate.scanout_m2.unflip_requested);
-    assert!(!b.pstate.scanout_m2.hold_direct);
+    assert!(b.pstate.direct.root().current.is_some());
+    assert!(b.pstate.direct.root().unflip_requested);
+    assert!(!b.pstate.direct.root().hold_direct);
     assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
     assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
     assert_eq!(b.store.get(cow_id).map(|d| d.refcount), Some(2));
@@ -921,9 +923,9 @@ fn final_cow_release_materialization_failure_keeps_cow_and_pins() {
     assert!(!b.deferred_cow_release);
     assert_eq!(b.cow_id, Some(cow_id));
     assert!(b.store.get(cow_id).is_some());
-    assert!(b.pstate.scanout_m2.current.is_some());
-    assert!(!b.pstate.scanout_m2.unflip_requested);
-    assert!(b.pstate.scanout_m2.hold_direct);
+    assert!(b.pstate.direct.root().current.is_some());
+    assert!(!b.pstate.direct.root().unflip_requested);
+    assert!(b.pstate.direct.root().hold_direct);
     assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
     assert_eq!(
         b.present_source_pins.get(&fallback_pin),
@@ -939,7 +941,7 @@ fn get_cow_during_deferred_release_reuses_backend_identity() {
     b.get_overlay_window(None).expect("materialize COW");
     let cow_id = b.cow_id.expect("COW id");
     let _ = install_direct_frame_for_target_test(&mut b, target_xid, cow_id, true);
-    b.pstate.scanout_m2.unflip_shadow_ready = true;
+    b.pstate.direct.root_mut().unflip_shadow_ready = true;
     assert!(b.prepare_overlay_release(None).expect("final release"));
     b.retire_overlay_window(None);
 
@@ -967,8 +969,8 @@ fn unmap_subwindow_requests_direct_unflip_without_releasing_pins() {
         .expect("unmap direct destination");
 
     assert!(!b.windows[&target_xid].mapped);
-    assert!(b.pstate.scanout_m2.unflip_requested);
-    assert!(!b.pstate.scanout_m2.hold_direct);
+    assert!(b.pstate.direct.root().unflip_requested);
+    assert!(!b.pstate.direct.root().hold_direct);
     assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
     assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
 }
@@ -989,8 +991,8 @@ fn unmap_unrelated_subwindow_keeps_direct_scanout_active() {
         .expect("unmap unrelated window");
 
     assert!(!b.windows[&unrelated_xid].mapped);
-    assert!(!b.pstate.scanout_m2.unflip_requested);
-    assert!(b.pstate.scanout_m2.hold_direct);
+    assert!(!b.pstate.direct.root().unflip_requested);
+    assert!(b.pstate.direct.root().hold_direct);
     assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
     assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
 }
@@ -1013,8 +1015,8 @@ fn map_subwindow_requests_direct_unflip_without_releasing_pins() {
         .expect("map direct destination");
 
     assert!(b.windows[&target_xid].mapped);
-    assert!(b.pstate.scanout_m2.unflip_requested);
-    assert!(!b.pstate.scanout_m2.hold_direct);
+    assert!(b.pstate.direct.root().unflip_requested);
+    assert!(!b.pstate.direct.root().hold_direct);
     assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
     assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
 }
@@ -1039,8 +1041,8 @@ fn map_unrelated_subwindow_keeps_direct_scanout_active() {
         .expect("map unrelated window");
 
     assert!(b.windows[&unrelated_xid].mapped);
-    assert!(!b.pstate.scanout_m2.unflip_requested);
-    assert!(b.pstate.scanout_m2.hold_direct);
+    assert!(!b.pstate.direct.root().unflip_requested);
+    assert!(b.pstate.direct.root().hold_direct);
     assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
     assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
 }
@@ -1073,8 +1075,8 @@ fn configure_subwindow_requests_direct_unflip_without_releasing_pins() {
     .expect("configure direct destination");
 
     assert_eq!(b.windows[&target_xid].x, 12);
-    assert!(b.pstate.scanout_m2.unflip_requested);
-    assert!(!b.pstate.scanout_m2.hold_direct);
+    assert!(b.pstate.direct.root().unflip_requested);
+    assert!(!b.pstate.direct.root().hold_direct);
     assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
     assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
 }
@@ -1109,8 +1111,8 @@ fn configure_unrelated_subwindow_keeps_direct_scanout_active() {
     .expect("configure unrelated window");
 
     assert_eq!(b.windows[&unrelated_xid].x, 12);
-    assert!(!b.pstate.scanout_m2.unflip_requested);
-    assert!(b.pstate.scanout_m2.hold_direct);
+    assert!(!b.pstate.direct.root().unflip_requested);
+    assert!(b.pstate.direct.root().hold_direct);
     assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
     assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
 }
@@ -1124,7 +1126,7 @@ fn logical_resize_keeps_old_cow_pinned_until_direct_replacement() {
     let old_cow_id = b.cow_id.expect("old COW id");
     let (source_id, _, source_pin, cow_pin) =
         install_direct_frame_for_target_test(&mut b, target_xid, old_cow_id, true);
-    b.pstate.scanout_m2.unflip_shadow_ready = true;
+    b.pstate.direct.root_mut().unflip_shadow_ready = true;
     let new_w = b.platform.fb_w.saturating_add(1);
     let new_h = b.platform.fb_h.saturating_add(1);
 
@@ -1133,8 +1135,8 @@ fn logical_resize_keeps_old_cow_pinned_until_direct_replacement() {
 
     let new_cow_id = b.cow_id.expect("replacement COW id");
     assert_ne!(new_cow_id, old_cow_id);
-    assert!(b.pstate.scanout_m2.unflip_requested);
-    assert!(!b.pstate.scanout_m2.hold_direct);
+    assert!(b.pstate.direct.root().unflip_requested);
+    assert!(!b.pstate.direct.root().hold_direct);
     assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
     assert_eq!(b.present_source_pins.get(&cow_pin), Some(&old_cow_id));
     assert_eq!(
@@ -1181,8 +1183,8 @@ fn logical_resize_materialization_failure_preserves_old_dimensions_and_cow() {
         Some(old_cow_id)
     );
     assert!(b.store.get(old_cow_id).is_some());
-    assert!(!b.pstate.scanout_m2.unflip_requested);
-    assert!(b.pstate.scanout_m2.hold_direct);
+    assert!(!b.pstate.direct.root().unflip_requested);
+    assert!(b.pstate.direct.root().hold_direct);
     assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
     assert_eq!(
         b.present_source_pins.get(&fallback_pin),
@@ -1215,7 +1217,7 @@ fn grouped_direct_waits_all_outputs_and_uses_selected_reference_sample() {
 
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     push_test_output(&mut b, 2);
-    b.pstate.scanout_m2.cursor_bound_all = true;
+    b.pstate.direct.root_mut().cursor_bound_all = true;
 
     let crtc_id = 0x5400;
     bind_test_randr_crtc(&mut b, 0, crtc_id);
@@ -1260,7 +1262,7 @@ fn grouped_direct_waits_all_outputs_and_uses_selected_reference_sample() {
         completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
         emit_idle: true,
     };
-    b.pstate.scanout_m2.pending = Some(crate::kms::render::backend::DirectPresentFrame {
+    b.pstate.direct.root_mut().pending = Some(crate::kms::render::backend::DirectPresentFrame {
         source_pin: 1,
         fallback_target_pin: 2,
         source_id,
@@ -1288,11 +1290,12 @@ fn grouped_direct_waits_all_outputs_and_uses_selected_reference_sample() {
         source: PresentClockSource::PageFlip,
     };
     assert!(b.retire_direct_output(0, Some(0x5a), reference));
-    assert!(b.pstate.scanout_m2.completed.is_empty());
-    assert!(b.pstate.scanout_m2.current.is_none());
+    assert!(b.pstate.direct.root().completed.is_empty());
+    assert!(b.pstate.direct.root().current.is_none());
     assert_eq!(
         b.pstate
-            .scanout_m2
+            .direct
+            .root()
             .pending
             .as_ref()
             .and_then(|frame| frame.completion_clock),
@@ -1301,20 +1304,20 @@ fn grouped_direct_waits_all_outputs_and_uses_selected_reference_sample() {
     );
 
     assert!(b.retire_direct_output(1, Some(0x5a), other));
-    assert_eq!(b.pstate.scanout_m2.completed.len(), 1);
+    assert_eq!(b.pstate.direct.root().completed.len(), 1);
     assert_eq!(
-        b.pstate.scanout_m2.completed[0].completion_clock,
+        b.pstate.direct.root().completed[0].completion_clock,
         Some(reference),
         "the last retiring output must not replace the selected CRTC timestamp"
     );
-    assert!(b.pstate.scanout_m2.pending.is_none());
-    assert!(b.pstate.scanout_m2.current.is_some());
-    assert!(b.pstate.scanout_m2.idled.is_empty());
+    assert!(b.pstate.direct.root().pending.is_none());
+    assert!(b.pstate.direct.root().current.is_some());
+    assert!(b.pstate.direct.root().idled.is_empty());
     assert!(
         !b.retire_direct_output(1, Some(0x5a), other),
         "a duplicate retirement cannot emit a second completion"
     );
-    assert_eq!(b.pstate.scanout_m2.completed.len(), 1);
+    assert_eq!(b.pstate.direct.root().completed.len(), 1);
 }
 
 #[test]
@@ -1324,14 +1327,26 @@ fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
     let mut b = crate::kms::render::backend::KmsBackend::for_tests_with_direct_submitter(
         crate::kms::render::backend::KmsBackend::submit_direct_frame_for_tests,
     );
-    b.pstate.scanout_m2.cursor_bound_all = true;
+    b.pstate.direct.root_mut().cursor_bound_all = true;
     let fallback_id = seed_window(&mut b, 0x6a00, None, 0, 0);
 
     install_direct_frame_for_target_test(&mut b, 0x6b00, fallback_id, false);
-    let predecessor = b.pstate.scanout_m2.pending.take().expect("predecessor");
+    let predecessor = b
+        .pstate
+        .direct
+        .root_mut()
+        .pending
+        .take()
+        .expect("predecessor");
 
     install_direct_frame_for_target_test(&mut b, 0x6c00, fallback_id, false);
-    let mut first_successor = b.pstate.scanout_m2.pending.take().expect("first successor");
+    let mut first_successor = b
+        .pstate
+        .direct
+        .root_mut()
+        .pending
+        .take()
+        .expect("first successor");
     first_successor.candidate.present_id = 78;
     first_successor.event.present_id = 78;
     first_successor.event.serial = 10;
@@ -1339,7 +1354,8 @@ fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
     install_direct_frame_for_target_test(&mut b, 0x6d00, fallback_id, false);
     let mut latest_successor = b
         .pstate
-        .scanout_m2
+        .direct
+        .root_mut()
         .pending
         .take()
         .expect("latest successor");
@@ -1347,13 +1363,14 @@ fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
     latest_successor.event.present_id = 79;
     latest_successor.event.serial = 11;
 
-    b.pstate.scanout_m2.pending = Some(predecessor);
+    b.pstate.direct.root_mut().pending = Some(predecessor);
     b.queue_direct_successor(first_successor);
     b.queue_direct_successor(latest_successor);
 
     assert_eq!(
         b.pstate
-            .scanout_m2
+            .direct
+            .root()
             .queued_successor
             .as_ref()
             .map(|frame| frame.candidate.present_id),
@@ -1362,7 +1379,8 @@ fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
     );
     assert_eq!(
         b.pstate
-            .scanout_m2
+            .direct
+            .root()
             .deferred_successor_skips
             .iter()
             .map(|event| event.present_id)
@@ -1372,7 +1390,8 @@ fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
     );
     assert_eq!(
         b.pstate
-            .scanout_m2
+            .direct
+            .root()
             .idled
             .iter()
             .map(|event| event.present_id)
@@ -1380,10 +1399,10 @@ fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
         vec![78],
         "the coalesced buffer idles immediately and exactly once"
     );
-    assert!(!b.pstate.scanout_m2.deferred_successor_skips[0].emit_idle);
-    assert!(!b.pstate.scanout_m2.unflip_requested);
-    assert!(b.pstate.scanout_m2.hold_direct);
-    assert!(b.pstate.scanout_m2.completed.is_empty());
+    assert!(!b.pstate.direct.root().deferred_successor_skips[0].emit_idle);
+    assert!(!b.pstate.direct.root().unflip_requested);
+    assert!(b.pstate.direct.root().hold_direct);
+    assert!(b.pstate.direct.root().completed.is_empty());
 
     let first_clock = PresentClockSample {
         msc: 100,
@@ -1394,7 +1413,8 @@ fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
 
     assert_eq!(
         b.pstate
-            .scanout_m2
+            .direct
+            .root()
             .completed
             .iter()
             .map(|event| (event.present_id, event.completion_mode))
@@ -1407,16 +1427,17 @@ fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
     );
     assert_eq!(
         b.pstate
-            .scanout_m2
+            .direct
+            .root()
             .pending
             .as_ref()
             .map(|frame| frame.candidate.present_id),
         Some(79),
         "retirement immediately submits the retained direct successor"
     );
-    assert!(b.pstate.scanout_m2.queued_successor.is_none());
-    assert!(!b.pstate.scanout_m2.unflip_requested);
-    assert!(b.pstate.scanout_m2.hold_direct);
+    assert!(b.pstate.direct.root().queued_successor.is_none());
+    assert!(!b.pstate.direct.root().unflip_requested);
+    assert!(b.pstate.direct.root().hold_direct);
 
     let second_clock = PresentClockSample {
         msc: 101,
@@ -1426,7 +1447,8 @@ fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
     assert!(b.retire_direct_output(0, None, second_clock));
     assert_eq!(
         b.pstate
-            .scanout_m2
+            .direct
+            .root()
             .completed
             .iter()
             .map(|event| (event.present_id, event.completion_mode))
@@ -1677,6 +1699,7 @@ fn crtc_disable_last_output_closes_kms_output_gate() {
 fn headless_output_inventory_keeps_present_in_blackout() {
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     b.platform.outputs.clear();
+    b.pstate.direct.sync_output_count(b.platform.outputs.len());
     b.kms_outputs_active = !b.platform.outputs.is_empty();
 
     assert!(b.scanout_allowed(), "the fixture VT remains active");
@@ -1691,6 +1714,7 @@ fn zero_device_backend_disables_dri3_and_vblank_arms() {
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     b.platform.devices.clear();
     b.platform.outputs.clear();
+    b.pstate.direct.sync_output_count(b.platform.outputs.len());
     b.kms_outputs_active = false;
 
     assert!(b.platform.primary_device().is_none());
@@ -2179,8 +2203,8 @@ fn hidden_cow_stage_present_keeps_unredirected_direct_frame() {
         u16::try_from(w).unwrap(),
         u16::try_from(h).unwrap(),
     );
-    let current_source = b.pstate.scanout_m2.current.as_ref().unwrap().source_id;
-    let fallback_before = b.pstate.scanout_m2.unflip_fallback_source;
+    let current_source = b.pstate.direct.root().current.as_ref().unwrap().source_id;
+    let fallback_before = b.pstate.direct.root().unflip_fallback_source;
 
     Backend::set_shape_rectangles(&mut b, None, cow, 0, Some(&[]))
         .expect("shape COW Bounding region empty");
@@ -2190,19 +2214,23 @@ fn hidden_cow_stage_present_keeps_unredirected_direct_frame() {
     assert!(!presented, "a hidden stage Present is not direct-eligible");
     assert_eq!(
         b.pstate
-            .scanout_m2
+            .direct
+            .root()
             .current
             .as_ref()
             .map(|frame| frame.source_id),
         Some(current_source),
         "the fullscreen client's direct frame remains current"
     );
-    assert!(!b.pstate.scanout_m2.unflip_requested);
+    assert!(!b.pstate.direct.root().unflip_requested);
     assert_ne!(
-        b.pstate.scanout_m2.unflip_last_reason,
+        b.pstate.direct.root().unflip_last_reason,
         Some("ineligible_authoritative_root_present")
     );
-    assert_eq!(b.pstate.scanout_m2.unflip_fallback_source, fallback_before);
+    assert_eq!(
+        b.pstate.direct.root().unflip_fallback_source,
+        fallback_before
+    );
     assert_ne!(stage_source_id, current_source);
 }
 
@@ -2238,8 +2266,8 @@ fn stage_present_is_authoritative_again_after_cow_shape_removed() {
             u16::try_from(w).unwrap(),
             u16::try_from(h).unwrap(),
         );
-        let current_source = b.pstate.scanout_m2.current.as_ref().unwrap().source_id;
-        let fallback_before = b.pstate.scanout_m2.unflip_fallback_source;
+        let current_source = b.pstate.direct.root().current.as_ref().unwrap().source_id;
+        let fallback_before = b.pstate.direct.root().unflip_fallback_source;
 
         Backend::set_shape_rectangles(&mut b, None, cow, 0, Some(&[]))
             .expect("shape COW Bounding region empty");
@@ -2256,19 +2284,23 @@ fn stage_present_is_authoritative_again_after_cow_shape_removed() {
         );
         assert_eq!(
             b.pstate
-                .scanout_m2
+                .direct
+                .root()
                 .current
                 .as_ref()
                 .map(|frame| frame.source_id),
             Some(current_source),
             "the fullscreen client's direct frame remains current while hidden"
         );
-        assert!(!b.pstate.scanout_m2.unflip_requested);
+        assert!(!b.pstate.direct.root().unflip_requested);
         assert_ne!(
-            b.pstate.scanout_m2.unflip_last_reason,
+            b.pstate.direct.root().unflip_last_reason,
             Some("ineligible_authoritative_root_present")
         );
-        assert_eq!(b.pstate.scanout_m2.unflip_fallback_source, fallback_before);
+        assert_eq!(
+            b.pstate.direct.root().unflip_fallback_source,
+            fallback_before
+        );
         assert_ne!(hidden_source_id, current_source);
 
         if partial_shape {
@@ -2301,12 +2333,15 @@ fn stage_present_is_authoritative_again_after_cow_shape_removed() {
             !presented,
             "the independent x offset gate rejects this Present"
         );
-        assert!(b.pstate.scanout_m2.unflip_requested);
+        assert!(b.pstate.direct.root().unflip_requested);
         assert_eq!(
-            b.pstate.scanout_m2.unflip_reason,
+            b.pstate.direct.root().unflip_reason,
             Some("ineligible_authoritative_root_present")
         );
-        assert_eq!(b.pstate.scanout_m2.unflip_fallback_source, Some(source_id));
+        assert_eq!(
+            b.pstate.direct.root().unflip_fallback_source,
+            Some(source_id)
+        );
     }
 }
 
@@ -2334,12 +2369,15 @@ fn hidden_unredirected_present_still_invalidates_direct_frame() {
         try_present_root_pixmap_for_shape_test(&mut b, 85, candidate_source, candidate_client, 1);
 
     assert!(!presented);
-    assert!(b.pstate.scanout_m2.unflip_requested);
+    assert!(b.pstate.direct.root().unflip_requested);
     assert_eq!(
-        b.pstate.scanout_m2.unflip_reason,
+        b.pstate.direct.root().unflip_reason,
         Some("ineligible_authoritative_root_present")
     );
-    assert_eq!(b.pstate.scanout_m2.unflip_fallback_source, Some(source_id));
+    assert_eq!(
+        b.pstate.direct.root().unflip_fallback_source,
+        Some(source_id)
+    );
 }
 
 /// Xorg flips a Present only when the window's clip list is the root's
@@ -2409,7 +2447,7 @@ fn an_empty_cow_bounding_shape_unflips_the_direct_stage_frame() {
     seed_window(&mut b, source, None, 0, 0);
     let (w, h) = (u16::try_from(w).unwrap(), u16::try_from(h).unwrap());
     retain_direct_frame_from_source_test(&mut b, source, stage, w, h);
-    assert!(b.pstate.scanout_m2.active());
+    assert!(b.pstate.direct.root().active());
 
     b.set_shape_rectangles(None, cow, 2, Some(&[])).unwrap();
     b.set_shape_rectangles(
@@ -2425,14 +2463,14 @@ fn an_empty_cow_bounding_shape_unflips_the_direct_stage_frame() {
     )
     .unwrap();
     assert!(
-        !b.pstate.scanout_m2.unflip_requested,
+        !b.pstate.direct.root().unflip_requested,
         "an input shape or a root-covering bounding shape keeps the flip"
     );
 
     b.set_shape_rectangles(None, cow, 0, Some(&[])).unwrap();
-    assert!(b.pstate.scanout_m2.unflip_requested);
+    assert!(b.pstate.direct.root().unflip_requested);
     assert_eq!(
-        b.pstate.scanout_m2.unflip_reason,
+        b.pstate.direct.root().unflip_reason,
         Some("shape_clips_direct_frame")
     );
 }
@@ -2499,8 +2537,8 @@ fn active_direct_scanout_unflips_on_cursor_output_fallback() {
         fallback_changed: true,
         retry_required: false,
     });
-    assert!(backend.pstate.scanout_m2.unflip_requested);
-    assert!(!backend.pstate.scanout_m2.hold_direct);
+    assert!(backend.pstate.direct.root().unflip_requested);
+    assert!(!backend.pstate.direct.root().hold_direct);
 }
 
 #[test]
@@ -2515,8 +2553,8 @@ fn active_direct_scanout_unflips_and_wakes_for_cursor_rollback_retry() {
         retry_required: true,
     });
     assert!(backend.scene.scene_structure_dirty);
-    assert!(backend.pstate.scanout_m2.unflip_requested);
-    assert!(!backend.pstate.scanout_m2.hold_direct);
+    assert!(backend.pstate.direct.root().unflip_requested);
+    assert!(!backend.pstate.direct.root().hold_direct);
 }
 
 #[test]
@@ -2788,8 +2826,8 @@ fn atomic_cursor_scanout_backend_with_hidden_cursor(hidden: bool) -> Option<KmsB
             backend.store.ack_presentation_damage(snapshot);
         }
     }
-    backend.pstate.scanout_m2.cursor_bound_all = true;
-    backend.pstate.scanout_m2.eligible_root_streak =
+    backend.pstate.direct.root_mut().cursor_bound_all = true;
+    backend.pstate.direct.root_mut().eligible_root_streak =
         crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1;
     Some(backend)
 }
@@ -2992,11 +3030,12 @@ fn randr_change_discards_an_inflight_cursor_flip_before_the_next_scene_flip() {
     let drm_fd = backend.platform.devices[0].device.as_fd().as_raw_fd();
     let mut state = yserver_core::server::ServerState::new();
     Backend::on_page_flip_ready(&mut backend, &mut state, drm_fd);
-    assert!(backend.pstate.scanout_m2.pending.is_none());
+    assert!(backend.pstate.direct.root().pending.is_none());
     assert_eq!(
         backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .current
             .as_ref()
             .map(|frame| frame.candidate.present_id),
@@ -3166,11 +3205,11 @@ fn hidden_cursor_allows_fullscreen_direct_scanout_without_unflip() {
             .expect("eligible fullscreen Present"),
         "a fully hidden cursor must not reject direct scanout"
     );
-    assert!(backend.pstate.scanout_m2.pending.is_some());
+    assert!(backend.pstate.direct.root().pending.is_some());
 
     Backend::maybe_composite(&mut backend).expect("composite tick during direct scanout");
     assert!(
-        !backend.pstate.scanout_m2.unflip_requested,
+        !backend.pstate.direct.root().unflip_requested,
         "Hidden must not request a direct unflip"
     );
     assert_eq!(recorder.records().len(), 1);
@@ -3294,7 +3333,8 @@ fn direct_successor_waits_for_retirement_and_carries_motion() {
     assert_eq!(
         backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .pending
             .as_ref()
             .expect("direct pending")
@@ -3309,7 +3349,8 @@ fn direct_successor_waits_for_retirement_and_carries_motion() {
     assert_eq!(
         backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .queued_successor
             .as_ref()
             .map(|frame| frame.candidate.present_id),
@@ -3347,7 +3388,8 @@ fn direct_successor_waits_for_retirement_and_carries_motion() {
     assert_eq!(
         backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .pending
             .as_ref()
             .map(|frame| frame.candidate.present_id),
@@ -3415,7 +3457,7 @@ fn direct_successor_waits_for_retirement_and_carries_motion() {
 
     draw_atomic_cursor_test_root_overlay(&mut backend, 2);
     assert!(!backend.scene.root_overlay.is_empty());
-    backend.pstate.scanout_m2.unflip_shadow_ready = true;
+    backend.pstate.direct.root_mut().unflip_shadow_ready = true;
     Backend::warp_pointer_root(&mut backend, &mut state, 1320, 330);
     let unflip_positions = backend
         .platform
@@ -3436,14 +3478,14 @@ fn direct_successor_waits_for_retirement_and_carries_motion() {
     );
     assert_atomic_cursor_properties(&records[4], &unflip_positions);
     assert_eq!(
-        backend.pstate.scanout_m2.unflip_outputs_to_replace,
+        backend.pstate.direct.root().unflip_outputs_to_replace,
         std::collections::HashSet::from([0, 1]),
     );
     assert_atomic_cursor_quiescent(&backend);
 
     retire_atomic_cursor_test_output(&mut backend, &mut state, 0, 4);
     retire_atomic_cursor_test_output(&mut backend, &mut state, 1, 4);
-    assert!(!backend.pstate.scanout_m2.active());
+    assert!(!backend.pstate.direct.root().active());
     Backend::client_disconnected(&mut backend, yserver_protocol::x11::ClientId(2));
     assert_atomic_cursor_quiescent(&backend);
 }
@@ -3469,7 +3511,7 @@ fn cursor_retirement_resumes_a_direct_successor_on_the_last_crtc() {
     assert_atomic_cursor_properties(&recorder.records()[0], &first_positions);
     retire_atomic_cursor_test_output(&mut backend, &mut state, 0, 1);
     retire_atomic_cursor_test_output(&mut backend, &mut state, 1, 1);
-    assert!(backend.pstate.scanout_m2.current.is_some());
+    assert!(backend.pstate.direct.root().current.is_some());
 
     Backend::warp_pointer_root(&mut backend, &mut state, 980, 230);
     Backend::maybe_composite(&mut backend).expect("submit two cursor-only commits");
@@ -3488,7 +3530,8 @@ fn cursor_retirement_resumes_a_direct_successor_on_the_last_crtc() {
     assert_eq!(
         backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .queued_successor
             .as_ref()
             .unwrap()
@@ -3508,7 +3551,7 @@ fn cursor_retirement_resumes_a_direct_successor_on_the_last_crtc() {
     retire_atomic_cursor_test_output(&mut backend, &mut state, 0, 2);
     Backend::maybe_composite(&mut backend).expect("one CRTC remains blocked");
     assert_eq!(recorder.records().len(), 3);
-    assert!(backend.pstate.scanout_m2.queued_successor.is_some());
+    assert!(backend.pstate.direct.root().queued_successor.is_some());
 
     retire_atomic_cursor_test_output(&mut backend, &mut state, 1, 2);
     Backend::maybe_composite(&mut backend).expect("last cursor retirement arbitration");
@@ -3527,11 +3570,12 @@ fn cursor_retirement_resumes_a_direct_successor_on_the_last_crtc() {
         crate::drm::atomic::AtomicCommitKind::SceneWithCursor
     );
     assert_atomic_cursor_properties(&records[3], &latest_positions);
-    assert!(backend.pstate.scanout_m2.queued_successor.is_none());
+    assert!(backend.pstate.direct.root().queued_successor.is_none());
     assert_eq!(
         backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .pending
             .as_ref()
             .map(|frame| frame.candidate.present_id),
@@ -3592,9 +3636,9 @@ fn first_direct_entry_declines_behind_cursor_commit_without_retaining_state() {
         !Backend::try_present_direct(&mut backend, declined.candidate, declined.event.clone(),)
             .expect("first direct entry declines")
     );
-    assert!(backend.pstate.scanout_m2.current.is_none());
-    assert!(backend.pstate.scanout_m2.pending.is_none());
-    assert!(backend.pstate.scanout_m2.queued_successor.is_none());
+    assert!(backend.pstate.direct.root().current.is_none());
+    assert!(backend.pstate.direct.root().pending.is_none());
+    assert!(backend.pstate.direct.root().queued_successor.is_none());
     assert_eq!(
         backend.store.get(declined.source_id).unwrap().refcount,
         declined_source_refcount
@@ -3626,14 +3670,14 @@ fn first_direct_entry_declines_behind_cursor_commit_without_retaining_state() {
         )
         .expect("root overlay keeps direct scanout off")
     );
-    assert!(backend.pstate.scanout_m2.queued_successor.is_none());
-    assert!(backend.pstate.scanout_m2.pending.is_none());
+    assert!(backend.pstate.direct.root().queued_successor.is_none());
+    assert!(backend.pstate.direct.root().pending.is_none());
 
     Backend::client_disconnected(&mut backend, yserver_protocol::x11::ClientId(1));
     assert!(backend.scene.root_overlay.is_empty());
     // The root overlay correctly reset direct-scanout probation. Restore the
     // admitted fixture state so this last Present isolates cursor retirement.
-    backend.pstate.scanout_m2.eligible_root_streak =
+    backend.pstate.direct.root_mut().eligible_root_streak =
         crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1;
     // A Copy completion is ready only once its GPU signal has executed; wait for the
     // device (bounded by the driver) instead of racing a slow software ICD.
@@ -3658,8 +3702,8 @@ fn first_direct_entry_declines_behind_cursor_commit_without_retaining_state() {
         crate::drm::atomic::AtomicCommitKind::SceneWithCursor
     );
     assert_atomic_cursor_properties(&recorder.records()[1], &[blocked_position]);
-    assert!(backend.pstate.scanout_m2.pending.is_some());
-    assert!(backend.pstate.scanout_m2.queued_successor.is_none());
+    assert!(backend.pstate.direct.root().pending.is_some());
+    assert!(backend.pstate.direct.root().queued_successor.is_none());
     assert_atomic_cursor_quiescent(&backend);
 }
 
@@ -3753,7 +3797,7 @@ fn eligible_fullscreen_present_records_cursor_positions_for_both_outputs() {
             crate::drm::modeset::DirectScanoutProbeFramebuffer::for_tests(atomic_cursor_raw(71)),
         ),
     );
-    backend.pstate.scanout_m2.eligible_root_streak =
+    backend.pstate.direct.root_mut().eligible_root_streak =
         crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1;
 
     let crtc_id = u32::from(backend.platform.outputs[0].output.crtc);
@@ -3809,7 +3853,7 @@ fn eligible_fullscreen_present_records_cursor_positions_for_both_outputs() {
         crate::drm::atomic::AtomicCommitKind::SceneWithCursor
     );
     assert_atomic_cursor_properties(&records[0], &positions);
-    assert!(backend.pstate.scanout_m2.pending.is_some());
+    assert!(backend.pstate.direct.root().pending.is_some());
     assert!(positions.iter().all(|position| {
         !backend
             .platform
@@ -3903,13 +3947,13 @@ fn shape_triggered_composed_unflip_records_cursor_positions_for_both_outputs() {
         u16::try_from(width).expect("test root width"),
         u16::try_from(height).expect("test root height"),
     );
-    backend.pstate.scanout_m2.unflip_shadow_ready = true;
+    backend.pstate.direct.root_mut().unflip_shadow_ready = true;
 
     Backend::set_shape_rectangles(&mut backend, None, cow, 0, Some(&[]))
         .expect("empty COW bounding shape");
-    assert!(backend.pstate.scanout_m2.unflip_requested);
+    assert!(backend.pstate.direct.root().unflip_requested);
     assert_eq!(
-        backend.pstate.scanout_m2.unflip_reason,
+        backend.pstate.direct.root().unflip_reason,
         Some("shape_clips_direct_frame")
     );
 
@@ -3923,7 +3967,7 @@ fn shape_triggered_composed_unflip_records_cursor_positions_for_both_outputs() {
     );
     assert_atomic_cursor_properties(&records[0], &positions);
     assert_eq!(
-        backend.pstate.scanout_m2.unflip_outputs_to_replace,
+        backend.pstate.direct.root().unflip_outputs_to_replace,
         std::collections::HashSet::from([0, 1])
     );
     assert!(positions.iter().all(|position| {

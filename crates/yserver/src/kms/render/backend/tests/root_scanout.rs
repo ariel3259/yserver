@@ -495,8 +495,8 @@ fn root_read_during_direct_scanout_returns_the_flipped_source() {
     );
 
     // Dropping the direct frame puts the read back on the composed route.
-    backend.pstate.scanout_m2.current = None;
-    backend.pstate.scanout_m2.hold_direct = false;
+    backend.pstate.direct.root_mut().current = None;
+    backend.pstate.direct.root_mut().hold_direct = false;
     assert!(
         bgr(&read(&mut backend)).iter().all(|px| *px == [0, 0, 0]),
         "the composed route must come back once the CRTC is unflipped"
@@ -1217,7 +1217,7 @@ fn scanout_read_route_is_composed_once_the_direct_frame_is_gone() {
     let target_xid = 0x5704;
     let fallback_id = seed_window(&mut b, target_xid, None, 0, 0);
     install_direct_frame_for_target_test(&mut b, target_xid, fallback_id, true);
-    b.pstate.scanout_m2.current = None;
+    b.pstate.direct.root_mut().current = None;
 
     // The stub fixture has no scanout pools, so the composed branch can
     // only report "not covered by any pool" — which is still proof the
@@ -1261,7 +1261,8 @@ fn scanout_read_route_rejects_a_vanished_direct_source() {
     let fallback_id = seed_window(&mut b, target_xid, None, 0, 0);
     install_direct_frame_for_target_test(&mut b, target_xid, fallback_id, true);
     b.pstate
-        .scanout_m2
+        .direct
+        .root_mut()
         .current
         .as_mut()
         .expect("direct frame installed")
@@ -1296,7 +1297,7 @@ fn scanout_read_route_is_per_output_during_a_composed_unflip() {
     let fallback_id = seed_window(&mut b, target_xid, None, 0, 0);
     install_direct_frame_for_target_test(&mut b, target_xid, fallback_id, true);
     // Composed unflip retired on output 0, still awaited on output 1.
-    b.pstate.scanout_m2.unflip_outputs_to_replace = outputs_set(&[1]);
+    b.pstate.direct.root_mut().unflip_outputs_to_replace = outputs_set(&[1]);
 
     assert!(
         b.direct_scanout_frame_for_output(0).is_none(),
@@ -1429,6 +1430,7 @@ fn a_hotplug_that_shrank_the_extent_leaves_root_storage_alone() {
 
     // B's route is retired, so the extent shrinks.
     b.platform.outputs.pop();
+    b.pstate.direct.sync_output_count(b.platform.outputs.len());
     b.platform.scanout_pools.pop();
     b.platform.bo_generations.pop();
     b.platform.first_pageflip_logged.pop();

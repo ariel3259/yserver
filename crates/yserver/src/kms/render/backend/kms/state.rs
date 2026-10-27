@@ -378,6 +378,49 @@ impl ScanoutM2State {
     }
 }
 
+/// Direct-scanout bookkeeping, with one grouped root owner and one slot per
+/// platform output for independently owned frames.
+pub(in crate::kms::render::backend) struct DirectOwners {
+    root: ScanoutM2State,
+    pub(in crate::kms::render::backend) outputs: Vec<ScanoutM2State>,
+}
+
+impl Default for DirectOwners {
+    fn default() -> Self {
+        Self {
+            root: ScanoutM2State::new(),
+            outputs: Vec::new(),
+        }
+    }
+}
+
+impl DirectOwners {
+    pub(in crate::kms::render::backend) fn root(&self) -> &ScanoutM2State {
+        &self.root
+    }
+
+    pub(in crate::kms::render::backend) fn root_mut(&mut self) -> &mut ScanoutM2State {
+        &mut self.root
+    }
+
+    pub(in crate::kms::render::backend) fn sync_output_count(&mut self, count: usize) {
+        if count < self.outputs.len() {
+            assert!(
+                self.outputs[count..].iter().all(|owner| !owner.active()),
+                "cannot remove an output with pending direct-scanout frames"
+            );
+            for mut owner in self.outputs.split_off(count) {
+                self.root.completed.append(&mut owner.completed);
+                self.root
+                    .deferred_successor_skips
+                    .append(&mut owner.deferred_successor_skips);
+                self.root.idled.append(&mut owner.idled);
+            }
+        }
+        self.outputs.resize_with(count, ScanoutM2State::new);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::kms::render::backend) enum TearingState {
     Off,
@@ -809,7 +852,7 @@ pub struct KmsBackendState {
     /// drawable pin, submits DRM work, or affects Present capabilities.
     pub(in crate::kms::render::backend) scanout_m0: ScanoutM0Telemetry,
     pub(in crate::kms::render::backend) scanout_m1: ScanoutM1ProbeCache,
-    pub(in crate::kms::render::backend) scanout_m2: ScanoutM2State,
+    pub(in crate::kms::render::backend) direct: DirectOwners,
     pub(in crate::kms::render::backend) tearing: Tearing,
     /// Monotonic clock for KMS cursor-composition pacing.
     pub(in crate::kms::render::backend) monotonic_clock:
