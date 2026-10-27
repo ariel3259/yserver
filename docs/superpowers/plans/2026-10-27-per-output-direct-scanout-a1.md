@@ -51,7 +51,7 @@
 **Files:**
 - Modify: `kms/state.rs` (`DirectScope`, scope API on `DirectOwners`; the `DirectFrameSubmitter` fn-pointer type ~248)
 - Modify: `kms/scanout.rs` — `submit_direct_frame_live` (~946), `submit_direct_frame_for_tests`, `release_direct_frame`, `queue_direct_successor`, `submit_queued_direct_successor`, `stop_direct_after_scanout_replaced`, `direct_scanout_frame_for_output` (~1637), `materialize_direct_shadow_for_unflip`, `submit_composed_unflip`, `fresh_composed_unflip_eligible`, `submit_fresh_composed_unflip`, `commit_fresh_composed_unflip`, `record_accepted_degraded_unflip_replacements`, `retire_direct_output` (~2072), `request_direct_unflip` (~427), `direct_frames_are_under_cow` (~408), `live_direct_vrr_wanted_by_output` (~1171), `current_primary_framebuffer_for_output`; in `backend_scanout_maybe_composite` the successor dispatch (~3560) and unflip processing (~3617) iterate the active owners
-- Modify: `kms/present.rs` callers; `kms/platform_hooks.rs` completion/Idle drain (~795) drains every slot; lifecycle teardown callers `kms/session.rs` (~538) and `kms/randr.rs` (~1349); `backend/for_tests.rs` `for_tests_with_direct_submitter` (~619) and the injected test submitters
+- Modify: `kms/present.rs` callers; `kms/platform_hooks.rs` completion/Idle drain (~795) drains every slot, and its fallback-materialization call (~329) passes the scope; lifecycle teardown callers `kms/session.rs` (~538) and `kms/randr.rs` (~1349); `backend/for_tests.rs` `for_tests_with_direct_submitter` (~619) and the injected test submitters
 - Test: `tests/commit_identity/direct_unflip.rs` (recording fixture), `tests/present_scanout.rs`
 
 **Interfaces:**
@@ -68,7 +68,7 @@
 - [ ] **Step 1: Failing tests** (recording fixture with two outputs; owners seeded through the existing direct-frame `for_tests` helpers, everything else through entry points):
   - `output_owner_submits_and_unflips_only_its_crtc`: an `Output(1)` owner's recorded direct commit and composed-unflip commit carry plane/CRTC properties for output 1's CRTC only. Mutation: build plane states for all outputs.
   - `two_output_owners_retire_independently`: `Output(0)` and `Output(1)` owners with distinct event identities and distinct clock samples; retiring output 1 completes owner 1 exactly once with output 1's sample and leaves owner 0 pending; then output 0 completes owner 0 with its own sample. Mutation: route retirement to the first active owner instead of `scope_for_output`.
-  - `global_teardown_unflips_every_output_owner`: two `Output` owners held; drive the VT-release (or RANDR) entry point → both unflip, both completions drained once, no pin left. Mutation: `request_direct_unflip` acts on the root slot only.
+  - `global_teardown_unflips_every_output_owner`: two `Output` owners held; drive the VT-release entry point → both owners stopped, both completions drained once, no pin left; repeat with a RANDR topology teardown. Mutation: the stop-all paths (`session.rs` ~567/~588 VT release, `scanout.rs` ~1621 topology teardown) stop only the root slot.
   - `stopped_output_owner_notifications_are_drained`: an `Output(1)` owner retires its unflip; the completion and Idle it queued are delivered through the normal drain. Mutation: drain the root slot only.
   - Root regression: the existing `p1_grouped_unflip_ignores_late_direct_or_duplicate_cookie` (`tests/commit_identity/direct_unflip.rs` ~693) passes unchanged.
 - [ ] **Step 2: Run, verify they fail.**
@@ -79,22 +79,23 @@
 ### Task 3: Composition skips only outputs that are direct
 
 **Files:**
-- Modify: `backend/portable/compose.rs` (`compose_tick` ~94, which supplies every output), `crates/yserver-render/src/kms/render/scene/tick.rs` (the per-output visit ~236)
+- Modify: `backend/portable/compose.rs` (`compose_tick` ~94, generic over `XBackend<P>` ~11, which supplies every output), `crates/yserver-render/src/kms/render/scene/tick.rs` (`SceneCompositor::tick`, the per-output visit ~236) and their callers: `surface/platform.rs` ~1053 (passes an all-false mask), `kms/session.rs` ~419, `crates/yserver-render/src/kms/render/scene/tests/tick.rs` ~355
 - Modify: `kms/scanout.rs` — `backend_scanout_maybe_composite` early returns (~3569–3612) and the held cursor-only loop (~3586); scene readiness (`scene_wants_compose` ~3029); held-direct wakeup (~3346); `backend_scanout_next_wakeup`; the reentry barrier (`reentry_blocked_until_composed`)
-- Modify: `kms/present.rs` — queued-successor arbitration's "scene flip pending" check (~924) considers only the owner's outputs
+- Modify: `kms/scanout.rs` queued-successor dispatch (`submit_queued_direct_successor` ~1429): its scene-flip-pending check considers only the owner's outputs. (The Present-time admission check, `kms/present.rs` ~924, is scoped in A2 together with `Output` admission, since A1 Presents can only be `Root`.)
 - Test: models `tests/tearing.rs` `live_scene_backend_with_outputs(2)`, `tests/cursor_sprites/scene_attach.rs` `held_direct_with_two_outputs`; `tests/present_scanout.rs`
 
 **Interfaces:**
 - Consumes: Task 2's scope API.
 - Produces:
-  - `fn output_is_direct(&self, output_idx: usize) -> bool` on `KmsBackend`: an owner of that output is pending, held, or awaiting its unflip replacement there — **except** while that output's replacement is being rendered by the fresh composed unflip (~1909) or the degraded unflip (~3645), which must compose it.
-  - Output selection seam: `compose_tick` passes a per-output skip mask (`&[bool]`, indexed by the platform output index, same length as the outputs) down to the scene tick; the scene tick skips masked outputs (no render, no flip, damage kept for later) and visits the rest exactly as today. The mask is `output_is_direct` per output. Output indices are preserved (no compaction).
+  - `fn output_is_direct(&self, output_idx: usize) -> bool` on `KmsBackend`: an owner of that output is pending, held, or awaiting its unflip replacement there.
+  - **Fresh/degraded unflip passes render only the owner's outputs.** The fresh composed unflip (~1909) sets the global scene-flip deferral and settles every deferred frame with the replacement's accepted identity (~1911, ~1945; `platform/scene_sink.rs` ~138), so that pass uses the inverse mask — compose exactly `direct_scope_outputs(scope)` and skip every other output; unrelated outputs compose in a normal pass (the same tick after the replacement commit is submitted is not allowed — they compose on the next pass, as today's "do not fall through" rule). The degraded unflip (~3645) likewise renders only the owner's outputs.
+  - Output selection seam: the mask is passed explicitly — `compose_tick(…, skip_outputs: &[bool])` on the generic `XBackend<P>` and `SceneCompositor::tick(…, skip_outputs: &[bool])` (indexed by the platform output index, same length as the outputs; callers without direct scanout pass all `false`); the scene tick skips masked outputs (no render, no flip, damage kept for later) and visits the rest exactly as today. The mask is `output_is_direct` per output. Output indices are preserved (no compaction).
   - The early returns in `backend_scanout_maybe_composite` stop only work on owned outputs; every other output composes and flips. Readiness, wakeups and the reentry barrier are evaluated per owner's outputs; held cursor-only commits iterate the owner's outputs only. The existing per-output commit gate (`platform/gamma.rs` ~202) still decides CRTC busyness.
 
 - [ ] **Step 1: Failing tests:**
   - `composed_output_flips_while_other_output_owner_held`: `Output(1)` held; damage a window on output 0; scheduling pass → a composed flip on output 0 only; owner 1 still current. Mutation: restore the root-wide early return.
-  - `composed_output_flips_while_other_output_owner_pending_and_unflipping`: same with owner 1 pending, then unflipping (fresh unflip renders output 1's replacement in the same pass). Mutation: skip mask true for an output under fresh unflip.
-  - `queued_successor_not_blocked_by_scene_flip_on_other_output`: a composed flip pending on output 0; owner 1's queued successor is submitted on the next pass, not deferred. Mutation: keep the global "any scene flip pending" check.
+  - `composed_output_flips_while_other_output_owner_pending_and_unflipping`: same with owner 1 pending, then unflipping: the fresh-unflip pass renders and commits only output 1's replacement and output 0 gets no pending acknowledgement from it; output 0 composes and flips on the next pass. Mutation: the fresh-unflip pass uses the normal mask (composes output 0 into the deferral).
+  - `queued_successor_not_blocked_by_scene_flip_on_other_output`: a composed flip pending on output 0; owner 1's queued successor is submitted by `submit_queued_direct_successor` on the next pass, not deferred. Mutation: keep the global "any scene flip pending" check in `submit_queued_direct_successor`.
   - `next_wakeup_reflects_composed_output_while_other_is_direct`: owner 1 held, damage on output 0 → `next_wakeup` is due. Mutation: held-direct wakeup considers cursor work only.
 - [ ] **Step 2: Run, verify they fail.**
 - [ ] **Step 3: Implement.**
