@@ -46,7 +46,7 @@ pub(crate) struct RecordingSceneFixture {
     pub(crate) events: AtomicEventFixture,
     /// Copied routes only: withholds delivery of real source completions.
     pub(crate) readiness: Option<Rc<RecordingRenderCompletionReadiness>>,
-    extra_drawables: Vec<u32>,
+    pub(crate) extra_drawables: Vec<u32>,
 }
 
 /// Preserve the fixture's explicit Vulkan drop order while a test is unwinding.
