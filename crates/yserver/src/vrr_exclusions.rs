@@ -80,7 +80,6 @@ pub(crate) struct VrrExclusionDecision {
 impl VrrExclusions {
     #[must_use]
     pub fn load(roots: &VrrListRoots) -> Self {
-        let mut nvidia_documents = Vec::new();
         let mut nvidia_paths = vec![roots.nvidia_etc_dir.join("nvidia-application-profiles-rc")];
         nvidia_paths.extend(files_in_dir(
             &roots
@@ -90,18 +89,7 @@ impl VrrExclusions {
         nvidia_paths.extend(files_named(&roots.nvidia_driver_dir, |name| {
             name.starts_with("nvidia-application-profiles-") && name.ends_with("-rc")
         }));
-        for path in nvidia_paths {
-            if let Some(contents) = read_optional(&path, "NVIDIA application profile") {
-                if let Some(document) = parse_nvidia_document(&contents) {
-                    nvidia_documents.push(document);
-                } else {
-                    log::warn!(
-                        "kms: skipping malformed NVIDIA application profile {}",
-                        path.display()
-                    );
-                }
-            }
-        }
+        let nvidia_documents = load_nvidia_documents(nvidia_paths);
         let nvidia = parse_nvidia_profiles(&nvidia_documents);
 
         let mesa_system_paths = files_named(&roots.mesa_system_dir, |name| name.ends_with(".conf"));
@@ -116,16 +104,7 @@ impl VrrExclusions {
         }
         let mut mesa_paths = mesa_system_paths;
         mesa_paths.push(roots.mesa_etc_file.clone());
-        let mut mesa = Vec::new();
-        for path in mesa_paths {
-            if let Some(contents) = read_optional(&path, "Mesa driconf") {
-                if let Some(entries) = parse_driconf(&contents) {
-                    mesa.extend(entries);
-                } else {
-                    log::warn!("kms: skipping malformed Mesa driconf {}", path.display());
-                }
-            }
-        }
+        let mesa = load_mesa_entries(mesa_paths);
 
         let nvidia_count = nvidia.values().filter(|allowed| !**allowed).count();
         let mesa_count = mesa.iter().filter(|entry| !entry.allowed).count();
@@ -177,25 +156,23 @@ impl VrrExclusions {
         process_name: &str,
         home: Option<&Path>,
     ) -> Option<VrrExclusionSource> {
-        if let Some(home) = home {
-            let mut user_lists = self.user_lists.borrow_mut();
-            if !user_lists.contains_key(home) {
-                let lists = self.load_user_lists(home);
-                user_lists.insert(home.to_path_buf(), lists);
-            }
-            let lists = user_lists
-                .get(home)
-                .expect("user exclusion lists inserted for this HOME");
-            if lists.nvidia.get(process_name) == Some(&false) {
-                Some(VrrExclusionSource::NvidiaProfiles)
-            } else if mesa_excludes(&lists.mesa, process_name) {
-                Some(VrrExclusionSource::MesaDriconf)
-            } else {
-                None
-            }
-        } else if self.nvidia.get(process_name) == Some(&false) {
+        if let Some(home) = home
+            && !self.user_lists.borrow().contains_key(home)
+        {
+            let lists = self.load_user_lists(home);
+            self.user_lists
+                .borrow_mut()
+                .insert(home.to_path_buf(), lists);
+        }
+        let user_lists = self.user_lists.borrow();
+        let selected_user_lists = home.and_then(|home| user_lists.get(home));
+        let (nvidia, mesa) = selected_user_lists
+            .map_or((&self.nvidia, self.mesa.as_slice()), |lists| {
+                (&lists.nvidia, lists.mesa.as_slice())
+            });
+        if nvidia.get(process_name) == Some(&false) {
             Some(VrrExclusionSource::NvidiaProfiles)
-        } else if mesa_excludes(&self.mesa, process_name) {
+        } else if mesa_excludes(mesa, process_name) {
             Some(VrrExclusionSource::MesaDriconf)
         } else {
             None
@@ -208,30 +185,11 @@ impl VrrExclusions {
         nvidia_paths.extend(files_in_dir(
             &user_nvidia.join("nvidia-application-profiles-rc.d"),
         ));
-        let mut nvidia_documents = Vec::new();
-        for path in nvidia_paths {
-            if let Some(contents) = read_optional(&path, "NVIDIA application profile") {
-                if let Some(document) = parse_nvidia_document(&contents) {
-                    nvidia_documents.push(document);
-                } else {
-                    log::warn!(
-                        "kms: skipping malformed NVIDIA application profile {}",
-                        path.display()
-                    );
-                }
-            }
-        }
+        let mut nvidia_documents = load_nvidia_documents(nvidia_paths);
         nvidia_documents.extend(self.nvidia_documents.iter().cloned());
 
         let mut mesa = self.mesa.clone();
-        let path = home.join(".drirc");
-        if let Some(contents) = read_optional(&path, "Mesa driconf") {
-            if let Some(entries) = parse_driconf(&contents) {
-                mesa.extend(entries);
-            } else {
-                log::warn!("kms: skipping malformed Mesa driconf {}", path.display());
-            }
-        }
+        mesa.extend(load_mesa_entries([home.join(".drirc")]));
         UserVrrLists {
             nvidia: parse_nvidia_profiles(&nvidia_documents),
             mesa,
@@ -281,6 +239,37 @@ fn read_optional(path: &Path, description: &str) -> Option<String> {
             None
         }
     }
+}
+
+fn load_nvidia_documents(paths: impl IntoIterator<Item = PathBuf>) -> Vec<Value> {
+    let mut documents = Vec::new();
+    for path in paths {
+        if let Some(contents) = read_optional(&path, "NVIDIA application profile") {
+            if let Some(document) = parse_nvidia_document(&contents) {
+                documents.push(document);
+            } else {
+                log::warn!(
+                    "kms: skipping malformed NVIDIA application profile {}",
+                    path.display()
+                );
+            }
+        }
+    }
+    documents
+}
+
+fn load_mesa_entries(paths: impl IntoIterator<Item = PathBuf>) -> Vec<MesaDriconfEntry> {
+    let mut entries = Vec::new();
+    for path in paths {
+        if let Some(contents) = read_optional(&path, "Mesa driconf") {
+            if let Some(file_entries) = parse_driconf(&contents) {
+                entries.extend(file_entries);
+            } else {
+                log::warn!("kms: skipping malformed Mesa driconf {}", path.display());
+            }
+        }
+    }
+    entries
 }
 
 fn parse_nvidia_document(contents: &str) -> Option<Value> {
@@ -776,7 +765,7 @@ mod tests {
     }
 
     #[test]
-    // Mutation: use full-match instead of Mesa's unanchored regex search.
+    // Mutations: use full-match instead of Mesa's unanchored regex search; treat an invalid regex as global.
     fn vrr_exclusions_mesa_executable_regexp() {
         let tree = TempTree::new();
         let roots = roots(&tree);
@@ -810,10 +799,16 @@ mod tests {
             &path,
             r#"<driconf><application executable_regexp="["><option name="adaptive_sync" value="false"/></application><application executable="vlc"><option name="adaptive_sync" value="false"/></application></driconf>"#,
         );
+        let invalid_regex = VrrExclusions::load(&roots);
         assert_eq!(
-            VrrExclusions::load(&roots).excluded(111, &proc_root),
+            invalid_regex.excluded(111, &proc_root),
             Some(VrrExclusionSource::MesaDriconf),
             "an invalid regex is ignored without losing later entries"
+        );
+        assert_eq!(
+            invalid_regex.excluded(110, &proc_root),
+            None,
+            "an invalid regex does not apply globally to mpv"
         );
     }
 
