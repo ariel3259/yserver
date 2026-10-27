@@ -27,13 +27,13 @@
 
 1. Mixed refresh (240 Hz + 75 Hz): `Output` admitted on the 240 Hz output while `Root` stays rejected — Task 1.
 2. The Present selected the other output's CRTC (window dragged between monitors, or a client choosing a CRTC): composed, never direct, no mis-stamped completion — Task 1.
-3. Two `Output` owners at once (game on one monitor, fullscreen video on the other), each completing in its own CRTC domain; a tearing game on one is not disturbed by the other — Tasks 1–2.
-4. `Root`↔`Output` change (a window goes from spanning the screen to one monitor, or a monitor is unplugged under it): one unflip, one completion per Present, no stale frame — Task 1.
-5. GetImage of the game's region while it is direct on an output at a nonzero origin returns the game's pixels — Task 3.
+3. Two `Output` owners at once (game on one monitor, fullscreen video on the other), each completing in its own CRTC domain; a tearing game on one is not disturbed by the other — Tasks 2–3.
+4. `Root`↔`Output` change (a window goes from spanning the screen to one monitor, or a monitor is unplugged under it): one unflip, one completion per Present, no stale frame — Task 2.
+5. GetImage of the game's region while it is direct on an output at a nonzero origin returns the game's pixels — Task 4.
 
 ---
 
-### Task 1: Scope classification, per-scope admission, transitions
+### Task 1: Scope classification and per-scope admission
 
 **Files:**
 - Modify: `crates/yserver/src/kms/render/backend/kms/present.rs` (`direct_candidate_authoritative_root` ~25, `direct_candidate_gate` ~70, `note_tearing_present` ~151 only as far as Task 1's authority change requires — the arbitration itself is Task 2 — the live admission/successor path including the "scene page flip pending" fallback ~924, probation streak)
@@ -60,17 +60,29 @@
   - `overlapping_output_is_rejected`: two 1920-wide outputs at x=0 and x=960; an output-sized window on output 1 presents → never direct. Mutation: drop the pairwise separation check for `Output`.
   - `output_probe_per_scope`: two equal-sized same-refresh outputs; one pixmap presented by a window covering output 0, then the same window moved to cover output 1 (no topology change) → the recorder saw two TEST_ONLY probes, `(id, Output(0))` with only output 0's plane and `(id, Output(1))` with only output 1's plane; drawable retirement removes both entries. Mutation: key the cache by drawable only.
   - `root_overlay_on_other_output_does_not_block_output_admission`: draw an XOR/Invert root-overlay rectangle on output 0 through the Backend drawing path (assert the root overlay is non-empty) → output 1 still admitted; an overlay rectangle on output 1 → rejected. Mutation: keep `root_overlay.is_empty()`.
-  - `two_output_owners_enter_and_complete_independently`: two windows, each covering one output with its own CRTC selected; both enter direct; each Present completes once in its own CRTC's domain. Mutation: entering a second `Output` owner unflips the first.
-  - `root_to_output_transition_unflips_once` (same-refresh topology): a root-covering window is direct; resized to cover output 1 only → the `Root` owner unflips through the grouped path, its last Present completes once, pins released, then `Output(1)` enters after probation. Mutation: admit `Output(1)` while the `Root` owner is active.
-  - `output_to_root_transition_unflips_every_output_owner`: two `Output` owners; a root-covering Present → both unflip, each completes once, then `Root` enters after probation. Mutation: unflip only the owner on the new Present's selected CRTC.
-  - Extend A1's RANDR teardown test (`tests/randr.rs` ~3754) to enter the `Output` owner through Presents instead of seeding.
   - Single-output and same-refresh dual-`Root` regressions: existing tests unchanged.
 - [ ] **Step 2: Run, verify they fail.**
 - [ ] **Step 3: Implement** as in Interfaces.
 - [ ] **Step 4: Gate**; new tests 20× under load.
 - [ ] **Step 5: Commit** `feat(scanout): admit output-covering Presents as per-output direct owners`.
 
-### Task 2: Cursor and tearing scoped to the owner's outputs
+### Task 2: Transitions and concurrent output owners
+
+**Files:**
+- Modify: `kms/present.rs` (the live admission path from Task 1: the "different kind → unflip existing owners first" rule and entry of a second `Output` owner)
+- Test: `tests/present_scanout.rs`, `tests/commit_identity/direct_unflip.rs`, `tests/randr.rs` (~3754)
+
+**Interfaces:**
+- Consumes: Task 1's `direct_candidate_scope`, per-scope admission, probe seam and two-output fixtures.
+- Produces no new API; it pins Task 1's transition rule and concurrent `Output` owners. If Task 1 already makes a test green, the report shows its mutation failing instead of a RED run.
+- [ ] **Step 1: Failing tests:**
+  - `two_output_owners_enter_and_complete_independently`: two windows, each covering one output with its own CRTC selected; both enter direct; each Present completes once in its own CRTC's domain. Mutation: entering a second `Output` owner unflips the first.
+  - `root_to_output_transition_unflips_once` (same-refresh topology): a root-covering window is direct; resized to cover output 1 only → the `Root` owner unflips through the grouped path, its last Present completes once, pins released, then `Output(1)` enters after probation. Mutation: admit `Output(1)` while the `Root` owner is active.
+  - `output_to_root_transition_unflips_every_output_owner`: two `Output` owners; a root-covering Present → both unflip, each completes once, then `Root` enters after probation. Mutation: unflip only the owner on the new Present's selected CRTC.
+  - Extend A1's RANDR teardown test (`tests/randr.rs` ~3754) to enter the `Output` owner through Presents instead of seeding.
+- [ ] **Step 2–5:** run/fail, implement what the tests require, gate + 20× load, commit `feat(scanout): Root/Output transitions and concurrent output owners`.
+
+### Task 3: Cursor and tearing scoped to the owner's outputs
 
 **Files:**
 - Modify: `kms/scanout.rs` — `bind_direct_cursor_on_outputs` ~588 and the external cursor synchronisation it records ~585, `refresh_direct_cursor_on_all_outputs` ~740, the scheduler's aggregate cursor check (~3876), `direct_frame_flip_timing` (~1586: async is refused while **any** output shows a hardware cursor → only the owner's outputs count), `tearing_cursor_compose_cap_applies` ~3315, `prepare_tearing_scene_pass` ~3610
@@ -81,7 +93,7 @@
 - Test: `tests/cursor_sprites/scene_attach.rs` (`held_direct_with_two_outputs` ~2803), `tests/tearing.rs`
 
 **Interfaces:**
-- Consumes: Task 1 (`direct_cursor_eligible_for`, scopes).
+- Consumes: Tasks 1–2 (`direct_cursor_eligible_for`, scopes).
 - Produces: cursor-mode / external-sync queries take `&[usize]`; the direct path passes `direct_scope_outputs(scope)`. Hardware-cursor suppression and async composed timing apply only to the tearing owner's outputs. One tearing owner at a time (user decision), and an unrelated scope never disturbs it.
 - [ ] **Step 1: Failing tests:**
   - `cursor_image_change_with_pending_ack_on_other_output_keeps_owner`: `Output(1)` owner held; output 0 has a scene frame whose acknowledgement is still pending; the client changes the cursor image (Backend `set_cursor`/DefineCursor path), which triggers the direct bind/refresh for owner 1 → owner 1 not revoked (`cursor_scene_sync_failed` not requested), output 1's cursor plane gets the new image, owner 1 stays current through the following scheduling passes and its next retirement (the cursor mode of output 1 never reads `Mixed`), and output 0's cursor plane gets the image once its frame retires. Mutations: the upload queue marks every hardware-cursor output; keep the all-output pending-acknowledgement check; restore the portable early return for any direct owner.
@@ -91,14 +103,14 @@
   - `second_output_tearing_request_does_not_disturb_owner`: tearing owner on output 1; a second client on output 0 presents async **past the tearing probation** → output 0 is direct with synchronised flips, output 1 still tears (owner unchanged). Mutation: `note_tearing_present` exits the owner on any other authoritative window.
 - [ ] **Step 2–5:** run/fail, implement, gate + 20× load, commit `feat(scanout): direct cursor and tearing scoped to the owner's outputs`.
 
-### Task 3: Readback rebase for `Output` owners
+### Task 4: Readback rebase for `Output` owners
 
 **Files:**
 - Modify: `kms/readback.rs` (`direct_scanout_route_for_rect` ~36)
 - Test: `tests/root_scanout.rs` (model the live GetImage path of `root_get_image_reads_scanout_pixels_not_root_storage` ~340, with Task 1's two-output Present-driven setup)
 
 **Interfaces:**
-- Consumes: Task 1.
+- Consumes: Tasks 1–2.
 - Produces: the root→source rebase subtracts the owner's paint-target origin (for `Output(i)`, output *i*'s origin) as well as `x_off/y_off`.
 - [ ] **Step 1: Failing test** `get_image_of_output_owner_at_nonzero_origin_reads_client_pixels`: an `Output(1)` owner at +1920+0 entered through Presents, source filled with a known pattern; GetImage of a rect inside output 1 returns the pattern; a rect spanning both outputs returns output 0's composed pixels for its part and the client's for the rest. Mutation: rebase by `x_off/y_off` only.
 - [ ] **Step 2–5:** run/fail, implement, gate + 20× load, commit `fix(scanout): readback rebases output-owner reads by the output origin`.
