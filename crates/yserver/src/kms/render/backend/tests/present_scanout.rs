@@ -2208,82 +2208,101 @@ fn stage_present_is_authoritative_again_after_cow_shape_removed() {
     use yserver_protocol::x11::xfixes::RegionRect;
 
     let cow = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
-    let (stage, client, client_source, stage_source) =
-        (0x0040_0033, 0x0040_0037, 0x0040_003b, 0x0040_003f);
-    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
-    let (w, h) = seed_cow_stage(&mut b, stage);
-    seed_window(&mut b, client, None, 0, 0);
-    b.windows.get_mut(&client).unwrap().width = b.platform.fb_w;
-    b.windows.get_mut(&client).unwrap().height = b.platform.fb_h;
-    seed_window(&mut b, client_source, None, 0, 0);
-    retain_direct_frame_from_source_test(
-        &mut b,
-        client_source,
-        client,
-        u16::try_from(w).unwrap(),
-        u16::try_from(h).unwrap(),
-    );
-    Backend::set_shape_rectangles(&mut b, None, cow, 0, Some(&[]))
-        .expect("shape COW Bounding region empty");
-    let (presented, _) = try_present_root_pixmap_for_shape_test(&mut b, 82, stage_source, stage, 0);
-    assert!(!presented);
-    assert!(!b.pstate.scanout_m2.unflip_requested);
+    for (partial_shape, (stage, client, client_source, stage_source), hidden_present_id) in [
+        (
+            false,
+            (0x0040_0033, 0x0040_0037, 0x0040_003b, 0x0040_003f),
+            82,
+        ),
+        (
+            true,
+            (0x0040_0043, 0x0040_0047, 0x0040_004b, 0x0040_004f),
+            84,
+        ),
+    ] {
+        let mut b = crate::kms::render::backend::KmsBackend::for_tests();
+        let (w, h) = seed_cow_stage(&mut b, stage);
+        seed_window(&mut b, client, None, 0, 0);
+        b.windows.get_mut(&client).unwrap().width = b.platform.fb_w;
+        b.windows.get_mut(&client).unwrap().height = b.platform.fb_h;
+        seed_window(&mut b, client_source, None, 0, 0);
+        retain_direct_frame_from_source_test(
+            &mut b,
+            client_source,
+            client,
+            u16::try_from(w).unwrap(),
+            u16::try_from(h).unwrap(),
+        );
+        let current_source = b.pstate.scanout_m2.current.as_ref().unwrap().source_id;
+        let fallback_before = b.pstate.scanout_m2.unflip_fallback_source;
 
-    Backend::set_shape_rectangles(&mut b, None, cow, 0, None).expect("remove COW Bounding shape");
-    let (presented, source_id) =
-        try_present_root_pixmap_for_shape_test(&mut b, 83, stage_source + 1, stage, 1);
-    assert!(
-        !presented,
-        "the independent x offset gate rejects this Present"
-    );
-    assert!(b.pstate.scanout_m2.unflip_requested);
-    assert_eq!(
-        b.pstate.scanout_m2.unflip_reason,
-        Some("ineligible_authoritative_root_present")
-    );
-    assert_eq!(b.pstate.scanout_m2.unflip_fallback_source, Some(source_id));
+        Backend::set_shape_rectangles(&mut b, None, cow, 0, Some(&[]))
+            .expect("shape COW Bounding region empty");
+        let (presented, hidden_source_id) = try_present_root_pixmap_for_shape_test(
+            &mut b,
+            hidden_present_id,
+            stage_source,
+            stage,
+            0,
+        );
+        assert!(
+            !presented,
+            "the hidden stage Present is not direct-eligible"
+        );
+        assert_eq!(
+            b.pstate
+                .scanout_m2
+                .current
+                .as_ref()
+                .map(|frame| frame.source_id),
+            Some(current_source),
+            "the fullscreen client's direct frame remains current while hidden"
+        );
+        assert!(!b.pstate.scanout_m2.unflip_requested);
+        assert_ne!(
+            b.pstate.scanout_m2.unflip_last_reason,
+            Some("ineligible_authoritative_root_present")
+        );
+        assert_eq!(b.pstate.scanout_m2.unflip_fallback_source, fallback_before);
+        assert_ne!(hidden_source_id, current_source);
 
-    let (stage, client, client_source, stage_source) =
-        (0x0040_0043, 0x0040_0047, 0x0040_004b, 0x0040_004f);
-    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
-    let (w, h) = seed_cow_stage(&mut b, stage);
-    seed_window(&mut b, client, None, 0, 0);
-    b.windows.get_mut(&client).unwrap().width = b.platform.fb_w;
-    b.windows.get_mut(&client).unwrap().height = b.platform.fb_h;
-    seed_window(&mut b, client_source, None, 0, 0);
-    retain_direct_frame_from_source_test(
-        &mut b,
-        client_source,
-        client,
-        u16::try_from(w).unwrap(),
-        u16::try_from(h).unwrap(),
-    );
-    Backend::set_shape_rectangles(
-        &mut b,
-        None,
-        cow,
-        0,
-        Some(&[RegionRect {
-            x: 0,
-            y: 0,
-            width: u16::try_from(w).unwrap() / 2,
-            height: u16::try_from(h).unwrap(),
-        }]),
-    )
-    .expect("set partial COW Bounding shape");
-    let (presented, source_id) =
-        try_present_root_pixmap_for_shape_test(&mut b, 84, stage_source, stage, 1);
+        if partial_shape {
+            Backend::set_shape_rectangles(
+                &mut b,
+                None,
+                cow,
+                0,
+                Some(&[RegionRect {
+                    x: 0,
+                    y: 0,
+                    width: u16::try_from(w).unwrap() / 2,
+                    height: u16::try_from(h).unwrap(),
+                }]),
+            )
+            .expect("set partial COW Bounding shape");
+        } else {
+            Backend::set_shape_rectangles(&mut b, None, cow, 0, None)
+                .expect("remove COW Bounding shape");
+        }
+        let (presented, source_id) = try_present_root_pixmap_for_shape_test(
+            &mut b,
+            hidden_present_id + 1,
+            stage_source + 1,
+            stage,
+            1,
+        );
 
-    assert!(
-        !presented,
-        "the independent x offset gate rejects this Present"
-    );
-    assert!(b.pstate.scanout_m2.unflip_requested);
-    assert_eq!(
-        b.pstate.scanout_m2.unflip_reason,
-        Some("ineligible_authoritative_root_present")
-    );
-    assert_eq!(b.pstate.scanout_m2.unflip_fallback_source, Some(source_id));
+        assert!(
+            !presented,
+            "the independent x offset gate rejects this Present"
+        );
+        assert!(b.pstate.scanout_m2.unflip_requested);
+        assert_eq!(
+            b.pstate.scanout_m2.unflip_reason,
+            Some("ineligible_authoritative_root_present")
+        );
+        assert_eq!(b.pstate.scanout_m2.unflip_fallback_source, Some(source_id));
+    }
 }
 
 #[test]

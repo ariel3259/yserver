@@ -71,16 +71,7 @@ pub(in crate::kms::render::backend) fn scanout_direct_eligible(
     // source crop proven valid.
 }
 
-/// Whether no Bounding or Clip shape on `leaf_xid` or any ancestor up to the
-/// root (the COW included) removes part of the `root` rect.
-///
-/// Xorg flips a Present only when the window's `clipList` equals the root's
-/// `winSize` (`present/present_scmd.c:102`), and every shape in the chain
-/// narrows that clip list (`SetWinSize`, `dix/window.c:1713`, propagated to
-/// descendants by `miComputeClips`). Muffin's lock screen is the load-bearing
-/// case: it shapes the COW to an EMPTY region and unredirects the locker, so
-/// its stage's Presents are clipped to nothing and the locker below shows.
-/// Shape rects are relative to each window's content origin.
+/// Returns the leaf-to-top-level chain with absolute content origins, or `None` if unresolved.
 fn direct_shape_chain_root_offsets(
     windows: &WindowsMap,
     root_window_id: u32,
@@ -110,6 +101,16 @@ fn direct_shape_chain_root_offsets(
     Some(chain)
 }
 
+/// Whether no Bounding or Clip shape on `leaf_xid` or any ancestor up to the
+/// root (the COW included) removes part of the `root` rect.
+///
+/// Xorg flips a Present only when the window's `clipList` equals the root's
+/// `winSize` (`present/present_scmd.c:102`), and every shape in the chain
+/// narrows that clip list (`SetWinSize`, `dix/window.c:1713`, propagated to
+/// descendants by `miComputeClips`). Muffin's lock screen is the load-bearing
+/// case: it shapes the COW to an EMPTY region and unredirects the locker, so
+/// its stage's Presents are clipped to nothing and the locker below shows.
+/// Shape rects are relative to each window's content origin.
 fn direct_shape_chain_covers_root(
     windows: &WindowsMap,
     root_window_id: u32,
