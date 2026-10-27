@@ -71,6 +71,36 @@ pub(in crate::kms::render::backend) fn scanout_direct_eligible(
     // source crop proven valid.
 }
 
+/// Returns the leaf-to-top-level chain with absolute content origins, or `None` if unresolved.
+fn direct_shape_chain_root_offsets(
+    windows: &WindowsMap,
+    root_window_id: u32,
+    leaf_xid: u32,
+) -> Option<Vec<(u32, i32, i32)>> {
+    let mut chain = Vec::new();
+    let mut xid = leaf_xid;
+    // Resource validation prevents cycles in production; stay bounded anyway.
+    for _ in 0..=windows.len() {
+        let geometry = windows.get(&xid)?;
+        let bw = i32::from(geometry.border_width);
+        chain.push((xid, i32::from(geometry.x) + bw, i32::from(geometry.y) + bw));
+        match geometry.parent {
+            None => break,
+            Some(parent) if parent == root_window_id => break,
+            Some(parent) => xid = parent,
+        }
+    }
+
+    let (mut abs_x, mut abs_y) = (0, 0);
+    for (_, x, y) in chain.iter_mut().rev() {
+        abs_x += *x;
+        abs_y += *y;
+        *x = abs_x;
+        *y = abs_y;
+    }
+    Some(chain)
+}
+
 /// Whether no Bounding or Clip shape on `leaf_xid` or any ancestor up to the
 /// root (the COW included) removes part of the `root` rect.
 ///
@@ -91,21 +121,9 @@ fn direct_shape_chain_covers_root(
 ) -> bool {
     use crate::kms::render::region::Region;
 
-    let mut chain = Vec::new();
-    let mut xid = leaf_xid;
-    // Resource validation prevents cycles in production; stay bounded anyway.
-    for _ in 0..=windows.len() {
-        let Some(geometry) = windows.get(&xid) else {
-            return false;
-        };
-        let bw = i32::from(geometry.border_width);
-        chain.push((xid, i32::from(geometry.x) + bw, i32::from(geometry.y) + bw));
-        match geometry.parent {
-            None => break,
-            Some(parent) if parent == root_window_id => break,
-            Some(parent) => xid = parent,
-        }
-    }
+    let Some(chain) = direct_shape_chain_root_offsets(windows, root_window_id, leaf_xid) else {
+        return false;
+    };
     let root_rect = vk::Rect2D {
         offset: vk::Offset2D::default(),
         extent: vk::Extent2D {
@@ -113,10 +131,7 @@ fn direct_shape_chain_covers_root(
             height: root.1,
         },
     };
-    let (mut abs_x, mut abs_y) = (0, 0);
-    for &(xid, x, y) in chain.iter().rev() {
-        abs_x += x;
-        abs_y += y;
+    for &(xid, abs_x, abs_y) in chain.iter().rev() {
         for shapes in [shape_bounding, shape_clip] {
             let Some(rects) = shapes.get(&xid) else {
                 continue;
@@ -142,6 +157,51 @@ fn direct_shape_chain_covers_root(
         }
     }
     true
+}
+
+fn direct_shape_chain_hides_root(
+    windows: &WindowsMap,
+    root_window_id: u32,
+    shape_bounding: &HashMap<u32, Vec<xfixes::RegionRect>>,
+    shape_clip: &HashMap<u32, Vec<xfixes::RegionRect>>,
+    leaf_xid: u32,
+    root: (u32, u32),
+) -> bool {
+    use crate::kms::render::region::Region;
+
+    let Some(chain) = direct_shape_chain_root_offsets(windows, root_window_id, leaf_xid) else {
+        return false;
+    };
+    let root_rect = vk::Rect2D {
+        offset: vk::Offset2D::default(),
+        extent: vk::Extent2D {
+            width: root.0,
+            height: root.1,
+        },
+    };
+    let root_region = Region::from_rect(root_rect);
+    for &(xid, abs_x, abs_y) in chain.iter().rev() {
+        for shapes in [shape_bounding, shape_clip] {
+            let Some(rects) = shapes.get(&xid) else {
+                continue;
+            };
+            if rects.iter().all(|rect| {
+                !root_region.intersects_rect(vk::Rect2D {
+                    offset: vk::Offset2D {
+                        x: abs_x + i32::from(rect.x),
+                        y: abs_y + i32::from(rect.y),
+                    },
+                    extent: vk::Extent2D {
+                        width: u32::from(rect.width),
+                        height: u32::from(rect.height),
+                    },
+                })
+            }) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Decide, per output, whether a CRTC is displaying a directly-flipped client
@@ -2439,6 +2499,21 @@ impl KmsBackend {
         root: (u32, u32),
     ) -> bool {
         direct_shape_chain_covers_root(
+            &self.windows,
+            self.core.window_id,
+            &self.core.shape_bounding,
+            &self.core.shape_clip,
+            leaf_xid,
+            root,
+        )
+    }
+
+    pub(in crate::kms::render::backend) fn direct_shape_chain_hides_root(
+        &self,
+        leaf_xid: u32,
+        root: (u32, u32),
+    ) -> bool {
+        direct_shape_chain_hides_root(
             &self.windows,
             self.core.window_id,
             &self.core.shape_bounding,

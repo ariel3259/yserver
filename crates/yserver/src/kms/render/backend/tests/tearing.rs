@@ -3127,6 +3127,56 @@ fn cow_descendant_composed_tearing_stays_on_across_passes() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: a hidden COW stage Present exits tearing or requests a direct unflip.
+fn hidden_cow_stage_present_does_not_exit_tearing() {
+    use yserver_core::backend::Backend;
+
+    let Some(mut backend) = live_scene_backend() else {
+        return;
+    };
+    let recorder = recording_sink(&mut backend, 0);
+    let cow = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+    let (client, stage) = (0x7851, 0x7852);
+    let root = backend.core.window_id;
+    super::seed_window(&mut backend, client, None, 0, 0);
+    super::seed_window(&mut backend, cow, Some(root), 0, 0);
+    super::seed_window(&mut backend, stage, Some(cow), 0, 0);
+    for xid in [client, cow, stage] {
+        let geometry = backend.windows.get_mut(&xid).expect("COW tree member");
+        geometry.width = backend.platform.fb_w;
+        geometry.height = backend.platform.fb_h;
+    }
+    let _state = enter_tearing_without_direct_scanout(&mut backend, client, 12_950);
+    assert!(backend.pstate.tearing.is_on());
+    recorder.clear_records();
+    Backend::set_shape_rectangles(&mut backend, None, cow, 0, Some(&[]))
+        .expect("shape COW Bounding region empty");
+
+    let (width, height) = backend.platform.fb_dimensions();
+    assert!(
+        try_direct_present_for_window(
+            &mut backend,
+            13_000,
+            stage,
+            width,
+            height,
+            yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+        )
+        .is_none(),
+        "a shaped-away stage Present must not submit as direct scanout"
+    );
+
+    assert!(backend.pstate.tearing.is_on());
+    assert!(!backend.pstate.scanout_m2.unflip_requested);
+    assert_ne!(
+        backend.pstate.scanout_m2.unflip_last_reason,
+        Some("ineligible_authoritative_root_present")
+    );
+    assert!(recorder.records().is_empty());
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutations: reset M2 probation for cursor-only Copies while tearing is on, or stop a limited compositor Present from resetting normal M2 probation.
 fn cursor_only_ineligibility_does_not_reset_direct_probation_while_on() {
     use yserver_core::{backend::Backend, resources::COMPOSITE_OVERLAY_WINDOW};

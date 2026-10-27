@@ -2025,6 +2025,320 @@ fn seed_cow_stage(b: &mut crate::kms::render::backend::KmsBackend, stage: u32) -
     (u32::from(w), u32::from(h))
 }
 
+fn try_present_root_pixmap_for_shape_test(
+    backend: &mut crate::kms::render::backend::KmsBackend,
+    present_id: u64,
+    source_xid: u32,
+    target_xid: u32,
+    x_off: i16,
+) -> (bool, crate::kms::render::store::DrawableId) {
+    use crate::kms::render::store::{DrawableKind, Storage};
+    use yserver_core::backend::{
+        Backend, CompletedPresentEvent, PresentScanoutCandidate, PresentWake,
+    };
+
+    let width = backend.platform.fb_w;
+    let height = backend.platform.fb_h;
+    let source_id = backend
+        .store
+        .allocate(
+            source_xid,
+            DrawableKind::Pixmap,
+            24,
+            false,
+            Storage::for_tests_null(
+                ash::vk::Extent2D {
+                    width: u32::from(width),
+                    height: u32::from(height),
+                },
+                ash::vk::Format::B8G8R8A8_UNORM,
+            ),
+        )
+        .expect("allocate root-sized test Present pixmap");
+    let crtc_id = u32::from(backend.platform.outputs[0].output.crtc);
+    bind_test_randr_crtc(backend, 0, crtc_id);
+    let crtc_epoch = backend.present_crtc_clock_epoch(crtc_id);
+    let candidate = PresentScanoutCandidate {
+        client_id: 1,
+        present_id,
+        crtc_id,
+        crtc_epoch,
+        src_pixmap_xid: source_xid,
+        dst_window_xid: target_xid,
+        variable_refresh: false,
+        src_host_xid: source_xid,
+        paint_dst_host_xid: target_xid,
+        completion_dst_host_xid: target_xid,
+        src_width: width,
+        src_height: height,
+        x_off,
+        y_off: 0,
+        valid_region_xid: 0,
+        update_region_xid: 0,
+        update_is_full: true,
+        explicit_sync: false,
+        options: 0,
+    };
+    let event = CompletedPresentEvent {
+        client_id: yserver_protocol::x11::ClientId(1),
+        serial: u32::try_from(present_id).expect("test Present serial fits"),
+        host_xid: source_xid,
+        dst_host_xid: target_xid,
+        options: 0,
+        present_id,
+        window_generation: 1,
+        crtc_id,
+        crtc_epoch,
+        msc_offset: 0,
+        completion_clock: None,
+        wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+        completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+        emit_idle: true,
+    };
+    let presented = Backend::try_present_direct(backend, candidate, event)
+        .expect("try root-sized Present through the backend entry point");
+    (presented, source_id)
+}
+
+#[test]
+// Mutation: make the hidden-shape predicate return false for every chain.
+fn direct_shape_chain_hides_root_only_when_a_shape_misses_the_root() {
+    use yserver_protocol::x11::xfixes::RegionRect;
+
+    let cow = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+    let stage = 0x0040_0013;
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
+    let root = seed_cow_stage(&mut b, stage);
+    let (w, h) = (
+        u16::try_from(root.0).unwrap(),
+        u16::try_from(root.1).unwrap(),
+    );
+    let rect = |x: i16, width: u16| RegionRect {
+        x,
+        y: 0,
+        width,
+        height: h,
+    };
+    let root_width_i16 = i16::try_from(w).unwrap();
+    let hides =
+        |b: &crate::kms::render::backend::KmsBackend| b.direct_shape_chain_hides_root(stage, root);
+
+    assert!(!hides(&b), "unshaped chain");
+    b.core.shape_bounding.insert(cow, Vec::new());
+    assert!(hides(&b), "empty COW Bounding shape");
+    b.core.shape_bounding.remove(&cow);
+    b.core.shape_clip.insert(stage, Vec::new());
+    assert!(hides(&b), "empty stage Clip shape");
+    b.core.shape_clip.remove(&stage);
+    b.core
+        .shape_bounding
+        .insert(cow, vec![rect(root_width_i16, w)]);
+    assert!(hides(&b), "COW Bounding rect entirely right of root");
+    b.core.shape_bounding.insert(cow, vec![rect(0, w / 2)]);
+    assert!(!hides(&b), "partial COW Bounding shape");
+    b.core.shape_bounding.insert(cow, vec![rect(0, w)]);
+    assert!(!hides(&b), "root-sized COW Bounding shape");
+
+    b.core.shape_bounding.remove(&cow);
+    b.windows.get_mut(&stage).unwrap().x = root_width_i16;
+    b.core
+        .shape_clip
+        .insert(stage, vec![rect(-root_width_i16, w)]);
+    assert!(
+        !hides(&b),
+        "translated stage Clip lands on root; skipping translation would hide it"
+    );
+    b.core.shape_clip.insert(stage, vec![rect(0, w)]);
+    assert!(
+        hides(&b),
+        "translated stage Clip lands right of root; skipping translation would show it"
+    );
+}
+
+#[test]
+// Mutation: a shaped-away COW stage Present still requests a direct unflip.
+fn hidden_cow_stage_present_keeps_unredirected_direct_frame() {
+    use yserver_core::backend::Backend;
+
+    let cow = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+    let (stage, client, client_source, stage_source) =
+        (0x0040_0023, 0x0040_0027, 0x0040_002b, 0x0040_002f);
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
+    let (w, h) = seed_cow_stage(&mut b, stage);
+    seed_window(&mut b, client, None, 0, 0);
+    b.windows.get_mut(&client).unwrap().width = b.platform.fb_w;
+    b.windows.get_mut(&client).unwrap().height = b.platform.fb_h;
+    seed_window(&mut b, client_source, None, 0, 0);
+    retain_direct_frame_from_source_test(
+        &mut b,
+        client_source,
+        client,
+        u16::try_from(w).unwrap(),
+        u16::try_from(h).unwrap(),
+    );
+    let current_source = b.pstate.scanout_m2.current.as_ref().unwrap().source_id;
+    let fallback_before = b.pstate.scanout_m2.unflip_fallback_source;
+
+    Backend::set_shape_rectangles(&mut b, None, cow, 0, Some(&[]))
+        .expect("shape COW Bounding region empty");
+    let (presented, stage_source_id) =
+        try_present_root_pixmap_for_shape_test(&mut b, 81, stage_source, stage, 0);
+
+    assert!(!presented, "a hidden stage Present is not direct-eligible");
+    assert_eq!(
+        b.pstate
+            .scanout_m2
+            .current
+            .as_ref()
+            .map(|frame| frame.source_id),
+        Some(current_source),
+        "the fullscreen client's direct frame remains current"
+    );
+    assert!(!b.pstate.scanout_m2.unflip_requested);
+    assert_ne!(
+        b.pstate.scanout_m2.unflip_last_reason,
+        Some("ineligible_authoritative_root_present")
+    );
+    assert_eq!(b.pstate.scanout_m2.unflip_fallback_source, fallback_before);
+    assert_ne!(stage_source_id, current_source);
+}
+
+#[test]
+// Mutation: classify a partial COW Bounding shape as hiding the root.
+fn stage_present_is_authoritative_again_after_cow_shape_removed() {
+    use yserver_core::backend::Backend;
+    use yserver_protocol::x11::xfixes::RegionRect;
+
+    let cow = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+    for (partial_shape, (stage, client, client_source, stage_source), hidden_present_id) in [
+        (
+            false,
+            (0x0040_0033, 0x0040_0037, 0x0040_003b, 0x0040_003f),
+            82,
+        ),
+        (
+            true,
+            (0x0040_0043, 0x0040_0047, 0x0040_004b, 0x0040_004f),
+            84,
+        ),
+    ] {
+        let mut b = crate::kms::render::backend::KmsBackend::for_tests();
+        let (w, h) = seed_cow_stage(&mut b, stage);
+        seed_window(&mut b, client, None, 0, 0);
+        b.windows.get_mut(&client).unwrap().width = b.platform.fb_w;
+        b.windows.get_mut(&client).unwrap().height = b.platform.fb_h;
+        seed_window(&mut b, client_source, None, 0, 0);
+        retain_direct_frame_from_source_test(
+            &mut b,
+            client_source,
+            client,
+            u16::try_from(w).unwrap(),
+            u16::try_from(h).unwrap(),
+        );
+        let current_source = b.pstate.scanout_m2.current.as_ref().unwrap().source_id;
+        let fallback_before = b.pstate.scanout_m2.unflip_fallback_source;
+
+        Backend::set_shape_rectangles(&mut b, None, cow, 0, Some(&[]))
+            .expect("shape COW Bounding region empty");
+        let (presented, hidden_source_id) = try_present_root_pixmap_for_shape_test(
+            &mut b,
+            hidden_present_id,
+            stage_source,
+            stage,
+            0,
+        );
+        assert!(
+            !presented,
+            "the hidden stage Present is not direct-eligible"
+        );
+        assert_eq!(
+            b.pstate
+                .scanout_m2
+                .current
+                .as_ref()
+                .map(|frame| frame.source_id),
+            Some(current_source),
+            "the fullscreen client's direct frame remains current while hidden"
+        );
+        assert!(!b.pstate.scanout_m2.unflip_requested);
+        assert_ne!(
+            b.pstate.scanout_m2.unflip_last_reason,
+            Some("ineligible_authoritative_root_present")
+        );
+        assert_eq!(b.pstate.scanout_m2.unflip_fallback_source, fallback_before);
+        assert_ne!(hidden_source_id, current_source);
+
+        if partial_shape {
+            Backend::set_shape_rectangles(
+                &mut b,
+                None,
+                cow,
+                0,
+                Some(&[RegionRect {
+                    x: 0,
+                    y: 0,
+                    width: u16::try_from(w).unwrap() / 2,
+                    height: u16::try_from(h).unwrap(),
+                }]),
+            )
+            .expect("set partial COW Bounding shape");
+        } else {
+            Backend::set_shape_rectangles(&mut b, None, cow, 0, None)
+                .expect("remove COW Bounding shape");
+        }
+        let (presented, source_id) = try_present_root_pixmap_for_shape_test(
+            &mut b,
+            hidden_present_id + 1,
+            stage_source + 1,
+            stage,
+            1,
+        );
+
+        assert!(
+            !presented,
+            "the independent x offset gate rejects this Present"
+        );
+        assert!(b.pstate.scanout_m2.unflip_requested);
+        assert_eq!(
+            b.pstate.scanout_m2.unflip_reason,
+            Some("ineligible_authoritative_root_present")
+        );
+        assert_eq!(b.pstate.scanout_m2.unflip_fallback_source, Some(source_id));
+    }
+}
+
+#[test]
+// Mutation: apply the COW hidden-shape authority rule to Unredirected targets.
+fn hidden_unredirected_present_still_invalidates_direct_frame() {
+    use yserver_core::backend::Backend;
+
+    let (current_client, candidate_client, current_source, candidate_source) =
+        (0x0040_0053, 0x0040_0057, 0x0040_005b, 0x0040_005f);
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
+    let (w, h) = (b.platform.fb_w, b.platform.fb_h);
+    for xid in [current_client, candidate_client] {
+        seed_window(&mut b, xid, None, 0, 0);
+        let geometry = b.windows.get_mut(&xid).unwrap();
+        geometry.width = w;
+        geometry.height = h;
+    }
+    seed_window(&mut b, current_source, None, 0, 0);
+    retain_direct_frame_from_source_test(&mut b, current_source, current_client, w, h);
+    Backend::set_shape_rectangles(&mut b, None, candidate_client, 0, Some(&[]))
+        .expect("shape the candidate Unredirected window empty");
+
+    let (presented, source_id) =
+        try_present_root_pixmap_for_shape_test(&mut b, 85, candidate_source, candidate_client, 1);
+
+    assert!(!presented);
+    assert!(b.pstate.scanout_m2.unflip_requested);
+    assert_eq!(
+        b.pstate.scanout_m2.unflip_reason,
+        Some("ineligible_authoritative_root_present")
+    );
+    assert_eq!(b.pstate.scanout_m2.unflip_fallback_source, Some(source_id));
+}
+
 /// Xorg flips a Present only when the window's clip list is the root's
 /// `winSize` (`present/present_scmd.c:102`), and a Bounding or Clip shape
 /// on the window or any ancestor narrows that clip list (`SetWinSize`,
