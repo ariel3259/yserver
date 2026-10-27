@@ -42,7 +42,7 @@ This spec is PR A (point 4 of the VRR order agreed on 2026-10-20). PR B (point 3
 6. **Present semantics unchanged.** CompleteNotify/IdleNotify for a direct frame use that frame's CRTC clock (`completion_output_idx`), as today; for an `Output(i)` frame that is CRTC *i*. MSC and UST for windows on composed outputs are unaffected.
 7. **Cursor.** The direct-mode cursor rules (hardware cursor required, cursor-only commits while a direct frame is held, the VRR cursor deadline) apply per output: the cursor on a composed output behaves exactly as with no direct frame.
 8. **VRR follows the per-output state with no new rule** (`live_direct_vrr_wanted_by_output` already reads per output). Making the VRR policy correct with several outputs on (composed outputs always carry `VRR_ENABLED=0`, the cursor deadline only on the VRR output) is PR B.
-9. **Tearing** (async flips) stays bound to one direct frame: the tearing owner is the direct frame of one output, and its rules apply to that output's CRTC only. (Controller's call; a second tearing owner is not needed for the user's case.)
+9. **Tearing has one owner (user decision 2026-10-27).** Tearing (`PresentOptionAsync` served with async flips) stays bound to ONE direct frame at a time, as today: the tearing owner is the direct frame of one output, and its rules (entry, exit, cursor handoff) apply to that output's CRTC only. A second output's direct client that also asks for tearing while the owner exists stays direct but flips synchronised to its own vblank; it can become the owner once the first stops tearing. **This limitation is documented to users** (see Documentation) and stated in the PR description.
 
 ### Reuse
 
@@ -58,8 +58,13 @@ This spec is PR A (point 4 of the VRR order agreed on 2026-10-20). PR B (point 3
 - A window spanning parts of two outputs (neither `Root` nor `Output`): composed, as today.
 - Mirrored or overlapping outputs, transformed outputs (page flipping stays off while any CRTC is transformed, as today), outputs whose mode size differs from their RANDR size.
 - Overlay planes, scaling, a direct buffer smaller than the output.
-- Two tearing owners at once.
+- Two tearing owners at once (documented limitation, design item 9).
 - Any change to single-monitor behaviour.
+
+## Documentation
+
+- `docs/status.md` (and `docs/high-level-design.md` where it describes direct scanout): direct scanout is per output; tearing serves one direct output at a time — a second fullscreen client on another monitor that disables V-Sync gets synchronised flips while the first one tears.
+- The PR description repeats the limitation.
 
 ## Must keep working
 
