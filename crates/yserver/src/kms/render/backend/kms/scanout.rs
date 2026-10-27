@@ -350,6 +350,25 @@ impl KmsBackend {
         }
     }
 
+    pub(in crate::kms::render::backend) fn direct_root_overlay_empty_for_outputs(
+        &self,
+        output_indices: &[usize],
+    ) -> bool {
+        output_indices.iter().all(|&output_idx| {
+            self.platform.outputs.get(output_idx).is_some_and(|output| {
+                self.scene
+                    .root_overlay
+                    .apply_list_for_output((
+                        output.x,
+                        output.y,
+                        u32::from(output.width),
+                        u32::from(output.height),
+                    ))
+                    .is_empty()
+            })
+        })
+    }
+
     pub(in crate::kms::render::backend) fn output_is_direct(&self, output_idx: usize) -> bool {
         if output_idx >= self.platform.outputs.len() {
             return false;
@@ -2624,19 +2643,7 @@ impl KmsBackend {
             return;
         };
         let output_indices = self.direct_scope_outputs(scope);
-        let root_overlay_empty = output_indices.iter().all(|&output_idx| {
-            self.platform.outputs.get(output_idx).is_some_and(|output| {
-                self.scene
-                    .root_overlay
-                    .apply_list_for_output((
-                        output.x,
-                        output.y,
-                        u32::from(output.width),
-                        u32::from(output.height),
-                    ))
-                    .is_empty()
-            })
-        });
+        let root_overlay_empty = self.direct_root_overlay_empty_for_outputs(&output_indices);
         if self.platform.any_output_transformed()
             || !self.direct_present_crtc_eligible(scope, candidate.crtc_id, candidate.crtc_epoch)
             || !scanout_m1_probe_eligible(
@@ -3162,19 +3169,7 @@ impl KmsBackend {
             .unwrap_or_default();
         let cursor_mode = self.scene.cursor_mode_for_outputs(&scope_outputs);
         let cursor_hw = self.direct_cursor_eligible_for(&scope_outputs);
-        let root_overlay_empty = scope_outputs.iter().all(|&output_idx| {
-            self.platform.outputs.get(output_idx).is_some_and(|output| {
-                self.scene
-                    .root_overlay
-                    .apply_list_for_output((
-                        output.x,
-                        output.y,
-                        u32::from(output.width),
-                        u32::from(output.height),
-                    ))
-                    .is_empty()
-            })
-        });
+        let root_overlay_empty = self.direct_root_overlay_empty_for_outputs(&scope_outputs);
         // Page flipping is off while any CRTC is transformed
         // (modesetting/present.c:266).
         let untransformed = !self.platform.any_output_transformed();

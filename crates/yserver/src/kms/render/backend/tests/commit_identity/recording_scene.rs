@@ -154,13 +154,7 @@ impl RecordingSceneFixture {
         screen_size: (u16, u16),
         outputs: &[(i32, i32, u16, u16, u32)],
     ) -> Result<Option<Self>, String> {
-        let backend = build_recording_scene_backend_with_geometry(
-            outputs.len(),
-            false,
-            false,
-            screen_size,
-            outputs,
-        )?;
+        let backend = build_recording_scene_backend_with_geometry(false, screen_size, outputs)?;
         Ok(backend.map(|backend| Self {
             events: AtomicEventFixture::from_backend(backend),
             readiness: None,
@@ -1001,8 +995,6 @@ pub(in crate::kms::render::backend::tests) fn build_recording_scene_backend(
         _ => return Err("unsupported recording scene fixture topology".to_owned()),
     };
     build_recording_scene_backend_with_geometry(
-        output_count,
-        dead_zone,
         second_output_uses_second_device,
         screen_size,
         &outputs,
@@ -1010,13 +1002,12 @@ pub(in crate::kms::render::backend::tests) fn build_recording_scene_backend(
 }
 
 pub(in crate::kms::render::backend::tests) fn build_recording_scene_backend_with_geometry(
-    output_count: usize,
-    dead_zone: bool,
     second_output_uses_second_device: bool,
     screen_size: (u16, u16),
     output_geometry: &[(i32, i32, u16, u16, u32)],
 ) -> Result<Option<KmsBackend>, String> {
     init_tearing_test_logger();
+    let output_count = output_geometry.len();
     let mut backend = match KmsBackend::for_tests_with_vk_dimensions(screen_size.0, screen_size.1) {
         Ok(backend) => backend,
         Err(error) if is_expected_vulkan_absence(&error) => {
@@ -1048,7 +1039,6 @@ pub(in crate::kms::render::backend::tests) fn build_recording_scene_backend_with
             super::super::push_test_output(&mut backend, 201);
         }
     }
-    debug_assert_eq!(output_geometry.len(), output_count);
     for (layout, &(x, y, width, height, refresh)) in
         backend.platform.outputs.iter_mut().zip(output_geometry)
     {
@@ -1061,7 +1051,6 @@ pub(in crate::kms::render::backend::tests) fn build_recording_scene_backend_with
         layout.output.picked.vrefresh = refresh;
         layout.output.modes = vec![layout.output.picked.clone()];
     }
-    let _ = dead_zone;
     backend
         .pstate
         .direct
