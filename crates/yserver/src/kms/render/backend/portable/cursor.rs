@@ -726,16 +726,8 @@ impl<P: Platform> XBackend<P> {
             let queued_outputs: Vec<_> = (0..output_count)
                 .filter(|output_idx| !refreshed_direct_outputs.contains(output_idx))
                 .collect();
-            let refreshes_hw_binding = self
-                .scene
+            self.scene
                 .queue_steady_state_cursor_upload(record.version, &queued_outputs);
-            if refreshes_hw_binding {
-                P::request_direct_unflip_for_outputs(
-                    self,
-                    &queued_outputs,
-                    "direct_cursor_refresh_failed",
-                );
-            }
         }
         // The scene blit ordering: register_cursor already marks
         // scene_structure_dirty so the next tick repaints; no extra

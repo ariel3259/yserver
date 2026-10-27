@@ -98,13 +98,6 @@ pub trait Platform: OutputSink + Sized + 'static {
     fn exit_tearing_for_window(_b: &mut XBackend<Self>, _host_xid: u32, _reason: &'static str) {}
     /// Leave direct scanout for the composed scene.
     fn request_direct_unflip(_b: &mut XBackend<Self>, _reason: &'static str) {}
-    /// Unflip only direct owners whose outputs need a composed cursor upload.
-    fn request_direct_unflip_for_outputs(
-        _b: &mut XBackend<Self>,
-        _output_indices: &[usize],
-        _reason: &'static str,
-    ) {
-    }
     /// Hand cursor visibility back from the tearing owner's outputs.
     fn request_tearing_cursor_handoff(_b: &mut XBackend<Self>) {}
     /// Whether every direct frame is the COW or one of its descendants.

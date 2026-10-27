@@ -166,14 +166,6 @@ impl Platform for PlatformBackend {
         b.request_direct_unflip(reason);
     }
 
-    fn request_direct_unflip_for_outputs(
-        b: &mut KmsBackend,
-        output_indices: &[usize],
-        reason: &'static str,
-    ) {
-        b.request_direct_unflip_for_outputs(output_indices, reason);
-    }
-
     fn request_tearing_cursor_handoff(b: &mut KmsBackend) {
         b.request_tearing_cursor_handoff();
     }
