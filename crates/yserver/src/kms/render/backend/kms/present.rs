@@ -140,19 +140,7 @@ impl KmsBackend {
                     .unredirected_direct_scene_eligible(candidate.paint_dst_host_xid, direct_rect));
         let outputs = self.direct_scope_outputs(scope);
         let cursor_hw = !include_cursor_term || self.direct_cursor_eligible_for(&outputs);
-        let root_overlay_empty = outputs.iter().all(|&output_idx| {
-            self.platform.outputs.get(output_idx).is_some_and(|output| {
-                self.scene
-                    .root_overlay
-                    .apply_list_for_output((
-                        output.x,
-                        output.y,
-                        u32::from(output.width),
-                        u32::from(output.height),
-                    ))
-                    .is_empty()
-            })
-        });
+        let root_overlay_empty = self.direct_root_overlay_empty_for_outputs(&outputs);
         !self.platform.any_output_transformed()
             && self.direct_present_crtc_eligible(scope, candidate.crtc_id, candidate.crtc_epoch)
             && scanout_direct_eligible(
@@ -935,8 +923,8 @@ impl KmsBackend {
             // currently scanned root-stage buffer remains authoritative until
             // Muffin presents its next root frame. Unflipping for every child
             // Present turns playback into direct/composed thrash. Only an
-            // ineligible authoritative-root successor invalidates the direct
-            // ownership contract and must expose the Copy fallback.
+            // ineligible authoritative successor within the candidate's scope
+            // invalidates that owner and must expose its Copy fallback.
             if authoritative_root && !(self.pstate.tearing.is_on() && tearing_gate_ignoring_cursor)
             {
                 self.pstate
@@ -947,6 +935,23 @@ impl KmsBackend {
                 if self.pstate.direct.root().active() {
                     self.pstate.direct.root_mut().unflip_fallback_source = source_id;
                     self.pstate.direct.root_mut().unflip_shadow_ready = false;
+                }
+            } else if let Some(scope @ DirectScope::Output(_)) = candidate_scope
+                && !(self.pstate.tearing.is_on() && tearing_gate_ignoring_cursor)
+            {
+                if let Some(owner) = self.pstate.direct.get_mut(scope) {
+                    owner.reset_eligible_direct_probation();
+                }
+                self.request_direct_unflip_for(scope, "ineligible_authoritative_output_present");
+                if self
+                    .pstate
+                    .direct
+                    .get(scope)
+                    .is_some_and(|owner| owner.active())
+                    && let Some(owner) = self.pstate.direct.get_mut(scope)
+                {
+                    owner.unflip_fallback_source = source_id;
+                    owner.unflip_shadow_ready = false;
                 }
             }
             return Ok(false);

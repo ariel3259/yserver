@@ -2210,7 +2210,7 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-fn record_scanout_m1_probe(
+pub(super) fn record_scanout_m1_probe(
     _: &crate::kms::render::backend::KmsBackend,
     _: crate::kms::render::store::DrawableId,
     scope: crate::kms::render::backend::DirectScope,
@@ -2268,14 +2268,18 @@ fn output_admission_fixture_with_geometry(
 )> {
     use yserver_core::backend::Backend;
 
-    let Ok(Some(mut fixture)) =
-        super::commit_identity::recording_scene::RecordingSceneFixture::with_output_geometry(
+    let mut fixture =
+        match super::commit_identity::recording_scene::RecordingSceneFixture::with_output_geometry(
             screen_size,
             outputs,
-        )
-    else {
-        return None;
-    };
+        ) {
+            Ok(Some(fixture)) => fixture,
+            Ok(None) => {
+                eprintln!("SKIP output admission: Vulkan scene fixture unavailable");
+                return None;
+            }
+            Err(error) => panic!("output admission fixture construction failed: {error}"),
+        };
     let direct = fixture.install_direct_output_present(output_idx, present_id, 0);
     let backend = &mut fixture.events.backend;
     SCANOUT_M1_PROBES.with(|probes| probes.borrow_mut().clear());
@@ -2444,6 +2448,121 @@ fn output_present_enters_direct_on_its_output_only() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: keep an Output(i) probation streak after a scoped Present is rejected.
+fn output_present_rejection_resets_probation() {
+    use yserver_core::backend::Backend;
+
+    let Some((mut fixture, direct)) = output_admission_fixture(1, 816) else {
+        return;
+    };
+    let fd = fixture.kms_fd(1);
+    let output0_crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    let output1_crtc = fixture.events.backend.platform.outputs[1].output.crtc;
+    let start = fixture.events.recorders[&fd].records().len();
+    let probation = usize::from(crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION);
+    for _ in 0..probation - 1 {
+        assert!(
+            !Backend::try_present_direct(
+                &mut fixture.events.backend,
+                direct.candidate,
+                direct.event.clone(),
+            )
+            .expect("eligible Output Present before probation")
+        );
+    }
+
+    let mut rejected = direct.candidate;
+    rejected.valid_region_xid = 0x55;
+    assert!(
+        !Backend::try_present_direct(&mut fixture.events.backend, rejected, direct.event.clone(),)
+            .expect("region-limited Output Present remains composed")
+    );
+    assert!(!fixture.events.backend.pstate.direct.outputs[1].active());
+
+    for attempt in 0..probation {
+        let entered = Backend::try_present_direct(
+            &mut fixture.events.backend,
+            direct.candidate,
+            direct.event.clone(),
+        )
+        .expect("eligible Output Present after rejected successor");
+        assert_eq!(
+            entered,
+            attempt + 1 == probation,
+            "a rejected Present restarts the Output probation streak"
+        );
+    }
+    assert!(fixture.events.backend.pstate.direct.outputs[1].active());
+    let records = fixture.events.recorders[&fd].records();
+    assert!(records[start..].iter().any(|record| {
+        record
+            .flags
+            .contains(::drm::control::AtomicCommitFlags::PAGE_FLIP_EVENT)
+            && record.events.len() == 1
+            && record.events[0].crtc == output1_crtc
+    }));
+    assert!(records[start..].iter().all(|record| {
+        !record
+            .flags
+            .contains(::drm::control::AtomicCommitFlags::PAGE_FLIP_EVENT)
+            || record.events.iter().all(|event| event.crtc != output0_crtc)
+    }));
+    fixture.finish();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: ignore a rejected successor from the active Output(i) owner.
+fn output_present_rejection_unflips_active_scope() {
+    use yserver_core::backend::Backend;
+
+    let Some((mut fixture, direct)) = output_admission_fixture(1, 817) else {
+        return;
+    };
+    let probation = usize::from(crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION);
+    for attempt in 0..probation {
+        let entered = Backend::try_present_direct(
+            &mut fixture.events.backend,
+            direct.candidate,
+            direct.event.clone(),
+        )
+        .expect("Output Present through Backend");
+        assert_eq!(entered, attempt + 1 == probation);
+    }
+
+    let fd = fixture.kms_fd(1);
+    let crtc = fixture.events.backend.platform.outputs[1].output.crtc;
+    assert!(
+        fixture.events.recorders[&fd]
+            .records()
+            .iter()
+            .any(|record| {
+                record
+                    .flags
+                    .contains(::drm::control::AtomicCommitFlags::PAGE_FLIP_EVENT)
+                    && record.events.iter().any(|event| event.crtc == crtc)
+            })
+    );
+
+    let mut rejected = direct.candidate;
+    rejected.valid_region_xid = 0x56;
+    assert!(
+        !Backend::try_present_direct(&mut fixture.events.backend, rejected, direct.event.clone(),)
+            .expect("region-limited Output successor stays composed")
+    );
+    let owner = &fixture.events.backend.pstate.direct.outputs[1];
+    assert!(owner.unflip_requested, "the Output owner must unflip");
+    assert_eq!(
+        owner.unflip_fallback_source,
+        Some(direct.source_id),
+        "the rejected successor becomes the composed fallback source"
+    );
+    assert!(!owner.unflip_shadow_ready);
+    fixture.finish();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: drop the selected-CRTC-to-output scope check.
 fn output_present_selecting_other_crtc_is_composed() {
     use yserver_core::backend::Backend;
@@ -2498,9 +2617,13 @@ fn output_present_selecting_other_crtc_is_composed() {
 fn mixed_refresh_root_present_still_rejected() {
     use yserver_core::backend::Backend;
 
-    let Ok(Some(mut fixture)) = super::commit_identity::recording_scene::RecordingSceneFixture::with_output_admission_topology() else {
-        eprintln!("SKIP mixed_refresh_root_present_still_rejected: Vulkan scene fixture unavailable");
-        return;
+    let mut fixture = match super::commit_identity::recording_scene::RecordingSceneFixture::with_output_admission_topology() {
+        Ok(Some(fixture)) => fixture,
+        Ok(None) => {
+            eprintln!("SKIP mixed_refresh_root_present_still_rejected: Vulkan scene fixture unavailable");
+            return;
+        }
+        Err(error) => panic!("mixed-refresh Root fixture construction failed: {error}"),
     };
     let direct = fixture.install_direct_present(812, 0);
     let fd = fixture.kms_fd(0);

@@ -2723,7 +2723,7 @@ fn live_scene_backend_with_geometry(
     screen_size: (u16, u16),
     outputs: &[(i32, i32, u16, u16, u32)],
 ) -> Option<KmsBackend> {
-    build_recording_scene_backend_with_geometry(outputs.len(), false, false, screen_size, outputs)
+    build_recording_scene_backend_with_geometry(false, screen_size, outputs)
         .unwrap_or_else(|error| panic!("recording scene fixture unavailable: {error}"))
 }
 
