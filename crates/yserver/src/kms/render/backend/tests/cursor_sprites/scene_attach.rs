@@ -4,7 +4,8 @@ use super::{
         AtomicPathFixture, PathKind, accept_cursor_detach, accepted_live_records,
         applied_cursor_binding, compose_until_cursor_commit, compose_until_cursor_commit_where,
         create_argb_cursor, damage_root, define_root_cursor, deliver_render_completion,
-        drain_unretired_output_events, enter_held_direct, establish_hardware_cursor, record_count,
+        drain_unretired_output_events, enter_held_direct, establish_hardware_cursor,
+        establish_hardware_cursor_on_output, has_unretired_accepted_event, record_count,
         record_property, retire_cursor_record, retire_pending_output, sprite_bytes, sprite_users,
     },
 };
@@ -2839,6 +2840,168 @@ fn held_direct_with_two_outputs(
     Some((fixture, delivered, hardware, direct))
 }
 
+fn held_output_direct_with_two_outputs(
+    present_id: u64,
+    output_idx: usize,
+    cursor_output_idx: usize,
+    pointer: (i32, i32),
+    options: u32,
+) -> Option<(
+    AtomicPathFixture,
+    HashSet<super::support::CompletionKey>,
+    super::support::HardwareCursor,
+    super::super::commit_identity::recording_scene::DirectPresentSetup,
+)> {
+    let mut fixture = AtomicPathFixture::with_output_count(PathKind::Physical, 2)
+        .expect("two-output atomic output-direct cursor fixture construction")?;
+    let cursor = create_argb_cursor(
+        &mut fixture.scene.events.backend,
+        (4, 4),
+        [71, 72, 73, 255],
+        (1, 2),
+    );
+    let mut delivered = HashSet::new();
+    let hardware = establish_hardware_cursor_on_output(
+        &mut fixture,
+        &mut delivered,
+        cursor,
+        cursor_output_idx,
+        pointer,
+    );
+    for idx in 0..2 {
+        drain_unretired_output_events(&mut fixture, &mut delivered, idx);
+    }
+
+    let direct = fixture
+        .scene
+        .install_direct_output_present(output_idx, present_id, options);
+    Backend::set_cursor_hidden(&mut fixture.scene.events.backend, false);
+    for frame in 30..34 {
+        Backend::maybe_composite(&mut fixture.scene.events.backend)
+            .expect("settle cursor transition before output direct Present");
+        for idx in 0..2 {
+            drain_unretired_output_events(&mut fixture, &mut delivered, idx);
+        }
+        let mode = fixture
+            .scene
+            .events
+            .backend
+            .scene
+            .cursor_mode_for_outputs(&[output_idx]);
+        if matches!(
+            mode,
+            crate::kms::render::scene::CursorPlaneMode::Hw
+                | crate::kms::render::scene::CursorPlaneMode::Hidden
+        ) {
+            break;
+        }
+        let _ = frame;
+    }
+    assert!(matches!(
+        fixture
+            .scene
+            .events
+            .backend
+            .scene
+            .cursor_mode_for_outputs(&[output_idx]),
+        crate::kms::render::scene::CursorPlaneMode::Hw
+            | crate::kms::render::scene::CursorPlaneMode::Hidden
+    ));
+
+    fixture
+        .scene
+        .events
+        .backend
+        .for_tests_set_scanout_m1_prober(super::super::present_scanout::record_scanout_m1_probe);
+    if options & yserver_core::present_scheduler::PRESENT_OPTION_ASYNC != 0 {
+        for device in &mut fixture.scene.events.backend.platform.devices {
+            device.async_page_flip = true;
+        }
+    }
+    Backend::note_present_scanout_candidate(&mut fixture.scene.events.backend, direct.candidate);
+    let device_fd = fixture.scene.kms_fd(output_idx);
+    let start = record_count(&fixture, device_fd);
+    for attempt in 0..usize::from(crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION) {
+        let accepted = Backend::try_present_direct(
+            &mut fixture.scene.events.backend,
+            direct.candidate,
+            direct.event.clone(),
+        )
+        .expect("output-sized Present reaches direct scanout through Backend");
+        assert_eq!(
+            accepted,
+            attempt + 1
+                == usize::from(crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION),
+            "Output({output_idx}) enters after the normal direct probation"
+        );
+    }
+    let crtc = fixture.scene.events.backend.platform.outputs[output_idx]
+        .output
+        .crtc;
+    let direct_record = accepted_live_records(&fixture.scene.events.recorders[&device_fd])
+        .into_iter()
+        .skip(start)
+        .find(|record| {
+            record.kind != AtomicCommitKind::CursorOnly
+                && record.events.len() == 1
+                && record.events[0].crtc == crtc
+                && accepted_event_id(record).is_some()
+        })
+        .expect("the selected output accepted its direct Present");
+    retire_pending_output(&mut fixture.scene.events, &mut delivered, output_idx, 39);
+    assert!(
+        fixture.scene.events.backend.pstate.direct.outputs[output_idx]
+            .current
+            .is_some(),
+        "the Present now owns Output({output_idx})"
+    );
+    if options & yserver_core::present_scheduler::PRESENT_OPTION_ASYNC != 0 {
+        let mut async_candidate = direct.candidate;
+        async_candidate.present_id = present_id + 1;
+        let mut async_event = direct.event.clone();
+        async_event.present_id = async_candidate.present_id;
+        async_event.serial =
+            u32::try_from(async_candidate.present_id).expect("follow-up Present serial fits");
+        Backend::note_present_scanout_candidate(&mut fixture.scene.events.backend, async_candidate);
+        let async_start = record_count(&fixture, device_fd);
+        assert!(
+            Backend::try_present_direct(
+                &mut fixture.scene.events.backend,
+                async_candidate,
+                async_event,
+            )
+            .expect("follow-up output Present uses the active tearing owner")
+        );
+        let async_record = accepted_live_records(&fixture.scene.events.recorders[&device_fd])
+            .into_iter()
+            .skip(async_start)
+            .find(|record| {
+                record.events.len() == 1
+                    && record.events[0].crtc == crtc
+                    && accepted_event_id(record).is_some()
+            })
+            .expect("the follow-up direct Present is accepted");
+        assert_eq!(
+            async_record.kind,
+            AtomicCommitKind::Async,
+            "the tearing owner's direct timing ignores cursors on unrelated outputs"
+        );
+        retire_pending_output(&mut fixture.scene.events, &mut delivered, output_idx, 40);
+    }
+    assert_eq!(
+        fixture
+            .scene
+            .events
+            .backend
+            .platform
+            .cursor_plane_visible_for_output(output_idx),
+        !fixture.scene.events.backend.pstate.tearing.is_on(),
+        "the selected output's cursor plane follows its tearing handoff"
+    );
+    let _ = direct_record;
+    Some((fixture, delivered, hardware, direct))
+}
+
 fn count_cursor_commits_for_output(fixture: &AtomicPathFixture, output_idx: usize) -> usize {
     let device_fd = fixture.scene.kms_fd(output_idx);
     let crtc = fixture.scene.events.backend.platform.outputs[output_idx]
@@ -2862,15 +3025,12 @@ fn finish_direct_fixture(
         .events
         .backend
         .for_tests_set_monotonic_clock(Rc::new(Instant::now));
-    if fixture.scene.events.backend.pstate.direct.root().active() {
+    for scope in fixture.scene.events.backend.pstate.direct.active_scopes() {
         fixture
             .scene
             .events
             .backend
-            .stop_direct_after_scanout_replaced(
-                crate::kms::render::backend::DirectScope::Root,
-                "test teardown",
-            );
+            .stop_direct_after_scanout_replaced(scope, "test teardown");
     }
     for output_idx in 0..fixture.scene.events.backend.platform.outputs.len() {
         drain_unretired_output_events(&mut fixture, delivered, output_idx);
@@ -2896,6 +3056,433 @@ fn finish_direct_fixture(
         drain_unretired_output_events(&mut fixture, delivered, output_idx);
     }
     super::support::finish_atomic_fixture(fixture, delivered);
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutations: queue the replacement for every HW output; require all-output
+// acknowledgement quiescence for external sync; return early while any direct
+// owner exists instead of queueing the composed output's replacement.
+fn cursor_image_change_with_pending_ack_on_other_output_keeps_owner() {
+    let Some((mut fixture, mut delivered, hardware, direct)) =
+        held_output_direct_with_two_outputs(715, 1, 1, (799, 90), 0)
+    else {
+        eprintln!(
+            "SKIP cursor_image_change_with_pending_ack_on_other_output_keeps_owner: Vulkan fixture unavailable"
+        );
+        return;
+    };
+    assert!(
+        fixture
+            .scene
+            .events
+            .backend
+            .platform
+            .cursor_plane_visible_for_output(0)
+    );
+    assert!(
+        fixture
+            .scene
+            .events
+            .backend
+            .platform
+            .cursor_plane_visible_for_output(1)
+    );
+
+    damage_root(&mut fixture);
+    let before_pending_scene = record_count(&fixture, hardware.device_fd);
+    Backend::maybe_composite(&mut fixture.scene.events.backend)
+        .expect("compose output 0 while Output(1) remains direct");
+    let output0 = fixture.scene.events.backend.platform.outputs[0].output.crtc;
+    let pending_scene = accepted_live_records(&fixture.scene.events.recorders[&hardware.device_fd])
+        .into_iter()
+        .skip(before_pending_scene)
+        .find(|record| {
+            matches!(
+                record.kind,
+                AtomicCommitKind::Scene | AtomicCommitKind::SceneWithCursor
+            ) && record.events.iter().any(|event| event.crtc == output0)
+        })
+        .expect("output 0 has a scene acknowledgement in flight");
+    assert!(fixture.scene.events.backend.scene.has_pending_page_flip(0));
+    assert!(
+        fixture.scene.events.backend.pstate.direct.outputs[1]
+            .current
+            .is_some()
+    );
+
+    let cursor_b = create_argb_cursor(
+        &mut fixture.scene.events.backend,
+        (4, 4),
+        [0x62, 0x71, 0x82, 0xff],
+        (1, 2),
+    );
+    define_root_cursor(&mut fixture.scene.events.backend, cursor_b);
+    let output1_props =
+        super::support::cursor_properties_for_output(&fixture.scene.events.backend, 1);
+    let output1_new_image =
+        accepted_live_records(&fixture.scene.events.recorders[&hardware.device_fd])
+            .into_iter()
+            .rev()
+            .find(|record| {
+                record.kind == AtomicCommitKind::CursorOnly
+                    && record_property(record, output1_props.fb_id).is_some_and(|fb| fb != 0)
+                    && record.events.iter().any(|event| {
+                        event.crtc == fixture.scene.events.backend.platform.outputs[1].output.crtc
+                    })
+            })
+            .expect("Output(1) cursor plane accepts the new image immediately");
+    assert!(
+        fixture.scene.events.backend.pstate.direct.outputs[1]
+            .current
+            .is_some()
+            && !fixture.scene.events.backend.pstate.direct.outputs[1].unflip_requested,
+        "the pending acknowledgement on output 0 cannot revoke Output(1)"
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .events
+            .backend
+            .scene
+            .cursor_mode_for_outputs(&[1]),
+        crate::kms::render::scene::CursorPlaneMode::Hw,
+        "refreshing Output(1) leaves its cursor mode out of Mixed"
+    );
+
+    retire_cursor_record(&mut fixture, &mut delivered, 1, &output1_new_image, 44);
+    retire_cursor_record(&mut fixture, &mut delivered, 0, &pending_scene, 45);
+    for frame in 46..50 {
+        Backend::maybe_composite(&mut fixture.scene.events.backend)
+            .expect("finish queued output 0 cursor image upload");
+        if !has_unretired_accepted_event(&fixture.scene.events, &delivered, 0) {
+            break;
+        }
+        retire_pending_output(&mut fixture.scene.events, &mut delivered, 0, frame);
+    }
+
+    let output0_binding = applied_cursor_binding(&fixture.scene.events.backend, 0)
+        .expect("output 0 keeps its cursor binding");
+    let output0_bytes = sprite_bytes(&fixture.scene.events.backend, 0, output0_binding.lease)
+        .expect("output 0 replacement sprite bytes");
+    assert_eq!(
+        output0_bytes
+            .chunks_exact(4)
+            .filter(|pixel| *pixel == [0x62, 0x71, 0x82, 0xff])
+            .count(),
+        16,
+        "output 0 receives the replacement's sixteen pixels after its scene frame retires"
+    );
+    assert_eq!(
+        fixture.scene.events.backend.pstate.direct.active_scopes(),
+        [crate::kms::render::backend::DirectScope::Output(1)],
+        "Output(1) stays direct through output 0's cursor upload"
+    );
+    assert!(
+        fixture.scene.events.backend.pstate.direct.outputs[1]
+            .current
+            .is_some()
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .events
+            .backend
+            .scene
+            .cursor_mode_for_outputs(&[1]),
+        crate::kms::render::scene::CursorPlaneMode::Hw,
+        "Output(1) cursor mode stays hardware after output 0's cursor upload"
+    );
+    let mut next_candidate = direct.candidate;
+    next_candidate.present_id += 1;
+    let mut next_event = direct.event.clone();
+    next_event.present_id = next_candidate.present_id;
+    next_event.serial = u32::try_from(next_candidate.present_id).expect("next serial fits");
+    Backend::note_present_scanout_candidate(&mut fixture.scene.events.backend, next_candidate);
+    let next_start = record_count(&fixture, hardware.device_fd);
+    assert!(
+        Backend::try_present_direct(
+            &mut fixture.scene.events.backend,
+            next_candidate,
+            next_event,
+        )
+        .expect("Output(1) accepts its next direct Present after the cursor upload")
+    );
+    let output1_next = accepted_live_records(&fixture.scene.events.recorders[&hardware.device_fd])
+        .into_iter()
+        .skip(next_start)
+        .find(|record| {
+            record.events.iter().any(|event| {
+                event.crtc == fixture.scene.events.backend.platform.outputs[1].output.crtc
+            }) && accepted_event_id(record).is_some()
+        })
+        .expect("Output(1)'s next direct Present has an accepted CRTC commit");
+    assert!(
+        matches!(
+            output1_next.kind,
+            AtomicCommitKind::Scene | AtomicCommitKind::SceneWithCursor
+        ),
+        "Output(1)'s successor is still a synchronized direct commit"
+    );
+    retire_pending_output(&mut fixture.scene.events, &mut delivered, 1, 50);
+    assert_eq!(
+        fixture
+            .scene
+            .events
+            .backend
+            .scene
+            .cursor_mode_for_outputs(&[1]),
+        crate::kms::render::scene::CursorPlaneMode::Hw,
+        "Output(1) cursor mode stays hardware through its next retirement"
+    );
+    assert!(
+        fixture.scene.events.backend.pstate.direct.outputs[1]
+            .current
+            .is_some()
+            && !fixture.scene.events.backend.pstate.direct.outputs[1].unflip_requested,
+        "Output(1) remains current after its next Present retires"
+    );
+    finish_direct_fixture(fixture, &mut delivered);
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: keep move_hw_cursor's any-direct-owner guard around membership detection.
+fn pointer_enters_idle_composed_output_while_other_is_direct() {
+    let Some((mut fixture, mut delivered, _, _direct)) =
+        held_output_direct_with_two_outputs(716, 1, 1, (900, 90), 0)
+    else {
+        eprintln!(
+            "SKIP pointer_enters_idle_composed_output_while_other_is_direct: Vulkan fixture unavailable"
+        );
+        return;
+    };
+    assert!(
+        fixture.scene.events.backend.pstate.direct.outputs[1]
+            .current
+            .is_some()
+    );
+    assert!(
+        fixture
+            .scene
+            .events
+            .backend
+            .platform
+            .cursor_plane_visible_for_output(1)
+    );
+    assert!(
+        !fixture
+            .scene
+            .events
+            .backend
+            .platform
+            .cursor_plane_visible_for_output(0)
+    );
+
+    Backend::warp_pointer_root(
+        &mut fixture.scene.events.backend,
+        &mut fixture.scene.events.state,
+        100,
+        90,
+    );
+    for frame in 50..54 {
+        Backend::maybe_composite(&mut fixture.scene.events.backend)
+            .expect("wake the idle composed output as the pointer enters it");
+        if has_unretired_accepted_event(&fixture.scene.events, &delivered, 0) {
+            retire_pending_output(&mut fixture.scene.events, &mut delivered, 0, frame);
+        }
+        if fixture
+            .scene
+            .events
+            .backend
+            .platform
+            .cursor_plane_visible_for_output(0)
+        {
+            break;
+        }
+    }
+
+    let binding = applied_cursor_binding(&fixture.scene.events.backend, 0)
+        .expect("composed output 0 binds the cursor after crossing");
+    assert_eq!((binding.x, binding.y), (99, 88));
+    assert!(
+        fixture
+            .scene
+            .events
+            .backend
+            .platform
+            .cursor_plane_visible_for_output(0)
+    );
+    assert!(
+        fixture.scene.events.backend.pstate.direct.outputs[1]
+            .current
+            .is_some()
+    );
+    finish_direct_fixture(fixture, &mut delivered);
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: keep pointer.rs routing every motion through the tearing scene path.
+fn pointer_motion_on_composed_output_during_other_output_tearing() {
+    let Some((mut fixture, mut delivered, hardware, _direct)) = held_output_direct_with_two_outputs(
+        717,
+        1,
+        0,
+        (100, 90),
+        yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+    ) else {
+        eprintln!(
+            "SKIP pointer_motion_on_composed_output_during_other_output_tearing: Vulkan fixture unavailable"
+        );
+        return;
+    };
+    assert!(fixture.scene.events.backend.pstate.tearing.is_on());
+    assert!(
+        fixture
+            .scene
+            .events
+            .backend
+            .platform
+            .cursor_plane_visible_for_output(0)
+    );
+    assert!(
+        !fixture
+            .scene
+            .events
+            .backend
+            .platform
+            .cursor_plane_visible_for_output(1)
+    );
+
+    let crtc0 = fixture.scene.events.backend.platform.outputs[0].output.crtc;
+    for (frame, (x, y)) in [(51, (150, 130)), (52, (165, 145))] {
+        let before = record_count(&fixture, hardware.device_fd);
+        Backend::warp_pointer_root(
+            &mut fixture.scene.events.backend,
+            &mut fixture.scene.events.state,
+            x,
+            y,
+        );
+        Backend::maybe_composite(&mut fixture.scene.events.backend)
+            .expect("route output 0 pointer motion while output 1 owns tearing");
+        let motion_records: Vec<_> =
+            accepted_live_records(&fixture.scene.events.recorders[&hardware.device_fd])
+                .into_iter()
+                .skip(before)
+                .collect();
+        assert!(
+            motion_records.iter().any(|record| {
+                record.kind == AtomicCommitKind::CursorOnly
+                    && record.events.iter().any(|event| event.crtc == crtc0)
+            }),
+            "each motion on output 0 submits a cursor-only commit there"
+        );
+        assert!(
+            !motion_records.iter().any(|record| {
+                matches!(
+                    record.kind,
+                    AtomicCommitKind::Scene | AtomicCommitKind::SceneWithCursor
+                ) && record.events.iter().any(|event| event.crtc == crtc0)
+            }),
+            "output 0 does not submit a primary scene flip for its hardware cursor motion"
+        );
+        retire_pending_output(&mut fixture.scene.events, &mut delivered, 0, frame);
+    }
+    assert!(fixture.scene.events.backend.pstate.tearing.is_on());
+    assert!(
+        fixture.scene.events.backend.pstate.direct.outputs[1]
+            .current
+            .is_some()
+    );
+    finish_direct_fixture(fixture, &mut delivered);
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: let any visible cursor plane veto async direct timing on every output.
+fn tearing_on_output_owner_scopes_cursor_and_async_timing() {
+    let Some((mut fixture, mut delivered, hardware, _direct)) = held_output_direct_with_two_outputs(
+        718,
+        1,
+        0,
+        (100, 90),
+        yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+    ) else {
+        eprintln!(
+            "SKIP tearing_on_output_owner_scopes_cursor_and_async_timing: Vulkan fixture unavailable"
+        );
+        return;
+    };
+    assert!(fixture.scene.events.backend.pstate.tearing.is_on());
+    assert!(
+        fixture
+            .scene
+            .events
+            .backend
+            .platform
+            .cursor_plane_visible_for_output(0)
+    );
+    assert!(
+        !fixture
+            .scene
+            .events
+            .backend
+            .platform
+            .cursor_plane_visible_for_output(1)
+    );
+    let crtc0 = fixture.scene.events.backend.platform.outputs[0].output.crtc;
+    let crtc1 = fixture.scene.events.backend.platform.outputs[1].output.crtc;
+    let output1_records =
+        accepted_live_records(&fixture.scene.events.recorders[&hardware.device_fd]);
+    assert!(
+        output1_records
+            .iter()
+            .any(|record| record.kind == AtomicCommitKind::Async
+                && record.events.iter().any(|event| event.crtc == crtc1)),
+        "output 1 direct tearing record is async; records={:?}",
+        output1_records
+            .iter()
+            .map(|record| (
+                record.kind,
+                record
+                    .events
+                    .iter()
+                    .map(|event| event.crtc)
+                    .collect::<Vec<_>>()
+            ))
+            .collect::<Vec<_>>()
+    );
+
+    damage_root(&mut fixture);
+    let before = record_count(&fixture, hardware.device_fd);
+    Backend::maybe_composite(&mut fixture.scene.events.backend)
+        .expect("compose output 0 while output 1 owns tearing");
+    let output0_scene = accepted_live_records(&fixture.scene.events.recorders[&hardware.device_fd])
+        .into_iter()
+        .skip(before)
+        .find(|record| {
+            matches!(
+                record.kind,
+                AtomicCommitKind::Scene | AtomicCommitKind::SceneWithCursor
+            ) && record.events.iter().any(|event| event.crtc == crtc0)
+        })
+        .expect("the unrelated output continues its composed scene");
+    assert_ne!(
+        output0_scene.kind,
+        AtomicCommitKind::Async,
+        "composed output 0 keeps vsync timing"
+    );
+    if has_unretired_accepted_event(&fixture.scene.events, &delivered, 0) {
+        retire_pending_output(&mut fixture.scene.events, &mut delivered, 0, 56);
+    }
+    assert!(fixture.scene.events.backend.pstate.tearing.is_on());
+    assert!(
+        fixture.scene.events.backend.pstate.direct.outputs[1]
+            .current
+            .is_some()
+    );
+    finish_direct_fixture(fixture, &mut delivered);
 }
 
 #[test]

@@ -616,10 +616,36 @@ impl<P: Platform> XBackend<P> {
             // transition pending) also wakes the scene so the software
             // cursor stays in sync with the eventual plane bind.
             let cursor_mode = self.scene.cursor_mode();
+            #[allow(clippy::cast_possible_truncation)]
+            let (cx, cy) = (new_x as i32, new_y as i32);
+            #[allow(clippy::cast_possible_truncation)]
+            let (cursor_x, cursor_y) = (new_x as i64, new_y as i64);
+            let (hot_x, hot_y, cw, ch) = self
+                .effective_cursor_xid
+                .and_then(|xid| self.cursor_records.get(&xid))
+                .map(|rec| {
+                    (
+                        rec.hot_x,
+                        rec.hot_y,
+                        i32::from(rec.width),
+                        i32::from(rec.height),
+                    )
+                })
+                .unwrap_or((0, 0, 0, 0));
             if self.effective_cursor_hidden() {
                 // The effective cursor has no visible pixels, so pointer
                 // motion has no cursor sprite to move.
-            } else if P::tearing_active(self) {
+            } else if P::tearing_active(self)
+                && P::tearing_cursor_intersects_owner(
+                    self,
+                    cursor_x,
+                    cursor_y,
+                    i64::from(hot_x),
+                    i64::from(hot_y),
+                    i64::from(cw),
+                    i64::from(ch),
+                )
+            {
                 // Tearing owns cursor policy until exit. Keep motion on the
                 // platform's capped scene-wake path.
                 P::cursor_motion_during_tearing(self, true);
@@ -628,22 +654,6 @@ impl<P: Platform> XBackend<P> {
                 crate::kms::render::scene::CursorPlaneMode::Hw
                     | crate::kms::render::scene::CursorPlaneMode::Mixed
             ) {
-                #[allow(clippy::cast_possible_truncation)]
-                let cx = new_x as i32;
-                #[allow(clippy::cast_possible_truncation)]
-                let cy = new_y as i32;
-                let (hot_x, hot_y, cw, ch) = self
-                    .effective_cursor_xid
-                    .and_then(|xid| self.cursor_records.get(&xid))
-                    .map(|rec| {
-                        (
-                            rec.hot_x,
-                            rec.hot_y,
-                            i32::from(rec.width),
-                            i32::from(rec.height),
-                        )
-                    })
-                    .unwrap_or((0, 0, 0, 0));
                 let mixed = matches!(
                     cursor_mode,
                     crate::kms::render::scene::CursorPlaneMode::Mixed

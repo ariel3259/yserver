@@ -32,6 +32,167 @@ fn recording_sink(
     recorder
 }
 
+fn enter_output_owner_through_backend(
+    fixture: &mut super::commit_identity::recording_scene::RecordingSceneFixture,
+    direct: &super::commit_identity::recording_scene::DirectPresentSetup,
+    output_idx: usize,
+) -> crate::drm::atomic::tests_support::AtomicCommitRecord {
+    use yserver_core::backend::Backend;
+
+    fixture
+        .events
+        .backend
+        .for_tests_set_scanout_m1_prober(super::present_scanout::record_scanout_m1_probe);
+    Backend::note_present_scanout_candidate(&mut fixture.events.backend, direct.candidate);
+    let device_fd = fixture.kms_fd(output_idx);
+    let before = fixture.events.recorders[&device_fd].records().len();
+    let probation = usize::from(crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION);
+    for attempt in 0..probation {
+        assert_eq!(
+            Backend::try_present_direct(
+                &mut fixture.events.backend,
+                direct.candidate,
+                direct.event.clone(),
+            )
+            .expect("output owner Present through Backend"),
+            attempt + 1 == probation,
+            "Output({output_idx}) enters on its final probationary Present"
+        );
+    }
+    let crtc = fixture.events.backend.platform.outputs[output_idx]
+        .output
+        .crtc;
+    let direct_record = fixture.events.recorders[&device_fd]
+        .records()
+        .into_iter()
+        .skip(before)
+        .find(|record| {
+            record.kind != AtomicCommitKind::CursorOnly
+                && record.events.len() == 1
+                && record.events[0].crtc == crtc
+                && super::commit_identity::accepted_event_id(record).is_some()
+        })
+        .expect("Output Present produced one accepted direct commit");
+    let tearing_outputs = fixture.events.backend.tearing_scope_outputs();
+    if tearing_outputs.contains(&output_idx) && direct_record.kind != AtomicCommitKind::Async {
+        use std::collections::HashSet;
+
+        let mut delivered = HashSet::new();
+        super::cursor_sprites::support::retire_pending_output(
+            &mut fixture.events,
+            &mut delivered,
+            output_idx,
+            30,
+        );
+        let mut async_candidate = direct.candidate;
+        async_candidate.present_id += 10_000;
+        let mut async_event = direct.event.clone();
+        async_event.present_id = async_candidate.present_id;
+        async_event.serial =
+            u32::try_from(async_candidate.present_id).expect("follow-up Present serial fits");
+        let async_before = fixture.events.recorders[&device_fd].records().len();
+        assert!(
+            Backend::try_present_direct(&mut fixture.events.backend, async_candidate, async_event,)
+                .expect("tearing owner accepts its follow-up direct Present")
+        );
+        let async_record = fixture.events.recorders[&device_fd]
+            .records()
+            .into_iter()
+            .skip(async_before)
+            .find(|record| {
+                record.events.len() == 1
+                    && record.events[0].crtc == crtc
+                    && super::commit_identity::support::accepted_event_id(record).is_some()
+            })
+            .expect("tearing owner follow-up direct Present is recorded");
+        assert_eq!(
+            async_record.kind,
+            AtomicCommitKind::Async,
+            "tearing follow-up must use async timing; state={:?}, outputs={tearing_outputs:?}, current={:?}",
+            fixture.events.backend.pstate.tearing.state,
+            fixture.events.backend.pstate.direct.outputs[output_idx]
+                .current
+                .as_ref()
+                .map(|frame| frame.async_outcome),
+        );
+        super::cursor_sprites::support::retire_pending_output(
+            &mut fixture.events,
+            &mut delivered,
+            output_idx,
+            31,
+        );
+        return async_record;
+    }
+    direct_record
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: a different authoritative window exits the active tearing owner
+// without checking whether its scope overlaps the owner's outputs.
+fn second_output_tearing_request_does_not_disturb_owner() {
+    use yserver_core::backend::Backend;
+
+    let Some(mut fixture) = super::commit_identity::recording_scene::RecordingSceneFixture::
+        with_output_admission_topology()
+        .expect("mixed-refresh two-output recording fixture")
+    else {
+        eprintln!(
+            "SKIP second_output_tearing_request_does_not_disturb_owner: Vulkan fixture unavailable"
+        );
+        return;
+    };
+    for device in &mut fixture.events.backend.platform.devices {
+        device.async_page_flip = true;
+    }
+    let owner = fixture.install_direct_output_present(
+        1,
+        15_001,
+        yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+    );
+    Backend::set_cursor_hidden(&mut fixture.events.backend, true);
+    let owner_record = enter_output_owner_through_backend(&mut fixture, &owner, 1);
+    assert_eq!(owner_record.kind, AtomicCommitKind::Async);
+    assert!(fixture.events.backend.pstate.tearing.is_on());
+    let tearing_window = owner.candidate.dst_window_xid;
+
+    let other = fixture.install_direct_output_present(
+        0,
+        15_002,
+        yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+    );
+    let other_record = enter_output_owner_through_backend(&mut fixture, &other, 0);
+
+    assert_eq!(
+        fixture.events.backend.pstate.direct.active_scopes(),
+        [
+            crate::kms::render::backend::DirectScope::Output(0),
+            crate::kms::render::backend::DirectScope::Output(1),
+        ],
+        "both output owners remain direct"
+    );
+    assert_eq!(
+        other_record.kind,
+        AtomicCommitKind::Scene,
+        "the second output's async request is submitted with synchronized timing"
+    );
+    assert!(matches!(
+        fixture.events.backend.pstate.tearing.state,
+        crate::kms::render::backend::TearingState::On { window, .. }
+            if window == tearing_window
+    ));
+    assert!(
+        !fixture.events.backend.pstate.direct.outputs[1].unflip_requested,
+        "output 1's tearing owner is not disturbed by output 0"
+    );
+    assert!(
+        fixture.events.backend.pstate.direct.outputs[1]
+            .current
+            .is_some(),
+        "output 1 remains the active tearing owner's direct scanout"
+    );
+}
+
 fn update<H: ::drm::control::ResourceHandle>(
     object: H,
     property: ::drm::control::property::Handle,

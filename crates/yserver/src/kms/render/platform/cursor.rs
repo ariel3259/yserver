@@ -1435,8 +1435,12 @@ impl PlatformBackend {
         hot_y: u16,
         cw: i32,
         ch: i32,
+        ignored_output_indices: &[usize],
     ) -> bool {
-        for l in &self.outputs {
+        for (output_idx, l) in self.outputs.iter().enumerate() {
+            if ignored_output_indices.contains(&output_idx) {
+                continue;
+            }
             let Some(device) = self.device_for_key(l.key.device_key) else {
                 continue;
             };

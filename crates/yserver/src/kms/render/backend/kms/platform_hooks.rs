@@ -64,7 +64,11 @@ impl Platform for PlatformBackend {
         b.pstate.tearing.is_on()
     }
 
-    fn cursor_intersects_outputs(
+    fn tearing_cursor_suppression_mask(b: &KmsBackend, _output_count: usize) -> Vec<bool> {
+        b.tearing_cursor_suppression_mask()
+    }
+
+    fn tearing_cursor_intersects_owner(
         b: &KmsBackend,
         cursor_x: i64,
         cursor_y: i64,
@@ -73,7 +77,26 @@ impl Platform for PlatformBackend {
         width: i64,
         height: i64,
     ) -> bool {
-        b.platform.outputs.iter().any(|output| {
+        let outputs = b.tearing_scope_outputs();
+        Self::cursor_intersects_outputs(
+            b, &outputs, cursor_x, cursor_y, hot_x, hot_y, width, height,
+        )
+    }
+
+    fn cursor_intersects_outputs(
+        b: &KmsBackend,
+        output_indices: &[usize],
+        cursor_x: i64,
+        cursor_y: i64,
+        hot_x: i64,
+        hot_y: i64,
+        width: i64,
+        height: i64,
+    ) -> bool {
+        output_indices.iter().any(|&output_idx| {
+            let Some(output) = b.platform.outputs.get(output_idx) else {
+                return false;
+            };
             let dx = cursor_x - hot_x - i64::from(output.x);
             let dy = cursor_y - hot_y - i64::from(output.y);
             dx < i64::from(output.width)
@@ -143,6 +166,18 @@ impl Platform for PlatformBackend {
         b.request_direct_unflip(reason);
     }
 
+    fn request_direct_unflip_for_outputs(
+        b: &mut KmsBackend,
+        output_indices: &[usize],
+        reason: &'static str,
+    ) {
+        b.request_direct_unflip_for_outputs(output_indices, reason);
+    }
+
+    fn request_tearing_cursor_handoff(b: &mut KmsBackend) {
+        b.request_tearing_cursor_handoff();
+    }
+
     fn direct_frames_are_under_cow(b: &KmsBackend) -> bool {
         b.direct_frames_are_under_cow()
     }
@@ -158,7 +193,7 @@ impl Platform for PlatformBackend {
     fn refresh_direct_cursor(
         b: &mut KmsBackend,
         record: &std::sync::Arc<crate::kms::render::cursor::CursorRecord>,
-    ) -> bool {
+    ) -> Vec<usize> {
         b.refresh_direct_cursor_on_all_outputs(record)
     }
 
@@ -169,19 +204,19 @@ impl Platform for PlatformBackend {
                 .iter()
                 .any(|&idx| b.platform.cursor_plane_visible_for_output(idx))
             {
-                for output_idx in output_indices {
+                for &output_idx in &output_indices {
                     b.platform.clear_direct_cursor_retry(output_idx);
                 }
                 if let Some(owner) = b.pstate.direct.get_mut(scope) {
                     owner.clear_all_direct_cursor_refresh_pending();
                 }
-                if !b.sync_direct_cursor_scene_state() {
+                if !b.sync_direct_cursor_scene_state(&output_indices) {
                     b.request_direct_unflip_for(scope, "cursor_scene_sync_failed");
                 }
                 continue;
             }
             let mut failed = false;
-            for output_idx in output_indices {
+            for &output_idx in &output_indices {
                 if !b.platform.cursor_plane_visible_for_output(output_idx) {
                     b.platform.clear_direct_cursor_retry(output_idx);
                     if let Some(owner) = b.pstate.direct.get_mut(scope) {
@@ -241,7 +276,7 @@ impl Platform for PlatformBackend {
             if failed {
                 b.request_direct_unflip_for(scope, "cursor_hide_failed");
             }
-            if !b.sync_direct_cursor_scene_state() {
+            if !b.sync_direct_cursor_scene_state(&output_indices) {
                 b.request_direct_unflip_for(scope, "cursor_scene_sync_failed");
             }
         }
@@ -291,12 +326,17 @@ impl Platform for PlatformBackend {
                 Err(e) => log::debug!("render cursor mixed path: move failed: {e}"),
             }
             b.scene.wake_for_damage();
-        } else if b.pstate.direct.active_scopes().is_empty()
-            && cw > 0
-            && ch > 0
-            && b.platform
-                .cursor_crtc_membership_dirty(cx, cy, hot_x, hot_y, cw, ch)
-        {
+        } else if cw > 0 && ch > 0 && {
+            let direct_outputs: Vec<_> = b
+                .pstate
+                .direct
+                .active_scopes()
+                .into_iter()
+                .flat_map(|scope| b.direct_scope_outputs(scope))
+                .collect();
+            b.platform
+                .cursor_crtc_membership_dirty(cx, cy, hot_x, hot_y, cw, ch, &direct_outputs)
+        } {
             // The cursor footprint crossed onto/off a CRTC the
             // plane isn't bound to. The move-only fast path
             // can't rebind across CRTCs, so route this motion

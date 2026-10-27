@@ -120,13 +120,14 @@ impl KmsBackend {
     /// holds — the wezterm white-block invariant.
     pub fn scene_participant_places_for_tests(&mut self) -> Vec<ScenePlacement> {
         let outputs = self.platform.scene_output_layouts();
+        let hw_cursor_suppressed = self.tearing_cursor_suppression_mask();
         crate::kms::render::scene::scene_participant_places(
             &crate::kms::render::backend::scene_input(
                 &self.core,
                 &self.windows,
                 &outputs,
                 self.platform.fb_dimensions(),
-                self.pstate.tearing.is_on(),
+                &hw_cursor_suppressed,
             ),
             &mut self.store,
             0,
@@ -151,13 +152,14 @@ impl KmsBackend {
     /// only a BOUNDING BOX and therefore blind to a gap inside it.
     pub fn scene_draw_rects_for_tests(&mut self) -> Vec<(i32, i32, u32, u32)> {
         let outputs = self.platform.scene_output_layouts();
+        let hw_cursor_suppressed = self.tearing_cursor_suppression_mask();
         crate::kms::render::scene::scene_draw_rects(
             &crate::kms::render::backend::scene_input(
                 &self.core,
                 &self.windows,
                 &outputs,
                 self.platform.fb_dimensions(),
-                self.pstate.tearing.is_on(),
+                &hw_cursor_suppressed,
             ),
             &mut self.store,
             0,
