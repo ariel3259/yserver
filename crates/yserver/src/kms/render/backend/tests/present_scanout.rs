@@ -917,9 +917,9 @@ fn final_cow_release_defers_storage_until_direct_replacement() {
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: call finish_deferred_cow_release on every owner stop.
 fn deferred_cow_release_waits_for_last_output_owner() {
-    use super::commit_identity::direct_unflip::{
-        accepted_record_id, complete_output_owner_record, direct_fixture, fd, record_count,
-        records_since,
+    use super::commit_identity::{
+        accepted_event_id, complete_recorded_attempt,
+        direct_unflip::{direct_fixture, fd, record_count, records_since},
     };
     use crate::kms::render::backend::ScanoutM0Target;
     use yserver_core::backend::Backend;
@@ -973,18 +973,18 @@ fn deferred_cow_release_waits_for_last_output_owner() {
         .iter()
         .find(|record| record.events.iter().any(|event| event.crtc == crtc1))
         .expect("output 1 direct record");
-    complete_output_owner_record(
+    complete_recorded_attempt(
         &mut fixture,
         device_fd,
         direct0,
-        accepted_record_id(direct0).expect("output 0 direct event id"),
+        accepted_event_id(direct0).expect("output 0 direct event id"),
         54,
     );
-    complete_output_owner_record(
+    complete_recorded_attempt(
         &mut fixture,
         device_fd,
         direct1,
-        accepted_record_id(direct1).expect("output 1 direct event id"),
+        accepted_event_id(direct1).expect("output 1 direct event id"),
         55,
     );
     assert_eq!(
@@ -1018,11 +1018,11 @@ fn deferred_cow_release_waits_for_last_output_owner() {
     assert_eq!(replacement0.events.len(), 1);
     assert_eq!(replacement1.events.len(), 1);
 
-    complete_output_owner_record(
+    complete_recorded_attempt(
         &mut fixture,
         device_fd,
         replacement1,
-        accepted_record_id(replacement1).expect("output 1 replacement event id"),
+        accepted_event_id(replacement1).expect("output 1 replacement event id"),
         56,
     );
     assert!(
@@ -1055,11 +1055,11 @@ fn deferred_cow_release_waits_for_last_output_owner() {
     assert!(fixture.events.backend.deferred_cow_release);
     assert_eq!(fixture.events.backend.cow_id, Some(cow_id));
 
-    complete_output_owner_record(
+    complete_recorded_attempt(
         &mut fixture,
         device_fd,
         replacement0,
-        accepted_record_id(replacement0).expect("output 0 replacement event id"),
+        accepted_event_id(replacement0).expect("output 0 replacement event id"),
         57,
     );
     assert!(

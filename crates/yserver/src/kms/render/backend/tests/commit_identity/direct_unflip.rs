@@ -321,18 +321,27 @@ fn submit_two_output_owner_successors(
     (first_record, second_record)
 }
 
-pub(crate) fn accepted_record_id(record: &AtomicCommitRecord) -> Option<u64> {
-    accepted_event_id(record)
-}
-
-pub(crate) fn complete_output_owner_record(
-    fixture: &mut RecordingSceneFixture,
-    device_fd: RawFd,
+fn assert_plane_source_origin(
+    fixture: &RecordingSceneFixture,
     record: &AtomicCommitRecord,
-    event_id: u64,
-    frame: u32,
+    output_idx: usize,
 ) {
-    complete_recorded_attempt(fixture, device_fd, record, event_id, frame);
+    let output = &fixture.events.backend.platform.outputs[output_idx].output;
+    for (property, name) in [
+        (output.plane_src_x_prop, "SRC_X"),
+        (output.plane_src_y_prop, "SRC_Y"),
+    ] {
+        let value = record
+            .properties
+            .iter()
+            .find(|update| update.object == output.plane.into() && update.property == property)
+            .unwrap_or_else(|| panic!("output {output_idx} commit is missing {name}"))
+            .value;
+        assert_eq!(
+            value, 0,
+            "output {output_idx} {name} must start at the pixmap origin"
+        );
+    }
 }
 
 fn assert_atomic_record_touches_output_only(
@@ -391,16 +400,78 @@ fn assert_atomic_record_touches_output_only(
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: build plane states for all outputs.
+// Mutation: use layout.x/y as an output owner's source origin.
 fn output_owner_submits_and_unflips_only_its_crtc() {
-    let Some((mut fixture, direct)) = direct_fixture(2, P1SceneRoute::Shared, 203, 0) else {
+    let Some((mut fixture, mut direct)) = direct_fixture(2, P1SceneRoute::Shared, 203, 0) else {
         return;
     };
+    // Give output 1 its own-sized source: using its desktop x coordinate as
+    // SRC_X would address beyond this 800-pixel framebuffer.
+    let output = &fixture.events.backend.platform.outputs[1];
+    let width = output.width;
+    let height = output.height;
+    let source_xid = direct.candidate.src_pixmap_xid + 0x10;
+    let source_storage = fixture
+        .events
+        .backend
+        .platform
+        .gpu
+        .allocate_drawable_storage(width, height, 24)
+        .expect("allocate output-sized direct source");
+    direct.source_id = fixture
+        .events
+        .backend
+        .store
+        .allocate(
+            source_xid,
+            crate::kms::render::store::DrawableKind::Pixmap,
+            24,
+            false,
+            source_storage,
+        )
+        .expect("register output-sized direct source");
+    Backend::put_image(
+        &mut fixture.events.backend,
+        None,
+        source_xid,
+        24,
+        1,
+        1,
+        0,
+        0,
+        &[0, 0, 0, 0],
+    )
+    .expect("initialize output-sized direct source through Backend");
+    direct.candidate.src_pixmap_xid = source_xid;
+    direct.candidate.src_host_xid = source_xid;
+    direct.candidate.src_width = width;
+    direct.candidate.src_height = height;
+    direct.event.host_xid = source_xid;
+    fixture.extra_drawables.push(source_xid);
+    let output_crtc = fixture.events.backend.platform.outputs[1].output.crtc;
+    fixture.events.backend.pstate.scanout_m1.entries.insert(
+        direct.source_id,
+        crate::kms::render::backend::ScanoutM1ProbeEntry::accepted_with_shape(
+            crate::drm::modeset::DirectScanoutProbeFramebuffer::for_tests(
+                super::recording_scene::raw(0x8203),
+            ),
+            crate::drm::async_flip::AsyncShape {
+                fourcc: 0x3432_5258,
+                modifier: 0,
+                pitch: u32::from(width) * 4,
+                width: u32::from(width),
+                height: u32::from(height),
+                crtcs: vec![output_crtc],
+                direct: true,
+            },
+        ),
+    );
     let device_fd = fd(&fixture);
     Backend::set_cursor_hidden(&mut fixture.events.backend, true);
     let direct_record = submit_output_owner_successor(&mut fixture, &direct, 1);
     let direct_id = accepted_event_id(&direct_record).expect("direct submit accepted");
     assert_atomic_record_touches_output_only(&fixture, &direct_record, 1);
+    assert_plane_source_origin(&fixture, &direct_record, 1);
     complete_recorded_attempt(&mut fixture, device_fd, &direct_record, direct_id, 53);
     assert!(
         fixture.events.backend.pstate.direct.outputs[1]
@@ -443,43 +514,15 @@ fn two_output_owners_retire_independently() {
     let device_fd = fd(&fixture);
     let second = fixture.install_direct_present(206, 0);
     Backend::set_cursor_hidden(&mut fixture.events.backend, true);
-    let start = record_count(&fixture, device_fd);
-    seed_output_owner_successor(
-        &mut fixture,
-        &first,
-        0,
-        crate::kms::render::backend::ScanoutM0Target::Unredirected,
-        None,
-        None,
-    );
-    seed_output_owner_successor(
-        &mut fixture,
-        &second,
-        1,
-        crate::kms::render::backend::ScanoutM0Target::Unredirected,
-        None,
-        None,
-    );
-    Backend::maybe_composite(&mut fixture.events.backend)
-        .expect("submit both output owners through the scheduling pass");
-    let records = records_since(&fixture, device_fd, start);
-    let first_crtc = fixture.events.backend.platform.outputs[0].output.crtc;
-    let second_crtc = fixture.events.backend.platform.outputs[1].output.crtc;
-    let first_record = records
-        .iter()
-        .find(|record| record.events.iter().any(|event| event.crtc == first_crtc))
-        .expect("first output direct commit");
-    let second_record = records
-        .iter()
-        .find(|record| record.events.iter().any(|event| event.crtc == second_crtc))
-        .expect("second output direct commit");
-    assert_atomic_record_touches_output_only(&fixture, first_record, 0);
-    assert_atomic_record_touches_output_only(&fixture, second_record, 1);
-    let first_id = accepted_event_id(first_record).expect("first output accepted ID");
-    let second_id = accepted_event_id(second_record).expect("second output accepted ID");
+    let (first_record, second_record) =
+        submit_two_output_owner_successors(&mut fixture, &first, &second);
+    assert_atomic_record_touches_output_only(&fixture, &first_record, 0);
+    assert_atomic_record_touches_output_only(&fixture, &second_record, 1);
+    let first_id = accepted_event_id(&first_record).expect("first output accepted ID");
+    let second_id = accepted_event_id(&second_record).expect("second output accepted ID");
     assert_ne!(first_id, second_id);
 
-    complete_recorded_attempt(&mut fixture, device_fd, second_record, second_id, 61);
+    complete_recorded_attempt(&mut fixture, device_fd, &second_record, second_id, 61);
     let second_completed = Backend::drain_completed_present_events(&mut fixture.events.backend);
     assert_eq!(
         second_completed
@@ -506,10 +549,10 @@ fn two_output_owners_retire_independently() {
             .current
             .is_some()
     );
-    complete_recorded_attempt(&mut fixture, device_fd, second_record, second_id, 62);
+    complete_recorded_attempt(&mut fixture, device_fd, &second_record, second_id, 62);
     assert!(Backend::drain_completed_present_events(&mut fixture.events.backend).is_empty());
 
-    complete_recorded_attempt(&mut fixture, device_fd, first_record, first_id, 71);
+    complete_recorded_attempt(&mut fixture, device_fd, &first_record, first_id, 71);
     let first_completed = Backend::drain_completed_present_events(&mut fixture.events.backend);
     assert_eq!(
         first_completed

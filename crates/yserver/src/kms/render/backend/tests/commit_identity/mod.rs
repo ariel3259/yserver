@@ -7,4 +7,5 @@ mod scene;
 pub(super) mod support;
 mod vrr;
 
-pub(super) use atomic_events::install_recording_vt_io;
+pub(super) use atomic_events::{complete_recorded_attempt, install_recording_vt_io};
+pub(super) use support::accepted_event_id;

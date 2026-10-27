@@ -994,10 +994,17 @@ impl KmsBackend {
             .iter()
             .map(|&output_idx| {
                 let layout = &self.platform.outputs[output_idx];
+                let (src_x, src_y) = match scope {
+                    DirectScope::Root => (
+                        u32::try_from(layout.x).expect("M1 validated non-negative x"),
+                        u32::try_from(layout.y).expect("M1 validated non-negative y"),
+                    ),
+                    DirectScope::Output(_) => (0, 0),
+                };
                 crate::drm::modeset::DirectScanoutPlaneState {
                     output: &layout.output,
-                    src_x: u32::try_from(layout.x).expect("M1 validated non-negative x"),
-                    src_y: u32::try_from(layout.y).expect("M1 validated non-negative y"),
+                    src_x,
+                    src_y,
                     src_w: u32::from(layout.width),
                     src_h: u32::from(layout.height),
                 }
