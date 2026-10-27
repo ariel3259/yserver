@@ -1486,8 +1486,16 @@ fn p1_gamma_set_while_dpms_off_stays_pending_and_applies_after_wake() {
     assert!(!fixture.backend.scene.output_submit_retry_pending(0));
     assert!(!fixture.backend.scene.owes_repaint());
     assert!(!fixture.backend.store.has_pending_presentation_damage());
-    assert!(fixture.backend.pstate.scanout_m2.pending.is_none());
-    assert!(fixture.backend.pstate.scanout_m2.queued_successor.is_none());
+    assert!(fixture.backend.pstate.direct.root().pending.is_none());
+    assert!(
+        fixture
+            .backend
+            .pstate
+            .direct
+            .root()
+            .queued_successor
+            .is_none()
+    );
     let off_request_record_count = recorder.records().len();
 
     let red = vec![0x1111; 4];
@@ -1791,8 +1799,22 @@ fn gamma_held_on_idle_crtc_by_other_output_gets_one_refresh_deadline() {
     assert_ne!(crtc, busy_crtc, "the outputs use distinct CRTCs");
 
     let idle_output = fixture.events.backend.platform.outputs.remove(1);
+    let output_count = fixture.events.backend.platform.outputs.len();
+    fixture
+        .events
+        .backend
+        .pstate
+        .direct
+        .sync_output_count(output_count);
     let direct_records = super::direct_unflip::submit_direct(&mut fixture, &direct, fd);
     fixture.events.backend.platform.outputs.push(idle_output);
+    let output_count = fixture.events.backend.platform.outputs.len();
+    fixture
+        .events
+        .backend
+        .pstate
+        .direct
+        .sync_output_count(output_count);
     let direct_record = direct_records
         .into_iter()
         .find(|record| accepted_event_id(record).is_some())
@@ -1814,7 +1836,16 @@ fn gamma_held_on_idle_crtc_by_other_output_gets_one_refresh_deadline() {
         [direct_id],
         "output 0's accepted direct flip remains in flight"
     );
-    assert!(fixture.events.backend.pstate.scanout_m2.pending.is_some());
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .root()
+            .pending
+            .is_some()
+    );
     assert!(
         !fixture.events.backend.platform.devices[0]
             .atomic_commit_sink
@@ -2032,8 +2063,26 @@ fn p1_gamma_active_direct_frame_carries_lut_without_gamma_only_commit() {
         50,
         Some((ust, received_at)),
     );
-    assert!(fixture.events.backend.pstate.scanout_m2.pending.is_none());
-    assert!(fixture.events.backend.pstate.scanout_m2.current.is_some());
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .root()
+            .pending
+            .is_none()
+    );
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .root()
+            .current
+            .is_some()
+    );
     super::direct_unflip::drain_present_notifications(
         &mut fixture,
         &[direct.candidate.present_id],
@@ -2283,13 +2332,23 @@ fn p1_gamma_direct_retry_eio_keeps_lut_pending_and_returns_retry_error() {
             .borrow()
             .is_some()
     );
-    assert!(fixture.events.backend.pstate.scanout_m2.pending.is_none());
     assert!(
         fixture
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
+            .pending
+            .is_none()
+    );
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .root()
             .queued_successor
             .is_none()
     );

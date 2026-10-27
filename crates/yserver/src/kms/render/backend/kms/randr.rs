@@ -1103,6 +1103,9 @@ impl KmsBackend {
         rebuild_scene: bool,
         relight_after_quiesce: bool,
     ) -> bool {
+        self.pstate
+            .direct
+            .sync_output_count(self.platform.outputs.len());
         let previous_outputs: HashMap<u32, ProjectedRandrOutputState> = state
             .randr
             .outputs
@@ -1154,7 +1157,8 @@ impl KmsBackend {
                 self.platform.clear_direct_cursor_retry(output_idx);
             }
             self.pstate
-                .scanout_m2
+                .direct
+                .root_mut()
                 .clear_all_direct_cursor_refresh_pending();
         }
 
@@ -1345,7 +1349,7 @@ impl KmsBackend {
         // an active direct frame. Snapshot that frame into its old COW and
         // request the synchronized replacement first. On failure, leave the
         // old dimensions and every storage owner/pin untouched.
-        if self.pstate.scanout_m2.active() {
+        if self.pstate.direct.root().active() {
             if let Err(e) = self.materialize_direct_shadow_for_unflip() {
                 self.discard_root_storage(prepared);
                 return Err(e);
@@ -1421,6 +1425,9 @@ impl KmsBackend {
         let rescan = self
             .platform
             .apply_connector_snapshot(snapshot, &known_connected);
+        self.pstate
+            .direct
+            .sync_output_count(self.platform.outputs.len());
         if quiesced {
             self.platform.invalidate_live_cursor_applied();
         }
@@ -1644,9 +1651,9 @@ impl KmsBackend {
             || self.scene.output_submit_retry_pending(output_idx)
             || self.scene.owes_repaint()
             || self.store.has_pending_presentation_damage()
-            || self.pstate.scanout_m2.pending.is_some()
-            || self.pstate.scanout_m2.queued_successor.is_some()
-            || self.pstate.scanout_m2.unflip_requested
+            || self.pstate.direct.root().pending.is_some()
+            || self.pstate.direct.root().queued_successor.is_some()
+            || self.pstate.direct.root().unflip_requested
     }
 
     pub(super) fn reapply_gamma_for_output(&self, output_key: &OutputKey) {

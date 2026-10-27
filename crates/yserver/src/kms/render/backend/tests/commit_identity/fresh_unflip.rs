@@ -201,7 +201,16 @@ fn fresh_unflip_flips_fresh_frames_and_retires_through_scene() {
         120,
         Duration::from_millis(12_000),
     );
-    assert!(fixture.events.backend.pstate.scanout_m2.current.is_some());
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .root()
+            .current
+            .is_some()
+    );
     assert_eq!(direct_source_pins(&fixture, direct.source_id), 1);
     assert!(!fixture.events.backend.scene.has_pending_page_flip(0));
     assert!(fixture.events.backend.scene.has_pending_page_flip(1));
@@ -215,7 +224,16 @@ fn fresh_unflip_flips_fresh_frames_and_retires_through_scene() {
         121,
         Duration::from_millis(12_100),
     );
-    assert!(fixture.events.backend.pstate.scanout_m2.current.is_none());
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .root()
+            .current
+            .is_none()
+    );
     assert!(fixture.events.backend.present_source_pins.is_empty());
     assert!(!fixture.events.backend.scene.has_pending_page_flips());
     assert!(
@@ -223,7 +241,8 @@ fn fresh_unflip_flips_fresh_frames_and_retires_through_scene() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .fresh_composed_unflip
     );
     drain_present_notifications(&mut fixture, &[], &[direct.candidate.present_id]);

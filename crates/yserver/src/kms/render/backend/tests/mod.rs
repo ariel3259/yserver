@@ -371,6 +371,7 @@ fn push_enabled_test_output(
     );
     let key = active.key.clone();
     b.platform.outputs.push(active);
+    b.pstate.direct.sync_output_count(b.platform.outputs.len());
     b.platform.scanout_pools.push(None);
     b.platform.bo_generations.push(Vec::new());
     b.platform.first_pageflip_logged.push(false);
@@ -389,6 +390,7 @@ fn push_enabled_test_output(
 
 fn clear_test_outputs(b: &mut crate::kms::render::backend::KmsBackend) {
     b.platform.outputs.clear();
+    b.pstate.direct.sync_output_count(b.platform.outputs.len());
     b.platform.scanout_pools.clear();
     b.platform.bo_generations.clear();
     b.platform.first_pageflip_logged.clear();
@@ -926,7 +928,7 @@ fn retain_direct_frame_from_source_test(
         ust: 300,
         source: PresentClockSource::PageFlip,
     });
-    b.pstate.scanout_m2.current = Some(crate::kms::render::backend::DirectPresentFrame {
+    b.pstate.direct.root_mut().current = Some(crate::kms::render::backend::DirectPresentFrame {
         source_pin,
         fallback_target_pin,
         source_id,
@@ -978,7 +980,7 @@ fn retain_direct_frame_from_source_test(
         accepted_event_id: None,
         async_outcome: crate::drm::async_flip::AsyncOutcome::NotRequested,
     });
-    b.pstate.scanout_m2.hold_direct = true;
+    b.pstate.direct.root_mut().hold_direct = true;
 }
 
 fn dispatch_raw(
@@ -1134,6 +1136,7 @@ pub(super) fn push_test_output(b: &mut crate::kms::render::backend::KmsBackend, 
         800,
         0,
     ));
+    b.pstate.direct.sync_output_count(b.platform.outputs.len());
 }
 
 pub(super) fn install_direct_frame_for_target_test(
@@ -1241,11 +1244,11 @@ pub(super) fn install_direct_frame_for_target_test(
         async_outcome: crate::drm::async_flip::AsyncOutcome::NotRequested,
     };
     if current {
-        b.pstate.scanout_m2.current = Some(frame);
+        b.pstate.direct.root_mut().current = Some(frame);
     } else {
-        b.pstate.scanout_m2.pending = Some(frame);
+        b.pstate.direct.root_mut().pending = Some(frame);
     }
-    b.pstate.scanout_m2.hold_direct = true;
+    b.pstate.direct.root_mut().hold_direct = true;
     (source_id, fallback_id, source_pin, fallback_target_pin)
 }
 

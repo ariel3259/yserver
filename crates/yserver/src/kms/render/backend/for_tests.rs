@@ -2,8 +2,8 @@ use crate::kms::{
     core::KmsCore,
     render::{
         backend::{
-            ConnectorConfig, KmsBackend, KmsBackendState, PaintTargetShape, RandrIdAllocator,
-            ScanoutM0Telemetry, ScanoutM1ProbeCache, ScanoutM2State, ScenePlacement, Tearing,
+            ConnectorConfig, DirectOwners, KmsBackend, KmsBackendState, PaintTargetShape,
+            RandrIdAllocator, ScanoutM0Telemetry, ScanoutM1ProbeCache, ScenePlacement, Tearing,
         },
         engine::{RenderEngine, decode_x11_pixel_for_storage},
         gpu::GpuCore,
@@ -637,7 +637,7 @@ impl KmsBackend {
             vrr_proc_root: std::path::PathBuf::from("/proc"),
             scanout_m0: ScanoutM0Telemetry::default(),
             scanout_m1: ScanoutM1ProbeCache::new(),
-            scanout_m2: ScanoutM2State::new(),
+            direct: DirectOwners::default(),
             tearing: Tearing::new(),
             direct_frame_submitter: KmsBackend::submit_direct_frame_live,
             vt_resume_executor: std::rc::Rc::new(
@@ -698,6 +698,10 @@ impl KmsBackend {
             pstate,
             true,
         );
+        backend
+            .pstate
+            .direct
+            .sync_output_count(backend.platform.outputs.len());
         let live: Vec<_> = backend
             .platform
             .outputs
