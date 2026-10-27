@@ -256,7 +256,6 @@ impl SceneCompositor {
         if let Err(e) = ensure_intermediates(inner, input.outputs) {
             log::warn!("render scene tick: transform intermediate allocation failed: {e}");
         }
-        let hw_cursor = hw_cursor_allowed(input.outputs) && !input.hw_cursor_suppressed;
         if damage_audit_enabled() {
             emit_damage_audit_heartbeat(inner);
         }
@@ -295,6 +294,12 @@ impl SceneCompositor {
                 .filter(|(j, _)| *j != output_idx)
                 .flat_map(|(_, o)| o.last_pieces.iter().copied())
                 .collect();
+            let hw_cursor = hw_cursor_allowed(input.outputs)
+                && !input
+                    .hw_cursor_suppressed
+                    .get(output_idx)
+                    .copied()
+                    .unwrap_or(false);
             match tick_one_output(
                 inner,
                 output_idx,

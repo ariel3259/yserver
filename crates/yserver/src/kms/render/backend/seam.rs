@@ -54,9 +54,26 @@ pub trait Platform: OutputSink + Sized + 'static {
     fn tearing_active(_b: &XBackend<Self>) -> bool {
         false
     }
+    /// Per-output hardware-cursor suppression for a direct tearing owner.
+    fn tearing_cursor_suppression_mask(_b: &XBackend<Self>, output_count: usize) -> Vec<bool> {
+        vec![false; output_count]
+    }
+    /// Whether the tearing owner overlaps this cursor footprint.
+    fn tearing_cursor_intersects_owner(
+        _b: &XBackend<Self>,
+        _cursor_x: i64,
+        _cursor_y: i64,
+        _hot_x: i64,
+        _hot_y: i64,
+        _width: i64,
+        _height: i64,
+    ) -> bool {
+        false
+    }
     /// Whether the effective cursor sprite overlaps any live output.
     fn cursor_intersects_outputs(
         _b: &XBackend<Self>,
+        _output_indices: &[usize],
         _cursor_x: i64,
         _cursor_y: i64,
         _hot_x: i64,
@@ -81,6 +98,15 @@ pub trait Platform: OutputSink + Sized + 'static {
     fn exit_tearing_for_window(_b: &mut XBackend<Self>, _host_xid: u32, _reason: &'static str) {}
     /// Leave direct scanout for the composed scene.
     fn request_direct_unflip(_b: &mut XBackend<Self>, _reason: &'static str) {}
+    /// Unflip only direct owners whose outputs need a composed cursor upload.
+    fn request_direct_unflip_for_outputs(
+        _b: &mut XBackend<Self>,
+        _output_indices: &[usize],
+        _reason: &'static str,
+    ) {
+    }
+    /// Hand cursor visibility back from the tearing owner's outputs.
+    fn request_tearing_cursor_handoff(_b: &mut XBackend<Self>) {}
     /// Whether every direct frame is the COW or one of its descendants.
     fn direct_frames_are_under_cow(_b: &XBackend<Self>) -> bool {
         false
@@ -98,8 +124,8 @@ pub trait Platform: OutputSink + Sized + 'static {
     fn refresh_direct_cursor(
         _b: &mut XBackend<Self>,
         _record: &std::sync::Arc<crate::kms::render::cursor::CursorRecord>,
-    ) -> bool {
-        false
+    ) -> Vec<usize> {
+        Vec::new()
     }
     /// XFIXES HideCursor while no compose runs: detach the cursor planes.
     fn hide_cursor_under_direct_scanout(_b: &mut XBackend<Self>) {}

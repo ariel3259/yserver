@@ -276,7 +276,16 @@ pub(crate) fn establish_hardware_cursor(
     cursor: CursorHandle,
     pointer: (i32, i32),
 ) -> HardwareCursor {
-    let output_idx = 0;
+    establish_hardware_cursor_on_output(fixture, delivered, cursor, 0, pointer)
+}
+
+pub(crate) fn establish_hardware_cursor_on_output(
+    fixture: &mut AtomicPathFixture,
+    delivered: &mut HashSet<CompletionKey>,
+    cursor: CursorHandle,
+    output_idx: usize,
+    pointer: (i32, i32),
+) -> HardwareCursor {
     {
         let backend = &mut fixture.scene.events.backend;
         define_root_cursor(backend, cursor);

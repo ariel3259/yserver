@@ -412,12 +412,13 @@ impl KmsBackend {
         }
         let cow_host_xid = self.cow_host_xid();
         let outputs = self.platform.scene_output_layouts();
+        let hw_cursor_suppressed = self.tearing_cursor_suppression_mask();
         let input = crate::kms::render::backend::scene_input(
             &self.core,
             &self.windows,
             &outputs,
             self.platform.fb_dimensions(),
-            self.pstate.tearing.is_on(),
+            &hw_cursor_suppressed,
         );
         let skip_outputs: Vec<_> = (0..self.platform.outputs.len())
             .map(|output_idx| self.output_is_direct(output_idx))
