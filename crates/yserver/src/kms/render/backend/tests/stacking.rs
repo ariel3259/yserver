@@ -362,7 +362,16 @@ fn unredirected_direct_scanout_rejects_a_fullscreen_window_covered_by_a_raised_t
     b.sync_top_level_order(&state);
 
     assert!(
-        b.unredirected_direct_scene_eligible(synth_host_xid(fullscreen), (100, 100)),
+        b.unredirected_direct_scene_eligible(
+            synth_host_xid(fullscreen),
+            ash::vk::Rect2D {
+                offset: ash::vk::Offset2D::default(),
+                extent: ash::vk::Extent2D {
+                    width: 100,
+                    height: 100
+                },
+            },
+        ),
         "the mapped fullscreen window is eligible while no mapped top-level covers it"
     );
 
@@ -371,7 +380,16 @@ fn unredirected_direct_scanout_rejects_a_fullscreen_window_covered_by_a_raised_t
     b.sync_top_level_order(&state);
 
     assert!(
-        !b.unredirected_direct_scene_eligible(synth_host_xid(fullscreen), (100, 100)),
+        !b.unredirected_direct_scene_eligible(
+            synth_host_xid(fullscreen),
+            ash::vk::Rect2D {
+                offset: ash::vk::Offset2D::default(),
+                extent: ash::vk::Extent2D {
+                    width: 100,
+                    height: 100
+                },
+            },
+        ),
         "a raised mapped top-level must keep the covered fullscreen window out of direct scanout"
     );
 }
@@ -396,7 +414,16 @@ fn unredirected_direct_scanout_keeps_an_uncovered_depth32_fullscreen_window_elig
     b.sync_top_level_order(&state);
 
     assert!(
-        b.unredirected_direct_scene_eligible(synth_host_xid(fullscreen), (100, 100)),
+        b.unredirected_direct_scene_eligible(
+            synth_host_xid(fullscreen),
+            ash::vk::Rect2D {
+                offset: ash::vk::Offset2D::default(),
+                extent: ash::vk::Extent2D {
+                    width: 100,
+                    height: 100
+                },
+            },
+        ),
         "an uncovered depth-32 fullscreen window must retain direct-scanout eligibility"
     );
 }

@@ -1549,7 +1549,9 @@ fn p2_current_cursor_bind_clears_a_superseded_deferred_show_retry_scenario(
         "the scene leaves Mixed after current cursor B binds"
     );
     assert!(
-        fixture.scene.events.backend.direct_cursor_eligible(),
+        fixture.scene.events.backend.direct_cursor_eligible_for(
+            &(0..fixture.scene.events.backend.platform.outputs.len()).collect::<Vec<_>>(),
+        ),
         "a bound current cursor makes the direct cursor gate eligible"
     );
     assert_eq!(

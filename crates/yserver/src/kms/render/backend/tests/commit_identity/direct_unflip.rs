@@ -244,6 +244,32 @@ pub(crate) fn seed_output_owner_successor(
         fallback_override,
         paint_host_override,
     );
+    let output = &fixture.events.backend.platform.outputs[output_idx].output;
+    let candidate = frame.candidate;
+    fixture.events.backend.pstate.scanout_m1.entries.insert(
+        (
+            direct.source_id,
+            crate::kms::render::backend::DirectScope::Output(output_idx),
+        ),
+        crate::kms::render::backend::ScanoutM1ProbeEntry::accepted_with_shape(
+            crate::drm::modeset::DirectScanoutProbeFramebuffer::for_tests(
+                super::recording_scene::raw(
+                    0x8a00
+                        + u32::try_from(candidate.present_id).expect("test Present id fits")
+                        + u32::try_from(output_idx).expect("test output index fits"),
+                ),
+            ),
+            crate::drm::async_flip::AsyncShape {
+                fourcc: 0x3432_5258,
+                modifier: 0,
+                pitch: u32::from(candidate.src_width) * 4,
+                width: u32::from(candidate.src_width),
+                height: u32::from(candidate.src_height),
+                crtcs: vec![output.crtc],
+                direct: true,
+            },
+        ),
+    );
     let owner = &mut fixture.events.backend.pstate.direct.outputs[output_idx];
     assert!(!owner.active(), "output owner slot starts empty");
     owner.queued_successor = Some(frame);
@@ -285,6 +311,18 @@ fn submit_two_output_owner_successors(
     first: &DirectPresentSetup,
     second: &DirectPresentSetup,
 ) -> (AtomicCommitRecord, AtomicCommitRecord) {
+    fixture.events.backend.platform.outputs[0]
+        .output
+        .picked
+        .vrefresh = 75;
+    fixture.events.backend.platform.outputs[1]
+        .output
+        .picked
+        .vrefresh = 240;
+    assert_ne!(
+        fixture.events.backend.platform.outputs[1].x, 0,
+        "two-output fixtures keep a nonzero second-output origin"
+    );
     let device_fd = fd(fixture);
     let start = record_count(fixture, device_fd);
     seed_output_owner_successor(
@@ -450,7 +488,10 @@ fn output_owner_submits_and_unflips_only_its_crtc() {
     fixture.extra_drawables.push(source_xid);
     let output_crtc = fixture.events.backend.platform.outputs[1].output.crtc;
     fixture.events.backend.pstate.scanout_m1.entries.insert(
-        direct.source_id,
+        (
+            direct.source_id,
+            crate::kms::render::backend::DirectScope::Output(1),
+        ),
         crate::kms::render::backend::ScanoutM1ProbeEntry::accepted_with_shape(
             crate::drm::modeset::DirectScanoutProbeFramebuffer::for_tests(
                 super::recording_scene::raw(0x8203),

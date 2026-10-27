@@ -12,7 +12,6 @@ use ash::vk;
 use std::{
     collections::{HashMap, HashSet},
     io,
-    os::fd::AsFd as _,
     rc::Rc,
 };
 use yserver_core::{
@@ -117,19 +116,12 @@ fn direct_shape_chain_covers_root(
     shape_bounding: &HashMap<u32, Vec<xfixes::RegionRect>>,
     shape_clip: &HashMap<u32, Vec<xfixes::RegionRect>>,
     leaf_xid: u32,
-    root: (u32, u32),
+    root_rect: vk::Rect2D,
 ) -> bool {
     use crate::kms::render::region::Region;
 
     let Some(chain) = direct_shape_chain_root_offsets(windows, root_window_id, leaf_xid) else {
         return false;
-    };
-    let root_rect = vk::Rect2D {
-        offset: vk::Offset2D::default(),
-        extent: vk::Extent2D {
-            width: root.0,
-            height: root.1,
-        },
     };
     for &(xid, abs_x, abs_y) in chain.iter().rev() {
         for shapes in [shape_bounding, shape_clip] {
@@ -165,19 +157,12 @@ fn direct_shape_chain_hides_root(
     shape_bounding: &HashMap<u32, Vec<xfixes::RegionRect>>,
     shape_clip: &HashMap<u32, Vec<xfixes::RegionRect>>,
     leaf_xid: u32,
-    root: (u32, u32),
+    root_rect: vk::Rect2D,
 ) -> bool {
     use crate::kms::render::region::Region;
 
     let Some(chain) = direct_shape_chain_root_offsets(windows, root_window_id, leaf_xid) else {
         return false;
-    };
-    let root_rect = vk::Rect2D {
-        offset: vk::Offset2D::default(),
-        extent: vk::Extent2D {
-            width: root.0,
-            height: root.1,
-        },
     };
     let root_region = Region::from_rect(root_rect);
     for &(xid, abs_x, abs_y) in chain.iter().rev() {
@@ -261,7 +246,10 @@ pub(in crate::kms::render::backend) fn scanout_m1_probe_eligible(
             target,
             ScanoutM0Target::Cow | ScanoutM0Target::CowDescendant | ScanoutM0Target::Unredirected
         )
-        && matches!(coverage, ScanoutM0Coverage::Root)
+        && matches!(
+            coverage,
+            ScanoutM0Coverage::Root | ScanoutM0Coverage::Output(_)
+        )
         && x_off == 0
         && y_off == 0
         && valid_region_xid == 0
@@ -301,6 +289,7 @@ pub(in crate::kms::render::backend) fn scanout_m1_outputs_cover_root(
             || output.height == 0
             || output.width != output.mode_width
             || output.height != output.mode_height
+            || !scanout_m1_output_is_unoverlapped(index, outputs)
         {
             return false;
         }
@@ -309,18 +298,45 @@ pub(in crate::kms::render::backend) fn scanout_m1_outputs_cover_root(
         if x.saturating_add(output.width) > root.0 || y.saturating_add(output.height) > root.1 {
             return false;
         }
-        for other in &outputs[..index] {
-            let separated = output.x + i32::try_from(output.width).unwrap_or(i32::MAX) <= other.x
-                || other.x + i32::try_from(other.width).unwrap_or(i32::MAX) <= output.x
-                || output.y + i32::try_from(output.height).unwrap_or(i32::MAX) <= other.y
-                || other.y + i32::try_from(other.height).unwrap_or(i32::MAX) <= output.y;
-            if !separated {
-                return false;
-            }
-        }
         area = area.saturating_add(u64::from(output.width) * u64::from(output.height));
     }
     area == u64::from(root.0) * u64::from(root.1)
+}
+
+/// Per-output geometry shared by Root tiling and Output admission. Output
+/// scope uses the selected mode-size and separation checks without requiring
+/// the other monitors to tile the virtual root.
+pub(in crate::kms::render::backend) fn scanout_m1_output_is_unoverlapped(
+    output_idx: usize,
+    outputs: &[ScanoutM1OutputGeometry],
+) -> bool {
+    let Some(output) = outputs.get(output_idx) else {
+        return false;
+    };
+    if output.width == 0
+        || output.height == 0
+        || output.width != output.mode_width
+        || output.height != output.mode_height
+    {
+        return false;
+    }
+    let x0 = i64::from(output.x);
+    let y0 = i64::from(output.y);
+    let x1 = x0 + i64::from(output.width);
+    let y1 = y0 + i64::from(output.height);
+    outputs.iter().enumerate().all(|(other_idx, other)| {
+        if other_idx == output_idx {
+            return true;
+        }
+        if other.width == 0 || other.height == 0 {
+            return false;
+        }
+        let other_x0 = i64::from(other.x);
+        let other_y0 = i64::from(other.y);
+        let other_x1 = other_x0 + i64::from(other.width);
+        let other_y1 = other_y0 + i64::from(other.height);
+        x1 <= other_x0 || other_x1 <= x0 || y1 <= other_y0 || other_y1 <= y0
+    })
 }
 
 impl KmsBackend {
@@ -461,27 +477,25 @@ impl KmsBackend {
     /// The direct scanout cursor gate depends on KMS plane visibility, so it
     /// stays with the KMS implementation while cursor image policy remains
     /// portable.
-    pub(in crate::kms::render::backend) fn direct_cursor_eligible(&self) -> bool {
+    pub(in crate::kms::render::backend) fn direct_cursor_eligible_for(
+        &self,
+        output_indices: &[usize],
+    ) -> bool {
         if self.effective_cursor_hidden() {
-            return !self.platform.any_cursor_plane_visible()
-                || (self.pstate.direct.root().active()
-                    && self
-                        .platform
-                        .outputs
-                        .iter()
-                        .enumerate()
-                        .all(|(output_idx, _)| {
-                            !self.platform.cursor_plane_visible_for_output(output_idx)
-                                || self
-                                    .pstate
-                                    .direct
-                                    .root()
-                                    .direct_cursor_refresh_pending
-                                    .contains(&output_idx)
-                        }));
+            return output_indices.iter().all(|&output_idx| {
+                !self.platform.cursor_plane_visible_for_output(output_idx)
+                    || self
+                        .pstate
+                        .direct
+                        .scope_for_output(output_idx)
+                        .and_then(|scope| self.pstate.direct.get(scope))
+                        .is_some_and(|owner| {
+                            owner.direct_cursor_refresh_pending.contains(&output_idx)
+                        })
+            });
         }
         matches!(
-            self.scene.cursor_mode(),
+            self.scene.cursor_mode_for_outputs(output_indices),
             crate::kms::render::scene::CursorPlaneMode::Hw
                 | crate::kms::render::scene::CursorPlaneMode::Hidden
         )
@@ -1072,7 +1086,7 @@ impl KmsBackend {
             .pstate
             .scanout_m1
             .entries
-            .get(&frame.source_id)
+            .get(&(frame.source_id, scope))
             .and_then(ScanoutM1ProbeEntry::framebuffer)
             .map(crate::drm::modeset::DirectScanoutProbeFramebuffer::handle)
             .ok_or_else(|| io::Error::other("direct successor framebuffer disappeared"))?;
@@ -1119,7 +1133,7 @@ impl KmsBackend {
                 self.pstate
                     .scanout_m1
                     .entries
-                    .get(&frame.source_id)
+                    .get(&(frame.source_id, scope))
                     .and_then(|entry| entry.async_shape.clone())
                     .ok_or_else(|| {
                         io::Error::other("direct async submit has no probed buffer shape")
@@ -1539,11 +1553,12 @@ impl KmsBackend {
         output_idx: usize,
     ) -> Option<::drm::control::framebuffer::Handle> {
         if let Some(frame) = self.direct_scanout_frame_for_output(output_idx) {
+            let scope = self.pstate.direct.scope_for_output(output_idx)?;
             return self
                 .pstate
                 .scanout_m1
                 .entries
-                .get(&frame.source_id)
+                .get(&(frame.source_id, scope))
                 .and_then(ScanoutM1ProbeEntry::framebuffer)
                 .map(crate::drm::modeset::DirectScanoutProbeFramebuffer::handle);
         }
@@ -1565,6 +1580,7 @@ impl KmsBackend {
     pub(super) fn direct_frame_flip_timing(
         &self,
         frame: &DirectPresentFrame,
+        scope: DirectScope,
     ) -> crate::drm::async_flip::FlipTiming {
         let owns_stream = matches!(
             self.pstate.tearing.state,
@@ -1579,7 +1595,7 @@ impl KmsBackend {
             .pstate
             .scanout_m1
             .entries
-            .get(&frame.source_id)
+            .get(&(frame.source_id, scope))
             .and_then(|entry| entry.async_shape.as_ref());
         if owns_stream
             && frame.candidate.options & yserver_core::present_scheduler::PRESENT_OPTION_ASYNC != 0
@@ -1621,7 +1637,7 @@ impl KmsBackend {
         else {
             return;
         };
-        let timing = self.direct_frame_flip_timing(&successor);
+        let timing = self.direct_frame_flip_timing(&successor, scope);
         match self.submit_direct_frame(&mut successor, scope, timing) {
             Ok(_) => {
                 log::debug!(
@@ -1767,7 +1783,7 @@ impl KmsBackend {
             owner.unflip_outputs_to_replace.clear();
             owner.unflip_awaiting_outputs.clear();
             owner.reentry_blocked_until_composed = false;
-            owner.reset_eligible_root_probation();
+            owner.reset_eligible_direct_probation();
             owner.unflip_fallback_source = None;
             owner.unflip_shadow_ready = false;
             owner.degraded_composed_unflip = false;
@@ -2001,7 +2017,7 @@ impl KmsBackend {
             return Ok(false);
         }
         let output_scope_is_primary = match scope {
-            DirectScope::Root => self.direct_scanout_topology_eligible(),
+            DirectScope::Root => self.direct_scanout_topology_eligible(DirectScope::Root),
             DirectScope::Output(output_idx) => {
                 self.platform.outputs.get(output_idx).is_some_and(|layout| {
                     self.platform
@@ -2124,7 +2140,7 @@ impl KmsBackend {
 
         let outputs = self.direct_scope_outputs(scope);
         let scope_is_on_primary = match scope {
-            DirectScope::Root => self.direct_scanout_topology_eligible(),
+            DirectScope::Root => self.direct_scanout_topology_eligible(DirectScope::Root),
             DirectScope::Output(output_idx) => {
                 self.platform.outputs.get(output_idx).is_some_and(|layout| {
                     self.platform
@@ -2519,20 +2535,50 @@ impl KmsBackend {
     /// the slowest CRTC; keep those layouts on the normal per-output composed
     /// path so each output retains its native cadence. Rates within 0.5% (two
     /// "60 Hz" monitors) are grouped, like Xorg's multi-CRTC flip.
-    pub(in crate::kms::render::backend) fn direct_scanout_topology_eligible(&self) -> bool {
+    pub(in crate::kms::render::backend) fn direct_scanout_topology_eligible(
+        &self,
+        scope: DirectScope,
+    ) -> bool {
         let Some(primary) = self.platform.primary_device() else {
             return false;
         };
-        let Some(first) = self.platform.outputs.first() else {
-            return false;
-        };
-        if first.key.device_key != primary.key {
-            return false;
+        match scope {
+            DirectScope::Root => {
+                let Some(first) = self.platform.outputs.first() else {
+                    return false;
+                };
+                first.key.device_key == primary.key
+                    && self.platform.outputs.iter().all(|layout| {
+                        layout.key.device_key == primary.key
+                            && effective_refresh_matches(
+                                &first.output.picked,
+                                &layout.output.picked,
+                            )
+                    })
+            }
+            DirectScope::Output(output_idx) => {
+                let Some(layout) = self.platform.outputs.get(output_idx) else {
+                    return false;
+                };
+                if layout.key.device_key != primary.key {
+                    return false;
+                }
+                let geometries: Vec<_> = self
+                    .platform
+                    .outputs
+                    .iter()
+                    .map(|layout| ScanoutM1OutputGeometry {
+                        x: layout.x,
+                        y: layout.y,
+                        width: u32::from(layout.width),
+                        height: u32::from(layout.height),
+                        mode_width: u32::from(layout.output.picked.width),
+                        mode_height: u32::from(layout.output.picked.height),
+                    })
+                    .collect();
+                scanout_m1_output_is_unoverlapped(output_idx, &geometries)
+            }
         }
-        self.platform.outputs.iter().all(|layout| {
-            layout.key.device_key == primary.key
-                && effective_refresh_matches(&first.output.picked, &layout.output.picked)
-        })
     }
 
     /// A whole-root direct Present is paced in the selected RANDR CRTC's
@@ -2542,19 +2588,28 @@ impl KmsBackend {
     /// homogeneous single-device topology accepted by the grouped path.
     pub(in crate::kms::render::backend) fn direct_present_crtc_eligible(
         &self,
+        scope: DirectScope,
         crtc_id: u32,
         crtc_epoch: u64,
     ) -> bool {
         if crtc_epoch == 0 || self.present_crtc_clock_epoch(crtc_id) != crtc_epoch {
             return false;
         }
-        let Some(crtc_key) = self.present_crtc_key(crtc_id) else {
+        let Some((selected_output_idx, crtc_key)) = self.present_crtc_output(crtc_id) else {
             return false;
         };
-        self.platform
+        let on_primary = self
+            .platform
             .primary_device()
-            .is_some_and(|primary| crtc_key.device_key == primary.key)
-            && self.direct_scanout_topology_eligible()
+            .is_some_and(|primary| crtc_key.device_key == primary.key);
+        on_primary
+            && match scope {
+                DirectScope::Root => self.direct_scanout_topology_eligible(DirectScope::Root),
+                DirectScope::Output(output_idx) => {
+                    selected_output_idx == output_idx
+                        && self.direct_scanout_topology_eligible(scope)
+                }
+            }
     }
 
     pub(in crate::kms::render::backend) fn maybe_probe_scanout_m1(
@@ -2562,15 +2617,33 @@ impl KmsBackend {
         source_id: Option<DrawableId>,
         target: ScanoutM0Target,
         coverage: ScanoutM0Coverage,
+        scope: Option<DirectScope>,
         candidate: PresentScanoutCandidate,
     ) {
+        let Some(scope) = scope else {
+            return;
+        };
+        let output_indices = self.direct_scope_outputs(scope);
+        let root_overlay_empty = output_indices.iter().all(|&output_idx| {
+            self.platform.outputs.get(output_idx).is_some_and(|output| {
+                self.scene
+                    .root_overlay
+                    .apply_list_for_output((
+                        output.x,
+                        output.y,
+                        u32::from(output.width),
+                        u32::from(output.height),
+                    ))
+                    .is_empty()
+            })
+        });
         if self.platform.any_output_transformed()
-            || !self.direct_present_crtc_eligible(candidate.crtc_id, candidate.crtc_epoch)
+            || !self.direct_present_crtc_eligible(scope, candidate.crtc_id, candidate.crtc_epoch)
             || !scanout_m1_probe_eligible(
                 self.scanout_allowed(),
                 self.kms_outputs_active,
-                self.direct_cursor_eligible(),
-                self.scene.root_overlay.is_empty(),
+                self.direct_cursor_eligible_for(&output_indices),
+                root_overlay_empty,
                 target,
                 coverage,
                 candidate.x_off,
@@ -2602,7 +2675,12 @@ impl KmsBackend {
                 .sync_output_count(self.platform.outputs.len());
             self.pstate.scanout_m1.topology_signature = topology_signature;
         }
-        if self.pstate.scanout_m1.entries.contains_key(&source_id) {
+        if self
+            .pstate
+            .scanout_m1
+            .entries
+            .contains_key(&(source_id, scope))
+        {
             return;
         }
 
@@ -2612,7 +2690,12 @@ impl KmsBackend {
             .outputs
             .iter()
             .map(|layout| {
-                let (mode_width, mode_height) = layout.output.mode.size();
+                let (mode_width, mode_height) = match scope {
+                    DirectScope::Root => layout.output.mode.size(),
+                    DirectScope::Output(_) => {
+                        (layout.output.picked.width, layout.output.picked.height)
+                    }
+                };
                 ScanoutM1OutputGeometry {
                     x: layout.x,
                     y: layout.y,
@@ -2623,220 +2706,192 @@ impl KmsBackend {
                 }
             })
             .collect();
-        if !scanout_m1_outputs_cover_root(root, &output_geometry) {
+        let geometry_eligible = match scope {
+            DirectScope::Root => scanout_m1_outputs_cover_root(root, &output_geometry),
+            DirectScope::Output(output_idx) => {
+                scanout_m1_output_is_unoverlapped(output_idx, &output_geometry)
+            }
+        };
+        if !geometry_eligible {
             log::debug!(
-                "scanout_m1: source_id={} skipped: active outputs do not exactly tile root {:?}: {:?}",
+                "scanout_m1: source_id={} skipped: invalid {scope:?} output geometry {:?}",
                 source_id.as_u64(),
-                root,
                 output_geometry,
             );
             self.pstate
                 .scanout_m1
                 .entries
-                .insert(source_id, ScanoutM1ProbeEntry::rejected());
+                .insert((source_id, scope), ScanoutM1ProbeEntry::rejected());
             self.pstate.scanout_m0.m1_probe_reject =
                 self.pstate.scanout_m0.m1_probe_reject.saturating_add(1);
             return;
         }
 
-        let import = self.store.get(source_id).and_then(|drawable| {
-            let metadata = drawable.storage.imported_dmabuf.as_ref()?;
-            // An unresolved layout must never reach KMS. The client never
-            // named it (legacy `PixmapFromBuffer`), so `metadata.modifier`
-            // is our linear guess; scanning a tiled buffer out as linear
-            // puts garbage on the display, and `add_fb2` may well accept
-            // it. Refuse the direct path and let the ordinary composite
-            // handle the pixmap instead.
-            if metadata.implicit_layout {
-                return None;
-            }
-            let plane = metadata.planes.first()?;
-            let fd = drawable
-                .storage
-                .imported_drawable
-                .as_ref()?
-                .imported_dma_buf_fd()?;
-            Some((
-                metadata.fourcc,
-                metadata.vk_format,
-                metadata.modifier,
-                metadata.planes.len(),
-                plane.offset,
-                plane.pitch,
-                metadata.width,
-                metadata.height,
-                metadata.depth,
-                metadata.bpp,
-                fd.try_clone_to_owned(),
-            ))
-        });
-        let Some((
-            fourcc,
-            vk_format,
-            modifier,
-            plane_count,
-            offset,
-            pitch,
-            width,
-            height,
-            depth,
-            bpp,
-            fd_result,
-        )) = import
-        else {
-            self.pstate.scanout_m0.m1_gate_reject_import = self
-                .pstate
-                .scanout_m0
-                .m1_gate_reject_import
-                .saturating_add(1);
-            return;
-        };
-        const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
-        if fourcc != DRM_FORMAT_XRGB8888
-            || vk_format != vk::Format::B8G8R8A8_UNORM
-            || plane_count != 1
-            || depth != 24
-            || bpp != 32
-            || pitch == 0
-            || (u32::from(width), u32::from(height)) != root
-            || (candidate.src_width, candidate.src_height) != (width, height)
-            || self.platform.outputs.iter().any(|layout| {
-                !layout.output.scanout_modifiers.is_empty()
-                    && !layout.output.scanout_modifiers.contains(&modifier)
+        let plane_states: Vec<crate::drm::modeset::DirectScanoutPlaneState<'_>> = output_indices
+            .iter()
+            .map(|&output_idx| {
+                let layout = &self.platform.outputs[output_idx];
+                let (src_x, src_y) = match scope {
+                    DirectScope::Root => (
+                        u32::try_from(layout.x).expect("root geometry validated non-negative"),
+                        u32::try_from(layout.y).expect("root geometry validated non-negative"),
+                    ),
+                    DirectScope::Output(_) => (0, 0),
+                };
+                crate::drm::modeset::DirectScanoutPlaneState {
+                    output: &layout.output,
+                    src_x,
+                    src_y,
+                    src_w: u32::from(layout.width),
+                    src_h: u32::from(layout.height),
+                }
             })
-        {
-            log::debug!(
-                "scanout_m1: source_id={} skipped: incompatible metadata fourcc={fourcc:#010x} \
-                 vk_format={vk_format:?} modifier={modifier:#x} planes={plane_count} \
-                 size={}x{} depth={depth} bpp={bpp} pitch={pitch}",
-                source_id.as_u64(),
-                width,
-                height,
-            );
-            self.pstate
-                .scanout_m1
-                .entries
-                .insert(source_id, ScanoutM1ProbeEntry::rejected());
-            self.pstate.scanout_m0.m1_probe_reject =
-                self.pstate.scanout_m0.m1_probe_reject.saturating_add(1);
-            return;
-        }
-        let fd = match fd_result {
-            Ok(fd) => fd,
+            .collect();
+        let prober = self.pstate.scanout_m1_prober;
+        match prober(self, source_id, scope, &plane_states) {
+            Ok(entry) => {
+                if entry.framebuffer().is_some() {
+                    self.pstate.scanout_m0.m1_probe_pass =
+                        self.pstate.scanout_m0.m1_probe_pass.saturating_add(1);
+                } else {
+                    self.pstate.scanout_m0.m1_probe_reject =
+                        self.pstate.scanout_m0.m1_probe_reject.saturating_add(1);
+                }
+                self.pstate
+                    .scanout_m1
+                    .entries
+                    .insert((source_id, scope), entry);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.pstate.scanout_m0.m1_gate_reject_import = self
+                    .pstate
+                    .scanout_m0
+                    .m1_gate_reject_import
+                    .saturating_add(1);
+            }
             Err(error) => {
                 log::warn!(
-                    "scanout_m1: source_id={} dma-buf dup failed: {error}",
-                    source_id.as_u64()
+                    "scanout_m1: import/probe failed source_id={} scope={scope:?}: {error}",
+                    source_id.as_u64(),
                 );
                 self.pstate
                     .scanout_m1
                     .entries
-                    .insert(source_id, ScanoutM1ProbeEntry::rejected());
+                    .insert((source_id, scope), ScanoutM1ProbeEntry::rejected());
                 self.pstate.scanout_m0.m1_probe_error =
                     self.pstate.scanout_m0.m1_probe_error.saturating_add(1);
-                return;
+            }
+        }
+    }
+
+    pub(in crate::kms::render::backend) fn probe_direct_scanout_m1_live(
+        &self,
+        source_id: DrawableId,
+        scope: DirectScope,
+        planes: &[crate::drm::modeset::DirectScanoutPlaneState<'_>],
+    ) -> io::Result<ScanoutM1ProbeEntry> {
+        use std::os::fd::AsFd as _;
+
+        let Some(drawable) = self.store.get(source_id) else {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "M1 source retired"));
+        };
+        let Some(metadata) = drawable.storage.imported_dmabuf.as_ref() else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "M1 source is not dma-buf",
+            ));
+        };
+        // A layout guessed by the legacy import path cannot safely reach KMS.
+        if metadata.implicit_layout {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "M1 source has an implicit layout",
+            ));
+        }
+        let Some(plane) = metadata.planes.first() else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "M1 source has no plane",
+            ));
+        };
+        let Some(fd) = drawable
+            .storage
+            .imported_drawable
+            .as_ref()
+            .and_then(|imported| imported.imported_dma_buf_fd())
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "M1 source fd unavailable",
+            ));
+        };
+        let fd = fd
+            .try_clone_to_owned()
+            .map_err(|error| io::Error::other(format!("M1 dma-buf dup failed: {error}")))?;
+        let (expected_width, expected_height) = match scope {
+            DirectScope::Root => (u32::from(self.platform.fb_w), u32::from(self.platform.fb_h)),
+            DirectScope::Output(output_idx) => {
+                let Some(output) = self.platform.outputs.get(output_idx) else {
+                    return Ok(ScanoutM1ProbeEntry::rejected());
+                };
+                (u32::from(output.width), u32::from(output.height))
             }
         };
-        let plane_states: Vec<crate::drm::modeset::DirectScanoutPlaneState<'_>> = self
-            .platform
-            .outputs
-            .iter()
-            .map(|layout| crate::drm::modeset::DirectScanoutPlaneState {
-                output: &layout.output,
-                src_x: u32::try_from(layout.x).expect("geometry validated non-negative"),
-                src_y: u32::try_from(layout.y).expect("geometry validated non-negative"),
-                src_w: u32::from(layout.width),
-                src_h: u32::from(layout.height),
+        const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
+        if metadata.fourcc != DRM_FORMAT_XRGB8888
+            || metadata.vk_format != vk::Format::B8G8R8A8_UNORM
+            || metadata.planes.len() != 1
+            || metadata.depth != 24
+            || metadata.bpp != 32
+            || plane.pitch == 0
+            || (u32::from(metadata.width), u32::from(metadata.height))
+                != (expected_width, expected_height)
+            || planes.iter().any(|state| {
+                !state.output.scanout_modifiers.is_empty()
+                    && !state.output.scanout_modifiers.contains(&metadata.modifier)
             })
-            .collect();
+        {
+            return Ok(ScanoutM1ProbeEntry::rejected());
+        }
         let Some(primary) = self.platform.primary_device() else {
-            self.pstate
-                .scanout_m1
-                .entries
-                .insert(source_id, ScanoutM1ProbeEntry::rejected());
-            self.pstate.scanout_m0.m1_probe_reject =
-                self.pstate.scanout_m0.m1_probe_reject.saturating_add(1);
-            return;
+            return Ok(ScanoutM1ProbeEntry::rejected());
         };
-        let output_indices: Vec<_> = (0..self.platform.outputs.len()).collect();
+        let output_indices = self.direct_scope_outputs(scope);
         let cursor_positions = self
             .platform
             .cursor_plane_atomic_positions_for_outputs(&output_indices);
-        let result = crate::drm::modeset::probe_direct_scanout_test_only(
+        match crate::drm::modeset::probe_direct_scanout_test_only(
             Rc::clone(&primary.device),
             fd.as_fd(),
-            u32::from(width),
-            u32::from(height),
-            fourcc,
-            modifier,
-            offset,
-            pitch,
+            u32::from(metadata.width),
+            u32::from(metadata.height),
+            metadata.fourcc,
+            metadata.modifier,
+            plane.offset,
+            plane.pitch,
             primary.atomic_commit_sink.as_ref(),
-            &plane_states,
+            planes,
             &cursor_positions,
-        );
-        match result {
-            Ok(crate::drm::modeset::DirectScanoutTestResult::Accepted(framebuffer)) => {
-                log::debug!(
-                    "scanout_m1: TEST_ONLY passed source_id={} drawable_host={:#x} \
-                     root={}x{} modifier={modifier:#x} pitch={pitch} outputs={:?}; \
-                     live scanout unchanged",
-                    source_id.as_u64(),
-                    candidate.src_host_xid,
-                    width,
-                    height,
-                    output_geometry,
-                );
-                let mut crtcs: Vec<_> = self
-                    .platform
-                    .outputs
-                    .iter()
-                    .map(|layout| layout.output.crtc)
-                    .collect();
+        )? {
+            crate::drm::modeset::DirectScanoutTestResult::Accepted(framebuffer) => {
+                let mut crtcs: Vec<_> = planes.iter().map(|state| state.output.crtc).collect();
                 crtcs.sort_by_key(|crtc| u32::from(*crtc));
-                self.pstate.scanout_m1.entries.insert(
-                    source_id,
-                    ScanoutM1ProbeEntry::accepted_with_shape(
-                        framebuffer,
-                        crate::drm::async_flip::AsyncShape {
-                            fourcc,
-                            modifier,
-                            pitch,
-                            width: u32::from(width),
-                            height: u32::from(height),
-                            crtcs,
-                            direct: true,
-                        },
-                    ),
-                );
-                self.pstate.scanout_m0.m1_probe_pass =
-                    self.pstate.scanout_m0.m1_probe_pass.saturating_add(1);
+                Ok(ScanoutM1ProbeEntry::accepted_with_shape(
+                    framebuffer,
+                    crate::drm::async_flip::AsyncShape {
+                        fourcc: metadata.fourcc,
+                        modifier: metadata.modifier,
+                        pitch: plane.pitch,
+                        width: u32::from(metadata.width),
+                        height: u32::from(metadata.height),
+                        crtcs,
+                        direct: true,
+                    },
+                ))
             }
-            Ok(crate::drm::modeset::DirectScanoutTestResult::Rejected(error)) => {
-                log::debug!(
-                    "scanout_m1: TEST_ONLY rejected source_id={} drawable_host={:#x}: {error}",
-                    source_id.as_u64(),
-                    candidate.src_host_xid,
-                );
-                self.pstate
-                    .scanout_m1
-                    .entries
-                    .insert(source_id, ScanoutM1ProbeEntry::rejected());
-                self.pstate.scanout_m0.m1_probe_reject =
-                    self.pstate.scanout_m0.m1_probe_reject.saturating_add(1);
-            }
-            Err(error) => {
-                log::warn!(
-                    "scanout_m1: import/probe failed source_id={} drawable_host={:#x}: {error}",
-                    source_id.as_u64(),
-                    candidate.src_host_xid,
-                );
-                self.pstate
-                    .scanout_m1
-                    .entries
-                    .insert(source_id, ScanoutM1ProbeEntry::rejected());
-                self.pstate.scanout_m0.m1_probe_error =
-                    self.pstate.scanout_m0.m1_probe_error.saturating_add(1);
+            crate::drm::modeset::DirectScanoutTestResult::Rejected(error) => {
+                log::debug!("scanout_m1: TEST_ONLY rejected {scope:?}: {error}");
+                Ok(ScanoutM1ProbeEntry::rejected())
             }
         }
     }
@@ -2873,7 +2928,7 @@ impl KmsBackend {
     pub(in crate::kms::render::backend) fn direct_shape_chain_covers_root(
         &self,
         leaf_xid: u32,
-        root: (u32, u32),
+        root_rect: vk::Rect2D,
     ) -> bool {
         direct_shape_chain_covers_root(
             &self.windows,
@@ -2881,14 +2936,14 @@ impl KmsBackend {
             &self.core.shape_bounding,
             &self.core.shape_clip,
             leaf_xid,
-            root,
+            root_rect,
         )
     }
 
     pub(in crate::kms::render::backend) fn direct_shape_chain_hides_root(
         &self,
         leaf_xid: u32,
-        root: (u32, u32),
+        root_rect: vk::Rect2D,
     ) -> bool {
         direct_shape_chain_hides_root(
             &self.windows,
@@ -2896,7 +2951,7 @@ impl KmsBackend {
             &self.core.shape_bounding,
             &self.core.shape_clip,
             leaf_xid,
-            root,
+            root_rect,
         )
     }
 
@@ -2904,30 +2959,22 @@ impl KmsBackend {
     /// Clip shape that no longer covers the root. A compositor may shape the
     /// COW without presenting again, so the shape change itself must unflip.
     pub(in crate::kms::render::backend) fn direct_frames_shaped_off_root(&self) -> bool {
-        let root = (u32::from(self.platform.fb_w), u32::from(self.platform.fb_h));
-        let shaped_off = |frame: &DirectPresentFrame| {
-            !self.direct_shape_chain_covers_root(frame.candidate.paint_dst_host_xid, root)
-        };
-        self.pstate
-            .direct
-            .root()
-            .pending
-            .as_ref()
-            .is_some_and(shaped_off)
-            || self
-                .pstate
-                .direct
-                .root()
-                .queued_successor
-                .as_ref()
-                .is_some_and(shaped_off)
-            || self
-                .pstate
-                .direct
-                .root()
-                .current
-                .as_ref()
-                .is_some_and(shaped_off)
+        self.pstate.direct.active_scopes().into_iter().any(|scope| {
+            let Some(owner) = self.pstate.direct.get(scope) else {
+                return false;
+            };
+            let rect = self.direct_scope_rect(scope);
+            [
+                owner.pending.as_ref(),
+                owner.queued_successor.as_ref(),
+                owner.current.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|frame| {
+                !self.direct_shape_chain_covers_root(frame.candidate.paint_dst_host_xid, rect)
+            })
+        })
     }
 
     /// Whether an unredirected Present target is still the window which the
@@ -2937,7 +2984,7 @@ impl KmsBackend {
     pub(in crate::kms::render::backend) fn unredirected_direct_scene_eligible(
         &self,
         leaf_xid: u32,
-        root: (u32, u32),
+        direct_rect: vk::Rect2D,
     ) -> bool {
         let mut top_xid = leaf_xid;
         let mut reached_top_level = false;
@@ -2965,13 +3012,19 @@ impl KmsBackend {
         let Some(candidate) = self.windows.get(&top_xid) else {
             return false;
         };
-        let root_w = i32::try_from(root.0).unwrap_or(i32::MAX);
-        let root_h = i32::try_from(root.1).unwrap_or(i32::MAX);
-        let covers_root = i32::from(candidate.x) <= 0
-            && i32::from(candidate.y) <= 0
-            && i32::from(candidate.x) + i32::from(candidate.width) >= root_w
-            && i32::from(candidate.y) + i32::from(candidate.height) >= root_h;
-        if !candidate.mapped || !covers_root {
+        let rect_x = direct_rect.offset.x;
+        let rect_y = direct_rect.offset.y;
+        let rect_right =
+            rect_x.saturating_add(i32::try_from(direct_rect.extent.width).unwrap_or(i32::MAX));
+        let rect_bottom =
+            rect_y.saturating_add(i32::try_from(direct_rect.extent.height).unwrap_or(i32::MAX));
+        let candidate_right = i32::from(candidate.x) + i32::from(candidate.width);
+        let candidate_bottom = i32::from(candidate.y) + i32::from(candidate.height);
+        let covers_rect = i32::from(candidate.x) <= rect_x
+            && i32::from(candidate.y) <= rect_y
+            && candidate_right >= rect_right
+            && candidate_bottom >= rect_bottom;
+        if !candidate.mapped || !covers_rect {
             return false;
         }
 
@@ -2985,10 +3038,10 @@ impl KmsBackend {
             .find(|&&xid| {
                 self.windows.get(&xid).is_some_and(|geometry| {
                     geometry.mapped
-                        && i32::from(geometry.x) < root_w
-                        && i32::from(geometry.y) < root_h
-                        && i32::from(geometry.x) + i32::from(geometry.width) > 0
-                        && i32::from(geometry.y) + i32::from(geometry.height) > 0
+                        && i32::from(geometry.x) < rect_right
+                        && i32::from(geometry.y) < rect_bottom
+                        && i32::from(geometry.x) + i32::from(geometry.width) > rect_x
+                        && i32::from(geometry.y) + i32::from(geometry.height) > rect_y
                 })
             });
         topmost_on_root.is_some_and(|&xid| xid == top_xid)
@@ -3041,6 +3094,7 @@ impl KmsBackend {
         let paint_target = self.resolve_paint_target(candidate.paint_dst_host_xid);
         let paint_id = paint_target.map(|target| target.backing_id());
         let target = self.scanout_m0_target(candidate.paint_dst_host_xid, leaf_id, paint_id);
+        let direct_scope = self.direct_candidate_scope(candidate, target);
         let rect = leaf_id
             .and_then(|id| self.window_absolute_rect(id))
             .map(|rect| {
@@ -3108,13 +3162,29 @@ impl KmsBackend {
             candidate.y_off,
             candidate.valid_region_xid,
         );
-        let crtc_eligible =
-            self.direct_present_crtc_eligible(candidate.crtc_id, candidate.crtc_epoch);
+        let crtc_eligible = direct_scope.is_some_and(|scope| {
+            self.direct_present_crtc_eligible(scope, candidate.crtc_id, candidate.crtc_epoch)
+        });
         let scanout_allowed = self.scanout_allowed();
         let kms_outputs_active = self.kms_outputs_active;
-        let cursor_mode = self.scene.cursor_mode();
-        let cursor_hw = self.direct_cursor_eligible();
-        let root_overlay_empty = self.scene.root_overlay.is_empty();
+        let scope_outputs = direct_scope
+            .map(|scope| self.direct_scope_outputs(scope))
+            .unwrap_or_default();
+        let cursor_mode = self.scene.cursor_mode_for_outputs(&scope_outputs);
+        let cursor_hw = self.direct_cursor_eligible_for(&scope_outputs);
+        let root_overlay_empty = scope_outputs.iter().all(|&output_idx| {
+            self.platform.outputs.get(output_idx).is_some_and(|output| {
+                self.scene
+                    .root_overlay
+                    .apply_list_for_output((
+                        output.x,
+                        output.y,
+                        u32::from(output.width),
+                        u32::from(output.height),
+                    ))
+                    .is_empty()
+            })
+        });
         // Page flipping is off while any CRTC is transformed
         // (modesetting/present.c:266).
         let untransformed = !self.platform.any_output_transformed();
@@ -3126,7 +3196,7 @@ impl KmsBackend {
             && root_overlay_empty
             && untransformed
             && source_id.is_some();
-        self.maybe_probe_scanout_m1(source_id, target, coverage, candidate);
+        self.maybe_probe_scanout_m1(source_id, target, coverage, direct_scope, candidate);
         let diag = &mut self.pstate.scanout_m0;
         diag.presents = diag.presents.saturating_add(1);
         if authoritative {
