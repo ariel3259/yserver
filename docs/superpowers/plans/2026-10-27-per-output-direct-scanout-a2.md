@@ -77,7 +77,7 @@
 - Modify: `backend/portable/compose.rs` (~116 `tearing_active`), `backend/portable/cursor.rs` (~694: the early return while any direct owner exists → skip only for outputs that are direct, so composed outputs refresh their cursor image)
 - Modify: pointer routing — `kms/platform_hooks.rs` `move_hw_cursor` (~294: cross-CRTC membership detection is disabled whenever any direct owner exists → disabled only for direct outputs, reusing the existing output-membership check, so entering an idle composed output binds/shows its cursor plane; `platform/cursor.rs` ~1367 moves only bound planes) and `backend/portable/pointer.rs` (~622: a tearing owner routes all pointer motion away from hardware movement → only motion on the tearing owner's outputs)
 - Modify: `crates/yserver-render/src/kms/render/scene.rs` (`SceneInput::hw_cursor_suppressed` ~132 becomes per output, indexed like the skip mask) and `scene/tick.rs` (~259 consumer); `scene/cursor.rs` (external-cursor sync pending-acknowledgement check ~206 takes the outputs; the mode query already did in Task 1)
-- Test: `tests/cursor_sprites/scene_attach.rs` (`held_direct_with_two_outputs` ~2775), `tests/tearing.rs`
+- Test: `tests/cursor_sprites/scene_attach.rs` (`held_direct_with_two_outputs` ~2803), `tests/tearing.rs`
 
 **Interfaces:**
 - Consumes: Task 1 (`direct_cursor_eligible_for`, scopes).
