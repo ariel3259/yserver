@@ -2754,6 +2754,50 @@ fn composed_output_flips_while_other_output_owner_held() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: let the degraded unflip pass use the normal mask, composing output 0 as well.
+fn degraded_output_unflip_composes_only_its_replacement_output() {
+    use yserver_core::backend::Backend;
+
+    let Some(mut backend) = live_scene_backend_with_outputs(2) else {
+        return;
+    };
+    let recorder = recording_sink(&mut backend, 0);
+    seed_held_output_owner(&mut backend, 1, 0x7488);
+    let owner = &mut backend.pstate.direct.outputs[1];
+    owner.hold_direct = false;
+    owner.unflip_requested = true;
+    owner.unflip_reason = Some("test_degraded_unflip");
+    owner.unflip_shadow_ready = true;
+    recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
+    recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
+    let before = recorder.records().len();
+
+    Backend::maybe_composite(&mut backend).expect("degrade the output owner's unflip");
+
+    let scene_crtcs: Vec<_> = recorder.records()[before..]
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.kind,
+                AtomicCommitKind::Scene | AtomicCommitKind::SceneWithCursor
+            ) && record.result == crate::drm::atomic::tests_support::ScriptedResult::Ok
+        })
+        .flat_map(|record| record.events.iter().map(|event| event.crtc))
+        .collect();
+    assert_eq!(
+        scene_crtcs,
+        [backend.platform.outputs[1].output.crtc],
+        "degraded replacement composes only the direct owner's output"
+    );
+    assert!(backend.pstate.direct.outputs[1].degraded_composed_unflip);
+    assert_eq!(
+        backend.pstate.direct.outputs[1].unflip_outputs_to_replace,
+        std::collections::HashSet::from([1])
+    );
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: held-direct wakeup considers cursor work only.
 fn next_wakeup_reflects_composed_output_while_other_is_direct() {
     use yserver_core::backend::Backend;
@@ -2768,6 +2812,67 @@ fn next_wakeup_reflects_composed_output_while_other_is_direct() {
     assert!(
         wakeup.is_some_and(|deadline| deadline <= std::time::Instant::now()),
         "damage on output 0 must arm an immediate scene wake while output 1 is direct"
+    );
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: let any pending direct transaction suppress cursor wakeups on all outputs.
+fn cursor_wakeup_on_composed_output_while_other_output_owner_pending() {
+    use yserver_core::backend::Backend;
+
+    let Some(mut backend) = live_scene_backend_with_outputs(2) else {
+        return;
+    };
+    let fallback_id = seed_window(&mut backend, 0x7498, None, 0, 0);
+    install_direct_frame_for_target_test(&mut backend, 0x7499, fallback_id, false);
+    let mut pending = backend
+        .pstate
+        .direct
+        .root_mut()
+        .pending
+        .take()
+        .expect("test helper installed a pending frame");
+    backend.pstate.direct.root_mut().hold_direct = false;
+    pending.completion_output_idx = 1;
+    pending.awaiting_outputs = std::collections::HashSet::from([1]);
+    backend.pstate.direct.outputs[1].pending = Some(pending);
+    backend.pstate.direct.outputs[1].hold_direct = true;
+
+    backend.scene.scene_structure_dirty = false;
+    for drawable in backend.store.armed_damaged_ids() {
+        if let Some(snapshot) = backend.store.peek_presentation_damage(drawable) {
+            backend.store.ack_presentation_damage(snapshot);
+        }
+    }
+    assert!(!backend.for_tests_scene_wants_scene());
+    let position = backend.platform.for_tests_seed_atomic_cursor_position(
+        0,
+        raw(51),
+        raw(61),
+        raw(62),
+        100,
+        100,
+        0,
+        0,
+    );
+    assert!(
+        backend
+            .platform
+            .for_tests_atomic_position_is_unsent(position.device_key, position.crtc,)
+    );
+
+    let wakeup = Backend::next_wakeup(&backend);
+
+    assert!(
+        wakeup.is_some_and(|deadline| deadline <= std::time::Instant::now()),
+        "an eligible cursor move on output 0 must wake despite output 1's pending direct frame"
+    );
+    assert!(backend.pstate.direct.outputs[1].pending.is_some());
+    assert!(
+        backend
+            .platform
+            .for_tests_atomic_position_is_unsent(position.device_key, position.crtc,)
     );
 }
 

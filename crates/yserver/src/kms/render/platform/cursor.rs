@@ -469,6 +469,7 @@ impl PlatformBackend {
     fn eligible_atomic_cursor_moves<'a>(
         &'a self,
         live_direct_vrr_wanted: &'a [bool],
+        eligible_outputs: Option<&'a [bool]>,
     ) -> impl Iterator<Item = (Option<Instant>, bool)> + 'a {
         self.devices.iter().flat_map(move |device| {
             device
@@ -476,6 +477,13 @@ impl PlatformBackend {
                 .atomic_pending_moves
                 .iter()
                 .filter_map(move |(crtc, pending)| {
+                    let output_is_eligible = eligible_outputs.is_none_or(|eligible| {
+                        self.outputs.iter().enumerate().any(|(output_idx, layout)| {
+                            layout.key.device_key == device.key
+                                && layout.output.crtc == *crtc
+                                && eligible.get(output_idx).copied().unwrap_or(false)
+                        })
+                    });
                     let output_is_vrr_on =
                         self.outputs.iter().enumerate().any(|(output_idx, layout)| {
                             layout.key.device_key == device.key
@@ -498,17 +506,20 @@ impl PlatformBackend {
                         && device.cursor.available_on(*crtc)
                         && device.cursor.hw_bound_on(*crtc))
                     .then_some((pending.deadline, output_is_vrr_on))
+                    .filter(|_| output_is_eligible)
                 })
         })
     }
 
-    /// Whether a cursor-only position can make the scheduling pass runnable.
-    pub(crate) fn has_eligible_atomic_cursor_move(
+    /// Whether a selected output has a cursor-only position that can make the
+    /// composed-scene scheduling pass runnable.
+    pub(crate) fn has_eligible_atomic_cursor_move_for_outputs(
         &self,
         now: Instant,
         live_direct_vrr_wanted: &[bool],
+        eligible_outputs: &[bool],
     ) -> bool {
-        self.eligible_atomic_cursor_moves(live_direct_vrr_wanted)
+        self.eligible_atomic_cursor_moves(live_direct_vrr_wanted, Some(eligible_outputs))
             .any(|(deadline, output_is_vrr_on)| {
                 !output_is_vrr_on || deadline.is_none_or(|deadline| now >= deadline)
             })
@@ -516,7 +527,7 @@ impl PlatformBackend {
 
     /// Earliest held VRR cursor position that is eligible to wake scanout.
     pub(crate) fn vrr_cursor_deadline(&self, live_direct_vrr_wanted: &[bool]) -> Option<Instant> {
-        self.eligible_atomic_cursor_moves(live_direct_vrr_wanted)
+        self.eligible_atomic_cursor_moves(live_direct_vrr_wanted, None)
             .filter_map(|(deadline, output_is_vrr_on)| {
                 output_is_vrr_on.then_some(deadline).flatten()
             })

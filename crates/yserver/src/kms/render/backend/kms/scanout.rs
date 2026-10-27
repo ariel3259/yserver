@@ -338,33 +338,37 @@ impl KmsBackend {
         if output_idx >= self.platform.outputs.len() {
             return false;
         }
-        let owner_covers_output = |owner: &crate::kms::render::backend::ScanoutM2State| {
-            owner.active()
-                || owner.unflip_outputs_to_replace.contains(&output_idx)
-                || owner.unflip_awaiting_outputs.contains_key(&output_idx)
-        };
-        owner_covers_output(self.pstate.direct.root())
-            || self
-                .pstate
-                .direct
-                .outputs
-                .get(output_idx)
-                .is_some_and(owner_covers_output)
+        self.pstate
+            .direct
+            .scope_for_output(output_idx)
+            .and_then(|scope| self.pstate.direct.get(scope))
+            .is_some_and(|owner| {
+                owner.active()
+                    || owner.unflip_outputs_to_replace.contains(&output_idx)
+                    || owner.unflip_awaiting_outputs.contains_key(&output_idx)
+            })
     }
 
     fn output_has_degraded_unflip(&self, output_idx: usize) -> bool {
-        self.pstate.direct.active_scopes().into_iter().any(|scope| {
-            self.pstate.direct.get(scope).is_some_and(|owner| {
+        self.pstate
+            .direct
+            .scope_for_output(output_idx)
+            .and_then(|scope| self.pstate.direct.get(scope))
+            .is_some_and(|owner| {
                 owner.degraded_composed_unflip
                     && owner.unflip_outputs_to_replace.contains(&output_idx)
             })
-        })
     }
 
-    fn scene_skip_outputs(&self) -> Vec<bool> {
+    fn scene_skip_outputs(&self, degraded_only: bool) -> Vec<bool> {
         (0..self.platform.outputs.len())
             .map(|output_idx| {
-                self.output_is_direct(output_idx) && !self.output_has_degraded_unflip(output_idx)
+                let selected = if degraded_only {
+                    self.output_has_degraded_unflip(output_idx)
+                } else {
+                    self.scene_output_ready_for_scheduled_compose(output_idx)
+                };
+                !selected
             })
             .collect()
     }
@@ -397,7 +401,24 @@ impl KmsBackend {
 
     fn scheduled_scene_retry_deadline(&self) -> Option<std::time::Instant> {
         self.scene
-            .earliest_retry_deadline_for_outputs(&self.scene_skip_outputs())
+            .earliest_retry_deadline_for_outputs(&self.scene_skip_outputs(false))
+    }
+
+    fn scene_cursor_eligible_outputs(&self) -> Vec<bool> {
+        (0..self.platform.outputs.len())
+            .map(|output_idx| {
+                !self
+                    .pstate
+                    .direct
+                    .scope_for_output(output_idx)
+                    .and_then(|scope| self.pstate.direct.get(scope))
+                    .is_some_and(|owner| {
+                        owner.pending.is_some()
+                            || owner.queued_successor.is_some()
+                            || owner.unflip_requested
+                    })
+            })
+            .collect()
     }
 
     pub(in crate::kms::render::backend) fn monotonic_now(&self) -> std::time::Instant {
@@ -3331,21 +3352,16 @@ impl KmsBackend {
         let cursor_compose_blocked = self
             .tearing_cursor_compose_deadline(self.monotonic_now())
             .is_some();
-        let direct_transaction_waiting =
-            self.pstate.direct.active_scopes().into_iter().any(|scope| {
-                self.pstate.direct.get(scope).is_some_and(|owner| {
-                    owner.pending.is_some()
-                        || owner.queued_successor.is_some()
-                        || owner.unflip_requested
-                })
-            });
+        let now = self.monotonic_now();
         let live_direct_vrr_wanted = self.live_direct_vrr_wanted_by_output();
+        let cursor_eligible_outputs = self.scene_cursor_eligible_outputs();
         (self.scene_has_ready_scheduled_output() && !cursor_compose_blocked)
             || (!cursor_compose_blocked
-                && !direct_transaction_waiting
-                && self
-                    .platform
-                    .has_eligible_atomic_cursor_move(self.monotonic_now(), &live_direct_vrr_wanted))
+                && self.platform.has_eligible_atomic_cursor_move_for_outputs(
+                    now,
+                    &live_direct_vrr_wanted,
+                    &cursor_eligible_outputs,
+                ))
     }
 
     #[cfg(test)]
@@ -3653,10 +3669,13 @@ impl KmsBackend {
         };
         let scene_deadline = if allow_kms_timers {
             if self.scene_wants_compose() {
+                let cursor_eligible_outputs = self.scene_cursor_eligible_outputs();
                 if self.scene_has_ready_scheduled_output()
-                    || self
-                        .platform
-                        .has_eligible_atomic_cursor_move(now, &live_direct_vrr_wanted)
+                    || self.platform.has_eligible_atomic_cursor_move_for_outputs(
+                        now,
+                        &live_direct_vrr_wanted,
+                        &cursor_eligible_outputs,
+                    )
                 {
                     Some(now)
                 } else {
@@ -3944,7 +3963,7 @@ impl KmsBackend {
             self.drain_paint_submit_telemetry();
             return Ok(());
         }
-        let skip_outputs = self.scene_skip_outputs();
+        let skip_outputs = self.scene_skip_outputs(degraded_compose);
         if !degraded_compose && skip_outputs.iter().all(|skip| *skip) {
             // Root direct ownership still holds the complete output set, while
             // per-output owners leave unrelated CRTCs available above.
