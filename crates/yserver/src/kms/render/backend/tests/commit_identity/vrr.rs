@@ -830,13 +830,7 @@ fn submit_direct_successor(
             .queued_successor
             .is_some(),
         fixture.events.backend.pstate.direct.root().unflip_requested,
-        fixture
-            .events
-            .backend
-            .pstate
-            .direct
-            .root()
-            .eligible_root_streak,
+        fixture.events.backend.pstate.direct.root().eligible_streak,
     );
     direct.candidate = candidate;
     direct.event = event;
@@ -1127,7 +1121,10 @@ fn prepare_property_present_source(
         direct: true,
     };
     fixture.events.backend.pstate.scanout_m1.entries.insert(
-        direct.source_id,
+        (
+            direct.source_id,
+            crate::kms::render::backend::DirectScope::Root,
+        ),
         crate::kms::render::backend::ScanoutM1ProbeEntry::accepted_with_shape(
             crate::drm::modeset::DirectScanoutProbeFramebuffer::for_tests(
                 super::recording_scene::raw(0x8130),
@@ -1166,7 +1163,7 @@ fn start_property_direct(
         .pstate
         .direct
         .root_mut()
-        .eligible_root_streak = crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1;
+        .eligible_streak = crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1;
     let offset = super::direct_unflip::record_count(fixture, fd);
     request_present(
         &mut state,
@@ -1407,7 +1404,10 @@ fn vrr_standalone_clear_event_retires_nothing() {
         .pstate
         .scanout_m1
         .entries
-        .get(&current_before.1)
+        .get(&(
+            current_before.1,
+            crate::kms::render::backend::DirectScope::Root,
+        ))
         .and_then(crate::kms::render::backend::ScanoutM1ProbeEntry::framebuffer)
         .map(crate::drm::modeset::DirectScanoutProbeFramebuffer::handle)
         .expect("current direct frame retains its framebuffer");
@@ -1489,7 +1489,10 @@ fn vrr_standalone_clear_event_retires_nothing() {
         .pstate
         .scanout_m1
         .entries
-        .get(&current_after.1)
+        .get(&(
+            current_after.1,
+            crate::kms::render::backend::DirectScope::Root,
+        ))
         .and_then(crate::kms::render::backend::ScanoutM1ProbeEntry::framebuffer)
         .map(crate::drm::modeset::DirectScanoutProbeFramebuffer::handle)
         .expect("standalone clear event retains the direct framebuffer");
@@ -1759,7 +1762,10 @@ fn vrr_property_mode_reads_like_xorg() {
         direct: true,
     };
     fixture.events.backend.pstate.scanout_m1.entries.insert(
-        direct.source_id,
+        (
+            direct.source_id,
+            crate::kms::render::backend::DirectScope::Root,
+        ),
         crate::kms::render::backend::ScanoutM1ProbeEntry::accepted_with_shape(
             crate::drm::modeset::DirectScanoutProbeFramebuffer::for_tests(
                 super::recording_scene::raw(0x8130),
@@ -1788,7 +1794,7 @@ fn vrr_property_mode_reads_like_xorg() {
         .pstate
         .direct
         .root_mut()
-        .eligible_root_streak = crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1;
+        .eligible_streak = crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1;
     let start = super::direct_unflip::record_count(&fixture, fd);
     request_present(
         &mut state,

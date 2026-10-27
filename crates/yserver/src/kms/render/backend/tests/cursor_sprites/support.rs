@@ -747,7 +747,7 @@ pub(crate) fn enter_held_direct(
                     .pstate
                     .direct
                     .root()
-                    .eligible_root_streak,
+                    .eligible_streak,
                 fixture.scene.events.backend.effective_cursor_hidden(),
                 fixture
                     .scene
@@ -755,7 +755,9 @@ pub(crate) fn enter_held_direct(
                     .backend
                     .platform
                     .any_cursor_plane_visible(),
-                fixture.scene.events.backend.direct_cursor_eligible(),
+                fixture.scene.events.backend.direct_cursor_eligible_for(
+                    &(0..fixture.scene.events.backend.platform.outputs.len()).collect::<Vec<_>>(),
+                ),
                 fixture
                     .scene
                     .events

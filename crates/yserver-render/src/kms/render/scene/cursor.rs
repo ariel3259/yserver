@@ -179,8 +179,22 @@ impl SceneCompositor {
         let Some(inner) = self.inner.as_ref() else {
             return CursorPlaneMode::Sw;
         };
-        for output in &inner.outputs {
-            // Any pending transition on any output forces Mixed —
+        let outputs: Vec<_> = (0..inner.outputs.len()).collect();
+        self.cursor_mode_for_outputs(&outputs)
+    }
+
+    /// Classify cursor state for only the outputs participating in a KMS
+    /// transaction. A pending transition on an unrelated output must not
+    /// block a direct owner on this output.
+    pub fn cursor_mode_for_outputs(&self, output_indices: &[usize]) -> CursorPlaneMode {
+        let Some(inner) = self.inner.as_ref() else {
+            return CursorPlaneMode::Sw;
+        };
+        for &output_idx in output_indices {
+            let Some(output) = inner.outputs.get(output_idx) else {
+                continue;
+            };
+            // Any pending transition on a selected output forces Mixed —
             // the fast path must not move the plane until every
             // ShowOnRetire / HideOnRetire has applied.
             if output
@@ -194,7 +208,12 @@ impl SceneCompositor {
                 return CursorPlaneMode::Mixed;
             }
         }
-        classify_cursor_mode_from_per_output(inner.outputs.iter().map(|o| o.last_frame_cursor_mode))
+        classify_cursor_mode_from_per_output(output_indices.iter().filter_map(|&output_idx| {
+            inner
+                .outputs
+                .get(output_idx)
+                .map(|output| output.last_frame_cursor_mode)
+        }))
     }
 
     /// Record cursor-plane ownership after an external scanout transaction

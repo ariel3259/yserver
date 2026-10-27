@@ -1715,7 +1715,7 @@ fn tearing_on_delayed_acquire_stream_survives_core_supersession() {
             .is_none()
         );
     }
-    assert_eq!(backend.pstate.direct.root().eligible_root_streak, 7);
+    assert_eq!(backend.pstate.direct.root().eligible_streak, 7);
     recorder.clear_records();
     let sink = std::rc::Rc::clone(&backend.platform.devices[0].atomic_commit_sink);
     let before_direct = sink.for_tests_tearing_counts().client_present_direct;
@@ -1787,7 +1787,7 @@ fn tearing_on_delayed_acquire_stream_survives_core_supersession() {
             .lookup(host_pixmap.as_raw())
             .expect("Present source has KMS storage");
         backend.pstate.scanout_m1.entries.insert(
-            source_id,
+            (source_id, crate::kms::render::backend::DirectScope::Root),
             crate::kms::render::backend::ScanoutM1ProbeEntry::accepted_with_shape(
                 crate::drm::modeset::DirectScanoutProbeFramebuffer::for_tests(raw(
                     0x8700 + u32::try_from(frame).unwrap()
@@ -1899,9 +1899,9 @@ fn tearing_on_delayed_acquire_stream_survives_core_supersession() {
     assert_eq!(
         sink.for_tests_tearing_counts().client_present_direct - before_direct,
         FRAME_COUNT,
-        "all 20 core requests reach the direct Backend entry; tearing={:?}, eligible_root_streak={}, unflip={:?}, completions={completions:?}",
+        "all 20 core requests reach the direct Backend entry; tearing={:?}, eligible_streak={}, unflip={:?}, completions={completions:?}",
         backend.pstate.tearing.state,
-        backend.pstate.direct.root().eligible_root_streak,
+        backend.pstate.direct.root().eligible_streak,
         backend.pstate.direct.root().unflip_reason,
     );
     assert_eq!(
