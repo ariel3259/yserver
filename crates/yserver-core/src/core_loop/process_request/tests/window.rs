@@ -3425,6 +3425,10 @@ fn describe_order_events(bytes: &[u8]) -> Vec<String> {
     out
 }
 
+/// `grb`'s and `obs`'s own windows in the probe's `setter-*` cases.
+const ORDER_G: u32 = 0x0020_0001;
+const ORDER_W: u32 = 0x0030_0001;
+
 /// One event as `tools/destroy-order-probe.c` prints it.
 fn describe_order_event(ev: &[u8]) -> String {
     let u32_at = |at: usize| u32::from_le_bytes([ev[at], ev[at + 1], ev[at + 2], ev[at + 3]]);
@@ -3435,6 +3439,8 @@ fn describe_order_event(ev: &[u8]) -> String {
         _ if id == ROOT_WINDOW.0 => "root".to_owned(),
         ORDER_T => "T".to_owned(),
         ORDER_C => "C".to_owned(),
+        ORDER_G => "G".to_owned(),
+        ORDER_W => "W".to_owned(),
         _ => format!("0x{id:x}"),
     };
     let detail = |d: u8| {
@@ -3518,6 +3524,17 @@ fn describe_order_event(ev: &[u8]) -> String {
             u16_at(34),
             u32_at(36),
         ),
+        29 => format!("SelectionClear(owner={})", nm(u32_at(8))),
+        30 => format!(
+            "SelectionRequest(owner={} requestor={})",
+            nm(u32_at(8)),
+            nm(u32_at(12))
+        ),
+        31 => format!(
+            "SelectionNotify(requestor={} property={})",
+            nm(u32_at(8)),
+            u32_at(20)
+        ),
         t if t == crate::nested::XFIXES_FIRST_EVENT => format!(
             "XFixesSelectionNotify(subtype={} window={} owner={})",
             ev[1],
@@ -3530,15 +3547,42 @@ fn describe_order_event(ev: &[u8]) -> String {
 
 /// `tools/destroy-order-probe.c`'s scenario: mapped T (100,100 200x200,
 /// child of root) with mapped C (50,50 100x100); the pointer at `pointer`;
-/// a survivor owns a selection on C, holds an active pointer grab on C and
+/// a survivor (`grb`) set a selection on C, holds an active pointer grab on C and
 /// has the focus on C (RevertToParent).
 fn destroy_order_fixture(pointer: (i16, i16)) -> (ServerState, UnixStream, UnixStream) {
-    const APP: u32 = 1;
-    const GRB: u32 = 2;
-    const OBS: u32 = 3;
+    destroy_order_fixture_set_by(pointer, ORDER_GRB)
+}
+
+/// [`destroy_order_fixture`] with the selection on C set by `setter`:
+/// `ORDER_GRB` as in the probe's plain cases, `ORDER_APP` as with its
+/// `appsel` modifier.
+fn destroy_order_fixture_set_by(
+    pointer: (i16, i16),
+    setter: u32,
+) -> (ServerState, UnixStream, UnixStream) {
+    let (mut state, _app, grb, mut obs) = selection_order_base(pointer);
+    set_order_selection(&mut state, &mut obs, setter, ORDER_C);
+    set_test_pointer_grab(&mut state, ORDER_GRB, ORDER_C, false, false);
+    state.core_focus = crate::server::CoreFocus {
+        raw: ORDER_C,
+        revert_to: 2,
+        time: 0,
+    };
+    (state, grb, obs)
+}
+
+const ORDER_APP: u32 = 1;
+const ORDER_GRB: u32 = 2;
+const ORDER_OBS: u32 = 3;
+
+/// The probe's windows and `obs` selections, without the selection owner,
+/// grab or focus. Returns the `app`, `grb` and `obs` peers.
+fn selection_order_base(pointer: (i16, i16)) -> (ServerState, UnixStream, UnixStream, UnixStream) {
+    const APP: u32 = ORDER_APP;
+    const OBS: u32 = ORDER_OBS;
     let mut state = ServerState::new();
-    let _app = install_client(&mut state, APP);
-    let grb = install_client(&mut state, GRB);
+    let app = install_client(&mut state, APP);
+    let grb = install_client(&mut state, ORDER_GRB);
     let obs = install_client(&mut state, OBS);
     for (window, parent, x, y, size) in [
         (ORDER_T, ROOT_WINDOW.0, 100, 100, 200),
@@ -3572,21 +3616,34 @@ fn destroy_order_fixture(pointer: (i16, i16)) -> (ServerState, UnixStream, UnixS
     );
     masks.insert(ResourceId(ORDER_T), 0x0002_0000 | 0x0020_0000 | 0x10 | 0x20);
     masks.insert(ResourceId(ORDER_C), 0x0002_0000 | 0x0020_0000 | 0x10 | 0x20);
-    let selection = AtomId(0x200);
+    let selection = state.atoms.intern(ORDER_SELECTION, false);
     state.xfixes_selection_masks.insert(
         (OBS, ROOT_WINDOW, selection),
         yserver_protocol::x11::xfixes::SELECTION_ALL_EVENTS_MASK,
     );
-
     state.pointer_root = pointer;
-    state.selections.insert(selection, (ResourceId(ORDER_C), 0));
-    set_test_pointer_grab(&mut state, GRB, ORDER_C, false, false);
-    state.core_focus = crate::server::CoreFocus {
-        raw: ORDER_C,
-        revert_to: 2,
-        time: 0,
-    };
-    (state, grb, obs)
+    (state, app, grb, obs)
+}
+
+const ORDER_SELECTION: &str = "DESTROY_ORDER_PROBE";
+
+/// `SetSelectionOwner(window, DESTROY_ORDER_PROBE, CurrentTime)` from
+/// `client`; the SetSelectionOwner notify `obs` gets is dropped, the probe
+/// prints it before the step it measures.
+fn set_order_selection(state: &mut ServerState, obs: &mut UnixStream, client: u32, window: u32) {
+    let selection = state.atoms.intern(ORDER_SELECTION, false);
+    let mut body = Vec::with_capacity(12);
+    body.extend_from_slice(&window.to_le_bytes());
+    body.extend_from_slice(&selection.0.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    crate::core_loop::process_request::selection::handle_set_selection_owner(
+        state,
+        ClientId(client),
+        SequenceNumber(1),
+        &body,
+    )
+    .expect("handle_set_selection_owner");
+    let _ = read_all_or_buffered(state, ORDER_OBS, obs);
 }
 
 /// The event stream of `DestroyWindow(T)`, measured on Xephyr with
@@ -3771,7 +3828,7 @@ fn destroy_window_drops_passive_grabs_and_a_recycled_id_does_not_match_them() {
 /// in [`destroy_window_event_order_matches_xorg`].
 #[test]
 fn disconnect_event_order_matches_xorg() {
-    let (mut state, mut grb, mut obs) = destroy_order_fixture((110, 110));
+    let (mut state, mut grb, mut obs) = destroy_order_fixture_set_by((110, 110), ORDER_APP);
     assert_eq!(
         disconnect_app_and_read_order_stream(&mut state, &mut obs),
         [
@@ -3800,7 +3857,7 @@ fn disconnect_event_order_matches_xorg() {
 /// `tools/destroy-order-probe c disconnect-appsel`, measured on Xephyr.
 #[test]
 fn disconnect_event_order_with_the_pointer_in_the_grab_window_matches_xorg() {
-    let (mut state, mut grb, mut obs) = destroy_order_fixture((200, 200));
+    let (mut state, mut grb, mut obs) = destroy_order_fixture_set_by((200, 200), ORDER_APP);
     assert_eq!(
         disconnect_app_and_read_order_stream(&mut state, &mut obs),
         [
@@ -3820,6 +3877,312 @@ fn disconnect_event_order_with_the_pointer_in_the_grab_window_matches_xorg() {
     assert!(state.active_pointer_grab.is_none());
 }
 
+/// `tools/destroy-order-probe t disconnect`, measured on Xephyr: `grb` set
+/// the selection on `app`'s C, then `app` disconnects. `grb` is still
+/// connected, so `DeleteClientFromAnySelections` (`dix/selection.c:128-139`)
+/// leaves the selection alone; C's `FreeWindowResources` sends
+/// SelectionWindowDestroy after its DestroyNotify (`dix/window.c:999`). The
+/// two backend crossings are left out as in
+/// [`destroy_window_event_order_matches_xorg`].
+#[test]
+fn disconnect_of_the_window_owner_sends_window_destroy_when_another_client_set_the_selection() {
+    let (mut state, mut grb, mut obs) = destroy_order_fixture_set_by((110, 110), ORDER_GRB);
+    assert_eq!(
+        disconnect_app_and_read_order_stream(&mut state, &mut obs),
+        [
+            "UnmapNotify(event=T window=T fromConfigure=0)",
+            "UnmapNotify(event=root window=T fromConfigure=0)",
+            "LeaveNotify(event=C child=None detail=Ancestor mode=Ungrab root=110,110 event=-40,-40 sf=0x3)",
+            "EnterNotify(event=T child=None detail=Inferior mode=Ungrab root=110,110 event=10,10 sf=0x2)",
+            "FocusOut(event=C detail=Ancestor mode=Normal)",
+            "FocusOut(event=T detail=Virtual mode=Normal)",
+            "FocusIn(event=root detail=Inferior mode=Normal)",
+            "Expose(root 100,100 200x200 count=0)",
+            "DestroyNotify(event=C window=C)",
+            "XFixesSelectionNotify(subtype=1 window=root owner=None)",
+            "DestroyNotify(event=T window=T)",
+            "DestroyNotify(event=root window=T)",
+        ]
+    );
+    assert!(read_all_or_buffered(&mut state, ORDER_GRB, &mut grb).is_empty());
+    assert!(state.selections.is_empty());
+}
+
+/// `tools/destroy-order-probe c disconnect`, measured on Xephyr; Xephyr's
+/// three WindowsRestructured crossings after the Expose are left out.
+#[test]
+fn disconnect_of_the_window_owner_with_the_pointer_in_c_sends_window_destroy_for_another_setter() {
+    let (mut state, mut grb, mut obs) = destroy_order_fixture_set_by((200, 200), ORDER_GRB);
+    assert_eq!(
+        disconnect_app_and_read_order_stream(&mut state, &mut obs),
+        [
+            "UnmapNotify(event=T window=T fromConfigure=0)",
+            "UnmapNotify(event=root window=T fromConfigure=0)",
+            "FocusOut(event=C detail=Ancestor mode=Normal)",
+            "FocusOut(event=T detail=Virtual mode=Normal)",
+            "FocusIn(event=root detail=Inferior mode=Normal)",
+            "Expose(root 100,100 200x200 count=0)",
+            "DestroyNotify(event=C window=C)",
+            "XFixesSelectionNotify(subtype=1 window=root owner=None)",
+            "DestroyNotify(event=T window=T)",
+            "DestroyNotify(event=root window=T)",
+        ]
+    );
+    assert!(read_all_or_buffered(&mut state, ORDER_GRB, &mut grb).is_empty());
+    assert!(state.selections.is_empty());
+}
+
+/// Every event `client` has received so far, as the probe prints it.
+fn order_stream(state: &mut ServerState, client: u32, peer: &mut UnixStream) -> Vec<String> {
+    read_all_or_buffered(state, client, peer)
+        .chunks_exact(32)
+        .map(describe_order_event)
+        .collect()
+}
+
+/// `tools/destroy-order-probe c setter-disconnect`, measured on Xephyr:
+/// `grb` sets the selection on `app`'s C and disconnects.
+///
+/// ```text
+/// disconnect grb
+///   obs: XFixesSelectionNotify(subtype=2 window=root owner=None)
+/// selection owner: None
+/// destroy T
+///   obs: UnmapNotify(event=T window=T fromConfigure=0)
+///   obs: UnmapNotify(event=root window=T fromConfigure=0)
+///   obs: Expose(root 100,100 200x200 count=0)
+///   obs: LeaveNotify(event=C ...) LeaveNotify(event=T ...) EnterNotify(event=root ...)
+///   obs: DestroyNotify(event=C window=C)
+///   obs: DestroyNotify(event=T window=T)
+///   obs: DestroyNotify(event=root window=T)
+/// selection owner: None
+/// ```
+///
+/// `DeleteClientFromAnySelections` matches `Selection.client`, the client
+/// that set the owner (`dix/selection.c:128-139`, `:220`), so ClientClose
+/// fires although C is `app`'s, and the selection no longer names C when C
+/// is destroyed. The three crossings come from WindowsRestructured and are
+/// left out.
+#[test]
+fn disconnect_of_the_selection_setter_sends_client_close_for_a_window_it_does_not_own() {
+    let (mut state, mut app, mut grb, mut obs) = selection_order_base((200, 200));
+    set_order_selection(&mut state, &mut obs, ORDER_GRB, ORDER_C);
+    let _ = order_stream(&mut state, ORDER_GRB, &mut grb);
+
+    let mut backend = RecordingBackend::new();
+    crate::core_loop::process_disconnect::process_disconnect(
+        &mut state,
+        &mut backend,
+        ClientId(ORDER_GRB),
+    );
+    assert_eq!(
+        order_stream(&mut state, ORDER_OBS, &mut obs),
+        ["XFixesSelectionNotify(subtype=2 window=root owner=None)"]
+    );
+    assert!(order_stream(&mut state, ORDER_APP, &mut app).is_empty());
+    assert!(state.selections.is_empty(), "selection owner: None");
+
+    handle_destroy_window(
+        &mut state,
+        &mut backend,
+        None,
+        ClientId(ORDER_APP),
+        SequenceNumber(2),
+        &ORDER_T.to_le_bytes(),
+    )
+    .expect("handle_destroy_window");
+    assert_eq!(
+        order_stream(&mut state, ORDER_OBS, &mut obs),
+        [
+            "UnmapNotify(event=T window=T fromConfigure=0)",
+            "UnmapNotify(event=root window=T fromConfigure=0)",
+            "Expose(root 100,100 200x200 count=0)",
+            "DestroyNotify(event=C window=C)",
+            "DestroyNotify(event=T window=T)",
+            "DestroyNotify(event=root window=T)",
+        ]
+    );
+}
+
+/// `tools/destroy-order-probe c winowner-disconnect`, measured on Xephyr:
+/// `grb` sets the selection on `app`'s C, then `app` disconnects.
+///
+/// ```text
+/// disconnect app
+///   obs: UnmapNotify(event=T window=T fromConfigure=0)
+///   obs: UnmapNotify(event=root window=T fromConfigure=0)
+///   obs: Expose(root 100,100 200x200 count=0)
+///   obs: LeaveNotify(event=C ...) LeaveNotify(event=T ...) EnterNotify(event=root ...)
+///   obs: DestroyNotify(event=C window=C)
+///   obs: XFixesSelectionNotify(subtype=1 window=root owner=None)
+///   obs: DestroyNotify(event=T window=T)
+///   obs: DestroyNotify(event=root window=T)
+/// selection owner: None
+/// ```
+#[test]
+fn disconnect_of_the_window_owner_sends_window_destroy_not_client_close() {
+    let (mut state, _app, mut grb, mut obs) = selection_order_base((200, 200));
+    set_order_selection(&mut state, &mut obs, ORDER_GRB, ORDER_C);
+    let _ = order_stream(&mut state, ORDER_GRB, &mut grb);
+
+    assert_eq!(
+        disconnect_app_and_read_order_stream(&mut state, &mut obs),
+        [
+            "UnmapNotify(event=T window=T fromConfigure=0)",
+            "UnmapNotify(event=root window=T fromConfigure=0)",
+            "Expose(root 100,100 200x200 count=0)",
+            "DestroyNotify(event=C window=C)",
+            "XFixesSelectionNotify(subtype=1 window=root owner=None)",
+            "DestroyNotify(event=T window=T)",
+            "DestroyNotify(event=root window=T)",
+        ]
+    );
+    assert!(order_stream(&mut state, ORDER_GRB, &mut grb).is_empty());
+    assert!(state.selections.is_empty(), "selection owner: None");
+}
+
+fn create_order_window(state: &mut ServerState, owner: u32, window: u32) {
+    state.resources.create_window(
+        ClientId(owner),
+        CreateWindowRequest {
+            depth: 24,
+            window: ResourceId(window),
+            parent: ROOT_WINDOW,
+            width: 10,
+            height: 10,
+            class: 1,
+            visual: crate::resources::ROOT_VISUAL,
+            ..Default::default()
+        },
+    );
+}
+
+/// `tools/destroy-order-probe c setter-route`, measured on Xephyr: `grb`
+/// sets the selection on `app`'s C; `obs` converts it into its window W,
+/// then takes it over on W.
+///
+/// ```text
+/// obs ConvertSelection
+///   obs: event16                       (CreateNotify of W)
+///   grb: SelectionRequest(owner=C requestor=W)
+/// obs SetSelectionOwner W
+///   obs: XFixesSelectionNotify(subtype=0 window=root owner=W)
+///   grb: SelectionClear(owner=C)
+/// selection owner: W
+/// ```
+///
+/// Both go to `Selection.client` (`dix/selection.c:183-191`, `:297-301`),
+/// not to the client that created the owner window; `app` gets nothing.
+#[test]
+fn selection_request_and_clear_go_to_the_setting_client() {
+    let (mut state, mut app, mut grb, mut obs) = selection_order_base((200, 200));
+    create_order_window(&mut state, ORDER_OBS, ORDER_W);
+    set_order_selection(&mut state, &mut obs, ORDER_GRB, ORDER_C);
+    let _ = order_stream(&mut state, ORDER_GRB, &mut grb);
+    let selection = state.atoms.intern(ORDER_SELECTION, false);
+
+    let mut body = Vec::with_capacity(20);
+    for word in [ORDER_W, selection.0, 31, 31, 0] {
+        body.extend_from_slice(&word.to_le_bytes());
+    }
+    crate::core_loop::process_request::selection::handle_convert_selection(
+        &mut state,
+        ClientId(ORDER_OBS),
+        SequenceNumber(2),
+        &body,
+    )
+    .expect("handle_convert_selection");
+    assert!(order_stream(&mut state, ORDER_OBS, &mut obs).is_empty());
+    assert!(order_stream(&mut state, ORDER_APP, &mut app).is_empty());
+    assert_eq!(
+        order_stream(&mut state, ORDER_GRB, &mut grb),
+        ["SelectionRequest(owner=C requestor=W)"]
+    );
+
+    let mut body = Vec::with_capacity(12);
+    for word in [ORDER_W, selection.0, 0] {
+        body.extend_from_slice(&word.to_le_bytes());
+    }
+    crate::core_loop::process_request::selection::handle_set_selection_owner(
+        &mut state,
+        ClientId(ORDER_OBS),
+        SequenceNumber(3),
+        &body,
+    )
+    .expect("handle_set_selection_owner");
+    assert_eq!(
+        order_stream(&mut state, ORDER_OBS, &mut obs),
+        ["XFixesSelectionNotify(subtype=0 window=root owner=W)"]
+    );
+    assert!(order_stream(&mut state, ORDER_APP, &mut app).is_empty());
+    assert_eq!(
+        order_stream(&mut state, ORDER_GRB, &mut grb),
+        ["SelectionClear(owner=C)"]
+    );
+}
+
+/// `tools/destroy-order-probe c setter-retake`, measured on Xephyr: `grb`
+/// sets the selection on `app`'s C, moves it to its own G and back to C,
+/// then `app` takes it on T.
+///
+/// ```text
+/// grb SetSelectionOwner G
+///   obs: event16                       (CreateNotify of G)
+///   obs: XFixesSelectionNotify(subtype=0 window=root owner=G)
+/// grb SetSelectionOwner C
+///   obs: XFixesSelectionNotify(subtype=0 window=root owner=C)
+/// app SetSelectionOwner T
+///   obs: XFixesSelectionNotify(subtype=0 window=root owner=T)
+///   grb: SelectionClear(owner=C)
+/// ```
+///
+/// SelectionClear is gated on the setting client (`dix/selection.c:183`):
+/// `grb` moving its selection between windows clears nothing, whoever owns
+/// the windows; `app` taking it from `grb` clears `grb`, although C is
+/// `app`'s own window.
+#[test]
+fn selection_clear_is_gated_on_the_setting_client_not_the_window_owner() {
+    let (mut state, mut app, mut grb, mut obs) = selection_order_base((200, 200));
+    create_order_window(&mut state, ORDER_GRB, ORDER_G);
+    set_order_selection(&mut state, &mut obs, ORDER_GRB, ORDER_C);
+    let _ = order_stream(&mut state, ORDER_GRB, &mut grb);
+    let selection = state.atoms.intern(ORDER_SELECTION, false);
+    let mut set = |state: &mut ServerState, client: u32, window: u32| {
+        let mut body = Vec::with_capacity(12);
+        for word in [window, selection.0, 0] {
+            body.extend_from_slice(&word.to_le_bytes());
+        }
+        crate::core_loop::process_request::selection::handle_set_selection_owner(
+            state,
+            ClientId(client),
+            SequenceNumber(2),
+            &body,
+        )
+        .expect("handle_set_selection_owner");
+        (
+            order_stream(state, ORDER_OBS, &mut obs),
+            order_stream(state, ORDER_APP, &mut app),
+            order_stream(state, ORDER_GRB, &mut grb),
+        )
+    };
+    let none: [&str; 0] = [];
+
+    let (o, a, g) = set(&mut state, ORDER_GRB, ORDER_G);
+    assert_eq!(o, ["XFixesSelectionNotify(subtype=0 window=root owner=G)"]);
+    assert_eq!(a, none, "grb SetSelectionOwner G: app gets nothing");
+    assert_eq!(g, none);
+
+    let (o, a, g) = set(&mut state, ORDER_GRB, ORDER_C);
+    assert_eq!(o, ["XFixesSelectionNotify(subtype=0 window=root owner=C)"]);
+    assert_eq!(a, none);
+    assert_eq!(g, none);
+
+    let (o, a, g) = set(&mut state, ORDER_APP, ORDER_T);
+    assert_eq!(o, ["XFixesSelectionNotify(subtype=0 window=root owner=T)"]);
+    assert_eq!(a, none);
+    assert_eq!(g, ["SelectionClear(owner=C)"], "app SetSelectionOwner T");
+}
+
 /// Client 1 disconnects; what client 3 (`obs`) received.
 fn disconnect_app_and_read_order_stream(
     state: &mut ServerState,
@@ -3831,11 +4194,14 @@ fn disconnect_app_and_read_order_stream(
     describe_order_events(&read_all_or_buffered(state, 3, obs))
 }
 
-/// [`destroy_order_fixture`] with the probe's `present` modifier: C has a 3px
-/// border and `obs` selects PresentConfigureNotify on T and C.
-fn present_order_fixture(pointer: (i16, i16)) -> (ServerState, UnixStream, UnixStream) {
+/// [`destroy_order_fixture_set_by`] with the probe's `present` modifier: C has
+/// a 3px border and `obs` selects PresentConfigureNotify on T and C.
+fn present_order_fixture(
+    pointer: (i16, i16),
+    setter: u32,
+) -> (ServerState, UnixStream, UnixStream) {
     use yserver_protocol::x11::present as x11present;
-    let (mut state, grb, obs) = destroy_order_fixture(pointer);
+    let (mut state, grb, obs) = destroy_order_fixture_set_by(pointer, setter);
     state
         .resources
         .window_mut(ResourceId(ORDER_C))
@@ -3868,7 +4234,7 @@ fn present_order_fixture(pointer: (i16, i16)) -> (ServerState, UnixStream, UnixS
 /// out as in [`destroy_window_event_order_matches_xorg`].
 #[test]
 fn destroy_window_sends_present_window_destroyed_in_xorg_order() {
-    let (mut state, mut grb, mut obs) = present_order_fixture((110, 110));
+    let (mut state, mut grb, mut obs) = present_order_fixture((110, 110), ORDER_GRB);
     assert_eq!(
         destroy_t_and_read_order_stream(&mut state, &mut obs),
         [
@@ -3897,7 +4263,7 @@ fn destroy_window_sends_present_window_destroyed_in_xorg_order() {
 /// T, to a surviving selector.
 #[test]
 fn disconnect_sends_present_window_destroyed_in_xorg_order() {
-    let (mut state, mut grb, mut obs) = present_order_fixture((110, 110));
+    let (mut state, mut grb, mut obs) = present_order_fixture((110, 110), ORDER_APP);
     assert_eq!(
         disconnect_app_and_read_order_stream(&mut state, &mut obs),
         [
@@ -3939,7 +4305,7 @@ fn grab_keyboard_on_t_for_app(state: &mut ServerState) {
 /// left out (see [`destroy_window_event_order_matches_xorg`]).
 #[test]
 fn disconnect_releasing_a_keyboard_grab_with_the_pointer_in_c_sends_ungrab_focus_events() {
-    let (mut state, mut grb, mut obs) = destroy_order_fixture((200, 200));
+    let (mut state, mut grb, mut obs) = destroy_order_fixture_set_by((200, 200), ORDER_APP);
     grab_keyboard_on_t_for_app(&mut state);
     assert_eq!(
         disconnect_app_and_read_order_stream(&mut state, &mut obs),
@@ -3971,7 +4337,7 @@ fn disconnect_releasing_a_keyboard_grab_with_the_pointer_in_c_sends_ungrab_focus
 /// out as above.
 #[test]
 fn disconnect_releasing_a_pointer_grab_sends_ungrab_crossings() {
-    let (mut state, mut grb, mut obs) = destroy_order_fixture((200, 200));
+    let (mut state, mut grb, mut obs) = destroy_order_fixture_set_by((200, 200), ORDER_APP);
     set_test_pointer_grab(&mut state, 1, ORDER_T, false, false);
     assert_eq!(
         disconnect_app_and_read_order_stream(&mut state, &mut obs),
@@ -3999,7 +4365,7 @@ fn disconnect_releasing_a_pointer_grab_sends_ungrab_crossings() {
 /// `DoEnterLeaveEvents(T, T)` sends nothing (`dix/enterleave.c:602-603`).
 #[test]
 fn disconnect_releasing_a_pointer_grab_with_the_pointer_in_the_grab_window_sends_no_crossings() {
-    let (mut state, mut grb, mut obs) = destroy_order_fixture((110, 110));
+    let (mut state, mut grb, mut obs) = destroy_order_fixture_set_by((110, 110), ORDER_APP);
     set_test_pointer_grab(&mut state, 1, ORDER_T, false, false);
     assert_eq!(
         disconnect_app_and_read_order_stream(&mut state, &mut obs),

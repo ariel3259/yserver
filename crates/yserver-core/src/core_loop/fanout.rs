@@ -251,16 +251,16 @@ pub fn client_target_id(state: &ServerState, client_id: ClientId) -> Option<Clie
 }
 
 /// Mirror of `ServerState::selection_owner_target` in the new fanout
-/// API: returns the owner window and the owning client's id.
+/// API: returns the owner window and the client that set it (Xorg
+/// `pSel->client`, `dix/selection.c:297-301`), which need not own the window.
 #[must_use]
 pub fn selection_owner_target_id(
     state: &ServerState,
     selection: yserver_protocol::x11::AtomId,
 ) -> Option<(ResourceId, ClientId)> {
-    let owner_window = state.selections.get(&selection)?.0;
-    let owner_client = state.resources.window_owner(owner_window)?;
-    let target = client_target_id(state, owner_client)?;
-    Some((owner_window, target))
+    let owner = state.selections.get(&selection)?;
+    let target = client_target_id(state, owner.client)?;
+    Some((owner.window, target))
 }
 
 /// `encode(buf, sequence, byte_order)` writes a 32-byte (or larger)

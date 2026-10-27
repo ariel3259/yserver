@@ -136,7 +136,7 @@ struct XiHotplugStateSnapshot {
     detached_masters: HashMap<u16, u16>,
     floating_pointer_positions: HashMap<u16, (f32, f32)>,
     client_selections: Vec<XiHotplugClientSelectionsSnapshot>,
-    selections: HashMap<AtomId, (ResourceId, u32)>,
+    selections: HashMap<AtomId, crate::server::SelectionOwner>,
 }
 
 fn xi_hotplug_state_snapshot(state: &ServerState) -> XiHotplugStateSnapshot {

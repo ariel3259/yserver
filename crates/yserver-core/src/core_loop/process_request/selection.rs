@@ -8,7 +8,7 @@ use crate::{
         process_request::{RequestOutcome, emit_x11_error, write_to_client},
     },
     resources::ROOT_WINDOW,
-    server::ServerState,
+    server::{SelectionOwner, ServerState},
 };
 use log::debug;
 use std::io;
@@ -91,8 +91,8 @@ pub(super) fn handle_set_selection_owner(
             22,
         );
     }
-    if let Some(&(_, prior_last_time)) = state.selections.get(&selection)
-        && resolved_time < prior_last_time
+    if let Some(prior) = state.selections.get(&selection)
+        && resolved_time < prior.last_time_changed
     {
         // Stale: silent no-op.
         return Ok(RequestOutcome::Handled);
@@ -100,13 +100,19 @@ pub(super) fn handle_set_selection_owner(
 
     // Snapshot prior ownership BEFORE we mutate state.selections so
     // the SelectionClear gate / event payload sees the previous
-    // owner. `selection_owner_target_id` returns the prior
-    // owner's window + the ClientId we should target.
-    let old = selection_owner_target_id(state, selection);
+    // owner: its window and the client that set it.
+    let old = state.selections.get(&selection).copied();
     if window.0 == 0 {
         state.selections.remove(&selection);
     } else {
-        state.selections.insert(selection, (window, resolved_time));
+        state.selections.insert(
+            selection,
+            SelectionOwner {
+                window,
+                last_time_changed: resolved_time,
+                client: client_id,
+            },
+        );
     }
     let name = state.atoms.name(selection).map(str::to_owned);
     debug!(
@@ -117,18 +123,20 @@ pub(super) fn handle_set_selection_owner(
         window.0
     );
 
-    // SelectionClear gating per Xorg `dix/selection.c:194`:
+    // SelectionClear gating per Xorg `dix/selection.c:183-191`:
     //   if (pSel->client && (!pWin || (pSel->client != client)))
     // i.e. fire only when there WAS a prior owner AND either the
-    // new owner is None OR the new owner is a different client.
-    // Same-client moves between own windows must NOT spawn a
-    // SelectionClear. The event's time field carries the resolved
+    // new owner is None OR the setting client differs. `pSel->client`
+    // is the client that set the prior owner, not the owner window's
+    // creator, and the SelectionClear goes to it. The event's time field carries the resolved
     // server time (`time.milliseconds` post-`ClientTimeToServerTime`
-    // at line 196), not the raw `time_val` — a client sending
+    // at line 185), not the raw `time_val` — a client sending
     // `CurrentTime`/0 must NOT see 0 in the event payload.
-    if let Some((old_window, old_target)) = old
-        && (window.0 == 0 || old_target != client_id)
+    if let Some(old) = old
+        && (window.0 == 0 || old.client != client_id)
+        && let Some(old_target) = client_target_id(state, old.client)
     {
+        let old_window = old.window;
         let _dropped = fanout_event_to_clients(state, &[old_target], |buf, seq, order| {
             x11::encode_selection_clear_event(
                 buf,
@@ -166,47 +174,52 @@ pub(super) fn handle_set_selection_owner(
     Ok(RequestOutcome::Handled)
 }
 
-/// Audit #9 fanout helper — emits an `XFixesSelectionNotify` to every
-/// `SelectSelectionInput` subscription on this selection whose mask
-/// includes the matching subtype bit. Each subscription gets its own
-/// event (the `window` field carries the *subscriber's* window, not
-/// the owner's, per the X11 protocol).
-///
-/// `owner_window` is the new owner (or 0 = `None`). `timestamp` /
-/// `selection_timestamp` follow Xorg's
-/// `XFixesSelectionCallback` (`xfixes/select.c:158-210`): for the
-/// SetOwner subtype both equal the request's `time` argument; for
-/// WindowDestroy / ClientClose the timestamp is currentTime and
-/// selection_timestamp is the last-set time of the selection (which
-/// yserver doesn't currently track per-selection — we pass the same
-/// `timestamp` for both for now; refine if a clipboard manager turns
-/// out to gate on selection_timestamp).
-/// Audit #9 — for every selection whose owner is in `owned_windows`,
-/// fire `XFixesSelectionNotify(subtype)` to subscribers and clear the
-/// ownership entry. Used by both `destroy_window_subtree` (with
-/// `subtype = WindowDestroy`) and the client-disconnect path
-/// (with `subtype = ClientClose`).
+/// Xorg `DeleteWindowFromAnySelections` (`dix/selection.c:113-125`): every
+/// selection owned by one of `owned_windows` fires
+/// `XFixesSelectionNotify(subtype)` and is cleared. `destroy_window_subtree`
+/// passes `SelectionWindowDestroy`.
 pub(super) fn drop_selections_owned_by_windows(
     state: &mut ServerState,
     owned_windows: &[ResourceId],
     subtype: u8,
 ) {
+    drop_selections_where(state, subtype, |owner| {
+        owned_windows.contains(&owner.window)
+    });
+}
+
+/// Xorg `DeleteClientFromAnySelections` (`dix/selection.c:128-139`), run by
+/// `CloseDownClient` (`dix/dispatch.c:3495`) before the client's resources
+/// go: every selection `cid` set fires
+/// `XFixesSelectionNotify(SelectionClientClose)` and is cleared, whoever owns
+/// its window. A selection another client set on one of `cid`'s windows is
+/// left for the window's destruction (SelectionWindowDestroy).
+pub(crate) fn fanout_xfixes_selection_client_close_for_client(
+    state: &mut ServerState,
+    cid: ClientId,
+) {
+    drop_selections_where(
+        state,
+        yserver_protocol::x11::xfixes::SELECTION_NOTIFY_CLIENT_CLOSE,
+        |owner| owner.client == cid,
+    );
+}
+
+fn drop_selections_where(
+    state: &mut ServerState,
+    subtype: u8,
+    matches: impl Fn(&SelectionOwner) -> bool,
+) {
     // Capture (selection, prior_last_time_changed) BEFORE clearing so
-    // the notify can carry the prior `selection_timestamp` — Xorg's
-    // `DeleteWindowFromAnySelections` / `DeleteClientFromAnySelections`
-    // (`dix/selection.c:131-138, 145-153`) fire the callback BEFORE
-    // mutating `pSel->window`/`pSel->client`, and the callback at
-    // `xfixes/select.c:89` reads `selection->lastTimeChanged`.
+    // the notify can carry the prior `selection_timestamp` — Xorg
+    // fires the callback BEFORE mutating `pSel->window`/`pSel->client`,
+    // and the callback at `xfixes/select.c:89` reads
+    // `selection->lastTimeChanged`.
     let to_drop: Vec<(AtomId, u32)> = state
         .selections
         .iter()
-        .filter_map(|(sel, (owner, last_time_changed))| {
-            if owned_windows.contains(owner) {
-                Some((*sel, *last_time_changed))
-            } else {
-                None
-            }
-        })
+        .filter(|(_, owner)| matches(owner))
+        .map(|(sel, owner)| (*sel, owner.last_time_changed))
         .collect();
     if to_drop.is_empty() {
         return;
@@ -227,32 +240,15 @@ pub(super) fn drop_selections_owned_by_windows(
     }
 }
 
-/// Audit #9 — client-disconnect cleanup: find every window the
-/// disconnecting client owns, check if any of them owns a selection,
-/// and fire `XFixesSelectionNotify(ClientClose)` + clear ownership.
-/// Reference: Xorg `xfixes/select.c`'s
-/// `SelectionClientClose` callback registered against
-/// `clientGoneSelectionRequest`.
-pub(crate) fn fanout_xfixes_selection_client_close_for_client(
-    state: &mut ServerState,
-    cid: ClientId,
-) {
-    let client_windows: Vec<ResourceId> = state
-        .selections
-        .values()
-        .map(|(win, _)| *win)
-        .filter(|win| state.resources.window_owner(*win) == Some(cid))
-        .collect();
-    if client_windows.is_empty() {
-        return;
-    }
-    drop_selections_owned_by_windows(
-        state,
-        &client_windows,
-        yserver_protocol::x11::xfixes::SELECTION_NOTIFY_CLIENT_CLOSE,
-    );
-}
-
+/// Audit #9 fanout helper — emits an `XFixesSelectionNotify` to every
+/// `SelectSelectionInput` subscription on this selection whose mask
+/// includes the matching subtype bit. Each subscription gets its own
+/// event (the `window` field carries the *subscriber's* window, not
+/// the owner's, per the X11 protocol).
+///
+/// `owner_window` is the new owner (or 0 = `None`). `timestamp` is
+/// currentTime and `selection_timestamp` the selection's
+/// `lastTimeChanged` (`xfixes/select.c:78-89`).
 fn fanout_xfixes_selection_notify(
     state: &mut ServerState,
     selection: AtomId,
@@ -584,8 +580,7 @@ pub(super) fn handle_get_selection_owner(
         state
             .selections
             .get(&selection)
-            .map(|(w, _)| *w)
-            .unwrap_or(ResourceId(0))
+            .map_or(ResourceId(0), |owner| owner.window)
     } else {
         ResourceId(0)
     };

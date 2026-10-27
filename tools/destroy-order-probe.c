@@ -2,6 +2,7 @@
  *                       a mapped subtree (window-destroy plan, phase 1).
  *
  *   ./destroy-order-probe c | t [destroy | disconnect][-appsel][-kbd][-ptr][-present]
+ *   ./destroy-order-probe c | t setter-disconnect | winowner-disconnect | setter-route | setter-retake
  *
  * `app` owns mapped T (child of root) and its mapped child C; the pointer is
  * warped into C (c) or into T outside C (t). `grb` owns a selection on C, holds an active pointer grab on
@@ -18,6 +19,15 @@
  *   `ptr`     the active pointer grab is `app`'s, on T, instead of `grb`'s on C;
  *   `present` C gets a 3px border and `obs` selects PresentConfigureNotify on T and C.
  *
+ * The setter-* / winowner-* cases have `grb` set the owner on `app`'s C and
+ * take no grab or focus:
+ * `setter-disconnect`: `grb` disconnects, then `app` destroys T.
+ * `winowner-disconnect`: `app` disconnects.
+ * `setter-route`: `obs` converts the selection, then takes it over on its own
+ * window; shows which client gets SelectionRequest and SelectionClear.
+ * `setter-retake`: `grb` moves the owner to its own window G and back to C,
+ * then `app` takes it on T.
+ *
  *   cc -O1 -o destroy-order-probe destroy-order-probe.c -lxcb -lxcb-xfixes -lxcb-present
  */
 #include <poll.h>
@@ -30,7 +40,7 @@
 #include <xcb/xfixes.h>
 
 static xcb_connection_t *app, *grb, *obs;
-static xcb_window_t root, T, C;
+static xcb_window_t root, T, C, W, G;
 static uint8_t xfixes_ev, present_op;
 static uint32_t eT, eC;
 
@@ -44,6 +54,10 @@ static const char *nm(uint32_t id)
         return "T";
     if (id == C)
         return "C";
+    if (id && id == W)
+        return "W";
+    if (id && id == G)
+        return "G";
     if (id == 0)
         return "None";
     if (id == 1)
@@ -118,6 +132,15 @@ static void drain(xcb_connection_t *c, const char *who)
                    "flags=0x%x)",
                    e->event == eT ? "eT" : e->event == eC ? "eC" : "?", nm(e->window), e->x, e->y, e->width,
                    e->height, e->off_x, e->off_y, e->pixmap_width, e->pixmap_height, e->pixmap_flags);
+        } else if (t == XCB_SELECTION_CLEAR) {
+            xcb_selection_clear_event_t *e = (void *)ev;
+            printf("SelectionClear(owner=%s)", nm(e->owner));
+        } else if (t == XCB_SELECTION_REQUEST) {
+            xcb_selection_request_event_t *e = (void *)ev;
+            printf("SelectionRequest(owner=%s requestor=%s)", nm(e->owner), nm(e->requestor));
+        } else if (t == XCB_SELECTION_NOTIFY) {
+            xcb_selection_notify_event_t *e = (void *)ev;
+            printf("SelectionNotify(requestor=%s property=%u)", nm(e->requestor), e->property);
         } else {
             printf("event%u", t);
         }
@@ -134,6 +157,103 @@ static xcb_connection_t *conn(void)
         exit(1);
     }
     return c;
+}
+
+static void owner(xcb_atom_t sel)
+{
+    xcb_get_selection_owner_reply_t *r =
+        xcb_get_selection_owner_reply(obs, xcb_get_selection_owner(obs, sel), NULL);
+    printf("selection owner: %s\n", r ? nm(r->owner) : "?");
+    free(r);
+}
+
+/* `grb` owns the selection on `app`'s C; no grab, no focus. */
+static int cross(const char *how, xcb_atom_t sel)
+{
+    xcb_set_selection_owner(grb, C, sel, XCB_CURRENT_TIME);
+    rt(grb);
+    rt(obs);
+    printf("setup\n");
+    drain(obs, "obs");
+    drain(app, "app");
+    drain(grb, "grb");
+    owner(sel);
+    if (strcmp(how, "setter-retake") == 0) {
+        G = xcb_generate_id(grb);
+        uint32_t v = 0;
+        xcb_create_window(grb, XCB_COPY_FROM_PARENT, G, root, 0, 0, 10, 10, 0, XCB_WINDOW_CLASS_INPUT_OUTPUT,
+                          XCB_COPY_FROM_PARENT, XCB_CW_BACK_PIXEL, &v);
+        xcb_window_t steps[3] = {G, C, T};
+        xcb_connection_t *who[3] = {grb, grb, app};
+        const char *names[3] = {"grb SetSelectionOwner G", "grb SetSelectionOwner C",
+                                "app SetSelectionOwner T"};
+        for (int i = 0; i < 3; i++) {
+            xcb_set_selection_owner(who[i], steps[i], sel, XCB_CURRENT_TIME);
+            rt(who[i]);
+            rt(obs);
+            rt(app);
+            rt(grb);
+            printf("%s\n", names[i]);
+            drain(obs, "obs");
+            drain(app, "app");
+            drain(grb, "grb");
+            owner(sel);
+        }
+    } else if (strcmp(how, "setter-route") == 0) {
+        W = xcb_generate_id(obs);
+        uint32_t v = 0;
+        xcb_create_window(obs, XCB_COPY_FROM_PARENT, W, root, 0, 0, 10, 10, 0, XCB_WINDOW_CLASS_INPUT_OUTPUT,
+                          XCB_COPY_FROM_PARENT, XCB_CW_BACK_PIXEL, &v);
+        xcb_convert_selection(obs, W, sel, XCB_ATOM_STRING, XCB_ATOM_STRING, XCB_CURRENT_TIME);
+        rt(obs);
+        rt(app);
+        rt(grb);
+        printf("obs ConvertSelection\n");
+        drain(obs, "obs");
+        drain(app, "app");
+        drain(grb, "grb");
+        xcb_set_selection_owner(obs, W, sel, XCB_CURRENT_TIME);
+        rt(obs);
+        rt(app);
+        rt(grb);
+        printf("obs SetSelectionOwner W\n");
+        drain(obs, "obs");
+        drain(app, "app");
+        drain(grb, "grb");
+        owner(sel);
+    } else if (strcmp(how, "setter-disconnect") == 0) {
+        xcb_disconnect(grb);
+        usleep(200000);
+        rt(app);
+        rt(obs);
+        printf("disconnect grb\n");
+        drain(obs, "obs");
+        drain(app, "app");
+        owner(sel);
+        xcb_destroy_window(app, T);
+        rt(app);
+        rt(obs);
+        printf("destroy T\n");
+        drain(obs, "obs");
+        owner(sel);
+        grb = NULL;
+    } else {
+        xcb_disconnect(app);
+        usleep(200000);
+        rt(grb);
+        rt(obs);
+        printf("disconnect app\n");
+        drain(obs, "obs");
+        drain(grb, "grb");
+        owner(sel);
+        app = NULL;
+    }
+    if (app)
+        xcb_disconnect(app);
+    if (grb)
+        xcb_disconnect(grb);
+    xcb_disconnect(obs);
+    return 0;
 }
 
 int main(int argc, char **argv)
@@ -204,6 +324,9 @@ int main(int argc, char **argv)
 
     xcb_warp_pointer(app, XCB_NONE, root, 0, 0, 0, 0, in_t ? 110 : 200, in_t ? 110 : 200);
     rt(app);
+
+    if (strncmp(how, "setter-", 7) == 0 || strncmp(how, "winowner-", 9) == 0)
+        return cross(how, sel);
 
     xcb_set_selection_owner(app_sel ? app : grb, C, sel, XCB_CURRENT_TIME);
     rt(app);

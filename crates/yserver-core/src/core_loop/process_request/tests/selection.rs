@@ -167,9 +167,14 @@ fn destroy_window_owning_selection_fires_window_destroy_notify_and_clears_owners
     );
 
     // PRIMARY currently owned by OWNER_WIN.
-    state
-        .selections
-        .insert(AtomId(PRIMARY), (ResourceId(OWNER_WIN), 0));
+    state.selections.insert(
+        AtomId(PRIMARY),
+        crate::server::SelectionOwner {
+            window: ResourceId(OWNER_WIN),
+            last_time_changed: 0,
+            client: ClientId(OWNER_ID),
+        },
+    );
 
     // Subscriber registered with WindowDestroy bit.
     state.xfixes_selection_masks.insert(
@@ -266,8 +271,7 @@ fn client_disconnect_owning_selection_fires_client_close_notify_and_clears_owner
     let mut peer = install_client(&mut state, SUBSCRIBER_ID);
     let _ = install_client(&mut state, OWNER_ID);
 
-    // OWNER_WIN belongs to OWNER_ID via window_owner mapping —
-    // `selection_owner_target_id` walks that mapping.
+    // OWNER_ID creates OWNER_WIN and sets the selection on it.
     state.resources.create_window(
         ClientId(OWNER_ID),
         yserver_protocol::x11::CreateWindowRequest {
@@ -284,9 +288,14 @@ fn client_disconnect_owning_selection_fires_client_close_notify_and_clears_owner
             ..Default::default()
         },
     );
-    state
-        .selections
-        .insert(AtomId(PRIMARY), (ResourceId(OWNER_WIN), 0));
+    state.selections.insert(
+        AtomId(PRIMARY),
+        crate::server::SelectionOwner {
+            window: ResourceId(OWNER_WIN),
+            last_time_changed: 0,
+            client: ClientId(OWNER_ID),
+        },
+    );
     state.xfixes_selection_masks.insert(
         (SUBSCRIBER_ID, ResourceId(SUBSCRIBER_WIN), AtomId(PRIMARY)),
         x11xfixes::SELECTION_MASK_CLIENT_CLOSE,
@@ -385,9 +394,14 @@ fn set_selection_owner_no_clear_when_same_client_moves_between_own_windows() {
     }
     // Seed prior ownership directly so we isolate the second-call
     // path. Owner = WIN_A (belongs to APP).
-    state
-        .selections
-        .insert(AtomId(PRIMARY), (ResourceId(WIN_A), 0));
+    state.selections.insert(
+        AtomId(PRIMARY),
+        crate::server::SelectionOwner {
+            window: ResourceId(WIN_A),
+            last_time_changed: 0,
+            client: ClientId(APP),
+        },
+    );
 
     // Same client takes ownership at WIN_B.
     let mut body = Vec::with_capacity(12);
@@ -457,9 +471,14 @@ fn set_selection_owner_clear_event_uses_resolved_time_when_client_sends_zero() {
     }
     // Seed prior ownership with lastTimeChanged=0 so the stale
     // check at the new call never trips.
-    state
-        .selections
-        .insert(AtomId(PRIMARY), (ResourceId(PRIOR_WIN), 0));
+    state.selections.insert(
+        AtomId(PRIMARY),
+        crate::server::SelectionOwner {
+            window: ResourceId(PRIOR_WIN),
+            last_time_changed: 0,
+            client: ClientId(PRIOR_OWNER),
+        },
+    );
 
     // Sleep so `state.timestamp_now()` is non-zero when the new
     // request runs — pre-fix the SelectionClear's `time` field
@@ -751,7 +770,11 @@ fn set_selection_owner_with_stale_time_is_silently_ignored() {
     // Seed prior ownership with lastTimeChanged = 1000.
     state.selections.insert(
         AtomId(PRIMARY),
-        (ResourceId(PRIOR_OWNER_WIN), PRIOR_LAST_TIME),
+        crate::server::SelectionOwner {
+            window: ResourceId(PRIOR_OWNER_WIN),
+            last_time_changed: PRIOR_LAST_TIME,
+            client: ClientId(PRIOR_OWNER_ID),
+        },
     );
     state.xfixes_selection_masks.insert(
         (SUBSCRIBER_ID, ResourceId(SUBSCRIBER_WIN), AtomId(PRIMARY)),
@@ -767,7 +790,10 @@ fn set_selection_owner_with_stale_time_is_silently_ignored() {
     handle_set_selection_owner(&mut state, ClientId(NEW_OWNER_ID), SequenceNumber(1), &body)
         .expect("handle_set_selection_owner");
 
-    let preserved = state.selections.get(&AtomId(PRIMARY)).copied();
+    let preserved = state
+        .selections
+        .get(&AtomId(PRIMARY))
+        .map(|owner| (owner.window, owner.last_time_changed));
     assert_eq!(
         preserved,
         Some((ResourceId(PRIOR_OWNER_WIN), PRIOR_LAST_TIME)),
@@ -978,9 +1004,14 @@ fn destroy_window_owning_selection_carries_prior_last_time_changed_in_selection_
     // (future/stale checks, ClientTime → ServerTime conversion);
     // we only care here that whatever value is in the second
     // tuple slot flows through to the notify wire payload.
-    state
-        .selections
-        .insert(AtomId(PRIMARY), (ResourceId(OWNER_WIN), SET_OWNER_TIME));
+    state.selections.insert(
+        AtomId(PRIMARY),
+        crate::server::SelectionOwner {
+            window: ResourceId(OWNER_WIN),
+            last_time_changed: SET_OWNER_TIME,
+            client: ClientId(OWNER_ID),
+        },
+    );
 
     let mut destroy_body = Vec::with_capacity(4);
     destroy_body.extend_from_slice(&OWNER_WIN.to_le_bytes());

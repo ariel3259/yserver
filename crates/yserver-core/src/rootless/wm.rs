@@ -131,7 +131,14 @@ pub(super) fn announce(state: &mut ServerState, backend: &mut dyn Backend) {
     );
     let wm_s0 = state.atoms.intern("WM_S0", false);
     let now = state.timestamp_now();
-    state.selections.insert(wm_s0, (check, now));
+    state.selections.insert(
+        wm_s0,
+        crate::server::SelectionOwner {
+            window: check,
+            last_time_changed: now,
+            client: SERVER_OWNER,
+        },
+    );
 }
 
 /// `_NET_FRAME_EXTENTS` (EWMH §5.11): native decorations sit outside the X

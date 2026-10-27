@@ -175,14 +175,10 @@ pub fn process_disconnect_reporting(
     // freed, and needs the client's base and sequence.
     crate::core_loop::record::client_disconnected(state, client_id);
 
-    // Audit #9 (docs/protocol-audit-2026-05-19.md) — before the
-    // disconnecting client's windows are destroyed, fire
-    // `XFixesSelectionNotify(SelectionClientClose)` to any subscriber
-    // whose mask includes the ClientClose bit, then clear those
-    // ownership entries. This must run BEFORE the destroy loop below
-    // because `fanout_xfixes_selection_client_close_for_client`
-    // resolves selection owners via `state.resources.window_owner`,
-    // and the destroy loop is about to evict those windows.
+    // Xorg `DeleteClientFromAnySelections` (`dix/dispatch.c:3495`), before
+    // any of the client's resources go: the selections this client set
+    // send SelectionClientClose and are cleared. Selections other clients
+    // set on its windows go with those windows (SelectionWindowDestroy).
     crate::core_loop::process_request::fanout_xfixes_selection_client_close_for_client(
         state, client_id,
     );

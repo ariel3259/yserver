@@ -361,6 +361,22 @@ pub struct Xi1ActiveGrab {
     pub passive_detail: Option<u8>,
 }
 
+/// An owned selection, Xorg's `Selection` (`include/selection.h`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectionOwner {
+    /// The owner window.
+    pub window: ResourceId,
+    /// `lastTimeChanged` in ms, the resolved time of the `SetSelectionOwner`
+    /// that set it; `selection_timestamp` in `XFixesSelectionNotify`
+    /// (`xfixes/select.c:89`).
+    pub last_time_changed: u32,
+    /// The client whose `SetSelectionOwner` set it, which need not own
+    /// `window` (`dix/selection.c:220`). SelectionClear and SelectionRequest
+    /// go to it, and its disconnect clears the selection with ClientClose
+    /// (`DeleteClientFromAnySelections`, `dix/selection.c:128-139`).
+    pub client: ClientId,
+}
+
 /// Core keyboard focus state — Xorg `FocusClassRec` (win/revert/time)
 /// for the virtual core keyboard.
 #[derive(Debug, Clone, Copy)]
@@ -1082,13 +1098,8 @@ pub struct ServerState {
     /// Xorg's per-device XKB interest (`XkbInterestRec`, the other
     /// XkbSelectEvents detail masks): (client, device spec) -> masks.
     pub xkb_interests: HashMap<(u32, u16), XkbInterest>,
-    /// Selection ownership: maps selection atom → (owning window,
-    /// `lastTimeChanged` in ms). `lastTimeChanged` is the timestamp
-    /// from the `SetSelectionOwner` request that produced this entry;
-    /// it surfaces on the wire as `selection_timestamp` in
-    /// `XFixesSelectionNotify` events (Xorg `xfixes/select.c:89` reads
-    /// `selection->lastTimeChanged`).
-    pub selections: HashMap<AtomId, (ResourceId, u32)>,
+    /// Selection ownership by selection atom.
+    pub selections: HashMap<AtomId, SelectionOwner>,
     /// Last known pointer position in root coordinates, cached from the
     /// pointer fanout. XI2 focus events (FocusIn/FocusOut share the
     /// `xXIEnterEvent` layout and carry the pointer position) are emitted
@@ -3632,12 +3643,12 @@ impl ServerState {
             .map(Self::event_target_for_client)
     }
 
+    /// The owner window and the client that set it (Xorg `pSel->client`).
     #[must_use]
     pub fn selection_owner_target(&self, selection: AtomId) -> Option<(ResourceId, EventTarget)> {
-        let owner_window = self.selections.get(&selection)?.0;
-        let owner_client = self.resources.window_owner(owner_window)?;
-        let target = self.client_target(owner_client)?;
-        Some((owner_window, target))
+        let owner = self.selections.get(&selection)?;
+        let target = self.client_target(owner.client)?;
+        Some((owner.window, target))
     }
 
     pub fn drop_window_subscriptions(&mut self, windows: &[ResourceId]) {

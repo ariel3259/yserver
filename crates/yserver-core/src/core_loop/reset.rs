@@ -1012,7 +1012,14 @@ mod tests {
         let mut backend = backend_with_topology();
         let f = seed_client_session(&mut state, &mut backend, 7);
         let session_atom = state.atoms.intern("_SESSION_ONLY_ATOM", false);
-        state.selections.insert(session_atom, (f.window, 1));
+        state.selections.insert(
+            session_atom,
+            crate::server::SelectionOwner {
+                window: f.window,
+                last_time_changed: 1,
+                client: ClientId(7),
+            },
+        );
         state.server_grab_owner = Some(ClientId(7));
         state.set_pointer_grab(crate::server::ActivePointerGrab {
             owner: ClientId(7),
