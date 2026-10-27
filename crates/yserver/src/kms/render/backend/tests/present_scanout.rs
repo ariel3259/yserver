@@ -849,8 +849,14 @@ fn destroy_subwindow_retires_current_direct_idle_once_after_replacement() {
     assert!(b.store.get(target_id).is_none());
     assert_eq!(b.store.get(cow_id).map(|d| d.refcount), Some(2));
 
-    b.stop_direct_after_scanout_replaced("destroy-subwindow test replacement");
-    b.stop_direct_after_scanout_replaced("destroy-subwindow duplicate replacement");
+    b.stop_direct_after_scanout_replaced(
+        crate::kms::render::backend::DirectScope::Root,
+        "destroy-subwindow test replacement",
+    );
+    b.stop_direct_after_scanout_replaced(
+        crate::kms::render::backend::DirectScope::Root,
+        "destroy-subwindow duplicate replacement",
+    );
 
     assert!(!b.present_source_pins.contains_key(&source_pin));
     assert!(!b.present_source_pins.contains_key(&cow_pin));
@@ -891,7 +897,10 @@ fn final_cow_release_defers_storage_until_direct_replacement() {
     assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
     assert_eq!(b.store.get(cow_id).map(|d| d.refcount), Some(2));
 
-    b.stop_direct_after_scanout_replaced("final COW release test replacement");
+    b.stop_direct_after_scanout_replaced(
+        crate::kms::render::backend::DirectScope::Root,
+        "final COW release test replacement",
+    );
 
     assert!(!b.deferred_cow_release);
     assert!(b.cow_id.is_none());
@@ -902,6 +911,179 @@ fn final_cow_release_defers_storage_until_direct_replacement() {
     assert_eq!(b.store.get(source_id).map(|d| d.refcount), Some(1));
     assert_eq!(b.drain_retired_present_idle_events().len(), 1);
     assert!(b.drain_retired_present_idle_events().is_empty());
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: call finish_deferred_cow_release on every owner stop.
+fn deferred_cow_release_waits_for_last_output_owner() {
+    use super::commit_identity::direct_unflip::{
+        accepted_record_id, complete_output_owner_record, direct_fixture, fd, record_count,
+        records_since,
+    };
+    use crate::kms::render::backend::ScanoutM0Target;
+    use yserver_core::backend::Backend;
+
+    let Some((fixture, first)) = direct_fixture(
+        2,
+        super::commit_identity::recording_scene::P1SceneRoute::Shared,
+        212,
+        0,
+    ) else {
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    let second = fixture.install_direct_present(213, 0);
+    assert!(
+        Backend::get_overlay_window(&mut fixture.events.backend, None)
+            .expect("materialize COW through Backend")
+    );
+    let cow_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+    let cow_id = fixture.events.backend.cow_id.expect("materialized COW id");
+    Backend::set_cursor_hidden(&mut fixture.events.backend, true);
+
+    let device_fd = fd(&fixture);
+    let start = record_count(&fixture, device_fd);
+    super::commit_identity::direct_unflip::seed_output_owner_successor(
+        &mut fixture,
+        &first,
+        0,
+        ScanoutM0Target::Cow,
+        Some(cow_id),
+        Some(cow_xid),
+    );
+    super::commit_identity::direct_unflip::seed_output_owner_successor(
+        &mut fixture,
+        &second,
+        1,
+        ScanoutM0Target::Cow,
+        Some(cow_id),
+        Some(cow_xid),
+    );
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("submit two output owners through the scheduler");
+    let direct_records = records_since(&fixture, device_fd, start);
+    let crtc0 = fixture.events.backend.platform.outputs[0].output.crtc;
+    let crtc1 = fixture.events.backend.platform.outputs[1].output.crtc;
+    let direct0 = direct_records
+        .iter()
+        .find(|record| record.events.iter().any(|event| event.crtc == crtc0))
+        .expect("output 0 direct record");
+    let direct1 = direct_records
+        .iter()
+        .find(|record| record.events.iter().any(|event| event.crtc == crtc1))
+        .expect("output 1 direct record");
+    complete_output_owner_record(
+        &mut fixture,
+        device_fd,
+        direct0,
+        accepted_record_id(direct0).expect("output 0 direct event id"),
+        54,
+    );
+    complete_output_owner_record(
+        &mut fixture,
+        device_fd,
+        direct1,
+        accepted_record_id(direct1).expect("output 1 direct event id"),
+        55,
+    );
+    assert_eq!(
+        Backend::drain_completed_present_events(&mut fixture.events.backend)
+            .into_iter()
+            .map(|event| event.present_id)
+            .collect::<Vec<_>>(),
+        [first.candidate.present_id, second.candidate.present_id]
+    );
+    assert!(
+        Backend::prepare_overlay_release(&mut fixture.events.backend, None)
+            .expect("prepare deferred COW release")
+    );
+    Backend::retire_overlay_window(&mut fixture.events.backend, None);
+    assert!(fixture.events.backend.deferred_cow_release);
+    assert_eq!(fixture.events.backend.cow_id, Some(cow_id));
+    assert!(fixture.events.backend.store.get(cow_id).is_some());
+
+    let start = record_count(&fixture, device_fd);
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("submit both output composed replacements");
+    let replacements = records_since(&fixture, device_fd, start);
+    let replacement0 = replacements
+        .iter()
+        .find(|record| record.events.iter().any(|event| event.crtc == crtc0))
+        .expect("output 0 replacement record");
+    let replacement1 = replacements
+        .iter()
+        .find(|record| record.events.iter().any(|event| event.crtc == crtc1))
+        .expect("output 1 replacement record");
+    assert_eq!(replacement0.events.len(), 1);
+    assert_eq!(replacement1.events.len(), 1);
+
+    complete_output_owner_record(
+        &mut fixture,
+        device_fd,
+        replacement1,
+        accepted_record_id(replacement1).expect("output 1 replacement event id"),
+        56,
+    );
+    assert!(
+        fixture.events.backend.pstate.direct.outputs[1]
+            .current
+            .is_none()
+    );
+    assert!(
+        fixture.events.backend.pstate.direct.outputs[0]
+            .current
+            .is_some()
+    );
+    assert!(fixture.events.backend.deferred_cow_release);
+    assert_eq!(fixture.events.backend.cow_id, Some(cow_id));
+    assert!(fixture.events.backend.store.get(cow_id).is_some());
+
+    assert!(
+        Backend::get_overlay_window(&mut fixture.events.backend, None)
+            .expect("reclaim deferred COW through Backend")
+    );
+    assert_eq!(fixture.events.backend.cow_id, Some(cow_id));
+    assert!(fixture.events.backend.windows.contains_key(&cow_xid));
+    assert!(fixture.events.backend.store.get(cow_id).is_some());
+
+    assert!(
+        Backend::prepare_overlay_release(&mut fixture.events.backend, None)
+            .expect("prepare final COW release")
+    );
+    Backend::retire_overlay_window(&mut fixture.events.backend, None);
+    assert!(fixture.events.backend.deferred_cow_release);
+    assert_eq!(fixture.events.backend.cow_id, Some(cow_id));
+
+    complete_output_owner_record(
+        &mut fixture,
+        device_fd,
+        replacement0,
+        accepted_record_id(replacement0).expect("output 0 replacement event id"),
+        57,
+    );
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .active_scopes()
+            .is_empty()
+    );
+    assert!(!fixture.events.backend.deferred_cow_release);
+    assert!(fixture.events.backend.cow_id.is_none());
+    assert!(!fixture.events.backend.windows.contains_key(&cow_xid));
+    assert!(fixture.events.backend.store.get(cow_id).is_none());
+    assert!(fixture.events.backend.present_source_pins.is_empty());
+    assert_eq!(
+        Backend::drain_retired_present_idle_events(&mut fixture.events.backend)
+            .into_iter()
+            .map(|event| event.present_id)
+            .collect::<Vec<_>>(),
+        [first.candidate.present_id, second.candidate.present_id]
+    );
+    assert!(Backend::drain_retired_present_idle_events(&mut fixture.events.backend).is_empty());
 }
 
 #[test]
@@ -950,7 +1132,10 @@ fn get_cow_during_deferred_release_reuses_backend_identity() {
     assert!(rematerialized, "core must rebuild its logical COW resource");
     assert!(!b.deferred_cow_release);
     assert_eq!(b.cow_id, Some(cow_id));
-    b.stop_direct_after_scanout_replaced("reclaimed COW test replacement");
+    b.stop_direct_after_scanout_replaced(
+        crate::kms::render::backend::DirectScope::Root,
+        "reclaimed COW test replacement",
+    );
     assert_eq!(b.cow_id, Some(cow_id));
     assert_eq!(b.store.get(cow_id).map(|d| d.refcount), Some(1));
 }
@@ -1150,7 +1335,10 @@ fn logical_resize_keeps_old_cow_pinned_until_direct_replacement() {
         Some(new_cow_id)
     );
 
-    b.stop_direct_after_scanout_replaced("logical resize test replacement");
+    b.stop_direct_after_scanout_replaced(
+        crate::kms::render::backend::DirectScope::Root,
+        "logical resize test replacement",
+    );
     assert!(b.store.get(old_cow_id).is_none());
     assert_eq!(b.cow_id, Some(new_cow_id));
     assert!(b.store.get(new_cow_id).is_some());
@@ -1364,8 +1552,14 @@ fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
     latest_successor.event.serial = 11;
 
     b.pstate.direct.root_mut().pending = Some(predecessor);
-    b.queue_direct_successor(first_successor);
-    b.queue_direct_successor(latest_successor);
+    b.queue_direct_successor(
+        crate::kms::render::backend::DirectScope::Root,
+        first_successor,
+    );
+    b.queue_direct_successor(
+        crate::kms::render::backend::DirectScope::Root,
+        latest_successor,
+    );
 
     assert_eq!(
         b.pstate

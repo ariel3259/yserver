@@ -57,7 +57,7 @@ impl Platform for PlatformBackend {
     }
 
     fn direct_scanout_owns_frame(b: &KmsBackend) -> bool {
-        b.pstate.direct.root().active()
+        !b.pstate.direct.active_scopes().is_empty()
     }
 
     fn tearing_active(b: &KmsBackend) -> bool {
@@ -163,87 +163,87 @@ impl Platform for PlatformBackend {
     }
 
     fn hide_cursor_under_direct_scanout(b: &mut KmsBackend) {
-        if !b.pstate.direct.root().active() {
-            return;
-        }
-        if !b.platform.any_cursor_plane_visible() {
-            for output_idx in 0..b.platform.outputs.len() {
-                b.platform.clear_direct_cursor_retry(output_idx);
-            }
-            b.pstate
-                .direct
-                .root_mut()
-                .clear_all_direct_cursor_refresh_pending();
-            if !b.sync_direct_cursor_scene_state() {
-                b.request_direct_unflip("cursor_scene_sync_failed");
-            }
-            return;
-        }
-        let mut failed = false;
-        for output_idx in 0..b.platform.outputs.len() {
-            if !b.platform.cursor_plane_visible_for_output(output_idx) {
-                b.platform.clear_direct_cursor_retry(output_idx);
-                b.pstate
-                    .direct
-                    .root_mut()
-                    .clear_direct_cursor_refresh_pending(output_idx);
+        for scope in b.pstate.direct.active_scopes() {
+            let output_indices = b.direct_scope_outputs(scope);
+            if !output_indices
+                .iter()
+                .any(|&idx| b.platform.cursor_plane_visible_for_output(idx))
+            {
+                for output_idx in output_indices {
+                    b.platform.clear_direct_cursor_retry(output_idx);
+                }
+                if let Some(owner) = b.pstate.direct.get_mut(scope) {
+                    owner.clear_all_direct_cursor_refresh_pending();
+                }
+                if !b.sync_direct_cursor_scene_state() {
+                    b.request_direct_unflip_for(scope, "cursor_scene_sync_failed");
+                }
                 continue;
             }
-            let atomic_path = b
-                .platform
-                .device_for_output(&b.platform.outputs[output_idx].key)
-                .is_some_and(|device| {
-                    device.cursor.state_path()
-                        == crate::kms::cursor_plane::topology::CursorStatePath::Atomic
-                });
-            match b.platform.cursor_plane_hide_on_crtc(output_idx) {
-                Ok(()) => {
+            let mut failed = false;
+            for output_idx in output_indices {
+                if !b.platform.cursor_plane_visible_for_output(output_idx) {
                     b.platform.clear_direct_cursor_retry(output_idx);
-                    b.pstate
-                        .direct
-                        .root_mut()
-                        .clear_direct_cursor_refresh_pending(output_idx);
+                    if let Some(owner) = b.pstate.direct.get_mut(scope) {
+                        owner.clear_direct_cursor_refresh_pending(output_idx);
+                    }
+                    continue;
                 }
-                Err(error)
-                    if error.kind() == io::ErrorKind::WouldBlock
-                        || error.raw_os_error() == Some(libc::EBUSY) =>
-                {
-                    b.platform.clear_direct_cursor_retry(output_idx);
-                    b.pstate
-                        .direct
-                        .root_mut()
-                        .mark_direct_cursor_refresh_pending(output_idx);
-                    log::debug!(
-                        "scanout_m2: direct cursor hide deferred on output {output_idx}; retrying on CRTC event"
-                    );
-                }
-                Err(error)
-                    if atomic_path
-                        && error.raw_os_error() != Some(libc::EINVAL)
-                        && error.raw_os_error() != Some(libc::EBUSY) =>
-                {
-                    if !b.schedule_direct_cursor_retry(
-                        output_idx,
-                        "hide",
-                        &error,
-                        "cursor_hide_failed",
-                    ) {
+                let atomic_path = b
+                    .platform
+                    .device_for_output(&b.platform.outputs[output_idx].key)
+                    .is_some_and(|device| {
+                        device.cursor.state_path()
+                            == crate::kms::cursor_plane::topology::CursorStatePath::Atomic
+                    });
+                match b.platform.cursor_plane_hide_on_crtc(output_idx) {
+                    Ok(()) => {
+                        b.platform.clear_direct_cursor_retry(output_idx);
+                        if let Some(owner) = b.pstate.direct.get_mut(scope) {
+                            owner.clear_direct_cursor_refresh_pending(output_idx);
+                        }
+                    }
+                    Err(error)
+                        if error.kind() == io::ErrorKind::WouldBlock
+                            || error.raw_os_error() == Some(libc::EBUSY) =>
+                    {
+                        b.platform.clear_direct_cursor_retry(output_idx);
+                        if let Some(owner) = b.pstate.direct.get_mut(scope) {
+                            owner.mark_direct_cursor_refresh_pending(output_idx);
+                        }
+                        log::debug!(
+                            "scanout_m2: direct cursor hide deferred on output {output_idx}; retrying on CRTC event"
+                        );
+                    }
+                    Err(error)
+                        if atomic_path
+                            && error.raw_os_error() != Some(libc::EINVAL)
+                            && error.raw_os_error() != Some(libc::EBUSY) =>
+                    {
+                        if !b.schedule_direct_cursor_retry(
+                            scope,
+                            output_idx,
+                            "hide",
+                            &error,
+                            "cursor_hide_failed",
+                        ) {
+                            failed = true;
+                        }
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "scanout_m2: direct cursor hide failed on output {output_idx}: {error}; unflipping"
+                        );
                         failed = true;
                     }
                 }
-                Err(error) => {
-                    log::warn!(
-                        "scanout_m2: cursor hide failed on output {output_idx}: {error}; unflipping"
-                    );
-                    failed = true;
-                }
             }
-        }
-        if failed {
-            b.request_direct_unflip("cursor_hide_failed");
-        }
-        if !b.sync_direct_cursor_scene_state() {
-            b.request_direct_unflip("cursor_scene_sync_failed");
+            if failed {
+                b.request_direct_unflip_for(scope, "cursor_hide_failed");
+            }
+            if !b.sync_direct_cursor_scene_state() {
+                b.request_direct_unflip_for(scope, "cursor_scene_sync_failed");
+            }
         }
     }
 
@@ -291,7 +291,7 @@ impl Platform for PlatformBackend {
                 Err(e) => log::debug!("render cursor mixed path: move failed: {e}"),
             }
             b.scene.wake_for_damage();
-        } else if !b.pstate.direct.root().active()
+        } else if b.pstate.direct.active_scopes().is_empty()
             && cw > 0
             && ch > 0
             && b.platform
@@ -323,20 +323,20 @@ impl Platform for PlatformBackend {
     }
 
     fn prepare_cow_release(b: &mut KmsBackend) -> io::Result<()> {
-        if b.pstate.direct.root().active() {
+        for scope in b.pstate.direct.active_scopes() {
             // Do this while cow_id and its storage owner are authoritative.
             // Failure leaves the COW and the direct pins untouched, so core
             // can keep the caller's claim and let the compositor retry, or
             // fail safely without freeing a scanned buffer. Success only
             // copies the scanned frame into its fallback target early, as
             // any unflip does (`submit_composed_unflip`); nothing to undo.
-            b.materialize_direct_shadow_for_unflip()?;
+            b.materialize_direct_shadow_for_unflip(scope)?;
         }
         Ok(())
     }
 
     fn defer_cow_release(b: &mut KmsBackend) -> bool {
-        if b.pstate.direct.root().active() {
+        if !b.pstate.direct.active_scopes().is_empty() {
             b.request_direct_unflip("release_last_overlay_window");
             b.deferred_cow_release = true;
             return true;
@@ -796,7 +796,11 @@ impl Platform for PlatformBackend {
     fn drain_retired_present_idle_events(
         b: &mut KmsBackend,
     ) -> Vec<yserver_core::backend::CompletedPresentEvent> {
-        std::mem::take(&mut b.pstate.direct.root_mut().idled)
+        let mut idled = std::mem::take(&mut b.pstate.direct.root_mut().idled);
+        for owner in &mut b.pstate.direct.outputs {
+            idled.append(&mut owner.idled);
+        }
+        idled
     }
 
     fn present_crtc_clock_epoch(b: &KmsBackend, crtc_id: u32) -> u64 {

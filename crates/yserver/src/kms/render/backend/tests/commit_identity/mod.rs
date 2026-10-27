@@ -1,5 +1,5 @@
 mod atomic_events;
-mod direct_unflip;
+pub(super) mod direct_unflip;
 mod fresh_unflip;
 mod gamma;
 pub(super) mod recording_scene;

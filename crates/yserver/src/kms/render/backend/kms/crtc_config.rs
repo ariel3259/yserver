@@ -50,24 +50,22 @@ impl KmsBackend {
             .iter()
             .enumerate()
             .filter(|(output_idx, _)| {
+                let direct = self
+                    .pstate
+                    .direct
+                    .scope_for_output(*output_idx)
+                    .and_then(|scope| self.pstate.direct.get(scope));
                 self.platform
                     .scanout_pools
                     .get(*output_idx)
                     .and_then(Option::as_ref)
                     .is_some_and(|pool| pool.display_pool().has_pending_pageflip())
-                    || self
-                        .pstate
-                        .direct
-                        .root()
-                        .pending
+                    || direct
+                        .and_then(|owner| owner.pending.as_ref())
                         .as_ref()
                         .is_some_and(|frame| frame.awaiting_outputs.contains(output_idx))
-                    || self
-                        .pstate
-                        .direct
-                        .root()
-                        .unflip_outputs_to_replace
-                        .contains(output_idx)
+                    || direct
+                        .is_some_and(|owner| owner.unflip_outputs_to_replace.contains(output_idx))
                     || self
                         .platform
                         .cursor_atomic_event_pending_for_output(*output_idx)
@@ -83,7 +81,7 @@ impl KmsBackend {
         self.exit_tearing("topology_mutation");
         self.bump_crtc_config_topology_epoch(context);
         let old_pending_pageflips = self.pending_pageflip_crtcs();
-        if self.pstate.direct.root().active() {
+        if !self.pstate.direct.active_scopes().is_empty() {
             if let Err(error) = self.teardown_direct_before_topology_requery(context) {
                 // This also covers failure to materialize the direct source's
                 // COW shadow. Consuming the topology event while retaining an
@@ -1349,7 +1347,7 @@ impl KmsBackend {
     /// Why `change` must take the global quiesce instead of touching only
     /// its own CRTC, or `None` when the per-CRTC path is safe.
     ///
-    /// Direct scanout holds one grouped transaction across every CRTC.
+    /// Direct scanout owns its participating output set until replacement.
     /// Copied and cross-device routes carry a second device's ledger the
     /// per-CRTC path does not migrate; requiring every live output to be a
     /// same-device route also confines the path to one KMS device, since
@@ -1359,11 +1357,20 @@ impl KmsBackend {
         output_key: &OutputKey,
         change: PerCrtcChange,
     ) -> Option<&'static str> {
-        let direct = &self.pstate.direct.root();
-        if direct.active()
-            || !direct.unflip_outputs_to_replace.is_empty()
-            || !direct.unflip_awaiting_outputs.is_empty()
-            || direct.degraded_composed_unflip
+        if !self.pstate.direct.active_scopes().is_empty()
+            || self.pstate.direct.outputs.iter().any(|direct| {
+                !direct.unflip_outputs_to_replace.is_empty()
+                    || !direct.unflip_awaiting_outputs.is_empty()
+                    || direct.degraded_composed_unflip
+            })
+            || !self
+                .pstate
+                .direct
+                .root()
+                .unflip_outputs_to_replace
+                .is_empty()
+            || !self.pstate.direct.root().unflip_awaiting_outputs.is_empty()
+            || self.pstate.direct.root().degraded_composed_unflip
         {
             return Some("direct scanout active");
         }
