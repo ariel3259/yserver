@@ -3588,7 +3588,7 @@ fn simulated_kms_dual_head() -> Option<(KmsBackend, ServerState, std::rc::Rc<Sim
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: omit sync_output_count after the RANDR topology shrinks.
+// Mutation: delete the removed-slot notification transfer in sync_output_count.
 fn direct_owners_follow_output_count_on_topology_change() {
     let Some((backend, _state, kms)) = simulated_kms_dual_head() else {
         eprintln!(
@@ -3622,6 +3622,26 @@ fn direct_owners_follow_output_count_on_topology_change() {
     assert!(events.backend.pstate.direct.root().pending.is_none());
     assert!(events.backend.pstate.direct.root().current.is_some());
     assert_eq!(events.backend.pstate.direct.root().completed.len(), 1);
+
+    let notification = events.backend.pstate.direct.root().completed[0].clone();
+    let mut completed = notification.clone();
+    completed.present_id = 901;
+    completed.serial = 901;
+    let mut deferred_skip = notification.clone();
+    deferred_skip.present_id = 902;
+    deferred_skip.serial = 902;
+    deferred_skip.completion_mode = yserver_protocol::x11::present::COMPLETE_MODE_SKIP;
+    deferred_skip.emit_idle = false;
+    let mut idled = notification;
+    idled.present_id = 903;
+    idled.serial = 903;
+    events.backend.pstate.direct.outputs[1]
+        .completed
+        .push(completed);
+    events.backend.pstate.direct.outputs[1]
+        .deferred_successor_skips
+        .push(deferred_skip);
+    events.backend.pstate.direct.outputs[1].idled.push(idled);
 
     let (outputs, _) = events.backend.randr_outputs_and_modes();
     let removed = &outputs[1];
@@ -3659,15 +3679,63 @@ fn direct_owners_follow_output_count_on_topology_change() {
     );
     assert!(events.backend.present_source_pins.is_empty());
     assert_eq!(
-        events.backend.pstate.direct.root().completed.len(),
-        1,
-        "topology teardown queues one completion for the root owner"
+        events
+            .backend
+            .pstate
+            .direct
+            .root()
+            .completed
+            .iter()
+            .map(|event| event.present_id)
+            .collect::<Vec<_>>(),
+        [77, 901],
+        "root and removed-slot completions both survive the shrink"
+    );
+    assert_eq!(
+        events
+            .backend
+            .pstate
+            .direct
+            .root()
+            .deferred_successor_skips
+            .iter()
+            .map(|event| event.present_id)
+            .collect::<Vec<_>>(),
+        [902],
+        "removed-slot deferred skips stay ordered in the root owner"
+    );
+    assert_eq!(
+        events
+            .backend
+            .pstate
+            .direct
+            .root()
+            .idled
+            .iter()
+            .map(|event| event.present_id)
+            .collect::<Vec<_>>(),
+        [77, 903],
+        "root and removed-slot Idle events both survive the shrink"
     );
 
     let completed = Backend::drain_completed_present_events(&mut events.backend);
-    assert_eq!(completed.len(), 1);
-    assert_eq!(completed[0].present_id, 77);
+    assert_eq!(
+        completed
+            .iter()
+            .map(|event| event.present_id)
+            .collect::<Vec<_>>(),
+        [77, 901]
+    );
     assert!(Backend::drain_completed_present_events(&mut events.backend).is_empty());
+    let idled = Backend::drain_retired_present_idle_events(&mut events.backend);
+    assert_eq!(
+        idled
+            .iter()
+            .map(|event| event.present_id)
+            .collect::<Vec<_>>(),
+        [77, 903]
+    );
+    assert!(Backend::drain_retired_present_idle_events(&mut events.backend).is_empty());
     assert_eq!(
         *kms.log.borrow(),
         vec![
@@ -3678,6 +3746,82 @@ fn direct_owners_follow_output_count_on_topology_change() {
         "RANDR tears down both old CRTCs before relighting the survivor"
     );
     assert!(kms.is_consistent());
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: the RANDR topology stop-all path stops only the root slot.
+fn randr_topology_teardown_stops_every_output_owner() {
+    let Some((backend, _state, _kms)) = simulated_kms_dual_head() else {
+        return;
+    };
+    let mut events = super::commit_identity::support::AtomicEventFixture::from_backend(backend);
+    events
+        .backend
+        .rebuild_randr_state(&mut events.state, None, true);
+    let cow_id = seed_window(&mut events.backend, 0x7a20, None, 0, 0);
+
+    for (output_idx, target_xid, present_id) in [(0, 0x7a30, 701), (1, 0x7a40, 702)] {
+        let _ = install_direct_frame_for_target_test(&mut events.backend, target_xid, cow_id, true);
+        let mut frame = events
+            .backend
+            .pstate
+            .direct
+            .root_mut()
+            .current
+            .take()
+            .expect("seeded current direct frame");
+        frame.candidate.present_id = present_id;
+        frame.event.present_id = present_id;
+        frame.event.serial = u32::try_from(present_id).expect("test serial fits");
+        frame.completion_output_idx = output_idx;
+        let owner = &mut events.backend.pstate.direct.outputs[output_idx];
+        owner.completed.push(frame.event.clone());
+        owner.current = Some(frame);
+        owner.hold_direct = true;
+        owner.unflip_shadow_ready = true;
+    }
+    assert_eq!(
+        events.backend.pstate.direct.active_scopes(),
+        [
+            crate::kms::render::backend::DirectScope::Output(0),
+            crate::kms::render::backend::DirectScope::Output(1),
+        ]
+    );
+    assert_eq!(events.backend.present_source_pins.len(), 4);
+
+    let (outputs, _) = events.backend.randr_outputs_and_modes();
+    let removed = &outputs[1];
+    assert!(
+        Backend::apply_crtc_config(
+            &mut events.backend,
+            removed.output_id,
+            &removed.name,
+            None,
+            0,
+            0,
+        )
+        .expect("RANDR disable simulated second output")
+    );
+
+    assert!(events.backend.pstate.direct.active_scopes().is_empty());
+    assert_eq!(events.backend.platform.outputs.len(), 1);
+    assert_eq!(events.backend.pstate.direct.outputs.len(), 1);
+    assert!(events.backend.present_source_pins.is_empty());
+    let mut completed = Backend::drain_completed_present_events(&mut events.backend)
+        .into_iter()
+        .map(|event| event.present_id)
+        .collect::<Vec<_>>();
+    completed.sort_unstable();
+    assert_eq!(completed, [701, 702]);
+    assert!(Backend::drain_completed_present_events(&mut events.backend).is_empty());
+    let mut idled = Backend::drain_retired_present_idle_events(&mut events.backend)
+        .into_iter()
+        .map(|event| event.present_id)
+        .collect::<Vec<_>>();
+    idled.sort_unstable();
+    assert_eq!(idled, [701, 702]);
+    assert!(Backend::drain_retired_present_idle_events(&mut events.backend).is_empty());
 }
 
 #[test]

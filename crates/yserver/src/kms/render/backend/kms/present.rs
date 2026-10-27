@@ -1,7 +1,7 @@
 use crate::kms::render::{
     backend::{
-        ABSOLUTE_SEQ_TAG, DirectPresentFrame, KmsBackend, ScanoutM0Target, ScanoutM1ProbeEntry,
-        TEARING_ENTRY_PROBATION, TearingState,
+        ABSOLUTE_SEQ_TAG, DirectPresentFrame, DirectScope, KmsBackend, ScanoutM0Target,
+        ScanoutM1ProbeEntry, TEARING_ENTRY_PROBATION, TearingState,
         kms::scanout::{
             phase_b_flip_in_flight_for_scheduler, scanout_direct_eligible,
             scanout_m2_is_authoritative_root,
@@ -922,7 +922,7 @@ impl KmsBackend {
 
         if self.pstate.direct.root().pending.is_some() {
             self.retain_direct_present_wake(&frame.event);
-            self.queue_direct_successor(frame);
+            self.queue_direct_successor(DirectScope::Root, frame);
             return Ok(true);
         }
         if self.scene.has_pending_page_flips() {
@@ -944,7 +944,7 @@ impl KmsBackend {
                 // the scheduling pass submits it after the last cursor-only
                 // commit on the grouped transaction retires.
                 self.retain_direct_present_wake(&frame.event);
-                self.queue_direct_successor(frame);
+                self.queue_direct_successor(DirectScope::Root, frame);
                 return Ok(true);
             }
 
@@ -964,7 +964,7 @@ impl KmsBackend {
         } else {
             crate::drm::async_flip::FlipTiming::Vsync
         };
-        if let Err(error) = self.submit_direct_frame(&mut frame, timing) {
+        if let Err(error) = self.submit_direct_frame(&mut frame, DirectScope::Root, timing) {
             self.request_direct_unflip("eligible_direct_successor_submit_failed");
             <Self as Backend>::release_present_source(self, source_pin);
             <Self as Backend>::release_present_source(self, fallback_target_pin);
@@ -1425,6 +1425,9 @@ impl KmsBackend {
     ) -> Vec<yserver_core::backend::CompletedPresentEvent> {
         let mut completed = self.drain_completed_present_events_impl();
         completed.append(&mut self.pstate.direct.root_mut().completed);
+        for owner in &mut self.pstate.direct.outputs {
+            completed.append(&mut owner.completed);
+        }
         for event in &completed {
             if event.completion_mode != yserver_protocol::x11::present::COMPLETE_MODE_SKIP {
                 continue;

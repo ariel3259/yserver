@@ -3038,7 +3038,10 @@ fn last_release_under_direct_scanout_defers_backend_retirement() {
     );
     assert!(b.pstate.direct.root().unflip_requested);
 
-    b.stop_direct_after_scanout_replaced("deferred COW retirement test");
+    b.stop_direct_after_scanout_replaced(
+        crate::kms::render::backend::DirectScope::Root,
+        "deferred COW retirement test",
+    );
 
     assert!(!b.deferred_cow_release);
     assert!(b.cow_id.is_none());
@@ -3089,7 +3092,10 @@ fn get_overlay_window_before_deferred_retirement_reuses_the_backend_cow() {
         "the reused COW resolves for crossings again"
     );
 
-    b.stop_direct_after_scanout_replaced("reacquired COW test replacement");
+    b.stop_direct_after_scanout_replaced(
+        crate::kms::render::backend::DirectScope::Root,
+        "reacquired COW test replacement",
+    );
     assert_eq!(b.cow_id, Some(cow_id), "a reacquired COW is not retired");
     assert!(b.windows.contains_key(&cow_xid));
 }
@@ -3179,7 +3185,10 @@ fn get_overlay_window_before_deferred_retirement_resets_the_cow_projection() {
         "the new COW is the topmost root child"
     );
 
-    b.stop_direct_after_scanout_replaced("reset COW projection test replacement");
+    b.stop_direct_after_scanout_replaced(
+        crate::kms::render::backend::DirectScope::Root,
+        "reset COW projection test replacement",
+    );
     assert_eq!(b.cow_id, Some(cow_id), "a reacquired COW is not retired");
     assert_eq!(b.windows.get(&cow_xid).and_then(|g| g.parent), None);
 }
