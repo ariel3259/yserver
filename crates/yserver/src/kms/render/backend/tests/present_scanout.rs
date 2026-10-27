@@ -343,7 +343,11 @@ fn present_randr_crtc_routes_equal_raw_handles_to_the_owning_device() {
     assert!(!b.present_absolute_vblank_arm_supported(primary_xid));
     assert!(b.present_absolute_vblank_arm_supported(secondary_xid));
     assert!(
-        !b.direct_present_crtc_eligible(secondary_xid, b.present_crtc_clock_epoch(secondary_xid),),
+        !b.direct_present_crtc_eligible(
+            crate::kms::render::backend::DirectScope::Root,
+            secondary_xid,
+            b.present_crtc_clock_epoch(secondary_xid),
+        ),
         "a secondary-card CRTC cannot own the primary-device grouped framebuffer"
     );
 }
@@ -355,7 +359,11 @@ fn present_clock_epoch_changes_on_route_removal_and_readd() {
     bind_test_randr_crtc(&mut b, 0, crtc_id);
     let first = b.present_crtc_clock_epoch(crtc_id);
     assert_ne!(first, 0);
-    assert!(b.direct_present_crtc_eligible(crtc_id, first));
+    assert!(b.direct_present_crtc_eligible(
+        crate::kms::render::backend::DirectScope::Root,
+        crtc_id,
+        first
+    ));
 
     b.refresh_present_crtc_clock_epochs();
     assert_eq!(b.present_crtc_clock_epoch(crtc_id), first);
@@ -372,7 +380,11 @@ fn present_clock_epoch_changes_on_route_removal_and_readd() {
     assert_ne!(second, 0);
     assert_ne!(second, first, "off-to-on starts a new MSC epoch");
     assert!(
-        !b.direct_present_crtc_eligible(crtc_id, first),
+        !b.direct_present_crtc_eligible(
+            crate::kms::render::backend::DirectScope::Root,
+            crtc_id,
+            first
+        ),
         "a candidate captured in the old domain cannot enter direct scanout"
     );
 }
@@ -390,7 +402,11 @@ fn off_randr_crtc_has_no_present_domain_or_direct_path() {
     assert_eq!(b.present_get_ust_msc(crtc_id), (0, 0));
     assert!(!b.present_flip_in_flight(crtc_id));
     assert!(!b.present_absolute_vblank_arm_supported(crtc_id));
-    assert!(!b.direct_present_crtc_eligible(crtc_id, 0));
+    assert!(!b.direct_present_crtc_eligible(
+        crate::kms::render::backend::DirectScope::Root,
+        crtc_id,
+        0
+    ));
 }
 
 /// With DPMS off the CRTCs are powered down and CRTC_QUEUE_SEQUENCE
@@ -1385,13 +1401,13 @@ fn direct_scanout_topology_requires_one_drm_device() {
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     push_test_output(&mut b, 2);
     assert!(
-        b.direct_scanout_topology_eligible(),
+        b.direct_scanout_topology_eligible(crate::kms::render::backend::DirectScope::Root),
         "two equal-refresh outputs on the primary card may use grouped direct scanout"
     );
 
     b.platform.outputs[1].key.device_key = test_device_key(1);
     assert!(
-        !b.direct_scanout_topology_eligible(),
+        !b.direct_scanout_topology_eligible(crate::kms::render::backend::DirectScope::Root),
         "one atomic direct transaction cannot span DRM devices"
     );
 }
@@ -1662,7 +1678,7 @@ fn direct_scanout_topology_rejects_heterogeneous_refresh() {
     b.platform.outputs[1].output.picked.vrefresh = 75;
 
     assert!(
-        !b.direct_scanout_topology_eligible(),
+        !b.direct_scanout_topology_eligible(crate::kms::render::backend::DirectScope::Root),
         "heterogeneous synthetic refresh rates stay on per-output composition"
     );
 }
@@ -1684,17 +1700,17 @@ fn direct_scanout_topology_compares_precise_fractional_timings() {
     };
     b.platform.outputs[0].output.picked = timing.clone();
     b.platform.outputs[1].output.picked = timing;
-    assert!(b.direct_scanout_topology_eligible());
+    assert!(b.direct_scanout_topology_eligible(crate::kms::render::backend::DirectScope::Root));
 
     // 60 vs 59.94 Hz: two "60 Hz" monitors, within the grouping tolerance.
     b.platform.outputs[1].output.picked.clock_khz = 148_352;
-    assert!(b.direct_scanout_topology_eligible());
+    assert!(b.direct_scanout_topology_eligible(crate::kms::render::backend::DirectScope::Root));
 
     // The advertised integer still says 60, but the kernel timing is 50 Hz.
     // The grouped path must go by the timing, not the integer.
     b.platform.outputs[1].output.picked.clock_khz = 123_750;
     assert!(
-        !b.direct_scanout_topology_eligible(),
+        !b.direct_scanout_topology_eligible(crate::kms::render::backend::DirectScope::Root),
         "same integer vrefresh is insufficient when kernel timing is available"
     );
 }
@@ -2115,12 +2131,14 @@ fn scanout_m1_redirected_game_and_region_present_never_reach_probe_cache() {
         Some(crate::kms::render::store::DrawableId::for_tests(99)),
         crate::kms::render::backend::ScanoutM0Target::Other,
         crate::kms::render::backend::ScanoutM0Coverage::Output(0),
+        None,
         candidate,
     );
     b.maybe_probe_scanout_m1(
         Some(crate::kms::render::store::DrawableId::for_tests(100)),
         crate::kms::render::backend::ScanoutM0Target::CowDescendant,
         crate::kms::render::backend::ScanoutM0Coverage::Root,
+        Some(crate::kms::render::backend::DirectScope::Root),
         PresentScanoutCandidate {
             valid_region_xid: 0xDEAD,
             ..candidate
@@ -2179,6 +2197,650 @@ fn scanout_m1_probe_eligible_accepts_unredirected_fullscreen() {
         0,
         0,
     ));
+}
+
+type ScanoutM1PlaneObservation = (u32, u32, u32, u32, u32);
+type ScanoutM1ProbeObservation = (
+    crate::kms::render::backend::DirectScope,
+    Vec<ScanoutM1PlaneObservation>,
+);
+
+thread_local! {
+    static SCANOUT_M1_PROBES: std::cell::RefCell<Vec<ScanoutM1ProbeObservation>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn record_scanout_m1_probe(
+    _: &crate::kms::render::backend::KmsBackend,
+    _: crate::kms::render::store::DrawableId,
+    scope: crate::kms::render::backend::DirectScope,
+    planes: &[crate::drm::modeset::DirectScanoutPlaneState<'_>],
+) -> std::io::Result<crate::kms::render::backend::ScanoutM1ProbeEntry> {
+    let observations: Vec<_> = planes
+        .iter()
+        .map(|plane| {
+            (
+                u32::from(plane.output.crtc),
+                plane.src_x,
+                plane.src_y,
+                plane.src_w,
+                plane.src_h,
+            )
+        })
+        .collect();
+    SCANOUT_M1_PROBES.with(|probes| probes.borrow_mut().push((scope, observations)));
+    let crtcs = planes
+        .iter()
+        .map(|plane| plane.output.crtc)
+        .collect::<Vec<_>>();
+    let plane = planes.first().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "probe has no output plane",
+        )
+    })?;
+    Ok(
+        crate::kms::render::backend::ScanoutM1ProbeEntry::accepted_with_shape(
+            crate::drm::modeset::DirectScanoutProbeFramebuffer::for_tests(
+                ::drm::control::from_u32(0x8f42).expect("nonzero test framebuffer"),
+            ),
+            crate::drm::async_flip::AsyncShape {
+                fourcc: 0x3432_5258,
+                modifier: 0,
+                pitch: plane.src_w * 4,
+                width: plane.src_w,
+                height: plane.src_h,
+                crtcs,
+                direct: true,
+            },
+        ),
+    )
+}
+
+fn output_admission_fixture_with_geometry(
+    output_idx: usize,
+    present_id: u64,
+    screen_size: (u16, u16),
+    outputs: &[(i32, i32, u16, u16, u32)],
+) -> Option<(
+    super::commit_identity::recording_scene::RecordingSceneFixture,
+    super::commit_identity::recording_scene::DirectPresentSetup,
+)> {
+    use yserver_core::backend::Backend;
+
+    let Ok(Some(mut fixture)) =
+        super::commit_identity::recording_scene::RecordingSceneFixture::with_output_geometry(
+            screen_size,
+            outputs,
+        )
+    else {
+        return None;
+    };
+    let direct = fixture.install_direct_output_present(output_idx, present_id, 0);
+    let backend = &mut fixture.events.backend;
+    SCANOUT_M1_PROBES.with(|probes| probes.borrow_mut().clear());
+    backend.for_tests_set_scanout_m1_prober(record_scanout_m1_probe);
+    Backend::note_present_scanout_candidate(backend, direct.candidate);
+    Some((fixture, direct))
+}
+
+fn output_admission_fixture(
+    output_idx: usize,
+    present_id: u64,
+) -> Option<(
+    super::commit_identity::recording_scene::RecordingSceneFixture,
+    super::commit_identity::recording_scene::DirectPresentSetup,
+)> {
+    output_admission_fixture_with_geometry(
+        output_idx,
+        present_id,
+        (3840, 1080),
+        &[(0, 0, 1920, 1080, 75), (1920, 0, 1920, 1080, 240)],
+    )
+}
+
+fn scanout_m1_probe_observations() -> Vec<ScanoutM1ProbeObservation> {
+    SCANOUT_M1_PROBES.with(|probes| probes.borrow().clone())
+}
+
+fn draw_direct_admission_overlay(backend: &mut KmsBackend, client_id: u32, x: i16) {
+    use yserver_core::backend::{Backend, DrawState, GcFunction, OriginContext, SubwindowMode};
+
+    let origin = Some(OriginContext {
+        client_id: yserver_protocol::x11::ClientId(client_id),
+        nested_seq: 0,
+        opcode: 70,
+    });
+    Backend::apply_draw_state(
+        backend,
+        origin,
+        &DrawState {
+            function: GcFunction::Invert,
+            subwindow_mode: SubwindowMode::IncludeInferiors,
+            ..DrawState::default()
+        },
+    )
+    .expect("set reversible root overlay draw state");
+    Backend::fill_rectangle(
+        backend,
+        origin,
+        backend.core.window_id,
+        u32::MAX,
+        x,
+        10,
+        50,
+        1,
+    )
+    .expect("draw root overlay through Backend");
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: keep the homogeneous-topology rule for Output.
+fn output_present_enters_direct_on_its_output_only() {
+    use std::time::Duration;
+    use yserver_core::backend::Backend;
+
+    let Some((mut fixture, direct)) = output_admission_fixture(1, 810) else {
+        return;
+    };
+    let device_fd = fixture.kms_fd(1);
+    let output0_crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    let output1 = &fixture.events.backend.platform.outputs[1].output;
+    let output1_crtc = output1.crtc;
+    let output1_plane = output1.plane;
+    let output1_src_x_prop = output1.plane_src_x_prop;
+    let output1_src_y_prop = output1.plane_src_y_prop;
+    let root = fixture.events.backend.core.window_id;
+    let start = fixture.events.recorders[&device_fd].records().len();
+    for attempt in 0..crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION {
+        let entered = Backend::try_present_direct(
+            &mut fixture.events.backend,
+            direct.candidate,
+            direct.event.clone(),
+        )
+        .expect("output-sized Present through Backend");
+        assert_eq!(
+            entered,
+            attempt + 1 == crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION,
+            "Output(1) enters after its own probation",
+        );
+    }
+    Backend::clear_area(
+        &mut fixture.events.backend,
+        None,
+        root,
+        0,
+        None,
+        0,
+        0,
+        100,
+        100,
+        (0, 0),
+    )
+    .expect("damage composed output 0 through Backend");
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("submit output 0 composed frame while output 1 is direct");
+    let records = fixture.events.recorders[&device_fd].records();
+    let direct_record = records[start..]
+        .iter()
+        .find(|record| {
+            record.events.iter().any(|event| {
+                event.crtc == output1_crtc
+                    && record
+                        .flags
+                        .contains(::drm::control::AtomicCommitFlags::PAGE_FLIP_EVENT)
+            })
+        })
+        .expect("output 1 direct commit");
+    assert_eq!(direct_record.events.len(), 1);
+    assert_eq!(direct_record.events[0].crtc, output1_crtc);
+    for (property, label) in [(output1_src_x_prop, "SRC_X"), (output1_src_y_prop, "SRC_Y")] {
+        assert_eq!(
+            direct_record
+                .properties
+                .iter()
+                .find(|update| update.object == output1_plane.into() && update.property == property)
+                .unwrap_or_else(|| panic!("output 1 direct commit lacks {label}"))
+                .value,
+            0,
+            "output-sized source starts at (0, 0)",
+        );
+    }
+    assert!(
+        records[start..].iter().any(|record| {
+            record.kind == crate::drm::atomic::AtomicCommitKind::Scene
+                && record.events.iter().any(|event| event.crtc == output0_crtc)
+        }),
+        "output 0 continues composing while output 1 is direct",
+    );
+
+    let commit_id = super::commit_identity::accepted_event_id(direct_record)
+        .expect("accepted direct commit has an identity");
+    fixture.events.queue_commit_completion(
+        device_fd,
+        output1_crtc,
+        commit_id,
+        240,
+        Duration::from_millis(2_400),
+    );
+    Backend::on_page_flip_ready(
+        &mut fixture.events.backend,
+        &mut fixture.events.state,
+        device_fd,
+    );
+    let completed = Backend::drain_completed_present_events(&mut fixture.events.backend);
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].present_id, direct.candidate.present_id);
+    assert_eq!(
+        completed[0]
+            .completion_clock
+            .map(|clock| (clock.msc, clock.ust)),
+        Some((240, 2_400_000)),
+        "CompleteNotify uses output 1's 240 Hz CRTC sample",
+    );
+    fixture.finish();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: drop the selected-CRTC-to-output scope check.
+fn output_present_selecting_other_crtc_is_composed() {
+    use yserver_core::backend::Backend;
+
+    let Some((mut fixture, mut direct)) = output_admission_fixture(1, 811) else {
+        eprintln!(
+            "SKIP output_present_selecting_other_crtc_is_composed: Vulkan scene fixture unavailable"
+        );
+        return;
+    };
+    let output0_crtc = u32::from(fixture.events.backend.platform.outputs[0].output.crtc);
+    direct.candidate.crtc_id = output0_crtc;
+    direct.candidate.crtc_epoch = fixture
+        .events
+        .backend
+        .present_crtc_clock_epoch(output0_crtc);
+    direct.event.crtc_id = direct.candidate.crtc_id;
+    direct.event.crtc_epoch = direct.candidate.crtc_epoch;
+    let fd = fixture.kms_fd(1);
+    let start = fixture.events.recorders[&fd].records().len();
+
+    for _ in 0..crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION {
+        assert!(
+            !Backend::try_present_direct(
+                &mut fixture.events.backend,
+                direct.candidate,
+                direct.event.clone(),
+            )
+            .expect("wrong-CRTC output Present remains composed")
+        );
+    }
+
+    assert!(!fixture.events.backend.pstate.direct.outputs[1].active());
+    assert!(
+        fixture.events.recorders[&fd].records()[start..]
+            .iter()
+            .all(|record| {
+                !record
+                    .flags
+                    .contains(::drm::control::AtomicCommitFlags::PAGE_FLIP_EVENT)
+                    || record.events.iter().all(|event| {
+                        event.crtc != fixture.events.backend.platform.outputs[1].output.crtc
+                    })
+            })
+    );
+    fixture.finish();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: apply Output's single-CRTC rule to Root and admit mixed-refresh Root.
+fn mixed_refresh_root_present_still_rejected() {
+    use yserver_core::backend::Backend;
+
+    let Ok(Some(mut fixture)) = super::commit_identity::recording_scene::RecordingSceneFixture::with_output_admission_topology() else {
+        eprintln!("SKIP mixed_refresh_root_present_still_rejected: Vulkan scene fixture unavailable");
+        return;
+    };
+    let direct = fixture.install_direct_present(812, 0);
+    let fd = fixture.kms_fd(0);
+    let start = fixture.events.recorders[&fd].records().len();
+
+    for _ in 0..crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION {
+        assert!(
+            !Backend::try_present_direct(
+                &mut fixture.events.backend,
+                direct.candidate,
+                direct.event.clone(),
+            )
+            .expect("mixed-refresh Root Present remains composed")
+        );
+    }
+
+    assert!(!fixture.events.backend.pstate.direct.root().active());
+    assert!(
+        fixture.events.recorders[&fd].records()[start..]
+            .iter()
+            .all(|record| {
+                !record
+                    .flags
+                    .contains(::drm::control::AtomicCommitFlags::PAGE_FLIP_EVENT)
+            })
+    );
+    fixture.finish();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: omit the selected output's RANDR-to-mode-size equality check.
+fn output_mode_size_mismatch_is_rejected() {
+    use yserver_core::backend::Backend;
+
+    let Some((mut fixture, direct)) = output_admission_fixture(1, 813) else {
+        eprintln!("SKIP output_mode_size_mismatch_is_rejected: Vulkan scene fixture unavailable");
+        return;
+    };
+    fixture.events.backend.platform.outputs[1]
+        .output
+        .picked
+        .width -= 1;
+    let fd = fixture.kms_fd(1);
+    let start = fixture.events.recorders[&fd].records().len();
+
+    for _ in 0..crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION {
+        assert!(
+            !Backend::try_present_direct(
+                &mut fixture.events.backend,
+                direct.candidate,
+                direct.event.clone(),
+            )
+            .expect("mode-size mismatch remains composed")
+        );
+    }
+
+    assert!(!fixture.events.backend.pstate.direct.outputs[1].active());
+    assert!(
+        fixture.events.recorders[&fd].records()[start..]
+            .iter()
+            .all(|record| {
+                !record
+                    .flags
+                    .contains(::drm::control::AtomicCommitFlags::PAGE_FLIP_EVENT)
+            })
+    );
+    fixture.finish();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: omit pairwise output separation for Output scope.
+fn overlapping_output_is_rejected() {
+    use yserver_core::{backend::Backend, host_x11::HostSubwindowConfig};
+
+    let Some((mut fixture, direct)) = output_admission_fixture(1, 814) else {
+        eprintln!("SKIP overlapping_output_is_rejected: Vulkan scene fixture unavailable");
+        return;
+    };
+    fixture.events.backend.platform.outputs[1].x = 960;
+    Backend::configure_subwindow(
+        &mut fixture.events.backend,
+        None,
+        direct.target_xid,
+        HostSubwindowConfig {
+            x: Some(960),
+            ..Default::default()
+        },
+    )
+    .expect("move output-sized window to the overlapping output origin");
+    let fd = fixture.kms_fd(1);
+    let start = fixture.events.recorders[&fd].records().len();
+
+    for _ in 0..crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION {
+        assert!(
+            !Backend::try_present_direct(
+                &mut fixture.events.backend,
+                direct.candidate,
+                direct.event.clone(),
+            )
+            .expect("overlapping output Present remains composed")
+        );
+    }
+
+    assert!(!fixture.events.backend.pstate.direct.outputs[1].active());
+    assert!(
+        fixture.events.recorders[&fd].records()[start..]
+            .iter()
+            .all(|record| {
+                !record
+                    .flags
+                    .contains(::drm::control::AtomicCommitFlags::PAGE_FLIP_EVENT)
+            })
+    );
+    fixture.finish();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: key M1 results by DrawableId alone, so the second output reuses the first probe.
+fn output_probe_per_scope() {
+    use yserver_core::{backend::Backend, host_x11::HostSubwindowConfig};
+
+    let Some((mut fixture, mut direct)) = output_admission_fixture_with_geometry(
+        0,
+        815,
+        (3840, 1080),
+        &[(0, 0, 1920, 1080, 60), (1920, 0, 1920, 1080, 60)],
+    ) else {
+        eprintln!("SKIP output_probe_per_scope: Vulkan scene fixture unavailable");
+        return;
+    };
+    let output1_crtc = u32::from(fixture.events.backend.platform.outputs[1].output.crtc);
+    Backend::configure_subwindow(
+        &mut fixture.events.backend,
+        None,
+        direct.target_xid,
+        HostSubwindowConfig {
+            x: Some(1920),
+            ..Default::default()
+        },
+    )
+    .expect("move the same window to output 1 through Backend");
+    direct.candidate.crtc_id = output1_crtc;
+    direct.candidate.crtc_epoch = fixture
+        .events
+        .backend
+        .present_crtc_clock_epoch(output1_crtc);
+    direct.event.crtc_id = output1_crtc;
+    direct.event.crtc_epoch = direct.candidate.crtc_epoch;
+    Backend::note_present_scanout_candidate(&mut fixture.events.backend, direct.candidate);
+
+    let observations = scanout_m1_probe_observations();
+    assert_eq!(
+        observations,
+        vec![
+            (
+                crate::kms::render::backend::DirectScope::Output(0),
+                vec![(
+                    u32::from(fixture.events.backend.platform.outputs[0].output.crtc),
+                    0,
+                    0,
+                    1920,
+                    1080,
+                )],
+            ),
+            (
+                crate::kms::render::backend::DirectScope::Output(1),
+                vec![(output1_crtc, 0, 0, 1920, 1080)],
+            ),
+        ],
+        "the same source is probed once for each output's plane at source origin (0, 0)",
+    );
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .scanout_m1
+            .entries
+            .contains_key(&(
+                direct.source_id,
+                crate::kms::render::backend::DirectScope::Output(0),
+            ))
+    );
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .scanout_m1
+            .entries
+            .contains_key(&(
+                direct.source_id,
+                crate::kms::render::backend::DirectScope::Output(1),
+            ))
+    );
+
+    Backend::free_pixmap(
+        &mut fixture.events.backend,
+        None,
+        direct.candidate.src_host_xid,
+    )
+    .expect("retire source pixmap through Backend");
+    let root = fixture.events.backend.core.window_id;
+    let (root_width, root_height) = (
+        fixture.events.backend.platform.fb_w,
+        fixture.events.backend.platform.fb_h,
+    );
+    Backend::clear_area(
+        &mut fixture.events.backend,
+        None,
+        root,
+        0,
+        None,
+        0,
+        0,
+        root_width,
+        root_height,
+        (0, 0),
+    )
+    .expect("submit pending source writes through Backend damage");
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("flush pending source writes through the scene scheduler");
+    fixture.events.wait_for_submitted_gpu_work();
+    for _ in 0..32 {
+        Backend::before_block(&mut fixture.events.backend);
+    }
+    assert!(
+        fixture.events.backend.store.get(direct.source_id).is_none(),
+        "Backend free and render retirement drop the drawable before its probe entries are checked"
+    );
+    assert!(
+        !fixture
+            .events
+            .backend
+            .pstate
+            .scanout_m1
+            .entries
+            .keys()
+            .any(|(source_id, _)| *source_id == direct.source_id)
+    );
+    fixture
+        .extra_drawables
+        .retain(|&xid| xid != direct.candidate.src_host_xid);
+    fixture.finish();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: use global root-overlay emptiness instead of filtering to scope outputs.
+fn root_overlay_on_other_output_does_not_block_output_admission() {
+    use yserver_core::backend::Backend;
+
+    let Some((mut other_overlay_fixture, other_direct)) = output_admission_fixture(1, 816) else {
+        eprintln!(
+            "SKIP root_overlay_on_other_output_does_not_block_output_admission: Vulkan scene fixture unavailable"
+        );
+        return;
+    };
+    draw_direct_admission_overlay(&mut other_overlay_fixture.events.backend, 817, 10);
+    assert!(
+        !other_overlay_fixture
+            .events
+            .backend
+            .scene
+            .root_overlay
+            .is_empty()
+    );
+    assert!(
+        other_overlay_fixture
+            .events
+            .backend
+            .scene
+            .root_overlay
+            .apply_list_for_output((
+                other_overlay_fixture.events.backend.platform.outputs[1].x,
+                other_overlay_fixture.events.backend.platform.outputs[1].y,
+                1920,
+                1080,
+            ))
+            .is_empty()
+    );
+    for attempt in 0..crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION {
+        assert_eq!(
+            Backend::try_present_direct(
+                &mut other_overlay_fixture.events.backend,
+                other_direct.candidate,
+                other_direct.event.clone(),
+            )
+            .expect("unrelated root overlay does not block Output(1)"),
+            attempt + 1 == crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION,
+        );
+    }
+    assert!(other_overlay_fixture.events.backend.pstate.direct.outputs[1].active());
+    other_overlay_fixture.finish();
+
+    let Some((mut selected_overlay_fixture, selected_direct)) = output_admission_fixture(1, 818)
+    else {
+        eprintln!(
+            "SKIP root_overlay_on_other_output_does_not_block_output_admission: second Vulkan scene fixture unavailable"
+        );
+        return;
+    };
+    draw_direct_admission_overlay(&mut selected_overlay_fixture.events.backend, 819, 1930);
+    assert!(
+        !selected_overlay_fixture
+            .events
+            .backend
+            .scene
+            .root_overlay
+            .apply_list_for_output((
+                selected_overlay_fixture.events.backend.platform.outputs[1].x,
+                selected_overlay_fixture.events.backend.platform.outputs[1].y,
+                1920,
+                1080,
+            ))
+            .is_empty()
+    );
+    for _ in 0..crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION {
+        assert!(
+            !Backend::try_present_direct(
+                &mut selected_overlay_fixture.events.backend,
+                selected_direct.candidate,
+                selected_direct.event.clone(),
+            )
+            .expect("overlay on Output(1) keeps Present composed")
+        );
+    }
+    assert!(
+        !selected_overlay_fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .outputs[1]
+            .active()
+    );
+    selected_overlay_fixture.finish();
 }
 
 #[test]
@@ -2341,8 +3003,10 @@ fn direct_shape_chain_hides_root_only_when_a_shape_misses_the_root() {
         height: h,
     };
     let root_width_i16 = i16::try_from(w).unwrap();
-    let hides =
-        |b: &crate::kms::render::backend::KmsBackend| b.direct_shape_chain_hides_root(stage, root);
+    let root_rect = b.direct_scope_rect(crate::kms::render::backend::DirectScope::Root);
+    let hides = |b: &crate::kms::render::backend::KmsBackend| {
+        b.direct_shape_chain_hides_root(stage, root_rect)
+    };
 
     assert!(!hides(&b), "unshaped chain");
     b.core.shape_bounding.insert(cow, Vec::new());
@@ -2598,8 +3262,10 @@ fn direct_shape_chain_requires_every_shape_to_cover_the_root() {
         height: h,
     };
     let half = i16::try_from(w / 2).unwrap();
-    let covers =
-        |b: &crate::kms::render::backend::KmsBackend| b.direct_shape_chain_covers_root(stage, root);
+    let root_rect = b.direct_scope_rect(crate::kms::render::backend::DirectScope::Root);
+    let covers = |b: &crate::kms::render::backend::KmsBackend| {
+        b.direct_shape_chain_covers_root(stage, root_rect)
+    };
 
     assert!(covers(&b), "unshaped chain");
     b.core.shape_bounding.insert(cow, Vec::new());
@@ -2701,13 +3367,13 @@ fn scanout_m2_authoritative_root_accepts_unredirected_fullscreen() {
 fn scanout_m2_requires_stable_eligible_root_stream_before_entry() {
     let mut state = crate::kms::render::backend::ScanoutM2State::new();
     for _ in 1..crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION {
-        assert!(!state.admit_eligible_root());
+        assert!(!state.admit_eligible_direct());
     }
-    assert!(state.admit_eligible_root());
-    assert!(state.admit_eligible_root(), "admission remains saturated");
+    assert!(state.admit_eligible_direct());
+    assert!(state.admit_eligible_direct(), "admission remains saturated");
 
-    state.reset_eligible_root_probation();
-    assert!(!state.admit_eligible_root());
+    state.reset_eligible_direct_probation();
+    assert!(!state.admit_eligible_direct());
 }
 
 #[test]
@@ -2715,9 +3381,9 @@ fn scanout_m2_ineligible_root_resets_short_eligible_bursts() {
     let mut state = crate::kms::render::backend::ScanoutM2State::new();
     for _ in 0..16 {
         for _ in 0..(crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1) {
-            assert!(!state.admit_eligible_root());
+            assert!(!state.admit_eligible_direct());
         }
-        state.reset_eligible_root_probation();
+        state.reset_eligible_direct_probation();
     }
 }
 
@@ -3021,7 +3687,7 @@ fn atomic_cursor_scanout_backend_with_hidden_cursor(hidden: bool) -> Option<KmsB
         }
     }
     backend.pstate.direct.root_mut().cursor_bound_all = true;
-    backend.pstate.direct.root_mut().eligible_root_streak =
+    backend.pstate.direct.root_mut().eligible_streak =
         crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1;
     Some(backend)
 }
@@ -3297,7 +3963,7 @@ fn prepare_atomic_cursor_direct_present_with_extent(
         )
         .expect("allocate fullscreen Present source");
     backend.pstate.scanout_m1.entries.insert(
-        source_id,
+        (source_id, crate::kms::render::backend::DirectScope::Root),
         crate::kms::render::backend::ScanoutM1ProbeEntry::accepted(
             crate::drm::modeset::DirectScanoutProbeFramebuffer::for_tests(atomic_cursor_raw(
                 0x8100 + suffix,
@@ -3376,7 +4042,7 @@ fn hidden_cursor_allows_fullscreen_direct_scanout_without_unflip() {
     Backend::maybe_composite(&mut backend).expect("schedule hidden-cursor scene");
 
     let direct = prepare_atomic_cursor_direct_present(&mut backend, 91);
-    backend.pstate.scanout_m1.entries.remove(&direct.source_id);
+    backend.pstate.scanout_m1.remove(direct.source_id);
     Backend::note_present_scanout_candidate(&mut backend, direct.candidate);
     assert_eq!(
         backend.pstate.scanout_m0.m1_probe_reject, 1,
@@ -3387,7 +4053,10 @@ fn hidden_cursor_allows_fullscreen_direct_scanout_without_unflip() {
         "the M1 diagnostic must report Hidden as direct-compatible"
     );
     backend.pstate.scanout_m1.entries.insert(
-        direct.source_id,
+        (
+            direct.source_id,
+            crate::kms::render::backend::DirectScope::Root,
+        ),
         crate::kms::render::backend::ScanoutM1ProbeEntry::accepted(
             crate::drm::modeset::DirectScanoutProbeFramebuffer::for_tests(atomic_cursor_raw(
                 0x9e01,
@@ -3871,7 +4540,7 @@ fn first_direct_entry_declines_behind_cursor_commit_without_retaining_state() {
     assert!(backend.scene.root_overlay.is_empty());
     // The root overlay correctly reset direct-scanout probation. Restore the
     // admitted fixture state so this last Present isolates cursor retirement.
-    backend.pstate.direct.root_mut().eligible_root_streak =
+    backend.pstate.direct.root_mut().eligible_streak =
         crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1;
     // A Copy completion is ready only once its GPU signal has executed; wait for the
     // device (bounded by the driver) instead of racing a slow software ICD.
@@ -3986,12 +4655,12 @@ fn eligible_fullscreen_present_records_cursor_positions_for_both_outputs() {
         )
         .expect("fullscreen Present source");
     backend.pstate.scanout_m1.entries.insert(
-        source_id,
+        (source_id, crate::kms::render::backend::DirectScope::Root),
         crate::kms::render::backend::ScanoutM1ProbeEntry::accepted(
             crate::drm::modeset::DirectScanoutProbeFramebuffer::for_tests(atomic_cursor_raw(71)),
         ),
     );
-    backend.pstate.direct.root_mut().eligible_root_streak =
+    backend.pstate.direct.root_mut().eligible_streak =
         crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1;
 
     let crtc_id = u32::from(backend.platform.outputs[0].output.crtc);

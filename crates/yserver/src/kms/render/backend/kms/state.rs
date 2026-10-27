@@ -191,7 +191,8 @@ impl ScanoutM1ProbeEntry {
 
 pub(in crate::kms::render::backend) struct ScanoutM1ProbeCache {
     pub(in crate::kms::render::backend) topology_signature: u64,
-    pub(in crate::kms::render::backend) entries: HashMap<DrawableId, ScanoutM1ProbeEntry>,
+    pub(in crate::kms::render::backend) entries:
+        HashMap<(DrawableId, DirectScope), ScanoutM1ProbeEntry>,
 }
 
 impl ScanoutM1ProbeCache {
@@ -203,7 +204,7 @@ impl ScanoutM1ProbeCache {
     }
 
     pub(in crate::kms::render::backend) fn remove(&mut self, id: DrawableId) {
-        self.entries.remove(&id);
+        self.entries.retain(|(drawable, _), _| *drawable != id);
     }
 
     pub(in crate::kms::render::backend) fn clear(&mut self, reason: &'static str) {
@@ -253,6 +254,13 @@ pub(in crate::kms::render::backend) type DirectFrameSubmitter =
         crate::drm::async_flip::FlipTiming,
     ) -> io::Result<crate::drm::async_flip::AsyncOutcome>;
 
+pub(in crate::kms::render::backend) type ScanoutM1Prober = fn(
+    &crate::kms::render::backend::KmsBackend,
+    DrawableId,
+    DirectScope,
+    &[crate::drm::modeset::DirectScanoutPlaneState<'_>],
+) -> io::Result<ScanoutM1ProbeEntry>;
+
 /// Require a short stable run before entering direct ownership. Compositors
 /// such as E27 alternate full-root Presents with authoritative region-limited
 /// Presents; entering on every eligible member of that stream otherwise
@@ -296,7 +304,7 @@ pub(in crate::kms::render::backend) struct ScanoutM2State {
     /// Accepted replacement identity for each output, when one exists.
     pub(in crate::kms::render::backend) unflip_awaiting_outputs: HashMap<usize, u64>,
     pub(in crate::kms::render::backend) reentry_blocked_until_composed: bool,
-    pub(in crate::kms::render::backend) eligible_root_streak: u8,
+    pub(in crate::kms::render::backend) eligible_streak: u8,
     pub(in crate::kms::render::backend) unflip_fallback_source: Option<DrawableId>,
     pub(in crate::kms::render::backend) unflip_shadow_ready: bool,
     /// The synchronized composed unflip failed and was degraded to the
@@ -327,7 +335,7 @@ impl ScanoutM2State {
             unflip_outputs_to_replace: HashSet::new(),
             unflip_awaiting_outputs: HashMap::new(),
             reentry_blocked_until_composed: false,
-            eligible_root_streak: 0,
+            eligible_streak: 0,
             unflip_fallback_source: None,
             unflip_shadow_ready: false,
             degraded_composed_unflip: false,
@@ -363,19 +371,19 @@ impl ScanoutM2State {
         self.direct_cursor_refresh_successor_deferrals.clear();
     }
 
-    pub(in crate::kms::render::backend) fn admit_eligible_root(&mut self) -> bool {
+    pub(in crate::kms::render::backend) fn admit_eligible_direct(&mut self) -> bool {
         if self.active() {
             return true;
         }
-        self.eligible_root_streak = self
-            .eligible_root_streak
+        self.eligible_streak = self
+            .eligible_streak
             .saturating_add(1)
             .min(SCANOUT_M2_ELIGIBLE_ROOT_PROBATION);
-        self.eligible_root_streak >= SCANOUT_M2_ELIGIBLE_ROOT_PROBATION
+        self.eligible_streak >= SCANOUT_M2_ELIGIBLE_ROOT_PROBATION
     }
 
-    pub(in crate::kms::render::backend) fn reset_eligible_root_probation(&mut self) {
-        self.eligible_root_streak = 0;
+    pub(in crate::kms::render::backend) fn reset_eligible_direct_probation(&mut self) {
+        self.eligible_streak = 0;
     }
 }
 
@@ -386,7 +394,7 @@ pub(in crate::kms::render::backend) struct DirectOwners {
     pub(in crate::kms::render::backend) outputs: Vec<ScanoutM2State>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(in crate::kms::render::backend) enum DirectScope {
     Root,
     Output(usize),
@@ -910,6 +918,7 @@ pub struct KmsBackendState {
     pub(in crate::kms::render::backend) monotonic_clock:
         std::rc::Rc<dyn Fn() -> std::time::Instant>,
     pub(in crate::kms::render::backend) direct_frame_submitter: DirectFrameSubmitter,
+    pub(in crate::kms::render::backend) scanout_m1_prober: ScanoutM1Prober,
     pub(in crate::kms::render::backend) vt_resume_executor:
         std::rc::Rc<dyn super::session::VtResumeExecutor>,
 

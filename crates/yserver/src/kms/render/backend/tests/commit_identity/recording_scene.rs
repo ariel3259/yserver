@@ -140,6 +140,34 @@ impl RecordingSceneFixture {
         }))
     }
 
+    /// Two primary-device outputs matching the mixed-refresh admission case.
+    /// Keep this separate from the smaller generic fixture so existing
+    /// recording tests retain their fast 800x600 pools.
+    pub(crate) fn with_output_admission_topology() -> Result<Option<Self>, String> {
+        Self::with_output_geometry(
+            (3840, 1080),
+            &[(0, 0, 1920, 1080, 75), (1920, 0, 1920, 1080, 240)],
+        )
+    }
+
+    pub(crate) fn with_output_geometry(
+        screen_size: (u16, u16),
+        outputs: &[(i32, i32, u16, u16, u32)],
+    ) -> Result<Option<Self>, String> {
+        let backend = build_recording_scene_backend_with_geometry(
+            outputs.len(),
+            false,
+            false,
+            screen_size,
+            outputs,
+        )?;
+        Ok(backend.map(|backend| Self {
+            events: AtomicEventFixture::from_backend(backend),
+            readiness: None,
+            extra_drawables: Vec::new(),
+        }))
+    }
+
     pub(crate) fn new_with_identical_crtcs_on_two_devices() -> Result<Option<Self>, String> {
         let backend = build_recording_scene_backend(2, false, true)?;
         Ok(backend.map(|backend| Self {
@@ -216,7 +244,7 @@ impl RecordingSceneFixture {
             direct: true,
         };
         backend.pstate.scanout_m1.entries.insert(
-            source_id,
+            (source_id, crate::kms::render::backend::DirectScope::Root),
             crate::kms::render::backend::ScanoutM1ProbeEntry::accepted_with_shape(
                 crate::drm::modeset::DirectScanoutProbeFramebuffer::for_tests(raw(0x8100 + suffix)),
                 shape,
@@ -224,6 +252,108 @@ impl RecordingSceneFixture {
         );
 
         let crtc_id = u32::from(backend.platform.outputs[0].output.crtc);
+        let crtc_epoch = backend.present_crtc_clock_epoch(crtc_id);
+        let candidate = PresentScanoutCandidate {
+            client_id: 1,
+            client_pid: None,
+            present_id,
+            crtc_id,
+            crtc_epoch,
+            src_pixmap_xid: source_xid,
+            dst_window_xid: target_xid,
+            variable_refresh: true,
+            src_host_xid: source_xid,
+            paint_dst_host_xid: target_xid,
+            completion_dst_host_xid: target_xid,
+            src_width: width,
+            src_height: height,
+            x_off: 0,
+            y_off: 0,
+            valid_region_xid: 0,
+            update_region_xid: 0,
+            update_is_full: true,
+            explicit_sync: false,
+            options,
+        };
+        let event = CompletedPresentEvent {
+            client_id: yserver_protocol::x11::ClientId(1),
+            serial: u32::try_from(present_id).expect("test Present serial fits"),
+            host_xid: source_xid,
+            dst_host_xid: target_xid,
+            options,
+            present_id,
+            window_generation: 0,
+            crtc_id,
+            crtc_epoch,
+            msc_offset: 0,
+            completion_clock: None,
+            wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+            emit_idle: true,
+        };
+        self.extra_drawables.extend([target_xid, source_xid]);
+        Backend::set_cursor_hidden(backend, true);
+        DirectPresentSetup {
+            candidate,
+            event,
+            source_id,
+            target_xid,
+        }
+    }
+
+    /// Install a live source and fallback window exactly covering one output.
+    /// The source is deliberately not inserted in the M1 cache: tests can
+    /// drive the ordinary observation/probe path or seed a known accepted
+    /// probe result for admission-only cases.
+    pub(crate) fn install_direct_output_present(
+        &mut self,
+        output_idx: usize,
+        present_id: u64,
+        options: u32,
+    ) -> DirectPresentSetup {
+        use crate::kms::render::store::DrawableKind;
+        use yserver_core::backend::{CompletedPresentEvent, PresentScanoutCandidate, PresentWake};
+
+        let backend = &mut self.events.backend;
+        let layout = &backend.platform.outputs[output_idx];
+        let (x, y, width, height) = (layout.x, layout.y, layout.width, layout.height);
+        let suffix = u32::try_from(present_id).expect("test Present id fits XID");
+        let target_xid = 0x7500 + suffix * 0x10;
+        let source_xid = target_xid + 1;
+        let old_target = super::super::seed_window(backend, target_xid, None, x as i16, y as i16);
+        let target = backend
+            .windows
+            .get_mut(&target_xid)
+            .expect("output-sized direct fallback window");
+        target.width = width;
+        target.height = height;
+        backend.core.top_level_order.push(target_xid);
+        backend.store.detach_xid(target_xid);
+        backend.store_decref_with_invalidate(old_target);
+        let target_storage = backend
+            .platform
+            .gpu
+            .allocate_drawable_storage(width, height, 24)
+            .expect("allocate output-sized direct fallback image");
+        backend
+            .store
+            .allocate(target_xid, DrawableKind::Window, 24, true, target_storage)
+            .expect("register output-sized direct fallback image");
+        let source_storage = backend
+            .platform
+            .gpu
+            .allocate_drawable_storage(width, height, 24)
+            .expect("allocate output-sized direct source image");
+        let source_id = backend
+            .store
+            .allocate(source_xid, DrawableKind::Pixmap, 24, false, source_storage)
+            .expect("register output-sized direct source image");
+        Backend::put_image(backend, None, target_xid, 24, 1, 1, 0, 0, &[0, 0, 0, 0])
+            .expect("initialize output fallback through Backend");
+        Backend::put_image(backend, None, source_xid, 24, 1, 1, 0, 0, &[0, 0, 0, 0])
+            .expect("initialize output Present source through Backend");
+
+        let crtc_id = u32::from(backend.platform.outputs[output_idx].output.crtc);
         let crtc_epoch = backend.present_crtc_clock_epoch(crtc_id);
         let candidate = PresentScanoutCandidate {
             client_id: 1,
@@ -858,13 +988,36 @@ pub(in crate::kms::render::backend::tests) fn build_recording_scene_backend(
     second_output_uses_second_device: bool,
 ) -> Result<Option<KmsBackend>, String> {
     init_tearing_test_logger();
-    let screen_width = match (output_count, dead_zone) {
-        (2, true) => 1700,
-        (2, false) => 1600,
-        (1, false) => 800,
+    let (screen_size, outputs) = match (output_count, dead_zone) {
+        (2, true) => (
+            (1700, 600),
+            vec![(0, 0, 800, 600, 60), (900, 0, 800, 400, 60)],
+        ),
+        (2, false) => (
+            (1600, 600),
+            vec![(0, 0, 800, 600, 60), (800, 0, 800, 600, 60)],
+        ),
+        (1, false) => ((800, 600), vec![(0, 0, 800, 600, 60)]),
         _ => return Err("unsupported recording scene fixture topology".to_owned()),
     };
-    let mut backend = match KmsBackend::for_tests_with_vk_dimensions(screen_width, 600) {
+    build_recording_scene_backend_with_geometry(
+        output_count,
+        dead_zone,
+        second_output_uses_second_device,
+        screen_size,
+        &outputs,
+    )
+}
+
+pub(in crate::kms::render::backend::tests) fn build_recording_scene_backend_with_geometry(
+    output_count: usize,
+    dead_zone: bool,
+    second_output_uses_second_device: bool,
+    screen_size: (u16, u16),
+    output_geometry: &[(i32, i32, u16, u16, u32)],
+) -> Result<Option<KmsBackend>, String> {
+    init_tearing_test_logger();
+    let mut backend = match KmsBackend::for_tests_with_vk_dimensions(screen_size.0, screen_size.1) {
         Ok(backend) => backend,
         Err(error) if is_expected_vulkan_absence(&error) => {
             eprintln!("SKIP recording_scene: Vulkan ICD unavailable ({error})");
@@ -894,17 +1047,21 @@ pub(in crate::kms::render::backend::tests) fn build_recording_scene_backend(
         } else {
             super::super::push_test_output(&mut backend, 201);
         }
-        if dead_zone {
-            backend.platform.outputs[1].x = 900;
-            backend.platform.outputs[1].height = 400;
-            backend.platform.outputs[1].output.picked.height = 400;
-            for mode in &mut backend.platform.outputs[1].output.modes {
-                mode.height = 400;
-            }
-        } else {
-            backend.platform.outputs[1].x = 800;
-        }
     }
+    debug_assert_eq!(output_geometry.len(), output_count);
+    for (layout, &(x, y, width, height, refresh)) in
+        backend.platform.outputs.iter_mut().zip(output_geometry)
+    {
+        layout.x = x;
+        layout.y = y;
+        layout.width = width;
+        layout.height = height;
+        layout.output.picked.width = width;
+        layout.output.picked.height = height;
+        layout.output.picked.vrefresh = refresh;
+        layout.output.modes = vec![layout.output.picked.clone()];
+    }
+    let _ = dead_zone;
     backend
         .pstate
         .direct

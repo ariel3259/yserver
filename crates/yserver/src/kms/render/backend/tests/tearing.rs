@@ -1,6 +1,7 @@
 use super::{
     commit_identity::recording_scene::{
-        build_recording_scene_backend, init_tearing_test_logger, raw, set_scene_fence_properties,
+        build_recording_scene_backend, build_recording_scene_backend_with_geometry,
+        init_tearing_test_logger, raw, set_scene_fence_properties,
         set_unique_direct_plane_properties, skip_unless_vulkan_fed_scanout,
         supports_vulkan_fed_scanout,
     },
@@ -206,7 +207,7 @@ fn prepare_direct_present_for_ids_with_storage(
         direct: true,
     };
     backend.pstate.scanout_m1.entries.insert(
-        source_id,
+        (source_id, crate::kms::render::backend::DirectScope::Root),
         crate::kms::render::backend::ScanoutM1ProbeEntry::accepted_with_shape(
             crate::drm::modeset::DirectScanoutProbeFramebuffer::for_tests(raw(
                 0x8100 + u32::try_from(present_id).expect("test id fits")
@@ -332,7 +333,7 @@ fn direct_backend(output_count: usize) -> Option<KmsBackend> {
         .expect("construct direct test scene");
     backend.scene.scene_structure_dirty = false;
     backend.pstate.direct.root_mut().cursor_bound_all = true;
-    backend.pstate.direct.root_mut().eligible_root_streak =
+    backend.pstate.direct.root_mut().eligible_streak =
         crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1;
     backend.platform.requested_flip_timing = crate::drm::async_flip::FlipTiming::Async;
     for device in &mut backend.platform.devices {
@@ -408,7 +409,7 @@ fn qualify_test_direct_async(
         );
     }
     assert_eq!(recorder.records().len(), before_warmup);
-    assert_eq!(backend.pstate.direct.root().eligible_root_streak, 7);
+    assert_eq!(backend.pstate.direct.root().eligible_streak, 7);
     assert!(backend.pstate.direct.root().current.is_none());
     assert!(backend.pstate.direct.root().pending.is_none());
     assert!(backend.pstate.direct.root().queued_successor.is_none());
@@ -554,20 +555,25 @@ fn qualify_direct_async(
         });
         let authoritative =
             crate::kms::render::backend::scanout_m2_is_authoritative_root(m0_target, root_coverage);
-        let direct_gate = backend
-            .direct_present_crtc_eligible(candidate.crtc_id, candidate.crtc_epoch)
-            && crate::kms::render::backend::scanout_direct_eligible(
-                backend.scanout_allowed(),
-                backend.kms_outputs_active,
-                true,
-                backend.scene.root_overlay.is_empty(),
-                authoritative
-                    && backend.direct_shape_chain_covers_root(candidate.paint_dst_host_xid, root),
-                paint_target.is_none_or(|target| !target.has_border_clip()),
-                candidate.x_off,
-                candidate.y_off,
-                candidate.valid_region_xid,
-            );
+        let direct_gate = backend.direct_present_crtc_eligible(
+            crate::kms::render::backend::DirectScope::Root,
+            candidate.crtc_id,
+            candidate.crtc_epoch,
+        ) && crate::kms::render::backend::scanout_direct_eligible(
+            backend.scanout_allowed(),
+            backend.kms_outputs_active,
+            true,
+            backend.scene.root_overlay.is_empty(),
+            authoritative
+                && backend.direct_shape_chain_covers_root(
+                    candidate.paint_dst_host_xid,
+                    backend.direct_scope_rect(crate::kms::render::backend::DirectScope::Root),
+                ),
+            paint_target.is_none_or(|target| !target.has_border_clip()),
+            candidate.x_off,
+            candidate.y_off,
+            candidate.valid_region_xid,
+        );
         let diagnostic = format!(
             "m0={m0_target:?} root={root:?} window_rect={window_rect:?} source={}x{} root_coverage={root_coverage} authoritative={authoritative} direct_gate={direct_gate} async_devices={} topology={} crtc_eligible={}",
             candidate.src_width,
@@ -576,8 +582,13 @@ fn qualify_direct_async(
                 .platform
                 .device_for_key(output.key.device_key)
                 .is_some_and(|device| device.async_page_flip)),
-            backend.direct_scanout_topology_eligible(),
-            backend.direct_present_crtc_eligible(candidate.crtc_id, candidate.crtc_epoch),
+            backend
+                .direct_scanout_topology_eligible(crate::kms::render::backend::DirectScope::Root),
+            backend.direct_present_crtc_eligible(
+                crate::kms::render::backend::DirectScope::Root,
+                candidate.crtc_id,
+                candidate.crtc_epoch,
+            ),
         );
         let submitted = Backend::try_present_direct(backend, candidate, event)
             .unwrap_or_else(|error| panic!("direct Present entry {present_id}: {error}"));
@@ -587,7 +598,7 @@ fn qualify_direct_async(
             backend.pstate.tearing.state,
             backend.pstate.tearing.probation,
             backend.pstate.tearing.probation_owner,
-            backend.pstate.direct.root().eligible_root_streak,
+            backend.pstate.direct.root().eligible_streak,
             backend.scene.cursor_mode(),
             backend.scene.has_pending_page_flips(),
         );
@@ -1135,7 +1146,7 @@ fn present_until_direct_async(
     panic!(
         "transparent cursor did not reach direct async; tearing={:?}, m2_streak={}, commits={:?}",
         backend.pstate.tearing.state,
-        backend.pstate.direct.root().eligible_root_streak,
+        backend.pstate.direct.root().eligible_streak,
         recorder
             .records()
             .iter()
@@ -1543,7 +1554,7 @@ fn non_async_authoritative_present_resets_probation_during_reentry_barrier() {
         retire_composed_frame(&mut backend, &mut state, index as u32 + 1);
     }
     assert_eq!(backend.pstate.tearing.probation, 7);
-    assert_eq!(backend.pstate.direct.root().eligible_root_streak, 7);
+    assert_eq!(backend.pstate.direct.root().eligible_streak, 7);
     assert!(
         try_direct_present_with_live_storage(
             &mut backend,
@@ -1874,7 +1885,7 @@ fn vt_release_exits_tearing_and_resume_needs_probation() {
             assert_eq!(recorder.records().len(), before_present);
             assert_eq!(backend.pstate.tearing.probation, index as u8 + 1);
             assert_eq!(
-                backend.pstate.direct.root().eligible_root_streak,
+                backend.pstate.direct.root().eligible_streak,
                 index as u8 + 1
             );
             damage_root_and_composite(&mut backend);
@@ -2567,7 +2578,7 @@ fn direct_shape_change_on_ebusy_resets_consecutive_einval_history() {
         1,
     );
 
-    backend.pstate.direct.root_mut().eligible_root_streak =
+    backend.pstate.direct.root_mut().eligible_streak =
         crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1;
     set_direct_second_crtc(&mut backend, 105);
     let (candidate_b, event_b, shape_b) = prepare_direct_present(&mut backend, 72, 1600, 600);
@@ -2597,7 +2608,7 @@ fn direct_shape_change_on_ebusy_resets_consecutive_einval_history() {
             .is_empty()
     );
 
-    backend.pstate.direct.root_mut().eligible_root_streak =
+    backend.pstate.direct.root_mut().eligible_streak =
         crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1;
     set_direct_second_crtc(&mut backend, 201);
     let shape_a_again = try_direct_present(&mut backend, 73, 1600, 600);
@@ -2708,6 +2719,14 @@ fn live_scene_backend_with_outputs(output_count: usize) -> Option<KmsBackend> {
         .unwrap_or_else(|error| panic!("recording scene fixture unavailable: {error}"))
 }
 
+fn live_scene_backend_with_geometry(
+    screen_size: (u16, u16),
+    outputs: &[(i32, i32, u16, u16, u32)],
+) -> Option<KmsBackend> {
+    build_recording_scene_backend_with_geometry(outputs.len(), false, false, screen_size, outputs)
+        .unwrap_or_else(|error| panic!("recording scene fixture unavailable: {error}"))
+}
+
 fn seed_held_output_owner(backend: &mut KmsBackend, output_idx: usize, target_xid: u32) {
     let fallback_id = super::seed_window(backend, target_xid, None, 0, 0);
     install_direct_frame_for_target_test(backend, target_xid, fallback_id, true);
@@ -2728,7 +2747,10 @@ fn seed_held_output_owner(backend: &mut KmsBackend, output_idx: usize, target_xi
 fn composed_output_flips_while_other_output_owner_held() {
     use yserver_core::backend::Backend;
 
-    let Some(mut backend) = live_scene_backend_with_outputs(2) else {
+    let Some(mut backend) = live_scene_backend_with_geometry(
+        (3840, 1080),
+        &[(0, 0, 1920, 1080, 75), (1920, 0, 1920, 1080, 240)],
+    ) else {
         return;
     };
     let recorder = recording_sink(&mut backend, 0);
@@ -3375,8 +3397,8 @@ fn cursor_only_ineligibility_does_not_reset_direct_probation_while_on() {
     let recorder = recording_sink(&mut backend, 0);
     let _state = enter_tearing_without_direct_scanout(&mut backend, 0x7820, 12_200);
     recorder.clear_records();
-    backend.pstate.direct.root_mut().eligible_root_streak = 3;
-    let before_m2_probation = backend.pstate.direct.root().eligible_root_streak;
+    backend.pstate.direct.root_mut().eligible_streak = 3;
+    let before_m2_probation = backend.pstate.direct.root().eligible_streak;
     for present_id in 12_300..12_320 {
         assert!(
             try_direct_present_for_window(
@@ -3392,7 +3414,7 @@ fn cursor_only_ineligibility_does_not_reset_direct_probation_while_on() {
     }
     assert!(backend.pstate.tearing.is_on());
     assert_eq!(
-        backend.pstate.direct.root().eligible_root_streak,
+        backend.pstate.direct.root().eligible_streak,
         before_m2_probation
     );
     assert_ne!(
@@ -3420,7 +3442,7 @@ fn cursor_only_ineligibility_does_not_reset_direct_probation_while_on() {
         window.height = height;
     }
     compositor.core.top_level_order.push(cow);
-    compositor.pstate.direct.root_mut().eligible_root_streak = 0;
+    compositor.pstate.direct.root_mut().eligible_streak = 0;
 
     for index in 0..5_u64 {
         let full_id = 12_400 + index * 2;
@@ -3438,7 +3460,7 @@ fn cursor_only_ineligibility_does_not_reset_direct_probation_while_on() {
                 .expect("full compositor Present remains in M2 probation")
         );
         assert_eq!(
-            compositor.pstate.direct.root().eligible_root_streak,
+            compositor.pstate.direct.root().eligible_streak,
             1,
             "each full compositor Present advances probation after the preceding limited Present reset it"
         );
@@ -3457,12 +3479,12 @@ fn cursor_only_ineligibility_does_not_reset_direct_probation_while_on() {
             !Backend::try_present_direct(&mut compositor, candidate, event)
                 .expect("region-limited compositor Present takes Copy path")
         );
-        assert_eq!(compositor.pstate.direct.root().eligible_root_streak, 0);
+        assert_eq!(compositor.pstate.direct.root().eligible_streak, 0);
         assert!(!compositor.pstate.tearing.is_on());
     }
 
     assert_tearing_off(&compositor);
-    assert_eq!(compositor.pstate.direct.root().eligible_root_streak, 0);
+    assert_eq!(compositor.pstate.direct.root().eligible_streak, 0);
     assert!(!compositor.pstate.direct.root().active());
     assert!(!compositor.pstate.direct.root().unflip_requested);
     assert!(compositor.scene.root_overlay.is_empty());
