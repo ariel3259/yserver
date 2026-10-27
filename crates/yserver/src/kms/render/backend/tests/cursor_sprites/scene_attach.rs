@@ -2074,7 +2074,10 @@ fn direct_deferred_cursor_show_keeps_direct_and_retries_on_event() {
             .scene
             .events
             .backend
-            .stop_direct_after_scanout_replaced("test teardown");
+            .stop_direct_after_scanout_replaced(
+                crate::kms::render::backend::DirectScope::Root,
+                "test teardown",
+            );
     }
 
     let detach = accept_cursor_detach(&mut fixture, &mut delivered, 0);
@@ -2668,7 +2671,10 @@ fn p2_direct_refresh_reaches_pool_pressure_and_keeps_only_the_newest_wanted_imag
         .scene
         .events
         .backend
-        .stop_direct_after_scanout_replaced("test teardown");
+        .stop_direct_after_scanout_replaced(
+            crate::kms::render::backend::DirectScope::Root,
+            "test teardown",
+        );
     let detach = accept_cursor_detach(&mut fixture, &mut delivered, 0);
     retire_cursor_record(&mut fixture, &mut delivered, 0, &detach, 11);
     super::support::finish_atomic_fixture(fixture, &mut delivered);
@@ -2785,7 +2791,10 @@ fn p2_direct_hook_keeps_scanout_until_deferred_refresh_retries() {
         .scene
         .events
         .backend
-        .stop_direct_after_scanout_replaced("test teardown");
+        .stop_direct_after_scanout_replaced(
+            crate::kms::render::backend::DirectScope::Root,
+            "test teardown",
+        );
     let detach = accept_cursor_detach(&mut fixture, &mut delivered, 0);
     retire_cursor_record(&mut fixture, &mut delivered, 0, &detach, 11);
     super::support::finish_atomic_fixture(fixture, &mut delivered);
@@ -2856,7 +2865,10 @@ fn finish_direct_fixture(
             .scene
             .events
             .backend
-            .stop_direct_after_scanout_replaced("test teardown");
+            .stop_direct_after_scanout_replaced(
+                crate::kms::render::backend::DirectScope::Root,
+                "test teardown",
+            );
     }
     for output_idx in 0..fixture.scene.events.backend.platform.outputs.len() {
         drain_unretired_output_events(&mut fixture, delivered, output_idx);
@@ -3514,7 +3526,10 @@ fn direct_cursor_retry_lands_under_continuous_successor_stream() {
             .scene
             .events
             .backend
-            .stop_direct_after_scanout_replaced("continuous cursor retry test teardown");
+            .stop_direct_after_scanout_replaced(
+                crate::kms::render::backend::DirectScope::Root,
+                "continuous cursor retry test teardown",
+            );
         drain_unretired_output_events(&mut fixture, &mut delivered, 0);
         if fixture
             .scene

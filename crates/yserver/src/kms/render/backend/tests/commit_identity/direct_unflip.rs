@@ -16,7 +16,7 @@ use yserver_core::backend::Backend;
 const DIRECT_PROBATION: usize = 8;
 const WAIT_DEADLINE: Duration = Duration::from_secs(5);
 
-pub(super) fn direct_fixture(
+pub(crate) fn direct_fixture(
     output_count: usize,
     route: P1SceneRoute,
     present_id: u64,
@@ -28,15 +28,15 @@ pub(super) fn direct_fixture(
     Some((fixture, direct))
 }
 
-pub(super) fn fd(fixture: &RecordingSceneFixture) -> RawFd {
+pub(crate) fn fd(fixture: &RecordingSceneFixture) -> RawFd {
     fixture.kms_fd(0)
 }
 
-pub(super) fn record_count(fixture: &RecordingSceneFixture, device_fd: RawFd) -> usize {
+pub(crate) fn record_count(fixture: &RecordingSceneFixture, device_fd: RawFd) -> usize {
     fixture.events.recorders[&device_fd].records().len()
 }
 
-pub(super) fn records_since(
+pub(crate) fn records_since(
     fixture: &RecordingSceneFixture,
     device_fd: RawFd,
     offset: usize,
@@ -178,6 +178,483 @@ pub(super) fn drain_present_notifications(
         expected_idled,
         "direct Idle events must belong to the expected Presents"
     );
+}
+
+pub(crate) fn output_owner_frame(
+    fixture: &mut RecordingSceneFixture,
+    direct: &DirectPresentSetup,
+    output_idx: usize,
+    target: crate::kms::render::backend::ScanoutM0Target,
+    fallback_override: Option<crate::kms::render::store::DrawableId>,
+    paint_host_override: Option<u32>,
+) -> crate::kms::render::backend::DirectPresentFrame {
+    use crate::kms::render::{backend::DirectPresentFrame, target::PaintTarget};
+    use std::collections::HashSet;
+
+    let backend = &mut fixture.events.backend;
+    let output = &backend.platform.outputs[output_idx].output;
+    let mut candidate = direct.candidate;
+    candidate.crtc_id = u32::from(output.crtc);
+    candidate.crtc_epoch = backend.present_crtc_clock_epoch(candidate.crtc_id);
+    if let Some(paint_host_xid) = paint_host_override {
+        candidate.paint_dst_host_xid = paint_host_xid;
+    }
+    let fallback_id = fallback_override.unwrap_or_else(|| {
+        backend
+            .store
+            .lookup(direct.target_xid)
+            .expect("direct setup has a fallback drawable")
+    });
+    let source_pin = backend.pin_direct_source(direct.source_id);
+    let fallback_target_pin = backend.pin_direct_source(fallback_id);
+    let mut event = direct.event.clone();
+    event.crtc_id = candidate.crtc_id;
+    event.crtc_epoch = candidate.crtc_epoch;
+    DirectPresentFrame {
+        source_pin,
+        fallback_target_pin,
+        source_id: direct.source_id,
+        candidate,
+        target,
+        present_received_at: Instant::now(),
+        present_received_monotonic: None,
+        fallback_target: PaintTarget::new(fallback_id, (0, 0), None, 24),
+        event,
+        completion_output_idx: output_idx,
+        completion_clock: None,
+        awaiting_outputs: HashSet::new(),
+        accepted_event_id: None,
+        async_outcome: crate::drm::async_flip::AsyncOutcome::NotRequested,
+    }
+}
+
+pub(crate) fn seed_output_owner_successor(
+    fixture: &mut RecordingSceneFixture,
+    direct: &DirectPresentSetup,
+    output_idx: usize,
+    target: crate::kms::render::backend::ScanoutM0Target,
+    fallback_override: Option<crate::kms::render::store::DrawableId>,
+    paint_host_override: Option<u32>,
+) {
+    let frame = output_owner_frame(
+        fixture,
+        direct,
+        output_idx,
+        target,
+        fallback_override,
+        paint_host_override,
+    );
+    let owner = &mut fixture.events.backend.pstate.direct.outputs[output_idx];
+    assert!(!owner.active(), "output owner slot starts empty");
+    owner.queued_successor = Some(frame);
+    owner.hold_direct = true;
+}
+
+fn submit_output_owner_successor(
+    fixture: &mut RecordingSceneFixture,
+    direct: &DirectPresentSetup,
+    output_idx: usize,
+) -> AtomicCommitRecord {
+    let device_fd = fd(fixture);
+    let start = record_count(fixture, device_fd);
+    seed_output_owner_successor(
+        fixture,
+        direct,
+        output_idx,
+        crate::kms::render::backend::ScanoutM0Target::Unredirected,
+        None,
+        None,
+    );
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("submit output owner through the scheduling pass");
+    let crtc = fixture.events.backend.platform.outputs[output_idx]
+        .output
+        .crtc;
+    records_since(fixture, device_fd, start)
+        .into_iter()
+        .find(|record| {
+            accepted_event_id(record).is_some()
+                && record.events.len() == 1
+                && record.events[0].crtc == crtc
+        })
+        .expect("output owner direct commit was accepted")
+}
+
+fn submit_two_output_owner_successors(
+    fixture: &mut RecordingSceneFixture,
+    first: &DirectPresentSetup,
+    second: &DirectPresentSetup,
+) -> (AtomicCommitRecord, AtomicCommitRecord) {
+    let device_fd = fd(fixture);
+    let start = record_count(fixture, device_fd);
+    seed_output_owner_successor(
+        fixture,
+        first,
+        0,
+        crate::kms::render::backend::ScanoutM0Target::Unredirected,
+        None,
+        None,
+    );
+    seed_output_owner_successor(
+        fixture,
+        second,
+        1,
+        crate::kms::render::backend::ScanoutM0Target::Unredirected,
+        None,
+        None,
+    );
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("submit both output owners through the scheduling pass");
+    let records = records_since(fixture, device_fd, start);
+    let first_crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    let second_crtc = fixture.events.backend.platform.outputs[1].output.crtc;
+    let first_record = records
+        .iter()
+        .find(|record| record.events.iter().any(|event| event.crtc == first_crtc))
+        .expect("first output direct commit")
+        .clone();
+    let second_record = records
+        .iter()
+        .find(|record| record.events.iter().any(|event| event.crtc == second_crtc))
+        .expect("second output direct commit")
+        .clone();
+    (first_record, second_record)
+}
+
+pub(crate) fn accepted_record_id(record: &AtomicCommitRecord) -> Option<u64> {
+    accepted_event_id(record)
+}
+
+pub(crate) fn complete_output_owner_record(
+    fixture: &mut RecordingSceneFixture,
+    device_fd: RawFd,
+    record: &AtomicCommitRecord,
+    event_id: u64,
+    frame: u32,
+) {
+    complete_recorded_attempt(fixture, device_fd, record, event_id, frame);
+}
+
+fn assert_atomic_record_touches_output_only(
+    fixture: &RecordingSceneFixture,
+    record: &AtomicCommitRecord,
+    output_idx: usize,
+) {
+    let output = &fixture.events.backend.platform.outputs[output_idx].output;
+    let other = &fixture.events.backend.platform.outputs[1 - output_idx].output;
+    assert_eq!(record.events.len(), 1);
+    assert_eq!(record.events[0].crtc, output.crtc);
+    assert!(record.properties.iter().any(|update| {
+        update.property == output.plane_fb_id_prop && update.object == output.plane.into()
+    }));
+    assert!(record.properties.iter().any(|update| {
+        update.property == output.plane_crtc_id_prop && update.object == output.plane.into()
+    }));
+    let other_plane_properties = [
+        other.plane_fb_id_prop,
+        other.plane_crtc_id_prop,
+        other.plane_src_x_prop,
+        other.plane_src_y_prop,
+        other.plane_src_w_prop,
+        other.plane_src_h_prop,
+        other.plane_crtc_x_prop,
+        other.plane_crtc_y_prop,
+        other.plane_crtc_w_prop,
+        other.plane_crtc_h_prop,
+    ];
+    for property in other_plane_properties {
+        assert!(
+            !record
+                .properties
+                .iter()
+                .any(|update| update.object == other.plane.into() && update.property == property)
+        );
+    }
+    for property in [
+        other.crtc_out_fence_ptr_prop,
+        other.crtc_vrr_enabled_prop,
+        other.crtc_gamma_lut_prop,
+        other.crtc_degamma_lut_prop,
+        other.crtc_ctm_prop,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        assert!(
+            !record
+                .properties
+                .iter()
+                .any(|update| update.object == other.crtc.into() && update.property == property)
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: build plane states for all outputs.
+fn output_owner_submits_and_unflips_only_its_crtc() {
+    let Some((mut fixture, direct)) = direct_fixture(2, P1SceneRoute::Shared, 203, 0) else {
+        return;
+    };
+    let device_fd = fd(&fixture);
+    Backend::set_cursor_hidden(&mut fixture.events.backend, true);
+    let direct_record = submit_output_owner_successor(&mut fixture, &direct, 1);
+    let direct_id = accepted_event_id(&direct_record).expect("direct submit accepted");
+    assert_atomic_record_touches_output_only(&fixture, &direct_record, 1);
+    complete_recorded_attempt(&mut fixture, device_fd, &direct_record, direct_id, 53);
+    assert!(
+        fixture.events.backend.pstate.direct.outputs[1]
+            .current
+            .is_some()
+    );
+    assert_eq!(
+        fixture.events.backend.pstate.direct.active_scopes(),
+        [crate::kms::render::backend::DirectScope::Output(1)]
+    );
+
+    Backend::unmap_subwindow(&mut fixture.events.backend, None, direct.target_xid)
+        .expect("unmap direct window through Backend");
+    let start = record_count(&fixture, device_fd);
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("submit output owner composed unflip through scheduler");
+    let crtc = fixture.events.backend.platform.outputs[1].output.crtc;
+    let unflip = records_since(&fixture, device_fd, start)
+        .into_iter()
+        .find(|record| {
+            accepted_event_id(record).is_some()
+                && record.events.len() == 1
+                && record.events[0].crtc == crtc
+        })
+        .expect("output owner composed-unflip commit was accepted");
+    assert_atomic_record_touches_output_only(&fixture, &unflip, 1);
+    assert_eq!(
+        fixture.events.backend.pstate.direct.outputs[1].unflip_awaiting_outputs,
+        HashMap::from([(1, accepted_event_id(&unflip).unwrap())])
+    );
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: route retirement to the first active owner instead of scope_for_output.
+fn two_output_owners_retire_independently() {
+    let Some((mut fixture, first)) = direct_fixture(2, P1SceneRoute::Shared, 205, 0) else {
+        return;
+    };
+    let device_fd = fd(&fixture);
+    let second = fixture.install_direct_present(206, 0);
+    Backend::set_cursor_hidden(&mut fixture.events.backend, true);
+    let start = record_count(&fixture, device_fd);
+    seed_output_owner_successor(
+        &mut fixture,
+        &first,
+        0,
+        crate::kms::render::backend::ScanoutM0Target::Unredirected,
+        None,
+        None,
+    );
+    seed_output_owner_successor(
+        &mut fixture,
+        &second,
+        1,
+        crate::kms::render::backend::ScanoutM0Target::Unredirected,
+        None,
+        None,
+    );
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("submit both output owners through the scheduling pass");
+    let records = records_since(&fixture, device_fd, start);
+    let first_crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    let second_crtc = fixture.events.backend.platform.outputs[1].output.crtc;
+    let first_record = records
+        .iter()
+        .find(|record| record.events.iter().any(|event| event.crtc == first_crtc))
+        .expect("first output direct commit");
+    let second_record = records
+        .iter()
+        .find(|record| record.events.iter().any(|event| event.crtc == second_crtc))
+        .expect("second output direct commit");
+    assert_atomic_record_touches_output_only(&fixture, first_record, 0);
+    assert_atomic_record_touches_output_only(&fixture, second_record, 1);
+    let first_id = accepted_event_id(first_record).expect("first output accepted ID");
+    let second_id = accepted_event_id(second_record).expect("second output accepted ID");
+    assert_ne!(first_id, second_id);
+
+    complete_recorded_attempt(&mut fixture, device_fd, second_record, second_id, 61);
+    let second_completed = Backend::drain_completed_present_events(&mut fixture.events.backend);
+    assert_eq!(
+        second_completed
+            .iter()
+            .map(|event| event.present_id)
+            .collect::<Vec<_>>(),
+        [second.candidate.present_id]
+    );
+    assert_eq!(
+        second_completed[0].completion_clock,
+        Some(yserver_core::backend::PresentClockSample {
+            msc: 61,
+            ust: 610_000,
+            source: yserver_core::backend::PresentClockSource::PageFlip,
+        })
+    );
+    assert!(
+        fixture.events.backend.pstate.direct.outputs[0]
+            .pending
+            .is_some()
+    );
+    assert!(
+        fixture.events.backend.pstate.direct.outputs[1]
+            .current
+            .is_some()
+    );
+    complete_recorded_attempt(&mut fixture, device_fd, second_record, second_id, 62);
+    assert!(Backend::drain_completed_present_events(&mut fixture.events.backend).is_empty());
+
+    complete_recorded_attempt(&mut fixture, device_fd, first_record, first_id, 71);
+    let first_completed = Backend::drain_completed_present_events(&mut fixture.events.backend);
+    assert_eq!(
+        first_completed
+            .iter()
+            .map(|event| event.present_id)
+            .collect::<Vec<_>>(),
+        [first.candidate.present_id]
+    );
+    assert_eq!(
+        first_completed[0].completion_clock,
+        Some(yserver_core::backend::PresentClockSample {
+            msc: 71,
+            ust: 710_000,
+            source: yserver_core::backend::PresentClockSource::PageFlip,
+        })
+    );
+    assert!(
+        fixture.events.backend.pstate.direct.outputs[0]
+            .current
+            .is_some()
+    );
+    assert!(
+        fixture.events.backend.pstate.direct.outputs[1]
+            .current
+            .is_some()
+    );
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: drain the root slot only.
+fn stopped_output_owner_notifications_are_drained() {
+    let Some((mut fixture, direct)) = direct_fixture(2, P1SceneRoute::Shared, 207, 0) else {
+        return;
+    };
+    let device_fd = fd(&fixture);
+    Backend::set_cursor_hidden(&mut fixture.events.backend, true);
+    let direct_record = submit_output_owner_successor(&mut fixture, &direct, 1);
+    let direct_id = accepted_event_id(&direct_record).expect("direct submit accepted");
+    complete_recorded_attempt(&mut fixture, device_fd, &direct_record, direct_id, 73);
+    Backend::unmap_subwindow(&mut fixture.events.backend, None, direct.target_xid)
+        .expect("unmap direct window through Backend");
+    let start = record_count(&fixture, device_fd);
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("submit composed unflip through Backend");
+    let crtc = fixture.events.backend.platform.outputs[1].output.crtc;
+    let unflip = records_since(&fixture, device_fd, start)
+        .into_iter()
+        .find(|record| {
+            accepted_event_id(record).is_some()
+                && record.events.len() == 1
+                && record.events[0].crtc == crtc
+        })
+        .expect("output unflip accepted");
+    complete_recorded_attempt(
+        &mut fixture,
+        device_fd,
+        &unflip,
+        accepted_event_id(&unflip).unwrap(),
+        74,
+    );
+
+    let completed = Backend::drain_completed_present_events(&mut fixture.events.backend);
+    assert_eq!(
+        completed
+            .iter()
+            .map(|event| event.present_id)
+            .collect::<Vec<_>>(),
+        [direct.candidate.present_id]
+    );
+    let idled = Backend::drain_retired_present_idle_events(&mut fixture.events.backend);
+    assert_eq!(
+        idled
+            .iter()
+            .map(|event| event.present_id)
+            .collect::<Vec<_>>(),
+        [direct.candidate.present_id]
+    );
+    assert!(Backend::drain_completed_present_events(&mut fixture.events.backend).is_empty());
+    assert!(Backend::drain_retired_present_idle_events(&mut fixture.events.backend).is_empty());
+    assert!(!fixture.events.backend.pstate.direct.outputs[1].active());
+    assert!(fixture.events.backend.present_source_pins.is_empty());
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: the VT release stop-all path stops only the root slot.
+fn global_teardown_unflips_every_output_owner() {
+    use yserver_core::core_loop::input_inventory::InputInventory;
+
+    let Some((mut fixture, first)) = direct_fixture(2, P1SceneRoute::Shared, 209, 0) else {
+        return;
+    };
+    let second = fixture.install_direct_present(210, 0);
+    let device_fd = fd(&fixture);
+    Backend::set_cursor_hidden(&mut fixture.events.backend, true);
+    let (first_record, second_record) =
+        submit_two_output_owner_successors(&mut fixture, &first, &second);
+    let first_id = accepted_event_id(&first_record).expect("first output accepted ID");
+    let second_id = accepted_event_id(&second_record).expect("second output accepted ID");
+    complete_recorded_attempt(&mut fixture, device_fd, &first_record, first_id, 81);
+    complete_recorded_attempt(&mut fixture, device_fd, &second_record, second_id, 82);
+    let completed = Backend::drain_completed_present_events(&mut fixture.events.backend);
+    assert_eq!(
+        completed
+            .iter()
+            .map(|event| event.present_id)
+            .collect::<Vec<_>>(),
+        [first.candidate.present_id, second.candidate.present_id]
+    );
+    assert_eq!(
+        fixture.events.backend.pstate.direct.active_scopes(),
+        [
+            crate::kms::render::backend::DirectScope::Output(0),
+            crate::kms::render::backend::DirectScope::Output(1),
+        ]
+    );
+
+    super::install_recording_vt_io(&mut fixture);
+    Backend::begin_vt_release(&mut fixture.events.backend);
+    Backend::finish_vt_release(
+        &mut fixture.events.backend,
+        &mut fixture.events.state,
+        &InputInventory::default(),
+    );
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .active_scopes()
+            .is_empty()
+    );
+    assert!(fixture.events.backend.present_source_pins.is_empty());
+    assert!(Backend::drain_completed_present_events(&mut fixture.events.backend).is_empty());
+    let idled = Backend::drain_retired_present_idle_events(&mut fixture.events.backend);
+    assert_eq!(
+        idled
+            .iter()
+            .map(|event| event.present_id)
+            .collect::<Vec<_>>(),
+        [first.candidate.present_id, second.candidate.present_id]
+    );
+    assert!(Backend::drain_retired_present_idle_events(&mut fixture.events.backend).is_empty());
 }
 
 pub(super) fn complete_direct_initial(

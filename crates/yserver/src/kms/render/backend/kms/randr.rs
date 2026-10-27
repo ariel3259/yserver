@@ -1349,11 +1349,13 @@ impl KmsBackend {
         // an active direct frame. Snapshot that frame into its old COW and
         // request the synchronized replacement first. On failure, leave the
         // old dimensions and every storage owner/pin untouched.
-        if self.pstate.direct.root().active() {
-            if let Err(e) = self.materialize_direct_shadow_for_unflip() {
+        for scope in self.pstate.direct.active_scopes() {
+            if let Err(e) = self.materialize_direct_shadow_for_unflip(scope) {
                 self.discard_root_storage(prepared);
                 return Err(e);
             }
+        }
+        if !self.pstate.direct.active_scopes().is_empty() {
             self.request_direct_unflip("virtual_screen_extent_before_storage_reallocation");
         }
 
@@ -1630,7 +1632,10 @@ impl KmsBackend {
                 output.pending_gamma_deadline.set(None);
                 self.submit_pending_crtc_property_for_output(
                     output_idx,
-                    self.live_direct_vrr_wanted(),
+                    self.live_direct_vrr_wanted_by_output()
+                        .get(output_idx)
+                        .copied()
+                        .unwrap_or(false),
                     now,
                 )?;
             } else if output.pending_gamma_deadline.get().is_none() {
@@ -1647,13 +1652,22 @@ impl KmsBackend {
     /// The output scheduler owns the detailed scene state; the CRTC's atomic
     /// sink only reports commits that have already been accepted.
     pub(super) fn gamma_output_has_queued_scanout(&self, output_idx: usize) -> bool {
+        let direct_work = self
+            .pstate
+            .direct
+            .scope_for_output(output_idx)
+            .and_then(|scope| self.pstate.direct.get(scope))
+            .is_some_and(|owner| {
+                owner.pending.is_some()
+                    || owner.queued_successor.is_some()
+                    || owner.unflip_requested
+                    || !owner.unflip_awaiting_outputs.is_empty()
+            });
         self.scene.has_pending_page_flip(output_idx)
             || self.scene.output_submit_retry_pending(output_idx)
             || self.scene.owes_repaint()
             || self.store.has_pending_presentation_damage()
-            || self.pstate.direct.root().pending.is_some()
-            || self.pstate.direct.root().queued_successor.is_some()
-            || self.pstate.direct.root().unflip_requested
+            || direct_work
     }
 
     pub(super) fn reapply_gamma_for_output(&self, output_key: &OutputKey) {

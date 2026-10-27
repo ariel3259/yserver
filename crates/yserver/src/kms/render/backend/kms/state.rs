@@ -249,6 +249,7 @@ pub(in crate::kms::render::backend) type DirectFrameSubmitter =
     fn(
         &mut KmsBackend,
         &mut DirectPresentFrame,
+        DirectScope,
         crate::drm::async_flip::FlipTiming,
     ) -> io::Result<crate::drm::async_flip::AsyncOutcome>;
 
@@ -385,6 +386,12 @@ pub(in crate::kms::render::backend) struct DirectOwners {
     pub(in crate::kms::render::backend) outputs: Vec<ScanoutM2State>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::kms::render::backend) enum DirectScope {
+    Root,
+    Output(usize),
+}
+
 impl Default for DirectOwners {
     fn default() -> Self {
         Self {
@@ -418,6 +425,51 @@ impl DirectOwners {
             }
         }
         self.outputs.resize_with(count, ScanoutM2State::new);
+    }
+
+    pub(in crate::kms::render::backend) fn get(
+        &self,
+        scope: DirectScope,
+    ) -> Option<&ScanoutM2State> {
+        match scope {
+            DirectScope::Root => Some(&self.root),
+            DirectScope::Output(output_idx) => self.outputs.get(output_idx),
+        }
+    }
+
+    pub(in crate::kms::render::backend) fn get_mut(
+        &mut self,
+        scope: DirectScope,
+    ) -> Option<&mut ScanoutM2State> {
+        match scope {
+            DirectScope::Root => Some(&mut self.root),
+            DirectScope::Output(output_idx) => self.outputs.get_mut(output_idx),
+        }
+    }
+
+    pub(in crate::kms::render::backend) fn active_scopes(&self) -> Vec<DirectScope> {
+        if self.root.active() {
+            return vec![DirectScope::Root];
+        }
+        self.outputs
+            .iter()
+            .enumerate()
+            .filter(|(_, owner)| owner.active())
+            .map(|(output_idx, _)| DirectScope::Output(output_idx))
+            .collect()
+    }
+
+    pub(in crate::kms::render::backend) fn scope_for_output(
+        &self,
+        output_idx: usize,
+    ) -> Option<DirectScope> {
+        if self.root.active() {
+            return Some(DirectScope::Root);
+        }
+        self.outputs
+            .get(output_idx)
+            .is_some_and(ScanoutM2State::active)
+            .then_some(DirectScope::Output(output_idx))
     }
 }
 
