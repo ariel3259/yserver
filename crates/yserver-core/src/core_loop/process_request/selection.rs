@@ -311,6 +311,32 @@ pub(super) fn handle_convert_selection(
     let property = AtomId(u32::from_le_bytes([body[12], body[13], body[14], body[15]]));
     let time_val = u32::from_le_bytes([body[16], body[17], body[18], body[19]]);
 
+    // BadWindow for the requestor, then BadAtom carrying the property as its
+    // value whichever atom is bad (`dix/selection.c:271-280`).
+    if state.resources.window(requestor).is_none() {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_WINDOW,
+            requestor.0,
+            24,
+        );
+    }
+    if !state.atoms.exists(selection)
+        || !state.atoms.exists(target_atom)
+        || (property.0 != 0 && !state.atoms.exists(property))
+    {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_ATOM,
+            property.0,
+            24,
+        );
+    }
+
     if let Some((owner_window, owner_id)) = selection_owner_target_id(state, selection) {
         let _dropped = fanout_event_to_clients(state, &[owner_id], |buf, seq, order| {
             x11::encode_selection_request_event(

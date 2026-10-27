@@ -1354,6 +1354,55 @@ fn convert_selection_without_an_owner_notifies_the_requesting_client() {
     );
 }
 
+/// `ProcConvertSelection` checks the requestor (BadWindow) and then the
+/// atoms (BadAtom, whose value is the property whichever atom is bad) before
+/// anything is sent (`dix/selection.c:271-280`).
+#[test]
+fn convert_selection_with_a_bad_requestor_or_atom_is_an_error_and_sends_nothing() {
+    let (mut state, mut a, mut b, selection, _now) = selection_record_fixture();
+    const BOGUS: u32 = 0x00ee_0000;
+    let convert = |state: &mut ServerState, requestor: u32, target: u32, property: u32| {
+        let mut body = Vec::with_capacity(20);
+        for word in [requestor, selection.0, target, property, 0] {
+            body.extend_from_slice(&word.to_le_bytes());
+        }
+        crate::core_loop::process_request::selection::handle_convert_selection(
+            state,
+            ClientId(REC_B),
+            SequenceNumber(3),
+            &body,
+        )
+        .expect("handle_convert_selection");
+    };
+    // (code, bad value, major opcode) of each error `b` reads.
+    let errors = |state: &mut ServerState, peer: &mut UnixStream| -> Vec<(u8, u32, u8)> {
+        read_all_or_buffered(state, REC_B, peer)
+            .chunks_exact(32)
+            .map(|e| {
+                assert_eq!(e[0], 0, "only errors expected, got event {}", e[0]);
+                (e[1], u32::from_le_bytes([e[4], e[5], e[6], e[7]]), e[10])
+            })
+            .collect()
+    };
+
+    convert(&mut state, BOGUS, 31, 31);
+    assert_eq!(
+        errors(&mut state, &mut b),
+        [(yserver_protocol::x11::error::BAD_WINDOW, BOGUS, 24)]
+    );
+    convert(&mut state, REC_WIN_A, BOGUS, 31);
+    assert_eq!(
+        errors(&mut state, &mut b),
+        [(yserver_protocol::x11::error::BAD_ATOM, 31, 24)]
+    );
+    convert(&mut state, REC_WIN_A, 31, BOGUS);
+    assert_eq!(
+        errors(&mut state, &mut b),
+        [(yserver_protocol::x11::error::BAD_ATOM, BOGUS, 24)]
+    );
+    assert!(record_events(&mut state, REC_A, &mut a).is_empty());
+}
+
 /// How `a` gives up the selection it set on A at `now`.
 #[derive(Clone, Copy)]
 enum RecordRelease {
