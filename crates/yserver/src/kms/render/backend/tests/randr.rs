@@ -3750,7 +3750,7 @@ fn direct_owners_follow_output_count_on_topology_change() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: prevent Output owners from entering through Presents before topology teardown.
+// Mutation: seed Output slots instead of entering owners through Backend Presents.
 fn randr_topology_teardown_stops_every_output_owner() {
     use std::time::Duration;
     use yserver_core::backend::Backend;
@@ -3867,6 +3867,17 @@ fn randr_topology_teardown_stops_every_output_owner() {
         );
         Backend::on_page_flip_ready(&mut fixture.events.backend, &mut fixture.events.state, fd);
     }
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .outputs
+            .iter()
+            .all(|owner| owner.current.is_some()),
+        "each owner entered through a Present and retired its recorded direct CRTC commit"
+    );
 
     let (outputs, _) = fixture.events.backend.randr_outputs_and_modes();
     let removed = &outputs[1];
