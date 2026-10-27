@@ -2068,6 +2068,7 @@ fn try_present_root_pixmap_for_shape_test(
         src_pixmap_xid: source_xid,
         dst_window_xid: target_xid,
         variable_refresh: false,
+        client_pid: None,
         src_host_xid: source_xid,
         paint_dst_host_xid: target_xid,
         completion_dst_host_xid: target_xid,
