@@ -142,7 +142,7 @@ pub(super) fn request_unflip(fixture: &mut RecordingSceneFixture, direct: &Direc
             .expect("ineligible authoritative-root successor"),
         "the successor must request a composed unflip"
     );
-    assert!(fixture.events.backend.pstate.scanout_m2.unflip_requested);
+    assert!(fixture.events.backend.pstate.direct.root().unflip_requested);
 }
 
 pub(super) fn drain_present_notifications(
@@ -200,8 +200,26 @@ pub(super) fn complete_direct_initial(
         &mut fixture.events.state,
         device_fd,
     );
-    assert!(fixture.events.backend.pstate.scanout_m2.pending.is_none());
-    assert!(fixture.events.backend.pstate.scanout_m2.current.is_some());
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .root()
+            .pending
+            .is_none()
+    );
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .root()
+            .current
+            .is_some()
+    );
 }
 
 pub(super) fn grouped_unflip_record(
@@ -352,7 +370,8 @@ fn p1_grouped_direct_awaits_accepted_id_on_every_output() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .pending
             .as_ref()
             .and_then(|frame| frame.accepted_event_id),
@@ -392,17 +411,19 @@ fn p1_grouped_direct_awaits_accepted_id_on_every_output() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .completed
             .is_empty()
     );
-    assert!(fixture.events.backend.pstate.scanout_m2.idled.is_empty());
+    assert!(fixture.events.backend.pstate.direct.root().idled.is_empty());
     assert_eq!(
         fixture
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .pending
             .as_ref()
             .unwrap()
@@ -414,7 +435,8 @@ fn p1_grouped_direct_awaits_accepted_id_on_every_output() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .pending
             .as_ref()
             .unwrap()
@@ -438,7 +460,8 @@ fn p1_grouped_direct_awaits_accepted_id_on_every_output() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .completed
             .is_empty()
     );
@@ -455,10 +478,22 @@ fn p1_grouped_direct_awaits_accepted_id_on_every_output() {
         63,
         Duration::from_millis(6_300),
     );
-    assert!(fixture.events.backend.pstate.scanout_m2.pending.is_none());
-    assert_eq!(fixture.events.backend.pstate.scanout_m2.completed.len(), 1);
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .root()
+            .pending
+            .is_none()
+    );
     assert_eq!(
-        fixture.events.backend.pstate.scanout_m2.completed[0].completion_clock,
+        fixture.events.backend.pstate.direct.root().completed.len(),
+        1
+    );
+    assert_eq!(
+        fixture.events.backend.pstate.direct.root().completed[0].completion_clock,
         Some(reference_clock),
         "the selected reference output supplies the completion clock"
     );
@@ -474,7 +509,8 @@ fn p1_grouped_direct_awaits_accepted_id_on_every_output() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_outputs_to_replace
             .is_empty()
     );
@@ -483,7 +519,8 @@ fn p1_grouped_direct_awaits_accepted_id_on_every_output() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_awaiting_outputs
             .is_empty()
     );
@@ -529,7 +566,8 @@ fn p1_direct_async_fallback_uses_only_vsync_acceptance() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .pending
             .as_ref()
             .and_then(|frame| frame.accepted_event_id),
@@ -549,10 +587,28 @@ fn p1_direct_async_fallback_uses_only_vsync_acceptance() {
         &mut fixture.events.state,
         device_fd,
     );
-    assert!(fixture.events.backend.pstate.scanout_m2.pending.is_some());
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .root()
+            .pending
+            .is_some()
+    );
     assert_eq!(pending_ids(&fixture, device_fd, crtc), [vsync_id]);
     complete_recorded_attempt(&mut fixture, device_fd, &attempts[1], vsync_id, 71);
-    assert!(fixture.events.backend.pstate.scanout_m2.current.is_some());
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .root()
+            .current
+            .is_some()
+    );
     drain_present_notifications(&mut fixture, &[direct.candidate.present_id], &[]);
     request_unflip(&mut fixture, &direct);
     let offset = record_count(&fixture, device_fd);
@@ -608,14 +664,33 @@ fn p1_direct_both_attempts_fail_without_obligation_or_pin_leak() {
             .iter()
             .all(|attempt| attempt.result != ScriptedResult::Ok)
     );
-    assert!(fixture.events.backend.pstate.scanout_m2.pending.is_none());
-    assert!(fixture.events.backend.pstate.scanout_m2.current.is_none());
     assert!(
         fixture
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
+            .pending
+            .is_none()
+    );
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .root()
+            .current
+            .is_none()
+    );
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .root()
             .queued_successor
             .is_none()
     );
@@ -624,7 +699,8 @@ fn p1_direct_both_attempts_fail_without_obligation_or_pin_leak() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_awaiting_outputs
             .is_empty()
     );
@@ -633,7 +709,8 @@ fn p1_direct_both_attempts_fail_without_obligation_or_pin_leak() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_outputs_to_replace
             .is_empty()
     );
@@ -669,13 +746,31 @@ fn p1_direct_both_attempts_fail_without_obligation_or_pin_leak() {
         &mut fixture.events.state,
         device_fd,
     );
-    assert!(fixture.events.backend.pstate.scanout_m2.pending.is_some());
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .root()
+            .pending
+            .is_some()
+    );
     assert_eq!(
         pending_ids(&fixture, device_fd, accepted[0].events[0].crtc),
         [accepted_id]
     );
     complete_recorded_attempt(&mut fixture, device_fd, &accepted[0], accepted_id, 81);
-    assert!(fixture.events.backend.pstate.scanout_m2.current.is_some());
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .root()
+            .current
+            .is_some()
+    );
     drain_present_notifications(&mut fixture, &[later.candidate.present_id], &[]);
     request_unflip(&mut fixture, &later);
     let offset = record_count(&fixture, device_fd);
@@ -709,7 +804,8 @@ fn p1_grouped_unflip_ignores_late_direct_or_duplicate_cookie() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_awaiting_outputs,
         HashMap::from([(0, replacement_id), (1, replacement_id)])
     );
@@ -718,7 +814,8 @@ fn p1_grouped_unflip_ignores_late_direct_or_duplicate_cookie() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_outputs_to_replace,
         HashSet::from([0, 1])
     );
@@ -740,7 +837,8 @@ fn p1_grouped_unflip_ignores_late_direct_or_duplicate_cookie() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_awaiting_outputs
             .len(),
         2,
@@ -760,7 +858,8 @@ fn p1_grouped_unflip_ignores_late_direct_or_duplicate_cookie() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_awaiting_outputs,
         HashMap::from([(1, replacement_id)])
     );
@@ -769,11 +868,21 @@ fn p1_grouped_unflip_ignores_late_direct_or_duplicate_cookie() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_outputs_to_replace,
         HashSet::from([1])
     );
-    assert!(fixture.events.backend.pstate.scanout_m2.current.is_some());
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .root()
+            .current
+            .is_some()
+    );
     assert!(!fixture.events.backend.present_source_pins.is_empty());
     fixture.events.queue_commit_completion(
         device_fd,
@@ -792,7 +901,8 @@ fn p1_grouped_unflip_ignores_late_direct_or_duplicate_cookie() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_awaiting_outputs,
         HashMap::from([(1, replacement_id)])
     );
@@ -810,7 +920,8 @@ fn p1_grouped_unflip_ignores_late_direct_or_duplicate_cookie() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_awaiting_outputs
             .is_empty()
     );
@@ -819,7 +930,8 @@ fn p1_grouped_unflip_ignores_late_direct_or_duplicate_cookie() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_outputs_to_replace
             .is_empty()
     );
@@ -883,7 +995,8 @@ fn p1_degraded_shared_unflip_waits_for_accepted_replacements() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_outputs_to_replace,
         HashSet::from([0, 1])
     );
@@ -892,7 +1005,8 @@ fn p1_degraded_shared_unflip_waits_for_accepted_replacements() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_awaiting_outputs,
         HashMap::from([(replaced, accepted_id)])
     );
@@ -922,7 +1036,8 @@ fn p1_degraded_shared_unflip_waits_for_accepted_replacements() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_outputs_to_replace
             .len(),
         2
@@ -932,7 +1047,8 @@ fn p1_degraded_shared_unflip_waits_for_accepted_replacements() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_awaiting_outputs,
         HashMap::from([(replaced, accepted_id)])
     );
@@ -951,7 +1067,8 @@ fn p1_degraded_shared_unflip_waits_for_accepted_replacements() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_outputs_to_replace,
         HashSet::from([waiting])
     );
@@ -960,13 +1077,21 @@ fn p1_degraded_shared_unflip_waits_for_accepted_replacements() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_awaiting_outputs
             .is_empty(),
         "no accepted replacement ID remains while one output still requires replacement"
     );
     assert!(
-        fixture.events.backend.pstate.scanout_m2.current.is_some(),
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .root()
+            .current
+            .is_some(),
         "an empty accepted map cannot retire direct scanout while another output still needs replacement"
     );
     assert_eq!(direct_source_pins(&fixture, direct.source_id), 1);
@@ -993,8 +1118,17 @@ fn p1_degraded_shared_unflip_waits_for_accepted_replacements() {
         before_early_reentry,
         "the eligible Present must not submit a direct commit"
     );
-    assert!(fixture.events.backend.pstate.scanout_m2.unflip_requested);
-    assert!(fixture.events.backend.pstate.scanout_m2.pending.is_none());
+    assert!(fixture.events.backend.pstate.direct.root().unflip_requested);
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .root()
+            .pending
+            .is_none()
+    );
 
     let later_offset = record_count(&fixture, device_fd);
     recorder.script_result(Ok(()));
@@ -1005,7 +1139,8 @@ fn p1_degraded_shared_unflip_waits_for_accepted_replacements() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_awaiting_outputs,
         HashMap::from([(waiting, later_id)])
     );
@@ -1027,7 +1162,8 @@ fn p1_degraded_shared_unflip_waits_for_accepted_replacements() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_outputs_to_replace
             .is_empty()
     );
@@ -1036,7 +1172,8 @@ fn p1_degraded_shared_unflip_waits_for_accepted_replacements() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_awaiting_outputs
             .is_empty()
     );
@@ -1049,7 +1186,8 @@ fn p1_degraded_shared_unflip_waits_for_accepted_replacements() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .reentry_blocked_until_composed,
         "normal composed fallback reopens direct admission after every replacement retires"
     );
@@ -1168,7 +1306,8 @@ fn p1_degraded_copied_unflip_registers_immediately_accepted_replacement() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_awaiting_outputs,
         HashMap::from([(0, replacement_id)]),
         "scene tick registers the accepted sink ID before returning"
@@ -1196,7 +1335,8 @@ fn p1_degraded_copied_unflip_registers_immediately_accepted_replacement() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_awaiting_outputs,
         HashMap::from([(0, replacement_id)])
     );
@@ -1207,7 +1347,8 @@ fn p1_degraded_copied_unflip_registers_immediately_accepted_replacement() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_outputs_to_replace
             .is_empty()
     );
@@ -1216,7 +1357,8 @@ fn p1_degraded_copied_unflip_registers_immediately_accepted_replacement() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_awaiting_outputs
             .is_empty()
     );
@@ -1262,7 +1404,8 @@ fn p1_degraded_copied_unflip_has_no_id_before_sink_acceptance() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_awaiting_outputs
             .is_empty(),
         "source render readiness must not create an accepted sink identity"
@@ -1272,7 +1415,8 @@ fn p1_degraded_copied_unflip_has_no_id_before_sink_acceptance() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_outputs_to_replace,
         HashSet::from([0])
     );
@@ -1306,7 +1450,8 @@ fn p1_degraded_copied_unflip_has_no_id_before_sink_acceptance() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_awaiting_outputs
             .is_empty()
     );
@@ -1315,7 +1460,8 @@ fn p1_degraded_copied_unflip_has_no_id_before_sink_acceptance() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_outputs_to_replace,
         HashSet::from([0])
     );
@@ -1338,7 +1484,8 @@ fn p1_degraded_copied_unflip_has_no_id_before_sink_acceptance() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_awaiting_outputs,
         HashMap::from([(0, accepted_id)])
     );
@@ -1364,7 +1511,8 @@ fn p1_degraded_copied_unflip_has_no_id_before_sink_acceptance() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_awaiting_outputs,
         HashMap::from([(0, accepted_id)])
     );
@@ -1375,7 +1523,8 @@ fn p1_degraded_copied_unflip_has_no_id_before_sink_acceptance() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_outputs_to_replace
             .is_empty()
     );
@@ -1384,7 +1533,8 @@ fn p1_degraded_copied_unflip_has_no_id_before_sink_acceptance() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_awaiting_outputs
             .is_empty()
     );

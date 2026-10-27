@@ -618,22 +618,22 @@ fn direct_scanout_unflips_and_stays_off_while_another_output_is_transformed() {
         [CrtcTransform::identity(), CrtcTransform::identity()],
         (5120, 1440),
     );
-    b.pstate.scanout_m2.cursor_bound_all = true;
+    b.pstate.direct.root_mut().cursor_bound_all = true;
     let fallback = super::tests::seed_window(&mut b, 0x6a00, None, 0, 0);
     super::tests::install_direct_frame_for_target_test(&mut b, 0x6b00, fallback, true);
-    b.pstate.scanout_m2.hold_direct = true;
+    b.pstate.direct.root_mut().hold_direct = true;
     Backend::randr_layout_changed(&mut b, &mut state);
     assert!(
-        !b.pstate.scanout_m2.unflip_requested,
+        !b.pstate.direct.root().unflip_requested,
         "identity keeps direct scanout"
     );
 
     state.randr.outputs[1].current_transform = scale(0x20000, Some(Filter::Bilinear));
     Backend::randr_layout_changed(&mut b, &mut state);
     assert!(b.platform.any_output_transformed());
-    assert!(b.pstate.scanout_m2.unflip_requested);
+    assert!(b.pstate.direct.root().unflip_requested);
     assert_eq!(
-        b.pstate.scanout_m2.unflip_reason,
+        b.pstate.direct.root().unflip_reason,
         Some("crtc_transform_changed")
     );
 }

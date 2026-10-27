@@ -805,21 +805,37 @@ fn submit_direct_successor(
         accepted,
         "eligible direct successor {} reaches scanout (current={}, pending={}, queued={}, unflip={}, probation={})",
         candidate.present_id,
-        fixture.events.backend.pstate.scanout_m2.current.is_some(),
-        fixture.events.backend.pstate.scanout_m2.pending.is_some(),
         fixture
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
+            .current
+            .is_some(),
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .root()
+            .pending
+            .is_some(),
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .root()
             .queued_successor
             .is_some(),
-        fixture.events.backend.pstate.scanout_m2.unflip_requested,
+        fixture.events.backend.pstate.direct.root().unflip_requested,
         fixture
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .eligible_root_streak,
     );
     direct.candidate = candidate;
@@ -1148,7 +1164,8 @@ fn start_property_direct(
         .events
         .backend
         .pstate
-        .scanout_m2
+        .direct
+        .root_mut()
         .eligible_root_streak = crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1;
     let offset = super::direct_unflip::record_count(fixture, fd);
     request_present(
@@ -1194,7 +1211,8 @@ fn finish_property_direct_scanout(
         .events
         .backend
         .pstate
-        .scanout_m2
+        .direct
+        .root()
         .current
         .as_ref()
         .expect("property direct frame remains current");
@@ -1369,7 +1387,8 @@ fn vrr_standalone_clear_event_retires_nothing() {
         .events
         .backend
         .pstate
-        .scanout_m2
+        .direct
+        .root()
         .current
         .as_ref()
         .map(|frame| {
@@ -1397,7 +1416,8 @@ fn vrr_standalone_clear_event_retires_nothing() {
         .events
         .backend
         .pstate
-        .scanout_m2
+        .direct
+        .root()
         .completed
         .iter()
         .map(|event| event.present_id)
@@ -1406,7 +1426,8 @@ fn vrr_standalone_clear_event_retires_nothing() {
         .events
         .backend
         .pstate
-        .scanout_m2
+        .direct
+        .root()
         .idled
         .iter()
         .map(|event| event.present_id)
@@ -1415,7 +1436,8 @@ fn vrr_standalone_clear_event_retires_nothing() {
         .events
         .backend
         .pstate
-        .scanout_m2
+        .direct
+        .root()
         .current
         .as_ref()
         .expect("current direct frame is retained")
@@ -1446,7 +1468,8 @@ fn vrr_standalone_clear_event_retires_nothing() {
         .events
         .backend
         .pstate
-        .scanout_m2
+        .direct
+        .root()
         .current
         .as_ref()
         .map(|frame| {
@@ -1480,7 +1503,8 @@ fn vrr_standalone_clear_event_retires_nothing() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .completed
             .iter()
             .map(|event| event.present_id)
@@ -1493,7 +1517,8 @@ fn vrr_standalone_clear_event_retires_nothing() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .idled
             .iter()
             .map(|event| event.present_id)
@@ -1548,7 +1573,14 @@ fn vrr_standalone_clear_without_direct_frame_is_not_submitted() {
     let initial_id = super::support::accepted_event_id(&initial).expect("scene event ID");
     super::atomic_events::complete_recorded_attempt(&mut fixture, fd, &initial, initial_id, 92);
     assert!(
-        fixture.events.backend.pstate.scanout_m2.current.is_none(),
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .root()
+            .current
+            .is_none(),
         "there is no live direct frame on the output"
     );
     assert!(
@@ -1754,7 +1786,8 @@ fn vrr_property_mode_reads_like_xorg() {
         .events
         .backend
         .pstate
-        .scanout_m2
+        .direct
+        .root_mut()
         .eligible_root_streak = crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1;
     let start = super::direct_unflip::record_count(&fixture, fd);
     request_present(
@@ -1958,7 +1991,8 @@ fn vrr_direct_unredirected_enables() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .pending
             .as_ref()
             .and_then(|frame| frame.accepted_event_id),
@@ -1972,7 +2006,16 @@ fn vrr_direct_unredirected_enables() {
         &[direct.candidate.present_id],
         &[],
     );
-    assert!(fixture.events.backend.pstate.scanout_m2.current.is_some());
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .root()
+            .current
+            .is_some()
+    );
     finish_direct_scanout(&mut fixture, &direct, fd);
     fixture.finish_after_normal_drain();
 }
@@ -2382,7 +2425,16 @@ fn vrr_einval_latches_and_frame_goes_out() {
     let second_present_id = direct.candidate.present_id;
     let later = submit_direct_successor(&mut fixture, &mut direct, fd);
     assert!(!has_vrr_property(&later, crtc));
-    assert!(fixture.events.backend.pstate.scanout_m2.pending.is_some());
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .root()
+            .pending
+            .is_some()
+    );
     let later_id = super::support::accepted_event_id(&later).expect("later frame event ID");
     super::direct_unflip::complete_direct_initial(&mut fixture, &later, later_id, fd);
     super::direct_unflip::drain_present_notifications(
@@ -3406,7 +3458,8 @@ fn vrr_cursor_not_held_after_rejected_clear() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .current
             .is_none()
     );
@@ -3536,7 +3589,8 @@ fn vrr_cursor_not_held_with_inherited_vrr() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .current
             .is_none()
     );
@@ -4154,13 +4208,23 @@ fn vrr_property_deleted_clears_without_frame_distinct_crtc_ids() {
         .map(|update| update.value)
         .expect("accepted direct frame sets the primary FB_ID");
     complete_direct_and_drain_present(&mut fixture, &initial, 1, None);
-    assert!(fixture.events.backend.pstate.scanout_m2.pending.is_none());
     assert!(
         fixture
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
+            .pending
+            .is_none()
+    );
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .root()
             .queued_successor
             .is_none()
     );
@@ -4565,7 +4629,8 @@ fn vrr_property_change_other_window_ignored() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .current
             .as_ref()
             .unwrap()
@@ -4620,7 +4685,8 @@ fn queued_property_change_case(initial: bool, changed: bool, present_id: u64) {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .queued_successor
             .is_some()
     );
@@ -4646,13 +4712,14 @@ fn queued_property_change_case(initial: bool, changed: bool, present_id: u64) {
         );
     }
     for frame in [
-        fixture.events.backend.pstate.scanout_m2.current.as_ref(),
-        fixture.events.backend.pstate.scanout_m2.pending.as_ref(),
+        fixture.events.backend.pstate.direct.root().current.as_ref(),
+        fixture.events.backend.pstate.direct.root().pending.as_ref(),
         fixture
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .queued_successor
             .as_ref(),
     ] {
@@ -4746,7 +4813,8 @@ fn vrr_standalone_clear_retried_after_error() {
         .events
         .backend
         .pstate
-        .scanout_m2
+        .direct
+        .root_mut()
         .clear_all_direct_cursor_refresh_pending();
     Backend::flush_before_damage_notify(&mut fixture.events.backend);
     fixture.events.wait_for_submitted_gpu_work();

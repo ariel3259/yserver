@@ -98,7 +98,7 @@ fn transparent_cursor_is_hidden_for_direct_scanout_and_define_cursor_handoff() {
     recorder.clear_records();
     present_until_direct_async(&mut backend, &recorder, &mut state, WINDOW, 15_100);
     assert!(backend.pstate.tearing.is_on());
-    assert!(backend.pstate.scanout_m2.active());
+    assert!(backend.pstate.direct.root().active());
     assert!(!backend.platform.any_cursor_plane_visible());
 
     // DefineCursor from a fully transparent image to one opaque pixel must
@@ -107,16 +107,16 @@ fn transparent_cursor_is_hidden_for_direct_scanout_and_define_cursor_handoff() {
         .expect("define one-pixel cursor");
     assert!(!backend.effective_cursor_hidden());
     assert!(backend.tearing_cursor_wants_visible());
-    assert!(backend.pstate.scanout_m2.unflip_requested);
+    assert!(backend.pstate.direct.root().unflip_requested);
     assert_eq!(
-        backend.pstate.scanout_m2.unflip_reason,
+        backend.pstate.direct.root().unflip_reason,
         Some("tearing_cursor_handoff")
     );
     Backend::maybe_composite(&mut backend).expect("submit cursor handoff");
     assert!(!recorder.records().is_empty());
     retire_composed_frame(&mut backend, &mut state, 52);
-    assert!(!backend.pstate.scanout_m2.active());
-    assert!(!backend.pstate.scanout_m2.unflip_requested);
+    assert!(!backend.pstate.direct.root().active());
+    assert!(!backend.pstate.direct.root().unflip_requested);
     damage_root(&mut backend);
     Backend::maybe_composite(&mut backend).expect("compose visible one-pixel cursor");
     assert!(
@@ -181,14 +181,15 @@ fn transparent_cursor_is_hidden_for_direct_scanout_and_define_cursor_handoff() {
         "transparent → visible → transparent cursor transitions must hand off composed ↔ direct"
     );
     assert!(backend.pstate.tearing.is_on());
-    assert!(backend.pstate.scanout_m2.active());
-    assert!(backend.pstate.scanout_m2.pending.is_none());
+    assert!(backend.pstate.direct.root().active());
+    assert!(backend.pstate.direct.root().pending.is_none());
     assert_direct_queue_drained(&backend);
-    assert!(!backend.pstate.scanout_m2.unflip_requested);
+    assert!(!backend.pstate.direct.root().unflip_requested);
     assert!(
         backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_outputs_to_replace
             .is_empty()
     );
@@ -209,17 +210,18 @@ fn transparent_cursor_is_hidden_for_direct_scanout_and_define_cursor_handoff() {
         "a non-async Backend Present exits tearing"
     );
     assert_tearing_off(&backend);
-    assert!(backend.pstate.scanout_m2.pending.is_some());
+    assert!(backend.pstate.direct.root().pending.is_some());
     retire_direct_present(&mut backend, &mut state, 55);
 
     assert_tearing_off(&backend);
-    assert!(backend.pstate.scanout_m2.active());
-    assert!(backend.pstate.scanout_m2.hold_direct);
-    assert!(!backend.pstate.scanout_m2.unflip_requested);
+    assert!(backend.pstate.direct.root().active());
+    assert!(backend.pstate.direct.root().hold_direct);
+    assert!(!backend.pstate.direct.root().unflip_requested);
     assert!(
         backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_outputs_to_replace
             .is_empty()
     );
@@ -485,7 +487,8 @@ fn entry_from_held_direct_with_visible_hw_cursor_runs_handoff() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .current
             .is_some()
     );
@@ -562,15 +565,24 @@ fn entry_from_held_direct_with_visible_hw_cursor_runs_handoff() {
         .events
         .backend
         .pstate
-        .scanout_m2
+        .direct
+        .root()
         .unflip_requested;
-    let handoff_reason = fixture.scene.events.backend.pstate.scanout_m2.unflip_reason;
+    let handoff_reason = fixture
+        .scene
+        .events
+        .backend
+        .pstate
+        .direct
+        .root()
+        .unflip_reason;
     let direct_retained_before_handoff = fixture
         .scene
         .events
         .backend
         .pstate
-        .scanout_m2
+        .direct
+        .root()
         .current
         .is_some();
     let hardware_cursor_visible_before_handoff = fixture
@@ -679,7 +691,8 @@ fn entry_from_held_direct_with_visible_hw_cursor_runs_handoff() {
         .events
         .backend
         .pstate
-        .scanout_m2
+        .direct
+        .root()
         .current
         .is_none();
     let hardware_cursor_hidden_after_handoff = !fixture
@@ -737,7 +750,8 @@ fn entry_from_held_direct_with_visible_hw_cursor_runs_handoff() {
         .events
         .backend
         .pstate
-        .scanout_m2
+        .direct
+        .root()
         .unflip_requested;
     let no_pending_scene = !fixture.scene.events.backend.scene.has_pending_page_flips();
     fixture.scene.events.wait_for_submitted_gpu_work();
@@ -909,7 +923,8 @@ fn handoff_keeps_newest_copy_not_retained_direct_frame() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_requested
     );
     let fallback_source_is_f1 = fixture
@@ -917,7 +932,8 @@ fn handoff_keeps_newest_copy_not_retained_direct_frame() {
         .events
         .backend
         .pstate
-        .scanout_m2
+        .direct
+        .root()
         .unflip_fallback_source
         == Some(f1_source);
     Backend::note_present_pixmap(
@@ -931,7 +947,8 @@ fn handoff_keeps_newest_copy_not_retained_direct_frame() {
         .events
         .backend
         .pstate
-        .scanout_m2
+        .direct
+        .root()
         .unflip_shadow_ready;
     if !fallback_source_is_f1 || !fallback_copy_ready {
         fixture
@@ -939,7 +956,8 @@ fn handoff_keeps_newest_copy_not_retained_direct_frame() {
             .events
             .backend
             .pstate
-            .scanout_m2
+            .direct
+            .root_mut()
             .unflip_fallback_source = Some(f1_source);
         fixture
             .scene
@@ -1019,7 +1037,8 @@ fn handoff_keeps_newest_copy_not_retained_direct_frame() {
         .events
         .backend
         .pstate
-        .scanout_m2
+        .direct
+        .root()
         .current
         .is_none();
 
@@ -1032,7 +1051,8 @@ fn handoff_keeps_newest_copy_not_retained_direct_frame() {
         .events
         .backend
         .pstate
-        .scanout_m2
+        .direct
+        .root()
         .current
         .is_none();
     fixture.scene.events.wait_for_submitted_gpu_work();
@@ -1047,7 +1067,8 @@ fn handoff_keeps_newest_copy_not_retained_direct_frame() {
         .events
         .backend
         .pstate
-        .scanout_m2
+        .direct
+        .root()
         .unflip_requested;
     finish_atomic_fixture(fixture, &mut delivered);
     assert!(
