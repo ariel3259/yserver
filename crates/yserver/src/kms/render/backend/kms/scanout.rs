@@ -829,6 +829,9 @@ impl KmsBackend {
             if succeeded && !self.sync_direct_cursor_scene_state(&output_indices) {
                 succeeded = false;
             }
+            if !succeeded {
+                self.request_direct_unflip_for(scope, "direct_cursor_refresh_failed");
+            }
             if let Some(owner) = self.pstate.direct.get_mut(scope) {
                 owner.cursor_bound_all = succeeded && output_indices.len() == scope_outputs.len();
             }
@@ -985,12 +988,10 @@ impl KmsBackend {
         {
             return;
         }
-        if self.pstate.tearing.is_on() {
-            for output_idx in self.direct_scope_outputs(scope) {
-                self.platform.clear_direct_cursor_retry(output_idx);
-            }
+        if self.tearing_scope_outputs().contains(&output_idx) {
+            self.platform.clear_direct_cursor_retry(output_idx);
             if let Some(owner) = self.pstate.direct.get_mut(scope) {
-                owner.clear_all_direct_cursor_refresh_pending();
+                owner.clear_direct_cursor_refresh_pending(output_idx);
             }
             return;
         }
