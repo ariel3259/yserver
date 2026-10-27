@@ -1,12 +1,17 @@
 use std::{
     cell::RefCell,
     collections::HashMap,
-    fs, io,
+    fs::{self, OpenOptions},
+    io::{self, Read},
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
 
 use regex::Regex;
 use serde_json::Value;
+
+const MAX_LIST_FILE_SIZE: u64 = 1_048_576;
+const MAX_USER_HOME_CACHE_ENTRIES: usize = 64; // Client HOME values must not grow this cache without bound.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VrrExclusionSource {
@@ -57,6 +62,7 @@ struct MesaDriconfEntry {
 enum MesaApplicationMatcher {
     Executable(String),
     ExecutableRegexp(Regex),
+    ExecutableAndRegexp(String, Regex),
     Global,
     Never,
 }
@@ -66,6 +72,9 @@ impl MesaApplicationMatcher {
         match self {
             Self::Executable(executable) => executable == process_name,
             Self::ExecutableRegexp(regex) => regex.is_match(process_name),
+            Self::ExecutableAndRegexp(executable, regex) => {
+                executable == process_name && regex.is_match(process_name)
+            }
             Self::Global => true,
             Self::Never => false,
         }
@@ -160,9 +169,11 @@ impl VrrExclusions {
             && !self.user_lists.borrow().contains_key(home)
         {
             let lists = self.load_user_lists(home);
-            self.user_lists
-                .borrow_mut()
-                .insert(home.to_path_buf(), lists);
+            let mut user_lists = self.user_lists.borrow_mut();
+            if user_lists.len() >= MAX_USER_HOME_CACHE_ENTRIES {
+                user_lists.clear();
+            }
+            user_lists.insert(home.to_path_buf(), lists);
         }
         let user_lists = self.user_lists.borrow();
         let selected_user_lists = home.and_then(|home| user_lists.get(home));
@@ -231,9 +242,55 @@ fn files_named(directory: &Path, matches: impl Fn(&str) -> bool) -> Vec<PathBuf>
 }
 
 fn read_optional(path: &Path, description: &str) -> Option<String> {
-    match fs::read_to_string(path) {
-        Ok(contents) => Some(contents),
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => Some(file),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => {
+            log::warn!("kms: cannot read {description} {}: {error}", path.display());
+            None
+        }
+    }?;
+
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            log::warn!("kms: cannot read {description} {}: {error}", path.display());
+            return None;
+        }
+    };
+    if !metadata.is_file() {
+        log::warn!("kms: skipping non-regular {description} {}", path.display());
+        return None;
+    }
+    if metadata.len() > MAX_LIST_FILE_SIZE {
+        log::warn!(
+            "kms: skipping oversized {description} {} ({} bytes; limit is {MAX_LIST_FILE_SIZE})",
+            path.display(),
+            metadata.len()
+        );
+        return None;
+    }
+    let mut bytes = Vec::new();
+    if let Err(error) = file.take(MAX_LIST_FILE_SIZE + 1).read_to_end(&mut bytes) {
+        if error.kind() != io::ErrorKind::NotFound {
+            log::warn!("kms: cannot read {description} {}: {error}", path.display());
+        }
+        return None;
+    }
+    if bytes.len() as u64 > MAX_LIST_FILE_SIZE {
+        log::warn!(
+            "kms: skipping oversized {description} {} (grew beyond {MAX_LIST_FILE_SIZE} bytes while reading)",
+            path.display()
+        );
+        return None;
+    }
+    match String::from_utf8(bytes) {
+        Ok(contents) => Some(contents),
         Err(error) => {
             log::warn!("kms: cannot read {description} {}: {error}", path.display());
             None
@@ -473,14 +530,16 @@ fn parse_driconf(contents: &str) -> Option<Vec<MesaDriconfEntry>> {
         .descendants()
         .filter(|node| node.is_element() && node.tag_name().name() == "application")
     {
-        // Mesa scopes these entries by the client's graphics driver. yserver
-        // cannot identify that driver, so it ignores device attributes; the
-        // conservative union moves uncertainty to fixed refresh.
-        let mut matcher = if let Some(executable) = application.attribute("executable") {
-            MesaApplicationMatcher::Executable(executable.to_owned())
-        } else if let Some(pattern) = application.attribute("executable_regexp") {
+        // Mesa checks executable first, then only the first present secondary matcher.
+        let executable = application.attribute("executable");
+        let mut matcher = if let Some(pattern) = application.attribute("executable_regexp") {
             match Regex::new(pattern) {
-                Ok(regex) => MesaApplicationMatcher::ExecutableRegexp(regex),
+                Ok(regex) => match executable {
+                    Some(executable) => {
+                        MesaApplicationMatcher::ExecutableAndRegexp(executable.to_owned(), regex)
+                    }
+                    None => MesaApplicationMatcher::ExecutableRegexp(regex),
+                },
                 Err(error) => {
                     log::warn!("kms: invalid Mesa executable_regexp {pattern:?}: {error}");
                     MesaApplicationMatcher::Never
@@ -490,6 +549,8 @@ fn parse_driconf(contents: &str) -> Option<Vec<MesaDriconfEntry>> {
             || application.attribute("application_name_match").is_some()
         {
             MesaApplicationMatcher::Never
+        } else if let Some(executable) = executable {
+            MesaApplicationMatcher::Executable(executable.to_owned())
         } else {
             MesaApplicationMatcher::Global
         };
@@ -498,6 +559,11 @@ fn parse_driconf(contents: &str) -> Option<Vec<MesaDriconfEntry>> {
         if application.attribute("application_versions").is_some() {
             matcher = MesaApplicationMatcher::Never;
         }
+        let has_unknown_device_scope = application.ancestors().any(|ancestor| {
+            ancestor.is_element()
+                && ancestor.tag_name().name() == "device"
+                && ancestor.attributes().next().is_some()
+        });
         for option in application
             .descendants()
             .filter(|node| node.is_element() && node.tag_name().name() == "option")
@@ -505,6 +571,10 @@ fn parse_driconf(contents: &str) -> Option<Vec<MesaDriconfEntry>> {
             if option.attribute("name") == Some("adaptive_sync")
                 && let Some(value) = option.attribute("value").and_then(parse_bool)
             {
+                if value && has_unknown_device_scope {
+                    // An unknown scoped allow cannot lift an exclusion; fallback stays on fixed refresh.
+                    continue;
+                }
                 entries.push(MesaDriconfEntry {
                     matcher: matcher.clone(),
                     allowed: value,
@@ -593,9 +663,27 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::{
-        VrrExclusionSource, VrrExclusions,
+        VrrExclusionSource, VrrExclusions, VrrListRoots,
         test_support::{TempTree, process, roots, write},
     };
+
+    struct FifoTestLogger;
+
+    impl log::Log for FifoTestLogger {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.level() <= log::Level::Warn
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if self.enabled(record.metadata()) {
+                eprintln!("{}", record.args());
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    static FIFO_TEST_LOGGER: FifoTestLogger = FifoTestLogger;
 
     #[test]
     // Mutation: read user files from a fixed server-side root instead of the client's HOME.
@@ -1354,6 +1442,288 @@ mod tests {
         assert_eq!(
             VrrExclusions::load(&roots).excluded(21, &proc_root),
             Some(VrrExclusionSource::MesaDriconf)
+        );
+    }
+
+    #[test]
+    // Mutation: let a matching executable bypass Mesa's executable_regexp condition.
+    fn review_vrr_executable_match_does_not_bypass_regexp() {
+        let tree = TempTree::new();
+        let roots = roots(&tree);
+        let proc_root = tree.path().join("proc");
+        write(
+            &roots.mesa_etc_file,
+            r#"<driconf><device>
+                <application executable="game"><option name="adaptive_sync" value="false"/></application>
+                <application executable="game" executable_regexp="^other$"><option name="adaptive_sync" value="true"/></application>
+            </device></driconf>"#,
+        );
+        process(&proc_root, 202, "/usr/bin/game", "game", &[], None);
+        assert_eq!(
+            VrrExclusions::load(&roots).excluded(202, &proc_root),
+            Some(VrrExclusionSource::MesaDriconf),
+            "matching executable does not bypass Mesa's executable_regexp condition"
+        );
+    }
+
+    #[test]
+    // Mutation: allow a driver-scoped Mesa true entry to cancel a global exclusion.
+    fn review_vrr_unknown_driver_allow_must_not_lift_global_exclusion() {
+        let tree = TempTree::new();
+        let roots = roots(&tree);
+        let proc_root = tree.path().join("proc");
+        write(
+            &roots.mesa_etc_file,
+            r#"<driconf>
+                <device><application executable="game"><option name="adaptive_sync" value="false"/></application></device>
+                <device driver="radeonsi"><application executable="game"><option name="adaptive_sync" value="true"/></application></device>
+            </driconf>"#,
+        );
+        process(&proc_root, 201, "/usr/bin/game", "game", &[], None);
+        assert_eq!(
+            VrrExclusions::load(&roots).excluded(201, &proc_root),
+            Some(VrrExclusionSource::MesaDriconf),
+            "an allow for an unidentified driver must not cancel a general exclusion"
+        );
+    }
+
+    #[test]
+    // Mutations: use executable alone; evaluate every present matcher instead of Mesa's first one.
+    fn vrr_exclusions_mesa_matcher_chain_like_mesa() {
+        let tree = TempTree::new();
+        let roots = roots(&tree);
+        let proc_root = tree.path().join("proc");
+        process(&proc_root, 203, "/usr/bin/game", "game", &[], None);
+        let path = roots.mesa_etc_file.clone();
+        let cases = [
+            (
+                r#"<application executable="game" blake3="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"><option name="adaptive_sync" value="false"/></application>"#,
+                None,
+                "unavailable blake3 after executable does not apply",
+            ),
+            (
+                r#"<application executable="game" application_name_match="x"><option name="adaptive_sync" value="false"/></application>"#,
+                None,
+                "unavailable application_name_match after executable does not apply",
+            ),
+            (
+                r#"<application executable="game" application_versions="1:2"><option name="adaptive_sync" value="false"/></application>"#,
+                None,
+                "unavailable application_versions independently prevents applying the entry",
+            ),
+            (
+                r#"<application executable="other" executable_regexp="ga"><option name="adaptive_sync" value="false"/></application>"#,
+                None,
+                "executable mismatch prevents the regexp from applying",
+            ),
+            (
+                r#"<application executable_regexp="ga" blake3="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"><option name="adaptive_sync" value="false"/></application>"#,
+                Some(VrrExclusionSource::MesaDriconf),
+                "regexp is evaluated and blake3 is ignored when both are present",
+            ),
+        ];
+        for (application, expected, message) in cases {
+            let contents = format!("<driconf><device>{application}</device></driconf>");
+            write(&path, &contents);
+            assert_eq!(
+                VrrExclusions::load(&roots).excluded(203, &proc_root),
+                expected,
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    // Mutation: drop every true adaptive_sync entry inside a device element.
+    fn vrr_exclusions_mesa_generic_allow_still_lifts() {
+        let tree = TempTree::new();
+        let roots = roots(&tree);
+        let proc_root = tree.path().join("proc");
+        process(&proc_root, 204, "/usr/bin/game", "game", &[], None);
+        write(
+            &roots.mesa_etc_file,
+            r#"<driconf>
+                <device><application executable="game"><option name="adaptive_sync" value="false"/></application></device>
+                <device><application executable="game"><option name="adaptive_sync" value="true"/></application></device>
+            </driconf>"#,
+        );
+        assert_eq!(
+            VrrExclusions::load(&roots).excluded(204, &proc_root),
+            None,
+            "a later generic-device allow lifts the general exclusion"
+        );
+
+        write(
+            &roots.mesa_etc_file,
+            r#"<driconf><device driver="radeonsi"><application executable="game"><option name="adaptive_sync" value="false"/></application></device></driconf>"#,
+        );
+        assert_eq!(
+            VrrExclusions::load(&roots).excluded(204, &proc_root),
+            Some(VrrExclusionSource::MesaDriconf),
+            "an unknown driver scope remains an exclusion"
+        );
+    }
+
+    #[test]
+    // Mutation: remove O_NONBLOCK so opening a client-controlled FIFO blocks the evaluation thread.
+    fn vrr_exclusions_list_file_fifo_is_skipped() {
+        use std::{
+            ffi::CString, os::unix::ffi::OsStrExt, process::Command, sync::mpsc, time::Duration,
+        };
+
+        let args: Vec<_> = std::env::args().collect();
+        if let Some(index) = args
+            .iter()
+            .position(|argument| argument == "--fifo-log-child")
+        {
+            let tree = std::path::PathBuf::from(&args[index + 1]);
+            log::set_logger(&FIFO_TEST_LOGGER).expect("install isolated FIFO test logger");
+            log::set_max_level(log::LevelFilter::Warn);
+            let roots = VrrListRoots {
+                nvidia_driver_dir: tree.join("usr/share/nvidia"),
+                nvidia_etc_dir: tree.join("etc/nvidia"),
+                mesa_system_dir: tree.join("usr/share/drirc.d"),
+                mesa_etc_file: tree.join("etc/drirc"),
+            };
+            assert_eq!(
+                VrrExclusions::load(&roots).excluded(205, &tree.join("proc")),
+                None,
+                "a FIFO contributes no user exclusion"
+            );
+            return;
+        }
+
+        let tree = TempTree::new();
+        let roots = roots(&tree);
+        let home = tree.path().join("home/game");
+        std::fs::create_dir_all(&home).expect("create client HOME");
+        let fifo = CString::new(home.join(".drirc").as_os_str().as_bytes())
+            .expect("FIFO path contains no NUL");
+        // SAFETY: mkfifo only reads the nul-terminated path and creates this fixture FIFO.
+        let result = unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) };
+        assert_eq!(result, 0, "create client-controlled drirc FIFO");
+
+        write(
+            &roots.mesa_etc_file,
+            r#"<driconf><device><application executable="system-app"><option name="adaptive_sync" value="false"/></application></device></driconf>"#,
+        );
+        let proc_root = tree.path().join("proc");
+        process(&proc_root, 205, "/usr/bin/game", "game", &[], Some(&home));
+        process(
+            &proc_root,
+            206,
+            "/usr/bin/system-app",
+            "system-app",
+            &[],
+            None,
+        );
+
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let exclusions = VrrExclusions::load(&roots);
+            let result = (
+                exclusions.excluded(205, &proc_root),
+                exclusions.excluded(206, &proc_root),
+            );
+            let _ = sender.send(result);
+        });
+        let (home_result, system_result) = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("opening and skipping the HOME FIFO must complete promptly");
+        assert_eq!(
+            home_result, None,
+            "FIFO contents do not add a user exclusion"
+        );
+        assert_eq!(
+            system_result,
+            Some(VrrExclusionSource::MesaDriconf),
+            "a skipped user FIFO does not prevent system list entries from applying"
+        );
+
+        let output = Command::new(std::env::current_exe().expect("current test binary path"))
+            .args([
+                "--exact",
+                "vrr_exclusions::tests::vrr_exclusions_list_file_fifo_is_skipped",
+                "--nocapture",
+                "--",
+                "--fifo-log-child",
+            ])
+            .arg(tree.path())
+            .output()
+            .expect("run the isolated FIFO warning check");
+        let output_text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success(),
+            "isolated FIFO warning check failed: {output_text}"
+        );
+        assert!(
+            output_text.contains("kms: skipping non-regular Mesa driconf"),
+            "the FIFO is skipped by the regular-file check: {output_text}"
+        );
+    }
+
+    #[test]
+    // Mutation: remove the 1 MiB list-file size cap.
+    fn vrr_exclusions_list_file_over_cap_is_skipped() {
+        let tree = TempTree::new();
+        let roots = roots(&tree);
+        let home = tree.path().join("home/game");
+        let proc_root = tree.path().join("proc");
+        process(&proc_root, 207, "/usr/bin/game", "game", &[], Some(&home));
+        let prefix = r#"<driconf><device><application executable="game"><option name="adaptive_sync" value="false"/></application><!--"#;
+        let suffix = "--></device></driconf>";
+        let cap = 1_048_576usize;
+        for (size, expected, message) in [
+            (cap + 1, None, "a user file one byte over 1 MiB is skipped"),
+            (
+                cap - 1,
+                Some(VrrExclusionSource::MesaDriconf),
+                "a valid user file just under 1 MiB is applied",
+            ),
+        ] {
+            let comment_len = size - prefix.len() - suffix.len();
+            let contents = format!("{prefix}{}{suffix}", "x".repeat(comment_len));
+            assert_eq!(contents.len(), size, "fixture has the requested byte size");
+            write(home.join(".drirc"), &contents);
+            assert_eq!(
+                VrrExclusions::load(&roots).excluded(207, &proc_root),
+                expected,
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    // Mutation: remove the per-HOME cache bound.
+    fn vrr_exclusions_home_cache_is_bounded() {
+        let tree = TempTree::new();
+        let roots = roots(&tree);
+        let proc_root = tree.path().join("proc");
+        let exclusions = VrrExclusions::load(&roots);
+        for index in 0..65 {
+            let home = tree.path().join(format!("home/{index}"));
+            let pid = 300 + index;
+            process(
+                &proc_root,
+                pid,
+                "/usr/bin/unlisted",
+                "unlisted",
+                &[],
+                Some(&home),
+            );
+            assert_eq!(
+                exclusions.excluded(pid, &proc_root),
+                None,
+                "an unlisted client remains eligible while populating the HOME cache"
+            );
+        }
+        assert!(
+            exclusions.user_lists.borrow().len() <= 64,
+            "the cache remains bounded after the 65th distinct HOME"
         );
     }
 }
