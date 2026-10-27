@@ -652,6 +652,7 @@ impl KmsBackend {
             dri3_syncobjs: HashMap::new(),
             syncobj_eventfd_supported: None,
             dmabuf_sync_file_warned: Cell::new(false),
+            present_poll_register_warned: false,
             pending_present_source_waits: HashMap::new(),
             next_present_source_wait_id: 1,
             // Test fixtures always run in Direct mode.

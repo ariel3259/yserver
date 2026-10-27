@@ -907,6 +907,11 @@ pub struct KmsBackendState {
     /// `&self` borrow of `self.store`; the backend remains on the core thread.
     pub(in crate::kms::render::backend) dmabuf_sync_file_warned: Cell<bool>,
 
+    /// The completion poller refused a batch's sync_file: OpenBSD's kqueue
+    /// rejects it with EINVAL on every Present. The batch drains immediately
+    /// either way; this only keeps the warning to the first refusal.
+    pub(in crate::kms::render::backend) present_poll_register_warned: bool,
+
     /// Imported Present sources parked on their producer sync-file. The exact
     /// source `DrawableId` is incref'd while an entry lives here.
     pub(crate) pending_present_source_waits:

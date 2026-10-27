@@ -303,10 +303,17 @@ impl KmsBackend {
         {
             Ok(()) => wait,
             Err(e) => {
-                log::warn!(
-                    "deferred PRESENT: poll ADD sync_file fd failed: {e}; \
-                     using immediate drain fallback"
-                );
+                if std::mem::replace(&mut self.pstate.present_poll_register_warned, true) {
+                    log::debug!(
+                        "deferred PRESENT: poll ADD sync_file fd failed: {e}; \
+                         using immediate drain fallback"
+                    );
+                } else {
+                    log::warn!(
+                        "deferred PRESENT: poll ADD sync_file fd failed: {e}; \
+                         using immediate drain fallback (further failures log at debug)"
+                    );
+                }
                 PresentBatchWait::Ready
             }
         }
