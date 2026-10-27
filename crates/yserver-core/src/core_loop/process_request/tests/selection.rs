@@ -1211,3 +1211,137 @@ fn set_selection_owner_skips_subscribers_whose_mask_excludes_set_owner() {
         all,
     );
 }
+
+// ── tools/selection-record-probe.c: `a` owns window A, `b` owns window B ──
+
+const REC_A: u32 = 40;
+const REC_B: u32 = 41;
+const REC_WIN_A: u32 = 0x0040_0001;
+const REC_WIN_B: u32 = 0x0041_0001;
+const REC_SELECTION: &str = "SELECTION_RECORD_PROBE";
+
+/// Clients `a` and `b`, each with its window, and the probe's selection
+/// atom. The clock is ten seconds in, so `now - 10` is a valid timestamp.
+fn selection_record_fixture() -> (ServerState, UnixStream, UnixStream, AtomId, u32) {
+    let mut state = ServerState::new();
+    state.start_instant -= std::time::Duration::from_secs(10);
+    let a = install_client(&mut state, REC_A);
+    let b = install_client(&mut state, REC_B);
+    for (client, window) in [(REC_A, REC_WIN_A), (REC_B, REC_WIN_B)] {
+        state.resources.create_window(
+            ClientId(client),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(window),
+                parent: crate::resources::ROOT_WINDOW,
+                width: 10,
+                height: 10,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+    }
+    let selection = state.atoms.intern(REC_SELECTION, false);
+    let now = state.timestamp_now();
+    (state, a, b, selection, now)
+}
+
+fn record_set_owner(
+    state: &mut ServerState,
+    client: u32,
+    window: u32,
+    selection: AtomId,
+    time: u32,
+) {
+    let mut body = Vec::with_capacity(12);
+    for word in [window, selection.0, time] {
+        body.extend_from_slice(&word.to_le_bytes());
+    }
+    handle_set_selection_owner(state, ClientId(client), SequenceNumber(1), &body)
+        .expect("handle_set_selection_owner");
+}
+
+/// GetSelectionOwner as `b` issues it.
+fn record_owner(state: &mut ServerState, b: &mut UnixStream, selection: AtomId) -> u32 {
+    let _ = read_all_or_buffered(state, REC_B, b);
+    crate::core_loop::process_request::selection::handle_get_selection_owner(
+        state,
+        ClientId(REC_B),
+        SequenceNumber(2),
+        &selection.0.to_le_bytes(),
+    )
+    .expect("handle_get_selection_owner");
+    let reply = read_all_or_buffered(state, REC_B, b);
+    assert_eq!(reply.len(), 32, "one GetSelectionOwner reply");
+    u32::from_le_bytes([reply[8], reply[9], reply[10], reply[11]])
+}
+
+/// `(type, requestor, property)` of every core event a client received.
+fn record_events(
+    state: &mut ServerState,
+    client: u32,
+    peer: &mut UnixStream,
+) -> Vec<(u8, u32, u32)> {
+    read_all_or_buffered(state, client, peer)
+        .chunks_exact(32)
+        .map(|e| {
+            let word = |i: usize| u32::from_le_bytes([e[i], e[i + 1], e[i + 2], e[i + 3]]);
+            (e[0] & 0x7f, word(8), word(20))
+        })
+        .collect()
+}
+
+fn record_convert(state: &mut ServerState, client: u32, requestor: u32, selection: AtomId) {
+    let mut body = Vec::with_capacity(20);
+    for word in [requestor, selection.0, 31, 31, 0] {
+        body.extend_from_slice(&word.to_le_bytes());
+    }
+    crate::core_loop::process_request::selection::handle_convert_selection(
+        state,
+        ClientId(client),
+        SequenceNumber(3),
+        &body,
+    )
+    .expect("handle_convert_selection");
+}
+
+/// `tools/selection-record-probe convert`, measured on Xephyr:
+///
+/// ```text
+/// b ConvertSelection requestor=A (never owned)
+///   b: SelectionNotify(requestor=A property=0)
+/// a SetSelectionOwner A, then None
+///   a: SelectionClear(owner=A)
+/// selection owner: None
+/// b ConvertSelection requestor=A (released)
+///   b: SelectionNotify(requestor=A property=0)
+/// ```
+///
+/// With no owner, `ProcConvertSelection` writes the SelectionNotify to the
+/// client that issued the request (`dix/selection.c:304-311`), not to the
+/// creator of the requestor window.
+#[test]
+fn convert_selection_without_an_owner_notifies_the_requesting_client() {
+    let (mut state, mut a, mut b, selection, now) = selection_record_fixture();
+    const SELECTION_NOTIFY: u8 = 31;
+
+    record_convert(&mut state, REC_B, REC_WIN_A, selection);
+    assert!(record_events(&mut state, REC_A, &mut a).is_empty());
+    assert_eq!(
+        record_events(&mut state, REC_B, &mut b),
+        [(SELECTION_NOTIFY, REC_WIN_A, 0)]
+    );
+
+    record_set_owner(&mut state, REC_A, REC_WIN_A, selection, now);
+    record_set_owner(&mut state, REC_A, 0, selection, now);
+    let _ = record_events(&mut state, REC_A, &mut a);
+    assert_eq!(record_owner(&mut state, &mut b, selection), 0);
+
+    record_convert(&mut state, REC_B, REC_WIN_A, selection);
+    assert!(record_events(&mut state, REC_A, &mut a).is_empty());
+    assert_eq!(
+        record_events(&mut state, REC_B, &mut b),
+        [(SELECTION_NOTIFY, REC_WIN_A, 0)]
+    );
+}

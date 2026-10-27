@@ -325,12 +325,10 @@ pub(super) fn handle_convert_selection(
             client_id.0, sequence.0, owner_window.0
         );
     } else {
-        // No owner — send SelectionNotify(None) to the requestor.
-        let requestor_id = state
-            .resources
-            .window_owner(requestor)
-            .and_then(|cid| client_target_id(state, cid));
-        if let Some(rt) = requestor_id {
+        // No owner, or its setter is gone (`dix/selection.c:297-301`):
+        // SelectionNotify(None) to the client that issued ConvertSelection
+        // (`dix/selection.c:304-311`), whoever created the requestor window.
+        if let Some(rt) = client_target_id(state, client_id) {
             let mut template = [0u8; 32];
             template[0] = 31; // SelectionNotify
             template[4..8].copy_from_slice(&time_val.to_le_bytes());
