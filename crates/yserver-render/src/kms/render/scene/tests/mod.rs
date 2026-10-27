@@ -1026,7 +1026,7 @@ impl TestCore {
             windows,
             outputs,
             fb_size: (800, 600),
-            hw_cursor_suppressed: false,
+            hw_cursor_suppressed: &[],
         }
     }
 }

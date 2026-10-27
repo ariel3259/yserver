@@ -421,7 +421,7 @@ fn p2_motion_inside_one_output_does_not_set_membership_dirty() {
             .events
             .backend
             .platform
-            .cursor_crtc_membership_dirty(137, 116, 0, 0, 8, 8),
+            .cursor_crtc_membership_dirty(137, 116, 0, 0, 8, 8, &[]),
         "an already-bound CRTC remains a member while the cursor stays inside it",
     );
     assert!(

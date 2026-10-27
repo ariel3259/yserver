@@ -106,7 +106,7 @@ fn transparent_cursor_is_hidden_for_direct_scanout_and_define_cursor_handoff() {
     Backend::define_cursor(&mut backend, None, root, opaque.as_raw())
         .expect("define one-pixel cursor");
     assert!(!backend.effective_cursor_hidden());
-    assert!(backend.tearing_cursor_wants_visible());
+    assert!(backend.tearing_cursor_wants_visible_for_outputs(&[0]));
     assert!(backend.pstate.direct.root().unflip_requested);
     assert_eq!(
         backend.pstate.direct.root().unflip_reason,

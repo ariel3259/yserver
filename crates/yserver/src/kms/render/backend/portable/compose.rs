@@ -108,12 +108,13 @@ impl<P: Platform> XBackend<P> {
         if can_submit_scene {
             let cow_host_xid = self.cow_host_xid();
             let outputs = self.platform.output_layouts();
+            let hw_cursor_suppressed = P::tearing_cursor_suppression_mask(self, outputs.len());
             let input = crate::kms::render::backend::scene_input(
                 &self.core,
                 &self.windows,
                 &outputs,
                 self.platform.fb_size(),
-                P::tearing_active(self),
+                &hw_cursor_suppressed,
             );
             match self.scene.tick(
                 &input,
