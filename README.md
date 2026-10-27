@@ -25,6 +25,38 @@ See [`docs/extensions.txt`](docs/extensions.txt) for a list of all supported/imp
 
 ### Recent work
 
+- macOS: yserver runs in a window on Apple Silicon (Mesa KosmicKrisp), with a
+  Dock icon and a Settings window; rootless mode gives every X window its own
+  Mac window
+- OpenBSD support
+- variable refresh rate on the monitor a fullscreen client is scanned out to
+  (`--vrr`) (@ariel3259)
+- `--vrr all`: VRR for NVIDIA clients too, honouring the NVIDIA and Mesa
+  application lists (@ariel3259)
+- tearing on demand: fullscreen clients that ask for async flips get uncapped
+  direct scanout (@ariel3259)
+- hardware cursor on atomic KMS: a cursor plane per CRTC, and cursor changes no
+  longer drop direct scanout (@ariel3259)
+- gamma through atomic GAMMA_LUT (@ariel3259)
+- multi-monitor: direct scanout across monitors whose refresh rates differ
+  slightly; switching off or unplugging one monitor no longer blanks the others;
+  `xrandr` changes to one output leave the others alone
+- compositors: redirected windows keep their own and their subwindows' borders
+  (@SetZero), and draw at the right offset when resized; no more blank windows
+  after a workspace switch under picom; no more smudged decorations when
+  resizing under fvwm + xcompmgr
+- less CPU in the core loop: a client's socket is only polled for writing while
+  output is waiting (@SetZero)
+- XKB modifier locks apply and survive `setxkbmap` (@petrovo-as)
+- RENDER text no longer loses glyphs after a long session
+- no more crash when a window tree is destroyed while windows in it are still
+  in use (#297); window teardown follows Xorg's order for grabs, focus,
+  selections and Present
+- clipboard and selection events go to the client that set the owner, as on
+  Xorg, and a second window manager is refused instead of fighting the first
+
+### Previously
+
 - CDE (the Common Desktop Environment) runs: dtsession, dtwm with its panel,
   dtterm, dtfile, dtpad, and the Motif/Xaw apps around it
 - old-style toolkits (Motif, Xaw, Tk, xterm) draw like on Xorg: lines, text and
@@ -50,8 +82,6 @@ See [`docs/extensions.txt`](docs/extensions.txt) for a list of all supported/imp
 - xmodmap and xkbcomp changes reach XKB clients; XI2 raw key events
 - a regression suite that runs the real server in a VM and compares it with Xorg,
   in CI
-
-### Previously
 
 - XDMCP session negotiation with a display manager, and a TCP listener —
   both optional Cargo build features, off by default; see
@@ -221,6 +251,9 @@ the lowest free display from `:1`, shows it in the window title
 `--scale` sets how many screen pixels one X pixel covers: `auto` (the
 default; one X pixel per point, 2 on a Retina screen), `1` (full
 resolution) or `2`.
+
+`just macos-rootless` runs it rootless instead: no desktop window, and every
+X top-level window becomes its own Mac window.
 
 Text copied in X clients (CLIPBOARD) can be pasted in Mac apps, and the other
 way round. PRIMARY (select / middle-click) stays within X.

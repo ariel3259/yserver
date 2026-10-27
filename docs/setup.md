@@ -262,7 +262,10 @@ starty bspwm -- --vrr  # pass --vrr to yserver with bspwm
 Server arguments go after `--`; arguments before it remain the client and its
 arguments. `--vrr` is off by default. It enables VRR for windows that set
 `_VARIABLE_REFRESH`, on outputs whose monitor reports VRR support. NVIDIA
-proprietary clients do not set `_VARIABLE_REFRESH`.
+proprietary clients do not set `_VARIABLE_REFRESH`; on NVIDIA (`nvidia-drm`),
+`--vrr all` enables VRR for every directly scanned-out client window instead,
+except applications that the NVIDIA or Mesa application lists, or the
+client's environment, exclude.
 
 It picks the lowest free display, mints a per-session
 MIT-MAGIC-COOKIE-1 (a server copy plus an entry in `~/.Xauthority`),

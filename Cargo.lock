@@ -1400,7 +1400,7 @@ dependencies = [
 
 [[package]]
 name = "yserver"
-version = "1.7.1"
+version = "1.8.0"
 dependencies = [
  "ash",
  "block2",
@@ -1435,7 +1435,7 @@ dependencies = [
 
 [[package]]
 name = "yserver-core"
-version = "1.7.1"
+version = "1.8.0"
 dependencies = [
  "crossbeam-channel",
  "libc",
@@ -1447,14 +1447,14 @@ dependencies = [
 
 [[package]]
 name = "yserver-protocol"
-version = "1.7.1"
+version = "1.8.0"
 dependencies = [
  "proptest",
 ]
 
 [[package]]
 name = "yserver-render"
-version = "1.7.1"
+version = "1.8.0"
 dependencies = [
  "ash",
  "libc",

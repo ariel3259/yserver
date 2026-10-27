@@ -14,10 +14,11 @@ run when the recipes disagree with `Cargo.toml`.
 
 In this repo:
 
-- `Cargo.toml:10` — the **only** version reference in the tree (verify with
+- `Cargo.toml:11` — the **only** version reference in the tree (verify with
   `grep -rn '<old version>' --include='*.toml' --include='*.rs' .`).
-- `Cargo.lock` — run `cargo check` and commit the result; the three
-  workspace crates (`yserver`, `yserver-core`, `yserver-protocol`) follow.
+- `Cargo.lock` — run `cargo check` and commit the result; the four
+  workspace crates (`yserver`, `yserver-core`, `yserver-protocol`,
+  `yserver-render`) follow.
 
 In `yserver-packaging`, all three recipes, which `build.yml` requires to equal
 `Cargo.toml` exactly:
