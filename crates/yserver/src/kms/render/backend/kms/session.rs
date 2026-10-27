@@ -417,12 +417,16 @@ impl KmsBackend {
             self.platform.fb_dimensions(),
             self.pstate.tearing.is_on(),
         );
+        let skip_outputs: Vec<_> = (0..self.platform.outputs.len())
+            .map(|output_idx| self.output_is_direct(output_idx))
+            .collect();
         let vrr_before = self.vrr_committed_snapshot();
         let result = self.scene.tick(
             &input,
             &mut self.store,
             &mut self.platform,
             &mut self.telemetry,
+            &skip_outputs,
             cow_host_xid,
         );
         self.log_vrr_committed_changes(&vrr_before, None, "inherited");

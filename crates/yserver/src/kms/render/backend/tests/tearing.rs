@@ -2708,6 +2708,69 @@ fn live_scene_backend_with_outputs(output_count: usize) -> Option<KmsBackend> {
         .unwrap_or_else(|error| panic!("recording scene fixture unavailable: {error}"))
 }
 
+fn seed_held_output_owner(backend: &mut KmsBackend, output_idx: usize, target_xid: u32) {
+    let fallback_id = super::seed_window(backend, target_xid, None, 0, 0);
+    install_direct_frame_for_target_test(backend, target_xid, fallback_id, true);
+    let owner = backend.pstate.direct.root_mut();
+    let frame = owner
+        .current
+        .take()
+        .expect("test helper installed current frame");
+    owner.hold_direct = false;
+    let output_owner = &mut backend.pstate.direct.outputs[output_idx];
+    output_owner.current = Some(frame);
+    output_owner.hold_direct = true;
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: restore the root-wide early return while an Output owner is held.
+fn composed_output_flips_while_other_output_owner_held() {
+    use yserver_core::backend::Backend;
+
+    let Some(mut backend) = live_scene_backend_with_outputs(2) else {
+        return;
+    };
+    let recorder = recording_sink(&mut backend, 0);
+    seed_held_output_owner(&mut backend, 1, 0x7480);
+    damage_root(&mut backend);
+    let before = recorder.records().len();
+
+    Backend::maybe_composite(&mut backend).expect("compose the unowned output");
+
+    let records = recorder.records();
+    let scene_crtcs: Vec<_> = records[before..]
+        .iter()
+        .filter(|record| record.kind == AtomicCommitKind::Scene)
+        .flat_map(|record| record.events.iter().map(|event| event.crtc))
+        .collect();
+    assert_eq!(
+        scene_crtcs,
+        [backend.platform.outputs[0].output.crtc],
+        "only output 0 gets a composed flip while output 1 is direct"
+    );
+    assert!(backend.pstate.direct.outputs[1].current.is_some());
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: held-direct wakeup considers cursor work only.
+fn next_wakeup_reflects_composed_output_while_other_is_direct() {
+    use yserver_core::backend::Backend;
+
+    let Some(mut backend) = live_scene_backend_with_outputs(2) else {
+        return;
+    };
+    seed_held_output_owner(&mut backend, 1, 0x7490);
+    damage_root(&mut backend);
+
+    let wakeup = Backend::next_wakeup(&backend);
+    assert!(
+        wakeup.is_some_and(|deadline| deadline <= std::time::Instant::now()),
+        "damage on output 0 must arm an immediate scene wake while output 1 is direct"
+    );
+}
+
 fn live_scene_backend_with_dead_zone() -> Option<KmsBackend> {
     let mut backend = scene_backend_with_recording_pools_and_dead_zone(2, true)
         .unwrap_or_else(|error| panic!("dead-zone scene fixture unavailable: {error}"))?;
