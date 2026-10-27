@@ -5164,6 +5164,7 @@ fn present_to_unviewable_window_skips_copy_and_damage_but_completes() {
 
 #[test]
 // Mutation: restore the CARDINAL type check or exact-one check; INTEGER/1 and CARDINAL/2 must grant permission.
+// Mutation: make the shared peer-PID helper return None on Linux.
 fn present_candidate_reports_variable_refresh_property() {
     use crate::backend::recording::RecordingBackend;
     use yserver_protocol::x11::{CreatePixmapRequest, CreateWindowRequest, present as x11present};
@@ -5283,6 +5284,26 @@ fn present_candidate_reports_variable_refresh_property() {
         state.atoms.id_for(PROPERTY_NAME),
         None,
         "Present does not intern the property atom"
+    );
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        backend
+            .present_direct_candidates
+            .first()
+            .expect("initial Present reaches Backend")
+            .client_pid,
+        Some(std::process::id()),
+        "PresentScanoutCandidate carries the local socket peer PID"
+    );
+    #[cfg(not(target_os = "linux"))]
+    assert_eq!(
+        backend
+            .present_direct_candidates
+            .first()
+            .expect("initial Present reaches Backend")
+            .client_pid,
+        None,
+        "platforms without peer PID support leave the candidate unowned"
     );
     assert!(
         !backend

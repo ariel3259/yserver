@@ -1224,6 +1224,7 @@ fn grouped_direct_waits_all_outputs_and_uses_selected_reference_sample() {
     let fallback_id = crate::kms::render::store::DrawableId::for_tests(91);
     let candidate = PresentScanoutCandidate {
         client_id: 1,
+        client_pid: None,
         present_id: 44,
         crtc_id,
         crtc_epoch,
@@ -1872,6 +1873,7 @@ fn scanout_m1_redirected_game_and_region_present_never_reach_probe_cache() {
     bind_test_randr_crtc(&mut b, 0, crtc_id);
     let candidate = PresentScanoutCandidate {
         client_id: 1,
+        client_pid: None,
         present_id: 1,
         crtc_id,
         crtc_epoch: b.present_crtc_clock_epoch(crtc_id),
@@ -2066,6 +2068,7 @@ fn try_present_root_pixmap_for_shape_test(
         src_pixmap_xid: source_xid,
         dst_window_xid: target_xid,
         variable_refresh: false,
+        client_pid: None,
         src_host_xid: source_xid,
         paint_dst_host_xid: target_xid,
         completion_dst_host_xid: target_xid,
@@ -2571,6 +2574,7 @@ fn scanout_m0_steady_candidate_keeps_one_shape_and_source_record() {
         .expect("source");
     let candidate = PresentScanoutCandidate {
         client_id: 1,
+        client_pid: None,
         present_id: 1,
         crtc_id: 0,
         crtc_epoch: 0,
@@ -2644,6 +2648,7 @@ fn scanout_m0_shape_ignores_region_xid_identity_but_not_presence() {
         .expect("source");
     let base = PresentScanoutCandidate {
         client_id: 1,
+        client_pid: None,
         present_id: 1,
         crtc_id: 0,
         crtc_epoch: 0,
@@ -3072,6 +3077,7 @@ fn prepare_atomic_cursor_direct_present_with_extent(
     let crtc_epoch = backend.present_crtc_clock_epoch(crtc_id);
     let candidate = PresentScanoutCandidate {
         client_id: 1,
+        client_pid: None,
         present_id,
         crtc_id,
         crtc_epoch,
@@ -3754,6 +3760,7 @@ fn eligible_fullscreen_present_records_cursor_positions_for_both_outputs() {
     bind_test_randr_crtc(&mut backend, 0, crtc_id);
     let candidate = PresentScanoutCandidate {
         client_id: 1,
+        client_pid: None,
         present_id: 45,
         crtc_id,
         crtc_epoch: backend.present_crtc_clock_epoch(crtc_id),

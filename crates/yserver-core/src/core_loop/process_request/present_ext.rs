@@ -942,6 +942,10 @@ pub(super) fn execute_present_pixmap_copy(
 
     let candidate = crate::backend::PresentScanoutCandidate {
         client_id: client_id.0,
+        client_pid: state
+            .clients
+            .get(&client_id.0)
+            .and_then(super::misc::client_peer_pid),
         present_id,
         crtc_id,
         crtc_epoch,

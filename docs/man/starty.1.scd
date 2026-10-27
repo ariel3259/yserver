@@ -6,7 +6,7 @@ starty - start yserver on a free display and run a session
 
 # SYNOPSIS
 
-*starty* [_client_ [_client_args_...]]
+*starty* [_client_ [_client_args_...]] [-- _server_args_...]
 
 # DESCRIPTION
 
@@ -16,7 +16,8 @@ server down when the session exits.
 
 With no _client_, it runs _~/.xinitrc_, falling back to
 _/etc/X11/xinit/xinitrc_. With a _client_, it resolves it via *PATH* and
-runs it with the given arguments, no xinitrc needed.
+runs it with the given arguments, no xinitrc needed. Arguments after the
+first *--* are passed to *yserver*(1).
 
 It must be run from a virtual console. *yserver* drives KMS directly and
 needs a real controlling console, so *starty* refuses to run from a
@@ -58,6 +59,12 @@ sockets.
 
 *-h*, *--help*
 	Print usage and exit.
+
+*--* _server_args_...
+	Pass the remaining arguments to *yserver*(1). For example,
+	*starty -- --vrr* runs the default xinitrc with VRR enabled, while
+	*starty bspwm -- --vrr all* starts *bspwm* and requests VRR with
+	application exclusions.
 
 # ENVIRONMENT
 

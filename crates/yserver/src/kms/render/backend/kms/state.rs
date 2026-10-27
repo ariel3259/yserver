@@ -797,6 +797,14 @@ pub type KmsBackend = XBackend<PlatformBackend>;
 pub struct KmsBackendState {
     /// Startup policy used when a client-window direct frame is submitted.
     pub(in crate::kms::render::backend) vrr_mode: crate::launch::VrrMode,
+    /// Application lists loaded only for `--vrr all` on `nvidia-drm`.
+    pub(in crate::kms::render::backend) vrr_exclusions:
+        Option<crate::vrr_exclusions::VrrExclusions>,
+    /// Per-client exclusion decision, retained until `client_disconnected`.
+    pub(in crate::kms::render::backend) vrr_exclusion_cache:
+        RefCell<HashMap<u32, Option<crate::vrr_exclusions::VrrExclusionSource>>>,
+    /// Process root used for exclusion lookup (`/proc` in production).
+    pub(in crate::kms::render::backend) vrr_proc_root: std::path::PathBuf,
     /// M0 direct-scanout telemetry. Purely observational: it never owns a
     /// drawable pin, submits DRM work, or affects Present capabilities.
     pub(in crate::kms::render::backend) scanout_m0: ScanoutM0Telemetry,

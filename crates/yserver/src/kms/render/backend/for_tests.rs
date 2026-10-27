@@ -26,6 +26,22 @@ use crate::kms::render::backend::DirectFrameSubmitter;
 
 impl KmsBackend {
     #[cfg(test)]
+    pub(crate) fn for_tests_configure_vrr_mode(
+        &mut self,
+        requested: crate::launch::VrrMode,
+        driver_name: &str,
+        roots: crate::vrr_exclusions::VrrListRoots,
+        proc_root: std::path::PathBuf,
+    ) {
+        let (mode, exclusions) =
+            super::kms::session::resolve_vrr_startup(requested, Some(driver_name), &roots);
+        self.pstate.vrr_mode = mode;
+        self.pstate.vrr_exclusions = exclusions;
+        self.pstate.vrr_proc_root = proc_root;
+        self.pstate.vrr_exclusion_cache.get_mut().clear();
+    }
+
+    #[cfg(test)]
     pub(crate) fn for_tests_set_monotonic_clock(
         &mut self,
         clock: Rc<dyn Fn() -> std::time::Instant>,
@@ -616,6 +632,9 @@ impl KmsBackend {
     fn for_tests_seed() -> Self {
         let pstate = KmsBackendState {
             vrr_mode: crate::launch::VrrMode::Property,
+            vrr_exclusions: None,
+            vrr_exclusion_cache: std::cell::RefCell::new(HashMap::new()),
+            vrr_proc_root: std::path::PathBuf::from("/proc"),
             scanout_m0: ScanoutM0Telemetry::default(),
             scanout_m1: ScanoutM1ProbeCache::new(),
             scanout_m2: ScanoutM2State::new(),

@@ -13,6 +13,46 @@ use yserver_protocol::{
     x11::{ClientId, RequestHeader, ResourceId, SequenceNumber},
 };
 
+/// Peer PID of a local client's connection. X-Resource reports the same
+/// identity as `LocalClientPID`; Present uses it to apply per-process scanout
+/// policy without adding a cached field to every `ClientState` construction.
+/// FreeBSD's peer-credential API does not expose a PID, so `None` is expected.
+#[cfg(target_os = "linux")]
+pub(super) fn client_peer_pid(client: &crate::server::ClientState) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    if !client.is_local {
+        return None;
+    }
+    let guard = client
+        .writer
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = u32::try_from(std::mem::size_of::<libc::ucred>()).ok()?;
+    // SAFETY: `guard` keeps the socket alive for the call, and `cred`/`len`
+    // are the exact out-param types SO_PEERCRED documents.
+    let rc = unsafe {
+        libc::getsockopt(
+            guard.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            std::ptr::from_mut(&mut cred).cast(),
+            &mut len,
+        )
+    };
+    drop(guard);
+    (rc == 0 && cred.pid > 0).then(|| cred.pid.cast_unsigned())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn client_peer_pid(_client: &crate::server::ClientState) -> Option<u32> {
+    None
+}
+
 /// X-Resource (`Res`) extension. `QueryClients` returns the real list of
 /// connected clients (their XID ranges); `QueryClientResources` returns
 /// real per-type resource counts for a client (the two queries `xrestop`
@@ -28,53 +68,6 @@ pub(super) fn handle_x_resource_request(
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     use yserver_protocol::x11::{ClientByteOrder, x_resource as x11xres};
-
-    /// Peer pid of a client's connection, for X-Resource's LocalClientPID
-    /// identity. Read from the live socket rather than cached at accept: the
-    /// credentials are fixed for the socket's lifetime, and `ClientState` is
-    /// built at 46 sites (mostly tests), so a lazy read avoids threading a
-    /// field through all of them for a rarely-issued request.
-    ///
-    /// `SO_PEERCRED`/`ucred` is Linux-specific. FreeBSD's `getpeereid` and
-    /// `LOCAL_PEERCRED` expose uid/gid but no pid, so there we report no PID
-    /// identity — which is a supported outcome, not a gap: Xorg's
-    /// `GetClientPid` returns -1 whenever the OS cannot supply one and the
-    /// caller then omits the identity (`Xext/xres.c`).
-    #[cfg(target_os = "linux")]
-    fn client_peer_pid(client: &crate::server::ClientState) -> Option<u32> {
-        use std::os::fd::AsRawFd;
-        if !client.is_local {
-            return None;
-        }
-        let guard = client
-            .writer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut cred = libc::ucred {
-            pid: 0,
-            uid: 0,
-            gid: 0,
-        };
-        let mut len = u32::try_from(std::mem::size_of::<libc::ucred>()).ok()?;
-        // SAFETY: `guard` keeps the socket alive for the call, and `cred`/`len`
-        // are the exact out-param types SO_PEERCRED documents.
-        let rc = unsafe {
-            libc::getsockopt(
-                guard.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_PEERCRED,
-                std::ptr::from_mut(&mut cred).cast(),
-                &mut len,
-            )
-        };
-        drop(guard);
-        (rc == 0 && cred.pid > 0).then(|| cred.pid.cast_unsigned())
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn client_peer_pid(_client: &crate::server::ClientState) -> Option<u32> {
-        None
-    }
 
     fn target_client_for_xid(state: &ServerState, xid: u32) -> Option<ClientId> {
         state

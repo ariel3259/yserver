@@ -173,6 +173,8 @@ pub enum VrrMode {
     Off,
     /// Enable VRR only when `_VARIABLE_REFRESH` has format 32, one item, and a nonzero value.
     Property,
+    /// Enable VRR on direct-scanned client windows, subject to NVIDIA and Mesa application lists.
+    All,
 }
 
 /// Whether `parsed` (straight from [`parse_args`]) differs from a launch
@@ -363,7 +365,12 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchOption
             o.scale = parse_scale(&next_value(&mut it, "--scale")?)?;
             o.set_by_argv.scale = true;
         } else if arg == "--vrr" {
-            o.vrr = VrrMode::Property;
+            o.vrr = if it.peek().is_some_and(|next| next == "all") {
+                it.next();
+                VrrMode::All
+            } else {
+                VrrMode::Property
+            };
         } else if matches!(arg.as_str(), "--version" | "-version") {
             // Print-and-exit; the binary acts on this before `run()`.
             // Keep scanning so it works regardless of position.
@@ -1554,14 +1561,25 @@ mod tests {
     }
 
     #[test]
-    // Mutation: default VrrMode to Property; parsing no flag must remain Off.
+    // Mutation: consume a display argument after --vrr or fail to consume exactly `all`.
     fn launch_vrr_flag_forms() {
         assert_eq!(parse(&[]).unwrap().vrr, VrrMode::Off);
         assert_eq!(parse(&["--vrr"]).unwrap().vrr, VrrMode::Property);
         let property_before_display = parse(&["--vrr", ":5"]).unwrap();
         assert_eq!(property_before_display.vrr, VrrMode::Property);
         assert_eq!(property_before_display.display, Some(5));
+        assert_eq!(parse(&["--vrr", "all"]).unwrap().vrr, VrrMode::All);
+        let all_before_display = parse(&["--vrr", "all", ":6"]).unwrap();
+        assert_eq!(all_before_display.vrr, VrrMode::All);
+        assert_eq!(all_before_display.display, Some(6));
+        let all_prefix = parse(&["--vrr", "allx", ":7"]).unwrap();
+        assert_eq!(all_prefix.vrr, VrrMode::Property);
+        assert_eq!(all_prefix.display, Some(7));
         assert_eq!(parse(&["--vrr", "--vrr"]).unwrap().vrr, VrrMode::Property);
+        assert_eq!(
+            parse(&["--vrr", "all", "--vrr"]).unwrap().vrr,
+            VrrMode::Property
+        );
     }
 
     #[test]

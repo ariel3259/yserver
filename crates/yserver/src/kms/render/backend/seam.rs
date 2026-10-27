@@ -37,6 +37,12 @@ pub trait Platform: OutputSink + Sized + 'static {
 
     /// A drawable's storage is gone; forget platform caches keyed by it.
     fn note_drawable_retired(_st: &mut Self::BackendState, _id: DrawableId) {}
+    /// Drop platform-owned per-client state when an X connection closes.
+    fn client_disconnected(
+        _st: &mut Self::BackendState,
+        _client_id: yserver_protocol::x11::ClientId,
+    ) {
+    }
     /// The keyboard LEDs should show `lit`, the lit XKB indicators (bit 0
     /// Caps Lock, bit 1 Num Lock, bit 2 Scroll Lock).
     fn set_keyboard_leds(_st: &mut Self::BackendState, _lit: u32) {}
