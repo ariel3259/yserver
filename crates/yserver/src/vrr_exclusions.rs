@@ -1,9 +1,11 @@
 use std::{
+    cell::RefCell,
     collections::HashMap,
     fs, io,
     path::{Path, PathBuf},
 };
 
+use regex::Regex;
 use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19,28 +21,55 @@ pub struct VrrListRoots {
     pub nvidia_etc_dir: PathBuf,
     pub mesa_system_dir: PathBuf,
     pub mesa_etc_file: PathBuf,
-    pub home: PathBuf,
 }
 
 impl VrrListRoots {
     #[must_use]
     pub fn system() -> Self {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/nonexistent"));
         Self {
             nvidia_driver_dir: PathBuf::from("/usr/share/nvidia"),
             nvidia_etc_dir: PathBuf::from("/etc/nvidia"),
             mesa_system_dir: PathBuf::from("/usr/share/drirc.d"),
             mesa_etc_file: PathBuf::from("/etc/drirc"),
-            home,
         }
     }
 }
 
 pub struct VrrExclusions {
     nvidia: HashMap<String, bool>,
-    mesa: HashMap<String, bool>,
+    nvidia_documents: Vec<Value>,
+    mesa: Vec<MesaDriconfEntry>,
+    user_lists: RefCell<HashMap<PathBuf, UserVrrLists>>,
+}
+
+struct UserVrrLists {
+    nvidia: HashMap<String, bool>,
+    mesa: Vec<MesaDriconfEntry>,
+}
+
+#[derive(Clone)]
+struct MesaDriconfEntry {
+    matcher: MesaApplicationMatcher,
+    allowed: bool,
+}
+
+#[derive(Clone)]
+enum MesaApplicationMatcher {
+    Executable(String),
+    ExecutableRegexp(Regex),
+    Global,
+    Never,
+}
+
+impl MesaApplicationMatcher {
+    fn matches(&self, process_name: &str) -> bool {
+        match self {
+            Self::Executable(executable) => executable == process_name,
+            Self::ExecutableRegexp(regex) => regex.is_match(process_name),
+            Self::Global => true,
+            Self::Never => false,
+        }
+    }
 }
 
 pub(crate) struct VrrExclusionDecision {
@@ -52,12 +81,7 @@ impl VrrExclusions {
     #[must_use]
     pub fn load(roots: &VrrListRoots) -> Self {
         let mut nvidia_documents = Vec::new();
-        let user_nvidia = roots.home.join(".nv");
-        let mut nvidia_paths = vec![user_nvidia.join("nvidia-application-profiles-rc")];
-        nvidia_paths.extend(files_in_dir(
-            &user_nvidia.join("nvidia-application-profiles-rc.d"),
-        ));
-        nvidia_paths.push(roots.nvidia_etc_dir.join("nvidia-application-profiles-rc"));
+        let mut nvidia_paths = vec![roots.nvidia_etc_dir.join("nvidia-application-profiles-rc")];
         nvidia_paths.extend(files_in_dir(
             &roots
                 .nvidia_etc_dir
@@ -80,7 +104,6 @@ impl VrrExclusions {
         }
         let nvidia = parse_nvidia_profiles(&nvidia_documents);
 
-        let mut mesa = HashMap::new();
         let mesa_system_paths = files_named(&roots.mesa_system_dir, |name| name.ends_with(".conf"));
         if mesa_system_paths.is_empty() {
             log::warn!(
@@ -93,7 +116,7 @@ impl VrrExclusions {
         }
         let mut mesa_paths = mesa_system_paths;
         mesa_paths.push(roots.mesa_etc_file.clone());
-        mesa_paths.push(roots.home.join(".drirc"));
+        let mut mesa = Vec::new();
         for path in mesa_paths {
             if let Some(contents) = read_optional(&path, "Mesa driconf") {
                 if let Some(entries) = parse_driconf(&contents) {
@@ -105,9 +128,14 @@ impl VrrExclusions {
         }
 
         let nvidia_count = nvidia.values().filter(|allowed| !**allowed).count();
-        let mesa_count = mesa.values().filter(|allowed| !**allowed).count();
+        let mesa_count = mesa.iter().filter(|entry| !entry.allowed).count();
         log::info!("kms: vrr exclusions nvidia={nvidia_count} mesa={mesa_count}");
-        Self { nvidia, mesa }
+        Self {
+            nvidia,
+            nvidia_documents,
+            mesa,
+            user_lists: RefCell::new(HashMap::new()),
+        }
     }
 
     /// Return the list source that excludes this process, or `None` when it
@@ -121,6 +149,7 @@ impl VrrExclusions {
     pub(crate) fn evaluate(&self, pid: u32, proc_root: &Path) -> VrrExclusionDecision {
         let process_dir = proc_root.join(pid.to_string());
         let environment = read_environment(&process_dir.join("environ"));
+        let home = environment.get("HOME").map(PathBuf::from);
         let nvidia_environment = environment
             .get("__GL_VRR_ALLOWED")
             .and_then(|value| parse_bool(value));
@@ -133,21 +162,90 @@ impl VrrExclusions {
         } else if nvidia_environment == Some(true) || mesa_environment == Some(true) {
             None
         } else {
-            process_name.as_ref().and_then(|name| {
-                if self.nvidia.get(name) == Some(&false) {
-                    Some(VrrExclusionSource::NvidiaProfiles)
-                } else if self.mesa.get(name) == Some(&false) {
-                    Some(VrrExclusionSource::MesaDriconf)
-                } else {
-                    None
-                }
-            })
+            process_name
+                .as_ref()
+                .and_then(|name| self.list_exclusion(name, home.as_deref()))
         };
         VrrExclusionDecision {
             process_name,
             source,
         }
     }
+
+    fn list_exclusion(
+        &self,
+        process_name: &str,
+        home: Option<&Path>,
+    ) -> Option<VrrExclusionSource> {
+        if let Some(home) = home {
+            let mut user_lists = self.user_lists.borrow_mut();
+            if !user_lists.contains_key(home) {
+                let lists = self.load_user_lists(home);
+                user_lists.insert(home.to_path_buf(), lists);
+            }
+            let lists = user_lists
+                .get(home)
+                .expect("user exclusion lists inserted for this HOME");
+            if lists.nvidia.get(process_name) == Some(&false) {
+                Some(VrrExclusionSource::NvidiaProfiles)
+            } else if mesa_excludes(&lists.mesa, process_name) {
+                Some(VrrExclusionSource::MesaDriconf)
+            } else {
+                None
+            }
+        } else if self.nvidia.get(process_name) == Some(&false) {
+            Some(VrrExclusionSource::NvidiaProfiles)
+        } else if mesa_excludes(&self.mesa, process_name) {
+            Some(VrrExclusionSource::MesaDriconf)
+        } else {
+            None
+        }
+    }
+
+    fn load_user_lists(&self, home: &Path) -> UserVrrLists {
+        let user_nvidia = home.join(".nv");
+        let mut nvidia_paths = vec![user_nvidia.join("nvidia-application-profiles-rc")];
+        nvidia_paths.extend(files_in_dir(
+            &user_nvidia.join("nvidia-application-profiles-rc.d"),
+        ));
+        let mut nvidia_documents = Vec::new();
+        for path in nvidia_paths {
+            if let Some(contents) = read_optional(&path, "NVIDIA application profile") {
+                if let Some(document) = parse_nvidia_document(&contents) {
+                    nvidia_documents.push(document);
+                } else {
+                    log::warn!(
+                        "kms: skipping malformed NVIDIA application profile {}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        nvidia_documents.extend(self.nvidia_documents.iter().cloned());
+
+        let mut mesa = self.mesa.clone();
+        let path = home.join(".drirc");
+        if let Some(contents) = read_optional(&path, "Mesa driconf") {
+            if let Some(entries) = parse_driconf(&contents) {
+                mesa.extend(entries);
+            } else {
+                log::warn!("kms: skipping malformed Mesa driconf {}", path.display());
+            }
+        }
+        UserVrrLists {
+            nvidia: parse_nvidia_profiles(&nvidia_documents),
+            mesa,
+        }
+    }
+}
+
+fn mesa_excludes(entries: &[MesaDriconfEntry], process_name: &str) -> bool {
+    entries
+        .iter()
+        .filter(|entry| entry.matcher.matches(process_name))
+        .map(|entry| entry.allowed)
+        .next_back()
+        == Some(false)
 }
 
 fn files_in_dir(directory: &Path) -> Vec<PathBuf> {
@@ -305,7 +403,26 @@ fn parse_bool(value: &str) -> Option<bool> {
 fn drop_hash_comment_lines(source: &str) -> String {
     source
         .lines()
-        .filter(|line| !line.trim_start().starts_with('#'))
+        .map(|line| {
+            let mut in_string = false;
+            let mut escaped = false;
+            for (index, character) in line.char_indices() {
+                if in_string {
+                    if escaped {
+                        escaped = false;
+                    } else if character == '\\' {
+                        escaped = true;
+                    } else if character == '"' {
+                        in_string = false;
+                    }
+                } else if character == '"' {
+                    in_string = true;
+                } else if character == '#' {
+                    return &line[..index];
+                }
+            }
+            line
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -319,7 +436,7 @@ fn read_environment(path: &Path) -> HashMap<String, String> {
         .filter_map(|entry| {
             let entry = std::str::from_utf8(entry).ok()?;
             let (key, value) = entry.split_once('=')?;
-            matches!(key, "__GL_VRR_ALLOWED" | "adaptive_sync")
+            matches!(key, "__GL_VRR_ALLOWED" | "adaptive_sync" | "HOME")
                 .then(|| (key.to_owned(), value.to_owned()))
         })
         .collect()
@@ -353,7 +470,7 @@ fn read_process_name(process_dir: &Path) -> Option<String> {
         .or(argv_name)
 }
 
-fn parse_driconf(contents: &str) -> Option<HashMap<String, bool>> {
+fn parse_driconf(contents: &str) -> Option<Vec<MesaDriconfEntry>> {
     let document = roxmltree::Document::parse_with_options(
         contents,
         roxmltree::ParsingOptions {
@@ -362,14 +479,36 @@ fn parse_driconf(contents: &str) -> Option<HashMap<String, bool>> {
         },
     )
     .ok()?;
-    let mut settings = HashMap::new();
+    let mut entries = Vec::new();
     for application in document
         .descendants()
         .filter(|node| node.is_element() && node.tag_name().name() == "application")
     {
-        let Some(name) = application.attribute("executable") else {
-            continue;
+        // Mesa scopes these entries by the client's graphics driver. yserver
+        // cannot identify that driver, so it ignores device attributes; the
+        // conservative union moves uncertainty to fixed refresh.
+        let mut matcher = if let Some(executable) = application.attribute("executable") {
+            MesaApplicationMatcher::Executable(executable.to_owned())
+        } else if let Some(pattern) = application.attribute("executable_regexp") {
+            match Regex::new(pattern) {
+                Ok(regex) => MesaApplicationMatcher::ExecutableRegexp(regex),
+                Err(error) => {
+                    log::warn!("kms: invalid Mesa executable_regexp {pattern:?}: {error}");
+                    MesaApplicationMatcher::Never
+                }
+            }
+        } else if application.attribute("blake3").is_some()
+            || application.attribute("application_name_match").is_some()
+        {
+            MesaApplicationMatcher::Never
+        } else {
+            MesaApplicationMatcher::Global
         };
+        // These attributes need client-side identity/version data. Entries
+        // whose matcher is selected from them never apply in yserver.
+        if application.attribute("application_versions").is_some() {
+            matcher = MesaApplicationMatcher::Never;
+        }
         for option in application
             .descendants()
             .filter(|node| node.is_element() && node.tag_name().name() == "option")
@@ -377,11 +516,14 @@ fn parse_driconf(contents: &str) -> Option<HashMap<String, bool>> {
             if option.attribute("name") == Some("adaptive_sync")
                 && let Some(value) = option.attribute("value").and_then(parse_bool)
             {
-                settings.insert(name.to_owned(), value);
+                entries.push(MesaDriconfEntry {
+                    matcher: matcher.clone(),
+                    allowed: value,
+                });
             }
         }
     }
-    Some(settings)
+    Some(entries)
 }
 
 #[cfg(test)]
@@ -423,7 +565,6 @@ pub(crate) mod test_support {
             nvidia_etc_dir: tree.path().join("etc/nvidia"),
             mesa_system_dir: tree.path().join("usr/share/drirc.d"),
             mesa_etc_file: tree.path().join("etc/drirc"),
-            home: tree.path().join("home/user"),
         }
     }
 
@@ -440,6 +581,7 @@ pub(crate) mod test_support {
         executable: &str,
         argv0: &str,
         environ: &[&str],
+        home: Option<&Path>,
     ) {
         use std::os::unix::fs::symlink;
 
@@ -450,6 +592,10 @@ pub(crate) mod test_support {
         let mut cmdline = argv0.as_bytes().to_vec();
         cmdline.push(0);
         fs::write(process_dir.join("cmdline"), cmdline).expect("write fake command line");
+        let mut environ: Vec<_> = environ.iter().map(|entry| (*entry).to_owned()).collect();
+        if let Some(home) = home {
+            environ.push(format!("HOME={}", home.display()));
+        }
         fs::write(process_dir.join("environ"), environ.join("\0") + "\0")
             .expect("write fake environment");
     }
@@ -463,6 +609,293 @@ mod tests {
     };
 
     #[test]
+    // Mutation: read user files from a fixed server-side root instead of the client's HOME.
+    fn vrr_exclusions_user_files_follow_client_home() {
+        let tree = TempTree::new();
+        let roots = roots(&tree);
+        let home_a = tree.path().join("home/alice");
+        let home_b = tree.path().join("home/bob");
+        let proc_root = tree.path().join("proc");
+        write(
+            home_a.join(".drirc"),
+            r#"<driconf><application executable="foo"><option name="adaptive_sync" value="false"/></application></driconf>"#,
+        );
+        write(
+            home_b.join(".nv/nvidia-application-profiles-rc"),
+            r#"{"rules":[{"pattern":"foo","profile":["GLVRRAllowed",false]}]}"#,
+        );
+        process(
+            &proc_root,
+            101,
+            "/usr/bin/foo",
+            "/usr/bin/foo",
+            &[],
+            Some(&home_a),
+        );
+        process(
+            &proc_root,
+            102,
+            "/usr/bin/foo",
+            "/usr/bin/foo",
+            &[],
+            Some(&home_b),
+        );
+        process(&proc_root, 103, "/usr/bin/foo", "/usr/bin/foo", &[], None);
+        let exclusions = VrrExclusions::load(&roots);
+
+        assert_eq!(
+            exclusions.excluded(101, &proc_root),
+            Some(VrrExclusionSource::MesaDriconf),
+            "HOME A's Mesa file excludes foo"
+        );
+        assert_eq!(
+            exclusions.excluded(102, &proc_root),
+            Some(VrrExclusionSource::NvidiaProfiles),
+            "HOME B's NVIDIA file excludes foo"
+        );
+        assert_eq!(
+            exclusions.excluded(103, &proc_root),
+            None,
+            "a process with no HOME uses only the system lists"
+        );
+    }
+
+    #[test]
+    // Mutation: drop the per-HOME user-list cache.
+    fn vrr_exclusions_user_files_cached_per_home() {
+        let tree = TempTree::new();
+        let roots = roots(&tree);
+        let home_a = tree.path().join("home/alice");
+        let home_c = tree.path().join("home/carol");
+        let proc_root = tree.path().join("proc");
+        let drirc = home_a.join(".drirc");
+        write(
+            &drirc,
+            r#"<driconf><application executable="foo"><option name="adaptive_sync" value="false"/></application></driconf>"#,
+        );
+        process(
+            &proc_root,
+            104,
+            "/usr/bin/foo",
+            "/usr/bin/foo",
+            &[],
+            Some(&home_a),
+        );
+        let exclusions = VrrExclusions::load(&roots);
+        assert_eq!(
+            exclusions.excluded(104, &proc_root),
+            Some(VrrExclusionSource::MesaDriconf)
+        );
+
+        std::fs::remove_file(drirc).expect("remove HOME A driconf after its first read");
+        process(
+            &proc_root,
+            105,
+            "/usr/bin/foo",
+            "/usr/bin/foo",
+            &[],
+            Some(&home_a),
+        );
+        process(
+            &proc_root,
+            106,
+            "/usr/bin/foo",
+            "/usr/bin/foo",
+            &[],
+            Some(&home_c),
+        );
+
+        assert_eq!(
+            exclusions.excluded(105, &proc_root),
+            Some(VrrExclusionSource::MesaDriconf),
+            "a second process with HOME A sees its cached list"
+        );
+        assert_eq!(
+            exclusions.excluded(106, &proc_root),
+            None,
+            "a new HOME is read independently"
+        );
+    }
+
+    #[test]
+    // Mutation: append user NVIDIA documents after the system documents.
+    fn vrr_exclusions_user_nvidia_file_wins_over_system() {
+        let tree = TempTree::new();
+        let roots = roots(&tree);
+        let home = tree.path().join("home/alice");
+        let proc_root = tree.path().join("proc");
+        write(
+            roots.nvidia_etc_dir.join("nvidia-application-profiles-rc"),
+            r#"{"rules":[{"pattern":"foo","profile":["GLVRRAllowed",false]}]}"#,
+        );
+        write(
+            home.join(".nv/nvidia-application-profiles-rc"),
+            r#"{"rules":[{"pattern":"foo","profile":["GLVRRAllowed",true]}]}"#,
+        );
+        process(
+            &proc_root,
+            107,
+            "/usr/bin/foo",
+            "/usr/bin/foo",
+            &[],
+            Some(&home),
+        );
+        let exclusions = VrrExclusions::load(&roots);
+
+        assert_eq!(
+            exclusions.excluded(107, &proc_root),
+            None,
+            "the first matching user rule allows VRR before the system rule"
+        );
+    }
+
+    #[test]
+    // Mutation: skip applications without a matching attribute.
+    fn vrr_exclusions_mesa_global_application_applies() {
+        let tree = TempTree::new();
+        let roots = roots(&tree);
+        let proc_root = tree.path().join("proc");
+        write(
+            roots.mesa_system_dir.join("10-global.conf"),
+            r#"<driconf><application name="all"><option name="adaptive_sync" value="false"/></application><application executable="mpv"><option name="adaptive_sync" value="true"/></application></driconf>"#,
+        );
+        process(&proc_root, 108, "/usr/bin/mpv", "/usr/bin/mpv", &[], None);
+        process(&proc_root, 109, "/usr/bin/bar", "/usr/bin/bar", &[], None);
+        let exclusions = VrrExclusions::load(&roots);
+
+        assert_eq!(
+            exclusions.excluded(108, &proc_root),
+            None,
+            "the later mpv entry overrides the earlier global false"
+        );
+        assert_eq!(
+            exclusions.excluded(109, &proc_root),
+            Some(VrrExclusionSource::MesaDriconf),
+            "an application without a matcher applies globally"
+        );
+    }
+
+    #[test]
+    // Mutation: use full-match instead of Mesa's unanchored regex search.
+    fn vrr_exclusions_mesa_executable_regexp() {
+        let tree = TempTree::new();
+        let roots = roots(&tree);
+        let proc_root = tree.path().join("proc");
+        let path = roots.mesa_system_dir.join("10-regex.conf");
+        write(
+            &path,
+            r#"<driconf><application executable_regexp="pv"><option name="adaptive_sync" value="false"/></application></driconf>"#,
+        );
+        process(&proc_root, 110, "/usr/bin/mpv", "/usr/bin/mpv", &[], None);
+        process(&proc_root, 111, "/usr/bin/vlc", "/usr/bin/vlc", &[], None);
+        let unanchored = VrrExclusions::load(&roots);
+        assert_eq!(
+            unanchored.excluded(110, &proc_root),
+            Some(VrrExclusionSource::MesaDriconf),
+            "Mesa regex matching searches within the process name"
+        );
+        assert_eq!(unanchored.excluded(111, &proc_root), None);
+
+        write(
+            &path,
+            r#"<driconf><application executable_regexp="^mp$"><option name="adaptive_sync" value="false"/></application></driconf>"#,
+        );
+        assert_eq!(
+            VrrExclusions::load(&roots).excluded(110, &proc_root),
+            None,
+            "anchors prevent ^mp$ from matching mpv"
+        );
+
+        write(
+            &path,
+            r#"<driconf><application executable_regexp="["><option name="adaptive_sync" value="false"/></application><application executable="vlc"><option name="adaptive_sync" value="false"/></application></driconf>"#,
+        );
+        assert_eq!(
+            VrrExclusions::load(&roots).excluded(111, &proc_root),
+            Some(VrrExclusionSource::MesaDriconf),
+            "an invalid regex is ignored without losing later entries"
+        );
+    }
+
+    #[test]
+    // Mutation: treat unevaluable application attributes as global matchers.
+    fn vrr_exclusions_mesa_unevaluable_attributes_skip() {
+        let tree = TempTree::new();
+        let roots = roots(&tree);
+        let proc_root = tree.path().join("proc");
+        write(
+            roots.mesa_system_dir.join("10-unevaluable.conf"),
+            r#"<driconf><application application_name_match=".*"><option name="adaptive_sync" value="false"/></application><application blake3="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"><option name="adaptive_sync" value="false"/></application><application application_versions="1"><option name="adaptive_sync" value="false"/></application></driconf>"#,
+        );
+        process(&proc_root, 112, "/usr/bin/foo", "/usr/bin/foo", &[], None);
+
+        assert_eq!(
+            VrrExclusions::load(&roots).excluded(112, &proc_root),
+            None,
+            "yserver cannot evaluate these client-side matching attributes"
+        );
+    }
+
+    #[test]
+    // Mutation: skip applications nested inside device elements with attributes.
+    fn vrr_exclusions_mesa_device_scope_ignored() {
+        let tree = TempTree::new();
+        let roots = roots(&tree);
+        let proc_root = tree.path().join("proc");
+        write(
+            roots.mesa_system_dir.join("10-device.conf"),
+            r#"<driconf><device driver="radeonsi"><application executable="foo"><option name="adaptive_sync" value="false"/></application></device></driconf>"#,
+        );
+        process(&proc_root, 113, "/usr/bin/foo", "/usr/bin/foo", &[], None);
+
+        assert_eq!(
+            VrrExclusions::load(&roots).excluded(113, &proc_root),
+            Some(VrrExclusionSource::MesaDriconf),
+            "unknown client driver scoping is ignored; fixed refresh is the safe error side for the union of both lists"
+        );
+    }
+
+    #[test]
+    // Mutation: restore line-start-only NVIDIA hash comment stripping.
+    fn vrr_exclusions_nvidia_inline_hash_comment() {
+        let tree = TempTree::new();
+        let roots = roots(&tree);
+        let proc_root = tree.path().join("proc");
+        write(
+            roots
+                .nvidia_driver_dir
+                .join("nvidia-application-profiles-580-rc"),
+            r##"{
+              "rules": [
+                {"pattern": "steam", "profile": ["GLVRRAllowed", false]}, # trailing comment
+                {"pattern": {"feature": "procname", "matches": "a#b"}, "profile": ["GLVRRAllowed", false]},
+                {"pattern": {"feature": "procname", "matches": "quote\"#tail"}, "profile": ["GLVRRAllowed", false]}
+              ],
+              "note": "escaped quote \"# remains in the string"
+            }"##,
+        );
+        process(&proc_root, 114, "/usr/bin/steam", "steam", &[], None);
+        process(&proc_root, 115, "/usr/bin/a#b", "/usr/bin/a#b", &[], None);
+        process(
+            &proc_root,
+            116,
+            "/usr/bin/quote\"#tail",
+            "/usr/bin/quote\"#tail",
+            &[],
+            None,
+        );
+        let exclusions = VrrExclusions::load(&roots);
+
+        for (pid, name) in [(114, "steam"), (115, "a#b"), (116, "quote\"#tail")] {
+            assert_eq!(
+                exclusions.excluded(pid, &proc_root),
+                Some(VrrExclusionSource::NvidiaProfiles),
+                "NVIDIA rule for {name} survives outside-string comments"
+            );
+        }
+    }
+
+    #[test]
     // Mutation: ignore Mesa adaptive_sync=false entries.
     fn vrr_exclusions_mesa_entry_excludes() {
         let tree = TempTree::new();
@@ -472,7 +905,14 @@ mod tests {
             roots.mesa_system_dir.join("10-app.conf"),
             r#"<driconf><device><application name="Browser" executable="firefox"><option name="adaptive_sync" value="false"/></application></device></driconf>"#,
         );
-        process(&proc_root, 21, "/usr/lib/firefox", "/usr/lib/firefox", &[]);
+        process(
+            &proc_root,
+            21,
+            "/usr/lib/firefox",
+            "/usr/lib/firefox",
+            &[],
+            None,
+        );
 
         assert_eq!(
             VrrExclusions::load(&roots).excluded(21, &proc_root),
@@ -499,7 +939,14 @@ mod tests {
 ]>
 <driconf><device><application executable="firefox"><option name="adaptive_sync" value="false"/></application></device></driconf>"#,
         );
-        process(&proc_root, 41, "/usr/lib/firefox", "/usr/lib/firefox", &[]);
+        process(
+            &proc_root,
+            41,
+            "/usr/lib/firefox",
+            "/usr/lib/firefox",
+            &[],
+            None,
+        );
 
         assert_eq!(
             VrrExclusions::load(&roots).excluded(41, &proc_root),
@@ -524,8 +971,15 @@ mod tests {
           ]
         }"##,
         );
-        process(&proc_root, 22, "/usr/lib/firefox", "/usr/lib/firefox", &[]);
-        process(&proc_root, 23, "/home/user/steam", "steam", &[]);
+        process(
+            &proc_root,
+            22,
+            "/usr/lib/firefox",
+            "/usr/lib/firefox",
+            &[],
+            None,
+        );
+        process(&proc_root, 23, "/home/user/steam", "steam", &[], None);
         let exclusions = VrrExclusions::load(&roots);
 
         assert_eq!(
@@ -550,6 +1004,7 @@ mod tests {
             "/usr/bin/terminal",
             "/usr/bin/terminal",
             &[],
+            None,
         );
 
         assert_eq!(VrrExclusions::load(&roots).excluded(24, &proc_root), None);
@@ -560,6 +1015,7 @@ mod tests {
     fn vrr_exclusions_later_file_lifts() {
         let tree = TempTree::new();
         let roots = roots(&tree);
+        let home = tree.path().join("home/user");
         let proc_root = tree.path().join("proc");
         write(
             roots
@@ -568,7 +1024,7 @@ mod tests {
             r#"{"rules":[{"pattern":"firefox","profile":["GLVRRAllowed",false]}]}"#,
         );
         write(
-            roots.home.join(".nv/nvidia-application-profiles-rc"),
+            home.join(".nv/nvidia-application-profiles-rc"),
             r#"{"rules":[{"pattern":"firefox","profile":["GLVRRAllowed",true]}]}"#,
         );
         write(
@@ -576,10 +1032,17 @@ mod tests {
             r#"<driconf><device><application executable="firefox"><option name="adaptive_sync" value="false"/></application></device></driconf>"#,
         );
         write(
-            roots.home.join(".drirc"),
+            home.join(".drirc"),
             r#"<driconf><device><application executable="firefox"><option name="adaptive_sync" value="true"/></application></device></driconf>"#,
         );
-        process(&proc_root, 25, "/usr/lib/firefox", "/usr/lib/firefox", &[]);
+        process(
+            &proc_root,
+            25,
+            "/usr/lib/firefox",
+            "/usr/lib/firefox",
+            &[],
+            Some(home.as_path()),
+        );
 
         assert_eq!(VrrExclusions::load(&roots).excluded(25, &proc_root), None);
     }
@@ -589,9 +1052,10 @@ mod tests {
     fn vrr_exclusions_nvidia_named_profile_cross_file() {
         let tree = TempTree::new();
         let roots = roots(&tree);
+        let home = tree.path().join("home/user");
         let proc_root = tree.path().join("proc");
         write(
-            roots.home.join(".nv/nvidia-application-profiles-rc"),
+            home.join(".nv/nvidia-application-profiles-rc"),
             r#"{"rules":[{"pattern":"firefox","profile":"deny"}]}"#,
         );
         write(
@@ -600,7 +1064,14 @@ mod tests {
                 .join("nvidia-application-profiles-580-rc"),
             r#"{"profiles":[{"name":"deny","settings":["GLVRRAllowed",false]}]}"#,
         );
-        process(&proc_root, 37, "/usr/lib/firefox", "/usr/lib/firefox", &[]);
+        process(
+            &proc_root,
+            37,
+            "/usr/lib/firefox",
+            "/usr/lib/firefox",
+            &[],
+            Some(home.as_path()),
+        );
 
         assert_eq!(
             VrrExclusions::load(&roots).excluded(37, &proc_root),
@@ -613,9 +1084,10 @@ mod tests {
     fn vrr_exclusions_nvidia_named_profile_user_override() {
         let tree = TempTree::new();
         let roots = roots(&tree);
+        let home = tree.path().join("home/user");
         let proc_root = tree.path().join("proc");
         write(
-            roots.home.join(".nv/nvidia-application-profiles-rc"),
+            home.join(".nv/nvidia-application-profiles-rc"),
             r#"{"rules":[{"pattern":"firefox","profile":"allow"}]}"#,
         );
         write(
@@ -630,7 +1102,14 @@ mod tests {
                 .join("nvidia-application-profiles-580.1-rc"),
             r#"{"rules":[{"pattern":"firefox","profile":["GLVRRAllowed",false]}]}"#,
         );
-        process(&proc_root, 38, "/usr/lib/firefox", "/usr/lib/firefox", &[]);
+        process(
+            &proc_root,
+            38,
+            "/usr/lib/firefox",
+            "/usr/lib/firefox",
+            &[],
+            Some(home.as_path()),
+        );
 
         assert_eq!(VrrExclusions::load(&roots).excluded(38, &proc_root), None);
     }
@@ -653,6 +1132,7 @@ mod tests {
             "/usr/bin/unlisted",
             "/usr/bin/unlisted",
             &["__GL_VRR_ALLOWED=0"],
+            None,
         );
         process(
             &proc_root,
@@ -660,6 +1140,7 @@ mod tests {
             "/usr/bin/listed",
             "/usr/bin/listed",
             &["__GL_VRR_ALLOWED=1"],
+            None,
         );
         process(
             &proc_root,
@@ -667,6 +1148,7 @@ mod tests {
             "/usr/bin/unlisted",
             "/usr/bin/unlisted",
             &["adaptive_sync=false"],
+            None,
         );
         process(
             &proc_root,
@@ -674,6 +1156,7 @@ mod tests {
             "/usr/bin/unlisted",
             "/usr/bin/unlisted",
             &["__GL_VRR_ALLOWED=1", "adaptive_sync=0"],
+            None,
         );
         let exclusions = VrrExclusions::load(&roots);
 
@@ -704,6 +1187,7 @@ mod tests {
             "/opt/x/firefox",
             "/opt/x/firefox --flag",
             &[],
+            None,
         );
         process(
             &proc_root,
@@ -711,16 +1195,32 @@ mod tests {
             "/home/u/.steam/ubuntu12_32/steam",
             "steam",
             &[],
+            None,
         );
-        process(&proc_root, 32, "/opt/x/other", "/usr/bin/unrelated", &[]);
+        process(
+            &proc_root,
+            32,
+            "/opt/x/other",
+            "/usr/bin/unrelated",
+            &[],
+            None,
+        );
         process(
             &proc_root,
             36,
             "/opt/x/firefox",
             "/opt/x/firefox-wrapper",
             &[],
+            None,
         );
-        process(&proc_root, 37, "/opt/My Game", "/opt/My Game --flag", &[]);
+        process(
+            &proc_root,
+            37,
+            "/opt/My Game",
+            "/opt/My Game --flag",
+            &[],
+            None,
+        );
         write(
             roots
                 .nvidia_driver_dir
@@ -765,7 +1265,14 @@ mod tests {
             first_roots.mesa_etc_file.clone(),
             r#"<driconf><device><application executable="firefox"><option name="adaptive_sync" value="false"/></application></device></driconf>"#,
         );
-        process(&proc_root, 33, "/usr/lib/firefox", "/usr/lib/firefox", &[]);
+        process(
+            &proc_root,
+            33,
+            "/usr/lib/firefox",
+            "/usr/lib/firefox",
+            &[],
+            None,
+        );
 
         assert_eq!(
             VrrExclusions::load(&first_roots).excluded(33, &proc_root),
@@ -779,7 +1286,14 @@ mod tests {
             nvidia_roots.mesa_etc_file.clone(),
             r#"<driconf><device><application executable="steam"><option name="adaptive_sync" value="false"/></application></device></driconf>"#,
         );
-        process(&nvidia_proc, 34, "/usr/bin/steam", "/usr/bin/steam", &[]);
+        process(
+            &nvidia_proc,
+            34,
+            "/usr/bin/steam",
+            "/usr/bin/steam",
+            &[],
+            None,
+        );
         assert_eq!(
             VrrExclusions::load(&nvidia_roots).excluded(34, &nvidia_proc),
             Some(VrrExclusionSource::MesaDriconf)
@@ -794,10 +1308,57 @@ mod tests {
                 .join("nvidia-application-profiles-580-rc"),
             "# Synthetic comment line\n{\"rules\":[{\"pattern\":\"steam\",\"profile\":[\"GLVRRAllowed\",false]}]}\n",
         );
-        process(&comments_proc, 35, "/usr/bin/steam", "/usr/bin/steam", &[]);
+        process(
+            &comments_proc,
+            35,
+            "/usr/bin/steam",
+            "/usr/bin/steam",
+            &[],
+            None,
+        );
         assert_eq!(
             VrrExclusions::load(&comments_roots).excluded(35, &comments_proc),
             Some(VrrExclusionSource::NvidiaProfiles)
+        );
+    }
+
+    // Maintainer reproductions for PR #298 review points 3 and 2 (verbatim from the PR thread,
+    // except: the second writes /etc/drirc (roots.mesa_etc_file) instead of roots.home/.drirc,
+    // since roots no longer carry a home after point 1, and pass `None` as the new HOME
+    // argument of `process`).
+    #[test]
+    fn review_vrr_nvidia_inline_comment_preserves_exclusion() {
+        let tree = TempTree::new();
+        let roots = roots(&tree);
+        let proc_root = tree.path().join("proc");
+        write(
+            roots
+                .nvidia_driver_dir
+                .join("nvidia-application-profiles-580-rc"),
+            r##"{
+                "rules": [ {"pattern":"steam", "profile":["GLVRRAllowed",false]} ] # valid NVIDIA comment
+            }"##,
+        );
+        process(&proc_root, 21, "/usr/bin/steam", "steam", &[], None);
+        assert_eq!(
+            VrrExclusions::load(&roots).excluded(21, &proc_root),
+            Some(VrrExclusionSource::NvidiaProfiles)
+        );
+    }
+
+    #[test]
+    fn review_vrr_driconf_global_exclusion_is_honoured() {
+        let tree = TempTree::new();
+        let roots = roots(&tree);
+        let proc_root = tree.path().join("proc");
+        write(
+            &roots.mesa_etc_file,
+            r#"<driconf><device><application name="all"><option name="adaptive_sync" value="false"/></application></device></driconf>"#,
+        );
+        process(&proc_root, 21, "/usr/bin/game", "/usr/bin/game", &[], None);
+        assert_eq!(
+            VrrExclusions::load(&roots).excluded(21, &proc_root),
+            Some(VrrExclusionSource::MesaDriconf)
         );
     }
 }

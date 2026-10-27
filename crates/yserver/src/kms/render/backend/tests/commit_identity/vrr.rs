@@ -4912,7 +4912,7 @@ fn vrr_standalone_clear_einval_latches_without_empty_retry() {
 
 fn write_fake_process(proc_root: &Path, pid: u32, name: &str) {
     let executable = format!("/usr/bin/{name}");
-    write_fake_process_fixture(proc_root, pid, &executable, &executable, &[]);
+    write_fake_process_fixture(proc_root, pid, &executable, &executable, &[], None);
 }
 
 fn accepted_vrr_direct(

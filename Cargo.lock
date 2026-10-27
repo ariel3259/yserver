@@ -1421,6 +1421,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-quartz-core",
  "objc2-service-management",
+ "regex",
  "roxmltree",
  "serde_json",
  "signal-hook",
