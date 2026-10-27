@@ -81,9 +81,9 @@ This spec is PR A (point 4 of the VRR order agreed on 2026-10-20). PR B (point 3
 - Present completion order and MSC per CRTC.
 - Hot-plug / RANDR changes while an output is direct: clean unflip, no stale frame.
 
-## To measure before the plan
+## Measured before the plan
 
-- **Muffin with two monitors.** Whether muffin unredirects a fullscreen window that covers one of two monitors (the client then presents `Unredirected` with `Output` coverage), or keeps compositing it into its root-sized stage (then the game reaches yserver as a COW Present with `Root` coverage and this PR alone does not give it direct scanout under Cinnamon). Measured with the scanout debug summary (`output_coverage`, target) in a Cinnamon session with both monitors on; behaviour observed only, no muffin source read. Without a compositor (i3, bare) the client window is presented directly and is `Output`.
+- **Muffin with two monitors (2026-10-27, NVIDIA card1, DP-3 MSI at +0+0 240 Hz, HDMI-2 LG at +1920+0, Cinnamon with unredirect-fullscreen-windows, mpv fullscreen on DP-3, master + #298/#299 binary).** Muffin unredirects the fullscreen window on one of two monitors: every mpv Present reached yserver as `target=Unredirected coverage=Output(1)` (the MSI is output index 1; root 3840×1080), about 100 authoritative Presents/s, `root=0`, and muffin's stage did not present meanwhile. The M1 gate saw 0 candidates (Root only today), so the game stayed composed. Therefore this PR alone gives direct scanout under Cinnamon too. Behaviour observed through yserver's log only; no muffin source read. Note: output indices follow the platform's output order, not the RANDR position (here HDMI-2 is index 0).
 
 ## Acceptance
 
