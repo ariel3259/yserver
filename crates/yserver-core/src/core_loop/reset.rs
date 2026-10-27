@@ -1017,7 +1017,7 @@ mod tests {
             crate::server::SelectionOwner {
                 window: f.window,
                 last_time_changed: 1,
-                client: ClientId(7),
+                client: Some(ClientId(7)),
             },
         );
         state.server_grab_owner = Some(ClientId(7));

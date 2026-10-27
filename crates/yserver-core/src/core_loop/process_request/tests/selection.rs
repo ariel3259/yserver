@@ -172,7 +172,7 @@ fn destroy_window_owning_selection_fires_window_destroy_notify_and_clears_owners
         crate::server::SelectionOwner {
             window: ResourceId(OWNER_WIN),
             last_time_changed: 0,
-            client: ClientId(OWNER_ID),
+            client: Some(ClientId(OWNER_ID)),
         },
     );
 
@@ -196,12 +196,15 @@ fn destroy_window_owning_selection_fires_window_destroy_notify_and_clears_owners
     )
     .expect("handle_destroy_window");
 
-    // Verify selection ownership cleared.
-    assert!(
-        !state.selections.contains_key(&AtomId(PRIMARY)),
-        "destroying the owning window must clear state.selections[PRIMARY]; \
-             got {:?}",
-        state.selections.get(&AtomId(PRIMARY)),
+    // Verify selection ownership cleared; the record keeps its time.
+    assert_eq!(
+        state.selections.get(&AtomId(PRIMARY)).copied(),
+        Some(crate::server::SelectionOwner {
+            window: ResourceId(0),
+            last_time_changed: 0,
+            client: None,
+        }),
+        "destroying the owning window must release state.selections[PRIMARY]",
     );
 
     // Verify subscriber received the event.
@@ -293,7 +296,7 @@ fn client_disconnect_owning_selection_fires_client_close_notify_and_clears_owner
         crate::server::SelectionOwner {
             window: ResourceId(OWNER_WIN),
             last_time_changed: 0,
-            client: ClientId(OWNER_ID),
+            client: Some(ClientId(OWNER_ID)),
         },
     );
     state.xfixes_selection_masks.insert(
@@ -304,9 +307,14 @@ fn client_disconnect_owning_selection_fires_client_close_notify_and_clears_owner
     // Simulate client disconnect cleanup for OWNER_ID's selections.
     fanout_xfixes_selection_client_close_for_client(&mut state, ClientId(OWNER_ID));
 
-    assert!(
-        !state.selections.contains_key(&AtomId(PRIMARY)),
-        "client disconnect must clear selections it owns",
+    assert_eq!(
+        state.selections.get(&AtomId(PRIMARY)).copied(),
+        Some(crate::server::SelectionOwner {
+            window: ResourceId(0),
+            last_time_changed: 0,
+            client: None,
+        }),
+        "client disconnect must release selections it set",
     );
 
     peer.set_nonblocking(true).unwrap();
@@ -399,7 +407,7 @@ fn set_selection_owner_no_clear_when_same_client_moves_between_own_windows() {
         crate::server::SelectionOwner {
             window: ResourceId(WIN_A),
             last_time_changed: 0,
-            client: ClientId(APP),
+            client: Some(ClientId(APP)),
         },
     );
 
@@ -476,7 +484,7 @@ fn set_selection_owner_clear_event_uses_resolved_time_when_client_sends_zero() {
         crate::server::SelectionOwner {
             window: ResourceId(PRIOR_WIN),
             last_time_changed: 0,
-            client: ClientId(PRIOR_OWNER),
+            client: Some(ClientId(PRIOR_OWNER)),
         },
     );
 
@@ -773,7 +781,7 @@ fn set_selection_owner_with_stale_time_is_silently_ignored() {
         crate::server::SelectionOwner {
             window: ResourceId(PRIOR_OWNER_WIN),
             last_time_changed: PRIOR_LAST_TIME,
-            client: ClientId(PRIOR_OWNER_ID),
+            client: Some(ClientId(PRIOR_OWNER_ID)),
         },
     );
     state.xfixes_selection_masks.insert(
@@ -1009,7 +1017,7 @@ fn destroy_window_owning_selection_carries_prior_last_time_changed_in_selection_
         crate::server::SelectionOwner {
             window: ResourceId(OWNER_WIN),
             last_time_changed: SET_OWNER_TIME,
-            client: ClientId(OWNER_ID),
+            client: Some(ClientId(OWNER_ID)),
         },
     );
 
@@ -1344,4 +1352,129 @@ fn convert_selection_without_an_owner_notifies_the_requesting_client() {
         record_events(&mut state, REC_B, &mut b),
         [(SELECTION_NOTIFY, REC_WIN_A, 0)]
     );
+}
+
+/// How `a` gives up the selection it set on A at `now`.
+#[derive(Clone, Copy)]
+enum RecordRelease {
+    /// `a` sets None at `now` (`ProcSetSelectionOwner`, `dix/selection.c:204-207`).
+    SetNone,
+    /// `a` disconnects (`DeleteClientFromAnySelections`, `dix/selection.c:128-139`).
+    Close,
+    /// `a` destroys A (`DeleteWindowFromAnySelections`, `dix/selection.c:113-125`).
+    Destroy,
+}
+
+/// `b`'s SetSelectionOwner(B) after the release: at `now - 10` it is older
+/// than the kept `lastTimeChanged` and ignored (`dix/selection.c:192-193`),
+/// at `now` it takes the selection with no SelectionClear, since the record's
+/// client is NullClient (`:194`).
+fn assert_stale_set_after_release_is_ignored(release: RecordRelease) {
+    let (mut state, mut a, mut b, selection, now) = selection_record_fixture();
+    record_set_owner(&mut state, REC_A, REC_WIN_A, selection, now);
+    assert_eq!(record_owner(&mut state, &mut b, selection), REC_WIN_A);
+    match release {
+        RecordRelease::SetNone => record_set_owner(&mut state, REC_A, 0, selection, now),
+        RecordRelease::Close => {
+            fanout_xfixes_selection_client_close_for_client(&mut state, ClientId(REC_A));
+        }
+        RecordRelease::Destroy => {
+            let mut backend = RecordingBackend::new();
+            handle_destroy_window(
+                &mut state,
+                &mut backend,
+                None,
+                ClientId(REC_A),
+                SequenceNumber(4),
+                &REC_WIN_A.to_le_bytes(),
+            )
+            .expect("handle_destroy_window");
+        }
+    }
+    assert_eq!(record_owner(&mut state, &mut b, selection), 0);
+    let _ = record_events(&mut state, REC_A, &mut a);
+
+    record_set_owner(&mut state, REC_B, REC_WIN_B, selection, now - 10);
+    assert_eq!(record_owner(&mut state, &mut b, selection), 0);
+    record_set_owner(&mut state, REC_B, REC_WIN_B, selection, now);
+    assert_eq!(record_owner(&mut state, &mut b, selection), REC_WIN_B);
+    assert!(record_events(&mut state, REC_A, &mut a).is_empty());
+    assert!(record_events(&mut state, REC_B, &mut b).is_empty());
+}
+
+/// `tools/selection-record-probe none`, measured on Xephyr:
+///
+/// ```text
+/// a SetSelectionOwner A at now
+/// selection owner: A
+/// a SetSelectionOwner None at now
+///   a: SelectionClear(owner=A)
+/// selection owner: None
+/// b SetSelectionOwner B at now-10
+/// selection owner: None
+/// b SetSelectionOwner B at now
+/// selection owner: B
+/// ```
+#[test]
+fn released_selection_keeps_its_last_time_changed_after_set_none() {
+    assert_stale_set_after_release_is_ignored(RecordRelease::SetNone);
+}
+
+/// `tools/selection-record-probe close`, measured on Xephyr:
+///
+/// ```text
+/// a SetSelectionOwner A at now
+/// selection owner: A
+/// a disconnects
+/// selection owner: None
+/// b SetSelectionOwner B at now-10
+/// selection owner: None
+/// b SetSelectionOwner B at now
+/// selection owner: B
+/// ```
+#[test]
+fn released_selection_keeps_its_last_time_changed_after_setter_disconnect() {
+    assert_stale_set_after_release_is_ignored(RecordRelease::Close);
+}
+
+/// `tools/selection-record-probe destroy`, measured on Xephyr:
+///
+/// ```text
+/// a SetSelectionOwner A at now
+/// selection owner: A
+/// a DestroyWindow A
+/// selection owner: None
+/// b SetSelectionOwner B at now-10
+/// selection owner: None
+/// b SetSelectionOwner B at now
+/// selection owner: B
+/// ```
+#[test]
+fn released_selection_keeps_its_last_time_changed_after_owner_window_destroy() {
+    assert_stale_set_after_release_is_ignored(RecordRelease::Destroy);
+}
+
+/// `tools/selection-record-probe fresh`, measured on Xephyr: releasing a
+/// selection nobody owned creates its record (`dix/selection.c:196-213`)
+/// with `lastTimeChanged` = the request's time.
+///
+/// ```text
+/// a SetSelectionOwner None (never owned) at now
+/// selection owner: None
+/// b SetSelectionOwner B at now-10
+/// selection owner: None
+/// b SetSelectionOwner B at now
+/// selection owner: B
+/// ```
+#[test]
+fn releasing_a_never_owned_selection_records_its_time() {
+    let (mut state, mut a, mut b, selection, now) = selection_record_fixture();
+    record_set_owner(&mut state, REC_A, 0, selection, now);
+    assert_eq!(record_owner(&mut state, &mut b, selection), 0);
+    record_set_owner(&mut state, REC_B, REC_WIN_B, selection, now - 10);
+    assert_eq!(record_owner(&mut state, &mut b, selection), 0);
+    record_set_owner(&mut state, REC_B, REC_WIN_B, selection, now);
+    assert_eq!(record_owner(&mut state, &mut b, selection), REC_WIN_B);
+    assert!(record_events(&mut state, REC_A, &mut a).is_empty());
+    assert!(record_events(&mut state, REC_B, &mut b).is_empty());
 }

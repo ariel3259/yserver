@@ -364,17 +364,21 @@ pub struct Xi1ActiveGrab {
 /// An owned selection, Xorg's `Selection` (`include/selection.h`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SelectionOwner {
-    /// The owner window.
+    /// The owner window; `ResourceId(0)` (None) once released. Xorg keeps
+    /// the record with its `lastTimeChanged` after SetSelectionOwner(None),
+    /// the setter's disconnect and the window's destruction
+    /// (`dix/selection.c:113-139`, `:204-207`).
     pub window: ResourceId,
     /// `lastTimeChanged` in ms, the resolved time of the `SetSelectionOwner`
     /// that set it; `selection_timestamp` in `XFixesSelectionNotify`
     /// (`xfixes/select.c:89`).
     pub last_time_changed: u32,
     /// The client whose `SetSelectionOwner` set it, which need not own
-    /// `window` (`dix/selection.c:220`). SelectionClear and SelectionRequest
-    /// go to it, and its disconnect clears the selection with ClientClose
+    /// `window` (`dix/selection.c:220`); `None` (`NullClient`) once released.
+    /// SelectionClear and SelectionRequest go to it, and its disconnect
+    /// clears the selection with ClientClose
     /// (`DeleteClientFromAnySelections`, `dix/selection.c:128-139`).
-    pub client: ClientId,
+    pub client: Option<ClientId>,
 }
 
 /// Core keyboard focus state — Xorg `FocusClassRec` (win/revert/time)
@@ -3647,7 +3651,7 @@ impl ServerState {
     #[must_use]
     pub fn selection_owner_target(&self, selection: AtomId) -> Option<(ResourceId, EventTarget)> {
         let owner = self.selections.get(&selection)?;
-        let target = self.client_target(owner.client)?;
+        let target = self.client_target(owner.client?)?;
         Some((owner.window, target))
     }
 

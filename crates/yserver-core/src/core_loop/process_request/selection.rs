@@ -100,20 +100,19 @@ pub(super) fn handle_set_selection_owner(
 
     // Snapshot prior ownership BEFORE we mutate state.selections so
     // the SelectionClear gate / event payload sees the previous
-    // owner: its window and the client that set it.
+    // owner: its window and the client that set it. A release (None)
+    // keeps the record with its time and `client = NullClient`
+    // (`dix/selection.c:204-207`), creating it if the selection was never
+    // set (`:196-213`).
     let old = state.selections.get(&selection).copied();
-    if window.0 == 0 {
-        state.selections.remove(&selection);
-    } else {
-        state.selections.insert(
-            selection,
-            SelectionOwner {
-                window,
-                last_time_changed: resolved_time,
-                client: client_id,
-            },
-        );
-    }
+    state.selections.insert(
+        selection,
+        SelectionOwner {
+            window,
+            last_time_changed: resolved_time,
+            client: (window.0 != 0).then_some(client_id),
+        },
+    );
     let name = state.atoms.name(selection).map(str::to_owned);
     debug!(
         "client {} #{} SetSelectionOwner {} -> 0x{:x}",
@@ -133,8 +132,9 @@ pub(super) fn handle_set_selection_owner(
     // at line 185), not the raw `time_val` — a client sending
     // `CurrentTime`/0 must NOT see 0 in the event payload.
     if let Some(old) = old
-        && (window.0 == 0 || old.client != client_id)
-        && let Some(old_target) = client_target_id(state, old.client)
+        && let Some(old_client) = old.client
+        && (window.0 == 0 || old_client != client_id)
+        && let Some(old_target) = client_target_id(state, old_client)
     {
         let old_window = old.window;
         let _dropped = fanout_event_to_clients(state, &[old_target], |buf, seq, order| {
@@ -201,7 +201,7 @@ pub(crate) fn fanout_xfixes_selection_client_close_for_client(
     drop_selections_where(
         state,
         yserver_protocol::x11::xfixes::SELECTION_NOTIFY_CLIENT_CLOSE,
-        |owner| owner.client == cid,
+        |owner| owner.client == Some(cid),
     );
 }
 
@@ -236,7 +236,12 @@ fn drop_selections_where(
         // owner=0 (None) — see Xorg `xfixes/select.c:85-86`:
         // destroy/close subtypes always carry owner=None.
         fanout_xfixes_selection_notify(state, sel, subtype, 0, now, prior_last_time_changed);
-        state.selections.remove(&sel);
+        // Xorg keeps the record and its `lastTimeChanged`
+        // (`dix/selection.c:120-122`, `:134-136`).
+        if let Some(owner) = state.selections.get_mut(&sel) {
+            owner.window = ResourceId(0);
+            owner.client = None;
+        }
     }
 }
 

@@ -3905,7 +3905,7 @@ fn disconnect_of_the_window_owner_sends_window_destroy_when_another_client_set_t
         ]
     );
     assert!(read_all_or_buffered(&mut state, ORDER_GRB, &mut grb).is_empty());
-    assert!(state.selections.is_empty());
+    assert!(state.selections.values().all(|s| s.window.0 == 0));
 }
 
 /// `tools/destroy-order-probe c disconnect`, measured on Xephyr; Xephyr's
@@ -3929,7 +3929,7 @@ fn disconnect_of_the_window_owner_with_the_pointer_in_c_sends_window_destroy_for
         ]
     );
     assert!(read_all_or_buffered(&mut state, ORDER_GRB, &mut grb).is_empty());
-    assert!(state.selections.is_empty());
+    assert!(state.selections.values().all(|s| s.window.0 == 0));
 }
 
 /// Every event `client` has received so far, as the probe prints it.
@@ -3980,7 +3980,10 @@ fn disconnect_of_the_selection_setter_sends_client_close_for_a_window_it_does_no
         ["XFixesSelectionNotify(subtype=2 window=root owner=None)"]
     );
     assert!(order_stream(&mut state, ORDER_APP, &mut app).is_empty());
-    assert!(state.selections.is_empty(), "selection owner: None");
+    assert!(
+        state.selections.values().all(|s| s.window.0 == 0),
+        "selection owner: None"
+    );
 
     handle_destroy_window(
         &mut state,
@@ -4038,7 +4041,10 @@ fn disconnect_of_the_window_owner_sends_window_destroy_not_client_close() {
         ]
     );
     assert!(order_stream(&mut state, ORDER_GRB, &mut grb).is_empty());
-    assert!(state.selections.is_empty(), "selection owner: None");
+    assert!(
+        state.selections.values().all(|s| s.window.0 == 0),
+        "selection owner: None"
+    );
 }
 
 fn create_order_window(state: &mut ServerState, owner: u32, window: u32) {

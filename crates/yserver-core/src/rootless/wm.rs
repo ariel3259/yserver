@@ -136,7 +136,7 @@ pub(super) fn announce(state: &mut ServerState, backend: &mut dyn Backend) {
         crate::server::SelectionOwner {
             window: check,
             last_time_changed: now,
-            client: SERVER_OWNER,
+            client: Some(SERVER_OWNER),
         },
     );
 }
