@@ -1388,8 +1388,9 @@ pub struct ServerState {
     /// This is the **single** authority on how many holds the overlay
     /// has; the backend deliberately counts nothing. Two counters that
     /// can disagree is what leaked the overlay across a compositor
-    /// crash. The backend sees exactly two edges: `get_overlay_window`
-    /// on 0 → 1 and `release_overlay_window` on 1 → 0.
+    /// crash. Claims do not decide existence: GetOverlayWindow
+    /// materializes whenever the COW record is absent, and
+    /// `DestroyWindow(COW)` leaves the claims (Xorg `compwindow.c:624-626`).
     ///
     /// Repeated Gets from one client push repeated entries, matching
     /// Xorg's N-`CompOverlayClientRec` model
@@ -1423,6 +1424,12 @@ pub struct ServerState {
     /// `ServerState` gives it the right lifetime under `-noreset` — as
     /// long as the server, which is as long as the orphaned overlay.
     pub cow_teardown_failed: bool,
+    /// Terminal: a client's windows could not be destroyed (a plan holding
+    /// the COW failed to prepare), so its teardown stopped with the client
+    /// record, its resources and its resource-ID range still in place. The
+    /// core loop shuts the server down at the end of the iteration. Holds
+    /// the cause for the shutdown log.
+    pub fatal_teardown: Option<String>,
     /// SYNC `Await` / `AwaitFence` in progress, keyed by client id. A client
     /// with an entry is suspended (Xorg `IgnoreClient`): the core loop's
     /// fair request queue keeps its later requests queued until the entry
@@ -1856,6 +1863,7 @@ impl ServerState {
             zombie_clients: HashMap::new(),
             cow_claims: Vec::new(),
             cow_teardown_failed: false,
+            fatal_teardown: None,
             scroll_axis_value: [0; 2],
             unpublished_pointer_buttons_down: HashMap::new(),
             key_down_by_device: HashMap::new(),
@@ -3061,6 +3069,10 @@ pub struct ClientState {
     /// flagged client (`client_io::failed_writers`) and nothing more is
     /// written to it meanwhile.
     pub write_failed: bool,
+    /// The client is being closed down: nothing more is written to it (Xorg
+    /// `clientGone`, `dix/dispatch.c:3518`). The entry stays until the
+    /// disconnect removes it.
+    pub gone: bool,
     /// Window the client's pointer/key events route through; demoted off
     /// `Arc<Mutex<ResourceId>>` in D3.
     pub focused_window: ResourceId,
@@ -3120,8 +3132,8 @@ pub struct EventTarget {
 
 impl ServerState {
     /// Drop the COW's shapes with the overlay: Xorg frees them in
-    /// DeleteWindow, so the next overlay starts unshaped. Called from the
-    /// `ReleaseOverlayWindow` handler on the 1→0 transition.
+    /// DeleteWindow, so the next overlay starts unshaped. Called by the
+    /// destroy executor for a plan holding the COW.
     pub fn destroy_cow_input_shape(&mut self) {
         self.shape_windows.remove(&COMPOSITE_OVERLAY_WINDOW);
     }
@@ -3538,6 +3550,7 @@ impl ServerState {
     pub fn subscribers(&self, window: ResourceId, mask_bit: u32) -> Vec<EventTarget> {
         self.clients
             .values()
+            .filter(|c| !c.gone)
             .filter_map(|c| {
                 let mask = c.event_masks.get(&window).copied().unwrap_or(0);
                 if mask & mask_bit != 0 {
@@ -3599,6 +3612,7 @@ impl ServerState {
     ) -> Vec<EventTarget> {
         self.clients
             .values()
+            .filter(|c| !c.gone)
             .filter_map(|c| {
                 let mask = c.event_masks.get(&window).copied().unwrap_or(0);
                 if mask & event_mask != 0 {
@@ -3614,6 +3628,7 @@ impl ServerState {
     pub fn client_target(&self, client_id: ClientId) -> Option<EventTarget> {
         self.clients
             .get(&client_id.0)
+            .filter(|c| !c.gone)
             .map(Self::event_target_for_client)
     }
 
@@ -3773,7 +3788,7 @@ impl ServerState {
 }
 
 /// Like `emit_window_event` but operates on a pre-snapshotted target list (use when the lock has
-/// already been dropped — e.g. after `destroy_window`).
+/// already been dropped).
 pub fn fanout_event(
     targets: &[EventTarget],
     encode: impl Fn(&mut Vec<u8>, SequenceNumber, ClientByteOrder),
@@ -4212,7 +4227,7 @@ fn pointer_event_fanout_inner(
             let mut xi2_targets = Vec::new();
             let mut xi2_raw_targets = Vec::new();
             if xi2_evtype != 0 {
-                for (cid, c) in g.clients.iter() {
+                for (cid, c) in g.clients.iter().filter(|(_, c)| !c.gone) {
                     let mask = xi2_mask_for_client(
                         c,
                         target,

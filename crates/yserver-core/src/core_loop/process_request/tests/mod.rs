@@ -38,7 +38,7 @@ use yserver_protocol::x11::{
     RequestHeader, ResourceId, SequenceNumber, screensaver as x11screensaver, sync as x11sync,
 };
 
-use super::*;
+use super::{window_destroy::destroy_window_subtree, *};
 use crate::{
     backend::{
         FillStyle,
@@ -132,6 +132,7 @@ fn install_client_with_transport(
             outbound: VecDeque::new(),
             watching_writable: false,
             write_failed: false,
+            gone: false,
             focused_window: ROOT_WINDOW,
             reader_control: None,
             is_local: true,

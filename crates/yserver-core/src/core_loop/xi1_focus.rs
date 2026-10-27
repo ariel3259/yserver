@@ -11,7 +11,7 @@
 //! Focus reverts (Xi/exevents.c `DeleteDeviceFromAnyExtEvents`) fire
 //! when the focus window becomes unviewable: unmap, destroy, and
 //! client-disconnect teardown all funnel through
-//! [`revert_unviewable_focus`] / [`revert_focus_for_dying_subtree`].
+//! [`revert_unviewable_focus`] / [`revert_focus_on_dying_window`].
 
 use yserver_protocol::x11::{ClientId, ResourceId};
 
@@ -164,21 +164,18 @@ pub fn revert_unviewable_focus(state: &mut ServerState) {
     }
 }
 
-/// Revert any device focus inside a window subtree that is about to be
-/// destroyed. Must run while the tree is still intact (before resource
-/// removal) so the RevertToParent walk can find the surviving
-/// ancestor. Hook for DestroyWindow / DestroySubwindows / disconnect
-/// teardown.
-pub fn revert_focus_for_dying_subtree(state: &mut ServerState, dying_root: ResourceId) {
-    if dying_root == ROOT_WINDOW {
-        return;
-    }
-    let devices: Vec<u16> = state.xi1_device_focus.keys().copied().collect();
+/// Revert every device focus on `w`, one window of the subtree `dying_root`
+/// being destroyed (Xi/exevents.c:3041-3095, per window from
+/// `DeleteWindowFromAnyEvents`). Devices in id order.
+pub fn revert_focus_on_dying_window(
+    state: &mut ServerState,
+    w: ResourceId,
+    dying_root: ResourceId,
+) {
+    let mut devices: Vec<u16> = state.xi1_device_focus.keys().copied().collect();
+    devices.sort_unstable();
     for dev in devices {
-        let f = device_focus(state, dev);
-        if let Xi1FocusTarget::Window(w) = resolve_raw_window_only(f.focus)
-            && in_subtree(state, w, dying_root)
-        {
+        if resolve_raw_window_only(device_focus(state, dev).focus) == Xi1FocusTarget::Window(w) {
             do_revert(state, dev, w, Some(dying_root));
         }
     }
@@ -744,6 +741,7 @@ mod tests {
                 outbound: VecDeque::new(),
                 watching_writable: false,
                 write_failed: false,
+                gone: false,
                 focused_window: ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
@@ -1035,7 +1033,7 @@ mod tests {
         let inner = make_window(&mut state, 0x0030_0053, dying);
 
         set_device_focus(&mut state, DEV, inner.0, REVERT_TO_PARENT, 100);
-        revert_focus_for_dying_subtree(&mut state, dying);
+        revert_focus_on_dying_window(&mut state, inner, dying);
 
         let f = device_focus(&state, DEV);
         assert_eq!(f.focus, keep.0, "focus must skip the dying subtree");

@@ -10,62 +10,7 @@
 
 use yserver_protocol::x11::{ClientId, ResourceId};
 
-use crate::{
-    backend::Backend,
-    core_loop::fanout::{fanout_event_to_clients, subscribers_by_id},
-    resources::{MapState, ROOT_WINDOW},
-    server::ServerState,
-};
-
-/// One window's identity captured before the resource table forgets
-/// it, so the post-mutation UnmapNotify+DestroyNotify fanout has
-/// stable subscriber lists.
-struct PendingDestroy {
-    window: ResourceId,
-    parent: ResourceId,
-    was_mapped: bool,
-    host_xid: Option<crate::backend::WindowHandle>,
-    on_window: Vec<ClientId>,
-    on_parent: Vec<ClientId>,
-}
-
-fn collect_destroy_order(
-    table: &crate::resources::ResourceTable,
-    root: ResourceId,
-    out: &mut Vec<ResourceId>,
-) {
-    let Some(w) = table.window(root) else {
-        return;
-    };
-    // Xorg CrushTree (`dix/window.c:1023`): inferiors first, topmost first.
-    for child in w.children.clone().into_iter().rev() {
-        collect_destroy_order(table, child, out);
-    }
-    out.push(root);
-}
-
-fn fanout_destroy_sequence(state: &mut ServerState, pending: &PendingDestroy) {
-    let window = pending.window;
-    let parent = pending.parent;
-    if pending.was_mapped {
-        let _dropped = fanout_event_to_clients(state, &pending.on_window, |buf, seq, order| {
-            yserver_protocol::x11::encode_unmap_notify_event(
-                buf, seq, order, window, window, false,
-            );
-        });
-        let _dropped = fanout_event_to_clients(state, &pending.on_parent, |buf, seq, order| {
-            yserver_protocol::x11::encode_unmap_notify_event(
-                buf, seq, order, parent, window, false,
-            );
-        });
-    }
-    let _dropped = fanout_event_to_clients(state, &pending.on_window, |buf, seq, order| {
-        yserver_protocol::x11::encode_destroy_notify_event(buf, seq, order, window, window);
-    });
-    let _dropped = fanout_event_to_clients(state, &pending.on_parent, |buf, seq, order| {
-        yserver_protocol::x11::encode_destroy_notify_event(buf, seq, order, parent, window);
-    });
-}
+use crate::{backend::Backend, resources::MapState, server::ServerState};
 
 /// The host-pixmap frees one teardown made: `freed` went back to the backend,
 /// `deferred` was held because [`ResourceTable::host_xid_still_referenced`]
@@ -193,9 +138,18 @@ pub fn process_disconnect_reporting(
     // (write-side EPIPE from process_request races the reader thread's
     // EOF → Message::ClientDisconnected). The first call removes the
     // entry from state.clients; the second sees None and bails.
-    if !state.clients.contains_key(&client_id.0) {
+    let Some(client) = state.clients.get_mut(&client_id.0) else {
+        return;
+    };
+    // Already gone and still here: an earlier teardown of this client hit a
+    // fatal failure and stopped (`fatal_teardown`); the server is shutting
+    // down, and nothing may run that teardown again.
+    if client.gone {
         return;
     }
+    // Xorg `clientGone` (`dix/dispatch.c:3518`): nothing emitted from here on
+    // reaches the departing client.
+    client.gone = true;
     let close_mode = state.close_down_modes.remove(&client_id.0).unwrap_or(0);
     let retain = close_mode == 1 || close_mode == 2;
     if state.server_grab_owner == Some(client_id) {
@@ -233,6 +187,121 @@ pub fn process_disconnect_reporting(
         state, client_id,
     );
 
+    // Xorg `ReleaseActiveGrabs` (`dix/dispatch.c:3496`) runs before
+    // `FreeClientResources` (`:3551`): the client's own grabs are gone before
+    // any of its windows.
+    state.button_grabs.retain(|g| g.owner != client_id);
+    state.key_grabs.retain(|g| g.owner != client_id);
+    let dynamic_pointer_grabs: Vec<u16> = state
+        .xi2_pointer_grabs
+        .iter()
+        .filter_map(|(device, grab)| (grab.owner == client_id).then_some(*device))
+        .collect();
+    let dynamic_keyboard_grabs: Vec<u16> = state
+        .xi2_keyboard_grabs
+        .iter()
+        .filter_map(|(device, grab)| (grab.owner == client_id).then_some(*device))
+        .collect();
+    for device in dynamic_pointer_grabs {
+        state.xi2_pointer_grabs.remove(&device);
+        if let Some(freeze) = state.xi1_frozen.get_mut(&device) {
+            freeze.state = crate::server::Xi1SyncState::Thawed;
+            freeze.stored = None;
+        }
+        crate::core_loop::pointer_fanout::xi1_core_grab_bridge_release(state, device, client_id);
+        state.reattach_xi2_slave(device);
+    }
+    for device in dynamic_keyboard_grabs {
+        state.xi2_keyboard_grabs.remove(&device);
+        if let Some(freeze) = state.xi1_frozen.get_mut(&device) {
+            freeze.state = crate::server::Xi1SyncState::Thawed;
+            freeze.stored = None;
+        }
+        crate::core_loop::pointer_fanout::xi1_core_grab_bridge_release(state, device, client_id);
+        state.reattach_xi2_slave(device);
+    }
+    let released_pointer_grab = state
+        .active_pointer_grab
+        .is_some_and(|grab| grab.owner == client_id);
+    if released_pointer_grab {
+        state.clear_pointer_grab();
+        if let Some(freeze) = state
+            .xi1_frozen
+            .get_mut(&crate::xinput::DEVICEID_MASTER_POINTER)
+        {
+            freeze.stored = None;
+            freeze.state = crate::server::Xi1SyncState::Thawed;
+            freeze.other = None;
+        }
+        crate::core_loop::pointer_fanout::xi1_core_grab_bridge_release(
+            state,
+            crate::xinput::DEVICEID_MASTER_POINTER,
+            client_id,
+        );
+    }
+    // Xorg ReleaseActiveGrabs (CloseDownClient): a disconnecting
+    // client's ACTIVE grabs must go too, or the stale record makes
+    // every later GrabPointer/GrabKeyboard return AlreadyGrabbed.
+    if released_pointer_grab {
+        // Xorg DeactivatePointerGrab on client teardown reverts the
+        // sprite from the grab cursor back to the window/default cursor.
+        let _ = backend.set_grab_cursor(None, None);
+    }
+    if state
+        .active_keyboard_grab
+        .is_some_and(|g| g.owner == client_id)
+    {
+        state.active_keyboard_grab = None;
+        if let Some(freeze) = state
+            .xi1_frozen
+            .get_mut(&crate::xinput::DEVICEID_MASTER_KEYBOARD)
+        {
+            freeze.stored = None;
+            freeze.state = crate::server::Xi1SyncState::Thawed;
+            freeze.other = None;
+        }
+        crate::core_loop::pointer_fanout::xi1_core_grab_bridge_release(
+            state,
+            crate::xinput::DEVICEID_MASTER_KEYBOARD,
+            client_id,
+        );
+    }
+    // XI 1.x grab teardown: drop the client's passive grabs, release
+    // its active device grabs, and thaw any devices its grabs froze —
+    // a leaked freeze queues device events forever and hangs every
+    // later test/client waiting on input.
+    state.xi1_passive_grabs.retain(|g| g.owner != client_id);
+    let released: Vec<u16> = state
+        .xi1_active_grabs
+        .iter()
+        .filter(|(_, g)| g.owner == client_id)
+        .map(|(d, _)| *d)
+        .collect();
+    for dev in &released {
+        // Deactivation resets the device's sync state, releases the
+        // paired device if it was held on this grab's behalf
+        // (other_devices_mode), and flushes the queues.
+        crate::core_loop::pointer_fanout::xi1_deactivate_device_grab(state, *dev);
+    }
+    if released.is_empty() && state.xi1_active_grabs.is_empty() {
+        // No active grabs anywhere, yet freezes linger (e.g. a sync
+        // passive grab's owner died between activation and release):
+        // clear them, or device events queue forever and every later
+        // client waiting on input hangs.
+        let devs: Vec<u16> = state
+            .xi1_frozen
+            .iter()
+            .filter(|(_, f)| f.frozen())
+            .map(|(d, _)| *d)
+            .collect();
+        for dev in devs {
+            let xid_map = backend.xid_map().clone();
+            crate::core_loop::pointer_fanout::xi1_thaw_device(state, backend, &xid_map, dev);
+        }
+    }
+    let xid_map = backend.xid_map().clone();
+    crate::core_loop::pointer_fanout::xi1_compute_freezes(state, backend, &xid_map);
+
     let hit_barriers: Vec<(u32, crate::server::PointerBarrier)> = state
         .pointer_barriers
         .iter()
@@ -263,79 +332,13 @@ pub fn process_disconnect_reporting(
         );
     }
 
-    let mut owned_roots: Vec<ResourceId> = Vec::new();
-    state
-        .resources
-        .collect_owned_window_roots(client_id, &mut owned_roots);
-
-    let mut pending: Vec<PendingDestroy> = Vec::new();
-    let mut all_destroyed: Vec<ResourceId> = Vec::new();
-    // Attribute pixmaps of the dying subtrees, snapshotted BEFORE the windows
-    // go away — the same thing `destroy_window_subtree` does. Without it a
-    // tile whose only reference was a destroyed window's background or border
-    // leaks: its pixmap resource may already be gone (FreePixmap retained it
-    // through the window), so `remove_non_window_resources_owned_by` has
-    // nothing to hand back and nothing is left to notice (#133).
-    let mut attr_pixmap_xids: Vec<u32> = Vec::new();
-    for root in owned_roots {
-        // XI1 device focus on a window in this dying subtree reverts
-        // while the tree is still intact (RevertToParent walks the
-        // surviving ancestors). A leaked focus on a destroyed window
-        // would silently eat all later DeviceKey events.
-        crate::core_loop::xi1_focus::revert_focus_for_dying_subtree(state, root);
-        let mut order: Vec<ResourceId> = Vec::new();
-        collect_destroy_order(&state.resources, root, &mut order);
-        for w in &order {
-            let (parent, was_mapped, host_xid) =
-                state
-                    .resources
-                    .window(*w)
-                    .map_or((ROOT_WINDOW, false, None), |win| {
-                        (
-                            win.parent,
-                            // Xorg DeleteWindow unmaps only the window it
-                            // deletes; CrushTree sends its inferiors none.
-                            *w == root && win.map_state != MapState::Unmapped,
-                            win.host_xid,
-                        )
-                    });
-            let on_window = subscribers_by_id(state, *w, 0x0002_0000);
-            let on_parent = subscribers_by_id(state, parent, 0x0008_0000);
-            pending.push(PendingDestroy {
-                window: *w,
-                parent,
-                was_mapped,
-                host_xid,
-                on_window,
-                on_parent,
-            });
+    let (all_destroyed, attr_pixmap_xids) = match destroy_owned_windows(state, backend, client_id) {
+        Ok(destroyed) => destroyed,
+        Err(err) => {
+            abort_teardown(state, "disconnect", client_id, &err);
+            return;
         }
-        // Xorg DeleteWindow unmaps first (`dix/window.c:1075`): the pointer
-        // leaves the dying subtree while it still exists.
-        if state
-            .resources
-            .window(root)
-            .is_some_and(|w| w.map_state != MapState::Unmapped)
-        {
-            let _ = state.resources.unmap_window(root);
-            backend.windows_restructured(state);
-        }
-        attr_pixmap_xids.extend(state.resources.collect_attribute_pixmap_host_xids(root));
-        crate::core_loop::process_request::free_pictures_on_destroyed_windows(
-            state, backend, None, &order,
-        );
-        crate::core_loop::process_request::release_redirects_on_destroyed_windows(
-            state, backend, None, &order,
-        );
-        let _ = state.resources.destroy_window(root);
-        all_destroyed.extend(order);
-    }
-    crate::core_loop::process_request::purge_present_for_destroyed_windows(
-        state,
-        backend,
-        &all_destroyed,
-    );
-    state.drop_window_subscriptions(&all_destroyed);
+    };
 
     let removed = if retain {
         // Resources keep their original `owner: ClientId`. Tracking
@@ -532,133 +535,7 @@ pub fn process_disconnect_reporting(
         state.dpms.last_activity = std::time::Instant::now();
         crate::core_loop::process_request::reset_idletime_state_after_suspend_release(state);
     }
-    state.button_grabs.retain(|g| g.owner != client_id);
-    state.key_grabs.retain(|g| g.owner != client_id);
-    let dynamic_pointer_grabs: Vec<u16> = state
-        .xi2_pointer_grabs
-        .iter()
-        .filter_map(|(device, grab)| (grab.owner == client_id).then_some(*device))
-        .collect();
-    let dynamic_keyboard_grabs: Vec<u16> = state
-        .xi2_keyboard_grabs
-        .iter()
-        .filter_map(|(device, grab)| (grab.owner == client_id).then_some(*device))
-        .collect();
-    for device in dynamic_pointer_grabs {
-        state.xi2_pointer_grabs.remove(&device);
-        if let Some(freeze) = state.xi1_frozen.get_mut(&device) {
-            freeze.state = crate::server::Xi1SyncState::Thawed;
-            freeze.stored = None;
-        }
-        crate::core_loop::pointer_fanout::xi1_core_grab_bridge_release(state, device, client_id);
-        state.reattach_xi2_slave(device);
-    }
-    for device in dynamic_keyboard_grabs {
-        state.xi2_keyboard_grabs.remove(&device);
-        if let Some(freeze) = state.xi1_frozen.get_mut(&device) {
-            freeze.state = crate::server::Xi1SyncState::Thawed;
-            freeze.stored = None;
-        }
-        crate::core_loop::pointer_fanout::xi1_core_grab_bridge_release(state, device, client_id);
-        state.reattach_xi2_slave(device);
-    }
-    let released_pointer_grab = state
-        .active_pointer_grab
-        .is_some_and(|grab| grab.owner == client_id);
-    if released_pointer_grab {
-        state.clear_pointer_grab();
-        if let Some(freeze) = state
-            .xi1_frozen
-            .get_mut(&crate::xinput::DEVICEID_MASTER_POINTER)
-        {
-            freeze.stored = None;
-            freeze.state = crate::server::Xi1SyncState::Thawed;
-            freeze.other = None;
-        }
-        crate::core_loop::pointer_fanout::xi1_core_grab_bridge_release(
-            state,
-            crate::xinput::DEVICEID_MASTER_POINTER,
-            client_id,
-        );
-    }
-    // Xorg ReleaseActiveGrabs (CloseDownClient): a disconnecting
-    // client's ACTIVE grabs must go too, or the stale record makes
-    // every later GrabPointer/GrabKeyboard return AlreadyGrabbed.
-    if released_pointer_grab {
-        // Xorg DeactivatePointerGrab on client teardown reverts the
-        // sprite from the grab cursor back to the window/default cursor.
-        let _ = backend.set_grab_cursor(None, None);
-    }
-    if state
-        .active_keyboard_grab
-        .is_some_and(|g| g.owner == client_id)
-    {
-        state.active_keyboard_grab = None;
-        if let Some(freeze) = state
-            .xi1_frozen
-            .get_mut(&crate::xinput::DEVICEID_MASTER_KEYBOARD)
-        {
-            freeze.stored = None;
-            freeze.state = crate::server::Xi1SyncState::Thawed;
-            freeze.other = None;
-        }
-        crate::core_loop::pointer_fanout::xi1_core_grab_bridge_release(
-            state,
-            crate::xinput::DEVICEID_MASTER_KEYBOARD,
-            client_id,
-        );
-    }
-    // XI 1.x grab teardown: drop the client's passive grabs, release
-    // its active device grabs, and thaw any devices its grabs froze —
-    // a leaked freeze queues device events forever and hangs every
-    // later test/client waiting on input.
-    state.xi1_passive_grabs.retain(|g| g.owner != client_id);
-    let released: Vec<u16> = state
-        .xi1_active_grabs
-        .iter()
-        .filter(|(_, g)| g.owner == client_id)
-        .map(|(d, _)| *d)
-        .collect();
-    for dev in &released {
-        // Deactivation resets the device's sync state, releases the
-        // paired device if it was held on this grab's behalf
-        // (other_devices_mode), and flushes the queues.
-        crate::core_loop::pointer_fanout::xi1_deactivate_device_grab(state, *dev);
-    }
-    if released.is_empty() && state.xi1_active_grabs.is_empty() {
-        // No active grabs anywhere, yet freezes linger (e.g. a sync
-        // passive grab's owner died between activation and release):
-        // clear them, or device events queue forever and every later
-        // client waiting on input hangs.
-        let devs: Vec<u16> = state
-            .xi1_frozen
-            .iter()
-            .filter(|(_, f)| f.frozen())
-            .map(|(d, _)| *d)
-            .collect();
-        for dev in devs {
-            let xid_map = backend.xid_map().clone();
-            crate::core_loop::pointer_fanout::xi1_thaw_device(state, backend, &xid_map, dev);
-        }
-    }
-    let xid_map = backend.xid_map().clone();
-    crate::core_loop::pointer_fanout::xi1_compute_freezes(state, backend, &xid_map);
-    state
-        .selections
-        .retain(|_, entry| !dead_windows.contains(&entry.0));
 
-    // Host-side teardown. Order matches `nested::handle_client`'s tail
-    // so behavior is bit-identical.
-    for entry in pending {
-        if let Some(xid) = entry.host_xid {
-            let _ = backend.destroy_subwindow(None, xid.as_raw());
-            backend.unregister_host_window(xid.as_raw());
-        }
-        fanout_destroy_sequence(state, &entry);
-    }
-    // Step 2 (DRIFT 2): destroyed top-levels changed root's child set;
-    // reproject the backend top-level order from core.
-    backend.sync_top_level_order(state);
     for xid in removed.closed_fonts {
         let _ = backend.close_font(None, xid);
     }
@@ -803,6 +680,62 @@ pub(crate) fn unrealize_redirect_backing(
     Some(backing.host_pixmap)
 }
 
+/// Destroy every window `client` owns, one owned root at a time, each run to
+/// completion before the next (Xorg `FreeClientResources` deletes each window
+/// resource through `DeleteWindow`, `dix/resource.c:1146-1154`). Returns the
+/// destroyed windows, survivors' windows under them included, and their
+/// attribute pixmaps for the orphan gate.
+///
+/// # Errors
+/// A plan holding the COW (the compositor reparented it under one of
+/// `client`'s windows) failed to prepare. That root goes first, so nothing
+/// was destroyed.
+fn destroy_owned_windows(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    client: ClientId,
+) -> std::io::Result<(Vec<ResourceId>, Vec<u32>)> {
+    let mut owned_roots: Vec<ResourceId> = Vec::new();
+    state
+        .resources
+        .collect_owned_window_roots(client, &mut owned_roots);
+    // Root order is free (hash order in Xorg too); the only fallible one
+    // goes first.
+    owned_roots.sort_by_key(|root| {
+        !state
+            .resources
+            .plan_destroy(*root)
+            .is_some_and(|plan| plan.contains_cow())
+    });
+    let mut destroyed = Vec::new();
+    let mut attr_pixmaps = Vec::new();
+    for root in owned_roots {
+        // An earlier root's plan already took a root nested under it.
+        let Some(plan) = state.resources.plan_destroy(root) else {
+            continue;
+        };
+        let prepared = plan.prepare(backend).map_err(|err| {
+            std::io::Error::other(format!(
+                "cannot destroy window 0x{:x}, which holds the composite overlay: {err}",
+                root.0
+            ))
+        })?;
+        let outcome =
+            crate::core_loop::process_request::execute_destroy(state, backend, None, prepared);
+        destroyed.extend(outcome.windows);
+        attr_pixmaps.extend(outcome.attr_pixmaps);
+    }
+    Ok((destroyed, attr_pixmaps))
+}
+
+/// A client teardown that cannot complete: leave its record, resources and
+/// resource-ID range in place and have the core loop shut the server down.
+fn abort_teardown(state: &mut ServerState, what: &str, client: ClientId, err: &std::io::Error) {
+    let cause = format!("{what} of client {}: {err}", client.0);
+    log::error!("{cause}; teardown stopped, shutting the server down");
+    state.fatal_teardown.get_or_insert(cause);
+}
+
 /// Destroy every resource owned by a zombie client — invoked by
 /// `KillClient(AllTemporary)` (for each RetainTemporary zombie) and by
 /// `KillClient(resource_owned_by_a_zombie)`. Mirrors the resource-
@@ -810,109 +743,40 @@ pub(crate) fn unrealize_redirect_backing(
 /// (there is no `state.clients` entry, no reader thread, no
 /// connection-tied extension state — those were torn down at the
 /// original disconnect). The caller must remove `zombie` from
-/// `state.zombie_clients` after this returns.
+/// `state.zombie_clients` after this returns `Ok`.
+///
+/// # Errors
+/// The zombie's windows could not be destroyed; nothing of it was freed and
+/// `state.fatal_teardown` is set. The zombie must stay recorded.
 pub fn destroy_zombie_resources(
     state: &mut ServerState,
     backend: &mut dyn Backend,
     zombie: ClientId,
-) {
-    destroy_zombie_resources_reporting(state, backend, zombie, None);
+) -> std::io::Result<()> {
+    destroy_zombie_resources_reporting(state, backend, zombie, None)
 }
 
 /// [`destroy_zombie_resources`], reporting its host-pixmap frees the same way
 /// [`process_disconnect_reporting`] does.
+///
+/// # Errors
+/// As [`destroy_zombie_resources`].
 pub fn destroy_zombie_resources_reporting(
     state: &mut ServerState,
     backend: &mut dyn Backend,
     zombie: ClientId,
     host_pixmap_frees: Option<&mut HostPixmapFrees>,
-) {
-    let mut owned_roots: Vec<ResourceId> = Vec::new();
-    state
-        .resources
-        .collect_owned_window_roots(zombie, &mut owned_roots);
-
-    let mut pending: Vec<PendingDestroy> = Vec::new();
-    let mut all_destroyed: Vec<ResourceId> = Vec::new();
-    // Attribute pixmaps of the dying subtrees, snapshotted BEFORE the windows
-    // go away — the same thing `destroy_window_subtree` does. Without it a
-    // tile whose only reference was a destroyed window's background or border
-    // leaks: its pixmap resource may already be gone (FreePixmap retained it
-    // through the window), so `remove_non_window_resources_owned_by` has
-    // nothing to hand back and nothing is left to notice (#133).
-    let mut attr_pixmap_xids: Vec<u32> = Vec::new();
-    for root in owned_roots {
-        // XI1 device focus on a window in this dying subtree reverts
-        // while the tree is still intact (RevertToParent walks the
-        // surviving ancestors). A leaked focus on a destroyed window
-        // would silently eat all later DeviceKey events.
-        crate::core_loop::xi1_focus::revert_focus_for_dying_subtree(state, root);
-        let mut order: Vec<ResourceId> = Vec::new();
-        collect_destroy_order(&state.resources, root, &mut order);
-        for w in &order {
-            let (parent, was_mapped, host_xid) =
-                state
-                    .resources
-                    .window(*w)
-                    .map_or((ROOT_WINDOW, false, None), |win| {
-                        (
-                            win.parent,
-                            // Xorg DeleteWindow unmaps only the window it
-                            // deletes; CrushTree sends its inferiors none.
-                            *w == root && win.map_state != MapState::Unmapped,
-                            win.host_xid,
-                        )
-                    });
-            let on_window = subscribers_by_id(state, *w, 0x0002_0000);
-            let on_parent = subscribers_by_id(state, parent, 0x0008_0000);
-            pending.push(PendingDestroy {
-                window: *w,
-                parent,
-                was_mapped,
-                host_xid,
-                on_window,
-                on_parent,
-            });
+) -> std::io::Result<()> {
+    let (_destroyed, attr_pixmap_xids) = match destroy_owned_windows(state, backend, zombie) {
+        Ok(destroyed) => destroyed,
+        Err(err) => {
+            abort_teardown(state, "zombie cleanup", zombie, &err);
+            return Err(err);
         }
-        // Xorg DeleteWindow unmaps first (`dix/window.c:1075`): the pointer
-        // leaves the dying subtree while it still exists.
-        if state
-            .resources
-            .window(root)
-            .is_some_and(|w| w.map_state != MapState::Unmapped)
-        {
-            let _ = state.resources.unmap_window(root);
-            backend.windows_restructured(state);
-        }
-        attr_pixmap_xids.extend(state.resources.collect_attribute_pixmap_host_xids(root));
-        crate::core_loop::process_request::free_pictures_on_destroyed_windows(
-            state, backend, None, &order,
-        );
-        crate::core_loop::process_request::release_redirects_on_destroyed_windows(
-            state, backend, None, &order,
-        );
-        let _ = state.resources.destroy_window(root);
-        all_destroyed.extend(order);
-    }
-    crate::core_loop::process_request::purge_present_for_destroyed_windows(
-        state,
-        backend,
-        &all_destroyed,
-    );
-    state.drop_window_subscriptions(&all_destroyed);
+    };
 
     let removed = state.resources.remove_non_window_resources_owned_by(zombie);
 
-    for entry in pending {
-        if let Some(xid) = entry.host_xid {
-            let _ = backend.destroy_subwindow(None, xid.as_raw());
-            backend.unregister_host_window(xid.as_raw());
-        }
-        fanout_destroy_sequence(state, &entry);
-    }
-    // Step 2 (DRIFT 2): destroyed top-levels changed root's child set;
-    // reproject the backend top-level order from core.
-    backend.sync_top_level_order(state);
     for xid in removed.closed_fonts {
         let _ = backend.close_font(None, xid);
     }
@@ -953,6 +817,7 @@ pub fn destroy_zombie_resources_reporting(
             );
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -994,6 +859,7 @@ mod tests {
                 outbound: VecDeque::new(),
                 watching_writable: false,
                 write_failed: false,
+                gone: false,
                 focused_window: ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
@@ -1021,6 +887,7 @@ mod tests {
                 outbound: VecDeque::new(),
                 watching_writable: false,
                 write_failed: false,
+                gone: false,
                 focused_window: ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
@@ -1482,6 +1349,72 @@ mod tests {
         }
     }
 
+    /// `HostPixmapFrees` for a tile that only a destroyed window's border
+    /// still held: freed when nothing else names it, deferred while another
+    /// client's border does.
+    #[test]
+    fn disconnect_reports_a_border_only_tile_freed_or_deferred() {
+        for shared in [false, true] {
+            const HOST_TILE: u32 = 0x9999_0061;
+            let host = crate::backend::PixmapHandle::from_raw(HOST_TILE).expect("non-zero");
+            let tile = ResourceId(0x0070_0061);
+            let mut state = ServerState::new();
+            let mut backend = RecordingBackend::new();
+            install_client(&mut state, 7);
+            install_client(&mut state, 8);
+            state.resources.create_pixmap(
+                ClientId(7),
+                CreatePixmapRequest {
+                    pixmap: tile,
+                    drawable: ROOT_WINDOW,
+                    width: 16,
+                    height: 16,
+                    depth: 24,
+                },
+            );
+            assert!(state.resources.set_pixmap_host_xid(tile, host));
+            let windows: &[(u32, u32)] = if shared {
+                &[(7, 0x0070_0062), (8, 0x0080_0062)]
+            } else {
+                &[(7, 0x0070_0062)]
+            };
+            for &(owner, window) in windows {
+                state.resources.create_window(
+                    ClientId(owner),
+                    CreateWindowRequest {
+                        depth: 24,
+                        window: ResourceId(window),
+                        parent: ROOT_WINDOW,
+                        width: 100,
+                        height: 100,
+                        border_width: 4,
+                        class: 1,
+                        visual: crate::resources::ROOT_VISUAL,
+                        border_pixmap: Some(tile),
+                        ..Default::default()
+                    },
+                );
+            }
+            assert!(state.resources.free_pixmap(tile).is_some());
+
+            let mut frees = super::HostPixmapFrees::default();
+            super::process_disconnect_reporting(
+                &mut state,
+                &mut backend,
+                ClientId(7),
+                Some(&mut frees),
+            );
+
+            let (freed, deferred) = if shared {
+                (vec![], vec![HOST_TILE])
+            } else {
+                (vec![HOST_TILE], vec![])
+            };
+            assert_eq!(frees.freed, freed, "shared={shared}");
+            assert_eq!(frees.deferred, deferred, "shared={shared}");
+        }
+    }
+
     /// #196: a pixmap the client freed while its GC still held it (as tile,
     /// stipple or clip mask) dies with the GC at disconnect — Xorg's `FreeGC`
     /// drops those refs (`dix/gc.c:776-781`). The pixmap resource was already
@@ -1613,7 +1546,7 @@ mod tests {
         );
 
         let mut backend = RecordingBackend::new();
-        destroy_zombie_resources(&mut state, &mut backend, ClientId(7));
+        destroy_zombie_resources(&mut state, &mut backend, ClientId(7)).expect("zombie cleanup");
         assert!(
             !backend
                 .calls()
@@ -1670,7 +1603,7 @@ mod tests {
         assert!(backend.dri3_syncobj_owners.contains_key(&XID));
         assert_eq!(state.zombie_clients.get(&7), Some(&1));
 
-        destroy_zombie_resources(&mut state, &mut backend, ClientId(7));
+        destroy_zombie_resources(&mut state, &mut backend, ClientId(7)).expect("zombie cleanup");
         assert!(!state.resources.xid_in_use(ResourceId(XID)));
         assert!(!backend.dri3_syncobj_owners.contains_key(&XID));
     }
@@ -1695,7 +1628,7 @@ mod tests {
 
         // This is the operation KillClient(AllTemporary) performs for each
         // mode-2 zombie.
-        destroy_zombie_resources(&mut state, &mut backend, ClientId(7));
+        destroy_zombie_resources(&mut state, &mut backend, ClientId(7)).expect("zombie cleanup");
         assert!(!state.resources.xid_in_use(ResourceId(XID)));
         assert!(!backend.dri3_syncobj_owners.contains_key(&XID));
     }
@@ -1731,7 +1664,7 @@ mod tests {
         state.zombie_clients.insert(32, 1);
         state.zombie_clients.insert(33, 1);
 
-        destroy_zombie_resources(&mut state, &mut backend, ClientId(32));
+        destroy_zombie_resources(&mut state, &mut backend, ClientId(32)).expect("zombie cleanup");
 
         assert!(
             state
@@ -2018,5 +1951,170 @@ mod tests {
         );
         process_disconnect(&mut state, &mut backend, ClientId(1));
         assert!(state.pointer_barriers.is_empty());
+    }
+
+    /// Drive one core or extension request from `client`.
+    fn request(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        client: u32,
+        opcode: u8,
+        data: u8,
+        body: &[u8],
+    ) {
+        crate::core_loop::process_request::process_request(
+            state,
+            backend,
+            ClientId(client),
+            yserver_protocol::x11::SequenceNumber(1),
+            yserver_protocol::x11::RequestHeader {
+                opcode,
+                data,
+                length_units: u32::try_from(1 + body.len().div_ceil(4)).expect("length"),
+            },
+            body,
+            None,
+        )
+        .expect("process_request");
+    }
+
+    /// Compositor client 2 takes the overlay and reparents it under `w`
+    /// (ReparentWindow, opcode 7); then the overlay release starts failing.
+    fn cow_under(state: &mut ServerState, backend: &mut RecordingBackend, w: u32) {
+        use crate::resources::COMPOSITE_OVERLAY_WINDOW;
+        request(
+            state,
+            backend,
+            2,
+            144,
+            yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+            &ROOT_WINDOW.0.to_le_bytes(),
+        );
+        let mut body = COMPOSITE_OVERLAY_WINDOW.0.to_le_bytes().to_vec();
+        body.extend_from_slice(&w.to_le_bytes());
+        body.extend_from_slice(&[0; 4]);
+        request(state, backend, 2, 7, 0, &body);
+        assert_eq!(
+            state
+                .resources
+                .window(COMPOSITE_OVERLAY_WINDOW)
+                .map(|cow| cow.parent),
+            Some(ResourceId(w)),
+            "precondition: the COW is under the client's window"
+        );
+        backend.cow_teardown_fails = true;
+    }
+
+    fn create_window_owned_by(state: &mut ServerState, owner: u32, w: u32, pixmap: u32) {
+        state.resources.create_window(
+            ClientId(owner),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(w),
+                parent: ROOT_WINDOW,
+                width: 100,
+                height: 100,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(ResourceId(w));
+        state.resources.create_pixmap(
+            ClientId(owner),
+            CreatePixmapRequest {
+                pixmap: ResourceId(pixmap),
+                drawable: ROOT_WINDOW,
+                width: 16,
+                height: 16,
+                depth: 24,
+            },
+        );
+    }
+
+    fn assert_teardown_stopped_intact(state: &ServerState, owner: u32, w: u32, pixmap: u32) {
+        use crate::resources::COMPOSITE_OVERLAY_WINDOW;
+        assert_eq!(
+            state.resources.window(ResourceId(w)).map(|w| w.owner),
+            Some(ClientId(owner)),
+            "the client's window survives, still its own"
+        );
+        assert_eq!(
+            state
+                .resources
+                .window(COMPOSITE_OVERLAY_WINDOW)
+                .map(|cow| cow.parent),
+            Some(ResourceId(w)),
+            "the COW survives where it was"
+        );
+        assert_eq!(
+            state.resources.resource_owner(ResourceId(pixmap)),
+            Some(ClientId(owner)),
+            "the client's other resources were not freed"
+        );
+        assert!(
+            state.fatal_teardown.is_some(),
+            "the shutdown request is raised"
+        );
+    }
+
+    /// A disconnect whose window holds the COW, with the overlay release
+    /// failing: the teardown stops before anything of the client is freed,
+    /// its record and resource-ID range stay, and the server is asked to
+    /// shut down (the terminal policy in
+    /// `docs/superpowers/plans/2026-10-27-window-destroy-plan.md`).
+    #[test]
+    fn disconnect_whose_window_holds_a_cow_that_cannot_be_released_stops_and_terminates() {
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        let (base, mask) = state.id_allocator.allocate().expect("a base");
+        install_client(&mut state, 1);
+        let client = state.clients.get_mut(&1).expect("client 1");
+        client.resource_id_base = base;
+        client.resource_id_mask = mask;
+        install_client(&mut state, 2);
+        let (w, pixmap) = (base | 1, base | 2);
+        create_window_owned_by(&mut state, 1, w, pixmap);
+        cow_under(&mut state, &mut backend, w);
+
+        process_disconnect(&mut state, &mut backend, ClientId(1));
+
+        assert_teardown_stopped_intact(&state, 1, w, pixmap);
+        assert!(state.clients.contains_key(&1), "the client record stays");
+        assert_ne!(
+            state.id_allocator.allocate().map(|(b, _)| b),
+            Some(base),
+            "the client's resource-ID range is not handed out again"
+        );
+
+        // A second disconnect of the same client (the reader's EOF racing
+        // the first) does not run the teardown again.
+        backend.calls.lock().expect("calls").clear();
+        process_disconnect(&mut state, &mut backend, ClientId(1));
+        let calls = backend.calls.lock().expect("calls");
+        assert!(calls.is_empty(), "nothing ran: {calls:?}");
+    }
+
+    /// The same failure on a zombie's window, through KillClient (opcode
+    /// 113) of a resource the zombie owns: nothing is freed and the zombie
+    /// stays recorded.
+    #[test]
+    fn zombie_cleanup_whose_window_holds_a_cow_that_cannot_be_released_stops_and_terminates() {
+        const ZOMBIE: u32 = 7;
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        install_client(&mut state, 2);
+        let (w, pixmap) = (0x0070_0001, 0x0070_0002);
+        create_window_owned_by(&mut state, ZOMBIE, w, pixmap);
+        state.zombie_clients.insert(ZOMBIE, 1);
+        cow_under(&mut state, &mut backend, w);
+
+        request(&mut state, &mut backend, 2, 113, 0, &pixmap.to_le_bytes());
+
+        assert_teardown_stopped_intact(&state, ZOMBIE, w, pixmap);
+        assert!(
+            state.zombie_clients.contains_key(&ZOMBIE),
+            "the zombie stays recorded"
+        );
     }
 }

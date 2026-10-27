@@ -171,22 +171,15 @@ impl ResourceTable {
         }
     }
 
-    pub fn destroy_window(&mut self, id: ResourceId) -> Vec<ResourceId> {
-        let mut destroyed = Vec::new();
-        self.destroy_window_inner(id, &mut destroyed);
-        destroyed
-    }
-
     /// Stage 4e — create the Composite Overlay Window resource record
     /// as a child of root, populate its `host_xid`, and insert it as
     /// the topmost child via `cow_aware_top_index`.
     ///
     /// **Precondition: COW is not currently materialized.** Called by
-    /// the core `GetOverlayWindow` handler only on the 0→1 refcount
-    /// transition (the backend's `get_overlay_window` returned
-    /// `Ok(true)`). Panics if a COW resource record already exists;
-    /// repeated `GetOverlayWindow` calls without an intervening release
-    /// are refcount-only and never reach this function. This guard is
+    /// the core `GetOverlayWindow` handler only when no COW record
+    /// exists and the backend's `get_overlay_window` returned
+    /// `Ok(true)`. Panics if a COW resource record already exists. This
+    /// guard is
     /// load-bearing: the COW's resource record may carry live state
     /// across an interactive session (event-mask selections, properties,
     /// children — the compositor stage gets reparented under it),
@@ -195,8 +188,7 @@ impl ResourceTable {
         assert!(
             !self.windows.contains_key(&COMPOSITE_OVERLAY_WINDOW.0),
             "materialize_cow_resource: COW already materialized; \
-             core handler must only call this on get_overlay_window's \
-             Ok(true) (0→1) return, never on subsequent claims"
+             core handler must only call this while no COW record exists"
         );
         // Build the resource record. Geometry mirrors Xorg
         // `compoverlay.c:compCreateOverlayWindow`: full screen, depth =
@@ -229,20 +221,6 @@ impl ResourceTable {
             let idx = cow_aware_top_index(root);
             root.children.insert(idx, COMPOSITE_OVERLAY_WINDOW);
         }
-    }
-
-    /// Stage 4e — symmetric teardown. Remove the COW from root.children
-    /// and drop the resource record. Called by the core
-    /// `ReleaseOverlayWindow` handler only on the 1→0 refcount
-    /// transition (`backend.release_overlay_window` returned
-    /// `Ok(true)`). Drops any live COW-local state (event-mask
-    /// selections, property store, child window list) — by definition
-    /// the compositor has explicitly released, so this is intentional.
-    pub fn destroy_cow_resource(&mut self) {
-        if let Some(root) = self.windows.get_mut(&ROOT_WINDOW.0) {
-            root.children.retain(|&c| c != COMPOSITE_OVERLAY_WINDOW);
-        }
-        self.windows.remove(&COMPOSITE_OVERLAY_WINDOW.0);
     }
 
     #[must_use]
@@ -292,33 +270,6 @@ impl ResourceTable {
         }
         for child in &window.children {
             self.collect_attribute_pixmap_host_xids_inner(*child, out);
-        }
-    }
-
-    fn destroy_window_inner(&mut self, id: ResourceId, destroyed: &mut Vec<ResourceId>) {
-        // X11 spec: "If the argument window is a root window, then this
-        // request has no effect." Without this guard a misbehaved client
-        // (or xts5 Xlib4/XDestroyWindow assertion 5, which calls
-        // `XDestroyWindow(root)` and verifies the root and a sibling
-        // window are still valid) would silently delete the root entry
-        // from the windows table — leaving every subsequent client to
-        // receive `BadWindow` from `GetGeometry` / `QueryTree` /
-        // `GetWindowAttributes` on `ROOT_WINDOW`.
-        if id == ROOT_WINDOW {
-            return;
-        }
-        let Some(window) = self.windows.remove(&id.0) else {
-            return;
-        };
-        if let Some(parent) = self.windows.get_mut(&window.parent.0) {
-            parent.children.retain(|child| *child != id);
-        }
-        if let Some(host) = window.cursor_host {
-            self.dropped_cursor_hosts.push(host.as_raw());
-        }
-        destroyed.push(id);
-        for child in window.children {
-            self.destroy_window_inner(child, destroyed);
         }
     }
 
