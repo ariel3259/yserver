@@ -351,12 +351,15 @@ fn stub_scene_is_not_live_and_declines_tick() {
     let mut sink = TestSink::new();
     let mut telemetry = Telemetry::new();
     let windows = crate::kms::render::window_geometry::WindowsMap::new();
+    let outputs = default_outputs();
+    let skip_outputs = vec![false; outputs.len()];
     let err = scene
         .tick(
-            &core.input(&windows, &default_outputs()),
+            &core.input(&windows, &outputs),
             &mut store,
             &mut sink,
             &mut telemetry,
+            &skip_outputs,
             None,
         )
         .expect_err("stub must reject tick");

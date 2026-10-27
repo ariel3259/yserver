@@ -334,6 +334,72 @@ impl KmsBackend {
         }
     }
 
+    pub(in crate::kms::render::backend) fn output_is_direct(&self, output_idx: usize) -> bool {
+        if output_idx >= self.platform.outputs.len() {
+            return false;
+        }
+        let owner_covers_output = |owner: &crate::kms::render::backend::ScanoutM2State| {
+            owner.active()
+                || owner.unflip_outputs_to_replace.contains(&output_idx)
+                || owner.unflip_awaiting_outputs.contains_key(&output_idx)
+        };
+        owner_covers_output(self.pstate.direct.root())
+            || self
+                .pstate
+                .direct
+                .outputs
+                .get(output_idx)
+                .is_some_and(owner_covers_output)
+    }
+
+    fn output_has_degraded_unflip(&self, output_idx: usize) -> bool {
+        self.pstate.direct.active_scopes().into_iter().any(|scope| {
+            self.pstate.direct.get(scope).is_some_and(|owner| {
+                owner.degraded_composed_unflip
+                    && owner.unflip_outputs_to_replace.contains(&output_idx)
+            })
+        })
+    }
+
+    fn scene_skip_outputs(&self) -> Vec<bool> {
+        (0..self.platform.outputs.len())
+            .map(|output_idx| {
+                self.output_is_direct(output_idx) && !self.output_has_degraded_unflip(output_idx)
+            })
+            .collect()
+    }
+
+    fn scene_output_ready_for_scheduled_compose(&self, output_idx: usize) -> bool {
+        !self.output_is_direct(output_idx) || self.output_has_degraded_unflip(output_idx)
+    }
+
+    fn scene_output_wants_scheduled_compose(&self, output_idx: usize) -> bool {
+        self.output_has_degraded_unflip(output_idx)
+            || self.scene_wants_scene() && self.scene.output_wants_compose(output_idx, &self.store)
+    }
+
+    fn scene_output_can_accept_scheduled_frame(&self, output_idx: usize) -> bool {
+        if self.scene.is_live() {
+            self.scene
+                .output_ready_for_submit(output_idx, &self.platform)
+        } else {
+            self.scene.has_output_ready_for_submit(&self.platform)
+        }
+    }
+
+    fn scene_has_ready_scheduled_output(&self) -> bool {
+        (0..self.platform.outputs.len()).any(|output_idx| {
+            self.scene_output_ready_for_scheduled_compose(output_idx)
+                && self.scene_output_wants_scheduled_compose(output_idx)
+                && self.scene_output_can_accept_scheduled_frame(output_idx)
+        })
+    }
+
+    fn scheduled_scene_retry_deadline(&self) -> Option<std::time::Instant> {
+        self.scene
+            .earliest_retry_deadline_for_outputs(&self.scene_skip_outputs())
+    }
+
     pub(in crate::kms::render::backend) fn monotonic_now(&self) -> std::time::Instant {
         (self.pstate.monotonic_clock)()
     }
@@ -2035,20 +2101,28 @@ impl KmsBackend {
     fn fresh_composed_unflip_eligible(&self, scope: DirectScope) -> bool {
         use crate::kms::render::scene::{OutputRoute, OutputSink};
 
-        // The existing fresh-frame path submits a single grouped transaction.
-        // Per-output owners use the retained per-output replacement path until
-        // the compose selection seam can render only their outputs.
-        if scope != DirectScope::Root {
-            return false;
-        }
         let outputs = self.direct_scope_outputs(scope);
-        let tearing_cursor_handoff =
-            self.pstate.direct.root().unflip_reason == Some("tearing_cursor_handoff");
+        let scope_is_on_primary = match scope {
+            DirectScope::Root => self.direct_scanout_topology_eligible(),
+            DirectScope::Output(output_idx) => {
+                self.platform.outputs.get(output_idx).is_some_and(|layout| {
+                    self.platform
+                        .primary_device()
+                        .is_some_and(|primary| layout.key.device_key == primary.key)
+                })
+            }
+        };
+        let tearing_cursor_handoff = self
+            .pstate
+            .direct
+            .get(scope)
+            .and_then(|owner| owner.unflip_reason)
+            == Some("tearing_cursor_handoff");
         !outputs.is_empty()
             // This handoff needs a fresh scene frame so the newest Present
             // Copy replaces the retained direct frame in the same commit.
             && (!self.pstate.tearing.is_on() || tearing_cursor_handoff)
-            && self.direct_scanout_topology_eligible()
+            && scope_is_on_primary
             && !self.platform.scanout_commit_in_flight_for_outputs(&outputs)
             && outputs.iter().all(|&output_idx| {
                 self.platform.route(output_idx) == OutputRoute::Shared
@@ -2079,26 +2153,39 @@ impl KmsBackend {
         self.scene.invalidate_all_scanout_damage();
         self.scene.mark_scene_structure_dirty();
         self.platform.defer_scene_flips = true;
-        self.compose_tick();
+        let mut skip_outputs = vec![true; self.platform.outputs.len()];
+        for output_idx in self.direct_scope_outputs(scope) {
+            if let Some(skip) = skip_outputs.get_mut(output_idx) {
+                *skip = false;
+            }
+        }
+        self.compose_tick(&skip_outputs);
         self.platform.defer_scene_flips = false;
         let deferred = std::mem::take(&mut self.platform.deferred_scene_flips);
-        let output_count = self.platform.outputs.len();
+        let output_indices = self.direct_scope_outputs(scope);
+        let output_count = output_indices.len();
         let incomplete: Vec<_> = deferred
             .iter()
             .filter(|&&(_, _, complete)| !complete)
             .map(|&(output_idx, _, _)| output_idx)
             .collect();
-        let targets: Option<Vec<_>> = (0..output_count)
-            .map(|output_idx| {
-                let mut frames = deferred.iter().filter(|&&(out, _, _)| out == output_idx);
-                match (frames.next(), frames.next()) {
-                    (Some(&(_, bo_idx, _)), None) => {
-                        self.platform.deferred_scene_flip_target(output_idx, bo_idx)
+        let targets: Option<Vec<_>> = if deferred.len() == output_count {
+            output_indices
+                .iter()
+                .copied()
+                .map(|output_idx| {
+                    let mut frames = deferred.iter().filter(|&&(out, _, _)| out == output_idx);
+                    match (frames.next(), frames.next()) {
+                        (Some(&(_, bo_idx, _)), None) => {
+                            self.platform.deferred_scene_flip_target(output_idx, bo_idx)
+                        }
+                        _ => None,
                     }
-                    _ => None,
-                }
-            })
-            .collect();
+                })
+                .collect()
+        } else {
+            None
+        };
         let result = match targets {
             // A truncated compose painted only a prefix of the scene: never
             // flip it, the retained frames are whole.
@@ -2149,7 +2236,6 @@ impl KmsBackend {
             );
             return false;
         };
-        let output_indices = self.direct_scope_outputs(scope);
         if let Some(owner) = self.pstate.direct.get_mut(scope) {
             owner.unflip_outputs_to_replace = output_indices.iter().copied().collect();
             owner.unflip_awaiting_outputs = output_indices
@@ -3252,38 +3338,19 @@ impl KmsBackend {
     }
 
     pub(super) fn scene_wants_compose(&self) -> bool {
-        if self.pstate.direct.root().pending.is_some()
-            || !self.pstate.direct.root().unflip_awaiting_outputs.is_empty()
-        {
-            // The grouped direct or composed transaction's flip events are
-            // the next progress source; its state will be re-arbitrated there.
-            return false;
-        }
-        let outputs: Vec<_> = (0..self.platform.outputs.len()).collect();
-        let direct_transaction_waiting = self.pstate.direct.root().pending.is_some()
-            || self.pstate.direct.root().queued_successor.is_some()
-            || self.pstate.direct.root().unflip_requested;
-        let degraded_replacement_needs_submit = self.pstate.direct.root().degraded_composed_unflip
-            && !self
-                .pstate
-                .direct
-                .root()
-                .unflip_outputs_to_replace
-                .is_empty();
-        let unflip_waiting_for_cursor = self.pstate.direct.root().current.is_some()
-            && self.pstate.direct.root().unflip_requested
-            && self.platform.scanout_commit_in_flight_for_outputs(&outputs);
-        if unflip_waiting_for_cursor {
-            // The cursor flip event is the next progress source. Re-arming an
-            // immediate scene wake here would spin while the grouped unflip is
-            // correctly waiting for that event.
-            return false;
-        }
         let cursor_compose_blocked = self
             .tearing_cursor_compose_deadline(self.monotonic_now())
             .is_some();
+        let direct_transaction_waiting =
+            self.pstate.direct.active_scopes().into_iter().any(|scope| {
+                self.pstate.direct.get(scope).is_some_and(|owner| {
+                    owner.pending.is_some()
+                        || owner.queued_successor.is_some()
+                        || owner.unflip_requested
+                })
+            });
         let live_direct_vrr_wanted = self.live_direct_vrr_wanted_by_output();
-        ((self.scene_wants_scene() || degraded_replacement_needs_submit) && !cursor_compose_blocked)
+        (self.scene_has_ready_scheduled_output() && !cursor_compose_blocked)
             || (!cursor_compose_blocked
                 && !direct_transaction_waiting
                 && self
@@ -3577,40 +3644,37 @@ impl KmsBackend {
         let now = self.monotonic_now();
         let live_direct_vrr_wanted = self.live_direct_vrr_wanted_by_output();
         let allow_kms_timers = self.scanout_allowed() && self.kms_outputs_active;
-        let direct_hold_waits_for_cursor_or_frame = self.pstate.direct.root().hold_direct
-            && self.pstate.direct.root().current.is_some()
-            && self.pstate.direct.root().pending.is_none()
-            && self.pstate.direct.root().queued_successor.is_none()
-            && !self.pstate.direct.root().unflip_requested;
-        let direct_cursor_retry_deadline = if allow_kms_timers
-            && self.pstate.direct.root().pending.is_none()
-            && self.pstate.direct.root().queued_successor.is_none()
-            && !self.pstate.direct.root().unflip_requested
-        {
+        let direct_cursor_retry_deadline = if allow_kms_timers {
             self.pstate
                 .direct
-                .root()
-                .direct_cursor_refresh_pending
-                .iter()
-                .filter_map(|output_idx| self.platform.direct_cursor_retry_deadline(*output_idx))
+                .active_scopes()
+                .into_iter()
+                .filter_map(|scope| self.pstate.direct.get(scope))
+                .filter(|owner| {
+                    owner.pending.is_none()
+                        && owner.queued_successor.is_none()
+                        && !owner.unflip_requested
+                })
+                .flat_map(|owner| owner.direct_cursor_refresh_pending.iter().copied())
+                .filter_map(|output_idx| self.platform.direct_cursor_retry_deadline(output_idx))
                 .min()
         } else {
             None
         };
-        let scene_deadline = if allow_kms_timers && direct_hold_waits_for_cursor_or_frame {
-            self.platform
-                .has_eligible_atomic_cursor_move(now, &live_direct_vrr_wanted)
-                .then_some(now)
-        } else if allow_kms_timers {
+        let scene_deadline = if allow_kms_timers {
             if self.scene_wants_compose() {
-                if self.scene.has_output_ready_for_submit(&self.platform) {
+                if self.scene_has_ready_scheduled_output()
+                    || self
+                        .platform
+                        .has_eligible_atomic_cursor_move(now, &live_direct_vrr_wanted)
+                {
                     Some(now)
                 } else {
-                    self.scene.earliest_retry_deadline()
+                    self.scheduled_scene_retry_deadline()
                 }
             } else {
                 self.tearing_cursor_compose_deadline(now)
-                    .or_else(|| self.scene.earliest_retry_deadline())
+                    .or_else(|| self.scheduled_scene_retry_deadline())
             }
         } else {
             None
@@ -3796,6 +3860,8 @@ impl KmsBackend {
         for &scope in &active_scopes {
             self.submit_queued_direct_successor(scope);
         }
+        let mut unflip_submitted = false;
+        let mut degraded_compose = false;
         if !active_scopes.is_empty() {
             use crate::kms::render::scene::CursorPlaneMode;
             let cursor_mode = self.scene.cursor_mode();
@@ -3811,14 +3877,11 @@ impl KmsBackend {
                 };
                 self.request_direct_unflip(reason);
             }
-            let mut direct_work_pending = false;
-            let mut root_degraded_compose = false;
             for scope in active_scopes {
                 let Some(owner) = self.pstate.direct.get(scope) else {
                     continue;
                 };
                 if owner.pending.is_some() || !owner.unflip_awaiting_outputs.is_empty() {
-                    direct_work_pending = true;
                     continue;
                 }
                 if owner.hold_direct && !owner.unflip_requested {
@@ -3840,7 +3903,6 @@ impl KmsBackend {
                             }
                         }
                     }
-                    direct_work_pending = true;
                     continue;
                 }
                 if owner.current.is_some()
@@ -3857,20 +3919,12 @@ impl KmsBackend {
                             self.pstate
                                 .tearing
                                 .note_composed_submit(self.monotonic_now());
-                            direct_work_pending = true;
+                            unflip_submitted = true;
                         }
-                        Ok(false) => direct_work_pending = true,
-                        Err(error) if scope != DirectScope::Root => {
-                            // Keep the one-output owner and its client pins in
-                            // place; only its CRTC can safely replace that scanout.
-                            log::error!(
-                                "scanout_m2: composed unflip for {scope:?} failed: {error}; retrying"
-                            );
-                            direct_work_pending = true;
-                        }
+                        Ok(false) => {}
                         Err(error) => {
                             log::error!(
-                                "scanout_m2: synchronized composed unflip failed: {error}; degrading to per-output composed flips"
+                                "scanout_m2: composed unflip for {scope:?} failed: {error}; degrading to per-output composed flips"
                             );
                             let replacement_outputs =
                                 self.direct_scope_outputs(scope).into_iter().collect();
@@ -3880,27 +3934,34 @@ impl KmsBackend {
                                 owner.degraded_composed_unflip = true;
                             }
                             self.scene.mark_scene_structure_dirty();
-                            root_degraded_compose = true;
+                            degraded_compose = true;
                         }
                     }
                 } else if self.pstate.direct.get(scope).is_some_and(|owner| {
                     owner.degraded_composed_unflip && !owner.unflip_outputs_to_replace.is_empty()
                 }) {
                     self.scene.mark_scene_structure_dirty();
-                    if scope == DirectScope::Root {
-                        root_degraded_compose = true;
-                    } else {
-                        direct_work_pending = true;
-                    }
+                    degraded_compose = true;
                 }
             }
-            if direct_work_pending
-                || (!self.pstate.direct.active_scopes().is_empty() && !root_degraded_compose)
-            {
-                self.drain_render_telemetry();
-                self.telemetry.maybe_emit(self.engine.pending_count());
-                return Ok(());
-            }
+        }
+        if unflip_submitted {
+            // Keep the replacement commit and the normal compose pass in
+            // separate scheduler ticks. Its output scope is already retained
+            // by the scene's accepted event identity.
+            self.drain_render_telemetry();
+            self.telemetry.maybe_emit(self.engine.pending_count());
+            self.drain_paint_submit_telemetry();
+            return Ok(());
+        }
+        let skip_outputs = self.scene_skip_outputs();
+        if !degraded_compose && skip_outputs.iter().all(|skip| *skip) {
+            // Root direct ownership still holds the complete output set, while
+            // per-output owners leave unrelated CRTCs available above.
+            self.drain_render_telemetry();
+            self.telemetry.maybe_emit(self.engine.pending_count());
+            self.drain_paint_submit_telemetry();
+            return Ok(());
         }
         let vrr_before = self.vrr_committed_snapshot();
         let composed_outputs = if self
@@ -3909,18 +3970,29 @@ impl KmsBackend {
         {
             None
         } else {
-            self.compose_tick()
+            self.compose_tick(&skip_outputs)
         };
         self.log_vrr_committed_changes(&vrr_before, None, "inherited");
         // `scene.tick` drains already-signalled copied completions itself,
         // without entering backend_scanout_on_scanout_render_completion.
         self.record_accepted_degraded_unflip_replacements();
-        if let Some(composed) = &composed_outputs
-            && self.pstate.direct.root().reentry_blocked_until_composed
-            && composed.len() == self.platform.outputs.len()
-        {
-            self.pstate.direct.root_mut().reentry_blocked_until_composed = false;
-            log::debug!("scanout_m2: composed fallback submitted; re-entry barrier cleared");
+        if let Some(composed) = &composed_outputs {
+            if self.pstate.direct.root().reentry_blocked_until_composed
+                && composed.len() == self.platform.outputs.len()
+            {
+                self.pstate.direct.root_mut().reentry_blocked_until_composed = false;
+                log::debug!(
+                    "scanout_m2: composed fallback submitted; root re-entry barrier cleared"
+                );
+            }
+            for (output_idx, owner) in self.pstate.direct.outputs.iter_mut().enumerate() {
+                if owner.reentry_blocked_until_composed && composed.contains(&output_idx) {
+                    owner.reentry_blocked_until_composed = false;
+                    log::debug!(
+                        "scanout_m2: output {output_idx} composed fallback submitted; re-entry barrier cleared"
+                    );
+                }
+            }
         }
         if composed_outputs
             .as_ref()
@@ -3936,7 +4008,8 @@ impl KmsBackend {
         self.handle_cursor_move_outcome(cursor_outcome);
         let live_direct_vrr_wanted = self.live_direct_vrr_wanted_by_output();
         for output_idx in 0..self.platform.outputs.len() {
-            if scene_submitted_outputs.contains(&output_idx)
+            if self.output_is_direct(output_idx)
+                || scene_submitted_outputs.contains(&output_idx)
                 || self.scene.has_pending_page_flip(output_idx)
                 || self.scene.output_submit_retry_pending(output_idx)
                 || (self.scene_wants_scene()

@@ -504,6 +504,199 @@ fn output_owner_submits_and_unflips_only_its_crtc() {
     );
 }
 
+fn damage_scene_root(fixture: &mut RecordingSceneFixture) {
+    let backend = &fixture.events.backend;
+    let root = backend.core.window_id;
+    let width = backend.platform.fb_w;
+    let height = backend.platform.fb_h;
+    Backend::clear_area(
+        &mut fixture.events.backend,
+        None,
+        root,
+        0,
+        None,
+        0,
+        0,
+        width,
+        height,
+        (0, 0),
+    )
+    .expect("damage scene root through Backend");
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutations: restore the root-wide early return; use the normal mask in the fresh-unflip pass.
+fn composed_output_flips_while_other_output_owner_pending_and_unflipping() {
+    let Some((mut fixture, direct)) = direct_fixture(2, P1SceneRoute::Shared, 208, 0) else {
+        return;
+    };
+    let device_fd = fd(&fixture);
+    Backend::set_cursor_hidden(&mut fixture.events.backend, true);
+    damage_scene_root(&mut fixture);
+    let before_pending_pass = record_count(&fixture, device_fd);
+    let direct_record = submit_output_owner_successor(&mut fixture, &direct, 1);
+    let direct_id = accepted_event_id(&direct_record).expect("direct output commit accepted");
+
+    let pending_records = records_since(&fixture, device_fd, before_pending_pass);
+    let output0_scene = pending_records
+        .iter()
+        .find(|record| {
+            record.kind == crate::drm::atomic::AtomicCommitKind::Scene
+                && record.events.len() == 1
+                && record.events[0].crtc == fixture.events.backend.platform.outputs[0].output.crtc
+        })
+        .unwrap_or_else(|| panic!("output 0 composed while output 1's direct commit is pending; records={pending_records:?}"));
+    assert!(
+        fixture.events.backend.pstate.direct.outputs[1]
+            .pending
+            .is_some()
+    );
+    complete_recorded_attempt(
+        &mut fixture,
+        device_fd,
+        output0_scene,
+        accepted_event_id(output0_scene).unwrap(),
+        58,
+    );
+    complete_recorded_attempt(&mut fixture, device_fd, &direct_record, direct_id, 59);
+    assert!(
+        fixture.events.backend.pstate.direct.outputs[1]
+            .current
+            .is_some()
+    );
+
+    Backend::unmap_subwindow(&mut fixture.events.backend, None, direct.target_xid)
+        .expect("request output 1 unflip through Backend");
+    damage_scene_root(&mut fixture);
+    let before_fresh_unflip = record_count(&fixture, device_fd);
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("fresh-unflip output 1 while output 0 damage waits");
+    let fresh_unflip = records_since(&fixture, device_fd, before_fresh_unflip)
+        .into_iter()
+        .find(|record| accepted_event_id(record).is_some())
+        .expect("fresh composed replacement accepted for output 1");
+    let output1_crtc = fixture.events.backend.platform.outputs[1].output.crtc;
+    assert_eq!(fresh_unflip.events.len(), 1);
+    assert_eq!(fresh_unflip.events[0].crtc, output1_crtc);
+    let fresh_id = accepted_event_id(&fresh_unflip).expect("fresh unflip accepted ID");
+    assert_eq!(
+        fixture.events.backend.scene.pending_page_flip_event_id(1),
+        Some(fresh_id),
+        "output 1's deferred scene frame uses the accepted replacement identity"
+    );
+    assert_eq!(
+        fixture.events.backend.scene.pending_page_flip_event_id(0),
+        None,
+        "output 0 receives no pending acknowledgement from output 1's replacement"
+    );
+    assert_eq!(
+        fixture.events.backend.pstate.direct.outputs[1].unflip_awaiting_outputs,
+        HashMap::from([(1, fresh_id)])
+    );
+
+    damage_scene_root(&mut fixture);
+    let before_next_pass = record_count(&fixture, device_fd);
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("compose output 0 on the pass after output 1's replacement submission");
+    let output0_after_unflip = records_since(&fixture, device_fd, before_next_pass)
+        .into_iter()
+        .find(|record| {
+            record.kind == crate::drm::atomic::AtomicCommitKind::Scene
+                && record.events.len() == 1
+                && record.events[0].crtc == fixture.events.backend.platform.outputs[0].output.crtc
+        })
+        .expect("output 0's deferred damage composes on the next scheduler pass");
+    assert_eq!(output0_after_unflip.events.len(), 1);
+    assert_eq!(
+        fixture.events.backend.scene.pending_page_flip_event_id(0),
+        accepted_event_id(&output0_after_unflip)
+    );
+    assert_eq!(
+        fixture.events.backend.pstate.direct.outputs[1].unflip_awaiting_outputs,
+        HashMap::from([(1, fresh_id)]),
+        "output 0's scene flip does not retire output 1's direct owner"
+    );
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: keep scanout_commit_in_flight_for_outputs over every output in queued dispatch.
+fn queued_successor_not_blocked_by_scene_flip_on_other_output() {
+    let Some((mut fixture, direct)) = direct_fixture(2, P1SceneRoute::Shared, 209, 0) else {
+        return;
+    };
+    let device_fd = fd(&fixture);
+    let initial = record_count(&fixture, device_fd);
+    damage_scene_root(&mut fixture);
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("submit composed scene frames before the queued direct successor");
+    let scene_records = records_since(&fixture, device_fd, initial);
+    let output0_scene = scene_records
+        .iter()
+        .find(|record| {
+            record.kind == crate::drm::atomic::AtomicCommitKind::Scene
+                && record.events.len() == 1
+                && record.events[0].crtc == fixture.events.backend.platform.outputs[0].output.crtc
+        })
+        .expect("output 0 scene flip is in flight");
+    let output1_scene = scene_records
+        .iter()
+        .find(|record| {
+            record.kind == crate::drm::atomic::AtomicCommitKind::Scene
+                && record.events.len() == 1
+                && record.events[0].crtc == fixture.events.backend.platform.outputs[1].output.crtc
+        })
+        .expect("output 1 scene flip is available for retirement");
+    complete_recorded_attempt(
+        &mut fixture,
+        device_fd,
+        output1_scene,
+        accepted_event_id(output1_scene).expect("output 1 scene ID"),
+        60,
+    );
+    assert!(fixture.events.backend.scene.has_pending_page_flip(0));
+    assert!(!fixture.events.backend.scene.has_pending_page_flip(1));
+
+    seed_output_owner_successor(
+        &mut fixture,
+        &direct,
+        1,
+        crate::kms::render::backend::ScanoutM0Target::Unredirected,
+        None,
+        None,
+    );
+    let before_successor = record_count(&fixture, device_fd);
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("dispatch output 1's queued direct successor");
+    let successor = records_since(&fixture, device_fd, before_successor)
+        .into_iter()
+        .find(|record| accepted_event_id(record).is_some())
+        .expect("queued successor submitted while output 0 scene flip is in flight");
+    assert_eq!(successor.events.len(), 1);
+    assert_eq!(
+        successor.events[0].crtc,
+        fixture.events.backend.platform.outputs[1].output.crtc
+    );
+    assert!(fixture.events.backend.scene.has_pending_page_flip(0));
+    assert!(
+        fixture.events.backend.pstate.direct.outputs[1]
+            .pending
+            .is_some()
+    );
+    assert!(
+        fixture.events.backend.pstate.direct.outputs[1]
+            .queued_successor
+            .is_none()
+    );
+    assert!(
+        output0_scene
+            .events
+            .iter()
+            .all(|event| event.crtc == fixture.events.backend.platform.outputs[0].output.crtc)
+    );
+}
+
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: route retirement to the first active owner instead of scope_for_output.
