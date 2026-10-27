@@ -81,7 +81,7 @@
 **Files:**
 - Modify: `backend/portable/compose.rs` (`compose_tick` ~94, generic over `XBackend<P>` ~11, which supplies every output), `crates/yserver-render/src/kms/render/scene/tick.rs` (`SceneCompositor::tick`, the per-output visit ~236) and their callers: `surface/platform.rs` ~1053 (passes an all-false mask), `kms/session.rs` ~419, `crates/yserver-render/src/kms/render/scene/tests/tick.rs` ~355
 - Modify: `kms/scanout.rs` — `backend_scanout_maybe_composite` early returns (~3569–3612) and the held cursor-only loop (~3586); scene readiness (`scene_wants_compose` ~3029); held-direct wakeup (~3346); `backend_scanout_next_wakeup`; the reentry barrier (`reentry_blocked_until_composed`)
-- Modify: `kms/scanout.rs` queued-successor dispatch (`submit_queued_direct_successor` ~1429): its scene-flip-pending check considers only the owner's outputs. (The Present-time admission check, `kms/present.rs` ~924, is scoped in A2 together with `Output` admission, since A1 Presents can only be `Root`.)
+- Modify: `kms/scanout.rs` queued-successor dispatch (`submit_queued_direct_successor` ~1429): its commit-in-flight check (`scanout_commit_in_flight_for_outputs` over all outputs today) uses `direct_scope_outputs(scope)`, and its submit-failure path uses `request_direct_unflip_for(scope, …)`. (The Present-time admission check, `kms/present.rs` ~924, is scoped in A2 together with `Output` admission, since A1 Presents can only be `Root`.)
 - Test: models `tests/tearing.rs` `live_scene_backend_with_outputs(2)`, `tests/cursor_sprites/scene_attach.rs` `held_direct_with_two_outputs`; `tests/present_scanout.rs`
 
 **Interfaces:**
@@ -95,7 +95,7 @@
 - [ ] **Step 1: Failing tests:**
   - `composed_output_flips_while_other_output_owner_held`: `Output(1)` held; damage a window on output 0; scheduling pass → a composed flip on output 0 only; owner 1 still current. Mutation: restore the root-wide early return.
   - `composed_output_flips_while_other_output_owner_pending_and_unflipping`: same with owner 1 pending, then unflipping: the fresh-unflip pass renders and commits only output 1's replacement and output 0 gets no pending acknowledgement from it; output 0 composes and flips on the next pass. Mutation: the fresh-unflip pass uses the normal mask (composes output 0 into the deferral).
-  - `queued_successor_not_blocked_by_scene_flip_on_other_output`: a composed flip pending on output 0; owner 1's queued successor is submitted by `submit_queued_direct_successor` on the next pass, not deferred. Mutation: keep the global "any scene flip pending" check in `submit_queued_direct_successor`.
+  - `queued_successor_not_blocked_by_scene_flip_on_other_output`: a composed flip in flight on output 0; owner 1's queued successor is submitted by `submit_queued_direct_successor` on the next pass, not deferred. Mutation: keep `scanout_commit_in_flight_for_outputs` over all outputs in `submit_queued_direct_successor`.
   - `next_wakeup_reflects_composed_output_while_other_is_direct`: owner 1 held, damage on output 0 → `next_wakeup` is due. Mutation: held-direct wakeup considers cursor work only.
 - [ ] **Step 2: Run, verify they fail.**
 - [ ] **Step 3: Implement.**
