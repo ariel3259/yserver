@@ -286,10 +286,10 @@ per output, so a client covering exactly one monitor can scan out there while
 other monitors keep composing at their own rates. A Present selecting another
 monitor's CRTC is composed. A whole-screen window can use grouped direct
 scanout when all outputs share the primary device and refresh rates within
-0.5%. Tearing serves one direct output at a time; a second fullscreen client
-on another monitor that disables V-Sync gets synchronized flips while the
-first tears, and can tear after it stops. VRR with multiple monitors enabled
-is validated in a later change.
+0.5%. Tearing requires Root direct scanout (single monitor, or a whole-screen
+window on same-refresh outputs); a fullscreen client on one monitor that
+disables V-Sync is flipped synchronized while other monitors are on. VRR
+with multiple monitors enabled is validated in a later change.
 
 It picks the lowest free display, mints a per-session
 MIT-MAGIC-COOKIE-1 (a server copy plus an entry in `~/.Xauthority`),

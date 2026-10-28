@@ -616,10 +616,6 @@ impl<P: Platform> XBackend<P> {
             // transition pending) also wakes the scene so the software
             // cursor stays in sync with the eventual plane bind.
             let cursor_mode = self.scene.cursor_mode();
-            #[allow(clippy::cast_possible_truncation)]
-            let (cx, cy) = (new_x as i32, new_y as i32);
-            #[allow(clippy::cast_possible_truncation)]
-            let (cursor_x, cursor_y) = (new_x as i64, new_y as i64);
             let (hot_x, hot_y, cw, ch) = self
                 .effective_cursor_xid
                 .and_then(|xid| self.cursor_records.get(&xid))
@@ -635,17 +631,7 @@ impl<P: Platform> XBackend<P> {
             if self.effective_cursor_hidden() {
                 // The effective cursor has no visible pixels, so pointer
                 // motion has no cursor sprite to move.
-            } else if P::tearing_active(self)
-                && P::tearing_cursor_intersects_owner(
-                    self,
-                    cursor_x,
-                    cursor_y,
-                    i64::from(hot_x),
-                    i64::from(hot_y),
-                    i64::from(cw),
-                    i64::from(ch),
-                )
-            {
+            } else if P::tearing_active(self) {
                 // Tearing owns cursor policy until exit. Keep motion on the
                 // platform's capped scene-wake path.
                 P::cursor_motion_during_tearing(self, true);
@@ -658,6 +644,8 @@ impl<P: Platform> XBackend<P> {
                     cursor_mode,
                     crate::kms::render::scene::CursorPlaneMode::Mixed
                 );
+                #[allow(clippy::cast_possible_truncation)]
+                let (cx, cy) = (new_x as i32, new_y as i32);
                 P::move_hw_cursor(self, mixed, (cx, cy), (hot_x, hot_y), (cw, ch));
             } else {
                 // Software cursors need repaint; an all-Hidden cursor also

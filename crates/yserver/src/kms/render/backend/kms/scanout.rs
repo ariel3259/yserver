@@ -569,26 +569,6 @@ impl KmsBackend {
         }
     }
 
-    pub(in crate::kms::render::backend) fn request_direct_unflip_for_outputs(
-        &mut self,
-        output_indices: &[usize],
-        reason: &'static str,
-    ) {
-        if output_indices.is_empty() {
-            return;
-        }
-        let scopes = self.pstate.direct.active_scopes();
-        for scope in scopes {
-            if self
-                .direct_scope_outputs(scope)
-                .iter()
-                .any(|output_idx| output_indices.contains(output_idx))
-            {
-                self.request_direct_unflip_for(scope, reason);
-            }
-        }
-    }
-
     pub(in crate::kms::render::backend) fn request_direct_unflip_for(
         &mut self,
         scope: DirectScope,
@@ -682,10 +662,7 @@ impl KmsBackend {
             return;
         }
         let output_indices = self.direct_scope_outputs(scope);
-        let tearing_outputs = self.tearing_scope_outputs();
-        let tearing = output_indices
-            .iter()
-            .all(|output_idx| tearing_outputs.contains(output_idx));
+        let tearing = scope == DirectScope::Root && self.pstate.tearing.is_on();
         if tearing || self.effective_cursor_hidden() {
             // Tearing keeps every cursor plane detached. A hidden effective
             // cursor also must not leave a stale sprite bound over direct scanout.
@@ -838,39 +815,33 @@ impl KmsBackend {
         let x = self.core.cursor_x as i32;
         #[allow(clippy::cast_possible_truncation)]
         let y = self.core.cursor_y as i32;
-        let tearing_outputs = self.tearing_scope_outputs();
         let mut refreshed_outputs = Vec::new();
         for scope in self.pstate.direct.active_scopes() {
             let scope_outputs = self.direct_scope_outputs(scope);
-            let output_indices: Vec<_> = scope_outputs
-                .iter()
-                .copied()
-                .filter(|output_idx| !tearing_outputs.contains(output_idx))
-                .collect();
-            if output_indices.is_empty() {
+            if scope == DirectScope::Root && self.pstate.tearing.is_on() {
                 if let Some(owner) = self.pstate.direct.get_mut(scope) {
                     owner.cursor_bound_all = false;
                 }
                 continue;
             }
             let mut succeeded = true;
-            for &output_idx in &output_indices {
+            for &output_idx in &scope_outputs {
                 if !self.refresh_direct_cursor_on_output(scope, output_idx, record, x, y) {
                     succeeded = false;
                     break;
                 }
             }
-            if succeeded && !self.sync_direct_cursor_scene_state(&output_indices) {
+            if succeeded && !self.sync_direct_cursor_scene_state(&scope_outputs) {
                 succeeded = false;
             }
             if !succeeded {
                 self.request_direct_unflip_for(scope, "direct_cursor_refresh_failed");
             }
             if let Some(owner) = self.pstate.direct.get_mut(scope) {
-                owner.cursor_bound_all = succeeded && output_indices.len() == scope_outputs.len();
+                owner.cursor_bound_all = succeeded;
             }
             if succeeded {
-                refreshed_outputs.extend(output_indices);
+                refreshed_outputs.extend(scope_outputs);
             }
         }
         refreshed_outputs.sort_unstable();
@@ -1022,10 +993,12 @@ impl KmsBackend {
         {
             return;
         }
-        if self.tearing_scope_outputs().contains(&output_idx) {
-            self.platform.clear_direct_cursor_retry(output_idx);
+        if scope == DirectScope::Root && self.pstate.tearing.is_on() {
+            for output_idx in 0..self.platform.outputs.len() {
+                self.platform.clear_direct_cursor_retry(output_idx);
+            }
             if let Some(owner) = self.pstate.direct.get_mut(scope) {
-                owner.clear_direct_cursor_refresh_pending(output_idx);
+                owner.clear_all_direct_cursor_refresh_pending();
             }
             return;
         }
@@ -3474,25 +3447,16 @@ impl KmsBackend {
         if !self.pstate.tearing.is_on() || self.effective_cursor_hidden() {
             return false;
         }
-        let outputs = self.tearing_scope_outputs();
-        if outputs.is_empty() {
-            return false;
-        }
-
         matches!(
-            self.scene.cursor_mode_for_outputs(&outputs),
+            self.scene.cursor_mode(),
             crate::kms::render::scene::CursorPlaneMode::Sw
-        ) || self.pstate.direct.active_scopes().into_iter().any(|scope| {
-            let touches_tearing_output = self
-                .direct_scope_outputs(scope)
-                .iter()
-                .any(|output_idx| outputs.contains(output_idx));
-            touches_tearing_output
-                && self.pstate.direct.get(scope).is_some_and(|owner| {
-                    owner.unflip_reason == Some("tearing_cursor_handoff")
-                        && !owner.unflip_outputs_to_replace.is_empty()
-                })
-        })
+        ) || (self.pstate.direct.root().unflip_reason == Some("tearing_cursor_handoff")
+            && !self
+                .pstate
+                .direct
+                .root()
+                .unflip_outputs_to_replace
+                .is_empty())
     }
 
     /// Earliest time a cursor-only software-scene wake may be composed while
@@ -3774,13 +3738,10 @@ impl KmsBackend {
     }
 
     fn prepare_tearing_scene_pass(&mut self) {
-        let tearing_outputs = self.tearing_scope_outputs();
         if std::mem::take(&mut self.platform.scene_cursor_hide_failed)
             && self.pstate.tearing.is_on()
             && !self.pstate.tearing.hide_failed_logged
-            && tearing_outputs
-                .iter()
-                .any(|&idx| self.platform.cursor_plane_visible_for_output(idx))
+            && self.platform.any_cursor_plane_visible()
         {
             log::warn!("kms: tearing cursor-plane hide failed; keeping composed flips on vsync");
             self.pstate.tearing.hide_failed_logged = true;
@@ -3793,16 +3754,13 @@ impl KmsBackend {
             self.exit_tearing("eligibility_lost");
             return;
         }
-        if self.tearing_cursor_wants_visible_for_outputs(&tearing_outputs) {
-            self.request_direct_unflip_for_outputs(&tearing_outputs, "tearing_cursor_handoff");
+        if self.tearing_cursor_wants_visible() && self.pstate.direct.root().active() {
+            self.request_direct_unflip_for(DirectScope::Root, "tearing_cursor_handoff");
         }
-        if tearing_outputs
-            .iter()
-            .any(|&idx| self.platform.cursor_plane_visible_for_output(idx))
-        {
+        if self.platform.any_cursor_plane_visible() {
             return;
         }
-        for output_idx in tearing_outputs {
+        for output_idx in 0..self.platform.outputs.len() {
             let Some(shape) = self.platform.scene_async_shape(output_idx) else {
                 continue;
             };

@@ -217,10 +217,10 @@ monitor can scan out there while the others compose at their own rates,
 with no limit on the number of monitors. A whole-screen window keeps
 grouped direct scanout when all outputs share the primary device and
 their refresh rates are within 0.5%. A Present selecting another
-monitor's CRTC is composed. Tearing (`PresentOptionAsync`) can serve one
-direct output at a time: a second fullscreen client on another monitor
-that disables V-Sync gets synchronized flips while the first tears, and
-can tear after the first stops. yserver advertises
+monitor's CRTC is composed. Tearing requires Root direct scanout (single
+monitor, or a whole-screen window on same-refresh outputs); a fullscreen
+client on one monitor that disables V-Sync is flipped synchronized while
+other monitors are on. yserver advertises
 `PresentCapabilityAsync`, not `PresentCapabilityAsyncMayTear`.
 
 VRR is off by default. `--vrr` honors `_VARIABLE_REFRESH` (format 32,

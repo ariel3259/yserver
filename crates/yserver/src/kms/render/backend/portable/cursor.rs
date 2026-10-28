@@ -484,10 +484,7 @@ impl<P: Platform> XBackend<P> {
 
     /// Whether the currently-effective sprite should be visible in the live
     /// output layout, regardless of the scene's retired HW/SW classification.
-    pub(in crate::kms::render::backend) fn tearing_cursor_wants_visible_for_outputs(
-        &self,
-        output_indices: &[usize],
-    ) -> bool {
+    pub(in crate::kms::render::backend) fn tearing_cursor_wants_visible(&self) -> bool {
         if self.effective_cursor_hidden() {
             return false;
         }
@@ -505,16 +502,7 @@ impl<P: Platform> XBackend<P> {
         let height = i64::from(record.height);
         let hot_x = i64::from(record.hot_x);
         let hot_y = i64::from(record.hot_y);
-        P::cursor_intersects_outputs(
-            self,
-            output_indices,
-            cursor_x,
-            cursor_y,
-            hot_x,
-            hot_y,
-            width,
-            height,
-        )
+        P::cursor_intersects_outputs(self, cursor_x, cursor_y, hot_x, hot_y, width, height)
     }
 
     /// XFIXES `HideCursor` / `ShowCursor` edge. Hiding drops the scene's
@@ -699,6 +687,9 @@ impl<P: Platform> XBackend<P> {
             });
 
         P::request_tearing_cursor_handoff(self);
+        if P::tearing_active(self) {
+            return;
+        }
 
         // Stage 5 Phase D — steady-state HW sprite-change. When the
         // plane is fully bound, the scene won't re-tick (v2's

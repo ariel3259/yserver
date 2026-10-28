@@ -64,28 +64,8 @@ impl Platform for PlatformBackend {
         b.pstate.tearing.is_on()
     }
 
-    fn tearing_cursor_suppression_mask(b: &KmsBackend, _output_count: usize) -> Vec<bool> {
-        b.tearing_cursor_suppression_mask()
-    }
-
-    fn tearing_cursor_intersects_owner(
-        b: &KmsBackend,
-        cursor_x: i64,
-        cursor_y: i64,
-        hot_x: i64,
-        hot_y: i64,
-        width: i64,
-        height: i64,
-    ) -> bool {
-        let outputs = b.tearing_scope_outputs();
-        Self::cursor_intersects_outputs(
-            b, &outputs, cursor_x, cursor_y, hot_x, hot_y, width, height,
-        )
-    }
-
     fn cursor_intersects_outputs(
         b: &KmsBackend,
-        output_indices: &[usize],
         cursor_x: i64,
         cursor_y: i64,
         hot_x: i64,
@@ -93,10 +73,7 @@ impl Platform for PlatformBackend {
         width: i64,
         height: i64,
     ) -> bool {
-        output_indices.iter().any(|&output_idx| {
-            let Some(output) = b.platform.outputs.get(output_idx) else {
-                return false;
-            };
+        b.platform.outputs.iter().any(|output| {
             let dx = cursor_x - hot_x - i64::from(output.x);
             let dy = cursor_y - hot_y - i64::from(output.y);
             dx < i64::from(output.width)

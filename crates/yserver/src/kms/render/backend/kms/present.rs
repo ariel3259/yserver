@@ -124,35 +124,13 @@ impl KmsBackend {
         }
     }
 
-    pub(in crate::kms::render::backend) fn tearing_scope(&self) -> Option<DirectScope> {
-        let TearingState::On { admission, .. } = self.pstate.tearing.state else {
-            return None;
-        };
-        self.direct_candidate_scope(admission.candidate, admission.target)
-    }
-
-    pub(in crate::kms::render::backend) fn tearing_scope_outputs(&self) -> Vec<usize> {
-        self.tearing_scope()
-            .map(|scope| self.direct_scope_outputs(scope))
-            .unwrap_or_default()
-    }
-
-    pub(in crate::kms::render::backend) fn tearing_cursor_suppression_mask(&self) -> Vec<bool> {
-        let mut suppressed = vec![false; self.platform.outputs.len()];
-        for output_idx in self.tearing_scope_outputs() {
-            if let Some(value) = suppressed.get_mut(output_idx) {
-                *value = true;
-            }
-        }
-        suppressed
-    }
-
     pub(in crate::kms::render::backend) fn request_tearing_cursor_handoff(&mut self) {
-        let outputs = self.tearing_scope_outputs();
-        if outputs.is_empty() || !self.tearing_cursor_wants_visible_for_outputs(&outputs) {
-            return;
+        if self.pstate.tearing.is_on()
+            && self.tearing_cursor_wants_visible()
+            && self.pstate.direct.root().active()
+        {
+            self.request_direct_unflip_for(DirectScope::Root, "tearing_cursor_handoff");
         }
-        self.request_direct_unflip_for_outputs(&outputs, "tearing_cursor_handoff");
     }
 
     fn direct_candidate_gate(
@@ -284,26 +262,17 @@ impl KmsBackend {
     fn note_tearing_present(
         &mut self,
         candidate: PresentScanoutCandidate,
-        candidate_scope: Option<DirectScope>,
+        authoritative_root: bool,
         target: ScanoutM0Target,
         gate_ignoring_cursor: bool,
     ) -> bool {
         let was_on = self.pstate.tearing.is_on();
-        let tearing_outputs = self.tearing_scope_outputs();
-        let candidate_outputs = candidate_scope
-            .map(|scope| self.direct_scope_outputs(scope))
-            .unwrap_or_default();
-        let overlaps_tearing_owner = candidate_outputs
-            .iter()
-            .any(|output_idx| tearing_outputs.contains(output_idx));
-        if was_on && !overlaps_tearing_owner {
-            return was_on;
-        }
         match self.pstate.tearing.state {
             TearingState::On {
                 window, crtc_epoch, ..
             } if candidate.dst_window_xid == window
                 && (candidate.crtc_epoch != crtc_epoch
+                    || !authoritative_root
                     || !gate_ignoring_cursor
                     || candidate.options
                         & yserver_core::present_scheduler::PRESENT_OPTION_ASYNC
@@ -312,7 +281,7 @@ impl KmsBackend {
                 self.exit_tearing("direct_present_no_longer_qualifies");
             }
             TearingState::On { window, .. }
-                if candidate_scope.is_some() && candidate.dst_window_xid != window =>
+                if authoritative_root && candidate.dst_window_xid != window =>
             {
                 self.exit_tearing("authoritative_root_window_changed");
             }
@@ -322,7 +291,7 @@ impl KmsBackend {
                 crtc_epoch,
                 ..
             } => {
-                if candidate_scope.is_some()
+                if authoritative_root
                     && candidate.dst_window_xid == window
                     && gate_ignoring_cursor
                     && candidate.options & yserver_core::present_scheduler::PRESENT_OPTION_ASYNC
@@ -344,9 +313,9 @@ impl KmsBackend {
             TearingState::Off => {}
         }
 
-        let Some(scope) = candidate_scope else {
+        if !authoritative_root {
             return was_on;
-        };
+        }
         let qualifies = gate_ignoring_cursor
             && candidate.options & yserver_core::present_scheduler::PRESENT_OPTION_ASYNC != 0;
         if !qualifies {
@@ -380,17 +349,15 @@ impl KmsBackend {
                     root_host_xid: self.core.window_id,
                 },
             };
-            if let Some(owner) = self.pstate.direct.get_mut(scope) {
-                owner.cursor_bound_all = false;
-            }
+            self.pstate.direct.root_mut().cursor_bound_all = false;
             self.pstate.tearing.hide_failed_logged = false;
             log::info!(
                 "kms: entering tearing for window=0x{:x} crtc_epoch={}",
                 candidate.dst_window_xid,
                 candidate.crtc_epoch,
             );
-            if self.tearing_cursor_wants_visible_for_outputs(&candidate_outputs) {
-                self.request_direct_unflip_for(scope, "tearing_cursor_handoff");
+            if self.tearing_cursor_wants_visible() {
+                self.request_direct_unflip_for(DirectScope::Root, "tearing_cursor_handoff");
             }
         }
         was_on
@@ -399,25 +366,21 @@ impl KmsBackend {
     fn register_tearing_copy_fallback(
         &mut self,
         candidate: PresentScanoutCandidate,
-        candidate_scope: Option<DirectScope>,
+        authoritative_root: bool,
         source_id: Option<crate::kms::render::store::DrawableId>,
     ) {
-        let Some(scope) = candidate_scope else {
+        if !authoritative_root {
             return;
-        };
-        if self
-            .pstate
-            .direct
-            .get(scope)
-            .is_some_and(|owner| owner.active() && (owner.unflip_requested || owner.hold_direct))
+        }
+        if self.pstate.direct.root().active()
+            && (self.pstate.direct.root().unflip_requested || self.pstate.direct.root().hold_direct)
             && matches!(
                 self.pstate.tearing.state,
                 TearingState::On { window, .. } if window == candidate.dst_window_xid
             )
-            && let Some(owner) = self.pstate.direct.get_mut(scope)
         {
-            owner.unflip_fallback_source = source_id;
-            owner.unflip_shadow_ready = false;
+            self.pstate.direct.root_mut().unflip_fallback_source = source_id;
+            self.pstate.direct.root_mut().unflip_shadow_ready = false;
         }
     }
 
@@ -1002,12 +965,12 @@ impl KmsBackend {
             self.tearing_gate_ignoring_cursor(candidate, target, unbordered);
         let was_tearing_on = self.note_tearing_present(
             candidate,
-            candidate_scope,
+            authoritative_root,
             target,
             tearing_gate_ignoring_cursor,
         );
         self.platform.set_tearing_on(self.pstate.tearing.is_on());
-        self.register_tearing_copy_fallback(candidate, candidate_scope, source_id);
+        self.register_tearing_copy_fallback(candidate, authoritative_root, source_id);
         if candidate_scope.is_some_and(|scope| {
             self.pstate
                 .direct
@@ -1079,9 +1042,7 @@ impl KmsBackend {
                         owner.unflip_shadow_ready = false;
                     }
                 }
-            } else if let Some(scope @ DirectScope::Output(_)) = candidate_scope
-                && !(self.pstate.tearing.is_on() && tearing_gate_ignoring_cursor)
-            {
+            } else if let Some(scope @ DirectScope::Output(_)) = candidate_scope {
                 if let Some(owner) = self.pstate.direct.get_mut(scope) {
                     owner.reset_eligible_direct_probation();
                 }
@@ -1274,7 +1235,7 @@ impl KmsBackend {
             <Self as Backend>::release_present_source(self, fallback_target_pin);
             return Ok(false);
         }
-        let timing = if was_tearing_on {
+        let timing = if was_tearing_on && authoritative_root {
             self.direct_frame_flip_timing(&frame, scope)
         } else {
             crate::drm::async_flip::FlipTiming::Vsync
