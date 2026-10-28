@@ -163,12 +163,8 @@ impl KmsBackend {
         unbordered: bool,
         include_cursor_term: bool,
     ) -> bool {
-        let direct_rect = self.direct_scope_rect(scope);
-        let scene_eligible = self
-            .direct_shape_chain_covers_root(candidate.paint_dst_host_xid, direct_rect)
-            && (!matches!(target, ScanoutM0Target::Unredirected)
-                || self
-                    .unredirected_direct_scene_eligible(candidate.paint_dst_host_xid, direct_rect));
+        let scene_eligible =
+            self.direct_scope_scene_eligible(candidate.paint_dst_host_xid, target, scope);
         let outputs = self.direct_scope_outputs(scope);
         let cursor_hw = !include_cursor_term || self.direct_cursor_eligible_for(&outputs);
         let root_overlay_empty = self.direct_root_overlay_empty_for_outputs(&outputs);
@@ -185,6 +181,28 @@ impl KmsBackend {
                 candidate.y_off,
                 candidate.valid_region_xid,
             )
+    }
+
+    /// Whether the current scene still allows a retained target to be scanned
+    /// out on this owner. Admission and tick revalidation share this policy so
+    /// an Unredirected window uses the scene's existing per-scope topmost test,
+    /// while COW targets use only the shape-chain coverage rule.
+    pub(in crate::kms::render::backend) fn direct_scope_scene_eligible(
+        &self,
+        leaf_xid: u32,
+        target: ScanoutM0Target,
+        scope: DirectScope,
+    ) -> bool {
+        if !matches!(
+            target,
+            ScanoutM0Target::Cow | ScanoutM0Target::CowDescendant | ScanoutM0Target::Unredirected
+        ) {
+            return false;
+        }
+        let direct_rect = self.direct_scope_rect(scope);
+        self.direct_shape_chain_covers_root(leaf_xid, direct_rect)
+            && (!matches!(target, ScanoutM0Target::Unredirected)
+                || self.unredirected_direct_scene_eligible(leaf_xid, direct_rect))
     }
 
     pub(in crate::kms::render::backend) fn tearing_gate_ignoring_cursor(

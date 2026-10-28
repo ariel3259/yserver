@@ -11,7 +11,7 @@ use yserver_core::{
 };
 
 use crate::kms::render::{
-    backend::{KmsBackend, KmsBackendState, seam::Platform},
+    backend::{DirectScope, KmsBackend, KmsBackendState, seam::Platform},
     platform::PlatformBackend,
     present_batch::{PendingPresentBatch, PresentBatchWait},
     scene::OutputLayout,
@@ -166,20 +166,32 @@ impl Platform for PlatformBackend {
         b.request_direct_unflip(reason);
     }
 
+    fn request_direct_unflip_for_host_drawable(
+        b: &mut KmsBackend,
+        host_xid: u32,
+        reason: &'static str,
+    ) {
+        b.request_direct_unflip_for_host_drawable(host_xid, reason);
+    }
+
+    fn on_top_level_order_changed(b: &mut KmsBackend) {
+        if !b.direct_frames_are_under_cow() {
+            b.request_direct_unflip_for(DirectScope::Root, "top_level_stack_changed");
+        }
+    }
+
+    fn on_direct_shape_changed(b: &mut KmsBackend) {
+        if b.direct_frames_shaped_off_root() {
+            b.request_direct_unflip_for(DirectScope::Root, "shape_clips_direct_frame");
+        }
+    }
+
     fn request_tearing_cursor_handoff(b: &mut KmsBackend) {
         b.request_tearing_cursor_handoff();
     }
 
     fn direct_frames_are_under_cow(b: &KmsBackend) -> bool {
         b.direct_frames_are_under_cow()
-    }
-
-    fn direct_frame_references_host_drawable(b: &KmsBackend, host_xid: u32) -> bool {
-        b.direct_frame_references_host_drawable(host_xid)
-    }
-
-    fn direct_frames_shaped_off_root(b: &KmsBackend) -> bool {
-        b.direct_frames_shaped_off_root()
     }
 
     fn refresh_direct_cursor(

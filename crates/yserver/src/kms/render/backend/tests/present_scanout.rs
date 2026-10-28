@@ -4962,3 +4962,6 @@ fn shape_triggered_composed_unflip_records_cursor_positions_for_both_outputs() {
             .for_tests_atomic_position_is_unsent(position.device_key, position.crtc)
     }));
 }
+
+#[path = "present_scanout_a3.rs"]
+mod a3;

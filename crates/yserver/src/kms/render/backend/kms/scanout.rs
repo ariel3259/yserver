@@ -608,24 +608,58 @@ impl KmsBackend {
         owner.hold_direct = false;
     }
 
-    pub(in crate::kms::render::backend) fn direct_frame_references_host_drawable(
+    pub(in crate::kms::render::backend) fn direct_scopes_referencing_host_drawable(
         &self,
         host_xid: u32,
-    ) -> bool {
+    ) -> Vec<DirectScope> {
         let drawable_id = self.store.lookup(host_xid);
-        let references = |frame: &DirectPresentFrame| {
+        let references_drawable = |frame: &DirectPresentFrame| {
             frame.candidate.paint_dst_host_xid == host_xid
                 || drawable_id.is_some_and(|id| {
                     frame.source_id == id || frame.fallback_target.backing_id() == id
                 })
         };
-        self.pstate.direct.active_scopes().into_iter().any(|scope| {
-            self.pstate.direct.get(scope).is_some_and(|owner| {
-                owner.pending.as_ref().is_some_and(references)
-                    || owner.queued_successor.as_ref().is_some_and(references)
-                    || owner.current.as_ref().is_some_and(references)
+        self.pstate
+            .direct
+            .active_scopes()
+            .into_iter()
+            .filter(|&scope| {
+                let Some(owner) = self.pstate.direct.get(scope) else {
+                    return false;
+                };
+                [
+                    owner.pending.as_ref(),
+                    owner.queued_successor.as_ref(),
+                    owner.current.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                .any(|frame| {
+                    if references_drawable(frame) {
+                        return true;
+                    }
+                    if !matches!(scope, DirectScope::Output(_)) {
+                        return false;
+                    }
+                    direct_shape_chain_root_offsets(
+                        &self.windows,
+                        self.core.window_id,
+                        frame.candidate.paint_dst_host_xid,
+                    )
+                    .is_none_or(|chain| chain.iter().any(|(xid, _, _)| *xid == host_xid))
+                })
             })
-        })
+            .collect()
+    }
+
+    pub(in crate::kms::render::backend) fn request_direct_unflip_for_host_drawable(
+        &mut self,
+        host_xid: u32,
+        reason: &'static str,
+    ) {
+        for scope in self.direct_scopes_referencing_host_drawable(host_xid) {
+            self.request_direct_unflip_for(scope, reason);
+        }
     }
 
     /// Keep the scene's per-output cursor mode aligned with cursor planes
@@ -3011,22 +3045,19 @@ impl KmsBackend {
     /// Clip shape that no longer covers the root. A compositor may shape the
     /// COW without presenting again, so the shape change itself must unflip.
     pub(in crate::kms::render::backend) fn direct_frames_shaped_off_root(&self) -> bool {
-        self.pstate.direct.active_scopes().into_iter().any(|scope| {
-            let Some(owner) = self.pstate.direct.get(scope) else {
-                return false;
-            };
-            let rect = self.direct_scope_rect(scope);
-            [
-                owner.pending.as_ref(),
-                owner.queued_successor.as_ref(),
-                owner.current.as_ref(),
-            ]
-            .into_iter()
-            .flatten()
-            .any(|frame| {
-                !self.direct_shape_chain_covers_root(frame.candidate.paint_dst_host_xid, rect)
-            })
-        })
+        let scope = DirectScope::Root;
+        let Some(owner) = self.pstate.direct.get(scope) else {
+            return false;
+        };
+        let rect = self.direct_scope_rect(scope);
+        [
+            owner.pending.as_ref(),
+            owner.queued_successor.as_ref(),
+            owner.current.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|frame| !self.direct_shape_chain_covers_root(frame.candidate.paint_dst_host_xid, rect))
     }
 
     /// Whether an unredirected Present target is still the window which the
@@ -4029,6 +4060,31 @@ impl KmsBackend {
                 }
             }
             for scope in active_scopes {
+                if matches!(scope, DirectScope::Output(_)) {
+                    let scene_eligible = self.pstate.direct.get(scope).is_some_and(|owner| {
+                        [
+                            owner.current.as_ref(),
+                            owner.pending.as_ref(),
+                            owner.queued_successor.as_ref(),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .all(|frame| {
+                            let host_xid = frame.candidate.paint_dst_host_xid;
+                            let leaf_id = self.store.lookup(host_xid);
+                            let paint_target = self.resolve_paint_target(host_xid);
+                            let paint_id = paint_target.map(|target| target.backing_id());
+                            let target = self.scanout_m0_target(host_xid, leaf_id, paint_id);
+                            self.direct_scope_scene_eligible(host_xid, target, scope)
+                        })
+                    });
+                    if !scene_eligible {
+                        self.request_direct_unflip_for(
+                            scope,
+                            "composite_tick_output_scene_changed",
+                        );
+                    }
+                }
                 let Some(owner) = self.pstate.direct.get(scope) else {
                     continue;
                 };

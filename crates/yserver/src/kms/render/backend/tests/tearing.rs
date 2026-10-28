@@ -2890,6 +2890,18 @@ fn live_scene_backend_with_geometry(
 
 fn seed_held_output_owner(backend: &mut KmsBackend, output_idx: usize, target_xid: u32) {
     let fallback_id = super::seed_window(backend, target_xid, None, 0, 0);
+    let output = &backend.platform.outputs[output_idx];
+    let target = backend
+        .windows
+        .get_mut(&target_xid)
+        .expect("seeded direct target window");
+    target.x = i16::try_from(output.x).expect("test output x fits X geometry");
+    target.y = i16::try_from(output.y).expect("test output y fits X geometry");
+    target.width = output.width;
+    target.height = output.height;
+    if !backend.core.top_level_order.contains(&target_xid) {
+        backend.core.top_level_order.push(target_xid);
+    }
     install_direct_frame_for_target_test(backend, target_xid, fallback_id, true);
     let owner = backend.pstate.direct.root_mut();
     let frame = owner
