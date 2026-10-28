@@ -17,36 +17,6 @@ fn a3_records_since(
         .collect()
 }
 
-fn a3_drain_output_events(
-    fixture: &mut super::commit_identity::recording_scene::RecordingSceneFixture,
-    delivered: &mut std::collections::HashSet<super::cursor_sprites::support::CompletionKey>,
-    output_idx: usize,
-) {
-    for frame in 20..28 {
-        if !super::cursor_sprites::support::has_unretired_accepted_event(
-            &fixture.events,
-            delivered,
-            output_idx,
-        ) {
-            return;
-        }
-        super::cursor_sprites::support::retire_pending_output(
-            &mut fixture.events,
-            delivered,
-            output_idx,
-            frame,
-        );
-    }
-    assert!(
-        !super::cursor_sprites::support::has_unretired_accepted_event(
-            &fixture.events,
-            delivered,
-            output_idx,
-        ),
-        "output {output_idx} accepted events drain through Backend"
-    );
-}
-
 pub(crate) fn a3_admit_output_owner(
     fixture: &mut super::commit_identity::recording_scene::RecordingSceneFixture,
     direct: &super::commit_identity::recording_scene::DirectPresentSetup,
@@ -499,27 +469,6 @@ fn a3_present_root_copy(
         candidate.src_pixmap_xid,
         candidate.paint_dst_host_xid,
     );
-}
-
-fn a3_damage_root(fixture: &mut super::commit_identity::recording_scene::RecordingSceneFixture) {
-    use yserver_core::backend::Backend;
-
-    let root = fixture.events.backend.core.window_id;
-    let width = fixture.events.backend.platform.fb_w;
-    let height = fixture.events.backend.platform.fb_h;
-    Backend::clear_area(
-        &mut fixture.events.backend,
-        None,
-        root,
-        0,
-        None,
-        0,
-        0,
-        width,
-        height,
-        (0, 0),
-    )
-    .expect("damage the root through Backend");
 }
 
 fn a3_visible_root_pixel(
@@ -1930,7 +1879,7 @@ fn output_unflip_does_not_stall_other_output_compose() {
     a3_enter_output_owner(&mut fixture, &direct, 1);
     Backend::unmap_subwindow(&mut fixture.events.backend, None, direct.target_xid)
         .expect("request Output(1) unflip through Backend");
-    a3_damage_root(&mut fixture);
+    super::commit_identity::direct_unflip::damage_scene_root(&mut fixture);
     let before = fixture.events.recorders[&device_fd].records().len();
 
     Backend::maybe_composite(&mut fixture.events.backend).expect("schedule Output(1) unflip");
@@ -1988,7 +1937,7 @@ fn output_unflip_does_not_stall_other_output_compose() {
     a3_enter_output_owner(&mut fixture, &direct, 1);
     Backend::unmap_subwindow(&mut fixture.events.backend, None, direct.target_xid)
         .expect("request degraded Output(1) unflip through Backend");
-    a3_damage_root(&mut fixture);
+    super::commit_identity::direct_unflip::damage_scene_root(&mut fixture);
     let recorder = fixture.events.recorders[&device_fd].clone();
     recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
     recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
@@ -2102,7 +2051,11 @@ fn retained_direct_damage_does_not_block_other_output_cursor_commit() {
             .expect("settle output 0's hardware cursor through Backend");
         fixture.events.wait_for_submitted_gpu_work();
         for output_idx in 0..2 {
-            a3_drain_output_events(fixture, &mut delivered, output_idx);
+            super::cursor_sprites::support::drain_output_events(
+                &mut fixture.events,
+                &mut delivered,
+                output_idx,
+            );
         }
     }
     assert_eq!(
@@ -2116,13 +2069,17 @@ fn retained_direct_damage_does_not_block_other_output_cursor_commit() {
         100,
         100,
     );
-    a3_damage_root(fixture);
+    super::commit_identity::direct_unflip::damage_scene_root(fixture);
     for _ in 0..4 {
         Backend::maybe_composite(&mut fixture.events.backend)
             .expect("compose the output window and establish output 0's cursor");
         fixture.events.wait_for_submitted_gpu_work();
         for output_idx in 0..2 {
-            a3_drain_output_events(fixture, &mut delivered, output_idx);
+            super::cursor_sprites::support::drain_output_events(
+                &mut fixture.events,
+                &mut delivered,
+                output_idx,
+            );
         }
     }
     let direct_records = a3_admit_output_owner(fixture, &direct, 1);
@@ -2185,7 +2142,11 @@ fn retained_direct_damage_does_not_block_other_output_cursor_commit() {
         "the scheduler clears the global wake after output 0 inspects its clean scene"
     );
     for output_idx in 0..2 {
-        a3_drain_output_events(fixture, &mut delivered, output_idx);
+        super::cursor_sprites::support::drain_output_events(
+            &mut fixture.events,
+            &mut delivered,
+            output_idx,
+        );
     }
     assert!(
         fixture
@@ -2248,19 +2209,27 @@ fn retained_direct_damage_does_not_block_other_output_cursor_commit() {
     );
 
     for output_idx in 0..2 {
-        a3_drain_output_events(fixture, &mut delivered, output_idx);
+        super::cursor_sprites::support::drain_output_events(
+            &mut fixture.events,
+            &mut delivered,
+            output_idx,
+        );
     }
 
     Backend::unmap_subwindow(&mut fixture.events.backend, None, direct.target_xid)
         .expect("request Output(1) cleanup unflip through Backend");
-    a3_damage_root(fixture);
+    super::commit_identity::direct_unflip::damage_scene_root(fixture);
     let cleanup_start = fixture.events.recorders[&device_fd].records().len();
     Backend::maybe_composite(&mut fixture.events.backend)
         .expect("replace Output(1)'s direct scanout");
     fixture.events.wait_for_submitted_gpu_work();
     let cleanup = a3_records_since(fixture, device_fd, cleanup_start);
     for output_idx in 0..2 {
-        a3_drain_output_events(fixture, &mut delivered, output_idx);
+        super::cursor_sprites::support::drain_output_events(
+            &mut fixture.events,
+            &mut delivered,
+            output_idx,
+        );
     }
     assert!(
         fixture.events.backend.pstate.direct.outputs[1]
@@ -2295,13 +2264,17 @@ fn retained_direct_damage_does_not_block_other_output_cursor_commit() {
         "Output(1)'s idle notification follows its completed replacement"
     );
     Backend::set_cursor_hidden(&mut fixture.events.backend, true);
-    a3_damage_root(fixture);
+    super::commit_identity::direct_unflip::damage_scene_root(fixture);
     for _ in 0..4 {
         Backend::maybe_composite(&mut fixture.events.backend)
             .expect("detach the fixture cursor through Backend");
         fixture.events.wait_for_submitted_gpu_work();
         for output_idx in 0..2 {
-            a3_drain_output_events(fixture, &mut delivered, output_idx);
+            super::cursor_sprites::support::drain_output_events(
+                &mut fixture.events,
+                &mut delivered,
+                output_idx,
+            );
         }
     }
     assert!(!fixture.events.backend.platform.any_cursor_plane_visible());

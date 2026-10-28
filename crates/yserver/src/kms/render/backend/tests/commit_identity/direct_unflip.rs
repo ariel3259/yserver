@@ -721,7 +721,7 @@ fn output_owner_submits_and_unflips_only_its_crtc() {
     );
 }
 
-fn damage_scene_root(fixture: &mut RecordingSceneFixture) {
+pub(crate) fn damage_scene_root(fixture: &mut RecordingSceneFixture) {
     let backend = &fixture.events.backend;
     let root = backend.core.window_id;
     let width = backend.platform.fb_w;
@@ -739,6 +739,162 @@ fn damage_scene_root(fixture: &mut RecordingSceneFixture) {
         (0, 0),
     )
     .expect("damage scene root through Backend");
+}
+
+fn submit_next_msc_present_and_assert_parked(
+    fixture: &mut RecordingSceneFixture,
+    direct: &DirectPresentSetup,
+    output_idx: usize,
+) {
+    use std::sync::{Arc, Mutex, atomic::AtomicU16};
+    use yserver_core::{
+        core_loop::process_request::process_request,
+        randr::{RR_ROTATE_0, RandrOutput, RandrState},
+        resources::ROOT_WINDOW,
+        server::ClientState,
+        transport::Transport,
+    };
+    use yserver_protocol::x11::{
+        ClientByteOrder, ClientId, CreatePixmapRequest, CreateWindowRequest, RequestHeader,
+        ResourceId, SequenceNumber, present as x11present,
+    };
+
+    const CLIENT_ID: u32 = 0x31;
+    const WINDOW_ID: u32 = 0x0031_0001;
+    const PIXMAP_ID: u32 = 0x0031_0002;
+
+    let layout = &fixture.events.backend.platform.outputs[output_idx];
+    let crtc_id = u32::from(layout.output.crtc);
+    let current_msc = Backend::present_get_ust_msc(&fixture.events.backend, crtc_id).0;
+    assert!(current_msc > 0, "the output has a recorded MSC sample");
+
+    let state = &mut fixture.events.state;
+    let (writer, _peer) = Transport::pair().expect("Present test client transport");
+    state.clients.insert(
+        CLIENT_ID,
+        ClientState {
+            writer: Arc::new(Mutex::new(writer)),
+            is_local: true,
+            fd_passing: true,
+            internal: false,
+            byte_order: ClientByteOrder::LittleEndian,
+            last_sequence: Arc::new(AtomicU16::new(0)),
+            resource_id_base: 0,
+            resource_id_mask: u32::MAX,
+            event_masks: HashMap::new(),
+            save_set: HashSet::new(),
+            big_requests_enabled: false,
+            xi2_masks: HashMap::new(),
+            xi1_event_classes: HashSet::new(),
+            xi1_window_event_classes: HashMap::new(),
+            outbound: std::collections::VecDeque::new(),
+            watching_writable: false,
+            write_failed: false,
+            gone: false,
+            focused_window: ROOT_WINDOW,
+            reader_control: None,
+        },
+    );
+    state.randr = RandrState::from_outputs(
+        1,
+        vec![RandrOutput {
+            name: format!("test-{output_idx}"),
+            output_id: 0x31_0001,
+            crtc_id,
+            mode_id: 0x31_0002,
+            connected: true,
+            x: 0,
+            y: 0,
+            width: layout.width,
+            height: layout.height,
+            vrefresh: 60,
+            timing: None,
+            mm_width: 0,
+            mm_height: 0,
+            mode_ids: vec![0x31_0002],
+            num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+            rotation: RR_ROTATE_0,
+        }],
+    );
+    state.resources.create_window(
+        ClientId(CLIENT_ID),
+        CreateWindowRequest {
+            depth: 24,
+            window: ResourceId(WINDOW_ID),
+            parent: ROOT_WINDOW,
+            width: layout.width,
+            height: layout.height,
+            class: 1,
+            visual: yserver_core::resources::ROOT_VISUAL,
+            ..Default::default()
+        },
+    );
+    let _ = state.resources.map_window(ResourceId(WINDOW_ID));
+    state
+        .resources
+        .window_mut(ResourceId(WINDOW_ID))
+        .expect("Present destination exists")
+        .host_xid = yserver_core::backend::WindowHandle::from_raw(direct.target_xid);
+    state.resources.create_pixmap(
+        ClientId(CLIENT_ID),
+        CreatePixmapRequest {
+            depth: 24,
+            pixmap: ResourceId(PIXMAP_ID),
+            drawable: ResourceId(WINDOW_ID),
+            width: layout.width,
+            height: layout.height,
+        },
+    );
+    assert!(
+        state.resources.set_pixmap_host_xid(
+            ResourceId(PIXMAP_ID),
+            yserver_core::backend::PixmapHandle::from_raw(direct.candidate.src_host_xid)
+                .expect("Present source host XID"),
+        )
+    );
+
+    let mut body = vec![0; 68];
+    body[0..4].copy_from_slice(&WINDOW_ID.to_le_bytes());
+    body[4..8].copy_from_slice(&PIXMAP_ID.to_le_bytes());
+    body[24..28].copy_from_slice(&crtc_id.to_le_bytes());
+    process_request(
+        state,
+        &mut fixture.events.backend,
+        ClientId(CLIENT_ID),
+        SequenceNumber(1),
+        RequestHeader {
+            opcode: 145,
+            data: x11present::PIXMAP,
+            length_units: 18,
+        },
+        &body,
+        None,
+    )
+    .expect("dispatch next-MSC Present through the core request path");
+
+    let present_id = {
+        let (present_id, pending) = state
+            .present_pending_exec
+            .iter()
+            .next()
+            .expect("next-MSC Present parks while its output flip is pending");
+        assert_eq!(state.present_pending_exec.len(), 1);
+        assert_eq!(pending.pending.crtc_id, crtc_id);
+        assert_eq!(pending.pending.effective_target_msc, Some(current_msc + 1));
+        assert!(pending.source_ready);
+        assert_eq!(pending.wait_id, None);
+        *present_id
+    };
+
+    let pending = state
+        .present_pending_exec
+        .remove(&present_id)
+        .expect("parked test request is removed during fixture cleanup");
+    if let Some(pin) = pending.pin {
+        Backend::release_present_source(&mut fixture.events.backend, pin);
+    }
 }
 
 #[test]
@@ -3302,9 +3458,40 @@ fn present_in_flight_reads_the_output_owner() {
     let output0_crtc = fixture.events.backend.platform.outputs[0].output.crtc;
     let output1_crtc = fixture.events.backend.platform.outputs[1].output.crtc;
 
-    let submission_start = record_count(&fixture, device_fd);
     Backend::set_cursor_hidden(&mut fixture.events.backend, true);
+    let seed_start = record_count(&fixture, device_fd);
+    damage_scene_root(&mut fixture);
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("seed the per-output Present clocks through the scheduler");
+    fixture.events.wait_for_submitted_gpu_work();
+    let seed_records = accepted_records(&records_since(&fixture, device_fd, seed_start));
+    assert!(seed_records.iter().any(|record| {
+        record.kind == AtomicCommitKind::Scene
+            && record.events.iter().any(|event| event.crtc == output1_crtc)
+    }));
+    for (index, record) in seed_records
+        .iter()
+        .filter(|record| record.kind == AtomicCommitKind::Scene)
+        .enumerate()
+    {
+        let frame = u32::try_from(80 + index).expect("seed frame fits");
+        complete_recorded_attempt(
+            &mut fixture,
+            device_fd,
+            record,
+            accepted_event_id(record).expect("accepted scene seed has an ID"),
+            frame,
+        );
+    }
+    assert!(
+        Backend::present_get_ust_msc(&fixture.events.backend, u32::from(output1_crtc)).0 > 0,
+        "the seed commit records output 1's general MSC clock"
+    );
+
+    let submission_start = record_count(&fixture, device_fd);
     let direct_record = submit_output_present_via_backend(&mut fixture, &direct, 1);
+    submit_next_msc_present_and_assert_parked(&mut fixture, &direct, 1);
+    damage_scene_root(&mut fixture);
     Backend::maybe_composite(&mut fixture.events.backend)
         .expect("compose output 0 while Output(1)'s Present flip is pending");
     fixture.events.wait_for_submitted_gpu_work();
@@ -3345,6 +3532,27 @@ fn present_in_flight_reads_the_output_owner() {
     drain_present_notifications(&mut fixture, &[direct.candidate.present_id], &[]);
     Backend::unmap_subwindow(&mut fixture.events.backend, None, direct.target_xid)
         .expect("request Output(1) replacement through Backend");
+    {
+        // Model the existing degraded-replacement marker without a scene
+        // page flip so the owner lookup is tested independently of scene state.
+        let owner = &mut fixture.events.backend.pstate.direct.outputs[1];
+        owner.degraded_composed_unflip = true;
+        owner.unflip_outputs_to_replace = HashSet::from([1]);
+    }
+    assert!(!fixture.events.backend.scene.has_pending_page_flip(1));
+    assert!(
+        Backend::present_flip_in_flight(&fixture.events.backend, u32::from(output1_crtc)),
+        "the Output(1) replacement marker alone reports an in-flight flip"
+    );
+    assert!(
+        !Backend::present_flip_in_flight(&fixture.events.backend, u32::from(output0_crtc)),
+        "the Output(1) replacement marker does not affect output 0"
+    );
+    {
+        let owner = &mut fixture.events.backend.pstate.direct.outputs[1];
+        owner.degraded_composed_unflip = false;
+        owner.unflip_outputs_to_replace.clear();
+    }
     let replacement_start = record_count(&fixture, device_fd);
     Backend::maybe_composite(&mut fixture.events.backend)
         .expect("submit Output(1)'s unflip replacement through the scheduler");
@@ -3364,17 +3572,17 @@ fn present_in_flight_reads_the_output_owner() {
         }
     }
     assert!(!fixture.events.backend.scene.has_pending_page_flip(0));
-    let replacement_id = fixture.events.backend.pstate.direct.outputs[1]
-        .unflip_awaiting_outputs
-        .get(&1)
-        .copied()
-        .expect("the output-scoped replacement is accepted and awaiting retirement");
     assert!(
         fixture.events.backend.pstate.direct.outputs[1]
             .pending
             .is_none(),
         "only the replacement, not another direct frame, is pending"
     );
+    let replacement_id = fixture.events.backend.pstate.direct.outputs[1]
+        .unflip_awaiting_outputs
+        .get(&1)
+        .copied()
+        .expect("the output-scoped replacement is accepted and awaiting retirement");
     assert!(
         Backend::present_flip_in_flight(&fixture.events.backend, u32::from(output1_crtc)),
         "Present sees the output owner's replacement in flight"

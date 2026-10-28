@@ -560,14 +560,22 @@ pub(crate) fn drain_unretired_output_events(
     delivered: &mut HashSet<CompletionKey>,
     output_idx: usize,
 ) {
+    drain_output_events(&mut fixture.scene.events, delivered, output_idx);
+}
+
+pub(crate) fn drain_output_events(
+    events: &mut AtomicEventFixture,
+    delivered: &mut HashSet<CompletionKey>,
+    output_idx: usize,
+) {
     for frame in 20..28 {
-        if !has_unretired_accepted_event(&fixture.scene.events, delivered, output_idx) {
+        if !has_unretired_accepted_event(events, delivered, output_idx) {
             return;
         }
-        retire_pending_output(&mut fixture.scene.events, delivered, output_idx, frame);
+        retire_pending_output(events, delivered, output_idx, frame);
     }
     assert!(
-        !has_unretired_accepted_event(&fixture.scene.events, delivered, output_idx),
+        !has_unretired_accepted_event(events, delivered, output_idx),
         "accepted output events did not drain"
     );
 }

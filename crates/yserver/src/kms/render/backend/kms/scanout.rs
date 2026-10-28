@@ -395,16 +395,9 @@ impl KmsBackend {
             })
     }
 
-    fn scene_skip_outputs(&self, degraded_only: bool) -> Vec<bool> {
+    fn scene_skip_outputs(&self) -> Vec<bool> {
         (0..self.platform.outputs.len())
-            .map(|output_idx| {
-                let selected = if degraded_only {
-                    self.output_has_degraded_unflip(output_idx)
-                } else {
-                    self.scene_output_ready_for_scheduled_compose(output_idx)
-                };
-                !selected
-            })
+            .map(|output_idx| !self.scene_output_ready_for_scheduled_compose(output_idx))
             .collect()
     }
 
@@ -436,7 +429,7 @@ impl KmsBackend {
 
     fn scheduled_scene_retry_deadline(&self) -> Option<std::time::Instant> {
         self.scene
-            .earliest_retry_deadline_for_outputs(&self.scene_skip_outputs(false))
+            .earliest_retry_deadline_for_outputs(&self.scene_skip_outputs())
     }
 
     fn scene_cursor_eligible_outputs(&self) -> Vec<bool> {
@@ -4134,7 +4127,7 @@ impl KmsBackend {
                 }
             }
         }
-        let skip_outputs = self.scene_skip_outputs(false);
+        let skip_outputs = self.scene_skip_outputs();
         if skip_outputs.iter().all(|skip| *skip) {
             // Root direct ownership still holds the complete output set, while
             // per-output owners leave unrelated CRTCs available above.
