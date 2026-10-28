@@ -421,7 +421,7 @@ impl KmsBackend {
             &hw_cursor_suppressed,
         );
         let skip_outputs: Vec<_> = (0..self.platform.outputs.len())
-            .map(|output_idx| self.output_is_direct(output_idx))
+            .map(|output_idx| self.output_skips_composition(output_idx))
             .collect();
         let vrr_before = self.vrr_committed_snapshot();
         let result = self.scene.tick(

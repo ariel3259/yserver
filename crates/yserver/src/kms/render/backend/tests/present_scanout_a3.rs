@@ -155,6 +155,26 @@ fn a3_tick(
     a3_records_since(fixture, fd, start)
 }
 
+fn a3_retire_hardware_cursor_mode(
+    fixture: &mut super::commit_identity::recording_scene::RecordingSceneFixture,
+) {
+    for _ in 0..4 {
+        let records = a3_tick(fixture);
+        a3_retire_records(fixture, &records);
+        if fixture.events.backend.scene.cursor_mode_for_outputs(&[0])
+            == crate::kms::render::scene::CursorPlaneMode::Hw
+            && fixture
+                .events
+                .backend
+                .platform
+                .cursor_plane_visible_for_output(0)
+        {
+            return;
+        }
+    }
+    panic!("Output(0) did not return to retired hardware cursor ownership");
+}
+
 fn a3_retire_records(
     fixture: &mut super::commit_identity::recording_scene::RecordingSceneFixture,
     records: &[crate::drm::atomic::tests_support::AtomicCommitRecord],
@@ -2191,7 +2211,8 @@ fn a3_enter_async_output1_tearing_owner(
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutations: remove the bounded hold or leave it set after successful direct entry.
+// Mutations: remove the bounded hold; leave it set after successful direct entry;
+// retain its source pin after the final scene consumer retires.
 fn unpaced_client_enters_direct_while_output_composes_scene_flip() {
     use yserver_core::backend::Backend;
 
@@ -2234,11 +2255,204 @@ fn unpaced_client_enters_direct_while_output_composes_scene_flip() {
     assert_eq!(completed.len(), 1, "direct Present completes exactly once");
     assert_eq!(completed[0].present_id, 970);
     assert!(
+        fixture
+            .events
+            .backend
+            .present_source_pins
+            .values()
+            .any(|&id| id == direct.source_id),
+        "the current direct frame keeps its Present source pinned"
+    );
+
+    Backend::destroy_subwindow(&mut fixture.events.backend, None, direct.target_xid)
+        .expect("destroy the direct owner through Backend");
+    let replacement = a3_tick(&mut fixture);
+    assert!(a3_has_scene_commit_for(
+        &replacement,
+        fixture.events.backend.platform.outputs[0].output.crtc
+    ));
+    a3_retire_records(&mut fixture, &replacement);
+    assert!(
+        !fixture
+            .events
+            .backend
+            .present_source_pins
+            .values()
+            .any(|&id| id == direct.source_id),
+        "the direct source pin is released when its final scene consumer retires"
+    );
+    assert!(
         fixture.events.backend.pstate.direct.outputs[1]
             .current
             .is_some()
     );
     fixture.finish();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: let an entry hold satisfy output_is_direct and suppress its cursor-only commit.
+fn entry_hold_keeps_cursor_only_updates_schedulable() {
+    use yserver_core::backend::Backend;
+
+    let Some(mut cursor_fixture) =
+        super::cursor_sprites::support::AtomicPathFixture::with_output_count(
+            super::cursor_sprites::support::PathKind::Physical,
+            2,
+        )
+        .expect("A3 dual-output cursor fixture")
+    else {
+        eprintln!(
+            "SKIP entry_hold_keeps_cursor_only_updates_schedulable: Vulkan fixture unavailable"
+        );
+        return;
+    };
+    let cursor = super::cursor_sprites::support::create_argb_cursor(
+        &mut cursor_fixture.scene.events.backend,
+        (16, 16),
+        [0xff; 4],
+        (2, 2),
+    );
+    let mut delivered = std::collections::HashSet::new();
+    super::cursor_sprites::support::establish_hardware_cursor_on_output(
+        &mut cursor_fixture,
+        &mut delivered,
+        cursor,
+        0,
+        (40, 50),
+    );
+    let mut fixture = cursor_fixture.scene.cleanup_guard();
+
+    let direct = fixture.install_direct_output_present(0, 995, 0);
+    Backend::set_cursor_hidden(&mut fixture.events.backend, false);
+    a3_retire_hardware_cursor_mode(&mut fixture);
+    let _ = a3_arm_output_entry_hold(&mut fixture, &direct, false, 0, None);
+    assert!(
+        fixture.events.backend.pstate.direct.outputs[0]
+            .entry_hold
+            .is_some(),
+        "the Output(0) composition hold is active"
+    );
+    assert!(
+        fixture
+            .events
+            .backend
+            .platform
+            .cursor_plane_visible_for_output(0),
+        "the hold starts with retired hardware cursor ownership"
+    );
+
+    {
+        let events = fixture.events_mut();
+        Backend::warp_pointer_root(&mut events.backend, &mut events.state, 41, 51);
+    }
+    let records = a3_tick(&mut fixture);
+    let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    assert!(
+        records.iter().any(|record| {
+            record.kind == crate::drm::atomic::AtomicCommitKind::CursorOnly
+                && record.events.iter().any(|event| event.crtc == crtc)
+        }),
+        "pending hardware cursor motion commits while composition is held"
+    );
+    assert!(
+        fixture.events.backend.pstate.direct.outputs[0]
+            .entry_hold
+            .is_some(),
+        "a cursor-only commit does not consume the composition hold"
+    );
+    a3_retire_records(&mut fixture, &records);
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: validate a held cursor only from retired scene mode, ignoring live fallback availability.
+fn entry_hold_clears_after_live_hardware_cursor_fallback() {
+    use yserver_core::backend::Backend;
+
+    let Some(mut cursor_fixture) =
+        super::cursor_sprites::support::AtomicPathFixture::with_output_count(
+            super::cursor_sprites::support::PathKind::Physical,
+            2,
+        )
+        .expect("A3 dual-output cursor fixture")
+    else {
+        eprintln!(
+            "SKIP entry_hold_clears_after_live_hardware_cursor_fallback: Vulkan fixture unavailable"
+        );
+        return;
+    };
+    let cursor = super::cursor_sprites::support::create_argb_cursor(
+        &mut cursor_fixture.scene.events.backend,
+        (16, 16),
+        [0xff; 4],
+        (2, 2),
+    );
+    let mut delivered = std::collections::HashSet::new();
+    super::cursor_sprites::support::establish_hardware_cursor_on_output(
+        &mut cursor_fixture,
+        &mut delivered,
+        cursor,
+        0,
+        (40, 50),
+    );
+    let mut fixture = cursor_fixture.scene.cleanup_guard();
+
+    let direct = fixture.install_direct_output_present(0, 996, 0);
+    Backend::set_cursor_hidden(&mut fixture.events.backend, false);
+    a3_retire_hardware_cursor_mode(&mut fixture);
+    let _ = a3_arm_output_entry_hold(&mut fixture, &direct, false, 0, None);
+    assert_eq!(
+        fixture.events.backend.scene.cursor_mode_for_outputs(&[0]),
+        crate::kms::render::scene::CursorPlaneMode::Hw,
+        "the hold starts with retired hardware cursor ownership"
+    );
+
+    let fd = fixture.kms_fd(0);
+    fixture.events.recorders[&fd]
+        .script_result(Err(std::io::Error::from_raw_os_error(libc::EINVAL)));
+    {
+        let events = fixture.events_mut();
+        Backend::warp_pointer_root(&mut events.backend, &mut events.state, 42, 52);
+    }
+    let rejected = a3_tick(&mut fixture);
+    let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    assert!(
+        rejected.iter().any(|record| {
+            record.kind == crate::drm::atomic::AtomicCommitKind::CursorOnly
+                && record.events.iter().any(|event| event.crtc == crtc)
+                && record.result
+                    == crate::drm::atomic::tests_support::ScriptedResult::Error {
+                        kind: std::io::ErrorKind::InvalidInput,
+                        raw_os_error: Some(libc::EINVAL),
+                    }
+        }),
+        "Backend cursor scheduling observes an attributed hardware cursor EINVAL"
+    );
+    assert!(
+        fixture.events.backend.pstate.direct.outputs[0]
+            .entry_hold
+            .is_some(),
+        "fallback follows the hold's validation pass in this scheduler tick"
+    );
+
+    let recovery = a3_tick(&mut fixture);
+    assert!(
+        fixture.events.backend.pstate.direct.outputs[0]
+            .entry_hold
+            .is_none(),
+        "live cursor fallback clears the stale hardware-cursor hold"
+    );
+    assert!(
+        a3_has_scene_commit_for(&recovery, crtc),
+        "composition resumes to include the software cursor"
+    );
+    a3_retire_records(&mut fixture, &recovery);
+    assert_eq!(
+        fixture.events.backend.scene.cursor_mode_for_outputs(&[0]),
+        crate::kms::render::scene::CursorPlaneMode::Sw,
+        "the resumed scene retires with software cursor ownership"
+    );
 }
 
 #[test]

@@ -420,7 +420,7 @@ impl PlatformBackend {
     /// True iff this output's owning DRM device currently has an eligible
     /// Atomic cursor plane. Raw CRTC handles never select a device.
     #[must_use]
-    pub(super) fn cursor_plane_available_for_output(&self, output_idx: usize) -> bool {
+    pub(crate) fn cursor_plane_available_for_output(&self, output_idx: usize) -> bool {
         let Some(layout) = self.outputs.get(output_idx) else {
             return false;
         };

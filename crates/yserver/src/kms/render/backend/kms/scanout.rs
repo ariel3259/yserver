@@ -373,7 +373,6 @@ impl KmsBackend {
         if output_idx >= self.platform.outputs.len() {
             return false;
         }
-        let now = self.monotonic_now();
         let owner = if self.pstate.direct.root().active() {
             Some(self.pstate.direct.root())
         } else {
@@ -383,8 +382,23 @@ impl KmsBackend {
             owner.active()
                 || owner.unflip_outputs_to_replace.contains(&output_idx)
                 || owner.unflip_awaiting_outputs.contains_key(&output_idx)
-                || owner.entry_hold.is_some_and(|hold| hold.deadline > now)
         })
+    }
+
+    fn output_entry_hold_active(&self, output_idx: usize) -> bool {
+        self.pstate
+            .direct
+            .outputs
+            .get(output_idx)
+            .and_then(|owner| owner.entry_hold)
+            .is_some_and(|hold| hold.deadline > self.monotonic_now())
+    }
+
+    pub(in crate::kms::render::backend) fn output_skips_composition(
+        &self,
+        output_idx: usize,
+    ) -> bool {
+        self.output_is_direct(output_idx) || self.output_entry_hold_active(output_idx)
     }
 
     fn entry_hold_scene_eligible(&self, output_idx: usize, hold: EntryHold) -> bool {
@@ -408,8 +422,11 @@ impl KmsBackend {
             // from the live cursor state so it can revoke the hold first,
             // while preserving an already-retired hardware cursor.
             && (!self.tearing_cursor_wants_visible_for_outputs(&[output_idx])
-                || self.scene.cursor_mode_for_outputs(&[output_idx])
-                    == crate::kms::render::scene::CursorPlaneMode::Hw)
+                || (self
+                    .platform
+                    .cursor_plane_available_for_output(output_idx)
+                    && self.scene.cursor_mode_for_outputs(&[output_idx])
+                        == crate::kms::render::scene::CursorPlaneMode::Hw))
     }
 
     fn update_direct_entry_holds(&mut self, now: std::time::Instant) {
@@ -483,7 +500,7 @@ impl KmsBackend {
     }
 
     fn scene_output_ready_for_scheduled_compose(&self, output_idx: usize) -> bool {
-        !self.output_is_direct(output_idx) || self.output_has_degraded_unflip(output_idx)
+        !self.output_skips_composition(output_idx) || self.output_has_degraded_unflip(output_idx)
     }
 
     fn scene_output_wants_scheduled_compose(&self, output_idx: usize) -> bool {
@@ -4300,7 +4317,8 @@ impl KmsBackend {
                 || scene_submitted_outputs.contains(&output_idx)
                 || self.scene.has_pending_page_flip(output_idx)
                 || self.scene.output_submit_retry_pending(output_idx)
-                || (self.scene_wants_scene()
+                || (!self.output_entry_hold_active(output_idx)
+                    && self.scene_wants_scene()
                     && self
                         .scene
                         .output_ready_for_submit(output_idx, &self.platform))
