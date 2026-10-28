@@ -350,24 +350,23 @@ impl KmsBackend {
         let qualifies = gate_ignoring_cursor
             && candidate.options & yserver_core::present_scheduler::PRESENT_OPTION_ASYNC != 0;
         if !qualifies {
-            self.pstate.tearing.reset_probation();
+            if let Some(owner) = self
+                .pstate
+                .direct
+                .get_mut(candidate_scope.unwrap_or(DirectScope::Root))
+            {
+                owner.tearing_probation.reset();
+            }
             return was_on;
         }
 
-        if self.pstate.tearing.probation_owner != Some(candidate.dst_window_xid) {
-            self.pstate.tearing.probation_owner = Some(candidate.dst_window_xid);
-            self.pstate.tearing.probation = 1;
-        } else {
-            self.pstate.tearing.probation = self
-                .pstate
-                .tearing
-                .probation
-                .saturating_add(1)
-                .min(TEARING_ENTRY_PROBATION);
-        }
-        if self.pstate.tearing.probation >= TEARING_ENTRY_PROBATION
-            && !self.scene.cursor_transition_pending()
-        {
+        let Some(owner) = self.pstate.direct.get_mut(scope) else {
+            return was_on;
+        };
+        let probation = owner
+            .tearing_probation
+            .note_qualifying_present(candidate.dst_window_xid);
+        if probation >= TEARING_ENTRY_PROBATION && !self.scene.cursor_transition_pending() {
             self.pstate.tearing.state = TearingState::On {
                 window: candidate.dst_window_xid,
                 // Lifecycle teardown reports the window's host ID. For a
@@ -424,7 +423,7 @@ impl KmsBackend {
     pub(super) fn exit_tearing(&mut self, reason: &'static str) {
         let was_on = self.pstate.tearing.is_on();
         self.pstate.tearing.state = TearingState::Off;
-        self.pstate.tearing.reset_probation();
+        self.pstate.direct.reset_tearing_probation();
         self.pstate.tearing.hide_failed_logged = false;
         self.pstate.tearing.last_cursor_compose = None;
         self.pstate.tearing.deferred_cursor_wake = None;
@@ -432,6 +431,39 @@ impl KmsBackend {
         self.platform.set_tearing_on(false);
         if was_on {
             log::info!("kms: leaving tearing: {reason}");
+        }
+    }
+
+    fn arm_output_direct_entry_hold(
+        &mut self,
+        scope: DirectScope,
+        candidate: PresentScanoutCandidate,
+    ) {
+        let DirectScope::Output(output_idx) = scope else {
+            return;
+        };
+        let Some(output) = self.platform.outputs.get(output_idx) else {
+            return;
+        };
+        let refresh_hz = output.output.picked.vrefresh.max(1);
+        let interval = std::time::Duration::from_nanos(1_000_000_000 / u64::from(refresh_hz));
+        let now = self.monotonic_now();
+        let Some(owner) = self.pstate.direct.get_mut(scope) else {
+            return;
+        };
+        if owner.active() || owner.entry_hold_rearm_blocked {
+            return;
+        }
+        if owner.entry_hold.is_some_and(|hold| hold.deadline <= now) {
+            owner.entry_hold = None;
+            owner.entry_hold_rearm_blocked = true;
+            return;
+        }
+        if owner.entry_hold.is_none() {
+            owner.entry_hold = Some(crate::kms::render::backend::EntryHold {
+                window: candidate.paint_dst_host_xid,
+                deadline: now + interval * 3,
+            });
         }
     }
 
@@ -1234,6 +1266,7 @@ impl KmsBackend {
             .any(|&output_idx| self.scene.has_pending_page_flip(output_idx))
         {
             self.request_direct_unflip_for(scope, "eligible_direct_successor_scene_flip_pending");
+            self.arm_output_direct_entry_hold(scope, candidate);
             if let Some(owner) = self.pstate.direct.get_mut(scope) {
                 owner.unflip_fallback_source = Some(source_id);
                 owner.unflip_shadow_ready = false;
@@ -1266,6 +1299,7 @@ impl KmsBackend {
             // path and release both pins. There must be no queued-only direct
             // state for the cursor retirement to discover later.
             self.request_direct_unflip_for(scope, "eligible_direct_present_cursor_commit_pending");
+            self.arm_output_direct_entry_hold(scope, candidate);
             if let Some(owner) = self.pstate.direct.get_mut(scope) {
                 owner.unflip_fallback_source = Some(source_id);
                 owner.unflip_shadow_ready = false;
@@ -1289,6 +1323,16 @@ impl KmsBackend {
             return Err(error);
         }
 
+        match scope {
+            DirectScope::Root => {
+                self.pstate.direct.clear_entry_holds();
+            }
+            DirectScope::Output(output_idx) => {
+                if let Some(owner) = self.pstate.direct.outputs.get_mut(output_idx) {
+                    owner.entry_hold = None;
+                }
+            }
+        }
         self.retain_direct_present_wake(&frame.event);
         let owner = self
             .pstate

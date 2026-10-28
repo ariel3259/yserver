@@ -267,6 +267,37 @@ pub(in crate::kms::render::backend) type ScanoutM1Prober = fn(
 /// causes direct/composed atomic thrash.
 pub(in crate::kms::render::backend) const SCANOUT_M2_ELIGIBLE_ROOT_PROBATION: u8 = 8;
 
+/// Per-direct-slot Presents that qualify for the single tearing owner.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::kms::render::backend) struct TearingProbation {
+    pub(in crate::kms::render::backend) window: Option<u32>,
+    pub(in crate::kms::render::backend) count: u8,
+}
+
+impl TearingProbation {
+    pub(in crate::kms::render::backend) fn note_qualifying_present(&mut self, window: u32) -> u8 {
+        if self.window != Some(window) {
+            self.window = Some(window);
+            self.count = 1;
+        } else {
+            self.count = self.count.saturating_add(1).min(TEARING_ENTRY_PROBATION);
+        }
+        self.count
+    }
+
+    pub(in crate::kms::render::backend) fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// A short output-local pause in composition after a direct-entry Present
+/// encounters an already-submitted CRTC transaction. It retains no frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::kms::render::backend) struct EntryHold {
+    pub(in crate::kms::render::backend) window: u32,
+    pub(in crate::kms::render::backend) deadline: std::time::Instant,
+}
+
 pub(in crate::kms::render::backend) struct ScanoutM2State {
     pub(in crate::kms::render::backend) pending: Option<DirectPresentFrame>,
     /// One eligible direct successor, retained while `pending` owns the
@@ -305,6 +336,13 @@ pub(in crate::kms::render::backend) struct ScanoutM2State {
     pub(in crate::kms::render::backend) unflip_awaiting_outputs: HashMap<usize, u64>,
     pub(in crate::kms::render::backend) reentry_blocked_until_composed: bool,
     pub(in crate::kms::render::backend) eligible_streak: u8,
+    pub(in crate::kms::render::backend) tearing_probation: TearingProbation,
+    /// An Output-only composition skip while its first direct Present waits
+    /// for the CRTC's existing transaction to retire.
+    pub(in crate::kms::render::backend) entry_hold: Option<EntryHold>,
+    /// Expiration cannot immediately arm another hold before a composed
+    /// output flip demonstrates progress.
+    pub(in crate::kms::render::backend) entry_hold_rearm_blocked: bool,
     pub(in crate::kms::render::backend) unflip_fallback_source: Option<DrawableId>,
     pub(in crate::kms::render::backend) unflip_shadow_ready: bool,
     /// The synchronized composed unflip failed and was degraded to the
@@ -336,6 +374,9 @@ impl ScanoutM2State {
             unflip_awaiting_outputs: HashMap::new(),
             reentry_blocked_until_composed: false,
             eligible_streak: 0,
+            tearing_probation: TearingProbation::default(),
+            entry_hold: None,
+            entry_hold_rearm_blocked: false,
             unflip_fallback_source: None,
             unflip_shadow_ready: false,
             degraded_composed_unflip: false,
@@ -385,6 +426,12 @@ impl ScanoutM2State {
     pub(in crate::kms::render::backend) fn reset_eligible_direct_probation(&mut self) {
         self.eligible_streak = 0;
     }
+
+    pub(in crate::kms::render::backend) fn clear_entry_hold(&mut self) -> bool {
+        let cleared = self.entry_hold.take().is_some() || self.entry_hold_rearm_blocked;
+        self.entry_hold_rearm_blocked = false;
+        cleared
+    }
 }
 
 /// Direct-scanout bookkeeping, with one grouped root owner and one slot per
@@ -419,6 +466,7 @@ impl DirectOwners {
     }
 
     pub(in crate::kms::render::backend) fn sync_output_count(&mut self, count: usize) {
+        self.clear_entry_holds();
         if count < self.outputs.len() {
             assert!(
                 self.outputs[count..].iter().all(|owner| !owner.active()),
@@ -433,6 +481,21 @@ impl DirectOwners {
             }
         }
         self.outputs.resize_with(count, ScanoutM2State::new);
+    }
+
+    pub(in crate::kms::render::backend) fn reset_tearing_probation(&mut self) {
+        self.root.tearing_probation.reset();
+        for owner in &mut self.outputs {
+            owner.tearing_probation.reset();
+        }
+    }
+
+    pub(in crate::kms::render::backend) fn clear_entry_holds(&mut self) -> bool {
+        let mut cleared = self.root.clear_entry_hold();
+        for owner in &mut self.outputs {
+            cleared |= owner.clear_entry_hold();
+        }
+        cleared
     }
 
     pub(in crate::kms::render::backend) fn get(
@@ -503,8 +566,6 @@ pub(in crate::kms::render::backend) struct TearingAdmissionContext {
 
 pub(in crate::kms::render::backend) struct Tearing {
     pub(in crate::kms::render::backend) state: TearingState,
-    pub(in crate::kms::render::backend) probation: u8,
-    pub(in crate::kms::render::backend) probation_owner: Option<u32>,
     pub(in crate::kms::render::backend) hide_failed_logged: bool,
     pub(in crate::kms::render::backend) last_cursor_compose: Option<std::time::Instant>,
     pub(in crate::kms::render::backend) deferred_cursor_wake: Option<std::time::Instant>,
@@ -514,8 +575,6 @@ impl Tearing {
     pub(in crate::kms::render::backend) fn new() -> Self {
         Self {
             state: TearingState::Off,
-            probation: 0,
-            probation_owner: None,
             hide_failed_logged: false,
             last_cursor_compose: None,
             deferred_cursor_wake: None,
@@ -524,11 +583,6 @@ impl Tearing {
 
     pub(in crate::kms::render::backend) fn is_on(&self) -> bool {
         matches!(self.state, TearingState::On { .. })
-    }
-
-    pub(in crate::kms::render::backend) fn reset_probation(&mut self) {
-        self.probation = 0;
-        self.probation_owner = None;
     }
 
     pub(in crate::kms::render::backend) fn note_composed_submit(

@@ -453,6 +453,7 @@ impl KmsBackend {
     /// failure; subsequent outputs still attempted.
     pub fn disable_output(&mut self) -> io::Result<()> {
         self.exit_tearing("shutdown");
+        self.clear_direct_entry_holds();
         // Stage 5 Task 6.1: explicitly flush open render batches
         // before drain_all walks the submitted queue. drain_all only
         // waits on already-submitted CBs; an open pending batch
@@ -529,6 +530,7 @@ impl KmsBackend {
     /// `drive_vt_event` on `BeginSuspend`.
     fn run_suspend(&mut self, state: &mut ServerState) {
         self.exit_tearing("VT release");
+        self.clear_direct_entry_holds();
         log::info!(
             "kms: run_suspend enter — down_keys={} button_mask=0x{:04x}",
             self.core.down_keys.len(),
@@ -1057,6 +1059,7 @@ impl KmsBackend {
         self.bump_crtc_config_topology_epoch("DPMS output state changed");
         if !want_active {
             self.exit_tearing("DPMS off");
+            self.clear_direct_entry_holds();
         }
         log::info!(
             "kms: set_dpms_power(level={level}) — transition active={} → {want_active}",

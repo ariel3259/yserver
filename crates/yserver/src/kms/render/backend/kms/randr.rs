@@ -1355,6 +1355,7 @@ impl KmsBackend {
                 return Err(e);
             }
         }
+        self.clear_direct_entry_holds();
         if !self.pstate.direct.active_scopes().is_empty() {
             self.request_direct_unflip("virtual_screen_extent_before_storage_reallocation");
         }

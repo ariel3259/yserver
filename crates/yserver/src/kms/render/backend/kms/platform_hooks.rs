@@ -376,6 +376,7 @@ impl Platform for PlatformBackend {
             // any unflip does (`submit_composed_unflip`); nothing to undo.
             b.materialize_direct_shadow_for_unflip(scope)?;
         }
+        b.clear_direct_entry_holds();
         Ok(())
     }
 

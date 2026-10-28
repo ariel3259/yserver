@@ -1,6 +1,6 @@
 use crate::kms::render::{
     backend::{
-        DirectFrameSlot, DirectPresentFrame, DirectScope, KmsBackend, ScanoutM0Coverage,
+        DirectFrameSlot, DirectPresentFrame, DirectScope, EntryHold, KmsBackend, ScanoutM0Coverage,
         ScanoutM0Shape, ScanoutM0Target, ScanoutM1OutputGeometry, ScanoutM1ProbeEntry, WindowsMap,
         kms::randr::effective_refresh_matches,
     },
@@ -373,15 +373,89 @@ impl KmsBackend {
         if output_idx >= self.platform.outputs.len() {
             return false;
         }
-        self.pstate
+        let now = self.monotonic_now();
+        let owner = if self.pstate.direct.root().active() {
+            Some(self.pstate.direct.root())
+        } else {
+            self.pstate.direct.outputs.get(output_idx)
+        };
+        owner.is_some_and(|owner| {
+            owner.active()
+                || owner.unflip_outputs_to_replace.contains(&output_idx)
+                || owner.unflip_awaiting_outputs.contains_key(&output_idx)
+                || owner.entry_hold.is_some_and(|hold| hold.deadline > now)
+        })
+    }
+
+    fn entry_hold_scene_eligible(&self, output_idx: usize, hold: EntryHold) -> bool {
+        if !self.scanout_allowed()
+            || !self.kms_outputs_active
+            || self.platform.any_output_transformed()
+        {
+            return false;
+        }
+        let scope = DirectScope::Output(output_idx);
+        let leaf_id = self.store.lookup(hold.window);
+        let paint_target = self.resolve_paint_target(hold.window);
+        let paint_id = paint_target.map(|target| target.backing_id());
+        let target = self.scanout_m0_target(hold.window, leaf_id, paint_id);
+        self.platform.outputs.get(output_idx).is_some()
+            && self.direct_scope_scene_eligible(hold.window, target, scope)
+            && self.direct_root_overlay_empty_for_outputs(&[output_idx])
+            && self.direct_cursor_eligible_for(&[output_idx])
+            // Scene cursor mode is updated on composed retirement, which this
+            // hold deliberately suppresses. Detect a newly visible cursor
+            // from the live cursor state so it can revoke the hold first,
+            // while preserving an already-retired hardware cursor.
+            && (!self.tearing_cursor_wants_visible_for_outputs(&[output_idx])
+                || self.scene.cursor_mode_for_outputs(&[output_idx])
+                    == crate::kms::render::scene::CursorPlaneMode::Hw)
+    }
+
+    fn update_direct_entry_holds(&mut self, now: std::time::Instant) {
+        let expired: Vec<_> = self
+            .pstate
             .direct
-            .scope_for_output(output_idx)
-            .and_then(|scope| self.pstate.direct.get(scope))
-            .is_some_and(|owner| {
-                owner.active()
-                    || owner.unflip_outputs_to_replace.contains(&output_idx)
-                    || owner.unflip_awaiting_outputs.contains_key(&output_idx)
+            .outputs
+            .iter()
+            .enumerate()
+            .filter_map(|(output_idx, owner)| {
+                owner
+                    .entry_hold
+                    .filter(|hold| hold.deadline <= now)
+                    .map(|_| output_idx)
             })
+            .collect();
+        let invalid: Vec<_> = self
+            .pstate
+            .direct
+            .outputs
+            .iter()
+            .enumerate()
+            .filter_map(|(output_idx, owner)| {
+                let hold = owner.entry_hold?;
+                (hold.deadline > now && !self.entry_hold_scene_eligible(output_idx, hold))
+                    .then_some(output_idx)
+            })
+            .collect();
+        for output_idx in expired {
+            if let Some(owner) = self.pstate.direct.outputs.get_mut(output_idx) {
+                owner.entry_hold = None;
+                owner.entry_hold_rearm_blocked = true;
+            }
+        }
+        for output_idx in invalid {
+            if let Some(owner) = self.pstate.direct.outputs.get_mut(output_idx) {
+                owner.entry_hold = None;
+                owner.entry_hold_rearm_blocked = false;
+            }
+        }
+    }
+
+    pub(in crate::kms::render::backend) fn clear_direct_entry_holds(&mut self) {
+        if self.pstate.direct.clear_entry_holds() {
+            self.scene.wake_for_damage();
+        }
     }
 
     fn output_has_degraded_unflip(&self, output_idx: usize) -> bool {
@@ -564,6 +638,7 @@ impl KmsBackend {
     }
 
     pub(in crate::kms::render::backend) fn request_direct_unflip(&mut self, reason: &'static str) {
+        self.clear_direct_entry_holds();
         for scope in self.pstate.direct.active_scopes() {
             self.request_direct_unflip_for(scope, reason);
         }
@@ -657,6 +732,16 @@ impl KmsBackend {
         host_xid: u32,
         reason: &'static str,
     ) {
+        let mut cleared_hold = false;
+        for owner in &mut self.pstate.direct.outputs {
+            if owner.entry_hold.is_some_and(|hold| hold.window == host_xid) {
+                owner.clear_entry_hold();
+                cleared_hold = true;
+            }
+        }
+        if cleared_hold {
+            self.scene.wake_for_damage();
+        }
         for scope in self.direct_scopes_referencing_host_drawable(host_xid) {
             self.request_direct_unflip_for(scope, reason);
         }
@@ -1939,6 +2024,7 @@ impl KmsBackend {
         &mut self,
         context: &'static str,
     ) -> io::Result<bool> {
+        self.clear_direct_entry_holds();
         let scopes = self.pstate.direct.active_scopes();
         if scopes.is_empty() {
             return Ok(false);
@@ -3682,6 +3768,9 @@ impl KmsBackend {
                     &mut self.store,
                     &mut self.platform,
                 );
+            if scene_retired && let Some(owner) = self.pstate.direct.outputs.get_mut(output_idx) {
+                owner.entry_hold_rearm_blocked = false;
+            }
             if direct_retired || scene_retired {
                 self.telemetry.record_frame_present();
             }
@@ -3890,6 +3979,16 @@ impl KmsBackend {
                 });
         let source_wait_deadline =
             needs_source_wait_poll.then(|| now + std::time::Duration::from_millis(1));
+        let entry_hold_deadline = allow_kms_timers
+            .then(|| {
+                self.pstate
+                    .direct
+                    .outputs
+                    .iter()
+                    .filter_map(|owner| owner.entry_hold.map(|hold| hold.deadline))
+                    .min()
+            })
+            .flatten();
         let rescan_deadline = self
             .pstate
             .hotplug_rescan_deadline
@@ -3901,6 +4000,7 @@ impl KmsBackend {
             .chain(vrr_clear_deadline)
             .chain(vrr_cursor_deadline)
             .chain(source_wait_deadline)
+            .chain(entry_hold_deadline)
             .chain(rescan_deadline)
             // Not gated on `allow_kms_timers`: `maybe_composite` closes the
             // paint frame on its timeout while dark too (#177).
@@ -3971,6 +4071,7 @@ impl KmsBackend {
         // (observed 2026-05-31 — 77 WARNs in 3 seconds on
         // `just startx` + VT switch under MATE).
         if !self.scanout_allowed() {
+            self.clear_direct_entry_holds();
             self.drain_paint_submit_telemetry();
             return Ok(());
         }
@@ -3983,6 +4084,7 @@ impl KmsBackend {
         // maybe_composite is a separate scene.tick caller).
         // See project_einval_atomic_commit_storm_wedge memory entry.
         if !self.kms_outputs_active {
+            self.clear_direct_entry_holds();
             self.drain_paint_submit_telemetry();
             return Ok(());
         }
@@ -4024,6 +4126,7 @@ impl KmsBackend {
         // Check visibility and current scene ownership before the held-direct
         // return below. Pointer motion from a dead zone wakes this pass.
         self.prepare_tearing_scene_pass();
+        self.update_direct_entry_holds(self.monotonic_now());
         let active_scopes = self.pstate.direct.active_scopes();
         for &scope in &active_scopes {
             if let DirectScope::Output(output_idx) = scope
