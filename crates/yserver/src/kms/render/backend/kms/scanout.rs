@@ -587,11 +587,20 @@ impl KmsBackend {
         output_indices: &[usize],
         reason: &'static str,
     ) {
-        for scope in self.pstate.direct.active_scopes() {
+        let mut scopes = Vec::new();
+        for &output_idx in output_indices {
+            if let Some(scope) = self.pstate.direct.scope_for_output(output_idx)
+                && !scopes.contains(&scope)
+            {
+                scopes.push(scope);
+            }
+        }
+        for scope in scopes {
             if self
-                .direct_scope_outputs(scope)
-                .iter()
-                .any(|output_idx| output_indices.contains(output_idx))
+                .pstate
+                .direct
+                .get(scope)
+                .is_some_and(|owner| owner.active())
             {
                 self.request_direct_unflip_for(scope, reason);
             }

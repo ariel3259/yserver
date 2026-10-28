@@ -17,11 +17,11 @@ fn a3_records_since(
         .collect()
 }
 
-fn a3_enter_output_owner(
+pub(crate) fn a3_admit_output_owner(
     fixture: &mut super::commit_identity::recording_scene::RecordingSceneFixture,
     direct: &super::commit_identity::recording_scene::DirectPresentSetup,
     output_idx: usize,
-) {
+) -> Vec<crate::drm::atomic::tests_support::AtomicCommitRecord> {
     use yserver_core::backend::Backend;
 
     let fd = fixture.kms_fd(output_idx);
@@ -66,6 +66,17 @@ fn a3_enter_output_owner(
         }),
         "Output Present made one accepted CRTC commit on its owner"
     );
+    records
+}
+
+pub(crate) fn a3_enter_output_owner(
+    fixture: &mut super::commit_identity::recording_scene::RecordingSceneFixture,
+    direct: &super::commit_identity::recording_scene::DirectPresentSetup,
+    output_idx: usize,
+) {
+    use yserver_core::backend::Backend;
+
+    let records = a3_admit_output_owner(fixture, direct, output_idx);
     a3_retire_records(fixture, &records);
     let completed = Backend::drain_completed_present_events(&mut fixture.events.backend);
     assert_eq!(completed.len(), 1, "one Present completes once");

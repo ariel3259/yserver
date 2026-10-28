@@ -279,7 +279,6 @@ impl PlatformBackend {
         cursor.clear_atomic_position(crtc);
         cursor.cursor_retry_waits_for_flip.remove(&crtc);
         cursor.cursor_hide_recovery.remove(&crtc);
-        cursor.permanently_disabled_crtcs.remove(&crtc);
         cursor.transient_fallback_crtcs.remove(&crtc);
     }
 

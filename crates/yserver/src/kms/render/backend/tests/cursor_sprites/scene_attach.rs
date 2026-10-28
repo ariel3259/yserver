@@ -3793,7 +3793,8 @@ fn membership_change_on_other_output_still_moves_direct_cursor() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: restore the device-wide permanent-disable flag after one CRTC exhausts recovery.
+// Mutations: restore the device-wide permanent-disable flag after one CRTC
+// exhausts recovery; clear the per-CRTC disable latch during all-off cleanup.
 fn cursor_recovery_exhaustion_disables_only_that_crtc() {
     let run = |present_id: u64, direct_output: usize, disabled_output: usize| {
         let Some((mut fixture, mut delivered, hardware, _direct)) =
@@ -4032,6 +4033,42 @@ fn cursor_recovery_exhaustion_disables_only_that_crtc() {
                 .for_tests_cursor_permanently_disabled(disabled_key),
             "recovery exhaustion does not set device-wide disable"
         );
+        for output_idx in 0..2 {
+            drain_unretired_output_events(&mut fixture, &mut delivered, output_idx);
+        }
+
+        let (disabled_output_id, disabled_connector) = {
+            let backend = &mut fixture.scene.events.backend;
+            let key = backend.platform.outputs[disabled_output].key.clone();
+            let output_id = backend.pstate.randr_id_alloc.ids_for(&key).output_id;
+            backend
+                .pstate
+                .output_key_by_id
+                .insert(output_id, key.clone());
+            backend.platform.for_tests_accept_output_power_commits();
+            (output_id, key.connector_name)
+        };
+        assert!(
+            Backend::apply_crtc_config(
+                &mut fixture.scene.events.backend,
+                disabled_output_id,
+                &disabled_connector,
+                None,
+                0,
+                0,
+            )
+            .expect("remove the exhausted CRTC through Backend"),
+            "the all-off CRTC removal completes"
+        );
+        assert!(
+            fixture
+                .scene
+                .events
+                .backend
+                .platform
+                .for_tests_cursor_crtc_permanently_disabled(disabled_key, disabled_crtc),
+            "all-off lease cleanup retains the exhausted CRTC's permanent-disable latch"
+        );
         finish_direct_fixture(fixture, &mut delivered);
     };
 
@@ -4064,60 +4101,11 @@ fn admit_two_output_direct_owners(
     for output_idx in 0..2 {
         settle_cursor_on_output(fixture, delivered, output_idx);
     }
-    fixture
-        .scene
-        .events
-        .backend
-        .for_tests_set_scanout_m1_prober(super::super::present_scanout::record_scanout_m1_probe);
-    let probation = usize::from(crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION);
     for (output_idx, direct) in directs.iter().enumerate() {
-        Backend::note_present_scanout_candidate(
-            &mut fixture.scene.events.backend,
-            direct.candidate,
-        );
-        let device_fd = fixture.scene.kms_fd(output_idx);
-        let direct_start = record_count(fixture, device_fd);
-        for attempt in 0..probation {
-            let entered = Backend::try_present_direct(
-                &mut fixture.scene.events.backend,
-                direct.candidate,
-                direct.event.clone(),
-            )
-            .expect("admit output owner through Backend");
-            assert_eq!(
-                entered,
-                attempt + 1 == probation,
-                "Output({output_idx}) enters after the normal direct probation; streak={:?}, current0={}, current1={}, unflip0={}, unflip1={}, cursor_mode={:?}",
-                fixture.scene.events.backend.pstate.direct.outputs[output_idx].eligible_streak,
-                fixture.scene.events.backend.pstate.direct.outputs[0]
-                    .current
-                    .is_some(),
-                fixture.scene.events.backend.pstate.direct.outputs[1]
-                    .current
-                    .is_some(),
-                fixture.scene.events.backend.pstate.direct.outputs[0].unflip_requested,
-                fixture.scene.events.backend.pstate.direct.outputs[1].unflip_requested,
-                fixture
-                    .scene
-                    .events
-                    .backend
-                    .scene
-                    .cursor_mode_for_outputs(&[output_idx]),
-            );
-        }
-        let crtc = fixture.scene.events.backend.platform.outputs[output_idx]
-            .output
-            .crtc;
-        assert!(
-            accepted_live_records(&fixture.scene.events.recorders[&device_fd])
-                .into_iter()
-                .skip(direct_start)
-                .any(|record| {
-                    record.events.len() == 1
-                        && record.events[0].crtc == crtc
-                        && accepted_event_id(&record).is_some()
-                        && record.kind != AtomicCommitKind::CursorOnly
-                })
+        super::super::present_scanout::a3::a3_admit_output_owner(
+            &mut fixture.scene,
+            direct,
+            output_idx,
         );
         retire_pending_output(
             &mut fixture.scene.events,
@@ -4243,6 +4231,9 @@ fn cursor_fallback_on_output_owner_unflips_only_that_owner() {
         !fixture.scene.events.backend.pstate.direct.outputs[0].unflip_requested,
         "Output(0) remains current when Output(1)'s cursor falls back"
     );
+    for output_idx in 0..2 {
+        drain_unretired_output_events(&mut fixture, &mut delivered, output_idx);
+    }
     finish_direct_fixture(fixture, &mut delivered);
 }
 
@@ -4279,22 +4270,31 @@ fn deferred_cursor_rejection_unflips_its_output_owner() {
     let properties1 =
         super::support::cursor_properties_for_output(&fixture.scene.events.backend, 1);
     let direct1_crtc = fixture.scene.events.backend.platform.outputs[1].output.crtc;
-    let owner1 = &mut fixture.scene.events.backend.pstate.direct.outputs[1];
-    assert!(owner1.current.is_some());
-    assert!(!owner1.unflip_requested);
-    // Route this already-direct output through the normal degraded scene
-    // replacement pass. There is no direct-Frame submission in this test:
-    // only the deferred scene-sink cursor rejection can request its unflip.
-    owner1.hold_direct = false;
-    owner1.degraded_composed_unflip = true;
-    owner1.unflip_outputs_to_replace.insert(1);
+    assert!(
+        fixture.scene.events.backend.pstate.direct.outputs[1]
+            .current
+            .is_some()
+    );
+    assert!(!fixture.scene.events.backend.pstate.direct.outputs[1].unflip_requested);
 
+    // Unmapping the direct frame through Backend starts its ordinary unflip.
+    // Two recorded KMS failures take the scheduler through fresh and retained
+    // unflip attempts into the existing degraded scene-sink path.
     let scene_start = record_count(&fixture, device_fd);
+    let output1_target = fixture.scene.events.backend.pstate.direct.outputs[1]
+        .current
+        .as_ref()
+        .expect("Output(1) remains current before unmap")
+        .candidate
+        .paint_dst_host_xid;
+    Backend::unmap_subwindow(&mut fixture.scene.events.backend, None, output1_target)
+        .expect("unmap Output(1)'s direct frame through Backend");
+    recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
+    recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
     recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EINVAL)));
     recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EINVAL)));
-    recorder.script_result(Ok(()));
     Backend::maybe_composite(&mut fixture.scene.events.backend)
-        .expect("compose the deferred output replacement through Backend");
+        .expect("degrade the output unflip and reject its deferred cursor through Backend");
 
     let rejected_scene = recorder
         .records()
@@ -4319,8 +4319,18 @@ fn deferred_cursor_rejection_unflips_its_output_owner() {
     );
     assert!(fixture.scene.events.backend.pstate.direct.outputs[1].unflip_requested);
     assert_eq!(
-        fixture.scene.events.backend.pstate.direct.outputs[1].unflip_reason,
-        Some("cursor_move_fallback_or_retry")
+        fixture.scene.events.backend.pstate.direct.outputs[1].unflip_last_reason,
+        Some("cursor_move_fallback_or_retry"),
+        "deferred cursor rejection must reach its output owner; records={:?}",
+        recorder
+            .records()
+            .into_iter()
+            .skip(scene_start)
+            .map(|record| {
+                let cursor_x = record_property(&record, properties1.crtc_x);
+                (record.kind, record.result, record.events, cursor_x)
+            })
+            .collect::<Vec<_>>()
     );
     assert!(
         fixture.scene.events.backend.pstate.direct.outputs[0]
@@ -4330,6 +4340,96 @@ fn deferred_cursor_rejection_unflips_its_output_owner() {
     assert!(
         !fixture.scene.events.backend.pstate.direct.outputs[0].unflip_requested,
         "deferred Output(1) cursor fallback leaves Output(0) current"
+    );
+    let retry_start = record_count(&fixture, device_fd);
+    let mut accepted_replacement = None;
+    for _ in 0..8 {
+        let deadline = Backend::next_wakeup(&fixture.scene.events.backend)
+            .expect("degraded scene retry schedules a Backend wakeup");
+        let until_retry = deadline.saturating_duration_since(Instant::now());
+        if !until_retry.is_zero() {
+            // Wait for the scheduler's reported retry timer; the scripted
+            // KMS outcomes are already fixed and are not ordered by this wait.
+            std::thread::sleep(until_retry);
+        }
+        Backend::before_block(&mut fixture.scene.events.backend);
+        damage_root(&mut fixture);
+        Backend::maybe_composite(&mut fixture.scene.events.backend)
+            .expect("retry Output(1)'s degraded replacement through Backend");
+        fixture.scene.events.wait_for_submitted_gpu_work();
+        accepted_replacement = recorder
+            .records()
+            .into_iter()
+            .skip(retry_start)
+            .find(|record| {
+                record.result == ScriptedResult::Ok
+                    && accepted_event_id(record).is_some()
+                    && record.events.iter().any(|event| event.crtc == direct1_crtc)
+                    && matches!(
+                        record.kind,
+                        AtomicCommitKind::Scene | AtomicCommitKind::SceneWithCursor
+                    )
+            });
+        if accepted_replacement.is_some() {
+            break;
+        }
+    }
+    let retry_records = recorder
+        .records()
+        .into_iter()
+        .skip(retry_start)
+        .collect::<Vec<_>>();
+    let retry_record_summary = retry_records
+        .iter()
+        .map(|record| {
+            (
+                record.kind,
+                record.result,
+                record.events.clone(),
+                accepted_event_id(record),
+            )
+        })
+        .collect::<Vec<_>>();
+    let accepted_replacement = accepted_replacement.unwrap_or_else(|| {
+            panic!(
+            "deferred replacement is accepted after the cursor rejection; state=({:?}, {:?}, {}, {}, {:?}, {:?}), scene=(dirty={}, ready={}, retry={}, pending_flip={}, cursor={:?}, wake={:?}), records={retry_record_summary:?}",
+                fixture.scene.events.backend.pstate.direct.outputs[1].current.is_some(),
+                fixture.scene.events.backend.pstate.direct.outputs[1].pending.is_some(),
+                fixture.scene.events.backend.pstate.direct.outputs[1].unflip_requested,
+                fixture.scene.events.backend.pstate.direct.outputs[1].degraded_composed_unflip,
+                fixture.scene.events.backend.pstate.direct.outputs[1].unflip_outputs_to_replace,
+                fixture.scene.events.backend.pstate.direct.outputs[1].unflip_awaiting_outputs,
+                fixture.scene.events.backend.scene.scene_structure_dirty,
+                fixture.scene.events.backend.scene.output_ready_for_submit(1, &fixture.scene.events.backend.platform),
+                fixture.scene.events.backend.scene.output_submit_retry_pending(1),
+                fixture.scene.events.backend.scene.has_pending_page_flip(1),
+                fixture.scene.events.backend.scene.cursor_mode_for_outputs(&[1]),
+                Backend::next_wakeup(&fixture.scene.events.backend),
+            )
+        });
+    let replacement_id = accepted_event_id(&accepted_replacement)
+        .expect("accepted deferred replacement carries its commit identity");
+    assert_eq!(
+        fixture.scene.events.backend.pstate.direct.outputs[1]
+            .unflip_awaiting_outputs
+            .get(&1),
+        Some(&replacement_id),
+        "Output(1) tracks its accepted replacement until retirement"
+    );
+    for output_idx in 0..2 {
+        drain_unretired_output_events(&mut fixture, &mut delivered, output_idx);
+    }
+    assert!(
+        fixture.scene.events.backend.pstate.direct.outputs[1]
+            .current
+            .is_none(),
+        "Output(1) releases its direct owner after replacement retirement"
+    );
+    assert!(
+        fixture.scene.events.backend.pstate.direct.outputs[0]
+            .current
+            .is_some(),
+        "Output(0) remains direct through Output(1)'s deferred replacement"
     );
     finish_direct_fixture(fixture, &mut delivered);
 }

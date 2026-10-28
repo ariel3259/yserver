@@ -306,18 +306,9 @@ impl Platform for PlatformBackend {
         {
             return;
         }
-        if mixed {
-            // Hardware and software cursor ownership may coexist on
-            // arbitrary cards. Record/dispatch every visible HW plane
-            // position and also repaint the SW outputs.
-            match b.platform.cursor_plane_move(cx, cy, hot_x, hot_y) {
-                Ok(outcome) => {
-                    b.handle_cursor_move_outcome(outcome);
-                }
-                Err(e) => log::debug!("render cursor mixed path: move failed: {e}"),
-            }
-            b.scene.wake_for_damage();
-        } else if cw > 0 && ch > 0 && {
+        let membership_changed = if mixed || cw == 0 || ch == 0 {
+            false
+        } else {
             let direct_outputs: Vec<_> = b
                 .pstate
                 .direct
@@ -327,7 +318,8 @@ impl Platform for PlatformBackend {
                 .collect();
             b.platform
                 .cursor_crtc_membership_dirty(cx, cy, hot_x, hot_y, cw, ch, &direct_outputs)
-        } {
+        };
+        if membership_changed {
             // The cursor footprint crossed onto/off a CRTC the
             // plane isn't bound to. The move-only fast path
             // can't rebind across CRTCs, so route this motion
@@ -338,18 +330,22 @@ impl Platform for PlatformBackend {
             // so the seam crossing must be detected here or the
             // cursor stays frozen on the CRTC it was last bound
             // to (invisible on the screen it moved onto).
-            match b.platform.cursor_plane_move(cx, cy, hot_x, hot_y) {
-                Ok(outcome) => b.handle_cursor_move_outcome(outcome),
-                Err(error) => log::debug!("render cursor membership move: {error}"),
+        }
+        // Hardware and software cursor ownership may coexist on arbitrary
+        // cards. Always dispatch visible HW positions once, then repaint SW
+        // outputs for a mixed cursor or membership transition.
+        match b.platform.cursor_plane_move(cx, cy, hot_x, hot_y) {
+            Ok(outcome) => b.handle_cursor_move_outcome(outcome),
+            Err(error) if mixed => {
+                log::debug!("render cursor mixed path: move failed: {error}")
             }
+            Err(error) if membership_changed => {
+                log::debug!("render cursor membership move: {error}")
+            }
+            Err(error) => log::debug!("render cursor fast path: move failed: {error}"),
+        }
+        if mixed || membership_changed {
             b.scene.wake_for_damage();
-        } else {
-            match b.platform.cursor_plane_move(cx, cy, hot_x, hot_y) {
-                Ok(outcome) => {
-                    b.handle_cursor_move_outcome(outcome);
-                }
-                Err(e) => log::debug!("render cursor fast path: move failed: {e}"),
-            }
         }
     }
 

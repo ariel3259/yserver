@@ -4968,4 +4968,4 @@ fn shape_triggered_composed_unflip_records_cursor_positions_for_both_outputs() {
 }
 
 #[path = "present_scanout_a3.rs"]
-mod a3;
+pub(crate) mod a3;
