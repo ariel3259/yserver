@@ -205,6 +205,33 @@ impl KmsBackend {
                 || self.unredirected_direct_scene_eligible(leaf_xid, direct_rect))
     }
 
+    /// Whether all retained frames for an output owner still pass the scene
+    /// rule used at Present admission. The scheduler and the page-flip path
+    /// both need this before a queued successor can be submitted.
+    pub(in crate::kms::render::backend) fn direct_output_frames_scene_eligible(
+        &self,
+        output_idx: usize,
+    ) -> bool {
+        let scope = DirectScope::Output(output_idx);
+        self.pstate.direct.get(scope).is_some_and(|owner| {
+            [
+                owner.current.as_ref(),
+                owner.pending.as_ref(),
+                owner.queued_successor.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .all(|frame| {
+                let host_xid = frame.candidate.paint_dst_host_xid;
+                let leaf_id = self.store.lookup(host_xid);
+                let paint_target = self.resolve_paint_target(host_xid);
+                let paint_id = paint_target.map(|target| target.backing_id());
+                let target = self.scanout_m0_target(host_xid, leaf_id, paint_id);
+                self.direct_scope_scene_eligible(host_xid, target, scope)
+            })
+        })
+    }
+
     pub(in crate::kms::render::backend) fn tearing_gate_ignoring_cursor(
         &self,
         candidate: PresentScanoutCandidate,

@@ -1720,6 +1720,13 @@ impl KmsBackend {
         if owner.unflip_requested || owner.pending.is_some() {
             return;
         }
+        if let DirectScope::Output(output_idx) = scope
+            && owner.queued_successor.is_some()
+            && !self.direct_output_frames_scene_eligible(output_idx)
+        {
+            self.request_direct_unflip_for(scope, "queued_direct_successor_scene_changed");
+            return;
+        }
         let direct_outputs = self.direct_scope_outputs(scope);
         if self
             .platform
@@ -4017,10 +4024,16 @@ impl KmsBackend {
         // Check visibility and current scene ownership before the held-direct
         // return below. Pointer motion from a dead zone wakes this pass.
         self.prepare_tearing_scene_pass();
-        // Arbitration step 1: a direct successor retained behind a cursor-only
-        // commit gets the first opportunity once all of its CRTCs are clear.
-        // The helper leaves it in the slot while any CRTC is still blocked.
         let active_scopes = self.pstate.direct.active_scopes();
+        for &scope in &active_scopes {
+            if let DirectScope::Output(output_idx) = scope
+                && !self.direct_output_frames_scene_eligible(output_idx)
+            {
+                self.request_direct_unflip_for(scope, "composite_tick_output_scene_changed");
+            }
+        }
+        // Preserve Root's existing successor priority; Output owners have
+        // already passed the per-output scene check above.
         for &scope in &active_scopes {
             self.submit_queued_direct_successor(scope);
         }
@@ -4050,31 +4063,6 @@ impl KmsBackend {
                 }
             }
             for scope in active_scopes {
-                if matches!(scope, DirectScope::Output(_)) {
-                    let scene_eligible = self.pstate.direct.get(scope).is_some_and(|owner| {
-                        [
-                            owner.current.as_ref(),
-                            owner.pending.as_ref(),
-                            owner.queued_successor.as_ref(),
-                        ]
-                        .into_iter()
-                        .flatten()
-                        .all(|frame| {
-                            let host_xid = frame.candidate.paint_dst_host_xid;
-                            let leaf_id = self.store.lookup(host_xid);
-                            let paint_target = self.resolve_paint_target(host_xid);
-                            let paint_id = paint_target.map(|target| target.backing_id());
-                            let target = self.scanout_m0_target(host_xid, leaf_id, paint_id);
-                            self.direct_scope_scene_eligible(host_xid, target, scope)
-                        })
-                    });
-                    if !scene_eligible {
-                        self.request_direct_unflip_for(
-                            scope,
-                            "composite_tick_output_scene_changed",
-                        );
-                    }
-                }
                 let Some(owner) = self.pstate.direct.get(scope) else {
                     continue;
                 };
