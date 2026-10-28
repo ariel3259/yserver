@@ -2356,6 +2356,16 @@ impl KmsBackend {
 
         let topology_signature = self.scanout_m1_topology_signature();
         if self.pstate.scanout_m1.topology_signature != topology_signature {
+            if self.pstate.direct.root().active()
+                || self
+                    .pstate
+                    .direct
+                    .outputs
+                    .iter()
+                    .any(|owner| owner.active())
+            {
+                return;
+            }
             self.pstate.scanout_m1.clear("output topology changed");
             self.pstate
                 .direct
