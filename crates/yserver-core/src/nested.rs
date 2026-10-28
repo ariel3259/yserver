@@ -14,7 +14,7 @@ use std::{
 use log::{error, info};
 use yserver_protocol::x11::{ResourceId, shape as x11shape, xfixes as x11xfixes};
 
-use crate::{host_x11::HostX11Backend, server::ServerState};
+use crate::{host_x11::HostX11Backend, region::Region, server::ServerState};
 
 // Extension error-code bases. INVARIANT: each extension's reserved range
 // `[first_error, first_error + error_count)` must NOT overlap any other
@@ -629,6 +629,7 @@ pub(crate) fn intersect_regions(
 /// area from each new source rect before appending it. That is enough
 /// for the compositor/shape workloads here, which only ever feed us
 /// normalized region lists.
+#[cfg(test)]
 pub(crate) fn union_regions(
     current: &[x11xfixes::RegionRect],
     source: &[x11xfixes::RegionRect],
@@ -795,6 +796,27 @@ pub(crate) fn shape_rects_for(
         .unwrap_or_else(|| normalize_region_rects(vec![default_shape_rect(server, window, kind)]))
 }
 
+/// `window`'s shape region of `kind` as set, `None` while unset. The
+/// stored rects are a banded list (a set operation's result, or a
+/// client's YXBanded rects as given), so they are adopted as they are.
+pub(crate) fn shape_region(server: &ServerState, window: ResourceId, kind: u8) -> Option<Region> {
+    server
+        .shape_windows
+        .get(&window)
+        .and_then(|state| state.rects(kind))
+        .map(|rects| Region::from_yx_banded(rects))
+}
+
+/// `window`'s shape region of `kind`, its default while unset.
+pub(crate) fn shape_region_or_default(
+    server: &ServerState,
+    window: ResourceId,
+    kind: u8,
+) -> Region {
+    shape_region(server, window, kind)
+        .unwrap_or_else(|| Region::rect(default_shape_rect(server, window, kind)))
+}
+
 pub(crate) fn shape_mask_source_rects(
     server: &ServerState,
     source: ResourceId,
@@ -889,26 +911,32 @@ pub(crate) fn shape_kind_is_set(server: &ServerState, window: ResourceId, kind: 
         .is_some()
 }
 
+/// Xorg's `RegionOperate` (`Xext/shape.c`): `source` combined into the
+/// current shape, `None` while the window is unshaped. On an unshaped
+/// window Union changes nothing, Intersect takes the source, Subtract
+/// starts from the default shape and Invert gives the empty region; on a
+/// shaped one Invert is the source minus the current shape. The result is
+/// `None` when the window stays unshaped.
 pub(crate) fn apply_shape_op(
-    current: Vec<x11xfixes::RegionRect>,
-    source: Vec<x11xfixes::RegionRect>,
+    current: Option<Region>,
+    default: impl FnOnce() -> Region,
+    source: Region,
     op: u8,
-) -> Vec<x11xfixes::RegionRect> {
-    match op {
-        x11shape::OP_SET => normalize_region_rects(source),
-        x11shape::OP_UNION => union_regions(&current, &source),
-        x11shape::OP_INTERSECT => intersect_regions(&current, &source),
-        x11shape::OP_SUBTRACT => subtract_regions(&current, &source),
-        x11shape::OP_INVERT => normalize_region_rects(source),
-        _ => current,
+) -> Option<Region> {
+    match (op, current) {
+        (x11shape::OP_SET, _) | (x11shape::OP_INTERSECT, None) => Some(source),
+        (x11shape::OP_UNION, Some(cur)) => Some(cur.union(&source)),
+        (x11shape::OP_INTERSECT, Some(cur)) => Some(cur.intersect(&source)),
+        (x11shape::OP_SUBTRACT, cur) => Some(cur.unwrap_or_else(default).subtract(&source)),
+        (x11shape::OP_INVERT, Some(cur)) => Some(source.subtract(&cur)),
+        (x11shape::OP_INVERT, None) => Some(Region::default()),
+        (_, cur) => cur,
     }
 }
 
-/// Store `rects` as `window`'s shape region for `kind`. Returns `true`
-/// iff the stored region actually changed — callers gate ShapeNotify
-/// emission on this so a no-op re-set (e.g. a WM re-asserting an
-/// unchanged shape) doesn't spam events, matching Xorg's
-/// `Xext/shape.c` which only notifies on a real change.
+/// Tests: store arbitrary `rects` (normalised) as `window`'s shape of
+/// `kind`; `true` iff it changed.
+#[cfg(test)]
 pub(crate) fn set_shape_rects(
     server: &mut ServerState,
     window: ResourceId,
@@ -926,6 +954,31 @@ pub(crate) fn set_shape_rects(
     let changed = state.rects(kind).map(Vec::as_slice) != Some(normalized.as_slice());
     if changed {
         state.set_rects(kind, Some(normalized));
+    }
+    changed
+}
+
+/// Store `region` as `window`'s shape of `kind`. Returns `true` iff the
+/// stored region actually changed — callers gate ShapeNotify emission on
+/// this so a no-op re-set (e.g. a WM re-asserting an unchanged shape)
+/// doesn't spam events.
+pub(crate) fn set_shape_region(
+    server: &mut ServerState,
+    window: ResourceId,
+    kind: u8,
+    region: &Region,
+) -> bool {
+    if !matches!(
+        kind,
+        x11shape::KIND_BOUNDING | x11shape::KIND_CLIP | x11shape::KIND_INPUT
+    ) {
+        return false;
+    }
+    let rects = region.to_rects();
+    let state = server.shape_windows.entry(window).or_default();
+    let changed = state.rects(kind) != Some(&rects);
+    if changed {
+        state.set_rects(kind, Some(rects));
     }
     changed
 }

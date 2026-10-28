@@ -170,9 +170,8 @@ pub(super) fn emit_shape_notify(state: &mut ServerState, window: ResourceId, kin
     if targets.is_empty() {
         return;
     }
-    let rects = crate::nested::shape_rects_for(state, window, kind);
     let shaped = crate::nested::shape_kind_is_set(state, window, kind);
-    let extents = crate::nested::region_extents(&rects);
+    let extents = crate::nested::shape_region_or_default(state, window, kind).extents_rect();
     let server_time = state.timestamp_now();
     let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
         yserver_protocol::x11::shape::encode_shape_notify_event(
@@ -205,6 +204,55 @@ fn fmt_shape_rects(rects: &[yserver_protocol::x11::xfixes::RegionRect]) -> Strin
     }
     s.push(']');
     s
+}
+
+/// Combine `source` into `window`'s shape of `kind` with SHAPE `op`
+/// (Xorg's `RegionOperate`); `true` iff the stored shape changed.
+fn shape_combine(
+    state: &mut ServerState,
+    window: ResourceId,
+    kind: u8,
+    source: Region,
+    op: u8,
+) -> bool {
+    let current = crate::nested::shape_region(state, window, kind);
+    let default = || Region::rect(crate::nested::default_shape_rect(state, window, kind));
+    match crate::nested::apply_shape_op(current, default, source, op) {
+        Some(region) => crate::nested::set_shape_region(state, window, kind, &region),
+        None => false,
+    }
+}
+
+/// `ProcShapeGetRectangles`: the shape's rects, or for an unshaped window
+/// one rect that for Bounding and Input is `[-bw, -bw, w + bw, h + bw]` —
+/// Xorg's reply, not the default shape, which is `2 * bw` larger.
+fn get_rectangles_rects(
+    state: &ServerState,
+    window: ResourceId,
+    kind: u8,
+) -> Vec<yserver_protocol::x11::xfixes::RegionRect> {
+    use yserver_protocol::x11::{shape as x11shape, xfixes::RegionRect};
+    if let Some(region) = crate::nested::shape_region(state, window, kind) {
+        return region.to_rects();
+    }
+    let Some(w) = state.resources.window(window) else {
+        return Vec::new();
+    };
+    if kind == x11shape::KIND_CLIP {
+        return vec![RegionRect {
+            x: 0,
+            y: 0,
+            width: w.width,
+            height: w.height,
+        }];
+    }
+    let bw = w.border_width;
+    vec![RegionRect {
+        x: i16::try_from(bw).map_or(i16::MIN, |b| -b),
+        y: i16::try_from(bw).map_or(i16::MIN, |b| -b),
+        width: w.width.wrapping_add(bw),
+        height: w.height.wrapping_add(bw),
+    }]
 }
 
 /// SHAPE requests, and the exposures a viewable window's new bounding or clip
@@ -281,6 +329,30 @@ fn handle_shape_request_ops(
         x11shape::RECTANGLES => {
             if let Some((req, rects)) = x11shape::parse_rectangles_request(body) {
                 let window = ResourceId(req.dest);
+                // `ProcShapeRectangles`: an ordering outside the four is
+                // BadValue, rects not in the claimed order BadMatch.
+                if req.ordering > x11shape::ORDERING_YX_BANDED {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_VALUE,
+                        u32::from(req.ordering),
+                        u16::from(minor),
+                        header.opcode,
+                    );
+                }
+                if !crate::region::verify_rect_order(&rects, req.ordering) {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_MATCH,
+                        0,
+                        u16::from(minor),
+                        header.opcode,
+                    );
+                }
                 debug!(
                     "client {} SHAPE::Rectangles dest=0x{:x} kind={} op={} off=({},{}) nrects={}",
                     client_id.0,
@@ -291,11 +363,14 @@ fn handle_shape_request_ops(
                     req.y_off,
                     rects.len(),
                 );
-                let source = crate::nested::offset_rects(rects, req.x_off, req.y_off);
-                let current = crate::nested::shape_rects_for(state, window, req.dest_kind);
-                let new_rects = crate::nested::apply_shape_op(current, source, req.op);
-                let changed =
-                    crate::nested::set_shape_rects(state, window, req.dest_kind, new_rects);
+                // `RegionFromRects` keeps YXBanded rects as they are.
+                let source = if req.ordering == x11shape::ORDERING_YX_BANDED {
+                    Region::from_yx_banded(&rects)
+                } else {
+                    Region::from_wire_rects(&rects)
+                }
+                .translate(i32::from(req.x_off), i32::from(req.y_off));
+                let changed = shape_combine(state, window, req.dest_kind, source, req.op);
                 mirror_shape_to_host_state(state, backend, origin, window, req.dest_kind);
                 // Xorg miSetShape re-evaluates the pointer before ShapeNotify
                 // goes out (`mi/miwindow.c:680`); so do the other SHAPE ops.
@@ -369,23 +444,16 @@ fn handle_shape_request_ops(
                 };
                 let source =
                     banded.unwrap_or_else(|| crate::nested::shape_mask_source_rects(state, src_id));
-                let pre_off_count = source.len();
-                let source = crate::nested::offset_rects(source, req.x_off, req.y_off);
-                let current = crate::nested::shape_rects_for(state, window, req.dest_kind);
-                let current_count = current.len();
-                let new_rects = crate::nested::apply_shape_op(current, source, req.op);
                 log::debug!(
-                    "shape diag: MASK dest=0x{:x} kind={} op={} source_rects(pre_offset)={} \
-                     current_rects={} new_rects={}",
+                    "shape diag: MASK dest=0x{:x} kind={} op={} source_rects={}",
                     req.dest,
                     req.dest_kind,
                     req.op,
-                    pre_off_count,
-                    current_count,
-                    new_rects.len()
+                    source.len(),
                 );
-                let changed =
-                    crate::nested::set_shape_rects(state, window, req.dest_kind, new_rects);
+                let source = Region::from_rects(&source)
+                    .translate(i32::from(req.x_off), i32::from(req.y_off));
+                let changed = shape_combine(state, window, req.dest_kind, source, req.op);
                 mirror_shape_to_host_state(state, backend, origin, window, req.dest_kind);
                 backend.windows_restructured(state);
                 if changed {
@@ -408,26 +476,19 @@ fn handle_shape_request_ops(
                     req.x_off,
                     req.y_off,
                 );
-                let src_rects = crate::nested::shape_rects_for(state, src, req.src_kind);
-                let src_count = src_rects.len();
-                let src_dims = fmt_shape_rects(&src_rects);
-                let source = crate::nested::offset_rects(src_rects, req.x_off, req.y_off);
-                let current = crate::nested::shape_rects_for(state, dest, req.dest_kind);
-                let current_count = current.len();
-                let new_rects = crate::nested::apply_shape_op(current, source, req.op);
-                let new_count = new_rects.len();
+                let source = crate::nested::shape_region_or_default(state, src, req.src_kind)
+                    .translate(i32::from(req.x_off), i32::from(req.y_off));
                 log::debug!(
                     "shape diag: COMBINE dest=0x{:x}(kind={}) src=0x{:x}(kind={}) op={} \
-                     src_rects={src_count} src_dims={src_dims} current_rects={current_count} \
-                     new_rects={new_count} new_dims={}",
+                     src_dims={}",
                     req.dest,
                     req.dest_kind,
                     req.src,
                     req.src_kind,
                     req.op,
-                    fmt_shape_rects(&new_rects),
+                    fmt_shape_rects(&source.to_rects()),
                 );
-                let changed = crate::nested::set_shape_rects(state, dest, req.dest_kind, new_rects);
+                let changed = shape_combine(state, dest, req.dest_kind, source, req.op);
                 mirror_shape_to_host_state(state, backend, origin, dest, req.dest_kind);
                 backend.windows_restructured(state);
                 if changed {
@@ -438,15 +499,9 @@ fn handle_shape_request_ops(
         x11shape::OFFSET => {
             if let Some(req) = x11shape::parse_offset_request(body) {
                 let dest = ResourceId(req.dest);
-                let mut translated = false;
-                if let Some(s) = state.shape_windows.get_mut(&dest)
-                    && let Some(mut rects) = s.rects(req.dest_kind).cloned()
-                {
-                    crate::nested::translate_region(&mut rects, req.x_off, req.y_off);
-                    s.set_rects(req.dest_kind, Some(rects));
-                    translated = true;
-                }
-                if translated {
+                if let Some(region) = crate::nested::shape_region(state, dest, req.dest_kind) {
+                    let region = region.translate(i32::from(req.x_off), i32::from(req.y_off));
+                    crate::nested::set_shape_region(state, dest, req.dest_kind, &region);
                     mirror_shape_to_host_state(state, backend, origin, dest, req.dest_kind);
                     backend.windows_restructured(state);
                     emit_shape_notify(state, dest, req.dest_kind);
@@ -455,14 +510,13 @@ fn handle_shape_request_ops(
         }
         x11shape::QUERY_EXTENTS => {
             let window = ResourceId(x11shape::parse_window(body).unwrap_or(ROOT_WINDOW.0));
-            let bounding_rects =
-                crate::nested::shape_rects_for(state, window, x11shape::KIND_BOUNDING);
-            let clip_rects = crate::nested::shape_rects_for(state, window, x11shape::KIND_CLIP);
+            let extents =
+                |kind| crate::nested::shape_region_or_default(state, window, kind).extents_rect();
+            let bounding = extents(x11shape::KIND_BOUNDING);
+            let clip = extents(x11shape::KIND_CLIP);
             let bounding_shaped =
                 crate::nested::shape_kind_is_set(state, window, x11shape::KIND_BOUNDING);
             let clip_shaped = crate::nested::shape_kind_is_set(state, window, x11shape::KIND_CLIP);
-            let bounding = crate::nested::region_extents(&bounding_rects);
-            let clip = crate::nested::region_extents(&clip_rects);
             let reply = x11shape::encode_query_extents_reply(
                 byte_order,
                 sequence,
@@ -505,7 +559,7 @@ fn handle_shape_request_ops(
             let (window, kind) = x11shape::parse_get_rectangles_request(body)
                 .map(|(w, k)| (ResourceId(w), k))
                 .unwrap_or((ROOT_WINDOW, x11shape::KIND_BOUNDING));
-            let rects = crate::nested::shape_rects_for(state, window, kind);
+            let rects = get_rectangles_rects(state, window, kind);
             let reply = x11shape::encode_get_rectangles_reply(
                 byte_order,
                 sequence,
@@ -1207,7 +1261,8 @@ pub(super) fn handle_xfixes_request(
                         XFIXES_MAJOR_OPCODE,
                     );
                 }
-                let rects = crate::nested::shape_rects_for(state, ResourceId(window), kind);
+                let rects = crate::nested::shape_region_or_default(state, ResourceId(window), kind)
+                    .to_rects();
                 trace!(
                     target: "yserver::xfixes::region",
                     "CreateRegionFromWindow region=0x{region:08x} window=0x{window:08x} kind={} rects{}",
@@ -1530,8 +1585,9 @@ pub(super) fn handle_xfixes_request(
                         .get(&req.region)
                         .map(|r| r.rects.clone())
                         .unwrap_or_default();
-                    let source = crate::nested::offset_rects(rects, req.x_offset, req.y_offset);
-                    crate::nested::set_shape_rects(state, window, req.dest_kind, source);
+                    let source = Region::from_rects(&rects)
+                        .translate(i32::from(req.x_offset), i32::from(req.y_offset));
+                    crate::nested::set_shape_region(state, window, req.dest_kind, &source);
                 }
                 mirror_shape_to_host_state(state, backend, origin, window, req.dest_kind);
                 // Xorg SetWindowShapeRegion goes through miSetShape too.

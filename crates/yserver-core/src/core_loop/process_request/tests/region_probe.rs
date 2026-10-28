@@ -13,6 +13,15 @@ const KNOWN_DIVERGENT: &[&str] = &[
     // region whose one box has no area, which FetchRegion reports as one
     // 0x0 rect; a canonical empty region has none.
     "extents.empty ",
+    // The default Input shape: Xorg's is the bounding default, border
+    // included (`CreateBoundingShape` for ShapeInput); ours excludes the
+    // border, which nested.rs's
+    // `the_default_shape_region_includes_the_border_for_bounding_only`
+    // pins. A Subtract on an unset Input shape starts from it.
+    "fresh.subtract.on2.k2 ",
+    "input.sub.k2 ",
+    "offset.c.k2 ",
+    "mask.none.k2 ",
 ];
 
 type R = (i16, i16, u16, u16);
@@ -537,7 +546,6 @@ fn xfixes_regions_match_xephyr() {
 }
 
 #[test]
-#[ignore = "SHAPE does not match Xorg yet"]
 fn shape_regions_match_xephyr() {
     let mut t = Twin::new();
     xfixes_section(&mut t);

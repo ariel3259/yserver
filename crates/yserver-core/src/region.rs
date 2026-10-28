@@ -80,6 +80,17 @@ impl Region {
         Self::from_boxes(rects.iter().map(|r| Box32::from_wire_rect(*r)).collect())
     }
 
+    /// `RegionFromRects` for `CT_YXBANDED`: Xorg takes the boxes as the
+    /// client gave them, so a band may hold touching boxes and two equal
+    /// bands may follow each other. The caller has checked the banding
+    /// ([`yx_banded`]); the set operations take such a region as pixman's
+    /// do, and their results are canonical again.
+    pub(crate) fn from_yx_banded(rects: &[RegionRect]) -> Self {
+        let mut boxes: Vec<Box32> = rects.iter().map(|r| Box32::from_wire_rect(*r)).collect();
+        boxes.retain(|b| b.x1 < b.x2 && b.y1 < b.y2);
+        Self { boxes }
+    }
+
     fn from_boxes(mut boxes: Vec<Box32>) -> Self {
         if is_canonical(&boxes) {
             return Self { boxes };
@@ -130,6 +141,20 @@ impl Region {
 
     pub(crate) fn to_rects(&self) -> Vec<RegionRect> {
         self.boxes.iter().map(|b| b.to_rect()).collect()
+    }
+
+    /// The bounding rect, all zero for the empty region (pixman's empty
+    /// extents).
+    pub(crate) fn extents_rect(&self) -> RegionRect {
+        self.extents().map_or(
+            RegionRect {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+            },
+            Box32::to_rect,
+        )
     }
 
     /// `pixman_region_inverse`: the part of `bounds` the region does not
@@ -184,6 +209,35 @@ impl Region {
             _ => self.clone(),
         }
     }
+}
+
+/// Xorg's `VerifyRectOrder` (`dix/gc.c`) for SHAPE and core clip
+/// orderings (0 Unsorted, 1 YSorted, 2 YXSorted, 3 YXBanded): whether
+/// `rects` are in the claimed order. A false claim is BadMatch.
+pub(crate) fn verify_rect_order(rects: &[RegionRect], ordering: u8) -> bool {
+    let pairs = || rects.windows(2).map(|w| (w[0], w[1]));
+    match ordering {
+        0 => true,
+        1 => pairs().all(|(p, n)| n.y >= p.y),
+        2 => pairs().all(|(p, n)| n.y > p.y || (n.y == p.y && n.x >= p.x)),
+        3 => yx_banded(rects),
+        _ => false,
+    }
+}
+
+/// `VerifyRectOrder`'s YXBanded test: each rect starts a new band below
+/// the previous one, or continues its band (same y and height) to the
+/// right of it.
+pub(crate) fn yx_banded(rects: &[RegionRect]) -> bool {
+    rects.windows(2).all(|w| {
+        let (p, n) = (w[0], w[1]);
+        let (py, ny) = (i32::from(p.y), i32::from(n.y));
+        if ny == py {
+            n.height == p.height && i32::from(n.x) >= i32::from(p.x) + i32::from(p.width)
+        } else {
+            ny >= py + i32::from(p.height)
+        }
+    })
 }
 
 fn disjoint(a: Box32, b: Box32) -> bool {
