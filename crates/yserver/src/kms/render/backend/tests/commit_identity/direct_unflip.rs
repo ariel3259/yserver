@@ -1251,7 +1251,7 @@ fn resize_root_direct_present_before_unflip() -> Option<ResizePendingUnflip> {
     };
     use yserver_protocol::x11::{
         ClientId, CreatePixmapRequest, CreateWindowRequest, RequestHeader, ResourceId,
-        SequenceNumber, present,
+        SequenceNumber,
     };
 
     const CLIENT: u32 = 1;
@@ -1478,27 +1478,7 @@ fn resize_root_direct_present_before_unflip() -> Option<ResizePendingUnflip> {
     // PresentPixmap with no valid/update region and zero offsets. The core
     // request path calls observe_scanout_m0 before try_present_direct; the
     // latter declines because the resize's composed replacement is pending.
-    let mut present_body = vec![0_u8; 68];
-    present_body[0..4].copy_from_slice(&WINDOW_XID.to_le_bytes());
-    present_body[4..8].copy_from_slice(&PIXMAP_XID.to_le_bytes());
-    present_body[8..12].copy_from_slice(&2_u32.to_le_bytes()); // serial
-    present_body[36..40]
-        .copy_from_slice(&yserver_core::present_scheduler::PRESENT_OPTION_ASYNC.to_le_bytes());
-    let events = fixture.events_mut();
-    yserver_core::core_loop::process_request::process_request(
-        &mut events.state,
-        &mut events.backend,
-        ClientId(CLIENT),
-        SequenceNumber(2),
-        RequestHeader {
-            opcode: 145,
-            data: present::PIXMAP,
-            length_units: 18,
-        },
-        &present_body,
-        None,
-    )
-    .expect("PresentPixmap through the core request dispatcher");
+    dispatch_resized_root_present(&mut fixture, 2, 2);
 
     assert!(
         fixture
