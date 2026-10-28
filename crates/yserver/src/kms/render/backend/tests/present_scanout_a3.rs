@@ -2115,6 +2115,9 @@ fn output_unflip_leaves_other_output_damage_alone() {
     let recorder = fixture.events.recorders[&fd].clone();
     recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
     recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
+    // Reject the first per-output replacement too, so the next scheduling
+    // pass must reach the degraded retry through Backend bookkeeping.
+    recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
     let degraded_start = recorder.records().len();
     Backend::maybe_composite(&mut fixture.events.backend)
         .expect("degrade Output(1) to per-output scene replacement");
@@ -2124,8 +2127,8 @@ fn output_unflip_leaves_other_output_damage_alone() {
     assert!(
         fixture.events.backend.pstate.direct.outputs[1]
             .unflip_awaiting_outputs
-            .contains_key(&1),
-        "the degraded setup accepted output 1's replacement"
+            .is_empty(),
+        "rejected degraded setup has no accepted replacement to retire"
     );
     assert!(
         fixture.events.backend.pstate.direct.outputs[1]
@@ -2142,7 +2145,7 @@ fn output_unflip_leaves_other_output_damage_alone() {
     assert_eq!(
         fixture.events.backend.pstate.direct.active_scopes(),
         [crate::kms::render::backend::DirectScope::Output(1)],
-        "the pending degraded replacement remains reachable through its owner scope"
+        "the degraded retry remains reachable through its owner scope"
     );
     assert!(
         !a3_has_scene_commit_for(&degraded_records, output0_crtc),
@@ -2158,39 +2161,35 @@ fn output_unflip_leaves_other_output_damage_alone() {
         "degraded setup leaves output 0's damage history and structural region unchanged"
     );
 
-    a3_retire_records(&mut fixture, &degraded_records);
     assert!(
-        fixture.events.backend.pstate.direct.outputs[1]
-            .current
-            .is_none()
+        degraded_records.iter().any(|record| {
+            record.result != crate::drm::atomic::tests_support::ScriptedResult::Ok
+                && a3_has_scene_commit_for(
+                    std::slice::from_ref(record),
+                    fixture.events.backend.platform.outputs[1].output.crtc,
+                )
+        }),
+        "the recorder shows the first Output(1) scene replacement was rejected"
     );
-    fixture.finish_after_normal_drain();
+    assert!(
+        degraded_records
+            .iter()
+            .all(|record| super::commit_identity::accepted_event_id(record).is_none()),
+        "the scripted first replacement attempt is rejected"
+    );
 
-    let Some((fixture, direct)) = a3_output_fixture(1, 960) else {
-        eprintln!(
-            "SKIP output_unflip_leaves_other_output_damage_alone: retry Vulkan fixture unavailable"
-        );
-        return;
-    };
-    let mut fixture = fixture.cleanup_guard();
-    let fd = fixture.kms_fd(0);
-    a3_enter_output_owner(&mut fixture, &direct, 1);
-    settle_other_output(&mut fixture);
-    let output0_crtc = fixture.events.backend.platform.outputs[0].output.crtc;
-    let output0_before = fixture
-        .events
-        .backend
-        .scene
-        .retirement_observation_for_tests(0);
-    {
-        let owner = &mut fixture.events.backend.pstate.direct.outputs[1];
-        owner.unflip_requested = true;
-        owner.degraded_composed_unflip = true;
-        owner.unflip_outputs_to_replace = std::collections::HashSet::from([1]);
+    let retry_deadline = Backend::next_wakeup(&fixture.events.backend)
+        .expect("rejected replacement schedules a Backend retry wakeup");
+    let until_retry = retry_deadline.saturating_duration_since(std::time::Instant::now());
+    if !until_retry.is_zero() {
+        // Follow the scheduler's reported KMS retry timer; the scripted
+        // outcomes determine the rejection and acceptance independently.
+        std::thread::sleep(until_retry);
     }
-    let retry_start = fixture.events.recorders[&fd].records().len();
+    Backend::before_block(&mut fixture.events.backend);
+    let retry_start = recorder.records().len();
     Backend::maybe_composite(&mut fixture.events.backend)
-        .expect("retry the degraded Output(1) replacement through Backend");
+        .expect("retry the rejected degraded Output(1) replacement through Backend");
     fixture.events.wait_for_submitted_gpu_work();
     let retry_records = a3_records_since(&fixture, fd, retry_start);
     assert!(

@@ -444,10 +444,9 @@ impl DirectOwners {
 
         let mut removed = Vec::with_capacity(indices.len());
         for idx in indices.into_iter().rev() {
-            removed.push((idx, self.outputs.remove(idx)));
+            removed.push(self.outputs.remove(idx));
         }
-        removed.sort_unstable_by_key(|(idx, _)| *idx);
-        for (_, mut owner) in removed {
+        for mut owner in removed.into_iter().rev() {
             self.root.completed.append(&mut owner.completed);
             self.root
                 .deferred_successor_skips
