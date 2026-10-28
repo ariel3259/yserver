@@ -367,6 +367,591 @@ fn a3_root_fixture(
     })
 }
 
+fn a3_materialize_cow(
+    fixture: &mut super::commit_identity::recording_scene::RecordingSceneFixture,
+    state: &mut yserver_core::server::ServerState,
+) -> u32 {
+    use yserver_core::{backend::Backend, core_loop::process_request};
+    use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber, composite};
+
+    super::super::install_client_for_render(state, 14);
+    let body = yserver_core::resources::ROOT_WINDOW.0.to_le_bytes();
+    process_request::process_request(
+        state,
+        &mut fixture.events.backend as &mut dyn Backend,
+        ClientId(14),
+        SequenceNumber(1),
+        RequestHeader {
+            opcode: 144,
+            data: composite::GET_OVERLAY_WINDOW,
+            length_units: 2,
+        },
+        &body,
+        None,
+    )
+    .expect("materialize the Composite overlay through Backend");
+    fixture
+        .events
+        .backend
+        .cow_host_xid()
+        .expect("GetOverlayWindow returns the materialized COW")
+}
+
+fn a3_add_existing_window_with_host(
+    state: &mut yserver_core::server::ServerState,
+    resource_id: yserver_protocol::x11::ResourceId,
+    host_xid: u32,
+    x: i16,
+    y: i16,
+    width: u16,
+    height: u16,
+) {
+    use yserver_core::resources::ROOT_WINDOW;
+    use yserver_protocol::x11::{ClientId, CreateWindowRequest};
+
+    state.resources.create_window(
+        ClientId(14),
+        CreateWindowRequest {
+            depth: 24,
+            window: resource_id,
+            parent: ROOT_WINDOW,
+            x,
+            y,
+            width,
+            height,
+            border_width: 0,
+            class: 1,
+            visual: yserver_core::resources::ROOT_VISUAL,
+            ..Default::default()
+        },
+    );
+    state
+        .resources
+        .window_mut(resource_id)
+        .expect("register the window in ServerState")
+        .host_xid = yserver_core::backend::WindowHandle::from_raw(host_xid);
+    let _ = state.resources.map_window(resource_id);
+}
+
+fn a3_install_root_present(
+    fixture: &mut super::commit_identity::recording_scene::RecordingSceneFixture,
+    present_id: u64,
+    target_xid: u32,
+) -> super::commit_identity::recording_scene::DirectPresentSetup {
+    let mut direct = fixture.install_direct_present(present_id, 0);
+    let backend = &mut fixture.events.backend;
+    backend
+        .core
+        .top_level_order
+        .retain(|&xid| xid != direct.target_xid);
+    direct.candidate.dst_window_xid = target_xid;
+    direct.candidate.paint_dst_host_xid = target_xid;
+    direct.candidate.completion_dst_host_xid = target_xid;
+    direct.event.dst_host_xid = target_xid;
+    direct
+}
+
+fn a3_present_root_copy(
+    fixture: &mut super::commit_identity::recording_scene::RecordingSceneFixture,
+    direct: &super::commit_identity::recording_scene::DirectPresentSetup,
+    color: u32,
+) {
+    use yserver_core::backend::Backend;
+
+    let mut candidate = direct.candidate;
+    candidate.valid_region_xid = 0xdead;
+    Backend::fill_rectangle(
+        &mut fixture.events.backend,
+        None,
+        candidate.src_host_xid,
+        color,
+        0,
+        0,
+        candidate.src_width,
+        candidate.src_height,
+    )
+    .expect("paint the authoritative Present pixmap");
+    assert!(
+        !Backend::try_present_direct(&mut fixture.events.backend, candidate, direct.event.clone(),)
+            .expect("ineligible authoritative Present through Backend"),
+        "a nonzero valid-region id keeps the root-sized Present on Copy"
+    );
+    Backend::copy_area(
+        &mut fixture.events.backend,
+        None,
+        candidate.src_host_xid,
+        candidate.paint_dst_host_xid,
+        0,
+        0,
+        0,
+        0,
+        candidate.src_width,
+        candidate.src_height,
+    )
+    .expect("run the Present Copy fallback");
+    Backend::note_present_pixmap(
+        &mut fixture.events.backend,
+        candidate.src_pixmap_xid,
+        candidate.paint_dst_host_xid,
+    );
+}
+
+fn a3_visible_root_pixel(
+    fixture: &mut super::commit_identity::recording_scene::RecordingSceneFixture,
+    x: i16,
+    y: i16,
+) -> Vec<u8> {
+    fixture
+        .events
+        .backend
+        .get_image_pixels_for_tests(fixture.events.backend.core.window_id, 2, x, y, 1, 1, !0)
+        .expect("read composed root pixel")
+        .expect("root pixel bytes")
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: restore the root-wide unflip request for every authoritative Present.
+fn shaped_away_stage_present_keeps_output_owner() {
+    use yserver_core::backend::Backend;
+    use yserver_protocol::x11::{ResourceId, xfixes::RegionRect};
+
+    let Some((mut fixture, direct)) = a3_output_fixture(1, 940) else {
+        eprintln!("SKIP shaped_away_stage_present_keeps_output_owner: Vulkan fixture unavailable");
+        return;
+    };
+    let mut state = yserver_core::server::ServerState::new();
+    let game_xid = direct.target_xid;
+    let (game_x, game_y, game_width, game_height) = {
+        let output = &fixture.events.backend.platform.outputs[1];
+        (
+            output.x as i16,
+            output.y as i16,
+            output.width,
+            output.height,
+        )
+    };
+    a3_add_existing_window_with_host(
+        &mut state,
+        ResourceId(0x3160),
+        game_xid,
+        game_x,
+        game_y,
+        game_width,
+        game_height,
+    );
+    Backend::sync_top_level_order(&mut fixture.events.backend, &state);
+    a3_enter_output_owner(&mut fixture, &direct, 1);
+    let current_present = fixture.events.backend.pstate.direct.outputs[1]
+        .current
+        .as_ref()
+        .expect("Output(1) is held")
+        .candidate
+        .present_id;
+
+    let cow_xid = a3_materialize_cow(&mut fixture, &mut state);
+    Backend::set_shape_rectangles(
+        &mut fixture.events.backend,
+        None,
+        cow_xid,
+        0,
+        Some(&[RegionRect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        }]),
+    )
+    .expect("shape the stage to output 0 through Backend");
+    let stage = a3_install_root_present(&mut fixture, 941, cow_xid);
+    a3_present_root_copy(&mut fixture, &stage, 0x00d1_7b31);
+
+    let owner = &fixture.events.backend.pstate.direct.outputs[1];
+    assert!(
+        !owner.unflip_requested,
+        "stage shaped away from output 1 is hidden there"
+    );
+    assert_eq!(
+        owner.current.as_ref().unwrap().candidate.present_id,
+        current_present,
+        "Output(1) keeps the same current direct Present"
+    );
+    let records = a3_tick(&mut fixture);
+    assert!(
+        a3_has_scene_commit_for(
+            &records,
+            fixture.events.backend.platform.outputs[0].output.crtc
+        ),
+        "output 0 composes the COW stage"
+    );
+    assert!(
+        !a3_has_scene_commit_for(
+            &records,
+            fixture.events.backend.platform.outputs[1].output.crtc
+        ),
+        "output 1 remains direct"
+    );
+    a3_retire_records(&mut fixture, &records);
+    assert_eq!(
+        &a3_visible_root_pixel(&mut fixture, 150, 150)[..3],
+        &[0x31, 0x7b, 0xd1],
+        "output 0 displays the stage pixels"
+    );
+    assert!(!fixture.events.backend.pstate.direct.outputs[1].unflip_requested);
+    assert_eq!(
+        fixture.events.backend.pstate.direct.outputs[1]
+            .current
+            .as_ref()
+            .unwrap()
+            .candidate
+            .present_id,
+        current_present,
+        "Output(1) stays current through output 0's retirement"
+    );
+    fixture.finish();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: treat every shaped COW as hidden from every output.
+fn stage_present_visible_on_output_revokes_it() {
+    use yserver_core::backend::Backend;
+    use yserver_protocol::x11::{ResourceId, xfixes::RegionRect};
+
+    let Some((mut fixture, direct)) = a3_output_fixture(1, 942) else {
+        eprintln!("SKIP stage_present_visible_on_output_revokes_it: Vulkan fixture unavailable");
+        return;
+    };
+    let mut state = yserver_core::server::ServerState::new();
+    let output = &fixture.events.backend.platform.outputs[1];
+    a3_add_existing_window_with_host(
+        &mut state,
+        ResourceId(0x3161),
+        direct.target_xid,
+        output.x as i16,
+        output.y as i16,
+        output.width,
+        output.height,
+    );
+    Backend::sync_top_level_order(&mut fixture.events.backend, &state);
+    a3_enter_output_owner(&mut fixture, &direct, 1);
+
+    let cow_xid = a3_materialize_cow(&mut fixture, &mut state);
+    Backend::set_shape_rectangles(
+        &mut fixture.events.backend,
+        None,
+        cow_xid,
+        0,
+        Some(&[RegionRect {
+            x: 0,
+            y: 0,
+            width: 3840,
+            height: 1080,
+        }]),
+    )
+    .expect("shape the COW across both outputs through Backend");
+    let stage = a3_install_root_present(&mut fixture, 943, cow_xid);
+    a3_present_root_copy(&mut fixture, &stage, 0x0000_8fda);
+
+    let owner = &fixture.events.backend.pstate.direct.outputs[1];
+    assert!(owner.unflip_requested, "the stage intersects output 1");
+    assert_eq!(
+        owner.unflip_reason,
+        Some("ineligible_authoritative_root_present")
+    );
+    assert_eq!(owner.unflip_fallback_source, None);
+    assert!(
+        owner.unflip_shadow_ready,
+        "the Copy prepared the replacement"
+    );
+    assert!(
+        owner.current.is_some(),
+        "the last direct frame awaits replacement"
+    );
+    let records = a3_tick(&mut fixture);
+    assert!(
+        a3_has_scene_commit_for(
+            &records,
+            fixture.events.backend.platform.outputs[1].output.crtc
+        ),
+        "the next scheduler pass composes output 1's replacement"
+    );
+    a3_retire_records(&mut fixture, &records);
+    fixture.finish();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: treat every root-covering Unredirected Present as visible on every output.
+fn root_window_below_game_presenting_keeps_output_owner() {
+    use yserver_core::backend::Backend;
+    use yserver_protocol::x11::ResourceId;
+
+    let Some((mut fixture, direct)) = a3_output_fixture(1, 944) else {
+        eprintln!(
+            "SKIP root_window_below_game_presenting_keeps_output_owner: Vulkan fixture unavailable"
+        );
+        return;
+    };
+    let mut state = yserver_core::server::ServerState::new();
+    let root_width = fixture.events.backend.platform.fb_w;
+    let root_height = fixture.events.backend.platform.fb_h;
+    let stage_resource = ResourceId(0x3162);
+    let stage_xid = a3_seed_ordered_window(
+        &mut fixture,
+        &mut state,
+        stage_resource,
+        0,
+        0,
+        root_width,
+        root_height,
+        true,
+    );
+    let game_resource = ResourceId(0x3163);
+    let game = &fixture.events.backend.platform.outputs[1];
+    a3_add_existing_window_with_host(
+        &mut state,
+        game_resource,
+        direct.target_xid,
+        game.x as i16,
+        game.y as i16,
+        game.width,
+        game.height,
+    );
+    Backend::sync_top_level_order(&mut fixture.events.backend, &state);
+    a3_enter_output_owner(&mut fixture, &direct, 1);
+
+    let root_present = fixture.install_direct_present(945, 0);
+    fixture
+        .events
+        .backend
+        .core
+        .top_level_order
+        .retain(|&xid| xid != root_present.target_xid);
+    let mut candidate = root_present.candidate;
+    candidate.dst_window_xid = stage_xid;
+    candidate.paint_dst_host_xid = stage_xid;
+    candidate.completion_dst_host_xid = stage_xid;
+    candidate.valid_region_xid = 0xdead;
+    let mut event = root_present.event.clone();
+    event.dst_host_xid = stage_xid;
+
+    Backend::fill_rectangle(
+        &mut fixture.events.backend,
+        None,
+        candidate.src_host_xid,
+        0x00d1_7b31,
+        0,
+        0,
+        candidate.src_width,
+        candidate.src_height,
+    )
+    .expect("paint the below-game root Present");
+    assert!(
+        !Backend::try_present_direct(&mut fixture.events.backend, candidate, event.clone())
+            .expect("below-game root Present remains a Copy"),
+        "the valid-region gate serves this Present by Copy"
+    );
+    assert!(
+        !fixture.events.backend.pstate.direct.outputs[1].unflip_requested,
+        "the root window covers output 0 only in the current stacking order"
+    );
+    Backend::copy_area(
+        &mut fixture.events.backend,
+        None,
+        candidate.src_host_xid,
+        candidate.paint_dst_host_xid,
+        0,
+        0,
+        0,
+        0,
+        candidate.src_width,
+        candidate.src_height,
+    )
+    .expect("copy the below-game Present");
+    Backend::note_present_pixmap(
+        &mut fixture.events.backend,
+        candidate.src_pixmap_xid,
+        candidate.paint_dst_host_xid,
+    );
+    let records = a3_tick(&mut fixture);
+    assert!(
+        a3_has_scene_commit_for(
+            &records,
+            fixture.events.backend.platform.outputs[0].output.crtc
+        ),
+        "the below-game root window is visible on output 0"
+    );
+    assert!(!fixture.events.backend.pstate.direct.outputs[1].unflip_requested);
+    a3_retire_records(&mut fixture, &records);
+    assert_eq!(
+        &a3_visible_root_pixel(&mut fixture, 150, 150)[..3],
+        &[0x31, 0x7b, 0xd1],
+        "output 0 displays the root window below the game"
+    );
+
+    a3_restack_top_level(
+        &mut fixture,
+        &mut state,
+        stage_resource,
+        game_resource,
+        stage_xid,
+        direct.target_xid,
+        0,
+    );
+    candidate.present_id = 946;
+    event.present_id = 946;
+    event.serial = 946;
+    assert!(
+        !Backend::try_present_direct(&mut fixture.events.backend, candidate, event)
+            .expect("raised root Present remains a Copy"),
+        "the valid-region gate keeps the raised Present composed"
+    );
+    let owner = &fixture.events.backend.pstate.direct.outputs[1];
+    assert!(
+        owner.unflip_requested,
+        "the raised root window now covers output 1"
+    );
+    assert_eq!(
+        owner.unflip_reason,
+        Some("ineligible_authoritative_root_present")
+    );
+    fixture.finish();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: leave Copy fallback readiness updates restricted to the Root owner.
+fn output_owner_copy_fallback_is_marked_ready() {
+    use yserver_core::backend::Backend;
+    use yserver_protocol::x11::ResourceId;
+
+    for (present_id, cow_descendant) in [(947, false), (949, true)] {
+        let Some((mut fixture, direct)) = a3_output_fixture(1, present_id) else {
+            eprintln!(
+                "SKIP output_owner_copy_fallback_is_marked_ready: Vulkan fixture unavailable"
+            );
+            return;
+        };
+        let mut state = yserver_core::server::ServerState::new();
+        let root_width = fixture.events.backend.platform.fb_w;
+        let root_height = fixture.events.backend.platform.fb_h;
+        let stage_resource = ResourceId(if cow_descendant { 0x3167 } else { 0x3166 });
+        let stage_xid = a3_seed_ordered_window(
+            &mut fixture,
+            &mut state,
+            stage_resource,
+            0,
+            0,
+            root_width,
+            root_height,
+            true,
+        );
+        let game = &fixture.events.backend.platform.outputs[1];
+        a3_add_existing_window_with_host(
+            &mut state,
+            ResourceId(if cow_descendant { 0x3165 } else { 0x3164 }),
+            direct.target_xid,
+            game.x as i16,
+            game.y as i16,
+            game.width,
+            game.height,
+        );
+        Backend::sync_top_level_order(&mut fixture.events.backend, &state);
+        let cow_xid = cow_descendant.then(|| a3_materialize_cow(&mut fixture, &mut state));
+        if cow_descendant {
+            let cow_xid = cow_xid.unwrap();
+            fixture
+                .events
+                .backend
+                .windows
+                .get_mut(&direct.target_xid)
+                .expect("direct Output target window")
+                .parent = Some(cow_xid);
+            fixture
+                .events
+                .backend
+                .core
+                .top_level_order
+                .retain(|&xid| xid != direct.target_xid);
+            assert!(
+                fixture
+                    .events
+                    .backend
+                    .test_set_redirected_target(cow_xid, cow_xid),
+                "the COW descendant resolves into the affected COW backing"
+            );
+            assert!(
+                fixture
+                    .events
+                    .backend
+                    .test_set_redirected_target(stage_xid, cow_xid),
+                "the root Present Copy updates the same backing as the direct fallback"
+            );
+        }
+        Backend::fill_rectangle(
+            &mut fixture.events.backend,
+            None,
+            direct.candidate.src_host_xid,
+            0x0000_00ff,
+            0,
+            0,
+            direct.candidate.src_width,
+            direct.candidate.src_height,
+        )
+        .expect("paint the retained direct source blue");
+        a3_enter_output_owner(&mut fixture, &direct, 1);
+        let owner = &fixture.events.backend.pstate.direct.outputs[1];
+        if cow_descendant {
+            assert_eq!(
+                owner.current.as_ref().unwrap().fallback_target.backing_id(),
+                fixture.events.backend.cow_id.unwrap(),
+                "the COW-descendant fallback shares the root Present backing"
+            );
+        } else {
+            a3_restack_top_level(
+                &mut fixture,
+                &mut state,
+                stage_resource,
+                ResourceId(0x3164),
+                stage_xid,
+                direct.target_xid,
+                0,
+            );
+        }
+
+        let stage = a3_install_root_present(&mut fixture, present_id + 1, stage_xid);
+        a3_present_root_copy(&mut fixture, &stage, 0x00d1_7b31);
+        let owner = &fixture.events.backend.pstate.direct.outputs[1];
+        assert!(
+            owner.unflip_requested,
+            "visible authoritative Copy revokes Output(1)"
+        );
+        assert_eq!(owner.unflip_fallback_source, None);
+        assert!(
+            owner.unflip_shadow_ready,
+            "the Copy already prepared the replacement"
+        );
+
+        let records = a3_tick(&mut fixture);
+        assert!(
+            a3_has_scene_commit_for(
+                &records,
+                fixture.events.backend.platform.outputs[1].output.crtc
+            ),
+            "output 1 submits its composed replacement"
+        );
+        a3_retire_records(&mut fixture, &records);
+        assert_eq!(
+            &a3_visible_root_pixel(&mut fixture, 1930, 20)[..3],
+            &[0x31, 0x7b, 0xd1],
+            "the replacement shows the new Present pixels, not the retained blue source"
+        );
+        assert!(!fixture.events.backend.pstate.direct.outputs[1].active());
+        fixture.finish();
+    }
+}
+
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: on_top_level_order_changed unflips every owner.

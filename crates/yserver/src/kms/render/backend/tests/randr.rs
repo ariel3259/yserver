@@ -3586,6 +3586,160 @@ fn simulated_kms_dual_head() -> Option<(KmsBackend, ServerState, std::rc::Rc<Sim
     Some((backend, state, kms))
 }
 
+fn randr_two_output_owner_fixture()
+-> Option<super::commit_identity::recording_scene::RecordingSceneFixture> {
+    use yserver_core::backend::Backend;
+
+    let mut fixture =
+        match super::commit_identity::recording_scene::RecordingSceneFixture::with_output_geometry(
+            (3840, 1080),
+            &[(0, 0, 1920, 1080, 75), (1920, 0, 1920, 1080, 240)],
+        ) {
+            Ok(Some(fixture)) => fixture,
+            Ok(None) => return None,
+            Err(error) => panic!("RANDR recording scene fixture construction failed: {error}"),
+        };
+    fixture
+        .events
+        .backend
+        .rebuild_randr_state(&mut fixture.events.state, None, true);
+    fixture
+        .events
+        .backend
+        .for_tests_set_scanout_m1_prober(super::present_scanout::record_scanout_m1_probe);
+
+    let probation = usize::from(crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION);
+    for (output_idx, present_id) in [(0, 701), (1, 702)] {
+        let mut direct = fixture.install_direct_output_present(output_idx, present_id, 0);
+        let selected_crtc = fixture.events.state.randr.outputs[output_idx].crtc_id;
+        direct.candidate.crtc_id = selected_crtc;
+        direct.candidate.crtc_epoch = fixture
+            .events
+            .backend
+            .present_crtc_clock_epoch(selected_crtc);
+        direct.event.crtc_id = selected_crtc;
+        direct.event.crtc_epoch = direct.candidate.crtc_epoch;
+        Backend::note_present_scanout_candidate(&mut fixture.events.backend, direct.candidate);
+
+        let output = &fixture.events.backend.platform.outputs[output_idx].output;
+        let crtc = output.crtc;
+        let fd = fixture.kms_fd(output_idx);
+        let start = fixture.events.recorders[&fd].records().len();
+        for attempt in 0..probation {
+            let entered = Backend::try_present_direct(
+                &mut fixture.events.backend,
+                direct.candidate,
+                direct.event.clone(),
+            )
+            .expect("Output Present through Backend");
+            assert_eq!(entered, attempt + 1 == probation);
+        }
+        let direct_record = fixture.events.recorders[&fd]
+            .records()
+            .into_iter()
+            .skip(start)
+            .find(|record| {
+                super::commit_identity::support::accepted_event_id(record).is_some()
+                    && record.events.len() == 1
+                    && record.events[0].crtc == crtc
+            })
+            .expect("Output Present produced a direct CRTC commit");
+        assert!(
+            super::commit_identity::support::accepted_event_id(&direct_record).is_some(),
+            "accepted Output commit carries an event identity"
+        );
+    }
+
+    assert_eq!(
+        fixture.events.backend.pstate.direct.active_scopes(),
+        [
+            crate::kms::render::backend::DirectScope::Output(0),
+            crate::kms::render::backend::DirectScope::Output(1),
+        ]
+    );
+    assert_eq!(fixture.events.backend.present_source_pins.len(), 4);
+    Some(fixture)
+}
+
+fn randr_retire_direct_enters(
+    fixture: &mut super::commit_identity::recording_scene::RecordingSceneFixture,
+) {
+    use std::time::Duration;
+    use yserver_core::backend::Backend;
+
+    for output_idx in 0..2 {
+        let fd = fixture.kms_fd(output_idx);
+        let crtc = fixture.events.backend.platform.outputs[output_idx]
+            .output
+            .crtc;
+        let direct_record = fixture.events.recorders[&fd]
+            .records()
+            .into_iter()
+            .rev()
+            .find(|record| {
+                super::commit_identity::support::accepted_event_id(record).is_some()
+                    && record.events.len() == 1
+                    && record.events[0].crtc == crtc
+            })
+            .expect("Output Present produced a direct CRTC commit");
+        let commit_id = super::commit_identity::support::accepted_event_id(&direct_record)
+            .expect("accepted Output commit carries an event identity");
+        fixture.events.queue_commit_completion(
+            fd,
+            crtc,
+            commit_id,
+            701 + u32::try_from(output_idx).expect("output index fits"),
+            Duration::from_millis(1_600 + u64::try_from(output_idx).expect("output index fits")),
+        );
+        Backend::on_page_flip_ready(&mut fixture.events.backend, &mut fixture.events.state, fd);
+    }
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .outputs
+            .iter()
+            .all(|owner| owner.current.is_some()),
+        "each Output owner retired its direct Present"
+    );
+}
+
+fn randr_compose_and_retire_replacements(
+    fixture: &mut super::commit_identity::recording_scene::RecordingSceneFixture,
+) -> Vec<crate::drm::atomic::tests_support::AtomicCommitRecord> {
+    use yserver_core::backend::Backend;
+
+    let fd = fixture.kms_fd(0);
+    let start = fixture.events.recorders[&fd].records().len();
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("submit global-cause composed replacements");
+    fixture.events.wait_for_submitted_gpu_work();
+    let records: Vec<_> = fixture.events.recorders[&fd]
+        .records()
+        .into_iter()
+        .skip(start)
+        .filter(|record| record.device_fd == fd)
+        .collect();
+    for record in &records {
+        let Some(event_id) = super::commit_identity::support::accepted_event_id(record) else {
+            continue;
+        };
+        for event in &record.events {
+            fixture.events.queue_commit_completion(
+                fd,
+                event.crtc,
+                event_id,
+                800,
+                std::time::Duration::from_millis(1_800),
+            );
+        }
+    }
+    Backend::on_page_flip_ready(&mut fixture.events.backend, &mut fixture.events.state, fd);
+    records
+}
+
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: delete the removed-slot notification transfer in sync_output_count.
@@ -3750,7 +3904,7 @@ fn direct_owners_follow_output_count_on_topology_change() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: seed Output slots instead of entering owners through Backend Presents.
+// Mutation: RANDR teardown stops only one Output owner.
 fn randr_topology_teardown_stops_every_output_owner() {
     use std::time::Duration;
     use yserver_core::backend::Backend;
@@ -3920,6 +4074,208 @@ fn randr_topology_teardown_stops_every_output_owner() {
     assert_eq!(idled, [701, 702]);
     assert!(Backend::drain_retired_present_idle_events(&mut fixture.events.backend).is_empty());
     fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: scope both storage reallocation requests or the CRTC transform request to one output.
+fn global_causes_revoke_every_output_owner() {
+    use yserver_core::backend::Backend;
+
+    let Some(mut storage_fixture) = randr_two_output_owner_fixture() else {
+        eprintln!("SKIP global_causes_revoke_every_output_owner: Vulkan fixture unavailable");
+        return;
+    };
+    randr_retire_direct_enters(&mut storage_fixture);
+    let mut completed =
+        Backend::drain_completed_present_events(&mut storage_fixture.events.backend)
+            .into_iter()
+            .map(|event| event.present_id)
+            .collect::<Vec<_>>();
+    completed.sort_unstable();
+    assert_eq!(completed, [701, 702], "each direct Present completes once");
+    assert!(
+        Backend::drain_completed_present_events(&mut storage_fixture.events.backend).is_empty()
+    );
+
+    Backend::set_logical_screen_size(&mut storage_fixture.events.backend, 3841, 1081)
+        .expect("storage reallocation through the Backend entry point");
+    for (output_idx, owner) in storage_fixture
+        .events
+        .backend
+        .pstate
+        .direct
+        .outputs
+        .iter()
+        .enumerate()
+    {
+        assert!(
+            owner.unflip_requested,
+            "storage reallocation requests Output({output_idx}) before a tick"
+        );
+        assert!(
+            owner.current.is_some(),
+            "the last Present waits for replacement"
+        );
+    }
+    let storage_replacements = randr_compose_and_retire_replacements(&mut storage_fixture);
+    for output_idx in 0..2 {
+        let crtc = storage_fixture.events.backend.platform.outputs[output_idx]
+            .output
+            .crtc;
+        assert!(
+            storage_replacements.iter().any(|record| {
+                matches!(
+                    record.kind,
+                    crate::drm::atomic::AtomicCommitKind::Scene
+                        | crate::drm::atomic::AtomicCommitKind::SceneWithCursor
+                ) && record.events.iter().any(|event| event.crtc == crtc)
+            }),
+            "storage replacement retires on output {output_idx}"
+        );
+    }
+    assert!(
+        storage_fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .active_scopes()
+            .is_empty()
+    );
+    assert!(
+        storage_fixture
+            .events
+            .backend
+            .present_source_pins
+            .is_empty()
+    );
+    assert!(
+        Backend::drain_completed_present_events(&mut storage_fixture.events.backend).is_empty(),
+        "unflip does not duplicate CompleteNotify"
+    );
+    let mut idled = Backend::drain_retired_present_idle_events(&mut storage_fixture.events.backend)
+        .into_iter()
+        .map(|event| event.present_id)
+        .collect::<Vec<_>>();
+    idled.sort_unstable();
+    assert_eq!(
+        idled,
+        [701, 702],
+        "both Present pins retire after replacement"
+    );
+    assert!(
+        Backend::drain_retired_present_idle_events(&mut storage_fixture.events.backend).is_empty()
+    );
+    storage_fixture.finish_after_normal_drain();
+
+    let Some(mut transform_fixture) = randr_two_output_owner_fixture() else {
+        eprintln!("SKIP global_causes_revoke_every_output_owner: Vulkan fixture unavailable");
+        return;
+    };
+    randr_retire_direct_enters(&mut transform_fixture);
+    let mut completed =
+        Backend::drain_completed_present_events(&mut transform_fixture.events.backend)
+            .into_iter()
+            .map(|event| event.present_id)
+            .collect::<Vec<_>>();
+    completed.sort_unstable();
+    assert_eq!(completed, [701, 702], "each direct Present completes once");
+    assert!(
+        Backend::drain_completed_present_events(&mut transform_fixture.events.backend).is_empty()
+    );
+
+    let half = yserver_core::randr::FIXED_ONE / 2;
+    transform_fixture.events.state.randr.outputs[0].current_transform =
+        yserver_core::randr::CrtcTransform::new(
+            [half, 0, 0, 0, half, 0, 0, 0, yserver_core::randr::FIXED_ONE],
+            None,
+            Vec::new(),
+        )
+        .expect("valid scale transform");
+    Backend::randr_layout_changed(
+        &mut transform_fixture.events.backend,
+        &mut transform_fixture.events.state,
+    );
+    assert_eq!(
+        transform_fixture
+            .events
+            .backend
+            .platform
+            .output_transforms
+            .len(),
+        1
+    );
+    for (output_idx, owner) in transform_fixture
+        .events
+        .backend
+        .pstate
+        .direct
+        .outputs
+        .iter()
+        .enumerate()
+    {
+        assert!(
+            owner.unflip_requested,
+            "a CRTC transform requests Output({output_idx}) before a tick"
+        );
+        assert!(
+            owner.current.is_some(),
+            "the last Present waits for replacement"
+        );
+    }
+    let transform_replacements = randr_compose_and_retire_replacements(&mut transform_fixture);
+    for output_idx in 0..2 {
+        let crtc = transform_fixture.events.backend.platform.outputs[output_idx]
+            .output
+            .crtc;
+        assert!(
+            transform_replacements.iter().any(|record| {
+                matches!(
+                    record.kind,
+                    crate::drm::atomic::AtomicCommitKind::Scene
+                        | crate::drm::atomic::AtomicCommitKind::SceneWithCursor
+                ) && record.events.iter().any(|event| event.crtc == crtc)
+            }),
+            "transformed replacement retires on output {output_idx}"
+        );
+    }
+    assert!(
+        transform_fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .active_scopes()
+            .is_empty()
+    );
+    assert!(
+        transform_fixture
+            .events
+            .backend
+            .present_source_pins
+            .is_empty()
+    );
+    assert!(
+        Backend::drain_completed_present_events(&mut transform_fixture.events.backend).is_empty(),
+        "unflip does not duplicate CompleteNotify"
+    );
+    let mut idled =
+        Backend::drain_retired_present_idle_events(&mut transform_fixture.events.backend)
+            .into_iter()
+            .map(|event| event.present_id)
+            .collect::<Vec<_>>();
+    idled.sort_unstable();
+    assert_eq!(
+        idled,
+        [701, 702],
+        "both Present pins retire after replacement"
+    );
+    assert!(
+        Backend::drain_retired_present_idle_events(&mut transform_fixture.events.backend)
+            .is_empty()
+    );
+    transform_fixture.finish_after_normal_drain();
 }
 
 #[test]

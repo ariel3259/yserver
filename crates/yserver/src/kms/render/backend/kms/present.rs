@@ -947,16 +947,25 @@ impl KmsBackend {
     ) {
         const PRESENT_CAP: usize = 32;
 
-        if self.pstate.direct.root().unflip_requested
-            && self.store.lookup(src_pixmap_xid).is_some_and(|source| {
-                Some(source) == self.pstate.direct.root().unflip_fallback_source
-            })
-        {
-            self.pstate.direct.root_mut().unflip_fallback_source = None;
-            self.pstate.direct.root_mut().unflip_shadow_ready = true;
-            log::debug!(
-                "scanout_m2: normal Present Copy prepared composed fallback source=0x{src_pixmap_xid:x}"
-            );
+        if let Some(source) = self.store.lookup(src_pixmap_xid) {
+            for scope in self.pstate.direct.active_scopes() {
+                let fallback_matches = self.pstate.direct.get(scope).is_some_and(|owner| {
+                    owner.unflip_requested && owner.unflip_fallback_source == Some(source)
+                });
+                if !fallback_matches {
+                    continue;
+                }
+                let owner = self
+                    .pstate
+                    .direct
+                    .get_mut(scope)
+                    .expect("active direct scope remains present");
+                owner.unflip_fallback_source = None;
+                owner.unflip_shadow_ready = true;
+                log::debug!(
+                    "scanout_m2: normal Present Copy prepared composed fallback source=0x{src_pixmap_xid:x}"
+                );
+            }
         }
 
         if self.recent_present_pixmaps.back() != Some(&(src_pixmap_xid, dst_window_xid)) {
@@ -1027,10 +1036,48 @@ impl KmsBackend {
                     .direct
                     .root_mut()
                     .reset_eligible_direct_probation();
-                self.request_direct_unflip("ineligible_authoritative_root_present");
+                self.request_direct_unflip_for(
+                    DirectScope::Root,
+                    "ineligible_authoritative_root_present",
+                );
                 if self.pstate.direct.root().active() {
                     self.pstate.direct.root_mut().unflip_fallback_source = source_id;
                     self.pstate.direct.root_mut().unflip_shadow_ready = false;
+                }
+                for scope in self.pstate.direct.active_scopes() {
+                    let DirectScope::Output(_) = scope else {
+                        continue;
+                    };
+                    let direct_rect = self.direct_scope_rect(scope);
+                    let visible = match target {
+                        ScanoutM0Target::Cow | ScanoutM0Target::CowDescendant => !self
+                            .direct_shape_chain_hides_root(
+                                candidate.paint_dst_host_xid,
+                                direct_rect,
+                            ),
+                        ScanoutM0Target::Unredirected => self.unredirected_direct_scene_eligible(
+                            candidate.paint_dst_host_xid,
+                            direct_rect,
+                        ),
+                        ScanoutM0Target::Other => true,
+                    };
+                    if !visible {
+                        continue;
+                    }
+                    if let Some(owner) = self.pstate.direct.get_mut(scope) {
+                        owner.reset_eligible_direct_probation();
+                    }
+                    self.request_direct_unflip_for(scope, "ineligible_authoritative_root_present");
+                    if self
+                        .pstate
+                        .direct
+                        .get(scope)
+                        .is_some_and(|owner| owner.active())
+                        && let Some(owner) = self.pstate.direct.get_mut(scope)
+                    {
+                        owner.unflip_fallback_source = source_id;
+                        owner.unflip_shadow_ready = false;
+                    }
                 }
             } else if let Some(scope @ DirectScope::Output(_)) = candidate_scope
                 && !(self.pstate.tearing.is_on() && tearing_gate_ignoring_cursor)
