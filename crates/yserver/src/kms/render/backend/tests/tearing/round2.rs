@@ -804,7 +804,7 @@ fn task5_handoff_unflip_starts_cursor_compose_interval() {
     )
     .expect("hold direct async frame");
     retire_direct_present(&mut backend, &mut state, 74);
-    assert!(backend.pstate.scanout_m2.current.is_some());
+    assert!(backend.pstate.direct.root().current.is_some());
     assert!(
         backend
             .platform
@@ -823,13 +823,13 @@ fn task5_handoff_unflip_starts_cursor_compose_interval() {
         Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
     Backend::set_cursor_hidden(&mut backend, false);
     assert_eq!(
-        backend.pstate.scanout_m2.unflip_reason,
+        backend.pstate.direct.root().unflip_reason,
         Some("tearing_cursor_handoff")
     );
     Backend::maybe_composite(&mut backend).expect("submit grouped cursor handoff");
     assert_eq!(recorder.records().len(), 1);
     assert_eq!(recorder.records()[0].kind, AtomicCommitKind::Scene);
-    assert!(backend.pstate.scanout_m2.current.is_some());
+    assert!(backend.pstate.direct.root().current.is_some());
 
     let compose_time = backend
         .pstate
@@ -857,12 +857,13 @@ fn task5_handoff_unflip_starts_cursor_compose_interval() {
     );
 
     retire_composed_frame(&mut backend, &mut state, 75);
-    assert!(backend.pstate.scanout_m2.current.is_none());
-    assert!(!backend.pstate.scanout_m2.unflip_requested);
+    assert!(backend.pstate.direct.root().current.is_none());
+    assert!(!backend.pstate.direct.root().unflip_requested);
     assert!(
         backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_outputs_to_replace
             .is_empty()
     );
@@ -881,17 +882,18 @@ fn task5_handoff_unflip_starts_cursor_compose_interval() {
     assert!(backend.pstate.tearing.is_on());
     assert_eq!(backend.pstate.tearing.deferred_cursor_wake, None);
     assert!(backend.pstate.tearing.last_cursor_compose.is_some());
-    assert!(!backend.pstate.scanout_m2.active());
-    assert!(!backend.pstate.scanout_m2.unflip_requested);
+    assert!(!backend.pstate.direct.root().active());
+    assert!(!backend.pstate.direct.root().unflip_requested);
     assert!(
         backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_outputs_to_replace
             .is_empty()
     );
-    assert!(backend.pstate.scanout_m2.pending.is_none());
-    assert!(backend.pstate.scanout_m2.queued_successor.is_none());
+    assert!(backend.pstate.direct.root().pending.is_none());
+    assert!(backend.pstate.direct.root().queued_successor.is_none());
     assert!(!backend.scene.has_pending_page_flips());
     assert_direct_queue_drained(&backend);
     assert_commit_sequence(
@@ -1263,7 +1265,8 @@ fn tearing_summary_counts_async_and_fallbacks() {
     assert!(
         backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .deferred_successor_skips
             .is_empty()
     );
@@ -1327,7 +1330,8 @@ fn tearing_on_uncapped_async_stream_reaches_backend_latest_wins_slot() {
     assert_eq!(
         backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .pending
             .as_ref()
             .map(|frame| frame.candidate.present_id),
@@ -1337,7 +1341,8 @@ fn tearing_on_uncapped_async_stream_reaches_backend_latest_wins_slot() {
     assert_eq!(
         backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .queued_successor
             .as_ref()
             .map(|frame| frame.candidate.present_id),
@@ -1347,7 +1352,8 @@ fn tearing_on_uncapped_async_stream_reaches_backend_latest_wins_slot() {
     assert_eq!(
         backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .deferred_successor_skips
             .iter()
             .map(|event| event.present_id)
@@ -1365,7 +1371,8 @@ fn tearing_on_uncapped_async_stream_reaches_backend_latest_wins_slot() {
     assert_eq!(
         backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .completed
             .iter()
             .map(|event| (event.present_id, event.completion_mode))
@@ -1708,7 +1715,7 @@ fn tearing_on_delayed_acquire_stream_survives_core_supersession() {
             .is_none()
         );
     }
-    assert_eq!(backend.pstate.scanout_m2.eligible_root_streak, 7);
+    assert_eq!(backend.pstate.direct.root().eligible_root_streak, 7);
     recorder.clear_records();
     let sink = std::rc::Rc::clone(&backend.platform.devices[0].atomic_commit_sink);
     let before_direct = sink.for_tests_tearing_counts().client_present_direct;
@@ -1894,13 +1901,14 @@ fn tearing_on_delayed_acquire_stream_survives_core_supersession() {
         FRAME_COUNT,
         "all 20 core requests reach the direct Backend entry; tearing={:?}, eligible_root_streak={}, unflip={:?}, completions={completions:?}",
         backend.pstate.tearing.state,
-        backend.pstate.scanout_m2.eligible_root_streak,
-        backend.pstate.scanout_m2.unflip_reason,
+        backend.pstate.direct.root().eligible_root_streak,
+        backend.pstate.direct.root().unflip_reason,
     );
     assert_eq!(
         backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .pending
             .as_ref()
             .map(|frame| frame.candidate.present_id),
@@ -1910,7 +1918,8 @@ fn tearing_on_delayed_acquire_stream_survives_core_supersession() {
     assert_eq!(
         backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .queued_successor
             .as_ref()
             .map(|frame| frame.candidate.present_id),
@@ -1919,7 +1928,8 @@ fn tearing_on_delayed_acquire_stream_survives_core_supersession() {
     );
     let backend_successor_skips: Vec<_> = backend
         .pstate
-        .scanout_m2
+        .direct
+        .root()
         .deferred_successor_skips
         .iter()
         .map(|event| event.present_id)

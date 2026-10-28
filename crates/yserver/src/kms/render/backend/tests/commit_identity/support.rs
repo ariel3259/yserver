@@ -74,6 +74,10 @@ impl AtomicEventFixture {
             ));
             backend.pstate.crtc_key_by_id.insert(1, output_key);
         }
+        backend
+            .pstate
+            .direct
+            .sync_output_count(backend.platform.outputs.len());
         backend.platform.fb_w =
             u16::try_from(output_count * 800).expect("test virtual screen width fits u16");
         backend

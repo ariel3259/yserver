@@ -687,7 +687,7 @@ pub(crate) fn enter_held_direct(
                     backend.scene.has_pending_page_flip(0),
                     backend.scene.cursor_transition_pending(),
                     backend.platform.cursor_commit_in_flight_for_output(0),
-                    backend.pstate.scanout_m2.active(),
+                    backend.pstate.direct.root().active(),
                 )
             })?;
         let id = accepted_event_id(&scene_frame).expect("accepted scene frame has an ID");
@@ -745,7 +745,8 @@ pub(crate) fn enter_held_direct(
                     .events
                     .backend
                     .pstate
-                    .scanout_m2
+                    .direct
+                    .root()
                     .eligible_root_streak,
                 fixture.scene.events.backend.effective_cursor_hidden(),
                 fixture
@@ -792,7 +793,7 @@ pub(crate) fn enter_held_direct(
             "Backend retires the grouped direct frame on output {output_idx}"
         );
     }
-    assert!(fixture.scene.events.backend.pstate.scanout_m2.active());
+    assert!(fixture.scene.events.backend.pstate.direct.root().active());
     Ok(direct)
 }
 
@@ -1345,7 +1346,7 @@ mod tests {
                 .expect("ineligible successor requests a composed unflip"),
             "the successor must request a composed unflip",
         );
-        assert!(fixture.events.backend.pstate.scanout_m2.unflip_requested);
+        assert!(fixture.events.backend.pstate.direct.root().unflip_requested);
 
         let unflip_offset = fixture.events.recorders[&fd].records().len();
         Backend::maybe_composite(&mut fixture.events.backend).expect("submit grouped unflip");
@@ -1365,7 +1366,16 @@ mod tests {
             super::retire_pending_output(&mut fixture.events, &mut delivered, 1, 4),
             unflip_id,
         );
-        assert!(fixture.events.backend.pstate.scanout_m2.current.is_none());
+        assert!(
+            fixture
+                .events
+                .backend
+                .pstate
+                .direct
+                .root()
+                .current
+                .is_none()
+        );
         assert!(fixture.events.backend.present_source_pins.is_empty());
         assert!(Backend::drain_completed_present_events(&mut fixture.events.backend).is_empty());
         let idled = Backend::drain_retired_present_idle_events(&mut fixture.events.backend);

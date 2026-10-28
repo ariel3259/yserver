@@ -217,7 +217,7 @@ impl KmsBackend {
                     root_host_xid: self.core.window_id,
                 },
             };
-            self.pstate.scanout_m2.cursor_bound_all = false;
+            self.pstate.direct.root_mut().cursor_bound_all = false;
             self.pstate.tearing.hide_failed_logged = false;
             log::info!(
                 "kms: entering tearing for window=0x{:x} crtc_epoch={}",
@@ -238,15 +238,15 @@ impl KmsBackend {
         source_id: Option<crate::kms::render::store::DrawableId>,
     ) {
         if authoritative_root
-            && self.pstate.scanout_m2.active()
-            && (self.pstate.scanout_m2.unflip_requested || self.pstate.scanout_m2.hold_direct)
+            && self.pstate.direct.root().active()
+            && (self.pstate.direct.root().unflip_requested || self.pstate.direct.root().hold_direct)
             && matches!(
                 self.pstate.tearing.state,
                 TearingState::On { window, .. } if window == candidate.dst_window_xid
             )
         {
-            self.pstate.scanout_m2.unflip_fallback_source = source_id;
-            self.pstate.scanout_m2.unflip_shadow_ready = false;
+            self.pstate.direct.root_mut().unflip_fallback_source = source_id;
+            self.pstate.direct.root_mut().unflip_shadow_ready = false;
         }
     }
 
@@ -352,12 +352,14 @@ impl KmsBackend {
         phase_b_flip_in_flight_for_scheduler(
             self.scene.has_pending_page_flip(output_idx),
             self.pstate
-                .scanout_m2
+                .direct
+                .root()
                 .pending
                 .as_ref()
                 .is_some_and(|frame| frame.awaiting_outputs.contains(&output_idx)),
             self.pstate
-                .scanout_m2
+                .direct
+                .root()
                 .unflip_outputs_to_replace
                 .contains(&output_idx),
         )
@@ -774,14 +776,13 @@ impl KmsBackend {
     ) {
         const PRESENT_CAP: usize = 32;
 
-        if self.pstate.scanout_m2.unflip_requested
-            && self
-                .store
-                .lookup(src_pixmap_xid)
-                .is_some_and(|source| Some(source) == self.pstate.scanout_m2.unflip_fallback_source)
+        if self.pstate.direct.root().unflip_requested
+            && self.store.lookup(src_pixmap_xid).is_some_and(|source| {
+                Some(source) == self.pstate.direct.root().unflip_fallback_source
+            })
         {
-            self.pstate.scanout_m2.unflip_fallback_source = None;
-            self.pstate.scanout_m2.unflip_shadow_ready = true;
+            self.pstate.direct.root_mut().unflip_fallback_source = None;
+            self.pstate.direct.root_mut().unflip_shadow_ready = true;
             log::debug!(
                 "scanout_m2: normal Present Copy prepared composed fallback source=0x{src_pixmap_xid:x}"
             );
@@ -826,7 +827,7 @@ impl KmsBackend {
         );
         self.platform.set_tearing_on(self.pstate.tearing.is_on());
         self.register_tearing_copy_fallback(candidate, authoritative_root, source_id);
-        if self.pstate.scanout_m2.reentry_blocked_until_composed {
+        if self.pstate.direct.root().reentry_blocked_until_composed {
             return Ok(false);
         }
         // No transformed CRTC is ever flipped directly (spec D5). During
@@ -843,11 +844,14 @@ impl KmsBackend {
             // ownership contract and must expose the Copy fallback.
             if authoritative_root && !(self.pstate.tearing.is_on() && tearing_gate_ignoring_cursor)
             {
-                self.pstate.scanout_m2.reset_eligible_root_probation();
+                self.pstate
+                    .direct
+                    .root_mut()
+                    .reset_eligible_root_probation();
                 self.request_direct_unflip("ineligible_authoritative_root_present");
-                if self.pstate.scanout_m2.active() {
-                    self.pstate.scanout_m2.unflip_fallback_source = source_id;
-                    self.pstate.scanout_m2.unflip_shadow_ready = false;
+                if self.pstate.direct.root().active() {
+                    self.pstate.direct.root_mut().unflip_fallback_source = source_id;
+                    self.pstate.direct.root_mut().unflip_shadow_ready = false;
                 }
             }
             return Ok(false);
@@ -866,7 +870,7 @@ impl KmsBackend {
             "direct candidate and completion must share one CRTC epoch"
         );
 
-        if !self.pstate.scanout_m2.admit_eligible_root() {
+        if !self.pstate.direct.root_mut().admit_eligible_root() {
             return Ok(false);
         }
 
@@ -874,7 +878,7 @@ impl KmsBackend {
         // overlay, or failed direct successor) before allowing direct re-entry.
         // Otherwise a fast Present stream can repeatedly replace a partial
         // dual-head unflip and starve the CRTC that did not submit yet.
-        if self.pstate.scanout_m2.unflip_requested {
+        if self.pstate.direct.root().unflip_requested {
             return Ok(false);
         }
 
@@ -886,10 +890,10 @@ impl KmsBackend {
             self.request_direct_unflip("eligible_direct_successor_paint_target_missing");
             return Ok(false);
         };
-        if self.pstate.scanout_m2.active() {
+        if self.pstate.direct.root().active() {
             // Set only on an actual fallback below. An eligible successor
             // queued behind a direct flip must leave direct ownership intact.
-            self.pstate.scanout_m2.unflip_fallback_source = None;
+            self.pstate.direct.root_mut().unflip_fallback_source = None;
         }
         let framebuffer_ready = self
             .pstate
@@ -923,15 +927,15 @@ impl KmsBackend {
             async_outcome: crate::drm::async_flip::AsyncOutcome::NotRequested,
         };
 
-        if self.pstate.scanout_m2.pending.is_some() {
+        if self.pstate.direct.root().pending.is_some() {
             self.retain_direct_present_wake(&frame.event);
             self.queue_direct_successor(frame);
             return Ok(true);
         }
         if self.scene.has_pending_page_flips() {
             self.request_direct_unflip("eligible_direct_successor_scene_flip_pending");
-            self.pstate.scanout_m2.unflip_fallback_source = Some(source_id);
-            self.pstate.scanout_m2.unflip_shadow_ready = false;
+            self.pstate.direct.root_mut().unflip_fallback_source = Some(source_id);
+            self.pstate.direct.root_mut().unflip_shadow_ready = false;
             <Self as Backend>::release_present_source(self, source_pin);
             <Self as Backend>::release_present_source(self, fallback_target_pin);
             return Ok(false);
@@ -941,7 +945,7 @@ impl KmsBackend {
             .platform
             .scanout_commit_in_flight_for_outputs(&direct_outputs)
         {
-            if self.pstate.scanout_m2.current.is_some() {
+            if self.pstate.direct.root().current.is_some() {
                 // A fully-retired direct frame owns the current slot. Keep
                 // this Present in the existing latest-wins successor slot;
                 // the scheduling pass submits it after the last cursor-only
@@ -956,8 +960,8 @@ impl KmsBackend {
             // path and release both pins. There must be no queued-only direct
             // state for the cursor retirement to discover later.
             self.request_direct_unflip("eligible_direct_present_cursor_commit_pending");
-            self.pstate.scanout_m2.unflip_fallback_source = Some(source_id);
-            self.pstate.scanout_m2.unflip_shadow_ready = false;
+            self.pstate.direct.root_mut().unflip_fallback_source = Some(source_id);
+            self.pstate.direct.root_mut().unflip_shadow_ready = false;
             <Self as Backend>::release_present_source(self, source_pin);
             <Self as Backend>::release_present_source(self, fallback_target_pin);
             return Ok(false);
@@ -971,18 +975,21 @@ impl KmsBackend {
             self.request_direct_unflip("eligible_direct_successor_submit_failed");
             <Self as Backend>::release_present_source(self, source_pin);
             <Self as Backend>::release_present_source(self, fallback_target_pin);
-            self.pstate.scanout_m2.reset_eligible_root_probation();
+            self.pstate
+                .direct
+                .root_mut()
+                .reset_eligible_root_probation();
             return Err(error);
         }
 
         self.retain_direct_present_wake(&frame.event);
-        self.pstate.scanout_m2.pending = Some(frame);
-        self.pstate.scanout_m2.hold_direct = true;
-        self.pstate.scanout_m2.unflip_requested = false;
-        self.pstate.scanout_m2.unflip_reason = None;
-        self.pstate.scanout_m2.unflip_last_reason = None;
-        self.pstate.scanout_m2.unflip_fallback_source = None;
-        self.pstate.scanout_m2.unflip_shadow_ready = false;
+        self.pstate.direct.root_mut().pending = Some(frame);
+        self.pstate.direct.root_mut().hold_direct = true;
+        self.pstate.direct.root_mut().unflip_requested = false;
+        self.pstate.direct.root_mut().unflip_reason = None;
+        self.pstate.direct.root_mut().unflip_last_reason = None;
+        self.pstate.direct.root_mut().unflip_fallback_source = None;
+        self.pstate.direct.root_mut().unflip_shadow_ready = false;
         log::debug!(
             "scanout_m2: live direct submit source_id={} present_id={} outputs={}",
             source_id.as_u64(),
@@ -1424,7 +1431,7 @@ impl KmsBackend {
         &mut self,
     ) -> Vec<yserver_core::backend::CompletedPresentEvent> {
         let mut completed = self.drain_completed_present_events_impl();
-        completed.append(&mut self.pstate.scanout_m2.completed);
+        completed.append(&mut self.pstate.direct.root_mut().completed);
         for event in &completed {
             if event.completion_mode != yserver_protocol::x11::present::COMPLETE_MODE_SKIP {
                 continue;

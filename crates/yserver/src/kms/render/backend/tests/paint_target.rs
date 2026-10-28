@@ -2990,7 +2990,7 @@ fn cow_with_child_under_direct_scanout(
     let cow_id = b.cow_id.expect("COW id");
     let _ = install_direct_frame_for_target_test(b, target_xid, cow_id, true);
     // Keep this free of Vulkan: the shadow is what `prepare_cow_release` makes.
-    b.pstate.scanout_m2.unflip_shadow_ready = true;
+    b.pstate.direct.root_mut().unflip_shadow_ready = true;
     child
 }
 
@@ -3036,7 +3036,7 @@ fn last_release_under_direct_scanout_defers_backend_retirement() {
         b.store.get(cow_id).is_some(),
         "COW storage waits for scanout"
     );
-    assert!(b.pstate.scanout_m2.unflip_requested);
+    assert!(b.pstate.direct.root().unflip_requested);
 
     b.stop_direct_after_scanout_replaced("deferred COW retirement test");
 

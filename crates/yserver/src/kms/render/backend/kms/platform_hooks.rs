@@ -57,7 +57,7 @@ impl Platform for PlatformBackend {
     }
 
     fn direct_scanout_owns_frame(b: &KmsBackend) -> bool {
-        b.pstate.scanout_m2.active()
+        b.pstate.direct.root().active()
     }
 
     fn tearing_active(b: &KmsBackend) -> bool {
@@ -163,7 +163,7 @@ impl Platform for PlatformBackend {
     }
 
     fn hide_cursor_under_direct_scanout(b: &mut KmsBackend) {
-        if !b.pstate.scanout_m2.active() {
+        if !b.pstate.direct.root().active() {
             return;
         }
         if !b.platform.any_cursor_plane_visible() {
@@ -171,7 +171,8 @@ impl Platform for PlatformBackend {
                 b.platform.clear_direct_cursor_retry(output_idx);
             }
             b.pstate
-                .scanout_m2
+                .direct
+                .root_mut()
                 .clear_all_direct_cursor_refresh_pending();
             if !b.sync_direct_cursor_scene_state() {
                 b.request_direct_unflip("cursor_scene_sync_failed");
@@ -183,7 +184,8 @@ impl Platform for PlatformBackend {
             if !b.platform.cursor_plane_visible_for_output(output_idx) {
                 b.platform.clear_direct_cursor_retry(output_idx);
                 b.pstate
-                    .scanout_m2
+                    .direct
+                    .root_mut()
                     .clear_direct_cursor_refresh_pending(output_idx);
                 continue;
             }
@@ -198,7 +200,8 @@ impl Platform for PlatformBackend {
                 Ok(()) => {
                     b.platform.clear_direct_cursor_retry(output_idx);
                     b.pstate
-                        .scanout_m2
+                        .direct
+                        .root_mut()
                         .clear_direct_cursor_refresh_pending(output_idx);
                 }
                 Err(error)
@@ -207,7 +210,8 @@ impl Platform for PlatformBackend {
                 {
                     b.platform.clear_direct_cursor_retry(output_idx);
                     b.pstate
-                        .scanout_m2
+                        .direct
+                        .root_mut()
                         .mark_direct_cursor_refresh_pending(output_idx);
                     log::debug!(
                         "scanout_m2: direct cursor hide deferred on output {output_idx}; retrying on CRTC event"
@@ -287,7 +291,7 @@ impl Platform for PlatformBackend {
                 Err(e) => log::debug!("render cursor mixed path: move failed: {e}"),
             }
             b.scene.wake_for_damage();
-        } else if !b.pstate.scanout_m2.active()
+        } else if !b.pstate.direct.root().active()
             && cw > 0
             && ch > 0
             && b.platform
@@ -319,7 +323,7 @@ impl Platform for PlatformBackend {
     }
 
     fn prepare_cow_release(b: &mut KmsBackend) -> io::Result<()> {
-        if b.pstate.scanout_m2.active() {
+        if b.pstate.direct.root().active() {
             // Do this while cow_id and its storage owner are authoritative.
             // Failure leaves the COW and the direct pins untouched, so core
             // can keep the caller's claim and let the compositor retry, or
@@ -332,7 +336,7 @@ impl Platform for PlatformBackend {
     }
 
     fn defer_cow_release(b: &mut KmsBackend) -> bool {
-        if b.pstate.scanout_m2.active() {
+        if b.pstate.direct.root().active() {
             b.request_direct_unflip("release_last_overlay_window");
             b.deferred_cow_release = true;
             return true;
@@ -792,7 +796,7 @@ impl Platform for PlatformBackend {
     fn drain_retired_present_idle_events(
         b: &mut KmsBackend,
     ) -> Vec<yserver_core::backend::CompletedPresentEvent> {
-        std::mem::take(&mut b.pstate.scanout_m2.idled)
+        std::mem::take(&mut b.pstate.direct.root_mut().idled)
     }
 
     fn present_crtc_clock_epoch(b: &KmsBackend, crtc_id: u32) -> u64 {

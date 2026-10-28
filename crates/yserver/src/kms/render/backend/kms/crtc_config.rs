@@ -57,13 +57,15 @@ impl KmsBackend {
                     .is_some_and(|pool| pool.display_pool().has_pending_pageflip())
                     || self
                         .pstate
-                        .scanout_m2
+                        .direct
+                        .root()
                         .pending
                         .as_ref()
                         .is_some_and(|frame| frame.awaiting_outputs.contains(output_idx))
                     || self
                         .pstate
-                        .scanout_m2
+                        .direct
+                        .root()
                         .unflip_outputs_to_replace
                         .contains(output_idx)
                     || self
@@ -81,7 +83,7 @@ impl KmsBackend {
         self.exit_tearing("topology_mutation");
         self.bump_crtc_config_topology_epoch(context);
         let old_pending_pageflips = self.pending_pageflip_crtcs();
-        if self.pstate.scanout_m2.active() {
+        if self.pstate.direct.root().active() {
             if let Err(error) = self.teardown_direct_before_topology_requery(context) {
                 // This also covers failure to materialize the direct source's
                 // COW shadow. Consuming the topology event while retaining an
@@ -141,6 +143,9 @@ impl KmsBackend {
         restore_old_topology: bool,
         original: io::Error,
     ) -> io::Error {
+        self.pstate
+            .direct
+            .sync_output_count(self.platform.outputs.len());
         let scene_recovery_failed = if let Err(scene_error) = self
             .scene
             .rebuild_outputs(&self.platform, &self.platform.scene_output_layouts())
@@ -824,6 +829,9 @@ impl KmsBackend {
             );
             return Err(self.recover_failed_crtc_config(restore_old_on_failure, error));
         }
+        self.pstate
+            .direct
+            .sync_output_count(self.platform.outputs.len());
 
         {
             let entry = self.pstate.randr_id_alloc.entry_mut(&pending.output_key);
@@ -1199,7 +1207,9 @@ impl KmsBackend {
                 );
             }
         }
-
+        self.pstate
+            .direct
+            .sync_output_count(self.platform.outputs.len());
         // Full modesets invalidate the kernel's cursor-plane comparison even
         // when a failed best-effort detach retained a live sprite lease.
         self.platform.invalidate_live_cursor_applied();
@@ -1349,7 +1359,7 @@ impl KmsBackend {
         output_key: &OutputKey,
         change: PerCrtcChange,
     ) -> Option<&'static str> {
-        let direct = &self.pstate.scanout_m2;
+        let direct = &self.pstate.direct.root();
         if direct.active()
             || !direct.unflip_outputs_to_replace.is_empty()
             || !direct.unflip_awaiting_outputs.is_empty()
@@ -1545,6 +1555,9 @@ impl KmsBackend {
             }
             return Err(error);
         }
+        self.pstate
+            .direct
+            .sync_output_count(self.platform.outputs.len());
 
         let idx = existing_idx.unwrap_or(self.platform.outputs.len() - 1);
         self.platform.invalidate_bo_generations_at(idx);
@@ -1597,6 +1610,9 @@ impl KmsBackend {
                 return Err(error);
             }
         }
+        self.pstate
+            .direct
+            .sync_output_count(self.platform.outputs.len());
         self.scene.remove_output(idx);
         self.prune_armed_targets_to_live_outputs();
         self.record_crtc_config_off(output_key);

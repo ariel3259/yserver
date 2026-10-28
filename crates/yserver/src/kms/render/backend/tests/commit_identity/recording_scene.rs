@@ -329,7 +329,7 @@ impl RecordingSceneFixture {
     pub(crate) fn assert_quiescent(&self) {
         self.events.assert_quiescent();
         let backend = &self.events.backend;
-        let direct = &backend.pstate.scanout_m2;
+        let direct = &backend.pstate.direct.root();
         // Mutation: retain direct/successor/unflip obligations or a source pin after normal completion.
         assert!(
             direct.pending.is_none(),
@@ -905,6 +905,10 @@ pub(in crate::kms::render::backend::tests) fn build_recording_scene_backend(
             backend.platform.outputs[1].x = 800;
         }
     }
+    backend
+        .pstate
+        .direct
+        .sync_output_count(backend.platform.outputs.len());
     let layouts = backend.platform.scene_output_layouts();
     backend.scene = SceneCompositor::new(&backend.platform, &layouts)
         .map_err(|error| format!("live SceneCompositor unavailable: {error:?}"))?;

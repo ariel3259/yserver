@@ -316,6 +316,10 @@ fn direct_backend(output_count: usize) -> Option<KmsBackend> {
         backend.platform.fb_w = 800;
         backend.platform.fb_h = 600;
     }
+    backend
+        .pstate
+        .direct
+        .sync_output_count(backend.platform.outputs.len());
     for layout in &backend.platform.outputs {
         backend
             .pstate
@@ -327,8 +331,8 @@ fn direct_backend(output_count: usize) -> Option<KmsBackend> {
     backend.scene = crate::kms::render::scene::SceneCompositor::new(&backend.platform, &layouts)
         .expect("construct direct test scene");
     backend.scene.scene_structure_dirty = false;
-    backend.pstate.scanout_m2.cursor_bound_all = true;
-    backend.pstate.scanout_m2.eligible_root_streak =
+    backend.pstate.direct.root_mut().cursor_bound_all = true;
+    backend.pstate.direct.root_mut().eligible_root_streak =
         crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1;
     backend.platform.requested_flip_timing = crate::drm::async_flip::FlipTiming::Async;
     for device in &mut backend.platform.devices {
@@ -404,10 +408,10 @@ fn qualify_test_direct_async(
         );
     }
     assert_eq!(recorder.records().len(), before_warmup);
-    assert_eq!(backend.pstate.scanout_m2.eligible_root_streak, 7);
-    assert!(backend.pstate.scanout_m2.current.is_none());
-    assert!(backend.pstate.scanout_m2.pending.is_none());
-    assert!(backend.pstate.scanout_m2.queued_successor.is_none());
+    assert_eq!(backend.pstate.direct.root().eligible_root_streak, 7);
+    assert!(backend.pstate.direct.root().current.is_none());
+    assert!(backend.pstate.direct.root().pending.is_none());
+    assert!(backend.pstate.direct.root().queued_successor.is_none());
     recorder.clear_records();
 }
 
@@ -583,7 +587,7 @@ fn qualify_direct_async(
             backend.pstate.tearing.state,
             backend.pstate.tearing.probation,
             backend.pstate.tearing.probation_owner,
-            backend.pstate.scanout_m2.eligible_root_streak,
+            backend.pstate.direct.root().eligible_root_streak,
             backend.scene.cursor_mode(),
             backend.scene.has_pending_page_flips(),
         );
@@ -853,12 +857,13 @@ fn assert_tearing_off(backend: &KmsBackend) {
 }
 
 fn assert_direct_queue_drained(backend: &KmsBackend) {
-    assert!(backend.pstate.scanout_m2.pending.is_none());
-    assert!(backend.pstate.scanout_m2.queued_successor.is_none());
+    assert!(backend.pstate.direct.root().pending.is_none());
+    assert!(backend.pstate.direct.root().queued_successor.is_none());
     assert!(
         backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .deferred_successor_skips
             .is_empty()
     );
@@ -1122,7 +1127,7 @@ fn present_until_direct_async(
         assert!(!backend.platform.any_cursor_plane_visible());
         retire_direct_present(backend, state, u32::try_from(offset + 60).unwrap());
         if backend.pstate.tearing.is_on() && record.kind == AtomicCommitKind::Async {
-            assert!(backend.pstate.scanout_m2.active());
+            assert!(backend.pstate.direct.root().active());
             return;
         }
         assert_eq!(record.kind, AtomicCommitKind::Scene);
@@ -1130,7 +1135,7 @@ fn present_until_direct_async(
     panic!(
         "transparent cursor did not reach direct async; tearing={:?}, m2_streak={}, commits={:?}",
         backend.pstate.tearing.state,
-        backend.pstate.scanout_m2.eligible_root_streak,
+        backend.pstate.direct.root().eligible_root_streak,
         recorder
             .records()
             .iter()
@@ -1477,9 +1482,9 @@ fn lifecycle_teardown_exits_protocol_owner_without_direct_frame() {
                 ..
             }
         ));
-        assert!(backend.pstate.scanout_m2.pending.is_none());
-        assert!(backend.pstate.scanout_m2.current.is_none());
-        assert!(backend.pstate.scanout_m2.queued_successor.is_none());
+        assert!(backend.pstate.direct.root().pending.is_none());
+        assert!(backend.pstate.direct.root().current.is_none());
+        assert!(backend.pstate.direct.root().queued_successor.is_none());
         assert_eq!(
             recorder.records().len(),
             1,
@@ -1495,9 +1500,9 @@ fn lifecycle_teardown_exits_protocol_owner_without_direct_frame() {
         }
 
         assert_tearing_off(&backend);
-        assert!(backend.pstate.scanout_m2.pending.is_none());
-        assert!(backend.pstate.scanout_m2.current.is_none());
-        assert!(backend.pstate.scanout_m2.queued_successor.is_none());
+        assert!(backend.pstate.direct.root().pending.is_none());
+        assert!(backend.pstate.direct.root().current.is_none());
+        assert!(backend.pstate.direct.root().queued_successor.is_none());
         assert_commit_sequence(&recorder, &[AtomicCommitKind::Scene]);
     }
 }
@@ -1538,7 +1543,7 @@ fn non_async_authoritative_present_resets_probation_during_reentry_barrier() {
         retire_composed_frame(&mut backend, &mut state, index as u32 + 1);
     }
     assert_eq!(backend.pstate.tearing.probation, 7);
-    assert_eq!(backend.pstate.scanout_m2.eligible_root_streak, 7);
+    assert_eq!(backend.pstate.direct.root().eligible_root_streak, 7);
     assert!(
         try_direct_present_with_live_storage(
             &mut backend,
@@ -1552,7 +1557,7 @@ fn non_async_authoritative_present_resets_probation_during_reentry_barrier() {
     );
     assert!(backend.pstate.tearing.is_on());
     retire_direct_present(&mut backend, &mut state, 8);
-    assert!(backend.pstate.scanout_m2.current.is_some());
+    assert!(backend.pstate.direct.root().current.is_some());
 
     let origin = Some(OriginContext {
         client_id: ClientId(7),
@@ -1574,17 +1579,18 @@ fn non_async_authoritative_present_resets_probation_during_reentry_barrier() {
         .expect("toggle root overlay while direct scanout is active");
     assert!(!backend.scene.root_overlay.is_empty());
     Backend::maybe_composite(&mut backend).expect("submit grouped composed unflip");
-    assert!(backend.pstate.scanout_m2.unflip_requested);
+    assert!(backend.pstate.direct.root().unflip_requested);
     assert!(
         !backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_outputs_to_replace
             .is_empty()
     );
     retire_composed_frame(&mut backend, &mut state, 9);
-    assert!(backend.pstate.scanout_m2.reentry_blocked_until_composed);
-    assert!(backend.pstate.scanout_m2.current.is_none());
+    assert!(backend.pstate.direct.root().reentry_blocked_until_composed);
+    assert!(backend.pstate.direct.root().current.is_none());
     assert_tearing_off(&backend);
 
     Backend::fill_rectangle(&mut backend, origin, root, u32::MAX, 10, 10, 50, 1)
@@ -1594,11 +1600,11 @@ fn non_async_authoritative_present_resets_probation_during_reentry_barrier() {
     assert!(try_direct_present_for_window(&mut backend, 848, WINDOW, width, height, 0).is_none());
     assert_eq!(backend.pstate.tearing.probation, 0);
     assert_eq!(backend.pstate.tearing.probation_owner, None);
-    assert!(backend.pstate.scanout_m2.reentry_blocked_until_composed);
+    assert!(backend.pstate.direct.root().reentry_blocked_until_composed);
     assert_tearing_off(&backend);
     damage_root_and_composite(&mut backend);
     retire_composed_frame(&mut backend, &mut state, 10);
-    assert!(!backend.pstate.scanout_m2.reentry_blocked_until_composed);
+    assert!(!backend.pstate.direct.root().reentry_blocked_until_composed);
     assert_commit_sequence(&recorder, &[AtomicCommitKind::Scene; 4]);
     assert_direct_queue_drained(&backend);
 }
@@ -1679,9 +1685,9 @@ fn dpms_off_exits_tearing_and_on_requires_fresh_probation() {
     Backend::set_dpms_power(&mut backend, 3).expect("DPMS off fixture");
     assert_tearing_off(&backend);
     assert!(backend.platform.async_ledger.for_tests_is_empty());
-    assert!(backend.pstate.scanout_m2.pending.is_none());
-    assert!(backend.pstate.scanout_m2.queued_successor.is_none());
-    assert!(backend.pstate.scanout_m2.current.is_none());
+    assert!(backend.pstate.direct.root().pending.is_none());
+    assert!(backend.pstate.direct.root().queued_successor.is_none());
+    assert!(backend.pstate.direct.root().current.is_none());
 
     Backend::set_dpms_power(&mut backend, 0).expect("DPMS on fixture");
     Backend::set_cursor_hidden(&mut backend, true);
@@ -1816,14 +1822,14 @@ fn vt_release_exits_tearing_and_resume_needs_probation() {
         crate::kms::render::scene::CursorPlaneMode::Hidden
     );
     assert!(backend.pstate.tearing.is_on());
-    assert!(backend.pstate.scanout_m2.current.is_none());
+    assert!(backend.pstate.direct.root().current.is_none());
 
     Backend::finish_vt_release(&mut backend, &mut state, &InputInventory::default());
     assert_tearing_off(&backend);
     assert!(backend.platform.async_ledger.for_tests_is_empty());
-    assert!(backend.pstate.scanout_m2.pending.is_none());
-    assert!(backend.pstate.scanout_m2.queued_successor.is_none());
-    assert!(backend.pstate.scanout_m2.current.is_none());
+    assert!(backend.pstate.direct.root().pending.is_none());
+    assert!(backend.pstate.direct.root().queued_successor.is_none());
+    assert!(backend.pstate.direct.root().current.is_none());
     Backend::on_vt_acquire(&mut backend, &mut state);
     assert_tearing_off(&backend);
     assert_direct_queue_drained(&backend);
@@ -1837,7 +1843,7 @@ fn vt_release_exits_tearing_and_resume_needs_probation() {
         "resumed VT must queue the repaint before new Presents"
     );
     retire_composed_frame(&mut backend, &mut state, 3);
-    assert!(!backend.pstate.scanout_m2.reentry_blocked_until_composed);
+    assert!(!backend.pstate.direct.root().reentry_blocked_until_composed);
     assert_eq!(
         backend.scene.cursor_mode(),
         crate::kms::render::scene::CursorPlaneMode::Hidden
@@ -1868,7 +1874,7 @@ fn vt_release_exits_tearing_and_resume_needs_probation() {
             assert_eq!(recorder.records().len(), before_present);
             assert_eq!(backend.pstate.tearing.probation, index as u8 + 1);
             assert_eq!(
-                backend.pstate.scanout_m2.eligible_root_streak,
+                backend.pstate.direct.root().eligible_root_streak,
                 index as u8 + 1
             );
             damage_root_and_composite(&mut backend);
@@ -1968,9 +1974,9 @@ fn topology_change_exits_tearing() {
         Backend::apply_crtc_config(&mut backend, output.output_id, &connector, None, 0, 0);
     assert_tearing_off(&backend);
     assert!(backend.platform.async_ledger.for_tests_is_empty());
-    assert!(backend.pstate.scanout_m2.pending.is_none());
-    assert!(backend.pstate.scanout_m2.queued_successor.is_none());
-    assert!(backend.pstate.scanout_m2.current.is_none());
+    assert!(backend.pstate.direct.root().pending.is_none());
+    assert!(backend.pstate.direct.root().queued_successor.is_none());
+    assert!(backend.pstate.direct.root().current.is_none());
     assert_commit_sequence(&recorder, &[AtomicCommitKind::Scene]);
 }
 
@@ -2025,7 +2031,8 @@ fn async_direct_request_has_flag_no_out_fence_no_cursor() {
     assert_eq!(
         backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .pending
             .as_ref()
             .map(|frame| frame.async_outcome),
@@ -2033,12 +2040,13 @@ fn async_direct_request_has_flag_no_out_fence_no_cursor() {
     );
     let mut state = ServerState::new();
     retire_recorded_direct_flip(&mut backend, &mut state, 1);
-    assert!(backend.pstate.scanout_m2.pending.is_none());
-    assert!(backend.pstate.scanout_m2.queued_successor.is_none());
+    assert!(backend.pstate.direct.root().pending.is_none());
+    assert!(backend.pstate.direct.root().queued_successor.is_none());
     assert!(
         backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .deferred_successor_skips
             .is_empty()
     );
@@ -2184,7 +2192,7 @@ fn vsync_requests_unchanged() {
     assert_eq!(direct_records[0].properties, expected_direct);
     let mut direct_state = ServerState::new();
     retire_recorded_direct_flip(&mut direct, &mut direct_state, 1);
-    assert!(direct.pstate.scanout_m2.pending.is_none());
+    assert!(direct.pstate.direct.root().pending.is_none());
     assert!(
         direct
             .platform
@@ -2297,7 +2305,8 @@ fn async_einval_resubmits_same_frame_vsync() {
     assert_eq!(
         backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .pending
             .as_ref()
             .map(|frame| frame.async_outcome),
@@ -2357,19 +2366,21 @@ fn async_einval_resubmits_same_frame_vsync() {
     assert_eq!(
         backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .pending
             .as_ref()
             .map(|frame| frame.async_outcome),
         Some(crate::drm::async_flip::AsyncOutcome::Accepted),
     );
     retire_recorded_direct_flip(&mut backend, &mut state, 2);
-    assert!(backend.pstate.scanout_m2.pending.is_none());
-    assert!(backend.pstate.scanout_m2.queued_successor.is_none());
+    assert!(backend.pstate.direct.root().pending.is_none());
+    assert!(backend.pstate.direct.root().queued_successor.is_none());
     assert!(
         backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .deferred_successor_skips
             .is_empty()
     );
@@ -2411,7 +2422,8 @@ fn multi_crtc_async_einval_suspends_after_two() {
     assert_eq!(
         backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .pending
             .as_ref()
             .map(|frame| frame.async_outcome),
@@ -2439,7 +2451,8 @@ fn multi_crtc_async_einval_suspends_after_two() {
     assert_eq!(
         backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .pending
             .as_ref()
             .map(|frame| frame.async_outcome),
@@ -2486,19 +2499,21 @@ fn multi_crtc_async_einval_suspends_after_two() {
     assert_eq!(
         backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .pending
             .as_ref()
             .map(|frame| frame.async_outcome),
         Some(crate::drm::async_flip::AsyncOutcome::Accepted)
     );
     retire_recorded_direct_flip(&mut backend, &mut state, 50);
-    assert!(backend.pstate.scanout_m2.pending.is_none());
-    assert!(backend.pstate.scanout_m2.queued_successor.is_none());
+    assert!(backend.pstate.direct.root().pending.is_none());
+    assert!(backend.pstate.direct.root().queued_successor.is_none());
     assert!(
         backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .deferred_successor_skips
             .is_empty()
     );
@@ -2543,7 +2558,7 @@ fn direct_shape_change_on_ebusy_resets_consecutive_einval_history() {
             .raw_os_error(),
         Some(libc::EBUSY),
     );
-    assert!(backend.pstate.scanout_m2.pending.is_none());
+    assert!(backend.pstate.direct.root().pending.is_none());
     assert_eq!(
         backend
             .platform
@@ -2552,7 +2567,7 @@ fn direct_shape_change_on_ebusy_resets_consecutive_einval_history() {
         1,
     );
 
-    backend.pstate.scanout_m2.eligible_root_streak =
+    backend.pstate.direct.root_mut().eligible_root_streak =
         crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1;
     set_direct_second_crtc(&mut backend, 105);
     let (candidate_b, event_b, shape_b) = prepare_direct_present(&mut backend, 72, 1600, 600);
@@ -2571,17 +2586,18 @@ fn direct_shape_change_on_ebusy_resets_consecutive_einval_history() {
         0,
         "submitting shape B resets A even when B returns EBUSY",
     );
-    assert!(backend.pstate.scanout_m2.pending.is_none());
-    assert!(backend.pstate.scanout_m2.queued_successor.is_none());
+    assert!(backend.pstate.direct.root().pending.is_none());
+    assert!(backend.pstate.direct.root().queued_successor.is_none());
     assert!(
         backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .deferred_successor_skips
             .is_empty()
     );
 
-    backend.pstate.scanout_m2.eligible_root_streak =
+    backend.pstate.direct.root_mut().eligible_root_streak =
         crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1;
     set_direct_second_crtc(&mut backend, 201);
     let shape_a_again = try_direct_present(&mut backend, 73, 1600, 600);
@@ -2589,7 +2605,8 @@ fn direct_shape_change_on_ebusy_resets_consecutive_einval_history() {
     assert_eq!(
         backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .pending
             .as_ref()
             .map(|frame| frame.async_outcome),
@@ -2615,12 +2632,13 @@ fn direct_shape_change_on_ebusy_resets_consecutive_einval_history() {
         records[3].properties[0].value
     );
     retire_recorded_direct_flip(&mut backend, &mut state, 2);
-    assert!(backend.pstate.scanout_m2.pending.is_none());
-    assert!(backend.pstate.scanout_m2.queued_successor.is_none());
+    assert!(backend.pstate.direct.root().pending.is_none());
+    assert!(backend.pstate.direct.root().queued_successor.is_none());
     assert!(
         backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .deferred_successor_skips
             .is_empty()
     );
@@ -2669,12 +2687,13 @@ fn async_ebusy_is_not_suspension() {
             .async_ledger
             .allows(crate::drm::async_flip::AsyncStream::Direct, &shape,)
     );
-    assert!(backend.pstate.scanout_m2.pending.is_none());
-    assert!(backend.pstate.scanout_m2.queued_successor.is_none());
+    assert!(backend.pstate.direct.root().pending.is_none());
+    assert!(backend.pstate.direct.root().queued_successor.is_none());
     assert!(
         backend
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .deferred_successor_skips
             .is_empty()
     );
@@ -2859,8 +2878,8 @@ fn composed_frame_submits_without_waiting_for_vblank_tick() {
     assert!(!backend.scene.has_pending_page_flips());
     assert!(backend.pending_present_batches.is_empty());
     assert!(backend.pstate.tearing.is_on());
-    assert!(!backend.pstate.scanout_m2.active());
-    assert!(!backend.pstate.scanout_m2.unflip_requested);
+    assert!(!backend.pstate.direct.root().active());
+    assert!(!backend.pstate.direct.root().unflip_requested);
     assert_direct_queue_drained(&backend);
     assert_commit_sequence(
         &recorder,
@@ -2921,7 +2940,7 @@ fn show_cursor_during_held_direct_hidden_tearing_makes_cursor_visible() {
     )
     .expect("hold direct async frame");
     retire_direct_present(&mut backend, &mut state, 42);
-    assert!(backend.pstate.scanout_m2.current.is_some());
+    assert!(backend.pstate.direct.root().current.is_some());
     assert!(!backend.platform.any_cursor_plane_visible());
     assert!(
         backend
@@ -2931,17 +2950,17 @@ fn show_cursor_during_held_direct_hidden_tearing_makes_cursor_visible() {
     );
 
     Backend::set_cursor_hidden(&mut backend, false);
-    assert!(backend.pstate.scanout_m2.unflip_requested);
+    assert!(backend.pstate.direct.root().unflip_requested);
     assert_eq!(
-        backend.pstate.scanout_m2.unflip_reason,
+        backend.pstate.direct.root().unflip_reason,
         Some("tearing_cursor_handoff")
     );
-    assert!(backend.pstate.scanout_m2.current.is_some());
+    assert!(backend.pstate.direct.root().current.is_some());
     Backend::maybe_composite(&mut backend).expect("submit grouped cursor handoff");
     assert!(!recorder.records().is_empty());
-    assert!(backend.pstate.scanout_m2.current.is_some());
+    assert!(backend.pstate.direct.root().current.is_some());
     retire_composed_frame(&mut backend, &mut state, 43);
-    assert!(backend.pstate.scanout_m2.current.is_none());
+    assert!(backend.pstate.direct.root().current.is_none());
 
     damage_root(&mut backend);
     Backend::maybe_composite(&mut backend).expect("compose visible software cursor");
@@ -2988,7 +3007,7 @@ fn dead_zone_motion_during_tearing_requests_cursor_handoff() {
     let mut state = ServerState::new();
     retire_registered_cursor_in_dead_zone(&mut backend, &mut state);
     qualify_from_dead_zone(&mut backend, &recorder, &mut state, WINDOW, 12_800);
-    assert!(backend.pstate.scanout_m2.current.is_some());
+    assert!(backend.pstate.direct.root().current.is_some());
     assert_eq!(
         backend.scene.cursor_mode(),
         crate::kms::render::scene::CursorPlaneMode::Hidden
@@ -2997,16 +3016,16 @@ fn dead_zone_motion_during_tearing_requests_cursor_handoff() {
 
     Backend::warp_pointer_root(&mut backend, &mut state, 100, 100);
     Backend::maybe_composite(&mut backend).expect("wake scene after entering an output");
-    assert!(backend.pstate.scanout_m2.unflip_requested);
+    assert!(backend.pstate.direct.root().unflip_requested);
     assert_eq!(
-        backend.pstate.scanout_m2.unflip_reason,
+        backend.pstate.direct.root().unflip_reason,
         Some("tearing_cursor_handoff")
     );
-    assert!(backend.pstate.scanout_m2.current.is_some());
+    assert!(backend.pstate.direct.root().current.is_some());
     assert!(backend.pstate.tearing.is_on());
     Backend::maybe_composite(&mut backend).expect("submit motion handoff replacement");
     retire_composed_frame(&mut backend, &mut state, 48);
-    assert!(backend.pstate.scanout_m2.current.is_none());
+    assert!(backend.pstate.direct.root().current.is_none());
     assert!(!backend.scene.has_pending_page_flips());
     assert!(backend.pstate.tearing.is_on());
     assert!(!backend.platform.any_cursor_plane_visible());
@@ -3168,9 +3187,9 @@ fn hidden_cow_stage_present_does_not_exit_tearing() {
     );
 
     assert!(backend.pstate.tearing.is_on());
-    assert!(!backend.pstate.scanout_m2.unflip_requested);
+    assert!(!backend.pstate.direct.root().unflip_requested);
     assert_ne!(
-        backend.pstate.scanout_m2.unflip_last_reason,
+        backend.pstate.direct.root().unflip_last_reason,
         Some("ineligible_authoritative_root_present")
     );
     assert!(recorder.records().is_empty());
@@ -3188,8 +3207,8 @@ fn cursor_only_ineligibility_does_not_reset_direct_probation_while_on() {
     let recorder = recording_sink(&mut backend, 0);
     let _state = enter_tearing_without_direct_scanout(&mut backend, 0x7820, 12_200);
     recorder.clear_records();
-    backend.pstate.scanout_m2.eligible_root_streak = 3;
-    let before_m2_probation = backend.pstate.scanout_m2.eligible_root_streak;
+    backend.pstate.direct.root_mut().eligible_root_streak = 3;
+    let before_m2_probation = backend.pstate.direct.root().eligible_root_streak;
     for present_id in 12_300..12_320 {
         assert!(
             try_direct_present_for_window(
@@ -3205,11 +3224,11 @@ fn cursor_only_ineligibility_does_not_reset_direct_probation_while_on() {
     }
     assert!(backend.pstate.tearing.is_on());
     assert_eq!(
-        backend.pstate.scanout_m2.eligible_root_streak,
+        backend.pstate.direct.root().eligible_root_streak,
         before_m2_probation
     );
     assert_ne!(
-        backend.pstate.scanout_m2.unflip_last_reason,
+        backend.pstate.direct.root().unflip_last_reason,
         Some("ineligible_authoritative_root_present")
     );
     assert!(recorder.records().is_empty());
@@ -3233,7 +3252,7 @@ fn cursor_only_ineligibility_does_not_reset_direct_probation_while_on() {
         window.height = height;
     }
     compositor.core.top_level_order.push(cow);
-    compositor.pstate.scanout_m2.eligible_root_streak = 0;
+    compositor.pstate.direct.root_mut().eligible_root_streak = 0;
 
     for index in 0..5_u64 {
         let full_id = 12_400 + index * 2;
@@ -3251,7 +3270,8 @@ fn cursor_only_ineligibility_does_not_reset_direct_probation_while_on() {
                 .expect("full compositor Present remains in M2 probation")
         );
         assert_eq!(
-            compositor.pstate.scanout_m2.eligible_root_streak, 1,
+            compositor.pstate.direct.root().eligible_root_streak,
+            1,
             "each full compositor Present advances probation after the preceding limited Present reset it"
         );
 
@@ -3269,14 +3289,14 @@ fn cursor_only_ineligibility_does_not_reset_direct_probation_while_on() {
             !Backend::try_present_direct(&mut compositor, candidate, event)
                 .expect("region-limited compositor Present takes Copy path")
         );
-        assert_eq!(compositor.pstate.scanout_m2.eligible_root_streak, 0);
+        assert_eq!(compositor.pstate.direct.root().eligible_root_streak, 0);
         assert!(!compositor.pstate.tearing.is_on());
     }
 
     assert_tearing_off(&compositor);
-    assert_eq!(compositor.pstate.scanout_m2.eligible_root_streak, 0);
-    assert!(!compositor.pstate.scanout_m2.active());
-    assert!(!compositor.pstate.scanout_m2.unflip_requested);
+    assert_eq!(compositor.pstate.direct.root().eligible_root_streak, 0);
+    assert!(!compositor.pstate.direct.root().active());
+    assert!(!compositor.pstate.direct.root().unflip_requested);
     assert!(compositor.scene.root_overlay.is_empty());
     assert!(compositor_recorder.records().is_empty());
     assert!(!compositor.scene.has_pending_page_flips());
@@ -3628,9 +3648,9 @@ fn copies_keep_copy_completion_with_composed_async() {
     retire_composed_frame(&mut backend, &mut state, 67);
     assert!(!backend.scene.has_pending_page_flips());
     assert!(backend.pstate.tearing.is_on());
-    assert!(!backend.pstate.scanout_m2.active());
-    assert!(!backend.pstate.scanout_m2.unflip_requested);
-    assert!(!backend.pstate.scanout_m2.unflip_shadow_ready);
+    assert!(!backend.pstate.direct.root().active());
+    assert!(!backend.pstate.direct.root().unflip_requested);
+    assert!(!backend.pstate.direct.root().unflip_shadow_ready);
     assert_direct_queue_drained(&backend);
     assert_commit_sequence(
         &recorder,
@@ -3691,8 +3711,8 @@ fn composed_async_accept_keeps_cursor_move_unsent() {
     retire_composed_frame(&mut backend, &mut state, 1);
     assert!(!backend.scene.has_pending_page_flips());
     assert!(backend.pstate.tearing.is_on());
-    assert!(backend.pstate.scanout_m2.pending.is_none());
-    assert!(backend.pstate.scanout_m2.queued_successor.is_none());
+    assert!(backend.pstate.direct.root().pending.is_none());
+    assert!(backend.pstate.direct.root().queued_successor.is_none());
     assert!(
         backend
             .platform

@@ -338,7 +338,8 @@ impl KmsBackend {
         unflip_reason: &'static str,
     ) -> bool {
         self.pstate
-            .scanout_m2
+            .direct
+            .root_mut()
             .mark_direct_cursor_refresh_pending(output_idx);
         let deadline = self.monotonic_now() + DIRECT_CURSOR_RETRY_DELAY;
         let attempts = self
@@ -366,7 +367,7 @@ impl KmsBackend {
     pub(in crate::kms::render::backend) fn direct_cursor_eligible(&self) -> bool {
         if self.effective_cursor_hidden() {
             return !self.platform.any_cursor_plane_visible()
-                || (self.pstate.scanout_m2.active()
+                || (self.pstate.direct.root().active()
                     && self
                         .platform
                         .outputs
@@ -376,7 +377,8 @@ impl KmsBackend {
                             !self.platform.cursor_plane_visible_for_output(output_idx)
                                 || self
                                     .pstate
-                                    .scanout_m2
+                                    .direct
+                                    .root()
                                     .direct_cursor_refresh_pending
                                     .contains(&output_idx)
                         }));
@@ -396,7 +398,7 @@ impl KmsBackend {
             .record_cursor_move_ebusy(u64::from(outcome.ebusy_count));
         if outcome.fallback_changed || outcome.retry_required {
             self.scene.wake_for_damage();
-            if self.pstate.scanout_m2.active() {
+            if self.pstate.direct.root().active() {
                 self.request_direct_unflip("cursor_move_fallback_or_retry");
             }
         }
@@ -407,9 +409,9 @@ impl KmsBackend {
     /// `false` when there are none, or when any is an ordinary window.
     pub(in crate::kms::render::backend) fn direct_frames_are_under_cow(&self) -> bool {
         let frames = [
-            self.pstate.scanout_m2.current.as_ref(),
-            self.pstate.scanout_m2.pending.as_ref(),
-            self.pstate.scanout_m2.queued_successor.as_ref(),
+            self.pstate.direct.root().current.as_ref(),
+            self.pstate.direct.root().pending.as_ref(),
+            self.pstate.direct.root().queued_successor.as_ref(),
         ];
         let mut any = false;
         for frame in frames.into_iter().flatten() {
@@ -425,15 +427,15 @@ impl KmsBackend {
     }
 
     pub(in crate::kms::render::backend) fn request_direct_unflip(&mut self, reason: &'static str) {
-        if !self.pstate.scanout_m2.active() {
+        if !self.pstate.direct.root().active() {
             return;
         }
-        if !self.pstate.scanout_m2.unflip_requested {
-            self.pstate.scanout_m2.unflip_reason = Some(reason);
+        if !self.pstate.direct.root().unflip_requested {
+            self.pstate.direct.root_mut().unflip_reason = Some(reason);
         }
-        self.pstate.scanout_m2.unflip_requested = true;
-        self.pstate.scanout_m2.unflip_last_reason = Some(reason);
-        self.pstate.scanout_m2.hold_direct = false;
+        self.pstate.direct.root_mut().unflip_requested = true;
+        self.pstate.direct.root_mut().unflip_last_reason = Some(reason);
+        self.pstate.direct.root_mut().hold_direct = false;
     }
 
     pub(in crate::kms::render::backend) fn direct_frame_references_host_drawable(
@@ -448,19 +450,22 @@ impl KmsBackend {
                 })
         };
         self.pstate
-            .scanout_m2
+            .direct
+            .root()
             .pending
             .as_ref()
             .is_some_and(references)
             || self
                 .pstate
-                .scanout_m2
+                .direct
+                .root()
                 .queued_successor
                 .as_ref()
                 .is_some_and(references)
             || self
                 .pstate
-                .scanout_m2
+                .direct
+                .root()
                 .current
                 .as_ref()
                 .is_some_and(references)
@@ -477,7 +482,7 @@ impl KmsBackend {
     }
 
     fn bind_direct_cursor_on_all_outputs(&mut self) {
-        if self.pstate.scanout_m2.cursor_bound_all {
+        if self.pstate.direct.root().cursor_bound_all {
             return;
         }
         let tearing = self.pstate.tearing.is_on();
@@ -489,7 +494,8 @@ impl KmsBackend {
                 if !self.platform.cursor_plane_visible_for_output(output_idx) {
                     self.platform.clear_direct_cursor_retry(output_idx);
                     self.pstate
-                        .scanout_m2
+                        .direct
+                        .root_mut()
                         .clear_direct_cursor_refresh_pending(output_idx);
                     continue;
                 }
@@ -504,7 +510,8 @@ impl KmsBackend {
                     Ok(()) => {
                         self.platform.clear_direct_cursor_retry(output_idx);
                         self.pstate
-                            .scanout_m2
+                            .direct
+                            .root_mut()
                             .clear_direct_cursor_refresh_pending(output_idx);
                     }
                     Err(error)
@@ -514,7 +521,8 @@ impl KmsBackend {
                     {
                         self.platform.clear_direct_cursor_retry(output_idx);
                         self.pstate
-                            .scanout_m2
+                            .direct
+                            .root_mut()
                             .mark_direct_cursor_refresh_pending(output_idx);
                         log::debug!(
                             "scanout_m2: cursor hide deferred on output {output_idx}; retrying on CRTC event"
@@ -543,14 +551,16 @@ impl KmsBackend {
                 self.request_direct_unflip("cursor_hide_failed");
             } else if self
                 .pstate
-                .scanout_m2
+                .direct
+                .root()
                 .direct_cursor_refresh_pending
                 .is_empty()
             {
                 self.pstate
-                    .scanout_m2
+                    .direct
+                    .root_mut()
                     .clear_all_direct_cursor_refresh_pending();
-                self.pstate.scanout_m2.cursor_bound_all = true;
+                self.pstate.direct.root_mut().cursor_bound_all = true;
             }
             return;
         }
@@ -571,7 +581,8 @@ impl KmsBackend {
                 Ok(()) => {
                     self.platform.clear_direct_cursor_retry(output_idx);
                     self.pstate
-                        .scanout_m2
+                        .direct
+                        .root_mut()
                         .clear_direct_cursor_refresh_pending(output_idx);
                 }
                 Err(error)
@@ -580,7 +591,8 @@ impl KmsBackend {
                 {
                     self.platform.clear_direct_cursor_retry(output_idx);
                     self.pstate
-                        .scanout_m2
+                        .direct
+                        .root_mut()
                         .mark_direct_cursor_refresh_pending(output_idx);
                     log::debug!(
                         "scanout_m2: direct cursor bind deferred on output {output_idx}; retrying on CRTC event"
@@ -609,7 +621,7 @@ impl KmsBackend {
         if failed || !scene_synced {
             self.request_direct_unflip("cursor_bind_failed");
         } else {
-            self.pstate.scanout_m2.cursor_bound_all = true;
+            self.pstate.direct.root_mut().cursor_bound_all = true;
         }
     }
 
@@ -624,7 +636,7 @@ impl KmsBackend {
         record: &crate::kms::render::cursor::CursorRecord,
     ) -> bool {
         if self.pstate.tearing.is_on()
-            || !self.pstate.scanout_m2.active()
+            || !self.pstate.direct.root().active()
             || self.platform.outputs.is_empty()
         {
             return false;
@@ -641,7 +653,7 @@ impl KmsBackend {
             }
         }
         let scene_synced = self.sync_direct_cursor_scene_state();
-        self.pstate.scanout_m2.cursor_bound_all = !failed && scene_synced;
+        self.pstate.direct.root_mut().cursor_bound_all = !failed && scene_synced;
         !failed && scene_synced
     }
 
@@ -665,7 +677,8 @@ impl KmsBackend {
             Ok(CursorUploadOutcome::Deferred) => {
                 self.platform.clear_direct_cursor_retry(output_idx);
                 self.pstate
-                    .scanout_m2
+                    .direct
+                    .root_mut()
                     .mark_direct_cursor_refresh_pending(output_idx);
                 log::debug!(
                     "scanout_m2: direct cursor upload deferred on output {output_idx}; retrying on CRTC event"
@@ -686,7 +699,8 @@ impl KmsBackend {
             Ok(()) => {
                 self.platform.clear_direct_cursor_retry(output_idx);
                 self.pstate
-                    .scanout_m2
+                    .direct
+                    .root_mut()
                     .clear_direct_cursor_refresh_pending(output_idx);
             }
             Err(error)
@@ -695,7 +709,8 @@ impl KmsBackend {
             {
                 self.platform.clear_direct_cursor_retry(output_idx);
                 self.pstate
-                    .scanout_m2
+                    .direct
+                    .root_mut()
                     .mark_direct_cursor_refresh_pending(output_idx);
                 log::debug!(
                     "scanout_m2: direct cursor show deferred on output {output_idx}; retrying on CRTC event"
@@ -722,13 +737,15 @@ impl KmsBackend {
     fn retry_due_direct_cursor_refreshes_before_successor(&mut self) {
         let due_outputs: Vec<_> = self
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .direct_cursor_refresh_pending
             .iter()
             .copied()
             .filter(|output_idx| {
                 self.pstate
-                    .scanout_m2
+                    .direct
+                    .root()
                     .direct_cursor_refresh_successor_deferrals
                     .get(output_idx)
                     .is_some_and(|count| *count >= DIRECT_CURSOR_RETRY_AFTER_SUCCESSOR_EVENTS)
@@ -740,16 +757,17 @@ impl KmsBackend {
     }
 
     fn retry_due_direct_cursor_refreshes_on_timer(&mut self) {
-        if self.pstate.scanout_m2.pending.is_some()
-            || self.pstate.scanout_m2.queued_successor.is_some()
-            || self.pstate.scanout_m2.unflip_requested
+        if self.pstate.direct.root().pending.is_some()
+            || self.pstate.direct.root().queued_successor.is_some()
+            || self.pstate.direct.root().unflip_requested
         {
             return;
         }
         let now = self.monotonic_now();
         let due_outputs: Vec<_> = self
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .direct_cursor_refresh_pending
             .iter()
             .copied()
@@ -771,11 +789,12 @@ impl KmsBackend {
     ) {
         if !self
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .direct_cursor_refresh_pending
             .contains(&output_idx)
-            || !self.pstate.scanout_m2.active()
-            || self.pstate.scanout_m2.unflip_requested
+            || !self.pstate.direct.root().active()
+            || self.pstate.direct.root().unflip_requested
         {
             return;
         }
@@ -791,7 +810,8 @@ impl KmsBackend {
                 self.platform.clear_direct_cursor_retry(output_idx);
             }
             self.pstate
-                .scanout_m2
+                .direct
+                .root_mut()
                 .clear_all_direct_cursor_refresh_pending();
             return;
         }
@@ -800,14 +820,15 @@ impl KmsBackend {
         // successor so the cursor commit gets one CRTC event to retire.
         let successor_deferrals = self
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .direct_cursor_refresh_successor_deferrals
             .get(&output_idx)
             .copied()
             .unwrap_or(0);
-        if (self.pstate.scanout_m2.queued_successor.is_some()
+        if (self.pstate.direct.root().queued_successor.is_some()
             && successor_deferrals < DIRECT_CURSOR_RETRY_AFTER_SUCCESSOR_EVENTS)
-            || (self.pstate.scanout_m2.pending.is_some() && !direct_frame_retired)
+            || (self.pstate.direct.root().pending.is_some() && !direct_frame_retired)
         {
             return;
         }
@@ -816,7 +837,8 @@ impl KmsBackend {
                 Ok(()) => {
                     self.platform.clear_direct_cursor_retry(output_idx);
                     self.pstate
-                        .scanout_m2
+                        .direct
+                        .root_mut()
                         .clear_direct_cursor_refresh_pending(output_idx);
                 }
                 Err(error)
@@ -856,7 +878,8 @@ impl KmsBackend {
         let Some(xid) = self.effective_cursor_xid else {
             self.platform.clear_direct_cursor_retry(output_idx);
             self.pstate
-                .scanout_m2
+                .direct
+                .root_mut()
                 .clear_direct_cursor_refresh_pending(output_idx);
             return;
         };
@@ -1160,11 +1183,12 @@ impl KmsBackend {
 
     pub(in crate::kms::render::backend) fn live_direct_vrr_wanted(&self) -> bool {
         self.pstate
-            .scanout_m2
+            .direct
+            .root()
             .queued_successor
             .as_ref()
-            .or(self.pstate.scanout_m2.pending.as_ref())
-            .or(self.pstate.scanout_m2.current.as_ref())
+            .or(self.pstate.direct.root().pending.as_ref())
+            .or(self.pstate.direct.root().current.as_ref())
             .is_some_and(|frame| self.direct_frame_wants_vrr(frame))
     }
 
@@ -1176,10 +1200,11 @@ impl KmsBackend {
                 };
                 let frame = self
                     .pstate
-                    .scanout_m2
+                    .direct
+                    .root()
                     .queued_successor
                     .as_ref()
-                    .or(self.pstate.scanout_m2.pending.as_ref())
+                    .or(self.pstate.direct.root().pending.as_ref())
                     .unwrap_or(output_frame);
                 self.direct_frame_wants_vrr(frame)
             })
@@ -1210,11 +1235,12 @@ impl KmsBackend {
         };
         let changed_owner = self
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .current
             .iter()
-            .chain(self.pstate.scanout_m2.pending.iter())
-            .chain(self.pstate.scanout_m2.queued_successor.iter())
+            .chain(self.pstate.direct.root().pending.iter())
+            .chain(self.pstate.direct.root().queued_successor.iter())
             .find(|frame| matches_host(&frame.candidate))
             .map(|frame| (frame.candidate.dst_window_xid, frame.candidate.crtc_id));
         let allowed = changed_owner.and_then(|(window, _)| {
@@ -1225,7 +1251,7 @@ impl KmsBackend {
         let allowed = yserver_core::properties::variable_refresh_property_enabled(allowed);
         let mut matched = false;
         {
-            let scanout = &mut self.pstate.scanout_m2;
+            let scanout = self.pstate.direct.root_mut();
             let (current, pending, queued_successor) = (
                 &mut scanout.current,
                 &mut scanout.pending,
@@ -1258,7 +1284,7 @@ impl KmsBackend {
             output.vrr_clear_waiting_for_flip.set(false);
             return;
         }
-        if self.pstate.scanout_m2.queued_successor.is_some()
+        if self.pstate.direct.root().queued_successor.is_some()
             || self.live_direct_vrr_wanted()
             || !self.scanout_allowed()
             || !self.kms_outputs_active
@@ -1271,7 +1297,7 @@ impl KmsBackend {
         if !output.vrr_committed.get() {
             return;
         }
-        if self.pstate.scanout_m2.pending.is_some()
+        if self.pstate.direct.root().pending.is_some()
             || self
                 .platform
                 .scanout_commit_in_flight_for_output(direct_output_idx)
@@ -1300,7 +1326,8 @@ impl KmsBackend {
             fallback_off_reason
         } else {
             self.pstate
-                .scanout_m2
+                .direct
+                .root()
                 .unflip_last_reason
                 .unwrap_or(fallback_off_reason)
         };
@@ -1430,7 +1457,8 @@ impl KmsBackend {
         // A cursor/overlay/topology invalidation which arrived while the
         // predecessor was in flight wins over the queued Present. Leave the
         // successor retained for the composed-unflip teardown to Skip.
-        if self.pstate.scanout_m2.unflip_requested || self.pstate.scanout_m2.pending.is_some() {
+        if self.pstate.direct.root().unflip_requested || self.pstate.direct.root().pending.is_some()
+        {
             return;
         }
         let direct_outputs: Vec<_> = (0..self.platform.outputs.len()).collect();
@@ -1440,7 +1468,7 @@ impl KmsBackend {
         {
             return;
         }
-        let Some(mut successor) = self.pstate.scanout_m2.queued_successor.take() else {
+        let Some(mut successor) = self.pstate.direct.root_mut().queued_successor.take() else {
             return;
         };
         let timing = self.direct_frame_flip_timing(&successor);
@@ -1452,25 +1480,25 @@ impl KmsBackend {
                     successor.candidate.present_id,
                     self.platform.outputs.len()
                 );
-                self.pstate.scanout_m2.pending = Some(successor);
-                self.pstate.scanout_m2.hold_direct = true;
+                self.pstate.direct.root_mut().pending = Some(successor);
+                self.pstate.direct.root_mut().hold_direct = true;
             }
             Err(error) => {
                 log::warn!(
                     "scanout_m2: queued direct successor submit failed after predecessor retirement: {error}"
                 );
                 self.defer_direct_successor_skip(successor);
-                self.pstate
-                    .scanout_m2
+                let direct = self.pstate.direct.root_mut();
+                direct
                     .completed
-                    .append(&mut self.pstate.scanout_m2.deferred_successor_skips);
+                    .append(&mut direct.deferred_successor_skips);
                 self.request_direct_unflip("queued_direct_successor_submit_failed");
             }
         }
     }
 
     fn release_direct_frame(&mut self, frame: DirectPresentFrame) {
-        self.pstate.scanout_m2.idled.push(frame.event);
+        self.pstate.direct.root_mut().idled.push(frame.event);
         <Self as Backend>::release_present_source(self, frame.source_pin);
         <Self as Backend>::release_present_source(self, frame.fallback_target_pin);
     }
@@ -1483,9 +1511,14 @@ impl KmsBackend {
         // `emit_idle = false` prevents the later completion from idling it a
         // second time.
         frame.event.emit_idle = false;
-        self.pstate.scanout_m2.idled.push(frame.event.clone());
         self.pstate
-            .scanout_m2
+            .direct
+            .root_mut()
+            .idled
+            .push(frame.event.clone());
+        self.pstate
+            .direct
+            .root_mut()
             .deferred_successor_skips
             .push(frame.event);
         <Self as Backend>::release_present_source(self, frame.source_pin);
@@ -1497,14 +1530,21 @@ impl KmsBackend {
         &mut self,
         frame: DirectPresentFrame,
     ) {
-        if let Some(superseded) = self.pstate.scanout_m2.queued_successor.replace(frame) {
+        if let Some(superseded) = self
+            .pstate
+            .direct
+            .root_mut()
+            .queued_successor
+            .replace(frame)
+        {
             self.defer_direct_successor_skip(superseded);
         }
-        self.pstate.scanout_m2.hold_direct = true;
+        self.pstate.direct.root_mut().hold_direct = true;
         log::debug!(
             "scanout_m2: queued latest direct successor present_id={}",
             self.pstate
-                .scanout_m2
+                .direct
+                .root()
                 .queued_successor
                 .as_ref()
                 .map_or(0, |frame| frame.candidate.present_id)
@@ -1524,47 +1564,60 @@ impl KmsBackend {
             .any(|output| output.output.vrr_committed.get());
         if vrr_committed {
             self.pstate
-                .scanout_m2
+                .direct
+                .root_mut()
                 .unflip_last_reason
                 .get_or_insert(reason);
         } else {
-            self.pstate.scanout_m2.unflip_last_reason = None;
+            self.pstate.direct.root_mut().unflip_last_reason = None;
         }
-        if let Some(mut pending) = self.pstate.scanout_m2.pending.take() {
+        if let Some(mut pending) = self.pstate.direct.root_mut().pending.take() {
             pending.event.completion_mode = yserver_protocol::x11::present::COMPLETE_MODE_COPY;
             pending.event.emit_idle = true;
-            self.pstate.scanout_m2.completed.push(pending.event);
+            self.pstate.direct.root_mut().completed.push(pending.event);
             <Self as Backend>::release_present_source(self, pending.source_pin);
             <Self as Backend>::release_present_source(self, pending.fallback_target_pin);
         }
-        if let Some(queued) = self.pstate.scanout_m2.queued_successor.take() {
+        if let Some(queued) = self.pstate.direct.root_mut().queued_successor.take() {
             self.defer_direct_successor_skip(queued);
         }
-        self.pstate
-            .scanout_m2
+        let direct = self.pstate.direct.root_mut();
+        direct
             .completed
-            .append(&mut self.pstate.scanout_m2.deferred_successor_skips);
-        if let Some(current) = self.pstate.scanout_m2.current.take() {
+            .append(&mut direct.deferred_successor_skips);
+        if let Some(current) = self.pstate.direct.root_mut().current.take() {
             self.release_direct_frame(current);
         }
-        self.pstate.scanout_m2.hold_direct = false;
-        self.pstate.scanout_m2.cursor_bound_all = false;
+        self.pstate.direct.root_mut().hold_direct = false;
+        self.pstate.direct.root_mut().cursor_bound_all = false;
         for output_idx in 0..self.platform.outputs.len() {
             self.platform.clear_direct_cursor_retry(output_idx);
         }
         self.pstate
-            .scanout_m2
+            .direct
+            .root_mut()
             .clear_all_direct_cursor_refresh_pending();
-        self.pstate.scanout_m2.unflip_requested = false;
-        self.pstate.scanout_m2.unflip_reason = None;
-        self.pstate.scanout_m2.unflip_outputs_to_replace.clear();
-        self.pstate.scanout_m2.unflip_awaiting_outputs.clear();
-        self.pstate.scanout_m2.reentry_blocked_until_composed = false;
-        self.pstate.scanout_m2.reset_eligible_root_probation();
-        self.pstate.scanout_m2.unflip_fallback_source = None;
-        self.pstate.scanout_m2.unflip_shadow_ready = false;
-        self.pstate.scanout_m2.degraded_composed_unflip = false;
-        self.pstate.scanout_m2.fresh_composed_unflip = false;
+        self.pstate.direct.root_mut().unflip_requested = false;
+        self.pstate.direct.root_mut().unflip_reason = None;
+        self.pstate
+            .direct
+            .root_mut()
+            .unflip_outputs_to_replace
+            .clear();
+        self.pstate
+            .direct
+            .root_mut()
+            .unflip_awaiting_outputs
+            .clear();
+        self.pstate.direct.root_mut().reentry_blocked_until_composed = false;
+        self.pstate
+            .direct
+            .root_mut()
+            .reset_eligible_root_probation();
+        self.pstate.direct.root_mut().unflip_fallback_source = None;
+        self.pstate.direct.root_mut().unflip_shadow_ready = false;
+        self.pstate.direct.root_mut().degraded_composed_unflip = false;
+        self.pstate.direct.root_mut().fresh_composed_unflip = false;
         self.finish_deferred_cow_release();
         log::debug!("scanout_m2: stopped after scanout replacement: {reason}");
     }
@@ -1604,7 +1657,7 @@ impl KmsBackend {
         &mut self,
         context: &'static str,
     ) -> io::Result<bool> {
-        if !self.pstate.scanout_m2.active() {
+        if !self.pstate.direct.root().active() {
             return Ok(false);
         }
         let relight = self.kms_outputs_active;
@@ -1641,16 +1694,17 @@ impl KmsBackend {
         let slot = direct_frame_slot_on_output(
             output_idx,
             self.pstate
-                .scanout_m2
+                .direct
+                .root()
                 .pending
                 .as_ref()
                 .map(|frame| &frame.awaiting_outputs),
-            self.pstate.scanout_m2.current.is_some(),
-            &self.pstate.scanout_m2.unflip_outputs_to_replace,
+            self.pstate.direct.root().current.is_some(),
+            &self.pstate.direct.root().unflip_outputs_to_replace,
         )?;
         match slot {
-            DirectFrameSlot::Pending => self.pstate.scanout_m2.pending.as_ref(),
-            DirectFrameSlot::Current => self.pstate.scanout_m2.current.as_ref(),
+            DirectFrameSlot::Pending => self.pstate.direct.root().pending.as_ref(),
+            DirectFrameSlot::Current => self.pstate.direct.root().current.as_ref(),
         }
     }
 
@@ -1663,15 +1717,16 @@ impl KmsBackend {
     pub(in crate::kms::render::backend) fn materialize_direct_shadow_for_unflip(
         &mut self,
     ) -> io::Result<()> {
-        if self.pstate.scanout_m2.unflip_shadow_ready {
+        if self.pstate.direct.root().unflip_shadow_ready {
             return Ok(());
         }
         let current = self
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .pending
             .as_ref()
-            .or(self.pstate.scanout_m2.current.as_ref())
+            .or(self.pstate.direct.root().current.as_ref())
             .ok_or_else(|| io::Error::other("scanout M2: no direct frame for fallback"))?;
         let source_id = current.source_id;
         let candidate = current.candidate;
@@ -1755,7 +1810,7 @@ impl KmsBackend {
                 crate::kms::render::submit_group::FlushReason::PresentCompletionSignal,
             )
             .map_err(|error| io::Error::other(format!("scanout M2 lazy COW submit: {error:?}")))?;
-        self.pstate.scanout_m2.unflip_shadow_ready = true;
+        self.pstate.direct.root_mut().unflip_shadow_ready = true;
         log::debug!(
             "scanout_m2: lazily materialized direct source_id={} into fallback_target={} for unflip",
             source_id.as_u64(),
@@ -1840,8 +1895,8 @@ impl KmsBackend {
         self.log_vrr_committed_changes(&vrr_before, None, "inherited");
         self.platform
             .cursor_plane_scene_commit_submitted(&cursor_positions);
-        self.pstate.scanout_m2.unflip_outputs_to_replace = (0..output_count).collect();
-        self.pstate.scanout_m2.unflip_awaiting_outputs = (0..output_count)
+        self.pstate.direct.root_mut().unflip_outputs_to_replace = (0..output_count).collect();
+        self.pstate.direct.root_mut().unflip_awaiting_outputs = (0..output_count)
             .map(|output_idx| (output_idx, accepted_event_id))
             .collect();
         let describe_frame = |frame: &DirectPresentFrame| {
@@ -1854,13 +1909,24 @@ impl KmsBackend {
         log::debug!(
             "scanout_m2: submitted atomic composed unflip outputs={} reason={} last_reason={} pending={:?} current={:?}",
             output_count,
-            self.pstate.scanout_m2.unflip_reason.unwrap_or("unknown"),
+            self.pstate.direct.root().unflip_reason.unwrap_or("unknown"),
             self.pstate
-                .scanout_m2
+                .direct
+                .root()
                 .unflip_last_reason
                 .unwrap_or("unknown"),
-            self.pstate.scanout_m2.pending.as_ref().map(describe_frame),
-            self.pstate.scanout_m2.current.as_ref().map(describe_frame)
+            self.pstate
+                .direct
+                .root()
+                .pending
+                .as_ref()
+                .map(describe_frame),
+            self.pstate
+                .direct
+                .root()
+                .current
+                .as_ref()
+                .map(describe_frame)
         );
         Ok(true)
     }
@@ -1873,7 +1939,7 @@ impl KmsBackend {
 
         let outputs: Vec<_> = (0..self.platform.outputs.len()).collect();
         let tearing_cursor_handoff =
-            self.pstate.scanout_m2.unflip_reason == Some("tearing_cursor_handoff");
+            self.pstate.direct.root().unflip_reason == Some("tearing_cursor_handoff");
         !outputs.is_empty()
             // This handoff needs a fresh scene frame so the newest Present
             // Copy replaces the retained direct frame in the same commit.
@@ -1979,14 +2045,14 @@ impl KmsBackend {
             );
             return false;
         };
-        self.pstate.scanout_m2.unflip_outputs_to_replace = (0..output_count).collect();
-        self.pstate.scanout_m2.unflip_awaiting_outputs = (0..output_count)
+        self.pstate.direct.root_mut().unflip_outputs_to_replace = (0..output_count).collect();
+        self.pstate.direct.root_mut().unflip_awaiting_outputs = (0..output_count)
             .map(|output_idx| (output_idx, accepted_event_id))
             .collect();
-        self.pstate.scanout_m2.fresh_composed_unflip = true;
+        self.pstate.direct.root_mut().fresh_composed_unflip = true;
         log::debug!(
             "scanout_m2: submitted fresh atomic composed unflip outputs={output_count} reason={}",
-            self.pstate.scanout_m2.unflip_reason.unwrap_or("unknown")
+            self.pstate.direct.root().unflip_reason.unwrap_or("unknown")
         );
         true
     }
@@ -2049,12 +2115,13 @@ impl KmsBackend {
     /// Install only accepted per-output scene commits as degraded-unflip
     /// retirement obligations. Copied render readiness alone has no KMS ID.
     pub(in crate::kms::render::backend) fn record_accepted_degraded_unflip_replacements(&mut self) {
-        if !self.pstate.scanout_m2.degraded_composed_unflip {
+        if !self.pstate.direct.root().degraded_composed_unflip {
             return;
         }
         let outputs = self
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_outputs_to_replace
             .iter()
             .copied()
@@ -2062,7 +2129,8 @@ impl KmsBackend {
         for output_idx in outputs {
             if let Some(event_id) = self.scene.pending_page_flip_event_id(output_idx) {
                 self.pstate
-                    .scanout_m2
+                    .direct
+                    .root_mut()
                     .unflip_awaiting_outputs
                     .insert(output_idx, event_id);
             }
@@ -2077,7 +2145,8 @@ impl KmsBackend {
     ) -> bool {
         if let Some(&accepted_replacement_id) = self
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_awaiting_outputs
             .get(&output_idx)
         {
@@ -2085,28 +2154,36 @@ impl KmsBackend {
                 return false;
             }
             self.pstate
-                .scanout_m2
+                .direct
+                .root_mut()
                 .unflip_awaiting_outputs
                 .remove(&output_idx);
             self.pstate
-                .scanout_m2
+                .direct
+                .root_mut()
                 .unflip_outputs_to_replace
                 .remove(&output_idx);
-            let degraded = self.pstate.scanout_m2.degraded_composed_unflip;
-            let scene_owned = degraded || self.pstate.scanout_m2.fresh_composed_unflip;
+            let degraded = self.pstate.direct.root().degraded_composed_unflip;
+            let scene_owned = degraded || self.pstate.direct.root().fresh_composed_unflip;
             let cursor_handoff = !scene_owned
-                && self.pstate.scanout_m2.unflip_reason == Some("tearing_cursor_handoff");
+                && self.pstate.direct.root().unflip_reason == Some("tearing_cursor_handoff");
             if cursor_handoff {
                 self.scene
                     .retire_external_cursor_handoff(output_idx, &mut self.platform);
             }
-            if self.pstate.scanout_m2.unflip_outputs_to_replace.is_empty() {
+            if self
+                .pstate
+                .direct
+                .root()
+                .unflip_outputs_to_replace
+                .is_empty()
+            {
                 self.stop_direct_after_scanout_replaced(if degraded {
                     "degraded composed unflip"
                 } else {
                     "atomic composed unflip"
                 });
-                self.pstate.scanout_m2.reentry_blocked_until_composed = true;
+                self.pstate.direct.root_mut().reentry_blocked_until_composed = true;
                 // Step 3 — while a CRTC scanned out a client buffer directly,
                 // the composed BOs were not painted and the scene was not
                 // tracking them; a direct retirement also bypasses
@@ -2114,7 +2191,7 @@ impl KmsBackend {
                 // as wholly stale on the way back.
                 self.scene.invalidate_all_scanout_damage();
                 self.scene.mark_scene_structure_dirty();
-                self.pstate.scanout_m2.degraded_composed_unflip = false;
+                self.pstate.direct.root_mut().degraded_composed_unflip = false;
                 log::debug!("scanout_m2: composed unflip retired on all outputs");
             }
             if scene_owned {
@@ -2127,13 +2204,14 @@ impl KmsBackend {
         }
         if self
             .pstate
-            .scanout_m2
+            .direct
+            .root()
             .unflip_outputs_to_replace
             .contains(&output_idx)
         {
             return false;
         }
-        let Some(pending) = self.pstate.scanout_m2.pending.as_mut() else {
+        let Some(pending) = self.pstate.direct.root_mut().pending.as_mut() else {
             return false;
         };
         if pending.accepted_event_id != event_id {
@@ -2153,7 +2231,8 @@ impl KmsBackend {
         if pending.awaiting_outputs.is_empty() {
             let mut presented = self
                 .pstate
-                .scanout_m2
+                .direct
+                .root_mut()
                 .pending
                 .take()
                 .expect("pending direct frame disappeared");
@@ -2164,23 +2243,25 @@ impl KmsBackend {
             presented.event.emit_idle = false;
             presented.event.completion_clock = Some(completion_clock);
             self.pstate
-                .scanout_m2
+                .direct
+                .root_mut()
                 .completed
                 .push(presented.event.clone());
             // Xorg publishes the retiring flip before re-executing any
             // flip-ready successor. Coalesced successors therefore become
             // ordered Skip completions only at this retirement boundary.
-            self.pstate
-                .scanout_m2
+            let direct = self.pstate.direct.root_mut();
+            direct
                 .completed
-                .append(&mut self.pstate.scanout_m2.deferred_successor_skips);
-            if let Some(previous) = self.pstate.scanout_m2.current.replace(presented) {
+                .append(&mut direct.deferred_successor_skips);
+            if let Some(previous) = self.pstate.direct.root_mut().current.replace(presented) {
                 self.release_direct_frame(previous);
             }
             log::debug!(
                 "scanout_m2: direct frame retired on all outputs source_id={}",
                 self.pstate
-                    .scanout_m2
+                    .direct
+                    .root()
                     .current
                     .as_ref()
                     .map_or(0, |frame| frame.source_id.as_u64())
@@ -2191,8 +2272,8 @@ impl KmsBackend {
             // transaction retires unless a bounded cursor retry just won a
             // CRTC event.
             self.submit_queued_direct_successor();
-            if self.pstate.scanout_m2.queued_successor.is_none()
-                && self.pstate.scanout_m2.pending.is_none()
+            if self.pstate.direct.root().queued_successor.is_none()
+                && self.pstate.direct.root().pending.is_none()
             {
                 self.bind_direct_cursor_on_all_outputs();
             }
@@ -2276,6 +2357,9 @@ impl KmsBackend {
         let topology_signature = self.scanout_m1_topology_signature();
         if self.pstate.scanout_m1.topology_signature != topology_signature {
             self.pstate.scanout_m1.clear("output topology changed");
+            self.pstate
+                .direct
+                .sync_output_count(self.platform.outputs.len());
             self.pstate.scanout_m1.topology_signature = topology_signature;
         }
         if self.pstate.scanout_m1.entries.contains_key(&source_id) {
@@ -2585,19 +2669,22 @@ impl KmsBackend {
             !self.direct_shape_chain_covers_root(frame.candidate.paint_dst_host_xid, root)
         };
         self.pstate
-            .scanout_m2
+            .direct
+            .root()
             .pending
             .as_ref()
             .is_some_and(shaped_off)
             || self
                 .pstate
-                .scanout_m2
+                .direct
+                .root()
                 .queued_successor
                 .as_ref()
                 .is_some_and(shaped_off)
             || self
                 .pstate
-                .scanout_m2
+                .direct
+                .root()
                 .current
                 .as_ref()
                 .is_some_and(shaped_off)
@@ -3003,8 +3090,13 @@ impl KmsBackend {
         matches!(
             self.scene.cursor_mode(),
             crate::kms::render::scene::CursorPlaneMode::Sw
-        ) || (self.pstate.scanout_m2.unflip_reason == Some("tearing_cursor_handoff")
-            && !self.pstate.scanout_m2.unflip_outputs_to_replace.is_empty())
+        ) || (self.pstate.direct.root().unflip_reason == Some("tearing_cursor_handoff")
+            && !self
+                .pstate
+                .direct
+                .root()
+                .unflip_outputs_to_replace
+                .is_empty())
     }
 
     /// Earliest time a cursor-only software-scene wake may be composed while
@@ -3027,21 +3119,26 @@ impl KmsBackend {
     }
 
     pub(super) fn scene_wants_compose(&self) -> bool {
-        if self.pstate.scanout_m2.pending.is_some()
-            || !self.pstate.scanout_m2.unflip_awaiting_outputs.is_empty()
+        if self.pstate.direct.root().pending.is_some()
+            || !self.pstate.direct.root().unflip_awaiting_outputs.is_empty()
         {
             // The grouped direct or composed transaction's flip events are
             // the next progress source; its state will be re-arbitrated there.
             return false;
         }
         let outputs: Vec<_> = (0..self.platform.outputs.len()).collect();
-        let direct_transaction_waiting = self.pstate.scanout_m2.pending.is_some()
-            || self.pstate.scanout_m2.queued_successor.is_some()
-            || self.pstate.scanout_m2.unflip_requested;
-        let degraded_replacement_needs_submit = self.pstate.scanout_m2.degraded_composed_unflip
-            && !self.pstate.scanout_m2.unflip_outputs_to_replace.is_empty();
-        let unflip_waiting_for_cursor = self.pstate.scanout_m2.current.is_some()
-            && self.pstate.scanout_m2.unflip_requested
+        let direct_transaction_waiting = self.pstate.direct.root().pending.is_some()
+            || self.pstate.direct.root().queued_successor.is_some()
+            || self.pstate.direct.root().unflip_requested;
+        let degraded_replacement_needs_submit = self.pstate.direct.root().degraded_composed_unflip
+            && !self
+                .pstate
+                .direct
+                .root()
+                .unflip_outputs_to_replace
+                .is_empty();
+        let unflip_waiting_for_cursor = self.pstate.direct.root().current.is_some()
+            && self.pstate.direct.root().unflip_requested
             && self.platform.scanout_commit_in_flight_for_outputs(&outputs);
         if unflip_waiting_for_cursor {
             // The cursor flip event is the next progress source. Re-arming an
@@ -3167,7 +3264,8 @@ impl KmsBackend {
             }
         };
         for (output_idx, clock, timestamps) in flipped {
-            let queued_successor_before_event = self.pstate.scanout_m2.queued_successor.is_some();
+            let queued_successor_before_event =
+                self.pstate.direct.root().queued_successor.is_some();
             let matched_event_id = self
                 .platform
                 .note_tearing_async_flip_event(output_idx, timestamps);
@@ -3177,13 +3275,15 @@ impl KmsBackend {
             if queued_successor_before_event
                 && self
                     .pstate
-                    .scanout_m2
+                    .direct
+                    .root()
                     .direct_cursor_refresh_pending
                     .contains(&output_idx)
             {
                 let count = self
                     .pstate
-                    .scanout_m2
+                    .direct
+                    .root_mut()
                     .direct_cursor_refresh_successor_deferrals
                     .entry(output_idx)
                     .or_default();
@@ -3194,15 +3294,16 @@ impl KmsBackend {
             let cursor_commit_retired =
                 self.record_atomic_cursor_commit_retirement(output_idx, matched_event_id);
             if cursor_commit_retired {
-                if self.pstate.scanout_m2.pending.is_none()
-                    && self.pstate.scanout_m2.queued_successor.is_some()
+                if self.pstate.direct.root().pending.is_none()
+                    && self.pstate.direct.root().queued_successor.is_some()
                 {
                     self.retry_due_direct_cursor_refreshes_before_successor();
                     self.submit_queued_direct_successor();
                 }
                 if self
                     .pstate
-                    .scanout_m2
+                    .direct
+                    .root()
                     .direct_cursor_refresh_pending
                     .contains(&output_idx)
                 {
@@ -3237,8 +3338,8 @@ impl KmsBackend {
                 .outputs
                 .get(output_idx)
                 .is_some_and(|layout| layout.output.vrr_clear_waiting_for_flip.get());
-            let direct_successor_owns_next_frame = self.pstate.scanout_m2.pending.is_some()
-                || self.pstate.scanout_m2.queued_successor.is_some();
+            let direct_successor_owns_next_frame = self.pstate.direct.root().pending.is_some()
+                || self.pstate.direct.root().queued_successor.is_some();
             if !self.gamma_output_has_queued_scanout(output_idx)
                 || (vrr_clear_waiting_for_flip && !direct_successor_owns_next_frame)
             {
@@ -3317,7 +3418,7 @@ impl KmsBackend {
             self.exit_tearing("eligibility_lost");
             return;
         }
-        if self.tearing_cursor_wants_visible() && self.pstate.scanout_m2.active() {
+        if self.tearing_cursor_wants_visible() && self.pstate.direct.root().active() {
             self.request_direct_unflip("tearing_cursor_handoff");
         }
         if self.platform.any_cursor_plane_visible() {
@@ -3343,18 +3444,19 @@ impl KmsBackend {
         let now = self.monotonic_now();
         let live_direct_vrr_wanted = self.live_direct_vrr_wanted_by_output();
         let allow_kms_timers = self.scanout_allowed() && self.kms_outputs_active;
-        let direct_hold_waits_for_cursor_or_frame = self.pstate.scanout_m2.hold_direct
-            && self.pstate.scanout_m2.current.is_some()
-            && self.pstate.scanout_m2.pending.is_none()
-            && self.pstate.scanout_m2.queued_successor.is_none()
-            && !self.pstate.scanout_m2.unflip_requested;
+        let direct_hold_waits_for_cursor_or_frame = self.pstate.direct.root().hold_direct
+            && self.pstate.direct.root().current.is_some()
+            && self.pstate.direct.root().pending.is_none()
+            && self.pstate.direct.root().queued_successor.is_none()
+            && !self.pstate.direct.root().unflip_requested;
         let direct_cursor_retry_deadline = if allow_kms_timers
-            && self.pstate.scanout_m2.pending.is_none()
-            && self.pstate.scanout_m2.queued_successor.is_none()
-            && !self.pstate.scanout_m2.unflip_requested
+            && self.pstate.direct.root().pending.is_none()
+            && self.pstate.direct.root().queued_successor.is_none()
+            && !self.pstate.direct.root().unflip_requested
         {
             self.pstate
-                .scanout_m2
+                .direct
+                .root()
                 .direct_cursor_refresh_pending
                 .iter()
                 .filter_map(|output_idx| self.platform.direct_cursor_retry_deadline(*output_idx))
@@ -3558,7 +3660,7 @@ impl KmsBackend {
         // commit gets the first opportunity once all of its CRTCs are clear.
         // The helper leaves it in the slot while any CRTC is still blocked.
         self.submit_queued_direct_successor();
-        if self.pstate.scanout_m2.active() {
+        if self.pstate.direct.root().active() {
             use crate::kms::render::scene::CursorPlaneMode;
             let cursor_mode = self.scene.cursor_mode();
             if self.platform.any_output_transformed() {
@@ -3576,22 +3678,23 @@ impl KmsBackend {
             // Never race a composed commit against the all-output direct
             // transaction. A requested unflip starts on the first tick after
             // the direct transaction itself has fully retired.
-            if self.pstate.scanout_m2.pending.is_some()
-                || !self.pstate.scanout_m2.unflip_awaiting_outputs.is_empty()
+            if self.pstate.direct.root().pending.is_some()
+                || !self.pstate.direct.root().unflip_awaiting_outputs.is_empty()
             {
                 self.drain_render_telemetry();
                 self.telemetry.maybe_emit(self.engine.pending_count());
                 return Ok(());
             }
-            if self.pstate.scanout_m2.hold_direct && !self.pstate.scanout_m2.unflip_requested {
+            if self.pstate.direct.root().hold_direct && !self.pstate.direct.root().unflip_requested
+            {
                 // A fully-retired direct frame may continue receiving cursor
                 // motion. Let the scheduling pass send cursor-only commits
                 // while there is no direct successor waiting; once a
                 // successor is retained, its grouped direct transaction gets
                 // every later position and no CRTC is extended by another
                 // cursor-only commit.
-                if self.pstate.scanout_m2.current.is_some()
-                    && self.pstate.scanout_m2.queued_successor.is_none()
+                if self.pstate.direct.root().current.is_some()
+                    && self.pstate.direct.root().queued_successor.is_none()
                 {
                     let live_direct_vrr_wanted = self.live_direct_vrr_wanted_by_output();
                     for output_idx in 0..self.platform.outputs.len() {
@@ -3614,9 +3717,9 @@ impl KmsBackend {
                 self.telemetry.maybe_emit(self.engine.pending_count());
                 return Ok(());
             }
-            if self.pstate.scanout_m2.current.is_some()
-                && self.pstate.scanout_m2.unflip_requested
-                && !self.pstate.scanout_m2.degraded_composed_unflip
+            if self.pstate.direct.root().current.is_some()
+                && self.pstate.direct.root().unflip_requested
+                && !self.pstate.direct.root().degraded_composed_unflip
             {
                 let submitted = if self.submit_fresh_composed_unflip() {
                     Ok(true)
@@ -3654,17 +3757,26 @@ impl KmsBackend {
                         // planes this tick, and `retire_direct_output` releases the
                         // direct frame only after every output has retired on the
                         // composed framebuffer.
-                        self.pstate.scanout_m2.unflip_outputs_to_replace =
+                        self.pstate.direct.root_mut().unflip_outputs_to_replace =
                             (0..self.platform.outputs.len()).collect();
-                        self.pstate.scanout_m2.unflip_awaiting_outputs.clear();
-                        self.pstate.scanout_m2.degraded_composed_unflip = true;
+                        self.pstate
+                            .direct
+                            .root_mut()
+                            .unflip_awaiting_outputs
+                            .clear();
+                        self.pstate.direct.root_mut().degraded_composed_unflip = true;
                         self.scene.mark_scene_structure_dirty();
                     }
                 }
             }
         }
-        if self.pstate.scanout_m2.degraded_composed_unflip
-            && !self.pstate.scanout_m2.unflip_outputs_to_replace.is_empty()
+        if self.pstate.direct.root().degraded_composed_unflip
+            && !self
+                .pstate
+                .direct
+                .root()
+                .unflip_outputs_to_replace
+                .is_empty()
         {
             // A failed per-output replacement can leave the scene clean after
             // another output's accepted frame retires. Keep the scene tick
@@ -3686,10 +3798,10 @@ impl KmsBackend {
         // without entering backend_scanout_on_scanout_render_completion.
         self.record_accepted_degraded_unflip_replacements();
         if let Some(composed) = &composed_outputs
-            && self.pstate.scanout_m2.reentry_blocked_until_composed
+            && self.pstate.direct.root().reentry_blocked_until_composed
             && composed.len() == self.platform.outputs.len()
         {
-            self.pstate.scanout_m2.reentry_blocked_until_composed = false;
+            self.pstate.direct.root_mut().reentry_blocked_until_composed = false;
             log::debug!("scanout_m2: composed fallback submitted; re-entry barrier cleared");
         }
         if composed_outputs
