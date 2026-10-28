@@ -4082,200 +4082,97 @@ fn randr_topology_teardown_stops_every_output_owner() {
 fn global_causes_revoke_every_output_owner() {
     use yserver_core::backend::Backend;
 
-    let Some(mut storage_fixture) = randr_two_output_owner_fixture() else {
-        eprintln!("SKIP global_causes_revoke_every_output_owner: Vulkan fixture unavailable");
-        return;
-    };
-    randr_retire_direct_enters(&mut storage_fixture);
-    let mut completed =
-        Backend::drain_completed_present_events(&mut storage_fixture.events.backend)
+    for (cause, reallocate_storage) in [("storage reallocation", true), ("CRTC transform", false)] {
+        let Some(mut fixture) = randr_two_output_owner_fixture() else {
+            eprintln!("SKIP global_causes_revoke_every_output_owner: Vulkan fixture unavailable");
+            return;
+        };
+        randr_retire_direct_enters(&mut fixture);
+        let mut completed = Backend::drain_completed_present_events(&mut fixture.events.backend)
             .into_iter()
             .map(|event| event.present_id)
             .collect::<Vec<_>>();
-    completed.sort_unstable();
-    assert_eq!(completed, [701, 702], "each direct Present completes once");
-    assert!(
-        Backend::drain_completed_present_events(&mut storage_fixture.events.backend).is_empty()
-    );
+        completed.sort_unstable();
+        assert_eq!(completed, [701, 702], "each direct Present completes once");
+        assert!(Backend::drain_completed_present_events(&mut fixture.events.backend).is_empty());
 
-    Backend::set_logical_screen_size(&mut storage_fixture.events.backend, 3841, 1081)
-        .expect("storage reallocation through the Backend entry point");
-    for (output_idx, owner) in storage_fixture
-        .events
-        .backend
-        .pstate
-        .direct
-        .outputs
-        .iter()
-        .enumerate()
-    {
-        assert!(
-            owner.unflip_requested,
-            "storage reallocation requests Output({output_idx}) before a tick"
-        );
-        assert!(
-            owner.current.is_some(),
-            "the last Present waits for replacement"
-        );
-    }
-    let storage_replacements = randr_compose_and_retire_replacements(&mut storage_fixture);
-    for output_idx in 0..2 {
-        let crtc = storage_fixture.events.backend.platform.outputs[output_idx]
-            .output
-            .crtc;
-        assert!(
-            storage_replacements.iter().any(|record| {
-                matches!(
-                    record.kind,
-                    crate::drm::atomic::AtomicCommitKind::Scene
-                        | crate::drm::atomic::AtomicCommitKind::SceneWithCursor
-                ) && record.events.iter().any(|event| event.crtc == crtc)
-            }),
-            "storage replacement retires on output {output_idx}"
-        );
-    }
-    assert!(
-        storage_fixture
+        if reallocate_storage {
+            Backend::set_logical_screen_size(&mut fixture.events.backend, 3841, 1081)
+                .expect("storage reallocation through the Backend entry point");
+        } else {
+            let half = yserver_core::randr::FIXED_ONE / 2;
+            fixture.events.state.randr.outputs[0].current_transform =
+                yserver_core::randr::CrtcTransform::new(
+                    [half, 0, 0, 0, half, 0, 0, 0, yserver_core::randr::FIXED_ONE],
+                    None,
+                    Vec::new(),
+                )
+                .expect("valid scale transform");
+            Backend::randr_layout_changed(&mut fixture.events.backend, &mut fixture.events.state);
+            assert_eq!(fixture.events.backend.platform.output_transforms.len(), 1);
+        }
+
+        for (output_idx, owner) in fixture
             .events
             .backend
             .pstate
             .direct
-            .active_scopes()
-            .is_empty()
-    );
-    assert!(
-        storage_fixture
-            .events
-            .backend
-            .present_source_pins
-            .is_empty()
-    );
-    assert!(
-        Backend::drain_completed_present_events(&mut storage_fixture.events.backend).is_empty(),
-        "unflip does not duplicate CompleteNotify"
-    );
-    let mut idled = Backend::drain_retired_present_idle_events(&mut storage_fixture.events.backend)
-        .into_iter()
-        .map(|event| event.present_id)
-        .collect::<Vec<_>>();
-    idled.sort_unstable();
-    assert_eq!(
-        idled,
-        [701, 702],
-        "both Present pins retire after replacement"
-    );
-    assert!(
-        Backend::drain_retired_present_idle_events(&mut storage_fixture.events.backend).is_empty()
-    );
-    storage_fixture.finish_after_normal_drain();
-
-    let Some(mut transform_fixture) = randr_two_output_owner_fixture() else {
-        eprintln!("SKIP global_causes_revoke_every_output_owner: Vulkan fixture unavailable");
-        return;
-    };
-    randr_retire_direct_enters(&mut transform_fixture);
-    let mut completed =
-        Backend::drain_completed_present_events(&mut transform_fixture.events.backend)
+            .outputs
+            .iter()
+            .enumerate()
+        {
+            assert!(
+                owner.unflip_requested,
+                "{cause} requests Output({output_idx}) before a tick"
+            );
+            assert!(
+                owner.current.is_some(),
+                "the last Present waits for replacement"
+            );
+        }
+        let replacements = randr_compose_and_retire_replacements(&mut fixture);
+        for output_idx in 0..2 {
+            let crtc = fixture.events.backend.platform.outputs[output_idx]
+                .output
+                .crtc;
+            assert!(
+                replacements.iter().any(|record| {
+                    matches!(
+                        record.kind,
+                        crate::drm::atomic::AtomicCommitKind::Scene
+                            | crate::drm::atomic::AtomicCommitKind::SceneWithCursor
+                    ) && record.events.iter().any(|event| event.crtc == crtc)
+                }),
+                "{cause} replacement retires on output {output_idx}"
+            );
+        }
+        assert!(
+            fixture
+                .events
+                .backend
+                .pstate
+                .direct
+                .active_scopes()
+                .is_empty()
+        );
+        assert!(fixture.events.backend.present_source_pins.is_empty());
+        assert!(
+            Backend::drain_completed_present_events(&mut fixture.events.backend).is_empty(),
+            "unflip does not duplicate CompleteNotify"
+        );
+        let mut idled = Backend::drain_retired_present_idle_events(&mut fixture.events.backend)
             .into_iter()
             .map(|event| event.present_id)
             .collect::<Vec<_>>();
-    completed.sort_unstable();
-    assert_eq!(completed, [701, 702], "each direct Present completes once");
-    assert!(
-        Backend::drain_completed_present_events(&mut transform_fixture.events.backend).is_empty()
-    );
-
-    let half = yserver_core::randr::FIXED_ONE / 2;
-    transform_fixture.events.state.randr.outputs[0].current_transform =
-        yserver_core::randr::CrtcTransform::new(
-            [half, 0, 0, 0, half, 0, 0, 0, yserver_core::randr::FIXED_ONE],
-            None,
-            Vec::new(),
-        )
-        .expect("valid scale transform");
-    Backend::randr_layout_changed(
-        &mut transform_fixture.events.backend,
-        &mut transform_fixture.events.state,
-    );
-    assert_eq!(
-        transform_fixture
-            .events
-            .backend
-            .platform
-            .output_transforms
-            .len(),
-        1
-    );
-    for (output_idx, owner) in transform_fixture
-        .events
-        .backend
-        .pstate
-        .direct
-        .outputs
-        .iter()
-        .enumerate()
-    {
-        assert!(
-            owner.unflip_requested,
-            "a CRTC transform requests Output({output_idx}) before a tick"
+        idled.sort_unstable();
+        assert_eq!(
+            idled,
+            [701, 702],
+            "both Present pins retire after {cause} replacement"
         );
-        assert!(
-            owner.current.is_some(),
-            "the last Present waits for replacement"
-        );
+        assert!(Backend::drain_retired_present_idle_events(&mut fixture.events.backend).is_empty());
+        fixture.finish_after_normal_drain();
     }
-    let transform_replacements = randr_compose_and_retire_replacements(&mut transform_fixture);
-    for output_idx in 0..2 {
-        let crtc = transform_fixture.events.backend.platform.outputs[output_idx]
-            .output
-            .crtc;
-        assert!(
-            transform_replacements.iter().any(|record| {
-                matches!(
-                    record.kind,
-                    crate::drm::atomic::AtomicCommitKind::Scene
-                        | crate::drm::atomic::AtomicCommitKind::SceneWithCursor
-                ) && record.events.iter().any(|event| event.crtc == crtc)
-            }),
-            "transformed replacement retires on output {output_idx}"
-        );
-    }
-    assert!(
-        transform_fixture
-            .events
-            .backend
-            .pstate
-            .direct
-            .active_scopes()
-            .is_empty()
-    );
-    assert!(
-        transform_fixture
-            .events
-            .backend
-            .present_source_pins
-            .is_empty()
-    );
-    assert!(
-        Backend::drain_completed_present_events(&mut transform_fixture.events.backend).is_empty(),
-        "unflip does not duplicate CompleteNotify"
-    );
-    let mut idled =
-        Backend::drain_retired_present_idle_events(&mut transform_fixture.events.backend)
-            .into_iter()
-            .map(|event| event.present_id)
-            .collect::<Vec<_>>();
-    idled.sort_unstable();
-    assert_eq!(
-        idled,
-        [701, 702],
-        "both Present pins retire after replacement"
-    );
-    assert!(
-        Backend::drain_retired_present_idle_events(&mut transform_fixture.events.backend)
-            .is_empty()
-    );
-    transform_fixture.finish_after_normal_drain();
 }
 
 #[test]
