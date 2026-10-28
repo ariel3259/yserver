@@ -31,6 +31,17 @@ impl Box32 {
         }
     }
 
+    /// `RegionFromRects`: the far edges stop at `MAXSHORT`.
+    fn from_wire_rect(r: RegionRect) -> Self {
+        let max = i32::from(i16::MAX);
+        let b = Self::from_rect(r);
+        Self {
+            x2: b.x2.min(max),
+            y2: b.y2.min(max),
+            ..b
+        }
+    }
+
     fn to_rect(self) -> RegionRect {
         let wire = |v: i32| v.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
         let len = |v: i32| v.clamp(0, i32::from(u16::MAX)) as u16;
@@ -59,7 +70,17 @@ impl Region {
     /// non-empty rect becomes a one-box region and the regions are unioned
     /// pairwise, a tree of `log n` rounds.
     pub(crate) fn from_rects(rects: &[RegionRect]) -> Self {
-        let mut boxes: Vec<Box32> = rects.iter().map(|r| Box32::from_rect(*r)).collect();
+        Self::from_boxes(rects.iter().map(|r| Box32::from_rect(*r)).collect())
+    }
+
+    /// The region of rects a client sent: Xorg's `RegionFromRects`
+    /// (`dix/region.c`), which clamps each rect's far edges at `MAXSHORT`
+    /// and normalises (`CT_UNSORTED` and the sorted orderings).
+    pub(crate) fn from_wire_rects(rects: &[RegionRect]) -> Self {
+        Self::from_boxes(rects.iter().map(|r| Box32::from_wire_rect(*r)).collect())
+    }
+
+    fn from_boxes(mut boxes: Vec<Box32>) -> Self {
         if is_canonical(&boxes) {
             return Self { boxes };
         }
@@ -109,6 +130,18 @@ impl Region {
 
     pub(crate) fn to_rects(&self) -> Vec<RegionRect> {
         self.boxes.iter().map(|b| b.to_rect()).collect()
+    }
+
+    /// `pixman_region_inverse`: the part of `bounds` the region does not
+    /// cover.
+    pub(crate) fn inverse(&self, bounds: Box32) -> Self {
+        if bounds.x1 >= bounds.x2 || bounds.y1 >= bounds.y2 {
+            return Self::default();
+        }
+        Self {
+            boxes: vec![bounds],
+        }
+        .subtract(self)
     }
 
     fn extents(&self) -> Option<Box32> {

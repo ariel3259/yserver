@@ -604,11 +604,12 @@ pub(super) fn handle_damage_request(
                 // `parts` into `SetPictureClipRectangles`; an empty
                 // parts collapses every subsequent composite to a no-op
                 // and the screen freezes.
-                let old_damage = state
+                let old_region = state
                     .damage_objects
                     .get(&damage_id)
-                    .map(|d| normalize_region_rects(d.rects.clone()))
+                    .map(|d| crate::region::Region::from_rects(&d.rects))
                     .unwrap_or_default();
+                let old_damage = old_region.to_rects();
                 let drawable = state
                     .damage_objects
                     .get(&damage_id)
@@ -632,9 +633,10 @@ pub(super) fn handle_damage_request(
                         .get(&repair)
                         .map(|r| r.rects.clone())
                         .unwrap_or_default();
+                    let repair_region = crate::region::Region::from_rects(&repair_rects);
                     (
-                        crate::nested::intersect_regions(&old_damage, &repair_rects),
-                        crate::nested::subtract_regions(&old_damage, &repair_rects),
+                        old_region.intersect(&repair_region).to_rects(),
+                        old_region.subtract(&repair_region).to_rects(),
                     )
                 };
                 let repair_rects = if repair == 0 {

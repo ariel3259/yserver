@@ -8,6 +8,7 @@ use crate::{
             windows::send_exposures, write_to_client, xid_out_of_client_range,
         },
     },
+    region::Region,
     resources::ROOT_WINDOW,
     server::ServerState,
 };
@@ -643,9 +644,24 @@ fn xfixes_expand_region_rects(
             }
         })
         .collect();
-    grown.iter().fold(Vec::new(), |acc, rect| {
-        crate::nested::union_regions(&acc, &[*rect])
-    })
+    grown
+        .iter()
+        .fold(Region::default(), |acc, rect| {
+            acc.union(&Region::rect(*rect))
+        })
+        .to_rects()
+}
+
+/// `ProcXFixesInvertRegion`'s bounds: the far edges stop at `MAXSHORT`.
+fn invert_bounds(r: yserver_protocol::x11::xfixes::RegionRect) -> crate::region::Box32 {
+    let max = i32::from(i16::MAX);
+    let (x1, y1) = (i32::from(r.x), i32::from(r.y));
+    crate::region::Box32 {
+        x1,
+        y1,
+        x2: (x1 + i32::from(r.width)).min(max),
+        y2: (y1 + i32::from(r.height)).min(max),
+    }
 }
 
 /// Send XFIXES `DisplayCursorNotify` for a backend-reported sprite change
@@ -915,7 +931,7 @@ pub(super) fn handle_xfixes_request(
                     region,
                     crate::server::XFixesRegion {
                         owner: client_id,
-                        rects: normalize_region_rects(rects),
+                        rects: Region::from_wire_rects(&rects).to_rects(),
                     },
                 );
             }
@@ -1137,7 +1153,7 @@ pub(super) fn handle_xfixes_request(
                         region,
                         crate::server::XFixesRegion {
                             owner: client_id,
-                            rects,
+                            rects: Region::from_wire_rects(&rects).to_rects(),
                         },
                     );
                 } else {
@@ -1281,7 +1297,7 @@ pub(super) fn handle_xfixes_request(
                     region,
                     crate::server::XFixesRegion {
                         owner: client_id,
-                        rects: normalize_region_rects(rects),
+                        rects: Region::from_wire_rects(&rects).to_rects(),
                     },
                 );
             }
@@ -1299,10 +1315,10 @@ pub(super) fn handle_xfixes_request(
                 state
                     .xfixes_regions
                     .entry(region)
-                    .and_modify(|r| r.rects = normalize_region_rects(rects.clone()))
+                    .and_modify(|r| r.rects = Region::from_wire_rects(&rects).to_rects())
                     .or_insert_with(|| crate::server::XFixesRegion {
                         owner: client_id,
-                        rects: normalize_region_rects(rects),
+                        rects: Region::from_wire_rects(&rects).to_rects(),
                     });
             }
         }
@@ -1345,19 +1361,14 @@ pub(super) fn handle_xfixes_request(
                     x11xfixes::SUBTRACT_REGION => "SubtractRegion",
                     _ => unreachable!(),
                 };
+                let (ra, rb) = (Region::from_rects(&a), Region::from_rects(&b));
                 let rects = match minor {
-                    x11xfixes::UNION_REGION => crate::nested::union_regions(&a, &b),
-                    x11xfixes::INTERSECT_REGION => crate::nested::intersect_regions(&a, &b),
-                    x11xfixes::SUBTRACT_REGION => {
-                        // Real rect-band subtraction (a - b). The
-                        // previous implementation collapsed any
-                        // overlap to an empty result — wrong for
-                        // any compositor that builds a wallpaper
-                        // clip via SubtractRegion(screen, windows).
-                        crate::nested::subtract_regions(&a, &b)
-                    }
+                    x11xfixes::UNION_REGION => ra.union(&rb),
+                    x11xfixes::INTERSECT_REGION => ra.intersect(&rb),
+                    x11xfixes::SUBTRACT_REGION => ra.subtract(&rb),
                     _ => unreachable!(),
-                };
+                }
+                .to_rects();
                 trace!(
                     target: "yserver::xfixes::region",
                     "{op_name} a=0x{source1:08x} rects{} b=0x{source2:08x} rects{} dst=0x{dest:08x} rects{}",
@@ -1385,10 +1396,9 @@ pub(super) fn handle_xfixes_request(
                     dest,
                     crate::server::XFixesRegion {
                         owner: client_id,
-                        rects: crate::nested::subtract_regions(
-                            &normalize_region_rects(vec![bounds]),
-                            &source_rects,
-                        ),
+                        rects: Region::from_rects(&source_rects)
+                            .inverse(invert_bounds(bounds))
+                            .to_rects(),
                     },
                 );
             }
