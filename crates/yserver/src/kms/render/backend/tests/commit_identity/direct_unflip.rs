@@ -5,7 +5,11 @@ use super::{
     recording_scene::{DirectPresentSetup, P1SceneRoute, RecordingSceneFixture},
     support::accepted_event_id,
 };
-use crate::drm::atomic::tests_support::{AtomicCommitRecord, ScriptedResult};
+use crate::drm::atomic::{
+    AtomicCommitEvent, AtomicCommitKind, AtomicCommitRequest,
+    tests_support::{AtomicCommitRecord, ScriptedResult},
+};
+use ::drm::control::AtomicCommitFlags;
 use std::{
     collections::{HashMap, HashSet},
     os::fd::RawFd,
@@ -739,7 +743,7 @@ fn damage_scene_root(fixture: &mut RecordingSceneFixture) {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutations: restore the root-wide early return; use the normal mask in the fresh-unflip pass.
+// Mutations: return after the fresh unflip; use the degraded-only mask for the pass.
 fn composed_output_flips_while_other_output_owner_pending_and_unflipping() {
     let Some((mut fixture, direct)) = direct_fixture(2, P1SceneRoute::Shared, 208, 0) else {
         return;
@@ -782,14 +786,29 @@ fn composed_output_flips_while_other_output_owner_pending_and_unflipping() {
     Backend::unmap_subwindow(&mut fixture.events.backend, None, direct.target_xid)
         .expect("request output 1 unflip through Backend");
     damage_scene_root(&mut fixture);
+    let output1_crtc = fixture.events.backend.platform.outputs[1].output.crtc;
     let before_fresh_unflip = record_count(&fixture, device_fd);
     Backend::maybe_composite(&mut fixture.events.backend)
-        .expect("fresh-unflip output 1 while output 0 damage waits");
-    let fresh_unflip = records_since(&fixture, device_fd, before_fresh_unflip)
-        .into_iter()
-        .find(|record| accepted_event_id(record).is_some())
-        .expect("fresh composed replacement accepted for output 1");
-    let output1_crtc = fixture.events.backend.platform.outputs[1].output.crtc;
+        .expect("fresh-unflip output 1 while output 0 composes in the same pass");
+    let pass_records = records_since(&fixture, device_fd, before_fresh_unflip);
+    let fresh_unflip = pass_records
+        .iter()
+        .find(|record| {
+            accepted_event_id(record).is_some()
+                && record.events.len() == 1
+                && record.events[0].crtc == output1_crtc
+        })
+        .expect("fresh composed replacement accepted for output 1")
+        .clone();
+    let output0_scene = pass_records
+        .iter()
+        .find(|record| {
+            record.kind == crate::drm::atomic::AtomicCommitKind::Scene
+                && record.events.len() == 1
+                && record.events[0].crtc == fixture.events.backend.platform.outputs[0].output.crtc
+                && accepted_event_id(record).is_some()
+        })
+        .expect("output 0 scene damage composes in the same pass as output 1's unflip");
     assert_eq!(fresh_unflip.events.len(), 1);
     assert_eq!(fresh_unflip.events[0].crtc, output1_crtc);
     let fresh_id = accepted_event_id(&fresh_unflip).expect("fresh unflip accepted ID");
@@ -800,35 +819,25 @@ fn composed_output_flips_while_other_output_owner_pending_and_unflipping() {
     );
     assert_eq!(
         fixture.events.backend.scene.pending_page_flip_event_id(0),
-        None,
-        "output 0 receives no pending acknowledgement from output 1's replacement"
+        accepted_event_id(output0_scene),
+        "output 0 owns its same-pass scene acknowledgement independently"
+    );
+    complete_recorded_attempt(
+        &mut fixture,
+        device_fd,
+        output0_scene,
+        accepted_event_id(output0_scene).expect("output 0 scene frame has an ID"),
+        60,
+    );
+    assert!(fixture.events.backend.scene.has_pending_page_flip(1));
+    assert!(
+        fixture.events.backend.pstate.direct.outputs[1]
+            .current
+            .is_some()
     );
     assert_eq!(
         fixture.events.backend.pstate.direct.outputs[1].unflip_awaiting_outputs,
         HashMap::from([(1, fresh_id)])
-    );
-
-    damage_scene_root(&mut fixture);
-    let before_next_pass = record_count(&fixture, device_fd);
-    Backend::maybe_composite(&mut fixture.events.backend)
-        .expect("compose output 0 on the pass after output 1's replacement submission");
-    let output0_after_unflip = records_since(&fixture, device_fd, before_next_pass)
-        .into_iter()
-        .find(|record| {
-            record.kind == crate::drm::atomic::AtomicCommitKind::Scene
-                && record.events.len() == 1
-                && record.events[0].crtc == fixture.events.backend.platform.outputs[0].output.crtc
-        })
-        .expect("output 0's deferred damage composes on the next scheduler pass");
-    assert_eq!(output0_after_unflip.events.len(), 1);
-    assert_eq!(
-        fixture.events.backend.scene.pending_page_flip_event_id(0),
-        accepted_event_id(&output0_after_unflip)
-    );
-    assert_eq!(
-        fixture.events.backend.pstate.direct.outputs[1].unflip_awaiting_outputs,
-        HashMap::from([(1, fresh_id)]),
-        "output 0's scene flip does not retire output 1's direct owner"
     );
 }
 
@@ -3274,5 +3283,448 @@ fn p1_degraded_copied_unflip_has_no_id_before_sink_acceptance() {
             .all(|row| { !(row.contains("phase=Free") && row.contains("ForeignPendingKms")) })
     );
     drain_present_notifications(&mut fixture, &[], &[direct.candidate.present_id]);
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: read Root's pending/replacement fields for every output query.
+fn present_in_flight_reads_the_output_owner() {
+    let Some(fixture) = RecordingSceneFixture::with_route(2, P1SceneRoute::Shared)
+        .expect("Present in-flight recording fixture construction")
+    else {
+        eprintln!("SKIP present_in_flight_reads_the_output_owner: Vulkan fixture unavailable");
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    let direct = fixture.install_direct_output_present(1, 216, 0);
+    let device_fd = fd(&fixture);
+    let output0_crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    let output1_crtc = fixture.events.backend.platform.outputs[1].output.crtc;
+
+    let submission_start = record_count(&fixture, device_fd);
+    Backend::set_cursor_hidden(&mut fixture.events.backend, true);
+    let direct_record = submit_output_present_via_backend(&mut fixture, &direct, 1);
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("compose output 0 while Output(1)'s Present flip is pending");
+    fixture.events.wait_for_submitted_gpu_work();
+    for record in accepted_records(&records_since(&fixture, device_fd, submission_start)) {
+        if record.kind == AtomicCommitKind::Scene
+            && record.events.iter().any(|event| event.crtc == output0_crtc)
+        {
+            complete_recorded_attempt(
+                &mut fixture,
+                device_fd,
+                &record,
+                accepted_event_id(&record).expect("output 0 scene commit has an ID"),
+                85,
+            );
+        }
+    }
+    assert!(!fixture.events.backend.scene.has_pending_page_flip(0));
+    assert!(!fixture.events.backend.scene.scene_structure_dirty);
+    assert!(
+        Backend::present_flip_in_flight(&fixture.events.backend, u32::from(output1_crtc)),
+        "the owning output reports its pending direct flip to Present's next-MSC path"
+    );
+    assert!(
+        !Backend::present_flip_in_flight(&fixture.events.backend, u32::from(output0_crtc)),
+        "output 0 does not borrow output 1's pending direct flip"
+    );
+    assert!(
+        !Backend::present_display_idle(&fixture.events.backend, u32::from(output1_crtc)),
+        "the idle-display classification sees output 1's pending direct flip"
+    );
+    assert!(
+        Backend::present_display_idle(&fixture.events.backend, u32::from(output0_crtc)),
+        "output 0 remains idle while output 1 owns the pending direct flip"
+    );
+
+    let direct_id = accepted_event_id(&direct_record).expect("Output(1) direct commit accepted");
+    complete_recorded_attempt(&mut fixture, device_fd, &direct_record, direct_id, 86);
+    drain_present_notifications(&mut fixture, &[direct.candidate.present_id], &[]);
+    Backend::unmap_subwindow(&mut fixture.events.backend, None, direct.target_xid)
+        .expect("request Output(1) replacement through Backend");
+    let replacement_start = record_count(&fixture, device_fd);
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("submit Output(1)'s unflip replacement through the scheduler");
+    fixture.events.wait_for_submitted_gpu_work();
+    let replacement_records = records_since(&fixture, device_fd, replacement_start);
+    for record in accepted_records(&replacement_records) {
+        if record.kind == AtomicCommitKind::Scene
+            && record.events.iter().any(|event| event.crtc == output0_crtc)
+        {
+            complete_recorded_attempt(
+                &mut fixture,
+                device_fd,
+                &record,
+                accepted_event_id(&record).expect("output 0 scene commit has an ID"),
+                86,
+            );
+        }
+    }
+    assert!(!fixture.events.backend.scene.has_pending_page_flip(0));
+    let replacement_id = fixture.events.backend.pstate.direct.outputs[1]
+        .unflip_awaiting_outputs
+        .get(&1)
+        .copied()
+        .expect("the output-scoped replacement is accepted and awaiting retirement");
+    assert!(
+        fixture.events.backend.pstate.direct.outputs[1]
+            .pending
+            .is_none(),
+        "only the replacement, not another direct frame, is pending"
+    );
+    assert!(
+        Backend::present_flip_in_flight(&fixture.events.backend, u32::from(output1_crtc)),
+        "Present sees the output owner's replacement in flight"
+    );
+    assert!(
+        !Backend::present_flip_in_flight(&fixture.events.backend, u32::from(output0_crtc)),
+        "output 0 remains unaffected while output 1's replacement is pending"
+    );
+    assert!(!Backend::present_display_idle(
+        &fixture.events.backend,
+        u32::from(output1_crtc)
+    ));
+    assert!(Backend::present_display_idle(
+        &fixture.events.backend,
+        u32::from(output0_crtc)
+    ));
+    assert!(replacement_records.iter().any(|record| {
+        accepted_event_id(record) == Some(replacement_id)
+            && record.events.iter().any(|event| event.crtc == output1_crtc)
+    }));
+
+    for record in accepted_records(&replacement_records)
+        .into_iter()
+        .filter(|record| !record.events.iter().any(|event| event.crtc == output0_crtc))
+    {
+        let id = accepted_event_id(&record).expect("accepted replacement has an ID");
+        complete_recorded_attempt(&mut fixture, device_fd, &record, id, 87);
+    }
+    let owner = &fixture.events.backend.pstate.direct.outputs[1];
+    assert!(owner.current.is_none());
+    assert!(owner.unflip_awaiting_outputs.is_empty());
+    assert!(owner.unflip_outputs_to_replace.is_empty());
+    assert!(fixture.events.backend.present_source_pins.is_empty());
+    drain_present_notifications(&mut fixture, &[], &[direct.candidate.present_id]);
+    fixture.finish_after_normal_drain();
+}
+
+fn try_output_owner_admission(
+    fixture: &mut RecordingSceneFixture,
+    direct: &DirectPresentSetup,
+) -> bool {
+    fixture
+        .events
+        .backend
+        .for_tests_set_scanout_m1_prober(super::super::present_scanout::record_scanout_m1_probe);
+    Backend::note_present_scanout_candidate(&mut fixture.events.backend, direct.candidate);
+    let probation = usize::from(crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION);
+    for _ in 0..probation {
+        if Backend::try_present_direct(
+            &mut fixture.events.backend,
+            direct.candidate,
+            direct.event.clone(),
+        )
+        .expect("Output candidate enters through Backend")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: make Output admission consult Root's reentry barrier after Root unflips.
+fn root_unflip_barrier_is_per_output_for_output_admission() {
+    let Some((fixture, root)) = direct_fixture(2, P1SceneRoute::Shared, 217, 0) else {
+        eprintln!(
+            "SKIP root_unflip_barrier_is_per_output_for_output_admission: Vulkan fixture unavailable"
+        );
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    let device_fd = fd(&fixture);
+    let root_record = submit_direct(&mut fixture, &root, device_fd)
+        .into_iter()
+        .find(|record| accepted_event_id(record).is_some() && record.events.len() == 2)
+        .expect("Root direct commit accepted on both outputs");
+    let root_id = accepted_event_id(&root_record).unwrap();
+    complete_direct_initial(&mut fixture, &root_record, root_id, device_fd);
+    drain_present_notifications(&mut fixture, &[root.candidate.present_id], &[]);
+
+    request_unflip(&mut fixture, &root);
+    let root_unflip_start = record_count(&fixture, device_fd);
+    let root_unflip = grouped_unflip_record(&mut fixture, device_fd, root_unflip_start, 2);
+    complete_recorded_attempt(
+        &mut fixture,
+        device_fd,
+        &root_unflip,
+        accepted_event_id(&root_unflip).unwrap(),
+        88,
+    );
+    drain_present_notifications(&mut fixture, &[], &[root.candidate.present_id]);
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .root()
+            .current
+            .is_none()
+    );
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .root()
+            .reentry_blocked_until_composed
+    );
+
+    // Simulate an unrelated KMS client holding output 1 with an accepted
+    // event-producing commit. The Backend scheduler must compose output 0
+    // while the foreign event keeps output 1 unavailable.
+    let output1_crtc = fixture.events.backend.platform.outputs[1].output.crtc;
+    let device = &fixture.events.backend.platform.devices[0];
+    let foreign_start = record_count(&fixture, device_fd);
+    let foreign_id = device
+        .atomic_commit_sink
+        .submit_with_commit_id(
+            &device.device,
+            AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK,
+            AtomicCommitKind::GammaOnly,
+            AtomicCommitRequest::new(),
+            &[AtomicCommitEvent {
+                crtc: output1_crtc,
+                motion_timestamp: None,
+            }],
+        )
+        .expect("record a foreign output 1 KMS hold");
+    let foreign_hold = records_since(&fixture, device_fd, foreign_start)
+        .into_iter()
+        .find(|record| accepted_event_id(record) == Some(foreign_id))
+        .expect("foreign output 1 hold is accepted by the recording KMS sink");
+    assert!(
+        fixture
+            .events
+            .backend
+            .platform
+            .scanout_commit_in_flight_for_output(1)
+    );
+
+    let output0 = fixture.install_direct_output_present(0, 218, 0);
+    let output1 = fixture.install_direct_output_present(1, 219, 0);
+    let compose_start = record_count(&fixture, device_fd);
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("compose output 0 while output 1's scene submission is held");
+    fixture.events.wait_for_submitted_gpu_work();
+    let held_records = records_since(&fixture, device_fd, compose_start);
+    assert!(held_records.iter().any(|record| {
+        record.kind == crate::drm::atomic::AtomicCommitKind::Scene
+            && accepted_event_id(record).is_some()
+            && record
+                .events
+                .iter()
+                .any(|event| event.crtc == fixture.events.backend.platform.outputs[0].output.crtc)
+    }));
+    assert!(!held_records.iter().any(|record| {
+        record.kind == crate::drm::atomic::AtomicCommitKind::Scene
+            && accepted_event_id(record).is_some()
+            && record
+                .events
+                .iter()
+                .any(|event| event.crtc == fixture.events.backend.platform.outputs[1].output.crtc)
+    }));
+    assert!(!fixture.events.backend.pstate.direct.outputs[0].reentry_blocked_until_composed);
+    assert!(fixture.events.backend.pstate.direct.outputs[1].reentry_blocked_until_composed);
+    for record in accepted_records(&held_records) {
+        let id = accepted_event_id(&record).unwrap();
+        complete_recorded_attempt(&mut fixture, device_fd, &record, id, 89);
+    }
+    complete_recorded_attempt(&mut fixture, device_fd, &foreign_hold, foreign_id, 90);
+    assert!(
+        !fixture
+            .events
+            .backend
+            .platform
+            .scanout_commit_in_flight_for_output(1)
+    );
+
+    let output0_admission_start = record_count(&fixture, device_fd);
+    assert!(
+        try_output_owner_admission(&mut fixture, &output0),
+        "Output(0) is admitted after its own composition even though Root's barrier remains"
+    );
+    let output0_admission_records = records_since(&fixture, device_fd, output0_admission_start);
+    assert!(
+        output0_admission_records.iter().any(|record| {
+            accepted_event_id(record).is_some()
+                && record.events.iter().any(|event| {
+                    event.crtc == fixture.events.backend.platform.outputs[0].output.crtc
+                })
+        }),
+        "Output(0) admission records its direct flip through Backend"
+    );
+    for record in accepted_records(&output0_admission_records) {
+        complete_recorded_attempt(
+            &mut fixture,
+            device_fd,
+            &record,
+            accepted_event_id(&record).unwrap(),
+            91,
+        );
+    }
+    assert!(
+        !try_output_owner_admission(&mut fixture, &output1),
+        "Output(1) stays blocked while its own composition barrier remains"
+    );
+
+    let output1_compose_start = record_count(&fixture, device_fd);
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("compose output 1 after releasing its foreign KMS hold");
+    fixture.events.wait_for_submitted_gpu_work();
+    let output1_records = records_since(&fixture, device_fd, output1_compose_start);
+    assert!(output1_records.iter().any(|record| {
+        record.kind == crate::drm::atomic::AtomicCommitKind::Scene
+            && accepted_event_id(record).is_some()
+            && record
+                .events
+                .iter()
+                .any(|event| event.crtc == fixture.events.backend.platform.outputs[1].output.crtc)
+    }));
+    for record in accepted_records(&output1_records) {
+        complete_recorded_attempt(
+            &mut fixture,
+            device_fd,
+            &record,
+            accepted_event_id(&record).unwrap(),
+            92,
+        );
+    }
+    assert!(!fixture.events.backend.pstate.direct.outputs[1].reentry_blocked_until_composed);
+    let output1_admission_start = record_count(&fixture, device_fd);
+    let output1_admitted = try_output_owner_admission(&mut fixture, &output1);
+    assert!(
+        output1_admitted,
+        "Output(1) is admitted after its own composition clears its barrier; root={:?}, output1={:?}, scene_pending=({}, {}), kms_pending=({}, {}), scope={:?}, cursor_mode={:?}",
+        (
+            fixture.events.backend.pstate.direct.root().active(),
+            fixture.events.backend.pstate.direct.root().unflip_requested,
+            fixture
+                .events
+                .backend
+                .pstate
+                .direct
+                .root()
+                .unflip_outputs_to_replace
+                .len(),
+            fixture
+                .events
+                .backend
+                .pstate
+                .direct
+                .root()
+                .unflip_awaiting_outputs
+                .len(),
+            fixture
+                .events
+                .backend
+                .pstate
+                .direct
+                .root()
+                .reentry_blocked_until_composed,
+        ),
+        (
+            fixture.events.backend.pstate.direct.outputs[1].eligible_streak,
+            fixture.events.backend.pstate.direct.outputs[1].active(),
+            fixture.events.backend.pstate.direct.outputs[1].unflip_requested,
+            fixture.events.backend.pstate.direct.outputs[1]
+                .unflip_outputs_to_replace
+                .len(),
+            fixture.events.backend.pstate.direct.outputs[1]
+                .unflip_awaiting_outputs
+                .len(),
+            fixture.events.backend.pstate.direct.outputs[1].reentry_blocked_until_composed,
+        ),
+        fixture.events.backend.scene.has_pending_page_flip(0),
+        fixture.events.backend.scene.has_pending_page_flip(1),
+        fixture
+            .events
+            .backend
+            .platform
+            .scanout_commit_in_flight_for_output(0),
+        fixture
+            .events
+            .backend
+            .platform
+            .scanout_commit_in_flight_for_output(1),
+        fixture.events.backend.direct_candidate_scope(
+            output1.candidate,
+            fixture.events.backend.scanout_m0_target(
+                output1.candidate.paint_dst_host_xid,
+                fixture
+                    .events
+                    .backend
+                    .store
+                    .lookup(output1.candidate.paint_dst_host_xid),
+                fixture
+                    .events
+                    .backend
+                    .resolve_paint_target(output1.candidate.paint_dst_host_xid)
+                    .map(|target| target.backing_id()),
+            ),
+        ),
+        fixture.events.backend.scene.cursor_mode_for_outputs(&[1]),
+    );
+
+    let output1_admission_records = records_since(&fixture, device_fd, output1_admission_start);
+    assert!(
+        output1_admission_records.iter().any(|record| {
+            accepted_event_id(record).is_some()
+                && record.events.iter().any(|event| {
+                    event.crtc == fixture.events.backend.platform.outputs[1].output.crtc
+                })
+        }),
+        "Output(1) admission records its direct flip through Backend"
+    );
+    for record in accepted_records(&output1_admission_records) {
+        complete_recorded_attempt(
+            &mut fixture,
+            device_fd,
+            &record,
+            accepted_event_id(&record).unwrap(),
+            93,
+        );
+    }
+    drain_present_notifications(
+        &mut fixture,
+        &[output0.candidate.present_id, output1.candidate.present_id],
+        &[],
+    );
+
+    Backend::unmap_subwindow(&mut fixture.events.backend, None, output0.target_xid)
+        .expect("request Output(0) cleanup unflip through Backend");
+    Backend::unmap_subwindow(&mut fixture.events.backend, None, output1.target_xid)
+        .expect("request Output(1) cleanup unflip through Backend");
+    let cleanup_start = record_count(&fixture, device_fd);
+    Backend::maybe_composite(&mut fixture.events.backend).expect("cleanup Output owners");
+    fixture.events.wait_for_submitted_gpu_work();
+    let cleanup_records = records_since(&fixture, device_fd, cleanup_start);
+    for record in accepted_records(&cleanup_records) {
+        let id = accepted_event_id(&record).unwrap();
+        complete_recorded_attempt(&mut fixture, device_fd, &record, id, 91);
+    }
+    assert!(fixture.events.backend.present_source_pins.is_empty());
+    drain_present_notifications(
+        &mut fixture,
+        &[],
+        &[output0.candidate.present_id, output1.candidate.present_id],
+    );
     fixture.finish_after_normal_drain();
 }

@@ -2542,6 +2542,11 @@ impl KmsBackend {
                 if let Some(owner) = self.pstate.direct.get_mut(scope) {
                     owner.reentry_blocked_until_composed = true;
                 }
+                if scope == DirectScope::Root {
+                    for owner in &mut self.pstate.direct.outputs {
+                        owner.reentry_blocked_until_composed = true;
+                    }
+                }
                 // Step 3 — while a CRTC scanned out a client buffer directly,
                 // the composed BOs were not painted and the scene was not
                 // tracking them; a direct retirement also bypasses
@@ -4041,8 +4046,6 @@ impl KmsBackend {
         for &scope in &active_scopes {
             self.submit_queued_direct_successor(scope);
         }
-        let mut unflip_submitted = false;
-        let mut degraded_compose = false;
         if !active_scopes.is_empty() {
             use crate::kms::render::scene::CursorPlaneMode;
             if self.platform.any_output_transformed() {
@@ -4108,7 +4111,6 @@ impl KmsBackend {
                             self.pstate
                                 .tearing
                                 .note_composed_submit(self.monotonic_now());
-                            unflip_submitted = true;
                         }
                         Ok(false) => {}
                         Err(error) => {
@@ -4123,28 +4125,17 @@ impl KmsBackend {
                                 owner.degraded_composed_unflip = true;
                             }
                             self.scene.mark_scene_structure_dirty();
-                            degraded_compose = true;
                         }
                     }
                 } else if self.pstate.direct.get(scope).is_some_and(|owner| {
                     owner.degraded_composed_unflip && !owner.unflip_outputs_to_replace.is_empty()
                 }) {
                     self.scene.mark_scene_structure_dirty();
-                    degraded_compose = true;
                 }
             }
         }
-        if unflip_submitted {
-            // Keep the replacement commit and the normal compose pass in
-            // separate scheduler ticks. Its output scope is already retained
-            // by the scene's accepted event identity.
-            self.drain_render_telemetry();
-            self.telemetry.maybe_emit(self.engine.pending_count());
-            self.drain_paint_submit_telemetry();
-            return Ok(());
-        }
-        let skip_outputs = self.scene_skip_outputs(degraded_compose);
-        if !degraded_compose && skip_outputs.iter().all(|skip| *skip) {
+        let skip_outputs = self.scene_skip_outputs(false);
+        if skip_outputs.iter().all(|skip| *skip) {
             // Root direct ownership still holds the complete output set, while
             // per-output owners leave unrelated CRTCs available above.
             self.drain_render_telemetry();
@@ -4201,7 +4192,7 @@ impl KmsBackend {
                 || scene_submitted_outputs.contains(&output_idx)
                 || self.scene.has_pending_page_flip(output_idx)
                 || self.scene.output_submit_retry_pending(output_idx)
-                || (self.scene_wants_scene()
+                || (self.scene_output_wants_scheduled_compose(output_idx)
                     && self
                         .scene
                         .output_ready_for_submit(output_idx, &self.platform))

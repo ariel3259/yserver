@@ -17,6 +17,36 @@ fn a3_records_since(
         .collect()
 }
 
+fn a3_drain_output_events(
+    fixture: &mut super::commit_identity::recording_scene::RecordingSceneFixture,
+    delivered: &mut std::collections::HashSet<super::cursor_sprites::support::CompletionKey>,
+    output_idx: usize,
+) {
+    for frame in 20..28 {
+        if !super::cursor_sprites::support::has_unretired_accepted_event(
+            &fixture.events,
+            delivered,
+            output_idx,
+        ) {
+            return;
+        }
+        super::cursor_sprites::support::retire_pending_output(
+            &mut fixture.events,
+            delivered,
+            output_idx,
+            frame,
+        );
+    }
+    assert!(
+        !super::cursor_sprites::support::has_unretired_accepted_event(
+            &fixture.events,
+            delivered,
+            output_idx,
+        ),
+        "output {output_idx} accepted events drain through Backend"
+    );
+}
+
 pub(crate) fn a3_admit_output_owner(
     fixture: &mut super::commit_identity::recording_scene::RecordingSceneFixture,
     direct: &super::commit_identity::recording_scene::DirectPresentSetup,
@@ -469,6 +499,27 @@ fn a3_present_root_copy(
         candidate.src_pixmap_xid,
         candidate.paint_dst_host_xid,
     );
+}
+
+fn a3_damage_root(fixture: &mut super::commit_identity::recording_scene::RecordingSceneFixture) {
+    use yserver_core::backend::Backend;
+
+    let root = fixture.events.backend.core.window_id;
+    let width = fixture.events.backend.platform.fb_w;
+    let height = fixture.events.backend.platform.fb_h;
+    Backend::clear_area(
+        &mut fixture.events.backend,
+        None,
+        root,
+        0,
+        None,
+        0,
+        0,
+        width,
+        height,
+        (0, 0),
+    )
+    .expect("damage the root through Backend");
 }
 
 fn a3_visible_root_pixel(
@@ -1860,4 +1911,399 @@ fn root_owner_triggers_unchanged() {
             .is_some()
     );
     fixture.finish();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutations: return for every submitted unflip; use the degraded-only mask; exclude the degraded output from scene readiness.
+fn output_unflip_does_not_stall_other_output_compose() {
+    use yserver_core::backend::Backend;
+
+    let Some((fixture, direct)) = a3_output_fixture(1, 956) else {
+        eprintln!(
+            "SKIP output_unflip_does_not_stall_other_output_compose: Vulkan fixture unavailable"
+        );
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    let device_fd = fixture.kms_fd(0);
+    a3_enter_output_owner(&mut fixture, &direct, 1);
+    Backend::unmap_subwindow(&mut fixture.events.backend, None, direct.target_xid)
+        .expect("request Output(1) unflip through Backend");
+    a3_damage_root(&mut fixture);
+    let before = fixture.events.recorders[&device_fd].records().len();
+
+    Backend::maybe_composite(&mut fixture.events.backend).expect("schedule Output(1) unflip");
+    fixture.events.wait_for_submitted_gpu_work();
+
+    let records = a3_records_since(&fixture, device_fd, before);
+    let output0_crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    let output1_crtc = fixture.events.backend.platform.outputs[1].output.crtc;
+    assert!(
+        a3_has_scene_commit_for(&records, output0_crtc),
+        "output 0's ready scene damage composes in the same pass as Output(1)'s unflip"
+    );
+    let replacement = records
+        .iter()
+        .find(|record| {
+            super::commit_identity::accepted_event_id(record).is_some()
+                && record.events.iter().any(|event| event.crtc == output1_crtc)
+        })
+        .expect("Output(1) replacement accepted in the same scheduling pass");
+    let replacement_id = super::commit_identity::accepted_event_id(replacement).unwrap();
+    assert_eq!(
+        fixture.events.backend.scene.pending_page_flip_event_id(0),
+        records
+            .iter()
+            .find(|record| { a3_has_scene_commit_for(std::slice::from_ref(*record), output0_crtc) })
+            .and_then(super::commit_identity::accepted_event_id),
+        "output 0 owns its scene acknowledgement independently"
+    );
+    assert!(
+        fixture.events.backend.pstate.direct.outputs[1]
+            .unflip_awaiting_outputs
+            .contains_key(&1)
+            || fixture.events.backend.scene.pending_page_flip_event_id(1) == Some(replacement_id),
+        "the accepted replacement remains tied to output 1 until retirement"
+    );
+
+    a3_retire_records(&mut fixture, &records);
+    assert!(
+        fixture.events.backend.pstate.direct.outputs[1]
+            .current
+            .is_none(),
+        "accepted output 1 replacement releases its direct owner"
+    );
+    assert!(fixture.events.backend.present_source_pins.is_empty());
+    fixture.finish_after_normal_drain();
+
+    let Some((fixture, direct)) = a3_output_fixture(1, 957) else {
+        eprintln!(
+            "SKIP output_unflip_does_not_stall_other_output_compose: second Vulkan fixture unavailable"
+        );
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    let device_fd = fixture.kms_fd(0);
+    a3_enter_output_owner(&mut fixture, &direct, 1);
+    Backend::unmap_subwindow(&mut fixture.events.backend, None, direct.target_xid)
+        .expect("request degraded Output(1) unflip through Backend");
+    a3_damage_root(&mut fixture);
+    let recorder = fixture.events.recorders[&device_fd].clone();
+    recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
+    recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
+    let before = recorder.records().len();
+
+    Backend::maybe_composite(&mut fixture.events.backend).expect("degrade Output(1) unflip");
+    fixture.events.wait_for_submitted_gpu_work();
+
+    let records = a3_records_since(&fixture, device_fd, before);
+    let output0_crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    let output1_crtc = fixture.events.backend.platform.outputs[1].output.crtc;
+    assert!(fixture.events.backend.pstate.direct.outputs[1].degraded_composed_unflip);
+    assert!(
+        a3_has_scene_commit_for(&records, output0_crtc),
+        "output 0 composes alongside the degraded output 1 replacement"
+    );
+    assert!(
+        a3_has_scene_commit_for(&records, output1_crtc),
+        "the degraded owner remains included until output 1's replacement is accepted"
+    );
+    let replacement = records
+        .iter()
+        .find(|record| {
+            super::commit_identity::accepted_event_id(record).is_some()
+                && record.events.iter().any(|event| event.crtc == output1_crtc)
+        })
+        .expect("degraded replacement accepted on output 1");
+    let replacement_id = super::commit_identity::accepted_event_id(replacement).unwrap();
+    assert_eq!(
+        fixture.events.backend.pstate.direct.outputs[1]
+            .unflip_awaiting_outputs
+            .get(&1),
+        Some(&replacement_id),
+        "accepted replacement identity remains assigned to its output"
+    );
+
+    a3_retire_records(&mut fixture, &records);
+    assert!(
+        fixture.events.backend.pstate.direct.outputs[1]
+            .current
+            .is_none(),
+        "retiring the accepted degraded replacement releases the owner"
+    );
+    assert!(fixture.events.backend.present_source_pins.is_empty());
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: use the global scene predicate when deciding whether to skip output 0's cursor-only commit.
+fn retained_direct_damage_does_not_block_other_output_cursor_commit() {
+    use yserver_core::backend::Backend;
+
+    let Some(mut atomic_fixture) =
+        super::cursor_sprites::support::AtomicPathFixture::with_output_count(
+            super::cursor_sprites::support::PathKind::Physical,
+            2,
+        )
+        .expect("two-output cursor scheduling fixture construction")
+    else {
+        eprintln!(
+            "SKIP retained_direct_damage_does_not_block_other_output_cursor_commit: Vulkan fixture unavailable"
+        );
+        return;
+    };
+    let mut delivered = std::collections::HashSet::new();
+    let cursor = super::cursor_sprites::support::create_bitmap_cursor(
+        &mut atomic_fixture.scene.events.backend,
+        true,
+    );
+    super::cursor_sprites::support::establish_hardware_cursor_on_output(
+        &mut atomic_fixture,
+        &mut delivered,
+        cursor,
+        0,
+        (100, 100),
+    );
+    for output_idx in 0..2 {
+        super::cursor_sprites::support::drain_unretired_output_events(
+            &mut atomic_fixture,
+            &mut delivered,
+            output_idx,
+        );
+    }
+    let direct = atomic_fixture
+        .scene
+        .install_direct_output_present(1, 958, 0);
+    let fixture = &mut atomic_fixture.scene;
+    let device_fd = fixture.kms_fd(0);
+    let output1 = &fixture.events.backend.platform.outputs[1];
+    let (x, y, width, height) = (
+        output1.x as i16,
+        output1.y as i16,
+        output1.width,
+        output1.height,
+    );
+    a3_add_existing_window_to_state(
+        &mut fixture.events.state,
+        yserver_protocol::x11::ResourceId(0x31a0),
+        direct.target_xid,
+        x,
+        y,
+        width,
+        height,
+        true,
+    );
+    Backend::sync_top_level_order(&mut fixture.events.backend, &fixture.events.state);
+    Backend::set_cursor_hidden(&mut fixture.events.backend, false);
+    for _ in 0..4 {
+        Backend::maybe_composite(&mut fixture.events.backend)
+            .expect("settle output 0's hardware cursor through Backend");
+        fixture.events.wait_for_submitted_gpu_work();
+        for output_idx in 0..2 {
+            a3_drain_output_events(fixture, &mut delivered, output_idx);
+        }
+    }
+    assert_eq!(
+        fixture.events.backend.scene.cursor_mode_for_outputs(&[0]),
+        crate::kms::render::scene::CursorPlaneMode::Hw,
+        "output 0 has an attached hardware cursor before Output(1) enters direct scanout"
+    );
+    Backend::warp_pointer_root(
+        &mut fixture.events.backend,
+        &mut fixture.events.state,
+        100,
+        100,
+    );
+    a3_damage_root(fixture);
+    for _ in 0..4 {
+        Backend::maybe_composite(&mut fixture.events.backend)
+            .expect("compose the output window and establish output 0's cursor");
+        fixture.events.wait_for_submitted_gpu_work();
+        for output_idx in 0..2 {
+            a3_drain_output_events(fixture, &mut delivered, output_idx);
+        }
+    }
+    let direct_records = a3_admit_output_owner(fixture, &direct, 1);
+    let direct_id = direct_records
+        .iter()
+        .find_map(super::commit_identity::accepted_event_id)
+        .expect("Output(1) direct request is accepted");
+    assert_eq!(
+        super::cursor_sprites::support::retire_pending_output(
+            &mut fixture.events,
+            &mut delivered,
+            1,
+            40,
+        ),
+        direct_id,
+        "Output(1)'s direct owner retires by its accepted event ID"
+    );
+    assert_eq!(
+        Backend::drain_completed_present_events(&mut fixture.events.backend)
+            .into_iter()
+            .map(|event| event.present_id)
+            .collect::<Vec<_>>(),
+        [direct.candidate.present_id]
+    );
+
+    Backend::fill_rectangle(
+        &mut fixture.events.backend,
+        None,
+        direct.candidate.src_host_xid,
+        0x0000_8fda,
+        0,
+        0,
+        width,
+        height,
+    )
+    .expect("paint the output-sized Present source through Backend");
+    Backend::copy_area(
+        &mut fixture.events.backend,
+        None,
+        direct.candidate.src_host_xid,
+        direct.target_xid,
+        0,
+        0,
+        0,
+        0,
+        width,
+        height,
+    )
+    .expect("retain output-window damage through the Present Copy fallback");
+    Backend::note_present_pixmap(
+        &mut fixture.events.backend,
+        direct.candidate.src_pixmap_xid,
+        direct.target_xid,
+    );
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("compose output 0 and clear the global wake while output 1 is direct");
+    fixture.events.wait_for_submitted_gpu_work();
+    assert!(
+        !fixture.events.backend.scene.scene_structure_dirty,
+        "the scheduler clears the global wake after output 0 inspects its clean scene"
+    );
+    for output_idx in 0..2 {
+        a3_drain_output_events(fixture, &mut delivered, output_idx);
+    }
+    assert!(
+        fixture
+            .events
+            .backend
+            .scene
+            .output_wants_compose(1, &fixture.events.backend.store),
+        "output 1 retains its direct-window damage; scene_dirty={}, armed={:?}",
+        fixture.events.backend.scene.scene_structure_dirty,
+        fixture.events.backend.store.armed_damaged_ids()
+    );
+    assert!(
+        !fixture
+            .events
+            .backend
+            .scene
+            .output_wants_compose(0, &fixture.events.backend.store),
+        "output 0 has no scene work"
+    );
+
+    Backend::warp_pointer_root(
+        &mut fixture.events.backend,
+        &mut fixture.events.state,
+        110,
+        100,
+    );
+    assert!(
+        Backend::next_wakeup(&fixture.events.backend)
+            .is_some_and(|wakeup| wakeup <= std::time::Instant::now()),
+        "Backend exposes the unsent pointer position as an immediate wake"
+    );
+    let before = fixture.events.recorders[&device_fd].records().len();
+
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("schedule output 0 cursor motion while output 1 damage is retained");
+    fixture.events.wait_for_submitted_gpu_work();
+
+    let records = a3_records_since(fixture, device_fd, before);
+    let cursor_only: Vec<_> = records
+        .iter()
+        .filter(|record| {
+            record.kind == crate::drm::atomic::AtomicCommitKind::CursorOnly
+                && super::commit_identity::accepted_event_id(record).is_some()
+                && record.events.iter().any(|event| {
+                    event.crtc == fixture.events.backend.platform.outputs[0].output.crtc
+                })
+        })
+        .collect();
+    assert!(
+        cursor_only.len() == 1,
+        "pointer motion submits one output 0 cursor-only request: cursor={cursor_only:?}, all={records:?}"
+    );
+    assert!(
+        fixture
+            .events
+            .backend
+            .scene
+            .output_wants_compose(1, &fixture.events.backend.store),
+        "output 1's retained damage remains pending"
+    );
+
+    for output_idx in 0..2 {
+        a3_drain_output_events(fixture, &mut delivered, output_idx);
+    }
+
+    Backend::unmap_subwindow(&mut fixture.events.backend, None, direct.target_xid)
+        .expect("request Output(1) cleanup unflip through Backend");
+    a3_damage_root(fixture);
+    let cleanup_start = fixture.events.recorders[&device_fd].records().len();
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("replace Output(1)'s direct scanout");
+    fixture.events.wait_for_submitted_gpu_work();
+    let cleanup = a3_records_since(fixture, device_fd, cleanup_start);
+    for output_idx in 0..2 {
+        a3_drain_output_events(fixture, &mut delivered, output_idx);
+    }
+    assert!(
+        fixture.events.backend.pstate.direct.outputs[1]
+            .current
+            .is_none(),
+        "cleanup retires the Output(1) owner; state={:?}, scene_pending={}, kms_pending={}, cursor={:?}, cleanup={cleanup:?}",
+        (
+            fixture.events.backend.pstate.direct.outputs[1].unflip_requested,
+            fixture.events.backend.pstate.direct.outputs[1]
+                .unflip_outputs_to_replace
+                .len(),
+            fixture.events.backend.pstate.direct.outputs[1]
+                .unflip_awaiting_outputs
+                .len(),
+        ),
+        fixture.events.backend.scene.has_pending_page_flip(1),
+        fixture
+            .events
+            .backend
+            .platform
+            .scanout_commit_in_flight_for_output(1),
+        fixture.events.backend.scene.cursor_mode_for_outputs(&[1]),
+    );
+    assert!(fixture.events.backend.present_source_pins.is_empty());
+    assert!(Backend::drain_completed_present_events(&mut fixture.events.backend).is_empty());
+    assert_eq!(
+        Backend::drain_retired_present_idle_events(&mut fixture.events.backend)
+            .into_iter()
+            .map(|event| event.present_id)
+            .collect::<Vec<_>>(),
+        [direct.candidate.present_id],
+        "Output(1)'s idle notification follows its completed replacement"
+    );
+    Backend::set_cursor_hidden(&mut fixture.events.backend, true);
+    a3_damage_root(fixture);
+    for _ in 0..4 {
+        Backend::maybe_composite(&mut fixture.events.backend)
+            .expect("detach the fixture cursor through Backend");
+        fixture.events.wait_for_submitted_gpu_work();
+        for output_idx in 0..2 {
+            a3_drain_output_events(fixture, &mut delivered, output_idx);
+        }
+    }
+    assert!(!fixture.events.backend.platform.any_cursor_plane_visible());
+    super::cursor_sprites::support::finish_atomic_fixture(atomic_fixture, &mut delivered);
 }

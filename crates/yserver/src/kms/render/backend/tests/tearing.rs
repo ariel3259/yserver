@@ -2965,11 +2965,14 @@ fn composed_output_flips_while_other_output_owner_held() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: let the degraded unflip pass use the normal mask, composing output 0 as well.
-fn degraded_output_unflip_composes_only_its_replacement_output() {
+// Mutation: restore the degraded-only mask so output 0 cannot compose in this pass.
+fn degraded_output_unflip_composes_other_ready_outputs_in_same_pass() {
     use yserver_core::backend::Backend;
 
     let Some(mut backend) = live_scene_backend_with_outputs(2) else {
+        eprintln!(
+            "SKIP degraded_output_unflip_composes_other_ready_outputs_in_same_pass: Vulkan fixture unavailable"
+        );
         return;
     };
     let recorder = recording_sink(&mut backend, 0);
@@ -2997,8 +3000,11 @@ fn degraded_output_unflip_composes_only_its_replacement_output() {
         .collect();
     assert_eq!(
         scene_crtcs,
-        [backend.platform.outputs[1].output.crtc],
-        "degraded replacement composes only the direct owner's output"
+        [
+            backend.platform.outputs[0].output.crtc,
+            backend.platform.outputs[1].output.crtc,
+        ],
+        "degraded replacement and unrelated ready output both compose in this pass"
     );
     assert!(backend.pstate.direct.outputs[1].degraded_composed_unflip);
     assert_eq!(

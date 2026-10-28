@@ -483,19 +483,17 @@ impl KmsBackend {
         &self,
         output_idx: usize,
     ) -> bool {
+        let owner = self
+            .pstate
+            .direct
+            .scope_for_output(output_idx)
+            .and_then(|scope| self.pstate.direct.get(scope));
         phase_b_flip_in_flight_for_scheduler(
             self.scene.has_pending_page_flip(output_idx),
-            self.pstate
-                .direct
-                .root()
-                .pending
-                .as_ref()
+            owner
+                .and_then(|owner| owner.pending.as_ref())
                 .is_some_and(|frame| frame.awaiting_outputs.contains(&output_idx)),
-            self.pstate
-                .direct
-                .root()
-                .unflip_outputs_to_replace
-                .contains(&output_idx),
+            owner.is_some_and(|owner| owner.unflip_outputs_to_replace.contains(&output_idx)),
         )
     }
 
@@ -1091,7 +1089,7 @@ impl KmsBackend {
                         || owner.unflip_requested
                         || !owner.unflip_outputs_to_replace.is_empty()
                         || !owner.unflip_awaiting_outputs.is_empty()
-                        || owner.reentry_blocked_until_composed
+                        || (scope == DirectScope::Root && owner.reentry_blocked_until_composed)
                 })
             })
             .collect();
