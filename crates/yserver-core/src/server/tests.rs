@@ -2076,7 +2076,7 @@ fn cow_with_empty_input_shape_passes_clicks_to_sibling_below() {
         .shape_windows
         .entry(crate::resources::COMPOSITE_OVERLAY_WINDOW)
         .or_default()
-        .input = Some(Vec::new());
+        .set_rects(yserver_protocol::x11::shape::KIND_INPUT, Some(Vec::new()));
 
     // Click at (50, 50): inside both sibling and COW geometry. COW's
     // empty input shape → hit_test_child(COW) = None → iteration
@@ -2210,12 +2210,15 @@ fn input_shape_is_tested_in_content_coordinates() {
     use yserver_protocol::x11::xfixes;
 
     let (mut state, frame) = bordered_frame_state();
-    state.shape_windows.entry(frame).or_default().input = Some(vec![xfixes::RegionRect {
-        x: 0,
-        y: 0,
-        width: 10,
-        height: 10,
-    }]);
+    state.shape_windows.entry(frame).or_default().set_rects(
+        yserver_protocol::x11::shape::KIND_INPUT,
+        Some(vec![xfixes::RegionRect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        }]),
+    );
 
     // Content origin (116, 216) → content (0,0): inside the shape.
     assert_eq!(
@@ -2349,12 +2352,15 @@ fn cow_with_non_empty_input_shape_descends_into_stage() {
         .shape_windows
         .entry(COMPOSITE_OVERLAY_WINDOW)
         .or_default()
-        .input = Some(vec![xfixes::RegionRect {
-        x: 0,
-        y: 0,
-        width: 800,
-        height: 600,
-    }]);
+        .set_rects(
+            yserver_protocol::x11::shape::KIND_INPUT,
+            Some(vec![xfixes::RegionRect {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            }]),
+        );
 
     let stage = ResourceId(0x0010_0050);
     state.resources.create_window(
@@ -2427,7 +2433,11 @@ fn core_empty_input_shape_makes_window_click_through() {
     let above = fullscreen_child(&mut state, 0x0010_0090);
 
     // `above` gets an EMPTY (but present) input shape → click-through.
-    state.shape_windows.entry(above).or_default().input = Some(vec![]);
+    state
+        .shape_windows
+        .entry(above)
+        .or_default()
+        .set_rects(yserver_protocol::x11::shape::KIND_INPUT, Some(vec![]));
 
     let (target, _, _) = state
         .root_pointer_target_at(50, 50)
@@ -2450,12 +2460,15 @@ fn core_full_input_shape_makes_window_opaque() {
     // Contrast with the empty case: a full-coverage input shape is
     // opaque, so the topmost window swallows the click. This also
     // proves the empty-case test above is not vacuous.
-    state.shape_windows.entry(above).or_default().input = Some(vec![xfixes::RegionRect {
-        x: 0,
-        y: 0,
-        width: 800,
-        height: 600,
-    }]);
+    state.shape_windows.entry(above).or_default().set_rects(
+        yserver_protocol::x11::shape::KIND_INPUT,
+        Some(vec![xfixes::RegionRect {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }]),
+    );
 
     let (target, _, _) = state
         .root_pointer_target_at(50, 50)
@@ -3002,7 +3015,7 @@ fn xid_occupied_covers_every_namespace() {
         id_xfixes,
         XFixesRegion {
             owner,
-            rects: vec![],
+            region: crate::region::Region::from_rects(&[]),
         },
     );
     expect.push(id_xfixes);

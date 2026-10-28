@@ -911,7 +911,7 @@ fn damage_subtract_flushes_coalesced_paint_before_consuming_damage() {
     )
     .expect("Subtract");
 
-    assert_eq!(state.xfixes_regions[&0x200].rects, rects);
+    assert_eq!(state.xfixes_regions[&0x200].rects(), rects);
     assert!(state.damage_objects[&0x100].rects.is_empty());
     assert_eq!(
         backend.calls(),
@@ -932,12 +932,12 @@ fn fetch_region_flushes_paint_before_exposing_damage_rectangles() {
         0x200,
         crate::server::XFixesRegion {
             owner: ClientId(1),
-            rects: vec![xfixes::RegionRect {
+            region: crate::region::Region::from_rects(&[xfixes::RegionRect {
                 x: 10,
                 y: 20,
                 width: 30,
                 height: 40,
-            }],
+            }]),
         },
     );
     process_request(
@@ -1091,7 +1091,7 @@ fn damage_subtract_with_no_repair_returns_old_damage_in_parts_and_clears() {
         0x21,
         XFixesRegion {
             owner: ClientId(1),
-            rects: Vec::new(),
+            region: crate::region::Region::default(),
         },
     );
 
@@ -1104,7 +1104,7 @@ fn damage_subtract_with_no_repair_returns_old_damage_in_parts_and_clears() {
         .get(&0x21)
         .expect("parts region must exist");
     assert_eq!(
-        parts.rects,
+        parts.rects(),
         vec![damaged_rect],
         "with repair=None, parts must receive the entire old damage region; \
              pre-fix this returns Vec::new() and starves compositors of a real clip"
@@ -1163,7 +1163,7 @@ fn damage_subtract_with_no_repair_canonicalizes_parts_region() {
         0x41,
         XFixesRegion {
             owner: ClientId(1),
-            rects: Vec::new(),
+            region: crate::region::Region::default(),
         },
     );
 
@@ -1174,7 +1174,7 @@ fn damage_subtract_with_no_repair_canonicalizes_parts_region() {
         .get(&0x41)
         .expect("parts region must exist");
     assert_eq!(
-        parts.rects,
+        parts.rects(),
         vec![RegionRect {
             x: 0,
             y: 0,
@@ -1222,21 +1222,21 @@ fn damage_subtract_with_repair_returns_intersection_and_subtracts_from_damage() 
         0x31,
         XFixesRegion {
             owner: ClientId(1),
-            rects: vec![repair_rect],
+            region: crate::region::Region::from_rects(&[repair_rect]),
         },
     );
     state.xfixes_regions.insert(
         0x32,
         XFixesRegion {
             owner: ClientId(1),
-            rects: Vec::new(),
+            region: crate::region::Region::default(),
         },
     );
 
     dispatch_damage_subtract(&mut state, &mut backend, 0x30, 0x31, 0x32);
 
     // parts = damage ∩ repair  →  right half 50x100 at (50, 0).
-    let parts = &state.xfixes_regions.get(&0x32).unwrap().rects;
+    let parts = &state.xfixes_regions.get(&0x32).unwrap().rects();
     let parts_area: u64 = parts
         .iter()
         .map(|r| u64::from(r.width) * u64::from(r.height))
@@ -1273,7 +1273,7 @@ fn damage_subtract_with_repair_returns_intersection_and_subtracts_from_damage() 
 
     // repair region MUST NOT have been overwritten — pre-fix this
     // stomped repair with `damage.rects.clone()`.
-    let repair_now = &state.xfixes_regions.get(&0x31).unwrap().rects;
+    let repair_now = &state.xfixes_regions.get(&0x31).unwrap().rects();
     assert_eq!(
         repair_now,
         &vec![repair_rect],
@@ -1331,19 +1331,19 @@ fn damage_subtract_with_remaining_nonempty_damage_rereports_immediately() {
         0x41,
         XFixesRegion {
             owner: ClientId(1),
-            rects: vec![RegionRect {
+            region: crate::region::Region::from_rects(&[RegionRect {
                 x: 50,
                 y: 0,
                 width: 50,
                 height: 100,
-            }],
+            }]),
         },
     );
     state.xfixes_regions.insert(
         0x42,
         XFixesRegion {
             owner: ClientId(1),
-            rects: Vec::new(),
+            region: crate::region::Region::default(),
         },
     );
 

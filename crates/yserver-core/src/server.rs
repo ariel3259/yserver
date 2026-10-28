@@ -2716,7 +2716,15 @@ pub struct PendingPresentPixmap {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct XFixesRegion {
     pub owner: ClientId,
-    pub rects: Vec<xfixes::RegionRect>,
+    pub(crate) region: crate::region::Region,
+}
+
+impl XFixesRegion {
+    /// The region's rects, as FetchRegion returns them.
+    #[must_use]
+    pub fn rects(&self) -> Vec<xfixes::RegionRect> {
+        self.region.to_rects()
+    }
 }
 
 /// XFIXES/XInput pointer barrier (XID resource, client-owned).
@@ -2745,17 +2753,14 @@ pub struct PointerBarrier {
     pub last_timestamp: u32,
 }
 
-/// A window's SHAPE regions as clients set them. The bounding and clip
-/// shapes also keep their canonical [`Region`](crate::region::Region),
-/// built once per change for the clip lists; the fields are private so
-/// that no write can leave it stale.
+/// A window's SHAPE regions, `None` while a kind is unset. Each is kept
+/// as a [`Region`](crate::region::Region) between requests, so the SHAPE
+/// operations and the clip lists use it as it is.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ShapeWindowState {
-    bounding: Option<Vec<xfixes::RegionRect>>,
-    clip: Option<Vec<xfixes::RegionRect>>,
-    input: Option<Vec<xfixes::RegionRect>>,
-    bounding_region: Option<crate::region::Region>,
-    clip_region: Option<crate::region::Region>,
+    bounding: Option<crate::region::Region>,
+    clip: Option<crate::region::Region>,
+    input: Option<crate::region::Region>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3023,47 +3028,53 @@ impl Default for SyncAlarm {
 impl ShapeWindowState {
     /// Set (or, with `None`, unset) the shape of `kind`; an unknown kind
     /// is ignored.
-    pub fn set_rects(&mut self, kind: u8, rects: Option<Vec<xfixes::RegionRect>>) {
-        let region = |r: &Option<Vec<xfixes::RegionRect>>| {
-            r.as_deref().map(crate::region::Region::from_rects)
-        };
+    pub(crate) fn set_region(&mut self, kind: u8, region: Option<crate::region::Region>) {
         match kind {
-            shape::KIND_BOUNDING => {
-                self.bounding_region = region(&rects);
-                self.bounding = rects;
-            }
-            shape::KIND_CLIP => {
-                self.clip_region = region(&rects);
-                self.clip = rects;
-            }
-            shape::KIND_INPUT => self.input = rects,
+            shape::KIND_BOUNDING => self.bounding = region,
+            shape::KIND_CLIP => self.clip = region,
+            shape::KIND_INPUT => self.input = region,
             _ => {}
         }
     }
 
-    #[must_use]
-    pub fn bounding(&self) -> Option<&Vec<xfixes::RegionRect>> {
+    /// [`ShapeWindowState::set_region`] from arbitrary rects.
+    pub fn set_rects(&mut self, kind: u8, rects: Option<Vec<xfixes::RegionRect>>) {
+        self.set_region(kind, rects.map(|r| crate::region::Region::from_rects(&r)));
+    }
+
+    /// The shape of `kind`, `None` while unset.
+    pub(crate) fn region(&self, kind: u8) -> Option<&crate::region::Region> {
+        match kind {
+            shape::KIND_BOUNDING => self.bounding.as_ref(),
+            shape::KIND_CLIP => self.clip.as_ref(),
+            shape::KIND_INPUT => self.input.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// The bounding shape.
+    pub(crate) fn bounding_region(&self) -> Option<&crate::region::Region> {
         self.bounding.as_ref()
     }
 
-    #[must_use]
-    pub fn clip(&self) -> Option<&Vec<xfixes::RegionRect>> {
+    /// The clip shape.
+    pub(crate) fn clip_region(&self) -> Option<&crate::region::Region> {
         self.clip.as_ref()
     }
 
     #[must_use]
-    pub fn input(&self) -> Option<&Vec<xfixes::RegionRect>> {
-        self.input.as_ref()
+    pub fn bounding(&self) -> Option<Vec<xfixes::RegionRect>> {
+        self.rects(shape::KIND_BOUNDING)
     }
 
-    /// The bounding shape's canonical region.
-    pub(crate) fn bounding_region(&self) -> Option<&crate::region::Region> {
-        self.bounding_region.as_ref()
+    #[must_use]
+    pub fn clip(&self) -> Option<Vec<xfixes::RegionRect>> {
+        self.rects(shape::KIND_CLIP)
     }
 
-    /// The clip shape's canonical region.
-    pub(crate) fn clip_region(&self) -> Option<&crate::region::Region> {
-        self.clip_region.as_ref()
+    #[must_use]
+    pub fn input(&self) -> Option<Vec<xfixes::RegionRect>> {
+        self.rects(shape::KIND_INPUT)
     }
 
     /// No shape of any kind is set.
@@ -3072,14 +3083,10 @@ impl ShapeWindowState {
         self.bounding.is_none() && self.clip.is_none() && self.input.is_none()
     }
 
+    /// The rects of the shape of `kind`, `None` while unset.
     #[must_use]
-    pub fn rects(&self, kind: u8) -> Option<&Vec<xfixes::RegionRect>> {
-        match kind {
-            shape::KIND_BOUNDING => self.bounding.as_ref(),
-            shape::KIND_CLIP => self.clip.as_ref(),
-            shape::KIND_INPUT => self.input.as_ref(),
-            _ => None,
-        }
+    pub fn rects(&self, kind: u8) -> Option<Vec<xfixes::RegionRect>> {
+        self.region(kind).map(crate::region::Region::to_rects)
     }
 }
 
@@ -3320,14 +3327,14 @@ impl ServerState {
         };
         let (ox, oy) = (x1 + bw, y1 + bw);
         shape
+            .boxes()
             .iter()
             .map(|r| {
-                let (rx, ry) = (ox + i32::from(r.x), oy + i32::from(r.y));
                 (
-                    rx.max(x1),
-                    ry.max(y1),
-                    (rx + i32::from(r.width)).min(x2),
-                    (ry + i32::from(r.height)).min(y2),
+                    (ox + r.x1).max(x1),
+                    (oy + r.y1).max(y1),
+                    (ox + r.x2).min(x2),
+                    (oy + r.y2).min(y2),
                 )
             })
             .filter(|b| b.0 < b.2 && b.1 < b.3)
@@ -3459,18 +3466,10 @@ impl ServerState {
         let Some(shape) = self.shape_windows.get(&window) else {
             return true;
         };
-        let holds = |rects: &Option<Vec<xfixes::RegionRect>>| {
-            rects.as_ref().is_none_or(|rects| {
-                rects.iter().any(|rect| {
-                    let rx = i32::from(rect.x);
-                    let ry = i32::from(rect.y);
-                    let rr = rx + i32::from(rect.width);
-                    let rb = ry + i32::from(rect.height);
-                    let px = i32::from(x);
-                    let py = i32::from(y);
-                    px >= rx && py >= ry && px < rr && py < rb
-                })
-            })
+        let holds = |region: &Option<crate::region::Region>| {
+            region
+                .as_ref()
+                .is_none_or(|r| r.contains_point(i32::from(x), i32::from(y)))
         };
         holds(&shape.bounding) && holds(&shape.input)
     }

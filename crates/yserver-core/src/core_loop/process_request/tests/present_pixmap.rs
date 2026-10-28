@@ -1015,7 +1015,7 @@ fn present_pixmap_common_validation_order_and_card32_remainder() {
         VALID,
         crate::server::XFixesRegion {
             owner: ClientId(1),
-            rects: Vec::new(),
+            region: crate::region::Region::default(),
         },
     );
     dispatch_present_body(
@@ -1032,7 +1032,7 @@ fn present_pixmap_common_validation_order_and_card32_remainder() {
         UPDATE,
         crate::server::XFixesRegion {
             owner: ClientId(1),
-            rects: Vec::new(),
+            region: crate::region::Region::default(),
         },
     );
     dispatch_present_body(
@@ -1188,7 +1188,7 @@ fn present_pixmap_synced_validation_order_and_card32_remainder() {
         VALID,
         crate::server::XFixesRegion {
             owner: ClientId(1),
-            rects: Vec::new(),
+            region: crate::region::Region::default(),
         },
     );
     dispatch_present_body(
@@ -1205,7 +1205,7 @@ fn present_pixmap_synced_validation_order_and_card32_remainder() {
         UPDATE,
         crate::server::XFixesRegion {
             owner: ClientId(1),
-            rects: Vec::new(),
+            region: crate::region::Region::default(),
         },
     );
     dispatch_present_body(
@@ -4578,7 +4578,7 @@ fn present_pixmap_update_region_emits_damage_on_destination_window() {
         UPDATE_REGION_XID,
         crate::server::XFixesRegion {
             owner: ClientId(CLIENT),
-            rects: vec![
+            region: crate::region::Region::from_rects(&[
                 RegionRect {
                     x: 100,
                     y: 120,
@@ -4591,7 +4591,7 @@ fn present_pixmap_update_region_emits_damage_on_destination_window() {
                     width: 25,
                     height: 35,
                 },
-            ],
+            ]),
         },
     );
 
@@ -4620,7 +4620,8 @@ fn present_pixmap_update_region_emits_damage_on_destination_window() {
         .get(&DAMAGE_XID)
         .expect("damage object");
     assert_eq!(
-        damage.rects, state.xfixes_regions[&UPDATE_REGION_XID].rects,
+        damage.rects,
+        state.xfixes_regions[&UPDATE_REGION_XID].rects(),
         "PresentPixmap must feed its update region into DAMAGE on the destination window",
     );
 }
@@ -4710,7 +4711,7 @@ fn present_pixmap_synced_update_region_emits_damage_on_destination_window() {
         UPDATE_REGION_XID,
         crate::server::XFixesRegion {
             owner: ClientId(CLIENT),
-            rects: vec![
+            region: crate::region::Region::from_rects(&[
                 RegionRect {
                     x: 100,
                     y: 120,
@@ -4723,7 +4724,7 @@ fn present_pixmap_synced_update_region_emits_damage_on_destination_window() {
                     width: 25,
                     height: 35,
                 },
-            ],
+            ]),
         },
     );
 
@@ -4810,7 +4811,8 @@ fn present_pixmap_synced_update_region_emits_damage_on_destination_window() {
         .get(&DAMAGE_XID)
         .expect("damage object");
     assert_eq!(
-        damage.rects, state.xfixes_regions[&UPDATE_REGION_XID].rects,
+        damage.rects,
+        state.xfixes_regions[&UPDATE_REGION_XID].rects(),
         "PresentPixmapSynced must feed its update region into DAMAGE on the destination window",
     );
 }
@@ -4869,7 +4871,7 @@ fn present_pixmap_copy_uses_update_region_rects_as_copy_clips() {
         UPDATE_REGION_XID,
         crate::server::XFixesRegion {
             owner: ClientId(CLIENT),
-            rects: vec![
+            region: crate::region::Region::from_rects(&[
                 RegionRect {
                     x: 100,
                     y: 120,
@@ -4882,7 +4884,7 @@ fn present_pixmap_copy_uses_update_region_rects_as_copy_clips() {
                     width: 25,
                     height: 35,
                 },
-            ],
+            ]),
         },
     );
 

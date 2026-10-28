@@ -625,9 +625,9 @@ fn xfixes_expand_region_matches_xvfb() {
         width,
         height,
     };
-    let region = |rects| crate::server::XFixesRegion {
+    let region = |rects: Vec<RegionRect>| crate::server::XFixesRegion {
         owner: ClientId(1),
-        rects,
+        region: crate::region::Region::from_rects(&rects),
     };
     state
         .xfixes_regions
@@ -652,7 +652,7 @@ fn xfixes_expand_region_matches_xvfb() {
         &expand(0x10, 0x11, 1, 2, 3, 4),
     );
     assert_eq!(
-        state.xfixes_regions[&0x11].rects,
+        state.xfixes_regions[&0x11].rects(),
         vec![rect(9, 7, 8, 12), rect(29, 27, 8, 12)]
     );
     xfixes_req(
@@ -663,7 +663,7 @@ fn xfixes_expand_region_matches_xvfb() {
         &expand(0x10, 0x11, 20, 20, 0, 0),
     );
     assert_eq!(
-        state.xfixes_regions[&0x11].rects,
+        state.xfixes_regions[&0x11].rects(),
         vec![rect(-10, 10, 45, 5), rect(10, 30, 45, 5)]
     );
     xfixes_req(
@@ -674,7 +674,7 @@ fn xfixes_expand_region_matches_xvfb() {
         &expand(0x12, 0x11, 1, 1, 1, 1),
     );
     assert_eq!(
-        state.xfixes_regions[&0x11].rects,
+        state.xfixes_regions[&0x11].rects(),
         vec![rect(-10, 10, 45, 5), rect(10, 30, 45, 5)]
     );
     assert!(wire_packets(&mut peer).is_empty());
@@ -1139,12 +1139,12 @@ fn xfixes_subtract_region_partial_overlap_returns_remaining_bands() {
         0x10,
         XFixesRegion {
             owner: ClientId(1),
-            rects: vec![RegionRect {
+            region: crate::region::Region::from_rects(&[RegionRect {
                 x: 0,
                 y: 0,
                 width: 100,
                 height: 100,
-            }],
+            }]),
         },
     );
     // Region B: a 50x100 strip overlapping the right half of A.
@@ -1152,12 +1152,12 @@ fn xfixes_subtract_region_partial_overlap_returns_remaining_bands() {
         0x11,
         XFixesRegion {
             owner: ClientId(1),
-            rects: vec![RegionRect {
+            region: crate::region::Region::from_rects(&[RegionRect {
                 x: 50,
                 y: 0,
                 width: 50,
                 height: 100,
-            }],
+            }]),
         },
     );
     // SUBTRACT_REGION body: source1(4) + source2(4) + dest(4).
@@ -1187,7 +1187,7 @@ fn xfixes_subtract_region_partial_overlap_returns_remaining_bands() {
         .get(&0x12)
         .expect("dest region recorded");
     assert!(
-        !result.rects.is_empty(),
+        !result.rects().is_empty(),
         "partial-overlap subtraction must NOT collapse to empty — \
              pre-fix this returns Vec::new() and breaks compositor \
              wallpaper-clip computation",
@@ -1196,7 +1196,7 @@ fn xfixes_subtract_region_partial_overlap_returns_remaining_bands() {
     // leaves the left band (0,0 50x100). Allow any equivalent
     // rect decomposition that covers exactly that area.
     let total_area: u64 = result
-        .rects
+        .rects()
         .iter()
         .map(|r| u64::from(r.width) * u64::from(r.height))
         .sum();
@@ -1204,10 +1204,10 @@ fn xfixes_subtract_region_partial_overlap_returns_remaining_bands() {
         total_area,
         50 * 100,
         "result area must be 5000 (the left half of A); got rects {:?}",
-        result.rects,
+        result.rects(),
     );
     // No result rect may extend into B's x-range [50, 100).
-    for r in &result.rects {
+    for r in &result.rects() {
         assert!(
             r.x + i16::try_from(r.width).unwrap_or(i16::MAX) <= 50,
             "result rect {r:?} extends into the subtracted region",
@@ -1502,7 +1502,7 @@ fn create_region_with_in_use_xid_returns_bad_id_choice() {
         REGION_XID,
         crate::server::XFixesRegion {
             owner: ClientId(APP),
-            rects: Vec::new(),
+            region: crate::region::Region::default(),
         },
     );
 
@@ -1546,10 +1546,10 @@ fn create_region_with_in_use_xid_returns_bad_id_choice() {
         .get(&REGION_XID)
         .expect("pre-existing region must remain");
     assert!(
-        r.rects.is_empty(),
+        r.rects().is_empty(),
         "pre-existing region must not be overwritten on BadIDChoice; \
              got rects={:?}",
-        r.rects,
+        r.rects(),
     );
 }
 
@@ -1643,7 +1643,7 @@ fn create_region_from_gc_with_in_use_xid_returns_bad_id_choice() {
         REGION_XID,
         crate::server::XFixesRegion {
             owner: ClientId(APP),
-            rects: Vec::new(),
+            region: crate::region::Region::default(),
         },
     );
 
@@ -1808,12 +1808,12 @@ fn create_region_from_gc_copies_clip_rects_without_origin_translation() {
         .get(&REGION_XID)
         .expect("CreateRegionFromGC inserted region");
     assert_eq!(
-        region.rects.len(),
+        region.rects().len(),
         1,
         "expected exactly one rect from the GC's single-rect clip; got {:?}",
-        region.rects,
+        region.rects(),
     );
-    let r = &region.rects[0];
+    let r = &region.rects()[0];
     assert_eq!(
         (r.x, r.y, r.width, r.height),
         (RECT_X, RECT_Y, RECT_W, RECT_H),

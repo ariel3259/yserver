@@ -152,6 +152,49 @@ proptest! {
     }
 }
 
+/// `rects`' canonical region with every box cut in two at its middle
+/// column and every band in two at its middle row: still YX-banded, as
+/// `yx_banded` checks, but with touching boxes and equal adjacent bands.
+fn uncoalesced(rects: &[RegionRect]) -> Vec<RegionRect> {
+    let mut out = Vec::new();
+    for b in &Region::from_rects(rects).boxes {
+        let (ym, xm) = ((b.y1 + b.y2) / 2, (b.x1 + b.x2) / 2);
+        for (y1, y2) in [(b.y1, ym), (ym, b.y2)] {
+            for (x1, x2) in [(b.x1, xm), (xm, b.x2)] {
+                if x1 < x2 && y1 < y2 {
+                    out.push(Box32 { x1, y1, x2, y2 }.to_rect());
+                }
+            }
+        }
+    }
+    // Back into band order: the cut made two bands of each.
+    out.sort_by_key(|r| (r.y, r.x));
+    out
+}
+
+proptest! {
+    /// A YXBanded region taken as given gives the operations the same
+    /// pixels. (Like pixman's, the results need not be canonical: bands
+    /// only one side covers are copied as they are.)
+    #[test]
+    fn yx_banded_regions_take_part_in_the_operations(a in rects(), b in rects()) {
+        let banded = uncoalesced(&a);
+        prop_assert!(yx_banded(&banded), "not banded: {:?}", banded);
+        let (ra, rb) = (Region::from_yx_banded(&banded), Region::from_rects(&b));
+        prop_assert_eq!(raster(&ra.to_rects()), raster(&a));
+        let cells = |f: fn(bool, bool) -> bool| -> Vec<bool> {
+            raster(&a).into_iter().zip(raster(&b)).map(|(p, q)| f(p, q)).collect()
+        };
+        let union = ra.union(&rb);
+        prop_assert_eq!(raster(&union.to_rects()), cells(|p, q| p || q));
+        prop_assert_eq!(raster(&ra.intersect(&rb).to_rects()), cells(|p, q| p && q));
+        let sub = ra.subtract(&rb);
+        prop_assert_eq!(raster(&sub.to_rects()), cells(|p, q| p && !q));
+        let rsub = rb.subtract(&ra);
+        prop_assert_eq!(raster(&rsub.to_rects()), cells(|p, q| q && !p));
+    }
+}
+
 /// pixman merges bands whose spans agree, and a hole splits a rect into a
 /// top band, two sides and a bottom band.
 #[test]

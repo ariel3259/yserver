@@ -1884,7 +1884,7 @@ pub(super) fn handle_present_request(
                             if req.update == 0 {
                                 (-1, None) // full copy: no update region
                             } else if let Some(region) = state.xfixes_regions.get(&req.update) {
-                                let bbox = region.rects.iter().fold(
+                                let bbox = region.rects().iter().fold(
                                     None,
                                     |acc: Option<(i32, i32, i32, i32)>, r| {
                                         let x0 = i32::from(r.x);
@@ -1899,7 +1899,7 @@ pub(super) fn handle_present_request(
                                         })
                                     },
                                 );
-                                (region.rects.len() as isize, bbox)
+                                (region.rects().len() as isize, bbox)
                             } else {
                                 (-2, None) // update id set but region not found → full copy
                             };
@@ -1925,7 +1925,7 @@ pub(super) fn handle_present_request(
                     state
                         .xfixes_regions
                         .get(&req.update)
-                        .map(|region| region.rects.clone())
+                        .map(crate::server::XFixesRegion::rects)
                 };
                 let present_id = state.next_present_id();
                 let window_generation = state.present_window_generation(req.window);
@@ -2311,7 +2311,7 @@ pub(super) fn handle_present_request(
                         state
                             .xfixes_regions
                             .get(&req.update)
-                            .map(|region| region.rects.clone())
+                            .map(crate::server::XFixesRegion::rects)
                     };
                     let present_id = state.next_present_id();
                     let window_generation = state.present_window_generation(req.window);

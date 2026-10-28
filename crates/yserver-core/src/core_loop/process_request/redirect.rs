@@ -976,13 +976,20 @@ fn bounding_in_parent(
     (x, y, width, height, border_width): (i16, i16, u16, u16, u16),
 ) -> Vec<x11::xfixes::RegionRect> {
     let outer = outer_rect(x, y, width, height, border_width);
-    let Some(shape) = state.shape_windows.get(&window).and_then(|s| s.bounding()) else {
+    let Some(shape) = state
+        .shape_windows
+        .get(&window)
+        .and_then(|s| s.bounding_region())
+    else {
         return vec![outer];
     };
-    let bw = i16::try_from(border_width).unwrap_or(i16::MAX);
-    let shape =
-        crate::nested::offset_rects(shape.clone(), x.saturating_add(bw), y.saturating_add(bw));
-    crate::nested::intersect_regions(&[outer], &shape)
+    let bw = i32::from(border_width);
+    let shape = shape
+        .clone()
+        .translate(i32::from(x) + bw, i32::from(y) + bw);
+    crate::region::Region::rect(outer)
+        .intersect(&shape)
+        .to_rects()
 }
 
 /// [`bounding_in_parent`] at the window's current geometry.

@@ -165,15 +165,19 @@ pub fn mapped_child_clip_rects(
             // A shaped child covers only its bounding shape (Xorg's
             // `borderSize`, `dix/window.c:1747-1770`); the shape is
             // relative to its content origin.
-            match state.shape_windows.get(&w.id).and_then(|s| s.bounding()) {
+            match state
+                .shape_windows
+                .get(&w.id)
+                .and_then(|s| s.bounding_region())
+            {
                 Some(shape) => {
-                    let bw = i16::try_from(w.border_width).unwrap_or(i16::MAX);
-                    let shape = crate::nested::offset_rects(
-                        shape.clone(),
-                        w.x.saturating_add(bw),
-                        w.y.saturating_add(bw),
-                    );
-                    crate::nested::intersect_regions(&[rect], &shape)
+                    let bw = i32::from(w.border_width);
+                    let shape = shape
+                        .clone()
+                        .translate(i32::from(w.x) + bw, i32::from(w.y) + bw);
+                    crate::region::Region::rect(rect)
+                        .intersect(&shape)
+                        .to_rects()
                 }
                 None => vec![rect],
             }

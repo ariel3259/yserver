@@ -391,24 +391,24 @@ fn shapes_stored_by_the_request_path_match_the_oracle() {
         KIND_BOUNDING,
         bands.clone()
     ));
+    let clip = vec![r(1, 1, 8, 3), r(1, 4, 8, 3), r(20, 1, 4, 6)];
     assert!(crate::nested::set_shape_rects(
         &mut state,
         ids[1],
         KIND_CLIP,
-        vec![r(1, 1, 8, 3), r(1, 4, 8, 3), r(20, 1, 4, 6)]
+        clip.clone()
     ));
     let shape = &state.shape_windows[&ids[1]];
-    let stored = shape.bounding().unwrap();
-    let canonical = crate::region::Region::from_rects(stored);
+    let canonical = crate::region::Region::from_rects(&bands);
     assert_ne!(
-        &canonical.to_rects(),
-        stored,
-        "the stored shape is meant to be non-canonical"
+        canonical.to_rects(),
+        bands,
+        "the rects given are meant to be non-canonical"
     );
     assert_eq!(shape.bounding_region(), Some(&canonical));
     assert_eq!(
         shape.clip_region(),
-        Some(&crate::region::Region::from_rects(shape.clip().unwrap()))
+        Some(&crate::region::Region::from_rects(&clip))
     );
     assert_queries_match(&state, &ids);
 

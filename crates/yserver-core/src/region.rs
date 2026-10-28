@@ -1,10 +1,14 @@
 //! Y-x banded regions with pixman's set operations (`pixman-region.c`,
 //! `pixman_op` and its `union_o` / `intersect_o` / `subtract_o` overlap
-//! functions). A [`Region`] is always in pixman's canonical form: boxes
+//! functions). A [`Region`] is in pixman's canonical form: boxes
 //! sorted by band then x, every box of a band sharing its y range, boxes in
 //! a band neither overlapping nor touching, and two adjacent bands with the
 //! same x spans merged. The operations take canonical regions and return
-//! one without normalising, which is what makes them cheap.
+//! one without normalising, which is what makes them cheap. The one
+//! exception is [`Region::from_yx_banded`], which keeps a client's YXBanded
+//! SHAPE rects as given, as Xorg does: banded, but possibly with touching
+//! boxes or equal adjacent bands. The operations accept that as pixman's
+//! do.
 
 use yserver_protocol::x11::xfixes::RegionRect;
 
@@ -155,6 +159,21 @@ impl Region {
             },
             Box32::to_rect,
         )
+    }
+
+    /// The boxes, in band order.
+    pub(crate) fn boxes(&self) -> &[Box32] {
+        &self.boxes
+    }
+
+    /// Whether the pixel at `(x, y)` is in the region.
+    pub(crate) fn contains_point(&self, x: i32, y: i32) -> bool {
+        // The bands are sorted: skip those that end above `y`.
+        let first = self.boxes.partition_point(|b| b.y2 <= y);
+        self.boxes[first..]
+            .iter()
+            .take_while(|b| b.y1 <= y)
+            .any(|b| b.x1 <= x && x < b.x2)
     }
 
     /// `pixman_region_inverse`: the part of `bounds` the region does not

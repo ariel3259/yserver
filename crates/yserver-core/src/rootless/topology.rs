@@ -74,7 +74,7 @@ fn changed_fields(old: Geometry, new: Geometry) -> GeometryFields {
 
 /// Shape rects (content-origin X coordinates) in backing pixels: `+bw`
 /// (spec §4.0; `dix/window.c:1735-1742`, `compalloc.c:600-606`).
-fn to_backing(rects: Option<&Vec<RegionRect>>, bw: u16) -> Option<Vec<Rect>> {
+fn to_backing(rects: Option<Vec<RegionRect>>, bw: u16) -> Option<Vec<Rect>> {
     rects.map(|rects| {
         rects
             .iter()

@@ -42,7 +42,7 @@ pub(super) fn border_size_in_parent(state: &ServerState, w: ResourceId) -> Vec<R
     match state
         .shape_windows
         .get(&w)
-        .and_then(|s| s.bounding().cloned())
+        .and_then(crate::server::ShapeWindowState::bounding)
     {
         Some(shape) => {
             let bw = i32::from(win.border_width);
@@ -68,7 +68,7 @@ fn win_size(state: &ServerState, w: ResourceId) -> Vec<RegionRect> {
     }];
     if let Some(shape) = state.shape_windows.get(&w) {
         for s in [shape.bounding(), shape.clip()].into_iter().flatten() {
-            region = intersect(&region, s);
+            region = intersect(&region, &s);
         }
     }
     region

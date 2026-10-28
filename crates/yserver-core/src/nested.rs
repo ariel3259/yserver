@@ -721,26 +721,6 @@ pub(crate) fn subtract_regions(
     normalize_region_rects(result)
 }
 
-pub(crate) fn translate_region(rects: &mut [x11xfixes::RegionRect], dx: i16, dy: i16) {
-    for rect in rects {
-        rect.x = rect.x.saturating_add(dx);
-        rect.y = rect.y.saturating_add(dy);
-    }
-}
-
-/// Handle `GetAtomName` (opcode 17). Atom IDs in our protocol stream can come
-/// from host-proxied replies (notably the `FONTPROP` atoms inside
-/// `ListFontsWithInfo`), so a client can legitimately ask us about an atom
-/// we never interned ourselves. Fall back to the host before returning
-pub(crate) fn offset_rects(
-    mut rects: Vec<x11xfixes::RegionRect>,
-    dx: i16,
-    dy: i16,
-) -> Vec<x11xfixes::RegionRect> {
-    translate_region(&mut rects, dx, dy);
-    normalize_region_rects(rects)
-}
-
 pub(crate) fn default_shape_rect(
     server: &ServerState,
     window: ResourceId,
@@ -792,19 +772,16 @@ pub(crate) fn shape_rects_for(
     server
         .shape_windows
         .get(&window)
-        .and_then(|state| state.rects(kind).cloned())
+        .and_then(|state| state.rects(kind))
         .unwrap_or_else(|| normalize_region_rects(vec![default_shape_rect(server, window, kind)]))
 }
 
-/// `window`'s shape region of `kind` as set, `None` while unset. The
-/// stored rects are a banded list (a set operation's result, or a
-/// client's YXBanded rects as given), so they are adopted as they are.
-pub(crate) fn shape_region(server: &ServerState, window: ResourceId, kind: u8) -> Option<Region> {
+/// `window`'s shape region of `kind` as set, `None` while unset.
+pub(crate) fn shape_region(server: &ServerState, window: ResourceId, kind: u8) -> Option<&Region> {
     server
         .shape_windows
         .get(&window)
-        .and_then(|state| state.rects(kind))
-        .map(|rects| Region::from_yx_banded(rects))
+        .and_then(|state| state.region(kind))
 }
 
 /// `window`'s shape region of `kind`, its default while unset.
@@ -814,6 +791,7 @@ pub(crate) fn shape_region_or_default(
     kind: u8,
 ) -> Region {
     shape_region(server, window, kind)
+        .cloned()
         .unwrap_or_else(|| Region::rect(default_shape_rect(server, window, kind)))
 }
 
@@ -907,7 +885,7 @@ pub(crate) fn shape_kind_is_set(server: &ServerState, window: ResourceId, kind: 
     server
         .shape_windows
         .get(&window)
-        .and_then(|state| state.rects(kind))
+        .and_then(|state| state.region(kind))
         .is_some()
 }
 
@@ -918,7 +896,7 @@ pub(crate) fn shape_kind_is_set(server: &ServerState, window: ResourceId, kind: 
 /// shaped one Invert is the source minus the current shape. The result is
 /// `None` when the window stays unshaped.
 pub(crate) fn apply_shape_op(
-    current: Option<Region>,
+    current: Option<&Region>,
     default: impl FnOnce() -> Region,
     source: Region,
     op: u8,
@@ -927,10 +905,11 @@ pub(crate) fn apply_shape_op(
         (x11shape::OP_SET, _) | (x11shape::OP_INTERSECT, None) => Some(source),
         (x11shape::OP_UNION, Some(cur)) => Some(cur.union(&source)),
         (x11shape::OP_INTERSECT, Some(cur)) => Some(cur.intersect(&source)),
-        (x11shape::OP_SUBTRACT, cur) => Some(cur.unwrap_or_else(default).subtract(&source)),
-        (x11shape::OP_INVERT, Some(cur)) => Some(source.subtract(&cur)),
+        (x11shape::OP_SUBTRACT, Some(cur)) => Some(cur.subtract(&source)),
+        (x11shape::OP_SUBTRACT, None) => Some(default().subtract(&source)),
+        (x11shape::OP_INVERT, Some(cur)) => Some(source.subtract(cur)),
         (x11shape::OP_INVERT, None) => Some(Region::default()),
-        (_, cur) => cur,
+        (_, cur) => cur.cloned(),
     }
 }
 
@@ -949,13 +928,7 @@ pub(crate) fn set_shape_rects(
     ) {
         return false;
     }
-    let normalized = normalize_region_rects(rects);
-    let state = server.shape_windows.entry(window).or_default();
-    let changed = state.rects(kind).map(Vec::as_slice) != Some(normalized.as_slice());
-    if changed {
-        state.set_rects(kind, Some(normalized));
-    }
-    changed
+    set_shape_region(server, window, kind, Region::from_rects(&rects))
 }
 
 /// Store `region` as `window`'s shape of `kind`. Returns `true` iff the
@@ -966,7 +939,7 @@ pub(crate) fn set_shape_region(
     server: &mut ServerState,
     window: ResourceId,
     kind: u8,
-    region: &Region,
+    region: Region,
 ) -> bool {
     if !matches!(
         kind,
@@ -974,11 +947,10 @@ pub(crate) fn set_shape_region(
     ) {
         return false;
     }
-    let rects = region.to_rects();
     let state = server.shape_windows.entry(window).or_default();
-    let changed = state.rects(kind) != Some(&rects);
+    let changed = state.region(kind) != Some(&region);
     if changed {
-        state.set_rects(kind, Some(rects));
+        state.set_region(kind, Some(region));
     }
     changed
 }
@@ -1000,8 +972,8 @@ pub(crate) fn clear_shape_rects(server: &mut ServerState, window: ResourceId, ki
     let Some(state) = server.shape_windows.get_mut(&window) else {
         return false;
     };
-    let changed = state.rects(kind).is_some();
-    state.set_rects(kind, None);
+    let changed = state.region(kind).is_some();
+    state.set_region(kind, None);
     if state.is_unshaped() {
         server.shape_windows.remove(&window);
     }
@@ -1264,8 +1236,7 @@ mod tests {
     mod xfixes_ops {
         use super::super::{
             clear_shape_rects, intersect_regions, normalize_region_rects, region_extents,
-            shape_kind_is_set, shape_mask_source_rects, shape_rects_for, translate_region,
-            union_regions,
+            shape_kind_is_set, shape_mask_source_rects, shape_rects_for, union_regions,
         };
         use crate::{resources::ROOT_WINDOW, server::ServerState};
         use yserver_protocol::x11::{
@@ -1366,21 +1337,6 @@ mod tests {
             let a = vec![r(0, 0, 100, 100)];
             let b = vec![r(10, 10, 5, 5)];
             assert_eq!(union_regions(&a, &b), vec![r(0, 0, 100, 100)]);
-        }
-
-        #[test]
-        fn translate_shifts_coords() {
-            let mut rects = vec![r(10, 20, 5, 5)];
-            translate_region(&mut rects, 3, -5);
-            assert_eq!(rects[0], r(13, 15, 5, 5));
-        }
-
-        #[test]
-        fn translate_saturates_at_bounds() {
-            let mut rects = vec![r(i16::MAX, i16::MIN, 1, 1)];
-            translate_region(&mut rects, 100, -100);
-            assert_eq!(rects[0].x, i16::MAX);
-            assert_eq!(rects[0].y, i16::MIN);
         }
 
         #[test]

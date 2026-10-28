@@ -218,7 +218,7 @@ fn shape_combine(
     let current = crate::nested::shape_region(state, window, kind);
     let default = || Region::rect(crate::nested::default_shape_rect(state, window, kind));
     match crate::nested::apply_shape_op(current, default, source, op) {
-        Some(region) => crate::nested::set_shape_region(state, window, kind, &region),
+        Some(region) => crate::nested::set_shape_region(state, window, kind, region),
         None => false,
     }
 }
@@ -500,8 +500,10 @@ fn handle_shape_request_ops(
             if let Some(req) = x11shape::parse_offset_request(body) {
                 let dest = ResourceId(req.dest);
                 if let Some(region) = crate::nested::shape_region(state, dest, req.dest_kind) {
-                    let region = region.translate(i32::from(req.x_off), i32::from(req.y_off));
-                    crate::nested::set_shape_region(state, dest, req.dest_kind, &region);
+                    let region = region
+                        .clone()
+                        .translate(i32::from(req.x_off), i32::from(req.y_off));
+                    crate::nested::set_shape_region(state, dest, req.dest_kind, region);
                     mirror_shape_to_host_state(state, backend, origin, dest, req.dest_kind);
                     backend.windows_restructured(state);
                     emit_shape_notify(state, dest, req.dest_kind);
@@ -671,13 +673,13 @@ fn xfixes_replace_cursor(
 /// Xorg `ExpandRegion` (`xfixes/region.c`): grow each rectangle of
 /// `source` by the four margins and union the results. Coordinates are
 /// computed wide and clamped to the protocol's 16-bit range.
-fn xfixes_expand_region_rects(
+fn xfixes_expand_region(
     source: &[yserver_protocol::x11::xfixes::RegionRect],
     left: u16,
     right: u16,
     top: u16,
     bottom: u16,
-) -> Vec<yserver_protocol::x11::xfixes::RegionRect> {
+) -> Region {
     use yserver_protocol::x11::xfixes::RegionRect;
     let clamp_i16 = |v: i32| {
         i16::try_from(v.clamp(i32::from(i16::MIN), i32::from(i16::MAX))).unwrap_or_default()
@@ -698,12 +700,18 @@ fn xfixes_expand_region_rects(
             }
         })
         .collect();
-    grown
-        .iter()
-        .fold(Region::default(), |acc, rect| {
-            acc.union(&Region::rect(*rect))
-        })
-        .to_rects()
+    grown.iter().fold(Region::default(), |acc, rect| {
+        acc.union(&Region::rect(*rect))
+    })
+}
+
+/// XFIXES region `id`, empty if there is none.
+fn xfixes_region(state: &ServerState, id: u32) -> Region {
+    state
+        .xfixes_regions
+        .get(&id)
+        .map(|r| r.region.clone())
+        .unwrap_or_default()
 }
 
 /// `ProcXFixesInvertRegion`'s bounds: the far edges stop at `MAXSHORT`.
@@ -985,7 +993,7 @@ pub(super) fn handle_xfixes_request(
                     region,
                     crate::server::XFixesRegion {
                         owner: client_id,
-                        rects: Region::from_wire_rects(&rects).to_rects(),
+                        region: Region::from_wire_rects(&rects),
                     },
                 );
             }
@@ -1207,7 +1215,7 @@ pub(super) fn handle_xfixes_request(
                         region,
                         crate::server::XFixesRegion {
                             owner: client_id,
-                            rects: Region::from_wire_rects(&rects).to_rects(),
+                            region: Region::from_wire_rects(&rects),
                         },
                     );
                 } else {
@@ -1215,7 +1223,7 @@ pub(super) fn handle_xfixes_request(
                         region,
                         crate::server::XFixesRegion {
                             owner: client_id,
-                            rects: Vec::new(),
+                            region: Region::default(),
                         },
                     );
                 }
@@ -1261,19 +1269,18 @@ pub(super) fn handle_xfixes_request(
                         XFIXES_MAJOR_OPCODE,
                     );
                 }
-                let rects = crate::nested::shape_region_or_default(state, ResourceId(window), kind)
-                    .to_rects();
+                let shape = crate::nested::shape_region_or_default(state, ResourceId(window), kind);
                 trace!(
                     target: "yserver::xfixes::region",
                     "CreateRegionFromWindow region=0x{region:08x} window=0x{window:08x} kind={} rects{}",
                     kind,
-                    format_region_rects(&rects),
+                    format_region_rects(&shape.to_rects()),
                 );
                 state.xfixes_regions.insert(
                     region,
                     crate::server::XFixesRegion {
                         owner: client_id,
-                        rects,
+                        region: shape,
                     },
                 );
             }
@@ -1352,7 +1359,7 @@ pub(super) fn handle_xfixes_request(
                     region,
                     crate::server::XFixesRegion {
                         owner: client_id,
-                        rects: Region::from_wire_rects(&rects).to_rects(),
+                        region: Region::from_wire_rects(&rects),
                     },
                 );
             }
@@ -1370,90 +1377,80 @@ pub(super) fn handle_xfixes_request(
                 state
                     .xfixes_regions
                     .entry(region)
-                    .and_modify(|r| r.rects = Region::from_wire_rects(&rects).to_rects())
+                    .and_modify(|r| r.region = Region::from_wire_rects(&rects))
                     .or_insert_with(|| crate::server::XFixesRegion {
                         owner: client_id,
-                        rects: Region::from_wire_rects(&rects).to_rects(),
+                        region: Region::from_wire_rects(&rects),
                     });
             }
         }
         x11xfixes::COPY_REGION => {
             if let Some((source, dest)) = x11xfixes::parse_u32_pair(body) {
-                let rects = state
-                    .xfixes_regions
-                    .get(&source)
-                    .map(|r| r.rects.clone())
-                    .unwrap_or_default();
+                let region = xfixes_region(state, source);
                 trace!(
                     target: "yserver::xfixes::region",
                     "CopyRegion src=0x{source:08x} dst=0x{dest:08x} rects{}",
-                    format_region_rects(&rects),
+                    format_region_rects(&region.to_rects()),
                 );
                 state.xfixes_regions.insert(
                     dest,
                     crate::server::XFixesRegion {
                         owner: client_id,
-                        rects,
+                        region,
                     },
                 );
             }
         }
         x11xfixes::UNION_REGION | x11xfixes::INTERSECT_REGION | x11xfixes::SUBTRACT_REGION => {
             if let Some((source1, source2, dest)) = x11xfixes::parse_u32_triplet(body) {
+                let empty = Region::default();
                 let a = state
                     .xfixes_regions
                     .get(&source1)
-                    .map(|r| r.rects.clone())
-                    .unwrap_or_default();
+                    .map_or(&empty, |r| &r.region);
                 let b = state
                     .xfixes_regions
                     .get(&source2)
-                    .map(|r| r.rects.clone())
-                    .unwrap_or_default();
+                    .map_or(&empty, |r| &r.region);
                 let op_name = match minor {
                     x11xfixes::UNION_REGION => "UnionRegion",
                     x11xfixes::INTERSECT_REGION => "IntersectRegion",
                     x11xfixes::SUBTRACT_REGION => "SubtractRegion",
                     _ => unreachable!(),
                 };
-                let (ra, rb) = (Region::from_rects(&a), Region::from_rects(&b));
-                let rects = match minor {
-                    x11xfixes::UNION_REGION => ra.union(&rb),
-                    x11xfixes::INTERSECT_REGION => ra.intersect(&rb),
-                    x11xfixes::SUBTRACT_REGION => ra.subtract(&rb),
+                let region = match minor {
+                    x11xfixes::UNION_REGION => a.union(b),
+                    x11xfixes::INTERSECT_REGION => a.intersect(b),
+                    x11xfixes::SUBTRACT_REGION => a.subtract(b),
                     _ => unreachable!(),
-                }
-                .to_rects();
+                };
                 trace!(
                     target: "yserver::xfixes::region",
                     "{op_name} a=0x{source1:08x} rects{} b=0x{source2:08x} rects{} dst=0x{dest:08x} rects{}",
-                    format_region_rects(&a),
-                    format_region_rects(&b),
-                    format_region_rects(&rects),
+                    format_region_rects(&a.to_rects()),
+                    format_region_rects(&b.to_rects()),
+                    format_region_rects(&region.to_rects()),
                 );
                 state.xfixes_regions.insert(
                     dest,
                     crate::server::XFixesRegion {
                         owner: client_id,
-                        rects,
+                        region,
                     },
                 );
             }
         }
         x11xfixes::INVERT_REGION => {
             if let Some((source, bounds, dest)) = x11xfixes::parse_invert_region(body) {
-                let source_rects = state
+                let region = state
                     .xfixes_regions
                     .get(&source)
-                    .map(|r| r.rects.clone())
-                    .unwrap_or_default();
+                    .map_or_else(Region::default, |r| r.region.inverse(invert_bounds(bounds)));
                 state.xfixes_regions.insert(
                     dest,
                     crate::server::XFixesRegion {
                         owner: client_id,
-                        rects: Region::from_rects(&source_rects)
-                            .inverse(invert_bounds(bounds))
-                            .to_rects(),
+                        region,
                     },
                 );
             }
@@ -1462,33 +1459,23 @@ pub(super) fn handle_xfixes_request(
             if let Some((region_id, dx, dy)) = x11xfixes::parse_translate_region(body)
                 && let Some(region) = state.xfixes_regions.get_mut(&region_id)
             {
-                let before = region.rects.clone();
-                crate::nested::translate_region(&mut region.rects, dx, dy);
+                region.region =
+                    std::mem::take(&mut region.region).translate(i32::from(dx), i32::from(dy));
                 trace!(
                     target: "yserver::xfixes::region",
-                    "TranslateRegion region=0x{region_id:08x} delta=({dx}, {dy}) before{} after{}",
-                    format_region_rects(&before),
-                    format_region_rects(&region.rects),
+                    "TranslateRegion region=0x{region_id:08x} delta=({dx}, {dy}) after{}",
+                    format_region_rects(&region.rects()),
                 );
             }
         }
         x11xfixes::REGION_EXTENTS => {
             if let Some((source, dest)) = x11xfixes::parse_u32_pair(body) {
-                let rect = state
-                    .xfixes_regions
-                    .get(&source)
-                    .map(|r| crate::nested::region_extents(&r.rects))
-                    .unwrap_or(x11xfixes::RegionRect {
-                        x: 0,
-                        y: 0,
-                        width: 0,
-                        height: 0,
-                    });
+                let rect = xfixes_region(state, source).extents_rect();
                 state.xfixes_regions.insert(
                     dest,
                     crate::server::XFixesRegion {
                         owner: client_id,
-                        rects: normalize_region_rects(vec![rect]),
+                        region: Region::rect(rect),
                     },
                 );
             }
@@ -1502,12 +1489,10 @@ pub(super) fn handle_xfixes_request(
             // not generate another DamageNotify. Submit it before the reply
             // lets an external compositor sample the corresponding pixels.
             backend.flush_before_damage_notify();
-            let rects = state
-                .xfixes_regions
-                .get(&region)
-                .map(|r| r.rects.clone())
-                .unwrap_or_default();
-            let extents = crate::nested::region_extents(&rects);
+            let (extents, rects) = state.xfixes_regions.get(&region).map_or_else(
+                || (Region::default().extents_rect(), Vec::new()),
+                |r| (r.region.extents_rect(), r.rects()),
+            );
             let reply = x11xfixes::encode_fetch_region_reply(byte_order, sequence, extents, &rects);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
@@ -1546,11 +1531,7 @@ pub(super) fn handle_xfixes_request(
                         .set_gc_clip_origin(gc_id, req.x_origin, req.y_origin);
                     displaced
                 } else {
-                    let rects = state
-                        .xfixes_regions
-                        .get(&req.region)
-                        .map(|r| r.rects.clone())
-                        .unwrap_or_default();
+                    let rects = xfixes_region(state, req.region).to_rects();
                     let mut rectangles = Vec::with_capacity(rects.len() * 8);
                     for rect in &rects {
                         rectangles.extend_from_slice(&rect.x.to_le_bytes());
@@ -1580,14 +1561,9 @@ pub(super) fn handle_xfixes_request(
                 if req.region == 0 {
                     crate::nested::clear_shape_rects(state, window, req.dest_kind);
                 } else {
-                    let rects = state
-                        .xfixes_regions
-                        .get(&req.region)
-                        .map(|r| r.rects.clone())
-                        .unwrap_or_default();
-                    let source = Region::from_rects(&rects)
+                    let source = xfixes_region(state, req.region)
                         .translate(i32::from(req.x_offset), i32::from(req.y_offset));
-                    crate::nested::set_shape_region(state, window, req.dest_kind, &source);
+                    crate::nested::set_shape_region(state, window, req.dest_kind, source);
                 }
                 mirror_shape_to_host_state(state, backend, origin, window, req.dest_kind);
                 // Xorg SetWindowShapeRegion goes through miSetShape too.
@@ -1611,11 +1587,7 @@ pub(super) fn handle_xfixes_request(
                         out.extend_from_slice(&0_u32.to_le_bytes());
                         let _ = backend.render_change_picture(origin, hp, &out);
                     } else {
-                        let rects = state
-                            .xfixes_regions
-                            .get(&req.region)
-                            .map(|r| r.rects.clone())
-                            .unwrap_or_default();
+                        let rects = xfixes_region(state, req.region).to_rects();
                         trace!(
                             target: "yserver::xfixes::clip",
                             "SetPictureClipRegion client_pic=0x{:08x} host_pic=0x{hp:08x} region=0x{:08x} origin=({}, {}) n={} rects{}",
@@ -1717,12 +1689,12 @@ pub(super) fn handle_xfixes_request(
                     );
                 }
             }
-            let source = state.xfixes_regions[&req.source].rects.clone();
+            let source = state.xfixes_regions[&req.source].rects();
             // An empty source leaves the destination untouched (Xorg only
             // rewrites it inside `if (nBoxes)`; confirmed on Xvfb).
             if !source.is_empty() {
-                let rects =
-                    xfixes_expand_region_rects(&source, req.left, req.right, req.top, req.bottom);
+                let expanded =
+                    xfixes_expand_region(&source, req.left, req.right, req.top, req.bottom);
                 trace!(
                     target: "yserver::xfixes::region",
                     "ExpandRegion src=0x{:08x} dst=0x{:08x} l={} r={} t={} b={} rects{}",
@@ -1732,10 +1704,10 @@ pub(super) fn handle_xfixes_request(
                     req.right,
                     req.top,
                     req.bottom,
-                    format_region_rects(&rects),
+                    format_region_rects(&expanded.to_rects()),
                 );
                 if let Some(dest) = state.xfixes_regions.get_mut(&req.destination) {
-                    dest.rects = rects;
+                    dest.region = expanded;
                 }
             }
         }

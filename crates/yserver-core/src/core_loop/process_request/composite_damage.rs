@@ -191,7 +191,7 @@ pub(super) fn handle_composite_request(
                     region,
                     crate::server::XFixesRegion {
                         owner: client_id,
-                        rects: normalize_region_rects(rects),
+                        region: crate::region::Region::from_rects(&rects),
                     },
                 );
             }
@@ -577,7 +577,7 @@ pub(super) fn handle_damage_request(
                     state
                         .xfixes_regions
                         .get(&region)
-                        .map(|r| r.rects.clone())
+                        .map(crate::server::XFixesRegion::rects)
                         .unwrap_or_default()
                 };
                 for damage in state.damage_objects.values_mut() {
@@ -625,35 +625,25 @@ pub(super) fn handle_damage_request(
                     .get(&damage_id)
                     .map(|d| d.owner.0)
                     .unwrap_or(0);
-                let (parts_rects, new_damage) = if repair == 0 {
-                    (old_damage.clone(), Vec::new())
-                } else {
-                    let repair_rects = state
-                        .xfixes_regions
-                        .get(&repair)
-                        .map(|r| r.rects.clone())
-                        .unwrap_or_default();
-                    let repair_region = crate::region::Region::from_rects(&repair_rects);
-                    (
-                        old_region.intersect(&repair_region).to_rects(),
-                        old_region.subtract(&repair_region).to_rects(),
-                    )
+                let repair_region = state.xfixes_regions.get(&repair).map(|r| &r.region);
+                let (parts_region, new_damage) = match repair_region {
+                    _ if repair == 0 => (old_region, Vec::new()),
+                    None => (crate::region::Region::default(), old_damage.clone()),
+                    Some(repair) => (
+                        old_region.intersect(repair),
+                        old_region.subtract(repair).to_rects(),
+                    ),
                 };
-                let repair_rects = if repair == 0 {
-                    Vec::new()
-                } else {
-                    state
-                        .xfixes_regions
-                        .get(&repair)
-                        .map(|r| r.rects.clone())
-                        .unwrap_or_default()
-                };
+                let repair_rects = repair_region
+                    .filter(|_| repair != 0)
+                    .map(crate::region::Region::to_rects)
+                    .unwrap_or_default();
                 if parts != 0 {
                     state.xfixes_regions.insert(
                         parts,
                         crate::server::XFixesRegion {
                             owner: client_id,
-                            rects: parts_rects,
+                            region: parts_region,
                         },
                     );
                 }
@@ -695,13 +685,13 @@ pub(super) fn handle_damage_request(
                         state
                             .xfixes_regions
                             .get(&parts)
-                            .map_or(0, |r| r.rects.len())
+                            .map_or(0, |r| r.rects().len())
                     },
                     format_region_rects(
                         &state
                             .xfixes_regions
                             .get(&parts)
-                            .map(|r| r.rects.clone())
+                            .map(crate::server::XFixesRegion::rects)
                             .unwrap_or_default()
                     ),
                     state
