@@ -1105,6 +1105,9 @@ impl KmsBackend {
     ) -> bool {
         self.pstate
             .direct
+            .remove_outputs(&rescan.dropped_old_indices);
+        self.pstate
+            .direct
             .sync_output_count(self.platform.outputs.len());
         let previous_outputs: HashMap<u32, ProjectedRandrOutputState> = state
             .randr
@@ -1427,9 +1430,6 @@ impl KmsBackend {
         let rescan = self
             .platform
             .apply_connector_snapshot(snapshot, &known_connected);
-        self.pstate
-            .direct
-            .sync_output_count(self.platform.outputs.len());
         if quiesced {
             self.platform.invalidate_live_cursor_applied();
         }

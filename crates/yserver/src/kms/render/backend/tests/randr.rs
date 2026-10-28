@@ -3742,11 +3742,11 @@ fn randr_compose_and_retire_replacements(
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: delete the removed-slot notification transfer in sync_output_count.
-fn direct_owners_follow_output_count_on_topology_change() {
+// Mutation: truncate the owner vector tail instead of removing the old output index.
+fn output_removal_keeps_owner_state_with_its_output() {
     let Some((backend, _state, kms)) = simulated_kms_dual_head() else {
         eprintln!(
-            "SKIP direct_owners_follow_output_count_on_topology_change: Vulkan fixture unavailable"
+            "SKIP output_removal_keeps_owner_state_with_its_output: Vulkan fixture unavailable"
         );
         return;
     };
@@ -3789,21 +3789,23 @@ fn direct_owners_follow_output_count_on_topology_change() {
     let mut idled = notification;
     idled.present_id = 903;
     idled.serial = 903;
-    events.backend.pstate.direct.outputs[1]
+    events.backend.pstate.direct.outputs[0]
         .completed
         .push(completed);
-    events.backend.pstate.direct.outputs[1]
+    events.backend.pstate.direct.outputs[0]
         .deferred_successor_skips
         .push(deferred_skip);
-    events.backend.pstate.direct.outputs[1].idled.push(idled);
+    events.backend.pstate.direct.outputs[0].idled.push(idled);
+    events.backend.pstate.direct.outputs[1].eligible_streak = 3;
+    events.backend.pstate.direct.outputs[1].reentry_blocked_until_composed = true;
 
     let (outputs, _) = events.backend.randr_outputs_and_modes();
-    let removed = &outputs[1];
-    let first_connector = events.backend.platform.outputs[0]
+    let removed = &outputs[0];
+    let removed_connector = events.backend.platform.outputs[0]
         .output
         .connector_name
         .clone();
-    let removed_connector = events.backend.platform.outputs[1]
+    let survivor_connector = events.backend.platform.outputs[1]
         .output
         .connector_name
         .clone();
@@ -3816,12 +3818,14 @@ fn direct_owners_follow_output_count_on_topology_change() {
             0,
             0,
         )
-        .expect("RANDR disable simulated second output"),
-        "the second output must be removed"
+        .expect("global RANDR disable simulated output 0"),
+        "output 0 must be removed"
     );
 
     assert_eq!(events.backend.platform.outputs.len(), 1);
     assert_eq!(events.backend.pstate.direct.outputs.len(), 1);
+    assert_eq!(events.backend.pstate.direct.outputs[0].eligible_streak, 3);
+    assert!(events.backend.pstate.direct.outputs[0].reentry_blocked_until_composed);
     assert!(!events.backend.pstate.direct.root().active());
     assert!(events.backend.pstate.direct.root().current.is_none());
     assert!(!events.backend.present_source_pins.contains_key(&source_pin));
@@ -3893,9 +3897,9 @@ fn direct_owners_follow_output_count_on_topology_change() {
     assert_eq!(
         *kms.log.borrow(),
         vec![
-            format!("off {first_connector}"),
             format!("off {removed_connector}"),
-            format!("on {first_connector}"),
+            format!("off {survivor_connector}"),
+            format!("on {survivor_connector}"),
         ],
         "RANDR tears down both old CRTCs before relighting the survivor"
     );

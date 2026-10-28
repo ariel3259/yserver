@@ -1603,7 +1603,6 @@ fn a_hotplug_that_shrank_the_extent_leaves_root_storage_alone() {
 
     // B's route is retired, so the extent shrinks.
     b.platform.outputs.pop();
-    b.pstate.direct.sync_output_count(b.platform.outputs.len());
     b.platform.scanout_pools.pop();
     b.platform.bo_generations.pop();
     b.platform.first_pageflip_logged.pop();

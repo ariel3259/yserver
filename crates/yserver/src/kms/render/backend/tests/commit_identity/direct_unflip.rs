@@ -363,7 +363,7 @@ fn submit_two_output_owner_successors(
     (first_record, second_record)
 }
 
-fn submit_output_present_via_backend(
+pub(super) fn submit_output_present_via_backend(
     fixture: &mut RecordingSceneFixture,
     direct: &DirectPresentSetup,
     output_idx: usize,

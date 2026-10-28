@@ -420,19 +420,40 @@ impl DirectOwners {
 
     pub(in crate::kms::render::backend) fn sync_output_count(&mut self, count: usize) {
         if count < self.outputs.len() {
-            assert!(
-                self.outputs[count..].iter().all(|owner| !owner.active()),
-                "cannot remove an output with pending direct-scanout frames"
-            );
-            for mut owner in self.outputs.split_off(count) {
-                self.root.completed.append(&mut owner.completed);
-                self.root
-                    .deferred_successor_skips
-                    .append(&mut owner.deferred_successor_skips);
-                self.root.idled.append(&mut owner.idled);
-            }
+            let removed: Vec<_> = (count..self.outputs.len()).collect();
+            self.remove_outputs(&removed);
         }
         self.outputs.resize_with(count, ScanoutM2State::new);
+    }
+
+    /// Remove the owner slots at old output indices, preserving each
+    /// surviving output's state as the platform compacts its output vector.
+    /// Notifications from removed slots retain the existing migration to Root.
+    pub(in crate::kms::render::backend) fn remove_outputs(&mut self, output_indices: &[usize]) {
+        let mut indices = output_indices.to_vec();
+        indices.sort_unstable();
+        indices.dedup();
+        assert!(
+            indices.iter().all(|&idx| idx < self.outputs.len()),
+            "cannot remove a missing direct-scanout output slot"
+        );
+        assert!(
+            indices.iter().all(|&idx| !self.outputs[idx].active()),
+            "cannot remove an output with pending direct-scanout frames"
+        );
+
+        let mut removed = Vec::with_capacity(indices.len());
+        for idx in indices.into_iter().rev() {
+            removed.push((idx, self.outputs.remove(idx)));
+        }
+        removed.sort_unstable_by_key(|(idx, _)| *idx);
+        for (_, mut owner) in removed {
+            self.root.completed.append(&mut owner.completed);
+            self.root
+                .deferred_successor_skips
+                .append(&mut owner.deferred_successor_skips);
+            self.root.idled.append(&mut owner.idled);
+        }
     }
 
     pub(in crate::kms::render::backend) fn get(

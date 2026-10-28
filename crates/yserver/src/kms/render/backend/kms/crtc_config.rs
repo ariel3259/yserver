@@ -1131,10 +1131,14 @@ impl KmsBackend {
         let restore_old_on_failure = self.kms_outputs_active;
         self.quiesce_before_topology_mutation("RANDR CRTC configuration changed")?;
 
+        let mut removed_output_indices = Vec::new();
         match mode {
             None => {
                 // ── Disable path ─────────────────────────────────────────
                 if self.platform.remove_connector_after_all_off(&output_key) {
+                    if let Some(idx) = existing_idx {
+                        removed_output_indices.push(idx);
+                    }
                     log::info!("apply_crtc_config: disabled {connector}");
                 } else {
                     // Already off — still update the registry.
@@ -1205,6 +1209,7 @@ impl KmsBackend {
                 );
             }
         }
+        self.pstate.direct.remove_outputs(&removed_output_indices);
         self.pstate
             .direct
             .sync_output_count(self.platform.outputs.len());
@@ -1617,6 +1622,7 @@ impl KmsBackend {
                 return Err(error);
             }
         }
+        self.pstate.direct.remove_outputs(&[idx]);
         self.pstate
             .direct
             .sync_output_count(self.platform.outputs.len());

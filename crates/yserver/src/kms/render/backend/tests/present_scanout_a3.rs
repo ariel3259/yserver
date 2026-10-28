@@ -1987,6 +1987,246 @@ fn output_unflip_does_not_stall_other_output_compose() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutations: invalidate every output's buffers; mark all outputs structurally dirty at fresh preparation, retirement, degraded setup, or degraded retry.
+fn output_unflip_leaves_other_output_damage_alone() {
+    use yserver_core::backend::Backend;
+
+    fn request_output_unflip(
+        fixture: &mut super::commit_identity::recording_scene::RecordingSceneFixtureGuard,
+        direct: &super::commit_identity::recording_scene::DirectPresentSetup,
+        output_idx: usize,
+    ) {
+        let mut successor = direct.candidate;
+        successor.present_id += 1;
+        successor.valid_region_xid = 0x55;
+        let mut event = direct.event.clone();
+        event.present_id = successor.present_id;
+        event.serial = event.serial.wrapping_add(1);
+        assert!(
+            !Backend::try_present_direct(&mut fixture.events.backend, successor, event,)
+                .expect("ineligible Output successor through Backend"),
+            "the successor requests composed unflip"
+        );
+        assert!(fixture.events.backend.pstate.direct.outputs[output_idx].unflip_requested);
+    }
+
+    fn settle_other_output(
+        fixture: &mut super::commit_identity::recording_scene::RecordingSceneFixtureGuard,
+    ) {
+        let output0_crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+        for _ in 0..3 {
+            let records = a3_tick(fixture);
+            let has_output0_scene = a3_has_scene_commit_for(&records, output0_crtc);
+            a3_retire_records(fixture, &records);
+            if !has_output0_scene {
+                break;
+            }
+        }
+        assert!(!fixture.events.backend.scene.has_pending_page_flip(0));
+    }
+
+    let Some((fixture, direct)) = a3_output_fixture(1, 958) else {
+        eprintln!(
+            "SKIP output_unflip_leaves_other_output_damage_alone: Vulkan fixture unavailable"
+        );
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    let fd = fixture.kms_fd(0);
+    a3_enter_output_owner(&mut fixture, &direct, 1);
+    settle_other_output(&mut fixture);
+    let output0_crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    let output0_before = fixture
+        .events
+        .backend
+        .scene
+        .retirement_observation_for_tests(0);
+    assert!(
+        output0_before.contains("structure_damage=RegionSet { rects: [] }"),
+        "output 0 starts without structure damage: {output0_before}"
+    );
+    request_output_unflip(&mut fixture, &direct, 1);
+    let fresh_start = fixture.events.recorders[&fd].records().len();
+    Backend::maybe_composite(&mut fixture.events.backend).expect("prepare fresh Output(1) unflip");
+    fixture.events.wait_for_submitted_gpu_work();
+    let fresh_records = a3_records_since(&fixture, fd, fresh_start);
+    assert!(
+        !a3_has_scene_commit_for(&fresh_records, output0_crtc),
+        "fresh unflip preparation does not repaint output 0"
+    );
+    assert_eq!(
+        fixture
+            .events
+            .backend
+            .scene
+            .retirement_observation_for_tests(0),
+        output0_before,
+        "fresh preparation leaves output 0's damage history and structural region unchanged"
+    );
+    assert!(fixture.events.backend.pstate.direct.outputs[1].fresh_composed_unflip);
+    let fresh_replacement = fresh_records
+        .iter()
+        .find(|record| {
+            super::commit_identity::accepted_event_id(record).is_some()
+                && a3_has_scene_commit_for(
+                    std::slice::from_ref(*record),
+                    fixture.events.backend.platform.outputs[1].output.crtc,
+                )
+        })
+        .expect("fresh output 1 replacement accepted");
+    a3_retire_records(&mut fixture, std::slice::from_ref(fresh_replacement));
+    assert!(
+        fixture.events.backend.pstate.direct.outputs[1]
+            .current
+            .is_none()
+    );
+    assert_eq!(
+        fixture
+            .events
+            .backend
+            .scene
+            .retirement_observation_for_tests(0),
+        output0_before,
+        "replacement retirement leaves output 0's damage history and structural region unchanged"
+    );
+    fixture.finish_after_normal_drain();
+
+    let Some((fixture, direct)) = a3_output_fixture(1, 959) else {
+        eprintln!(
+            "SKIP output_unflip_leaves_other_output_damage_alone: degraded Vulkan fixture unavailable"
+        );
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    let fd = fixture.kms_fd(0);
+    a3_enter_output_owner(&mut fixture, &direct, 1);
+    settle_other_output(&mut fixture);
+    let output0_crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    let output0_before = fixture
+        .events
+        .backend
+        .scene
+        .retirement_observation_for_tests(0);
+    assert!(
+        output0_before.contains("structure_damage=RegionSet { rects: [] }"),
+        "output 0 starts without structure damage: {output0_before}"
+    );
+    request_output_unflip(&mut fixture, &direct, 1);
+    let recorder = fixture.events.recorders[&fd].clone();
+    recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
+    recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
+    let degraded_start = recorder.records().len();
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("degrade Output(1) to per-output scene replacement");
+    fixture.events.wait_for_submitted_gpu_work();
+    let degraded_records = a3_records_since(&fixture, fd, degraded_start);
+    assert!(fixture.events.backend.pstate.direct.outputs[1].degraded_composed_unflip);
+    assert!(
+        fixture.events.backend.pstate.direct.outputs[1]
+            .unflip_awaiting_outputs
+            .contains_key(&1),
+        "the degraded setup accepted output 1's replacement"
+    );
+    assert!(
+        fixture.events.backend.pstate.direct.outputs[1]
+            .unflip_outputs_to_replace
+            .contains(&1),
+        "output 1 remains an unflip replacement obligation until its event retires"
+    );
+    assert!(
+        fixture.events.backend.pstate.direct.outputs[1]
+            .current
+            .is_some(),
+        "the degraded owner remains active until the replacement event retires"
+    );
+    assert_eq!(
+        fixture.events.backend.pstate.direct.active_scopes(),
+        [crate::kms::render::backend::DirectScope::Output(1)],
+        "the pending degraded replacement remains reachable through its owner scope"
+    );
+    assert!(
+        !a3_has_scene_commit_for(&degraded_records, output0_crtc),
+        "degraded setup does not repaint output 0"
+    );
+    assert_eq!(
+        fixture
+            .events
+            .backend
+            .scene
+            .retirement_observation_for_tests(0),
+        output0_before,
+        "degraded setup leaves output 0's damage history and structural region unchanged"
+    );
+
+    a3_retire_records(&mut fixture, &degraded_records);
+    assert!(
+        fixture.events.backend.pstate.direct.outputs[1]
+            .current
+            .is_none()
+    );
+    fixture.finish_after_normal_drain();
+
+    let Some((fixture, direct)) = a3_output_fixture(1, 960) else {
+        eprintln!(
+            "SKIP output_unflip_leaves_other_output_damage_alone: retry Vulkan fixture unavailable"
+        );
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    let fd = fixture.kms_fd(0);
+    a3_enter_output_owner(&mut fixture, &direct, 1);
+    settle_other_output(&mut fixture);
+    let output0_crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    let output0_before = fixture
+        .events
+        .backend
+        .scene
+        .retirement_observation_for_tests(0);
+    {
+        let owner = &mut fixture.events.backend.pstate.direct.outputs[1];
+        owner.unflip_requested = true;
+        owner.degraded_composed_unflip = true;
+        owner.unflip_outputs_to_replace = std::collections::HashSet::from([1]);
+    }
+    let retry_start = fixture.events.recorders[&fd].records().len();
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("retry the degraded Output(1) replacement through Backend");
+    fixture.events.wait_for_submitted_gpu_work();
+    let retry_records = a3_records_since(&fixture, fd, retry_start);
+    assert!(
+        !a3_has_scene_commit_for(&retry_records, output0_crtc),
+        "degraded retry does not repaint output 0"
+    );
+    assert_eq!(
+        fixture
+            .events
+            .backend
+            .scene
+            .retirement_observation_for_tests(0),
+        output0_before,
+        "degraded retry leaves output 0's damage history and structural region unchanged"
+    );
+    let retry_replacement = retry_records
+        .iter()
+        .find(|record| {
+            super::commit_identity::accepted_event_id(record).is_some()
+                && a3_has_scene_commit_for(
+                    std::slice::from_ref(*record),
+                    fixture.events.backend.platform.outputs[1].output.crtc,
+                )
+        })
+        .expect("degraded retry accepts output 1's replacement");
+    a3_retire_records(&mut fixture, std::slice::from_ref(retry_replacement));
+    assert!(
+        fixture.events.backend.pstate.direct.outputs[1]
+            .current
+            .is_none()
+    );
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: use the global scene predicate when deciding whether to skip output 0's cursor-only commit.
 fn retained_direct_damage_does_not_block_other_output_cursor_commit() {
     use yserver_core::backend::Backend;

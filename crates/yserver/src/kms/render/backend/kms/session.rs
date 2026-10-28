@@ -731,9 +731,6 @@ impl KmsBackend {
         let rescan = self
             .platform
             .apply_connector_snapshot(snapshot, &known_connected);
-        self.pstate
-            .direct
-            .sync_output_count(self.platform.outputs.len());
         let registry_delta =
             self.reconcile_connector_registry(&rescan.connected, &rescan.dropped_keys);
         let active_topology_changed = !rescan.dropped_old_indices.is_empty();

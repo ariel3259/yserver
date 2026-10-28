@@ -176,14 +176,18 @@ impl SceneCompositor {
             .is_some_and(|deadline| std::time::Instant::now() < deadline)
     }
 
-    /// True if any output's per-BO damage model owes a repaint that no producer
-    /// is reporting — after an `invalidate`, or a submitted frame that never
-    /// reached the screen. The backend's compose-wanted predicate must include
-    /// this, or an invalidated output waits for unrelated damage to be repaired.
+    /// True if any output owes a repaint through its buffer damage, retained
+    /// scene-structure damage, or failed-submit damage. The backend's
+    /// compose-wanted predicate must include this, or output-local damage waits
+    /// for unrelated global damage to be repaired.
     pub fn owes_repaint(&self) -> bool {
-        self.inner
-            .as_ref()
-            .is_some_and(|inner| inner.outputs.iter().any(|o| o.damage.owes_repaint()))
+        self.inner.as_ref().is_some_and(|inner| {
+            inner.outputs.iter().any(|output| {
+                output.damage.owes_repaint()
+                    || !output.scene_structure_damage.is_empty()
+                    || !output.pending_repaint_after_failed_submit.is_empty()
+            })
+        })
     }
 
     /// Compose a frame per output. Each output that has a free

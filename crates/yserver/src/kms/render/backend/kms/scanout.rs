@@ -1456,12 +1456,12 @@ impl KmsBackend {
                 .and_then(|window| window.host_xid)
                 .is_some_and(|window| window.as_raw() == host_xid)
         };
-        let changed_owner = self
+        let changed_owners: Vec<_> = self
             .pstate
             .direct
             .active_scopes()
             .into_iter()
-            .find_map(|scope| {
+            .filter_map(|scope| {
                 self.pstate.direct.get(scope).and_then(|owner| {
                     owner
                         .current
@@ -1477,19 +1477,22 @@ impl KmsBackend {
                             )
                         })
                 })
-            });
-        let allowed = changed_owner.and_then(|(_, window, _)| {
+            })
+            .collect();
+        let Some((_, window, _)) = changed_owners.first().copied() else {
+            return;
+        };
+        let allowed = {
             state
                 .resources
                 .window_property(yserver_protocol::x11::ResourceId(window), vrr_atom)
-        });
+        };
         let allowed = yserver_core::properties::variable_refresh_property_enabled(allowed);
-        let mut matched = false;
-        if let Some((scope, _, _)) = changed_owner {
+        for (scope, _, _) in &changed_owners {
             let scanout = self
                 .pstate
                 .direct
-                .get_mut(scope)
+                .get_mut(*scope)
                 .expect("matched direct owner remains present");
             let (current, pending, queued_successor) = (
                 &mut scanout.current,
@@ -1503,67 +1506,62 @@ impl KmsBackend {
             {
                 if matches_host(&frame.candidate) {
                     frame.candidate.variable_refresh = allowed;
-                    matched = true;
                 }
             }
         }
-        if !matched {
-            return;
-        }
-        let Some((scope, _, direct_crtc_id)) = changed_owner else {
-            return;
-        };
-        let Some((direct_output_idx, _)) = self.present_crtc_output(direct_crtc_id) else {
-            return;
-        };
+        for (scope, _, direct_crtc_id) in changed_owners {
+            let Some((direct_output_idx, _)) = self.present_crtc_output(direct_crtc_id) else {
+                continue;
+            };
 
-        if allowed {
+            if allowed {
+                let output = &self.platform.outputs[direct_output_idx].output;
+                output.vrr_clear_retry_deadline.set(None);
+                output.vrr_clear_waiting_for_flip.set(false);
+                continue;
+            }
+            let Some(owner) = self.pstate.direct.get(scope) else {
+                continue;
+            };
+            if owner.queued_successor.is_some()
+                || owner
+                    .queued_successor
+                    .as_ref()
+                    .or(owner.pending.as_ref())
+                    .or(owner.current.as_ref())
+                    .is_some_and(|frame| self.direct_frame_wants_vrr(frame))
+                || !self.scanout_allowed()
+                || !self.kms_outputs_active
+            {
+                continue;
+            }
+
+            let now = self.monotonic_now();
             let output = &self.platform.outputs[direct_output_idx].output;
-            output.vrr_clear_retry_deadline.set(None);
-            output.vrr_clear_waiting_for_flip.set(false);
-            return;
-        }
-        let Some(owner) = self.pstate.direct.get(scope) else {
-            return;
-        };
-        if owner.queued_successor.is_some()
-            || owner
-                .queued_successor
-                .as_ref()
-                .or(owner.pending.as_ref())
-                .or(owner.current.as_ref())
-                .is_some_and(|frame| self.direct_frame_wants_vrr(frame))
-            || !self.scanout_allowed()
-            || !self.kms_outputs_active
-        {
-            return;
-        }
-
-        let now = self.monotonic_now();
-        let output = &self.platform.outputs[direct_output_idx].output;
-        if !output.vrr_committed.get() {
-            return;
-        }
-        if self
-            .pstate
-            .direct
-            .get(scope)
-            .is_some_and(|owner| owner.pending.is_some())
-            || self
-                .platform
-                .scanout_commit_in_flight_for_output(direct_output_idx)
-        {
-            output.vrr_clear_retry_deadline.set(None);
-            output.vrr_clear_waiting_for_flip.set(true);
-            return;
-        }
-        if let Err(error) =
-            self.submit_pending_crtc_property_for_output(direct_output_idx, false, now)
-        {
-            log::warn!(
-                "kms: standalone VRR clear for CRTC {:?} failed: {error}",
-                output.crtc
-            );
+            if !output.vrr_committed.get() {
+                continue;
+            }
+            if self
+                .pstate
+                .direct
+                .get(scope)
+                .is_some_and(|owner| owner.pending.is_some())
+                || self
+                    .platform
+                    .scanout_commit_in_flight_for_output(direct_output_idx)
+            {
+                output.vrr_clear_retry_deadline.set(None);
+                output.vrr_clear_waiting_for_flip.set(true);
+                continue;
+            }
+            if let Err(error) =
+                self.submit_pending_crtc_property_for_output(direct_output_idx, false, now)
+            {
+                log::warn!(
+                    "kms: standalone VRR clear for CRTC {:?} failed: {error}",
+                    output.crtc
+                );
+            }
         }
     }
 
@@ -2296,8 +2294,18 @@ impl KmsBackend {
             log::debug!("scanout_m2: fresh composed unflip skipped: {error}");
             return false;
         }
-        self.scene.invalidate_all_scanout_damage();
-        self.scene.mark_scene_structure_dirty();
+        let preserve_global_scene_wake =
+            matches!(scope, DirectScope::Output(_)) && self.scene.scene_structure_dirty;
+        match scope {
+            DirectScope::Root => {
+                self.scene.invalidate_all_scanout_damage();
+                self.scene.mark_scene_structure_dirty();
+            }
+            DirectScope::Output(output_idx) => {
+                self.scene.invalidate_scanout_damage_for_output(output_idx);
+                self.scene.mark_scene_structure_dirty_for_output(output_idx);
+            }
+        }
         self.platform.defer_scene_flips = true;
         let mut skip_outputs = vec![true; self.platform.outputs.len()];
         for output_idx in self.direct_scope_outputs(scope) {
@@ -2306,6 +2314,9 @@ impl KmsBackend {
             }
         }
         self.compose_tick(&skip_outputs);
+        if preserve_global_scene_wake {
+            self.scene.scene_structure_dirty = true;
+        }
         self.platform.defer_scene_flips = false;
         let deferred = std::mem::take(&mut self.platform.deferred_scene_flips);
         let output_indices = self.direct_scope_outputs(scope);
@@ -2545,8 +2556,16 @@ impl KmsBackend {
                 // tracking them; a direct retirement also bypasses
                 // `handle_page_flip_complete` entirely. Treat every composed BO
                 // as wholly stale on the way back.
-                self.scene.invalidate_all_scanout_damage();
-                self.scene.mark_scene_structure_dirty();
+                match scope {
+                    DirectScope::Root => {
+                        self.scene.invalidate_all_scanout_damage();
+                        self.scene.mark_scene_structure_dirty();
+                    }
+                    DirectScope::Output(output_idx) => {
+                        self.scene.invalidate_scanout_damage_for_output(output_idx);
+                        self.scene.mark_scene_structure_dirty_for_output(output_idx);
+                    }
+                }
                 log::debug!("scanout_m2: composed unflip retired for {scope:?}");
             }
             if scene_owned {
@@ -4117,13 +4136,23 @@ impl KmsBackend {
                                 owner.unflip_awaiting_outputs.clear();
                                 owner.degraded_composed_unflip = true;
                             }
-                            self.scene.mark_scene_structure_dirty();
+                            match scope {
+                                DirectScope::Root => self.scene.mark_scene_structure_dirty(),
+                                DirectScope::Output(output_idx) => {
+                                    self.scene.mark_scene_structure_dirty_for_output(output_idx)
+                                }
+                            }
                         }
                     }
                 } else if self.pstate.direct.get(scope).is_some_and(|owner| {
                     owner.degraded_composed_unflip && !owner.unflip_outputs_to_replace.is_empty()
                 }) {
-                    self.scene.mark_scene_structure_dirty();
+                    match scope {
+                        DirectScope::Root => self.scene.mark_scene_structure_dirty(),
+                        DirectScope::Output(output_idx) => {
+                            self.scene.mark_scene_structure_dirty_for_output(output_idx)
+                        }
+                    }
                 }
             }
         }
