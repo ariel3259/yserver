@@ -1,8 +1,9 @@
 use super::*;
 
-// A3 Task 1 helpers: these use the recording KMS fixture and the normal
-// Present/scheduler/backend entry points so each regression checks retained
-// ownership and the accepted per-CRTC replacement, not a direct helper call.
+// A3 uses the existing recording fixture for Vulkan and accepted KMS commits,
+// but it does not seed ServerState window trees or drive their Backend events.
+// These small helpers supply that missing scene setup and inspection while
+// keeping each test on the normal Present, scheduler, and Backend paths.
 fn a3_records_since(
     fixture: &super::commit_identity::recording_scene::RecordingSceneFixture,
     fd: std::os::fd::RawFd,
@@ -56,19 +57,15 @@ fn a3_enter_output_owner(
     let crtc = fixture.events.backend.platform.outputs[output_idx]
         .output
         .crtc;
-    let record = a3_records_since(fixture, fd, start)
-        .into_iter()
-        .find(|record| {
+    let records = a3_records_since(fixture, fd, start);
+    assert!(
+        records.iter().any(|record| {
             super::commit_identity::accepted_event_id(record) == Some(pending_id)
                 && record.events.len() == 1
                 && record.events[0].crtc == crtc
-        })
-        .expect("Output Present made one accepted CRTC commit");
-    let records = a3_records_since(fixture, fd, start);
-    assert!(records.iter().any(|candidate| {
-        super::commit_identity::accepted_event_id(candidate) == Some(pending_id)
-    }));
-    assert_eq!(record.events.len(), 1);
+        }),
+        "Output Present made one accepted CRTC commit on its owner"
+    );
     a3_retire_records(fixture, &records);
     let completed = Backend::drain_completed_present_events(&mut fixture.events.backend);
     assert_eq!(completed.len(), 1, "one Present completes once");
@@ -396,12 +393,34 @@ fn restack_on_other_output_keeps_output_owner() {
         &mut fixture,
         &mut state,
         ResourceId(0x3101),
-        700,
+        100,
         100,
         500,
         500,
         true,
     );
+    Backend::fill_rectangle(
+        &mut fixture.events.backend,
+        None,
+        lower,
+        0x00ff_0000,
+        0,
+        0,
+        500,
+        500,
+    )
+    .expect("paint the lower output 0 window red");
+    Backend::fill_rectangle(
+        &mut fixture.events.backend,
+        None,
+        upper,
+        0x0000_00ff,
+        0,
+        0,
+        500,
+        500,
+    )
+    .expect("paint the upper output 0 window blue");
     a3_add_existing_window_to_state(
         &mut state,
         ResourceId(0x3102),
@@ -430,18 +449,6 @@ fn restack_on_other_output_keeps_output_owner() {
         upper,
         0,
     );
-    let root = fixture.events.backend.core.window_id;
-    Backend::fill_rectangle(
-        &mut fixture.events.backend,
-        None,
-        root,
-        0x0001_2345,
-        0,
-        0,
-        1920,
-        1080,
-    )
-    .expect("damage output 0 after its top-level restack");
     let records = a3_tick(&mut fixture);
     let owner = &fixture.events.backend.pstate.direct.outputs[1];
     assert!(
@@ -457,6 +464,18 @@ fn restack_on_other_output_keeps_output_owner() {
         "output 0 composes the changed top-level order"
     );
     a3_retire_records(&mut fixture, &records);
+    let root = fixture.events.backend.core.window_id;
+    let visible = fixture
+        .events
+        .backend
+        .get_image_pixels_for_tests(root, 2, 150, 150, 1, 1, !0)
+        .expect("read restacked output 0 pixel")
+        .expect("restacked pixel bytes");
+    assert_eq!(
+        &visible[..3],
+        &[0x00, 0x00, 0xff],
+        "the lower window raised above the upper window is visible"
+    );
     assert_eq!(
         fixture.events.backend.pstate.direct.outputs[1]
             .current
@@ -590,6 +609,17 @@ fn map_over_paused_output_owner_revokes_without_present() {
         1080,
         false,
     );
+    Backend::fill_rectangle(
+        &mut fixture.events.backend,
+        None,
+        over_game,
+        0x00d1_7b31,
+        0,
+        0,
+        1920,
+        1080,
+    )
+    .expect("paint a distinguishable notification overlay");
     Backend::map_subwindow(&mut fixture.events.backend, None, over_game)
         .expect("map the output 1 window through Backend");
     let output1_records = a3_tick(&mut fixture);
@@ -606,7 +636,157 @@ fn map_over_paused_output_owner_revokes_without_present() {
         "the replacement is composed on output 1 without a new Present"
     );
     a3_retire_records(&mut fixture, &output1_records);
+    let root = fixture.events.backend.core.window_id;
+    let visible = fixture
+        .events
+        .backend
+        .get_image_pixels_for_tests(root, 2, 1930, 20, 1, 1, !0)
+        .expect("read output 1 after its replacement retires")
+        .expect("replacement pixel bytes");
+    assert_eq!(
+        &visible[..3],
+        &[0x31, 0x7b, 0xd1],
+        "the composed replacement shows the mapped notification"
+    );
     fixture.finish();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: submit a queued successor after a mapped window makes its scene ineligible.
+fn queued_successor_waits_for_scene_revalidation_after_overlay_map() {
+    use yserver_core::{backend::Backend, server::ServerState};
+    use yserver_protocol::x11::ResourceId;
+
+    let Some((fixture, direct)) = a3_output_fixture(1, 945) else {
+        eprintln!(
+            "SKIP queued_successor_waits_for_scene_revalidation_after_overlay_map: Vulkan fixture unavailable"
+        );
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    a3_enter_output_owner(&mut fixture, &direct, 1);
+
+    let fd = fixture.kms_fd(1);
+    let before = fixture.events.recorders[&fd].records().len();
+    let mut pending_candidate = direct.candidate;
+    pending_candidate.present_id = 946;
+    let mut pending_event = direct.event.clone();
+    pending_event.present_id = 946;
+    pending_event.serial = 946;
+    Backend::note_present_scanout_candidate(&mut fixture.events.backend, pending_candidate);
+    assert!(
+        Backend::try_present_direct(
+            &mut fixture.events.backend,
+            pending_candidate,
+            pending_event,
+        )
+        .expect("submit the first successor through Backend Present")
+    );
+    let pending_id = fixture.events.backend.pstate.direct.outputs[1]
+        .pending
+        .as_ref()
+        .and_then(|frame| frame.accepted_event_id)
+        .expect("first successor has an accepted commit identity");
+    let pending_record = a3_records_since(&fixture, fd, before)
+        .into_iter()
+        .find(|record| super::commit_identity::accepted_event_id(record) == Some(pending_id))
+        .expect("record the pending direct successor commit");
+    assert_eq!(pending_record.events.len(), 1);
+    assert_eq!(
+        pending_record.events[0].crtc,
+        fixture.events.backend.platform.outputs[1].output.crtc
+    );
+
+    let mut successor_candidate = pending_candidate;
+    successor_candidate.present_id = 947;
+    let mut successor_event = direct.event.clone();
+    successor_event.present_id = 947;
+    successor_event.serial = 947;
+    Backend::note_present_scanout_candidate(&mut fixture.events.backend, successor_candidate);
+    assert!(
+        Backend::try_present_direct(
+            &mut fixture.events.backend,
+            successor_candidate,
+            successor_event,
+        )
+        .expect("queue the next Present through Backend")
+    );
+    assert_eq!(
+        fixture.events.backend.pstate.direct.outputs[1]
+            .queued_successor
+            .as_ref()
+            .map(|frame| frame.candidate.present_id),
+        Some(947),
+        "the successor waits behind the pending direct commit"
+    );
+
+    let mut state = ServerState::new();
+    let overlay = a3_seed_ordered_window(
+        &mut fixture,
+        &mut state,
+        ResourceId(0x3190),
+        1920,
+        0,
+        1920,
+        1080,
+        false,
+    );
+    Backend::fill_rectangle(
+        &mut fixture.events.backend,
+        None,
+        overlay,
+        0x0001_2345,
+        0,
+        0,
+        1920,
+        1080,
+    )
+    .expect("paint distinguishable overlay pixels");
+    Backend::map_subwindow(&mut fixture.events.backend, None, overlay)
+        .expect("map overlay through Backend");
+
+    a3_retire_records(&mut fixture, std::slice::from_ref(&pending_record));
+    let owner = &fixture.events.backend.pstate.direct.outputs[1];
+    assert!(
+        owner.unflip_requested,
+        "the newly ineligible scene requests unflip before queued direct submission"
+    );
+    assert!(
+        owner.pending.is_none(),
+        "the queued successor was not submitted after the pending frame retires"
+    );
+
+    let replacement = a3_tick(&mut fixture);
+    assert!(
+        a3_has_scene_commit_for(
+            &replacement,
+            fixture.events.backend.platform.outputs[1].output.crtc,
+        ),
+        "the next Backend scheduler pass composes output 1"
+    );
+    a3_retire_records(&mut fixture, &replacement);
+    assert!(
+        fixture
+            .events
+            .backend
+            .direct_scanout_frame_for_output(1)
+            .is_none(),
+        "the invalid direct owner retires after the composed replacement"
+    );
+    let root_xid = fixture.events.backend.core.window_id;
+    let visible = fixture
+        .events
+        .backend
+        .get_image_pixels_for_tests(root_xid, 2, 1930, 20, 1, 1, !0)
+        .expect("read output 1 after replacement")
+        .expect("replacement pixel bytes");
+    assert_eq!(
+        &visible[..3],
+        &[0x45, 0x23, 0x01],
+        "the composed replacement shows the newly mapped overlay, not a direct successor"
+    );
+    fixture.finish_after_normal_drain();
 }
 
 #[test]
@@ -868,17 +1048,17 @@ fn drawable_cause_revokes_only_its_owner() {
         &records,
         fixture.events.backend.platform.outputs[0].output.crtc
     ));
-    assert_eq!(
-        fixture.events.backend.pstate.direct.outputs[1]
-            .current
-            .as_ref()
-            .unwrap()
-            .candidate
-            .present_id,
-        second.candidate.present_id,
-        "Output(1) remains current through Output(0)'s replacement pass"
-    );
     a3_retire_records(&mut fixture, &records);
+    let unaffected = &fixture.events.backend.pstate.direct.outputs[1];
+    assert!(
+        !unaffected.unflip_requested,
+        "Output(1) remains held after retirement"
+    );
+    assert_eq!(
+        unaffected.current.as_ref().unwrap().candidate.present_id,
+        second.candidate.present_id,
+        "Output(1) stays current through Output(0)'s retirement"
+    );
     fixture.finish();
 }
 

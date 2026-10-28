@@ -914,11 +914,14 @@ fn queued_successor_not_blocked_by_scene_flip_on_other_output() {
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: route retirement to the first active owner instead of scope_for_output.
 fn two_output_owners_retire_independently() {
-    let Some((mut fixture, first)) = direct_fixture(2, P1SceneRoute::Shared, 205, 0) else {
+    let Some(mut fixture) = RecordingSceneFixture::with_route(2, P1SceneRoute::Shared)
+        .expect("direct recording scene fixture construction")
+    else {
         return;
     };
+    let first = fixture.install_direct_output_present(0, 205, 0);
+    let second = fixture.install_direct_output_present(1, 206, 0);
     let device_fd = fd(&fixture);
-    let second = fixture.install_direct_present(206, 0);
     Backend::set_cursor_hidden(&mut fixture.events.backend, true);
     let (first_record, second_record) =
         submit_two_output_owner_successors(&mut fixture, &first, &second);
@@ -1373,10 +1376,13 @@ fn stopped_output_owner_notifications_are_drained() {
 fn global_teardown_unflips_every_output_owner() {
     use yserver_core::core_loop::input_inventory::InputInventory;
 
-    let Some((mut fixture, first)) = direct_fixture(2, P1SceneRoute::Shared, 209, 0) else {
+    let Some(mut fixture) = RecordingSceneFixture::with_route(2, P1SceneRoute::Shared)
+        .expect("direct recording scene fixture construction")
+    else {
         return;
     };
-    let second = fixture.install_direct_present(210, 0);
+    let first = fixture.install_direct_output_present(0, 209, 0);
+    let second = fixture.install_direct_output_present(1, 210, 0);
     let device_fd = fd(&fixture);
     Backend::set_cursor_hidden(&mut fixture.events.backend, true);
     let (first_record, second_record) =
