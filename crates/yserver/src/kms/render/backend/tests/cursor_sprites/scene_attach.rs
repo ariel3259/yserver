@@ -3341,6 +3341,255 @@ fn output_owner_async_presents_flip_synchronized() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutations: restore the global tearing early-return before Output cursor
+// refresh; skip hardware motion whenever Root tearing is active. The accepted
+// Output(1) image and position commits must both disappear.
+fn output_owner_cursor_updates_during_root_tearing() {
+    let Some(mut fixture) = AtomicPathFixture::with_output_count(PathKind::Physical, 2)
+        .expect("two-output cursor/tearing fixture construction")
+    else {
+        eprintln!(
+            "SKIP output_owner_cursor_updates_during_root_tearing: Vulkan fixture unavailable"
+        );
+        return;
+    };
+    let mut delivered = HashSet::new();
+    for device in &mut fixture.scene.events.backend.platform.devices {
+        device.async_page_flip = true;
+    }
+
+    // Keep the Root candidate out of direct scanout with a software cursor,
+    // so Backend's normal async-Present path enters Root tearing.
+    let large_cursor = create_argb_cursor(
+        &mut fixture.scene.events.backend,
+        (300, 4),
+        [0x18, 0x29, 0x3a, 0xff],
+        (1, 2),
+    );
+    define_root_cursor(&mut fixture.scene.events.backend, large_cursor);
+    Backend::set_cursor_hidden(&mut fixture.scene.events.backend, false);
+    Backend::warp_pointer_root(
+        &mut fixture.scene.events.backend,
+        &mut fixture.scene.events.state,
+        100,
+        90,
+    );
+    damage_root(&mut fixture);
+    for frame in 1..=4 {
+        Backend::maybe_composite(&mut fixture.scene.events.backend)
+            .expect("settle software cursor before Root async Presents");
+        for output_idx in 0..2 {
+            if has_unretired_accepted_event(&fixture.scene.events, &delivered, output_idx) {
+                retire_pending_output(&mut fixture.scene.events, &mut delivered, output_idx, frame);
+            }
+        }
+        if fixture
+            .scene
+            .events
+            .backend
+            .scene
+            .cursor_mode_for_outputs(&[0, 1])
+            == crate::kms::render::scene::CursorPlaneMode::Sw
+        {
+            break;
+        }
+    }
+    assert_eq!(
+        fixture
+            .scene
+            .events
+            .backend
+            .scene
+            .cursor_mode_for_outputs(&[0, 1]),
+        crate::kms::render::scene::CursorPlaneMode::Sw,
+        "the oversized cursor keeps Root candidates out of direct scanout"
+    );
+
+    fixture
+        .scene
+        .events
+        .backend
+        .for_tests_set_scanout_m1_prober(super::super::present_scanout::record_scanout_m1_probe);
+    let root = fixture
+        .scene
+        .install_direct_present(7_221, yserver_core::present_scheduler::PRESENT_OPTION_ASYNC);
+    Backend::set_cursor_hidden(&mut fixture.scene.events.backend, false);
+    let probation = usize::from(crate::kms::render::backend::TEARING_ENTRY_PROBATION);
+    for attempt in 0..probation {
+        let mut candidate = root.candidate;
+        candidate.present_id += u64::try_from(attempt).expect("attempt fits Present id");
+        let mut event = root.event.clone();
+        event.present_id = candidate.present_id;
+        event.serial = u32::try_from(candidate.present_id).expect("Root serial fits");
+        Backend::note_present_scanout_candidate(&mut fixture.scene.events.backend, candidate);
+        assert!(
+            !Backend::try_present_direct(&mut fixture.scene.events.backend, candidate, event,)
+                .expect("Root async Present enters tearing through Backend"),
+            "the software cursor keeps the Root Present composed"
+        );
+    }
+    assert!(
+        fixture.scene.events.backend.pstate.tearing.is_on(),
+        "Root async Presents enter Root tearing"
+    );
+    assert!(
+        !fixture.scene.events.backend.pstate.direct.root().active(),
+        "Root tearing has no direct Root owner in this fixture"
+    );
+    let output1_x = fixture.scene.events.backend.platform.outputs[1].x;
+    Backend::warp_pointer_root(
+        &mut fixture.scene.events.backend,
+        &mut fixture.scene.events.state,
+        output1_x + 100,
+        90,
+    );
+
+    let direct = fixture.scene.install_direct_output_present(
+        1,
+        7_222,
+        yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+    );
+    Backend::note_present_scanout_candidate(&mut fixture.scene.events.backend, direct.candidate);
+    let device_fd = fixture.scene.kms_fd(1);
+    let direct_start = record_count(&fixture, device_fd);
+    for attempt in 0..usize::from(crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION) {
+        assert_eq!(
+            Backend::try_present_direct(
+                &mut fixture.scene.events.backend,
+                direct.candidate,
+                direct.event.clone(),
+            )
+            .expect("Output(1) Present stays direct during Root tearing"),
+            attempt + 1
+                == usize::from(crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION),
+            "Output(1) enters after direct scanout probation"
+        );
+    }
+    let crtc1 = fixture.scene.events.backend.platform.outputs[1].output.crtc;
+    let direct_record = accepted_live_records(&fixture.scene.events.recorders[&device_fd])
+        .into_iter()
+        .skip(direct_start)
+        .find(|record| {
+            record.events.iter().any(|event| event.crtc == crtc1)
+                && accepted_event_id(record).is_some()
+        })
+        .expect("Output(1) direct Present has an accepted commit");
+    assert!(
+        !direct_record
+            .flags
+            .contains(::drm::control::AtomicCommitFlags::PAGE_FLIP_ASYNC),
+        "Output(1) remains synchronized while Root tearing is active"
+    );
+    retire_pending_output(&mut fixture.scene.events, &mut delivered, 1, 40);
+    assert!(fixture.scene.events.backend.pstate.tearing.is_on());
+    assert!(
+        fixture.scene.events.backend.pstate.direct.outputs[1]
+            .current
+            .is_some(),
+        "Output(1) is the live direct owner"
+    );
+
+    let cursor = create_argb_cursor(
+        &mut fixture.scene.events.backend,
+        (4, 4),
+        [0x62, 0x71, 0x82, 0xff],
+        (1, 2),
+    );
+    let image_start = record_count(&fixture, device_fd);
+    define_root_cursor(&mut fixture.scene.events.backend, cursor);
+    Backend::set_cursor_hidden(&mut fixture.scene.events.backend, false);
+    let image_record = accepted_live_records(&fixture.scene.events.recorders[&device_fd])
+        .into_iter()
+        .skip(image_start)
+        .find(|record| {
+            record.kind == AtomicCommitKind::CursorOnly
+                && record_property(
+                    record,
+                    super::support::cursor_properties_for_output(&fixture.scene.events.backend, 1)
+                        .fb_id,
+                )
+                .is_some_and(|fb| fb != 0)
+                && record.events.iter().any(|event| event.crtc == crtc1)
+        })
+        .expect("Output(1) accepts the new hardware cursor image during Root tearing");
+    retire_cursor_record(&mut fixture, &mut delivered, 1, &image_record, 41);
+    let binding = applied_cursor_binding(&fixture.scene.events.backend, 1)
+        .expect("Output(1) retains its hardware cursor binding");
+    let bytes = sprite_bytes(&fixture.scene.events.backend, 1, binding.lease)
+        .expect("Output(1) cursor sprite bytes");
+    assert_eq!(
+        bytes
+            .chunks_exact(4)
+            .filter(|pixel| *pixel == [0x62, 0x71, 0x82, 0xff])
+            .count(),
+        16,
+        "Output(1) is showing the replacement sprite"
+    );
+    assert!(
+        fixture
+            .scene
+            .events
+            .backend
+            .platform
+            .cursor_plane_visible_for_output(1)
+    );
+    assert!(fixture.scene.events.backend.pstate.tearing.is_on());
+    assert!(
+        fixture.scene.events.backend.pstate.direct.outputs[1]
+            .current
+            .is_some(),
+        "cursor refresh leaves Output(1) direct"
+    );
+
+    let properties1 =
+        super::support::cursor_properties_for_output(&fixture.scene.events.backend, 1);
+    Backend::warp_pointer_root(
+        &mut fixture.scene.events.backend,
+        &mut fixture.scene.events.state,
+        output1_x + 140,
+        120,
+    );
+    assert!(
+        fixture.scene.events.backend.pstate.tearing.is_on(),
+        "pointer motion enters the Output-owner path while Root tearing is still active"
+    );
+    let move_start = record_count(&fixture, device_fd);
+    Backend::maybe_composite(&mut fixture.scene.events.backend)
+        .expect("submit Output(1) cursor motion during Root tearing");
+    let position = accepted_live_records(&fixture.scene.events.recorders[&device_fd])
+        .into_iter()
+        .skip(move_start)
+        .find(|record| {
+            record.kind == AtomicCommitKind::CursorOnly
+                && record_property(record, properties1.crtc_x).is_some()
+                && record_property(record, properties1.fb_id).is_none()
+                && record.events.iter().any(|event| event.crtc == crtc1)
+        })
+        .expect("Output(1) accepts a position-only cursor commit during Root tearing");
+    let output1_layout = &fixture.scene.events.backend.platform.outputs[1];
+    assert_eq!(
+        record_property(&position, properties1.crtc_x),
+        Some(
+            u64::try_from(output1_x + 140 - 1 - output1_layout.x).expect("cursor x is nonnegative")
+        )
+    );
+    assert_eq!(record_property(&position, properties1.crtc_y), Some(118));
+    retire_cursor_record(&mut fixture, &mut delivered, 1, &position, 42);
+    assert!(
+        !fixture.scene.events.backend.pstate.tearing.is_on(),
+        "the scheduling pass exits Root tearing after the new output window changes Root visibility"
+    );
+    assert!(
+        fixture.scene.events.backend.pstate.direct.outputs[1]
+            .current
+            .is_some(),
+        "Output(1) remains the direct owner after cursor motion"
+    );
+    finish_direct_fixture(fixture, &mut delivered);
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: omit the refresh loop's per-scope hard-failure fallback; a Hidden
 // retired cursor does not queue a scene retry to rescue the direct owner.
 fn hard_direct_cursor_refresh_failure_unflips_hidden_output_owner() {

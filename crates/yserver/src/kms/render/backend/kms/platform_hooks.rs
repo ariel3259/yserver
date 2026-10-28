@@ -296,6 +296,16 @@ impl Platform for PlatformBackend {
         (hot_x, hot_y): (u16, u16),
         (cw, ch): (i32, i32),
     ) {
+        if b.pstate.tearing.is_on()
+            && !b
+                .pstate
+                .direct
+                .active_scopes()
+                .iter()
+                .any(|scope| matches!(scope, DirectScope::Output(_)))
+        {
+            return;
+        }
         if mixed {
             // Hardware and software cursor ownership may coexist on
             // arbitrary cards. Record/dispatch every visible HW plane

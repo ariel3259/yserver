@@ -3754,9 +3754,7 @@ impl KmsBackend {
             self.exit_tearing("eligibility_lost");
             return;
         }
-        if self.tearing_cursor_wants_visible() && self.pstate.direct.root().active() {
-            self.request_direct_unflip_for(DirectScope::Root, "tearing_cursor_handoff");
-        }
+        self.request_tearing_cursor_handoff();
         if self.platform.any_cursor_plane_visible() {
             return;
         }

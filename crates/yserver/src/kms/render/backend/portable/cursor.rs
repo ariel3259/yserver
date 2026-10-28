@@ -687,9 +687,6 @@ impl<P: Platform> XBackend<P> {
             });
 
         P::request_tearing_cursor_handoff(self);
-        if P::tearing_active(self) {
-            return;
-        }
 
         // Stage 5 Phase D — steady-state HW sprite-change. When the
         // plane is fully bound, the scene won't re-tick (v2's
@@ -705,6 +702,12 @@ impl<P: Platform> XBackend<P> {
         } else {
             Vec::new()
         };
+        // Root tearing suppresses the scene-wide cursor upload, but an
+        // independent Output owner still refreshes its own hardware cursor
+        // through the owner-aware path above.
+        if P::tearing_active(self) {
+            return;
+        }
         let refreshes_visible_cursor = direct_owns_frame
             || match self.scene.cursor_mode() {
                 crate::kms::render::scene::CursorPlaneMode::Hw

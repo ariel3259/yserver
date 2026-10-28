@@ -628,18 +628,23 @@ impl<P: Platform> XBackend<P> {
                     )
                 })
                 .unwrap_or((0, 0, 0, 0));
+            let tearing_active = P::tearing_active(self);
             if self.effective_cursor_hidden() {
                 // The effective cursor has no visible pixels, so pointer
                 // motion has no cursor sprite to move.
-            } else if P::tearing_active(self) {
-                // Tearing owns cursor policy until exit. Keep motion on the
-                // platform's capped scene-wake path.
-                P::cursor_motion_during_tearing(self, true);
-            } else if matches!(
-                cursor_mode,
-                crate::kms::render::scene::CursorPlaneMode::Hw
-                    | crate::kms::render::scene::CursorPlaneMode::Mixed
-            ) {
+            } else if tearing_active
+                || matches!(
+                    cursor_mode,
+                    crate::kms::render::scene::CursorPlaneMode::Hw
+                        | crate::kms::render::scene::CursorPlaneMode::Mixed
+                )
+            {
+                if tearing_active {
+                    // Keep Root tearing motion on the capped scene-wake path.
+                    // The KMS hook also moves an independent Output owner's
+                    // visible hardware cursor.
+                    P::cursor_motion_during_tearing(self, true);
+                }
                 let mixed = matches!(
                     cursor_mode,
                     crate::kms::render::scene::CursorPlaneMode::Mixed
