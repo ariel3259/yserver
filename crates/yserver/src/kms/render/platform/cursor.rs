@@ -42,6 +42,7 @@ impl KmsCursorState {
             atomic_cursor_commits_in_flight: HashMap::new(),
             cursor_retry_waits_for_flip: HashSet::new(),
             cursor_hide_recovery: HashMap::new(),
+            permanently_disabled_crtcs: HashSet::new(),
             permanently_disabled: false,
             initialization_retryable: false,
             headless_deferred: true,
@@ -70,7 +71,7 @@ impl KmsCursorState {
         y: i32,
         motion_timestamp: Option<Instant>,
     ) {
-        if !self.atomic_cursor {
+        if !self.atomic_cursor || self.permanently_disabled_crtcs.contains(&crtc) {
             return;
         }
         let Some((plane, crtc_x, crtc_y)) = self
@@ -111,6 +112,7 @@ impl KmsCursorState {
             && self.atomic_cursor
             && self.plane.is_some()
             && !self.permanently_disabled
+            && !self.permanently_disabled_crtcs.contains(&crtc)
             && !self.topology_blocked
             && self
                 .transient_fallback_crtcs
@@ -277,6 +279,7 @@ impl PlatformBackend {
         cursor.clear_atomic_position(crtc);
         cursor.cursor_retry_waits_for_flip.remove(&crtc);
         cursor.cursor_hide_recovery.remove(&crtc);
+        cursor.permanently_disabled_crtcs.remove(&crtc);
         cursor.transient_fallback_crtcs.remove(&crtc);
     }
 
@@ -329,6 +332,7 @@ impl CursorMoveOutcome {
         self.ebusy_count = self.ebusy_count.saturating_add(other.ebusy_count);
         self.fallback_changed |= other.fallback_changed;
         self.retry_required |= other.retry_required;
+        self.affected_crtcs.extend(other.affected_crtcs);
     }
 }
 
@@ -446,6 +450,7 @@ impl PlatformBackend {
             let crtc = layout.output.crtc;
             if !device.cursor.atomic_cursor
                 || device.cursor.permanently_disabled
+                || device.cursor.permanently_disabled_crtcs.contains(&crtc)
                 || device.cursor.cursor_hide_recovery.contains_key(&crtc)
                 || !device.cursor.hw_bound_on(crtc)
             {
@@ -793,6 +798,12 @@ impl PlatformBackend {
                 Ok(()) => outcome.fallback_changed = true,
                 Err(_) => outcome.retry_required = true,
             }
+            outcome
+                .affected_crtcs
+                .insert(crate::kms::render::platform::CrtcKey {
+                    device_key: position.device_key,
+                    crtc,
+                });
         }
         outcome
     }
@@ -1034,6 +1045,18 @@ impl PlatformBackend {
             .iter()
             .find(|device| device.key == device_key)
             .is_some_and(|device| device.cursor.permanently_disabled)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_cursor_crtc_permanently_disabled(
+        &self,
+        device_key: crate::platform::drm::DrmDeviceKey,
+        crtc: ::drm::control::crtc::Handle,
+    ) -> bool {
+        self.devices
+            .iter()
+            .find(|device| device.key == device_key)
+            .is_some_and(|device| device.cursor.permanently_disabled_crtcs.contains(&crtc))
     }
 
     #[cfg(test)]
@@ -1315,14 +1338,13 @@ impl PlatformBackend {
                 );
                 outcome.retry_required = true;
                 if attempts >= crate::kms::render::platform::CURSOR_HIDE_RECOVERY_MAX_ATTEMPTS {
-                    state.permanently_disabled = true;
-                    state.atomic_positions.clear();
-                    state.atomic_pending_moves.clear();
-                    state.cursor_retry_waits_for_flip.clear();
-                    state.cursor_hide_recovery.clear();
+                    state.permanently_disabled_crtcs.insert(crtc);
+                    state.clear_atomic_position(crtc);
+                    state.cursor_retry_waits_for_flip.remove(&crtc);
+                    state.cursor_hide_recovery.remove(&crtc);
                     outcome.fallback_changed = true;
                     log::error!(
-                        "render cursor hide recovery: device {device_key} CRTC {crtc:?} {operation} failed {attempts} times ({error}); permanently disabling the hardware cursor"
+                        "render cursor hide recovery: device {device_key} CRTC {crtc:?} {operation} failed {attempts} times ({error}); permanently disabling the hardware cursor on this CRTC"
                     );
                 } else {
                     log::warn!(
@@ -1333,6 +1355,9 @@ impl PlatformBackend {
                 }
             }
         }
+        outcome
+            .affected_crtcs
+            .insert(crate::kms::render::platform::CrtcKey { device_key, crtc });
         outcome
     }
 
@@ -1361,8 +1386,12 @@ impl PlatformBackend {
         }
         let mut outcome = CursorMoveOutcome::default();
         for (crtc, layout_x, layout_y) in layouts {
-            if self.devices[device_idx].cursor.permanently_disabled {
-                break;
+            if self.devices[device_idx]
+                .cursor
+                .permanently_disabled_crtcs
+                .contains(&crtc)
+            {
+                continue;
             }
             if !self.devices[device_idx].cursor.hw_bound_on(crtc) {
                 continue;

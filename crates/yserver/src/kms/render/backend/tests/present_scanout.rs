@@ -3515,10 +3515,12 @@ fn active_direct_scanout_unflips_on_cursor_output_fallback() {
     let mut backend = crate::kms::render::backend::KmsBackend::for_tests();
     let fallback_id = seed_window(&mut backend, 0x6e00, None, 0, 0);
     install_direct_frame_for_target_test(&mut backend, 0x6e10, fallback_id, true);
+    let affected_crtc = output_crtc_key(&backend, 0);
     backend.handle_cursor_move_outcome(crate::kms::render::platform::CursorMoveOutcome {
         ebusy_count: 0,
         fallback_changed: true,
         retry_required: false,
+        affected_crtcs: std::collections::HashSet::from([affected_crtc]),
     });
     assert!(backend.pstate.direct.root().unflip_requested);
     assert!(!backend.pstate.direct.root().hold_direct);
@@ -3530,10 +3532,12 @@ fn active_direct_scanout_unflips_and_wakes_for_cursor_rollback_retry() {
     let fallback_id = seed_window(&mut backend, 0x6e20, None, 0, 0);
     install_direct_frame_for_target_test(&mut backend, 0x6e30, fallback_id, true);
     backend.scene.scene_structure_dirty = false;
+    let affected_crtc = output_crtc_key(&backend, 0);
     backend.handle_cursor_move_outcome(crate::kms::render::platform::CursorMoveOutcome {
         ebusy_count: 0,
         fallback_changed: false,
         retry_required: true,
+        affected_crtcs: std::collections::HashSet::from([affected_crtc]),
     });
     assert!(backend.scene.scene_structure_dirty);
     assert!(backend.pstate.direct.root().unflip_requested);

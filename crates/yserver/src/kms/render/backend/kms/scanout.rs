@@ -528,9 +528,22 @@ impl KmsBackend {
             .record_cursor_move_ebusy(u64::from(outcome.ebusy_count));
         if outcome.fallback_changed || outcome.retry_required {
             self.scene.wake_for_damage();
-            if self.pstate.direct.root().active() {
-                self.request_direct_unflip("cursor_move_fallback_or_retry");
-            }
+            let affected_outputs: Vec<_> = self
+                .platform
+                .outputs
+                .iter()
+                .enumerate()
+                .filter_map(|(output_idx, layout)| {
+                    outcome
+                        .affected_crtcs
+                        .contains(&crate::kms::render::platform::CrtcKey::for_output(layout))
+                        .then_some(output_idx)
+                })
+                .collect();
+            self.request_direct_unflip_for_outputs(
+                &affected_outputs,
+                "cursor_move_fallback_or_retry",
+            );
         }
     }
 
@@ -566,6 +579,22 @@ impl KmsBackend {
     pub(in crate::kms::render::backend) fn request_direct_unflip(&mut self, reason: &'static str) {
         for scope in self.pstate.direct.active_scopes() {
             self.request_direct_unflip_for(scope, reason);
+        }
+    }
+
+    pub(in crate::kms::render::backend) fn request_direct_unflip_for_outputs(
+        &mut self,
+        output_indices: &[usize],
+        reason: &'static str,
+    ) {
+        for scope in self.pstate.direct.active_scopes() {
+            if self
+                .direct_scope_outputs(scope)
+                .iter()
+                .any(|output_idx| output_indices.contains(output_idx))
+            {
+                self.request_direct_unflip_for(scope, reason);
+            }
         }
     }
 

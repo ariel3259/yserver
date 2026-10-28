@@ -338,6 +338,10 @@ impl Platform for PlatformBackend {
             // so the seam crossing must be detected here or the
             // cursor stays frozen on the CRTC it was last bound
             // to (invisible on the screen it moved onto).
+            match b.platform.cursor_plane_move(cx, cy, hot_x, hot_y) {
+                Ok(outcome) => b.handle_cursor_move_outcome(outcome),
+                Err(error) => log::debug!("render cursor membership move: {error}"),
+            }
             b.scene.wake_for_damage();
         } else {
             match b.platform.cursor_plane_move(cx, cy, hot_x, hot_y) {
