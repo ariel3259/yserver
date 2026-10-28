@@ -397,42 +397,6 @@ fn a3_materialize_cow(
         .expect("GetOverlayWindow returns the materialized COW")
 }
 
-fn a3_add_existing_window_with_host(
-    state: &mut yserver_core::server::ServerState,
-    resource_id: yserver_protocol::x11::ResourceId,
-    host_xid: u32,
-    x: i16,
-    y: i16,
-    width: u16,
-    height: u16,
-) {
-    use yserver_core::resources::ROOT_WINDOW;
-    use yserver_protocol::x11::{ClientId, CreateWindowRequest};
-
-    state.resources.create_window(
-        ClientId(14),
-        CreateWindowRequest {
-            depth: 24,
-            window: resource_id,
-            parent: ROOT_WINDOW,
-            x,
-            y,
-            width,
-            height,
-            border_width: 0,
-            class: 1,
-            visual: yserver_core::resources::ROOT_VISUAL,
-            ..Default::default()
-        },
-    );
-    state
-        .resources
-        .window_mut(resource_id)
-        .expect("register the window in ServerState")
-        .host_xid = yserver_core::backend::WindowHandle::from_raw(host_xid);
-    let _ = state.resources.map_window(resource_id);
-}
-
 fn a3_install_root_present(
     fixture: &mut super::commit_identity::recording_scene::RecordingSceneFixture,
     present_id: u64,
@@ -501,12 +465,21 @@ fn a3_visible_root_pixel(
     x: i16,
     y: i16,
 ) -> Vec<u8> {
-    fixture
-        .events
-        .backend
-        .get_image_pixels_for_tests(fixture.events.backend.core.window_id, 2, x, y, 1, 1, !0)
-        .expect("read composed root pixel")
-        .expect("root pixel bytes")
+    crate::kms::render::backend::read_scanout_region(
+        &mut fixture.events.backend,
+        ash::vk::Rect2D {
+            offset: ash::vk::Offset2D {
+                x: i32::from(x),
+                y: i32::from(y),
+            },
+            extent: ash::vk::Extent2D {
+                width: 1,
+                height: 1,
+            },
+        },
+        crate::kms::render::backend::ScanoutReadSelection::PermissiveDump,
+    )
+    .expect("read the visible scanout buffer")
 }
 
 #[test]
@@ -531,7 +504,7 @@ fn shaped_away_stage_present_keeps_output_owner() {
             output.height,
         )
     };
-    a3_add_existing_window_with_host(
+    a3_add_existing_window_to_state(
         &mut state,
         ResourceId(0x3160),
         game_xid,
@@ -539,6 +512,7 @@ fn shaped_away_stage_present_keeps_output_owner() {
         game_y,
         game_width,
         game_height,
+        true,
     );
     Backend::sync_top_level_order(&mut fixture.events.backend, &state);
     a3_enter_output_owner(&mut fixture, &direct, 1);
@@ -624,7 +598,7 @@ fn stage_present_visible_on_output_revokes_it() {
     };
     let mut state = yserver_core::server::ServerState::new();
     let output = &fixture.events.backend.platform.outputs[1];
-    a3_add_existing_window_with_host(
+    a3_add_existing_window_to_state(
         &mut state,
         ResourceId(0x3161),
         direct.target_xid,
@@ -632,6 +606,7 @@ fn stage_present_visible_on_output_revokes_it() {
         output.y as i16,
         output.width,
         output.height,
+        true,
     );
     Backend::sync_top_level_order(&mut fixture.events.backend, &state);
     a3_enter_output_owner(&mut fixture, &direct, 1);
@@ -709,7 +684,7 @@ fn root_window_below_game_presenting_keeps_output_owner() {
     );
     let game_resource = ResourceId(0x3163);
     let game = &fixture.events.backend.platform.outputs[1];
-    a3_add_existing_window_with_host(
+    a3_add_existing_window_to_state(
         &mut state,
         game_resource,
         direct.target_xid,
@@ -717,6 +692,7 @@ fn root_window_below_game_presenting_keeps_output_owner() {
         game.y as i16,
         game.width,
         game.height,
+        true,
     );
     Backend::sync_top_level_order(&mut fixture.events.backend, &state);
     a3_enter_output_owner(&mut fixture, &direct, 1);
@@ -848,7 +824,7 @@ fn output_owner_copy_fallback_is_marked_ready() {
             true,
         );
         let game = &fixture.events.backend.platform.outputs[1];
-        a3_add_existing_window_with_host(
+        a3_add_existing_window_to_state(
             &mut state,
             ResourceId(if cow_descendant { 0x3165 } else { 0x3164 }),
             direct.target_xid,
@@ -856,6 +832,7 @@ fn output_owner_copy_fallback_is_marked_ready() {
             game.y as i16,
             game.width,
             game.height,
+            true,
         );
         Backend::sync_top_level_order(&mut fixture.events.backend, &state);
         let cow_xid = cow_descendant.then(|| a3_materialize_cow(&mut fixture, &mut state));
@@ -942,12 +919,15 @@ fn output_owner_copy_fallback_is_marked_ready() {
             "output 1 submits its composed replacement"
         );
         a3_retire_records(&mut fixture, &records);
+        assert!(
+            !fixture.events.backend.pstate.direct.outputs[1].active(),
+            "Output(1) retired its composed replacement"
+        );
         assert_eq!(
             &a3_visible_root_pixel(&mut fixture, 1930, 20)[..3],
             &[0x31, 0x7b, 0xd1],
             "the replacement shows the new Present pixels, not the retained blue source"
         );
-        assert!(!fixture.events.backend.pstate.direct.outputs[1].active());
         fixture.finish();
     }
 }
