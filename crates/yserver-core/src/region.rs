@@ -143,6 +143,36 @@ impl Region {
         self
     }
 
+    /// A client-requested move: Xorg's `RegionTranslate`, the 16-bit
+    /// `pixman_region_translate`. Each moved box is clipped to the `i16`
+    /// range and dropped if nothing of it is left; the bands are not
+    /// coalesced again. [`Self::translate`] is for internal geometry,
+    /// which may leave that range.
+    ///
+    /// A box with an edge moved exactly onto the limit (`x1` to
+    /// `MAXSHORT`, `x2` to `MINSHORT`, likewise `y`) is dropped here;
+    /// pixman keeps it as a box with no area.
+    pub(crate) fn translate_clipped(mut self, dx: i32, dy: i32) -> Self {
+        let (min, max) = (i64::from(i16::MIN), i64::from(i16::MAX));
+        let (dx, dy) = (i64::from(dx), i64::from(dy));
+        let clip = |v: i64| v.clamp(min, max) as i32;
+        self.boxes.retain_mut(|b| {
+            let (x1, x2) = (i64::from(b.x1) + dx, i64::from(b.x2) + dx);
+            let (y1, y2) = (i64::from(b.y1) + dy, i64::from(b.y2) + dy);
+            if x2 <= min || y2 <= min || x1 >= max || y1 >= max {
+                return false;
+            }
+            *b = Box32 {
+                x1: clip(x1),
+                y1: clip(y1),
+                x2: clip(x2),
+                y2: clip(y2),
+            };
+            true
+        });
+        self
+    }
+
     pub(crate) fn to_rects(&self) -> Vec<RegionRect> {
         self.boxes.iter().map(|b| b.to_rect()).collect()
     }

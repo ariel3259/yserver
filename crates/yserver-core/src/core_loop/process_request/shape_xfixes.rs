@@ -223,6 +223,17 @@ fn shape_combine(
     }
 }
 
+/// A source region moved by a request's offset, as `RegionOperate` and
+/// XFIXES SetWindowShapeRegion do: `RegionTranslate`, only when the offset
+/// is not zero.
+fn offset_source(source: Region, dx: i16, dy: i16) -> Region {
+    if dx == 0 && dy == 0 {
+        source
+    } else {
+        source.translate_clipped(i32::from(dx), i32::from(dy))
+    }
+}
+
 /// `ProcShapeGetRectangles`: the shape's rects, or for an unshaped window
 /// one rect that for Bounding and Input is `[-bw, -bw, w + bw, h + bw]` —
 /// Xorg's reply, not the default shape, which is `2 * bw` larger.
@@ -368,8 +379,8 @@ fn handle_shape_request_ops(
                     Region::from_yx_banded(&rects)
                 } else {
                     Region::from_wire_rects(&rects)
-                }
-                .translate(i32::from(req.x_off), i32::from(req.y_off));
+                };
+                let source = offset_source(source, req.x_off, req.y_off);
                 let changed = shape_combine(state, window, req.dest_kind, source, req.op);
                 mirror_shape_to_host_state(state, backend, origin, window, req.dest_kind);
                 // Xorg miSetShape re-evaluates the pointer before ShapeNotify
@@ -451,8 +462,7 @@ fn handle_shape_request_ops(
                     req.op,
                     source.len(),
                 );
-                let source = Region::from_rects(&source)
-                    .translate(i32::from(req.x_off), i32::from(req.y_off));
+                let source = offset_source(Region::from_rects(&source), req.x_off, req.y_off);
                 let changed = shape_combine(state, window, req.dest_kind, source, req.op);
                 mirror_shape_to_host_state(state, backend, origin, window, req.dest_kind);
                 backend.windows_restructured(state);
@@ -476,8 +486,11 @@ fn handle_shape_request_ops(
                     req.x_off,
                     req.y_off,
                 );
-                let source = crate::nested::shape_region_or_default(state, src, req.src_kind)
-                    .translate(i32::from(req.x_off), i32::from(req.y_off));
+                let source = offset_source(
+                    crate::nested::shape_region_or_default(state, src, req.src_kind),
+                    req.x_off,
+                    req.y_off,
+                );
                 log::debug!(
                     "shape diag: COMBINE dest=0x{:x}(kind={}) src=0x{:x}(kind={}) op={} \
                      src_dims={}",
@@ -502,7 +515,7 @@ fn handle_shape_request_ops(
                 if let Some(region) = crate::nested::shape_region(state, dest, req.dest_kind) {
                     let region = region
                         .clone()
-                        .translate(i32::from(req.x_off), i32::from(req.y_off));
+                        .translate_clipped(i32::from(req.x_off), i32::from(req.y_off));
                     crate::nested::set_shape_region(state, dest, req.dest_kind, region);
                     mirror_shape_to_host_state(state, backend, origin, dest, req.dest_kind);
                     backend.windows_restructured(state);
@@ -1459,8 +1472,8 @@ pub(super) fn handle_xfixes_request(
             if let Some((region_id, dx, dy)) = x11xfixes::parse_translate_region(body)
                 && let Some(region) = state.xfixes_regions.get_mut(&region_id)
             {
-                region.region =
-                    std::mem::take(&mut region.region).translate(i32::from(dx), i32::from(dy));
+                region.region = std::mem::take(&mut region.region)
+                    .translate_clipped(i32::from(dx), i32::from(dy));
                 trace!(
                     target: "yserver::xfixes::region",
                     "TranslateRegion region=0x{region_id:08x} delta=({dx}, {dy}) after{}",
@@ -1561,8 +1574,8 @@ pub(super) fn handle_xfixes_request(
                 if req.region == 0 {
                     crate::nested::clear_shape_rects(state, window, req.dest_kind);
                 } else {
-                    let source = xfixes_region(state, req.region)
-                        .translate(i32::from(req.x_offset), i32::from(req.y_offset));
+                    let source =
+                        offset_source(xfixes_region(state, req.region), req.x_offset, req.y_offset);
                     crate::nested::set_shape_region(state, window, req.dest_kind, source);
                 }
                 mirror_shape_to_host_state(state, backend, origin, window, req.dest_kind);

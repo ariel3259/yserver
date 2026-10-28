@@ -308,3 +308,76 @@ fn arbitrary_input_keeps_internal_bands_above_wire_origin_limit() {
         "constructor must always return canonical boxes"
     );
 }
+
+fn bx(x1: i32, y1: i32, x2: i32, y2: i32) -> Box32 {
+    Box32 { x1, y1, x2, y2 }
+}
+
+/// `pixman_region_translate` (16-bit) results, from a run against the
+/// system pixman: boxes clipped at both edges, wholly moved-out boxes
+/// dropped, bands not coalesced again.
+#[test]
+fn protocol_translation_clips_like_pixman16() {
+    let moved =
+        |rects: &[RegionRect], dx, dy| Region::from_rects(rects).translate_clipped(dx, dy).boxes;
+    let edge = [r(32760, 0, 7, 10)];
+    assert_eq!(moved(&edge, 5, 0), [bx(32765, 0, 32767, 10)]);
+    assert_eq!(
+        moved(&[r(0, 32760, 10, 7)], 0, 5),
+        [bx(0, 32765, 10, 32767)]
+    );
+    assert_eq!(
+        moved(&[r(-32768, 0, 10, 10)], -5, 0),
+        [bx(-32768, 0, -32763, 10)]
+    );
+    assert!(moved(&edge, 8, 0).is_empty());
+    assert!(moved(&[r(-32768, 0, 10, 10)], -11, 0).is_empty());
+    // Exactly onto the limit: pixman keeps a box without area; we drop it.
+    assert!(moved(&edge, 7, 0).is_empty());
+    assert!(moved(&[r(-32768, 0, 10, 10)], -10, 0).is_empty());
+
+    // Dropping a band's far box leaves two equal bands, not merged.
+    let multi = [r(0, 0, 10, 10), r(32760, 0, 7, 10), r(0, 10, 10, 10)];
+    assert_eq!(Region::from_rects(&multi).boxes.len(), 3);
+    assert_eq!(moved(&multi, 8, 0), [bx(8, 0, 18, 10), bx(8, 10, 18, 20)]);
+    // Every box out on a different axis.
+    let diag = [r(32000, 0, 767, 10), r(0, 32000, 10, 767)];
+    assert!(moved(&diag, 1000, 1000).is_empty());
+    let two = [r(0, 0, 10, 10), r(20, 0, 32747, 10)];
+    assert_eq!(
+        moved(&two, -15, 0),
+        [bx(-15, 0, -5, 10), bx(5, 0, 32752, 10)]
+    );
+}
+
+/// Translating back keeps only what the first move left: the clipped
+/// pixels do not come back.
+#[test]
+fn protocol_translation_and_back_keeps_the_clipped_part() {
+    let back = Region::from_rects(&[r(32760, 0, 7, 10)])
+        .translate_clipped(5, 0)
+        .translate_clipped(-5, 0);
+    assert_eq!(back.boxes, [bx(32760, 0, 32762, 10)]);
+    let back = Region::from_rects(&[r(-10, -10, 30, 30)])
+        .translate_clipped(-32760, -32760)
+        .translate_clipped(32760, 32760);
+    assert_eq!(back.boxes, [bx(-8, -8, 20, 20)]);
+}
+
+/// Repeated moves by the largest offsets neither overflow nor bring
+/// anything back.
+#[test]
+fn repeated_protocol_translation_saturates_to_empty() {
+    let mut region = Region::from_rects(&[r(0, 0, 1, 1)]);
+    for _ in 0..4 {
+        region = region.translate_clipped(i32::from(i16::MAX), 0);
+    }
+    assert!(region.is_empty());
+    let mut region = Region::from_rects(&[r(-32768, -32768, 65535, 65535)]);
+    for _ in 0..4 {
+        region = region.translate_clipped(i32::from(i16::MIN), i32::from(i16::MIN));
+    }
+    assert!(region.is_empty());
+    let region = Region::from_rects(&[r(0, 0, 1, 1)]).translate_clipped(i32::MAX, i32::MIN);
+    assert!(region.is_empty());
+}

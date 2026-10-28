@@ -343,6 +343,120 @@ static void shape_section(void) {
     get_all("mask.none", w);
 }
 
+/* --- translations at the 16-bit limits: RegionTranslate is the 16-bit
+ * pixman_region_translate, which clips boxes to [MINSHORT, MAXSHORT] and
+ * drops those moved wholly out, without coalescing again. An emptied region
+ * keeps stale extents, so it is fetched through a union with HOLE. --- */
+static const R EDGE[] = {{32760, 0, 7, 10}};
+static const R EDGE_Y[] = {{0, 32760, 10, 7}};
+static const R LOW[] = {{-32768, 0, 10, 10}};
+static const R BANDS[] = {{0, 0, 10, 10}, {32760, 0, 7, 10}, {0, 10, 10, 10}};
+static const R DIAG[] = {{32000, 0, 767, 10}, {0, 32000, 10, 767}};
+static const R CORNER[] = {{-10, -10, 30, 30}};
+static const R DOT[] = {{0, 0, 1, 1}};
+static const R FULL[] = {{-32768, -32768, 65535, 65535}};
+
+static void translate(xcb_xfixes_region_t r, int16_t dx, int16_t dy) {
+    check("translate", xcb_xfixes_translate_region_checked(c, r, dx, dy));
+}
+
+static void fetch_union_hole(const char *tag, xcb_xfixes_region_t r) {
+    xcb_xfixes_region_t h = mk(HOLE, 1), d = mk(NULL, 0);
+    check("union", xcb_xfixes_union_region_checked(c, r, h, d));
+    fetch(tag, d);
+    destroy(h);
+    destroy(d);
+}
+
+static void translate_section(void) {
+    const uint8_t B = XCB_SHAPE_SK_BOUNDING, U = XCB_CLIP_ORDERING_UNSORTED;
+    xcb_xfixes_region_t a;
+
+    printf("== translate limits\n");
+    a = mk(EDGE, 1);
+    translate(a, 5, 0);
+    fetch("edge.right", a);
+    translate(a, -5, 0);
+    fetch("edge.right.back", a);
+    destroy(a);
+    a = mk(EDGE_Y, 1);
+    translate(a, 0, 5);
+    fetch("edge.down", a);
+    destroy(a);
+    a = mk(LOW, 1);
+    translate(a, -5, 0);
+    fetch("edge.left", a);
+    translate(a, 5, 0);
+    fetch("edge.left.back", a);
+    destroy(a);
+    a = mk(EDGE, 1);
+    translate(a, 7, 0);
+    fetch("edge.exact", a);
+    destroy(a);
+    a = mk(EDGE, 1);
+    translate(a, 8, 0);
+    fetch_union_hole("edge.gone", a);
+    destroy(a);
+    a = mk(BANDS, N(BANDS));
+    fetch("bands", a);
+    translate(a, 8, 0);
+    fetch("bands.right", a);
+    destroy(a);
+    a = mk(DIAG, N(DIAG));
+    translate(a, 1000, 1000);
+    fetch_union_hole("diag.gone", a);
+    destroy(a);
+    a = mk(CORNER, 1);
+    translate(a, -32760, -32760);
+    fetch("corner.low", a);
+    translate(a, 32760, 32760);
+    fetch("corner.low.back", a);
+    destroy(a);
+    a = mk(DOT, 1);
+    for (int i = 0; i < 65540; i++)
+        xcb_xfixes_translate_region(c, a, 32767, 0);
+    fetch_union_hole("repeat.right", a);
+    destroy(a);
+    a = mk(FULL, 1);
+    fetch("full", a);
+    for (int i = 0; i < 4; i++)
+        xcb_xfixes_translate_region(c, a, -32768, -32768);
+    fetch_union_hole("repeat.full", a);
+    destroy(a);
+
+    printf("== shape offsets at the limits\n");
+    xcb_window_t w = mkwin();
+    rects("rect.off", w, XCB_SHAPE_SO_SET, B, U, 32760, 0, BIG, 1);
+    get_shape("rect.off", w, B);
+    check("offset", xcb_shape_offset_checked(c, B, w, -32760, 0));
+    get_shape("offset.back", w, B);
+    check("offset", xcb_shape_offset_checked(c, B, w, 32765, 0));
+    get_shape("offset.clip", w, B);
+    check("offset", xcb_shape_offset_checked(c, B, w, 5, 0));
+    get_shape("offset.gone", w, B);
+    xcb_window_t src = mkwin();
+    rects("src.set", src, XCB_SHAPE_SO_SET, B, U, 0, 0, ELL, N(ELL));
+    check("combine.off",
+          xcb_shape_combine_checked(c, XCB_SHAPE_SO_SET, B, B, w, 32760, 32760, src));
+    get_shape("combine.off", w, B);
+    a = mk(CORNER, 1);
+    check("xfixes_shape.off",
+          xcb_xfixes_set_window_shape_region_checked(c, w, B, -32760, -32760, a));
+    get_shape("xfixes_shape.off", w, B);
+    destroy(a);
+    xcb_pixmap_t p = xcb_generate_id(c);
+    xcb_create_pixmap(c, 1, p, root, 30, 30);
+    xcb_gcontext_t gc = xcb_generate_id(c);
+    uint32_t one = 1;
+    xcb_create_gc(c, gc, p, XCB_GC_FOREGROUND, &one);
+    xcb_rectangle_t all = {0, 0, 30, 30};
+    xcb_poly_fill_rectangle(c, p, gc, 1, &all);
+    check("mask.off", xcb_shape_mask_checked(c, XCB_SHAPE_SO_SET, B, w, 32760, 0, p));
+    get_shape("mask.off", w, B);
+    xcb_free_gc(c, gc);
+    xcb_free_pixmap(c, p);
+}
+
 int main(void) {
     c = xcb_connect(NULL, NULL);
     if (xcb_connection_has_error(c)) {
@@ -362,6 +476,7 @@ int main(void) {
     free(s);
     xfixes_section();
     shape_section();
+    translate_section();
     xcb_disconnect(c);
     return 0;
 }

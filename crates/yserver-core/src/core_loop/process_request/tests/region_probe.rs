@@ -22,6 +22,9 @@ const KNOWN_DIVERGENT: &[&str] = &[
     "input.sub.k2 ",
     "offset.c.k2 ",
     "mask.none.k2 ",
+    // A translation that puts an edge exactly on the 16-bit limit: pixman
+    // keeps the box with no area, `Region::translate_clipped` drops it.
+    "edge.exact ",
 ];
 
 type R = (i16, i16, u16, u16);
@@ -44,6 +47,14 @@ const CLAMP: &[R] = &[(32760, 32760, 100, 100)];
 const STRIPES: &[R] = &[(0, 0, 30, 2), (0, 4, 30, 2), (0, 8, 30, 2)];
 const COLS: &[R] = &[(0, 0, 2, 10), (4, 0, 2, 10), (8, 0, 2, 10)];
 const FRESH: &[R] = &[(10, 10, 10, 10), (90, 70, 20, 20)];
+const EDGE: &[R] = &[(32760, 0, 7, 10)];
+const EDGE_Y: &[R] = &[(0, 32760, 10, 7)];
+const LOW: &[R] = &[(-32768, 0, 10, 10)];
+const BANDS: &[R] = &[(0, 0, 10, 10), (32760, 0, 7, 10), (0, 10, 10, 10)];
+const DIAG: &[R] = &[(32000, 0, 767, 10), (0, 32000, 10, 767)];
+const CORNER: &[R] = &[(-10, -10, 30, 30)];
+const DOT: &[R] = &[(0, 0, 1, 1)];
+const FULL: &[R] = &[(-32768, -32768, 65535, 65535)];
 
 const SHAPE_MAJOR: u8 = 141;
 
@@ -293,6 +304,23 @@ impl Twin {
         self.req(what, SHAPE_MAJOR, x11shape::MASK, &body);
     }
 
+    fn translate(&mut self, region: u32, dx: i16, dy: i16) {
+        let mut body = region.to_le_bytes().to_vec();
+        body.extend_from_slice(&dx.to_le_bytes());
+        body.extend_from_slice(&dy.to_le_bytes());
+        self.xf("translate", x11xfixes::TRANSLATE_REGION, &body);
+    }
+
+    /// Fetch `region` united with `HOLE`: an emptied region's extents are
+    /// stale in Xorg, the union's are not.
+    fn fetch_union_hole(&mut self, tag: &str, region: u32) {
+        let (h, d) = (self.mk(HOLE), self.mk(&[]));
+        self.op3("union", x11xfixes::UNION_REGION, region, h, d);
+        self.fetch(tag, d);
+        self.destroy(h);
+        self.destroy(d);
+    }
+
     fn region_from_window(&mut self, tag: &str, w: u32, kind: u8) {
         let d = self.id();
         let mut body = xfixes_u32s(&[d, w]);
@@ -508,6 +536,112 @@ fn shape_section(t: &mut Twin) {
     t.get_all("mask.none", w);
 }
 
+#[allow(clippy::too_many_lines)]
+fn translate_section(t: &mut Twin) {
+    use x11shape::{KIND_BOUNDING as B, OP_SET, ORDERING_UNSORTED as U};
+    t.out.push("== translate limits".into());
+    let a = t.mk(EDGE);
+    t.translate(a, 5, 0);
+    t.fetch("edge.right", a);
+    t.translate(a, -5, 0);
+    t.fetch("edge.right.back", a);
+    t.destroy(a);
+    let a = t.mk(EDGE_Y);
+    t.translate(a, 0, 5);
+    t.fetch("edge.down", a);
+    t.destroy(a);
+    let a = t.mk(LOW);
+    t.translate(a, -5, 0);
+    t.fetch("edge.left", a);
+    t.translate(a, 5, 0);
+    t.fetch("edge.left.back", a);
+    t.destroy(a);
+    let a = t.mk(EDGE);
+    t.translate(a, 7, 0);
+    t.fetch("edge.exact", a);
+    t.destroy(a);
+    let a = t.mk(EDGE);
+    t.translate(a, 8, 0);
+    t.fetch_union_hole("edge.gone", a);
+    t.destroy(a);
+    let a = t.mk(BANDS);
+    t.fetch("bands", a);
+    t.translate(a, 8, 0);
+    t.fetch("bands.right", a);
+    t.destroy(a);
+    let a = t.mk(DIAG);
+    t.translate(a, 1000, 1000);
+    t.fetch_union_hole("diag.gone", a);
+    t.destroy(a);
+    let a = t.mk(CORNER);
+    t.translate(a, -32760, -32760);
+    t.fetch("corner.low", a);
+    t.translate(a, 32760, 32760);
+    t.fetch("corner.low.back", a);
+    t.destroy(a);
+    let a = t.mk(DOT);
+    for _ in 0..65540 {
+        t.translate(a, 32767, 0);
+    }
+    t.fetch_union_hole("repeat.right", a);
+    t.destroy(a);
+    let a = t.mk(FULL);
+    t.fetch("full", a);
+    for _ in 0..4 {
+        t.translate(a, -32768, -32768);
+    }
+    t.fetch_union_hole("repeat.full", a);
+    t.destroy(a);
+
+    t.out.push("== shape offsets at the limits".into());
+    let w = t.mkwin();
+    t.rects("rect.off", w, OP_SET, B, U, (32760, 0), BIG);
+    t.get_shape("rect.off", w, B);
+    t.offset("offset", B, w, -32760, 0);
+    t.get_shape("offset.back", w, B);
+    t.offset("offset", B, w, 32765, 0);
+    t.get_shape("offset.clip", w, B);
+    t.offset("offset", B, w, 5, 0);
+    t.get_shape("offset.gone", w, B);
+    let src = t.mkwin();
+    t.rects("src.set", src, OP_SET, B, U, (0, 0), ELL);
+    t.combine("combine.off", OP_SET, B, B, w, (32760, 32760), src);
+    t.get_shape("combine.off", w, B);
+    let a = t.mk(CORNER);
+    let mut body = w.to_le_bytes().to_vec();
+    body.extend_from_slice(&[B, 0, 0, 0]);
+    body.extend_from_slice(&(-32760i16).to_le_bytes());
+    body.extend_from_slice(&(-32760i16).to_le_bytes());
+    body.extend_from_slice(&a.to_le_bytes());
+    t.xf(
+        "xfixes_shape.off",
+        x11xfixes::SET_WINDOW_SHAPE_REGION,
+        &body,
+    );
+    t.get_shape("xfixes_shape.off", w, B);
+    t.destroy(a);
+    // A 30x30 depth-1 pixmap, all set in the probe; without a pixmap
+    // mirror the dispatcher takes its bounds, the same region.
+    let p = t.id();
+    t.state.resources.create_pixmap(
+        ClientId(1),
+        CreatePixmapRequest {
+            pixmap: ResourceId(p),
+            drawable: ROOT_WINDOW,
+            width: 30,
+            height: 30,
+            depth: 1,
+        },
+    );
+    let mut body = vec![OP_SET, B, 0, 0];
+    body.extend_from_slice(&w.to_le_bytes());
+    body.extend_from_slice(&32760i16.to_le_bytes());
+    body.extend_from_slice(&0i16.to_le_bytes());
+    body.extend_from_slice(&p.to_le_bytes());
+    t.req("mask.off", SHAPE_MAJOR, x11shape::MASK, &body);
+    t.get_shape("mask.off", w, B);
+}
+
 /// Compare `out` with the golden lines up to (not including) the line
 /// `until`, skipping [`KNOWN_DIVERGENT`] tags.
 fn compare(out: &[String], until: Option<&str>) {
@@ -550,5 +684,37 @@ fn shape_regions_match_xephyr() {
     let mut t = Twin::new();
     xfixes_section(&mut t);
     shape_section(&mut t);
+    compare(&t.out, Some("== translate limits"));
+}
+
+#[test]
+fn translations_at_the_limits_match_xephyr() {
+    let mut t = Twin::new();
+    xfixes_section(&mut t);
+    shape_section(&mut t);
+    translate_section(&mut t);
     compare(&t.out, None);
+}
+
+/// Repeated translations by the largest offset end in the empty region
+/// (pixman drops what leaves the 16-bit range) and cannot overflow.
+#[test]
+fn repeated_translation_cannot_overflow() {
+    let mut t = Twin::new();
+    let a = t.mk(DOT);
+    for _ in 0..65540 {
+        t.translate(a, 32767, 0);
+    }
+    assert!(t.state.xfixes_regions[&a].region.is_empty());
+}
+
+/// TranslateRegion clips at the 16-bit limit, as `pixman_region_translate`
+/// does (`edge.right` in the golden).
+#[test]
+fn translate_clips_at_the_16_bit_limit() {
+    let mut t = Twin::new();
+    let a = t.mk(EDGE);
+    t.translate(a, 5, 0);
+    t.fetch("clipped", a);
+    assert_eq!(t.out, ["clipped ext=[32765,0 2x10]  n=1 [32765,0 2x10]"]);
 }
