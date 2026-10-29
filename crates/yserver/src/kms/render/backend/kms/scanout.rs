@@ -7,7 +7,7 @@ use crate::kms::render::{
     },
     scene::CursorUploadOutcome,
     store::DrawableId,
-    target::Src,
+    target::{PaintTarget, Src},
 };
 use ash::vk;
 use std::{
@@ -1887,22 +1887,11 @@ impl KmsBackend {
     ) {
         let candidate = frame.candidate;
         let target = frame.fallback_target;
-        let copy_result = self.engine.cow_copy_area(
-            &mut self.store,
-            &mut self.platform.gpu,
-            target.server_backing_dst(),
-            Src::server_internal(frame.source_id),
-            ash::vk::Rect2D {
-                offset: ash::vk::Offset2D::default(),
-                extent: ash::vk::Extent2D {
-                    width: u32::from(candidate.src_width),
-                    height: u32::from(candidate.src_height),
-                },
-            },
-            ash::vk::Offset2D {
-                x: target.offset().0 + i32::from(candidate.x_off),
-                y: target.offset().1 + i32::from(candidate.y_off),
-            },
+        let copy_result = self.copy_direct_source_to_fallback_target(
+            frame.source_id,
+            candidate,
+            target,
+            "queued direct entry Copy fallback",
         );
         let copy_succeeded = copy_result.is_ok();
         if let Err(error) = copy_result {
@@ -1971,6 +1960,38 @@ impl KmsBackend {
         <Self as Backend>::release_present_source(self, frame.source_pin);
         <Self as Backend>::release_present_source(self, frame.fallback_target_pin);
         self.note_present_skip();
+    }
+
+    /// Copy a retained direct source into the exact paint target captured for
+    /// that Present. Queued-entry fallback and lazy unflip materialization
+    /// share this operation so their source crop and destination offset cannot
+    /// drift apart.
+    fn copy_direct_source_to_fallback_target(
+        &mut self,
+        source_id: DrawableId,
+        candidate: PresentScanoutCandidate,
+        target: PaintTarget,
+        failure_context: &'static str,
+    ) -> io::Result<()> {
+        self.engine
+            .cow_copy_area(
+                &mut self.store,
+                &mut self.platform.gpu,
+                target.server_backing_dst(),
+                Src::server_internal(source_id),
+                ash::vk::Rect2D {
+                    offset: ash::vk::Offset2D::default(),
+                    extent: ash::vk::Extent2D {
+                        width: u32::from(candidate.src_width),
+                        height: u32::from(candidate.src_height),
+                    },
+                },
+                ash::vk::Offset2D {
+                    x: target.offset().0 + i32::from(candidate.x_off),
+                    y: target.offset().1 + i32::from(candidate.y_off),
+                },
+            )
+            .map_err(|error| io::Error::other(format!("{failure_context}: {error:?}")))
     }
 
     pub(in crate::kms::render::backend) fn queue_direct_successor(
@@ -2237,27 +2258,12 @@ impl KmsBackend {
                 target.backing_id().as_u64(),
             )));
         }
-        self.engine
-            .cow_copy_area(
-                &mut self.store,
-                &mut self.platform.gpu,
-                target.server_backing_dst(),
-                Src::server_internal(source_id),
-                ash::vk::Rect2D {
-                    offset: ash::vk::Offset2D::default(),
-                    extent: ash::vk::Extent2D {
-                        width: u32::from(candidate.src_width),
-                        height: u32::from(candidate.src_height),
-                    },
-                },
-                ash::vk::Offset2D {
-                    x: target.offset().0 + i32::from(candidate.x_off),
-                    y: target.offset().1 + i32::from(candidate.y_off),
-                },
-            )
-            .map_err(|error| {
-                io::Error::other(format!("scanout M2 lazy fallback Copy: {error:?}"))
-            })?;
+        self.copy_direct_source_to_fallback_target(
+            source_id,
+            candidate,
+            target,
+            "scanout M2 lazy fallback Copy",
+        )?;
         self.engine
             .flush_render_batch(
                 &mut self.store,

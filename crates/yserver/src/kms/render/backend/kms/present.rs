@@ -164,7 +164,7 @@ impl KmsBackend {
         suppressed
     }
 
-    pub(in crate::kms::render::backend) fn direct_candidate_gate(
+    fn direct_candidate_gate(
         &self,
         candidate: PresentScanoutCandidate,
         target: ScanoutM0Target,
@@ -1422,12 +1422,13 @@ impl KmsBackend {
             fence_tally,
         };
 
-        if self
-            .pstate
-            .direct
-            .get(scope)
-            .is_some_and(|owner| owner.pending.is_some())
-        {
+        if self.pstate.direct.get(scope).is_some_and(|owner| {
+            owner.pending.is_some()
+                || (matches!(scope, DirectScope::Output(_)) && owner.queued_successor.is_some())
+        }) {
+            // Keep an occupied successor slot authoritative until dispatch.
+            // A newer Present must replace it even when its predecessor just
+            // retired and both admission busy gates have become free.
             self.retain_direct_present_wake(&frame.event);
             self.queue_direct_successor(scope, frame);
             return Ok(true);

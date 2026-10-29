@@ -602,6 +602,79 @@ fn a3_submit_gamma_commit(
     record
 }
 
+fn a3_submit_composed_scene_commit(
+    fixture: &mut super::commit_identity::recording_scene::RecordingSceneFixtureGuard,
+    output_idx: usize,
+) -> crate::drm::atomic::tests_support::AtomicCommitRecord {
+    use std::os::fd::{AsFd, AsRawFd};
+    use yserver_core::backend::Backend;
+
+    let root = fixture.events.backend.core.window_id;
+    let output = &fixture.events.backend.platform.outputs[output_idx];
+    let crtc = output.output.crtc;
+    let (x, y, width, height) = (
+        i16::try_from(output.x).expect("test output x fits X coordinates"),
+        i16::try_from(output.y).expect("test output y fits X coordinates"),
+        output.width,
+        output.height,
+    );
+    let fd = fixture.events.backend.platform.devices[0]
+        .device
+        .as_fd()
+        .as_raw_fd();
+    let recorder = fixture.events.recorders[&fd].clone();
+    let before = recorder.records().len();
+    Backend::clear_area(
+        &mut fixture.events.backend,
+        None,
+        root,
+        0,
+        None,
+        x,
+        y,
+        width,
+        height,
+        (0, 0),
+    )
+    .expect("damage the composed output through Backend");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        Backend::before_block(&mut fixture.events.backend);
+        Backend::maybe_composite(&mut fixture.events.backend)
+            .expect("schedule composed scene work through Backend");
+        fixture.events.wait_for_submitted_gpu_work();
+        {
+            let events = fixture.events_mut();
+            Backend::on_scanout_render_completion(&mut events.backend, &mut events.state);
+        }
+        if let Some(record) = recorder.records().into_iter().skip(before).find(|record| {
+            matches!(
+                record.kind,
+                crate::drm::atomic::AtomicCommitKind::Scene
+                    | crate::drm::atomic::AtomicCommitKind::SceneWithCursor
+            ) && record.events.len() == 1
+                && record.events[0].crtc == crtc
+                && super::commit_identity::accepted_event_id(record).is_some()
+        }) {
+            assert_eq!(
+                fixture
+                    .events
+                    .backend
+                    .scene
+                    .pending_page_flip_event_id(output_idx),
+                super::commit_identity::accepted_event_id(&record),
+                "the composed output owns its accepted scene flip"
+            );
+            return record;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a Backend damage pass accepts a composed scene commit on Output({output_idx})"
+        );
+    }
+}
+
 fn a3_offer_direct_present(
     fixture: &mut super::commit_identity::recording_scene::RecordingSceneFixtureGuard,
     candidate: yserver_core::backend::PresentScanoutCandidate,
@@ -692,8 +765,13 @@ fn unpaced_output_client_enters_direct_on_first_retirement() {
         "Output(0) retains tearing while Output(1) enters"
     );
 
-    let direct = fixture.install_direct_output_present(1, 982, 0);
-    let gamma_record = a3_submit_gamma_commit(&mut fixture, 1);
+    let direct = fixture.install_direct_output_present(
+        1,
+        982,
+        yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+    );
+    let scene_record = a3_submit_composed_scene_commit(&mut fixture, 1);
+    assert!(fixture.events.backend.scene.has_pending_page_flip(1));
     let fd = fixture.events.backend.platform.devices[0]
         .device
         .as_fd()
@@ -728,7 +806,7 @@ fn unpaced_output_client_enters_direct_on_first_retirement() {
             .backend
             .platform
             .scanout_commit_in_flight_for_output(1),
-        "the cursor/property CRTC commit is the only busy gate"
+        "the composed scene commit is the busy CRTC gate"
     );
     assert!(
         a3_records_since(&fixture, fd, record_offset)
@@ -737,7 +815,7 @@ fn unpaced_output_client_enters_direct_on_first_retirement() {
         "a queued first entry waits for the commit that already owns its CRTC"
     );
 
-    a3_retire_records(&mut fixture, std::slice::from_ref(&gamma_record));
+    a3_retire_records(&mut fixture, std::slice::from_ref(&scene_record));
     let after_retirement = a3_tick(&mut fixture);
     let owner = &fixture.events.backend.pstate.direct.outputs[1];
     let pending = owner
@@ -766,6 +844,11 @@ fn unpaced_output_client_enters_direct_on_first_retirement() {
         super::commit_identity::accepted_event_id(output1_commits[0]),
         Some(pending_id),
         "Output(1)'s only accepted commit is the queued direct frame"
+    );
+    assert_ne!(
+        output1_commits[0].kind,
+        crate::drm::atomic::AtomicCommitKind::Async,
+        "the async requester enters synchronously while Output(0) owns tearing"
     );
     fixture.events.wait_for_submitted_gpu_work();
     fixture.finish();
@@ -1006,10 +1089,29 @@ fn newer_present_supersedes_queued_entry() {
         .events
         .backend
         .for_tests_set_scanout_m1_prober(super::present_scanout::record_scanout_m1_probe);
-    let gamma_record = a3_submit_gamma_commit(&mut fixture, 1);
+    let scene_record = a3_submit_composed_scene_commit(&mut fixture, 1);
+    assert!(fixture.events.backend.scene.has_pending_page_flip(1));
     assert!(
         a3_offer_output_candidate_after_probation(&mut fixture, &direct),
-        "the first busy Present enters the successor slot"
+        "the first Present queues behind the composed scene commit"
+    );
+    assert_eq!(
+        fixture.events.backend.pstate.direct.outputs[1]
+            .queued_successor
+            .as_ref()
+            .map(|frame| frame.candidate.present_id),
+        Some(direct.candidate.present_id),
+        "the first Present occupies the successor slot before scene retirement"
+    );
+
+    a3_retire_records(&mut fixture, std::slice::from_ref(&scene_record));
+    assert_eq!(
+        fixture.events.backend.pstate.direct.outputs[1]
+            .queued_successor
+            .as_ref()
+            .map(|frame| frame.candidate.present_id),
+        Some(direct.candidate.present_id),
+        "scene retirement leaves the queued frame for the next scheduling pass"
     );
 
     let mut newer = direct.candidate;
@@ -1044,8 +1146,13 @@ fn newer_present_supersedes_queued_entry() {
         1,
         "replaced queued Present completes once as Skip"
     );
+    assert!(
+        fixture.events.backend.pstate.direct.outputs[1]
+            .pending
+            .is_none(),
+        "the newer Present replaces the queued frame instead of bypassing it"
+    );
 
-    a3_retire_records(&mut fixture, std::slice::from_ref(&gamma_record));
     let dispatched = a3_tick(&mut fixture);
     let pending = fixture.events.backend.pstate.direct.outputs[1]
         .pending
