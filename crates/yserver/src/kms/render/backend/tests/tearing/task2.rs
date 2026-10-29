@@ -402,7 +402,8 @@ fn tearing_probation_reads_only_the_candidate_outputs() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutations: use max refresh across all outputs; advance on any composed submit; apply one global deadline.
+// Mutations: use max refresh across all outputs; advance on any composed submit;
+// apply one global deadline; omit the deferred owner wake for foreign motion.
 fn tearing_cursor_pacing_is_scoped_to_the_owner_outputs() {
     use yserver_core::backend::Backend;
 
@@ -494,6 +495,147 @@ fn tearing_cursor_pacing_is_scoped_to_the_owner_outputs() {
     );
 
     let expected_interval = std::time::Duration::from_nanos(1_000_000_000 / 75);
+    // Mutation: foreign software-cursor motion must retain the owner's pending
+    // cursor cleanup after a foreign scene tick consumes the shared dirty bit.
+    use std::{
+        rc::Rc,
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
+        time::Instant,
+    };
+    assert_eq!(
+        fixture.events.backend.pstate.tearing.deferred_cursor_wake,
+        None
+    );
+    let clock_base = Instant::now();
+    let elapsed_ns = Arc::new(AtomicU64::new(0));
+    let clock_elapsed_ns = Arc::clone(&elapsed_ns);
+    fixture
+        .events
+        .backend
+        .for_tests_set_monotonic_clock(Rc::new(move || {
+            clock_base + std::time::Duration::from_nanos(clock_elapsed_ns.load(Ordering::SeqCst))
+        }));
+    fixture.events.backend.pstate.tearing.last_cursor_compose = Some(clock_base);
+    let cleanup_deadline = clock_base + expected_interval;
+    let cleanup_foreign_x = fixture.events.backend.platform.outputs[0].x
+        + i32::from(fixture.events.backend.platform.outputs[0].width)
+        - 300;
+    Backend::warp_pointer_root(
+        &mut fixture.events.backend,
+        &mut fixture.events.state,
+        cleanup_foreign_x,
+        120,
+    );
+    assert_eq!(
+        fixture.events.backend.pstate.tearing.deferred_cursor_wake,
+        Some(cleanup_deadline),
+        "foreign cursor motion retains the owner's paced cleanup deadline"
+    );
+    assert!(fixture.events.backend.scene.cursor_only_wake_pending());
+    let cleanup_foreign_crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    let cleanup_foreign_start = fixture.events.recorders[&fd].records().len();
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("compose the software cursor on foreign Output(0) during owner pacing");
+    let cleanup_foreign = fixture.events.recorders[&fd]
+        .records()
+        .into_iter()
+        .skip(cleanup_foreign_start)
+        .find(|record| {
+            matches!(
+                record.kind,
+                AtomicCommitKind::Scene | AtomicCommitKind::SceneWithCursor
+            ) && record
+                .events
+                .iter()
+                .any(|event| event.crtc == cleanup_foreign_crtc)
+                && super::commit_identity::support::accepted_event_id(record).is_some()
+        })
+        .expect("foreign software cursor still composes before the owner deadline");
+    assert!(
+        cleanup_foreign
+            .events
+            .iter()
+            .all(|event| event.crtc == cleanup_foreign_crtc)
+    );
+    retire_recorded_output_commits(&mut fixture, 0, cleanup_foreign_start, 70);
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .tearing
+            .deferred_cursor_wake
+            .is_some()
+    );
+    assert!(!fixture.events.backend.scene.cursor_only_wake_pending());
+
+    elapsed_ns.store(
+        u64::try_from(expected_interval.as_nanos()).expect("pacing interval fits u64 nanoseconds"),
+        Ordering::SeqCst,
+    );
+    let owner_cleanup_start = fixture.events.recorders[&fd].records().len();
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("service owner cursor cleanup at the deadline without further pointer input");
+    retire_recorded_output_commits(&mut fixture, 0, owner_cleanup_start, 80);
+    retire_recorded_output_commits(&mut fixture, 1, owner_cleanup_start, 81);
+    let owner_cleanup = fixture.events.recorders[&fd]
+        .records()
+        .into_iter()
+        .skip(owner_cleanup_start)
+        .find(|record| {
+            matches!(
+                record.kind,
+                AtomicCommitKind::Scene
+                    | AtomicCommitKind::SceneWithCursor
+                    | AtomicCommitKind::Async
+            ) && record.events.iter().any(|event| event.crtc == owner_crtc)
+                && super::commit_identity::support::accepted_event_id(record).is_some()
+        })
+        .expect("the deadline re-composes owner Output(1) after foreign dirty state was consumed");
+    assert!(
+        owner_cleanup
+            .events
+            .iter()
+            .all(|event| event.crtc == owner_crtc)
+    );
+    assert_eq!(
+        fixture.events.backend.pstate.tearing.deferred_cursor_wake,
+        None
+    );
+    retire_recorded_output_commits(&mut fixture, 1, owner_cleanup_start, 75);
+    assert!(
+        !fixture
+            .events
+            .backend
+            .scene
+            .output_has_pending_compose(1, &fixture.events.backend.store),
+        "the accepted owner frame retires the cursor cleanup damage"
+    );
+
+    let restore_owner_start = fixture.events.recorders[&fd].records().len();
+    Backend::warp_pointer_root(
+        &mut fixture.events.backend,
+        &mut fixture.events.state,
+        2000,
+        120,
+    );
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("restore the software cursor on owner Output(1) for the pacing checks");
+    retire_recorded_output_commits(&mut fixture, 0, restore_owner_start, 90);
+    retire_recorded_output_commits(&mut fixture, 1, restore_owner_start, 91);
+    assert_eq!(
+        fixture.events.backend.scene.cursor_mode_for_outputs(&[1]),
+        crate::kms::render::scene::CursorPlaneMode::Sw,
+        "the subsequent owner pacing check starts with its software cursor composed"
+    );
+    fixture
+        .events
+        .backend
+        .for_tests_set_monotonic_clock(Rc::new(Instant::now));
+
     let last_compose = std::time::Instant::now() + std::time::Duration::from_secs(30);
     fixture.events.backend.pstate.tearing.last_cursor_compose = Some(last_compose);
     Backend::warp_pointer_root(

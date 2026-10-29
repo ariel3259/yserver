@@ -666,9 +666,10 @@ impl<P: Platform> XBackend<P> {
                     P::move_hw_cursor(self, mixed, (cx, cy), (hot_x, hot_y), (cw, ch));
                 } else if tearing_active && !tearing_intersects_owner {
                     // A software cursor on a composed foreign output remains
-                    // cursor-only work; the scheduler paces only the tearing
-                    // owner's outputs.
-                    self.scene.wake_for_cursor_damage();
+                    // cursor-only work. Retain the owner's deferred wake too:
+                    // a foreign compose can consume this shared dirty bit
+                    // before the tearing output gets its cursor cleanup.
+                    P::cursor_motion_during_tearing(self, true);
                 } else if !tearing_intersects_owner {
                     // Software cursors need repaint; an all-Hidden cursor
                     // also needs a scene pass so motion back onto an output
