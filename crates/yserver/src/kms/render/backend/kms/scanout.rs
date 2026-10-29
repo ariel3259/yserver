@@ -689,6 +689,9 @@ impl KmsBackend {
         scope: DirectScope,
         reason: &'static str,
     ) {
+        if self.cancel_queued_direct_entry_to_copy(scope).is_some() {
+            return;
+        }
         self.pstate.request_direct_unflip_for(scope, reason);
     }
 
@@ -1884,7 +1887,7 @@ impl KmsBackend {
         &mut self,
         scope: DirectScope,
         mut frame: DirectPresentFrame,
-    ) {
+    ) -> bool {
         let candidate = frame.candidate;
         let target = frame.fallback_target;
         let copy_result = self.copy_direct_source_to_fallback_target(
@@ -1934,6 +1937,25 @@ impl KmsBackend {
             owner.fresh_composed_unflip = false;
             owner.reset_eligible_direct_probation();
         }
+        copy_succeeded
+    }
+
+    fn cancel_queued_direct_entry_to_copy(&mut self, scope: DirectScope) -> Option<bool> {
+        let first_entry = matches!(scope, DirectScope::Output(_))
+            && self.pstate.direct.get(scope).is_some_and(|owner| {
+                owner.current.is_none()
+                    && owner.pending.is_none()
+                    && owner.queued_successor.is_some()
+            });
+        if !first_entry {
+            return None;
+        }
+        let frame = self
+            .pstate
+            .direct
+            .get_mut(scope)
+            .and_then(|owner| owner.queued_successor.take())?;
+        Some(self.fallback_queued_direct_entry_to_copy(scope, frame))
     }
 
     fn release_direct_frame(&mut self, scope: DirectScope, frame: DirectPresentFrame) {
@@ -1960,6 +1982,37 @@ impl KmsBackend {
         <Self as Backend>::release_present_source(self, frame.source_pin);
         <Self as Backend>::release_present_source(self, frame.fallback_target_pin);
         self.note_present_skip();
+    }
+
+    /// Submit render work for the direct fallback Copy before its storage can
+    /// be replaced by a topology or session transition.
+    fn submit_direct_fallback_copy(&mut self) -> io::Result<()> {
+        self.engine
+            .flush_render_batch(
+                &mut self.store,
+                &mut self.platform.gpu,
+                crate::kms::render::engine::RenderFlushReason::Present,
+            )
+            .map_err(|error| {
+                io::Error::other(format!("scanout M2 lazy render flush: {error:?}"))
+            })?;
+        self.engine
+            .close_open_frame(
+                &mut self.store,
+                &mut self.platform.gpu,
+                crate::kms::render::frame_builder::CloseReason::PresentCompletionSignal,
+            )
+            .map_err(|error| {
+                io::Error::other(format!("scanout M2 lazy fallback frame close: {error:?}"))
+            })?;
+        self.engine
+            .flush_submit_group(
+                &mut self.store,
+                &mut self.platform.gpu,
+                crate::kms::render::submit_group::FlushReason::PresentCompletionSignal,
+            )
+            .map(|_| ())
+            .map_err(|error| io::Error::other(format!("scanout M2 lazy COW submit: {error:?}")))
     }
 
     /// Copy a retained direct source into the exact paint target captured for
@@ -2209,6 +2262,15 @@ impl KmsBackend {
         &mut self,
         scope: DirectScope,
     ) -> io::Result<()> {
+        if let Some(copy_succeeded) = self.cancel_queued_direct_entry_to_copy(scope) {
+            if !copy_succeeded {
+                return Err(io::Error::other(
+                    "scanout M2: queued direct entry fallback Copy failed",
+                ));
+            }
+            self.submit_direct_fallback_copy()?;
+            return Ok(());
+        }
         let owner = self
             .pstate
             .direct
@@ -2264,31 +2326,7 @@ impl KmsBackend {
             target,
             "scanout M2 lazy fallback Copy",
         )?;
-        self.engine
-            .flush_render_batch(
-                &mut self.store,
-                &mut self.platform.gpu,
-                crate::kms::render::engine::RenderFlushReason::Present,
-            )
-            .map_err(|error| {
-                io::Error::other(format!("scanout M2 lazy render flush: {error:?}"))
-            })?;
-        self.engine
-            .close_open_frame(
-                &mut self.store,
-                &mut self.platform.gpu,
-                crate::kms::render::frame_builder::CloseReason::PresentCompletionSignal,
-            )
-            .map_err(|error| {
-                io::Error::other(format!("scanout M2 lazy fallback frame close: {error:?}"))
-            })?;
-        self.engine
-            .flush_submit_group(
-                &mut self.store,
-                &mut self.platform.gpu,
-                crate::kms::render::submit_group::FlushReason::PresentCompletionSignal,
-            )
-            .map_err(|error| io::Error::other(format!("scanout M2 lazy COW submit: {error:?}")))?;
+        self.submit_direct_fallback_copy()?;
         if let Some(owner) = self.pstate.direct.get_mut(scope) {
             owner.unflip_shadow_ready = true;
         }
