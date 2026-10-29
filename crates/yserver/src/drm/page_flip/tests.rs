@@ -264,3 +264,49 @@ fn queue_sequence_flags_absolute_with_next_on_miss() {
     assert_eq!(req.flags & 1, 0, "RELATIVE bit clear for absolute target");
     assert_eq!(req.flags & 2, 2, "NEXT_ON_MISS set");
 }
+
+fn legacy_vblank_event(signal: u64, sec: u32, usec: u32, sequence: u32, crtc_id: u32) -> Vec<u8> {
+    let mut bytes = flip(signal, sec, usec, sequence, crtc_id);
+    bytes[..4].copy_from_slice(&super::DRM_EVENT_VBLANK.to_ne_bytes());
+    bytes
+}
+
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn drm_wait_vblank_ioctl_request_code() {
+    // _IOWR('d', 0x3A, union drm_wait_vblank): the reply member is
+    // 4 + 4 + 8 + 8 = 24 bytes on LP64 → 0xC018643A.
+    assert_eq!(std::mem::size_of::<super::drm_wait_vblank>(), 24);
+    assert_eq!(
+        super::DRM_IOCTL_WAIT_VBLANK,
+        0xC018_643A_u32 as super::IoctlReq
+    );
+}
+
+#[test]
+fn wait_vblank_pipe_bits_match_xorg_encoding() {
+    assert_eq!(super::wait_vblank_pipe_bits(0), 0);
+    assert_eq!(super::wait_vblank_pipe_bits(1), super::DRM_VBLANK_SECONDARY);
+    assert_eq!(super::wait_vblank_pipe_bits(2), 2 << 1);
+    assert_eq!(super::wait_vblank_pipe_bits(5), 5 << 1);
+}
+
+#[test]
+fn legacy_vblank_event_joins_the_sequence_stream() {
+    let absolute = u64::from(super::LEGACY_VBLANK_ABSOLUTE_SIGNAL) | 0x55;
+    let mut bytes = legacy_vblank_event(0x55, 2, 250, 1_000, 0x55);
+    bytes.extend(legacy_vblank_event(absolute, 3, 0, 1_001, 0x55));
+    let (flips, sequences) = dispatch(&bytes);
+    assert!(flips.is_empty(), "a vblank event is not a page flip");
+    assert_eq!(
+        sequences,
+        [
+            (0x55, 2_000_250_000, 1_000),
+            (
+                super::SEQUENCE_ABSOLUTE_USER_DATA | 0x55,
+                3_000_000_000,
+                1_001
+            ),
+        ]
+    );
+}

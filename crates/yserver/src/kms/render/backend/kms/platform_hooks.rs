@@ -454,6 +454,9 @@ impl Platform for PlatformBackend {
 
     fn next_wakeup(b: &KmsBackend) -> Option<std::time::Instant> {
         KmsBackend::backend_scanout_next_wakeup(b)
+            .into_iter()
+            .chain(b.platform.next_software_vblank_deadline())
+            .min()
     }
 
     fn maybe_composite(b: &mut KmsBackend) -> io::Result<()> {
@@ -661,6 +664,7 @@ impl Platform for PlatformBackend {
     }
 
     fn poll_deferred_input(b: &mut KmsBackend, state: &mut ServerState) {
+        b.service_software_vblanks();
         KmsBackend::backend_session_poll_deferred_input(b, state)
     }
 

@@ -18,6 +18,7 @@ mod render_picture;
 mod root_scanout;
 mod stacking;
 mod tearing;
+mod vblank_fallback;
 mod vt_session;
 mod window_border;
 mod window_tree;

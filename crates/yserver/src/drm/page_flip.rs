@@ -164,6 +164,166 @@ pub(crate) fn queue_crtc_sequence(
     Ok(req.sequence)
 }
 
+// ── Legacy DRM_IOCTL_WAIT_VBLANK plumbing ───────────────────────
+//
+// Fallback for devices that reject CRTC_QUEUE_SEQUENCE, as Xorg
+// modesetting's `ms_queue_vblank` / `ms_get_kernel_ust_msc` do. Layouts
+// mirror `union drm_wait_vblank` in `<drm/drm.h>`.
+
+/// Kernel `DRM_EVENT_VBLANK` event type id.
+pub(crate) const DRM_EVENT_VBLANK: u32 = 0x01;
+
+pub(crate) const DRM_VBLANK_ABSOLUTE: u32 = 0x0000_0000;
+pub(crate) const DRM_VBLANK_RELATIVE: u32 = 0x0000_0001;
+pub(crate) const DRM_VBLANK_EVENT: u32 = 0x0400_0000;
+pub(crate) const DRM_VBLANK_NEXTONMISS: u32 = 0x1000_0000;
+pub(crate) const DRM_VBLANK_SECONDARY: u32 = 0x2000_0000;
+pub(crate) const DRM_VBLANK_HIGH_CRTC_SHIFT: u32 = 1;
+
+/// Legacy `signal` bit marking an absolute per-target arm. `signal` is an
+/// `unsigned long`, so the tag stays inside 32 bits.
+pub(crate) const LEGACY_VBLANK_ABSOLUTE_SIGNAL: u32 = 1 << 31;
+
+/// Sequence-event `user_data` tag the backend decodes as an absolute arm.
+pub(crate) const SEQUENCE_ABSOLUTE_USER_DATA: u64 = 1 << 63;
+
+#[allow(non_camel_case_types)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct drm_wait_vblank_request {
+    pub r#type: u32,
+    pub sequence: u32,
+    pub signal: libc::c_ulong,
+}
+
+#[allow(non_camel_case_types)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct drm_wait_vblank_reply {
+    pub r#type: u32,
+    pub sequence: u32,
+    pub tval_sec: libc::c_long,
+    pub tval_usec: libc::c_long,
+}
+
+#[allow(non_camel_case_types)]
+#[repr(C)]
+pub(crate) union drm_wait_vblank {
+    pub request: drm_wait_vblank_request,
+    pub reply: drm_wait_vblank_reply,
+}
+
+// `_IOWR('d', 0x3A, union drm_wait_vblank)`; see the sequence ioctl above.
+pub(crate) const DRM_IOCTL_WAIT_VBLANK: IoctlReq = ((3u32 << 30)
+    | ((std::mem::size_of::<drm_wait_vblank>() as u32) << 16)
+    | (0x64u32 << 8)
+    | 0x3A) as IoctlReq;
+
+/// Xorg `drmmode_crtc_vblank_pipe`: the CRTC's index in the device's
+/// resource list selects the pipe through the high-CRTC bits.
+pub(crate) fn wait_vblank_pipe_bits(pipe: u32) -> u32 {
+    match pipe {
+        0 => 0,
+        1 => DRM_VBLANK_SECONDARY,
+        _ => (pipe << DRM_VBLANK_HIGH_CRTC_SHIFT) & 0x3e,
+    }
+}
+
+/// Index of `crtc` in the device's CRTC list, the legacy vblank pipe.
+pub(crate) fn crtc_pipe_index(device: &Device, crtc: crtc::Handle) -> Option<u32> {
+    let resources = device.resource_handles().ok()?;
+    let index = resources.crtcs().iter().position(|c| *c == crtc)?;
+    u32::try_from(index).ok()
+}
+
+/// Map a legacy vblank event's `signal` onto the sequence-event `user_data`
+/// encoding so both kinds share one completion path.
+pub(crate) fn sequence_user_data_from_legacy_signal(signal: u64) -> u64 {
+    let crtc_id = signal & u64::from(!LEGACY_VBLANK_ABSOLUTE_SIGNAL);
+    if signal & u64::from(LEGACY_VBLANK_ABSOLUTE_SIGNAL) == 0 {
+        crtc_id
+    } else {
+        SEQUENCE_ABSOLUTE_USER_DATA | crtc_id
+    }
+}
+
+fn wait_vblank_ioctl(
+    device: &Device,
+    request: drm_wait_vblank_request,
+) -> io::Result<drm_wait_vblank_reply> {
+    use std::os::{fd::AsFd, unix::io::AsRawFd};
+
+    let mut arg = drm_wait_vblank { request };
+    // SAFETY: `arg` is the kernel's union layout, live for the call; the
+    // device keeps its fd open.
+    let rc = unsafe {
+        libc::ioctl(
+            device.as_fd().as_raw_fd(),
+            DRM_IOCTL_WAIT_VBLANK,
+            &raw mut arg,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: on success the kernel wrote the reply member.
+    Ok(unsafe { arg.reply })
+}
+
+/// Current vblank count and timestamp of `pipe` (relative-0 wait).
+///
+/// # Errors
+///
+/// `EOPNOTSUPP`/`ENOTTY`/`EINVAL` when the device has no vblank support.
+pub(crate) fn wait_vblank_query(
+    device: &Device,
+    pipe: u32,
+) -> io::Result<(u32, std::time::Duration)> {
+    let reply = wait_vblank_ioctl(
+        device,
+        drm_wait_vblank_request {
+            r#type: DRM_VBLANK_RELATIVE | wait_vblank_pipe_bits(pipe),
+            sequence: 0,
+            signal: 0,
+        },
+    )?;
+    let secs = u64::try_from(reply.tval_sec).unwrap_or(0);
+    let micros = u64::try_from(reply.tval_usec).unwrap_or(0);
+    Ok((
+        reply.sequence,
+        std::time::Duration::from_secs(secs) + std::time::Duration::from_micros(micros),
+    ))
+}
+
+/// Queue a `DRM_EVENT_VBLANK` on `pipe`: relative `+sequence`, or absolute
+/// with NEXTONMISS. Returns the kernel's scheduled sequence.
+///
+/// # Errors
+///
+/// `EOPNOTSUPP`/`ENOTTY`/`EINVAL` when the device has no vblank support.
+pub(crate) fn wait_vblank_queue_event(
+    device: &Device,
+    pipe: u32,
+    relative: bool,
+    sequence: u32,
+    signal: u32,
+) -> io::Result<u32> {
+    let kind = if relative {
+        DRM_VBLANK_RELATIVE
+    } else {
+        DRM_VBLANK_ABSOLUTE | DRM_VBLANK_NEXTONMISS
+    };
+    let reply = wait_vblank_ioctl(
+        device,
+        drm_wait_vblank_request {
+            r#type: kind | DRM_VBLANK_EVENT | wait_vblank_pipe_bits(pipe),
+            sequence,
+            signal: libc::c_ulong::from(signal),
+        },
+    )?;
+    Ok(reply.sequence)
+}
+
 pub fn submit_flip(device: &Device, output: &Output, fb_id: framebuffer::Handle) -> io::Result<()> {
     submit_flip_inner(device, output, fb_id, None, None)
 }
@@ -445,6 +605,7 @@ where
                 unroutable_flips += usize::from(dispatch_flip_complete(event, on_advance));
             }
             DRM_EVENT_CRTC_SEQUENCE => dispatch_crtc_sequence(event, on_sequence),
+            DRM_EVENT_VBLANK => dispatch_legacy_vblank(event, on_sequence),
             _ => {}
         }
         offset += length;
@@ -494,6 +655,25 @@ where
     // SAFETY: the length check proves this is a complete sequence event.
     let ev = unsafe { std::ptr::read_unaligned(event.as_ptr().cast::<drm_event_crtc_sequence>()) };
     on_sequence(ev.user_data, ev.time_ns, ev.sequence);
+}
+
+/// A legacy vblank event joins the sequence-event stream: its 32-bit
+/// counter and timestamp become the `(user_data, time_ns, sequence)` triple.
+fn dispatch_legacy_vblank<S>(event: &[u8], on_sequence: &mut S)
+where
+    S: FnMut(u64, i64, u64),
+{
+    if event.len() < std::mem::size_of::<drm_event_vblank>() {
+        return;
+    }
+    // SAFETY: the payload length contains the complete ABI structure.
+    let vblank = unsafe { std::ptr::read_unaligned(event.as_ptr().cast::<drm_event_vblank>()) };
+    let time_ns = i64::from(vblank.tv_sec) * 1_000_000_000 + i64::from(vblank.tv_usec) * 1_000;
+    on_sequence(
+        sequence_user_data_from_legacy_signal(vblank.user_data),
+        time_ns,
+        u64::from(vblank.sequence),
+    );
 }
 
 #[cfg(test)]

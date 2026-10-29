@@ -37,6 +37,7 @@ pub(in crate::kms::render) mod power;
 mod qualify;
 mod scanout_bos;
 mod scene_sink;
+pub(crate) mod vblank_fallback;
 
 #[cfg(test)]
 use connectors::*;
@@ -525,6 +526,9 @@ pub struct PlatformBackend {
     /// report a real `frame > 0` this map stays empty (the real value
     /// is used directly).
     pub(crate) software_msc: std::collections::HashMap<CrtcKey, u64>,
+    /// Legacy WAIT_VBLANK and software vblank state for devices without
+    /// CRTC_QUEUE_SEQUENCE.
+    pub(crate) vblank_fallback: vblank_fallback::VblankFallback,
 
     /// Per-stream history for async page-flip EINVAL fallback. Cleared when
     /// the backend leaves its active KMS session.

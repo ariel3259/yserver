@@ -142,6 +142,27 @@ pub(crate) trait PageFlipEventSource {
         device: &crate::drm::Device,
     ) -> io::Result<Option<(Vec<KernelPageFlip>, Vec<KernelCrtcSequence>)>>;
 
+    /// Legacy `DRM_IOCTL_WAIT_VBLANK` count query for `pipe`.
+    fn query_vblank(
+        &self,
+        device: &crate::drm::Device,
+        pipe: u32,
+    ) -> io::Result<(u32, std::time::Duration)> {
+        crate::drm::page_flip::wait_vblank_query(device, pipe)
+    }
+
+    /// Legacy `DRM_IOCTL_WAIT_VBLANK` event arm for `pipe`.
+    fn queue_vblank_event(
+        &self,
+        device: &crate::drm::Device,
+        pipe: u32,
+        relative: bool,
+        sequence: u32,
+        signal: u32,
+    ) -> io::Result<u32> {
+        crate::drm::page_flip::wait_vblank_queue_event(device, pipe, relative, sequence, signal)
+    }
+
     /// Wait up to `timeout` for events to become readable without reading
     /// them, so the caller can deliver them through the normal handler.
     fn wait_ready(
@@ -235,12 +256,21 @@ impl PageFlipEventSource for DrmPageFlipEventSource {
     }
 }
 
+/// One recorded legacy vblank arm: `(pipe, relative, sequence, signal)`.
+#[cfg(test)]
+pub(crate) type LegacyVblankArm = (u32, bool, u32, u32);
+
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct RecordingPageFlipEventSource {
     flips: std::cell::RefCell<std::collections::VecDeque<KernelPageFlip>>,
     sequences: std::cell::RefCell<std::collections::VecDeque<KernelCrtcSequence>>,
     delayed_ready_checks: std::cell::Cell<usize>,
+    /// `Ok(count)` answers legacy queries/arms at that count; `Err(errno)`
+    /// fails them. `None` keeps the real ioctl on the fixture device.
+    legacy_vblank: std::cell::Cell<Option<Result<u32, i32>>>,
+    legacy_arms: std::cell::RefCell<Vec<LegacyVblankArm>>,
+    legacy_queries: std::cell::Cell<usize>,
 }
 
 #[cfg(test)]
@@ -335,6 +365,29 @@ impl RecordingPageFlipEventSource {
             .push_back((user_data, time_ns, sequence));
     }
 
+    pub(crate) fn set_legacy_vblank(&self, answer: Result<u32, i32>) {
+        self.legacy_vblank.set(Some(answer));
+    }
+
+    pub(crate) fn legacy_vblank_arms(&self) -> Vec<LegacyVblankArm> {
+        self.legacy_arms.borrow().clone()
+    }
+
+    pub(crate) fn legacy_vblank_queries(&self) -> usize {
+        self.legacy_queries.get()
+    }
+
+    /// Deliver a kernel `DRM_EVENT_VBLANK` for every recorded arm.
+    pub(crate) fn fire_legacy_vblank_arms(&self, time_ns: i64, sequence: u32) {
+        for (_, _, _, signal) in self.legacy_arms.borrow_mut().drain(..) {
+            self.sequences.borrow_mut().push_back((
+                crate::drm::page_flip::sequence_user_data_from_legacy_signal(u64::from(signal)),
+                time_ns,
+                u64::from(sequence),
+            ));
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn delay_next_ready_checks(&self, count: usize) {
         self.delayed_ready_checks.set(count);
@@ -348,6 +401,45 @@ impl RecordingPageFlipEventSource {
 
 #[cfg(test)]
 impl PageFlipEventSource for RecordingPageFlipEventSource {
+    fn query_vblank(
+        &self,
+        device: &crate::drm::Device,
+        pipe: u32,
+    ) -> io::Result<(u32, std::time::Duration)> {
+        self.legacy_queries.set(self.legacy_queries.get() + 1);
+        match self.legacy_vblank.get() {
+            Some(Ok(count)) => Ok((count, std::time::Duration::ZERO)),
+            Some(Err(errno)) => Err(io::Error::from_raw_os_error(errno)),
+            None => crate::drm::page_flip::wait_vblank_query(device, pipe),
+        }
+    }
+
+    fn queue_vblank_event(
+        &self,
+        device: &crate::drm::Device,
+        pipe: u32,
+        relative: bool,
+        sequence: u32,
+        signal: u32,
+    ) -> io::Result<u32> {
+        match self.legacy_vblank.get() {
+            Some(Ok(count)) => {
+                self.legacy_arms
+                    .borrow_mut()
+                    .push((pipe, relative, sequence, signal));
+                Ok(if relative {
+                    count.wrapping_add(sequence)
+                } else {
+                    sequence
+                })
+            }
+            Some(Err(errno)) => Err(io::Error::from_raw_os_error(errno)),
+            None => crate::drm::page_flip::wait_vblank_queue_event(
+                device, pipe, relative, sequence, signal,
+            ),
+        }
+    }
+
     fn drain_events(
         &self,
         _device: &crate::drm::Device,
@@ -412,6 +504,7 @@ impl PlatformBackend {
         self.last_page_flip_received_at
             .retain(|key, _| live.contains(key));
         self.software_msc.retain(|key, _| live.contains(key));
+        self.vblank_fallback.retain_live(&live);
     }
 
     pub(crate) fn poll_fds(&self) -> Vec<(RawFd, BackendFdKind)> {
@@ -707,7 +800,14 @@ impl PlatformBackend {
             // forever). Fall back to a per-output software counter that
             // increments on every flip when the kernel reports 0; on
             // drivers that report a real frame this stays untouched.
-            let msc = if flip.frame == 0 {
+            let legacy_msc = if flip.frame == 0 {
+                self.query_legacy_vblank_msc(crtc_key, &device, event_source.as_ref())
+            } else {
+                None
+            };
+            let msc = if let Some(msc) = legacy_msc {
+                msc
+            } else if flip.frame == 0 {
                 let next = self
                     .software_msc
                     .get(&crtc_key)

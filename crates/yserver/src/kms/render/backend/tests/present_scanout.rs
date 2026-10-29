@@ -340,6 +340,14 @@ fn present_randr_crtc_routes_equal_raw_handles_to_the_owning_device() {
     b.pstate
         .crtc_queue_sequence_unsupported_devices
         .insert(primary.device_key);
+    assert!(
+        b.present_absolute_vblank_arm_supported(primary_xid),
+        "WAIT_VBLANK still arms absolute targets"
+    );
+    b.platform
+        .vblank_fallback
+        .wait_vblank_unsupported_devices
+        .insert(primary.device_key);
     assert!(!b.present_absolute_vblank_arm_supported(primary_xid));
     assert!(b.present_absolute_vblank_arm_supported(secondary_xid));
     assert!(
@@ -494,7 +502,7 @@ fn arm_idle_vblanks_with_arms_primary_once_then_dedups() {
 }
 
 #[test]
-fn arm_idle_vblanks_skips_an_unsupported_selected_device() {
+fn arm_idle_vblanks_without_kernel_vblank_arms_only_a_software_vblank() {
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let primary = output_crtc_key(&b, 0);
     push_test_output(&mut b, 2);
@@ -502,6 +510,10 @@ fn arm_idle_vblanks_skips_an_unsupported_selected_device() {
     let secondary = output_crtc_key(&b, 1);
     b.pstate
         .crtc_queue_sequence_unsupported_devices
+        .insert(primary.device_key);
+    b.platform
+        .vblank_fallback
+        .wait_vblank_unsupported_devices
         .insert(primary.device_key);
 
     let mut attempted = Vec::new();
@@ -512,9 +524,11 @@ fn arm_idle_vblanks_skips_an_unsupported_selected_device() {
         })
         .unwrap();
 
-    assert_eq!(armed, 0);
-    assert!(attempted.is_empty());
+    assert_eq!(armed, 1, "the software vblank covers the wait");
+    assert!(attempted.is_empty(), "no kernel arm on that device");
     assert!(!b.pstate.armed_vblank_targets.contains_key(&primary));
+    assert!(b.platform.vblank_fallback.software.contains_key(&primary));
+    assert!(!b.platform.vblank_fallback.software.contains_key(&secondary));
 
     let secondary_armed = b
         .arm_idle_vblanks_with(secondary, &[100], |crtc_key| {

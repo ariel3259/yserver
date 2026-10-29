@@ -531,6 +531,7 @@ impl KmsBackend {
         if !self.pstate.absolute_vblank_targets.is_empty() {
             self.pstate.absolute_vblank_targets.clear();
         }
+        self.platform.vblank_fallback.software.clear();
     }
 
     /// Drop armed-target entries (both the relative single-slot map and
@@ -681,12 +682,13 @@ impl KmsBackend {
             self.clear_all_armed_vblank_targets();
             return Ok(0);
         }
-        if self
-            .pstate
-            .crtc_queue_sequence_unsupported_devices
-            .contains(&crtc_key.device_key)
-            || self.pstate.armed_vblank_targets.contains_key(&crtc_key)
-        {
+        if !self.kernel_vblank_arm_available(crtc_key.device_key) {
+            let now = (self.pstate.monotonic_clock)();
+            return Ok(usize::from(
+                self.platform.arm_software_vblank(crtc_key, now),
+            ));
+        }
+        if self.pstate.armed_vblank_targets.contains_key(&crtc_key) {
             return Ok(0);
         }
         if armer(crtc_key)? {
@@ -736,11 +738,7 @@ impl KmsBackend {
             self.clear_all_armed_vblank_targets();
             return Ok(0);
         }
-        if self
-            .pstate
-            .crtc_queue_sequence_unsupported_devices
-            .contains(&crtc_key.device_key)
-        {
+        if !self.kernel_vblank_arm_available(crtc_key.device_key) {
             return Ok(0);
         }
         let mut covered = 0;
@@ -774,45 +772,183 @@ impl KmsBackend {
         let Some(crtc_key) = self.present_crtc_key(randr_crtc_id) else {
             return Ok(0);
         };
-        let Some(device) = self
-            .platform
-            .device_for_key(crtc_key.device_key)
-            .map(|device| Rc::clone(&device.device))
-        else {
+        let Some(mut kernel) = self.kernel_vblank_armer(crtc_key) else {
             return Ok(0);
         };
-        let mut newly_unsupported = false;
         let result = self.arm_idle_vblanks_with(crtc_key, target_mscs, |crtc_key| {
             let crtc_id = u32::from(crtc_key.crtc);
-            match crate::drm::page_flip::queue_crtc_sequence(
-                &device,
-                crtc_id,
-                /* relative */ true,
-                /* sequence */ 1,
-                /* user_data */ u64::from(crtc_id),
-            ) {
-                Ok(_) => Ok(true),
-                Err(e)
-                    if e.raw_os_error() == Some(libc::EOPNOTSUPP)
-                        || e.raw_os_error() == Some(libc::ENOTTY) =>
-                {
-                    newly_unsupported = true;
-                    Ok(false)
-                }
-                Err(e) => Err(e),
-            }
+            kernel.arm(crtc_key, true, 1, u64::from(crtc_id), crtc_id)
         });
-        if newly_unsupported {
+        let kernel_lost = self.finish_kernel_vblank_armer(crtc_key, kernel);
+        if kernel_lost && matches!(result, Ok(0)) {
+            // The device just proved it has no kernel vblank: arm the software one now.
+            return self.arm_idle_vblanks_with(crtc_key, target_mscs, |_| Ok(false));
+        }
+        result
+    }
+
+    /// Whether `device_key` still has a kernel vblank event source:
+    /// CRTC_QUEUE_SEQUENCE, or the legacy WAIT_VBLANK fallback.
+    pub(in crate::kms::render::backend) fn kernel_vblank_arm_available(
+        &self,
+        device_key: crate::platform::drm::DrmDeviceKey,
+    ) -> bool {
+        !self
+            .pstate
+            .crtc_queue_sequence_unsupported_devices
+            .contains(&device_key)
+            || self.platform.wait_vblank_supported(device_key)
+    }
+
+    fn kernel_vblank_armer(&self, crtc_key: CrtcKey) -> Option<KernelVblankArmer> {
+        let device = self.platform.device_for_key(crtc_key.device_key)?;
+        Some(KernelVblankArmer {
+            device: Rc::clone(&device.device),
+            source: Rc::clone(&device.page_flip_event_source),
+            sequence_supported: !self
+                .pstate
+                .crtc_queue_sequence_unsupported_devices
+                .contains(&crtc_key.device_key),
+            wait_vblank_supported: self.platform.wait_vblank_supported(crtc_key.device_key),
+            pipe: self.platform.vblank_fallback.pipes.get(&crtc_key).copied(),
+            newly_sequence_unsupported: false,
+            wait_vblank_error: None,
+        })
+    }
+
+    /// Latch what the armer learned; returns whether the device has just
+    /// lost its last kernel vblank source.
+    fn finish_kernel_vblank_armer(&mut self, crtc_key: CrtcKey, kernel: KernelVblankArmer) -> bool {
+        if let Some(pipe) = kernel.pipe {
+            self.platform.vblank_fallback.pipes.insert(crtc_key, pipe);
+        }
+        if kernel.newly_sequence_unsupported {
             log::warn!(
                 "DRM_IOCTL_CRTC_QUEUE_SEQUENCE returned EOPNOTSUPP on {} — disabling \
-                 vblank arming on that DRM device (flip-driven MSC only)",
+                 sequence arming on that device; falling back to DRM_IOCTL_WAIT_VBLANK",
                 crtc_key.device_key
             );
             self.pstate
                 .crtc_queue_sequence_unsupported_devices
                 .insert(crtc_key.device_key);
         }
-        result
+        let Some(error) = kernel.wait_vblank_error else {
+            return false;
+        };
+        self.platform
+            .note_wait_vblank_error(crtc_key.device_key, &error);
+        !self.kernel_vblank_arm_available(crtc_key.device_key)
+    }
+
+    /// Fire due software vblanks: each advances its CRTC's MSC by one and
+    /// feeds the sequence-event path, unless a flip or another event already
+    /// advanced that MSC since the arm.
+    pub(in crate::kms::render::backend) fn service_software_vblanks(&mut self) {
+        if self.platform.vblank_fallback.software.is_empty() {
+            return;
+        }
+        if !self.scanout_allowed() || !self.kms_outputs_active {
+            self.platform.vblank_fallback.software.clear();
+            return;
+        }
+        let now = (self.pstate.monotonic_clock)();
+        for (crtc_key, vblank) in self.platform.take_due_software_vblanks(now) {
+            let Some(output_idx) = self.platform.output_index_for_crtc(crtc_key) else {
+                continue;
+            };
+            if self.platform.present_get_ust_msc(crtc_key).0 != vblank.armed_msc
+                || self.present_flip_in_flight_for_output(output_idx)
+            {
+                continue;
+            }
+            let msc = self.platform.advance_software_msc(crtc_key);
+            let time_ns = crate::drm::atomic::monotonic_timestamp()
+                .and_then(|now| i64::try_from(now.as_nanos()).ok())
+                .unwrap_or(0);
+            log::debug!(
+                target: "present_pace",
+                "present_clock software vblank output={output_idx} msc={msc}"
+            );
+            self.on_crtc_sequence_event(
+                crtc_key.device_key,
+                u64::from(u32::from(crtc_key.crtc)),
+                time_ns,
+                msc,
+            );
+        }
+    }
+}
+
+/// One kernel vblank arm attempt: CRTC_QUEUE_SEQUENCE while the device takes
+/// it, then the legacy WAIT_VBLANK event (Xorg `ms_queue_vblank`).
+struct KernelVblankArmer {
+    device: Rc<crate::drm::Device>,
+    source: Rc<dyn crate::kms::render::platform::flip_events::PageFlipEventSource>,
+    sequence_supported: bool,
+    wait_vblank_supported: bool,
+    pipe: Option<u32>,
+    newly_sequence_unsupported: bool,
+    wait_vblank_error: Option<io::Error>,
+}
+
+impl KernelVblankArmer {
+    /// `Ok(false)` when the device has no kernel vblank source left.
+    fn arm(
+        &mut self,
+        crtc_key: CrtcKey,
+        relative: bool,
+        target: u64,
+        user_data: u64,
+        signal: u32,
+    ) -> io::Result<bool> {
+        if self.sequence_supported {
+            match crate::drm::page_flip::queue_crtc_sequence(
+                &self.device,
+                u32::from(crtc_key.crtc),
+                relative,
+                target,
+                user_data,
+            ) {
+                Ok(_) => return Ok(true),
+                Err(e)
+                    if e.raw_os_error() == Some(libc::EOPNOTSUPP)
+                        || e.raw_os_error() == Some(libc::ENOTTY) =>
+                {
+                    self.sequence_supported = false;
+                    self.newly_sequence_unsupported = true;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        if !self.wait_vblank_supported {
+            return Ok(false);
+        }
+        let Some(pipe) = self
+            .pipe
+            .or_else(|| crate::drm::page_flip::crtc_pipe_index(&self.device, crtc_key.crtc))
+        else {
+            self.wait_vblank_supported = false;
+            self.wait_vblank_error = Some(io::Error::from_raw_os_error(libc::EINVAL));
+            return Ok(false);
+        };
+        self.pipe = Some(pipe);
+        // WAIT_VBLANK takes the low 32 bits of the target, as in Xorg.
+        match self
+            .source
+            .queue_vblank_event(&self.device, pipe, relative, target as u32, signal)
+        {
+            Ok(_) => Ok(true),
+            Err(e)
+                if crate::kms::render::platform::vblank_fallback::wait_vblank_unsupported_error(
+                    &e,
+                ) =>
+            {
+                self.wait_vblank_supported = false;
+                self.wait_vblank_error = Some(e);
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -1636,12 +1772,8 @@ impl KmsBackend {
         &self,
         crtc_id: u32,
     ) -> bool {
-        self.present_crtc_key(crtc_id).is_some_and(|key| {
-            !self
-                .pstate
-                .crtc_queue_sequence_unsupported_devices
-                .contains(&key.device_key)
-        })
+        self.present_crtc_key(crtc_id)
+            .is_some_and(|key| self.kernel_vblank_arm_available(key.device_key))
     }
 
     pub(in crate::kms::render::backend) fn backend_present_arm_present_absolute_vblank(
@@ -1652,45 +1784,21 @@ impl KmsBackend {
         let Some(crtc_key) = self.present_crtc_key(randr_crtc_id) else {
             return Ok(0);
         };
-        let Some(device) = self
-            .platform
-            .device_for_key(crtc_key.device_key)
-            .map(|device| Rc::clone(&device.device))
-        else {
+        let Some(mut kernel) = self.kernel_vblank_armer(crtc_key) else {
             return Ok(0);
         };
-        let mut newly_unsupported = false;
         let result =
             self.arm_present_absolute_vblank_with(crtc_key, targets, |crtc_key, target| {
                 let crtc_id = u32::from(crtc_key.crtc);
-                match crate::drm::page_flip::queue_crtc_sequence(
-                    &device,
-                    crtc_id,
-                    /* relative */ false,
+                kernel.arm(
+                    crtc_key,
+                    false,
                     target,
                     absolute_seq_user_data(crtc_id),
-                ) {
-                    Ok(_) => Ok(true),
-                    Err(e)
-                        if e.raw_os_error() == Some(libc::EOPNOTSUPP)
-                            || e.raw_os_error() == Some(libc::ENOTTY) =>
-                    {
-                        newly_unsupported = true;
-                        Ok(false)
-                    }
-                    Err(e) => Err(e),
-                }
+                    crtc_id | crate::drm::page_flip::LEGACY_VBLANK_ABSOLUTE_SIGNAL,
+                )
             });
-        if newly_unsupported {
-            log::warn!(
-                "DRM_IOCTL_CRTC_QUEUE_SEQUENCE returned EOPNOTSUPP from the absolute \
-                 vblank arm on {} — disabling sequence arming on that device",
-                crtc_key.device_key,
-            );
-            self.pstate
-                .crtc_queue_sequence_unsupported_devices
-                .insert(crtc_key.device_key);
-        }
+        self.finish_kernel_vblank_armer(crtc_key, kernel);
         result
     }
 
