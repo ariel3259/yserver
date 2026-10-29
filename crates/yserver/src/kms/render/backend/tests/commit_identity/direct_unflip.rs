@@ -314,6 +314,14 @@ pub(super) fn submit_output_present_via_backend(
     fixture: &mut RecordingSceneFixture,
     direct: &DirectPresentSetup,
     output_idx: usize,
+) -> AtomicCommitRecord {
+    submit_output_present_via_backend_for_row(fixture, direct, output_idx, "Output Present")
+}
+
+fn submit_output_present_via_backend_for_row(
+    fixture: &mut RecordingSceneFixture,
+    direct: &DirectPresentSetup,
+    output_idx: usize,
     row: &str,
 ) -> AtomicCommitRecord {
     fixture
@@ -663,7 +671,7 @@ fn output_direct_lifecycle() {
         );
 
         let direct_record =
-            submit_output_present_via_backend(&mut fixture, &direct, output_idx, row);
+            submit_output_present_via_backend_for_row(&mut fixture, &direct, output_idx, row);
         let direct_id = accepted_event_id(&direct_record)
             .unwrap_or_else(|| panic!("{row}: normal Output Present has an accepted event ID"));
         assert_atomic_record_touches_output_only(&fixture, &direct_record, output_idx, row);
@@ -1231,7 +1239,7 @@ fn independent_output_owners() {
         let mut accepted_ids = [None, None];
 
         for (entry_count, output_idx) in entry_order.into_iter().enumerate() {
-            let record = submit_output_present_via_backend(
+            let record = submit_output_present_via_backend_for_row(
                 &mut fixture,
                 &directs[output_idx],
                 output_idx,
@@ -1440,8 +1448,7 @@ fn root_to_output_transition_unflips_once() {
     assert!(Backend::drain_retired_present_idle_events(&mut fixture.events.backend).is_empty());
 
     compose_and_complete_outputs(&mut fixture, device_fd, &[0, 1]);
-    let output_record =
-        submit_output_present_via_backend(&mut fixture, &output, 1, "root_to_output_transition");
+    let output_record = submit_output_present_via_backend(&mut fixture, &output, 1);
     let output_id = accepted_event_id(&output_record).expect("Output(1) commit accepted");
     assert_atomic_record_touches_output_only(
         &fixture,
@@ -1485,10 +1492,8 @@ fn output_to_root_transition_unflips_every_output_owner() {
     let second = fixture.install_direct_output_present(1, 216, 0);
     Backend::set_cursor_hidden(&mut fixture.events.backend, true);
     let device_fd = fd(&fixture);
-    let first_record =
-        submit_output_present_via_backend(&mut fixture, &first, 0, "output_to_root_transition_0");
-    let second_record =
-        submit_output_present_via_backend(&mut fixture, &second, 1, "output_to_root_transition_1");
+    let first_record = submit_output_present_via_backend(&mut fixture, &first, 0);
+    let second_record = submit_output_present_via_backend(&mut fixture, &second, 1);
     let first_id = accepted_event_id(&first_record).expect("Output(0) commit accepted");
     let second_id = accepted_event_id(&second_record).expect("Output(1) commit accepted");
     complete_recorded_attempt(&mut fixture, device_fd, &first_record, first_id, 75);

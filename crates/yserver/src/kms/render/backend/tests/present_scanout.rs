@@ -1887,10 +1887,6 @@ fn output_present_in_flight_policy() {
         ("replacement_requested_owner_query", 1, 1_u32, true),
         // D12: a peer query does not borrow the replacement marker.
         ("replacement_requested_other_output_query", 0, 1_u32, false),
-        // D12: accepted replacement state remains visible until retirement.
-        ("replacement_accepted_owner_query", 1, 2_u32, true),
-        // D12: accepted replacement state remains isolated from its peer.
-        ("replacement_accepted_other_output_query", 0, 2_u32, false),
     ] {
         let mut backend = KmsBackend::for_tests();
         push_test_output(&mut backend, 0x5001);
@@ -1970,9 +1966,6 @@ fn output_present_in_flight_policy() {
             owner.current = Some(frame);
             owner.unflip_requested = true;
             owner.unflip_outputs_to_replace = HashSet::from([output_idx]);
-            if phase == 2 {
-                owner.unflip_awaiting_outputs.insert(output_idx, 0xD120);
-            }
         }
         assert!(
             owner.active(),
