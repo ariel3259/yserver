@@ -470,6 +470,11 @@ pub struct XBackend<P: seam::Platform> {
     pub(crate) present_source_pins: HashMap<u64, crate::kms::render::store::DrawableId>,
     pub(crate) next_present_source_pin_id: u64,
 
+    /// Pins held by a queued first-entry direct Present after its admission
+    /// claim fell back to Copy. Keep both drawables alive until the Copy's
+    /// completion batch reports that the GPU consumed the source.
+    pub(crate) queued_copy_present_pins: HashMap<u64, (u64, u64)>,
+
     /// Stage 5 Task 6.1: shutdown-time accumulator for PRESENT
     /// completions that need to be drained past `disable_output`
     /// and handed to `lib.rs::run` for client fan-out before the
@@ -602,6 +607,7 @@ impl<P: seam::Platform> XBackend<P> {
             retained_present_wakes: std::collections::HashMap::new(),
             present_source_pins: HashMap::new(),
             next_present_source_pin_id: 1,
+            queued_copy_present_pins: HashMap::new(),
             pending_completed_events_on_shutdown: Vec::new(),
             cursor_records: HashMap::new(),
             cursor_pixmaps: HashMap::new(),

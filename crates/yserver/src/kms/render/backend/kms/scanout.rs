@@ -451,7 +451,12 @@ impl KmsBackend {
             .scope_for_output(output_idx)
             .and_then(|scope| self.pstate.direct.get(scope))
             .is_some_and(|owner| {
-                owner.active()
+                // A queued first entry is an admission claim, not hardware
+                // ownership yet. Keep the scene free to compose until the
+                // successor passes both dispatch gates and is submitted.
+                owner.pending.is_some()
+                    || owner.current.is_some()
+                    || (owner.hold_direct && owner.queued_successor.is_some())
                     || owner.unflip_outputs_to_replace.contains(&output_idx)
                     || owner.unflip_awaiting_outputs.contains_key(&output_idx)
             })
@@ -1789,14 +1794,24 @@ impl KmsBackend {
         let Some(owner) = self.pstate.direct.get(scope) else {
             return;
         };
-        if owner.unflip_requested || owner.pending.is_some() {
+        if owner.pending.is_some() {
+            return;
+        }
+        let first_output_entry = matches!(scope, DirectScope::Output(_))
+            && owner.current.is_none()
+            && !owner.hold_direct
+            && owner.queued_successor.is_some();
+        if owner.unflip_requested && !first_output_entry {
             return;
         }
         if let DirectScope::Output(output_idx) = scope
             && owner.queued_successor.is_some()
-            && !self.direct_output_frames_scene_eligible(output_idx)
+            && (self.scene.has_pending_page_flip(output_idx)
+                || (!first_output_entry && !self.direct_output_frames_scene_eligible(output_idx)))
         {
-            self.request_direct_unflip_for(scope, "queued_direct_successor_scene_changed");
+            if !first_output_entry {
+                self.request_direct_unflip_for(scope, "queued_direct_successor_scene_changed");
+            }
             return;
         }
         let direct_outputs = self.direct_scope_outputs(scope);
@@ -1804,6 +1819,24 @@ impl KmsBackend {
             .platform
             .scanout_commit_in_flight_for_outputs(&direct_outputs)
         {
+            return;
+        }
+        if first_output_entry
+            && !self
+                .pstate
+                .direct
+                .get(scope)
+                .and_then(|owner| owner.queued_successor.as_ref())
+                .is_some_and(|frame| self.queued_output_candidate_eligible(frame, scope))
+        {
+            if let Some(frame) = self
+                .pstate
+                .direct
+                .get_mut(scope)
+                .and_then(|owner| owner.queued_successor.take())
+            {
+                self.fallback_queued_direct_entry_to_copy(scope, frame);
+            }
             return;
         }
         let Some(mut successor) = self
@@ -1832,14 +1865,85 @@ impl KmsBackend {
                 log::warn!(
                     "scanout_m2: queued direct successor submit failed after predecessor retirement: {error}"
                 );
-                self.defer_direct_successor_skip(scope, successor);
-                if let Some(direct) = self.pstate.direct.get_mut(scope) {
-                    direct
-                        .completed
-                        .append(&mut direct.deferred_successor_skips);
+                if first_output_entry {
+                    self.fallback_queued_direct_entry_to_copy(scope, successor);
+                } else {
+                    self.defer_direct_successor_skip(scope, successor);
+                    if let Some(direct) = self.pstate.direct.get_mut(scope) {
+                        direct
+                            .completed
+                            .append(&mut direct.deferred_successor_skips);
+                    }
+                    self.request_direct_unflip_for(scope, "queued_direct_successor_submit_failed");
                 }
-                self.request_direct_unflip_for(scope, "queued_direct_successor_submit_failed");
             }
+        }
+    }
+
+    fn fallback_queued_direct_entry_to_copy(
+        &mut self,
+        scope: DirectScope,
+        mut frame: DirectPresentFrame,
+    ) {
+        let candidate = frame.candidate;
+        let target = frame.fallback_target;
+        let copy_result = self.engine.cow_copy_area(
+            &mut self.store,
+            &mut self.platform.gpu,
+            target.server_backing_dst(),
+            Src::server_internal(frame.source_id),
+            ash::vk::Rect2D {
+                offset: ash::vk::Offset2D::default(),
+                extent: ash::vk::Extent2D {
+                    width: u32::from(candidate.src_width),
+                    height: u32::from(candidate.src_height),
+                },
+            },
+            ash::vk::Offset2D {
+                x: target.offset().0 + i32::from(candidate.x_off),
+                y: target.offset().1 + i32::from(candidate.y_off),
+            },
+        );
+        let copy_succeeded = copy_result.is_ok();
+        if let Err(error) = copy_result {
+            log::error!(
+                "scanout_m2: queued direct entry Copy fallback failed for present_id={}: {error:?}",
+                candidate.present_id
+            );
+        }
+
+        frame.event.completion_mode = if copy_succeeded {
+            yserver_protocol::x11::present::COMPLETE_MODE_COPY
+        } else {
+            self.note_present_skip();
+            yserver_protocol::x11::present::COMPLETE_MODE_SKIP
+        };
+        frame.event.completion_clock = None;
+        frame.event.emit_idle = true;
+        self.queued_copy_present_pins.insert(
+            candidate.present_id,
+            (frame.source_pin, frame.fallback_target_pin),
+        );
+        <Self as Backend>::enqueue_present_completion(
+            self,
+            frame.event,
+            candidate.completion_dst_host_xid,
+        );
+        if let DirectScope::Output(output_idx) = scope {
+            self.scene.mark_scene_structure_dirty_for_output(output_idx);
+        }
+        if let Some(owner) = self.pstate.direct.get_mut(scope) {
+            owner.hold_direct = false;
+            owner.unflip_requested = false;
+            owner.unflip_reason = None;
+            owner.unflip_last_reason = None;
+            owner.unflip_outputs_to_replace.clear();
+            owner.unflip_awaiting_outputs.clear();
+            owner.unflip_fallback_source = None;
+            owner.unflip_shadow_ready = false;
+            owner.degraded_composed_unflip = false;
+            owner.fresh_composed_unflip = false;
+            owner.reset_eligible_direct_probation();
         }
     }
 
@@ -1874,6 +1978,11 @@ impl KmsBackend {
         scope: DirectScope,
         frame: DirectPresentFrame,
     ) {
+        let has_predecessor = self
+            .pstate
+            .direct
+            .get(scope)
+            .is_some_and(|owner| owner.pending.is_some() || owner.current.is_some());
         let superseded = self
             .pstate
             .direct
@@ -1883,7 +1992,10 @@ impl KmsBackend {
             self.defer_direct_successor_skip(scope, superseded);
         }
         if let Some(owner) = self.pstate.direct.get_mut(scope) {
-            owner.hold_direct = true;
+            owner.hold_direct = has_predecessor;
+            if !has_predecessor {
+                owner.completed.append(&mut owner.deferred_successor_skips);
+            }
         }
         log::debug!(
             "scanout_m2: queued latest direct successor present_id={}",
@@ -4283,7 +4395,14 @@ impl KmsBackend {
         self.prepare_tearing_scene_pass();
         let active_scopes = self.pstate.direct.active_scopes();
         for &scope in &active_scopes {
+            let queued_first_entry = self.pstate.direct.get(scope).is_some_and(|owner| {
+                owner.pending.is_none()
+                    && owner.current.is_none()
+                    && !owner.hold_direct
+                    && owner.queued_successor.is_some()
+            });
             if let DirectScope::Output(output_idx) = scope
+                && !queued_first_entry
                 && !self.direct_output_frames_scene_eligible(output_idx)
             {
                 self.request_direct_unflip_for(scope, "composite_tick_output_scene_changed");
@@ -4297,9 +4416,28 @@ impl KmsBackend {
         if !active_scopes.is_empty() {
             use crate::kms::render::scene::CursorPlaneMode;
             if self.platform.any_output_transformed() {
-                self.request_direct_unflip("composite_tick_crtc_transform");
+                for &scope in &active_scopes {
+                    let queued_first_entry = self.pstate.direct.get(scope).is_some_and(|owner| {
+                        owner.pending.is_none()
+                            && owner.current.is_none()
+                            && !owner.hold_direct
+                            && owner.queued_successor.is_some()
+                    });
+                    if !queued_first_entry {
+                        self.request_direct_unflip_for(scope, "composite_tick_crtc_transform");
+                    }
+                }
             } else {
                 for &scope in &active_scopes {
+                    let queued_first_entry = self.pstate.direct.get(scope).is_some_and(|owner| {
+                        owner.pending.is_none()
+                            && owner.current.is_none()
+                            && !owner.hold_direct
+                            && owner.queued_successor.is_some()
+                    });
+                    if queued_first_entry {
+                        continue;
+                    }
                     let outputs = self.direct_scope_outputs(scope);
                     let cursor_mode = self.scene.cursor_mode_for_outputs(&outputs);
                     let root_overlay_empty = self.direct_root_overlay_empty_for_outputs(&outputs);

@@ -192,6 +192,35 @@ impl KmsBackend {
             )
     }
 
+    /// Recheck an Output first-entry frame against the same eligibility gate
+    /// used by Present admission after it waited in the successor slot.
+    pub(in crate::kms::render::backend) fn queued_output_candidate_eligible(
+        &self,
+        frame: &DirectPresentFrame,
+        scope: DirectScope,
+    ) -> bool {
+        let DirectScope::Output(_) = scope else {
+            return false;
+        };
+        let host_xid = frame.candidate.paint_dst_host_xid;
+        let Some(leaf_id) = self.store.lookup(host_xid) else {
+            return false;
+        };
+        let paint_target = self.resolve_paint_target(host_xid);
+        let paint_id = paint_target.map(|target| target.backing_id());
+        let target = self.scanout_m0_target(host_xid, Some(leaf_id), paint_id);
+        let unbordered = paint_target.is_none_or(|target| !target.has_border_clip());
+        self.direct_candidate_scope(frame.candidate, target) == Some(scope)
+            && self.direct_candidate_gate(frame.candidate, target, scope, unbordered, true)
+            && self
+                .pstate
+                .scanout_m1
+                .entries
+                .get(&(frame.source_id, scope))
+                .and_then(ScanoutM1ProbeEntry::framebuffer)
+                .is_some()
+    }
+
     /// Whether the current scene still allows a retained target to be scanned
     /// out on this owner. Admission and tick revalidation share this policy so
     /// an Unredirected window uses the scene's existing per-scope topmost test,
@@ -1408,6 +1437,11 @@ impl KmsBackend {
             .iter()
             .any(|&output_idx| self.scene.has_pending_page_flip(output_idx))
         {
+            if matches!(scope, DirectScope::Output(_)) {
+                self.retain_direct_present_wake(&frame.event);
+                self.queue_direct_successor(scope, frame);
+                return Ok(true);
+            }
             self.request_direct_unflip_for(scope, "eligible_direct_successor_scene_flip_pending");
             if let Some(owner) = self.pstate.direct.get_mut(scope) {
                 owner.unflip_fallback_source = Some(source_id);
@@ -1421,11 +1455,12 @@ impl KmsBackend {
             .platform
             .scanout_commit_in_flight_for_outputs(&direct_outputs)
         {
-            if self
-                .pstate
-                .direct
-                .get(scope)
-                .is_some_and(|owner| owner.current.is_some())
+            if matches!(scope, DirectScope::Output(_))
+                || self
+                    .pstate
+                    .direct
+                    .get(scope)
+                    .is_some_and(|owner| owner.current.is_some())
             {
                 // A fully-retired direct frame owns the current slot. Keep
                 // this Present in the existing latest-wins successor slot;
@@ -1893,6 +1928,14 @@ impl KmsBackend {
         completed.append(&mut self.pstate.direct.root_mut().completed);
         for owner in &mut self.pstate.direct.outputs {
             completed.append(&mut owner.completed);
+        }
+        for event in &completed {
+            if let Some((source_pin, fallback_target_pin)) =
+                self.queued_copy_present_pins.remove(&event.present_id)
+            {
+                <Self as Backend>::release_present_source(self, source_pin);
+                <Self as Backend>::release_present_source(self, fallback_target_pin);
+            }
         }
         for event in &completed {
             if event.completion_mode != yserver_protocol::x11::present::COMPLETE_MODE_SKIP {
