@@ -2691,7 +2691,10 @@ fn resize_root_direct_present_before_unflip() -> Option<ResizePendingUnflip> {
     // root extent, then restore the fixture's synthetic accepted M1 owner.
     Backend::note_present_scanout_candidate(&mut fixture.events.backend, direct.candidate);
     fixture.events.backend.pstate.scanout_m1.entries.insert(
-        direct.source_id,
+        (
+            direct.source_id,
+            crate::kms::render::backend::DirectScope::Root,
+        ),
         crate::kms::render::backend::ScanoutM1ProbeEntry::accepted(
             crate::drm::modeset::DirectScanoutProbeFramebuffer::for_tests(
                 ::drm::control::from_u32(0x8711).expect("nonzero synthetic framebuffer"),
@@ -2706,7 +2709,10 @@ fn resize_root_direct_present_before_unflip() -> Option<ResizePendingUnflip> {
             .pstate
             .scanout_m1
             .entries
-            .contains_key(&direct.source_id)
+            .contains_key(&(
+                direct.source_id,
+                crate::kms::render::backend::DirectScope::Root
+            ))
     );
 
     let attempts = submit_direct(&mut fixture, &direct, device_fd);
@@ -2746,7 +2752,10 @@ fn resize_root_direct_present_before_unflip() -> Option<ResizePendingUnflip> {
             .pstate
             .scanout_m1
             .entries
-            .contains_key(&direct.source_id)
+            .contains_key(&(
+                direct.source_id,
+                crate::kms::render::backend::DirectScope::Root
+            ))
     );
 
     let replacement_offset = record_count(&fixture, device_fd);
@@ -2980,7 +2989,10 @@ fn assert_live_resize_m1_owner_is_held(scenario: &ResizePendingUnflip) {
         .pstate
         .scanout_m1
         .entries
-        .get(&scenario.direct_source_id)
+        .get(&(
+            scenario.direct_source_id,
+            crate::kms::render::backend::DirectScope::Root,
+        ))
         .expect("live direct source retains its M1 cache entry");
     assert!(
         entry.framebuffer().is_some(),
@@ -2991,11 +3003,10 @@ fn assert_live_resize_m1_owner_is_held(scenario: &ResizePendingUnflip) {
         "the live direct owner keeps the old M1 topology signature"
     );
     assert!(
-        !backend
-            .pstate
-            .scanout_m1
-            .entries
-            .contains_key(&scenario.new_source_id),
+        !backend.pstate.scanout_m1.entries.contains_key(&(
+            scenario.new_source_id,
+            crate::kms::render::backend::DirectScope::Root
+        )),
         "the changed-topology candidate is deferred while an owner is active"
     );
     assert!(backend.pstate.direct.root().active());
@@ -3051,7 +3062,10 @@ fn resize_keeps_live_direct_framebuffer_until_unflip_retires() {
             .pstate
             .scanout_m1
             .entries
-            .contains_key(&scenario.direct_source_id)
+            .contains_key(&(
+                scenario.direct_source_id,
+                crate::kms::render::backend::DirectScope::Root
+            ))
     );
     drain_present_notifications(&mut scenario.fixture, &[], &[0x711]);
     scenario.fixture.finish_after_normal_drain();
@@ -3103,18 +3117,18 @@ fn stale_m1_cache_clears_after_owners_retire() {
         backend.pstate.scanout_m1.topology_signature, scenario.old_topology,
         "the next eligible Present records the resized topology signature"
     );
-    assert!(
-        !backend
-            .pstate
-            .scanout_m1
-            .entries
-            .contains_key(&scenario.direct_source_id)
-    );
+    assert!(!backend.pstate.scanout_m1.entries.contains_key(&(
+        scenario.direct_source_id,
+        crate::kms::render::backend::DirectScope::Root
+    )));
     let new_entry = backend
         .pstate
         .scanout_m1
         .entries
-        .get(&scenario.new_source_id)
+        .get(&(
+            scenario.new_source_id,
+            crate::kms::render::backend::DirectScope::Root,
+        ))
         .expect("the next eligible Present is probed under the new signature");
     assert!(new_entry.framebuffer().is_none());
     let copied_present = Backend::drain_completed_present_events(backend);
