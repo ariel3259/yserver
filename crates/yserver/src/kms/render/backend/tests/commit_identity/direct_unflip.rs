@@ -310,63 +310,11 @@ fn submit_output_owner_successor(
         .expect("output owner direct commit was accepted")
 }
 
-fn submit_two_output_owner_successors(
-    fixture: &mut RecordingSceneFixture,
-    first: &DirectPresentSetup,
-    second: &DirectPresentSetup,
-) -> (AtomicCommitRecord, AtomicCommitRecord) {
-    fixture.events.backend.platform.outputs[0]
-        .output
-        .picked
-        .vrefresh = 75;
-    fixture.events.backend.platform.outputs[1]
-        .output
-        .picked
-        .vrefresh = 240;
-    assert_ne!(
-        fixture.events.backend.platform.outputs[1].x, 0,
-        "two-output fixtures keep a nonzero second-output origin"
-    );
-    let device_fd = fd(fixture);
-    let start = record_count(fixture, device_fd);
-    seed_output_owner_successor(
-        fixture,
-        first,
-        0,
-        crate::kms::render::backend::ScanoutM0Target::Unredirected,
-        None,
-        None,
-    );
-    seed_output_owner_successor(
-        fixture,
-        second,
-        1,
-        crate::kms::render::backend::ScanoutM0Target::Unredirected,
-        None,
-        None,
-    );
-    Backend::maybe_composite(&mut fixture.events.backend)
-        .expect("submit both output owners through the scheduling pass");
-    let records = records_since(fixture, device_fd, start);
-    let first_crtc = fixture.events.backend.platform.outputs[0].output.crtc;
-    let second_crtc = fixture.events.backend.platform.outputs[1].output.crtc;
-    let first_record = records
-        .iter()
-        .find(|record| record.events.iter().any(|event| event.crtc == first_crtc))
-        .expect("first output direct commit")
-        .clone();
-    let second_record = records
-        .iter()
-        .find(|record| record.events.iter().any(|event| event.crtc == second_crtc))
-        .expect("second output direct commit")
-        .clone();
-    (first_record, second_record)
-}
-
 pub(super) fn submit_output_present_via_backend(
     fixture: &mut RecordingSceneFixture,
     direct: &DirectPresentSetup,
     output_idx: usize,
+    row: &str,
 ) -> AtomicCommitRecord {
     fixture
         .events
@@ -387,7 +335,7 @@ pub(super) fn submit_output_present_via_backend(
         assert_eq!(
             entered,
             attempt + 1 == probation,
-            "Output({output_idx}) enters after normal probation"
+            "{row}: Output({output_idx}) enters after normal probation"
         );
     }
 
@@ -539,6 +487,7 @@ fn assert_plane_source_origin(
     fixture: &RecordingSceneFixture,
     record: &AtomicCommitRecord,
     output_idx: usize,
+    row: &str,
 ) {
     let output = &fixture.events.backend.platform.outputs[output_idx].output;
     for (property, name) in [
@@ -549,11 +498,11 @@ fn assert_plane_source_origin(
             .properties
             .iter()
             .find(|update| update.object == output.plane.into() && update.property == property)
-            .unwrap_or_else(|| panic!("output {output_idx} commit is missing {name}"))
+            .unwrap_or_else(|| panic!("{row}: output {output_idx} commit is missing {name}"))
             .value;
         assert_eq!(
             value, 0,
-            "output {output_idx} {name} must start at the pixmap origin"
+            "{row}: output {output_idx} {name} must start at the pixmap origin"
         );
     }
 }
@@ -562,17 +511,31 @@ fn assert_atomic_record_touches_output_only(
     fixture: &RecordingSceneFixture,
     record: &AtomicCommitRecord,
     output_idx: usize,
+    row: &str,
 ) {
     let output = &fixture.events.backend.platform.outputs[output_idx].output;
     let other = &fixture.events.backend.platform.outputs[1 - output_idx].output;
-    assert_eq!(record.events.len(), 1);
-    assert_eq!(record.events[0].crtc, output.crtc);
-    assert!(record.properties.iter().any(|update| {
-        update.property == output.plane_fb_id_prop && update.object == output.plane.into()
-    }));
-    assert!(record.properties.iter().any(|update| {
-        update.property == output.plane_crtc_id_prop && update.object == output.plane.into()
-    }));
+    assert_eq!(
+        record.events.len(),
+        1,
+        "{row}: commit has only its output event"
+    );
+    assert_eq!(
+        record.events[0].crtc, output.crtc,
+        "{row}: commit uses its output CRTC"
+    );
+    assert!(
+        record.properties.iter().any(|update| {
+            update.property == output.plane_fb_id_prop && update.object == output.plane.into()
+        }),
+        "{row}: commit updates its output framebuffer"
+    );
+    assert!(
+        record.properties.iter().any(|update| {
+            update.property == output.plane_crtc_id_prop && update.object == output.plane.into()
+        }),
+        "{row}: commit updates its output CRTC"
+    );
     let other_plane_properties = [
         other.plane_fb_id_prop,
         other.plane_crtc_id_prop,
@@ -590,7 +553,8 @@ fn assert_atomic_record_touches_output_only(
             !record
                 .properties
                 .iter()
-                .any(|update| update.object == other.plane.into() && update.property == property)
+                .any(|update| update.object == other.plane.into() && update.property == property),
+            "{row}: commit leaves the other output's plane property untouched"
         );
     }
     for property in [
@@ -607,118 +571,246 @@ fn assert_atomic_record_touches_output_only(
             !record
                 .properties
                 .iter()
-                .any(|update| update.object == other.crtc.into() && update.property == property)
+                .any(|update| update.object == other.crtc.into() && update.property == property),
+            "{row}: commit leaves the other output's CRTC property untouched"
         );
     }
 }
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: use layout.x/y as an output owner's source origin.
-fn output_owner_submits_and_unflips_only_its_crtc() {
-    let Some((mut fixture, mut direct)) = direct_fixture(2, P1SceneRoute::Shared, 203, 0) else {
-        return;
-    };
-    // Give output 1 its own-sized source: using its desktop x coordinate as
-    // SRC_X would address beyond this 800-pixel framebuffer.
-    let output = &fixture.events.backend.platform.outputs[1];
-    let width = output.width;
-    let height = output.height;
-    let source_xid = direct.candidate.src_pixmap_xid + 0x10;
-    let source_storage = fixture
-        .events
-        .backend
-        .platform
-        .gpu
-        .allocate_drawable_storage(width, height, 24)
-        .expect("allocate output-sized direct source");
-    direct.source_id = fixture
-        .events
-        .backend
-        .store
-        .allocate(
-            source_xid,
-            crate::kms::render::store::DrawableKind::Pixmap,
-            24,
-            false,
-            source_storage,
-        )
-        .expect("register output-sized direct source");
-    Backend::put_image(
-        &mut fixture.events.backend,
-        None,
-        source_xid,
-        24,
-        1,
-        1,
-        0,
-        0,
-        &[0, 0, 0, 0],
-    )
-    .expect("initialize output-sized direct source through Backend");
-    direct.candidate.src_pixmap_xid = source_xid;
-    direct.candidate.src_host_xid = source_xid;
-    direct.candidate.src_width = width;
-    direct.candidate.src_height = height;
-    direct.event.host_xid = source_xid;
-    fixture.extra_drawables.push(source_xid);
-    let output_crtc = fixture.events.backend.platform.outputs[1].output.crtc;
-    fixture.events.backend.pstate.scanout_m1.entries.insert(
-        (
-            direct.source_id,
-            crate::kms::render::backend::DirectScope::Output(1),
-        ),
-        crate::kms::render::backend::ScanoutM1ProbeEntry::accepted_with_shape(
-            crate::drm::modeset::DirectScanoutProbeFramebuffer::for_tests(
-                super::recording_scene::raw(0x8203),
-            ),
-            crate::drm::async_flip::AsyncShape {
-                fourcc: 0x3432_5258,
-                modifier: 0,
-                pitch: u32::from(width) * 4,
-                width: u32::from(width),
-                height: u32::from(height),
-                crtcs: vec![output_crtc],
-                direct: true,
-            },
-        ),
-    );
-    let device_fd = fd(&fixture);
-    Backend::set_cursor_hidden(&mut fixture.events.backend, true);
-    let direct_record = submit_output_owner_successor(&mut fixture, &direct, 1);
-    let direct_id = accepted_event_id(&direct_record).expect("direct submit accepted");
-    assert_atomic_record_touches_output_only(&fixture, &direct_record, 1);
-    assert_plane_source_origin(&fixture, &direct_record, 1);
-    complete_recorded_attempt(&mut fixture, device_fd, &direct_record, direct_id, 53);
-    assert!(
-        fixture.events.backend.pstate.direct.outputs[1]
-            .current
-            .is_some()
-    );
-    assert_eq!(
-        fixture.events.backend.pstate.direct.active_scopes(),
-        [crate::kms::render::backend::DirectScope::Output(1)]
-    );
+// Mutations: D01 uses layout.x/y as source origin; D08 drains Root only;
+// P14 applies the homogeneous-refresh rule to Output; D12 reads Root state
+// for every Present output query.
+fn output_direct_lifecycle() {
+    // D01/P14: output 1 keeps its nonzero desktop origin and both rows use
+    // the original mixed-refresh 75/240 Hz topology.
+    for (row, output_idx, present_id) in [
+        // P14: Output admission remains valid on the mixed-refresh topology.
+        ("output_0_zero_origin", 0, 203),
+        // D01/P14: the output-sized source starts at zero despite its layout origin.
+        ("output_1_nonzero_origin", 1, 810),
+    ] {
+        let Some((fixture, direct)) =
+            super::super::present_scanout::output_admission_fixture(output_idx, present_id)
+        else {
+            eprintln!("SKIP output_direct_lifecycle: Vulkan fixture unavailable row={row}");
+            return;
+        };
+        let mut fixture = fixture.cleanup_guard();
+        let device_fd = fd(&fixture);
+        let own_crtc = fixture.events.backend.platform.outputs[output_idx]
+            .output
+            .crtc;
+        let other_idx = 1 - output_idx;
+        let other_crtc = fixture.events.backend.platform.outputs[other_idx]
+            .output
+            .crtc;
+        assert_eq!(
+            fixture.events.backend.platform.outputs[0]
+                .output
+                .picked
+                .vrefresh,
+            75,
+            "{row}: output 0 retains the mixed-refresh control"
+        );
+        assert_eq!(
+            fixture.events.backend.platform.outputs[1]
+                .output
+                .picked
+                .vrefresh,
+            240,
+            "{row}: output 1 retains the mixed-refresh control"
+        );
+        if output_idx == 1 {
+            assert_ne!(
+                fixture.events.backend.platform.outputs[1].x, 0,
+                "{row}: output 1 begins at a nonzero desktop origin"
+            );
+        }
 
-    Backend::unmap_subwindow(&mut fixture.events.backend, None, direct.target_xid)
-        .expect("unmap direct window through Backend");
-    let start = record_count(&fixture, device_fd);
-    Backend::maybe_composite(&mut fixture.events.backend)
-        .expect("submit output owner composed unflip through scheduler");
-    let crtc = fixture.events.backend.platform.outputs[1].output.crtc;
-    let unflip = records_since(&fixture, device_fd, start)
-        .into_iter()
-        .find(|record| {
-            accepted_event_id(record).is_some()
-                && record.events.len() == 1
-                && record.events[0].crtc == crtc
-        })
-        .expect("output owner composed-unflip commit was accepted");
-    assert_atomic_record_touches_output_only(&fixture, &unflip, 1);
-    assert_eq!(
-        fixture.events.backend.pstate.direct.outputs[1].unflip_awaiting_outputs,
-        HashMap::from([(1, accepted_event_id(&unflip).unwrap())])
-    );
+        // D12: establish an output MSC through a real scheduled scene commit
+        // before asking the core Present request path to park at next-MSC.
+        let seed_start = record_count(&fixture, device_fd);
+        damage_scene_root(&mut fixture);
+        Backend::maybe_composite(&mut fixture.events.backend)
+            .expect("seed output clocks through the scheduling pass");
+        fixture.events.wait_for_submitted_gpu_work();
+        let seed_records = accepted_records(&records_since(&fixture, device_fd, seed_start));
+        assert!(
+            seed_records.iter().any(|record| {
+                record.kind == AtomicCommitKind::Scene
+                    && record.events.iter().any(|event| event.crtc == own_crtc)
+            }),
+            "{row}: the scheduler records an initial scene flip for the queried output"
+        );
+        for (index, record) in seed_records
+            .iter()
+            .filter(|record| record.kind == AtomicCommitKind::Scene)
+            .enumerate()
+        {
+            complete_recorded_attempt(
+                &mut fixture,
+                device_fd,
+                record,
+                accepted_event_id(record).expect("accepted clock seed has an ID"),
+                100 + u32::try_from(index).expect("seed index fits"),
+            );
+        }
+        assert!(
+            Backend::present_get_ust_msc(&fixture.events.backend, u32::from(own_crtc)).0 > 0,
+            "{row}: the queried output has a recorded MSC sample"
+        );
+
+        let direct_record =
+            submit_output_present_via_backend(&mut fixture, &direct, output_idx, row);
+        let direct_id = accepted_event_id(&direct_record)
+            .unwrap_or_else(|| panic!("{row}: normal Output Present has an accepted event ID"));
+        assert_atomic_record_touches_output_only(&fixture, &direct_record, output_idx, row);
+        assert_plane_source_origin(&fixture, &direct_record, output_idx, row);
+        assert!(
+            fixture.events.backend.pstate.direct.outputs[output_idx]
+                .pending
+                .is_some(),
+            "{row}: the normal Output admission owns its pending direct frame"
+        );
+
+        submit_next_msc_present_and_assert_parked(&mut fixture, &direct, output_idx, row);
+
+        let compose_start = record_count(&fixture, device_fd);
+        damage_scene_root(&mut fixture);
+        Backend::maybe_composite(&mut fixture.events.backend)
+            .expect("compose the unrelated output through the scheduling pass");
+        fixture.events.wait_for_submitted_gpu_work();
+        let concurrent_scene = accepted_records(&records_since(&fixture, device_fd, compose_start))
+            .into_iter()
+            .filter(|record| record.kind == AtomicCommitKind::Scene)
+            .collect::<Vec<_>>();
+        assert!(
+            concurrent_scene
+                .iter()
+                .any(|record| { record.events.iter().any(|event| event.crtc == other_crtc) }),
+            "{row}: the other output composes while this direct Present is pending"
+        );
+        assert!(
+            concurrent_scene
+                .iter()
+                .all(|record| record.events.iter().all(|event| event.crtc != own_crtc)),
+            "{row}: concurrent composition leaves the direct output untouched"
+        );
+        for record in &concurrent_scene {
+            complete_recorded_attempt(
+                &mut fixture,
+                device_fd,
+                record,
+                accepted_event_id(record).expect("accepted concurrent scene has an ID"),
+                110,
+            );
+        }
+
+        let clock_msc = if output_idx == 0 { 75 } else { 240 };
+        complete_recorded_attempt(
+            &mut fixture,
+            device_fd,
+            &direct_record,
+            direct_id,
+            clock_msc,
+        );
+        assert!(
+            fixture.events.backend.pstate.direct.outputs[output_idx]
+                .current
+                .is_some(),
+            "{row}: the direct frame is current after its accepted page flip"
+        );
+        assert_eq!(
+            fixture.events.backend.pstate.direct.active_scopes(),
+            [crate::kms::render::backend::DirectScope::Output(output_idx)],
+            "{row}: only the selected output owns direct scanout"
+        );
+
+        Backend::unmap_subwindow(&mut fixture.events.backend, None, direct.target_xid)
+            .expect("unmap the direct target through Backend");
+        let replacement_start = record_count(&fixture, device_fd);
+        Backend::maybe_composite(&mut fixture.events.backend)
+            .expect("submit the output's composed replacement through the scheduler");
+        fixture.events.wait_for_submitted_gpu_work();
+        let replacement = accepted_records(&records_since(&fixture, device_fd, replacement_start))
+            .into_iter()
+            .find(|record| record.events.len() == 1 && record.events[0].crtc == own_crtc)
+            .unwrap_or_else(|| panic!("{row}: the output's composed replacement is accepted"));
+        assert_atomic_record_touches_output_only(&fixture, &replacement, output_idx, row);
+        let replacement_id = accepted_event_id(&replacement)
+            .unwrap_or_else(|| panic!("{row}: the composed replacement has an accepted ID"));
+        assert_eq!(
+            fixture.events.backend.pstate.direct.outputs[output_idx].unflip_awaiting_outputs,
+            HashMap::from([(output_idx, replacement_id)]),
+            "{row}: the direct owner remains until its output replacement retires"
+        );
+        complete_recorded_attempt(
+            &mut fixture,
+            device_fd,
+            &replacement,
+            replacement_id,
+            clock_msc + 1,
+        );
+        assert!(
+            !fixture.events.backend.pstate.direct.outputs[output_idx].active(),
+            "{row}: the output owner stops after replacement retirement"
+        );
+        assert!(
+            fixture.events.backend.present_source_pins.is_empty(),
+            "{row}: replacement retirement releases direct source pins"
+        );
+        assert!(
+            fixture
+                .events
+                .backend
+                .pstate
+                .direct
+                .active_scopes()
+                .is_empty(),
+            "{row}: no direct owner remains after replacement retirement"
+        );
+
+        // D08: both notifications remain available after the output owner
+        // stops and each stream drains exactly once.
+        let completed = Backend::drain_completed_present_events(&mut fixture.events.backend);
+        assert_eq!(
+            completed
+                .iter()
+                .map(|event| event.present_id)
+                .collect::<Vec<_>>(),
+            [direct.candidate.present_id],
+            "{row}: output Complete survives owner stop and drains once"
+        );
+        assert_eq!(
+            completed[0].completion_clock,
+            Some(yserver_core::backend::PresentClockSample {
+                msc: u64::from(clock_msc),
+                ust: u64::from(clock_msc) * 10_000,
+                source: yserver_core::backend::PresentClockSource::PageFlip,
+            }),
+            "{row}: CompleteNotify carries the selected output's page-flip clock"
+        );
+        let idled = Backend::drain_retired_present_idle_events(&mut fixture.events.backend);
+        assert_eq!(
+            idled
+                .iter()
+                .map(|event| event.present_id)
+                .collect::<Vec<_>>(),
+            [direct.candidate.present_id],
+            "{row}: output Idle survives owner stop and drains once"
+        );
+        assert!(
+            Backend::drain_completed_present_events(&mut fixture.events.backend).is_empty(),
+            "{row}: output Complete does not drain twice"
+        );
+        assert!(
+            Backend::drain_retired_present_idle_events(&mut fixture.events.backend).is_empty(),
+            "{row}: output Idle does not drain twice"
+        );
+        fixture.finish_after_normal_drain();
+    }
 }
 
 pub(crate) fn damage_scene_root(fixture: &mut RecordingSceneFixture) {
@@ -745,6 +837,7 @@ fn submit_next_msc_present_and_assert_parked(
     fixture: &mut RecordingSceneFixture,
     direct: &DirectPresentSetup,
     output_idx: usize,
+    row: &str,
 ) {
     use std::sync::{Arc, Mutex, atomic::AtomicU16};
     use yserver_core::{
@@ -766,7 +859,10 @@ fn submit_next_msc_present_and_assert_parked(
     let layout = &fixture.events.backend.platform.outputs[output_idx];
     let crtc_id = u32::from(layout.output.crtc);
     let current_msc = Backend::present_get_ust_msc(&fixture.events.backend, crtc_id).0;
-    assert!(current_msc > 0, "the output has a recorded MSC sample");
+    assert!(
+        current_msc > 0,
+        "{row}: the output has a recorded MSC sample"
+    );
 
     let state = &mut fixture.events.state;
     let (writer, _peer) = Transport::pair().expect("Present test client transport");
@@ -875,16 +971,28 @@ fn submit_next_msc_present_and_assert_parked(
     .expect("dispatch next-MSC Present through the core request path");
 
     let present_id = {
-        let (present_id, pending) = state
-            .present_pending_exec
-            .iter()
-            .next()
-            .expect("next-MSC Present parks while its output flip is pending");
-        assert_eq!(state.present_pending_exec.len(), 1);
-        assert_eq!(pending.pending.crtc_id, crtc_id);
-        assert_eq!(pending.pending.effective_target_msc, Some(current_msc + 1));
-        assert!(pending.source_ready);
-        assert_eq!(pending.wait_id, None);
+        let (present_id, pending) = state.present_pending_exec.iter().next().unwrap_or_else(|| {
+            panic!("{row}: next-MSC Present parks while its output flip is pending")
+        });
+        assert_eq!(
+            state.present_pending_exec.len(),
+            1,
+            "{row}: only this request is parked"
+        );
+        assert_eq!(
+            pending.pending.crtc_id, crtc_id,
+            "{row}: parked request uses the owned CRTC"
+        );
+        assert_eq!(
+            pending.pending.effective_target_msc,
+            Some(current_msc + 1),
+            "{row}: parked request targets the next sampled MSC"
+        );
+        assert!(pending.source_ready, "{row}: parked source is ready");
+        assert_eq!(
+            pending.wait_id, None,
+            "{row}: parking is due to output work, not source wait"
+        );
         *present_id
     };
 
@@ -1077,174 +1185,174 @@ fn queued_successor_not_blocked_by_scene_flip_on_other_output() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: route retirement to the first active owner instead of scope_for_output.
-fn two_output_owners_retire_independently() {
-    let Some(mut fixture) = RecordingSceneFixture::with_route(2, P1SceneRoute::Shared)
-        .expect("direct recording scene fixture construction")
-    else {
-        return;
-    };
-    let first = fixture.install_direct_output_present(0, 205, 0);
-    let second = fixture.install_direct_output_present(1, 206, 0);
-    let device_fd = fd(&fixture);
-    Backend::set_cursor_hidden(&mut fixture.events.backend, true);
-    let (first_record, second_record) =
-        submit_two_output_owner_successors(&mut fixture, &first, &second);
-    assert_atomic_record_touches_output_only(&fixture, &first_record, 0);
-    assert_atomic_record_touches_output_only(&fixture, &second_record, 1);
-    let first_id = accepted_event_id(&first_record).expect("first output accepted ID");
-    let second_id = accepted_event_id(&second_record).expect("second output accepted ID");
-    assert_ne!(first_id, second_id);
+// Mutations: D04 retires the first active owner instead of the output-selected
+// owner; D05 unflips the first owner when the second enters.
+fn independent_output_owners() {
+    // D04: the second output retires first. D05: reverse entry and retirement
+    // order, with the original per-CRTC MSC samples retained.
+    for (row, present_ids, entry_order, retirement_order, clocks) in [
+        // D04: retirement is selected by output even when Output(1) retires first.
+        (
+            "retire_output_1_first",
+            [205, 206],
+            [0, 1],
+            [1, 0],
+            [71, 61],
+        ),
+        // D05: entering Output(0) second leaves the first owner active.
+        (
+            "reverse_entry_and_retirement",
+            [211, 212],
+            [1, 0],
+            [0, 1],
+            [72, 61],
+        ),
+    ] {
+        let Some(mut fixture) = RecordingSceneFixture::with_route(2, P1SceneRoute::Shared)
+            .expect("two-output recording scene fixture construction")
+        else {
+            eprintln!("SKIP independent_output_owners: Vulkan fixture unavailable row={row}");
+            return;
+        };
+        fixture.events.backend.platform.outputs[0]
+            .output
+            .picked
+            .vrefresh = 75;
+        fixture.events.backend.platform.outputs[1]
+            .output
+            .picked
+            .vrefresh = 240;
+        let directs = [
+            fixture.install_direct_output_present(0, present_ids[0], 0),
+            fixture.install_direct_output_present(1, present_ids[1], 0),
+        ];
+        let device_fd = fd(&fixture);
+        let mut records: [Option<AtomicCommitRecord>; 2] = [None, None];
+        let mut accepted_ids = [None, None];
 
-    complete_recorded_attempt(&mut fixture, device_fd, &second_record, second_id, 61);
-    let second_completed = Backend::drain_completed_present_events(&mut fixture.events.backend);
-    assert_eq!(
-        second_completed
-            .iter()
-            .map(|event| event.present_id)
-            .collect::<Vec<_>>(),
-        [second.candidate.present_id]
-    );
-    assert_eq!(
-        second_completed[0].completion_clock,
-        Some(yserver_core::backend::PresentClockSample {
-            msc: 61,
-            ust: 610_000,
-            source: yserver_core::backend::PresentClockSource::PageFlip,
-        })
-    );
-    assert!(
-        fixture.events.backend.pstate.direct.outputs[0]
-            .pending
-            .is_some()
-    );
-    assert!(
-        fixture.events.backend.pstate.direct.outputs[1]
-            .current
-            .is_some()
-    );
-    complete_recorded_attempt(&mut fixture, device_fd, &second_record, second_id, 62);
-    assert!(Backend::drain_completed_present_events(&mut fixture.events.backend).is_empty());
+        for (entry_count, output_idx) in entry_order.into_iter().enumerate() {
+            let record = submit_output_present_via_backend(
+                &mut fixture,
+                &directs[output_idx],
+                output_idx,
+                row,
+            );
+            let id = accepted_event_id(&record)
+                .unwrap_or_else(|| panic!("{row}: Output({output_idx}) commit has an accepted ID"));
+            assert_atomic_record_touches_output_only(&fixture, &record, output_idx, row);
+            records[output_idx] = Some(record);
+            accepted_ids[output_idx] = Some(id);
+            assert_eq!(
+                fixture.events.backend.present_source_pins.len(),
+                2 * (entry_count + 1),
+                "{row}: each admitted owner retains its source and fallback pins"
+            );
+        }
 
-    complete_recorded_attempt(&mut fixture, device_fd, &first_record, first_id, 71);
-    let first_completed = Backend::drain_completed_present_events(&mut fixture.events.backend);
-    assert_eq!(
-        first_completed
-            .iter()
-            .map(|event| event.present_id)
-            .collect::<Vec<_>>(),
-        [first.candidate.present_id]
-    );
-    assert_eq!(
-        first_completed[0].completion_clock,
-        Some(yserver_core::backend::PresentClockSample {
-            msc: 71,
-            ust: 710_000,
-            source: yserver_core::backend::PresentClockSource::PageFlip,
-        })
-    );
-    assert!(
-        fixture.events.backend.pstate.direct.outputs[0]
-            .current
-            .is_some()
-    );
-    assert!(
-        fixture.events.backend.pstate.direct.outputs[1]
-            .current
-            .is_some()
-    );
-}
-
-#[test]
-#[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: entering a second Output owner requests an unflip for the first.
-fn two_output_owners_enter_and_complete_independently() {
-    let Some(mut fixture) = RecordingSceneFixture::with_route(2, P1SceneRoute::Shared)
-        .expect("two-output recording scene fixture construction")
-    else {
-        eprintln!(
-            "SKIP two_output_owners_enter_and_complete_independently: Vulkan fixture unavailable"
+        assert_ne!(
+            accepted_ids[0], accepted_ids[1],
+            "{row}: each output has an independent accepted commit identity"
         );
-        return;
-    };
-    fixture.events.backend.platform.outputs[0]
-        .output
-        .picked
-        .vrefresh = 75;
-    fixture.events.backend.platform.outputs[1]
-        .output
-        .picked
-        .vrefresh = 240;
-    let first = fixture.install_direct_output_present(0, 211, 0);
-    let second = fixture.install_direct_output_present(1, 212, 0);
-    Backend::set_cursor_hidden(&mut fixture.events.backend, true);
-    let device_fd = fd(&fixture);
+        assert_eq!(
+            fixture.events.backend.pstate.direct.active_scopes(),
+            [
+                crate::kms::render::backend::DirectScope::Output(0),
+                crate::kms::render::backend::DirectScope::Output(1),
+            ],
+            "{row}: both Output owners remain active after normal admission"
+        );
+        for (output_idx, owner) in fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .outputs
+            .iter()
+            .enumerate()
+        {
+            assert!(
+                !owner.unflip_requested,
+                "{row}: Output({output_idx}) is not revoked by the other admission"
+            );
+        }
+        assert_eq!(
+            fixture.events.backend.present_source_pins.len(),
+            4,
+            "{row}: both active owners retain four source/fallback pins"
+        );
 
-    let first_record = submit_output_present_via_backend(&mut fixture, &first, 0);
-    let first_id = accepted_event_id(&first_record).expect("first direct commit accepted");
-    let second_record = submit_output_present_via_backend(&mut fixture, &second, 1);
-    let second_id = accepted_event_id(&second_record).expect("second direct commit accepted");
-    assert_atomic_record_touches_output_only(&fixture, &first_record, 0);
-    assert_atomic_record_touches_output_only(&fixture, &second_record, 1);
-    assert_ne!(first_id, second_id);
-    assert_eq!(
-        fixture.events.backend.pstate.direct.active_scopes(),
-        [
-            crate::kms::render::backend::DirectScope::Output(0),
-            crate::kms::render::backend::DirectScope::Output(1),
-        ]
-    );
-    assert!(
-        !fixture.events.backend.pstate.direct.outputs[0].unflip_requested,
-        "entering Output(1) leaves Output(0) current"
-    );
+        for (retired_count, output_idx) in retirement_order.into_iter().enumerate() {
+            let record = records[output_idx]
+                .as_ref()
+                .expect("each output has its own normal admission record");
+            let id = accepted_ids[output_idx].expect("accepted ID is stored per output");
+            let frame = clocks[output_idx];
+            complete_recorded_attempt(&mut fixture, device_fd, record, id, frame);
+            let completed = Backend::drain_completed_present_events(&mut fixture.events.backend);
+            assert_eq!(
+                completed
+                    .iter()
+                    .map(|event| event.present_id)
+                    .collect::<Vec<_>>(),
+                [directs[output_idx].candidate.present_id],
+                "{row}: Output({output_idx}) completion is independent"
+            );
+            assert_eq!(
+                completed[0].completion_clock,
+                Some(yserver_core::backend::PresentClockSample {
+                    msc: u64::from(frame),
+                    ust: u64::from(frame) * 10_000,
+                    source: yserver_core::backend::PresentClockSource::PageFlip,
+                }),
+                "{row}: Output({output_idx}) uses its own CRTC clock"
+            );
+            assert!(
+                fixture.events.backend.pstate.direct.outputs[output_idx]
+                    .current
+                    .is_some(),
+                "{row}: Output({output_idx}) becomes current on its own event"
+            );
+            assert!(
+                fixture.events.backend.pstate.direct.outputs[output_idx]
+                    .pending
+                    .is_none(),
+                "{row}: Output({output_idx}) pending frame retires"
+            );
+            assert_eq!(
+                fixture.events.backend.present_source_pins.len(),
+                4,
+                "{row}: retiring one owner leaves both owners' pins retained"
+            );
 
-    complete_recorded_attempt(&mut fixture, device_fd, &second_record, second_id, 61);
-    let second_completed = Backend::drain_completed_present_events(&mut fixture.events.backend);
-    assert_eq!(second_completed.len(), 1);
-    assert_eq!(second_completed[0].present_id, second.candidate.present_id);
-    assert_eq!(
-        second_completed[0].completion_clock,
-        Some(yserver_core::backend::PresentClockSample {
-            msc: 61,
-            ust: 610_000,
-            source: yserver_core::backend::PresentClockSource::PageFlip,
-        }),
-        "Output(1) completes in its own CRTC clock domain"
-    );
-    assert!(
-        fixture.events.backend.pstate.direct.outputs[0]
-            .pending
-            .is_some(),
-        "Output(1)'s page flip does not retire Output(0)"
-    );
-
-    complete_recorded_attempt(&mut fixture, device_fd, &first_record, first_id, 72);
-    let first_completed = Backend::drain_completed_present_events(&mut fixture.events.backend);
-    assert_eq!(first_completed.len(), 1);
-    assert_eq!(first_completed[0].present_id, first.candidate.present_id);
-    assert_eq!(
-        first_completed[0].completion_clock,
-        Some(yserver_core::backend::PresentClockSample {
-            msc: 72,
-            ust: 720_000,
-            source: yserver_core::backend::PresentClockSource::PageFlip,
-        }),
-        "Output(0) completes in its own CRTC clock domain"
-    );
-    assert!(Backend::drain_completed_present_events(&mut fixture.events.backend).is_empty());
-    assert_eq!(fixture.events.backend.present_source_pins.len(), 4);
-    assert!(
-        fixture.events.backend.pstate.direct.outputs[0]
-            .current
-            .is_some()
-    );
-    assert!(
-        fixture.events.backend.pstate.direct.outputs[1]
-            .current
-            .is_some()
-    );
-    fixture.finish();
+            complete_recorded_attempt(&mut fixture, device_fd, record, id, frame + 1);
+            assert!(
+                Backend::drain_completed_present_events(&mut fixture.events.backend).is_empty(),
+                "{row}: duplicate Output({output_idx}) event produces no second completion"
+            );
+            let other_idx = 1 - output_idx;
+            if retired_count == 0 {
+                assert!(
+                    fixture.events.backend.pstate.direct.outputs[other_idx]
+                        .pending
+                        .is_some(),
+                    "{row}: Output({output_idx}) event leaves Output({other_idx}) pending"
+                );
+            }
+        }
+        assert!(
+            fixture.events.backend.pstate.direct.outputs[0]
+                .current
+                .is_some(),
+            "{row}: Output(0) remains current after both independent events"
+        );
+        assert!(
+            fixture.events.backend.pstate.direct.outputs[1]
+                .current
+                .is_some(),
+            "{row}: Output(1) remains current after both independent events"
+        );
+        fixture.finish();
+    }
 }
 
 #[test]
@@ -1332,9 +1440,15 @@ fn root_to_output_transition_unflips_once() {
     assert!(Backend::drain_retired_present_idle_events(&mut fixture.events.backend).is_empty());
 
     compose_and_complete_outputs(&mut fixture, device_fd, &[0, 1]);
-    let output_record = submit_output_present_via_backend(&mut fixture, &output, 1);
+    let output_record =
+        submit_output_present_via_backend(&mut fixture, &output, 1, "root_to_output_transition");
     let output_id = accepted_event_id(&output_record).expect("Output(1) commit accepted");
-    assert_atomic_record_touches_output_only(&fixture, &output_record, 1);
+    assert_atomic_record_touches_output_only(
+        &fixture,
+        &output_record,
+        1,
+        "root-to-output transition",
+    );
     assert_eq!(
         fixture.events.backend.pstate.direct.active_scopes(),
         [crate::kms::render::backend::DirectScope::Output(1)]
@@ -1371,8 +1485,10 @@ fn output_to_root_transition_unflips_every_output_owner() {
     let second = fixture.install_direct_output_present(1, 216, 0);
     Backend::set_cursor_hidden(&mut fixture.events.backend, true);
     let device_fd = fd(&fixture);
-    let first_record = submit_output_present_via_backend(&mut fixture, &first, 0);
-    let second_record = submit_output_present_via_backend(&mut fixture, &second, 1);
+    let first_record =
+        submit_output_present_via_backend(&mut fixture, &first, 0, "output_to_root_transition_0");
+    let second_record =
+        submit_output_present_via_backend(&mut fixture, &second, 1, "output_to_root_transition_1");
     let first_id = accepted_event_id(&first_record).expect("Output(0) commit accepted");
     let second_id = accepted_event_id(&second_record).expect("Output(1) commit accepted");
     complete_recorded_attempt(&mut fixture, device_fd, &first_record, first_id, 75);
@@ -1424,8 +1540,8 @@ fn output_to_root_transition_unflips_every_output_owner() {
         })
         .expect("Output(1) composed replacement accepted")
         .clone();
-    assert_atomic_record_touches_output_only(&fixture, &unflip0, 0);
-    assert_atomic_record_touches_output_only(&fixture, &unflip1, 1);
+    assert_atomic_record_touches_output_only(&fixture, &unflip0, 0, "output 0 root replacement");
+    assert_atomic_record_touches_output_only(&fixture, &unflip1, 1, "output 1 root replacement");
     complete_recorded_attempt(
         &mut fixture,
         device_fd,
@@ -1477,128 +1593,6 @@ fn output_to_root_transition_unflips_every_output_owner() {
         [crate::kms::render::backend::DirectScope::Root]
     );
     fixture.finish();
-}
-
-#[test]
-#[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: drain the root slot only.
-fn stopped_output_owner_notifications_are_drained() {
-    let Some((mut fixture, direct)) = direct_fixture(2, P1SceneRoute::Shared, 207, 0) else {
-        return;
-    };
-    let device_fd = fd(&fixture);
-    Backend::set_cursor_hidden(&mut fixture.events.backend, true);
-    let direct_record = submit_output_owner_successor(&mut fixture, &direct, 1);
-    let direct_id = accepted_event_id(&direct_record).expect("direct submit accepted");
-    complete_recorded_attempt(&mut fixture, device_fd, &direct_record, direct_id, 73);
-    Backend::unmap_subwindow(&mut fixture.events.backend, None, direct.target_xid)
-        .expect("unmap direct window through Backend");
-    let start = record_count(&fixture, device_fd);
-    Backend::maybe_composite(&mut fixture.events.backend)
-        .expect("submit composed unflip through Backend");
-    let crtc = fixture.events.backend.platform.outputs[1].output.crtc;
-    let unflip = records_since(&fixture, device_fd, start)
-        .into_iter()
-        .find(|record| {
-            accepted_event_id(record).is_some()
-                && record.events.len() == 1
-                && record.events[0].crtc == crtc
-        })
-        .expect("output unflip accepted");
-    complete_recorded_attempt(
-        &mut fixture,
-        device_fd,
-        &unflip,
-        accepted_event_id(&unflip).unwrap(),
-        74,
-    );
-
-    let completed = Backend::drain_completed_present_events(&mut fixture.events.backend);
-    assert_eq!(
-        completed
-            .iter()
-            .map(|event| event.present_id)
-            .collect::<Vec<_>>(),
-        [direct.candidate.present_id]
-    );
-    let idled = Backend::drain_retired_present_idle_events(&mut fixture.events.backend);
-    assert_eq!(
-        idled
-            .iter()
-            .map(|event| event.present_id)
-            .collect::<Vec<_>>(),
-        [direct.candidate.present_id]
-    );
-    assert!(Backend::drain_completed_present_events(&mut fixture.events.backend).is_empty());
-    assert!(Backend::drain_retired_present_idle_events(&mut fixture.events.backend).is_empty());
-    assert!(!fixture.events.backend.pstate.direct.outputs[1].active());
-    assert!(fixture.events.backend.present_source_pins.is_empty());
-}
-
-#[test]
-#[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: the VT release stop-all path stops only the root slot.
-fn global_teardown_unflips_every_output_owner() {
-    use yserver_core::core_loop::input_inventory::InputInventory;
-
-    let Some(mut fixture) = RecordingSceneFixture::with_route(2, P1SceneRoute::Shared)
-        .expect("direct recording scene fixture construction")
-    else {
-        return;
-    };
-    let first = fixture.install_direct_output_present(0, 209, 0);
-    let second = fixture.install_direct_output_present(1, 210, 0);
-    let device_fd = fd(&fixture);
-    Backend::set_cursor_hidden(&mut fixture.events.backend, true);
-    let (first_record, second_record) =
-        submit_two_output_owner_successors(&mut fixture, &first, &second);
-    let first_id = accepted_event_id(&first_record).expect("first output accepted ID");
-    let second_id = accepted_event_id(&second_record).expect("second output accepted ID");
-    complete_recorded_attempt(&mut fixture, device_fd, &first_record, first_id, 81);
-    complete_recorded_attempt(&mut fixture, device_fd, &second_record, second_id, 82);
-    let completed = Backend::drain_completed_present_events(&mut fixture.events.backend);
-    assert_eq!(
-        completed
-            .iter()
-            .map(|event| event.present_id)
-            .collect::<Vec<_>>(),
-        [first.candidate.present_id, second.candidate.present_id]
-    );
-    assert_eq!(
-        fixture.events.backend.pstate.direct.active_scopes(),
-        [
-            crate::kms::render::backend::DirectScope::Output(0),
-            crate::kms::render::backend::DirectScope::Output(1),
-        ]
-    );
-
-    super::install_recording_vt_io(&mut fixture);
-    Backend::begin_vt_release(&mut fixture.events.backend);
-    Backend::finish_vt_release(
-        &mut fixture.events.backend,
-        &mut fixture.events.state,
-        &InputInventory::default(),
-    );
-    assert!(
-        fixture
-            .events
-            .backend
-            .pstate
-            .direct
-            .active_scopes()
-            .is_empty()
-    );
-    assert!(fixture.events.backend.present_source_pins.is_empty());
-    assert!(Backend::drain_completed_present_events(&mut fixture.events.backend).is_empty());
-    let idled = Backend::drain_retired_present_idle_events(&mut fixture.events.backend);
-    assert_eq!(
-        idled
-            .iter()
-            .map(|event| event.present_id)
-            .collect::<Vec<_>>(),
-        [first.candidate.present_id, second.candidate.present_id]
-    );
-    assert!(Backend::drain_retired_present_idle_events(&mut fixture.events.backend).is_empty());
 }
 
 pub(super) fn complete_direct_initial(
@@ -2983,7 +2977,7 @@ fn dispatch_resized_root_present(
     .expect("PresentPixmap through the core request dispatcher");
 }
 
-fn assert_live_resize_m1_owner_is_held(scenario: &ResizePendingUnflip) {
+fn assert_live_resize_m1_owner_is_held(scenario: &ResizePendingUnflip, row: &str) {
     let backend = &scenario.fixture.events.backend;
     let entry = backend
         .pstate
@@ -2993,30 +2987,34 @@ fn assert_live_resize_m1_owner_is_held(scenario: &ResizePendingUnflip) {
             scenario.direct_source_id,
             crate::kms::render::backend::DirectScope::Root,
         ))
-        .expect("live direct source retains its M1 cache entry");
+        .unwrap_or_else(|| panic!("{row}: live direct source retains its M1 cache entry"));
     assert!(
         entry.framebuffer().is_some(),
-        "the live source retains its M1 framebuffer owner"
+        "{row}: the live source retains its M1 framebuffer owner"
     );
     assert_eq!(
         backend.pstate.scanout_m1.topology_signature, scenario.old_topology,
-        "the live direct owner keeps the old M1 topology signature"
+        "{row}: the live direct owner keeps the old M1 topology signature"
     );
     assert!(
         !backend.pstate.scanout_m1.entries.contains_key(&(
             scenario.new_source_id,
             crate::kms::render::backend::DirectScope::Root
         )),
-        "the changed-topology candidate is deferred while an owner is active"
+        "{row}: the changed-topology candidate is deferred while an owner is active"
     );
-    assert!(backend.pstate.direct.root().active());
+    assert!(
+        backend.pstate.direct.root().active(),
+        "{row}: the direct owner remains active"
+    );
     assert!(
         backend
             .pstate
             .direct
             .root()
             .unflip_awaiting_outputs
-            .contains_key(&0)
+            .contains_key(&0),
+        "{row}: the old owner awaits its composed replacement"
     );
     assert_eq!(
         backend
@@ -3027,117 +3025,120 @@ fn assert_live_resize_m1_owner_is_held(scenario: &ResizePendingUnflip) {
             .as_ref()
             .map(|frame| frame.source_id),
         Some(scenario.direct_source_id),
-        "the old source remains current until replacement retirement"
+        "{row}: the old source remains current until replacement retirement"
     );
 }
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-fn resize_keeps_live_direct_framebuffer_until_unflip_retires() {
-    // Mutation: remove the active-owner check before clearing the cache on a signature change.
-    let Some(mut scenario) = resize_root_direct_present_before_unflip() else {
-        eprintln!(
-            "SKIP resize_keeps_live_direct_framebuffer_until_unflip_retires: Vulkan fixture unavailable"
-        );
-        return;
-    };
-    assert_live_resize_m1_owner_is_held(&scenario);
+// Mutations: D10 clears the M1 cache on a signature change despite an active
+// owner; D11 never clears stale M1 entries after owners retire.
+fn m1_cache_owner_lifetime() {
+    // D10 checks the live-owner checkpoint. D11 continues the same fresh
+    // resize fixture to the next eligible Present after retirement.
+    for (row, observe_after_retirement) in [
+        // D10: preserve the framebuffer while the live direct owner exists.
+        ("live_owner_checkpoint", false),
+        // D11: evict the stale signature entry on the next observation.
+        ("post_retirement_reprobe", true),
+    ] {
+        let Some(mut scenario) = resize_root_direct_present_before_unflip() else {
+            eprintln!("SKIP m1_cache_owner_lifetime: Vulkan fixture unavailable row={row}");
+            return;
+        };
+        assert_live_resize_m1_owner_is_held(&scenario, row);
 
-    complete_recorded_attempt(
-        &mut scenario.fixture,
-        scenario.device_fd,
-        &scenario.replacement,
-        scenario.replacement_id,
-        90,
-    );
-    let direct = scenario.fixture.events.backend.pstate.direct.root();
-    assert!(direct.unflip_awaiting_outputs.is_empty());
-    assert!(!direct.active());
-    assert!(direct.current.is_none());
-    assert!(
-        scenario
-            .fixture
-            .events
-            .backend
-            .pstate
-            .scanout_m1
-            .entries
-            .contains_key(&(
+        complete_recorded_attempt(
+            &mut scenario.fixture,
+            scenario.device_fd,
+            &scenario.replacement,
+            scenario.replacement_id,
+            90,
+        );
+        let backend = &scenario.fixture.events.backend;
+        let direct = backend.pstate.direct.root();
+        assert!(
+            direct.unflip_awaiting_outputs.is_empty(),
+            "{row}: replacement retirement clears the awaiting output"
+        );
+        assert!(
+            !direct.active(),
+            "{row}: replacement retirement stops the direct owner"
+        );
+        assert!(
+            direct.current.is_none(),
+            "{row}: replacement retirement releases the current frame"
+        );
+        assert!(
+            backend.pstate.scanout_m1.entries.contains_key(&(
                 scenario.direct_source_id,
                 crate::kms::render::backend::DirectScope::Root
-            ))
-    );
-    drain_present_notifications(&mut scenario.fixture, &[], &[0x711]);
-    scenario.fixture.finish_after_normal_drain();
+            )),
+            "{row}: the old M1 entry survives replacement retirement"
+        );
+        let idled =
+            Backend::drain_retired_present_idle_events(&mut scenario.fixture.events.backend);
+        assert_eq!(
+            idled
+                .iter()
+                .map(|event| event.present_id)
+                .collect::<Vec<_>>(),
+            [0x711],
+            "{row}: the retired direct Present idles once"
+        );
+        assert!(
+            Backend::drain_retired_present_idle_events(&mut scenario.fixture.events.backend)
+                .is_empty(),
+            "{row}: the direct Present Idle event does not drain twice"
+        );
+
+        if observe_after_retirement {
+            dispatch_resized_root_present(&mut scenario.fixture, 3, 3);
+            let backend = &mut scenario.fixture.events.backend;
+            assert_ne!(
+                backend.pstate.scanout_m1.topology_signature, scenario.old_topology,
+                "{row}: the next eligible Present records the resized topology signature"
+            );
+            assert!(
+                !backend.pstate.scanout_m1.entries.contains_key(&(
+                    scenario.direct_source_id,
+                    crate::kms::render::backend::DirectScope::Root
+                )),
+                "{row}: the next observation removes the stale old-source cache entry"
+            );
+            let new_entry = backend
+                .pstate
+                .scanout_m1
+                .entries
+                .get(&(
+                    scenario.new_source_id,
+                    crate::kms::render::backend::DirectScope::Root,
+                ))
+                .unwrap_or_else(|| {
+                    panic!("{row}: the resized source is probed under the new signature")
+                });
+            assert!(
+                new_entry.framebuffer().is_none(),
+                "{row}: the newly observed source has no accepted M1 framebuffer yet"
+            );
+            let copied_present = Backend::drain_completed_present_events(backend);
+            assert_eq!(
+                copied_present.len(),
+                1,
+                "{row}: resized Copy Present completes once"
+            );
+            assert_eq!(
+                copied_present[0].host_xid, 0x0071_1002,
+                "{row}: Copy completion belongs to the resized source"
+            );
+            assert!(
+                Backend::drain_retired_present_idle_events(backend).is_empty(),
+                "{row}: Copy completion does not duplicate the retired direct Idle"
+            );
+        }
+        scenario.fixture.finish_after_normal_drain();
+    }
 }
-
-#[test]
-#[ignore = "needs live Vulkan ICD (lavapipe)"]
-fn stale_m1_cache_clears_after_owners_retire() {
-    // Mutation: never clear stale M1 entries when the topology signature changes.
-    let Some(mut scenario) = resize_root_direct_present_before_unflip() else {
-        eprintln!("SKIP stale_m1_cache_clears_after_owners_retire: Vulkan fixture unavailable");
-        return;
-    };
-    assert_live_resize_m1_owner_is_held(&scenario);
-
-    complete_recorded_attempt(
-        &mut scenario.fixture,
-        scenario.device_fd,
-        &scenario.replacement,
-        scenario.replacement_id,
-        90,
-    );
-    assert!(
-        !scenario
-            .fixture
-            .events
-            .backend
-            .pstate
-            .direct
-            .root()
-            .active()
-    );
-    assert!(
-        scenario
-            .fixture
-            .events
-            .backend
-            .pstate
-            .direct
-            .root()
-            .current
-            .is_none()
-    );
-    drain_present_notifications(&mut scenario.fixture, &[], &[0x711]);
-
-    dispatch_resized_root_present(&mut scenario.fixture, 3, 3);
-    let backend = &mut scenario.fixture.events.backend;
-    assert_ne!(
-        backend.pstate.scanout_m1.topology_signature, scenario.old_topology,
-        "the next eligible Present records the resized topology signature"
-    );
-    assert!(!backend.pstate.scanout_m1.entries.contains_key(&(
-        scenario.direct_source_id,
-        crate::kms::render::backend::DirectScope::Root
-    )));
-    let new_entry = backend
-        .pstate
-        .scanout_m1
-        .entries
-        .get(&(
-            scenario.new_source_id,
-            crate::kms::render::backend::DirectScope::Root,
-        ))
-        .expect("the next eligible Present is probed under the new signature");
-    assert!(new_entry.framebuffer().is_none());
-    let copied_present = Backend::drain_completed_present_events(backend);
-    assert_eq!(copied_present.len(), 1);
-    assert_eq!(copied_present[0].host_xid, 0x0071_1002);
-    assert!(Backend::drain_retired_present_idle_events(backend).is_empty());
-    scenario.fixture.finish_after_normal_drain();
-}
-
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: omit post-tick registration of an already-signalled copied replacement accepted inside scene.tick.
@@ -3452,184 +3453,6 @@ fn p1_degraded_copied_unflip_has_no_id_before_sink_acceptance() {
             .iter()
             .all(|row| { !(row.contains("phase=Free") && row.contains("ForeignPendingKms")) })
     );
-    drain_present_notifications(&mut fixture, &[], &[direct.candidate.present_id]);
-    fixture.finish_after_normal_drain();
-}
-
-#[test]
-#[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: read Root's pending/replacement fields for every output query.
-fn present_in_flight_reads_the_output_owner() {
-    let Some(fixture) = RecordingSceneFixture::with_route(2, P1SceneRoute::Shared)
-        .expect("Present in-flight recording fixture construction")
-    else {
-        eprintln!("SKIP present_in_flight_reads_the_output_owner: Vulkan fixture unavailable");
-        return;
-    };
-    let mut fixture = fixture.cleanup_guard();
-    let direct = fixture.install_direct_output_present(1, 216, 0);
-    let device_fd = fd(&fixture);
-    let output0_crtc = fixture.events.backend.platform.outputs[0].output.crtc;
-    let output1_crtc = fixture.events.backend.platform.outputs[1].output.crtc;
-
-    Backend::set_cursor_hidden(&mut fixture.events.backend, true);
-    let seed_start = record_count(&fixture, device_fd);
-    damage_scene_root(&mut fixture);
-    Backend::maybe_composite(&mut fixture.events.backend)
-        .expect("seed the per-output Present clocks through the scheduler");
-    fixture.events.wait_for_submitted_gpu_work();
-    let seed_records = accepted_records(&records_since(&fixture, device_fd, seed_start));
-    assert!(seed_records.iter().any(|record| {
-        record.kind == AtomicCommitKind::Scene
-            && record.events.iter().any(|event| event.crtc == output1_crtc)
-    }));
-    for (index, record) in seed_records
-        .iter()
-        .filter(|record| record.kind == AtomicCommitKind::Scene)
-        .enumerate()
-    {
-        let frame = u32::try_from(80 + index).expect("seed frame fits");
-        complete_recorded_attempt(
-            &mut fixture,
-            device_fd,
-            record,
-            accepted_event_id(record).expect("accepted scene seed has an ID"),
-            frame,
-        );
-    }
-    assert!(
-        Backend::present_get_ust_msc(&fixture.events.backend, u32::from(output1_crtc)).0 > 0,
-        "the seed commit records output 1's general MSC clock"
-    );
-
-    let submission_start = record_count(&fixture, device_fd);
-    let direct_record = submit_output_present_via_backend(&mut fixture, &direct, 1);
-    submit_next_msc_present_and_assert_parked(&mut fixture, &direct, 1);
-    damage_scene_root(&mut fixture);
-    Backend::maybe_composite(&mut fixture.events.backend)
-        .expect("compose output 0 while Output(1)'s Present flip is pending");
-    fixture.events.wait_for_submitted_gpu_work();
-    for record in accepted_records(&records_since(&fixture, device_fd, submission_start)) {
-        if record.kind == AtomicCommitKind::Scene
-            && record.events.iter().any(|event| event.crtc == output0_crtc)
-        {
-            complete_recorded_attempt(
-                &mut fixture,
-                device_fd,
-                &record,
-                accepted_event_id(&record).expect("output 0 scene commit has an ID"),
-                85,
-            );
-        }
-    }
-    assert!(!fixture.events.backend.scene.has_pending_page_flip(0));
-    assert!(!fixture.events.backend.scene.scene_structure_dirty);
-    assert!(
-        Backend::present_flip_in_flight(&fixture.events.backend, u32::from(output1_crtc)),
-        "the owning output reports its pending direct flip to Present's next-MSC path"
-    );
-    assert!(
-        !Backend::present_flip_in_flight(&fixture.events.backend, u32::from(output0_crtc)),
-        "output 0 does not borrow output 1's pending direct flip"
-    );
-    assert!(
-        !Backend::present_display_idle(&fixture.events.backend, u32::from(output1_crtc)),
-        "the idle-display classification sees output 1's pending direct flip"
-    );
-    assert!(
-        Backend::present_display_idle(&fixture.events.backend, u32::from(output0_crtc)),
-        "output 0 remains idle while output 1 owns the pending direct flip"
-    );
-
-    let direct_id = accepted_event_id(&direct_record).expect("Output(1) direct commit accepted");
-    complete_recorded_attempt(&mut fixture, device_fd, &direct_record, direct_id, 86);
-    drain_present_notifications(&mut fixture, &[direct.candidate.present_id], &[]);
-    Backend::unmap_subwindow(&mut fixture.events.backend, None, direct.target_xid)
-        .expect("request Output(1) replacement through Backend");
-    {
-        // Model the existing degraded-replacement marker without a scene
-        // page flip so the owner lookup is tested independently of scene state.
-        let owner = &mut fixture.events.backend.pstate.direct.outputs[1];
-        owner.degraded_composed_unflip = true;
-        owner.unflip_outputs_to_replace = HashSet::from([1]);
-    }
-    assert!(!fixture.events.backend.scene.has_pending_page_flip(1));
-    assert!(
-        Backend::present_flip_in_flight(&fixture.events.backend, u32::from(output1_crtc)),
-        "the Output(1) replacement marker alone reports an in-flight flip"
-    );
-    assert!(
-        !Backend::present_flip_in_flight(&fixture.events.backend, u32::from(output0_crtc)),
-        "the Output(1) replacement marker does not affect output 0"
-    );
-    {
-        let owner = &mut fixture.events.backend.pstate.direct.outputs[1];
-        owner.degraded_composed_unflip = false;
-        owner.unflip_outputs_to_replace.clear();
-    }
-    let replacement_start = record_count(&fixture, device_fd);
-    Backend::maybe_composite(&mut fixture.events.backend)
-        .expect("submit Output(1)'s unflip replacement through the scheduler");
-    fixture.events.wait_for_submitted_gpu_work();
-    let replacement_records = records_since(&fixture, device_fd, replacement_start);
-    for record in accepted_records(&replacement_records) {
-        if record.kind == AtomicCommitKind::Scene
-            && record.events.iter().any(|event| event.crtc == output0_crtc)
-        {
-            complete_recorded_attempt(
-                &mut fixture,
-                device_fd,
-                &record,
-                accepted_event_id(&record).expect("output 0 scene commit has an ID"),
-                86,
-            );
-        }
-    }
-    assert!(!fixture.events.backend.scene.has_pending_page_flip(0));
-    assert!(
-        fixture.events.backend.pstate.direct.outputs[1]
-            .pending
-            .is_none(),
-        "only the replacement, not another direct frame, is pending"
-    );
-    let replacement_id = fixture.events.backend.pstate.direct.outputs[1]
-        .unflip_awaiting_outputs
-        .get(&1)
-        .copied()
-        .expect("the output-scoped replacement is accepted and awaiting retirement");
-    assert!(
-        Backend::present_flip_in_flight(&fixture.events.backend, u32::from(output1_crtc)),
-        "Present sees the output owner's replacement in flight"
-    );
-    assert!(
-        !Backend::present_flip_in_flight(&fixture.events.backend, u32::from(output0_crtc)),
-        "output 0 remains unaffected while output 1's replacement is pending"
-    );
-    assert!(!Backend::present_display_idle(
-        &fixture.events.backend,
-        u32::from(output1_crtc)
-    ));
-    assert!(Backend::present_display_idle(
-        &fixture.events.backend,
-        u32::from(output0_crtc)
-    ));
-    assert!(replacement_records.iter().any(|record| {
-        accepted_event_id(record) == Some(replacement_id)
-            && record.events.iter().any(|event| event.crtc == output1_crtc)
-    }));
-
-    for record in accepted_records(&replacement_records)
-        .into_iter()
-        .filter(|record| !record.events.iter().any(|event| event.crtc == output0_crtc))
-    {
-        let id = accepted_event_id(&record).expect("accepted replacement has an ID");
-        complete_recorded_attempt(&mut fixture, device_fd, &record, id, 87);
-    }
-    let owner = &fixture.events.backend.pstate.direct.outputs[1];
-    assert!(owner.current.is_none());
-    assert!(owner.unflip_awaiting_outputs.is_empty());
-    assert!(owner.unflip_outputs_to_replace.is_empty());
-    assert!(fixture.events.backend.present_source_pins.is_empty());
     drain_present_notifications(&mut fixture, &[], &[direct.candidate.present_id]);
     fixture.finish_after_normal_drain();
 }

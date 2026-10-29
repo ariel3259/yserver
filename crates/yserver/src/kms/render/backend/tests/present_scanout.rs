@@ -1866,6 +1866,134 @@ fn present_flip_in_flight_mirrors_scene_state() {
 }
 
 #[test]
+// Mutation: read Root pending/replacement fields for every output query.
+fn output_present_in_flight_policy() {
+    use crate::kms::render::{
+        backend::{DirectPresentFrame, ScanoutM0Target},
+        store::DrawableId,
+        target::PaintTarget,
+    };
+    use std::collections::HashSet;
+    use yserver_core::backend::{CompletedPresentEvent, PresentScanoutCandidate, PresentWake};
+
+    // Each row gets a fresh backend so pending frames and replacement markers
+    // cannot leak into another query's classification.
+    for (row, queried_output, phase, expected_in_flight) in [
+        // D12: pending direct state is visible on its owner output.
+        ("pending_owner_query", 1, 0_u32, true),
+        // D12: the pending output does not make its peer look busy.
+        ("pending_other_output_query", 0, 0_u32, false),
+        // D12: a requested replacement marker remains output-local.
+        ("replacement_requested_owner_query", 1, 1_u32, true),
+        // D12: a peer query does not borrow the replacement marker.
+        ("replacement_requested_other_output_query", 0, 1_u32, false),
+        // D12: accepted replacement state remains visible until retirement.
+        ("replacement_accepted_owner_query", 1, 2_u32, true),
+        // D12: accepted replacement state remains isolated from its peer.
+        ("replacement_accepted_other_output_query", 0, 2_u32, false),
+    ] {
+        let mut backend = KmsBackend::for_tests();
+        push_test_output(&mut backend, 0x5001);
+        backend.scene.scene_structure_dirty = false;
+        backend.scene.test_set_flip_in_flight(false);
+        let output_crtcs = [
+            u32::from(backend.platform.outputs[0].output.crtc),
+            u32::from(backend.platform.outputs[1].output.crtc),
+        ];
+        bind_test_randr_crtc(&mut backend, 0, output_crtcs[0]);
+        bind_test_randr_crtc(&mut backend, 1, output_crtcs[1]);
+        let output_idx = 1;
+        let present_id = 0xD1_2000
+            + u64::from(phase) * 10
+            + u64::try_from(queried_output).expect("output index fits");
+        let source_id = DrawableId::for_tests(present_id);
+        let fallback_id = DrawableId::for_tests(present_id + 1);
+        let crtc_id = output_crtcs[output_idx];
+        let crtc_epoch = backend.present_crtc_clock_epoch(crtc_id);
+        let candidate = PresentScanoutCandidate {
+            client_id: 1,
+            client_pid: None,
+            present_id,
+            crtc_id,
+            crtc_epoch,
+            src_pixmap_xid: 0xD120,
+            dst_window_xid: 0xD121,
+            variable_refresh: false,
+            src_host_xid: 0xD122,
+            paint_dst_host_xid: 0xD121,
+            completion_dst_host_xid: 0xD121,
+            src_width: 800,
+            src_height: 600,
+            x_off: 0,
+            y_off: 0,
+            valid_region_xid: 0,
+            update_region_xid: 0,
+            update_is_full: true,
+            explicit_sync: false,
+            options: 0,
+        };
+        let frame = DirectPresentFrame {
+            source_pin: 1,
+            fallback_target_pin: 2,
+            source_id,
+            candidate,
+            target: ScanoutM0Target::Unredirected,
+            present_received_at: std::time::Instant::now(),
+            present_received_monotonic: None,
+            fallback_target: PaintTarget::new(fallback_id, (0, 0), None, 24),
+            event: CompletedPresentEvent {
+                client_id: yserver_protocol::x11::ClientId(1),
+                serial: u32::try_from(present_id).expect("Present serial fits"),
+                host_xid: 0xD122,
+                dst_host_xid: 0xD121,
+                options: 0,
+                present_id,
+                window_generation: 0,
+                crtc_id,
+                crtc_epoch,
+                msc_offset: 0,
+                completion_clock: None,
+                wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+                completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_FLIP,
+                emit_idle: false,
+            },
+            completion_output_idx: output_idx,
+            completion_clock: None,
+            awaiting_outputs: HashSet::from([output_idx]),
+            accepted_event_id: Some(0xD120),
+            async_outcome: crate::drm::async_flip::AsyncOutcome::NotRequested,
+        };
+        let owner = &mut backend.pstate.direct.outputs[output_idx];
+        if phase == 0 {
+            owner.pending = Some(frame);
+        } else {
+            owner.current = Some(frame);
+            owner.unflip_requested = true;
+            owner.unflip_outputs_to_replace = HashSet::from([output_idx]);
+            if phase == 2 {
+                owner.unflip_awaiting_outputs.insert(output_idx, 0xD120);
+            }
+        }
+        assert!(
+            owner.active(),
+            "{row}: the output-scoped marker is paired with an active owner"
+        );
+
+        let queried_crtc = output_crtcs[queried_output];
+        assert_eq!(
+            Backend::present_flip_in_flight(&backend, queried_crtc),
+            expected_in_flight,
+            "{row}: Present sees only the queried output's direct transaction"
+        );
+        assert_eq!(
+            Backend::present_display_idle(&backend, queried_crtc),
+            !expected_in_flight,
+            "{row}: idle-display classification follows the queried output owner"
+        );
+    }
+}
+
+#[test]
 fn present_display_idle_false_when_scene_wants_compose_even_with_no_flips() {
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let crtc_id = 0x5000;
@@ -2288,7 +2416,7 @@ fn output_admission_fixture_with_geometry(
     Some((fixture, direct))
 }
 
-fn output_admission_fixture(
+pub(super) fn output_admission_fixture(
     output_idx: usize,
     present_id: u64,
 ) -> Option<(
@@ -2336,114 +2464,6 @@ fn draw_direct_admission_overlay(backend: &mut KmsBackend, client_id: u32, x: i1
         1,
     )
     .expect("draw root overlay through Backend");
-}
-
-#[test]
-#[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: keep the homogeneous-topology rule for Output.
-fn output_present_enters_direct_on_its_output_only() {
-    use std::time::Duration;
-    use yserver_core::backend::Backend;
-
-    let Some((mut fixture, direct)) = output_admission_fixture(1, 810) else {
-        return;
-    };
-    let device_fd = fixture.kms_fd(1);
-    let output0_crtc = fixture.events.backend.platform.outputs[0].output.crtc;
-    let output1 = &fixture.events.backend.platform.outputs[1].output;
-    let output1_crtc = output1.crtc;
-    let output1_plane = output1.plane;
-    let output1_src_x_prop = output1.plane_src_x_prop;
-    let output1_src_y_prop = output1.plane_src_y_prop;
-    let root = fixture.events.backend.core.window_id;
-    let start = fixture.events.recorders[&device_fd].records().len();
-    for attempt in 0..crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION {
-        let entered = Backend::try_present_direct(
-            &mut fixture.events.backend,
-            direct.candidate,
-            direct.event.clone(),
-        )
-        .expect("output-sized Present through Backend");
-        assert_eq!(
-            entered,
-            attempt + 1 == crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION,
-            "Output(1) enters after its own probation",
-        );
-    }
-    Backend::clear_area(
-        &mut fixture.events.backend,
-        None,
-        root,
-        0,
-        None,
-        0,
-        0,
-        100,
-        100,
-        (0, 0),
-    )
-    .expect("damage composed output 0 through Backend");
-    Backend::maybe_composite(&mut fixture.events.backend)
-        .expect("submit output 0 composed frame while output 1 is direct");
-    let records = fixture.events.recorders[&device_fd].records();
-    let direct_record = records[start..]
-        .iter()
-        .find(|record| {
-            record.events.iter().any(|event| {
-                event.crtc == output1_crtc
-                    && record
-                        .flags
-                        .contains(::drm::control::AtomicCommitFlags::PAGE_FLIP_EVENT)
-            })
-        })
-        .expect("output 1 direct commit");
-    assert_eq!(direct_record.events.len(), 1);
-    assert_eq!(direct_record.events[0].crtc, output1_crtc);
-    for (property, label) in [(output1_src_x_prop, "SRC_X"), (output1_src_y_prop, "SRC_Y")] {
-        assert_eq!(
-            direct_record
-                .properties
-                .iter()
-                .find(|update| update.object == output1_plane.into() && update.property == property)
-                .unwrap_or_else(|| panic!("output 1 direct commit lacks {label}"))
-                .value,
-            0,
-            "output-sized source starts at (0, 0)",
-        );
-    }
-    assert!(
-        records[start..].iter().any(|record| {
-            record.kind == crate::drm::atomic::AtomicCommitKind::Scene
-                && record.events.iter().any(|event| event.crtc == output0_crtc)
-        }),
-        "output 0 continues composing while output 1 is direct",
-    );
-
-    let commit_id = super::commit_identity::accepted_event_id(direct_record)
-        .expect("accepted direct commit has an identity");
-    fixture.events.queue_commit_completion(
-        device_fd,
-        output1_crtc,
-        commit_id,
-        240,
-        Duration::from_millis(2_400),
-    );
-    Backend::on_page_flip_ready(
-        &mut fixture.events.backend,
-        &mut fixture.events.state,
-        device_fd,
-    );
-    let completed = Backend::drain_completed_present_events(&mut fixture.events.backend);
-    assert_eq!(completed.len(), 1);
-    assert_eq!(completed[0].present_id, direct.candidate.present_id);
-    assert_eq!(
-        completed[0]
-            .completion_clock
-            .map(|clock| (clock.msc, clock.ust)),
-        Some((240, 2_400_000)),
-        "CompleteNotify uses output 1's 240 Hz CRTC sample",
-    );
-    fixture.finish();
 }
 
 #[test]

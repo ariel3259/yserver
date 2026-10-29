@@ -3908,178 +3908,182 @@ fn output_removal_keeps_owner_state_with_its_output() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: RANDR teardown stops only one Output owner.
-fn randr_topology_teardown_stops_every_output_owner() {
-    use std::time::Duration;
+// Mutations: D09 makes VT stop-all stop only Root; R02 makes RANDR teardown
+// stop only one Output owner.
+fn all_owner_teardown() {
     use yserver_core::backend::Backend;
 
-    let mut fixture =
-        match super::commit_identity::recording_scene::RecordingSceneFixture::with_output_geometry(
-            (1600, 600),
-            &[(0, 0, 800, 600, 60), (800, 0, 800, 600, 60)],
-        ) {
-            Ok(Some(fixture)) => fixture,
-            Ok(None) => {
-                eprintln!(
-                    "SKIP randr_topology_teardown_stops_every_output_owner: Vulkan fixture unavailable"
-                );
-                return;
-            }
-            Err(error) => panic!("RANDR recording scene fixture construction failed: {error}"),
+    // D09 uses the VT release entry points. R02 disables output 1 through the
+    // RandR CRTC configuration path. Each route receives a new two-owner fixture.
+    for (row, teardown) in [
+        // D09: VT release stops and drains every output owner.
+        ("vt_release", 0),
+        // R02: disabling output 1 retires the complete old owner set.
+        ("randr_disable", 1),
+    ] {
+        let Some(mut fixture) = randr_two_output_owner_fixture() else {
+            eprintln!("SKIP all_owner_teardown: Vulkan fixture unavailable row={row}");
+            return;
         };
-    let snapshots = fixture
-        .events
-        .backend
-        .platform
-        .outputs
-        .iter()
-        .map(|output| relight_test_snapshot(&output.key, vec![output.output.picked.clone()]))
-        .collect();
-    fixture
-        .events
-        .backend
-        .for_tests_set_vt_resume_executor(std::rc::Rc::new(ScriptedConnectorProbe(
-            std::cell::RefCell::new(snapshots),
-        )));
-    let kms = std::rc::Rc::new(SimulatedKms::default());
-    for output in &fixture.events.backend.platform.outputs {
-        kms.bound.borrow_mut().insert(
-            raw_handle(output.output.connector),
-            raw_handle(output.output.crtc),
-        );
-        kms.active
-            .borrow_mut()
-            .insert(raw_handle(output.output.crtc));
-    }
-    fixture
-        .events
-        .backend
-        .platform
-        .for_tests_set_output_power_executor(kms);
-    fixture
-        .events
-        .backend
-        .rebuild_randr_state(&mut fixture.events.state, None, true);
-    fixture
-        .events
-        .backend
-        .for_tests_set_scanout_m1_prober(super::present_scanout::record_scanout_m1_probe);
-
-    let probation = usize::from(crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION);
-    let mut direct_commits = Vec::new();
-    for (output_idx, present_id) in [(0, 701), (1, 702)] {
-        let mut direct = fixture.install_direct_output_present(output_idx, present_id, 0);
-        let selected_crtc = fixture.events.state.randr.outputs[output_idx].crtc_id;
-        direct.candidate.crtc_id = selected_crtc;
-        direct.candidate.crtc_epoch = fixture
+        let snapshots = fixture
             .events
             .backend
-            .present_crtc_clock_epoch(selected_crtc);
-        direct.event.crtc_id = selected_crtc;
-        direct.event.crtc_epoch = direct.candidate.crtc_epoch;
-        Backend::note_present_scanout_candidate(&mut fixture.events.backend, direct.candidate);
-        let output = &fixture.events.backend.platform.outputs[output_idx].output;
-        let crtc = output.crtc;
-        let fd = fixture.kms_fd(output_idx);
-        let start = fixture.events.recorders[&fd].records().len();
-        for attempt in 0..probation {
-            let entered = Backend::try_present_direct(
-                &mut fixture.events.backend,
-                direct.candidate,
-                direct.event.clone(),
-            )
-            .expect("Output Present through Backend before RANDR teardown");
-            assert_eq!(entered, attempt + 1 == probation);
-        }
-        let direct_record = fixture.events.recorders[&fd]
-            .records()
-            .into_iter()
-            .skip(start)
-            .find(|record| {
-                super::commit_identity::support::accepted_event_id(record).is_some()
-                    && record.events.len() == 1
-                    && record.events[0].crtc == crtc
-            })
-            .expect("Output Present produced a direct CRTC commit");
-        let commit_id = super::commit_identity::support::accepted_event_id(&direct_record)
-            .expect("accepted Output commit carries an event identity");
-        direct_commits.push((fd, crtc, commit_id));
-    }
-
-    assert_eq!(
-        fixture.events.backend.pstate.direct.active_scopes(),
-        [
-            crate::kms::render::backend::DirectScope::Output(0),
-            crate::kms::render::backend::DirectScope::Output(1),
-        ]
-    );
-    assert_eq!(fixture.events.backend.present_source_pins.len(), 4);
-
-    for (index, &(fd, crtc, commit_id)) in direct_commits.iter().enumerate() {
-        fixture.events.queue_commit_completion(
-            fd,
-            crtc,
-            commit_id,
-            701 + u32::try_from(index).expect("output index fits"),
-            Duration::from_millis(1_600 + u64::try_from(index).expect("output index fits")),
-        );
-        Backend::on_page_flip_ready(&mut fixture.events.backend, &mut fixture.events.state, fd);
-    }
-    assert!(
-        fixture
-            .events
-            .backend
-            .pstate
-            .direct
+            .platform
             .outputs
             .iter()
-            .all(|owner| owner.current.is_some()),
-        "each owner entered through a Present and retired its recorded direct CRTC commit"
-    );
-
-    let (outputs, _) = fixture.events.backend.randr_outputs_and_modes();
-    let removed = &outputs[1];
-    assert!(
-        Backend::apply_crtc_config(
-            &mut fixture.events.backend,
-            removed.output_id,
-            &removed.name,
-            None,
-            0,
-            0,
-        )
-        .expect("RANDR disable simulated second output")
-    );
-
-    assert!(
+            .map(|output| relight_test_snapshot(&output.key, vec![output.output.picked.clone()]))
+            .collect();
         fixture
             .events
             .backend
-            .pstate
-            .direct
-            .active_scopes()
-            .is_empty()
-    );
-    assert_eq!(fixture.events.backend.platform.outputs.len(), 1);
-    assert_eq!(fixture.events.backend.pstate.direct.outputs.len(), 1);
-    assert!(fixture.events.backend.present_source_pins.is_empty());
-    let mut completed = Backend::drain_completed_present_events(&mut fixture.events.backend)
-        .into_iter()
-        .map(|event| event.present_id)
-        .collect::<Vec<_>>();
-    completed.sort_unstable();
-    assert_eq!(completed, [701, 702]);
-    assert!(Backend::drain_completed_present_events(&mut fixture.events.backend).is_empty());
-    let mut idled = Backend::drain_retired_present_idle_events(&mut fixture.events.backend)
-        .into_iter()
-        .map(|event| event.present_id)
-        .collect::<Vec<_>>();
-    idled.sort_unstable();
-    assert_eq!(idled, [701, 702]);
-    assert!(Backend::drain_retired_present_idle_events(&mut fixture.events.backend).is_empty());
-    fixture.finish_after_normal_drain();
-}
+            .for_tests_set_vt_resume_executor(std::rc::Rc::new(ScriptedConnectorProbe(
+                std::cell::RefCell::new(snapshots),
+            )));
+        let kms = std::rc::Rc::new(SimulatedKms::default());
+        for output in &fixture.events.backend.platform.outputs {
+            kms.bound.borrow_mut().insert(
+                raw_handle(output.output.connector),
+                raw_handle(output.output.crtc),
+            );
+            kms.active
+                .borrow_mut()
+                .insert(raw_handle(output.output.crtc));
+        }
+        fixture
+            .events
+            .backend
+            .platform
+            .for_tests_set_output_power_executor(kms);
 
+        randr_retire_direct_enters(&mut fixture);
+        assert_eq!(
+            fixture.events.backend.pstate.direct.active_scopes(),
+            [
+                crate::kms::render::backend::DirectScope::Output(0),
+                crate::kms::render::backend::DirectScope::Output(1),
+            ],
+            "{row}: both normally admitted Output owners are active before teardown"
+        );
+        assert_eq!(
+            fixture.events.backend.present_source_pins.len(),
+            4,
+            "{row}: both owners retain their source and fallback pins"
+        );
+        assert!(
+            fixture
+                .events
+                .backend
+                .pstate
+                .direct
+                .outputs
+                .iter()
+                .all(|owner| owner.current.is_some()),
+            "{row}: both direct Present events retired before teardown"
+        );
+
+        if teardown == 0 {
+            let mut completed =
+                Backend::drain_completed_present_events(&mut fixture.events.backend)
+                    .into_iter()
+                    .map(|event| event.present_id)
+                    .collect::<Vec<_>>();
+            completed.sort_unstable();
+            assert_eq!(
+                completed,
+                [701, 702],
+                "{row}: both Complete events drain before VT release"
+            );
+            assert!(
+                Backend::drain_completed_present_events(&mut fixture.events.backend).is_empty(),
+                "{row}: direct Complete events drain only once before VT release"
+            );
+            super::commit_identity::install_recording_vt_io(&mut fixture);
+            Backend::begin_vt_release(&mut fixture.events.backend);
+            Backend::finish_vt_release(
+                &mut fixture.events.backend,
+                &mut fixture.events.state,
+                &yserver_core::core_loop::input_inventory::InputInventory::default(),
+            );
+        } else {
+            let (outputs, _) = Backend::randr_outputs_and_modes(&mut fixture.events.backend);
+            let removed = &outputs[1];
+            assert!(
+                Backend::apply_crtc_config(
+                    &mut fixture.events.backend,
+                    removed.output_id,
+                    &removed.name,
+                    None,
+                    0,
+                    0,
+                )
+                .expect("disable output 1 through the RandR Backend path"),
+                "{row}: RANDR accepts disabling output 1"
+            );
+            assert_eq!(
+                fixture.events.backend.platform.outputs.len(),
+                1,
+                "{row}: RANDR removes output 1 from the platform vector"
+            );
+            assert_eq!(
+                fixture.events.backend.pstate.direct.outputs.len(),
+                1,
+                "{row}: RANDR compacts the matching direct-owner slot"
+            );
+        }
+
+        assert!(
+            fixture
+                .events
+                .backend
+                .pstate
+                .direct
+                .active_scopes()
+                .is_empty(),
+            "{row}: teardown stops every Output owner"
+        );
+        assert!(
+            fixture.events.backend.present_source_pins.is_empty(),
+            "{row}: teardown releases all four direct pins"
+        );
+        let mut completed = Backend::drain_completed_present_events(&mut fixture.events.backend)
+            .into_iter()
+            .map(|event| event.present_id)
+            .collect::<Vec<_>>();
+        completed.sort_unstable();
+        assert_eq!(
+            completed,
+            if teardown == 0 {
+                vec![]
+            } else {
+                vec![701, 702]
+            },
+            "{row}: completion notifications drain according to the teardown route exactly once"
+        );
+        assert!(
+            Backend::drain_completed_present_events(&mut fixture.events.backend).is_empty(),
+            "{row}: Complete notifications do not drain twice"
+        );
+        let mut idled = Backend::drain_retired_present_idle_events(&mut fixture.events.backend)
+            .into_iter()
+            .map(|event| event.present_id)
+            .collect::<Vec<_>>();
+        idled.sort_unstable();
+        assert_eq!(
+            idled,
+            [701, 702],
+            "{row}: both Idle notifications drain once"
+        );
+        assert!(
+            Backend::drain_retired_present_idle_events(&mut fixture.events.backend).is_empty(),
+            "{row}: Idle notifications do not drain twice"
+        );
+        if teardown == 0 {
+            fixture.finish();
+        } else {
+            fixture.finish_after_normal_drain();
+        }
+    }
+}
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: scope both storage reallocation requests or the CRTC transform request to one output.

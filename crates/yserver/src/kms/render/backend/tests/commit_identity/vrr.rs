@@ -4968,10 +4968,18 @@ fn vrr_property_change_reaches_every_owner_of_the_window() {
             1,
         );
 
-        let direct0 =
-            super::direct_unflip::submit_output_present_via_backend(&mut fixture, &output0, 0);
-        let direct1 =
-            super::direct_unflip::submit_output_present_via_backend(&mut fixture, &output1, 1);
+        let direct0 = super::direct_unflip::submit_output_present_via_backend(
+            &mut fixture,
+            &output0,
+            0,
+            "vrr_output_0_admission",
+        );
+        let direct1 = super::direct_unflip::submit_output_present_via_backend(
+            &mut fixture,
+            &output1,
+            1,
+            "vrr_output_1_admission",
+        );
         let direct_ids = [
             super::support::accepted_event_id(&direct0).expect("Output(0) direct ID"),
             super::support::accepted_event_id(&direct1).expect("Output(1) direct ID"),
