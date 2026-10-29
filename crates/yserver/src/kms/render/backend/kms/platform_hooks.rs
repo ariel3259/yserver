@@ -42,7 +42,7 @@ impl Platform for PlatformBackend {
     }
 
     fn note_drawable_retired(st: &mut KmsBackendState, id: DrawableId) {
-        st.scanout_m1.remove(id);
+        st.retire_scanout_drawable(id);
     }
 
     fn set_keyboard_leds(st: &mut KmsBackendState, lit: u32) {
@@ -487,7 +487,9 @@ impl Platform for PlatformBackend {
         candidate: PresentScanoutCandidate,
         event: yserver_core::backend::CompletedPresentEvent,
     ) -> io::Result<bool> {
-        KmsBackend::backend_present_try_present_direct(b, candidate, event)
+        let result = KmsBackend::backend_present_try_present_direct(b, candidate, event);
+        b.note_present_outcome(candidate.src_host_xid, matches!(result, Ok(true)));
+        result
     }
 
     fn arm_present_source_wait(
@@ -749,6 +751,28 @@ impl Platform for PlatformBackend {
         host_xid: u32,
     ) -> io::Result<Dri3PixmapExport> {
         KmsBackend::backend_export_dri3_export_pixmap_buffers(b, host_xid)
+    }
+
+    fn dri3_begin_export_pixmap_buffers(
+        b: &mut KmsBackend,
+        host_xid: u32,
+    ) -> io::Result<yserver_core::backend::Dri3ExportBegin> {
+        KmsBackend::backend_export_dri3_begin_export(b, host_xid)
+    }
+
+    fn drain_ready_dri3_exports(b: &mut KmsBackend) -> Vec<yserver_core::backend::Dri3ExportToken> {
+        KmsBackend::backend_export_drain_ready_dri3_exports(b)
+    }
+
+    fn finish_dri3_export(
+        b: &mut KmsBackend,
+        token: yserver_core::backend::Dri3ExportToken,
+    ) -> io::Result<Dri3PixmapExport> {
+        KmsBackend::backend_export_finish_dri3_export(b, token)
+    }
+
+    fn release_dri3_export(b: &mut KmsBackend, token: yserver_core::backend::Dri3ExportToken) {
+        KmsBackend::backend_export_release_dri3_export(b, token);
     }
 
     fn dri3_fence_from_fd(

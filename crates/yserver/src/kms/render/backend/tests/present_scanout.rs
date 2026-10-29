@@ -4,7 +4,7 @@ fn output_crtc_key(backend: &KmsBackend, output_idx: usize) -> CrtcKey {
     CrtcKey::for_output(&backend.platform.outputs[output_idx])
 }
 
-fn bind_test_randr_crtc(backend: &mut KmsBackend, output_idx: usize, crtc_id: u32) {
+pub(super) fn bind_test_randr_crtc(backend: &mut KmsBackend, output_idx: usize, crtc_id: u32) {
     let output_key = backend.platform.outputs[output_idx].key.clone();
     backend.pstate.crtc_key_by_id.insert(crtc_id, output_key);
     backend.refresh_present_crtc_clock_epochs();
@@ -1587,6 +1587,8 @@ fn grouped_direct_waits_all_outputs_and_uses_selected_reference_sample() {
         awaiting_outputs: std::collections::HashSet::from([0, 1]),
         accepted_event_id: Some(0x5a),
         async_outcome: crate::drm::async_flip::AsyncOutcome::NotRequested,
+        in_fence: None,
+        fence_tally: None,
     });
 
     let reference = PresentClockSample {
@@ -2064,6 +2066,8 @@ fn output_present_in_flight_policy() {
             awaiting_outputs: HashSet::from([output_idx]),
             accepted_event_id: Some(0xD120),
             async_outcome: crate::drm::async_flip::AsyncOutcome::NotRequested,
+            in_fence: None,
+            fence_tally: None,
         };
         let owner = &mut backend.pstate.direct.outputs[output_idx];
         if phase == 0 {
@@ -2323,6 +2327,58 @@ fn scanout_m1_rejects_gap_overlap_bounds_and_mode_mismatch() {
         (5120, 1440),
         &[output(0, 2560, 1920), output(2560, 2560, 2560)],
     ));
+}
+
+fn m1_valid_layout() -> crate::kms::render::backend::ScanoutSourceLayout {
+    crate::kms::render::backend::ScanoutSourceLayout {
+        fourcc: 0x3432_5258,
+        vk_format: ash::vk::Format::B8G8R8A8_UNORM,
+        depth: 24,
+        bpp: 32,
+        width: 5120,
+        height: 1440,
+        plane_count: 1,
+        offset: 0,
+        pitch: 20480,
+        modifier: 0,
+    }
+}
+
+fn m1_validate(
+    layout: &crate::kms::render::backend::ScanoutSourceLayout,
+    output_modifiers: &[&[u64]],
+) -> Result<(), crate::kms::render::backend::ScanoutM1Reject> {
+    crate::kms::render::backend::scanout_m1_validate(layout, (5120, 1440), output_modifiers)
+}
+
+#[test]
+fn scanout_m1_validate_accepts_scope_sized_xrgb_linear() {
+    assert_eq!(m1_validate(&m1_valid_layout(), &[&[0], &[]]), Ok(()));
+}
+
+#[test]
+fn scanout_m1_validate_names_each_reject() {
+    use crate::kms::render::backend::ScanoutM1Reject as R;
+    let any: [&[u64]; 2] = [&[], &[]];
+    let with = |edit: fn(&mut crate::kms::render::backend::ScanoutSourceLayout)| {
+        let mut layout = m1_valid_layout();
+        edit(&mut layout);
+        m1_validate(&layout, &any)
+    };
+    assert_eq!(with(|l| l.fourcc = 0x3432_4152), Err(R::Fourcc));
+    assert_eq!(
+        with(|l| l.vk_format = ash::vk::Format::R8G8B8A8_UNORM),
+        Err(R::VkFormat)
+    );
+    assert_eq!(with(|l| l.plane_count = 2), Err(R::PlaneCount));
+    assert_eq!(with(|l| l.depth = 32), Err(R::Depth));
+    assert_eq!(with(|l| l.bpp = 24), Err(R::Bpp));
+    assert_eq!(with(|l| l.pitch = 0), Err(R::ZeroPitch));
+    assert_eq!(with(|l| l.width = 2560), Err(R::ScopeSizeMismatch));
+    assert_eq!(
+        m1_validate(&m1_valid_layout(), &[&[0], &[0x0100_0000_0000_0001]]),
+        Err(R::Modifier)
+    );
 }
 
 #[test]
@@ -2819,22 +2875,18 @@ fn scoped_crtc_admission() {
             )
             .expect("allocate null fallback storage");
 
+        let mut source_storage = Storage::for_tests_null(
+            ash::vk::Extent2D {
+                width: u32::from(width),
+                height: 600,
+            },
+            ash::vk::Format::B8G8R8A8_UNORM,
+        );
+        source_storage.imported_dmabuf = Some(imported_dmabuf_for_test(width, 600));
         let source_id = backend
             .store
-            .allocate(
-                source_xid,
-                DrawableKind::Pixmap,
-                24,
-                false,
-                Storage::for_tests_null(
-                    ash::vk::Extent2D {
-                        width: u32::from(width),
-                        height: 600,
-                    },
-                    ash::vk::Format::B8G8R8A8_UNORM,
-                ),
-            )
-            .expect("allocate null source storage");
+            .allocate(source_xid, DrawableKind::Pixmap, 24, false, source_storage)
+            .expect("allocate imported source storage");
         assert_eq!(
             backend
                 .store
@@ -2921,6 +2973,7 @@ fn scoped_crtc_admission() {
                     src_y,
                     src_w: u32::from(layout.width),
                     src_h: u32::from(layout.height),
+                    in_fence_fd: None,
                 }
             })
             .collect();
@@ -3299,7 +3352,10 @@ fn scanout_direct_eligible_accepts_fullscreen_game_candidate() {
 }
 
 /// A root-sized stage under the COW, as muffin lays it out.
-fn seed_cow_stage(b: &mut crate::kms::render::backend::KmsBackend, stage: u32) -> (u32, u32) {
+pub(super) fn seed_cow_stage(
+    b: &mut crate::kms::render::backend::KmsBackend,
+    stage: u32,
+) -> (u32, u32) {
     let cow = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
     let (w, h) = (b.platform.fb_w, b.platform.fb_h);
     let root_window = b.core.window_id;
@@ -4338,10 +4394,27 @@ fn prepare_atomic_cursor_direct_present_with_extent(
     width: u16,
     height: u16,
 ) -> AtomicCursorDirectPresent {
-    use ash::vk;
+    let mut storage = crate::kms::render::store::Storage::for_tests_null(
+        ash::vk::Extent2D {
+            width: u32::from(width),
+            height: u32::from(height),
+        },
+        ash::vk::Format::B8G8R8A8_UNORM,
+    );
+    storage.imported_dmabuf = Some(imported_dmabuf_for_test(width, height));
+    prepare_atomic_cursor_direct_present_with_storage(backend, present_id, width, height, storage)
+}
+
+fn prepare_atomic_cursor_direct_present_with_storage(
+    backend: &mut KmsBackend,
+    present_id: u64,
+    width: u16,
+    height: u16,
+    storage: crate::kms::render::store::Storage,
+) -> AtomicCursorDirectPresent {
     use yserver_core::backend::{CompletedPresentEvent, PresentScanoutCandidate, PresentWake};
 
-    use crate::kms::render::store::{DrawableKind, Storage};
+    use crate::kms::render::store::DrawableKind;
 
     let suffix = u32::try_from(present_id).expect("test Present id fits in XID");
     let target_xid = 0x7300 + suffix * 0x10;
@@ -4358,19 +4431,7 @@ fn prepare_atomic_cursor_direct_present_with_extent(
     backend.core.top_level_order.push(target_xid);
     let source_id = backend
         .store
-        .allocate(
-            source_xid,
-            DrawableKind::Pixmap,
-            24,
-            false,
-            Storage::for_tests_null(
-                vk::Extent2D {
-                    width: u32::from(width),
-                    height: u32::from(height),
-                },
-                vk::Format::B8G8R8A8_UNORM,
-            ),
-        )
+        .allocate(source_xid, DrawableKind::Pixmap, 24, false, storage)
         .expect("allocate fullscreen Present source");
     backend.pstate.scanout_m1.entries.insert(
         (source_id, crate::kms::render::backend::DirectScope::Root),
@@ -5055,13 +5116,17 @@ fn eligible_fullscreen_present_records_cursor_positions_for_both_outputs() {
             crate::kms::render::store::DrawableKind::Pixmap,
             24,
             false,
-            Storage::for_tests_null(
-                ash::vk::Extent2D {
-                    width: 1600,
-                    height: 600,
-                },
-                ash::vk::Format::B8G8R8A8_UNORM,
-            ),
+            {
+                let mut storage = Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 1600,
+                        height: 600,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                );
+                storage.imported_dmabuf = Some(imported_dmabuf_for_test(1600, 600));
+                storage
+            },
         )
         .expect("fullscreen Present source");
     backend.pstate.scanout_m1.entries.insert(
@@ -5248,6 +5313,74 @@ fn shape_triggered_composed_unflip_records_cursor_positions_for_both_outputs() {
             .platform
             .for_tests_atomic_position_is_unsent(position.device_key, position.crtc)
     }));
+}
+
+#[test]
+fn present_outcome_telemetry_counts_a_copy_present() {
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
+    let stage = 0x0040_0021;
+    seed_cow_stage(&mut b, stage);
+    let (presented, _) = try_present_root_pixmap_for_shape_test(&mut b, 1, 0x0040_0121, stage, 0);
+    assert!(!presented, "a first Present is inside M2 probation");
+    let server = &b.pstate.scanout_m0.server;
+    assert_eq!(
+        (
+            server.presents_copy,
+            server.presents_direct_imported,
+            server.presents_direct_server
+        ),
+        (1, 0, 0)
+    );
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn present_outcome_telemetry_counts_an_imported_direct_present() {
+    use yserver_core::backend::Backend;
+
+    let Some(mut backend) = atomic_cursor_hidden_scanout_backend() else {
+        return;
+    };
+    let _recorder = atomic_cursor_recording_sink(&mut backend);
+    Backend::set_cursor_hidden(&mut backend, true);
+    Backend::maybe_composite(&mut backend).expect("schedule hidden-cursor scene");
+
+    let mut storage = crate::kms::render::store::Storage::for_tests_null(
+        ash::vk::Extent2D {
+            width: 1600,
+            height: 600,
+        },
+        ash::vk::Format::B8G8R8A8_UNORM,
+    );
+    storage.imported_dmabuf = Some(crate::kms::render::store::ImportedDmabufMetadata {
+        fourcc: 0x3432_5258,
+        vk_format: ash::vk::Format::B8G8R8A8_UNORM,
+        modifier: 0,
+        implicit_layout: false,
+        planes: vec![crate::kms::render::store::ImportedDmabufPlane {
+            offset: 0,
+            pitch: 1600 * 4,
+        }],
+        width: 1600,
+        height: 600,
+        depth: 24,
+        bpp: 32,
+    });
+    let direct =
+        prepare_atomic_cursor_direct_present_with_storage(&mut backend, 92, 1600, 600, storage);
+    assert!(
+        Backend::try_present_direct(&mut backend, direct.candidate, direct.event)
+            .expect("eligible fullscreen Present"),
+    );
+    let server = &backend.pstate.scanout_m0.server;
+    assert_eq!(
+        (
+            server.presents_direct_imported,
+            server.presents_direct_server,
+            server.presents_copy
+        ),
+        (1, 0, 0)
+    );
 }
 
 #[path = "present_scanout_a3.rs"]

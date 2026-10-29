@@ -546,7 +546,7 @@ impl KmsBackend {
             .vk
             .as_ref()
             .ok_or_else(|| io::Error::other("promote: no VkContext"))?;
-        let (memory, stride, size, modifier) = {
+        let (memory, stride, size, offset, modifier) = {
             let d = self
                 .store
                 .get(id)
@@ -555,14 +555,15 @@ impl KmsBackend {
                 d.storage.memory,
                 d.storage.export_stride,
                 d.storage.export_size,
+                d.storage.export_offset,
                 d.storage.export_modifier,
             )
         };
         // Export the promoted memory directly (the Storage now owns the
         // exportable image's handles; we don't have the ExportableImage
         // wrapper any more, so build the export from the raw memory handle
-        // + the stride/size/modifier adopt_exportable stored).
-        crate::kms::vk::dri3::export_promoted(vk, memory, stride, size, modifier)
+        // + the stride/size/offset/modifier adopt_exportable stored).
+        crate::kms::vk::dri3::export_promoted(vk, memory, stride, size, offset, modifier)
             .map_err(|e| io::Error::other(format!("export_promoted: {e:?}")))
     }
 
@@ -648,10 +649,19 @@ impl KmsBackend {
             vrr_proc_root: std::path::PathBuf::from("/proc"),
             scanout_m0: ScanoutM0Telemetry::default(),
             scanout_m1: ScanoutM1ProbeCache::new(),
+            scanout_m1_importer: KmsBackend::import_scanout_m1_framebuffer_live,
             direct: DirectOwners::default(),
             tearing: Tearing::new(),
             direct_frame_submitter: KmsBackend::submit_direct_frame_live,
             scanout_m1_prober: KmsBackend::probe_direct_scanout_m1_live,
+            server_scanout: crate::kms::render::backend::ServerScanoutSources::new(
+                std::time::Instant::now(),
+            ),
+            server_scanout_promoter: KmsBackend::promote_server_scanout_live,
+            direct_source_cpu_waiter: KmsBackend::wait_for_direct_source_ticket_live,
+            server_scanout_exports:
+                crate::kms::render::backend::DeferredServerScanoutExports::default(),
+            dri3_drawable_exporter: KmsBackend::dri3_export_drawable,
             vt_resume_executor: std::rc::Rc::new(
                 crate::kms::render::backend::kms::session::DrmVtResumeExecutor,
             ),

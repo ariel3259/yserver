@@ -216,10 +216,19 @@ impl KmsBackend {
             vrr_proc_root: std::path::PathBuf::from("/proc"),
             scanout_m0: ScanoutM0Telemetry::default(),
             scanout_m1: ScanoutM1ProbeCache::new(),
+            scanout_m1_importer: KmsBackend::import_scanout_m1_framebuffer_live,
             direct,
             tearing: Tearing::new(),
             direct_frame_submitter: KmsBackend::submit_direct_frame_live,
             scanout_m1_prober: KmsBackend::probe_direct_scanout_m1_live,
+            server_scanout: crate::kms::render::backend::ServerScanoutSources::new(
+                std::time::Instant::now(),
+            ),
+            server_scanout_promoter: KmsBackend::promote_server_scanout_live,
+            direct_source_cpu_waiter: KmsBackend::wait_for_direct_source_ticket_live,
+            server_scanout_exports:
+                crate::kms::render::backend::DeferredServerScanoutExports::default(),
+            dri3_drawable_exporter: KmsBackend::dri3_export_drawable,
             vt_resume_executor: std::rc::Rc::new(DrmVtResumeExecutor),
             monotonic_clock: std::rc::Rc::new(std::time::Instant::now),
             armed_vblank_targets: std::collections::HashMap::new(),
@@ -981,6 +990,7 @@ impl KmsBackend {
             self.pstate.hotplug_rescan_deadline = None;
             self.run_display_rescan(state);
         }
+        self.service_server_scanout_export_deadlines();
     }
 
     pub(in crate::kms::render::backend) fn backend_session_start_device_config(

@@ -1312,17 +1312,18 @@ impl ExportableImage {
     /// the struct is wrapped in `ManuallyDrop` so `Drop` never fires on
     /// the Vk handles, then the `Arc<VkContext>` is read out and
     /// dropped normally, decrementing the strong-count as it should.
-    pub fn into_raw_parts(self) -> (vk::Image, vk::DeviceMemory, u32, u64, u64) {
+    pub fn into_raw_parts(self) -> (vk::Image, vk::DeviceMemory, u32, u64, u64, u64) {
         let mut md = std::mem::ManuallyDrop::new(self);
         let image = md.image;
         let memory = md.memory;
         let stride = md.stride;
         let size = md.size;
+        let offset = md.offset;
         let modifier = md.modifier;
         // Drop the Arc<VkContext> normally (decrement strong-count)
         // without destroying the Vk handles the caller now owns.
         unsafe { std::ptr::drop_in_place(&mut md.vk) };
-        (image, memory, stride, size, modifier)
+        (image, memory, stride, size, offset, modifier)
     }
 }
 
@@ -1464,6 +1465,46 @@ pub fn allocate_exportable(
     };
     let _ = vk.tfp_tiling_strategy.set(strategy);
     Ok(img)
+}
+
+/// Allocate a linear, dma-buf-exportable pixmap image for direct scanout.
+/// Never reads or sets [`VkContext::tfp_tiling_strategy`].
+///
+/// `plane_modifiers` holds each output's primary-plane modifiers; an empty
+/// list means unknown. `ERROR_FORMAT_NOT_SUPPORTED`, before anything is
+/// allocated, when a known list lacks `DRM_FORMAT_MOD_LINEAR` or the driver
+/// advertises neither a `TILING_LINEAR` dma-buf nor the LINEAR modifier with
+/// [`EXPORT_IMAGE_USAGE`].
+pub fn allocate_scanout_pixmap(
+    vk: &Arc<VkContext>,
+    width: u32,
+    height: u32,
+    format: vk::Format,
+    plane_modifiers: &[&[u64]],
+) -> Result<ExportableImage, vk::Result> {
+    let linear = super::dri3::DRM_FORMAT_MOD_LINEAR;
+    if !vk.dmabuf_export
+        || plane_modifiers
+            .iter()
+            .any(|modifiers| !modifiers.is_empty() && !modifiers.contains(&linear))
+    {
+        return Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED);
+    }
+    if linear_tiling_exportable(vk, format) {
+        allocate_exportable_linear(vk, width, height, format, EXPORT_IMAGE_USAGE)
+    } else if vk.image_drm_format_modifier && super::dri3::can_export_modifier(vk, format, linear) {
+        allocate_exportable_modifier(
+            vk,
+            width,
+            height,
+            format,
+            &[linear],
+            EXPORT_IMAGE_USAGE,
+            ExportMemoryPlacement::DeviceLocal,
+        )
+    } else {
+        Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED)
+    }
 }
 
 /// Whether the driver advertises a `TILING_LINEAR` image with

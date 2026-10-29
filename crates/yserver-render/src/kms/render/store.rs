@@ -82,6 +82,18 @@ pub enum DrawableKind {
     // COW deferred to Stage 4.
 }
 
+/// The last write to a scanout-fenced drawable, as a direct plane commit
+/// must wait for it (D8).
+#[derive(Debug, Clone)]
+pub enum ScanoutWriteFence {
+    /// No write since promotion: its copy waited on the CPU.
+    NoPendingWrite,
+    /// The sync_file of the last submit that wrote it.
+    Fence(Arc<OwnedFd>),
+    /// The last writing submit produced no sync_file.
+    ExportFailed,
+}
+
 /// Immutable dma-buf layout supplied by the DRI3 client at import time.
 /// Vulkan consumes this information while importing the image, but retaining
 /// it here lets later Present/scanout policy prove KMS compatibility without
@@ -185,6 +197,9 @@ pub struct Storage {
     /// image, captured at allocation time. `0` for non-promoted
     /// storage.
     pub export_size: u64,
+    /// Plane-0 byte offset of the exportable image, from the same
+    /// allocation-time layout query. `0` for non-promoted storage.
+    pub export_offset: u64,
     /// GLX-TFP (Phase 1): DRM format modifier of the exportable image,
     /// read back from `vkGetImageDrmFormatModifierPropertiesEXT` at
     /// promotion time. `DRM_FORMAT_MOD_LINEAR` (0) for the LINEAR path or
@@ -232,6 +247,7 @@ impl Storage {
             promoted_exportable: false,
             export_stride: 0,
             export_size: 0,
+            export_offset: 0,
             export_modifier: 0,
         }
     }
@@ -269,6 +285,7 @@ impl Storage {
             promoted_exportable: false,
             export_stride: 0,
             export_size: 0,
+            export_offset: 0,
             export_modifier: 0,
         }
     }
@@ -299,6 +316,7 @@ impl Storage {
             promoted_exportable: false,
             export_stride: 0,
             export_size: 0,
+            export_offset: 0,
             export_modifier: 0,
         }
     }
@@ -330,6 +348,7 @@ impl Storage {
             promoted_exportable: false,
             export_stride: 0,
             export_size: 0,
+            export_offset: 0,
             export_modifier: 0,
         }
     }
@@ -347,7 +366,7 @@ impl Storage {
     /// handles only after the old image's last render fence has
     /// signaled (see `RenderEngine::retire_image_after`).
     ///
-    /// `export_stride`/`export_size` come from the exportable image's
+    /// `export_stride`/`export_size`/`export_offset` come from the exportable image's
     /// `vkGetImageSubresourceLayout` at allocation time and are stored
     /// so the DRI3 export reply (Task 1.3) never has to re-query them.
     pub(crate) fn adopt_exportable(
@@ -359,8 +378,11 @@ impl Storage {
         new_layout: vk::ImageLayout,
         export_stride: u32,
         export_size: u64,
+        export_offset: u64,
         export_modifier: u64,
     ) -> RetiredImage {
+        // One swap per drawable: the M1 probe cache keys on `DrawableId` alone.
+        debug_assert!(!self.promoted_exportable, "storage already promoted");
         let retired = RetiredImage {
             image: self.image,
             memory: self.memory,
@@ -375,6 +397,7 @@ impl Storage {
         self.promoted_exportable = true;
         self.export_stride = export_stride;
         self.export_size = export_size;
+        self.export_offset = export_offset;
         self.export_modifier = export_modifier;
         retired
     }
@@ -894,6 +917,14 @@ pub struct DrawableStore {
     /// by the deferred Present gate. Consumed by the next flush containing a
     /// write to that drawable; the flush still publishes its new WRITE fence.
     prewaited_exported_writes: std::collections::HashSet<DrawableId>,
+    /// Drawables promoted to scanout storage whose writes are fenced for
+    /// direct plane commits (D7). Separate from `exported_sync`: no client
+    /// holds their fd.
+    scanout_fenced: std::collections::HashSet<DrawableId>,
+    /// The last-write fence of each `scanout_fenced` drawable (D8).
+    scanout_write_fence: HashMap<DrawableId, ScanoutWriteFence>,
+    /// `scanout_fenced` drawables written since their last submit.
+    scanout_writes: Vec<DrawableId>,
     /// Counts the paints the scene composites (presentation damage) and
     /// scene-participation changes: whether a composed root readback is
     /// still current (`SceneCompositor::root_readback`).
@@ -917,6 +948,9 @@ impl DrawableStore {
             exported_sync: HashMap::new(),
             exported_writes: Vec::new(),
             prewaited_exported_writes: std::collections::HashSet::new(),
+            scanout_fenced: std::collections::HashSet::new(),
+            scanout_write_fence: HashMap::new(),
+            scanout_writes: Vec::new(),
             scene_damage_generation: 0,
             topology_generation: 0,
         }
@@ -937,6 +971,62 @@ impl DrawableStore {
     /// `ExportedBacking` first gains its fd.
     pub fn set_exported_sync_fd(&mut self, id: DrawableId, fd: Arc<OwnedFd>) {
         self.exported_sync.insert(id, fd);
+    }
+
+    /// Fence `id`'s writes for direct scanout; it was just promoted and its
+    /// copy waited on the CPU, so no write is pending.
+    pub fn track_scanout_writes(&mut self, id: DrawableId) {
+        self.scanout_fenced.insert(id);
+        self.scanout_write_fence
+            .insert(id, ScanoutWriteFence::NoPendingWrite);
+        self.scanout_writes.retain(|&w| w != id);
+    }
+
+    /// Stop fencing `id`'s writes (retired, or handed to a client).
+    pub fn untrack_scanout_writes(&mut self, id: DrawableId) {
+        self.scanout_fenced.remove(&id);
+        self.scanout_write_fence.remove(&id);
+        self.scanout_writes.retain(|&w| w != id);
+    }
+
+    pub fn is_scanout_fenced(&self, id: DrawableId) -> bool {
+        self.scanout_fenced.contains(&id)
+    }
+
+    /// Whether a write to scanout-fenced `id` is recorded but not submitted.
+    pub fn has_unsubmitted_scanout_write(&self, id: DrawableId) -> bool {
+        self.scanout_writes.contains(&id)
+    }
+
+    /// The last-write fence of scanout-fenced `id`.
+    pub fn scanout_write_fence(&self, id: DrawableId) -> Option<&ScanoutWriteFence> {
+        self.scanout_write_fence.get(&id)
+    }
+
+    /// Drain the unsubmitted scanout writes, except `held` (written by work
+    /// not yet in the submit group).
+    pub(crate) fn take_scanout_writes(
+        &mut self,
+        held: &std::collections::HashSet<DrawableId>,
+    ) -> Vec<DrawableId> {
+        let (kept, taken) = std::mem::take(&mut self.scanout_writes)
+            .into_iter()
+            .partition(|id| held.contains(id));
+        self.scanout_writes = kept;
+        taken
+    }
+
+    /// Record the fence of the submit that wrote `ids`.
+    pub(crate) fn set_scanout_write_fence(
+        &mut self,
+        ids: &[DrawableId],
+        fence: &ScanoutWriteFence,
+    ) {
+        for id in ids {
+            if self.scanout_fenced.contains(id) {
+                self.scanout_write_fence.insert(*id, fence.clone());
+            }
+        }
     }
 
     /// GLX-TFP (Task 2.3): drop the sync-only fd dup for `id`. Called by
@@ -1109,6 +1199,20 @@ impl DrawableStore {
         self.entries.get_mut(&id)
     }
 
+    /// Set scanout-fenced `id`'s last-write fence directly.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_tests_set_scanout_write_fence(&mut self, id: DrawableId, fence: ScanoutWriteFence) {
+        self.set_scanout_write_fence(&[id], &fence);
+    }
+
+    /// Mark `id` as an imported dma-buf for tests that model one.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_tests_set_imported_dmabuf(&mut self, id: DrawableId, meta: ImportedDmabufMetadata) {
+        if let Some(d) = self.entries.get_mut(&id) {
+            d.storage.imported_dmabuf = Some(meta);
+        }
+    }
+
     pub fn incref(&mut self, id: DrawableId) {
         if let Some(d) = self.entries.get_mut(&id) {
             d.refcount = d.refcount.saturating_add(1);
@@ -1245,6 +1349,7 @@ impl DrawableStore {
         let Some(mut drawable) = self.entries.remove(&id) else {
             return;
         };
+        self.untrack_scanout_writes(id);
         if self.by_xid.get(&drawable.xid).copied() == Some(id) {
             self.by_xid.remove(&drawable.xid);
             self.topology_generation = self.topology_generation.wrapping_add(1);
@@ -1507,6 +1612,16 @@ impl DrawableStore {
         // at the flush chokepoint.
         if self.exported_sync.contains_key(&id) {
             self.exported_writes.push(id);
+        }
+    }
+
+    /// Stamp `id` as WRITTEN by `ticket`. Unlike [`Self::touch_render_fence`],
+    /// which read sources share, this queues a scanout-fenced drawable for
+    /// its write fence (D7).
+    pub fn touch_render_write(&mut self, id: DrawableId, ticket: FenceTicket) {
+        self.touch_render_fence(id, ticket);
+        if self.scanout_fenced.contains(&id) && !self.scanout_writes.contains(&id) {
+            self.scanout_writes.push(id);
         }
     }
 
@@ -1946,6 +2061,47 @@ mod tests {
         );
     }
 
+    /// Only a write stamp queues a scanout-fenced drawable for its write
+    /// fence; read stamps and untracked drawables never do.
+    #[test]
+    fn touch_render_write_queues_only_fenced_destinations() {
+        let mut s = DrawableStore::new();
+        let fenced = s
+            .allocate(0x1, DrawableKind::Pixmap, 24, false, stub_storage())
+            .unwrap();
+        let plain = s
+            .allocate(0x2, DrawableKind::Pixmap, 24, false, stub_storage())
+            .unwrap();
+        s.track_scanout_writes(fenced);
+        assert!(matches!(
+            s.scanout_write_fence(fenced),
+            Some(ScanoutWriteFence::NoPendingWrite)
+        ));
+
+        s.touch_render_fence(fenced, FenceTicket::for_tests_stub());
+        assert!(
+            !s.has_unsubmitted_scanout_write(fenced),
+            "a read is no write"
+        );
+        s.touch_render_write(plain, FenceTicket::for_tests_stub());
+        assert!(!s.has_unsubmitted_scanout_write(plain));
+        assert!(s.get(plain).unwrap().last_render_ticket.is_some());
+
+        s.touch_render_write(fenced, FenceTicket::for_tests_stub());
+        s.touch_render_write(fenced, FenceTicket::for_tests_stub());
+        assert!(s.has_unsubmitted_scanout_write(fenced));
+        let held = HashSet::from([fenced]);
+        assert!(s.take_scanout_writes(&held).is_empty());
+        assert!(s.has_unsubmitted_scanout_write(fenced), "held writes stay");
+        assert_eq!(s.take_scanout_writes(&HashSet::new()), [fenced]);
+        assert!(!s.has_unsubmitted_scanout_write(fenced));
+
+        s.untrack_scanout_writes(fenced);
+        s.touch_render_write(fenced, FenceTicket::for_tests_stub());
+        assert!(!s.has_unsubmitted_scanout_write(fenced));
+        assert!(s.scanout_write_fence(fenced).is_none());
+    }
+
     #[test]
     fn ack_after_unmap_is_noop_against_empty_live_damage() {
         // Codex round 1 point 5: peek; unmap; ack against the
@@ -2382,5 +2538,33 @@ mod tests {
         assert_eq!(metadata.depth, 24);
         assert_eq!(metadata.bpp, 32);
         assert!(stub_storage().imported_dmabuf.is_none());
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "storage already promoted")]
+    fn adopt_exportable_twice_panics() {
+        let mut storage = stub_storage();
+        let null = || {
+            (
+                vk::Image::null(),
+                vk::DeviceMemory::null(),
+                vk::ImageView::null(),
+            )
+        };
+        for _ in 0..2 {
+            let (image, memory, view) = null();
+            let _ = storage.adopt_exportable(
+                image,
+                memory,
+                view,
+                view,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                256,
+                4096,
+                0,
+                0,
+            );
+        }
     }
 }

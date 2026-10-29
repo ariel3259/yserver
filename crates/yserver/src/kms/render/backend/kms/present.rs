@@ -1,7 +1,7 @@
 use crate::kms::render::{
     backend::{
         ABSOLUTE_SEQ_TAG, DirectPresentFrame, DirectScope, KmsBackend, ScanoutM0Target,
-        ScanoutM1ProbeEntry, TEARING_ENTRY_PROBATION, TearingState,
+        TEARING_ENTRY_PROBATION, TearingState,
         kms::scanout::{
             phase_b_flip_in_flight_for_scheduler, scanout_direct_eligible,
             scanout_m2_is_authoritative_root,
@@ -133,7 +133,7 @@ impl KmsBackend {
         }
     }
 
-    fn direct_candidate_gate(
+    pub(in crate::kms::render::backend) fn direct_candidate_gate(
         &self,
         candidate: PresentScanoutCandidate,
         target: ScanoutM0Target,
@@ -1281,17 +1281,34 @@ impl KmsBackend {
                 owner.unflip_fallback_source = None;
             }
         }
-        let framebuffer_ready = self
-            .pstate
-            .scanout_m1
-            .entries
-            .get(&(source_id, scope))
-            .and_then(ScanoutM1ProbeEntry::framebuffer)
-            .is_some();
+        let framebuffer_ready = self.direct_source_ready(source_id, leaf_id, scope);
         if !framebuffer_ready {
             self.request_direct_unflip_for(scope, "eligible_direct_successor_framebuffer_missing");
             return Ok(false);
         }
+        // Fence a promoted source's writes before this Present is submitted or queued (D8).
+        let (in_fence, fence_tally) = if self.pstate.server_scanout.is_promoted(source_id) {
+            match self.server_direct_source_fence(source_id, scope) {
+                Ok((fence, tally)) => (fence, Some(tally)),
+                Err(error) => {
+                    log::warn!(
+                        target: "yserver::scanout_server",
+                        "direct Present of server-owned source_id={} takes Copy: {error}",
+                        source_id.as_u64(),
+                    );
+                    self.request_direct_unflip_for(scope, "server_source_fence_failed");
+                    if let Some(owner) = self.pstate.direct.get_mut(scope)
+                        && owner.active()
+                    {
+                        owner.unflip_fallback_source = Some(source_id);
+                        owner.unflip_shadow_ready = false;
+                    }
+                    return Ok(false);
+                }
+            }
+        } else {
+            (None, None)
+        };
 
         let source_pin = self.pin_direct_source(source_id);
         let fallback_target_pin = self.pin_direct_source(fallback_target.backing_id());
@@ -1311,6 +1328,8 @@ impl KmsBackend {
             awaiting_outputs: HashSet::new(),
             accepted_event_id: None,
             async_outcome: crate::drm::async_flip::AsyncOutcome::NotRequested,
+            in_fence,
+            fence_tally,
         };
 
         if self

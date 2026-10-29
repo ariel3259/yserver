@@ -112,6 +112,40 @@ pub(in crate::kms::render::backend) struct ScanoutM0Telemetry {
     pub(in crate::kms::render::backend) m1_probe_pass: u64,
     pub(in crate::kms::render::backend) m1_probe_reject: u64,
     pub(in crate::kms::render::backend) m1_probe_error: u64,
+    pub(in crate::kms::render::backend) server: ServerScanoutTelemetry,
+}
+
+/// Per-interval counters for direct scanout of server-owned Present sources,
+/// plus the Present outcome split and unflip reasons.
+#[derive(Debug, Default)]
+pub(in crate::kms::render::backend) struct ServerScanoutTelemetry {
+    /// Eligible-shaped server-owned Presents.
+    pub(in crate::kms::render::backend) candidates: u64,
+    pub(in crate::kms::render::backend) promote_attempts: u64,
+    pub(in crate::kms::render::backend) promote_ok: u64,
+    pub(in crate::kms::render::backend) promote_fail: u64,
+    pub(in crate::kms::render::backend) promote_us_max: u64,
+    /// Receipt to Copy submit of the Present that promoted.
+    pub(in crate::kms::render::backend) promote_present_us_max: u64,
+    pub(in crate::kms::render::backend) reject_exported: u64,
+    pub(in crate::kms::render::backend) reject_cap_fail: u64,
+    pub(in crate::kms::render::backend) reject_cap_success: u64,
+    pub(in crate::kms::render::backend) reject_cap_live: u64,
+    pub(in crate::kms::render::backend) export_deferred: u64,
+    pub(in crate::kms::render::backend) export_defer_us_max: u64,
+    pub(in crate::kms::render::backend) export_deadline_teardown: u64,
+    pub(in crate::kms::render::backend) export_deadline_fail: u64,
+    pub(in crate::kms::render::backend) probe_accept: u64,
+    pub(in crate::kms::render::backend) probe_reject: u64,
+    pub(in crate::kms::render::backend) presents_direct_imported: u64,
+    pub(in crate::kms::render::backend) presents_direct_server: u64,
+    pub(in crate::kms::render::backend) presents_copy: u64,
+    pub(in crate::kms::render::backend) fence_explicit: u64,
+    pub(in crate::kms::render::backend) fence_none: u64,
+    pub(in crate::kms::render::backend) fence_cpu_wait: u64,
+    pub(in crate::kms::render::backend) direct_flush_added: u64,
+    pub(in crate::kms::render::backend) direct_flush_reused: u64,
+    pub(in crate::kms::render::backend) unflip_reasons: HashMap<&'static str, u64>,
 }
 
 impl Default for ScanoutM0Telemetry {
@@ -142,6 +176,7 @@ impl Default for ScanoutM0Telemetry {
             m1_probe_pass: 0,
             m1_probe_reject: 0,
             m1_probe_error: 0,
+            server: ServerScanoutTelemetry::default(),
         }
     }
 }
@@ -189,6 +224,9 @@ impl ScanoutM1ProbeEntry {
     }
 }
 
+/// M1 probe results keyed by `DrawableId` alone. Sound because a drawable's
+/// storage is swapped at most once, non-exportable to exportable
+/// (`Storage::adopt_exportable`); a second swap would need a generation key.
 pub(in crate::kms::render::backend) struct ScanoutM1ProbeCache {
     pub(in crate::kms::render::backend) topology_signature: u64,
     pub(in crate::kms::render::backend) entries:
@@ -218,6 +256,274 @@ impl ScanoutM1ProbeCache {
     }
 }
 
+/// Promotion token bucket burst (D3): marco's two buffers, with room for
+/// compositor restarts.
+pub(in crate::kms::render::backend) const SERVER_SCANOUT_PROMOTE_BURST: u32 = 8;
+/// One promotion token refills per interval (D3).
+pub(in crate::kms::render::backend) const SERVER_SCANOUT_PROMOTE_REFILL: std::time::Duration =
+    std::time::Duration::from_secs(30);
+/// Failed promotions allowed per topology epoch (D3).
+pub(in crate::kms::render::backend) const SERVER_SCANOUT_FAILURE_CAP: u32 = 4;
+/// Promoted server-owned drawables alive at once (D3).
+pub(in crate::kms::render::backend) const SERVER_SCANOUT_LIVE_CAP: usize = 4;
+
+/// The exported layout of a promoted server-owned pixmap. Owns the dma-buf
+/// fd; the probe framebuffer that imported it lives in the M1 cache and is
+/// always dropped first (D9).
+#[derive(Debug)]
+pub(in crate::kms::render::backend) struct ServerScanoutDescriptor {
+    pub(in crate::kms::render::backend) fd: OwnedFd,
+    pub(in crate::kms::render::backend) layout: ScanoutSourceLayout,
+}
+
+/// Direct-scanout lifecycle of one server-owned Present source.
+#[derive(Debug)]
+pub(in crate::kms::render::backend) enum ServerScanoutState {
+    Candidate,
+    Promoted(ServerScanoutDescriptor),
+    Failed(String),
+    /// Handed to a client after promotion; never flipped again (D6). Keeps
+    /// the descriptor until no direct frame references the source.
+    Disqualified(Option<ServerScanoutDescriptor>),
+}
+
+/// Whether a Present destination's source rotation may flip (D1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::kms::render::backend) enum RotationState {
+    Observing,
+    Complete,
+    Failed,
+}
+
+/// The distinct eligible sources Presented to one destination, in order, at
+/// most two, with each one's eligible Present count since the rotation began.
+#[derive(Debug)]
+pub(in crate::kms::render::backend) struct Rotation {
+    pub(in crate::kms::render::backend) members: Vec<(DrawableId, u8)>,
+    pub(in crate::kms::render::backend) state: RotationState,
+}
+
+/// What one admitted Present did to its destination's rotation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::kms::render::backend) struct RotationObservation {
+    /// A `Complete` rotation stopped being complete; the caller unflips.
+    pub(in crate::kms::render::backend) left_complete: bool,
+    /// Every member has had a second eligible Present: promote now.
+    pub(in crate::kms::render::backend) identified: bool,
+}
+
+/// Successful-promotion rate limit (D3): a token bucket.
+#[derive(Debug)]
+pub(in crate::kms::render::backend) struct PromoteTokens {
+    pub(in crate::kms::render::backend) tokens: u32,
+    pub(in crate::kms::render::backend) last_refill: std::time::Instant,
+}
+
+impl PromoteTokens {
+    pub(in crate::kms::render::backend) fn new(now: std::time::Instant) -> Self {
+        Self {
+            tokens: SERVER_SCANOUT_PROMOTE_BURST,
+            last_refill: now,
+        }
+    }
+
+    fn refill(&mut self, now: std::time::Instant) {
+        if self.tokens >= SERVER_SCANOUT_PROMOTE_BURST {
+            self.last_refill = now;
+            return;
+        }
+        let elapsed = now.saturating_duration_since(self.last_refill);
+        let earned = elapsed.as_nanos() / SERVER_SCANOUT_PROMOTE_REFILL.as_nanos();
+        let earned = u32::try_from(earned).unwrap_or(u32::MAX);
+        if earned == 0 {
+            return;
+        }
+        self.tokens = self
+            .tokens
+            .saturating_add(earned)
+            .min(SERVER_SCANOUT_PROMOTE_BURST);
+        self.last_refill = if self.tokens == SERVER_SCANOUT_PROMOTE_BURST {
+            now
+        } else {
+            self.last_refill + SERVER_SCANOUT_PROMOTE_REFILL * earned
+        };
+    }
+
+    /// Take `n` tokens, all or none.
+    pub(in crate::kms::render::backend) fn reserve(
+        &mut self,
+        n: u32,
+        now: std::time::Instant,
+    ) -> bool {
+        self.refill(now);
+        if self.tokens < n {
+            return false;
+        }
+        self.tokens -= n;
+        true
+    }
+
+    /// Return `n` reserved tokens that no promotion spent.
+    pub(in crate::kms::render::backend) fn refund(&mut self, n: u32) {
+        self.tokens = self
+            .tokens
+            .saturating_add(n)
+            .min(SERVER_SCANOUT_PROMOTE_BURST);
+    }
+}
+
+/// Candidate tracking for direct scanout of server-owned Present sources:
+/// per-source state, per-destination rotations and the D3 caps.
+#[derive(Debug)]
+pub(in crate::kms::render::backend) struct ServerScanoutSources {
+    pub(in crate::kms::render::backend) sources: HashMap<DrawableId, ServerScanoutState>,
+    /// Keyed by the Present destination's drawable.
+    pub(in crate::kms::render::backend) rotations: HashMap<DrawableId, Rotation>,
+    pub(in crate::kms::render::backend) failures: u32,
+    /// Topology signature the failure count belongs to.
+    pub(in crate::kms::render::backend) failure_epoch: u64,
+    pub(in crate::kms::render::backend) tokens: PromoteTokens,
+    /// The D8 CPU-wait fallback has been logged.
+    pub(in crate::kms::render::backend) fence_cpu_wait_warned: bool,
+}
+
+impl ServerScanoutSources {
+    pub(in crate::kms::render::backend) fn new(now: std::time::Instant) -> Self {
+        Self {
+            sources: HashMap::new(),
+            rotations: HashMap::new(),
+            failures: 0,
+            failure_epoch: 0,
+            tokens: PromoteTokens::new(now),
+            fence_cpu_wait_warned: false,
+        }
+    }
+
+    /// Promoted drawables alive now.
+    pub(in crate::kms::render::backend) fn live(&self) -> usize {
+        self.sources
+            .values()
+            .filter(|state| matches!(state, ServerScanoutState::Promoted(_)))
+            .count()
+    }
+
+    pub(in crate::kms::render::backend) fn is_promoted(&self, id: DrawableId) -> bool {
+        matches!(self.sources.get(&id), Some(ServerScanoutState::Promoted(_)))
+    }
+
+    /// Whether `id` is disqualified but its descriptor still waits for the
+    /// CRTCs to leave it.
+    pub(in crate::kms::render::backend) fn awaits_release(&self, id: DrawableId) -> bool {
+        matches!(
+            self.sources.get(&id),
+            Some(ServerScanoutState::Disqualified(Some(_)))
+        )
+    }
+
+    pub(in crate::kms::render::backend) fn descriptor(
+        &self,
+        id: DrawableId,
+    ) -> Option<&ServerScanoutDescriptor> {
+        match self.sources.get(&id) {
+            Some(ServerScanoutState::Promoted(descriptor)) => Some(descriptor),
+            _ => None,
+        }
+    }
+
+    /// Whether `source`'s rotation on `dest` is complete, the condition for
+    /// a server-owned source to flip.
+    pub(in crate::kms::render::backend) fn rotation_complete(
+        &self,
+        dest: DrawableId,
+        source: DrawableId,
+    ) -> bool {
+        self.rotations.get(&dest).is_some_and(|rotation| {
+            rotation.state == RotationState::Complete
+                && rotation.members.iter().any(|(id, _)| *id == source)
+        })
+    }
+
+    /// Record one admitted Present of `source` on `dest` (D1).
+    pub(in crate::kms::render::backend) fn observe(
+        &mut self,
+        dest: DrawableId,
+        source: DrawableId,
+    ) -> RotationObservation {
+        self.sources
+            .entry(source)
+            .or_insert(ServerScanoutState::Candidate);
+        let rotation = self.rotations.entry(dest).or_insert_with(|| Rotation {
+            members: Vec::with_capacity(2),
+            state: RotationState::Observing,
+        });
+        let was_complete = rotation.state == RotationState::Complete;
+        if let Some(member) = rotation.members.iter_mut().find(|(id, _)| *id == source) {
+            member.1 = member.1.saturating_add(1);
+        } else if rotation.members.len() < 2 {
+            rotation.members.push((source, 1));
+            if rotation.state == RotationState::Complete {
+                rotation.state = RotationState::Observing;
+            }
+        } else {
+            rotation.members.clear();
+            rotation.members.push((source, 1));
+            rotation.state = RotationState::Observing;
+        }
+        RotationObservation {
+            left_complete: was_complete && rotation.state != RotationState::Complete,
+            identified: rotation.state == RotationState::Observing
+                && rotation.members.iter().all(|(_, presents)| *presents >= 2),
+        }
+    }
+
+    /// Forget a retired drawable: its source state, a rotation it was the
+    /// destination of, and its membership in others. Returns whether a
+    /// `Complete` rotation lost a member (the caller unflips).
+    pub(in crate::kms::render::backend) fn retire(&mut self, id: DrawableId) -> bool {
+        self.sources.remove(&id);
+        self.rotations.remove(&id);
+        let mut left_complete = false;
+        for rotation in self.rotations.values_mut() {
+            let before = rotation.members.len();
+            rotation.members.retain(|(member, _)| *member != id);
+            if rotation.members.len() != before && rotation.state == RotationState::Complete {
+                rotation.state = RotationState::Observing;
+                left_complete = true;
+            }
+        }
+        left_complete
+    }
+}
+
+/// A DRI3 export of a promoted source, parked until no direct frame
+/// references it (D6). The pin keeps the exact storage alive; completion
+/// never resolves the XID again.
+#[derive(Debug)]
+pub(in crate::kms::render::backend) struct ParkedServerScanoutExport {
+    pub(in crate::kms::render::backend) id: DrawableId,
+    pub(in crate::kms::render::backend) host_xid: u32,
+    pub(in crate::kms::render::backend) pin: u64,
+    pub(in crate::kms::render::backend) parked_at: std::time::Instant,
+    pub(in crate::kms::render::backend) deadline: std::time::Instant,
+    /// Set once the export ran (or failed); the token is then ready.
+    pub(in crate::kms::render::backend) result:
+        Option<io::Result<yserver_core::backend::Dri3PixmapExport>>,
+}
+
+/// How long a deferred DRI3 export waits for the CRTCs before the safe
+/// teardown (D6): the per-CRTC RANDR event wait.
+pub(in crate::kms::render::backend) const SERVER_SCANOUT_EXPORT_WAIT: std::time::Duration =
+    super::crtc_config::PER_CRTC_EVENT_WAIT;
+
+/// Deferred DRI3 exports of promoted server-owned sources.
+#[derive(Debug, Default)]
+pub(in crate::kms::render::backend) struct DeferredServerScanoutExports {
+    pub(in crate::kms::render::backend) parked:
+        HashMap<yserver_core::backend::Dri3ExportToken, ParkedServerScanoutExport>,
+    pub(in crate::kms::render::backend) ready: Vec<yserver_core::backend::Dri3ExportToken>,
+    pub(in crate::kms::render::backend) next_token: u64,
+}
+
 pub(in crate::kms::render::backend) struct DirectPresentFrame {
     pub(in crate::kms::render::backend) source_pin: u64,
     pub(in crate::kms::render::backend) fallback_target_pin: u64,
@@ -244,7 +550,76 @@ pub(in crate::kms::render::backend) struct DirectPresentFrame {
     /// directly constructed frames have no event identity.
     pub(in crate::kms::render::backend) accepted_event_id: Option<u64>,
     pub(in crate::kms::render::backend) async_outcome: crate::drm::async_flip::AsyncOutcome,
+    /// `IN_FENCE_FD` for a server-owned source: the sync_file of the last
+    /// submit that wrote it, captured when this Present was taken (D8).
+    pub(in crate::kms::render::backend) in_fence: Option<OwnedFd>,
+    /// How `in_fence` was produced; counted once this frame is committed.
+    pub(in crate::kms::render::backend) fence_tally: Option<ServerFenceTally>,
 }
+
+/// How a server-owned direct Present was fenced (D8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::kms::render::backend) struct ServerFenceTally {
+    /// Unsubmitted writes were flushed for this Present.
+    pub(in crate::kms::render::backend) flush_added: bool,
+    pub(in crate::kms::render::backend) kind: ServerFenceKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::kms::render::backend) enum ServerFenceKind {
+    /// No write since promotion.
+    None,
+    /// The commit carries the writing submit's sync_file.
+    Explicit,
+    /// The CPU waited for the source's last render ticket.
+    CpuWait,
+}
+
+/// A successful server-owned promotion: the descriptor and the accepted
+/// probe framebuffer for the M1 cache.
+/// Field order drops the framebuffer before the descriptor's fd (D9).
+pub(in crate::kms::render::backend) struct ServerScanoutPromotion {
+    pub(in crate::kms::render::backend) framebuffer:
+        crate::drm::modeset::DirectScanoutProbeFramebuffer,
+    pub(in crate::kms::render::backend) descriptor: ServerScanoutDescriptor,
+}
+
+/// Why a server-owned promotion left the storage unchanged.
+#[derive(Debug)]
+pub(in crate::kms::render::backend) enum ServerScanoutPromoteError {
+    /// Allocation, export, copy or adopt failed in the engine.
+    Engine(String),
+    /// Validation, `AddFB2` or `TEST_ONLY` refused the candidate.
+    ProbeRejected(String),
+}
+
+impl std::fmt::Display for ServerScanoutPromoteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Engine(reason) => write!(f, "engine: {reason}"),
+            Self::ProbeRejected(reason) => write!(f, "probe rejected: {reason}"),
+        }
+    }
+}
+
+pub(in crate::kms::render::backend) type ServerScanoutPromoter =
+    fn(&mut KmsBackend, DrawableId) -> Result<ServerScanoutPromotion, ServerScanoutPromoteError>;
+
+/// Imports an M1 probe source as a framebuffer (PRIME + `AddFB2`); a seam for tests.
+pub(in crate::kms::render::backend) type ScanoutM1Importer =
+    fn(
+        std::rc::Rc<crate::drm::Device>,
+        std::os::fd::BorrowedFd<'_>,
+        &ScanoutSourceLayout,
+    ) -> io::Result<crate::drm::modeset::DirectScanoutProbeFramebuffer>;
+
+/// Waits on the CPU for a server-owned source's last render; a seam for tests.
+pub(in crate::kms::render::backend) type DirectSourceCpuWaiter =
+    fn(&KmsBackend, DrawableId) -> io::Result<()>;
+
+/// Exports one drawable for DRI3; a seam for tests.
+pub(in crate::kms::render::backend) type Dri3DrawableExporter =
+    fn(&mut KmsBackend, DrawableId, u32) -> io::Result<yserver_core::backend::Dri3PixmapExport>;
 
 pub(in crate::kms::render::backend) type DirectFrameSubmitter =
     fn(
@@ -587,6 +962,54 @@ pub(in crate::kms::render::backend) struct ScanoutM1OutputGeometry {
     pub(in crate::kms::render::backend) height: u32,
     pub(in crate::kms::render::backend) mode_width: u32,
     pub(in crate::kms::render::backend) mode_height: u32,
+}
+
+/// Format and plane-0 layout of a direct-scanout source, as M1 validates it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::kms::render::backend) struct ScanoutSourceLayout {
+    pub(in crate::kms::render::backend) fourcc: u32,
+    pub(in crate::kms::render::backend) vk_format: vk::Format,
+    pub(in crate::kms::render::backend) depth: u8,
+    pub(in crate::kms::render::backend) bpp: u8,
+    pub(in crate::kms::render::backend) width: u16,
+    pub(in crate::kms::render::backend) height: u16,
+    pub(in crate::kms::render::backend) plane_count: usize,
+    pub(in crate::kms::render::backend) offset: u64,
+    pub(in crate::kms::render::backend) pitch: u32,
+    pub(in crate::kms::render::backend) modifier: u64,
+}
+
+/// A direct-scanout source's layout plus an fd the M1 probe may import.
+#[derive(Debug)]
+pub(in crate::kms::render::backend) struct ScanoutSourceDescriptor {
+    pub(in crate::kms::render::backend) fd: OwnedFd,
+    pub(in crate::kms::render::backend) layout: ScanoutSourceLayout,
+}
+
+/// Why no [`ScanoutSourceDescriptor`] could be built for a source.
+#[derive(Debug)]
+pub(in crate::kms::render::backend) enum ScanoutM1DescriptorError {
+    /// No scanout-capable dma-buf metadata (server-owned or implicit layout).
+    Unavailable,
+    /// The layout is known but duplicating its fd failed.
+    FdDup {
+        layout: ScanoutSourceLayout,
+        error: io::Error,
+    },
+}
+
+/// The M1 format/size check a source failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::kms::render::backend) enum ScanoutM1Reject {
+    Fourcc,
+    VkFormat,
+    PlaneCount,
+    Depth,
+    Bpp,
+    ZeroPitch,
+    /// Not the size of the scope's area: the root, or the output.
+    ScopeSizeMismatch,
+    Modifier,
 }
 
 /// Monotonic device-qualified RANDR connector registry.
@@ -932,6 +1355,7 @@ pub struct KmsBackendState {
     /// drawable pin, submits DRM work, or affects Present capabilities.
     pub(in crate::kms::render::backend) scanout_m0: ScanoutM0Telemetry,
     pub(in crate::kms::render::backend) scanout_m1: ScanoutM1ProbeCache,
+    pub(in crate::kms::render::backend) scanout_m1_importer: ScanoutM1Importer,
     pub(in crate::kms::render::backend) direct: DirectOwners,
     pub(in crate::kms::render::backend) tearing: Tearing,
     /// Monotonic clock for KMS cursor-composition pacing.
@@ -939,6 +1363,13 @@ pub struct KmsBackendState {
         std::rc::Rc<dyn Fn() -> std::time::Instant>,
     pub(in crate::kms::render::backend) direct_frame_submitter: DirectFrameSubmitter,
     pub(in crate::kms::render::backend) scanout_m1_prober: ScanoutM1Prober,
+    /// Declared after `scanout_m1`: probe framebuffers drop before descriptor fds (D9).
+    pub(in crate::kms::render::backend) server_scanout: ServerScanoutSources,
+    /// Promotes one server-owned source for scanout; a seam for tests.
+    pub(in crate::kms::render::backend) server_scanout_promoter: ServerScanoutPromoter,
+    pub(in crate::kms::render::backend) direct_source_cpu_waiter: DirectSourceCpuWaiter,
+    pub(in crate::kms::render::backend) server_scanout_exports: DeferredServerScanoutExports,
+    pub(in crate::kms::render::backend) dri3_drawable_exporter: Dri3DrawableExporter,
     pub(in crate::kms::render::backend) vt_resume_executor:
         std::rc::Rc<dyn super::session::VtResumeExecutor>,
 

@@ -16,6 +16,7 @@ mod randr;
 mod render_clip;
 mod render_picture;
 mod root_scanout;
+mod server_scanout;
 mod stacking;
 mod tearing;
 mod vblank_fallback;
@@ -908,7 +909,29 @@ fn create_live_window(
 /// the DRM transaction. `source_xid` stands in for the client buffer the
 /// CRTCs are scanning out; the compositor's pools are left untouched,
 /// which is exactly what happens on hardware.
-fn retain_direct_frame_from_source_test(
+/// Linear single-plane XRGB8888 dma-buf metadata, which makes a test
+/// source an imported one for M2.
+pub(super) fn imported_dmabuf_for_test(
+    width: u16,
+    height: u16,
+) -> crate::kms::render::store::ImportedDmabufMetadata {
+    crate::kms::render::store::ImportedDmabufMetadata {
+        fourcc: 0x3432_5258,
+        vk_format: ash::vk::Format::B8G8R8A8_UNORM,
+        modifier: 0,
+        implicit_layout: false,
+        planes: vec![crate::kms::render::store::ImportedDmabufPlane {
+            offset: 0,
+            pitch: u32::from(width) * 4,
+        }],
+        width,
+        height,
+        depth: 24,
+        bpp: 32,
+    }
+}
+
+pub(super) fn retain_direct_frame_from_source_test(
     b: &mut crate::kms::render::backend::KmsBackend,
     source_xid: u32,
     fallback_xid: u32,
@@ -980,6 +1003,8 @@ fn retain_direct_frame_from_source_test(
         awaiting_outputs: std::collections::HashSet::new(),
         accepted_event_id: None,
         async_outcome: crate::drm::async_flip::AsyncOutcome::NotRequested,
+        in_fence: None,
+        fence_tally: None,
     });
     b.pstate.direct.root_mut().hold_direct = true;
 }
@@ -1243,6 +1268,8 @@ pub(super) fn install_direct_frame_for_target_test(
             std::collections::HashSet::from([0])
         },
         async_outcome: crate::drm::async_flip::AsyncOutcome::NotRequested,
+        in_fence: None,
+        fence_tally: None,
     };
     if current {
         b.pstate.direct.root_mut().current = Some(frame);
