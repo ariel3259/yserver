@@ -2896,14 +2896,12 @@ fn live_scene_backend_with_outputs(output_count: usize) -> Option<KmsBackend> {
 }
 
 #[test]
-#[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: let any pending direct transaction suppress cursor wakeups on all outputs.
-fn cursor_wakeup_on_composed_output_while_other_output_owner_pending() {
+// Mutation T09: let any pending direct transaction suppress cursor wakeups on all outputs.
+fn composed_cursor_wakeup_policy() {
     use yserver_core::backend::Backend;
 
-    let Some(mut backend) = live_scene_backend_with_outputs(2) else {
-        return;
-    };
+    let mut backend = KmsBackend::for_tests();
+    super::push_test_output(&mut backend, 0x7499);
     let fallback_id = seed_window(&mut backend, 0x7498, None, 0, 0);
     install_direct_frame_for_target_test(&mut backend, 0x7499, fallback_id, false);
     let mut pending = backend
@@ -2919,13 +2917,22 @@ fn cursor_wakeup_on_composed_output_while_other_output_owner_pending() {
     backend.pstate.direct.outputs[1].pending = Some(pending);
     backend.pstate.direct.outputs[1].hold_direct = true;
 
+    // Keep the cursor move as the only possible immediate source. In
+    // particular, the pending output owner itself must not schedule a wake.
     backend.scene.scene_structure_dirty = false;
     for drawable in backend.store.armed_damaged_ids() {
         if let Some(snapshot) = backend.store.peek_presentation_damage(drawable) {
             backend.store.ack_presentation_damage(snapshot);
         }
     }
-    assert!(!backend.for_tests_scene_wants_scene());
+    assert!(
+        !backend.for_tests_scene_wants_scene(),
+        "scene damage is quiet"
+    );
+    assert!(
+        Backend::next_wakeup(&backend).is_none(),
+        "pending Output(1) alone does not schedule an immediate wake"
+    );
     let position = backend.platform.for_tests_seed_atomic_cursor_position(
         0,
         raw(51),
@@ -2946,9 +2953,12 @@ fn cursor_wakeup_on_composed_output_while_other_output_owner_pending() {
 
     assert!(
         wakeup.is_some_and(|deadline| deadline <= std::time::Instant::now()),
-        "an eligible cursor move on output 0 must wake despite output 1's pending direct frame"
+        "an eligible cursor move on output 0 wakes despite Output(1)'s pending direct frame"
     );
-    assert!(backend.pstate.direct.outputs[1].pending.is_some());
+    assert!(
+        backend.pstate.direct.outputs[1].pending.is_some(),
+        "next_wakeup does not consume Output(1)'s pending frame"
+    );
     assert!(
         backend
             .platform
