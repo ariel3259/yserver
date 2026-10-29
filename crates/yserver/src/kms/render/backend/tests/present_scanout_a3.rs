@@ -495,175 +495,149 @@ fn a3_visible_root_pixel(
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: restore the root-wide unflip request for every authoritative Present.
-fn shaped_away_stage_present_keeps_output_owner() {
+// Mutations: A01 makes every authoritative Present request a root-wide unflip;
+// A02 treats every shaped COW as hidden from every output.
+fn cow_present_visibility() {
     use yserver_core::backend::Backend;
     use yserver_protocol::x11::{ResourceId, xfixes::RegionRect};
 
-    let Some((mut fixture, direct)) = a3_output_fixture(1, 940) else {
-        eprintln!("SKIP shaped_away_stage_present_keeps_output_owner: Vulkan fixture unavailable");
-        return;
-    };
-    let mut state = yserver_core::server::ServerState::new();
-    let game_xid = direct.target_xid;
-    let (game_x, game_y, game_width, game_height) = {
-        let output = &fixture.events.backend.platform.outputs[1];
-        (
-            output.x as i16,
-            output.y as i16,
-            output.width,
-            output.height,
-        )
-    };
-    a3_add_existing_window_to_state(
-        &mut state,
-        ResourceId(0x3160),
-        game_xid,
-        game_x,
-        game_y,
-        game_width,
-        game_height,
-        true,
-    );
-    Backend::sync_top_level_order(&mut fixture.events.backend, &state);
-    a3_enter_output_owner(&mut fixture, &direct, 1);
-    let current_present = fixture.events.backend.pstate.direct.outputs[1]
-        .current
-        .as_ref()
-        .expect("Output(1) is held")
-        .candidate
-        .present_id;
-
-    let cow_xid = a3_materialize_cow(&mut fixture, &mut state);
-    Backend::set_shape_rectangles(
-        &mut fixture.events.backend,
-        None,
-        cow_xid,
-        0,
-        Some(&[RegionRect {
-            x: 0,
-            y: 0,
-            width: 1920,
-            height: 1080,
-        }]),
-    )
-    .expect("shape the stage to output 0 through Backend");
-    let stage = a3_install_root_present(&mut fixture, 941, cow_xid);
-    a3_present_root_copy(&mut fixture, &stage, 0x00d1_7b31);
-
-    let owner = &fixture.events.backend.pstate.direct.outputs[1];
-    assert!(
-        !owner.unflip_requested,
-        "stage shaped away from output 1 is hidden there"
-    );
-    assert_eq!(
-        owner.current.as_ref().unwrap().candidate.present_id,
-        current_present,
-        "Output(1) keeps the same current direct Present"
-    );
-    let records = a3_tick(&mut fixture);
-    assert!(
-        a3_has_scene_commit_for(
-            &records,
-            fixture.events.backend.platform.outputs[0].output.crtc
-        ),
-        "output 0 composes the COW stage"
-    );
-    assert!(
-        !a3_has_scene_commit_for(
-            &records,
-            fixture.events.backend.platform.outputs[1].output.crtc
-        ),
-        "output 1 remains direct"
-    );
-    a3_retire_records(&mut fixture, &records);
-    assert_eq!(
-        &a3_visible_root_pixel(&mut fixture, 150, 150)[..3],
-        &[0x31, 0x7b, 0xd1],
-        "output 0 displays the stage pixels"
-    );
-    assert!(!fixture.events.backend.pstate.direct.outputs[1].unflip_requested);
-    assert_eq!(
-        fixture.events.backend.pstate.direct.outputs[1]
+    for (row, present_id, shape_width, expected_unflip) in [
+        ("shaped-away", 940, 1920, false),
+        ("intersecting", 943, 3840, true),
+    ] {
+        let Some((fixture, direct)) = a3_output_fixture(1, present_id) else {
+            eprintln!("SKIP cow_present_visibility: Vulkan fixture unavailable");
+            return;
+        };
+        let mut fixture = fixture.cleanup_guard();
+        let mut state = yserver_core::server::ServerState::new();
+        let game_xid = direct.target_xid;
+        let (game_x, game_y, game_width, game_height) = {
+            let output = &fixture.events.backend.platform.outputs[1];
+            (
+                output.x as i16,
+                output.y as i16,
+                output.width,
+                output.height,
+            )
+        };
+        a3_add_existing_window_to_state(
+            &mut state,
+            ResourceId(0x3160),
+            game_xid,
+            game_x,
+            game_y,
+            game_width,
+            game_height,
+            true,
+        );
+        Backend::sync_top_level_order(&mut fixture.events.backend, &state);
+        a3_enter_output_owner(&mut fixture, &direct, 1);
+        let current_present = fixture.events.backend.pstate.direct.outputs[1]
             .current
             .as_ref()
-            .unwrap()
+            .expect("Output(1) is held")
             .candidate
-            .present_id,
-        current_present,
-        "Output(1) stays current through output 0's retirement"
-    );
-    fixture.finish();
-}
+            .present_id;
 
-#[test]
-#[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: treat every shaped COW as hidden from every output.
-fn stage_present_visible_on_output_revokes_it() {
-    use yserver_core::backend::Backend;
-    use yserver_protocol::x11::{ResourceId, xfixes::RegionRect};
+        let cow_xid = a3_materialize_cow(&mut fixture, &mut state);
+        Backend::set_shape_rectangles(
+            &mut fixture.events.backend,
+            None,
+            cow_xid,
+            0,
+            Some(&[RegionRect {
+                x: 0,
+                y: 0,
+                width: shape_width,
+                height: 1080,
+            }]),
+        )
+        .expect("shape the COW through Backend");
+        let stage = a3_install_root_present(&mut fixture, present_id + 1, cow_xid);
+        a3_present_root_copy(&mut fixture, &stage, 0x00d1_7b31);
+        assert_eq!(
+            fixture.events.backend.pstate.direct.outputs[1]
+                .current
+                .as_ref()
+                .map(|frame| frame.candidate.present_id),
+            Some(current_present),
+            "{row}: the held direct owner remains until a replacement retires"
+        );
 
-    let Some((mut fixture, direct)) = a3_output_fixture(1, 942) else {
-        eprintln!("SKIP stage_present_visible_on_output_revokes_it: Vulkan fixture unavailable");
-        return;
-    };
-    let mut state = yserver_core::server::ServerState::new();
-    let output = &fixture.events.backend.platform.outputs[1];
-    a3_add_existing_window_to_state(
-        &mut state,
-        ResourceId(0x3161),
-        direct.target_xid,
-        output.x as i16,
-        output.y as i16,
-        output.width,
-        output.height,
-        true,
-    );
-    Backend::sync_top_level_order(&mut fixture.events.backend, &state);
-    a3_enter_output_owner(&mut fixture, &direct, 1);
+        let owner = &fixture.events.backend.pstate.direct.outputs[1];
+        assert_eq!(
+            owner.unflip_requested, expected_unflip,
+            "{row}: COW visibility controls only the intersecting output"
+        );
+        if expected_unflip {
+            assert_eq!(
+                owner.unflip_reason,
+                Some("ineligible_authoritative_root_present"),
+                "{row}: selected output records the authoritative Present reason"
+            );
+            assert_eq!(
+                owner.unflip_fallback_source, None,
+                "{row}: Output scope does not retain a fallback source"
+            );
+            assert!(
+                owner.unflip_shadow_ready,
+                "{row}: Copy prepares the replacement"
+            );
+            assert!(
+                owner.current.is_some(),
+                "{row}: direct frame awaits replacement"
+            );
+        }
 
-    let cow_xid = a3_materialize_cow(&mut fixture, &mut state);
-    Backend::set_shape_rectangles(
-        &mut fixture.events.backend,
-        None,
-        cow_xid,
-        0,
-        Some(&[RegionRect {
-            x: 0,
-            y: 0,
-            width: 3840,
-            height: 1080,
-        }]),
-    )
-    .expect("shape the COW across both outputs through Backend");
-    let stage = a3_install_root_present(&mut fixture, 943, cow_xid);
-    a3_present_root_copy(&mut fixture, &stage, 0x0000_8fda);
-
-    let owner = &fixture.events.backend.pstate.direct.outputs[1];
-    assert!(owner.unflip_requested, "the stage intersects output 1");
-    assert_eq!(
-        owner.unflip_reason,
-        Some("ineligible_authoritative_root_present")
-    );
-    assert_eq!(owner.unflip_fallback_source, None);
-    assert!(
-        owner.unflip_shadow_ready,
-        "the Copy prepared the replacement"
-    );
-    assert!(
-        owner.current.is_some(),
-        "the last direct frame awaits replacement"
-    );
-    let records = a3_tick(&mut fixture);
-    assert!(
-        a3_has_scene_commit_for(
-            &records,
-            fixture.events.backend.platform.outputs[1].output.crtc
-        ),
-        "the next scheduler pass composes output 1's replacement"
-    );
-    a3_retire_records(&mut fixture, &records);
-    fixture.finish();
+        let records = a3_tick(&mut fixture);
+        let output0_crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+        let output1_crtc = fixture.events.backend.platform.outputs[1].output.crtc;
+        assert_eq!(
+            [
+                a3_has_scene_commit_for(&records, output0_crtc),
+                a3_has_scene_commit_for(&records, output1_crtc),
+            ],
+            if expected_unflip {
+                [true, true]
+            } else {
+                [true, false]
+            },
+            "{row}: only outputs selected by the shaped COW submit scene commits"
+        );
+        if expected_unflip {
+            let replacement = records.iter().find(|record| {
+                super::commit_identity::accepted_event_id(record).is_some()
+                    && a3_has_scene_commit_for(std::slice::from_ref(*record), output1_crtc)
+            });
+            assert!(
+                replacement.is_some(),
+                "{row}: output 1 replacement is accepted"
+            );
+            a3_retire_records(&mut fixture, &records);
+            assert!(
+                fixture.events.backend.pstate.direct.outputs[1]
+                    .current
+                    .is_none(),
+                "{row}: output 1 owner releases after its replacement retires"
+            );
+        } else {
+            a3_retire_records(&mut fixture, &records);
+            assert_eq!(
+                &a3_visible_root_pixel(&mut fixture, 150, 150)[..3],
+                &[0x31, 0x7b, 0xd1],
+                "{row}: output 0 displays the copied stage pixels"
+            );
+            let owner = &fixture.events.backend.pstate.direct.outputs[1];
+            assert!(!owner.unflip_requested, "{row}: output 1 remains direct");
+            assert_eq!(
+                owner.current.as_ref().unwrap().candidate.present_id,
+                current_present,
+                "{row}: output 1 stays current through output 0 retirement"
+            );
+        }
+        drop(fixture);
+    }
 }
 
 #[test]
@@ -945,286 +919,517 @@ fn output_owner_copy_fallback_is_marked_ready() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: on_top_level_order_changed unflips every owner.
-fn restack_on_other_output_keeps_output_owner() {
-    use yserver_core::{backend::Backend, server::ServerState};
-    use yserver_protocol::x11::ResourceId;
+// Mutations: A05 revokes every owner on any top-level restack; A06 omits stacking
+// from tick revalidation; A10 revalidates before the core tree's stacking reprojection.
+fn output_restack_revalidation() {
+    use yserver_core::{backend::Backend, host_x11::HostSubwindowConfig, server::ServerState};
+    use yserver_protocol::x11::{ConfigureWindowRequest, ResourceId};
 
-    let Some((mut fixture, direct)) = a3_output_fixture(1, 930) else {
-        eprintln!("SKIP restack_on_other_output_keeps_output_owner: Vulkan fixture unavailable");
-        return;
-    };
-    let mut state = ServerState::new();
-    let lower = a3_seed_ordered_window(
-        &mut fixture,
-        &mut state,
-        ResourceId(0x3100),
-        100,
-        100,
-        500,
-        500,
-        true,
-    );
-    let upper = a3_seed_ordered_window(
-        &mut fixture,
-        &mut state,
-        ResourceId(0x3101),
-        100,
-        100,
-        500,
-        500,
-        true,
-    );
-    Backend::fill_rectangle(
-        &mut fixture.events.backend,
-        None,
-        lower,
-        0x00ff_0000,
-        0,
-        0,
-        500,
-        500,
-    )
-    .expect("paint the lower output 0 window red");
-    Backend::fill_rectangle(
-        &mut fixture.events.backend,
-        None,
-        upper,
-        0x0000_00ff,
-        0,
-        0,
-        500,
-        500,
-    )
-    .expect("paint the upper output 0 window blue");
-    a3_add_existing_window_to_state(
-        &mut state,
-        ResourceId(0x3102),
-        direct.target_xid,
-        1920,
-        0,
-        1920,
-        1080,
-        true,
-    );
-    Backend::sync_top_level_order(&mut fixture.events.backend, &state);
-    a3_enter_output_owner(&mut fixture, &direct, 1);
-    let before = fixture.events.backend.pstate.direct.outputs[1]
-        .current
-        .as_ref()
-        .unwrap()
-        .candidate
-        .present_id;
+    for (row, present_id) in [
+        ("restack-elsewhere", 930),
+        ("raise-over-owner", 931),
+        ("move-and-lower", 934),
+    ] {
+        let Some((fixture, direct)) = a3_output_fixture(1, present_id) else {
+            eprintln!("SKIP output_restack_revalidation: Vulkan fixture unavailable");
+            return;
+        };
+        let mut fixture = fixture.cleanup_guard();
+        let mut state = ServerState::new();
+        let lower = a3_seed_ordered_window(
+            &mut fixture,
+            &mut state,
+            ResourceId(0x3100),
+            100,
+            100,
+            500,
+            500,
+            true,
+        );
+        let upper = a3_seed_ordered_window(
+            &mut fixture,
+            &mut state,
+            ResourceId(0x3101),
+            100,
+            100,
+            500,
+            500,
+            true,
+        );
+        Backend::fill_rectangle(
+            &mut fixture.events.backend,
+            None,
+            lower,
+            0x00ff_0000,
+            0,
+            0,
+            500,
+            500,
+        )
+        .expect("paint the lower output 0 window red");
+        Backend::fill_rectangle(
+            &mut fixture.events.backend,
+            None,
+            upper,
+            0x0000_00ff,
+            0,
+            0,
+            500,
+            500,
+        )
+        .expect("paint the upper output 0 window blue");
 
-    a3_restack_top_level(
-        &mut fixture,
-        &mut state,
-        ResourceId(0x3100),
-        ResourceId(0x3101),
-        lower,
-        upper,
-        0,
-    );
-    let records = a3_tick(&mut fixture);
-    let owner = &fixture.events.backend.pstate.direct.outputs[1];
-    assert!(
-        !owner.unflip_requested,
-        "output 0 restack leaves Output(1) held"
-    );
-    assert_eq!(owner.current.as_ref().unwrap().candidate.present_id, before);
-    assert!(
-        a3_has_scene_commit_for(
-            &records,
-            fixture.events.backend.platform.outputs[0].output.crtc
-        ),
-        "output 0 composes the changed top-level order"
-    );
-    a3_retire_records(&mut fixture, &records);
-    let root = fixture.events.backend.core.window_id;
-    let visible = fixture
-        .events
-        .backend
-        .get_image_pixels_for_tests(root, 2, 150, 150, 1, 1, !0)
-        .expect("read restacked output 0 pixel")
-        .expect("restacked pixel bytes");
-    assert_eq!(
-        &visible[..3],
-        &[0x00, 0x00, 0xff],
-        "the lower window raised above the upper window is visible"
-    );
-    assert_eq!(
-        fixture.events.backend.pstate.direct.outputs[1]
+        let game_rid = ResourceId(0x3111);
+        let game_xid = direct.target_xid;
+        let mut raised = None;
+        let mut mover = None;
+        if row == "raise-over-owner" {
+            raised = Some(a3_seed_ordered_window(
+                &mut fixture,
+                &mut state,
+                ResourceId(0x3110),
+                1920,
+                0,
+                1920,
+                1080,
+                true,
+            ));
+        }
+        a3_add_existing_window_to_state(&mut state, game_rid, game_xid, 1920, 0, 1920, 1080, true);
+        if row == "move-and-lower" {
+            mover = Some(a3_seed_ordered_window(
+                &mut fixture,
+                &mut state,
+                ResourceId(0x3140),
+                100,
+                0,
+                500,
+                500,
+                true,
+            ));
+        }
+        Backend::sync_top_level_order(&mut fixture.events.backend, &state);
+        a3_enter_output_owner(&mut fixture, &direct, 1);
+        let owner_present = fixture.events.backend.pstate.direct.outputs[1]
             .current
             .as_ref()
-            .unwrap()
+            .expect("Output(1) owner held")
             .candidate
-            .present_id,
-        before,
-        "Output(1) remains current through the other output's scene retirement"
-    );
-    fixture.finish();
+            .present_id;
+
+        match row {
+            "restack-elsewhere" => {
+                a3_restack_top_level(
+                    &mut fixture,
+                    &mut state,
+                    ResourceId(0x3100),
+                    ResourceId(0x3101),
+                    lower,
+                    upper,
+                    0,
+                );
+                let records = a3_tick(&mut fixture);
+                let owner = &fixture.events.backend.pstate.direct.outputs[1];
+                assert!(
+                    !owner.unflip_requested,
+                    "{row}: output 0 restack leaves Output(1) held"
+                );
+                assert_eq!(
+                    owner.current.as_ref().unwrap().candidate.present_id,
+                    owner_present,
+                    "{row}: Output(1) retains the same direct Present"
+                );
+                assert!(
+                    a3_has_scene_commit_for(
+                        &records,
+                        fixture.events.backend.platform.outputs[0].output.crtc
+                    ),
+                    "{row}: output 0 submits its restacked scene"
+                );
+                a3_retire_records(&mut fixture, &records);
+                let root = fixture.events.backend.core.window_id;
+                let visible = fixture
+                    .events
+                    .backend
+                    .get_image_pixels_for_tests(root, 2, 150, 150, 1, 1, !0)
+                    .expect("read restacked output 0 pixel")
+                    .expect("restacked pixel bytes");
+                assert_eq!(
+                    &visible[..3],
+                    &[0x00, 0x00, 0xff],
+                    "{row}: raised lower window is visible in the committed scene"
+                );
+                assert_eq!(
+                    fixture.events.backend.pstate.direct.outputs[1]
+                        .current
+                        .as_ref()
+                        .unwrap()
+                        .candidate
+                        .present_id,
+                    owner_present,
+                    "{row}: Output(1) stays current through output 0 retirement"
+                );
+            }
+            "raise-over-owner" => {
+                a3_restack_top_level(
+                    &mut fixture,
+                    &mut state,
+                    ResourceId(0x3110),
+                    game_rid,
+                    raised.expect("raise row has an overlay"),
+                    game_xid,
+                    0,
+                );
+                assert!(
+                    !fixture.events.backend.pstate.direct.outputs[1].unflip_requested,
+                    "{row}: revalidation waits for the scheduler tick"
+                );
+                let records = a3_tick(&mut fixture);
+                let owner = &fixture.events.backend.pstate.direct.outputs[1];
+                assert!(
+                    owner.unflip_requested,
+                    "{row}: intersecting raised window revokes the owner"
+                );
+                assert_eq!(
+                    owner.unflip_reason,
+                    Some("composite_tick_output_scene_changed"),
+                    "{row}: tick records the scene-change reason"
+                );
+                assert!(
+                    a3_has_scene_commit_for(
+                        &records,
+                        fixture.events.backend.platform.outputs[1].output.crtc
+                    ),
+                    "{row}: tick accepts the output 1 replacement"
+                );
+                a3_retire_records(&mut fixture, &records);
+                assert!(
+                    fixture.events.backend.pstate.direct.outputs[1]
+                        .current
+                        .is_none(),
+                    "{row}: output 1 owner retires after replacement acknowledgement"
+                );
+            }
+            "move-and-lower" => {
+                let mover = mover.expect("combined configure row has a mover");
+                let mover_rid = ResourceId(0x3140);
+                Backend::configure_subwindow(
+                    &mut fixture.events.backend,
+                    None,
+                    mover,
+                    HostSubwindowConfig {
+                        x: Some(2000),
+                        sibling: Some(game_xid),
+                        stack_mode: Some(1),
+                        ..Default::default()
+                    },
+                )
+                .expect("combined ConfigureWindow backend callback");
+                state.resources.configure_window(ConfigureWindowRequest {
+                    window: mover_rid,
+                    value_mask: 0,
+                    x: Some(2000),
+                    y: None,
+                    width: None,
+                    height: None,
+                    border_width: None,
+                    sibling: Some(game_rid),
+                    stack_mode: Some(1),
+                });
+                Backend::sync_top_level_order(&mut fixture.events.backend, &state);
+                let records = a3_tick(&mut fixture);
+                let owner = &fixture.events.backend.pstate.direct.outputs[1];
+                assert!(
+                    !owner.unflip_requested,
+                    "{row}: final core stacking order keeps the game topmost"
+                );
+                assert_eq!(
+                    owner
+                        .current
+                        .as_ref()
+                        .map(|frame| frame.candidate.present_id),
+                    Some(owner_present),
+                    "{row}: the same direct owner survives configure reprojection"
+                );
+                assert!(
+                    !a3_has_scene_commit_for(
+                        &records,
+                        fixture.events.backend.platform.outputs[1].output.crtc
+                    ),
+                    "{row}: no output 1 replacement is submitted for the final eligible scene"
+                );
+                a3_retire_records(&mut fixture, &records);
+            }
+            _ => unreachable!("known Q10 row"),
+        }
+        drop(fixture);
+    }
 }
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: the tick revalidation skips the stacking term.
-fn raise_over_output_owner_revokes_it() {
-    use yserver_core::{backend::Backend, server::ServerState};
+// Mutations: A07 removes tick scene revalidation; A09 ignores configured geometry
+// during tick revalidation; A13 accepts an Output target classified as Other.
+fn paused_output_scene_change() {
+    use yserver_core::{backend::Backend, host_x11::HostSubwindowConfig, server::ServerState};
     use yserver_protocol::x11::ResourceId;
 
-    let Some((mut fixture, direct)) = a3_output_fixture(1, 931) else {
-        eprintln!("SKIP raise_over_output_owner_revokes_it: Vulkan fixture unavailable");
-        return;
-    };
-    let mut state = ServerState::new();
-    let raised = a3_seed_ordered_window(
-        &mut fixture,
-        &mut state,
-        ResourceId(0x3110),
-        1920,
-        0,
-        1920,
-        1080,
-        true,
-    );
-    a3_add_existing_window_to_state(
-        &mut state,
-        ResourceId(0x3111),
-        direct.target_xid,
-        1920,
-        0,
-        1920,
-        1080,
-        true,
-    );
-    Backend::sync_top_level_order(&mut fixture.events.backend, &state);
-    a3_enter_output_owner(&mut fixture, &direct, 1);
+    for (row, present_id) in [("map", 932), ("geometry-move", 933), ("redirect", 938)] {
+        let Some((fixture, direct)) = a3_output_fixture(1, present_id) else {
+            eprintln!("SKIP paused_output_scene_change: Vulkan fixture unavailable");
+            return;
+        };
+        let mut fixture = fixture.cleanup_guard();
+        a3_enter_output_owner(&mut fixture, &direct, 1);
+        let owner_present = fixture.events.backend.pstate.direct.outputs[1]
+            .current
+            .as_ref()
+            .expect("Output(1) owner held")
+            .candidate
+            .present_id;
+        let mut state = ServerState::new();
 
-    a3_restack_top_level(
-        &mut fixture,
-        &mut state,
-        ResourceId(0x3110),
-        ResourceId(0x3111),
-        raised,
-        direct.target_xid,
-        0,
-    );
-    assert!(
-        !fixture.events.backend.pstate.direct.outputs[1].unflip_requested,
-        "Output owners wait for the scene check at the scheduler tick"
-    );
-    let records = a3_tick(&mut fixture);
-    let owner = &fixture.events.backend.pstate.direct.outputs[1];
-    assert!(
-        owner.unflip_requested,
-        "raised intersecting window revokes Output(1)"
-    );
-    assert_eq!(
-        owner.unflip_reason,
-        Some("composite_tick_output_scene_changed")
-    );
-    assert!(
-        a3_has_scene_commit_for(
-            &records,
-            fixture.events.backend.platform.outputs[1].output.crtc
-        ),
-        "the next tick submits the composed replacement on output 1"
-    );
-    a3_retire_records(&mut fixture, &records);
-    fixture.finish();
-}
+        match row {
+            "map" => {
+                let unrelated = a3_seed_ordered_window(
+                    &mut fixture,
+                    &mut state,
+                    ResourceId(0x3120),
+                    0,
+                    0,
+                    1920,
+                    1080,
+                    false,
+                );
+                Backend::map_subwindow(&mut fixture.events.backend, None, unrelated)
+                    .expect("map output 0 window through Backend");
+                let unrelated_records = a3_tick(&mut fixture);
+                assert!(
+                    !fixture.events.backend.pstate.direct.outputs[1].unflip_requested,
+                    "{row}: unrelated map leaves Output(1) held"
+                );
+                assert!(
+                    a3_has_scene_commit_for(
+                        &unrelated_records,
+                        fixture.events.backend.platform.outputs[0].output.crtc
+                    ),
+                    "{row}: output 0 composes its newly mapped window"
+                );
+                a3_retire_records(&mut fixture, &unrelated_records);
+                assert_eq!(
+                    fixture.events.backend.pstate.direct.outputs[1]
+                        .current
+                        .as_ref()
+                        .unwrap()
+                        .candidate
+                        .present_id,
+                    owner_present,
+                    "{row}: unrelated map preserves the same owner"
+                );
 
-#[test]
-#[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: remove Output-owner scene revalidation from the scheduler tick.
-fn map_over_paused_output_owner_revokes_without_present() {
-    use yserver_core::{backend::Backend, server::ServerState};
-    use yserver_protocol::x11::ResourceId;
+                let overlay = a3_seed_ordered_window(
+                    &mut fixture,
+                    &mut state,
+                    ResourceId(0x3122),
+                    1920,
+                    0,
+                    1920,
+                    1080,
+                    false,
+                );
+                Backend::fill_rectangle(
+                    &mut fixture.events.backend,
+                    None,
+                    overlay,
+                    0x00d1_7b31,
+                    0,
+                    0,
+                    1920,
+                    1080,
+                )
+                .expect("paint a distinguishable mapped overlay");
+                Backend::map_subwindow(&mut fixture.events.backend, None, overlay)
+                    .expect("map the intersecting window through Backend");
+                let records = a3_tick(&mut fixture);
+                let owner = &fixture.events.backend.pstate.direct.outputs[1];
+                assert!(
+                    owner.unflip_requested,
+                    "{row}: intersecting map revokes the paused owner"
+                );
+                assert_eq!(
+                    owner.unflip_reason,
+                    Some("composite_tick_output_scene_changed"),
+                    "{row}: tick records the scene-change reason"
+                );
+                assert_eq!(
+                    owner.current.as_ref().unwrap().candidate.present_id,
+                    owner_present,
+                    "{row}: the held direct frame remains until replacement retirement"
+                );
+                assert!(
+                    owner.pending.is_none() && owner.queued_successor.is_none(),
+                    "{row}: map revalidation does not create another Present"
+                );
+                assert!(
+                    a3_has_scene_commit_for(
+                        &records,
+                        fixture.events.backend.platform.outputs[1].output.crtc
+                    ),
+                    "{row}: replacement is composed without a new Present"
+                );
+                a3_retire_records(&mut fixture, &records);
+                let root = fixture.events.backend.core.window_id;
+                let visible = fixture
+                    .events
+                    .backend
+                    .get_image_pixels_for_tests(root, 2, 1930, 20, 1, 1, !0)
+                    .expect("read output 1 after replacement")
+                    .expect("replacement pixel bytes");
+                assert_eq!(
+                    &visible[..3],
+                    &[0x31, 0x7b, 0xd1],
+                    "{row}: replacement displays the mapped overlay pixels"
+                );
+            }
+            "geometry-move" => {
+                let mover = a3_seed_ordered_window(
+                    &mut fixture,
+                    &mut state,
+                    ResourceId(0x3130),
+                    100,
+                    0,
+                    500,
+                    500,
+                    true,
+                );
+                Backend::configure_subwindow(
+                    &mut fixture.events.backend,
+                    None,
+                    mover,
+                    HostSubwindowConfig {
+                        x: Some(300),
+                        ..Default::default()
+                    },
+                )
+                .expect("move within output 0 through Backend");
+                let unrelated_records = a3_tick(&mut fixture);
+                assert!(
+                    !fixture.events.backend.pstate.direct.outputs[1].unflip_requested,
+                    "{row}: geometry remaining on output 0 keeps the owner"
+                );
+                assert!(
+                    a3_has_scene_commit_for(
+                        &unrelated_records,
+                        fixture.events.backend.platform.outputs[0].output.crtc
+                    ),
+                    "{row}: output 0 composes the moved window"
+                );
+                a3_retire_records(&mut fixture, &unrelated_records);
+                assert_eq!(
+                    fixture.events.backend.pstate.direct.outputs[1]
+                        .current
+                        .as_ref()
+                        .unwrap()
+                        .candidate
+                        .present_id,
+                    owner_present,
+                    "{row}: unrelated geometry change preserves the owner"
+                );
 
-    let Some((mut fixture, direct)) = a3_output_fixture(1, 932) else {
-        eprintln!(
-            "SKIP map_over_paused_output_owner_revokes_without_present: Vulkan fixture unavailable"
-        );
-        return;
-    };
-    a3_enter_output_owner(&mut fixture, &direct, 1);
-    let mut state = ServerState::new();
-    let other_output = a3_seed_ordered_window(
-        &mut fixture,
-        &mut state,
-        ResourceId(0x3120),
-        0,
-        0,
-        1920,
-        1080,
-        false,
-    );
-    Backend::map_subwindow(&mut fixture.events.backend, None, other_output)
-        .expect("map the output 0 window through Backend");
-    let output0_records = a3_tick(&mut fixture);
-    assert!(
-        !fixture.events.backend.pstate.direct.outputs[1].unflip_requested,
-        "mapping on output 0 leaves paused Output(1) held"
-    );
-    assert!(
-        a3_has_scene_commit_for(
-            &output0_records,
-            fixture.events.backend.platform.outputs[0].output.crtc
-        ),
-        "output 0 composes its newly mapped window"
-    );
-    a3_retire_records(&mut fixture, &output0_records);
-
-    let over_game = a3_seed_ordered_window(
-        &mut fixture,
-        &mut state,
-        ResourceId(0x3122),
-        1920,
-        0,
-        1920,
-        1080,
-        false,
-    );
-    Backend::fill_rectangle(
-        &mut fixture.events.backend,
-        None,
-        over_game,
-        0x00d1_7b31,
-        0,
-        0,
-        1920,
-        1080,
-    )
-    .expect("paint a distinguishable notification overlay");
-    Backend::map_subwindow(&mut fixture.events.backend, None, over_game)
-        .expect("map the output 1 window through Backend");
-    let output1_records = a3_tick(&mut fixture);
-    let owner = &fixture.events.backend.pstate.direct.outputs[1];
-    assert!(
-        owner.unflip_requested,
-        "mapping over a paused owner revokes it"
-    );
-    assert!(
-        a3_has_scene_commit_for(
-            &output1_records,
-            fixture.events.backend.platform.outputs[1].output.crtc
-        ),
-        "the replacement is composed on output 1 without a new Present"
-    );
-    a3_retire_records(&mut fixture, &output1_records);
-    let root = fixture.events.backend.core.window_id;
-    let visible = fixture
-        .events
-        .backend
-        .get_image_pixels_for_tests(root, 2, 1930, 20, 1, 1, !0)
-        .expect("read output 1 after its replacement retires")
-        .expect("replacement pixel bytes");
-    assert_eq!(
-        &visible[..3],
-        &[0x31, 0x7b, 0xd1],
-        "the composed replacement shows the mapped notification"
-    );
-    fixture.finish();
+                Backend::configure_subwindow(
+                    &mut fixture.events.backend,
+                    None,
+                    mover,
+                    HostSubwindowConfig {
+                        x: Some(2000),
+                        ..Default::default()
+                    },
+                )
+                .expect("move the mapped window onto output 1 through Backend");
+                let records = a3_tick(&mut fixture);
+                let owner = &fixture.events.backend.pstate.direct.outputs[1];
+                assert!(
+                    owner.unflip_requested,
+                    "{row}: tick revalidation notices geometry newly intersecting output 1"
+                );
+                assert_eq!(
+                    owner.unflip_reason,
+                    Some("composite_tick_output_scene_changed"),
+                    "{row}: configured geometry records the tick-revalidation reason"
+                );
+                assert_eq!(
+                    owner.current.as_ref().unwrap().candidate.present_id,
+                    owner_present,
+                    "{row}: direct frame remains until output 1 replacement retires"
+                );
+                assert!(
+                    owner.pending.is_none() && owner.queued_successor.is_none(),
+                    "{row}: geometry revalidation does not submit a new Present"
+                );
+                assert!(
+                    a3_has_scene_commit_for(
+                        &records,
+                        fixture.events.backend.platform.outputs[1].output.crtc
+                    ),
+                    "{row}: tick accepts the composed replacement"
+                );
+                a3_retire_records(&mut fixture, &records);
+                assert!(
+                    fixture.events.backend.pstate.direct.outputs[1]
+                        .current
+                        .is_none(),
+                    "{row}: owner retires after replacement acknowledgement"
+                );
+            }
+            "redirect" => {
+                Backend::allocate_redirected_backing(
+                    &mut fixture.events.backend,
+                    None,
+                    yserver_core::backend::WindowHandle::from_raw_panicking(direct.target_xid),
+                    direct.candidate.src_width,
+                    direct.candidate.src_height,
+                    24,
+                )
+                .expect("redirect the held window through Backend");
+                let records = a3_tick(&mut fixture);
+                let owner = &fixture.events.backend.pstate.direct.outputs[1];
+                assert!(
+                    owner.unflip_requested,
+                    "{row}: redirected target is no longer eligible"
+                );
+                assert_eq!(
+                    owner.unflip_reason,
+                    Some("composite_tick_output_scene_changed"),
+                    "{row}: redirect records the tick scene-change reason"
+                );
+                assert_eq!(
+                    owner.current.as_ref().unwrap().candidate.present_id,
+                    owner_present,
+                    "{row}: retained direct frame awaits replacement"
+                );
+                assert!(
+                    owner.pending.is_none() && owner.queued_successor.is_none(),
+                    "{row}: redirect revalidation does not create a new Present"
+                );
+                assert!(
+                    a3_has_scene_commit_for(
+                        &records,
+                        fixture.events.backend.platform.outputs[1].output.crtc
+                    ),
+                    "{row}: output 1 replacement is composed without a Present"
+                );
+                a3_retire_records(&mut fixture, &records);
+                assert!(
+                    fixture.events.backend.pstate.direct.outputs[1]
+                        .current
+                        .is_none(),
+                    "{row}: redirected owner retires after replacement acknowledgement"
+                );
+            }
+            _ => unreachable!("known Q11 row"),
+        }
+        fixture.finish_after_normal_drain();
+    }
 }
 
 #[test]
@@ -1367,161 +1572,6 @@ fn queued_successor_waits_for_scene_revalidation_after_overlay_map() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: configure-time scope checks ignore geometry changes onto another output.
-fn configure_window_onto_output_owner_revokes() {
-    use yserver_core::{backend::Backend, host_x11::HostSubwindowConfig, server::ServerState};
-    use yserver_protocol::x11::ResourceId;
-
-    let Some((mut fixture, direct)) = a3_output_fixture(1, 933) else {
-        eprintln!("SKIP configure_window_onto_output_owner_revokes: Vulkan fixture unavailable");
-        return;
-    };
-    a3_enter_output_owner(&mut fixture, &direct, 1);
-    let mut state = ServerState::new();
-    let mover = a3_seed_ordered_window(
-        &mut fixture,
-        &mut state,
-        ResourceId(0x3130),
-        100,
-        0,
-        500,
-        500,
-        true,
-    );
-    let output0 = fixture.events.backend.pstate.direct.outputs[1]
-        .current
-        .as_ref()
-        .unwrap()
-        .candidate
-        .present_id;
-    Backend::configure_subwindow(
-        &mut fixture.events.backend,
-        None,
-        mover,
-        HostSubwindowConfig {
-            x: Some(300),
-            ..Default::default()
-        },
-    )
-    .expect("move within output 0 through Backend");
-    let output0_records = a3_tick(&mut fixture);
-    assert!(!fixture.events.backend.pstate.direct.outputs[1].unflip_requested);
-    assert!(a3_has_scene_commit_for(
-        &output0_records,
-        fixture.events.backend.platform.outputs[0].output.crtc
-    ));
-    a3_retire_records(&mut fixture, &output0_records);
-    assert_eq!(
-        fixture.events.backend.pstate.direct.outputs[1]
-            .current
-            .as_ref()
-            .unwrap()
-            .candidate
-            .present_id,
-        output0
-    );
-
-    Backend::configure_subwindow(
-        &mut fixture.events.backend,
-        None,
-        mover,
-        HostSubwindowConfig {
-            x: Some(2000),
-            ..Default::default()
-        },
-    )
-    .expect("move the already-above window onto output 1 through Backend");
-    let output1_records = a3_tick(&mut fixture);
-    assert!(fixture.events.backend.pstate.direct.outputs[1].unflip_requested);
-    assert!(a3_has_scene_commit_for(
-        &output1_records,
-        fixture.events.backend.platform.outputs[1].output.crtc
-    ));
-    a3_retire_records(&mut fixture, &output1_records);
-    fixture.finish();
-}
-
-#[test]
-#[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: revalidate inside configure_subwindow before core reprojects stacking.
-fn combined_configure_onto_output_and_below_game_keeps_owner() {
-    use yserver_core::{backend::Backend, host_x11::HostSubwindowConfig, server::ServerState};
-    use yserver_protocol::x11::{ConfigureWindowRequest, ResourceId};
-
-    let Some((mut fixture, direct)) = a3_output_fixture(1, 934) else {
-        eprintln!(
-            "SKIP combined_configure_onto_output_and_below_game_keeps_owner: Vulkan fixture unavailable"
-        );
-        return;
-    };
-    let mut state = ServerState::new();
-    let game_rid = ResourceId(0x3141);
-    a3_add_existing_window_to_state(
-        &mut state,
-        game_rid,
-        direct.target_xid,
-        1920,
-        0,
-        1920,
-        1080,
-        true,
-    );
-    let mover = a3_seed_ordered_window(
-        &mut fixture,
-        &mut state,
-        ResourceId(0x3140),
-        100,
-        0,
-        500,
-        500,
-        true,
-    );
-    let mover_rid = ResourceId(0x3140);
-    // The mover was created after the game and is currently above it, but it
-    // does not intersect output 1 yet.
-    Backend::sync_top_level_order(&mut fixture.events.backend, &state);
-    a3_enter_output_owner(&mut fixture, &direct, 1);
-    Backend::configure_subwindow(
-        &mut fixture.events.backend,
-        None,
-        mover,
-        HostSubwindowConfig {
-            x: Some(2000),
-            sibling: Some(direct.target_xid),
-            stack_mode: Some(1),
-            ..Default::default()
-        },
-    )
-    .expect("combined ConfigureWindow backend callback");
-    state.resources.configure_window(ConfigureWindowRequest {
-        window: mover_rid,
-        value_mask: 0,
-        x: Some(2000),
-        y: None,
-        width: None,
-        height: None,
-        border_width: None,
-        sibling: Some(game_rid),
-        stack_mode: Some(1),
-    });
-    Backend::sync_top_level_order(&mut fixture.events.backend, &state);
-    let records = a3_tick(&mut fixture);
-    assert!(
-        !fixture.events.backend.pstate.direct.outputs[1].unflip_requested,
-        "the final ConfigureWindow order leaves the game topmost on output 1"
-    );
-    assert!(
-        fixture.events.backend.pstate.direct.outputs[1]
-            .current
-            .as_ref()
-            .is_some_and(|frame| frame.candidate.present_id == direct.candidate.present_id)
-    );
-    a3_retire_records(&mut fixture, &records);
-    fixture.finish();
-}
-
-#[test]
-#[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: drop the Output-owner ancestor walk from direct_scopes_referencing_host_drawable.
 fn ancestor_reparent_revokes_output_owner_immediately() {
     use yserver_core::backend::Backend;
@@ -1593,151 +1643,139 @@ fn ancestor_reparent_revokes_output_owner_immediately() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: request_direct_unflip_for_host_drawable revokes every owner.
-fn drawable_cause_revokes_only_its_owner() {
-    use yserver_core::backend::Backend;
-
-    let Some(mut fixture) = super::commit_identity::recording_scene::RecordingSceneFixture::with_output_admission_topology()
-        .expect("A3 dual-owner fixture")
-    else {
-        eprintln!("SKIP drawable_cause_revokes_only_its_owner: Vulkan fixture unavailable");
-        return;
-    };
-    let first = fixture.install_direct_output_present(0, 936, 0);
-    let second = fixture.install_direct_output_present(1, 937, 0);
-    a3_enter_output_owner(&mut fixture, &first, 0);
-    a3_enter_output_owner(&mut fixture, &second, 1);
-
-    Backend::unmap_subwindow(&mut fixture.events.backend, None, first.target_xid)
-        .expect("unmap Output(0) drawable through Backend");
-    let output0 = &fixture.events.backend.pstate.direct.outputs[0];
-    let output1 = &fixture.events.backend.pstate.direct.outputs[1];
-    assert!(output0.unflip_requested, "the referenced owner is revoked");
-    assert_eq!(output0.unflip_reason, Some("unmap_direct_frame_drawable"));
-    assert!(!output1.unflip_requested, "Output(1) stays held");
-    assert_eq!(
-        output1.current.as_ref().unwrap().candidate.present_id,
-        second.candidate.present_id
-    );
-    let records = a3_tick(&mut fixture);
-    assert!(a3_has_scene_commit_for(
-        &records,
-        fixture.events.backend.platform.outputs[0].output.crtc
-    ));
-    a3_retire_records(&mut fixture, &records);
-    let unaffected = &fixture.events.backend.pstate.direct.outputs[1];
-    assert!(
-        !unaffected.unflip_requested,
-        "Output(1) remains held after retirement"
-    );
-    assert_eq!(
-        unaffected.current.as_ref().unwrap().candidate.present_id,
-        second.candidate.present_id,
-        "Output(1) stays current through Output(0)'s retirement"
-    );
-    fixture.finish();
-}
-
-#[test]
-#[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: direct_scope_scene_eligible accepts a target classified as Other.
-fn redirect_of_held_output_owner_revokes_without_present() {
-    use yserver_core::backend::Backend;
-
-    let Some((mut fixture, direct)) = a3_output_fixture(1, 938) else {
-        eprintln!(
-            "SKIP redirect_of_held_output_owner_revokes_without_present: Vulkan fixture unavailable"
-        );
-        return;
-    };
-    a3_enter_output_owner(&mut fixture, &direct, 1);
-    let before = fixture.events.backend.pstate.direct.outputs[1]
-        .current
-        .as_ref()
-        .unwrap()
-        .candidate
-        .present_id;
-    Backend::allocate_redirected_backing(
-        &mut fixture.events.backend,
-        None,
-        yserver_core::backend::WindowHandle::from_raw_panicking(direct.target_xid),
-        direct.candidate.src_width,
-        direct.candidate.src_height,
-        24,
-    )
-    .expect("redirect the held window through Backend");
-    let records = a3_tick(&mut fixture);
-    let owner = &fixture.events.backend.pstate.direct.outputs[1];
-    assert!(
-        owner.unflip_requested,
-        "redirected target is no longer direct eligible"
-    );
-    assert_eq!(
-        owner.unflip_reason,
-        Some("composite_tick_output_scene_changed")
-    );
-    assert_eq!(owner.current.as_ref().unwrap().candidate.present_id, before);
-    assert!(a3_has_scene_commit_for(
-        &records,
-        fixture.events.backend.platform.outputs[1].output.crtc
-    ));
-    a3_retire_records(&mut fixture, &records);
-    fixture.finish();
-}
-
-#[test]
-#[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: on_direct_shape_changed revokes every direct scope.
-fn shape_on_one_output_owner_revokes_only_it() {
+// Mutations: A12 makes drawable-specific unflip revoke every owner; A14 makes
+// SHAPE revoke every scope immediately instead of waiting for tick revalidation.
+fn drawable_change_isolation() {
     use yserver_core::backend::Backend;
     use yserver_protocol::x11::xfixes::RegionRect;
 
-    let Some(mut fixture) = super::commit_identity::recording_scene::RecordingSceneFixture::with_output_admission_topology()
-        .expect("A3 dual-owner fixture")
-    else {
-        eprintln!("SKIP shape_on_one_output_owner_revokes_only_it: Vulkan fixture unavailable");
-        return;
-    };
-    let first = fixture.install_direct_output_present(0, 939, 0);
-    let second = fixture.install_direct_output_present(1, 940, 0);
-    a3_enter_output_owner(&mut fixture, &first, 0);
-    a3_enter_output_owner(&mut fixture, &second, 1);
+    for (row, first_id, second_id) in [("unmap", 936, 937), ("shape", 939, 940)] {
+        let Some(fixture) = super::commit_identity::recording_scene::RecordingSceneFixture::with_output_admission_topology()
+            .expect("A3 dual-owner fixture")
+        else {
+            eprintln!("SKIP drawable_change_isolation: Vulkan fixture unavailable");
+            return;
+        };
+        let mut fixture = fixture.cleanup_guard();
+        let first = fixture.install_direct_output_present(0, first_id, 0);
+        let second = fixture.install_direct_output_present(1, second_id, 0);
+        a3_enter_output_owner(&mut fixture, &first, 0);
+        a3_enter_output_owner(&mut fixture, &second, 1);
 
-    Backend::set_shape_rectangles(
-        &mut fixture.events.backend,
-        None,
-        second.target_xid,
-        0,
-        Some(&[RegionRect {
-            x: 0,
-            y: 0,
-            width: 1000,
-            height: 1080,
-        }]),
-    )
-    .expect("clip Output(1) direct window through Backend SHAPE");
-    assert!(
-        !fixture.events.backend.pstate.direct.outputs[1].unflip_requested,
-        "Output owners revalidate at the next scheduler pass"
-    );
-    let records = a3_tick(&mut fixture);
-    assert!(fixture.events.backend.pstate.direct.outputs[1].unflip_requested);
-    assert_eq!(
-        fixture.events.backend.pstate.direct.outputs[1].unflip_reason,
-        Some("composite_tick_output_scene_changed")
-    );
-    assert!(!fixture.events.backend.pstate.direct.outputs[0].unflip_requested);
-    assert!(
-        fixture.events.backend.pstate.direct.outputs[0]
-            .current
-            .is_some()
-    );
-    assert!(a3_has_scene_commit_for(
-        &records,
-        fixture.events.backend.platform.outputs[1].output.crtc
-    ));
-    a3_retire_records(&mut fixture, &records);
-    fixture.finish();
+        match row {
+            "unmap" => {
+                Backend::unmap_subwindow(&mut fixture.events.backend, None, first.target_xid)
+                    .expect("unmap Output(0) drawable through Backend");
+                let output0 = &fixture.events.backend.pstate.direct.outputs[0];
+                let output1 = &fixture.events.backend.pstate.direct.outputs[1];
+                assert!(
+                    output0.unflip_requested,
+                    "{row}: changed drawable revokes its owner"
+                );
+                assert_eq!(
+                    output0.unflip_reason,
+                    Some("unmap_direct_frame_drawable"),
+                    "{row}: unmap keeps its scoped reason"
+                );
+                assert!(!output1.unflip_requested, "{row}: Output(1) stays held");
+                assert_eq!(
+                    output1.current.as_ref().unwrap().candidate.present_id,
+                    second_id,
+                    "{row}: Output(1) keeps its independent current frame"
+                );
+                let records = a3_tick(&mut fixture);
+                let output0_crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+                let output1_crtc = fixture.events.backend.platform.outputs[1].output.crtc;
+                assert!(
+                    a3_has_scene_commit_for(&records, output0_crtc),
+                    "{row}: Output(0) replacement is accepted"
+                );
+                assert!(
+                    !a3_has_scene_commit_for(&records, output1_crtc),
+                    "{row}: unaffected Output(1) gets no replacement"
+                );
+                a3_retire_records(&mut fixture, &records);
+                let survivor = &fixture.events.backend.pstate.direct.outputs[1];
+                assert!(
+                    !survivor.unflip_requested,
+                    "{row}: Output(1) survives retirement"
+                );
+                assert_eq!(
+                    survivor.current.as_ref().unwrap().candidate.present_id,
+                    second_id,
+                    "{row}: Output(1) remains current through Output(0) retirement"
+                );
+            }
+            "shape" => {
+                Backend::set_shape_rectangles(
+                    &mut fixture.events.backend,
+                    None,
+                    second.target_xid,
+                    0,
+                    Some(&[RegionRect {
+                        x: 0,
+                        y: 0,
+                        width: 1000,
+                        height: 1080,
+                    }]),
+                )
+                .expect("clip Output(1) target through Backend SHAPE");
+                assert!(
+                    !fixture.events.backend.pstate.direct.outputs[1].unflip_requested,
+                    "{row}: SHAPE waits for the next scheduler pass"
+                );
+                assert!(
+                    !fixture.events.backend.pstate.direct.outputs[0].unflip_requested,
+                    "{row}: SHAPE does not eagerly revoke Output(0)"
+                );
+                let records = a3_tick(&mut fixture);
+                let output0 = &fixture.events.backend.pstate.direct.outputs[0];
+                let output1 = &fixture.events.backend.pstate.direct.outputs[1];
+                assert!(
+                    output1.unflip_requested,
+                    "{row}: tick revalidation revokes Output(1)"
+                );
+                assert_eq!(
+                    output1.unflip_reason,
+                    Some("composite_tick_output_scene_changed"),
+                    "{row}: SHAPE retains the tick scene-change reason"
+                );
+                assert!(!output0.unflip_requested, "{row}: Output(0) remains active");
+                assert_eq!(
+                    output0.current.as_ref().unwrap().candidate.present_id,
+                    first_id,
+                    "{row}: Output(0) keeps its direct frame"
+                );
+                assert!(
+                    a3_has_scene_commit_for(
+                        &records,
+                        fixture.events.backend.platform.outputs[1].output.crtc
+                    ),
+                    "{row}: Output(1) replacement is accepted"
+                );
+                assert!(
+                    !a3_has_scene_commit_for(
+                        &records,
+                        fixture.events.backend.platform.outputs[0].output.crtc
+                    ),
+                    "{row}: Output(0) gets no replacement"
+                );
+                a3_retire_records(&mut fixture, &records);
+                let survivor = &fixture.events.backend.pstate.direct.outputs[0];
+                assert!(
+                    !survivor.unflip_requested,
+                    "{row}: Output(0) survives Output(1) retirement"
+                );
+                assert_eq!(
+                    survivor.current.as_ref().unwrap().candidate.present_id,
+                    first_id,
+                    "{row}: Output(0) remains current after Output(1) retirement"
+                );
+            }
+            _ => unreachable!("known Q12 row"),
+        }
+        drop(fixture);
+    }
 }
 
 #[test]
@@ -1864,137 +1902,388 @@ fn root_owner_triggers_unchanged() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutations: return for every submitted unflip; use the degraded-only mask; exclude the degraded output from scene readiness.
-fn output_unflip_does_not_stall_other_output_compose() {
+// Mutations by row: D02 returns after fresh unflip / uses a degraded-only pass mask;
+// A16 returns after a submitted unflip / uses a degraded-only mask / excludes the degraded owner;
+// T06 returns globally while an Output owner is held; T07 excludes unrelated output in degraded mode;
+// T08 ignores scene damage when an Output owner is held.
+fn other_output_progresses() {
     use yserver_core::backend::Backend;
 
-    let Some((fixture, direct)) = a3_output_fixture(1, 956) else {
-        eprintln!(
-            "SKIP output_unflip_does_not_stall_other_output_compose: Vulkan fixture unavailable"
+    fn retire_held_output_owner(
+        fixture: &mut super::commit_identity::recording_scene::RecordingSceneFixtureGuard,
+        direct: &super::commit_identity::recording_scene::DirectPresentSetup,
+        row: &str,
+    ) {
+        Backend::unmap_subwindow(&mut fixture.events.backend, None, direct.target_xid)
+            .expect("retire the held Output owner through Backend");
+        let records = a3_tick(fixture);
+        assert!(
+            a3_has_scene_commit_for(
+                &records,
+                fixture.events.backend.platform.outputs[1].output.crtc
+            ),
+            "{row}: cleanup submits the owner replacement"
         );
-        return;
-    };
-    let mut fixture = fixture.cleanup_guard();
-    let device_fd = fixture.kms_fd(0);
-    a3_enter_output_owner(&mut fixture, &direct, 1);
-    Backend::unmap_subwindow(&mut fixture.events.backend, None, direct.target_xid)
-        .expect("request Output(1) unflip through Backend");
-    super::commit_identity::direct_unflip::damage_scene_root(&mut fixture);
-    let before = fixture.events.recorders[&device_fd].records().len();
-
-    Backend::maybe_composite(&mut fixture.events.backend).expect("schedule Output(1) unflip");
-    fixture.events.wait_for_submitted_gpu_work();
-
-    let records = a3_records_since(&fixture, device_fd, before);
-    let output0_crtc = fixture.events.backend.platform.outputs[0].output.crtc;
-    let output1_crtc = fixture.events.backend.platform.outputs[1].output.crtc;
-    assert!(
-        a3_has_scene_commit_for(&records, output0_crtc),
-        "output 0's ready scene damage composes in the same pass as Output(1)'s unflip"
-    );
-    let replacement = records
-        .iter()
-        .find(|record| {
-            super::commit_identity::accepted_event_id(record).is_some()
-                && record.events.iter().any(|event| event.crtc == output1_crtc)
-        })
-        .expect("Output(1) replacement accepted in the same scheduling pass");
-    let replacement_id = super::commit_identity::accepted_event_id(replacement).unwrap();
-    assert_eq!(
-        fixture.events.backend.scene.pending_page_flip_event_id(0),
-        records
-            .iter()
-            .find(|record| { a3_has_scene_commit_for(std::slice::from_ref(*record), output0_crtc) })
-            .and_then(super::commit_identity::accepted_event_id),
-        "output 0 owns its scene acknowledgement independently"
-    );
-    assert!(
-        fixture.events.backend.pstate.direct.outputs[1]
-            .unflip_awaiting_outputs
-            .contains_key(&1)
-            || fixture.events.backend.scene.pending_page_flip_event_id(1) == Some(replacement_id),
-        "the accepted replacement remains tied to output 1 until retirement"
-    );
-
-    a3_retire_records(&mut fixture, &records);
-    assert!(
-        fixture.events.backend.pstate.direct.outputs[1]
-            .current
-            .is_none(),
-        "accepted output 1 replacement releases its direct owner"
-    );
-    assert!(fixture.events.backend.present_source_pins.is_empty());
-    fixture.finish_after_normal_drain();
-
-    let Some((fixture, direct)) = a3_output_fixture(1, 957) else {
-        eprintln!(
-            "SKIP output_unflip_does_not_stall_other_output_compose: second Vulkan fixture unavailable"
+        a3_retire_records(fixture, &records);
+        assert!(
+            fixture.events.backend.pstate.direct.outputs[1]
+                .current
+                .is_none(),
+            "{row}: cleanup retires the held owner"
         );
-        return;
-    };
-    let mut fixture = fixture.cleanup_guard();
-    let device_fd = fixture.kms_fd(0);
-    a3_enter_output_owner(&mut fixture, &direct, 1);
-    Backend::unmap_subwindow(&mut fixture.events.backend, None, direct.target_xid)
-        .expect("request degraded Output(1) unflip through Backend");
-    super::commit_identity::direct_unflip::damage_scene_root(&mut fixture);
-    let recorder = fixture.events.recorders[&device_fd].clone();
-    recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
-    recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
-    let before = recorder.records().len();
+        let _ = Backend::drain_completed_present_events(&mut fixture.events.backend);
+        let _ = Backend::drain_retired_present_idle_events(&mut fixture.events.backend);
+    }
 
-    Backend::maybe_composite(&mut fixture.events.backend).expect("degrade Output(1) unflip");
-    fixture.events.wait_for_submitted_gpu_work();
+    for (row, present_id) in [
+        ("pending-direct", 956),
+        ("held-direct", 957),
+        ("fresh-unflip", 958),
+        ("degraded-unflip", 959),
+    ] {
+        let Some((fixture, direct)) = a3_output_fixture(1, present_id) else {
+            eprintln!("SKIP other_output_progresses: Vulkan fixture unavailable");
+            return;
+        };
+        let mut fixture = fixture.cleanup_guard();
+        let fd = fixture.kms_fd(0);
+        let output0_crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+        let output1_crtc = fixture.events.backend.platform.outputs[1].output.crtc;
+        a3_enter_output_owner(&mut fixture, &direct, 1);
+        let warmup = a3_tick(&mut fixture);
+        a3_retire_records(&mut fixture, &warmup);
+        assert!(
+            !fixture.events.backend.scene.has_pending_page_flip(0),
+            "{row}: composed output is settled before the scenario damage"
+        );
+        assert_eq!(
+            fixture.events.backend.pstate.direct.outputs[1]
+                .current
+                .as_ref()
+                .map(|frame| frame.candidate.present_id),
+            Some(direct.candidate.present_id),
+            "{row}: scheduler warm-up leaves the held owner unchanged"
+        );
 
-    let records = a3_records_since(&fixture, device_fd, before);
-    let output0_crtc = fixture.events.backend.platform.outputs[0].output.crtc;
-    let output1_crtc = fixture.events.backend.platform.outputs[1].output.crtc;
-    assert!(fixture.events.backend.pstate.direct.outputs[1].degraded_composed_unflip);
-    assert!(
-        a3_has_scene_commit_for(&records, output0_crtc),
-        "output 0 composes alongside the degraded output 1 replacement"
-    );
-    assert!(
-        a3_has_scene_commit_for(&records, output1_crtc),
-        "the degraded owner remains included until output 1's replacement is accepted"
-    );
-    let replacement = records
-        .iter()
-        .find(|record| {
-            super::commit_identity::accepted_event_id(record).is_some()
-                && record.events.iter().any(|event| event.crtc == output1_crtc)
-        })
-        .expect("degraded replacement accepted on output 1");
-    let replacement_id = super::commit_identity::accepted_event_id(replacement).unwrap();
-    assert_eq!(
-        fixture.events.backend.pstate.direct.outputs[1]
-            .unflip_awaiting_outputs
-            .get(&1),
-        Some(&replacement_id),
-        "accepted replacement identity remains assigned to its output"
-    );
+        match row {
+            // D02: an output 0 scene commit is accepted while a later output 1 direct frame is pending.
+            "pending-direct" => {
+                let before = fixture.events.recorders[&fd].records().len();
+                let mut candidate = direct.candidate;
+                candidate.present_id += 1;
+                let mut event = direct.event.clone();
+                event.present_id = candidate.present_id;
+                event.serial = event.serial.wrapping_add(1);
+                Backend::note_present_scanout_candidate(&mut fixture.events.backend, candidate);
+                assert!(
+                    Backend::try_present_direct(&mut fixture.events.backend, candidate, event)
+                        .expect("pending successor through Backend Present"),
+                    "{row}: successor is accepted while the owner remains current"
+                );
+                let pending_id = fixture.events.backend.pstate.direct.outputs[1]
+                    .pending
+                    .as_ref()
+                    .and_then(|frame| frame.accepted_event_id)
+                    .expect("pending output 1 frame has an accepted event identity");
+                let pending_record = a3_records_since(&fixture, fd, before)
+                    .into_iter()
+                    .find(|record| {
+                        super::commit_identity::accepted_event_id(record) == Some(pending_id)
+                    })
+                    .expect("record accepted output 1 pending commit");
+                assert_eq!(
+                    pending_record.events.len(),
+                    1,
+                    "{row}: pending commit has one CRTC event"
+                );
+                assert_eq!(
+                    pending_record.events[0].crtc, output1_crtc,
+                    "{row}: pending direct commit belongs to output 1"
+                );
 
-    a3_retire_records(&mut fixture, &records);
-    assert!(
-        fixture.events.backend.pstate.direct.outputs[1]
-            .current
-            .is_none(),
-        "retiring the accepted degraded replacement releases the owner"
-    );
-    assert!(fixture.events.backend.present_source_pins.is_empty());
-    fixture.finish_after_normal_drain();
+                super::commit_identity::direct_unflip::damage_scene_root(&mut fixture);
+                let records = a3_tick(&mut fixture);
+                let output0_record = records
+                    .iter()
+                    .find(|record| {
+                        super::commit_identity::accepted_event_id(record).is_some()
+                            && a3_has_scene_commit_for(std::slice::from_ref(*record), output0_crtc)
+                    })
+                    .expect("output 0 scene damage is accepted while output 1 is pending");
+                let output0_id = super::commit_identity::accepted_event_id(output0_record).unwrap();
+                assert_ne!(
+                    output0_id, pending_id,
+                    "{row}: independent CRTC acknowledgements use distinct event IDs"
+                );
+                let mut accepted_crtcs = vec![pending_record.events[0].crtc];
+                accepted_crtcs.extend(records.iter().filter_map(|record| {
+                    super::commit_identity::accepted_event_id(record).and_then(|_| {
+                        record
+                            .events
+                            .iter()
+                            .find(|event| event.crtc == output0_crtc)
+                            .map(|event| event.crtc)
+                    })
+                }));
+                assert_eq!(
+                    accepted_crtcs,
+                    [output1_crtc, output0_crtc],
+                    "{row}: exact accepted commits cover the pending owner and damaged output"
+                );
+                assert_eq!(
+                    fixture.events.backend.scene.pending_page_flip_event_id(0),
+                    Some(output0_id),
+                    "{row}: output 0 tracks its scene acknowledgement"
+                );
+                assert_eq!(
+                    fixture.events.backend.pstate.direct.outputs[1]
+                        .pending
+                        .as_ref()
+                        .and_then(|frame| frame.accepted_event_id),
+                    Some(pending_id),
+                    "{row}: output 1 tracks its direct acknowledgement independently"
+                );
+                assert!(
+                    fixture.events.backend.pstate.direct.outputs[1]
+                        .pending
+                        .is_some(),
+                    "{row}: output 1 remains pending after output 0 submission"
+                );
+                a3_retire_records(&mut fixture, std::slice::from_ref(output0_record));
+                assert!(
+                    fixture.events.backend.pstate.direct.outputs[1]
+                        .pending
+                        .is_some(),
+                    "{row}: output 0 retirement leaves output 1 pending"
+                );
+                a3_retire_records(&mut fixture, std::slice::from_ref(&pending_record));
+                assert_eq!(
+                    fixture.events.backend.pstate.direct.outputs[1]
+                        .current
+                        .as_ref()
+                        .map(|frame| frame.candidate.present_id),
+                    Some(candidate.present_id),
+                    "{row}: output 1 advances only after its own acknowledgement"
+                );
+                retire_held_output_owner(&mut fixture, &direct, row);
+            }
+            // T06/T08: a held owner must not suppress an immediate wake or output 0's scene commit.
+            "held-direct" => {
+                super::commit_identity::direct_unflip::damage_scene_root(&mut fixture);
+                let wakeup = Backend::next_wakeup(&fixture.events.backend);
+                assert!(
+                    wakeup.is_some_and(|deadline| deadline <= std::time::Instant::now()),
+                    "{row}: output 0 scene damage arms an immediate wake"
+                );
+                assert!(
+                    fixture.events.backend.pstate.direct.outputs[1]
+                        .pending
+                        .is_none(),
+                    "{row}: wake assertion is driven only by held direct state, not pending work"
+                );
+                let records = a3_tick(&mut fixture);
+                let accepted_crtcs: Vec<_> = records
+                    .iter()
+                    .filter(|record| super::commit_identity::accepted_event_id(record).is_some())
+                    .flat_map(|record| record.events.iter().map(|event| event.crtc))
+                    .collect();
+                assert_eq!(
+                    accepted_crtcs,
+                    [output0_crtc],
+                    "{row}: exact accepted CRTC set contains only composed output 0"
+                );
+                assert_eq!(
+                    fixture.events.backend.pstate.direct.outputs[1]
+                        .current
+                        .as_ref()
+                        .map(|frame| frame.candidate.present_id),
+                    Some(direct.candidate.present_id),
+                    "{row}: held Output(1) remains the same owner"
+                );
+                a3_retire_records(&mut fixture, &records);
+                assert_eq!(
+                    fixture.events.backend.pstate.direct.outputs[1]
+                        .current
+                        .as_ref()
+                        .map(|frame| frame.candidate.present_id),
+                    Some(direct.candidate.present_id),
+                    "{row}: output 0 retirement leaves Output(1) held"
+                );
+                retire_held_output_owner(&mut fixture, &direct, row);
+            }
+            // D02/A16: fresh replacement and unrelated scene damage are both accepted in one pass.
+            "fresh-unflip" => {
+                Backend::unmap_subwindow(&mut fixture.events.backend, None, direct.target_xid)
+                    .expect("request fresh unflip through Backend");
+                super::commit_identity::direct_unflip::damage_scene_root(&mut fixture);
+                let records = a3_tick(&mut fixture);
+                let mut accepted_crtcs: Vec<_> = records
+                    .iter()
+                    .filter(|record| super::commit_identity::accepted_event_id(record).is_some())
+                    .flat_map(|record| record.events.iter().map(|event| event.crtc))
+                    .collect();
+                accepted_crtcs.sort_by_key(|crtc| u32::from(*crtc));
+                let mut expected_crtcs = vec![output0_crtc, output1_crtc];
+                expected_crtcs.sort_by_key(|crtc| u32::from(*crtc));
+                assert_eq!(
+                    accepted_crtcs, expected_crtcs,
+                    "{row}: exact accepted CRTC set includes composed output and unflip replacement"
+                );
+                let output0_record = records
+                    .iter()
+                    .find(|record| {
+                        super::commit_identity::accepted_event_id(record).is_some()
+                            && a3_has_scene_commit_for(std::slice::from_ref(*record), output0_crtc)
+                    })
+                    .expect("output 0 scene frame accepted in fresh-unflip pass");
+                let replacement = records
+                    .iter()
+                    .find(|record| {
+                        super::commit_identity::accepted_event_id(record).is_some()
+                            && a3_has_scene_commit_for(std::slice::from_ref(*record), output1_crtc)
+                    })
+                    .expect("output 1 fresh replacement accepted in same pass");
+                let output0_id = super::commit_identity::accepted_event_id(output0_record).unwrap();
+                let replacement_id =
+                    super::commit_identity::accepted_event_id(replacement).unwrap();
+                assert_ne!(
+                    output0_id, replacement_id,
+                    "{row}: each output has an independent accepted acknowledgement ID"
+                );
+                assert_eq!(
+                    fixture.events.backend.scene.pending_page_flip_event_id(0),
+                    Some(output0_id),
+                    "{row}: output 0 tracks its own scene acknowledgement"
+                );
+                assert_eq!(
+                    fixture.events.backend.scene.pending_page_flip_event_id(1),
+                    Some(replacement_id),
+                    "{row}: output 1 tracks its replacement acknowledgement"
+                );
+                assert!(
+                    fixture.events.backend.pstate.direct.outputs[1].fresh_composed_unflip,
+                    "{row}: accepted replacement is classified as a fresh unflip"
+                );
+                assert_eq!(
+                    fixture.events.backend.pstate.direct.outputs[1]
+                        .unflip_awaiting_outputs
+                        .get(&1),
+                    Some(&replacement_id),
+                    "{row}: replacement identity remains assigned to output 1"
+                );
+                a3_retire_records(&mut fixture, std::slice::from_ref(output0_record));
+                assert!(
+                    fixture.events.backend.pstate.direct.outputs[1]
+                        .current
+                        .is_some(),
+                    "{row}: output 0 retirement does not release output 1's owner"
+                );
+                assert!(
+                    fixture.events.backend.scene.has_pending_page_flip(1),
+                    "{row}: output 1 acknowledgement remains pending independently"
+                );
+                a3_retire_records(&mut fixture, std::slice::from_ref(replacement));
+                assert!(
+                    fixture.events.backend.pstate.direct.outputs[1]
+                        .current
+                        .is_none(),
+                    "{row}: output 1 owner releases when its replacement retires"
+                );
+                assert!(
+                    fixture.events.backend.present_source_pins.is_empty(),
+                    "{row}: replacement retirement releases source pins"
+                );
+            }
+            // D02/A16/T07: degraded replacement still composes unrelated ready output 0.
+            "degraded-unflip" => {
+                Backend::unmap_subwindow(&mut fixture.events.backend, None, direct.target_xid)
+                    .expect("request degraded unflip through Backend");
+                super::commit_identity::direct_unflip::damage_scene_root(&mut fixture);
+                let recorder = fixture.events.recorders[&fd].clone();
+                recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
+                recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
+                let records = a3_tick(&mut fixture);
+                let mut accepted_crtcs: Vec<_> = records
+                    .iter()
+                    .filter(|record| super::commit_identity::accepted_event_id(record).is_some())
+                    .flat_map(|record| record.events.iter().map(|event| event.crtc))
+                    .collect();
+                accepted_crtcs.sort_by_key(|crtc| u32::from(*crtc));
+                let mut expected_crtcs = vec![output0_crtc, output1_crtc];
+                expected_crtcs.sort_by_key(|crtc| u32::from(*crtc));
+                assert_eq!(
+                    accepted_crtcs, expected_crtcs,
+                    "{row}: degraded pass accepts both unrelated scene and replacement CRTCs"
+                );
+                assert!(
+                    fixture.events.backend.pstate.direct.outputs[1].degraded_composed_unflip,
+                    "{row}: EIO enters degraded replacement"
+                );
+                let output0_record = records
+                    .iter()
+                    .find(|record| {
+                        super::commit_identity::accepted_event_id(record).is_some()
+                            && a3_has_scene_commit_for(std::slice::from_ref(*record), output0_crtc)
+                    })
+                    .expect("unrelated output 0 composition is accepted in degraded pass");
+                let replacement = records
+                    .iter()
+                    .find(|record| {
+                        super::commit_identity::accepted_event_id(record).is_some()
+                            && a3_has_scene_commit_for(std::slice::from_ref(*record), output1_crtc)
+                    })
+                    .expect("degraded output 1 replacement is accepted");
+                let replacement_id =
+                    super::commit_identity::accepted_event_id(replacement).unwrap();
+                assert_eq!(
+                    fixture.events.backend.pstate.direct.outputs[1]
+                        .unflip_awaiting_outputs
+                        .get(&1),
+                    Some(&replacement_id),
+                    "{row}: accepted degraded replacement identity is tracked"
+                );
+                assert!(
+                    fixture.events.backend.pstate.direct.outputs[1]
+                        .unflip_outputs_to_replace
+                        .contains(&1),
+                    "{row}: degraded replacement obligation remains until retirement"
+                );
+                a3_retire_records(&mut fixture, std::slice::from_ref(output0_record));
+                assert!(
+                    fixture.events.backend.pstate.direct.outputs[1]
+                        .current
+                        .is_some(),
+                    "{row}: unrelated output retirement leaves degraded owner active"
+                );
+                a3_retire_records(&mut fixture, std::slice::from_ref(replacement));
+                assert!(
+                    fixture.events.backend.pstate.direct.outputs[1]
+                        .current
+                        .is_none(),
+                    "{row}: replacement retirement releases degraded owner"
+                );
+                assert!(
+                    fixture.events.backend.present_source_pins.is_empty(),
+                    "{row}: degraded retirement releases source pins"
+                );
+            }
+            _ => unreachable!("known Q06 row"),
+        }
+        fixture.finish_after_normal_drain();
+    }
 }
-
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutations: invalidate every output's buffers; mark all outputs structurally dirty at fresh preparation, retirement, degraded setup, or degraded retry.
-fn output_unflip_leaves_other_output_damage_alone() {
+// Mutations: A17 invalidates every output's buffers; it also marks output 0
+// structurally dirty during fresh preparation, retirement, degraded setup, or retry.
+fn output_unflip_preserves_other_damage() {
     use yserver_core::backend::Backend;
 
     fn request_output_unflip(
         fixture: &mut super::commit_identity::recording_scene::RecordingSceneFixtureGuard,
         direct: &super::commit_identity::recording_scene::DirectPresentSetup,
         output_idx: usize,
+        row: &str,
     ) {
         let mut successor = direct.candidate;
         successor.present_id += 1;
@@ -2003,17 +2292,21 @@ fn output_unflip_leaves_other_output_damage_alone() {
         event.present_id = successor.present_id;
         event.serial = event.serial.wrapping_add(1);
         assert!(
-            !Backend::try_present_direct(&mut fixture.events.backend, successor, event,)
+            !Backend::try_present_direct(&mut fixture.events.backend, successor, event)
                 .expect("ineligible Output successor through Backend"),
-            "the successor requests composed unflip"
+            "{row}: successor requests composed unflip"
         );
-        assert!(fixture.events.backend.pstate.direct.outputs[output_idx].unflip_requested);
+        assert!(
+            fixture.events.backend.pstate.direct.outputs[output_idx].unflip_requested,
+            "{row}: ineligible successor marks its output for unflip"
+        );
     }
 
     fn settle_other_output(
         fixture: &mut super::commit_identity::recording_scene::RecordingSceneFixtureGuard,
+        output0_crtc: ::drm::control::crtc::Handle,
+        row: &str,
     ) {
-        let output0_crtc = fixture.events.backend.platform.outputs[0].output.crtc;
         for _ in 0..3 {
             let records = a3_tick(fixture);
             let has_output0_scene = a3_has_scene_commit_for(&records, output0_crtc);
@@ -2022,208 +2315,198 @@ fn output_unflip_leaves_other_output_damage_alone() {
                 break;
             }
         }
-        assert!(!fixture.events.backend.scene.has_pending_page_flip(0));
+        assert!(
+            !fixture.events.backend.scene.has_pending_page_flip(0),
+            "{row}: output 0 starts with no scene acknowledgement in flight"
+        );
     }
 
-    let Some((fixture, direct)) = a3_output_fixture(1, 958) else {
-        eprintln!(
-            "SKIP output_unflip_leaves_other_output_damage_alone: Vulkan fixture unavailable"
+    for (row, present_id, degraded) in [("fresh", 958, false), ("degraded-retry", 959, true)] {
+        let Some((fixture, direct)) = a3_output_fixture(1, present_id) else {
+            eprintln!("SKIP output_unflip_preserves_other_damage: Vulkan fixture unavailable");
+            return;
+        };
+        let mut fixture = fixture.cleanup_guard();
+        let fd = fixture.kms_fd(0);
+        a3_enter_output_owner(&mut fixture, &direct, 1);
+        let output0_crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+        settle_other_output(&mut fixture, output0_crtc, row);
+        let output0_before = fixture
+            .events
+            .backend
+            .scene
+            .retirement_observation_for_tests(0);
+        assert!(
+            output0_before.contains("structure_damage=RegionSet { rects: [] }"),
+            "{row}: output 0 starts clean: {output0_before}"
         );
-        return;
-    };
-    let mut fixture = fixture.cleanup_guard();
-    let fd = fixture.kms_fd(0);
-    a3_enter_output_owner(&mut fixture, &direct, 1);
-    settle_other_output(&mut fixture);
-    let output0_crtc = fixture.events.backend.platform.outputs[0].output.crtc;
-    let output0_before = fixture
-        .events
-        .backend
-        .scene
-        .retirement_observation_for_tests(0);
-    assert!(
-        output0_before.contains("structure_damage=RegionSet { rects: [] }"),
-        "output 0 starts without structure damage: {output0_before}"
-    );
-    request_output_unflip(&mut fixture, &direct, 1);
-    let fresh_start = fixture.events.recorders[&fd].records().len();
-    Backend::maybe_composite(&mut fixture.events.backend).expect("prepare fresh Output(1) unflip");
-    fixture.events.wait_for_submitted_gpu_work();
-    let fresh_records = a3_records_since(&fixture, fd, fresh_start);
-    assert!(
-        !a3_has_scene_commit_for(&fresh_records, output0_crtc),
-        "fresh unflip preparation does not repaint output 0"
-    );
-    assert_eq!(
-        fixture
-            .events
-            .backend
-            .scene
-            .retirement_observation_for_tests(0),
-        output0_before,
-        "fresh preparation leaves output 0's damage history and structural region unchanged"
-    );
-    assert!(fixture.events.backend.pstate.direct.outputs[1].fresh_composed_unflip);
-    let fresh_replacement = fresh_records
-        .iter()
-        .find(|record| {
-            super::commit_identity::accepted_event_id(record).is_some()
-                && a3_has_scene_commit_for(
-                    std::slice::from_ref(*record),
-                    fixture.events.backend.platform.outputs[1].output.crtc,
-                )
-        })
-        .expect("fresh output 1 replacement accepted");
-    a3_retire_records(&mut fixture, std::slice::from_ref(fresh_replacement));
-    assert!(
-        fixture.events.backend.pstate.direct.outputs[1]
-            .current
-            .is_none()
-    );
-    assert_eq!(
-        fixture
-            .events
-            .backend
-            .scene
-            .retirement_observation_for_tests(0),
-        output0_before,
-        "replacement retirement leaves output 0's damage history and structural region unchanged"
-    );
-    fixture.finish_after_normal_drain();
+        request_output_unflip(&mut fixture, &direct, 1, row);
 
-    let Some((fixture, direct)) = a3_output_fixture(1, 959) else {
-        eprintln!(
-            "SKIP output_unflip_leaves_other_output_damage_alone: degraded Vulkan fixture unavailable"
-        );
-        return;
-    };
-    let mut fixture = fixture.cleanup_guard();
-    let fd = fixture.kms_fd(0);
-    a3_enter_output_owner(&mut fixture, &direct, 1);
-    settle_other_output(&mut fixture);
-    let output0_crtc = fixture.events.backend.platform.outputs[0].output.crtc;
-    let output0_before = fixture
-        .events
-        .backend
-        .scene
-        .retirement_observation_for_tests(0);
-    assert!(
-        output0_before.contains("structure_damage=RegionSet { rects: [] }"),
-        "output 0 starts without structure damage: {output0_before}"
-    );
-    request_output_unflip(&mut fixture, &direct, 1);
-    let recorder = fixture.events.recorders[&fd].clone();
-    recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
-    recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
-    // Reject the first per-output replacement too, so the next scheduling
-    // pass must reach the degraded retry through Backend bookkeeping.
-    recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
-    let degraded_start = recorder.records().len();
-    Backend::maybe_composite(&mut fixture.events.backend)
-        .expect("degrade Output(1) to per-output scene replacement");
-    fixture.events.wait_for_submitted_gpu_work();
-    let degraded_records = a3_records_since(&fixture, fd, degraded_start);
-    assert!(fixture.events.backend.pstate.direct.outputs[1].degraded_composed_unflip);
-    assert!(
-        fixture.events.backend.pstate.direct.outputs[1]
-            .unflip_awaiting_outputs
-            .is_empty(),
-        "rejected degraded setup has no accepted replacement to retire"
-    );
-    assert!(
-        fixture.events.backend.pstate.direct.outputs[1]
-            .unflip_outputs_to_replace
-            .contains(&1),
-        "output 1 remains an unflip replacement obligation until its event retires"
-    );
-    assert!(
-        fixture.events.backend.pstate.direct.outputs[1]
-            .current
-            .is_some(),
-        "the degraded owner remains active until the replacement event retires"
-    );
-    assert_eq!(
-        fixture.events.backend.pstate.direct.active_scopes(),
-        [crate::kms::render::backend::DirectScope::Output(1)],
-        "the degraded retry remains reachable through its owner scope"
-    );
-    assert!(
-        !a3_has_scene_commit_for(&degraded_records, output0_crtc),
-        "degraded setup does not repaint output 0"
-    );
-    assert_eq!(
-        fixture
-            .events
-            .backend
-            .scene
-            .retirement_observation_for_tests(0),
-        output0_before,
-        "degraded setup leaves output 0's damage history and structural region unchanged"
-    );
+        let recorder = fixture.events.recorders[&fd].clone();
+        if degraded {
+            recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
+            recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
+            // Reject the first per-output replacement too, forcing the Backend retry path.
+            recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
+        }
+        let setup_start = recorder.records().len();
+        Backend::maybe_composite(&mut fixture.events.backend)
+            .expect("prepare output 1 composed unflip through Backend");
+        fixture.events.wait_for_submitted_gpu_work();
+        let setup_records = a3_records_since(&fixture, fd, setup_start);
 
-    assert!(
-        degraded_records.iter().any(|record| {
-            record.result != crate::drm::atomic::tests_support::ScriptedResult::Ok
-                && a3_has_scene_commit_for(
-                    std::slice::from_ref(record),
-                    fixture.events.backend.platform.outputs[1].output.crtc,
-                )
-        }),
-        "the recorder shows the first Output(1) scene replacement was rejected"
-    );
-    assert!(
-        degraded_records
-            .iter()
-            .all(|record| super::commit_identity::accepted_event_id(record).is_none()),
-        "the scripted first replacement attempt is rejected"
-    );
+        if !degraded {
+            assert!(
+                fixture.events.backend.pstate.direct.outputs[1].fresh_composed_unflip,
+                "{row}: output 1 enters the fresh replacement path"
+            );
+            assert!(
+                !a3_has_scene_commit_for(&setup_records, output0_crtc),
+                "{row}: fresh preparation does not repaint output 0"
+            );
+            assert_eq!(
+                fixture
+                    .events
+                    .backend
+                    .scene
+                    .retirement_observation_for_tests(0),
+                output0_before,
+                "{row}: fresh preparation preserves output 0 buffer history and structure damage"
+            );
+            let replacement = setup_records
+                .iter()
+                .find(|record| {
+                    super::commit_identity::accepted_event_id(record).is_some()
+                        && a3_has_scene_commit_for(
+                            std::slice::from_ref(*record),
+                            fixture.events.backend.platform.outputs[1].output.crtc,
+                        )
+                })
+                .expect("fresh output 1 replacement accepted");
+            a3_retire_records(&mut fixture, std::slice::from_ref(replacement));
+            assert!(
+                fixture.events.backend.pstate.direct.outputs[1]
+                    .current
+                    .is_none(),
+                "{row}: fresh replacement retirement releases the output 1 owner"
+            );
+            assert_eq!(
+                fixture
+                    .events
+                    .backend
+                    .scene
+                    .retirement_observation_for_tests(0),
+                output0_before,
+                "{row}: fresh replacement retirement preserves output 0 history and structure damage"
+            );
+        } else {
+            let owner = &fixture.events.backend.pstate.direct.outputs[1];
+            assert!(
+                owner.degraded_composed_unflip,
+                "{row}: scripted EIO enters degraded replacement"
+            );
+            assert!(
+                owner.unflip_awaiting_outputs.is_empty(),
+                "{row}: rejected degraded setup has no accepted replacement identity"
+            );
+            assert!(
+                owner.unflip_outputs_to_replace.contains(&1),
+                "{row}: output 1 replacement obligation remains tracked"
+            );
+            assert!(
+                owner.current.is_some(),
+                "{row}: owner remains active before replacement retirement"
+            );
+            assert_eq!(
+                fixture.events.backend.pstate.direct.active_scopes(),
+                [crate::kms::render::backend::DirectScope::Output(1)],
+                "{row}: degraded work remains reachable through its owner scope"
+            );
+            assert!(
+                !a3_has_scene_commit_for(&setup_records, output0_crtc),
+                "{row}: degraded setup does not repaint output 0"
+            );
+            assert_eq!(
+                fixture
+                    .events
+                    .backend
+                    .scene
+                    .retirement_observation_for_tests(0),
+                output0_before,
+                "{row}: degraded setup preserves output 0 history and structure damage"
+            );
+            assert!(
+                setup_records.iter().any(|record| {
+                    record.result != crate::drm::atomic::tests_support::ScriptedResult::Ok
+                        && a3_has_scene_commit_for(
+                            std::slice::from_ref(record),
+                            fixture.events.backend.platform.outputs[1].output.crtc,
+                        )
+                }),
+                "{row}: recorder confirms the first output 1 replacement was rejected"
+            );
+            assert!(
+                setup_records
+                    .iter()
+                    .all(|record| super::commit_identity::accepted_event_id(record).is_none()),
+                "{row}: setup contains no accepted replacement event"
+            );
 
-    let retry_deadline = Backend::next_wakeup(&fixture.events.backend)
-        .expect("rejected replacement schedules a Backend retry wakeup");
-    let until_retry = retry_deadline.saturating_duration_since(std::time::Instant::now());
-    if !until_retry.is_zero() {
-        // Follow the scheduler's reported KMS retry timer; the scripted
-        // outcomes determine the rejection and acceptance independently.
-        std::thread::sleep(until_retry);
+            let retry_deadline = Backend::next_wakeup(&fixture.events.backend)
+                .expect("rejected replacement schedules a Backend retry");
+            let until_retry = retry_deadline.saturating_duration_since(std::time::Instant::now());
+            if !until_retry.is_zero() {
+                std::thread::sleep(until_retry);
+            }
+            Backend::before_block(&mut fixture.events.backend);
+            let retry_start = recorder.records().len();
+            Backend::maybe_composite(&mut fixture.events.backend)
+                .expect("retry the rejected degraded replacement through Backend");
+            fixture.events.wait_for_submitted_gpu_work();
+            let retry_records = a3_records_since(&fixture, fd, retry_start);
+            assert!(
+                !a3_has_scene_commit_for(&retry_records, output0_crtc),
+                "{row}: degraded retry does not repaint output 0"
+            );
+            assert_eq!(
+                fixture
+                    .events
+                    .backend
+                    .scene
+                    .retirement_observation_for_tests(0),
+                output0_before,
+                "{row}: degraded retry preserves output 0 history and structure damage"
+            );
+            let replacement = retry_records
+                .iter()
+                .find(|record| {
+                    super::commit_identity::accepted_event_id(record).is_some()
+                        && a3_has_scene_commit_for(
+                            std::slice::from_ref(*record),
+                            fixture.events.backend.platform.outputs[1].output.crtc,
+                        )
+                })
+                .expect("degraded retry accepts output 1 replacement");
+            a3_retire_records(&mut fixture, std::slice::from_ref(replacement));
+            assert!(
+                fixture.events.backend.pstate.direct.outputs[1]
+                    .current
+                    .is_none(),
+                "{row}: retry retirement releases output 1's owner"
+            );
+            assert_eq!(
+                fixture
+                    .events
+                    .backend
+                    .scene
+                    .retirement_observation_for_tests(0),
+                output0_before,
+                "{row}: retry replacement retirement keeps output 0 history and structure damage"
+            );
+        }
+        fixture.finish_after_normal_drain();
     }
-    Backend::before_block(&mut fixture.events.backend);
-    let retry_start = recorder.records().len();
-    Backend::maybe_composite(&mut fixture.events.backend)
-        .expect("retry the rejected degraded Output(1) replacement through Backend");
-    fixture.events.wait_for_submitted_gpu_work();
-    let retry_records = a3_records_since(&fixture, fd, retry_start);
-    assert!(
-        !a3_has_scene_commit_for(&retry_records, output0_crtc),
-        "degraded retry does not repaint output 0"
-    );
-    assert_eq!(
-        fixture
-            .events
-            .backend
-            .scene
-            .retirement_observation_for_tests(0),
-        output0_before,
-        "degraded retry leaves output 0's damage history and structural region unchanged"
-    );
-    let retry_replacement = retry_records
-        .iter()
-        .find(|record| {
-            super::commit_identity::accepted_event_id(record).is_some()
-                && a3_has_scene_commit_for(
-                    std::slice::from_ref(*record),
-                    fixture.events.backend.platform.outputs[1].output.crtc,
-                )
-        })
-        .expect("degraded retry accepts output 1's replacement");
-    a3_retire_records(&mut fixture, std::slice::from_ref(retry_replacement));
-    assert!(
-        fixture.events.backend.pstate.direct.outputs[1]
-            .current
-            .is_none()
-    );
-    fixture.finish_after_normal_drain();
 }
-
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: use the global scene predicate when deciding whether to skip output 0's cursor-only commit.
