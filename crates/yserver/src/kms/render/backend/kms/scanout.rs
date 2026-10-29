@@ -656,7 +656,9 @@ impl KmsBackend {
     }
 
     pub(in crate::kms::render::backend) fn request_direct_unflip(&mut self, reason: &'static str) {
-        self.pstate.request_direct_unflip(reason);
+        for scope in self.pstate.direct.active_scopes() {
+            self.request_direct_unflip_for(scope, reason);
+        }
     }
 
     pub(in crate::kms::render::backend) fn request_direct_unflip_for_outputs(
@@ -692,7 +694,26 @@ impl KmsBackend {
         if self.cancel_queued_direct_entry_to_copy(scope).is_some() {
             return;
         }
-        self.pstate.request_direct_unflip_for(scope, reason);
+        self.pstate.mark_direct_unflip_for(scope, reason);
+    }
+
+    /// Route drawable-referencing unflips through queued-entry cancellation.
+    pub(in crate::kms::render::backend) fn request_direct_unflip_referencing(
+        &mut self,
+        ids: &[DrawableId],
+        reason: &'static str,
+    ) {
+        let mut scopes = Vec::new();
+        for &id in ids {
+            for scope in self.pstate.direct_scopes_referencing_drawable(id) {
+                if !scopes.contains(&scope) {
+                    scopes.push(scope);
+                }
+            }
+        }
+        for scope in scopes {
+            self.request_direct_unflip_for(scope, reason);
+        }
     }
 
     pub(in crate::kms::render::backend) fn direct_scopes_referencing_host_drawable(

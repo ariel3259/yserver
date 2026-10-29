@@ -3907,6 +3907,94 @@ fn queued_entry_cancelled_by_unflip_cause() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: route the global unflip back through KmsBackendState only.
+// A queued server-source-retired case is impossible: promoted server-owned sources are admitted
+// only as Root candidates, while the queued first-entry owner is Output(i).
+fn queued_entry_cancelled_by_global_unflip() {
+    use yserver_core::backend::Backend;
+
+    let Some((fixture, direct)) = a3_output_fixture(1, 1106) else {
+        eprintln!("SKIP queued_entry_cancelled_by_global_unflip: Vulkan fixture unavailable");
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    let (source_pin, fallback_pin) =
+        a3_queue_first_output_entry(&mut fixture, &direct, 0x0012_3456);
+    {
+        let events = fixture.events_mut();
+        events
+            .backend
+            .rebuild_randr_state(&mut events.state, None, true);
+    }
+
+    let half = yserver_core::randr::FIXED_ONE / 2;
+    fixture.events.state.randr.outputs[0].current_transform =
+        yserver_core::randr::CrtcTransform::new(
+            [half, 0, 0, 0, half, 0, 0, 0, yserver_core::randr::FIXED_ONE],
+            None,
+            Vec::new(),
+        )
+        .expect("valid scale transform");
+    {
+        let events = fixture.events_mut();
+        Backend::randr_layout_changed(&mut events.backend, &mut events.state);
+    }
+    assert_eq!(fixture.events.backend.platform.output_transforms.len(), 1);
+
+    let owner = &fixture.events.backend.pstate.direct.outputs[1];
+    assert!(
+        owner.current.is_none()
+            && owner.pending.is_none()
+            && owner.queued_successor.is_none()
+            && !owner.hold_direct
+            && !owner.active(),
+        "global transform unflip cancels queued-only Output ownership"
+    );
+    assert!(
+        fixture
+            .events
+            .backend
+            .present_source_pins
+            .contains_key(&source_pin)
+            && fixture
+                .events
+                .backend
+                .present_source_pins
+                .contains_key(&fallback_pin),
+        "Copy pins stay held until the fallback is consumed"
+    );
+
+    let fd = fixture.kms_fd(1);
+    let before = fixture.events.recorders[&fd].records().len();
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("compose Output(1) after global queued-entry cancellation");
+    fixture.events.wait_for_submitted_gpu_work();
+    let crtc = fixture.events.backend.platform.outputs[1].output.crtc;
+    let records = a3_records_since(&fixture, fd, before);
+    assert!(
+        a3_has_scene_commit_for(&records, crtc),
+        "the revoked Output composes after its Copy fallback"
+    );
+    a3_retire_records(&mut fixture, &records);
+    assert!(!fixture.events.backend.scene.has_pending_page_flips());
+    let copied = fixture
+        .events
+        .backend
+        .backing_pixels_for_tests(direct.target_xid)
+        .expect("queued fallback target remains readable")
+        .2;
+    assert_eq!(&copied[..3], &[0x56, 0x34, 0x12]);
+    a3_assert_queued_entry_copy_completion(
+        &mut fixture,
+        direct.candidate.present_id,
+        source_pin,
+        fallback_pin,
+    );
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: leave the queued-only owner set (composition stays suppressed / pins held).
 fn queued_entry_cancelled_by_output_removal() {
     use yserver_core::backend::Backend;

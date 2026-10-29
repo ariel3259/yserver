@@ -1721,7 +1721,7 @@ fn change_mode_clock(b: &mut KmsBackend) {
 
 /// The direct frame is replaced on output 0 and released.
 fn unflip_and_retire(b: &mut KmsBackend) {
-    b.pstate.request_direct_unflip("test_unflip");
+    b.request_direct_unflip("test_unflip");
     await_composed_replacement(b, &[0]);
     retire_composed_replacement(b, 0);
     assert!(!b.pstate.direct.root().active());
